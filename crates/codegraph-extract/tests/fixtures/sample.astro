@@ -1,0 +1,25 @@
+---
+import Layout from './Layout.astro';
+import { formatDate } from '../utils/date';
+
+function getTitle(): string {
+  return "Home";
+}
+
+const posts = await fetch("/api/posts");
+---
+
+<Layout title={getTitle()}>
+  <h1>{formatDate(posts.date)}</h1>
+  {posts.map((post) => (
+    <PostCard post={post} />
+  ))}
+  <Fragment>raw</Fragment>
+</Layout>
+
+<script>
+  function clientHandler() {
+    console.log("hi");
+  }
+  clientHandler();
+</script>

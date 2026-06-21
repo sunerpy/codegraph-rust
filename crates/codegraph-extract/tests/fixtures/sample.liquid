@@ -1,0 +1,7 @@
+{% assign title = product.title %}
+{% render 'card-product', product: product %}
+{% include 'icon-star' %}
+{% section 'featured-collection' %}
+{% schema %}
+{ "name": "Featured" }
+{% endschema %}

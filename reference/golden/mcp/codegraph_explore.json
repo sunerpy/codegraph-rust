@@ -1,0 +1,26 @@
+{
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9,
+    "method": "tools/call",
+    "params": {
+      "name": "codegraph_explore",
+      "arguments": {
+        "query": "Counter add runDemo",
+        "projectPath": "/tmp/cg-mcp-golden"
+      }
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 9,
+    "result": {
+      "content": [
+        {
+          "type": "text",
+          "text": "## Exploration: Counter add runDemo\n\nFound 6 symbols across 2 files.\n\n### Blast radius — what depends on these (update/verify before editing)\n\n- `runDemo` (src/app.ts:3) — 1 caller in `src/app.ts`; ⚠️ no covering tests found\n- `add` (src/math.ts:1) — 3 callers in `src/app.ts`, `src/math.ts`; ⚠️ no covering tests found\n- `Counter` (src/math.ts:5) — 1 caller in `src/app.ts`; ⚠️ no covering tests found\n- `increment` (src/math.ts:8) — 1 caller in `src/app.ts`; ⚠️ no covering tests found\n\n### Source Code\n\n> The code below is the **verbatim, current on-disk source** of these files — re-read from disk on this call and line-numbered, byte-for-byte identical to what the Read tool returns. It is NOT a summary, outline, or stale cache. Treat each block as a Read you have already performed: do not Read a file shown here.\n\n#### src/math.ts — add(function), Counter(class), value(property), increment(method)\n\n```typescript\n1\texport function add(left: number, right: number): number {\n2\t  return left + right;\n3\t}\n4\t\n5\texport class Counter {\n6\t  private value = 0;\n7\t\n8\t  increment(step: number = 1): number {\n9\t    this.value = add(this.value, step);\n10\t    return this.value;\n11\t  }\n12\t}\n```\n\n#### src/app.ts — runDemo(function), app.ts(file)\n\n```typescript\n1\timport { Counter, add } from './math';\n2\t\n3\texport function runDemo(): number {\n4\t  const counter = new Counter();\n5\t  counter.increment(add(1, 2));\n6\t  return counter.increment();\n7\t}\n8\t\n9\trunDemo();\n```\n"
+        }
+      ]
+    }
+  }
+}

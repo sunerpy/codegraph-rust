@@ -1,0 +1,22 @@
+[package]
+name = "codegraph-resolve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+description = "Cross-file symbol resolution (import resolver, name matcher, framework resolvers) for CodeGraph-rs."
+readme = "../../README.md"
+
+[dependencies]
+codegraph-core = { path = "../codegraph-core", version = "0.1.0" }
+codegraph-store = { path = "../codegraph-store", version = "0.1.0" }
+codegraph-extract = { path = "../codegraph-extract", version = "0.1.0" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+regex = "1.10"

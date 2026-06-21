@@ -1,0 +1,260 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  # Manual re-trigger for re-attaching binaries to an ALREADY-released tag
+  # (e.g. when the original build-binaries jobs failed). Deliberately SKIPS
+  # publish-crates: crate versions are immutable on crates.io.
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Existing release tag to (re)build binaries for (e.g. v0.1.0)"
+        required: true
+        type: string
+      version:
+        description: "Version string for artifact names (e.g. 0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: codegraph
+
+jobs:
+  # ----------------------------------------------------------------
+  # release-please: open/maintain the release PR; on merge, cut a tag
+  # and emit outputs that gate the heavy jobs below.
+  # ----------------------------------------------------------------
+  release-please:
+    name: Release Please
+    runs-on: ubuntu-latest
+    outputs:
+      build_artifacts: ${{ steps.gate.outputs.build_artifacts }}
+      tag_name: ${{ steps.gate.outputs.tag_name }}
+      version: ${{ steps.gate.outputs.version }}
+      release_created: ${{ steps.release.outputs.release_created }}
+    steps:
+      - name: Run release-please
+        id: release
+        if: github.event_name == 'push'
+        uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      - name: Resolve build gate
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "build_artifacts=true" >> "$GITHUB_OUTPUT"
+            echo "tag_name=${{ inputs.tag_name }}" >> "$GITHUB_OUTPUT"
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "build_artifacts=${{ steps.release.outputs.release_created }}" >> "$GITHUB_OUTPUT"
+            echo "tag_name=${{ steps.release.outputs.tag_name }}" >> "$GITHUB_OUTPUT"
+            echo "version=${{ steps.release.outputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ----------------------------------------------------------------
+  # build-binaries: cross-compile release artifacts for all targets.
+  # Gated on a cut tag. The CLI crate is `codegraph-rs`, binary `codegraph`.
+  # ----------------------------------------------------------------
+  build-binaries:
+    name: Build ${{ matrix.target }}
+    needs: release-please
+    if: needs.release-please.outputs.build_artifacts == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            use_zigbuild: true
+            archive: tar.gz
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            use_zigbuild: true
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            use_zigbuild: false
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            use_zigbuild: false
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            use_zigbuild: false
+            archive: zip
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install Zig
+        if: matrix.use_zigbuild
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        if: matrix.use_zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build (zigbuild)
+        if: matrix.use_zigbuild
+        run: cargo zigbuild --release -p codegraph-rs --target ${{ matrix.target }}
+
+      - name: Build (native)
+        if: ${{ !matrix.use_zigbuild }}
+        run: cargo build --release -p codegraph-rs --target ${{ matrix.target }}
+
+      - name: Package (unix tar.gz)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          mkdir -p dist
+          tar -czf "dist/${BINARY_NAME}-${{ needs.release-please.outputs.version }}-${{ matrix.target }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" "${BINARY_NAME}"
+
+      - name: Package (windows zip)
+        if: matrix.archive == 'zip'
+        shell: bash
+        run: |
+          mkdir -p dist
+          7z a "dist/${BINARY_NAME}-${{ needs.release-please.outputs.version }}-${{ matrix.target }}.zip" \
+            "./target/${{ matrix.target }}/release/${BINARY_NAME}.exe"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          retention-days: 1
+
+  # ----------------------------------------------------------------
+  # upload-assets: gather all artifacts, render release notes with
+  # git-cliff, and attach binaries to the GitHub Release.
+  # ----------------------------------------------------------------
+  upload-assets:
+    name: Upload Release Assets
+    needs: [release-please, build-binaries]
+    if: needs.release-please.outputs.build_artifacts == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate release notes
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+        env:
+          OUTPUT: RELEASE_NOTES.md
+
+      - name: Attach assets to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.release-please.outputs.tag_name }}
+          body_path: RELEASE_NOTES.md
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ----------------------------------------------------------------
+  # publish-crates: publish the workspace to crates.io in dependency
+  # (topological) order. Gated on release_created. --no-verify skips the
+  # cross-compile/network verify step; binaries are already validated above.
+  # ----------------------------------------------------------------
+  publish-crates:
+    name: Publish to crates.io
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Topological order: a crate is published only after its deps are live.
+          # codegraph-bench is publish=false and intentionally omitted.
+          crates=(
+            codegraph-core
+            codegraph-store
+            codegraph-extract
+            codegraph-graph
+            codegraph-resolve
+            codegraph-mcp
+            codegraph-daemon
+            codegraph-watch
+            codegraph-rs
+          )
+          for c in "${crates[@]}"; do
+            echo "::group::publish $c"
+            if cargo publish --no-verify -p "$c" 2>&1 | tee /tmp/pub.log; then
+              echo "published $c"
+            else
+              if grep -q "already exists\|already uploaded" /tmp/pub.log; then
+                echo "$c already published, skipping"
+              else
+                echo "publish failed for $c"; exit 1
+              fi
+            fi
+            # Let the crates.io index propagate before the next dependent crate.
+            sleep 30
+            echo "::endgroup::"
+          done

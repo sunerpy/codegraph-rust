@@ -1,0 +1,224 @@
+[
+  {
+    "col": 0,
+    "kind": "calls",
+    "line": 9,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:src/app.ts",
+    "target": "function:60629aa3876961b8bd3c07c43bbe6a37"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "file:src/app.ts",
+    "target": "import:4ec14e7f870d20bf811e565c9993468c"
+  },
+  {
+    "col": 11,
+    "kind": "calls",
+    "line": 11,
+    "metadata": {
+      "confidence": 0.8,
+      "resolvedBy": "instance-method"
+    },
+    "provenance": null,
+    "source": "function:8a6f7270b7e9d62aee91dd9e70f126f3",
+    "target": "method:3c01f33894e563f457be2f29fffca19c"
+  },
+  {
+    "col": 14,
+    "kind": "instantiates",
+    "line": 10,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:8a6f7270b7e9d62aee91dd9e70f126f3",
+    "target": "class:7ea38da25781893f519b36a80bfe6fb6"
+  },
+  {
+    "col": 17,
+    "kind": "calls",
+    "line": 9,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:f501ba98441869bd251c636e30d31e3d",
+    "target": "function:cce15011e0125d59f6bef014ae79c04f"
+  },
+  {
+    "col": 18,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:src/app.ts",
+    "target": "function:cce15011e0125d59f6bef014ae79c04f"
+  },
+  {
+    "col": 18,
+    "kind": "instantiates",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "function:60629aa3876961b8bd3c07c43bbe6a37",
+    "target": "class:7ac92ae0dce4208dfad9148e025726c4"
+  },
+  {
+    "col": 2,
+    "kind": "calls",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.8,
+      "resolvedBy": "instance-method"
+    },
+    "provenance": null,
+    "source": "function:60629aa3876961b8bd3c07c43bbe6a37",
+    "target": "method:f501ba98441869bd251c636e30d31e3d"
+  },
+  {
+    "col": 20,
+    "kind": "calls",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "function:60629aa3876961b8bd3c07c43bbe6a37",
+    "target": "function:cce15011e0125d59f6bef014ae79c04f"
+  },
+  {
+    "col": 9,
+    "kind": "calls",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.8,
+      "resolvedBy": "instance-method"
+    },
+    "provenance": null,
+    "source": "function:60629aa3876961b8bd3c07c43bbe6a37",
+    "target": "method:f501ba98441869bd251c636e30d31e3d"
+  },
+  {
+    "col": 9,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:src/app.ts",
+    "target": "class:7ac92ae0dce4208dfad9148e025726c4"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:7ac92ae0dce4208dfad9148e025726c4",
+    "target": "method:f501ba98441869bd251c636e30d31e3d"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:7ac92ae0dce4208dfad9148e025726c4",
+    "target": "property:eb609167b4cd30142dad32b03a8d8f87"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:7ea38da25781893f519b36a80bfe6fb6",
+    "target": "method:3c01f33894e563f457be2f29fffca19c"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:7ea38da25781893f519b36a80bfe6fb6",
+    "target": "method:d9785bc27131eb51e96712a75cf8b935"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:src/app.ts",
+    "target": "function:60629aa3876961b8bd3c07c43bbe6a37"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:src/app.ts",
+    "target": "import:4ec14e7f870d20bf811e565c9993468c"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:src/math.ts",
+    "target": "class:7ac92ae0dce4208dfad9148e025726c4"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:src/math.ts",
+    "target": "function:cce15011e0125d59f6bef014ae79c04f"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:tools/greeter.py",
+    "target": "class:7ea38da25781893f519b36a80bfe6fb6"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:tools/greeter.py",
+    "target": "function:8a6f7270b7e9d62aee91dd9e70f126f3"
+  }
+]
