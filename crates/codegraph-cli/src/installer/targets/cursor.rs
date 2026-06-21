@@ -10,11 +10,11 @@
 use std::fs;
 use std::path::PathBuf;
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use super::super::shared::{
-    mcp_server_config, read_json_file, remove_codegraph_from_mcp_servers, to_upstream_json,
-    write_json_file, CODEGRAPH_SECTION_END, CODEGRAPH_SECTION_START,
+    mcp_server_config, read_config_file, read_json_file, remove_codegraph_from_mcp_servers,
+    to_upstream_json, write_json_file, ConfigRead, CODEGRAPH_SECTION_END, CODEGRAPH_SECTION_START,
 };
 use super::super::types::{
     AgentTarget, DetectionResult, FileAction, FileWrite, InstallContext, InstallOptions, Location,
@@ -133,7 +133,16 @@ impl AgentTarget for CursorTarget {
 // Ports writeMcpEntry (cursor.ts:177).
 fn write_mcp_entry(ctx: &InstallContext, loc: Location) -> FileWrite {
     let file = mcp_json_path(ctx, loc);
-    let mut existing = read_json_file(&file);
+    let mut existing = match read_config_file(&file) {
+        ConfigRead::Missing => Map::new(),
+        ConfigRead::Parsed(map) => map,
+        ConfigRead::Unparseable => {
+            return FileWrite {
+                path: file,
+                action: FileAction::Skipped,
+            };
+        }
+    };
     let before = existing.get("mcpServers").and_then(|s| s.get("codegraph"));
     let after = build_cursor_mcp_config(ctx, loc);
     if before == Some(&after) {

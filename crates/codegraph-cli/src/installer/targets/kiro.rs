@@ -8,11 +8,11 @@
 use std::fs;
 use std::path::PathBuf;
 
-use serde_json::json;
+use serde_json::{json, Map};
 
 use super::super::shared::{
-    mcp_server_config, read_json_file, remove_codegraph_from_mcp_servers, to_upstream_json,
-    write_json_file,
+    mcp_server_config, read_config_file, read_json_file, remove_codegraph_from_mcp_servers,
+    to_upstream_json, write_json_file, ConfigRead,
 };
 use super::super::types::{
     AgentTarget, DetectionResult, FileAction, FileWrite, InstallContext, InstallOptions, Location,
@@ -116,7 +116,16 @@ fn write_mcp_entry(ctx: &InstallContext, loc: Location) -> FileWrite {
     if let Some(dir) = file.parent() {
         let _ = fs::create_dir_all(dir);
     }
-    let mut existing = read_json_file(&file);
+    let mut existing = match read_config_file(&file) {
+        ConfigRead::Missing => Map::new(),
+        ConfigRead::Parsed(map) => map,
+        ConfigRead::Unparseable => {
+            return FileWrite {
+                path: file,
+                action: FileAction::Skipped,
+            };
+        }
+    };
     let before = existing.get("mcpServers").and_then(|s| s.get("codegraph"));
     let after = mcp_server_config();
     if before == Some(&after) {
