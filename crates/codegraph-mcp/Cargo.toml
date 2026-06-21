@@ -1,0 +1,27 @@
+[package]
+name = "codegraph-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+description = "MCP stdio JSON-RPC server and tool handlers for CodeGraph-rs."
+readme = "../../README.md"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+codegraph-core = { path = "../codegraph-core", version = "0.1.0" }
+codegraph-store = { path = "../codegraph-store", version = "0.1.0" }
+codegraph-graph = { path = "../codegraph-graph", version = "0.1.0" }
+codegraph-resolve = { path = "../codegraph-resolve", version = "0.1.0" }
+regex = "1.10"
+
+[dev-dependencies]
+codegraph-extract = { path = "../codegraph-extract", version = "0.1.0" }

@@ -1,0 +1,12 @@
+@model MyApp.ViewModels.ProductModel
+@inject MyApp.Services.ICatalogService Catalog
+<PageTitle>@typeof(MainLayout)</PageTitle>
+<ProductGrid TItem="CatalogItem" />
+
+@code {
+    private void Load()
+    {
+        var query = new ProductQuery();
+        Catalog.Load(query);
+    }
+}

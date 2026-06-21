@@ -1,0 +1,38 @@
+# oxfmt ignore — files oxfmt must NOT touch.
+#
+# Auto-generated changelog / release-please manifests are produced and formatted
+# by the release workflow (update-changelog job); the dev/CI fmt flow must not
+# touch them, otherwise git-cliff regeneration conflicts with oxfmt's expected
+# format and fmt-check would falsely fail on every PR between releases.
+CHANGELOG.md
+changelog/
+.release-please-manifest.json
+release-please-config.json
+
+# Golden artifacts are byte-compared by the equivalence/golden oracle tests
+# (include_str! / fs::read). Reformatting them breaks the test suite.
+reference/
+
+# Test input fixtures are parsed by the extractors; reformatting changes the
+# extraction output and breaks golden parity.
+crates/codegraph-bench/fixtures/
+crates/codegraph-extract/tests/fixtures/
+
+# Embedded verbatim into the MCP tools/list response and byte-compared against
+# golden; reformatting breaks the MCP golden test.
+crates/codegraph-mcp/src/tools_list.json
+
+# Parsed at runtime by the golden oracle (KnownDiffs::load reads `RULE tier=…`
+# lines); reformatting can break that line-oriented parse.
+KNOWN_DIFFS.md
+
+# TOML manifests are owned by `cargo fmt` conventions, not oxfmt.
+*.toml
+
+# Rust sources are formatted by `cargo fmt`.
+*.rs
+
+# Build artifacts / vendored deps.
+target/
+dist/
+node_modules/

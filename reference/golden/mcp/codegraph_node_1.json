@@ -1,0 +1,26 @@
+{
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 13,
+    "method": "tools/call",
+    "params": {
+      "name": "codegraph_node",
+      "arguments": {
+        "file": "src/math.ts",
+        "projectPath": "/tmp/cg-mcp-golden"
+      }
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 13,
+    "result": {
+      "content": [
+        {
+          "type": "text",
+          "text": "**src/math.ts** — 13 lines, 4 symbols · used by 1 file: src/app.ts\n\n1\texport function add(left: number, right: number): number {\n2\t  return left + right;\n3\t}\n4\t\n5\texport class Counter {\n6\t  private value = 0;\n7\t\n8\t  increment(step: number = 1): number {\n9\t    this.value = add(this.value, step);\n10\t    return this.value;\n11\t  }\n12\t}\n13\t"
+        }
+      ]
+    }
+  }
+}

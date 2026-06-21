@@ -1,0 +1,8 @@
+<mapper namespace="com.example.UserMapper">
+  <sql id="BaseColumns">
+    id, name
+  </sql>
+  <select id="findById" parameterType="int" resultType="User">
+    SELECT <include refid="BaseColumns"/> FROM users WHERE id = #{id}
+  </select>
+</mapper>

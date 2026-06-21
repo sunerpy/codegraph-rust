@@ -1,0 +1,31 @@
+[package]
+name = "codegraph-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "codegraph_bench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bench"
+path = "src/main.rs"
+
+[[bench]]
+name = "micro"
+harness = false
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+rusqlite = { workspace = true }
+codegraph-core = { path = "../codegraph-core" }
+codegraph-extract = { path = "../codegraph-extract" }
+libc = "0.2"
+
+[dev-dependencies]
+criterion = { workspace = true }
