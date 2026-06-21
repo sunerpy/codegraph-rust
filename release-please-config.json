@@ -5,7 +5,6 @@
     ".": {
       "release-type": "simple",
       "package-name": "codegraph-rs",
-      "release-as": "0.1.0",
       "bump-minor-pre-major": true,
       "include-v-in-tag": true,
       "changelog-path": "changelog/CHANGELOG-v0.x.md",
