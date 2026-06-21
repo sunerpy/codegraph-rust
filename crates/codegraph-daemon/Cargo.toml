@@ -1,0 +1,25 @@
+[package]
+name = "codegraph-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+description = "Per-project single-instance daemon (pid + socket, ppid watchdog) for CodeGraph-rs."
+readme = "../../README.md"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+notify = { workspace = true }
+sha2 = { workspace = true }
+tracing = { workspace = true }
+codegraph-mcp = { path = "../codegraph-mcp", version = "0.1.0" }
+
+[dev-dependencies]
+codegraph-core = { path = "../codegraph-core", version = "0.1.0" }

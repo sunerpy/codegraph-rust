@@ -1,0 +1,21 @@
+[package]
+name = "codegraph-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+description = "SQLite + FTS5 persistence layer for CodeGraph-rs (fixed, byte-stable schema)."
+readme = "../../README.md"
+
+[dependencies]
+codegraph-core = { path = "../codegraph-core", version = "0.1.0" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+rusqlite = { workspace = true }

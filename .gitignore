@@ -1,0 +1,17 @@
+.omo
+.opencode
+/target/
+**/*.rs.bk
+
+# Benchmark corpora are fetched on demand (codegraph-bench), not committed.
+bench/corpora/
+
+# Locally-built release binary (see README install/build instructions).
+/codegraph
+dist/
+
+# Per-project index DB written by `codegraph init` / `index`.
+.codegraph/
+
+# Local upstream-sync ledger (colby-upstream-sync skill); not part of the repo.
+docs/upstream-sync/

@@ -1,0 +1,425 @@
+{
+  "single_term_counter": {
+    "query": "Counter",
+    "options": {},
+    "results": [
+      {
+        "id": "class:7ac92ae0dce4208dfad9148e025726c4",
+        "name": "Counter",
+        "kind": "class",
+        "score": 89.59458452595162
+      },
+      {
+        "id": "method:89ae38f0afd5d9ed9a7eb3286a91a590",
+        "name": "value",
+        "kind": "method",
+        "score": 11.395261460207665
+      },
+      {
+        "id": "method:f501ba98441869bd251c636e30d31e3d",
+        "name": "increment",
+        "kind": "method",
+        "score": 11.291613466020811
+      },
+      {
+        "id": "import:4ec14e7f870d20bf811e565c9993468c",
+        "name": "./math",
+        "kind": "import",
+        "score": 1.9774372175292623
+      }
+    ]
+  },
+  "prefix_incr": {
+    "query": "incr",
+    "options": {},
+    "results": [
+      {
+        "id": "method:f501ba98441869bd251c636e30d31e3d",
+        "name": "increment",
+        "kind": "method",
+        "score": 37.423308411727774
+      }
+    ]
+  },
+  "multi_term": {
+    "query": "Counter increment",
+    "options": {},
+    "results": [
+      {
+        "id": "method:f501ba98441869bd251c636e30d31e3d",
+        "name": "increment",
+        "kind": "method",
+        "score": 75.7149218777486
+      },
+      {
+        "id": "class:7ac92ae0dce4208dfad9148e025726c4",
+        "name": "Counter",
+        "kind": "class",
+        "score": 69.59458452595162
+      },
+      {
+        "id": "method:89ae38f0afd5d9ed9a7eb3286a91a590",
+        "name": "value",
+        "kind": "method",
+        "score": 11.395261460207665
+      },
+      {
+        "id": "import:4ec14e7f870d20bf811e565c9993468c",
+        "name": "./math",
+        "kind": "import",
+        "score": 1.9774372175292623
+      }
+    ]
+  },
+  "kind_filter_function": {
+    "query": "add",
+    "options": {
+      "kinds": [
+        "function"
+      ]
+    },
+    "results": [
+      {
+        "id": "function:cce15011e0125d59f6bef014ae79c04f",
+        "name": "add",
+        "kind": "function",
+        "score": 93.1836691848776
+      }
+    ]
+  },
+  "kind_option_method": {
+    "query": "increment",
+    "options": {
+      "kinds": [
+        "method"
+      ]
+    },
+    "results": [
+      {
+        "id": "method:f501ba98441869bd251c636e30d31e3d",
+        "name": "increment",
+        "kind": "method",
+        "score": 94.42330841172777
+      }
+    ]
+  },
+  "limit_2": {
+    "query": "greet",
+    "options": {
+      "limit": 2
+    },
+    "results": [
+      {
+        "id": "method:3c01f33894e563f457be2f29fffca19c",
+        "name": "greet",
+        "kind": "method",
+        "score": 103.91606063690782
+      },
+      {
+        "id": "class:7ea38da25781893f519b36a80bfe6fb6",
+        "name": "Greeter",
+        "kind": "class",
+        "score": 52.928985654712505
+      }
+    ]
+  },
+  "field_kind_filter": {
+    "query": "kind:method increment",
+    "options": {},
+    "results": [
+      {
+        "id": "method:f501ba98441869bd251c636e30d31e3d",
+        "name": "increment",
+        "kind": "method",
+        "score": 94.42330841172777
+      }
+    ]
+  },
+  "filter_only_kind_method": {
+    "query": "kind:method",
+    "options": {},
+    "results": [
+      {
+        "id": "method:d9785bc27131eb51e96712a75cf8b935",
+        "name": "__init__",
+        "kind": "method",
+        "score": 11
+      },
+      {
+        "id": "method:3c01f33894e563f457be2f29fffca19c",
+        "name": "greet",
+        "kind": "method",
+        "score": 11
+      },
+      {
+        "id": "method:f501ba98441869bd251c636e30d31e3d",
+        "name": "increment",
+        "kind": "method",
+        "score": 11
+      },
+      {
+        "id": "method:89ae38f0afd5d9ed9a7eb3286a91a590",
+        "name": "value",
+        "kind": "method",
+        "score": 11
+      }
+    ]
+  },
+  "lang_filter": {
+    "query": "lang:python greet",
+    "options": {},
+    "results": [
+      {
+        "id": "method:3c01f33894e563f457be2f29fffca19c",
+        "name": "greet",
+        "kind": "method",
+        "score": 103.91606063690782
+      },
+      {
+        "id": "class:7ea38da25781893f519b36a80bfe6fb6",
+        "name": "Greeter",
+        "kind": "class",
+        "score": 52.928985654712505
+      },
+      {
+        "id": "file:tools/greeter.py",
+        "name": "greeter.py",
+        "kind": "file",
+        "score": 38.90816356245171
+      },
+      {
+        "id": "function:8a6f7270b7e9d62aee91dd9e70f126f3",
+        "name": "make_greeting",
+        "kind": "function",
+        "score": 33.90816356245171
+      },
+      {
+        "id": "method:d9785bc27131eb51e96712a75cf8b935",
+        "name": "__init__",
+        "kind": "method",
+        "score": 23.752478380317132
+      }
+    ]
+  },
+  "path_filter": {
+    "query": "path:tools greet",
+    "options": {},
+    "results": [
+      {
+        "id": "method:3c01f33894e563f457be2f29fffca19c",
+        "name": "greet",
+        "kind": "method",
+        "score": 103.91606063690782
+      },
+      {
+        "id": "class:7ea38da25781893f519b36a80bfe6fb6",
+        "name": "Greeter",
+        "kind": "class",
+        "score": 52.928985654712505
+      },
+      {
+        "id": "file:tools/greeter.py",
+        "name": "greeter.py",
+        "kind": "file",
+        "score": 38.90816356245171
+      },
+      {
+        "id": "function:8a6f7270b7e9d62aee91dd9e70f126f3",
+        "name": "make_greeting",
+        "kind": "function",
+        "score": 33.90816356245171
+      },
+      {
+        "id": "method:d9785bc27131eb51e96712a75cf8b935",
+        "name": "__init__",
+        "kind": "method",
+        "score": 23.752478380317132
+      }
+    ]
+  },
+  "name_filter": {
+    "query": "name:increment counter",
+    "options": {},
+    "results": [
+      {
+        "id": "method:f501ba98441869bd251c636e30d31e3d",
+        "name": "increment",
+        "kind": "method",
+        "score": 11.291613466020811
+      }
+    ]
+  },
+  "like_fallback_substring": {
+    "query": "ncrement",
+    "options": {},
+    "results": [
+      {
+        "id": "method:f501ba98441869bd251c636e30d31e3d",
+        "name": "increment",
+        "kind": "method",
+        "score": 20.8
+      }
+    ]
+  },
+  "fuzzy_fallback": {
+    "query": "Countr",
+    "options": {},
+    "results": [
+      {
+        "id": "class:7ac92ae0dce4208dfad9148e025726c4",
+        "name": "Counter",
+        "kind": "class",
+        "score": 8.5
+      }
+    ]
+  },
+  "rust_qualifier": {
+    "query": "Counter::increment",
+    "options": {},
+    "results": [
+      {
+        "id": "method:f501ba98441869bd251c636e30d31e3d",
+        "name": "increment",
+        "kind": "method",
+        "score": 15.714921877748587
+      },
+      {
+        "id": "method:89ae38f0afd5d9ed9a7eb3286a91a590",
+        "name": "value",
+        "kind": "method",
+        "score": 11.395261460207665
+      },
+      {
+        "id": "class:7ac92ae0dce4208dfad9148e025726c4",
+        "name": "Counter",
+        "kind": "class",
+        "score": 9.594584525951618
+      },
+      {
+        "id": "import:4ec14e7f870d20bf811e565c9993468c",
+        "name": "./math",
+        "kind": "import",
+        "score": 1.9774372175292623
+      }
+    ]
+  },
+  "fts_operator_strip": {
+    "query": "Counter AND add",
+    "options": {},
+    "results": [
+      {
+        "id": "function:cce15011e0125d59f6bef014ae79c04f",
+        "name": "add",
+        "kind": "function",
+        "score": 73.1836691848776
+      },
+      {
+        "id": "class:7ac92ae0dce4208dfad9148e025726c4",
+        "name": "Counter",
+        "kind": "class",
+        "score": 69.59458452595162
+      },
+      {
+        "id": "method:89ae38f0afd5d9ed9a7eb3286a91a590",
+        "name": "value",
+        "kind": "method",
+        "score": 11.395261460207665
+      },
+      {
+        "id": "method:f501ba98441869bd251c636e30d31e3d",
+        "name": "increment",
+        "kind": "method",
+        "score": 11.291613466020811
+      },
+      {
+        "id": "import:4ec14e7f870d20bf811e565c9993468c",
+        "name": "./math",
+        "kind": "import",
+        "score": 3.973683841560624
+      }
+    ]
+  },
+  "no_results": {
+    "query": "zzzzqqqq",
+    "options": {},
+    "results": []
+  },
+  "special_chars": {
+    "query": "add()",
+    "options": {},
+    "results": [
+      {
+        "id": "function:cce15011e0125d59f6bef014ae79c04f",
+        "name": "add",
+        "kind": "function",
+        "score": 13.183669184877603
+      },
+      {
+        "id": "import:4ec14e7f870d20bf811e565c9993468c",
+        "name": "./math",
+        "kind": "import",
+        "score": 2.996246624031362
+      }
+    ]
+  },
+  "quoted_path_filter": {
+    "query": "path:\"src\" add",
+    "options": {},
+    "results": [
+      {
+        "id": "function:cce15011e0125d59f6bef014ae79c04f",
+        "name": "add",
+        "kind": "function",
+        "score": 93.1836691848776
+      },
+      {
+        "id": "import:4ec14e7f870d20bf811e565c9993468c",
+        "name": "./math",
+        "kind": "import",
+        "score": 2.996246624031362
+      }
+    ]
+  },
+  "greeter_class": {
+    "query": "Greeter",
+    "options": {},
+    "results": [
+      {
+        "id": "class:7ea38da25781893f519b36a80bfe6fb6",
+        "name": "Greeter",
+        "kind": "class",
+        "score": 102.59458452595162
+      },
+      {
+        "id": "file:tools/greeter.py",
+        "name": "greeter.py",
+        "kind": "file",
+        "score": 45.55884383830098
+      },
+      {
+        "id": "method:d9785bc27131eb51e96712a75cf8b935",
+        "name": "__init__",
+        "kind": "method",
+        "score": 24.291613466020813
+      },
+      {
+        "id": "method:3c01f33894e563f457be2f29fffca19c",
+        "name": "greet",
+        "kind": "method",
+        "score": 24.291613466020813
+      }
+    ]
+  },
+  "snake_query": {
+    "query": "make_greeting",
+    "options": {},
+    "results": [
+      {
+        "id": "function:8a6f7270b7e9d62aee91dd9e70f126f3",
+        "name": "make_greeting",
+        "kind": "function",
+        "score": 94.42330841172777
+      }
+    ]
+  }
+}

@@ -1,0 +1,5 @@
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost/app
+routes:
+  home: App\\Controller::home

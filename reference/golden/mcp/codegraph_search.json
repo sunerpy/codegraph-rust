@@ -1,0 +1,26 @@
+{
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 4,
+    "method": "tools/call",
+    "params": {
+      "name": "codegraph_search",
+      "arguments": {
+        "query": "Counter",
+        "projectPath": "/tmp/cg-mcp-golden"
+      }
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 4,
+    "result": {
+      "content": [
+        {
+          "type": "text",
+          "text": "## Search Results (4 found)\n\n### Counter (class)\nsrc/math.ts:5\n\n### value (property)\nsrc/math.ts:6\n`value`\n\n### increment (method)\nsrc/math.ts:8\n`(step: number = 1): number`\n\n### ./math (import)\nsrc/app.ts:1\n`import { Counter, add } from './math';`\n"
+        }
+      ]
+    }
+  }
+}

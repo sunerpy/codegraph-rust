@@ -1,0 +1,27 @@
+{
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 8,
+    "method": "tools/call",
+    "params": {
+      "name": "codegraph_node",
+      "arguments": {
+        "symbol": "Counter",
+        "includeCode": true,
+        "projectPath": "/tmp/cg-mcp-golden"
+      }
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 8,
+    "result": {
+      "content": [
+        {
+          "type": "text",
+          "text": "## Counter (class)\n\n**Location:** src/math.ts:5\n\n**Members (2):**\n\n- value (property):6 — `value`\n- increment (method):8 — `(step: number = 1): number`\n\n> Structural outline only. Read `src/math.ts` or call codegraph_node on a specific member for its body.\n### Trail — codegraph_node any of these to follow it (no Read needed)\n**Called by ←** app.ts (src/app.ts:1)"
+        }
+      ]
+    }
+  }
+}

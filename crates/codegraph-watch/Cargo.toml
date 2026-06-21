@@ -1,0 +1,23 @@
+[package]
+name = "codegraph-watch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+description = "Debounced file watcher and incremental sync for CodeGraph-rs."
+readme = "../../README.md"
+
+[dependencies]
+serde = { workspace = true }
+anyhow = { workspace = true }
+notify = { workspace = true }
+rusqlite = { workspace = true }
+codegraph-core = { path = "../codegraph-core", version = "0.1.0" }
+codegraph-extract = { path = "../codegraph-extract", version = "0.1.0" }
+codegraph-resolve = { path = "../codegraph-resolve", version = "0.1.0" }
+codegraph-store = { path = "../codegraph-store", version = "0.1.0" }
