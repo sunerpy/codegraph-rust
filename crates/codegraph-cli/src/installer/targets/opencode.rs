@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Map, Value};
 
 use super::super::shared::{
-    self, to_upstream_json, upsert_instructions_entry, write_json_file, CODEGRAPH_SECTION_END,
-    CODEGRAPH_SECTION_START,
+    self, parse_json_object, read_config_file, to_upstream_json, upsert_instructions_entry,
+    write_json_file, ConfigRead, CODEGRAPH_SECTION_END, CODEGRAPH_SECTION_START,
 };
 use super::super::types::{
     AgentTarget, DetectionResult, FileAction, FileWrite, InstallContext, InstallOptions, Location,
@@ -90,13 +90,7 @@ fn opencode_server_entry() -> Value {
 }
 
 fn parse_config(text: &str) -> Map<String, Value> {
-    if text.trim().is_empty() {
-        return Map::new();
-    }
-    match serde_json::from_str::<Value>(text) {
-        Ok(Value::Object(map)) => map,
-        _ => Map::new(),
-    }
+    parse_json_object(text).unwrap_or_default()
 }
 
 impl AgentTarget for OpencodeTarget {
@@ -169,8 +163,16 @@ impl AgentTarget for OpencodeTarget {
 fn write_mcp_entry(ctx: &InstallContext, loc: Location) -> FileWrite {
     let file = config_path(ctx, loc);
     let existed = file.exists();
-    let text = fs::read_to_string(&file).unwrap_or_default();
-    let mut config = parse_config(&text);
+    let mut config = match read_config_file(&file) {
+        ConfigRead::Missing => Map::new(),
+        ConfigRead::Parsed(map) => map,
+        ConfigRead::Unparseable => {
+            return FileWrite {
+                path: file,
+                action: FileAction::Skipped,
+            };
+        }
+    };
     let before = config.get("mcp").and_then(|m| m.get("codegraph"));
     let after = opencode_server_entry();
     if before == Some(&after) {

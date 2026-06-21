@@ -54,20 +54,153 @@ pub fn codegraph_permissions() -> Vec<&'static str> {
     ]
 }
 
-/// Read a JSON file, returning `{}` when missing or unparseable. Ports
-/// `readJsonFile` (shared.ts:57): an unparseable file is backed up to
-/// `<path>.backup` before returning empty.
-pub fn read_json_file(path: &Path) -> Map<String, Value> {
-    let Ok(text) = fs::read_to_string(path) else {
-        return Map::new();
-    };
-    match serde_json::from_str::<Value>(&text) {
-        Ok(Value::Object(map)) => map,
-        Ok(_) => Map::new(),
-        Err(_) => {
-            let _ = fs::copy(path, path.with_extension("backup"));
-            Map::new()
+/// Data-safety invariant: a missing file is safe to treat as empty (fresh
+/// install), but an existing-yet-unparseable file must NEVER become `{}` — that
+/// empty map, written back, destroys the user's real config. Write paths abort
+/// on `Unparseable`.
+pub enum ConfigRead {
+    Missing,
+    Parsed(Map<String, Value>),
+    Unparseable,
+}
+
+/// Strip `//` line comments and `/* */` block comments from JSONC, preserving
+/// anything inside string literals (so `"a//b"` and `"a/*b*/c"` survive). Also
+/// drops a single trailing comma before `}`/`]`. Pure string transform — no I/O.
+fn strip_jsonc(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            out.push(b as char);
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
         }
+        if b == b'"' {
+            in_string = true;
+            out.push('"');
+            i += 1;
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i += 2;
+            continue;
+        }
+        out.push(b as char);
+        i += 1;
+    }
+    drop_trailing_commas(&out)
+}
+
+/// Remove `,` that is immediately followed (ignoring whitespace) by `}` or `]`.
+/// Runs on comment-stripped text, so it never sees commas inside comments;
+/// commas inside strings are guarded by tracking string state.
+fn drop_trailing_commas(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            out.push(b as char);
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_string = true;
+            out.push('"');
+            i += 1;
+            continue;
+        }
+        if b == b',' {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && (bytes[j] == b'}' || bytes[j] == b']') {
+                i += 1;
+                continue;
+            }
+        }
+        out.push(b as char);
+        i += 1;
+    }
+    out
+}
+
+/// Parse JSON, then JSONC (comments / trailing commas) as a fallback. Returns the
+/// top-level object map, or `None` if neither parse yields a JSON object.
+pub fn parse_json_object(text: &str) -> Option<Map<String, Value>> {
+    if text.trim().is_empty() {
+        return Some(Map::new());
+    }
+    if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(text) {
+        return Some(map);
+    }
+    match serde_json::from_str::<Value>(&strip_jsonc(text)) {
+        Ok(Value::Object(map)) => Some(map),
+        _ => None,
+    }
+}
+
+/// Read an agent config file, distinguishing missing / parsed / unparseable.
+///
+/// Tolerates JSONC (comments + trailing commas). A present-but-unparseable file
+/// is backed up to `<path>.backup` and reported as [`ConfigRead::Unparseable`]
+/// WITHOUT being modified, so the caller can skip writing instead of clobbering
+/// the user's config.
+pub fn read_config_file(path: &Path) -> ConfigRead {
+    let Ok(text) = fs::read_to_string(path) else {
+        return ConfigRead::Missing;
+    };
+    match parse_json_object(&text) {
+        Some(map) => ConfigRead::Parsed(map),
+        None => {
+            let _ = fs::copy(path, path.with_extension("backup"));
+            ConfigRead::Unparseable
+        }
+    }
+}
+
+/// Read a JSON/JSONC file into a map. Backward-compatible helper that maps
+/// [`ConfigRead::Missing`] to `{}`. Callers on the WRITE path must NOT use this
+/// (it cannot signal the unparseable case); use [`read_config_file`] and abort
+/// on [`ConfigRead::Unparseable`] there.
+pub fn read_json_file(path: &Path) -> Map<String, Value> {
+    match read_config_file(path) {
+        ConfigRead::Parsed(map) => map,
+        ConfigRead::Missing | ConfigRead::Unparseable => Map::new(),
     }
 }
 
@@ -314,4 +447,74 @@ fn find_next_table_header(content: &str, from: usize) -> usize {
         }
     }
     content.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_jsonc_with_line_and_block_comments() {
+        let text = r#"{
+            // a line comment
+            "a": 1, /* inline */
+            "b": "keep // and /* */ inside string"
+        }"#;
+        let map = parse_json_object(text).expect("JSONC must parse");
+        assert_eq!(map.get("a"), Some(&serde_json::json!(1)));
+        assert_eq!(
+            map.get("b"),
+            Some(&serde_json::json!("keep // and /* */ inside string"))
+        );
+    }
+
+    #[test]
+    fn parses_jsonc_with_trailing_commas() {
+        let map = parse_json_object("{ \"a\": [1, 2,], \"b\": 3, }").expect("trailing commas ok");
+        assert_eq!(map.get("a"), Some(&serde_json::json!([1, 2])));
+        assert_eq!(map.get("b"), Some(&serde_json::json!(3)));
+    }
+
+    #[test]
+    fn truly_corrupt_text_is_unparseable() {
+        assert!(parse_json_object("{ this is not json").is_none());
+    }
+
+    #[test]
+    fn read_outcome_missing_parsed_unparseable() {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-shared-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let missing = dir.join("missing.json");
+        assert!(matches!(read_config_file(&missing), ConfigRead::Missing));
+
+        let jsonc = dir.join("config.jsonc");
+        fs::write(&jsonc, "{\n  // c\n  \"x\": 1,\n}\n").unwrap();
+        match read_config_file(&jsonc) {
+            ConfigRead::Parsed(map) => assert_eq!(map.get("x"), Some(&serde_json::json!(1))),
+            other => panic!("expected Parsed, got {:?}", std::mem::discriminant(&other)),
+        }
+
+        let corrupt = dir.join("corrupt.json");
+        let raw = "{ broken not json";
+        fs::write(&corrupt, raw).unwrap();
+        assert!(matches!(
+            read_config_file(&corrupt),
+            ConfigRead::Unparseable
+        ));
+        assert_eq!(
+            fs::read_to_string(&corrupt).unwrap(),
+            raw,
+            "unparseable file must be left byte-for-byte unchanged"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
