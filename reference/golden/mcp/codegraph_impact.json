@@ -1,0 +1,27 @@
+{
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 7,
+    "method": "tools/call",
+    "params": {
+      "name": "codegraph_impact",
+      "arguments": {
+        "symbol": "add",
+        "depth": 2,
+        "projectPath": "/tmp/cg-mcp-golden"
+      }
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 7,
+    "result": {
+      "content": [
+        {
+          "type": "text",
+          "text": "## Impact: \"add\" affects 4 symbols\n\n**src/math.ts:**\nadd:1, increment:8\n\n**src/app.ts:**\nrunDemo:3, app.ts:1\n"
+        }
+      ]
+    }
+  }
+}

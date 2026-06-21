@@ -1,0 +1,25 @@
+{
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 3,
+    "method": "tools/call",
+    "params": {
+      "name": "codegraph_status",
+      "arguments": {
+        "projectPath": "/tmp/cg-mcp-golden"
+      }
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 3,
+    "result": {
+      "content": [
+        {
+          "type": "text",
+          "text": "## CodeGraph Status\n\n**Files indexed:** 3\n**Total nodes:** 13\n**Total edges:** 21\n**Database size:** 0.14 MB\n**Backend:** node:sqlite (Node built-in) — full WAL + FTS5\n**Journal mode:** wal (concurrent reads safe)\n\n### Nodes by Kind:\n- class: 2\n- file: 3\n- function: 3\n- import: 1\n- method: 3\n- property: 1\n\n### Languages:\n- python: 1\n- typescript: 2"
+        }
+      ]
+    }
+  }
+}

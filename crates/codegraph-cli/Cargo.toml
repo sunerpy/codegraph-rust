@@ -1,0 +1,38 @@
+[package]
+name = "codegraph-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+description = "CodeGraph-rs: a deterministic tree-sitter + SQLite/FTS5 code knowledge graph CLI and MCP server."
+readme = "../../README.md"
+
+[[bin]]
+name = "codegraph"
+path = "src/main.rs"
+
+[dependencies]
+codegraph-core = { path = "../codegraph-core", version = "0.1.0" }
+codegraph-daemon = { path = "../codegraph-daemon", version = "0.1.0" }
+codegraph-extract = { path = "../codegraph-extract", version = "0.1.0" }
+codegraph-graph = { path = "../codegraph-graph", version = "0.1.0" }
+codegraph-mcp = { path = "../codegraph-mcp", version = "0.1.0" }
+codegraph-resolve = { path = "../codegraph-resolve", version = "0.1.0" }
+codegraph-store = { path = "../codegraph-store", version = "0.1.0" }
+codegraph-watch = { path = "../codegraph-watch", version = "0.1.0" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+time = { workspace = true }
+
+[dev-dependencies]
+codegraph-bench = { path = "../codegraph-bench" }

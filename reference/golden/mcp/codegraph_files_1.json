@@ -1,0 +1,26 @@
+{
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 11,
+    "method": "tools/call",
+    "params": {
+      "name": "codegraph_files",
+      "arguments": {
+        "format": "flat",
+        "projectPath": "/tmp/cg-mcp-golden"
+      }
+    }
+  },
+  "response": {
+    "jsonrpc": "2.0",
+    "id": 11,
+    "result": {
+      "content": [
+        {
+          "type": "text",
+          "text": "## Files (3)\n\n- src/app.ts (typescript, 3 symbols)\n- src/math.ts (typescript, 5 symbols)\n- tools/greeter.py (python, 5 symbols)"
+        }
+      ]
+    }
+  }
+}

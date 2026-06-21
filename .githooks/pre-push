@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+#
+# pre-push hook — push-time quality gate
+#
+# Runs ONLY on `git push`, never on `git commit`: commit freely to save WIP;
+# the full gate runs only when you actually push.
+#
+# The checks mirror .github/workflows/ci.yml exactly, so "local pre-push green"
+# implies "CI will be green":
+#   1. cargo fmt --all --check        (rustfmt)
+#   2. cargo clippy ... -D warnings    (lint, warnings are errors)
+#   3. cargo test --workspace          (incl. golden oracle + sync equivalence)
+#   4. scripts/guardrail.sh            (no AI / vector / LLM crates)
+#
+# Enable once per clone:
+#   make hooks            # == git config core.hooksPath .githooks
+#
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+echo "==> [pre-push] running push gate (fmt → clippy → test → guardrail)..."
+
+echo "==> [1/4] cargo fmt --all --check"
+if ! cargo fmt --all --check; then
+    echo "" >&2
+    echo "❌ Format check failed. Run 'cargo fmt --all' (and 'make fmt' for docs)," >&2
+    echo "   commit the result, then push again. Push aborted." >&2
+    exit 1
+fi
+
+echo "==> [2/4] cargo clippy --workspace --all-targets -- -D warnings"
+if ! cargo clippy --workspace --all-targets -- -D warnings; then
+    echo "" >&2
+    echo "❌ Clippy failed (warnings are denied). Fix the lints above and push again." >&2
+    echo "   Push aborted." >&2
+    exit 1
+fi
+
+echo "==> [3/4] cargo test --workspace"
+if ! cargo test --workspace; then
+    echo "" >&2
+    echo "❌ Tests failed. Fix the failing tests above and push again. Push aborted." >&2
+    exit 1
+fi
+
+echo "==> [4/4] scripts/guardrail.sh (no AI/vector/LLM crates)"
+if ! bash scripts/guardrail.sh; then
+    echo "" >&2
+    echo "❌ Scope guardrail failed: a forbidden AI/vector/LLM crate was detected." >&2
+    echo "   This project is deterministic and ML-free by design. Push aborted." >&2
+    exit 1
+fi
+
+echo "==> [pre-push] ✅ all checks passed, push allowed."
+exit 0
