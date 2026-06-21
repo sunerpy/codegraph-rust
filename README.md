@@ -158,10 +158,13 @@ put the `codegraph` binary on your `PATH`. Assets are named
 | Linux    | aarch64 (static, musl)  | `aarch64-unknown-linux-musl` |
 | macOS    | x86_64                  | `x86_64-apple-darwin`        |
 | macOS    | aarch64 (Apple Silicon) | `aarch64-apple-darwin`       |
-| Windows  | x86_64                  | `x86_64-pc-windows-msvc`     |
 
 The Linux builds are statically linked against musl, so they run on any
-distribution with no glibc/SQLite system dependency.
+distribution with no glibc/SQLite system dependency. Prebuilt binaries target
+Linux and macOS only; the per-project daemon is Unix-socket based, so Windows is
+not a prebuilt target yet — on Windows, build from source with
+`cargo install codegraph-rs` (the CLI and MCP server work; the background daemon
+does not).
 
 ### From source
 

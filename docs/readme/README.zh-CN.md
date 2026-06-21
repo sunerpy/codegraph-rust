@@ -136,15 +136,17 @@ codegraph --version
 压缩包，解压后把 `codegraph` 放到 `PATH`。产物命名为
 `codegraph-<version>-<target>.<ext>`：
 
-| 平台    | 架构                    | target                       |
-| ------- | ----------------------- | ---------------------------- |
-| Linux   | x86_64（静态 musl）     | `x86_64-unknown-linux-musl`  |
-| Linux   | aarch64（静态 musl）    | `aarch64-unknown-linux-musl` |
-| macOS   | x86_64                  | `x86_64-apple-darwin`        |
-| macOS   | aarch64 (Apple Silicon) | `aarch64-apple-darwin`       |
-| Windows | x86_64                  | `x86_64-pc-windows-msvc`     |
+| 平台  | 架构                    | target                       |
+| ----- | ----------------------- | ---------------------------- |
+| Linux | x86_64（静态 musl）     | `x86_64-unknown-linux-musl`  |
+| Linux | aarch64（静态 musl）    | `aarch64-unknown-linux-musl` |
+| macOS | x86_64                  | `x86_64-apple-darwin`        |
+| macOS | aarch64 (Apple Silicon) | `aarch64-apple-darwin`       |
 
-Linux 版本静态链接 musl，可在任意发行版运行，无 glibc/SQLite 系统依赖。
+Linux 版本静态链接 musl，可在任意发行版运行，无 glibc/SQLite 系统依赖。预编译二进制
+仅覆盖 Linux 与 macOS；按项目守护进程基于 Unix 域套接字，故暂不提供 Windows 预编译
+——Windows 上请用 `cargo install codegraph-rs` 从源码安装（CLI 与 MCP 服务器可用，
+后台守护进程不可用）。
 
 ### 从源码构建
 

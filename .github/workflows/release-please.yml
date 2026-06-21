@@ -96,10 +96,6 @@ jobs:
             os: macos-latest
             use_zigbuild: false
             archive: tar.gz
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            use_zigbuild: false
-            archive: zip
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -147,14 +143,6 @@ jobs:
           tar -czf "dist/${BINARY_NAME}-${{ needs.release-please.outputs.version }}-${{ matrix.target }}.tar.gz" \
             -C "target/${{ matrix.target }}/release" "${BINARY_NAME}"
 
-      - name: Package (windows zip)
-        if: matrix.archive == 'zip'
-        shell: bash
-        run: |
-          mkdir -p dist
-          7z a "dist/${BINARY_NAME}-${{ needs.release-please.outputs.version }}-${{ matrix.target }}.zip" \
-            "./target/${{ matrix.target }}/release/${BINARY_NAME}.exe"
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -201,7 +189,6 @@ jobs:
           body_path: RELEASE_NOTES.md
           files: |
             dist/*.tar.gz
-            dist/*.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

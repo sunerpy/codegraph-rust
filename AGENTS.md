@@ -58,8 +58,8 @@ bash scripts/guardrail.sh
   `Security Audit` (cargo-audit) + `CI Success` gate, on push/PR to `main`.
 - **Release** (`.github/workflows/release-please.yml`): release-please opens a
   release PR; merging it cuts a `v<version>` tag and triggers the pipeline —
-  5-platform binaries (linux musl x86_64/aarch64 via cargo-zigbuild, macOS
-  x86_64/aarch64, windows x86_64), git-cliff release notes, GitHub Release
+  4-platform binaries (linux musl x86_64/aarch64 via cargo-zigbuild, macOS
+  x86_64/aarch64), git-cliff release notes, GitHub Release
   assets, and topological crates.io publish of the 9 publishable crates
   (`core → … → codegraph-rs`; `codegraph-bench` is skipped). Version bumps are
   owned by release-please via `.release-please-manifest.json` — never bump by
