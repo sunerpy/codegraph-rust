@@ -3,11 +3,18 @@
   "include-component-in-tag": false,
   "packages": {
     ".": {
-      "release-type": "rust",
+      "release-type": "simple",
       "package-name": "codegraph-rs",
       "bump-minor-pre-major": true,
       "include-v-in-tag": true,
-      "skip-changelog": true
+      "skip-changelog": true,
+      "extra-files": [
+        {
+          "type": "toml",
+          "path": "Cargo.toml",
+          "jsonpath": "$.workspace.package.version"
+        }
+      ]
     }
   }
 }
