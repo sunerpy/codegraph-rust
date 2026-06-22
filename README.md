@@ -194,7 +194,7 @@ LLM library _inside_ the codegraph binary itself.
 Core commands: `init`, `index`, `sync`, `query`, `files`, `status`, `serve`,
 `callers`, `callees`, `impact`, `affected`, `check`, `export`, `unlock`.
 
-Agent / install commands: `install`, `uninstall`, `self-update`, `completions`.
+Agent / install commands: `install`, `uninstall`, `self-update`, `completions` (`--install` sets up Tab completion for bash/zsh/fish/powershell/elvish).
 
 > **Full reference with flags:** [`docs/cli.md`](docs/cli.md)
 

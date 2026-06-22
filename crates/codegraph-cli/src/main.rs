@@ -271,6 +271,9 @@ enum Command {
     /// Generate shell completion scripts (bash, zsh, fish, powershell, elvish).
     Completions {
         shell: Shell,
+        /// Install the script to the shell's completion location instead of printing it.
+        #[arg(long)]
+        install: bool,
     },
     /// Update codegraph in place to the latest GitHub release.
     SelfUpdate {
@@ -386,10 +389,14 @@ fn run(cli: Cli) -> Result<()> {
             println!("codegraph {VERSION}");
             Ok(())
         }
-        Command::Completions { shell } => {
-            let mut cmd = Cli::command();
-            generate(shell, &mut cmd, "codegraph", &mut io::stdout());
-            Ok(())
+        Command::Completions { shell, install } => {
+            if install {
+                install_completions(shell)
+            } else {
+                let mut cmd = Cli::command();
+                generate(shell, &mut cmd, "codegraph", &mut io::stdout());
+                Ok(())
+            }
         }
         Command::SelfUpdate { check, force, tag } => cmd_self_update(check, force, tag),
     }
@@ -407,6 +414,122 @@ fn location_flag(location: Option<String>, global: bool, local: bool) -> Option<
         return Some("local".to_string());
     }
     None
+}
+
+fn generate_completion_bytes(shell: Shell) -> Vec<u8> {
+    let mut cmd = Cli::command();
+    let mut buf = Vec::new();
+    generate(shell, &mut cmd, "codegraph", &mut buf);
+    buf
+}
+
+fn env_path(key: &str) -> Option<PathBuf> {
+    std::env::var_os(key)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+fn home_dir() -> Result<PathBuf> {
+    env_path("HOME")
+        .or_else(|| env_path("USERPROFILE"))
+        .ok_or_else(|| anyhow!("cannot resolve home directory (HOME/USERPROFILE unset)"))
+}
+
+fn write_completion_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating completion directory {}", parent.display()))?;
+    }
+    fs::write(path, bytes)
+        .with_context(|| format!("writing completion script {}", path.display()))?;
+    Ok(())
+}
+
+fn completion_target(shell: Shell) -> Result<PathBuf> {
+    Ok(match shell {
+        Shell::Bash => {
+            let base = env_path("XDG_DATA_HOME")
+                .unwrap_or_else(|| home_dir().unwrap_or_default().join(".local/share"));
+            base.join("bash-completion/completions/codegraph")
+        }
+        Shell::Zsh => home_dir()?.join(".zfunc/_codegraph"),
+        Shell::Fish => home_dir()?.join(".config/fish/completions/codegraph.fish"),
+        Shell::PowerShell => {
+            let base = env_path("LOCALAPPDATA")
+                .unwrap_or_else(|| home_dir().unwrap_or_default().join(".local/share"));
+            base.join("codegraph/completion.ps1")
+        }
+        Shell::Elvish => home_dir()?.join(".config/codegraph/completion.elv"),
+        _ => bail!("unsupported shell for --install"),
+    })
+}
+
+fn powershell_profile_path() -> Result<PathBuf> {
+    if let Some(p) = env_path("CODEGRAPH_PS_PROFILE") {
+        return Ok(p);
+    }
+    let user = env_path("USERPROFILE").or_else(|| env_path("HOME")).ok_or_else(|| {
+        anyhow!("cannot resolve PowerShell profile (set CODEGRAPH_PS_PROFILE, USERPROFILE, or HOME)")
+    })?;
+    Ok(user.join("Documents/WindowsPowerShell/Microsoft.PowerShell_profile.ps1"))
+}
+
+fn append_dot_source_once(profile: &Path, script: &Path) -> Result<bool> {
+    let line = format!(". \"{}\"", script.display());
+    let existing = fs::read_to_string(profile).unwrap_or_default();
+    if existing.lines().any(|l| l.trim() == line) {
+        return Ok(false);
+    }
+    if let Some(parent) = profile.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating profile directory {}", parent.display()))?;
+    }
+    let mut prefix = String::new();
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        prefix.push('\n');
+    }
+    fs::write(profile, format!("{existing}{prefix}{line}\n"))
+        .with_context(|| format!("appending dot-source line to {}", profile.display()))?;
+    Ok(true)
+}
+
+fn install_completions(shell: Shell) -> Result<()> {
+    let target = completion_target(shell)?;
+    let bytes = generate_completion_bytes(shell);
+    write_completion_file(&target, &bytes)?;
+    println!("Installed {shell} completions to {}", target.display());
+
+    match shell {
+        // PowerShell's `using namespace` header is legal only at file start, so write a separate file and dot-source it (never append inline to $PROFILE).
+        Shell::PowerShell => {
+            let profile = powershell_profile_path()?;
+            let added = append_dot_source_once(&profile, &target)?;
+            if added {
+                println!("Added dot-source line to {}", profile.display());
+            } else {
+                println!(
+                    "Profile already sources the completion script: {}",
+                    profile.display()
+                );
+            }
+            println!("Restart your shell (or run `. $PROFILE`) to load completions.");
+            println!("Press Ctrl+Space to trigger menu completion (Set-PSReadLineKeyHandler -Key Tab -Function MenuComplete).");
+        }
+        Shell::Zsh => {
+            println!("Add `fpath+=~/.zfunc` before `compinit` in your ~/.zshrc if it is not already there.");
+            println!("Restart your shell to load completions.");
+        }
+        Shell::Elvish => {
+            println!(
+                "Add `eval (slurp < {})` to your ~/.config/elvish/rc.elv to load completions.",
+                target.display()
+            );
+        }
+        _ => {
+            println!("Restart your shell to load completions.");
+        }
+    }
+    Ok(())
 }
 
 fn cmd_self_update(check: bool, force: bool, tag: Option<String>) -> Result<()> {

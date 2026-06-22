@@ -192,6 +192,46 @@ python examples/llm_orchestration.py --repo . --query "how does indexing work"
 
 ---
 
+## Shell 补全（Tab Completion）
+
+使用 `--install` 一键安装，写入对应 shell 的标准位置，**幂等**（重复执行安全）：
+
+```bash
+codegraph completions bash --install        # Bash
+codegraph completions zsh --install         # Zsh
+codegraph completions fish --install        # Fish
+codegraph completions powershell --install  # PowerShell
+codegraph completions elvish --install      # Elvish
+```
+
+不加 `--install` 则输出到 stdout，可自行重定向。
+
+**各 shell 安装位置：**
+
+| Shell      | 写入路径                                                                 | 是否需要手动配置 rc                                  |
+| ---------- | ------------------------------------------------------------------------ | ---------------------------------------------------- |
+| bash       | `${XDG_DATA_HOME:-~/.local/share}/bash-completion/completions/codegraph` | 否，bash-completion 包自动加载                       |
+| zsh        | `~/.zfunc/_codegraph`                                                    | 需在 `~/.zshrc` 的 `compinit` 前加 `fpath+=~/.zfunc` |
+| fish       | `~/.config/fish/completions/codegraph.fish`                              | 否，fish 自动加载                                    |
+| powershell | `%LOCALAPPDATA%\codegraph\completion.ps1`（独立文件）                    | 自动在 `$PROFILE` 中追加一行 dot-source（幂等）      |
+| elvish     | `~/.config/codegraph/completion.elv`                                     | 需在 `rc.elv` 中加 `eval (slurp < <path>)`           |
+
+**PowerShell 说明：** clap_complete 生成的脚本以 `using namespace ...` 开头，
+PowerShell 要求 `using` 必须在脚本的最开始。若直接追加到非空的 `$PROFILE`，会
+报 `UsingMustBeAtStartOfScript` 错误。`--install` 通过写入独立的 `.ps1` 文件
+（`using` 在文件开头合法），再在 `$PROFILE` 追加一行 dot-source 来规避此问题。
+
+**PowerShell Tab 补全提示：** 默认 Tab 逐个循环候选项。按 `Ctrl+Space` 可弹出
+菜单列表；或在 `$PROFILE` 中加：
+
+```powershell
+Set-PSReadLineKeyHandler -Key Tab -Function MenuComplete
+```
+
+完整的各 shell 手动安装步骤见 [`../cli.md`](../cli.md)。
+
+---
+
 ## CodeGraph 的能力范围
 
 **做什么：** 确定性代码结构提取，支持约 28 种语言（TypeScript、Python、Go、Rust、
