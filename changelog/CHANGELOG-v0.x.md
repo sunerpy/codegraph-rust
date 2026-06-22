@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.3](https://github.com/sunerpy/codegraph-rust/compare/v0.5.2...v0.5.3) (2026-06-22)
+
+
+### Bug Fixes
+
+* **deps:** bump quinn-proto to 0.11.15 for RUSTSEC-2026-0185 ([c6a1c4c](https://github.com/sunerpy/codegraph-rust/commit/c6a1c4c53f5a2ba899e3dd9813b392e4dea6681b))
+
 ## [0.5.2](https://github.com/sunerpy/codegraph-rust/compare/v0.5.1...v0.5.2) (2026-06-22)
 
 
