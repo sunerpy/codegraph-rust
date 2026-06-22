@@ -399,7 +399,7 @@ golden byte-stable output.
   layer — see above).
 - No semantic search; search is FTS5 + deterministic scoring only.
 - Concrete `FrameworkResolver`s exist for React/Vue/NestJS; other framework
-  resolution is deferred (see [`KNOWN_DIFFS.md`](KNOWN_DIFFS.md)).
+  resolution is deferred.
 - No languages beyond the fixed `LANGUAGES` set.
 
 ---
