@@ -266,6 +266,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "clap_complete"
+version = "4.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0a7a9bfdb35811f9e59832f0f05975114d2251b415fb534108e6f34060fd772"
+dependencies = [
+ "clap",
+]
+
+[[package]]
 name = "clap_derive"
 version = "4.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -285,7 +294,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "codegraph-bench"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -300,7 +309,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -316,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-daemon"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -333,7 +342,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-extract"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -373,7 +382,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-graph"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -385,7 +394,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-mcp"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -401,7 +410,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-resolve"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -414,12 +423,13 @@ dependencies = [
 
 [[package]]
 name = "codegraph-rs"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
  "assert_fs",
  "clap",
+ "clap_complete",
  "codegraph-bench",
  "codegraph-core",
  "codegraph-daemon",
@@ -443,7 +453,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-store"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -455,7 +465,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-watch"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "codegraph-core",

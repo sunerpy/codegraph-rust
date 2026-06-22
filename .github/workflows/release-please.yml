@@ -33,6 +33,13 @@ jobs:
   # ----------------------------------------------------------------
   # release-please: open/maintain the release PR; on merge, cut a tag
   # and emit outputs that gate the heavy jobs below.
+  #
+  # The GitHub Release is created as a DRAFT (draft: true in
+  # release-please-config.json) with the git tag forced into existence
+  # immediately (force-tag-creation: true) so the build/upload jobs can
+  # check out the tag. The release is flipped to published (draft=false)
+  # only by the final publish-release job, after all builds + asset
+  # uploads succeed — closing the old zero/partial-asset public window.
   # ----------------------------------------------------------------
   release-please:
     name: Release Please
@@ -97,6 +104,10 @@ jobs:
             archive: tar.gz
           - target: x86_64-pc-windows-msvc
             os: windows-latest
+            use_zigbuild: false
+            archive: zip
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
             use_zigbuild: false
             archive: zip
     steps:
@@ -164,7 +175,10 @@ jobs:
 
   # ----------------------------------------------------------------
   # upload-assets: gather all artifacts, render release notes with
-  # git-cliff, and attach binaries to the GitHub Release.
+  # git-cliff, and attach binaries to the (still-DRAFT) GitHub Release.
+  # release-please created the Release as a draft (release-please-config.json
+  # "draft": true), so the softprops step keeps draft:true here — it only
+  # updates the draft with notes + assets, it must NOT publish.
   # ----------------------------------------------------------------
   upload-assets:
     name: Upload Release Assets
@@ -199,8 +213,42 @@ jobs:
         with:
           tag_name: ${{ needs.release-please.outputs.tag_name }}
           body_path: RELEASE_NOTES.md
+          # Keep the release a DRAFT while attaching assets; the dedicated
+          # publish-release job below flips it to published only on full success.
+          draft: true
           files: |
             dist/*.tar.gz
             dist/*.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ----------------------------------------------------------------
+  # publish-release: flip the draft Release to PUBLISHED (draft=false) and
+  # mark it "latest" — but ONLY after every build-binaries matrix job AND
+  # upload-assets succeeded.
+  #
+  # WHY (draft-until-all-green): release-please creates the Release as a DRAFT
+  # (config "draft": true) and the tag immediately (config "force-tag-creation":
+  # true). Without this gate the Release would be PUBLIC the instant release-please
+  # ran — i.e. before any binary was built — leaving a window where a public
+  # "latest" Release has zero/partial assets if a build later fails. By deferring
+  # publication to this terminal job, a failed build leaves a *visible draft*
+  # (observable failure) instead of a broken public release. The default `needs`
+  # semantics require all listed jobs to succeed, so this job only runs on a fully
+  # green build+upload; otherwise the Release stays a draft.
+  # ----------------------------------------------------------------
+  publish-release:
+    name: Publish Release
+    needs: [release-please, build-binaries, upload-assets]
+    if: needs.release-please.outputs.build_artifacts == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Publish the draft Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit "${{ needs.release-please.outputs.tag_name }}" \
+            --repo "${{ github.repository }}" \
+            --draft=false \
+            --latest

@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{generate, Shell};
 use codegraph_core::config::init_config;
 use codegraph_core::logger::{init_logger, LoggerConfig};
 use codegraph_core::node_id::hash_content;
@@ -95,6 +96,7 @@ impl Cli {
             Command::Install { .. }
             | Command::Uninstall { .. }
             | Command::Version
+            | Command::Completions { .. }
             | Command::SelfUpdate { .. } => None,
         };
         let start = absolute_path(raw.unwrap_or_else(|| PathBuf::from(".")));
@@ -266,6 +268,10 @@ enum Command {
     },
     /// Print the codegraph version.
     Version,
+    /// Generate shell completion scripts (bash, zsh, fish, powershell, elvish).
+    Completions {
+        shell: Shell,
+    },
     /// Update codegraph in place to the latest GitHub release.
     SelfUpdate {
         /// Check for a newer release without installing it.
@@ -378,6 +384,11 @@ fn run(cli: Cli) -> Result<()> {
         }),
         Command::Version => {
             println!("codegraph {VERSION}");
+            Ok(())
+        }
+        Command::Completions { shell } => {
+            let mut cmd = Cli::command();
+            generate(shell, &mut cmd, "codegraph", &mut io::stdout());
             Ok(())
         }
         Command::SelfUpdate { check, force, tag } => cmd_self_update(check, force, tag),
