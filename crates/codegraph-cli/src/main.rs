@@ -805,7 +805,11 @@ fn cmd_files(
 }
 
 fn cmd_serve(path: Option<PathBuf>, mcp: bool, no_watch: bool) -> Result<()> {
-    let project = path.map(|p| resolve_project_path_optional(&absolute_path(p)));
+    // Default the MCP project to cwd so `serve --mcp` (no --path, as the
+    // installer injects) finds the index of the agent's project root.
+    let project = Some(resolve_project_path_optional(&absolute_path(
+        path.unwrap_or_else(|| PathBuf::from(".")),
+    )));
     if no_watch {
         std::env::set_var("CODEGRAPH_NO_WATCH", "1");
     }
