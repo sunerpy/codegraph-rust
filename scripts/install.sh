@@ -1,7 +1,7 @@
 #!/bin/sh
 # codegraph one-liner installer (Linux / macOS).
 #
-#   curl -fsSL https://raw.githubusercontent.com/sunerpy/codegraph-rust/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/sunerpy/codegraph-rust/main/scripts/install.sh | sh
 #
 # Env overrides:
 #   CODEGRAPH_VERSION      pin a release (e.g. 0.4.0 or v0.4.0); default: latest

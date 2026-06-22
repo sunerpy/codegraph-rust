@@ -4,7 +4,7 @@
     codegraph one-liner installer (Windows, PowerShell 5.1+).
 
 .DESCRIPTION
-    irm https://raw.githubusercontent.com/sunerpy/codegraph-rust/main/install.ps1 | iex
+    irm https://raw.githubusercontent.com/sunerpy/codegraph-rust/main/scripts/install.ps1 | iex
 
     Env overrides:
       CODEGRAPH_VERSION      pin a release (e.g. 0.4.0 or v0.4.0); default: latest
