@@ -58,6 +58,7 @@ rustix = { version = "0.38", features = ["process"] }
 
 # CLI
 clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
 
 # JSONC config editing (preserve comments + key order on agent config writes)
 jsonc-parser = { version = "0.26", features = ["cst", "serde"] }
