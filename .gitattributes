@@ -1,0 +1,54 @@
+# Cross-platform byte-stability for codegraph-rs.
+#
+# The project's HARD INVARIANT is deterministic, byte-stable node-id / golden
+# output. node-id content hashes (codegraph-core::node_id::hash_content) SHA-256
+# the RAW bytes of source/fixture files, several of which are embedded at compile
+# time via include_str!. On Windows, git's default core.autocrlf=true would check
+# those text files out with CRLF, changing the bytes -> changing the SHA-256 ->
+# silently breaking the invariant. Force LF on every hashed / golden-compared
+# input so the bytes are identical on all platforms, and mark binary artifacts so
+# git never line-ending-normalizes them.
+
+# Default: detect text vs binary, and normalize all text to LF in the working
+# tree on every platform (overrides core.autocrlf=true on Windows).
+* text=auto eol=lf
+
+# --- Hashed fixtures (include_str! inputs) and golden artifacts: force LF ---
+crates/codegraph-bench/fixtures/** text eol=lf
+reference/golden/**               text eol=lf
+
+# include_str! corpus used by the MCP schema tests / runtime payload.
+crates/codegraph-mcp/src/tools_list.json text eol=lf
+
+# --- Source / golden text types: force LF broadly to be safe ---
+*.ts   text eol=lf
+*.tsx  text eol=lf
+*.js   text eol=lf
+*.jsx  text eol=lf
+*.py   text eol=lf
+*.json text eol=lf
+*.sql  text eol=lf
+*.rs   text eol=lf
+*.md   text eol=lf
+*.toml text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+
+# --- Binary artifacts: never let git touch these bytes ---
+reference/golden/**/*.db     binary
+reference/golden/**/*.db-shm binary
+reference/golden/**/*.db-wal binary
+*.db     binary
+*.db-shm binary
+*.db-wal binary
+*.sqlite binary
+*.sqlite3 binary
+*.tar.gz binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.webp binary
+*.ico  binary
+*.pdf  binary
+*.zip  binary
