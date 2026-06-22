@@ -157,6 +157,9 @@ fn effectively_empty(content: &str) -> bool {
         .all(|line| line.is_empty() || line.starts_with("#!"))
 }
 
+// `file` is only consumed by the Unix `set_mode` path; on Windows the cfg block
+// is compiled out, so the parameter is intentionally unused there.
+#[cfg_attr(not(unix), allow(unused_variables))]
 fn chmod_executable(file: &Path) {
     #[cfg(unix)]
     {

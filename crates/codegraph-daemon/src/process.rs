@@ -1,7 +1,3 @@
-use std::fs;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
-
 #[derive(Clone, Debug)]
 pub struct SupervisionState {
     pub original_ppid: u32,
@@ -15,6 +11,11 @@ where
 {
     // Port of upstream mcp/ppid-watchdog.ts:48-61: POSIX orphaning
     // is detected by ppid divergence; a known host pid is also liveness-polled.
+    //
+    // Windows has no stable getppid (`current_ppid()` returns 0), so the ppid
+    // branch is unix-only: comparing a real `original_ppid` against 0 there
+    // would self-kill the daemon on its first watchdog tick (audit BUG #5/#8).
+    #[cfg(unix)]
     if state.current_ppid != state.original_ppid {
         return Some(format!(
             "ppid {} -> {}",
@@ -29,35 +30,67 @@ where
     None
 }
 
+#[cfg(unix)]
 pub fn current_ppid() -> u32 {
-    parse_ppid_from_proc().unwrap_or(0)
+    rustix::process::getppid().map_or(0, |pid| pid.as_raw_nonzero().get() as u32)
 }
 
+#[cfg(unix)]
 pub fn is_process_alive(pid: u32) -> bool {
+    let Ok(raw) = i32::try_from(pid) else {
+        return false;
+    };
+    let Some(pid) = rustix::process::Pid::from_raw(raw) else {
+        return false;
+    };
+    // signal-0 liveness: ESRCH means gone; EPERM (or Ok) means the pid exists.
+    !matches!(
+        rustix::process::test_kill_process(pid),
+        Err(rustix::io::Errno::SRCH)
+    )
+}
+
+// Windows has no stable getppid; returning 0 makes the ppid-divergence branch
+// inert (it is `#[cfg(unix)]`-gated anyway — see `supervision_lost_reason`).
+#[cfg(windows)]
+pub fn current_ppid() -> u32 {
+    0
+}
+
+#[cfg(windows)]
+pub fn is_process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_ACCESS_DENIED, FALSE, STILL_ACTIVE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
     if pid == 0 {
         return false;
     }
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
 
-fn parse_ppid_from_proc() -> Option<u32> {
-    let stat = fs::read_to_string(PathBuf::from("/proc/self/stat")).ok()?;
-    let after_name = stat.rsplit_once(") ")?.1;
-    let mut fields = after_name.split_whitespace();
-    let _state = fields.next()?;
-    fields.next()?.parse().ok()
+    // SAFETY: OpenProcess/GetExitCodeProcess/CloseHandle are FFI calls with no
+    // Rust-side aliasing; `code` is a stack local we only read after a TRUE
+    // return. A null handle means we could not open the process: ACCESS_DENIED
+    // proves it exists (treat as alive); any other error means it is gone.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if handle == 0 {
+            return GetLastError() == ERROR_ACCESS_DENIED;
+        }
+        let mut code: u32 = 0;
+        let got = GetExitCodeProcess(handle, &mut code);
+        CloseHandle(handle);
+        got != FALSE && code == STILL_ACTIVE as u32
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn supervision_detects_ppid_change() {
         let state = SupervisionState {

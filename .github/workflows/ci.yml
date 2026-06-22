@@ -42,8 +42,35 @@ jobs:
       - name: Run tests (incl. golden oracle + sync equivalence)
         run: cargo test --workspace
 
+      # Windows cross-check is intentionally omitted on Ubuntu: target C deps
+      # (tree-sitter/libsqlite3-sys/ring) require MSVC tooling. Runtime
+      # correctness is gated by the native windows-latest job below.
+
       - name: Scope guardrail (no AI / vector / LLM crates)
         run: bash scripts/guardrail.sh
+
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy lint
+        # codegraph-bench is a Unix-only dev harness (publish=false); excluded from the Windows job.
+        run: cargo clippy --workspace --exclude codegraph-bench --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --exclude codegraph-bench
 
   audit:
     name: Security Audit
@@ -62,11 +89,11 @@ jobs:
     name: CI Success
     runs-on: ubuntu-latest
     if: always()
-    needs: [test, audit]
+    needs: [test, audit, windows]
     steps:
       - name: Check job status
         run: |
-          if [[ "${{ needs.test.result }}" == "failure" || "${{ needs.audit.result }}" == "failure" ]]; then
+          if [[ "${{ needs.test.result }}" == "failure" || "${{ needs.audit.result }}" == "failure" || "${{ needs.windows.result }}" == "failure" ]]; then
             echo "❌ CI failed"
             exit 1
           fi

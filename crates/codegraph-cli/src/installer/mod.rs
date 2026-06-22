@@ -288,12 +288,12 @@ fn report_write_result(display_name: &str, ctx: &InstallContext, result: &WriteR
 
 /// Replace the home prefix with `~/`. Ports tildify (index.ts:437).
 fn tildify(ctx: &InstallContext, path: &std::path::Path) -> String {
-    let home = ctx.home.to_string_lossy();
-    let p = path.to_string_lossy();
-    if let Some(rest) = p.strip_prefix(&format!("{home}/")) {
-        return format!("~/{rest}");
+    if let Ok(rest) = path.strip_prefix(&ctx.home) {
+        // Display the home-relative tail POSIX-style (`~/...`) on every platform,
+        // so Windows backslash separators render identically to Unix.
+        return format!("~/{}", rest.to_string_lossy().replace('\\', "/"));
     }
-    p.to_string()
+    path.to_string_lossy().into_owned()
 }
 
 #[cfg(test)]

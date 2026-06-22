@@ -25,6 +25,8 @@ clap = { workspace = true }
 rusqlite = { workspace = true }
 codegraph-core = { path = "../codegraph-core" }
 codegraph-extract = { path = "../codegraph-extract" }
+
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]

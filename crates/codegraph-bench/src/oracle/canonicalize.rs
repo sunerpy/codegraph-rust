@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::path::{Component, Path};
-use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
@@ -168,19 +167,48 @@ fn canonical_files(conn: &Connection) -> Result<Vec<CanonicalRow>> {
 }
 
 fn sqlite_schema(db_path: &Path) -> Result<String> {
-    let output = Command::new("sqlite3")
-        .arg(db_path)
-        .arg(".schema")
-        .output()
-        .with_context(|| format!("running sqlite3 .schema for {}", db_path.display()))?;
-    if !output.status.success() {
-        bail!(
-            "sqlite3 .schema failed for {}\nstderr:\n{}",
-            db_path.display(),
-            String::from_utf8_lossy(&output.stderr)
-        );
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("opening {} for schema dump", db_path.display()))?;
+    Ok(normalize_schema(&schema_dump(&conn)?))
+}
+
+// Byte-equivalent to `sqlite3 .schema`: rowid order, and the `/* name(cols) */`
+// comment the shell appends after each CREATE VIRTUAL TABLE (kept so the golden
+// schema string matches the old CLI path).
+fn schema_dump(conn: &Connection) -> Result<String> {
+    let mut stmt = conn.prepare(
+        "SELECT name, type, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY rowid",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut raw = String::new();
+    for (name, kind, sql) in rows {
+        raw.push_str(&sql);
+        if kind == "table" && sql.starts_with("CREATE VIRTUAL TABLE") {
+            raw.push_str(&format!(
+                "\n/* {}({}) */",
+                name,
+                virtual_table_columns(conn, &name)?
+            ));
+        }
+        raw.push_str(";\n");
     }
-    Ok(normalize_schema(&String::from_utf8(output.stdout)?))
+    Ok(raw)
+}
+
+fn virtual_table_columns(conn: &Connection, table: &str) -> Result<String> {
+    let mut stmt = conn.prepare("SELECT name FROM pragma_table_info(?1)")?;
+    let columns = stmt
+        .query_map([table], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(columns.join(","))
 }
 
 fn assert_relative_slash_path(path: &str, column: &str) -> Result<()> {

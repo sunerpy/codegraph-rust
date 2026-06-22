@@ -1,12 +1,14 @@
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use codegraph_mcp::McpServer;
+use interprocess::local_socket::traits::Stream as _;
 use serde::Serialize;
+
+use crate::transport::Stream;
 
 #[derive(Clone, Debug, Default)]
 pub struct SessionRegistry {
@@ -46,13 +48,18 @@ pub struct DaemonHello<'a> {
 }
 
 pub(crate) fn serve_session(
-    mut stream: UnixStream,
+    stream: Stream,
     project_root: PathBuf,
     socket_path: String,
     registry: SessionRegistry,
     run_mcp: bool,
 ) -> Result<()> {
     let _guard = registry.start_session();
+    // Split into independent recv/send halves: interprocess `Stream` has no
+    // `try_clone`, and an `Arc<Stream>` exposes no `Read` impl, so the reader
+    // and writer must own separate halves of the same connection.
+    let (recv, mut send) = stream.split();
+
     // Port of upstream mcp/daemon.ts:253-262: every connection gets
     // a one-line versioned daemon hello before JSON-RPC bytes are forwarded.
     let hello = DaemonHello {
@@ -61,8 +68,8 @@ pub(crate) fn serve_session(
         socket_path,
         protocol: 1,
     };
-    writeln!(stream, "{}", serde_json::to_string(&hello)?)?;
-    stream.flush()?;
+    writeln!(send, "{}", serde_json::to_string(&hello)?)?;
+    send.flush()?;
 
     if !run_mcp {
         return Ok(());
@@ -70,15 +77,13 @@ pub(crate) fn serve_session(
 
     // Port of upstream mcp/session.ts:78-115 in Rust form: one
     // session per connection, while the daemon process keeps the project store warm.
-    let reader_stream = stream.try_clone().context("cloning daemon socket")?;
-    let reader = BufReader::new(reader_stream);
+    let reader = BufReader::new(recv);
     let mut server = McpServer::new(Some(project_root));
-    server.run(reader, stream)
+    server.run(reader, send)
 }
 
-pub fn read_daemon_hello(stream: &mut UnixStream) -> Result<serde_json::Value> {
-    let reader_stream = stream.try_clone().context("cloning daemon client socket")?;
-    let mut reader = BufReader::new(reader_stream);
+pub fn read_daemon_hello(stream: &mut Stream) -> Result<serde_json::Value> {
+    let mut reader = BufReader::new(&*stream);
     let mut line = String::new();
     reader.read_line(&mut line)?;
     Ok(serde_json::from_str(line.trim())?)

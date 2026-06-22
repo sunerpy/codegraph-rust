@@ -18,11 +18,11 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use codegraph_extract::{extract_project, ExtractOptions};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::corpus::{corpus_benchmark_path, Corpus, CORPORA};
@@ -534,19 +534,48 @@ fn db_path(arm: &Path) -> PathBuf {
 }
 
 fn sqlite_schema(db: &Path) -> Result<String> {
-    let output = Command::new("sqlite3")
-        .arg(db)
-        .arg(".schema")
-        .output()
-        .with_context(|| format!("running sqlite3 .schema on {}", db.display()))?;
-    if !output.status.success() {
-        bail!(
-            "sqlite3 .schema failed on {}: {}",
-            db.display(),
-            String::from_utf8_lossy(&output.stderr)
-        );
+    let conn = Connection::open(db)
+        .with_context(|| format!("opening {} for schema dump", db.display()))?;
+    Ok(normalize_schema(&schema_dump(&conn)?))
+}
+
+// Byte-equivalent to `sqlite3 .schema`: rowid order, and the `/* name(cols) */`
+// comment the shell appends after each CREATE VIRTUAL TABLE (kept so the golden
+// schema string matches the old CLI path).
+fn schema_dump(conn: &Connection) -> Result<String> {
+    let mut stmt = conn.prepare(
+        "SELECT name, type, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY rowid",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut raw = String::new();
+    for (name, kind, sql) in rows {
+        raw.push_str(&sql);
+        if kind == "table" && sql.starts_with("CREATE VIRTUAL TABLE") {
+            raw.push_str(&format!(
+                "\n/* {}({}) */",
+                name,
+                virtual_table_columns(conn, &name)?
+            ));
+        }
+        raw.push_str(";\n");
     }
-    Ok(normalize_schema(&String::from_utf8_lossy(&output.stdout)))
+    Ok(raw)
+}
+
+fn virtual_table_columns(conn: &Connection, table: &str) -> Result<String> {
+    let mut stmt = conn.prepare("SELECT name FROM pragma_table_info(?1)")?;
+    let columns = stmt
+        .query_map([table], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(columns.join(","))
 }
 
 /// Canonicalize a `.schema` dump for equality comparison: trim trailing

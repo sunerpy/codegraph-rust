@@ -158,18 +158,16 @@ put the `codegraph` binary on your `PATH`. Assets are named
 | Linux    | aarch64 (static, musl)  | `aarch64-unknown-linux-musl` |
 | macOS    | x86_64                  | `x86_64-apple-darwin`        |
 | macOS    | aarch64 (Apple Silicon) | `aarch64-apple-darwin`       |
+| Windows  | x86_64                  | `x86_64-pc-windows-msvc`     |
 
 The Linux builds are statically linked against musl, so they run on any
-distribution with no glibc/SQLite system dependency. Prebuilt binaries target
-Linux and macOS only; the per-project daemon is Unix-socket based, so Windows is
-not a prebuilt target yet — on Windows, build from source with
-`cargo install --git https://github.com/sunerpy/codegraph-rust codegraph-rs` (the
-CLI and MCP server work; the background daemon
-does not).
+distribution with no glibc/SQLite system dependency. Windows assets are packaged
+as `.zip` (Linux and macOS ship as `.tar.gz`). The per-project daemon works on all
+three platforms: Unix socket on Linux/macOS, named pipe on Windows.
 
 ### From source
 
-Prerequisite: Rust stable (MSRV 1.70).
+Prerequisite: Rust stable (MSRV 1.75).
 
 ```bash
 git clone https://github.com/sunerpy/codegraph-rust.git
@@ -278,8 +276,9 @@ codegraph self-update --tag v0.2.0   # pin a specific release tag
 ```
 
 If codegraph lives on a root-owned path (e.g. `/usr/local/bin`), run it with the
-appropriate privileges. Works on the prebuilt Linux (musl) and macOS targets; on
-Windows, reinstall from source instead.
+appropriate privileges. Works on the prebuilt Linux (musl), macOS, and Windows targets. Windows assets
+are `.zip`; if `self-update` cannot fetch them automatically, reinstall via
+`cargo install --git https://github.com/sunerpy/codegraph-rust codegraph-rs`.
 
 ### `codegraph export` — whole-graph export + centrality
 

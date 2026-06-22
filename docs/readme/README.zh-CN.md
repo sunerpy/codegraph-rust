@@ -136,21 +136,21 @@ codegraph --version
 压缩包，解压后把 `codegraph` 放到 `PATH`。产物命名为
 `codegraph-<version>-<target>.<ext>`：
 
-| 平台  | 架构                    | target                       |
-| ----- | ----------------------- | ---------------------------- |
-| Linux | x86_64（静态 musl）     | `x86_64-unknown-linux-musl`  |
-| Linux | aarch64（静态 musl）    | `aarch64-unknown-linux-musl` |
-| macOS | x86_64                  | `x86_64-apple-darwin`        |
-| macOS | aarch64 (Apple Silicon) | `aarch64-apple-darwin`       |
+| 平台    | 架构                    | target                       |
+| ------- | ----------------------- | ---------------------------- |
+| Linux   | x86_64（静态 musl）     | `x86_64-unknown-linux-musl`  |
+| Linux   | aarch64（静态 musl）    | `aarch64-unknown-linux-musl` |
+| macOS   | x86_64                  | `x86_64-apple-darwin`        |
+| macOS   | aarch64 (Apple Silicon) | `aarch64-apple-darwin`       |
+| Windows | x86_64                  | `x86_64-pc-windows-msvc`     |
 
-Linux 版本静态链接 musl，可在任意发行版运行，无 glibc/SQLite 系统依赖。预编译二进制
-仅覆盖 Linux 与 macOS；按项目守护进程基于 Unix 域套接字，故暂不提供 Windows 预编译
-——Windows 上请用 `cargo install --git https://github.com/sunerpy/codegraph-rust codegraph-rs` 从源码安装（CLI 与 MCP 服务器可用，
-后台守护进程不可用）。
+Linux 版本静态链接 musl，可在任意发行版运行，无 glibc/SQLite 系统依赖。Windows 产物
+打包为 `.zip`（Linux 与 macOS 为 `.tar.gz`）。按项目守护进程在三个平台均可用：
+Linux/macOS 使用 Unix 域套接字，Windows 使用命名管道。
 
 ### 从源码构建
 
-前置：Rust stable（MSRV 1.70）。
+前置：Rust stable（MSRV 1.75）。
 
 ```bash
 git clone https://github.com/sunerpy/codegraph-rust.git
@@ -213,7 +213,7 @@ codegraph self-update --force      # 即使已是最新也重新安装
 codegraph self-update --tag v0.2.0 # 指定某个 Release 标签
 ```
 
-若 `codegraph` 位于受保护路径（如系统目录 `/usr/local/bin`），请用具备写权限的身份运行；升级后用 `codegraph version`（或 `--version`）确认版本。预编译升级支持 Linux（musl）与 macOS；Windows 请从源码重新安装。
+若 `codegraph` 位于受保护路径（如系统目录 `/usr/local/bin`），请用具备写权限的身份运行；升级后用 `codegraph version`（或 `--version`）确认版本。预编译升级支持 Linux（musl）、macOS 与 Windows。Windows 产物为 `.zip`；若 `self-update` 暂无法自动获取，请用 `cargo install --git https://github.com/sunerpy/codegraph-rust codegraph-rs` 重新安装。
 
 ### `codegraph export` — 全图导出 + 中心性
 

@@ -19,7 +19,20 @@ anyhow = { workspace = true }
 notify = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
+# Cross-platform IPC (local socket on unix, named pipe on windows)
+interprocess = { workspace = true }
 codegraph-mcp = { path = "../codegraph-mcp" }
+
+# Unix process introspection (getppid, signal-0 liveness)
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
+# Windows process introspection (OpenProcess + GetExitCodeProcess liveness)
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 codegraph-core = { path = "../codegraph-core" }

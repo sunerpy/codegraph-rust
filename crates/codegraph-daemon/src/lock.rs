@@ -2,13 +2,16 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::paths::{codegraph_dir, daemon_pid_path, daemon_socket_path};
 use crate::process::is_process_alive;
+
+const EMPTY_RETRY_DELAY: Duration = Duration::from_millis(20);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -67,37 +70,53 @@ pub fn try_acquire_daemon_lock(project_root: &Path) -> Result<AcquireResult> {
         started_at: now_millis(),
     };
 
-    // Port of upstream mcp/daemon.ts:393-412: write a complete
-    // private temp pidfile and hard-link it into place so readers never observe
-    // an empty or partial lock record during concurrent daemon startup.
+    // Port of upstream mcp/daemon.ts:393-412: write a complete private temp
+    // pidfile, then atomically claim the final path by renaming the temp over a
+    // freshly created (create_new) placeholder. Renaming the fully-written temp
+    // means a concurrent reader never observes an empty or partial lock record.
+    let payload = encode_lock_info(&info)?;
     let tmp = pid_path.with_extension(format!("pid.{}.tmp", process::id()));
-    let mut acquired = false;
-    fs::write(&tmp, encode_lock_info(&info)?)
+    fs::write(&tmp, &payload)
         .with_context(|| format!("writing temp daemon lock {}", tmp.display()))?;
-    match fs::hard_link(&tmp, &pid_path) {
-        Ok(()) => acquired = true,
-        Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
-        Err(err) => return Err(err).with_context(|| format!("linking {}", pid_path.display())),
-    }
-    let _ = fs::remove_file(&tmp);
+
+    let acquired = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&pid_path)
+    {
+        Ok(_placeholder) => {
+            fs::rename(&tmp, &pid_path)
+                .with_context(|| format!("publishing daemon lock {}", pid_path.display()))?;
+            true
+        }
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(&tmp);
+            false
+        }
+        Err(err) => {
+            let _ = fs::remove_file(&tmp);
+            return Err(err).with_context(|| format!("claiming {}", pid_path.display()));
+        }
+    };
 
     if acquired {
         return Ok(AcquireResult::Acquired { pid_path, info });
     }
 
-    let existing = fs::read_to_string(&pid_path)
-        .ok()
-        .and_then(|raw| decode_lock_info(&raw));
+    let existing = read_lock_info_tolerant(&pid_path);
     Ok(AcquireResult::Taken { pid_path, existing })
 }
 
 pub fn clear_stale_daemon_lock(pid_path: &Path, expected_dead_pid: Option<u32>) -> bool {
     // Port of upstream mcp/daemon.ts:453-481: compare-and-delete the
     // pidfile only after re-reading it, and never remove a lock held by a live pid.
-    let raw = match fs::read_to_string(pid_path) {
-        Ok(raw) => raw,
-        Err(err) if err.kind() == ErrorKind::NotFound => return true,
-        Err(_) => return false,
+    let raw = match read_pidfile_tolerant(pid_path) {
+        ReadOutcome::Missing => return true,
+        ReadOutcome::Unreadable => return false,
+        // An empty pidfile is an in-flight publish (create_new placeholder before
+        // the rename lands); treat as live, never delete on empty.
+        ReadOutcome::Empty => return false,
+        ReadOutcome::Content(raw) => raw,
     };
     if let Some(info) = decode_lock_info(&raw) {
         if expected_dead_pid.is_some_and(|pid| pid != info.pid) {
@@ -116,12 +135,44 @@ pub fn unlock_project(project_root: &Path) -> bool {
 }
 
 pub(crate) fn cleanup_owned_lock(pid_path: &Path, pid: u32) {
-    let owned = fs::read_to_string(pid_path)
-        .ok()
-        .and_then(|raw| decode_lock_info(&raw))
-        .is_some_and(|info| info.pid == pid);
+    let owned = read_lock_info_tolerant(pid_path).is_some_and(|info| info.pid == pid);
     if owned {
         let _ = fs::remove_file(pid_path);
+    }
+}
+
+enum ReadOutcome {
+    Missing,
+    Unreadable,
+    Empty,
+    Content(String),
+}
+
+fn read_pidfile_once(pid_path: &Path) -> ReadOutcome {
+    match fs::read_to_string(pid_path) {
+        Ok(raw) if raw.trim().is_empty() => ReadOutcome::Empty,
+        Ok(raw) => ReadOutcome::Content(raw),
+        Err(err) if err.kind() == ErrorKind::NotFound => ReadOutcome::Missing,
+        Err(_) => ReadOutcome::Unreadable,
+    }
+}
+
+fn read_pidfile_tolerant(pid_path: &Path) -> ReadOutcome {
+    match read_pidfile_once(pid_path) {
+        // Retry once after a short sleep: an empty pidfile is an in-flight
+        // create_new placeholder whose rename has not landed yet.
+        ReadOutcome::Empty => {
+            thread::sleep(EMPTY_RETRY_DELAY);
+            read_pidfile_once(pid_path)
+        }
+        other => other,
+    }
+}
+
+fn read_lock_info_tolerant(pid_path: &Path) -> Option<DaemonLockInfo> {
+    match read_pidfile_tolerant(pid_path) {
+        ReadOutcome::Content(raw) => decode_lock_info(&raw),
+        _ => None,
     }
 }
 

@@ -20,7 +20,7 @@ license = "MIT"
 authors = ["sunerpy <nkuzhangshn@gmail.com>"]
 repository = "https://github.com/sunerpy/codegraph-rust"
 homepage = "https://github.com/sunerpy/codegraph-rust"
-rust-version = "1.70"
+rust-version = "1.75"
 keywords = ["code-graph", "tree-sitter", "code-analysis", "sqlite", "mcp"]
 categories = ["development-tools", "command-line-utilities", "parsing"]
 
@@ -51,6 +51,10 @@ streaming-iterator = "0.1"
 
 # File watching
 notify = "6"
+
+# Cross-platform IPC (daemon local socket / named pipe)
+interprocess = "2.4"
+rustix = { version = "0.38", features = ["process"] }
 
 # CLI
 clap = { version = "4.5", features = ["derive"] }

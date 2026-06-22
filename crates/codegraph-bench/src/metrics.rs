@@ -1,4 +1,5 @@
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -51,8 +52,13 @@ pub fn run_with_proc_status_timeout(
         .arg("-c")
         .arg(format!("exec {command}"))
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
+        .stderr(Stdio::piped());
+    // Unix-only: put the child in its own process group so the timeout kill
+    // reaches the whole tree (the upstream `--liftoff-only` Node subchild).
+    // `process_group` is a Unix `CommandExt` method; on Windows we spawn
+    // normally and clean up via `child.kill()` below.
+    #[cfg(unix)]
+    process.process_group(0);
     if let Some(cwd) = cwd {
         process.current_dir(cwd);
     }
@@ -80,7 +86,12 @@ pub fn run_with_proc_status_timeout(
         peak_rss_kb = peak_rss_kb.max(read_proc_status_kb(pid, "VmHWM:"));
         if let Some(limit) = timeout {
             if started.elapsed() > limit {
+                // Unix kills the whole process group (negative PID); Windows has
+                // no POSIX process group, so kill just the spawned child.
+                #[cfg(unix)]
                 kill_process_group(pid);
+                #[cfg(not(unix))]
+                let _ = child.kill();
                 timed_out = true;
                 let _ = child.wait();
                 break None;
@@ -128,6 +139,7 @@ where
     })
 }
 
+#[cfg(unix)]
 fn kill_process_group(pid: u32) {
     // Negative PID targets the whole process group (created via process_group(0)).
     let _ = Command::new("kill")
