@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/sunerpy/codegraph-rust/compare/v0.3.0...v0.4.0) (2026-06-22)
+
+
+### Features
+
+* **install:** one-liner install scripts, Windows ARM64 target, completions, release gating, slim READMEs ([#17](https://github.com/sunerpy/codegraph-rust/issues/17)) ([9504080](https://github.com/sunerpy/codegraph-rust/commit/95040800bbe5be6d34a5ee9e80c0322a496cc716))
+
 ## [0.3.0](https://github.com/sunerpy/codegraph-rust/compare/v0.2.1...v0.3.0) (2026-06-22)
 
 
