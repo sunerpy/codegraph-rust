@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/sunerpy/codegraph-rust/compare/v0.1.2...v0.2.0) (2026-06-22)
+
+
+### Features
+
+* **cli:** add version + self-update commands and parameterized installer tests ([#11](https://github.com/sunerpy/codegraph-rust/issues/11)) ([62bb65d](https://github.com/sunerpy/codegraph-rust/commit/62bb65dd5c5f92265693b173d9e188ed216eb713))
+
 ## [0.1.2](https://github.com/sunerpy/codegraph-rust/compare/v0.1.1...v0.1.2) (2026-06-22)
 
 
