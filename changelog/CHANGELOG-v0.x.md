@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/sunerpy/codegraph-rust/compare/v0.1.1...v0.1.2) (2026-06-22)
+
+
+### Bug Fixes
+
+* **installer:** preserve comments and key order when editing agent configs ([#9](https://github.com/sunerpy/codegraph-rust/issues/9)) ([844388a](https://github.com/sunerpy/codegraph-rust/commit/844388af82a7d57b074678f7c5326441aec8d041))
+
 ## [0.1.1](https://github.com/sunerpy/codegraph-rust/compare/v0.1.0...v0.1.1) (2026-06-21)
 
 
