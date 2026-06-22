@@ -6,6 +6,8 @@
 use std::fs;
 use std::path::Path;
 
+use jsonc_parser::cst::{CstInputValue, CstRootNode};
+use jsonc_parser::ParseOptions;
 use serde_json::{Map, Value};
 
 use super::types::{FileAction, FileWrite};
@@ -235,6 +237,114 @@ pub fn write_json_file(path: &Path, data: &Map<String, Value>) -> std::io::Resul
 /// printer matches this for the object/array/string/number shapes we write.
 pub fn to_upstream_json(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn to_cst_input(value: &Value) -> CstInputValue {
+    match value {
+        Value::Null => CstInputValue::Null,
+        Value::Bool(b) => CstInputValue::Bool(*b),
+        Value::Number(n) => CstInputValue::Number(n.to_string()),
+        Value::String(s) => CstInputValue::String(s.clone()),
+        Value::Array(arr) => CstInputValue::Array(arr.iter().map(to_cst_input).collect()),
+        Value::Object(map) => CstInputValue::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), to_cst_input(v)))
+                .collect(),
+        ),
+    }
+}
+
+/// Surgically upsert `<parent_key>.<leaf_key> = value` in JSONC, preserving the
+/// file's comments, key order, and formatting. `Unchanged` when the leaf already
+/// equals `value` (no write — avoids comment churn). Caller must pre-confirm the
+/// file parses (see `read_config_file`); a parse failure returns an error so the
+/// caller skips rather than clobbers.
+pub fn upsert_nested_key_jsonc(
+    path: &Path,
+    parent_key: &str,
+    leaf_key: &str,
+    value: &Value,
+    schema_url: Option<&str>,
+) -> std::io::Result<FileAction> {
+    let text = fs::read_to_string(path)?;
+    let existed = !text.trim().is_empty();
+
+    let parsed = parse_json_object(&text);
+    if let Some(map) = &parsed {
+        let current = map.get(parent_key).and_then(|p| p.get(leaf_key));
+        if current == Some(value) && (schema_url.is_none() || map.contains_key("$schema")) {
+            return Ok(FileAction::Unchanged);
+        }
+    }
+
+    let root = CstRootNode::parse(&text, &ParseOptions::default())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    let root_obj = root.object_value_or_set();
+    let parent = root_obj.object_value_or_create(parent_key).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("`{parent_key}` exists but is not an object"),
+        )
+    })?;
+    match parent.get(leaf_key) {
+        Some(prop) => prop.set_value(to_cst_input(value)),
+        None => {
+            parent.append(leaf_key, to_cst_input(value));
+        }
+    }
+    if let Some(schema) = schema_url {
+        if root_obj.get("$schema").is_none() {
+            root_obj.insert(0, "$schema", CstInputValue::String(schema.to_string()));
+        }
+    }
+
+    let mut out = root.to_string();
+    if text.ends_with('\n') && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    atomic_write_file(path, &out)?;
+    Ok(if existed {
+        FileAction::Updated
+    } else {
+        FileAction::Created
+    })
+}
+
+/// Surgically remove `<parent_key>.<leaf_key>` from a JSONC file, preserving
+/// surrounding comments/formatting. Drops the now-empty parent object too.
+/// Returns `Removed` if the key was present, `NotFound` otherwise.
+pub fn remove_nested_key_jsonc(
+    path: &Path,
+    parent_key: &str,
+    leaf_key: &str,
+) -> std::io::Result<FileAction> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return Ok(FileAction::NotFound);
+    };
+    let present = parse_json_object(&text)
+        .and_then(|m| m.get(parent_key).and_then(|p| p.get(leaf_key)).cloned())
+        .is_some();
+    if !present {
+        return Ok(FileAction::NotFound);
+    }
+    let root = CstRootNode::parse(&text, &ParseOptions::default())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    if let Some(parent) = root.object_value().and_then(|o| o.object_value(parent_key)) {
+        if let Some(prop) = parent.get(leaf_key) {
+            prop.remove();
+        }
+        if parent.properties().is_empty() {
+            if let Some(parent_prop) = root.object_value().and_then(|o| o.get(parent_key)) {
+                parent_prop.remove();
+            }
+        }
+    }
+    let mut out = root.to_string();
+    if text.ends_with('\n') && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    atomic_write_file(path, &out)?;
+    Ok(FileAction::Removed)
 }
 
 /// Replace or append a marker-delimited section. Ports
@@ -516,5 +626,74 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn tmp_path(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-jsonc-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir.join(name)
+    }
+
+    #[test]
+    fn upsert_preserves_comments_and_key_order() {
+        let p = tmp_path("opencode.json");
+        let original = "{\n  // lead comment\n  \"$schema\": \"https://x\",\n  \"theme\": \"dark\", // trailing\n  \"mcp\": {\n    \"existing\": { \"enabled\": true }\n  },\n  \"zzz\": \"last\"\n}\n";
+        fs::write(&p, original).unwrap();
+        let value = serde_json::json!({"type": "local", "enabled": true});
+        let action =
+            upsert_nested_key_jsonc(&p, "mcp", "codegraph", &value, Some("https://x")).unwrap();
+        assert_eq!(action, FileAction::Updated);
+        let out = fs::read_to_string(&p).unwrap();
+        assert!(out.contains("// lead comment"), "lead comment preserved");
+        assert!(out.contains("// trailing"), "trailing comment preserved");
+        assert!(out.contains("\"existing\""), "sibling preserved");
+        assert!(out.contains("\"codegraph\""), "codegraph inserted");
+        let theme_at = out.find("\"theme\"").unwrap();
+        let zzz_at = out.find("\"zzz\"").unwrap();
+        assert!(theme_at < zzz_at, "original key order preserved");
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn upsert_is_idempotent() {
+        let p = tmp_path("conf.json");
+        fs::write(&p, "{\n  // keep\n  \"mcpServers\": {}\n}\n").unwrap();
+        let value = serde_json::json!({"command": "codegraph"});
+        let first = upsert_nested_key_jsonc(&p, "mcpServers", "codegraph", &value, None).unwrap();
+        assert_eq!(first, FileAction::Updated);
+        let after_first = fs::read_to_string(&p).unwrap();
+        let second = upsert_nested_key_jsonc(&p, "mcpServers", "codegraph", &value, None).unwrap();
+        assert_eq!(second, FileAction::Unchanged);
+        assert_eq!(
+            fs::read_to_string(&p).unwrap(),
+            after_first,
+            "no churn on re-run"
+        );
+        assert!(after_first.contains("// keep"));
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn remove_preserves_comments() {
+        let p = tmp_path("conf.json");
+        fs::write(
+            &p,
+            "{\n  // keep me\n  \"mcpServers\": {\n    \"other\": 1,\n    \"codegraph\": { \"x\": 1 }\n  }\n}\n",
+        )
+        .unwrap();
+        let action = remove_nested_key_jsonc(&p, "mcpServers", "codegraph").unwrap();
+        assert_eq!(action, FileAction::Removed);
+        let out = fs::read_to_string(&p).unwrap();
+        assert!(out.contains("// keep me"), "comment preserved on remove");
+        assert!(out.contains("\"other\""), "sibling preserved");
+        assert!(!out.contains("\"codegraph\""), "codegraph removed");
+        let _ = fs::remove_dir_all(p.parent().unwrap());
     }
 }

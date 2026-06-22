@@ -55,6 +55,9 @@ notify = "6"
 # CLI
 clap = { version = "4.5", features = ["derive"] }
 
+# JSONC config editing (preserve comments + key order on agent config writes)
+jsonc-parser = { version = "0.26", features = ["cst", "serde"] }
+
 # Benchmarking
 criterion = "0.7"
 
