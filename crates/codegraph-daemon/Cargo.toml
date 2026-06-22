@@ -27,5 +27,12 @@ codegraph-mcp = { path = "../codegraph-mcp" }
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
 
+# Windows process introspection (OpenProcess + GetExitCodeProcess liveness)
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 codegraph-core = { path = "../codegraph-core" }
