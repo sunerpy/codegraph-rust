@@ -99,6 +99,10 @@ jobs:
             os: windows-latest
             use_zigbuild: false
             archive: zip
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+            use_zigbuild: false
+            archive: zip
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
