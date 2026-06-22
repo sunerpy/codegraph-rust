@@ -66,10 +66,11 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Clippy lint
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        # codegraph-bench is a Unix-only dev harness (publish=false); excluded from the Windows job.
+        run: cargo clippy --workspace --exclude codegraph-bench --all-targets -- -D warnings
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude codegraph-bench
 
   audit:
     name: Security Audit
