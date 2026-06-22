@@ -28,6 +28,7 @@ codegraph-watch = { path = "../codegraph-watch", version = "0.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 jsonc-parser = { workspace = true }
+self_update = { workspace = true }
 toml = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
@@ -37,3 +38,7 @@ time = { workspace = true }
 
 [dev-dependencies]
 codegraph-bench = { path = "../codegraph-bench" }
+rstest = { workspace = true }
+assert_fs = { workspace = true }
+assert_cmd = { workspace = true }
+predicates = { workspace = true }

@@ -58,8 +58,17 @@ clap = { version = "4.5", features = ["derive"] }
 # JSONC config editing (preserve comments + key order on agent config writes)
 jsonc-parser = { version = "0.26", features = ["cst", "serde"] }
 
+# Self-update from GitHub Releases (mise-style `codegraph self-update`)
+self_update = { version = "0.42", default-features = false, features = ["archive-tar", "compression-flate2", "rustls"] }
+
 # Benchmarking
 criterion = "0.7"
+
+# Testing (dev-dependencies; not shipped in the binary)
+rstest = "0.23"
+assert_fs = "1"
+assert_cmd = "2"
+predicates = "3"
 
 
 
