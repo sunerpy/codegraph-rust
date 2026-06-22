@@ -285,7 +285,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "codegraph-bench"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -300,7 +300,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -316,12 +316,14 @@ dependencies = [
 
 [[package]]
 name = "codegraph-daemon"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "codegraph-core",
  "codegraph-mcp",
+ "interprocess",
  "notify",
+ "rustix 0.38.44",
  "serde",
  "serde_json",
  "sha2",
@@ -330,7 +332,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-extract"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -370,7 +372,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-graph"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -382,7 +384,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-mcp"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -398,7 +400,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-resolve"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -411,7 +413,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-rs"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -440,7 +442,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-store"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -452,7 +454,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-watch"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -662,6 +664,12 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "doctest-file"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2db04e74f0a9a93103b50e90b96024c9b2bdca8bce6a632ec71b88736d3d359"
 
 [[package]]
 name = "ed25519"
@@ -1293,6 +1301,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "interprocess"
+version = "2.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "069323743400cb7ab06a8fe5c1ed911d36b6919ec531661d034c89083629595b"
+dependencies = [
+ "doctest-file",
+ "libc",
+ "recvmsg",
+ "widestring",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1381,6 +1402,12 @@ dependencies = [
  "pkg-config",
  "vcpkg",
 ]
+
+[[package]]
+name = "linux-raw-sys"
+version = "0.4.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d26c52dbd32dccf2d10cac7725f8eae5296885fb5703b261f7d0a0739ec807ab"
 
 [[package]]
 name = "linux-raw-sys"
@@ -1814,6 +1841,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "recvmsg"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3edd4d5d42c92f0a659926464d4cce56b562761267ecf0f469d85b7de384175"
+
+[[package]]
 name = "regex"
 version = "1.12.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1964,6 +1997,19 @@ dependencies = [
 
 [[package]]
 name = "rustix"
+version = "0.38.44"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdb5bc1ae2baa591800df16c9ca78619bf65c0488b41b96ccec5d11220d8c154"
+dependencies = [
+ "bitflags 2.13.0",
+ "errno",
+ "libc",
+ "linux-raw-sys 0.4.15",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "rustix"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
@@ -1971,7 +2017,7 @@ dependencies = [
  "bitflags 2.13.0",
  "errno",
  "libc",
- "linux-raw-sys",
+ "linux-raw-sys 0.12.1",
  "windows-sys 0.61.2",
 ]
 
@@ -2291,7 +2337,7 @@ dependencies = [
  "fastrand",
  "getrandom 0.4.3",
  "once_cell",
- "rustix",
+ "rustix 1.1.4",
  "windows-sys 0.61.2",
 ]
 
@@ -3145,6 +3191,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "widestring"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
+
+[[package]]
 name = "winapi-util"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3427,7 +3479,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
 dependencies = [
  "libc",
- "rustix",
+ "rustix 1.1.4",
 ]
 
 [[package]]

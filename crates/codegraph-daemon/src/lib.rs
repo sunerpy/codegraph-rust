@@ -1,18 +1,18 @@
 //! Per-project daemon lifecycle for CodeGraph.
 //!
 //! This crate owns the task-24 daemon mechanics: project-scoped rendezvous paths,
-//! atomic pid locks, Unix socket session handling, parent/host watchdogs, graceful
-//! shutdown, and stale-lock recovery. It deliberately does not implement task-25
-//! file watching.
+//! atomic pid locks, cross-platform local-socket session handling, parent/host
+//! watchdogs, graceful shutdown, and stale-lock recovery. It deliberately does
+//! not implement task-25 file watching.
 
 mod lock;
 mod paths;
 mod process;
 mod session;
+mod transport;
 
 use std::fs;
 use std::io::ErrorKind;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -20,6 +20,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use interprocess::local_socket::traits::Listener as _;
 pub use lock::{
     clear_stale_daemon_lock, decode_lock_info, encode_lock_info, try_acquire_daemon_lock,
     unlock_project, AcquireResult, DaemonLockInfo,
@@ -32,8 +33,10 @@ use tracing::{debug, info, warn};
 use crate::lock::cleanup_owned_lock;
 use crate::paths::codegraph_dir;
 use crate::session::serve_session;
+use crate::transport::{bind, connect, Listener, Rendezvous};
 
 const DEFAULT_WATCHDOG_INTERVAL: Duration = Duration::from_millis(500);
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Debug)]
 pub struct DaemonOptions {
@@ -89,7 +92,6 @@ impl DaemonHandle {
 
     pub fn stop(mut self) -> Result<()> {
         self.shutdown.store(true, Ordering::SeqCst);
-        let _ = UnixStream::connect(&self.socket_path);
         if let Some(thread) = self.thread.take() {
             thread
                 .join()
@@ -111,7 +113,6 @@ impl DaemonHandle {
 impl Drop for DaemonHandle {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        let _ = UnixStream::connect(&self.socket_path);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -159,7 +160,8 @@ pub fn run_foreground(project_root: impl AsRef<Path>, options: DaemonOptions) ->
 }
 
 pub fn attach_to_daemon(socket_path: &Path) -> Result<DaemonClient> {
-    let mut stream = UnixStream::connect(socket_path)
+    let rendezvous = Rendezvous::from_socket_path(socket_path);
+    let mut stream = connect(&rendezvous)
         .with_context(|| format!("connecting to daemon socket {}", socket_path.display()))?;
     let hello = read_daemon_hello(&mut stream)?;
     Ok(DaemonClient {
@@ -176,15 +178,16 @@ fn start_with_lock(
 ) -> Result<DaemonHandle> {
     fs::create_dir_all(codegraph_dir(&project_root))
         .with_context(|| format!("creating {}", codegraph_dir(&project_root).display()))?;
-    if socket_path.exists() {
-        fs::remove_file(&socket_path)
-            .with_context(|| format!("removing stale socket {}", socket_path.display()))?;
+    let rendezvous = Rendezvous::from_socket_path(&socket_path);
+    #[cfg(unix)]
+    if let Some(stale) = rendezvous.cleanup_path() {
+        if stale.exists() {
+            fs::remove_file(stale)
+                .with_context(|| format!("removing stale socket {}", stale.display()))?;
+        }
     }
-    let listener = UnixListener::bind(&socket_path)
+    let listener = bind(&rendezvous)
         .with_context(|| format!("binding daemon socket {}", socket_path.display()))?;
-    listener
-        .set_nonblocking(true)
-        .context("setting daemon socket nonblocking")?;
     let registry = SessionRegistry::default();
     let shutdown = Arc::new(AtomicBool::new(false));
     let thread_registry = registry.clone();
@@ -213,8 +216,9 @@ fn start_with_lock(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_accept_loop(
-    listener: UnixListener,
+    listener: Listener,
     project_root: PathBuf,
     socket_path: PathBuf,
     pid_path: PathBuf,
@@ -238,7 +242,7 @@ fn run_accept_loop(
         }
 
         match listener.accept() {
-            Ok((stream, _addr)) => {
+            Ok(stream) => {
                 let session_project = project_root.clone();
                 let session_socket = socket_display.clone();
                 let session_registry = registry.clone();
@@ -256,14 +260,17 @@ fn run_accept_loop(
                 });
             }
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                thread::sleep(options.watchdog_interval);
+                thread::sleep(ACCEPT_POLL_INTERVAL);
             }
             Err(err) => return Err(err).context("accepting daemon connection"),
         }
     }
 
     cleanup_owned_lock(&pid_path, std::process::id());
-    let _ = fs::remove_file(&socket_path);
+    #[cfg(unix)]
+    if let Some(stale) = Rendezvous::from_socket_path(&socket_path).cleanup_path() {
+        let _ = fs::remove_file(stale);
+    }
     info!(project = %project_root.display(), "daemon stopped");
     Ok(())
 }

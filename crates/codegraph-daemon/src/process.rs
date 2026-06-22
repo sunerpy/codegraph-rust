@@ -1,7 +1,3 @@
-use std::fs;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
-
 #[derive(Clone, Debug)]
 pub struct SupervisionState {
     pub original_ppid: u32,
@@ -29,29 +25,24 @@ where
     None
 }
 
+#[cfg(unix)]
 pub fn current_ppid() -> u32 {
-    parse_ppid_from_proc().unwrap_or(0)
+    rustix::process::getppid().map_or(0, |pid| pid.as_raw_nonzero().get() as u32)
 }
 
+#[cfg(unix)]
 pub fn is_process_alive(pid: u32) -> bool {
-    if pid == 0 {
+    let Ok(raw) = i32::try_from(pid) else {
         return false;
-    }
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-fn parse_ppid_from_proc() -> Option<u32> {
-    let stat = fs::read_to_string(PathBuf::from("/proc/self/stat")).ok()?;
-    let after_name = stat.rsplit_once(") ")?.1;
-    let mut fields = after_name.split_whitespace();
-    let _state = fields.next()?;
-    fields.next()?.parse().ok()
+    };
+    let Some(pid) = rustix::process::Pid::from_raw(raw) else {
+        return false;
+    };
+    // signal-0 liveness: ESRCH means gone; EPERM (or Ok) means the pid exists.
+    !matches!(
+        rustix::process::test_kill_process(pid),
+        Err(rustix::io::Errno::SRCH)
+    )
 }
 
 #[cfg(test)]
