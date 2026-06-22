@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/sunerpy/codegraph-rust/compare/v0.5.0...v0.5.1) (2026-06-22)
+
+
+### Bug Fixes
+
+* **cli:** enable self_update zip extraction for Windows releases ([d4f7766](https://github.com/sunerpy/codegraph-rust/commit/d4f776691bcd2832b2b1727003cada8c2017a712))
+
 ## [0.5.0](https://github.com/sunerpy/codegraph-rust/compare/v0.4.0...v0.5.0) (2026-06-22)
 
 
