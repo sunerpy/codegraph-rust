@@ -247,6 +247,79 @@ fn tools_list_is_empty_when_workspace_not_indexed() {
 }
 
 #[test]
+fn default_project_indexed_serves_full_tools_list_after_initialize() {
+    // Regression for the `serve --mcp` (no --path) bug: the installer launches
+    // the server with the agent's project root as cwd and no projectPath, so the
+    // CLI must default the project to that indexed root. With a Some(indexed)
+    // default_project, the initialize->tools/list handshake must expose 4 tools.
+    let project = index_fixture(&[(
+        "src/app.ts",
+        "export function greet(name: string): string {\n  return `hi ${name}`;\n}\n",
+    )]);
+    let frames = format!(
+        "{}\n{}\n",
+        serde_json::to_string(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}))
+            .unwrap(),
+        serde_json::to_string(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}))
+            .unwrap(),
+    );
+    let mut output = Vec::new();
+    let mut server = McpServer::new(Some(project.path().to_path_buf()));
+    server
+        .run(Cursor::new(frames.into_bytes()), &mut output)
+        .expect("server run");
+    let text = String::from_utf8(output).expect("utf8 output");
+    let tools_line = text.lines().nth(1).expect("tools/list response line");
+    let resp: Value = serde_json::from_str(tools_line).expect("response json");
+    assert_eq!(
+        resp["result"]["tools"].as_array().map(Vec::len),
+        Some(4),
+        "indexed default project must serve the 4-tool default surface"
+    );
+}
+
+#[test]
+fn default_project_unindexed_serves_empty_tools_list() {
+    // The non-bailing cwd default still starts the server for an unindexed root;
+    // it must serve an EMPTY tools/list (upstream parity, golden-pinned).
+    let base = std::env::temp_dir().join(format!(
+        "cg-mcp-default-noidx-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&base).unwrap();
+    let mut output = Vec::new();
+    let mut server = McpServer::new(Some(base.clone()));
+    server
+        .run(
+            Cursor::new(
+                format!(
+                    "{}\n",
+                    serde_json::to_string(
+                        &json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})
+                    )
+                    .unwrap()
+                )
+                .into_bytes(),
+            ),
+            &mut output,
+        )
+        .expect("server run");
+    let _ = fs::remove_dir_all(&base);
+    let text = String::from_utf8(output).expect("utf8 output");
+    let line = text.lines().next().expect("one response line");
+    let resp: Value = serde_json::from_str(line).expect("response json");
+    assert_eq!(
+        resp["result"]["tools"].as_array().map(Vec::len),
+        Some(0),
+        "unindexed default project must serve empty tools/list"
+    );
+}
+
+#[test]
 fn tools_list_honors_codegraph_mcp_tools_allowlist() {
     // CODEGRAPH_MCP_TOOLS replaces the default surface with exactly the named
     // tools — any of the 8 (tools.ts:711-740). Serialized to avoid env-var
