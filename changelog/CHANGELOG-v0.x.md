@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/sunerpy/codegraph-rust/compare/v0.4.0...v0.5.0) (2026-06-22)
+
+
+### Features
+
+* **cli:** one-command shell completion install (completions --install) ([c7961b7](https://github.com/sunerpy/codegraph-rust/commit/c7961b7cfe137060d3783ff178f47f6dea9041c4))
+
 ## [0.4.0](https://github.com/sunerpy/codegraph-rust/compare/v0.3.0...v0.4.0) (2026-06-22)
 
 
