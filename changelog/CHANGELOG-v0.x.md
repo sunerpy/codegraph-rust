@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/sunerpy/codegraph-rust/compare/v0.2.0...v0.2.1) (2026-06-22)
+
+
+### Bug Fixes
+
+* **build:** drop pinned inter-crate version requirements so workspace bumps build ([#13](https://github.com/sunerpy/codegraph-rust/issues/13)) ([e836c0f](https://github.com/sunerpy/codegraph-rust/commit/e836c0f5225d21671eda66d2a35384e27c54b0fe))
+
 ## [0.2.0](https://github.com/sunerpy/codegraph-rust/compare/v0.1.2...v0.2.0) (2026-06-22)
 
 
