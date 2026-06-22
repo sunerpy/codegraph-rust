@@ -13,7 +13,7 @@ description = "SQLite + FTS5 persistence layer for CodeGraph-rs (fixed, byte-sta
 readme = "../../README.md"
 
 [dependencies]
-codegraph-core = { path = "../codegraph-core", version = "0.1.0" }
+codegraph-core = { path = "../codegraph-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
