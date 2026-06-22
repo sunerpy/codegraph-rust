@@ -35,7 +35,7 @@ irm https://raw.githubusercontent.com/sunerpy/codegraph-rust/main/scripts/instal
 ```bash
 codegraph init  /path/to/project          # create .codegraph/ and run the first index
 codegraph query "<symbol>" -p /path/to/project   # full-text search
-codegraph serve --mcp --path /path/to/project    # MCP server for AI agents
+codegraph serve --mcp --path /path/to/project    # MCP server (--path optional, defaults to cwd)
 ```
 
 ---
@@ -67,7 +67,8 @@ codegraph index /path/to/project     # parse + build the graph
 **Use it as an MCP server (recommended for agents).** It speaks MCP over stdio:
 
 ```bash
-codegraph serve --mcp --path /path/to/project
+codegraph serve --mcp                        # defaults to cwd (recommended: use codegraph install)
+codegraph serve --mcp --path /path/to/project  # optional: pin to a specific project
 ```
 
 Auto-register it into your agent's config (Claude Code, Cursor, Codex CLI,
@@ -149,11 +150,17 @@ automatically):
   "mcpServers": {
     "codegraph": {
       "command": "codegraph",
-      "args": ["serve", "--mcp", "-p", "/abs/path/to/your/project"],
+      "args": ["serve", "--mcp"],
     },
   },
 }
 ```
+
+**Default (no `-p`):** the MCP server resolves the project from the agent's
+working directory, so one config works for all your projects — each just needs
+to be indexed with `codegraph index`. **Optional `-p <path>` / `--path <path>`:**
+pin the server to one fixed project regardless of cwd (e.g.
+`"args": ["serve", "--mcp", "-p", "/abs/path/to/project"]`).
 
 Supported agents: Claude Code, Cursor, Codex CLI, opencode, Hermes Agent,
 Gemini CLI, Antigravity IDE, Kiro.
