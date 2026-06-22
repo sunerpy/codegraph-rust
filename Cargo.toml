@@ -64,7 +64,7 @@ clap_complete = "4.5"
 jsonc-parser = { version = "0.26", features = ["cst", "serde"] }
 
 # Self-update from GitHub Releases (mise-style `codegraph self-update`)
-self_update = { version = "0.42", default-features = false, features = ["archive-tar", "compression-flate2", "rustls"] }
+self_update = { version = "0.42", default-features = false, features = ["archive-tar", "archive-zip", "compression-flate2", "compression-zip-deflate", "rustls"] }
 
 # Benchmarking
 criterion = "0.7"
