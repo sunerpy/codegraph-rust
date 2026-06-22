@@ -1,0 +1,7 @@
+# cargo-audit configuration.
+# RUSTSEC-2025-0119: `number_prefix` is unmaintained. It is a transitive dependency
+# (codegraph-rs -> self_update -> indicatif -> number_prefix) with no fixed release;
+# this is an unmaintained-crate warning, not a vulnerability. Re-evaluate if indicatif
+# drops the dependency or a patched version appears.
+[advisories]
+ignore = ["RUSTSEC-2025-0119"]
