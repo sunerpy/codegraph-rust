@@ -19,7 +19,7 @@ regex = "1.10"
 rayon = { workspace = true }
 tree-sitter = { workspace = true }
 streaming-iterator = { workspace = true }
-codegraph-core = { path = "../codegraph-core", version = "0.1.0" }
+codegraph-core = { path = "../codegraph-core" }
 serde_json = { workspace = true }
 
 tree-sitter-c = "0.24.2"

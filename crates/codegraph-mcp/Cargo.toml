@@ -17,11 +17,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
-codegraph-core = { path = "../codegraph-core", version = "0.1.0" }
-codegraph-store = { path = "../codegraph-store", version = "0.1.0" }
-codegraph-graph = { path = "../codegraph-graph", version = "0.1.0" }
-codegraph-resolve = { path = "../codegraph-resolve", version = "0.1.0" }
+codegraph-core = { path = "../codegraph-core" }
+codegraph-store = { path = "../codegraph-store" }
+codegraph-graph = { path = "../codegraph-graph" }
+codegraph-resolve = { path = "../codegraph-resolve" }
 regex = "1.10"
 
 [dev-dependencies]
-codegraph-extract = { path = "../codegraph-extract", version = "0.1.0" }
+codegraph-extract = { path = "../codegraph-extract" }

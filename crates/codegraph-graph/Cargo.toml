@@ -16,8 +16,8 @@ readme = "../../README.md"
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
-codegraph-core = { path = "../codegraph-core", version = "0.1.0" }
-codegraph-store = { path = "../codegraph-store", version = "0.1.0" }
+codegraph-core = { path = "../codegraph-core" }
+codegraph-store = { path = "../codegraph-store" }
 rusqlite = { workspace = true }
 
 [dev-dependencies]
