@@ -1,7 +1,4 @@
-use std::{
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::path::{Path, PathBuf};
 
 use codegraph_store::Store;
 
@@ -38,18 +35,44 @@ fn reopening_database_does_not_rerun_migrations() {
     assert_eq!(first_max, second_max);
 }
 
+// Replicates `sqlite3 .schema` in-process (no sqlite3 CLI on the Windows runner):
+// dump sqlite_master.sql in rowid order, and reproduce the `/* name(cols) */`
+// comment the shell appends after each CREATE VIRTUAL TABLE so the dump is
+// byte-identical to the committed golden schema across platforms.
 fn sqlite_schema(db_path: &Path) -> String {
-    let output = Command::new("sqlite3")
-        .arg(db_path)
-        .arg(".schema")
-        .output()
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT name, type, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY rowid")
         .unwrap();
-
-    assert!(
-        output.status.success(),
-        "sqlite3 .schema failed: {output:?}"
-    );
-    String::from_utf8(output.stdout).unwrap()
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    let mut raw = String::new();
+    for (name, kind, sql) in rows {
+        raw.push_str(&sql);
+        if kind == "table" && sql.starts_with("CREATE VIRTUAL TABLE") {
+            let mut col_stmt = conn
+                .prepare("SELECT name FROM pragma_table_info(?1)")
+                .unwrap();
+            let cols = col_stmt
+                .query_map([&name], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .join(",");
+            raw.push_str(&format!("\n/* {name}({cols}) */"));
+        }
+        raw.push_str(";\n");
+    }
+    raw
 }
 
 fn schema_version_count(conn: &rusqlite::Connection) -> i64 {
