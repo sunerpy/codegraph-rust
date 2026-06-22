@@ -415,8 +415,6 @@ golden byte-stable output.
 - [`docs/grammar-manifest.md`](docs/grammar-manifest.md) /
   [`docs/embedded-extraction.md`](docs/embedded-extraction.md) — languages /
   extraction.
-- [`KNOWN_DIFFS.md`](KNOWN_DIFFS.md) — registered Tier-3 presentation diffs (read
-  at runtime by the equivalence oracle).
 - [`examples/`](examples/) — codegraph -> LLM orchestration example.
 - [`docs/readme/README.zh-CN.md`](docs/readme/README.zh-CN.md) — 中文说明.
 

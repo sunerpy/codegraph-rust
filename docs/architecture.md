@@ -181,7 +181,7 @@ graph LR
 （`framework.rs`），v1 **零具体实现**。orchestrator 持有空的
 `Vec<Box<dyn FrameworkResolver>>`，因此行为等同于“零框架检测”下的结果。
 框架感知解析、回调合成、C++/Java 接收者推断、批处理/conformance 二次扫描等均为
-延后项，登记在 [`KNOWN_DIFFS.md`](../KNOWN_DIFFS.md)。
+延后项（内部上游差异台账登记）。
 
 mini golden 校验：提取 → 落库 → `resolve_and_persist` 后回读非 `contains` 边，
 其集合与 `reference/golden/mini/edges.json` 的 11 条已解析边**逐项相等**
