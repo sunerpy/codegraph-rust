@@ -1,5 +1,6 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::process::Command;
@@ -125,9 +126,15 @@ pub fn evict_path_from_cache(dir: &Path) {
             // SAFETY: `posix_fadvise` only reads kernel page-cache state for the
             // given valid borrowed fd; it mutates no Rust memory and the fd
             // outlives the call. A non-zero return is advisory and ignored.
+            #[cfg(unix)]
             unsafe {
                 libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
             }
+            // On non-Unix targets there is no `posix_fadvise`; eviction is a
+            // best-effort Unix optimization, so this arm is a no-op (the file is
+            // still synced above). The bind silences the unused-variable warning.
+            #[cfg(not(unix))]
+            let _ = &file;
         }
     }
 }
