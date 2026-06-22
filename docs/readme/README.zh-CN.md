@@ -313,7 +313,7 @@ MCP/CLI 表面、golden 字节稳定输出。
   见上文）。
 - 无语义检索；检索仅为 FTS5 + 确定性打分。
 - `FrameworkResolver` 已落地 React/Vue/NestJS 三个；其余框架解析为延后项
-  （见 [`../../KNOWN_DIFFS.md`](../../KNOWN_DIFFS.md)）。
+  （延后项，内部上游差异台账登记）。
 - 不新增固定 `LANGUAGES` 集以外的语言。
 
 ---
@@ -324,7 +324,6 @@ MCP/CLI 表面、golden 字节稳定输出。
 - [`../data-model.md`](../data-model.md) — SQLite/FTS5 存储契约。
 - [`../equivalence.md`](../equivalence.md) — 3 层等价方法、golden 流程、KNOWN_DIFFS 规则格式。
 - [`../grammar-manifest.md`](../grammar-manifest.md) / [`../embedded-extraction.md`](../embedded-extraction.md) — 语言/提取。
-- [`../../KNOWN_DIFFS.md`](../../KNOWN_DIFFS.md) — 已登记 Tier-3 表现层差异（被等价预言机运行时读取）。
 - [`../../examples/`](../../examples/) — codegraph→LLM 编排示例。
 
 ---

@@ -6,11 +6,10 @@
 //! `mcp.<name>` wrapper with a string-array `command` and an `enabled` flag —
 //! not `mcpServers`.
 //!
-//! DIVERGENCE FROM UPSTREAM: the upstream edits through `jsonc-parser` to preserve `//`
-//! comments on idempotent re-runs. This port uses serde_json (the task's JSON
-//! tool of choice): the written keys/shape are byte-faithful, but a user's
-//! hand-added JSONC comments are not preserved across an install rewrite. The
-//! emitted config remains valid opencode JSON.
+//! Existing configs are edited surgically via `jsonc-parser` (see
+//! `shared::upsert_nested_key_jsonc`), preserving the user's comments, key
+//! order, and formatting; only the `codegraph` entry changes. Fresh files are
+//! seeded with the canonical shape.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,8 +17,9 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Map, Value};
 
 use super::super::shared::{
-    self, parse_json_object, read_config_file, to_upstream_json, upsert_instructions_entry,
-    write_json_file, ConfigRead, CODEGRAPH_SECTION_END, CODEGRAPH_SECTION_START,
+    self, parse_json_object, read_config_file, remove_nested_key_jsonc, to_upstream_json,
+    upsert_instructions_entry, upsert_nested_key_jsonc, write_json_file, ConfigRead,
+    CODEGRAPH_SECTION_END, CODEGRAPH_SECTION_START,
 };
 use super::super::types::{
     AgentTarget, DetectionResult, FileAction, FileWrite, InstallContext, InstallOptions, Location,
@@ -162,80 +162,39 @@ impl AgentTarget for OpencodeTarget {
 // Ports writeMcpEntry (opencode.ts:189).
 fn write_mcp_entry(ctx: &InstallContext, loc: Location) -> FileWrite {
     let file = config_path(ctx, loc);
-    let existed = file.exists();
-    let mut config = match read_config_file(&file) {
-        ConfigRead::Missing => Map::new(),
-        ConfigRead::Parsed(map) => map,
-        ConfigRead::Unparseable => {
-            return FileWrite {
-                path: file,
-                action: FileAction::Skipped,
-            };
-        }
-    };
-    let before = config.get("mcp").and_then(|m| m.get("codegraph"));
     let after = opencode_server_entry();
-    if before == Some(&after) {
-        return FileWrite {
+    match read_config_file(&file) {
+        ConfigRead::Unparseable => FileWrite {
             path: file,
-            action: FileAction::Unchanged,
-        };
-    }
-    if !config.contains_key("$schema") {
-        // Insert $schema first so it leads the file, matching the seeded shape.
-        let mut reordered = Map::new();
-        reordered.insert("$schema".to_string(), json!(SCHEMA_URL));
-        for (k, v) in config {
-            reordered.insert(k, v);
-        }
-        config = reordered;
-    }
-    let mcp = config
-        .entry("mcp")
-        .or_insert_with(|| Value::Object(Map::new()));
-    if !mcp.is_object() {
-        *mcp = Value::Object(Map::new());
-    }
-    if let Value::Object(map) = mcp {
-        map.insert("codegraph".to_string(), after);
-    }
-    let _ = write_json_file(&file, &config);
-    FileWrite {
-        path: file,
-        action: if existed {
-            FileAction::Updated
-        } else {
-            FileAction::Created
+            action: FileAction::Skipped,
         },
+        ConfigRead::Missing => {
+            let mut config = Map::new();
+            config.insert("$schema".to_string(), json!(SCHEMA_URL));
+            let mut mcp = Map::new();
+            mcp.insert("codegraph".to_string(), after);
+            config.insert("mcp".to_string(), Value::Object(mcp));
+            let _ = write_json_file(&file, &config);
+            FileWrite {
+                path: file,
+                action: FileAction::Created,
+            }
+        }
+        ConfigRead::Parsed(_) => {
+            let action =
+                upsert_nested_key_jsonc(&file, "mcp", "codegraph", &after, Some(SCHEMA_URL))
+                    .unwrap_or(FileAction::Skipped);
+            FileWrite { path: file, action }
+        }
     }
 }
 
 // Ports removeMcpEntryAt (opencode.ts:233).
 fn remove_mcp_entry_at(file: &Path) -> FileWrite {
-    if !file.exists() {
-        return FileWrite {
-            path: file.to_path_buf(),
-            action: FileAction::NotFound,
-        };
-    }
-    let text = fs::read_to_string(file).unwrap_or_default();
-    let mut config = parse_config(&text);
-    if config.get("mcp").and_then(|m| m.get("codegraph")).is_none() {
-        return FileWrite {
-            path: file.to_path_buf(),
-            action: FileAction::NotFound,
-        };
-    }
-    if let Some(Value::Object(mcp)) = config.get_mut("mcp") {
-        mcp.remove("codegraph");
-        if mcp.is_empty() {
-            config.remove("mcp");
-        }
-    }
-    let _ = write_json_file(file, &config);
+    let action = remove_nested_key_jsonc(file, "mcp", "codegraph").unwrap_or(FileAction::NotFound);
     FileWrite {
         path: file.to_path_buf(),
-        action: FileAction::Removed,
+        action,
     }
 }
 

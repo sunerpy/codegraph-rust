@@ -14,7 +14,8 @@ use serde_json::{json, Map, Value};
 
 use super::super::shared::{
     mcp_server_config, read_config_file, read_json_file, remove_codegraph_from_mcp_servers,
-    to_upstream_json, write_json_file, ConfigRead, CODEGRAPH_SECTION_END, CODEGRAPH_SECTION_START,
+    to_upstream_json, upsert_nested_key_jsonc, write_json_file, ConfigRead, CODEGRAPH_SECTION_END,
+    CODEGRAPH_SECTION_START,
 };
 use super::super::types::{
     AgentTarget, DetectionResult, FileAction, FileWrite, InstallContext, InstallOptions, Location,
@@ -133,32 +134,27 @@ impl AgentTarget for CursorTarget {
 // Ports writeMcpEntry (cursor.ts:177).
 fn write_mcp_entry(ctx: &InstallContext, loc: Location) -> FileWrite {
     let file = mcp_json_path(ctx, loc);
-    let mut existing = match read_config_file(&file) {
-        ConfigRead::Missing => Map::new(),
-        ConfigRead::Parsed(map) => map,
-        ConfigRead::Unparseable => {
-            return FileWrite {
-                path: file,
-                action: FileAction::Skipped,
-            };
-        }
-    };
-    let before = existing.get("mcpServers").and_then(|s| s.get("codegraph"));
     let after = build_cursor_mcp_config(ctx, loc);
-    if before == Some(&after) {
-        return FileWrite {
+    match read_config_file(&file) {
+        ConfigRead::Unparseable => FileWrite {
             path: file,
-            action: FileAction::Unchanged,
-        };
+            action: FileAction::Skipped,
+        },
+        ConfigRead::Missing => {
+            let mut config = Map::new();
+            upsert_mcp_server(&mut config, "codegraph", after);
+            let _ = write_json_file(&file, &config);
+            FileWrite {
+                path: file,
+                action: FileAction::Created,
+            }
+        }
+        ConfigRead::Parsed(_) => {
+            let action = upsert_nested_key_jsonc(&file, "mcpServers", "codegraph", &after, None)
+                .unwrap_or(FileAction::Skipped);
+            FileWrite { path: file, action }
+        }
     }
-    let action = if before.is_some() || file.exists() {
-        FileAction::Updated
-    } else {
-        FileAction::Created
-    };
-    upsert_mcp_server(&mut existing, "codegraph", after);
-    let _ = write_json_file(&file, &existing);
-    FileWrite { path: file, action }
 }
 
 // Ports removeRulesEntry (cursor.ts:208).
