@@ -59,7 +59,11 @@ pure pre-computed structure for _you_ to consume.
 **Install + index a project:**
 
 ```bash
-cargo install --git https://github.com/sunerpy/codegraph-rust codegraph-rs   # binary: `codegraph`
+# Install the prebuilt binary (no Rust toolchain needed):
+curl -fsSL https://raw.githubusercontent.com/sunerpy/codegraph-rust/main/scripts/install.sh | sh
+# Windows (PowerShell): irm https://raw.githubusercontent.com/sunerpy/codegraph-rust/main/scripts/install.ps1 | iex
+# Fallback (build from source, needs Rust): cargo install --git https://github.com/sunerpy/codegraph-rust codegraph-rs
+
 codegraph init  /path/to/project     # create the index DB (.codegraph/)
 codegraph index /path/to/project     # parse + build the graph
 ```
