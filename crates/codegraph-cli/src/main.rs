@@ -92,7 +92,10 @@ impl Cli {
             | Command::Check { path, .. } => path.clone(),
             Command::Export { path, .. } => path.clone(),
             // install/uninstall are not project-scoped — bootstrap from cwd.
-            Command::Install { .. } | Command::Uninstall { .. } => None,
+            Command::Install { .. }
+            | Command::Uninstall { .. }
+            | Command::Version
+            | Command::SelfUpdate { .. } => None,
         };
         let start = absolute_path(raw.unwrap_or_else(|| PathBuf::from(".")));
         resolve_project_path_optional(&start)
@@ -261,6 +264,20 @@ enum Command {
         #[arg(short, long)]
         yes: bool,
     },
+    /// Print the codegraph version.
+    Version,
+    /// Update codegraph in place to the latest GitHub release.
+    SelfUpdate {
+        /// Check for a newer release without installing it.
+        #[arg(long)]
+        check: bool,
+        /// Reinstall even if already on the latest version.
+        #[arg(long)]
+        force: bool,
+        /// Update to a specific version tag (e.g. v0.2.0) instead of latest.
+        #[arg(long)]
+        tag: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -359,6 +376,11 @@ fn run(cli: Cli) -> Result<()> {
             location: location_flag(location, global, local),
             yes,
         }),
+        Command::Version => {
+            println!("codegraph {VERSION}");
+            Ok(())
+        }
+        Command::SelfUpdate { check, force, tag } => cmd_self_update(check, force, tag),
     }
 }
 
@@ -374,6 +396,47 @@ fn location_flag(location: Option<String>, global: bool, local: bool) -> Option<
         return Some("local".to_string());
     }
     None
+}
+
+fn cmd_self_update(check: bool, force: bool, tag: Option<String>) -> Result<()> {
+    use self_update::cargo_crate_version;
+
+    let mut builder = self_update::backends::github::Update::configure();
+    builder
+        .repo_owner("sunerpy")
+        .repo_name("codegraph-rust")
+        .bin_name("codegraph")
+        .current_version(cargo_crate_version!())
+        .show_download_progress(true)
+        .no_confirm(force);
+    if let Some(tag) = &tag {
+        builder.target_version_tag(tag);
+    }
+    let updater = builder
+        .build()
+        .context("configuring the self-update backend")?;
+
+    if check {
+        let latest = updater
+            .get_latest_release()
+            .context("querying the latest GitHub release")?;
+        let current = cargo_crate_version!();
+        if self_update::version::bump_is_greater(current, &latest.version).unwrap_or(false) {
+            println!("codegraph {current} -> {} available", latest.version);
+            println!("run `codegraph self-update` to install it");
+        } else {
+            println!("codegraph {current} is up to date");
+        }
+        return Ok(());
+    }
+
+    let status = updater.update().context("performing the self-update")?;
+    if status.updated() {
+        println!("Updated codegraph to {}", status.version());
+    } else {
+        println!("codegraph {} is already up to date", status.version());
+    }
+    Ok(())
 }
 
 fn cmd_init(path: Option<PathBuf>) -> Result<()> {

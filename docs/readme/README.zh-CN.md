@@ -61,7 +61,7 @@ SQLite 数据库（含 FTS5 检索索引），并通过 CLI 与 MCP（Model Cont
 | `codegraph-graph`   | 图遍历（callers/callees/impact/类型层级/路径/循环检测）+ FTS5 检索打分 + 全图导出/中心性。 |
 | `codegraph-resolve` | import resolver + name matcher + React/Vue/NestJS FrameworkResolver。                      |
 | `codegraph-mcp`     | MCP stdio JSON-RPC 服务器与 10 个工具的处理器/渲染器。                                     |
-| `codegraph-cli`     | `codegraph` 单一二进制（17 个子命令）。                                                    |
+| `codegraph-cli`     | `codegraph` 单一二进制（19 个子命令）。                                                    |
 | `codegraph-daemon`  | 按项目的单实例守护进程。                                                                   |
 | `codegraph-watch`   | 去抖动文件监听 + 增量同步。                                                                |
 | `codegraph-bench`   | 基准测试与等价预言机库 + `bench` 二进制。                                                  |
@@ -184,7 +184,7 @@ codegraph export --path /tmp/cg-demo --out graph.json   # 全图导出
 
 ---
 
-## CLI 子命令（共 17 个）
+## CLI 子命令（共 19 个）
 
 | 子命令                           | 作用                                           | 关键标志                                                               |
 | -------------------------------- | ---------------------------------------------- | ---------------------------------------------------------------------- |
@@ -199,6 +199,21 @@ codegraph export --path /tmp/cg-demo --out graph.json   # 全图导出
 | `check`                          | 循环依赖检测（环列为 a.ts → b.ts → a.ts）      | `[path]`、`-j/--json`                                                  |
 | `export`                         | 导出整张代码图谱为 NetworkX node-link JSON     | `[path]`、`-o/--out <文件>`、`--no-centrality`                         |
 | `unlock`                         | 清理陈旧守护进程锁                             | `[path]`                                                               |
+| `version`                        | 打印 codegraph 版本（等同 `--version`）        | —                                                                      |
+| `self-update`                    | 从最新 GitHub Release 原地升级二进制           | `--check`、`--force`、`--tag <vX.Y.Z>`                                 |
+
+### `codegraph self-update` — 从 GitHub Releases 原地升级
+
+无需重新跑包管理器，即可把当前运行的 `codegraph` 升级到最新 GitHub Release（类似 `mise self-update`）。它会探测平台、从 [Releases](https://github.com/sunerpy/codegraph-rust/releases) 下载匹配的 `codegraph-<version>-<target>.tar.gz` 资产、校验后原子替换当前可执行文件。分发始终基于 GitHub Releases，不从 crates.io 拉取。
+
+```bash
+codegraph self-update              # 有新版则升级到最新
+codegraph self-update --check      # 只检查是否有新版，不安装
+codegraph self-update --force      # 即使已是最新也重新安装
+codegraph self-update --tag v0.2.0 # 指定某个 Release 标签
+```
+
+若 `codegraph` 位于受保护路径（如系统目录 `/usr/local/bin`），请用具备写权限的身份运行；升级后用 `codegraph version`（或 `--version`）确认版本。预编译升级支持 Linux（musl）与 macOS；Windows 请从源码重新安装。
 
 ### `codegraph export` — 全图导出 + 中心性
 

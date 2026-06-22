@@ -212,27 +212,29 @@ codegraph query Counter -p /tmp/cg-demo -l 1 -j # JSON output
 
 ---
 
-## CLI Subcommands (17)
+## CLI Subcommands (19)
 
-| Subcommand  | Purpose                                                             | Key flags                                                                                                    |
-| ----------- | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `install`   | Write the codegraph MCP server into each AI agent's config          | `-t/--target`, `-l/--location`, `--global`, `--local`, `-y/--yes`, `--no-permissions`, `--print-config <id>` |
-| `uninstall` | Remove codegraph from agent configs (inverse of `install`)          | `-t/--target`, `-l/--location`, `--global`, `--local`, `-y/--yes`                                            |
-| `init`      | Initialize `.codegraph/` and run the first full index               | `[path]`                                                                                                     |
-| `uninit`    | Delete the project's `.codegraph/` index                            | `[path]`, `-f/--force`                                                                                       |
-| `index`     | (Re-)index in full                                                  | `[path]`, `-f/--force`, `-q/--quiet`, `-v/--verbose`                                                         |
-| `sync`      | Sync changes (currently reuses the safe full-index path)            | `[path]`, `-q/--quiet`                                                                                       |
-| `status`    | Print index stats (files/nodes/edges/DB size/journal)               | `[path]`, `-j/--json`                                                                                        |
-| `query`     | FTS5 + multi-signal scored search                                   | `<search>`, `-p`, `-l/--limit`, `-k/--kind`, `-j`                                                            |
-| `files`     | List indexed files (tree/flat/grouped)                              | `-p`, `--filter`, `--pattern`, `--format`, `--max-depth`, `-j`                                               |
-| `serve`     | Start the server; `--mcp` enters MCP stdio mode                     | `-p`, `--mcp`, `--no-watch`                                                                                  |
-| `unlock`    | Clear a stale daemon lock (keeps live pids)                         | `[path]`                                                                                                     |
-| `callers`   | Who calls a symbol (along calls/references/imports)                 | `<symbol>`, `-p`, `-l`, `-j`                                                                                 |
-| `callees`   | What a symbol calls                                                 | `<symbol>`, `-p`, `-l`, `-j`                                                                                 |
-| `impact`    | Blast radius of changing a symbol (incoming deps)                   | `<symbol>`, `-p`, `-d/--depth`, `-j`                                                                         |
-| `affected`  | Given changed files, the affected symbol set                        | `[files...]`, `-p`, `-d/--depth`, `--filter`                                                                 |
-| `check`     | Detect circular dependencies (each cycle as `a.ts -> b.ts -> a.ts`) | `[path]`, `-j/--json`                                                                                        |
-| `export`    | Export the whole code graph as NetworkX node-link JSON              | `[path]`, `-o/--out <file>`, `--no-centrality`                                                               |
+| Subcommand    | Purpose                                                             | Key flags                                                                                                    |
+| ------------- | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `install`     | Write the codegraph MCP server into each AI agent's config          | `-t/--target`, `-l/--location`, `--global`, `--local`, `-y/--yes`, `--no-permissions`, `--print-config <id>` |
+| `uninstall`   | Remove codegraph from agent configs (inverse of `install`)          | `-t/--target`, `-l/--location`, `--global`, `--local`, `-y/--yes`                                            |
+| `init`        | Initialize `.codegraph/` and run the first full index               | `[path]`                                                                                                     |
+| `uninit`      | Delete the project's `.codegraph/` index                            | `[path]`, `-f/--force`                                                                                       |
+| `index`       | (Re-)index in full                                                  | `[path]`, `-f/--force`, `-q/--quiet`, `-v/--verbose`                                                         |
+| `sync`        | Sync changes (currently reuses the safe full-index path)            | `[path]`, `-q/--quiet`                                                                                       |
+| `status`      | Print index stats (files/nodes/edges/DB size/journal)               | `[path]`, `-j/--json`                                                                                        |
+| `query`       | FTS5 + multi-signal scored search                                   | `<search>`, `-p`, `-l/--limit`, `-k/--kind`, `-j`                                                            |
+| `files`       | List indexed files (tree/flat/grouped)                              | `-p`, `--filter`, `--pattern`, `--format`, `--max-depth`, `-j`                                               |
+| `serve`       | Start the server; `--mcp` enters MCP stdio mode                     | `-p`, `--mcp`, `--no-watch`                                                                                  |
+| `unlock`      | Clear a stale daemon lock (keeps live pids)                         | `[path]`                                                                                                     |
+| `callers`     | Who calls a symbol (along calls/references/imports)                 | `<symbol>`, `-p`, `-l`, `-j`                                                                                 |
+| `callees`     | What a symbol calls                                                 | `<symbol>`, `-p`, `-l`, `-j`                                                                                 |
+| `impact`      | Blast radius of changing a symbol (incoming deps)                   | `<symbol>`, `-p`, `-d/--depth`, `-j`                                                                         |
+| `affected`    | Given changed files, the affected symbol set                        | `[files...]`, `-p`, `-d/--depth`, `--filter`                                                                 |
+| `check`       | Detect circular dependencies (each cycle as `a.ts -> b.ts -> a.ts`) | `[path]`, `-j/--json`                                                                                        |
+| `export`      | Export the whole code graph as NetworkX node-link JSON              | `[path]`, `-o/--out <file>`, `--no-centrality`                                                               |
+| `version`     | Print the codegraph version (same as `--version`)                   | —                                                                                                            |
+| `self-update` | Update the binary in place from the latest GitHub release           | `--check`, `--force`, `--tag <vX.Y.Z>`                                                                       |
 
 Each subcommand's output / JSON shape follows a fixed contract (reference line
 numbers annotated in the source comments).
@@ -259,6 +261,25 @@ own entry/section and leaves other MCP servers intact. Instruction files are
 delimited by `<!-- CODEGRAPH_START -->`/`<!-- CODEGRAPH_END -->` markers. The
 interactive multiselect TUI is not provided — this is non-interactive,
 flag-driven (defaults to `auto` when no `--target`).
+
+### `codegraph self-update` — upgrade in place from GitHub Releases
+
+Update the running binary to the latest GitHub release without a package
+manager (mise-style). It detects your platform, downloads the matching
+`codegraph-<version>-<target>.tar.gz` asset from the
+[Releases](https://github.com/sunerpy/codegraph-rust/releases) page, verifies it,
+and atomically replaces the current executable.
+
+```bash
+codegraph self-update            # update to the latest release
+codegraph self-update --check    # only report whether a newer version exists
+codegraph self-update --force    # reinstall even if already current
+codegraph self-update --tag v0.2.0   # pin a specific release tag
+```
+
+If codegraph lives on a root-owned path (e.g. `/usr/local/bin`), run it with the
+appropriate privileges. Works on the prebuilt Linux (musl) and macOS targets; on
+Windows, reinstall from source instead.
 
 ### `codegraph export` — whole-graph export + centrality
 
