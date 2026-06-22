@@ -33,7 +33,7 @@ irm https://raw.githubusercontent.com/sunerpy/codegraph-rust/main/scripts/instal
 ```bash
 codegraph init  /path/to/project                   # 创建 .codegraph/ 并执行首次索引
 codegraph query "<symbol>" -p /path/to/project     # 全文检索
-codegraph serve --mcp --path /path/to/project      # 为 AI 代理启动 MCP 服务器
+codegraph serve --mcp --path /path/to/project      # 为 AI 代理启动 MCP 服务器（--path 可选，默认 cwd）
 ```
 
 ---
@@ -63,7 +63,8 @@ codegraph index /path/to/project     # 解析 + 构建图
 **作为 MCP 服务器使用（推荐给代理）**，它通过 stdio 走 MCP：
 
 ```bash
-codegraph serve --mcp --path /path/to/project
+codegraph serve --mcp                          # 默认使用 cwd（推荐：用 codegraph install 自动注册）
+codegraph serve --mcp --path /path/to/project  # 可选：固定到指定项目
 ```
 
 自动注册进你的代理配置（Claude Code / Cursor / Codex CLI / opencode / Hermes /
@@ -141,11 +142,16 @@ cargo install --git https://github.com/sunerpy/codegraph-rust codegraph-rs
   "mcpServers": {
     "codegraph": {
       "command": "codegraph",
-      "args": ["serve", "--mcp", "-p", "/abs/path/to/your/project"],
+      "args": ["serve", "--mcp"],
     },
   },
 }
 ```
+
+**默认（不带 `-p`）：** MCP 服务器从代理的工作目录解析项目，一份配置即可覆盖所有
+项目——每个项目只需提前用 `codegraph index` 建立索引。**可选 `-p <path>` /
+`--path <path>`：** 不依赖工作目录、固定指向单个项目（例如
+`"args": ["serve", "--mcp", "-p", "/abs/path/to/project"]`）。
 
 支持的代理：Claude Code、Cursor、Codex CLI、opencode、Hermes Agent、
 Gemini CLI、Antigravity IDE、Kiro。

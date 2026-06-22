@@ -18,11 +18,17 @@ it automatically:
   "mcpServers": {
     "codegraph": {
       "command": "codegraph",
-      "args": ["serve", "--mcp", "-p", "/abs/path/to/your/project"],
+      "args": ["serve", "--mcp"],
     },
   },
 }
 ```
+
+**Default (no `-p`):** the MCP server resolves the project from the agent's
+working directory, so one config works for all your projects — each just needs
+to be indexed with `codegraph index`. **Optional `-p <path>` / `--path <path>`:**
+pin the server to one fixed project regardless of cwd (e.g.
+`"args": ["serve", "--mcp", "-p", "/abs/path/to/project"]`).
 
 Supported agents: Claude Code, Cursor, Codex CLI, opencode, Hermes Agent,
 Gemini CLI, Antigravity IDE, Kiro.
@@ -38,7 +44,7 @@ set the `CODEGRAPH_MCP_TOOLS` environment variable to a comma-separated list of
 short names, e.g.:
 
 ```bash
-CODEGRAPH_MCP_TOOLS=explore,node,search,callers,impact,check codegraph serve --mcp -p .
+CODEGRAPH_MCP_TOOLS=explore,node,search,callers,impact,check codegraph serve --mcp
 ```
 
 ---
