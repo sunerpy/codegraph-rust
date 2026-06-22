@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.2](https://github.com/sunerpy/codegraph-rust/compare/v0.5.1...v0.5.2) (2026-06-22)
+
+
+### Bug Fixes
+
+* **cli:** default serve --mcp project to the current directory ([26be9df](https://github.com/sunerpy/codegraph-rust/commit/26be9df27a2061fe58b5f939230dc693ef42796b))
+
 ## [0.5.1](https://github.com/sunerpy/codegraph-rust/compare/v0.5.0...v0.5.1) (2026-06-22)
 
 
