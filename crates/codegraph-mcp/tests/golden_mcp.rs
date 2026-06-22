@@ -11,9 +11,12 @@
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use codegraph_mcp::McpServer;
 use serde_json::{json, Value};
+
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -21,6 +24,21 @@ fn workspace_root() -> PathBuf {
         .join("..")
         .canonicalize()
         .expect("workspace root")
+}
+
+// Retry on Windows ERROR_SHARING_VIOLATION (raw OS error 32): a still-open SQLite
+// handle or an AV scanner can briefly lock the destination. raw_os_error() == 32
+// never occurs on Unix, so the first attempt always succeeds there (byte-identical).
+fn copy_with_retry(src: &Path, dst: &Path) {
+    for attempt in 0..10 {
+        match fs::copy(src, dst) {
+            Ok(_) => return,
+            Err(err) if err.raw_os_error() == Some(32) && attempt < 9 => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(err) => panic!("copy {} -> {}: {err:?}", src.display(), dst.display()),
+        }
+    }
 }
 
 /// Owns a temp project dir and removes it on drop (workspace convention is
@@ -51,19 +69,20 @@ fn setup_mini_project() -> TestProject {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let base = std::env::temp_dir().join(format!("cg-mcp-test-{}-{nanos}", std::process::id()));
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let base =
+        std::env::temp_dir().join(format!("cg-mcp-test-{}-{nanos}-{seq}", std::process::id()));
     fs::create_dir_all(base.join(".codegraph")).unwrap();
-    fs::copy(
-        root.join("reference/golden/mini/colby.db"),
-        base.join(".codegraph").join("codegraph.db"),
-    )
-    .expect("copy golden db");
+    copy_with_retry(
+        &root.join("reference/golden/mini/colby.db"),
+        &base.join(".codegraph").join("codegraph.db"),
+    );
 
     let fixtures = root.join("crates/codegraph-bench/fixtures/mini");
     for rel in ["src/app.ts", "src/math.ts", "tools/greeter.py"] {
         let dst = base.join(rel);
         fs::create_dir_all(dst.parent().unwrap()).unwrap();
-        fs::copy(fixtures.join(rel), &dst).unwrap_or_else(|e| panic!("copy fixture {rel}: {e}"));
+        copy_with_retry(&fixtures.join(rel), &dst);
     }
     TestProject { path: base }
 }
@@ -428,7 +447,9 @@ fn index_fixture(files: &[(&str, &str)]) -> TestProject {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let base = std::env::temp_dir().join(format!("cg-mcp-dyn-{}-{nanos}", std::process::id()));
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let base =
+        std::env::temp_dir().join(format!("cg-mcp-dyn-{}-{nanos}-{seq}", std::process::id()));
     for (rel, src) in files {
         let dst = base.join(rel);
         fs::create_dir_all(dst.parent().unwrap()).unwrap();

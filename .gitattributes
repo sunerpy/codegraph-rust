@@ -35,14 +35,17 @@ crates/codegraph-mcp/src/tools_list.json text eol=lf
 *.yaml text eol=lf
 
 # --- Binary artifacts: never let git touch these bytes ---
-reference/golden/**/*.db     binary
-reference/golden/**/*.db-shm binary
-reference/golden/**/*.db-wal binary
-*.db     binary
-*.db-shm binary
-*.db-wal binary
-*.sqlite binary
-*.sqlite3 binary
+# `-text` is explicit (not just `binary`) so the catch-all `* text=auto eol=lf`
+# can never leave a dangling `eol=lf` applied to a binary SQLite DB: `-text`
+# unsets text (making eol inert) and `!eol` clears the inherited eol outright.
+reference/golden/**/*.db     binary -text !eol
+reference/golden/**/*.db-shm binary -text !eol
+reference/golden/**/*.db-wal binary -text !eol
+*.db      binary -text !eol
+*.db-shm  binary -text !eol
+*.db-wal  binary -text !eol
+*.sqlite  binary -text !eol
+*.sqlite3 binary -text !eol
 *.tar.gz binary
 *.png  binary
 *.jpg  binary
