@@ -16,8 +16,8 @@ use clap_complete::{generate, Shell};
 use codegraph_core::config::init_config;
 use codegraph_core::logger::{init_logger, LoggerConfig};
 use codegraph_core::node_id::hash_content;
-use codegraph_core::types::{FileRecord, Language, Node, NodeKind};
-use codegraph_extract::{detect_language, extract_file, ExtractOptions};
+use codegraph_core::types::{ExtractionResult, FileRecord, Language, Node, NodeKind};
+use codegraph_extract::{detect_language, extract_source, ExtractOptions};
 use codegraph_graph::graph::GraphTraverser;
 use codegraph_graph::query::{search_nodes, SearchOptions};
 use codegraph_mcp::McpServer;
@@ -25,6 +25,7 @@ use codegraph_resolve::ReferenceResolver;
 use codegraph_store::queries::SearchResult;
 use codegraph_store::Store;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use rayon::prelude::*;
 use serde::Serialize;
 use serde_json::json;
 use time::format_description::well_known::Rfc3339;
@@ -1151,38 +1152,70 @@ fn index_project_inner(
         quiet,
         "{spinner:.green} Indexing [{bar:30}] {pos}/{len} files ({elapsed}) {wide_msg}",
     );
-    for relative in files {
-        if verbose {
-            bar.set_message(relative.clone());
-        }
-        let full = project.join(&relative);
-        let source = fs::read_to_string(&full)
-            .with_context(|| format!("reading source file {}", full.display()))?;
-        let metadata = fs::metadata(&full)
-            .with_context(|| format!("reading metadata for {}", full.display()))?;
-        let mut result = extract_file(project, &relative)?;
-        let errors = result.errors.clone();
-        if errors.is_empty() {
+    if verbose {
+        bar.set_message(format!(
+            "parsing ({} threads)",
+            rayon::current_num_threads()
+        ));
+    }
+
+    // Parse in parallel; the order-preserving collect keeps the Vec in sorted
+    // `scan_project` order. One metadata + one source read per file (no double
+    // read, no TOCTOU straddle); the size gate mirrors `extract_file`
+    // (engine.rs:152) exactly so oversized files still size-skip identically.
+    let parsed: Vec<(String, FileRecord, ExtractionResult)> = files
+        .par_iter()
+        .map(
+            |relative| -> Result<(String, FileRecord, ExtractionResult)> {
+                let full = project.join(relative);
+                let metadata = fs::metadata(&full)
+                    .with_context(|| format!("reading metadata for {}", full.display()))?;
+                let source = fs::read_to_string(&full)
+                    .with_context(|| format!("reading source file {}", full.display()))?;
+                let result = if metadata.len() > options.max_file_size {
+                    ExtractionResult {
+                        nodes: Vec::new(),
+                        edges: Vec::new(),
+                        unresolved_references: Vec::new(),
+                        errors: vec![format!(
+                            "File exceeds max size ({} > {}): {relative}",
+                            metadata.len(),
+                            options.max_file_size
+                        )],
+                        duration_ms: 0,
+                    }
+                } else {
+                    extract_source(relative, &source, None)
+                };
+                let file = FileRecord {
+                    path: relative.clone(),
+                    content_hash: hash_content(&source),
+                    language: detect_language(relative),
+                    size: metadata.len() as i64,
+                    modified_at: modified_millis(&metadata),
+                    indexed_at: now_millis(),
+                    node_count: result
+                        .nodes
+                        .iter()
+                        .filter(|n| n.file_path == *relative)
+                        .count() as i64,
+                    errors: result.errors.clone(),
+                };
+                Ok((relative.clone(), file, result))
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
+
+    // Drain serially in sorted `scan_project` order: node/edge/ref insert order
+    // stays byte-for-byte identical to the serial path.
+    for (_relative, file, mut result) in parsed {
+        if file.errors.is_empty() {
             files_indexed += 1;
         } else if result.nodes.is_empty() {
             files_skipped += 1;
         } else {
             files_errored += 1;
         }
-        let file = FileRecord {
-            path: relative.clone(),
-            content_hash: hash_content(&source),
-            language: detect_language(&relative),
-            size: metadata.len() as i64,
-            modified_at: modified_millis(&metadata),
-            indexed_at: now_millis(),
-            node_count: result
-                .nodes
-                .iter()
-                .filter(|n| n.file_path == relative)
-                .count() as i64,
-            errors,
-        };
 
         store.upsert_file(&file)?;
 
