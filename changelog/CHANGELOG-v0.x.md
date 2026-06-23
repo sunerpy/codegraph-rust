@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/sunerpy/codegraph-rust/compare/v0.7.0...v0.8.0) (2026-06-23)
+
+
+### Features
+
+* **index:** parallelize parsing and reference resolution ([5692768](https://github.com/sunerpy/codegraph-rust/commit/56927686f402a325bc9e4cf984a3b84cf199643f))
+
 ## [0.7.0](https://github.com/sunerpy/codegraph-rust/compare/v0.6.0...v0.7.0) (2026-06-23)
 
 
