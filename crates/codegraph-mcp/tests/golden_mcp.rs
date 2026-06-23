@@ -12,11 +12,26 @@ use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use codegraph_mcp::McpServer;
 use serde_json::{json, Value};
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Serializes every test that is sensitive to the PROCESS-GLOBAL
+/// `CODEGRAPH_MCP_TOOLS` env var (read in `schemas.rs`). cargo runs tests
+/// multi-threaded in ONE process, so the allowlist test's `set_var` would
+/// otherwise race the default-surface readers (which assert the 4-tool
+/// surface) and intermittently observe the 2-tool allowlist instead. Every
+/// such test acquires this SHARED lock for the env-set→read window.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Acquire [`ENV_LOCK`], recovering from poisoning so one failing test does not
+/// cascade-poison the rest of the suite.
+fn lock_env() -> MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -188,6 +203,7 @@ fn initialize_matches_golden() {
 
 #[test]
 fn tools_list_matches_upstream_names_and_schemas() {
+    let _env = lock_env();
     let project = setup_mini_project();
     let (req, golden_resp) = load_golden("tools_list");
     let resp = roundtrip(project.path(), req);
@@ -252,6 +268,7 @@ fn default_project_indexed_serves_full_tools_list_after_initialize() {
     // the server with the agent's project root as cwd and no projectPath, so the
     // CLI must default the project to that indexed root. With a Some(indexed)
     // default_project, the initialize->tools/list handshake must expose 4 tools.
+    let _env = lock_env();
     let project = index_fixture(&[(
         "src/app.ts",
         "export function greet(name: string): string {\n  return `hi ${name}`;\n}\n",
@@ -322,14 +339,15 @@ fn default_project_unindexed_serves_empty_tools_list() {
 #[test]
 fn tools_list_honors_codegraph_mcp_tools_allowlist() {
     // CODEGRAPH_MCP_TOOLS replaces the default surface with exactly the named
-    // tools — any of the 8 (tools.ts:711-740). Serialized to avoid env-var
-    // races with other tests in the same process.
-    use std::sync::Mutex;
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-    let _guard = ENV_LOCK.lock().unwrap();
+    // tools — any of the 8 (tools.ts:711-740). Serialized via the shared
+    // ENV_LOCK to avoid env-var races with the default-surface readers in the
+    // same process.
+    let _env = lock_env();
 
     let project = setup_mini_project();
-    // SAFETY: single-threaded test section guarded by ENV_LOCK.
+    // SAFETY: single-threaded test section guarded by ENV_LOCK; remove_var runs
+    // before any assertion that could panic, so a failed assert never leaks the
+    // var to other tests.
     unsafe { std::env::set_var("CODEGRAPH_MCP_TOOLS", "impact,files") };
     let resp = roundtrip(
         project.path(),

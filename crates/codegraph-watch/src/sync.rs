@@ -23,6 +23,17 @@ pub struct SyncOutcome {
 }
 
 pub fn sync_project_once(project_root: impl AsRef<Path>) -> Result<SyncOutcome> {
+    sync_project_once_with_progress(project_root, |_, _| {})
+}
+
+/// Like [`sync_project_once`] but invokes `on_progress(done, total)` after each
+/// candidate file is processed, letting a caller drive a progress bar. The
+/// callback is a pure side effect: it never gates or reorders work, so the
+/// result stays byte-equivalent to `index --force`.
+pub fn sync_project_once_with_progress(
+    project_root: impl AsRef<Path>,
+    on_progress: impl FnMut(usize, usize),
+) -> Result<SyncOutcome> {
     let project_root = project_root.as_ref();
     let config = codegraph_core::config::get_config();
     let options = ExtractOptions {
@@ -47,7 +58,7 @@ pub fn sync_project_once(project_root: impl AsRef<Path>) -> Result<SyncOutcome> 
         }
     }
 
-    sync_paths_with_store(&mut store, project_root, candidates, started)
+    sync_paths_with_store(&mut store, project_root, candidates, started, on_progress)
 }
 
 pub fn sync_changed_paths(
@@ -59,7 +70,7 @@ pub fn sync_changed_paths(
     let project_root = project_root.as_ref();
     let db_path = db_path.as_ref();
     let mut store = Store::open(db_path).with_context(|| format!("open {}", db_path.display()))?;
-    sync_paths_with_store(&mut store, project_root, paths, started)
+    sync_paths_with_store(&mut store, project_root, paths, started, |_, _| {})
 }
 
 fn sync_paths_with_store(
@@ -67,6 +78,7 @@ fn sync_paths_with_store(
     project_root: &Path,
     paths: impl IntoIterator<Item = impl AsRef<Path>>,
     started: std::time::Instant,
+    mut on_progress: impl FnMut(usize, usize),
 ) -> Result<SyncOutcome> {
     let policy = WatchPolicy::new(project_root);
     let mut outcome = SyncOutcome::default();
@@ -77,17 +89,22 @@ fn sync_paths_with_store(
     let mut reindexed = HashSet::new();
     let mut changed_names = HashSet::new();
 
-    for path in paths {
+    let paths = paths.into_iter().collect::<Vec<_>>();
+    let total = paths.len();
+    for (done, path) in paths.into_iter().enumerate() {
         let Some(relative) = policy.normalize_relative(path.as_ref()) else {
             outcome.files_ignored += 1;
+            on_progress(done + 1, total);
             continue;
         };
         if !seen.insert(relative.clone()) {
+            on_progress(done + 1, total);
             continue;
         }
         outcome.files_checked += 1;
         if !policy.should_handle_file(&relative) {
             outcome.files_ignored += 1;
+            on_progress(done + 1, total);
             continue;
         }
         if sync_one(
@@ -101,6 +118,7 @@ fn sync_paths_with_store(
             changed = true;
             reindexed.insert(relative);
         }
+        on_progress(done + 1, total);
     }
 
     if changed {

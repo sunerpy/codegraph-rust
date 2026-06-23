@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -24,6 +24,7 @@ use codegraph_mcp::McpServer;
 use codegraph_resolve::ReferenceResolver;
 use codegraph_store::queries::SearchResult;
 use codegraph_store::Store;
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use serde::Serialize;
 use serde_json::json;
 use time::format_description::well_known::Rfc3339;
@@ -604,7 +605,7 @@ fn cmd_index(path: Option<PathBuf>, force: bool, quiet: bool, verbose: bool) -> 
     if force {
         remove_db_files(&project)?;
     }
-    let result = index_project(&project, true, verbose)?;
+    let result = index_project_inner(&project, true, verbose, quiet)?;
     if !quiet {
         print_index_result(&result);
     }
@@ -620,7 +621,22 @@ fn cmd_sync(path: Option<PathBuf>, quiet: bool) -> Result<()> {
     // sync_project_once self-discovers candidate files via scan_project, so it works
     // for a cold CLI invocation with no daemon. Hash-gated skip + per-file delete/reinsert
     // + full re-resolve makes the result equivalent to `index --force`.
-    let outcome = codegraph_watch::sync_project_once(&project)?;
+    if !quiet {
+        eprintln!("Scanning files…");
+    }
+    let bar = spinner(
+        quiet,
+        "{spinner:.green} Syncing {pos}/{len} files ({elapsed})",
+    );
+    let mut bar_len_set = false;
+    let outcome = codegraph_watch::sync_project_once_with_progress(&project, |done, total| {
+        if !bar_len_set {
+            bar.set_length(total as u64);
+            bar_len_set = true;
+        }
+        bar.set_position(done as u64);
+    })?;
+    bar.finish_and_clear();
     if !quiet {
         println!(
             "Synced: {} reindexed, {} skipped (unchanged), {} removed in {}",
@@ -1025,7 +1041,43 @@ struct IndexSummary {
     duration_ms: i64,
 }
 
+// Progress is a pure side effect: it only counts/displays and never gates,
+// reorders, or alters extraction, so golden byte-equivalence is preserved. It
+// draws to stderr (stdout carries JSON / golden output) and is hidden when
+// stderr is not a TTY or `--quiet`, so CI logs and pipes stay clean.
+fn progress_bar(len: u64, quiet: bool, template: &str) -> ProgressBar {
+    if quiet || !io::stderr().is_terminal() {
+        return ProgressBar::hidden();
+    }
+    let bar = ProgressBar::with_draw_target(Some(len), ProgressDrawTarget::stderr());
+    if let Ok(style) = ProgressStyle::with_template(template) {
+        bar.set_style(style.progress_chars("=>-"));
+    }
+    bar
+}
+
+fn spinner(quiet: bool, template: &str) -> ProgressBar {
+    if quiet || !io::stderr().is_terminal() {
+        return ProgressBar::hidden();
+    }
+    let bar = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr());
+    if let Ok(style) = ProgressStyle::with_template(template) {
+        bar.set_style(style);
+    }
+    bar.enable_steady_tick(std::time::Duration::from_millis(100));
+    bar
+}
+
 fn index_project(project: &Path, clear_first: bool, verbose: bool) -> Result<IndexSummary> {
+    index_project_inner(project, clear_first, verbose, false)
+}
+
+fn index_project_inner(
+    project: &Path,
+    clear_first: bool,
+    verbose: bool,
+    quiet: bool,
+) -> Result<IndexSummary> {
     let started = std::time::Instant::now();
     if clear_first {
         remove_db_files(project)?;
@@ -1037,6 +1089,9 @@ fn index_project(project: &Path, clear_first: bool, verbose: bool) -> Result<Ind
         ignore_dirs: config.indexing.ignore_dirs.clone(),
         parallel: true,
     };
+    if !quiet {
+        eprintln!("Scanning files…");
+    }
     let files = codegraph_extract::engine::scan_project(project, &options)?;
     let mut store = open_store(project)?;
     let before = store.counts()?;
@@ -1064,9 +1119,14 @@ fn index_project(project: &Path, clear_first: bool, verbose: bool) -> Result<Ind
     let mut spill = SpillWriter::new(codegraph_dir(project))?;
     let mut pending_nodes: Vec<Node> = Vec::with_capacity(NODE_FLUSH_ROWS);
 
+    let bar = progress_bar(
+        files.len() as u64,
+        quiet,
+        "{spinner:.green} Indexing [{bar:30}] {pos}/{len} files ({elapsed}) {wide_msg}",
+    );
     for relative in files {
         if verbose {
-            println!("indexing {relative}");
+            bar.set_message(relative.clone());
         }
         let full = project.join(&relative);
         let source = fs::read_to_string(&full)
@@ -1107,7 +1167,9 @@ fn index_project(project: &Path, clear_first: bool, verbose: bool) -> Result<Ind
 
         spill.write_edges(&result.edges)?;
         spill.write_refs(&result.unresolved_references)?;
+        bar.inc(1);
     }
+    bar.finish_and_clear();
 
     if !pending_nodes.is_empty() {
         store.upsert_nodes(&pending_nodes)?;
