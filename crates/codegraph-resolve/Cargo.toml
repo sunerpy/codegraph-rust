@@ -19,4 +19,5 @@ codegraph-extract = { path = "../codegraph-extract" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+rayon = { workspace = true }
 regex = "1.10"

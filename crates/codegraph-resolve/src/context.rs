@@ -305,6 +305,22 @@ impl ResolutionContext for StoreResolutionContext<'_> {
     }
 }
 
+/// Shares the byte-equivalence-critical [`order_candidates`] tie-break with the
+/// [`SnapshotResolutionContext`](crate::snapshot_context::SnapshotResolutionContext).
+pub(crate) fn order_candidates_pub(nodes: &mut [Node]) {
+    order_candidates(nodes);
+}
+
+/// Shares [`is_js_family_path`] with the snapshot context.
+pub(crate) fn is_js_family_path_pub(file_path: &str) -> bool {
+    is_js_family_path(file_path)
+}
+
+/// Shares [`load_go_module`] with the snapshot context.
+pub(crate) fn load_go_module_pub(project_root: &str) -> Option<GoModule> {
+    load_go_module(project_root)
+}
+
 /// Order name-lookup candidates by `(file_path, start_line, start_column, id)`.
 ///
 /// A full index inserts nodes file-by-file in sorted-path order, each file's

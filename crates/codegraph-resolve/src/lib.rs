@@ -25,6 +25,7 @@ pub mod name_matcher;
 pub mod path_aliases;
 pub mod pathutil;
 pub mod resolver;
+pub mod snapshot_context;
 pub mod strip_comments;
 pub mod types;
 pub mod workspace_packages;
@@ -32,6 +33,7 @@ pub mod workspace_packages;
 pub use context::StoreResolutionContext;
 pub use framework::FrameworkResolver;
 pub use resolver::ReferenceResolver;
+pub use snapshot_context::{build_edge_adjacency, EdgeAdjacency, SnapshotResolutionContext};
 pub use types::{
     FrameworkResolverExtractionResult, ImportMapping, ReExport, RefView, ResolutionContext,
     ResolutionResult, ResolutionStats, ResolvedBy, ResolvedRef,

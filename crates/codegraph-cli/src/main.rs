@@ -16,8 +16,8 @@ use clap_complete::{generate, Shell};
 use codegraph_core::config::init_config;
 use codegraph_core::logger::{init_logger, LoggerConfig};
 use codegraph_core::node_id::hash_content;
-use codegraph_core::types::{FileRecord, Language, Node, NodeKind};
-use codegraph_extract::{detect_language, extract_file, ExtractOptions};
+use codegraph_core::types::{ExtractionResult, FileRecord, Language, Node, NodeKind};
+use codegraph_extract::{detect_language, extract_source, ExtractOptions};
 use codegraph_graph::graph::GraphTraverser;
 use codegraph_graph::query::{search_nodes, SearchOptions};
 use codegraph_mcp::McpServer;
@@ -25,6 +25,7 @@ use codegraph_resolve::ReferenceResolver;
 use codegraph_store::queries::SearchResult;
 use codegraph_store::Store;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use rayon::prelude::*;
 use serde::Serialize;
 use serde_json::json;
 use time::format_description::well_known::Rfc3339;
@@ -1099,6 +1100,29 @@ fn index_project(project: &Path, clear_first: bool, verbose: bool) -> Result<Ind
     index_project_inner(project, clear_first, verbose, false)
 }
 
+/// Restores the shared `synchronous=NORMAL` durability (and truncates the WAL) when
+/// the full index finishes OR bails out early via `?`. Drop never panics: a failed
+/// restore is logged, not propagated.
+struct BulkIndexPragmaGuard {
+    db_path: PathBuf,
+}
+
+impl Drop for BulkIndexPragmaGuard {
+    fn drop(&mut self) {
+        let result = match Store::open(&self.db_path) {
+            Ok(store) => store.restore_default_pragmas().map_err(anyhow::Error::from),
+            Err(err) => Err(anyhow::Error::from(err)),
+        };
+        if let Err(err) = result {
+            tracing::warn!(
+                error = %err,
+                db = %self.db_path.display(),
+                "failed to restore default pragmas after full index",
+            );
+        }
+    }
+}
+
 fn index_project_inner(
     project: &Path,
     clear_first: bool,
@@ -1120,7 +1144,19 @@ fn index_project_inner(
         eprintln!("Scanning files…");
     }
     let files = codegraph_extract::engine::scan_project(project, &options)?;
+
+    // `synchronous=OFF` + a larger cache/mmap window speed up the from-scratch bulk
+    // index. The restore lives in a Drop guard, NOT a trailing statement, because
+    // every `?` below would skip a trailing restore and leave `synchronous=OFF`
+    // durable on the error path. Declared BEFORE `store` so it drops AFTER it: the
+    // guard's own connection then runs wal_checkpoint(TRUNCATE)+NORMAL with no WAL
+    // contention, leaving the file in the same shape a NORMAL run produces.
+    let _pragma_guard = BulkIndexPragmaGuard {
+        db_path: db_path(project),
+    };
     let mut store = open_store(project)?;
+    store.set_bulk_index_pragmas()?;
+
     let before = store.counts()?;
     let mut files_indexed = 0;
     let mut files_skipped = 0;
@@ -1151,38 +1187,70 @@ fn index_project_inner(
         quiet,
         "{spinner:.green} Indexing [{bar:30}] {pos}/{len} files ({elapsed}) {wide_msg}",
     );
-    for relative in files {
-        if verbose {
-            bar.set_message(relative.clone());
-        }
-        let full = project.join(&relative);
-        let source = fs::read_to_string(&full)
-            .with_context(|| format!("reading source file {}", full.display()))?;
-        let metadata = fs::metadata(&full)
-            .with_context(|| format!("reading metadata for {}", full.display()))?;
-        let mut result = extract_file(project, &relative)?;
-        let errors = result.errors.clone();
-        if errors.is_empty() {
+    if verbose {
+        bar.set_message(format!(
+            "parsing ({} threads)",
+            rayon::current_num_threads()
+        ));
+    }
+
+    // Parse in parallel; the order-preserving collect keeps the Vec in sorted
+    // `scan_project` order. One metadata + one source read per file (no double
+    // read, no TOCTOU straddle); the size gate mirrors `extract_file`
+    // (engine.rs:152) exactly so oversized files still size-skip identically.
+    let parsed: Vec<(String, FileRecord, ExtractionResult)> = files
+        .par_iter()
+        .map(
+            |relative| -> Result<(String, FileRecord, ExtractionResult)> {
+                let full = project.join(relative);
+                let metadata = fs::metadata(&full)
+                    .with_context(|| format!("reading metadata for {}", full.display()))?;
+                let source = fs::read_to_string(&full)
+                    .with_context(|| format!("reading source file {}", full.display()))?;
+                let result = if metadata.len() > options.max_file_size {
+                    ExtractionResult {
+                        nodes: Vec::new(),
+                        edges: Vec::new(),
+                        unresolved_references: Vec::new(),
+                        errors: vec![format!(
+                            "File exceeds max size ({} > {}): {relative}",
+                            metadata.len(),
+                            options.max_file_size
+                        )],
+                        duration_ms: 0,
+                    }
+                } else {
+                    extract_source(relative, &source, None)
+                };
+                let file = FileRecord {
+                    path: relative.clone(),
+                    content_hash: hash_content(&source),
+                    language: detect_language(relative),
+                    size: metadata.len() as i64,
+                    modified_at: modified_millis(&metadata),
+                    indexed_at: now_millis(),
+                    node_count: result
+                        .nodes
+                        .iter()
+                        .filter(|n| n.file_path == *relative)
+                        .count() as i64,
+                    errors: result.errors.clone(),
+                };
+                Ok((relative.clone(), file, result))
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
+
+    // Drain serially in sorted `scan_project` order: node/edge/ref insert order
+    // stays byte-for-byte identical to the serial path.
+    for (_relative, file, mut result) in parsed {
+        if file.errors.is_empty() {
             files_indexed += 1;
         } else if result.nodes.is_empty() {
             files_skipped += 1;
         } else {
             files_errored += 1;
         }
-        let file = FileRecord {
-            path: relative.clone(),
-            content_hash: hash_content(&source),
-            language: detect_language(&relative),
-            size: metadata.len() as i64,
-            modified_at: modified_millis(&metadata),
-            indexed_at: now_millis(),
-            node_count: result
-                .nodes
-                .iter()
-                .filter(|n| n.file_path == relative)
-                .count() as i64,
-            errors,
-        };
 
         store.upsert_file(&file)?;
 
@@ -1243,9 +1311,35 @@ fn index_project_inner(
         resolver.extract_and_persist_frameworks(&mut store, &relative_files)?;
     }
     finish_phase(&pb, "Detected frameworks");
-    let pb = phase_spinner("Resolving references", quiet);
-    resolver.resolve_and_persist_batched(&mut store, RESOLVE_BATCH_ROWS)?;
-    finish_phase(&pb, "Resolved references");
+    // Finished from INSIDE the callback on the final chunk so the retained line
+    // lands before the resolver's deferred passes (which resolve refs this bar
+    // does not count). The trailing finish covers the no-chunk case where the
+    // callback never fires; `done_in_callback` prevents a double finish.
+    let resolve_bar = progress_bar(
+        0,
+        quiet,
+        "{spinner:.green} Resolving references [{bar:30}] {pos}/{len} ({elapsed})",
+    );
+    let mut bar_sized = false;
+    let mut done_in_callback = false;
+    resolver.resolve_and_persist_batched_with_progress(
+        &mut store,
+        RESOLVE_BATCH_ROWS,
+        |processed, total| {
+            if !bar_sized {
+                resolve_bar.set_length(total);
+                bar_sized = true;
+            }
+            resolve_bar.set_position(processed);
+            if processed >= total && !done_in_callback {
+                finish_phase(&resolve_bar, "Resolved references");
+                done_in_callback = true;
+            }
+        },
+    )?;
+    if !done_in_callback {
+        finish_phase(&resolve_bar, "Resolved references");
+    }
     let pb = phase_spinner("Finalizing frameworks", quiet);
     // Cross-file framework finalization (NestJS RouterModule prefixing) after
     // resolution, mirroring the upstream index.ts:358 runPostExtract.

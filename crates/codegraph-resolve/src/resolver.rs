@@ -13,13 +13,26 @@ use crate::name_matcher::{
     crosses_known_family, match_dotted_call_chain, match_function_ref, match_reference,
     match_scoped_call_chain, same_language_family,
 };
+use crate::snapshot_context::{build_edge_adjacency, SnapshotResolutionContext};
 use crate::types::{
     RefView, ResolutionContext, ResolutionResult, ResolutionStats, ResolvedBy, ResolvedRef,
 };
 use codegraph_core::types::{Edge, EdgeKind, Language, Node, NodeKind, UnresolvedRef};
 use codegraph_store::Store;
-use std::collections::BTreeSet;
-use std::sync::OnceLock;
+use rayon::prelude::*;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, OnceLock};
+
+/// Read-only deferred-pass intent returned by [`ReferenceResolver::resolve_one_pure`]
+/// instead of the deferred-list pushes [`ReferenceResolver::resolve_one`] performs, so
+/// the pure path stays callable from the `rayon` parallel map over the `Sync`
+/// snapshot. Serial reassembly drains these in index order into the same lists.
+pub(crate) enum DeferredIntent {
+    /// `deferred_chain_refs` push (#750 conformance pass).
+    ChainRef(RefView),
+    /// `deferred_this_member_refs` push (#808 supertype pass).
+    ThisMemberRef(RefView),
+}
 
 /// Languages whose chained static-factory/fluent calls defer to the conformance
 /// second pass (`CHAIN_LANGUAGES`, `index.ts:40`).
@@ -679,13 +692,16 @@ pub struct ReferenceResolver {
     known_names: Option<BTreeSet<String>>,
     /// `this.<member>` fn-refs whose member wasn't on the enclosing class
     /// itself — retried in the supertype pass once implements/extends edges
-    /// exist (`deferredThisMemberRefs`, index.ts:214 / #808).
-    deferred_this_member_refs: std::cell::RefCell<Vec<RefView>>,
+    /// exist (`deferredThisMemberRefs`, index.ts:214 / #808). A `Mutex` (not
+    /// `RefCell`) so the resolver is `Sync` for the parallel chunk resolve; it
+    /// is only ever pushed from serial code, never inside the `rayon` map.
+    deferred_this_member_refs: std::sync::Mutex<Vec<RefView>>,
     /// Chained static-factory/fluent `calls` refs the first pass couldn't
     /// resolve — drained by [`Self::resolve_chained_calls_via_conformance`]
     /// once implements/extends edges exist (`deferredChainRefs`,
-    /// index.ts:209 / #750).
-    deferred_chain_refs: std::cell::RefCell<Vec<RefView>>,
+    /// index.ts:209 / #750). A `Mutex` for the same `Sync` reason as
+    /// `deferred_this_member_refs`; pushed only from serial code.
+    deferred_chain_refs: std::sync::Mutex<Vec<RefView>>,
 }
 
 impl ReferenceResolver {
@@ -697,8 +713,8 @@ impl ReferenceResolver {
             project_root: project_root.into(),
             framework_resolver_extensions: Vec::new(),
             known_names: None,
-            deferred_this_member_refs: std::cell::RefCell::new(Vec::new()),
-            deferred_chain_refs: std::cell::RefCell::new(Vec::new()),
+            deferred_this_member_refs: std::sync::Mutex::new(Vec::new()),
+            deferred_chain_refs: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -838,13 +854,46 @@ impl ReferenceResolver {
     }
 
     /// Resolve a single reference (`resolveOne`, `index.ts:652-746`).
+    ///
+    /// Serial wrapper over [`Self::resolve_one_pure`]: pushes any returned
+    /// deferred intent to the matching deferred list, reproducing the original
+    /// in-place push behavior for the non-parallel callers.
     pub fn resolve_one(
         &self,
         reference: &RefView,
         context: &dyn ResolutionContext,
     ) -> Option<ResolvedRef> {
+        let (resolved, deferred) = self.resolve_one_pure(reference, context);
+        match deferred {
+            Some(DeferredIntent::ChainRef(reference)) => {
+                self.deferred_chain_refs.lock().unwrap().push(reference);
+            }
+            Some(DeferredIntent::ThisMemberRef(reference)) => {
+                self.deferred_this_member_refs
+                    .lock()
+                    .unwrap()
+                    .push(reference);
+            }
+            None => {}
+        }
+        resolved
+    }
+
+    /// Read-only twin of [`Self::resolve_one`] for the parallel resolve path.
+    ///
+    /// Identical resolution logic, but instead of pushing to the resolver's
+    /// deferred lists it RETURNS a [`DeferredIntent`], so it can run
+    /// inside a `rayon` parallel map over a `Sync` [`ResolutionContext`]
+    /// (`SnapshotResolutionContext`). `&self` is shared read-only here:
+    /// `known_names` is set once in `warm_caches` and only read, and the
+    /// `framework_resolver_extensions` are read-only.
+    pub(crate) fn resolve_one_pure(
+        &self,
+        reference: &RefView,
+        context: &dyn ResolutionContext,
+    ) -> (Option<ResolvedRef>, Option<DeferredIntent>) {
         if self.is_built_in_or_external(reference) {
-            return None;
+            return (None, None);
         }
 
         // Fast pre-filter (index.ts:664-670). The `FrameworkResolver`
@@ -857,34 +906,34 @@ impl ReferenceResolver {
                 .iter()
                 .any(|f| f.claims_reference(&reference.reference_name))
         {
-            return None;
+            return (None, None);
         }
 
         // Function-as-value refs (#756) get a dedicated, strictly-gated path,
         // never reaching framework/fuzzy strategies (index.ts:686-699).
         if reference.is_function_ref {
             if reference.reference_name.starts_with("this.") {
-                return self.gate_language(
-                    self.resolve_this_member_fn_ref(reference, context),
-                    reference,
-                    context,
-                );
+                let (resolved, deferred) = self.resolve_this_member_fn_ref_pure(reference, context);
+                return (self.gate_language(resolved, reference, context), deferred);
             }
             if let Some(via_import) =
                 self.gate_language(resolve_via_import(reference, context), reference, context)
             {
                 if let Some(target) = context.get_node_by_id(&via_import.target_node_id) {
                     if matches!(target.kind, NodeKind::Function | NodeKind::Method) {
-                        return Some(via_import);
+                        return (Some(via_import), None);
                     }
                 }
             }
-            return self.gate_language(match_function_ref(reference, context), reference, context);
+            return (
+                self.gate_language(match_function_ref(reference, context), reference, context),
+                None,
+            );
         }
 
         // JVM FQN imports skip everything else (index.ts:675-676).
         if let Some(jvm_import) = resolve_jvm_import(reference, context) {
-            return Some(jvm_import);
+            return (Some(jvm_import), None);
         }
 
         let mut candidates: Vec<ResolvedRef> = Vec::new();
@@ -898,7 +947,7 @@ impl ReferenceResolver {
                 context,
             ) {
                 if result.confidence >= 0.9 {
-                    return Some(result);
+                    return (Some(result), None);
                 }
                 candidates.push(result);
             }
@@ -909,14 +958,14 @@ impl ReferenceResolver {
             self.gate_language(resolve_via_import(reference, context), reference, context)
         {
             if import_result.confidence >= 0.9 {
-                return Some(import_result);
+                return (Some(import_result), None);
             }
             candidates.push(import_result);
         }
 
         // PHP include path: never fall through to name-matcher (index.ts:714-720).
         if is_php_include_path_ref(reference) {
-            return candidates.into_iter().reduce(highest_confidence);
+            return (candidates.into_iter().reduce(highest_confidence), None);
         }
 
         // Strategy 3: name matching (index.ts:723-726).
@@ -935,30 +984,32 @@ impl ReferenceResolver {
                 && is_chain_language(reference.language)
                 && has_chain_shape(&reference.reference_name)
             {
-                self.deferred_chain_refs
-                    .borrow_mut()
-                    .push(reference.clone());
+                return (None, Some(DeferredIntent::ChainRef(reference.clone())));
             }
-            return None;
+            return (None, None);
         }
 
-        candidates.into_iter().reduce(highest_confidence)
+        (candidates.into_iter().reduce(highest_confidence), None)
     }
 
     /// Resolve a `this.<member>` function_ref against the enclosing class's own
-    /// members only (same file, function/method kind). Ports
-    /// `resolveThisMemberFnRef` (index.ts:1210-1248); a member not on the class
-    /// itself is deferred to the supertype pass (#808).
-    fn resolve_this_member_fn_ref(
+    /// members (same file, function/method kind); a member not on the class
+    /// RETURNS [`DeferredIntent::ThisMemberRef`] for the #808 supertype pass
+    /// instead of pushing it. Ports `resolveThisMemberFnRef` (index.ts:1210-1248).
+    fn resolve_this_member_fn_ref_pure(
         &self,
         reference: &RefView,
         context: &dyn ResolutionContext,
-    ) -> Option<ResolvedRef> {
-        let member = reference.reference_name.strip_prefix("this.")?;
+    ) -> (Option<ResolvedRef>, Option<DeferredIntent>) {
+        let Some(member) = reference.reference_name.strip_prefix("this.") else {
+            return (None, None);
+        };
         if member.is_empty() {
-            return None;
+            return (None, None);
         }
-        let from_node = context.get_node_by_id(&reference.from_node_id)?;
+        let Some(from_node) = context.get_node_by_id(&reference.from_node_id) else {
+            return (None, None);
+        };
         let class_prefix = if matches!(
             from_node.kind,
             NodeKind::Class
@@ -971,9 +1022,11 @@ impl ReferenceResolver {
         ) {
             from_node.qualified_name.clone()
         } else {
-            let sep = from_node.qualified_name.rfind("::")?;
+            let Some(sep) = from_node.qualified_name.rfind("::") else {
+                return (None, None);
+            };
             if sep == 0 {
-                return None;
+                return (None, None);
             }
             from_node.qualified_name[..sep].to_string()
         };
@@ -988,21 +1041,19 @@ impl ReferenceResolver {
             })
             .reduce(|a, b| if a.start_line <= b.start_line { a } else { b });
         match target {
-            Some(target) => Some(ResolvedRef {
-                original: reference.clone(),
-                target_node_id: target.id,
-                confidence: 0.95,
-                resolved_by: ResolvedBy::FunctionRef,
-            }),
-            None => {
-                // Not on the class itself — possibly INHERITED. Retry in the
-                // supertype pass once implements/extends edges exist
-                // (index.ts:1234-1239).
-                self.deferred_this_member_refs
-                    .borrow_mut()
-                    .push(reference.clone());
-                None
-            }
+            Some(target) => (
+                Some(ResolvedRef {
+                    original: reference.clone(),
+                    target_node_id: target.id,
+                    confidence: 0.95,
+                    resolved_by: ResolvedBy::FunctionRef,
+                }),
+                None,
+            ),
+            // Not on the class itself — possibly INHERITED. Retry in the
+            // supertype pass once implements/extends edges exist
+            // (index.ts:1234-1239).
+            None => (None, Some(DeferredIntent::ThisMemberRef(reference.clone()))),
         }
     }
 
@@ -1012,7 +1063,7 @@ impl ReferenceResolver {
     /// nearest supertype declaring it. Ports `resolveDeferredThisMemberRefs`
     /// (index.ts:1260-1356). Returns the number of newly-created edges.
     pub fn resolve_deferred_this_member_refs(&self, store: &mut Store) -> anyhow::Result<usize> {
-        let deferred = std::mem::take(&mut *self.deferred_this_member_refs.borrow_mut());
+        let deferred = std::mem::take(&mut *self.deferred_this_member_refs.lock().unwrap());
         if deferred.is_empty() {
             return Ok(0);
         }
@@ -1081,7 +1132,7 @@ impl ReferenceResolver {
         &self,
         store: &mut Store,
     ) -> anyhow::Result<usize> {
-        let deferred = std::mem::take(&mut *self.deferred_chain_refs.borrow_mut());
+        let deferred = std::mem::take(&mut *self.deferred_chain_refs.lock().unwrap());
         if deferred.is_empty() {
             return Ok(0);
         }
@@ -1215,15 +1266,53 @@ impl ReferenceResolver {
     /// batch (which would lose its edge — `unresolved_refs` rows have no UNIQUE
     /// constraint, so the same `(from,name,kind)` tuple recurs across batches); and
     /// only resolved rows are deleted, leaving the same final `unresolved_refs` table.
+    ///
+    /// Each chunk's refs are resolved IN PARALLEL via an order-preserving
+    /// `par_iter().map().collect()` over a `Sync` [`SnapshotResolutionContext`],
+    /// then the results are reassembled SERIALLY in index order — identical to the
+    /// serial path. The WHOLE-RUN node snapshot is built LAZILY on first-chunk
+    /// entry (AFTER framework extraction has injected its nodes/refs at the call
+    /// site); the per-chunk `implements`/`extends` edge map is rebuilt from the
+    /// live store before each chunk so `get_supertypes` sees per-chunk edge growth.
     pub fn resolve_and_persist_batched(
         &mut self,
         store: &mut Store,
         batch_size: usize,
     ) -> anyhow::Result<ResolutionResult> {
+        self.resolve_and_persist_batched_with_progress(store, batch_size, |_, _| {})
+    }
+
+    /// Like [`Self::resolve_and_persist_batched`] but reports progress via
+    /// `on_progress(processed, total)` after each chunk, letting a caller drive a
+    /// `pos/len` bar without `codegraph-resolve` depending on the bar library.
+    /// `total` is the post-framework `unresolved_refs` count; `processed`
+    /// accumulates `batch.len()` per chunk (refs PROCESSED — resolved rows are
+    /// deleted). `on_progress` never gates or reorders work, so resolution output
+    /// stays byte-equivalent to the no-callback path.
+    pub fn resolve_and_persist_batched_with_progress(
+        &mut self,
+        store: &mut Store,
+        batch_size: usize,
+        mut on_progress: impl FnMut(u64, u64),
+    ) -> anyhow::Result<ResolutionResult> {
         {
             let context = crate::context::StoreResolutionContext::new(store, &self.project_root);
             self.warm_caches(&context);
         }
+
+        let total_refs = store.unresolved_refs_count()? as u64;
+        let mut processed: u64 = 0;
+
+        // Built lazily on first-chunk entry, AFTER framework extraction injected
+        // its nodes — never in `new`/`initialize` (would miss framework nodes).
+        let mut node_snapshot: Option<SnapshotResolutionContext> = None;
+        // Implements/Extends adjacency for `get_supertypes`, seeded once from the
+        // store and folded forward per chunk. `create_edges` is the sole producer
+        // of inheritance edges between chunks, so a chunk seeing edges from chunks
+        // 0..N-1 here is byte-identical to a fresh per-chunk store rebuild — but
+        // without that rebuild's per-chunk query storm. Holds only Implements/
+        // Extends, so it stays small (inheritance edges, not Calls/References).
+        let mut base_adjacency: HashMap<String, Vec<(String, EdgeKind)>> = HashMap::new();
 
         let mut aggregate = ResolutionResult {
             stats: ResolutionStats {
@@ -1248,15 +1337,36 @@ impl ReferenceResolver {
                 .max()
                 .unwrap_or(cursor);
 
-            let result = {
-                let context =
-                    crate::context::StoreResolutionContext::new(store, &self.project_root);
-                self.resolve_all(&batch, &context)
+            let base = match &node_snapshot {
+                Some(snapshot) => snapshot,
+                None => {
+                    base_adjacency = (*build_edge_adjacency(store)?).clone();
+                    node_snapshot.insert(SnapshotResolutionContext::from_store(
+                        store,
+                        &self.project_root,
+                    )?)
+                }
             };
+            // Install the adjacency from chunks 0..N-1 BEFORE resolving chunk N
+            // (matches the old per-chunk full rebuild's observable state).
+            let chunk_ctx = base.with_edge_adjacency(Arc::new(base_adjacency.clone()));
+
+            let result = self.resolve_chunk_parallel(&batch, &chunk_ctx);
 
             let edges = self.create_edges(&result.resolved, store);
             if !edges.is_empty() {
                 store.insert_edges(&edges)?;
+            }
+            // Fold this chunk's NEW Implements/Extends edges into the adjacency
+            // AFTER inserting them, so chunk N+1 sees chunks 0..N — the same
+            // forward visibility the per-chunk rebuild produced.
+            for edge in &edges {
+                if matches!(edge.kind, EdgeKind::Implements | EdgeKind::Extends) {
+                    base_adjacency
+                        .entry(edge.source.clone())
+                        .or_default()
+                        .push((edge.target.clone(), edge.kind));
+                }
             }
 
             // Delete THIS batch's resolved rows immediately, bounded by the
@@ -1285,6 +1395,9 @@ impl ReferenceResolver {
             for (method, count) in result.stats.by_method {
                 *aggregate.stats.by_method.entry(method).or_insert(0) += count;
             }
+
+            processed += batch.len() as u64;
+            on_progress(processed, total_refs);
         }
 
         // #750 conformance pass then #808 supertype pass, after implements/extends
@@ -1293,6 +1406,69 @@ impl ReferenceResolver {
         self.resolve_deferred_this_member_refs(store)?;
 
         Ok(aggregate)
+    }
+
+    /// Resolve one chunk's refs in parallel over the `Sync` snapshot context,
+    /// then reassemble SERIALLY in index order — byte-identical to the serial
+    /// [`Self::resolve_all`].
+    ///
+    /// The parallel map is order-preserving (`par_iter().map().collect()`); the
+    /// reassembly iterates the collected `Vec` in index order, so resolved-ref
+    /// order, `by_method` stats, and the deferred push order all match
+    /// the serial batch-slice traversal exactly. `resolve_one_pure` reads `&self`
+    /// and the snapshot read-only — no shared mutation inside the map.
+    fn resolve_chunk_parallel(
+        &self,
+        batch: &[UnresolvedRef],
+        context: &SnapshotResolutionContext,
+    ) -> ResolutionResult {
+        let refs: Vec<RefView> = batch.iter().map(to_ref_view).collect();
+        let total = refs.len();
+
+        let results: Vec<(Option<ResolvedRef>, Option<DeferredIntent>)> = refs
+            .par_iter()
+            .map(|reference| self.resolve_one_pure(reference, context))
+            .collect();
+
+        let mut resolved: Vec<ResolvedRef> = Vec::new();
+        let mut unresolved: Vec<RefView> = Vec::new();
+        let mut by_method: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+
+        for (reference, (maybe_resolved, deferred)) in refs.iter().zip(results) {
+            match deferred {
+                Some(DeferredIntent::ChainRef(reference)) => {
+                    self.deferred_chain_refs.lock().unwrap().push(reference);
+                }
+                Some(DeferredIntent::ThisMemberRef(reference)) => {
+                    self.deferred_this_member_refs
+                        .lock()
+                        .unwrap()
+                        .push(reference);
+                }
+                None => {}
+            }
+            match maybe_resolved {
+                Some(result) => {
+                    *by_method
+                        .entry(result.resolved_by.as_str().to_string())
+                        .or_insert(0) += 1;
+                    resolved.push(result);
+                }
+                None => unresolved.push(reference.clone()),
+            }
+        }
+
+        ResolutionResult {
+            stats: ResolutionStats {
+                total,
+                resolved: resolved.len(),
+                unresolved: unresolved.len(),
+                by_method,
+            },
+            resolved,
+            unresolved,
+        }
     }
 
     /// Incremental form of [`Self::resolve_and_persist`] for `sync`.
