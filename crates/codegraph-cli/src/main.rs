@@ -4,10 +4,13 @@
 //! keep the `WorkerGuard` alive, then run the requested command. Library crates
 //! only emit tracing events.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -1154,13 +1157,13 @@ fn index_project_inner(
     let _pragma_guard = BulkIndexPragmaGuard {
         db_path: db_path(project),
     };
-    let mut store = open_store(project)?;
+    let store = open_store(project)?;
     store.set_bulk_index_pragmas()?;
 
     let before = store.counts()?;
-    let mut files_indexed = 0;
-    let mut files_skipped = 0;
-    let mut files_errored = 0;
+    let files_indexed = 0;
+    let files_skipped = 0;
+    let files_errored = 0;
 
     // Stream the graph to the store in capped batches instead of holding the whole
     // project in memory. Equivalence with the all-at-once path is byte-for-byte and
@@ -1179,8 +1182,8 @@ fn index_project_inner(
     const REF_FLUSH_ROWS: usize = 20_000;
     const RESOLVE_BATCH_ROWS: usize = 5_000;
 
-    let mut spill = SpillWriter::new(codegraph_dir(project))?;
-    let mut pending_nodes: Vec<Node> = Vec::with_capacity(NODE_FLUSH_ROWS);
+    let spill = SpillWriter::new(codegraph_dir(project))?;
+    let pending_nodes: Vec<Node> = Vec::with_capacity(NODE_FLUSH_ROWS);
 
     let bar = progress_bar(
         files.len() as u64,
@@ -1194,79 +1197,202 @@ fn index_project_inner(
         ));
     }
 
-    // Parse in parallel; the order-preserving collect keeps the Vec in sorted
-    // `scan_project` order. One metadata + one source read per file (no double
-    // read, no TOCTOU straddle); the size gate mirrors `extract_file`
-    // (engine.rs:152) exactly so oversized files still size-skip identically.
-    let parsed: Vec<(String, FileRecord, ExtractionResult)> = files
-        .par_iter()
-        .progress_with(bar.clone())
-        .map(
-            |relative| -> Result<(String, FileRecord, ExtractionResult)> {
-                let full = project.join(relative);
-                let metadata = fs::metadata(&full)
-                    .with_context(|| format!("reading metadata for {}", full.display()))?;
-                let source = fs::read_to_string(&full)
-                    .with_context(|| format!("reading source file {}", full.display()))?;
-                let result = if metadata.len() > options.max_file_size {
-                    ExtractionResult {
-                        nodes: Vec::new(),
-                        edges: Vec::new(),
-                        unresolved_references: Vec::new(),
-                        errors: vec![format!(
-                            "File exceeds max size ({} > {}): {relative}",
-                            metadata.len(),
-                            options.max_file_size
-                        )],
-                        duration_ms: 0,
+    // Overlap parse (rayon producers) with persist (one ordered consumer) while
+    // persisting in EXACT sorted `scan_project` order — byte-identical to the
+    // serial drain. The handoff channel is UNBOUNDED so a producer's `send` never
+    // parks a rayon worker; memory is bounded by a reorder WINDOW instead: a
+    // producer for index `i` waits until `i < next_expected + WINDOW`, capping the
+    // buffer to ≤ WINDOW entries. The head index (`i == next_expected`) is never
+    // gated, so the consumer can always advance — deadlock-free by construction.
+    // Producers only parse; the consumer alone touches the Store.
+    const PARSE_REORDER_WINDOW: usize = 512;
+
+    type ParsePayload = (usize, String, FileRecord, ExtractionResult);
+    let (tx, rx) = mpsc::channel::<ParsePayload>();
+    let gate = Arc::new((Mutex::new(0usize), Condvar::new()));
+    // Set on a consumer store-write error so gated producers wake and abort.
+    let abort = Arc::new(AtomicBool::new(false));
+
+    let producer_err: Arc<Mutex<Option<anyhow::Error>>> = Arc::new(Mutex::new(None));
+    let bar_for_finish = bar.clone();
+
+    // The scope closure is `move` so it owns `rx` (a `Receiver` is `Send` but not
+    // `Sync`, so it cannot be captured by reference into the `Send` closure). The
+    // consumer-side owned state (store/spill/pending_nodes/counters) moves in too
+    // and is returned out so the rest of the function can continue using it.
+    let (
+        consumer_err,
+        mut store,
+        spill,
+        pending_nodes,
+        files_indexed,
+        files_skipped,
+        files_errored,
+    ) = {
+        let gate = Arc::clone(&gate);
+        let abort = Arc::clone(&abort);
+        let producer_err = Arc::clone(&producer_err);
+        let bar = bar.clone();
+        // Borrow `files`/`options` from the function scope (outlives the rayon
+        // scope); only these references — not the owned Vecs — enter the `move`
+        // closure, so the borrowed data stays alive past the scope.
+        let files_ref: &[String] = &files;
+        let options_ref = &options;
+        rayon::scope(move |s| {
+            let mut store = store;
+            let mut spill = spill;
+            let mut pending_nodes = pending_nodes;
+            let mut files_indexed = files_indexed;
+            let mut files_skipped = files_skipped;
+            let mut files_errored = files_errored;
+            let mut consumer_err: Option<anyhow::Error> = None;
+
+            // The sole `tx` moves into the producer closure so it drops when
+            // parsing ends → the consumer's `rx.recv()` disconnects and exits.
+            let producer_gate = Arc::clone(&gate);
+            let producer_abort = Arc::clone(&abort);
+            let producer_err = Arc::clone(&producer_err);
+            s.spawn(move |_| {
+                let tx = tx;
+                let result = files_ref
+                    .par_iter()
+                    .enumerate()
+                    .progress_with(bar)
+                    .try_for_each(|(i, relative)| -> Result<()> {
+                        {
+                            let (lock, cvar) = &*producer_gate;
+                            let mut next_expected = lock.lock().unwrap();
+                            while should_block(i, *next_expected, PARSE_REORDER_WINDOW)
+                                && !producer_abort.load(Ordering::Relaxed)
+                            {
+                                next_expected = cvar.wait(next_expected).unwrap();
+                            }
+                        }
+                        if producer_abort.load(Ordering::Relaxed) {
+                            return Err(anyhow!("indexing aborted by consumer write error"));
+                        }
+
+                        // One metadata + one source read per file (no double read, no
+                        // TOCTOU straddle); the size gate mirrors `extract_file`
+                        // (engine.rs:152) exactly so oversized files still size-skip.
+                        let full = project.join(relative);
+                        let metadata = fs::metadata(&full)
+                            .with_context(|| format!("reading metadata for {}", full.display()))?;
+                        let source = fs::read_to_string(&full)
+                            .with_context(|| format!("reading source file {}", full.display()))?;
+                        let result = if metadata.len() > options_ref.max_file_size {
+                            ExtractionResult {
+                                nodes: Vec::new(),
+                                edges: Vec::new(),
+                                unresolved_references: Vec::new(),
+                                errors: vec![format!(
+                                    "File exceeds max size ({} > {}): {relative}",
+                                    metadata.len(),
+                                    options_ref.max_file_size
+                                )],
+                                duration_ms: 0,
+                            }
+                        } else {
+                            extract_source(relative, &source, None)
+                        };
+                        let file = FileRecord {
+                            path: relative.clone(),
+                            content_hash: hash_content(&source),
+                            language: detect_language(relative),
+                            size: metadata.len() as i64,
+                            modified_at: modified_millis(&metadata),
+                            indexed_at: now_millis(),
+                            node_count: result
+                                .nodes
+                                .iter()
+                                .filter(|n| n.file_path == *relative)
+                                .count() as i64,
+                            errors: result.errors.clone(),
+                        };
+                        tx.send((i, relative.clone(), file, result))
+                            .map_err(|_| anyhow!("parse result channel disconnected"))?;
+                        Ok(())
+                    });
+                if let Err(err) = result {
+                    *producer_err.lock().unwrap() = Some(err);
+                }
+            });
+
+            // Drain strictly in cursor order via an index-keyed reorder buffer,
+            // reproducing the exact sorted-scan persist order. A store-write Err sets
+            // `abort`, wakes gated producers, and stops. When `tx` drops, `rx.recv()`
+            // disconnects and the loop exits — a missing index (its producer errored)
+            // never arrives, so we drain the buffered in-order prefix and stop.
+            let mut buffer: ReorderBuffer<ParsePayload> = ReorderBuffer::new();
+            let mut next_expected = 0usize;
+            'consume: while let Ok(payload) = rx.recv() {
+                buffer.insert(payload.0, payload);
+                while let Some((_i, _relative, file, mut result)) = buffer.take(next_expected) {
+                    if file.errors.is_empty() {
+                        files_indexed += 1;
+                    } else if result.nodes.is_empty() {
+                        files_skipped += 1;
+                    } else {
+                        files_errored += 1;
                     }
-                } else {
-                    extract_source(relative, &source, None)
-                };
-                let file = FileRecord {
-                    path: relative.clone(),
-                    content_hash: hash_content(&source),
-                    language: detect_language(relative),
-                    size: metadata.len() as i64,
-                    modified_at: modified_millis(&metadata),
-                    indexed_at: now_millis(),
-                    node_count: result
-                        .nodes
-                        .iter()
-                        .filter(|n| n.file_path == *relative)
-                        .count() as i64,
-                    errors: result.errors.clone(),
-                };
-                Ok((relative.clone(), file, result))
-            },
-        )
-        .collect::<Result<Vec<_>>>()?;
 
-    // Drain serially in sorted `scan_project` order: node/edge/ref insert order
-    // stays byte-for-byte identical to the serial path.
-    for (_relative, file, mut result) in parsed {
-        if file.errors.is_empty() {
-            files_indexed += 1;
-        } else if result.nodes.is_empty() {
-            files_skipped += 1;
-        } else {
-            files_errored += 1;
-        }
+                    let drain = (|| -> Result<()> {
+                        store.upsert_file(&file)?;
+                        pending_nodes.append(&mut result.nodes);
+                        if pending_nodes.len() >= NODE_FLUSH_ROWS {
+                            store.upsert_nodes(&pending_nodes)?;
+                            pending_nodes.clear();
+                        }
+                        spill.write_edges(&result.edges)?;
+                        spill.write_refs(&result.unresolved_references)?;
+                        Ok(())
+                    })();
+                    if let Err(err) = drain {
+                        abort.store(true, Ordering::Relaxed);
+                        let (lock, cvar) = &*gate;
+                        let _guard = lock.lock().unwrap();
+                        cvar.notify_all();
+                        consumer_err = Some(err);
+                        break 'consume;
+                    }
 
-        store.upsert_file(&file)?;
+                    next_expected += 1;
+                    let (lock, cvar) = &*gate;
+                    {
+                        let mut ne = lock.lock().unwrap();
+                        *ne = next_expected;
+                    }
+                    cvar.notify_all();
+                }
+            }
 
-        pending_nodes.append(&mut result.nodes);
-        if pending_nodes.len() >= NODE_FLUSH_ROWS {
-            store.upsert_nodes(&pending_nodes)?;
-            pending_nodes.clear();
-        }
+            (
+                consumer_err,
+                store,
+                spill,
+                pending_nodes,
+                files_indexed,
+                files_skipped,
+                files_errored,
+            )
+        })
+    };
 
-        spill.write_edges(&result.edges)?;
-        spill.write_refs(&result.unresolved_references)?;
+    // Net behavior MUST equal today's `collect::<Result<Vec>>()?` short-circuit:
+    // a consumer write error or any producer parse error returns Err, no hang.
+    if let Some(err) = consumer_err {
+        return Err(err);
     }
-    let scan_files = bar.position();
+    if let Some(err) = Arc::into_inner(producer_err)
+        .expect("producer scope joined; no other Arc holders remain")
+        .into_inner()
+        .unwrap()
+    {
+        return Err(err);
+    }
+    let scan_files = bar_for_finish.position();
     finish_phase(
-        &bar,
+        &bar_for_finish,
         &format!("Indexed {} files", format_number(scan_files as i64)),
     );
 
@@ -1362,6 +1488,42 @@ fn index_project_inner(
         edges_created: after.edge_count - before.edge_count,
         duration_ms: started.elapsed().as_millis() as i64,
     })
+}
+
+/// Index-keyed reorder buffer for the streaming index consumer: parsed payloads
+/// arrive out of order and are drained strictly by ascending index, reproducing
+/// the serial sorted-scan persist order regardless of parse-completion timing.
+struct ReorderBuffer<T> {
+    pending: BTreeMap<usize, T>,
+}
+
+impl<T> ReorderBuffer<T> {
+    fn new() -> Self {
+        Self {
+            pending: BTreeMap::new(),
+        }
+    }
+
+    fn insert(&mut self, index: usize, payload: T) {
+        self.pending.insert(index, payload);
+    }
+
+    fn take(&mut self, index: usize) -> Option<T> {
+        self.pending.remove(&index)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.pending.len()
+    }
+}
+
+/// Window-gate predicate: a producer at `index` must wait while it would run
+/// more than `window` indices ahead of the consumer's `next_expected` cursor.
+/// The head index (`index == next_expected`) is never blocked for `window >= 1`,
+/// which is what makes the design deadlock-free.
+fn should_block(index: usize, next_expected: usize, window: usize) -> bool {
+    index >= next_expected + window
 }
 
 /// On-disk spill for extracted edges and unresolved refs during a full index.
@@ -1870,5 +2032,123 @@ fn print_files_tree(files: &[FileRecord], max_depth: Option<usize>) {
                 file.path, file.language, file.node_count
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod reorder_tests {
+    use super::{should_block, ReorderBuffer};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
+
+    fn drain_ready(
+        buffer: &mut ReorderBuffer<usize>,
+        next_expected: &mut usize,
+        out: &mut Vec<usize>,
+    ) {
+        while let Some(payload) = buffer.take(*next_expected) {
+            out.push(payload);
+            *next_expected += 1;
+        }
+    }
+
+    #[test]
+    fn shuffled_arrival_drains_in_order() {
+        let mut buffer = ReorderBuffer::new();
+        let mut next_expected = 0usize;
+        let mut out = Vec::new();
+        for i in [3usize, 1, 0, 2, 4] {
+            buffer.insert(i, i);
+            drain_ready(&mut buffer, &mut next_expected, &mut out);
+        }
+        assert_eq!(out, vec![0, 1, 2, 3, 4]);
+        assert_eq!(buffer.len(), 0);
+    }
+
+    #[test]
+    fn head_arriving_last_holds_then_releases_all() {
+        let mut buffer = ReorderBuffer::new();
+        let mut next_expected = 0usize;
+        let mut out = Vec::new();
+        for i in [1usize, 2, 3, 4] {
+            buffer.insert(i, i);
+            drain_ready(&mut buffer, &mut next_expected, &mut out);
+        }
+        assert!(out.is_empty(), "nothing drains until index 0 arrives");
+        assert_eq!(buffer.len(), 4);
+        buffer.insert(0, 0);
+        drain_ready(&mut buffer, &mut next_expected, &mut out);
+        assert_eq!(out, vec![0, 1, 2, 3, 4]);
+        assert_eq!(buffer.len(), 0);
+    }
+
+    #[test]
+    fn window_gate_blocks_far_index_and_releases_on_advance() {
+        let window = 4usize;
+        assert!(!should_block(0, 0, window), "head index never blocks");
+        assert!(
+            !should_block(3, 0, window),
+            "last in-window index does not block"
+        );
+        assert!(should_block(4, 0, window), "index at cursor+window blocks");
+
+        let gate = Arc::new((Mutex::new(0usize), Condvar::new()));
+        let abort = Arc::new(AtomicBool::new(false));
+        let producer_gate = Arc::clone(&gate);
+        let producer_abort = Arc::clone(&abort);
+        let index = 4usize;
+
+        let handle = std::thread::spawn(move || {
+            let (lock, cvar) = &*producer_gate;
+            let mut ne = lock.lock().unwrap();
+            while should_block(index, *ne, window) && !producer_abort.load(Ordering::Relaxed) {
+                ne = cvar.wait(ne).unwrap();
+            }
+            *ne
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !handle.is_finished(),
+            "producer at cursor+window stays blocked"
+        );
+
+        let (lock, cvar) = &*gate;
+        {
+            let mut ne = lock.lock().unwrap();
+            *ne = 1;
+        }
+        cvar.notify_all();
+
+        let observed = handle.join().unwrap();
+        assert!(
+            observed >= 1,
+            "producer unblocked after the cursor advanced"
+        );
+    }
+
+    #[test]
+    fn producer_disconnect_with_gap_terminates_consumer() {
+        let (tx, rx) = mpsc::channel::<(usize, usize)>();
+        tx.send((0, 0)).unwrap();
+        tx.send((1, 1)).unwrap();
+        tx.send((3, 3)).unwrap();
+        drop(tx);
+
+        let mut buffer = ReorderBuffer::new();
+        let mut next_expected = 0usize;
+        let mut out = Vec::new();
+        while let Ok((i, payload)) = rx.recv() {
+            buffer.insert(i, payload);
+            while let Some(p) = buffer.take(next_expected) {
+                out.push(p);
+                next_expected += 1;
+            }
+        }
+        assert_eq!(out, vec![0, 1], "drains buffered prefix, stops at the gap");
+        assert_eq!(next_expected, 2);
+        assert_eq!(buffer.len(), 1, "index 3 stays buffered, never drained");
     }
 }
