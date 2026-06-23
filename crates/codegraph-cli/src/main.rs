@@ -636,7 +636,7 @@ fn cmd_sync(path: Option<PathBuf>, quiet: bool) -> Result<()> {
         }
         bar.set_position(done as u64);
     })?;
-    bar.finish_and_clear();
+    finish_phase(&bar, "Synced files");
     if !quiet {
         println!(
             "Synced: {} reindexed, {} skipped (unchanged), {} removed in {}",
@@ -1068,6 +1068,33 @@ fn spinner(quiet: bool, template: &str) -> ProgressBar {
     bar
 }
 
+// A labeled phase spinner that ticks while running. `finish_phase` retains a
+// "✓ <label> (<elapsed>)" summary line on stderr (vs finish_and_clear which
+// wipes it); gated like the other indicators.
+fn phase_spinner(label: &str, quiet: bool) -> ProgressBar {
+    if quiet || !io::stderr().is_terminal() {
+        return ProgressBar::hidden();
+    }
+    let bar = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr());
+    if let Ok(style) = ProgressStyle::with_template("{spinner:.green} {msg}") {
+        bar.set_style(style);
+    }
+    bar.set_message(label.to_string());
+    bar.enable_steady_tick(std::time::Duration::from_millis(100));
+    bar
+}
+
+fn finish_phase(bar: &ProgressBar, label: &str) {
+    if bar.is_hidden() {
+        return;
+    }
+    let elapsed = format_duration(bar.elapsed().as_millis() as i64);
+    if let Ok(style) = ProgressStyle::with_template("{msg}") {
+        bar.set_style(style);
+    }
+    bar.abandon_with_message(format!("✓ {label} ({elapsed})"));
+}
+
 fn index_project(project: &Path, clear_first: bool, verbose: bool) -> Result<IndexSummary> {
     index_project_inner(project, clear_first, verbose, false)
 }
@@ -1169,24 +1196,35 @@ fn index_project_inner(
         spill.write_refs(&result.unresolved_references)?;
         bar.inc(1);
     }
-    bar.finish_and_clear();
+    let scan_files = bar.position();
+    finish_phase(
+        &bar,
+        &format!("Indexed {} files", format_number(scan_files as i64)),
+    );
 
+    let pb = phase_spinner("Persisting nodes", quiet);
     if !pending_nodes.is_empty() {
         store.upsert_nodes(&pending_nodes)?;
     }
     drop(pending_nodes);
+    finish_phase(&pb, "Persisted nodes");
 
     let mut spill = spill.into_reader()?;
+    let pb = phase_spinner("Persisting edges", quiet);
     spill.replay_edges(EDGE_FLUSH_ROWS, |batch| {
         store.insert_edges(batch).map_err(anyhow::Error::from)
     })?;
+    finish_phase(&pb, "Persisted edges");
+    let pb = phase_spinner("Persisting references", quiet);
     spill.replay_refs(REF_FLUSH_ROWS, |batch| {
         store
             .insert_unresolved_refs(batch)
             .map_err(anyhow::Error::from)
     })?;
+    finish_phase(&pb, "Persisted references");
     spill.cleanup();
 
+    let pb = phase_spinner("Detecting frameworks", quiet);
     let mut resolver = ReferenceResolver::new(project.to_string_lossy());
     // Detect frameworks then run their per-file extract (route/component/handler
     // nodes + refs) BEFORE resolution, mirroring the upstream tree-sitter.ts:4796-4819
@@ -1204,16 +1242,23 @@ fn index_project_inner(
             .collect::<Vec<_>>();
         resolver.extract_and_persist_frameworks(&mut store, &relative_files)?;
     }
+    finish_phase(&pb, "Detected frameworks");
+    let pb = phase_spinner("Resolving references", quiet);
     resolver.resolve_and_persist_batched(&mut store, RESOLVE_BATCH_ROWS)?;
+    finish_phase(&pb, "Resolved references");
+    let pb = phase_spinner("Finalizing frameworks", quiet);
     // Cross-file framework finalization (NestJS RouterModule prefixing) after
     // resolution, mirroring the upstream index.ts:358 runPostExtract.
     resolver.run_post_extract(&mut store)?;
+    finish_phase(&pb, "Finalized frameworks");
     store.set_project_metadata("indexed_with_version", VERSION)?;
     store.set_project_metadata(
         "indexed_with_extraction_version",
         &EXTRACTION_VERSION.to_string(),
     )?;
+    let pb = phase_spinner("Compacting database", quiet);
     store.compact()?;
+    finish_phase(&pb, "Compacted database");
     let after = store.counts()?;
     Ok(IndexSummary {
         files_indexed,
