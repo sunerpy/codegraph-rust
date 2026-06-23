@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/sunerpy/codegraph-rust/compare/v0.6.0...v0.7.0) (2026-06-23)
+
+
+### Features
+
+* **index:** show per-phase progress with elapsed time ([1fa33e9](https://github.com/sunerpy/codegraph-rust/commit/1fa33e900bf3a03f2f732f5882833ebc0ee16ff2))
+
 ## [0.6.0](https://github.com/sunerpy/codegraph-rust/compare/v0.5.3...v0.6.0) (2026-06-23)
 
 
