@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/sunerpy/codegraph-rust/compare/v0.5.3...v0.6.0) (2026-06-23)
+
+
+### Features
+
+* **index:** styled progress bar for index and sync ([6abc762](https://github.com/sunerpy/codegraph-rust/commit/6abc7628f6fdf24f2ac4ff41dd00759237d3eb9a))
+
 ## [0.5.3](https://github.com/sunerpy/codegraph-rust/compare/v0.5.2...v0.5.3) (2026-06-22)
 
 
