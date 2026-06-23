@@ -24,7 +24,7 @@ use codegraph_mcp::McpServer;
 use codegraph_resolve::ReferenceResolver;
 use codegraph_store::queries::SearchResult;
 use codegraph_store::Store;
-use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use indicatif::{ParallelProgressIterator, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
 use serde::Serialize;
 use serde_json::json;
@@ -1200,6 +1200,7 @@ fn index_project_inner(
     // (engine.rs:152) exactly so oversized files still size-skip identically.
     let parsed: Vec<(String, FileRecord, ExtractionResult)> = files
         .par_iter()
+        .progress_with(bar.clone())
         .map(
             |relative| -> Result<(String, FileRecord, ExtractionResult)> {
                 let full = project.join(relative);
@@ -1262,7 +1263,6 @@ fn index_project_inner(
 
         spill.write_edges(&result.edges)?;
         spill.write_refs(&result.unresolved_references)?;
-        bar.inc(1);
     }
     let scan_files = bar.position();
     finish_phase(
