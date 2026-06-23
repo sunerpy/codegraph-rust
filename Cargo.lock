@@ -425,6 +425,7 @@ dependencies = [
  "codegraph-core",
  "codegraph-extract",
  "codegraph-store",
+ "rayon",
  "regex",
  "serde",
  "serde_json",
