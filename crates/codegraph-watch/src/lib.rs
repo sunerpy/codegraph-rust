@@ -9,7 +9,9 @@ pub use git::{
     GitHookName, GitHookResult, DEFAULT_SYNC_HOOKS,
 };
 pub use policy::{watch_disabled_reason, WatchPolicy, CODEGRAPH_NO_WATCH};
-pub use sync::{sync_changed_paths, sync_project_once, SyncOutcome};
+pub use sync::{
+    sync_changed_paths, sync_project_once, sync_project_once_with_progress, SyncOutcome,
+};
 pub use watcher::{start_serve_watcher, PendingFile, ProjectWatcher, WatchOptions};
 pub use worktree::{
     detect_worktree_index_mismatch, git_worktree_root, worktree_mismatch_notice,
