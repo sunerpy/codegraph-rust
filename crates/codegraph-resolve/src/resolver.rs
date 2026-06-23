@@ -20,8 +20,8 @@ use crate::types::{
 use codegraph_core::types::{Edge, EdgeKind, Language, Node, NodeKind, UnresolvedRef};
 use codegraph_store::Store;
 use rayon::prelude::*;
-use std::collections::BTreeSet;
-use std::sync::OnceLock;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, OnceLock};
 
 /// Read-only deferred-pass intent returned by [`ReferenceResolver::resolve_one_pure`]
 /// instead of the deferred-list pushes [`ReferenceResolver::resolve_one`] performs, so
@@ -1306,6 +1306,13 @@ impl ReferenceResolver {
         // Built lazily on first-chunk entry, AFTER framework extraction injected
         // its nodes — never in `new`/`initialize` (would miss framework nodes).
         let mut node_snapshot: Option<SnapshotResolutionContext> = None;
+        // Implements/Extends adjacency for `get_supertypes`, seeded once from the
+        // store and folded forward per chunk. `create_edges` is the sole producer
+        // of inheritance edges between chunks, so a chunk seeing edges from chunks
+        // 0..N-1 here is byte-identical to a fresh per-chunk store rebuild — but
+        // without that rebuild's per-chunk query storm. Holds only Implements/
+        // Extends, so it stays small (inheritance edges, not Calls/References).
+        let mut base_adjacency: HashMap<String, Vec<(String, EdgeKind)>> = HashMap::new();
 
         let mut aggregate = ResolutionResult {
             stats: ResolutionStats {
@@ -1332,18 +1339,34 @@ impl ReferenceResolver {
 
             let base = match &node_snapshot {
                 Some(snapshot) => snapshot,
-                None => node_snapshot.insert(SnapshotResolutionContext::from_store(
-                    store,
-                    &self.project_root,
-                )?),
+                None => {
+                    base_adjacency = (*build_edge_adjacency(store)?).clone();
+                    node_snapshot.insert(SnapshotResolutionContext::from_store(
+                        store,
+                        &self.project_root,
+                    )?)
+                }
             };
-            let chunk_ctx = base.with_edge_adjacency(build_edge_adjacency(store)?);
+            // Install the adjacency from chunks 0..N-1 BEFORE resolving chunk N
+            // (matches the old per-chunk full rebuild's observable state).
+            let chunk_ctx = base.with_edge_adjacency(Arc::new(base_adjacency.clone()));
 
             let result = self.resolve_chunk_parallel(&batch, &chunk_ctx);
 
             let edges = self.create_edges(&result.resolved, store);
             if !edges.is_empty() {
                 store.insert_edges(&edges)?;
+            }
+            // Fold this chunk's NEW Implements/Extends edges into the adjacency
+            // AFTER inserting them, so chunk N+1 sees chunks 0..N — the same
+            // forward visibility the per-chunk rebuild produced.
+            for edge in &edges {
+                if matches!(edge.kind, EdgeKind::Implements | EdgeKind::Extends) {
+                    base_adjacency
+                        .entry(edge.source.clone())
+                        .or_default()
+                        .push((edge.target.clone(), edge.kind));
+                }
             }
 
             // Delete THIS batch's resolved rows immediately, bounded by the
