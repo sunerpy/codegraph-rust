@@ -34,7 +34,7 @@ use codegraph_core::types::Language;
 /// React/Next.js, Vue/Nuxt, NestJS); the trait remains the seam through which
 /// the remaining upstream resolvers (Java/React-Native/Go-module/Swift-ObjC/…) can
 /// be added later.
-pub trait FrameworkResolver {
+pub trait FrameworkResolver: Sync {
     /// `FrameworkResolver` name (`name`, `types.ts:159`).
     fn name(&self) -> &str;
 
