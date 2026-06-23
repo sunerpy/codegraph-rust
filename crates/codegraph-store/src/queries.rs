@@ -839,6 +839,39 @@ impl Store {
         Ok(())
     }
 
+    /// Tune THIS connection for a from-scratch bulk index: drop `synchronous` to
+    /// `OFF` and grow the page cache and mmap window. This trades crash durability
+    /// for throughput during the one-shot full index, which is always safe because
+    /// the full-index path starts from an empty DB (`index --force` removes the file
+    /// first) and is re-runnable from scratch on failure.
+    ///
+    /// `synchronous` is a durability knob only: it never alters committed content,
+    /// so golden byte-equivalence is preserved. MUST be scoped to the CLI full-index
+    /// connection — never the shared `Store::open` defaults used by sync/daemon/watch.
+    /// Pair with [`Store::restore_default_pragmas`] (via a Drop guard) so the restore
+    /// runs on both the happy and the error path.
+    pub fn set_bulk_index_pragmas(&self) -> rusqlite::Result<()> {
+        self.conn.pragma_update(None, "synchronous", "OFF")?;
+        self.conn.pragma_update(None, "cache_size", -262_144)?;
+        self.conn
+            .pragma_update(None, "mmap_size", 1_073_741_824_i64)?;
+        Ok(())
+    }
+
+    /// Undo [`Store::set_bulk_index_pragmas`]: checkpoint the WAL back into the main
+    /// file (truncating the `-wal` sidecar) and restore `synchronous=NORMAL` so any
+    /// later reopen of this DB sees the shared default durability. The checkpoint
+    /// leaves the on-disk file in the same compact, no-stray-`-wal` shape a NORMAL
+    /// run produces.
+    ///
+    /// Must be called with no active transaction.
+    pub fn restore_default_pragmas(&self) -> rusqlite::Result<()> {
+        self.conn
+            .pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
+        self.conn.pragma_update(None, "synchronous", "NORMAL")?;
+        Ok(())
+    }
+
     /// Ports `getMetadata` from `upstream db/queries.ts:1798-1804`.
     pub fn get_project_metadata(&self, key: &str) -> rusqlite::Result<Option<String>> {
         self.conn

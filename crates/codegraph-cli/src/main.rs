@@ -1100,6 +1100,29 @@ fn index_project(project: &Path, clear_first: bool, verbose: bool) -> Result<Ind
     index_project_inner(project, clear_first, verbose, false)
 }
 
+/// Restores the shared `synchronous=NORMAL` durability (and truncates the WAL) when
+/// the full index finishes OR bails out early via `?`. Drop never panics: a failed
+/// restore is logged, not propagated.
+struct BulkIndexPragmaGuard {
+    db_path: PathBuf,
+}
+
+impl Drop for BulkIndexPragmaGuard {
+    fn drop(&mut self) {
+        let result = match Store::open(&self.db_path) {
+            Ok(store) => store.restore_default_pragmas().map_err(anyhow::Error::from),
+            Err(err) => Err(anyhow::Error::from(err)),
+        };
+        if let Err(err) = result {
+            tracing::warn!(
+                error = %err,
+                db = %self.db_path.display(),
+                "failed to restore default pragmas after full index",
+            );
+        }
+    }
+}
+
 fn index_project_inner(
     project: &Path,
     clear_first: bool,
@@ -1121,7 +1144,19 @@ fn index_project_inner(
         eprintln!("Scanning files…");
     }
     let files = codegraph_extract::engine::scan_project(project, &options)?;
+
+    // `synchronous=OFF` + a larger cache/mmap window speed up the from-scratch bulk
+    // index. The restore lives in a Drop guard, NOT a trailing statement, because
+    // every `?` below would skip a trailing restore and leave `synchronous=OFF`
+    // durable on the error path. Declared BEFORE `store` so it drops AFTER it: the
+    // guard's own connection then runs wal_checkpoint(TRUNCATE)+NORMAL with no WAL
+    // contention, leaving the file in the same shape a NORMAL run produces.
+    let _pragma_guard = BulkIndexPragmaGuard {
+        db_path: db_path(project),
+    };
     let mut store = open_store(project)?;
+    store.set_bulk_index_pragmas()?;
+
     let before = store.counts()?;
     let mut files_indexed = 0;
     let mut files_skipped = 0;
