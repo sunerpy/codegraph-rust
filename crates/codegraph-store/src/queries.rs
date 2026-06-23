@@ -649,6 +649,13 @@ impl Store {
         rows.collect()
     }
 
+    /// Count rows currently in `unresolved_refs`. Sizes the resolve-phase
+    /// progress bar; read AFTER framework refs are inserted or the bar overflows.
+    pub fn unresolved_refs_count(&self) -> rusqlite::Result<i64> {
+        self.conn
+            .query_row("SELECT count(*) FROM unresolved_refs", [], |row| row.get(0))
+    }
+
     /// Ports `deleteSpecificResolvedReferences` from `upstream db/queries.ts:1716-1727`.
     /// Deletes one row per `(from_node_id, reference_name, reference_kind)` tuple in a single
     /// transaction, matching the upstream precise per-tuple delete so only actually-resolved refs go.

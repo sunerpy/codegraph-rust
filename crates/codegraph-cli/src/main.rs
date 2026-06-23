@@ -1311,9 +1311,35 @@ fn index_project_inner(
         resolver.extract_and_persist_frameworks(&mut store, &relative_files)?;
     }
     finish_phase(&pb, "Detected frameworks");
-    let pb = phase_spinner("Resolving references", quiet);
-    resolver.resolve_and_persist_batched(&mut store, RESOLVE_BATCH_ROWS)?;
-    finish_phase(&pb, "Resolved references");
+    // Finished from INSIDE the callback on the final chunk so the retained line
+    // lands before the resolver's deferred passes (which resolve refs this bar
+    // does not count). The trailing finish covers the no-chunk case where the
+    // callback never fires; `done_in_callback` prevents a double finish.
+    let resolve_bar = progress_bar(
+        0,
+        quiet,
+        "{spinner:.green} Resolving references [{bar:30}] {pos}/{len} ({elapsed})",
+    );
+    let mut bar_sized = false;
+    let mut done_in_callback = false;
+    resolver.resolve_and_persist_batched_with_progress(
+        &mut store,
+        RESOLVE_BATCH_ROWS,
+        |processed, total| {
+            if !bar_sized {
+                resolve_bar.set_length(total);
+                bar_sized = true;
+            }
+            resolve_bar.set_position(processed);
+            if processed >= total && !done_in_callback {
+                finish_phase(&resolve_bar, "Resolved references");
+                done_in_callback = true;
+            }
+        },
+    )?;
+    if !done_in_callback {
+        finish_phase(&resolve_bar, "Resolved references");
+    }
     let pb = phase_spinner("Finalizing frameworks", quiet);
     // Cross-file framework finalization (NestJS RouterModule prefixing) after
     // resolution, mirroring the upstream index.ts:358 runPostExtract.

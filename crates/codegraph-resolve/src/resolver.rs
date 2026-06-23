@@ -1279,10 +1279,29 @@ impl ReferenceResolver {
         store: &mut Store,
         batch_size: usize,
     ) -> anyhow::Result<ResolutionResult> {
+        self.resolve_and_persist_batched_with_progress(store, batch_size, |_, _| {})
+    }
+
+    /// Like [`Self::resolve_and_persist_batched`] but reports progress via
+    /// `on_progress(processed, total)` after each chunk, letting a caller drive a
+    /// `pos/len` bar without `codegraph-resolve` depending on the bar library.
+    /// `total` is the post-framework `unresolved_refs` count; `processed`
+    /// accumulates `batch.len()` per chunk (refs PROCESSED — resolved rows are
+    /// deleted). `on_progress` never gates or reorders work, so resolution output
+    /// stays byte-equivalent to the no-callback path.
+    pub fn resolve_and_persist_batched_with_progress(
+        &mut self,
+        store: &mut Store,
+        batch_size: usize,
+        mut on_progress: impl FnMut(u64, u64),
+    ) -> anyhow::Result<ResolutionResult> {
         {
             let context = crate::context::StoreResolutionContext::new(store, &self.project_root);
             self.warm_caches(&context);
         }
+
+        let total_refs = store.unresolved_refs_count()? as u64;
+        let mut processed: u64 = 0;
 
         // Built lazily on first-chunk entry, AFTER framework extraction injected
         // its nodes — never in `new`/`initialize` (would miss framework nodes).
@@ -1353,6 +1372,9 @@ impl ReferenceResolver {
             for (method, count) in result.stats.by_method {
                 *aggregate.stats.by_method.entry(method).or_insert(0) += count;
             }
+
+            processed += batch.len() as u64;
+            on_progress(processed, total_refs);
         }
 
         // #750 conformance pass then #808 supertype pass, after implements/extends
