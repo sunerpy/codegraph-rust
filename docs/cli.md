@@ -1,41 +1,46 @@
 # CLI Subcommand Reference
 
-`codegraph` ships 20 subcommands. All commands accept `--help` for usage details.
+`codegraph` ships 22 subcommands. All commands accept `--help` for usage details.
 
 ## Path Convention
 
 - **Positional or `-p/--path`:** `init`, `uninit`, `index`, `sync`, `status`,
   `callers`, `callees`, `impact`, `affected`, `unlock`, `check`, `export`.
 - **`-p/--path` only:** `query`, `files`, `serve`.
-- **No project path:** `install`, `uninstall`, `version`, `self-update`,
+- **No project path:** `install`, `uninstall`, `skill`, `version`, `self-update`,
   `completions`.
 
 ---
 
 ## Full Subcommand Table
 
-| Subcommand    | Purpose                                                             | Key flags                                                                                                                     |
-| ------------- | ------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `install`     | Write the codegraph MCP server into each AI agent's config          | `-t/--target`, `-l/--location`, `--global`, `--local`, `-y/--yes`, `--no-permissions`, `--print-config <id>`, `--prompt-hook` |
-| `uninstall`   | Remove codegraph from agent configs (inverse of `install`)          | `-t/--target`, `-l/--location`, `--global`, `--local`, `-y/--yes`                                                             |
-| `init`        | Initialize `.codegraph/` and run the first full index               | `[path]`                                                                                                                      |
-| `uninit`      | Delete the project's `.codegraph/` index                            | `[path]`, `-f/--force`                                                                                                        |
-| `index`       | (Re-)index in full                                                  | `[path]`, `-f/--force`, `-q/--quiet`, `-v/--verbose`                                                                          |
-| `sync`        | Sync changes (currently reuses the safe full-index path)            | `[path]`, `-q/--quiet`                                                                                                        |
-| `status`      | Print index stats (files/nodes/edges/DB size/journal)               | `[path]`, `-j/--json`                                                                                                         |
-| `query`       | FTS5 + multi-signal scored search                                   | `<search>`, `-p`, `-l/--limit`, `-k/--kind`, `-j/--json`                                                                      |
-| `files`       | List indexed files (tree/flat/grouped)                              | `-p`, `--filter`, `--pattern`, `--format`, `--max-depth`, `-j`                                                                |
-| `serve`       | Start the server; `--mcp` enters MCP stdio mode                     | `-p`, `--mcp`, `--no-watch`                                                                                                   |
-| `unlock`      | Clear a stale daemon lock (keeps live pids)                         | `[path]`                                                                                                                      |
-| `callers`     | Who calls a symbol (along calls/references/imports)                 | `<symbol>`, `-p`, `-l`, `-j`                                                                                                  |
-| `callees`     | What a symbol calls                                                 | `<symbol>`, `-p`, `-l`, `-j`                                                                                                  |
-| `impact`      | Blast radius of changing a symbol (incoming deps, transitive)       | `<symbol>`, `-p`, `-d/--depth`, `-j`                                                                                          |
-| `affected`    | Given changed files, the affected symbol set                        | `[files...]`, `-p`, `-d/--depth`, `--filter`                                                                                  |
-| `check`       | Detect circular dependencies (each cycle as `a.ts -> b.ts -> a.ts`) | `[path]`, `-j/--json`                                                                                                         |
-| `export`      | Export the whole code graph as NetworkX node-link JSON              | `[path]`, `-o/--out <file>`, `--no-centrality`                                                                                |
-| `version`     | Print the codegraph version (same as `--version`)                   | —                                                                                                                             |
-| `self-update` | Update the binary in place from the latest GitHub release           | `--check`, `--force`, `--tag <vX.Y.Z>`                                                                                        |
-| `completions` | Print or install shell completions                                  | `<shell>` (bash, zsh, fish, powershell, elvish), `--install`                                                                  |
+| Subcommand        | Purpose                                                                                   | Key flags                                                                                                                     |
+| ----------------- | ----------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `install`         | Write the codegraph MCP server into each AI agent's config                                | `-t/--target`, `-l/--location`, `--global`, `--local`, `-y/--yes`, `--no-permissions`, `--print-config <id>`, `--prompt-hook` |
+| `uninstall`       | Remove codegraph from agent configs (inverse of `install`)                                | `-t/--target`, `-l/--location`, `--global`, `--local`, `-y/--yes`                                                             |
+| `skill`           | Install / update / uninstall / check the embedded agent skill                             | `<action>` (install, update, uninstall, status)                                                                               |
+| `skill install`   | Write the embedded SKILL.md into each agent's skill directory                             | `-t/--target`, `--global`, `--local`, `-y/--yes`                                                                              |
+| `skill update`    | Refresh the installed skill when unchanged by the user                                    | `-t/--target`, `--global`, `--local`, `--force`                                                                               |
+| `skill uninstall` | Remove the skill from agent skill directories                                             | `-t/--target`, `--global`, `--local`, `-y/--yes`                                                                              |
+| `skill status`    | Report install state per agent (up to date / locally modified / outdated / not installed) | `-t/--target`, `--global`, `--local`                                                                                          |
+| `init`            | Initialize `.codegraph/` and run the first full index                                     | `[path]`                                                                                                                      |
+| `uninit`          | Delete the project's `.codegraph/` index                                                  | `[path]`, `-f/--force`                                                                                                        |
+| `index`           | (Re-)index in full                                                                        | `[path]`, `-f/--force`, `-q/--quiet`, `-v/--verbose`                                                                          |
+| `sync`            | Sync changes (currently reuses the safe full-index path)                                  | `[path]`, `-q/--quiet`                                                                                                        |
+| `status`          | Print index stats (files/nodes/edges/DB size/journal)                                     | `[path]`, `-j/--json`                                                                                                         |
+| `query`           | FTS5 + multi-signal scored search                                                         | `<search>`, `-p`, `-l/--limit`, `-k/--kind`, `-j/--json`                                                                      |
+| `files`           | List indexed files (tree/flat/grouped)                                                    | `-p`, `--filter`, `--pattern`, `--format`, `--max-depth`, `-j`                                                                |
+| `serve`           | Start the server; `--mcp` enters MCP stdio mode                                           | `-p`, `--mcp`, `--no-watch`                                                                                                   |
+| `unlock`          | Clear a stale daemon lock (keeps live pids)                                               | `[path]`                                                                                                                      |
+| `callers`         | Who calls a symbol (along calls/references/imports)                                       | `<symbol>`, `-p`, `-l`, `-j`                                                                                                  |
+| `callees`         | What a symbol calls                                                                       | `<symbol>`, `-p`, `-l`, `-j`                                                                                                  |
+| `impact`          | Blast radius of changing a symbol (incoming deps, transitive)                             | `<symbol>`, `-p`, `-d/--depth`, `-j`                                                                                          |
+| `affected`        | Given changed files, the affected symbol set                                              | `[files...]`, `-p`, `-d/--depth`, `--filter`                                                                                  |
+| `check`           | Detect circular dependencies (each cycle as `a.ts -> b.ts -> a.ts`)                       | `[path]`, `-j/--json`                                                                                                         |
+| `export`          | Export the whole code graph as NetworkX node-link JSON                                    | `[path]`, `-o/--out <file>`, `--no-centrality`                                                                                |
+| `version`         | Print the codegraph version (same as `--version`)                                         | —                                                                                                                             |
+| `self-update`     | Update the binary in place from the latest GitHub release                                 | `--check`, `--force`, `--tag <vX.Y.Z>`                                                                                        |
+| `completions`     | Print or install shell completions                                                        | `<shell>` (bash, zsh, fish, powershell, elvish), `--install`                                                                  |
 
 > **Note:** `serve --no-watch` and `CODEGRAPH_NO_WATCH=1` are fully equivalent —
 > both disable the live file watcher. See
@@ -73,6 +78,68 @@ the hook calls `codegraph prompt-hook`, which runs `codegraph_explore` against t
 nearest index and prepends relevant structural context to the prompt. This flag is
 **off by default** and is never implied by `--yes` — you must pass it explicitly.
 No other agent configs are affected.
+
+---
+
+## `codegraph skill` — install the agent skill into your agents
+
+`codegraph skill` installs a bundled `SKILL.md` into each supported agent's skill
+directory. The skill teaches the agent to use CodeGraph for code research and
+project onboarding: reach for `codegraph_explore` before grep/read, use
+`codegraph_node` instead of a plain file read on indexed source, and run
+`codegraph init` when no `.codegraph/` index is present.
+
+Four actions:
+
+```bash
+codegraph skill install   --yes                         # install into all detected agents (global)
+codegraph skill install   --target=claude,cursor --yes  # explicit target list
+codegraph skill install   --target=auto --local         # project-local skill dirs
+codegraph skill update                                  # refresh if unchanged by user
+codegraph skill update    --force                       # overwrite even locally-modified files
+codegraph skill uninstall --target=claude --yes         # remove from one agent
+codegraph skill status                                  # report state for all detected agents
+codegraph skill status    --target=all                  # report state for every agent
+```
+
+All eight supported agents have a skill directory. `--target` accepts the same
+agent ids as `codegraph install` (`claude`, `cursor`, `codex`, `opencode`,
+`hermes`, `gemini`, `antigravity`, `kiro`) plus `auto`, `all`, and `none`.
+Default location is `--global`; pass `--local` to write into the project tree.
+Hermes supports global only (no automatic project-scope for skills).
+
+### Per-agent skill paths
+
+| Agent       | Global skill dir                      | Local skill dir              |
+| ----------- | ------------------------------------- | ---------------------------- |
+| claude      | `~/.claude/skills/codegraph/`         | `.claude/skills/codegraph/`  |
+| cursor      | `~/.cursor/skills/codegraph/`         | `.cursor/skills/codegraph/`  |
+| codex       | `~/.agents/skills/codegraph/`         | `.agents/skills/codegraph/`  |
+| opencode    | `~/.config/opencode/skill/codegraph/` | `.opencode/skill/codegraph/` |
+| hermes      | `~/.hermes/skills/codegraph/`         | (global only)                |
+| gemini      | `~/.gemini/skills/codegraph/`         | `.gemini/skills/codegraph/`  |
+| antigravity | `~/.gemini/config/skills/codegraph/`  | `.agents/skills/codegraph/`  |
+| kiro        | `~/.kiro/skills/codegraph/`           | `.kiro/skills/codegraph/`    |
+
+Note: opencode uses the singular `skill/` directory name (not `skills/`).
+Codex and Antigravity share `.agents/skills/` for local installs — writing both
+targets locally is idempotent (same content and hash).
+
+### Update semantics
+
+`skill update` compares the installed file's content hash against the embedded
+version using a git blob SHA-1:
+
+- **Unchanged** — installed file matches the embedded version; nothing to do.
+- **Update** — installed file was written by codegraph and is now outdated; the
+  file is refreshed automatically.
+- **Locally modified** — the file has been edited by hand (hash drifted from the
+  recorded install hash); the file is **skipped** with a "locally modified — use
+  `--force` to overwrite" note. Pass `--force` to overwrite anyway.
+
+A small sidecar file (`.codegraph-skill.json`) next to `SKILL.md` records the
+installed hash, version, and timestamp. Deleting the sidecar causes the update
+check to treat the file as locally modified (conservative).
 
 ---
 
