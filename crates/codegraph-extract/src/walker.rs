@@ -209,6 +209,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             Language::Ruby => self.visit_ruby_node(node),
             Language::Php => self.visit_php_node(node),
             Language::R => self.visit_r_node(node),
+            Language::Gdscript => self.visit_gdscript_node(node),
             _ => false,
         }
     }
@@ -298,6 +299,168 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             "binary_operator" => self.visit_r_binary(node),
             _ => false,
         }
+    }
+
+    fn visit_gdscript_node(&mut self, node: SyntaxNode<'tree>) -> bool {
+        match node.kind() {
+            "enumerator" => {
+                let Some(left) = child_by_field(node, "left") else {
+                    return false;
+                };
+                let name = node_text(left, self.source);
+                self.create_node(NodeKind::EnumMember, &name, node, NodeExtra::default());
+                true
+            }
+            "const_statement" => {
+                let Some(name_node) = child_by_field(node, "name") else {
+                    return false;
+                };
+                let name = node_text(name_node, self.source);
+                self.create_node(NodeKind::Constant, &name, node, NodeExtra::default());
+                self.gdscript_visit_initializer(node);
+                true
+            }
+            // `var`, `@export var`, `@onready var` all parse as
+            // `variable_statement` (annotation is a child, not a distinct
+            // kind); the other two arms guard against a future grammar split.
+            "variable_statement" | "export_variable_statement" | "onready_variable_statement" => {
+                let Some(name_node) = child_by_field(node, "name") else {
+                    return false;
+                };
+                let name = node_text(name_node, self.source);
+                self.create_node(NodeKind::Variable, &name, node, NodeExtra::default());
+                self.gdscript_visit_initializer(node);
+                true
+            }
+            // `extends X` is a SIBLING statement, never a child clause of
+            // extract_inheritance. Target is a non-field named child of kind
+            // `type` or `string`; an `annotations` child is skipped. Strip
+            // quotes for a `string` target.
+            "extends_statement" => {
+                if let Some((target, text)) = self.gdscript_extends_target(node) {
+                    if let Some(parent_id) = self.node_stack.last().cloned() {
+                        self.push_ref(&parent_id, &text, EdgeKind::Extends, target);
+                    }
+                }
+                true
+            }
+            // An inner `class X extends Y:` keeps its `extends_statement` as the
+            // `extends:` field, which class extraction never re-visits. Emit the
+            // edge here (before extract_classified_class runs) and return false
+            // so normal class extraction still owns the Class node.
+            "class_definition" => {
+                if let Some(extends) = child_by_field(node, "extends") {
+                    if let Some((target, text)) = self.gdscript_extends_target(extends) {
+                        if let Some(parent_id) = self.node_stack.last().cloned() {
+                            self.push_ref(&parent_id, &text, EdgeKind::Extends, target);
+                        }
+                    }
+                }
+                false
+            }
+            // `class_name X` is the script file's own class; members are
+            // file-level siblings, so it is NOT pushed onto node_stack (keeps
+            // file-level funcs top-level Functions). Sole owner of this kind.
+            "class_name_statement" => {
+                let Some(name_node) = child_by_field(node, "name") else {
+                    return false;
+                };
+                let name = node_text(name_node, self.source);
+                self.create_node(NodeKind::Class, &name, node, NodeExtra::default());
+                true
+            }
+            // `preload(...)` / `load(...)` have NO dedicated grammar node — they
+            // are ordinary `call`s whose callee identifier is `preload`/`load`
+            // and whose resource path is a `string` argument. Emit an Import
+            // node + Imports edge and return true to SUPPRESS the generic
+            // extract_call (so they are imports, not Calls refs). Any other
+            // call returns false so extract_call still emits the normal Calls
+            // ref. Mirrors emit_lua_require.
+            "call" => {
+                let Some(path) = self.gdscript_preload_path(node) else {
+                    return false;
+                };
+                self.create_node(
+                    NodeKind::Import,
+                    &path,
+                    node,
+                    NodeExtra {
+                        signature: Some(node_text(node, self.source).chars().take(100).collect()),
+                        ..NodeExtra::default()
+                    },
+                );
+                if let Some(parent_id) = self.node_stack.last().cloned() {
+                    self.push_ref(&parent_id, &path, EdgeKind::Imports, node);
+                }
+                true
+            }
+            // `signal X(args)` has no callable identity; mapping it to
+            // Function would collide with a same-named `func X()` in the call
+            // graph, so it is recorded as a Property (D1). NodeKind has no
+            // Signal variant.
+            "signal_statement" => {
+                let Some(name_node) = child_by_field(node, "name") else {
+                    return false;
+                };
+                let name = node_text(name_node, self.source);
+                self.create_node(NodeKind::Property, &name, node, NodeExtra::default());
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A const/var arm returns `true`, which short-circuits the generic
+    /// child walk, so a `preload(...)`/`load(...)` call in the initializer is
+    /// never reached. Re-enter only the `value` subtree so the `call` arm can
+    /// emit the Import while const/var keep owning the declaration node.
+    fn gdscript_visit_initializer(&mut self, node: SyntaxNode<'tree>) {
+        if let Some(value) = child_by_field(node, "value") {
+            self.visit_node(value);
+        }
+    }
+
+    /// Return the stripped resource path of a GDScript `preload(...)`/`load(...)`
+    /// call, or `None` for any other call. The callee is the first named child
+    /// that is NOT the `arguments` field; only a bare `identifier` named
+    /// exactly `preload` or `load` qualifies. The path is the first `string`
+    /// inside the `arguments` field, with surrounding quotes stripped.
+    fn gdscript_preload_path(&self, node: SyntaxNode<'tree>) -> Option<String> {
+        let args = child_by_field(node, "arguments");
+        let callee = node
+            .named_children(&mut node.walk())
+            .find(|child| Some(*child) != args)?;
+        if callee.kind() != "identifier" {
+            return None;
+        }
+        if !matches!(node_text(callee, self.source).as_str(), "preload" | "load") {
+            return None;
+        }
+        let string_node = first_descendant_kind(args?, "string")?;
+        let path = node_text(string_node, self.source)
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'')
+            .to_string();
+        if path.is_empty() {
+            return None;
+        }
+        Some(path)
+    }
+
+    fn gdscript_extends_target(
+        &self,
+        node: SyntaxNode<'tree>,
+    ) -> Option<(SyntaxNode<'tree>, String)> {
+        let target = node
+            .named_children(&mut node.walk())
+            .find(|child| matches!(child.kind(), "type" | "string"))?;
+        let raw = node_text(target, self.source);
+        let text = if target.kind() == "string" {
+            raw.trim_matches(|c| c == '"' || c == '\'').to_string()
+        } else {
+            raw
+        };
+        Some((target, text))
     }
 
     fn visit_r_call(&mut self, node: SyntaxNode<'tree>) -> bool {
@@ -1864,6 +2027,13 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     fn visit_body_node(&mut self, node: SyntaxNode<'tree>) {
         let node_type = node.kind();
         self.maybe_capture_fn_refs(node, node_type);
+        // Inside a function body, GDScript `preload(...)`/`load(...)` calls must
+        // become Imports, not Calls. The body walker never dispatches the
+        // language hook, so route GDScript nodes through it first; a `true`
+        // return (preload/load handled) short-circuits the generic call path.
+        if self.spec.language() == Language::Gdscript && self.visit_gdscript_node(node) {
+            return;
+        }
         if is_jsx_element_kind(node_type) {
             self.extract_jsx_component_ref(node);
         } else if has_type(self.spec.call_types(), node_type) {

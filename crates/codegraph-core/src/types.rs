@@ -49,7 +49,7 @@ pub const EDGE_KIND_STRINGS: [&str; 12] = [
     "decorates",
 ];
 
-pub const LANGUAGE_STRINGS: [&str; 32] = [
+pub const LANGUAGE_STRINGS: [&str; 33] = [
     "typescript",
     "javascript",
     "tsx",
@@ -81,6 +81,7 @@ pub const LANGUAGE_STRINGS: [&str; 32] = [
     "twig",
     "xml",
     "properties",
+    "gdscript",
     "unknown",
 ];
 
@@ -324,12 +325,14 @@ pub enum Language {
     Xml,
     #[serde(rename = "properties")]
     Properties,
+    #[serde(rename = "gdscript")]
+    Gdscript,
     #[serde(rename = "unknown")]
     Unknown,
 }
 
 impl Language {
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 33] = [
         Self::TypeScript,
         Self::JavaScript,
         Self::Tsx,
@@ -361,6 +364,7 @@ impl Language {
         Self::Twig,
         Self::Xml,
         Self::Properties,
+        Self::Gdscript,
         Self::Unknown,
     ];
 
@@ -397,6 +401,7 @@ impl Language {
             Self::Twig => "twig",
             Self::Xml => "xml",
             Self::Properties => "properties",
+            Self::Gdscript => "gdscript",
             Self::Unknown => "unknown",
         }
     }

@@ -1263,6 +1263,7 @@ fn parse_language(value: String) -> rusqlite::Result<Language> {
         "twig" => Language::Twig,
         "xml" => Language::Xml,
         "properties" => Language::Properties,
+        "gdscript" => Language::Gdscript,
         "unknown" => Language::Unknown,
         _ => return Err(enum_error(value, "language")),
     };
@@ -1444,6 +1445,20 @@ mod tests {
             store.file_by_path("src/lib.rs").unwrap(),
             Some(file("src/lib.rs"))
         );
+    }
+
+    #[test]
+    fn gdscript_node_round_trips_language_through_sqlite() {
+        let mut store = store("gdscript-round-trip");
+        store.upsert_file(&file("scripts/player.gd")).unwrap();
+        let mut inserted = node("function:gd", "ready", "scripts/player.gd");
+        inserted.language = Language::Gdscript;
+
+        store.upsert_nodes(std::slice::from_ref(&inserted)).unwrap();
+
+        let read_back = store.node_by_id("function:gd").unwrap();
+        assert_eq!(read_back, Some(inserted.clone()));
+        assert_eq!(read_back.unwrap().language, Language::Gdscript);
     }
 
     #[test]

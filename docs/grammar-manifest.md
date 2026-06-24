@@ -2,7 +2,7 @@
 
 Task 5 smoke target: `tree-sitter = "0.26"` from the workspace. The authoritative language set is the `LANGUAGES` table plus the grammar manifest (WASM_GRAMMAR_FILES, extension delegation, custom/file-level branches). `unknown` is intentionally excluded from dependency planning.
 
-The current `LANGUAGES` set has 29 entries including `unknown`; this manifest accounts for the 28 concrete entries, `dfm` as the Pascal custom extension path, and the user-requested future/static-resource grammars `sql`, `html`, `css`, and `json`. In this language set, `sql`, `html`, `css`, and general `json` are not `Language` enum entries; Shopify `templates/*.json` and `sections/*.json` delegate to Liquid.
+The current `LANGUAGES` set has 30 entries including `unknown`; this manifest accounts for the 29 concrete entries, `dfm` as the Pascal custom extension path, and the user-requested future/static-resource grammars `sql`, `html`, `css`, and `json`. In this language set, `sql`, `html`, `css`, and general `json` are not `Language` enum entries; Shopify `templates/*.json` and `sections/*.json` delegate to Liquid.
 
 ## Tier policy
 
@@ -34,6 +34,7 @@ The current `LANGUAGES` set has 29 entries including `unknown`; this manifest ac
 | swift      | WASM `tree-sitter-swift.wasm`                                                       | `tree-sitter-swift = "0.7.3"`, `LANGUAGE`                  | a      | PASS       | Verified against 0.26 despite historical old-core risk; crate uses `tree-sitter-language` and only dev-depends on older core. |
 | kotlin     | WASM `tree-sitter-kotlin.wasm`                                                      | `tree-sitter-kotlin-ng = "1.1.0"`, `LANGUAGE`              | a      | PASS       | Use `kotlin-ng`; avoid legacy `tree-sitter-kotlin = 0.3.8` for this workspace.                                                |
 | dart       | WASM `tree-sitter-dart.wasm`                                                        | `tree-sitter-dart = "0.2.0"`, `LANGUAGE`                   | a      | PASS       | Crate is old but exposes `LanguageFn`, so it links with workspace TS 0.26.                                                    |
+| gdscript   | non-upstream Rust-side addition                                                     | `tree-sitter-gdscript = "6.1.0"`, `LANGUAGE`               | a      | PASS       | `.gd`; Godot scripting; functions/classes/enums/vars/signals(as Property)/extends/preload-load                                |
 | svelte     | custom extractor                                                                    | CUSTOM                                                     | custom | CUSTOM     | Delegates script blocks to TypeScript/JavaScript grammars.                                                                    |
 | vue        | custom extractor                                                                    | CUSTOM                                                     | custom | CUSTOM     | Delegates `<script>` / `<script setup>` to TypeScript/JavaScript grammars.                                                    |
 | liquid     | custom regex extractor                                                              | CUSTOM                                                     | custom | CUSTOM     | Shopify `templates/*.json` and `sections/*.json` delegate to Liquid.                                                          |
@@ -61,6 +62,7 @@ tree-sitter-c-sharp = "0.23.5"
 tree-sitter-cpp = "0.23.4"
 tree-sitter-css = "0.25.0"
 tree-sitter-dart = "0.2.0"
+tree-sitter-gdscript = "6.1.0"
 tree-sitter-go = "0.25.0"
 tree-sitter-html = "0.23.2"
 tree-sitter-java = "0.23.5"
