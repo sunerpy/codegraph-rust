@@ -155,10 +155,6 @@ pub fn decide(
 }
 
 /// The installed-skill status for one directory (consumed by `status`).
-///
-/// Consumed by the `status` CLI command (a later task); the install/uninstall
-/// flows do not query status, so it has no binary caller yet.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillStatus {
     /// No SKILL.md present in the skill directory.
@@ -335,9 +331,6 @@ pub fn uninstall_from_dir(skill_parent_dir: &Path) -> WriteResult {
 }
 
 /// Report the installed-skill status for one directory.
-///
-/// Consumed by the `status` CLI command (a later task); no binary caller yet.
-#[allow(dead_code)]
 pub fn status_for_dir(skill_parent_dir: &Path) -> SkillStatus {
     let (installed, sidecar) = read_installed(skill_parent_dir);
     let Some(installed) = installed else {

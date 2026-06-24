@@ -98,9 +98,10 @@ impl Cli {
             | Command::Check { path, .. } => path.clone(),
             Command::Export { path, .. } => path.clone(),
             Command::PromptHook { path, .. } => path.clone(),
-            // install/uninstall are not project-scoped — bootstrap from cwd.
+            // install/uninstall/skill are not project-scoped — bootstrap from cwd.
             Command::Install { .. }
             | Command::Uninstall { .. }
+            | Command::Skill { .. }
             | Command::Version
             | Command::Completions { .. }
             | Command::SelfUpdate { .. } => None,
@@ -274,6 +275,11 @@ enum Command {
         #[arg(short, long)]
         yes: bool,
     },
+    /// Manage the embedded CodeGraph agent skill (install/update/uninstall/status).
+    Skill {
+        #[command(subcommand)]
+        action: SkillAction,
+    },
     /// Print the codegraph version.
     Version,
     /// Generate shell completion scripts (bash, zsh, fish, powershell, elvish).
@@ -313,6 +319,60 @@ enum FilesFormat {
     Tree,
     Flat,
     Grouped,
+}
+
+#[derive(Debug, Subcommand)]
+enum SkillAction {
+    /// Install the embedded CodeGraph skill into the agent's skill directory.
+    Install {
+        #[arg(short, long)]
+        target: Option<String>,
+        #[arg(short, long)]
+        location: Option<String>,
+        #[arg(long, conflicts_with_all = ["local", "location"])]
+        global: bool,
+        #[arg(long, conflicts_with = "location")]
+        local: bool,
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// Refresh an installed skill to the embedded version (use --force to overwrite local edits).
+    Update {
+        #[arg(short, long)]
+        target: Option<String>,
+        #[arg(short, long)]
+        location: Option<String>,
+        #[arg(long, conflicts_with_all = ["local", "location"])]
+        global: bool,
+        #[arg(long, conflicts_with = "location")]
+        local: bool,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove the installed CodeGraph skill.
+    Uninstall {
+        #[arg(short, long)]
+        target: Option<String>,
+        #[arg(short, long)]
+        location: Option<String>,
+        #[arg(long, conflicts_with_all = ["local", "location"])]
+        global: bool,
+        #[arg(long, conflicts_with = "location")]
+        local: bool,
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// Report installed-skill status per agent.
+    Status {
+        #[arg(short, long)]
+        target: Option<String>,
+        #[arg(short, long)]
+        location: Option<String>,
+        #[arg(long, conflicts_with_all = ["local", "location"])]
+        global: bool,
+        #[arg(long, conflicts_with = "location")]
+        local: bool,
+    },
 }
 
 fn run(cli: Cli) -> Result<()> {
@@ -406,6 +466,55 @@ fn run(cli: Cli) -> Result<()> {
             location: location_flag(location, global, local),
             yes,
         }),
+        Command::Skill { action } => match action {
+            SkillAction::Install {
+                target,
+                location,
+                global,
+                local,
+                yes,
+            } => installer::run_skill_install(installer::SkillArgs {
+                target,
+                location: location_flag(location, global, local),
+                yes,
+                force: false,
+            }),
+            SkillAction::Update {
+                target,
+                location,
+                global,
+                local,
+                force,
+            } => installer::run_skill_update(installer::SkillArgs {
+                target,
+                location: location_flag(location, global, local),
+                yes: false,
+                force,
+            }),
+            SkillAction::Uninstall {
+                target,
+                location,
+                global,
+                local,
+                yes,
+            } => installer::run_skill_uninstall(installer::SkillArgs {
+                target,
+                location: location_flag(location, global, local),
+                yes,
+                force: false,
+            }),
+            SkillAction::Status {
+                target,
+                location,
+                global,
+                local,
+            } => installer::run_skill_status(installer::SkillArgs {
+                target,
+                location: location_flag(location, global, local),
+                yes: false,
+                force: false,
+            }),
+        },
         Command::Version => {
             println!("codegraph {VERSION}");
             Ok(())

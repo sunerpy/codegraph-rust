@@ -182,11 +182,6 @@ pub trait AgentTarget {
     /// Report the installed-skill status. When unsupported, the report's
     /// `unsupported` flag is set; otherwise delegates to
     /// [`skill::status_for_dir`].
-    ///
-    /// Consumed by the `status` CLI command (a later task); the
-    /// install/uninstall flows do not query status, so it has no binary caller
-    /// yet.
-    #[allow(dead_code)]
     fn skill_status(&self, ctx: &InstallContext, loc: Location) -> SkillStatusReport {
         match self.resolved_skill_dir(ctx, loc) {
             Some(dir) => SkillStatusReport {
@@ -227,22 +222,21 @@ pub trait AgentTarget {
     }
 }
 
-/// A target's installed-skill status, ready for the `status` command (T10) to
+/// A target's installed-skill status, ready for the `status` command to
 /// render. `status` is `None` when the target does not support skills at the
 /// queried `location` (an "unsupported"/"not supported" state, not an error).
-///
-/// Consumed by the `status` CLI command (a later task); no binary caller yet.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SkillStatusReport {
     pub display_name: &'static str,
+    /// Queried location; carried for callers/tests, not read by the status line.
+    #[allow(dead_code)]
     pub location: Location,
     pub status: Option<skill::SkillStatus>,
 }
 
-#[allow(dead_code)]
 impl SkillStatusReport {
     /// `true` when the target does not support skills at this location.
+    #[allow(dead_code)]
     pub fn is_unsupported(&self) -> bool {
         self.status.is_none()
     }
