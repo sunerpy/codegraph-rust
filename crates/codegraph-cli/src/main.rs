@@ -864,12 +864,44 @@ fn cmd_serve(path: Option<PathBuf>, mcp: bool, no_watch: bool) -> Result<()> {
 
 fn serve_direct(project: Option<PathBuf>, project_root: &Path, no_watch: bool) -> Result<()> {
     let _watcher = start_direct_watcher(project_root, no_watch);
+    // Background catch-up of edits made while the server was down (#905). It runs
+    // on a detached worker thread; `server.run` proceeds immediately so the FIRST
+    // tools/call NEVER waits on the reconcile. Bind the flag to keep it alive (a
+    // future status surface can read it); it is intentionally never awaited.
+    let _catch_up_done = spawn_catch_up(project_root);
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut server = McpServer::new(project);
     server
         .run(BufReader::new(stdin.lock()), stdout.lock())
         .context("running MCP stdio server")
+}
+
+/// Spawn a ONE-SHOT background catch-up sync that absorbs edits made while the
+/// server was down (upstream colby `catchUpSync`, #905). Returns an
+/// `Arc<AtomicBool>` flipped to `true` when the background sync finishes, so a
+/// status surface could observe completion. The request path MUST NOT block on
+/// it: this runs on a detached `std::thread` and is never joined on the
+/// handshake / tool-call path.
+fn spawn_catch_up(project_root: &Path) -> Arc<AtomicBool> {
+    let done = Arc::new(AtomicBool::new(false));
+    let thread_done = Arc::clone(&done);
+    let root = project_root.to_path_buf();
+    std::thread::spawn(move || {
+        match codegraph_watch::sync_project_once(&root) {
+            Ok(outcome) => {
+                let changed = outcome.files_reindexed + outcome.files_removed;
+                if changed > 0 {
+                    eprintln!("[CodeGraph MCP] Caught up {changed} file(s) changed since last run");
+                }
+            }
+            Err(err) => {
+                eprintln!("[CodeGraph MCP] Catch-up sync failed: {err}");
+            }
+        }
+        thread_done.store(true, Ordering::SeqCst);
+    });
+    done
 }
 
 fn start_direct_watcher(

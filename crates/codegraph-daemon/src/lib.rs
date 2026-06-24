@@ -250,6 +250,8 @@ fn run_accept_loop(
     // `serve_session`: per-connection would spawn N watchers.
     let _watcher = start_project_watcher(&project_root, &options);
 
+    let _catch_up_done = spawn_catch_up(&project_root);
+
     while !shutdown.load(Ordering::SeqCst) {
         let state = SupervisionState {
             original_ppid,
@@ -314,4 +316,27 @@ fn start_project_watcher(
             None
         }
     }
+}
+
+/// Spawn a ONE-SHOT background catch-up sync absorbing edits made while the
+/// daemon was down (#905). Returns an `Arc<AtomicBool>` flipped `true` on
+/// completion. Runs on a detached `std::thread`; the accept loop is never
+/// blocked on it, so the first client's first tool call does not wait.
+fn spawn_catch_up(project_root: &Path) -> Arc<AtomicBool> {
+    let done = Arc::new(AtomicBool::new(false));
+    let thread_done = Arc::clone(&done);
+    let root = project_root.to_path_buf();
+    thread::spawn(move || {
+        match codegraph_watch::sync_project_once(&root) {
+            Ok(outcome) => {
+                let changed = outcome.files_reindexed + outcome.files_removed;
+                if changed > 0 {
+                    eprintln!("[CodeGraph MCP] Caught up {changed} file(s) changed since last run");
+                }
+            }
+            Err(err) => warn!(error = %err, "daemon catch-up sync failed"),
+        }
+        thread_done.store(true, Ordering::SeqCst);
+    });
+    done
 }
