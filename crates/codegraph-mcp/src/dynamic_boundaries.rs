@@ -737,6 +737,7 @@ fn forms() -> &'static [FormSpec] {
 fn comment_lang(language: &str) -> Option<CommentLang> {
     match language {
         "python" => Some(CommentLang::Python),
+        "gdscript" => Some(CommentLang::Python),
         "ruby" => Some(CommentLang::Ruby),
         "rust" => Some(CommentLang::Rust),
         "php" => Some(CommentLang::Php),

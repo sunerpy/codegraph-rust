@@ -7,6 +7,7 @@ mod c;
 mod cpp;
 mod csharp;
 mod dart;
+mod gdscript;
 mod go;
 mod java;
 mod javascript;
@@ -34,6 +35,7 @@ pub use c::C_SPEC;
 pub use cpp::CPP_SPEC;
 pub use csharp::CSHARP_SPEC;
 pub use dart::DART_SPEC;
+pub use gdscript::GDSCRIPT_SPEC;
 pub use go::GO_SPEC;
 pub use java::JAVA_SPEC;
 pub use javascript::JAVASCRIPT_SPEC;
@@ -77,6 +79,7 @@ pub fn spec_for_language(language: Language) -> Option<&'static dyn LanguageSpec
         Language::Pascal => Some(&PASCAL_SPEC),
         Language::ObjC => Some(&OBJC_SPEC),
         Language::R => Some(&R_SPEC),
+        Language::Gdscript => Some(&GDSCRIPT_SPEC),
         _ => None,
     }
 }

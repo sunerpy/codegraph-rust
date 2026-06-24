@@ -209,6 +209,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             Language::Ruby => self.visit_ruby_node(node),
             Language::Php => self.visit_php_node(node),
             Language::R => self.visit_r_node(node),
+            Language::Gdscript => self.visit_gdscript_node(node),
             _ => false,
         }
     }
@@ -298,6 +299,10 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             "binary_operator" => self.visit_r_binary(node),
             _ => false,
         }
+    }
+
+    fn visit_gdscript_node(&mut self, _node: SyntaxNode<'tree>) -> bool {
+        false
     }
 
     fn visit_r_call(&mut self, node: SyntaxNode<'tree>) -> bool {

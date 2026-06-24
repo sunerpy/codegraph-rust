@@ -68,6 +68,7 @@ pub fn detect_language(file_path: impl AsRef<Path>) -> Language {
         "pas" | "dpr" | "dpk" | "lpr" | "dfm" | "fmx" => Language::Pascal,
         "scala" | "sc" => Language::Scala,
         "lua" => Language::Lua,
+        "gd" => Language::Gdscript,
         "luau" => Language::Luau,
         "m" | "mm" => Language::ObjC,
         "r" => Language::R,
