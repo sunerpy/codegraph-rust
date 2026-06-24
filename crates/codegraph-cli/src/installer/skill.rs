@@ -13,10 +13,6 @@
 //! directory that will contain the `codegraph/` skill folder) and own all the
 //! filesystem + decision logic.
 
-// Foundation API: the per-agent skill writers and CLI orchestrator that call
-// this surface land in later tasks, so it has no non-test callers here yet.
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -159,6 +155,10 @@ pub fn decide(
 }
 
 /// The installed-skill status for one directory (consumed by `status`).
+///
+/// Consumed by the `status` CLI command (a later task); the install/uninstall
+/// flows do not query status, so it has no binary caller yet.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillStatus {
     /// No SKILL.md present in the skill directory.
@@ -335,6 +335,9 @@ pub fn uninstall_from_dir(skill_parent_dir: &Path) -> WriteResult {
 }
 
 /// Report the installed-skill status for one directory.
+///
+/// Consumed by the `status` CLI command (a later task); no binary caller yet.
+#[allow(dead_code)]
 pub fn status_for_dir(skill_parent_dir: &Path) -> SkillStatus {
     let (installed, sidecar) = read_installed(skill_parent_dir);
     let Some(installed) = installed else {

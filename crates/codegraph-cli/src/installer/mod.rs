@@ -135,6 +135,10 @@ pub fn run_install(args: InstallArgs) -> Result<()> {
         let result = target.install(&ctx, location, opts);
         installed_ids.push(target.id());
         report_write_result(target.display_name(), &ctx, &result);
+        if target.supports_skills(location) {
+            let skill_result = target.install_skill(&ctx, location, false);
+            report_write_result(target.display_name(), &ctx, &skill_result);
+        }
     }
 
     if !installed_ids.is_empty() {
@@ -252,9 +256,11 @@ fn uninstall_targets(
                 };
             }
             let result = target.uninstall(ctx, location);
+            let skill_result = target.uninstall_skill(ctx, location);
             let removed_paths: Vec<PathBuf> = result
                 .files
                 .iter()
+                .chain(skill_result.files.iter())
                 .filter(|f| f.action == FileAction::Removed)
                 .map(|f| f.path.clone())
                 .collect();
