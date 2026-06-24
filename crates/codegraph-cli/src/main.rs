@@ -920,6 +920,12 @@ fn start_direct_watcher(
             );
         },
     ));
+    opts.on_degraded = Some(std::sync::Arc::new(|reason: String| {
+        eprintln!("[CodeGraph MCP] File watcher degraded — {reason}");
+    }));
+    opts.on_sync_error = Some(std::sync::Arc::new(|reason: String| {
+        eprintln!("[CodeGraph MCP] File watcher warning — {reason}");
+    }));
     match codegraph_watch::start_serve_watcher(project_root, opts) {
         Ok(Some(watcher)) => {
             eprintln!("[CodeGraph MCP] File watcher active — graph will auto-sync on changes");

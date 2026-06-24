@@ -396,6 +396,12 @@ fn start_project_watcher(
             let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
             eprintln!("[watcher] sync #{n}: {} file(s)", outcome.files_reindexed);
         }));
+    watch_options.on_degraded = Some(Arc::new(|reason: String| {
+        eprintln!("[CodeGraph MCP] File watcher degraded — {reason}");
+    }));
+    watch_options.on_sync_error = Some(Arc::new(|reason: String| {
+        eprintln!("[CodeGraph MCP] File watcher warning — {reason}");
+    }));
     match codegraph_watch::start_serve_watcher(project_root, watch_options) {
         Ok(watcher) => watcher,
         Err(err) => {
