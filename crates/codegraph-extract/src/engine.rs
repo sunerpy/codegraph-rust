@@ -36,16 +36,10 @@ impl Default for ExtractOptions {
     }
 }
 
-pub fn detect_language(file_path: impl AsRef<Path>) -> Language {
-    let path = file_path.as_ref();
-    let normalized = normalize_path(path);
-    if let Some(language) = crate::embedded::detect_embedded_language(&normalized) {
-        return language;
-    }
-    let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
-        return Language::Unknown;
-    };
-    match ext.to_ascii_lowercase().as_str() {
+/// `ext` is lowercased, no leading dot. `None` is the exact set of extensions a
+/// `.codegraph/codegraph.json` override may claim (the golden-safety skip-list).
+pub fn builtin_language_for_ext(ext: &str) -> Option<Language> {
+    let language = match ext {
         "ts" | "mts" | "cts" => Language::TypeScript,
         "tsx" => Language::Tsx,
         "js" | "mjs" | "cjs" | "xsjs" | "xsjslib" => Language::JavaScript,
@@ -76,8 +70,31 @@ pub fn detect_language(file_path: impl AsRef<Path>) -> Language {
         "twig" => Language::Twig,
         "xml" => Language::Xml,
         "properties" => Language::Properties,
-        _ => Language::Unknown,
+        _ => return None,
+    };
+    Some(language)
+}
+
+pub fn detect_language(file_path: impl AsRef<Path>) -> Language {
+    let path = file_path.as_ref();
+    let normalized = normalize_path(path);
+    if let Some(language) = crate::embedded::detect_embedded_language(&normalized) {
+        return language;
     }
+    let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
+        return Language::Unknown;
+    };
+    let ext = ext.to_ascii_lowercase();
+    if let Some(language) = builtin_language_for_ext(&ext) {
+        return language;
+    }
+    // Golden safety: the override is consulted ONLY for extensions unclaimed by
+    // both the built-in match and the embedded pre-pass (both already checked
+    // above). Absent codegraph.json => no override => exact current behavior.
+    if let Some(language) = crate::ext_config::override_language_for(path, &ext) {
+        return language;
+    }
+    Language::Unknown
 }
 
 pub fn extract_source(

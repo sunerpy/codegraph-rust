@@ -361,6 +361,7 @@ dependencies = [
  "serde",
  "serde_json",
  "streaming-iterator",
+ "tracing",
  "tree-sitter",
  "tree-sitter-c",
  "tree-sitter-c-sharp",

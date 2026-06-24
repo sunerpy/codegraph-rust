@@ -10,6 +10,7 @@
 
 pub mod embedded;
 pub mod engine;
+pub mod ext_config;
 pub mod function_ref;
 pub mod lang;
 pub mod spec;
