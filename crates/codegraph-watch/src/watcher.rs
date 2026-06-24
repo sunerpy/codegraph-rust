@@ -490,53 +490,9 @@ fn snapshot(pending: &BTreeMap<String, PendingInfo>) -> Vec<PendingFile> {
 }
 
 fn maybe_deleted_source(relative: &str) -> bool {
-    static SOURCE_EXTENSIONS: &[&str] = &[
-        "ts",
-        "tsx",
-        "js",
-        "jsx",
-        "py",
-        "go",
-        "rs",
-        "java",
-        "c",
-        "h",
-        "cpp",
-        "cc",
-        "cxx",
-        "hpp",
-        "hxx",
-        "cs",
-        "php",
-        "rb",
-        "swift",
-        "kt",
-        "kts",
-        "dart",
-        "vue",
-        "svelte",
-        "liquid",
-        "pas",
-        "dpr",
-        "dpk",
-        "lpr",
-        "dfm",
-        "fmx",
-        "scala",
-        "sc",
-        "lua",
-        "luau",
-        "m",
-        "mm",
-        "yml",
-        "yaml",
-        "twig",
-        "xml",
-        "properties",
-    ];
-    relative
-        .rsplit_once('.')
-        .is_some_and(|(_, ext)| SOURCE_EXTENSIONS.contains(&ext))
+    relative.rsplit_once('.').is_some_and(|(_, ext)| {
+        codegraph_extract::engine::builtin_language_for_ext(&ext.to_ascii_lowercase()).is_some()
+    })
 }
 
 fn debounce_from_env() -> Duration {
@@ -768,5 +724,29 @@ mod tests {
             SyncAttempt::Done(_) => panic!("expected non-degrading Error, got Done"),
             SyncAttempt::Degraded(_) => panic!("expected non-degrading Error, got Degraded"),
         }
+    }
+
+    #[test]
+    fn maybe_deleted_source_tracks_builtin_language_table() {
+        // A deleted file is "source" iff its extension maps to a builtin
+        // language in `builtin_language_for_ext` (the single source of truth).
+        // GDScript (`gd`) regression: the prior hardcoded SOURCE_EXTENSIONS list
+        // omitted it, so a deleted `.gd` file was wrongly skipped on cleanup.
+        assert!(
+            maybe_deleted_source("foo.gd"),
+            "gd is a builtin source language"
+        );
+        assert!(
+            maybe_deleted_source("foo.ts"),
+            "ts is a builtin source language"
+        );
+        assert!(
+            !maybe_deleted_source("foo.unknownxyz"),
+            "unknown extension is not a source language"
+        );
+        assert!(
+            !maybe_deleted_source("README.md"),
+            "md is not a builtin source language"
+        );
     }
 }

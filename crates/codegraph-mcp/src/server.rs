@@ -24,9 +24,9 @@ use crate::schemas;
 const PROTOCOL_VERSION: &str = "2024-11-05";
 /// `SERVER_INFO.name` (`session.ts:28-31`).
 const SERVER_NAME: &str = "codegraph";
-/// `SERVER_INFO.version` — the upstream package version at the pinned commit
-/// (captured live: `serverInfo.version` == "0.9.9").
-const SERVER_VERSION: &str = "0.9.9";
+/// `SERVER_INFO.version` — follows the real crate version (`CARGO_PKG_VERSION`),
+/// so it auto-tracks release-please bumps instead of drifting.
+const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The relative `.codegraph/codegraph.db` path under a project root, honoring
 /// the `CODEGRAPH_DIR` override (mirrors [`McpServer::has_default_codegraph`]).
