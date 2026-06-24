@@ -38,6 +38,14 @@ use crate::transport::{bind, connect, Listener, Rendezvous};
 const DEFAULT_WATCHDOG_INTERVAL: Duration = Duration::from_millis(500);
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Env var name: when set to `"1"`, the process re-invoked by the launcher IS
+/// the detached daemon and must listen+serve, never re-spawn.
+pub const CODEGRAPH_DAEMON_INTERNAL: &str = "CODEGRAPH_DAEMON_INTERNAL";
+
+/// Env var name: when set to `"1"`, the daemon is opted out and `serve --mcp`
+/// runs in direct (single-process) mode.
+pub const CODEGRAPH_NO_DAEMON: &str = "CODEGRAPH_NO_DAEMON";
+
 #[derive(Clone, Debug)]
 pub struct DaemonOptions {
     pub parent_pid: Option<u32>,

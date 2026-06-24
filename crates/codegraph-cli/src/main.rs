@@ -834,17 +834,85 @@ fn cmd_serve(path: Option<PathBuf>, mcp: bool, no_watch: bool) -> Result<()> {
         std::env::set_var("CODEGRAPH_NO_WATCH", "1");
     }
     if mcp {
-        let stdin = io::stdin();
-        let stdout = io::stdout();
-        let mut server = McpServer::new(project);
-        return server
-            .run(BufReader::new(stdin.lock()), stdout.lock())
-            .context("running MCP stdio server");
+        let project_root = project
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("."));
+        let has_codegraph = codegraph_dir(&project_root).is_dir();
+        match select_serve_mode(daemon_opt_out(), is_daemon_internal(), has_codegraph) {
+            ServeMode::Direct => {
+                let stdin = io::stdin();
+                let stdout = io::stdout();
+                let mut server = McpServer::new(project);
+                return server
+                    .run(BufReader::new(stdin.lock()), stdout.lock())
+                    .context("running MCP stdio server");
+            }
+            ServeMode::BeDaemon => {
+                return codegraph_daemon::run_foreground(
+                    &project_root,
+                    codegraph_daemon::DaemonOptions {
+                        run_mcp: true,
+                        ..Default::default()
+                    },
+                )
+                .context("running as detached MCP daemon");
+            }
+            ServeMode::SpawnOrProxy => {
+                tracing::debug!("daemon-eligible project; spawn/proxy not yet wired, serving direct");
+                // TODO(T2/T7): spawn_or_proxy(project)
+                let stdin = io::stdin();
+                let stdout = io::stdout();
+                let mut server = McpServer::new(project);
+                return server
+                    .run(BufReader::new(stdin.lock()), stdout.lock())
+                    .context("running MCP stdio server");
+            }
+        }
     }
     eprintln!("\nCodeGraph daemon/watch server\n");
     eprintln!("Daemon and watcher startup is wired here for tasks 24/25.");
     eprintln!("Use `codegraph serve --mcp` to start the committed MCP stdio server.");
     Ok(())
+}
+
+fn daemon_opt_out() -> bool {
+    std::env::var(codegraph_daemon::CODEGRAPH_NO_DAEMON).as_deref() == Ok("1")
+}
+
+fn is_daemon_internal() -> bool {
+    std::env::var(codegraph_daemon::CODEGRAPH_DAEMON_INTERNAL).as_deref() == Ok("1")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ServeMode {
+    Direct,
+    BeDaemon,
+    SpawnOrProxy,
+}
+
+pub fn select_serve_mode(no_daemon: bool, is_daemon_internal: bool, has_codegraph: bool) -> ServeMode {
+    if no_daemon {
+        ServeMode::Direct
+    } else if is_daemon_internal {
+        ServeMode::BeDaemon
+    } else if !has_codegraph {
+        ServeMode::Direct
+    } else {
+        ServeMode::SpawnOrProxy
+    }
+}
+
+#[cfg(test)]
+mod serve_mode_tests {
+    use super::{select_serve_mode, ServeMode};
+
+    #[test]
+    fn select_serve_mode_decision_order() {
+        assert_eq!(select_serve_mode(true, false, true), ServeMode::Direct);
+        assert_eq!(select_serve_mode(false, true, true), ServeMode::BeDaemon);
+        assert_eq!(select_serve_mode(false, false, false), ServeMode::Direct);
+        assert_eq!(select_serve_mode(false, false, true), ServeMode::SpawnOrProxy);
+    }
 }
 
 fn cmd_unlock(path: Option<PathBuf>) -> Result<()> {
