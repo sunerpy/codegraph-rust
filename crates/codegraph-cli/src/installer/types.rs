@@ -75,7 +75,7 @@ impl FileAction {
             FileAction::Removed => "Removed",
             FileAction::NotFound => "Not found",
             FileAction::Kept => "Kept",
-            FileAction::Skipped => "Skipped (unparseable — left unchanged)",
+            FileAction::Skipped => "Skipped (left unchanged)",
         }
     }
 }
