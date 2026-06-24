@@ -133,6 +133,14 @@ impl AgentTarget for ClaudeCodeTarget {
             to_upstream_json(&json!({ "mcpServers": { "codegraph": mcp_server_config() } }));
         format!("# Add to {}\n\n{snippet}\n", target.display())
     }
+
+    fn supports_skills(&self, _loc: Location) -> bool {
+        true
+    }
+
+    fn skill_dir(&self, ctx: &InstallContext, loc: Location) -> Option<PathBuf> {
+        Some(config_dir(ctx, loc).join("skills"))
+    }
 }
 
 // Ports writeMcpEntry (claude.ts:214).
@@ -390,3 +398,49 @@ fn remove_prompt_hook_entry(ctx: &InstallContext, loc: Location) -> FileWrite {
 }
 
 pub static CLAUDE_TARGET: ClaudeCodeTarget = ClaudeCodeTarget;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_ctx() -> InstallContext {
+        let base = std::env::temp_dir().join(format!(
+            "codegraph-claude-skill-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        InstallContext {
+            home: base.join("home"),
+            cwd: base.join("cwd"),
+            app_data: None,
+            xdg_config_home: None,
+            hermes_home: None,
+        }
+    }
+
+    #[test]
+    fn claude_supports_and_locates_skills_at_both_locations() {
+        // Given the Claude Code target and a temp install context
+        let target = ClaudeCodeTarget;
+        let ctx = temp_ctx();
+
+        // Then it supports skills at both Global and Local
+        assert!(target.supports_skills(Location::Global));
+        assert!(target.supports_skills(Location::Local));
+
+        // And the parent skills dir is `.claude/skills` for each location
+        // (the engine appends `codegraph/SKILL.md` itself).
+        let global = target.skill_dir(&ctx, Location::Global).unwrap();
+        assert!(global.ends_with("skills"));
+        assert!(global.parent().unwrap().ends_with(".claude"));
+        assert_eq!(global, ctx.home.join(".claude").join("skills"));
+
+        let local = target.skill_dir(&ctx, Location::Local).unwrap();
+        assert!(local.ends_with("skills"));
+        assert!(local.parent().unwrap().ends_with(".claude"));
+        assert_eq!(local, ctx.cwd.join(".claude").join("skills"));
+    }
+}
