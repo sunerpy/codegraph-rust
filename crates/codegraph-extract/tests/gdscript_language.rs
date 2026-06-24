@@ -192,6 +192,74 @@ fn gdscript_malformed_var_no_panic() {
     assert!(node_count < usize::MAX);
 }
 
+#[test]
+fn gdscript_extends_type() {
+    let source = "extends Node\n";
+    let result = extract_source("scripts/x.gd", source, Some(Language::Gdscript));
+    assert!(result.errors.is_empty(), "errors={:#?}", result.errors);
+    assert_ref(&result.unresolved_references, EdgeKind::Extends, "Node");
+}
+
+#[test]
+fn gdscript_extends_string_path() {
+    let source = "extends \"res://base.gd\"\n";
+    let result = extract_source("scripts/x.gd", source, Some(Language::Gdscript));
+    assert!(result.errors.is_empty(), "errors={:#?}", result.errors);
+    assert_ref(
+        &result.unresolved_references,
+        EdgeKind::Extends,
+        "res://base.gd",
+    );
+}
+
+#[test]
+fn gdscript_inner_class_extends() {
+    let source = "class Inner extends Node2D:\n\tpass\n";
+    let result = extract_source("scripts/x.gd", source, Some(Language::Gdscript));
+    assert!(result.errors.is_empty(), "errors={:#?}", result.errors);
+    assert_ref(&result.unresolved_references, EdgeKind::Extends, "Node2D");
+}
+
+#[test]
+fn gdscript_class_name_is_class() {
+    let source = "class_name Player\n";
+    let result = extract_source("scripts/x.gd", source, Some(Language::Gdscript));
+    assert!(result.errors.is_empty(), "errors={:#?}", result.errors);
+    assert_node(&result.nodes, NodeKind::Class, "Player");
+}
+
+#[test]
+fn gdscript_class_name_func_stays_function() {
+    let source = "class_name Player\nfunc ready():\n\tpass\n";
+    let result = extract_source("scripts/x.gd", source, Some(Language::Gdscript));
+    assert!(result.errors.is_empty(), "errors={:#?}", result.errors);
+    assert_node(&result.nodes, NodeKind::Class, "Player");
+    assert_node(&result.nodes, NodeKind::Function, "ready");
+    assert!(
+        !result
+            .nodes
+            .iter()
+            .any(|node| node.name == "ready" && node.kind == NodeKind::Method),
+        "ready must NOT be a Method (class_name not pushed on stack); nodes={:#?}",
+        result.nodes
+    );
+}
+
+#[test]
+fn gdscript_no_extends_no_ref() {
+    let source = "func f():\n\tpass\n";
+    let result = extract_source("scripts/x.gd", source, Some(Language::Gdscript));
+    assert!(result.errors.is_empty(), "errors={:#?}", result.errors);
+    assert!(
+        !result
+            .unresolved_references
+            .iter()
+            .any(|reference| reference.reference_kind == EdgeKind::Extends),
+        "expected ZERO Extends refs; refs={:#?}",
+        result.unresolved_references
+    );
+}
+
 #[allow(dead_code)]
 fn assert_node(nodes: &[codegraph_core::types::Node], kind: NodeKind, name: &str) {
     assert!(

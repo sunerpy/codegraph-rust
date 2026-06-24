@@ -330,8 +330,61 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 self.create_node(NodeKind::Variable, &name, node, NodeExtra::default());
                 true
             }
+            // `extends X` is a SIBLING statement, never a child clause of
+            // extract_inheritance. Target is a non-field named child of kind
+            // `type` or `string`; an `annotations` child is skipped. Strip
+            // quotes for a `string` target.
+            "extends_statement" => {
+                if let Some((target, text)) = self.gdscript_extends_target(node) {
+                    if let Some(parent_id) = self.node_stack.last().cloned() {
+                        self.push_ref(&parent_id, &text, EdgeKind::Extends, target);
+                    }
+                }
+                true
+            }
+            // An inner `class X extends Y:` keeps its `extends_statement` as the
+            // `extends:` field, which class extraction never re-visits. Emit the
+            // edge here (before extract_classified_class runs) and return false
+            // so normal class extraction still owns the Class node.
+            "class_definition" => {
+                if let Some(extends) = child_by_field(node, "extends") {
+                    if let Some((target, text)) = self.gdscript_extends_target(extends) {
+                        if let Some(parent_id) = self.node_stack.last().cloned() {
+                            self.push_ref(&parent_id, &text, EdgeKind::Extends, target);
+                        }
+                    }
+                }
+                false
+            }
+            // `class_name X` is the script file's own class; members are
+            // file-level siblings, so it is NOT pushed onto node_stack (keeps
+            // file-level funcs top-level Functions). Sole owner of this kind.
+            "class_name_statement" => {
+                let Some(name_node) = child_by_field(node, "name") else {
+                    return false;
+                };
+                let name = node_text(name_node, self.source);
+                self.create_node(NodeKind::Class, &name, node, NodeExtra::default());
+                true
+            }
             _ => false,
         }
+    }
+
+    fn gdscript_extends_target(
+        &self,
+        node: SyntaxNode<'tree>,
+    ) -> Option<(SyntaxNode<'tree>, String)> {
+        let target = node
+            .named_children(&mut node.walk())
+            .find(|child| matches!(child.kind(), "type" | "string"))?;
+        let raw = node_text(target, self.source);
+        let text = if target.kind() == "string" {
+            raw.trim_matches(|c| c == '"' || c == '\'').to_string()
+        } else {
+            raw
+        };
+        Some((target, text))
     }
 
     fn visit_r_call(&mut self, node: SyntaxNode<'tree>) -> bool {
