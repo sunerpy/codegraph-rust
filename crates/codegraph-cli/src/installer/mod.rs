@@ -58,6 +58,8 @@ pub struct InstallArgs {
     pub yes: bool,
     /// `--no-permissions` → false; absent → None (default-on, see below).
     pub permissions: Option<bool>,
+    /// `--prompt-hook` → true; opt-in front-load hook, off by default.
+    pub front_load_hook: bool,
     pub print_config: Option<String>,
 }
 
@@ -112,7 +114,10 @@ pub fn run_install(args: InstallArgs) -> Result<()> {
         return Ok(());
     }
 
-    let opts = InstallOptions { auto_allow };
+    let opts = InstallOptions {
+        auto_allow,
+        front_load_hook: args.front_load_hook,
+    };
     let mut installed_ids: Vec<TargetId> = Vec::new();
     for target in &targets {
         if !target.supports_location(location) {

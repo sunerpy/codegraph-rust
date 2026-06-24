@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{self, BufRead, BufReader, IsTerminal, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -97,6 +97,7 @@ impl Cli {
             | Command::Affected { path, .. }
             | Command::Check { path, .. } => path.clone(),
             Command::Export { path, .. } => path.clone(),
+            Command::PromptHook { path, .. } => path.clone(),
             // install/uninstall are not project-scoped — bootstrap from cwd.
             Command::Install { .. }
             | Command::Uninstall { .. }
@@ -255,6 +256,8 @@ enum Command {
         yes: bool,
         #[arg(long = "no-permissions")]
         no_permissions: bool,
+        #[arg(long = "prompt-hook")]
+        prompt_hook: bool,
         #[arg(long = "print-config")]
         print_config: Option<String>,
     },
@@ -291,6 +294,17 @@ enum Command {
         /// Update to a specific version tag (e.g. v0.2.0) instead of latest.
         #[arg(long)]
         tag: Option<String>,
+    },
+    /// Emit deterministic `codegraph_explore` output for a query (NO LLM). Query
+    /// from `--query`/positional or stdin; project is the nearest `.codegraph/`.
+    #[command(hide = true)]
+    PromptHook {
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+        #[arg(short, long)]
+        query: Option<String>,
+        #[arg(value_name = "QUERY")]
+        query_positional: Option<String>,
     },
 }
 
@@ -371,12 +385,14 @@ fn run(cli: Cli) -> Result<()> {
             local,
             yes,
             no_permissions,
+            prompt_hook,
             print_config,
         } => installer::run_install(installer::InstallArgs {
             target,
             location: location_flag(location, global, local),
             yes,
             permissions: if no_permissions { Some(false) } else { None },
+            front_load_hook: prompt_hook,
             print_config,
         }),
         Command::Uninstall {
@@ -404,6 +420,11 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::SelfUpdate { check, force, tag } => cmd_self_update(check, force, tag),
+        Command::PromptHook {
+            path,
+            query,
+            query_positional,
+        } => cmd_prompt_hook(path, query.or(query_positional)),
     }
 }
 
@@ -574,6 +595,48 @@ fn cmd_self_update(check: bool, force: bool, tag: Option<String>) -> Result<()> 
         println!("Updated codegraph to {}", status.version());
     } else {
         println!("codegraph {} is already up to date", status.version());
+    }
+    Ok(())
+}
+
+fn cmd_prompt_hook(path: Option<PathBuf>, query: Option<String>) -> Result<()> {
+    let query = match query {
+        Some(q) if !q.trim().is_empty() => q,
+        _ => {
+            let mut buf = String::new();
+            io::stdin().read_to_string(&mut buf).ok();
+            buf
+        }
+    };
+    let query = query.trim();
+    if query.is_empty() {
+        println!("[codegraph] No query provided — nothing to explore.");
+        return Ok(());
+    }
+
+    let start = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
+    let project = resolve_project_path_optional(&start);
+    if !is_initialized(&project) {
+        println!(
+            "[codegraph] No .codegraph index found near {} — run `codegraph init` to enable context.",
+            start.display()
+        );
+        return Ok(());
+    }
+
+    let engine = match codegraph_mcp::CodeGraphEngine::open(&project) {
+        Ok(engine) => engine,
+        Err(err) => {
+            println!(
+                "[codegraph] Could not open the index at {}: {err}",
+                project.display()
+            );
+            return Ok(());
+        }
+    };
+    let result = engine.execute("codegraph_explore", &json!({ "query": query }));
+    for content in &result.content {
+        println!("{}", content.text);
     }
     Ok(())
 }
