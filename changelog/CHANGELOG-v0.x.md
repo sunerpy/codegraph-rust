@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0](https://github.com/sunerpy/codegraph-rust/compare/v0.8.0...v0.9.0) (2026-06-24)
+
+
+### Features
+
+* **index:** real parse progress and parse/persist streaming overlap ([cec7f9a](https://github.com/sunerpy/codegraph-rust/commit/cec7f9ab6ec83921cf70c6900cfef0116948d5b8))
+
 ## [0.8.0](https://github.com/sunerpy/codegraph-rust/compare/v0.7.0...v0.8.0) (2026-06-23)
 
 
