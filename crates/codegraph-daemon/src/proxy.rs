@@ -24,7 +24,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -122,8 +122,12 @@ pub fn run_proxy<R: BufRead, W: Write + Send + 'static>(
     let client_hello = json!({ "hostPid": host_pid }).to_string();
     forward_to_daemon(&mut send, &client_hello).context("sending client hello")?;
 
-    // Shared shutdown flag flipped by the watchdog on host death.
+    // Shared shutdown flag flipped by the watchdog on host death and polled
+    // per-line by the up pump. Its byte-for-byte pump semantics are unchanged.
     let shutdown = Arc::new(AtomicBool::new(false));
+    // Event channel the watchdog parks on: lets teardown wake it the instant
+    // shutdown is decided instead of after the remainder of a poll interval.
+    let watchdog_wake = Arc::new(Shutdown::new());
     // The forwarded `initialize` id whose daemon reply must be suppressed.
     let suppressed_id: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
     // Both directions write to the host; serialize them behind one lock so an
@@ -132,7 +136,8 @@ pub fn run_proxy<R: BufRead, W: Write + Send + 'static>(
 
     // PPID watchdog: a SIGKILL'd host never closes stdin on POSIX, so poll the
     // host pid and flip shutdown when supervision is lost (colby proxy.ts:380).
-    let watchdog = spawn_ppid_watchdog(host_ppid, Arc::clone(&shutdown));
+    let watchdog =
+        spawn_ppid_watchdog(host_ppid, Arc::clone(&watchdog_wake), Arc::clone(&shutdown));
 
     // daemon -> host pump (own thread): forward every daemon line to the host,
     // except the suppressed-initialize reply.
@@ -153,6 +158,9 @@ pub fn run_proxy<R: BufRead, W: Write + Send + 'static>(
     half_close_write(write_fd);
     let _ = down.join();
     shutdown.store(true, Ordering::SeqCst);
+    // Wake the watchdog at once so its join (in drop) returns promptly instead
+    // of waiting out the remainder of a poll interval.
+    watchdog_wake.signal();
     drop(watchdog);
 
     up_result?;
@@ -329,12 +337,81 @@ fn forward_to_daemon<S: Write>(daemon_send: &mut S, line: &str) -> Result<()> {
     Ok(())
 }
 
+/// Event-driven shutdown signal for the PPID watchdog.
+///
+/// The watchdog must still wake every [`PPID_POLL_INTERVAL`] to re-run the
+/// supervision check (host death is detected by polling, not by an event), but
+/// the *shutdown* itself is an event: when teardown signals it the watchdog has
+/// to wake at once so `WatchdogGuard::drop`'s join returns promptly instead of
+/// blocking out the remainder of a `thread::sleep` (the old up-to-500ms stall).
+///
+/// A `Condvar` over a `Mutex<bool>` gives exactly that: [`wait_timeout`] parks
+/// until either the timer elapses (a poll tick) or [`signal`] wakes it (a
+/// shutdown). The `bool` is also the predicate guarding against the lost-wakeup
+/// race — a `signal()` that lands before the wait is seen on entry.
+///
+/// [`wait_timeout`]: Shutdown::wait_timeout
+/// [`signal`]: Shutdown::signal
+struct Shutdown {
+    signaled: Mutex<bool>,
+    woke: Condvar,
+}
+
+impl Shutdown {
+    fn new() -> Self {
+        Self {
+            signaled: Mutex::new(false),
+            woke: Condvar::new(),
+        }
+    }
+
+    /// Raise the shutdown event and wake every parked waiter at once.
+    fn signal(&self) {
+        let mut guard = self
+            .signaled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = true;
+        self.woke.notify_all();
+    }
+
+    /// Park until `signal()` fires or `timeout` elapses. Returns `true` when the
+    /// wake was a shutdown signal, `false` on a plain timeout (a poll tick). The
+    /// predicate is checked under the lock first, so a signal racing ahead of
+    /// the wait is never missed and spurious wakeups never report a false
+    /// shutdown.
+    fn wait_timeout(&self, timeout: Duration) -> bool {
+        let guard = self
+            .signaled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (guard, _) = self
+            .woke
+            .wait_timeout_while(guard, timeout, |&mut signaled| !signaled)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard
+    }
+}
+
 /// Spawn the PPID watchdog. Returns a guard whose drop joins the thread; the
-/// thread exits when `shutdown` flips (set by drop-order or supervisor loss).
-fn spawn_ppid_watchdog(host_ppid: Option<u32>, shutdown: Arc<AtomicBool>) -> WatchdogGuard {
+/// thread exits the instant `wake` is signaled (by teardown or by its own
+/// host-death detection) — the `Condvar` wake makes the join return without
+/// waiting out a poll.
+///
+/// Two signals, two consumers: `wake` (a `Condvar`) is what the watchdog itself
+/// parks on, so teardown can break it immediately; `pump_shutdown` (the
+/// `AtomicBool` the pump loops poll per-line) is flipped by the watchdog when it
+/// detects host death, so the host->daemon pump tears down too. On host death
+/// the watchdog flips BOTH; on a clean teardown the caller signals `wake` (the
+/// up pump has already exited on its own EOF, so its `AtomicBool` is moot).
+fn spawn_ppid_watchdog(
+    host_ppid: Option<u32>,
+    wake: Arc<Shutdown>,
+    pump_shutdown: Arc<AtomicBool>,
+) -> WatchdogGuard {
     let original_ppid = current_ppid();
     let handle = thread::spawn(move || loop {
-        if shutdown.load(Ordering::SeqCst) {
+        if wake.wait_timeout(PPID_POLL_INTERVAL) {
             break;
         }
         let state = SupervisionState {
@@ -343,10 +420,10 @@ fn spawn_ppid_watchdog(host_ppid: Option<u32>, shutdown: Arc<AtomicBool>) -> Wat
             host_pid: host_ppid,
         };
         if supervision_lost_reason(&state, is_process_alive).is_some() {
-            shutdown.store(true, Ordering::SeqCst);
+            pump_shutdown.store(true, Ordering::SeqCst);
+            wake.signal();
             break;
         }
-        thread::sleep(PPID_POLL_INTERVAL);
     });
     WatchdogGuard {
         handle: Some(handle),
@@ -362,5 +439,82 @@ impl Drop for WatchdogGuard {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// A watchdog still needs to wake every poll interval to run the supervision
+    /// check (host-death detection is a poll, not an event), but the *shutdown*
+    /// signal must wake it immediately. With a plain `thread::sleep`, a signal
+    /// raised mid-sleep is invisible until the sleep elapses, so `drop`+`join`
+    /// blocked up to one full poll interval (~500ms) on every clean exit.
+    ///
+    /// `Shutdown::wait_timeout` is the fix: it parks on a `Condvar` and returns
+    /// the instant `signal()` is called. This test parks a thread on a LONG
+    /// timeout, signals from the main thread, and asserts the parked thread
+    /// woke in WELL UNDER the timeout — proving the wake is event-driven, not a
+    /// timer that must run out.
+    #[test]
+    fn shutdown_signal_wakes_waiter_immediately() {
+        let long = Duration::from_secs(10);
+        let shutdown = Arc::new(Shutdown::new());
+
+        let waiter = Arc::clone(&shutdown);
+        let parked = thread::spawn(move || {
+            let start = Instant::now();
+            // Returns `true` only if shutdown was signaled (vs. timing out).
+            let signaled = waiter.wait_timeout(long);
+            (signaled, start.elapsed())
+        });
+
+        // Give the waiter a beat to actually park on the condvar, then signal.
+        thread::sleep(Duration::from_millis(20));
+        shutdown.signal();
+
+        let (signaled, elapsed) = parked.join().expect("waiter thread panicked");
+        assert!(signaled, "wait_timeout must report the shutdown signal");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "Condvar wake must be near-immediate, not bounded by the {long:?} \
+             timeout; woke after {elapsed:?}"
+        );
+    }
+
+    /// When NO signal arrives, `wait_timeout` must run out the timer and report
+    /// `false` (a poll tick, not a shutdown) — this is what keeps the watchdog
+    /// polling `supervision_lost_reason` every `PPID_POLL_INTERVAL`.
+    #[test]
+    fn shutdown_wait_times_out_when_not_signaled() {
+        let shutdown = Shutdown::new();
+        let start = Instant::now();
+        let signaled = shutdown.wait_timeout(Duration::from_millis(40));
+        assert!(
+            !signaled,
+            "an un-signaled wait must report a timeout, not a signal"
+        );
+        assert!(
+            start.elapsed() >= Duration::from_millis(40),
+            "wait_timeout must actually wait out the poll interval"
+        );
+    }
+
+    /// A signal raised BEFORE the wait must be observed immediately (the
+    /// predicate is checked under the lock before parking), so a shutdown that
+    /// races ahead of the watchdog loop is never missed.
+    #[test]
+    fn shutdown_already_signaled_returns_without_waiting() {
+        let shutdown = Shutdown::new();
+        shutdown.signal();
+        let start = Instant::now();
+        let signaled = shutdown.wait_timeout(Duration::from_secs(10));
+        assert!(signaled, "a pre-set shutdown must be seen on entry");
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "a pre-signaled wait must not park"
+        );
     }
 }
