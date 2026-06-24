@@ -147,6 +147,22 @@ impl AgentTarget for CodexTarget {
             build_codegraph_block()
         )
     }
+
+    // Skill support is INTENTIONALLY decoupled from `supports_location`: Codex
+    // MCP config is global-only, yet Codex DOES scan project-local skills, so
+    // skills are gated on `supports_skills` (true for BOTH locations), never on
+    // `supports_location`. Codex + Antigravity LOCAL both target `.agents/skills`
+    // — co-installing them is idempotent (same content, same hash).
+    fn supports_skills(&self, _loc: Location) -> bool {
+        true
+    }
+    fn skill_dir(&self, ctx: &InstallContext, loc: Location) -> Option<PathBuf> {
+        let parent = match loc {
+            Location::Global => ctx.home.join(".agents").join("skills"),
+            Location::Local => ctx.cwd.join(".agents").join("skills"),
+        };
+        Some(parent)
+    }
 }
 
 // Ports writeMcpEntry (codex.ts:144).
@@ -185,3 +201,41 @@ fn remove_instructions_entry(ctx: &InstallContext) -> FileWrite {
 }
 
 pub static CODEX_TARGET: CodexTarget = CodexTarget;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx() -> InstallContext {
+        InstallContext {
+            home: PathBuf::from("/home/u"),
+            cwd: PathBuf::from("/proj"),
+            app_data: None,
+            xdg_config_home: None,
+            hermes_home: None,
+        }
+    }
+
+    #[test]
+    fn global_skill_dir_ends_agents_skills() {
+        let t = CodexTarget;
+        let dir = t.skill_dir(&ctx(), Location::Global).unwrap();
+        assert!(dir.ends_with(".agents/skills"), "got {}", dir.display());
+    }
+
+    #[test]
+    fn local_skill_dir_ends_agents_skills() {
+        let t = CodexTarget;
+        let dir = t.skill_dir(&ctx(), Location::Local).unwrap();
+        assert!(dir.ends_with(".agents/skills"), "got {}", dir.display());
+    }
+
+    #[test]
+    fn skills_are_decoupled_from_mcp_location() {
+        let t = CodexTarget;
+        assert!(t.supports_skills(Location::Local));
+        assert!(t.supports_skills(Location::Global));
+        assert!(!t.supports_location(Location::Local));
+        assert!(t.supports_location(Location::Global));
+    }
+}
