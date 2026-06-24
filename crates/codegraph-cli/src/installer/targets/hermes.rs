@@ -123,6 +123,17 @@ impl AgentTarget for HermesTarget {
             render_codegraph_mcp_block().join("\n"),
         )
     }
+
+    fn supports_skills(&self, loc: Location) -> bool {
+        loc == Location::Global
+    }
+
+    fn skill_dir(&self, ctx: &InstallContext, loc: Location) -> Option<PathBuf> {
+        match loc {
+            Location::Global => Some(hermes_home(ctx).join("skills")),
+            Location::Local => None,
+        }
+    }
 }
 
 // Ports writeHermesConfig (hermes.ts:123).
@@ -467,3 +478,53 @@ fn remove_codegraph_toolset(content: &str) -> String {
 }
 
 pub static HERMES_TARGET: HermesTarget = HermesTarget;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx_with_home(home: PathBuf) -> InstallContext {
+        InstallContext {
+            home,
+            cwd: PathBuf::from("/tmp/cwd"),
+            app_data: None,
+            xdg_config_home: None,
+            hermes_home: None,
+        }
+    }
+
+    #[test]
+    fn hermes_skills_are_global_only() {
+        // Given the Hermes target with a default hermes_home (~/.hermes).
+        let target = HermesTarget;
+        let ctx = ctx_with_home(PathBuf::from("/tmp/home"));
+
+        // Then skills are supported ONLY at Global.
+        assert!(target.supports_skills(Location::Global));
+        assert!(!target.supports_skills(Location::Local));
+
+        // And the Global skill dir is the PARENT `<hermes_home>/skills`.
+        let global = target.skill_dir(&ctx, Location::Global).unwrap();
+        assert!(global.ends_with(".hermes/skills"));
+
+        // And there is NO Local skill dir.
+        assert!(target.skill_dir(&ctx, Location::Local).is_none());
+    }
+
+    #[test]
+    fn hermes_local_skill_install_returns_unsupported_note() {
+        // Given the Hermes target (global-only for skills).
+        let target = HermesTarget;
+        let ctx = ctx_with_home(PathBuf::from("/tmp/home"));
+
+        // When installing a skill for --location=local via the T3 default.
+        let result = target.install_skill(&ctx, Location::Local, false);
+
+        // Then no files are written and a "not supported" note is emitted.
+        assert!(result.files.is_empty());
+        assert_eq!(result.notes.len(), 1);
+        assert!(
+            result.notes[0].contains("skills not supported by Hermes Agent for --location=local")
+        );
+    }
+}
