@@ -16,6 +16,7 @@ use crate::transport::Stream;
 /// client-hello line before proceeding to serve JSON-RPC. Mirrors colby
 /// `CLIENT_HELLO_TIMEOUT_MS`. A client that sends none simply blocks here no
 /// longer than a normal client blocks waiting to send its first request.
+#[cfg(unix)]
 pub const CLIENT_HELLO_TIMEOUT_MS: u64 = 3000;
 
 /// Hard cap on the OPTIONAL client-hello line length (mirrors colby
