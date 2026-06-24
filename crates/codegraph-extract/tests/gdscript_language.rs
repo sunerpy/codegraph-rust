@@ -260,6 +260,59 @@ fn gdscript_no_extends_no_ref() {
     );
 }
 
+#[test]
+fn gdscript_preload_creates_import() {
+    let source = "const Foo = preload(\"res://foo.gd\")\n";
+    let result = extract_source("scripts/x.gd", source, Some(Language::Gdscript));
+    assert!(result.errors.is_empty(), "errors={:#?}", result.errors);
+    assert_node(&result.nodes, NodeKind::Import, "res://foo.gd");
+    assert_ref(
+        &result.unresolved_references,
+        EdgeKind::Imports,
+        "res://foo.gd",
+    );
+}
+
+#[test]
+fn gdscript_load_creates_import() {
+    let source = "func f():\n\tvar x = load(\"res://bar.gd\")\n";
+    let result = extract_source("scripts/x.gd", source, Some(Language::Gdscript));
+    assert!(result.errors.is_empty(), "errors={:#?}", result.errors);
+    assert_node(&result.nodes, NodeKind::Import, "res://bar.gd");
+    assert_ref(
+        &result.unresolved_references,
+        EdgeKind::Imports,
+        "res://bar.gd",
+    );
+}
+
+#[test]
+fn gdscript_normal_call_still_calls_ref() {
+    let source = "func f():\n\tprint(\"hi\")\n";
+    let result = extract_source("scripts/x.gd", source, Some(Language::Gdscript));
+    assert!(result.errors.is_empty(), "errors={:#?}", result.errors);
+    assert_ref(&result.unresolved_references, EdgeKind::Calls, "print");
+}
+
+#[test]
+fn gdscript_preload_not_a_call_ref() {
+    let source = "func f():\n\tvar x = load(\"res://bar.gd\")\n";
+    let result = extract_source("scripts/x.gd", source, Some(Language::Gdscript));
+    assert!(result.errors.is_empty(), "errors={:#?}", result.errors);
+    let load_calls = result
+        .unresolved_references
+        .iter()
+        .filter(|reference| {
+            reference.reference_kind == EdgeKind::Calls && reference.reference_name == "load"
+        })
+        .count();
+    assert_eq!(
+        load_calls, 0,
+        "preload/load must NOT be a Calls ref; refs={:#?}",
+        result.unresolved_references
+    );
+}
+
 #[allow(dead_code)]
 fn assert_node(nodes: &[codegraph_core::types::Node], kind: NodeKind, name: &str) {
     assert!(
