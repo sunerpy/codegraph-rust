@@ -37,18 +37,22 @@ fn db_path_for(project_path: &std::path::Path) -> PathBuf {
 
 /// Stable identity of the on-disk database file, used to tell a REPLACEMENT
 /// (a fresh file at the same path) apart from an in-place write. Keyed on the
-/// filesystem inode (unix) / file index (windows), NOT modified-time: an
-/// in-place WAL write bumps mtime while keeping the same inode, and FAT's 2s
-/// mtime granularity can miss a fast replace.
+/// filesystem inode (unix) / `(len, creation-time)` (windows), NOT
+/// modified-time: an in-place WAL write bumps mtime while keeping the same
+/// inode, and FAT's 2s mtime granularity can miss a fast replace.
+///
+/// On windows we deliberately avoid the nightly-only unstable
+/// `MetadataExt::file-index` accessor and rely on the stable
+/// `(len, creation_time())` pair: deleting and recreating the db file resets
+/// its creation time, which preserves the #925 replacement-detection intent on
+/// stable toolchains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DbIdentity {
     #[cfg(unix)]
     ino: u64,
-    #[cfg(windows)]
-    file_index: Option<u64>,
-    /// `(len, creation-time)` fallback, consulted only when no stronger id is
-    /// available (windows `file_index()` is `None`, or a non-unix/non-windows
-    /// target).
+    /// `(len, creation-time)` identity for non-unix targets. On windows
+    /// `creation-time` is `meta.creation_time()` (stable); on other non-unix
+    /// targets it is `0` (len only).
     #[cfg(not(unix))]
     fallback: (u64, u64),
 }
@@ -67,11 +71,10 @@ impl DbIdentity {
         {
             use std::os::windows::fs::MetadataExt;
             Some(Self {
-                file_index: meta.file_index(),
                 fallback: (meta.len(), meta.creation_time()),
             })
         }
-        #[cfg(not(any(unix, windows)))]
+        #[cfg(all(not(unix), not(windows)))]
         {
             Some(Self {
                 fallback: (meta.len(), 0),
