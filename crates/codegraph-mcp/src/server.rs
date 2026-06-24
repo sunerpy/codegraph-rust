@@ -37,24 +37,36 @@ fn db_path_for(project_path: &std::path::Path) -> PathBuf {
 
 /// Stable identity of the on-disk database file, used to tell a REPLACEMENT
 /// (a fresh file at the same path) apart from an in-place write. Keyed on the
-/// filesystem inode (unix) / `(len, creation-time)` (windows), NOT
-/// modified-time: an in-place WAL write bumps mtime while keeping the same
-/// inode, and FAT's 2s mtime granularity can miss a fast replace.
+/// filesystem inode (unix) / `(len, last_write_time, creation_time)` (windows),
+/// NOT modified-time alone: an in-place WAL write bumps mtime while keeping the
+/// same inode, and FAT's 2s mtime granularity can miss a fast replace.
 ///
 /// On windows we deliberately avoid the nightly-only unstable
-/// `MetadataExt::file-index` accessor and rely on the stable
-/// `(len, creation_time())` pair: deleting and recreating the db file resets
-/// its creation time, which preserves the #925 replacement-detection intent on
-/// stable toolchains.
+/// by-handle accessors (true volume + index identity) — no stable
+/// true-identity API exists — and instead key on the stable
+/// `(len, last_write_time(), creation_time())` triple. The crucial signal is
+/// `last_write_time`: NTFS **file system tunneling** restores ONLY the original
+/// `creation_time` + name when a file is deleted and recreated at the same path
+/// within ~15s, so `creation_time` (and often `len`) can look UNCHANGED across
+/// an `index --force` rebuild — but tunneling never restores mtime, so a
+/// delete+recreate reliably changes `last_write_time`. `len` + `creation_time`
+/// are cheap corroborating signals layered on top.
+///
+/// ACCEPTED TRADEOFF: an in-place WAL write may bump `last_write_time` and
+/// trigger an occasional NEEDLESS reopen. This is fine — #925's hard
+/// requirement is "never MISS a replace"; a rare extra reopen is just cost, not
+/// a correctness bug (and WAL writes mostly land in the `-wal` sidecar, not the
+/// main db file, so even that is uncommon).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DbIdentity {
     #[cfg(unix)]
     ino: u64,
-    /// `(len, creation-time)` identity for non-unix targets. On windows
-    /// `creation-time` is `meta.creation_time()` (stable); on other non-unix
-    /// targets it is `0` (len only).
+    /// `(len, last_write_time, creation_time)` identity for non-unix targets.
+    /// On windows these are `meta.len()`, `meta.last_write_time()`, and
+    /// `meta.creation_time()` (all stable); on other non-unix targets it is
+    /// `(len, 0, 0)` (len only).
     #[cfg(not(unix))]
-    fallback: (u64, u64),
+    fallback: (u64, u64, u64),
 }
 
 impl DbIdentity {
@@ -67,17 +79,20 @@ impl DbIdentity {
             use std::os::unix::fs::MetadataExt;
             Some(Self { ino: meta.ino() })
         }
-        #[cfg(windows)]
+        #[cfg(all(not(unix), windows))]
         {
             use std::os::windows::fs::MetadataExt;
+            // last_write_time defeats NTFS tunneling (tunneling restores only
+            // creation_time + name, never mtime); len + creation_time are cheap
+            // corroborating signals.
             Some(Self {
-                fallback: (meta.len(), meta.creation_time()),
+                fallback: (meta.len(), meta.last_write_time(), meta.creation_time()),
             })
         }
         #[cfg(all(not(unix), not(windows)))]
         {
             Some(Self {
-                fallback: (meta.len(), 0),
+                fallback: (meta.len(), 0, 0),
             })
         }
     }

@@ -2,9 +2,10 @@
 //! project's `.codegraph/codegraph.db` is REPLACED on disk (new inode), so a
 //! long-lived `serve` never keeps serving a deleted inode.
 //!
-//! The decision is keyed on the db file IDENTITY (unix inode / windows file
-//! index), NOT on modified-time: an in-place WAL write bumps mtime but keeps the
-//! same inode, so it must NOT trigger a reopen.
+//! The decision is keyed on the db file IDENTITY (unix inode / windows
+//! `(len, last_write_time, creation_time)` triple), NOT on modified-time alone:
+//! an in-place WAL write bumps mtime but keeps the same inode, so on unix it
+//! must NOT trigger a reopen.
 
 use std::fs;
 use std::io::Cursor;
@@ -131,19 +132,26 @@ fn reopens_cached_engine_when_db_replaced_with_new_inode() {
     );
     let reopens_before = reopen_count();
 
-    // When: the db is REPLACED on disk with a fresh index (new inode B) whose
+    // When: the db is REPLACED on disk with a fresh index (new identity) whose
     // content differs (a new symbol `betaSymbol`). Removing the dir first
     // guarantees a new inode for the rebuilt db file.
-    let id_a = db_inode(project.path());
+    let id_before = db_identity(project.path());
+    // Sleep ~1.1s so the rebuilt db's last_write_time lands on a distinct tick:
+    // FILETIME granularity vs the NTFS mtime-update floor means a sub-second
+    // rebuild can otherwise reuse the same mtime value, and NTFS tunneling
+    // preserves creation_time + len across delete+recreate — without this margin
+    // the windows identity could look unchanged and the test would flake.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
     fs::remove_dir_all(project.path().join(".codegraph")).unwrap();
     index_into(
         project.path(),
         &[("src/b.ts", "export function betaSymbol() {}\n")],
     );
-    let id_b = db_inode(project.path());
+    let id_after = db_identity(project.path());
     assert_ne!(
-        id_a, id_b,
-        "the rebuilt db must have a new inode (replacement)"
+        id_before, id_after,
+        "replace must change DbIdentity (inode on unix; \
+         len/last_write_time/creation_time triple on windows)"
     );
 
     // Then: the SAME server's SAME tool call must REOPEN the engine — without the
@@ -204,19 +212,29 @@ fn does_not_reopen_when_inode_is_unchanged() {
     );
 }
 
-/// Inode (unix) / file-len proxy (other) of the project's db file, used only to
-/// confirm the test's own replacement actually changed the inode.
-fn db_inode(project: &Path) -> u64 {
+/// Mirror of the production `DbIdentity` for the project's db file, folded into
+/// a single `u128` so the replace test can assert the identity actually changed.
+/// Unix uses the inode; windows mirrors the `(len, last_write_time,
+/// creation_time)` triple (last_write_time defeats NTFS tunneling); other
+/// non-unix targets fall back to `len`.
+fn db_identity(project: &Path) -> u128 {
     let db = project.join(".codegraph").join("codegraph.db");
     let meta = fs::metadata(&db).expect("db metadata");
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        meta.ino()
+        u128::from(meta.ino())
     }
-    #[cfg(not(unix))]
+    #[cfg(all(not(unix), windows))]
     {
-        meta.len()
+        use std::os::windows::fs::MetadataExt;
+        (u128::from(meta.len()) << 64)
+            ^ (u128::from(meta.last_write_time()) << 1)
+            ^ u128::from(meta.creation_time())
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        u128::from(meta.len())
     }
 }
 
