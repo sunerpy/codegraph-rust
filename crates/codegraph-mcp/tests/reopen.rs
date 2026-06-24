@@ -1,11 +1,13 @@
 //! T6 (#925): `McpServer` reopens its cached `CodeGraphEngine` when the
-//! project's `.codegraph/codegraph.db` is REPLACED on disk (new inode), so a
-//! long-lived `serve` never keeps serving a deleted inode.
+//! project's `.codegraph/codegraph.db` is REPLACED on disk, so a long-lived
+//! `serve` never keeps serving a stale database.
 //!
-//! The decision is keyed on the db file IDENTITY (unix inode / windows
-//! `(len, last_write_time, creation_time)` triple), NOT on modified-time alone:
-//! an in-place WAL write bumps mtime but keeps the same inode, so on unix it
-//! must NOT trigger a reopen.
+//! The decision is keyed on the db file IDENTITY (unix inode / a content-based
+//! signature on non-unix), NOT on modified-time: an in-place WAL write bumps
+//! mtime but does not replace the file, so it must NOT trigger a reopen. On
+//! non-unix the signature is a hash of the WAL-stable SQLite header slices
+//! (page count + schema cookie + structural header), which is deterministic and
+//! mtime-independent — it changes only when the db is rebuilt.
 
 use std::fs;
 use std::io::Cursor;
@@ -134,14 +136,8 @@ fn reopens_cached_engine_when_db_replaced_with_new_inode() {
 
     // When: the db is REPLACED on disk with a fresh index (new identity) whose
     // content differs (a new symbol `betaSymbol`). Removing the dir first
-    // guarantees a new inode for the rebuilt db file.
+    // guarantees a freshly built db file.
     let id_before = db_identity(project.path());
-    // Sleep ~1.1s so the rebuilt db's last_write_time lands on a distinct tick:
-    // FILETIME granularity vs the NTFS mtime-update floor means a sub-second
-    // rebuild can otherwise reuse the same mtime value, and NTFS tunneling
-    // preserves creation_time + len across delete+recreate — without this margin
-    // the windows identity could look unchanged and the test would flake.
-    std::thread::sleep(std::time::Duration::from_millis(1100));
     fs::remove_dir_all(project.path().join(".codegraph")).unwrap();
     index_into(
         project.path(),
@@ -151,7 +147,8 @@ fn reopens_cached_engine_when_db_replaced_with_new_inode() {
     assert_ne!(
         id_before, id_after,
         "replace must change DbIdentity (inode on unix; \
-         len/last_write_time/creation_time triple on windows)"
+         len/creation_time/header-sig fold on non-unix — the rebuild changes \
+         the SQLite page count + schema cookie deterministically)"
     );
 
     // Then: the SAME server's SAME tool call must REOPEN the engine — without the
@@ -194,10 +191,18 @@ fn does_not_reopen_when_inode_is_unchanged() {
     let _ = search(&mut server, project.path(), "gammaSymbol");
     let after_first = reopen_count();
 
-    // When: more calls run WITHOUT replacing the db (same inode), even after an
+    // When: more calls run WITHOUT replacing the db (same file), even after an
     // in-place mtime bump (a normal WAL write) — that must NOT be treated as a
-    // replace.
-    filetouch(&project.path().join(".codegraph").join("codegraph.db"));
+    // replace. First prove the identity itself is content-neutral under a pure
+    // mtime touch (the header bytes are unchanged, so the signature holds).
+    let db = project.path().join(".codegraph").join("codegraph.db");
+    let id_before_touch = db_identity(project.path());
+    filetouch(&db);
+    assert_eq!(
+        id_before_touch,
+        db_identity(project.path()),
+        "an mtime-only touch (rewriting identical bytes) must not change DbIdentity"
+    );
     for _ in 0..5 {
         let _ = search(&mut server, project.path(), "gammaSymbol");
     }
@@ -207,16 +212,17 @@ fn does_not_reopen_when_inode_is_unchanged() {
     // open, despite the changed mtime.
     assert_eq!(
         after_first, after_many,
-        "a same-inode (in-place) project must NOT trigger any reopen \
+        "a same-file (in-place) project must NOT trigger any reopen \
          (after_first_call={after_first}, after_many={after_many})"
     );
 }
 
 /// Mirror of the production `DbIdentity` for the project's db file, folded into
 /// a single `u128` so the replace test can assert the identity actually changed.
-/// Unix uses the inode; windows mirrors the `(len, last_write_time,
-/// creation_time)` triple (last_write_time defeats NTFS tunneling); other
-/// non-unix targets fall back to `len`.
+/// Unix uses the inode; non-unix mirrors the production `(len, creation_time,
+/// header_sig)` fold where `header_sig` hashes the SAME WAL-stable SQLite header
+/// slices (`[16..24]`, `[28..32]`, `[40..44]`) — NO mtime, so a pure mtime touch
+/// leaves it unchanged while a rebuild changes it.
 fn db_identity(project: &Path) -> u128 {
     let db = project.join(".codegraph").join("codegraph.db");
     let meta = fs::metadata(&db).expect("db metadata");
@@ -229,13 +235,46 @@ fn db_identity(project: &Path) -> u128 {
     {
         use std::os::windows::fs::MetadataExt;
         (u128::from(meta.len()) << 64)
-            ^ (u128::from(meta.last_write_time()) << 1)
-            ^ u128::from(meta.creation_time())
+            ^ (u128::from(meta.creation_time()) << 1)
+            ^ u128::from(header_sig(&db))
     }
     #[cfg(all(not(unix), not(windows)))]
     {
-        u128::from(meta.len())
+        (u128::from(meta.len()) << 64) ^ u128::from(header_sig(&db))
     }
+}
+
+/// Hash of the WAL-stable SQLite header slices, mirroring the production
+/// `header_sig` in `server.rs`: a short-read-tolerant read of up to 100 header
+/// bytes, hashing only `[16..24]`, `[28..32]`, `[40..44]` (page count + schema
+/// cookie + structural header — stable on a WAL write, changes on a rebuild).
+/// `0` on any failure or a too-short file. Only compiled on non-unix (the unix
+/// arm keys on the inode and never reads the header).
+#[cfg(not(unix))]
+fn header_sig(db: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    use std::io::Read;
+
+    let Ok(mut file) = fs::File::open(db) else {
+        return 0;
+    };
+    let mut header = [0u8; 100];
+    let mut filled = 0usize;
+    while filled < header.len() {
+        match file.read(&mut header[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return 0,
+        }
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (start, end) in [(16usize, 24usize), (28, 32), (40, 44)] {
+        if filled >= end {
+            header[start..end].hash(&mut hasher);
+        }
+    }
+    hasher.finish()
 }
 
 /// Bump the db file's modified-time without changing its inode, simulating a

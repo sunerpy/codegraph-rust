@@ -37,41 +37,99 @@ fn db_path_for(project_path: &std::path::Path) -> PathBuf {
 
 /// Stable identity of the on-disk database file, used to tell a REPLACEMENT
 /// (a fresh file at the same path) apart from an in-place write. Keyed on the
-/// filesystem inode (unix) / `(len, last_write_time, creation_time)` (windows),
-/// NOT modified-time alone: an in-place WAL write bumps mtime while keeping the
-/// same inode, and FAT's 2s mtime granularity can miss a fast replace.
+/// filesystem inode (unix) / a content-based signature (non-unix), NOT
+/// modified-time: an in-place WAL write bumps mtime while keeping the same
+/// inode, so mtime cannot discriminate a replace from a normal write.
 ///
-/// On windows we deliberately avoid the nightly-only unstable
-/// by-handle accessors (true volume + index identity) — no stable
-/// true-identity API exists — and instead key on the stable
-/// `(len, last_write_time(), creation_time())` triple. The crucial signal is
-/// `last_write_time`: NTFS **file system tunneling** restores ONLY the original
-/// `creation_time` + name when a file is deleted and recreated at the same path
-/// within ~15s, so `creation_time` (and often `len`) can look UNCHANGED across
-/// an `index --force` rebuild — but tunneling never restores mtime, so a
-/// delete+recreate reliably changes `last_write_time`. `len` + `creation_time`
-/// are cheap corroborating signals layered on top.
-///
-/// ACCEPTED TRADEOFF: an in-place WAL write may bump `last_write_time` and
-/// trigger an occasional NEEDLESS reopen. This is fine — #925's hard
-/// requirement is "never MISS a replace"; a rare extra reopen is just cost, not
-/// a correctness bug (and WAL writes mostly land in the `-wal` sidecar, not the
-/// main db file, so even that is uncommon).
+/// On windows there is NO stable true-inode API (the by-handle file-index
+/// accessor is nightly-only and unstable), so instead of a timestamp
+/// tuple — which either misses a replace or false-fires on a WAL write — we hash
+/// a small set of STABLE-under-WAL-but-changes-on-rebuild fields from the
+/// SQLite database header (the fixed 100-byte header at offset 0). See
+/// [`NonUnixId`] for the exact byte slices and why each is chosen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DbIdentity {
     #[cfg(unix)]
     ino: u64,
-    /// `(len, last_write_time, creation_time)` identity for non-unix targets.
-    /// On windows these are `meta.len()`, `meta.last_write_time()`, and
-    /// `meta.creation_time()` (all stable); on other non-unix targets it is
-    /// `(len, 0, 0)` (len only).
     #[cfg(not(unix))]
-    fallback: (u64, u64, u64),
+    fallback: NonUnixId,
+}
+
+/// Content-based identity for non-unix targets (primarily windows). The
+/// discriminator is `header_sig`: a hash of the SQLite database header bytes
+/// that are STABLE across an in-place WAL write but CHANGE on an
+/// `index --force` rebuild. `len` + `creation_time` are cheap corroborating
+/// signals layered on top (NTFS file-system tunneling may restore
+/// `creation_time` across a fast delete+recreate, so it is only a backstop).
+///
+/// The hashed header slices (SQLite file format §1.3):
+/// - bytes `[16..24]` — page size + structural header fields (stable on WAL;
+///   may change on a rebuild).
+/// - bytes `[28..32]` — database page count (STABLE on a WAL write, CHANGES on
+///   an `index --force` rebuild).
+/// - bytes `[40..44]` — schema cookie (STABLE on a WAL write, CHANGES on a
+///   schema rebuild).
+///
+/// Deliberately EXCLUDED:
+/// - bytes `[24..28]` — file change counter: increments on EVERY transaction
+///   including a plain WAL write, which would false-fire a reopen.
+/// - bytes `[92..100]` — version-valid-for / SQLite version: mutate on writes.
+///
+/// No timestamp (mtime) is involved, so a normal WAL write that
+/// bumps mtime does NOT change the identity, while a rebuild deterministically
+/// does. `DefaultHasher`'s per-run seed is fine: identity is only ever compared
+/// within one running process, never persisted.
+#[cfg(not(unix))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NonUnixId {
+    len: u64,
+    /// Cheap corroborating signal. On windows this is `meta.creation_time()`
+    /// (NTFS may tunnel it across a fast delete+recreate, so it is only a
+    /// backstop); on other non-unix targets it is `0`.
+    creation_time: u64,
+    /// PRIMARY discriminator: hash of the stable SQLite header slices. `0` when
+    /// the file is too short to read the header (or the header read failed).
+    header_sig: u64,
+}
+
+/// Hash the STABLE SQLite header slices from up to the first 100 bytes of the
+/// db file, returning `0` on any open/read failure or a too-short file. Reads
+/// with a short-read-tolerant loop and guards each hashed slice by the number
+/// of bytes actually read, so it never panics on a short or locked file.
+#[cfg(not(unix))]
+fn header_sig(db_path: &std::path::Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    use std::io::Read;
+
+    let Ok(mut file) = std::fs::File::open(db_path) else {
+        return 0;
+    };
+    let mut header = [0u8; 100];
+    let mut filled = 0usize;
+    while filled < header.len() {
+        match file.read(&mut header[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return 0,
+        }
+    }
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // Only hash a slice if the short-read actually reached its end offset.
+    for (start, end) in [(16usize, 24usize), (28, 32), (40, 44)] {
+        if filled >= end {
+            header[start..end].hash(&mut hasher);
+        }
+    }
+    hasher.finish()
 }
 
 impl DbIdentity {
     /// Identity of the db file, or `None` when it is missing — which the caller
-    /// treats as "must reopen".
+    /// treats as "must reopen". Honors "never miss a replace": a metadata error
+    /// yields `None` (reopen); a header read error degrades `header_sig` to `0`
+    /// (the slices simply do not contribute), never a panic.
     fn read(db_path: &std::path::Path) -> Option<Self> {
         let meta = std::fs::metadata(db_path).ok()?;
         #[cfg(unix)]
@@ -82,17 +140,25 @@ impl DbIdentity {
         #[cfg(all(not(unix), windows))]
         {
             use std::os::windows::fs::MetadataExt;
-            // last_write_time defeats NTFS tunneling (tunneling restores only
-            // creation_time + name, never mtime); len + creation_time are cheap
-            // corroborating signals.
+            // No mtime signal: a WAL write bumps mtime but the hashed header
+            // slices are WAL-stable. len + creation_time corroborate.
             Some(Self {
-                fallback: (meta.len(), meta.last_write_time(), meta.creation_time()),
+                fallback: NonUnixId {
+                    len: meta.len(),
+                    creation_time: meta.creation_time(),
+                    header_sig: header_sig(db_path),
+                },
             })
         }
         #[cfg(all(not(unix), not(windows)))]
         {
+            // Best-effort: len + the same content signature; no creation_time.
             Some(Self {
-                fallback: (meta.len(), 0, 0),
+                fallback: NonUnixId {
+                    len: meta.len(),
+                    creation_time: 0,
+                    header_sig: header_sig(db_path),
+                },
             })
         }
     }
