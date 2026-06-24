@@ -56,13 +56,24 @@ It returns verbatim source plus the caller/callee/impact graph, so you get more
 accurate context in far fewer tokens and round-trips. No AI/LLM inside it — it is
 pure pre-computed structure for _you_ to consume.
 
-**Install + index a project:**
+**Install + index a project** — prefer the one-line installer (downloads a
+prebuilt binary; no Rust toolchain, no compile wait):
 
 ```bash
+# Linux / macOS — one-click install (recommended)
+curl -fsSL https://raw.githubusercontent.com/sunerpy/codegraph-rust/main/scripts/install.sh | sh
+# Windows (PowerShell 5.1+)
+irm https://raw.githubusercontent.com/sunerpy/codegraph-rust/main/scripts/install.ps1 | iex
+
+# Fallback — build from source (only if you have a Rust toolchain)
 cargo install --git https://github.com/sunerpy/codegraph-rust codegraph-rs   # binary: `codegraph`
+
 codegraph init  /path/to/project     # create the index DB (.codegraph/)
 codegraph index /path/to/project     # parse + build the graph
 ```
+
+> 中文：优先用上面的一键安装脚本（直接下载预编译二进制，无需 Rust 工具链、无需编译等待）；
+> `cargo install --git` 仅作为有 Rust 环境时的回退方案。
 
 **Use it as an MCP server (recommended for agents).** It speaks MCP over stdio:
 
