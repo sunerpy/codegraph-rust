@@ -125,6 +125,73 @@ fn gdscript_enum_value_not_spurious_member() {
     );
 }
 
+#[test]
+fn gdscript_const_is_constant() {
+    let source = "const C = 1\n";
+    let result = extract_source("scripts/x.gd", source, Some(Language::Gdscript));
+    assert!(result.errors.is_empty(), "errors={:#?}", result.errors);
+    assert_node(&result.nodes, NodeKind::Constant, "C");
+}
+
+#[test]
+fn gdscript_var_is_variable() {
+    let source = "var hp = 10\n";
+    let result = extract_source("scripts/x.gd", source, Some(Language::Gdscript));
+    assert!(result.errors.is_empty(), "errors={:#?}", result.errors);
+    assert_node(&result.nodes, NodeKind::Variable, "hp");
+}
+
+#[test]
+fn gdscript_export_var_is_variable() {
+    let source = "@export var speed: float\n";
+    let result = extract_source("scripts/x.gd", source, Some(Language::Gdscript));
+    assert!(result.errors.is_empty(), "errors={:#?}", result.errors);
+    assert_node(&result.nodes, NodeKind::Variable, "speed");
+}
+
+#[test]
+fn gdscript_onready_var_is_variable() {
+    let source = "@onready var node_ref = 1\n";
+    let result = extract_source("scripts/x.gd", source, Some(Language::Gdscript));
+    assert!(result.errors.is_empty(), "errors={:#?}", result.errors);
+    assert_node(&result.nodes, NodeKind::Variable, "node_ref");
+}
+
+#[test]
+fn gdscript_var_const_counts() {
+    let source = "const C = 1\nvar a = 1\nvar b = 2\n";
+    let result = extract_source("scripts/x.gd", source, Some(Language::Gdscript));
+    assert!(result.errors.is_empty(), "errors={:#?}", result.errors);
+    let constant_count = result
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::Constant)
+        .count();
+    let variable_count = result
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::Variable)
+        .count();
+    assert_eq!(
+        constant_count, 1,
+        "expected exactly 1 Constant; nodes={:#?}",
+        result.nodes
+    );
+    assert_eq!(
+        variable_count, 2,
+        "expected exactly 2 Variable; nodes={:#?}",
+        result.nodes
+    );
+}
+
+#[test]
+fn gdscript_malformed_var_no_panic() {
+    let source = "var \n@@@\n";
+    let result = extract_source("scripts/x.gd", source, Some(Language::Gdscript));
+    let node_count = result.nodes.len();
+    assert!(node_count < usize::MAX);
+}
+
 #[allow(dead_code)]
 fn assert_node(nodes: &[codegraph_core::types::Node], kind: NodeKind, name: &str) {
     assert!(

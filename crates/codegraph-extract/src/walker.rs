@@ -311,6 +311,25 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 self.create_node(NodeKind::EnumMember, &name, node, NodeExtra::default());
                 true
             }
+            "const_statement" => {
+                let Some(name_node) = child_by_field(node, "name") else {
+                    return false;
+                };
+                let name = node_text(name_node, self.source);
+                self.create_node(NodeKind::Constant, &name, node, NodeExtra::default());
+                true
+            }
+            // `var`, `@export var`, `@onready var` all parse as
+            // `variable_statement` (annotation is a child, not a distinct
+            // kind); the other two arms guard against a future grammar split.
+            "variable_statement" | "export_variable_statement" | "onready_variable_statement" => {
+                let Some(name_node) = child_by_field(node, "name") else {
+                    return false;
+                };
+                let name = node_text(name_node, self.source);
+                self.create_node(NodeKind::Variable, &name, node, NodeExtra::default());
+                true
+            }
             _ => false,
         }
     }
