@@ -28,11 +28,83 @@ const SERVER_NAME: &str = "codegraph";
 /// (captured live: `serverInfo.version` == "0.9.9").
 const SERVER_VERSION: &str = "0.9.9";
 
+/// The relative `.codegraph/codegraph.db` path under a project root, honoring
+/// the `CODEGRAPH_DIR` override (mirrors [`McpServer::has_default_codegraph`]).
+fn db_path_for(project_path: &std::path::Path) -> PathBuf {
+    let dir = std::env::var("CODEGRAPH_DIR").unwrap_or_else(|_| ".codegraph".to_string());
+    project_path.join(dir).join("codegraph.db")
+}
+
+/// Stable identity of the on-disk database file, used to tell a REPLACEMENT
+/// (a fresh file at the same path) apart from an in-place write. Keyed on the
+/// filesystem inode (unix) / file index (windows), NOT modified-time: an
+/// in-place WAL write bumps mtime while keeping the same inode, and FAT's 2s
+/// mtime granularity can miss a fast replace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DbIdentity {
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(windows)]
+    file_index: Option<u64>,
+    /// `(len, creation-time)` fallback, consulted only when no stronger id is
+    /// available (windows `file_index()` is `None`, or a non-unix/non-windows
+    /// target).
+    #[cfg(not(unix))]
+    fallback: (u64, u64),
+}
+
+impl DbIdentity {
+    /// Identity of the db file, or `None` when it is missing — which the caller
+    /// treats as "must reopen".
+    fn read(db_path: &std::path::Path) -> Option<Self> {
+        let meta = std::fs::metadata(db_path).ok()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Some(Self { ino: meta.ino() })
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            Some(Self {
+                file_index: meta.file_index(),
+                fallback: (meta.len(), meta.creation_time()),
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Some(Self {
+                fallback: (meta.len(), 0),
+            })
+        }
+    }
+}
+
+/// A cached engine plus the db-file identity recorded when it was opened.
+struct CachedEngine {
+    engine: CodeGraphEngine,
+    identity: DbIdentity,
+}
+
+/// Process-global count of engine reopens (drop the cached engine + open a
+/// fresh one because the db file went missing or was replaced). The first open
+/// of a never-cached path is not a reopen. `tests/reopen.rs` reads it via
+/// [`reopen_count`] to prove a same-inode project triggers no needless reopen.
+static REOPEN_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Number of engine reopens since process start. Test-observability hook for
+/// the #925 replacement rule; cheap enough to keep unconditionally.
+pub fn reopen_count() -> u64 {
+    REOPEN_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Holds the default project path and a per-path engine cache (mirrors
-/// `ToolHandler.projectCache`, `tools.ts:591`).
+/// `ToolHandler.projectCache`, `tools.ts:591`). Each cached engine carries the
+/// db-file identity it was opened against, so [`McpServer::engine_for`] can
+/// reopen when the database is REPLACED on disk (#925).
 pub struct McpServer {
     default_project: Option<PathBuf>,
-    engines: HashMap<PathBuf, CodeGraphEngine>,
+    engines: HashMap<PathBuf, CachedEngine>,
 }
 
 impl McpServer {
@@ -51,8 +123,7 @@ impl McpServer {
         let Some(project) = &self.default_project else {
             return false;
         };
-        let dir = std::env::var("CODEGRAPH_DIR").unwrap_or_else(|_| ".codegraph".to_string());
-        project.join(dir).join("codegraph.db").is_file()
+        db_path_for(project).is_file()
     }
 
     /// Run the stdio loop until EOF. Reads `reader` line-by-line, writes one
@@ -181,13 +252,37 @@ impl McpServer {
     }
 
     /// Open-on-demand + cache the engine for a project path
-    /// (`ToolHandler.getCodeGraph`, `tools.ts`).
+    /// (`ToolHandler.getCodeGraph`, `tools.ts`), reopening when the db file was
+    /// REPLACED on disk (#925). Before returning a cached engine, re-stat the db
+    /// path: reopen iff it is MISSING or its identity differs from the recorded
+    /// one (inode/file-index changed). An in-place write keeps the same identity,
+    /// so the common path returns the cached engine without reopening.
     fn engine_for(&mut self, project_path: &PathBuf) -> anyhow::Result<&CodeGraphEngine> {
-        if !self.engines.contains_key(project_path) {
+        let db_path = db_path_for(project_path);
+        let current = DbIdentity::read(&db_path);
+
+        let stale = match self.engines.get(project_path) {
+            None => true,
+            Some(cached) => current != Some(cached.identity),
+        };
+
+        if stale {
+            if self.engines.remove(project_path).is_some() {
+                REOPEN_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             let engine = CodeGraphEngine::open(project_path)?;
-            self.engines.insert(project_path.clone(), engine);
+            let identity = DbIdentity::read(&db_path).ok_or_else(|| {
+                anyhow::anyhow!("database vanished after open at {}", db_path.display())
+            })?;
+            self.engines
+                .insert(project_path.clone(), CachedEngine { engine, identity });
         }
-        Ok(self.engines.get(project_path).expect("just inserted"))
+
+        Ok(&self
+            .engines
+            .get(project_path)
+            .expect("engine present after open")
+            .engine)
     }
 }
 
