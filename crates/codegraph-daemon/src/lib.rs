@@ -9,6 +9,7 @@ mod lock;
 mod paths;
 mod process;
 mod session;
+pub mod spawn;
 mod transport;
 
 use std::fs;
@@ -25,9 +26,10 @@ pub use lock::{
     clear_stale_daemon_lock, decode_lock_info, encode_lock_info, try_acquire_daemon_lock,
     unlock_project, AcquireResult, DaemonLockInfo,
 };
-pub use paths::{daemon_pid_path, daemon_socket_path};
+pub use paths::{daemon_log_path, daemon_pid_path, daemon_socket_path};
 pub use process::{current_ppid, is_process_alive, supervision_lost_reason, SupervisionState};
 pub use session::{read_daemon_hello, SessionRegistry};
+pub use spawn::spawn_detached_daemon;
 use tracing::{debug, info, warn};
 
 use crate::lock::cleanup_owned_lock;

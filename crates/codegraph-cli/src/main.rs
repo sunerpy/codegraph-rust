@@ -834,9 +834,7 @@ fn cmd_serve(path: Option<PathBuf>, mcp: bool, no_watch: bool) -> Result<()> {
         std::env::set_var("CODEGRAPH_NO_WATCH", "1");
     }
     if mcp {
-        let project_root = project
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("."));
+        let project_root = project.clone().unwrap_or_else(|| PathBuf::from("."));
         let has_codegraph = codegraph_dir(&project_root).is_dir();
         match select_serve_mode(daemon_opt_out(), is_daemon_internal(), has_codegraph) {
             ServeMode::Direct => {
@@ -858,8 +856,7 @@ fn cmd_serve(path: Option<PathBuf>, mcp: bool, no_watch: bool) -> Result<()> {
                 .context("running as detached MCP daemon");
             }
             ServeMode::SpawnOrProxy => {
-                tracing::debug!("daemon-eligible project; spawn/proxy not yet wired, serving direct");
-                // TODO(T2/T7): spawn_or_proxy(project)
+                spawn_or_proxy(&project_root);
                 let stdin = io::stdin();
                 let stdout = io::stdout();
                 let mut server = McpServer::new(project);
@@ -873,6 +870,55 @@ fn cmd_serve(path: Option<PathBuf>, mcp: bool, no_watch: bool) -> Result<()> {
     eprintln!("Daemon and watcher startup is wired here for tasks 24/25.");
     eprintln!("Use `codegraph serve --mcp` to start the committed MCP stdio server.");
     Ok(())
+}
+
+const DAEMON_SOCKET_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+const DAEMON_SOCKET_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(400);
+
+fn spawn_or_proxy(project_root: &Path) {
+    if !daemon_already_running(project_root) {
+        match std::env::current_exe() {
+            Ok(exe) => {
+                if let Err(err) = codegraph_daemon::spawn_detached_daemon(&exe, project_root) {
+                    tracing::debug!(error = %err, "detached daemon spawn failed; serving direct");
+                    return;
+                }
+                poll_for_daemon_socket(project_root);
+            }
+            Err(err) => {
+                tracing::debug!(error = %err, "current_exe unavailable; serving direct");
+                return;
+            }
+        }
+    }
+    if let Err(err) = proxy_attach_stub() {
+        tracing::debug!(error = %err, "proxy attach unavailable; serving direct");
+    }
+}
+
+fn daemon_already_running(project_root: &Path) -> bool {
+    let pid_path = codegraph_daemon::daemon_pid_path(project_root);
+    let Ok(raw) = fs::read_to_string(&pid_path) else {
+        return false;
+    };
+    codegraph_daemon::decode_lock_info(&raw)
+        .filter(|info| info.pid > 0)
+        .is_some_and(|info| codegraph_daemon::is_process_alive(info.pid))
+}
+
+fn poll_for_daemon_socket(project_root: &Path) {
+    let socket = codegraph_daemon::daemon_socket_path(project_root);
+    let deadline = std::time::Instant::now() + DAEMON_SOCKET_POLL_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        if socket.exists() {
+            return;
+        }
+        std::thread::sleep(DAEMON_SOCKET_POLL_INTERVAL);
+    }
+}
+
+fn proxy_attach_stub() -> Result<()> {
+    anyhow::bail!("proxy not yet wired (T7)")
 }
 
 fn daemon_opt_out() -> bool {
@@ -890,7 +936,11 @@ pub enum ServeMode {
     SpawnOrProxy,
 }
 
-pub fn select_serve_mode(no_daemon: bool, is_daemon_internal: bool, has_codegraph: bool) -> ServeMode {
+pub fn select_serve_mode(
+    no_daemon: bool,
+    is_daemon_internal: bool,
+    has_codegraph: bool,
+) -> ServeMode {
     if no_daemon {
         ServeMode::Direct
     } else if is_daemon_internal {
@@ -911,7 +961,10 @@ mod serve_mode_tests {
         assert_eq!(select_serve_mode(true, false, true), ServeMode::Direct);
         assert_eq!(select_serve_mode(false, true, true), ServeMode::BeDaemon);
         assert_eq!(select_serve_mode(false, false, false), ServeMode::Direct);
-        assert_eq!(select_serve_mode(false, false, true), ServeMode::SpawnOrProxy);
+        assert_eq!(
+            select_serve_mode(false, false, true),
+            ServeMode::SpawnOrProxy
+        );
     }
 }
 

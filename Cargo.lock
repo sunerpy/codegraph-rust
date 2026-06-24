@@ -451,6 +451,7 @@ dependencies = [
  "codegraph-store",
  "codegraph-watch",
  "indicatif",
+ "interprocess",
  "jsonc-parser",
  "predicates",
  "rayon",

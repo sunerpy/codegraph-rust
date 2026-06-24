@@ -15,6 +15,12 @@ pub fn daemon_pid_path(project_root: &Path) -> PathBuf {
     codegraph_dir(project_root).join("daemon.pid")
 }
 
+/// Path of the appended log file the detached daemon's stdout+stderr are
+/// redirected to (`.codegraph/daemon.log`).
+pub fn daemon_log_path(project_root: &Path) -> PathBuf {
+    codegraph_dir(project_root).join("daemon.log")
+}
+
 #[cfg(unix)]
 pub fn daemon_socket_path(project_root: &Path) -> PathBuf {
     let in_project = codegraph_dir(project_root).join("daemon.sock");
