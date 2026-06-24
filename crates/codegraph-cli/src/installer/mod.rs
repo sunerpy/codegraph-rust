@@ -10,6 +10,7 @@
 
 mod registry;
 mod shared;
+pub mod skill;
 mod targets;
 mod types;
 
