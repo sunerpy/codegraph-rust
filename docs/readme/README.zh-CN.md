@@ -192,6 +192,80 @@ python examples/llm_orchestration.py --repo . --query "how does indexing work"
 
 ---
 
+## 守护进程、文件监听与配置
+
+### 共享脱离终端的守护进程
+
+在已索引的项目（存在 `.codegraph/` 目录）中运行 `codegraph serve --mcp` 时，
+CodeGraph 会自动在后台启动一个**共享的、脱离终端的守护进程**，而不是在当前进程内
+运行。同一项目的多个 MCP 客户端（多个终端标签页、多个 agent）通过 Unix socket
+（`.codegraph/daemon.sock`）共用这同一个 daemon。所有客户端断开且空闲超时后，
+daemon 会自动退出。
+
+**日志与失效锁。** Daemon 的标准输出和标准错误追加写入 `.codegraph/daemon.log`。
+若 daemon 异常退出并留下失效锁，运行：
+
+```bash
+codegraph unlock [path]   # 清除失效锁；正在运行的 daemon 进程不受影响
+```
+
+**跳过 daemon 模式。** 设置 `CODEGRAPH_NO_DAEMON=1` 可强制以前台（直连）模式运行，
+无论项目状态如何。适用于不希望后台进程常驻的 CI 或脚本场景。
+
+### 实时文件监听
+
+Daemon 会监听项目文件变动并自动增量重建索引。默认去抖窗口为 2 秒
+（`CODEGRAPH_WATCH_DEBOUNCE_MS`），改动后约 1 秒延迟触发重建。在 WSL2 的 `/mnt/`
+路径下，监听会自动关闭（递归 `fs.watch` 在该路径上过慢）；可设置
+`CODEGRAPH_FORCE_WATCH=1` 强制开启，但该值不会覆盖显式的 `CODEGRAPH_NO_WATCH`。
+若需完全关闭监听，传 `--no-watch` 或设置 `CODEGRAPH_NO_WATCH=1`。
+
+### 环境变量
+
+| 变量                               | 默认值    | 取值范围     | 说明                                              |
+| ---------------------------------- | --------- | ------------ | ------------------------------------------------- |
+| `CODEGRAPH_NO_DAEMON`              | —         | —            | 强制前台直连模式，永不启动/代理 daemon            |
+| `CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS` | `300000`  | 1000–3600000 | 无客户端连接超过该时长后退出                      |
+| `CODEGRAPH_DAEMON_MAX_IDLE_MS`     | `1800000` | 1000–3600000 | daemon 空闲时的生命周期硬上限                     |
+| `CODEGRAPH_DAEMON_CLIENT_SWEEP_MS` | `30000`   | 50–600000    | daemon 扫描失联客户端的频率                       |
+| `CODEGRAPH_WATCH_DEBOUNCE_MS`      | `2000`    | 100–60000    | 文件变动触发重建前的去抖延迟                      |
+| `CODEGRAPH_NO_WATCH`               | —         | —            | 关闭实时文件监听（等价于 `serve --no-watch`）     |
+| `CODEGRAPH_FORCE_WATCH`            | —         | —            | 覆盖 WSL2 `/mnt/` 自动禁用（不会覆盖 `NO_WATCH`） |
+| `CODEGRAPH_DAEMON_INTERNAL`        | —         | —            | **内部使用，用户请勿设置**                        |
+
+完整的启动决策顺序与更多参考：[`../cli.md`](../cli.md)。
+
+### 自定义扩展名映射（`.codegraph/codegraph.json`）
+
+在 `.codegraph/codegraph.json` 中配置非标准扩展名的解析语言：
+
+```jsonc
+{
+  "extensions": {
+    ".x": "lua",
+    ".blade": "php",
+  },
+}
+```
+
+键会去掉前导点并转为小写后再匹配；未知语言名称会被静默忽略；文件格式不合法时
+忽略（记录日志）。查找时从文件所在目录逐级向上，取最近的
+`.codegraph/codegraph.json` 生效。
+
+### 可选的 Claude prompt hook
+
+`codegraph install --prompt-hook` 会向 Claude Code 写入一个 `UserPromptSubmit`
+hook。每次提交 prompt 前，hook 调用 `codegraph prompt-hook`，对最近的索引执行
+`codegraph_explore`，并将相关上下文自动前置注入 prompt。此功能**默认关闭**，
+`--yes` 不会隐式开启，其他 agent 不受影响。
+
+```bash
+codegraph install --prompt-hook          # 仅为 Claude Code 添加 hook
+codegraph install --yes --prompt-hook    # 注册所有 agent 并添加 Claude hook
+```
+
+---
+
 ## CLI 子命令
 
 核心命令：`init`、`index`、`sync`、`query`、`files`、`status`、`serve`、
