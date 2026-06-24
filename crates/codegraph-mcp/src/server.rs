@@ -165,8 +165,14 @@ impl DbIdentity {
 }
 
 /// A cached engine plus the db-file identity recorded when it was opened.
+///
+/// `engine` is `Option` so [`McpServer::close_cached_handles`] can drop the live
+/// DB connection (releasing the OS file handle) while keeping the recorded
+/// `identity`. [`McpServer::engine_for`] treats a `None` engine as stale, so it
+/// reopens and counts the reopen exactly as a replaced-on-disk db would. Normal
+/// serve flow always holds `Some`.
 struct CachedEngine {
-    engine: CodeGraphEngine,
+    engine: Option<CodeGraphEngine>,
     identity: DbIdentity,
 }
 
@@ -347,7 +353,7 @@ impl McpServer {
 
         let stale = match self.engines.get(project_path) {
             None => true,
-            Some(cached) => current != Some(cached.identity),
+            Some(cached) => cached.engine.is_none() || current != Some(cached.identity),
         };
 
         if stale {
@@ -358,15 +364,33 @@ impl McpServer {
             let identity = DbIdentity::read(&db_path).ok_or_else(|| {
                 anyhow::anyhow!("database vanished after open at {}", db_path.display())
             })?;
-            self.engines
-                .insert(project_path.clone(), CachedEngine { engine, identity });
+            self.engines.insert(
+                project_path.clone(),
+                CachedEngine {
+                    engine: Some(engine),
+                    identity,
+                },
+            );
         }
 
-        Ok(&self
+        Ok(self
             .engines
             .get(project_path)
-            .expect("engine present after open")
-            .engine)
+            .and_then(|c| c.engine.as_ref())
+            .expect("engine present after open"))
+    }
+
+    /// Test/diagnostic only: drop every cached engine's live DB connection while
+    /// keeping its recorded identity, so the underlying db files can be replaced
+    /// on platforms (windows) where an open handle blocks delete/overwrite. The
+    /// next [`McpServer::engine_for`] reopens the still-recorded path and counts
+    /// it as a reopen, identical to a replaced-on-disk db. Normal serve flow
+    /// never calls this; the cache reopens on demand.
+    #[doc(hidden)]
+    pub fn close_cached_handles(&mut self) {
+        for cached in self.engines.values_mut() {
+            cached.engine = None;
+        }
     }
 }
 

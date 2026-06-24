@@ -135,9 +135,14 @@ fn reopens_cached_engine_when_db_replaced_with_new_inode() {
     let reopens_before = reopen_count();
 
     // When: the db is REPLACED on disk with a fresh index (new identity) whose
-    // content differs (a new symbol `betaSymbol`). Removing the dir first
-    // guarantees a freshly built db file.
+    // content differs (a new symbol `betaSymbol`). The cached engine still holds
+    // an open WAL connection, which on windows blocks deleting the db dir
+    // (OS error 32). Drop the live connections first — `close_cached_handles`
+    // keeps the cache RECORD (with its old identity) while releasing the file
+    // handle, so the next call still detects the identity change and counts
+    // exactly one reopen. Removing the dir first guarantees a freshly built db.
     let id_before = db_identity(project.path());
+    server.close_cached_handles();
     fs::remove_dir_all(project.path().join(".codegraph")).unwrap();
     index_into(
         project.path(),
