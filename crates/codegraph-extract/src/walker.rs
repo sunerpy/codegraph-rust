@@ -394,6 +394,18 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 }
                 true
             }
+            // `signal X(args)` has no callable identity; mapping it to
+            // Function would collide with a same-named `func X()` in the call
+            // graph, so it is recorded as a Property (D1). NodeKind has no
+            // Signal variant.
+            "signal_statement" => {
+                let Some(name_node) = child_by_field(node, "name") else {
+                    return false;
+                };
+                let name = node_text(name_node, self.source);
+                self.create_node(NodeKind::Property, &name, node, NodeExtra::default());
+                true
+            }
             _ => false,
         }
     }

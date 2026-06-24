@@ -313,6 +313,137 @@ fn gdscript_preload_not_a_call_ref() {
     );
 }
 
+#[test]
+fn gdscript_signal_is_property() {
+    let source = "signal hit(amount)\n";
+    let result = extract_source("scripts/x.gd", source, Some(Language::Gdscript));
+    assert!(result.errors.is_empty(), "errors={:#?}", result.errors);
+    assert_node(&result.nodes, NodeKind::Property, "hit");
+}
+
+#[test]
+fn gdscript_signal_no_param() {
+    let source = "signal died\n";
+    let result = extract_source("scripts/x.gd", source, Some(Language::Gdscript));
+    assert!(result.errors.is_empty(), "errors={:#?}", result.errors);
+    assert_node(&result.nodes, NodeKind::Property, "died");
+}
+
+#[test]
+fn gdscript_empty_file_only_file_node() {
+    let source = "";
+    let result = extract_source("scripts/x.gd", source, Some(Language::Gdscript));
+    assert!(result.errors.is_empty(), "errors={:#?}", result.errors);
+    assert_eq!(
+        result.nodes.len(),
+        1,
+        "empty file must yield exactly the File node; nodes={:#?}",
+        result.nodes
+    );
+    assert_eq!(
+        result.nodes[0].kind,
+        NodeKind::File,
+        "the sole node must be the File node; nodes={:#?}",
+        result.nodes
+    );
+    assert!(
+        !result.nodes.iter().any(|node| matches!(
+            node.kind,
+            NodeKind::Function | NodeKind::Class | NodeKind::Method | NodeKind::Enum
+        )),
+        "empty file must yield no Function/Class/Method/Enum; nodes={:#?}",
+        result.nodes
+    );
+}
+
+#[test]
+fn gdscript_lambda_no_anonymous_node() {
+    let source = "func f():\n\tvar cb = func(): pass\n";
+    let result = extract_source("scripts/x.gd", source, Some(Language::Gdscript));
+    // A lambda must NOT be emitted as a symbol node.
+    assert!(
+        !result.nodes.iter().any(|node| node.name == "<anonymous>"),
+        "lambda must not emit an <anonymous> node; nodes={:#?}",
+        result.nodes
+    );
+    // The outer named function must still be extracted.
+    assert_node(&result.nodes, NodeKind::Function, "f");
+}
+
+#[test]
+fn gdscript_malformed_source_no_panic() {
+    let source = "class \nfunc :\n@@@ %%%\n";
+    let result = extract_source("scripts/x.gd", source, Some(Language::Gdscript));
+    // Must NOT panic; a result is returned. (Malformed source may carry
+    // parse errors; we only assert the call completes and returns sanely.)
+    assert!(result.nodes.len() < usize::MAX);
+}
+
+#[test]
+fn gdscript_realistic_script_full_extraction() {
+    let source = "@tool\n\
+extends Node2D\n\
+class_name Player\n\
+\n\
+signal health_changed(amount)\n\
+\n\
+enum State { IDLE, RUNNING }\n\
+\n\
+const MAX_HP = 100\n\
+@export var speed: float = 5.0\n\
+@onready var sprite = null\n\
+\n\
+const Bullet = preload(\"res://bullet.gd\")\n\
+\n\
+class Inner:\n\
+\tfunc helper():\n\
+\t\tpass\n\
+\n\
+func _init():\n\
+\tpass\n\
+\n\
+func take_damage(amount):\n\
+\temit_signal(\"health_changed\", amount)\n\
+\t_update()\n\
+\n\
+func _update():\n\
+\tpass\n";
+    let result = extract_source("scripts/player.gd", source, Some(Language::Gdscript));
+    assert!(result.errors.is_empty(), "errors={:#?}", result.errors);
+
+    assert_node(&result.nodes, NodeKind::Class, "Player");
+    assert_node(&result.nodes, NodeKind::Property, "health_changed");
+    assert_node(&result.nodes, NodeKind::Enum, "State");
+    assert_node(&result.nodes, NodeKind::EnumMember, "IDLE");
+    assert_node(&result.nodes, NodeKind::EnumMember, "RUNNING");
+    assert_node(&result.nodes, NodeKind::Constant, "MAX_HP");
+    assert_node(&result.nodes, NodeKind::Variable, "speed");
+    assert_node(&result.nodes, NodeKind::Variable, "sprite");
+    assert_node(&result.nodes, NodeKind::Import, "res://bullet.gd");
+    assert_ref(
+        &result.unresolved_references,
+        EdgeKind::Imports,
+        "res://bullet.gd",
+    );
+    assert_node(&result.nodes, NodeKind::Class, "Inner");
+    assert_node(&result.nodes, NodeKind::Method, "helper");
+    assert!(
+        result.nodes.iter().any(|node| node.name == "_init"
+            && matches!(node.kind, NodeKind::Function | NodeKind::Method)),
+        "missing _init; nodes={:#?}",
+        result.nodes
+    );
+    assert_node(&result.nodes, NodeKind::Function, "take_damage");
+    assert_node(&result.nodes, NodeKind::Function, "_update");
+    assert_ref(&result.unresolved_references, EdgeKind::Extends, "Node2D");
+    assert_ref(
+        &result.unresolved_references,
+        EdgeKind::Calls,
+        "emit_signal",
+    );
+    assert_ref(&result.unresolved_references, EdgeKind::Calls, "_update");
+}
+
 #[allow(dead_code)]
 fn assert_node(nodes: &[codegraph_core::types::Node], kind: NodeKind, name: &str) {
     assert!(
