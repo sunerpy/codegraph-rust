@@ -838,12 +838,7 @@ fn cmd_serve(path: Option<PathBuf>, mcp: bool, no_watch: bool) -> Result<()> {
         let has_codegraph = codegraph_dir(&project_root).is_dir();
         match select_serve_mode(daemon_opt_out(), is_daemon_internal(), has_codegraph) {
             ServeMode::Direct => {
-                let stdin = io::stdin();
-                let stdout = io::stdout();
-                let mut server = McpServer::new(project);
-                return server
-                    .run(BufReader::new(stdin.lock()), stdout.lock())
-                    .context("running MCP stdio server");
+                return serve_direct(project, &project_root, no_watch);
             }
             ServeMode::BeDaemon => {
                 return codegraph_daemon::run_foreground(
@@ -857,12 +852,7 @@ fn cmd_serve(path: Option<PathBuf>, mcp: bool, no_watch: bool) -> Result<()> {
             }
             ServeMode::SpawnOrProxy => {
                 spawn_or_proxy(&project_root);
-                let stdin = io::stdin();
-                let stdout = io::stdout();
-                let mut server = McpServer::new(project);
-                return server
-                    .run(BufReader::new(stdin.lock()), stdout.lock())
-                    .context("running MCP stdio server");
+                return serve_direct(project, &project_root, no_watch);
             }
         }
     }
@@ -870,6 +860,48 @@ fn cmd_serve(path: Option<PathBuf>, mcp: bool, no_watch: bool) -> Result<()> {
     eprintln!("Daemon and watcher startup is wired here for tasks 24/25.");
     eprintln!("Use `codegraph serve --mcp` to start the committed MCP stdio server.");
     Ok(())
+}
+
+fn serve_direct(project: Option<PathBuf>, project_root: &Path, no_watch: bool) -> Result<()> {
+    let _watcher = start_direct_watcher(project_root, no_watch);
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut server = McpServer::new(project);
+    server
+        .run(BufReader::new(stdin.lock()), stdout.lock())
+        .context("running MCP stdio server")
+}
+
+fn start_direct_watcher(
+    project_root: &Path,
+    no_watch: bool,
+) -> Option<codegraph_watch::ProjectWatcher> {
+    let mut opts = codegraph_watch::WatchOptions::default();
+    opts.no_watch = no_watch;
+    opts.on_sync_complete = Some(std::sync::Arc::new(
+        |outcome: codegraph_watch::SyncOutcome| {
+            eprintln!(
+                "[CodeGraph MCP] Auto-synced {} file(s) in {}ms",
+                outcome.files_reindexed, outcome.duration_ms
+            );
+        },
+    ));
+    match codegraph_watch::start_serve_watcher(project_root, opts) {
+        Ok(Some(watcher)) => {
+            eprintln!("[CodeGraph MCP] File watcher active — graph will auto-sync on changes");
+            Some(watcher)
+        }
+        Ok(None) => {
+            let reason = codegraph_watch::watch_disabled_reason(project_root, no_watch)
+                .unwrap_or_else(|| "watching disabled".to_string());
+            eprintln!("[CodeGraph MCP] File watcher disabled — {reason}");
+            None
+        }
+        Err(err) => {
+            eprintln!("[CodeGraph MCP] File watcher failed to start: {err}");
+            None
+        }
+    }
 }
 
 const DAEMON_SOCKET_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
