@@ -106,6 +106,13 @@ impl AgentTarget for GeminiTarget {
             to_upstream_json(&json!({ "mcpServers": { "codegraph": mcp_server_config() } }));
         format!("# Add to {}\n\n{snippet}\n", target.display())
     }
+
+    fn supports_skills(&self, _loc: Location) -> bool {
+        true
+    }
+    fn skill_dir(&self, ctx: &InstallContext, loc: Location) -> Option<PathBuf> {
+        Some(config_dir(ctx, loc).join("skills"))
+    }
 }
 
 // Ports writeMcpEntry (gemini.ts:131).
@@ -146,3 +153,37 @@ fn remove_instructions_entry(ctx: &InstallContext, loc: Location) -> FileWrite {
 }
 
 pub static GEMINI_TARGET: GeminiTarget = GeminiTarget;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx() -> InstallContext {
+        InstallContext {
+            home: PathBuf::from("/home/u"),
+            cwd: PathBuf::from("/work/proj"),
+            app_data: None,
+            xdg_config_home: None,
+            hermes_home: None,
+        }
+    }
+
+    #[test]
+    fn gemini_supports_and_locates_skills_at_both_locations() {
+        // Given the Gemini target
+        let target = GeminiTarget;
+        let ctx = ctx();
+
+        // Then it supports skills at both locations
+        assert!(target.supports_skills(Location::Global));
+        assert!(target.supports_skills(Location::Local));
+
+        // And global skill_dir is ~/.gemini/skills
+        let global = target.skill_dir(&ctx, Location::Global).unwrap();
+        assert!(global.ends_with(".gemini/skills"));
+
+        // And local skill_dir is ./.gemini/skills
+        let local = target.skill_dir(&ctx, Location::Local).unwrap();
+        assert!(local.ends_with(".gemini/skills"));
+    }
+}
