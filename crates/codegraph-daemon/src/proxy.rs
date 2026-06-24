@@ -167,10 +167,21 @@ pub fn run_proxy<R: BufRead, W: Write + Send + 'static>(
     Ok(ProxyOutcome::Proxied)
 }
 
+/// The write-side fd handle carried between `write_raw_fd` and
+/// `half_close_write`. On unix it is the real socket `RawFd`; on non-unix there
+/// is no half-close and the value is always `None`, so a unit placeholder keeps
+/// both cfg variants' signatures structurally identical for the cfg-agnostic
+/// caller. NEVER name `std::os::fd::*` outside the `#[cfg(unix)]` path — that
+/// module does not exist on Windows.
+#[cfg(unix)]
+type WriteFd = std::os::fd::RawFd;
+#[cfg(not(unix))]
+type WriteFd = ();
+
 /// Capture the write-side raw fd from the send half before it is moved into the
 /// up pump. `None` on non-unix (no half-close there).
 #[cfg(unix)]
-fn write_raw_fd(send: &crate::transport::SendHalf) -> Option<std::os::fd::RawFd> {
+fn write_raw_fd(send: &crate::transport::SendHalf) -> Option<WriteFd> {
     use std::os::fd::{AsFd, AsRawFd};
     // The enum `SendHalf` does not surface `AsFd`/`AsRawFd`; the concrete
     // `UdSocket` variant does. Match it to read the raw fd.
@@ -182,7 +193,7 @@ fn write_raw_fd(send: &crate::transport::SendHalf) -> Option<std::os::fd::RawFd>
 }
 
 #[cfg(not(unix))]
-fn write_raw_fd(_send: &crate::transport::SendHalf) -> Option<std::os::fd::RawFd> {
+fn write_raw_fd(_send: &crate::transport::SendHalf) -> Option<WriteFd> {
     None
 }
 
@@ -191,7 +202,7 @@ fn write_raw_fd(_send: &crate::transport::SendHalf) -> Option<std::os::fd::RawFd
 /// the EOF signal the daemon's blocking line-reader needs; a plain drop of the
 /// send half is insufficient because interprocess shares one fd across halves.
 #[cfg(unix)]
-fn half_close_write(write_fd: Option<std::os::fd::RawFd>) {
+fn half_close_write(write_fd: Option<WriteFd>) {
     use std::os::fd::BorrowedFd;
     if let Some(fd) = write_fd {
         // SAFETY: `fd` is the live socket fd captured at split time; the recv
@@ -205,7 +216,7 @@ fn half_close_write(write_fd: Option<std::os::fd::RawFd>) {
 /// Windows named pipes have no half-close; the proxy relies on the full-stream
 /// drop + the daemon's own idle/sweep lifecycle instead.
 #[cfg(not(unix))]
-fn half_close_write(_write_fd: Option<std::os::fd::RawFd>) {}
+fn half_close_write(_write_fd: Option<WriteFd>) {}
 
 /// host -> daemon: read host_in line-by-line; answer `initialize`+`tools/list`
 /// locally, forward everything else. On `initialize`, ALSO forward it to prime
