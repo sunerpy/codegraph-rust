@@ -1,13 +1,14 @@
 //! GDScript (`.gd`) `LanguageSpec`.
 //!
-//! Non-upstream Rust-side addition. T2 wires a minimal compiling stub; symbol
-//! extraction (functions, classes, enums, variables, extends/preload edges) is
-//! filled in by later todos. All `*_types()` return `&[]` for now.
+//! Non-upstream Rust-side addition. T3 implements function/method/constructor
+//! and call extraction; classes, enums, variables, and extends/preload edges
+//! are filled in by later todos.
 
 use codegraph_core::types::Language;
-use tree_sitter::Language as TsLanguage;
+use tree_sitter::{Language as TsLanguage, Node};
 
 use crate::spec::LanguageSpec;
+use crate::walker::{child_by_field, node_text};
 
 pub struct GdscriptSpec;
 
@@ -23,7 +24,7 @@ impl LanguageSpec for GdscriptSpec {
     }
 
     fn function_types(&self) -> &'static [&'static str] {
-        &[]
+        &["function_definition", "constructor_definition"]
     }
 
     fn class_types(&self) -> &'static [&'static str] {
@@ -31,7 +32,7 @@ impl LanguageSpec for GdscriptSpec {
     }
 
     fn method_types(&self) -> &'static [&'static str] {
-        &[]
+        &["function_definition", "constructor_definition"]
     }
 
     fn interface_types(&self) -> &'static [&'static str] {
@@ -59,7 +60,7 @@ impl LanguageSpec for GdscriptSpec {
     }
 
     fn call_types(&self) -> &'static [&'static str] {
-        &[]
+        &["call"]
     }
 
     fn variable_types(&self) -> &'static [&'static str] {
@@ -80,5 +81,33 @@ impl LanguageSpec for GdscriptSpec {
 
     fn return_field(&self) -> &'static str {
         "return_type"
+    }
+
+    fn resolve_name(&self, node: Node<'_>, source: &str) -> Option<String> {
+        if node.kind() != "constructor_definition" {
+            return None;
+        }
+        let mut cursor = node.walk();
+        let ctor = node
+            .children(&mut cursor)
+            .find(|child| child.kind() == "_init")
+            .map(|tok| node_text(tok, source));
+        ctor
+    }
+
+    fn is_static(&self, node: Node<'_>, _source: &str) -> bool {
+        let mut cursor = node.walk();
+        let has_static = node
+            .children(&mut cursor)
+            .any(|child| child.kind() == "static_keyword");
+        has_static
+    }
+
+    fn get_signature(&self, node: Node<'_>, source: &str) -> Option<String> {
+        child_by_field(node, "parameters").map(|params| node_text(params, source))
+    }
+
+    fn get_return_type(&self, node: Node<'_>, source: &str) -> Option<String> {
+        child_by_field(node, "return_type").map(|ret| node_text(ret, source))
     }
 }
