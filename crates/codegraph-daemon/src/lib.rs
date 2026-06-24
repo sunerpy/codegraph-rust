@@ -48,6 +48,49 @@ pub const CODEGRAPH_DAEMON_INTERNAL: &str = "CODEGRAPH_DAEMON_INTERNAL";
 /// runs in direct (single-process) mode.
 pub const CODEGRAPH_NO_DAEMON: &str = "CODEGRAPH_NO_DAEMON";
 
+/// Env var name: milliseconds the daemon lingers after the LAST client
+/// disconnects before exiting (default 300000). Mirrors colby.
+pub const CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: &str = "CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS";
+
+/// Env var name: hard backstop in milliseconds — exit once idle this long
+/// regardless of client count (default 1800000; #692 phantom-client guard).
+pub const CODEGRAPH_DAEMON_MAX_IDLE_MS: &str = "CODEGRAPH_DAEMON_MAX_IDLE_MS";
+
+const DEFAULT_IDLE_TIMEOUT_MS: u128 = 300_000;
+const DEFAULT_MAX_IDLE_MS: u128 = 1_800_000;
+const MIN_IDLE_TIMEOUT_MS: u128 = 1_000;
+const MAX_IDLE_TIMEOUT_MS: u128 = 3_600_000;
+
+/// Parse + clamp the idle-timeout env var (mirror colby `resolveIdleTimeoutMs`):
+/// unset/empty/invalid -> default; otherwise clamp to [MIN, MAX].
+fn resolve_idle_timeout_ms() -> u128 {
+    resolve_ms_env(
+        CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS,
+        DEFAULT_IDLE_TIMEOUT_MS,
+        MIN_IDLE_TIMEOUT_MS,
+        MAX_IDLE_TIMEOUT_MS,
+    )
+}
+
+/// Parse + clamp the max-idle backstop env var (mirror colby `resolveMaxIdleMs`).
+fn resolve_max_idle_ms() -> u128 {
+    resolve_ms_env(
+        CODEGRAPH_DAEMON_MAX_IDLE_MS,
+        DEFAULT_MAX_IDLE_MS,
+        MIN_IDLE_TIMEOUT_MS,
+        MAX_IDLE_TIMEOUT_MS,
+    )
+}
+
+fn resolve_ms_env(name: &str, default: u128, min: u128, max: u128) -> u128 {
+    match std::env::var(name) {
+        Ok(raw) if !raw.is_empty() => raw
+            .parse::<u128>()
+            .map_or(default, |parsed| parsed.clamp(min, max)),
+        _ => default,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DaemonOptions {
     pub parent_pid: Option<u32>,
@@ -243,6 +286,8 @@ fn run_accept_loop(
 ) -> Result<()> {
     let original_ppid = options.parent_pid.unwrap_or_else(current_ppid);
     let socket_display = socket_path.to_string_lossy().to_string();
+    let idle_timeout_ms = resolve_idle_timeout_ms();
+    let max_idle_ms = resolve_max_idle_ms();
     info!(project = %project_root.display(), socket = %socket_path.display(), "daemon started");
 
     // ONE shared watcher per daemon process (issue-#411). Bound to a local so
@@ -282,6 +327,15 @@ fn run_accept_loop(
                 });
             }
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                let idle_ms = registry.millis_since_active();
+                if idle_ms > max_idle_ms {
+                    info!(idle_ms, max_idle_ms, "daemon exiting on max-idle backstop");
+                    break;
+                }
+                if registry.active_count() == 0 && idle_ms > idle_timeout_ms {
+                    info!(idle_ms, idle_timeout_ms, "daemon idle-exit: no clients");
+                    break;
+                }
                 thread::sleep(ACCEPT_POLL_INTERVAL);
             }
             Err(err) => return Err(err).context("accepting daemon connection"),

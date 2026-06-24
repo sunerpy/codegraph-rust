@@ -1,7 +1,8 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::Result;
 use codegraph_mcp::McpServer;
@@ -10,9 +11,21 @@ use serde::Serialize;
 
 use crate::transport::Stream;
 
-#[derive(Clone, Debug, Default)]
+/// Tracks live client sessions plus a shared last-active instant bumped on BOTH
+/// connect and disconnect, so the accept loop can measure idle time.
+#[derive(Clone, Debug)]
 pub struct SessionRegistry {
     active: Arc<AtomicUsize>,
+    last_active: Arc<Mutex<Instant>>,
+}
+
+impl Default for SessionRegistry {
+    fn default() -> Self {
+        Self {
+            active: Arc::new(AtomicUsize::new(0)),
+            last_active: Arc::new(Mutex::new(Instant::now())),
+        }
+    }
 }
 
 impl SessionRegistry {
@@ -20,21 +33,44 @@ impl SessionRegistry {
         self.active.load(Ordering::SeqCst)
     }
 
+    /// Milliseconds since the last connect-or-disconnect edge.
+    pub fn millis_since_active(&self) -> u128 {
+        let last = bump_or_read(&self.last_active, false);
+        last.elapsed().as_millis()
+    }
+
     pub(crate) fn start_session(&self) -> SessionGuard {
         self.active.fetch_add(1, Ordering::SeqCst);
+        bump_or_read(&self.last_active, true);
         SessionGuard {
             active: Arc::clone(&self.active),
+            last_active: Arc::clone(&self.last_active),
         }
     }
 }
 
+/// Bump the shared instant to now (when `bump`) or just read it. A poisoned
+/// lock is recovered in place — the only datum behind it is one `Instant`.
+fn bump_or_read(slot: &Mutex<Instant>, bump: bool) -> Instant {
+    let mut guard = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if bump {
+        *guard = Instant::now();
+    }
+    *guard
+}
+
 pub(crate) struct SessionGuard {
     active: Arc<AtomicUsize>,
+    last_active: Arc<Mutex<Instant>>,
 }
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
         self.active.fetch_sub(1, Ordering::SeqCst);
+        // Bump on disconnect so the linger window starts at the LAST client leaving.
+        bump_or_read(&self.last_active, true);
     }
 }
 
