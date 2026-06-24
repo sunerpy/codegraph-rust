@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/sunerpy/codegraph-rust/compare/v0.9.0...v0.10.0) (2026-06-24)
+
+
+### Features
+
+* **extract:** add GDScript (.gd) language support ([#38](https://github.com/sunerpy/codegraph-rust/issues/38)) ([74d799a](https://github.com/sunerpy/codegraph-rust/commit/74d799a1e01248e6e5254202682d322ad5820b85))
+
 ## [0.9.0](https://github.com/sunerpy/codegraph-rust/compare/v0.8.0...v0.9.0) (2026-06-24)
 
 
