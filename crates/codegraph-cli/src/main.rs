@@ -851,7 +851,9 @@ fn cmd_serve(path: Option<PathBuf>, mcp: bool, no_watch: bool) -> Result<()> {
                 .context("running as detached MCP daemon");
             }
             ServeMode::SpawnOrProxy => {
-                spawn_or_proxy(&project_root);
+                if let Some(result) = spawn_or_proxy(project.clone(), &project_root, no_watch) {
+                    return result;
+                }
                 return serve_direct(project, &project_root, no_watch);
             }
         }
@@ -939,24 +941,55 @@ fn start_direct_watcher(
 const DAEMON_SOCKET_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 const DAEMON_SOCKET_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(400);
 
-fn spawn_or_proxy(project_root: &Path) {
+/// Spawn the shared daemon if needed, poll for its socket, then run the real
+/// proxy. Returns `Some(Ok(()))` when the proxy bridged the session (caller
+/// must NOT also serve direct), or `None` when the proxy could not attach
+/// (daemon spawn failed, socket never appeared, or a version mismatch) — the
+/// caller then transparently falls back to direct serving.
+fn spawn_or_proxy(
+    _project: Option<PathBuf>,
+    project_root: &Path,
+    _no_watch: bool,
+) -> Option<Result<()>> {
     if !daemon_already_running(project_root) {
         match std::env::current_exe() {
             Ok(exe) => {
                 if let Err(err) = codegraph_daemon::spawn_detached_daemon(&exe, project_root) {
                     tracing::debug!(error = %err, "detached daemon spawn failed; serving direct");
-                    return;
+                    return None;
                 }
                 poll_for_daemon_socket(project_root);
             }
             Err(err) => {
                 tracing::debug!(error = %err, "current_exe unavailable; serving direct");
-                return;
+                return None;
             }
         }
     }
-    if let Err(err) = proxy_attach_stub() {
-        tracing::debug!(error = %err, "proxy attach unavailable; serving direct");
+
+    let socket_path = codegraph_daemon::daemon_socket_path(project_root);
+    if !socket_path.exists() {
+        tracing::debug!("daemon socket never appeared; serving direct");
+        return None;
+    }
+
+    let host_ppid = Some(codegraph_daemon::current_ppid());
+    let stdin = io::stdin();
+    match codegraph_daemon::run_proxy(
+        &socket_path,
+        host_ppid,
+        BufReader::new(stdin.lock()),
+        io::stdout(),
+    ) {
+        Ok(codegraph_daemon::ProxyOutcome::Proxied) => Some(Ok(())),
+        Ok(codegraph_daemon::ProxyOutcome::VersionMismatch) => {
+            tracing::debug!("daemon version mismatch; serving direct");
+            None
+        }
+        Err(err) => {
+            tracing::debug!(error = %err, "proxy attach failed; serving direct");
+            None
+        }
     }
 }
 
@@ -979,10 +1012,6 @@ fn poll_for_daemon_socket(project_root: &Path) {
         }
         std::thread::sleep(DAEMON_SOCKET_POLL_INTERVAL);
     }
-}
-
-fn proxy_attach_stub() -> Result<()> {
-    anyhow::bail!("proxy not yet wired (T7)")
 }
 
 fn daemon_opt_out() -> bool {

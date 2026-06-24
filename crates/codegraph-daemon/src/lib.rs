@@ -8,6 +8,7 @@
 mod lock;
 mod paths;
 mod process;
+pub mod proxy;
 mod session;
 pub mod spawn;
 mod transport;
@@ -28,6 +29,7 @@ pub use lock::{
 };
 pub use paths::{daemon_log_path, daemon_pid_path, daemon_socket_path};
 pub use process::{current_ppid, is_process_alive, supervision_lost_reason, SupervisionState};
+pub use proxy::{run_proxy, verify_daemon_hello, ProxyOutcome};
 pub use session::{read_daemon_hello, SessionRegistry};
 pub use spawn::spawn_detached_daemon;
 use tracing::{debug, info, warn};
