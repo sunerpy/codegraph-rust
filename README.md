@@ -213,8 +213,8 @@ accept the project path as a positional argument or `-p/--path`; `query`/`files`
 
 ## What CodeGraph Does (and Doesn't)
 
-**Does:** deterministic code-structure extraction across ~28 languages (TypeScript,
-Python, Go, Rust, Java, C/C++, C#, Vue, Svelte, and more — see
+**Does:** deterministic code-structure extraction across ~29 languages (TypeScript,
+Python, Go, Rust, Java, C/C++, C#, Vue, Svelte, GDScript, and more — see
 [`docs/grammar-manifest.md`](docs/grammar-manifest.md)), cross-file resolution,
 graph traversal, FTS5 search, whole-graph export with deterministic PageRank
 centrality, MCP/CLI surfaces, and golden byte-stable output.

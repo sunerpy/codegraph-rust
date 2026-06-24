@@ -240,8 +240,8 @@ Set-PSReadLineKeyHandler -Key Tab -Function MenuComplete
 
 ## CodeGraph 的能力范围
 
-**做什么：** 确定性代码结构提取，支持约 28 种语言（TypeScript、Python、Go、Rust、
-Java、C/C++、C#、Vue、Svelte 等——详见
+**做什么：** 确定性代码结构提取，支持约 29 种语言（TypeScript、Python、Go、Rust、
+Java、C/C++、C#、Vue、Svelte、GDScript 等——详见
 [`../grammar-manifest.md`](../grammar-manifest.md)），跨文件解析，图遍历，FTS5 检索，
 全图导出（含确定性 PageRank 中心性），MCP/CLI 表面，golden 字节稳定输出。
 
