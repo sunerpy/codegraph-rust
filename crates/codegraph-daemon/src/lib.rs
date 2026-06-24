@@ -30,7 +30,7 @@ pub use lock::{
 pub use paths::{daemon_log_path, daemon_pid_path, daemon_socket_path};
 pub use process::{current_ppid, is_process_alive, supervision_lost_reason, SupervisionState};
 pub use proxy::{run_proxy, verify_daemon_hello, ProxyOutcome};
-pub use session::{read_daemon_hello, SessionRegistry};
+pub use session::{read_daemon_hello, run_session_recv, SessionRegistry};
 pub use spawn::spawn_detached_daemon;
 use tracing::{debug, info, warn};
 
@@ -58,10 +58,19 @@ pub const CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: &str = "CODEGRAPH_DAEMON_IDLE_TIMEOU
 /// regardless of client count (default 1800000; #692 phantom-client guard).
 pub const CODEGRAPH_DAEMON_MAX_IDLE_MS: &str = "CODEGRAPH_DAEMON_MAX_IDLE_MS";
 
+/// Env var name: how often (ms) the daemon sweeps connected sessions whose
+/// announced host pid is dead and force-closes them (default 30000). Mirrors
+/// colby `DEFAULT_CLIENT_SWEEP_MS`.
+pub const CODEGRAPH_DAEMON_CLIENT_SWEEP_MS: &str = "CODEGRAPH_DAEMON_CLIENT_SWEEP_MS";
+
 const DEFAULT_IDLE_TIMEOUT_MS: u128 = 300_000;
 const DEFAULT_MAX_IDLE_MS: u128 = 1_800_000;
 const MIN_IDLE_TIMEOUT_MS: u128 = 1_000;
 const MAX_IDLE_TIMEOUT_MS: u128 = 3_600_000;
+
+const DEFAULT_CLIENT_SWEEP_MS: u128 = 30_000;
+const MIN_CLIENT_SWEEP_MS: u128 = 50;
+const MAX_CLIENT_SWEEP_MS: u128 = 600_000;
 
 /// Parse + clamp the idle-timeout env var (mirror colby `resolveIdleTimeoutMs`):
 /// unset/empty/invalid -> default; otherwise clamp to [MIN, MAX].
@@ -91,6 +100,15 @@ fn resolve_ms_env(name: &str, default: u128, min: u128, max: u128) -> u128 {
             .map_or(default, |parsed| parsed.clamp(min, max)),
         _ => default,
     }
+}
+
+fn resolve_client_sweep_ms() -> u128 {
+    resolve_ms_env(
+        CODEGRAPH_DAEMON_CLIENT_SWEEP_MS,
+        DEFAULT_CLIENT_SWEEP_MS,
+        MIN_CLIENT_SWEEP_MS,
+        MAX_CLIENT_SWEEP_MS,
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -290,6 +308,8 @@ fn run_accept_loop(
     let socket_display = socket_path.to_string_lossy().to_string();
     let idle_timeout_ms = resolve_idle_timeout_ms();
     let max_idle_ms = resolve_max_idle_ms();
+    let client_sweep_ms = resolve_client_sweep_ms();
+    let mut last_sweep = std::time::Instant::now();
     info!(project = %project_root.display(), socket = %socket_path.display(), "daemon started");
 
     // ONE shared watcher per daemon process (issue-#411). Bound to a local so
@@ -329,6 +349,10 @@ fn run_accept_loop(
                 });
             }
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                if last_sweep.elapsed().as_millis() >= client_sweep_ms {
+                    sweep_dead_clients(&registry);
+                    last_sweep = std::time::Instant::now();
+                }
                 let idle_ms = registry.millis_since_active();
                 if idle_ms > max_idle_ms {
                     info!(idle_ms, max_idle_ms, "daemon exiting on max-idle backstop");
@@ -351,6 +375,13 @@ fn run_accept_loop(
     }
     info!(project = %project_root.display(), "daemon stopped");
     Ok(())
+}
+
+fn sweep_dead_clients(registry: &SessionRegistry) {
+    for id in registry.dead_session_ids(is_process_alive) {
+        debug!(session = id, "sweeping session whose host pid is dead");
+        registry.shutdown_session(id);
+    }
 }
 
 fn start_project_watcher(

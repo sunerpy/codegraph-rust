@@ -109,8 +109,18 @@ pub fn run_proxy<R: BufRead, W: Write + Send + 'static>(
     // EOF, flush its last reply, and close — which in turn EOFs our recv pump so
     // `down.join()` never hangs. The fd stays valid through teardown because the
     // recv half keeps the shared socket open.
-    let (recv, send) = stream.split();
+    let (recv, mut send) = stream.split();
     let write_fd = write_raw_fd(&send);
+
+    // Send the OPTIONAL client-hello FIRST (T9), before any JSON-RPC: it
+    // announces the host pid this proxy serves so the daemon can reap our
+    // session if the host dies. The daemon reads it from its ONE long-lived
+    // recv reader; a daemon that does not understand it simply ignores a
+    // non-JSON-RPC first line. Use the served host pid when known, else our own
+    // parent pid.
+    let host_pid = host_ppid.unwrap_or_else(current_ppid);
+    let client_hello = json!({ "hostPid": host_pid }).to_string();
+    forward_to_daemon(&mut send, &client_hello).context("sending client hello")?;
 
     // Shared shutdown flag flipped by the watchdog on host death.
     let shutdown = Arc::new(AtomicBool::new(false));
