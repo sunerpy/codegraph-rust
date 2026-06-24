@@ -301,8 +301,18 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
     }
 
-    fn visit_gdscript_node(&mut self, _node: SyntaxNode<'tree>) -> bool {
-        false
+    fn visit_gdscript_node(&mut self, node: SyntaxNode<'tree>) -> bool {
+        match node.kind() {
+            "enumerator" => {
+                let Some(left) = child_by_field(node, "left") else {
+                    return false;
+                };
+                let name = node_text(left, self.source);
+                self.create_node(NodeKind::EnumMember, &name, node, NodeExtra::default());
+                true
+            }
+            _ => false,
+        }
     }
 
     fn visit_r_call(&mut self, node: SyntaxNode<'tree>) -> bool {

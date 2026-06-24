@@ -75,6 +75,56 @@ fn gdscript_inner_class_malformed_no_panic() {
     assert!(node_count < usize::MAX);
 }
 
+#[test]
+fn gdscript_named_enum_with_members() {
+    let source = "enum Mode { FAST, SLOW }\n";
+    let result = extract_source("scripts/x.gd", source, Some(Language::Gdscript));
+    assert!(result.errors.is_empty(), "errors={:#?}", result.errors);
+    assert_node(&result.nodes, NodeKind::Enum, "Mode");
+    assert_node(&result.nodes, NodeKind::EnumMember, "FAST");
+    assert_node(&result.nodes, NodeKind::EnumMember, "SLOW");
+}
+
+#[test]
+fn gdscript_anonymous_enum() {
+    let source = "enum { A, B }\n";
+    let result = extract_source("scripts/x.gd", source, Some(Language::Gdscript));
+    assert!(result.errors.is_empty(), "errors={:#?}", result.errors);
+    assert!(
+        result.nodes.iter().any(|node| node.kind == NodeKind::Enum),
+        "missing Enum node; nodes={:#?}",
+        result.nodes
+    );
+    assert_node(&result.nodes, NodeKind::EnumMember, "A");
+    assert_node(&result.nodes, NodeKind::EnumMember, "B");
+}
+
+#[test]
+fn gdscript_enum_value_not_spurious_member() {
+    let source = "enum E { X = SOME_CONST }\n";
+    let result = extract_source("scripts/x.gd", source, Some(Language::Gdscript));
+    assert!(result.errors.is_empty(), "errors={:#?}", result.errors);
+    assert_node(&result.nodes, NodeKind::EnumMember, "X");
+    assert!(
+        !result
+            .nodes
+            .iter()
+            .any(|node| node.kind == NodeKind::EnumMember && node.name == "SOME_CONST"),
+        "spurious EnumMember SOME_CONST; nodes={:#?}",
+        result.nodes
+    );
+    let member_count = result
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::EnumMember)
+        .count();
+    assert_eq!(
+        member_count, 1,
+        "expected exactly 1 EnumMember; nodes={:#?}",
+        result.nodes
+    );
+}
+
 #[allow(dead_code)]
 fn assert_node(nodes: &[codegraph_core::types::Node], kind: NodeKind, name: &str) {
     assert!(

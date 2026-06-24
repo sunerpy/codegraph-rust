@@ -44,7 +44,7 @@ impl LanguageSpec for GdscriptSpec {
     }
 
     fn enum_types(&self) -> &'static [&'static str] {
-        &[]
+        &["enum_definition"]
     }
 
     fn enum_member_types(&self) -> &'static [&'static str] {
