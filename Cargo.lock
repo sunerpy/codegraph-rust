@@ -339,6 +339,7 @@ dependencies = [
  "anyhow",
  "codegraph-core",
  "codegraph-mcp",
+ "codegraph-watch",
  "interprocess",
  "notify",
  "rustix 0.38.44",

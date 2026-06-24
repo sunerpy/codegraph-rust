@@ -15,7 +15,7 @@ mod transport;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -54,6 +54,10 @@ pub struct DaemonOptions {
     pub host_pid: Option<u32>,
     pub watchdog_interval: Duration,
     pub run_mcp: bool,
+    /// When true (default), the daemon owns ONE shared `ProjectWatcher` for the
+    /// project (issue-#411: N client inotify sets collapse to 1). Honors
+    /// `watch_disabled_reason` (e.g. `CODEGRAPH_NO_WATCH=1`).
+    pub watch: bool,
 }
 
 impl Default for DaemonOptions {
@@ -63,6 +67,7 @@ impl Default for DaemonOptions {
             host_pid: None,
             watchdog_interval: DEFAULT_WATCHDOG_INTERVAL,
             run_mcp: true,
+            watch: true,
         }
     }
 }
@@ -240,6 +245,11 @@ fn run_accept_loop(
     let socket_display = socket_path.to_string_lossy().to_string();
     info!(project = %project_root.display(), socket = %socket_path.display(), "daemon started");
 
+    // ONE shared watcher per daemon process (issue-#411). Bound to a local so
+    // its `Drop` stops the watch thread on shutdown. NEVER move this into
+    // `serve_session`: per-connection would spawn N watchers.
+    let _watcher = start_project_watcher(&project_root, &options);
+
     while !shutdown.load(Ordering::SeqCst) {
         let state = SupervisionState {
             original_ppid,
@@ -283,4 +293,25 @@ fn run_accept_loop(
     }
     info!(project = %project_root.display(), "daemon stopped");
     Ok(())
+}
+
+fn start_project_watcher(
+    project_root: &Path,
+    options: &DaemonOptions,
+) -> Option<codegraph_watch::ProjectWatcher> {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let mut watch_options = codegraph_watch::WatchOptions::default();
+    watch_options.no_watch = !options.watch;
+    watch_options.on_sync_complete =
+        Some(Arc::new(move |outcome: codegraph_watch::SyncOutcome| {
+            let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+            eprintln!("[watcher] sync #{n}: {} file(s)", outcome.files_reindexed);
+        }));
+    match codegraph_watch::start_serve_watcher(project_root, watch_options) {
+        Ok(watcher) => watcher,
+        Err(err) => {
+            warn!(error = %err, "daemon failed to start project watcher");
+            None
+        }
+    }
 }

@@ -22,6 +22,7 @@ tracing = { workspace = true }
 # Cross-platform IPC (local socket on unix, named pipe on windows)
 interprocess = { workspace = true }
 codegraph-mcp = { path = "../codegraph-mcp" }
+codegraph-watch = { path = "../codegraph-watch" }
 
 # Unix process introspection (getppid, signal-0 liveness)
 [target.'cfg(unix)'.dependencies]
