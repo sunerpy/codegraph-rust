@@ -28,7 +28,7 @@ impl LanguageSpec for GdscriptSpec {
     }
 
     fn class_types(&self) -> &'static [&'static str] {
-        &[]
+        &["class_definition"]
     }
 
     fn method_types(&self) -> &'static [&'static str] {
@@ -81,6 +81,16 @@ impl LanguageSpec for GdscriptSpec {
 
     fn return_field(&self) -> &'static str {
         "return_type"
+    }
+
+    fn resolve_body<'tree>(&self, node: Node<'tree>, _body_field: &str) -> Option<Node<'tree>> {
+        match node.kind() {
+            "class_definition" => child_by_field(node, "class_body"),
+            "enum_definition" => node
+                .named_children(&mut node.walk())
+                .find(|child| child.kind() == "enumerator_list"),
+            _ => None,
+        }
     }
 
     fn resolve_name(&self, node: Node<'_>, source: &str) -> Option<String> {

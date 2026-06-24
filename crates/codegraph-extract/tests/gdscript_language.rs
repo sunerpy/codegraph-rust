@@ -58,6 +58,23 @@ fn gdscript_malformed_func_no_panic() {
     assert!(node_count < usize::MAX);
 }
 
+#[test]
+fn gdscript_inner_class_with_method() {
+    let source = "class Inner:\n\tfunc m():\n\t\tpass\n";
+    let result = extract_source("scripts/x.gd", source, Some(Language::Gdscript));
+    assert!(result.errors.is_empty(), "errors={:#?}", result.errors);
+    assert_node(&result.nodes, NodeKind::Class, "Inner");
+    assert_node(&result.nodes, NodeKind::Method, "m");
+}
+
+#[test]
+fn gdscript_inner_class_malformed_no_panic() {
+    let source = "class Inner:\n";
+    let result = extract_source("scripts/x.gd", source, Some(Language::Gdscript));
+    let node_count = result.nodes.len();
+    assert!(node_count < usize::MAX);
+}
+
 #[allow(dead_code)]
 fn assert_node(nodes: &[codegraph_core::types::Node], kind: NodeKind, name: &str) {
     assert!(
