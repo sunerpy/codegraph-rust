@@ -14,28 +14,33 @@
 
 ## Full Subcommand Table
 
-| Subcommand    | Purpose                                                             | Key flags                                                                                                    |
-| ------------- | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `install`     | Write the codegraph MCP server into each AI agent's config          | `-t/--target`, `-l/--location`, `--global`, `--local`, `-y/--yes`, `--no-permissions`, `--print-config <id>` |
-| `uninstall`   | Remove codegraph from agent configs (inverse of `install`)          | `-t/--target`, `-l/--location`, `--global`, `--local`, `-y/--yes`                                            |
-| `init`        | Initialize `.codegraph/` and run the first full index               | `[path]`                                                                                                     |
-| `uninit`      | Delete the project's `.codegraph/` index                            | `[path]`, `-f/--force`                                                                                       |
-| `index`       | (Re-)index in full                                                  | `[path]`, `-f/--force`, `-q/--quiet`, `-v/--verbose`                                                         |
-| `sync`        | Sync changes (currently reuses the safe full-index path)            | `[path]`, `-q/--quiet`                                                                                       |
-| `status`      | Print index stats (files/nodes/edges/DB size/journal)               | `[path]`, `-j/--json`                                                                                        |
-| `query`       | FTS5 + multi-signal scored search                                   | `<search>`, `-p`, `-l/--limit`, `-k/--kind`, `-j/--json`                                                     |
-| `files`       | List indexed files (tree/flat/grouped)                              | `-p`, `--filter`, `--pattern`, `--format`, `--max-depth`, `-j`                                               |
-| `serve`       | Start the server; `--mcp` enters MCP stdio mode                     | `-p`, `--mcp`, `--no-watch`                                                                                  |
-| `unlock`      | Clear a stale daemon lock (keeps live pids)                         | `[path]`                                                                                                     |
-| `callers`     | Who calls a symbol (along calls/references/imports)                 | `<symbol>`, `-p`, `-l`, `-j`                                                                                 |
-| `callees`     | What a symbol calls                                                 | `<symbol>`, `-p`, `-l`, `-j`                                                                                 |
-| `impact`      | Blast radius of changing a symbol (incoming deps, transitive)       | `<symbol>`, `-p`, `-d/--depth`, `-j`                                                                         |
-| `affected`    | Given changed files, the affected symbol set                        | `[files...]`, `-p`, `-d/--depth`, `--filter`                                                                 |
-| `check`       | Detect circular dependencies (each cycle as `a.ts -> b.ts -> a.ts`) | `[path]`, `-j/--json`                                                                                        |
-| `export`      | Export the whole code graph as NetworkX node-link JSON              | `[path]`, `-o/--out <file>`, `--no-centrality`                                                               |
-| `version`     | Print the codegraph version (same as `--version`)                   | —                                                                                                            |
-| `self-update` | Update the binary in place from the latest GitHub release           | `--check`, `--force`, `--tag <vX.Y.Z>`                                                                       |
-| `completions` | Print or install shell completions                                  | `<shell>` (bash, zsh, fish, powershell, elvish), `--install`                                                 |
+| Subcommand    | Purpose                                                             | Key flags                                                                                                                     |
+| ------------- | ------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `install`     | Write the codegraph MCP server into each AI agent's config          | `-t/--target`, `-l/--location`, `--global`, `--local`, `-y/--yes`, `--no-permissions`, `--print-config <id>`, `--prompt-hook` |
+| `uninstall`   | Remove codegraph from agent configs (inverse of `install`)          | `-t/--target`, `-l/--location`, `--global`, `--local`, `-y/--yes`                                                             |
+| `init`        | Initialize `.codegraph/` and run the first full index               | `[path]`                                                                                                                      |
+| `uninit`      | Delete the project's `.codegraph/` index                            | `[path]`, `-f/--force`                                                                                                        |
+| `index`       | (Re-)index in full                                                  | `[path]`, `-f/--force`, `-q/--quiet`, `-v/--verbose`                                                                          |
+| `sync`        | Sync changes (currently reuses the safe full-index path)            | `[path]`, `-q/--quiet`                                                                                                        |
+| `status`      | Print index stats (files/nodes/edges/DB size/journal)               | `[path]`, `-j/--json`                                                                                                         |
+| `query`       | FTS5 + multi-signal scored search                                   | `<search>`, `-p`, `-l/--limit`, `-k/--kind`, `-j/--json`                                                                      |
+| `files`       | List indexed files (tree/flat/grouped)                              | `-p`, `--filter`, `--pattern`, `--format`, `--max-depth`, `-j`                                                                |
+| `serve`       | Start the server; `--mcp` enters MCP stdio mode                     | `-p`, `--mcp`, `--no-watch`                                                                                                   |
+| `unlock`      | Clear a stale daemon lock (keeps live pids)                         | `[path]`                                                                                                                      |
+| `callers`     | Who calls a symbol (along calls/references/imports)                 | `<symbol>`, `-p`, `-l`, `-j`                                                                                                  |
+| `callees`     | What a symbol calls                                                 | `<symbol>`, `-p`, `-l`, `-j`                                                                                                  |
+| `impact`      | Blast radius of changing a symbol (incoming deps, transitive)       | `<symbol>`, `-p`, `-d/--depth`, `-j`                                                                                          |
+| `affected`    | Given changed files, the affected symbol set                        | `[files...]`, `-p`, `-d/--depth`, `--filter`                                                                                  |
+| `check`       | Detect circular dependencies (each cycle as `a.ts -> b.ts -> a.ts`) | `[path]`, `-j/--json`                                                                                                         |
+| `export`      | Export the whole code graph as NetworkX node-link JSON              | `[path]`, `-o/--out <file>`, `--no-centrality`                                                                                |
+| `version`     | Print the codegraph version (same as `--version`)                   | —                                                                                                                             |
+| `self-update` | Update the binary in place from the latest GitHub release           | `--check`, `--force`, `--tag <vX.Y.Z>`                                                                                        |
+| `completions` | Print or install shell completions                                  | `<shell>` (bash, zsh, fish, powershell, elvish), `--install`                                                                  |
+
+> **Note:** `serve --no-watch` and `CODEGRAPH_NO_WATCH=1` are fully equivalent —
+> both disable the live file watcher. See
+> [Daemon, watch & environment variables](#daemon-watch--environment-variables)
+> for the full env-var reference.
 
 ---
 
@@ -54,12 +59,20 @@ codegraph install --yes                          # auto-detect installed agents,
 codegraph install --target=claude,cursor --yes   # explicit list
 codegraph install --target=auto --local          # detected agents, project-local
 codegraph install --print-config cursor          # print the snippet only, no write
+codegraph install --prompt-hook                  # also add the Claude UserPromptSubmit hook (opt-in)
 codegraph uninstall --target=claude --local      # remove one agent's local config
 ```
 
 Behavior is idempotent (upsert by the `codegraph` key). `uninstall` removes only
 codegraph's own entry and leaves other MCP servers intact. Instruction files are
 delimited by `<!-- CODEGRAPH_START -->`/`<!-- CODEGRAPH_END -->` markers.
+
+**`--prompt-hook` (opt-in, Claude Code only).** Passing `--prompt-hook` writes an
+additional `UserPromptSubmit` hook into Claude Code's config. Before each prompt
+the hook calls `codegraph prompt-hook`, which runs `codegraph_explore` against the
+nearest index and prepends relevant structural context to the prompt. This flag is
+**off by default** and is never implied by `--yes` — you must pass it explicitly.
+No other agent configs are affected.
 
 ---
 
@@ -271,6 +284,106 @@ eval (slurp < ~/.config/codegraph/completion.elv)
 codegraph completions elvish > ~/.config/codegraph/completion.elv
 # then add: eval (slurp < ~/.config/codegraph/completion.elv) to ~/.config/elvish/rc.elv
 ```
+
+---
+
+## Daemon, watch & environment variables
+
+### How `serve --mcp` chooses a run mode
+
+The launcher selects a mode in this exact order:
+
+1. `CODEGRAPH_NO_DAEMON=1` is set → **Direct** (foreground, no daemon ever spawned)
+2. No `.codegraph/` directory in the project → **Direct** (nothing to share yet)
+3. Otherwise → **SpawnOrProxy**: spawn a new shared detached daemon, or proxy to one already running
+
+> `CODEGRAPH_DAEMON_INTERNAL=1` is **internal-only** — it is set automatically on
+> the daemon child process by the spawner. Do not set it yourself.
+
+### Detached daemon lifecycle
+
+When the daemon starts, it detaches from the parent process group (Unix:
+`process_group(0)`; Windows: `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`).
+Its stdout and stderr are appended to `.codegraph/daemon.log`. The Unix socket is
+at `.codegraph/daemon.sock`; the pid/lock file lives alongside it.
+
+If the daemon crashes and leaves a stale lock:
+
+```bash
+codegraph unlock [path]   # removes the stale lock file; live daemon pids are left intact
+```
+
+To suppress the daemon entirely in CI or scripted contexts:
+
+```bash
+CODEGRAPH_NO_DAEMON=1 codegraph serve --mcp --path /path/to/project
+```
+
+### Live file watch
+
+The daemon watches the project for file changes and re-indexes automatically.
+Changes are debounced before the re-index triggers. On WSL2, watching files under
+`/mnt/` is automatically disabled because recursive `fs.watch` is too slow on
+those paths; the reason is surfaced in the log. Two escape hatches:
+
+- `CODEGRAPH_FORCE_WATCH=1` — override the WSL2 `/mnt/` auto-disable. Does **not**
+  override an explicit `CODEGRAPH_NO_WATCH=1`.
+- `CODEGRAPH_NO_WATCH=1` (or `serve --no-watch`) — disable watching entirely.
+  `--no-watch` and `CODEGRAPH_NO_WATCH=1` are fully equivalent.
+
+### Environment variable reference
+
+| Variable                           | Default   | Clamp range  | Meaning                                                          |
+| ---------------------------------- | --------- | ------------ | ---------------------------------------------------------------- |
+| `CODEGRAPH_NO_DAEMON`              | —         | —            | Force foreground Direct mode; never spawn or proxy a daemon      |
+| `CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS` | `300000`  | 1000–3600000 | Exit after this long with no connected clients                   |
+| `CODEGRAPH_DAEMON_MAX_IDLE_MS`     | `1800000` | 1000–3600000 | Hard cap on total daemon lifetime when idle                      |
+| `CODEGRAPH_DAEMON_CLIENT_SWEEP_MS` | `30000`   | 50–600000    | How often the daemon sweeps for dead clients                     |
+| `CODEGRAPH_WATCH_DEBOUNCE_MS`      | `2000`    | 100–60000    | File-change debounce window before a re-index triggers           |
+| `CODEGRAPH_NO_WATCH`               | —         | —            | Disable the live file watcher (equivalent to `serve --no-watch`) |
+| `CODEGRAPH_FORCE_WATCH`            | —         | —            | Override WSL2 `/mnt/` auto-disable; does not override `NO_WATCH` |
+
+Values outside the clamp range are silently clamped to the nearest bound.
+
+### Custom extension mapping (`.codegraph/codegraph.json`)
+
+Place a `codegraph.json` inside the `.codegraph/` directory of any project to
+teach CodeGraph how to treat files with non-standard extensions:
+
+```jsonc
+{
+  "extensions": {
+    ".x": "lua",
+    ".blade": "php",
+  },
+}
+```
+
+Rules:
+
+- Keys are normalized before matching: the leading `.` is stripped and the result
+  is lowercased (so `.X` and `.x` are the same key).
+- Language names must match the internal `Language` enum (serde names). Unknown
+  language names are **silently skipped**.
+- Config resolution walks up the directory tree from each source file; the nearest
+  `.codegraph/codegraph.json` wins. Results are mtime-cached — absent files are
+  cached too, so no repeated I/O on every lookup.
+- A malformed JSON file is ignored and the error is logged; it does not abort
+  indexing.
+
+### `--prompt-hook` detail
+
+`codegraph prompt-hook` is a hidden subcommand (not shown in `--help`). It accepts
+a query as an argument or reads one from stdin, runs `codegraph_explore` against
+the nearest index, and prints structured context. If no index is found it prints a
+graceful message and exits cleanly; same if no query is provided.
+
+`codegraph install --prompt-hook` writes a `UserPromptSubmit` hook into Claude
+Code's config that calls `codegraph prompt-hook` before each prompt. This is
+**off by default**. `--yes` never implies it — you must pass `--prompt-hook`
+explicitly. The hook entry is delimited by the same
+`<!-- CODEGRAPH_START -->`/`<!-- CODEGRAPH_END -->` markers used for the MCP
+entry. No other agent configs are touched.
 
 ---
 
