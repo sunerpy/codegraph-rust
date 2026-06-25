@@ -46,8 +46,8 @@ impl WorkspaceRoots {
         &self,
         default_project: &mut Option<PathBuf>,
         params: Option<&Value>,
-    ) {
-        let Some(params) = params else { return };
+    ) -> Option<PathBuf> {
+        let params = params?;
         let path = params
             .get("rootUri")
             .and_then(Value::as_str)
@@ -68,21 +68,18 @@ impl WorkspaceRoots {
                     .and_then(Value::as_str)
                     .and_then(file_uri_to_path)
             });
-        let Some(path) = path else { return };
-        adopt_path(default_project, path);
+        let path = path?;
+        adopt_path(default_project, path)
     }
 
     pub fn adopt_from_roots_result(
         &self,
         default_project: &mut Option<PathBuf>,
         result: Option<&Value>,
-    ) {
-        let Some(roots) = result
+    ) -> Option<PathBuf> {
+        let roots = result
             .and_then(|r| r.get("roots"))
-            .and_then(Value::as_array)
-        else {
-            return;
-        };
+            .and_then(Value::as_array)?;
         for root in roots {
             let Some(path) = root
                 .get("uri")
@@ -92,10 +89,11 @@ impl WorkspaceRoots {
             else {
                 continue;
             };
-            if adopt_path(default_project, path) {
-                return;
+            if let Some(adopted) = adopt_path(default_project, path) {
+                return Some(adopted);
             }
         }
+        None
     }
 }
 
@@ -107,18 +105,19 @@ pub fn roots_list_request() -> Value {
     })
 }
 
-fn adopt_path(default_project: &mut Option<PathBuf>, path: PathBuf) -> bool {
+fn adopt_path(default_project: &mut Option<PathBuf>, path: PathBuf) -> Option<PathBuf> {
     if default_project.as_ref() == Some(&path) {
-        return true;
+        return None;
     }
     if !default_is_absent_or_home(default_project.as_ref()) {
-        return false;
+        return None;
     }
     if db_path_for(&path).is_file() {
+        let adopted = path.clone();
         *default_project = Some(path);
-        return true;
+        return Some(adopted);
     }
-    false
+    None
 }
 
 fn default_is_absent_or_home(default_project: Option<&PathBuf>) -> bool {

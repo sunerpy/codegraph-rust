@@ -126,14 +126,15 @@ tree and peg a CPU at 99%. In this initial safe mode the server still answers al
 tool queries off any existing `.codegraph` index, but it will not start
 background services against `$HOME`. If the client advertises MCP roots support,
 the server then sends `roots/list` and adopts the first indexed root from the
-client's response, so a single global config can recover the real project even
-when the launch CWD was home. `CODEGRAPH_FORCE_WATCH` does **not** override this
-guard (it only overrides the WSL2 `/mnt/` disable). A real project nested under
-`$HOME` (e.g. `~/projects/myapp`) is unaffected and gets the full daemon,
-watcher, and catch-up. To guarantee per-project services for clients that do not
-support roots, pin the root via `--path <project>` in the client's MCP config
-args (e.g. a workspace-level `.kiro/settings/mcp.json`), or open the project
-folder as the working directory.
+client's response. When that adopted root is indexed, CodeGraph also starts the
+shared project daemon for that root, so a single global config can recover the
+real project even when the launch CWD was home. `CODEGRAPH_FORCE_WATCH` does
+**not** override this guard (it only overrides the WSL2 `/mnt/` disable). A real
+project nested under `$HOME` (e.g. `~/projects/myapp`) is unaffected and gets the
+full daemon, watcher, and catch-up. To guarantee per-project services for clients
+that do not support roots, pin the root via `--path <project>` in the client's
+MCP config args (e.g. a workspace-level `.kiro/settings/mcp.json`), or open the
+project folder as the working directory.
 
 When `serve --mcp` is started without an explicit `--path`, the server reads the
 MCP `initialize` handshake sent by the client and adopts the workspace it
