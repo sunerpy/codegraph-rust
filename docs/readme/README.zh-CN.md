@@ -354,9 +354,8 @@ Set-PSReadLineKeyHandler -Key Tab -Function MenuComplete
 
 **做什么：** 确定性代码结构提取，支持 32 种语言（TypeScript、Python、Go、Rust、
 Java、C/C++、C#、Vue、Svelte、GDScript 等——详见
-[`../languages.md`](../languages.md)），跨文件解析（含 Godot 场景/资源/自动加载图，
-详见 [`../godot.md`](../godot.md)），图遍历，FTS5 检索，
-全图导出（含确定性 PageRank 中心性），MCP/CLI 表面，golden 字节稳定输出。
+[`../languages.md`](../languages.md)），跨文件解析（含 Godot 项目图），图遍历，
+FTS5 检索，全图导出（含确定性 PageRank 中心性），MCP/CLI 表面，golden 字节稳定输出。
 
 **不做什么：** 二进制内部无任何 AI/向量/嵌入/LLM（硬约束，`scripts/guardrail.sh`
 强制执行）；无语义检索；不新增固定 `LANGUAGES` 集以外的语言。
@@ -379,15 +378,6 @@ XML/MyBatis mapper。
 索引，不提取符号。
 
 完整列表（含各语言扩展名和说明）：[`../languages.md`](../languages.md)。
-
-### Godot 项目
-
-对于含 `project.godot` 的 Godot 项目，CodeGraph 的静态分析范围超出纯 GDScript：
-解析 `project.godot` 自动加载单例、`.tscn` 节点树和信号连接、`.tres` 资源引用，
-以及 GDScript 中的动态分发模式（`connect`/`get_node`/`$`/`%`/`call`/group 方法）。
-无法静态确认的计算目标以 `godot:dynamic:…` 哨兵形式呈现，而非伪造边。
-CodeGraph 只做静态影响分析——不运行引擎，不验证运行时行为。
-完整参考及静态与运行时的分工说明见 [`../godot.md`](../godot.md)。
 
 ---
 

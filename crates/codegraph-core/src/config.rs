@@ -5,13 +5,13 @@
 //!
 //! ### Config Sources
 //! - `max_file_size`: upstream extraction/index.ts:101 (skip files >1MB)
-//! - `ignore_dirs`: upstream extraction/index.ts:117-145 (41 default dirs)
+//! - `ignore_dirs`: upstream extraction/index.ts:117-145 (default per-ecosystem dirs)
 //! - `watch`: upstream sync/watch-policy.ts (debounce, enable/disable)
 //!
 //! ### Defaults
 //! - app.log_level: "info"
 //! - indexing.max_file_size: 1048576 bytes
-//! - indexing.ignore_dirs: 41 standard names (node_modules, target, dist, etc.)
+//! - indexing.ignore_dirs: standard per-ecosystem names (node_modules, target, dist, etc.)
 //! - watch.enabled: true
 //! - watch.debounce_ms: 2000
 //!
@@ -132,6 +132,11 @@ fn default_ignore_dirs() -> Vec<String> {
         // Dart / Flutter
         ".dart_tool".to_string(),
         ".pub-cache".to_string(),
+        // Godot — .godot is the regenerated engine import/cache dir (never source);
+        // addons holds vendored third-party editor plugins / GDScript. Both are
+        // re-includable via a .gitignore negation or a custom indexing.ignore_dirs.
+        ".godot".to_string(),
+        "addons".to_string(),
     ]
 }
 

@@ -13,6 +13,26 @@ CodeGraph activates its Godot analysis automatically when a `project.godot`
 file is present at the root of the indexed project. All extraction is
 deterministic and byte-stable across runs.
 
+### Indexing scope (ignored directories)
+
+By default, CodeGraph excludes `.godot/` and `addons/` from the index, alongside
+the standard cross-ecosystem defaults (`node_modules`, `target`, `dist`, `.venv`,
+etc.). `.godot/` is the engine's regenerated import/cache directory — never
+business source, fully reconstructed by the editor on open. `addons/` holds
+vendored third-party editor plugins that would otherwise crowd out first-party
+`.gd`/`.tscn`/`.tres` code in search results and impact queries.
+
+Both exclusions are opt-out. To re-include a directory (for example, a team that
+keeps first-party code under `addons/`), set a custom `indexing.ignore_dirs` list
+in `.codegraph/config.toml`. That list replaces the default set entirely, so
+re-list any other directories you still want ignored — e.g. keep `.godot` while
+dropping `addons`:
+
+```toml
+[indexing]
+ignore_dirs = [".godot", "node_modules", "target", "dist", ".venv"]
+```
+
 ### `project.godot` — autoload singletons, input actions, plugins
 
 | Extracted item                   | Graph representation                                                       |
@@ -227,6 +247,11 @@ extracted automatically without any configuration.
   at the project root, the Godot resolver does not activate and no Godot-specific
   edges are emitted — `.gd` files are still indexed by the base GDScript
   extractor (functions, classes, signals, extends, preload edges).
+- **`.godot/` and `addons/` are skipped by default.** Both directories are
+  excluded from indexing so engine cache and vendored plugins don't bury
+  first-party code in search results. Re-include a directory via a custom
+  `indexing.ignore_dirs` list in `.codegraph/config.toml`. See
+  [Indexing scope](#indexing-scope-ignored-directories).
 
 ---
 
