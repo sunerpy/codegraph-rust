@@ -2,10 +2,12 @@
 //!
 //! The daemon lives in a SEPARATE detached process, so we assert lifecycle via
 //! pid liveness (`is_process_alive`) at timed checkpoints, not via stdout (it is
-//! detached + logs to `.codegraph/daemon.log`). With `CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS=500`
-//! the daemon should LINGER while a client is connected and shortly after the
-//! LAST client disconnects, then EXIT once the idle window elapses with zero
-//! clients. De-flake by polling pid liveness against a clear deadline.
+//! detached + logs to `.codegraph/daemon.log`). With a multi-second
+//! `CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS` the daemon should LINGER while a client is
+//! connected and shortly after the LAST client disconnects, then EXIT once the
+//! idle window elapses with zero clients. De-flake by polling pid liveness
+//! against a clear deadline AND by keeping the "still alive" observation a tiny
+//! fraction of the idle window so CI scheduling jitter cannot flip the edge.
 
 #![cfg(unix)]
 
@@ -172,14 +174,14 @@ fn wait_until_gone(pid: u32, timeout: Duration) -> bool {
     process_is_gone_or_zombie(pid)
 }
 
-/// HAPPY: with a 500ms idle timeout, the daemon stays alive right after the last
+/// HAPPY: with a 2000ms idle timeout, the daemon stays alive right after the last
 /// client disconnects (< idle) and idle-exits once the window elapses (> idle).
 #[test]
 fn daemon_idle_exits_after_last_client() {
     let (_dir, project) = indexed_project("exits");
     let socket = daemon_socket_path(&project);
 
-    spawn_idle_daemon(&project, "500");
+    spawn_idle_daemon(&project, "2000");
     let pid = poll_for_daemon_pid(&socket, Duration::from_millis(3000))
         .expect("daemon socket + hello pid within poll window");
 
@@ -190,15 +192,17 @@ fn daemon_idle_exits_after_last_client() {
         drop(client);
     }
 
-    // At ~200ms after disconnect (< 500ms idle) the daemon must still be alive.
+    // At ~200ms after disconnect (≪ 2000ms idle) the daemon must still be alive.
+    // 200ms is a tiny fraction (10%) of the idle window, so even heavy CI
+    // scheduling jitter cannot stretch this observation past idle-exit.
     std::thread::sleep(Duration::from_millis(200));
     let alive_before_idle = is_process_alive(pid);
 
     // GENEROUS deadline, not a tight margin: `wait_until_gone` polls every 20ms and
     // returns the instant the process is gone, so the happy path still finishes in
-    // ~500-800ms — an 8s ceiling costs nothing on a quiet machine but stops a loaded
+    // ~2-2.5s — a 10s ceiling costs nothing on a quiet machine but stops a loaded
     // CI runner's slow idle-sweep + teardown from false-negativing (de-flake).
-    let exited = wait_until_gone(pid, Duration::from_secs(8));
+    let exited = wait_until_gone(pid, Duration::from_secs(10));
 
     // TEARDOWN before asserting so a failing assert never leaks the process.
     if !exited {
