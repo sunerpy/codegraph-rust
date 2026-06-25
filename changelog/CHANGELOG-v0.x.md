@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.4](https://github.com/sunerpy/codegraph-rust/compare/v0.15.3...v0.15.4) (2026-06-25)
+
+
+### Bug Fixes
+
+* **cli:** never run daemon/catch-up when launched at $HOME or filesystem root ([#68](https://github.com/sunerpy/codegraph-rust/issues/68)) ([cf34500](https://github.com/sunerpy/codegraph-rust/commit/cf3450026725b6070bd8b16e1bc546fe46edbcc5))
+
 ## [0.15.3](https://github.com/sunerpy/codegraph-rust/compare/v0.15.2...v0.15.3) (2026-06-25)
 
 
