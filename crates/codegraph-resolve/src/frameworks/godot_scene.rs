@@ -100,6 +100,10 @@ pub(crate) fn parse_tscn(file_path: &str, content: &str) -> FrameworkResolverExt
     // Map scene-node NAME → its node id, so a `[connection from="X"]` can
     // originate from node X when it is known.
     let mut node_ids: HashMap<String, String> = HashMap::new();
+    // The scene's root node id — the first `[node]` (which has no `parent`).
+    // Godot writes `from="."`/`to="."` to mean this root/self node, so a
+    // connection anchored at "." resolves here instead of a phantom marker.
+    let mut root_node_id: Option<String> = None;
 
     for (idx, raw_line) in content.lines().enumerate() {
         let line_no = (idx + 1) as i64;
@@ -123,6 +127,9 @@ pub(crate) fn parse_tscn(file_path: &str, content: &str) -> FrameworkResolverExt
                         &mut nodes,
                         &mut references,
                     ) {
+                        if root_node_id.is_none() && attr(&header.attrs, "parent").is_none() {
+                            root_node_id = Some(cn.id.clone());
+                        }
                         node_ids.insert(cn.name.clone(), cn.id.clone());
                         current_node = Some(cn);
                     }
@@ -132,6 +139,7 @@ pub(crate) fn parse_tscn(file_path: &str, content: &str) -> FrameworkResolverExt
                     line_no,
                     &header.attrs,
                     &node_ids,
+                    root_node_id.as_deref(),
                     &mut references,
                 ),
                 _ => {} // sub_resource / gd_scene / unknown → ignored
@@ -270,14 +278,21 @@ fn emit_groups(
 
 /// Emit a signal-connection `References` edge to the handler method NAME from a
 /// `[connection signal="s" from="A" to="B" method="m"]`. The edge originates
-/// from the `from` scene node when that node is known, else from a synthesized
+/// from the `from` scene node when that node is known; from the scene root node
+/// when `from="."` (Godot's self/root marker); else from a synthesized
 /// connection marker node (so the handler name is still recorded). T7 resolves
 /// the method name to its actual symbol.
+///
+/// Anchoring `from="."` to the real, emitted root node (rather than a marker id
+/// that is never pushed as a `Node`) is what keeps the ref alive: the store's
+/// `insert_unresolved_refs` drops any ref whose `from_node_id` is absent from
+/// `nodes`, so a phantom-marker anchor would silently vanish during persistence.
 fn emit_connection(
     file_path: &str,
     line_no: i64,
     attrs: &[(String, String)],
     node_ids: &HashMap<String, String>,
+    root_node_id: Option<&str>,
     references: &mut Vec<RefView>,
 ) {
     let Some(method) = attr(attrs, "method") else {
@@ -290,6 +305,14 @@ fn emit_connection(
     let from_node_id = node_ids
         .get(from)
         .cloned()
+        // Godot's self/root marker — anchor to the actual scene root node.
+        .or_else(|| {
+            if from == "." {
+                root_node_id.map(str::to_string)
+            } else {
+                None
+            }
+        })
         // No matching scene node: cannot happen for a well-formed scene, but be
         // tolerant — anchor the handler ref to a deterministic connection marker
         // keyed on the signal/from/to so the method name is not lost.
