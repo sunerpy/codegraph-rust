@@ -352,13 +352,32 @@ Set-PSReadLineKeyHandler -Key Tab -Function MenuComplete
 
 ## CodeGraph 的能力范围
 
-**做什么：** 确定性代码结构提取，支持约 29 种语言（TypeScript、Python、Go、Rust、
+**做什么：** 确定性代码结构提取，支持 32 种语言（TypeScript、Python、Go、Rust、
 Java、C/C++、C#、Vue、Svelte、GDScript 等——详见
-[`../grammar-manifest.md`](../grammar-manifest.md)），跨文件解析，图遍历，FTS5 检索，
+[`../languages.md`](../languages.md)），跨文件解析，图遍历，FTS5 检索，
 全图导出（含确定性 PageRank 中心性），MCP/CLI 表面，golden 字节稳定输出。
 
 **不做什么：** 二进制内部无任何 AI/向量/嵌入/LLM（硬约束，`scripts/guardrail.sh`
 强制执行）；无语义检索；不新增固定 `LANGUAGES` 集以外的语言。
+
+---
+
+## 支持的语言
+
+CodeGraph 支持 **32 种语言**，按提取深度分为三个层级：
+
+**Tier 1 — 完整符号提取（23 种）：** TypeScript、TSX、JavaScript、JSX、
+Python、Go、Rust、Java、C、C++、C#、PHP、Ruby、Swift、Kotlin、Dart、Scala、Lua、
+Luau、Objective-C、R、GDScript、Pascal。
+
+**Tier 2 — 嵌入式 / 模板提取（6 种）：** Vue（`<script>` 委托给 TS/JS）、
+Svelte（脚本块委托）、Astro、Razor/`.cshtml`、Liquid（Shopify 模板与 sections）、
+XML/MyBatis mapper。
+
+**Tier 3 — 仅文件级索引（3 种）：** YAML、Twig、Properties——作为文件节点
+索引，不提取符号。
+
+完整列表（含各语言扩展名和说明）：[`../languages.md`](../languages.md)。
 
 ---
 
@@ -367,7 +386,8 @@ Java、C/C++、C#、Vue、Svelte、GDScript 等——详见
 - [`../architecture.md`](../architecture.md) — crate 依赖图、提取/解析/遍历/检索流水线、daemon/watch 生命周期。
 - [`../data-model.md`](../data-model.md) — SQLite/FTS5 存储契约。
 - [`../equivalence.md`](../equivalence.md) — 3 层等价预言机、golden 再生流程、KNOWN_DIFFS 规则格式。
-- [`../grammar-manifest.md`](../grammar-manifest.md) / [`../embedded-extraction.md`](../embedded-extraction.md) — 语言支持与提取层级。
+- [`../languages.md`](../languages.md) — 支持语言完整列表，按提取深度分层。
+- [`../grammar-manifest.md`](../grammar-manifest.md) / [`../embedded-extraction.md`](../embedded-extraction.md) — 语言支持与提取层级（工程 ABI 细节）。
 - [`../cli.md`](../cli.md) — 完整 CLI 子命令参考（22 个子命令，所有标志）。
 - [`../mcp.md`](../mcp.md) — MCP 服务器协议、全部 10 个工具、JSON-RPC 详情。
 - [`../../examples/`](../../examples/) — codegraph + LLM 编排示例。
