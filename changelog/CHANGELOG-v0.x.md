@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.3](https://github.com/sunerpy/codegraph-rust/compare/v0.15.2...v0.15.3) (2026-06-25)
+
+
+### Bug Fixes
+
+* **daemon:** setsid the detached daemon so init reaps it (no zombie) ([#66](https://github.com/sunerpy/codegraph-rust/issues/66)) ([8d8d26e](https://github.com/sunerpy/codegraph-rust/commit/8d8d26e341ffc8b58756046685be9a7ebbc89029))
+
 ## [0.15.2](https://github.com/sunerpy/codegraph-rust/compare/v0.15.1...v0.15.2) (2026-06-25)
 
 
