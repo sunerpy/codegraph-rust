@@ -117,6 +117,20 @@ files. Events are debounced (default ~2 s; tunable via
 `CODEGRAPH_WATCH_DEBOUNCE_MS`) so a burst of saves triggers one incremental
 rebuild rather than many. The watcher is auto-disabled on WSL2 `/mnt/` drives
 where recursive watch is too slow; set `CODEGRAPH_FORCE_WATCH=1` to override.
+The watcher is also disabled when the resolved root is the filesystem root (`/`)
+or the user's home directory (`$HOME`) — this happens when an IDE or agent (e.g.
+Kiro) launches `codegraph serve --mcp` with no `--path` and its CWD resolves to
+`$HOME`. Tool queries still work off any existing `.codegraph` index; only live
+reindexing stops. `CODEGRAPH_FORCE_WATCH` does **not** override this guard (it
+only overrides the WSL2 `/mnt/` disable). The remedy is to open a specific
+project folder or pass `--path <project>`.
+
+When `serve --mcp` is started without an explicit `--path`, the server reads the
+MCP `initialize` handshake sent by the client and adopts the workspace it
+advertises (`rootUri`, `rootPath`, or `workspaceFolders[0].uri`) as its project
+root — provided that path is already indexed. This means a single global MCP
+config (one `serve --mcp` entry, no `--path`) correctly serves whichever
+project window is connected, without any per-project config.
 
 The daemon exits automatically after all clients disconnect and an idle timeout
 elapses. Logs are appended to `.codegraph/daemon.log`. A stale lock (e.g. after

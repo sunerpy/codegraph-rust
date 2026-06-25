@@ -398,17 +398,30 @@ those paths; the reason is surfaced in the log.
 The watcher registers per-directory watches only on non-ignored directories,
 pruning `node_modules`, `.venv`, `__pycache__`, `target`, `dist`, `.godot`,
 `.cache`, `.git`, `.codegraph`, and everything else in the default ignore set,
-plus any paths matched by the root `.gitignore`. This keeps the total watch count
-well inside the OS inotify limit on large trees and makes daemon startup fast. A
-newly-created non-ignored directory is picked up automatically on its create
-event — no restart required.
+plus any paths matched by the root `.gitignore`. This pruning applies at any
+nesting depth, so an `node_modules` buried several levels deep is never walked.
+This keeps the total watch count well inside the OS inotify limit on large trees
+and makes daemon startup fast. A newly-created non-ignored directory is picked up
+automatically on its create event — no restart required.
 
-Two escape hatches:
+The watcher is also auto-disabled when the resolved project root is the
+filesystem root (`/`) or the current user's home directory (`$HOME`). This
+commonly happens when an IDE or agent (e.g. Kiro) launches `codegraph serve
+--mcp` with no `--path` and its working directory resolves to `$HOME`. In that
+case the watcher is disabled and the reason is logged — tool queries still work
+off any existing index. The remedy: open a specific project folder, let the
+client send its workspace root via the MCP `initialize` handshake, or pass
+`--path <project>` explicitly. `CODEGRAPH_FORCE_WATCH=1` does **not** override
+this guard (it only overrides the WSL2 `/mnt/` disable).
 
-- `CODEGRAPH_FORCE_WATCH=1` — override the WSL2 `/mnt/` auto-disable. Does **not**
-  override an explicit `CODEGRAPH_NO_WATCH=1`.
+Three escape hatches:
+
+- `CODEGRAPH_FORCE_WATCH=1` — override the WSL2 `/mnt/` auto-disable only. Does
+  **not** override the home/root guard or an explicit `CODEGRAPH_NO_WATCH=1`.
 - `CODEGRAPH_NO_WATCH=1` (or `serve --no-watch`) — disable watching entirely.
   `--no-watch` and `CODEGRAPH_NO_WATCH=1` are fully equivalent.
+- `--path <project>` — pin to a specific project root, avoiding the home/root
+  guard entirely.
 
 ### Environment variable reference
 
