@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.1](https://github.com/sunerpy/codegraph-rust/compare/v0.15.0...v0.15.1) (2026-06-25)
+
+
+### Bug Fixes
+
+* self-update jumps to latest + watcher prunes ignored dirs (inotify exhaustion / slow MCP startup) ([#62](https://github.com/sunerpy/codegraph-rust/issues/62)) ([da10bd7](https://github.com/sunerpy/codegraph-rust/commit/da10bd7c2a81d157aea6528e6d042c5ca4d6b062))
+
 ## [0.15.0](https://github.com/sunerpy/codegraph-rust/compare/v0.14.0...v0.15.0) (2026-06-25)
 
 
