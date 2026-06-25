@@ -667,25 +667,38 @@ fn install_completions(shell: Shell) -> Result<()> {
     Ok(())
 }
 
+/// Format the GitHub release tag to target from a release's bare semver.
+///
+/// `self_update`'s `Release.version` (from `get_latest_release()`) is the bare
+/// semver with NO leading `v` (e.g. `0.15.0`), but this repo tags releases as
+/// `v{semver}` (e.g. `v0.15.0`), and `target_version_tag` must match the tag
+/// exactly. This bridges the two and is idempotent on an already-`v`-prefixed
+/// input so it's safe regardless of which form the backend hands us.
+fn latest_update_tag(latest_version: &str) -> String {
+    let bare = latest_version.strip_prefix('v').unwrap_or(latest_version);
+    format!("v{bare}")
+}
+
 fn cmd_self_update(check: bool, force: bool, tag: Option<String>) -> Result<()> {
     use self_update::cargo_crate_version;
 
-    let mut builder = self_update::backends::github::Update::configure();
-    builder
-        .repo_owner("sunerpy")
-        .repo_name("codegraph-rust")
-        .bin_name("codegraph")
-        .current_version(cargo_crate_version!())
-        .show_download_progress(true)
-        .no_confirm(force);
-    if let Some(tag) = &tag {
-        builder.target_version_tag(tag);
-    }
-    let updater = builder
-        .build()
-        .context("configuring the self-update backend")?;
+    let configure = || {
+        let mut builder = self_update::backends::github::Update::configure();
+        builder
+            .repo_owner("sunerpy")
+            .repo_name("codegraph-rust")
+            .bin_name("codegraph")
+            .current_version(cargo_crate_version!())
+            .show_download_progress(true)
+            .no_confirm(force);
+        builder
+    };
 
+    // `--check`: just report whether a newer release exists, never install.
     if check {
+        let updater = configure()
+            .build()
+            .context("configuring the self-update backend")?;
         let latest = updater
             .get_latest_release()
             .context("querying the latest GitHub release")?;
@@ -698,6 +711,33 @@ fn cmd_self_update(check: bool, force: bool, tag: Option<String>) -> Result<()> 
         }
         return Ok(());
     }
+
+    // Resolve the tag to install. With an explicit `--tag` we honor it verbatim.
+    //
+    // Without `--tag` we must resolve the LATEST release ourselves and pin it via
+    // `target_version_tag`. Otherwise `self_update`'s no-target path filters
+    // releases by semver-compatibility and installs the *first compatible* one,
+    // which on a 0.x line advances a single minor per run (e.g. 0.5.2 -> 0.5.3,
+    // then 0.5.3 -> 0.14.0) instead of jumping straight to newest. Pinning the
+    // latest tag bypasses that stepping so one run lands on the newest release.
+    let target_tag = match tag {
+        Some(t) => t,
+        None => {
+            let probe = configure()
+                .build()
+                .context("configuring the self-update backend")?;
+            let latest = probe
+                .get_latest_release()
+                .context("querying the latest GitHub release")?;
+            latest_update_tag(&latest.version)
+        }
+    };
+
+    let mut builder = configure();
+    builder.target_version_tag(&target_tag);
+    let updater = builder
+        .build()
+        .context("configuring the self-update backend")?;
 
     let status = updater.update().context("performing the self-update")?;
     if status.updated() {
@@ -2525,6 +2565,22 @@ fn print_files_tree(files: &[FileRecord], max_depth: Option<usize>) {
                 file.path, file.language, file.node_count
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod self_update_tests {
+    use super::latest_update_tag;
+
+    #[test]
+    fn formats_bare_semver_as_v_prefixed_tag() {
+        assert_eq!(latest_update_tag("0.15.0"), "v0.15.0");
+        assert_eq!(latest_update_tag("1.2.3"), "v1.2.3");
+    }
+
+    #[test]
+    fn idempotent_on_already_v_prefixed_input() {
+        assert_eq!(latest_update_tag("v0.15.0"), "v0.15.0");
     }
 }
 
