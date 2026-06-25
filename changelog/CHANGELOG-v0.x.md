@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.0](https://github.com/sunerpy/codegraph-rust/compare/v0.11.0...v0.12.0) (2026-06-25)
+
+
+### Features
+
+* **installer:** codegraph skill install/update/uninstall/status across 8 agents ([#43](https://github.com/sunerpy/codegraph-rust/issues/43)) ([0c6164f](https://github.com/sunerpy/codegraph-rust/commit/0c6164fe050ce864372ced6e3ff2f5a1eb480b05))
+
 ## [0.11.0](https://github.com/sunerpy/codegraph-rust/compare/v0.10.0...v0.11.0) (2026-06-25)
 
 
