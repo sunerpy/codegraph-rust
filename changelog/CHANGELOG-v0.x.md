@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.13.0](https://github.com/sunerpy/codegraph-rust/compare/v0.12.1...v0.13.0) (2026-06-25)
+
+
+### Features
+
+* **godot:** dynamic GDScript edges + fix determinism flake (L3) ([#53](https://github.com/sunerpy/codegraph-rust/issues/53)) ([2d1e53c](https://github.com/sunerpy/codegraph-rust/commit/2d1e53c1b55d37631e4bfda7464519f16fb0d088))
+* **godot:** file ingestion + GodotResolver + project.godot autoload graph (L1) ([#49](https://github.com/sunerpy/codegraph-rust/issues/49)) ([2ecfe5a](https://github.com/sunerpy/codegraph-rust/commit/2ecfe5ab05e4ed9285de45f82b3fc1bd526e1564))
+* **godot:** parse .tscn scenes and .tres resources (L2/L4) ([#52](https://github.com/sunerpy/codegraph-rust/issues/52)) ([1269003](https://github.com/sunerpy/codegraph-rust/commit/1269003d1a28da52d9ea026296b6f74a991528b8))
+* **resolve:** resolve Godot autoload access cross-file via roster-gated resolve() ([#54](https://github.com/sunerpy/codegraph-rust/issues/54)) ([564fc58](https://github.com/sunerpy/codegraph-rust/commit/564fc58c7b39117042b9939e32bf57a34fddd760))
+
+
+### Bug Fixes
+
+* **daemon:** bound MCP proxy hello read so a wedged daemon socket never hangs the handshake ([#55](https://github.com/sunerpy/codegraph-rust/issues/55)) ([50580e3](https://github.com/sunerpy/codegraph-rust/commit/50580e3fa7e53c6dbadf82cba5fd8d3075a68a12))
+
 ## [0.12.1](https://github.com/sunerpy/codegraph-rust/compare/v0.12.0...v0.12.1) (2026-06-25)
 
 
