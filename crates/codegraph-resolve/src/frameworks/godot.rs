@@ -40,6 +40,7 @@
 use codegraph_core::types::{Language, Node};
 
 use super::godot_project;
+use super::godot_resource;
 use super::godot_scene;
 use crate::framework::FrameworkResolver;
 use crate::types::{FrameworkResolverExtractionResult, RefView, ResolutionContext, ResolvedRef};
@@ -104,16 +105,23 @@ impl FrameworkResolver for GodotResolver {
     /// [`godot_scene::parse_tscn`] (scene-tree nodes + script-binding,
     /// signal-handler, group-membership, and instanced-subscene references).
     ///
-    /// Every other file returns `None` for now — T5 adds the `.tres` branch
-    /// here, dispatching the same way (extension match → a sibling parser
-    /// helper → `Some(result)`), so the resolver pipeline
-    /// (`extract_and_persist_frameworks`) persists their nodes/edges.
+    /// L4 (T5): when the file's basename ends in `.tres`, delegate to
+    /// [`godot_resource::parse_tres`] (a single resource marker node +
+    /// resource→script / resource→resource references resolved through the same
+    /// `[ext_resource]` id-table mechanics as L2).
+    ///
+    /// Every other file (`.gd`, etc.) returns `None`, which the pipeline
+    /// (`extract_and_persist_frameworks`) treats as "this resolver has nothing
+    /// for this file".
     fn extract(&self, file_path: &str, content: &str) -> Option<FrameworkResolverExtractionResult> {
         if godot_project::is_project_godot(file_path) {
             return Some(godot_project::parse_project_godot(file_path, content));
         }
         if godot_scene::is_tscn(file_path) {
             return Some(godot_scene::parse_tscn(file_path, content));
+        }
+        if godot_resource::is_tres(file_path) {
+            return Some(godot_resource::parse_tres(file_path, content));
         }
         None
     }

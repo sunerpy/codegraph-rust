@@ -193,10 +193,10 @@ fn extract_routes_only_tscn_not_gd_or_tres() {
     assert!(GodotResolver
         .extract("player.gd", "extends Node\n")
         .is_none());
-    // A .tres is T5's job — still None for now.
+    // A .tres routes to T5's resource parser (Some, via that parser, not this).
     assert!(GodotResolver
         .extract("data/item.tres", "[gd_resource format=3]\n")
-        .is_none());
+        .is_some());
     // project.godot still routes to T3 (not this parser) — it returns Some, but
     // via the project parser, so it is NOT None.
     assert!(GodotResolver
