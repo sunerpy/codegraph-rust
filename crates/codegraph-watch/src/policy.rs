@@ -213,7 +213,16 @@ fn rule_matches(pattern: &str, relative: &str, is_dir: bool) -> bool {
     };
     let pattern = pattern.trim_start_matches('/');
     if let Some(dir) = pattern.strip_suffix('/') {
-        return candidate == format!("{dir}/") || candidate.starts_with(&format!("{dir}/"));
+        // gitignore semantics: a `dir/` rule matches that directory at ANY
+        // segment depth, not just the path root. Match on segment boundaries
+        // (`== "{dir}/"` whole, `"{dir}/"` prefix, `"/{dir}/"` interior) so a
+        // nested `.../node_modules/...` is pruned while a partial-segment name
+        // like `mynode_modules/` never matches the `node_modules/` rule.
+        let dir_slash = format!("{dir}/");
+        let nested = format!("/{dir}/");
+        return candidate == dir_slash
+            || candidate.starts_with(&dir_slash)
+            || candidate.contains(&nested);
     }
     if let Some((prefix, suffix)) = pattern.split_once('*') {
         let tail = relative.rsplit('/').next().unwrap_or(relative);
@@ -257,5 +266,37 @@ mod tests {
         let policy = WatchPolicy::new(dir.path());
         assert!(policy.should_handle_file("vendor/first_party.ts"));
         assert!(!policy.should_handle_file("node_modules/pkg/index.ts"));
+    }
+
+    #[test]
+    fn nested_ignore_dirs_are_pruned() {
+        let dir = crate::sync::tests::TestDir::new("watch-policy-nested");
+        let policy = WatchPolicy::new(dir.path());
+        assert!(!policy.should_watch_dir("workspace/app/node_modules"));
+        assert!(!policy.should_watch_dir("a/b/.venv"));
+        assert!(!policy.should_watch_dir("x/y/__pycache__"));
+        assert!(!policy.should_watch_dir("examples/demo/node_modules/.pnpm/vue-demi/node_modules"));
+        assert!(policy.should_watch_dir("src/components"));
+    }
+
+    #[test]
+    fn partial_segment_names_are_not_false_positives() {
+        let dir = crate::sync::tests::TestDir::new("watch-policy-partial");
+        let policy = WatchPolicy::new(dir.path());
+        assert!(policy.should_watch_dir("a/mynode_modules"));
+        assert!(policy.should_watch_dir("node_modules_old"));
+        assert!(policy.should_watch_dir("a/mynode_modules/b"));
+    }
+
+    #[test]
+    fn multi_segment_dir_rule_matches_on_boundaries() {
+        let dir = crate::sync::tests::TestDir::new("watch-policy-multiseg");
+        fs::write(dir.path().join(".gitignore"), "a/b/\n").unwrap();
+        let policy = WatchPolicy::new(dir.path());
+        assert!(!policy.should_watch_dir("a/b"));
+        assert!(!policy.should_watch_dir("x/a/b"));
+        assert!(!policy.should_watch_dir("a/b/c"));
+        assert!(policy.should_watch_dir("a/bb"));
+        assert!(policy.should_watch_dir("za/b"));
     }
 }
