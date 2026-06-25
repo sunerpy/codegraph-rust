@@ -334,15 +334,34 @@ accept the project path as a positional argument or `-p/--path`; `query`/`files`
 
 ## What CodeGraph Does (and Doesn't)
 
-**Does:** deterministic code-structure extraction across ~29 languages (TypeScript,
+**Does:** deterministic code-structure extraction across 32 languages (TypeScript,
 Python, Go, Rust, Java, C/C++, C#, Vue, Svelte, GDScript, and more — see
-[`docs/grammar-manifest.md`](docs/grammar-manifest.md)), cross-file resolution,
+[`docs/languages.md`](docs/languages.md)), cross-file resolution,
 graph traversal, FTS5 search, whole-graph export with deterministic PageRank
 centrality, MCP/CLI surfaces, and golden byte-stable output.
 
 **Doesn't:** no AI / vector / embedding / LLM anywhere inside the binary (hard
 constraint, `scripts/guardrail.sh`-enforced); no semantic search; no languages
 beyond the fixed `LANGUAGES` set.
+
+---
+
+## Supported Languages
+
+CodeGraph supports **32 languages** grouped by extraction depth:
+
+**Tier 1 — Full symbol extraction (23):** TypeScript, TSX, JavaScript, JSX,
+Python, Go, Rust, Java, C, C++, C#, PHP, Ruby, Swift, Kotlin, Dart, Scala, Lua,
+Luau, Objective-C, R, GDScript, Pascal.
+
+**Tier 2 — Embedded / template extraction (6):** Vue (delegates `<script>` to
+TS/JS), Svelte (delegates script blocks), Astro, Razor/`.cshtml`, Liquid
+(Shopify templates + sections), XML/MyBatis mapper.
+
+**Tier 3 — File-level only (3):** YAML, Twig, Properties — indexed as file
+nodes; no symbol extraction.
+
+Full list with extensions and per-language notes: [`docs/languages.md`](docs/languages.md).
 
 ---
 
@@ -353,9 +372,11 @@ beyond the fixed `LANGUAGES` set.
 - [`docs/data-model.md`](docs/data-model.md) — SQLite/FTS5 storage contract.
 - [`docs/equivalence.md`](docs/equivalence.md) — the 3-tier equivalence oracle,
   golden regeneration, `KNOWN_DIFFS.md` format.
+- [`docs/languages.md`](docs/languages.md) — full supported-language list grouped
+  by extraction depth.
 - [`docs/grammar-manifest.md`](docs/grammar-manifest.md) /
   [`docs/embedded-extraction.md`](docs/embedded-extraction.md) — language support
-  and extraction tiers.
+  and extraction tiers (engineering ABI detail).
 - [`docs/cli.md`](docs/cli.md) — full CLI subcommand reference (22 subcommands,
   all flags).
 - [`docs/mcp.md`](docs/mcp.md) — MCP server protocol, all 10 tools, JSON-RPC
