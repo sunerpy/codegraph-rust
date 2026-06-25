@@ -194,7 +194,19 @@ fn initialize_matches_golden() {
         "protocolVersion"
     );
     assert_eq!(g["capabilities"], a["capabilities"], "capabilities");
-    assert_eq!(g["serverInfo"], a["serverInfo"], "serverInfo");
+    // serverInfo.name stays byte-stable; serverInfo.version is DYNAMIC — it must
+    // equal the running crate version (`CARGO_PKG_VERSION`, see server.rs:29), so
+    // a release-please bump never staleness-fails this golden. The golden's
+    // `version` field is informational only and is not enforced here.
+    assert_eq!(
+        g["serverInfo"]["name"], a["serverInfo"]["name"],
+        "serverInfo.name"
+    );
+    assert_eq!(
+        a["serverInfo"]["version"],
+        json!(env!("CARGO_PKG_VERSION")),
+        "serverInfo.version must equal the running crate version"
+    );
     assert_eq!(
         g["instructions"], a["instructions"],
         "instructions must be byte-identical to the golden"
