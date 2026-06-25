@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use codegraph_resolve::framework::FrameworkResolver;
-use codegraph_resolve::frameworks::{detect_frameworks, nestjs, react, vue};
+use codegraph_resolve::frameworks::{detect_frameworks, godot, nestjs, react, vue};
 use codegraph_resolve::types::{ImportMapping, RefView, ResolutionContext, ResolvedBy};
 
 /// A self-contained, in-memory [`ResolutionContext`] for resolver tests.
@@ -479,4 +479,64 @@ fn detect_frameworks_empty_on_plain_project() {
         .with_file("package.json", r#"{"dependencies":{"lodash":"4"}}"#)
         .with_file("src/index.ts", "export const x = 1;");
     assert!(detect_frameworks(&ctx).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Godot (T2 skeleton: registration + detect only; resolve/extract/post_extract
+// are stubs filled in T3-T7)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn godot_detects_project_with_project_godot() {
+    // A project carrying a `project.godot` at its root IS a Godot project.
+    let ctx = MockContext::default()
+        .with_file("project.godot", "config_version=5\n\n[application]\n")
+        .with_file("scenes/Main.tscn", "[gd_scene]\n")
+        .with_file("scripts/player.gd", "extends Node\n");
+    assert!(godot::GodotResolver.detect(&ctx));
+}
+
+#[test]
+fn godot_does_not_detect_project_without_project_godot() {
+    // No `project.godot` anywhere -> the resolver must NOT activate (it would
+    // otherwise fire on every project, since languages() == None).
+    let ctx = MockContext::default()
+        .with_file("package.json", r#"{"dependencies":{"lodash":"4"}}"#)
+        .with_file("scripts/player.gd", "extends Node\n");
+    assert!(!godot::GodotResolver.detect(&ctx));
+}
+
+#[test]
+fn godot_languages_is_none_applies_to_all() {
+    // None == apply to all languages, so extract() can later see .tscn/.tres/
+    // project.godot/.gd files regardless of their Language variant.
+    assert!(godot::GodotResolver.languages().is_none());
+}
+
+#[test]
+fn godot_resolver_name_is_godot() {
+    assert_eq!(godot::GodotResolver.name(), "godot");
+}
+
+#[test]
+fn detect_frameworks_includes_godot_for_godot_project() {
+    // The registry instantiates GodotResolver and consults its detect().
+    let ctx =
+        MockContext::default().with_file("project.godot", "config_version=5\n\n[application]\n");
+    let detected = detect_frameworks(&ctx);
+    let names: Vec<&str> = detected.iter().map(|r| r.name()).collect();
+    assert!(names.contains(&"godot"), "expected godot, got {names:?}");
+}
+
+#[test]
+fn detect_frameworks_excludes_godot_without_project_godot() {
+    // No spurious activation: a non-Godot project must not list godot.
+    let ctx =
+        MockContext::default().with_file("package.json", r#"{"dependencies":{"react":"18"}}"#);
+    let detected = detect_frameworks(&ctx);
+    let names: Vec<&str> = detected.iter().map(|r| r.name()).collect();
+    assert!(
+        !names.contains(&"godot"),
+        "godot must not fire, got {names:?}"
+    );
 }

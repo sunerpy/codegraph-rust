@@ -49,7 +49,7 @@ pub const EDGE_KIND_STRINGS: [&str; 12] = [
     "decorates",
 ];
 
-pub const LANGUAGE_STRINGS: [&str; 33] = [
+pub const LANGUAGE_STRINGS: [&str; 36] = [
     "typescript",
     "javascript",
     "tsx",
@@ -82,6 +82,9 @@ pub const LANGUAGE_STRINGS: [&str; 33] = [
     "xml",
     "properties",
     "gdscript",
+    "godot_scene",
+    "godot_resource",
+    "godot_project",
     "unknown",
 ];
 
@@ -327,12 +330,18 @@ pub enum Language {
     Properties,
     #[serde(rename = "gdscript")]
     Gdscript,
+    #[serde(rename = "godot_scene")]
+    GodotScene,
+    #[serde(rename = "godot_resource")]
+    GodotResource,
+    #[serde(rename = "godot_project")]
+    GodotProject,
     #[serde(rename = "unknown")]
     Unknown,
 }
 
 impl Language {
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 36] = [
         Self::TypeScript,
         Self::JavaScript,
         Self::Tsx,
@@ -365,6 +374,9 @@ impl Language {
         Self::Xml,
         Self::Properties,
         Self::Gdscript,
+        Self::GodotScene,
+        Self::GodotResource,
+        Self::GodotProject,
         Self::Unknown,
     ];
 
@@ -402,6 +414,9 @@ impl Language {
             Self::Xml => "xml",
             Self::Properties => "properties",
             Self::Gdscript => "gdscript",
+            Self::GodotScene => "godot_scene",
+            Self::GodotResource => "godot_resource",
+            Self::GodotProject => "godot_project",
             Self::Unknown => "unknown",
         }
     }

@@ -10,6 +10,8 @@
 //! [`crate::resolver::ReferenceResolver::resolve_one`] Strategy-1 exactly where
 //! the upstream runs them (`index.ts:695-701`).
 
+pub mod godot;
+pub(crate) mod godot_project;
 pub mod nestjs;
 pub mod react;
 pub mod vue;
@@ -28,6 +30,7 @@ pub fn detect_frameworks(context: &dyn ResolutionContext) -> Vec<Box<dyn Framewo
         Box::new(nestjs::NestjsResolver),
         Box::new(react::ReactResolver),
         Box::new(vue::VueResolver),
+        Box::new(godot::GodotResolver),
     ];
     candidates
         .into_iter()

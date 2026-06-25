@@ -1264,6 +1264,9 @@ fn parse_language(value: String) -> rusqlite::Result<Language> {
         "xml" => Language::Xml,
         "properties" => Language::Properties,
         "gdscript" => Language::Gdscript,
+        "godot_scene" => Language::GodotScene,
+        "godot_resource" => Language::GodotResource,
+        "godot_project" => Language::GodotProject,
         "unknown" => Language::Unknown,
         _ => return Err(enum_error(value, "language")),
     };
