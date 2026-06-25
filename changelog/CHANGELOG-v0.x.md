@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.5](https://github.com/sunerpy/codegraph-rust/compare/v0.15.4...v0.15.5) (2026-06-25)
+
+
+### Bug Fixes
+
+* **mcp:** discover client roots for home-launched servers ([#70](https://github.com/sunerpy/codegraph-rust/issues/70)) ([f7e1813](https://github.com/sunerpy/codegraph-rust/commit/f7e1813cd5196f96ba11431f02424361e66842b1))
+
 ## [0.15.4](https://github.com/sunerpy/codegraph-rust/compare/v0.15.3...v0.15.4) (2026-06-25)
 
 
