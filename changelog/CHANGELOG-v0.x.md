@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.0](https://github.com/sunerpy/codegraph-rust/compare/v0.10.0...v0.11.0) (2026-06-25)
+
+
+### Features
+
+* **daemon:** shared detached daemon with live file-watch incremental re-index ([#41](https://github.com/sunerpy/codegraph-rust/issues/41)) ([ee9de19](https://github.com/sunerpy/codegraph-rust/commit/ee9de19145ba7827691cc284d1ca7eae2966da75))
+
 ## [0.10.0](https://github.com/sunerpy/codegraph-rust/compare/v0.9.0...v0.10.0) (2026-06-24)
 
 
