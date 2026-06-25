@@ -63,6 +63,8 @@ pub fn builtin_language_for_ext(ext: &str) -> Option<Language> {
         "scala" | "sc" => Language::Scala,
         "lua" => Language::Lua,
         "gd" => Language::Gdscript,
+        "tscn" => Language::GodotScene,
+        "tres" => Language::GodotResource,
         "luau" => Language::Luau,
         "m" | "mm" => Language::ObjC,
         "r" => Language::R,
@@ -80,6 +82,11 @@ pub fn detect_language(file_path: impl AsRef<Path>) -> Language {
     let normalized = normalize_path(path);
     if let Some(language) = crate::embedded::detect_embedded_language(&normalized) {
         return language;
+    }
+    // `project.godot` has no extension, so the extension map below cannot catch
+    // it. Special-case the bare file name before the extension lookup.
+    if path.file_name().and_then(|name| name.to_str()) == Some("project.godot") {
+        return Language::GodotProject;
     }
     let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
         return Language::Unknown;
@@ -319,7 +326,12 @@ fn is_extractable_source_path(relative: &str) -> bool {
 fn is_file_level_only_language(language: Language) -> bool {
     matches!(
         language,
-        Language::Yaml | Language::Twig | Language::Properties
+        Language::Yaml
+            | Language::Twig
+            | Language::Properties
+            | Language::GodotScene
+            | Language::GodotResource
+            | Language::GodotProject
     )
 }
 
