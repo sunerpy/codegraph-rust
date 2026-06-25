@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.14.0](https://github.com/sunerpy/codegraph-rust/compare/v0.13.0...v0.14.0) (2026-06-25)
+
+
+### Features
+
+* **graph:** report Godot dynamic reachability instead of false dead-code ([#56](https://github.com/sunerpy/codegraph-rust/issues/56)) ([18d0e2b](https://github.com/sunerpy/codegraph-rust/commit/18d0e2bbd4a73d8f92bcabdb5c8f90acfff54018))
+* **resolve:** optional Godot resource DSL hook + Godot docs (L5) ([#58](https://github.com/sunerpy/codegraph-rust/issues/58)) ([de7e5f6](https://github.com/sunerpy/codegraph-rust/commit/de7e5f621f0139dbedd8744553edcbcb4619357d))
+
+
+### Bug Fixes
+
+* **resolve:** anchor Godot from="." scene connections to the root node ([#59](https://github.com/sunerpy/codegraph-rust/issues/59)) ([2a33e62](https://github.com/sunerpy/codegraph-rust/commit/2a33e62440cb121356b9fbb33bc35dc9d42075b6))
+
 ## [0.13.0](https://github.com/sunerpy/codegraph-rust/compare/v0.12.1...v0.13.0) (2026-06-25)
 
 
