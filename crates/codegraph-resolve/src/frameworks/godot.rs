@@ -39,6 +39,7 @@
 
 use codegraph_core::types::{Language, Node};
 
+use super::godot_project;
 use crate::framework::FrameworkResolver;
 use crate::types::{FrameworkResolverExtractionResult, RefView, ResolutionContext, ResolvedRef};
 
@@ -92,13 +93,20 @@ impl FrameworkResolver for GodotResolver {
         false
     }
 
-    /// STUB — per-file parsing of `project.godot` (T3), `.tscn` (T4), and
-    /// `.tres` (T5) into nodes + references lands in those layers.
-    fn extract(
-        &self,
-        _file_path: &str,
-        _content: &str,
-    ) -> Option<FrameworkResolverExtractionResult> {
+    /// Per-file Godot parsing dispatch.
+    ///
+    /// L1 (T3): when the file's basename is `project.godot`, delegate to
+    /// [`godot_project::parse_project_godot`] (autoload-singleton graph + input
+    /// actions + main scene + enabled plugins) and return its result.
+    ///
+    /// Every other file returns `None` for now — T4 adds the `.tscn` branch and
+    /// T5 the `.tres` branch here, dispatching the same way (basename / extension
+    /// match → a sibling parser helper → `Some(result)`), so the resolver
+    /// pipeline (`extract_and_persist_frameworks`) persists their nodes/edges.
+    fn extract(&self, file_path: &str, content: &str) -> Option<FrameworkResolverExtractionResult> {
+        if godot_project::is_project_godot(file_path) {
+            return Some(godot_project::parse_project_godot(file_path, content));
+        }
         None
     }
 
