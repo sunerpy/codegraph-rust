@@ -342,3 +342,87 @@ fn normalize_path(path: impl AsRef<Path>) -> String {
         .to_string_lossy()
         .replace('\\', "/")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::SystemTime;
+
+    fn unique_project(tag: &str) -> PathBuf {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("cg_scan_{tag}_{}_{nanos}_{n}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create temp project");
+        dir
+    }
+
+    fn touch(root: &Path, relative: &str, contents: &str) {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).expect("create parent dirs");
+        fs::write(&path, contents).expect("write file");
+    }
+
+    /// A real directory scan of a Godot project skips the regenerated `.godot/`
+    /// engine cache and the vendored `addons/` plugin tree while still finding
+    /// first-party `.gd` business code.
+    #[test]
+    fn scan_ignores_godot_cache_and_addons_by_default() {
+        let project = unique_project("godot");
+        touch(&project, "player.gd", "extends Node");
+        touch(&project, ".godot/imported/icon.png-abc.ctex", "cache");
+        touch(&project, ".godot/global_script_class_cache.cfg", "[]");
+        touch(
+            &project,
+            "addons/some_plugin/plugin.gd",
+            "extends EditorPlugin",
+        );
+
+        let options = ExtractOptions::default();
+        let files = scan_project(&project, &options).expect("scan project");
+
+        assert!(
+            files.contains(&"player.gd".to_string()),
+            "first-party business code must be indexed: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f.starts_with(".godot/")),
+            ".godot/ engine cache must be skipped: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f.starts_with("addons/")),
+            "addons/ vendored plugins must be skipped: {files:?}"
+        );
+
+        fs::remove_dir_all(&project).ok();
+    }
+
+    /// A team authoring first-party code under `addons/` can re-include it by
+    /// overriding `indexing.ignore_dirs` (the same override surface a custom
+    /// `.codegraph/config.toml` populates), proving the default is opt-out.
+    #[test]
+    fn scan_reincludes_addons_when_override_drops_it() {
+        let project = unique_project("godot_override");
+        touch(&project, "addons/first_party/tool.gd", "extends Node");
+        touch(&project, ".godot/cache.cfg", "[]");
+
+        let mut options = ExtractOptions::default();
+        options.ignore_dirs.retain(|dir| dir != "addons");
+        let files = scan_project(&project, &options).expect("scan project");
+        assert!(
+            files.contains(&"addons/first_party/tool.gd".to_string()),
+            "addons/ must be re-includable via ignore_dirs override: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f.starts_with(".godot/")),
+            ".godot/ stays ignored even when addons is re-included: {files:?}"
+        );
+
+        fs::remove_dir_all(&project).ok();
+    }
+}
