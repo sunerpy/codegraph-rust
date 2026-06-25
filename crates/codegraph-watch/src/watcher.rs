@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,6 +17,14 @@ use crate::sync::{default_db_path, sync_changed_paths, SyncOutcome};
 type SyncCallback = Arc<dyn Fn(SyncOutcome) + Send + Sync>;
 type SyncFn = Arc<dyn Fn(Vec<String>) -> Result<SyncOutcome> + Send + Sync>;
 type NoticeCallback = Arc<dyn Fn(String) + Send + Sync>;
+
+/// The OS watcher, shared between [`ProjectWatcher`] (which owns its lifetime)
+/// and the event-loop thread (which registers a watch when a brand-new
+/// non-ignored directory appears). Because Linux watches are NON-recursive
+/// per-dir (see [`collect_watch_dirs`]), a freshly-created directory would
+/// otherwise hold no watch until a server restart; the loop adds one on its
+/// create event.
+type SharedWatcher = Arc<Mutex<Option<RecommendedWatcher>>>;
 
 // libc errnos used to classify a backend watch failure. Hard-coded (rather than
 // pulling in `libc`) because these three values are stable across every Unix the
@@ -67,6 +76,83 @@ fn classify_notify_error(err: &notify::Error) -> WatchErrorClass {
         notify::ErrorKind::Io(io_err) => classify_watch_error(io_err),
         notify::ErrorKind::MaxFilesWatch => WatchErrorClass::Warn,
         _ => WatchErrorClass::Other,
+    }
+}
+
+/// Walk `root` and collect every directory that should be watched, PRUNING any
+/// subtree the [`WatchPolicy`] excludes.
+///
+/// # Why this exists (inotify exhaustion)
+///
+/// On Linux `notify`'s `RecursiveMode::Recursive` registers one inotify watch
+/// per subdirectory. A blanket recursive watch on a large root (e.g. a home dir
+/// holding Python `site-packages`, `node_modules`, `.venv`, `__pycache__`,
+/// `.godot`, …) registers tens of thousands of watches at startup: it exhausts
+/// the kernel's `max_user_watches` limit (the "OS file watch limit reached"
+/// warning) AND stalls MCP startup while every watch is registered. By pruning
+/// ignored subtrees here and registering a NON-recursive watch per surviving
+/// directory, we only ever hold inotify watches for source directories the index
+/// actually cares about — and we never even `stat` into `site-packages`.
+///
+/// The walk reuses the SAME [`WatchPolicy`] already built in
+/// [`ProjectWatcher::start`] (its `normalize_relative` + `should_watch_dir`), so
+/// the watch-registration set matches the extract-side ignore set exactly. When a
+/// directory is ignored, the walk does not descend into it at all.
+///
+/// Pure and deterministic: the result is sorted, always includes `root` itself,
+/// and `read_dir`/metadata errors on any subdir are tolerated (that subdir is
+/// skipped, the walk continues) so a transient FS error never panics startup.
+fn collect_watch_dirs(root: &Path, policy: &WatchPolicy) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    // Explicit stack DFS (no recursion) so a deep tree can't blow the stack.
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        dirs.push(dir.clone());
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            // Tolerate permission / transient errors: skip this dir, keep going.
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // Only directories add inotify watches. Use `file_type()` (no extra
+            // stat syscall via DirEntry) and skip symlinks to avoid cycles.
+            let is_dir = match entry.file_type() {
+                Ok(ft) => ft.is_dir() && !ft.is_symlink(),
+                Err(_) => continue,
+            };
+            if !is_dir {
+                continue;
+            }
+            match policy.normalize_relative(&path) {
+                // PRUNE: do not descend into an ignored subtree at all. This is
+                // what keeps us out of node_modules/.venv/__pycache__/.git/etc.
+                Some(relative) if !policy.should_watch_dir(&relative) => continue,
+                // A path that doesn't normalize (escape / root) is not pushed.
+                None => continue,
+                Some(_) => stack.push(path),
+            }
+        }
+    }
+    dirs.sort();
+    dirs
+}
+
+/// Register a NonRecursive watch for a newly-created directory `new_dir` and all
+/// of its non-ignored descendants (a `mkdir -p a/b/c` surfaces one create event,
+/// so the subtree must be re-walked). Reuses `collect_watch_dirs`' pruning rules
+/// via the SAME policy, and silently tolerates a poisoned lock, a stopped watcher
+/// (`None`), or a per-dir watch error — a best-effort top-up that must never panic
+/// the event loop.
+fn register_new_dirs(watcher: &SharedWatcher, policy: &WatchPolicy, new_dir: &Path) {
+    let Ok(mut guard) = watcher.lock() else {
+        return;
+    };
+    let Some(watcher) = guard.as_mut() else {
+        return;
+    };
+    for dir in collect_watch_dirs(new_dir, policy) {
+        let _ = watcher.watch(&dir, RecursiveMode::NonRecursive);
     }
 }
 
@@ -151,7 +237,7 @@ pub struct PendingFile {
 pub struct ProjectWatcher {
     tx: Sender<LoopMessage>,
     thread: Option<JoinHandle<()>>,
-    watcher: Option<RecommendedWatcher>,
+    watcher: SharedWatcher,
     degraded: Arc<DegradedState>,
 }
 
@@ -179,27 +265,12 @@ impl ProjectWatcher {
         });
         let (tx, rx) = mpsc::channel();
         let degraded = Arc::new(DegradedState::default());
-        let loop_policy = policy.clone();
-        let on_sync_complete = options.on_sync_complete.clone();
-        let on_degraded = options.on_degraded.clone();
-        let on_sync_error = options.on_sync_error.clone();
-        let debounce = options.debounce;
-        let loop_degraded = Arc::clone(&degraded);
-        let thread = thread::spawn(move || {
-            event_loop(EventLoopCtx {
-                rx,
-                policy: loop_policy,
-                debounce,
-                sync_fn,
-                on_sync_complete,
-                on_degraded,
-                on_sync_error,
-                degraded: loop_degraded,
-            });
-        });
 
-        let watcher = if options.inert_for_tests {
-            None
+        // Build the OS watcher and register the pruned watch set BEFORE spawning
+        // the loop, so its create-event handler can share the same watcher to add
+        // watches for newly-created directories (Linux NonRecursive — see below).
+        let watcher: SharedWatcher = if options.inert_for_tests {
+            Arc::new(Mutex::new(None))
         } else {
             let callback_tx = tx.clone();
             let mut watcher =
@@ -211,32 +282,86 @@ impl ProjectWatcher {
                         let _ = callback_tx.send(LoopMessage::WatchError(err));
                     }
                 })?;
-            // Unlike the upstream platform split (`watcher.ts:283-384`), notify v6
-            // owns the OS-specific recursion strategy behind this recursive watch.
-            match watcher.watch(&project_root, RecursiveMode::Recursive) {
-                Ok(()) => Some(watcher),
-                Err(err) => match classify_notify_error(&err) {
-                    WatchErrorClass::Degrade => {
-                        let reason = format!("watch {} failed: {err}", project_root.display());
-                        degraded.mark(reason.clone());
-                        if let Some(cb) = &options.on_degraded {
-                            cb(reason);
+            // Register a NON-recursive watch per surviving directory instead of one
+            // blanket `RecursiveMode::Recursive` on the root. On Linux that recursive
+            // mode makes notify register an inotify watch for EVERY subdirectory —
+            // including node_modules/.venv/__pycache__/site-packages/.godot — which
+            // exhausts the kernel `max_user_watches` limit and stalls startup on a
+            // large root. `collect_watch_dirs` prunes ignored subtrees up front, so
+            // we only watch source dirs.
+            //
+            // Platform note: notify v6 honors `NonRecursive` on Linux (inotify, one
+            // watch per dir, exactly what we want). On macOS (FSEvents) and Windows
+            // (ReadDirectoryChangesW) the backend is natively recursive; using
+            // `NonRecursive` there yields per-dir watches that still cover the pruned
+            // set, and any event from an ignored subtree (had we over-watched) is
+            // dropped by the `WatchPolicy` filter in the event loop. So this single
+            // strategy is correct on Linux (the platform with the bug) and safe
+            // elsewhere, with no `#[cfg]` split needed.
+            let dirs = collect_watch_dirs(&project_root, &policy);
+            let mut watch_err: Option<notify::Error> = None;
+            for dir in &dirs {
+                if let Err(err) = watcher.watch(dir, RecursiveMode::NonRecursive) {
+                    let is_root = dir == &project_root;
+                    match classify_notify_error(&err) {
+                        // fd/file-table exhaustion can never recover: degrade once.
+                        // A failure on the root is fatal to coverage; on a subdir we
+                        // still degrade (the watch is incomplete and won't recover).
+                        WatchErrorClass::Degrade => {
+                            let reason = format!("watch {} failed: {err}", dir.display());
+                            if !degraded.is_degraded() {
+                                degraded.mark(reason.clone());
+                                if let Some(cb) = &options.on_degraded {
+                                    cb(reason);
+                                }
+                            }
                         }
-                        None
-                    }
-                    WatchErrorClass::Warn => {
-                        if let Some(cb) = &options.on_sync_error {
-                            cb(format!("watch {} warning: {err}", project_root.display()));
+                        // inotify watch-count exhaustion: a soft, user-raisable limit.
+                        // Warn and keep the watches we did manage to register.
+                        WatchErrorClass::Warn => {
+                            if let Some(cb) = &options.on_sync_error {
+                                cb(format!("watch {} warning: {err}", dir.display()));
+                            }
                         }
-                        Some(watcher)
+                        // A non-recoverable error on the ROOT means we have no watch at
+                        // all: surface it. On a subdir, remember the first one but keep
+                        // going so a single bad dir doesn't sink the whole watcher.
+                        WatchErrorClass::Other => {
+                            if is_root {
+                                return Err(anyhow::Error::new(err)
+                                    .context(format!("watch {}", dir.display())));
+                            }
+                            watch_err.get_or_insert(err);
+                        }
                     }
-                    WatchErrorClass::Other => {
-                        return Err(anyhow::Error::new(err)
-                            .context(format!("watch {}", project_root.display())));
-                    }
-                },
+                }
             }
+            if let (Some(err), Some(cb)) = (&watch_err, &options.on_sync_error) {
+                cb(format!("watch (partial) warning: {err}"));
+            }
+            Arc::new(Mutex::new(Some(watcher)))
         };
+
+        let loop_policy = policy.clone();
+        let on_sync_complete = options.on_sync_complete.clone();
+        let on_degraded = options.on_degraded.clone();
+        let on_sync_error = options.on_sync_error.clone();
+        let debounce = options.debounce;
+        let loop_degraded = Arc::clone(&degraded);
+        let loop_watcher = Arc::clone(&watcher);
+        let thread = thread::spawn(move || {
+            event_loop(EventLoopCtx {
+                rx,
+                policy: loop_policy,
+                debounce,
+                sync_fn,
+                on_sync_complete,
+                on_degraded,
+                on_sync_error,
+                degraded: loop_degraded,
+                watcher: loop_watcher,
+            });
+        });
 
         Ok(Some(Self {
             tx,
@@ -269,7 +394,9 @@ impl ProjectWatcher {
     }
 
     fn stop_inner(&mut self) {
-        let _ = self.watcher.take();
+        if let Ok(mut guard) = self.watcher.lock() {
+            let _ = guard.take();
+        }
         let _ = self.tx.send(LoopMessage::Stop);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -305,6 +432,7 @@ struct EventLoopCtx {
     on_degraded: Option<NoticeCallback>,
     on_sync_error: Option<NoticeCallback>,
     degraded: Arc<DegradedState>,
+    watcher: SharedWatcher,
 }
 
 fn event_loop(ctx: EventLoopCtx) {
@@ -317,6 +445,7 @@ fn event_loop(ctx: EventLoopCtx) {
         on_degraded,
         on_sync_error,
         degraded,
+        watcher,
     } = ctx;
     let mut pending = BTreeMap::<String, PendingInfo>::new();
     let mut deadline = None::<Instant>;
@@ -337,6 +466,14 @@ fn event_loop(ctx: EventLoopCtx) {
             Some(LoopMessage::Event(paths)) => {
                 for path in paths {
                     if let Some(relative) = policy.normalize_relative(&path) {
+                        // A brand-new non-ignored directory holds no inotify watch
+                        // yet (Linux watches are per-dir NonRecursive — see
+                        // `collect_watch_dirs`). Register it (and any non-ignored
+                        // descendants created in the same burst, e.g. `mkdir -p`) so
+                        // edits inside it are seen without a server restart.
+                        if path.is_dir() && policy.should_watch_dir(&relative) {
+                            register_new_dirs(&watcher, &policy, &path);
+                        }
                         if policy.should_handle_file(&relative)
                             || (policy.allows_file_path(&relative)
                                 && maybe_deleted_source(&relative))
@@ -747,6 +884,224 @@ mod tests {
         assert!(
             !maybe_deleted_source("README.md"),
             "md is not a builtin source language"
+        );
+    }
+
+    #[test]
+    fn collect_watch_dirs_prunes_ignored_subtrees() {
+        let dir = crate::sync::tests::TestDir::new("watch-collect-dirs");
+        let root = dir.path();
+        // A realistic tree: source dirs to keep, and one TOP-LEVEL dir per ignore
+        // family the WatchPolicy recognizes (node_modules / .venv / __pycache__ /
+        // .git / .codegraph), each with a descendant that must also be excluded.
+        // The policy's ignore rules anchor at the relative-path root, so a
+        // top-level ignored dir prunes its whole subtree — that is exactly the
+        // existing semantics we must honor (not extend) at watch-registration time.
+        for keep in ["src", "src/inner", "lib"] {
+            fs::create_dir_all(root.join(keep)).unwrap();
+        }
+        for ignored in [
+            "node_modules/pkg",
+            ".venv/lib/site-packages",
+            "__pycache__/sub",
+            ".git/objects",
+            ".codegraph/cache",
+        ] {
+            fs::create_dir_all(root.join(ignored)).unwrap();
+        }
+
+        let policy = WatchPolicy::new(root);
+        let dirs = collect_watch_dirs(root, &policy);
+
+        let rels = |dirs: &[PathBuf]| -> Vec<String> {
+            dirs.iter()
+                .map(|d| {
+                    d.strip_prefix(root)
+                        .map(normalize_relative_for_test)
+                        .unwrap_or_default()
+                })
+                .collect()
+        };
+        let got = rels(&dirs);
+
+        // Root and every real source dir are watched.
+        assert!(dirs.iter().any(|d| d == root), "root must be watched");
+        for keep in ["src", "src/inner", "lib"] {
+            assert!(got.contains(&keep.to_string()), "missing source dir {keep}");
+        }
+        // No ignored dir OR descendant survives — the walk never descended.
+        for bad in [
+            "node_modules",
+            "node_modules/pkg",
+            ".venv",
+            ".venv/lib",
+            ".venv/lib/site-packages",
+            "__pycache__",
+            "__pycache__/sub",
+            ".git",
+            ".git/objects",
+            ".codegraph",
+            ".codegraph/cache",
+        ] {
+            assert!(
+                !got.contains(&bad.to_string()),
+                "ignored subtree {bad} must be pruned, got {got:?}"
+            );
+        }
+        // Deterministic: output is sorted.
+        let mut sorted = dirs.clone();
+        sorted.sort();
+        assert_eq!(dirs, sorted, "collect_watch_dirs must be sorted");
+    }
+
+    fn normalize_relative_for_test(relative: &Path) -> String {
+        relative.to_string_lossy().replace('\\', "/")
+    }
+
+    #[test]
+    fn collect_watch_dirs_honors_gitignore_pruning() {
+        // `.godot/` is not in DEFAULT_IGNORE_DIRS, but a real Godot project lists
+        // it in .gitignore, which WatchPolicy::new merges. This proves the watch
+        // set is pruned by the SAME merged policy (not a second hardcoded list),
+        // so project-specific ignores keep us out of generated trees too.
+        let dir = crate::sync::tests::TestDir::new("watch-collect-gitignore");
+        let root = dir.path();
+        fs::write(root.join(".gitignore"), ".godot/\n").unwrap();
+        fs::create_dir_all(root.join("scenes")).unwrap();
+        fs::create_dir_all(root.join(".godot/imported")).unwrap();
+
+        let policy = WatchPolicy::new(root);
+        let dirs = collect_watch_dirs(root, &policy);
+        let got: Vec<String> = dirs
+            .iter()
+            .filter_map(|d| d.strip_prefix(root).ok().map(normalize_relative_for_test))
+            .collect();
+
+        assert!(got.contains(&"scenes".to_string()), "source dir kept");
+        assert!(
+            !got.iter().any(|p| p.starts_with(".godot")),
+            ".godot subtree must be pruned via .gitignore, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn editing_a_real_source_file_still_triggers_sync() {
+        // End-to-end with a REAL notify watcher (inert_for_tests = false), proving
+        // the per-dir NonRecursive registration still delivers source edits to the
+        // sync pipeline. `sync_fn` is injected so no real index is needed.
+        let dir = crate::sync::tests::TestDir::new("watch-real-sync");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("src/app.ts"),
+            "export function one() { return 1; }\n",
+        )
+        .unwrap();
+
+        let synced = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let recorder = Arc::clone(&synced);
+        let sync_fn: SyncFn = Arc::new(move |paths| {
+            recorder.lock().unwrap().push(paths.clone());
+            Ok(SyncOutcome {
+                files_checked: paths.len(),
+                files_reindexed: paths.len(),
+                ..Default::default()
+            })
+        });
+
+        let watcher = ProjectWatcher::start(
+            dir.path(),
+            WatchOptions {
+                debounce: Duration::from_millis(50),
+                sync_fn: Some(sync_fn),
+                ..WatchOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        // Give the OS watch registration a moment, then edit the source file.
+        std::thread::sleep(Duration::from_millis(150));
+        fs::write(
+            dir.path().join("src/app.ts"),
+            "export function two() { return 2; }\n",
+        )
+        .unwrap();
+
+        // Poll for the sync to land (debounce + OS delivery latency).
+        let mut seen = false;
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(50));
+            if synced
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|paths| paths.iter().any(|p| p == "src/app.ts"))
+            {
+                seen = true;
+                break;
+            }
+        }
+        watcher.stop();
+        assert!(
+            seen,
+            "editing src/app.ts should trigger a sync of that path"
+        );
+    }
+
+    #[test]
+    fn newly_created_source_dir_is_watched_after_start() {
+        // A directory created AFTER start must be picked up (Linux NonRecursive:
+        // the event loop registers a watch on the create event) so edits inside
+        // it sync without a server restart.
+        let dir = crate::sync::tests::TestDir::new("watch-new-dir");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+
+        let synced = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let recorder = Arc::clone(&synced);
+        let sync_fn: SyncFn = Arc::new(move |paths| {
+            recorder.lock().unwrap().push(paths.clone());
+            Ok(SyncOutcome {
+                files_checked: paths.len(),
+                files_reindexed: paths.len(),
+                ..Default::default()
+            })
+        });
+
+        let watcher = ProjectWatcher::start(
+            dir.path(),
+            WatchOptions {
+                debounce: Duration::from_millis(50),
+                sync_fn: Some(sync_fn),
+                ..WatchOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        std::thread::sleep(Duration::from_millis(150));
+        // Create a brand-new dir, let the create event register its watch, then
+        // edit a file inside it.
+        fs::create_dir_all(dir.path().join("feature")).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        fs::write(dir.path().join("feature/mod.ts"), "export const x = 1;\n").unwrap();
+
+        let mut seen = false;
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(50));
+            if synced
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|paths| paths.iter().any(|p| p == "feature/mod.ts"))
+            {
+                seen = true;
+                break;
+            }
+        }
+        watcher.stop();
+        assert!(
+            seen,
+            "editing a file in a dir created after start should trigger a sync"
         );
     }
 }
