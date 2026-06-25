@@ -139,6 +139,54 @@ pub(crate) fn parse_project_godot(
     FrameworkResolverExtractionResult { nodes, references }
 }
 
+/// Map each `[autoload]` singleton NAME to its repo-relative backing script
+/// path, for L7's cross-file binding confirmation.
+///
+/// Reuses the exact `[autoload]` line scan + [`map_res_path`] rule
+/// [`parse_project_godot`] uses, but yields only `(name, path)` pairs (no nodes
+/// / no clock), so it is pure and deterministic. An entry whose value is not a
+/// `res://` path is skipped. First-write-wins on a duplicate name.
+pub(crate) fn autoload_script_paths(content: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut section: Option<Section> = None;
+    let mut brace_depth: i32 = 0;
+
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if brace_depth > 0 {
+            brace_depth += brace_delta(raw_line);
+            continue;
+        }
+        if line.is_empty() || is_comment(line) {
+            continue;
+        }
+        if let Some(name) = parse_section_header(line) {
+            section = Section::from_name(name);
+            continue;
+        }
+        let Some(section) = section else {
+            continue;
+        };
+        let Some((key, value)) = split_key_value(line) else {
+            continue;
+        };
+        match section {
+            Section::Autoload => {
+                if !key.is_empty() {
+                    if let Some(path) = map_res_path(value) {
+                        if !out.iter().any(|(n, _)| n == key) {
+                            out.push((key.to_string(), path));
+                        }
+                    }
+                }
+            }
+            Section::Input => brace_depth += brace_delta(raw_line),
+            _ => {}
+        }
+    }
+    out
+}
+
 /// The sections L1 understands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Section {

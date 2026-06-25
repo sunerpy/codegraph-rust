@@ -167,6 +167,104 @@ pub(crate) fn parse_gdscript_dynamics(
     }
 }
 
+/// Parse a `.gd` GDScript file into AUTOLOAD-CANDIDATE references (the T7
+/// deferred-from-L3 work).
+///
+/// Emits a `Receiver.member` reference ([`EdgeKind::Calls`]) for every
+/// `Uppercase.member` access whose receiver is a bare uppercase-initial
+/// identifier (`BuffManager.apply`, `GameState.score`). This is the
+/// over-emitting half: it deliberately does NOT know which receivers are real
+/// autoloads (that roster lives in `project.godot`, unavailable per-file). The
+/// roster gate is [`crate::frameworks::godot::GodotResolver::resolve`], which
+/// binds ONLY receivers matching a known autoload singleton and returns `None`
+/// for everything else (`Vector2.ZERO`, `Input.is_action_pressed`, class
+/// constructors). A non-autoload candidate therefore stays unresolved and
+/// produces NO edge — zero false positives by construction.
+///
+/// Kept SEPARATE from [`parse_gdscript_dynamics`] so the L3 dynamic-dispatch
+/// output is byte-unchanged; [`crate::frameworks::godot::GodotResolver::extract`]
+/// merges both reference sets for a `.gd` file. Emits NO nodes. Attributes each
+/// reference to the enclosing `func` (or the file node), exactly like L3.
+pub(crate) fn parse_autoload_candidates(
+    file_path: &str,
+    content: &str,
+) -> FrameworkResolverExtractionResult {
+    let mut references: Vec<RefView> = Vec::new();
+    let mut current_fn: Option<String> = None;
+    let file_node_id = format!("file:{file_path}");
+
+    for (idx, raw_line) in content.lines().enumerate() {
+        let line_no = (idx + 1) as i64;
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(fn_name) = parse_func_header(line) {
+            current_fn = Some(generate_node_id(
+                file_path,
+                NodeKind::Function,
+                fn_name,
+                line_no as u32,
+            ));
+            continue;
+        }
+        let from = current_fn.clone().unwrap_or_else(|| file_node_id.clone());
+        scan_autoload_candidates(file_path, line_no, line, &from, &mut references);
+    }
+
+    FrameworkResolverExtractionResult {
+        nodes: Vec::new(),
+        references,
+    }
+}
+
+/// Scan one line for `Uppercase.member` accesses and push a `Receiver.member`
+/// candidate reference per access. Only an uppercase-initial receiver at an
+/// identifier boundary qualifies (a lowercase `local.method` is an instance
+/// call, never an autoload). A receiver preceded by `.` (a chained
+/// `a.B.c`) is skipped — only the leftmost receiver in a chain can be an
+/// autoload singleton.
+fn scan_autoload_candidates(
+    file_path: &str,
+    line_no: i64,
+    line: &str,
+    from: &str,
+    out: &mut Vec<RefView>,
+) {
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if !(b.is_ascii_uppercase()) {
+            i += 1;
+            continue;
+        }
+        if i > 0 && (is_ident_byte(bytes[i - 1]) || bytes[i - 1] == b'.') {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut j = i + 1;
+        while j < bytes.len() && is_ident_byte(bytes[j]) {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b'.' {
+            i = j.max(start + 1);
+            continue;
+        }
+        let member_start = j + 1;
+        let mut k = member_start;
+        while k < bytes.len() && is_ident_byte(bytes[k]) {
+            k += 1;
+        }
+        if k > member_start {
+            let name = &line[start..k];
+            out.push(reference(from, name, EdgeKind::Calls, line_no, file_path));
+        }
+        i = k.max(start + 1);
+    }
+}
+
 /// Scan a single (already function-attributed) line for every dynamic call-site
 /// pattern and push the resulting references. A line may carry more than one
 /// pattern (e.g. `$Sprite` and `.connect(...)`), so each scanner runs
