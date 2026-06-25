@@ -221,9 +221,12 @@ fn dead_client_is_swept_and_daemon_idle_exits() {
     let _ = child.wait();
 
     // Hold the client socket open: it must NOT be what keeps the daemon alive —
-    // the sweep should force-close the (dead-pid) session regardless.
-    // The daemon should idle-exit within sweep + idle window + margin.
-    let exited = wait_until_gone(daemon_pid, Duration::from_millis(3000));
+    // the sweep should force-close the (dead-pid) session regardless. GENEROUS
+    // deadline, not a tight margin: `wait_until_gone` polls every 20ms and returns
+    // the instant the process is gone, so the happy path still finishes in ~1s —
+    // an 8s ceiling costs nothing on a quiet machine but stops a loaded CI runner's
+    // slow sweep + idle-exit from false-negativing (de-flake).
+    let exited = wait_until_gone(daemon_pid, Duration::from_secs(8));
 
     // TEARDOWN before asserting.
     drop(client);

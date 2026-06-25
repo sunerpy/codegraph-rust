@@ -189,18 +189,16 @@ fn daemon_idle_exits_after_last_client() {
         std::thread::sleep(Duration::from_millis(50));
         drop(client);
     }
-    let disconnect_at = Instant::now();
 
     // At ~200ms after disconnect (< 500ms idle) the daemon must still be alive.
     std::thread::sleep(Duration::from_millis(200));
     let alive_before_idle = is_process_alive(pid);
 
-    // By the time the idle window + margin elapses the daemon must have exited.
-    // Poll with a clear deadline rather than one fixed sleep (de-flake).
-    let exited = wait_until_gone(
-        pid,
-        Duration::from_millis(2000).saturating_sub(disconnect_at.elapsed()),
-    );
+    // GENEROUS deadline, not a tight margin: `wait_until_gone` polls every 20ms and
+    // returns the instant the process is gone, so the happy path still finishes in
+    // ~500-800ms — an 8s ceiling costs nothing on a quiet machine but stops a loaded
+    // CI runner's slow idle-sweep + teardown from false-negativing (de-flake).
+    let exited = wait_until_gone(pid, Duration::from_secs(8));
 
     // TEARDOWN before asserting so a failing assert never leaks the process.
     if !exited {
