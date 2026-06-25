@@ -42,6 +42,7 @@ use codegraph_core::types::{Language, Node};
 use super::godot_project;
 use super::godot_resource;
 use super::godot_scene;
+use super::godot_script;
 use crate::framework::FrameworkResolver;
 use crate::types::{FrameworkResolverExtractionResult, RefView, ResolutionContext, ResolvedRef};
 
@@ -110,7 +111,16 @@ impl FrameworkResolver for GodotResolver {
     /// resource→script / resource→resource references resolved through the same
     /// `[ext_resource]` id-table mechanics as L2).
     ///
-    /// Every other file (`.gd`, etc.) returns `None`, which the pipeline
+    /// L3 (T6): when the file's basename ends in `.gd`, delegate to
+    /// [`godot_script::parse_gdscript_dynamics`] (dynamic GDScript call-sites:
+    /// `connect`/`emit_signal`/`get_node`/`$`/`%`/group queries/`has_method`/
+    /// `call` → references to the literal target NAME, or a dynamic-unresolved
+    /// sentinel reference when the target is a computed/non-literal expression).
+    /// This is ADDITIVE and gated behind [`Self::detect`] (a `project.godot`
+    /// must exist), so a plain non-Godot `.gd` repo never reaches here and the
+    /// golden-protected base GDScript symbol extraction is untouched.
+    ///
+    /// Every other file returns `None`, which the pipeline
     /// (`extract_and_persist_frameworks`) treats as "this resolver has nothing
     /// for this file".
     fn extract(&self, file_path: &str, content: &str) -> Option<FrameworkResolverExtractionResult> {
@@ -122,6 +132,9 @@ impl FrameworkResolver for GodotResolver {
         }
         if godot_resource::is_tres(file_path) {
             return Some(godot_resource::parse_tres(file_path, content));
+        }
+        if godot_script::is_gdscript(file_path) {
+            return Some(godot_script::parse_gdscript_dynamics(file_path, content));
         }
         None
     }

@@ -242,10 +242,10 @@ fn extract_routes_tres_to_t5_and_others_correctly() {
         .extract("a/b/c/Deep.tres", "[gd_resource format=3]\n")
         .is_some());
 
-    // A .gd file is not this layer's job — None.
+    // A .gd file now routes to T6's GDScript dynamic parser (Some).
     assert!(GodotResolver
         .extract("player.gd", "extends Node\n")
-        .is_none());
+        .is_some());
     // A .tscn routes to T4 (Some, via the scene parser, not this one).
     assert!(GodotResolver
         .extract("scenes/Main.tscn", "[gd_scene format=3]\n")

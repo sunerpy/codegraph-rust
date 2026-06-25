@@ -15,6 +15,7 @@ pub(crate) mod godot_common;
 pub(crate) mod godot_project;
 pub(crate) mod godot_resource;
 pub(crate) mod godot_scene;
+pub mod godot_script;
 pub mod nestjs;
 pub mod react;
 pub mod vue;
