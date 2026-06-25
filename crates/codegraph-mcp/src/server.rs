@@ -260,7 +260,10 @@ impl McpServer {
     fn dispatch(&mut self, req: &JsonRpcRequest) -> Dispatch {
         let is_request = req.id.is_some();
         match req.method.as_str() {
-            "initialize" if is_request => Dispatch::Reply(initialize_result()),
+            "initialize" if is_request => {
+                self.adopt_workspace_from_initialize(req.params.as_ref());
+                Dispatch::Reply(initialize_result())
+            }
             "initialized" => Dispatch::Notification,
             "notifications/initialized" => Dispatch::Notification,
             "tools/list" if is_request => Dispatch::Reply(json!({
@@ -392,6 +395,117 @@ impl McpServer {
             cached.engine = None;
         }
     }
+
+    /// Adopt a workspace root advertised in the `initialize` params as the
+    /// default project, so a single global MCP config (one `serve --mcp` with no
+    /// --path) serves the client's ACTUAL workspace rather than its launch CWD.
+    /// Liberal in what it accepts: LSP-style `rootUri` (a `file://` URI),
+    /// `rootPath` (a bare path), or `workspaceFolders[0].uri`. Clients that send
+    /// none keep current behavior. Adoption only happens when the current
+    /// default is absent or is itself the home directory (the symptom this
+    /// fixes), and the hinted root is indexed (`.codegraph/codegraph.db`), so a
+    /// bogus hint never displaces an explicit `--path` default.
+    fn adopt_workspace_from_initialize(&mut self, params: Option<&Value>) {
+        let Some(params) = params else { return };
+        let path = params
+            .get("rootUri")
+            .and_then(Value::as_str)
+            .and_then(file_uri_to_path)
+            .or_else(|| {
+                params
+                    .get("rootPath")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from)
+            })
+            .or_else(|| {
+                params
+                    .get("workspaceFolders")
+                    .and_then(Value::as_array)
+                    .and_then(|folders| folders.first())
+                    .and_then(|folder| folder.get("uri"))
+                    .and_then(Value::as_str)
+                    .and_then(file_uri_to_path)
+            });
+        let Some(path) = path else { return };
+        if self.default_project.as_ref() == Some(&path) {
+            return;
+        }
+        if !self.default_is_absent_or_home() {
+            return;
+        }
+        if db_path_for(&path).is_file() {
+            self.default_project = Some(path);
+        }
+    }
+
+    /// Whether the current default project is unset or resolves to the user's
+    /// home directory — the only states in which an `initialize` root may
+    /// override it. An explicit `--path` to a real project is preserved.
+    fn default_is_absent_or_home(&self) -> bool {
+        let Some(current) = &self.default_project else {
+            return true;
+        };
+        let Some(home) = home_dir() else {
+            return false;
+        };
+        canonicalize_lenient(current) == canonicalize_lenient(&home)
+    }
+
+    /// Test/diagnostic only: the currently adopted default project path.
+    #[doc(hidden)]
+    pub fn default_project(&self) -> Option<&std::path::Path> {
+        self.default_project.as_deref()
+    }
+}
+
+/// Decode a `file://` URI to a local path, or `None` for any other scheme.
+/// Handles the `file://host/path` and `file:///path` forms and percent-decodes
+/// `%XX` octets (clients encode spaces as `%20`, etc.).
+fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    let path_part = rest.find('/').map(|idx| &rest[idx..]).unwrap_or(rest);
+    let decoded = percent_decode(path_part);
+    if decoded.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(decoded))
+}
+
+fn home_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("USERPROFILE").map(PathBuf::from)
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME").map(PathBuf::from)
+    }
+}
+
+fn canonicalize_lenient(path: &std::path::Path) -> PathBuf {
+    path.canonicalize()
+        .unwrap_or_else(|_| path.components().collect::<PathBuf>())
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 enum Dispatch {
@@ -408,4 +522,141 @@ pub fn initialize_result() -> Value {
         "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION },
         "instructions": SERVER_INSTRUCTIONS,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    struct TempProject {
+        path: PathBuf,
+    }
+
+    impl Drop for TempProject {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    impl TempProject {
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    fn indexed_project(tag: &str) -> TempProject {
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("cg-mcp-init-{tag}-{}-{seq}", std::process::id()));
+        let db = db_path_for(&path);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::fs::write(&db, b"placeholder").unwrap();
+        TempProject { path }
+    }
+
+    fn run_initialize(server: &mut McpServer, params: Value) {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": params,
+        });
+        let line = format!("{request}\n");
+        let mut out = Vec::new();
+        server
+            .run(Cursor::new(line.into_bytes()), Cursor::new(&mut out))
+            .unwrap();
+    }
+
+    #[test]
+    fn initialize_root_uri_adopts_indexed_workspace() {
+        let project = indexed_project("rooturi");
+        let uri = format!("file://{}", project.path().display());
+        let mut server = McpServer::new(None);
+        run_initialize(&mut server, json!({ "rootUri": uri }));
+        assert_eq!(server.default_project(), Some(project.path()));
+    }
+
+    #[test]
+    fn initialize_workspace_folders_adopts_indexed_workspace() {
+        let project = indexed_project("wsfolders");
+        let uri = format!("file://{}", project.path().display());
+        let mut server = McpServer::new(None);
+        run_initialize(
+            &mut server,
+            json!({ "workspaceFolders": [{ "uri": uri, "name": "proj" }] }),
+        );
+        assert_eq!(server.default_project(), Some(project.path()));
+    }
+
+    #[test]
+    fn initialize_root_path_adopts_indexed_workspace() {
+        let project = indexed_project("rootpath");
+        let mut server = McpServer::new(None);
+        run_initialize(
+            &mut server,
+            json!({ "rootPath": project.path().to_string_lossy() }),
+        );
+        assert_eq!(server.default_project(), Some(project.path()));
+    }
+
+    #[test]
+    fn initialize_does_not_override_explicit_non_home_default() {
+        let explicit = indexed_project("explicit");
+        let hinted = indexed_project("hinted");
+        let uri = format!("file://{}", hinted.path().display());
+        let mut server = McpServer::new(Some(explicit.path().to_path_buf()));
+        run_initialize(&mut server, json!({ "rootUri": uri }));
+        assert_eq!(
+            server.default_project(),
+            Some(explicit.path()),
+            "an explicit --path default must not be displaced by an initialize hint"
+        );
+    }
+
+    #[test]
+    fn initialize_unindexed_workspace_does_not_displace_default() {
+        let unindexed = std::env::temp_dir().join("cg-mcp-init-unindexed-never");
+        let uri = format!("file://{}", unindexed.display());
+        let mut server = McpServer::new(None);
+        run_initialize(&mut server, json!({ "rootUri": uri }));
+        assert_eq!(server.default_project(), None);
+    }
+
+    #[test]
+    fn initialize_without_workspace_hint_keeps_default() {
+        let mut server = McpServer::new(None);
+        run_initialize(&mut server, json!({ "capabilities": {} }));
+        assert_eq!(server.default_project(), None);
+    }
+
+    #[test]
+    fn initialize_with_no_params_returns_standard_result_without_panic() {
+        let request = json!({ "jsonrpc": "2.0", "id": 7, "method": "initialize" });
+        let line = format!("{request}\n");
+        let mut out = Vec::new();
+        let mut server = McpServer::new(None);
+        server
+            .run(Cursor::new(line.into_bytes()), Cursor::new(&mut out))
+            .unwrap();
+        let response: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(response["id"], json!(7));
+        assert_eq!(response["result"]["serverInfo"]["name"], json!(SERVER_NAME));
+        assert_eq!(server.default_project(), None);
+    }
+
+    #[test]
+    fn file_uri_decodes_percent_escapes() {
+        let decoded = file_uri_to_path("file:///tmp/my%20project").unwrap();
+        assert_eq!(decoded, PathBuf::from("/tmp/my project"));
+    }
+
+    #[test]
+    fn non_file_scheme_is_rejected() {
+        assert_eq!(file_uri_to_path("https://example.com/x"), None);
+    }
 }

@@ -1077,6 +1077,13 @@ fn cmd_serve(path: Option<PathBuf>, mcp: bool, no_watch: bool) -> Result<()> {
 }
 
 fn serve_direct(project: Option<PathBuf>, project_root: &Path, no_watch: bool) -> Result<()> {
+    // Watcher startup stays here (pre-handshake). Layer A
+    // (`watch_disabled_reason`) already refuses to walk HOME / the filesystem
+    // root, so a home-rooted launch never exhausts inotify. Restarting the
+    // watcher against a project root adopted later from the `initialize` roots
+    // (Layer B) would require McpServer to own the watcher lifecycle across
+    // crates; it is deferred — the adopted root still serves tools and is
+    // reconciled by the background catch-up sync, just without a live watch.
     let _watcher = start_direct_watcher(project_root, no_watch);
     // Background catch-up of edits made while the server was down (#905). It runs
     // on a detached worker thread; `server.run` proceeds immediately so the FIRST

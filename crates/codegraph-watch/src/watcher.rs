@@ -959,6 +959,57 @@ mod tests {
     }
 
     #[test]
+    fn collect_watch_dirs_prunes_nested_ignored_subtrees() {
+        let dir = crate::sync::tests::TestDir::new("watch-collect-nested");
+        let root = dir.path();
+        // A project nested 3+ levels under root, with a `.pnpm`-style nested
+        // node_modules tree. The whole nested ignore subtree (and its
+        // descendants) must be pruned while real source dirs are kept.
+        for keep in [
+            "workspace/team/app/src",
+            "workspace/team/app/src/components",
+            "workspace/team/lib",
+        ] {
+            fs::create_dir_all(root.join(keep)).unwrap();
+        }
+        for ignored in [
+            "workspace/team/app/node_modules/pkg",
+            "workspace/team/app/node_modules/.pnpm/vue-demi@1/node_modules/vue-demi/bin",
+            "workspace/team/app/src/.venv/lib",
+        ] {
+            fs::create_dir_all(root.join(ignored)).unwrap();
+        }
+
+        let policy = WatchPolicy::new(root);
+        let dirs = collect_watch_dirs(root, &policy);
+        let got: Vec<String> = dirs
+            .iter()
+            .filter_map(|d| d.strip_prefix(root).ok().map(normalize_relative_for_test))
+            .collect();
+
+        for keep in [
+            "workspace/team/app/src",
+            "workspace/team/app/src/components",
+            "workspace/team/lib",
+        ] {
+            assert!(got.contains(&keep.to_string()), "missing source dir {keep}");
+        }
+        for bad in [
+            "workspace/team/app/node_modules",
+            "workspace/team/app/node_modules/pkg",
+            "workspace/team/app/node_modules/.pnpm",
+            "workspace/team/app/src/.venv",
+            "workspace/team/app/src/.venv/lib",
+        ] {
+            assert!(
+                !got.iter()
+                    .any(|p| p == bad || p.starts_with(&format!("{bad}/"))),
+                "nested ignored subtree {bad} must be pruned, got {got:?}"
+            );
+        }
+    }
+
+    #[test]
     fn collect_watch_dirs_honors_gitignore_pruning() {
         // `.godot/` is not in DEFAULT_IGNORE_DIRS, but a real Godot project lists
         // it in .gitignore, which WatchPolicy::new merges. This proves the watch

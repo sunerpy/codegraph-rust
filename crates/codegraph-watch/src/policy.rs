@@ -165,6 +165,16 @@ pub fn watch_disabled_reason(project_root: impl AsRef<Path>, no_watch: bool) -> 
     if no_watch || std::env::var(CODEGRAPH_NO_WATCH).as_deref() == Ok("1") {
         return Some("CODEGRAPH_NO_WATCH=1 is set".to_string());
     }
+    // The home/too-broad-root guard sits BEFORE the FORCE_WATCH escape on
+    // purpose. A single global MCP config (e.g. Kiro) launches `serve --mcp`
+    // with no --path and the client's FIRST workspace root as CWD, which often
+    // resolves to HOME; a recursive watch there walks every nested project's
+    // node_modules/.venv and exhausts inotify. That is catastrophic regardless
+    // of intent, so FORCE_WATCH (a WSL `/mnt/` escape) must NOT re-enable it.
+    // Tool queries still serve off any existing index; only the watcher stops.
+    if let Some(reason) = home_or_too_broad_root_reason(project_root.as_ref()) {
+        return Some(reason);
+    }
     if std::env::var("CODEGRAPH_FORCE_WATCH").as_deref() == Ok("1") {
         return None;
     }
@@ -175,6 +185,57 @@ pub fn watch_disabled_reason(project_root: impl AsRef<Path>, no_watch: bool) -> 
         );
     }
     None
+}
+
+fn home_or_too_broad_root_reason(project_root: &Path) -> Option<String> {
+    let resolved = canonicalize_lenient(project_root);
+
+    if is_filesystem_root(&resolved) {
+        return Some(format!(
+            "refusing to watch the filesystem root ({}); launch with --path <project> or open the workspace as the working directory",
+            resolved.display()
+        ));
+    }
+
+    if let Some(home) = home_dir() {
+        if resolved == canonicalize_lenient(&home) {
+            return Some(format!(
+                "refusing to watch the home directory ({}); launch with --path <project> or open the workspace as the working directory",
+                resolved.display()
+            ));
+        }
+    }
+
+    None
+}
+
+fn canonicalize_lenient(path: &Path) -> PathBuf {
+    path.canonicalize()
+        .unwrap_or_else(|_| path.components().collect::<PathBuf>())
+}
+
+fn home_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("USERPROFILE").map(PathBuf::from)
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME").map(PathBuf::from)
+    }
+}
+
+fn is_filesystem_root(path: &Path) -> bool {
+    use std::path::Component;
+    let mut components = path.components();
+    match components.next() {
+        Some(Component::RootDir) => components.next().is_none(),
+        Some(Component::Prefix(_)) => {
+            matches!(components.next(), None | Some(Component::RootDir))
+                && components.next().is_none()
+        }
+        _ => false,
+    }
 }
 
 pub fn normalize_path(path: impl AsRef<Path>) -> String {
@@ -213,7 +274,16 @@ fn rule_matches(pattern: &str, relative: &str, is_dir: bool) -> bool {
     };
     let pattern = pattern.trim_start_matches('/');
     if let Some(dir) = pattern.strip_suffix('/') {
-        return candidate == format!("{dir}/") || candidate.starts_with(&format!("{dir}/"));
+        // gitignore semantics: a `dir/` rule matches that directory at ANY
+        // segment depth, not just the path root. Match on segment boundaries
+        // (`== "{dir}/"` whole, `"{dir}/"` prefix, `"/{dir}/"` interior) so a
+        // nested `.../node_modules/...` is pruned while a partial-segment name
+        // like `mynode_modules/` never matches the `node_modules/` rule.
+        let dir_slash = format!("{dir}/");
+        let nested = format!("/{dir}/");
+        return candidate == dir_slash
+            || candidate.starts_with(&dir_slash)
+            || candidate.contains(&nested);
     }
     if let Some((prefix, suffix)) = pattern.split_once('*') {
         let tail = relative.rsplit('/').next().unwrap_or(relative);
@@ -249,6 +319,108 @@ fn is_windows_drive_mount(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        home: Option<std::ffi::OsString>,
+        force: Option<std::ffi::OsString>,
+        no_watch: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn capture() -> Self {
+            Self {
+                home: std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }),
+                force: std::env::var_os("CODEGRAPH_FORCE_WATCH"),
+                no_watch: std::env::var_os(CODEGRAPH_NO_WATCH),
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+            restore(home_key, self.home.take());
+            restore("CODEGRAPH_FORCE_WATCH", self.force.take());
+            restore(CODEGRAPH_NO_WATCH, self.no_watch.take());
+        }
+    }
+
+    fn restore(key: &str, value: Option<std::ffi::OsString>) {
+        match value {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    #[test]
+    fn watch_disabled_when_root_is_home() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture();
+        let home = crate::sync::tests::TestDir::new("watch-policy-home");
+        std::env::set_var(
+            if cfg!(windows) { "USERPROFILE" } else { "HOME" },
+            home.path(),
+        );
+        std::env::remove_var("CODEGRAPH_FORCE_WATCH");
+        std::env::remove_var(CODEGRAPH_NO_WATCH);
+
+        let reason = watch_disabled_reason(home.path(), false);
+        assert!(reason.is_some(), "watching HOME must be disabled");
+        assert!(reason.unwrap().contains("home directory"));
+    }
+
+    #[test]
+    fn watch_disabled_for_home_even_with_force_watch() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture();
+        let home = crate::sync::tests::TestDir::new("watch-policy-home-force");
+        std::env::set_var(
+            if cfg!(windows) { "USERPROFILE" } else { "HOME" },
+            home.path(),
+        );
+        std::env::set_var("CODEGRAPH_FORCE_WATCH", "1");
+        std::env::remove_var(CODEGRAPH_NO_WATCH);
+
+        assert!(
+            watch_disabled_reason(home.path(), false).is_some(),
+            "CODEGRAPH_FORCE_WATCH must NOT re-enable a home walk"
+        );
+    }
+
+    #[test]
+    fn watch_disabled_when_root_is_filesystem_root() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture();
+        std::env::remove_var("CODEGRAPH_FORCE_WATCH");
+        std::env::remove_var(CODEGRAPH_NO_WATCH);
+
+        let reason = watch_disabled_reason(Path::new("/"), false);
+        assert!(reason.is_some(), "watching `/` must be disabled");
+        assert!(reason.unwrap().contains("filesystem root"));
+    }
+
+    #[test]
+    fn watch_allowed_for_normal_project_subdir() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture();
+        let home = crate::sync::tests::TestDir::new("watch-policy-subdir-home");
+        std::env::set_var(
+            if cfg!(windows) { "USERPROFILE" } else { "HOME" },
+            home.path(),
+        );
+        std::env::remove_var("CODEGRAPH_FORCE_WATCH");
+        std::env::remove_var(CODEGRAPH_NO_WATCH);
+
+        let project = home.path().join("workspace/proj");
+        fs::create_dir_all(&project).unwrap();
+        assert!(
+            watch_disabled_reason(&project, false).is_none(),
+            "a normal project subdir must be watchable"
+        );
+    }
 
     #[test]
     fn gitignore_negation_reincludes_default_ignored_dir() {
@@ -257,5 +429,56 @@ mod tests {
         let policy = WatchPolicy::new(dir.path());
         assert!(policy.should_handle_file("vendor/first_party.ts"));
         assert!(!policy.should_handle_file("node_modules/pkg/index.ts"));
+    }
+
+    #[test]
+    fn nested_ignore_dirs_are_pruned() {
+        let dir = crate::sync::tests::TestDir::new("watch-policy-nested");
+        let policy = WatchPolicy::new(dir.path());
+        assert!(!policy.should_watch_dir("workspace/app/node_modules"));
+        assert!(!policy.should_watch_dir("a/b/.venv"));
+        assert!(!policy.should_watch_dir("x/y/__pycache__"));
+        assert!(!policy.should_watch_dir("examples/demo/node_modules/.pnpm/vue-demi/node_modules"));
+        assert!(policy.should_watch_dir("src/components"));
+    }
+
+    #[test]
+    fn partial_segment_names_are_not_false_positives() {
+        let dir = crate::sync::tests::TestDir::new("watch-policy-partial");
+        let policy = WatchPolicy::new(dir.path());
+        assert!(policy.should_watch_dir("a/mynode_modules"));
+        assert!(policy.should_watch_dir("node_modules_old"));
+        assert!(policy.should_watch_dir("a/mynode_modules/b"));
+    }
+
+    #[test]
+    fn multi_segment_dir_rule_matches_on_boundaries() {
+        let dir = crate::sync::tests::TestDir::new("watch-policy-multiseg");
+        fs::write(dir.path().join(".gitignore"), "a/b/\n").unwrap();
+        let policy = WatchPolicy::new(dir.path());
+        assert!(!policy.should_watch_dir("a/b"));
+        assert!(!policy.should_watch_dir("x/a/b"));
+        assert!(!policy.should_watch_dir("a/b/c"));
+        assert!(policy.should_watch_dir("a/bb"));
+        assert!(policy.should_watch_dir("za/b"));
+    }
+
+    #[test]
+    fn watch_disabled_when_root_is_home_with_trailing_dot() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture();
+        let home = crate::sync::tests::TestDir::new("watch-policy-home-dot");
+        std::env::set_var(
+            if cfg!(windows) { "USERPROFILE" } else { "HOME" },
+            home.path(),
+        );
+        std::env::remove_var("CODEGRAPH_FORCE_WATCH");
+        std::env::remove_var(CODEGRAPH_NO_WATCH);
+
+        let with_dot = home.path().join(".");
+        assert!(
+            watch_disabled_reason(&with_dot, false).is_some(),
+            "`$HOME/.` must normalize to `$HOME` and be disabled"
+        );
     }
 }
