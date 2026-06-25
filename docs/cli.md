@@ -148,7 +148,9 @@ check to treat the file as locally modified (conservative).
 Detects your platform, downloads the matching
 `codegraph-<version>-<target>.<ext>` asset from the
 [Releases](https://github.com/sunerpy/codegraph-rust/releases) page, verifies it,
-and atomically replaces the current executable.
+and atomically replaces the current executable. A plain `self-update` resolves
+the latest release directly and upgrades in one run, regardless of how many
+versions behind you are.
 
 ```bash
 codegraph self-update              # update to the latest release
@@ -391,7 +393,17 @@ CODEGRAPH_NO_DAEMON=1 codegraph serve --mcp --path /path/to/project
 The daemon watches the project for file changes and re-indexes automatically.
 Changes are debounced before the re-index triggers. On WSL2, watching files under
 `/mnt/` is automatically disabled because recursive `fs.watch` is too slow on
-those paths; the reason is surfaced in the log. Two escape hatches:
+those paths; the reason is surfaced in the log.
+
+The watcher registers per-directory watches only on non-ignored directories,
+pruning `node_modules`, `.venv`, `__pycache__`, `target`, `dist`, `.godot`,
+`.cache`, `.git`, `.codegraph`, and everything else in the default ignore set,
+plus any paths matched by the root `.gitignore`. This keeps the total watch count
+well inside the OS inotify limit on large trees and makes daemon startup fast. A
+newly-created non-ignored directory is picked up automatically on its create
+event — no restart required.
+
+Two escape hatches:
 
 - `CODEGRAPH_FORCE_WATCH=1` — override the WSL2 `/mnt/` auto-disable. Does **not**
   override an explicit `CODEGRAPH_NO_WATCH=1`.
