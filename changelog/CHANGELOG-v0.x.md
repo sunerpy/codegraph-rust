@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.0](https://github.com/sunerpy/codegraph-rust/compare/v0.14.0...v0.15.0) (2026-06-25)
+
+
+### Features
+
+* **extract:** ignore Godot .godot/ and addons/ dirs by default ([#60](https://github.com/sunerpy/codegraph-rust/issues/60)) ([8a2dffa](https://github.com/sunerpy/codegraph-rust/commit/8a2dffa326645f82fc6c2a4b53f81267b4c67bee))
+
 ## [0.14.0](https://github.com/sunerpy/codegraph-rust/compare/v0.13.0...v0.14.0) (2026-06-25)
 
 
