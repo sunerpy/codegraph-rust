@@ -11,7 +11,10 @@
 //! the upstream runs them (`index.ts:695-701`).
 
 pub mod godot;
+pub(crate) mod godot_common;
 pub(crate) mod godot_project;
+pub(crate) mod godot_resource;
+pub(crate) mod godot_scene;
 pub mod nestjs;
 pub mod react;
 pub mod vue;

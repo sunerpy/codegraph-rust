@@ -205,12 +205,12 @@ jump={
 
 #[test]
 fn extract_returns_none_for_non_project_godot_file() {
-    // A .gd file (or anything not basenamed project.godot) is not this layer's
-    // job yet — extract() returns None so T4/T5 can add their branches.
+    // A .gd file is not this layer's job — extract() returns None.
     assert!(GodotResolver.extract("foo.gd", "extends Node\n").is_none());
+    // A .tres routes to T5's resource parser (Some, not this project parser).
     assert!(GodotResolver
-        .extract("scenes/Main.tscn", "[gd_scene]\n")
-        .is_none());
+        .extract("data/item.tres", "[gd_resource]\n")
+        .is_some());
     // A nested path whose basename IS project.godot still dispatches.
     assert!(GodotResolver
         .extract("sub/dir/project.godot", "[autoload]\nX=\"res://x.gd\"\n")
