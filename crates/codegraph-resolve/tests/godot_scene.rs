@@ -78,6 +78,80 @@ fn connection_emits_reference_to_handler_method() {
 }
 
 #[test]
+fn connection_from_self_root_node_emits_handler_reference() {
+    // Given the exact E2E `scenes/player.tscn` that exhibited the QA
+    // discrepancy: a `[connection ... from="Timer" ...]` (sibling node) AND a
+    // `[connection ... from="." ...]` (the root/self node) wiring `_on_hurt`.
+    // The `.` from-node is never a key in the node-name→id map (node names are
+    // "Player"/"Timer"/"HUD"), so `emit_connection` must fall through to the
+    // deterministic connection-marker fallback and STILL emit the handler ref.
+    let content = "\
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type=\"Script\" path=\"res://scenes/player.gd\" id=\"1\"]
+
+[node name=\"Player\" type=\"CharacterBody2D\"]
+script = ExtResource(\"1\")
+
+[node name=\"Timer\" type=\"Timer\" parent=\".\"]
+
+[node name=\"HUD\" type=\"CanvasLayer\" parent=\".\"]
+
+[connection signal=\"timeout\" from=\"Timer\" to=\".\" method=\"_on_timer_timeout\"]
+[connection signal=\"hurt\" from=\".\" to=\".\" method=\"_on_hurt\"]
+";
+    // When extracting,
+    let result = extract("scenes/player.tscn", content);
+
+    // Then BOTH handler-method references are emitted — the sibling-node one
+    // (`from="Timer"`, known node) and the self-root one (`from="."`, marker
+    // fallback). The `from="."` connection MUST NOT be silently dropped.
+    let names: Vec<&str> = result
+        .references
+        .iter()
+        .map(|r| r.reference_name.as_str())
+        .collect();
+    assert!(
+        names.contains(&"_on_timer_timeout"),
+        "sibling-node connection handler must be emitted, got {names:?}"
+    );
+    let hurt = result
+        .references
+        .iter()
+        .find(|r| r.reference_name == "_on_hurt")
+        .unwrap_or_else(|| {
+            panic!("self-root (from=\".\") connection handler `_on_hurt` must be emitted, got {names:?}")
+        });
+    // And it is a `References` edge (the same kind the resolved/sibling case uses).
+    assert_eq!(hurt.reference_kind, EdgeKind::References);
+
+    // And — the persistence-survivability invariant — its `from_node_id` MUST be
+    // one of the scene nodes actually emitted by this extraction. The store's
+    // `insert_unresolved_refs` SKIPS any ref whose `from_node_id` is absent from
+    // `nodes` (the FK is `ON DELETE CASCADE`), so a ref anchored to a phantom
+    // marker id that was never pushed as a Node is silently dropped — exactly the
+    // E2E loss. `from="."` is the Godot self/root marker, so it must anchor to
+    // the scene's emitted root node (Player), not an unpersisted marker.
+    let emitted_ids: Vec<&str> = result.nodes.iter().map(|n| n.id.as_str()).collect();
+    assert!(
+        emitted_ids.contains(&hurt.from_node_id.as_str()),
+        "self-root connection ref must originate from an EMITTED node so it \
+         survives persistence; from_node_id={} is not among emitted nodes {:?}",
+        hurt.from_node_id,
+        emitted_ids
+    );
+    let root = result
+        .nodes
+        .iter()
+        .find(|n| n.name == "Player")
+        .expect("root Player node");
+    assert_eq!(
+        hurt.from_node_id, root.id,
+        "from=\".\" must map to the scene root node"
+    );
+}
+
+#[test]
 fn node_groups_emit_group_membership_references() {
     // Given a node with a `groups = [...]` membership list,
     let content = "\
