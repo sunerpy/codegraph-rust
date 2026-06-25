@@ -1047,6 +1047,18 @@ fn cmd_serve(path: Option<PathBuf>, mcp: bool, no_watch: bool) -> Result<()> {
     }
     if mcp {
         let project_root = project.clone().unwrap_or_else(|| PathBuf::from("."));
+        // Stop-the-bleed home guard: an IDE (e.g. Kiro) launches `serve --mcp`
+        // with CWD=$HOME, which would otherwise spawn a daemon and run a
+        // home-wide catch-up sync that pegs a CPU indexing the entire home
+        // tree. When the resolved root is too broad ($HOME or filesystem root),
+        // serve tools off any existing index but run NO daemon, watcher, or
+        // catch-up. A real project nested under $HOME is unaffected.
+        if let Some(reason) = codegraph_watch::too_broad_root_reason(&project_root) {
+            eprintln!(
+                "[CodeGraph MCP] No project root: {reason}. Tools still answer off an existing index if present."
+            );
+            return serve_direct_no_services(project, &project_root);
+        }
         let has_codegraph = codegraph_dir(&project_root).is_dir();
         match select_serve_mode(daemon_opt_out(), is_daemon_internal(), has_codegraph) {
             ServeMode::Direct => {
@@ -1089,13 +1101,37 @@ fn serve_direct(project: Option<PathBuf>, project_root: &Path, no_watch: bool) -
     // on a detached worker thread; `server.run` proceeds immediately so the FIRST
     // tools/call NEVER waits on the reconcile. Bind the flag to keep it alive (a
     // future status surface can read it); it is intentionally never awaited.
-    let _catch_up_done = spawn_catch_up(project_root);
+    // Skipped for a too-broad root ($HOME / filesystem root) — `sync_project_once`
+    // there walks the entire home tree and pegs a CPU at 99%.
+    let _catch_up_done =
+        should_run_daemon_services(project_root).then(|| spawn_catch_up(project_root));
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut server = McpServer::new(project);
     server
         .run(BufReader::new(stdin.lock()), stdout.lock())
         .context("running MCP stdio server")
+}
+
+/// Serves MCP tools off any existing index WITHOUT starting the watcher,
+/// daemon, or catch-up sync. Used when the resolved root is too broad
+/// ($HOME / filesystem root), where background services would index the whole
+/// home tree.
+fn serve_direct_no_services(project: Option<PathBuf>, _project_root: &Path) -> Result<()> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut server = McpServer::new(project);
+    server
+        .run(BufReader::new(stdin.lock()), stdout.lock())
+        .context("running MCP stdio server")
+}
+
+/// Whether daemon-style background services (detached daemon, file watcher,
+/// catch-up sync) may run against `root`. Returns `false` for a too-broad root
+/// ($HOME or the filesystem root); shares the decision with the watcher guard
+/// via `codegraph_watch::too_broad_root_reason`.
+fn should_run_daemon_services(root: &Path) -> bool {
+    codegraph_watch::too_broad_root_reason(root).is_none()
 }
 
 /// Spawn a ONE-SHOT background catch-up sync that absorbs edits made while the
@@ -1272,7 +1308,11 @@ pub fn select_serve_mode(
 
 #[cfg(test)]
 mod serve_mode_tests {
-    use super::{select_serve_mode, ServeMode};
+    use super::{select_serve_mode, should_run_daemon_services, ServeMode};
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn select_serve_mode_decision_order() {
@@ -1283,6 +1323,37 @@ mod serve_mode_tests {
             select_serve_mode(false, false, true),
             ServeMode::SpawnOrProxy
         );
+    }
+
+    #[test]
+    fn daemon_services_disabled_at_home_and_root_enabled_for_nested_project() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        let prev_home = std::env::var_os(home_key);
+
+        let tmp = std::env::temp_dir().join(format!("cg-serve-home-{}", std::process::id()));
+        let nested = tmp.join("workspace/ProdDir/AI/codegraph-rust");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::env::set_var(home_key, &tmp);
+
+        assert!(
+            !should_run_daemon_services(&tmp),
+            "$HOME must disable daemon services"
+        );
+        assert!(
+            !should_run_daemon_services(Path::new("/")),
+            "filesystem root must disable daemon services"
+        );
+        assert!(
+            should_run_daemon_services(&nested),
+            "a project nested under $HOME must keep daemon services"
+        );
+
+        match prev_home {
+            Some(v) => std::env::set_var(home_key, v),
+            None => std::env::remove_var(home_key),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
 

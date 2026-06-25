@@ -188,21 +188,70 @@ pub fn watch_disabled_reason(project_root: impl AsRef<Path>, no_watch: bool) -> 
 }
 
 fn home_or_too_broad_root_reason(project_root: &Path) -> Option<String> {
+    // The watcher keeps its original "refusing to watch …" wording, so its
+    // tests and user-facing messages are unchanged. The home/filesystem-root
+    // DECISION, however, is shared with the daemon/catch-up guard via the
+    // public `too_broad_root_reason` below — both must agree on what counts as
+    // "too broad to run background services in".
+    classify_too_broad_root(project_root).map(|kind| match kind {
+        TooBroadRoot::FilesystemRoot(resolved) => format!(
+            "refusing to watch the filesystem root ({}); launch with --path <project> or open the workspace as the working directory",
+            resolved.display()
+        ),
+        TooBroadRoot::HomeDirectory(resolved) => format!(
+            "refusing to watch the home directory ({}); launch with --path <project> or open the workspace as the working directory",
+            resolved.display()
+        ),
+    })
+}
+
+/// Classifies a resolved project root that is too broad to run background
+/// services (watcher, daemon, catch-up sync) against.
+///
+/// An EXACT `$HOME` or filesystem-root match is too broad; a project nested
+/// under `$HOME` (e.g. `~/workspace/proj`) is NOT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TooBroadRoot {
+    /// The resolved root is the filesystem root (e.g. `/` or `C:\`).
+    FilesystemRoot(PathBuf),
+    /// The resolved root is exactly the user's home directory.
+    HomeDirectory(PathBuf),
+}
+
+/// Returns `Some(reason)` when `project_root` resolves to a root too broad to
+/// run daemon services (watcher, detached daemon, catch-up sync) against —
+/// namely an exact `$HOME` or filesystem-root match. Returns `None` for any
+/// real project root, including projects nested under `$HOME`.
+///
+/// Paths are canonicalized leniently first, so `~/.` resolves to `$HOME` and a
+/// user-supplied `/config/.` compares equal to `$HOME`.
+///
+/// This is the single source of truth shared by the watcher guard
+/// (`watch_disabled_reason`) and the daemon/catch-up guard in the CLI; the
+/// message is phrased generically because it now governs more than the watcher.
+pub fn too_broad_root_reason(project_root: &Path) -> Option<String> {
+    classify_too_broad_root(project_root).map(|kind| match kind {
+        TooBroadRoot::FilesystemRoot(resolved) => format!(
+            "launched at the filesystem root ({}); daemon, watcher, and catch-up are disabled — launch with --path <project> or open a project folder",
+            resolved.display()
+        ),
+        TooBroadRoot::HomeDirectory(resolved) => format!(
+            "launched at the home directory ({}); daemon, watcher, and catch-up are disabled — launch with --path <project> or open a project folder",
+            resolved.display()
+        ),
+    })
+}
+
+fn classify_too_broad_root(project_root: &Path) -> Option<TooBroadRoot> {
     let resolved = canonicalize_lenient(project_root);
 
     if is_filesystem_root(&resolved) {
-        return Some(format!(
-            "refusing to watch the filesystem root ({}); launch with --path <project> or open the workspace as the working directory",
-            resolved.display()
-        ));
+        return Some(TooBroadRoot::FilesystemRoot(resolved));
     }
 
     if let Some(home) = home_dir() {
         if resolved == canonicalize_lenient(&home) {
-            return Some(format!(
-                "refusing to watch the home directory ({}); launch with --path <project> or open the workspace as the working directory",
-                resolved.display()
-            ));
+            return Some(TooBroadRoot::HomeDirectory(resolved));
         }
     }
 
@@ -461,6 +510,50 @@ mod tests {
         assert!(!policy.should_watch_dir("a/b/c"));
         assert!(policy.should_watch_dir("a/bb"));
         assert!(policy.should_watch_dir("za/b"));
+    }
+
+    #[test]
+    fn too_broad_reason_flags_home_and_filesystem_root_but_not_nested_project() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture();
+        let home = crate::sync::tests::TestDir::new("too-broad-home");
+        std::env::set_var(
+            if cfg!(windows) { "USERPROFILE" } else { "HOME" },
+            home.path(),
+        );
+
+        assert!(
+            too_broad_root_reason(home.path()).is_some(),
+            "$HOME must be too broad"
+        );
+        assert!(
+            too_broad_root_reason(Path::new("/")).is_some(),
+            "the filesystem root must be too broad"
+        );
+
+        let nested = home.path().join("workspace/ProdDir/AI/codegraph-rust");
+        fs::create_dir_all(&nested).unwrap();
+        assert!(
+            too_broad_root_reason(&nested).is_none(),
+            "a project nested under $HOME must NOT be too broad"
+        );
+    }
+
+    #[test]
+    fn too_broad_reason_normalizes_trailing_dot_to_home() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture();
+        let home = crate::sync::tests::TestDir::new("too-broad-home-dot");
+        std::env::set_var(
+            if cfg!(windows) { "USERPROFILE" } else { "HOME" },
+            home.path(),
+        );
+
+        let with_dot = home.path().join(".");
+        assert!(
+            too_broad_root_reason(&with_dot).is_some(),
+            "`$HOME/.` must normalize to `$HOME` and be too broad"
+        );
     }
 
     #[test]
