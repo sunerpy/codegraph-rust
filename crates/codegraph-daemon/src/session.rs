@@ -19,6 +19,17 @@ use crate::transport::Stream;
 #[cfg(unix)]
 pub const CLIENT_HELLO_TIMEOUT_MS: u64 = 3000;
 
+/// Max milliseconds the PROXY waits for the daemon's one-line versioned hello
+/// after connecting, before giving up so the caller falls back to direct
+/// serving. Without this bound a stale/wedged `daemon.sock` (a crashed daemon
+/// that left its socket, or a daemon that accepted the connection but is stuck
+/// before writing its hello) makes the proxy's `read_line` block forever —
+/// which surfaces to an MCP host such as Kiro as a 60s "connection timed out"
+/// on the `initialize` handshake. On timeout the hello read returns `Err`,
+/// which `spawn_or_proxy` maps to direct serving.
+#[cfg(unix)]
+pub const DAEMON_HELLO_TIMEOUT_MS: u64 = 2000;
+
 /// Hard cap on the OPTIONAL client-hello line length (mirrors colby
 /// `MAX_HELLO_LINE_BYTES`). A first line longer than this is treated as "not a
 /// hello" — its bytes are still handed intact to the JSON-RPC layer, never
@@ -439,8 +450,75 @@ fn read_first_line_bounded<R: BufRead>(reader: &mut R, max: usize) -> Vec<u8> {
 }
 
 pub fn read_daemon_hello(stream: &mut Stream) -> Result<serde_json::Value> {
-    let mut reader = BufReader::new(&*stream);
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
-    Ok(serde_json::from_str(line.trim())?)
+    #[cfg(unix)]
+    let _ = stream.set_recv_timeout(Some(std::time::Duration::from_millis(
+        DAEMON_HELLO_TIMEOUT_MS,
+    )));
+    let result = (|| {
+        let mut reader = BufReader::new(&*stream);
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        Ok(serde_json::from_str(line.trim())?)
+    })();
+    #[cfg(unix)]
+    let _ = stream.set_recv_timeout(None);
+    result
+}
+
+#[cfg(all(test, unix))]
+mod hello_timeout_tests {
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use interprocess::local_socket::traits::Listener as _;
+
+    use crate::transport::{bind, connect, Rendezvous};
+
+    #[test]
+    fn read_daemon_hello_times_out_on_silent_socket() {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-hello-timeout-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let socket_path = dir.join("daemon.sock");
+        let rendezvous = Rendezvous::from_socket_path(&socket_path);
+
+        let listener = bind(&rendezvous).expect("bind listener");
+        let acceptor = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match listener.accept() {
+                    Ok(stream) => {
+                        thread::sleep(Duration::from_secs(4));
+                        drop(stream);
+                        return;
+                    }
+                    Err(_) if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let mut stream = connect(&rendezvous).expect("connect to listener");
+        let started = Instant::now();
+        let result = super::read_daemon_hello(&mut stream);
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_err(),
+            "a daemon that never sends a hello must surface as Err, not a value"
+        );
+        assert!(
+            elapsed < Duration::from_millis(super::DAEMON_HELLO_TIMEOUT_MS + 1500),
+            "hello read must give up near the bound, not hang (elapsed {elapsed:?})"
+        );
+
+        drop(stream);
+        let _ = acceptor.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
