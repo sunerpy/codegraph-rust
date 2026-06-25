@@ -420,6 +420,17 @@ impl Language {
             Self::Unknown => "unknown",
         }
     }
+
+    /// True only for `.tscn` / `.tres` / `project.godot`. `Gdscript` is
+    /// deliberately excluded so a `.gd`→`.gd` link stays an ordinary static
+    /// reference; the dynamic-reachability signal fires only for links
+    /// originating in these engine-driven Godot files.
+    pub const fn is_godot_non_script_file(self) -> bool {
+        matches!(
+            self,
+            Self::GodotScene | Self::GodotResource | Self::GodotProject
+        )
+    }
 }
 
 impl fmt::Display for Language {

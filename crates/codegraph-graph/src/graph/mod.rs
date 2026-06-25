@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use codegraph_core::types::{Edge, EdgeKind, Node, NodeKind};
+use codegraph_core::types::{Edge, EdgeKind, Language, Node, NodeKind};
 use codegraph_store::Store;
 
 // upstream graph/traversal.ts:506 — container kinds whose `contains`
@@ -96,6 +96,45 @@ pub struct NodeEdge {
 pub struct PathStep {
     pub node: Node,
     pub edge: Option<Edge>,
+}
+
+/// Sentinel-prefix that L3's `godot_script` resolver stamps onto the
+/// `reference_name` of a computed (statically-unconfirmable) Godot call-site.
+/// Mirrors `codegraph_resolve::frameworks::godot_script::DYNAMIC_PREFIX`;
+/// duplicated here because `codegraph-graph` does not depend on the resolve
+/// crate, and a single source-level constant cannot be shared without that dep.
+const GODOT_DYNAMIC_PREFIX: &str = "godot:dynamic:";
+
+/// Honesty signal for the caller/dead-code surfaces: whether a symbol with no
+/// static caller is nonetheless reached through a Godot dynamic/structural link,
+/// plus the computed call-sites it owns that cannot be statically confirmed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GodotDynamicReach {
+    /// Reasons the symbol is reachable at runtime despite zero static callers.
+    /// Empty when no Godot link targets the symbol.
+    pub reached_by: Vec<GodotReach>,
+    /// `godot:dynamic:` sentinel reference names ORIGINATING from this symbol —
+    /// computed call-sites whose target the static analysis cannot pin down.
+    pub dynamic_unresolved: Vec<String>,
+}
+
+/// One way a symbol is reached through a Godot runtime link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GodotReach {
+    /// A `.tscn`/`.tres`/`project.godot` reference name-matched the symbol.
+    SceneOrResourceLink,
+    /// The symbol's file is the script bound to an autoload singleton.
+    Autoload,
+}
+
+impl GodotDynamicReach {
+    pub fn is_dynamically_reachable(&self) -> bool {
+        !self.reached_by.is_empty()
+    }
+
+    pub fn has_any_signal(&self) -> bool {
+        !self.reached_by.is_empty() || !self.dynamic_unresolved.is_empty()
+    }
 }
 
 pub struct GraphTraverser<'store> {
@@ -302,6 +341,67 @@ impl<'store> GraphTraverser<'store> {
             }
         }
         Ok(())
+    }
+
+    /// T8 (L6) honesty signal: does a Godot dynamic/structural link reach this
+    /// symbol, and which `godot:dynamic:` sentinel sites does it own?
+    ///
+    /// Two reachability signals (either is sufficient):
+    /// 1. an unresolved reference whose `reference_name` equals the symbol's
+    ///    name AND originates from a `.tscn`/`.tres`/`project.godot` file — the
+    ///    Godot engine wires the target at runtime (`[connection]` handler,
+    ///    scene/resource script binding, group), so name-match is the honest
+    ///    link the static graph cannot turn into an edge;
+    /// 2. an autoload singleton (`project.godot` `Constant`) whose post-extract
+    ///    `signature` (`autoload -> <path>`) names this symbol's file.
+    ///
+    /// The result is empty for any symbol with no such Godot link — so the
+    /// caller/dead-code surfaces stay byte-unchanged for non-Godot projects.
+    pub fn godot_dynamic_reachability(&self, node: &Node) -> rusqlite::Result<GodotDynamicReach> {
+        let mut reached_by = Vec::new();
+
+        let name_links = self
+            .store
+            .unresolved_refs_by_names(std::slice::from_ref(&node.name))?;
+        if name_links
+            .iter()
+            .any(|r| r.language.is_godot_non_script_file())
+        {
+            reached_by.push(GodotReach::SceneOrResourceLink);
+        }
+
+        if self.file_is_autoload_bound(&node.file_path)? {
+            reached_by.push(GodotReach::Autoload);
+        }
+
+        let mut dynamic_unresolved: Vec<String> = self
+            .store
+            .all_unresolved_refs()?
+            .into_iter()
+            .filter(|r| {
+                r.from_node_id == node.id && r.reference_name.starts_with(GODOT_DYNAMIC_PREFIX)
+            })
+            .map(|r| r.reference_name)
+            .collect();
+        dynamic_unresolved.sort();
+        dynamic_unresolved.dedup();
+
+        Ok(GodotDynamicReach {
+            reached_by,
+            dynamic_unresolved,
+        })
+    }
+
+    fn file_is_autoload_bound(&self, file_path: &str) -> rusqlite::Result<bool> {
+        let binding = format!("autoload -> {file_path}");
+        Ok(self
+            .store
+            .nodes_by_kind(NodeKind::Constant)?
+            .into_iter()
+            .any(|n| {
+                n.language == Language::GodotProject
+                    && n.signature.as_deref() == Some(binding.as_str())
+            }))
     }
 
     /// Ports `getCallees` from `upstream graph/traversal.ts:275-310`.
