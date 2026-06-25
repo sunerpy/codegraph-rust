@@ -336,7 +336,8 @@ accept the project path as a positional argument or `-p/--path`; `query`/`files`
 
 **Does:** deterministic code-structure extraction across 32 languages (TypeScript,
 Python, Go, Rust, Java, C/C++, C#, Vue, Svelte, GDScript, and more — see
-[`docs/languages.md`](docs/languages.md)), cross-file resolution,
+[`docs/languages.md`](docs/languages.md)), cross-file resolution including
+Godot scene/resource/autoload graphs (see [`docs/godot.md`](docs/godot.md)),
 graph traversal, FTS5 search, whole-graph export with deterministic PageRank
 centrality, MCP/CLI surfaces, and golden byte-stable output.
 
@@ -363,6 +364,19 @@ nodes; no symbol extraction.
 
 Full list with extensions and per-language notes: [`docs/languages.md`](docs/languages.md).
 
+### Godot projects
+
+For Godot projects (detected by the presence of `project.godot`), CodeGraph
+statically understands scene/resource/autoload structure beyond plain GDScript:
+`project.godot` autoload singletons, `.tscn` node trees and signal connections,
+`.tres` resource references, and dynamic GDScript dispatch patterns
+(`connect`/`get_node`/`$`/`%`/`call`/group methods). Computed targets that
+cannot be confirmed statically are surfaced as `godot:dynamic:…` sentinels
+rather than fabricated edges. CodeGraph does static impact analysis only — it
+does not run the engine or verify runtime behavior. See
+[`docs/godot.md`](docs/godot.md) for the full reference and the
+static-vs-runtime division of labor.
+
 ---
 
 ## Documentation
@@ -374,6 +388,9 @@ Full list with extensions and per-language notes: [`docs/languages.md`](docs/lan
   golden regeneration, `KNOWN_DIFFS.md` format.
 - [`docs/languages.md`](docs/languages.md) — full supported-language list grouped
   by extraction depth.
+- [`docs/godot.md`](docs/godot.md) — Godot static analysis: what CodeGraph
+  extracts from `.tscn`/`.tres`/`project.godot`/`.gd`, the static-vs-runtime
+  boundary, and honesty signals for dynamic reachability.
 - [`docs/grammar-manifest.md`](docs/grammar-manifest.md) /
   [`docs/embedded-extraction.md`](docs/embedded-extraction.md) — language support
   and extraction tiers (engineering ABI detail).
