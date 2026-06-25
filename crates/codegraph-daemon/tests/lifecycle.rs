@@ -36,8 +36,15 @@ fn second_daemon_attaches_to_existing_project_daemon() {
 #[test]
 fn host_pid_watchdog_stops_daemon_after_parent_agent_exits() {
     let project = temp_project("ppid-watchdog");
+    // `sleep` is Unix-only; Windows uses PowerShell `Start-Sleep` (always present).
+    #[cfg(unix)]
     let mut parent = Command::new("sleep")
         .arg("0.1")
+        .spawn()
+        .expect("spawn parent");
+    #[cfg(windows)]
+    let mut parent = Command::new("powershell")
+        .args(["-NoProfile", "-Command", "Start-Sleep -Milliseconds 100"])
         .spawn()
         .expect("spawn parent");
     let parent_pid = parent.id();

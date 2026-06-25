@@ -96,6 +96,9 @@ pub struct WriteResult {
 #[derive(Debug, Clone, Copy)]
 pub struct InstallOptions {
     pub auto_allow: bool,
+    /// Opt-in: write the Claude `UserPromptSubmit` front-load hook that invokes
+    /// `codegraph prompt-hook`. Off by default; never implied by `--yes`.
+    pub front_load_hook: bool,
 }
 
 /// Ports `DetectionResult` (types.ts:37).

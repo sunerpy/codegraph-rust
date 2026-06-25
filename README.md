@@ -207,6 +207,83 @@ LLM library _inside_ the codegraph binary itself.
 
 ---
 
+## Daemon, Watch & Configuration
+
+### Shared detached daemon
+
+When you run `codegraph serve --mcp` in a project that has a `.codegraph/`
+directory, CodeGraph automatically spawns a single shared background daemon
+instead of running in-process. Every MCP client that connects to the same project
+(multiple terminal tabs, multiple agents) shares that one daemon via a Unix socket
+(`.codegraph/daemon.sock`). The daemon exits on its own once all clients have
+disconnected and the idle timeout elapses.
+
+**Logs and stale locks.** The daemon appends stdout and stderr to
+`.codegraph/daemon.log`. If a daemon crashes and leaves a stale lock, run:
+
+```bash
+codegraph unlock [path]   # clears the stale lock; live daemon pids are preserved
+```
+
+**Skipping the daemon.** Set `CODEGRAPH_NO_DAEMON=1` to force foreground
+(direct) mode regardless of project state. Useful in CI or scripts where you
+don't want a background process.
+
+### Live file watch
+
+The daemon watches your project for file changes and re-indexes automatically.
+The debounce window defaults to 2 s (`CODEGRAPH_WATCH_DEBOUNCE_MS`). On WSL2,
+watching files under `/mnt/` is auto-disabled (recursive `fs.watch` is too slow
+on those paths); set `CODEGRAPH_FORCE_WATCH=1` to override that. To disable
+watching entirely, pass `--no-watch` or set `CODEGRAPH_NO_WATCH=1`.
+
+### Environment variables
+
+| Variable                           | Default   | Clamp range  | Meaning                                                        |
+| ---------------------------------- | --------- | ------------ | -------------------------------------------------------------- |
+| `CODEGRAPH_NO_DAEMON`              | —         | —            | Force foreground direct mode; never spawn/proxy a daemon       |
+| `CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS` | `300000`  | 1000–3600000 | Exit after this long with no connected clients                 |
+| `CODEGRAPH_DAEMON_MAX_IDLE_MS`     | `1800000` | 1000–3600000 | Hard cap on total daemon lifetime when idle                    |
+| `CODEGRAPH_DAEMON_CLIENT_SWEEP_MS` | `30000`   | 50–600000    | How often the daemon sweeps for dead clients                   |
+| `CODEGRAPH_WATCH_DEBOUNCE_MS`      | `2000`    | 100–60000    | File-change debounce before re-index triggers                  |
+| `CODEGRAPH_NO_WATCH`               | —         | —            | Disable the live file watcher (equiv. `serve --no-watch`)      |
+| `CODEGRAPH_FORCE_WATCH`            | —         | —            | Override WSL2 `/mnt/` auto-disable (won't override `NO_WATCH`) |
+
+Full launcher decision order and deeper reference: [`docs/cli.md`](docs/cli.md#daemon-watch--environment-variables).
+
+### Custom extension mapping (`.codegraph/codegraph.json`)
+
+To tell CodeGraph how to parse files with non-standard extensions, add a config
+file at `.codegraph/codegraph.json`:
+
+```jsonc
+{
+  "extensions": {
+    ".x": "lua",
+    ".blade": "php",
+  },
+}
+```
+
+Keys are dot-stripped and lowercased before matching. Unknown language names are
+silently skipped. When multiple configs exist up the directory tree, the nearest
+one wins. A malformed file is ignored (logged).
+
+### Opt-in Claude prompt hook
+
+`codegraph install --prompt-hook` writes a `UserPromptSubmit` hook into Claude
+Code's config. Before each prompt, the hook calls `codegraph prompt-hook`, which
+runs `codegraph_explore` against the nearest index and prepends relevant context
+to the prompt automatically. This is **off by default** and is never implied by
+`--yes`. Other agents are unaffected.
+
+```bash
+codegraph install --prompt-hook          # add the hook to Claude Code only
+codegraph install --yes --prompt-hook    # wire all agents + add Claude hook
+```
+
+---
+
 ## CLI Subcommands
 
 Core commands: `init`, `index`, `sync`, `query`, `files`, `status`, `serve`,

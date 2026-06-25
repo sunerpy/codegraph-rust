@@ -15,3 +15,9 @@ dist/
 
 # Local upstream-sync ledger (colby-upstream-sync skill); not part of the repo.
 docs/upstream-sync/
+
+# AWS CodeBuild local config (sensitive — never commit)
+.aws/codebuild.env
+.aws/*.local
+.aws/*.rendered.local.json
+.aws/pipeline.rendered*

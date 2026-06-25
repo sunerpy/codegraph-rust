@@ -303,7 +303,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "codegraph-bench"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -318,7 +318,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-core"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -334,11 +334,12 @@ dependencies = [
 
 [[package]]
 name = "codegraph-daemon"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "codegraph-core",
  "codegraph-mcp",
+ "codegraph-watch",
  "interprocess",
  "notify",
  "rustix 0.38.44",
@@ -351,7 +352,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-extract"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -360,6 +361,7 @@ dependencies = [
  "serde",
  "serde_json",
  "streaming-iterator",
+ "tracing",
  "tree-sitter",
  "tree-sitter-c",
  "tree-sitter-c-sharp",
@@ -392,7 +394,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-graph"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -404,7 +406,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-mcp"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -420,7 +422,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-resolve"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -434,7 +436,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-rs"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -451,6 +453,7 @@ dependencies = [
  "codegraph-store",
  "codegraph-watch",
  "indicatif",
+ "interprocess",
  "jsonc-parser",
  "predicates",
  "rayon",
@@ -466,7 +469,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-store"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -478,7 +481,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-watch"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "codegraph-core",

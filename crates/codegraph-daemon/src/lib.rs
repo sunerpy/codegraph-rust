@@ -8,13 +8,15 @@
 mod lock;
 mod paths;
 mod process;
+pub mod proxy;
 mod session;
+pub mod spawn;
 mod transport;
 
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -25,9 +27,11 @@ pub use lock::{
     clear_stale_daemon_lock, decode_lock_info, encode_lock_info, try_acquire_daemon_lock,
     unlock_project, AcquireResult, DaemonLockInfo,
 };
-pub use paths::{daemon_pid_path, daemon_socket_path};
+pub use paths::{daemon_log_path, daemon_pid_path, daemon_socket_path};
 pub use process::{current_ppid, is_process_alive, supervision_lost_reason, SupervisionState};
-pub use session::{read_daemon_hello, SessionRegistry};
+pub use proxy::{run_proxy, verify_daemon_hello, ProxyOutcome};
+pub use session::{read_daemon_hello, run_session_recv, SessionRegistry};
+pub use spawn::spawn_detached_daemon;
 use tracing::{debug, info, warn};
 
 use crate::lock::cleanup_owned_lock;
@@ -38,12 +42,85 @@ use crate::transport::{bind, connect, Listener, Rendezvous};
 const DEFAULT_WATCHDOG_INTERVAL: Duration = Duration::from_millis(500);
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Env var name: when set to `"1"`, the process re-invoked by the launcher IS
+/// the detached daemon and must listen+serve, never re-spawn.
+pub const CODEGRAPH_DAEMON_INTERNAL: &str = "CODEGRAPH_DAEMON_INTERNAL";
+
+/// Env var name: when set to `"1"`, the daemon is opted out and `serve --mcp`
+/// runs in direct (single-process) mode.
+pub const CODEGRAPH_NO_DAEMON: &str = "CODEGRAPH_NO_DAEMON";
+
+/// Env var name: milliseconds the daemon lingers after the LAST client
+/// disconnects before exiting (default 300000). Mirrors colby.
+pub const CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: &str = "CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS";
+
+/// Env var name: hard backstop in milliseconds — exit once idle this long
+/// regardless of client count (default 1800000; #692 phantom-client guard).
+pub const CODEGRAPH_DAEMON_MAX_IDLE_MS: &str = "CODEGRAPH_DAEMON_MAX_IDLE_MS";
+
+/// Env var name: how often (ms) the daemon sweeps connected sessions whose
+/// announced host pid is dead and force-closes them (default 30000). Mirrors
+/// colby `DEFAULT_CLIENT_SWEEP_MS`.
+pub const CODEGRAPH_DAEMON_CLIENT_SWEEP_MS: &str = "CODEGRAPH_DAEMON_CLIENT_SWEEP_MS";
+
+const DEFAULT_IDLE_TIMEOUT_MS: u128 = 300_000;
+const DEFAULT_MAX_IDLE_MS: u128 = 1_800_000;
+const MIN_IDLE_TIMEOUT_MS: u128 = 1_000;
+const MAX_IDLE_TIMEOUT_MS: u128 = 3_600_000;
+
+const DEFAULT_CLIENT_SWEEP_MS: u128 = 30_000;
+const MIN_CLIENT_SWEEP_MS: u128 = 50;
+const MAX_CLIENT_SWEEP_MS: u128 = 600_000;
+
+/// Parse + clamp the idle-timeout env var (mirror colby `resolveIdleTimeoutMs`):
+/// unset/empty/invalid -> default; otherwise clamp to [MIN, MAX].
+fn resolve_idle_timeout_ms() -> u128 {
+    resolve_ms_env(
+        CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS,
+        DEFAULT_IDLE_TIMEOUT_MS,
+        MIN_IDLE_TIMEOUT_MS,
+        MAX_IDLE_TIMEOUT_MS,
+    )
+}
+
+/// Parse + clamp the max-idle backstop env var (mirror colby `resolveMaxIdleMs`).
+fn resolve_max_idle_ms() -> u128 {
+    resolve_ms_env(
+        CODEGRAPH_DAEMON_MAX_IDLE_MS,
+        DEFAULT_MAX_IDLE_MS,
+        MIN_IDLE_TIMEOUT_MS,
+        MAX_IDLE_TIMEOUT_MS,
+    )
+}
+
+fn resolve_ms_env(name: &str, default: u128, min: u128, max: u128) -> u128 {
+    match std::env::var(name) {
+        Ok(raw) if !raw.is_empty() => raw
+            .parse::<u128>()
+            .map_or(default, |parsed| parsed.clamp(min, max)),
+        _ => default,
+    }
+}
+
+fn resolve_client_sweep_ms() -> u128 {
+    resolve_ms_env(
+        CODEGRAPH_DAEMON_CLIENT_SWEEP_MS,
+        DEFAULT_CLIENT_SWEEP_MS,
+        MIN_CLIENT_SWEEP_MS,
+        MAX_CLIENT_SWEEP_MS,
+    )
+}
+
 #[derive(Clone, Debug)]
 pub struct DaemonOptions {
     pub parent_pid: Option<u32>,
     pub host_pid: Option<u32>,
     pub watchdog_interval: Duration,
     pub run_mcp: bool,
+    /// When true (default), the daemon owns ONE shared `ProjectWatcher` for the
+    /// project (issue-#411: N client inotify sets collapse to 1). Honors
+    /// `watch_disabled_reason` (e.g. `CODEGRAPH_NO_WATCH=1`).
+    pub watch: bool,
 }
 
 impl Default for DaemonOptions {
@@ -53,6 +130,7 @@ impl Default for DaemonOptions {
             host_pid: None,
             watchdog_interval: DEFAULT_WATCHDOG_INTERVAL,
             run_mcp: true,
+            watch: true,
         }
     }
 }
@@ -228,7 +306,18 @@ fn run_accept_loop(
 ) -> Result<()> {
     let original_ppid = options.parent_pid.unwrap_or_else(current_ppid);
     let socket_display = socket_path.to_string_lossy().to_string();
+    let idle_timeout_ms = resolve_idle_timeout_ms();
+    let max_idle_ms = resolve_max_idle_ms();
+    let client_sweep_ms = resolve_client_sweep_ms();
+    let mut last_sweep = std::time::Instant::now();
     info!(project = %project_root.display(), socket = %socket_path.display(), "daemon started");
+
+    // ONE shared watcher per daemon process (issue-#411). Bound to a local so
+    // its `Drop` stops the watch thread on shutdown. NEVER move this into
+    // `serve_session`: per-connection would spawn N watchers.
+    let _watcher = start_project_watcher(&project_root, &options);
+
+    let _catch_up_done = spawn_catch_up(&project_root);
 
     while !shutdown.load(Ordering::SeqCst) {
         let state = SupervisionState {
@@ -260,6 +349,19 @@ fn run_accept_loop(
                 });
             }
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                if last_sweep.elapsed().as_millis() >= client_sweep_ms {
+                    sweep_dead_clients(&registry);
+                    last_sweep = std::time::Instant::now();
+                }
+                let idle_ms = registry.millis_since_active();
+                if idle_ms > max_idle_ms {
+                    info!(idle_ms, max_idle_ms, "daemon exiting on max-idle backstop");
+                    break;
+                }
+                if registry.active_count() == 0 && idle_ms > idle_timeout_ms {
+                    info!(idle_ms, idle_timeout_ms, "daemon idle-exit: no clients");
+                    break;
+                }
                 thread::sleep(ACCEPT_POLL_INTERVAL);
             }
             Err(err) => return Err(err).context("accepting daemon connection"),
@@ -273,4 +375,61 @@ fn run_accept_loop(
     }
     info!(project = %project_root.display(), "daemon stopped");
     Ok(())
+}
+
+fn sweep_dead_clients(registry: &SessionRegistry) {
+    for id in registry.dead_session_ids(is_process_alive) {
+        debug!(session = id, "sweeping session whose host pid is dead");
+        registry.shutdown_session(id);
+    }
+}
+
+fn start_project_watcher(
+    project_root: &Path,
+    options: &DaemonOptions,
+) -> Option<codegraph_watch::ProjectWatcher> {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let mut watch_options = codegraph_watch::WatchOptions::default();
+    watch_options.no_watch = !options.watch;
+    watch_options.on_sync_complete =
+        Some(Arc::new(move |outcome: codegraph_watch::SyncOutcome| {
+            let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+            eprintln!("[watcher] sync #{n}: {} file(s)", outcome.files_reindexed);
+        }));
+    watch_options.on_degraded = Some(Arc::new(|reason: String| {
+        eprintln!("[CodeGraph MCP] File watcher degraded — {reason}");
+    }));
+    watch_options.on_sync_error = Some(Arc::new(|reason: String| {
+        eprintln!("[CodeGraph MCP] File watcher warning — {reason}");
+    }));
+    match codegraph_watch::start_serve_watcher(project_root, watch_options) {
+        Ok(watcher) => watcher,
+        Err(err) => {
+            warn!(error = %err, "daemon failed to start project watcher");
+            None
+        }
+    }
+}
+
+/// Spawn a ONE-SHOT background catch-up sync absorbing edits made while the
+/// daemon was down (#905). Returns an `Arc<AtomicBool>` flipped `true` on
+/// completion. Runs on a detached `std::thread`; the accept loop is never
+/// blocked on it, so the first client's first tool call does not wait.
+fn spawn_catch_up(project_root: &Path) -> Arc<AtomicBool> {
+    let done = Arc::new(AtomicBool::new(false));
+    let thread_done = Arc::clone(&done);
+    let root = project_root.to_path_buf();
+    thread::spawn(move || {
+        match codegraph_watch::sync_project_once(&root) {
+            Ok(outcome) => {
+                let changed = outcome.files_reindexed + outcome.files_removed;
+                if changed > 0 {
+                    eprintln!("[CodeGraph MCP] Caught up {changed} file(s) changed since last run");
+                }
+            }
+            Err(err) => warn!(error = %err, "daemon catch-up sync failed"),
+        }
+        thread_done.store(true, Ordering::SeqCst);
+    });
+    done
 }

@@ -218,6 +218,102 @@ fn codex_local_is_skipped_global_only() {
     assert!(!fx.home.join(".codex/config.toml").exists());
 }
 
+fn user_prompt_groups(settings: &Value) -> Vec<Value> {
+    settings["hooks"]["UserPromptSubmit"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn group_is_codegraph(group: &Value) -> bool {
+    group["hooks"]
+        .as_array()
+        .map(|hooks| {
+            hooks.iter().any(|h| {
+                h["command"]
+                    .as_str()
+                    .map(|c| c.contains("prompt-hook"))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+#[test]
+fn claude_prompt_hook_is_opt_in_idempotent_then_uninstall() {
+    let fx = Fixture::new("claude-hook");
+    let settings = fx.project.join(".claude/settings.json");
+
+    // Opt-out (default): a plain install must NOT write the front-load hook.
+    fx.run(&["install", "--target=claude", "--local", "--yes"]);
+    if settings.exists() {
+        assert!(
+            user_prompt_groups(&read_json(&settings))
+                .iter()
+                .all(|g| !group_is_codegraph(g)),
+            "front-load hook must NOT be written without --prompt-hook"
+        );
+    }
+
+    // A user-owned hook the installer must never touch.
+    let mut cfg = read_json(&settings);
+    cfg["hooks"]["UserPromptSubmit"] = serde_json::json!([
+        { "hooks": [{ "type": "command", "command": "my-own-hook" }] }
+    ]);
+    fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    fs::write(&settings, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
+
+    // Opt-in: --prompt-hook writes exactly one codegraph UserPromptSubmit group.
+    fx.run(&[
+        "install",
+        "--target=claude",
+        "--local",
+        "--yes",
+        "--prompt-hook",
+    ]);
+    let groups = user_prompt_groups(&read_json(&settings));
+    assert_eq!(
+        groups.iter().filter(|g| group_is_codegraph(g)).count(),
+        1,
+        "exactly one codegraph front-load hook, got {groups:?}"
+    );
+    assert!(
+        groups
+            .iter()
+            .any(|g| g["hooks"][0]["command"] == "my-own-hook"),
+        "user's own hook must survive"
+    );
+
+    // Re-install with --prompt-hook: idempotent, still exactly one.
+    fx.run(&[
+        "install",
+        "--target=claude",
+        "--local",
+        "--yes",
+        "--prompt-hook",
+    ]);
+    let groups = user_prompt_groups(&read_json(&settings));
+    assert_eq!(
+        groups.iter().filter(|g| group_is_codegraph(g)).count(),
+        1,
+        "re-install must not duplicate the hook"
+    );
+
+    // Uninstall: codegraph hook gone, user's own hook kept.
+    fx.run(&["uninstall", "--target=claude", "--local"]);
+    let groups = user_prompt_groups(&read_json(&settings));
+    assert!(
+        groups.iter().all(|g| !group_is_codegraph(g)),
+        "codegraph front-load hook removed on uninstall"
+    );
+    assert!(
+        groups
+            .iter()
+            .any(|g| g["hooks"][0]["command"] == "my-own-hook"),
+        "user's own hook preserved through uninstall"
+    );
+}
+
 #[test]
 fn unknown_target_fails() {
     let fx = Fixture::new("unknown");

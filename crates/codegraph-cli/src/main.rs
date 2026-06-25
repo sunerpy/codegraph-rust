@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{self, BufRead, BufReader, IsTerminal, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -97,6 +97,7 @@ impl Cli {
             | Command::Affected { path, .. }
             | Command::Check { path, .. } => path.clone(),
             Command::Export { path, .. } => path.clone(),
+            Command::PromptHook { path, .. } => path.clone(),
             // install/uninstall are not project-scoped — bootstrap from cwd.
             Command::Install { .. }
             | Command::Uninstall { .. }
@@ -255,6 +256,8 @@ enum Command {
         yes: bool,
         #[arg(long = "no-permissions")]
         no_permissions: bool,
+        #[arg(long = "prompt-hook")]
+        prompt_hook: bool,
         #[arg(long = "print-config")]
         print_config: Option<String>,
     },
@@ -291,6 +294,17 @@ enum Command {
         /// Update to a specific version tag (e.g. v0.2.0) instead of latest.
         #[arg(long)]
         tag: Option<String>,
+    },
+    /// Emit deterministic `codegraph_explore` output for a query (NO LLM). Query
+    /// from `--query`/positional or stdin; project is the nearest `.codegraph/`.
+    #[command(hide = true)]
+    PromptHook {
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+        #[arg(short, long)]
+        query: Option<String>,
+        #[arg(value_name = "QUERY")]
+        query_positional: Option<String>,
     },
 }
 
@@ -371,12 +385,14 @@ fn run(cli: Cli) -> Result<()> {
             local,
             yes,
             no_permissions,
+            prompt_hook,
             print_config,
         } => installer::run_install(installer::InstallArgs {
             target,
             location: location_flag(location, global, local),
             yes,
             permissions: if no_permissions { Some(false) } else { None },
+            front_load_hook: prompt_hook,
             print_config,
         }),
         Command::Uninstall {
@@ -404,6 +420,11 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::SelfUpdate { check, force, tag } => cmd_self_update(check, force, tag),
+        Command::PromptHook {
+            path,
+            query,
+            query_positional,
+        } => cmd_prompt_hook(path, query.or(query_positional)),
     }
 }
 
@@ -574,6 +595,48 @@ fn cmd_self_update(check: bool, force: bool, tag: Option<String>) -> Result<()> 
         println!("Updated codegraph to {}", status.version());
     } else {
         println!("codegraph {} is already up to date", status.version());
+    }
+    Ok(())
+}
+
+fn cmd_prompt_hook(path: Option<PathBuf>, query: Option<String>) -> Result<()> {
+    let query = match query {
+        Some(q) if !q.trim().is_empty() => q,
+        _ => {
+            let mut buf = String::new();
+            io::stdin().read_to_string(&mut buf).ok();
+            buf
+        }
+    };
+    let query = query.trim();
+    if query.is_empty() {
+        println!("[codegraph] No query provided — nothing to explore.");
+        return Ok(());
+    }
+
+    let start = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
+    let project = resolve_project_path_optional(&start);
+    if !is_initialized(&project) {
+        println!(
+            "[codegraph] No .codegraph index found near {} — run `codegraph init` to enable context.",
+            start.display()
+        );
+        return Ok(());
+    }
+
+    let engine = match codegraph_mcp::CodeGraphEngine::open(&project) {
+        Ok(engine) => engine,
+        Err(err) => {
+            println!(
+                "[codegraph] Could not open the index at {}: {err}",
+                project.display()
+            );
+            return Ok(());
+        }
+    };
+    let result = engine.execute("codegraph_explore", &json!({ "query": query }));
+    for content in &result.content {
+        println!("{}", content.text);
     }
     Ok(())
 }
@@ -834,17 +897,237 @@ fn cmd_serve(path: Option<PathBuf>, mcp: bool, no_watch: bool) -> Result<()> {
         std::env::set_var("CODEGRAPH_NO_WATCH", "1");
     }
     if mcp {
-        let stdin = io::stdin();
-        let stdout = io::stdout();
-        let mut server = McpServer::new(project);
-        return server
-            .run(BufReader::new(stdin.lock()), stdout.lock())
-            .context("running MCP stdio server");
+        let project_root = project.clone().unwrap_or_else(|| PathBuf::from("."));
+        let has_codegraph = codegraph_dir(&project_root).is_dir();
+        match select_serve_mode(daemon_opt_out(), is_daemon_internal(), has_codegraph) {
+            ServeMode::Direct => {
+                return serve_direct(project, &project_root, no_watch);
+            }
+            ServeMode::BeDaemon => {
+                return codegraph_daemon::run_foreground(
+                    &project_root,
+                    codegraph_daemon::DaemonOptions {
+                        run_mcp: true,
+                        ..Default::default()
+                    },
+                )
+                .context("running as detached MCP daemon");
+            }
+            ServeMode::SpawnOrProxy => {
+                if let Some(result) = spawn_or_proxy(project.clone(), &project_root, no_watch) {
+                    return result;
+                }
+                return serve_direct(project, &project_root, no_watch);
+            }
+        }
     }
     eprintln!("\nCodeGraph daemon/watch server\n");
     eprintln!("Daemon and watcher startup is wired here for tasks 24/25.");
     eprintln!("Use `codegraph serve --mcp` to start the committed MCP stdio server.");
     Ok(())
+}
+
+fn serve_direct(project: Option<PathBuf>, project_root: &Path, no_watch: bool) -> Result<()> {
+    let _watcher = start_direct_watcher(project_root, no_watch);
+    // Background catch-up of edits made while the server was down (#905). It runs
+    // on a detached worker thread; `server.run` proceeds immediately so the FIRST
+    // tools/call NEVER waits on the reconcile. Bind the flag to keep it alive (a
+    // future status surface can read it); it is intentionally never awaited.
+    let _catch_up_done = spawn_catch_up(project_root);
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut server = McpServer::new(project);
+    server
+        .run(BufReader::new(stdin.lock()), stdout.lock())
+        .context("running MCP stdio server")
+}
+
+/// Spawn a ONE-SHOT background catch-up sync that absorbs edits made while the
+/// server was down (upstream colby `catchUpSync`, #905). Returns an
+/// `Arc<AtomicBool>` flipped to `true` when the background sync finishes, so a
+/// status surface could observe completion. The request path MUST NOT block on
+/// it: this runs on a detached `std::thread` and is never joined on the
+/// handshake / tool-call path.
+fn spawn_catch_up(project_root: &Path) -> Arc<AtomicBool> {
+    let done = Arc::new(AtomicBool::new(false));
+    let thread_done = Arc::clone(&done);
+    let root = project_root.to_path_buf();
+    std::thread::spawn(move || {
+        match codegraph_watch::sync_project_once(&root) {
+            Ok(outcome) => {
+                let changed = outcome.files_reindexed + outcome.files_removed;
+                if changed > 0 {
+                    eprintln!("[CodeGraph MCP] Caught up {changed} file(s) changed since last run");
+                }
+            }
+            Err(err) => {
+                eprintln!("[CodeGraph MCP] Catch-up sync failed: {err}");
+            }
+        }
+        thread_done.store(true, Ordering::SeqCst);
+    });
+    done
+}
+
+fn start_direct_watcher(
+    project_root: &Path,
+    no_watch: bool,
+) -> Option<codegraph_watch::ProjectWatcher> {
+    let mut opts = codegraph_watch::WatchOptions::default();
+    opts.no_watch = no_watch;
+    opts.on_sync_complete = Some(std::sync::Arc::new(
+        |outcome: codegraph_watch::SyncOutcome| {
+            eprintln!(
+                "[CodeGraph MCP] Auto-synced {} file(s) in {}ms",
+                outcome.files_reindexed, outcome.duration_ms
+            );
+        },
+    ));
+    opts.on_degraded = Some(std::sync::Arc::new(|reason: String| {
+        eprintln!("[CodeGraph MCP] File watcher degraded — {reason}");
+    }));
+    opts.on_sync_error = Some(std::sync::Arc::new(|reason: String| {
+        eprintln!("[CodeGraph MCP] File watcher warning — {reason}");
+    }));
+    match codegraph_watch::start_serve_watcher(project_root, opts) {
+        Ok(Some(watcher)) => {
+            eprintln!("[CodeGraph MCP] File watcher active — graph will auto-sync on changes");
+            Some(watcher)
+        }
+        Ok(None) => {
+            let reason = codegraph_watch::watch_disabled_reason(project_root, no_watch)
+                .unwrap_or_else(|| "watching disabled".to_string());
+            eprintln!("[CodeGraph MCP] File watcher disabled — {reason}");
+            None
+        }
+        Err(err) => {
+            eprintln!("[CodeGraph MCP] File watcher failed to start: {err}");
+            None
+        }
+    }
+}
+
+const DAEMON_SOCKET_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+const DAEMON_SOCKET_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// Spawn the shared daemon if needed, poll for its socket, then run the real
+/// proxy. Returns `Some(Ok(()))` when the proxy bridged the session (caller
+/// must NOT also serve direct), or `None` when the proxy could not attach
+/// (daemon spawn failed, socket never appeared, or a version mismatch) — the
+/// caller then transparently falls back to direct serving.
+fn spawn_or_proxy(
+    _project: Option<PathBuf>,
+    project_root: &Path,
+    _no_watch: bool,
+) -> Option<Result<()>> {
+    if !daemon_already_running(project_root) {
+        match std::env::current_exe() {
+            Ok(exe) => {
+                if let Err(err) = codegraph_daemon::spawn_detached_daemon(&exe, project_root) {
+                    tracing::debug!(error = %err, "detached daemon spawn failed; serving direct");
+                    return None;
+                }
+                poll_for_daemon_socket(project_root);
+            }
+            Err(err) => {
+                tracing::debug!(error = %err, "current_exe unavailable; serving direct");
+                return None;
+            }
+        }
+    }
+
+    let socket_path = codegraph_daemon::daemon_socket_path(project_root);
+    if !socket_path.exists() {
+        tracing::debug!("daemon socket never appeared; serving direct");
+        return None;
+    }
+
+    let host_ppid = Some(codegraph_daemon::current_ppid());
+    let stdin = io::stdin();
+    match codegraph_daemon::run_proxy(
+        &socket_path,
+        host_ppid,
+        BufReader::new(stdin.lock()),
+        io::stdout(),
+    ) {
+        Ok(codegraph_daemon::ProxyOutcome::Proxied) => Some(Ok(())),
+        Ok(codegraph_daemon::ProxyOutcome::VersionMismatch) => {
+            tracing::debug!("daemon version mismatch; serving direct");
+            None
+        }
+        Err(err) => {
+            tracing::debug!(error = %err, "proxy attach failed; serving direct");
+            None
+        }
+    }
+}
+
+fn daemon_already_running(project_root: &Path) -> bool {
+    let pid_path = codegraph_daemon::daemon_pid_path(project_root);
+    let Ok(raw) = fs::read_to_string(&pid_path) else {
+        return false;
+    };
+    codegraph_daemon::decode_lock_info(&raw)
+        .filter(|info| info.pid > 0)
+        .is_some_and(|info| codegraph_daemon::is_process_alive(info.pid))
+}
+
+fn poll_for_daemon_socket(project_root: &Path) {
+    let socket = codegraph_daemon::daemon_socket_path(project_root);
+    let deadline = std::time::Instant::now() + DAEMON_SOCKET_POLL_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        if socket.exists() {
+            return;
+        }
+        std::thread::sleep(DAEMON_SOCKET_POLL_INTERVAL);
+    }
+}
+
+fn daemon_opt_out() -> bool {
+    std::env::var(codegraph_daemon::CODEGRAPH_NO_DAEMON).as_deref() == Ok("1")
+}
+
+fn is_daemon_internal() -> bool {
+    std::env::var(codegraph_daemon::CODEGRAPH_DAEMON_INTERNAL).as_deref() == Ok("1")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ServeMode {
+    Direct,
+    BeDaemon,
+    SpawnOrProxy,
+}
+
+pub fn select_serve_mode(
+    no_daemon: bool,
+    is_daemon_internal: bool,
+    has_codegraph: bool,
+) -> ServeMode {
+    if no_daemon {
+        ServeMode::Direct
+    } else if is_daemon_internal {
+        ServeMode::BeDaemon
+    } else if !has_codegraph {
+        ServeMode::Direct
+    } else {
+        ServeMode::SpawnOrProxy
+    }
+}
+
+#[cfg(test)]
+mod serve_mode_tests {
+    use super::{select_serve_mode, ServeMode};
+
+    #[test]
+    fn select_serve_mode_decision_order() {
+        assert_eq!(select_serve_mode(true, false, true), ServeMode::Direct);
+        assert_eq!(select_serve_mode(false, true, true), ServeMode::BeDaemon);
+        assert_eq!(select_serve_mode(false, false, false), ServeMode::Direct);
+        assert_eq!(
+            select_serve_mode(false, false, true),
+            ServeMode::SpawnOrProxy
+        );
+    }
 }
 
 fn cmd_unlock(path: Option<PathBuf>) -> Result<()> {

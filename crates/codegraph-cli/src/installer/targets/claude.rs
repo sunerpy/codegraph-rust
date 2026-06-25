@@ -82,6 +82,9 @@ impl AgentTarget for ClaudeCodeTarget {
         if opts.auto_allow {
             files.push(write_permissions_entry(ctx, loc));
         }
+        if opts.front_load_hook {
+            files.push(write_prompt_hook_entry(ctx, loc));
+        }
         files.push(upsert_instructions_entry(&instructions_path(ctx, loc)));
         WriteResult {
             files,
@@ -115,6 +118,7 @@ impl AgentTarget for ClaudeCodeTarget {
         }
 
         files.push(remove_permissions_entry(ctx, loc));
+        files.push(remove_prompt_hook_entry(ctx, loc));
         files.push(remove_instructions_entry(ctx, loc));
         WriteResult {
             files,
@@ -280,6 +284,109 @@ fn remove_instructions_entry(ctx: &InstallContext, loc: Location) -> FileWrite {
     let action =
         shared::remove_marked_section(&file, CODEGRAPH_SECTION_START, CODEGRAPH_SECTION_END);
     FileWrite { path: file, action }
+}
+
+fn prompt_hook_command() -> &'static str {
+    "codegraph prompt-hook"
+}
+
+/// True if a `UserPromptSubmit` group already holds a codegraph `prompt-hook`
+/// command — the idempotency guard that stops re-install duplicating the entry.
+fn group_has_codegraph_hook(group: &Value) -> bool {
+    group
+        .get("hooks")
+        .and_then(Value::as_array)
+        .is_some_and(|hooks| {
+            hooks.iter().any(|h| {
+                h.get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(|c| c.contains("prompt-hook"))
+            })
+        })
+}
+
+/// Write the opt-in `UserPromptSubmit` front-load hook into `settings.json`
+/// (additive + idempotent; sibling groups survive; OPT-IN, never default-on).
+fn write_prompt_hook_entry(ctx: &InstallContext, loc: Location) -> FileWrite {
+    let file = settings_json_path(ctx, loc);
+    let created = !file.exists();
+    let mut settings = read_json_file(&file);
+
+    let hooks = settings
+        .entry("hooks")
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !hooks.is_object() {
+        *hooks = Value::Object(Map::new());
+    }
+    let hooks_obj = hooks.as_object_mut().expect("hooks is object");
+    let groups = hooks_obj
+        .entry("UserPromptSubmit")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !groups.is_array() {
+        *groups = Value::Array(Vec::new());
+    }
+    let groups_arr = groups.as_array_mut().expect("UserPromptSubmit is array");
+
+    if groups_arr.iter().any(group_has_codegraph_hook) {
+        return FileWrite {
+            path: file,
+            action: if created {
+                FileAction::Created
+            } else {
+                FileAction::Unchanged
+            },
+        };
+    }
+    groups_arr.push(json!({
+        "hooks": [{ "type": "command", "command": prompt_hook_command() }],
+    }));
+
+    let _ = write_json_file(&file, &settings);
+    FileWrite {
+        path: file,
+        action: if created {
+            FileAction::Created
+        } else {
+            FileAction::Updated
+        },
+    }
+}
+
+/// Strip codegraph's `UserPromptSubmit` front-load hook on uninstall, dropping
+/// empty `UserPromptSubmit`/`hooks` wrappers. A user's own hooks survive.
+fn remove_prompt_hook_entry(ctx: &InstallContext, loc: Location) -> FileWrite {
+    let file = settings_json_path(ctx, loc);
+    let mut settings = read_json_file(&file);
+    let removed = (|| {
+        let hooks = settings.get_mut("hooks")?.as_object_mut()?;
+        let groups = hooks.get_mut("UserPromptSubmit")?.as_array_mut()?;
+        let before = groups.len();
+        groups.retain(|g| !group_has_codegraph_hook(g));
+        if groups.len() == before {
+            return Some(false);
+        }
+        if groups.is_empty() {
+            hooks.remove("UserPromptSubmit");
+        }
+        if hooks.is_empty() {
+            settings.remove("hooks");
+        }
+        Some(true)
+    })()
+    .unwrap_or(false);
+
+    if removed {
+        let _ = write_json_file(&file, &settings);
+        FileWrite {
+            path: file,
+            action: FileAction::Removed,
+        }
+    } else {
+        FileWrite {
+            path: file,
+            action: FileAction::NotFound,
+        }
+    }
 }
 
 pub static CLAUDE_TARGET: ClaudeCodeTarget = ClaudeCodeTarget;

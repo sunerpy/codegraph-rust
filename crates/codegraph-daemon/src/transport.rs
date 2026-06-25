@@ -17,7 +17,7 @@ use interprocess::local_socket::{GenericFilePath, ToFsName};
 use interprocess::local_socket::{GenericNamespaced, ToNsName};
 use interprocess::local_socket::{ListenerNonblockingMode, ListenerOptions};
 
-pub use interprocess::local_socket::{Listener, Stream};
+pub use interprocess::local_socket::{Listener, SendHalf, Stream};
 
 /// Resolved rendezvous address for a project daemon. On unix `socket_path` is
 /// the `.sock` filesystem path; on windows it holds the BARE namespaced name

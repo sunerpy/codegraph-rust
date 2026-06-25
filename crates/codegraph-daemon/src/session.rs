@@ -1,40 +1,257 @@
-use std::io::{BufRead, BufReader, Write};
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::Result;
 use codegraph_mcp::McpServer;
 use interprocess::local_socket::traits::Stream as _;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::transport::Stream;
 
-#[derive(Clone, Debug, Default)]
-pub struct SessionRegistry {
-    active: Arc<AtomicUsize>,
+/// Max milliseconds the daemon waits for a client to send its OPTIONAL
+/// client-hello line before proceeding to serve JSON-RPC. Mirrors colby
+/// `CLIENT_HELLO_TIMEOUT_MS`. A client that sends none simply blocks here no
+/// longer than a normal client blocks waiting to send its first request.
+#[cfg(unix)]
+pub const CLIENT_HELLO_TIMEOUT_MS: u64 = 3000;
+
+/// Hard cap on the OPTIONAL client-hello line length (mirrors colby
+/// `MAX_HELLO_LINE_BYTES`). A first line longer than this is treated as "not a
+/// hello" — its bytes are still handed intact to the JSON-RPC layer, never
+/// dropped.
+pub const MAX_HELLO_LINE_BYTES: usize = 4096;
+
+/// The OPTIONAL hello a client (the proxy) MAY send back AFTER reading the
+/// daemon hello and BEFORE any JSON-RPC: it announces the host process pid so
+/// the daemon can reap the session if that pid dies (colby `DaemonClientHello`).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonClientHello {
+    pub host_pid: u32,
 }
 
-impl SessionRegistry {
-    pub fn active_count(&self) -> usize {
-        self.active.load(Ordering::SeqCst)
+/// Try to parse one already-read line as a [`DaemonClientHello`], returning the
+/// announced host pid. A line that is too long, is not JSON, or lacks `hostPid`
+/// is NOT a hello (`None`) — the caller must then treat the line as the first
+/// JSON-RPC frame and never drop it.
+pub fn parse_client_hello_line(line: &str) -> Option<u32> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.len() > MAX_HELLO_LINE_BYTES {
+        return None;
     }
+    serde_json::from_str::<DaemonClientHello>(trimmed)
+        .ok()
+        .map(|hello| hello.host_pid)
+}
 
-    pub(crate) fn start_session(&self) -> SessionGuard {
-        self.active.fetch_add(1, Ordering::SeqCst);
-        SessionGuard {
-            active: Arc::clone(&self.active),
+/// A session's force-close handle. Dropping the [`SessionGuard`] removes the
+/// session from the registry; the sweep additionally calls
+/// [`SessionRegistry::shutdown_session`] to force the session thread (blocked in
+/// `McpServer::run`) to EOF by half/full-closing its socket.
+#[derive(Clone)]
+struct SessionEntry {
+    pid: Option<u32>,
+    #[cfg(unix)]
+    recv_fd: Option<std::os::fd::RawFd>,
+}
+
+/// Tracks live client sessions (each with an OPTIONAL host pid + a shutdown
+/// handle) plus a shared last-active instant bumped on BOTH connect and
+/// disconnect, so the accept loop can measure idle time AND reap dead peers.
+#[derive(Clone)]
+pub struct SessionRegistry {
+    sessions: Arc<Mutex<HashMap<u64, SessionEntry>>>,
+    next_id: Arc<AtomicU64>,
+    last_active: Arc<Mutex<Instant>>,
+}
+
+impl std::fmt::Debug for SessionRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionRegistry")
+            .field("active", &self.active_count())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for SessionRegistry {
+    fn default() -> Self {
+        Self {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(AtomicU64::new(1)),
+            last_active: Arc::new(Mutex::new(Instant::now())),
         }
     }
 }
 
+impl SessionRegistry {
+    pub fn active_count(&self) -> usize {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    /// Milliseconds since the last connect-or-disconnect edge.
+    pub fn millis_since_active(&self) -> u128 {
+        let last = bump_or_read(&self.last_active, false);
+        last.elapsed().as_millis()
+    }
+
+    pub(crate) fn start_session(&self) -> SessionGuard {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                id,
+                SessionEntry {
+                    pid: None,
+                    #[cfg(unix)]
+                    recv_fd: None,
+                },
+            );
+        bump_or_read(&self.last_active, true);
+        SessionGuard {
+            id,
+            sessions: Arc::clone(&self.sessions),
+            last_active: Arc::clone(&self.last_active),
+        }
+    }
+
+    /// Record the OPTIONAL host pid parsed from a session's client-hello.
+    pub(crate) fn set_pid(&self, session_id: u64, pid: u32) {
+        if let Some(entry) = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&session_id)
+        {
+            entry.pid = Some(pid);
+        }
+    }
+
+    /// Record a session's recv-side socket fd so the sweep can force EOF by
+    /// shutting it down (unix only).
+    #[cfg(unix)]
+    pub(crate) fn set_recv_fd(&self, session_id: u64, fd: std::os::fd::RawFd) {
+        if let Some(entry) = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&session_id)
+        {
+            entry.recv_fd = Some(fd);
+        }
+    }
+
+    /// Clear the hello-phase recv timeout on a session's socket so the JSON-RPC
+    /// reader blocks indefinitely (normal session behavior) instead of erroring
+    /// out after [`CLIENT_HELLO_TIMEOUT_MS`]. No-op when the fd is unknown.
+    #[cfg(unix)]
+    pub(crate) fn clear_recv_timeout(&self, session_id: u64) {
+        let fd = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&session_id)
+            .and_then(|entry| entry.recv_fd);
+        if let Some(fd) = fd {
+            use std::os::fd::BorrowedFd;
+            // SAFETY: `fd` is the live recv socket fd recorded by this session
+            // thread, which owns the socket for the duration of this call. We
+            // only set a socket option; no ownership is taken, the fd is not
+            // closed.
+            let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+            let _ = rustix::net::sockopt::set_socket_timeout(
+                borrowed,
+                rustix::net::sockopt::Timeout::Recv,
+                None,
+            );
+        }
+    }
+
+    /// Return the ids of sessions whose host pid is KNOWN and NOT alive,
+    /// per `is_alive`. Sessions with no announced pid are never returned (never
+    /// swept).
+    pub(crate) fn dead_session_ids(&self, is_alive: impl Fn(u32) -> bool) -> Vec<u64> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter_map(|(id, entry)| match entry.pid {
+                Some(pid) if !is_alive(pid) => Some(*id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Force a dead session's reader to EOF by half-closing the read direction
+    /// of its socket. The session thread, blocked in `McpServer::run`, then sees
+    /// EOF, returns, and drops its [`SessionGuard`] (which removes the entry +
+    /// bumps last-active). No-op when the fd is unknown or on non-unix.
+    pub(crate) fn shutdown_session(&self, session_id: u64) {
+        #[cfg(unix)]
+        {
+            let fd = self
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&session_id)
+                .and_then(|entry| entry.recv_fd);
+            if let Some(fd) = fd {
+                use std::os::fd::BorrowedFd;
+                // SAFETY: `fd` is the live recv socket fd recorded by the session
+                // thread, which owns the socket and outlives the sweep call (the
+                // session only drops AFTER its reader EOFs, which this shutdown
+                // triggers). We only issue shutdown(SHUT_RDWR); no ownership is
+                // taken and the fd is not closed here.
+                let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+                let _ = rustix::net::shutdown(borrowed, rustix::net::Shutdown::ReadWrite);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = session_id;
+        }
+    }
+}
+
+/// Bump the shared instant to now (when `bump`) or just read it. A poisoned
+/// lock is recovered in place — the only datum behind it is one `Instant`.
+fn bump_or_read(slot: &Mutex<Instant>, bump: bool) -> Instant {
+    let mut guard = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if bump {
+        *guard = Instant::now();
+    }
+    *guard
+}
+
 pub(crate) struct SessionGuard {
-    active: Arc<AtomicUsize>,
+    id: u64,
+    sessions: Arc<Mutex<HashMap<u64, SessionEntry>>>,
+    last_active: Arc<Mutex<Instant>>,
+}
+
+impl SessionGuard {
+    fn session_id(&self) -> u64 {
+        self.id
+    }
 }
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        self.active.fetch_sub(1, Ordering::SeqCst);
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
+        // Bump on disconnect so the linger window starts at the LAST client leaving.
+        bump_or_read(&self.last_active, true);
     }
 }
 
@@ -54,11 +271,23 @@ pub(crate) fn serve_session(
     registry: SessionRegistry,
     run_mcp: bool,
 ) -> Result<()> {
-    let _guard = registry.start_session();
+    let guard = registry.start_session();
+    let session_id = guard.session_id();
     // Split into independent recv/send halves: interprocess `Stream` has no
     // `try_clone`, and an `Arc<Stream>` exposes no `Read` impl, so the reader
     // and writer must own separate halves of the same connection.
     let (recv, mut send) = stream.split();
+
+    // Record the recv-side fd so the sweep (lib.rs) can force this session's
+    // reader to EOF by shutting the socket down when its host pid dies.
+    #[cfg(unix)]
+    {
+        use std::os::fd::{AsFd, AsRawFd};
+        #[allow(irrefutable_let_patterns)]
+        if let interprocess::local_socket::RecvHalf::UdSocket(uds) = &recv {
+            registry.set_recv_fd(session_id, uds.as_fd().as_raw_fd());
+        }
+    }
 
     // Port of upstream mcp/daemon.ts:253-262: every connection gets
     // a one-line versioned daemon hello before JSON-RPC bytes are forwarded.
@@ -75,11 +304,138 @@ pub(crate) fn serve_session(
         return Ok(());
     }
 
-    // Port of upstream mcp/session.ts:78-115 in Rust form: one
-    // session per connection, while the daemon process keeps the project store warm.
+    // Bound how long we wait for the OPTIONAL client-hello so a client that
+    // connects and announces nothing does not stall the hello phase. The
+    // timeout is applied at the socket layer (the generic seam stays transport-
+    // agnostic); on timeout the seam reads zero/partial bytes and treats the
+    // session as hello-less WITHOUT dropping anything.
+    #[cfg(unix)]
+    #[allow(irrefutable_let_patterns)]
+    if let interprocess::local_socket::RecvHalf::UdSocket(uds) = &recv {
+        use std::os::fd::AsFd;
+        let _ = rustix::net::sockopt::set_socket_timeout(
+            uds.as_fd(),
+            rustix::net::sockopt::Timeout::Recv,
+            Some(std::time::Duration::from_millis(CLIENT_HELLO_TIMEOUT_MS)),
+        );
+    }
+
+    // ONE long-lived BufReader over the recv half — allocated here, never a
+    // second one. This is the load-bearing buffer-safety fix: the old throwaway
+    // reader in `read_daemon_hello` dropped any JSON-RPC bytes that arrived in
+    // the same chunk after the hello newline.
     let reader = BufReader::new(recv);
+    let pid_registry = registry.clone();
+    run_session_recv_with(reader, send, project_root, run_mcp, move |pid| {
+        // Record the pid BEFORE McpServer::run blocks, so the sweep can reap a
+        // dead peer mid-session. Also clear the hello-phase recv timeout so the
+        // session reader blocks indefinitely on JSON-RPC (normal behavior)
+        // instead of erroring out after CLIENT_HELLO_TIMEOUT_MS.
+        if let Some(pid) = pid {
+            pid_registry.set_pid(session_id, pid);
+        }
+        #[cfg(unix)]
+        pid_registry.clear_recv_timeout(session_id);
+    })?;
+    Ok(())
+}
+
+/// Buffer-safe generic recv seam (the T9 GENERIC SEAM): read the OPTIONAL
+/// client-hello line from `reader`, surface the parsed host pid via
+/// `on_client_pid` BEFORE blocking, then hand the SAME logical stream to
+/// `McpServer::run(reader, writer)`. Also returns the parsed host pid (`Some`)
+/// when the first line was a [`DaemonClientHello`], else `None`.
+///
+/// `on_client_pid` is invoked exactly once, immediately after the hello phase
+/// and BEFORE the (blocking) `McpServer::run`, so a long-lived daemon can record
+/// the pid in time for its dead-client sweep. Tests that only care about the
+/// return value pass a no-op.
+///
+/// BUFFER SAFETY: there is exactly ONE reader. We read the first line's bytes
+/// once. If they parse as a client-hello we consume them and continue with the
+/// remaining `reader`. If they do NOT (a normal client whose first line is its
+/// first JSON-RPC frame, OR a timed-out/partial read), we PREPEND the bytes we
+/// already read back in front of `reader` via `Cursor::chain`, so `McpServer`
+/// sees the complete, in-order stream and no byte is ever lost.
+pub fn run_session_recv<R: BufRead, W: Write>(
+    reader: R,
+    writer: W,
+    project_root: PathBuf,
+    run_mcp: bool,
+) -> Result<Option<u32>> {
+    run_session_recv_with(reader, writer, project_root, run_mcp, |_| {})
+}
+
+/// [`run_session_recv`] plus an `on_client_pid` hook fired right after the hello
+/// phase and before the blocking run. See [`run_session_recv`] for the buffer
+/// safety contract.
+pub fn run_session_recv_with<R, W, F>(
+    mut reader: R,
+    writer: W,
+    project_root: PathBuf,
+    run_mcp: bool,
+    on_client_pid: F,
+) -> Result<Option<u32>>
+where
+    R: BufRead,
+    W: Write,
+    F: FnOnce(Option<u32>),
+{
+    if !run_mcp {
+        on_client_pid(None);
+        return Ok(None);
+    }
+
+    // Read the first line's bytes ONCE, bounded by MAX_HELLO_LINE_BYTES + 1 (the
+    // trailing newline). A timeout/partial read leaves whatever arrived in
+    // `first`, which is then prepended intact below.
+    let first = read_first_line_bounded(&mut reader, MAX_HELLO_LINE_BYTES + 1);
+
+    let line = String::from_utf8_lossy(&first);
+    if let Some(pid) = parse_client_hello_line(&line) {
+        // It WAS a client-hello: surface the pid BEFORE blocking, then consume
+        // it and serve the rest from the same reader (no bytes to prepend — the
+        // hello line is fully consumed).
+        on_client_pid(Some(pid));
+        let mut server = McpServer::new(Some(project_root));
+        server.run(reader, writer)?;
+        return Ok(Some(pid));
+    }
+
+    // NOT a hello: `first` is the first JSON-RPC frame (or partial bytes). We
+    // must not lose it — prepend it in front of the remaining reader so the
+    // session sees one continuous, in-order stream.
+    on_client_pid(None);
+    let chained = BufReader::new(Cursor::new(first).chain(reader));
     let mut server = McpServer::new(Some(project_root));
-    server.run(reader, send)
+    server.run(chained, writer)?;
+    Ok(None)
+}
+
+/// Read bytes from `reader` up to and including the first `\n`, or until `max`
+/// bytes have been read, whichever comes first. Returns the raw bytes read
+/// (which may be empty on immediate EOF/timeout, or a partial line on a bounded
+/// stop). Uses one-byte reads so it consumes EXACTLY the first line and not a
+/// byte more — the rest stays buffered in `reader` for the JSON-RPC layer.
+fn read_first_line_bounded<R: BufRead>(reader: &mut R, max: usize) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64);
+    let mut byte = [0u8; 1];
+    while buf.len() < max {
+        match reader.read(&mut byte) {
+            Ok(0) => break, // EOF
+            Ok(_) => {
+                buf.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+            // Timeout (WouldBlock/TimedOut) or any read error: stop and hand
+            // back whatever we have. Nothing is lost — partial bytes are
+            // prepended by the caller.
+            Err(_) => break,
+        }
+    }
+    buf
 }
 
 pub fn read_daemon_hello(stream: &mut Stream) -> Result<serde_json::Value> {

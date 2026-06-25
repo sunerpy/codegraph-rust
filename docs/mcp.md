@@ -5,6 +5,9 @@ stdin/stdout. It does **not** use LSP `Content-Length` framing.
 
 Protocol handshake: `initialize` returns
 `protocolVersion: "2024-11-05"`, `serverInfo.name: "codegraph"`.
+`serverInfo.version` reports the running binary's crate version (from
+`CARGO_PKG_VERSION`), so it tracks releases automatically rather than being
+hardcoded.
 
 ---
 
@@ -98,6 +101,30 @@ Two distinct error channels:
 - **Unknown tool name** — JSON-RPC error `-32602` (invalid params).
 - **Missing or invalid required argument** — tool result with
   `{content: ..., isError: true}` and `Error: <message>` body.
+
+---
+
+## Daemon & live watch
+
+When the project is indexed (`.codegraph/` exists), `serve --mcp` does not run
+inline. Instead it spawns — or proxies to — a single shared detached daemon
+process per project. Multiple agent clients (e.g. Claude Code + Cursor open
+simultaneously) all attach to the same daemon, so the index is loaded and
+maintained once.
+
+The daemon runs a file watcher (`codegraph-watch`) that live-reindexes changed
+files. Events are debounced (default ~2 s; tunable via
+`CODEGRAPH_WATCH_DEBOUNCE_MS`) so a burst of saves triggers one incremental
+rebuild rather than many. The watcher is auto-disabled on WSL2 `/mnt/` drives
+where recursive watch is too slow; set `CODEGRAPH_FORCE_WATCH=1` to override.
+
+The daemon exits automatically after all clients disconnect and an idle timeout
+elapses. Logs are appended to `.codegraph/daemon.log`. A stale lock (e.g. after
+a crash) can be cleared with `codegraph unlock`.
+
+To disable the daemon entirely and run the MCP server in the foreground, set
+`CODEGRAPH_NO_DAEMON=1`. For the full set of env-var knobs — timeouts, sweep
+intervals, watch settings — see [`docs/cli.md`](cli.md).
 
 ---
 
