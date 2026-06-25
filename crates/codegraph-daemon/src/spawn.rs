@@ -50,7 +50,29 @@ fn log_target(root: &Path) -> Stdio {
 #[cfg(unix)]
 fn detach(command: &mut Command) {
     use std::os::unix::process::CommandExt as _;
-    command.process_group(0);
+
+    // SAFETY / async-signal-safety contract: `pre_exec` runs in the forked child
+    // AFTER fork() and BEFORE exec(). In that window only async-signal-safe work
+    // is permitted (no heap allocation, no locks, no Rust std I/O) because the
+    // child shares the parent's address space until exec and the runtime is in an
+    // indeterminate state. The closure below calls EXACTLY ONE thing —
+    // `setsid()`, a bare async-signal-safe syscall (rustix issues it directly,
+    // no allocation) — and returns its result. Nothing else runs here.
+    //
+    // Why setsid (the zombie fix): `process_group(0)` only put the daemon in a
+    // new process GROUP; it stayed a DIRECT child of the spawning `serve --mcp`
+    // proxy. When the daemon exited while that proxy lived on (and never wait()ed
+    // it), it became a `<defunct>` zombie holding a process-table slot. `setsid()`
+    // makes the daemon a SESSION LEADER in a brand-new session, so once the
+    // spawning proxy exits the daemon is reparented to init (PID 1) and an exiting
+    // daemon is reaped by init — no zombie. setsid already creates a new process
+    // group, so the previous `process_group(0)` call is now redundant and removed.
+    unsafe {
+        command.pre_exec(|| {
+            rustix::process::setsid()?;
+            Ok(())
+        });
+    }
 }
 
 #[cfg(windows)]

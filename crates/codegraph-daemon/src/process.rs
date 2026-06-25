@@ -3,6 +3,12 @@ pub struct SupervisionState {
     pub original_ppid: u32,
     pub current_ppid: u32,
     pub host_pid: Option<u32>,
+    /// True when this process is its own session leader (it called `setsid`).
+    /// A session leader was DELIBERATELY daemonized and reparents to init on
+    /// spawner exit, so ppid divergence is expected, not orphaning — suppress
+    /// the ppid branch and rely on `host_pid` liveness. The proxy (NOT a session
+    /// leader) sets this `false` and keeps the ppid-divergence signal.
+    pub session_leader: bool,
 }
 
 pub fn supervision_lost_reason<F>(state: &SupervisionState, is_alive: F) -> Option<String>
@@ -15,8 +21,15 @@ where
     // Windows has no stable getppid (`current_ppid()` returns 0), so the ppid
     // branch is unix-only: comparing a real `original_ppid` against 0 there
     // would self-kill the daemon on its first watchdog tick (audit BUG #5/#8).
+    //
+    // Option (b) (zombie-reaping fix): the detached daemon now `setsid`s into a
+    // new session and reparents to init (PID 1) when its spawner exits. That
+    // makes ppid divergence the NORMAL state for a session leader, so a session
+    // leader MUST NOT self-trip on it — doing so would suicide the daemon on its
+    // first tick. A genuinely dead host is still caught by the `host_pid`
+    // liveness branch below, which the proxy announces via the client-hello.
     #[cfg(unix)]
-    if state.current_ppid != state.original_ppid {
+    if !state.session_leader && state.current_ppid != state.original_ppid {
         return Some(format!(
             "ppid {} -> {}",
             state.original_ppid, state.current_ppid
@@ -28,6 +41,23 @@ where
         }
     }
     None
+}
+
+/// True when the calling process is its own session leader (`getsid(0) ==
+/// getpid()`), i.e. it has run `setsid`. The detached daemon uses this to mark
+/// its [`SupervisionState`] so ppid divergence after reparenting to init does
+/// not falsely read as orphaning. Always `false` on Windows (no sessions).
+#[cfg(unix)]
+pub fn is_session_leader() -> bool {
+    matches!(
+        rustix::process::getsid(None),
+        Ok(sid) if sid == rustix::process::getpid()
+    )
+}
+
+#[cfg(windows)]
+pub fn is_session_leader() -> bool {
+    false
 }
 
 #[cfg(unix)]
@@ -97,11 +127,28 @@ mod tests {
             original_ppid: 10,
             current_ppid: 1,
             host_pid: None,
+            session_leader: false,
         };
         assert_eq!(
             supervision_lost_reason(&state, |_| true),
             Some("ppid 10 -> 1".to_string())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervision_ignores_ppid_change_for_session_leader() {
+        // A deliberately-daemonized session leader reparents to init (ppid -> 1)
+        // by design, so the SAME divergence that orphans the proxy must NOT trip
+        // the daemon — otherwise it suicides on its first watchdog tick (the
+        // zombie-reaping regression this fix prevents).
+        let state = SupervisionState {
+            original_ppid: 10,
+            current_ppid: 1,
+            host_pid: None,
+            session_leader: true,
+        };
+        assert_eq!(supervision_lost_reason(&state, |_| true), None);
     }
 
     #[test]
@@ -110,6 +157,24 @@ mod tests {
             original_ppid: 10,
             current_ppid: 10,
             host_pid: Some(20),
+            session_leader: false,
+        };
+        assert_eq!(
+            supervision_lost_reason(&state, |pid| pid != 20),
+            Some("host pid 20 exited".to_string())
+        );
+    }
+
+    #[test]
+    fn supervision_session_leader_still_detects_dead_host() {
+        // The host_pid liveness path MUST keep firing for a session leader: that
+        // is the ONLY signal left after the ppid branch is suppressed, and it is
+        // what makes the detached daemon exit when its real host actually dies.
+        let state = SupervisionState {
+            original_ppid: 10,
+            current_ppid: 1,
+            host_pid: Some(20),
+            session_leader: true,
         };
         assert_eq!(
             supervision_lost_reason(&state, |pid| pid != 20),
