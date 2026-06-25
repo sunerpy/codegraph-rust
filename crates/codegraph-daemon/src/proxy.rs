@@ -429,6 +429,9 @@ fn spawn_ppid_watchdog(
             original_ppid,
             current_ppid: current_ppid(),
             host_pid: host_ppid,
+            // The proxy is a short-lived child of the real host (never setsid'd),
+            // so ppid divergence DOES mean the host died — keep that signal.
+            session_leader: false,
         };
         if supervision_lost_reason(&state, is_process_alive).is_some() {
             pump_shutdown.store(true, Ordering::SeqCst);

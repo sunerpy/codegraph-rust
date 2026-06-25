@@ -28,7 +28,9 @@ pub use lock::{
     unlock_project, AcquireResult, DaemonLockInfo,
 };
 pub use paths::{daemon_log_path, daemon_pid_path, daemon_socket_path};
-pub use process::{current_ppid, is_process_alive, supervision_lost_reason, SupervisionState};
+pub use process::{
+    current_ppid, is_process_alive, is_session_leader, supervision_lost_reason, SupervisionState,
+};
 pub use proxy::{run_proxy, verify_daemon_hello, ProxyOutcome};
 pub use session::{read_daemon_hello, run_session_recv, SessionRegistry};
 pub use spawn::spawn_detached_daemon;
@@ -324,6 +326,7 @@ fn run_accept_loop(
             original_ppid,
             current_ppid: current_ppid(),
             host_pid: options.host_pid,
+            session_leader: is_session_leader(),
         };
         if let Some(reason) = supervision_lost_reason(&state, is_process_alive) {
             warn!(reason, "daemon watchdog stopping after supervisor loss");
