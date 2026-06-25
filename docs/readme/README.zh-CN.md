@@ -174,6 +174,36 @@ codegraph install --target=auto --local          # 项目级配置
 
 ---
 
+## 安装 Agent 技能（`codegraph skill`）
+
+除了写入 MCP 服务器配置，CodeGraph 还可以把一个 `SKILL.md` 直接安装到每个代理的
+技能目录中。该技能教会代理如何将 CodeGraph 用于代码研究与项目初始化：在 grep/read
+之前优先调用 `codegraph_explore`，对已索引的源码用 `codegraph_node` 代替直接读文件，
+以及在尚未建立 `.codegraph/` 索引时自动运行 `codegraph init`。
+
+```bash
+codegraph skill install --yes                         # 安装到所有已检测到的代理（全局）
+codegraph skill install --target=claude,cursor --yes  # 显式指定代理列表
+codegraph skill install --target=auto --local         # 写入项目级技能目录
+codegraph skill update                                # 若未被手动修改则刷新技能文件
+codegraph skill update --force                        # 强制覆盖，即使已被本地修改
+codegraph skill uninstall --target=claude --yes       # 从单个代理中移除
+codegraph skill status                                # 查看所有已检测代理的安装状态
+```
+
+全部 8 个支持的代理均有技能目录（Claude Code、Cursor、Codex CLI、opencode、
+Hermes Agent、Gemini CLI、Antigravity IDE、Kiro）。默认位置为 `--global`；传入
+`--local` 可写入项目树。Hermes 仅支持全局安装。
+
+**更新语义。** `skill update` 用 git blob SHA-1 对比已安装文件与内嵌版本的内容哈希。
+未被修改的文件会自动刷新；经过手动编辑的文件会被跳过并提示"locally modified"（可传
+`--force` 强制覆盖）。紧邻 `SKILL.md` 的附属文件 `.codegraph-skill.json` 记录了安装
+时的哈希值，更新检查据此区分"已过时"与"本地修改"两种状态。
+
+完整参考（含各代理技能路径）：[`../cli.md`](../cli.md)。
+
+---
+
 ## 结合 LLM 使用
 
 codegraph 本身**不内置 LLM**，但天生为"喂给 LLM"而设计。推荐分工：
@@ -271,7 +301,7 @@ codegraph install --yes --prompt-hook    # 注册所有 agent 并添加 Claude h
 核心命令：`init`、`index`、`sync`、`query`、`files`、`status`、`serve`、
 `callers`、`callees`、`impact`、`affected`、`check`、`export`、`unlock`。
 
-代理 / 安装命令：`install`、`uninstall`、`self-update`、`completions`。
+代理 / 安装命令：`install`、`uninstall`、`skill`、`self-update`、`completions`。
 
 > **完整参考（含所有标志）：** [`../cli.md`](../cli.md)
 
@@ -338,7 +368,7 @@ Java、C/C++、C#、Vue、Svelte、GDScript 等——详见
 - [`../data-model.md`](../data-model.md) — SQLite/FTS5 存储契约。
 - [`../equivalence.md`](../equivalence.md) — 3 层等价预言机、golden 再生流程、KNOWN_DIFFS 规则格式。
 - [`../grammar-manifest.md`](../grammar-manifest.md) / [`../embedded-extraction.md`](../embedded-extraction.md) — 语言支持与提取层级。
-- [`../cli.md`](../cli.md) — 完整 CLI 子命令参考（20 个子命令，所有标志）。
+- [`../cli.md`](../cli.md) — 完整 CLI 子命令参考（22 个子命令，所有标志）。
 - [`../mcp.md`](../mcp.md) — MCP 服务器协议、全部 10 个工具、JSON-RPC 详情。
 - [`../../examples/`](../../examples/) — codegraph + LLM 编排示例。
 

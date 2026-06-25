@@ -129,6 +129,17 @@ impl AgentTarget for CursorTarget {
         );
         format!("# Add to {}\n\n{snippet}\n", target.display())
     }
+
+    fn supports_skills(&self, _loc: Location) -> bool {
+        true
+    }
+    fn skill_dir(&self, ctx: &InstallContext, loc: Location) -> Option<PathBuf> {
+        let parent = match loc {
+            Location::Global => ctx.home.join(".cursor").join("skills"),
+            Location::Local => ctx.cwd.join(".cursor").join("skills"),
+        };
+        Some(parent)
+    }
 }
 
 // Ports writeMcpEntry (cursor.ts:177).
@@ -215,3 +226,39 @@ fn remove_rules_entry(ctx: &InstallContext) -> FileWrite {
 }
 
 pub static CURSOR_TARGET: CursorTarget = CursorTarget;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx() -> InstallContext {
+        InstallContext {
+            home: PathBuf::from("/home/u"),
+            cwd: PathBuf::from("/proj"),
+            app_data: None,
+            xdg_config_home: None,
+            hermes_home: None,
+        }
+    }
+
+    #[test]
+    fn supports_skills_both_locations() {
+        let t = CursorTarget;
+        assert!(t.supports_skills(Location::Global));
+        assert!(t.supports_skills(Location::Local));
+    }
+
+    #[test]
+    fn global_skill_dir_ends_cursor_skills() {
+        let t = CursorTarget;
+        let dir = t.skill_dir(&ctx(), Location::Global).unwrap();
+        assert!(dir.ends_with(".cursor/skills"), "got {}", dir.display());
+    }
+
+    #[test]
+    fn local_skill_dir_ends_cursor_skills() {
+        let t = CursorTarget;
+        let dir = t.skill_dir(&ctx(), Location::Local).unwrap();
+        assert!(dir.ends_with(".cursor/skills"), "got {}", dir.display());
+    }
+}

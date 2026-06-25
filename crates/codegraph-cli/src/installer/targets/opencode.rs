@@ -157,6 +157,18 @@ impl AgentTarget for OpencodeTarget {
         }));
         format!("# Add to {}\n\n{snippet}\n", target.display())
     }
+
+    fn supports_skills(&self, _loc: Location) -> bool {
+        true
+    }
+
+    fn skill_dir(&self, ctx: &InstallContext, loc: Location) -> Option<PathBuf> {
+        let parent = match loc {
+            Location::Global => global_config_dir(ctx).join("skill"),
+            Location::Local => ctx.cwd.join(".opencode").join("skill"),
+        };
+        Some(parent)
+    }
 }
 
 // Ports writeMcpEntry (opencode.ts:189).
@@ -234,3 +246,48 @@ fn remove_instructions_entry(ctx: &InstallContext, loc: Location) -> FileWrite {
 }
 
 pub static OPENCODE_TARGET: OpencodeTarget = OpencodeTarget;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx() -> InstallContext {
+        InstallContext {
+            home: PathBuf::from("/home/u"),
+            cwd: PathBuf::from("/work/proj"),
+            app_data: None,
+            xdg_config_home: None,
+            hermes_home: None,
+        }
+    }
+
+    #[test]
+    fn opencode_supports_skills_both_locations() {
+        let t = OpencodeTarget;
+        assert!(t.supports_skills(Location::Global));
+        assert!(t.supports_skills(Location::Local));
+    }
+
+    #[test]
+    fn opencode_global_skill_dir_is_singular_skill_under_opencode() {
+        // Given no XDG override → falls back to ~/.config/opencode.
+        let dir = OpencodeTarget
+            .skill_dir(&ctx(), Location::Global)
+            .expect("global skill dir");
+        // SINGULAR `skill`, parent dir (engine appends codegraph/SKILL.md).
+        assert!(
+            dir.ends_with("opencode/skill"),
+            "expected to end with opencode/skill, got {}",
+            dir.display()
+        );
+    }
+
+    #[test]
+    fn opencode_local_skill_dir_is_dot_opencode_skill() {
+        let dir = OpencodeTarget
+            .skill_dir(&ctx(), Location::Local)
+            .expect("local skill dir");
+        assert_eq!(dir, PathBuf::from("/work/proj/.opencode/skill"));
+        assert!(dir.ends_with(".opencode/skill"));
+    }
+}

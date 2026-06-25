@@ -186,6 +186,39 @@ Full MCP tool reference: [`docs/mcp.md`](docs/mcp.md).
 
 ---
 
+## Install the Agent Skill (`codegraph skill`)
+
+Beyond wiring the MCP server, CodeGraph can install a `SKILL.md` directly into
+each agent's skill directory. The skill teaches your agent to use CodeGraph for
+code research and project onboarding — reach for `codegraph_explore` before
+grep/read, use `codegraph_node` instead of a plain file read on indexed source,
+and run `codegraph init` when no `.codegraph/` index is present yet.
+
+```bash
+codegraph skill install --yes              # install into all detected agents (global)
+codegraph skill install --target=claude,cursor --yes  # explicit list
+codegraph skill install --target=auto --local         # project-local skill dirs
+codegraph skill update                     # refresh skill if unchanged by user
+codegraph skill update --force             # overwrite even locally-modified files
+codegraph skill uninstall --target=claude --yes       # remove from one agent
+codegraph skill status                     # show state for all detected agents
+```
+
+All eight supported agents have a skill directory (Claude Code, Cursor, Codex
+CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro). Default
+location is `--global`; pass `--local` to write into the project tree. Hermes
+supports global only.
+
+**Update behavior.** `skill update` compares the installed file's content hash
+against the embedded version. An unmodified file is refreshed automatically; a
+hand-edited file is skipped with a "locally modified" note (pass `--force` to
+overwrite). A small sidecar file (`.codegraph-skill.json`) records the installed
+hash so the update check can distinguish "outdated" from "locally modified".
+
+Full reference including per-agent skill paths: [`docs/cli.md`](docs/cli.md).
+
+---
+
 ## Using CodeGraph with an LLM
 
 CodeGraph has **no built-in LLM**, but it's designed to feed one. The division of
@@ -289,7 +322,7 @@ codegraph install --yes --prompt-hook    # wire all agents + add Claude hook
 Core commands: `init`, `index`, `sync`, `query`, `files`, `status`, `serve`,
 `callers`, `callees`, `impact`, `affected`, `check`, `export`, `unlock`.
 
-Agent / install commands: `install`, `uninstall`, `self-update`, `completions` (`--install` sets up Tab completion for bash/zsh/fish/powershell/elvish).
+Agent / install commands: `install`, `uninstall`, `skill`, `self-update`, `completions` (`--install` sets up Tab completion for bash/zsh/fish/powershell/elvish).
 
 > **Full reference with flags:** [`docs/cli.md`](docs/cli.md)
 
@@ -323,7 +356,7 @@ beyond the fixed `LANGUAGES` set.
 - [`docs/grammar-manifest.md`](docs/grammar-manifest.md) /
   [`docs/embedded-extraction.md`](docs/embedded-extraction.md) — language support
   and extraction tiers.
-- [`docs/cli.md`](docs/cli.md) — full CLI subcommand reference (20 subcommands,
+- [`docs/cli.md`](docs/cli.md) — full CLI subcommand reference (22 subcommands,
   all flags).
 - [`docs/mcp.md`](docs/mcp.md) — MCP server protocol, all 10 tools, JSON-RPC
   details.

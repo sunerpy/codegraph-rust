@@ -27,6 +27,7 @@ codegraph-store = { path = "../codegraph-store" }
 codegraph-watch = { path = "../codegraph-watch" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha1_smol = { workspace = true }
 jsonc-parser = { workspace = true }
 self_update = { workspace = true }
 toml = { workspace = true }

@@ -108,6 +108,14 @@ impl AgentTarget for KiroTarget {
             to_upstream_json(&json!({ "mcpServers": { "codegraph": mcp_server_config() } }));
         format!("# Add to {}\n\n{snippet}\n", target.display())
     }
+
+    fn supports_skills(&self, _loc: Location) -> bool {
+        true
+    }
+
+    fn skill_dir(&self, ctx: &InstallContext, loc: Location) -> Option<PathBuf> {
+        Some(config_dir(ctx, loc).join("skills"))
+    }
 }
 
 // Ports writeMcpEntry (kiro.ts:131).
@@ -156,3 +164,38 @@ fn remove_steering_entry(ctx: &InstallContext, loc: Location) -> FileWrite {
 }
 
 pub static KIRO_TARGET: KiroTarget = KiroTarget;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx() -> InstallContext {
+        InstallContext {
+            home: PathBuf::from("/home/user"),
+            cwd: PathBuf::from("/work/proj"),
+            app_data: None,
+            xdg_config_home: None,
+            hermes_home: None,
+        }
+    }
+
+    #[test]
+    fn kiro_supports_and_locates_skills_at_both_locations() {
+        // Given the Kiro target
+        let target = KiroTarget;
+        let ctx = ctx();
+
+        // Then it supports skills at both locations
+        assert!(target.supports_skills(Location::Global));
+        assert!(target.supports_skills(Location::Local));
+
+        // And the PARENT skill dir is `<root>/.kiro/skills` (engine appends codegraph/SKILL.md)
+        let global = target.skill_dir(&ctx, Location::Global).unwrap();
+        assert!(global.ends_with(".kiro/skills"));
+        assert_eq!(global, PathBuf::from("/home/user/.kiro/skills"));
+
+        let local = target.skill_dir(&ctx, Location::Local).unwrap();
+        assert!(local.ends_with(".kiro/skills"));
+        assert_eq!(local, PathBuf::from("/work/proj/.kiro/skills"));
+    }
+}

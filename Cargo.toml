@@ -34,6 +34,7 @@ thiserror = "1"
 
 # Utilities
 sha2 = "0.10"
+sha1_smol = "1"
 rayon = "1.8"
 
 # Logging (rust-base-convention)

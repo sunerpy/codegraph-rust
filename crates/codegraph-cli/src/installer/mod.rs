@@ -10,6 +10,7 @@
 
 mod registry;
 mod shared;
+pub mod skill;
 mod targets;
 mod types;
 
@@ -19,7 +20,8 @@ use anyhow::{bail, Result};
 
 use registry::{get_target, list_target_ids, resolve_target_flag};
 use types::{
-    AgentTarget, FileAction, InstallContext, InstallOptions, Location, TargetId, WriteResult,
+    AgentTarget, FileAction, InstallContext, InstallOptions, Location, SkillStatusReport, TargetId,
+    WriteResult,
 };
 
 /// Build the install context from the process environment, mirroring the upstream's
@@ -134,6 +136,10 @@ pub fn run_install(args: InstallArgs) -> Result<()> {
         let result = target.install(&ctx, location, opts);
         installed_ids.push(target.id());
         report_write_result(target.display_name(), &ctx, &result);
+        if target.supports_skills(location) {
+            let skill_result = target.install_skill(&ctx, location, false);
+            report_write_result(target.display_name(), &ctx, &skill_result);
+        }
     }
 
     if !installed_ids.is_empty() {
@@ -251,9 +257,11 @@ fn uninstall_targets(
                 };
             }
             let result = target.uninstall(ctx, location);
+            let skill_result = target.uninstall_skill(ctx, location);
             let removed_paths: Vec<PathBuf> = result
                 .files
                 .iter()
+                .chain(skill_result.files.iter())
                 .filter(|f| f.action == FileAction::Removed)
                 .map(|f| f.path.clone())
                 .collect();
@@ -270,6 +278,158 @@ fn uninstall_targets(
             }
         })
         .collect()
+}
+
+/// Options for `codegraph skill <action>`. One arg struct serves all four
+/// actions; `yes` is consumed by install/uninstall, `force` by update.
+pub struct SkillArgs {
+    pub target: Option<String>,
+    pub location: Option<String>,
+    pub yes: bool,
+    pub force: bool,
+}
+
+fn resolve_skill_targets(
+    ctx: &InstallContext,
+    args: &SkillArgs,
+) -> Result<(Location, Vec<&'static dyn AgentTarget>)> {
+    let explicit_location = parse_location(args.location.as_deref())?;
+    let location = explicit_location.unwrap_or(Location::Global);
+    let target_flag = args.target.clone().unwrap_or_else(|| "auto".to_string());
+    let targets = resolve_target_flag(ctx, &target_flag, location)?;
+    Ok((location, targets))
+}
+
+/// `codegraph skill install`. Writes the embedded skill into each resolved
+/// target's skill directory, gating on `supports_skills` (NOT
+/// `supports_location` — codex/antigravity support local skills even though
+/// their MCP config is global-only).
+pub fn run_skill_install(args: SkillArgs) -> Result<()> {
+    let _ = args.yes;
+    let ctx = context_from_env()?;
+    let (location, targets) = resolve_skill_targets(&ctx, &args)?;
+    if targets.is_empty() {
+        println!("No agent targets selected — nothing to do.");
+        return Ok(());
+    }
+
+    let mut names: Vec<&str> = Vec::new();
+    for target in &targets {
+        if !target.supports_skills(location) {
+            println!(
+                "{}: skills not supported for --location={}",
+                target.display_name(),
+                location.as_str()
+            );
+            continue;
+        }
+        let result = target.install_skill(&ctx, location, args.force);
+        if result
+            .files
+            .iter()
+            .any(|f| matches!(f.action, FileAction::Created | FileAction::Updated))
+        {
+            names.push(target.display_name());
+        }
+        report_write_result(target.display_name(), &ctx, &result);
+    }
+
+    if !names.is_empty() {
+        println!(
+            "\nInstalled the CodeGraph skill for {} agent{}: {}.",
+            names.len(),
+            if names.len() > 1 { "s" } else { "" },
+            names.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// `codegraph skill update`: identical to install, but `--force` (plumbed
+/// through [`SkillArgs::force`]) overwrites a locally modified skill.
+pub fn run_skill_update(args: SkillArgs) -> Result<()> {
+    run_skill_install(args)
+}
+
+/// `codegraph skill uninstall`. Removes the installed skill from each resolved
+/// target; an absent skill is reported as "not configured" (success exit).
+pub fn run_skill_uninstall(args: SkillArgs) -> Result<()> {
+    let _ = args.yes;
+    let ctx = context_from_env()?;
+    let (location, targets) = resolve_skill_targets(&ctx, &args)?;
+    if targets.is_empty() {
+        println!("No agent targets selected — nothing to do.");
+        return Ok(());
+    }
+
+    let mut removed_names: Vec<&str> = Vec::new();
+    for target in &targets {
+        if !target.supports_skills(location) {
+            println!(
+                "{}: skills not supported for --location={}",
+                target.display_name(),
+                location.as_str()
+            );
+            continue;
+        }
+        let result = target.uninstall_skill(&ctx, location);
+        let removed: Vec<&PathBuf> = result
+            .files
+            .iter()
+            .filter(|f| f.action == FileAction::Removed)
+            .map(|f| &f.path)
+            .collect();
+        if removed.is_empty() {
+            println!(
+                "{}: not configured — nothing to remove",
+                target.display_name()
+            );
+        } else {
+            for path in removed {
+                println!("{}: removed {}", target.display_name(), tildify(&ctx, path));
+            }
+            removed_names.push(target.display_name());
+        }
+    }
+
+    if removed_names.is_empty() {
+        println!(
+            "\nThe CodeGraph skill was not installed in any {} agent — nothing to remove.",
+            location.as_str()
+        );
+    } else {
+        println!(
+            "\nRemoved the CodeGraph skill from {} agent{}: {}.",
+            removed_names.len(),
+            if removed_names.len() > 1 { "s" } else { "" },
+            removed_names.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// `codegraph skill status`. Prints one line per target: "up to date" /
+/// "locally modified" / "outdated" / "not installed" / "not supported".
+pub fn run_skill_status(args: SkillArgs) -> Result<()> {
+    let _ = (args.yes, args.force);
+    let ctx = context_from_env()?;
+    let (location, targets) = resolve_skill_targets(&ctx, &args)?;
+    if targets.is_empty() {
+        println!("No agent targets selected — nothing to do.");
+        return Ok(());
+    }
+
+    for target in &targets {
+        let report = target.skill_status(&ctx, location);
+        println!("{}", skill_status_line(&report));
+    }
+    Ok(())
+}
+
+/// Map a [`SkillStatusReport`] to its single printed line. Extracted so the
+/// label mapping is unit-testable without filesystem state.
+fn skill_status_line(report: &SkillStatusReport) -> String {
+    format!("{}: {}", report.display_name, report.label())
 }
 
 /// Render the per-file log lines for an install result. Ports the loop in
@@ -353,5 +513,40 @@ mod tests {
         let p = ctx.home.join("foo.json");
         assert_eq!(tildify(&ctx, &p), "~/foo.json");
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn skill_status_line_renders_each_state() {
+        // Given a supported target reporting each status, Then the line is
+        // "<name>: <label>"; an unsupported report yields "not supported".
+        let supported = |status| SkillStatusReport {
+            display_name: "Claude Code",
+            location: Location::Global,
+            status: Some(status),
+        };
+        assert_eq!(
+            skill_status_line(&supported(skill::SkillStatus::UpToDate)),
+            "Claude Code: up to date"
+        );
+        assert_eq!(
+            skill_status_line(&supported(skill::SkillStatus::LocallyModified)),
+            "Claude Code: locally modified"
+        );
+        assert_eq!(
+            skill_status_line(&supported(skill::SkillStatus::Outdated)),
+            "Claude Code: outdated"
+        );
+        assert_eq!(
+            skill_status_line(&supported(skill::SkillStatus::NotInstalled)),
+            "Claude Code: not installed"
+        );
+        assert_eq!(
+            skill_status_line(&SkillStatusReport {
+                display_name: "Hermes Agent",
+                location: Location::Local,
+                status: None,
+            }),
+            "Hermes Agent: not supported"
+        );
     }
 }

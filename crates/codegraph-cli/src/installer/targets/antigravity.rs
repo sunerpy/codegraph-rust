@@ -165,6 +165,22 @@ impl AgentTarget for AntigravityTarget {
             to_upstream_json(&json!({ "mcpServers": { "codegraph": build_antigravity_entry() } }));
         format!("# Add to {}\n\n{snippet}\n", file.display())
     }
+
+    // Skill support is DECOUPLED from supports_location: MCP is global-only
+    // (supports_location(Local)==false above) but Antigravity reads workspace
+    // skills, so both locations support skills here. Global skill dir is
+    // `~/.gemini/config/skills` (NOT gemini's `~/.gemini/skills`); local is
+    // `<cwd>/.agents/skills`.
+    fn supports_skills(&self, _loc: Location) -> bool {
+        true
+    }
+    fn skill_dir(&self, ctx: &InstallContext, loc: Location) -> Option<PathBuf> {
+        let parent = match loc {
+            Location::Global => unified_config_dir(ctx).join("skills"),
+            Location::Local => ctx.cwd.join(".agents").join("skills"),
+        };
+        Some(parent)
+    }
 }
 
 // Ports writeMcpEntry (antigravity.ts:234).
@@ -244,3 +260,42 @@ fn remove_codegraph_from_file(file: &Path) -> FileWrite {
 }
 
 pub static ANTIGRAVITY_TARGET: AntigravityTarget = AntigravityTarget;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx() -> InstallContext {
+        InstallContext {
+            home: PathBuf::from("/home/u"),
+            cwd: PathBuf::from("/work/proj"),
+            app_data: None,
+            xdg_config_home: None,
+            hermes_home: None,
+        }
+    }
+
+    #[test]
+    fn antigravity_skills_decoupled_from_location_with_distinct_paths() {
+        // Given the Antigravity target
+        let target = AntigravityTarget;
+        let ctx = ctx();
+
+        // Then skill support is decoupled from MCP location support: it supports
+        // skills at BOTH locations even though supports_location(Local) is false.
+        assert!(target.supports_skills(Location::Global));
+        assert!(target.supports_skills(Location::Local));
+        assert!(
+            target.supports_skills(Location::Local) && !target.supports_location(Location::Local)
+        );
+
+        // And global skill_dir is ~/.gemini/config/skills (DISTINCT from gemini's ~/.gemini/skills)
+        let global = target.skill_dir(&ctx, Location::Global).unwrap();
+        assert!(global.ends_with(".gemini/config/skills"));
+        assert!(!global.ends_with(".gemini/skills"));
+
+        // And local skill_dir is ./.agents/skills
+        let local = target.skill_dir(&ctx, Location::Local).unwrap();
+        assert!(local.ends_with(".agents/skills"));
+    }
+}
