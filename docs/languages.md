@@ -20,31 +20,31 @@ Tree-sitter parses the file and extracts all symbols (functions, classes, struct
 variables, imports, etc.) plus call and dependency edges. This is the richest extraction
 level.
 
-| Language    | Extensions                                  | Extraction                | Notes                                                                                     |
-| ----------- | ------------------------------------------- | ------------------------- | ----------------------------------------------------------------------------------------- |
-| TypeScript  | `.ts` `.mts` `.cts`                         | Full tree-sitter          |                                                                                           |
-| TSX         | `.tsx`                                      | Full tree-sitter          | TypeScript grammar, JSX syntax                                                            |
-| JavaScript  | `.js` `.mjs` `.cjs` `.xsjs` `.xsjslib`      | Full tree-sitter          |                                                                                           |
-| JSX         | `.jsx`                                      | Full tree-sitter          | JavaScript grammar, JSX syntax                                                            |
-| Python      | `.py` `.pyw`                                | Full tree-sitter          |                                                                                           |
-| Go          | `.go`                                       | Full tree-sitter          |                                                                                           |
-| Rust        | `.rs`                                       | Full tree-sitter          |                                                                                           |
-| Java        | `.java`                                     | Full tree-sitter          |                                                                                           |
-| C           | `.c` `.h`                                   | Full tree-sitter          | `.h` may be promoted to C++ or Objective-C by heuristics                                  |
-| C++         | `.cpp` `.cc` `.cxx` `.hpp` `.hxx`           | Full tree-sitter          |                                                                                           |
-| C#          | `.cs`                                       | Full tree-sitter          |                                                                                           |
-| PHP         | `.php` `.module` `.install` `.theme` `.inc` | Full tree-sitter          |                                                                                           |
-| Ruby        | `.rb` `.rake`                               | Full tree-sitter          |                                                                                           |
-| Swift       | `.swift`                                    | Full tree-sitter          |                                                                                           |
-| Kotlin      | `.kt` `.kts`                                | Full tree-sitter          |                                                                                           |
-| Dart        | `.dart`                                     | Full tree-sitter          |                                                                                           |
-| Scala       | `.scala` `.sc`                              | Full tree-sitter          |                                                                                           |
-| Lua         | `.lua`                                      | Full tree-sitter          |                                                                                           |
-| Luau        | `.luau`                                     | Full tree-sitter          | Roblox Luau dialect                                                                       |
-| Objective-C | `.m` `.mm`                                  | Full tree-sitter          |                                                                                           |
-| R           | `.r`                                        | Full tree-sitter          |                                                                                           |
-| GDScript    | `.gd`                                       | Full tree-sitter          | Godot scripting; extracts functions, classes, enums, variables, signals, extends, preload |
-| Pascal      | `.pas` `.dpr` `.dpk` `.lpr` `.dfm` `.fmx`   | Full tree-sitter / custom | `.dfm`/`.fmx` form files use a custom path                                                |
+| Language    | Extensions                                  | Extraction                | Notes                                                                                                                                                                                                             |
+| ----------- | ------------------------------------------- | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| TypeScript  | `.ts` `.mts` `.cts`                         | Full tree-sitter          |                                                                                                                                                                                                                   |
+| TSX         | `.tsx`                                      | Full tree-sitter          | TypeScript grammar, JSX syntax                                                                                                                                                                                    |
+| JavaScript  | `.js` `.mjs` `.cjs` `.xsjs` `.xsjslib`      | Full tree-sitter          |                                                                                                                                                                                                                   |
+| JSX         | `.jsx`                                      | Full tree-sitter          | JavaScript grammar, JSX syntax                                                                                                                                                                                    |
+| Python      | `.py` `.pyw`                                | Full tree-sitter          |                                                                                                                                                                                                                   |
+| Go          | `.go`                                       | Full tree-sitter          |                                                                                                                                                                                                                   |
+| Rust        | `.rs`                                       | Full tree-sitter          |                                                                                                                                                                                                                   |
+| Java        | `.java`                                     | Full tree-sitter          |                                                                                                                                                                                                                   |
+| C           | `.c` `.h`                                   | Full tree-sitter          | `.h` may be promoted to C++ or Objective-C by heuristics                                                                                                                                                          |
+| C++         | `.cpp` `.cc` `.cxx` `.hpp` `.hxx`           | Full tree-sitter          |                                                                                                                                                                                                                   |
+| C#          | `.cs`                                       | Full tree-sitter          |                                                                                                                                                                                                                   |
+| PHP         | `.php` `.module` `.install` `.theme` `.inc` | Full tree-sitter          |                                                                                                                                                                                                                   |
+| Ruby        | `.rb` `.rake`                               | Full tree-sitter          |                                                                                                                                                                                                                   |
+| Swift       | `.swift`                                    | Full tree-sitter          |                                                                                                                                                                                                                   |
+| Kotlin      | `.kt` `.kts`                                | Full tree-sitter          |                                                                                                                                                                                                                   |
+| Dart        | `.dart`                                     | Full tree-sitter          |                                                                                                                                                                                                                   |
+| Scala       | `.scala` `.sc`                              | Full tree-sitter          |                                                                                                                                                                                                                   |
+| Lua         | `.lua`                                      | Full tree-sitter          |                                                                                                                                                                                                                   |
+| Luau        | `.luau`                                     | Full tree-sitter          | Roblox Luau dialect                                                                                                                                                                                               |
+| Objective-C | `.m` `.mm`                                  | Full tree-sitter          |                                                                                                                                                                                                                   |
+| R           | `.r`                                        | Full tree-sitter          |                                                                                                                                                                                                                   |
+| GDScript    | `.gd`                                       | Full tree-sitter          | Godot scripting; extracts functions, classes, enums, variables, signals, extends, preload. Dynamic dispatch edges (connect/get_node/$/%/call/group) added by the Godot resolver — see [`docs/godot.md`](godot.md) |
+| Pascal      | `.pas` `.dpr` `.dpk` `.lpr` `.dfm` `.fmx`   | Full tree-sitter / custom | `.dfm`/`.fmx` form files use a custom path                                                                                                                                                                        |
 
 ---
 
@@ -65,17 +65,25 @@ and merged back into the parent result.
 
 ---
 
-## Tier 3 — File-level only (3 languages)
+## Tier 3 — File-level only (6 languages)
 
 These files are indexed as file nodes so they appear in the graph and are searchable, but
-no symbol extraction is performed. They contribute to traversal and impact analysis at the
-file level.
+no symbol extraction is performed at the language level. They contribute to traversal and
+impact analysis at the file level.
 
-| Language   | Extensions     | Extraction     | Notes                |
-| ---------- | -------------- | -------------- | -------------------- |
-| YAML       | `.yml` `.yaml` | File node only | No symbol extraction |
-| Twig       | `.twig`        | File node only | No symbol extraction |
-| Properties | `.properties`  | File node only | No symbol extraction |
+| Language      | Extensions      | Extraction     | Notes                                                                                                                                    |
+| ------------- | --------------- | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| YAML          | `.yml` `.yaml`  | File node only | No symbol extraction                                                                                                                     |
+| Twig          | `.twig`         | File node only | No symbol extraction                                                                                                                     |
+| Properties    | `.properties`   | File node only | No symbol extraction                                                                                                                     |
+| GodotScene    | `.tscn`         | File node only | Semantic graph (node tree, signals, scripts, groups, sub-scenes) built by the Godot framework resolver — see [`docs/godot.md`](godot.md) |
+| GodotResource | `.tres`         | File node only | Resource→script/resource references built by the Godot framework resolver — see [`docs/godot.md`](godot.md)                              |
+| GodotProject  | `project.godot` | File node only | Autoload singletons, input actions, plugins parsed by the Godot framework resolver — see [`docs/godot.md`](godot.md)                     |
+
+> The three Godot file types carry file nodes only at the language-extraction level.
+> All Godot-specific symbols, edges, and honesty signals are emitted by the `GodotResolver`
+> (a `FrameworkResolver` that activates when `project.godot` is present). For the full
+> extraction inventory and static-vs-runtime boundary, see [`docs/godot.md`](godot.md).
 
 ---
 
@@ -99,6 +107,9 @@ skipped. The nearest config up the directory tree wins.
 
 ## See also
 
+- [`docs/godot.md`](godot.md) — full Godot static-analysis reference: what gets extracted
+  from `.tscn`/`.tres`/`project.godot`/`.gd`, the static-vs-runtime boundary, honesty
+  signals, and the optional resource DSL hook.
 - [`docs/grammar-manifest.md`](grammar-manifest.md) — engineering ABI manifest: per-language
   grammar crate, tier policy, and ABI smoke status (for contributors and grammar maintainers).
 - [`docs/embedded-extraction.md`](embedded-extraction.md) — detailed description of the

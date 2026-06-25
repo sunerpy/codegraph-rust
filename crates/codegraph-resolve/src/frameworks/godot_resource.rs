@@ -63,12 +63,14 @@
 //! (only the text `.tres`).
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use codegraph_core::node_id::generate_node_id;
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 
 use super::framework_node;
 use super::godot_common::{map_res_path, quoted_strings, strip_quotes};
+use super::godot_dsl_config::dsl_resource_fields;
 use crate::types::{FrameworkResolverExtractionResult, RefView};
 
 /// The marker-node name used when a `.tres` has no `[gd_resource type="..."]`.
@@ -94,6 +96,12 @@ pub(crate) fn is_tres(file_path: &str) -> bool {
 pub(crate) fn parse_tres(file_path: &str, content: &str) -> FrameworkResolverExtractionResult {
     let mut nodes: Vec<Node> = Vec::new();
     let mut references: Vec<RefView> = Vec::new();
+
+    // OPT-IN DSL fields (T9): the `godot.dsl.resourceFields` list from the
+    // nearest `.codegraph/codegraph.json` (empty when absent — the off-by-default
+    // case, so zero DSL behavior). A `key = value` line whose key is in this list
+    // emits a reference to its value (string literal → the literal text).
+    let dsl_fields = dsl_resource_fields(Path::new(file_path));
 
     // In-file ext_resource lookup: id → repo-relative path. Built top-down as
     // the file is scanned (Godot declares ext_resources before `[resource]`),
@@ -139,12 +147,17 @@ pub(crate) fn parse_tres(file_path: &str, content: &str) -> FrameworkResolverExt
         if !in_resource {
             continue;
         }
-        let Some((_key, value)) = split_key_value(line) else {
+        let Some((key, value)) = split_key_value(line) else {
             continue;
         };
-        // Resolve the value as an `ExtResource("id")` handle; non-handle values
-        // (scalars, arrays, SubResource handles) yield nothing.
-        let Some(target) = resolve_ext_resource(value, &ext_resources) else {
+        // The standard T5 edge: a value resolving as `ExtResource("id")` emits a
+        // reference to the resolved repo-relative path, for ANY key. Non-handle
+        // values fall through to the opt-in DSL check.
+        let target = match resolve_ext_resource(value, &ext_resources) {
+            Some(resolved) => Some(resolved),
+            None => dsl_literal_target(key, value, &dsl_fields),
+        };
+        let Some(target) = target else {
             continue;
         };
         let from_node_id = marker
@@ -197,6 +210,26 @@ fn parse_ext_resource_id(value: &str) -> Option<&str> {
     let inner = inner.trim_start();
     let inner = inner.strip_prefix('(')?.strip_suffix(')')?;
     quoted_strings(inner).into_iter().next()
+}
+
+/// The OPT-IN DSL edge target (T9). Returns the string-literal value of `key`
+/// ONLY when `key` is one of the configured `dsl_fields` and `value` is a plain
+/// double-quoted string. With no config `dsl_fields` is empty, so this is always
+/// `None` — the off-by-default contract. A non-empty quoted value yields its
+/// inner text as the reference target.
+fn dsl_literal_target(key: &str, value: &str, dsl_fields: &[String]) -> Option<String> {
+    if !dsl_fields.iter().any(|f| f == key) {
+        return None;
+    }
+    let trimmed = value.trim();
+    if !(trimmed.starts_with('"') && trimmed.ends_with('"')) {
+        return None;
+    }
+    let inner = strip_quotes(trimmed);
+    if inner.is_empty() {
+        return None;
+    }
+    Some(inner.to_string())
 }
 
 /// Build a [`NodeKind::Constant`] resource marker node with the deterministic

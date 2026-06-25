@@ -12,6 +12,7 @@
 
 pub mod godot;
 pub(crate) mod godot_common;
+pub(crate) mod godot_dsl_config;
 pub(crate) mod godot_project;
 pub(crate) mod godot_resource;
 pub(crate) mod godot_scene;
