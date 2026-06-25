@@ -52,6 +52,7 @@ use codegraph_core::node_id::generate_node_id;
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 
 use super::framework_node;
+use super::godot_common::{map_res_path, map_res_path_inner, quoted_strings};
 use crate::types::{FrameworkResolverExtractionResult, RefView};
 
 /// The marker basename this parser handles.
@@ -293,60 +294,6 @@ fn split_key_value(line: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((key, value))
-}
-
-/// Map a quoted Godot value (`"[*]res://path"`) to a repo-relative path.
-/// Strips the surrounding quotes, a leading `*`, the `res://` scheme, and any
-/// remaining leading `/`. Returns `None` if the result is not a `res://` path
-/// or is empty.
-fn map_res_path(value: &str) -> Option<String> {
-    let unquoted = strip_quotes(value);
-    map_res_path_inner(unquoted)
-}
-
-/// Same as [`map_res_path`] but for an already-unquoted token.
-fn map_res_path_inner(token: &str) -> Option<String> {
-    let token = token.trim();
-    let token = token.strip_prefix('*').unwrap_or(token);
-    let rest = token.strip_prefix("res://")?;
-    let rest = rest.trim_start_matches('/');
-    if rest.is_empty() {
-        return None;
-    }
-    Some(rest.to_string())
-}
-
-/// Strip one pair of surrounding double quotes, if present.
-fn strip_quotes(value: &str) -> &str {
-    let v = value.trim();
-    v.strip_prefix('"')
-        .and_then(|s| s.strip_suffix('"'))
-        .unwrap_or(v)
-}
-
-/// Yield every double-quoted substring's inner text from `s`
-/// (`PackedStringArray("a", "b")` → `["a", "b"]`).
-fn quoted_strings(s: &str) -> Vec<&str> {
-    let bytes = s.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'"' {
-            let start = i + 1;
-            let mut j = start;
-            while j < bytes.len() && bytes[j] != b'"' {
-                j += 1;
-            }
-            if j < bytes.len() {
-                out.push(&s[start..j]);
-                i = j + 1;
-                continue;
-            }
-            break; // unterminated quote — stop
-        }
-        i += 1;
-    }
-    out
 }
 
 /// Net `{` minus `}` count on a line (string-content unaware, sufficient for

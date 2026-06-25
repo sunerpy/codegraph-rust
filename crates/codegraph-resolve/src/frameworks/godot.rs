@@ -40,6 +40,7 @@
 use codegraph_core::types::{Language, Node};
 
 use super::godot_project;
+use super::godot_scene;
 use crate::framework::FrameworkResolver;
 use crate::types::{FrameworkResolverExtractionResult, RefView, ResolutionContext, ResolvedRef};
 
@@ -97,15 +98,22 @@ impl FrameworkResolver for GodotResolver {
     ///
     /// L1 (T3): when the file's basename is `project.godot`, delegate to
     /// [`godot_project::parse_project_godot`] (autoload-singleton graph + input
-    /// actions + main scene + enabled plugins) and return its result.
+    /// actions + main scene + enabled plugins).
     ///
-    /// Every other file returns `None` for now — T4 adds the `.tscn` branch and
-    /// T5 the `.tres` branch here, dispatching the same way (basename / extension
-    /// match → a sibling parser helper → `Some(result)`), so the resolver
-    /// pipeline (`extract_and_persist_frameworks`) persists their nodes/edges.
+    /// L2 (T4): when the file's basename ends in `.tscn`, delegate to
+    /// [`godot_scene::parse_tscn`] (scene-tree nodes + script-binding,
+    /// signal-handler, group-membership, and instanced-subscene references).
+    ///
+    /// Every other file returns `None` for now — T5 adds the `.tres` branch
+    /// here, dispatching the same way (extension match → a sibling parser
+    /// helper → `Some(result)`), so the resolver pipeline
+    /// (`extract_and_persist_frameworks`) persists their nodes/edges.
     fn extract(&self, file_path: &str, content: &str) -> Option<FrameworkResolverExtractionResult> {
         if godot_project::is_project_godot(file_path) {
             return Some(godot_project::parse_project_godot(file_path, content));
+        }
+        if godot_scene::is_tscn(file_path) {
+            return Some(godot_scene::parse_tscn(file_path, content));
         }
         None
     }
