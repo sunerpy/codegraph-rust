@@ -182,6 +182,8 @@ pub fn reopen_count() -> u64 {
     REOPEN_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+type AdoptionObserver = Box<dyn FnMut(&std::path::Path)>;
+
 /// Holds the default project path and a per-path engine cache (mirrors
 /// `ToolHandler.projectCache`, `tools.ts:591`). Each cached engine carries the
 /// db-file identity it was opened against, so [`McpServer::engine_for`] can
@@ -190,6 +192,7 @@ pub struct McpServer {
     default_project: Option<PathBuf>,
     engines: HashMap<PathBuf, CachedEngine>,
     workspace_roots: WorkspaceRoots,
+    adoption_observer: Option<AdoptionObserver>,
 }
 
 impl McpServer {
@@ -198,6 +201,19 @@ impl McpServer {
             default_project,
             engines: HashMap::new(),
             workspace_roots: WorkspaceRoots::new(),
+            adoption_observer: None,
+        }
+    }
+
+    pub fn with_adoption_observer(
+        default_project: Option<PathBuf>,
+        adoption_observer: AdoptionObserver,
+    ) -> Self {
+        Self {
+            default_project,
+            engines: HashMap::new(),
+            workspace_roots: WorkspaceRoots::new(),
+            adoption_observer: Some(adoption_observer),
         }
     }
 
@@ -280,8 +296,12 @@ impl McpServer {
         let is_request = req.id.is_some();
         match req.method.as_str() {
             "initialize" if is_request => {
-                self.workspace_roots
-                    .adopt_from_initialize(&mut self.default_project, req.params.as_ref());
+                if let Some(adopted) = self
+                    .workspace_roots
+                    .adopt_from_initialize(&mut self.default_project, req.params.as_ref())
+                {
+                    self.notify_adopted(&adopted);
+                }
                 if self
                     .workspace_roots
                     .should_request_roots(self.default_project.as_ref(), req.params.as_ref())
@@ -325,8 +345,18 @@ impl McpServer {
         if !is_roots_response {
             return;
         }
-        self.workspace_roots
-            .adopt_from_roots_result(&mut self.default_project, response.get("result"));
+        if let Some(adopted) = self
+            .workspace_roots
+            .adopt_from_roots_result(&mut self.default_project, response.get("result"))
+        {
+            self.notify_adopted(&adopted);
+        }
+    }
+
+    fn notify_adopted(&mut self, path: &std::path::Path) {
+        if let Some(observer) = &mut self.adoption_observer {
+            observer(path);
+        }
     }
 
     /// `handleToolsCall` (`session.ts:204-232`). Validates the tool name; an
@@ -480,6 +510,7 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -581,6 +612,30 @@ mod tests {
         );
 
         assert_eq!(server.default_project(), Some(project.path()));
+    }
+
+    #[test]
+    fn roots_list_response_notifies_adoption_observer() {
+        let project = indexed_project("observer");
+        let observed = Arc::new(Mutex::new(None));
+        let observed_for_callback = Arc::clone(&observed);
+        let mut server = McpServer::with_adoption_observer(
+            None,
+            Box::new(move |path| {
+                *observed_for_callback.lock().unwrap() = Some(path.to_path_buf());
+            }),
+        );
+        let _ = run_initialize_capture(
+            &mut server,
+            json!({ "capabilities": { "roots": { "listChanged": true } } }),
+        );
+
+        run_roots_list_response(
+            &mut server,
+            json!([{ "uri": format!("file://{}", project.path().display()), "name": "proj" }]),
+        );
+
+        assert_eq!(observed.lock().unwrap().as_deref(), Some(project.path()));
     }
 
     #[test]

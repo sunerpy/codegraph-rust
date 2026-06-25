@@ -1120,10 +1120,35 @@ fn serve_direct(project: Option<PathBuf>, project_root: &Path, no_watch: bool) -
 fn serve_direct_no_services(project: Option<PathBuf>, _project_root: &Path) -> Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
-    let mut server = McpServer::new(project);
+    let mut server =
+        McpServer::with_adoption_observer(project, Box::new(start_daemon_for_adopted_root));
     server
         .run(BufReader::new(stdin.lock()), stdout.lock())
         .context("running MCP stdio server")
+}
+
+fn start_daemon_for_adopted_root(project_root: &Path) {
+    if daemon_opt_out() || is_daemon_internal() || !should_run_daemon_services(project_root) {
+        return;
+    }
+    if !codegraph_dir(project_root).is_dir() || daemon_already_running(project_root) {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    match codegraph_daemon::spawn_detached_daemon(&exe, project_root) {
+        Ok(()) => {
+            poll_for_daemon_socket(project_root);
+            eprintln!(
+                "[CodeGraph MCP] Started shared daemon for adopted project root {}",
+                project_root.display()
+            );
+        }
+        Err(err) => {
+            eprintln!("[CodeGraph MCP] Adopted project daemon start failed: {err}");
+        }
+    }
 }
 
 /// Whether daemon-style background services (detached daemon, file watcher,
