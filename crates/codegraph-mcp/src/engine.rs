@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use codegraph_core::types::{FileRecord, Node, NodeKind};
-use codegraph_graph::graph::{GraphTraverser, NodeEdge};
+use codegraph_graph::graph::{GodotReach, GraphTraverser, NodeEdge};
 use codegraph_graph::query::{search_nodes, SearchOptions};
 use codegraph_store::Store;
 use serde_json::Value;
@@ -190,14 +190,20 @@ impl CodeGraphEngine {
             }
         }
 
+        let godot = match dir {
+            CallDir::Callers => self.godot_honesty(&all_matches.nodes)?,
+            CallDir::Callees => GodotHonesty::default(),
+        };
+
         if aggregated.is_empty() {
             let label = match dir {
                 CallDir::Callers => "callers",
                 CallDir::Callees => "callees",
             };
             return Ok(ToolResult::text(format!(
-                "No {label} found for \"{symbol}\"{}",
-                all_matches.note
+                "No {label} found for \"{symbol}\"{}{}",
+                all_matches.note,
+                godot.annotation(true)
             )));
         }
 
@@ -207,9 +213,10 @@ impl CodeGraphEngine {
             CallDir::Callees => format!("Callees of {symbol}"),
         };
         let formatted = format!(
-            "{}{}",
+            "{}{}{}",
             format_node_list(&title, &aggregated),
-            all_matches.note
+            all_matches.note,
+            godot.annotation(false)
         );
         Ok(ToolResult::text(truncate_output(&formatted)))
     }
@@ -251,7 +258,15 @@ impl CodeGraphEngine {
             .iter()
             .filter_map(|id| merged.get(id))
             .collect();
-        let formatted = format!("{}{}", format_impact(&symbol, &ordered), all_matches.note);
+        let godot = self.godot_honesty(&all_matches.nodes)?;
+        let match_ids: HashSet<&str> = all_matches.nodes.iter().map(|n| n.id.as_str()).collect();
+        let no_static_dependents = ordered.iter().all(|n| match_ids.contains(n.id.as_str()));
+        let formatted = format!(
+            "{}{}{}",
+            format_impact(&symbol, &ordered),
+            all_matches.note,
+            godot.annotation(no_static_dependents)
+        );
         Ok(ToolResult::text(truncate_output(&formatted)))
     }
 
@@ -1184,6 +1199,31 @@ impl CodeGraphEngine {
         })
     }
 
+    /// Aggregate the Godot dynamic-reachability honesty signal across the name
+    /// matches. Returns an all-empty summary for any project without Godot links
+    /// to those matches — the gate that keeps non-Godot output byte-unchanged.
+    fn godot_honesty(&self, nodes: &[Node]) -> anyhow::Result<GodotHonesty> {
+        let traverser = GraphTraverser::new(&self.store);
+        let mut summary = GodotHonesty::default();
+        let mut seen = HashSet::new();
+        for node in nodes {
+            let reach = traverser.godot_dynamic_reachability(node)?;
+            for r in &reach.reached_by {
+                match r {
+                    GodotReach::SceneOrResourceLink => summary.reached_via_scene = true,
+                    GodotReach::Autoload => summary.reached_via_autoload = true,
+                }
+            }
+            for name in reach.dynamic_unresolved {
+                if seen.insert(name.clone()) {
+                    summary.dynamic_unresolved.push(name);
+                }
+            }
+        }
+        summary.dynamic_unresolved.sort();
+        Ok(summary)
+    }
+
     /// FTS search + the colon-strip fallback for qualified names
     /// (`tools.ts:3241-3248`).
     fn search_qualified(&self, symbol: &str, limit: i64) -> anyhow::Result<Vec<Node>> {
@@ -1521,6 +1561,56 @@ enum CallDir {
 struct AllSymbols {
     nodes: Vec<Node>,
     note: String,
+}
+
+/// Godot honesty signal for the callers/impact tools: runtime-reachability
+/// reasons (so a symbol reached only via a Godot link is never reported dead)
+/// and the matched symbols' own `godot:dynamic:` computed call-sites. All-empty
+/// for non-Godot projects, which keeps the tool text byte-unchanged.
+#[derive(Default)]
+struct GodotHonesty {
+    reached_via_scene: bool,
+    reached_via_autoload: bool,
+    dynamic_unresolved: Vec<String>,
+}
+
+impl GodotHonesty {
+    fn is_dynamically_reachable(&self) -> bool {
+        self.reached_via_scene || self.reached_via_autoload
+    }
+
+    fn reachability_sources(&self) -> String {
+        let mut parts = Vec::new();
+        if self.reached_via_scene {
+            parts.push("signal/get_node/group");
+        }
+        if self.reached_via_autoload {
+            parts.push("autoload");
+        }
+        parts.join("/")
+    }
+
+    /// The text appended to the callers/impact body. `no_static_callers` gates
+    /// the "may be reached dynamically" line so it replaces a bare "no callers"
+    /// only when there genuinely are none.
+    fn annotation(&self, no_static_callers: bool) -> String {
+        let mut out = String::new();
+        if self.is_dynamically_reachable() && no_static_callers {
+            out.push_str(&format!(
+                "\n\n> No static callers — may be reached dynamically (Godot {}).",
+                self.reachability_sources()
+            ));
+        }
+        if !self.dynamic_unresolved.is_empty() {
+            out.push_str(
+                "\n\n### Dynamic / unresolved references (cannot be statically confirmed)\n",
+            );
+            for name in &self.dynamic_unresolved {
+                out.push_str(&format!("\n- `{name}`"));
+            }
+        }
+        out
+    }
 }
 
 /// The explore subgraph: nodes (insertion-ordered), edges, roots, and per-file

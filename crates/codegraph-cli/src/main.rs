@@ -21,7 +21,7 @@ use codegraph_core::logger::{init_logger, LoggerConfig};
 use codegraph_core::node_id::hash_content;
 use codegraph_core::types::{ExtractionResult, FileRecord, Language, Node, NodeKind};
 use codegraph_extract::{detect_language, extract_source, ExtractOptions};
-use codegraph_graph::graph::GraphTraverser;
+use codegraph_graph::graph::{GodotReach, GraphTraverser};
 use codegraph_graph::query::{search_nodes, SearchOptions};
 use codegraph_mcp::McpServer;
 use codegraph_resolve::ReferenceResolver;
@@ -1264,10 +1264,16 @@ fn cmd_callers(
     let project = resolve_required_project(path)?;
     let store = open_store(&project)?;
     let nodes = related_nodes_for_symbol(&store, &project, &symbol, limit, Related::Callers)?;
+    let godot = godot_honesty_for_symbol(&store, &project, &symbol)?;
     if json_output {
-        print_json_pretty(&json!({ "symbol": symbol, "callers": nodes }))?;
+        print_json_pretty(&json!({
+            "symbol": symbol,
+            "callers": nodes,
+            "godotDynamic": godot.as_json(),
+        }))?;
     } else {
         print_related("Callers", &symbol, &nodes);
+        godot.print_cli(nodes.is_empty());
     }
     Ok(())
 }
@@ -1316,6 +1322,7 @@ fn cmd_impact(
         }
     }
     let affected = nodes.values().map(NodeSummary::from).collect::<Vec<_>>();
+    let godot = godot_honesty_for_symbol(&store, &project, &symbol)?;
     if json_output {
         print_json_pretty(&json!({
             "symbol": symbol,
@@ -1323,6 +1330,7 @@ fn cmd_impact(
             "nodeCount": affected.len(),
             "edgeCount": edge_keys.len(),
             "affected": affected,
+            "godotDynamic": godot.as_json(),
         }))?;
     } else {
         println!(
@@ -1331,6 +1339,7 @@ fn cmd_impact(
             affected.len()
         );
         print_by_file(&affected);
+        godot.print_cli(affected.is_empty());
     }
     Ok(())
 }
@@ -2083,6 +2092,98 @@ fn related_nodes_for_symbol(
 enum Related {
     Callers,
     Callees,
+}
+
+/// Collected Godot honesty signals for the matched symbols of one query: the
+/// runtime-reachability reasons (so "no static callers" is never reported as
+/// dead) and the symbols' own `godot:dynamic:` computed call-sites. Empty for
+/// non-Godot projects, which keeps the caller/impact output byte-unchanged.
+#[derive(Debug, Default)]
+struct GodotHonestySummary {
+    reached_via_scene: bool,
+    reached_via_autoload: bool,
+    dynamic_unresolved: Vec<String>,
+}
+
+impl GodotHonestySummary {
+    fn has_signal(&self) -> bool {
+        self.reached_via_scene || self.reached_via_autoload || !self.dynamic_unresolved.is_empty()
+    }
+
+    fn is_dynamically_reachable(&self) -> bool {
+        self.reached_via_scene || self.reached_via_autoload
+    }
+
+    fn reachability_sources(&self) -> String {
+        let mut parts = Vec::new();
+        if self.reached_via_scene {
+            parts.push("signal/get_node/group");
+        }
+        if self.reached_via_autoload {
+            parts.push("autoload");
+        }
+        parts.join("/")
+    }
+
+    fn as_json(&self) -> serde_json::Value {
+        if !self.has_signal() {
+            return serde_json::Value::Null;
+        }
+        json!({
+            "dynamicallyReachable": self.is_dynamically_reachable(),
+            "reachedViaScene": self.reached_via_scene,
+            "reachedViaAutoload": self.reached_via_autoload,
+            "dynamicUnresolved": self.dynamic_unresolved,
+        })
+    }
+
+    fn print_cli(&self, callers_were_empty: bool) {
+        if self.is_dynamically_reachable() && callers_were_empty {
+            println!(
+                "no static callers - may be reached dynamically (Godot {})",
+                self.reachability_sources()
+            );
+        }
+        if !self.dynamic_unresolved.is_empty() {
+            println!("\ndynamic / unresolved references (cannot be statically confirmed):");
+            for name in &self.dynamic_unresolved {
+                println!("  {name}");
+            }
+        }
+    }
+}
+
+/// Aggregate the Godot dynamic-reachability signal across the exact/top matches
+/// for `symbol`. Returns an all-empty summary for any project without Godot
+/// links to those matches — the gate that keeps non-Godot output unchanged.
+fn godot_honesty_for_symbol(
+    store: &Store,
+    project: &Path,
+    symbol: &str,
+) -> Result<GodotHonestySummary> {
+    let matches = symbol_matches(store, project, symbol)?;
+    let mut summary = GodotHonestySummary::default();
+    if matches.is_empty() {
+        return Ok(summary);
+    }
+    let traverser = GraphTraverser::new(store);
+    let mut seen = HashSet::new();
+    for node in exact_or_top_matches(&matches, symbol) {
+        let reach = traverser.godot_dynamic_reachability(node)?;
+        for r in &reach.reached_by {
+            match r {
+                GodotReach::SceneOrResourceLink => summary.reached_via_scene = true,
+                GodotReach::Autoload => summary.reached_via_autoload = true,
+            }
+        }
+        for name in reach.dynamic_unresolved {
+            if seen.insert(name.clone()) {
+                summary.dynamic_unresolved.push(name);
+            }
+        }
+    }
+    summary.dynamic_unresolved.sort();
+    Ok(summary)
 }
 
 fn symbol_matches(store: &Store, project: &Path, symbol: &str) -> Result<Vec<Node>> {
