@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.1](https://github.com/sunerpy/codegraph-rust/compare/v0.12.0...v0.12.1) (2026-06-25)
+
+
+### Bug Fixes
+
+* **mcp:** assert serverInfo.version dynamically so release bumps never break golden ([#45](https://github.com/sunerpy/codegraph-rust/issues/45)) ([1138fe7](https://github.com/sunerpy/codegraph-rust/commit/1138fe7f0c90de1d5421ed1ad2f357f6719dc03e))
+
 ## [0.12.0](https://github.com/sunerpy/codegraph-rust/compare/v0.11.0...v0.12.0) (2026-06-25)
 
 
