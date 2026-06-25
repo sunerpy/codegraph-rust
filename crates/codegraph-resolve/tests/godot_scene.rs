@@ -171,11 +171,50 @@ groups = [\"players\"]
     let a = extract("scenes/Player.tscn", content);
     let b = extract("scenes/Player.tscn", content);
 
-    // Then node ids and the full node/ref ordering are byte-identical.
-    let ids_a: Vec<&str> = a.nodes.iter().map(|n| n.id.as_str()).collect();
-    let ids_b: Vec<&str> = b.nodes.iter().map(|n| n.id.as_str()).collect();
-    assert_eq!(ids_a, ids_b, "node ids must be deterministic");
-    assert_eq!(a, b, "the whole extraction result must be identical");
+    // `updated_at` is a wall-clock value the shared `framework_node` helper
+    // stamps, so it is EXCLUDED here — two extract() calls can straddle a
+    // millisecond boundary under load. Assert only parser-controlled fields.
+    let nodes_a: Vec<(&str, &str, NodeKind)> = a
+        .nodes
+        .iter()
+        .map(|n| (n.id.as_str(), n.name.as_str(), n.kind))
+        .collect();
+    let nodes_b: Vec<(&str, &str, NodeKind)> = b
+        .nodes
+        .iter()
+        .map(|n| (n.id.as_str(), n.name.as_str(), n.kind))
+        .collect();
+    assert_eq!(
+        nodes_a, nodes_b,
+        "node ids/names/kinds/order must be deterministic"
+    );
+
+    let refs_a: Vec<(&str, &str, EdgeKind)> = a
+        .references
+        .iter()
+        .map(|r| {
+            (
+                r.from_node_id.as_str(),
+                r.reference_name.as_str(),
+                r.reference_kind,
+            )
+        })
+        .collect();
+    let refs_b: Vec<(&str, &str, EdgeKind)> = b
+        .references
+        .iter()
+        .map(|r| {
+            (
+                r.from_node_id.as_str(),
+                r.reference_name.as_str(),
+                r.reference_kind,
+            )
+        })
+        .collect();
+    assert_eq!(
+        refs_a, refs_b,
+        "reference source/target/kind/order must be deterministic"
+    );
 }
 
 #[test]
@@ -189,10 +228,10 @@ fn extract_routes_only_tscn_not_gd_or_tres() {
         .extract("a/b/c/Deep.tscn", "[gd_scene format=3]\n")
         .is_some());
 
-    // A .gd file is not this layer's job — None.
+    // A .gd file now routes to T6's GDScript dynamic parser (Some).
     assert!(GodotResolver
         .extract("player.gd", "extends Node\n")
-        .is_none());
+        .is_some());
     // A .tres routes to T5's resource parser (Some, via that parser, not this).
     assert!(GodotResolver
         .extract("data/item.tres", "[gd_resource format=3]\n")

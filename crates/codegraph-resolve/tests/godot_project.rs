@@ -174,11 +174,52 @@ run/main_scene=\"res://main.tscn\"
     let a = extract("project.godot", content);
     let b = extract("project.godot", content);
 
-    // Then node ids and the full node/ref ordering are byte-identical.
-    let ids_a: Vec<&str> = a.nodes.iter().map(|n| n.id.as_str()).collect();
-    let ids_b: Vec<&str> = b.nodes.iter().map(|n| n.id.as_str()).collect();
-    assert_eq!(ids_a, ids_b, "node ids must be deterministic");
-    assert_eq!(a, b, "the whole extraction result must be identical");
+    // Then every parser-controlled field matches across runs. `updated_at` is a
+    // wall-clock value the shared `framework_node` helper stamps (same as the
+    // other resolvers), so it is intentionally EXCLUDED — two extract() calls
+    // can straddle a millisecond boundary under load. The parser controls node
+    // ids/names/kinds and reference targets/kinds/order, not the clock.
+    let nodes_a: Vec<(&str, &str, NodeKind)> = a
+        .nodes
+        .iter()
+        .map(|n| (n.id.as_str(), n.name.as_str(), n.kind))
+        .collect();
+    let nodes_b: Vec<(&str, &str, NodeKind)> = b
+        .nodes
+        .iter()
+        .map(|n| (n.id.as_str(), n.name.as_str(), n.kind))
+        .collect();
+    assert_eq!(
+        nodes_a, nodes_b,
+        "node ids/names/kinds/order must be deterministic"
+    );
+
+    let refs_a: Vec<(&str, &str, EdgeKind)> = a
+        .references
+        .iter()
+        .map(|r| {
+            (
+                r.from_node_id.as_str(),
+                r.reference_name.as_str(),
+                r.reference_kind,
+            )
+        })
+        .collect();
+    let refs_b: Vec<(&str, &str, EdgeKind)> = b
+        .references
+        .iter()
+        .map(|r| {
+            (
+                r.from_node_id.as_str(),
+                r.reference_name.as_str(),
+                r.reference_kind,
+            )
+        })
+        .collect();
+    assert_eq!(
+        refs_a, refs_b,
+        "reference source/target/kind/order must be deterministic"
+    );
 }
 
 #[test]
@@ -205,8 +246,11 @@ jump={
 
 #[test]
 fn extract_returns_none_for_non_project_godot_file() {
-    // A .gd file is not this layer's job — extract() returns None.
-    assert!(GodotResolver.extract("foo.gd", "extends Node\n").is_none());
+    // A .gd file now routes to T6's GDScript dynamic parser (Some), not this
+    // project parser.
+    assert!(GodotResolver.extract("foo.gd", "extends Node\n").is_some());
+    // A genuinely unclaimed file → None.
+    assert!(GodotResolver.extract("README.md", "# hi\n").is_none());
     // A .tres routes to T5's resource parser (Some, not this project parser).
     assert!(GodotResolver
         .extract("data/item.tres", "[gd_resource]\n")
