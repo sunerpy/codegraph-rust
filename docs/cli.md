@@ -409,8 +409,10 @@ filesystem root (`/`) or the current user's home directory (`$HOME`). This
 commonly happens when an IDE or agent (e.g. Kiro) launches `codegraph serve
 --mcp` with no `--path` and its working directory resolves to `$HOME`. In that
 case the watcher is disabled and the reason is logged — tool queries still work
-off any existing index. The remedy: open a specific project folder, let the
-client send its workspace root via the MCP `initialize` handshake, or pass
+off any existing index, and clients that advertise MCP roots support are asked
+for `roots/list` so the server can adopt their first indexed workspace root. The
+remedy for clients that do not support roots: open a specific project folder, let
+the client send its workspace root via the MCP `initialize` handshake, or pass
 `--path <project>` explicitly. `CODEGRAPH_FORCE_WATCH=1` does **not** override
 this guard (it only overrides the WSL2 `/mnt/` disable).
 

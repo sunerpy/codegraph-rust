@@ -118,26 +118,31 @@ files. Events are debounced (default ~2 s; tunable via
 rebuild rather than many. The watcher is auto-disabled on WSL2 `/mnt/` drives
 where recursive watch is too slow; set `CODEGRAPH_FORCE_WATCH=1` to override.
 When the resolved root is exactly `$HOME` or the filesystem root (`/`), the
-server disables the daemon, the file watcher, AND catch-up sync — not just the
-watcher. This happens when an IDE or agent (e.g. Kiro) launches
+server first disables the daemon, the file watcher, AND catch-up sync — not just
+the watcher. This happens when an IDE or agent (e.g. Kiro) launches
 `codegraph serve --mcp` with no `--path` and its CWD is the home directory;
 without the guard, the server would spawn a daemon that indexes the entire home
-tree and peg a CPU at 99%. In this mode the server still answers all tool queries
-off any existing `.codegraph` index, but it will not start background services.
-`CODEGRAPH_FORCE_WATCH` does **not** override this guard (it only overrides the
-WSL2 `/mnt/` disable). A real project nested under `$HOME` (e.g.
-`~/projects/myapp`) is unaffected and gets the full daemon, watcher, and
-catch-up. To guarantee per-project services when your client launches from home,
-pin the root via `--path <project>` in the client's MCP config args (e.g. a
-workspace-level `.kiro/settings/mcp.json`), or open the project folder as the
-working directory.
+tree and peg a CPU at 99%. In this initial safe mode the server still answers all
+tool queries off any existing `.codegraph` index, but it will not start
+background services against `$HOME`. If the client advertises MCP roots support,
+the server then sends `roots/list` and adopts the first indexed root from the
+client's response, so a single global config can recover the real project even
+when the launch CWD was home. `CODEGRAPH_FORCE_WATCH` does **not** override this
+guard (it only overrides the WSL2 `/mnt/` disable). A real project nested under
+`$HOME` (e.g. `~/projects/myapp`) is unaffected and gets the full daemon,
+watcher, and catch-up. To guarantee per-project services for clients that do not
+support roots, pin the root via `--path <project>` in the client's MCP config
+args (e.g. a workspace-level `.kiro/settings/mcp.json`), or open the project
+folder as the working directory.
 
 When `serve --mcp` is started without an explicit `--path`, the server reads the
 MCP `initialize` handshake sent by the client and adopts the workspace it
 advertises (`rootUri`, `rootPath`, or `workspaceFolders[0].uri`) as its project
-root — provided that path is already indexed. This means a single global MCP
-config (one `serve --mcp` entry, no `--path`) correctly serves whichever
-project window is connected, without any per-project config.
+root — provided that path is already indexed. If the client does not include
+those fields but advertises `capabilities.roots`, the server asks the client for
+`roots/list` and adopts the first indexed root from that response. This means a
+single global MCP config (one `serve --mcp` entry, no `--path`) correctly serves
+whichever project window is connected, without any per-project config.
 
 The daemon exits automatically after all clients disconnect and an idle timeout
 elapses. Logs are appended to `.codegraph/daemon.log`. A stale lock (e.g. after

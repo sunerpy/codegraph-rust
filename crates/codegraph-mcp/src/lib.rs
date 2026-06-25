@@ -15,6 +15,7 @@ pub mod engine;
 pub mod explore_budget;
 pub mod instructions;
 pub mod protocol;
+mod roots;
 pub mod schemas;
 pub mod server;
 

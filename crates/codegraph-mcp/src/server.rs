@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 use crate::engine::CodeGraphEngine;
 use crate::instructions::SERVER_INSTRUCTIONS;
 use crate::protocol::{error_codes, JsonRpcRequest, JsonRpcResponse, ToolResult};
+use crate::roots::{db_path_for, roots_list_request, WorkspaceRoots, ROOTS_LIST_REQUEST_ID};
 use crate::schemas;
 
 /// `PROTOCOL_VERSION` (`session.ts:34`).
@@ -27,13 +28,6 @@ const SERVER_NAME: &str = "codegraph";
 /// `SERVER_INFO.version` — follows the real crate version (`CARGO_PKG_VERSION`),
 /// so it auto-tracks release-please bumps instead of drifting.
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// The relative `.codegraph/codegraph.db` path under a project root, honoring
-/// the `CODEGRAPH_DIR` override (mirrors [`McpServer::has_default_codegraph`]).
-fn db_path_for(project_path: &std::path::Path) -> PathBuf {
-    let dir = std::env::var("CODEGRAPH_DIR").unwrap_or_else(|_| ".codegraph".to_string());
-    project_path.join(dir).join("codegraph.db")
-}
 
 /// Stable identity of the on-disk database file, used to tell a REPLACEMENT
 /// (a fresh file at the same path) apart from an in-place write. Keyed on the
@@ -195,6 +189,7 @@ pub fn reopen_count() -> u64 {
 pub struct McpServer {
     default_project: Option<PathBuf>,
     engines: HashMap<PathBuf, CachedEngine>,
+    workspace_roots: WorkspaceRoots,
 }
 
 impl McpServer {
@@ -202,6 +197,7 @@ impl McpServer {
         Self {
             default_project,
             engines: HashMap::new(),
+            workspace_roots: WorkspaceRoots::new(),
         }
     }
 
@@ -225,7 +221,7 @@ impl McpServer {
             if line.trim().is_empty() {
                 continue;
             }
-            if let Some(response) = self.handle_line(&line) {
+            for response in self.handle_line(&line) {
                 let serialized = serde_json::to_string(&response)?;
                 writeln!(writer, "{serialized}")?;
                 writer.flush()?;
@@ -236,23 +232,46 @@ impl McpServer {
 
     /// Parse + dispatch one line. Returns `Some(response)` for a request,
     /// `None` for a notification or unparseable notification.
-    fn handle_line(&mut self, line: &str) -> Option<JsonRpcResponse> {
-        let req: JsonRpcRequest = match serde_json::from_str(line) {
-            Ok(r) => r,
+    fn handle_line(&mut self, line: &str) -> Vec<Value> {
+        let value: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
             Err(_) => {
                 // `transport.ts:167-171`: parse error with a null id.
-                return Some(JsonRpcResponse::error(
+                return vec![json_response(JsonRpcResponse::error(
                     Value::Null,
                     error_codes::PARSE_ERROR,
                     "Parse error: invalid JSON",
-                ));
+                ))];
+            }
+        };
+
+        if value.get("method").is_none() {
+            self.handle_response(&value);
+            return Vec::new();
+        }
+
+        let req: JsonRpcRequest = match serde_json::from_value(value) {
+            Ok(r) => r,
+            Err(_) => {
+                return vec![json_response(JsonRpcResponse::error(
+                    Value::Null,
+                    error_codes::INVALID_REQUEST,
+                    "Invalid Request",
+                ))]
             }
         };
         let id = req.id.clone();
         match self.dispatch(&req) {
-            Dispatch::Reply(value) => id.map(|id| JsonRpcResponse::result(id, value)),
-            Dispatch::Err(code, msg) => id.map(|id| JsonRpcResponse::error(id, code, msg)),
-            Dispatch::Notification => None,
+            Dispatch::Reply(value) => id
+                .map(|id| vec![json_response(JsonRpcResponse::result(id, value))])
+                .unwrap_or_default(),
+            Dispatch::ReplyAndRequest { reply, request } => id
+                .map(|id| vec![json_response(JsonRpcResponse::result(id, reply)), request])
+                .unwrap_or_default(),
+            Dispatch::Err(code, msg) => id
+                .map(|id| vec![json_response(JsonRpcResponse::error(id, code, msg))])
+                .unwrap_or_default(),
+            Dispatch::Notification => Vec::new(),
         }
     }
 
@@ -261,8 +280,20 @@ impl McpServer {
         let is_request = req.id.is_some();
         match req.method.as_str() {
             "initialize" if is_request => {
-                self.adopt_workspace_from_initialize(req.params.as_ref());
-                Dispatch::Reply(initialize_result())
+                self.workspace_roots
+                    .adopt_from_initialize(&mut self.default_project, req.params.as_ref());
+                if self
+                    .workspace_roots
+                    .should_request_roots(self.default_project.as_ref(), req.params.as_ref())
+                {
+                    self.workspace_roots.mark_roots_list_requested();
+                    Dispatch::ReplyAndRequest {
+                        reply: initialize_result(),
+                        request: roots_list_request(),
+                    }
+                } else {
+                    Dispatch::Reply(initialize_result())
+                }
             }
             "initialized" => Dispatch::Notification,
             "notifications/initialized" => Dispatch::Notification,
@@ -286,6 +317,16 @@ impl McpServer {
             ),
             _ => Dispatch::Notification,
         }
+    }
+
+    fn handle_response(&mut self, response: &Value) {
+        let is_roots_response =
+            response.get("id").and_then(Value::as_str) == Some(ROOTS_LIST_REQUEST_ID);
+        if !is_roots_response {
+            return;
+        }
+        self.workspace_roots
+            .adopt_from_roots_result(&mut self.default_project, response.get("result"));
     }
 
     /// `handleToolsCall` (`session.ts:204-232`). Validates the tool name; an
@@ -396,62 +437,6 @@ impl McpServer {
         }
     }
 
-    /// Adopt a workspace root advertised in the `initialize` params as the
-    /// default project, so a single global MCP config (one `serve --mcp` with no
-    /// --path) serves the client's ACTUAL workspace rather than its launch CWD.
-    /// Liberal in what it accepts: LSP-style `rootUri` (a `file://` URI),
-    /// `rootPath` (a bare path), or `workspaceFolders[0].uri`. Clients that send
-    /// none keep current behavior. Adoption only happens when the current
-    /// default is absent or is itself the home directory (the symptom this
-    /// fixes), and the hinted root is indexed (`.codegraph/codegraph.db`), so a
-    /// bogus hint never displaces an explicit `--path` default.
-    fn adopt_workspace_from_initialize(&mut self, params: Option<&Value>) {
-        let Some(params) = params else { return };
-        let path = params
-            .get("rootUri")
-            .and_then(Value::as_str)
-            .and_then(file_uri_to_path)
-            .or_else(|| {
-                params
-                    .get("rootPath")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .map(PathBuf::from)
-            })
-            .or_else(|| {
-                params
-                    .get("workspaceFolders")
-                    .and_then(Value::as_array)
-                    .and_then(|folders| folders.first())
-                    .and_then(|folder| folder.get("uri"))
-                    .and_then(Value::as_str)
-                    .and_then(file_uri_to_path)
-            });
-        let Some(path) = path else { return };
-        if self.default_project.as_ref() == Some(&path) {
-            return;
-        }
-        if !self.default_is_absent_or_home() {
-            return;
-        }
-        if db_path_for(&path).is_file() {
-            self.default_project = Some(path);
-        }
-    }
-
-    /// Whether the current default project is unset or resolves to the user's
-    /// home directory — the only states in which an `initialize` root may
-    /// override it. An explicit `--path` to a real project is preserved.
-    fn default_is_absent_or_home(&self) -> bool {
-        let Some(current) = &self.default_project else {
-            return true;
-        };
-        let Some(home) = home_dir() else {
-            return false;
-        };
-        canonicalize_lenient(current) == canonicalize_lenient(&home)
-    }
-
     /// Test/diagnostic only: the currently adopted default project path.
     #[doc(hidden)]
     pub fn default_project(&self) -> Option<&std::path::Path> {
@@ -459,59 +444,25 @@ impl McpServer {
     }
 }
 
-/// Decode a `file://` URI to a local path, or `None` for any other scheme.
-/// Handles the `file://host/path` and `file:///path` forms and percent-decodes
-/// `%XX` octets (clients encode spaces as `%20`, etc.).
-fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
-    let rest = uri.strip_prefix("file://")?;
-    let path_part = rest.find('/').map(|idx| &rest[idx..]).unwrap_or(rest);
-    let decoded = percent_decode(path_part);
-    if decoded.is_empty() {
-        return None;
-    }
-    Some(PathBuf::from(decoded))
-}
-
-fn home_dir() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        std::env::var_os("USERPROFILE").map(PathBuf::from)
-    }
-    #[cfg(not(windows))]
-    {
-        std::env::var_os("HOME").map(PathBuf::from)
-    }
-}
-
-fn canonicalize_lenient(path: &std::path::Path) -> PathBuf {
-    path.canonicalize()
-        .unwrap_or_else(|_| path.components().collect::<PathBuf>())
-}
-
-fn percent_decode(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hi = (bytes[i + 1] as char).to_digit(16);
-            let lo = (bytes[i + 2] as char).to_digit(16);
-            if let (Some(hi), Some(lo)) = (hi, lo) {
-                out.push((hi * 16 + lo) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 enum Dispatch {
     Reply(Value),
+    ReplyAndRequest { reply: Value, request: Value },
     Err(i64, String),
     Notification,
+}
+
+fn json_response(response: JsonRpcResponse) -> Value {
+    match serde_json::to_value(response) {
+        Ok(value) => value,
+        Err(err) => json!({
+            "jsonrpc": "2.0",
+            "id": null,
+            "error": {
+                "code": error_codes::INTERNAL_ERROR,
+                "message": format!("Internal error: failed to serialize response: {err}"),
+            },
+        }),
+    }
 }
 
 /// The `initialize` result (`session.ts:182-187`).
@@ -558,7 +509,7 @@ mod tests {
         TempProject { path }
     }
 
-    fn run_initialize(server: &mut McpServer, params: Value) {
+    fn run_initialize_capture(server: &mut McpServer, params: Value) -> Vec<Value> {
         let request = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -570,68 +521,66 @@ mod tests {
         server
             .run(Cursor::new(line.into_bytes()), Cursor::new(&mut out))
             .unwrap();
+        parse_json_lines(&out)
+    }
+
+    fn run_roots_list_response(server: &mut McpServer, roots: Value) {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": ROOTS_LIST_REQUEST_ID,
+            "result": { "roots": roots },
+        });
+        let line = format!("{response}\n");
+        let mut out = Vec::new();
+        server
+            .run(Cursor::new(line.into_bytes()), Cursor::new(&mut out))
+            .unwrap();
+        assert!(out.is_empty(), "JSON-RPC responses produce no reply");
+    }
+
+    fn parse_json_lines(bytes: &[u8]) -> Vec<Value> {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
     }
 
     #[test]
-    fn initialize_root_uri_adopts_indexed_workspace() {
-        let project = indexed_project("rooturi");
-        let uri = format!("file://{}", project.path().display());
+    fn initialize_requests_roots_when_client_supports_roots_and_default_is_absent() {
         let mut server = McpServer::new(None);
-        run_initialize(&mut server, json!({ "rootUri": uri }));
-        assert_eq!(server.default_project(), Some(project.path()));
-    }
-
-    #[test]
-    fn initialize_workspace_folders_adopts_indexed_workspace() {
-        let project = indexed_project("wsfolders");
-        let uri = format!("file://{}", project.path().display());
-        let mut server = McpServer::new(None);
-        run_initialize(
+        let responses = run_initialize_capture(
             &mut server,
-            json!({ "workspaceFolders": [{ "uri": uri, "name": "proj" }] }),
+            json!({ "capabilities": { "roots": { "listChanged": true } } }),
         );
-        assert_eq!(server.default_project(), Some(project.path()));
-    }
-
-    #[test]
-    fn initialize_root_path_adopts_indexed_workspace() {
-        let project = indexed_project("rootpath");
-        let mut server = McpServer::new(None);
-        run_initialize(
-            &mut server,
-            json!({ "rootPath": project.path().to_string_lossy() }),
-        );
-        assert_eq!(server.default_project(), Some(project.path()));
-    }
-
-    #[test]
-    fn initialize_does_not_override_explicit_non_home_default() {
-        let explicit = indexed_project("explicit");
-        let hinted = indexed_project("hinted");
-        let uri = format!("file://{}", hinted.path().display());
-        let mut server = McpServer::new(Some(explicit.path().to_path_buf()));
-        run_initialize(&mut server, json!({ "rootUri": uri }));
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["id"], json!(1));
         assert_eq!(
-            server.default_project(),
-            Some(explicit.path()),
-            "an explicit --path default must not be displaced by an initialize hint"
+            responses[0]["result"]["serverInfo"]["name"],
+            json!(SERVER_NAME)
         );
+        assert_eq!(responses[1]["id"], json!(ROOTS_LIST_REQUEST_ID));
+        assert_eq!(responses[1]["method"], json!("roots/list"));
     }
 
     #[test]
-    fn initialize_unindexed_workspace_does_not_displace_default() {
-        let unindexed = std::env::temp_dir().join("cg-mcp-init-unindexed-never");
-        let uri = format!("file://{}", unindexed.display());
+    fn roots_list_response_adopts_first_indexed_workspace() {
+        let project = indexed_project("roots-list");
+        let unindexed = std::env::temp_dir().join("cg-mcp-roots-unindexed-never");
         let mut server = McpServer::new(None);
-        run_initialize(&mut server, json!({ "rootUri": uri }));
-        assert_eq!(server.default_project(), None);
-    }
+        let _ = run_initialize_capture(
+            &mut server,
+            json!({ "capabilities": { "roots": { "listChanged": true } } }),
+        );
 
-    #[test]
-    fn initialize_without_workspace_hint_keeps_default() {
-        let mut server = McpServer::new(None);
-        run_initialize(&mut server, json!({ "capabilities": {} }));
-        assert_eq!(server.default_project(), None);
+        run_roots_list_response(
+            &mut server,
+            json!([
+                { "uri": format!("file://{}", unindexed.display()), "name": "empty" },
+                { "uri": format!("file://{}", project.path().display()), "name": "proj" }
+            ]),
+        );
+
+        assert_eq!(server.default_project(), Some(project.path()));
     }
 
     #[test]
@@ -647,16 +596,5 @@ mod tests {
         assert_eq!(response["id"], json!(7));
         assert_eq!(response["result"]["serverInfo"]["name"], json!(SERVER_NAME));
         assert_eq!(server.default_project(), None);
-    }
-
-    #[test]
-    fn file_uri_decodes_percent_escapes() {
-        let decoded = file_uri_to_path("file:///tmp/my%20project").unwrap();
-        assert_eq!(decoded, PathBuf::from("/tmp/my project"));
-    }
-
-    #[test]
-    fn non_file_scheme_is_rejected() {
-        assert_eq!(file_uri_to_path("https://example.com/x"), None);
     }
 }
