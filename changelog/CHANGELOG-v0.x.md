@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.6](https://github.com/sunerpy/codegraph-rust/compare/v0.15.5...v0.15.6) (2026-06-25)
+
+
+### Bug Fixes
+
+* **mcp:** start daemon after client root adoption ([#72](https://github.com/sunerpy/codegraph-rust/issues/72)) ([7fd0ef8](https://github.com/sunerpy/codegraph-rust/commit/7fd0ef81dab8e9a2057a2f543a30e50e1b7102b0))
+
 ## [0.15.5](https://github.com/sunerpy/codegraph-rust/compare/v0.15.4...v0.15.5) (2026-06-25)
 
 
