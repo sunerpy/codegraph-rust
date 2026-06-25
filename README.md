@@ -336,10 +336,10 @@ accept the project path as a positional argument or `-p/--path`; `query`/`files`
 
 **Does:** deterministic code-structure extraction across 32 languages (TypeScript,
 Python, Go, Rust, Java, C/C++, C#, Vue, Svelte, GDScript, and more — see
-[`docs/languages.md`](docs/languages.md)), cross-file resolution including
-Godot scene/resource/autoload graphs (see [`docs/godot.md`](docs/godot.md)),
-graph traversal, FTS5 search, whole-graph export with deterministic PageRank
-centrality, MCP/CLI surfaces, and golden byte-stable output.
+[`docs/languages.md`](docs/languages.md)), cross-file resolution (including
+Godot project graphs), graph traversal, FTS5 search, whole-graph export with
+deterministic PageRank centrality, MCP/CLI surfaces, and golden byte-stable
+output.
 
 **Doesn't:** no AI / vector / embedding / LLM anywhere inside the binary (hard
 constraint, `scripts/guardrail.sh`-enforced); no semantic search; no languages
@@ -363,19 +363,6 @@ TS/JS), Svelte (delegates script blocks), Astro, Razor/`.cshtml`, Liquid
 nodes; no symbol extraction.
 
 Full list with extensions and per-language notes: [`docs/languages.md`](docs/languages.md).
-
-### Godot projects
-
-For Godot projects (detected by the presence of `project.godot`), CodeGraph
-statically understands scene/resource/autoload structure beyond plain GDScript:
-`project.godot` autoload singletons, `.tscn` node trees and signal connections,
-`.tres` resource references, and dynamic GDScript dispatch patterns
-(`connect`/`get_node`/`$`/`%`/`call`/group methods). Computed targets that
-cannot be confirmed statically are surfaced as `godot:dynamic:…` sentinels
-rather than fabricated edges. CodeGraph does static impact analysis only — it
-does not run the engine or verify runtime behavior. See
-[`docs/godot.md`](docs/godot.md) for the full reference and the
-static-vs-runtime division of labor.
 
 ---
 
