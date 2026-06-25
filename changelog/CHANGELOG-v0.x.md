@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.2](https://github.com/sunerpy/codegraph-rust/compare/v0.15.1...v0.15.2) (2026-06-25)
+
+
+### Bug Fixes
+
+* **watch,mcp:** never watch $HOME, prune nested ignore dirs, adopt MCP workspace root ([#64](https://github.com/sunerpy/codegraph-rust/issues/64)) ([be63060](https://github.com/sunerpy/codegraph-rust/commit/be630608f4fb31315c033a875e6f54edfe099d11))
+
 ## [0.15.1](https://github.com/sunerpy/codegraph-rust/compare/v0.15.0...v0.15.1) (2026-06-25)
 
 
