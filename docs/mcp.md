@@ -136,6 +136,14 @@ The daemon exits automatically after all clients disconnect and an idle timeout
 elapses. Logs are appended to `.codegraph/daemon.log`. A stale lock (e.g. after
 a crash) can be cleared with `codegraph unlock`.
 
+On Unix, the detached daemon calls `setsid` to become a session leader, so when
+the short-lived proxy that spawned it exits the daemon is reparented to `init`
+and reaped automatically — no `<defunct>` zombie appears in the process table.
+The daemon exits when its real host (the IDE or agent running `serve --mcp`)
+dies, detected via `host_pid` liveness; raw parent-pid divergence is not used
+for this check because a deliberately daemonized process legitimately reparents
+to `init`.
+
 To disable the daemon entirely and run the MCP server in the foreground, set
 `CODEGRAPH_NO_DAEMON=1`. For the full set of env-var knobs — timeouts, sweep
 intervals, watch settings — see [`docs/cli.md`](cli.md).
