@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.7](https://github.com/sunerpy/codegraph-rust/compare/v0.15.6...v0.15.7) (2026-06-26)
+
+
+### Bug Fixes
+
+* **mcp:** scope Kiro MCP to project path and guard home-root indexing ([#74](https://github.com/sunerpy/codegraph-rust/issues/74)) ([fd0c049](https://github.com/sunerpy/codegraph-rust/commit/fd0c04948b2679e0648ab6aa153529d54a2b9d95))
+
 ## [0.15.6](https://github.com/sunerpy/codegraph-rust/compare/v0.15.5...v0.15.6) (2026-06-25)
 
 
