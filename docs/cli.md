@@ -47,6 +47,12 @@
 > [Daemon, watch & environment variables](#daemon-watch--environment-variables)
 > for the full env-var reference.
 
+> **`init` / `index` refuse a too-broad root.** Running `codegraph init` or
+> `codegraph index` against exactly `$HOME` or the filesystem root (`/`) is
+> rejected with an error instead of building a home-wide index — that index
+> would be enormous and would make a home-launched `serve --mcp` peg a CPU. Run
+> these commands inside a specific project directory.
+
 ---
 
 ## `codegraph install` / `uninstall` — wire up AI agents
@@ -57,7 +63,15 @@ config file; `uninstall` reverses it. No hand-editing of JSON/TOML required.
 Supported agents (`ALL_TARGETS` order): **Claude Code, Cursor, Codex CLI,
 opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro.** The written MCP
 command launches the Rust binary: `command: "codegraph"`, `args: ["serve",
-"--mcp"]` (Cursor also injects `--path`).
+"--mcp"]` (Cursor and Kiro also inject `--path`).
+
+> **Kiro is best installed project-level.** Kiro launches its stdio MCP
+> subprocess from `$HOME` and its `initialize` carries no workspace root and no
+> `roots` capability, so a bare `serve --mcp` would degrade to home safe mode.
+> The installer therefore injects `--path`. Run
+> `codegraph install --target=kiro --local` from each project root to pin that
+> project's absolute path; a global install pins `${workspaceFolder}`, which
+> Kiro expands per workspace.
 
 ```bash
 codegraph install --yes                          # auto-detect installed agents, global
@@ -408,12 +422,12 @@ The watcher is also auto-disabled when the resolved project root is the
 filesystem root (`/`) or the current user's home directory (`$HOME`). This
 commonly happens when an IDE or agent (e.g. Kiro) launches `codegraph serve
 --mcp` with no `--path` and its working directory resolves to `$HOME`. In that
-case the watcher is disabled and the reason is logged — tool queries still work
-off any existing index, and clients that advertise MCP roots support are asked
-for `roots/list` so the server can adopt their first indexed workspace root and
-start that root's shared daemon. The remedy for clients that do not support
-roots: open a specific project folder, let the client send its workspace root via
-the MCP `initialize` handshake, or pass `--path <project>` explicitly.
+case the watcher is disabled and the reason is logged. Clients that advertise
+MCP roots support are asked for `roots/list`; once the server adopts their first
+indexed workspace root, it starts or attaches to that root's shared daemon and
+proxies the current stdio session to it. The remedy for clients that do not
+support roots: open a specific project folder, let the client send its workspace
+root via the MCP `initialize` handshake, or pass `--path <project>` explicitly.
 `CODEGRAPH_FORCE_WATCH=1` does **not** override this guard (it only overrides the
 WSL2 `/mnt/` disable).
 

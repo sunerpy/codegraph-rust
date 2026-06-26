@@ -20,4 +20,4 @@ pub mod schemas;
 pub mod server;
 
 pub use engine::CodeGraphEngine;
-pub use server::{initialize_result, McpServer};
+pub use server::{initialize_result, McpServer, RunUntilAdoption};

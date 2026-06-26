@@ -23,7 +23,7 @@ use codegraph_core::types::{ExtractionResult, FileRecord, Language, Node, NodeKi
 use codegraph_extract::{detect_language, extract_source, ExtractOptions};
 use codegraph_graph::graph::{GodotReach, GraphTraverser};
 use codegraph_graph::query::{search_nodes, SearchOptions};
-use codegraph_mcp::McpServer;
+use codegraph_mcp::{McpServer, RunUntilAdoption};
 use codegraph_resolve::ReferenceResolver;
 use codegraph_store::queries::SearchResult;
 use codegraph_store::Store;
@@ -797,6 +797,7 @@ fn cmd_init(path: Option<PathBuf>) -> Result<()> {
         println!("Use \"codegraph index\" to re-index or \"codegraph sync\" to update");
         return Ok(());
     }
+    guard_indexable_root(&project)?;
     fs::create_dir_all(codegraph_dir(&project))
         .with_context(|| format!("creating {}", codegraph_dir(&project).display()))?;
     let result = index_project(&project, true, false)?;
@@ -818,6 +819,7 @@ fn cmd_uninit(path: Option<PathBuf>, force: bool) -> Result<()> {
 
 fn cmd_index(path: Option<PathBuf>, force: bool, quiet: bool, verbose: bool) -> Result<()> {
     let project = resolve_required_project(path)?;
+    guard_indexable_root(&project)?;
     if force {
         remove_db_files(&project)?;
     }
@@ -1120,22 +1122,76 @@ fn serve_direct(project: Option<PathBuf>, project_root: &Path, no_watch: bool) -
 fn serve_direct_no_services(project: Option<PathBuf>, _project_root: &Path) -> Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
-    let mut server =
-        McpServer::with_adoption_observer(project, Box::new(start_daemon_for_adopted_root));
-    server
-        .run(BufReader::new(stdin.lock()), stdout.lock())
-        .context("running MCP stdio server")
+    let mut server = McpServer::new(project);
+    match server
+        .run_until_adoption(BufReader::new(stdin.lock()), stdout.lock())
+        .context("running MCP stdio server until workspace adoption")?
+    {
+        RunUntilAdoption::Eof => Ok(()),
+        RunUntilAdoption::Adopted {
+            project_root,
+            reader,
+        } => serve_adopted_project(reader, stdout, project_root),
+    }
 }
 
-fn start_daemon_for_adopted_root(project_root: &Path) {
-    if daemon_opt_out() || is_daemon_internal() || !should_run_daemon_services(project_root) {
-        return;
+fn serve_adopted_project<R: BufRead, W: Write + Send + 'static>(
+    reader: R,
+    writer: W,
+    project_root: PathBuf,
+) -> Result<()> {
+    let Some(socket_path) = start_daemon_for_adopted_root(&project_root) else {
+        let mut server = McpServer::new(Some(project_root));
+        return server
+            .run(reader, writer)
+            .context("running MCP stdio server for adopted project");
+    };
+
+    match codegraph_daemon::attach_to_daemon(&socket_path) {
+        Ok(client) if codegraph_daemon::verify_daemon_hello(&client.hello).is_none() => {}
+        Ok(_) => {
+            tracing::debug!("adopted project daemon version mismatch; serving direct");
+            let mut server = McpServer::new(Some(project_root));
+            return server
+                .run(reader, writer)
+                .context("running MCP stdio server for adopted project");
+        }
+        Err(err) => {
+            tracing::debug!(error = %err, "adopted project daemon preflight failed; serving direct");
+            let mut server = McpServer::new(Some(project_root));
+            return server
+                .run(reader, writer)
+                .context("running MCP stdio server for adopted project");
+        }
     }
-    if !codegraph_dir(project_root).is_dir() || daemon_already_running(project_root) {
-        return;
+
+    match codegraph_daemon::run_proxy(
+        &socket_path,
+        Some(codegraph_daemon::current_ppid()),
+        reader,
+        writer,
+    ) {
+        Ok(codegraph_daemon::ProxyOutcome::Proxied) => Ok(()),
+        Ok(codegraph_daemon::ProxyOutcome::VersionMismatch) => Ok(()),
+        Err(err) => {
+            tracing::debug!(error = %err, "adopted project proxy attach failed");
+            Ok(())
+        }
+    }
+}
+
+fn start_daemon_for_adopted_root(project_root: &Path) -> Option<PathBuf> {
+    if daemon_opt_out() || is_daemon_internal() || !should_run_daemon_services(project_root) {
+        return None;
+    }
+    if !codegraph_dir(project_root).is_dir() {
+        return None;
+    }
+    if daemon_already_running(project_root) {
+        return Some(codegraph_daemon::daemon_socket_path(project_root));
     }
     let Ok(exe) = std::env::current_exe() else {
-        return;
+        return None;
     };
     match codegraph_daemon::spawn_detached_daemon(&exe, project_root) {
         Ok(()) => {
@@ -1144,9 +1200,12 @@ fn start_daemon_for_adopted_root(project_root: &Path) {
                 "[CodeGraph MCP] Started shared daemon for adopted project root {}",
                 project_root.display()
             );
+            let socket_path = codegraph_daemon::daemon_socket_path(project_root);
+            socket_path.exists().then_some(socket_path)
         }
         Err(err) => {
             eprintln!("[CodeGraph MCP] Adopted project daemon start failed: {err}");
+            None
         }
     }
 }
@@ -1157,6 +1216,16 @@ fn start_daemon_for_adopted_root(project_root: &Path) {
 /// via `codegraph_watch::too_broad_root_reason`.
 fn should_run_daemon_services(root: &Path) -> bool {
     codegraph_watch::too_broad_root_reason(root).is_none()
+}
+
+fn guard_indexable_root(root: &Path) -> Result<()> {
+    if let Some(reason) = codegraph_watch::too_broad_root_reason(root) {
+        bail!(
+            "refusing to index {}: {reason}. Run `codegraph init`/`index` inside a specific project directory instead.",
+            root.display()
+        );
+    }
+    Ok(())
 }
 
 /// Spawn a ONE-SHOT background catch-up sync that absorbs edits made while the
@@ -1333,7 +1402,7 @@ pub fn select_serve_mode(
 
 #[cfg(test)]
 mod serve_mode_tests {
-    use super::{select_serve_mode, should_run_daemon_services, ServeMode};
+    use super::{guard_indexable_root, select_serve_mode, should_run_daemon_services, ServeMode};
     use std::path::Path;
     use std::sync::Mutex;
 
@@ -1372,6 +1441,37 @@ mod serve_mode_tests {
         assert!(
             should_run_daemon_services(&nested),
             "a project nested under $HOME must keep daemon services"
+        );
+
+        match prev_home {
+            Some(v) => std::env::set_var(home_key, v),
+            None => std::env::remove_var(home_key),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn guard_indexable_root_rejects_home_and_root_allows_nested_project() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        let prev_home = std::env::var_os(home_key);
+
+        let tmp = std::env::temp_dir().join(format!("cg-guard-home-{}", std::process::id()));
+        let nested = tmp.join("workspace/proj");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::env::set_var(home_key, &tmp);
+
+        assert!(
+            guard_indexable_root(&tmp).is_err(),
+            "$HOME must be refused as an index root"
+        );
+        assert!(
+            guard_indexable_root(Path::new("/")).is_err(),
+            "filesystem root must be refused as an index root"
+        );
+        assert!(
+            guard_indexable_root(&nested).is_ok(),
+            "a project nested under $HOME must be indexable"
         );
 
         match prev_home {
