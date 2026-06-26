@@ -597,13 +597,20 @@ mod tests {
         run_install_local_targets(ctx.cwd.clone(), "kiro").unwrap();
         run_install_local_targets(ctx.cwd.clone(), "kiro").unwrap();
 
-        // Then the project's .kiro/settings/mcp.json pins this project's --path
+        // Then the project's .kiro/settings/mcp.json pins this project's --path.
+        // Parse the JSON (raw-string matching is unreliable on Windows, where the
+        // path's backslashes are escaped as `\\` in the serialized output).
         let mcp = ctx.cwd.join(".kiro").join("settings").join("mcp.json");
         let written = fs::read_to_string(&mcp).expect("project mcp.json written");
-        assert!(written.contains("\"--path\""), "got: {written}");
+        let parsed: serde_json::Value = serde_json::from_str(&written).expect("valid mcp.json");
+        let args = parsed["mcpServers"]["codegraph"]["args"]
+            .as_array()
+            .expect("codegraph args array");
+        let expected_path = serde_json::Value::String(ctx.cwd.to_string_lossy().to_string());
+        assert!(args.contains(&serde_json::Value::String("--path".to_string())));
         assert!(
-            written.contains(&ctx.cwd.to_string_lossy().to_string()),
-            "must pin concrete project path, got: {written}"
+            args.contains(&expected_path),
+            "must pin concrete project path, got: {args:?}"
         );
 
         match prev_home {
