@@ -63,15 +63,18 @@ config file; `uninstall` reverses it. No hand-editing of JSON/TOML required.
 Supported agents (`ALL_TARGETS` order): **Claude Code, Cursor, Codex CLI,
 opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro.** The written MCP
 command launches the Rust binary: `command: "codegraph"`, `args: ["serve",
-"--mcp"]` (Cursor and Kiro also inject `--path`).
+"--mcp"]` (Cursor injects `--path`; Kiro injects `--path` only on a project-local
+install).
 
-> **Kiro is best installed project-level.** Kiro launches its stdio MCP
+> **Kiro must be installed project-level.** Kiro launches its stdio MCP
 > subprocess from `$HOME` and its `initialize` carries no workspace root and no
 > `roots` capability, so a bare `serve --mcp` would degrade to home safe mode.
-> The installer therefore injects `--path`. Run
-> `codegraph install --target=kiro --local` from each project root to pin that
-> project's absolute path; a global install pins `${workspaceFolder}`, which
-> Kiro expands per workspace.
+> Run `codegraph install --target=kiro --local` from each project root — that
+> pins the project's absolute `--path`. A **global** Kiro install intentionally
+> writes **no** MCP entry (and removes a stale one left by an older version),
+> because Kiro CLI does not expand `${workspaceFolder}` in `mcp.json` args: a
+> global `--path ${workspaceFolder}` would resolve to a literal, non-existent
+> directory and break the watcher and catch-up sync.
 
 ```bash
 codegraph install --yes                          # auto-detect installed agents, global

@@ -35,22 +35,21 @@ fn steering_path(ctx: &InstallContext, loc: Location) -> PathBuf {
     config_dir(ctx, loc).join("steering").join("codegraph.md")
 }
 
-/// Build the Kiro MCP entry with an explicit `--path`, mirroring Cursor.
+const KIRO_LOCAL_GUIDANCE: &str = "Kiro is project-scoped: run `codegraph install --target=kiro --local` from each project root. That pins the project's absolute --path so the server serves that project. A global install is intentionally NOT written — Kiro CLI does not expand ${workspaceFolder} in mcp.json args, so a global --path would resolve to a literal, broken directory.";
+
+/// Build the project-local Kiro MCP entry with an explicit `--path = ctx.cwd`.
 ///
 /// Kiro's `initialize` carries no `rootUri`/`workspaceFolders` and does not
-/// advertise `capabilities.roots`, so a bare global `serve --mcp` launched from
-/// `$HOME` cannot discover the project and degrades to home safe mode. Pinning
-/// `--path` fixes that: Local pins the concrete `ctx.cwd`; Global pins
-/// `${workspaceFolder}`, which Kiro expands per workspace.
-fn build_kiro_mcp_config(ctx: &InstallContext, loc: Location) -> Value {
-    let path_arg = match loc {
-        Location::Local => ctx.cwd.to_string_lossy().to_string(),
-        Location::Global => "${workspaceFolder}".to_string(),
-    };
+/// advertise `capabilities.roots`, so a bare `serve --mcp` cannot discover the
+/// project and degrades to home safe mode. Pinning the concrete project root
+/// fixes that. Only Local installs write an entry: Kiro CLI does not expand
+/// `${workspaceFolder}`, so a global `--path` variable would resolve to a
+/// literal, non-existent directory (the watcher/sync then fail on it).
+fn build_kiro_local_mcp_config(ctx: &InstallContext) -> Value {
     let mut base = mcp_server_config();
     if let Some(args) = base.get_mut("args").and_then(|a| a.as_array_mut()) {
         args.push(json!("--path"));
-        args.push(json!(path_arg));
+        args.push(json!(ctx.cwd.to_string_lossy().to_string()));
     }
     base
 }
@@ -87,16 +86,15 @@ impl AgentTarget for KiroTarget {
         if cleanup.action == FileAction::Removed {
             files.push(cleanup);
         }
-        WriteResult {
-            files,
-            notes: vec![
+        let notes = match loc {
+            Location::Local => vec![
                 "Restart Kiro for MCP changes to take effect.".to_string(),
                 "Kiro IDE: also enable MCP in Settings (search \"MCP\" → \"Enabled\"). Kiro CLI users can skip this step."
                     .to_string(),
-                "Prefer a project-level install: run `codegraph install --target=kiro --local` from each project root so the MCP entry pins that project's --path. A global install uses ${workspaceFolder}, which Kiro must expand per workspace."
-                    .to_string(),
             ],
-        }
+            Location::Global => vec![KIRO_LOCAL_GUIDANCE.to_string()],
+        };
+        WriteResult { files, notes }
     }
 
     // Ports kiroTarget.uninstall (kiro.ts:99).
@@ -125,11 +123,16 @@ impl AgentTarget for KiroTarget {
 
     // Ports kiroTarget.printConfig (kiro.ts:120).
     fn print_config(&self, ctx: &InstallContext, loc: Location) -> String {
-        let target = mcp_json_path(ctx, loc);
-        let snippet = to_upstream_json(
-            &json!({ "mcpServers": { "codegraph": build_kiro_mcp_config(ctx, loc) } }),
-        );
-        format!("# Add to {}\n\n{snippet}\n", target.display())
+        match loc {
+            Location::Local => {
+                let target = mcp_json_path(ctx, loc);
+                let snippet = to_upstream_json(
+                    &json!({ "mcpServers": { "codegraph": build_kiro_local_mcp_config(ctx) } }),
+                );
+                format!("# Add to {}\n\n{snippet}\n", target.display())
+            }
+            Location::Global => format!("# {KIRO_LOCAL_GUIDANCE}\n"),
+        }
     }
 
     fn supports_skills(&self, _loc: Location) -> bool {
@@ -142,12 +145,20 @@ impl AgentTarget for KiroTarget {
 }
 
 // Ports writeMcpEntry (kiro.ts:131).
+//
+// Global installs intentionally write NO entry: Kiro CLI does not expand
+// ${workspaceFolder}, so a global --path is broken. A global install instead
+// self-heals — it removes any stale codegraph entry a prior version wrote — and
+// the caller emits per-project guidance. Only Local installs write the entry.
 fn write_mcp_entry(ctx: &InstallContext, loc: Location) -> FileWrite {
     let file = mcp_json_path(ctx, loc);
+    if loc == Location::Global {
+        return remove_global_codegraph_entry(file);
+    }
     if let Some(dir) = file.parent() {
         let _ = fs::create_dir_all(dir);
     }
-    let after = build_kiro_mcp_config(ctx, loc);
+    let after = build_kiro_local_mcp_config(ctx);
     match read_config_file(&file) {
         ConfigRead::Unparseable => FileWrite {
             path: file,
@@ -166,6 +177,22 @@ fn write_mcp_entry(ctx: &InstallContext, loc: Location) -> FileWrite {
             let action = upsert_nested_key_jsonc(&file, "mcpServers", "codegraph", &after, None)
                 .unwrap_or(FileAction::Skipped);
             FileWrite { path: file, action }
+        }
+    }
+}
+
+fn remove_global_codegraph_entry(file: PathBuf) -> FileWrite {
+    let mut config = read_json_file(&file);
+    if remove_codegraph_from_mcp_servers(&mut config) {
+        let _ = write_json_file(&file, &config);
+        FileWrite {
+            path: file,
+            action: FileAction::Removed,
+        }
+    } else {
+        FileWrite {
+            path: file,
+            action: FileAction::Skipped,
         }
     }
 }
@@ -228,7 +255,7 @@ mod tests {
         let ctx = ctx();
 
         // When the MCP entry is built for the local location
-        let entry = build_kiro_mcp_config(&ctx, Location::Local);
+        let entry = build_kiro_local_mcp_config(&ctx);
 
         // Then args end with --path pinned to the concrete cwd
         let args = entry["args"].as_array().expect("args array");
@@ -244,16 +271,44 @@ mod tests {
     }
 
     #[test]
-    fn kiro_global_mcp_entry_pins_workspace_folder_variable() {
-        // Given a global Kiro install context
-        let ctx = ctx();
+    fn kiro_global_install_writes_no_mcp_entry_and_emits_local_guidance() {
+        // Given a global Kiro install into a temp HOME with no prior config
+        let home = std::env::temp_dir().join(format!("cg-kiro-global-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let ctx = InstallContext {
+            home: home.clone(),
+            cwd: PathBuf::from("/work/proj"),
+            app_data: None,
+            xdg_config_home: None,
+            hermes_home: None,
+        };
 
-        // When the MCP entry is built for the global location
-        let entry = build_kiro_mcp_config(&ctx, Location::Global);
+        // When a global install runs
+        let result = KiroTarget.install(
+            &ctx,
+            Location::Global,
+            InstallOptions {
+                auto_allow: true,
+                front_load_hook: false,
+            },
+        );
 
-        // Then args end with --path ${workspaceFolder} for per-workspace expansion
-        let args = entry["args"].as_array().expect("args array");
-        assert_eq!(args.last(), Some(&json!("${workspaceFolder}")));
-        assert!(args.contains(&json!("--path")));
+        // Then no codegraph MCP entry is written to the global mcp.json
+        let mcp = home.join(".kiro").join("settings").join("mcp.json");
+        let written = std::fs::read_to_string(&mcp).unwrap_or_default();
+        assert!(
+            !written.contains("codegraph"),
+            "global install must not write a codegraph entry, got: {written}"
+        );
+        // And the user is told to install per project
+        assert!(
+            result
+                .notes
+                .iter()
+                .any(|n| n.contains("--target=kiro --local")),
+            "global install must emit per-project guidance"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
