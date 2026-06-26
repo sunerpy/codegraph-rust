@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.8](https://github.com/sunerpy/codegraph-rust/compare/v0.15.7...v0.15.8) (2026-06-26)
+
+
+### Bug Fixes
+
+* **installer:** never write a broken global Kiro --path ([#76](https://github.com/sunerpy/codegraph-rust/issues/76)) ([2572eb2](https://github.com/sunerpy/codegraph-rust/commit/2572eb28f1ab1e976e84c44d03ace71d0077b026))
+
 ## [0.15.7](https://github.com/sunerpy/codegraph-rust/compare/v0.15.6...v0.15.7) (2026-06-26)
 
 
