@@ -76,7 +76,10 @@ pub struct UninstallArgs {
 /// non-interactive parts of runInstallerWithOptions (index.ts:88).
 pub fn run_install(args: InstallArgs) -> Result<()> {
     let ctx = context_from_env()?;
+    run_install_with_ctx(ctx, args)
+}
 
+fn run_install_with_ctx(ctx: InstallContext, args: InstallArgs) -> Result<()> {
     // --print-config <id>: dump the snippet and exit, no file writes
     // (codegraph.ts:1878).
     if let Some(id) = &args.print_config {
@@ -151,6 +154,34 @@ pub fn run_install(args: InstallArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Install project-level (`Location::Local`) MCP config for the given target
+/// flag under an explicit project root, reusing the `run_install` engine. Backs
+/// `codegraph init [path] --target=…`, where "init" means "set this project
+/// up", so the location is always Local (an absolute project `--path` for
+/// editors like Kiro/Cursor that launch the server from a non-project CWD).
+/// `project_root` overrides the context CWD so the config and its `--path` land
+/// under the project being initialized, not the process CWD. `target_flag`
+/// accepts the same values as `install --target` (csv ids, `auto`, `all`,
+/// `none`); `none` is a no-op.
+pub fn run_install_local_targets(project_root: PathBuf, target_flag: &str) -> Result<()> {
+    if target_flag == "none" {
+        return Ok(());
+    }
+    let mut ctx = context_from_env()?;
+    ctx.cwd = project_root;
+    run_install_with_ctx(
+        ctx,
+        InstallArgs {
+            target: Some(target_flag.to_string()),
+            location: Some("local".to_string()),
+            yes: true,
+            permissions: None,
+            front_load_hook: false,
+            print_config: None,
+        },
+    )
 }
 
 /// `codegraph uninstall`. Ports runUninstaller (index.ts:346) — sweeps every
@@ -465,6 +496,9 @@ fn tildify(ctx: &InstallContext, path: &std::path::Path) -> String {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn temp_ctx(label: &str) -> (InstallContext, PathBuf) {
         let base = std::env::temp_dir().join(format!(
@@ -548,5 +582,59 @@ mod tests {
             }),
             "Hermes Agent: not supported"
         );
+    }
+
+    #[test]
+    fn init_target_kiro_writes_project_local_mcp_with_concrete_path() {
+        // Given a temp HOME and an indexed project root
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (ctx, base) = temp_ctx("init-kiro");
+        let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        let prev_home = std::env::var_os(home_key);
+        std::env::set_var(home_key, &ctx.home);
+
+        // When init --target=kiro installs project-local config (run twice = idempotent)
+        run_install_local_targets(ctx.cwd.clone(), "kiro").unwrap();
+        run_install_local_targets(ctx.cwd.clone(), "kiro").unwrap();
+
+        // Then the project's .kiro/settings/mcp.json pins this project's --path
+        let mcp = ctx.cwd.join(".kiro").join("settings").join("mcp.json");
+        let written = fs::read_to_string(&mcp).expect("project mcp.json written");
+        assert!(written.contains("\"--path\""), "got: {written}");
+        assert!(
+            written.contains(&ctx.cwd.to_string_lossy().to_string()),
+            "must pin concrete project path, got: {written}"
+        );
+
+        match prev_home {
+            Some(v) => std::env::set_var(home_key, v),
+            None => std::env::remove_var(home_key),
+        }
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn init_target_none_writes_nothing() {
+        // Given a temp HOME and a project root
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (ctx, base) = temp_ctx("init-none");
+        let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        let prev_home = std::env::var_os(home_key);
+        std::env::set_var(home_key, &ctx.home);
+
+        // When init runs with the default target (none)
+        run_install_local_targets(ctx.cwd.clone(), "none").unwrap();
+
+        // Then no agent config dir is created under the project
+        assert!(
+            !ctx.cwd.join(".kiro").exists() && !ctx.cwd.join(".cursor").exists(),
+            "none must be a pure no-op"
+        );
+
+        match prev_home {
+            Some(v) => std::env::set_var(home_key, v),
+            None => std::env::remove_var(home_key),
+        }
+        let _ = fs::remove_dir_all(base);
     }
 }

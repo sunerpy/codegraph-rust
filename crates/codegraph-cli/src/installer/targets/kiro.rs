@@ -35,7 +35,8 @@ fn steering_path(ctx: &InstallContext, loc: Location) -> PathBuf {
     config_dir(ctx, loc).join("steering").join("codegraph.md")
 }
 
-const KIRO_LOCAL_GUIDANCE: &str = "Kiro is project-scoped: run `codegraph install --target=kiro --local` from each project root. That pins the project's absolute --path so the server serves that project. A global install is intentionally NOT written — Kiro CLI does not expand ${workspaceFolder} in mcp.json args, so a global --path would resolve to a literal, broken directory.";
+const KIRO_GLOBAL_WHY: &str = "Kiro is project-scoped, so a global install is intentionally NOT written: Kiro CLI does not expand ${workspaceFolder} in mcp.json args, so a global --path would resolve to a literal, broken directory.";
+const KIRO_GLOBAL_HOWTO: &str = "Install per project instead — cd into each project root, then run `codegraph install --target=kiro --local` (writes that project's absolute --path). Repeat for every project you open in Kiro.";
 
 /// Build the project-local Kiro MCP entry with an explicit `--path = ctx.cwd`.
 ///
@@ -88,11 +89,17 @@ impl AgentTarget for KiroTarget {
         }
         let notes = match loc {
             Location::Local => vec![
+                format!(
+                    "CodeGraph MCP configured for project {}.",
+                    ctx.cwd.display()
+                ),
                 "Restart Kiro for MCP changes to take effect.".to_string(),
                 "Kiro IDE: also enable MCP in Settings (search \"MCP\" → \"Enabled\"). Kiro CLI users can skip this step."
                     .to_string(),
+                "Each project you open in Kiro needs its own install: cd into it and re-run `codegraph install --target=kiro --local`."
+                    .to_string(),
             ],
-            Location::Global => vec![KIRO_LOCAL_GUIDANCE.to_string()],
+            Location::Global => vec![KIRO_GLOBAL_WHY.to_string(), KIRO_GLOBAL_HOWTO.to_string()],
         };
         WriteResult { files, notes }
     }
@@ -131,7 +138,7 @@ impl AgentTarget for KiroTarget {
                 );
                 format!("# Add to {}\n\n{snippet}\n", target.display())
             }
-            Location::Global => format!("# {KIRO_LOCAL_GUIDANCE}\n"),
+            Location::Global => format!("# {KIRO_GLOBAL_WHY}\n# {KIRO_GLOBAL_HOWTO}\n"),
         }
     }
 

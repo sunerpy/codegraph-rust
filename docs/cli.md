@@ -23,7 +23,7 @@
 | `skill update`    | Refresh the installed skill when unchanged by the user                                    | `-t/--target`, `--global`, `--local`, `--force`                                                                               |
 | `skill uninstall` | Remove the skill from agent skill directories                                             | `-t/--target`, `--global`, `--local`, `-y/--yes`                                                                              |
 | `skill status`    | Report install state per agent (up to date / locally modified / outdated / not installed) | `-t/--target`, `--global`, `--local`                                                                                          |
-| `init`            | Initialize `.codegraph/` and run the first full index                                     | `[path]`                                                                                                                      |
+| `init`            | Initialize `.codegraph/` and run the first full index                                     | `[path]`, `-t/--target` (also write project-level MCP config; default `none`)                                                 |
 | `uninit`          | Delete the project's `.codegraph/` index                                                  | `[path]`, `-f/--force`                                                                                                        |
 | `index`           | (Re-)index in full                                                                        | `[path]`, `-f/--force`, `-q/--quiet`, `-v/--verbose`                                                                          |
 | `sync`            | Sync changes (currently reuses the safe full-index path)                                  | `[path]`, `-q/--quiet`                                                                                                        |
@@ -95,6 +95,35 @@ the hook calls `codegraph prompt-hook`, which runs `codegraph_explore` against t
 nearest index and prepends relevant structural context to the prompt. This flag is
 **off by default** and is never implied by `--yes` — you must pass it explicitly.
 No other agent configs are affected.
+
+### Editor adaptation: agents that need a project `--path`
+
+Some editors launch the MCP subprocess from a non-project working directory and
+do not advertise the project root in the MCP `initialize` handshake. For those, a
+bare `serve --mcp` cannot find the project and degrades to home safe mode, so the
+installer pins an explicit `--path`:
+
+- **Cursor** — `install` injects `--path` automatically (local install pins the
+  project dir; global uses `${workspaceFolder}`, which Cursor expands).
+- **Kiro** — install **project-level** only: `--path` is the concrete project dir.
+  A global Kiro install writes no entry, because Kiro CLI does not expand
+  `${workspaceFolder}` (see the note above).
+
+### `codegraph init --target` — index and wire an editor in one step
+
+`init` accepts `-t/--target` to also write **project-level** MCP config right after
+indexing — the project-scoped analog of `install --target=… --local`. It accepts
+the same target values as `install` (csv ids such as `kiro,cursor`, plus `auto`,
+`all`, `none`) and **defaults to `none`** (index only, no config written). The
+config and its `--path` are written under the project being initialized, even when
+the `[path]` argument differs from the current directory. It is idempotent.
+
+```bash
+codegraph init                       # index only — no MCP config written (default none)
+codegraph init --target=kiro         # index, then write this project's .kiro/settings/mcp.json with --path
+codegraph init . --target=kiro,cursor  # index + wire both editors project-level
+codegraph init /path/to/proj -t auto  # index that project + wire detected editors there
+```
 
 ---
 
