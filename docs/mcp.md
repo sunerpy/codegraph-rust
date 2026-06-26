@@ -122,18 +122,18 @@ server first disables the daemon, the file watcher, AND catch-up sync — not ju
 the watcher. This happens when an IDE or agent (e.g. Kiro) launches
 `codegraph serve --mcp` with no `--path` and its CWD is the home directory;
 without the guard, the server would spawn a daemon that indexes the entire home
-tree and peg a CPU at 99%. In this initial safe mode the server still answers all
-tool queries off any existing `.codegraph` index, but it will not start
-background services against `$HOME`. If the client advertises MCP roots support,
-the server then sends `roots/list` and adopts the first indexed root from the
-client's response. When that adopted root is indexed, CodeGraph also starts the
-shared project daemon for that root, so a single global config can recover the
-real project even when the launch CWD was home. `CODEGRAPH_FORCE_WATCH` does
-**not** override this guard (it only overrides the WSL2 `/mnt/` disable). A real
-project nested under `$HOME` (e.g. `~/projects/myapp`) is unaffected and gets the
-full daemon, watcher, and catch-up. To guarantee per-project services for clients
-that do not support roots, pin the root via `--path <project>` in the client's
-MCP config args (e.g. a workspace-level `.kiro/settings/mcp.json`), or open the
+tree and peg a CPU at 99%. In this initial safe mode the server still answers the
+handshake, but it will not start background services against `$HOME`. If the
+client advertises MCP roots support, the server sends `roots/list`, adopts the
+first indexed root from the client's response, starts or attaches to that root's
+shared project daemon, then proxies the current stdio session to that daemon.
+That lets a single global config recover the real project even when the launch
+CWD was home, without hardcoding `--path`. `CODEGRAPH_FORCE_WATCH` does **not**
+override this guard (it only overrides the WSL2 `/mnt/` disable). A real project
+nested under `$HOME` (e.g. `~/projects/myapp`) is unaffected and gets the full
+daemon, watcher, and catch-up. To guarantee per-project services for clients that
+do not support roots, pin the root via `--path <project>` in the client's MCP
+config args (e.g. a workspace-level `.kiro/settings/mcp.json`), or open the
 project folder as the working directory.
 
 When `serve --mcp` is started without an explicit `--path`, the server reads the

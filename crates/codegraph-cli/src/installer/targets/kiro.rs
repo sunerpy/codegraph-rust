@@ -8,7 +8,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use serde_json::{json, Map};
+use serde_json::{json, Map, Value};
 
 use super::super::shared::{
     mcp_server_config, read_config_file, read_json_file, remove_codegraph_from_mcp_servers,
@@ -33,6 +33,26 @@ fn mcp_json_path(ctx: &InstallContext, loc: Location) -> PathBuf {
 }
 fn steering_path(ctx: &InstallContext, loc: Location) -> PathBuf {
     config_dir(ctx, loc).join("steering").join("codegraph.md")
+}
+
+/// Build the Kiro MCP entry with an explicit `--path`, mirroring Cursor.
+///
+/// Kiro's `initialize` carries no `rootUri`/`workspaceFolders` and does not
+/// advertise `capabilities.roots`, so a bare global `serve --mcp` launched from
+/// `$HOME` cannot discover the project and degrades to home safe mode. Pinning
+/// `--path` fixes that: Local pins the concrete `ctx.cwd`; Global pins
+/// `${workspaceFolder}`, which Kiro expands per workspace.
+fn build_kiro_mcp_config(ctx: &InstallContext, loc: Location) -> Value {
+    let path_arg = match loc {
+        Location::Local => ctx.cwd.to_string_lossy().to_string(),
+        Location::Global => "${workspaceFolder}".to_string(),
+    };
+    let mut base = mcp_server_config();
+    if let Some(args) = base.get_mut("args").and_then(|a| a.as_array_mut()) {
+        args.push(json!("--path"));
+        args.push(json!(path_arg));
+    }
+    base
 }
 
 impl AgentTarget for KiroTarget {
@@ -73,6 +93,8 @@ impl AgentTarget for KiroTarget {
                 "Restart Kiro for MCP changes to take effect.".to_string(),
                 "Kiro IDE: also enable MCP in Settings (search \"MCP\" → \"Enabled\"). Kiro CLI users can skip this step."
                     .to_string(),
+                "Prefer a project-level install: run `codegraph install --target=kiro --local` from each project root so the MCP entry pins that project's --path. A global install uses ${workspaceFolder}, which Kiro must expand per workspace."
+                    .to_string(),
             ],
         }
     }
@@ -104,8 +126,9 @@ impl AgentTarget for KiroTarget {
     // Ports kiroTarget.printConfig (kiro.ts:120).
     fn print_config(&self, ctx: &InstallContext, loc: Location) -> String {
         let target = mcp_json_path(ctx, loc);
-        let snippet =
-            to_upstream_json(&json!({ "mcpServers": { "codegraph": mcp_server_config() } }));
+        let snippet = to_upstream_json(
+            &json!({ "mcpServers": { "codegraph": build_kiro_mcp_config(ctx, loc) } }),
+        );
         format!("# Add to {}\n\n{snippet}\n", target.display())
     }
 
@@ -124,7 +147,7 @@ fn write_mcp_entry(ctx: &InstallContext, loc: Location) -> FileWrite {
     if let Some(dir) = file.parent() {
         let _ = fs::create_dir_all(dir);
     }
-    let after = mcp_server_config();
+    let after = build_kiro_mcp_config(ctx, loc);
     match read_config_file(&file) {
         ConfigRead::Unparseable => FileWrite {
             path: file,
@@ -197,5 +220,40 @@ mod tests {
         let local = target.skill_dir(&ctx, Location::Local).unwrap();
         assert!(local.ends_with(".kiro/skills"));
         assert_eq!(local, PathBuf::from("/work/proj/.kiro/skills"));
+    }
+
+    #[test]
+    fn kiro_local_mcp_entry_pins_concrete_project_path() {
+        // Given a local Kiro install context
+        let ctx = ctx();
+
+        // When the MCP entry is built for the local location
+        let entry = build_kiro_mcp_config(&ctx, Location::Local);
+
+        // Then args end with --path pinned to the concrete cwd
+        let args = entry["args"].as_array().expect("args array");
+        assert_eq!(
+            args,
+            &vec![
+                json!("serve"),
+                json!("--mcp"),
+                json!("--path"),
+                json!("/work/proj"),
+            ]
+        );
+    }
+
+    #[test]
+    fn kiro_global_mcp_entry_pins_workspace_folder_variable() {
+        // Given a global Kiro install context
+        let ctx = ctx();
+
+        // When the MCP entry is built for the global location
+        let entry = build_kiro_mcp_config(&ctx, Location::Global);
+
+        // Then args end with --path ${workspaceFolder} for per-workspace expansion
+        let args = entry["args"].as_array().expect("args array");
+        assert_eq!(args.last(), Some(&json!("${workspaceFolder}")));
+        assert!(args.contains(&json!("--path")));
     }
 }

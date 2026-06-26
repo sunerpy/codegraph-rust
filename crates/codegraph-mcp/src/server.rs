@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
@@ -184,6 +184,11 @@ pub fn reopen_count() -> u64 {
 
 type AdoptionObserver = Box<dyn FnMut(&std::path::Path)>;
 
+pub enum RunUntilAdoption<R> {
+    Eof,
+    Adopted { project_root: PathBuf, reader: R },
+}
+
 /// Holds the default project path and a per-path engine cache (mirrors
 /// `ToolHandler.projectCache`, `tools.ts:591`). Each cached engine carries the
 /// db-file identity it was opened against, so [`McpServer::engine_for`] can
@@ -232,12 +237,17 @@ impl McpServer {
     /// response line per request to `writer`. Notifications (no `id`) produce no
     /// output (`session.ts:118` gates every reply on `isRequest`).
     pub fn run<R: BufRead, W: Write>(&mut self, reader: R, mut writer: W) -> anyhow::Result<()> {
-        for line in reader.lines() {
-            let line = line?;
+        let mut reader = reader;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
             if line.trim().is_empty() {
                 continue;
             }
-            for response in self.handle_line(&line) {
+            let handled = self.handle_line(&line);
+            for response in handled.responses {
                 let serialized = serde_json::to_string(&response)?;
                 writeln!(writer, "{serialized}")?;
                 writer.flush()?;
@@ -246,41 +256,80 @@ impl McpServer {
         Ok(())
     }
 
+    pub fn run_until_adoption<R: BufRead, W: Write>(
+        &mut self,
+        mut reader: R,
+        mut writer: W,
+    ) -> anyhow::Result<RunUntilAdoption<R>> {
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line)? == 0 {
+                return Ok(RunUntilAdoption::Eof);
+            }
+            if line.trim().is_empty() {
+                continue;
+            }
+            let handled = self.handle_line(&line);
+            for response in handled.responses {
+                let serialized = serde_json::to_string(&response)?;
+                writeln!(writer, "{serialized}")?;
+                writer.flush()?;
+            }
+            if let Some(project_root) = handled.adopted {
+                return Ok(RunUntilAdoption::Adopted {
+                    project_root,
+                    reader,
+                });
+            }
+        }
+    }
+
     /// Parse + dispatch one line. Returns `Some(response)` for a request,
     /// `None` for a notification or unparseable notification.
-    fn handle_line(&mut self, line: &str) -> Vec<Value> {
+    fn handle_line(&mut self, line: &str) -> HandledLine {
         let value: Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(_) => {
                 // `transport.ts:167-171`: parse error with a null id.
-                return vec![json_response(JsonRpcResponse::error(
+                return HandledLine::responses(vec![json_response(JsonRpcResponse::error(
                     Value::Null,
                     error_codes::PARSE_ERROR,
                     "Parse error: invalid JSON",
-                ))];
+                ))]);
             }
         };
 
         if value.get("method").is_none() {
-            self.handle_response(&value);
-            return Vec::new();
+            return HandledLine {
+                responses: Vec::new(),
+                adopted: self.handle_response(&value),
+            };
         }
 
         let req: JsonRpcRequest = match serde_json::from_value(value) {
             Ok(r) => r,
             Err(_) => {
-                return vec![json_response(JsonRpcResponse::error(
+                return HandledLine::responses(vec![json_response(JsonRpcResponse::error(
                     Value::Null,
                     error_codes::INVALID_REQUEST,
                     "Invalid Request",
-                ))]
+                ))])
             }
         };
         let id = req.id.clone();
-        match self.dispatch(&req) {
+        let handled = match self.dispatch(&req) {
             Dispatch::Reply(value) => id
                 .map(|id| vec![json_response(JsonRpcResponse::result(id, value))])
                 .unwrap_or_default(),
+            Dispatch::ReplyWithAdoption { reply, adopted } => {
+                let responses = id
+                    .map(|id| vec![json_response(JsonRpcResponse::result(id, reply))])
+                    .unwrap_or_default();
+                return HandledLine {
+                    responses,
+                    adopted: Some(adopted),
+                };
+            }
             Dispatch::ReplyAndRequest { reply, request } => id
                 .map(|id| vec![json_response(JsonRpcResponse::result(id, reply)), request])
                 .unwrap_or_default(),
@@ -288,7 +337,8 @@ impl McpServer {
                 .map(|id| vec![json_response(JsonRpcResponse::error(id, code, msg))])
                 .unwrap_or_default(),
             Dispatch::Notification => Vec::new(),
-        }
+        };
+        HandledLine::responses(handled)
     }
 
     /// Method dispatch, mirroring `session.ts:119-156`.
@@ -301,6 +351,10 @@ impl McpServer {
                     .adopt_from_initialize(&mut self.default_project, req.params.as_ref())
                 {
                     self.notify_adopted(&adopted);
+                    return Dispatch::ReplyWithAdoption {
+                        reply: initialize_result(),
+                        adopted,
+                    };
                 }
                 if self
                     .workspace_roots
@@ -339,21 +393,23 @@ impl McpServer {
         }
     }
 
-    fn handle_response(&mut self, response: &Value) {
+    fn handle_response(&mut self, response: &Value) -> Option<PathBuf> {
         let is_roots_response =
             response.get("id").and_then(Value::as_str) == Some(ROOTS_LIST_REQUEST_ID);
         if !is_roots_response {
-            return;
+            return None;
         }
         if let Some(adopted) = self
             .workspace_roots
             .adopt_from_roots_result(&mut self.default_project, response.get("result"))
         {
             self.notify_adopted(&adopted);
+            return Some(adopted);
         }
+        None
     }
 
-    fn notify_adopted(&mut self, path: &std::path::Path) {
+    fn notify_adopted(&mut self, path: &Path) {
         if let Some(observer) = &mut self.adoption_observer {
             observer(path);
         }
@@ -476,9 +532,24 @@ impl McpServer {
 
 enum Dispatch {
     Reply(Value),
+    ReplyWithAdoption { reply: Value, adopted: PathBuf },
     ReplyAndRequest { reply: Value, request: Value },
     Err(i64, String),
     Notification,
+}
+
+struct HandledLine {
+    responses: Vec<Value>,
+    adopted: Option<PathBuf>,
+}
+
+impl HandledLine {
+    fn responses(responses: Vec<Value>) -> Self {
+        Self {
+            responses,
+            adopted: None,
+        }
+    }
 }
 
 fn json_response(response: JsonRpcResponse) -> Value {
@@ -508,7 +579,7 @@ pub fn initialize_result() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::io::{Cursor, Read};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -636,6 +707,40 @@ mod tests {
         );
 
         assert_eq!(observed.lock().unwrap().as_deref(), Some(project.path()));
+    }
+
+    #[test]
+    fn roots_list_adoption_returns_remaining_reader_for_proxy_handoff() {
+        let project = indexed_project("handoff");
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": ROOTS_LIST_REQUEST_ID,
+            "result": {
+                "roots": [{ "uri": format!("file://{}", project.path().display()), "name": "proj" }]
+            },
+        });
+        let next = json!({ "jsonrpc": "2.0", "id": 99, "method": "tools/list" });
+        let input = format!("{response}\n{next}\n");
+        let mut out = Vec::new();
+        let mut server = McpServer::new(None);
+
+        let outcome = server
+            .run_until_adoption(Cursor::new(input.into_bytes()), Cursor::new(&mut out))
+            .unwrap();
+
+        assert!(out.is_empty(), "roots/list responses are client replies");
+        let RunUntilAdoption::Adopted {
+            project_root,
+            mut reader,
+        } = outcome
+        else {
+            panic!("indexed roots/list response must stop the loop for handoff");
+        };
+        assert_eq!(project_root, project.path());
+
+        let mut remaining = String::new();
+        reader.read_to_string(&mut remaining).unwrap();
+        assert_eq!(remaining, format!("{next}\n"));
     }
 
     #[test]
