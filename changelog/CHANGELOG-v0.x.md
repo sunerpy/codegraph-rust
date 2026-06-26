@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.16.0](https://github.com/sunerpy/codegraph-rust/compare/v0.15.8...v0.16.0) (2026-06-26)
+
+
+### Features
+
+* **cli:** add init --target to wire project-level editor MCP config ([#78](https://github.com/sunerpy/codegraph-rust/issues/78)) ([7301477](https://github.com/sunerpy/codegraph-rust/commit/7301477077ae712a52c295baa987ab623b291507))
+
 ## [0.15.8](https://github.com/sunerpy/codegraph-rust/compare/v0.15.7...v0.15.8) (2026-06-26)
 
 
