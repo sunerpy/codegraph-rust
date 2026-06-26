@@ -82,7 +82,7 @@ struct Cli {
 impl Cli {
     fn bootstrap_project_root(&self) -> PathBuf {
         let raw = match &self.command {
-            Command::Init { path }
+            Command::Init { path, .. }
             | Command::Uninit { path, .. }
             | Command::Index { path, .. }
             | Command::Sync { path, .. }
@@ -116,6 +116,12 @@ enum Command {
     // Upstream flags/output: upstream bin/codegraph.ts:420-424, 431-470.
     Init {
         path: Option<PathBuf>,
+        /// Also write project-level MCP config for these agents (csv ids,
+        /// `auto`, `all`, `none`). Defaults to `none` (index only). Editors that
+        /// launch the server from a non-project CWD (Kiro, Cursor) need this to
+        /// get the project's absolute `--path`.
+        #[arg(short, long, default_value = "none")]
+        target: String,
     },
     // Upstream flags/output: upstream bin/codegraph.ts:482-485, 489-527.
     Uninit {
@@ -377,7 +383,7 @@ enum SkillAction {
 
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Init { path } => cmd_init(path),
+        Command::Init { path, target } => cmd_init(path, &target),
         Command::Uninit { path, force } => cmd_uninit(path, force),
         Command::Index {
             path,
@@ -790,12 +796,12 @@ fn cmd_prompt_hook(path: Option<PathBuf>, query: Option<String>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_init(path: Option<PathBuf>) -> Result<()> {
+fn cmd_init(path: Option<PathBuf>, target: &str) -> Result<()> {
     let project = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
     if is_initialized(&project) {
         println!("Already initialized in {}", project.display());
         println!("Use \"codegraph index\" to re-index or \"codegraph sync\" to update");
-        return Ok(());
+        return installer::run_install_local_targets(project, target);
     }
     guard_indexable_root(&project)?;
     fs::create_dir_all(codegraph_dir(&project))
@@ -803,7 +809,7 @@ fn cmd_init(path: Option<PathBuf>) -> Result<()> {
     let result = index_project(&project, true, false)?;
     println!("Initialized in {}", project.display());
     print_index_result(&result);
-    Ok(())
+    installer::run_install_local_targets(project, target)
 }
 
 fn cmd_uninit(path: Option<PathBuf>, force: bool) -> Result<()> {
