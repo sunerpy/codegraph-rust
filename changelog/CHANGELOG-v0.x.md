@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.16.1](https://github.com/sunerpy/codegraph-rust/compare/v0.16.0...v0.16.1) (2026-06-26)
+
+
+### Bug Fixes
+
+* **daemon:** reap detached daemon child to avoid zombie ([#80](https://github.com/sunerpy/codegraph-rust/issues/80)) ([bc1d828](https://github.com/sunerpy/codegraph-rust/commit/bc1d828a7cd4f94e81f24c7e6f376ef3e73e96de))
+
 ## [0.16.0](https://github.com/sunerpy/codegraph-rust/compare/v0.15.8...v0.16.0) (2026-06-26)
 
 
