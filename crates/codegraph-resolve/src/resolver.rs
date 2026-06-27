@@ -777,7 +777,7 @@ impl ReferenceResolver {
                 if !applies_to_language(resolver.as_ref(), language) {
                     continue;
                 }
-                if let Some(result) = resolver.extract(relative, &content) {
+                if let Some(result) = resolver.extract(relative, &content, &self.project_root) {
                     nodes.extend(result.nodes);
                     for reference in result.references {
                         refs.push(ref_view_to_unresolved(&reference));

@@ -74,7 +74,12 @@ impl FrameworkResolver for ReactResolver {
     }
 
     // Ports reactResolver.extract (react.ts:88-268).
-    fn extract(&self, file_path: &str, content: &str) -> Option<FrameworkResolverExtractionResult> {
+    fn extract(
+        &self,
+        file_path: &str,
+        content: &str,
+        _project_root: &str,
+    ) -> Option<FrameworkResolverExtractionResult> {
         let mut nodes = Vec::new();
         let mut references = Vec::new();
         let jsx_lang = js_language_for(file_path);

@@ -253,6 +253,7 @@ fn react_extract_emits_nextjs_page_route() {
         .extract(
             "pages/about.tsx",
             "export default function About() { return <div/>; }",
+            "",
         )
         .expect("extract result");
     let route = result
@@ -268,7 +269,7 @@ fn react_extract_component_and_route_reference() {
     let content =
         "export function Home() { return <Layout/>; }\n<Route path=\"/home\" component={Home}/>";
     let result = react::ReactResolver
-        .extract("src/Home.tsx", content)
+        .extract("src/Home.tsx", content, "")
         .expect("extract result");
     assert!(result
         .nodes
@@ -348,7 +349,7 @@ fn vue_extract_emits_nuxt_page_route() {
     // the upstream extract keys on `/pages/` (with leading slash), so the route file
     // must sit under a parent dir (vue.ts:198).
     let result = vue::VueResolver
-        .extract("app/pages/users/[id].vue", "")
+        .extract("app/pages/users/[id].vue", "", "")
         .expect("extract result");
     let route = result
         .nodes
@@ -405,7 +406,7 @@ fn nestjs_resolves_service_provider_preferring_convention() {
 fn nestjs_extract_http_route_joins_controller_prefix() {
     let content = "@Controller('users')\nclass UsersController {\n  @Get(':id')\n  findOne() {}\n}";
     let result = nestjs::NestjsResolver
-        .extract("src/users/users.controller.ts", content)
+        .extract("src/users/users.controller.ts", content, "")
         .expect("extract result");
     let route = result
         .nodes

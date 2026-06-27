@@ -14,7 +14,7 @@ use codegraph_resolve::types::FrameworkResolverExtractionResult;
 /// `None`, which for `project.godot` is itself a failure).
 fn extract(path: &str, content: &str) -> FrameworkResolverExtractionResult {
     GodotResolver
-        .extract(path, content)
+        .extract(path, content, "")
         .expect("project.godot must produce Some(result)")
 }
 
@@ -248,15 +248,21 @@ jump={
 fn extract_returns_none_for_non_project_godot_file() {
     // A .gd file now routes to T6's GDScript dynamic parser (Some), not this
     // project parser.
-    assert!(GodotResolver.extract("foo.gd", "extends Node\n").is_some());
+    assert!(GodotResolver
+        .extract("foo.gd", "extends Node\n", "")
+        .is_some());
     // A genuinely unclaimed file → None.
-    assert!(GodotResolver.extract("README.md", "# hi\n").is_none());
+    assert!(GodotResolver.extract("README.md", "# hi\n", "").is_none());
     // A .tres routes to T5's resource parser (Some, not this project parser).
     assert!(GodotResolver
-        .extract("data/item.tres", "[gd_resource]\n")
+        .extract("data/item.tres", "[gd_resource]\n", "")
         .is_some());
     // A nested path whose basename IS project.godot still dispatches.
     assert!(GodotResolver
-        .extract("sub/dir/project.godot", "[autoload]\nX=\"res://x.gd\"\n")
+        .extract(
+            "sub/dir/project.godot",
+            "[autoload]\nX=\"res://x.gd\"\n",
+            ""
+        )
         .is_some());
 }

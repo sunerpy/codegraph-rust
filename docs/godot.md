@@ -258,6 +258,53 @@ hardcoded (`skill_effect`/`effect_on` above are only examples). Most projects do
 not need it — the standard `ExtResource(…)` references in `.tres` files are
 extracted automatically without any configuration.
 
+### Opt-in ID capture (`idFields`)
+
+A separate, independent opt-in block captures **bare or compound IDs** inside a
+`.tres` `[resource]` body as `godot:id:<kind>:<value>` sentinel references. Use
+it when a resource encodes domain IDs that are not `ExtResource(…)` handles —
+e.g. a bare `buff_id = 7005`, or a compound `skill_effect = "a:b:9015:c:7005:1000"`
+that packs several IDs into one delimited string. Declare each field under
+`godot.dsl.idFields`:
+
+```jsonc
+{
+  "godot": {
+    "dsl": {
+      "idFields": {
+        "buff_id": { "kind": "buff" },
+        "skill_effect": { "kind": "skill", "separator": ":", "idSegments": [2, 4] },
+      },
+    },
+  },
+}
+```
+
+Each key is a `[resource]` property name, matched by exact key against
+`key = value` lines. The value is quote-stripped first, then:
+
+- **Bare scalar / no `separator`** — the whole stripped value becomes one ID.
+  `buff_id = 7005` → `godot:id:buff:7005`.
+- **`separator` + `idSegments`** — the stripped value is split on `separator`
+  and the listed `idSegments` parts are captured. **`idSegments` indices are
+  0-based** into the split parts; the example `"a:b:9015:c:7005:1000"` with
+  `[2, 4]` yields `godot:id:skill:9015` and `godot:id:skill:7005`. An
+  **out-of-range index is silently skipped** (tolerant — never an error).
+- **`idSegments` without a `separator`** — the segment list is inert and the
+  whole stripped value is the single ID.
+
+The captured IDs surface as **`godot:id:*` sentinel references** in
+`unresolved_refs` — they are deliberately **never resolved to a node** (there is
+no canonical "buff 7005" node), exactly like the `godot:dynamic:*` sentinels. A
+colon-delimited literal can never name-match a symbol, so it stays unresolved and
+is greppable via `codegraph search godot:id:buff:7005`.
+
+Like `resourceFields`, `idFields` is **off by default** and has no effect unless
+explicitly configured. Every field name, kind, separator, and segment index is
+**project-supplied — CodeGraph hardcodes no domain field name, ID scheme, or
+separator**. A project with no `idFields` block produces output byte-identical to
+having no DSL config at all.
+
 ---
 
 ## Limitations

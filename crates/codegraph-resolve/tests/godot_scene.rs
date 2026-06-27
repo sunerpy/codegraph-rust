@@ -15,7 +15,7 @@ use codegraph_resolve::types::FrameworkResolverExtractionResult;
 /// `None`, which for a `.tscn` is itself a failure).
 fn extract(path: &str, content: &str) -> FrameworkResolverExtractionResult {
     GodotResolver
-        .extract(path, content)
+        .extract(path, content, "")
         .expect(".tscn must produce Some(result)")
 }
 
@@ -295,25 +295,25 @@ groups = [\"players\"]
 fn extract_routes_only_tscn_not_gd_or_tres() {
     // A .tscn dispatches to T4.
     assert!(GodotResolver
-        .extract("scenes/Main.tscn", "[gd_scene format=3]\n")
+        .extract("scenes/Main.tscn", "[gd_scene format=3]\n", "")
         .is_some());
     // A nested path whose extension is .tscn still dispatches.
     assert!(GodotResolver
-        .extract("a/b/c/Deep.tscn", "[gd_scene format=3]\n")
+        .extract("a/b/c/Deep.tscn", "[gd_scene format=3]\n", "")
         .is_some());
 
     // A .gd file now routes to T6's GDScript dynamic parser (Some).
     assert!(GodotResolver
-        .extract("player.gd", "extends Node\n")
+        .extract("player.gd", "extends Node\n", "")
         .is_some());
     // A .tres routes to T5's resource parser (Some, via that parser, not this).
     assert!(GodotResolver
-        .extract("data/item.tres", "[gd_resource format=3]\n")
+        .extract("data/item.tres", "[gd_resource format=3]\n", "")
         .is_some());
     // project.godot still routes to T3 (not this parser) — it returns Some, but
     // via the project parser, so it is NOT None.
     assert!(GodotResolver
-        .extract("project.godot", "[autoload]\nX=\"res://x.gd\"\n")
+        .extract("project.godot", "[autoload]\nX=\"res://x.gd\"\n", "")
         .is_some());
 }
 

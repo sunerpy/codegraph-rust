@@ -182,7 +182,12 @@ impl FrameworkResolver for GodotResolver {
     /// Every other file returns `None`, which the pipeline
     /// (`extract_and_persist_frameworks`) treats as "this resolver has nothing
     /// for this file".
-    fn extract(&self, file_path: &str, content: &str) -> Option<FrameworkResolverExtractionResult> {
+    fn extract(
+        &self,
+        file_path: &str,
+        content: &str,
+        project_root: &str,
+    ) -> Option<FrameworkResolverExtractionResult> {
         if godot_project::is_project_godot(file_path) {
             return Some(godot_project::parse_project_godot(file_path, content));
         }
@@ -190,7 +195,7 @@ impl FrameworkResolver for GodotResolver {
             return Some(godot_scene::parse_tscn(file_path, content));
         }
         if godot_resource::is_tres(file_path) {
-            return Some(godot_resource::parse_tres(file_path, content));
+            return Some(godot_resource::parse_tres(file_path, content, project_root));
         }
         if godot_script::is_gdscript(file_path) {
             let mut result = godot_script::parse_gdscript_dynamics(file_path, content);
