@@ -254,6 +254,75 @@ fn impact_lists_the_referencing_files() {
 }
 
 #[test]
+fn impact_carries_the_graph_edge_kind() {
+    // Given target.tres referenced by data.tres via an ExtResource ref,
+    let dir = unique_dir("impact-edgekind");
+    write(&dir, "project.godot", PROJECT_GODOT);
+    write(&dir, "target.tres", PLAIN_RESOURCE);
+    write(&dir, "data.tres", &referencing_resource("target.tres"));
+    // When impact is computed for target.tres,
+    let store = run_pipeline(
+        "impact-edgekind",
+        &dir,
+        &["project.godot", "target.tres", "data.tres"],
+    );
+    let impact = GraphTraverser::new(&store)
+        .resource_impact("target.tres")
+        .expect("impact");
+    // Then the data.tres site carries the graph EDGE kind that links it.
+    let data_ref = impact
+        .affected
+        .iter()
+        .find(|a| a.from_file == "data.tres")
+        .expect("data.tres in impact");
+    assert!(
+        data_ref.edge_kind == "references" || data_ref.edge_kind == "instantiates",
+        "edge_kind must surface the graph edge kind, got: {:?}",
+        data_ref.edge_kind
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn impact_dedup_keeps_distinct_edge_kinds_at_a_shared_site() {
+    // Given a resource referenced both as an unresolved ref AND a resolved edge
+    // (impact merges both sources before sort+dedup),
+    let dir = unique_dir("impact-dedup");
+    write(&dir, "project.godot", PROJECT_GODOT);
+    write(&dir, "target.tres", PLAIN_RESOURCE);
+    write(&dir, "data.tres", &referencing_resource("target.tres"));
+    // When impact is computed,
+    let store = run_pipeline(
+        "impact-dedup",
+        &dir,
+        &["project.godot", "target.tres", "data.tres"],
+    );
+    let impact = GraphTraverser::new(&store)
+        .resource_impact("target.tres")
+        .expect("impact");
+    // Then for any shared (from_file, line) the rows differ only by edge_kind,
+    // and dedup keeps one row per distinct (from_file, line, edge_kind) tuple —
+    // pinning the post-edge_kind dedup behaviour as intentional + deterministic.
+    let data_rows: Vec<_> = impact
+        .affected
+        .iter()
+        .filter(|a| a.from_file == "data.tres")
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    for row in &data_rows {
+        assert!(
+            seen.insert((row.from_file.clone(), row.line, row.edge_kind.clone())),
+            "dedup must leave no duplicate (from_file,line,edge_kind), got: {data_rows:?}"
+        );
+    }
+    assert!(
+        !data_rows.is_empty(),
+        "expected at least one data.tres row, got: {impact:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn orphan_accounting_is_keyed_on_resource_path_not_a_file_node() {
     // Given a referenced .tres — and confirmation that godot resources carry no
     // file: node (the B0 finding the orphan model relies on),

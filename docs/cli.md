@@ -29,7 +29,7 @@
 | `sync`            | Sync changes (currently reuses the safe full-index path)                                  | `[path]`, `-q/--quiet`                                                                                                        |
 | `status`          | Print index stats (files/nodes/edges/DB size/journal)                                     | `[path]`, `-j/--json`                                                                                                         |
 | `query`           | FTS5 + multi-signal scored search                                                         | `<search>`, `-p`, `-l/--limit`, `-k/--kind`, `-j/--json`                                                                      |
-| `files`           | List indexed files (tree/flat/grouped)                                                    | `-p`, `--filter`, `--pattern`, `--format`, `--max-depth`, `-j`                                                                |
+| `files`           | List indexed files (tree/flat/grouped)                                                    | `-p`, `--filter <DIR>`, `--language <LANG>`, `--pattern`, `--format`, `--max-depth`, `-j`                                     |
 | `serve`           | Start the server; `--mcp` enters MCP stdio mode                                           | `-p`, `--mcp`, `--no-watch`                                                                                                   |
 | `unlock`          | Clear a stale daemon lock (keeps live pids)                                               | `[path]`                                                                                                                      |
 | `callers`         | Who calls a symbol (along calls/references/imports)                                       | `<symbol>`, `-p`, `-l`, `-j`                                                                                                  |
@@ -37,7 +37,7 @@
 | `impact`          | Blast radius of changing a symbol (incoming deps, transitive)                             | `<symbol>`, `-p`, `-d/--depth`, `-j`                                                                                          |
 | `affected`        | Given changed files, the affected symbol set                                              | `[files...]`, `-p`, `-d/--depth`, `--filter`                                                                                  |
 | `check`           | Detect circular dependencies (each cycle as `a.ts -> b.ts -> a.ts`)                       | `[path]`, `-j/--json`                                                                                                         |
-| `audit`           | Read-only Godot resource audit: orphan resources, dangling references, impact             | `-p`, `--orphans`, `--dangling`, `--impact <path>` (≥1 required), `-j/--json`                                                 |
+| `audit`           | Read-only Godot resource audit: orphan resources, dangling references, impact             | `-p`, `--orphans`, `--dangling`, `--impact <path>` (≥1 required), `--include <PREFIX>`, `--exclude <PREFIX>`, `-j/--json`     |
 | `export`          | Export the whole code graph as NetworkX node-link JSON                                    | `[path]`, `-o/--out <file>`, `--no-centrality`                                                                                |
 | `version`         | Print the codegraph version (same as `--version`)                                         | —                                                                                                                             |
 | `self-update`     | Update the binary in place from the latest GitHub release                                 | `--check`, `--force`, `--tag <vX.Y.Z>`                                                                                        |
@@ -213,6 +213,39 @@ them automatically, reinstall via
 
 ---
 
+## `codegraph files` — list indexed files
+
+Lists the files in the index (tree/flat/grouped). Two independent filters:
+
+```bash
+codegraph files -p .                            # all indexed files (tree)
+codegraph files -p . --filter src/components     # only files UNDER this directory
+codegraph files -p . --language gdscript         # only files of this language
+codegraph files -p . --filter src --language go  # combine: Go files under src/
+```
+
+- **`--filter <DIR>`** — a **path-prefix** filter: keeps only files whose
+  repo-relative path starts with `<DIR>` (a leading `./` is also matched). This
+  is a directory filter, not a language filter (it is a faithful port of the
+  upstream `--filter <dir>` flag and keeps that meaning).
+- **`--language <LANG>`** — keeps only files whose language equals `<LANG>`,
+  matching the exact names `status` prints (e.g. `gdscript`, `godot_scene`,
+  `godot_resource`, `godot_project`, `python`, `rust`). The match is an exact,
+  case-sensitive comparison; a `<LANG>` no file uses yields an empty result with
+  no error and no hint.
+
+**Symbol count semantics.** The per-file "symbols" count shown by `files` is the
+**live count of graph nodes for that file** (`COUNT(*)` over the `nodes` table),
+so it stays consistent with what `query`/`callers`/`callees` see. This matters
+for Godot `.tscn`/`.tres` files: their scene/resource marker nodes are added by
+the framework resolver after the initial extractor, so the stored
+`files.node_count` column (which records only the initial extractor's count) can
+read `0` while the graph actually holds those nodes. `files` recomputes the
+displayed count from the `nodes` table for display only — it never rewrites the
+stored `files.node_count` column, so the golden output is unaffected.
+
+---
+
 ## `codegraph audit` — read-only Godot resource audit
 
 `audit` is a separate, **read-only** analysis surface for Godot projects. It is
@@ -228,7 +261,23 @@ codegraph audit --orphans -p .                 # .tres/.tscn resources nothing r
 codegraph audit --dangling -p .                # path references whose target is missing on disk
 codegraph audit --impact res://buff.tres -p .  # what references a given changed path
 codegraph audit --orphans --dangling --json -p .   # combine modes; structured JSON output
+codegraph audit --orphans --exclude addons/ -p .   # denoise: drop addons/ results
+codegraph audit --dangling --include Data/ -p .    # narrow: keep only Data/ results
 ```
+
+**`-p` is the project root, not a result filter.** `-p/--path` selects which
+project to audit (consistent with every other subcommand). To narrow the
+**results**, use the CLI-layer prefix filters:
+
+- **`--include <PREFIX>`** — keep only results whose path is under `<PREFIX>`.
+- **`--exclude <PREFIX>`** — drop results whose path is under `<PREFIX>`, e.g.
+  `--exclude addons/` to denoise a Godot project's vendored plugin tree.
+
+Both are repeatable and `/`-normalized; `--include` keeps a result if it matches
+any include prefix, then `--exclude` drops any that match an exclude prefix. The
+filters are applied in the CLI layer over the orphan / dangling / impact lists
+(matching `filePath` for orphans, `fromFile` for dangling and impact rows); the
+underlying graph functions stay pure, so the report is deterministic.
 
 **How references resolve (why this is path-based).** Godot `.tres`/`.tscn`/
 `project.godot` files have no tree-sitter grammar, so they get no `file:` graph
@@ -252,7 +301,12 @@ resource's repo-relative **path** — the `files` row plus the path-shaped
   method exists; signal-method resolution is out of scope.
 - **`--impact <path>`** — the reverse-dependency list for a changed path: every
   reference whose normalized target equals it, plus any resolved incoming edges
-  on that path's `file:` node (present for `.gd` / grammar-backed files).
+  on that path's `file:` node (present for `.gd` / grammar-backed files). In
+  `--json`, each affected site carries `fromFile`, `line`, and `edgeKind`.
+  `edgeKind` surfaces the graph EDGE kind that links the site (`references` /
+  `instantiates` for resolved edges; the reference's kind for unresolved refs) —
+  it is the structural relation, not a domain-semantic label, and does not
+  100%-distinguish every sub-flavor of reference.
 
 This is a static structural report. Runtime `ResourceLoader` load-verification
 is out of scope (that is Godot MCP Pro's job).

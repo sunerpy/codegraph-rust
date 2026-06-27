@@ -167,12 +167,13 @@ pub struct ResourceImpact {
     pub affected: Vec<AffectedRef>,
 }
 
-/// One referencing site (source file + line).
+/// One referencing site (source file + line + the graph edge kind that links it).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AffectedRef {
     pub from_file: String,
     pub line: i64,
+    pub edge_kind: String,
 }
 
 pub struct GraphTraverser<'store> {
@@ -1032,6 +1033,7 @@ impl<'store> GraphTraverser<'store> {
                 affected.push(AffectedRef {
                     from_file: reference.file_path,
                     line: reference.line,
+                    edge_kind: reference.reference_kind.as_str().to_string(),
                 });
             }
         }
@@ -1045,6 +1047,7 @@ impl<'store> GraphTraverser<'store> {
                 affected.push(AffectedRef {
                     from_file: source.file_path,
                     line: edge.line.unwrap_or(0),
+                    edge_kind: edge.kind.as_str().to_string(),
                 });
             }
         }

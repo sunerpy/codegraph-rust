@@ -168,8 +168,12 @@ enum Command {
     Files {
         #[arg(short, long)]
         path: Option<PathBuf>,
-        #[arg(long)]
+        /// Filter to files under this directory (path prefix).
+        #[arg(long, value_name = "DIR")]
         filter: Option<String>,
+        /// Filter to files of this language (matches `status` names, e.g. gdscript, godot_scene).
+        #[arg(long, value_name = "LANG")]
+        language: Option<String>,
         #[arg(long)]
         pattern: Option<String>,
         #[arg(long, value_enum, default_value_t = FilesFormat::Tree)]
@@ -245,6 +249,7 @@ enum Command {
     /// and reverse-dependency impact. Computed from the existing graph + disk
     /// checks; adds no extraction and is separate from `check`.
     Audit {
+        /// Project root (NOT a result filter; use --include/--exclude to narrow).
         #[arg(short, long)]
         path: Option<PathBuf>,
         /// Report `.tres`/`.tscn` resources nothing references.
@@ -256,6 +261,12 @@ enum Command {
         /// Report what references the given changed resource/script path.
         #[arg(long, value_name = "PATH")]
         impact: Option<String>,
+        /// Keep only results whose path is under this prefix (repeatable).
+        #[arg(long, value_name = "PREFIX")]
+        include: Vec<String>,
+        /// Drop results whose path is under this prefix, e.g. addons/ (repeatable).
+        #[arg(long, value_name = "PREFIX")]
+        exclude: Vec<String>,
         #[arg(short = 'j', long = "json")]
         json: bool,
     },
@@ -422,11 +433,12 @@ fn run(cli: Cli) -> Result<()> {
         Command::Files {
             path,
             filter,
+            language,
             pattern,
             format,
             max_depth,
             json,
-        } => cmd_files(path, filter, pattern, format, max_depth, json),
+        } => cmd_files(path, filter, language, pattern, format, max_depth, json),
         Command::Serve {
             path,
             mcp,
@@ -463,8 +475,10 @@ fn run(cli: Cli) -> Result<()> {
             orphans,
             dangling,
             impact,
+            include,
+            exclude,
             json,
-        } => cmd_audit(path, orphans, dangling, impact, json),
+        } => cmd_audit(path, orphans, dangling, impact, include, exclude, json),
         Command::Export {
             path,
             out,
@@ -1038,6 +1052,7 @@ fn cmd_query(
 fn cmd_files(
     path: Option<PathBuf>,
     filter: Option<String>,
+    language: Option<String>,
     pattern: Option<String>,
     format: FilesFormat,
     max_depth: Option<usize>,
@@ -1050,8 +1065,14 @@ fn cmd_files(
         let alt = format!("./{filter}");
         files.retain(|f| f.path.starts_with(&filter) || f.path.starts_with(&alt));
     }
+    if let Some(language) = language {
+        files.retain(|f| f.language.as_str() == language);
+    }
     if let Some(pattern) = pattern {
         files.retain(|f| glob_matches(&pattern, &f.path));
+    }
+    for file in &mut files {
+        file.node_count = store.node_count_by_file_path(&file.path)?;
     }
     if json_output {
         let output = files.iter().map(FileOutput::from).collect::<Vec<_>>();
@@ -1689,11 +1710,22 @@ fn cmd_check(path: Option<PathBuf>, json_output: bool) -> Result<()> {
     Ok(())
 }
 
+fn audit_prefix_keep(path: &str, include: &[String], exclude: &[String]) -> bool {
+    let normalized = path.replace('\\', "/");
+    let under = |prefix: &String| normalized.starts_with(&prefix.replace('\\', "/"));
+    if !include.is_empty() && !include.iter().any(under) {
+        return false;
+    }
+    !exclude.iter().any(under)
+}
+
 fn cmd_audit(
     path: Option<PathBuf>,
     orphans: bool,
     dangling: bool,
     impact: Option<String>,
+    include: Vec<String>,
+    exclude: Vec<String>,
     json_output: bool,
 ) -> Result<()> {
     if !orphans && !dangling && impact.is_none() {
@@ -1703,18 +1735,26 @@ fn cmd_audit(
     let store = open_store(&project)?;
     let traverser = GraphTraverser::new(&store);
 
-    let orphan_list = if orphans {
+    let mut orphan_list = if orphans {
         traverser.find_orphan_resources()?
     } else {
         Vec::new()
     };
-    let dangling_list = if dangling {
+    orphan_list.retain(|o| audit_prefix_keep(&o.file_path, &include, &exclude));
+    let mut dangling_list = if dangling {
         traverser.find_dangling_references(&project)?
     } else {
         Vec::new()
     };
+    dangling_list.retain(|d| audit_prefix_keep(&d.from_file, &include, &exclude));
     let impact_result = match &impact {
-        Some(changed) => Some(traverser.resource_impact(changed)?),
+        Some(changed) => {
+            let mut result = traverser.resource_impact(changed)?;
+            result
+                .affected
+                .retain(|a| audit_prefix_keep(&a.from_file, &include, &exclude));
+            Some(result)
+        }
         None => None,
     };
 

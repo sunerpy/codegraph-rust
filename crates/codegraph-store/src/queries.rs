@@ -126,6 +126,18 @@ impl Store {
         )
     }
 
+    /// Count of nodes whose `file_path` matches, for the displayed file-level
+    /// symbol total. Reads the live `nodes` table (which includes framework
+    /// marker nodes added after the initial extractor), so it can exceed the
+    /// stored `files.node_count`; it never writes that column.
+    pub fn node_count_by_file_path(&self, path: &str) -> rusqlite::Result<i64> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE file_path = ?1",
+            [path],
+            |row| row.get(0),
+        )
+    }
+
     /// Ports `getNodesByKind` from `upstream db/queries.ts:695-704`.
     pub fn nodes_by_kind(&self, kind: NodeKind) -> rusqlite::Result<Vec<Node>> {
         query_nodes(
