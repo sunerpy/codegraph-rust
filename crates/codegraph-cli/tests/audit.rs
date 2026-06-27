@@ -131,6 +131,31 @@ fn audit_reports_planted_orphan_and_dangling_as_json() {
 }
 
 #[test]
+fn audit_dangling_does_not_report_a_scene_connection_method() {
+    // Given the fixture indexed (main.tscn wires a `pressed` signal to the
+    // _on_Close_pressed handler that exists in the sibling player.gd),
+    let (_dir, project) = indexed_project("signal-method");
+    let p = project.to_str().unwrap();
+
+    // When audit runs with --dangling --json,
+    let (stdout, err, ok) = cli(&["audit", "--dangling", "--json", "-p", p]);
+    assert!(ok, "audit failed: stderr={err}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("audit emits valid JSON");
+
+    // Then the bare connection method is NOT listed as a dangling path.
+    let dangling_targets: Vec<&str> = value["dangling"]
+        .as_array()
+        .expect("dangling array")
+        .iter()
+        .map(|d| d["targetPath"].as_str().expect("targetPath"))
+        .collect();
+    assert!(
+        !dangling_targets.contains(&"_on_Close_pressed"),
+        "signal handler _on_Close_pressed must not be dangling, got: {dangling_targets:?}"
+    );
+}
+
+#[test]
 fn audit_requires_at_least_one_mode() {
     // Given the indexed fixture,
     let (_dir, project) = indexed_project("no-mode");

@@ -91,6 +91,21 @@ fn run_pipeline(test_name: &str, root: &Path, relative_files: &[&str]) -> Store 
 const PLAIN_RESOURCE: &str = "[gd_resource type=\"Resource\" format=3]\n\n[resource]\n";
 const PROJECT_GODOT: &str = "config_version=5\n\n[application]\nconfig/name=\"Audit Fixture\"\n";
 
+/// A `.gd` script exposing one handler method, and a `.tscn` that binds the
+/// script to its root node and wires a `pressed` signal to that handler via a
+/// `[connection method="..."]`. The connection emits a bare-name unresolved ref
+/// (`reference_name=<method>`, `language=GodotScene`) — the input the dangling
+/// narrowing must NOT report as a missing path.
+fn handler_script(method: &str) -> String {
+    format!("extends Button\n\nfunc {method}():\n\tpass\n")
+}
+
+fn scene_with_connection(script_rel: &str, method: &str) -> String {
+    format!(
+        "[gd_scene load_steps=2 format=3]\n\n[ext_resource type=\"Script\" path=\"res://{script_rel}\" id=\"1\"]\n\n[node name=\"Root\" type=\"Button\"]\nscript = ExtResource(\"1\")\n\n[connection signal=\"pressed\" from=\".\" to=\".\" method=\"{method}\"]\n"
+    )
+}
+
 fn referencing_resource(target: &str) -> String {
     format!(
         "[gd_resource type=\"Resource\" format=3]\n\n[ext_resource type=\"Resource\" path=\"res://{target}\" id=\"1\"]\n\n[resource]\nlinked = ExtResource(\"1\")\n"
@@ -268,6 +283,126 @@ fn orphan_accounting_is_keyed_on_resource_path_not_a_file_node() {
     assert!(
         !orphans.iter().any(|o| o.file_path == "target.tres"),
         "path-keyed accounting must mark target.tres as referenced, got: {orphans:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn existing_signal_handler_method_is_not_dangling() {
+    // Given a scene wiring a `pressed` signal to `_on_Existing`, whose method
+    // exists in the attached player.gd,
+    let dir = unique_dir("dangling-signal-existing");
+    write(&dir, "project.godot", PROJECT_GODOT);
+    write(&dir, "player.gd", &handler_script("_on_Existing"));
+    write(
+        &dir,
+        "main.tscn",
+        &scene_with_connection("player.gd", "_on_Existing"),
+    );
+    // When dangling detection runs,
+    let store = run_pipeline(
+        "dangling-signal-existing",
+        &dir,
+        &["project.godot", "player.gd", "main.tscn"],
+    );
+    let dangling = GraphTraverser::new(&store)
+        .find_dangling_references(&dir)
+        .expect("dangling");
+    // Then the bare handler name is NOT reported as a missing path.
+    assert!(
+        !dangling.iter().any(|d| d.target_path == "_on_Existing"),
+        "existing signal handler must not be dangling, got: {dangling:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn nonexistent_signal_handler_method_is_still_not_reported_by_dangling() {
+    // Given a scene wiring a signal to `_on_Missing`, a method that does NOT
+    // exist in the attached player.gd (only `_on_Existing` does),
+    let dir = unique_dir("dangling-signal-missing");
+    write(&dir, "project.godot", PROJECT_GODOT);
+    write(&dir, "player.gd", &handler_script("_on_Existing"));
+    write(
+        &dir,
+        "main.tscn",
+        &scene_with_connection("player.gd", "_on_Missing"),
+    );
+    // When dangling detection runs,
+    let store = run_pipeline(
+        "dangling-signal-missing",
+        &dir,
+        &["project.godot", "player.gd", "main.tscn"],
+    );
+    let dangling = GraphTraverser::new(&store)
+        .find_dangling_references(&dir)
+        .expect("dangling");
+    // Then it is STILL not reported — dangling reports missing PATHS only, not
+    // signal-method resolution (the documented scope boundary).
+    assert!(
+        !dangling.iter().any(|d| d.target_path == "_on_Missing"),
+        "dangling reports missing paths only, never bare signal methods, got: {dangling:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn genuine_missing_ext_resource_path_is_still_dangling() {
+    // Given a scene whose attached script path res://Data/Missing.tres does not
+    // exist on disk (alongside an existing-handler connection),
+    let dir = unique_dir("dangling-missing-path");
+    write(&dir, "project.godot", PROJECT_GODOT);
+    write(
+        &dir,
+        "main.tscn",
+        &scene_with_connection("Data/Missing.tres", "_on_Existing"),
+    );
+    // When dangling detection runs,
+    let store = run_pipeline(
+        "dangling-missing-path",
+        &dir,
+        &["project.godot", "main.tscn"],
+    );
+    let dangling = GraphTraverser::new(&store)
+        .find_dangling_references(&dir)
+        .expect("dangling");
+    // Then the genuine missing PATH is still reported, while the bare handler
+    // name is not.
+    assert!(
+        dangling
+            .iter()
+            .any(|d| d.target_path == "Data/Missing.tres"),
+        "missing ExtResource path must still be dangling, got: {dangling:?}"
+    );
+    assert!(
+        !dangling.iter().any(|d| d.target_path == "_on_Existing"),
+        "bare handler name must not be dangling, got: {dangling:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn orphan_detection_unchanged_by_the_dangling_narrowing() {
+    // Given target.tres referenced only via a path ref from data.tres — the
+    // exact orphan-accounting input that keys on path-shaped resource refs (all
+    // of which contain `/`), so the dangling-only narrowing must not touch it,
+    let dir = unique_dir("orphan-unchanged");
+    write(&dir, "project.godot", PROJECT_GODOT);
+    write(&dir, "target.tres", PLAIN_RESOURCE);
+    write(&dir, "data.tres", &referencing_resource("target.tres"));
+    // When orphan detection runs,
+    let store = run_pipeline(
+        "orphan-unchanged",
+        &dir,
+        &["project.godot", "target.tres", "data.tres"],
+    );
+    let orphans = GraphTraverser::new(&store)
+        .find_orphan_resources()
+        .expect("orphans");
+    // Then target.tres stays non-orphan (referenced) — output unchanged.
+    assert!(
+        !orphans.iter().any(|o| o.file_path == "target.tres"),
+        "orphan output must be unchanged by the dangling narrowing, got: {orphans:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
