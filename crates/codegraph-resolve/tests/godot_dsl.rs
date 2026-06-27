@@ -282,3 +282,215 @@ effect_on = \"Enemy\"
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ---------------------------------------------------------------------------
+// PR2 idFields tests (A3): opt-in bare/compound ID capture as
+// `godot:id:<kind>:<value>` sentinel references.
+// ---------------------------------------------------------------------------
+
+/// Collect every `godot:id:*` sentinel reference_name, in emission order.
+fn id_sentinels(result: &FrameworkResolverExtractionResult) -> Vec<String> {
+    result
+        .references
+        .iter()
+        .filter(|r| r.reference_name.starts_with("godot:id:"))
+        .map(|r| r.reference_name.clone())
+        .collect()
+}
+
+#[test]
+fn idfields_bare_integer_emits_single_sentinel() {
+    // Given a config declaring `buff_id` as an idField of kind `buff`,
+    let root = unique_dir("id-bare");
+    write_config(
+        &root,
+        r#"{ "godot": { "dsl": { "idFields": { "buff_id": { "kind": "buff" } } } } }"#,
+    );
+    let content = "\
+[gd_resource type=\"Resource\" format=3]
+
+[resource]
+buff_id = 7005
+";
+    let tres = write_tres(&root, "data/strength.tres", content);
+
+    // When extracting a `.tres` with a bare integer `buff_id = 7005`,
+    let result = extract(&tres, content);
+
+    // Then exactly one `godot:id:buff:7005` sentinel is emitted, anchored on the
+    // resource marker with EdgeKind::References.
+    assert_eq!(id_sentinels(&result), vec!["godot:id:buff:7005"]);
+    let sentinel = result
+        .references
+        .iter()
+        .find(|r| r.reference_name == "godot:id:buff:7005")
+        .expect("the buff sentinel");
+    assert_eq!(sentinel.reference_kind, EdgeKind::References);
+    let marker = result.nodes.first().expect("a resource marker node");
+    assert_eq!(sentinel.from_node_id, marker.id);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn idfields_compound_split_selects_exactly_configured_segments() {
+    // Given a config splitting `skill_effect` on `:` and selecting segments [2, 4],
+    let root = unique_dir("id-compound");
+    write_config(
+        &root,
+        r#"{ "godot": { "dsl": { "idFields": { "skill_effect": { "kind": "skill", "separator": ":", "idSegments": [2, 4] } } } } }"#,
+    );
+    let content = "\
+[gd_resource type=\"Resource\" format=3]
+
+[resource]
+skill_effect = \"a:b:9015:c:7005:1000\"
+";
+    let tres = write_tres(&root, "data/mage.tres", content);
+
+    // When extracting the compound value,
+    let result = extract(&tres, content);
+
+    // Then EXACTLY the 0-based segments 2 and 4 (9015, 7005) become sentinels —
+    // not the whole string, not segment 5 (1000).
+    assert_eq!(
+        id_sentinels(&result),
+        vec!["godot:id:skill:9015", "godot:id:skill:7005"],
+        "only segments [2, 4] are captured, in idSegments order"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn idfields_without_config_emits_zero_id_sentinels() {
+    // Given a project with NO codegraph.json at all (the golden-neutrality lock),
+    let root = unique_dir("id-no-config");
+    let content = "\
+[gd_resource type=\"Resource\" format=3]
+
+[resource]
+buff_id = 7005
+skill_effect = \"a:b:9015:c:7005:1000\"
+";
+    let tres = write_tres(&root, "data/strength.tres", content);
+
+    // When extracting a `.tres` full of ID-shaped lines,
+    let result = extract(&tres, content);
+
+    // Then ZERO id sentinels are emitted — the config is the only trigger, so a
+    // non-configured project behaves byte-identically to pre-PR2.
+    assert!(
+        id_sentinels(&result).is_empty(),
+        "without idFields config there must be NO id sentinel, got {:?}",
+        result.references
+    );
+    // No ext_resource either → the off path emits nothing at all.
+    assert!(
+        result.references.is_empty(),
+        "no config + no ext_resource → zero refs, got {:?}",
+        result.references
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn idfields_configured_field_absent_from_file_emits_no_sentinel() {
+    // Given a config declaring `buff_id` but a `.tres` that never uses it,
+    let root = unique_dir("id-absent");
+    write_config(
+        &root,
+        r#"{ "godot": { "dsl": { "idFields": { "buff_id": { "kind": "buff" } } } } }"#,
+    );
+    let content = "\
+[gd_resource type=\"Resource\" format=3]
+
+[resource]
+duration = 5.0
+";
+    let tres = write_tres(&root, "data/strength.tres", content);
+
+    // When extracting a `.tres` with no matching key,
+    let result = extract(&tres, content);
+
+    // Then no sentinel fires — the spec map is matched by exact key.
+    assert!(
+        id_sentinels(&result).is_empty(),
+        "a configured field absent from the file emits no sentinel, got {:?}",
+        result.references
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn idfields_out_of_range_segment_is_silently_skipped() {
+    // Given a config selecting an in-range segment 1 and an out-of-range 9,
+    let root = unique_dir("id-oob");
+    write_config(
+        &root,
+        r#"{ "godot": { "dsl": { "idFields": { "pair": { "kind": "x", "separator": ":", "idSegments": [1, 9] } } } } }"#,
+    );
+    let content = "\
+[gd_resource type=\"Resource\" format=3]
+
+[resource]
+pair = \"100:200\"
+";
+    let tres = write_tres(&root, "data/oob.tres", content);
+
+    // When extracting a value with only two segments,
+    let result = extract(&tres, content);
+
+    // Then the in-range segment yields a sentinel and the out-of-range index is
+    // silently skipped (no panic, no error, no empty sentinel).
+    assert_eq!(
+        id_sentinels(&result),
+        vec!["godot:id:x:200"],
+        "in-range segment 1 captured; out-of-range 9 dropped"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn idfields_emission_is_deterministic_across_runs() {
+    // Given a config with two idFields and a `.tres` using both,
+    let root = unique_dir("id-determinism");
+    write_config(
+        &root,
+        r#"{ "godot": { "dsl": { "idFields": { "buff_id": { "kind": "buff" }, "skill_effect": { "kind": "skill", "separator": ":", "idSegments": [0, 2] } } } } }"#,
+    );
+    let content = "\
+[gd_resource type=\"Resource\" format=3]
+
+[resource]
+buff_id = 7005
+skill_effect = \"9015:c:7005\"
+";
+    let tres = write_tres(&root, "data/spell.tres", content);
+
+    // When extracting twice,
+    let a = extract(&tres, content);
+    let b = extract(&tres, content);
+
+    // Then the sentinel set, order, and edge sources are byte-stable, and follow
+    // SOURCE-LINE order (buff_id line before skill_effect line), not config order.
+    assert_eq!(
+        id_sentinels(&a),
+        id_sentinels(&b),
+        "deterministic across runs"
+    );
+    assert_eq!(
+        id_sentinels(&a),
+        vec![
+            "godot:id:buff:7005",
+            "godot:id:skill:9015",
+            "godot:id:skill:7005"
+        ],
+        "sentinels follow source-line order then idSegments order"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}

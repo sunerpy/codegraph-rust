@@ -62,7 +62,7 @@
 //! panics. An empty file yields an empty result. Binary `.res` is NOT parsed
 //! (only the text `.tres`).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use codegraph_core::node_id::generate_node_id;
@@ -70,7 +70,7 @@ use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 
 use super::framework_node;
 use super::godot_common::{map_res_path, quoted_strings, strip_quotes};
-use super::godot_dsl_config::dsl_resource_fields;
+use super::godot_dsl_config::{dsl_id_fields, dsl_resource_fields, IdFieldSpec};
 use crate::types::{FrameworkResolverExtractionResult, RefView};
 
 /// The marker-node name used when a `.tres` has no `[gd_resource type="..."]`.
@@ -102,6 +102,12 @@ pub(crate) fn parse_tres(file_path: &str, content: &str) -> FrameworkResolverExt
     // case, so zero DSL behavior). A `key = value` line whose key is in this list
     // emits a reference to its value (string literal → the literal text).
     let dsl_fields = dsl_resource_fields(Path::new(file_path));
+
+    // OPT-IN ID fields (PR2): the `godot.dsl.idFields` spec map from the same
+    // nearest config (empty when absent — off-by-default). A `key = value` line
+    // whose key is a spec key emits one `godot:id:<kind>:<value>` sentinel per
+    // selected segment. Independent of `dsl_fields`: a line may match both.
+    let id_fields = dsl_id_fields(Path::new(file_path));
 
     // In-file ext_resource lookup: id → repo-relative path. Built top-down as
     // the file is scanned (Godot declares ext_resources before `[resource]`),
@@ -157,22 +163,42 @@ pub(crate) fn parse_tres(file_path: &str, content: &str) -> FrameworkResolverExt
             Some(resolved) => Some(resolved),
             None => dsl_literal_target(key, value, &dsl_fields),
         };
-        let Some(target) = target else {
-            continue;
-        };
-        let from_node_id = marker
-            .get_or_insert_with(|| {
-                let node = constant_node(file_path, line_no, &resource_type);
-                let id = node.id.clone();
-                nodes.push(node);
-                MarkerNode { id }
-            })
-            .id
-            .clone();
-        references.push(reference(from_node_id, target, line_no, file_path));
+        if let Some(target) = target {
+            let from = marker_id(&mut marker, &mut nodes, file_path, line_no, &resource_type);
+            references.push(reference(from, target, line_no, file_path));
+        }
+        // The opt-in PR2 ID edges: one `godot:id:<kind>:<value>` sentinel per
+        // configured segment, emitted AFTER the standard edge so a line that
+        // matches both keeps source-line order. Empty when `id_fields` is empty.
+        for sentinel in dsl_id_targets(key, value, &id_fields) {
+            let from = marker_id(&mut marker, &mut nodes, file_path, line_no, &resource_type);
+            references.push(reference(from, sentinel, line_no, file_path));
+        }
     }
 
     FrameworkResolverExtractionResult { nodes, references }
+}
+
+/// Lazily create (once) and return the resource marker node id, pushing the
+/// marker node into `nodes` on first use. Shared by the standard T5 edge and the
+/// PR2 ID-sentinel edges so the marker is created exactly once, on the first
+/// reference to anchor.
+fn marker_id(
+    marker: &mut Option<MarkerNode>,
+    nodes: &mut Vec<Node>,
+    file_path: &str,
+    line_no: i64,
+    resource_type: &str,
+) -> String {
+    marker
+        .get_or_insert_with(|| {
+            let node = constant_node(file_path, line_no, resource_type);
+            let id = node.id.clone();
+            nodes.push(node);
+            MarkerNode { id }
+        })
+        .id
+        .clone()
 }
 
 /// The single resource marker node, once created.
@@ -230,6 +256,50 @@ fn dsl_literal_target(key: &str, value: &str, dsl_fields: &[String]) -> Option<S
         return None;
     }
     Some(inner.to_string())
+}
+
+/// The OPT-IN ID-field sentinels (PR2). Returns one `godot:id:<kind>:<value>`
+/// sentinel string per ID captured from `key = value` when `key` is a configured
+/// `id_fields` spec. With no config `id_fields` is empty, so this is always an
+/// empty `Vec` — the off-by-default contract.
+///
+/// The value is quote-stripped first. A spec WITHOUT a `separator` (or with an
+/// empty one) yields ONE sentinel for the whole stripped value. A spec WITH a
+/// `separator` splits the stripped value and selects the `id_segments` (0-based)
+/// parts; an out-of-range index is silently skipped (tolerant). A spec with
+/// `id_segments` but no `separator` treats the whole value as one ID (segments
+/// inert), per D-A3. Empty captured segments are dropped so a sentinel always
+/// carries a non-empty value.
+fn dsl_id_targets(
+    key: &str,
+    value: &str,
+    id_fields: &BTreeMap<String, IdFieldSpec>,
+) -> Vec<String> {
+    let Some(spec) = id_fields.get(key) else {
+        return Vec::new();
+    };
+    let stripped = strip_quotes(value.trim());
+
+    let values: Vec<&str> = match spec.separator.as_deref() {
+        Some(sep) if !sep.is_empty() => {
+            let parts: Vec<&str> = stripped.split(sep).collect();
+            match &spec.id_segments {
+                Some(segments) => segments
+                    .iter()
+                    .filter_map(|&i| parts.get(i).copied())
+                    .collect(),
+                None => parts,
+            }
+        }
+        _ => vec![stripped],
+    };
+
+    values
+        .into_iter()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| format!("godot:id:{}:{}", spec.kind, v))
+        .collect()
 }
 
 /// Build a [`NodeKind::Constant`] resource marker node with the deterministic
