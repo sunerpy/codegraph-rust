@@ -22,3 +22,5 @@ rusqlite = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+codegraph-extract = { path = "../codegraph-extract" }
+codegraph-resolve = { path = "../codegraph-resolve" }

@@ -1,0 +1,6 @@
+config_version=5
+
+[application]
+
+config/name="Godot Audit Fixture"
+run/main_scene="res://main.tscn"

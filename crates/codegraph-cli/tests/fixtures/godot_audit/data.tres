@@ -1,0 +1,8 @@
+[gd_resource type="Resource" format=3]
+
+[ext_resource type="Resource" path="res://referenced.tres" id="1"]
+[ext_resource type="Resource" path="res://missing/ghost.tres" id="2"]
+
+[resource]
+linked = ExtResource("1")
+ghost = ExtResource("2")

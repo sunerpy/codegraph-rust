@@ -6,7 +6,7 @@
 
 - **Positional or `-p/--path`:** `init`, `uninit`, `index`, `sync`, `status`,
   `callers`, `callees`, `impact`, `affected`, `unlock`, `check`, `export`.
-- **`-p/--path` only:** `query`, `files`, `serve`.
+- **`-p/--path` only:** `query`, `files`, `serve`, `audit`.
 - **No project path:** `install`, `uninstall`, `skill`, `version`, `self-update`,
   `completions`.
 
@@ -37,6 +37,7 @@
 | `impact`          | Blast radius of changing a symbol (incoming deps, transitive)                             | `<symbol>`, `-p`, `-d/--depth`, `-j`                                                                                          |
 | `affected`        | Given changed files, the affected symbol set                                              | `[files...]`, `-p`, `-d/--depth`, `--filter`                                                                                  |
 | `check`           | Detect circular dependencies (each cycle as `a.ts -> b.ts -> a.ts`)                       | `[path]`, `-j/--json`                                                                                                         |
+| `audit`           | Read-only Godot resource audit: orphan resources, dangling references, impact             | `-p`, `--orphans`, `--dangling`, `--impact <path>` (≥1 required), `-j/--json`                                                 |
 | `export`          | Export the whole code graph as NetworkX node-link JSON                                    | `[path]`, `-o/--out <file>`, `--no-centrality`                                                                                |
 | `version`         | Print the codegraph version (same as `--version`)                                         | —                                                                                                                             |
 | `self-update`     | Update the binary in place from the latest GitHub release                                 | `--check`, `--force`, `--tag <vX.Y.Z>`                                                                                        |
@@ -209,6 +210,48 @@ If codegraph lives on a root-owned path (e.g. `/usr/local/bin`), run with
 appropriate privileges. Windows assets are `.zip`; if `self-update` cannot fetch
 them automatically, reinstall via
 `cargo install --git https://github.com/sunerpy/codegraph-rust codegraph-rs`.
+
+---
+
+## `codegraph audit` — read-only Godot resource audit
+
+`audit` is a separate, **read-only** analysis surface for Godot projects. It is
+computed entirely from the existing graph plus on-disk existence checks — it adds
+no extraction and writes no nodes/edges, so it is golden-neutral and never
+perturbs `check` or any other output. It is its own subcommand (not a flag on
+`check`), so `check`'s parser, `--help`, and output stay unchanged.
+
+At least one mode flag is required:
+
+```bash
+codegraph audit --orphans -p .                 # .tres/.tscn resources nothing references
+codegraph audit --dangling -p .                # path references whose target is missing on disk
+codegraph audit --impact res://buff.tres -p .  # what references a given changed path
+codegraph audit --orphans --dangling --json -p .   # combine modes; structured JSON output
+```
+
+**How references resolve (why this is path-based).** Godot `.tres`/`.tscn`/
+`project.godot` files have no tree-sitter grammar, so they get no `file:` graph
+node, and their `ExtResource(...)` references stay in the `unresolved_refs` table
+(they never become golden-compared `edges`). The audit therefore keys on the
+resource's repo-relative **path** — the `files` row plus the path-shaped
+`reference_name`s — not on incoming graph edges.
+
+- **`--orphans`** — a `.tres`/`.tscn` whose path no reference names. Sorted by
+  path.
+- **`--dangling`** — a path-shaped reference (`reference_name` contains `/` and
+  ends in `.tres`/`.tscn`/`.gd`/`.res`, or whose language is a Godot non-script
+  language) whose target does not exist on disk under the project root.
+  **Exclusion precedence:** (1) a normalized target under `.godot/` or `addons/`
+  is excluded first (never dangling, regardless of disk state); (2) then a
+  `godot:dynamic:` reference is excluded; (3) only the survivors get the
+  disk-exists check.
+- **`--impact <path>`** — the reverse-dependency list for a changed path: every
+  reference whose normalized target equals it, plus any resolved incoming edges
+  on that path's `file:` node (present for `.gd` / grammar-backed files).
+
+This is a static structural report. Runtime `ResourceLoader` load-verification
+is out of scope (that is Godot MCP Pro's job).
 
 ---
 

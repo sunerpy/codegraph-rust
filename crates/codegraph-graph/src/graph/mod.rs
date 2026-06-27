@@ -7,9 +7,11 @@
 //! with the committed search `query` module (Task 21).
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
 
 use codegraph_core::types::{Edge, EdgeKind, Language, Node, NodeKind};
 use codegraph_store::Store;
+use serde::Serialize;
 
 // upstream graph/traversal.ts:506 — container kinds whose `contains`
 // children are pulled into the impact set at the same depth as the container.
@@ -135,6 +137,42 @@ impl GodotDynamicReach {
     pub fn has_any_signal(&self) -> bool {
         !self.reached_by.is_empty() || !self.dynamic_unresolved.is_empty()
     }
+}
+
+/// A Godot `.tres`/`.tscn` resource file no indexed reference names. Keyed on
+/// the repo-relative path (resource files have no `file:` graph node — orphan
+/// accounting is by path, per the B0 probe finding).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrphanResource {
+    pub file_path: String,
+}
+
+/// A path-shaped Godot reference whose target is missing on disk under the
+/// project root and is not an excluded (`.godot/`/`addons/`/`godot:dynamic:`) ref.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DanglingRef {
+    pub from_file: String,
+    pub target_path: String,
+    pub line: i64,
+    pub kind: String,
+}
+
+/// The reverse-dependency view for one changed resource/script path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceImpact {
+    pub changed: String,
+    pub affected: Vec<AffectedRef>,
+}
+
+/// One referencing site (source file + line).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AffectedRef {
+    pub from_file: String,
+    pub line: i64,
 }
 
 pub struct GraphTraverser<'store> {
@@ -909,6 +947,166 @@ impl<'store> GraphTraverser<'store> {
         }
         Ok(out)
     }
+
+    /// Godot `.tres`/`.tscn` resource files no indexed reference names (orphans).
+    ///
+    /// Read-only, golden-neutral. Per the B0 probe, godot resource files carry no
+    /// `file:` graph node and their inbound references stay in `unresolved_refs`,
+    /// so orphan accounting compares each resource's repo-relative path against
+    /// the set of referenced paths (`unresolved_refs.reference_name` plus any
+    /// resolved-edge target paths). Deterministic: sorted by `file_path`.
+    pub fn find_orphan_resources(&self) -> rusqlite::Result<Vec<OrphanResource>> {
+        let referenced = self.referenced_resource_paths()?;
+        let mut orphans: Vec<OrphanResource> = self
+            .store
+            .all_files()?
+            .into_iter()
+            .filter(|f| {
+                f.language.is_godot_non_script_file() && f.language != Language::GodotProject
+            })
+            .filter(|f| !referenced.contains(&normalize_rel(&f.path)))
+            .map(|f| OrphanResource { file_path: f.path })
+            .collect();
+        orphans.sort_by(|a, b| a.file_path.cmp(&b.file_path));
+        Ok(orphans)
+    }
+
+    /// Path-shaped Godot references whose target is missing on disk (dangling).
+    ///
+    /// Read-only, golden-neutral. Source set is `all_unresolved_refs()` filtered
+    /// to path-shaped names. Exclusion precedence: (1) normalized target prefix
+    /// `.godot/`/`addons/` → skip; (2) `reference_name` prefix `godot:dynamic:` →
+    /// skip; (3) survivors are dangling iff `project_root.join(normalized)` does
+    /// not exist on disk. Deterministic: sorted by `(from_file, target_path, line)`.
+    pub fn find_dangling_references(
+        &self,
+        project_root: &Path,
+    ) -> rusqlite::Result<Vec<DanglingRef>> {
+        let mut out: Vec<DanglingRef> = Vec::new();
+        for reference in self.store.all_unresolved_refs()? {
+            if !is_path_shaped(&reference.reference_name, reference.language) {
+                continue;
+            }
+            let normalized = normalize_rel(&reference.reference_name);
+            if is_excluded_prefix(&normalized) {
+                continue;
+            }
+            if reference.reference_name.starts_with("godot:dynamic:") {
+                continue;
+            }
+            if project_root.join(&normalized).exists() {
+                continue;
+            }
+            out.push(DanglingRef {
+                from_file: reference.file_path,
+                target_path: normalized,
+                line: reference.line,
+                kind: reference.reference_kind.as_str().to_string(),
+            });
+        }
+        out.sort_by(|a, b| {
+            a.from_file
+                .cmp(&b.from_file)
+                .then_with(|| a.target_path.cmp(&b.target_path))
+                .then_with(|| a.line.cmp(&b.line))
+        });
+        Ok(out)
+    }
+
+    /// Reverse-dependency (impact) list for a changed resource/script path.
+    ///
+    /// Read-only, golden-neutral. Lists every reference whose normalized target
+    /// equals `changed_rel_path`: unresolved path refs (the godot reference home,
+    /// per B0) plus any resolved incoming edges on the changed file's `file:`
+    /// node (present for `.gd`/grammar files). Deterministic: sorted by
+    /// `(from_file, line)`.
+    pub fn resource_impact(&self, changed_rel_path: &str) -> rusqlite::Result<ResourceImpact> {
+        let changed = normalize_rel(changed_rel_path);
+        let mut affected: Vec<AffectedRef> = Vec::new();
+
+        for reference in self.store.all_unresolved_refs()? {
+            if normalize_rel(&reference.reference_name) == changed {
+                affected.push(AffectedRef {
+                    from_file: reference.file_path,
+                    line: reference.line,
+                });
+            }
+        }
+
+        let file_id = codegraph_core::node_id::file_node_id(&changed);
+        for edge in self.store.edges_by_target_kind(&file_id, None)? {
+            if !matches!(edge.kind, EdgeKind::References | EdgeKind::Instantiates) {
+                continue;
+            }
+            if let Some(source) = self.store.node_by_id(&edge.source)? {
+                affected.push(AffectedRef {
+                    from_file: source.file_path,
+                    line: edge.line.unwrap_or(0),
+                });
+            }
+        }
+
+        affected.sort_by(|a, b| {
+            a.from_file
+                .cmp(&b.from_file)
+                .then_with(|| a.line.cmp(&b.line))
+        });
+        affected.dedup();
+        Ok(ResourceImpact { changed, affected })
+    }
+
+    /// The set of repo-relative resource paths referenced anywhere in the graph:
+    /// every path-shaped `unresolved_refs.reference_name` plus the file path of
+    /// any node that is the target of a resolved `References`/`Instantiates` edge.
+    fn referenced_resource_paths(&self) -> rusqlite::Result<HashSet<String>> {
+        let mut referenced: HashSet<String> = HashSet::new();
+        for reference in self.store.all_unresolved_refs()? {
+            if is_path_shaped(&reference.reference_name, reference.language) {
+                referenced.insert(normalize_rel(&reference.reference_name));
+            }
+        }
+        for node in self.store.nodes_by_kind(NodeKind::File)? {
+            for kind in [EdgeKind::References, EdgeKind::Instantiates] {
+                if !self
+                    .store
+                    .edges_by_target_kind(&node.id, Some(kind))?
+                    .is_empty()
+                {
+                    referenced.insert(normalize_rel(&node.file_path));
+                    break;
+                }
+            }
+        }
+        Ok(referenced)
+    }
+}
+
+/// Normalize a stored relative path to `/`-separated form (paths are stored
+/// `/`-joined by the node-id formula; this is belt-and-suspenders for any ref
+/// carrying a backslash).
+fn normalize_rel(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+/// `.godot/` and `addons/` references are engine-managed / third-party and are
+/// never reported as dangling, regardless of disk state.
+fn is_excluded_prefix(normalized: &str) -> bool {
+    normalized.starts_with(".godot/") || normalized.starts_with("addons/")
+}
+
+/// A reference name is path-shaped when it contains `/` AND ends in a Godot
+/// resource extension, OR its language is a Godot non-script file language.
+fn is_path_shaped(reference_name: &str, language: Language) -> bool {
+    let by_language = matches!(
+        language,
+        Language::GodotScene | Language::GodotResource | Language::GodotProject
+    );
+    let by_extension = reference_name.contains('/')
+        && (reference_name.ends_with(".tres")
+            || reference_name.ends_with(".tscn")
+            || reference_name.ends_with(".gd")
+            || reference_name.ends_with(".res"));
+    by_language || by_extension
 }
 
 /// Ambiguity resolution for `codegraph_node`: a bare name maps to EVERY exact

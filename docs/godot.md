@@ -193,6 +193,40 @@ which call pattern produced the reference so you can inspect the call site.
 
 ---
 
+## Resource audit (`codegraph audit`)
+
+`codegraph audit` is a read-only report over an already-indexed Godot project:
+orphan resources, dangling references, and reverse-dependency impact. It adds no
+extraction and writes no nodes/edges — it is computed from the existing graph
+plus on-disk existence checks, so it never perturbs `check` or golden output.
+
+```bash
+codegraph audit --orphans -p .                 # .tres/.tscn resources nothing references
+codegraph audit --dangling -p .                # path references whose target is missing on disk
+codegraph audit --impact res://buff.tres -p .  # what references a changed path
+codegraph audit --orphans --dangling --json -p .
+```
+
+Because `.tres`/`.tscn`/`project.godot` files have no tree-sitter grammar, they
+get no `file:` graph node and their `ExtResource(…)` references stay in the
+unresolved-reference table. The audit therefore keys on the resource's
+repo-relative **path** (its `files` row + the path-shaped reference names), not
+on incoming graph edges.
+
+- **Orphan** — a `.tres`/`.tscn` whose path no reference names.
+- **Dangling** — a path-shaped reference whose target is missing on disk.
+  **Exclusion precedence:** a target under `.godot/` or `addons/` is excluded
+  first (never dangling, regardless of disk state); then a `godot:dynamic:`
+  reference is excluded; only the survivors get the disk-exists check.
+- **Impact** — the reverse-dependency list for a changed path: references that
+  name it, plus any resolved incoming edges on that path's `file:` node.
+
+This is a static structural report. Runtime `ResourceLoader` load-verification is
+out of scope (that is Godot MCP Pro's job). See [`cli.md`](cli.md) for the full
+flag reference.
+
+---
+
 ## Optional resource DSL hook
 
 For projects that define custom `.tres` resource types with domain-specific
