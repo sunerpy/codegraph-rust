@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.18.0](https://github.com/sunerpy/codegraph-rust/compare/v0.17.0...v0.18.0) (2026-06-27)
+
+
+### Features
+
+* **cli:** add files --language, audit include/exclude, impact edgeKind, accurate symbol count ([#87](https://github.com/sunerpy/codegraph-rust/issues/87)) ([8b07975](https://github.com/sunerpy/codegraph-rust/commit/8b0797578e1204d7d0aaa69cd17c1c16b0209c75))
+
+
+### Bug Fixes
+
+* **graph:** stop audit --dangling reporting bare signal methods as missing paths ([#85](https://github.com/sunerpy/codegraph-rust/issues/85)) ([091b3f3](https://github.com/sunerpy/codegraph-rust/commit/091b3f39983cf4c94d9a8bd3ce9baedc89775314))
+
 ## [0.17.0](https://github.com/sunerpy/codegraph-rust/compare/v0.16.1...v0.17.0) (2026-06-27)
 
 
