@@ -134,6 +134,7 @@ impl FrameworkResolver for VueResolver {
         &self,
         file_path: &str,
         _content: &str,
+        _project_root: &str,
     ) -> Option<FrameworkResolverExtractionResult> {
         let mut nodes = Vec::new();
         let normalized = file_path.replace('\\', "/");

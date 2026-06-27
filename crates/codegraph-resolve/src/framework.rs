@@ -62,10 +62,20 @@ pub trait FrameworkResolver: Sync {
     /// Extract this `FrameworkResolver`'s nodes + references from a file
     /// (`extract?`, `types.ts:174-182`). `None` when the resolver has no
     /// per-file extraction.
+    ///
+    /// `file_path` is the repo-RELATIVE path that MUST be used for all node /
+    /// reference attribution (preserving golden byte-stability). `project_root`
+    /// is the absolute project root the pipeline is indexing; resolvers that
+    /// read a per-project `.codegraph/codegraph.json` (e.g. Godot's opt-in DSL
+    /// config) MUST resolve that config against `project_root.join(file_path)`
+    /// rather than the process CWD — otherwise the config is only found when the
+    /// CLI happens to run with its CWD == the project root. Resolvers that need
+    /// no project config simply ignore `project_root`.
     fn extract(
         &self,
         _file_path: &str,
         _content: &str,
+        _project_root: &str,
     ) -> Option<FrameworkResolverExtractionResult> {
         None
     }

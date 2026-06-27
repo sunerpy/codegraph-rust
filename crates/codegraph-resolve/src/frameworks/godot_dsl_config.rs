@@ -116,9 +116,15 @@ pub(crate) fn dsl_resource_fields(path: &Path) -> Arc<DslFields> {
     load_cached(&config_path)
 }
 
-/// Walk up from `path` to the nearest `.codegraph/codegraph.json`. IDENTICAL in
-/// shape to `ext_config::find_config_path` (absolute paths use the file's own
-/// parent; relative paths are joined onto the cwd first).
+/// Walk up from `path` to the nearest `.codegraph/codegraph.json`. The starting
+/// directory is the file's own parent. `path` is expected to be ABSOLUTE — the
+/// pipeline resolves the `.tres` against the project root before calling
+/// (`godot_resource::config_lookup_path`), and the unit tests pass absolute
+/// paths. A relative `path` is still tolerated (joined onto the CWD, matching
+/// `ext_config::find_config_path`), but the pipeline never relies on that CWD
+/// join: doing so silently mislocated the config whenever the CLI ran with its
+/// CWD != the project root, which is the bug this resolution was hardened
+/// against.
 fn find_config_path(file_path: &Path) -> Option<PathBuf> {
     let start = if file_path.is_absolute() {
         file_path.parent().map(Path::to_path_buf)

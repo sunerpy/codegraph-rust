@@ -55,7 +55,7 @@ fn write_tres(root: &Path, rel: &str, content: &str) -> String {
 /// Extract a `.tres` at `abs_path` (panics if the resolver returned `None`).
 fn extract(abs_path: &str, content: &str) -> FrameworkResolverExtractionResult {
     GodotResolver
-        .extract(abs_path, content)
+        .extract(abs_path, content, "")
         .expect(".tres must produce Some(result)")
 }
 

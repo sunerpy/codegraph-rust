@@ -99,7 +99,12 @@ impl FrameworkResolver for NestjsResolver {
     }
 
     // Ports nestjsResolver.extract (nestjs.ts:113-193).
-    fn extract(&self, file_path: &str, content: &str) -> Option<FrameworkResolverExtractionResult> {
+    fn extract(
+        &self,
+        file_path: &str,
+        content: &str,
+        _project_root: &str,
+    ) -> Option<FrameworkResolverExtractionResult> {
         if !nestjs_file_ext_regex().is_match(file_path) {
             return Some(FrameworkResolverExtractionResult::default());
         }
