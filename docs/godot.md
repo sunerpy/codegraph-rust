@@ -205,7 +205,14 @@ codegraph audit --orphans -p .                 # .tres/.tscn resources nothing r
 codegraph audit --dangling -p .                # path references whose target is missing on disk
 codegraph audit --impact res://buff.tres -p .  # what references a changed path
 codegraph audit --orphans --dangling --json -p .
+codegraph audit --orphans --exclude addons/ -p .   # recommended: denoise vendored plugins
 ```
+
+`-p` selects the **project root**, not a result filter. To scope or denoise the
+report, use the CLI-layer prefix filters `--include <PREFIX>` / `--exclude
+<PREFIX>` (both repeatable, `/`-normalized). For a typical Godot project,
+`--exclude addons/` drops noise from vendored editor plugins; `--include
+<your-content-dir>/` narrows to your own resources.
 
 Because `.tres`/`.tscn`/`project.godot` files have no tree-sitter grammar, they
 get no `file:` graph node and their `ExtResource(…)` references stay in the
@@ -224,7 +231,11 @@ on incoming graph edges.
   reported as dangling, whether or not the handler method exists; signal-method
   resolution is out of scope.
 - **Impact** — the reverse-dependency list for a changed path: references that
-  name it, plus any resolved incoming edges on that path's `file:` node.
+  name it, plus any resolved incoming edges on that path's `file:` node. In
+  `--json`, each affected site carries `edgeKind` — the graph EDGE kind that
+  links it (`references` / `instantiates`, or the reference's kind for
+  unresolved refs). It is the structural relation, not a domain-semantic label,
+  and does not 100%-distinguish every sub-flavor of reference.
 
 This is a static structural report. Runtime `ResourceLoader` load-verification is
 out of scope (that is Godot MCP Pro's job). See [`cli.md`](cli.md) for the full

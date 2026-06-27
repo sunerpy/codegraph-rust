@@ -156,6 +156,107 @@ fn audit_dangling_does_not_report_a_scene_connection_method() {
 }
 
 #[test]
+fn audit_orphans_exclude_drops_matching_prefix() {
+    // Given the fixture with an orphan resource planted under levels/ (an
+    // indexed subdir; addons/ and vendor/ are index-ignored so they cannot
+    // exercise the CLI-layer prefix filter),
+    let (_dir, project) = indexed_project("exclude-prefix");
+    let p = project.to_str().unwrap();
+    let levels = project.join("levels");
+    fs::create_dir_all(&levels).unwrap();
+    fs::copy(
+        project.join("orphan.tres"),
+        levels.join("level_orphan.tres"),
+    )
+    .unwrap();
+    let (_o, _e, ok) = cli(&["index", "--force", p]);
+    assert!(ok, "reindex failed");
+
+    // When audit --orphans runs without and with --exclude levels/,
+    let unfiltered: serde_json::Value = {
+        let (stdout, err, ok) = cli(&["audit", "--orphans", "--json", "-p", p]);
+        assert!(ok, "audit failed: stderr={err}");
+        serde_json::from_str(&stdout).expect("valid JSON")
+    };
+    let filtered: serde_json::Value = {
+        let (stdout, err, ok) = cli(&[
+            "audit",
+            "--orphans",
+            "--exclude",
+            "levels/",
+            "--json",
+            "-p",
+            p,
+        ]);
+        assert!(ok, "audit failed: stderr={err}");
+        serde_json::from_str(&stdout).expect("valid JSON")
+    };
+
+    // Then the levels/ orphan is present unfiltered but dropped by --exclude.
+    let orphans = |v: &serde_json::Value| -> Vec<String> {
+        v["orphans"]
+            .as_array()
+            .expect("orphans array")
+            .iter()
+            .map(|o| o["filePath"].as_str().expect("filePath").to_string())
+            .collect()
+    };
+    assert!(
+        orphans(&unfiltered)
+            .iter()
+            .any(|f| f.starts_with("levels/")),
+        "levels orphan must appear unfiltered, got: {:?}",
+        orphans(&unfiltered)
+    );
+    assert!(
+        !orphans(&filtered).iter().any(|f| f.starts_with("levels/")),
+        "--exclude levels/ must drop levels orphans, got: {:?}",
+        orphans(&filtered)
+    );
+}
+
+#[test]
+fn audit_dangling_include_keeps_only_matching_prefix() {
+    // Given the fixture with a Data/ resource whose ref target is missing,
+    let (_dir, project) = indexed_project("include-data");
+    let p = project.to_str().unwrap();
+    let data = project.join("Data");
+    fs::create_dir_all(&data).unwrap();
+    fs::write(
+        data.join("config.tres"),
+        "[gd_resource type=\"Resource\" format=3]\n\n[ext_resource type=\"Resource\" path=\"res://Data/gone.tres\" id=\"1\"]\n\n[resource]\nlinked = ExtResource(\"1\")\n",
+    )
+    .unwrap();
+    let (_o, _e, ok) = cli(&["index", "--force", p]);
+    assert!(ok, "reindex failed");
+
+    // When audit --dangling runs with --include Data/,
+    let (stdout, err, ok) = cli(&[
+        "audit",
+        "--dangling",
+        "--include",
+        "Data/",
+        "--json",
+        "-p",
+        p,
+    ]);
+    assert!(ok, "audit failed: stderr={err}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+
+    // Then every reported dangling ref originates under Data/.
+    let from_files: Vec<&str> = value["dangling"]
+        .as_array()
+        .expect("dangling array")
+        .iter()
+        .map(|d| d["fromFile"].as_str().expect("fromFile"))
+        .collect();
+    assert!(
+        !from_files.is_empty() && from_files.iter().all(|f| f.starts_with("Data/")),
+        "--include Data/ must keep only Data/ refs, got: {from_files:?}"
+    );
+}
+
+#[test]
 fn audit_requires_at_least_one_mode() {
     // Given the indexed fixture,
     let (_dir, project) = indexed_project("no-mode");
