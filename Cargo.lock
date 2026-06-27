@@ -398,6 +398,8 @@ version = "0.15.8"
 dependencies = [
  "anyhow",
  "codegraph-core",
+ "codegraph-extract",
+ "codegraph-resolve",
  "codegraph-store",
  "rusqlite",
  "serde",

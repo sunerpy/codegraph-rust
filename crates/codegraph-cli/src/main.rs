@@ -95,7 +95,8 @@ impl Cli {
             | Command::Callees { path, .. }
             | Command::Impact { path, .. }
             | Command::Affected { path, .. }
-            | Command::Check { path, .. } => path.clone(),
+            | Command::Check { path, .. }
+            | Command::Audit { path, .. } => path.clone(),
             Command::Export { path, .. } => path.clone(),
             Command::PromptHook { path, .. } => path.clone(),
             // install/uninstall/skill are not project-scoped — bootstrap from cwd.
@@ -237,6 +238,24 @@ enum Command {
     Check {
         #[arg(short, long)]
         path: Option<PathBuf>,
+        #[arg(short = 'j', long = "json")]
+        json: bool,
+    },
+    /// Read-only Godot resource audit: orphan resources, dangling references,
+    /// and reverse-dependency impact. Computed from the existing graph + disk
+    /// checks; adds no extraction and is separate from `check`.
+    Audit {
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+        /// Report `.tres`/`.tscn` resources nothing references.
+        #[arg(long)]
+        orphans: bool,
+        /// Report path references whose target is missing on disk.
+        #[arg(long)]
+        dangling: bool,
+        /// Report what references the given changed resource/script path.
+        #[arg(long, value_name = "PATH")]
+        impact: Option<String>,
         #[arg(short = 'j', long = "json")]
         json: bool,
     },
@@ -439,6 +458,13 @@ fn run(cli: Cli) -> Result<()> {
             filter,
         } => cmd_affected(files, path, depth, filter),
         Command::Check { path, json } => cmd_check(path, json),
+        Command::Audit {
+            path,
+            orphans,
+            dangling,
+            impact,
+            json,
+        } => cmd_audit(path, orphans, dangling, impact, json),
         Command::Export {
             path,
             out,
@@ -1661,6 +1687,102 @@ fn cmd_check(path: Option<PathBuf>, json_output: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn cmd_audit(
+    path: Option<PathBuf>,
+    orphans: bool,
+    dangling: bool,
+    impact: Option<String>,
+    json_output: bool,
+) -> Result<()> {
+    if !orphans && !dangling && impact.is_none() {
+        bail!("audit requires at least one of --orphans, --dangling, --impact <path>");
+    }
+    let project = resolve_required_project(path)?;
+    let store = open_store(&project)?;
+    let traverser = GraphTraverser::new(&store);
+
+    let orphan_list = if orphans {
+        traverser.find_orphan_resources()?
+    } else {
+        Vec::new()
+    };
+    let dangling_list = if dangling {
+        traverser.find_dangling_references(&project)?
+    } else {
+        Vec::new()
+    };
+    let impact_result = match &impact {
+        Some(changed) => Some(traverser.resource_impact(changed)?),
+        None => None,
+    };
+
+    if json_output {
+        let mut out = serde_json::Map::new();
+        if orphans {
+            out.insert("orphans".to_string(), json!(orphan_list));
+        }
+        if dangling {
+            out.insert("dangling".to_string(), json!(dangling_list));
+        }
+        if let Some(result) = &impact_result {
+            out.insert("impact".to_string(), json!(result));
+        }
+        print_json_pretty(&serde_json::Value::Object(out))?;
+        return Ok(());
+    }
+
+    if orphans {
+        print_audit_orphans(&orphan_list);
+    }
+    if dangling {
+        print_audit_dangling(&dangling_list);
+    }
+    if let Some(result) = &impact_result {
+        print_audit_impact(result);
+    }
+    Ok(())
+}
+
+fn print_audit_orphans(orphans: &[codegraph_graph::graph::OrphanResource]) {
+    if orphans.is_empty() {
+        println!("No orphan resources found");
+    } else {
+        println!("\nFound {} orphan resources:\n", orphans.len());
+        for orphan in orphans {
+            println!("  {}", orphan.file_path);
+        }
+    }
+}
+
+fn print_audit_dangling(dangling: &[codegraph_graph::graph::DanglingRef]) {
+    if dangling.is_empty() {
+        println!("No dangling references found");
+    } else {
+        println!("\nFound {} dangling references:\n", dangling.len());
+        for reference in dangling {
+            println!(
+                "  {}:{} \u{2192} {} ({})",
+                reference.from_file, reference.line, reference.target_path, reference.kind
+            );
+        }
+    }
+}
+
+fn print_audit_impact(impact: &codegraph_graph::graph::ResourceImpact) {
+    if impact.affected.is_empty() {
+        println!("\nNothing references {}", impact.changed);
+    } else {
+        println!(
+            "\n{} is referenced by {} site(s):\n",
+            impact.changed,
+            impact.affected.len()
+        );
+        for affected in &impact.affected {
+            println!("  {}:{}", affected.from_file, affected.line);
+        }
+    }
 }
 
 fn cmd_export(path: Option<PathBuf>, out: Option<PathBuf>, no_centrality: bool) -> Result<()> {
