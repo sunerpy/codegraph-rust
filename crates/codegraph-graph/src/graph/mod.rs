@@ -987,6 +987,9 @@ impl<'store> GraphTraverser<'store> {
             if !is_path_shaped(&reference.reference_name, reference.language) {
                 continue;
             }
+            if !looks_like_path(&reference.reference_name) {
+                continue;
+            }
             let normalized = normalize_rel(&reference.reference_name);
             if is_excluded_prefix(&normalized) {
                 continue;
@@ -1107,6 +1110,32 @@ fn is_path_shaped(reference_name: &str, language: Language) -> bool {
             || reference_name.ends_with(".gd")
             || reference_name.ends_with(".res"));
     by_language || by_extension
+}
+
+/// A reference name *looks like a path* — used as an ADDITIONAL dangling-only
+/// gate so a bare identifier (e.g. a `[connection] method="_on_X"` signal
+/// handler name, which `is_path_shaped` classifies as path-shaped purely by its
+/// `GodotScene` language) is never disk-checked and reported as a missing path.
+///
+/// The `/` check is the PRIMARY gate: every genuine resource path reference is a
+/// repo-relative resolved path and therefore contains a `/`. The resource
+/// extension list is a SECONDARY, defensive signal that only matters for the
+/// rare slashless-but-extension-bearing case (a resource sitting at the project
+/// root, e.g. `icon.png`); it is intentionally small — the goal is to exclude
+/// bare identifiers, not to enumerate every asset type.
+fn looks_like_path(reference_name: &str) -> bool {
+    reference_name.contains('/')
+        || reference_name.ends_with(".tres")
+        || reference_name.ends_with(".tscn")
+        || reference_name.ends_with(".gd")
+        || reference_name.ends_with(".res")
+        || reference_name.ends_with(".gdshader")
+        || reference_name.ends_with(".gdshaderinc")
+        || reference_name.ends_with(".png")
+        || reference_name.ends_with(".svg")
+        || reference_name.ends_with(".ogg")
+        || reference_name.ends_with(".wav")
+        || reference_name.ends_with(".ttf")
 }
 
 /// Ambiguity resolution for `codegraph_node`: a bare name maps to EVERY exact

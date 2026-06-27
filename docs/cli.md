@@ -245,7 +245,11 @@ resource's repo-relative **path** — the `files` row plus the path-shaped
   **Exclusion precedence:** (1) a normalized target under `.godot/` or `addons/`
   is excluded first (never dangling, regardless of disk state); (2) then a
   `godot:dynamic:` reference is excluded; (3) only the survivors get the
-  disk-exists check.
+  disk-exists check. `--dangling` reports missing resource/script **paths**
+  only — a reference must look like a path (contain `/`, or carry a resource
+  extension) to be a candidate. A bare `[connection] method="_on_X"` signal
+  handler name is not a path and is never reported, whether or not the handler
+  method exists; signal-method resolution is out of scope.
 - **`--impact <path>`** — the reverse-dependency list for a changed path: every
   reference whose normalized target equals it, plus any resolved incoming edges
   on that path's `file:` node (present for `.gd` / grammar-backed files).

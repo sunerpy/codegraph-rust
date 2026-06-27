@@ -217,7 +217,12 @@ on incoming graph edges.
 - **Dangling** — a path-shaped reference whose target is missing on disk.
   **Exclusion precedence:** a target under `.godot/` or `addons/` is excluded
   first (never dangling, regardless of disk state); then a `godot:dynamic:`
-  reference is excluded; only the survivors get the disk-exists check.
+  reference is excluded; only the survivors get the disk-exists check. Dangling
+  reports missing resource/script **paths** only — a reference must look like a
+  path (contain `/`, or carry a resource extension) to be a candidate. A bare
+  `[connection] method="_on_X"` signal handler name is not a path and is never
+  reported as dangling, whether or not the handler method exists; signal-method
+  resolution is out of scope.
 - **Impact** — the reverse-dependency list for a changed path: references that
   name it, plus any resolved incoming edges on that path's `file:` node.
 
