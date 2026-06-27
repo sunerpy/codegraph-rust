@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.17.0](https://github.com/sunerpy/codegraph-rust/compare/v0.16.1...v0.17.0) (2026-06-27)
+
+
+### Features
+
+* **graph:** add read-only Godot resource audit (orphan/dangling/impact) ([#82](https://github.com/sunerpy/codegraph-rust/issues/82)) ([7f80b0f](https://github.com/sunerpy/codegraph-rust/commit/7f80b0f10314951a5e9f808ca3ec0138c97834b0))
+* **resolve:** add opt-in Godot idFields DSL indexing via godot:id sentinels ([#84](https://github.com/sunerpy/codegraph-rust/issues/84)) ([54bf901](https://github.com/sunerpy/codegraph-rust/commit/54bf901ec89dc97e1dd75fe36e1d02caa4e3ec06))
+
 ## [0.16.1](https://github.com/sunerpy/codegraph-rust/compare/v0.16.0...v0.16.1) (2026-06-26)
 
 
