@@ -193,6 +193,18 @@ fn count_sync_lines(log: &Path) -> usize {
         .count()
 }
 
+/// Return the first `[watcher] sync #` line in the daemon.log, if any.
+fn first_sync_line(log: &Path) -> Option<String> {
+    let mut contents = String::new();
+    if let Ok(mut file) = fs::File::open(log) {
+        let _ = file.read_to_string(&mut contents);
+    }
+    contents
+        .lines()
+        .find(|line| line.contains("[watcher] sync #"))
+        .map(str::to_string)
+}
+
 /// Poll the daemon.log up to `timeout` for AT LEAST one `[watcher] sync #` line,
 /// returning the final count once at least one appears (or the deadline hits).
 fn poll_for_sync_lines(log: &Path, timeout: Duration) -> usize {
@@ -260,6 +272,23 @@ fn daemon_single_watcher_fires_once() {
         fs::read_to_string(&log).unwrap_or_default()
     );
     assert!(gone, "daemon pid {pid} must be dead after teardown");
+
+    // The enriched sync line carries a timestamp token, the reindexed/removed
+    // counts, AND the changed filename — while keeping the `[watcher] sync #`
+    // prefix the count assertion above depends on.
+    let sync_line = first_sync_line(&log).expect("a `[watcher] sync #` line must exist");
+    assert!(
+        sync_line.contains('T') && sync_line.starts_with('['),
+        "sync line must begin with a bracketed ISO-8601 timestamp token: {sync_line:?}"
+    );
+    assert!(
+        sync_line.contains("reindexed") && sync_line.contains("removed"),
+        "sync line must show reindexed/removed counts: {sync_line:?}"
+    );
+    assert!(
+        sync_line.contains("brand_new_symbol.ts"),
+        "sync line must name the changed file: {sync_line:?}"
+    );
 }
 
 /// FAILURE: with `CODEGRAPH_NO_WATCH=1` in the daemon's env, the daemon serves

@@ -20,6 +20,9 @@ pub struct SyncOutcome {
     pub files_removed: usize,
     pub files_ignored: usize,
     pub duration_ms: u128,
+    /// Reindexed or removed paths this sync, root-relative and SORTED — the
+    /// source set is a `HashSet`, so sorting is required for a stable log line.
+    pub changed_paths: Vec<String>,
 }
 
 pub fn sync_project_once(project_root: impl AsRef<Path>) -> Result<SyncOutcome> {
@@ -161,6 +164,9 @@ fn sync_paths_with_store(
         resolver.run_post_extract(store)?;
     }
     outcome.duration_ms = started.elapsed().as_millis();
+    let mut changed_paths: Vec<String> = reindexed.into_iter().collect();
+    changed_paths.sort();
+    outcome.changed_paths = changed_paths;
     Ok(outcome)
 }
 
@@ -424,5 +430,68 @@ pub(crate) mod tests {
         let second = sync_changed_paths(dir.path(), &db, ["src/app.ts"]).unwrap();
         assert_eq!(second.files_reindexed, 0);
         assert_eq!(second.files_skipped_unchanged, 1);
+    }
+
+    #[test]
+    fn changed_paths_lists_sorted_relative_path_deterministically() {
+        // Given: two source files freshly written into the project.
+        let dir = TestDir::new("watch-changed-paths");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("src/zeta.ts"),
+            "export function zeta() { return 1; }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/alpha.ts"),
+            "export function alpha() { return 2; }\n",
+        )
+        .unwrap();
+        let db = default_db_path(dir.path());
+
+        // When: a sync processes them in reverse-sorted input order.
+        let first = sync_changed_paths(dir.path(), &db, ["src/zeta.ts", "src/alpha.ts"]).unwrap();
+
+        // Then: changed_paths is the SORTED relative-path list (not input order).
+        assert_eq!(
+            first.changed_paths,
+            vec!["src/alpha.ts".to_string(), "src/zeta.ts".to_string()],
+        );
+
+        // And: a second identical sync (re-touching both) yields the same list,
+        // proving determinism across runs despite the HashSet source.
+        fs::write(
+            dir.path().join("src/zeta.ts"),
+            "export function zeta() { return 11; }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/alpha.ts"),
+            "export function alpha() { return 22; }\n",
+        )
+        .unwrap();
+        let second = sync_changed_paths(dir.path(), &db, ["src/zeta.ts", "src/alpha.ts"]).unwrap();
+        assert_eq!(second.changed_paths, first.changed_paths);
+    }
+
+    #[test]
+    fn changed_paths_empty_when_nothing_reindexed() {
+        // Given: a file already indexed once.
+        let dir = TestDir::new("watch-changed-paths-empty");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("src/app.ts"),
+            "export function answer() { return 42; }\n",
+        )
+        .unwrap();
+        let db = default_db_path(dir.path());
+        let _ = sync_changed_paths(dir.path(), &db, ["src/app.ts"]).unwrap();
+
+        // When: a sync re-checks the same unchanged file.
+        let second = sync_changed_paths(dir.path(), &db, ["src/app.ts"]).unwrap();
+
+        // Then: nothing was reindexed, so changed_paths is empty.
+        assert_eq!(second.files_reindexed, 0);
+        assert!(second.changed_paths.is_empty());
     }
 }

@@ -442,7 +442,12 @@ fn start_project_watcher(
     watch_options.on_sync_complete =
         Some(Arc::new(move |outcome: codegraph_watch::SyncOutcome| {
             let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
-            eprintln!("[watcher] sync #{n}: {} file(s)", outcome.files_reindexed);
+            let ts = local_timestamp();
+            let tail = changed_paths_tail(&outcome.changed_paths);
+            eprintln!(
+                "[{ts}] [watcher] sync #{n}: {} file(s) reindexed, {} removed{tail}",
+                outcome.files_reindexed, outcome.files_removed,
+            );
         }));
     watch_options.on_degraded = Some(Arc::new(|reason: String| {
         eprintln!("[CodeGraph MCP] File watcher degraded — {reason}");
@@ -459,6 +464,36 @@ fn start_project_watcher(
     }
 }
 
+/// RFC 3339 local timestamp, falling back local -> UTC -> empty so logging
+/// never panics on a missing TZ database.
+fn local_timestamp() -> String {
+    use time::format_description::well_known::Rfc3339;
+    use time::OffsetDateTime;
+    OffsetDateTime::now_local()
+        .unwrap_or_else(|_| OffsetDateTime::now_utc())
+        .format(&Rfc3339)
+        .unwrap_or_default()
+}
+
+/// Bounded inline file list ` — a, b`: first 10 paths, then ` (+N more)`, so a
+/// large batch can never produce a multi-kilobyte log line. Empty when no paths.
+fn changed_paths_tail(paths: &[String]) -> String {
+    const MAX: usize = 10;
+    if paths.is_empty() {
+        return String::new();
+    }
+    let shown = paths
+        .iter()
+        .take(MAX)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    match paths.len().checked_sub(MAX) {
+        Some(extra) if extra > 0 => format!(" — {shown} (+{extra} more)"),
+        _ => format!(" — {shown}"),
+    }
+}
+
 /// Spawn a ONE-SHOT background catch-up sync absorbing edits made while the
 /// daemon was down (#905). Returns an `Arc<AtomicBool>` flipped `true` on
 /// completion. Runs on a detached `std::thread`; the accept loop is never
@@ -472,7 +507,10 @@ fn spawn_catch_up(project_root: &Path) -> Arc<AtomicBool> {
             Ok(outcome) => {
                 let changed = outcome.files_reindexed + outcome.files_removed;
                 if changed > 0 {
-                    eprintln!("[CodeGraph MCP] Caught up {changed} file(s) changed since last run");
+                    let ts = local_timestamp();
+                    eprintln!(
+                        "[{ts}] [CodeGraph MCP] Caught up {changed} file(s) changed since last run"
+                    );
                 }
             }
             Err(err) => warn!(error = %err, "daemon catch-up sync failed"),
