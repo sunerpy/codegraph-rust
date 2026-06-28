@@ -293,21 +293,32 @@ fn start_with_lock(
     })
 }
 
+/// Ordered bind candidates: the lock-recorded `preferred` socket first, then the
+/// remaining unix fallback candidates (`f83a1ec`). On non-unix there is a single
+/// namespaced pipe name, so the chain is just `[preferred]`.
+#[cfg(unix)]
+fn socket_candidate_chain(project_root: &Path, preferred: PathBuf) -> Vec<PathBuf> {
+    let mut candidates = vec![preferred];
+    for candidate in paths::daemon_socket_candidates(project_root) {
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    candidates
+}
+
+#[cfg(not(unix))]
+fn socket_candidate_chain(_project_root: &Path, preferred: PathBuf) -> Vec<PathBuf> {
+    vec![preferred]
+}
+
 /// Bind the daemon listener, falling through the deterministic socket-candidate
 /// chain on `bind()` failure (`f83a1ec`). `preferred` is the socket the lock
 /// recorded; it is tried first, then any remaining
 /// [`daemon_socket_candidates`] in order. Returns the listener plus the socket
 /// that actually bound. Errors only when EVERY candidate fails.
 fn bind_with_fallback(project_root: &Path, preferred: PathBuf) -> Result<(Listener, PathBuf)> {
-    let mut candidates = vec![preferred.clone()];
-    #[cfg(unix)]
-    for candidate in paths::daemon_socket_candidates(project_root) {
-        if !candidates.contains(&candidate) {
-            candidates.push(candidate);
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = project_root;
+    let candidates = socket_candidate_chain(project_root, preferred);
 
     let mut last_err = None;
     for socket_path in candidates {
