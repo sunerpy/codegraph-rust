@@ -10,6 +10,25 @@ use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use regex::Regex;
 use std::sync::OnceLock;
 
+/// Ceiling on same-name candidates a proximity-SCORED strategy will rank
+/// (`AMBIGUOUS_NAME_CEILING`, upstream name-matcher; override
+/// `CODEGRAPH_AMBIGUOUS_NAME_CEILING`). Above it the scored strategies DECLINE
+/// rather than degrade to O(K²). ONLY `match_fuzzy` and the multi-candidate
+/// branch of `match_by_exact_name` consult it; edge-producing strategies are
+/// never gated, so resolved golden edges are unchanged.
+const AMBIGUOUS_NAME_CEILING: usize = 500;
+
+fn ambiguous_name_ceiling() -> usize {
+    static CEILING: OnceLock<usize> = OnceLock::new();
+    *CEILING.get_or_init(|| {
+        std::env::var("CODEGRAPH_AMBIGUOUS_NAME_CEILING")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(AMBIGUOUS_NAME_CEILING)
+    })
+}
+
 /// Try to resolve a path-like reference by matching the filename against file
 /// nodes (`matchByFilePath`, `name-matcher.ts:14-77`).
 pub fn match_by_file_path(
@@ -209,7 +228,11 @@ pub fn match_by_exact_name(
         });
     }
 
-    // Multiple matches — narrow down (name-matcher.ts:194-206).
+    // Multiple matches — narrow down (name-matcher.ts:194-206). Decline past the
+    // ambiguity ceiling rather than proximity-rank a pathological candidate set.
+    if candidates.len() > ambiguous_name_ceiling() {
+        return None;
+    }
     if let Some(best) = find_best_match(reference, &candidates) {
         let proximity = compute_path_proximity(&reference.file_path, &best.file_path);
         let confidence = if proximity >= 30.0 { 0.7 } else { 0.4 };
@@ -1058,6 +1081,9 @@ fn find_best_match<'a>(reference: &RefView, candidates: &'a [Node]) -> Option<&'
 pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Option<ResolvedRef> {
     let lower_name = reference.reference_name.to_lowercase();
     let candidates = context.get_nodes_by_lower_name(&lower_name);
+    if candidates.len() > ambiguous_name_ceiling() {
+        return None;
+    }
 
     let callable_kinds = [NodeKind::Function, NodeKind::Method, NodeKind::Class];
     let callable_candidates = apply_language_gate(
@@ -1489,4 +1515,131 @@ pub fn match_function_ref(
         });
     }
     None
+}
+
+#[cfg(test)]
+mod ceiling_tests {
+    use super::*;
+    use crate::types::ImportMapping;
+    use codegraph_core::types::ReferenceSubkind;
+
+    struct FakeContext {
+        by_name: Vec<Node>,
+        by_lower: Vec<Node>,
+    }
+
+    impl ResolutionContext for FakeContext {
+        fn get_nodes_in_file(&self, _file_path: &str) -> Vec<Node> {
+            Vec::new()
+        }
+        fn get_nodes_by_name(&self, _name: &str) -> Vec<Node> {
+            self.by_name.clone()
+        }
+        fn get_nodes_by_qualified_name(&self, _qualified_name: &str) -> Vec<Node> {
+            Vec::new()
+        }
+        fn get_nodes_by_kind(&self, _kind: NodeKind) -> Vec<Node> {
+            Vec::new()
+        }
+        fn file_exists(&self, _file_path: &str) -> bool {
+            false
+        }
+        fn read_file(&self, _file_path: &str) -> Option<String> {
+            None
+        }
+        fn get_project_root(&self) -> &str {
+            ""
+        }
+        fn get_all_files(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn get_nodes_by_lower_name(&self, _lower_name: &str) -> Vec<Node> {
+            self.by_lower.clone()
+        }
+        fn get_node_by_id(&self, _id: &str) -> Option<Node> {
+            None
+        }
+        fn get_import_mappings(&self, _file_path: &str, _language: Language) -> Vec<ImportMapping> {
+            Vec::new()
+        }
+    }
+
+    fn node(idx: usize) -> Node {
+        Node {
+            id: format!("function:{idx:032x}"),
+            kind: NodeKind::Function,
+            name: "doThing".to_string(),
+            qualified_name: "doThing".to_string(),
+            file_path: format!("src/f{idx}.ts"),
+            language: Language::TypeScript,
+            start_line: 1,
+            end_line: 1,
+            start_column: 0,
+            end_column: 0,
+            docstring: None,
+            signature: None,
+            visibility: None,
+            is_exported: false,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+            decorators: Vec::new(),
+            type_parameters: Vec::new(),
+            return_type: None,
+            updated_at: 0,
+        }
+    }
+
+    fn reference() -> RefView {
+        RefView {
+            from_node_id: "function:caller".to_string(),
+            reference_name: "doThing".to_string(),
+            reference_kind: EdgeKind::Calls,
+            line: 10,
+            column: 0,
+            file_path: "src/caller.ts".to_string(),
+            language: Language::TypeScript,
+            is_function_ref: false,
+            reference_subkind: None::<ReferenceSubkind>,
+        }
+    }
+
+    fn nodes(count: usize) -> Vec<Node> {
+        (0..count).map(node).collect()
+    }
+
+    #[test]
+    fn exact_match_declines_above_ceiling_but_resolves_at_it() {
+        // Given a candidate set just over the default ceiling, the multi-candidate
+        // exact-match branch declines rather than proximity-rank it.
+        let over = FakeContext {
+            by_name: nodes(AMBIGUOUS_NAME_CEILING + 1),
+            by_lower: Vec::new(),
+        };
+        assert!(match_by_exact_name(&reference(), &over).is_none());
+
+        // Given exactly the ceiling, it still ranks and resolves a winner.
+        let at = FakeContext {
+            by_name: nodes(AMBIGUOUS_NAME_CEILING),
+            by_lower: Vec::new(),
+        };
+        assert!(match_by_exact_name(&reference(), &at).is_some());
+    }
+
+    #[test]
+    fn fuzzy_declines_above_ceiling() {
+        // Given a fuzzy candidate set over the ceiling, match_fuzzy declines.
+        let over = FakeContext {
+            by_name: Vec::new(),
+            by_lower: nodes(AMBIGUOUS_NAME_CEILING + 1),
+        };
+        assert!(match_fuzzy(&reference(), &over).is_none());
+
+        // Given a single fuzzy candidate (well under), it resolves.
+        let one = FakeContext {
+            by_name: Vec::new(),
+            by_lower: nodes(1),
+        };
+        assert!(match_fuzzy(&reference(), &one).is_some());
+    }
 }
