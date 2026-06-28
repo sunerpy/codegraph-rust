@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.19.0](https://github.com/sunerpy/codegraph-rust/compare/v0.18.0...v0.19.0) (2026-06-28)
+
+
+### Features
+
+* **graph:** add Godot edge subkind, impact target/verify-plan, orphan confidence ([#88](https://github.com/sunerpy/codegraph-rust/issues/88)) ([270a5e6](https://github.com/sunerpy/codegraph-rust/commit/270a5e693d397b3a9e4b86c4a3c7d725bfe7b0f6))
+
 ## [0.18.0](https://github.com/sunerpy/codegraph-rust/compare/v0.17.0...v0.18.0) (2026-06-27)
 
 
