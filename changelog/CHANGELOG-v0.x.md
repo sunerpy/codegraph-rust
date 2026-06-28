@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.20.1](https://github.com/sunerpy/codegraph-rust/compare/v0.20.0...v0.20.1) (2026-06-28)
+
+
+### Bug Fixes
+
+* **daemon:** enrich watcher sync log with timestamp, filenames, and counts ([#92](https://github.com/sunerpy/codegraph-rust/issues/92)) ([7a29cc4](https://github.com/sunerpy/codegraph-rust/commit/7a29cc4bb8fc97494022f47450be062efae6b1b3))
+
 ## [0.20.0](https://github.com/sunerpy/codegraph-rust/compare/v0.19.0...v0.20.0) (2026-06-28)
 
 
