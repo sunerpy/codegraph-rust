@@ -541,6 +541,14 @@ When the daemon starts, it detaches from the parent process group (Unix:
 Its stdout and stderr are appended to `.codegraph/daemon.log`. The Unix socket is
 at `.codegraph/daemon.sock`; the pid/lock file lives alongside it.
 
+On filesystems that reject binding an `AF_UNIX` socket inside the project
+directory (ExFAT/FAT, some network mounts, WSL DrvFs), the daemon falls back
+through a deterministic candidate chain — first the project-dir
+`.codegraph/daemon.sock`, then a hashed socket under the system temp dir — and
+records the socket it actually bound in the lock file. The pid/lock file always
+stays at `.codegraph/daemon.pid`, and clients read the recorded socket from the
+lock, so they attach to whichever candidate the daemon chose.
+
 If the daemon crashes and leaves a stale lock:
 
 ```bash

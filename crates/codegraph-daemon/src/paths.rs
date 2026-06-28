@@ -30,6 +30,24 @@ pub fn daemon_socket_path(project_root: &Path) -> PathBuf {
     env::temp_dir().join(format!("codegraph-{}.sock", project_hash(project_root)))
 }
 
+/// Ordered, deterministic socket-bind candidates for `project_root`
+/// (`f83a1ec`). Candidate #1 is the project-dir socket (when its path fits the
+/// POSIX limit); candidate #2 is the hashed-tmpdir socket. On filesystems that
+/// reject `bind()` for an AF_UNIX socket (ExFAT/FAT, some network mounts, WSL
+/// DrvFs), the daemon falls through to the next candidate. The list is
+/// deduplicated and never empty: when the project path is too long for #1, the
+/// tmpdir socket IS candidate #1 (matching `daemon_socket_path`).
+#[cfg(unix)]
+pub fn daemon_socket_candidates(project_root: &Path) -> Vec<PathBuf> {
+    let in_project = codegraph_dir(project_root).join("daemon.sock");
+    let tmp = env::temp_dir().join(format!("codegraph-{}.sock", project_hash(project_root)));
+    if in_project.as_os_str().len() <= POSIX_SOCKET_PATH_LIMIT && in_project != tmp {
+        vec![in_project, tmp]
+    } else {
+        vec![tmp]
+    }
+}
+
 // Windows has no filesystem socket: the rendezvous is a BARE namespaced name.
 // interprocess `GenericNamespaced` prepends `\\.\pipe\` itself, so storing the
 // prefix here would double it (Locked decision #8/#9).
@@ -60,6 +78,36 @@ mod tests {
             daemon_socket_path(&root),
             root.join(".codegraph/daemon.sock")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_chain_starts_with_project_socket_then_tmpdir() {
+        // Given a short project path, candidate #1 is the project-dir socket and
+        // candidate #2 is the hashed-tmpdir socket (the bind-fallback target).
+        let root = PathBuf::from("/tmp/cg-short");
+        let candidates = daemon_socket_candidates(&root);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0], root.join(".codegraph/daemon.sock"));
+        assert!(candidates[1].starts_with(env::temp_dir()));
+        assert!(candidates[1]
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("codegraph-") && n.ends_with(".sock")));
+        // The default socket path equals candidate #1.
+        assert_eq!(daemon_socket_path(&root), candidates[0]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_chain_collapses_to_tmpdir_for_long_paths() {
+        // Given a project path too long for an AF_UNIX socket, the only candidate
+        // is the hashed-tmpdir socket (so the chain is never empty).
+        let long = PathBuf::from(format!("/tmp/{}", "x".repeat(120)));
+        let candidates = daemon_socket_candidates(&long);
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].starts_with(env::temp_dir()));
+        assert_eq!(daemon_socket_path(&long), candidates[0]);
     }
 
     #[cfg(windows)]

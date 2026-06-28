@@ -107,6 +107,21 @@ pub fn try_acquire_daemon_lock(project_root: &Path) -> Result<AcquireResult> {
     Ok(AcquireResult::Taken { pid_path, existing })
 }
 
+/// Rewrite the lock's recorded `socket_path` to `socket_path` (`f83a1ec`),
+/// preserving pid/version/started_at. The daemon calls this after bind-fallback
+/// selects a socket other than the one recorded at acquire time, so the client
+/// reading the lock attaches to the socket the daemon actually bound.
+pub fn rewrite_lock_socket_path(pid_path: &Path, socket_path: &Path) -> Result<()> {
+    let raw = fs::read_to_string(pid_path)
+        .with_context(|| format!("reading daemon lock {}", pid_path.display()))?;
+    let mut info = decode_lock_info(&raw)
+        .with_context(|| format!("decoding daemon lock {}", pid_path.display()))?;
+    info.socket_path = socket_path.to_path_buf();
+    fs::write(pid_path, encode_lock_info(&info)?)
+        .with_context(|| format!("rewriting daemon lock {}", pid_path.display()))?;
+    Ok(())
+}
+
 pub fn clear_stale_daemon_lock(pid_path: &Path, expected_dead_pid: Option<u32>) -> bool {
     // Port of upstream mcp/daemon.ts:453-481: compare-and-delete the
     // pidfile only after re-reading it, and never remove a lock held by a live pid.
@@ -176,6 +191,21 @@ fn read_lock_info_tolerant(pid_path: &Path) -> Option<DaemonLockInfo> {
     }
 }
 
+/// The socket a client should connect to for `project_root` (`f83a1ec` /
+/// D-Daemon-b): the path the daemon RECORDED in its lock, which is where it
+/// actually bound after any bind-fallback. Falls back to the computed default
+/// [`daemon_socket_path`] when the lock is absent, unreadable, or carries no
+/// recorded socket (a legacy plain-pid lock). Reading the recorded path — not
+/// recomputing — is what lets a client attach to a daemon that bound a fallback
+/// candidate (e.g. the tmpdir socket on an ExFAT project dir).
+pub fn recorded_socket_path(project_root: &Path) -> PathBuf {
+    let pid_path = daemon_pid_path(project_root);
+    read_lock_info_tolerant(&pid_path)
+        .map(|info| info.socket_path)
+        .filter(|socket| !socket.as_os_str().is_empty())
+        .unwrap_or_else(|| daemon_socket_path(project_root))
+}
+
 fn now_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -192,5 +222,32 @@ mod tests {
         let info = decode_lock_info("1234\n").expect("pid decodes");
         assert_eq!(info.pid, 1234);
         assert_eq!(info.version, "unknown");
+    }
+
+    #[test]
+    fn rewrite_socket_path_updates_recorded_socket_and_keeps_pid() {
+        // Given an acquired lock recording the default socket, rewriting the
+        // recorded socket to a fallback path is what the client later reads.
+        let base = std::env::temp_dir().join(format!(
+            "cg-lock-rewrite-{}-{}",
+            process::id(),
+            now_millis()
+        ));
+        let AcquireResult::Acquired { pid_path, info } =
+            try_acquire_daemon_lock(&base).expect("acquire lock")
+        else {
+            panic!("expected a fresh lock to be acquired");
+        };
+
+        let fallback = std::env::temp_dir().join("codegraph-fallback.sock");
+        rewrite_lock_socket_path(&pid_path, &fallback).expect("rewrite socket path");
+
+        let raw = fs::read_to_string(&pid_path).expect("read lock");
+        let reloaded = decode_lock_info(&raw).expect("decode lock");
+        assert_eq!(reloaded.socket_path, fallback);
+        assert_eq!(reloaded.pid, info.pid);
+        assert_eq!(reloaded.version, info.version);
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

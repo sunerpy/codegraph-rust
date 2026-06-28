@@ -147,14 +147,25 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             self.scan_fn_ref_subtree(node, 0);
             skip_children = true;
         } else if self.spec.language() == Language::Swift
+            && node_type == "protocol_property_declaration"
+        {
+            self.extract_swift_protocol_property(node);
+            skip_children = true;
+        } else if self.spec.language() == Language::Swift
             && node_type == "property_declaration"
             && self.is_inside_class_like_node()
         {
-            // tree-sitter.ts:453-487 — Swift stored properties inside a type
-            // are not their own nodes; their property-wrapper attributes and
-            // declared type attach to the enclosing type. Children stay
-            // visited so initializer calls are captured.
-            if let Some(owner_id) = self.node_stack.last().cloned() {
+            if let Some(computed) = swift_computed_property_body(node) {
+                // A computed property is its own node; its getter is consumed by
+                // the function-body walk, so skip the generic child descent that
+                // would re-visit (and mis-node) the getter's local bindings.
+                self.extract_swift_computed_property(node, computed);
+                skip_children = true;
+            } else if let Some(owner_id) = self.node_stack.last().cloned() {
+                // tree-sitter.ts:453-487 — Swift stored properties inside a type
+                // are not their own nodes; their property-wrapper attributes and
+                // declared type attach to the enclosing type. Children stay
+                // visited so initializer calls are captured.
                 self.extract_decorators_for(node, &owner_id);
                 self.extract_variable_type_annotation(node, &owner_id);
             }
@@ -1534,6 +1545,64 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
     }
 
+    /// Swift computed property (`b3f59c7`): a `property_declaration` whose body
+    /// is a `computed_property` (SwiftUI `var body: some View { ... }`, or an
+    /// explicit `{ get { } set { } }`) becomes its own `property` node, with the
+    /// getter routed through the function-body walk so its calls attribute to
+    /// the property and getter-local `let`/`var` are NOT mis-noded as fields.
+    /// Stored properties never reach here (they have no `computed_property`).
+    fn extract_swift_computed_property(
+        &mut self,
+        node: SyntaxNode<'tree>,
+        computed: SyntaxNode<'tree>,
+    ) {
+        let name = self
+            .spec
+            .extract_property_name(node, self.source)
+            .unwrap_or_else(|| self.extract_name(node));
+        let signature = property_or_field_signature(node, &name, self.source);
+        let Some(prop_node) = self.create_node(
+            NodeKind::Property,
+            &name,
+            node,
+            NodeExtra {
+                signature,
+                visibility: self.spec.get_visibility(node),
+                is_static: self.spec.is_static(node, self.source),
+                ..NodeExtra::default()
+            },
+        ) else {
+            return;
+        };
+        self.extract_type_annotations(node, &prop_node.id);
+        self.extract_decorators_for(node, &prop_node.id);
+        self.node_stack.push(prop_node.id);
+        self.visit_function_body(computed);
+        self.node_stack.pop();
+    }
+
+    /// Swift protocol property requirement (`b3f59c7`): `var x: T { get }` in a
+    /// protocol body is a `protocol_property_declaration` (a distinct grammar
+    /// node), surfaced as a `property` node. There is no getter body to walk.
+    fn extract_swift_protocol_property(&mut self, node: SyntaxNode<'tree>) {
+        let name =
+            swift_property_identifier(node, self.source).unwrap_or_else(|| self.extract_name(node));
+        let signature = property_or_field_signature(node, &name, self.source);
+        if let Some(prop_node) = self.create_node(
+            NodeKind::Property,
+            &name,
+            node,
+            NodeExtra {
+                signature,
+                visibility: self.spec.get_visibility(node),
+                is_static: self.spec.is_static(node, self.source),
+                ..NodeExtra::default()
+            },
+        ) {
+            self.extract_type_annotations(node, &prop_node.id);
+        }
+    }
+
     fn extract_field(&mut self, node: SyntaxNode<'tree>) {
         let declarators = field_declarators(node).collect::<Vec<_>>();
         if declarators.is_empty() && self.spec.language() == Language::Php {
@@ -2776,6 +2845,36 @@ fn unwrap_declarator_name<'tree>(node: SyntaxNode<'tree>) -> SyntaxNode<'tree> {
         }
     }
     resolved
+}
+
+/// The `computed_property` child of a Swift `property_declaration`, present
+/// only for computed properties (SwiftUI `var body { ... }`, `{ get } / { set }`
+/// accessors). Absent for stored properties, which is how the walker tells the
+/// two apart (`b3f59c7`).
+fn swift_computed_property_body(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
+    node.named_children(&mut node.walk())
+        .find(|child| child.kind() == "computed_property")
+}
+
+/// The bare identifier of a Swift `(protocol_)property_declaration`. The grammar
+/// nests the name under a `pattern` (which for a protocol requirement also wraps
+/// a `value_binding_pattern`), so `node_text` on the pattern yields `var x`, not
+/// `x`. Descend to the first `simple_identifier` to recover the bare name.
+fn swift_property_identifier(node: SyntaxNode<'_>, source: &str) -> Option<String> {
+    let pattern = child_by_field(node, "name")?;
+    let ident = first_descendant_of_kind(pattern, "simple_identifier")?;
+    Some(node_text(ident, source))
+}
+
+fn first_descendant_of_kind<'tree>(
+    node: SyntaxNode<'tree>,
+    kind: &str,
+) -> Option<SyntaxNode<'tree>> {
+    if node.kind() == kind {
+        return Some(node);
+    }
+    node.named_children(&mut node.walk())
+        .find_map(|child| first_descendant_of_kind(child, kind))
 }
 
 fn field_declarators(node: SyntaxNode<'_>) -> impl Iterator<Item = SyntaxNode<'_>> {
