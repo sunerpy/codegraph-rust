@@ -491,6 +491,42 @@ pub struct FileRecord {
     pub errors: Vec<String>,
 }
 
+/// Structural label for HOW a reference was extracted, orthogonal to the typed
+/// [`EdgeKind`]. Godot-only today: it distinguishes the otherwise-opaque
+/// `references`/`instantiates` edges a `.tscn`/`.tres` parser emits. It is NOT a
+/// domain label and never extends [`EdgeKind`]; it rides a separate nullable
+/// column / `edge.metadata.subkind`, mirroring the `is_function_ref`/`fnRef`
+/// channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferenceSubkind {
+    ScriptAttach,
+    SceneInstance,
+    ExtResource,
+    GroupMember,
+    SignalMethod,
+    GdscriptLoadPath,
+}
+
+impl ReferenceSubkind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ScriptAttach => "script_attach",
+            Self::SceneInstance => "scene_instance",
+            Self::ExtResource => "ext_resource",
+            Self::GroupMember => "group_member",
+            Self::SignalMethod => "signal_method",
+            Self::GdscriptLoadPath => "gdscript_load_path",
+        }
+    }
+}
+
+impl fmt::Display for ReferenceSubkind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UnresolvedRef {
@@ -509,6 +545,10 @@ pub struct UnresolvedRef {
     /// tags the produced edge with `fnRef: true` metadata.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_function_ref: bool,
+    /// Finer structural extraction label (Godot only), persisted to the nullable
+    /// `unresolved_refs.reference_subkind` column. `None` for every non-Godot ref.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_subkind: Option<ReferenceSubkind>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -638,6 +678,7 @@ mod tests {
             file_path: "src/utils.ts".to_string(),
             language: Language::TypeScript,
             is_function_ref: false,
+            reference_subkind: None,
         };
         let unresolved_value = serde_json::to_value(unresolved).expect("unresolved ref serializes");
         assert_eq!(unresolved_value["fromNodeId"], json!("function:source"));

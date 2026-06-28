@@ -6,7 +6,7 @@
 //! extraction shape, not internals. T4 adds the `.tscn` branch; `.tres` (T5)
 //! still returns `None`.
 
-use codegraph_core::types::{EdgeKind, NodeKind};
+use codegraph_core::types::{EdgeKind, NodeKind, ReferenceSubkind};
 use codegraph_resolve::framework::FrameworkResolver;
 use codegraph_resolve::frameworks::godot::GodotResolver;
 use codegraph_resolve::types::FrameworkResolverExtractionResult;
@@ -339,5 +339,50 @@ script = ExtResource(\"999_missing\")
         result.references.is_empty(),
         "no ref for an unresolvable ExtResource id, got {:?}",
         result.references
+    );
+}
+
+#[test]
+fn each_scene_emit_site_sets_its_reference_subkind() {
+    // Given a scene exercising all four emit sites: instance, script, groups, connection,
+    let content = "\
+[gd_scene load_steps=3 format=3]
+
+[ext_resource type=\"Script\" path=\"res://player.gd\" id=\"1\"]
+[ext_resource type=\"PackedScene\" path=\"res://hud.tscn\" id=\"2\"]
+
+[node name=\"Root\" type=\"Node\"]
+script = ExtResource(\"1\")
+groups = [\"enemies\"]
+
+[node name=\"Hud\" type=\"Node\" parent=\".\" instance=ExtResource(\"2\")]
+
+[connection signal=\"pressed\" from=\".\" to=\".\" method=\"_on_pressed\"]
+";
+    // When extracting,
+    let result = extract("scenes/Main.tscn", content);
+
+    let subkind_of = |name: &str| {
+        result
+            .references
+            .iter()
+            .find(|r| r.reference_name == name)
+            .unwrap_or_else(|| panic!("ref to {name}"))
+            .reference_subkind
+    };
+
+    // Then each construct carries its structural subkind.
+    assert_eq!(
+        subkind_of("player.gd"),
+        Some(ReferenceSubkind::ScriptAttach)
+    );
+    assert_eq!(
+        subkind_of("hud.tscn"),
+        Some(ReferenceSubkind::SceneInstance)
+    );
+    assert_eq!(subkind_of("enemies"), Some(ReferenceSubkind::GroupMember));
+    assert_eq!(
+        subkind_of("_on_pressed"),
+        Some(ReferenceSubkind::SignalMethod)
     );
 }

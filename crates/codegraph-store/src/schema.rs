@@ -79,6 +79,7 @@ CREATE TABLE IF NOT EXISTS unresolved_refs (
     candidates TEXT, -- JSON array
     file_path TEXT NOT NULL DEFAULT '',
     language TEXT NOT NULL DEFAULT 'unknown',
+    reference_subkind TEXT,
     FOREIGN KEY (from_node_id) REFERENCES nodes(id) ON DELETE CASCADE
 );
 

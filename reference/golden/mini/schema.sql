@@ -59,6 +59,7 @@ col INTEGER NOT NULL,
 candidates TEXT, -- JSON array
 file_path TEXT NOT NULL DEFAULT '',
 language TEXT NOT NULL DEFAULT 'unknown',
+reference_subkind TEXT,
 FOREIGN KEY (from_node_id) REFERENCES nodes(id) ON DELETE CASCADE
 );
 CREATE INDEX idx_nodes_kind ON nodes(kind);

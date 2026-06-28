@@ -137,6 +137,7 @@ pub fn unresolved_ref(
         file_path: file_path.to_string(),
         language,
         is_function_ref: false,
+        reference_subkind: None,
     }
 }
 

@@ -125,6 +125,7 @@ fn assert_contexts_equivalent(test_name: &str, root: &Path, relative_files: &[&s
             file_path: unresolved.file_path.clone(),
             language: unresolved.language,
             is_function_ref: unresolved.is_function_ref,
+            reference_subkind: unresolved.reference_subkind,
         };
         let via_store = probe.resolve_one(&view, &store_ctx);
         let via_snapshot = probe.resolve_one(&view, &snapshot_ctx);

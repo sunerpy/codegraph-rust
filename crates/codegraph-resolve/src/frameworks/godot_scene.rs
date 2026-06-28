@@ -63,7 +63,7 @@
 use std::collections::HashMap;
 
 use codegraph_core::node_id::generate_node_id;
-use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
+use codegraph_core::types::{EdgeKind, Language, Node, NodeKind, ReferenceSubkind};
 
 use super::framework_node;
 use super::godot_common::{map_res_path, quoted_strings, strip_quotes};
@@ -221,6 +221,7 @@ fn emit_node(
                 EdgeKind::Instantiates,
                 line_no,
                 file_path,
+                ReferenceSubkind::SceneInstance,
             ));
         }
     }
@@ -248,6 +249,7 @@ fn emit_script(
             EdgeKind::References,
             line_no,
             file_path,
+            ReferenceSubkind::ScriptAttach,
         ));
     }
 }
@@ -272,6 +274,7 @@ fn emit_groups(
             EdgeKind::References,
             line_no,
             file_path,
+            ReferenceSubkind::GroupMember,
         ));
     }
 }
@@ -328,6 +331,7 @@ fn emit_connection(
         EdgeKind::References,
         line_no,
         file_path,
+        ReferenceSubkind::SignalMethod,
     ));
 }
 
@@ -373,6 +377,7 @@ fn reference(
     kind: EdgeKind,
     line_no: i64,
     file_path: &str,
+    subkind: ReferenceSubkind,
 ) -> RefView {
     RefView {
         from_node_id,
@@ -383,6 +388,7 @@ fn reference(
         file_path: file_path.to_string(),
         language: Language::GodotScene,
         is_function_ref: false,
+        reference_subkind: Some(subkind),
     }
 }
 

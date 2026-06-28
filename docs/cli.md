@@ -14,34 +14,34 @@
 
 ## Full Subcommand Table
 
-| Subcommand        | Purpose                                                                                   | Key flags                                                                                                                     |
-| ----------------- | ----------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `install`         | Write the codegraph MCP server into each AI agent's config                                | `-t/--target`, `-l/--location`, `--global`, `--local`, `-y/--yes`, `--no-permissions`, `--print-config <id>`, `--prompt-hook` |
-| `uninstall`       | Remove codegraph from agent configs (inverse of `install`)                                | `-t/--target`, `-l/--location`, `--global`, `--local`, `-y/--yes`                                                             |
-| `skill`           | Install / update / uninstall / check the embedded agent skill                             | `<action>` (install, update, uninstall, status)                                                                               |
-| `skill install`   | Write the embedded SKILL.md into each agent's skill directory                             | `-t/--target`, `--global`, `--local`, `-y/--yes`                                                                              |
-| `skill update`    | Refresh the installed skill when unchanged by the user                                    | `-t/--target`, `--global`, `--local`, `--force`                                                                               |
-| `skill uninstall` | Remove the skill from agent skill directories                                             | `-t/--target`, `--global`, `--local`, `-y/--yes`                                                                              |
-| `skill status`    | Report install state per agent (up to date / locally modified / outdated / not installed) | `-t/--target`, `--global`, `--local`                                                                                          |
-| `init`            | Initialize `.codegraph/` and run the first full index                                     | `[path]`, `-t/--target` (also write project-level MCP config; default `none`)                                                 |
-| `uninit`          | Delete the project's `.codegraph/` index                                                  | `[path]`, `-f/--force`                                                                                                        |
-| `index`           | (Re-)index in full                                                                        | `[path]`, `-f/--force`, `-q/--quiet`, `-v/--verbose`                                                                          |
-| `sync`            | Sync changes (currently reuses the safe full-index path)                                  | `[path]`, `-q/--quiet`                                                                                                        |
-| `status`          | Print index stats (files/nodes/edges/DB size/journal)                                     | `[path]`, `-j/--json`                                                                                                         |
-| `query`           | FTS5 + multi-signal scored search                                                         | `<search>`, `-p`, `-l/--limit`, `-k/--kind`, `-j/--json`                                                                      |
-| `files`           | List indexed files (tree/flat/grouped)                                                    | `-p`, `--filter <DIR>`, `--language <LANG>`, `--pattern`, `--format`, `--max-depth`, `-j`                                     |
-| `serve`           | Start the server; `--mcp` enters MCP stdio mode                                           | `-p`, `--mcp`, `--no-watch`                                                                                                   |
-| `unlock`          | Clear a stale daemon lock (keeps live pids)                                               | `[path]`                                                                                                                      |
-| `callers`         | Who calls a symbol (along calls/references/imports)                                       | `<symbol>`, `-p`, `-l`, `-j`                                                                                                  |
-| `callees`         | What a symbol calls                                                                       | `<symbol>`, `-p`, `-l`, `-j`                                                                                                  |
-| `impact`          | Blast radius of changing a symbol (incoming deps, transitive)                             | `<symbol>`, `-p`, `-d/--depth`, `-j`                                                                                          |
-| `affected`        | Given changed files, the affected symbol set                                              | `[files...]`, `-p`, `-d/--depth`, `--filter`                                                                                  |
-| `check`           | Detect circular dependencies (each cycle as `a.ts -> b.ts -> a.ts`)                       | `[path]`, `-j/--json`                                                                                                         |
-| `audit`           | Read-only Godot resource audit: orphan resources, dangling references, impact             | `-p`, `--orphans`, `--dangling`, `--impact <path>` (≥1 required), `--include <PREFIX>`, `--exclude <PREFIX>`, `-j/--json`     |
-| `export`          | Export the whole code graph as NetworkX node-link JSON                                    | `[path]`, `-o/--out <file>`, `--no-centrality`                                                                                |
-| `version`         | Print the codegraph version (same as `--version`)                                         | —                                                                                                                             |
-| `self-update`     | Update the binary in place from the latest GitHub release                                 | `--check`, `--force`, `--tag <vX.Y.Z>`                                                                                        |
-| `completions`     | Print or install shell completions                                                        | `<shell>` (bash, zsh, fish, powershell, elvish), `--install`                                                                  |
+| Subcommand        | Purpose                                                                                   | Key flags                                                                                                                                  |
+| ----------------- | ----------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `install`         | Write the codegraph MCP server into each AI agent's config                                | `-t/--target`, `-l/--location`, `--global`, `--local`, `-y/--yes`, `--no-permissions`, `--print-config <id>`, `--prompt-hook`              |
+| `uninstall`       | Remove codegraph from agent configs (inverse of `install`)                                | `-t/--target`, `-l/--location`, `--global`, `--local`, `-y/--yes`                                                                          |
+| `skill`           | Install / update / uninstall / check the embedded agent skill                             | `<action>` (install, update, uninstall, status)                                                                                            |
+| `skill install`   | Write the embedded SKILL.md into each agent's skill directory                             | `-t/--target`, `--global`, `--local`, `-y/--yes`                                                                                           |
+| `skill update`    | Refresh the installed skill when unchanged by the user                                    | `-t/--target`, `--global`, `--local`, `--force`                                                                                            |
+| `skill uninstall` | Remove the skill from agent skill directories                                             | `-t/--target`, `--global`, `--local`, `-y/--yes`                                                                                           |
+| `skill status`    | Report install state per agent (up to date / locally modified / outdated / not installed) | `-t/--target`, `--global`, `--local`                                                                                                       |
+| `init`            | Initialize `.codegraph/` and run the first full index                                     | `[path]`, `-t/--target` (also write project-level MCP config; default `none`)                                                              |
+| `uninit`          | Delete the project's `.codegraph/` index                                                  | `[path]`, `-f/--force`                                                                                                                     |
+| `index`           | (Re-)index in full                                                                        | `[path]`, `-f/--force`, `-q/--quiet`, `-v/--verbose`                                                                                       |
+| `sync`            | Sync changes (currently reuses the safe full-index path)                                  | `[path]`, `-q/--quiet`                                                                                                                     |
+| `status`          | Print index stats (files/nodes/edges/DB size/journal)                                     | `[path]`, `-j/--json`                                                                                                                      |
+| `query`           | FTS5 + multi-signal scored search                                                         | `<search>`, `-p`, `-l/--limit`, `-k/--kind`, `-j/--json`                                                                                   |
+| `files`           | List indexed files (tree/flat/grouped)                                                    | `-p`, `--filter <DIR>`, `--language <LANG>`, `--pattern`, `--format`, `--max-depth`, `-j`                                                  |
+| `serve`           | Start the server; `--mcp` enters MCP stdio mode                                           | `-p`, `--mcp`, `--no-watch`                                                                                                                |
+| `unlock`          | Clear a stale daemon lock (keeps live pids)                                               | `[path]`                                                                                                                                   |
+| `callers`         | Who calls a symbol (along calls/references/imports)                                       | `<symbol>`, `-p`, `-l`, `-j`                                                                                                               |
+| `callees`         | What a symbol calls                                                                       | `<symbol>`, `-p`, `-l`, `-j`                                                                                                               |
+| `impact`          | Blast radius of changing a symbol (incoming deps, transitive)                             | `<symbol>`, `-p`, `-d/--depth`, `-j`                                                                                                       |
+| `affected`        | Given changed files, the affected symbol set                                              | `[files...]`, `-p`, `-d/--depth`, `--filter`                                                                                               |
+| `check`           | Detect circular dependencies (each cycle as `a.ts -> b.ts -> a.ts`)                       | `[path]`, `-j/--json`                                                                                                                      |
+| `audit`           | Read-only Godot resource audit: orphan resources, dangling references, impact             | `-p`, `--orphans`, `--dangling`, `--impact <path>` (≥1 required), `--verify-plan`, `--include <PREFIX>`, `--exclude <PREFIX>`, `-j/--json` |
+| `export`          | Export the whole code graph as NetworkX node-link JSON                                    | `[path]`, `-o/--out <file>`, `--no-centrality`                                                                                             |
+| `version`         | Print the codegraph version (same as `--version`)                                         | —                                                                                                                                          |
+| `self-update`     | Update the binary in place from the latest GitHub release                                 | `--check`, `--force`, `--tag <vX.Y.Z>`                                                                                                     |
+| `completions`     | Print or install shell completions                                                        | `<shell>` (bash, zsh, fish, powershell, elvish), `--install`                                                                               |
 
 > **Note:** `serve --no-watch` and `CODEGRAPH_NO_WATCH=1` are fully equivalent —
 > both disable the live file watcher. See
@@ -263,6 +263,7 @@ codegraph audit --impact res://buff.tres -p .  # what references a given changed
 codegraph audit --orphans --dangling --json -p .   # combine modes; structured JSON output
 codegraph audit --orphans --exclude addons/ -p .   # denoise: drop addons/ results
 codegraph audit --dangling --include Data/ -p .    # narrow: keep only Data/ results
+codegraph audit --impact res://player.gd --verify-plan --json -p .  # derived load/open plan
 ```
 
 **`-p` is the project root, not a result filter.** `-p/--path` selects which
@@ -287,7 +288,12 @@ resource's repo-relative **path** — the `files` row plus the path-shaped
 `reference_name`s — not on incoming graph edges.
 
 - **`--orphans`** — a `.tres`/`.tscn` whose path no reference names. Sorted by
-  path.
+  path. In `--json`, each orphan carries `reason` (`no_path_reference`),
+  `confidence`, and an optional `note`. `confidence` is a **static** signal:
+  `"low"` for Godot resource/scene files (whose inbound references can be
+  data-driven numeric ids / DSL paths that static analysis does not follow, so
+  "orphan" is not proof of zero use), `"high"` otherwise. It is a structural
+  caveat, not a runtime guarantee.
 - **`--dangling`** — a path-shaped reference (`reference_name` contains `/` and
   ends in `.tres`/`.tscn`/`.gd`/`.res`, or whose language is a Godot non-script
   language) whose target does not exist on disk under the project root.
@@ -302,11 +308,23 @@ resource's repo-relative **path** — the `files` row plus the path-shaped
 - **`--impact <path>`** — the reverse-dependency list for a changed path: every
   reference whose normalized target equals it, plus any resolved incoming edges
   on that path's `file:` node (present for `.gd` / grammar-backed files). In
-  `--json`, each affected site carries `fromFile`, `line`, and `edgeKind`.
+  `--json`, each affected site carries `fromFile`, `line`, `edgeKind`, `target`
+  (the changed path, echoed onto every row), and an optional `edgeSubkind`.
   `edgeKind` surfaces the graph EDGE kind that links the site (`references` /
   `instantiates` for resolved edges; the reference's kind for unresolved refs) —
-  it is the structural relation, not a domain-semantic label, and does not
-  100%-distinguish every sub-flavor of reference.
+  it is the structural relation, not a domain-semantic label. `edgeSubkind` is a
+  finer **structural** extraction label, present for Godot refs only:
+  `script_attach`, `scene_instance`, `ext_resource`, `group_member`,
+  `signal_method` (and the reserved `gdscript_load_path`). It records _how_ the
+  reference was extracted, NOT a domain/business meaning. When `--impact`
+  produces no affected sites for a Godot resource/script path, a `note` field
+  (text and JSON) flags that data-driven numeric-id / DSL references are not
+  included by default — so "nothing references X" is not proof of zero use.
+- **`--verify-plan`** (used with `--impact`) — emits a derived
+  `verifyPlan` view reshaping the impact result into a load/open plan:
+  `{ changed, loadScripts: [res:// .gd], openScenes: [res:// .tscn], reasons:
+[{file, line, edgeKind, edgeSubkind?}] }`. Pure CLI reshape of the impact
+  data (no new graph queries); `reasons` carry `edgeSubkind` when present.
 
 This is a static structural report. Runtime `ResourceLoader` load-verification
 is out of scope (that is Godot MCP Pro's job).

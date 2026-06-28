@@ -312,6 +312,7 @@ fn reference(from_node_id: String, target: String, line_no: i64, file_path: &str
         file_path: file_path.to_string(),
         language: Language::GodotProject,
         is_function_ref: false,
+        reference_subkind: None,
     }
 }
 

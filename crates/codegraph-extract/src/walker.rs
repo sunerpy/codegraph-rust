@@ -2511,6 +2511,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 file_path: self.file_path.to_string(),
                 language: self.spec.language(),
                 is_function_ref: true,
+                reference_subkind: None,
             });
         }
     }
@@ -2533,6 +2534,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             file_path: self.file_path.to_string(),
             language: self.spec.language(),
             is_function_ref: false,
+            reference_subkind: None,
         });
     }
 

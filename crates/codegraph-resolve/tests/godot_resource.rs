@@ -7,7 +7,7 @@
 //! single flat resource (no scene-tree), so its edges anchor on ONE resource
 //! marker node rather than per-scene-node as in T4.
 
-use codegraph_core::types::{EdgeKind, NodeKind};
+use codegraph_core::types::{EdgeKind, NodeKind, ReferenceSubkind};
 use codegraph_resolve::framework::FrameworkResolver;
 use codegraph_resolve::frameworks::godot::GodotResolver;
 use codegraph_resolve::types::FrameworkResolverExtractionResult;
@@ -254,4 +254,35 @@ fn extract_routes_tres_to_t5_and_others_correctly() {
     assert!(GodotResolver
         .extract("project.godot", "[autoload]\nX=\"res://x.gd\"\n", "")
         .is_some());
+}
+
+#[test]
+fn resource_ext_resource_refs_carry_ext_resource_subkind() {
+    // Given a `.tres` binding a script and another resource via ExtResource,
+    let content = "\
+[gd_resource type=\"Resource\" load_steps=3 format=3]
+
+[ext_resource type=\"Script\" path=\"res://buff.gd\" id=\"1\"]
+[ext_resource type=\"Resource\" path=\"res://effect.tres\" id=\"2\"]
+
+[resource]
+script = ExtResource(\"1\")
+effect = ExtResource(\"2\")
+";
+    // When extracting,
+    let result = extract("data/buff.tres", content);
+
+    // Then every resource ExtResource ref carries the ExtResource subkind.
+    assert!(
+        !result.references.is_empty(),
+        "expected ExtResource refs, got none"
+    );
+    for reference in &result.references {
+        assert_eq!(
+            reference.reference_subkind,
+            Some(ReferenceSubkind::ExtResource),
+            "ref {} must carry ExtResource subkind",
+            reference.reference_name
+        );
+    }
 }

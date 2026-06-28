@@ -261,6 +261,9 @@ enum Command {
         /// Report what references the given changed resource/script path.
         #[arg(long, value_name = "PATH")]
         impact: Option<String>,
+        /// With --impact: emit a derived load/open plan (loadScripts/openScenes/reasons).
+        #[arg(long = "verify-plan", requires = "impact")]
+        verify_plan: bool,
         /// Keep only results whose path is under this prefix (repeatable).
         #[arg(long, value_name = "PREFIX")]
         include: Vec<String>,
@@ -475,10 +478,20 @@ fn run(cli: Cli) -> Result<()> {
             orphans,
             dangling,
             impact,
+            verify_plan,
             include,
             exclude,
             json,
-        } => cmd_audit(path, orphans, dangling, impact, include, exclude, json),
+        } => cmd_audit(AuditArgs {
+            path,
+            orphans,
+            dangling,
+            impact,
+            verify_plan,
+            include,
+            exclude,
+            json_output: json,
+        }),
         Command::Export {
             path,
             out,
@@ -1719,15 +1732,28 @@ fn audit_prefix_keep(path: &str, include: &[String], exclude: &[String]) -> bool
     !exclude.iter().any(under)
 }
 
-fn cmd_audit(
+struct AuditArgs {
     path: Option<PathBuf>,
     orphans: bool,
     dangling: bool,
     impact: Option<String>,
+    verify_plan: bool,
     include: Vec<String>,
     exclude: Vec<String>,
     json_output: bool,
-) -> Result<()> {
+}
+
+fn cmd_audit(args: AuditArgs) -> Result<()> {
+    let AuditArgs {
+        path,
+        orphans,
+        dangling,
+        impact,
+        verify_plan,
+        include,
+        exclude,
+        json_output,
+    } = args;
     if !orphans && !dangling && impact.is_none() {
         bail!("audit requires at least one of --orphans, --dangling, --impact <path>");
     }
@@ -1768,6 +1794,12 @@ fn cmd_audit(
         }
         if let Some(result) = &impact_result {
             out.insert("impact".to_string(), json!(result));
+            if let Some(note) = empty_impact_note(result) {
+                out.insert("note".to_string(), json!(note));
+            }
+            if verify_plan {
+                out.insert("verifyPlan".to_string(), json!(verify_plan_view(result)));
+            }
         }
         print_json_pretty(&serde_json::Value::Object(out))?;
         return Ok(());
@@ -1781,8 +1813,90 @@ fn cmd_audit(
     }
     if let Some(result) = &impact_result {
         print_audit_impact(result);
+        if verify_plan {
+            print_verify_plan(&verify_plan_view(result));
+        }
     }
     Ok(())
+}
+
+/// Derived load/open plan for one impact result: the `.gd` scripts to reload and
+/// `.tscn` scenes to reopen that reference the changed path, plus per-site reasons.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VerifyPlan {
+    changed: String,
+    load_scripts: Vec<String>,
+    open_scenes: Vec<String>,
+    reasons: Vec<VerifyReason>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VerifyReason {
+    file: String,
+    line: i64,
+    edge_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    edge_subkind: Option<String>,
+}
+
+fn verify_plan_view(impact: &codegraph_graph::graph::ResourceImpact) -> VerifyPlan {
+    let mut load_scripts: Vec<String> = Vec::new();
+    let mut open_scenes: Vec<String> = Vec::new();
+    let mut reasons: Vec<VerifyReason> = Vec::new();
+    for affected in &impact.affected {
+        if affected.from_file.ends_with(".gd") {
+            load_scripts.push(res_path(&affected.from_file));
+        } else if affected.from_file.ends_with(".tscn") {
+            open_scenes.push(res_path(&affected.from_file));
+        }
+        reasons.push(VerifyReason {
+            file: affected.from_file.clone(),
+            line: affected.line,
+            edge_kind: affected.edge_kind.clone(),
+            edge_subkind: affected.edge_subkind.clone(),
+        });
+    }
+    load_scripts.sort();
+    load_scripts.dedup();
+    open_scenes.sort();
+    open_scenes.dedup();
+    VerifyPlan {
+        changed: impact.changed.clone(),
+        load_scripts,
+        open_scenes,
+        reasons,
+    }
+}
+
+fn res_path(rel: &str) -> String {
+    format!("res://{}", rel.replace('\\', "/"))
+}
+
+/// The static boundary note for an EMPTY impact on a Godot resource/script path:
+/// "nothing references X" is not proof of zero use (data-driven numeric-id/DSL
+/// refs are not followed). `None` when the impact is non-empty or the path is not
+/// a Godot resource/script.
+fn empty_impact_note(impact: &codegraph_graph::graph::ResourceImpact) -> Option<String> {
+    if !impact.affected.is_empty() {
+        return None;
+    }
+    if !is_godot_resource_path(&impact.changed) {
+        return None;
+    }
+    Some(
+        "no static references found; godot data-driven numeric-id/DSL references are not included by default"
+            .to_string(),
+    )
+}
+
+fn is_godot_resource_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".tres")
+        || lower.ends_with(".tscn")
+        || lower.ends_with(".res")
+        || lower.ends_with(".gd")
 }
 
 fn print_audit_orphans(orphans: &[codegraph_graph::graph::OrphanResource]) {
@@ -1791,7 +1905,11 @@ fn print_audit_orphans(orphans: &[codegraph_graph::graph::OrphanResource]) {
     } else {
         println!("\nFound {} orphan resources:\n", orphans.len());
         for orphan in orphans {
-            println!("  {}", orphan.file_path);
+            print!("  {} [{}]", orphan.file_path, orphan.confidence);
+            if let Some(note) = &orphan.note {
+                print!(" \u{2014} {note}");
+            }
+            println!();
         }
     }
 }
@@ -1813,6 +1931,9 @@ fn print_audit_dangling(dangling: &[codegraph_graph::graph::DanglingRef]) {
 fn print_audit_impact(impact: &codegraph_graph::graph::ResourceImpact) {
     if impact.affected.is_empty() {
         println!("\nNothing references {}", impact.changed);
+        if let Some(note) = empty_impact_note(impact) {
+            println!("  note: {note}");
+        }
     } else {
         println!(
             "\n{} is referenced by {} site(s):\n",
@@ -1820,8 +1941,29 @@ fn print_audit_impact(impact: &codegraph_graph::graph::ResourceImpact) {
             impact.affected.len()
         );
         for affected in &impact.affected {
-            println!("  {}:{}", affected.from_file, affected.line);
+            match &affected.edge_subkind {
+                Some(subkind) => println!(
+                    "  {}:{} ({}/{})",
+                    affected.from_file, affected.line, affected.edge_kind, subkind
+                ),
+                None => println!(
+                    "  {}:{} ({})",
+                    affected.from_file, affected.line, affected.edge_kind
+                ),
+            }
         }
+    }
+}
+
+fn print_verify_plan(plan: &VerifyPlan) {
+    println!("\nverify-plan for {}:", plan.changed);
+    println!("  loadScripts ({}):", plan.load_scripts.len());
+    for script in &plan.load_scripts {
+        println!("    {script}");
+    }
+    println!("  openScenes ({}):", plan.open_scenes.len());
+    for scene in &plan.open_scenes {
+        println!("    {scene}");
     }
 }
 

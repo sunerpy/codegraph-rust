@@ -274,6 +274,7 @@ impl<'a> VueExtractor<'a> {
                         file_path: self.file_path.to_string(),
                         language: Language::Vue,
                         is_function_ref: false,
+                        reference_subkind: None,
                     });
                 }
             }
@@ -327,6 +328,7 @@ impl<'a> VueExtractor<'a> {
                     file_path: self.file_path.to_string(),
                     language: Language::Vue,
                     is_function_ref: false,
+                    reference_subkind: None,
                 });
             }
         }

@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
-use codegraph_core::types::{Edge, EdgeKind, FileRecord, Language, Node, NodeKind, UnresolvedRef};
+use codegraph_core::types::{
+    Edge, EdgeKind, FileRecord, Language, Node, NodeKind, ReferenceSubkind, UnresolvedRef,
+};
 use rusqlite::{named_params, params, Connection, OptionalExtension, Row, ToSql};
 use serde_json::Value;
 
@@ -601,8 +603,8 @@ impl Store {
         {
             let mut stmt = tx.prepare_cached(
                 r#"
-                INSERT INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, candidates, file_path, language)
-                VALUES (@fromNodeId, @referenceName, @referenceKind, @line, @col, @candidates, @filePath, @language)
+                INSERT INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, candidates, file_path, language, reference_subkind)
+                VALUES (@fromNodeId, @referenceName, @referenceKind, @line, @col, @candidates, @filePath, @language, @referenceSubkind)
                 "#,
             )?;
             for unresolved in refs {
@@ -629,6 +631,7 @@ impl Store {
                     "@candidates": candidates,
                     "@filePath": unresolved.file_path,
                     "@language": unresolved.language.as_str(),
+                    "@referenceSubkind": unresolved.reference_subkind.map(|s| s.as_str()),
                 })?;
             }
         }
@@ -1155,6 +1158,7 @@ fn row_to_unresolved_ref(row: &Row<'_>) -> rusqlite::Result<UnresolvedRef> {
         file_path: row.get("file_path")?,
         language: parse_language(row.get::<_, String>("language")?)?,
         is_function_ref,
+        reference_subkind: parse_reference_subkind(row.get("reference_subkind")?)?,
     })
 }
 
@@ -1240,6 +1244,22 @@ fn parse_edge_kind(value: String) -> rusqlite::Result<EdgeKind> {
         _ => return Err(enum_error(value, "edge kind")),
     };
     Ok(kind)
+}
+
+fn parse_reference_subkind(value: Option<String>) -> rusqlite::Result<Option<ReferenceSubkind>> {
+    let Some(text) = value else {
+        return Ok(None);
+    };
+    let subkind = match text.as_str() {
+        "script_attach" => ReferenceSubkind::ScriptAttach,
+        "scene_instance" => ReferenceSubkind::SceneInstance,
+        "ext_resource" => ReferenceSubkind::ExtResource,
+        "group_member" => ReferenceSubkind::GroupMember,
+        "signal_method" => ReferenceSubkind::SignalMethod,
+        "gdscript_load_path" => ReferenceSubkind::GdscriptLoadPath,
+        _ => return Err(enum_error(text, "reference subkind")),
+    };
+    Ok(Some(subkind))
 }
 
 fn parse_language(value: String) -> rusqlite::Result<Language> {
@@ -1620,6 +1640,7 @@ mod tests {
             file_path: "src/u.rs".to_string(),
             language: Language::Rust,
             is_function_ref: false,
+            reference_subkind: None,
         };
         store
             .insert_unresolved_refs(std::slice::from_ref(&unresolved))

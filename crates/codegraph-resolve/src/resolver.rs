@@ -1204,20 +1204,7 @@ impl ReferenceResolver {
                     source: reference.original.from_node_id.clone(),
                     target: reference.target_node_id.clone(),
                     kind,
-                    metadata: Some(if reference.original.is_function_ref {
-                        // Uniform marker for function-as-value edges (#756),
-                        // regardless of resolution strategy (index.ts:824-827).
-                        serde_json::json!({
-                            "confidence": reference.confidence,
-                            "resolvedBy": reference.resolved_by.as_str(),
-                            "fnRef": true,
-                        })
-                    } else {
-                        serde_json::json!({
-                            "confidence": reference.confidence,
-                            "resolvedBy": reference.resolved_by.as_str(),
-                        })
-                    }),
+                    metadata: Some(build_edge_metadata(reference)),
                     line: Some(reference.original.line),
                     col: Some(reference.original.column),
                     provenance: None,
@@ -1774,6 +1761,7 @@ fn to_ref_view(reference: &UnresolvedRef) -> RefView {
         file_path: reference.file_path.clone(),
         language: reference.language,
         is_function_ref: reference.is_function_ref,
+        reference_subkind: reference.reference_subkind,
     }
 }
 
@@ -1791,7 +1779,32 @@ fn ref_view_to_unresolved(reference: &RefView) -> UnresolvedRef {
         file_path: reference.file_path.clone(),
         language: reference.language,
         is_function_ref: reference.is_function_ref,
+        reference_subkind: reference.reference_subkind,
     }
+}
+
+/// Build a resolved edge's `metadata` JSON: `confidence`+`resolvedBy`, plus
+/// `fnRef: true` for function-as-value edges (#756, index.ts:824-827) and
+/// `subkind` for Godot refs carrying a `reference_subkind`. The base shape (no
+/// `fnRef`, no `subkind`) stays byte-identical to the prior output, keeping
+/// existing resolved-edge goldens stable.
+fn build_edge_metadata(reference: &ResolvedRef) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "confidence".to_string(),
+        serde_json::json!(reference.confidence),
+    );
+    map.insert(
+        "resolvedBy".to_string(),
+        serde_json::json!(reference.resolved_by.as_str()),
+    );
+    if reference.original.is_function_ref {
+        map.insert("fnRef".to_string(), serde_json::json!(true));
+    }
+    if let Some(subkind) = reference.original.reference_subkind {
+        map.insert("subkind".to_string(), serde_json::json!(subkind.as_str()));
+    }
+    serde_json::Value::Object(map)
 }
 
 /// Does a `FrameworkResolver` apply to `language`? (`getApplicableFrameworks`,

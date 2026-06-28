@@ -268,6 +268,175 @@ fn audit_requires_at_least_one_mode() {
 }
 
 #[test]
+fn audit_impact_rows_carry_the_changed_path_as_target() {
+    // Given the fixture indexed (data.tres references referenced.tres),
+    let (_dir, project) = indexed_project("impact-target");
+    let p = project.to_str().unwrap();
+
+    // When audit --impact referenced.tres --json runs,
+    let (stdout, err, ok) = cli(&["audit", "--impact", "referenced.tres", "--json", "-p", p]);
+    assert!(ok, "audit failed: stderr={err}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+
+    // Then every affected row echoes target=referenced.tres and there is no note.
+    let affected = value["impact"]["affected"]
+        .as_array()
+        .expect("affected array");
+    assert!(!affected.is_empty(), "referenced.tres must have referrers");
+    assert!(
+        affected
+            .iter()
+            .all(|a| a["target"].as_str() == Some("referenced.tres")),
+        "every affected row must carry target=referenced.tres, got: {affected:?}"
+    );
+    assert!(
+        value.get("note").is_none(),
+        "a non-empty impact must NOT emit a boundary note"
+    );
+}
+
+#[test]
+fn audit_impact_empty_on_godot_path_emits_boundary_note() {
+    // Given the fixture indexed (orphan.tres is referenced by nothing),
+    let (_dir, project) = indexed_project("impact-empty-note");
+    let p = project.to_str().unwrap();
+
+    // When audit --impact orphan.tres --json runs,
+    let (stdout, err, ok) = cli(&["audit", "--impact", "orphan.tres", "--json", "-p", p]);
+    assert!(ok, "audit failed: stderr={err}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+
+    // Then the impact is empty and a boundary note is emitted.
+    assert!(
+        value["impact"]["affected"]
+            .as_array()
+            .expect("affected array")
+            .is_empty(),
+        "orphan.tres must have no static referrers"
+    );
+    assert!(
+        value["note"].as_str().is_some_and(|n| n.contains("godot")),
+        "an empty godot impact must emit a boundary note, got: {value:?}"
+    );
+}
+
+#[test]
+fn audit_orphans_carry_reason_and_low_confidence_note_for_godot_resource() {
+    // Given the fixture indexed (orphan.tres is an orphan godot resource),
+    let (_dir, project) = indexed_project("orphan-confidence");
+    let p = project.to_str().unwrap();
+
+    // When audit --orphans --json runs,
+    let (stdout, err, ok) = cli(&["audit", "--orphans", "--json", "-p", p]);
+    assert!(ok, "audit failed: stderr={err}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+
+    // Then orphan.tres carries reason=no_path_reference, confidence=low, a note.
+    let orphan = value["orphans"]
+        .as_array()
+        .expect("orphans array")
+        .iter()
+        .find(|o| o["filePath"].as_str() == Some("orphan.tres"))
+        .expect("orphan.tres reported");
+    assert_eq!(
+        orphan["reason"].as_str(),
+        Some("no_path_reference"),
+        "orphan reason must be no_path_reference, got: {orphan:?}"
+    );
+    assert_eq!(
+        orphan["confidence"].as_str(),
+        Some("low"),
+        "godot resource orphan must be low-confidence, got: {orphan:?}"
+    );
+    assert!(
+        orphan["note"].as_str().is_some(),
+        "low-confidence orphan must carry a note, got: {orphan:?}"
+    );
+}
+
+#[test]
+fn audit_verify_plan_groups_open_scenes_for_a_changed_script() {
+    // Given the fixture indexed (main.tscn binds a script = res://player.gd),
+    let (_dir, project) = indexed_project("verify-plan");
+    let p = project.to_str().unwrap();
+
+    // When audit --impact player.gd --verify-plan --json runs,
+    let (stdout, err, ok) = cli(&[
+        "audit",
+        "--impact",
+        "player.gd",
+        "--verify-plan",
+        "--json",
+        "-p",
+        p,
+    ]);
+    assert!(ok, "audit failed: stderr={err}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+
+    // Then the plan opens main.tscn and lists a reason for it.
+    let plan = &value["verifyPlan"];
+    assert_eq!(
+        plan["changed"].as_str(),
+        Some("player.gd"),
+        "plan changed must echo the impact path, got: {plan:?}"
+    );
+    let open_scenes: Vec<&str> = plan["openScenes"]
+        .as_array()
+        .expect("openScenes array")
+        .iter()
+        .map(|s| s.as_str().expect("res path"))
+        .collect();
+    assert!(
+        open_scenes.contains(&"res://main.tscn"),
+        "main.tscn must be in openScenes, got: {open_scenes:?}"
+    );
+    assert!(
+        plan["reasons"]
+            .as_array()
+            .expect("reasons array")
+            .iter()
+            .any(|r| r["file"].as_str() == Some("main.tscn")),
+        "main.tscn must appear in reasons, got: {plan:?}"
+    );
+}
+
+#[test]
+fn audit_verify_plan_requires_impact() {
+    // Given the indexed fixture,
+    let (_dir, project) = indexed_project("verify-plan-requires-impact");
+    let p = project.to_str().unwrap();
+    // When audit --verify-plan runs without --impact,
+    let (_out, _err, ok) = cli(&["audit", "--verify-plan", "--orphans", "-p", p]);
+    // Then clap rejects it (verify-plan requires impact).
+    assert!(!ok, "--verify-plan without --impact must fail");
+}
+
+#[test]
+fn audit_impact_surfaces_edge_subkind_for_godot_ref() {
+    // Given the fixture indexed (data.tres references referenced.tres via ExtResource),
+    let (_dir, project) = indexed_project("impact-subkind");
+    let p = project.to_str().unwrap();
+
+    // When audit --impact referenced.tres --json runs,
+    let (stdout, err, ok) = cli(&["audit", "--impact", "referenced.tres", "--json", "-p", p]);
+    assert!(ok, "audit failed: stderr={err}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+
+    // Then the affected row from data.tres carries edgeSubkind=ext_resource.
+    let row = value["impact"]["affected"]
+        .as_array()
+        .expect("affected array")
+        .iter()
+        .find(|a| a["fromFile"].as_str() == Some("data.tres"))
+        .expect("data.tres referrer present");
+    assert_eq!(
+        row["edgeSubkind"].as_str(),
+        Some("ext_resource"),
+        "godot ExtResource ref must surface edgeSubkind, got: {row:?}"
+    );
+}
+
+#[test]
 fn check_stdout_is_byte_identical_to_the_committed_baseline() {
     // Given the indexed fixture (after the audit subcommand was added),
     let (_dir, project) = indexed_project("check-lock");
