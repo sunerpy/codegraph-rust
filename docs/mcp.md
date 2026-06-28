@@ -67,6 +67,11 @@ CODEGRAPH_MCP_TOOLS=explore,node,search,callers,impact,check codegraph serve --m
 | `codegraph_check`   | Circular-dependency detection. Returns each cycle as `a.ts -> b.ts -> a.ts`.                                                            |
 | `codegraph_export`  | Whole-graph NetworkX node-link JSON export with optional PageRank centrality.                                                           |
 
+Every tool is query-only, so each carries MCP tool **annotations** in
+`tools/list` — `readOnlyHint: true`, `destructiveHint: false`,
+`idempotentHint: true`, `openWorldHint: false`. Hosts that respect these hints
+can call codegraph tools freely without write-confirmation prompts.
+
 ---
 
 ## Tool Usage Notes

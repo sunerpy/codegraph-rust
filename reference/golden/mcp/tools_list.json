@@ -47,6 +47,12 @@
             "required": [
               "query"
             ]
+          },
+          "annotations": {
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false
           }
         },
         {
@@ -72,6 +78,12 @@
             "required": [
               "symbol"
             ]
+          },
+          "annotations": {
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false
           }
         },
         {
@@ -116,6 +128,12 @@
               }
             },
             "required": []
+          },
+          "annotations": {
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false
           }
         },
         {
@@ -141,6 +159,12 @@
             "required": [
               "query"
             ]
+          },
+          "annotations": {
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false
           }
         }
       ]

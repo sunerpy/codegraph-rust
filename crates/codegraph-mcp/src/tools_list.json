@@ -36,6 +36,12 @@
       "required": [
         "query"
       ]
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
     }
   },
   {
@@ -61,6 +67,12 @@
       "required": [
         "symbol"
       ]
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
     }
   },
   {
@@ -86,6 +98,12 @@
       "required": [
         "symbol"
       ]
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
     }
   },
   {
@@ -111,6 +129,12 @@
       "required": [
         "symbol"
       ]
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
     }
   },
   {
@@ -155,6 +179,12 @@
         }
       },
       "required": []
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
     }
   },
   {
@@ -180,6 +210,12 @@
       "required": [
         "query"
       ]
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
     }
   },
   {
@@ -193,6 +229,12 @@
           "description": "Path to a different project with .codegraph/ initialized. If omitted, uses current project. Use this to query other codebases."
         }
       }
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
     }
   },
   {
@@ -233,6 +275,12 @@
           "description": "Path to a different project with .codegraph/ initialized. If omitted, uses current project. Use this to query other codebases."
         }
       }
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
     }
   },
   {
@@ -246,6 +294,12 @@
           "description": "Path to a different project with .codegraph/ initialized. If omitted, uses current project. Use this to query other codebases."
         }
       }
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
     }
   },
   {
@@ -259,6 +313,12 @@
           "description": "Path to a different project with .codegraph/ initialized. If omitted, uses current project."
         }
       }
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
     }
   }
 ]
