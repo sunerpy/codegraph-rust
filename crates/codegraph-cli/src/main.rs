@@ -1254,7 +1254,7 @@ fn start_daemon_for_adopted_root(project_root: &Path) -> Option<PathBuf> {
         return None;
     }
     if daemon_already_running(project_root) {
-        return Some(codegraph_daemon::daemon_socket_path(project_root));
+        return Some(codegraph_daemon::recorded_socket_path(project_root));
     }
     let Ok(exe) = std::env::current_exe() else {
         return None;
@@ -1266,7 +1266,7 @@ fn start_daemon_for_adopted_root(project_root: &Path) -> Option<PathBuf> {
                 "[CodeGraph MCP] Started shared daemon for adopted project root {}",
                 project_root.display()
             );
-            let socket_path = codegraph_daemon::daemon_socket_path(project_root);
+            let socket_path = codegraph_daemon::recorded_socket_path(project_root);
             socket_path.exists().then_some(socket_path)
         }
         Err(err) => {
@@ -1388,7 +1388,7 @@ fn spawn_or_proxy(
         }
     }
 
-    let socket_path = codegraph_daemon::daemon_socket_path(project_root);
+    let socket_path = codegraph_daemon::recorded_socket_path(project_root);
     if !socket_path.exists() {
         tracing::debug!("daemon socket never appeared; serving direct");
         return None;
@@ -1425,10 +1425,12 @@ fn daemon_already_running(project_root: &Path) -> bool {
 }
 
 fn poll_for_daemon_socket(project_root: &Path) {
-    let socket = codegraph_daemon::daemon_socket_path(project_root);
     let deadline = std::time::Instant::now() + DAEMON_SOCKET_POLL_TIMEOUT;
     while std::time::Instant::now() < deadline {
-        if socket.exists() {
+        // Re-read the lock each tick: the daemon rewrites the recorded socket to
+        // its bind-fallback choice during startup, so the path can change while
+        // we poll (D-Daemon-b).
+        if codegraph_daemon::recorded_socket_path(project_root).exists() {
             return;
         }
         std::thread::sleep(DAEMON_SOCKET_POLL_INTERVAL);
@@ -2095,6 +2097,7 @@ fn index_project_inner(
     let options = ExtractOptions {
         max_file_size: config.indexing.max_file_size,
         ignore_dirs: config.indexing.ignore_dirs.clone(),
+        exclude: config.indexing.exclude.clone(),
         parallel: true,
     };
     if !quiet {

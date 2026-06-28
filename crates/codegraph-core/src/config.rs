@@ -55,6 +55,11 @@ pub struct IndexingConfig {
     pub max_file_size: u64,
     #[serde(default = "default_ignore_dirs")]
     pub ignore_dirs: Vec<String>,
+    /// Root-relative path patterns skipped during the walk, alongside
+    /// `ignore_dirs`/`.gitignore`. Same matcher as `.gitignore` (`static/`,
+    /// `docs/gen`, `gen*`); honored by index and sync. Off by default.
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 fn default_max_file_size() -> u64 {
@@ -145,6 +150,7 @@ impl Default for IndexingConfig {
         Self {
             max_file_size: default_max_file_size(),
             ignore_dirs: default_ignore_dirs(),
+            exclude: Vec::new(),
         }
     }
 }
@@ -289,6 +295,30 @@ name = "my-project"
         assert!(cfg.indexing.ignore_dirs.len() >= 40); // should have many defaults
         assert!(cfg.watch.enabled); // default
         assert_eq!(cfg.watch.debounce_ms, 2000); // default
+        assert!(cfg.indexing.exclude.is_empty()); // off by default
+    }
+
+    #[test]
+    fn test_exclude_parses_and_defaults_empty() {
+        let with_exclude = r#"
+[app]
+name = "p"
+
+[indexing]
+exclude = ["static/", "docs/gen"]
+"#;
+        let cfg: Config = toml::from_str(with_exclude).expect("should parse");
+        assert_eq!(cfg.indexing.exclude, vec!["static/", "docs/gen"]);
+
+        let without = r#"
+[app]
+name = "p"
+
+[indexing]
+max_file_size = 2097152
+"#;
+        let cfg: Config = toml::from_str(without).expect("should parse");
+        assert!(cfg.indexing.exclude.is_empty());
     }
 
     #[test]

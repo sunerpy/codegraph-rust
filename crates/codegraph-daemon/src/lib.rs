@@ -24,8 +24,8 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use interprocess::local_socket::traits::Listener as _;
 pub use lock::{
-    clear_stale_daemon_lock, decode_lock_info, encode_lock_info, try_acquire_daemon_lock,
-    unlock_project, AcquireResult, DaemonLockInfo,
+    clear_stale_daemon_lock, decode_lock_info, encode_lock_info, recorded_socket_path,
+    try_acquire_daemon_lock, unlock_project, AcquireResult, DaemonLockInfo,
 };
 pub use paths::{daemon_log_path, daemon_pid_path, daemon_socket_path};
 pub use process::{
@@ -36,7 +36,7 @@ pub use session::{read_daemon_hello, run_session_recv, SessionRegistry};
 pub use spawn::spawn_detached_daemon;
 use tracing::{debug, info, warn};
 
-use crate::lock::cleanup_owned_lock;
+use crate::lock::{cleanup_owned_lock, rewrite_lock_socket_path};
 use crate::paths::codegraph_dir;
 use crate::session::serve_session;
 use crate::transport::{bind, connect, Listener, Rendezvous};
@@ -258,16 +258,13 @@ fn start_with_lock(
 ) -> Result<DaemonHandle> {
     fs::create_dir_all(codegraph_dir(&project_root))
         .with_context(|| format!("creating {}", codegraph_dir(&project_root).display()))?;
-    let rendezvous = Rendezvous::from_socket_path(&socket_path);
-    #[cfg(unix)]
-    if let Some(stale) = rendezvous.cleanup_path() {
-        if stale.exists() {
-            fs::remove_file(stale)
-                .with_context(|| format!("removing stale socket {}", stale.display()))?;
-        }
+    let (listener, socket_path) = bind_with_fallback(&project_root, socket_path)?;
+    // The bind-fallback may have selected a candidate other than the one
+    // recorded at acquire time; persist the CHOSEN socket so a client reading
+    // the lock attaches to the socket actually bound (f83a1ec / D-Daemon).
+    if let Err(err) = rewrite_lock_socket_path(&pid_path, &socket_path) {
+        debug!(error = %err, "could not persist chosen daemon socket into lock");
     }
-    let listener = bind(&rendezvous)
-        .with_context(|| format!("binding daemon socket {}", socket_path.display()))?;
     let registry = SessionRegistry::default();
     let shutdown = Arc::new(AtomicBool::new(false));
     let thread_registry = registry.clone();
@@ -294,6 +291,54 @@ fn start_with_lock(
         shutdown,
         thread: Some(thread),
     })
+}
+
+/// Ordered bind candidates: the lock-recorded `preferred` socket first, then the
+/// remaining unix fallback candidates (`f83a1ec`). On non-unix there is a single
+/// namespaced pipe name, so the chain is just `[preferred]`.
+#[cfg(unix)]
+fn socket_candidate_chain(project_root: &Path, preferred: PathBuf) -> Vec<PathBuf> {
+    let mut candidates = vec![preferred];
+    for candidate in paths::daemon_socket_candidates(project_root) {
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    candidates
+}
+
+#[cfg(not(unix))]
+fn socket_candidate_chain(_project_root: &Path, preferred: PathBuf) -> Vec<PathBuf> {
+    vec![preferred]
+}
+
+/// Bind the daemon listener, falling through the deterministic socket-candidate
+/// chain on `bind()` failure (`f83a1ec`). `preferred` is the socket the lock
+/// recorded; it is tried first, then any remaining
+/// [`daemon_socket_candidates`] in order. Returns the listener plus the socket
+/// that actually bound. Errors only when EVERY candidate fails.
+fn bind_with_fallback(project_root: &Path, preferred: PathBuf) -> Result<(Listener, PathBuf)> {
+    let candidates = socket_candidate_chain(project_root, preferred);
+
+    let mut last_err = None;
+    for socket_path in candidates {
+        let rendezvous = Rendezvous::from_socket_path(&socket_path);
+        #[cfg(unix)]
+        if let Some(stale) = rendezvous.cleanup_path() {
+            if stale.exists() {
+                let _ = fs::remove_file(stale);
+            }
+        }
+        match bind(&rendezvous) {
+            Ok(listener) => return Ok((listener, socket_path)),
+            Err(err) => {
+                debug!(socket = %socket_path.display(), error = %err, "daemon socket bind failed; trying next candidate");
+                last_err = Some((socket_path, err));
+            }
+        }
+    }
+    let (socket_path, err) = last_err.expect("candidate list is never empty");
+    Err(err).with_context(|| format!("binding daemon socket {}", socket_path.display()))
 }
 
 #[allow(clippy::too_many_arguments)]

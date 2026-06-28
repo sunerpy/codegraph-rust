@@ -262,6 +262,31 @@ codegraph unlock [path]   # clears the stale lock; live daemon pids are preserve
 (direct) mode regardless of project state. Useful in CI or scripts where you
 don't want a background process.
 
+**Filesystems that can't bind a socket.** On ExFAT/FAT, some network mounts,
+and WSL DrvFs, binding an `AF_UNIX` socket inside the project directory fails.
+The daemon then falls back through a deterministic candidate chain — the
+project-dir `.codegraph/daemon.sock` first, then a hashed socket under the
+system temp dir — and records the socket it actually bound in the lock file.
+The pid/lock file always stays at `.codegraph/daemon.pid`, and clients read the
+recorded socket from the lock, so they attach regardless of which candidate the
+daemon chose.
+
+### Indexing exclusions (`[indexing] exclude`)
+
+Beyond the default `ignore_dirs`, you can skip additional root-relative path
+patterns by listing them under `[indexing] exclude` in
+`.codegraph/config.toml`:
+
+```toml
+[indexing]
+exclude = ["static/", "docs/generated", "gen*"]
+```
+
+Patterns use the same matcher as `.gitignore` (`static/` for a directory,
+`gen*` for a prefix, `docs/generated` for an exact/suffix path) and are honored
+by both `index` and `sync`. The list is empty by default, so an existing config
+without `exclude` behaves identically.
+
 ### Live file watch
 
 The daemon watches your project for file changes and re-indexes automatically.

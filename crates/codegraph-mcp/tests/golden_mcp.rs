@@ -245,6 +245,14 @@ fn tools_list_matches_upstream_names_and_schemas() {
             "inputSchema for {} must match the golden",
             g["name"]
         );
+        // readOnlyHint annotations (a79fa51) are part of the tool surface: the
+        // golden fixture pins them so a divergence between source and fixture
+        // fails here, keeping the annotations update load-bearing.
+        assert_eq!(
+            g["annotations"], a["annotations"],
+            "annotations for {} must match the golden",
+            g["name"]
+        );
     }
 }
 

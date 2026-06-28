@@ -22,6 +22,7 @@ use crate::walker::TreeSitterWalker;
 pub struct ExtractOptions {
     pub max_file_size: u64,
     pub ignore_dirs: Vec<String>,
+    pub exclude: Vec<String>,
     pub parallel: bool,
 }
 
@@ -31,6 +32,7 @@ impl Default for ExtractOptions {
         Self {
             max_file_size: indexing.max_file_size,
             ignore_dirs: indexing.ignore_dirs,
+            exclude: indexing.exclude,
             parallel: true,
         }
     }
@@ -226,7 +228,14 @@ pub fn scan_project(root: &Path, options: &ExtractOptions) -> Result<Vec<String>
         .map(String::as_str)
         .collect::<HashSet<_>>();
     let gitignore = read_root_gitignore(root);
-    scan_dir(root, root, &ignored_dirs, &gitignore, &mut files)?;
+    scan_dir(
+        root,
+        root,
+        &ignored_dirs,
+        &gitignore,
+        &options.exclude,
+        &mut files,
+    )?;
     files.sort();
     Ok(files)
 }
@@ -236,6 +245,7 @@ fn scan_dir(
     dir: &Path,
     ignored_dirs: &HashSet<&str>,
     gitignore: &[String],
+    exclude: &[String],
     files: &mut Vec<String>,
 ) -> Result<()> {
     let entries = fs::read_dir(dir).with_context(|| format!("read dir {}", dir.display()))?;
@@ -248,12 +258,14 @@ fn scan_dir(
             continue;
         }
         let relative = normalize_path(path.strip_prefix(root).unwrap_or(&path));
-        if is_ignored_by_patterns(&relative, gitignore) {
+        if is_ignored_by_patterns(&relative, gitignore)
+            || is_ignored_by_patterns(&relative, exclude)
+        {
             continue;
         }
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            scan_dir(root, &path, ignored_dirs, gitignore, files)?;
+            scan_dir(root, &path, ignored_dirs, gitignore, exclude, files)?;
         } else if file_type.is_file() && is_extractable_source_path(&relative) {
             files.push(relative);
         }
@@ -421,6 +433,37 @@ mod tests {
         assert!(
             !files.iter().any(|f| f.starts_with(".godot/")),
             ".godot/ stays ignored even when addons is re-included: {files:?}"
+        );
+
+        fs::remove_dir_all(&project).ok();
+    }
+
+    /// `[indexing] exclude` skips root-relative path patterns the same way
+    /// `.gitignore` does, while leaving everything else indexed.
+    #[test]
+    fn scan_honors_config_exclude_patterns() {
+        let project = unique_project("exclude");
+        touch(&project, "src/app.ts", "export const a = 1;");
+        touch(&project, "static/bundle.ts", "export const b = 2;");
+        touch(&project, "gen/out.ts", "export const c = 3;");
+
+        let options = ExtractOptions {
+            exclude: vec!["static/".to_string(), "gen".to_string()],
+            ..ExtractOptions::default()
+        };
+        let files = scan_project(&project, &options).expect("scan project");
+
+        assert!(
+            files.contains(&"src/app.ts".to_string()),
+            "non-excluded source must be indexed: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f.starts_with("static/")),
+            "excluded static/ must be skipped: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f.starts_with("gen/")),
+            "excluded gen must be skipped: {files:?}"
         );
 
         fs::remove_dir_all(&project).ok();
