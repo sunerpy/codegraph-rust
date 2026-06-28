@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.20.0](https://github.com/sunerpy/codegraph-rust/compare/v0.19.0...v0.20.0) (2026-06-28)
+
+
+### Features
+
+* port colby v1.1.2 (readOnlyHint, daemon FS fallback, name-ceiling, exclude, swift computed props) ([#90](https://github.com/sunerpy/codegraph-rust/issues/90)) ([c7e828a](https://github.com/sunerpy/codegraph-rust/commit/c7e828afbe52d873b1de46881607b5095044dddd))
+
 ## [0.19.0](https://github.com/sunerpy/codegraph-rust/compare/v0.18.0...v0.19.0) (2026-06-28)
 
 
