@@ -66,7 +66,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use codegraph_core::node_id::generate_node_id;
-use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
+use codegraph_core::types::{EdgeKind, Language, Node, NodeKind, ReferenceSubkind};
 
 use super::framework_node;
 use super::godot_common::{map_res_path, quoted_strings, strip_quotes};
@@ -361,6 +361,7 @@ fn reference(from_node_id: String, target: String, line_no: i64, file_path: &str
         file_path: file_path.to_string(),
         language: Language::GodotResource,
         is_function_ref: false,
+        reference_subkind: Some(ReferenceSubkind::ExtResource),
     }
 }
 

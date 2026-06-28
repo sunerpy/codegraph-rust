@@ -6,7 +6,7 @@
 //! [`codegraph_core::types::UnresolvedRef`] row read from the store. We model it
 //! here as [`RefView`] so the two never get confused.
 
-use codegraph_core::types::{EdgeKind, Language, Node};
+use codegraph_core::types::{EdgeKind, Language, Node, ReferenceSubkind};
 
 /// An unresolved reference in resolution-ready form.
 ///
@@ -34,6 +34,9 @@ pub struct RefView {
     /// upstream `function_ref` callback registration that resolves to a
     /// `references` edge tagged `fnRef: true`.
     pub is_function_ref: bool,
+    /// Finer structural extraction label (Godot only); `None` otherwise. Threaded
+    /// like `is_function_ref` into the persisted row's `reference_subkind` column.
+    pub reference_subkind: Option<ReferenceSubkind>,
 }
 
 /// How a reference was resolved.

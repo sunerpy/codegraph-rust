@@ -142,10 +142,19 @@ impl GodotDynamicReach {
 /// A Godot `.tres`/`.tscn` resource file no indexed reference names. Keyed on
 /// the repo-relative path (resource files have no `file:` graph node — orphan
 /// accounting is by path, per the B0 probe finding).
+///
+/// `reason`/`confidence`/`note` are static, CLI-only fields (never persisted,
+/// golden-neutral): `confidence` is `"low"` for Godot resource/scene files
+/// (inbound refs can be data-driven and unseen by static analysis), `"high"`
+/// otherwise.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrphanResource {
     pub file_path: String,
+    pub reason: String,
+    pub confidence: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// A path-shaped Godot reference whose target is missing on disk under the
@@ -168,12 +177,18 @@ pub struct ResourceImpact {
 }
 
 /// One referencing site (source file + line + the graph edge kind that links it).
+///
+/// `target` echoes `ResourceImpact.changed` onto every row. `edge_subkind` is the
+/// finer structural extraction label (Godot only; `None` otherwise).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AffectedRef {
     pub from_file: String,
     pub line: i64,
     pub edge_kind: String,
+    pub target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edge_subkind: Option<String>,
 }
 
 pub struct GraphTraverser<'store> {
@@ -966,7 +981,20 @@ impl<'store> GraphTraverser<'store> {
                 f.language.is_godot_non_script_file() && f.language != Language::GodotProject
             })
             .filter(|f| !referenced.contains(&normalize_rel(&f.path)))
-            .map(|f| OrphanResource { file_path: f.path })
+            .map(|f| {
+                let low_confidence = matches!(
+                    f.language,
+                    Language::GodotResource | Language::GodotScene
+                );
+                OrphanResource {
+                    file_path: f.path,
+                    reason: "no_path_reference".to_string(),
+                    confidence: if low_confidence { "low" } else { "high" }.to_string(),
+                    note: low_confidence.then(|| {
+                        "godot resources may be referenced by data-driven numeric ids or DSL paths not followed by static analysis".to_string()
+                    }),
+                }
+            })
             .collect();
         orphans.sort_by(|a, b| a.file_path.cmp(&b.file_path));
         Ok(orphans)
@@ -1034,6 +1062,10 @@ impl<'store> GraphTraverser<'store> {
                     from_file: reference.file_path,
                     line: reference.line,
                     edge_kind: reference.reference_kind.as_str().to_string(),
+                    target: changed.clone(),
+                    edge_subkind: reference
+                        .reference_subkind
+                        .map(|subkind| subkind.as_str().to_string()),
                 });
             }
         }
@@ -1048,6 +1080,8 @@ impl<'store> GraphTraverser<'store> {
                     from_file: source.file_path,
                     line: edge.line.unwrap_or(0),
                     edge_kind: edge.kind.as_str().to_string(),
+                    target: changed.clone(),
+                    edge_subkind: edge_metadata_subkind(&edge),
                 });
             }
         }
@@ -1092,6 +1126,15 @@ impl<'store> GraphTraverser<'store> {
 /// carrying a backslash).
 fn normalize_rel(path: &str) -> String {
     path.replace('\\', "/")
+}
+
+/// The `metadata.subkind` string the resolver tags onto Godot edges; `None` otherwise.
+fn edge_metadata_subkind(edge: &Edge) -> Option<String> {
+    edge.metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("subkind"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 /// `.godot/` and `addons/` references are engine-managed / third-party and are

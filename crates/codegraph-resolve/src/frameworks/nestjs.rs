@@ -386,6 +386,7 @@ fn add_route(
             file_path: file_path.to_string(),
             language: lang,
             is_function_ref: false,
+            reference_subkind: None,
         });
     }
 }

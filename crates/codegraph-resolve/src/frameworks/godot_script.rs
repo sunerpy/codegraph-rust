@@ -710,5 +710,6 @@ fn reference(
         file_path: file_path.to_string(),
         language: Language::Gdscript,
         is_function_ref: false,
+        reference_subkind: None,
     }
 }

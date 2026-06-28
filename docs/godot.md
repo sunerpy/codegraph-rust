@@ -220,7 +220,12 @@ unresolved-reference table. The audit therefore keys on the resource's
 repo-relative **path** (its `files` row + the path-shaped reference names), not
 on incoming graph edges.
 
-- **Orphan** — a `.tres`/`.tscn` whose path no reference names.
+- **Orphan** — a `.tres`/`.tscn` whose path no reference names. In `--json`,
+  each orphan carries `reason` (`no_path_reference`), a static `confidence`
+  (`"low"` for Godot resource/scene files — whose inbound references can be
+  data-driven numeric ids / DSL paths static analysis does not follow — else
+  `"high"`), and an optional `note`. The confidence is a structural caveat, not
+  a runtime guarantee.
 - **Dangling** — a path-shaped reference whose target is missing on disk.
   **Exclusion precedence:** a target under `.godot/` or `addons/` is excluded
   first (never dangling, regardless of disk state); then a `godot:dynamic:`
@@ -232,10 +237,21 @@ on incoming graph edges.
   resolution is out of scope.
 - **Impact** — the reverse-dependency list for a changed path: references that
   name it, plus any resolved incoming edges on that path's `file:` node. In
-  `--json`, each affected site carries `edgeKind` — the graph EDGE kind that
-  links it (`references` / `instantiates`, or the reference's kind for
-  unresolved refs). It is the structural relation, not a domain-semantic label,
-  and does not 100%-distinguish every sub-flavor of reference.
+  `--json`, each affected site carries `fromFile`, `line`, `edgeKind`, `target`
+  (the changed path), and an optional `edgeSubkind`. `edgeKind` is the graph
+  EDGE kind that links it (`references` / `instantiates`, or the reference's
+  kind for unresolved refs). `edgeSubkind` is a finer **structural** extraction
+  label, present for Godot refs only — `script_attach`, `scene_instance`,
+  `ext_resource`, `group_member`, `signal_method` (plus the reserved
+  `gdscript_load_path`). It records _how_ the reference was extracted, NOT a
+  domain/business meaning. When impact is empty for a Godot resource/script
+  path, a `note` flags that data-driven numeric-id / DSL references are not
+  included by default — "nothing references X" is not proof of zero use.
+- **Verify-plan** (`--verify-plan` with `--impact`) — reshapes the impact result
+  into a load/open plan: `{ changed, loadScripts: [res:// .gd], openScenes:
+[res:// .tscn], reasons: [{file, line, edgeKind, edgeSubkind?}] }`. A pure CLI
+  reshape of the impact data — useful for "what must I reload/reopen after
+  editing this resource?".
 
 This is a static structural report. Runtime `ResourceLoader` load-verification is
 out of scope (that is Godot MCP Pro's job). See [`cli.md`](cli.md) for the full

@@ -121,7 +121,7 @@ fn canonical_edges(conn: &Connection) -> Result<Vec<CanonicalRow>> {
 fn canonical_refs(conn: &Connection) -> Result<Vec<CanonicalRow>> {
     let mut stmt = conn.prepare(
         "SELECT from_node_id, reference_name, reference_kind, line, col, candidates, file_path, \
-         language FROM unresolved_refs",
+         language, reference_subkind FROM unresolved_refs",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(RawRef {
@@ -133,6 +133,7 @@ fn canonical_refs(conn: &Connection) -> Result<Vec<CanonicalRow>> {
             candidates: row.get(5)?,
             file_path: row.get(6)?,
             language: row.get(7)?,
+            reference_subkind: row.get(8)?,
         })
     })?;
 
@@ -352,6 +353,7 @@ struct RawRef {
     candidates: Option<String>,
     file_path: String,
     language: String,
+    reference_subkind: Option<String>,
 }
 
 impl RawRef {
@@ -369,6 +371,11 @@ impl RawRef {
         );
         row.insert("file_path".to_string(), json!(self.file_path));
         row.insert("language".to_string(), json!(self.language));
+        // RULE G1: omit the key entirely when NULL so every existing (non-Godot)
+        // row stays byte-identical; only Godot rows that carry a subkind differ.
+        if let Some(subkind) = self.reference_subkind {
+            row.insert("reference_subkind".to_string(), json!(subkind));
+        }
         Ok(row)
     }
 }

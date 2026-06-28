@@ -2,7 +2,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::schema::BASE_SCHEMA;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 5;
+pub const CURRENT_SCHEMA_VERSION: i64 = 6;
 pub const FRESH_SCHEMA_DESCRIPTION: &str = "Initial schema includes all migrations";
 
 const MIGRATIONS: &[Migration] = &[
@@ -42,6 +42,13 @@ const MIGRATIONS: &[Migration] = &[
         description: "Add nodes.return_type — normalized return/result type for receiver-type inference (C++ singletons/factories, #645)",
         sql: r#"
         ALTER TABLE nodes ADD COLUMN return_type TEXT;
+      "#,
+    },
+    Migration {
+        version: 6,
+        description: "Add unresolved_refs.reference_subkind — structural extraction label (Godot edge subkind)",
+        sql: r#"
+        ALTER TABLE unresolved_refs ADD COLUMN reference_subkind TEXT;
       "#,
     },
 ];

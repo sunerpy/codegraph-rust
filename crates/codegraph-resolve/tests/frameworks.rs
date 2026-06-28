@@ -132,6 +132,7 @@ fn ref_view(name: &str, kind: EdgeKind, file_path: &str, lang: Language) -> RefV
         file_path: file_path.to_string(),
         language: lang,
         is_function_ref: false,
+        reference_subkind: None,
     }
 }
 
