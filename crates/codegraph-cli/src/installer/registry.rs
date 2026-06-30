@@ -99,3 +99,43 @@ pub fn resolve_target_flag(
     }
     Ok(resolved)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The full registry id set, in load-bearing order (registry.rs:5-7).
+    const ALL_IDS: &[&str] = &[
+        "claude",
+        "cursor",
+        "codex",
+        "opencode",
+        "hermes",
+        "gemini",
+        "antigravity",
+        "kiro",
+        "trae",
+        "qoder",
+    ];
+
+    #[test]
+    fn list_target_ids_matches_expected_order_and_count() {
+        assert_eq!(list_target_ids(), ALL_IDS);
+        assert_eq!(all_targets().len(), ALL_IDS.len());
+    }
+
+    #[test]
+    fn every_known_id_resolves_via_get_target() {
+        for id in ALL_IDS {
+            let target = get_target(id);
+            assert!(target.is_some(), "get_target({id:?}) should resolve");
+            assert_eq!(target.unwrap().id().as_str(), *id);
+        }
+    }
+
+    #[test]
+    fn rebranded_lingma_id_does_not_resolve() {
+        // Lingma was folded into Qoder; the stale id must not resolve.
+        assert!(get_target("lingma").is_none());
+    }
+}

@@ -249,10 +249,7 @@ impl AgentTarget for QoderTarget {
             FileAction::NotFound
         };
         WriteResult {
-            files: vec![FileWrite {
-                path: file,
-                action,
-            }],
+            files: vec![FileWrite { path: file, action }],
             notes: Vec::new(),
         }
     }
@@ -450,7 +447,12 @@ mod tests {
 
         // When resolving, Then server mode wins.
         let resolved = qoder_global_mcp_json(&ctx).expect("should resolve");
-        assert_eq!(resolved, server, "server mode must win, got {}", resolved.display());
+        assert_eq!(
+            resolved,
+            server,
+            "server mode must win, got {}",
+            resolved.display()
+        );
 
         let _ = fs::remove_dir_all(base);
     }
@@ -646,7 +648,10 @@ mod tests {
 
         // Then github survives and codegraph is gone.
         let config = read_json_file(&mcp);
-        assert!(config["mcpServers"].get("github").is_some(), "github survives");
+        assert!(
+            config["mcpServers"].get("github").is_some(),
+            "github survives"
+        );
         assert!(
             config["mcpServers"].get("codegraph").is_none(),
             "codegraph removed"
