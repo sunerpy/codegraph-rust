@@ -223,9 +223,10 @@ impl McpServer {
     }
 
     /// Whether the default project is indexed (its `.codegraph/codegraph.db`
-    /// exists). An unindexed workspace serves an EMPTY `tools/list` — absence
-    /// is the one signal an agent can't misread (`hasDefaultCodeGraph` /
-    /// `session.ts:222-231`).
+    /// exists). Tools are ALWAYS served now (#94 / colby #964); this only
+    /// selects the `tools/list` schema variant — projectPath OPTIONAL when a
+    /// default project is resolved, REQUIRED when none is (`hasDefaultCodeGraph`
+    /// / `session.ts:222-231`).
     fn has_default_codegraph(&self) -> bool {
         let Some(project) = &self.default_project else {
             return false;
@@ -372,10 +373,17 @@ impl McpServer {
             "initialized" => Dispatch::Notification,
             "notifications/initialized" => Dispatch::Notification,
             "tools/list" if is_request => Dispatch::Reply(json!({
+                // tools/list ALWAYS exposes the visible tool surface (#94 /
+                // colby #964, PR#966). When a default project is resolved,
+                // projectPath stays OPTIONAL (byte-identical to the golden).
+                // When none is resolved (roots-less client, unindexed cwd),
+                // the SAME tools are listed with projectPath marked required
+                // (#993, PR#1007) so the agent supplies it per call. This
+                // reverses the c450fd95 "empty list when unindexed" behavior.
                 "tools": if self.has_default_codegraph() {
                     schemas::visible_tool_definitions()
                 } else {
-                    Value::Array(Vec::new())
+                    schemas::visible_tool_definitions_requiring_project_path()
                 }
             })),
             "tools/call" if is_request => self.handle_tools_call(req),
