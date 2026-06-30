@@ -167,11 +167,21 @@ automatically):
 }
 ```
 
-**Default (no `-p`):** the MCP server resolves the project from the agent's
-working directory, so one config works for all your projects — each just needs
-to be indexed with `codegraph index`. **Optional `-p <path>` / `--path <path>`:**
-pin the server to one fixed project regardless of cwd (e.g.
+**Default (no `-p`):** `tools/list` always returns the full tool surface, even
+before a project is resolved. When the server resolves a default project — the
+working directory is at or inside an indexed project (find-up), or the client
+sends `rootUri`/`workspaceFolders`/`roots` — all tools work with `projectPath`
+optional, so one config works for all your projects (each just needs to be
+indexed with `codegraph index`). When it cannot resolve one (a roots-less client
+launched from a fixed directory not inside any project, e.g. a shared global
+config using the home directory as cwd), tools are still listed but `projectPath`
+is marked required in each tool's schema; the agent must then pass it per call.
+**Optional `-p <path>` / `--path <path>`:** pin the server to one fixed project
+regardless of cwd — the simpler choice for single-project setups (e.g.
 `"args": ["serve", "--mcp", "-p", "/abs/path/to/project"]`).
+
+See [`docs/mcp.md`](docs/mcp.md#project-resolution) for the full three-case
+breakdown.
 
 Supported agents: Claude Code, Cursor, Codex CLI, opencode, Hermes Agent,
 Gemini CLI, Antigravity IDE, Kiro.
