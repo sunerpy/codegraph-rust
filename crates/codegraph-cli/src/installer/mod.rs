@@ -13,6 +13,7 @@ mod shared;
 pub mod skill;
 mod targets;
 mod types;
+mod vscode_user;
 
 use std::path::PathBuf;
 

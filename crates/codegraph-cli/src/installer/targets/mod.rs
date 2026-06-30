@@ -8,3 +8,5 @@ pub mod gemini;
 pub mod hermes;
 pub mod kiro;
 pub mod opencode;
+pub mod qoder;
+pub mod trae;

@@ -3,14 +3,15 @@
 //!
 //! Order is load-bearing: it is the order in `--target=all`, in detection, and
 //! in `--print-config`'s help listing. Matches `ALL_TARGETS` (registry.ts:20):
-//! claude, cursor, codex, opencode, hermes, gemini, antigravity, kiro.
+//! claude, cursor, codex, opencode, hermes, gemini, antigravity, kiro, trae,
+//! qoder.
 
 use anyhow::{bail, Result};
 
 use super::targets::{
     antigravity::ANTIGRAVITY_TARGET, claude::CLAUDE_TARGET, codex::CODEX_TARGET,
     cursor::CURSOR_TARGET, gemini::GEMINI_TARGET, hermes::HERMES_TARGET, kiro::KIRO_TARGET,
-    opencode::OPENCODE_TARGET,
+    opencode::OPENCODE_TARGET, qoder::QODER_TARGET, trae::TRAE_TARGET,
 };
 use super::types::{AgentTarget, DetectionResult, InstallContext, Location};
 
@@ -24,6 +25,8 @@ pub fn all_targets() -> Vec<&'static dyn AgentTarget> {
         &GEMINI_TARGET,
         &ANTIGRAVITY_TARGET,
         &KIRO_TARGET,
+        &TRAE_TARGET,
+        &QODER_TARGET,
     ]
 }
 
