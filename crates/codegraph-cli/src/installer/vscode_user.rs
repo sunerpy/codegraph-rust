@@ -23,7 +23,12 @@ use super::types::InstallContext;
 /// - else (Linux/Unix) → `xdg` (ignored when empty) else `home/.config`
 // `dead_code`: the T1 foundation helper; wired by the T2 Trae target.
 #[allow(dead_code)]
-pub fn config_base_for(home: &Path, app_data: Option<&Path>, xdg: Option<&Path>, os: &str) -> PathBuf {
+pub fn config_base_for(
+    home: &Path,
+    app_data: Option<&Path>,
+    xdg: Option<&Path>,
+    os: &str,
+) -> PathBuf {
     match os {
         "macos" => home.join("Library").join("Application Support"),
         "windows" => app_data

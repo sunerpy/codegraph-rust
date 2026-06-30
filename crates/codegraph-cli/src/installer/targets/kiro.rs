@@ -35,17 +35,17 @@ fn steering_path(ctx: &InstallContext, loc: Location) -> PathBuf {
     config_dir(ctx, loc).join("steering").join("codegraph.md")
 }
 
-const KIRO_GLOBAL_WHY: &str = "Kiro is project-scoped, so a global install is intentionally NOT written: Kiro CLI does not expand ${workspaceFolder} in mcp.json args, so a global --path would resolve to a literal, broken directory.";
-const KIRO_GLOBAL_HOWTO: &str = "Install per project instead — cd into each project root, then run `codegraph install --target=kiro --local` (writes that project's absolute --path). Repeat for every project you open in Kiro.";
+const KIRO_GLOBAL_WHY: &str = "The global Kiro entry is read-only off any existing index — tools list and the agent passes projectPath per call (since v0.21.0).";
+const KIRO_GLOBAL_HOWTO: &str = "For LIVE auto-update (watcher) run `codegraph init --target=kiro` in each project (writes the project's absolute --path).";
 
 /// Build the project-local Kiro MCP entry with an explicit `--path = ctx.cwd`.
 ///
 /// Kiro's `initialize` carries no `rootUri`/`workspaceFolders` and does not
 /// advertise `capabilities.roots`, so a bare `serve --mcp` cannot discover the
 /// project and degrades to home safe mode. Pinning the concrete project root
-/// fixes that. Only Local installs write an entry: Kiro CLI does not expand
-/// `${workspaceFolder}`, so a global `--path` variable would resolve to a
-/// literal, non-existent directory (the watcher/sync then fail on it).
+/// fixes that. The global install instead writes a bare `serve --mcp` entry that
+/// is read-only off any existing index (the agent passes projectPath per call);
+/// for live auto-update run `codegraph init --target=kiro` per project.
 fn build_kiro_local_mcp_config(ctx: &InstallContext) -> Value {
     let mut base = mcp_server_config();
     if let Some(args) = base.get_mut("args").and_then(|a| a.as_array_mut()) {
@@ -138,7 +138,15 @@ impl AgentTarget for KiroTarget {
                 );
                 format!("# Add to {}\n\n{snippet}\n", target.display())
             }
-            Location::Global => format!("# {KIRO_GLOBAL_WHY}\n# {KIRO_GLOBAL_HOWTO}\n"),
+            Location::Global => {
+                let target = mcp_json_path(ctx, loc);
+                let snippet =
+                    to_upstream_json(&json!({ "mcpServers": { "codegraph": mcp_server_config() } }));
+                format!(
+                    "# Add to {}\n# {KIRO_GLOBAL_WHY}\n# {KIRO_GLOBAL_HOWTO}\n\n{snippet}\n",
+                    target.display()
+                )
+            }
         }
     }
 
@@ -153,19 +161,20 @@ impl AgentTarget for KiroTarget {
 
 // Ports writeMcpEntry (kiro.ts:131).
 //
-// Global installs intentionally write NO entry: Kiro CLI does not expand
-// ${workspaceFolder}, so a global --path is broken. A global install instead
-// self-heals — it removes any stale codegraph entry a prior version wrote — and
-// the caller emits per-project guidance. Only Local installs write the entry.
+// Both locations write `mcpServers.codegraph`. Local pins an absolute `--path`
+// so the watcher resolves the project; Global writes a bare `serve --mcp` entry
+// (no `--path`) — it serves tools read-only off any existing index and the agent
+// passes projectPath per call (v0.21.0). For live auto-update run
+// `codegraph init --target=kiro` per project.
 fn write_mcp_entry(ctx: &InstallContext, loc: Location) -> FileWrite {
     let file = mcp_json_path(ctx, loc);
-    if loc == Location::Global {
-        return remove_global_codegraph_entry(file);
-    }
     if let Some(dir) = file.parent() {
         let _ = fs::create_dir_all(dir);
     }
-    let after = build_kiro_local_mcp_config(ctx);
+    let after = match loc {
+        Location::Local => build_kiro_local_mcp_config(ctx),
+        Location::Global => mcp_server_config(),
+    };
     match read_config_file(&file) {
         ConfigRead::Unparseable => FileWrite {
             path: file,
@@ -184,22 +193,6 @@ fn write_mcp_entry(ctx: &InstallContext, loc: Location) -> FileWrite {
             let action = upsert_nested_key_jsonc(&file, "mcpServers", "codegraph", &after, None)
                 .unwrap_or(FileAction::Skipped);
             FileWrite { path: file, action }
-        }
-    }
-}
-
-fn remove_global_codegraph_entry(file: PathBuf) -> FileWrite {
-    let mut config = read_json_file(&file);
-    if remove_codegraph_from_mcp_servers(&mut config) {
-        let _ = write_json_file(&file, &config);
-        FileWrite {
-            path: file,
-            action: FileAction::Removed,
-        }
-    } else {
-        FileWrite {
-            path: file,
-            action: FileAction::Skipped,
         }
     }
 }
@@ -278,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn kiro_global_install_writes_no_mcp_entry_and_emits_local_guidance() {
+    fn kiro_global_install_writes_bare_mcp_entry_without_path() {
         // Given a global Kiro install into a temp HOME with no prior config
         let home = std::env::temp_dir().join(format!("cg-kiro-global-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
@@ -300,20 +293,32 @@ mod tests {
             },
         );
 
-        // Then no codegraph MCP entry is written to the global mcp.json
+        // Then the global mcp.json now carries a BARE codegraph entry (no --path)
         let mcp = home.join(".kiro").join("settings").join("mcp.json");
-        let written = std::fs::read_to_string(&mcp).unwrap_or_default();
-        assert!(
-            !written.contains("codegraph"),
-            "global install must not write a codegraph entry, got: {written}"
+        let config = read_json_file(&mcp);
+        let args = config["mcpServers"]["codegraph"]["args"]
+            .as_array()
+            .expect("global codegraph args array");
+        assert_eq!(
+            args,
+            &vec![json!("serve"), json!("--mcp")],
+            "global install must write a bare `serve --mcp` entry with no --path"
         );
-        // And the user is told to install per project
+        assert!(
+            !args.iter().any(|a| a == &json!("--path")),
+            "global entry must NOT contain --path"
+        );
+        // And the notes describe the read-only reality + the per-project live-watch path
+        assert!(
+            result.notes.iter().any(|n| n.contains("read-only")),
+            "global install must explain the entry is read-only"
+        );
         assert!(
             result
                 .notes
                 .iter()
-                .any(|n| n.contains("--target=kiro --local")),
-            "global install must emit per-project guidance"
+                .any(|n| n.contains("codegraph init --target=kiro")),
+            "global install must point at `codegraph init --target=kiro` for live auto-update"
         );
 
         let _ = std::fs::remove_dir_all(&home);
