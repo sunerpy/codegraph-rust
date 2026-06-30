@@ -21,8 +21,6 @@ use super::types::InstallContext;
 /// - macOS → `home/Library/Application Support`
 /// - Windows → `app_data` (ignored when empty) else `home/AppData/Roaming`
 /// - else (Linux/Unix) → `xdg` (ignored when empty) else `home/.config`
-// `dead_code`: the T1 foundation helper; wired by the T2 Trae target.
-#[allow(dead_code)]
 pub fn config_base_for(
     home: &Path,
     app_data: Option<&Path>,
@@ -45,8 +43,6 @@ pub fn config_base_for(
 /// The VS Code DESKTOP `User/mcp.json` path for an app (e.g. Trae desktop):
 /// `<config_base>/<app_name>/User/mcp.json`. Resolves the base via
 /// [`config_base_for`] using the live platform.
-// `dead_code`: the T1 foundation helper; wired by the T2 Trae target.
-#[allow(dead_code)]
 pub fn vscode_user_mcp_json(ctx: &InstallContext, app_name: &str) -> PathBuf {
     config_base_for(
         &ctx.home,

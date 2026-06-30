@@ -140,8 +140,9 @@ impl AgentTarget for KiroTarget {
             }
             Location::Global => {
                 let target = mcp_json_path(ctx, loc);
-                let snippet =
-                    to_upstream_json(&json!({ "mcpServers": { "codegraph": mcp_server_config() } }));
+                let snippet = to_upstream_json(
+                    &json!({ "mcpServers": { "codegraph": mcp_server_config() } }),
+                );
                 format!(
                     "# Add to {}\n# {KIRO_GLOBAL_WHY}\n# {KIRO_GLOBAL_HOWTO}\n\n{snippet}\n",
                     target.display()
