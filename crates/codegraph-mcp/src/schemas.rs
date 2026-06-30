@@ -97,6 +97,48 @@ pub fn is_known_tool(name: &str) -> bool {
     TOOL_NAMES.contains(&name)
 }
 
+/// Clone `tools` and ensure every tool's `inputSchema.required` array contains
+/// `"projectPath"`. Used when no default project is resolved so a roots-less
+/// client's agent is nudged to supply the path per call. Ports colby
+/// `withRequiredProjectPath` (`tools.ts:736-746`, #993 / PR#1007). Pure +
+/// idempotent: applying twice equals applying once (never duplicates
+/// `"projectPath"`). Does NOT mutate the embedded `tools_list.json` or the
+/// caller's value — operates on a clone.
+fn with_required_project_path(tools: Value) -> Value {
+    let Value::Array(arr) = tools else {
+        return tools;
+    };
+    let mapped: Vec<Value> = arr
+        .into_iter()
+        .map(|mut tool| {
+            if let Some(schema) = tool.get_mut("inputSchema").and_then(Value::as_object_mut) {
+                match schema.get_mut("required").and_then(Value::as_array_mut) {
+                    Some(required) => {
+                        if !required.iter().any(|v| v == "projectPath") {
+                            required.push(Value::String("projectPath".to_string()));
+                        }
+                    }
+                    None => {
+                        schema.insert(
+                            "required".to_string(),
+                            Value::Array(vec![Value::String("projectPath".to_string())]),
+                        );
+                    }
+                }
+            }
+            tool
+        })
+        .collect();
+    Value::Array(mapped)
+}
+
+/// The visible tool surface with `projectPath` marked required in every tool's
+/// `inputSchema.required` — served when no default project is resolved (#94 /
+/// colby #964 always-expose + #993 required-projectPath).
+pub fn visible_tool_definitions_requiring_project_path() -> Value {
+    with_required_project_path(visible_tool_definitions())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,6 +176,80 @@ mod tests {
             assert!(
                 !arr.iter().any(|t| t["name"] == forbidden),
                 "{forbidden} must NOT exist in the pinned snapshot"
+            );
+        }
+    }
+
+    fn required_of<'a>(tools: &'a Value, name: &str) -> &'a Vec<Value> {
+        tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name} present"))["inputSchema"]["required"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{name} has a required array"))
+    }
+
+    #[test]
+    fn with_required_project_path_covers_all_three_shapes() {
+        let fixture = serde_json::json!([
+            { "name": "with_keys", "inputSchema": { "type": "object", "required": ["query"] } },
+            { "name": "empty", "inputSchema": { "type": "object", "required": [] } },
+            { "name": "absent", "inputSchema": { "type": "object" } }
+        ]);
+        let out = with_required_project_path(fixture);
+
+        let with_keys = required_of(&out, "with_keys");
+        assert!(with_keys.iter().any(|v| v == "query"), "keeps existing key");
+        assert!(with_keys.iter().any(|v| v == "projectPath"), "appends");
+
+        assert_eq!(
+            required_of(&out, "empty"),
+            &vec![Value::String("projectPath".to_string())],
+            "empty required gains projectPath"
+        );
+        assert_eq!(
+            required_of(&out, "absent"),
+            &vec![Value::String("projectPath".to_string())],
+            "absent required key is inserted as [\"projectPath\"]"
+        );
+    }
+
+    #[test]
+    fn with_required_project_path_is_idempotent() {
+        let once = with_required_project_path(visible_tool_definitions());
+        let twice = with_required_project_path(once.clone());
+        assert_eq!(once, twice, "applying twice equals applying once");
+        for tool in twice.as_array().unwrap() {
+            let count = tool["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|v| *v == "projectPath")
+                .count();
+            assert_eq!(count, 1, "no duplicate projectPath in {}", tool["name"]);
+        }
+    }
+
+    #[test]
+    fn visible_definitions_unchanged_by_required_transform() {
+        let plain = visible_tool_definitions();
+        let _ = visible_tool_definitions_requiring_project_path();
+        assert_eq!(
+            plain,
+            visible_tool_definitions(),
+            "the transform must not mutate the embedded definitions"
+        );
+        for tool in plain.as_array().unwrap() {
+            let has_pp = tool["inputSchema"]["required"]
+                .as_array()
+                .map(|r| r.iter().any(|v| v == "projectPath"))
+                .unwrap_or(false);
+            assert!(
+                !has_pp,
+                "plain visible tool {} keeps projectPath OPTIONAL",
+                tool["name"]
             );
         }
     }

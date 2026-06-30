@@ -257,10 +257,11 @@ fn tools_list_matches_upstream_names_and_schemas() {
 }
 
 #[test]
-fn tools_list_is_empty_when_workspace_not_indexed() {
-    // Unindexed workspace (no .codegraph/codegraph.db) serves an EMPTY tool
-    // list (c450fd95 / session.ts:222). Absence is the signal an agent can't
-    // misread — listing tools that all fail teaches it codegraph is broken.
+fn tools_list_exposed_with_required_project_path_when_workspace_not_indexed() {
+    // Unindexed workspace (no .codegraph/codegraph.db) STILL serves the full
+    // tool surface (#94 / colby #964, PR#966 — reverses c450fd95). Each tool's
+    // inputSchema.required gains "projectPath" (#993, PR#1007) so a roots-less
+    // client's agent supplies it per call instead of seeing 0 tools.
     let base = std::env::temp_dir().join(format!(
         "cg-mcp-noidx-{}-{}",
         std::process::id(),
@@ -275,11 +276,24 @@ fn tools_list_is_empty_when_workspace_not_indexed() {
         json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
     );
     let _ = fs::remove_dir_all(&base);
+    let tools = resp["result"]["tools"]
+        .as_array()
+        .expect("tools is an array");
     assert_eq!(
-        resp["result"]["tools"].as_array().map(Vec::len),
-        Some(0),
-        "unindexed workspace must serve empty tools/list"
+        tools.len(),
+        4,
+        "unindexed workspace must still expose the 4-tool default surface"
     );
+    for tool in tools {
+        let required = tool["inputSchema"]["required"]
+            .as_array()
+            .unwrap_or_else(|| panic!("tool {} has a required array", tool["name"]));
+        assert!(
+            required.iter().any(|v| v == "projectPath"),
+            "tool {} must mark projectPath required when unindexed",
+            tool["name"]
+        );
+    }
 }
 
 #[test]
@@ -308,17 +322,32 @@ fn default_project_indexed_serves_full_tools_list_after_initialize() {
     let text = String::from_utf8(output).expect("utf8 output");
     let tools_line = text.lines().nth(1).expect("tools/list response line");
     let resp: Value = serde_json::from_str(tools_line).expect("response json");
+    let tools = resp["result"]["tools"]
+        .as_array()
+        .expect("tools is an array");
     assert_eq!(
-        resp["result"]["tools"].as_array().map(Vec::len),
-        Some(4),
+        tools.len(),
+        4,
         "indexed default project must serve the 4-tool default surface"
     );
+    for tool in tools {
+        let has_pp = tool["inputSchema"]["required"]
+            .as_array()
+            .map(|r| r.iter().any(|v| v == "projectPath"))
+            .unwrap_or(false);
+        assert!(
+            !has_pp,
+            "indexed default keeps projectPath OPTIONAL for {} (byte-identical to golden)",
+            tool["name"]
+        );
+    }
 }
 
 #[test]
-fn default_project_unindexed_serves_empty_tools_list() {
+fn default_project_unindexed_serves_tools_with_required_project_path() {
     // The non-bailing cwd default still starts the server for an unindexed root;
-    // it must serve an EMPTY tools/list (upstream parity, golden-pinned).
+    // it now serves the full tool surface with projectPath marked required
+    // (#94 / colby #964/#993 — reverses the golden-pinned c450fd95 empty list).
     let base = std::env::temp_dir().join(format!(
         "cg-mcp-default-noidx-{}-{}",
         std::process::id(),
@@ -349,11 +378,67 @@ fn default_project_unindexed_serves_empty_tools_list() {
     let text = String::from_utf8(output).expect("utf8 output");
     let line = text.lines().next().expect("one response line");
     let resp: Value = serde_json::from_str(line).expect("response json");
+    let tools = resp["result"]["tools"]
+        .as_array()
+        .expect("tools is an array");
     assert_eq!(
-        resp["result"]["tools"].as_array().map(Vec::len),
-        Some(0),
-        "unindexed default project must serve empty tools/list"
+        tools.len(),
+        4,
+        "unindexed default project must still expose the 4-tool default surface"
     );
+    for tool in tools {
+        let required = tool["inputSchema"]["required"]
+            .as_array()
+            .unwrap_or_else(|| panic!("tool {} has a required array", tool["name"]));
+        assert!(
+            required.iter().any(|v| v == "projectPath"),
+            "tool {} must mark projectPath required when default project unindexed",
+            tool["name"]
+        );
+    }
+}
+
+#[test]
+fn no_default_project_exposes_tools_with_required_project_path() {
+    // Issue #94 (通义灵码/Lingma): a roots-less client launches `serve --mcp`
+    // with no `-p` and no default project ever resolves (McpServer::new(None)).
+    // The always-expose forward-port (colby #964) means tools/list STILL lists
+    // the 4-tool default surface; the projectPath-required forward-port (colby
+    // #993) marks projectPath required in each schema so the agent supplies it.
+    let _env = lock_env();
+    let mut output = Vec::new();
+    let mut server = McpServer::new(None);
+    let frames = format!(
+        "{}\n{}\n",
+        serde_json::to_string(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}))
+            .unwrap(),
+        serde_json::to_string(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}))
+            .unwrap(),
+    );
+    server
+        .run(Cursor::new(frames.into_bytes()), &mut output)
+        .expect("server run");
+    let text = String::from_utf8(output).expect("utf8 output");
+    let tools_line = text.lines().nth(1).expect("tools/list response line");
+    let resp: Value = serde_json::from_str(tools_line).expect("response json");
+    let tools = resp["result"]["tools"]
+        .as_array()
+        .expect("tools is an array");
+    assert_eq!(
+        tools.len(),
+        4,
+        "no-default project must still expose the 4-tool default surface (#94 / colby #964)"
+    );
+    for tool in tools {
+        let required = tool["inputSchema"]["required"]
+            .as_array()
+            .unwrap_or_else(|| panic!("tool {} has a required array", tool["name"]));
+        assert!(
+            required.iter().any(|v| v == "projectPath"),
+            "tool {} must mark projectPath required when no default project (#94 / colby #993)",
+            tool["name"]
+        );
+    }
 }
 
 #[test]

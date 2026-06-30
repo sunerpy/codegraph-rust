@@ -27,10 +27,17 @@ it automatically:
 }
 ```
 
-**Default (no `-p`):** the MCP server resolves the project from the agent's
-working directory, so one config works for all your projects — each just needs
-to be indexed with `codegraph index`. **Optional `-p <path>` / `--path <path>`:**
-pin the server to one fixed project regardless of cwd (e.g.
+**Default (no `-p`):** `tools/list` always returns the full tool surface, even
+before a project is resolved. When the server resolves a default project — the
+working directory is at or inside an indexed project (find-up), or the client
+sends `rootUri`/`workspaceFolders`/`roots` — all tools work with `projectPath`
+optional. When it cannot resolve one (a roots-less client launched from a fixed
+directory that is not inside any project, e.g. a shared global config using the
+home directory as cwd), tools are still listed but `projectPath` is marked
+required in each tool's schema; the agent must then pass it per call. See
+[Project resolution](#project-resolution) for the full three-case breakdown.
+**Optional `-p <path>` / `--path <path>`:** pin the server to one fixed project
+regardless of cwd (e.g.
 `"args": ["serve", "--mcp", "-p", "/abs/path/to/project"]`).
 
 Supported agents: Claude Code, Cursor, Codex CLI, opencode, Hermes Agent,
@@ -141,14 +148,46 @@ do not support roots, pin the root via `--path <project>` in the client's MCP
 config args (e.g. a workspace-level `.kiro/settings/mcp.json`), or open the
 project folder as the working directory.
 
-When `serve --mcp` is started without an explicit `--path`, the server reads the
-MCP `initialize` handshake sent by the client and adopts the workspace it
-advertises (`rootUri`, `rootPath`, or `workspaceFolders[0].uri`) as its project
-root — provided that path is already indexed. If the client does not include
-those fields but advertises `capabilities.roots`, the server asks the client for
-`roots/list` and adopts the first indexed root from that response. This means a
-single global MCP config (one `serve --mcp` entry, no `--path`) correctly serves
-whichever project window is connected, without any per-project config.
+---
+
+## Project resolution
+
+`tools/list` **always** returns the full default tool surface (4 tools by
+default, or the `CODEGRAPH_MCP_TOOLS` allowlist). What changes depending on
+whether a default project was resolved is which tool parameters are required:
+
+- **`projectPath` optional** — the server resolved a default project. Tools just
+  work with no per-call path argument.
+- **`projectPath` required** — no default project was resolved. Tools are still
+  listed, but the schema marks `projectPath` required on every tool so the
+  agent knows to supply it per call. You can also pin a single project with
+  `-p`/`--path` instead.
+
+The server resolves a default project by walking three sources in order:
+
+1. **`--path` flag** — explicit pin; always wins.
+2. **find-up from cwd** — ascends from the working directory to the nearest
+   `.codegraph/` directory. A cwd at or inside an indexed project resolves it
+   here, and `projectPath` is optional.
+3. **MCP `initialize` handshake** — if find-up yields nothing, the server reads
+   the `initialize` message sent by the client and adopts the workspace it
+   advertises (`rootUri`, `rootPath`, or `workspaceFolders[0].uri`) — provided
+   that path is already indexed. If the client does not include those fields but
+   advertises `capabilities.roots`, the server sends a `roots/list` request and
+   adopts the first indexed root from the response.
+
+If all three sources yield nothing, the server serves the full tool list with
+`projectPath` marked required. This is the case for roots-less clients that use
+a fixed launch directory not inside any project — for example, 通义灵码/Lingma
+configured with a single global MCP entry whose working directory is the home
+directory. In that scenario the tools are listed and the agent can still call
+them by passing an explicit `projectPath`; for single-project setups, pinning
+`-p /path/to/project` in the MCP config args is the simpler alternative.
+
+> **Note:** the home-directory / filesystem-root guard (see [Daemon & live watch]
+> above) also skips the normal watcher and catch-up sync for those paths. A real
+> project nested under `$HOME` (e.g. `~/projects/myapp`) is unaffected — it is
+> resolved via find-up and gets the full daemon and watcher.
 
 The daemon exits automatically after all clients disconnect and an idle timeout
 elapses. Logs are appended to `.codegraph/daemon.log`. A stale lock (e.g. after
