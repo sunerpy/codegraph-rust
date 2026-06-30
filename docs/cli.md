@@ -149,9 +149,10 @@ codegraph skill status                                  # report state for all d
 codegraph skill status    --target=all                  # report state for every agent
 ```
 
-All eight supported agents have a skill directory. `--target` accepts the same
+All ten supported agents have a skill directory. `--target` accepts the same
 agent ids as `codegraph install` (`claude`, `cursor`, `codex`, `opencode`,
-`hermes`, `gemini`, `antigravity`, `kiro`) plus `auto`, `all`, and `none`.
+`hermes`, `gemini`, `antigravity`, `kiro`, `trae`, `qoder`) plus `auto`, `all`,
+and `none`.
 Default location is `--global`; pass `--local` to write into the project tree.
 Hermes supports global only (no automatic project-scope for skills).
 
@@ -167,6 +168,8 @@ Hermes supports global only (no automatic project-scope for skills).
 | gemini      | `~/.gemini/skills/codegraph/`         | `.gemini/skills/codegraph/`  |
 | antigravity | `~/.gemini/config/skills/codegraph/`  | `.agents/skills/codegraph/`  |
 | kiro        | `~/.kiro/skills/codegraph/`           | `.kiro/skills/codegraph/`    |
+| trae        | `Trae/User/skills/codegraph/`         | `.trae/skills/codegraph/`    |
+| qoder       | `~/.agents/skills/codegraph/`         | `.qoder/skills/codegraph/`   |
 
 Note: opencode uses the singular `skill/` directory name (not `skills/`).
 Codex and Antigravity share `.agents/skills/` for local installs — writing both
