@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.21.0](https://github.com/sunerpy/codegraph-rust/compare/v0.20.1...v0.21.0) (2026-06-30)
+
+
+### Features
+
+* **mcp:** always expose tools and require projectPath when no default project ([#94](https://github.com/sunerpy/codegraph-rust/issues/94)) ([#95](https://github.com/sunerpy/codegraph-rust/issues/95)) ([f4ec1bc](https://github.com/sunerpy/codegraph-rust/commit/f4ec1bc8e95bf728023fc8a7de835e511d9afd16))
+
 ## [0.20.1](https://github.com/sunerpy/codegraph-rust/compare/v0.20.0...v0.20.1) (2026-06-28)
 
 
