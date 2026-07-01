@@ -506,6 +506,7 @@ pub enum ReferenceSubkind {
     GroupMember,
     SignalMethod,
     GdscriptLoadPath,
+    Autoload,
 }
 
 impl ReferenceSubkind {
@@ -517,6 +518,7 @@ impl ReferenceSubkind {
             Self::GroupMember => "group_member",
             Self::SignalMethod => "signal_method",
             Self::GdscriptLoadPath => "gdscript_load_path",
+            Self::Autoload => "autoload",
         }
     }
 }

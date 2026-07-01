@@ -90,6 +90,13 @@ fn run_pipeline(test_name: &str, root: &Path, relative_files: &[&str]) -> Store 
 
 const PLAIN_RESOURCE: &str = "[gd_resource type=\"Resource\" format=3]\n\n[resource]\n";
 const PROJECT_GODOT: &str = "config_version=5\n\n[application]\nconfig/name=\"Audit Fixture\"\n";
+/// A `project.godot` with an `[autoload]` singleton pointing at a script; kept
+/// separate from the autoload-free `PROJECT_GODOT` that sibling tests reuse.
+const PROJECT_GODOT_AUTOLOAD: &str =
+    "config_version=5\n\n[autoload]\nBuffManager=\"*res://buff_manager.gd\"\n";
+/// A `project.godot` whose only resource ref is a `run/main_scene` path.
+const PROJECT_GODOT_MAIN_SCENE: &str =
+    "config_version=5\n\n[application]\nrun/main_scene=\"res://main.tscn\"\n";
 
 /// A `.gd` script exposing one handler method, and a `.tscn` that binds the
 /// script to its root node and wires a `pressed` signal to that handler via a
@@ -472,6 +479,66 @@ fn orphan_detection_unchanged_by_the_dangling_narrowing() {
     assert!(
         !orphans.iter().any(|o| o.file_path == "target.tres"),
         "orphan output must be unchanged by the dangling narrowing, got: {orphans:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn autoload_ref_carries_the_autoload_edge_subkind() {
+    // Given a project.godot [autoload] singleton pointing at buff_manager.gd,
+    let dir = unique_dir("autoload-subkind");
+    write(&dir, "project.godot", PROJECT_GODOT_AUTOLOAD);
+    write(
+        &dir,
+        "buff_manager.gd",
+        "extends Node\n\nfunc _ready():\n\tpass\n",
+    );
+    // When impact is computed for the autoloaded script,
+    let store = run_pipeline(
+        "autoload-subkind",
+        &dir,
+        &["project.godot", "buff_manager.gd"],
+    );
+    let impact = GraphTraverser::new(&store)
+        .resource_impact("buff_manager.gd")
+        .expect("impact");
+    // Then the project.godot row surfaces edge_subkind == "autoload".
+    assert!(
+        impact
+            .affected
+            .iter()
+            .any(|a| a.edge_subkind == Some("autoload".to_string())),
+        "autoload edge must carry edge_subkind=autoload, got: {impact:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn main_scene_ref_is_not_tagged_autoload() {
+    // Given a project.godot main_scene ref (NOT an autoload) to main.tscn,
+    let dir = unique_dir("main-scene-not-autoload");
+    write(&dir, "project.godot", PROJECT_GODOT_MAIN_SCENE);
+    write(
+        &dir,
+        "main.tscn",
+        "[gd_scene format=3]\n\n[node name=\"Root\" type=\"Node\"]\n",
+    );
+    // When impact is computed for the main scene,
+    let store = run_pipeline(
+        "main-scene-not-autoload",
+        &dir,
+        &["project.godot", "main.tscn"],
+    );
+    let impact = GraphTraverser::new(&store)
+        .resource_impact("main.tscn")
+        .expect("impact");
+    // Then no row is mistagged as autoload (main-scene shares reference()).
+    assert!(
+        !impact
+            .affected
+            .iter()
+            .any(|a| a.edge_subkind == Some("autoload".to_string())),
+        "main-scene ref must NOT be tagged autoload, got: {impact:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

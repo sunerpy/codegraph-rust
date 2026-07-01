@@ -49,7 +49,7 @@
 //! panics. An empty or sectionless file yields an empty result.
 
 use codegraph_core::node_id::generate_node_id;
-use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
+use codegraph_core::types::{EdgeKind, Language, Node, NodeKind, ReferenceSubkind};
 
 use super::framework_node;
 use super::godot_common::{map_res_path, map_res_path_inner, quoted_strings};
@@ -226,7 +226,7 @@ fn emit_autoload(
     nodes.push(node);
 
     if let Some(target) = map_res_path(value) {
-        references.push(reference(node_id, target, line_no, file_path));
+        references.push(autoload_reference(node_id, target, line_no, file_path));
     }
 }
 
@@ -313,6 +313,27 @@ fn reference(from_node_id: String, target: String, line_no: i64, file_path: &str
         language: Language::GodotProject,
         is_function_ref: false,
         reference_subkind: None,
+    }
+}
+
+/// Like [`reference`] but tags the ref `ReferenceSubkind::Autoload`. The
+/// autoload `project.godot` -> `res://x.gd` ref crosses a language-family
+/// boundary (GodotProject and GDScript both `language_family() == None`), so
+/// `gate_language` drops its resolution and it stays UNRESOLVED; `resource_impact`
+/// then reads the subkind from `reference.reference_subkind` — so tagging the
+/// `RefView` here is the correct and sufficient layer (the resolved-edge
+/// `build_edge_metadata` path never fires for autoload). Used ONLY by
+/// `emit_autoload`; `reference` stays `None` for the main-scene and
+/// enabled-plugin refs that share it.
+fn autoload_reference(
+    from_node_id: String,
+    target: String,
+    line_no: i64,
+    file_path: &str,
+) -> RefView {
+    RefView {
+        reference_subkind: Some(ReferenceSubkind::Autoload),
+        ..reference(from_node_id, target, line_no, file_path)
     }
 }
 

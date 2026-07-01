@@ -1257,6 +1257,7 @@ fn parse_reference_subkind(value: Option<String>) -> rusqlite::Result<Option<Ref
         "group_member" => ReferenceSubkind::GroupMember,
         "signal_method" => ReferenceSubkind::SignalMethod,
         "gdscript_load_path" => ReferenceSubkind::GdscriptLoadPath,
+        "autoload" => ReferenceSubkind::Autoload,
         _ => return Err(enum_error(text, "reference subkind")),
     };
     Ok(Some(subkind))
