@@ -401,6 +401,93 @@ fn audit_verify_plan_groups_open_scenes_for_a_changed_script() {
 }
 
 #[test]
+fn audit_verify_plan_lists_load_resources_for_changed_tres() {
+    // Given the fixture indexed (data.tres references referenced.tres via ExtResource),
+    let (_dir, project) = indexed_project("verify-plan-load-resources");
+    let p = project.to_str().unwrap();
+
+    // When audit --impact referenced.tres --verify-plan --json runs,
+    let (stdout, err, ok) = cli(&[
+        "audit",
+        "--impact",
+        "referenced.tres",
+        "--verify-plan",
+        "--json",
+        "-p",
+        p,
+    ]);
+    assert!(ok, "audit failed: stderr={err}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("audit emits valid JSON");
+
+    // Then the plan lists the .tres resources to load: the affected referrer
+    // data.tres AND the changed referenced.tres itself.
+    let plan = &value["verifyPlan"];
+    let load_resources: Vec<&str> = plan["loadResources"]
+        .as_array()
+        .expect("loadResources array")
+        .iter()
+        .map(|s| s.as_str().expect("res path"))
+        .collect();
+    assert!(
+        !load_resources.is_empty(),
+        "loadResources must be non-empty for a changed .tres, got: {load_resources:?}"
+    );
+    assert!(
+        load_resources.contains(&"res://data.tres"),
+        "the affected referrer data.tres must be in loadResources, got: {load_resources:?}"
+    );
+    assert!(
+        load_resources.contains(&"res://referenced.tres"),
+        "the changed referenced.tres itself must be in loadResources, got: {load_resources:?}"
+    );
+}
+
+#[test]
+fn audit_verify_plan_includes_changed_script_in_load_scripts() {
+    // Given the fixture indexed (main.tscn binds a script = res://player.gd;
+    // player.gd is a .gd referenced only by the .tscn, not by any other .gd),
+    let (_dir, project) = indexed_project("verify-plan-changed-script");
+    let p = project.to_str().unwrap();
+
+    // When audit --impact player.gd --verify-plan --json runs,
+    let (stdout, err, ok) = cli(&[
+        "audit",
+        "--impact",
+        "player.gd",
+        "--verify-plan",
+        "--json",
+        "-p",
+        p,
+    ]);
+    assert!(ok, "audit failed: stderr={err}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("audit emits valid JSON");
+
+    // Then the changed .gd itself is in loadScripts (even though only a .tscn
+    // references it), AND the referencing .tscn is in openScenes.
+    let plan = &value["verifyPlan"];
+    let load_scripts: Vec<&str> = plan["loadScripts"]
+        .as_array()
+        .expect("loadScripts array")
+        .iter()
+        .map(|s| s.as_str().expect("res path"))
+        .collect();
+    assert!(
+        load_scripts.contains(&"res://player.gd"),
+        "the changed player.gd must be seeded into loadScripts, got: {load_scripts:?}"
+    );
+    let open_scenes: Vec<&str> = plan["openScenes"]
+        .as_array()
+        .expect("openScenes array")
+        .iter()
+        .map(|s| s.as_str().expect("res path"))
+        .collect();
+    assert!(
+        open_scenes.contains(&"res://main.tscn"),
+        "main.tscn (which references player.gd) must be in openScenes, got: {open_scenes:?}"
+    );
+}
+
+#[test]
 fn audit_verify_plan_requires_impact() {
     // Given the indexed fixture,
     let (_dir, project) = indexed_project("verify-plan-requires-impact");

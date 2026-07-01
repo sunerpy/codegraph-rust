@@ -90,6 +90,13 @@ fn run_pipeline(test_name: &str, root: &Path, relative_files: &[&str]) -> Store 
 
 const PLAIN_RESOURCE: &str = "[gd_resource type=\"Resource\" format=3]\n\n[resource]\n";
 const PROJECT_GODOT: &str = "config_version=5\n\n[application]\nconfig/name=\"Audit Fixture\"\n";
+/// A `project.godot` with an `[autoload]` singleton pointing at a script; kept
+/// separate from the autoload-free `PROJECT_GODOT` that sibling tests reuse.
+const PROJECT_GODOT_AUTOLOAD: &str =
+    "config_version=5\n\n[autoload]\nBuffManager=\"*res://buff_manager.gd\"\n";
+/// A `project.godot` whose only resource ref is a `run/main_scene` path.
+const PROJECT_GODOT_MAIN_SCENE: &str =
+    "config_version=5\n\n[application]\nrun/main_scene=\"res://main.tscn\"\n";
 
 /// A `.gd` script exposing one handler method, and a `.tscn` that binds the
 /// script to its root node and wires a `pressed` signal to that handler via a
@@ -472,6 +479,146 @@ fn orphan_detection_unchanged_by_the_dangling_narrowing() {
     assert!(
         !orphans.iter().any(|o| o.file_path == "target.tres"),
         "orphan output must be unchanged by the dangling narrowing, got: {orphans:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn autoload_ref_carries_the_autoload_edge_subkind() {
+    // Given a project.godot [autoload] singleton pointing at buff_manager.gd,
+    let dir = unique_dir("autoload-subkind");
+    write(&dir, "project.godot", PROJECT_GODOT_AUTOLOAD);
+    write(
+        &dir,
+        "buff_manager.gd",
+        "extends Node\n\nfunc _ready():\n\tpass\n",
+    );
+    // When impact is computed for the autoloaded script,
+    let store = run_pipeline(
+        "autoload-subkind",
+        &dir,
+        &["project.godot", "buff_manager.gd"],
+    );
+    let impact = GraphTraverser::new(&store)
+        .resource_impact("buff_manager.gd")
+        .expect("impact");
+    // Then the project.godot row surfaces edge_subkind == "autoload".
+    assert!(
+        impact
+            .affected
+            .iter()
+            .any(|a| a.edge_subkind == Some("autoload".to_string())),
+        "autoload edge must carry edge_subkind=autoload, got: {impact:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn main_scene_ref_is_not_tagged_autoload() {
+    // Given a project.godot main_scene ref (NOT an autoload) to main.tscn,
+    let dir = unique_dir("main-scene-not-autoload");
+    write(&dir, "project.godot", PROJECT_GODOT_MAIN_SCENE);
+    write(
+        &dir,
+        "main.tscn",
+        "[gd_scene format=3]\n\n[node name=\"Root\" type=\"Node\"]\n",
+    );
+    // When impact is computed for the main scene,
+    let store = run_pipeline(
+        "main-scene-not-autoload",
+        &dir,
+        &["project.godot", "main.tscn"],
+    );
+    let impact = GraphTraverser::new(&store)
+        .resource_impact("main.tscn")
+        .expect("impact");
+    // Then no row is mistagged as autoload (main-scene shares reference()).
+    assert!(
+        !impact
+            .affected
+            .iter()
+            .any(|a| a.edge_subkind == Some("autoload".to_string())),
+        "main-scene ref must NOT be tagged autoload, got: {impact:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn impact_surfaces_gdscript_preload_via_imports_edge() {
+    // Given a .gd that `preload`s another .gd (a resolved `imports` edge tagged
+    // gdscript_load_path by the walker),
+    let dir = unique_dir("impact-preload-imports");
+    write(&dir, "project.godot", PROJECT_GODOT);
+    write(&dir, "scripts/x.gd", "extends Node\n\nfunc go():\n\tpass\n");
+    write(
+        &dir,
+        "loader.gd",
+        "extends Node\n\nconst X = preload(\"res://scripts/x.gd\")\n",
+    );
+    // When impact is computed for the preloaded script,
+    let store = run_pipeline(
+        "impact-preload-imports",
+        &dir,
+        &["project.godot", "scripts/x.gd", "loader.gd"],
+    );
+    let impact = GraphTraverser::new(&store)
+        .resource_impact("scripts/x.gd")
+        .expect("impact");
+    // Then the preloading site surfaces as an `imports` edge carrying the
+    // gdscript_load_path subkind (previously excluded from resource_impact).
+    let row = impact
+        .affected
+        .iter()
+        .find(|a| a.from_file == "loader.gd")
+        .unwrap_or_else(|| panic!("expected loader.gd in impact, got: {impact:?}"));
+    assert_eq!(
+        row.edge_kind, "imports",
+        "preload must surface as an imports edge, got: {row:?}"
+    );
+    assert_eq!(
+        row.edge_subkind,
+        Some("gdscript_load_path".to_string()),
+        "imports edge must carry the gdscript_load_path subkind, got: {row:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn impact_surfaces_gdscript_extends_path_via_extends_edge() {
+    // Given a .gd that `extends "res://base.gd"` (a resolved `extends` edge
+    // tagged gdscript_load_path by the walker),
+    let dir = unique_dir("impact-extends-path");
+    write(&dir, "project.godot", PROJECT_GODOT);
+    write(&dir, "base.gd", "extends Node\n\nfunc base_fn():\n\tpass\n");
+    write(
+        &dir,
+        "child.gd",
+        "extends \"res://base.gd\"\n\nfunc go():\n\tpass\n",
+    );
+    // When impact is computed for the base script,
+    let store = run_pipeline(
+        "impact-extends-path",
+        &dir,
+        &["project.godot", "base.gd", "child.gd"],
+    );
+    let impact = GraphTraverser::new(&store)
+        .resource_impact("base.gd")
+        .expect("impact");
+    // Then the extending site surfaces as an `extends` edge carrying the
+    // gdscript_load_path subkind (previously excluded from resource_impact).
+    let row = impact
+        .affected
+        .iter()
+        .find(|a| a.from_file == "child.gd")
+        .unwrap_or_else(|| panic!("expected child.gd in impact, got: {impact:?}"));
+    assert_eq!(
+        row.edge_kind, "extends",
+        "extends-path must surface as an extends edge, got: {row:?}"
+    );
+    assert_eq!(
+        row.edge_subkind,
+        Some("gdscript_load_path".to_string()),
+        "extends edge must carry the gdscript_load_path subkind, got: {row:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

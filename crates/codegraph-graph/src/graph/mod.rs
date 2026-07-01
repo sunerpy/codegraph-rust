@@ -1072,7 +1072,13 @@ impl<'store> GraphTraverser<'store> {
 
         let file_id = codegraph_core::node_id::file_node_id(&changed);
         for edge in self.store.edges_by_target_kind(&file_id, None)? {
-            if !matches!(edge.kind, EdgeKind::References | EdgeKind::Instantiates) {
+            if !matches!(
+                edge.kind,
+                EdgeKind::References
+                    | EdgeKind::Instantiates
+                    | EdgeKind::Imports
+                    | EdgeKind::Extends
+            ) {
                 continue;
             }
             if let Some(source) = self.store.node_by_id(&edge.source)? {
