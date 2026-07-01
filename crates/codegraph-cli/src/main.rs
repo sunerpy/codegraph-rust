@@ -1044,7 +1044,7 @@ fn cmd_query(
         .transpose()?
         .into_iter()
         .collect();
-    let results = search_nodes(
+    let mut results = search_nodes(
         &store,
         &search,
         &SearchOptions {
@@ -1055,6 +1055,14 @@ fn cmd_query(
         },
         &project_name_tokens(&project),
     )?;
+    if results.iter().all(|r| r.node.name != search) {
+        if let Some(resolved) = resolve_gdscript_class_member(&store, &search)? {
+            results = resolved
+                .into_iter()
+                .map(|node| SearchResult { node, score: 1.0 })
+                .collect();
+        }
+    }
     if json_output {
         let output = results.iter().map(SearchOutput::from).collect::<Vec<_>>();
         print_json_pretty(&output)?;
@@ -2817,7 +2825,78 @@ fn symbol_matches(store: &Store, project: &Path, symbol: &str) -> Result<Vec<Nod
         },
         &project_name_tokens(project),
     )?;
-    Ok(results.into_iter().map(|r| r.node).collect())
+    let nodes: Vec<Node> = results.into_iter().map(|r| r.node).collect();
+    // GDScript `ClassName.member` qualified-name fallback: when the normal
+    // search found no node whose exact `name` equals the queried `symbol` and
+    // `symbol` is shaped `<Recv>.<member>`, try to resolve the dotted form to
+    // the same `Function` node the short name resolves to. GDScript
+    // `class_name X` globals are NOT pushed on the extractor's node stack, so
+    // a class method stores `name == qualified_name == <member>` and no dotted
+    // node exists — this mirrors the committed T2 resolver
+    // (`godot::resolve_class_member`). Returns the resolved nodes directly so
+    // callers/impact/query all resolve the dotted form to the exact target.
+    if nodes.iter().all(|n| n.name != symbol) {
+        if let Some(resolved) = resolve_gdscript_class_member(store, symbol)? {
+            if !resolved.is_empty() {
+                return Ok(resolved);
+            }
+        }
+    }
+    Ok(nodes)
+}
+
+/// Resolve a GDScript `<Recv>.<member>` symbol to the `Function` node(s) named
+/// `<member>` in the file(s) that define the GDScript `class_name` global named
+/// `<Recv>`. Returns `Ok(None)` when `symbol` is not a single-dotted form, when
+/// `<Recv>` names no GDScript `Class` node, or when no matching member function
+/// exists (the caller then falls back to the normal search results — no
+/// regression). Deterministic: class files are sorted lexicographically and
+/// deduped, mirroring the T2 resolver's byte-stable ordering.
+fn resolve_gdscript_class_member(store: &Store, symbol: &str) -> Result<Option<Vec<Node>>> {
+    let Some((receiver, member)) = symbol.split_once('.') else {
+        return Ok(None);
+    };
+    // Only a single-level `<Recv>.<member>` receiver.member shape; a further
+    // '.' means a chained/nested access this fallback does not handle.
+    if receiver.is_empty() || member.is_empty() || member.contains('.') {
+        return Ok(None);
+    }
+
+    // (a) GDScript `Class` nodes named `<Recv>`; collect their files.
+    let mut class_files: Vec<String> = store
+        .nodes_by_name(receiver)?
+        .into_iter()
+        .filter(|n| n.kind == NodeKind::Class && n.language == Language::Gdscript)
+        .map(|n| n.file_path)
+        .collect();
+    if class_files.is_empty() {
+        return Ok(None);
+    }
+    class_files.sort();
+    class_files.dedup();
+
+    // (b) For each class file (sorted), the `<member>` `Function` node(s) in it.
+    let member_nodes = store.nodes_by_name(member)?;
+    let mut out: Vec<Node> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for file in &class_files {
+        for node in &member_nodes {
+            if node.kind == NodeKind::Function
+                && node.language == Language::Gdscript
+                && &node.file_path == file
+                && seen.insert(node.id.clone())
+            {
+                out.push(node.clone());
+            }
+        }
+    }
+
+    // (c) Return resolved Function nodes, or `None` to fall through.
+    if out.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(out))
+    }
 }
 
 fn exact_or_top_matches<'a>(matches: &'a [Node], symbol: &str) -> Vec<&'a Node> {
