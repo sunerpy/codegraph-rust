@@ -738,6 +738,20 @@ fn latest_update_tag(latest_version: &str) -> String {
     format!("v{bare}")
 }
 
+/// Decide whether `self-update` should skip the download/replace flow because
+/// the running binary is already current.
+///
+/// Returns `true` (skip, print "up to date", do NOT prompt/download) only when:
+/// no explicit `--tag` was given, `--force` was not passed, and `latest` is not
+/// a greater semver than `current`. An explicit tag or `--force` always proceeds
+/// (returns `false`), and a genuinely newer release also proceeds.
+fn should_skip_update(current: &str, latest: &str, force: bool, has_explicit_tag: bool) -> bool {
+    if force || has_explicit_tag {
+        return false;
+    }
+    !self_update::version::bump_is_greater(current, latest).unwrap_or(false)
+}
+
 fn cmd_self_update(check: bool, force: bool, tag: Option<String>) -> Result<()> {
     use self_update::cargo_crate_version;
 
@@ -788,6 +802,11 @@ fn cmd_self_update(check: bool, force: bool, tag: Option<String>) -> Result<()> 
             let latest = probe
                 .get_latest_release()
                 .context("querying the latest GitHub release")?;
+            let current = cargo_crate_version!();
+            if should_skip_update(current, &latest.version, force, false) {
+                println!("codegraph {current} is already up to date");
+                return Ok(());
+            }
             latest_update_tag(&latest.version)
         }
     };
@@ -3104,7 +3123,7 @@ fn print_files_tree(files: &[FileRecord], max_depth: Option<usize>) {
 
 #[cfg(test)]
 mod self_update_tests {
-    use super::latest_update_tag;
+    use super::{latest_update_tag, should_skip_update};
 
     #[test]
     fn formats_bare_semver_as_v_prefixed_tag() {
@@ -3115,6 +3134,26 @@ mod self_update_tests {
     #[test]
     fn idempotent_on_already_v_prefixed_input() {
         assert_eq!(latest_update_tag("v0.15.0"), "v0.15.0");
+    }
+
+    #[test]
+    fn skips_when_current_equals_latest_and_not_forced() {
+        assert!(should_skip_update("0.23.0", "0.23.0", false, false));
+    }
+
+    #[test]
+    fn force_never_skips() {
+        assert!(!should_skip_update("0.23.0", "0.23.0", true, false));
+    }
+
+    #[test]
+    fn newer_latest_never_skips() {
+        assert!(!should_skip_update("0.23.0", "0.24.0", false, false));
+    }
+
+    #[test]
+    fn explicit_tag_never_skips() {
+        assert!(!should_skip_update("0.23.0", "0.23.0", false, true));
     }
 }
 
