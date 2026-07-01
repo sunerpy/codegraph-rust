@@ -37,7 +37,7 @@
 //!   robustness wall the hand parser cannot clear (e.g. deeply nested quoted /
 //!   escaped values inside resource literals); none is evident in the format.
 
-use codegraph_core::types::{Language, Node, NodeKind};
+use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 
 use super::godot_project;
 use super::godot_resource;
@@ -117,13 +117,41 @@ impl FrameworkResolver for GodotResolver {
         {
             return None;
         }
-        let receiver = match reference.reference_name.split_once('.') {
-            Some((head, _)) => head,
-            None => reference.reference_name.as_str(),
+        let (receiver, member) = match reference.reference_name.split_once('.') {
+            Some((head, tail)) => (head, Some(tail)),
+            None => (reference.reference_name.as_str(), None),
         };
         if receiver.is_empty() {
             return None;
         }
+
+        // `ClassName.member()` static-call resolution (T2). A GDScript
+        // `class_name X` global's members are file-level `Function` nodes in the
+        // SAME file as the `Class` node (`class_name_statement` is NOT pushed on
+        // the walker's node_stack, so `func`s stay top-level Functions). When the
+        // RECEIVER matches a real GDScript `Class` node name and the reference is
+        // a `Calls` ref shaped `<Class>.<member>`, resolve to the `Function`
+        // named `<member>` in that class's file. Keyed ONLY on persisted fields
+        // (kind/name/file_path) — no extraction marker. STATIC-ONLY: it fires
+        // solely for a genuine class-node receiver, so a lowercase/instance/self
+        // receiver never matches (no lowercase name is a `Class` node), and it
+        // is checked BEFORE the autoload roster so a class global takes
+        // precedence over an identically-named autoload constant.
+        if reference.reference_kind == EdgeKind::Calls {
+            if let Some(member) = member {
+                if !member.is_empty() {
+                    if let Some(target) = resolve_class_member(context, receiver, member) {
+                        return Some(ResolvedRef {
+                            original: reference.clone(),
+                            target_node_id: target.id,
+                            confidence: 0.9,
+                            resolved_by: ResolvedBy::Framework,
+                        });
+                    }
+                }
+            }
+        }
+
         let singleton = find_autoload_singleton(context, receiver)?;
         Some(ResolvedRef {
             original: reference.clone(),
@@ -280,6 +308,47 @@ fn autoload_singletons(context: &dyn ResolutionContext) -> Vec<Node> {
             n.language == Language::GodotProject && godot_project::is_project_godot(&n.file_path)
         })
         .collect()
+}
+
+/// Resolve a GDScript `<Class>.<member>` static call to the `Function` named
+/// `member` in the class's own file.
+///
+/// The receiver must name a real GDScript `Class` node (a `class_name X`
+/// global — lowercase/instance/self receivers never match). If the same class
+/// NAME maps to multiple files (illegal in Godot but possible in a broken
+/// project), the candidate files are sorted lexicographically and the first is
+/// chosen, so output is byte-stable; `member` is resolved ONLY within that
+/// file. If that file holds more than one `Function` named `member`, none is
+/// resolved (ambiguity is left unresolved rather than emitting a guess).
+fn resolve_class_member(
+    context: &dyn ResolutionContext,
+    receiver: &str,
+    member: &str,
+) -> Option<Node> {
+    let mut class_files: Vec<String> = context
+        .get_nodes_by_name(receiver)
+        .into_iter()
+        .filter(|n| n.kind == NodeKind::Class && n.language == Language::Gdscript)
+        .map(|n| n.file_path)
+        .collect();
+    if class_files.is_empty() {
+        return None;
+    }
+    class_files.sort();
+    class_files.dedup();
+    let class_file = &class_files[0];
+
+    let mut matches = context
+        .get_nodes_in_file(class_file)
+        .into_iter()
+        .filter(|n| {
+            n.kind == NodeKind::Function && n.language == Language::Gdscript && n.name == member
+        });
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(first)
 }
 
 /// Find the autoload singleton node whose name EXACTLY equals `name`.
