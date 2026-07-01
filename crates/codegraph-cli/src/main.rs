@@ -261,7 +261,7 @@ enum Command {
         /// Report what references the given changed resource/script path.
         #[arg(long, value_name = "PATH")]
         impact: Option<String>,
-        /// With --impact: emit a derived load/open plan (loadScripts/openScenes/reasons).
+        /// With --impact: emit a derived load/open plan (loadScripts/loadResources/openScenes/reasons).
         #[arg(long = "verify-plan", requires = "impact")]
         verify_plan: bool,
         /// Keep only results whose path is under this prefix (repeatable).
@@ -1829,6 +1829,7 @@ fn cmd_audit(args: AuditArgs) -> Result<()> {
 struct VerifyPlan {
     changed: String,
     load_scripts: Vec<String>,
+    load_resources: Vec<String>,
     open_scenes: Vec<String>,
     reasons: Vec<VerifyReason>,
 }
@@ -1845,11 +1846,21 @@ struct VerifyReason {
 
 fn verify_plan_view(impact: &codegraph_graph::graph::ResourceImpact) -> VerifyPlan {
     let mut load_scripts: Vec<String> = Vec::new();
+    let mut load_resources: Vec<String> = Vec::new();
     let mut open_scenes: Vec<String> = Vec::new();
     let mut reasons: Vec<VerifyReason> = Vec::new();
+    if impact.changed.ends_with(".gd") {
+        load_scripts.push(res_path(&impact.changed));
+    } else if impact.changed.ends_with(".tres") || impact.changed.ends_with(".res") {
+        load_resources.push(res_path(&impact.changed));
+    } else if impact.changed.ends_with(".tscn") {
+        open_scenes.push(res_path(&impact.changed));
+    }
     for affected in &impact.affected {
         if affected.from_file.ends_with(".gd") {
             load_scripts.push(res_path(&affected.from_file));
+        } else if affected.from_file.ends_with(".tres") || affected.from_file.ends_with(".res") {
+            load_resources.push(res_path(&affected.from_file));
         } else if affected.from_file.ends_with(".tscn") {
             open_scenes.push(res_path(&affected.from_file));
         }
@@ -1862,11 +1873,14 @@ fn verify_plan_view(impact: &codegraph_graph::graph::ResourceImpact) -> VerifyPl
     }
     load_scripts.sort();
     load_scripts.dedup();
+    load_resources.sort();
+    load_resources.dedup();
     open_scenes.sort();
     open_scenes.dedup();
     VerifyPlan {
         changed: impact.changed.clone(),
         load_scripts,
+        load_resources,
         open_scenes,
         reasons,
     }
@@ -1962,6 +1976,10 @@ fn print_verify_plan(plan: &VerifyPlan) {
     println!("  loadScripts ({}):", plan.load_scripts.len());
     for script in &plan.load_scripts {
         println!("    {script}");
+    }
+    println!("  loadResources ({}):", plan.load_resources.len());
+    for resource in &plan.load_resources {
+        println!("    {resource}");
     }
     println!("  openScenes ({}):", plan.open_scenes.len());
     for scene in &plan.open_scenes {
