@@ -542,3 +542,83 @@ fn main_scene_ref_is_not_tagged_autoload() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn impact_surfaces_gdscript_preload_via_imports_edge() {
+    // Given a .gd that `preload`s another .gd (a resolved `imports` edge tagged
+    // gdscript_load_path by the walker),
+    let dir = unique_dir("impact-preload-imports");
+    write(&dir, "project.godot", PROJECT_GODOT);
+    write(&dir, "scripts/x.gd", "extends Node\n\nfunc go():\n\tpass\n");
+    write(
+        &dir,
+        "loader.gd",
+        "extends Node\n\nconst X = preload(\"res://scripts/x.gd\")\n",
+    );
+    // When impact is computed for the preloaded script,
+    let store = run_pipeline(
+        "impact-preload-imports",
+        &dir,
+        &["project.godot", "scripts/x.gd", "loader.gd"],
+    );
+    let impact = GraphTraverser::new(&store)
+        .resource_impact("scripts/x.gd")
+        .expect("impact");
+    // Then the preloading site surfaces as an `imports` edge carrying the
+    // gdscript_load_path subkind (previously excluded from resource_impact).
+    let row = impact
+        .affected
+        .iter()
+        .find(|a| a.from_file == "loader.gd")
+        .unwrap_or_else(|| panic!("expected loader.gd in impact, got: {impact:?}"));
+    assert_eq!(
+        row.edge_kind, "imports",
+        "preload must surface as an imports edge, got: {row:?}"
+    );
+    assert_eq!(
+        row.edge_subkind,
+        Some("gdscript_load_path".to_string()),
+        "imports edge must carry the gdscript_load_path subkind, got: {row:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn impact_surfaces_gdscript_extends_path_via_extends_edge() {
+    // Given a .gd that `extends "res://base.gd"` (a resolved `extends` edge
+    // tagged gdscript_load_path by the walker),
+    let dir = unique_dir("impact-extends-path");
+    write(&dir, "project.godot", PROJECT_GODOT);
+    write(&dir, "base.gd", "extends Node\n\nfunc base_fn():\n\tpass\n");
+    write(
+        &dir,
+        "child.gd",
+        "extends \"res://base.gd\"\n\nfunc go():\n\tpass\n",
+    );
+    // When impact is computed for the base script,
+    let store = run_pipeline(
+        "impact-extends-path",
+        &dir,
+        &["project.godot", "base.gd", "child.gd"],
+    );
+    let impact = GraphTraverser::new(&store)
+        .resource_impact("base.gd")
+        .expect("impact");
+    // Then the extending site surfaces as an `extends` edge carrying the
+    // gdscript_load_path subkind (previously excluded from resource_impact).
+    let row = impact
+        .affected
+        .iter()
+        .find(|a| a.from_file == "child.gd")
+        .unwrap_or_else(|| panic!("expected child.gd in impact, got: {impact:?}"));
+    assert_eq!(
+        row.edge_kind, "extends",
+        "extends-path must surface as an extends edge, got: {row:?}"
+    );
+    assert_eq!(
+        row.edge_subkind,
+        Some("gdscript_load_path".to_string()),
+        "extends edge must carry the gdscript_load_path subkind, got: {row:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
