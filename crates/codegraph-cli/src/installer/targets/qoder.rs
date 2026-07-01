@@ -329,8 +329,11 @@ mod tests {
     use super::*;
 
     /// A temp-rooted context so the probe never hits the real `~/.qoder-*` or
-    /// `~/.config/QoderCN`. `xdg_config_home` points into the temp home so
-    /// `config_base_for` on Linux resolves there (not the real `~/.config`).
+    /// the real per-OS config dir. Sets BOTH `app_data` and `xdg_config_home`
+    /// to temp-home subdirs so `config_base_for` resolves UNDER the temp home
+    /// on EVERY OS: linux → `<home>/.config`, windows → `<home>/AppData/Roaming`,
+    /// macos → `<home>/Library/Application Support`. Tests must derive fixture
+    /// paths via [`qoder_base`] rather than hardcoding `.config`.
     fn temp_ctx(label: &str) -> (InstallContext, PathBuf) {
         let base = std::env::temp_dir().join(format!(
             "cg-qoder-{label}-{}-{}",
@@ -344,20 +347,33 @@ mod tests {
         let ctx = InstallContext {
             home: home.clone(),
             cwd: base.join("cwd"),
-            app_data: None,
+            app_data: Some(home.join("AppData").join("Roaming")),
             xdg_config_home: Some(home.join(".config")),
             hermes_home: None,
         };
         (ctx, base)
     }
 
+    /// The edition-parent config base for the CURRENT OS, computed exactly the
+    /// way production's [`qoder_config_base`] does. Tests build their
+    /// `QoderCN|Qoder/<machineId>/SharedClientCache/mcp.json` fixtures under
+    /// this so they land where the current OS's `qoder_global_mcp_json` looks —
+    /// OS-agnostic by construction (linux/windows/macos all resolve under the
+    /// temp home because `temp_ctx` sets both `app_data` and `xdg_config_home`).
+    fn qoder_base(ctx: &InstallContext) -> PathBuf {
+        config_base_for(
+            &ctx.home,
+            ctx.app_data.as_deref(),
+            ctx.xdg_config_home.as_deref(),
+            std::env::consts::OS,
+        )
+    }
+
     #[test]
     fn discovers_shared_client_cache_under_qoder_cn() {
-        // Given a temp `<home>/.config/QoderCN/ABC123/SharedClientCache/mcp.json`
+        // Given a temp `<config_base>/QoderCN/ABC123/SharedClientCache/mcp.json`
         let (ctx, base) = temp_ctx("discover");
-        let mcp = ctx
-            .home
-            .join(".config")
+        let mcp = qoder_base(&ctx)
             .join("QoderCN")
             .join("ABC123")
             .join("SharedClientCache")
@@ -378,7 +394,7 @@ mod tests {
     fn discovery_sort_is_deterministic_lexicographic_first() {
         // Given TWO machineId dirs each with a SharedClientCache/mcp.json
         let (ctx, base) = temp_ctx("sort");
-        let qoder_cn = ctx.home.join(".config").join("QoderCN");
+        let qoder_cn = qoder_base(&ctx).join("QoderCN");
         for id in ["BBB", "AAA"] {
             let mcp = qoder_cn.join(id).join("SharedClientCache").join("mcp.json");
             fs::create_dir_all(mcp.parent().unwrap()).unwrap();
@@ -387,8 +403,13 @@ mod tests {
 
         // When resolving, Then the lexicographically-first ("AAA") is chosen.
         let resolved = qoder_global_mcp_json(&ctx).expect("should discover");
-        assert!(
-            resolved.ends_with("QoderCN/AAA/SharedClientCache/mcp.json"),
+        let expected = qoder_cn
+            .join("AAA")
+            .join("SharedClientCache")
+            .join("mcp.json");
+        assert_eq!(
+            resolved,
+            expected,
             "expected AAA, got {}",
             resolved.display()
         );
@@ -401,9 +422,7 @@ mod tests {
         // Given BOTH QoderCN and Qoder editions present
         let (ctx, base) = temp_ctx("edition");
         for edition in ["QoderCN", "Qoder"] {
-            let mcp = ctx
-                .home
-                .join(".config")
+            let mcp = qoder_base(&ctx)
                 .join(edition)
                 .join("ID")
                 .join("SharedClientCache")
@@ -414,8 +433,14 @@ mod tests {
 
         // When resolving, Then QoderCN wins.
         let resolved = qoder_global_mcp_json(&ctx).expect("should discover");
-        assert!(
-            resolved.to_string_lossy().contains("QoderCN"),
+        let expected = qoder_base(&ctx)
+            .join("QoderCN")
+            .join("ID")
+            .join("SharedClientCache")
+            .join("mcp.json");
+        assert_eq!(
+            resolved,
+            expected,
             "QoderCN must be preferred, got {}",
             resolved.display()
         );
@@ -435,9 +460,7 @@ mod tests {
             .join("mcp.json");
         fs::create_dir_all(server.parent().unwrap()).unwrap();
         fs::write(&server, "{\"mcpServers\":{}}").unwrap();
-        let cache = ctx
-            .home
-            .join(".config")
+        let cache = qoder_base(&ctx)
             .join("QoderCN")
             .join("ID")
             .join("SharedClientCache")
@@ -496,7 +519,11 @@ mod tests {
             ]
         );
         let path = qoder_local_mcp_json(&ctx);
-        assert!(path.ends_with(".qoder/mcp.json"), "got {}", path.display());
+        assert!(
+            path.ends_with(PathBuf::from(".qoder").join("mcp.json")),
+            "got {}",
+            path.display()
+        );
         let _ = fs::remove_dir_all(base);
     }
 
@@ -504,9 +531,7 @@ mod tests {
     fn global_install_upserts_preserving_siblings() {
         // Given a discovered SharedClientCache mcp.json pre-seeded with a sibling
         let (ctx, base) = temp_ctx("siblings");
-        let mcp = ctx
-            .home
-            .join(".config")
+        let mcp = qoder_base(&ctx)
             .join("QoderCN")
             .join("ID")
             .join("SharedClientCache")
@@ -617,7 +642,7 @@ mod tests {
         );
         // And no dir was fabricated.
         assert!(
-            !ctx.home.join(".config").join("QoderCN").exists(),
+            !qoder_base(&ctx).join("QoderCN").exists(),
             "must NOT fabricate a machineId dir"
         );
 
@@ -628,9 +653,7 @@ mod tests {
     fn uninstall_removes_only_codegraph() {
         // Given a discovered mcp.json with github + codegraph
         let (ctx, base) = temp_ctx("uninstall");
-        let mcp = ctx
-            .home
-            .join(".config")
+        let mcp = qoder_base(&ctx)
             .join("QoderCN")
             .join("ID")
             .join("SharedClientCache")
@@ -672,7 +695,11 @@ mod tests {
     fn skill_dir_global_ends_with_agents_skills() {
         let (ctx, base) = temp_ctx("skillglobal");
         let dir = QoderTarget.skill_dir(&ctx, Location::Global).unwrap();
-        assert!(dir.ends_with(".agents/skills"), "got {}", dir.display());
+        assert!(
+            dir.ends_with(PathBuf::from(".agents").join("skills")),
+            "got {}",
+            dir.display()
+        );
         let _ = fs::remove_dir_all(base);
     }
 
@@ -680,7 +707,11 @@ mod tests {
     fn skill_dir_local_ends_with_qoder_skills() {
         let (ctx, base) = temp_ctx("skilllocal");
         let dir = QoderTarget.skill_dir(&ctx, Location::Local).unwrap();
-        assert!(dir.ends_with(".qoder/skills"), "got {}", dir.display());
+        assert!(
+            dir.ends_with(PathBuf::from(".qoder").join("skills")),
+            "got {}",
+            dir.display()
+        );
         let _ = fs::remove_dir_all(base);
     }
 
