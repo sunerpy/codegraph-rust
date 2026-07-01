@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.23.0](https://github.com/sunerpy/codegraph-rust/compare/v0.22.0...v0.23.0) (2026-07-01)
+
+
+### Features
+
+* **godot:** richer edge subkinds and verifyPlan for the static graph ([#99](https://github.com/sunerpy/codegraph-rust/issues/99)) ([0c51ff3](https://github.com/sunerpy/codegraph-rust/commit/0c51ff3a8e3748a38eb6301f27d9b38fc22160dc))
+
 ## [0.22.0](https://github.com/sunerpy/codegraph-rust/compare/v0.21.0...v0.22.0) (2026-07-01)
 
 
