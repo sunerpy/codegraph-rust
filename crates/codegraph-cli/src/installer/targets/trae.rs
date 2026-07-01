@@ -71,6 +71,12 @@ fn build_trae_mcp_config(ctx: &InstallContext, loc: Location) -> Value {
         Location::Global => "${workspaceFolder}".to_string(),
     };
     let mut base = mcp_server_config();
+    // Trae's stdio schema (docs.trae.ai/ide/add-mcp-servers) has NO `type` key
+    // (stdio is implied by `command`); strip it here only, since shared
+    // `mcp_server_config()` must keep `type` for Cursor/Kiro/Codex.
+    if let Some(obj) = base.as_object_mut() {
+        obj.remove("type");
+    }
     if let Some(args) = base.get_mut("args").and_then(|a| a.as_array_mut()) {
         args.push(json!("--path"));
         args.push(json!(path_arg));
@@ -284,6 +290,10 @@ mod tests {
     fn global_build_uses_workspace_folder() {
         let (ctx, base) = temp_ctx("globalbuild");
         let entry = build_trae_mcp_config(&ctx, Location::Global);
+        assert!(
+            entry.get("type").is_none(),
+            "Trae entry must not carry a `type` key"
+        );
         let args = entry["args"].as_array().expect("args array");
         assert_eq!(
             args,
@@ -301,6 +311,10 @@ mod tests {
     fn local_build_uses_absolute_cwd() {
         let (ctx, base) = temp_ctx("localbuild");
         let entry = build_trae_mcp_config(&ctx, Location::Local);
+        assert!(
+            entry.get("type").is_none(),
+            "Trae entry must not carry a `type` key"
+        );
         let args = entry["args"].as_array().expect("args array");
         assert_eq!(
             args,
@@ -314,6 +328,34 @@ mod tests {
         // The local path is `<cwd>/.trae/mcp.json`.
         let path = mcp_json_path(&ctx, Location::Local);
         assert!(path.ends_with(".trae/mcp.json"), "got {}", path.display());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn trae_config_omits_type_field() {
+        // Given both install locations
+        let (ctx, base) = temp_ctx("notype");
+
+        // When building the global entry
+        let global = build_trae_mcp_config(&ctx, Location::Global);
+        // Then it has command + args (ending in ${workspaceFolder}) and NO type
+        assert_eq!(global["command"], json!("codegraph"));
+        assert!(global.get("type").is_none(), "global must omit `type`");
+        assert_eq!(
+            global["args"].as_array().expect("global args").last(),
+            Some(&json!("${workspaceFolder}"))
+        );
+
+        // When building the local entry
+        let local = build_trae_mcp_config(&ctx, Location::Local);
+        // Then it has command + args (ending in the abs cwd) and NO type
+        assert_eq!(local["command"], json!("codegraph"));
+        assert!(local.get("type").is_none(), "local must omit `type`");
+        assert_eq!(
+            local["args"].as_array().expect("local args").last(),
+            Some(&json!(ctx.cwd.to_string_lossy().to_string()))
+        );
+
         let _ = fs::remove_dir_all(base);
     }
 
