@@ -1044,7 +1044,7 @@ fn cmd_query(
         .transpose()?
         .into_iter()
         .collect();
-    let results = search_nodes(
+    let mut results = search_nodes(
         &store,
         &search,
         &SearchOptions {
@@ -1055,6 +1055,14 @@ fn cmd_query(
         },
         &project_name_tokens(&project),
     )?;
+    if results.iter().all(|r| r.node.name != search) {
+        if let Some(resolved) = resolve_gdscript_class_member(&store, &search)? {
+            results = resolved
+                .into_iter()
+                .map(|node| SearchResult { node, score: 1.0 })
+                .collect();
+        }
+    }
     if json_output {
         let output = results.iter().map(SearchOutput::from).collect::<Vec<_>>();
         print_json_pretty(&output)?;
@@ -1796,7 +1804,8 @@ fn cmd_audit(args: AuditArgs) -> Result<()> {
     dangling_list.retain(|d| audit_prefix_keep(&d.from_file, &include, &exclude));
     let impact_result = match &impact {
         Some(changed) => {
-            let mut result = traverser.resource_impact(changed)?;
+            let normalized = normalize_impact_input(changed, &project);
+            let mut result = traverser.resource_impact(&normalized)?;
             result
                 .affected
                 .retain(|a| audit_prefix_keep(&a.from_file, &include, &exclude));
@@ -1859,8 +1868,34 @@ struct VerifyReason {
     file: String,
     line: i64,
     edge_kind: String,
+    target: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     edge_subkind: Option<String>,
+}
+
+/// Normalize a raw `audit --impact <changed>` value into the project-relative,
+/// `/`-separated form that `resource_impact` expects. Strict order: strip a
+/// leading `res://` FIRST (so a `res://…` value is never mistaken for an
+/// absolute path), then a leading `./` or `.\`, then convert `\` to `/`. If the
+/// result is an OS-absolute path under the project root, make it relative; an
+/// absolute path outside the root passes through unchanged (yields an empty
+/// impact rather than an error).
+fn normalize_impact_input(changed: &str, project: &Path) -> String {
+    let mut s = changed;
+    if let Some(rest) = s.strip_prefix("res://") {
+        s = rest;
+    }
+    if let Some(rest) = s.strip_prefix("./").or_else(|| s.strip_prefix(".\\")) {
+        s = rest;
+    }
+    let s = s.replace('\\', "/");
+    let candidate = Path::new(&s);
+    if candidate.is_absolute() {
+        if let Ok(rel) = candidate.strip_prefix(project) {
+            return rel.to_string_lossy().replace('\\', "/");
+        }
+    }
+    s
 }
 
 fn verify_plan_view(impact: &codegraph_graph::graph::ResourceImpact) -> VerifyPlan {
@@ -1887,6 +1922,7 @@ fn verify_plan_view(impact: &codegraph_graph::graph::ResourceImpact) -> VerifyPl
             file: affected.from_file.clone(),
             line: affected.line,
             edge_kind: affected.edge_kind.clone(),
+            target: affected.target.clone(),
             edge_subkind: affected.edge_subkind.clone(),
         });
     }
@@ -2789,7 +2825,78 @@ fn symbol_matches(store: &Store, project: &Path, symbol: &str) -> Result<Vec<Nod
         },
         &project_name_tokens(project),
     )?;
-    Ok(results.into_iter().map(|r| r.node).collect())
+    let nodes: Vec<Node> = results.into_iter().map(|r| r.node).collect();
+    // GDScript `ClassName.member` qualified-name fallback: when the normal
+    // search found no node whose exact `name` equals the queried `symbol` and
+    // `symbol` is shaped `<Recv>.<member>`, try to resolve the dotted form to
+    // the same `Function` node the short name resolves to. GDScript
+    // `class_name X` globals are NOT pushed on the extractor's node stack, so
+    // a class method stores `name == qualified_name == <member>` and no dotted
+    // node exists — this mirrors the committed T2 resolver
+    // (`godot::resolve_class_member`). Returns the resolved nodes directly so
+    // callers/impact/query all resolve the dotted form to the exact target.
+    if nodes.iter().all(|n| n.name != symbol) {
+        if let Some(resolved) = resolve_gdscript_class_member(store, symbol)? {
+            if !resolved.is_empty() {
+                return Ok(resolved);
+            }
+        }
+    }
+    Ok(nodes)
+}
+
+/// Resolve a GDScript `<Recv>.<member>` symbol to the `Function` node(s) named
+/// `<member>` in the file(s) that define the GDScript `class_name` global named
+/// `<Recv>`. Returns `Ok(None)` when `symbol` is not a single-dotted form, when
+/// `<Recv>` names no GDScript `Class` node, or when no matching member function
+/// exists (the caller then falls back to the normal search results — no
+/// regression). Deterministic: class files are sorted lexicographically and
+/// deduped, mirroring the T2 resolver's byte-stable ordering.
+fn resolve_gdscript_class_member(store: &Store, symbol: &str) -> Result<Option<Vec<Node>>> {
+    let Some((receiver, member)) = symbol.split_once('.') else {
+        return Ok(None);
+    };
+    // Only a single-level `<Recv>.<member>` receiver.member shape; a further
+    // '.' means a chained/nested access this fallback does not handle.
+    if receiver.is_empty() || member.is_empty() || member.contains('.') {
+        return Ok(None);
+    }
+
+    // (a) GDScript `Class` nodes named `<Recv>`; collect their files.
+    let mut class_files: Vec<String> = store
+        .nodes_by_name(receiver)?
+        .into_iter()
+        .filter(|n| n.kind == NodeKind::Class && n.language == Language::Gdscript)
+        .map(|n| n.file_path)
+        .collect();
+    if class_files.is_empty() {
+        return Ok(None);
+    }
+    class_files.sort();
+    class_files.dedup();
+
+    // (b) For each class file (sorted), the `<member>` `Function` node(s) in it.
+    let member_nodes = store.nodes_by_name(member)?;
+    let mut out: Vec<Node> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for file in &class_files {
+        for node in &member_nodes {
+            if node.kind == NodeKind::Function
+                && node.language == Language::Gdscript
+                && &node.file_path == file
+                && seen.insert(node.id.clone())
+            {
+                out.push(node.clone());
+            }
+        }
+    }
+
+    // (c) Return resolved Function nodes, or `None` to fall through.
+    if out.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(out))
+    }
 }
 
 fn exact_or_top_matches<'a>(matches: &'a [Node], symbol: &str) -> Vec<&'a Node> {

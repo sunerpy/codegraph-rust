@@ -499,6 +499,42 @@ fn audit_verify_plan_requires_impact() {
 }
 
 #[test]
+fn audit_verify_plan_reasons_carry_target() {
+    // Given the fixture indexed (data.tres references referenced.tres via ExtResource),
+    let (_dir, project) = indexed_project("verify-plan-reasons-target");
+    let p = project.to_str().unwrap();
+
+    // When audit --impact referenced.tres --verify-plan --json runs,
+    let (stdout, err, ok) = cli(&[
+        "audit",
+        "--impact",
+        "referenced.tres",
+        "--verify-plan",
+        "--json",
+        "-p",
+        p,
+    ]);
+    assert!(ok, "audit failed: stderr={err}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+
+    // Then every verifyPlan reason row carries target=referenced.tres (the
+    // changed/affected target it refers to), and there is at least one reason.
+    let reasons = value["verifyPlan"]["reasons"]
+        .as_array()
+        .expect("reasons array");
+    assert!(
+        !reasons.is_empty(),
+        "referenced.tres must produce at least one reason, got: {value:?}"
+    );
+    assert!(
+        reasons
+            .iter()
+            .all(|r| r["target"].as_str() == Some("referenced.tres")),
+        "every reason must carry target=referenced.tres, got: {reasons:?}"
+    );
+}
+
+#[test]
 fn audit_impact_surfaces_edge_subkind_for_godot_ref() {
     // Given the fixture indexed (data.tres references referenced.tres via ExtResource),
     let (_dir, project) = indexed_project("impact-subkind");
@@ -520,6 +556,110 @@ fn audit_impact_surfaces_edge_subkind_for_godot_ref() {
         row["edgeSubkind"].as_str(),
         Some("ext_resource"),
         "godot ExtResource ref must surface edgeSubkind, got: {row:?}"
+    );
+}
+
+#[test]
+fn audit_impact_input_forms_are_equivalent() {
+    // Given the fixture indexed (main.tscn binds a script = res://player.gd,
+    // so `--impact player.gd` yields a non-empty impact),
+    let (_dir, project) = indexed_project("impact-input-forms");
+    let p = project.to_str().unwrap();
+    let abs = project.join("player.gd");
+    let abs = abs.to_str().unwrap();
+
+    // A helper that runs `audit --impact <form> --verify-plan --json` and returns
+    // (affected-row-count, loadScripts).
+    let run = |form: &str| -> (usize, Vec<String>) {
+        let (stdout, err, ok) = cli(&[
+            "audit",
+            "--impact",
+            form,
+            "--verify-plan",
+            "--json",
+            "-p",
+            p,
+        ]);
+        assert!(ok, "audit --impact {form} failed: stderr={err}");
+        let value: serde_json::Value =
+            serde_json::from_str(&stdout).expect("audit emits valid JSON");
+        let affected = value["impact"]["affected"]
+            .as_array()
+            .expect("affected array")
+            .len();
+        let load_scripts: Vec<String> = value["verifyPlan"]["loadScripts"]
+            .as_array()
+            .expect("loadScripts array")
+            .iter()
+            .map(|s| s.as_str().expect("res path").to_string())
+            .collect();
+        (affected, load_scripts)
+    };
+
+    // When the plain project-relative form runs (the baseline),
+    let baseline = run("player.gd");
+    assert!(
+        baseline.0 > 0,
+        "baseline player.gd must produce a non-empty impact"
+    );
+    assert_eq!(
+        baseline.1,
+        vec!["res://player.gd".to_string()],
+        "baseline loadScripts must be exactly one valid res:// script"
+    );
+
+    // Then every alternate input form yields the SAME impact + verifyPlan.
+    for form in [
+        "res://player.gd",
+        "./player.gd",
+        ".\\player.gd",
+        abs, // <project-abs>/player.gd
+    ] {
+        let got = run(form);
+        assert_eq!(
+            got.0, baseline.0,
+            "form `{form}` must give the same affected count as the baseline"
+        );
+        assert_eq!(
+            got.1, baseline.1,
+            "form `{form}` must give loadScripts == [res://player.gd] (no res://res://, no absolute leak), got: {:?}",
+            got.1
+        );
+        assert!(
+            got.1.iter().all(|s| !s.contains("res://res://")),
+            "form `{form}` must not double-prefix res://, got: {:?}",
+            got.1
+        );
+    }
+}
+
+#[test]
+fn audit_impact_out_of_project_absolute_path_does_not_crash() {
+    // Given the indexed fixture,
+    let (_dir, project) = indexed_project("impact-abs-outside");
+    let p = project.to_str().unwrap();
+    // An absolute path that is NOT under the project root.
+    let outside = if cfg!(windows) {
+        "C:\\definitely\\not\\under\\project\\ghost.gd".to_string()
+    } else {
+        "/definitely/not/under/project/ghost.gd".to_string()
+    };
+
+    // When audit --impact <out-of-project-absolute> --json runs,
+    let (stdout, err, ok) = cli(&["audit", "--impact", &outside, "--json", "-p", p]);
+
+    // Then it does not crash; an empty impact is acceptable.
+    assert!(
+        ok,
+        "out-of-project absolute path must not error: stderr={err}"
+    );
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert!(
+        value["impact"]["affected"]
+            .as_array()
+            .expect("affected array")
+            .is_empty(),
+        "an out-of-project path must yield an empty impact, got: {value:?}"
     );
 }
 
