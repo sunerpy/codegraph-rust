@@ -7,7 +7,7 @@
 
 use codegraph_core::node_id::{file_node_id, generate_node_id};
 use codegraph_core::types::{
-    Edge, EdgeKind, ExtractionResult, Language, Node, NodeKind, UnresolvedRef,
+    Edge, EdgeKind, ExtractionResult, Language, Node, NodeKind, ReferenceSubkind, UnresolvedRef,
 };
 use regex::Regex;
 use std::path::Path;
@@ -351,6 +351,14 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 if let Some((target, text)) = self.gdscript_extends_target(node) {
                     if let Some(parent_id) = self.node_stack.last().cloned() {
                         self.push_ref(&parent_id, &text, EdgeKind::Extends, target);
+                        // A `string` target is a `res://…` path; a `type` target
+                        // is a bare class name (supertype) → tag ONLY the path.
+                        if target.kind() == "string" {
+                            if let Some(reference) = self.unresolved_references.last_mut() {
+                                reference.reference_subkind =
+                                    Some(ReferenceSubkind::GdscriptLoadPath);
+                            }
+                        }
                     }
                 }
                 true
@@ -364,6 +372,13 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                     if let Some((target, text)) = self.gdscript_extends_target(extends) {
                         if let Some(parent_id) = self.node_stack.last().cloned() {
                             self.push_ref(&parent_id, &text, EdgeKind::Extends, target);
+                            // Same path-vs-classname rule as `extends_statement`.
+                            if target.kind() == "string" {
+                                if let Some(reference) = self.unresolved_references.last_mut() {
+                                    reference.reference_subkind =
+                                        Some(ReferenceSubkind::GdscriptLoadPath);
+                                }
+                            }
                         }
                     }
                 }
@@ -402,6 +417,10 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 );
                 if let Some(parent_id) = self.node_stack.last().cloned() {
                     self.push_ref(&parent_id, &path, EdgeKind::Imports, node);
+                    // The preload/load argument is ALWAYS a resource path → tag unconditionally.
+                    if let Some(reference) = self.unresolved_references.last_mut() {
+                        reference.reference_subkind = Some(ReferenceSubkind::GdscriptLoadPath);
+                    }
                 }
                 true
             }

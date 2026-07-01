@@ -1,4 +1,4 @@
-use codegraph_core::types::{EdgeKind, Language, NodeKind};
+use codegraph_core::types::{EdgeKind, Language, NodeKind, ReferenceSubkind};
 #[allow(unused_imports)]
 use codegraph_extract::{detect_language, extract_source};
 
@@ -310,6 +310,79 @@ fn gdscript_preload_not_a_call_ref() {
         load_calls, 0,
         "preload/load must NOT be a Calls ref; refs={:#?}",
         result.unresolved_references
+    );
+}
+
+#[test]
+fn gdscript_preload_ref_tagged_gdscript_load_path() {
+    let source = "const Foo = preload(\"res://scripts/x.gd\")\n";
+    let result = extract_source("scripts/x.gd", source, Some(Language::Gdscript));
+    assert!(result.errors.is_empty(), "errors={:#?}", result.errors);
+    let import_ref = result
+        .unresolved_references
+        .iter()
+        .find(|reference| {
+            reference.reference_kind == EdgeKind::Imports
+                && reference.reference_name == "res://scripts/x.gd"
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "missing preload Imports ref; refs={:#?}",
+                result.unresolved_references
+            )
+        });
+    assert_eq!(
+        import_ref.reference_subkind,
+        Some(ReferenceSubkind::GdscriptLoadPath),
+        "preload path ref must carry GdscriptLoadPath; ref={import_ref:#?}"
+    );
+}
+
+#[test]
+fn gdscript_extends_string_path_tagged_gdscript_load_path() {
+    let source = "extends \"res://base.gd\"\n";
+    let result = extract_source("scripts/x.gd", source, Some(Language::Gdscript));
+    assert!(result.errors.is_empty(), "errors={:#?}", result.errors);
+    let extends_ref = result
+        .unresolved_references
+        .iter()
+        .find(|reference| {
+            reference.reference_kind == EdgeKind::Extends
+                && reference.reference_name == "res://base.gd"
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "missing extends-path Extends ref; refs={:#?}",
+                result.unresolved_references
+            )
+        });
+    assert_eq!(
+        extends_ref.reference_subkind,
+        Some(ReferenceSubkind::GdscriptLoadPath),
+        "extends \"res://...\" ref must carry GdscriptLoadPath; ref={extends_ref:#?}"
+    );
+}
+
+#[test]
+fn gdscript_extends_classname_not_tagged_gdscript_load_path() {
+    let source = "extends Node\n";
+    let result = extract_source("scripts/x.gd", source, Some(Language::Gdscript));
+    assert!(result.errors.is_empty(), "errors={:#?}", result.errors);
+    let extends_ref = result
+        .unresolved_references
+        .iter()
+        .find(|reference| {
+            reference.reference_kind == EdgeKind::Extends && reference.reference_name == "Node"
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "missing extends-classname Extends ref; refs={:#?}",
+                result.unresolved_references
+            )
+        });
+    assert_eq!(
+        extends_ref.reference_subkind, None,
+        "bare `extends <ClassName>` must NOT carry GdscriptLoadPath (it is a supertype, not a path); ref={extends_ref:#?}"
     );
 }
 
