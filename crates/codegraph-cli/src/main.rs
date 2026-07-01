@@ -1796,7 +1796,8 @@ fn cmd_audit(args: AuditArgs) -> Result<()> {
     dangling_list.retain(|d| audit_prefix_keep(&d.from_file, &include, &exclude));
     let impact_result = match &impact {
         Some(changed) => {
-            let mut result = traverser.resource_impact(changed)?;
+            let normalized = normalize_impact_input(changed, &project);
+            let mut result = traverser.resource_impact(&normalized)?;
             result
                 .affected
                 .retain(|a| audit_prefix_keep(&a.from_file, &include, &exclude));
@@ -1861,6 +1862,31 @@ struct VerifyReason {
     edge_kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     edge_subkind: Option<String>,
+}
+
+/// Normalize a raw `audit --impact <changed>` value into the project-relative,
+/// `/`-separated form that `resource_impact` expects. Strict order: strip a
+/// leading `res://` FIRST (so a `res://…` value is never mistaken for an
+/// absolute path), then a leading `./` or `.\`, then convert `\` to `/`. If the
+/// result is an OS-absolute path under the project root, make it relative; an
+/// absolute path outside the root passes through unchanged (yields an empty
+/// impact rather than an error).
+fn normalize_impact_input(changed: &str, project: &Path) -> String {
+    let mut s = changed;
+    if let Some(rest) = s.strip_prefix("res://") {
+        s = rest;
+    }
+    if let Some(rest) = s.strip_prefix("./").or_else(|| s.strip_prefix(".\\")) {
+        s = rest;
+    }
+    let s = s.replace('\\', "/");
+    let candidate = Path::new(&s);
+    if candidate.is_absolute() {
+        if let Ok(rel) = candidate.strip_prefix(project) {
+            return rel.to_string_lossy().replace('\\', "/");
+        }
+    }
+    s
 }
 
 fn verify_plan_view(impact: &codegraph_graph::graph::ResourceImpact) -> VerifyPlan {
