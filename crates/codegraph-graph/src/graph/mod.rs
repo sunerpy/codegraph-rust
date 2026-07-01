@@ -1019,7 +1019,8 @@ impl<'store> GraphTraverser<'store> {
             if !looks_like_path(&reference.reference_name) {
                 continue;
             }
-            let normalized = normalize_rel(&reference.reference_name);
+            let normalized =
+                strip_res_prefix(&normalize_rel(&reference.reference_name)).to_string();
             if is_excluded_prefix(&normalized) {
                 continue;
             }
@@ -1057,7 +1058,7 @@ impl<'store> GraphTraverser<'store> {
         let mut affected: Vec<AffectedRef> = Vec::new();
 
         for reference in self.store.all_unresolved_refs()? {
-            if normalize_rel(&reference.reference_name) == changed {
+            if strip_res_prefix(&normalize_rel(&reference.reference_name)) == changed {
                 affected.push(AffectedRef {
                     from_file: reference.file_path,
                     line: reference.line,
@@ -1108,7 +1109,9 @@ impl<'store> GraphTraverser<'store> {
         let mut referenced: HashSet<String> = HashSet::new();
         for reference in self.store.all_unresolved_refs()? {
             if is_path_shaped(&reference.reference_name, reference.language) {
-                referenced.insert(normalize_rel(&reference.reference_name));
+                referenced.insert(
+                    strip_res_prefix(&normalize_rel(&reference.reference_name)).to_string(),
+                );
             }
         }
         for node in self.store.nodes_by_kind(NodeKind::File)? {
@@ -1132,6 +1135,17 @@ impl<'store> GraphTraverser<'store> {
 /// carrying a backslash).
 fn normalize_rel(path: &str) -> String {
     path.replace('\\', "/")
+}
+
+/// Strip a leading `res://` Godot project-URI scheme; return the input unchanged
+/// otherwise. GDScript `extends "res://X"` / `preload("res://X")` store the ref
+/// name WITH this prefix (walker.rs quote-strips but keeps the scheme), whereas
+/// `.tscn`/`.tres` refs are already mapped to project-relative at extraction
+/// (godot_common.rs `map_res_path`). Applied only at the unresolved-ref path
+/// comparison sites so both families compare as project-relative; NOT folded
+/// into the shared `normalize_rel` (6 callers) to avoid coupling.
+fn strip_res_prefix(s: &str) -> &str {
+    s.strip_prefix("res://").unwrap_or(s)
 }
 
 /// The `metadata.subkind` string the resolver tags onto Godot edges; `None` otherwise.

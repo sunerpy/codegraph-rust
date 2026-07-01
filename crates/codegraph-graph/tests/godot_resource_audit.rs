@@ -622,3 +622,141 @@ fn impact_surfaces_gdscript_extends_path_via_extends_edge() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn gdscript_extends_res_prefix_to_existing_file_is_not_dangling() {
+    // Given a child.gd whose `extends "res://a/base.gd"` target EXISTS on disk.
+    // The GDScript ref is stored WITH the `res://` prefix
+    // (`reference_name="res://a/base.gd"`), while the file lives at the
+    // project-relative `a/base.gd`; without stripping the prefix, the disk
+    // existence check `project_root.join("res://a/base.gd")` misses the real
+    // file and falsely reports it dangling.
+    let dir = unique_dir("dangling-extends-res-exists");
+    write(&dir, "project.godot", PROJECT_GODOT);
+    write(
+        &dir,
+        "a/base.gd",
+        "extends Node\n\nfunc base_fn():\n\tpass\n",
+    );
+    write(
+        &dir,
+        "child.gd",
+        "extends \"res://a/base.gd\"\n\nfunc go():\n\tpass\n",
+    );
+    // When dangling detection runs,
+    let store = run_pipeline(
+        "dangling-extends-res-exists",
+        &dir,
+        &["project.godot", "a/base.gd", "child.gd"],
+    );
+    let dangling = GraphTraverser::new(&store)
+        .find_dangling_references(&dir)
+        .expect("dangling");
+    // Then the existing target is NOT reported dangling under either the raw
+    // `res://` name or the stripped project-relative name.
+    assert!(
+        !dangling
+            .iter()
+            .any(|d| d.target_path == "res://a/base.gd" || d.target_path == "a/base.gd"),
+        "extends \"res://a/base.gd\" whose target exists must not be dangling, got: {dangling:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn gdscript_extends_res_prefix_to_missing_file_is_dangling_with_clean_target() {
+    // Given a child.gd whose `extends "res://a/missing.gd"` target does NOT
+    // exist on disk. It must still be reported dangling, and the reported
+    // `target_path` must be the clean project-relative path (no `res://`).
+    let dir = unique_dir("dangling-extends-res-missing");
+    write(&dir, "project.godot", PROJECT_GODOT);
+    write(
+        &dir,
+        "child.gd",
+        "extends \"res://a/missing.gd\"\n\nfunc go():\n\tpass\n",
+    );
+    // When dangling detection runs,
+    let store = run_pipeline(
+        "dangling-extends-res-missing",
+        &dir,
+        &["project.godot", "child.gd"],
+    );
+    let dangling = GraphTraverser::new(&store)
+        .find_dangling_references(&dir)
+        .expect("dangling");
+    // Then the missing target is reported with a `res://`-free target_path.
+    assert!(
+        dangling.iter().any(|d| d.target_path == "a/missing.gd"),
+        "missing extends target must be dangling with a clean project-relative target, got: {dangling:?}"
+    );
+    assert!(
+        !dangling.iter().any(|d| d.target_path.contains("res://")),
+        "dangling target_path must never carry a res:// prefix, got: {dangling:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn impact_matches_gdscript_res_prefix_extends_ref() {
+    // Given a child.gd whose `extends "res://a/base.gd"` target is MISSING, so
+    // the ref stays unresolved carrying the `res://` prefix
+    // (`reference_name="res://a/base.gd"`). `resource_impact("a/base.gd")` must
+    // still match it despite the prefix (the unresolved-ref match strips it).
+    let dir = unique_dir("impact-res-prefix-extends");
+    write(&dir, "project.godot", PROJECT_GODOT);
+    write(
+        &dir,
+        "child.gd",
+        "extends \"res://a/base.gd\"\n\nfunc go():\n\tpass\n",
+    );
+    // When impact is computed for the (missing) extended base path,
+    let store = run_pipeline(
+        "impact-res-prefix-extends",
+        &dir,
+        &["project.godot", "child.gd"],
+    );
+    let impact = GraphTraverser::new(&store)
+        .resource_impact("a/base.gd")
+        .expect("impact");
+    // Then the extending site is listed despite the stored `res://` prefix.
+    assert!(
+        impact.affected.iter().any(|a| a.from_file == "child.gd"),
+        "res://-prefixed extends must match resource_impact(\"a/base.gd\"), got: {impact:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn resource_referenced_only_by_res_prefix_gdscript_ref_is_not_orphan() {
+    // Given a .tscn referenced ONLY by a GDScript `get_node("res://…")` — the
+    // ref carries the `res://` prefix in `unresolved_refs`. Without stripping the
+    // prefix when building the referenced-set for orphan accounting, the target
+    // is falsely reported orphan.
+    let dir = unique_dir("orphan-res-prefix-gdscript");
+    write(&dir, "project.godot", PROJECT_GODOT);
+    write(
+        &dir,
+        "data/thing.tscn",
+        "[gd_scene format=3]\n\n[node name=\"R\" type=\"Node\"]\n",
+    );
+    write(
+        &dir,
+        "loader.gd",
+        "extends Node\n\nfunc go():\n\tget_node(\"res://data/thing.tscn\")\n",
+    );
+    // When orphan detection runs,
+    let store = run_pipeline(
+        "orphan-res-prefix-gdscript",
+        &dir,
+        &["project.godot", "data/thing.tscn", "loader.gd"],
+    );
+    let orphans = GraphTraverser::new(&store)
+        .find_orphan_resources()
+        .expect("orphans");
+    // Then the resource is NOT orphan — the res:// GDScript ref marks it referenced.
+    assert!(
+        !orphans.iter().any(|o| o.file_path == "data/thing.tscn"),
+        "resource referenced by a res:// GDScript ref must not be orphan, got: {orphans:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
