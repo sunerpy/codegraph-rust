@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.22.0](https://github.com/sunerpy/codegraph-rust/compare/v0.21.0...v0.22.0) (2026-07-01)
+
+
+### Features
+
+* **installer:** add Trae and Qoder targets, read-only global Kiro entry, IDE docs ([#97](https://github.com/sunerpy/codegraph-rust/issues/97)) ([6b14f0e](https://github.com/sunerpy/codegraph-rust/commit/6b14f0e4057ae413936cf5ca655387f8a5d15bcc))
+
 ## [0.21.0](https://github.com/sunerpy/codegraph-rust/compare/v0.20.1...v0.21.0) (2026-06-30)
 
 
