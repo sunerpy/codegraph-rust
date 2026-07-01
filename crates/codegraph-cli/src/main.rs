@@ -1860,6 +1860,7 @@ struct VerifyReason {
     file: String,
     line: i64,
     edge_kind: String,
+    target: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     edge_subkind: Option<String>,
 }
@@ -1913,6 +1914,7 @@ fn verify_plan_view(impact: &codegraph_graph::graph::ResourceImpact) -> VerifyPl
             file: affected.from_file.clone(),
             line: affected.line,
             edge_kind: affected.edge_kind.clone(),
+            target: affected.target.clone(),
             edge_subkind: affected.edge_subkind.clone(),
         });
     }

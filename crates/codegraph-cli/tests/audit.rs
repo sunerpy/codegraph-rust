@@ -499,6 +499,42 @@ fn audit_verify_plan_requires_impact() {
 }
 
 #[test]
+fn audit_verify_plan_reasons_carry_target() {
+    // Given the fixture indexed (data.tres references referenced.tres via ExtResource),
+    let (_dir, project) = indexed_project("verify-plan-reasons-target");
+    let p = project.to_str().unwrap();
+
+    // When audit --impact referenced.tres --verify-plan --json runs,
+    let (stdout, err, ok) = cli(&[
+        "audit",
+        "--impact",
+        "referenced.tres",
+        "--verify-plan",
+        "--json",
+        "-p",
+        p,
+    ]);
+    assert!(ok, "audit failed: stderr={err}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+
+    // Then every verifyPlan reason row carries target=referenced.tres (the
+    // changed/affected target it refers to), and there is at least one reason.
+    let reasons = value["verifyPlan"]["reasons"]
+        .as_array()
+        .expect("reasons array");
+    assert!(
+        !reasons.is_empty(),
+        "referenced.tres must produce at least one reason, got: {value:?}"
+    );
+    assert!(
+        reasons
+            .iter()
+            .all(|r| r["target"].as_str() == Some("referenced.tres")),
+        "every reason must carry target=referenced.tres, got: {reasons:?}"
+    );
+}
+
+#[test]
 fn audit_impact_surfaces_edge_subkind_for_godot_ref() {
     // Given the fixture indexed (data.tres references referenced.tres via ExtResource),
     let (_dir, project) = indexed_project("impact-subkind");
