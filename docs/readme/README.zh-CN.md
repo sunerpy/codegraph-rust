@@ -76,7 +76,7 @@ codegraph serve --mcp --path /path/to/project  # 可选：固定到指定项目
 ```
 
 自动注册进你的代理配置（Claude Code / Cursor / Codex CLI / opencode / Hermes /
-Gemini CLI / Antigravity / Kiro）：
+Gemini CLI / Antigravity / Kiro / Trae / Qoder）：
 
 ```bash
 codegraph install --yes              # 检测已安装的代理并接线
@@ -162,7 +162,7 @@ cargo install --git https://github.com/sunerpy/codegraph-rust codegraph-rs
 `"args": ["serve", "--mcp", "-p", "/abs/path/to/project"]`）。
 
 支持的代理：Claude Code、Cursor、Codex CLI、opencode、Hermes Agent、
-Gemini CLI、Antigravity IDE、Kiro。
+Gemini CLI、Antigravity IDE、Kiro、Trae、Qoder。
 
 ```bash
 codegraph install --yes                          # 自动检测已安装代理
@@ -191,8 +191,8 @@ codegraph skill uninstall --target=claude --yes       # 从单个代理中移除
 codegraph skill status                                # 查看所有已检测代理的安装状态
 ```
 
-全部 8 个支持的代理均有技能目录（Claude Code、Cursor、Codex CLI、opencode、
-Hermes Agent、Gemini CLI、Antigravity IDE、Kiro）。默认位置为 `--global`；传入
+全部 10 个支持的代理均有技能目录（Claude Code、Cursor、Codex CLI、opencode、
+Hermes Agent、Gemini CLI、Antigravity IDE、Kiro、Trae、Qoder）。默认位置为 `--global`；传入
 `--local` 可写入项目树。Hermes 仅支持全局安装。
 
 **更新语义。** `skill update` 用 git blob SHA-1 对比已安装文件与内嵌版本的内容哈希。
@@ -201,6 +201,36 @@ Hermes Agent、Gemini CLI、Antigravity IDE、Kiro）。默认位置为 `--globa
 时的哈希值，更新检查据此区分"已过时"与"本地修改"两种状态。
 
 完整参考（含各代理技能路径）：[`../cli.md`](../cli.md)。
+
+---
+
+## 在 IDE 中使用 CodeGraph
+
+`codegraph install` 为每个支持的代理/IDE 写入 MCP 服务器配置。索引能否保持实时更新，
+取决于 IDE 是否支持 `${workspaceFolder}` 变量替换。
+
+| IDE / 代理 | 全局配置策略                                                                                                                                                                                                                                                                   | 实时监听                     |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------- |
+| **Cursor** | 全局 `~/.cursor/mcp.json` 使用 `--path ${workspaceFolder}`，一份配置自动跟随每个项目窗口。                                                                                                                                                                                     | 保存即更新（守护进程监听）。 |
+| **Trae**   | 全局配置（服务器/远程模式使用 `~/.trae-server/data/Machine/mcp.json`，桌面模式使用 `Trae/User/mcp.json`）使用 `--path ${workspaceFolder}`，一份配置自动跟随每个项目窗口。注意：项目级 `.trae/mcp.json` 需要在 Trae 设置中开启**"启用项目级 MCP / Enable project-level MCP"**。 | 保存即更新（守护进程监听）。 |
+| **Kiro**   | 全局 `~/.kiro/settings/mcp.json` 写入裸 `serve --mcp` 条目（无 `--path`）。代理每次工具调用时传入项目路径——工具可只读访问现有索引，但没有实时监听。                                                                                                                            | 仅手动触发（见下文）。       |
+| **Qoder**  | 全局条目（`<config_base>/QoderCN\|Qoder/<machineId>/SharedClientCache/mcp.json`）写入裸 `serve --mcp` 条目。工具可只读访问现有索引；该布局下 IDE 不展开 `${workspaceFolder}`。                                                                                                 | 仅手动触发（见下文）。       |
+
+**在 Kiro 或 Qoder 中获得实时自动更新。** 在每个项目中运行一次
+`codegraph init --target=<ide>`：
+
+```bash
+cd /your/project
+codegraph init --target=kiro    # 或 --target=qoder
+```
+
+对于未建立索引的新项目，该命令会建立索引并写入包含绝对 `--path` 的项目级配置。
+对于已建立索引的项目，它只写入（或刷新）项目级配置，依靠守护进程的文件监听和
+启动追赶机制保持实时更新。配置写入后，你的编辑会自动反映到索引中。
+
+若没有项目级配置，索引只有在手动执行 `codegraph index` 或 `codegraph sync` 时
+才会更新。这与上游 CodeGraph 的行为一致：无法上报工作区根目录的客户端依靠启动追赶
+和手动重建索引，而非每次工具调用时同步。
 
 ---
 

@@ -31,9 +31,13 @@ The published crate is `codegraph-rs` (the `codegraph-cli` package); the install
 ## Agent installer (`codegraph install` / `uninstall`)
 
 `codegraph install` writes the codegraph MCP-server entry into each supported agent's config
-(Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro);
+(Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, Trae, Qoder);
 `uninstall` reverses it. The written command launches the binary (`command: "codegraph"`,
-`args: ["serve", "--mcp"]`). Non-interactive, flag-driven (`--target`, `--global`/`--local`/`--location`,
+`args: ["serve", "--mcp"]`). Cursor and Trae use `--path ${workspaceFolder}` in their global config so
+one entry auto-follows each project window; Kiro and Qoder write a bare global entry (no `--path`) that
+serves tools read-only off any existing index, with the agent passing the project path per call — run
+`codegraph init --target=<ide>` inside each project to write a project-local config with an absolute
+`--path` for live watch. Non-interactive, flag-driven (`--target`, `--global`/`--local`/`--location`,
 `--yes`, `--no-permissions`, `--print-config`); the config-writing logic (paths/keys/marker sections,
 idempotent upsert, uninstall removal) is CLI-only and additive — it does NOT touch
 extraction/golden equivalence.

@@ -37,6 +37,8 @@ pub enum TargetId {
     Gemini,
     Antigravity,
     Kiro,
+    Trae,
+    Qoder,
 }
 
 impl TargetId {
@@ -50,6 +52,8 @@ impl TargetId {
             TargetId::Gemini => "gemini",
             TargetId::Antigravity => "antigravity",
             TargetId::Kiro => "kiro",
+            TargetId::Trae => "trae",
+            TargetId::Qoder => "qoder",
         }
     }
 }

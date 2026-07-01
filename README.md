@@ -184,7 +184,7 @@ See [`docs/mcp.md`](docs/mcp.md#project-resolution) for the full three-case
 breakdown.
 
 Supported agents: Claude Code, Cursor, Codex CLI, opencode, Hermes Agent,
-Gemini CLI, Antigravity IDE, Kiro.
+Gemini CLI, Antigravity IDE, Kiro, Trae, Qoder.
 
 ```bash
 codegraph install --yes                          # auto-detect installed agents
@@ -214,10 +214,10 @@ codegraph skill uninstall --target=claude --yes       # remove from one agent
 codegraph skill status                     # show state for all detected agents
 ```
 
-All eight supported agents have a skill directory (Claude Code, Cursor, Codex
-CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro). Default
-location is `--global`; pass `--local` to write into the project tree. Hermes
-supports global only.
+All ten supported agents have a skill directory (Claude Code, Cursor, Codex
+CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, Trae, Qoder).
+Default location is `--global`; pass `--local` to write into the project tree.
+Hermes supports global only.
 
 **Update behavior.** `skill update` compares the installed file's content hash
 against the embedded version. An unmodified file is refreshed automatically; a
@@ -226,6 +226,39 @@ overwrite). A small sidecar file (`.codegraph-skill.json`) records the installed
 hash so the update check can distinguish "outdated" from "locally modified".
 
 Full reference including per-agent skill paths: [`docs/cli.md`](docs/cli.md).
+
+---
+
+## Using CodeGraph in IDEs
+
+`codegraph install` registers the MCP server entry for each supported agent/IDE.
+How well the index stays live depends on whether the IDE expands `${workspaceFolder}`.
+
+| IDE / Agent | Global config strategy                                                                                                                                                                                                                                                                                                          | Live watch                     |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------ |
+| **Cursor**  | Global `~/.cursor/mcp.json` uses `--path ${workspaceFolder}` — one config auto-follows every project window.                                                                                                                                                                                                                    | Live on save (daemon watcher). |
+| **Trae**    | Global config (`~/.trae-server/data/Machine/mcp.json` in server/remote mode, or `Trae/User/mcp.json` in desktop mode) uses `--path ${workspaceFolder}` — one config auto-follows every project window. Note: project-level `.trae/mcp.json` requires enabling **"Enable project-level MCP / 启用项目级 MCP"** in Trae settings. | Live on save (daemon watcher). |
+| **Kiro**    | Global `~/.kiro/settings/mcp.json` holds a bare `serve --mcp` entry (no `--path`). The agent passes the project path per tool call — tools work read-only off the existing index, but there is no live watch.                                                                                                                   | Manual only (see below).       |
+| **Qoder**   | Global entry (`<config_base>/QoderCN\|Qoder/<machineId>/SharedClientCache/mcp.json`) holds a bare `serve --mcp` entry. Tools work read-only off the existing index; the IDE does not expand `${workspaceFolder}` in this layout.                                                                                                | Manual only (see below).       |
+
+**Getting live auto-update in Kiro or Qoder.** Run `codegraph init --target=<ide>`
+once inside each project:
+
+```bash
+cd /your/project
+codegraph init --target=kiro    # or --target=qoder
+```
+
+On a fresh (unindexed) project this builds the index and writes a project-level
+config with the absolute `--path`. On an already-indexed project it writes (or
+refreshes) the project-level config and relies on the daemon's file watcher and
+startup catch-up to keep it live. Either way, once the local config is in place
+the index stays current as you edit.
+
+Without a project-level config, the index only updates when you run
+`codegraph index` or `codegraph sync` manually. This mirrors upstream CodeGraph's
+behavior: clients that cannot report a workspace root rely on startup catch-up and
+manual reindex rather than per-call sync.
 
 ---
 
