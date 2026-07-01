@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.24.0](https://github.com/sunerpy/codegraph-rust/compare/v0.23.1...v0.24.0) (2026-07-01)
+
+
+### Features
+
+* **godot:** static graph fixes — res:// paths, ClassName.member resolution & qualified queries, impact input, reasons.target ([#103](https://github.com/sunerpy/codegraph-rust/issues/103)) ([364ebd8](https://github.com/sunerpy/codegraph-rust/commit/364ebd8cd0935db551c009d877026658307089b6))
+
 ## [0.23.1](https://github.com/sunerpy/codegraph-rust/compare/v0.23.0...v0.23.1) (2026-07-01)
 
 
