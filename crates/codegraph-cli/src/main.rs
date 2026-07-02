@@ -1134,6 +1134,7 @@ fn cmd_files(
 fn cmd_serve(path: Option<PathBuf>, mcp: bool, no_watch: bool) -> Result<()> {
     // Default the MCP project to cwd so `serve --mcp` (no --path, as the
     // installer injects) finds the index of the agent's project root.
+    let explicit_path = path.is_some();
     let project = Some(resolve_project_path_optional(&absolute_path(
         path.unwrap_or_else(|| PathBuf::from(".")),
     )));
@@ -1157,7 +1158,7 @@ fn cmd_serve(path: Option<PathBuf>, mcp: bool, no_watch: bool) -> Result<()> {
         let has_codegraph = codegraph_dir(&project_root).is_dir();
         match select_serve_mode(daemon_opt_out(), is_daemon_internal(), has_codegraph) {
             ServeMode::Direct => {
-                return serve_direct(project, &project_root, no_watch);
+                return serve_direct(project, &project_root, no_watch, explicit_path);
             }
             ServeMode::BeDaemon => {
                 return codegraph_daemon::run_foreground(
@@ -1173,7 +1174,7 @@ fn cmd_serve(path: Option<PathBuf>, mcp: bool, no_watch: bool) -> Result<()> {
                 if let Some(result) = spawn_or_proxy(project.clone(), &project_root, no_watch) {
                     return result;
                 }
-                return serve_direct(project, &project_root, no_watch);
+                return serve_direct(project, &project_root, no_watch, explicit_path);
             }
         }
     }
@@ -1183,7 +1184,23 @@ fn cmd_serve(path: Option<PathBuf>, mcp: bool, no_watch: bool) -> Result<()> {
     Ok(())
 }
 
-fn serve_direct(project: Option<PathBuf>, project_root: &Path, no_watch: bool) -> Result<()> {
+/// Whether `serve --mcp` should start background services (live watcher +
+/// catch-up sync) for `project_root`. They run when the path was EXPLICIT
+/// (`--path X` — the user opted into X) or the cwd is ALREADY indexed. A bare
+/// serve from an UNINDEXED cwd (the Zed case) returns false so catch-up never
+/// self-indexes the cwd — keeping it unindexed and therefore adoptable when the
+/// client reports its real workspace root via `roots/list`.
+fn should_run_serve_services(explicit_path: bool, project_root: &Path) -> bool {
+    explicit_path || codegraph_dir(project_root).is_dir()
+}
+
+fn serve_direct(
+    project: Option<PathBuf>,
+    project_root: &Path,
+    no_watch: bool,
+    explicit_path: bool,
+) -> Result<()> {
+    let run_services = should_run_serve_services(explicit_path, project_root);
     // Watcher startup stays here (pre-handshake). Layer A
     // (`watch_disabled_reason`) already refuses to walk HOME / the filesystem
     // root, so a home-rooted launch never exhausts inotify. Restarting the
@@ -1191,15 +1208,20 @@ fn serve_direct(project: Option<PathBuf>, project_root: &Path, no_watch: bool) -
     // (Layer B) would require McpServer to own the watcher lifecycle across
     // crates; it is deferred — the adopted root still serves tools and is
     // reconciled by the background catch-up sync, just without a live watch.
-    let _watcher = start_direct_watcher(project_root, no_watch);
+    // Skipped entirely for a bare serve from an unindexed cwd so the cwd is
+    // never self-indexed (keeps it adoptable via roots/list).
+    let _watcher = run_services.then(|| start_direct_watcher(project_root, no_watch));
     // Background catch-up of edits made while the server was down (#905). It runs
     // on a detached worker thread; `server.run` proceeds immediately so the FIRST
     // tools/call NEVER waits on the reconcile. Bind the flag to keep it alive (a
     // future status surface can read it); it is intentionally never awaited.
     // Skipped for a too-broad root ($HOME / filesystem root) — `sync_project_once`
-    // there walks the entire home tree and pegs a CPU at 99%.
-    let _catch_up_done =
-        should_run_daemon_services(project_root).then(|| spawn_catch_up(project_root));
+    // there walks the entire home tree and pegs a CPU at 99% — and for a bare
+    // serve from an unindexed cwd, where `Store::open` would otherwise create
+    // `.codegraph/` and race roots adoption (the real project root Zed reports
+    // would then be rejected as "already indexed cwd").
+    let _catch_up_done = (run_services && should_run_daemon_services(project_root))
+        .then(|| spawn_catch_up(project_root));
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut server = McpServer::new(project);
@@ -1497,7 +1519,10 @@ pub fn select_serve_mode(
 
 #[cfg(test)]
 mod serve_mode_tests {
-    use super::{guard_indexable_root, select_serve_mode, should_run_daemon_services, ServeMode};
+    use super::{
+        guard_indexable_root, select_serve_mode, should_run_daemon_services,
+        should_run_serve_services, ServeMode,
+    };
     use std::path::Path;
     use std::sync::Mutex;
 
@@ -1512,6 +1537,36 @@ mod serve_mode_tests {
             select_serve_mode(false, false, true),
             ServeMode::SpawnOrProxy
         );
+    }
+
+    #[test]
+    fn serve_services_gate_skips_unindexed_bare_cwd_but_runs_when_explicit_or_indexed() {
+        let seq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let unindexed =
+            std::env::temp_dir().join(format!("cg-serve-gate-unidx-{}-{seq}", std::process::id()));
+        let indexed =
+            std::env::temp_dir().join(format!("cg-serve-gate-idx-{}-{seq}", std::process::id()));
+        std::fs::create_dir_all(&unindexed).unwrap();
+        std::fs::create_dir_all(indexed.join(".codegraph")).unwrap();
+
+        assert!(
+            should_run_serve_services(true, &unindexed),
+            "explicit --path must run services even on an unindexed root"
+        );
+        assert!(
+            !should_run_serve_services(false, &unindexed),
+            "bare serve from an unindexed cwd must NOT run services (keeps cwd adoptable)"
+        );
+        assert!(
+            should_run_serve_services(false, &indexed),
+            "an already-indexed cwd must keep services"
+        );
+
+        let _ = std::fs::remove_dir_all(&unindexed);
+        let _ = std::fs::remove_dir_all(&indexed);
     }
 
     #[test]
