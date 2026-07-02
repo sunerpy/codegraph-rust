@@ -18,7 +18,10 @@ use serde_json::{json, Value};
 use crate::engine::CodeGraphEngine;
 use crate::instructions::SERVER_INSTRUCTIONS;
 use crate::protocol::{error_codes, JsonRpcRequest, JsonRpcResponse, ToolResult};
-use crate::roots::{db_path_for, roots_list_request, WorkspaceRoots, ROOTS_LIST_REQUEST_ID};
+use crate::roots::{
+    db_path_for, debug_enabled, format_tool_debug_line, roots_list_request, WorkspaceRoots,
+    ROOTS_LIST_REQUEST_ID,
+};
 use crate::schemas;
 
 /// `PROTOCOL_VERSION` (`session.ts:34`).
@@ -351,11 +354,13 @@ impl McpServer {
         match req.method.as_str() {
             "initialize" if is_request => {
                 let cwd = self.cwd.clone();
+                let old_default = self.default_project.clone();
                 if let Some(adopted) = self.workspace_roots.adopt_from_initialize(
                     &mut self.default_project,
                     cwd.as_deref(),
                     req.params.as_ref(),
                 ) {
+                    self.debug_roots_adopted(&adopted, old_default.as_deref());
                     self.notify_adopted(&adopted);
                     return Dispatch::ReplyWithAdoption {
                         reply: initialize_result(),
@@ -414,15 +419,28 @@ impl McpServer {
             return None;
         }
         let cwd = self.cwd.clone();
+        let old_default = self.default_project.clone();
         if let Some(adopted) = self.workspace_roots.adopt_from_roots_result(
             &mut self.default_project,
             cwd.as_deref(),
             response.get("result"),
         ) {
+            self.debug_roots_adopted(&adopted, old_default.as_deref());
             self.notify_adopted(&adopted);
             return Some(adopted);
         }
         None
+    }
+
+    fn debug_roots_adopted(&self, adopted: &Path, old_default: Option<&Path>) {
+        if !debug_enabled() {
+            return;
+        }
+        let was = old_default.map_or_else(|| "none".to_string(), |p| p.display().to_string());
+        eprintln!(
+            "[codegraph debug] roots: adopted {} (was default={was})",
+            adopted.display()
+        );
     }
 
     fn notify_adopted(&mut self, path: &Path) {
@@ -453,7 +471,20 @@ impl McpServer {
             .unwrap_or_else(|| json!({}));
 
         let raw_project = args.get("projectPath").and_then(Value::as_str);
-        let project_path = match self.resolve_project_arg(raw_project) {
+        let resolved = self.resolve_project_arg(raw_project);
+        if debug_enabled() {
+            eprintln!(
+                "{}",
+                format_tool_debug_line(
+                    &tool_name,
+                    raw_project,
+                    resolved.as_deref(),
+                    self.cwd.as_deref(),
+                    self.default_project.as_deref(),
+                )
+            );
+        }
+        let project_path = match resolved {
             Some(p) => p,
             None => {
                 let message = match raw_project {

@@ -6,6 +6,42 @@ use serde_json::{json, Value};
 
 pub const ROOTS_LIST_REQUEST_ID: &str = "codegraph-roots-list-1";
 
+/// Whether `CODEGRAPH_DEBUG` is truthy (`"1"`/`"true"`), gating the
+/// `[codegraph debug]` stderr trace lines. Off ⇒ no new output (stdout stays
+/// pure JSON-RPC).
+pub fn debug_enabled() -> bool {
+    matches!(
+        std::env::var("CODEGRAPH_DEBUG").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
+/// Pure formatter for the per-tool `projectPath` resolution debug line
+/// (unit-tested without touching process state).
+pub fn format_tool_debug_line(
+    tool_name: &str,
+    raw_project: Option<&str>,
+    resolved: Option<&Path>,
+    cwd: Option<&Path>,
+    default_project: Option<&Path>,
+) -> String {
+    let raw = raw_project.unwrap_or("(none)");
+    let (resolved_str, db_str, db_exists) = match resolved {
+        Some(p) => {
+            let db = db_path_for(p);
+            let exists = db.is_file();
+            (p.display().to_string(), db.display().to_string(), exists)
+        }
+        None => ("(unresolved)".to_string(), "(none)".to_string(), false),
+    };
+    let cwd_str = cwd.map_or_else(|| "(none)".to_string(), |p| p.display().to_string());
+    let default_str =
+        default_project.map_or_else(|| "(none)".to_string(), |p| p.display().to_string());
+    format!(
+        "[codegraph debug] tool={tool_name} projectPath_raw={raw} resolved={resolved_str} db={db_str} db_exists={db_exists} cwd={cwd_str} default_project={default_str}"
+    )
+}
+
 /// The relative `.codegraph/codegraph.db` path under a project root, honoring
 /// the `CODEGRAPH_DIR` override.
 pub fn db_path_for(project_path: &Path) -> PathBuf {
@@ -199,8 +235,10 @@ fn percent_decode(input: &str) -> String {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct TempProject {
         path: PathBuf,
@@ -400,5 +438,58 @@ mod tests {
             Some(explicit.path()),
             Some(&json!({ "capabilities": { "roots": { "listChanged": true } } }))
         ));
+    }
+
+    #[test]
+    fn debug_enabled_honors_truthy_values_only() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("CODEGRAPH_DEBUG").ok();
+
+        std::env::remove_var("CODEGRAPH_DEBUG");
+        assert!(!debug_enabled(), "unset ⇒ off");
+
+        std::env::set_var("CODEGRAPH_DEBUG", "1");
+        assert!(debug_enabled(), "\"1\" ⇒ on");
+
+        std::env::set_var("CODEGRAPH_DEBUG", "true");
+        assert!(debug_enabled(), "\"true\" ⇒ on");
+
+        std::env::set_var("CODEGRAPH_DEBUG", "0");
+        assert!(!debug_enabled(), "\"0\" ⇒ off");
+
+        std::env::set_var("CODEGRAPH_DEBUG", "yes");
+        assert!(!debug_enabled(), "any other value ⇒ off");
+
+        match prev {
+            Some(v) => std::env::set_var("CODEGRAPH_DEBUG", v),
+            None => std::env::remove_var("CODEGRAPH_DEBUG"),
+        }
+    }
+
+    #[test]
+    fn format_tool_debug_line_reports_resolved_project_and_db() {
+        let project = indexed_project("dbgline");
+        let line = format_tool_debug_line(
+            "codegraph_search",
+            Some("codegraph-rust"),
+            Some(project.path()),
+            Some(Path::new("/tmp/cwd")),
+            Some(Path::new("/tmp/default")),
+        );
+        let expected = format!(
+            "[codegraph debug] tool=codegraph_search projectPath_raw=codegraph-rust resolved={} db={} db_exists=true cwd=/tmp/cwd default_project=/tmp/default",
+            project.path().display(),
+            db_path_for(project.path()).display(),
+        );
+        assert_eq!(line, expected);
+    }
+
+    #[test]
+    fn format_tool_debug_line_marks_unresolved_and_missing() {
+        let line = format_tool_debug_line("codegraph_node", None, None, None, None);
+        assert_eq!(
+            line,
+            "[codegraph debug] tool=codegraph_node projectPath_raw=(none) resolved=(unresolved) db=(none) db_exists=false cwd=(none) default_project=(none)"
+        );
     }
 }

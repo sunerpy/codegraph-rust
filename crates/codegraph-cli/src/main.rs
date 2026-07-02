@@ -948,6 +948,12 @@ fn cmd_sync(path: Option<PathBuf>, quiet: bool) -> Result<()> {
 fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
     let start = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
     let project = resolve_project_path_optional(&start);
+    let db = db_path(&project);
+    let db_exists = db.is_file();
+    let daemon_running = daemon_already_running(&project);
+    let daemon_pid_path = codegraph_daemon::daemon_pid_path(&project);
+    let daemon_socket_path = codegraph_daemon::recorded_socket_path(&project);
+    let daemon_log_path = codegraph_daemon::daemon_log_path(&project);
     if !is_initialized(&project) {
         if json_output {
             print_json(&json!({
@@ -956,10 +962,21 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
                 "projectPath": project,
                 "indexPath": codegraph_dir(&project),
                 "lastIndexed": null,
+                "dbPath": db,
+                "dbExists": db_exists,
+                "daemonRunning": daemon_running,
+                "daemonPidPath": daemon_pid_path,
+                "daemonSocketPath": daemon_socket_path,
+                "daemonLogPath": daemon_log_path,
             }))?;
         } else {
             println!("\nCodeGraph Status\n");
             println!("Project: {}", project.display());
+            println!("DB Path: {}", db.display());
+            println!(
+                "Daemon:  {}",
+                if daemon_running { "running" } else { "stopped" }
+            );
             println!("Not initialized");
             println!("Run \"codegraph init\" to initialize");
         }
@@ -1004,6 +1021,12 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
                 "currentExtractionVersion": EXTRACTION_VERSION,
                 "reindexRecommended": reindex_recommended,
             },
+            "dbPath": db,
+            "dbExists": db_exists,
+            "daemonRunning": daemon_running,
+            "daemonPidPath": daemon_pid_path,
+            "daemonSocketPath": daemon_socket_path,
+            "daemonLogPath": daemon_log_path,
         }))?;
         return Ok(());
     }
@@ -1017,6 +1040,11 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
     println!("  DB Size:   {:.2} MB", db_size as f64 / 1024.0 / 1024.0);
     println!("  Backend:   rusqlite - bundled SQLite");
     println!("  Journal:   {}\n", journal_mode(&store)?);
+    println!("  DB Path:   {}", db.display());
+    println!(
+        "  Daemon:    {}\n",
+        if daemon_running { "running" } else { "stopped" }
+    );
     println!("Nodes by Kind:");
     for (kind, count) in nodes_by_kind {
         println!("  {kind:15} {}", format_number(count));
@@ -1131,6 +1159,36 @@ fn cmd_files(
     Ok(())
 }
 
+/// Whether `CODEGRAPH_DEBUG` is truthy (`"1"`/`"true"`), gating the
+/// `[codegraph debug]` stderr trace lines. Off ⇒ no new output.
+fn debug_enabled() -> bool {
+    matches!(
+        std::env::var("CODEGRAPH_DEBUG").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
+fn emit_serve_startup_debug(
+    project_root: &Path,
+    explicit_path: bool,
+    has_codegraph: bool,
+    mode: &ServeMode,
+) {
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "(unknown)".to_string());
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "(unknown)".to_string());
+    let db = db_path(project_root);
+    eprintln!(
+        "[codegraph debug] serve: exe={exe} cwd={cwd} explicit_path={explicit_path} default_project={} db={} db_exists={} has_codegraph_dir={has_codegraph} mode={mode:?}",
+        project_root.display(),
+        db.display(),
+        db.is_file(),
+    );
+}
+
 fn cmd_serve(path: Option<PathBuf>, mcp: bool, no_watch: bool) -> Result<()> {
     // Default the MCP project to cwd so `serve --mcp` (no --path, as the
     // installer injects) finds the index of the agent's project root.
@@ -1156,7 +1214,11 @@ fn cmd_serve(path: Option<PathBuf>, mcp: bool, no_watch: bool) -> Result<()> {
             return serve_direct_no_services(project, &project_root);
         }
         let has_codegraph = codegraph_dir(&project_root).is_dir();
-        match select_serve_mode(daemon_opt_out(), is_daemon_internal(), has_codegraph) {
+        let mode = select_serve_mode(daemon_opt_out(), is_daemon_internal(), has_codegraph);
+        if debug_enabled() {
+            emit_serve_startup_debug(&project_root, explicit_path, has_codegraph, &mode);
+        }
+        match mode {
             ServeMode::Direct => {
                 return serve_direct(project, &project_root, no_watch, explicit_path);
             }
@@ -1266,6 +1328,11 @@ fn serve_adopted_project<R: BufRead, W: Write + Send + 'static>(
         Ok(client) if codegraph_daemon::verify_daemon_hello(&client.hello).is_none() => {}
         Ok(_) => {
             tracing::debug!("adopted project daemon version mismatch; serving direct");
+            if debug_enabled() {
+                eprintln!(
+                    "[codegraph debug] serve_adopted: daemon version mismatch; serving direct"
+                );
+            }
             let mut server = McpServer::new(Some(project_root));
             return server
                 .run(reader, writer)
@@ -1273,6 +1340,11 @@ fn serve_adopted_project<R: BufRead, W: Write + Send + 'static>(
         }
         Err(err) => {
             tracing::debug!(error = %err, "adopted project daemon preflight failed; serving direct");
+            if debug_enabled() {
+                eprintln!(
+                    "[codegraph debug] serve_adopted: daemon preflight failed ({err}); serving direct"
+                );
+            }
             let mut server = McpServer::new(Some(project_root));
             return server
                 .run(reader, writer)
@@ -1290,6 +1362,9 @@ fn serve_adopted_project<R: BufRead, W: Write + Send + 'static>(
         Ok(codegraph_daemon::ProxyOutcome::VersionMismatch) => Ok(()),
         Err(err) => {
             tracing::debug!(error = %err, "adopted project proxy attach failed");
+            if debug_enabled() {
+                eprintln!("[codegraph debug] serve_adopted: proxy attach failed ({err})");
+            }
             Ok(())
         }
     }
@@ -1303,6 +1378,13 @@ fn start_daemon_for_adopted_root(project_root: &Path) -> Option<PathBuf> {
         return None;
     }
     if daemon_already_running(project_root) {
+        if debug_enabled() {
+            eprintln!(
+                "[codegraph debug] adopted-root: attaching to existing daemon (pid_path={} socket_path={})",
+                codegraph_daemon::daemon_pid_path(project_root).display(),
+                codegraph_daemon::recorded_socket_path(project_root).display(),
+            );
+        }
         return Some(codegraph_daemon::recorded_socket_path(project_root));
     }
     let Ok(exe) = std::env::current_exe() else {
@@ -1315,6 +1397,13 @@ fn start_daemon_for_adopted_root(project_root: &Path) -> Option<PathBuf> {
                 "[CodeGraph MCP] Started shared daemon for adopted project root {}",
                 project_root.display()
             );
+            if debug_enabled() {
+                eprintln!(
+                    "[codegraph debug] adopted-root: spawned new daemon (pid_path={} socket_path={})",
+                    codegraph_daemon::daemon_pid_path(project_root).display(),
+                    codegraph_daemon::recorded_socket_path(project_root).display(),
+                );
+            }
             let socket_path = codegraph_daemon::recorded_socket_path(project_root);
             socket_path.exists().then_some(socket_path)
         }
@@ -1421,17 +1510,42 @@ fn spawn_or_proxy(
     project_root: &Path,
     _no_watch: bool,
 ) -> Option<Result<()>> {
-    if !daemon_already_running(project_root) {
+    let dbg = debug_enabled();
+    if dbg {
+        eprintln!(
+            "[codegraph debug] spawn_or_proxy: pid_path={} socket_path={}",
+            codegraph_daemon::daemon_pid_path(project_root).display(),
+            codegraph_daemon::recorded_socket_path(project_root).display(),
+        );
+    }
+    if daemon_already_running(project_root) {
+        if dbg {
+            eprintln!("[codegraph debug] spawn_or_proxy: attaching to existing daemon");
+        }
+    } else {
         match std::env::current_exe() {
             Ok(exe) => {
                 if let Err(err) = codegraph_daemon::spawn_detached_daemon(&exe, project_root) {
                     tracing::debug!(error = %err, "detached daemon spawn failed; serving direct");
+                    if dbg {
+                        eprintln!(
+                            "[codegraph debug] spawn_or_proxy: daemon spawn failed ({err}); falling back to direct"
+                        );
+                    }
                     return None;
+                }
+                if dbg {
+                    eprintln!("[codegraph debug] spawn_or_proxy: spawned new daemon");
                 }
                 poll_for_daemon_socket(project_root);
             }
             Err(err) => {
                 tracing::debug!(error = %err, "current_exe unavailable; serving direct");
+                if dbg {
+                    eprintln!(
+                        "[codegraph debug] spawn_or_proxy: current_exe unavailable ({err}); falling back to direct"
+                    );
+                }
                 return None;
             }
         }
@@ -1440,6 +1554,11 @@ fn spawn_or_proxy(
     let socket_path = codegraph_daemon::recorded_socket_path(project_root);
     if !socket_path.exists() {
         tracing::debug!("daemon socket never appeared; serving direct");
+        if dbg {
+            eprintln!(
+                "[codegraph debug] spawn_or_proxy: daemon socket never appeared; falling back to direct"
+            );
+        }
         return None;
     }
 
@@ -1454,10 +1573,20 @@ fn spawn_or_proxy(
         Ok(codegraph_daemon::ProxyOutcome::Proxied) => Some(Ok(())),
         Ok(codegraph_daemon::ProxyOutcome::VersionMismatch) => {
             tracing::debug!("daemon version mismatch; serving direct");
+            if dbg {
+                eprintln!(
+                    "[codegraph debug] spawn_or_proxy: daemon version mismatch; falling back to direct"
+                );
+            }
             None
         }
         Err(err) => {
             tracing::debug!(error = %err, "proxy attach failed; serving direct");
+            if dbg {
+                eprintln!(
+                    "[codegraph debug] spawn_or_proxy: proxy attach failed ({err}); falling back to direct"
+                );
+            }
             None
         }
     }
@@ -1520,13 +1649,35 @@ pub fn select_serve_mode(
 #[cfg(test)]
 mod serve_mode_tests {
     use super::{
-        guard_indexable_root, select_serve_mode, should_run_daemon_services,
+        debug_enabled, guard_indexable_root, select_serve_mode, should_run_daemon_services,
         should_run_serve_services, ServeMode,
     };
     use std::path::Path;
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn debug_enabled_honors_truthy_values_only() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("CODEGRAPH_DEBUG").ok();
+
+        std::env::remove_var("CODEGRAPH_DEBUG");
+        assert!(!debug_enabled(), "unset ⇒ off");
+        std::env::set_var("CODEGRAPH_DEBUG", "1");
+        assert!(debug_enabled(), "\"1\" ⇒ on");
+        std::env::set_var("CODEGRAPH_DEBUG", "true");
+        assert!(debug_enabled(), "\"true\" ⇒ on");
+        std::env::set_var("CODEGRAPH_DEBUG", "0");
+        assert!(!debug_enabled(), "\"0\" ⇒ off");
+        std::env::set_var("CODEGRAPH_DEBUG", "yes");
+        assert!(!debug_enabled(), "any other value ⇒ off");
+
+        match prev {
+            Some(v) => std::env::set_var("CODEGRAPH_DEBUG", v),
+            None => std::env::remove_var("CODEGRAPH_DEBUG"),
+        }
+    }
 
     #[test]
     fn select_serve_mode_decision_order() {
