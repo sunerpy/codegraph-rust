@@ -22,6 +22,25 @@ codegraph-store = { path = "../codegraph-store" }
 codegraph-graph = { path = "../codegraph-graph" }
 codegraph-resolve = { path = "../codegraph-resolve" }
 regex = "1.10"
+rmcp = { version = "2.1", features = [
+    "server",
+    "transport-io",
+    "transport-streamable-http-server",
+], optional = true }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "io-util",
+    "net",
+    "sync",
+], optional = true }
+
+[features]
+# Default build MUST stay rmcp-free (no rmcp/tokio in the tree) — dual-path gate.
+rmcp = ["dep:rmcp", "dep:tokio"]
 
 [dev-dependencies]
 codegraph-extract = { path = "../codegraph-extract" }
+# rmcp `client` feature: dev-only, drives the handler over duplex in parity tests.
+rmcp = { version = "2.1", features = ["client", "transport-io"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "sync", "time"] }

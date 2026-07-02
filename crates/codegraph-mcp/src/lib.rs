@@ -15,7 +15,9 @@ pub mod engine;
 pub mod explore_budget;
 pub mod instructions;
 pub mod protocol;
-mod roots;
+#[cfg(feature = "rmcp")]
+pub mod rmcp_handler;
+pub(crate) mod roots;
 pub mod schemas;
 pub mod server;
 
