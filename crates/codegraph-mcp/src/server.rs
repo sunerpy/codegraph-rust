@@ -452,21 +452,20 @@ impl McpServer {
             .cloned()
             .unwrap_or_else(|| json!({}));
 
-        let project_path = args
-            .get("projectPath")
-            .and_then(Value::as_str)
-            .map(PathBuf::from)
-            .or_else(|| self.default_project.clone());
-
-        let project_path = match project_path {
+        let raw_project = args.get("projectPath").and_then(Value::as_str);
+        let project_path = match self.resolve_project_arg(raw_project) {
             Some(p) => p,
             None => {
+                let message = match raw_project {
+                    Some(raw) => format!(
+                        "No indexed project found for projectPath {raw:?}. Pass an absolute path to an indexed project, or run `codegraph init` there."
+                    ),
+                    None => "No indexed project resolved. Pass a `projectPath` argument, run `codegraph init` in the project, or start the server with `--path <project>`.".to_string(),
+                };
                 return Dispatch::Reply(
-                    serde_json::to_value(ToolResult::error(
-                        "No indexed project resolved. Pass a `projectPath` argument, run `codegraph init` in the project, or start the server with `--path <project>`.",
-                    ))
-                    .expect("ToolResult serializes"),
-                )
+                    serde_json::to_value(ToolResult::error(message))
+                        .expect("ToolResult serializes"),
+                );
             }
         };
 
@@ -485,6 +484,53 @@ impl McpServer {
 
         let result = engine.execute(&tool_name, &args);
         Dispatch::Reply(serde_json::to_value(result).expect("ToolResult serializes"))
+    }
+
+    /// Resolve a caller's `projectPath` argument to an INDEXED project dir (one
+    /// whose `.codegraph/codegraph.db` exists). A Zed agent may pass a bare
+    /// directory NAME ("codegraph-rust") or a relative path rather than an
+    /// absolute one; feeding that verbatim to [`Self::engine_for`] opens a
+    /// non-existent db and silently returns empty results. This maps such inputs
+    /// back to a real indexed project by trying candidates in priority order and
+    /// returning the FIRST that is indexed:
+    ///
+    /// - `raw = Some`: the absolute `raw`; then `cwd.join(raw)`; then bare `raw`;
+    ///   and — for the reported Zed case — the `default_project` when `raw`'s
+    ///   final component equals `default_project`'s basename (agent passed the
+    ///   NAME of the known indexed project).
+    /// - `raw = None`: the `default_project` (existing behavior).
+    ///
+    /// Honesty rule: when `raw` is given but resolves to nothing AND its basename
+    /// does not match `default_project`, this returns `None` rather than silently
+    /// falling back to `default_project` — a genuinely wrong path must surface an
+    /// error, not mask itself behind the default.
+    fn resolve_project_arg(&self, raw: Option<&str>) -> Option<PathBuf> {
+        let Some(raw) = raw else {
+            return self
+                .default_project
+                .clone()
+                .filter(|p| db_path_for(p).is_file());
+        };
+
+        let raw_path = PathBuf::from(raw);
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if raw_path.is_absolute() {
+            candidates.push(raw_path.clone());
+        } else {
+            if let Some(cwd) = &self.cwd {
+                candidates.push(cwd.join(&raw_path));
+            }
+            candidates.push(raw_path.clone());
+        }
+        if let Some(default) = &self.default_project {
+            if raw_path.file_name() == default.file_name() {
+                candidates.push(default.clone());
+            }
+        }
+
+        candidates
+            .into_iter()
+            .find(|candidate| db_path_for(candidate).is_file())
     }
 
     /// Open-on-demand + cache the engine for a project path
@@ -787,5 +833,98 @@ mod tests {
         assert_eq!(response["id"], json!(7));
         assert_eq!(response["result"]["serverInfo"]["name"], json!(SERVER_NAME));
         assert_eq!(server.default_project(), None);
+    }
+
+    // === projectPath resolution robustness (Zed bare-name fix) ==============
+
+    /// Case 1: a BARE BASENAME projectPath (e.g. "mini") whose final component
+    /// matches the basename of an indexed `default_project` resolves to that
+    /// default_project. This is the exact Zed-agent case: the client passes the
+    /// project NAME, not an absolute path.
+    #[test]
+    fn resolve_bare_basename_matching_default_resolves_to_default() {
+        let project = indexed_project("basename");
+        let name = project
+            .path()
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap()
+            .to_string();
+        // cwd deliberately elsewhere so ONLY the basename-match path can win.
+        let cwd = std::env::temp_dir().join("cg-mcp-basename-cwd-elsewhere");
+        let server = McpServer::new_with_cwd(Some(project.path().to_path_buf()), Some(cwd));
+        assert_eq!(
+            server.resolve_project_arg(Some(&name)).as_deref(),
+            Some(project.path()),
+        );
+    }
+
+    /// Case 2: a RELATIVE projectPath that joins with cwd to an indexed project
+    /// resolves via the cwd-join candidate.
+    #[test]
+    fn resolve_relative_path_joined_with_cwd_resolves() {
+        let project = indexed_project("relative");
+        // cwd = parent, raw = the project's dir name → cwd.join(raw) == project.
+        let parent = project.path().parent().unwrap().to_path_buf();
+        let name = project.path().file_name().and_then(|s| s.to_str()).unwrap();
+        // default_project unset so ONLY the cwd-join candidate can resolve.
+        let server = McpServer::new_with_cwd(None, Some(parent));
+        assert_eq!(
+            server.resolve_project_arg(Some(name)).as_deref(),
+            Some(project.path()),
+        );
+    }
+
+    /// Case 3: an ABSOLUTE indexed projectPath resolves unchanged.
+    #[test]
+    fn resolve_absolute_indexed_path_resolves() {
+        let project = indexed_project("absolute");
+        let raw = project.path().display().to_string();
+        let server = McpServer::new_with_cwd(None, None);
+        assert_eq!(
+            server.resolve_project_arg(Some(&raw)).as_deref(),
+            Some(project.path()),
+        );
+    }
+
+    /// Case 4: a bogus name matching NOTHING and != default_project's basename
+    /// resolves to None (→ the caller emits the actionable error, NOT a silent
+    /// default_project fallback).
+    #[test]
+    fn resolve_bogus_name_does_not_fall_back_to_default() {
+        let project = indexed_project("honest-default");
+        let cwd = std::env::temp_dir().join("cg-mcp-bogus-cwd-elsewhere");
+        let server = McpServer::new_with_cwd(Some(project.path().to_path_buf()), Some(cwd));
+        assert_eq!(
+            server.resolve_project_arg(Some("definitely-not-a-real-project-xyz")),
+            None,
+        );
+    }
+
+    /// Case 5: no projectPath + an indexed default_project resolves to the
+    /// default (regression: existing behavior preserved).
+    #[test]
+    fn resolve_none_falls_back_to_indexed_default() {
+        let project = indexed_project("none-default");
+        let server = McpServer::new_with_cwd(Some(project.path().to_path_buf()), None);
+        assert_eq!(
+            server.resolve_project_arg(None).as_deref(),
+            Some(project.path()),
+        );
+    }
+
+    /// Guard: an unindexed default_project with raw=None resolves to None (no
+    /// phantom project). Complements case 5.
+    #[test]
+    fn resolve_none_with_unindexed_default_resolves_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-mcp-unidx-default-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = McpServer::new_with_cwd(Some(dir.clone()), None);
+        assert_eq!(server.resolve_project_arg(None), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
