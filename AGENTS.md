@@ -31,7 +31,7 @@ The published crate is `codegraph-rs` (the `codegraph-cli` package); the install
 ## Agent installer (`codegraph install` / `uninstall`)
 
 `codegraph install` writes the codegraph MCP-server entry into each supported agent's config
-(Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, Trae, Qoder);
+(Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, Trae, Qoder, Zed);
 `uninstall` reverses it. The written command launches the binary (`command: "codegraph"`,
 `args: ["serve", "--mcp"]`). Cursor and Trae use `--path ${workspaceFolder}` in their global config so
 one entry auto-follows each project window; Kiro and Qoder write a bare global entry (no `--path`) that

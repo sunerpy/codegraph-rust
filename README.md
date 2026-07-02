@@ -83,7 +83,7 @@ codegraph serve --mcp --path /path/to/project  # optional: pin to a specific pro
 ```
 
 Auto-register it into your agent's config (Claude Code, Cursor, Codex CLI,
-opencode, Hermes, Gemini CLI, Antigravity, Kiro):
+opencode, Hermes, Gemini CLI, Antigravity, Kiro, Trae, Qoder, Zed):
 
 ```bash
 codegraph install --yes              # detects installed agents and wires them up
@@ -184,7 +184,7 @@ See [`docs/mcp.md`](docs/mcp.md#project-resolution) for the full three-case
 breakdown.
 
 Supported agents: Claude Code, Cursor, Codex CLI, opencode, Hermes Agent,
-Gemini CLI, Antigravity IDE, Kiro, Trae, Qoder.
+Gemini CLI, Antigravity IDE, Kiro, Trae, Qoder, Zed.
 
 ```bash
 codegraph install --yes                          # auto-detect installed agents
@@ -214,8 +214,9 @@ codegraph skill uninstall --target=claude --yes       # remove from one agent
 codegraph skill status                     # show state for all detected agents
 ```
 
-All ten supported agents have a skill directory (Claude Code, Cursor, Codex
-CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, Trae, Qoder).
+Ten of the eleven install targets have a skill directory (Claude Code, Cursor,
+Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, Trae,
+Qoder; `zed` is MCP-only and has no skill directory).
 Default location is `--global`; pass `--local` to write into the project tree.
 Hermes supports global only.
 
@@ -234,20 +235,26 @@ Full reference including per-agent skill paths: [`docs/cli.md`](docs/cli.md).
 `codegraph install` registers the MCP server entry for each supported agent/IDE.
 How well the index stays live depends on whether the IDE expands `${workspaceFolder}`.
 
-| IDE / Agent | Global config strategy                                                                                                                                                                                                                                                                                                          | Live watch                     |
-| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------ |
-| **Cursor**  | Global `~/.cursor/mcp.json` uses `--path ${workspaceFolder}` — one config auto-follows every project window.                                                                                                                                                                                                                    | Live on save (daemon watcher). |
-| **Trae**    | Global config (`~/.trae-server/data/Machine/mcp.json` in server/remote mode, or `Trae/User/mcp.json` in desktop mode) uses `--path ${workspaceFolder}` — one config auto-follows every project window. Note: project-level `.trae/mcp.json` requires enabling **"Enable project-level MCP / 启用项目级 MCP"** in Trae settings. | Live on save (daemon watcher). |
-| **Kiro**    | Global `~/.kiro/settings/mcp.json` holds a bare `serve --mcp` entry (no `--path`). The agent passes the project path per tool call — tools work read-only off the existing index, but there is no live watch.                                                                                                                   | Manual only (see below).       |
-| **Qoder**   | Global entry (`<config_base>/QoderCN\|Qoder/<machineId>/SharedClientCache/mcp.json`) holds a bare `serve --mcp` entry. Tools work read-only off the existing index; the IDE does not expand `${workspaceFolder}` in this layout.                                                                                                | Manual only (see below).       |
+| IDE / Agent | Global config strategy                                                                                                                                                                                                                                                                                                          | Live watch                                                                                              |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| **Cursor**  | Global `~/.cursor/mcp.json` uses `--path ${workspaceFolder}` — one config auto-follows every project window.                                                                                                                                                                                                                    | Live on save (daemon watcher).                                                                          |
+| **Trae**    | Global config (`~/.trae-server/data/Machine/mcp.json` in server/remote mode, or `Trae/User/mcp.json` in desktop mode) uses `--path ${workspaceFolder}` — one config auto-follows every project window. Note: project-level `.trae/mcp.json` requires enabling **"Enable project-level MCP / 启用项目级 MCP"** in Trae settings. | Live on save (daemon watcher).                                                                          |
+| **Kiro**    | Global `~/.kiro/settings/mcp.json` holds a bare `serve --mcp` entry (no `--path`). The agent passes the project path per tool call — tools work read-only off the existing index, but there is no live watch.                                                                                                                   | Manual only (see below).                                                                                |
+| **Qoder**   | Global entry (`<config_base>/QoderCN\|Qoder/<machineId>/SharedClientCache/mcp.json`) holds a bare `serve --mcp` entry. Tools work read-only off the existing index; the IDE does not expand `${workspaceFolder}` in this layout.                                                                                                | Manual only (see below).                                                                                |
+| **Zed**     | Global `~/.config/zed/settings.json` (Linux/macOS) or `%APPDATA%\Zed\settings.json` (Windows) holds a bare `context_servers.codegraph` entry (no `--path`). Zed's global config has no `${workspaceFolder}` expansion — tools work read-only off the existing index globally.                                                   | Manual/read-only globally; run `codegraph init --target=zed` per project for live per-project `--path`. |
 
-**Getting live auto-update in Kiro or Qoder.** Run `codegraph init --target=<ide>`
+**Getting live auto-update in Kiro, Qoder, or Zed.** Run `codegraph init --target=<ide>`
 once inside each project:
 
 ```bash
 cd /your/project
 codegraph init --target=kiro    # or --target=qoder
+codegraph init --target=zed     # writes .zed/settings.json with absolute --path
 ```
+
+For Zed specifically, this writes a project-level `.zed/settings.json` with an
+absolute `--path` — the **only** way to give Zed a per-project path, since Zed's
+global `context_servers` config cannot inject one.
 
 On a fresh (unindexed) project this builds the index and writes a project-level
 config with the absolute `--path`. On an already-indexed project it writes (or
@@ -259,6 +266,67 @@ Without a project-level config, the index only updates when you run
 `codegraph index` or `codegraph sync` manually. This mirrors upstream CodeGraph's
 behavior: clients that cannot report a workspace root rely on startup catch-up and
 manual reindex rather than per-call sync.
+
+---
+
+## CodeGraph for Zed (extension)
+
+A standalone Zed extension lives under [`editors/zed/`](editors/zed/). It
+registers CodeGraph as a `context_servers` context server inside Zed and
+downloads the right platform binary automatically — no separate install step
+needed.
+
+### Install (dev extension)
+
+1. Clone this repository.
+2. In Zed, open the command palette and run **`zed: install dev extension`**.
+3. Select the `editors/zed/` directory.
+
+Zed compiles the extension to WebAssembly and registers a `codegraph` context
+server. On first launch it downloads the latest CodeGraph release binary for your
+platform.
+
+### Auto-update
+
+The extension never pins a CodeGraph version. On each launch it resolves the
+**latest** `sunerpy/codegraph-rust` GitHub release, picks the asset matching your
+platform, downloads and extracts it, and caches it under a version-stamped path
+(`codegraph-<version>/codegraph`). When the CodeGraph CLI ships a new release the
+extension picks up the new binary automatically — **no extension re-publish or
+manual update required**.
+
+If you already have `codegraph` installed via the CLI, or want to pin a specific
+project path, add a `command` override in your project's `.zed/settings.json`:
+
+```jsonc
+{
+  "context_servers": {
+    "codegraph": {
+      "command": {
+        "path": "codegraph",
+        "args": ["serve", "--mcp", "--path", "/abs/path/to/project"],
+        "env": {},
+      },
+    },
+  },
+}
+```
+
+Or let the installer write it for you:
+
+```bash
+cd /your/project
+codegraph init --target=zed     # writes .zed/settings.json with absolute --path
+```
+
+See [`editors/zed/README.md`](editors/zed/README.md) for the full extension
+reference, and [`docs/mcp.md`](docs/mcp.md#zed----context_servers-config) for the
+Zed `context_servers` config shape.
+
+> **Publishing.** The extension is not yet published to the
+> [`zed-industries/extensions`](https://github.com/zed-industries/extensions)
+> registry. Dev-install via the step above works today; marketplace publish is a
+> later manual step.
 
 ---
 

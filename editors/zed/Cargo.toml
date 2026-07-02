@@ -1,0 +1,19 @@
+# Standalone Zed extension crate. It compiles to a wasm32 cdylib and is
+# intentionally NOT a member of the root cargo workspace: the empty
+# `[workspace]` table below makes this directory its own workspace root, so it
+# gets its own Cargo.lock and the parent `cargo build --workspace`, golden
+# oracle, and guardrail are entirely unaffected. Never published to crates.io.
+[package]
+name = "codegraph-zed"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+zed_extension_api = "0.7.0"
+
+# Empty table => this crate is its own workspace root, detached from the parent.
+[workspace]

@@ -62,8 +62,8 @@
 config file; `uninstall` reverses it. No hand-editing of JSON/TOML required.
 
 Supported agents (`ALL_TARGETS` order): **Claude Code, Cursor, Codex CLI,
-opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro.** The written MCP
-command launches the Rust binary: `command: "codegraph"`, `args: ["serve",
+opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, Trae, Qoder, Zed.**
+The written MCP command launches the Rust binary: `command: "codegraph"`, `args: ["serve",
 "--mcp"]` (Cursor injects `--path`; Kiro injects `--path` only on a project-local
 install).
 
@@ -109,6 +109,12 @@ installer pins an explicit `--path`:
 - **Kiro** — install **project-level** only: `--path` is the concrete project dir.
   A global Kiro install writes no entry, because Kiro CLI does not expand
   `${workspaceFolder}` (see the note above).
+- **Zed** — Zed's global `context_servers` config cannot inject a per-project
+  path (no `${workspaceFolder}` expansion). A global `codegraph install --target=zed`
+  writes a bare entry (read-only off any existing index). To pin a specific project,
+  run `codegraph init --target=zed` inside the project — this writes
+  `.zed/settings.json` with an absolute `--path` and is the **only** way to get
+  live per-project indexing in Zed.
 
 ### `codegraph init --target` — index and wire an editor in one step
 
@@ -149,10 +155,11 @@ codegraph skill status                                  # report state for all d
 codegraph skill status    --target=all                  # report state for every agent
 ```
 
-All ten supported agents have a skill directory. `--target` accepts the same
-agent ids as `codegraph install` (`claude`, `cursor`, `codex`, `opencode`,
-`hermes`, `gemini`, `antigravity`, `kiro`, `trae`, `qoder`) plus `auto`, `all`,
-and `none`.
+Ten of the eleven install targets have a skill directory. `--target` accepts
+those ten agent ids (`claude`, `cursor`, `codex`, `opencode`, `hermes`,
+`gemini`, `antigravity`, `kiro`, `trae`, `qoder`) plus `auto`, `all`, and
+`none`. Note: `zed` is a valid install target but has **no skill directory**
+(MCP config only) — passing `--target=zed` to `codegraph skill` is a no-op.
 Default location is `--global`; pass `--local` to write into the project tree.
 Hermes supports global only (no automatic project-scope for skills).
 

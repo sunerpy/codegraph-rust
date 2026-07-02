@@ -76,7 +76,7 @@ codegraph serve --mcp --path /path/to/project  # 可选：固定到指定项目
 ```
 
 自动注册进你的代理配置（Claude Code / Cursor / Codex CLI / opencode / Hermes /
-Gemini CLI / Antigravity / Kiro / Trae / Qoder）：
+Gemini CLI / Antigravity / Kiro / Trae / Qoder / Zed）：
 
 ```bash
 codegraph install --yes              # 检测已安装的代理并接线
@@ -162,7 +162,7 @@ cargo install --git https://github.com/sunerpy/codegraph-rust codegraph-rs
 `"args": ["serve", "--mcp", "-p", "/abs/path/to/project"]`）。
 
 支持的代理：Claude Code、Cursor、Codex CLI、opencode、Hermes Agent、
-Gemini CLI、Antigravity IDE、Kiro、Trae、Qoder。
+Gemini CLI、Antigravity IDE、Kiro、Trae、Qoder、Zed。
 
 ```bash
 codegraph install --yes                          # 自动检测已安装代理
@@ -193,7 +193,7 @@ codegraph skill status                                # 查看所有已检测代
 
 全部 10 个支持的代理均有技能目录（Claude Code、Cursor、Codex CLI、opencode、
 Hermes Agent、Gemini CLI、Antigravity IDE、Kiro、Trae、Qoder）。默认位置为 `--global`；传入
-`--local` 可写入项目树。Hermes 仅支持全局安装。
+`--local` 可写入项目树。Hermes 仅支持全局安装。注意：`zed` 是有效的安装目标但**无技能目录**（仅 MCP 配置）。
 
 **更新语义。** `skill update` 用 git blob SHA-1 对比已安装文件与内嵌版本的内容哈希。
 未被修改的文件会自动刷新；经过手动编辑的文件会被跳过并提示"locally modified"（可传
@@ -209,20 +209,26 @@ Hermes Agent、Gemini CLI、Antigravity IDE、Kiro、Trae、Qoder）。默认位
 `codegraph install` 为每个支持的代理/IDE 写入 MCP 服务器配置。索引能否保持实时更新，
 取决于 IDE 是否支持 `${workspaceFolder}` 变量替换。
 
-| IDE / 代理 | 全局配置策略                                                                                                                                                                                                                                                                   | 实时监听                     |
-| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------- |
-| **Cursor** | 全局 `~/.cursor/mcp.json` 使用 `--path ${workspaceFolder}`，一份配置自动跟随每个项目窗口。                                                                                                                                                                                     | 保存即更新（守护进程监听）。 |
-| **Trae**   | 全局配置（服务器/远程模式使用 `~/.trae-server/data/Machine/mcp.json`，桌面模式使用 `Trae/User/mcp.json`）使用 `--path ${workspaceFolder}`，一份配置自动跟随每个项目窗口。注意：项目级 `.trae/mcp.json` 需要在 Trae 设置中开启**"启用项目级 MCP / Enable project-level MCP"**。 | 保存即更新（守护进程监听）。 |
-| **Kiro**   | 全局 `~/.kiro/settings/mcp.json` 写入裸 `serve --mcp` 条目（无 `--path`）。代理每次工具调用时传入项目路径——工具可只读访问现有索引，但没有实时监听。                                                                                                                            | 仅手动触发（见下文）。       |
-| **Qoder**  | 全局条目（`<config_base>/QoderCN\|Qoder/<machineId>/SharedClientCache/mcp.json`）写入裸 `serve --mcp` 条目。工具可只读访问现有索引；该布局下 IDE 不展开 `${workspaceFolder}`。                                                                                                 | 仅手动触发（见下文）。       |
+| IDE / 代理 | 全局配置策略                                                                                                                                                                                                                                                                   | 实时监听                                                                                                       |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
+| **Cursor** | 全局 `~/.cursor/mcp.json` 使用 `--path ${workspaceFolder}`，一份配置自动跟随每个项目窗口。                                                                                                                                                                                     | 保存即更新（守护进程监听）。                                                                                   |
+| **Trae**   | 全局配置（服务器/远程模式使用 `~/.trae-server/data/Machine/mcp.json`，桌面模式使用 `Trae/User/mcp.json`）使用 `--path ${workspaceFolder}`，一份配置自动跟随每个项目窗口。注意：项目级 `.trae/mcp.json` 需要在 Trae 设置中开启**"启用项目级 MCP / Enable project-level MCP"**。 | 保存即更新（守护进程监听）。                                                                                   |
+| **Kiro**   | 全局 `~/.kiro/settings/mcp.json` 写入裸 `serve --mcp` 条目（无 `--path`）。代理每次工具调用时传入项目路径——工具可只读访问现有索引，但没有实时监听。                                                                                                                            | 仅手动触发（见下文）。                                                                                         |
+| **Qoder**  | 全局条目（`<config_base>/QoderCN\|Qoder/<machineId>/SharedClientCache/mcp.json`）写入裸 `serve --mcp` 条目。工具可只读访问现有索引；该布局下 IDE 不展开 `${workspaceFolder}`。                                                                                                 | 仅手动触发（见下文）。                                                                                         |
+| **Zed**    | 全局 `~/.config/zed/settings.json`（Linux/macOS）或 `%APPDATA%\Zed\settings.json`（Windows）写入裸 `context_servers.codegraph` 条目（无 `--path`）。Zed 全局配置不支持 `${workspaceFolder}` 展开——工具全局只读访问现有索引。                                                   | 全局仅手动/只读；在项目内运行 `codegraph init --target=zed` 可写入带绝对 `--path` 的项目级配置，实现实时更新。 |
 
-**在 Kiro 或 Qoder 中获得实时自动更新。** 在每个项目中运行一次
+**在 Kiro、Qoder 或 Zed 中获得实时自动更新。** 在每个项目中运行一次
 `codegraph init --target=<ide>`：
 
 ```bash
 cd /your/project
 codegraph init --target=kiro    # 或 --target=qoder
+codegraph init --target=zed     # 写入带绝对 --path 的 .zed/settings.json
 ```
+
+对 Zed 而言，这会写入项目级 `.zed/settings.json` 并内嵌绝对 `--path`——这是
+让 Zed 获得项目级路径的**唯一方式**，因为 Zed 的全局 `context_servers` 配置
+不支持变量展开。
 
 对于未建立索引的新项目，该命令会建立索引并写入包含绝对 `--path` 的项目级配置。
 对于已建立索引的项目，它只写入（或刷新）项目级配置，依靠守护进程的文件监听和
@@ -231,6 +237,62 @@ codegraph init --target=kiro    # 或 --target=qoder
 若没有项目级配置，索引只有在手动执行 `codegraph index` 或 `codegraph sync` 时
 才会更新。这与上游 CodeGraph 的行为一致：无法上报工作区根目录的客户端依靠启动追赶
 和手动重建索引，而非每次工具调用时同步。
+
+---
+
+## CodeGraph for Zed（编辑器扩展）
+
+项目下的 [`editors/zed/`](../../editors/zed/) 目录包含一个独立的 Zed 扩展，将
+CodeGraph 注册为 Zed 的 `context_servers` 上下文服务器，并自动下载适合当前平台的
+二进制——无需单独安装步骤。
+
+### 安装（开发者扩展）
+
+1. 克隆本仓库。
+2. 在 Zed 中打开命令面板，执行 **`zed: install dev extension`**。
+3. 选择 `editors/zed/` 目录。
+
+Zed 会将扩展编译为 WebAssembly 并注册 `codegraph` 上下文服务器。首次启动时，
+扩展会自动下载当前平台对应的最新 CodeGraph 发布版本二进制。
+
+### 自动更新
+
+扩展不固定 CodeGraph 版本。每次启动时，它会解析 `sunerpy/codegraph-rust` 在
+GitHub 上的**最新**发布版本，选取匹配当前平台的资产文件，下载并解压，以版本号命名
+缓存路径（`codegraph-<version>/codegraph`）。当 CodeGraph CLI 发布新版本时，扩展
+会在下次启动时自动获取新二进制——**无需重新发布扩展或手动更新**。
+
+若你已通过 CLI 安装了 `codegraph`，或想为特定项目固定路径，可在项目的
+`.zed/settings.json` 中添加 `command` 覆盖项。扩展会直接使用该命令并跳过下载：
+
+```jsonc
+{
+  "context_servers": {
+    "codegraph": {
+      "command": {
+        "path": "codegraph",
+        "args": ["serve", "--mcp", "--path", "/abs/path/to/project"],
+        "env": {},
+      },
+    },
+  },
+}
+```
+
+也可以让安装器自动写入：
+
+```bash
+cd /your/project
+codegraph init --target=zed     # 写入带绝对 --path 的 .zed/settings.json
+```
+
+详见 [`editors/zed/README.md`](../../editors/zed/README.md) 及
+[`../mcp.md`](../mcp.md#zed----context_servers-config) 中的 Zed `context_servers`
+配置说明。
+
+> **发布说明。** 本扩展尚未发布到
+> [`zed-industries/extensions`](https://github.com/zed-industries/extensions)
+> 市场。目前可通过上述步骤以开发者模式安装；市场发布是后续独立步骤。
 
 ---
 
