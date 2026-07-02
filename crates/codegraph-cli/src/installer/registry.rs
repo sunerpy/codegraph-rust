@@ -11,7 +11,7 @@ use anyhow::{bail, Result};
 use super::targets::{
     antigravity::ANTIGRAVITY_TARGET, claude::CLAUDE_TARGET, codex::CODEX_TARGET,
     cursor::CURSOR_TARGET, gemini::GEMINI_TARGET, hermes::HERMES_TARGET, kiro::KIRO_TARGET,
-    opencode::OPENCODE_TARGET, qoder::QODER_TARGET, trae::TRAE_TARGET,
+    opencode::OPENCODE_TARGET, qoder::QODER_TARGET, trae::TRAE_TARGET, zed::ZED_TARGET,
 };
 use super::types::{AgentTarget, DetectionResult, InstallContext, Location};
 
@@ -27,6 +27,7 @@ pub fn all_targets() -> Vec<&'static dyn AgentTarget> {
         &KIRO_TARGET,
         &TRAE_TARGET,
         &QODER_TARGET,
+        &ZED_TARGET,
     ]
 }
 
@@ -116,6 +117,7 @@ mod tests {
         "kiro",
         "trae",
         "qoder",
+        "zed",
     ];
 
     #[test]
