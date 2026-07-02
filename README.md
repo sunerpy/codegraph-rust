@@ -256,6 +256,13 @@ For Zed specifically, this writes a project-level `.zed/settings.json` with an
 absolute `--path` — the **only** way to give Zed a per-project path, since Zed's
 global `context_servers` config cannot inject one.
 
+> **Zed Remote (SSH).** Zed runs MCP `context_servers` on the local client, not
+> on the remote host — even when a remote SSH project is open. If codegraph tools
+> return empty in a remote SSH session, use an `ssh` bridge command instead of
+> `command: "codegraph"` directly. See
+> [`docs/mcp.md` — Zed over SSH](docs/mcp.md#zed-over-ssh-remote-development)
+> for the config and full explanation.
+
 On a fresh (unindexed) project this builds the index and writes a project-level
 config with the absolute `--path`. On an already-indexed project it writes (or
 refreshes) the project-level config and relies on the daemon's file watcher and

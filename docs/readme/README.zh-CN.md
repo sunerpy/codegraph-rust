@@ -230,6 +230,11 @@ codegraph init --target=zed     # 写入带绝对 --path 的 .zed/settings.json
 让 Zed 获得项目级路径的**唯一方式**，因为 Zed 的全局 `context_servers` 配置
 不支持变量展开。
 
+> **Zed 远程开发（SSH）。** Zed 在本地客户端上运行 MCP `context_servers`，而非
+> 远程主机——即使当前打开的是远程 SSH 项目。若在远程 SSH 会话中 codegraph 工具返回
+> 空结果，请用 `ssh` 桥接命令替代直接的 `command: "codegraph"`。详见
+> [`docs/mcp.md` — Zed over SSH](../mcp.md#zed-over-ssh-remote-development)。
+
 对于未建立索引的新项目，该命令会建立索引并写入包含绝对 `--path` 的项目级配置。
 对于已建立索引的项目，它只写入（或刷新）项目级配置，依靠守护进程的文件监听和
 启动追赶机制保持实时更新。配置写入后，你的编辑会自动反映到索引中。

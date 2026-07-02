@@ -71,6 +71,42 @@ cd /your/project
 codegraph init --target=zed     # writes .zed/settings.json with an absolute --path
 ```
 
+## Remote development (SSH)
+
+If you use Zed's remote SSH feature (Zed UI on your local machine, code and
+`.codegraph/` index on a remote Linux host), codegraph MCP tools will silently
+return empty results. The cause: Zed runs `context_servers` on the **local**
+machine even for remote SSH projects, so the extension's downloaded binary cannot
+reach the remote index. Native remote MCP execution is not yet implemented in Zed
+(as of mid-2026).
+
+**Workaround — ssh bridge.** Add this to your project's `.zed/settings.json` on
+the local machine. It replaces the extension's command with `ssh`, which proxies
+the MCP JSON-RPC stream transparently to codegraph running on the remote host:
+
+```jsonc
+{
+  "context_servers": {
+    "codegraph": {
+      "command": "ssh",
+      "args": [
+        "-T",
+        "<your-ssh-host-alias>",
+        "cd /abs/path/to/project && /abs/path/to/codegraph serve --mcp --path /abs/path/to/project",
+      ],
+      "env": {},
+    },
+  },
+}
+```
+
+Use an absolute path to the codegraph binary on the remote host (non-login SSH
+shells often lack `~/.cargo/bin` on `PATH`). The `-T` flag disables PTY
+allocation, which would otherwise corrupt the JSON-RPC byte stream.
+
+For the full explanation of each argument and the known caveats, see
+[`docs/mcp.md` — Zed over SSH](../../docs/mcp.md#zed-over-ssh-remote-development).
+
 ## Publishing
 
 Publishing this extension to the public
