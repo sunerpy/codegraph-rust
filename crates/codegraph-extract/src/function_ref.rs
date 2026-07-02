@@ -524,7 +524,7 @@ pub fn capture_fn_ref_candidates(
                         let name_child = name_node;
                         if let Some(value) = value {
                             if container.named_child_count() >= 2
-                                && name_child.map_or(true, |n| value.id() != n.id())
+                                && name_child.is_none_or(|n| value.id() != n.id())
                             {
                                 value_nodes.push(value);
                             }

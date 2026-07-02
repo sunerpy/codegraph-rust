@@ -188,8 +188,7 @@ impl Store {
         unique.sort_unstable();
         unique.dedup();
         for chunk in unique.chunks(SQLITE_PARAM_CHUNK_SIZE) {
-            let placeholders = std::iter::repeat("?")
-                .take(chunk.len())
+            let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!("SELECT * FROM nodes WHERE id IN ({placeholders})");
@@ -760,8 +759,7 @@ impl Store {
         unique.sort_unstable();
         unique.dedup();
         for chunk in unique.chunks(SQLITE_PARAM_CHUNK_SIZE) {
-            let placeholders = std::iter::repeat("?")
-                .take(chunk.len())
+            let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!("SELECT * FROM unresolved_refs WHERE file_path IN ({placeholders})");
@@ -793,8 +791,7 @@ impl Store {
         unique.sort_unstable();
         unique.dedup();
         for chunk in unique.chunks(SQLITE_PARAM_CHUNK_SIZE) {
-            let placeholders = std::iter::repeat("?")
-                .take(chunk.len())
+            let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(",");
             let sql =
@@ -1026,8 +1023,7 @@ impl Store {
         unique.sort_unstable();
         unique.dedup();
         for chunk in unique.chunks(SQLITE_PARAM_CHUNK_SIZE) {
-            let placeholders = std::iter::repeat("?")
-                .take(chunk.len())
+            let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!(
@@ -1334,8 +1330,7 @@ fn existing_node_ids(
     unique.sort_unstable();
     unique.dedup();
     for chunk in unique.chunks(SQLITE_PARAM_CHUNK_SIZE) {
-        let placeholders = std::iter::repeat("?")
-            .take(chunk.len())
+        let placeholders = std::iter::repeat_n("?", chunk.len())
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!("SELECT id FROM nodes WHERE id IN ({placeholders})");

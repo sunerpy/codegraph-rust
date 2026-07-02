@@ -54,7 +54,7 @@ pub fn resolve_workspace_import(import_path: &str, ws: &WorkspacePackages) -> Op
     let mut best_name: Option<&str> = None;
     for name in ws.by_name.keys() {
         if import_path == name || import_path.starts_with(&format!("{name}/")) {
-            if best_name.map_or(true, |b| name.len() > b.len()) {
+            if best_name.is_none_or(|b| name.len() > b.len()) {
                 best_name = Some(name);
             }
         }

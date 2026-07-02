@@ -996,7 +996,7 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
         .get_project_metadata("indexed_with_extraction_version")?
         .and_then(|v| v.parse::<i64>().ok());
     let reindex_recommended = last_indexed.is_some()
-        && built_with_extraction_version.map_or(true, |v| v < EXTRACTION_VERSION);
+        && built_with_extraction_version.is_none_or(|v| v < EXTRACTION_VERSION);
 
     if json_output {
         print_json(&json!({
@@ -3425,7 +3425,7 @@ fn print_files_tree(files: &[FileRecord], max_depth: Option<usize>) {
     println!("\nProject Structure ({} files):\n", files.len());
     for file in files {
         let depth = file.path.matches('/').count() + 1;
-        if max_depth.map_or(true, |max| depth <= max) {
+        if max_depth.is_none_or(|max| depth <= max) {
             println!(
                 "  {} ({}, {} symbols)",
                 file.path, file.language, file.node_count

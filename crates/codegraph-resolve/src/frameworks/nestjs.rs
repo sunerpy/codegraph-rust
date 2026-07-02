@@ -573,7 +573,7 @@ fn eat_modifier(bytes: &[u8], i: usize) -> Option<usize> {
             // `\b`: next char must not be a word char.
             let boundary = bytes
                 .get(end)
-                .map_or(true, |c| !(c.is_ascii_alphanumeric() || *c == b'_'));
+                .is_none_or(|c| !(c.is_ascii_alphanumeric() || *c == b'_'));
             if boundary {
                 return Some(end);
             }

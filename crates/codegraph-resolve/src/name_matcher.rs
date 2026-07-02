@@ -622,7 +622,7 @@ fn infer_java_field_receiver_type(
             n.start_line
         };
         if n.start_line <= reference.line && end >= reference.line {
-            if enclosing.map_or(true, |e| n.start_line >= e.start_line) {
+            if enclosing.is_none_or(|e| n.start_line >= e.start_line) {
                 enclosing = Some(n);
             }
         }

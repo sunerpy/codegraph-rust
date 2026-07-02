@@ -257,7 +257,7 @@ fn remove_permissions_entry(ctx: &InstallContext, loc: Location) -> FileWrite {
         let before = allow.len();
         allow.retain(|p| {
             p.as_str()
-                .map_or(true, |s| !s.starts_with("mcp__codegraph__"))
+                .is_none_or(|s| !s.starts_with("mcp__codegraph__"))
         });
         if allow.len() == before {
             return Some(false);
