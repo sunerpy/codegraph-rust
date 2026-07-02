@@ -36,3 +36,6 @@ KNOWN_DIFFS.md
 target/
 dist/
 node_modules/
+
+# IDE local configuration (editor paths/settings, not versioned).
+.zed/

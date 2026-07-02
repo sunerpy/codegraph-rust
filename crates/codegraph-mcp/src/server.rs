@@ -202,6 +202,7 @@ pub struct McpServer {
     engines: HashMap<PathBuf, CachedEngine>,
     workspace_roots: WorkspaceRoots,
     adoption_observer: Option<AdoptionObserver>,
+    no_roots: bool,
 }
 
 impl McpServer {
@@ -212,7 +213,18 @@ impl McpServer {
             engines: HashMap::new(),
             workspace_roots: WorkspaceRoots::new(),
             adoption_observer: None,
+            no_roots: false,
         }
+    }
+
+    /// HTTP-transport server pinned to `project`. A stateless HTTP server cannot
+    /// send the client a `roots/list` request, so `no_roots` disables both the
+    /// roots handshake and `initialize`-param adoption; the project stays
+    /// `--path`-fixed for the session.
+    pub fn http(project: PathBuf) -> Self {
+        let mut server = Self::new(Some(project));
+        server.no_roots = true;
+        server
     }
 
     pub fn with_adoption_observer(
@@ -225,6 +237,7 @@ impl McpServer {
             engines: HashMap::new(),
             workspace_roots: WorkspaceRoots::new(),
             adoption_observer: Some(adoption_observer),
+            no_roots: false,
         }
     }
 
@@ -323,29 +336,43 @@ impl McpServer {
                 ))])
             }
         };
+        let (responses, adopted) = self.dispatch_to_responses(&req);
+        HandledLine { responses, adopted }
+    }
+
+    /// Transport-agnostic handler: dispatch `req`, return its response line(s) as
+    /// raw `Value`s (the stdio path already emits raw Values, and a `roots/list`
+    /// server→client request is not a [`JsonRpcResponse`], so this keeps stdio
+    /// byte-identical). Any adoption side-effect is already applied to `self`.
+    pub fn handle_request(&mut self, req: &JsonRpcRequest) -> Vec<Value> {
+        self.dispatch_to_responses(req).0
+    }
+
+    fn dispatch_to_responses(&mut self, req: &JsonRpcRequest) -> (Vec<Value>, Option<PathBuf>) {
         let id = req.id.clone();
-        let handled = match self.dispatch(&req) {
-            Dispatch::Reply(value) => id
-                .map(|id| vec![json_response(JsonRpcResponse::result(id, value))])
-                .unwrap_or_default(),
-            Dispatch::ReplyWithAdoption { reply, adopted } => {
-                let responses = id
-                    .map(|id| vec![json_response(JsonRpcResponse::result(id, reply))])
-                    .unwrap_or_default();
-                return HandledLine {
-                    responses,
-                    adopted: Some(adopted),
-                };
-            }
-            Dispatch::ReplyAndRequest { reply, request } => id
-                .map(|id| vec![json_response(JsonRpcResponse::result(id, reply)), request])
-                .unwrap_or_default(),
-            Dispatch::Err(code, msg) => id
-                .map(|id| vec![json_response(JsonRpcResponse::error(id, code, msg))])
-                .unwrap_or_default(),
-            Dispatch::Notification => Vec::new(),
-        };
-        HandledLine::responses(handled)
+        match self.dispatch(req) {
+            Dispatch::Reply(value) => (
+                id.map(|id| vec![json_response(JsonRpcResponse::result(id, value))])
+                    .unwrap_or_default(),
+                None,
+            ),
+            Dispatch::ReplyWithAdoption { reply, adopted } => (
+                id.map(|id| vec![json_response(JsonRpcResponse::result(id, reply))])
+                    .unwrap_or_default(),
+                Some(adopted),
+            ),
+            Dispatch::ReplyAndRequest { reply, request } => (
+                id.map(|id| vec![json_response(JsonRpcResponse::result(id, reply)), request])
+                    .unwrap_or_default(),
+                None,
+            ),
+            Dispatch::Err(code, msg) => (
+                id.map(|id| vec![json_response(JsonRpcResponse::error(id, code, msg))])
+                    .unwrap_or_default(),
+                None,
+            ),
+            Dispatch::Notification => (Vec::new(), None),
+        }
     }
 
     /// Method dispatch, mirroring `session.ts:119-156`.
@@ -353,6 +380,9 @@ impl McpServer {
         let is_request = req.id.is_some();
         match req.method.as_str() {
             "initialize" if is_request => {
+                if self.no_roots {
+                    return Dispatch::Reply(initialize_result());
+                }
                 let cwd = self.cwd.clone();
                 let old_default = self.default_project.clone();
                 if let Some(adopted) = self.workspace_roots.adopt_from_initialize(
@@ -633,6 +663,7 @@ impl McpServer {
             engines: HashMap::new(),
             workspace_roots: WorkspaceRoots::new(),
             adoption_observer: None,
+            no_roots: false,
         }
     }
 }
@@ -770,6 +801,79 @@ mod tests {
         );
         assert_eq!(responses[1]["id"], json!(ROOTS_LIST_REQUEST_ID));
         assert_eq!(responses[1]["method"], json!("roots/list"));
+    }
+
+    fn workspace_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .canonicalize()
+            .expect("workspace root")
+    }
+
+    fn real_indexed_project(tag: &str) -> TempProject {
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("cg-mcp-http-{tag}-{}-{seq}", std::process::id()));
+        let db = db_path_for(&path);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::fs::copy(workspace_root().join("reference/golden/mini/colby.db"), &db)
+            .expect("copy golden mini db");
+        TempProject { path }
+    }
+
+    #[test]
+    fn http_mode_initialize_returns_only_result_without_roots_or_adoption() {
+        // GIVEN an http-mode server pinned to an indexed project
+        let project = indexed_project("http-init");
+        let fixed = project.path().to_path_buf();
+        let mut server = McpServer::http(fixed.clone());
+        // WHEN initialize carries BOTH capabilities.roots AND rootUri/workspaceFolders elsewhere
+        let elsewhere = indexed_project("http-init-elsewhere");
+        let responses = run_initialize_capture(
+            &mut server,
+            json!({
+                "capabilities": { "roots": { "listChanged": true } },
+                "rootUri": format!("file://{}", elsewhere.path().display()),
+                "workspaceFolders": [
+                    { "uri": format!("file://{}", elsewhere.path().display()), "name": "other" }
+                ],
+            }),
+        );
+        // THEN only the init result is emitted (no roots/list) and no adoption occurs
+        assert_eq!(responses.len(), 1, "http mode must not emit a roots/list");
+        assert_eq!(responses[0]["id"], json!(1));
+        assert_eq!(
+            responses[0]["result"]["serverInfo"]["name"],
+            json!(SERVER_NAME)
+        );
+        assert_eq!(server.default_project(), Some(fixed.as_path()));
+    }
+
+    #[test]
+    fn http_mode_tools_call_routes_to_fixed_project() {
+        // GIVEN an http-mode server pinned to a real indexed project
+        let project = real_indexed_project("tools-call");
+        let mut server = McpServer::http(project.path().to_path_buf());
+        // WHEN a codegraph_search request is handled with NO projectPath
+        let req: JsonRpcRequest = serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "codegraph_search", "arguments": { "query": "add" } },
+        }))
+        .unwrap();
+        let responses = server.handle_request(&req);
+        // THEN it routes to the fixed project's engine and returns a non-error result
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0]["id"], json!(2));
+        let result = &responses[0]["result"];
+        assert!(result.is_object(), "tools/call must return a result object");
+        assert_ne!(
+            result.get("isError"),
+            Some(&json!(true)),
+            "search on the fixed indexed project must not error"
+        );
     }
 
     #[test]
