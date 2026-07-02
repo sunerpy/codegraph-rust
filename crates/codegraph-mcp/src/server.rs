@@ -195,6 +195,7 @@ pub enum RunUntilAdoption<R> {
 /// reopen when the database is REPLACED on disk (#925).
 pub struct McpServer {
     default_project: Option<PathBuf>,
+    cwd: Option<PathBuf>,
     engines: HashMap<PathBuf, CachedEngine>,
     workspace_roots: WorkspaceRoots,
     adoption_observer: Option<AdoptionObserver>,
@@ -204,6 +205,7 @@ impl McpServer {
     pub fn new(default_project: Option<PathBuf>) -> Self {
         Self {
             default_project,
+            cwd: std::env::current_dir().ok(),
             engines: HashMap::new(),
             workspace_roots: WorkspaceRoots::new(),
             adoption_observer: None,
@@ -216,6 +218,7 @@ impl McpServer {
     ) -> Self {
         Self {
             default_project,
+            cwd: std::env::current_dir().ok(),
             engines: HashMap::new(),
             workspace_roots: WorkspaceRoots::new(),
             adoption_observer: Some(adoption_observer),
@@ -347,20 +350,23 @@ impl McpServer {
         let is_request = req.id.is_some();
         match req.method.as_str() {
             "initialize" if is_request => {
-                if let Some(adopted) = self
-                    .workspace_roots
-                    .adopt_from_initialize(&mut self.default_project, req.params.as_ref())
-                {
+                let cwd = self.cwd.clone();
+                if let Some(adopted) = self.workspace_roots.adopt_from_initialize(
+                    &mut self.default_project,
+                    cwd.as_deref(),
+                    req.params.as_ref(),
+                ) {
                     self.notify_adopted(&adopted);
                     return Dispatch::ReplyWithAdoption {
                         reply: initialize_result(),
                         adopted,
                     };
                 }
-                if self
-                    .workspace_roots
-                    .should_request_roots(self.default_project.as_ref(), req.params.as_ref())
-                {
+                if self.workspace_roots.should_request_roots(
+                    self.default_project.as_ref(),
+                    cwd.as_deref(),
+                    req.params.as_ref(),
+                ) {
                     self.workspace_roots.mark_roots_list_requested();
                     Dispatch::ReplyAndRequest {
                         reply: initialize_result(),
@@ -407,10 +413,12 @@ impl McpServer {
         if !is_roots_response {
             return None;
         }
-        if let Some(adopted) = self
-            .workspace_roots
-            .adopt_from_roots_result(&mut self.default_project, response.get("result"))
-        {
+        let cwd = self.cwd.clone();
+        if let Some(adopted) = self.workspace_roots.adopt_from_roots_result(
+            &mut self.default_project,
+            cwd.as_deref(),
+            response.get("result"),
+        ) {
             self.notify_adopted(&adopted);
             return Some(adopted);
         }
@@ -455,7 +463,7 @@ impl McpServer {
             None => {
                 return Dispatch::Reply(
                     serde_json::to_value(ToolResult::error(
-                        "No project path provided and no default project is configured. Pass `projectPath` or launch the server with a project root.",
+                        "No indexed project resolved. Pass a `projectPath` argument, run `codegraph init` in the project, or start the server with `--path <project>`.",
                     ))
                     .expect("ToolResult serializes"),
                 )
@@ -536,6 +544,20 @@ impl McpServer {
     pub fn default_project(&self) -> Option<&std::path::Path> {
         self.default_project.as_deref()
     }
+
+    /// Test-only: construct with an explicit cwd instead of `current_dir()`, so
+    /// the roots-adoption `default == cwd` discriminator is exercised without
+    /// mutating the process-global working directory.
+    #[doc(hidden)]
+    pub fn new_with_cwd(default_project: Option<PathBuf>, cwd: Option<PathBuf>) -> Self {
+        Self {
+            default_project,
+            cwd,
+            engines: HashMap::new(),
+            workspace_roots: WorkspaceRoots::new(),
+            adoption_observer: None,
+        }
+    }
 }
 
 enum Dispatch {
@@ -576,6 +598,7 @@ fn json_response(response: JsonRpcResponse) -> Value {
 
 /// The `initialize` result (`session.ts:182-187`).
 pub fn initialize_result() -> Value {
+    // NB: `roots` is a CLIENT capability (MCP spec) — never declared here.
     json!({
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": { "tools": {} },

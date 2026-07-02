@@ -442,6 +442,105 @@ fn no_default_project_exposes_tools_with_required_project_path() {
 }
 
 #[test]
+fn zed_bare_serve_adopts_roots_and_resolves_tool_call() {
+    // GIVEN a bare `serve --mcp` (no --path) launched from an UNINDEXED cwd —
+    // the Zed case: the cwd-derived default is Some(cwd) but has no index.
+    // WHEN the client advertises `capabilities.roots`, later reports an INDEXED
+    // workspace via roots/list, then calls a tool with NO projectPath —
+    // THEN the server adopts the indexed root and the tool call resolves against
+    // it with a NON-EMPTY, non-error result.
+    let _env = lock_env();
+    let indexed = setup_mini_project();
+    let unindexed_cwd = std::env::temp_dir().join(format!(
+        "cg-mcp-zed-cwd-{}-{}",
+        std::process::id(),
+        TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&unindexed_cwd).unwrap();
+    let _cwd_guard = TestProject {
+        path: unindexed_cwd.clone(),
+    };
+
+    let mut server =
+        McpServer::new_with_cwd(Some(unindexed_cwd.clone()), Some(unindexed_cwd.clone()));
+
+    let init = serde_json::to_string(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "capabilities": { "roots": { "listChanged": true } } }
+    }))
+    .unwrap();
+    let mut init_out = Vec::new();
+    server
+        .run(Cursor::new(format!("{init}\n").into_bytes()), &mut init_out)
+        .expect("initialize run");
+    let init_lines: Vec<Value> = String::from_utf8(init_out)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(
+        init_lines.len(),
+        2,
+        "initialize must also request roots/list"
+    );
+    assert_eq!(init_lines[1]["method"], json!("roots/list"));
+
+    let roots_response = serde_json::to_string(&json!({
+        "jsonrpc": "2.0",
+        "id": "codegraph-roots-list-1",
+        "result": { "roots": [
+            { "uri": format!("file://{}", indexed.path().display()), "name": "proj" }
+        ] }
+    }))
+    .unwrap();
+    let mut roots_out = Vec::new();
+    server
+        .run(
+            Cursor::new(format!("{roots_response}\n").into_bytes()),
+            &mut roots_out,
+        )
+        .expect("roots/list response run");
+    assert!(roots_out.is_empty(), "a JSON-RPC response yields no reply");
+    assert_eq!(
+        server.default_project(),
+        Some(indexed.path()),
+        "the indexed workspace root must be adopted as the default project"
+    );
+
+    let call = serde_json::to_string(&json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": { "name": "codegraph_search", "arguments": { "query": "add" } }
+    }))
+    .unwrap();
+    let mut call_out = Vec::new();
+    server
+        .run(Cursor::new(format!("{call}\n").into_bytes()), &mut call_out)
+        .expect("tools/call run");
+    let call_resp: Value =
+        serde_json::from_str(String::from_utf8(call_out).unwrap().lines().next().unwrap()).unwrap();
+    let text = call_resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("tool content text");
+    assert_ne!(
+        call_resp["result"]["isError"],
+        json!(true),
+        "adopted-root tool call must not error: {text}"
+    );
+    assert!(
+        !text.contains("No indexed project resolved"),
+        "must not fall through to the no-project error: {text}"
+    );
+    assert!(
+        text.contains("add"),
+        "search against the adopted indexed root must return results: {text}"
+    );
+}
+
+#[test]
 fn tools_list_honors_codegraph_mcp_tools_allowlist() {
     // CODEGRAPH_MCP_TOOLS replaces the default surface with exactly the named
     // tools — any of the 8 (tools.ts:711-740). Serialized via the shared
