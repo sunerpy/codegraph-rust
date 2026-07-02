@@ -1,6 +1,8 @@
 .omo
 .opencode
 /target/
+# Root /target/ is anchored and does not cover the isolated Zed extension crate.
+editors/zed/target/
 **/*.rs.bk
 
 # Benchmark corpora are fetched on demand (codegraph-bench), not committed.
