@@ -34,13 +34,23 @@ tokio = { version = "1", features = [
     "net",
     "sync",
 ], optional = true }
+# axum + tokio-util: only used by the streamable-HTTP serve path (Phase C).
+# axum hosts the `StreamableHttpService` tower service and binds the listener;
+# tokio-util provides the `CancellationToken` the service shuts down on.
+axum = { version = "0.8", default-features = false, features = [
+    "http1",
+    "tokio",
+], optional = true }
+tokio-util = { version = "0.7", optional = true }
 
 [features]
-# Default build MUST stay rmcp-free (no rmcp/tokio in the tree) — dual-path gate.
-rmcp = ["dep:rmcp", "dep:tokio"]
+# Default build MUST stay rmcp-free (no rmcp/tokio/axum in the tree) — dual-path gate.
+rmcp = ["dep:rmcp", "dep:tokio", "dep:axum", "dep:tokio-util"]
 
 [dev-dependencies]
 codegraph-extract = { path = "../codegraph-extract" }
 # rmcp `client` feature: dev-only, drives the handler over duplex in parity tests.
 rmcp = { version = "2.1", features = ["client", "transport-io"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "sync", "time"] }
+# reqwest: dev-only HTTP client for the Phase C streamable-HTTP integration test.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }

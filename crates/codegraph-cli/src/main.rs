@@ -191,6 +191,13 @@ enum Command {
         mcp: bool,
         #[arg(long = "no-watch")]
         no_watch: bool,
+        /// Serve MCP over streamable-HTTP (rmcp) instead of stdio. Requires an
+        /// already-indexed `--path` (or an indexed cwd); binds localhost.
+        #[arg(long)]
+        http: bool,
+        /// Address to bind the streamable-HTTP server to (localhost only).
+        #[arg(long = "http-addr", default_value = "127.0.0.1:8111")]
+        http_addr: String,
     },
     // Upstream flags/output: upstream bin/codegraph.ts:1167-1169, 1173-1186.
     Unlock {
@@ -446,7 +453,9 @@ fn run(cli: Cli) -> Result<()> {
             path,
             mcp,
             no_watch,
-        } => cmd_serve(path, mcp, no_watch),
+            http,
+            http_addr,
+        } => cmd_serve(path, mcp, no_watch, http, http_addr),
         Command::Unlock { path } => cmd_unlock(path),
         Command::Callers {
             symbol,
@@ -1189,7 +1198,21 @@ fn emit_serve_startup_debug(
     );
 }
 
-fn cmd_serve(path: Option<PathBuf>, mcp: bool, no_watch: bool) -> Result<()> {
+fn cmd_serve(
+    path: Option<PathBuf>,
+    mcp: bool,
+    no_watch: bool,
+    http: bool,
+    http_addr: String,
+) -> Result<()> {
+    if http && mcp {
+        anyhow::bail!(
+            "`--mcp` and `--http` are mutually exclusive: `--mcp` serves MCP over stdio, `--http` serves it over streamable-HTTP. Pick one."
+        );
+    }
+    if http {
+        return cmd_serve_http(path, &http_addr);
+    }
     // Default the MCP project to cwd so `serve --mcp` (no --path, as the
     // installer injects) finds the index of the agent's project root.
     let explicit_path = path.is_some();
@@ -1244,6 +1267,51 @@ fn cmd_serve(path: Option<PathBuf>, mcp: bool, no_watch: bool) -> Result<()> {
     eprintln!("Daemon and watcher startup is wired here for tasks 24/25.");
     eprintln!("Use `codegraph serve --mcp` to start the committed MCP stdio server.");
     Ok(())
+}
+
+/// `serve --http`: serve MCP over streamable-HTTP (rmcp), pinned to an
+/// already-indexed project. Resolves the project from `--path` (find-up if
+/// omitted), REQUIRES an on-disk index (hard-errors otherwise — never
+/// self-indexes), parses the bind address, and hands off to
+/// `codegraph_mcp::serve_http`. Not routed through the daemon/SpawnOrProxy path.
+fn cmd_serve_http(path: Option<PathBuf>, http_addr: &str) -> Result<()> {
+    let project =
+        resolve_project_path_optional(&absolute_path(path.unwrap_or_else(|| PathBuf::from("."))));
+    let db = db_path(&project);
+    if !db.is_file() {
+        anyhow::bail!(
+            "`serve --http` requires an indexed project, but no index was found at {}. Run `codegraph init {}` (or `codegraph index`) first, or pass `--path <indexed-project>`.",
+            db.display(),
+            project.display(),
+        );
+    }
+    let addr: std::net::SocketAddr = http_addr.parse().with_context(|| {
+        format!("invalid --http-addr {http_addr:?}: expected an <ip>:<port> socket address")
+    })?;
+    if debug_enabled() {
+        eprintln!(
+            "[codegraph debug] serve --http: addr={addr} project={} db={} db_exists={}",
+            project.display(),
+            db.display(),
+            db.is_file(),
+        );
+    }
+    serve_http_impl(project, addr)
+}
+
+/// Feature-gated indirection to `codegraph_mcp::serve_http`. Under the `rmcp`
+/// feature this forwards to the streamable-HTTP server; the shipped default
+/// build is rmcp-free, so the flag exists but errors with an actionable message.
+#[cfg(feature = "rmcp")]
+fn serve_http_impl(project: PathBuf, addr: std::net::SocketAddr) -> Result<()> {
+    codegraph_mcp::serve_http(project, addr).context("serving MCP over streamable-HTTP")
+}
+
+#[cfg(not(feature = "rmcp"))]
+fn serve_http_impl(_project: PathBuf, _addr: std::net::SocketAddr) -> Result<()> {
+    anyhow::bail!(
+        "codegraph was built without the `rmcp` feature, so `serve --http` (streamable-HTTP) is unavailable. Rebuild with `--features rmcp` to enable it, or use `serve --mcp` (stdio)."
+    )
 }
 
 /// Whether `serve --mcp` should start background services (live watcher +

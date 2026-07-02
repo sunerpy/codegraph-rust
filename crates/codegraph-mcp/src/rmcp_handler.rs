@@ -75,6 +75,15 @@ impl CodeGraphHandler {
         }
     }
 
+    /// Streamable-HTTP constructor (Phase C): the project is PINNED via
+    /// `--path` and roots adoption is OFF (`no_roots`), mirroring
+    /// [`crate::McpServer::http`]. Identical state to [`Self::new`] with the
+    /// default project set; named separately to make the no_roots/pinned intent
+    /// explicit at the HTTP serve site.
+    pub fn http(project: PathBuf) -> Self {
+        Self::new(Some(project))
+    }
+
     /// Test-only constructor with an explicit cwd (mirrors
     /// [`crate::McpServer::new_with_cwd`]) so the resolution candidates are
     /// exercised deterministically.
@@ -315,6 +324,57 @@ pub fn serve_stdio_rmcp(project: Option<PathBuf>) -> anyhow::Result<()> {
             .waiting()
             .await
             .map_err(|e| anyhow::anyhow!("rmcp stdio serve join failed: {e}"))?;
+        Ok::<(), anyhow::Error>(())
+    })
+}
+
+/// Serve `CodeGraphHandler` over streamable-HTTP via rmcp's
+/// [`StreamableHttpService`], PINNED to `project` in `no_roots` mode (Phase C —
+/// the Zed-remote path). Builds a multi-thread tokio runtime, binds an axum
+/// listener on `addr`, and blocks until the process is signalled.
+///
+/// The service runs in stateless `json_response` mode: every POST to `/mcp`
+/// returns a single `application/json` body (no SSE). That is sound here because
+/// no_roots mode never emits a server-initiated message — so there is nothing to
+/// stream — and it is the shape a plain MCP url client (e.g. Zed's `url` entry)
+/// consumes directly. The listening address is logged to STDERR (never stdout,
+/// which stays pure protocol).
+pub fn serve_http(project: PathBuf, addr: std::net::SocketAddr) -> anyhow::Result<()> {
+    use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService,
+    };
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async move {
+        let db = db_path_for(&project);
+        eprintln!(
+            "[CodeGraph MCP] streamable-HTTP serving on http://{addr}/mcp (project={}, db={}, db_exists={})",
+            project.display(),
+            db.display(),
+            db.is_file(),
+        );
+
+        let handler_project = project.clone();
+        let service: StreamableHttpService<CodeGraphHandler, LocalSessionManager> =
+            StreamableHttpService::new(
+                move || Ok(CodeGraphHandler::http(handler_project.clone())),
+                Arc::new(LocalSessionManager::default()),
+                StreamableHttpServerConfig::default()
+                    .with_stateful_mode(false)
+                    .with_json_response(true)
+                    .with_sse_keep_alive(None),
+            );
+
+        let router = axum::Router::new().nest_service("/mcp", service);
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("binding streamable-HTTP listener on {addr}: {e}"))?;
+        axum::serve(listener, router)
+            .await
+            .map_err(|e| anyhow::anyhow!("streamable-HTTP serve failed: {e}"))?;
         Ok::<(), anyhow::Error>(())
     })
 }

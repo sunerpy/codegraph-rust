@@ -23,3 +23,6 @@ pub mod server;
 
 pub use engine::CodeGraphEngine;
 pub use server::{initialize_result, McpServer, RunUntilAdoption};
+
+#[cfg(feature = "rmcp")]
+pub use rmcp_handler::serve_http;
