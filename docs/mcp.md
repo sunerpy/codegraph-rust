@@ -41,7 +41,55 @@ regardless of cwd (e.g.
 `"args": ["serve", "--mcp", "-p", "/abs/path/to/project"]`).
 
 Supported agents: Claude Code, Cursor, Codex CLI, opencode, Hermes Agent,
-Gemini CLI, Antigravity IDE, Kiro.
+Gemini CLI, Antigravity IDE, Kiro, Trae, Qoder, Zed.
+
+---
+
+## Zed — `context_servers` config
+
+Zed uses a different MCP config shape than other agents. Instead of `mcpServers`,
+it uses a `context_servers` key, and the entry has **no `type` field**:
+
+```jsonc
+{
+  "context_servers": {
+    "codegraph": {
+      "command": "codegraph",
+      "args": ["serve", "--mcp"],
+      "env": {},
+    },
+  },
+}
+```
+
+**Global vs. project-level path constraint.** Zed's global user settings
+(`~/.config/zed/settings.json` on Linux and macOS; `%APPDATA%\Zed\settings.json`
+on Windows) cannot inject a per-project `--path` — there is no `${workspaceFolder}`
+expansion in Zed's `context_servers` args. A global entry therefore runs
+read-only off whatever index the working directory resolves to.
+
+To pin a project's server to an absolute path and get live per-project indexing,
+run `codegraph init --target=zed` inside the project. This writes a
+**project-level** `.zed/settings.json` with the absolute `--path` baked in:
+
+```jsonc
+{
+  "context_servers": {
+    "codegraph": {
+      "command": "codegraph",
+      "args": ["serve", "--mcp", "--path", "/absolute/path/to/project"],
+      "env": {},
+    },
+  },
+}
+```
+
+This is the **only** way to give Zed a per-project path. Without it the server
+falls back to home safe mode if Zed's CWD cannot find an indexed project via
+find-up.
+
+Run `codegraph install --target=zed` to write the bare global entry, or
+`codegraph init --target=zed` inside a project to write the project-level entry.
 
 ---
 
