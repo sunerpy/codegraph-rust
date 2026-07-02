@@ -34,13 +34,13 @@ use rmcp::model::{
     InitializeResult, JsonObject, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
     ServerCapabilities, ServerInfo, Tool,
 };
-use rmcp::service::{RequestContext, RoleServer};
+use rmcp::service::{NotificationContext, RequestContext, RoleServer};
 use serde_json::{json, Value};
 
 use crate::engine::CodeGraphEngine;
 use crate::instructions::SERVER_INSTRUCTIONS;
 use crate::protocol::ToolResult;
-use crate::roots::db_path_for;
+use crate::roots::{db_path_for, debug_enabled, WorkspaceRoots};
 use crate::schemas;
 
 const SERVER_NAME: &str = "codegraph";
@@ -53,15 +53,20 @@ const PANIC_TOOL: &str = "__panic__";
 
 type EngineCache = Arc<Mutex<HashMap<PathBuf, CodeGraphEngine>>>;
 
+/// The default project may be DISPLACED at runtime by roots adoption
+/// (`on_initialized`, non-pinned mode), and adoption runs through a `&self`
+/// handler, so it lives behind a `Mutex` for interior mutability. In pinned /
+/// `no_roots` mode it never changes after construction.
+type DefaultProject = Arc<Mutex<Option<PathBuf>>>;
+
 /// rmcp handler state: the shared engine cache plus the default project /
 /// cwd used to resolve a per-call `projectPath`. `no_roots` mirrors the
-/// [`crate::McpServer::http`] pin (roots adoption is Phase B; Phase A always
-/// runs pinned/no-roots for parity testing).
+/// [`crate::McpServer::http`] pin — when set, roots adoption is OFF (HTTP /
+/// pinned mode); when clear, `on_initialized` may adopt an indexed client root.
 pub struct CodeGraphHandler {
     engines: EngineCache,
-    default_project: Option<PathBuf>,
+    default_project: DefaultProject,
     cwd: Option<PathBuf>,
-    #[allow(dead_code)]
     no_roots: bool,
 }
 
@@ -69,7 +74,7 @@ impl CodeGraphHandler {
     pub fn new(default_project: Option<PathBuf>) -> Self {
         Self {
             engines: Arc::new(Mutex::new(HashMap::new())),
-            default_project,
+            default_project: Arc::new(Mutex::new(default_project)),
             cwd: std::env::current_dir().ok(),
             no_roots: true,
         }
@@ -84,6 +89,20 @@ impl CodeGraphHandler {
         Self::new(Some(project))
     }
 
+    /// Non-pinned stdio constructor (Phase B): `no_roots = false`, so
+    /// `on_initialized` requests the client's roots and adopts an indexed one
+    /// when the current default is displaceable (`roots::` adoption rules). This
+    /// is the bare-`serve --mcp` / Zed-local case where `default_project` is a
+    /// cwd-derived, possibly unindexed dir.
+    pub fn serve_with_roots(default_project: Option<PathBuf>, cwd: Option<PathBuf>) -> Self {
+        Self {
+            engines: Arc::new(Mutex::new(HashMap::new())),
+            default_project: Arc::new(Mutex::new(default_project)),
+            cwd,
+            no_roots: false,
+        }
+    }
+
     /// Test-only constructor with an explicit cwd (mirrors
     /// [`crate::McpServer::new_with_cwd`]) so the resolution candidates are
     /// exercised deterministically.
@@ -91,16 +110,23 @@ impl CodeGraphHandler {
     pub fn new_with_cwd(default_project: Option<PathBuf>, cwd: Option<PathBuf>) -> Self {
         Self {
             engines: Arc::new(Mutex::new(HashMap::new())),
-            default_project,
+            default_project: Arc::new(Mutex::new(default_project)),
             cwd,
             no_roots: true,
         }
     }
 
+    fn default_project_snapshot(&self) -> Option<PathBuf> {
+        self.default_project
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// Whether the default project has an on-disk index — selects the
     /// `tools/list` schema variant (`has_default_codegraph`, server.rs:249).
     fn has_default_codegraph(&self) -> bool {
-        self.default_project
+        self.default_project_snapshot()
             .as_ref()
             .is_some_and(|p| db_path_for(p).is_file())
     }
@@ -110,11 +136,9 @@ impl CodeGraphHandler {
     /// (server.rs:568): absolute raw → cwd-join → bare raw → default-by-basename;
     /// `None` raw → the indexed default. Returns `None` when nothing resolves.
     fn resolve_project_arg(&self, raw: Option<&str>) -> Option<PathBuf> {
+        let default_project = self.default_project_snapshot();
         let Some(raw) = raw else {
-            return self
-                .default_project
-                .clone()
-                .filter(|p| db_path_for(p).is_file());
+            return default_project.filter(|p| db_path_for(p).is_file());
         };
         let raw_path = PathBuf::from(raw);
         let mut candidates: Vec<PathBuf> = Vec::new();
@@ -126,7 +150,7 @@ impl CodeGraphHandler {
             }
             candidates.push(raw_path.clone());
         }
-        if let Some(default) = &self.default_project {
+        if let Some(default) = &default_project {
             if raw_path.file_name() == default.file_name() {
                 candidates.push(default.clone());
             }
@@ -134,6 +158,37 @@ impl CodeGraphHandler {
         candidates
             .into_iter()
             .find(|candidate| db_path_for(candidate).is_file())
+    }
+
+    /// Adopt an indexed client workspace root when the current default is
+    /// displaceable — the Phase-B behavior. Feeds a `ListRootsResult` (already
+    /// serialized to the `{"roots":[…]}` shape) through the SAME `roots::`
+    /// rules the hand-rolled server uses (`should_request_roots` gate +
+    /// `adopt_from_roots_result`), mutating `default_project` in place. Returns
+    /// the adopted root (for the debug trace), or `None` when nothing adopts.
+    fn adopt_client_roots(&self, roots_result: &Value) -> Option<PathBuf> {
+        let mut guard = self
+            .default_project
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let old_default = guard.clone();
+        let adopted = WorkspaceRoots::new().adopt_from_roots_result(
+            &mut guard,
+            self.cwd.as_deref(),
+            Some(roots_result),
+        );
+        if let Some(adopted) = &adopted {
+            if debug_enabled() {
+                let was = old_default
+                    .as_deref()
+                    .map_or_else(|| "none".to_string(), |p| p.display().to_string());
+                eprintln!(
+                    "[codegraph debug] roots: adopted {} (was default={was})",
+                    adopted.display()
+                );
+            }
+        }
+        adopted
     }
 }
 
@@ -230,6 +285,44 @@ impl ServerHandler for CodeGraphHandler {
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_server_info(Implementation::new(SERVER_NAME, SERVER_VERSION))
             .with_instructions(SERVER_INSTRUCTIONS)
+    }
+
+    async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
+        // HTTP / pinned (`no_roots`) mode NEVER requests roots — leave the pin
+        // exactly as Phase C. Only the non-pinned stdio path adopts.
+        if self.no_roots {
+            return;
+        }
+
+        // The client's declared capabilities live in the negotiated peer info
+        // (`context.peer.peer_info()`). Gate on `should_request_roots`, reusing
+        // the SAME rule the hand-rolled server uses (adoptable default + the
+        // client declaring `capabilities.roots`).
+        let Some(peer_info) = context.peer.peer_info() else {
+            return;
+        };
+        let capabilities = serde_json::to_value(&peer_info.capabilities).unwrap_or(Value::Null);
+        let init_params = json!({ "capabilities": capabilities });
+        let default_project = self.default_project_snapshot();
+        if !WorkspaceRoots::new().should_request_roots(
+            default_project.as_ref(),
+            self.cwd.as_deref(),
+            Some(&init_params),
+        ) {
+            return;
+        }
+
+        // `Peer::list_roots` is `#[deprecated]` (SEP-2577); it is still THE
+        // mechanism in rmcp 2.1 for a server to ask the client for its roots and
+        // has no non-deprecated replacement, so the deprecation is allowed at
+        // this one call site (rmcp pinned to 2.1.x; revisit on upgrade).
+        #[allow(deprecated)]
+        let roots = match context.peer.list_roots().await {
+            Ok(result) => result,
+            Err(_) => return,
+        };
+        let roots_value = serde_json::to_value(&roots).unwrap_or(Value::Null);
+        let _ = self.adopt_client_roots(&roots_value);
     }
 
     async fn list_tools(
