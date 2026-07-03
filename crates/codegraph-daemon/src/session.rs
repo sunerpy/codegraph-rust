@@ -351,6 +351,29 @@ pub(crate) fn serve_session(
     Ok(())
 }
 
+/// The session reader/writer bounds. The rmcp path (`serve_session_rmcp`) moves
+/// the halves into a tokio runtime, so it needs `Send + Unpin + 'static`; the
+/// default (rmcp-free) build keeps minimal `BufRead`/`Write` so a caller may
+/// pass a borrowed, non-static writer (e.g. `&mut Vec<u8>` in `session_buffer`).
+/// A blanket impl keeps these as zero-cost aliases over the real traits.
+#[cfg(feature = "rmcp")]
+pub trait SessionReader: BufRead + Send + Unpin + 'static {}
+#[cfg(feature = "rmcp")]
+impl<T: BufRead + Send + Unpin + 'static> SessionReader for T {}
+#[cfg(feature = "rmcp")]
+pub trait SessionWriter: Write + Send + Unpin + 'static {}
+#[cfg(feature = "rmcp")]
+impl<T: Write + Send + Unpin + 'static> SessionWriter for T {}
+
+#[cfg(not(feature = "rmcp"))]
+pub trait SessionReader: BufRead {}
+#[cfg(not(feature = "rmcp"))]
+impl<T: BufRead> SessionReader for T {}
+#[cfg(not(feature = "rmcp"))]
+pub trait SessionWriter: Write {}
+#[cfg(not(feature = "rmcp"))]
+impl<T: Write> SessionWriter for T {}
+
 /// Buffer-safe generic recv seam (the T9 GENERIC SEAM): read the OPTIONAL
 /// client-hello line from `reader`, surface the parsed host pid via
 /// `on_client_pid` BEFORE blocking, then hand the SAME logical stream to
@@ -368,7 +391,7 @@ pub(crate) fn serve_session(
 /// first JSON-RPC frame, OR a timed-out/partial read), we PREPEND the bytes we
 /// already read back in front of `reader` via `Cursor::chain`, so `McpServer`
 /// sees the complete, in-order stream and no byte is ever lost.
-pub fn run_session_recv<R: BufRead, W: Write>(
+pub fn run_session_recv<R: SessionReader, W: SessionWriter>(
     reader: R,
     writer: W,
     project_root: PathBuf,
@@ -388,8 +411,8 @@ pub fn run_session_recv_with<R, W, F>(
     on_client_pid: F,
 ) -> Result<Option<u32>>
 where
-    R: BufRead,
-    W: Write,
+    R: SessionReader,
+    W: SessionWriter,
     F: FnOnce(Option<u32>),
 {
     if !run_mcp {
@@ -408,8 +431,7 @@ where
         // it and serve the rest from the same reader (no bytes to prepend — the
         // hello line is fully consumed).
         on_client_pid(Some(pid));
-        let mut server = McpServer::new(Some(project_root));
-        server.run(reader, writer)?;
+        serve_stream(reader, writer, project_root)?;
         return Ok(Some(pid));
     }
 
@@ -418,9 +440,35 @@ where
     // session sees one continuous, in-order stream.
     on_client_pid(None);
     let chained = BufReader::new(Cursor::new(first).chain(reader));
-    let mut server = McpServer::new(Some(project_root));
-    server.run(chained, writer)?;
+    serve_stream(chained, writer, project_root)?;
     Ok(None)
+}
+
+/// Serve one session's (hello-consumed) stream to EOF. Under `--features rmcp`
+/// with `CODEGRAPH_DAEMON_RMCP=1` this drives the rmcp [`CodeGraphHandler`]
+/// (Phase D); otherwise it drives the hand-rolled [`McpServer`]. BOTH block
+/// until the reader hits EOF (socket half/full-close), so the session thread
+/// returns and its [`SessionGuard`] drops — the reap contract is identical.
+fn serve_stream<R, W>(reader: R, writer: W, project_root: PathBuf) -> Result<()>
+where
+    R: SessionReader,
+    W: SessionWriter,
+{
+    #[cfg(feature = "rmcp")]
+    if rmcp_session_enabled() {
+        return codegraph_mcp::rmcp_session::serve_session_rmcp(reader, writer, project_root);
+    }
+    let mut server = McpServer::new(Some(project_root));
+    server.run(reader, writer)?;
+    Ok(())
+}
+
+/// Whether the daemon session should route through the rmcp handler. Gated on
+/// the `CODEGRAPH_DAEMON_RMCP=1` env var so Phase D can exercise the rmcp path
+/// in tests without flipping the default; Phase E makes rmcp the sole path.
+#[cfg(feature = "rmcp")]
+fn rmcp_session_enabled() -> bool {
+    std::env::var("CODEGRAPH_DAEMON_RMCP").as_deref() == Ok("1")
 }
 
 /// Read bytes from `reader` up to and including the first `\n`, or until `max`

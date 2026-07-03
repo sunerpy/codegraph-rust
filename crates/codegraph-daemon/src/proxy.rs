@@ -266,6 +266,16 @@ where
             }
             Some("tools/list") => {
                 // Answer locally; do NOT forward (the daemon would re-answer it).
+                //
+                // Phase D decision: PRESERVE the static full-tool-surface answer
+                // (`visible_tool_definitions`), NOT the dynamic
+                // required-projectPath variant. This is correct here — the daemon
+                // proxy path is only entered when the project has a `.codegraph/`
+                // index (the daemon only starts pinned to an indexed root), so
+                // the default project always resolves and the direct rmcp path's
+                // dynamic `list_tools` would return the SAME full surface. The two
+                // paths therefore do not diverge; the static call is retained
+                // deliberately (reviewer-signed-off) rather than by omission.
                 if let Some(id) = id {
                     let tools = json!({
                         "tools": codegraph_mcp::schemas::visible_tool_definitions()

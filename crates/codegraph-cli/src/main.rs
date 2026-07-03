@@ -1352,6 +1352,30 @@ fn serve_direct(
     // would then be rejected as "already indexed cwd").
     let _catch_up_done = (run_services && should_run_daemon_services(project_root))
         .then(|| spawn_catch_up(project_root));
+    serve_direct_stdio(project)
+}
+
+/// Serve the direct (pinned) stdio path. Under `--features rmcp` with
+/// `CODEGRAPH_DAEMON_RMCP=1` this drives the rmcp [`CodeGraphHandler`] (Phase D);
+/// otherwise it drives the hand-rolled [`McpServer`]. Both block until stdin
+/// EOF. The broad-root/unindexed-cwd adoption handoff keeps the hand-rolled
+/// path (`serve_direct_no_services`), since rmcp owns its read loop and cannot
+/// hand the reader back for the daemon proxy.
+#[cfg(feature = "rmcp")]
+fn serve_direct_stdio(project: Option<PathBuf>) -> Result<()> {
+    if std::env::var("CODEGRAPH_DAEMON_RMCP").as_deref() == Ok("1") {
+        return codegraph_mcp::serve_stdio_rmcp(project).context("running rmcp MCP stdio server");
+    }
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut server = McpServer::new(project);
+    server
+        .run(BufReader::new(stdin.lock()), stdout.lock())
+        .context("running MCP stdio server")
+}
+
+#[cfg(not(feature = "rmcp"))]
+fn serve_direct_stdio(project: Option<PathBuf>) -> Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut server = McpServer::new(project);

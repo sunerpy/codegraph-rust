@@ -11,9 +11,34 @@
 //! `run_session_recv` is `pub` + generic over `BufRead`/`Write`, so this
 //! external crate drives it with an in-memory `Cursor` — no CLI, no real daemon.
 
-use std::io::{BufReader, Cursor};
+use std::io::{BufReader, Cursor, Write};
+use std::sync::{Arc, Mutex};
 
 use codegraph_daemon::run_session_recv;
+
+/// An owned, `'static + Send` writer that appends to a shared buffer, so it
+/// satisfies the session writer bound under BOTH the default and the `rmcp`
+/// build (the rmcp path moves the writer into a tokio runtime, requiring
+/// `Send + 'static`). The test reads the captured bytes back via [`Self::take`].
+#[derive(Clone, Default)]
+struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+impl SharedBuf {
+    fn take(&self) -> Vec<u8> {
+        self.0.lock().expect("buffer lock").clone()
+    }
+}
+
+impl Write for SharedBuf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("buffer lock").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// A minimal JSON-RPC `initialize` request frame (one line).
 fn initialize_frame() -> String {
@@ -49,17 +74,17 @@ fn assert_initialize_answered(out: &[u8]) {
 fn client_hello_then_initialize_in_one_buffer_is_not_lost() {
     let bytes = format!("{}\n{}\n", r#"{"hostPid":4321}"#, initialize_frame());
     let reader = BufReader::new(Cursor::new(bytes.into_bytes()));
-    let mut out: Vec<u8> = Vec::new();
+    let out = SharedBuf::default();
 
     let project = std::env::temp_dir().join("codegraph-session-buffer-hello");
-    let pid = run_session_recv(reader, &mut out, project, true).expect("run_session_recv ok");
+    let pid = run_session_recv(reader, out.clone(), project, true).expect("run_session_recv ok");
 
     assert_eq!(
         pid,
         Some(4321),
         "the client-hello hostPid must be parsed and returned"
     );
-    assert_initialize_answered(&out);
+    assert_initialize_answered(&out.take());
 }
 
 /// NO client-hello: the buffer is just an `initialize` frame. The non-hello
@@ -69,11 +94,11 @@ fn client_hello_then_initialize_in_one_buffer_is_not_lost() {
 fn no_client_hello_first_frame_is_answered() {
     let bytes = format!("{}\n", initialize_frame());
     let reader = BufReader::new(Cursor::new(bytes.into_bytes()));
-    let mut out: Vec<u8> = Vec::new();
+    let out = SharedBuf::default();
 
     let project = std::env::temp_dir().join("codegraph-session-buffer-nohello");
-    let pid = run_session_recv(reader, &mut out, project, true).expect("run_session_recv ok");
+    let pid = run_session_recv(reader, out.clone(), project, true).expect("run_session_recv ok");
 
     assert_eq!(pid, None, "a client that sent no hello reports no pid");
-    assert_initialize_answered(&out);
+    assert_initialize_answered(&out.take());
 }

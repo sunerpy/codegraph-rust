@@ -17,6 +17,8 @@ pub mod instructions;
 pub mod protocol;
 #[cfg(feature = "rmcp")]
 pub mod rmcp_handler;
+#[cfg(feature = "rmcp")]
+pub mod rmcp_session;
 pub(crate) mod roots;
 pub mod schemas;
 pub mod server;
@@ -25,4 +27,4 @@ pub use engine::CodeGraphEngine;
 pub use server::{initialize_result, McpServer, RunUntilAdoption};
 
 #[cfg(feature = "rmcp")]
-pub use rmcp_handler::serve_http;
+pub use rmcp_handler::{serve_http, serve_stdio_rmcp};
