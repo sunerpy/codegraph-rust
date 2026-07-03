@@ -194,10 +194,15 @@ enum Command {
         /// Serve MCP over streamable-HTTP (rmcp) instead of stdio. With `--path`
         /// it pins one already-indexed project; without `--path` it starts a
         /// GLOBAL server where each call carries its own `projectPath`. Binds
-        /// localhost.
+        /// localhost. A DNS-rebinding guard only accepts a `Host` matching the
+        /// bind address (or loopback); set `CODEGRAPH_HTTP_ALLOW_ANY_HOST=1` to
+        /// accept any `Host` (only when fronted by your own proxy/auth).
         #[arg(long)]
         http: bool,
-        /// Address to bind the streamable-HTTP server to (localhost only).
+        /// Address to bind the streamable-HTTP server to. Loopback binds
+        /// (127.0.0.1/localhost) work out of the box; for a non-loopback bind
+        /// (0.0.0.0 or a real interface) the guard accepts that exact
+        /// `Host: <addr>`, or set `CODEGRAPH_HTTP_ALLOW_ANY_HOST=1` for any Host.
         #[arg(long = "http-addr", default_value = "127.0.0.1:8111")]
         http_addr: String,
     },

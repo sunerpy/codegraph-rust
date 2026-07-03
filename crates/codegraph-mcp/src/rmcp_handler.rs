@@ -443,14 +443,24 @@ pub fn serve_stdio_rmcp(project: Option<PathBuf>) -> anyhow::Result<()> {
 /// stream — and it is the shape a plain MCP url client (e.g. Zed's `url` entry)
 /// consumes directly. The listening address is logged to STDERR (never stdout,
 /// which stays pure protocol).
+///
+/// # DNS-rebinding host guard
+///
+/// rmcp's [`StreamableHttpServerConfig`] enforces a bare-host allowlist
+/// (`localhost`, `127.0.0.1`, `::1`) so a malicious webpage cannot rebind DNS to
+/// reach this server. The allowlist is rebuilt here from the actual bind `addr`
+/// so a local client (MCP Inspector, curl, Zed) that sends the exact
+/// `Host: <bind>:<port>` authority is accepted while the guard stays on for
+/// arbitrary hosts. Set `CODEGRAPH_HTTP_ALLOW_ANY_HOST=1` to disable the guard
+/// entirely when fronting the server with your own reverse proxy/auth (e.g. a
+/// non-loopback bind reached through SSH-forward), where the client `Host` may
+/// be anything.
 pub fn serve_http(
     default_project: Option<PathBuf>,
     addr: std::net::SocketAddr,
 ) -> anyhow::Result<()> {
+    use rmcp::transport::streamable_http_server::StreamableHttpService;
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-    use rmcp::transport::streamable_http_server::{
-        StreamableHttpServerConfig, StreamableHttpService,
-    };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -478,10 +488,7 @@ pub fn serve_http(
             StreamableHttpService::new(
                 move || Ok(CodeGraphHandler::new(handler_default.clone())),
                 Arc::new(LocalSessionManager::default()),
-                StreamableHttpServerConfig::default()
-                    .with_stateful_mode(false)
-                    .with_json_response(true)
-                    .with_sse_keep_alive(None),
+                build_http_config(addr, http_allow_any_host_from_env()),
             );
 
         let router = axum::Router::new().nest_service("/mcp", service);
@@ -493,4 +500,55 @@ pub fn serve_http(
             .map_err(|e| anyhow::anyhow!("streamable-HTTP serve failed: {e}"))?;
         Ok::<(), anyhow::Error>(())
     })
+}
+
+/// Environment name for the opt-in host-guard escape hatch.
+pub const ALLOW_ANY_HOST_ENV: &str = "CODEGRAPH_HTTP_ALLOW_ANY_HOST";
+
+/// Read the [`ALLOW_ANY_HOST_ENV`] escape hatch. `1`/`true`/`yes`/`on`
+/// (case-insensitive) enable it; anything else (including unset) keeps the guard.
+pub fn http_allow_any_host_from_env() -> bool {
+    matches!(
+        std::env::var(ALLOW_ANY_HOST_ENV)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Build the streamable-HTTP config for [`serve_http`], centralizing the
+/// `allowed_hosts` DNS-rebinding guard so tests exercise the exact production
+/// list. rmcp compares each entry as a normalized authority: a bare host matches
+/// any port, a `host:port` entry matches that port exactly (IPv6 brackets/case
+/// are normalized away). The list therefore includes both the bare loopback
+/// hosts and the explicit `host:port` authorities for the actual bind `addr` so
+/// `Host: <bind>:<port>` (what the MCP Inspector / curl / Zed send) is accepted.
+/// When `allow_any_host` is set the guard is disabled entirely.
+pub fn build_http_config(
+    addr: std::net::SocketAddr,
+    allow_any_host: bool,
+) -> rmcp::transport::streamable_http_server::StreamableHttpServerConfig {
+    use rmcp::transport::streamable_http_server::StreamableHttpServerConfig;
+
+    let base = StreamableHttpServerConfig::default()
+        .with_stateful_mode(false)
+        .with_json_response(true)
+        .with_sse_keep_alive(None);
+
+    if allow_any_host {
+        return base.disable_allowed_hosts();
+    }
+
+    let port = addr.port();
+    base.with_allowed_hosts([
+        addr.to_string(),
+        format!("localhost:{port}"),
+        format!("127.0.0.1:{port}"),
+        format!("[::1]:{port}"),
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ])
 }
