@@ -426,9 +426,16 @@ pub fn serve_stdio_rmcp(project: Option<PathBuf>) -> anyhow::Result<()> {
 }
 
 /// Serve `CodeGraphHandler` over streamable-HTTP via rmcp's
-/// [`StreamableHttpService`], PINNED to `project` in `no_roots` mode (Phase C —
-/// the Zed-remote path). Builds a multi-thread tokio runtime, binds an axum
-/// listener on `addr`, and blocks until the process is signalled.
+/// [`StreamableHttpService`] in `no_roots` mode. Builds a multi-thread tokio
+/// runtime, binds an axum listener on `addr`, and blocks until the process is
+/// signalled.
+///
+/// `default_project` selects the mode: `Some(project)` PINS the server to one
+/// project (Phase C — the Zed-remote / single-project path), so a call without
+/// `projectPath` resolves that pinned default. `None` is the GLOBAL mode: no
+/// pinned default, every tool call MUST carry its own `projectPath`, and one
+/// server serves many projects (the HTTP analog of the Kiro/Qoder bare global
+/// entry). HTTP can never adopt client roots, so both modes stay `no_roots`.
 ///
 /// The service runs in stateless `json_response` mode: every POST to `/mcp`
 /// returns a single `application/json` body (no SSE). That is sound here because
@@ -436,7 +443,10 @@ pub fn serve_stdio_rmcp(project: Option<PathBuf>) -> anyhow::Result<()> {
 /// stream — and it is the shape a plain MCP url client (e.g. Zed's `url` entry)
 /// consumes directly. The listening address is logged to STDERR (never stdout,
 /// which stays pure protocol).
-pub fn serve_http(project: PathBuf, addr: std::net::SocketAddr) -> anyhow::Result<()> {
+pub fn serve_http(
+    default_project: Option<PathBuf>,
+    addr: std::net::SocketAddr,
+) -> anyhow::Result<()> {
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService,
@@ -446,18 +456,27 @@ pub fn serve_http(project: PathBuf, addr: std::net::SocketAddr) -> anyhow::Resul
         .enable_all()
         .build()?;
     runtime.block_on(async move {
-        let db = db_path_for(&project);
-        eprintln!(
-            "[CodeGraph MCP] streamable-HTTP serving on http://{addr}/mcp (project={}, db={}, db_exists={})",
-            project.display(),
-            db.display(),
-            db.is_file(),
-        );
+        match &default_project {
+            Some(project) => {
+                let db = db_path_for(project);
+                eprintln!(
+                    "[CodeGraph MCP] streamable-HTTP serving on http://{addr}/mcp (project={}, db={}, db_exists={})",
+                    project.display(),
+                    db.display(),
+                    db.is_file(),
+                );
+            }
+            None => {
+                eprintln!(
+                    "[CodeGraph MCP] streamable-HTTP serving (global, per-call projectPath) on http://{addr}/mcp",
+                );
+            }
+        }
 
-        let handler_project = project.clone();
+        let handler_default = default_project.clone();
         let service: StreamableHttpService<CodeGraphHandler, LocalSessionManager> =
             StreamableHttpService::new(
-                move || Ok(CodeGraphHandler::http(handler_project.clone())),
+                move || Ok(CodeGraphHandler::new(handler_default.clone())),
                 Arc::new(LocalSessionManager::default()),
                 StreamableHttpServerConfig::default()
                     .with_stateful_mode(false)

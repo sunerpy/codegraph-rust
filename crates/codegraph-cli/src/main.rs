@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
@@ -191,8 +191,10 @@ enum Command {
         mcp: bool,
         #[arg(long = "no-watch")]
         no_watch: bool,
-        /// Serve MCP over streamable-HTTP (rmcp) instead of stdio. Requires an
-        /// already-indexed `--path` (or an indexed cwd); binds localhost.
+        /// Serve MCP over streamable-HTTP (rmcp) instead of stdio. With `--path`
+        /// it pins one already-indexed project; without `--path` it starts a
+        /// GLOBAL server where each call carries its own `projectPath`. Binds
+        /// localhost.
         #[arg(long)]
         http: bool,
         /// Address to bind the streamable-HTTP server to (localhost only).
@@ -1274,32 +1276,45 @@ fn cmd_serve(
     Ok(())
 }
 
-/// `serve --http`: serve MCP over streamable-HTTP (rmcp), pinned to an
-/// already-indexed project. Resolves the project from `--path` (find-up if
-/// omitted), REQUIRES an on-disk index (hard-errors otherwise — never
-/// self-indexes), parses the bind address, and hands off to
+/// `serve --http`: serve MCP over streamable-HTTP (rmcp). Two modes selected by
+/// `--path`. With `--path`: PINNED — resolve the project (find-up), REQUIRE an
+/// on-disk index (hard-error otherwise — never self-index), and pin it as the
+/// default. Without `--path`: GLOBAL — no pinned default, no startup index
+/// requirement; each tool call MUST carry its own `projectPath` (the HTTP analog
+/// of the Kiro/Qoder bare global entry). Parses the bind address and hands off to
 /// `codegraph_mcp::serve_http`. Not routed through the daemon/SpawnOrProxy path.
 fn cmd_serve_http(path: Option<PathBuf>, http_addr: &str) -> Result<()> {
-    let project =
-        resolve_project_path_optional(&absolute_path(path.unwrap_or_else(|| PathBuf::from("."))));
-    let db = db_path(&project);
-    if !db.is_file() {
-        anyhow::bail!(
-            "`serve --http` requires an indexed project, but no index was found at {}. Run `codegraph init {}` (or `codegraph index`) first, or pass `--path <indexed-project>`.",
-            db.display(),
-            project.display(),
-        );
-    }
     let addr = resolve_http_addr(http_addr)?;
-    if debug_enabled() {
-        eprintln!(
-            "[codegraph debug] serve --http: addr={addr} project={} db={} db_exists={}",
-            project.display(),
-            db.display(),
-            db.is_file(),
-        );
+    match path {
+        Some(raw) => {
+            let project = resolve_project_path_optional(&absolute_path(raw));
+            let db = db_path(&project);
+            if !db.is_file() {
+                anyhow::bail!(
+                    "`serve --http --path` requires an indexed project, but no index was found at {}. Run `codegraph init {}` (or `codegraph index`) first.",
+                    db.display(),
+                    project.display(),
+                );
+            }
+            if debug_enabled() {
+                eprintln!(
+                    "[codegraph debug] serve --http (pinned): addr={addr} project={} db={} db_exists={}",
+                    project.display(),
+                    db.display(),
+                    db.is_file(),
+                );
+            }
+            serve_http_impl(Some(project), addr)
+        }
+        None => {
+            if debug_enabled() {
+                eprintln!(
+                    "[codegraph debug] serve --http (global): addr={addr} per-call projectPath, no pinned default",
+                );
+            }
+            serve_http_impl(None, addr)
+        }
     }
-    serve_http_impl(project, addr)
 }
 
 /// Resolve a `--http-addr` string to a bind `SocketAddr`, accepting IP literals
@@ -1326,14 +1341,13 @@ fn resolve_http_addr(http_addr: &str) -> Result<std::net::SocketAddr> {
 
 /// Indirection to `codegraph_mcp::serve_http` (streamable-HTTP via rmcp, the
 /// sole HTTP transport).
-fn serve_http_impl(project: PathBuf, addr: std::net::SocketAddr) -> Result<()> {
-    codegraph_mcp::serve_http(project, addr).context("serving MCP over streamable-HTTP")
+fn serve_http_impl(default_project: Option<PathBuf>, addr: std::net::SocketAddr) -> Result<()> {
+    codegraph_mcp::serve_http(default_project, addr).context("serving MCP over streamable-HTTP")
 }
 
 #[cfg(test)]
 mod resolve_http_addr_tests {
     use super::resolve_http_addr;
-
     #[test]
     fn localhost_with_port_resolves_to_loopback() {
         let addr = resolve_http_addr("localhost:12025").expect("localhost:PORT must resolve");
@@ -1381,6 +1395,50 @@ mod resolve_http_addr_tests {
     #[test]
     fn missing_port_errors() {
         resolve_http_addr("localhost").expect_err("host with no port must error");
+    }
+}
+
+#[cfg(test)]
+mod normalize_lexical_tests {
+    use super::{absolute_path, normalize_lexical};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn cwd_dot_has_no_trailing_curdir_segment() {
+        let normalized = absolute_path(".");
+        assert!(
+            normalized.is_absolute(),
+            "absolute_path(.) must be absolute: {}",
+            normalized.display()
+        );
+        assert!(
+            !normalized.to_string_lossy().ends_with("/."),
+            "absolute_path(.) must not carry a trailing /. segment: {}",
+            normalized.display()
+        );
+        assert_eq!(
+            normalized,
+            std::env::current_dir().unwrap(),
+            "absolute_path(.) must equal the cwd verbatim"
+        );
+    }
+
+    #[test]
+    fn already_clean_absolute_path_is_unchanged() {
+        let clean = PathBuf::from("/tmp/codegraph-project");
+        assert_eq!(normalize_lexical(&clean), clean);
+    }
+
+    #[test]
+    fn strips_curdir_and_folds_parentdir() {
+        assert_eq!(
+            normalize_lexical(Path::new("/a/./b/../c")),
+            PathBuf::from("/a/c")
+        );
+        assert_eq!(
+            normalize_lexical(Path::new("/a/b/.")),
+            PathBuf::from("/a/b")
+        );
     }
 }
 
@@ -3306,13 +3364,41 @@ fn resolve_project_path_optional(start: &Path) -> PathBuf {
 
 fn absolute_path(path: impl AsRef<Path>) -> PathBuf {
     let path = path.as_ref();
-    if path.is_absolute() {
+    let joined = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(path)
+    };
+    normalize_lexical(&joined)
+}
+
+/// Lexically normalize a path WITHOUT touching the filesystem: drop `.`
+/// components and fold each `..` into the preceding component. Unlike
+/// [`std::fs::canonicalize`] it never reads the disk, never resolves symlinks,
+/// and never fails on a nonexistent path — so `serve --http` (which may point at
+/// a not-yet-indexed project) logs `<cwd>` and `<cwd>/.codegraph/codegraph.db`
+/// with no dangling `/.` segment from a `cwd.join(".")`.
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else {
+                    out.push(component);
+                }
+            }
+            other => out.push(other),
+        }
     }
+    if out.as_os_str().is_empty() {
+        out.push(Component::CurDir);
+    }
+    out
 }
 
 fn codegraph_dir(project: &Path) -> PathBuf {

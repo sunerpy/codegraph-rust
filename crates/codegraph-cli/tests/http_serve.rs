@@ -77,7 +77,11 @@ fn copy_tree(src: &Path, dst: &Path) {
 }
 
 fn indexed_project(dir: &TestDir) -> PathBuf {
-    let project = dir.path().join("mini");
+    indexed_project_named(dir, "mini")
+}
+
+fn indexed_project_named(dir: &TestDir, name: &str) -> PathBuf {
+    let project = dir.path().join(name);
     copy_tree(&mini_fixture(), &project);
     let status = Command::new(bin())
         .args(["init", project.to_str().unwrap()])
@@ -213,37 +217,45 @@ fn serve_http_localhost_hostname_starts_and_is_reachable() {
     );
 }
 
-/// (2) `serve --http` with NO indexed project → a clean, non-zero hard error
-/// (does not hang, exits promptly with an actionable message).
+/// (2) PINNED mode: `serve --http --path <unindexed>` → a clean, non-zero hard
+/// error (does not hang, exits promptly with an actionable message). This is the
+/// require-index guarantee for the pinned path — it survives the global-mode
+/// addition below (which only relaxes the *no-`--path*` case).
 #[test]
-fn serve_http_without_index_errors_cleanly() {
+fn serve_http_pinned_without_index_errors_cleanly() {
     let unindexed = TestDir::new("unindexed");
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
     let output = Command::new(bin())
-        .args(["serve", "--http", "--http-addr", &addr])
-        .current_dir(unindexed.path())
+        .args([
+            "serve",
+            "--http",
+            "--path",
+            unindexed.path().to_str().unwrap(),
+            "--http-addr",
+            &addr,
+        ])
         .env("CODEGRAPH_NO_DAEMON", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .expect("run serve --http (no index)");
+        .expect("run serve --http --path (no index)");
 
     assert!(
         !output.status.success(),
-        "serve --http without an index must exit non-zero"
+        "serve --http --path <unindexed> must exit non-zero"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.to_lowercase().contains("index") || stderr.to_lowercase().contains("codegraph init"),
         "error must name the missing index / suggest `codegraph init`: {stderr}"
     );
-    // Must NOT have self-indexed the cwd.
+    // Must NOT have self-indexed the pinned dir.
     assert!(
         !unindexed.path().join(".codegraph").exists(),
-        "serve --http must NOT self-index the cwd"
+        "serve --http --path must NOT self-index the target"
     );
 }
 
@@ -281,5 +293,101 @@ fn serve_mcp_and_http_together_errors() {
     assert!(
         stderr.to_lowercase().contains("--mcp") && stderr.to_lowercase().contains("--http"),
         "error must name the conflicting --mcp / --http flags: {stderr}"
+    );
+}
+
+fn spawn_global_server(addr: &str) -> std::process::Child {
+    Command::new(bin())
+        .args(["serve", "--http", "--http-addr", addr])
+        .env("CODEGRAPH_NO_DAEMON", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn global serve --http")
+}
+
+fn wait_reachable(addr: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#;
+    while Instant::now() < deadline {
+        if let Ok(resp) = http_post_mcp(addr, init)
+            && resp.contains("\"result\"")
+            && resp.contains("2024-11-05")
+        {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    false
+}
+
+fn call_search(addr: &str, query: &str, project_path: Option<&str>) -> String {
+    let args = match project_path {
+        Some(p) => format!(r#"{{"query":"{query}","projectPath":"{p}"}}"#),
+        None => format!(r#"{{"query":"{query}"}}"#),
+    };
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"codegraph_search","arguments":{args}}}}}"#
+    );
+    http_post_mcp(addr, &body).expect("tools/call codegraph_search")
+}
+
+/// (4) GLOBAL mode: `serve --http` with NO `--path` starts (does NOT error on a
+/// missing index) and serves MANY projects from ONE server — a `codegraph_search`
+/// carrying `projectPath=<projA>` returns projA's results, and a second call on
+/// the SAME server with `projectPath=<projB>` (a distinct indexed fixture)
+/// returns projB's results.
+#[test]
+fn serve_http_global_serves_multiple_projectpaths() {
+    let home = TestDir::new("global");
+    let proj_a = indexed_project_named(&home, "alpha");
+    let proj_b = indexed_project_named(&home, "beta");
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let mut child = spawn_global_server(&addr);
+    let reachable = wait_reachable(&addr);
+
+    let resp_a = call_search(&addr, "Greeter", Some(proj_a.to_str().unwrap()));
+    let resp_b = call_search(&addr, "Counter", Some(proj_b.to_str().unwrap()));
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        reachable,
+        "global serve --http (no --path) must start and answer initialize"
+    );
+    assert!(
+        resp_a.contains("Greeter"),
+        "global mode: projectPath={} must return that project's Greeter results: {resp_a}",
+        proj_a.display()
+    );
+    assert!(
+        resp_b.contains("Counter"),
+        "global mode: a SECOND call with projectPath={} must return that project's Counter results from the SAME server: {resp_b}",
+        proj_b.display()
+    );
+}
+
+/// (5) GLOBAL mode, tool call WITHOUT `projectPath` → the actionable
+/// "No indexed project resolved" error (a normal isError result, not a crash).
+#[test]
+fn serve_http_global_without_projectpath_returns_actionable_error() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    let mut child = spawn_global_server(&addr);
+    let reachable = wait_reachable(&addr);
+    let resp = call_search(&addr, "Greeter", None);
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(reachable, "global serve --http must start");
+    assert!(
+        resp.contains("No indexed project resolved"),
+        "global mode without projectPath must return the actionable resolve error: {resp}"
     );
 }
