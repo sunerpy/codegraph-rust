@@ -25,12 +25,6 @@ interprocess = { workspace = true }
 codegraph-mcp = { path = "../codegraph-mcp" }
 codegraph-watch = { path = "../codegraph-watch" }
 
-[features]
-# Route the per-connection daemon session through the rmcp handler (Phase D).
-# Default build stays rmcp-free — this only pulls rmcp through codegraph-mcp
-# when explicitly enabled, keeping the shipped binary's dependency tree unchanged.
-rmcp = ["codegraph-mcp/rmcp"]
-
 # Unix process introspection (getppid, signal-0 liveness) + socket half-close
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["net"] }

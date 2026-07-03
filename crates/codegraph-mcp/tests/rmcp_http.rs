@@ -15,7 +15,7 @@
 //! The server runs in stateless `json_response` mode: every POST returns a
 //! single `application/json` body (no SSE), because no_roots mode never emits a
 //! server-initiated message — the exact shape a plain MCP url client consumes.
-#![cfg(feature = "rmcp")]
+// rmcp is the sole MCP transport (Phase E); this test exercises it unconditionally.
 
 #[path = "support/parity.rs"]
 mod parity;

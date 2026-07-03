@@ -8,7 +8,7 @@
 //!     runtime/process survives (Q5-unwind);
 //! (e) dynamic tools/list: indexed default → full surface; no indexed default →
 //!     the projectPath-required variant.
-#![cfg(feature = "rmcp")]
+// rmcp is the sole MCP transport (Phase E); this test exercises it unconditionally.
 
 #[path = "support/parity.rs"]
 mod parity;

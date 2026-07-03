@@ -40,9 +40,12 @@ impl Write for SharedBuf {
     }
 }
 
-/// A minimal JSON-RPC `initialize` request frame (one line).
+/// A spec-valid JSON-RPC `initialize` request frame (one line). rmcp's
+/// handshake requires `protocolVersion`/`capabilities`/`clientInfo`, so the
+/// frame carries them; the buffer-safety contract under test is that this frame
+/// is delivered intact after the OPTIONAL client-hello, not the protocol shape.
 fn initialize_frame() -> String {
-    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.to_string()
+    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"session-buffer-test","version":"0"}}}"#.to_string()
 }
 
 /// `initialize` is answered by `McpServer` regardless of index, so the output

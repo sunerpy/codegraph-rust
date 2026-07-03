@@ -178,7 +178,7 @@ fn direct_mode_auto_syncs_new_file() {
     let mut serve = ServeProcess::spawn(&project, false);
 
     // Handshake.
-    serve.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+    serve.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-test","version":"0"}}}"#);
     let init = serve.read_line().expect("initialize response");
     assert!(
         init.contains("serverInfo") || init.contains("protocolVersion") || init.contains("result"),
@@ -232,7 +232,7 @@ fn no_watch_disables_auto_sync() {
 
     let mut serve = ServeProcess::spawn(&project, true);
 
-    serve.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+    serve.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-test","version":"0"}}}"#);
     let _ = serve.read_line().expect("initialize response");
 
     assert!(

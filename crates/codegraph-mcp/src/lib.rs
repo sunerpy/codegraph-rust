@@ -15,16 +15,12 @@ pub mod engine;
 pub mod explore_budget;
 pub mod instructions;
 pub mod protocol;
-#[cfg(feature = "rmcp")]
 pub mod rmcp_handler;
-#[cfg(feature = "rmcp")]
 pub mod rmcp_session;
 pub(crate) mod roots;
 pub mod schemas;
 pub mod server;
 
 pub use engine::CodeGraphEngine;
-pub use server::{McpServer, RunUntilAdoption, initialize_result};
-
-#[cfg(feature = "rmcp")]
 pub use rmcp_handler::{serve_http, serve_stdio_rmcp};
+pub use server::{McpServer, RunUntilAdoption, initialize_result};

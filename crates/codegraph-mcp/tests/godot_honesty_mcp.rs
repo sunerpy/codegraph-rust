@@ -119,7 +119,7 @@ fn tool_text(project: &Path, tool: &str, mut arguments: Value) -> String {
     let mut output = Vec::new();
     let mut server = McpServer::new(Some(project.to_path_buf()));
     server
-        .run(Cursor::new(input.into_bytes()), &mut output)
+        .run_until_adoption(Cursor::new(input.into_bytes()), &mut output)
         .unwrap();
     let text = String::from_utf8(output).unwrap();
     let line = text.lines().next().unwrap();

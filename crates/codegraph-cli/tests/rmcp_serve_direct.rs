@@ -1,17 +1,13 @@
-//! Phase D — the CLI direct stdio serve path (`serve --mcp`) routes through the
-//! rmcp `CodeGraphHandler` when built `--features rmcp` and opted in with
-//! `CODEGRAPH_DAEMON_RMCP=1`.
+//! Phase E — the CLI direct stdio serve path (`serve --mcp`) routes through the
+//! rmcp `CodeGraphHandler` (the sole MCP transport).
 //!
 //! Drives the real `codegraph` binary end-to-end from an INDEXED cwd with the
 //! daemon disabled (`CODEGRAPH_NO_DAEMON=1`, forcing `serve_direct`), sends an
 //! `initialize` + a `tools/call codegraph_search` over stdio, and asserts a
 //! non-empty, non-error tool result — proving the rmcp direct path serves the
-//! same tools as the hand-rolled path. Then closes stdin and confirms the
-//! process exits (stdin EOF → rmcp serve ends → block_on returns → exit).
-//!
-//! Requires the `rmcp` feature; the whole file is gated so the default
-//! `cargo test -p codegraph-rs` skips it.
-#![cfg(all(unix, feature = "rmcp"))]
+//! tools. Then closes stdin and confirms the process exits (stdin EOF → rmcp
+//! serve ends → block_on returns → exit).
+#![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -130,7 +126,6 @@ fn serve_mcp_direct_routes_through_rmcp_handler() {
         .args(["serve", "--mcp", "--path", indexed.to_str().unwrap()])
         .env("CODEGRAPH_NO_DAEMON", "1")
         .env("CODEGRAPH_NO_WATCH", "1")
-        .env("CODEGRAPH_DAEMON_RMCP", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

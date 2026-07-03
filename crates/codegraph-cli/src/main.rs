@@ -1304,19 +1304,10 @@ fn cmd_serve_http(path: Option<PathBuf>, http_addr: &str) -> Result<()> {
     serve_http_impl(project, addr)
 }
 
-/// Feature-gated indirection to `codegraph_mcp::serve_http`. Under the `rmcp`
-/// feature this forwards to the streamable-HTTP server; the shipped default
-/// build is rmcp-free, so the flag exists but errors with an actionable message.
-#[cfg(feature = "rmcp")]
+/// Indirection to `codegraph_mcp::serve_http` (streamable-HTTP via rmcp, the
+/// sole HTTP transport).
 fn serve_http_impl(project: PathBuf, addr: std::net::SocketAddr) -> Result<()> {
     codegraph_mcp::serve_http(project, addr).context("serving MCP over streamable-HTTP")
-}
-
-#[cfg(not(feature = "rmcp"))]
-fn serve_http_impl(_project: PathBuf, _addr: std::net::SocketAddr) -> Result<()> {
-    anyhow::bail!(
-        "codegraph was built without the `rmcp` feature, so `serve --http` (streamable-HTTP) is unavailable. Rebuild with `--features rmcp` to enable it, or use `serve --mcp` (stdio)."
-    )
 }
 
 /// Whether `serve --mcp` should start background services (live watcher +
@@ -1360,33 +1351,13 @@ fn serve_direct(
     serve_direct_stdio(project)
 }
 
-/// Serve the direct (pinned) stdio path. Under `--features rmcp` with
-/// `CODEGRAPH_DAEMON_RMCP=1` this drives the rmcp [`CodeGraphHandler`] (Phase D);
-/// otherwise it drives the hand-rolled [`McpServer`]. Both block until stdin
-/// EOF. The broad-root/unindexed-cwd adoption handoff keeps the hand-rolled
-/// path (`serve_direct_no_services`), since rmcp owns its read loop and cannot
+/// Serve the direct (pinned) stdio path through the rmcp [`CodeGraphHandler`]
+/// (the sole MCP transport). Blocks until stdin EOF. The broad-root/unindexed-cwd
+/// adoption handoff keeps the hand-rolled path (`serve_direct_no_services` →
+/// [`McpServer::run_until_adoption`]), since rmcp owns its read loop and cannot
 /// hand the reader back for the daemon proxy.
-#[cfg(feature = "rmcp")]
 fn serve_direct_stdio(project: Option<PathBuf>) -> Result<()> {
-    if std::env::var("CODEGRAPH_DAEMON_RMCP").as_deref() == Ok("1") {
-        return codegraph_mcp::serve_stdio_rmcp(project).context("running rmcp MCP stdio server");
-    }
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    let mut server = McpServer::new(project);
-    server
-        .run(BufReader::new(stdin.lock()), stdout.lock())
-        .context("running MCP stdio server")
-}
-
-#[cfg(not(feature = "rmcp"))]
-fn serve_direct_stdio(project: Option<PathBuf>) -> Result<()> {
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    let mut server = McpServer::new(project);
-    server
-        .run(BufReader::new(stdin.lock()), stdout.lock())
-        .context("running MCP stdio server")
+    codegraph_mcp::serve_stdio_rmcp(project).context("running rmcp MCP stdio server")
 }
 
 /// Serves MCP tools off any existing index WITHOUT starting the watcher,
@@ -1398,11 +1369,14 @@ fn serve_direct_no_services(
     _project_root: &Path,
     no_watch: bool,
 ) -> Result<()> {
-    let stdin = io::stdin();
+    // Owned `Stdin`/`Stdout` (both `Send + 'static`) so the reader handed back
+    // on adoption can move into the rmcp session's tokio runtime, which the
+    // borrowed `.lock()` guards (`!Send`) cannot.
+    let reader = BufReader::new(io::stdin());
     let stdout = io::stdout();
     let mut server = McpServer::new(project);
     match server
-        .run_until_adoption(BufReader::new(stdin.lock()), stdout.lock())
+        .run_until_adoption(reader, &stdout)
         .context("running MCP stdio server until workspace adoption")?
     {
         RunUntilAdoption::Eof => Ok(()),
@@ -1413,17 +1387,19 @@ fn serve_direct_no_services(
     }
 }
 
-fn serve_adopted_project<R: BufRead, W: Write + Send + 'static>(
+fn serve_adopted_project<R, W>(
     reader: R,
     writer: W,
     project_root: PathBuf,
     no_watch: bool,
-) -> Result<()> {
+) -> Result<()>
+where
+    R: BufRead + Send + 'static + Unpin,
+    W: Write + Send + 'static + Unpin,
+{
     let Some(socket_path) = start_daemon_for_adopted_root(&project_root, no_watch) else {
-        let mut server = McpServer::new(Some(project_root));
-        return server
-            .run(reader, writer)
-            .context("running MCP stdio server for adopted project");
+        return codegraph_mcp::rmcp_session::serve_session_rmcp(reader, writer, project_root)
+            .context("running rmcp MCP stdio server for adopted project");
     };
 
     match codegraph_daemon::attach_to_daemon(&socket_path) {
@@ -1435,10 +1411,8 @@ fn serve_adopted_project<R: BufRead, W: Write + Send + 'static>(
                     "[codegraph debug] serve_adopted: daemon version mismatch; serving direct"
                 );
             }
-            let mut server = McpServer::new(Some(project_root));
-            return server
-                .run(reader, writer)
-                .context("running MCP stdio server for adopted project");
+            return codegraph_mcp::rmcp_session::serve_session_rmcp(reader, writer, project_root)
+                .context("running rmcp MCP stdio server for adopted project");
         }
         Err(err) => {
             tracing::debug!(error = %err, "adopted project daemon preflight failed; serving direct");
@@ -1447,10 +1421,8 @@ fn serve_adopted_project<R: BufRead, W: Write + Send + 'static>(
                     "[codegraph debug] serve_adopted: daemon preflight failed ({err}); serving direct"
                 );
             }
-            let mut server = McpServer::new(Some(project_root));
-            return server
-                .run(reader, writer)
-                .context("running MCP stdio server for adopted project");
+            return codegraph_mcp::rmcp_session::serve_session_rmcp(reader, writer, project_root)
+                .context("running rmcp MCP stdio server for adopted project");
         }
     }
 

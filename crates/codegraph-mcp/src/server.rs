@@ -185,8 +185,6 @@ pub fn reopen_count() -> u64 {
     REOPEN_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-type AdoptionObserver = Box<dyn FnMut(&std::path::Path)>;
-
 pub enum RunUntilAdoption<R> {
     Eof,
     Adopted { project_root: PathBuf, reader: R },
@@ -201,7 +199,6 @@ pub struct McpServer {
     cwd: Option<PathBuf>,
     engines: HashMap<PathBuf, CachedEngine>,
     workspace_roots: WorkspaceRoots,
-    adoption_observer: Option<AdoptionObserver>,
     no_roots: bool,
 }
 
@@ -212,31 +209,6 @@ impl McpServer {
             cwd: std::env::current_dir().ok(),
             engines: HashMap::new(),
             workspace_roots: WorkspaceRoots::new(),
-            adoption_observer: None,
-            no_roots: false,
-        }
-    }
-
-    /// HTTP-transport server pinned to `project`. A stateless HTTP server cannot
-    /// send the client a `roots/list` request, so `no_roots` disables both the
-    /// roots handshake and `initialize`-param adoption; the project stays
-    /// `--path`-fixed for the session.
-    pub fn http(project: PathBuf) -> Self {
-        let mut server = Self::new(Some(project));
-        server.no_roots = true;
-        server
-    }
-
-    pub fn with_adoption_observer(
-        default_project: Option<PathBuf>,
-        adoption_observer: AdoptionObserver,
-    ) -> Self {
-        Self {
-            default_project,
-            cwd: std::env::current_dir().ok(),
-            engines: HashMap::new(),
-            workspace_roots: WorkspaceRoots::new(),
-            adoption_observer: Some(adoption_observer),
             no_roots: false,
         }
     }
@@ -253,29 +225,13 @@ impl McpServer {
         db_path_for(project).is_file()
     }
 
-    /// Run the stdio loop until EOF. Reads `reader` line-by-line, writes one
-    /// response line per request to `writer`. Notifications (no `id`) produce no
-    /// output (`session.ts:118` gates every reply on `isRequest`).
-    pub fn run<R: BufRead, W: Write>(&mut self, reader: R, mut writer: W) -> anyhow::Result<()> {
-        let mut reader = reader;
-        loop {
-            let mut line = String::new();
-            if reader.read_line(&mut line)? == 0 {
-                break;
-            }
-            if line.trim().is_empty() {
-                continue;
-            }
-            let handled = self.handle_line(&line);
-            for response in handled.responses {
-                let serialized = serde_json::to_string(&response)?;
-                writeln!(writer, "{serialized}")?;
-                writer.flush()?;
-            }
-        }
-        Ok(())
-    }
-
+    /// Run the stdio loop until the broad-root daemon handoff adopts a project
+    /// (or EOF). Reads `reader` line-by-line, writes one response line per
+    /// request to `writer`. Notifications (no `id`) produce no output
+    /// (`session.ts:118` gates every reply on `isRequest`). This is the ONE
+    /// retained hand-rolled path (Decision 11): the broad-root→daemon handoff
+    /// needs the raw reader back mid-session, which rmcp (owning its own read
+    /// loop) cannot provide. All other serve paths go through the rmcp handler.
     pub fn run_until_adoption<R: BufRead, W: Write>(
         &mut self,
         mut reader: R,
@@ -340,14 +296,6 @@ impl McpServer {
         HandledLine { responses, adopted }
     }
 
-    /// Transport-agnostic handler: dispatch `req`, return its response line(s) as
-    /// raw `Value`s (the stdio path already emits raw Values, and a `roots/list`
-    /// server→client request is not a [`JsonRpcResponse`], so this keeps stdio
-    /// byte-identical). Any adoption side-effect is already applied to `self`.
-    pub fn handle_request(&mut self, req: &JsonRpcRequest) -> Vec<Value> {
-        self.dispatch_to_responses(req).0
-    }
-
     fn dispatch_to_responses(&mut self, req: &JsonRpcRequest) -> (Vec<Value>, Option<PathBuf>) {
         let id = req.id.clone();
         match self.dispatch(req) {
@@ -391,7 +339,6 @@ impl McpServer {
                     req.params.as_ref(),
                 ) {
                     self.debug_roots_adopted(&adopted, old_default.as_deref());
-                    self.notify_adopted(&adopted);
                     return Dispatch::ReplyWithAdoption {
                         reply: initialize_result(),
                         adopted,
@@ -456,7 +403,6 @@ impl McpServer {
             response.get("result"),
         ) {
             self.debug_roots_adopted(&adopted, old_default.as_deref());
-            self.notify_adopted(&adopted);
             return Some(adopted);
         }
         None
@@ -471,12 +417,6 @@ impl McpServer {
             "[codegraph debug] roots: adopted {} (was default={was})",
             adopted.display()
         );
-    }
-
-    fn notify_adopted(&mut self, path: &Path) {
-        if let Some(observer) = &mut self.adoption_observer {
-            observer(path);
-        }
     }
 
     /// `handleToolsCall` (`session.ts:204-232`). Validates the tool name; an
@@ -662,7 +602,6 @@ impl McpServer {
             cwd,
             engines: HashMap::new(),
             workspace_roots: WorkspaceRoots::new(),
-            adoption_observer: None,
             no_roots: false,
         }
     }
@@ -720,7 +659,6 @@ mod tests {
     use super::*;
     use std::io::{Cursor, Read};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -750,6 +688,9 @@ mod tests {
         TempProject { path }
     }
 
+    /// Drive one `initialize` frame through the retained `run_until_adoption`
+    /// loop and capture every response line. `initialize` never adopts (adoption
+    /// only fires on a roots/list RESPONSE), so the loop runs to EOF.
     fn run_initialize_capture(server: &mut McpServer, params: Value) -> Vec<Value> {
         let request = json!({
             "jsonrpc": "2.0",
@@ -760,11 +701,14 @@ mod tests {
         let line = format!("{request}\n");
         let mut out = Vec::new();
         server
-            .run(Cursor::new(line.into_bytes()), Cursor::new(&mut out))
+            .run_until_adoption(Cursor::new(line.into_bytes()), Cursor::new(&mut out))
             .unwrap();
         parse_json_lines(&out)
     }
 
+    /// Feed a roots/list RESPONSE line through `run_until_adoption`; an indexed
+    /// root adopts (returns `Adopted`), an all-unindexed set runs to `Eof`.
+    /// Either way a JSON-RPC response produces no reply line.
     fn run_roots_list_response(server: &mut McpServer, roots: Value) {
         let response = json!({
             "jsonrpc": "2.0",
@@ -774,7 +718,7 @@ mod tests {
         let line = format!("{response}\n");
         let mut out = Vec::new();
         server
-            .run(Cursor::new(line.into_bytes()), Cursor::new(&mut out))
+            .run_until_adoption(Cursor::new(line.into_bytes()), Cursor::new(&mut out))
             .unwrap();
         assert!(out.is_empty(), "JSON-RPC responses produce no reply");
     }
@@ -803,79 +747,6 @@ mod tests {
         assert_eq!(responses[1]["method"], json!("roots/list"));
     }
 
-    fn workspace_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .canonicalize()
-            .expect("workspace root")
-    }
-
-    fn real_indexed_project(tag: &str) -> TempProject {
-        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("cg-mcp-http-{tag}-{}-{seq}", std::process::id()));
-        let db = db_path_for(&path);
-        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
-        std::fs::copy(workspace_root().join("reference/golden/mini/colby.db"), &db)
-            .expect("copy golden mini db");
-        TempProject { path }
-    }
-
-    #[test]
-    fn http_mode_initialize_returns_only_result_without_roots_or_adoption() {
-        // GIVEN an http-mode server pinned to an indexed project
-        let project = indexed_project("http-init");
-        let fixed = project.path().to_path_buf();
-        let mut server = McpServer::http(fixed.clone());
-        // WHEN initialize carries BOTH capabilities.roots AND rootUri/workspaceFolders elsewhere
-        let elsewhere = indexed_project("http-init-elsewhere");
-        let responses = run_initialize_capture(
-            &mut server,
-            json!({
-                "capabilities": { "roots": { "listChanged": true } },
-                "rootUri": format!("file://{}", elsewhere.path().display()),
-                "workspaceFolders": [
-                    { "uri": format!("file://{}", elsewhere.path().display()), "name": "other" }
-                ],
-            }),
-        );
-        // THEN only the init result is emitted (no roots/list) and no adoption occurs
-        assert_eq!(responses.len(), 1, "http mode must not emit a roots/list");
-        assert_eq!(responses[0]["id"], json!(1));
-        assert_eq!(
-            responses[0]["result"]["serverInfo"]["name"],
-            json!(SERVER_NAME)
-        );
-        assert_eq!(server.default_project(), Some(fixed.as_path()));
-    }
-
-    #[test]
-    fn http_mode_tools_call_routes_to_fixed_project() {
-        // GIVEN an http-mode server pinned to a real indexed project
-        let project = real_indexed_project("tools-call");
-        let mut server = McpServer::http(project.path().to_path_buf());
-        // WHEN a codegraph_search request is handled with NO projectPath
-        let req: JsonRpcRequest = serde_json::from_value(json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": { "name": "codegraph_search", "arguments": { "query": "add" } },
-        }))
-        .unwrap();
-        let responses = server.handle_request(&req);
-        // THEN it routes to the fixed project's engine and returns a non-error result
-        assert_eq!(responses.len(), 1);
-        assert_eq!(responses[0]["id"], json!(2));
-        let result = &responses[0]["result"];
-        assert!(result.is_object(), "tools/call must return a result object");
-        assert_ne!(
-            result.get("isError"),
-            Some(&json!(true)),
-            "search on the fixed indexed project must not error"
-        );
-    }
-
     #[test]
     fn roots_list_response_adopts_first_indexed_workspace() {
         let project = indexed_project("roots-list");
@@ -895,30 +766,6 @@ mod tests {
         );
 
         assert_eq!(server.default_project(), Some(project.path()));
-    }
-
-    #[test]
-    fn roots_list_response_notifies_adoption_observer() {
-        let project = indexed_project("observer");
-        let observed = Arc::new(Mutex::new(None));
-        let observed_for_callback = Arc::clone(&observed);
-        let mut server = McpServer::with_adoption_observer(
-            None,
-            Box::new(move |path| {
-                *observed_for_callback.lock().unwrap() = Some(path.to_path_buf());
-            }),
-        );
-        let _ = run_initialize_capture(
-            &mut server,
-            json!({ "capabilities": { "roots": { "listChanged": true } } }),
-        );
-
-        run_roots_list_response(
-            &mut server,
-            json!([{ "uri": format!("file://{}", project.path().display()), "name": "proj" }]),
-        );
-
-        assert_eq!(observed.lock().unwrap().as_deref(), Some(project.path()));
     }
 
     #[test]
@@ -962,7 +809,7 @@ mod tests {
         let mut out = Vec::new();
         let mut server = McpServer::new(None);
         server
-            .run(Cursor::new(line.into_bytes()), Cursor::new(&mut out))
+            .run_until_adoption(Cursor::new(line.into_bytes()), Cursor::new(&mut out))
             .unwrap();
         let response: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(response["id"], json!(7));

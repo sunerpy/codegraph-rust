@@ -16,7 +16,6 @@
 //! The engine work still runs on `spawn_blocking` inside the handler; on a
 //! current-thread runtime those closures run on the blocking pool the runtime
 //! spawns, so the single session thread is never starved.
-#![cfg(feature = "rmcp")]
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;

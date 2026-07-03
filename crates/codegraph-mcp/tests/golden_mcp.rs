@@ -118,7 +118,7 @@ fn roundtrip(project: &Path, mut request: Value) -> Value {
     let mut output = Vec::new();
     let mut server = McpServer::new(Some(project.to_path_buf()));
     server
-        .run(Cursor::new(input.into_bytes()), &mut output)
+        .run_until_adoption(Cursor::new(input.into_bytes()), &mut output)
         .expect("server run");
     let text = String::from_utf8(output).expect("utf8 output");
     let line = text.lines().next().expect("one response line");
@@ -315,7 +315,7 @@ fn default_project_indexed_serves_full_tools_list_after_initialize() {
     let mut output = Vec::new();
     let mut server = McpServer::new(Some(project.path().to_path_buf()));
     server
-        .run(Cursor::new(frames.into_bytes()), &mut output)
+        .run_until_adoption(Cursor::new(frames.into_bytes()), &mut output)
         .expect("server run");
     let text = String::from_utf8(output).expect("utf8 output");
     let tools_line = text.lines().nth(1).expect("tools/list response line");
@@ -358,7 +358,7 @@ fn default_project_unindexed_serves_tools_with_required_project_path() {
     let mut output = Vec::new();
     let mut server = McpServer::new(Some(base.clone()));
     server
-        .run(
+        .run_until_adoption(
             Cursor::new(
                 format!(
                     "{}\n",
@@ -414,7 +414,7 @@ fn no_default_project_exposes_tools_with_required_project_path() {
             .unwrap(),
     );
     server
-        .run(Cursor::new(frames.into_bytes()), &mut output)
+        .run_until_adoption(Cursor::new(frames.into_bytes()), &mut output)
         .expect("server run");
     let text = String::from_utf8(output).expect("utf8 output");
     let tools_line = text.lines().nth(1).expect("tools/list response line");
@@ -471,7 +471,7 @@ fn zed_bare_serve_adopts_roots_and_resolves_tool_call() {
     .unwrap();
     let mut init_out = Vec::new();
     server
-        .run(Cursor::new(format!("{init}\n").into_bytes()), &mut init_out)
+        .run_until_adoption(Cursor::new(format!("{init}\n").into_bytes()), &mut init_out)
         .expect("initialize run");
     let init_lines: Vec<Value> = String::from_utf8(init_out)
         .unwrap()
@@ -495,7 +495,7 @@ fn zed_bare_serve_adopts_roots_and_resolves_tool_call() {
     .unwrap();
     let mut roots_out = Vec::new();
     server
-        .run(
+        .run_until_adoption(
             Cursor::new(format!("{roots_response}\n").into_bytes()),
             &mut roots_out,
         )
@@ -516,7 +516,7 @@ fn zed_bare_serve_adopts_roots_and_resolves_tool_call() {
     .unwrap();
     let mut call_out = Vec::new();
     server
-        .run(Cursor::new(format!("{call}\n").into_bytes()), &mut call_out)
+        .run_until_adoption(Cursor::new(format!("{call}\n").into_bytes()), &mut call_out)
         .expect("tools/call run");
     let call_resp: Value =
         serde_json::from_str(String::from_utf8(call_out).unwrap().lines().next().unwrap()).unwrap();

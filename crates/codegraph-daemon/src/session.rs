@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::Result;
-use codegraph_mcp::McpServer;
 use interprocess::local_socket::traits::Stream as _;
 use serde::{Deserialize, Serialize};
 
@@ -62,7 +61,7 @@ pub fn parse_client_hello_line(line: &str) -> Option<u32> {
 /// A session's force-close handle. Dropping the [`SessionGuard`] removes the
 /// session from the registry; the sweep additionally calls
 /// [`SessionRegistry::shutdown_session`] to force the session thread (blocked in
-/// `McpServer::run`) to EOF by half/full-closing its socket.
+/// the rmcp session serve loop) to EOF by half/full-closing its socket.
 #[derive(Clone)]
 struct SessionEntry {
     pid: Option<u32>,
@@ -201,7 +200,7 @@ impl SessionRegistry {
     }
 
     /// Force a dead session's reader to EOF by half-closing the read direction
-    /// of its socket. The session thread, blocked in `McpServer::run`, then sees
+    /// of its socket. The session thread, blocked in the rmcp serve loop, then sees
     /// EOF, returns, and drops its [`SessionGuard`] (which removes the entry +
     /// bumps last-active). No-op when the fd is unknown or on non-unix.
     pub(crate) fn shutdown_session(&self, session_id: u64) {
@@ -338,7 +337,7 @@ pub(crate) fn serve_session(
     let reader = BufReader::new(recv);
     let pid_registry = registry.clone();
     run_session_recv_with(reader, send, project_root, run_mcp, move |pid| {
-        // Record the pid BEFORE McpServer::run blocks, so the sweep can reap a
+        // Record the pid BEFORE the rmcp serve loop blocks, so the sweep can reap a
         // dead peer mid-session. Also clear the hello-phase recv timeout so the
         // session reader blocks indefinitely on JSON-RPC (normal behavior)
         // instead of erroring out after CLIENT_HELLO_TIMEOUT_MS.
@@ -352,36 +351,21 @@ pub(crate) fn serve_session(
 }
 
 /// The session reader/writer bounds. The rmcp path (`serve_session_rmcp`) moves
-/// the halves into a tokio runtime, so it needs `Send + Unpin + 'static`; the
-/// default (rmcp-free) build keeps minimal `BufRead`/`Write` so a caller may
-/// pass a borrowed, non-static writer (e.g. `&mut Vec<u8>` in `session_buffer`).
-/// A blanket impl keeps these as zero-cost aliases over the real traits.
-#[cfg(feature = "rmcp")]
+/// the halves into a tokio runtime, so it needs `Send + Unpin + 'static`. A
+/// blanket impl keeps these as zero-cost aliases over the real traits.
 pub trait SessionReader: BufRead + Send + Unpin + 'static {}
-#[cfg(feature = "rmcp")]
 impl<T: BufRead + Send + Unpin + 'static> SessionReader for T {}
-#[cfg(feature = "rmcp")]
 pub trait SessionWriter: Write + Send + Unpin + 'static {}
-#[cfg(feature = "rmcp")]
 impl<T: Write + Send + Unpin + 'static> SessionWriter for T {}
-
-#[cfg(not(feature = "rmcp"))]
-pub trait SessionReader: BufRead {}
-#[cfg(not(feature = "rmcp"))]
-impl<T: BufRead> SessionReader for T {}
-#[cfg(not(feature = "rmcp"))]
-pub trait SessionWriter: Write {}
-#[cfg(not(feature = "rmcp"))]
-impl<T: Write> SessionWriter for T {}
 
 /// Buffer-safe generic recv seam (the T9 GENERIC SEAM): read the OPTIONAL
 /// client-hello line from `reader`, surface the parsed host pid via
 /// `on_client_pid` BEFORE blocking, then hand the SAME logical stream to
-/// `McpServer::run(reader, writer)`. Also returns the parsed host pid (`Some`)
+/// `serve_session_rmcp(reader, writer, ...)`. Also returns the parsed host pid (`Some`)
 /// when the first line was a [`DaemonClientHello`], else `None`.
 ///
 /// `on_client_pid` is invoked exactly once, immediately after the hello phase
-/// and BEFORE the (blocking) `McpServer::run`, so a long-lived daemon can record
+/// and BEFORE the (blocking) rmcp serve loop, so a long-lived daemon can record
 /// the pid in time for its dead-client sweep. Tests that only care about the
 /// return value pass a no-op.
 ///
@@ -389,7 +373,7 @@ impl<T: Write> SessionWriter for T {}
 /// once. If they parse as a client-hello we consume them and continue with the
 /// remaining `reader`. If they do NOT (a normal client whose first line is its
 /// first JSON-RPC frame, OR a timed-out/partial read), we PREPEND the bytes we
-/// already read back in front of `reader` via `Cursor::chain`, so `McpServer`
+/// already read back in front of `reader` via `Cursor::chain`, so the session
 /// sees the complete, in-order stream and no byte is ever lost.
 pub fn run_session_recv<R: SessionReader, W: SessionWriter>(
     reader: R,
@@ -444,31 +428,16 @@ where
     Ok(None)
 }
 
-/// Serve one session's (hello-consumed) stream to EOF. Under `--features rmcp`
-/// with `CODEGRAPH_DAEMON_RMCP=1` this drives the rmcp [`CodeGraphHandler`]
-/// (Phase D); otherwise it drives the hand-rolled [`McpServer`]. BOTH block
-/// until the reader hits EOF (socket half/full-close), so the session thread
-/// returns and its [`SessionGuard`] drops — the reap contract is identical.
+/// Serve one session's (hello-consumed) stream to EOF through the rmcp
+/// [`CodeGraphHandler`] (the sole MCP transport). Blocks until the reader hits
+/// EOF (socket half/full-close), so the session thread returns and its
+/// [`SessionGuard`] drops — preserving the dead-client reap contract.
 fn serve_stream<R, W>(reader: R, writer: W, project_root: PathBuf) -> Result<()>
 where
     R: SessionReader,
     W: SessionWriter,
 {
-    #[cfg(feature = "rmcp")]
-    if rmcp_session_enabled() {
-        return codegraph_mcp::rmcp_session::serve_session_rmcp(reader, writer, project_root);
-    }
-    let mut server = McpServer::new(Some(project_root));
-    server.run(reader, writer)?;
-    Ok(())
-}
-
-/// Whether the daemon session should route through the rmcp handler. Gated on
-/// the `CODEGRAPH_DAEMON_RMCP=1` env var so Phase D can exercise the rmcp path
-/// in tests without flipping the default; Phase E makes rmcp the sole path.
-#[cfg(feature = "rmcp")]
-fn rmcp_session_enabled() -> bool {
-    std::env::var("CODEGRAPH_DAEMON_RMCP").as_deref() == Ok("1")
+    codegraph_mcp::rmcp_session::serve_session_rmcp(reader, writer, project_root)
 }
 
 /// Read bytes from `reader` up to and including the first `\n`, or until `max`

@@ -216,7 +216,7 @@ fn proxy_local_handshake_and_forwarded_tool_call() {
     // initialize (id 1) -> tools/list (id 2) -> tools/call codegraph_search (id 3).
     let requests = format!(
         "{}\n{}\n{}\n",
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-test","version":"0"}}}),
         json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
         json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
                "params":{"name":"codegraph_search","arguments":{"query":"add"}}}),

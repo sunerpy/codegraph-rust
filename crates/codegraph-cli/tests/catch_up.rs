@@ -189,7 +189,7 @@ fn catch_up_absorbs_offline_edit() {
     let mut serve = ServeProcess::spawn(&project);
 
     // Handshake.
-    serve.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+    serve.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-test","version":"0"}}}"#);
     let init = serve.read_line().expect("initialize response");
     assert!(
         init.contains("serverInfo") || init.contains("protocolVersion") || init.contains("result"),

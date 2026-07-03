@@ -10,7 +10,7 @@
 //!
 //! Requires the `rmcp` feature (the shipped default build is rmcp-free); the
 //! whole file is gated so the default `cargo test -p codegraph-rs` skips it.
-#![cfg(all(unix, feature = "rmcp"))]
+#![cfg(unix)]
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};

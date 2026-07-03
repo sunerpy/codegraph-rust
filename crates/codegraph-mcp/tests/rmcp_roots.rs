@@ -20,7 +20,7 @@
 //!
 //! RED until `CodeGraphHandler` grows the non-pinned adoption path
 //! (`on_initialized` → `peer.list_roots()` → `roots::` adoption rules).
-#![cfg(feature = "rmcp")]
+// rmcp is the sole MCP transport (Phase E); this test exercises it unconditionally.
 
 #[path = "support/parity.rs"]
 mod parity;

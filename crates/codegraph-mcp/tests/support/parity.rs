@@ -1,30 +1,25 @@
-//! L1 behavioral-parity harness (Phase A backbone).
+//! L1 behavioral-parity harness.
 //!
-//! Runs one MCP request through EITHER transport and returns the parsed
-//! response `Value`, then structurally compares the two. This is how "rmcp ==
-//! hand-rolled" is PROVEN across the 15 golden fixtures (L2) rather than
-//! asserted:
-//! - [`run_old`] drives today's [`McpServer`] over an in-memory stdio pipe
-//!   (the existing `golden_mcp.rs::roundtrip`).
-//! - [`run_rmcp_stdio`] drives the NEW `CodeGraphHandler` over a
-//!   `tokio::io::duplex` pair with a real rmcp client — exercising rmcp's REAL
-//!   framing, NOT direct method calls.
-//! - [`assert_parity`] reuses the SAME structural comparison `golden_mcp.rs`
+//! Runs one MCP request through the rmcp transport and returns the parsed
+//! response `Value`, then structurally compares it against the GOLDEN response.
+//! This is how "rmcp reproduces the golden" is PROVEN across the 15 fixtures
+//! (L2) rather than asserted:
+//! - [`run_rmcp_stdio`] drives the `CodeGraphHandler` over a `tokio::io::duplex`
+//!   pair with a real rmcp client — exercising rmcp's REAL framing, NOT direct
+//!   method calls.
+//! - [`assert_parity`] applies the SAME structural comparison the golden suite
 //!   uses (type/isError/sorted-text-lines for tool results; names+order+schema
 //!   for tools/list; capabilities/serverInfo.name/instructions + negotiated
-//!   protocolVersion for initialize).
+//!   protocolVersion for initialize). The BASELINE is the golden JSON itself
+//!   (Phase E deleted the hand-rolled `run_old` server).
 //!
-//! Included via `#[path]` by the feature-gated parity tests; not a standalone
-//! test binary.
-#![cfg(feature = "rmcp")]
+//! Included via `#[path]` by the parity tests; not a standalone test binary.
 #![allow(dead_code)]
 
 use std::fs;
-use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use codegraph_mcp::McpServer;
 use codegraph_mcp::rmcp_handler::CodeGraphHandler;
 use rmcp::ServiceExt;
 use rmcp::model::{
@@ -114,23 +109,6 @@ pub fn rewrite_project(project: &Path, request: &mut Value) {
     {
         obj.insert("projectPath".to_string(), json!(project.to_str().unwrap()));
     }
-}
-
-/// Run one JSON-RPC request frame through today's [`McpServer`] over an
-/// in-memory stdio pipe (the parity BASELINE). Mirrors
-/// `golden_mcp.rs::roundtrip`.
-pub fn run_old(project: &Path, mut request: Value) -> Value {
-    rewrite_project(project, &mut request);
-    let frame = serde_json::to_string(&request).unwrap();
-    let input = format!("{frame}\n");
-    let mut output = Vec::new();
-    let mut server = McpServer::new(Some(project.to_path_buf()));
-    server
-        .run(Cursor::new(input.into_bytes()), &mut output)
-        .expect("server run");
-    let text = String::from_utf8(output).expect("utf8 output");
-    let line = text.lines().next().expect("one response line");
-    serde_json::from_str(line).expect("response json")
 }
 
 /// An rmcp client that requests protocolVersion 2024-11-05 (the golden's

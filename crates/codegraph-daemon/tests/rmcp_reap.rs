@@ -13,10 +13,10 @@
 //! within a bounded timeout — the same contract `read_daemon_hello_times_out`
 //! does NOT cover.
 //!
-//! Gated on `--features rmcp` because it specifically exercises the
-//! rmcp-backed session path (routed when `CODEGRAPH_DAEMON_RMCP=1`).
+//! rmcp is the sole daemon-session transport (Phase E), so this exercises the
+//! shipped path directly.
 
-#![cfg(all(unix, feature = "rmcp"))]
+#![cfg(unix)]
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -68,8 +68,7 @@ fn read_initialize_reply<R: BufRead>(
 
 #[test]
 fn shutdown_reaps_rmcp_backed_session_on_socket_close() {
-    // Route the daemon session through the rmcp serve path.
-    unsafe { std::env::set_var("CODEGRAPH_DAEMON_RMCP", "1") };
+    // The daemon session always routes through the rmcp serve path (Phase E).
     // Keep the daemon from spawning a watcher/catch-up that would touch the
     // empty temp project (run_mcp still true so the session actually serves).
     unsafe { std::env::set_var("CODEGRAPH_NO_WATCH", "1") };
@@ -136,7 +135,6 @@ fn shutdown_reaps_rmcp_backed_session_on_socket_close() {
     );
 
     handle.stop().expect("daemon stops");
-    unsafe { std::env::remove_var("CODEGRAPH_DAEMON_RMCP") };
     unsafe { std::env::remove_var("CODEGRAPH_NO_WATCH") };
     let _ = fs::remove_dir_all(project);
 }

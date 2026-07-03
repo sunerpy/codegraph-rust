@@ -22,7 +22,6 @@
 //! `spawn_blocking` closure surfaces as `JoinError::is_panic()`, which this maps
 //! to an `isError` [`CallToolResult`] — a tool bug returns an error and the
 //! process/runtime stays alive (parity with the sync stdio server).
-#![cfg(feature = "rmcp")]
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -398,9 +397,13 @@ impl ServerHandler for CodeGraphHandler {
 }
 
 /// Serve `CodeGraphHandler` over stdio via rmcp, building a multi-thread tokio
+/// Serve `CodeGraphHandler` over stdio via rmcp, building a multi-thread tokio
 /// runtime (the sync engine work runs on `spawn_blocking` pool threads). Blocks
-/// until the client disconnects (EOF). Phase A wires this behind the `rmcp`
-/// feature; the CLI `--mcp2` integration is Phase D.
+/// until the client disconnects (EOF). This is the CLI `serve --mcp` direct
+/// path (the sole stdio transport): the handler runs in roots-adoption mode
+/// (`no_roots = false`), so `on_initialized` requests the client's roots and
+/// adopts an indexed one when the cwd-derived default is displaceable — parity
+/// with the hand-rolled `McpServer::new` direct serve.
 pub fn serve_stdio_rmcp(project: Option<PathBuf>) -> anyhow::Result<()> {
     use rmcp::ServiceExt;
 
@@ -408,7 +411,8 @@ pub fn serve_stdio_rmcp(project: Option<PathBuf>) -> anyhow::Result<()> {
         .enable_all()
         .build()?;
     runtime.block_on(async move {
-        let handler = CodeGraphHandler::new(project);
+        let cwd = std::env::current_dir().ok();
+        let handler = CodeGraphHandler::serve_with_roots(project, cwd);
         let running = handler
             .serve(rmcp::transport::stdio())
             .await

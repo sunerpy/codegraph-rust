@@ -139,23 +139,35 @@ fn zed_bare_serve_adopts_roots_and_does_not_self_index_cwd() {
     let mut stdout = BufReader::new(child.stdout.take().expect("child stdout"));
     let deadline = Instant::now() + Duration::from_secs(20);
 
-    // WHEN the client advertises capabilities.roots on initialize.
+    // WHEN a spec-valid MCP client initializes advertising capabilities.roots.
+    // rmcp enforces the full handshake (protocolVersion + clientInfo) and only
+    // requests roots after the client sends `notifications/initialized`.
     let init = json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "initialize",
-        "params": { "capabilities": { "roots": { "listChanged": true } } }
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": { "roots": { "listChanged": true } },
+            "clientInfo": { "name": "zed", "version": "1" }
+        }
     });
     writeln!(stdin, "{init}").unwrap();
     stdin.flush().unwrap();
 
-    // THEN two frames come back: the initialize result and a roots/list request.
+    // THEN the initialize result comes back first.
     let first = read_one_json_line(&mut stdout, deadline).expect("initialize result");
     assert_eq!(
         first["id"],
         json!(1),
         "first frame is the initialize result"
     );
+
+    // The client completes the handshake; rmcp then requests roots/list.
+    let initialized = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
+    writeln!(stdin, "{initialized}").unwrap();
+    stdin.flush().unwrap();
+
     let roots_req = read_one_json_line(&mut stdout, deadline).expect("roots/list request");
     assert_eq!(
         roots_req["method"],
@@ -163,7 +175,7 @@ fn zed_bare_serve_adopts_roots_and_does_not_self_index_cwd() {
         "server must proactively request roots/list for an unindexed cwd default"
     );
 
-    // The client replies with the INDEXED workspace root.
+    // The client replies (echoing rmcp's own request id) with the INDEXED root.
     let roots_reply = json!({
         "jsonrpc": "2.0",
         "id": roots_req["id"],
@@ -174,21 +186,36 @@ fn zed_bare_serve_adopts_roots_and_does_not_self_index_cwd() {
     writeln!(stdin, "{roots_reply}").unwrap();
     stdin.flush().unwrap();
 
-    // codegraph_search WITHOUT projectPath must resolve against the adopted root.
-    let call = json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "tools/call",
-        "params": { "name": "codegraph_search", "arguments": { "query": "add" } }
-    });
-    writeln!(stdin, "{call}").unwrap();
-    stdin.flush().unwrap();
-
+    // codegraph_search WITHOUT projectPath must resolve against the adopted
+    // root. rmcp's `on_initialized` adoption runs concurrently with request
+    // handling, so the FIRST tools/call can race ahead of adoption; retry until
+    // it resolves against the adopted root (or the deadline elapses).
+    let mut call_id = 2u64;
     let call_resp = loop {
-        let frame = read_one_json_line(&mut stdout, deadline).expect("tools/call response");
-        if frame["id"] == json!(2) {
+        assert!(Instant::now() < deadline, "tools/call never resolved");
+        let call = json!({
+            "jsonrpc": "2.0",
+            "id": call_id,
+            "method": "tools/call",
+            "params": { "name": "codegraph_search", "arguments": { "query": "add" } }
+        });
+        writeln!(stdin, "{call}").unwrap();
+        stdin.flush().unwrap();
+
+        let frame = loop {
+            let frame = read_one_json_line(&mut stdout, deadline).expect("tools/call response");
+            if frame["id"] == json!(call_id) {
+                break frame;
+            }
+        };
+        let text = frame["result"]["content"][0]["text"].as_str().unwrap_or("");
+        if frame["result"]["isError"] != json!(true)
+            && !text.contains("No indexed project resolved")
+        {
             break frame;
         }
+        call_id += 1;
+        std::thread::sleep(Duration::from_millis(150));
     };
 
     // Close stdin so the server loop sees EOF and exits.

@@ -102,7 +102,7 @@ fn search(server: &mut McpServer, project: &Path, query: &str) -> String {
     let input = format!("{}\n", serde_json::to_string(&req).unwrap());
     let mut output = Vec::new();
     server
-        .run(Cursor::new(input.into_bytes()), &mut output)
+        .run_until_adoption(Cursor::new(input.into_bytes()), &mut output)
         .expect("server run");
     let text = String::from_utf8(output).expect("utf8 output");
     let line = text.lines().next().expect("one response line");
