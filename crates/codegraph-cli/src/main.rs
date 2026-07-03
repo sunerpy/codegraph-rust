@@ -1290,9 +1290,7 @@ fn cmd_serve_http(path: Option<PathBuf>, http_addr: &str) -> Result<()> {
             project.display(),
         );
     }
-    let addr: std::net::SocketAddr = http_addr.parse().with_context(|| {
-        format!("invalid --http-addr {http_addr:?}: expected an <ip>:<port> socket address")
-    })?;
+    let addr = resolve_http_addr(http_addr)?;
     if debug_enabled() {
         eprintln!(
             "[codegraph debug] serve --http: addr={addr} project={} db={} db_exists={}",
@@ -1304,10 +1302,86 @@ fn cmd_serve_http(path: Option<PathBuf>, http_addr: &str) -> Result<()> {
     serve_http_impl(project, addr)
 }
 
+/// Resolve a `--http-addr` string to a bind `SocketAddr`, accepting IP literals
+/// (`127.0.0.1:8111`, `[::1]:8111`) AND hostnames (`localhost:8111`). Uses
+/// `ToSocketAddrs` so `localhost` resolves through the OS resolver; when it
+/// yields both IPv6 and IPv4 loopbacks the first IPv4 is preferred so a plain
+/// `localhost` binds `127.0.0.1` (keeping curl-to-127.0.0.1 predictable),
+/// falling back to the first resolved address otherwise.
+fn resolve_http_addr(http_addr: &str) -> Result<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+    let mut addrs = http_addr.to_socket_addrs().with_context(|| {
+        format!(
+            "invalid --http-addr {http_addr:?}: expected <host>:<port> (e.g. 127.0.0.1:8111 or localhost:8111)"
+        )
+    })?;
+    let first = addrs
+        .next()
+        .ok_or_else(|| anyhow!("--http-addr {http_addr:?} resolved to no socket address"))?;
+    if first.is_ipv4() {
+        return Ok(first);
+    }
+    Ok(addrs.find(std::net::SocketAddr::is_ipv4).unwrap_or(first))
+}
+
 /// Indirection to `codegraph_mcp::serve_http` (streamable-HTTP via rmcp, the
 /// sole HTTP transport).
 fn serve_http_impl(project: PathBuf, addr: std::net::SocketAddr) -> Result<()> {
     codegraph_mcp::serve_http(project, addr).context("serving MCP over streamable-HTTP")
+}
+
+#[cfg(test)]
+mod resolve_http_addr_tests {
+    use super::resolve_http_addr;
+
+    #[test]
+    fn localhost_with_port_resolves_to_loopback() {
+        let addr = resolve_http_addr("localhost:12025").expect("localhost:PORT must resolve");
+        assert_eq!(addr.port(), 12025);
+        assert!(
+            addr.ip().is_loopback(),
+            "localhost must resolve to a loopback address, got {addr}"
+        );
+    }
+
+    #[test]
+    fn ipv4_literal_resolves() {
+        let addr = resolve_http_addr("127.0.0.1:8111").expect("127.0.0.1:PORT must resolve");
+        assert_eq!(addr.port(), 8111);
+        assert!(addr.ip().is_ipv4());
+        assert!(addr.ip().is_loopback());
+    }
+
+    #[test]
+    fn ipv6_bracketed_literal_resolves() {
+        let addr = resolve_http_addr("[::1]:8111").expect("[::1]:PORT must resolve");
+        assert_eq!(addr.port(), 8111);
+        assert!(addr.ip().is_ipv6());
+        assert!(addr.ip().is_loopback());
+    }
+
+    #[test]
+    fn ipv6_unbracketed_literal_resolves() {
+        // `::1:8111` is accepted by std's ToSocketAddrs (parsed as [::1]:8111).
+        let addr = resolve_http_addr("::1:8111").expect("::1:8111 must resolve");
+        assert_eq!(addr.port(), 8111);
+        assert!(addr.ip().is_ipv6());
+    }
+
+    #[test]
+    fn bogus_host_errors_with_actionable_message() {
+        let err = resolve_http_addr("not a host").expect_err("bogus host must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--http-addr") && msg.contains("localhost"),
+            "error must be actionable (mention --http-addr + localhost form): {msg}"
+        );
+    }
+
+    #[test]
+    fn missing_port_errors() {
+        resolve_http_addr("localhost").expect_err("host with no port must error");
+    }
 }
 
 /// Whether `serve --mcp` should start background services (live watcher +

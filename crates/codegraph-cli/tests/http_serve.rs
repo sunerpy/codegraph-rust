@@ -163,6 +163,56 @@ fn serve_http_indexed_starts_and_is_reachable() {
     );
 }
 
+/// (1b) `serve --http --http-addr localhost:PORT` starts and is reachable —
+/// proving a hostname (not just an IP literal) is accepted by the address parse
+/// and binds a loopback the client can reach.
+#[test]
+fn serve_http_localhost_hostname_starts_and_is_reachable() {
+    let home = TestDir::new("localhost");
+    let indexed = indexed_project(&home);
+    let port = free_port();
+    let bind = format!("localhost:{port}");
+    let probe = format!("127.0.0.1:{port}");
+
+    let mut child = Command::new(bin())
+        .args([
+            "serve",
+            "--http",
+            "--path",
+            indexed.to_str().unwrap(),
+            "--http-addr",
+            &bind,
+        ])
+        .env("CODEGRAPH_NO_DAEMON", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn serve --http localhost");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut reachable = false;
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#;
+    while Instant::now() < deadline {
+        if let Ok(resp) = http_post_mcp(&probe, init)
+            && resp.contains("\"result\"")
+            && resp.contains("2024-11-05")
+        {
+            reachable = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        reachable,
+        "serve --http --http-addr {bind} must resolve the hostname, bind a loopback, and answer an initialize POST"
+    );
+}
+
 /// (2) `serve --http` with NO indexed project → a clean, non-zero hard error
 /// (does not hang, exits promptly with an actionable message).
 #[test]
