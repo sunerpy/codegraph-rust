@@ -23,11 +23,11 @@
 use std::fs;
 use std::path::PathBuf;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::super::shared::{
-    read_config_file, read_json_file, remove_nested_key_jsonc, to_upstream_json,
-    upsert_nested_key_jsonc, write_json_file, ConfigRead,
+    ConfigRead, read_config_file, read_json_file, remove_nested_key_jsonc, to_upstream_json,
+    upsert_nested_key_jsonc, write_json_file,
 };
 use super::super::types::{
     AgentTarget, DetectionResult, FileAction, FileWrite, InstallContext, InstallOptions, Location,

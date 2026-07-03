@@ -22,11 +22,11 @@
 use std::fs;
 use std::path::PathBuf;
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use super::super::shared::{
-    mcp_server_config, read_config_file, read_json_file, remove_codegraph_from_mcp_servers,
-    to_upstream_json, upsert_nested_key_jsonc, write_json_file, ConfigRead,
+    ConfigRead, mcp_server_config, read_config_file, read_json_file,
+    remove_codegraph_from_mcp_servers, to_upstream_json, upsert_nested_key_jsonc, write_json_file,
 };
 use super::super::types::{
     AgentTarget, DetectionResult, FileAction, FileWrite, InstallContext, InstallOptions, Location,

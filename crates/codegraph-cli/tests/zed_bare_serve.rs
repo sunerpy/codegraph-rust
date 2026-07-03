@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_codegraph"))

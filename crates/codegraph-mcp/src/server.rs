@@ -13,14 +13,14 @@ use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::engine::CodeGraphEngine;
 use crate::instructions::SERVER_INSTRUCTIONS;
-use crate::protocol::{error_codes, JsonRpcRequest, JsonRpcResponse, ToolResult};
+use crate::protocol::{JsonRpcRequest, JsonRpcResponse, ToolResult, error_codes};
 use crate::roots::{
-    db_path_for, debug_enabled, format_tool_debug_line, roots_list_request, WorkspaceRoots,
-    ROOTS_LIST_REQUEST_ID,
+    ROOTS_LIST_REQUEST_ID, WorkspaceRoots, db_path_for, debug_enabled, format_tool_debug_line,
+    roots_list_request,
 };
 use crate::schemas;
 
@@ -333,7 +333,7 @@ impl McpServer {
                     Value::Null,
                     error_codes::INVALID_REQUEST,
                     "Invalid Request",
-                ))])
+                ))]);
             }
         };
         let (responses, adopted) = self.dispatch_to_responses(&req);
@@ -486,7 +486,7 @@ impl McpServer {
         let tool_name = match params.get("name").and_then(Value::as_str) {
             Some(n) => n.to_string(),
             None => {
-                return Dispatch::Err(error_codes::INVALID_PARAMS, "Missing tool name".to_string())
+                return Dispatch::Err(error_codes::INVALID_PARAMS, "Missing tool name".to_string());
             }
         };
         if !schemas::is_known_tool(&tool_name) {
@@ -539,7 +539,7 @@ impl McpServer {
                         project_path.display()
                     )))
                     .expect("ToolResult serializes"),
-                )
+                );
             }
         };
 
@@ -583,10 +583,10 @@ impl McpServer {
             }
             candidates.push(raw_path.clone());
         }
-        if let Some(default) = &self.default_project {
-            if raw_path.file_name() == default.file_name() {
-                candidates.push(default.clone());
-            }
+        if let Some(default) = &self.default_project
+            && raw_path.file_name() == default.file_name()
+        {
+            candidates.push(default.clone());
         }
 
         candidates

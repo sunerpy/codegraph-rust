@@ -10,12 +10,12 @@
 use std::fs;
 use std::path::PathBuf;
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use super::super::shared::{
-    mcp_server_config, read_config_file, read_json_file, remove_codegraph_from_mcp_servers,
-    to_upstream_json, upsert_nested_key_jsonc, write_json_file, ConfigRead, CODEGRAPH_SECTION_END,
-    CODEGRAPH_SECTION_START,
+    CODEGRAPH_SECTION_END, CODEGRAPH_SECTION_START, ConfigRead, mcp_server_config,
+    read_config_file, read_json_file, remove_codegraph_from_mcp_servers, to_upstream_json,
+    upsert_nested_key_jsonc, write_json_file,
 };
 use super::super::types::{
     AgentTarget, DetectionResult, FileAction, FileWrite, InstallContext, InstallOptions, Location,
@@ -188,27 +188,26 @@ fn remove_rules_entry(ctx: &InstallContext) -> FileWrite {
     if let (Some(start_idx), Some(end_idx)) = (
         content.find(CODEGRAPH_SECTION_START),
         content.find(CODEGRAPH_SECTION_END),
-    ) {
-        if end_idx > start_idx {
-            let before = content[..start_idx].trim_end();
-            let after = content[end_idx + CODEGRAPH_SECTION_END.len()..].trim_start();
-            let sep = if !before.is_empty() && !after.is_empty() {
-                "\n\n"
-            } else {
-                ""
-            };
-            let remainder = format!("{before}{sep}{after}");
-            let remainder = remainder.trim();
-            if remainder.is_empty() || remainder == our_frontmatter {
-                let _ = fs::remove_file(&file);
-            } else {
-                let _ = super::super::shared::atomic_write_file(&file, &format!("{remainder}\n"));
-            }
-            return FileWrite {
-                path: file,
-                action: FileAction::Removed,
-            };
+    ) && end_idx > start_idx
+    {
+        let before = content[..start_idx].trim_end();
+        let after = content[end_idx + CODEGRAPH_SECTION_END.len()..].trim_start();
+        let sep = if !before.is_empty() && !after.is_empty() {
+            "\n\n"
+        } else {
+            ""
+        };
+        let remainder = format!("{before}{sep}{after}");
+        let remainder = remainder.trim();
+        if remainder.is_empty() || remainder == our_frontmatter {
+            let _ = fs::remove_file(&file);
+        } else {
+            let _ = super::super::shared::atomic_write_file(&file, &format!("{remainder}\n"));
         }
+        return FileWrite {
+            path: file,
+            action: FileAction::Removed,
+        };
     }
 
     if content.trim() == our_frontmatter {

@@ -7,9 +7,9 @@
 //! per-resolver LRU caches the upstream uses (`index.ts:217-250`). Resolution is sync.
 
 use crate::lru_cache::LruCache;
-use crate::path_aliases::{load_project_aliases, AliasMap};
+use crate::path_aliases::{AliasMap, load_project_aliases};
 use crate::types::{GoModule, ImportMapping, ReExport, ResolutionContext};
-use crate::workspace_packages::{load_workspace_packages, WorkspacePackages};
+use crate::workspace_packages::{WorkspacePackages, load_workspace_packages};
 use crate::{import_resolver, pathutil};
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use codegraph_store::Store;

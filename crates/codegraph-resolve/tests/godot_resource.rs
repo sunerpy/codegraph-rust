@@ -234,26 +234,36 @@ effect = ExtResource(\"2\")
 #[test]
 fn extract_routes_tres_to_t5_and_others_correctly() {
     // A .tres dispatches to T5 (Some).
-    assert!(GodotResolver
-        .extract("data/item.tres", "[gd_resource format=3]\n", "")
-        .is_some());
+    assert!(
+        GodotResolver
+            .extract("data/item.tres", "[gd_resource format=3]\n", "")
+            .is_some()
+    );
     // A nested path whose extension is .tres still dispatches.
-    assert!(GodotResolver
-        .extract("a/b/c/Deep.tres", "[gd_resource format=3]\n", "")
-        .is_some());
+    assert!(
+        GodotResolver
+            .extract("a/b/c/Deep.tres", "[gd_resource format=3]\n", "")
+            .is_some()
+    );
 
     // A .gd file now routes to T6's GDScript dynamic parser (Some).
-    assert!(GodotResolver
-        .extract("player.gd", "extends Node\n", "")
-        .is_some());
+    assert!(
+        GodotResolver
+            .extract("player.gd", "extends Node\n", "")
+            .is_some()
+    );
     // A .tscn routes to T4 (Some, via the scene parser, not this one).
-    assert!(GodotResolver
-        .extract("scenes/Main.tscn", "[gd_scene format=3]\n", "")
-        .is_some());
+    assert!(
+        GodotResolver
+            .extract("scenes/Main.tscn", "[gd_scene format=3]\n", "")
+            .is_some()
+    );
     // project.godot routes to T3 (Some, via the project parser).
-    assert!(GodotResolver
-        .extract("project.godot", "[autoload]\nX=\"res://x.gd\"\n", "")
-        .is_some());
+    assert!(
+        GodotResolver
+            .extract("project.godot", "[autoload]\nX=\"res://x.gd\"\n", "")
+            .is_some()
+    );
 }
 
 #[test]

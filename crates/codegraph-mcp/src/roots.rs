@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub const ROOTS_LIST_REQUEST_ID: &str = "codegraph-roots-list-1";
 
@@ -234,8 +234,8 @@ fn percent_decode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -445,24 +445,24 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let prev = std::env::var("CODEGRAPH_DEBUG").ok();
 
-        std::env::remove_var("CODEGRAPH_DEBUG");
+        unsafe { std::env::remove_var("CODEGRAPH_DEBUG") };
         assert!(!debug_enabled(), "unset ⇒ off");
 
-        std::env::set_var("CODEGRAPH_DEBUG", "1");
+        unsafe { std::env::set_var("CODEGRAPH_DEBUG", "1") };
         assert!(debug_enabled(), "\"1\" ⇒ on");
 
-        std::env::set_var("CODEGRAPH_DEBUG", "true");
+        unsafe { std::env::set_var("CODEGRAPH_DEBUG", "true") };
         assert!(debug_enabled(), "\"true\" ⇒ on");
 
-        std::env::set_var("CODEGRAPH_DEBUG", "0");
+        unsafe { std::env::set_var("CODEGRAPH_DEBUG", "0") };
         assert!(!debug_enabled(), "\"0\" ⇒ off");
 
-        std::env::set_var("CODEGRAPH_DEBUG", "yes");
+        unsafe { std::env::set_var("CODEGRAPH_DEBUG", "yes") };
         assert!(!debug_enabled(), "any other value ⇒ off");
 
         match prev {
-            Some(v) => std::env::set_var("CODEGRAPH_DEBUG", v),
-            None => std::env::remove_var("CODEGRAPH_DEBUG"),
+            Some(v) => unsafe { std::env::set_var("CODEGRAPH_DEBUG", v) },
+            None => unsafe { std::env::remove_var("CODEGRAPH_DEBUG") },
         }
     }
 

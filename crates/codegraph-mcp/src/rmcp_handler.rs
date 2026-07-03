@@ -35,12 +35,12 @@ use rmcp::model::{
     ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleServer};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::engine::CodeGraphEngine;
 use crate::instructions::SERVER_INSTRUCTIONS;
 use crate::protocol::ToolResult;
-use crate::roots::{db_path_for, debug_enabled, WorkspaceRoots};
+use crate::roots::{WorkspaceRoots, db_path_for, debug_enabled};
 use crate::schemas;
 
 const SERVER_NAME: &str = "codegraph";
@@ -150,10 +150,10 @@ impl CodeGraphHandler {
             }
             candidates.push(raw_path.clone());
         }
-        if let Some(default) = &default_project {
-            if raw_path.file_name() == default.file_name() {
-                candidates.push(default.clone());
-            }
+        if let Some(default) = &default_project
+            && raw_path.file_name() == default.file_name()
+        {
+            candidates.push(default.clone());
         }
         candidates
             .into_iter()
@@ -177,16 +177,16 @@ impl CodeGraphHandler {
             self.cwd.as_deref(),
             Some(roots_result),
         );
-        if let Some(adopted) = &adopted {
-            if debug_enabled() {
-                let was = old_default
-                    .as_deref()
-                    .map_or_else(|| "none".to_string(), |p| p.display().to_string());
-                eprintln!(
-                    "[codegraph debug] roots: adopted {} (was default={was})",
-                    adopted.display()
-                );
-            }
+        if let Some(adopted) = &adopted
+            && debug_enabled()
+        {
+            let was = old_default
+                .as_deref()
+                .map_or_else(|| "none".to_string(), |p| p.display().to_string());
+            eprintln!(
+                "[codegraph debug] roots: adopted {} (was default={was})",
+                adopted.display()
+            );
         }
         adopted
     }

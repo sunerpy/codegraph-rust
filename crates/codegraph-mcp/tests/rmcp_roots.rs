@@ -29,6 +29,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use codegraph_mcp::rmcp_handler::CodeGraphHandler;
+use rmcp::ServiceExt;
 use rmcp::handler::client::ClientHandler;
 #[allow(deprecated)]
 // ListRootsResult/Root: SEP-2577 roots wire types (rmcp 2.1, no replacement).
@@ -37,10 +38,9 @@ use rmcp::model::{
     ProtocolVersion, Root,
 };
 use rmcp::service::{RequestContext, RoleClient};
-use rmcp::ServiceExt;
 use serde_json::json;
 
-use parity::{setup_mini_project, TestProject};
+use parity::{TestProject, setup_mini_project};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 

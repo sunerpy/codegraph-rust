@@ -5,7 +5,7 @@
 //! in codegraph-cli (Task 23); this example exists only to prove a live stdio
 //! round-trip for Task 22 evidence.
 
-use std::io::{stdin, stdout, BufReader};
+use std::io::{BufReader, stdin, stdout};
 use std::path::PathBuf;
 
 use codegraph_mcp::McpServer;

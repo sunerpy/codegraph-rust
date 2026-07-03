@@ -14,12 +14,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use super::super::shared::{
-    self, parse_json_object, read_config_file, remove_nested_key_jsonc, to_upstream_json,
-    upsert_instructions_entry, upsert_nested_key_jsonc, write_json_file, ConfigRead,
-    CODEGRAPH_SECTION_END, CODEGRAPH_SECTION_START,
+    self, CODEGRAPH_SECTION_END, CODEGRAPH_SECTION_START, ConfigRead, parse_json_object,
+    read_config_file, remove_nested_key_jsonc, to_upstream_json, upsert_instructions_entry,
+    upsert_nested_key_jsonc, write_json_file,
 };
 use super::super::types::{
     AgentTarget, DetectionResult, FileAction, FileWrite, InstallContext, InstallOptions, Location,

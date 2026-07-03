@@ -11,7 +11,7 @@
 mod parity;
 
 use parity::{
-    assert_parity, load_golden, run_old, run_rmcp_stdio, setup_mini_project, GOLDEN_FIXTURES,
+    GOLDEN_FIXTURES, assert_parity, load_golden, run_old, run_rmcp_stdio, setup_mini_project,
 };
 
 #[test]

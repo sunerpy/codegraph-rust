@@ -1002,10 +1002,10 @@ pub fn scan_dynamic_dispatch(
         if out.len() >= MAX_MATCHES_PER_BODY {
             break;
         }
-        if let Some(langs) = spec.langs {
-            if !in_set(langs, language) {
-                continue;
-            }
+        if let Some(langs) = spec.langs
+            && !in_set(langs, language)
+        {
+            continue;
         }
         for m in spec.re.find_iter(&stripped_str) {
             let m_index = m.start();

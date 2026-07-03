@@ -20,7 +20,7 @@ use codegraph_extract::{detect_language, extract_file};
 use codegraph_mcp::McpServer;
 use codegraph_resolve::ReferenceResolver;
 use codegraph_store::Store;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 

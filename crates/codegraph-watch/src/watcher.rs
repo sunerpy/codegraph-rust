@@ -11,8 +11,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
-use crate::policy::{watch_disabled_reason, WatchPolicy};
-use crate::sync::{default_db_path, sync_changed_paths, SyncOutcome};
+use crate::policy::{WatchPolicy, watch_disabled_reason};
+use crate::sync::{SyncOutcome, default_db_path, sync_changed_paths};
 
 type SyncCallback = Arc<dyn Fn(SyncOutcome) + Send + Sync>;
 type SyncFn = Arc<dyn Fn(Vec<String>) -> Result<SyncOutcome> + Send + Sync>;

@@ -98,19 +98,15 @@ impl LanguageSpec for GdscriptSpec {
             return None;
         }
         let mut cursor = node.walk();
-        let ctor = node
-            .children(&mut cursor)
+        node.children(&mut cursor)
             .find(|child| child.kind() == "_init")
-            .map(|tok| node_text(tok, source));
-        ctor
+            .map(|tok| node_text(tok, source))
     }
 
     fn is_static(&self, node: Node<'_>, _source: &str) -> bool {
         let mut cursor = node.walk();
-        let has_static = node
-            .children(&mut cursor)
-            .any(|child| child.kind() == "static_keyword");
-        has_static
+        node.children(&mut cursor)
+            .any(|child| child.kind() == "static_keyword")
     }
 
     fn get_signature(&self, node: Node<'_>, source: &str) -> Option<String> {

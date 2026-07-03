@@ -6,8 +6,8 @@
 use std::fs;
 use std::path::Path;
 
-use jsonc_parser::cst::{CstInputValue, CstRootNode};
 use jsonc_parser::ParseOptions;
+use jsonc_parser::cst::{CstInputValue, CstRootNode};
 use serde_json::{Map, Value};
 
 use super::types::{FileAction, FileWrite};
@@ -209,10 +209,10 @@ pub fn read_json_file(path: &Path) -> Map<String, Value> {
 /// Write a file atomically: write to `<path>.tmp.<pid>`, then rename.
 /// Ports `atomicWriteFileSync` (shared.ts:80).
 pub fn atomic_write_file(path: &Path, content: &str) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        if !dir.as_os_str().is_empty() {
-            fs::create_dir_all(dir)?;
-        }
+    if let Some(dir) = path.parent()
+        && !dir.as_os_str().is_empty()
+    {
+        fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     match fs::write(&tmp, content).and_then(|()| fs::rename(&tmp, path)) {
@@ -292,10 +292,10 @@ pub fn upsert_nested_key_jsonc(
             parent.append(leaf_key, to_cst_input(value));
         }
     }
-    if let Some(schema) = schema_url {
-        if root_obj.get("$schema").is_none() {
-            root_obj.insert(0, "$schema", CstInputValue::String(schema.to_string()));
-        }
+    if let Some(schema) = schema_url
+        && root_obj.get("$schema").is_none()
+    {
+        root_obj.insert(0, "$schema", CstInputValue::String(schema.to_string()));
     }
 
     let mut out = root.to_string();
@@ -333,10 +333,10 @@ pub fn remove_nested_key_jsonc(
         if let Some(prop) = parent.get(leaf_key) {
             prop.remove();
         }
-        if parent.properties().is_empty() {
-            if let Some(parent_prop) = root.object_value().and_then(|o| o.get(parent_key)) {
-                parent_prop.remove();
-            }
+        if parent.properties().is_empty()
+            && let Some(parent_prop) = root.object_value().and_then(|o| o.get(parent_key))
+        {
+            parent_prop.remove();
         }
     }
     let mut out = root.to_string();
@@ -361,18 +361,17 @@ pub fn replace_or_append_marked_section(
     };
 
     if let (Some(start_idx), Some(end_idx)) = (content.find(start_marker), content.find(end_marker))
+        && end_idx > start_idx
     {
-        if end_idx > start_idx {
-            let block_end = end_idx + end_marker.len();
-            let existing_block = &content[start_idx..block_end];
-            if existing_block == body {
-                return FileAction::Unchanged;
-            }
-            let before = &content[..start_idx];
-            let after = &content[block_end..];
-            let _ = atomic_write_file(path, &format!("{before}{body}{after}"));
-            return FileAction::Updated;
+        let block_end = end_idx + end_marker.len();
+        let existing_block = &content[start_idx..block_end];
+        if existing_block == body {
+            return FileAction::Unchanged;
         }
+        let before = &content[..start_idx];
+        let after = &content[block_end..];
+        let _ = atomic_write_file(path, &format!("{before}{body}{after}"));
+        return FileAction::Updated;
     }
 
     let trimmed = content.trim_end();

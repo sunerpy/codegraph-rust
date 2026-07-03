@@ -5,8 +5,8 @@
 //! 2. Re-serialization dropped comments and re-sorted keys.
 
 use assert_cmd::Command;
-use assert_fs::prelude::*;
 use assert_fs::TempDir;
+use assert_fs::prelude::*;
 use rstest::rstest;
 
 fn run_install(home: &TempDir, project: &std::path::Path, target: &str) {

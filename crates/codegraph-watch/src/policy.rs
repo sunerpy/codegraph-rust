@@ -249,10 +249,10 @@ fn classify_too_broad_root(project_root: &Path) -> Option<TooBroadRoot> {
         return Some(TooBroadRoot::FilesystemRoot(resolved));
     }
 
-    if let Some(home) = home_dir() {
-        if resolved == canonicalize_lenient(&home) {
-            return Some(TooBroadRoot::HomeDirectory(resolved));
-        }
+    if let Some(home) = home_dir()
+        && resolved == canonicalize_lenient(&home)
+    {
+        return Some(TooBroadRoot::HomeDirectory(resolved));
     }
 
     None
@@ -399,8 +399,8 @@ mod tests {
 
     fn restore(key: &str, value: Option<std::ffi::OsString>) {
         match value {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
         }
     }
 
@@ -409,12 +409,10 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let _guard = EnvGuard::capture();
         let home = crate::sync::tests::TestDir::new("watch-policy-home");
-        std::env::set_var(
-            if cfg!(windows) { "USERPROFILE" } else { "HOME" },
-            home.path(),
-        );
-        std::env::remove_var("CODEGRAPH_FORCE_WATCH");
-        std::env::remove_var(CODEGRAPH_NO_WATCH);
+        let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        unsafe { std::env::set_var(home_key, home.path()) };
+        unsafe { std::env::remove_var("CODEGRAPH_FORCE_WATCH") };
+        unsafe { std::env::remove_var(CODEGRAPH_NO_WATCH) };
 
         let reason = watch_disabled_reason(home.path(), false);
         assert!(reason.is_some(), "watching HOME must be disabled");
@@ -426,12 +424,10 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let _guard = EnvGuard::capture();
         let home = crate::sync::tests::TestDir::new("watch-policy-home-force");
-        std::env::set_var(
-            if cfg!(windows) { "USERPROFILE" } else { "HOME" },
-            home.path(),
-        );
-        std::env::set_var("CODEGRAPH_FORCE_WATCH", "1");
-        std::env::remove_var(CODEGRAPH_NO_WATCH);
+        let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        unsafe { std::env::set_var(home_key, home.path()) };
+        unsafe { std::env::set_var("CODEGRAPH_FORCE_WATCH", "1") };
+        unsafe { std::env::remove_var(CODEGRAPH_NO_WATCH) };
 
         assert!(
             watch_disabled_reason(home.path(), false).is_some(),
@@ -443,8 +439,8 @@ mod tests {
     fn watch_disabled_when_root_is_filesystem_root() {
         let _lock = ENV_LOCK.lock().unwrap();
         let _guard = EnvGuard::capture();
-        std::env::remove_var("CODEGRAPH_FORCE_WATCH");
-        std::env::remove_var(CODEGRAPH_NO_WATCH);
+        unsafe { std::env::remove_var("CODEGRAPH_FORCE_WATCH") };
+        unsafe { std::env::remove_var(CODEGRAPH_NO_WATCH) };
 
         let reason = watch_disabled_reason(Path::new("/"), false);
         assert!(reason.is_some(), "watching `/` must be disabled");
@@ -456,12 +452,10 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let _guard = EnvGuard::capture();
         let home = crate::sync::tests::TestDir::new("watch-policy-subdir-home");
-        std::env::set_var(
-            if cfg!(windows) { "USERPROFILE" } else { "HOME" },
-            home.path(),
-        );
-        std::env::remove_var("CODEGRAPH_FORCE_WATCH");
-        std::env::remove_var(CODEGRAPH_NO_WATCH);
+        let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        unsafe { std::env::set_var(home_key, home.path()) };
+        unsafe { std::env::remove_var("CODEGRAPH_FORCE_WATCH") };
+        unsafe { std::env::remove_var(CODEGRAPH_NO_WATCH) };
 
         let project = home.path().join("workspace/proj");
         fs::create_dir_all(&project).unwrap();
@@ -517,10 +511,8 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let _guard = EnvGuard::capture();
         let home = crate::sync::tests::TestDir::new("too-broad-home");
-        std::env::set_var(
-            if cfg!(windows) { "USERPROFILE" } else { "HOME" },
-            home.path(),
-        );
+        let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        unsafe { std::env::set_var(home_key, home.path()) };
 
         assert!(
             too_broad_root_reason(home.path()).is_some(),
@@ -544,10 +536,8 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let _guard = EnvGuard::capture();
         let home = crate::sync::tests::TestDir::new("too-broad-home-dot");
-        std::env::set_var(
-            if cfg!(windows) { "USERPROFILE" } else { "HOME" },
-            home.path(),
-        );
+        let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        unsafe { std::env::set_var(home_key, home.path()) };
 
         let with_dot = home.path().join(".");
         assert!(
@@ -561,12 +551,10 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let _guard = EnvGuard::capture();
         let home = crate::sync::tests::TestDir::new("watch-policy-home-dot");
-        std::env::set_var(
-            if cfg!(windows) { "USERPROFILE" } else { "HOME" },
-            home.path(),
-        );
-        std::env::remove_var("CODEGRAPH_FORCE_WATCH");
-        std::env::remove_var(CODEGRAPH_NO_WATCH);
+        let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        unsafe { std::env::set_var(home_key, home.path()) };
+        unsafe { std::env::remove_var("CODEGRAPH_FORCE_WATCH") };
+        unsafe { std::env::remove_var(CODEGRAPH_NO_WATCH) };
 
         let with_dot = home.path().join(".");
         assert!(

@@ -8,9 +8,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use super::super::shared::{
-    self, atomic_write_file, build_toml_table, mcp_server_config, remove_toml_table,
-    upsert_instructions_entry, upsert_toml_table, TomlUpsert, TomlValue, CODEGRAPH_SECTION_END,
-    CODEGRAPH_SECTION_START,
+    self, CODEGRAPH_SECTION_END, CODEGRAPH_SECTION_START, TomlUpsert, TomlValue, atomic_write_file,
+    build_toml_table, mcp_server_config, remove_toml_table, upsert_instructions_entry,
+    upsert_toml_table,
 };
 use super::super::types::{
     AgentTarget, DetectionResult, FileAction, FileWrite, InstallContext, InstallOptions, Location,

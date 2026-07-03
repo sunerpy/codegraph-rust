@@ -17,7 +17,7 @@ mod vscode_user;
 
 use std::path::PathBuf;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 use registry::{get_target, list_target_ids, resolve_target_flag};
 use types::{
@@ -592,7 +592,7 @@ mod tests {
         let (ctx, base) = temp_ctx("init-kiro");
         let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
         let prev_home = std::env::var_os(home_key);
-        std::env::set_var(home_key, &ctx.home);
+        unsafe { std::env::set_var(home_key, &ctx.home) };
 
         // When init --target=kiro installs project-local config (run twice = idempotent)
         run_install_local_targets(ctx.cwd.clone(), "kiro").unwrap();
@@ -615,8 +615,8 @@ mod tests {
         );
 
         match prev_home {
-            Some(v) => std::env::set_var(home_key, v),
-            None => std::env::remove_var(home_key),
+            Some(v) => unsafe { std::env::set_var(home_key, v) },
+            None => unsafe { std::env::remove_var(home_key) },
         }
         let _ = fs::remove_dir_all(base);
     }
@@ -628,7 +628,7 @@ mod tests {
         let (ctx, base) = temp_ctx("init-none");
         let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
         let prev_home = std::env::var_os(home_key);
-        std::env::set_var(home_key, &ctx.home);
+        unsafe { std::env::set_var(home_key, &ctx.home) };
 
         // When init runs with the default target (none)
         run_install_local_targets(ctx.cwd.clone(), "none").unwrap();
@@ -640,8 +640,8 @@ mod tests {
         );
 
         match prev_home {
-            Some(v) => std::env::set_var(home_key, v),
-            None => std::env::remove_var(home_key),
+            Some(v) => unsafe { std::env::set_var(home_key, v) },
+            None => unsafe { std::env::remove_var(home_key) },
         }
         let _ = fs::remove_dir_all(base);
     }

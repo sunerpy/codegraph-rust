@@ -13,7 +13,7 @@ use crate::name_matcher::{
     crosses_known_family, match_dotted_call_chain, match_function_ref, match_reference,
     match_scoped_call_chain, same_language_family,
 };
-use crate::snapshot_context::{build_edge_adjacency, SnapshotResolutionContext};
+use crate::snapshot_context::{SnapshotResolutionContext, build_edge_adjacency};
 use crate::types::{
     RefView, ResolutionContext, ResolutionResult, ResolutionStats, ResolvedBy, ResolvedRef,
 };

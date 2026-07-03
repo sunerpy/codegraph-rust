@@ -24,14 +24,14 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use codegraph_mcp::rmcp_handler::CodeGraphHandler;
 use codegraph_mcp::McpServer;
+use codegraph_mcp::rmcp_handler::CodeGraphHandler;
+use rmcp::ServiceExt;
 use rmcp::model::{
     CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation, PaginatedRequestParams,
     ProtocolVersion,
 };
-use rmcp::ServiceExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -109,12 +109,10 @@ pub fn rewrite_project(project: &Path, request: &mut Value) {
     if let Some(args) = request
         .get_mut("params")
         .and_then(|p| p.get_mut("arguments"))
+        && let Some(obj) = args.as_object_mut()
+        && obj.contains_key("projectPath")
     {
-        if let Some(obj) = args.as_object_mut() {
-            if obj.contains_key("projectPath") {
-                obj.insert("projectPath".to_string(), json!(project.to_str().unwrap()));
-            }
-        }
+        obj.insert("projectPath".to_string(), json!(project.to_str().unwrap()));
     }
 }
 
@@ -243,12 +241,12 @@ fn error_code_message(err: &rmcp::ServiceError) -> (i64, String) {
 // === Structural parity assertions (reused from golden_mcp.rs) ================
 
 fn normalize_header_line(line: String) -> String {
-    if let Some((head, syms)) = line.split_once(" — ") {
-        if head.starts_with("#### ") {
-            let mut parts: Vec<&str> = syms.split(", ").collect();
-            parts.sort_unstable();
-            return format!("{head} — {}", parts.join(", "));
-        }
+    if let Some((head, syms)) = line.split_once(" — ")
+        && head.starts_with("#### ")
+    {
+        let mut parts: Vec<&str> = syms.split(", ").collect();
+        parts.sort_unstable();
+        return format!("{head} — {}", parts.join(", "));
     }
     line
 }

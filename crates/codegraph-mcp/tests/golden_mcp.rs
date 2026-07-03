@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use codegraph_mcp::McpServer;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -108,12 +108,10 @@ fn roundtrip(project: &Path, mut request: Value) -> Value {
     if let Some(args) = request
         .get_mut("params")
         .and_then(|p| p.get_mut("arguments"))
+        && let Some(obj) = args.as_object_mut()
+        && obj.contains_key("projectPath")
     {
-        if let Some(obj) = args.as_object_mut() {
-            if obj.contains_key("projectPath") {
-                obj.insert("projectPath".to_string(), json!(project.to_str().unwrap()));
-            }
-        }
+        obj.insert("projectPath".to_string(), json!(project.to_str().unwrap()));
     }
     let frame = serde_json::to_string(&request).unwrap();
     let input = format!("{frame}\n");
@@ -172,12 +170,12 @@ fn assert_tool_result_structural(golden: &Value, actual: &Value, ctx: &str) {
 /// For an explore `#### <file> — sym1, sym2, …` header, sort the symbol list so
 /// the header's internal symbol ordering is a documented text-formatting diff.
 fn normalize_header_line(line: String) -> String {
-    if let Some((head, syms)) = line.split_once(" — ") {
-        if head.starts_with("#### ") {
-            let mut parts: Vec<&str> = syms.split(", ").collect();
-            parts.sort_unstable();
-            return format!("{head} — {}", parts.join(", "));
-        }
+    if let Some((head, syms)) = line.split_once(" — ")
+        && head.starts_with("#### ")
+    {
+        let mut parts: Vec<&str> = syms.split(", ").collect();
+        parts.sort_unstable();
+        return format!("{head} — {}", parts.join(", "));
     }
     line
 }

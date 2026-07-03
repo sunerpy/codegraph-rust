@@ -520,7 +520,7 @@ mod hello_timeout_tests {
 
     use interprocess::local_socket::traits::Listener as _;
 
-    use crate::transport::{bind, connect, Rendezvous};
+    use crate::transport::{Rendezvous, bind, connect};
 
     #[test]
     fn read_daemon_hello_times_out_on_silent_socket() {

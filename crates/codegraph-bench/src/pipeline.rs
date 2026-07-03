@@ -20,13 +20,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
-use codegraph_extract::{extract_project, ExtractOptions};
+use anyhow::{Context, Result, bail};
+use codegraph_extract::{ExtractOptions, extract_project};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use crate::corpus::{corpus_benchmark_path, Corpus, CORPORA};
-use crate::metrics::{db_file_size_bytes, stats, LatencyStats};
+use crate::corpus::{CORPORA, Corpus, corpus_benchmark_path};
+use crate::metrics::{LatencyStats, db_file_size_bytes, stats};
 use crate::runner::cold_mode_supported;
 
 /// Implementations compared by the pipeline.

@@ -4,10 +4,10 @@ pub mod scoring;
 use std::collections::HashSet;
 
 use codegraph_core::types::{Language, Node, NodeKind};
-use codegraph_store::queries::SearchResult;
 use codegraph_store::Store;
+use codegraph_store::queries::SearchResult;
 
-pub use parser::{bounded_edit_distance, parse_query, ParsedQuery};
+pub use parser::{ParsedQuery, bounded_edit_distance, parse_query};
 
 #[derive(Debug, Clone, Default)]
 pub struct SearchOptions {

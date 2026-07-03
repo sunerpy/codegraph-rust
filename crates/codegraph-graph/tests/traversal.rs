@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use codegraph_core::types::{Edge, EdgeKind, Language, Node, NodeKind};
-use codegraph_graph::graph::{find_all_definitions, Direction, GraphTraverser, TraversalOptions};
+use codegraph_graph::graph::{Direction, GraphTraverser, TraversalOptions, find_all_definitions};
 use codegraph_store::Store;
 
 fn temp_db_path(test_name: &str) -> std::path::PathBuf {

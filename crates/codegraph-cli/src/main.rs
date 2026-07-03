@@ -13,26 +13,26 @@ use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
-use clap_complete::{generate, Shell};
+use clap_complete::{Shell, generate};
 use codegraph_core::config::init_config;
-use codegraph_core::logger::{init_logger, LoggerConfig};
+use codegraph_core::logger::{LoggerConfig, init_logger};
 use codegraph_core::node_id::hash_content;
 use codegraph_core::types::{ExtractionResult, FileRecord, Language, Node, NodeKind};
-use codegraph_extract::{detect_language, extract_source, ExtractOptions};
+use codegraph_extract::{ExtractOptions, detect_language, extract_source};
 use codegraph_graph::graph::{GodotReach, GraphTraverser};
-use codegraph_graph::query::{search_nodes, SearchOptions};
+use codegraph_graph::query::{SearchOptions, search_nodes};
 use codegraph_mcp::{McpServer, RunUntilAdoption};
 use codegraph_resolve::ReferenceResolver;
-use codegraph_store::queries::SearchResult;
 use codegraph_store::Store;
+use codegraph_store::queries::SearchResult;
 use indicatif::{ParallelProgressIterator, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
 use serde::Serialize;
 use serde_json::json;
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 mod installer;
 
@@ -671,9 +671,13 @@ fn powershell_profile_path() -> Result<PathBuf> {
     if let Some(p) = env_path("CODEGRAPH_PS_PROFILE") {
         return Ok(p);
     }
-    let user = env_path("USERPROFILE").or_else(|| env_path("HOME")).ok_or_else(|| {
-        anyhow!("cannot resolve PowerShell profile (set CODEGRAPH_PS_PROFILE, USERPROFILE, or HOME)")
-    })?;
+    let user = env_path("USERPROFILE")
+        .or_else(|| env_path("HOME"))
+        .ok_or_else(|| {
+            anyhow!(
+                "cannot resolve PowerShell profile (set CODEGRAPH_PS_PROFILE, USERPROFILE, or HOME)"
+            )
+        })?;
     Ok(user.join("Documents/WindowsPowerShell/Microsoft.PowerShell_profile.ps1"))
 }
 
@@ -716,10 +720,14 @@ fn install_completions(shell: Shell) -> Result<()> {
                 );
             }
             println!("Restart your shell (or run `. $PROFILE`) to load completions.");
-            println!("Press Ctrl+Space to trigger menu completion (Set-PSReadLineKeyHandler -Key Tab -Function MenuComplete).");
+            println!(
+                "Press Ctrl+Space to trigger menu completion (Set-PSReadLineKeyHandler -Key Tab -Function MenuComplete)."
+            );
         }
         Shell::Zsh => {
-            println!("Add `fpath+=~/.zfunc` before `compinit` in your ~/.zshrc if it is not already there.");
+            println!(
+                "Add `fpath+=~/.zfunc` before `compinit` in your ~/.zshrc if it is not already there."
+            );
             println!("Restart your shell to load completions.");
         }
         Shell::Elvish => {
@@ -1092,13 +1100,13 @@ fn cmd_query(
         },
         &project_name_tokens(&project),
     )?;
-    if results.iter().all(|r| r.node.name != search) {
-        if let Some(resolved) = resolve_gdscript_class_member(&store, &search)? {
-            results = resolved
-                .into_iter()
-                .map(|node| SearchResult { node, score: 1.0 })
-                .collect();
-        }
+    if results.iter().all(|r| r.node.name != search)
+        && let Some(resolved) = resolve_gdscript_class_member(&store, &search)?
+    {
+        results = resolved
+            .into_iter()
+            .map(|node| SearchResult { node, score: 1.0 })
+            .collect();
     }
     if json_output {
         let output = results.iter().map(SearchOutput::from).collect::<Vec<_>>();
@@ -1219,9 +1227,6 @@ fn cmd_serve(
     let project = Some(resolve_project_path_optional(&absolute_path(
         path.unwrap_or_else(|| PathBuf::from(".")),
     )));
-    if no_watch {
-        std::env::set_var("CODEGRAPH_NO_WATCH", "1");
-    }
     if mcp {
         let project_root = project.clone().unwrap_or_else(|| PathBuf::from("."));
         // Stop-the-bleed home guard: an IDE (e.g. Kiro) launches `serve --mcp`
@@ -1234,7 +1239,7 @@ fn cmd_serve(
             eprintln!(
                 "[CodeGraph MCP] No project root: {reason}. Tools still answer off an existing index if present."
             );
-            return serve_direct_no_services(project, &project_root);
+            return serve_direct_no_services(project, &project_root, no_watch);
         }
         let has_codegraph = codegraph_dir(&project_root).is_dir();
         let mode = select_serve_mode(daemon_opt_out(), is_daemon_internal(), has_codegraph);
@@ -1388,7 +1393,11 @@ fn serve_direct_stdio(project: Option<PathBuf>) -> Result<()> {
 /// daemon, or catch-up sync. Used when the resolved root is too broad
 /// ($HOME / filesystem root), where background services would index the whole
 /// home tree.
-fn serve_direct_no_services(project: Option<PathBuf>, _project_root: &Path) -> Result<()> {
+fn serve_direct_no_services(
+    project: Option<PathBuf>,
+    _project_root: &Path,
+    no_watch: bool,
+) -> Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut server = McpServer::new(project);
@@ -1400,7 +1409,7 @@ fn serve_direct_no_services(project: Option<PathBuf>, _project_root: &Path) -> R
         RunUntilAdoption::Adopted {
             project_root,
             reader,
-        } => serve_adopted_project(reader, stdout, project_root),
+        } => serve_adopted_project(reader, stdout, project_root, no_watch),
     }
 }
 
@@ -1408,8 +1417,9 @@ fn serve_adopted_project<R: BufRead, W: Write + Send + 'static>(
     reader: R,
     writer: W,
     project_root: PathBuf,
+    no_watch: bool,
 ) -> Result<()> {
-    let Some(socket_path) = start_daemon_for_adopted_root(&project_root) else {
+    let Some(socket_path) = start_daemon_for_adopted_root(&project_root, no_watch) else {
         let mut server = McpServer::new(Some(project_root));
         return server
             .run(reader, writer)
@@ -1462,7 +1472,7 @@ fn serve_adopted_project<R: BufRead, W: Write + Send + 'static>(
     }
 }
 
-fn start_daemon_for_adopted_root(project_root: &Path) -> Option<PathBuf> {
+fn start_daemon_for_adopted_root(project_root: &Path, no_watch: bool) -> Option<PathBuf> {
     if daemon_opt_out() || is_daemon_internal() || !should_run_daemon_services(project_root) {
         return None;
     }
@@ -1482,7 +1492,7 @@ fn start_daemon_for_adopted_root(project_root: &Path) -> Option<PathBuf> {
     let Ok(exe) = std::env::current_exe() else {
         return None;
     };
-    match codegraph_daemon::spawn_detached_daemon(&exe, project_root) {
+    match codegraph_daemon::spawn_detached_daemon(&exe, project_root, no_watch) {
         Ok(()) => {
             poll_for_daemon_socket(project_root);
             eprintln!(
@@ -1600,7 +1610,7 @@ const DAEMON_SOCKET_POLL_TIMEOUT: std::time::Duration = std::time::Duration::fro
 fn spawn_or_proxy(
     _project: Option<PathBuf>,
     project_root: &Path,
-    _no_watch: bool,
+    no_watch: bool,
 ) -> Option<Result<()>> {
     let dbg = debug_enabled();
     if dbg {
@@ -1617,7 +1627,9 @@ fn spawn_or_proxy(
     } else {
         match std::env::current_exe() {
             Ok(exe) => {
-                if let Err(err) = codegraph_daemon::spawn_detached_daemon(&exe, project_root) {
+                if let Err(err) =
+                    codegraph_daemon::spawn_detached_daemon(&exe, project_root, no_watch)
+                {
                     tracing::debug!(error = %err, "detached daemon spawn failed; serving direct");
                     if dbg {
                         eprintln!(
@@ -1741,8 +1753,8 @@ pub fn select_serve_mode(
 #[cfg(test)]
 mod serve_mode_tests {
     use super::{
-        debug_enabled, guard_indexable_root, select_serve_mode, should_run_daemon_services,
-        should_run_serve_services, ServeMode,
+        ServeMode, debug_enabled, guard_indexable_root, select_serve_mode,
+        should_run_daemon_services, should_run_serve_services,
     };
     use std::path::Path;
     use std::sync::Mutex;
@@ -1754,20 +1766,20 @@ mod serve_mode_tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let prev = std::env::var("CODEGRAPH_DEBUG").ok();
 
-        std::env::remove_var("CODEGRAPH_DEBUG");
+        unsafe { std::env::remove_var("CODEGRAPH_DEBUG") };
         assert!(!debug_enabled(), "unset ⇒ off");
-        std::env::set_var("CODEGRAPH_DEBUG", "1");
+        unsafe { std::env::set_var("CODEGRAPH_DEBUG", "1") };
         assert!(debug_enabled(), "\"1\" ⇒ on");
-        std::env::set_var("CODEGRAPH_DEBUG", "true");
+        unsafe { std::env::set_var("CODEGRAPH_DEBUG", "true") };
         assert!(debug_enabled(), "\"true\" ⇒ on");
-        std::env::set_var("CODEGRAPH_DEBUG", "0");
+        unsafe { std::env::set_var("CODEGRAPH_DEBUG", "0") };
         assert!(!debug_enabled(), "\"0\" ⇒ off");
-        std::env::set_var("CODEGRAPH_DEBUG", "yes");
+        unsafe { std::env::set_var("CODEGRAPH_DEBUG", "yes") };
         assert!(!debug_enabled(), "any other value ⇒ off");
 
         match prev {
-            Some(v) => std::env::set_var("CODEGRAPH_DEBUG", v),
-            None => std::env::remove_var("CODEGRAPH_DEBUG"),
+            Some(v) => unsafe { std::env::set_var("CODEGRAPH_DEBUG", v) },
+            None => unsafe { std::env::remove_var("CODEGRAPH_DEBUG") },
         }
     }
 
@@ -1821,7 +1833,7 @@ mod serve_mode_tests {
         let tmp = std::env::temp_dir().join(format!("cg-serve-home-{}", std::process::id()));
         let nested = tmp.join("workspace/ProdDir/AI/codegraph-rust");
         std::fs::create_dir_all(&nested).unwrap();
-        std::env::set_var(home_key, &tmp);
+        unsafe { std::env::set_var(home_key, &tmp) };
 
         assert!(
             !should_run_daemon_services(&tmp),
@@ -1837,8 +1849,8 @@ mod serve_mode_tests {
         );
 
         match prev_home {
-            Some(v) => std::env::set_var(home_key, v),
-            None => std::env::remove_var(home_key),
+            Some(v) => unsafe { std::env::set_var(home_key, v) },
+            None => unsafe { std::env::remove_var(home_key) },
         }
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1852,7 +1864,7 @@ mod serve_mode_tests {
         let tmp = std::env::temp_dir().join(format!("cg-guard-home-{}", std::process::id()));
         let nested = tmp.join("workspace/proj");
         std::fs::create_dir_all(&nested).unwrap();
-        std::env::set_var(home_key, &tmp);
+        unsafe { std::env::set_var(home_key, &tmp) };
 
         assert!(
             guard_indexable_root(&tmp).is_err(),
@@ -1868,8 +1880,8 @@ mod serve_mode_tests {
         );
 
         match prev_home {
-            Some(v) => std::env::set_var(home_key, v),
-            None => std::env::remove_var(home_key),
+            Some(v) => unsafe { std::env::set_var(home_key, v) },
+            None => unsafe { std::env::remove_var(home_key) },
         }
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -2188,10 +2200,10 @@ fn normalize_impact_input(changed: &str, project: &Path) -> String {
     }
     let s = s.replace('\\', "/");
     let candidate = Path::new(&s);
-    if candidate.is_absolute() {
-        if let Ok(rel) = candidate.strip_prefix(project) {
-            return rel.to_string_lossy().replace('\\', "/");
-        }
+    if candidate.is_absolute()
+        && let Ok(rel) = candidate.strip_prefix(project)
+    {
+        return rel.to_string_lossy().replace('\\', "/");
     }
     s
 }
@@ -3133,12 +3145,11 @@ fn symbol_matches(store: &Store, project: &Path, symbol: &str) -> Result<Vec<Nod
     // node exists — this mirrors the committed T2 resolver
     // (`godot::resolve_class_member`). Returns the resolved nodes directly so
     // callers/impact/query all resolve the dotted form to the exact target.
-    if nodes.iter().all(|n| n.name != symbol) {
-        if let Some(resolved) = resolve_gdscript_class_member(store, symbol)? {
-            if !resolved.is_empty() {
-                return Ok(resolved);
-            }
-        }
+    if nodes.iter().all(|n| n.name != symbol)
+        && let Some(resolved) = resolve_gdscript_class_member(store, symbol)?
+        && !resolved.is_empty()
+    {
+        return Ok(resolved);
     }
     Ok(nodes)
 }
@@ -3564,7 +3575,7 @@ mod self_update_tests {
 
 #[cfg(test)]
 mod reorder_tests {
-    use super::{should_block, ReorderBuffer};
+    use super::{ReorderBuffer, should_block};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::sync::{Arc, Condvar, Mutex};

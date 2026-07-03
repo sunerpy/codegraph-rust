@@ -24,8 +24,8 @@ use time::format_description::well_known::Rfc3339;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::fmt::time::OffsetTime;
 use tracing_subscriber::{
-    filter::LevelFilter, fmt, layer::SubscriberExt, reload, util::SubscriberInitExt, EnvFilter,
-    Layer, Registry,
+    EnvFilter, Layer, Registry, filter::LevelFilter, fmt, layer::SubscriberExt, reload,
+    util::SubscriberInitExt,
 };
 
 /// Configuration for the application logger.
@@ -281,7 +281,7 @@ mod tests {
         // We test this by checking that parse_level respects the config,
         // and EnvFilter would respect the env var (the tracing-subscriber handles it).
 
-        std::env::remove_var("RUST_LOG");
+        unsafe { std::env::remove_var("RUST_LOG") };
         let base_level = parse_level("info");
         assert_eq!(base_level, LevelFilter::INFO);
 

@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use codegraph_core::types::{Node, NodeKind};
 use codegraph_store::Store;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::centrality::{self, Centrality};
 

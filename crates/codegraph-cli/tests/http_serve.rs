@@ -144,11 +144,12 @@ fn serve_http_indexed_starts_and_is_reachable() {
     let mut reachable = false;
     let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#;
     while Instant::now() < deadline {
-        if let Ok(resp) = http_post_mcp(&addr, init) {
-            if resp.contains("\"result\"") && resp.contains("2024-11-05") {
-                reachable = true;
-                break;
-            }
+        if let Ok(resp) = http_post_mcp(&addr, init)
+            && resp.contains("\"result\"")
+            && resp.contains("2024-11-05")
+        {
+            reachable = true;
+            break;
         }
         std::thread::sleep(Duration::from_millis(200));
     }

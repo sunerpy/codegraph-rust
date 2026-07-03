@@ -12,12 +12,12 @@ use std::path::{Path, PathBuf};
 
 use codegraph_core::types::{FileRecord, Node, NodeKind};
 use codegraph_graph::graph::{GodotReach, GraphTraverser, NodeEdge};
-use codegraph_graph::query::{search_nodes, SearchOptions};
+use codegraph_graph::query::{SearchOptions, search_nodes};
 use codegraph_store::Store;
 use serde_json::Value;
 
 use crate::dynamic_boundaries::scan_dynamic_dispatch;
-use crate::explore_budget::{get_explore_budget, get_explore_output_budget, ExploreOutputBudget};
+use crate::explore_budget::{ExploreOutputBudget, get_explore_budget, get_explore_output_budget};
 use crate::protocol::ToolResult;
 
 /// Default caller/callee recursion depth for callers/callees tools. The upstream
@@ -279,10 +279,10 @@ impl CodeGraphEngine {
         let symbol_raw = args.get("symbol").and_then(Value::as_str);
         let file_hint = args.get("file").and_then(Value::as_str);
 
-        if symbol_raw.is_none() {
-            if let Some(file_hint) = file_hint {
-                return self.handle_file_view(args, file_hint);
-            }
+        if symbol_raw.is_none()
+            && let Some(file_hint) = file_hint
+        {
+            return self.handle_file_view(args, file_hint);
         }
 
         let symbol = match symbol_raw {
@@ -628,12 +628,11 @@ impl CodeGraphEngine {
         }
 
         // Relationships, gated + capped by the budget (`tools.ts:2386-2414`).
-        if budget.include_relationships {
-            if let Some(rel) =
+        if budget.include_relationships
+            && let Some(rel) =
                 self.build_relationships(&subgraph, budget.max_edges_per_relationship_kind)
-            {
-                lines.push(rel);
-            }
+        {
+            lines.push(rel);
         }
 
         // Ports `buildDynamicBoundaries` (#687, `tools.ts:1706-1760`). The upstream
@@ -737,15 +736,15 @@ impl CodeGraphEngine {
 
         // Explore budget note (call-count recommendation), gated
         // (`tools.ts:2943-2952`).
-        if budget.include_budget_note {
-            if let Ok(c) = self.store.counts() {
-                let call_budget = get_explore_budget(c.file_count);
-                lines.push(format!(
+        if budget.include_budget_note
+            && let Ok(c) = self.store.counts()
+        {
+            let call_budget = get_explore_budget(c.file_count);
+            lines.push(format!(
                     "> **Explore budget: {call_budget} calls for this project ({} files indexed).** Each call covers ~6 files; if your question spans more, spend your remaining calls on the uncovered area BEFORE falling back to Read — another explore is cheaper and more complete than reading those files. Synthesize once you've used {call_budget}.",
                     c.file_count
                 ));
-                lines.push(String::new());
-            }
+            lines.push(String::new());
         }
 
         // Final ABSOLUTE inline ceiling — cut at a `#### ` file-section boundary
@@ -1233,12 +1232,12 @@ impl CodeGraphEngine {
         };
         let mut results = search_nodes(&self.store, symbol, &opts, &self.project_name_tokens())?;
         let is_qualified = symbol.contains(['.', '/']) || symbol.contains("::");
-        if results.is_empty() && is_qualified {
-            if let Some(tail) = last_qualifier_part(symbol) {
-                if tail != symbol {
-                    results = search_nodes(&self.store, tail, &opts, &self.project_name_tokens())?;
-                }
-            }
+        if results.is_empty()
+            && is_qualified
+            && let Some(tail) = last_qualifier_part(symbol)
+            && tail != symbol
+        {
+            results = search_nodes(&self.store, tail, &opts, &self.project_name_tokens())?;
         }
         Ok(results.into_iter().map(|r| r.node).collect())
     }
@@ -1354,12 +1353,11 @@ impl CodeGraphEngine {
                     "- `{}` ({}:{}) — {}: `{}`{more}",
                     node.name, node.file_path, m.line, m.label, m.snippet
                 ));
-                if let Some(key) = &m.key {
-                    if let Some(cand) =
+                if let Some(key) = &m.key
+                    && let Some(cand) =
                         self.boundary_candidates(key, m.key_is_type, subgraph, &node.id)?
-                    {
-                        notes.push(format!("  {cand}"));
-                    }
+                {
+                    notes.push(format!("  {cand}"));
                 }
             }
         }
@@ -1510,16 +1508,15 @@ impl CodeGraphEngine {
             let mut at = format!("{}:{}", n.file_path, n.start_line);
             // Typed-bus convention: the runtime target is the candidate class's
             // Handle/Execute/Consume method (`tools.ts:1814-1822`).
-            if key_is_type && n.kind == NodeKind::Class {
-                if let Ok(children) = traverser.get_children(&n.id) {
-                    if let Some(method) = children
-                        .iter()
-                        .find(|c| c.kind == NodeKind::Method && is_handler_method_name(&c.name))
-                    {
-                        display = format!("{}.{}", n.name, method.name);
-                        at = format!("{}:{}", method.file_path, method.start_line);
-                    }
-                }
+            if key_is_type
+                && n.kind == NodeKind::Class
+                && let Ok(children) = traverser.get_children(&n.id)
+                && let Some(method) = children
+                    .iter()
+                    .find(|c| c.kind == NodeKind::Method && is_handler_method_name(&c.name))
+            {
+                display = format!("{}.{}", n.name, method.name);
+                at = format!("{}:{}", method.file_path, method.start_line);
             }
             let mark = if is_named(n) {
                 " ← you named this"
@@ -1671,15 +1668,15 @@ impl ExploreSubgraph {
         // Files one graph hop from a seed (edge source or target is a seed).
         let mut neighbor_files: HashSet<&str> = HashSet::new();
         for e in &self.edges {
-            if self.roots.iter().any(|r| r == &e.source) {
-                if let Some(n) = self.node(&e.target) {
-                    neighbor_files.insert(n.file_path.as_str());
-                }
+            if self.roots.iter().any(|r| r == &e.source)
+                && let Some(n) = self.node(&e.target)
+            {
+                neighbor_files.insert(n.file_path.as_str());
             }
-            if self.roots.iter().any(|r| r == &e.target) {
-                if let Some(n) = self.node(&e.source) {
-                    neighbor_files.insert(n.file_path.as_str());
-                }
+            if self.roots.iter().any(|r| r == &e.target)
+                && let Some(n) = self.node(&e.source)
+            {
+                neighbor_files.insert(n.file_path.as_str());
             }
         }
         let scores: HashMap<String, (u8, usize)> = self
@@ -1865,11 +1862,11 @@ fn format_node_details(node: &Node, code: Option<&str>, outline: Option<&str>) -
     if let Some(sig) = &node.signature {
         lines.push(format!("**Signature:** `{sig}`"));
     }
-    if let Some(doc) = &node.docstring {
-        if doc.len() < 200 {
-            lines.push(String::new());
-            lines.push(doc.clone());
-        }
+    if let Some(doc) = &node.docstring
+        && doc.len() < 200
+    {
+        lines.push(String::new());
+        lines.push(doc.clone());
     }
     if let Some(outline) = outline {
         lines.push(String::new());
@@ -2065,11 +2062,7 @@ fn truncate_output(text: &str) -> String {
 }
 
 fn plural(n: usize) -> &'static str {
-    if n == 1 {
-        ""
-    } else {
-        "s"
-    }
+    if n == 1 { "" } else { "s" }
 }
 
 fn normalize_ws(s: &str) -> String {
@@ -2300,26 +2293,26 @@ fn simple_regex_match(re: &str, text: &str) -> bool {
             return txt.is_empty();
         }
         // Class [^/]
-        if pat[0] == '[' {
-            if let Some(close) = pat.iter().position(|&c| c == ']') {
-                let star = pat.get(close + 1) == Some(&'*');
-                let next = if star { close + 2 } else { close + 1 };
-                let test = |c: char| c != '/';
-                if star {
-                    let mut k = 0;
-                    loop {
-                        if matches(&pat[next..], &txt[k..]) {
-                            return true;
-                        }
-                        if k < txt.len() && test(txt[k]) {
-                            k += 1;
-                        } else {
-                            return false;
-                        }
+        if pat[0] == '['
+            && let Some(close) = pat.iter().position(|&c| c == ']')
+        {
+            let star = pat.get(close + 1) == Some(&'*');
+            let next = if star { close + 2 } else { close + 1 };
+            let test = |c: char| c != '/';
+            if star {
+                let mut k = 0;
+                loop {
+                    if matches(&pat[next..], &txt[k..]) {
+                        return true;
                     }
-                } else {
-                    return !txt.is_empty() && test(txt[0]) && matches(&pat[next..], &txt[1..]);
+                    if k < txt.len() && test(txt[k]) {
+                        k += 1;
+                    } else {
+                        return false;
+                    }
                 }
+            } else {
+                return !txt.is_empty() && test(txt[0]) && matches(&pat[next..], &txt[1..]);
             }
         }
         if pat[0] == '.' && pat.get(1) == Some(&'*') {
@@ -2409,7 +2402,9 @@ fn cut_at_section_boundary(output: &str, ceiling: usize) -> String {
         _ => cut.rfind('\n').unwrap_or(0),
     };
     let safe = if boundary > 0 { &cut[..boundary] } else { cut };
-    format!("{safe}\n\n... (output truncated to budget; the source above is complete and verbatim — treat it as already Read. For any area not covered, run another codegraph_explore with the specific names — do NOT Read these files.)")
+    format!(
+        "{safe}\n\n... (output truncated to budget; the source above is complete and verbatim — treat it as already Read. For any area not covered, run another codegraph_explore with the specific names — do NOT Read these files.)"
+    )
 }
 
 fn require_string(args: &Value, field: &str) -> Result<String, String> {

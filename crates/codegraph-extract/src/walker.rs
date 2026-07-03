@@ -13,7 +13,7 @@ use regex::Regex;
 use std::path::Path;
 use tree_sitter::Node as SyntaxNode;
 
-use crate::spec::{has_type, LanguageSpec};
+use crate::spec::{LanguageSpec, has_type};
 
 pub fn node_text(node: SyntaxNode<'_>, source: &str) -> String {
     let bytes = source.as_bytes();

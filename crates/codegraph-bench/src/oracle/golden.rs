@@ -3,7 +3,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use super::canonicalize::{canonicalize_db, CanonicalDb, CanonicalRow};
+use super::canonicalize::{CanonicalDb, CanonicalRow, canonicalize_db};
 
 pub fn write_golden(db_path: &Path, outdir: &Path) -> Result<()> {
     let canonical = canonicalize_db(db_path)?;

@@ -33,7 +33,7 @@ pub mod workspace_packages;
 pub use context::StoreResolutionContext;
 pub use framework::FrameworkResolver;
 pub use resolver::ReferenceResolver;
-pub use snapshot_context::{build_edge_adjacency, EdgeAdjacency, SnapshotResolutionContext};
+pub use snapshot_context::{EdgeAdjacency, SnapshotResolutionContext, build_edge_adjacency};
 pub use types::{
     FrameworkResolverExtractionResult, ImportMapping, ReExport, RefView, ResolutionContext,
     ResolutionResult, ResolutionStats, ResolvedBy, ResolvedRef,

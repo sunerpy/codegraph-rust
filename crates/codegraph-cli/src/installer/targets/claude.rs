@@ -7,13 +7,12 @@
 use std::fs;
 use std::path::PathBuf;
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use super::super::shared::{
-    self, codegraph_permissions, mcp_server_config, read_config_file, read_json_file,
-    remove_codegraph_from_mcp_servers, to_upstream_json, upsert_instructions_entry,
-    upsert_nested_key_jsonc, write_json_file, ConfigRead, CODEGRAPH_SECTION_END,
-    CODEGRAPH_SECTION_START,
+    self, CODEGRAPH_SECTION_END, CODEGRAPH_SECTION_START, ConfigRead, codegraph_permissions,
+    mcp_server_config, read_config_file, read_json_file, remove_codegraph_from_mcp_servers,
+    to_upstream_json, upsert_instructions_entry, upsert_nested_key_jsonc, write_json_file,
 };
 use super::super::types::{
     AgentTarget, DetectionResult, FileAction, FileWrite, InstallContext, InstallOptions, Location,
@@ -74,10 +73,10 @@ impl AgentTarget for ClaudeCodeTarget {
     fn install(&self, ctx: &InstallContext, loc: Location, opts: InstallOptions) -> WriteResult {
         let mut files = Vec::new();
         files.push(write_mcp_entry(ctx, loc));
-        if loc == Location::Local {
-            if let Some(migrated) = cleanup_legacy_local_mcp(ctx) {
-                files.push(migrated);
-            }
+        if loc == Location::Local
+            && let Some(migrated) = cleanup_legacy_local_mcp(ctx)
+        {
+            files.push(migrated);
         }
         if opts.auto_allow {
             files.push(write_permissions_entry(ctx, loc));
@@ -111,10 +110,10 @@ impl AgentTarget for ClaudeCodeTarget {
             });
         }
 
-        if loc == Location::Local {
-            if let Some(migrated) = cleanup_legacy_local_mcp(ctx) {
-                files.push(migrated);
-            }
+        if loc == Location::Local
+            && let Some(migrated) = cleanup_legacy_local_mcp(ctx)
+        {
+            files.push(migrated);
         }
 
         files.push(remove_permissions_entry(ctx, loc));

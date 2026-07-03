@@ -16,11 +16,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use codegraph_core::types::FileRecord;
 use codegraph_extract::engine::{detect_language, extract_file};
-use codegraph_mcp::server::reopen_count;
 use codegraph_mcp::McpServer;
+use codegraph_mcp::server::reopen_count;
 
 use codegraph_store::Store;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 

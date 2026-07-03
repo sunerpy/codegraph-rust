@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use codegraph_core::node_id::hash_content;
 use codegraph_core::types::FileRecord;
-use codegraph_extract::{detect_language, extract_file, ExtractOptions};
+use codegraph_extract::{ExtractOptions, detect_language, extract_file};
 use codegraph_resolve::ReferenceResolver;
 use codegraph_store::Store;
 
@@ -259,11 +259,12 @@ fn sync_one(
     // which stays authoritative — keeping the DB byte-identical to `index
     // --force`. (The equivalence tests edit file content, which changes size
     // and/or mtime, so they correctly fall through and reindex.)
-    if let Some(file) = &stored {
-        if file.size == metadata.len() as i64 && file.modified_at == modified_millis(&metadata) {
-            outcome.files_skipped_unchanged += 1;
-            return Ok(false);
-        }
+    if let Some(file) = &stored
+        && file.size == metadata.len() as i64
+        && file.modified_at == modified_millis(&metadata)
+    {
+        outcome.files_skipped_unchanged += 1;
+        return Ok(false);
     }
 
     let source = fs::read_to_string(&full).with_context(|| format!("read {}", full.display()))?;

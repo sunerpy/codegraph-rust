@@ -16,4 +16,4 @@ pub mod lang;
 pub mod spec;
 pub mod walker;
 
-pub use engine::{detect_language, extract_file, extract_project, extract_source, ExtractOptions};
+pub use engine::{ExtractOptions, detect_language, extract_file, extract_project, extract_source};

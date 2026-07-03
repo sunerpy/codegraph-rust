@@ -1415,10 +1415,10 @@ pub fn match_function_ref(
         } else {
             same_file
         };
-        let target =
-            pool.iter()
-                .copied()
-                .reduce(|a, b| if a.start_line <= b.start_line { a } else { b })?;
+        let target = pool
+            .iter()
+            .copied()
+            .reduce(|a, b| if a.start_line <= b.start_line { a } else { b })?;
         return Some(ResolvedRef {
             original: reference.clone(),
             target_node_id: target.id.clone(),
@@ -1493,11 +1493,10 @@ pub fn match_function_ref(
         {
             return None;
         }
-        let target =
-            same_file
-                .iter()
-                .copied()
-                .reduce(|a, b| if a.start_line <= b.start_line { a } else { b })?;
+        let target = same_file
+            .iter()
+            .copied()
+            .reduce(|a, b| if a.start_line <= b.start_line { a } else { b })?;
         return Some(ResolvedRef {
             original: reference.clone(),
             target_node_id: target.id.clone(),

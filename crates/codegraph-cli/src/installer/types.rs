@@ -368,13 +368,17 @@ mod tests {
         let install = target.install_skill(&ctx, Location::Global, false);
         assert!(install.files.is_empty());
         assert_eq!(install.notes.len(), 1);
-        assert!(install.notes[0]
-            .contains("skills not supported by Dummy Unsupported for --location=global"));
+        assert!(
+            install.notes[0]
+                .contains("skills not supported by Dummy Unsupported for --location=global")
+        );
 
         let uninstall = target.uninstall_skill(&ctx, Location::Global);
         assert!(uninstall.files.is_empty());
-        assert!(uninstall.notes[0]
-            .contains("skills not supported by Dummy Unsupported for --location=global"));
+        assert!(
+            uninstall.notes[0]
+                .contains("skills not supported by Dummy Unsupported for --location=global")
+        );
 
         let status = target.skill_status(&ctx, Location::Global);
         assert!(status.is_unsupported());
@@ -395,10 +399,11 @@ mod tests {
 
         // When installing for the first time → Created (via default delegation).
         let r1 = target.install_skill(&ctx, Location::Global, false);
-        assert!(r1
-            .files
-            .iter()
-            .any(|f| f.action == FileAction::Created && f.path.ends_with("SKILL.md")));
+        assert!(
+            r1.files
+                .iter()
+                .any(|f| f.action == FileAction::Created && f.path.ends_with("SKILL.md"))
+        );
         assert_eq!(
             target.skill_status(&ctx, Location::Global).status,
             Some(skill::SkillStatus::UpToDate)
@@ -425,10 +430,11 @@ mod tests {
 
         // When forcing → Updated, embedded content restored.
         let r4 = target.install_skill(&ctx, Location::Global, true);
-        assert!(r4
-            .files
-            .iter()
-            .any(|f| f.action == FileAction::Updated && f.path.ends_with("SKILL.md")));
+        assert!(
+            r4.files
+                .iter()
+                .any(|f| f.action == FileAction::Updated && f.path.ends_with("SKILL.md"))
+        );
         assert_eq!(fs::read_to_string(&skill_md).unwrap(), skill::SKILL_MD);
 
         // When uninstalling → files removed.

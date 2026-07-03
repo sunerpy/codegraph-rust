@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use codegraph_core::types::{Language, Node, NodeKind};
-use codegraph_graph::query::{parse_query, search_nodes, SearchOptions};
+use codegraph_graph::query::{SearchOptions, parse_query, search_nodes};
 use codegraph_store::Store;
 
 fn temp_db_path(test_name: &str) -> std::path::PathBuf {

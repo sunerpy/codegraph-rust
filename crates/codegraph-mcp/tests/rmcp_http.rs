@@ -24,7 +24,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use parity::setup_mini_project;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Spawn the `StreamableHttpService` for the mini fixture on an ephemeral port,
 /// returning the bound base URL (`http://127.0.0.1:PORT/mcp`) plus a guard whose

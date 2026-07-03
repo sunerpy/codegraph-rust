@@ -6,7 +6,7 @@
 //! claude, cursor, codex, opencode, hermes, gemini, antigravity, kiro, trae,
 //! qoder.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 use super::targets::{
     antigravity::ANTIGRAVITY_TARGET, claude::CLAUDE_TARGET, codex::CODEX_TARGET,

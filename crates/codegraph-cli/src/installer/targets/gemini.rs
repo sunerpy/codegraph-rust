@@ -7,12 +7,12 @@
 
 use std::path::PathBuf;
 
-use serde_json::{json, Map};
+use serde_json::{Map, json};
 
 use super::super::shared::{
-    self, mcp_server_config, read_config_file, read_json_file, remove_codegraph_from_mcp_servers,
-    to_upstream_json, upsert_instructions_entry, upsert_nested_key_jsonc, write_json_file,
-    ConfigRead, CODEGRAPH_SECTION_END, CODEGRAPH_SECTION_START,
+    self, CODEGRAPH_SECTION_END, CODEGRAPH_SECTION_START, ConfigRead, mcp_server_config,
+    read_config_file, read_json_file, remove_codegraph_from_mcp_servers, to_upstream_json,
+    upsert_instructions_entry, upsert_nested_key_jsonc, write_json_file,
 };
 use super::super::types::{
     AgentTarget, DetectionResult, FileAction, FileWrite, InstallContext, InstallOptions, Location,

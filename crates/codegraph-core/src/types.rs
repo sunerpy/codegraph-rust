@@ -566,7 +566,7 @@ pub struct ExtractionResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     fn sample_node() -> Node {
         Node {

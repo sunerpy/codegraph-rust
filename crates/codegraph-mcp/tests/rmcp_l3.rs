@@ -14,12 +14,12 @@
 mod parity;
 
 use codegraph_mcp::rmcp_handler::CodeGraphHandler;
+use rmcp::ServiceExt;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{CallToolRequestParams, PaginatedRequestParams};
-use rmcp::ServiceExt;
 use serde_json::json;
 
-use parity::{golden_client, setup_mini_project, workspace_root, TestProject};
+use parity::{TestProject, golden_client, setup_mini_project, workspace_root};
 
 async fn connect(
     handler: CodeGraphHandler,

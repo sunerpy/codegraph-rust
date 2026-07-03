@@ -512,12 +512,13 @@ fn matches_separator_test(lower_name: &str) -> bool {
     let stem = &lower_name[..dot];
     let stem_chars: Vec<char> = stem.chars().collect();
     for marker in ["test", "tests", "spec", "specs"] {
-        if let Some(pos) = stem.rfind(marker) {
-            if pos + marker.len() == stem.len() && pos > 0 {
-                let sep = stem_chars[pos - 1];
-                if sep == '.' || sep == '_' || sep == '-' {
-                    return true;
-                }
+        if let Some(pos) = stem.rfind(marker)
+            && pos + marker.len() == stem.len()
+            && pos > 0
+        {
+            let sep = stem_chars[pos - 1];
+            if sep == '.' || sep == '_' || sep == '-' {
+                return true;
             }
         }
     }

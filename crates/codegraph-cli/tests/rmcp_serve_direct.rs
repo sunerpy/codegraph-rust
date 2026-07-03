@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_codegraph"))
@@ -108,10 +108,10 @@ fn read_json_line_with_id(
                 if trimmed.is_empty() {
                     continue;
                 }
-                if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
-                    if value.get("id").and_then(Value::as_i64) == Some(want_id) {
-                        return Some(value);
-                    }
+                if let Ok(value) = serde_json::from_str::<Value>(trimmed)
+                    && value.get("id").and_then(Value::as_i64) == Some(want_id)
+                {
+                    return Some(value);
                 }
             }
             Err(_) => return None,

@@ -4,8 +4,13 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
 
-use crate::paths::daemon_log_path;
 use crate::CODEGRAPH_DAEMON_INTERNAL;
+use crate::paths::daemon_log_path;
+
+/// Env var the daemon child reads to disable its live file watcher. Kept in
+/// sync with `codegraph_watch::CODEGRAPH_NO_WATCH`; duplicated here so the
+/// daemon crate does not need to depend on codegraph-watch just for a string.
+const CODEGRAPH_NO_WATCH: &str = "CODEGRAPH_NO_WATCH";
 
 #[cfg(windows)]
 const DETACHED_PROCESS: u32 = 0x0000_0008;
@@ -18,7 +23,13 @@ const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 /// keeping a tiny reaper thread to wait on the child when it exits. The
 /// executable path is a parameter so the daemon crate stays testable; the CLI
 /// passes `std::env::current_exe()?`.
-pub fn spawn_detached_daemon(exe: &Path, root: &Path) -> Result<()> {
+///
+/// `no_watch` forwards the `--no-watch` intent to the detached child EXPLICITLY
+/// via `Command.env` instead of mutating this process's global environment.
+/// When `true`, the child sees `CODEGRAPH_NO_WATCH=1` and disables its live
+/// file watcher, exactly as if the flag had been inherited — but without any
+/// global-env mutation in the parent.
+pub fn spawn_detached_daemon(exe: &Path, root: &Path, no_watch: bool) -> Result<()> {
     let mut command = Command::new(exe);
     command
         .arg("serve")
@@ -29,6 +40,9 @@ pub fn spawn_detached_daemon(exe: &Path, root: &Path) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(log_target(root))
         .stderr(log_target(root));
+    if no_watch {
+        command.env(CODEGRAPH_NO_WATCH, "1");
+    }
 
     detach(&mut command);
 
@@ -144,7 +158,7 @@ mod tests {
         );
         let root = temp_root("reap-exited-child");
 
-        spawn_detached_daemon(exe, &root).expect("spawn short-lived daemon command");
+        spawn_detached_daemon(exe, &root, false).expect("spawn short-lived daemon command");
 
         assert!(
             eventually_no_zombie_children(Duration::from_secs(1)),

@@ -91,8 +91,8 @@ impl SkillMarker {
 
 /// Current UTC time as an RFC3339 string, reusing the workspace `time` dep.
 fn now_rfc3339() -> String {
-    use time::format_description::well_known::Rfc3339;
     use time::OffsetDateTime;
+    use time::format_description::well_known::Rfc3339;
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
@@ -489,14 +489,16 @@ mod tests {
 
         // Fresh install → Created (skill + sidecar both Created).
         let r1 = write_skill_to_dir(&parent, false);
-        assert!(r1
-            .files
-            .iter()
-            .any(|f| f.action == FileAction::Created && f.path.ends_with("SKILL.md")));
-        assert!(r1
-            .files
-            .iter()
-            .any(|f| f.action == FileAction::Created && f.path.ends_with(SIDECAR_FILE_NAME)));
+        assert!(
+            r1.files
+                .iter()
+                .any(|f| f.action == FileAction::Created && f.path.ends_with("SKILL.md"))
+        );
+        assert!(
+            r1.files
+                .iter()
+                .any(|f| f.action == FileAction::Created && f.path.ends_with(SIDECAR_FILE_NAME))
+        );
         assert_eq!(fs::read_to_string(skill_file(&parent)).unwrap(), SKILL_MD);
         // Sidecar round-trips and records the embedded hash.
         let (_, marker) = read_installed(&parent);
@@ -532,10 +534,11 @@ mod tests {
 
         // With force → Updated, embedded content restored.
         let r2 = write_skill_to_dir(&parent, true);
-        assert!(r2
-            .files
-            .iter()
-            .any(|f| f.action == FileAction::Updated && f.path.ends_with("SKILL.md")));
+        assert!(
+            r2.files
+                .iter()
+                .any(|f| f.action == FileAction::Updated && f.path.ends_with("SKILL.md"))
+        );
         assert_eq!(fs::read_to_string(skill_file(&parent)).unwrap(), SKILL_MD);
 
         let _ = fs::remove_dir_all(&parent);
@@ -559,10 +562,11 @@ mod tests {
 
         // Provenance match ⇒ Update (no force) ⇒ embedded restored.
         let r = write_skill_to_dir(&parent, false);
-        assert!(r
-            .files
-            .iter()
-            .any(|f| f.action == FileAction::Updated && f.path.ends_with("SKILL.md")));
+        assert!(
+            r.files
+                .iter()
+                .any(|f| f.action == FileAction::Updated && f.path.ends_with("SKILL.md"))
+        );
         assert_eq!(fs::read_to_string(skill_file(&parent)).unwrap(), SKILL_MD);
 
         let _ = fs::remove_dir_all(&parent);

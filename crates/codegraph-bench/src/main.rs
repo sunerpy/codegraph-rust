@@ -1,15 +1,15 @@
 use std::path::PathBuf;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use clap::{Parser, ValueEnum};
 use codegraph_bench::corpus::{fetch_all, list_statuses};
 use codegraph_bench::markdown::{render_from_json, write_markdown};
 use codegraph_bench::oracle::golden::write_golden;
-use codegraph_bench::pipeline::{run_pipeline, select_corpora, PipelineConfig};
+use codegraph_bench::pipeline::{PipelineConfig, run_pipeline, select_corpora};
 use codegraph_bench::report::{
-    write_pipeline_report, write_report, BenchmarkReport, PipelineReport,
+    BenchmarkReport, PipelineReport, write_pipeline_report, write_report,
 };
-use codegraph_bench::runner::{run_command, CacheMode, RunConfig};
+use codegraph_bench::runner::{CacheMode, RunConfig, run_command};
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "CodeGraph benchmark harness")]

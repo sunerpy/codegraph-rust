@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use codegraph_bench::oracle::{
-    assert_equivalent, canonicalize_db, diff_canonical, load_golden, write_golden, Tier,
+    Tier, assert_equivalent, canonicalize_db, diff_canonical, load_golden, write_golden,
 };
 use serde_json::json;
 
@@ -30,10 +30,12 @@ fn tier1_node_drift_is_reported() {
     let error = diff_canonical(&expected, &actual, None).unwrap_err();
     println!("injected Tier-1 drift failure:\n{error}");
 
-    assert!(error
-        .entries()
-        .iter()
-        .any(|entry| entry.tier == Tier::Tier1 && entry.surface == "nodes"));
+    assert!(
+        error
+            .entries()
+            .iter()
+            .any(|entry| entry.tier == Tier::Tier1 && entry.surface == "nodes")
+    );
 }
 
 #[test]
@@ -49,10 +51,12 @@ fn tier2_edges_are_order_independent_but_counted() {
     println!("removed edge for Tier-2 missing-edge assertion: {removed:?}");
     println!("missing-edge failure:\n{error}");
 
-    assert!(error
-        .entries()
-        .iter()
-        .any(|entry| entry.tier == Tier::Tier2 && entry.surface == "edges"));
+    assert!(
+        error
+            .entries()
+            .iter()
+            .any(|entry| entry.tier == Tier::Tier2 && entry.surface == "edges")
+    );
 }
 
 fn workspace_root() -> PathBuf {

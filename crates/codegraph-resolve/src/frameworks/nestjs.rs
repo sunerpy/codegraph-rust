@@ -13,7 +13,7 @@ use regex::Regex;
 
 use super::framework_node;
 use crate::framework::FrameworkResolver;
-use crate::strip_comments::{strip_comments_for_regex, CommentLang};
+use crate::strip_comments::{CommentLang, strip_comments_for_regex};
 use crate::types::{
     FrameworkResolverExtractionResult, RefView, ResolutionContext, ResolvedBy, ResolvedRef,
 };

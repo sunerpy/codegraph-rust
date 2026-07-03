@@ -30,11 +30,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use interprocess::local_socket::traits::Stream as _;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::process::{current_ppid, is_process_alive, supervision_lost_reason, SupervisionState};
+use crate::process::{SupervisionState, current_ppid, is_process_alive, supervision_lost_reason};
 use crate::session::read_daemon_hello;
-use crate::transport::{connect, Rendezvous};
+use crate::transport::{Rendezvous, connect};
 
 /// The wire protocol version the daemon advertises in its hello
 /// (`session.rs` `DaemonHello.protocol`). Proxy and daemon must agree.
@@ -323,10 +323,10 @@ where
                 let suppressed = suppressed_id
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if let (Some(resp_id), Some(want)) = (resp_id, suppressed.as_ref()) {
-                    if resp_id == want {
-                        continue;
-                    }
+                if let (Some(resp_id), Some(want)) = (resp_id, suppressed.as_ref())
+                    && resp_id == want
+                {
+                    continue;
                 }
             }
         }
@@ -431,22 +431,24 @@ fn spawn_ppid_watchdog(
     pump_shutdown: Arc<AtomicBool>,
 ) -> WatchdogGuard {
     let original_ppid = current_ppid();
-    let handle = thread::spawn(move || loop {
-        if wake.wait_timeout(PPID_POLL_INTERVAL) {
-            break;
-        }
-        let state = SupervisionState {
-            original_ppid,
-            current_ppid: current_ppid(),
-            host_pid: host_ppid,
-            // The proxy is a short-lived child of the real host (never setsid'd),
-            // so ppid divergence DOES mean the host died — keep that signal.
-            session_leader: false,
-        };
-        if supervision_lost_reason(&state, is_process_alive).is_some() {
-            pump_shutdown.store(true, Ordering::SeqCst);
-            wake.signal();
-            break;
+    let handle = thread::spawn(move || {
+        loop {
+            if wake.wait_timeout(PPID_POLL_INTERVAL) {
+                break;
+            }
+            let state = SupervisionState {
+                original_ppid,
+                current_ppid: current_ppid(),
+                host_pid: host_ppid,
+                // The proxy is a short-lived child of the real host (never setsid'd),
+                // so ppid divergence DOES mean the host died — keep that signal.
+                session_leader: false,
+            };
+            if supervision_lost_reason(&state, is_process_alive).is_some() {
+                pump_shutdown.store(true, Ordering::SeqCst);
+                wake.signal();
+                break;
+            }
         }
     });
     WatchdogGuard {

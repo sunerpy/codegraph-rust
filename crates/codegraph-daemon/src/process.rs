@@ -35,10 +35,10 @@ where
             state.original_ppid, state.current_ppid
         ));
     }
-    if let Some(host_pid) = state.host_pid {
-        if !is_alive(host_pid) {
-            return Some(format!("host pid {host_pid} exited"));
-        }
+    if let Some(host_pid) = state.host_pid
+        && !is_alive(host_pid)
+    {
+        return Some(format!("host pid {host_pid} exited"));
     }
     None
 }
@@ -90,7 +90,7 @@ pub fn current_ppid() -> u32 {
 #[cfg(windows)]
 pub fn is_process_alive(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, ERROR_ACCESS_DENIED, FALSE, STILL_ACTIVE,
+        CloseHandle, ERROR_ACCESS_DENIED, FALSE, GetLastError, STILL_ACTIVE,
     };
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,

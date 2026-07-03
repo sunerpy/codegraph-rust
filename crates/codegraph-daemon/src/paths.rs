@@ -90,10 +90,12 @@ mod tests {
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0], root.join(".codegraph/daemon.sock"));
         assert!(candidates[1].starts_with(env::temp_dir()));
-        assert!(candidates[1]
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("codegraph-") && n.ends_with(".sock")));
+        assert!(
+            candidates[1]
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("codegraph-") && n.ends_with(".sock"))
+        );
         // The default socket path equals candidate #1.
         assert_eq!(daemon_socket_path(&root), candidates[0]);
     }

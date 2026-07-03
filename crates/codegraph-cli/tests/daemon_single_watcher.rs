@@ -134,10 +134,10 @@ fn read_pid_from_hello(socket: &Path) -> Option<u32> {
 fn poll_for_daemon_pid(socket: &Path, timeout: Duration) -> Option<u32> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if socket.exists() {
-            if let Some(pid) = read_pid_from_hello(socket) {
-                return Some(pid);
-            }
+        if socket.exists()
+            && let Some(pid) = read_pid_from_hello(socket)
+        {
+            return Some(pid);
         }
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -232,9 +232,9 @@ fn daemon_single_watcher_fires_once() {
         // the parallel no-watch test cannot toggle CODEGRAPH_NO_WATCH while this
         // daemon is reading its inherited env at startup.
         let _env = env_guard();
-        std::env::set_var("CODEGRAPH_WATCH_DEBOUNCE_MS", "100");
-        std::env::remove_var("CODEGRAPH_NO_WATCH");
-        spawn_detached_daemon(&bin(), &project).expect("spawn_detached_daemon");
+        unsafe { std::env::set_var("CODEGRAPH_WATCH_DEBOUNCE_MS", "100") };
+        unsafe { std::env::remove_var("CODEGRAPH_NO_WATCH") };
+        spawn_detached_daemon(&bin(), &project, false).expect("spawn_detached_daemon");
         poll_for_daemon_pid(&socket, Duration::from_millis(3000))
             .expect("daemon socket + hello pid within poll window")
     };
@@ -305,13 +305,13 @@ fn daemon_no_watch_does_not_autosync() {
         // BEFORE releasing the guard so the happy test's spawn never inherits
         // CODEGRAPH_NO_WATCH.
         let _env = env_guard();
-        std::env::set_var("CODEGRAPH_WATCH_DEBOUNCE_MS", "100");
-        std::env::set_var("CODEGRAPH_NO_WATCH", "1");
-        let spawn = spawn_detached_daemon(&bin(), &project);
+        unsafe { std::env::set_var("CODEGRAPH_WATCH_DEBOUNCE_MS", "100") };
+        unsafe { std::env::set_var("CODEGRAPH_NO_WATCH", "1") };
+        let spawn = spawn_detached_daemon(&bin(), &project, true);
         let pid = spawn
             .ok()
             .and_then(|()| poll_for_daemon_pid(&socket, Duration::from_millis(3000)));
-        std::env::remove_var("CODEGRAPH_NO_WATCH");
+        unsafe { std::env::remove_var("CODEGRAPH_NO_WATCH") };
         pid.expect("daemon socket + hello pid within poll window")
     };
 

@@ -19,9 +19,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use codegraph_daemon::{
+    AcquireResult, DaemonHandle, DaemonLockInfo, DaemonOptions, StartOrAttach,
     clear_stale_daemon_lock, daemon_pid_path, encode_lock_info, start_or_attach,
-    try_acquire_daemon_lock, AcquireResult, DaemonHandle, DaemonLockInfo, DaemonOptions,
-    StartOrAttach,
+    try_acquire_daemon_lock,
 };
 
 // A pid that is not a live process on any sane Unix host; used to forge a

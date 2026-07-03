@@ -16,30 +16,30 @@ mod transport;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use interprocess::local_socket::traits::Listener as _;
 pub use lock::{
-    clear_stale_daemon_lock, decode_lock_info, encode_lock_info, recorded_socket_path,
-    try_acquire_daemon_lock, unlock_project, AcquireResult, DaemonLockInfo,
+    AcquireResult, DaemonLockInfo, clear_stale_daemon_lock, decode_lock_info, encode_lock_info,
+    recorded_socket_path, try_acquire_daemon_lock, unlock_project,
 };
 pub use paths::{daemon_log_path, daemon_pid_path, daemon_socket_path};
 pub use process::{
-    current_ppid, is_process_alive, is_session_leader, supervision_lost_reason, SupervisionState,
+    SupervisionState, current_ppid, is_process_alive, is_session_leader, supervision_lost_reason,
 };
-pub use proxy::{run_proxy, verify_daemon_hello, ProxyOutcome};
-pub use session::{read_daemon_hello, run_session_recv, SessionRegistry};
+pub use proxy::{ProxyOutcome, run_proxy, verify_daemon_hello};
+pub use session::{SessionRegistry, read_daemon_hello, run_session_recv};
 pub use spawn::spawn_detached_daemon;
 use tracing::{debug, info, warn};
 
 use crate::lock::{cleanup_owned_lock, rewrite_lock_socket_path};
 use crate::paths::codegraph_dir;
 use crate::session::serve_session;
-use crate::transport::{bind, connect, Listener, Rendezvous};
+use crate::transport::{Listener, Rendezvous, bind, connect};
 
 const DEFAULT_WATCHDOG_INTERVAL: Duration = Duration::from_millis(500);
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -324,10 +324,10 @@ fn bind_with_fallback(project_root: &Path, preferred: PathBuf) -> Result<(Listen
     for socket_path in candidates {
         let rendezvous = Rendezvous::from_socket_path(&socket_path);
         #[cfg(unix)]
-        if let Some(stale) = rendezvous.cleanup_path() {
-            if stale.exists() {
-                let _ = fs::remove_file(stale);
-            }
+        if let Some(stale) = rendezvous.cleanup_path()
+            && stale.exists()
+        {
+            let _ = fs::remove_file(stale);
         }
         match bind(&rendezvous) {
             Ok(listener) => return Ok((listener, socket_path)),
@@ -467,8 +467,8 @@ fn start_project_watcher(
 /// RFC 3339 local timestamp, falling back local -> UTC -> empty so logging
 /// never panics on a missing TZ database.
 fn local_timestamp() -> String {
-    use time::format_description::well_known::Rfc3339;
     use time::OffsetDateTime;
+    use time::format_description::well_known::Rfc3339;
     OffsetDateTime::now_local()
         .unwrap_or_else(|_| OffsetDateTime::now_utc())
         .format(&Rfc3339)

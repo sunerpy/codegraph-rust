@@ -93,13 +93,17 @@ fn claude_local_install_idempotent_then_uninstall() {
     assert_eq!(entry["type"], "stdio");
     assert!(settings.exists());
     let allow = read_json(&settings)["permissions"]["allow"].clone();
-    assert!(allow
-        .as_array()
-        .unwrap()
-        .contains(&Value::String("mcp__codegraph__codegraph_explore".into())));
-    assert!(fs::read_to_string(&claude_md)
-        .unwrap()
-        .contains("<!-- CODEGRAPH_START -->"));
+    assert!(
+        allow
+            .as_array()
+            .unwrap()
+            .contains(&Value::String("mcp__codegraph__codegraph_explore".into()))
+    );
+    assert!(
+        fs::read_to_string(&claude_md)
+            .unwrap()
+            .contains("<!-- CODEGRAPH_START -->")
+    );
 
     // a sibling MCP server the user owns must survive every operation
     let mut config = read_json(&mcp);

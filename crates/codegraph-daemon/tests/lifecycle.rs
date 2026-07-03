@@ -5,8 +5,8 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use codegraph_daemon::{
-    daemon_pid_path, encode_lock_info, start_or_attach, unlock_project, DaemonLockInfo,
-    DaemonOptions, StartOrAttach,
+    DaemonLockInfo, DaemonOptions, StartOrAttach, daemon_pid_path, encode_lock_info,
+    start_or_attach, unlock_project,
 };
 
 #[test]

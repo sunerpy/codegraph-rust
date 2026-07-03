@@ -84,18 +84,18 @@ pub fn run_with_proc_status_timeout(
             break Some(status);
         }
         peak_rss_kb = peak_rss_kb.max(read_proc_status_kb(pid, "VmHWM:"));
-        if let Some(limit) = timeout {
-            if started.elapsed() > limit {
-                // Unix kills the whole process group (negative PID); Windows has
-                // no POSIX process group, so kill just the spawned child.
-                #[cfg(unix)]
-                kill_process_group(pid);
-                #[cfg(not(unix))]
-                let _ = child.kill();
-                timed_out = true;
-                let _ = child.wait();
-                break None;
-            }
+        if let Some(limit) = timeout
+            && started.elapsed() > limit
+        {
+            // Unix kills the whole process group (negative PID); Windows has
+            // no POSIX process group, so kill just the spawned child.
+            #[cfg(unix)]
+            kill_process_group(pid);
+            #[cfg(not(unix))]
+            let _ = child.kill();
+            timed_out = true;
+            let _ = child.wait();
+            break None;
         }
         thread::sleep(Duration::from_millis(2));
     };

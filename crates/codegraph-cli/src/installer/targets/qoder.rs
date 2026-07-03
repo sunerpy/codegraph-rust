@@ -33,11 +33,11 @@
 use std::fs;
 use std::path::PathBuf;
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use super::super::shared::{
-    mcp_server_config, read_config_file, read_json_file, remove_codegraph_from_mcp_servers,
-    to_upstream_json, upsert_nested_key_jsonc, write_json_file, ConfigRead,
+    ConfigRead, mcp_server_config, read_config_file, read_json_file,
+    remove_codegraph_from_mcp_servers, to_upstream_json, upsert_nested_key_jsonc, write_json_file,
 };
 use super::super::types::{
     AgentTarget, DetectionResult, FileAction, FileWrite, InstallContext, InstallOptions, Location,
@@ -135,11 +135,11 @@ fn qoder_local_mcp_json(ctx: &InstallContext) -> PathBuf {
 /// pins the absolute project path.
 fn build_qoder_mcp_config(ctx: &InstallContext, loc: Location) -> Value {
     let mut base = mcp_server_config();
-    if loc == Location::Local {
-        if let Some(args) = base.get_mut("args").and_then(|a| a.as_array_mut()) {
-            args.push(json!("--path"));
-            args.push(json!(ctx.cwd.to_string_lossy().to_string()));
-        }
+    if loc == Location::Local
+        && let Some(args) = base.get_mut("args").and_then(|a| a.as_array_mut())
+    {
+        args.push(json!("--path"));
+        args.push(json!(ctx.cwd.to_string_lossy().to_string()));
     }
     base
 }

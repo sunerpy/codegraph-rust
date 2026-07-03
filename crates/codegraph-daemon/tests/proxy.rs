@@ -6,7 +6,7 @@
 
 #![cfg(unix)]
 
-use codegraph_daemon::{verify_daemon_hello, ProxyOutcome};
+use codegraph_daemon::{ProxyOutcome, verify_daemon_hello};
 use serde_json::json;
 
 #[test]

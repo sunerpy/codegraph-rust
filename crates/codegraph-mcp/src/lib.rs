@@ -24,7 +24,7 @@ pub mod schemas;
 pub mod server;
 
 pub use engine::CodeGraphEngine;
-pub use server::{initialize_result, McpServer, RunUntilAdoption};
+pub use server::{McpServer, RunUntilAdoption, initialize_result};
 
 #[cfg(feature = "rmcp")]
 pub use rmcp_handler::{serve_http, serve_stdio_rmcp};

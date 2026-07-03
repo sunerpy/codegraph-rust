@@ -379,19 +379,13 @@ impl<'store> GraphTraverser<'store> {
         let caller_nodes = self.store.nodes_by_ids(&source_ids)?;
 
         for edge in incoming {
-            if let Some(caller) = caller_nodes.get(&edge.source) {
-                if !visited.contains(&caller.id) {
-                    let caller = caller.clone();
-                    let caller_id = caller.id.clone();
-                    result.push(NodeEdge { node: caller, edge });
-                    self.callers_recursive(
-                        &caller_id,
-                        max_depth,
-                        current_depth + 1,
-                        result,
-                        visited,
-                    )?;
-                }
+            if let Some(caller) = caller_nodes.get(&edge.source)
+                && !visited.contains(&caller.id)
+            {
+                let caller = caller.clone();
+                let caller_id = caller.id.clone();
+                result.push(NodeEdge { node: caller, edge });
+                self.callers_recursive(&caller_id, max_depth, current_depth + 1, result, visited)?;
             }
         }
         Ok(())
@@ -493,19 +487,13 @@ impl<'store> GraphTraverser<'store> {
         let callee_nodes = self.store.nodes_by_ids(&target_ids)?;
 
         for edge in outgoing {
-            if let Some(callee) = callee_nodes.get(&edge.target) {
-                if !visited.contains(&callee.id) {
-                    let callee = callee.clone();
-                    let callee_id = callee.id.clone();
-                    result.push(NodeEdge { node: callee, edge });
-                    self.callees_recursive(
-                        &callee_id,
-                        max_depth,
-                        current_depth + 1,
-                        result,
-                        visited,
-                    )?;
-                }
+            if let Some(callee) = callee_nodes.get(&edge.target)
+                && !visited.contains(&callee.id)
+            {
+                let callee = callee.clone();
+                let callee_id = callee.id.clone();
+                result.push(NodeEdge { node: callee, edge });
+                self.callees_recursive(&callee_id, max_depth, current_depth + 1, result, visited)?;
             }
         }
         Ok(())
@@ -574,14 +562,14 @@ impl<'store> GraphTraverser<'store> {
         )?;
 
         for edge in outgoing {
-            if let Some(parent) = parents.get(&edge.target) {
-                if !graph.nodes.contains_key(&parent.id) {
-                    let parent = parent.clone();
-                    let parent_id = parent.id.clone();
-                    graph.set_node(parent);
-                    graph.edges.push(edge);
-                    self.type_ancestors(&parent_id, graph, visited)?;
-                }
+            if let Some(parent) = parents.get(&edge.target)
+                && !graph.nodes.contains_key(&parent.id)
+            {
+                let parent = parent.clone();
+                let parent_id = parent.id.clone();
+                graph.set_node(parent);
+                graph.edges.push(edge);
+                self.type_ancestors(&parent_id, graph, visited)?;
             }
         }
         Ok(())
@@ -611,14 +599,14 @@ impl<'store> GraphTraverser<'store> {
         )?;
 
         for edge in incoming {
-            if let Some(child) = children.get(&edge.source) {
-                if !graph.nodes.contains_key(&child.id) {
-                    let child = child.clone();
-                    let child_id = child.id.clone();
-                    graph.set_node(child);
-                    graph.edges.push(edge);
-                    self.type_descendants(&child_id, graph, visited)?;
-                }
+            if let Some(child) = children.get(&edge.source)
+                && !graph.nodes.contains_key(&child.id)
+            {
+                let child = child.clone();
+                let child_id = child.id.clone();
+                graph.set_node(child);
+                graph.edges.push(edge);
+                self.type_descendants(&child_id, graph, visited)?;
             }
         }
         Ok(())
@@ -680,32 +668,26 @@ impl<'store> GraphTraverser<'store> {
         }
         visited.insert(node_id.to_string());
 
-        if let Some(focal) = self.store.node_by_id(node_id)? {
-            if CONTAINER_KINDS.contains(&focal.kind) {
-                let contains = self.outgoing_edges_kinds(node_id, &[EdgeKind::Contains])?;
-                if !contains.is_empty() {
-                    let children = self.store.nodes_by_ids(
-                        &contains
-                            .iter()
-                            .map(|e| e.target.clone())
-                            .collect::<Vec<_>>(),
-                    )?;
-                    for edge in contains {
-                        if let Some(child) = children.get(&edge.target) {
-                            if !visited.contains(&child.id) {
-                                let child = child.clone();
-                                let child_id = child.id.clone();
-                                graph.set_node(child);
-                                graph.edges.push(edge);
-                                self.impact_recursive(
-                                    &child_id,
-                                    max_depth,
-                                    current_depth,
-                                    graph,
-                                    visited,
-                                )?;
-                            }
-                        }
+        if let Some(focal) = self.store.node_by_id(node_id)?
+            && CONTAINER_KINDS.contains(&focal.kind)
+        {
+            let contains = self.outgoing_edges_kinds(node_id, &[EdgeKind::Contains])?;
+            if !contains.is_empty() {
+                let children = self.store.nodes_by_ids(
+                    &contains
+                        .iter()
+                        .map(|e| e.target.clone())
+                        .collect::<Vec<_>>(),
+                )?;
+                for edge in contains {
+                    if let Some(child) = children.get(&edge.target)
+                        && !visited.contains(&child.id)
+                    {
+                        let child = child.clone();
+                        let child_id = child.id.clone();
+                        graph.set_node(child);
+                        graph.edges.push(edge);
+                        self.impact_recursive(&child_id, max_depth, current_depth, graph, visited)?;
                     }
                 }
             }
@@ -727,20 +709,14 @@ impl<'store> GraphTraverser<'store> {
         )?;
 
         for edge in incoming {
-            if let Some(source) = sources.get(&edge.source) {
-                if !graph.nodes.contains_key(&source.id) {
-                    let source = source.clone();
-                    let source_id = source.id.clone();
-                    graph.set_node(source);
-                    graph.edges.push(edge);
-                    self.impact_recursive(
-                        &source_id,
-                        max_depth,
-                        current_depth + 1,
-                        graph,
-                        visited,
-                    )?;
-                }
+            if let Some(source) = sources.get(&edge.source)
+                && !graph.nodes.contains_key(&source.id)
+            {
+                let source = source.clone();
+                let source_id = source.id.clone();
+                graph.set_node(source);
+                graph.edges.push(edge);
+                self.impact_recursive(&source_id, max_depth, current_depth + 1, graph, visited)?;
             }
         }
         Ok(())
@@ -792,15 +768,15 @@ impl<'store> GraphTraverser<'store> {
             let next_nodes = self.store.nodes_by_ids(&want_ids)?;
 
             for edge in outgoing {
-                if !visited.contains(&edge.target) {
-                    if let Some(next_node) = next_nodes.get(&edge.target) {
-                        let mut next_path = path.clone();
-                        next_path.push(PathStep {
-                            node: next_node.clone(),
-                            edge: Some(edge.clone()),
-                        });
-                        queue.push_back((edge.target.clone(), next_path));
-                    }
+                if !visited.contains(&edge.target)
+                    && let Some(next_node) = next_nodes.get(&edge.target)
+                {
+                    let mut next_path = path.clone();
+                    next_path.push(PathStep {
+                        node: next_node.clone(),
+                        edge: Some(edge.clone()),
+                    });
+                    queue.push_back((edge.target.clone(), next_path));
                 }
             }
         }

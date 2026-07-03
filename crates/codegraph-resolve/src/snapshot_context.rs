@@ -27,9 +27,9 @@
 
 use crate::context::order_candidates_pub;
 use crate::import_resolver;
-use crate::path_aliases::{load_project_aliases, AliasMap};
+use crate::path_aliases::{AliasMap, load_project_aliases};
 use crate::types::{GoModule, ImportMapping, ReExport, ResolutionContext};
-use crate::workspace_packages::{load_workspace_packages, WorkspacePackages};
+use crate::workspace_packages::{WorkspacePackages, load_workspace_packages};
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use codegraph_store::Store;
 use std::collections::{HashMap, HashSet};

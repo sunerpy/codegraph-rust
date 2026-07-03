@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use codegraph_core::types::{
     Edge, EdgeKind, FileRecord, Language, Node, NodeKind, ReferenceSubkind, UnresolvedRef,
 };
-use rusqlite::{named_params, params, Connection, OptionalExtension, Row, ToSql};
+use rusqlite::{Connection, OptionalExtension, Row, ToSql, named_params, params};
 use serde_json::Value;
 
 use crate::connection::Store;
