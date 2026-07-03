@@ -373,9 +373,28 @@ impl ServerHandler for CodeGraphHandler {
             }
         };
 
+        // Handler half of the debug split (paired with the `debug_log_requests`
+        // middleware): logs the resolved tool + projectPath — values already in
+        // hand here, so no request-body buffering is needed. Gated on
+        // `debug_enabled()`; STDERR only. The result `isError` is appended after
+        // execution below.
+        if debug_enabled() {
+            eprintln!(
+                "{}",
+                crate::roots::format_tool_debug_line(
+                    &tool_name,
+                    raw_project,
+                    Some(project_path.as_path()),
+                    self.cwd.as_deref(),
+                    self.default_project_snapshot().as_deref(),
+                )
+            );
+        }
+
         // Decision 10: open+execute+render entirely inside ONE spawn_blocking
         // closure returning an OWNED ToolResult; nothing borrows &self.
         let engines = Arc::clone(&self.engines);
+        let debug_tool = debug_enabled().then(|| tool_name.clone());
         let join = tokio::task::spawn_blocking(move || {
             execute_owned(&engines, &project_path, &tool_name, &args)
         })
@@ -383,16 +402,25 @@ impl ServerHandler for CodeGraphHandler {
 
         // Decision 9 / Q5-unwind: a panic inside the closure surfaces as a
         // JoinError; map it to an isError result so the process survives.
-        match join {
-            Ok(result) => Ok(tool_result_to_call_result(&result)),
-            Err(join_err) if join_err.is_panic() => Ok(tool_result_to_call_result(
-                &ToolResult::error("tool handler panicked"),
-            )),
-            Err(join_err) => Err(ErrorData::internal_error(
-                format!("tool task failed: {join_err}"),
-                None,
-            )),
+        let result = match join {
+            Ok(result) => result,
+            Err(join_err) if join_err.is_panic() => ToolResult::error("tool handler panicked"),
+            Err(join_err) => {
+                return Err(ErrorData::internal_error(
+                    format!("tool task failed: {join_err}"),
+                    None,
+                ));
+            }
+        };
+        // Handler-half outcome line (STDERR, debug-only): tool + isError, the
+        // per-call result the middleware envelope cannot see.
+        if let Some(tool) = debug_tool {
+            eprintln!(
+                "[codegraph debug] tool={tool} isError={}",
+                result.is_error == Some(true)
+            );
         }
+        Ok(tool_result_to_call_result(&result))
     }
 }
 
@@ -423,6 +451,39 @@ pub fn serve_stdio_rmcp(project: Option<PathBuf>) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("rmcp stdio serve join failed: {e}"))?;
         Ok::<(), anyhow::Error>(())
     })
+}
+
+/// axum middleware logging one line per HTTP request to STDERR: method, path,
+/// `Host` header, response status, and elapsed time. Attached to the
+/// streamable-HTTP router ONLY when [`debug_enabled`] is true (see
+/// [`serve_http`]), so it is a pure passthrough that never runs — and never
+/// changes output — when debug is off.
+///
+/// It deliberately does NOT read the request body: an axum `Request` body is a
+/// stream, so parsing `projectPath` / the tool name here would mean buffering
+/// the whole body and reconstructing the `Request` — added fragility for data
+/// the handler ([`CodeGraphHandler::call_tool`]) already has in hand and logs
+/// itself. Middleware = HTTP envelope; handler = tool + project + outcome.
+pub async fn debug_log_requests(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let host = req
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("-")
+        .to_string();
+    let started = std::time::Instant::now();
+    let resp = next.run(req).await;
+    eprintln!(
+        "[codegraph debug] http {method} {path} host={host} -> {} ({} ms)",
+        resp.status().as_u16(),
+        started.elapsed().as_millis(),
+    );
+    resp
 }
 
 /// Serve `CodeGraphHandler` over streamable-HTTP via rmcp's
@@ -492,6 +553,18 @@ pub fn serve_http(
             );
 
         let router = axum::Router::new().nest_service("/mcp", service);
+        // Debug logging is a two-part split, both gated on `debug_enabled()`:
+        //   - THIS middleware logs the HTTP request/response envelope
+        //     (method/path/Host/status/timing) — the connection-level view;
+        //   - `call_tool` logs the resolved tool + projectPath + isError — the
+        //     handler-level view — where those values are already in hand
+        //     (no request-body buffering in the middleware).
+        // Attached ONLY when debug is on, so debug-off output is byte-identical.
+        let router = if debug_enabled() {
+            router.layer(axum::middleware::from_fn(debug_log_requests))
+        } else {
+            router
+        };
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|e| anyhow::anyhow!("binding streamable-HTTP listener on {addr}: {e}"))?;

@@ -456,3 +456,53 @@ fn allow_any_host_env_parses_truthy_values() {
 }
 
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The per-request debug middleware must be a TRANSPARENT passthrough: it logs
+/// (side effect on STDERR) but returns `next.run(req)`'s response byte-identical
+/// — same status, same headers, same body. This unit test drives
+/// `debug_log_requests` directly (no server spawn) and asserts the status the
+/// inner handler produced survives the layer unchanged. RED before the
+/// middleware exists.
+#[test]
+fn debug_log_requests_is_transparent_passthrough() {
+    use axum::body::Body;
+    use axum::extract::Request;
+    use axum::http::StatusCode;
+    use axum::routing::post;
+    use tower::util::ServiceExt;
+
+    rt().block_on(async {
+        // A tiny inner router that returns a fixed 418 body; the middleware must
+        // pass that exact status + body through untouched.
+        let app = axum::Router::new()
+            .route(
+                "/mcp",
+                post(|| async { (StatusCode::IM_A_TEAPOT, "brewed") }),
+            )
+            .layer(axum::middleware::from_fn(
+                codegraph_mcp::rmcp_handler::debug_log_requests,
+            ));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("Host", "127.0.0.1:9")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.expect("middleware passthrough");
+        assert_eq!(
+            resp.status(),
+            StatusCode::IM_A_TEAPOT,
+            "middleware must pass the inner status through unchanged"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            &bytes[..],
+            b"brewed",
+            "middleware must pass the inner body through unchanged"
+        );
+    });
+}

@@ -51,3 +51,6 @@ rmcp = { version = "2.1", features = ["server", "client", "transport-io", "trans
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "sync", "time"] }
 # reqwest: dev-only HTTP client for the streamable-HTTP integration test.
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# tower: dev-only, provides `ServiceExt::oneshot` to unit-test the debug
+# middleware's transparent passthrough without spawning a server.
+tower = { version = "0.5", features = ["util"] }

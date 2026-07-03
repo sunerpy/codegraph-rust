@@ -391,3 +391,105 @@ fn serve_http_global_without_projectpath_returns_actionable_error() {
         "global mode without projectPath must return the actionable resolve error: {resp}"
     );
 }
+
+/// Spawn `serve --http --path <indexed>` with `CODEGRAPH_DEBUG` set to `debug`
+/// and stderr redirected to `err_path` (a file, so the still-running child does
+/// not block a piped read). Returns the child handle.
+fn spawn_pinned_server_stderr_to(
+    indexed: &Path,
+    addr: &str,
+    debug: Option<&str>,
+    err_path: &Path,
+) -> std::process::Child {
+    let err_file = std::fs::File::create(err_path).expect("create stderr capture file");
+    let mut cmd = Command::new(bin());
+    cmd.args([
+        "serve",
+        "--http",
+        "--path",
+        indexed.to_str().unwrap(),
+        "--http-addr",
+        addr,
+    ])
+    .env("CODEGRAPH_NO_DAEMON", "1")
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::from(err_file));
+    match debug {
+        Some(v) => {
+            cmd.env("CODEGRAPH_DEBUG", v);
+        }
+        None => {
+            cmd.env_remove("CODEGRAPH_DEBUG");
+        }
+    }
+    cmd.spawn().expect("spawn serve --http (stderr capture)")
+}
+
+/// (6) DEBUG ON: with `CODEGRAPH_DEBUG=1`, each POST to `/mcp` logs a per-request
+/// line `[codegraph debug] http POST /mcp host=... -> <status> (<n> ms)` on
+/// STDERR, and a `tools/call` logs a handler line naming the tool +
+/// resolved projectPath. STDOUT stays pure protocol (the JSON-RPC responses come
+/// back over the socket, not stdout — asserted by (1)). RED before the middleware
+/// + handler debug line exist.
+#[test]
+fn serve_http_debug_on_logs_per_request_lines_to_stderr() {
+    let home = TestDir::new("dbg-on");
+    let indexed = indexed_project(&home);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let err_path = home.path().join("dbg-on.err");
+
+    let mut child = spawn_pinned_server_stderr_to(&indexed, &addr, Some("1"), &err_path);
+    let reachable = wait_reachable(&addr);
+    // Drive a tools/call so the handler debug line also fires.
+    let _ = call_search(&addr, "McpServer", None);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
+
+    assert!(reachable, "serve --http (debug on) must start");
+    assert!(
+        stderr.contains("[codegraph debug] http POST /mcp"),
+        "debug-on stderr must contain the per-request middleware line: {stderr}"
+    );
+    assert!(
+        stderr.contains("[codegraph debug] tool=codegraph_search"),
+        "debug-on stderr must contain the handler tool line naming the tool: {stderr}"
+    );
+}
+
+/// (7) DEBUG OFF: with `CODEGRAPH_DEBUG` unset, NO per-request lines appear on
+/// STDERR (byte-identical to the pre-feature behavior — only the one startup
+/// line). Guards the "off by default, zero new output" contract.
+#[test]
+fn serve_http_debug_off_emits_no_per_request_lines() {
+    let home = TestDir::new("dbg-off");
+    let indexed = indexed_project(&home);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let err_path = home.path().join("dbg-off.err");
+
+    let mut child = spawn_pinned_server_stderr_to(&indexed, &addr, None, &err_path);
+    let reachable = wait_reachable(&addr);
+    let _ = call_search(&addr, "McpServer", None);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
+
+    assert!(reachable, "serve --http (debug off) must start");
+    assert!(
+        !stderr.contains("[codegraph debug] http"),
+        "debug-off stderr must NOT contain any per-request middleware line: {stderr}"
+    );
+    assert!(
+        !stderr.contains("[codegraph debug] tool="),
+        "debug-off stderr must NOT contain any handler tool line: {stderr}"
+    );
+}
