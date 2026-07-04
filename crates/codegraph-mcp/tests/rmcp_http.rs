@@ -26,24 +26,26 @@ use std::time::Duration;
 use parity::setup_mini_project;
 use serde_json::{Value, json};
 
+use codegraph_mcp::rmcp_handler::HostGuard;
+
 /// Spawn the `StreamableHttpService` for the mini fixture on an ephemeral port,
 /// returning the bound base URL (`http://127.0.0.1:PORT/mcp`) plus a guard whose
-/// drop cancels the server. Runs inside the caller's tokio runtime.
+/// drop cancels the server. Runs inside the caller's tokio runtime. Uses the
+/// OPEN default guard (mirrors a no-env production launch).
 async fn spawn_http_server(
     project: std::path::PathBuf,
 ) -> (String, SocketAddr, tokio_util::sync::CancellationToken) {
-    spawn_http_server_cfg(project, false).await
+    spawn_http_server_cfg(project, HostGuard::AllowAny).await
 }
 
 /// Builds the config through the production `build_http_config` path so the
 /// guard under test is the real one; returns the bound `SocketAddr` so callers
-/// can craft explicit `Host:` headers. `allow_any_host` toggles the
-/// `CODEGRAPH_HTTP_ALLOW_ANY_HOST` escape hatch.
+/// can craft explicit `Host:` headers.
 async fn spawn_http_server_cfg(
     project: std::path::PathBuf,
-    allow_any_host: bool,
+    guard: HostGuard,
 ) -> (String, SocketAddr, tokio_util::sync::CancellationToken) {
-    spawn_http_server_declared(project, allow_any_host, None).await
+    spawn_http_server_declared(project, guard, None).await
 }
 
 /// Binds an ephemeral loopback listener but builds the host-guard from a
@@ -51,10 +53,10 @@ async fn spawn_http_server_cfg(
 /// `declared` addr reproduces the production case where the bind is
 /// `0.0.0.0`/a real interface: the bare loopback defaults do NOT cover a
 /// `Host: <declared>` authority, so the guard must have learned it from the
-/// bind address — exactly what `build_http_config` adds.
+/// bind address — exactly what `build_http_config` adds under `Strict`.
 async fn spawn_http_server_declared(
     project: std::path::PathBuf,
-    allow_any_host: bool,
+    guard: HostGuard,
     declared: Option<SocketAddr>,
 ) -> (String, SocketAddr, tokio_util::sync::CancellationToken) {
     use rmcp::transport::streamable_http_server::StreamableHttpService;
@@ -65,7 +67,7 @@ async fn spawn_http_server_declared(
     let guard_addr = declared.unwrap_or(addr);
 
     let ct = tokio_util::sync::CancellationToken::new();
-    let config = codegraph_mcp::rmcp_handler::build_http_config(guard_addr, allow_any_host)
+    let config = codegraph_mcp::rmcp_handler::build_http_config(guard_addr, guard)
         .with_cancellation_token(ct.child_token());
 
     let service: StreamableHttpService<
@@ -353,33 +355,120 @@ fn http_explicit_host_localhost_port_is_allowed() {
     });
 }
 
-/// With the guard on (default), an arbitrary non-loopback `Host` must still be
-/// rejected with 403 — DNS-rebinding protection stays intact.
+/// NEW DEFAULT: the host guard is OPEN. With no env / `HostGuard::AllowAny`, an
+/// arbitrary non-loopback `Host` (e.g. the MCP Inspector's `code-server:12025`
+/// or `evil.example.com`) must be ACCEPTED — 200, not 403. This is the reversal
+/// of the previous strict default: strictness is now opt-in via
+/// `CODEGRAPH_HTTP_ALLOWED_HOSTS` (see the strict-mode tests below).
 #[test]
-fn http_arbitrary_host_is_forbidden_by_default() {
+fn http_arbitrary_host_allowed_by_default() {
     rt().block_on(async {
         let project = setup_mini_project();
         let (url, _addr, ct) = spawn_http_server(project.path().to_path_buf()).await;
         let client = reqwest::Client::new();
 
         let resp = post_json_with_host(&client, &url, "evil.example.com", initialize_body()).await;
+        let status = resp.status();
+        let text = resp.text().await.expect("body");
         assert_eq!(
-            resp.status(),
-            403,
-            "an arbitrary Host must be rejected while the guard is on"
+            status, 200,
+            "OPEN default must accept an arbitrary Host (got {status}): {text}"
         );
 
         ct.cancel();
     });
 }
 
-/// With the escape hatch enabled, the guard is disabled and even an arbitrary
+/// STRICT opt-in: with `HostGuard::Strict` and no extra hosts, an arbitrary
+/// non-loopback `Host` is rejected with 403 — DNS-rebinding protection is intact
+/// once opted in — while a loopback `Host` matching the bind authority is 200.
+#[test]
+fn http_strict_mode_rejects_unlisted_host() {
+    rt().block_on(async {
+        let project = setup_mini_project();
+        let (url, addr, ct) =
+            spawn_http_server_cfg(project.path().to_path_buf(), HostGuard::Strict(vec![])).await;
+        let client = reqwest::Client::new();
+
+        let evil = post_json_with_host(&client, &url, "evil.example.com", initialize_body()).await;
+        assert_eq!(
+            evil.status(),
+            403,
+            "strict mode must reject an unlisted arbitrary Host"
+        );
+
+        let host = format!("127.0.0.1:{}", addr.port());
+        let ok = post_json_with_host(&client, &url, &host, initialize_body()).await;
+        assert_eq!(
+            ok.status(),
+            200,
+            "strict mode must still accept the loopback bind authority"
+        );
+
+        ct.cancel();
+    });
+}
+
+/// THE user's scenario: a strict allowlist carrying `code-server:12025` accepts
+/// `Host: code-server:12025` (200) while still rejecting an unlisted host (403).
+#[test]
+fn http_allowed_hosts_list_accepts_listed_host() {
+    rt().block_on(async {
+        let project = setup_mini_project();
+        let guard = HostGuard::Strict(vec!["code-server:12025".to_string()]);
+        let (url, _addr, ct) = spawn_http_server_cfg(project.path().to_path_buf(), guard).await;
+        let client = reqwest::Client::new();
+
+        let listed =
+            post_json_with_host(&client, &url, "code-server:12025", initialize_body()).await;
+        let status = listed.status();
+        let text = listed.text().await.expect("body");
+        assert_eq!(
+            status, 200,
+            "a listed Host: code-server:12025 must be accepted (got {status}): {text}"
+        );
+
+        let evil = post_json_with_host(&client, &url, "evil.example.com", initialize_body()).await;
+        assert_eq!(
+            evil.status(),
+            403,
+            "an unlisted Host must still be rejected under a concrete allowlist"
+        );
+
+        ct.cancel();
+    });
+}
+
+/// A `*` entry parses to `HostGuard::AllowAny`, so any `Host` is accepted (200).
+#[test]
+fn http_allowed_hosts_star_allows_any() {
+    rt().block_on(async {
+        let project = setup_mini_project();
+        let guard = codegraph_mcp::rmcp_handler::parse_allowed_hosts(Some("a,*,b"));
+        assert_eq!(guard, HostGuard::AllowAny, "'a,*,b' must parse to AllowAny");
+        let (url, _addr, ct) = spawn_http_server_cfg(project.path().to_path_buf(), guard).await;
+        let client = reqwest::Client::new();
+
+        let resp = post_json_with_host(&client, &url, "evil.example.com", initialize_body()).await;
+        let status = resp.status();
+        let text = resp.text().await.expect("body");
+        assert_eq!(
+            status, 200,
+            "a '*' allowlist must accept an arbitrary Host (got {status}): {text}"
+        );
+
+        ct.cancel();
+    });
+}
+
+/// With the escape hatch enabled (mapped to `AllowAny`), even an arbitrary
 /// `Host` is accepted (for users fronting the server with their own proxy/auth).
 #[test]
 fn http_allow_any_host_env_disables_guard() {
     rt().block_on(async {
         let project = setup_mini_project();
-        let (url, _addr, ct) = spawn_http_server_cfg(project.path().to_path_buf(), true).await;
+        let (url, _addr, ct) =
+            spawn_http_server_cfg(project.path().to_path_buf(), HostGuard::AllowAny).await;
         let client = reqwest::Client::new();
 
         let resp = post_json_with_host(&client, &url, "evil.example.com", initialize_body()).await;
@@ -394,18 +483,22 @@ fn http_allow_any_host_env_disables_guard() {
     });
 }
 
-/// The genuine 403 reproduction: a non-loopback bind (`0.0.0.0:<port>`, the
-/// "serve for a remote client behind SSH-forward/proxy" case). The bare
+/// The genuine non-loopback bind reproduction (`0.0.0.0:<port>`, the "serve for a
+/// remote client behind SSH-forward/proxy" case) under STRICT mode. The bare
 /// loopback defaults do NOT cover `Host: 0.0.0.0:<port>`, so without the bind
 /// address in the allowlist this is a 403. `build_http_config` adds
-/// `addr.to_string()`, so the exact bind authority is accepted.
+/// `addr.to_string()` to the strict defaults, so the exact bind authority is 200.
 #[test]
 fn http_non_loopback_bind_authority_is_allowed() {
     rt().block_on(async {
         let project = setup_mini_project();
         let declared: SocketAddr = "0.0.0.0:12026".parse().unwrap();
-        let (url, _addr, ct) =
-            spawn_http_server_declared(project.path().to_path_buf(), false, Some(declared)).await;
+        let (url, _addr, ct) = spawn_http_server_declared(
+            project.path().to_path_buf(),
+            HostGuard::Strict(vec![]),
+            Some(declared),
+        )
+        .await;
         let client = reqwest::Client::new();
 
         let resp = post_json_with_host(&client, &url, "0.0.0.0:12026", initialize_body()).await;
@@ -418,6 +511,40 @@ fn http_non_loopback_bind_authority_is_allowed() {
 
         ct.cancel();
     });
+}
+
+/// Unit tests for the pure `parse_allowed_hosts` — kept env-free to avoid the
+/// process-global env-race flakiness. Covers every branch of the parsing rules.
+#[test]
+fn parse_allowed_hosts_covers_all_branches() {
+    use codegraph_mcp::rmcp_handler::parse_allowed_hosts;
+
+    assert_eq!(parse_allowed_hosts(None), HostGuard::AllowAny, "unset");
+    assert_eq!(parse_allowed_hosts(Some("")), HostGuard::AllowAny, "empty");
+    assert_eq!(
+        parse_allowed_hosts(Some("   ")),
+        HostGuard::AllowAny,
+        "whitespace-only"
+    );
+    assert_eq!(parse_allowed_hosts(Some("*")), HostGuard::AllowAny, "star");
+    assert_eq!(
+        parse_allowed_hosts(Some("a,*,b")),
+        HostGuard::AllowAny,
+        "any '*' entry wins"
+    );
+    assert_eq!(
+        parse_allowed_hosts(Some("localhost,code-server:12025")),
+        HostGuard::Strict(vec![
+            "localhost".to_string(),
+            "code-server:12025".to_string()
+        ]),
+        "concrete list"
+    );
+    assert_eq!(
+        parse_allowed_hosts(Some(" a , b ")),
+        HostGuard::Strict(vec!["a".to_string(), "b".to_string()]),
+        "entries are trimmed and empties dropped"
+    );
 }
 
 #[test]

@@ -26,6 +26,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
@@ -47,8 +48,58 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Test-only tool name that forces the `spawn_blocking` closure to panic, so
 /// the Q5-unwind panic→error mapping can be exercised (see `tests/rmcp_l3.rs`).
-#[cfg(test)]
+/// Gated on the `test-hooks` feature (auto-enabled for this crate's dev/test
+/// builds) because `cfg!(test)` is false in the lib when linked by an
+/// integration-test binary.
+#[cfg(feature = "test-hooks")]
 const PANIC_TOOL: &str = "__panic__";
+
+/// Test-only tool name whose `spawn_blocking` closure SLEEPS well past any sane
+/// per-call timeout, so the [`tokio::time::timeout`] wrapper in `call_tool` can
+/// be exercised (see `tests/rmcp_l3.rs`). The blocking sleep intentionally
+/// out-lives the timeout so the client-side `Elapsed` path fires first.
+#[cfg(feature = "test-hooks")]
+const SLEEP_TOOL: &str = "__sleep__";
+
+/// Environment variable naming the per-tool-call wall-clock timeout, in whole
+/// seconds. See [`parse_tool_timeout`] for the parse contract and
+/// [`tool_timeout`] for the effective value.
+pub const TOOL_TIMEOUT_ENV: &str = "CODEGRAPH_MCP_TOOL_TIMEOUT_SECS";
+
+/// Default per-tool-call timeout when [`TOOL_TIMEOUT_ENV`] is unset or invalid.
+/// 60s is generous — `explore` on a large repo can legitimately take a few
+/// seconds — while still bounding the 2h+ wedged-call pathology.
+const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 60;
+
+/// Parse a raw [`TOOL_TIMEOUT_ENV`] value into an optional timeout. Kept pure
+/// (no env access) so it is unit-tested without env-race flakiness.
+///
+/// - `Some("0")` (after trimming) => `None`: the explicit opt-out escape hatch,
+///   meaning NO timeout (unbounded, the pre-fix behavior for users who want it);
+/// - `Some(n)` for a valid `u64` `n > 0` => `Some(Duration::from_secs(n))`;
+/// - `None`, empty, whitespace-only, or unparseable => the
+///   [`DEFAULT_TOOL_TIMEOUT_SECS`] default (a timeout, never unbounded on a typo).
+///
+/// The asymmetry is deliberate: unbounded is opt-in ONLY via a literal `0`, so
+/// a fat-fingered value degrades to the safe bounded default rather than hanging.
+pub fn parse_tool_timeout(raw: Option<&str>) -> Option<Duration> {
+    let default = Some(Duration::from_secs(DEFAULT_TOOL_TIMEOUT_SECS));
+    let Some(raw) = raw else {
+        return default;
+    };
+    let trimmed = raw.trim();
+    match trimmed.parse::<u64>() {
+        Ok(0) => None,
+        Ok(secs) => Some(Duration::from_secs(secs)),
+        Err(_) => default,
+    }
+}
+
+/// Effective per-tool-call timeout, read from [`TOOL_TIMEOUT_ENV`] via
+/// [`parse_tool_timeout`]. `None` means unbounded (the `0` opt-out).
+fn tool_timeout() -> Option<Duration> {
+    parse_tool_timeout(std::env::var(TOOL_TIMEOUT_ENV).ok().as_deref())
+}
 
 type EngineCache = Arc<Mutex<HashMap<PathBuf, CodeGraphEngine>>>;
 
@@ -250,9 +301,16 @@ fn execute_owned(
     tool_name: &str,
     args: &Value,
 ) -> ToolResult {
-    #[cfg(test)]
+    #[cfg(feature = "test-hooks")]
     if tool_name == PANIC_TOOL {
         panic!("simulated tool handler panic (Q5-unwind test)");
+    }
+
+    #[cfg(feature = "test-hooks")]
+    if tool_name == SLEEP_TOOL {
+        let secs = args.get("seconds").and_then(Value::as_u64).unwrap_or(30);
+        std::thread::sleep(Duration::from_secs(secs));
+        return ToolResult::text(format!("slept {secs}s"));
     }
 
     let mut guard = engines
@@ -346,7 +404,9 @@ impl ServerHandler for CodeGraphHandler {
 
         // Unknown tool → JSON-RPC -32602 (keep our own lookup so rmcp's built-in
         // -32601 method-not-found never fires); `__panic__` is test-only-known.
-        let known = schemas::is_known_tool(&tool_name) || (cfg!(test) && tool_name == "__panic__");
+        let known = schemas::is_known_tool(&tool_name)
+            || (cfg!(feature = "test-hooks")
+                && matches!(tool_name.as_str(), "__panic__" | "__sleep__"));
         if !known {
             return Err(ErrorData::invalid_params(
                 format!("Unknown tool: {tool_name}"),
@@ -393,12 +453,41 @@ impl ServerHandler for CodeGraphHandler {
 
         // Decision 10: open+execute+render entirely inside ONE spawn_blocking
         // closure returning an OWNED ToolResult; nothing borrows &self.
+        //
+        // Per-request timeout (Kiro 2h-hang fix): the JoinHandle is a Future, so
+        // `tokio::time::timeout` bounds how long the CLIENT waits for it. CAVEAT:
+        // an elapsed timeout does NOT kill the blocking OS thread — the closure
+        // keeps running on the blocking pool until it finishes and its result is
+        // dropped. That is intentional: we bound the client wait, not the CPU
+        // work; interrupting sync SQLite mid-read is unsafe. The client is
+        // unblocked fast with an isError result; the orphaned thread drains
+        // on its own. `tool_timeout() == None` (env `0`) opts out entirely.
         let engines = Arc::clone(&self.engines);
         let debug_tool = debug_enabled().then(|| tool_name.clone());
-        let join = tokio::task::spawn_blocking(move || {
+        let join_future = tokio::task::spawn_blocking(move || {
             execute_owned(&engines, &project_path, &tool_name, &args)
-        })
-        .await;
+        });
+
+        let timed_out;
+        let join = match tool_timeout() {
+            Some(dur) => match tokio::time::timeout(dur, join_future).await {
+                Ok(join_result) => {
+                    timed_out = false;
+                    join_result
+                }
+                Err(_elapsed) => {
+                    timed_out = true;
+                    Ok(ToolResult::error(format!(
+                        "tool call timed out after {}s (raise {TOOL_TIMEOUT_ENV} or narrow the query)",
+                        dur.as_secs()
+                    )))
+                }
+            },
+            None => {
+                timed_out = false;
+                join_future.await
+            }
+        };
 
         // Decision 9 / Q5-unwind: a panic inside the closure surfaces as a
         // JoinError; map it to an isError result so the process survives.
@@ -416,8 +505,9 @@ impl ServerHandler for CodeGraphHandler {
         // per-call result the middleware envelope cannot see.
         if let Some(tool) = debug_tool {
             eprintln!(
-                "[codegraph debug] tool={tool} isError={}",
-                result.is_error == Some(true)
+                "[codegraph debug] tool={tool} isError={}{}",
+                result.is_error == Some(true),
+                if timed_out { " (timed out)" } else { "" }
             );
         }
         Ok(tool_result_to_call_result(&result))
@@ -507,15 +597,25 @@ pub async fn debug_log_requests(
 ///
 /// # DNS-rebinding host guard
 ///
-/// rmcp's [`StreamableHttpServerConfig`] enforces a bare-host allowlist
-/// (`localhost`, `127.0.0.1`, `::1`) so a malicious webpage cannot rebind DNS to
-/// reach this server. The allowlist is rebuilt here from the actual bind `addr`
-/// so a local client (MCP Inspector, curl, Zed) that sends the exact
-/// `Host: <bind>:<port>` authority is accepted while the guard stays on for
-/// arbitrary hosts. Set `CODEGRAPH_HTTP_ALLOW_ANY_HOST=1` to disable the guard
-/// entirely when fronting the server with your own reverse proxy/auth (e.g. a
-/// non-loopback bind reached through SSH-forward), where the client `Host` may
-/// be anything.
+/// The host guard is **OPEN by default** — with no environment set, any `Host`
+/// header is accepted, so the MCP Inspector (`Host: code-server:12025`), Zed,
+/// and curl all connect out of the box. Strictness is **opt-in** via a single
+/// env var [`ALLOWED_HOSTS_ENV`] (`CODEGRAPH_HTTP_ALLOWED_HOSTS`):
+///
+/// - unset / empty / whitespace  => allow ALL hosts (same as `*`);
+/// - a comma list containing a `*` entry => allow ALL hosts;
+/// - a comma list of concrete hosts (e.g. `localhost,code-server:12025`) =>
+///   STRICT: rmcp's [`StreamableHttpServerConfig`] enforces an allowlist built
+///   from the loopback defaults (`localhost`, `127.0.0.1`, `::1`) PLUS the
+///   actual bind authority PLUS the listed hosts; every other `Host` => 403.
+///
+/// The strict allowlist reuses the actual bind `addr`, so a local client that
+/// sends the exact `Host: <bind>:<port>` authority is accepted while arbitrary
+/// hosts are rejected — DNS-rebinding protection when you ask for it.
+///
+/// Back-compat: the legacy [`ALLOW_ANY_HOST_ENV`] (`CODEGRAPH_HTTP_ALLOW_ANY_HOST`)
+/// is still honored but now only matters as a lower-precedence signal — see
+/// [`host_guard_from_env`]. With nothing set at all the guard is OPEN.
 pub fn serve_http(
     default_project: Option<PathBuf>,
     addr: std::net::SocketAddr,
@@ -544,12 +644,23 @@ pub fn serve_http(
             }
         }
 
+        let guard = host_guard_from_env();
+        match &guard {
+            HostGuard::AllowAny => eprintln!(
+                "[CodeGraph MCP] host guard: OPEN (all hosts) — set {ALLOWED_HOSTS_ENV}=localhost,<host> to restrict",
+            ),
+            HostGuard::Strict(hosts) => eprintln!(
+                "[CodeGraph MCP] host guard: strict (allowed: {})",
+                hosts.join(", "),
+            ),
+        }
+
         let handler_default = default_project.clone();
         let service: StreamableHttpService<CodeGraphHandler, LocalSessionManager> =
             StreamableHttpService::new(
                 move || Ok(CodeGraphHandler::new(handler_default.clone())),
                 Arc::new(LocalSessionManager::default()),
-                build_http_config(addr, http_allow_any_host_from_env()),
+                build_http_config(addr, guard),
             );
 
         let router = axum::Router::new().nest_service("/mcp", service);
@@ -575,11 +686,48 @@ pub fn serve_http(
     })
 }
 
-/// Environment name for the opt-in host-guard escape hatch.
+/// Legacy environment name for the host-guard escape hatch. Retained for
+/// back-compat and now a lower-precedence signal behind [`ALLOWED_HOSTS_ENV`].
 pub const ALLOW_ANY_HOST_ENV: &str = "CODEGRAPH_HTTP_ALLOW_ANY_HOST";
 
+/// Environment name for the opt-in host allowlist. Unset/empty (or a value
+/// containing a `*`) leaves the guard OPEN; a concrete comma list turns it strict.
+pub const ALLOWED_HOSTS_ENV: &str = "CODEGRAPH_HTTP_ALLOWED_HOSTS";
+
+/// Host-guard policy resolved from the environment.
+///
+/// `AllowAny` accepts any `Host`; `Strict` restricts to the loopback + bind
+/// defaults plus the carried hosts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostGuard {
+    AllowAny,
+    Strict(Vec<String>),
+}
+
+/// Parse a raw [`ALLOWED_HOSTS_ENV`] value into a [`HostGuard`]. Kept pure (no
+/// env access) so parsing is unit-tested without env-race flakiness.
+///
+/// - `None`, empty, or whitespace-only => [`HostGuard::AllowAny`];
+/// - a comma list with ANY trimmed entry equal to `*` => [`HostGuard::AllowAny`];
+/// - otherwise => [`HostGuard::Strict`] carrying the trimmed, non-empty entries.
+pub fn parse_allowed_hosts(raw: Option<&str>) -> HostGuard {
+    let Some(raw) = raw else {
+        return HostGuard::AllowAny;
+    };
+    let entries: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
+        .collect();
+    if entries.is_empty() || entries.iter().any(|entry| entry == "*") {
+        return HostGuard::AllowAny;
+    }
+    HostGuard::Strict(entries)
+}
+
 /// Read the [`ALLOW_ANY_HOST_ENV`] escape hatch. `1`/`true`/`yes`/`on`
-/// (case-insensitive) enable it; anything else (including unset) keeps the guard.
+/// (case-insensitive) resolve to `true`; anything else (including unset) `false`.
 pub fn http_allow_any_host_from_env() -> bool {
     matches!(
         std::env::var(ALLOW_ANY_HOST_ENV)
@@ -591,17 +739,31 @@ pub fn http_allow_any_host_from_env() -> bool {
     )
 }
 
+/// Resolve the effective [`HostGuard`] from the environment. Precedence:
+/// [`ALLOWED_HOSTS_ENV`], when set and non-empty, wins via [`parse_allowed_hosts`].
+/// Otherwise the guard is OPEN — which subsumes the legacy [`ALLOW_ANY_HOST_ENV`]
+/// escape hatch (its only effect was `AllowAny`, now the default), so existing
+/// `CODEGRAPH_HTTP_ALLOW_ANY_HOST=1` users keep the open behavior they had.
+pub fn host_guard_from_env() -> HostGuard {
+    let allowed = std::env::var(ALLOWED_HOSTS_ENV).ok();
+    let raw = allowed.as_deref().map(str::trim).filter(|v| !v.is_empty());
+    match raw {
+        Some(value) => parse_allowed_hosts(Some(value)),
+        None => HostGuard::AllowAny,
+    }
+}
+
 /// Build the streamable-HTTP config for [`serve_http`], centralizing the
 /// `allowed_hosts` DNS-rebinding guard so tests exercise the exact production
 /// list. rmcp compares each entry as a normalized authority: a bare host matches
 /// any port, a `host:port` entry matches that port exactly (IPv6 brackets/case
-/// are normalized away). The list therefore includes both the bare loopback
-/// hosts and the explicit `host:port` authorities for the actual bind `addr` so
-/// `Host: <bind>:<port>` (what the MCP Inspector / curl / Zed send) is accepted.
-/// When `allow_any_host` is set the guard is disabled entirely.
+/// are normalized away). A [`HostGuard::Strict`] list therefore includes the bare
+/// loopback hosts, the explicit `host:port` authorities for the actual bind
+/// `addr`, and the user-listed hosts verbatim so `Host: <bind>:<port>` and each
+/// listed host are accepted. [`HostGuard::AllowAny`] disables the guard entirely.
 pub fn build_http_config(
     addr: std::net::SocketAddr,
-    allow_any_host: bool,
+    guard: HostGuard,
 ) -> rmcp::transport::streamable_http_server::StreamableHttpServerConfig {
     use rmcp::transport::streamable_http_server::StreamableHttpServerConfig;
 
@@ -610,12 +772,13 @@ pub fn build_http_config(
         .with_json_response(true)
         .with_sse_keep_alive(None);
 
-    if allow_any_host {
-        return base.disable_allowed_hosts();
-    }
+    let extra = match guard {
+        HostGuard::AllowAny => return base.disable_allowed_hosts(),
+        HostGuard::Strict(extra) => extra,
+    };
 
     let port = addr.port();
-    base.with_allowed_hosts([
+    let defaults = [
         addr.to_string(),
         format!("localhost:{port}"),
         format!("127.0.0.1:{port}"),
@@ -623,5 +786,50 @@ pub fn build_http_config(
         "localhost".to_string(),
         "127.0.0.1".to_string(),
         "::1".to_string(),
-    ])
+    ];
+    base.with_allowed_hosts(defaults.into_iter().chain(extra))
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::{DEFAULT_TOOL_TIMEOUT_SECS, parse_tool_timeout};
+    use std::time::Duration;
+
+    #[test]
+    fn unset_yields_default() {
+        assert_eq!(
+            parse_tool_timeout(None),
+            Some(Duration::from_secs(DEFAULT_TOOL_TIMEOUT_SECS))
+        );
+    }
+
+    #[test]
+    fn empty_and_whitespace_yield_default() {
+        let default = Some(Duration::from_secs(DEFAULT_TOOL_TIMEOUT_SECS));
+        assert_eq!(parse_tool_timeout(Some("")), default);
+        assert_eq!(parse_tool_timeout(Some("   ")), default);
+    }
+
+    #[test]
+    fn zero_opts_out_of_timeout() {
+        assert_eq!(parse_tool_timeout(Some("0")), None);
+        assert_eq!(parse_tool_timeout(Some("  0  ")), None);
+    }
+
+    #[test]
+    fn positive_secs_parse() {
+        assert_eq!(parse_tool_timeout(Some("5")), Some(Duration::from_secs(5)));
+        assert_eq!(
+            parse_tool_timeout(Some(" 120 ")),
+            Some(Duration::from_secs(120))
+        );
+    }
+
+    #[test]
+    fn invalid_falls_back_to_default() {
+        let default = Some(Duration::from_secs(DEFAULT_TOOL_TIMEOUT_SECS));
+        assert_eq!(parse_tool_timeout(Some("abc")), default);
+        assert_eq!(parse_tool_timeout(Some("-1")), default);
+        assert_eq!(parse_tool_timeout(Some("3.5")), default);
+    }
 }

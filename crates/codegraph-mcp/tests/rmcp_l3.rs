@@ -225,3 +225,123 @@ fn tools_list_no_indexed_default_marks_project_path_required() {
 fn workspace_root_exists() {
     assert!(workspace_root().join("reference/golden/mcp").is_dir());
 }
+
+/// Serializes the two tests that mutate the process-global
+/// `CODEGRAPH_MCP_TOOL_TIMEOUT_SECS`, so a value set by one never bleeds into
+/// the other under nextest's in-process parallelism.
+static TIMEOUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// (f) Per-request timeout: a tool whose engine work SLEEPS past the configured
+/// timeout returns an `isError` "timed out" result QUICKLY (not hanging), AND
+/// the runtime survives to serve the next call. RED before the fix: the slow
+/// call has no wall-clock bound and hangs. GREEN: bounded by ~the timeout.
+#[test]
+fn slow_tool_times_out_and_runtime_survives() {
+    let _env = TIMEOUT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    rt().block_on(async {
+        // Given: a 1s per-call timeout and a __sleep__ tool that sleeps 10s.
+        unsafe {
+            std::env::set_var("CODEGRAPH_MCP_TOOL_TIMEOUT_SECS", "1");
+        }
+        let project = setup_mini_project();
+        let handler = CodeGraphHandler::new(Some(project.path().to_path_buf()));
+        let (client, task) = connect(handler).await;
+
+        // When: the slow tool is called, bounded by the overall test await.
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            client.call_tool(call(
+                "__sleep__",
+                json!({ "seconds": 10 }).as_object().cloned(),
+            )),
+        )
+        .await
+        .expect("slow call must return within the client bound, not hang");
+        let elapsed = started.elapsed();
+
+        // Then: it returned an isError "timed out" result well under the sleep.
+        let tool_result = result.expect("timed-out call returns a result, not a transport error");
+        assert_eq!(
+            tool_result.is_error,
+            Some(true),
+            "a timed-out tool must return an isError result"
+        );
+        let text: String = tool_result
+            .content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect();
+        assert!(
+            text.contains("timed out"),
+            "timeout result must say 'timed out', got: {text}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "timeout must fire near the 1s bound, took {elapsed:?}"
+        );
+
+        // Then: the runtime survived — a normal call still works.
+        let ok = client
+            .call_tool(call(
+                "codegraph_search",
+                json!({ "query": "add" }).as_object().cloned(),
+            ))
+            .await
+            .expect("post-timeout call must succeed (runtime alive)");
+        assert_ne!(
+            ok.is_error,
+            Some(true),
+            "post-timeout search must not error"
+        );
+
+        let _ = client.cancel().await;
+        let _ = task.await;
+        unsafe {
+            std::env::remove_var("CODEGRAPH_MCP_TOOL_TIMEOUT_SECS");
+        }
+    });
+}
+
+/// (g) Regression: a NORMAL fast tool call still returns its real result
+/// (isError=false) with a low timeout configured — the timeout never interferes
+/// with sub-second work.
+#[test]
+fn fast_tool_call_unaffected_by_timeout() {
+    let _env = TIMEOUT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    rt().block_on(async {
+        // Given: a 5s timeout — generous for a mini-project search.
+        unsafe {
+            std::env::set_var("CODEGRAPH_MCP_TOOL_TIMEOUT_SECS", "5");
+        }
+        let project = setup_mini_project();
+        let handler = CodeGraphHandler::new(Some(project.path().to_path_buf()));
+        let (client, task) = connect(handler).await;
+
+        // When: a normal fast search runs.
+        let ok = client
+            .call_tool(call(
+                "codegraph_search",
+                json!({ "query": "add" }).as_object().cloned(),
+            ))
+            .await
+            .expect("fast call succeeds");
+
+        // Then: it returns its real (non-error) result.
+        assert_ne!(
+            ok.is_error,
+            Some(true),
+            "fast call must not be flagged isError by the timeout"
+        );
+
+        let _ = client.cancel().await;
+        let _ = task.await;
+        unsafe {
+            std::env::remove_var("CODEGRAPH_MCP_TOOL_TIMEOUT_SECS");
+        }
+    });
+}
