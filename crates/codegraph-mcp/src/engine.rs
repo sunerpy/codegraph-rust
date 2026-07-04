@@ -811,13 +811,22 @@ impl CodeGraphEngine {
                 } else {
                     1
                 };
+                // Clamp stored symbol lines into `[1, total_lines]`: a stale
+                // index can hold a node whose `end_line`/`start_line` is past
+                // the current file's EOF (the file shrank since it was
+                // indexed). Clamping keeps downstream span math and slice
+                // bounds valid so a stale index degrades instead of panicking.
+                let start = (n.start_line as usize).clamp(1, total_lines);
+                let end = (n.end_line as usize).clamp(start, total_lines);
                 ClusterRange {
-                    start: n.start_line as usize,
-                    end: n.end_line as usize,
+                    start,
+                    end,
                     label: format!("{}({})", n.name, n.kind.as_str()),
                     importance,
                 }
             })
+            // Drop ranges whose start is past EOF (a fully-stale node).
+            .filter(|r| r.start <= total_lines)
             .collect();
         ranges.sort_by_key(|r| r.start);
 
@@ -843,8 +852,14 @@ impl CodeGraphEngine {
         const CONTEXT_PADDING: usize = 3;
         const GAP_MARKER: &str = "\n\n... (gap) ...\n\n";
         let build_section = |c: &Cluster| -> String {
-            let start_idx = c.start.saturating_sub(1).saturating_sub(CONTEXT_PADDING);
             let end_idx = (c.end + CONTEXT_PADDING).min(total_lines);
+            // `.min(end_idx)` guards the slice start: even if a cluster's start
+            // slipped past EOF, `start_idx <= end_idx` keeps the range valid.
+            let start_idx = c
+                .start
+                .saturating_sub(1)
+                .saturating_sub(CONTEXT_PADDING)
+                .min(end_idx);
             let slice = &file_lines[start_idx..end_idx];
             number_source_lines_at(slice, start_idx + 1)
         };
@@ -1545,6 +1560,10 @@ impl CodeGraphEngine {
         if start_idx >= lines.len() {
             return Ok(None);
         }
+        // `.min(end_idx)` keeps `start_idx <= end_idx` when a stale index holds
+        // a node whose `end_line` < `start_line`, so the slice range stays valid
+        // (no-op on the healthy path). Mirrors Fix C's `build_section` clamp.
+        let start_idx = start_idx.min(end_idx);
         Ok(Some(lines[start_idx..end_idx].join("\n")))
     }
 }
@@ -2411,5 +2430,177 @@ fn require_string(args: &Value, field: &str) -> Result<String, String> {
     match args.get(field).and_then(Value::as_str) {
         Some(s) if !s.is_empty() => Ok(s.to_string()),
         _ => Err(format!("{field} must be a non-empty string")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codegraph_core::types::Language;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEMP_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    fn test_engine() -> CodeGraphEngine {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!("cg-mcp-engine-{}-{seq}", std::process::id()));
+        let db = base.join(".codegraph").join("codegraph.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let store = Store::open(&db).unwrap();
+        CodeGraphEngine {
+            store,
+            project_root: base,
+        }
+    }
+
+    fn node(name: &str, file: &str, start: i64, end: i64, kind: NodeKind) -> Node {
+        Node {
+            id: format!("{kind:?}:{name}:{start}"),
+            kind,
+            name: name.to_string(),
+            qualified_name: name.to_string(),
+            file_path: file.to_string(),
+            language: Language::Rust,
+            start_line: start,
+            end_line: end,
+            start_column: 0,
+            end_column: 0,
+            docstring: None,
+            signature: None,
+            visibility: None,
+            is_exported: false,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+            decorators: Vec::new(),
+            type_parameters: Vec::new(),
+            return_type: None,
+            updated_at: 0,
+        }
+    }
+
+    fn subgraph_with(nodes: Vec<Node>, roots: Vec<String>) -> ExploreSubgraph {
+        let mut sg = ExploreSubgraph::default();
+        for n in nodes {
+            sg.insert(n);
+        }
+        sg.roots = roots;
+        sg
+    }
+
+    /// Given a stale index whose node start_line (921) is past a shrunk
+    /// 913-line file's EOF, When `render_explore_file` runs, Then it returns a
+    /// String instead of panicking with the historical "range start index 921
+    /// out of range for slice of length 913".
+    #[test]
+    fn render_explore_file_does_not_panic_on_stale_node_past_eof() {
+        let engine = test_engine();
+        let file = "server.rs";
+        // A 913-line file that must cluster (well over WHOLE_FILE_MAX_LINES),
+        // so build_section's slice math runs. Reproduces the exact user crash.
+        let owned: Vec<String> = (1..=913).map(|i| format!("line {i}")).collect();
+        let file_lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        // Two nodes: a real in-bounds one so a section still renders, plus a
+        // stale one whose START (918) and END (921) both exceed EOF — the
+        // original crash had start_idx=921 > total_lines=913.
+        let real = node("Handler", file, 100, 200, NodeKind::Function);
+        let stale = node("McpServer", file, 918, 921, NodeKind::Struct);
+        let sg = subgraph_with(vec![real.clone(), stale], vec![real.id.clone()]);
+        let budget = crate::explore_budget::get_explore_output_budget(200);
+
+        let out = engine.render_explore_file(&sg, file, &file_lines, "rust", &budget);
+        assert!(
+            out.contains(file),
+            "stale-node render should still produce a file section, got: {out:?}"
+        );
+    }
+
+    /// Given a stale node whose ENTIRE span is past EOF, When rendered, Then the
+    /// range is dropped and the (now sub-threshold) file still renders whole.
+    #[test]
+    fn render_explore_file_drops_fully_stale_range() {
+        let engine = test_engine();
+        let file = "shrunk.rs";
+        let owned: Vec<String> = (1..=300).map(|i| format!("line {i}")).collect();
+        let file_lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let stale = node("Gone", file, 400, 450, NodeKind::Function);
+        let sg = subgraph_with(vec![stale.clone()], vec![stale.id.clone()]);
+        let budget = crate::explore_budget::get_explore_output_budget(200);
+
+        let out = engine.render_explore_file(&sg, file, &file_lines, "rust", &budget);
+        assert!(out.contains(file), "should render a header, got: {out:?}");
+    }
+
+    /// Regression: a HEALTHY god-file (all node lines within total_lines) still
+    /// renders a clustered section with the real source, unchanged by the clamp.
+    #[test]
+    fn render_explore_file_healthy_god_file_clusters() {
+        let engine = test_engine();
+        let file = "big.rs";
+        let owned: Vec<String> = (1..=500).map(|i| format!("line {i}")).collect();
+        let file_lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let f1 = node("first", file, 10, 30, NodeKind::Function);
+        let f2 = node("second", file, 400, 430, NodeKind::Function);
+        let sg = subgraph_with(vec![f1.clone(), f2], vec![f1.id.clone()]);
+        let budget = crate::explore_budget::get_explore_output_budget(200);
+
+        let out = engine.render_explore_file(&sg, file, &file_lines, "rust", &budget);
+        assert!(out.contains("line 10"), "cluster source missing: {out:?}");
+        assert!(out.contains("line 30"), "cluster source missing: {out:?}");
+    }
+
+    /// Regression: a small HEALTHY file returns WHOLE, byte-for-byte, exactly as
+    /// before the clamp change.
+    #[test]
+    fn render_explore_file_whole_file_unchanged() {
+        let engine = test_engine();
+        let file = "small.rs";
+        let owned: Vec<String> = (1..=20).map(|i| format!("line {i}")).collect();
+        let file_lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let n = node("Small", file, 1, 20, NodeKind::Struct);
+        let sg = subgraph_with(vec![n.clone()], vec![n.id.clone()]);
+        let budget = crate::explore_budget::get_explore_output_budget(200);
+
+        let out = engine.render_explore_file(&sg, file, &file_lines, "rust", &budget);
+        let expected = {
+            let numbered = number_source_lines_at(&file_lines, 1);
+            format!("#### {file} — Small(struct)\n\n```rust\n{numbered}\n```\n")
+        };
+        assert_eq!(out, expected);
+    }
+
+    /// Given a stale index whose node `end_line` (10) is BELOW its `start_line`
+    /// (50) — a malformed/shrunk-file row — When `get_code` slices the on-disk
+    /// file, Then it returns Ok (graceful) instead of panicking with "slice
+    /// index starts at 49 but ends at 10".
+    #[test]
+    fn get_code_does_not_panic_when_end_line_below_start_line() {
+        let engine = test_engine();
+        let file = "reversed.rs";
+        let abs = engine.project_root.join(file);
+        let body: String = (1..=100).map(|i| format!("line {i}\n")).collect::<String>();
+        std::fs::write(&abs, body).unwrap();
+        let stale = node("Reversed", file, 50, 10, NodeKind::Function);
+
+        let out = engine.get_code(&stale).unwrap();
+        assert!(
+            out.is_none() || out.as_deref() == Some(""),
+            "reversed-span stale node should degrade to empty/None, got: {out:?}"
+        );
+    }
+
+    /// Regression: a HEALTHY node (`start_line <= end_line`, both in range)
+    /// returns its verbatim source unchanged by the clamp.
+    #[test]
+    fn get_code_healthy_node_unchanged() {
+        let engine = test_engine();
+        let file = "ok.rs";
+        let abs = engine.project_root.join(file);
+        let body: String = (1..=100).map(|i| format!("line {i}\n")).collect::<String>();
+        std::fs::write(&abs, body).unwrap();
+        let healthy = node("Ok", file, 10, 12, NodeKind::Function);
+
+        let out = engine.get_code(&healthy).unwrap();
+        assert_eq!(out.as_deref(), Some("line 10\nline 11\nline 12"));
     }
 }
