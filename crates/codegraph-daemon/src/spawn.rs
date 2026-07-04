@@ -7,6 +7,11 @@ use anyhow::{Context, Result};
 use crate::CODEGRAPH_DAEMON_INTERNAL;
 use crate::paths::daemon_log_path;
 
+/// Env var the detached HTTP child reads to know it IS the background server and
+/// must run the foreground serve path (NOT re-detach). Set on the spawned child
+/// by [`spawn_detached_http`]; the CLI checks it before deciding to detach.
+pub const CODEGRAPH_HTTP_DETACH_INTERNAL: &str = "CODEGRAPH_HTTP_DETACH_INTERNAL";
+
 /// Env var the daemon child reads to disable its live file watcher. Kept in
 /// sync with `codegraph_watch::CODEGRAPH_NO_WATCH`; duplicated here so the
 /// daemon crate does not need to depend on codegraph-watch just for a string.
@@ -60,6 +65,52 @@ fn log_target(root: &Path) -> Stdio {
         .create(true)
         .append(true)
         .open(daemon_log_path(root))
+        .map_or_else(|_| Stdio::null(), Stdio::from)
+}
+
+/// Spawn a detached background HTTP MCP server by re-invoking `exe serve --http
+/// --http-addr <addr> [--path <project>]` with `CODEGRAPH_HTTP_DETACH_INTERNAL=1`
+/// so the child runs the foreground serve path and does NOT re-detach. Stdout
+/// and stderr are appended to `log_file`; the child is detached from this
+/// process group (shared [`detach`] primitive) and a reaper thread waits on it.
+/// Returns the child pid so the parent can write the registry entry.
+pub fn spawn_detached_http(
+    exe: &Path,
+    addr: &str,
+    project: Option<&Path>,
+    log_file: &Path,
+) -> Result<u32> {
+    let mut command = Command::new(exe);
+    command
+        .arg("serve")
+        .arg("--http")
+        .arg("--http-addr")
+        .arg(addr)
+        .env(CODEGRAPH_HTTP_DETACH_INTERNAL, "1")
+        .stdin(Stdio::null())
+        .stdout(open_log(log_file))
+        .stderr(open_log(log_file));
+    if let Some(project) = project {
+        command.arg("--path").arg(project);
+    }
+
+    detach(&mut command);
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("spawning detached HTTP server via {}", exe.display()))?;
+    let pid = child.id();
+    let _reaper = std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(pid)
+}
+
+fn open_log(path: &Path) -> Stdio {
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
         .map_or_else(|_| Stdio::null(), Stdio::from)
 }
 
@@ -163,6 +214,25 @@ mod tests {
         assert!(
             eventually_no_zombie_children(Duration::from_secs(1)),
             "spawn_detached_daemon must reap an exited child instead of leaving a zombie"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn spawn_detached_http_returns_pid_and_reaps_child() {
+        let exe = Path::new("/bin/true");
+        assert!(exe.exists(), "/bin/true is required for this test");
+        let root = temp_root("http-reap");
+        let log = root.join("http.log");
+
+        let pid = super::spawn_detached_http(exe, "127.0.0.1:0", Some(&root), &log)
+            .expect("spawn short-lived http command");
+        assert!(pid > 0, "spawn_detached_http must return the child pid");
+
+        assert!(
+            eventually_no_zombie_children(Duration::from_secs(1)),
+            "spawn_detached_http must reap an exited child instead of leaving a zombie"
         );
 
         let _ = fs::remove_dir_all(root);

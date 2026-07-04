@@ -80,6 +80,20 @@ pub fn is_process_alive(pid: u32) -> bool {
     )
 }
 
+/// Send a graceful termination request to `pid` (SIGTERM on unix). Returns true
+/// when the signal was delivered. Used by `codegraph http stop` to stop a
+/// background HTTP MCP server by its recorded pid.
+#[cfg(unix)]
+pub fn terminate_pid(pid: u32) -> bool {
+    let Ok(raw) = i32::try_from(pid) else {
+        return false;
+    };
+    let Some(pid) = rustix::process::Pid::from_raw(raw) else {
+        return false;
+    };
+    rustix::process::kill_process(pid, rustix::process::Signal::Term).is_ok()
+}
+
 // Windows has no stable getppid; returning 0 makes the ppid-divergence branch
 // inert (it is `#[cfg(unix)]`-gated anyway — see `supervision_lost_reason`).
 #[cfg(windows)]
@@ -113,6 +127,30 @@ pub fn is_process_alive(pid: u32) -> bool {
         let got = GetExitCodeProcess(handle, &mut code);
         CloseHandle(handle);
         got != FALSE && code == STILL_ACTIVE as u32
+    }
+}
+
+/// Send a termination request to `pid` (Windows: `TerminateProcess`). Returns
+/// true when the request was issued. Windows analog of the unix SIGTERM path
+/// used by `codegraph http stop`.
+#[cfg(windows)]
+pub fn terminate_pid(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, FALSE};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: OpenProcess/TerminateProcess/CloseHandle are FFI calls with no
+    // Rust-side aliasing. A null handle means the open failed (nothing to kill).
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+        if handle == 0 {
+            return false;
+        }
+        let ok = TerminateProcess(handle, 1);
+        CloseHandle(handle);
+        ok != FALSE
     }
 }
 

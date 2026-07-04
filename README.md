@@ -1,6 +1,7 @@
 # CodeGraph-Rust
 
 [![CI](https://github.com/sunerpy/codegraph-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/sunerpy/codegraph-rust/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/sunerpy/codegraph-rust/branch/main/graph/badge.svg)](https://codecov.io/gh/sunerpy/codegraph-rust)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
 
 > A deterministic **code knowledge graph**: tree-sitter parsing persisted to
@@ -389,7 +390,38 @@ The pid/lock file always stays at `.codegraph/daemon.pid`, and clients read the
 recorded socket from the lock, so they attach regardless of which candidate the
 daemon chose.
 
-### Indexing exclusions (`[indexing] exclude`)
+### HTTP MCP server (background mode)
+
+Besides the stdio transport, CodeGraph can serve MCP over streamable-HTTP for
+web/remote clients (`serve --http`). HTTP servers are keyed by **bind address**
+(not by project — a global server with no `--path` spans many projects), so they
+have their own address-keyed registry, separate from the per-project daemon.
+
+```bash
+codegraph serve --http --http-addr 127.0.0.1:8111            # foreground (blocks; default)
+codegraph serve --http --http-addr 127.0.0.1:8111 --detach   # background; prints pid + log, then exits
+codegraph http list                                          # table of running servers
+codegraph http status [<addr>]                               # detail for one, or all
+codegraph http stop 127.0.0.1:8111                           # terminate one by address
+```
+
+**Foreground stays the default** — `serve --http` blocks and serves until you
+stop it. Add `--detach` to run it in the background: the parent spawns a
+detached child, records it in the registry, prints `started HTTP MCP server on
+<addr> (pid N), logs: <path>`, and exits.
+
+**Multi-instance by address.** Two servers on **different** addresses coexist;
+starting a second one notes the others. Starting on an **address already in
+use** is refused with an error that lists the running instance — stop it with
+`codegraph http stop <addr>` or pick a different `--http-addr`.
+
+**Self-healing registry.** One JSON file per running server lives under the
+global state dir (`$XDG_STATE_HOME/codegraph/http/`, else
+`~/.local/state/codegraph/http/`; `%LOCALAPPDATA%\codegraph\http\` on Windows;
+override with `CODEGRAPH_HTTP_REGISTRY_DIR`). Detached-server logs are written
+to `<registry_dir>/<addr>.log`. Each entry records the server's pid; on the next
+`serve --http`, `http list`, or `http stop`, any entry whose process has died is
+pruned automatically, so a crash never leaves a phantom conflict.
 
 Beyond the default `ignore_dirs`, you can skip additional root-relative path
 patterns by listing them under `[indexing] exclude` in

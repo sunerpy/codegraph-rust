@@ -103,6 +103,7 @@ impl Cli {
             Command::Install { .. }
             | Command::Uninstall { .. }
             | Command::Skill { .. }
+            | Command::Http { .. }
             | Command::Version
             | Command::Completions { .. }
             | Command::SelfUpdate { .. } => None,
@@ -193,18 +194,26 @@ enum Command {
         no_watch: bool,
         /// Serve MCP over streamable-HTTP (rmcp) instead of stdio. With `--path`
         /// it pins one already-indexed project; without `--path` it starts a
-        /// GLOBAL server where each call carries its own `projectPath`. Binds
-        /// localhost. A DNS-rebinding guard only accepts a `Host` matching the
-        /// bind address (or loopback); set `CODEGRAPH_HTTP_ALLOW_ANY_HOST=1` to
-        /// accept any `Host` (only when fronted by your own proxy/auth).
+        /// GLOBAL server where each call carries its own `projectPath`. The
+        /// DNS-rebinding host guard is OPEN by default — any `Host` is accepted
+        /// (MCP Inspector, Zed, curl connect out of the box). Restrict it by
+        /// setting `CODEGRAPH_HTTP_ALLOWED_HOSTS` to a comma list of allowed
+        /// hosts (e.g. `localhost,code-server:12025`); a `*` entry (or unset)
+        /// means allow all.
         #[arg(long)]
         http: bool,
-        /// Address to bind the streamable-HTTP server to. Loopback binds
-        /// (127.0.0.1/localhost) work out of the box; for a non-loopback bind
-        /// (0.0.0.0 or a real interface) the guard accepts that exact
-        /// `Host: <addr>`, or set `CODEGRAPH_HTTP_ALLOW_ANY_HOST=1` for any Host.
+        /// Address to bind the streamable-HTTP server to (loopback or a real
+        /// interface such as `0.0.0.0`). The host guard is OPEN by default; when
+        /// restricted via `CODEGRAPH_HTTP_ALLOWED_HOSTS` the loopback defaults
+        /// plus this bind authority are always allowed alongside the listed hosts.
         #[arg(long = "http-addr", default_value = "127.0.0.1:8111")]
         http_addr: String,
+        /// Run the HTTP MCP server in the BACKGROUND (detached) instead of the
+        /// foreground. Only meaningful with `--http`; the parent registers the
+        /// server, prints its pid + log path, and exits. Without `--http` this
+        /// flag is a hard error.
+        #[arg(long)]
+        detach: bool,
     },
     // Upstream flags/output: upstream bin/codegraph.ts:1167-1169, 1173-1186.
     Unlock {
@@ -333,6 +342,11 @@ enum Command {
         #[command(subcommand)]
         action: SkillAction,
     },
+    /// Manage background HTTP MCP servers started with `serve --http --detach`.
+    Http {
+        #[command(subcommand)]
+        action: HttpAction,
+    },
     /// Print the codegraph version.
     Version,
     /// Generate shell completion scripts (bash, zsh, fish, powershell, elvish).
@@ -428,6 +442,16 @@ enum SkillAction {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum HttpAction {
+    /// List all running background HTTP MCP servers.
+    List,
+    /// Show status for one HTTP MCP server (by addr) or all when omitted.
+    Status { addr: Option<String> },
+    /// Stop the background HTTP MCP server bound to `addr`.
+    Stop { addr: String },
+}
+
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Init { path, target } => cmd_init(path, &target),
@@ -462,7 +486,8 @@ fn run(cli: Cli) -> Result<()> {
             no_watch,
             http,
             http_addr,
-        } => cmd_serve(path, mcp, no_watch, http, http_addr),
+            detach,
+        } => cmd_serve(path, mcp, no_watch, http, http_addr, detach),
         Command::Unlock { path } => cmd_unlock(path),
         Command::Callers {
             symbol,
@@ -589,6 +614,11 @@ fn run(cli: Cli) -> Result<()> {
                 yes: false,
                 force: false,
             }),
+        },
+        Command::Http { action } => match action {
+            HttpAction::List => cmd_http_list(),
+            HttpAction::Status { addr } => cmd_http_status(addr),
+            HttpAction::Stop { addr } => cmd_http_stop(&addr),
         },
         Command::Version => {
             println!("codegraph {VERSION}");
@@ -1219,14 +1249,20 @@ fn cmd_serve(
     no_watch: bool,
     http: bool,
     http_addr: String,
+    detach: bool,
 ) -> Result<()> {
     if http && mcp {
         anyhow::bail!(
             "`--mcp` and `--http` are mutually exclusive: `--mcp` serves MCP over stdio, `--http` serves it over streamable-HTTP. Pick one."
         );
     }
+    if detach && !http {
+        anyhow::bail!(
+            "`--detach` is only meaningful with `--http` (background HTTP MCP server). For stdio `serve --mcp`, the shared daemon already runs in the background automatically."
+        );
+    }
     if http {
-        return cmd_serve_http(path, &http_addr);
+        return cmd_serve_http(path, &http_addr, detach);
     }
     // Default the MCP project to cwd so `serve --mcp` (no --path, as the
     // installer injects) finds the index of the agent's project root.
@@ -1286,11 +1322,21 @@ fn cmd_serve(
 /// on-disk index (hard-error otherwise — never self-index), and pin it as the
 /// default. Without `--path`: GLOBAL — no pinned default, no startup index
 /// requirement; each tool call MUST carry its own `projectPath` (the HTTP analog
-/// of the Kiro/Qoder bare global entry). Parses the bind address and hands off to
-/// `codegraph_mcp::serve_http`. Not routed through the daemon/SpawnOrProxy path.
-fn cmd_serve_http(path: Option<PathBuf>, http_addr: &str) -> Result<()> {
+/// of the Kiro/Qoder bare global entry).
+///
+/// HTTP servers are keyed by BIND ADDR in a GLOBAL registry (not `.codegraph/`),
+/// so this path also does self-healing conflict detection: prune dead entries,
+/// error out if a LIVE server already binds the same addr, and (when free) note
+/// any other running servers. `--detach` spawns a background child (via the
+/// generalized daemon detach primitive) and the parent registers it + exits;
+/// foreground (default) registers itself and blocks on `serve_http`.
+fn cmd_serve_http(path: Option<PathBuf>, http_addr: &str, detach: bool) -> Result<()> {
+    use codegraph_daemon::http_registry::{self, HttpMode, HttpServerInfo};
+
     let addr = resolve_http_addr(http_addr)?;
-    match path {
+    let addr_key = addr.to_string();
+
+    let (project, mode) = match path {
         Some(raw) => {
             let project = resolve_project_path_optional(&absolute_path(raw));
             let db = db_path(&project);
@@ -1301,25 +1347,178 @@ fn cmd_serve_http(path: Option<PathBuf>, http_addr: &str) -> Result<()> {
                     project.display(),
                 );
             }
-            if debug_enabled() {
-                eprintln!(
-                    "[codegraph debug] serve --http (pinned): addr={addr} project={} db={} db_exists={}",
-                    project.display(),
-                    db.display(),
-                    db.is_file(),
-                );
-            }
-            serve_http_impl(Some(project), addr)
+            (Some(project), HttpMode::Pinned)
         }
-        None => {
-            if debug_enabled() {
-                eprintln!(
-                    "[codegraph debug] serve --http (global): addr={addr} per-call projectPath, no pinned default",
-                );
-            }
-            serve_http_impl(None, addr)
+        None => (None, HttpMode::Global),
+    };
+
+    // The detached child re-invokes this same command with the internal marker
+    // set. It IS the background server: register itself and run the foreground
+    // serve path (never re-detach, never re-run conflict detection — the parent
+    // already did that before spawning).
+    if is_http_detach_internal() {
+        let info = HttpServerInfo {
+            pid: std::process::id(),
+            addr: addr_key.clone(),
+            mode,
+            project: project.as_ref().map(|p| p.display().to_string()),
+            started_at: http_registry::now_millis(),
+            version: VERSION.to_string(),
+            log_file: Some(http_log_path(&addr_key).display().to_string()),
+        };
+        let _ = http_registry::write_entry(&info);
+        let _guard = HttpRegistryGuard::new(addr_key);
+        return serve_http_impl(project, addr);
+    }
+
+    // Parent path: self-heal the registry, then detect conflicts.
+    http_registry::prune_dead();
+    if let Some(existing) = http_registry::live_entry_for(&addr_key) {
+        print_http_conflict(&existing);
+        anyhow::bail!(
+            "an HTTP MCP server is already running on {addr_key} (pid {}, started {}); stop it with `codegraph http stop {addr_key}` or choose a different --http-addr",
+            existing.pid,
+            format_started_at(existing.started_at),
+        );
+    }
+    note_other_running_servers(&addr_key);
+
+    if detach {
+        let exe = std::env::current_exe().context("resolving current executable for --detach")?;
+        let log_file = http_log_path(&addr_key);
+        if let Some(parent) = log_file.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let pid =
+            codegraph_daemon::spawn_detached_http(&exe, &addr_key, project.as_deref(), &log_file)
+                .context("spawning detached HTTP MCP server")?;
+        let info = HttpServerInfo {
+            pid,
+            addr: addr_key.clone(),
+            mode,
+            project: project.as_ref().map(|p| p.display().to_string()),
+            started_at: http_registry::now_millis(),
+            version: VERSION.to_string(),
+            log_file: Some(log_file.display().to_string()),
+        };
+        http_registry::write_entry(&info).context("writing HTTP registry entry")?;
+        println!(
+            "started HTTP MCP server on {addr_key} (pid {pid}), logs: {}",
+            log_file.display()
+        );
+        return Ok(());
+    }
+
+    // Foreground (default): register self, run serve_http (blocking); the Drop
+    // guard best-effort removes the entry on graceful exit.
+    let info = HttpServerInfo {
+        pid: std::process::id(),
+        addr: addr_key.clone(),
+        mode,
+        project: project.as_ref().map(|p| p.display().to_string()),
+        started_at: http_registry::now_millis(),
+        version: VERSION.to_string(),
+        log_file: None,
+    };
+    let _ = http_registry::write_entry(&info);
+    let _guard = HttpRegistryGuard::new(addr_key);
+    if debug_enabled() {
+        match &project {
+            Some(project) => eprintln!(
+                "[codegraph debug] serve --http (pinned): addr={addr} project={}",
+                project.display(),
+            ),
+            None => eprintln!(
+                "[codegraph debug] serve --http (global): addr={addr} per-call projectPath, no pinned default",
+            ),
         }
     }
+    serve_http_impl(project, addr)
+}
+
+/// True when this process is the detached HTTP child (re-invoked by
+/// [`codegraph_daemon::spawn_detached_http`] with the internal marker set).
+fn is_http_detach_internal() -> bool {
+    std::env::var(codegraph_daemon::CODEGRAPH_HTTP_DETACH_INTERNAL).as_deref() == Ok("1")
+}
+
+/// Log-file path for a detached HTTP server: `<registry_dir>/<addr-sanitized>.log`.
+fn http_log_path(addr_key: &str) -> PathBuf {
+    codegraph_daemon::http_registry::registry_dir().join(format!(
+        "{}.log",
+        codegraph_daemon::http_registry::sanitize_addr(addr_key)
+    ))
+}
+
+/// Best-effort removal of this process's own registry entry on scope exit
+/// (graceful foreground shutdown / detached child exit). A crash is covered by
+/// the next-start prune, so this is a courtesy, not a correctness requirement.
+struct HttpRegistryGuard {
+    addr_key: String,
+}
+
+impl HttpRegistryGuard {
+    fn new(addr_key: String) -> Self {
+        Self { addr_key }
+    }
+}
+
+impl Drop for HttpRegistryGuard {
+    fn drop(&mut self) {
+        let _ = codegraph_daemon::http_registry::remove_entry(&self.addr_key);
+    }
+}
+
+/// Print a running instance's details for a same-addr conflict (pid, mode,
+/// project, started, log) so the user sees exactly what is holding the addr.
+fn print_http_conflict(info: &codegraph_daemon::http_registry::HttpServerInfo) {
+    eprintln!(
+        "  running: {} (pid {}, mode {}, project {}, started {}{})",
+        info.addr,
+        info.pid,
+        info.mode.as_str(),
+        info.project.as_deref().unwrap_or("<global>"),
+        format_started_at(info.started_at),
+        info.log_file
+            .as_deref()
+            .map(|l| format!(", log {l}"))
+            .unwrap_or_default(),
+    );
+}
+
+/// After confirming the requested addr is free, note any OTHER live servers so
+/// the user knows multiple instances are running.
+fn note_other_running_servers(addr_key: &str) {
+    let others: Vec<_> = codegraph_daemon::http_registry::live_entries()
+        .into_iter()
+        .filter(|info| info.addr != addr_key)
+        .collect();
+    if others.is_empty() {
+        return;
+    }
+    let list = others
+        .iter()
+        .map(|info| format!("{} (pid {})", info.addr, info.pid))
+        .collect::<Vec<_>>()
+        .join(", ");
+    eprintln!(
+        "Note: {} other HTTP MCP server(s) running: {list}",
+        others.len()
+    );
+}
+
+/// Format an epoch-ms timestamp as an RFC3339 local string, falling back to the
+/// raw millis when the time crate cannot render it.
+fn format_started_at(started_at_ms: u64) -> String {
+    let secs = i64::try_from(started_at_ms / 1000).unwrap_or(0);
+    OffsetDateTime::from_unix_timestamp(secs)
+        .ok()
+        .and_then(|dt| {
+            dt.to_offset(time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC))
+                .format(&Rfc3339)
+                .ok()
+        })
+        .unwrap_or_else(|| format!("{started_at_ms} ms"))
 }
 
 /// Resolve a `--http-addr` string to a bind `SocketAddr`, accepting IP literals
@@ -1348,6 +1547,111 @@ fn resolve_http_addr(http_addr: &str) -> Result<std::net::SocketAddr> {
 /// sole HTTP transport).
 fn serve_http_impl(default_project: Option<PathBuf>, addr: std::net::SocketAddr) -> Result<()> {
     codegraph_mcp::serve_http(default_project, addr).context("serving MCP over streamable-HTTP")
+}
+
+/// `codegraph http list`: prune dead entries, then print a table of the live
+/// background HTTP MCP servers (ADDR | PID | MODE | PROJECT | STARTED | LOG).
+fn cmd_http_list() -> Result<()> {
+    let servers = codegraph_daemon::http_registry::live_entries();
+    print_http_table(&servers);
+    Ok(())
+}
+
+/// `codegraph http status [<addr>]`: with an addr, print detail for that one
+/// server; without, behave like `list` plus a running-count note.
+fn cmd_http_status(addr: Option<String>) -> Result<()> {
+    let servers = codegraph_daemon::http_registry::live_entries();
+    match addr {
+        Some(addr) => match servers.iter().find(|info| info.addr == addr) {
+            Some(info) => {
+                println!("addr:    {}", info.addr);
+                println!("pid:     {}", info.pid);
+                println!("mode:    {}", info.mode.as_str());
+                println!("project: {}", info.project.as_deref().unwrap_or("<global>"));
+                println!("started: {}", format_started_at(info.started_at));
+                println!("version: {}", info.version);
+                println!("log:     {}", info.log_file.as_deref().unwrap_or("-"));
+            }
+            None => println!("No HTTP MCP server running on {addr}."),
+        },
+        None => {
+            print_http_table(&servers);
+            if !servers.is_empty() {
+                println!("({} HTTP MCP server(s) running)", servers.len());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `codegraph http stop <addr>`: find the live server on `addr`, send it a
+/// graceful terminate (SIGTERM on unix / TerminateProcess on windows), wait
+/// briefly, and remove its registry entry.
+fn cmd_http_stop(addr: &str) -> Result<()> {
+    let addr_key = resolve_http_addr(addr)
+        .map(|resolved| resolved.to_string())
+        .unwrap_or_else(|_| addr.to_string());
+    let info = codegraph_daemon::http_registry::live_entry_for(&addr_key)
+        .or_else(|| codegraph_daemon::http_registry::live_entry_for(addr));
+    let Some(info) = info else {
+        println!("No HTTP MCP server running on {addr}.");
+        return Ok(());
+    };
+    let delivered = codegraph_daemon::terminate_pid(info.pid);
+    for _ in 0..50 {
+        if !codegraph_daemon::is_process_alive(info.pid) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    codegraph_daemon::http_registry::remove_entry(&info.addr);
+    if delivered {
+        println!(
+            "stopped HTTP MCP server on {} (pid {})",
+            info.addr, info.pid
+        );
+    } else {
+        println!(
+            "removed stale registry entry for {} (pid {} did not accept the terminate signal)",
+            info.addr, info.pid
+        );
+    }
+    Ok(())
+}
+
+/// Render the running-servers table, or a "none" line when empty.
+fn print_http_table(servers: &[codegraph_daemon::http_registry::HttpServerInfo]) {
+    if servers.is_empty() {
+        println!("No HTTP MCP servers running.");
+        return;
+    }
+    println!(
+        "{:<22} {:>7} {:<7} {:<28} {:<25} LOG",
+        "ADDR", "PID", "MODE", "PROJECT", "STARTED"
+    );
+    for info in servers {
+        println!(
+            "{:<22} {:>7} {:<7} {:<28} {:<25} {}",
+            info.addr,
+            info.pid,
+            info.mode.as_str(),
+            truncate_field(info.project.as_deref().unwrap_or("<global>"), 28),
+            format_started_at(info.started_at),
+            info.log_file.as_deref().unwrap_or("-"),
+        );
+    }
+}
+
+/// Truncate a display field to `max` chars, appending `…` when clipped, so the
+/// table columns stay aligned for long project paths.
+fn truncate_field(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    let mut out: String = value.chars().take(keep).collect();
+    out.push('…');
+    out
 }
 
 #[cfg(test)]
@@ -1558,6 +1862,7 @@ where
                     "[codegraph debug] serve_adopted: daemon preflight failed ({err}); serving direct"
                 );
             }
+            heal_stale_daemon_if_dead(&project_root, debug_enabled());
             return codegraph_mcp::rmcp_session::serve_session_rmcp(reader, writer, project_root)
                 .context("running rmcp MCP stdio server for adopted project");
         }
@@ -1576,6 +1881,7 @@ where
             if debug_enabled() {
                 eprintln!("[codegraph debug] serve_adopted: proxy attach failed ({err})");
             }
+            heal_stale_daemon_if_dead(&project_root, debug_enabled());
             Ok(())
         }
     }
@@ -1772,6 +2078,7 @@ fn spawn_or_proxy(
                 "[codegraph debug] spawn_or_proxy: daemon socket never appeared; falling back to direct"
             );
         }
+        heal_stale_daemon_if_dead(project_root, dbg);
         return None;
     }
 
@@ -1800,8 +2107,23 @@ fn spawn_or_proxy(
                     "[codegraph debug] spawn_or_proxy: proxy attach failed ({err}); falling back to direct"
                 );
             }
+            heal_stale_daemon_if_dead(project_root, dbg);
             None
         }
+    }
+}
+
+/// Self-heal a project's stale daemon artifacts on a failed proxy attach when
+/// the recorded pid is not alive (Fix A): removes the dead daemon's leftover
+/// `daemon.sock` + pid lock so the NEXT `serve --mcp` spawns a fresh daemon
+/// instead of re-attaching to a socket that never answers. Liveness-gated — a
+/// LIVE daemon's artifacts are preserved — so it is safe on any attach failure;
+/// the current request still falls back to DIRECT serving regardless.
+fn heal_stale_daemon_if_dead(project_root: &Path, dbg: bool) {
+    if codegraph_daemon::clear_stale_daemon_socket(project_root) && dbg {
+        eprintln!(
+            "[codegraph debug] cleared stale daemon artifacts (dead pid) so the next start spawns fresh"
+        );
     }
 }
 
