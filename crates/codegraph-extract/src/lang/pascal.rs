@@ -173,3 +173,56 @@ impl LanguageSpec for PascalSpec {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(src: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_pascal::LANGUAGE.into())
+            .unwrap();
+        parser.parse(src, None).unwrap()
+    }
+
+    fn first_of_kind<'t>(node: Node<'t>, kind: &str) -> Option<Node<'t>> {
+        if node.kind() == kind {
+            return Some(node);
+        }
+        for i in 0..node.named_child_count() {
+            let child = node.named_child(i as u32)?;
+            if let Some(found) = first_of_kind(child, kind) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn trait_field_constants_are_stable() {
+        assert!(PASCAL_SPEC.enum_member_types().is_empty());
+        assert_eq!(PASCAL_SPEC.name_field(), "name");
+        assert_eq!(PASCAL_SPEC.body_field(), "body");
+        assert_eq!(PASCAL_SPEC.params_field(), "args");
+        assert_eq!(PASCAL_SPEC.return_field(), "type");
+    }
+
+    #[test]
+    fn decl_const_is_const() {
+        let src = "unit U;\ninterface\nconst MAX = 100;\nimplementation\nend.\n";
+        let tree = parse(src);
+        if let Some(decl_const) = first_of_kind(tree.root_node(), "declConst") {
+            assert!(PASCAL_SPEC.is_const(decl_const));
+        }
+    }
+
+    #[test]
+    fn import_identifier_direct_child() {
+        let src = "unit U;\ninterface\nuses SysUtils, Classes;\nimplementation\nend.\n";
+        let tree = parse(src);
+        let uses = first_of_kind(tree.root_node(), "declUses").unwrap();
+        let info = PASCAL_SPEC.extract_import(uses, src).unwrap();
+        assert!(!info.module_name.is_empty());
+    }
+}

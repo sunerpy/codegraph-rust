@@ -1201,4 +1201,101 @@ mod handler_tests {
         );
         assert_ne!(second.is_error, Some(true), "cached engine reused");
     }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+    }
+
+    async fn connect(
+        handler: CodeGraphHandler,
+    ) -> (
+        rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientInfo>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use rmcp::ServiceExt;
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let server_task = tokio::spawn(async move {
+            if let Ok(running) = handler.serve(server_io).await {
+                let _ = running.waiting().await;
+            }
+        });
+        let client = rmcp::model::ClientInfo::default()
+            .serve(client_io)
+            .await
+            .expect("rmcp client handshake");
+        (client, server_task)
+    }
+
+    fn call_params(name: &str, args: Value) -> CallToolRequestParams {
+        let params = CallToolRequestParams::new(name.to_string());
+        match args.as_object().cloned() {
+            Some(map) => params.with_arguments(map),
+            None => params,
+        }
+    }
+
+    #[test]
+    fn call_tool_bad_project_path_returns_error_result() {
+        rt().block_on(async {
+            // A pinned indexed default keeps `list_tools` happy, but a bogus
+            // absolute `projectPath` argument resolves to nothing → the
+            // `Some(raw)` error-message arm of `call_tool`.
+            let project = real_indexed_project("call-bad-pp");
+            let handler = CodeGraphHandler::new(Some(project.path.clone()));
+            let (client, task) = connect(handler).await;
+            let result = client
+                .call_tool(call_params(
+                    "codegraph_search",
+                    json!({ "query": "add", "projectPath": "/no/such/indexed/project/xyz" }),
+                ))
+                .await
+                .expect("bad projectPath yields an isError result, not a transport error");
+            assert_eq!(result.is_error, Some(true));
+            let text: String = result
+                .content
+                .iter()
+                .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+                .collect();
+            assert!(
+                text.contains("No indexed project found for projectPath"),
+                "bad-projectPath message, got: {text}"
+            );
+            let _ = client.cancel().await;
+            let _ = task.await;
+        });
+    }
+
+    #[test]
+    fn call_tool_timeout_disabled_runs_unbounded_path() {
+        let _env = TIMEOUT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        rt().block_on(async {
+            // `CODEGRAPH_MCP_TOOL_TIMEOUT_SECS=0` opts out of the timeout, so
+            // `call_tool` takes the `None => join_future.await` (unbounded) arm.
+            // SAFETY: serialized by TIMEOUT_ENV_LOCK; single-threaded here.
+            unsafe {
+                std::env::set_var(TOOL_TIMEOUT_ENV, "0");
+            }
+            let project = real_indexed_project("call-no-timeout");
+            let handler = CodeGraphHandler::new(Some(project.path.clone()));
+            let (client, task) = connect(handler).await;
+            let ok = client
+                .call_tool(call_params("codegraph_search", json!({ "query": "add" })))
+                .await
+                .expect("unbounded call still returns a result");
+            assert_ne!(ok.is_error, Some(true), "search on indexed project");
+            let _ = client.cancel().await;
+            let _ = task.await;
+            // SAFETY: serialized by TIMEOUT_ENV_LOCK; restore to unset.
+            unsafe {
+                std::env::remove_var(TOOL_TIMEOUT_ENV);
+            }
+        });
+    }
+
+    static TIMEOUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

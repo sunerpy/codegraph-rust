@@ -585,4 +585,23 @@ mod tests {
         );
         fs::remove_dir_all(&project).ok();
     }
+
+    #[test]
+    fn extract_project_parallel_path_merges_results() {
+        let project = unique_project("extract_project_par");
+        touch(&project, "a.rs", "pub fn a() {}\n");
+        touch(&project, "b.rs", "pub fn b() {}\n");
+        let options = ExtractOptions {
+            parallel: true,
+            ..ExtractOptions::default()
+        };
+        let merged = extract_project(&project, &options).expect("extract");
+        fs::remove_dir_all(&project).ok();
+        assert!(
+            merged.nodes.iter().any(|n| n.name == "a")
+                && merged.nodes.iter().any(|n| n.name == "b"),
+            "parallel extract merges both files: {:?}",
+            merged.nodes.iter().map(|n| &n.name).collect::<Vec<_>>()
+        );
+    }
 }

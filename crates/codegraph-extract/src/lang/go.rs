@@ -156,3 +156,54 @@ fn is_identifier(text: &str) -> bool {
         .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
         && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(src: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_go::LANGUAGE.into())
+            .unwrap();
+        parser.parse(src, None).unwrap()
+    }
+
+    fn first_of_kind<'t>(node: Node<'t>, kind: &str) -> Option<Node<'t>> {
+        if node.kind() == kind {
+            return Some(node);
+        }
+        for i in 0..node.named_child_count() {
+            let child = node.named_child(i as u32)?;
+            if let Some(found) = first_of_kind(child, kind) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn trait_field_constants_are_stable() {
+        assert!(GO_SPEC.enum_member_types().is_empty());
+        assert!(GO_SPEC.methods_are_top_level());
+        assert_eq!(GO_SPEC.name_field(), "name");
+        assert_eq!(GO_SPEC.body_field(), "body");
+        assert_eq!(GO_SPEC.params_field(), "parameters");
+        assert_eq!(GO_SPEC.return_field(), "result");
+    }
+
+    #[test]
+    fn parameter_list_return_and_single_word_receiver() {
+        let src = "package p\nfunc (Store) f() (Widget, error) { return }\n";
+        let tree = parse(src);
+        let method = first_of_kind(tree.root_node(), "method_declaration").unwrap();
+        assert_eq!(
+            GO_SPEC.get_return_type(method, src).as_deref(),
+            Some("Widget")
+        );
+        assert_eq!(
+            GO_SPEC.get_receiver_type(method, src).as_deref(),
+            Some("Store")
+        );
+    }
+}

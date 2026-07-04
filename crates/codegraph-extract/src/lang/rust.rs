@@ -213,3 +213,83 @@ fn is_identifier(text: &str) -> bool {
         .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
         && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(src: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        parser.parse(src, None).unwrap()
+    }
+
+    fn first_of_kind<'t>(node: Node<'t>, kind: &str) -> Option<Node<'t>> {
+        if node.kind() == kind {
+            return Some(node);
+        }
+        for i in 0..node.named_child_count() {
+            let child = node.named_child(i as u32)?;
+            if let Some(found) = first_of_kind(child, kind) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn trait_field_constants_are_stable() {
+        assert_eq!(RUST_SPEC.name_field(), "name");
+        assert_eq!(RUST_SPEC.body_field(), "body");
+        assert_eq!(RUST_SPEC.params_field(), "parameters");
+        assert_eq!(RUST_SPEC.return_field(), "return_type");
+    }
+
+    #[test]
+    fn non_identifier_return_drops_to_none() {
+        let src = "fn f() -> (i32, i32) { (0, 0) }\n";
+        let tree = parse(src);
+        let func = first_of_kind(tree.root_node(), "function_item").unwrap();
+        assert!(RUST_SPEC.get_return_type(func, src).is_none());
+    }
+
+    #[test]
+    fn private_and_default_visibility() {
+        let src = "fn hidden() {}\n";
+        let tree = parse(src);
+        let func = first_of_kind(tree.root_node(), "function_item").unwrap();
+        assert_eq!(RUST_SPEC.get_visibility(func).as_deref(), Some("private"));
+    }
+
+    #[test]
+    fn generic_impl_receiver_via_generic_type() {
+        let src = "struct S<T>(T);\nimpl<T> S<T> { fn m(&self) {} }\n";
+        let tree = parse(src);
+        let func = first_of_kind(tree.root_node(), "function_item").unwrap();
+        assert_eq!(RUST_SPEC.get_receiver_type(func, src).as_deref(), Some("S"));
+    }
+
+    #[test]
+    fn use_root_module_scoped_and_leaf_forms() {
+        let src = "use a::b::c;\nuse solo;\n";
+        let tree = parse(src);
+        let mut uses = Vec::new();
+        fn walk<'t>(n: Node<'t>, out: &mut Vec<Node<'t>>) {
+            if n.kind() == "use_declaration" {
+                out.push(n);
+            }
+            for i in 0..n.named_child_count() {
+                if let Some(c) = n.named_child(i as u32) {
+                    walk(c, out);
+                }
+            }
+        }
+        walk(tree.root_node(), &mut uses);
+        let scoped = RUST_SPEC.extract_import(uses[0], src).unwrap();
+        assert_eq!(scoped.module_name, "a");
+        let leaf = RUST_SPEC.extract_import(uses[1], src).unwrap();
+        assert_eq!(leaf.module_name, "solo");
+    }
+}

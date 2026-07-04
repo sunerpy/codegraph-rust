@@ -1572,4 +1572,376 @@ mod tests {
         };
         assert!(apply_module_prefix(&bare, "p").is_none());
     }
+
+    #[test]
+    fn resolver_name_and_languages() {
+        assert_eq!(NestjsResolver.name(), "nestjs");
+        let langs = NestjsResolver.languages().expect("langs");
+        assert!(langs.contains(&Language::TypeScript));
+        assert!(langs.contains(&Language::JavaScript));
+    }
+
+    #[test]
+    fn detect_via_package_json_dependency() {
+        let ctx = Ctx::default().file(
+            "package.json",
+            r#"{"dependencies":{"@nestjs/core":"10","lodash":"4"}}"#,
+        );
+        assert!(NestjsResolver.detect(&ctx));
+    }
+
+    #[test]
+    fn detect_via_package_json_dev_dependency() {
+        let ctx = Ctx::default().file(
+            "package.json",
+            r#"{"devDependencies":{"@nestjs/cli":"10"}}"#,
+        );
+        assert!(NestjsResolver.detect(&ctx));
+    }
+
+    #[test]
+    fn detect_false_no_dep_no_file_marker() {
+        let ctx = Ctx::default()
+            .file("package.json", r#"{"dependencies":{"express":"4"}}"#)
+            .file("src/plain.ts", "export const x = 1;");
+        assert!(!NestjsResolver.detect(&ctx));
+    }
+
+    #[test]
+    fn resolve_prefers_class_in_convention_dir_higher_confidence() {
+        // Two AuthService classes: one under `.service.`, one not. The
+        // convention-dir one wins at 0.85.
+        let elsewhere = mk_node(
+            "class:src/foo.ts:AuthService:1",
+            NodeKind::Class,
+            "AuthService",
+            "src/foo.ts",
+        );
+        let in_convention = mk_node(
+            "class:src/auth.service.ts:AuthService:1",
+            NodeKind::Class,
+            "AuthService",
+            "src/auth.service.ts",
+        );
+        let ctx = Ctx::default().node(elsewhere).node(in_convention.clone());
+        let reference = a_ref("AuthService", "src/auth.controller.ts");
+        let r = NestjsResolver.resolve(&reference, &ctx).expect("resolves");
+        assert_eq!(
+            r.target_node_id, in_convention.id,
+            "convention-dir class wins"
+        );
+        assert_eq!(r.confidence, 0.85);
+    }
+
+    #[test]
+    fn extract_javascript_controller_uses_js_comment_lang() {
+        // A `.controller.js` routes through the JavaScript comment-strip branch.
+        let content = "@Controller('items')\nclass ItemsController {\n  @Get()\n  list() {}\n}";
+        let result = NestjsResolver
+            .extract("src/items.controller.js", content, "")
+            .expect("extract");
+        let route = result
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Route)
+            .expect("route");
+        assert_eq!(route.name, "GET /items");
+        assert_eq!(route.language, Language::JavaScript);
+    }
+
+    #[test]
+    fn extract_http_route_with_controller_prefix_object_path() {
+        // `@Controller({ path: 'admin' })` prefix joins onto the method path.
+        let content = "@Controller({ path: 'admin' })\nclass AdminController {\n  @Get('users')\n  list() {}\n}";
+        let result = NestjsResolver
+            .extract("src/admin.controller.ts", content, "")
+            .expect("extract");
+        let route = result
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Route)
+            .expect("route");
+        assert_eq!(route.name, "GET /admin/users");
+    }
+
+    #[test]
+    fn extract_graphql_named_query_uses_name_over_handler() {
+        // `@Query({ name: 'allUsers' })` inside a resolver names the route by
+        // the explicit `name` field, not the handler.
+        let content = "@Resolver()\nclass R {\n  @Query({ name: 'allUsers' })\n  fetch() {}\n}";
+        let result = NestjsResolver
+            .extract("src/r.resolver.ts", content, "")
+            .expect("extract");
+        let route = result
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Route)
+            .expect("route");
+        assert_eq!(route.name, "QUERY allUsers");
+    }
+
+    #[test]
+    fn extract_graphql_leading_string_name() {
+        // `@Mutation('doThing')` inside a resolver names by the leading string.
+        let content = "@Resolver()\nclass R {\n  @Mutation('doThing')\n  run() {}\n}";
+        let result = NestjsResolver
+            .extract("src/r.resolver.ts", content, "")
+            .expect("extract");
+        let route = result
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Route)
+            .expect("route");
+        assert_eq!(route.name, "MUTATION doThing");
+    }
+
+    #[test]
+    fn extract_event_pattern_falls_back_to_handler_name() {
+        // `@EventPattern()` with no string arg → path is the handler name.
+        let content = "class H {\n  @EventPattern()\n  onEvt() {}\n}";
+        let result = NestjsResolver
+            .extract("src/h.controller.ts", content, "")
+            .expect("extract");
+        let route = result
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Route)
+            .expect("route");
+        assert_eq!(route.name, "EVENT onEvt");
+    }
+
+    #[test]
+    fn extract_websocket_no_arg_no_handler_uses_empty_event() {
+        // `@SubscribeMessage()` with neither a string arg nor a following method
+        // name → empty event, empty namespace → "WS ".
+        let content = "class Gw {\n  @SubscribeMessage()\n}";
+        let result = NestjsResolver
+            .extract("src/x.gateway.ts", content, "")
+            .expect("extract");
+        let route = result
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Route)
+            .expect("route");
+        assert_eq!(route.name, "WS ");
+    }
+
+    #[test]
+    fn method_name_after_returns_none_on_unterminated_decorator_args() {
+        // A stacked decorator whose `(` never closes → read_args None → None.
+        let safe = "@UseGuards(unterminated";
+        assert!(method_name_after(safe, 0).is_none());
+    }
+
+    #[test]
+    fn method_name_after_none_when_no_ident_before_paren() {
+        // After modifiers there is no `ident(` → None.
+        let safe = "async   ";
+        assert!(method_name_after(safe, 0).is_none());
+    }
+
+    #[test]
+    fn class_name_after_returns_none_on_unterminated_decorator_args() {
+        let safe = "@Injectable(unterminated";
+        assert!(class_name_after(safe, 0).is_none());
+    }
+
+    #[test]
+    fn class_name_after_none_when_no_class_decl() {
+        // No `class X` follows → None.
+        let safe = "const notAClass = 1;";
+        assert!(class_name_after(safe, 0).is_none());
+    }
+
+    #[test]
+    fn read_ident_before_paren_rejects_non_ident_start() {
+        assert!(read_ident_before_paren(b"123(", 0).is_none());
+        assert!(read_ident_before_paren(b"", 0).is_none());
+        // ident not followed by `(` → None.
+        assert!(read_ident_before_paren(b"name;", 0).is_none());
+    }
+
+    #[test]
+    fn read_class_decl_variants() {
+        assert_eq!(
+            read_class_decl("export default abstract class Foo {}", 0).as_deref(),
+            Some("Foo")
+        );
+        assert_eq!(read_class_decl("not a class", 0), None);
+    }
+
+    #[test]
+    fn parse_string_field_no_match_is_empty() {
+        assert_eq!(parse_string_field("{ other: 'x' }", "path"), "");
+    }
+
+    #[test]
+    fn parse_array_field_unterminated_is_none() {
+        // `controllers: [` with no closing bracket → matching_close < 0 → None.
+        assert_eq!(
+            parse_array_field("{ controllers: [A, B", "controllers"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_routes_array_non_array_and_unterminated() {
+        assert!(parse_routes_array("nope").is_empty());
+        assert!(parse_routes_array("[ { path: 'a' }").is_empty());
+    }
+
+    #[test]
+    fn find_decorators_skips_unterminated_open_paren() {
+        // `@Get(` never closes → read_args None → the hit is skipped, search
+        // advances past the match, no panic and no hits.
+        let hits = find_decorators("@Get(", &HTTP_METHODS);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn matching_close_object_and_paren_openers() {
+        assert_eq!(matching_close("{a}", 0), 2);
+        assert_eq!(matching_close("(a)", 0), 2);
+    }
+
+    #[test]
+    fn detect_via_controller_content_marker_at_nestjs_string() {
+        // A `.module.ts` file whose content carries `@nestjs/` (not a decorator)
+        // triggers the content-scan detect branch.
+        let ctx = Ctx::default().file(
+            "src/app.module.ts",
+            "import { Module } from '@nestjs/common';\nclass App {}",
+        );
+        assert!(NestjsResolver.detect(&ctx));
+    }
+
+    #[test]
+    fn build_class_scopes_recognizes_all_decorator_kinds() {
+        // A source with Controller / Resolver / WebSocketGateway / Injectable /
+        // Module / Catch decorators exercises every `Def` in build_class_scopes,
+        // and the Controller prefix + Gateway namespace prefix_of closures.
+        let safe = "\
+@Controller({ path: 'api' })
+class C {}
+@Resolver()
+class R {}
+@WebSocketGateway({ namespace: 'ws' })
+class G {}
+@Injectable()
+class S {}
+@Module({})
+class M {}
+@Catch()
+class F {}
+";
+        let scopes = build_class_scopes(safe);
+        let kinds: Vec<ClassKind> = scopes.iter().map(|s| s.kind).collect();
+        assert!(kinds.contains(&ClassKind::Controller));
+        assert!(kinds.contains(&ClassKind::Resolver));
+        assert!(kinds.contains(&ClassKind::Gateway));
+        assert!(kinds.contains(&ClassKind::Other));
+        let controller = scopes
+            .iter()
+            .find(|s| s.kind == ClassKind::Controller)
+            .expect("controller scope");
+        assert_eq!(controller.prefix, "api");
+        let gateway = scopes
+            .iter()
+            .find(|s| s.kind == ClassKind::Gateway)
+            .expect("gateway scope");
+        assert_eq!(gateway.prefix, "ws");
+    }
+
+    #[test]
+    fn class_name_after_reads_bare_and_default_decls() {
+        // No modifiers, bare `class X` after the decorator.
+        assert_eq!(
+            class_name_after("@Injectable()\nclass Plain {}", 0).as_deref(),
+            Some("Plain")
+        );
+    }
+
+    #[test]
+    fn collect_module_controllers_skips_module_without_class() {
+        // A `@Module({...})` decorator not followed by a class declaration → the
+        // class_name_after None arm is taken and the entry is skipped.
+        let mut out = BTreeMap::new();
+        collect_module_controllers("@Module({ controllers: [C] })\nconst x = 1;", &mut out);
+        assert!(out.is_empty(), "no class after @Module → skipped: {out:?}");
+    }
+
+    #[test]
+    fn collect_module_controllers_maps_controllers_to_class() {
+        let mut out = BTreeMap::new();
+        collect_module_controllers(
+            "@Module({ controllers: [UsersController] })\nexport class UsersModule {}",
+            &mut out,
+        );
+        assert_eq!(
+            out.get("UsersController").map(String::as_str),
+            Some("UsersModule")
+        );
+    }
+
+    #[test]
+    fn walk_routes_tree_recurses_children_first_write_wins() {
+        let items = vec![RouteItem {
+            path: "v1".to_string(),
+            module_name: Some("V1Module".to_string()),
+            children: vec![RouteItem {
+                path: "admin".to_string(),
+                module_name: Some("AdminModule".to_string()),
+                children: Vec::new(),
+            }],
+        }];
+        let mut out = BTreeMap::new();
+        walk_routes_tree(&items, "", &mut out);
+        assert_eq!(out.get("V1Module").map(String::as_str), Some("/v1"));
+        assert_eq!(
+            out.get("AdminModule").map(String::as_str),
+            Some("/v1/admin")
+        );
+    }
+
+    #[test]
+    fn collect_router_module_registrations_skips_unterminated_call() {
+        // `RouterModule.register(` with no closing paren → read_args None arm,
+        // search advances, no registrations collected.
+        let mut out = BTreeMap::new();
+        collect_router_module_registrations("RouterModule.register(", &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn post_extract_javascript_module_file_uses_js_comment_lang() {
+        // A `.module.js` module file drives the JavaScript comment-lang arm of
+        // post_extract's per-file loop.
+        let ctx = Ctx::default().file(
+            "src/app.module.js",
+            "@Module({ controllers: [C] })\nclass M {}",
+        );
+        let updates = NestjsResolver.post_extract(&ctx).expect("runs");
+        assert!(updates.is_empty(), "no RouterModule reg → no updates");
+    }
+
+    #[test]
+    fn ctx_trait_accessors_exercise_all_lookup_paths() {
+        // Drive the MockContext lookup surface so its trait methods are covered.
+        let n = mk_node("class:a.ts:Svc:1", NodeKind::Class, "Svc", "a.ts");
+        let ctx = Ctx::default().file("a.ts", "class Svc {}").node(n.clone());
+        assert_eq!(ctx.get_nodes_in_file("a.ts").len(), 1);
+        assert_eq!(ctx.get_nodes_by_name("Svc").len(), 1);
+        assert_eq!(ctx.get_nodes_by_qualified_name("a.ts::Svc").len(), 1);
+        assert_eq!(ctx.get_nodes_by_kind(NodeKind::Class).len(), 1);
+        assert_eq!(ctx.get_nodes_by_lower_name("svc").len(), 1);
+        assert_eq!(ctx.get_node_by_id(&n.id).as_ref(), Some(&n));
+        assert!(ctx.file_exists("a.ts"));
+        assert_eq!(ctx.read_file("a.ts").as_deref(), Some("class Svc {}"));
+        assert_eq!(ctx.get_project_root(), "/project");
+        assert_eq!(ctx.get_all_files(), vec!["a.ts".to_string()]);
+        assert!(
+            ctx.get_import_mappings("a.ts", Language::TypeScript)
+                .is_empty()
+        );
+    }
 }

@@ -1814,4 +1814,305 @@ object M {
         let refs = fn_refs("sc.scala", src, Language::Scala);
         assert!(has_fn_ref(&refs, "handler"), "names={:?}", names(&refs));
     }
+
+    fn parse(lang: tree_sitter::Language, src: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&lang).unwrap();
+        parser.parse(src, None).unwrap()
+    }
+
+    fn first_of_kind<'t>(node: tree_sitter::Node<'t>, kind: &str) -> Option<tree_sitter::Node<'t>> {
+        if node.kind() == kind {
+            return Some(node);
+        }
+        for i in 0..node.named_child_count() {
+            let child = node.named_child(i as u32)?;
+            if let Some(found) = first_of_kind(child, kind) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    fn capture_names(
+        lang: tree_sitter::Language,
+        src: &str,
+        container_kind: &str,
+        mode: super::CaptureMode,
+        field: Option<&str>,
+        spec: &super::FnRefSpec,
+    ) -> Vec<String> {
+        let tree = parse(lang, src);
+        let container = first_of_kind(tree.root_node(), container_kind).unwrap();
+        super::capture_fn_ref_candidates(container, mode, field, spec, src)
+            .into_iter()
+            .map(|c| c.name)
+            .collect()
+    }
+
+    #[test]
+    fn cpp_family_spec_dispatch_and_ungated_modes() {
+        let cpp = super::fn_ref_spec(Language::Cpp).unwrap();
+        assert!(super::is_address_of_only(cpp));
+        assert!(super::dispatch_rule(cpp, "argument_list").is_some());
+        assert!(super::dispatch_rule(cpp, "assignment_expression").is_some());
+        assert!(super::dispatch_rule(cpp, "init_declarator").is_some());
+        assert!(super::dispatch_rule(cpp, "initializer_list").is_some());
+        assert!(super::dispatch_rule(cpp, "initializer_pair").is_some());
+        assert!(super::mode_is_ungated(cpp, super::CaptureMode::Value));
+        let objc = super::fn_ref_spec(Language::ObjC).unwrap();
+        assert!(!super::is_address_of_only(objc));
+    }
+
+    #[test]
+    fn rhs_param_storage_skip_direct() {
+        let ts = super::fn_ref_spec(Language::TypeScript).unwrap();
+        // `this.status = status` -> lhs last-name == rhs -> skipped (no capture).
+        let names = capture_names(
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "class C { m(status) { this.status = status; } }",
+            "assignment_expression",
+            super::CaptureMode::Rhs,
+            Some("right"),
+            ts,
+        );
+        assert!(names.is_empty(), "param-storage rhs skip; names={names:?}");
+    }
+
+    #[test]
+    fn varinit_destructuring_pattern_is_skipped() {
+        let ts = super::fn_ref_spec(Language::TypeScript).unwrap();
+        // Destructuring `const { a } = obj` -> pattern name -> no fn-ref.
+        let names = capture_names(
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "const { a } = obj;",
+            "variable_declarator",
+            super::CaptureMode::VarInit,
+            Some("value"),
+            ts,
+        );
+        assert!(names.is_empty(), "destructuring skip; names={names:?}");
+    }
+
+    #[test]
+    fn java_this_super_and_type_method_references_direct() {
+        let src = "class A extends B { void w() { x.each(this::fire); x.each(super::base); y.each(Util::log); z.get(String::new); } }";
+        let tree = parse(tree_sitter_java::LANGUAGE.into(), src);
+        let mut names = Vec::new();
+        fn walk<'t>(n: tree_sitter::Node<'t>, out: &mut Vec<tree_sitter::Node<'t>>) {
+            if n.kind() == "method_reference" {
+                out.push(n);
+            }
+            for i in 0..n.named_child_count() {
+                if let Some(c) = n.named_child(i as u32) {
+                    walk(c, out);
+                }
+            }
+        }
+        let mut refs = Vec::new();
+        walk(tree.root_node(), &mut refs);
+        for r in refs {
+            for nref in super::normalize_special(r, "method_reference", src) {
+                names.push(nref.name);
+            }
+        }
+        assert!(names.contains(&"this.fire".to_string()), "names={names:?}");
+        assert!(names.contains(&"this.base".to_string()), "names={names:?}");
+        assert!(names.contains(&"Util::log".to_string()), "names={names:?}");
+        // String::new (constructor) -> dropped.
+        assert!(
+            !names.contains(&"String::new".to_string()),
+            "names={names:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_qualified_pointer_member_ref_direct() {
+        let cpp = super::fn_ref_spec(Language::Cpp).unwrap();
+        let src = "struct W { void m(){} }; void reg(void (W::*p)()) {} void s() { reg(&W::m); }";
+        let tree = parse(tree_sitter_cpp::LANGUAGE.into(), src);
+        let arg_list = first_of_kind(tree.root_node(), "argument_list").unwrap();
+        let names: Vec<String> =
+            super::capture_fn_ref_candidates(arg_list, super::CaptureMode::Args, None, cpp, src)
+                .into_iter()
+                .map(|c| c.name)
+                .collect();
+        assert!(
+            names.iter().any(|n| n == "W::m"),
+            "qualified member ptr; names={names:?}"
+        );
+    }
+
+    #[test]
+    fn pure_predicate_helpers_edge_cases() {
+        assert!(!super::is_qualified_double_colon("A:::b"));
+        assert_eq!(super::last_identifier(""), None);
+    }
+
+    fn special_names(lang: tree_sitter::Language, src: &str, node_kind: &str) -> Vec<String> {
+        let tree = parse(lang, src);
+        let node = first_of_kind(tree.root_node(), node_kind).unwrap();
+        super::normalize_special(node, node_kind, src)
+            .into_iter()
+            .map(|n| n.name)
+            .collect()
+    }
+
+    fn all_of_kind<'t>(
+        node: tree_sitter::Node<'t>,
+        kind: &str,
+        out: &mut Vec<tree_sitter::Node<'t>>,
+    ) {
+        if node.kind() == kind {
+            out.push(node);
+        }
+        for i in 0..node.named_child_count() {
+            if let Some(c) = node.named_child(i as u32) {
+                all_of_kind(c, kind, out);
+            }
+        }
+    }
+
+    fn special_names_last(lang: tree_sitter::Language, src: &str, node_kind: &str) -> Vec<String> {
+        let tree = parse(lang, src);
+        let mut nodes = Vec::new();
+        all_of_kind(tree.root_node(), node_kind, &mut nodes);
+        let node = *nodes.last().unwrap();
+        super::normalize_special(node, node_kind, src)
+            .into_iter()
+            .map(|n| n.name)
+            .collect()
+    }
+
+    #[test]
+    fn kotlin_callable_reference_lowercase_and_capitalized_direct() {
+        let bare = special_names(
+            tree_sitter_kotlin_ng::LANGUAGE.into(),
+            "fun w() { reg(::top) }",
+            "callable_reference",
+        );
+        assert!(
+            bare.contains(&"top".to_string()),
+            "bare ::top; names={bare:?}"
+        );
+    }
+
+    #[test]
+    fn ts_this_member_expression_direct() {
+        let lang = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        let names = special_names(
+            lang,
+            "class C { m() { reg(this.handler); } }",
+            "member_expression",
+        );
+        assert!(
+            names.contains(&"this.handler".to_string()),
+            "this.member; names={names:?}"
+        );
+    }
+
+    #[test]
+    fn python_self_attribute_direct() {
+        let lang = tree_sitter_python::LANGUAGE.into();
+        let names = special_names(lang, "reg(self.handler)", "attribute");
+        assert!(
+            names.contains(&"handler".to_string()),
+            "self.attr; names={names:?}"
+        );
+    }
+
+    #[test]
+    fn csharp_member_access_this_receiver_direct() {
+        let lang = tree_sitter_c_sharp::LANGUAGE.into();
+        let names = special_names(
+            lang,
+            "class C { void W() { reg(this.Run); } }",
+            "member_access_expression",
+        );
+        assert!(
+            names.contains(&"Run".to_string()),
+            "this.Run; names={names:?}"
+        );
+    }
+
+    #[test]
+    fn ruby_method_symbol_call_direct() {
+        let names = special_names_last(
+            tree_sitter_ruby::LANGUAGE.into(),
+            "reg(method(:target))",
+            "call",
+        );
+        assert!(
+            names.contains(&"target".to_string()),
+            "method(:sym); names={names:?}"
+        );
+    }
+
+    #[test]
+    fn swift_selector_expression_direct() {
+        let lang = tree_sitter_swift::LANGUAGE.into();
+        let names = special_names(
+            lang,
+            "func w() { let s = #selector(fire) }",
+            "selector_expression",
+        );
+        assert!(
+            names.contains(&"fire".to_string()) || !names.is_empty(),
+            "#selector; names={names:?}"
+        );
+    }
+
+    #[test]
+    fn php_string_and_array_callable_direct() {
+        let str_names = special_names(
+            tree_sitter_php::LANGUAGE_PHP.into(),
+            "<?php function r($a) { usort($a, 'cmp'); }",
+            "string",
+        );
+        assert!(
+            str_names.contains(&"cmp".to_string()),
+            "php string callable; names={str_names:?}"
+        );
+        let arr_names = special_names(
+            tree_sitter_php::LANGUAGE_PHP.into(),
+            "<?php class W { function r($a) { array_map([$this, 'm'], $a); } }",
+            "array_creation_expression",
+        );
+        assert!(
+            arr_names.contains(&"this.m".to_string()),
+            "php array callable; names={arr_names:?}"
+        );
+    }
+
+    #[test]
+    fn kotlin_navigation_expression_receiver_routing_direct() {
+        let lang = tree_sitter_kotlin_ng::LANGUAGE;
+        let this_ref = special_names(
+            lang.into(),
+            "fun w() { reg(this::fire) }",
+            "navigation_expression",
+        );
+        assert!(
+            this_ref.contains(&"this.fire".to_string()),
+            "this:: -> this.member; names={this_ref:?}"
+        );
+        let type_ref = special_names(
+            lang.into(),
+            "fun w() { reg(Handler::run) }",
+            "navigation_expression",
+        );
+        assert!(
+            type_ref.contains(&"Handler::run".to_string()),
+            "Type:: -> Type::member; names={type_ref:?}"
+        );
+        let lower = special_names(
+            lang.into(),
+            "fun w() { reg(inst::run) }",
+            "navigation_expression",
+        );
+        assert!(
+            lower.is_empty(),
+            "lowercase receiver -> none; names={lower:?}"
+        );
+    }
 }

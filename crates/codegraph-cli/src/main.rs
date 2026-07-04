@@ -5108,4 +5108,71 @@ mod formatter_and_env_tests {
             assert!(String::from_utf8_lossy(&bytes).contains("codegraph"));
         }
     }
+
+    #[test]
+    fn install_completions_writes_zsh_fish_elvish_into_home() {
+        let dir = tmp("install-comp");
+        let prev_home = std::env::var_os("HOME");
+        let prev_xdg = std::env::var_os("XDG_DATA_HOME");
+        unsafe { std::env::set_var("HOME", &dir) };
+        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+
+        install_completions(Shell::Zsh).unwrap();
+        assert!(dir.join(".zfunc/_codegraph").is_file());
+
+        install_completions(Shell::Fish).unwrap();
+        assert!(
+            dir.join(".config/fish/completions/codegraph.fish")
+                .is_file()
+        );
+
+        install_completions(Shell::Elvish).unwrap();
+        let elv = dir.join(".config/codegraph/completion.elv");
+        assert!(elv.is_file());
+        assert!(fs::read_to_string(&elv).unwrap().contains("codegraph"));
+
+        install_completions(Shell::Bash).unwrap();
+        assert!(
+            dir.join(".local/share/bash-completion/completions/codegraph")
+                .is_file()
+        );
+
+        match prev_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        match prev_xdg {
+            Some(v) => unsafe { std::env::set_var("XDG_DATA_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_DATA_HOME") },
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn install_completions_powershell_writes_script_and_dot_sources_profile() {
+        let dir = tmp("install-ps");
+        let prev_local = std::env::var_os("LOCALAPPDATA");
+        let prev_ps = std::env::var_os("CODEGRAPH_PS_PROFILE");
+        let profile = dir.join("profile.ps1");
+        unsafe { std::env::set_var("LOCALAPPDATA", &dir) };
+        unsafe { std::env::set_var("CODEGRAPH_PS_PROFILE", &profile) };
+
+        install_completions(Shell::PowerShell).unwrap();
+        let script = dir.join("codegraph/completion.ps1");
+        assert!(script.is_file());
+        install_completions(Shell::PowerShell).unwrap();
+        let line = format!(". \"{}\"", script.display());
+        let body = fs::read_to_string(&profile).unwrap();
+        assert_eq!(body.lines().filter(|l| l.trim() == line).count(), 1);
+
+        match prev_local {
+            Some(v) => unsafe { std::env::set_var("LOCALAPPDATA", v) },
+            None => unsafe { std::env::remove_var("LOCALAPPDATA") },
+        }
+        match prev_ps {
+            Some(v) => unsafe { std::env::set_var("CODEGRAPH_PS_PROFILE", v) },
+            None => unsafe { std::env::remove_var("CODEGRAPH_PS_PROFILE") },
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

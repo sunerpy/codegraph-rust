@@ -273,6 +273,48 @@ fn affected_json_lists_tests_for_a_changed_file() {
 }
 
 #[test]
+fn affected_traverses_dependents_at_depth() {
+    let dir = TestDir::new("affected-depth");
+    let project = indexed_project(&dir);
+    let p = project.to_str().unwrap();
+    let run = run_in(
+        dir.path(),
+        &["affected", "-p", p, "--depth", "3", "src/math.ts"],
+    );
+    assert!(run.ok, "affected --depth must succeed: {}", run.stderr);
+    let value: serde_json::Value = serde_json::from_str(&run.stdout).expect("affected JSON");
+    assert!(
+        value["totalDependentsTraversed"].as_i64().unwrap() >= 1,
+        "changing src/math.ts must traverse its dependent app.ts: {}",
+        run.stdout
+    );
+}
+
+#[test]
+fn affected_with_filter_treats_matches_as_tests() {
+    let dir = TestDir::new("affected-filter");
+    let project = indexed_project(&dir);
+    let p = project.to_str().unwrap();
+    let run = run_in(
+        dir.path(),
+        &["affected", "-p", p, "--filter", "src/*", "src/math.ts"],
+    );
+    assert!(run.ok, "affected --filter must succeed: {}", run.stderr);
+    let value: serde_json::Value = serde_json::from_str(&run.stdout).expect("affected JSON");
+    let tests: Vec<String> = value["affectedTests"]
+        .as_array()
+        .expect("affectedTests array")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        tests.contains(&"src/math.ts".to_string()),
+        "a --filter match must count the changed file as a test: {}",
+        run.stdout
+    );
+}
+
+#[test]
 fn index_without_init_errors() {
     let dir = TestDir::new("index-noinit");
     let bare = dir.path().join("bare");
@@ -322,6 +364,124 @@ fn export_pretty_and_centrality_to_stdout() {
     assert!(
         value.get("nodes").is_some(),
         "export graph must carry nodes: {}",
+        run.stdout
+    );
+}
+
+#[test]
+fn files_pattern_filter_keeps_only_glob_matches() {
+    let dir = TestDir::new("files-pattern");
+    let project = indexed_project(&dir);
+    let p = project.to_str().unwrap();
+    let run = run_in(
+        dir.path(),
+        &["files", "-p", p, "--pattern", "*.ts", "--json"],
+    );
+    assert!(run.ok, "files --pattern must succeed: {}", run.stderr);
+    let value: serde_json::Value = serde_json::from_str(&run.stdout).expect("files JSON");
+    let paths: Vec<String> = value
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|f| f["path"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        !paths.is_empty() && paths.iter().all(|path| path.ends_with(".ts")),
+        "pattern *.ts must keep only .ts files: {paths:?}"
+    );
+}
+
+#[test]
+fn files_flat_and_grouped_text_render() {
+    let dir = TestDir::new("files-formats");
+    let project = indexed_project(&dir);
+    let p = project.to_str().unwrap();
+    for fmt in ["flat", "grouped"] {
+        let run = run_in(dir.path(), &["files", "-p", p, "--format", fmt]);
+        assert!(run.ok, "files --format {fmt} must succeed: {}", run.stderr);
+        assert!(
+            run.stdout.contains(".ts") || run.stdout.contains(".py"),
+            "files --format {fmt} must list source files: {}",
+            run.stdout
+        );
+    }
+}
+
+#[test]
+fn status_json_initialized_carries_index_metadata() {
+    let dir = TestDir::new("status-json-full");
+    let project = indexed_project(&dir);
+    let p = project.to_str().unwrap();
+    let run = run_in(dir.path(), &["status", p, "--json"]);
+    assert!(run.ok, "status --json must succeed: {}", run.stderr);
+    let value: serde_json::Value = serde_json::from_str(&run.stdout).expect("status JSON");
+    assert_eq!(value["initialized"], serde_json::json!(true));
+    assert_eq!(value["journalMode"], serde_json::json!("wal"));
+    assert!(
+        value["nodesByKind"].is_object(),
+        "nodesByKind must be present"
+    );
+    assert!(
+        value["index"]["currentExtractionVersion"]
+            .as_i64()
+            .is_some(),
+        "index metadata must carry the extraction version: {}",
+        run.stdout
+    );
+}
+
+#[test]
+fn sync_after_index_reports_a_summary() {
+    let dir = TestDir::new("sync-summary");
+    let project = indexed_project(&dir);
+    let p = project.to_str().unwrap();
+    let run = run_in(dir.path(), &["sync", p]);
+    assert!(run.ok, "sync must succeed: {}", run.stderr);
+    assert!(
+        run.stdout.contains("Synced:") && run.stdout.contains("skipped"),
+        "sync must print the reindexed/skipped/removed summary: {}",
+        run.stdout
+    );
+}
+
+#[test]
+fn sync_quiet_prints_no_summary() {
+    let dir = TestDir::new("sync-quiet");
+    let project = indexed_project(&dir);
+    let p = project.to_str().unwrap();
+    let run = run_in(dir.path(), &["sync", p, "--quiet"]);
+    assert!(run.ok, "sync --quiet must succeed: {}", run.stderr);
+    assert!(
+        !run.stdout.contains("Synced:"),
+        "sync --quiet must stay silent on stdout: {}",
+        run.stdout
+    );
+}
+
+#[test]
+fn index_quiet_suppresses_the_result_banner() {
+    let dir = TestDir::new("index-quiet");
+    let project = indexed_project(&dir);
+    let p = project.to_str().unwrap();
+    let run = run_in(dir.path(), &["index", "--force", "--quiet", p]);
+    assert!(run.ok, "index --quiet must succeed: {}", run.stderr);
+    assert!(
+        run.stdout.trim().is_empty(),
+        "index --quiet must not print the result banner: {}",
+        run.stdout
+    );
+}
+
+#[test]
+fn index_verbose_prints_the_result_banner() {
+    let dir = TestDir::new("index-verbose");
+    let project = indexed_project(&dir);
+    let p = project.to_str().unwrap();
+    let run = run_in(dir.path(), &["index", "--force", "--verbose", p]);
+    assert!(run.ok, "index --verbose must succeed: {}", run.stderr);
+    assert!(
+        run.stdout.contains("Indexed") && run.stdout.contains("nodes"),
+        "index --verbose must print the result banner: {}",
         run.stdout
     );
 }

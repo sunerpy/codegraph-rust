@@ -192,3 +192,66 @@ fn is_ident(text: &str) -> bool {
         .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
         && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(src: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_scala::LANGUAGE.into())
+            .unwrap();
+        parser.parse(src, None).unwrap()
+    }
+
+    fn first_of_kind<'t>(node: Node<'t>, kind: &str) -> Option<Node<'t>> {
+        if node.kind() == kind {
+            return Some(node);
+        }
+        for i in 0..node.named_child_count() {
+            let child = node.named_child(i as u32)?;
+            if let Some(found) = first_of_kind(child, kind) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn trait_field_constants_are_stable() {
+        assert_eq!(SCALA_SPEC.name_field(), "name");
+        assert_eq!(SCALA_SPEC.body_field(), "body");
+        assert_eq!(SCALA_SPEC.params_field(), "parameters");
+        assert_eq!(SCALA_SPEC.return_field(), "return_type");
+    }
+
+    #[test]
+    fn stable_identifier_import_fallback() {
+        let src = "import a.b.c\n";
+        let tree = parse(src);
+        let import = first_of_kind(tree.root_node(), "import_declaration").unwrap();
+        let info = SCALA_SPEC.extract_import(import, src).unwrap();
+        assert!(!info.module_name.is_empty());
+    }
+
+    #[test]
+    fn single_identifier_import_uses_fallback_branch() {
+        let src = "import foo\n";
+        let tree = parse(src);
+        let import = first_of_kind(tree.root_node(), "import_declaration").unwrap();
+        let info = SCALA_SPEC.extract_import(import, src).unwrap();
+        assert_eq!(info.module_name, "foo");
+    }
+
+    #[test]
+    fn generic_bracket_return_strips_to_outer_type() {
+        let src = "class C { def f(): Option[String] = None }";
+        let tree = parse(src);
+        let func = first_of_kind(tree.root_node(), "function_definition").unwrap();
+        assert_eq!(
+            SCALA_SPEC.get_return_type(func, src).as_deref(),
+            Some("Option")
+        );
+    }
+}

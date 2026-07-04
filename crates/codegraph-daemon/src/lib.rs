@@ -681,4 +681,98 @@ mod tests {
         handle.stop().expect("stop the daemon");
         let _ = fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn handle_wait_returns_after_shutdown_and_reports_finished() {
+        let root = temp_root("wait");
+        let StartOrAttach::Started(handle) =
+            start_or_attach(&root, quiet_options()).expect("start a fresh daemon")
+        else {
+            panic!("a fresh project must start a daemon");
+        };
+        assert!(
+            !handle.is_finished(),
+            "a just-started daemon is not finished"
+        );
+        handle.shutdown.store(true, Ordering::SeqCst);
+        for _ in 0..200 {
+            if handle.is_finished() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(handle.is_finished(), "loop must observe the shutdown flag");
+        handle.wait().expect("wait joins the accept thread cleanly");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn start_or_attach_clears_a_stale_lock_with_a_dead_pid_and_restarts() {
+        let root = temp_root("stale-dead");
+        fs::create_dir_all(paths::codegraph_dir(&root)).unwrap();
+        let mut dead_pid = 999_999u32;
+        while is_process_alive(dead_pid) {
+            dead_pid -= 1;
+        }
+        let pid_path = daemon_pid_path(&root);
+        let stale = DaemonLockInfo {
+            pid: dead_pid,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            socket_path: daemon_socket_path(&root),
+            started_at: 1,
+        };
+        fs::write(&pid_path, encode_lock_info(&stale).unwrap()).unwrap();
+
+        let started = start_or_attach(&root, quiet_options())
+            .expect("a stale dead-pid lock must be cleared and a new daemon started");
+        let StartOrAttach::Started(handle) = started else {
+            panic!("a stale dead-pid lock must yield a freshly started daemon, not an attach");
+        };
+        assert_eq!(handle.active_sessions(), 0);
+        handle.stop().expect("stop the recovered daemon");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn start_or_attach_clears_a_garbage_lock_without_info_and_restarts() {
+        let root = temp_root("stale-garbage");
+        fs::create_dir_all(paths::codegraph_dir(&root)).unwrap();
+        let pid_path = daemon_pid_path(&root);
+        fs::write(&pid_path, b"not-json-at-all").unwrap();
+
+        let started = start_or_attach(&root, quiet_options())
+            .expect("an undecodable lock must be cleared and a new daemon started");
+        let StartOrAttach::Started(handle) = started else {
+            panic!("an undecodable lock must yield a freshly started daemon");
+        };
+        handle.stop().expect("stop the recovered daemon");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bind_with_fallback_binds_the_preferred_socket_first() {
+        let root = temp_root("bind-fallback");
+        fs::create_dir_all(paths::codegraph_dir(&root)).unwrap();
+        let preferred = daemon_socket_path(&root);
+        let (_listener, bound) =
+            bind_with_fallback(&root, preferred.clone()).expect("preferred socket must bind");
+        assert_eq!(bound, preferred, "the preferred candidate binds first");
+        #[cfg(unix)]
+        if let Some(stale) = Rendezvous::from_socket_path(&bound).cleanup_path() {
+            let _ = fs::remove_file(stale);
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn attach_to_a_dead_socket_path_errors() {
+        let root = temp_root("attach-dead");
+        let socket = daemon_socket_path(&root);
+        let err = attach_to_daemon(&socket).expect_err("attaching to an unbound socket must fail");
+        assert!(
+            err.to_string().contains("connecting to daemon socket"),
+            "unexpected error: {err}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
 }

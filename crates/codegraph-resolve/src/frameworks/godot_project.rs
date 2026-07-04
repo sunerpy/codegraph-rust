@@ -379,3 +379,60 @@ fn brace_delta(line: &str) -> i32 {
     }
     delta
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn autoload_script_paths_maps_name_to_repo_relative() {
+        let content =
+            "[autoload]\nGameState=\"*res://globals/state.gd\"\nMusic=\"res://audio/m.gd\"\n";
+        let got = autoload_script_paths(content);
+        assert_eq!(
+            got,
+            vec![
+                ("GameState".to_string(), "globals/state.gd".to_string()),
+                ("Music".to_string(), "audio/m.gd".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn autoload_script_paths_first_write_wins_on_dup_name() {
+        let content = "[autoload]\nX=\"res://a.gd\"\nX=\"res://b.gd\"\n";
+        let got = autoload_script_paths(content);
+        assert_eq!(got, vec![("X".to_string(), "a.gd".to_string())]);
+    }
+
+    #[test]
+    fn autoload_script_paths_skips_non_res_value() {
+        let content = "[autoload]\nX=\"user://a.gd\"\n";
+        assert!(autoload_script_paths(content).is_empty());
+    }
+
+    #[test]
+    fn autoload_script_paths_ignores_input_multiline_and_other_sections() {
+        let content = "\
+[input]
+jump={
+\"deadzone\": 0.5
+}
+
+[application]
+run/main_scene=\"res://main.tscn\"
+
+[autoload]
+X=\"res://x.gd\"
+";
+        assert_eq!(
+            autoload_script_paths(content),
+            vec![("X".to_string(), "x.gd".to_string())]
+        );
+    }
+
+    #[test]
+    fn autoload_script_paths_empty_when_no_autoload() {
+        assert!(autoload_script_paths("; comment\nconfig_version=5\n").is_empty());
+    }
+}

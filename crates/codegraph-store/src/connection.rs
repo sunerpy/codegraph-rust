@@ -205,4 +205,111 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn open_on_a_non_sqlite_file_surfaces_migrate_error() {
+        let base = std::env::temp_dir().join(format!(
+            "codegraph-conn-garbage-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let db_path = base.join("graph.db");
+        std::fs::write(&db_path, b"this is not a sqlite database at all").unwrap();
+
+        let Err(err) = Store::open(&db_path) else {
+            panic!("a non-sqlite file must fail to open+migrate");
+        };
+        assert!(
+            matches!(
+                err,
+                StoreError::Configure { .. } | StoreError::Migrate { .. } | StoreError::Open { .. }
+            ),
+            "a corrupt db must surface a Configure/Migrate/Open error, got: {err}"
+        );
+        assert!(err.to_string().contains(&db_path.display().to_string()));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn open_when_db_path_is_a_directory_surfaces_open_error() {
+        let base = std::env::temp_dir().join(format!(
+            "codegraph-conn-dbdir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db_path = base.join("graph.db");
+        std::fs::create_dir_all(&db_path).unwrap();
+
+        let Err(err) = Store::open(&db_path) else {
+            panic!("opening a directory as a db file must fail");
+        };
+        assert!(
+            matches!(err, StoreError::Open { .. } | StoreError::Configure { .. }),
+            "a directory db path must surface an Open/Configure error, got: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn open_when_parent_is_a_file_surfaces_create_dir_error() {
+        let base = std::env::temp_dir().join(format!(
+            "codegraph-conn-fileparent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let blocker = base.join("blocker");
+        std::fs::write(&blocker, b"i am a file, not a directory").unwrap();
+        let db_path = blocker.join("nested").join("graph.db");
+
+        let Err(err) = Store::open(&db_path) else {
+            panic!("creating a dir under a regular file must fail at CreateDir");
+        };
+        assert!(
+            matches!(err, StoreError::CreateDir { .. }),
+            "unexpected error variant: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn store_error_messages_name_the_path_for_each_variant() {
+        let p = PathBuf::from("/tmp/x.db");
+        let io_err = || std::io::Error::other("boom");
+        let sql_err = || rusqlite::Error::InvalidQuery;
+
+        let create = StoreError::CreateDir {
+            path: p.clone(),
+            source: io_err(),
+        };
+        assert!(create.to_string().contains("/tmp/x.db"));
+        let open = StoreError::Open {
+            path: p.clone(),
+            source: sql_err(),
+        };
+        assert!(open.to_string().contains("/tmp/x.db"));
+        let configure = StoreError::Configure {
+            path: p.clone(),
+            source: sql_err(),
+        };
+        assert!(configure.to_string().contains("/tmp/x.db"));
+        let migrate = StoreError::Migrate {
+            path: p,
+            source: sql_err(),
+        };
+        assert!(migrate.to_string().contains("/tmp/x.db"));
+    }
 }

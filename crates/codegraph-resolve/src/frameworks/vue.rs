@@ -764,4 +764,139 @@ mod tests {
             .expect("route");
         assert_eq!(route.name, "/about");
     }
+
+    #[test]
+    fn resolver_name_is_vue() {
+        assert_eq!(VueResolver.name(), "vue");
+    }
+
+    #[test]
+    fn resolve_tilde_alias_when_at_prefix_absent() {
+        // A `~/` import (the `@/` strip_prefix returns None first, then the `~/`
+        // branch resolves) lands on the aliased node.
+        let target = mk_node(
+            "var:src/helpers/fmt.ts:fmt:1",
+            NodeKind::Variable,
+            "fmt",
+            "src/helpers/fmt.ts",
+        );
+        let ctx = Ctx::default()
+            .file("src/helpers/fmt.ts", "export const fmt=1;")
+            .node(target.clone());
+        let reference = a_ref("~/helpers/fmt", EdgeKind::Imports, "src/App.vue");
+        let r = VueResolver.resolve(&reference, &ctx).expect("resolves");
+        assert_eq!(r.target_node_id, target.id);
+        assert_eq!(r.confidence, 0.9);
+    }
+
+    #[test]
+    fn resolve_component_same_dir_wins_over_other_dirs() {
+        // Two Button.vue files: one in the caller's dir, one elsewhere. The
+        // same-dir match resolves even though the basename is ambiguous.
+        let same_dir = mk_node(
+            "component:z/Button.vue:Button:1",
+            NodeKind::Component,
+            "Button",
+            "z/Button.vue",
+        );
+        let other = mk_node(
+            "component:x/Button.vue:Button:1",
+            NodeKind::Component,
+            "Button",
+            "x/Button.vue",
+        );
+        let ctx = Ctx::default()
+            .file("z/Button.vue", "<template/>")
+            .file("x/Button.vue", "<template/>")
+            .node(same_dir.clone())
+            .node(other);
+        let reference = a_ref("Button", EdgeKind::Calls, "z/Page.vue");
+        let r = VueResolver.resolve(&reference, &ctx).expect("resolves");
+        assert_eq!(r.target_node_id, same_dir.id, "same-dir component wins");
+        assert_eq!(r.confidence, 0.8);
+    }
+
+    #[test]
+    fn resolve_component_unique_basename_resolves() {
+        // A single matching Button.vue not in the caller's dir → unambiguous, so
+        // it resolves.
+        let comp = mk_node(
+            "component:widgets/Button.vue:Button:1",
+            NodeKind::Component,
+            "Button",
+            "widgets/Button.vue",
+        );
+        let ctx = Ctx::default()
+            .file("widgets/Button.vue", "<template/>")
+            .node(comp.clone());
+        let reference = a_ref("Button", EdgeKind::Calls, "pages/Home.vue");
+        let r = VueResolver.resolve(&reference, &ctx).expect("resolves");
+        assert_eq!(r.target_node_id, comp.id);
+    }
+
+    #[test]
+    fn resolve_component_matching_file_but_no_component_node_none() {
+        // A Button.vue exists and is unique, but has no Component node → None.
+        let ctx = Ctx::default().file("widgets/Button.vue", "<template/>");
+        let reference = a_ref("Button", EdgeKind::Calls, "pages/Home.vue");
+        assert!(VueResolver.resolve(&reference, &ctx).is_none());
+    }
+
+    #[test]
+    fn extract_pages_dot_vue_api_and_middleware_use_vue_language() {
+        // A `.vue` file under server/api and under middleware exercises the
+        // Language::Vue arm of both extract branches.
+        let api = VueResolver
+            .extract("app/server/api/ping.vue", "", "")
+            .expect("extract");
+        let api_route = api
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Route)
+            .expect("api route");
+        assert_eq!(api_route.name, "/api/ping");
+        assert_eq!(api_route.language, Language::Vue);
+
+        let mw = VueResolver
+            .extract("app/middleware/guard.vue", "", "")
+            .expect("extract");
+        let mw_node = mw
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Function)
+            .expect("middleware");
+        assert_eq!(mw_node.name, "guard");
+        assert_eq!(mw_node.language, Language::Vue);
+    }
+
+    #[test]
+    fn extract_root_pages_index_is_root_route() {
+        // `pages/index.vue` → after_pages "index"; strip_suffix("/index") does
+        // not match (no leading segment), so the route is "/index".
+        let result = VueResolver
+            .extract("app/pages/index.vue", "", "")
+            .expect("extract");
+        let route = result
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Route)
+            .expect("route");
+        assert_eq!(route.name, "/index");
+    }
+
+    #[test]
+    fn ctx_trait_accessors_exercise_all_lookup_paths() {
+        // Drive the MockContext lookup surface directly so its trait methods are
+        // exercised (get_nodes_by_* / get_node_by_id / import mappings).
+        let n = mk_node("var:a.ts:X:1", NodeKind::Variable, "X", "a.ts");
+        let ctx = Ctx::default().file("a.ts", "const X=1;").node(n.clone());
+        assert_eq!(ctx.get_nodes_by_name("X").len(), 1);
+        assert_eq!(ctx.get_nodes_by_qualified_name("a.ts::X").len(), 1);
+        assert_eq!(ctx.get_nodes_by_kind(NodeKind::Variable).len(), 1);
+        assert_eq!(ctx.get_nodes_by_lower_name("x").len(), 1);
+        assert_eq!(ctx.get_node_by_id(&n.id).as_ref(), Some(&n));
+        assert!(ctx.get_import_mappings("a.ts", Language::Vue).is_empty());
+        assert_eq!(ctx.get_project_root(), "/project");
+        assert_eq!(ctx.get_all_files(), vec!["a.ts".to_string()]);
+    }
 }

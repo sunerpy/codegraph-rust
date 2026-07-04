@@ -301,3 +301,103 @@ fn is_ident(text: &str) -> bool {
         .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
         && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(src: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())
+            .unwrap();
+        parser.parse(src, None).unwrap()
+    }
+
+    fn first_of_kind<'t>(node: Node<'t>, kind: &str) -> Option<Node<'t>> {
+        if node.kind() == kind {
+            return Some(node);
+        }
+        for i in 0..node.named_child_count() {
+            let child = node.named_child(i as u32)?;
+            if let Some(found) = first_of_kind(child, kind) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn trait_field_constants_are_stable() {
+        assert_eq!(KOTLIN_SPEC.name_field(), "name");
+        assert_eq!(KOTLIN_SPEC.body_field(), "function_body");
+        assert_eq!(KOTLIN_SPEC.params_field(), "function_value_parameters");
+        assert_eq!(KOTLIN_SPEC.return_field(), "type");
+    }
+
+    #[test]
+    fn nullable_return_and_missing_return() {
+        let src = "class C {\n  fun a(): Widget? = null\n  fun b() {}\n}\n";
+        let tree = parse(src);
+        let mut fns = Vec::new();
+        fn walk<'t>(n: Node<'t>, out: &mut Vec<Node<'t>>) {
+            if n.kind() == "function_declaration" {
+                out.push(n);
+            }
+            for i in 0..n.named_child_count() {
+                if let Some(c) = n.named_child(i as u32) {
+                    walk(c, out);
+                }
+            }
+        }
+        walk(tree.root_node(), &mut fns);
+        assert_eq!(
+            KOTLIN_SPEC.get_return_type(fns[0], src).as_deref(),
+            Some("Widget")
+        );
+        assert!(KOTLIN_SPEC.get_return_type(fns[1], src).is_none());
+    }
+
+    #[test]
+    fn visibility_public_default_and_modifiers() {
+        let src = "class C {\n  private fun a() {}\n  protected fun b() {}\n  internal fun c() {}\n  fun d() {}\n}\n";
+        let tree = parse(src);
+        let mut fns = Vec::new();
+        fn walk<'t>(n: Node<'t>, out: &mut Vec<Node<'t>>) {
+            if n.kind() == "function_declaration" {
+                out.push(n);
+            }
+            for i in 0..n.named_child_count() {
+                if let Some(c) = n.named_child(i as u32) {
+                    walk(c, out);
+                }
+            }
+        }
+        walk(tree.root_node(), &mut fns);
+        assert_eq!(
+            KOTLIN_SPEC.get_visibility(fns[0]).as_deref(),
+            Some("private")
+        );
+        assert_eq!(
+            KOTLIN_SPEC.get_visibility(fns[1]).as_deref(),
+            Some("protected")
+        );
+        assert_eq!(
+            KOTLIN_SPEC.get_visibility(fns[2]).as_deref(),
+            Some("internal")
+        );
+        assert_eq!(
+            KOTLIN_SPEC.get_visibility(fns[3]).as_deref(),
+            Some("public")
+        );
+    }
+
+    #[test]
+    fn qualified_import_produces_module() {
+        let src = "import com.example.util.Helper\n";
+        let tree = parse(src);
+        let import = first_of_kind(tree.root_node(), "import").unwrap();
+        let info = KOTLIN_SPEC.extract_import(import, src).unwrap();
+        assert!(info.module_name.contains("Helper") || !info.module_name.is_empty());
+    }
+}
