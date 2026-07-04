@@ -4177,3 +4177,919 @@ mod reorder_tests {
         assert_eq!(buffer.len(), 1, "index 3 stays buffered, never drained");
     }
 }
+
+#[cfg(test)]
+mod pure_helper_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn tmp(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "cg-cli-ut-{tag}-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn node(name: &str) -> Node {
+        Node {
+            id: format!("function:{name}"),
+            kind: NodeKind::Function,
+            name: name.to_string(),
+            qualified_name: name.to_string(),
+            file_path: "a.rs".to_string(),
+            language: Language::Rust,
+            start_line: 1,
+            end_line: 2,
+            start_column: 0,
+            end_column: 0,
+            docstring: None,
+            signature: None,
+            visibility: None,
+            is_exported: false,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+            decorators: Vec::new(),
+            type_parameters: Vec::new(),
+            return_type: None,
+            updated_at: 0,
+        }
+    }
+
+    fn affected(from_file: &str, subkind: Option<&str>) -> codegraph_graph::graph::AffectedRef {
+        codegraph_graph::graph::AffectedRef {
+            from_file: from_file.to_string(),
+            line: 1,
+            edge_kind: "ext_resource".to_string(),
+            target: "res://player.gd".to_string(),
+            edge_subkind: subkind.map(str::to_string),
+        }
+    }
+
+    fn impact(
+        changed: &str,
+        affected: Vec<codegraph_graph::graph::AffectedRef>,
+    ) -> codegraph_graph::graph::ResourceImpact {
+        codegraph_graph::graph::ResourceImpact {
+            changed: changed.to_string(),
+            affected,
+        }
+    }
+
+    #[test]
+    fn location_flag_prefers_explicit_location() {
+        assert_eq!(
+            location_flag(Some("global".to_string()), true, true),
+            Some("global".to_string())
+        );
+    }
+
+    #[test]
+    fn location_flag_maps_global_then_local_then_none() {
+        assert_eq!(location_flag(None, true, false), Some("global".to_string()));
+        assert_eq!(location_flag(None, false, true), Some("local".to_string()));
+        assert_eq!(location_flag(None, false, false), None);
+    }
+
+    #[test]
+    fn truncate_field_leaves_short_values_unchanged() {
+        assert_eq!(truncate_field("abc", 5), "abc");
+        assert_eq!(truncate_field("abcde", 5), "abcde");
+    }
+
+    #[test]
+    fn truncate_field_clips_and_appends_ellipsis() {
+        assert_eq!(truncate_field("abcdef", 5), "abcd\u{2026}");
+    }
+
+    #[test]
+    fn truncate_field_counts_chars_not_bytes() {
+        let v = "\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}";
+        let out = truncate_field(v, 4);
+        assert_eq!(out.chars().count(), 4);
+        assert!(out.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn format_started_at_renders_epoch_ms_deterministically() {
+        let s = format_started_at(0);
+        assert!(
+            s.contains("1970-01-01") || s.ends_with("ms"),
+            "unexpected rendering: {s}"
+        );
+    }
+
+    #[test]
+    fn res_path_prefixes_res_scheme_and_normalizes_backslashes() {
+        assert_eq!(res_path("scenes/main.tscn"), "res://scenes/main.tscn");
+        assert_eq!(res_path("a\\b\\c.gd"), "res://a/b/c.gd");
+    }
+
+    #[test]
+    fn is_godot_resource_path_matches_known_extensions_case_insensitive() {
+        assert!(is_godot_resource_path("a.tres"));
+        assert!(is_godot_resource_path("a.TSCN"));
+        assert!(is_godot_resource_path("a.Res"));
+        assert!(is_godot_resource_path("a.gd"));
+        assert!(!is_godot_resource_path("a.rs"));
+        assert!(!is_godot_resource_path("a.txt"));
+    }
+
+    #[test]
+    fn audit_prefix_keep_no_filters_keeps_everything() {
+        assert!(audit_prefix_keep("src/a.gd", &[], &[]));
+    }
+
+    #[test]
+    fn audit_prefix_keep_include_requires_a_prefix_match() {
+        let include = vec!["src/".to_string()];
+        assert!(audit_prefix_keep("src/a.gd", &include, &[]));
+        assert!(!audit_prefix_keep("assets/a.gd", &include, &[]));
+    }
+
+    #[test]
+    fn audit_prefix_keep_exclude_drops_matching_prefix() {
+        let exclude = vec!["gen/".to_string()];
+        assert!(!audit_prefix_keep("gen/a.gd", &[], &exclude));
+        assert!(audit_prefix_keep("src/a.gd", &[], &exclude));
+    }
+
+    #[test]
+    fn audit_prefix_keep_normalizes_backslashes_on_both_sides() {
+        let include = vec!["src\\sub".to_string()];
+        assert!(audit_prefix_keep("src\\sub\\a.gd", &include, &[]));
+        assert!(audit_prefix_keep("src/sub/a.gd", &include, &[]));
+    }
+
+    #[test]
+    fn normalize_impact_input_strips_res_scheme() {
+        assert_eq!(
+            normalize_impact_input("res://scenes/main.tscn", Path::new("/proj")),
+            "scenes/main.tscn"
+        );
+    }
+
+    #[test]
+    fn normalize_impact_input_strips_leading_curdir_and_folds_backslashes() {
+        assert_eq!(
+            normalize_impact_input("./a\\b.gd", Path::new("/proj")),
+            "a/b.gd"
+        );
+        assert_eq!(
+            normalize_impact_input(".\\a\\b.gd", Path::new("/proj")),
+            "a/b.gd"
+        );
+    }
+
+    #[test]
+    fn normalize_impact_input_makes_absolute_under_project_relative() {
+        assert_eq!(
+            normalize_impact_input("/proj/scenes/x.tscn", Path::new("/proj")),
+            "scenes/x.tscn"
+        );
+    }
+
+    #[test]
+    fn normalize_impact_input_absolute_outside_project_passes_through() {
+        assert_eq!(
+            normalize_impact_input("/other/x.tscn", Path::new("/proj")),
+            "/other/x.tscn"
+        );
+    }
+
+    #[test]
+    fn empty_impact_note_none_when_affected_present() {
+        let i = impact("x.gd", vec![affected("a.tscn", None)]);
+        assert_eq!(empty_impact_note(&i), None);
+    }
+
+    #[test]
+    fn empty_impact_note_none_for_non_godot_path() {
+        let i = impact("src/lib.rs", Vec::new());
+        assert_eq!(empty_impact_note(&i), None);
+    }
+
+    #[test]
+    fn empty_impact_note_some_for_empty_godot_impact() {
+        let i = impact("scenes/main.tscn", Vec::new());
+        let note = empty_impact_note(&i).expect("godot path with empty impact yields a note");
+        assert!(note.contains("no static references"));
+    }
+
+    #[test]
+    fn verify_plan_view_categorizes_changed_and_affected_by_extension() {
+        let i = impact(
+            "player.gd",
+            vec![affected("scenes/a.tscn", Some("script")), {
+                let mut a = affected("data/b.tres", None);
+                a.line = 7;
+                a
+            }],
+        );
+        let plan = verify_plan_view(&i);
+        assert_eq!(plan.changed, "player.gd");
+        assert_eq!(plan.load_scripts, vec!["res://player.gd".to_string()]);
+        assert_eq!(plan.open_scenes, vec!["res://scenes/a.tscn".to_string()]);
+        assert_eq!(plan.load_resources, vec!["res://data/b.tres".to_string()]);
+        assert_eq!(plan.reasons.len(), 2);
+        assert_eq!(plan.reasons[0].edge_subkind.as_deref(), Some("script"));
+    }
+
+    #[test]
+    fn verify_plan_view_dedups_and_sorts_categories() {
+        let i = impact(
+            "scenes/main.tscn",
+            vec![
+                affected("z.gd", None),
+                affected("a.gd", None),
+                affected("a.gd", None),
+            ],
+        );
+        let plan = verify_plan_view(&i);
+        assert_eq!(
+            plan.load_scripts,
+            vec!["res://a.gd".to_string(), "res://z.gd".to_string()]
+        );
+        assert_eq!(plan.open_scenes, vec!["res://scenes/main.tscn".to_string()]);
+        assert_eq!(plan.reasons.len(), 3);
+    }
+
+    #[test]
+    fn exact_or_top_matches_prefers_exact_name() {
+        let matches = vec![node("other"), node("target"), node("more")];
+        let picked = exact_or_top_matches(&matches, "target");
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].name, "target");
+    }
+
+    #[test]
+    fn exact_or_top_matches_matches_dotted_and_colon_suffix() {
+        let matches = vec![node("Foo.target"), node("Bar::target")];
+        let picked = exact_or_top_matches(&matches, "target");
+        assert_eq!(picked.len(), 2);
+    }
+
+    #[test]
+    fn exact_or_top_matches_falls_back_to_first_when_no_exact() {
+        let matches = vec![node("alpha"), node("beta")];
+        let picked = exact_or_top_matches(&matches, "zzz");
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].name, "alpha");
+    }
+
+    #[test]
+    fn exact_or_top_matches_empty_input_yields_empty() {
+        let matches: Vec<Node> = Vec::new();
+        assert!(exact_or_top_matches(&matches, "x").is_empty());
+    }
+
+    #[test]
+    fn parse_node_kind_accepts_known_and_rejects_unknown() {
+        assert_eq!(parse_node_kind("function").unwrap(), NodeKind::Function);
+        assert!(parse_node_kind("not-a-kind").is_err());
+    }
+
+    #[test]
+    fn glob_matches_literal_star_and_question() {
+        assert!(glob_matches("abc", "abc"));
+        assert!(!glob_matches("abc", "abd"));
+        assert!(glob_matches("a*c", "axxxc"));
+        assert!(glob_matches("a?c", "abc"));
+        assert!(!glob_matches("a?c", "a/c"));
+        assert!(glob_matches("*", "anything"));
+        assert!(glob_matches("", ""));
+        assert!(!glob_matches("", "x"));
+    }
+
+    #[test]
+    fn is_test_file_honors_explicit_filter_glob() {
+        assert!(is_test_file("src/a.rs", Some("src/*")));
+        assert!(!is_test_file("lib/a.rs", Some("src/*")));
+    }
+
+    #[test]
+    fn is_test_file_default_heuristics() {
+        assert!(is_test_file("src/a.test.ts", None));
+        assert!(is_test_file("pkg/__tests__/a.js", None));
+        assert!(is_test_file("app/tests/mod.rs", None));
+        assert!(is_test_file("e2e/flow.spec.ts", None));
+        assert!(!is_test_file("src/main.rs", None));
+    }
+
+    #[test]
+    fn project_name_tokens_splits_lowercases_and_dedups() {
+        let tokens = project_name_tokens(Path::new("/x/My-Cool_Proj.v2"));
+        assert!(tokens.contains("my"));
+        assert!(tokens.contains("cool"));
+        assert!(tokens.contains("proj"));
+        assert!(tokens.contains("v2"));
+    }
+
+    #[test]
+    fn project_name_tokens_empty_for_root() {
+        assert!(project_name_tokens(Path::new("/")).is_empty());
+    }
+
+    #[test]
+    fn map_counts_builds_json_object() {
+        let v = map_counts(vec![("a".to_string(), 1), ("b".to_string(), 2)]);
+        assert_eq!(v["a"], serde_json::json!(1));
+        assert_eq!(v["b"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn format_number_inserts_thousands_separators() {
+        assert_eq!(format_number(0), "0");
+        assert_eq!(format_number(999), "999");
+        assert_eq!(format_number(1000), "1,000");
+        assert_eq!(format_number(1234567), "1,234,567");
+    }
+
+    #[test]
+    fn format_duration_scales_units() {
+        assert_eq!(format_duration(500), "500ms");
+        assert_eq!(format_duration(1500), "1.5s");
+        assert_eq!(format_duration(65_000), "1m 5s");
+    }
+
+    #[test]
+    fn iso_like_millis_renders_rfc3339_for_valid_epoch() {
+        assert!(iso_like_millis(0).starts_with("1970-01-01T00:00:00"));
+    }
+
+    #[test]
+    fn now_millis_is_positive() {
+        assert!(now_millis() > 0);
+    }
+
+    #[test]
+    fn modified_millis_reads_file_mtime() {
+        let dir = tmp("mtime");
+        let file = dir.join("f.txt");
+        fs::write(&file, b"x").unwrap();
+        let meta = fs::metadata(&file).unwrap();
+        assert!(modified_millis(&meta) > 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn db_path_is_under_codegraph_dir() {
+        if std::env::var("CODEGRAPH_DIR").is_err() {
+            let p = Path::new("/proj");
+            assert_eq!(db_path(p), PathBuf::from("/proj/.codegraph/codegraph.db"));
+            assert_eq!(codegraph_dir(p), PathBuf::from("/proj/.codegraph"));
+        }
+    }
+
+    #[test]
+    fn is_initialized_false_for_missing_db() {
+        let dir = tmp("init");
+        assert!(!is_initialized(&dir));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_required_project_errors_when_uninitialized() {
+        let dir = tmp("required");
+        let err = resolve_required_project(Some(dir.clone())).unwrap_err();
+        assert!(err.to_string().contains("not initialized"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_project_path_optional_returns_start_when_uninitialized() {
+        let dir = tmp("resolve");
+        assert_eq!(resolve_project_path_optional(&dir), dir);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn normalize_lexical_leading_parentdir_is_preserved() {
+        assert_eq!(
+            normalize_lexical(Path::new("../a/b")),
+            PathBuf::from("../a/b")
+        );
+    }
+
+    #[test]
+    fn normalize_lexical_empty_becomes_curdir() {
+        assert_eq!(normalize_lexical(Path::new("")), PathBuf::from("."));
+        assert_eq!(normalize_lexical(Path::new(".")), PathBuf::from("."));
+    }
+
+    #[test]
+    fn absolute_path_joins_relative_onto_cwd() {
+        let out = absolute_path("some/rel");
+        assert!(out.is_absolute());
+        assert!(out.ends_with("some/rel"));
+    }
+
+    #[test]
+    fn should_run_serve_services_true_when_explicit_false_when_bare_unindexed() {
+        let dir = tmp("serve-svc");
+        assert!(should_run_serve_services(true, &dir));
+        assert!(!should_run_serve_services(false, &dir));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn godot_honesty_empty_has_no_signal_and_null_json() {
+        let s = GodotHonestySummary::default();
+        assert!(!s.has_signal());
+        assert!(!s.is_dynamically_reachable());
+        assert_eq!(s.reachability_sources(), "");
+        assert_eq!(s.as_json(), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn godot_honesty_scene_and_autoload_sources() {
+        let s = GodotHonestySummary {
+            reached_via_scene: true,
+            reached_via_autoload: true,
+            dynamic_unresolved: vec!["call_deferred".to_string()],
+        };
+        assert!(s.has_signal());
+        assert!(s.is_dynamically_reachable());
+        assert_eq!(s.reachability_sources(), "signal/get_node/group/autoload");
+        let j = s.as_json();
+        assert_eq!(j["dynamicallyReachable"], serde_json::json!(true));
+        assert_eq!(j["reachedViaScene"], serde_json::json!(true));
+        assert_eq!(j["reachedViaAutoload"], serde_json::json!(true));
+        assert_eq!(j["dynamicUnresolved"], serde_json::json!(["call_deferred"]));
+    }
+
+    #[test]
+    fn godot_honesty_only_unresolved_has_signal_but_not_reachable() {
+        let s = GodotHonestySummary {
+            reached_via_scene: false,
+            reached_via_autoload: false,
+            dynamic_unresolved: vec!["x".to_string()],
+        };
+        assert!(s.has_signal());
+        assert!(!s.is_dynamically_reachable());
+        assert_eq!(s.reachability_sources(), "");
+        assert_ne!(s.as_json(), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn node_summary_from_node_copies_key_fields() {
+        let s = NodeSummary::from(&node("frobnicate"));
+        assert_eq!(s.name, "frobnicate");
+        assert_eq!(s.kind, NodeKind::Function);
+        assert_eq!(s.file_path, "a.rs");
+        assert_eq!(s.start_line, 1);
+    }
+
+    #[test]
+    fn generate_completion_bytes_are_non_empty_for_bash() {
+        let bytes = generate_completion_bytes(clap_complete::Shell::Bash);
+        assert!(!bytes.is_empty());
+        assert!(String::from_utf8_lossy(&bytes).contains("codegraph"));
+    }
+
+    #[test]
+    fn env_path_none_for_empty_or_unset_some_for_value() {
+        let key = "CODEGRAPH_TEST_ENV_PATH_UNSET_XYZ";
+        // SAFETY: the key is test-private and this test runs single-threaded within its own scope.
+        unsafe {
+            std::env::remove_var(key);
+        }
+        assert_eq!(env_path(key), None);
+        unsafe {
+            std::env::set_var(key, "");
+        }
+        assert_eq!(env_path(key), None);
+        unsafe {
+            std::env::set_var(key, "/some/where");
+        }
+        assert_eq!(env_path(key), Some(PathBuf::from("/some/where")));
+        unsafe {
+            std::env::remove_var(key);
+        }
+    }
+}
+
+#[cfg(test)]
+mod formatter_and_env_tests {
+    use super::*;
+    use codegraph_core::types::{FileRecord, Language, NodeKind};
+
+    fn tmp(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "cg-cli-fmt-{tag}-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn summary(name: &str, kind: NodeKind, file: &str, line: i64) -> NodeSummary {
+        NodeSummary {
+            name: name.to_string(),
+            kind,
+            file_path: file.to_string(),
+            start_line: line,
+        }
+    }
+
+    fn file_record(path: &str, language: Language, node_count: i64) -> FileRecord {
+        FileRecord {
+            path: path.to_string(),
+            content_hash: "hash".to_string(),
+            language,
+            size: 100,
+            modified_at: 0,
+            indexed_at: 0,
+            node_count,
+            errors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn codegraph_dir_and_db_path_default_layout() {
+        let prev = std::env::var_os("CODEGRAPH_DIR");
+        unsafe { std::env::remove_var("CODEGRAPH_DIR") };
+        let proj = Path::new("/tmp/proj");
+        assert_eq!(codegraph_dir(proj), proj.join(".codegraph"));
+        assert_eq!(db_path(proj), proj.join(".codegraph/codegraph.db"));
+        if let Some(v) = prev {
+            unsafe { std::env::set_var("CODEGRAPH_DIR", v) };
+        }
+    }
+
+    #[test]
+    fn file_output_from_file_record_copies_fields() {
+        let fr = file_record("src/x.rs", Language::Rust, 4);
+        let out = FileOutput::from(&fr);
+        assert_eq!(out.path, "src/x.rs");
+        assert_eq!(out.node_count, 4);
+        assert_eq!(out.size, 100);
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(json.contains("\"nodeCount\":4"));
+    }
+
+    #[test]
+    fn search_output_from_search_result_serializes_score() {
+        let n = Node {
+            id: "function:q".to_string(),
+            kind: NodeKind::Function,
+            name: "q".to_string(),
+            qualified_name: "q".to_string(),
+            file_path: "a.rs".to_string(),
+            language: Language::Rust,
+            start_line: 1,
+            end_line: 2,
+            start_column: 0,
+            end_column: 0,
+            docstring: None,
+            signature: None,
+            visibility: None,
+            is_exported: false,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+            decorators: Vec::new(),
+            type_parameters: Vec::new(),
+            return_type: None,
+            updated_at: 0,
+        };
+        let sr = SearchResult {
+            node: n,
+            score: 0.75,
+        };
+        let out = SearchOutput::from(&sr);
+        assert_eq!(out.score, 0.75);
+        assert_eq!(out.node.name, "q");
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(json.contains("\"score\":0.75"));
+    }
+
+    #[test]
+    fn print_index_result_covers_all_three_branches() {
+        print_index_result(&IndexSummary {
+            files_indexed: 5,
+            files_skipped: 2,
+            files_errored: 0,
+            nodes_created: 10,
+            edges_created: 3,
+            duration_ms: 1200,
+        });
+        print_index_result(&IndexSummary {
+            files_indexed: 0,
+            files_skipped: 0,
+            files_errored: 4,
+            nodes_created: 0,
+            edges_created: 0,
+            duration_ms: 5,
+        });
+        print_index_result(&IndexSummary {
+            files_indexed: 0,
+            files_skipped: 0,
+            files_errored: 0,
+            nodes_created: 0,
+            edges_created: 0,
+            duration_ms: 5,
+        });
+    }
+
+    #[test]
+    fn print_related_empty_and_nonempty_paths() {
+        print_related("Callers", "foo", &[]);
+        let nodes = vec![summary("foo", NodeKind::Function, "a.rs", 1)];
+        print_related("Callers", "foo", &nodes);
+    }
+
+    #[test]
+    fn print_by_file_groups_and_sorts() {
+        let nodes = vec![
+            summary("b", NodeKind::Function, "z.rs", 2),
+            summary("a", NodeKind::Function, "a.rs", 1),
+        ];
+        print_by_file(&nodes);
+    }
+
+    #[test]
+    fn print_files_flat_grouped_tree_smoke() {
+        let files = vec![
+            file_record("src/a.rs", Language::Rust, 3),
+            file_record("src/sub/b.gd", Language::Gdscript, 1),
+        ];
+        print_files_flat(&files);
+        print_files_grouped(&files);
+        print_files_tree(&files, None);
+        print_files_tree(&files, Some(1));
+    }
+
+    #[test]
+    fn print_audit_and_verify_plan_smoke() {
+        use codegraph_graph::graph::{AffectedRef, DanglingRef, OrphanResource, ResourceImpact};
+        print_audit_orphans(&[]);
+        print_audit_orphans(&[OrphanResource {
+            file_path: "x.tres".to_string(),
+            reason: "unused".to_string(),
+            confidence: "high".to_string(),
+            note: Some("maybe dynamic".to_string()),
+        }]);
+        print_audit_dangling(&[]);
+        print_audit_dangling(&[DanglingRef {
+            from_file: "a.tscn".to_string(),
+            target_path: "missing.png".to_string(),
+            line: 3,
+            kind: "ext_resource".to_string(),
+        }]);
+        let empty = ResourceImpact {
+            changed: "a.gd".to_string(),
+            affected: Vec::new(),
+        };
+        print_audit_impact(&empty);
+        let impact = ResourceImpact {
+            changed: "a.gd".to_string(),
+            affected: vec![
+                AffectedRef {
+                    from_file: "b.tscn".to_string(),
+                    line: 2,
+                    edge_kind: "instantiates".to_string(),
+                    target: "a.gd".to_string(),
+                    edge_subkind: Some("scene_instance".to_string()),
+                },
+                AffectedRef {
+                    from_file: "c.gd".to_string(),
+                    line: 4,
+                    edge_kind: "calls".to_string(),
+                    target: "a.gd".to_string(),
+                    edge_subkind: None,
+                },
+            ],
+        };
+        print_audit_impact(&impact);
+        print_verify_plan(&verify_plan_view(&impact));
+    }
+
+    #[test]
+    fn godot_honesty_print_cli_smoke() {
+        let s = GodotHonestySummary {
+            reached_via_scene: true,
+            dynamic_unresolved: vec!["emit_signal".to_string()],
+            ..Default::default()
+        };
+        s.print_cli(true);
+        s.print_cli(false);
+    }
+
+    #[test]
+    fn print_json_helpers_emit_valid_json() {
+        print_json(&json!({ "a": 1 })).unwrap();
+        print_json_pretty(&json!({ "b": [1, 2] })).unwrap();
+    }
+
+    #[test]
+    fn home_dir_resolves_from_home_then_userprofile_then_errors() {
+        let prev_home = std::env::var_os("HOME");
+        let prev_up = std::env::var_os("USERPROFILE");
+        unsafe { std::env::set_var("HOME", "/home/tester") };
+        assert_eq!(home_dir().unwrap(), PathBuf::from("/home/tester"));
+        unsafe { std::env::remove_var("HOME") };
+        unsafe { std::env::remove_var("USERPROFILE") };
+        assert!(home_dir().is_err());
+        if let Some(v) = prev_home {
+            unsafe { std::env::set_var("HOME", v) };
+        }
+        if let Some(v) = prev_up {
+            unsafe { std::env::set_var("USERPROFILE", v) };
+        }
+    }
+
+    #[test]
+    fn completion_target_paths_per_shell() {
+        let prev_home = std::env::var_os("HOME");
+        let prev_xdg = std::env::var_os("XDG_DATA_HOME");
+        let prev_local = std::env::var_os("LOCALAPPDATA");
+        unsafe { std::env::set_var("HOME", "/h") };
+        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        unsafe { std::env::remove_var("LOCALAPPDATA") };
+
+        assert_eq!(
+            completion_target(Shell::Bash).unwrap(),
+            PathBuf::from("/h/.local/share/bash-completion/completions/codegraph")
+        );
+        assert_eq!(
+            completion_target(Shell::Zsh).unwrap(),
+            PathBuf::from("/h/.zfunc/_codegraph")
+        );
+        assert_eq!(
+            completion_target(Shell::Fish).unwrap(),
+            PathBuf::from("/h/.config/fish/completions/codegraph.fish")
+        );
+        assert_eq!(
+            completion_target(Shell::PowerShell).unwrap(),
+            PathBuf::from("/h/.local/share/codegraph/completion.ps1")
+        );
+        assert_eq!(
+            completion_target(Shell::Elvish).unwrap(),
+            PathBuf::from("/h/.config/codegraph/completion.elv")
+        );
+        unsafe { std::env::set_var("XDG_DATA_HOME", "/xdg") };
+        assert_eq!(
+            completion_target(Shell::Bash).unwrap(),
+            PathBuf::from("/xdg/bash-completion/completions/codegraph")
+        );
+
+        if let Some(v) = prev_home {
+            unsafe { std::env::set_var("HOME", v) };
+        } else {
+            unsafe { std::env::remove_var("HOME") };
+        }
+        match prev_xdg {
+            Some(v) => unsafe { std::env::set_var("XDG_DATA_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_DATA_HOME") },
+        }
+        match prev_local {
+            Some(v) => unsafe { std::env::set_var("LOCALAPPDATA", v) },
+            None => unsafe { std::env::remove_var("LOCALAPPDATA") },
+        }
+    }
+
+    #[test]
+    fn powershell_profile_path_override_then_userprofile_then_error() {
+        let prev_ps = std::env::var_os("CODEGRAPH_PS_PROFILE");
+        let prev_up = std::env::var_os("USERPROFILE");
+        let prev_home = std::env::var_os("HOME");
+
+        unsafe { std::env::set_var("CODEGRAPH_PS_PROFILE", "/custom/profile.ps1") };
+        assert_eq!(
+            powershell_profile_path().unwrap(),
+            PathBuf::from("/custom/profile.ps1")
+        );
+        unsafe { std::env::remove_var("CODEGRAPH_PS_PROFILE") };
+        unsafe { std::env::set_var("USERPROFILE", "/up") };
+        assert_eq!(
+            powershell_profile_path().unwrap(),
+            PathBuf::from("/up/Documents/WindowsPowerShell/Microsoft.PowerShell_profile.ps1")
+        );
+        unsafe { std::env::remove_var("USERPROFILE") };
+        unsafe { std::env::remove_var("HOME") };
+        assert!(powershell_profile_path().is_err());
+
+        match prev_ps {
+            Some(v) => unsafe { std::env::set_var("CODEGRAPH_PS_PROFILE", v) },
+            None => unsafe { std::env::remove_var("CODEGRAPH_PS_PROFILE") },
+        }
+        match prev_up {
+            Some(v) => unsafe { std::env::set_var("USERPROFILE", v) },
+            None => unsafe { std::env::remove_var("USERPROFILE") },
+        }
+        match prev_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    #[test]
+    fn write_completion_file_creates_parent_and_writes() {
+        let dir = tmp("wcf");
+        let target = dir.join("nested/deep/codegraph");
+        write_completion_file(&target, b"# completion").unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "# completion");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_dot_source_once_is_idempotent() {
+        let dir = tmp("ads");
+        let profile = dir.join("profile.ps1");
+        let script = dir.join("completion.ps1");
+        assert!(append_dot_source_once(&profile, &script).unwrap());
+        assert!(!append_dot_source_once(&profile, &script).unwrap());
+        let body = fs::read_to_string(&profile).unwrap();
+        let line = format!(". \"{}\"", script.display());
+        assert_eq!(body.lines().filter(|l| l.trim() == line).count(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn http_log_path_lands_under_registry_dir() {
+        let dir = tmp("httplog");
+        let prev = std::env::var_os("CODEGRAPH_HTTP_REGISTRY_DIR");
+        unsafe { std::env::set_var("CODEGRAPH_HTTP_REGISTRY_DIR", &dir) };
+        let p = http_log_path("127.0.0.1:8111");
+        assert!(p.starts_with(&dir));
+        assert!(p.extension().is_some_and(|e| e == "log"));
+        match prev {
+            Some(v) => unsafe { std::env::set_var("CODEGRAPH_HTTP_REGISTRY_DIR", v) },
+            None => unsafe { std::env::remove_var("CODEGRAPH_HTTP_REGISTRY_DIR") },
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn print_http_table_empty_and_nonempty() {
+        use codegraph_daemon::http_registry::{HttpMode, HttpServerInfo};
+        print_http_table(&[]);
+        print_http_table(&[HttpServerInfo {
+            pid: 4242,
+            addr: "127.0.0.1:8111".to_string(),
+            mode: HttpMode::Global,
+            project: Some("/a/very/long/project/path/that/exceeds/the/column/width".to_string()),
+            started_at: 1_700_000_000_000,
+            version: VERSION.to_string(),
+            log_file: Some("/tmp/x.log".to_string()),
+        }]);
+    }
+
+    #[test]
+    fn print_http_conflict_and_note_others_isolated() {
+        use codegraph_daemon::http_registry::{HttpMode, HttpServerInfo};
+        let info = HttpServerInfo {
+            pid: 99,
+            addr: "127.0.0.1:9999".to_string(),
+            mode: HttpMode::Pinned,
+            project: Some("/proj".to_string()),
+            started_at: 1_700_000_000_000,
+            version: VERSION.to_string(),
+            log_file: Some("/tmp/y.log".to_string()),
+        };
+        print_http_conflict(&info);
+        let dir = tmp("noteothers");
+        let prev = std::env::var_os("CODEGRAPH_HTTP_REGISTRY_DIR");
+        unsafe { std::env::set_var("CODEGRAPH_HTTP_REGISTRY_DIR", &dir) };
+        note_other_running_servers("127.0.0.1:1234");
+        match prev {
+            Some(v) => unsafe { std::env::set_var("CODEGRAPH_HTTP_REGISTRY_DIR", v) },
+            None => unsafe { std::env::remove_var("CODEGRAPH_HTTP_REGISTRY_DIR") },
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_http_detach_internal_reads_env_marker() {
+        let key = codegraph_daemon::CODEGRAPH_HTTP_DETACH_INTERNAL;
+        let prev = std::env::var_os(key);
+        unsafe { std::env::remove_var(key) };
+        assert!(!is_http_detach_internal());
+        unsafe { std::env::set_var(key, "1") };
+        assert!(is_http_detach_internal());
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    #[test]
+    fn generate_completion_bytes_nonempty_for_each_shell() {
+        for shell in [
+            Shell::Bash,
+            Shell::Zsh,
+            Shell::Fish,
+            Shell::PowerShell,
+            Shell::Elvish,
+        ] {
+            let bytes = generate_completion_bytes(shell);
+            assert!(bytes.len() > 100);
+            assert!(String::from_utf8_lossy(&bytes).contains("codegraph"));
+        }
+    }
+}

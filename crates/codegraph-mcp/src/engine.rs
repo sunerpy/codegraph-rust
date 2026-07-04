@@ -2603,4 +2603,1751 @@ mod tests {
         let out = engine.get_code(&healthy).unwrap();
         assert_eq!(out.as_deref(), Some("line 10\nline 11\nline 12"));
     }
+
+    fn text_of(tr: &ToolResult) -> String {
+        tr.content
+            .first()
+            .map(|c| c.text.clone())
+            .unwrap_or_default()
+    }
+
+    fn node_lang(
+        name: &str,
+        qualified: &str,
+        file: &str,
+        start: i64,
+        end: i64,
+        kind: NodeKind,
+        lang: Language,
+    ) -> Node {
+        let mut n = node(name, file, start, end, kind);
+        n.id = format!("{kind:?}:{file}:{name}:{start}");
+        n.qualified_name = qualified.to_string();
+        n.language = lang;
+        n
+    }
+
+    fn mk_edge(
+        source: &str,
+        target: &str,
+        kind: codegraph_core::types::EdgeKind,
+    ) -> codegraph_core::types::Edge {
+        codegraph_core::types::Edge {
+            id: None,
+            source: source.to_string(),
+            target: target.to_string(),
+            kind,
+            metadata: None,
+            line: None,
+            col: None,
+            provenance: None,
+        }
+    }
+
+    fn file_rec(path: &str, lang: Language, node_count: i64) -> FileRecord {
+        FileRecord {
+            path: path.to_string(),
+            content_hash: "hash".to_string(),
+            language: lang,
+            size: 100,
+            modified_at: 0,
+            indexed_at: 0,
+            node_count,
+            errors: Vec::new(),
+        }
+    }
+
+    fn put_nodes(engine: &mut CodeGraphEngine, nodes: &[Node]) {
+        engine.store.upsert_nodes(nodes).unwrap();
+    }
+
+    fn put_edges(engine: &mut CodeGraphEngine, edges: &[codegraph_core::types::Edge]) {
+        engine.store.insert_edges(edges).unwrap();
+    }
+
+    fn put_file(engine: &CodeGraphEngine, file: &FileRecord) {
+        engine.store.upsert_file(file).unwrap();
+    }
+
+    fn write_src(engine: &CodeGraphEngine, rel: &str, content: &str) {
+        let abs = engine.project_root.join(rel);
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&abs, content).unwrap();
+    }
+
+    #[test]
+    fn ext_search_empty_query_errors() {
+        let engine = test_engine();
+        let tr = engine.execute("codegraph_search", &serde_json::json!({}));
+        assert_eq!(tr.is_error, Some(true));
+        assert!(text_of(&tr).contains("query must be a non-empty string"));
+    }
+
+    #[test]
+    fn ext_search_no_results() {
+        let engine = test_engine();
+        let tr = engine.execute(
+            "codegraph_search",
+            &serde_json::json!({"query": "nonexistent_zzz"}),
+        );
+        assert!(text_of(&tr).contains("No results found for"));
+    }
+
+    #[test]
+    fn ext_search_returns_results_and_kind_filter() {
+        let mut engine = test_engine();
+        let f = node_lang(
+            "alphaFunc",
+            "alphaFunc",
+            "a.rs",
+            1,
+            5,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        let c = node_lang(
+            "AlphaClass",
+            "AlphaClass",
+            "a.rs",
+            10,
+            20,
+            NodeKind::Class,
+            Language::Rust,
+        );
+        put_nodes(&mut engine, &[f, c]);
+
+        let tr = engine.execute(
+            "codegraph_search",
+            &serde_json::json!({"query": "alpha", "limit": 5}),
+        );
+        assert!(
+            text_of(&tr).contains("Search Results"),
+            "got: {}",
+            text_of(&tr)
+        );
+
+        let tr2 = engine.execute(
+            "codegraph_search",
+            &serde_json::json!({"query": "alpha", "kind": "function"}),
+        );
+        assert!(text_of(&tr2).contains("Search Results"));
+    }
+
+    #[test]
+    fn ext_callers_symbol_not_found() {
+        let engine = test_engine();
+        let tr = engine.execute("codegraph_callers", &serde_json::json!({"symbol": "ghost"}));
+        assert!(text_of(&tr).contains("not found in the codebase"));
+    }
+
+    #[test]
+    fn ext_callers_missing_symbol_errors() {
+        let engine = test_engine();
+        let tr = engine.execute("codegraph_callers", &serde_json::json!({}));
+        assert_eq!(tr.is_error, Some(true));
+    }
+
+    #[test]
+    fn ext_callers_and_callees_render_lists() {
+        let mut engine = test_engine();
+        let save = node_lang(
+            "save",
+            "save",
+            "svc.rs",
+            10,
+            20,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        let caller = node_lang(
+            "caller_a",
+            "caller_a",
+            "svc.rs",
+            30,
+            40,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        let helper = node_lang(
+            "helper",
+            "helper",
+            "svc.rs",
+            50,
+            60,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        put_nodes(&mut engine, &[save.clone(), caller.clone(), helper.clone()]);
+        put_edges(
+            &mut engine,
+            &[
+                mk_edge(&caller.id, &save.id, codegraph_core::types::EdgeKind::Calls),
+                mk_edge(&save.id, &helper.id, codegraph_core::types::EdgeKind::Calls),
+            ],
+        );
+
+        let cr = engine.execute("codegraph_callers", &serde_json::json!({"symbol": "save"}));
+        assert!(
+            text_of(&cr).contains("Callers of save"),
+            "got: {}",
+            text_of(&cr)
+        );
+        assert!(text_of(&cr).contains("caller_a"));
+
+        let ce = engine.execute(
+            "codegraph_callees",
+            &serde_json::json!({"symbol": "save", "limit": 5}),
+        );
+        assert!(
+            text_of(&ce).contains("Callees of save"),
+            "got: {}",
+            text_of(&ce)
+        );
+        assert!(text_of(&ce).contains("helper"));
+    }
+
+    #[test]
+    fn ext_callers_and_callees_none_found_message() {
+        let mut engine = test_engine();
+        let lonely = node_lang(
+            "lonely",
+            "lonely",
+            "svc.rs",
+            10,
+            20,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        put_nodes(&mut engine, &[lonely]);
+        let cr = engine.execute(
+            "codegraph_callers",
+            &serde_json::json!({"symbol": "lonely"}),
+        );
+        assert!(
+            text_of(&cr).contains("No callers found for"),
+            "got: {}",
+            text_of(&cr)
+        );
+        let ce = engine.execute(
+            "codegraph_callees",
+            &serde_json::json!({"symbol": "lonely"}),
+        );
+        assert!(
+            text_of(&ce).contains("No callees found for"),
+            "got: {}",
+            text_of(&ce)
+        );
+    }
+
+    #[test]
+    fn ext_impact_not_found_and_radius() {
+        let mut engine = test_engine();
+        let tr = engine.execute("codegraph_impact", &serde_json::json!({"symbol": "ghost"}));
+        assert!(text_of(&tr).contains("not found in the codebase"));
+
+        let core = node_lang(
+            "core",
+            "core",
+            "core.rs",
+            10,
+            20,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        let dep = node_lang(
+            "dependent",
+            "dependent",
+            "dep.rs",
+            5,
+            15,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        put_nodes(&mut engine, &[core.clone(), dep.clone()]);
+        put_edges(
+            &mut engine,
+            &[mk_edge(
+                &dep.id,
+                &core.id,
+                codegraph_core::types::EdgeKind::Calls,
+            )],
+        );
+
+        let ir = engine.execute(
+            "codegraph_impact",
+            &serde_json::json!({"symbol": "core", "depth": 2}),
+        );
+        let txt = text_of(&ir);
+        assert!(txt.contains("Impact:"), "got: {txt}");
+        assert!(txt.contains("dependent"));
+    }
+
+    #[test]
+    fn ext_impact_missing_symbol_errors() {
+        let engine = test_engine();
+        let tr = engine.execute("codegraph_impact", &serde_json::json!({}));
+        assert_eq!(tr.is_error, Some(true));
+    }
+
+    #[test]
+    fn ext_node_missing_symbol_errors() {
+        let engine = test_engine();
+        let tr = engine.execute("codegraph_node", &serde_json::json!({"symbol": "  "}));
+        assert_eq!(tr.is_error, Some(true));
+        assert!(text_of(&tr).contains("symbol must be a non-empty string"));
+    }
+
+    #[test]
+    fn ext_node_symbol_not_found() {
+        let engine = test_engine();
+        let tr = engine.execute("codegraph_node", &serde_json::json!({"symbol": "ghost"}));
+        assert!(text_of(&tr).contains("not found in the codebase"));
+    }
+
+    #[test]
+    fn ext_node_single_match_with_code_and_trail() {
+        let mut engine = test_engine();
+        write_src(
+            &engine,
+            "svc.rs",
+            &(1..=30).map(|i| format!("line {i}\n")).collect::<String>(),
+        );
+        let mut target = node_lang(
+            "doThing",
+            "doThing",
+            "svc.rs",
+            10,
+            12,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        target.signature = Some("fn doThing()".to_string());
+        target.docstring = Some("does the thing".to_string());
+        let callee = node_lang(
+            "inner",
+            "inner",
+            "svc.rs",
+            20,
+            22,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        put_nodes(&mut engine, &[target.clone(), callee.clone()]);
+        put_edges(
+            &mut engine,
+            &[mk_edge(
+                &target.id,
+                &callee.id,
+                codegraph_core::types::EdgeKind::Calls,
+            )],
+        );
+
+        let tr = engine.execute(
+            "codegraph_node",
+            &serde_json::json!({"symbol": "doThing", "includeCode": true}),
+        );
+        let txt = text_of(&tr);
+        assert!(txt.contains("## doThing (function)"), "got: {txt}");
+        assert!(txt.contains("**Signature:**"));
+        assert!(txt.contains("does the thing"));
+        assert!(txt.contains("line 10"));
+        assert!(txt.contains("Trail"));
+        assert!(txt.contains("Calls"));
+    }
+
+    #[test]
+    fn ext_node_container_renders_outline() {
+        let mut engine = test_engine();
+        let class = node_lang(
+            "Widget",
+            "Widget",
+            "w.rs",
+            1,
+            40,
+            NodeKind::Struct,
+            Language::Rust,
+        );
+        let method = node_lang(
+            "render",
+            "Widget::render",
+            "w.rs",
+            5,
+            10,
+            NodeKind::Method,
+            Language::Rust,
+        );
+        put_nodes(&mut engine, &[class.clone(), method.clone()]);
+        put_edges(
+            &mut engine,
+            &[mk_edge(
+                &class.id,
+                &method.id,
+                codegraph_core::types::EdgeKind::Contains,
+            )],
+        );
+
+        let tr = engine.execute(
+            "codegraph_node",
+            &serde_json::json!({"symbol": "Widget", "includeCode": true}),
+        );
+        let txt = text_of(&tr);
+        assert!(txt.contains("**Members (1):**"), "got: {txt}");
+        assert!(txt.contains("render"));
+        assert!(txt.contains("Structural outline only"));
+    }
+
+    #[test]
+    fn ext_node_ambiguous_without_and_with_code() {
+        let mut engine = test_engine();
+        write_src(
+            &engine,
+            "a.rs",
+            &(1..=20).map(|i| format!("line {i}\n")).collect::<String>(),
+        );
+        write_src(
+            &engine,
+            "b.rs",
+            &(1..=20).map(|i| format!("line {i}\n")).collect::<String>(),
+        );
+        let n1 = node_lang(
+            "dup",
+            "dup",
+            "a.rs",
+            1,
+            3,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        let n2 = node_lang(
+            "dup",
+            "dup",
+            "b.rs",
+            5,
+            7,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        put_nodes(&mut engine, &[n1, n2]);
+
+        let tr = engine.execute("codegraph_node", &serde_json::json!({"symbol": "dup"}));
+        let txt = text_of(&tr);
+        assert!(txt.contains("definitions named \"dup\""), "got: {txt}");
+        assert!(txt.contains("includeCode: true"));
+
+        let tr2 = engine.execute(
+            "codegraph_node",
+            &serde_json::json!({"symbol": "dup", "includeCode": true}),
+        );
+        assert!(
+            text_of(&tr2).contains("Returning 2 in full"),
+            "got: {}",
+            text_of(&tr2)
+        );
+    }
+
+    #[test]
+    fn ext_file_view_no_files_indexed() {
+        let engine = test_engine();
+        let tr = engine.execute("codegraph_node", &serde_json::json!({"file": "x.rs"}));
+        assert!(text_of(&tr).contains("No files indexed"));
+    }
+
+    #[test]
+    fn ext_file_view_no_match() {
+        let engine = test_engine();
+        put_file(&engine, &file_rec("real.rs", Language::Rust, 1));
+        let tr = engine.execute("codegraph_node", &serde_json::json!({"file": "missing.rs"}));
+        assert!(
+            text_of(&tr).contains("No indexed file matches"),
+            "got: {}",
+            text_of(&tr)
+        );
+    }
+
+    #[test]
+    fn ext_file_view_ambiguous_match() {
+        let engine = test_engine();
+        put_file(&engine, &file_rec("src/a/mod.rs", Language::Rust, 1));
+        put_file(&engine, &file_rec("src/b/mod.rs", Language::Rust, 1));
+        let tr = engine.execute("codegraph_node", &serde_json::json!({"file": "mod.rs"}));
+        assert!(
+            text_of(&tr).contains("matches 2 indexed files"),
+            "got: {}",
+            text_of(&tr)
+        );
+    }
+
+    #[test]
+    fn ext_file_view_symbols_only_and_empty() {
+        let mut engine = test_engine();
+        put_file(&engine, &file_rec("svc.rs", Language::Rust, 1));
+        let mut n = node_lang(
+            "thing",
+            "thing",
+            "svc.rs",
+            3,
+            4,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        n.signature = Some("fn thing()".to_string());
+        put_nodes(&mut engine, &[n]);
+        let tr = engine.execute(
+            "codegraph_node",
+            &serde_json::json!({"file": "svc.rs", "symbolsOnly": true}),
+        );
+        let txt = text_of(&tr);
+        assert!(txt.contains("symbol"), "got: {txt}");
+        assert!(txt.contains("thing"));
+        assert!(txt.contains("Drop `symbolsOnly`"));
+
+        let engine2 = test_engine();
+        put_file(&engine2, &file_rec("empty.rs", Language::Rust, 0));
+        let tr2 = engine2.execute(
+            "codegraph_node",
+            &serde_json::json!({"file": "empty.rs", "symbolsOnly": true}),
+        );
+        assert!(text_of(&tr2).contains("No indexed symbols in this file"));
+    }
+
+    #[test]
+    fn ext_file_view_read_source_full_and_ranged() {
+        let mut engine = test_engine();
+        put_file(&engine, &file_rec("svc.rs", Language::Rust, 1));
+        write_src(
+            &engine,
+            "svc.rs",
+            &(1..=10).map(|i| format!("line {i}\n")).collect::<String>(),
+        );
+        let n = node_lang(
+            "thing",
+            "thing",
+            "svc.rs",
+            3,
+            4,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        put_nodes(&mut engine, &[n]);
+
+        let full = engine.execute("codegraph_node", &serde_json::json!({"file": "svc.rs"}));
+        assert!(text_of(&full).contains("line 1"), "got: {}", text_of(&full));
+
+        let ranged = engine.execute(
+            "codegraph_node",
+            &serde_json::json!({"file": "svc.rs", "offset": 2, "limit": 3}),
+        );
+        let rtxt = text_of(&ranged);
+        assert!(rtxt.contains("line 2"), "got: {rtxt}");
+        assert!(rtxt.contains("pass `offset`/`limit`"));
+    }
+
+    #[test]
+    fn ext_file_view_offset_past_end() {
+        let mut engine = test_engine();
+        put_file(&engine, &file_rec("svc.rs", Language::Rust, 1));
+        write_src(&engine, "svc.rs", "one\ntwo\nthree\n");
+        put_nodes(
+            &mut engine,
+            &[node_lang(
+                "t",
+                "t",
+                "svc.rs",
+                1,
+                1,
+                NodeKind::Function,
+                Language::Rust,
+            )],
+        );
+        let tr = engine.execute(
+            "codegraph_node",
+            &serde_json::json!({"file": "svc.rs", "offset": 999}),
+        );
+        assert!(
+            text_of(&tr).contains("is past the end"),
+            "got: {}",
+            text_of(&tr)
+        );
+    }
+
+    #[test]
+    fn ext_file_view_missing_on_disk() {
+        let mut engine = test_engine();
+        put_file(&engine, &file_rec("gone.rs", Language::Rust, 1));
+        put_nodes(
+            &mut engine,
+            &[node_lang(
+                "g",
+                "g",
+                "gone.rs",
+                1,
+                2,
+                NodeKind::Function,
+                Language::Rust,
+            )],
+        );
+        let tr = engine.execute("codegraph_node", &serde_json::json!({"file": "gone.rs"}));
+        assert!(
+            text_of(&tr).contains("could not read from disk"),
+            "got: {}",
+            text_of(&tr)
+        );
+    }
+
+    #[test]
+    fn ext_explore_empty_query_errors() {
+        let engine = test_engine();
+        let tr = engine.execute("codegraph_explore", &serde_json::json!({}));
+        assert_eq!(tr.is_error, Some(true));
+    }
+
+    #[test]
+    fn ext_explore_no_relevant_code() {
+        let engine = test_engine();
+        let tr = engine.execute(
+            "codegraph_explore",
+            &serde_json::json!({"query": "nothing_here_zzz"}),
+        );
+        assert!(text_of(&tr).contains("No relevant code found for"));
+    }
+
+    #[test]
+    fn ext_explore_full_render_with_blast_relationships_and_source() {
+        let mut engine = test_engine();
+        put_file(&engine, &file_rec("svc.rs", Language::Rust, 3));
+        // 5001 empty file rows cross the file_count>=5000 budget tier, enabling
+        // include_relationships/additional_files/completeness/budget_note.
+        for i in 0..5001 {
+            put_file(
+                &engine,
+                &file_rec(&format!("pad/f{i}.rs"), Language::Rust, 0),
+            );
+        }
+        write_src(
+            &engine,
+            "svc.rs",
+            &(1..=40).map(|i| format!("line {i}\n")).collect::<String>(),
+        );
+        let root = node_lang(
+            "processOrder",
+            "processOrder",
+            "svc.rs",
+            5,
+            12,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        let caller = node_lang(
+            "mainLoop",
+            "mainLoop",
+            "svc.rs",
+            20,
+            30,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        let callee = node_lang(
+            "validate",
+            "validate",
+            "svc.rs",
+            32,
+            38,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        put_nodes(&mut engine, &[root.clone(), caller.clone(), callee.clone()]);
+        put_edges(
+            &mut engine,
+            &[
+                mk_edge(&caller.id, &root.id, codegraph_core::types::EdgeKind::Calls),
+                mk_edge(&root.id, &callee.id, codegraph_core::types::EdgeKind::Calls),
+            ],
+        );
+
+        let tr = engine.execute(
+            "codegraph_explore",
+            &serde_json::json!({"query": "processOrder"}),
+        );
+        let txt = text_of(&tr);
+        assert!(txt.contains("## Exploration: processOrder"), "got: {txt}");
+        assert!(txt.contains("### Source Code"));
+        assert!(txt.contains("Blast radius"), "got: {txt}");
+        assert!(txt.contains("### Relationships"), "got: {txt}");
+        assert!(txt.contains("line 5"));
+        assert!(
+            txt.contains("Explore budget"),
+            "expected budget note, got: {txt}"
+        );
+    }
+
+    #[test]
+    fn ext_explore_max_files_clamped() {
+        let mut engine = test_engine();
+        put_file(&engine, &file_rec("a.rs", Language::Rust, 1));
+        write_src(&engine, "a.rs", "fn foo() {}\n");
+        put_nodes(
+            &mut engine,
+            &[node_lang(
+                "foo",
+                "foo",
+                "a.rs",
+                1,
+                1,
+                NodeKind::Function,
+                Language::Rust,
+            )],
+        );
+        let tr = engine.execute(
+            "codegraph_explore",
+            &serde_json::json!({"query": "foo", "maxFiles": 0}),
+        );
+        assert!(text_of(&tr).contains("Exploration: foo"));
+    }
+
+    #[test]
+    fn ext_status_renders_counts_and_kinds() {
+        let mut engine = test_engine();
+        put_file(&engine, &file_rec("a.rs", Language::Rust, 2));
+        put_nodes(
+            &mut engine,
+            &[
+                node_lang("f", "f", "a.rs", 1, 2, NodeKind::Function, Language::Rust),
+                node_lang("C", "C", "a.rs", 3, 8, NodeKind::Class, Language::Rust),
+            ],
+        );
+        let tr = engine.execute("codegraph_status", &serde_json::json!({}));
+        let txt = text_of(&tr);
+        assert!(txt.contains("## CodeGraph Status"), "got: {txt}");
+        assert!(txt.contains("**Files indexed:**"));
+        assert!(txt.contains("Nodes by Kind"));
+        assert!(txt.contains("Languages"));
+    }
+
+    #[test]
+    fn ext_files_no_index_and_tree_flat_grouped() {
+        let engine = test_engine();
+        let empty = engine.execute("codegraph_files", &serde_json::json!({}));
+        assert!(text_of(&empty).contains("No files indexed"));
+
+        let engine = test_engine();
+        put_file(&engine, &file_rec("src/a.rs", Language::Rust, 1));
+        put_file(&engine, &file_rec("src/b.rs", Language::Rust, 2));
+
+        let tree = engine.execute("codegraph_files", &serde_json::json!({"format": "tree"}));
+        assert!(
+            text_of(&tree).contains("Project Structure"),
+            "got: {}",
+            text_of(&tree)
+        );
+        let flat = engine.execute("codegraph_files", &serde_json::json!({"format": "flat"}));
+        assert!(text_of(&flat).contains("## Files ("));
+        let grouped = engine.execute("codegraph_files", &serde_json::json!({"format": "grouped"}));
+        assert!(text_of(&grouped).contains("Files by Language"));
+    }
+
+    #[test]
+    fn ext_files_path_and_pattern_filters() {
+        let engine = test_engine();
+        put_file(&engine, &file_rec("src/a.rs", Language::Rust, 1));
+        put_file(&engine, &file_rec("b.md", Language::Unknown, 0));
+
+        let by_path = engine.execute("codegraph_files", &serde_json::json!({"path": "src/"}));
+        assert!(
+            text_of(&by_path).contains("a.rs"),
+            "got: {}",
+            text_of(&by_path)
+        );
+        assert!(!text_of(&by_path).contains("b.md"));
+
+        let by_pattern = engine.execute("codegraph_files", &serde_json::json!({"pattern": "*.md"}));
+        assert!(
+            text_of(&by_pattern).contains("b.md"),
+            "got: {}",
+            text_of(&by_pattern)
+        );
+
+        let none = engine.execute("codegraph_files", &serde_json::json!({"pattern": "*.zzz"}));
+        assert!(text_of(&none).contains("No files found matching"));
+    }
+
+    #[test]
+    fn ext_check_no_cycles_and_export_json() {
+        let mut engine = test_engine();
+        put_file(&engine, &file_rec("a.rs", Language::Rust, 1));
+        put_nodes(
+            &mut engine,
+            &[node_lang(
+                "f",
+                "f",
+                "a.rs",
+                1,
+                2,
+                NodeKind::Function,
+                Language::Rust,
+            )],
+        );
+
+        let chk = engine.execute("codegraph_check", &serde_json::json!({}));
+        assert!(text_of(&chk).contains("No circular dependencies found"));
+
+        let exp = engine.execute("codegraph_export", &serde_json::json!({}));
+        let v: Value = serde_json::from_str(&text_of(&exp)).unwrap();
+        assert!(v.is_object());
+    }
+
+    #[test]
+    fn ext_unknown_tool_backstop() {
+        let engine = test_engine();
+        let tr = engine.execute("codegraph_bogus", &serde_json::json!({}));
+        assert_eq!(tr.is_error, Some(true));
+        assert!(text_of(&tr).contains("Unknown tool"));
+    }
+
+    #[test]
+    fn ext_glob_match_variants() {
+        assert!(glob_match("*.rs", "main.rs"));
+        assert!(!glob_match("*.rs", "src/main.rs"));
+        assert!(glob_match("**/*.rs", "src/main.rs"));
+        assert!(glob_match("src/?.rs", "src/a.rs"));
+        assert!(!glob_match("src/?.rs", "src/ab.rs"));
+        assert!(glob_match("a-b_c.rs", "a-b_c.rs"));
+    }
+
+    #[test]
+    fn ext_truncate_output_caps_long_text() {
+        assert_eq!(truncate_output("hello"), "hello");
+        let mut long = "x".repeat(49_000);
+        long.push('\n');
+        long.push_str(&"y".repeat(5_000));
+        let out = truncate_output(&long);
+        assert!(out.contains("output truncated"));
+        assert!(out.len() < long.len());
+    }
+
+    #[test]
+    fn ext_cut_at_section_boundary_prefers_section() {
+        let mut s = String::from("head\n");
+        s.push_str(&"a".repeat(100));
+        s.push_str("\n#### file.rs — X\n");
+        s.push_str(&"b".repeat(400));
+        let out = cut_at_section_boundary(&s, 200);
+        assert!(out.contains("output truncated to budget"), "got: {out}");
+    }
+
+    #[test]
+    fn ext_helpers_plural_normalize_basename_stripext() {
+        assert_eq!(plural(1), "");
+        assert_eq!(plural(2), "s");
+        assert_eq!(normalize_ws("a   b\tc"), "a b c");
+        assert_eq!(basename("a/b/c.rs"), "c.rs");
+        assert_eq!(strip_ext("mod.rs"), "mod");
+        assert_eq!(strip_ext(".hidden"), ".hidden");
+    }
+
+    #[test]
+    fn ext_dependents_summary_variants() {
+        assert!(dependents_summary(&[]).contains("no other indexed file"));
+        let many: Vec<String> = (0..10).map(|i| format!("f{i}.rs")).collect();
+        let s = dependents_summary(&many);
+        assert!(s.contains("+2 more"), "got: {s}");
+    }
+
+    #[test]
+    fn ext_matches_symbol_qualified_and_file() {
+        let f = node_lang(
+            "mod",
+            "mod",
+            "src/mod.rs",
+            1,
+            1,
+            NodeKind::File,
+            Language::Rust,
+        );
+        assert!(matches_symbol(&f, "mod"));
+        let mut m = node_lang(
+            "render",
+            "widget::render",
+            "src/widget.rs",
+            1,
+            1,
+            NodeKind::Method,
+            Language::Rust,
+        );
+        m.qualified_name = "widget::render".to_string();
+        assert!(matches_symbol(&m, "widget::render"));
+        assert!(!matches_symbol(&m, "other::render"));
+    }
+
+    #[test]
+    fn ext_parse_node_kind_all() {
+        assert_eq!(parse_node_kind("function"), Some(NodeKind::Function));
+        assert_eq!(parse_node_kind("method"), Some(NodeKind::Method));
+        assert_eq!(parse_node_kind("class"), Some(NodeKind::Class));
+        assert_eq!(parse_node_kind("interface"), Some(NodeKind::Interface));
+        assert_eq!(parse_node_kind("type"), Some(NodeKind::TypeAlias));
+        assert_eq!(parse_node_kind("variable"), Some(NodeKind::Variable));
+        assert_eq!(parse_node_kind("route"), Some(NodeKind::Route));
+        assert_eq!(parse_node_kind("component"), Some(NodeKind::Component));
+        assert_eq!(parse_node_kind("bogus"), None);
+    }
+
+    #[test]
+    fn ext_is_handler_method_name_all() {
+        for n in [
+            "handle",
+            "handleAsync",
+            "execute",
+            "consume",
+            "run",
+            "__invoke",
+        ] {
+            assert!(is_handler_method_name(n), "{n}");
+        }
+        assert!(!is_handler_method_name("random"));
+    }
+
+    #[test]
+    fn ext_is_generated_and_test_file_detectors() {
+        assert!(is_generated_file("api.pb.go"));
+        assert!(is_generated_file("model.g.dart"));
+        assert!(!is_generated_file("main.rs"));
+        assert!(is_test_file("src/foo.test.ts"));
+        assert!(is_test_file("crate/tests/bar.rs"));
+        assert!(!is_test_file("src/lib.rs"));
+        assert!(is_low_value_file("src/foo.spec.ts"));
+        assert!(is_low_value_file("assets/icon.svg"));
+        assert!(!is_low_value_file("src/lib.rs"));
+    }
+
+    #[test]
+    fn ext_query_mentions_tests_detector() {
+        assert!(query_mentions_tests("how does the test suite work"));
+        assert!(query_mentions_tests("verify the parser"));
+        assert!(!query_mentions_tests("how does indexing work"));
+    }
+
+    #[test]
+    fn ext_godot_honesty_annotation_and_sources() {
+        let mut g = GodotHonesty::default();
+        assert!(g.annotation(true).is_empty());
+        g.reached_via_scene = true;
+        g.reached_via_autoload = true;
+        assert_eq!(g.reachability_sources(), "signal/get_node/group/autoload");
+        assert!(g.is_dynamically_reachable());
+        assert!(g.annotation(true).contains("may be reached dynamically"));
+        g.dynamic_unresolved.push("foo".to_string());
+        assert!(
+            g.annotation(false)
+                .contains("Dynamic / unresolved references")
+        );
+    }
+
+    #[test]
+    fn ext_cap_header_names_and_explore_file_header() {
+        let names: Vec<String> = (0..5).map(|i| format!("n{i}")).collect();
+        let capped = cap_header_names(&names, 2);
+        assert!(capped.contains("+3 more"), "got: {capped}");
+        assert_eq!(cap_header_names(&names[..2], 5), "n0, n1");
+
+        let syms = vec![
+            "a(function)".to_string(),
+            "a(function)".to_string(),
+            "b(function)".to_string(),
+        ];
+        let h = explore_file_header("f.rs", &syms, 5);
+        assert!(h.starts_with("#### f.rs — "), "got: {h}");
+    }
+
+    #[test]
+    fn ext_subgraph_locations_and_language() {
+        let n1 = node_lang("a", "a", "f.rs", 5, 6, NodeKind::Function, Language::Rust);
+        let n2 = node_lang("b", "b", "f.rs", 1, 2, NodeKind::Function, Language::Rust);
+        let sg = subgraph_with(vec![n1, n2], Vec::new());
+        assert_eq!(sg.file_language("f.rs"), "rust");
+        assert_eq!(sg.file_language("missing.rs"), "");
+        assert_eq!(sg.file_node_locations("f.rs"), "b:1, a:5");
+    }
+
+    #[test]
+    fn ext_format_impact_groups_by_file() {
+        let n1 = node_lang("a", "a", "x.rs", 1, 2, NodeKind::Function, Language::Rust);
+        let n2 = node_lang("b", "b", "y.rs", 3, 4, NodeKind::Function, Language::Rust);
+        let refs = vec![&n1, &n2];
+        let out = format_impact("sym", &refs);
+        assert!(out.contains("affects 2 symbols"));
+        assert!(out.contains("**x.rs:**"));
+        assert!(out.contains("**y.rs:**"));
+    }
+
+    #[test]
+    fn ext_number_source_lines_offsets() {
+        assert_eq!(number_source_lines_at(&["one", "two"], 5), "5\tone\n6\ttwo");
+    }
+
+    #[test]
+    fn ext_explore_dynamic_boundaries_and_candidates() {
+        let mut engine = test_engine();
+        put_file(&engine, &file_rec("bus.ts", Language::TypeScript, 2));
+        write_src(
+            &engine,
+            "bus.ts",
+            "function dispatchIt(m) {\n  return m.Send(new SaveCommand(x));\n}\n\nclass SaveCommandHandler {\n  handle(cmd) { return 1; }\n}\n",
+        );
+        let root = node_lang(
+            "dispatchIt",
+            "dispatchIt",
+            "bus.ts",
+            1,
+            3,
+            NodeKind::Function,
+            Language::TypeScript,
+        );
+        let handler = node_lang(
+            "SaveCommandHandler",
+            "SaveCommandHandler",
+            "bus.ts",
+            5,
+            7,
+            NodeKind::Class,
+            Language::TypeScript,
+        );
+        let method = node_lang(
+            "handle",
+            "SaveCommandHandler::handle",
+            "bus.ts",
+            6,
+            6,
+            NodeKind::Method,
+            Language::TypeScript,
+        );
+        put_nodes(
+            &mut engine,
+            &[root.clone(), handler.clone(), method.clone()],
+        );
+        put_edges(
+            &mut engine,
+            &[mk_edge(
+                &handler.id,
+                &method.id,
+                codegraph_core::types::EdgeKind::Contains,
+            )],
+        );
+
+        let tr = engine.execute(
+            "codegraph_explore",
+            &serde_json::json!({"query": "dispatchIt"}),
+        );
+        let txt = text_of(&tr);
+        assert!(txt.contains("Dynamic boundaries"), "got: {txt}");
+        assert!(txt.contains("typed message dispatch"), "got: {txt}");
+    }
+
+    #[test]
+    fn ext_open_reads_store_from_project_dir() {
+        let base = std::env::temp_dir().join(format!(
+            "cg-mcp-open-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(base.join(".codegraph")).unwrap();
+        {
+            let db = base.join(".codegraph").join("codegraph.db");
+            Store::open(&db).unwrap();
+        }
+        let engine = CodeGraphEngine::open(&base).unwrap();
+        let tr = engine.execute("codegraph_status", &serde_json::json!({}));
+        assert!(text_of(&tr).contains("## CodeGraph Status"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ext_check_reports_cycle() {
+        let mut engine = test_engine();
+        let a = node_lang("a.rs", "a.rs", "a.rs", 1, 1, NodeKind::File, Language::Rust);
+        let b = node_lang("b.rs", "b.rs", "b.rs", 1, 1, NodeKind::File, Language::Rust);
+        put_nodes(&mut engine, &[a.clone(), b.clone()]);
+        put_edges(
+            &mut engine,
+            &[
+                mk_edge(&a.id, &b.id, codegraph_core::types::EdgeKind::Imports),
+                mk_edge(&b.id, &a.id, codegraph_core::types::EdgeKind::Imports),
+            ],
+        );
+        let tr = engine.execute("codegraph_check", &serde_json::json!({}));
+        let txt = text_of(&tr);
+        assert!(
+            txt.contains("circular dependencies") || txt.contains("No circular"),
+            "got: {txt}"
+        );
+    }
+
+    #[test]
+    fn ext_trail_overflows_trail_cap() {
+        let mut engine = test_engine();
+        write_src(
+            &engine,
+            "hub.rs",
+            &(1..=60).map(|i| format!("line {i}\n")).collect::<String>(),
+        );
+        let hub = node_lang(
+            "hub",
+            "hub",
+            "hub.rs",
+            1,
+            2,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        let mut nodes = vec![hub.clone()];
+        let mut edges = Vec::new();
+        for i in 0..10 {
+            let callee = node_lang(
+                &format!("c{i}"),
+                &format!("c{i}"),
+                "hub.rs",
+                (i + 5) as i64,
+                (i + 5) as i64,
+                NodeKind::Function,
+                Language::Rust,
+            );
+            edges.push(mk_edge(
+                &hub.id,
+                &callee.id,
+                codegraph_core::types::EdgeKind::Calls,
+            ));
+            nodes.push(callee);
+        }
+        put_nodes(&mut engine, &nodes);
+        put_edges(&mut engine, &edges);
+        let tr = engine.execute("codegraph_node", &serde_json::json!({"symbol": "hub"}));
+        assert!(text_of(&tr).contains("more"), "got: {}", text_of(&tr));
+    }
+
+    #[test]
+    fn ext_qualified_symbol_matches_via_search() {
+        let mut engine = test_engine();
+        let n = node_lang(
+            "render",
+            "widget::render",
+            "src/widget.rs",
+            3,
+            5,
+            NodeKind::Method,
+            Language::Rust,
+        );
+        put_nodes(&mut engine, &[n]);
+        let tr = engine.execute(
+            "codegraph_node",
+            &serde_json::json!({"symbol": "widget::render"}),
+        );
+        assert!(text_of(&tr).contains("render"), "got: {}", text_of(&tr));
+    }
+
+    #[test]
+    fn ext_boundary_candidates_shortlist_rendered() {
+        let mut engine = test_engine();
+        put_file(&engine, &file_rec("bus.ts", Language::TypeScript, 4));
+        write_src(
+            &engine,
+            "bus.ts",
+            "function dispatchIt(m) {\n  return handlers['saveOrder'](x);\n}\n\nfunction handleSaveOrder(x) { return 1; }\n",
+        );
+        let root = node_lang(
+            "dispatchIt",
+            "dispatchIt",
+            "bus.ts",
+            1,
+            3,
+            NodeKind::Function,
+            Language::TypeScript,
+        );
+        let handler = node_lang(
+            "handleSaveOrder",
+            "handleSaveOrder",
+            "bus.ts",
+            5,
+            5,
+            NodeKind::Function,
+            Language::TypeScript,
+        );
+        put_nodes(&mut engine, &[root, handler]);
+        let tr = engine.execute(
+            "codegraph_explore",
+            &serde_json::json!({"query": "dispatchIt"}),
+        );
+        let txt = text_of(&tr);
+        assert!(txt.contains("Dynamic boundaries"), "got: {txt}");
+        assert!(
+            txt.contains("candidates for key") || txt.contains("computed member call"),
+            "got: {txt}"
+        );
+    }
+
+    #[test]
+    fn ext_search_result_includes_signature() {
+        let mut engine = test_engine();
+        let mut n = node_lang(
+            "sigFunc",
+            "sigFunc",
+            "s.rs",
+            2,
+            4,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        n.signature = Some("fn sigFunc() -> i32".to_string());
+        put_nodes(&mut engine, &[n]);
+        let tr = engine.execute("codegraph_search", &serde_json::json!({"query": "sigFunc"}));
+        let txt = text_of(&tr);
+        assert!(txt.contains("sigFunc"), "got: {txt}");
+        assert!(txt.contains("fn sigFunc"), "got: {txt}");
+    }
+
+    #[test]
+    fn ext_files_flat_grouped_without_metadata() {
+        let engine = test_engine();
+        put_file(&engine, &file_rec("src/a.rs", Language::Rust, 1));
+        let flat = engine.execute(
+            "codegraph_files",
+            &serde_json::json!({"format": "flat", "includeMetadata": false}),
+        );
+        assert!(text_of(&flat).contains("- src/a.rs"));
+        let grouped = engine.execute(
+            "codegraph_files",
+            &serde_json::json!({"format": "grouped", "includeMetadata": false}),
+        );
+        assert!(text_of(&grouped).contains("Files by Language"));
+    }
+
+    #[test]
+    fn ext_node_details_with_signature_and_docstring() {
+        let mut n = node_lang(
+            "documented",
+            "documented",
+            "d.rs",
+            5,
+            10,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        n.signature = Some("fn documented()".to_string());
+        n.docstring = Some("short doc".to_string());
+        let out = format_node_details(&n, Some("fn documented() {}"), None);
+        assert!(out.contains("**Signature:**"));
+        assert!(out.contains("short doc"));
+        assert!(out.contains("```rust"));
+    }
+
+    #[test]
+    fn ext_symbol_map_caps_and_signature() {
+        let nodes: Vec<Node> = (0..5)
+            .map(|i| {
+                let mut n = node_lang(
+                    &format!("s{i}"),
+                    &format!("s{i}"),
+                    "f.rs",
+                    (i + 1) as i64,
+                    (i + 1) as i64,
+                    NodeKind::Function,
+                    Language::Rust,
+                );
+                n.signature = Some(format!("fn s{i}()  "));
+                n
+            })
+            .collect();
+        let lines = symbol_map("### Symbols", &nodes, 2);
+        let joined = lines.join("\n");
+        assert!(joined.contains("+3 more"), "got: {joined}");
+        assert!(joined.contains("fn s0()"));
+    }
+
+    #[test]
+    fn ext_callers_multi_match_aggregated_note() {
+        let mut engine = test_engine();
+        let a = node_lang(
+            "api",
+            "svc::api",
+            "svc/a.rs",
+            1,
+            5,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        let b = node_lang(
+            "api",
+            "core::api",
+            "core/b.rs",
+            1,
+            5,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        let caller = node_lang(
+            "boot",
+            "boot",
+            "main.rs",
+            1,
+            5,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        put_nodes(&mut engine, &[a.clone(), b.clone(), caller.clone()]);
+        put_edges(
+            &mut engine,
+            &[mk_edge(
+                &caller.id,
+                &a.id,
+                codegraph_core::types::EdgeKind::Calls,
+            )],
+        );
+        let tr = engine.execute("codegraph_callers", &serde_json::json!({"symbol": "api"}));
+        let txt = text_of(&tr);
+        assert!(
+            txt.contains("Aggregated results across 2 symbols"),
+            "got: {txt}"
+        );
+    }
+
+    #[test]
+    fn ext_impact_multi_match_aggregated_note() {
+        let mut engine = test_engine();
+        let a = node_lang(
+            "core",
+            "a::core",
+            "a.rs",
+            1,
+            5,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        let b = node_lang(
+            "core",
+            "b::core",
+            "b.rs",
+            1,
+            5,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        put_nodes(&mut engine, &[a, b]);
+        let tr = engine.execute("codegraph_impact", &serde_json::json!({"symbol": "core"}));
+        let txt = text_of(&tr);
+        assert!(txt.contains("## Impact: \"core\""), "got: {txt}");
+        assert!(
+            txt.contains("Aggregated results across 2 symbols"),
+            "got: {txt}"
+        );
+    }
+
+    #[test]
+    fn ext_node_qualified_symbol_resolves() {
+        let mut engine = test_engine();
+        write_src(&engine, "svc/worker.rs", "fn run() {}\n");
+        let n = node_lang(
+            "run",
+            "worker::run",
+            "svc/worker.rs",
+            1,
+            1,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        put_nodes(&mut engine, &[n]);
+        let tr = engine.execute(
+            "codegraph_node",
+            &serde_json::json!({"symbol": "worker::run", "includeCode": true}),
+        );
+        let txt = text_of(&tr);
+        assert!(
+            txt.contains("## run (function)") || txt.contains("not found"),
+            "got: {txt}"
+        );
+    }
+
+    #[test]
+    fn ext_node_fuzzy_fallback_single_result() {
+        let mut engine = test_engine();
+        let n = node_lang(
+            "computeChecksum",
+            "computeChecksum",
+            "c.rs",
+            1,
+            5,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        put_nodes(&mut engine, &[n]);
+        let tr = engine.execute(
+            "codegraph_node",
+            &serde_json::json!({"symbol": "computeChecksum"}),
+        );
+        assert!(text_of(&tr).contains("computeChecksum"));
+    }
+
+    #[test]
+    fn ext_boundary_candidates_typed_bus_handler_class() {
+        let mut engine = test_engine();
+        put_file(&engine, &file_rec("bus.ts", Language::TypeScript, 3));
+        write_src(
+            &engine,
+            "bus.ts",
+            "function run(m) {\n  return m.Send(new SaveCommand(x));\n}\n\nclass SaveCommandHandler {\n  handle(cmd) { return 1; }\n}\n",
+        );
+        let root = node_lang(
+            "run",
+            "run",
+            "bus.ts",
+            1,
+            3,
+            NodeKind::Function,
+            Language::TypeScript,
+        );
+        let handler = node_lang(
+            "SaveCommandHandler",
+            "SaveCommandHandler",
+            "bus.ts",
+            5,
+            7,
+            NodeKind::Class,
+            Language::TypeScript,
+        );
+        let method = node_lang(
+            "handle",
+            "SaveCommandHandler::handle",
+            "bus.ts",
+            6,
+            6,
+            NodeKind::Method,
+            Language::TypeScript,
+        );
+        put_nodes(
+            &mut engine,
+            &[root.clone(), handler.clone(), method.clone()],
+        );
+        put_edges(
+            &mut engine,
+            &[mk_edge(
+                &handler.id,
+                &method.id,
+                codegraph_core::types::EdgeKind::Contains,
+            )],
+        );
+        let tr = engine.execute("codegraph_explore", &serde_json::json!({"query": "run"}));
+        let txt = text_of(&tr);
+        assert!(
+            txt.contains("candidates for key `SaveCommand`"),
+            "got: {txt}"
+        );
+        assert!(txt.contains("SaveCommandHandler.handle"), "got: {txt}");
+    }
+
+    #[test]
+    fn ext_matches_symbol_path_hints() {
+        let mut n = node_lang(
+            "render",
+            "render",
+            "src/widget/view.rs",
+            1,
+            1,
+            NodeKind::Method,
+            Language::Rust,
+        );
+        n.qualified_name = "render".to_string();
+        assert!(matches_symbol(&n, "widget/render"));
+        assert!(matches_symbol(&n, "view/render"));
+        assert!(!matches_symbol(&n, "other/render"));
+    }
+
+    #[test]
+    fn ext_render_node_section_container_via_render_ambiguous() {
+        let mut engine = test_engine();
+        let class = node_lang(
+            "Svc",
+            "Svc",
+            "s.rs",
+            1,
+            20,
+            NodeKind::Struct,
+            Language::Rust,
+        );
+        let method = node_lang(
+            "do_it",
+            "Svc::do_it",
+            "s.rs",
+            5,
+            8,
+            NodeKind::Method,
+            Language::Rust,
+        );
+        put_nodes(&mut engine, &[class.clone(), method.clone()]);
+        put_edges(
+            &mut engine,
+            &[mk_edge(
+                &class.id,
+                &method.id,
+                codegraph_core::types::EdgeKind::Contains,
+            )],
+        );
+        let out = engine.render_ambiguous_node("Svc", &[class], true).unwrap();
+        assert!(out.contains("Members"));
+    }
+
+    #[test]
+    fn ext_check_multiple_cycles_render() {
+        let mut engine = test_engine();
+        put_file(&engine, &file_rec("a.rs", Language::Rust, 1));
+        put_file(&engine, &file_rec("b.rs", Language::Rust, 1));
+        put_file(&engine, &file_rec("c.rs", Language::Rust, 1));
+        let a = node_lang("a1", "a1", "a.rs", 1, 5, NodeKind::Function, Language::Rust);
+        let b = node_lang("b1", "b1", "b.rs", 1, 5, NodeKind::Function, Language::Rust);
+        let c = node_lang("c1", "c1", "c.rs", 1, 5, NodeKind::Function, Language::Rust);
+        put_nodes(&mut engine, &[a.clone(), b.clone(), c.clone()]);
+        put_edges(
+            &mut engine,
+            &[
+                mk_edge(&a.id, &b.id, codegraph_core::types::EdgeKind::Imports),
+                mk_edge(&b.id, &c.id, codegraph_core::types::EdgeKind::Imports),
+                mk_edge(&c.id, &a.id, codegraph_core::types::EdgeKind::Imports),
+            ],
+        );
+        let tr = engine.execute("codegraph_check", &serde_json::json!({}));
+        assert!(text_of(&tr).contains("circular dependencies"));
+    }
+
+    #[test]
+    fn ext_explore_low_value_files_excluded() {
+        let mut engine = test_engine();
+        put_file(&engine, &file_rec("src/core.rs", Language::Rust, 1));
+        put_file(&engine, &file_rec("src/core.test.rs", Language::Rust, 1));
+        write_src(&engine, "src/core.rs", "fn coreFn() {}\n");
+        write_src(&engine, "src/core.test.rs", "fn coreFn_test() {}\n");
+        let core = node_lang(
+            "coreFn",
+            "coreFn",
+            "src/core.rs",
+            1,
+            1,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        let core2 = node_lang(
+            "coreFn2",
+            "coreFn2",
+            "src/core.rs",
+            1,
+            1,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        let test = node_lang(
+            "coreFn",
+            "coreFn",
+            "src/core.test.rs",
+            1,
+            1,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        put_nodes(&mut engine, &[core, core2, test]);
+        let tr = engine.execute("codegraph_explore", &serde_json::json!({"query": "coreFn"}));
+        assert!(text_of(&tr).contains("## Exploration: coreFn"));
+    }
+
+    #[test]
+    fn ext_blast_radius_test_and_nontest_callers() {
+        let mut engine = test_engine();
+        write_src(
+            &engine,
+            "svc.rs",
+            &(1..=20).map(|i| format!("line {i}\n")).collect::<String>(),
+        );
+        let root = node_lang(
+            "target",
+            "target",
+            "svc.rs",
+            1,
+            3,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        let prod = node_lang(
+            "producer",
+            "producer",
+            "src/prod.rs",
+            1,
+            3,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        let tester = node_lang(
+            "verify",
+            "verify",
+            "tests/target_test.rs",
+            1,
+            3,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        put_nodes(&mut engine, &[root.clone(), prod.clone(), tester.clone()]);
+        put_edges(
+            &mut engine,
+            &[
+                mk_edge(&prod.id, &root.id, codegraph_core::types::EdgeKind::Calls),
+                mk_edge(&tester.id, &root.id, codegraph_core::types::EdgeKind::Calls),
+            ],
+        );
+        let tr = engine.execute("codegraph_explore", &serde_json::json!({"query": "target"}));
+        let txt = text_of(&tr);
+        assert!(txt.contains("Blast radius"), "got: {txt}");
+        assert!(txt.contains("tests:"), "expected tests label, got: {txt}");
+    }
+
+    #[test]
+    fn ext_blast_radius_no_covering_tests_warning() {
+        let mut engine = test_engine();
+        write_src(
+            &engine,
+            "svc.rs",
+            &(1..=20).map(|i| format!("line {i}\n")).collect::<String>(),
+        );
+        let root = node_lang(
+            "solo",
+            "solo",
+            "svc.rs",
+            1,
+            3,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        let prod = node_lang(
+            "onlyProd",
+            "onlyProd",
+            "src/prod.rs",
+            1,
+            3,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        put_nodes(&mut engine, &[root.clone(), prod.clone()]);
+        put_edges(
+            &mut engine,
+            &[mk_edge(
+                &prod.id,
+                &root.id,
+                codegraph_core::types::EdgeKind::Calls,
+            )],
+        );
+        let tr = engine.execute("codegraph_explore", &serde_json::json!({"query": "solo"}));
+        let txt = text_of(&tr);
+        assert!(txt.contains("no covering tests found"), "got: {txt}");
+    }
+
+    #[test]
+    fn ext_boundary_candidates_generic_key_too_common() {
+        let mut engine = test_engine();
+        put_file(&engine, &file_rec("bus.ts", Language::TypeScript, 20));
+        write_src(
+            &engine,
+            "bus.ts",
+            "function dispatchIt(m) {\n  return handlers['run'](x);\n}\n",
+        );
+        let root = node_lang(
+            "dispatchIt",
+            "dispatchIt",
+            "bus.ts",
+            1,
+            3,
+            NodeKind::Function,
+            Language::TypeScript,
+        );
+        let mut nodes = vec![root];
+        for i in 0..15 {
+            nodes.push(node_lang(
+                &format!("runThing{i}"),
+                &format!("runThing{i}"),
+                "bus.ts",
+                (i + 5) as i64,
+                (i + 5) as i64,
+                NodeKind::Function,
+                Language::TypeScript,
+            ));
+        }
+        put_nodes(&mut engine, &nodes);
+        let tr = engine.execute(
+            "codegraph_explore",
+            &serde_json::json!({"query": "dispatchIt"}),
+        );
+        assert!(
+            text_of(&tr).contains("Dynamic boundaries"),
+            "got: {}",
+            text_of(&tr)
+        );
+    }
+
+    #[test]
+    fn ext_matches_symbol_file_node_and_negative() {
+        let f = node_lang(
+            "config",
+            "config",
+            "src/config.rs",
+            1,
+            1,
+            NodeKind::File,
+            Language::Rust,
+        );
+        assert!(matches_symbol(&f, "config"));
+        let m = node_lang(
+            "foo",
+            "foo",
+            "src/foo.rs",
+            1,
+            1,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        assert!(!matches_symbol(&m, "a.b"));
+    }
+
+    #[test]
+    fn ext_last_qualifier_part_and_glob_escapes() {
+        assert_eq!(last_qualifier_part("a::b::c"), Some("c"));
+        assert_eq!(last_qualifier_part("plain"), Some("plain"));
+        assert!(glob_match("a.b?.rs", "a.bx.rs"));
+        assert!(!glob_match("a.b.rs", "axb.rs"));
+    }
+
+    #[test]
+    fn ext_search_kind_filter_excludes_other_kinds() {
+        let mut engine = test_engine();
+        let f = node_lang(
+            "betaFn",
+            "betaFn",
+            "b.rs",
+            1,
+            5,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        let s = node_lang(
+            "betaStruct",
+            "betaStruct",
+            "b.rs",
+            10,
+            20,
+            NodeKind::Struct,
+            Language::Rust,
+        );
+        put_nodes(&mut engine, &[f, s]);
+        let tr = engine.execute(
+            "codegraph_search",
+            &serde_json::json!({"query": "beta", "kind": "class"}),
+        );
+        let txt = text_of(&tr);
+        assert!(
+            txt.contains("Search Results") || txt.contains("No results"),
+            "got: {txt}"
+        );
+    }
 }

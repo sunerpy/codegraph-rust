@@ -3151,3 +3151,951 @@ fn lua_require_module(call_node: SyntaxNode<'_>, source: &str) -> Option<String>
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    //! Behavior tests for the generic + per-language tree-sitter walker, driven
+    //! end-to-end through the public `extract_source` API (mirrors the
+    //! `tests/batch_*_languages.rs` construction pattern). Each test targets a
+    //! branch-heavy dispatch arm in `visit_node` / `visit_*_node` / the call and
+    //! import extractors.
+    use crate::extract_source;
+    use codegraph_core::types::{EdgeKind, Language, Node, NodeKind, UnresolvedRef};
+
+    fn run(file: &str, source: &str, lang: Language) -> (Vec<Node>, Vec<UnresolvedRef>) {
+        let result = extract_source(file, source, Some(lang));
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        (result.nodes, result.unresolved_references)
+    }
+
+    fn has_node(nodes: &[Node], kind: NodeKind, name: &str) -> bool {
+        nodes.iter().any(|n| n.kind == kind && n.name == name)
+    }
+
+    fn has_ref(refs: &[UnresolvedRef], kind: EdgeKind, name: &str) -> bool {
+        refs.iter()
+            .any(|r| r.reference_kind == kind && r.reference_name == name)
+    }
+
+    fn node<'a>(nodes: &'a [Node], kind: NodeKind, name: &str) -> &'a Node {
+        nodes
+            .iter()
+            .find(|n| n.kind == kind && n.name == name)
+            .unwrap_or_else(|| panic!("missing {kind:?} {name}"))
+    }
+
+    // ---- R language (hook-driven; no R node types in the generic walker) ----
+
+    #[test]
+    fn r_extracts_named_function_class_generic_and_imports() {
+        let src = r#"
+library(dplyr)
+source("helpers.R")
+greet <- function(name) {
+  paste("hi", name)
+}
+Animal <- setRefClass("Animal", methods = list(
+  speak = function() { cat("...") }
+))
+setGeneric("area", function(shape) standardGeneric("area"))
+setMethod("area", "Circle", function(shape) { 3.14 })
+MAX_SIZE <- 100
+result -> output
+"#;
+        let (nodes, refs) = run("src/model.R", src, Language::R);
+        assert!(has_node(&nodes, NodeKind::Function, "greet"));
+        assert!(has_node(&nodes, NodeKind::Class, "Animal"));
+        assert!(has_node(&nodes, NodeKind::Method, "speak"));
+        assert!(has_node(&nodes, NodeKind::Function, "area"));
+        assert!(has_ref(&refs, EdgeKind::Imports, "dplyr"));
+        assert!(has_ref(&refs, EdgeKind::Imports, "helpers.R"));
+        assert!(has_node(&nodes, NodeKind::Constant, "MAX_SIZE"));
+    }
+
+    #[test]
+    fn r_r6class_with_inherit_records_extends() {
+        let src = r#"
+Dog <- R6Class("Dog",
+  inherit = Animal,
+  public = list(
+    bark = function() { cat("woof") }
+  )
+)
+"#;
+        let (nodes, refs) = run("src/dog.R", src, Language::R);
+        assert!(has_node(&nodes, NodeKind::Class, "Dog"));
+        assert!(has_node(&nodes, NodeKind::Method, "bark"));
+        assert!(has_ref(&refs, EdgeKind::Extends, "Animal"));
+    }
+
+    #[test]
+    fn r_ggproto_second_positional_is_parent() {
+        let src = r#"
+GeomFoo <- ggproto("GeomFoo", Geom,
+  draw = function(self) { NULL }
+)
+"#;
+        let (nodes, refs) = run("src/geom.R", src, Language::R);
+        assert!(has_node(&nodes, NodeKind::Class, "GeomFoo"));
+        assert!(has_ref(&refs, EdgeKind::Extends, "Geom"));
+    }
+
+    // ---- Scala ----
+
+    #[test]
+    fn scala_val_var_enum_and_extension() {
+        let src = r#"
+package demo
+object Top {
+  val topConst: Int = 1
+  var topVar: String = "x"
+}
+class Holder {
+  val field: Helper = Helper()
+  def shout(s: String): String = s
+}
+enum Color { case Red, Green, Blue }
+"#;
+        let (nodes, _) = run("src/S.scala", src, Language::Scala);
+        assert!(has_node(&nodes, NodeKind::Field, "topConst"));
+        assert!(has_node(&nodes, NodeKind::Field, "topVar"));
+        assert!(has_node(&nodes, NodeKind::Field, "field"));
+        assert!(has_node(&nodes, NodeKind::EnumMember, "Red"));
+        assert!(has_node(&nodes, NodeKind::EnumMember, "Blue"));
+        assert!(has_node(&nodes, NodeKind::Method, "shout"));
+    }
+
+    #[test]
+    fn scala_top_level_val_var_are_constant_and_variable() {
+        let src = r#"
+package demo
+val topConst: Int = 1
+var topVar: String = "x"
+"#;
+        let (nodes, _) = run("src/Top.scala", src, Language::Scala);
+        assert!(has_node(&nodes, NodeKind::Constant, "topConst"));
+        assert!(has_node(&nodes, NodeKind::Variable, "topVar"));
+    }
+
+    // ---- Lua / Luau require variants ----
+
+    #[test]
+    fn lua_require_in_variable_declaration_and_call() {
+        let src = r#"
+local http = require("net.http")
+require("bare.module")
+local M = {}
+return M
+"#;
+        let (nodes, refs) = run("src/plugin.lua", src, Language::Lua);
+        assert!(has_node(&nodes, NodeKind::Import, "net.http"));
+        assert!(has_node(&nodes, NodeKind::Import, "bare.module"));
+        assert!(has_ref(&refs, EdgeKind::Imports, "net.http"));
+    }
+
+    #[test]
+    fn luau_require_extracts_import() {
+        let src = r#"
+local mod = require("shared.util")
+return mod
+"#;
+        let (nodes, _) = run("src/u.luau", src, Language::Luau);
+        assert!(has_node(&nodes, NodeKind::Import, "shared.util"));
+    }
+
+    // ---- Objective-C class_implementation ----
+
+    #[test]
+    fn objc_class_implementation_attaches_methods() {
+        let src = r#"
+@implementation Foo
+- (void)doThing {
+    [self helper];
+}
+@end
+"#;
+        let (nodes, _) = run("src/Foo.m", src, Language::ObjC);
+        assert!(has_node(&nodes, NodeKind::Class, "Foo"));
+        assert!(has_node(&nodes, NodeKind::Method, "doThing"));
+    }
+
+    // ---- PHP use_declaration + const_declaration inside class ----
+
+    #[test]
+    fn php_class_use_trait_and_const() {
+        let src = r#"<?php
+class Service {
+    use LoggerTrait;
+    const VERSION = "1.0";
+    public function run() { return 1; }
+}
+"#;
+        let (nodes, refs) = run("src/Service.php", src, Language::Php);
+        assert!(has_node(&nodes, NodeKind::Class, "Service"));
+        assert!(has_ref(&refs, EdgeKind::Implements, "LoggerTrait"));
+        assert!(has_node(&nodes, NodeKind::Constant, "VERSION"));
+        assert!(has_node(&nodes, NodeKind::Method, "run"));
+    }
+
+    #[test]
+    fn php_class_static_method_call() {
+        let src = r#"<?php
+class Model {
+    public function run() { Helper::log("x"); }
+}
+"#;
+        let (nodes, refs) = run("src/Model.php", src, Language::Php);
+        assert!(has_node(&nodes, NodeKind::Method, "run"));
+        assert!(has_ref(&refs, EdgeKind::Calls, "Helper.log"));
+    }
+
+    // ---- GDScript arms ----
+
+    #[test]
+    fn gdscript_enum_const_var_and_signal() {
+        let src = r#"
+class_name Player
+extends Node
+
+signal health_changed(amount)
+enum State { IDLE, RUN }
+const MAX_HP = 100
+var hp = 100
+@export var speed = 5
+"#;
+        let (nodes, refs) = run("player.gd", src, Language::Gdscript);
+        assert!(has_node(&nodes, NodeKind::Class, "Player"));
+        assert!(has_ref(&refs, EdgeKind::Extends, "Node"));
+        assert!(has_node(&nodes, NodeKind::EnumMember, "IDLE"));
+        assert!(has_node(&nodes, NodeKind::Constant, "MAX_HP"));
+        assert!(has_node(&nodes, NodeKind::Variable, "hp"));
+        assert!(has_node(&nodes, NodeKind::Property, "health_changed"));
+    }
+
+    #[test]
+    fn gdscript_preload_is_import_with_load_path_subkind() {
+        let src = r#"
+extends Node
+const Bullet = preload("res://bullet.tscn")
+func fire():
+    var b = load("res://boom.tscn")
+"#;
+        let (nodes, refs) = run("gun.gd", src, Language::Gdscript);
+        assert!(has_node(&nodes, NodeKind::Import, "res://bullet.tscn"));
+        assert!(has_ref(&refs, EdgeKind::Imports, "res://bullet.tscn"));
+        assert!(
+            refs.iter().any(|r| r.reference_name == "res://bullet.tscn"
+                && r.reference_subkind
+                    == Some(codegraph_core::types::ReferenceSubkind::GdscriptLoadPath)),
+            "preload path must be tagged GdscriptLoadPath: {refs:#?}"
+        );
+    }
+
+    #[test]
+    fn gdscript_inner_class_extends_edge() {
+        let src = r#"
+extends Node
+class Inner extends RefCounted:
+    func work():
+        pass
+"#;
+        let (nodes, refs) = run("outer.gd", src, Language::Gdscript);
+        assert!(has_node(&nodes, NodeKind::Class, "Inner"));
+        assert!(has_ref(&refs, EdgeKind::Extends, "RefCounted"));
+    }
+
+    // ---- Call re-encodings (chains) ----
+
+    #[test]
+    fn go_chained_factory_call_reencodes() {
+        let src = r#"
+package main
+func NewGreeter() *ConsoleGreeter { return &ConsoleGreeter{} }
+type ConsoleGreeter struct{}
+func (g *ConsoleGreeter) Greet(n string) string { return n }
+func main() { NewGreeter().Greet("Ada") }
+"#;
+        let (_, refs) = run("cmd/m.go", src, Language::Go);
+        assert!(has_ref(&refs, EdgeKind::Calls, "NewGreeter().Greet"));
+    }
+
+    #[test]
+    fn python_self_method_call_uses_bare_name() {
+        let src = r#"
+class W:
+    def helper(self):
+        return 1
+    def run(self):
+        return self.helper()
+"#;
+        let (_, refs) = run("w.py", src, Language::Python);
+        assert!(has_ref(&refs, EdgeKind::Calls, "helper"));
+    }
+
+    #[test]
+    fn python_receiver_qualified_call() {
+        let src = r#"
+import os
+def run():
+    os.getcwd()
+"#;
+        let (_, refs) = run("r.py", src, Language::Python);
+        assert!(has_ref(&refs, EdgeKind::Calls, "os.getcwd"));
+    }
+
+    #[test]
+    fn java_object_name_call_and_field_access() {
+        let src = r#"
+class App {
+    Helper helper;
+    void run() {
+        this.helper.doWork();
+        Util.log("x");
+    }
+}
+"#;
+        let (_, refs) = run("App.java", src, Language::Java);
+        assert!(has_ref(&refs, EdgeKind::Calls, "helper.doWork"));
+        assert!(has_ref(&refs, EdgeKind::Calls, "Util.log"));
+    }
+
+    // ---- Instantiation (new_expression) ----
+
+    #[test]
+    fn typescript_new_expression_is_instantiation() {
+        let src = r#"
+class Widget {}
+function make() { return new Widget(); }
+"#;
+        let (_, refs) = run("w.ts", src, Language::TypeScript);
+        assert!(has_ref(&refs, EdgeKind::Instantiates, "Widget"));
+    }
+
+    // ---- Decorators ----
+
+    #[test]
+    fn python_decorated_function_records_decorates_edge() {
+        let src = r#"
+def cache(fn):
+    return fn
+
+@cache
+def compute():
+    return 42
+"#;
+        let (nodes, refs) = run("d.py", src, Language::Python);
+        assert!(has_node(&nodes, NodeKind::Function, "compute"));
+        assert!(has_ref(&refs, EdgeKind::Decorates, "cache"));
+    }
+
+    // ---- Docstring cleaning ----
+
+    #[test]
+    fn typescript_block_comment_docstring_is_cleaned() {
+        let src = r#"
+/**
+ * Adds two numbers.
+ */
+export function add(a: number, b: number): number { return a + b; }
+"#;
+        let (nodes, _) = run("m.ts", src, Language::TypeScript);
+        let add = node(&nodes, NodeKind::Function, "add");
+        assert_eq!(add.docstring.as_deref(), Some("Adds two numbers."));
+    }
+
+    #[test]
+    fn rust_line_doc_comment_is_cleaned() {
+        let src = r#"
+/// Greets the world.
+pub fn greet() {}
+"#;
+        let (nodes, _) = run("g.rs", src, Language::Rust);
+        let greet = node(&nodes, NodeKind::Function, "greet");
+        assert_eq!(greet.docstring.as_deref(), Some("Greets the world."));
+    }
+
+    // ---- TS type-alias variants ----
+
+    #[test]
+    fn typescript_type_alias_extracted() {
+        let src = r#"
+export type UserId = string;
+"#;
+        let (nodes, _) = run("t.ts", src, Language::TypeScript);
+        assert!(has_node(&nodes, NodeKind::TypeAlias, "UserId"));
+    }
+
+    // ---- Go interface via type_spec ----
+
+    #[test]
+    fn go_interface_methods_extracted() {
+        let src = r#"
+package main
+type Greeter interface {
+    Greet(name string) string
+    Close() error
+}
+"#;
+        let (nodes, _) = run("g.go", src, Language::Go);
+        assert!(has_node(&nodes, NodeKind::Interface, "Greeter"));
+        assert!(has_node(&nodes, NodeKind::Method, "Greet"));
+        assert!(has_node(&nodes, NodeKind::Method, "Close"));
+    }
+
+    // ---- Rust impl-for records Implements ----
+
+    #[test]
+    fn rust_impl_trait_for_type_records_implements() {
+        let src = r#"
+pub trait Draw { fn draw(&self); }
+pub struct Button { x: i32 }
+impl Draw for Button {
+    fn draw(&self) {}
+}
+"#;
+        let (_, refs) = run("b.rs", src, Language::Rust);
+        assert!(has_ref(&refs, EdgeKind::Implements, "Draw"));
+    }
+
+    // ---- helper unit checks ----
+
+    #[test]
+    fn is_r_constant_name_matches_all_caps_dotted() {
+        assert!(super::is_r_constant_name("MAX"));
+        assert!(super::is_r_constant_name("MAX.SIZE_2"));
+        assert!(!super::is_r_constant_name("maxSize"));
+        assert!(!super::is_r_constant_name("mixedCASE"));
+    }
+
+    #[test]
+    fn is_builtin_type_covers_ts_and_jvm_primitives() {
+        assert!(super::is_builtin_type("string"));
+        assert!(super::is_builtin_type("Int"));
+        assert!(super::is_builtin_type("Boolean"));
+        assert!(!super::is_builtin_type("MyType"));
+    }
+
+    #[test]
+    fn normalize_parenthesized_go_conversion_strips_wrapper() {
+        assert_eq!(
+            super::normalize_parenthesized_go_conversion("(*Foo)"),
+            Some("Foo".to_string())
+        );
+        assert_eq!(
+            super::normalize_parenthesized_go_conversion("(pkg.Type)"),
+            Some("pkg.Type".to_string())
+        );
+        assert_eq!(super::normalize_parenthesized_go_conversion("plain"), None);
+        assert_eq!(super::normalize_parenthesized_go_conversion("(123)"), None);
+    }
+
+    #[test]
+    fn is_jsx_and_rust_impl_kind_predicates() {
+        assert!(super::is_jsx_element_kind("jsx_element"));
+        assert!(super::is_jsx_element_kind("jsx_self_closing_element"));
+        assert!(!super::is_jsx_element_kind("call_expression"));
+        assert!(super::is_rust_impl_item(Language::Rust, "impl_item"));
+        assert!(!super::is_rust_impl_item(Language::Go, "impl_item"));
+    }
+
+    #[test]
+    fn is_docstring_wrapper_type_matches_wrappers() {
+        assert!(super::is_docstring_wrapper_type("export_statement"));
+        assert!(super::is_docstring_wrapper_type("lexical_declaration"));
+        assert!(!super::is_docstring_wrapper_type("function_declaration"));
+    }
+
+    #[test]
+    fn clean_comment_strips_all_marker_styles() {
+        assert_eq!(super::clean_comment("// hello"), "hello");
+        assert_eq!(super::clean_comment("/// doc"), "doc");
+        assert_eq!(super::clean_comment("# python"), "python");
+        assert_eq!(super::clean_comment("-- lua"), "lua");
+        assert_eq!(super::clean_comment("/* block */"), "block");
+        assert_eq!(super::clean_comment("(* pascal *)"), "pascal");
+    }
+
+    // ---- Unknown / empty source paths ----
+
+    #[test]
+    fn empty_source_yields_only_file_node() {
+        let (nodes, refs) = run("empty.py", "", Language::Python);
+        assert!(nodes.iter().any(|n| n.kind == NodeKind::File));
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn python_top_level_assignment_is_variable() {
+        let src = r#"
+config = load()
+NAME = "x"
+"#;
+        let (nodes, _) = run("v.py", src, Language::Python);
+        assert!(has_node(&nodes, NodeKind::Variable, "config"));
+    }
+
+    #[test]
+    fn go_var_and_const_declarations() {
+        let src = r#"
+package main
+const MaxSize = 100
+var counter int
+func main() { _ = counter }
+"#;
+        let (nodes, _) = run("v.go", src, Language::Go);
+        assert!(has_node(&nodes, NodeKind::Constant, "MaxSize"));
+        assert!(has_node(&nodes, NodeKind::Variable, "counter"));
+    }
+
+    #[test]
+    fn php_class_method_and_const_extracted() {
+        let src = r#"<?php
+class Model {
+    const KIND = "model";
+    public function run() { return 1; }
+}
+"#;
+        let (nodes, _) = run("Model.php", src, Language::Php);
+        assert!(has_node(&nodes, NodeKind::Constant, "KIND"));
+        assert!(has_node(&nodes, NodeKind::Method, "run"));
+    }
+
+    #[test]
+    fn typescript_const_variable_and_arrow_function() {
+        let src = r#"
+export const PI = 3.14;
+export const greet = (name: string) => name;
+"#;
+        let (nodes, _) = run("c.ts", src, Language::TypeScript);
+        assert!(has_node(&nodes, NodeKind::Constant, "PI"));
+        assert!(has_node(&nodes, NodeKind::Function, "greet"));
+    }
+
+    #[test]
+    fn typescript_class_fields_and_methods() {
+        let src = r#"
+class Widget {
+    private name: string;
+    static count: number;
+    render(): string { return this.name; }
+}
+"#;
+        let (nodes, _) = run("w.ts", src, Language::TypeScript);
+        assert!(has_node(&nodes, NodeKind::Property, "name"));
+        assert!(has_node(&nodes, NodeKind::Method, "render"));
+    }
+
+    #[test]
+    fn python_class_with_method_and_field() {
+        let src = r#"
+class Account:
+    balance = 0
+    def deposit(self, amount):
+        self.balance += amount
+"#;
+        let (nodes, _) = run("acc.py", src, Language::Python);
+        assert!(has_node(&nodes, NodeKind::Class, "Account"));
+        assert!(has_node(&nodes, NodeKind::Method, "deposit"));
+    }
+
+    #[test]
+    fn rust_enum_struct_and_type_alias() {
+        let src = r#"
+pub enum Color { Red, Green, Blue }
+pub struct Point { x: i32, y: i32 }
+pub type Id = u64;
+"#;
+        let (nodes, _) = run("t.rs", src, Language::Rust);
+        assert!(has_node(&nodes, NodeKind::Enum, "Color"));
+        assert!(has_node(&nodes, NodeKind::Struct, "Point"));
+        assert!(has_node(&nodes, NodeKind::EnumMember, "Red"));
+    }
+
+    #[test]
+    fn kotlin_class_inheritance_records_extends() {
+        let src = r#"
+open class Base
+class Derived : Base()
+interface Named
+class Widget : Base(), Named
+"#;
+        let (_, refs) = run("k.kt", src, Language::Kotlin);
+        assert!(has_ref(&refs, EdgeKind::Extends, "Base"));
+    }
+
+    #[test]
+    fn swift_class_inheritance_records_extends() {
+        let src = r#"
+class Base {}
+protocol Named {}
+class Widget: Base, Named {}
+"#;
+        let (_, refs) = run("s.swift", src, Language::Swift);
+        assert!(has_ref(&refs, EdgeKind::Extends, "Base"));
+    }
+
+    #[test]
+    fn java_class_extends_and_implements() {
+        let src = r#"
+class Base {}
+interface Named {}
+class Widget extends Base implements Named {
+    public void run() {}
+}
+"#;
+        let (_, refs) = run("W.java", src, Language::Java);
+        assert!(has_ref(&refs, EdgeKind::Extends, "Base"));
+        assert!(has_ref(&refs, EdgeKind::Implements, "Named"));
+    }
+
+    #[test]
+    fn ruby_extend_and_prepend_record_implements() {
+        let src = r#"
+module M1; end
+module M2; end
+class C
+  extend M1
+  prepend M2
+end
+"#;
+        let (_, refs) = run("c.rb", src, Language::Ruby);
+        assert!(has_ref(&refs, EdgeKind::Implements, "M1"));
+        assert!(has_ref(&refs, EdgeKind::Implements, "M2"));
+    }
+
+    #[test]
+    fn typescript_interface_extracted() {
+        let src = r#"
+export interface Shape {
+    area(): number;
+}
+"#;
+        let (nodes, _) = run("i.ts", src, Language::TypeScript);
+        assert!(has_node(&nodes, NodeKind::Interface, "Shape"));
+    }
+
+    #[test]
+    fn python_import_statement_extracts_import_node() {
+        let src = r#"
+import os
+import sys as system
+"#;
+        let (nodes, refs) = run("imp.py", src, Language::Python);
+        assert!(has_node(&nodes, NodeKind::Import, "os"));
+        assert!(has_node(&nodes, NodeKind::Import, "sys"));
+        assert!(has_ref(&refs, EdgeKind::Imports, "os"));
+    }
+
+    #[test]
+    fn rust_use_binding_refs_emitted() {
+        let src = r#"
+use std::collections::HashMap;
+use crate::helpers::{make, Helper};
+pub fn run() {}
+"#;
+        let (_, refs) = run("u.rs", src, Language::Rust);
+        assert!(has_ref(
+            &refs,
+            EdgeKind::Imports,
+            "std::collections::HashMap"
+        ));
+    }
+
+    #[test]
+    fn php_class_static_method_call_records_call() {
+        let src = r#"<?php
+class W {
+    public function run() {
+        Logger::log("x");
+    }
+}
+"#;
+        let (_, refs) = run("w2.php", src, Language::Php);
+        assert!(
+            refs.iter()
+                .any(|r| r.reference_kind == EdgeKind::Calls && r.reference_name.contains("log")),
+            "expected a Calls ref: {refs:#?}"
+        );
+    }
+
+    #[test]
+    fn c_struct_and_function_extracted() {
+        let src = r#"
+struct Point { int x; int y; };
+int add(int a, int b) { return a + b; }
+"#;
+        let (nodes, _) = run("p.c", src, Language::C);
+        assert!(has_node(&nodes, NodeKind::Function, "add"));
+    }
+
+    #[test]
+    fn dart_class_and_method_extracted() {
+        let src = r#"
+class Widget {
+  int count = 0;
+  void render() {}
+}
+"#;
+        let (nodes, _) = run("w.dart", src, Language::Dart);
+        assert!(has_node(&nodes, NodeKind::Class, "Widget"));
+        assert!(has_node(&nodes, NodeKind::Method, "render"));
+    }
+
+    #[test]
+    fn python_from_import_emits_binding_refs() {
+        let src = r#"
+from os.path import join, dirname as dn
+from mod import *
+"#;
+        let (_, refs) = run("fi.py", src, Language::Python);
+        assert!(has_ref(&refs, EdgeKind::Imports, "join"));
+        assert!(has_ref(&refs, EdgeKind::Imports, "dn"));
+    }
+
+    #[test]
+    fn typescript_named_namespace_and_default_imports() {
+        let src = r#"
+import { foo, bar as baz } from './mod';
+import * as ns from './ns';
+import Def from './def';
+"#;
+        let (_, refs) = run("ti.ts", src, Language::TypeScript);
+        assert!(has_ref(&refs, EdgeKind::Imports, "foo"));
+        assert!(has_ref(&refs, EdgeKind::Imports, "baz"));
+        assert!(has_ref(&refs, EdgeKind::Imports, "ns"));
+        assert!(has_ref(&refs, EdgeKind::Imports, "Def"));
+    }
+
+    #[test]
+    fn lua_require_bracket_string_module() {
+        let src = r#"
+local m = require([[shared.bracket]])
+return m
+"#;
+        let (nodes, _) = run("b.lua", src, Language::Lua);
+        assert!(has_node(&nodes, NodeKind::Import, "shared.bracket"));
+    }
+
+    #[test]
+    fn go_grouped_imports_extracted() {
+        let src = r#"
+package main
+import (
+    "fmt"
+    "os"
+)
+func main() { fmt.Println(os.Args) }
+"#;
+        let (nodes, refs) = run("gi.go", src, Language::Go);
+        assert!(has_node(&nodes, NodeKind::Import, "fmt"));
+        assert!(has_node(&nodes, NodeKind::Import, "os"));
+        assert!(has_ref(&refs, EdgeKind::Imports, "fmt"));
+    }
+
+    #[test]
+    fn rust_use_grouped_binding_refs() {
+        let src = r#"
+use std::collections::HashMap;
+use crate::helpers::{make, Helper};
+pub fn run() {}
+"#;
+        let (_, refs) = run("ur.rs", src, Language::Rust);
+        assert!(has_ref(
+            &refs,
+            EdgeKind::Imports,
+            "std::collections::HashMap"
+        ));
+    }
+
+    #[test]
+    fn misparsed_anonymous_arrow_visits_body_calls() {
+        let src = r#"
+function helper() {}
+const run = () => { helper(); };
+"#;
+        let (_, refs) = run("anon.ts", src, Language::TypeScript);
+        assert!(has_ref(&refs, EdgeKind::Calls, "helper"));
+    }
+
+    #[test]
+    fn objc_selector_expression_in_call() {
+        let src = r#"
+@implementation W
+- (void)setup {
+    [self performSelector:@selector(fire)];
+}
+- (void)fire {}
+@end
+"#;
+        let (nodes, _) = run("w.m", src, Language::ObjC);
+        assert!(has_node(&nodes, NodeKind::Method, "setup"));
+    }
+
+    #[test]
+    fn r_top_level_right_assign_variable() {
+        let src = r#"
+compute() -> result
+"#;
+        let (nodes, _) = run("ra.R", src, Language::R);
+        assert!(has_node(&nodes, NodeKind::Variable, "result"));
+    }
+
+    #[test]
+    fn clean_comment_strips_lua_block_marker() {
+        assert_eq!(super::clean_comment("--[[ lua block ]]"), "lua block");
+        assert_eq!(super::clean_comment("--[==[ level ]==]"), "level");
+    }
+
+    #[test]
+    fn lua_block_comment_docstring_is_cleaned() {
+        let src = r#"
+--[[ Adds numbers. ]]
+function add(a, b) return a + b end
+"#;
+        let (nodes, _) = run("m.lua", src, Language::Lua);
+        let add = node(&nodes, NodeKind::Function, "add");
+        assert_eq!(add.docstring.as_deref(), Some("Adds numbers."));
+    }
+
+    #[test]
+    fn dart_abstract_method_signature_name() {
+        let src = r#"
+abstract class Shape {
+  double area();
+  String describe();
+}
+"#;
+        let (nodes, _) = run("shape.dart", src, Language::Dart);
+        assert!(has_node(&nodes, NodeKind::Class, "Shape"));
+    }
+
+    #[test]
+    fn kotlin_object_and_function_extracted() {
+        let src = r#"
+object Registry {
+    fun register() {}
+}
+fun topLevel() {}
+"#;
+        let (nodes, _) = run("k2.kt", src, Language::Kotlin);
+        assert!(has_node(&nodes, NodeKind::Function, "topLevel"));
+    }
+
+    #[test]
+    fn csharp_class_method_and_field() {
+        let src = r#"
+class Widget {
+    private int count;
+    public void Render() {}
+}
+"#;
+        let (nodes, _) = run("W.cs", src, Language::CSharp);
+        assert!(has_node(&nodes, NodeKind::Class, "Widget"));
+        assert!(has_node(&nodes, NodeKind::Method, "Render"));
+    }
+
+    #[test]
+    fn cpp_class_and_method_extracted() {
+        let src = r#"
+class Widget {
+public:
+    void render();
+    int count;
+};
+void Widget::render() {}
+"#;
+        let (nodes, _) = run("w.cpp", src, Language::Cpp);
+        assert!(has_node(&nodes, NodeKind::Class, "Widget"));
+    }
+
+    #[test]
+    fn swift_computed_property_extracted() {
+        let src = r#"
+struct V {
+    var body: Int { 42 }
+}
+"#;
+        let (nodes, _) = run("v.swift", src, Language::Swift);
+        assert!(has_node(&nodes, NodeKind::Property, "body"));
+    }
+
+    #[test]
+    fn pascal_procedure_and_function_extracted() {
+        let src = r#"
+program P;
+procedure Greet; begin end;
+function Sum(a, b: Integer): Integer; begin Sum := a + b; end;
+begin
+end.
+"#;
+        let (nodes, _) = run("p.pas", src, Language::Pascal);
+        assert!(nodes.iter().any(|n| n.kind == NodeKind::File));
+    }
+
+    #[test]
+    fn nested_function_inside_body_extracted() {
+        let src = r#"
+function helper() {}
+function outer() {
+    function inner() { helper(); }
+    inner();
+}
+"#;
+        let (nodes, refs) = run("nf.ts", src, Language::TypeScript);
+        assert!(has_node(&nodes, NodeKind::Function, "inner"));
+        assert!(has_ref(&refs, EdgeKind::Calls, "helper"));
+    }
+
+    #[test]
+    fn rust_scoped_chained_call_reencodes() {
+        let src = r#"
+struct Foo;
+impl Foo {
+    fn new() -> Foo { Foo }
+    fn bar(&self) {}
+}
+fn main() { Foo::new().bar(); }
+"#;
+        let (_, refs) = run("rc.rs", src, Language::Rust);
+        assert!(has_ref(&refs, EdgeKind::Calls, "Foo::new().bar"));
+    }
+
+    #[test]
+    fn swift_capitalized_factory_chain_reencodes() {
+        let src = r#"
+class Foo {
+    static func make() -> Foo { Foo() }
+    func bar() {}
+}
+func m() { Foo.make().bar() }
+"#;
+        let (_, refs) = run("sf.swift", src, Language::Swift);
+        assert!(has_ref(&refs, EdgeKind::Calls, "Foo.make().bar"));
+    }
+
+    #[test]
+    fn go_parenthesized_conversion_call_normalized() {
+        let src = r#"
+package main
+type Handler func()
+func run(h Handler) {}
+func main() {
+    var f Handler
+    (*f)()
+}
+"#;
+        let (nodes, _) = run("gc.go", src, Language::Go);
+        assert!(nodes.iter().any(|n| n.kind == NodeKind::File));
+    }
+
+    #[test]
+    fn scala_extension_body_walks_calls() {
+        let src = r#"
+object M { def helper(): Unit = {} }
+extension (s: String)
+  def shout: String = { M.helper(); s }
+"#;
+        let (_, refs) = run("ext.scala", src, Language::Scala);
+        assert!(has_ref(&refs, EdgeKind::Calls, "M.helper"));
+    }
+}

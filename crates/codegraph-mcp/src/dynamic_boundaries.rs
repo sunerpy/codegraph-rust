@@ -1216,4 +1216,314 @@ mod tests {
         assert!(m.snippet.ends_with("..."));
         assert_eq!(m.snippet.chars().count(), 120);
     }
+
+    #[test]
+    fn ext_rust_nested_block_comment_stripped() {
+        let body = "fn f() {\n    /* outer /* inner handlers[\"x\"]() */ still */\n    let v = obj[key]();\n}";
+        let ms = scan_dynamic_dispatch(body, "rust", 1);
+        assert_eq!(
+            ms.len(),
+            1,
+            "only the real call outside the comment fires: {ms:?}"
+        );
+        assert_eq!(ms[0].form, "computed-call");
+    }
+
+    #[test]
+    fn ext_go_raw_string_and_line_comment_stripped() {
+        let body = "func f() {\n    // reflect m.invoke(x)\n    s := `raw m.MethodByName(\"x\")`\n    r := reflect.ValueOf(x).MethodByName(\"Real\")\n}";
+        let ms = scan_dynamic_dispatch(body, "go", 1);
+        assert_eq!(
+            ms.len(),
+            1,
+            "comment + raw-string dispatches suppressed: {ms:?}"
+        );
+        assert_eq!(ms[0].form, "reflection");
+        assert_eq!(ms[0].key.as_deref(), Some("Real"));
+    }
+
+    #[test]
+    fn ext_php_hash_and_block_comment_stripped() {
+        let body = "<?php\n# call_user_func($fake)\n/* $this->$m() */\n$r = call_user_func('realHandler');";
+        let ms = scan_dynamic_dispatch(body, "php", 1);
+        assert_eq!(ms.len(), 1, "hash + block comment sites suppressed: {ms:?}");
+        assert_eq!(ms[0].form, "php-dynamic");
+        assert_eq!(ms[0].key.as_deref(), Some("realHandler"));
+    }
+
+    #[test]
+    fn ext_ruby_begin_end_block_comment_stripped() {
+        let body = "def run\n=begin\n obj.send(:hidden)\n=end\n  obj.send(:visible)\nend";
+        let ms = scan_dynamic_dispatch(body, "ruby", 1);
+        assert_eq!(ms.len(), 1, "=begin/=end body suppressed: {ms:?}");
+        assert_eq!(ms[0].key.as_deref(), Some("visible"));
+    }
+
+    #[test]
+    fn ext_php_dynamic_this_method_var() {
+        let body = "<?php\nfunction r($this){ return $this->$method(); }";
+        let m = one(body, "php", 1);
+        assert_eq!(m.form, "php-dynamic");
+    }
+
+    #[test]
+    fn ext_reflection_csharp_activator() {
+        let m = one("var o = Activator.CreateInstance(t);", "csharp", 7);
+        assert_eq!(m.form, "reflection");
+        assert_eq!(m.line, 7);
+    }
+
+    #[test]
+    fn ext_reflection_java_forname_with_key_window() {
+        let m = one("Class.forName(\"com.example.Impl\");", "java", 1);
+        assert_eq!(m.form, "reflection");
+        assert_eq!(m.key.as_deref(), Some("com.example.Impl"));
+    }
+
+    #[test]
+    fn ext_proxy_reflect_reflect_apply() {
+        let m = one(
+            "const r = Reflect.apply(fn, thisArg, args);",
+            "javascript",
+            1,
+        );
+        assert_eq!(m.form, "proxy-reflect");
+    }
+
+    #[test]
+    fn ext_selector_nsclassfromstring() {
+        let m = one("let c = NSClassFromString(name);", "swift", 1);
+        assert_eq!(m.form, "selector");
+        assert!(m.key.is_none());
+    }
+
+    #[test]
+    fn ext_var_key_dispatch_dotted_path() {
+        let m = one("bus.publish(config.event.name, payload);", "typescript", 1);
+        assert_eq!(m.form, "var-key-dispatch");
+    }
+
+    #[test]
+    fn ext_getattr_not_called_yields_nothing() {
+        let body = "def d(self, name):\n    x = getattr(self, name)\n    return x";
+        assert!(scan_dynamic_dispatch(body, "python", 1).is_empty());
+    }
+
+    #[test]
+    fn ext_getattr_unbalanced_paren_skipped() {
+        let body = "def d(self, name):\n    return getattr(self, name";
+        assert!(scan_dynamic_dispatch(body, "python", 1).is_empty());
+    }
+
+    #[test]
+    fn ext_getattr_dedupe_counts_more_sites() {
+        let body = "def d(self):\n    getattr(self, 'x')()\n    getattr(self, 'x')()";
+        let ms = scan_dynamic_dispatch(body, "python", 1);
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].form, "getattr-call");
+        assert_eq!(ms[0].more_sites, 1);
+    }
+
+    #[test]
+    fn ext_unknown_language_still_scans_generic_forms() {
+        let m = one("result = table[key](arg)", "haskell", 1);
+        assert_eq!(m.form, "computed-call");
+    }
+
+    #[test]
+    fn ext_max_body_chars_truncation_char_boundary() {
+        // A body larger than MAX_BODY_CHARS is sliced on a char boundary; the
+        // dispatch site sits inside the retained prefix and still fires.
+        let mut body = String::from("function f(){\n  reg['save']();\n");
+        body.push_str(&"  const pad = 1;\n".repeat(5000));
+        body.push('}');
+        assert!(body.len() > MAX_BODY_CHARS);
+        let ms = scan_dynamic_dispatch(&body, "typescript", 1);
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].key.as_deref(), Some("save"));
+    }
+
+    #[test]
+    fn ext_single_string_literal_all_quote_styles() {
+        assert_eq!(single_string_literal("'foo'").as_deref(), Some("foo"));
+        assert_eq!(single_string_literal("\"bar\"").as_deref(), Some("bar"));
+        assert_eq!(single_string_literal("`baz`").as_deref(), Some("baz"));
+        assert!(single_string_literal("no literal here").is_none());
+    }
+
+    #[test]
+    fn ext_typed_bus_generic_async_variant() {
+        let m = one(
+            "await mediator.SendAsync<Result>(new QueryThing(id));",
+            "csharp",
+            1,
+        );
+        assert_eq!(m.form, "typed-bus");
+        assert_eq!(m.key.as_deref(), Some("QueryThing"));
+        assert!(m.key_is_type);
+    }
+
+    #[test]
+    fn ext_dynamic_import_python_dunder_import() {
+        let m = one("def f(n):\n    return __import__(n)", "python", 3);
+        assert_eq!(m.form, "dynamic-import");
+        assert_eq!(m.line, 4);
+    }
+
+    #[test]
+    fn ext_gdscript_uses_python_comment_lang() {
+        let body = "func f():\n\t# handlers['x']()\n\treturn table[k]()";
+        let ms = scan_dynamic_dispatch(body, "gdscript", 1);
+        assert_eq!(ms.len(), 1, "comment suppressed, real call fires: {ms:?}");
+        assert_eq!(ms[0].form, "computed-call");
+    }
+
+    #[test]
+    fn ext_python_triple_quote_and_string_stripped() {
+        let body = "def f(self, name):\n    doc = \"\"\"getattr(self, 'x')() in a docstring\"\"\"\n    s = 'obj.send(:y)'\n    return getattr(self, name)()";
+        let ms = scan_dynamic_dispatch(body, "python", 1);
+        assert_eq!(ms.len(), 1, "only the real getattr fires: {ms:?}");
+        assert_eq!(ms[0].form, "getattr-call");
+    }
+
+    #[test]
+    fn ext_python_string_with_escape_stripped() {
+        let body = "def f(self, name):\n    s = 'it\\'s table[k]() here'\n    return getattr(self, name)()";
+        let ms = scan_dynamic_dispatch(body, "python", 1);
+        assert_eq!(ms.len(), 1, "escaped-quote string blanked: {ms:?}");
+        assert_eq!(ms[0].form, "getattr-call");
+    }
+
+    #[test]
+    fn ext_ruby_string_and_line_comment_stripped() {
+        let body =
+            "def run\n  s = \"handlers['x']()\"\n  # obj.send(:hidden)\n  obj.send(:visible)\nend";
+        let ms = scan_dynamic_dispatch(body, "ruby", 1);
+        assert_eq!(ms.len(), 1, "string + comment suppressed: {ms:?}");
+        assert_eq!(ms[0].key.as_deref(), Some("visible"));
+    }
+
+    #[test]
+    fn ext_c_style_block_and_line_comment_stripped() {
+        let body = "function f(){\n  /* handlers['x']() */\n  // reg[y]()\n  return table[k]();\n}";
+        let ms = scan_dynamic_dispatch(body, "java", 1);
+        assert_eq!(ms.len(), 1, "block + line comment suppressed: {ms:?}");
+        assert_eq!(ms[0].form, "computed-call");
+    }
+
+    #[test]
+    fn ext_java_string_literal_stripped() {
+        let body = "class C {\n  void f() {\n    String s = \"m.invoke(x)\";\n    var r = table[k]();\n  }\n}";
+        let ms = scan_dynamic_dispatch(body, "java", 1);
+        assert_eq!(ms.len(), 1, "string literal blanked: {ms:?}");
+        assert_eq!(ms[0].form, "computed-call");
+    }
+
+    #[test]
+    fn ext_php_string_literal_stripped() {
+        let body =
+            "<?php\nfunction r(){ $s = 'call_user_func($x)'; return call_user_func('real'); }";
+        let ms = scan_dynamic_dispatch(body, "php", 1);
+        assert_eq!(ms.len(), 1, "php string blanked: {ms:?}");
+        assert_eq!(ms[0].key.as_deref(), Some("real"));
+    }
+
+    #[test]
+    fn ext_go_interpreted_string_and_rune_stripped() {
+        let body = "func f() {\n    s := \"m.invoke(x)\"\n    c := '('\n    r := reflect.ValueOf(x).MethodByName(\"Real\")\n}";
+        let ms = scan_dynamic_dispatch(body, "go", 1);
+        assert_eq!(ms.len(), 1, "interpreted string + rune blanked: {ms:?}");
+        assert_eq!(ms[0].form, "reflection");
+    }
+
+    #[test]
+    fn ext_rust_string_and_char_literal_stripped() {
+        let body = "fn f() {\n    let s = \"handlers[\\\"x\\\"]()\";\n    let c = '(';\n    let v = table[k]();\n}";
+        let ms = scan_dynamic_dispatch(body, "rust", 1);
+        assert_eq!(ms.len(), 1, "string + char literal blanked: {ms:?}");
+        assert_eq!(ms[0].form, "computed-call");
+    }
+
+    #[test]
+    fn ext_getattr_assigned_then_immediate_call_form() {
+        let body = "def dispatch(self, req):\n    fn = getattr(self, req)\n    return fn(req)";
+        let m = one(body, "python", 1);
+        assert_eq!(m.form, "getattr-assign");
+    }
+
+    #[test]
+    fn ext_python_string_escaped_quote_branch() {
+        let body =
+            "def f(self, name):\n    s = \"a \\\" b table[k]()\"\n    return getattr(self, name)()";
+        let ms = scan_dynamic_dispatch(body, "python", 1);
+        assert_eq!(ms.len(), 1, "escaped quote keeps string intact: {ms:?}");
+        assert_eq!(ms[0].form, "getattr-call");
+    }
+
+    #[test]
+    fn ext_c_style_string_escaped_quote_branch() {
+        let body = "function f(){\n  const s = \"esc \\\" m.invoke(x)\";\n  return table[k]();\n}";
+        let ms = scan_dynamic_dispatch(body, "java", 1);
+        assert_eq!(ms.len(), 1, "escaped quote blanks whole string: {ms:?}");
+        assert_eq!(ms[0].form, "computed-call");
+    }
+
+    #[test]
+    fn ext_php_string_escaped_quote_branch() {
+        let body = "<?php\nfunction r(){ $s = \"esc \\\" call_user_func($x)\"; return call_user_func('real'); }";
+        let ms = scan_dynamic_dispatch(body, "php", 1);
+        assert_eq!(ms.len(), 1, "escaped quote blanks php string: {ms:?}");
+        assert_eq!(ms[0].key.as_deref(), Some("real"));
+    }
+
+    #[test]
+    fn ext_go_string_and_rune_escaped_quote_branch() {
+        let body = "func f() {\n    s := \"esc \\\" m.invoke(x)\"\n    c := '\\''\n    r := reflect.ValueOf(x).MethodByName(\"Real\")\n}";
+        let ms = scan_dynamic_dispatch(body, "go", 1);
+        assert_eq!(ms.len(), 1, "escaped quotes blank string + rune: {ms:?}");
+        assert_eq!(ms[0].form, "reflection");
+    }
+
+    #[test]
+    fn ext_rust_string_and_char_escaped_quote_branch() {
+        let body = "fn f() {\n    let s = \"esc \\\" table[x]()\";\n    let c = '\\'';\n    let v = table[k]();\n}";
+        let ms = scan_dynamic_dispatch(body, "rust", 1);
+        assert_eq!(ms.len(), 1, "escaped quotes blank string + char: {ms:?}");
+        assert_eq!(ms[0].form, "computed-call");
+    }
+
+    #[test]
+    fn ext_python_single_line_string_hits_newline_break() {
+        let body = "def f(self, name):\n    s = 'unterminated\n    return getattr(self, name)()";
+        let ms = scan_dynamic_dispatch(body, "python", 1);
+        assert!(
+            !ms.is_empty(),
+            "getattr after broken string still fires: {ms:?}"
+        );
+    }
+
+    #[test]
+    fn ext_ruby_indented_begin_end_block() {
+        let body = "def run\n   =begin\n obj.send(:hidden)\n   =end\n  obj.send(:shown)\nend";
+        let ms = scan_dynamic_dispatch(body, "ruby", 1);
+        assert_eq!(ms.len(), 1, "indented =end terminates block: {ms:?}");
+        assert_eq!(ms[0].key.as_deref(), Some("shown"));
+    }
+
+    #[test]
+    fn ext_blank_string_contents_unterminated_stops() {
+        let body = "def f(self, name):\n    x = \"open string\n    return getattr(self, name)()";
+        let ms = scan_dynamic_dispatch(body, "python", 1);
+        assert!(
+            !ms.is_empty(),
+            "unterminated blank stops at newline: {ms:?}"
+        );
+    }
+
+    #[test]
+    fn ext_getattr_max_matches_cap() {
+        let body = "def d(self):\n    getattr(self, 'aa')()\n    getattr(self, 'bb')()\n    getattr(self, 'cc')()\n    getattr(self, 'dd')()";
+        let ms = scan_dynamic_dispatch(body, "python", 1);
+        assert_eq!(ms.len(), MAX_MATCHES_PER_BODY);
+    }
 }
