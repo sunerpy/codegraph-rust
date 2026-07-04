@@ -261,6 +261,223 @@ mod tests {
         }
     }
 
+    struct TempOc {
+        base: PathBuf,
+        ctx: InstallContext,
+    }
+
+    impl TempOc {
+        fn new(label: &str) -> Self {
+            let base = std::env::temp_dir().join(format!(
+                "cg-opencode-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&base).unwrap();
+            let ctx = InstallContext {
+                home: base.join("home"),
+                cwd: base.join("cwd"),
+                app_data: None,
+                xdg_config_home: Some(base.join("xdg")),
+                hermes_home: None,
+            };
+            fs::create_dir_all(&ctx.cwd).unwrap();
+            Self { base, ctx }
+        }
+        fn read(&self, p: &PathBuf) -> Value {
+            let text = fs::read_to_string(p).unwrap();
+            Value::Object(parse_json_object(&text).unwrap())
+        }
+    }
+
+    impl Drop for TempOc {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.base);
+        }
+    }
+
+    fn opts() -> InstallOptions {
+        InstallOptions {
+            auto_allow: false,
+            front_load_hook: false,
+        }
+    }
+
+    #[test]
+    fn local_install_writes_mcp_wrapper_and_agents_md() {
+        let fx = TempOc::new("local-install");
+        let target = OpencodeTarget;
+        let cfg = config_path(&fx.ctx, Location::Local);
+
+        let detect = target.detect(&fx.ctx, Location::Local);
+        assert!(!detect.installed);
+
+        let result = target.install(&fx.ctx, Location::Local, opts());
+        assert!(result.files.len() >= 2);
+        let json = fx.read(&cfg);
+        assert_eq!(json["$schema"], SCHEMA_URL);
+        let entry = &json["mcp"]["codegraph"];
+        assert_eq!(entry["type"], "local");
+        assert_eq!(
+            entry["command"],
+            serde_json::json!(["codegraph", "serve", "--mcp"])
+        );
+        assert_eq!(entry["enabled"], true);
+        assert!(instructions_path(&fx.ctx, Location::Local).exists());
+
+        let detect = target.detect(&fx.ctx, Location::Local);
+        assert!(detect.installed);
+        assert!(detect.already_configured);
+    }
+
+    #[test]
+    fn global_install_uses_xdg_config_dir() {
+        let fx = TempOc::new("global-install");
+        let target = OpencodeTarget;
+        target.install(&fx.ctx, Location::Global, opts());
+        let cfg = config_path(&fx.ctx, Location::Global);
+        assert!(cfg.starts_with(fx.ctx.xdg_config_home.as_ref().unwrap()));
+        assert!(fx.read(&cfg)["mcp"]["codegraph"].is_object());
+    }
+
+    #[test]
+    fn install_is_idempotent_preserving_siblings() {
+        let fx = TempOc::new("idempotent");
+        let target = OpencodeTarget;
+        let cfg = fx.ctx.cwd.join("opencode.jsonc");
+        fs::write(
+            &cfg,
+            "{\n  // keep this\n  \"mcp\": { \"other\": { \"type\": \"local\" } }\n}\n",
+        )
+        .unwrap();
+
+        target.install(&fx.ctx, Location::Local, opts());
+        let first = fs::read_to_string(&cfg).unwrap();
+        assert!(first.contains("// keep this"), "comment preserved");
+        assert!(first.contains("\"other\""), "sibling preserved");
+        assert!(first.contains("\"codegraph\""), "codegraph inserted");
+        target.install(&fx.ctx, Location::Local, opts());
+        assert_eq!(fs::read_to_string(&cfg).unwrap(), first, "no churn");
+    }
+
+    #[test]
+    fn config_path_prefers_existing_json_over_default_jsonc() {
+        let fx = TempOc::new("prefer-json");
+        let json_file = fx.ctx.cwd.join("opencode.json");
+        fs::write(&json_file, "{}\n").unwrap();
+        assert_eq!(config_path(&fx.ctx, Location::Local), json_file);
+    }
+
+    #[test]
+    fn uninstall_removes_entry_and_instructions() {
+        let fx = TempOc::new("uninstall");
+        let target = OpencodeTarget;
+        let cfg = config_path(&fx.ctx, Location::Local);
+        target.install(&fx.ctx, Location::Local, opts());
+        let result = target.uninstall(&fx.ctx, Location::Local);
+        assert_eq!(result.files[0].action, FileAction::Removed);
+        let json = fx.read(&cfg);
+        assert!(json.get("mcp").is_none() || json["mcp"].get("codegraph").is_none());
+    }
+
+    #[test]
+    fn install_skips_unparseable_config() {
+        let fx = TempOc::new("unparseable");
+        let cfg = fx.ctx.cwd.join("opencode.jsonc");
+        let corrupt = "{ not json";
+        fs::write(&cfg, corrupt).unwrap();
+        let entry = write_mcp_entry(&fx.ctx, Location::Local);
+        assert_eq!(entry.action, FileAction::Skipped);
+        assert_eq!(fs::read_to_string(&cfg).unwrap(), corrupt);
+    }
+
+    #[test]
+    fn legacy_windows_dir_none_when_no_app_data() {
+        let fx = TempOc::new("no-appdata");
+        assert!(legacy_windows_config_dir(&fx.ctx).is_none());
+    }
+
+    #[test]
+    fn legacy_windows_dir_some_when_distinct_app_data() {
+        let base = std::env::temp_dir().join(format!(
+            "cg-oc-legacy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let ctx = InstallContext {
+            home: base.join("home"),
+            cwd: base.join("cwd"),
+            app_data: Some(base.join("appdata")),
+            xdg_config_home: Some(base.join("xdg")),
+            hermes_home: None,
+        };
+        let legacy = legacy_windows_config_dir(&ctx).expect("distinct app_data yields legacy dir");
+        assert!(legacy.ends_with("opencode"));
+        assert!(
+            cleanup_legacy_windows_state(&ctx).is_empty(),
+            "no legacy files to clean when dir absent"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cleanup_legacy_windows_state_removes_stale_entries() {
+        let base = std::env::temp_dir().join(format!(
+            "cg-oc-legacy-clean-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let ctx = InstallContext {
+            home: base.join("home"),
+            cwd: base.join("cwd"),
+            app_data: Some(base.join("appdata")),
+            xdg_config_home: Some(base.join("xdg")),
+            hermes_home: None,
+        };
+        let legacy = legacy_windows_config_dir(&ctx).unwrap();
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(
+            legacy.join("opencode.jsonc"),
+            "{\n  \"mcp\": { \"codegraph\": { \"type\": \"local\" } }\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            legacy.join("AGENTS.md"),
+            format!("body\n\n{CODEGRAPH_SECTION_START}\nx\n{CODEGRAPH_SECTION_END}\n"),
+        )
+        .unwrap();
+
+        let removed = cleanup_legacy_windows_state(&ctx);
+        assert!(
+            removed.iter().any(|f| f.action == FileAction::Removed),
+            "stale legacy entries removed"
+        );
+        let json: Value =
+            serde_json::from_str(&fs::read_to_string(legacy.join("opencode.jsonc")).unwrap())
+                .unwrap();
+        assert!(json.get("mcp").is_none() || json["mcp"].get("codegraph").is_none());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn print_config_shows_mcp_wrapper() {
+        let target = OpencodeTarget;
+        let out = target.print_config(&ctx(), Location::Local);
+        assert!(out.contains("$schema"));
+        assert!(out.contains(SCHEMA_URL));
+        assert!(out.contains("\"mcp\""));
+        assert!(out.contains("codegraph"));
+    }
+
     #[test]
     fn opencode_supports_skills_both_locations() {
         let t = OpencodeTarget;

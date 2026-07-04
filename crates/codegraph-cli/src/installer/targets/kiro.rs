@@ -324,4 +324,157 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&home);
     }
+
+    struct TempKiro {
+        base: PathBuf,
+        ctx: InstallContext,
+    }
+
+    impl TempKiro {
+        fn new(label: &str) -> Self {
+            let base = std::env::temp_dir().join(format!(
+                "cg-kiro-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&base).unwrap();
+            let ctx = InstallContext {
+                home: base.join("home"),
+                cwd: base.join("cwd"),
+                app_data: None,
+                xdg_config_home: None,
+                hermes_home: None,
+            };
+            fs::create_dir_all(&ctx.cwd).unwrap();
+            Self { base, ctx }
+        }
+        fn read(&self, p: &PathBuf) -> Value {
+            serde_json::from_str(&fs::read_to_string(p).unwrap()).unwrap()
+        }
+    }
+
+    impl Drop for TempKiro {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.base);
+        }
+    }
+
+    fn opts() -> InstallOptions {
+        InstallOptions {
+            auto_allow: false,
+            front_load_hook: false,
+        }
+    }
+
+    #[test]
+    fn local_install_detect_idempotent_then_uninstall() {
+        let fx = TempKiro::new("lifecycle");
+        let target = KiroTarget;
+        let mcp = mcp_json_path(&fx.ctx, Location::Local);
+
+        let detect = target.detect(&fx.ctx, Location::Local);
+        assert!(!detect.installed);
+
+        let result = target.install(&fx.ctx, Location::Local, opts());
+        assert_eq!(result.files[0].action, FileAction::Created);
+        assert!(
+            result
+                .notes
+                .iter()
+                .any(|n| n.contains("CodeGraph MCP configured"))
+        );
+        let args = fx.read(&mcp)["mcpServers"]["codegraph"]["args"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(args[2], "--path");
+        assert_eq!(args[3], fx.ctx.cwd.to_string_lossy().as_ref());
+
+        let detect = target.detect(&fx.ctx, Location::Local);
+        assert!(detect.installed);
+        assert!(detect.already_configured);
+
+        let first = fs::read_to_string(&mcp).unwrap();
+        target.install(&fx.ctx, Location::Local, opts());
+        assert_eq!(fs::read_to_string(&mcp).unwrap(), first, "idempotent");
+
+        let removed = target.uninstall(&fx.ctx, Location::Local);
+        assert_eq!(removed.files[0].action, FileAction::Removed);
+        let json = fx.read(&mcp);
+        assert!(json.get("mcpServers").is_none());
+    }
+
+    #[test]
+    fn uninstall_missing_is_not_found() {
+        let fx = TempKiro::new("uninstall-missing");
+        let target = KiroTarget;
+        let result = target.uninstall(&fx.ctx, Location::Global);
+        assert_eq!(result.files[0].action, FileAction::NotFound);
+    }
+
+    #[test]
+    fn install_sweeps_stale_steering_doc() {
+        let fx = TempKiro::new("steering");
+        let target = KiroTarget;
+        let steering = steering_path(&fx.ctx, Location::Local);
+        fs::create_dir_all(steering.parent().unwrap()).unwrap();
+        fs::write(&steering, "stale steering doc\n").unwrap();
+
+        let result = target.install(&fx.ctx, Location::Local, opts());
+        assert!(
+            result.files.iter().any(|f| f.action == FileAction::Removed),
+            "stale steering doc swept on install"
+        );
+        assert!(!steering.exists());
+    }
+
+    #[test]
+    fn install_skips_unparseable_config() {
+        let fx = TempKiro::new("unparseable");
+        let mcp = mcp_json_path(&fx.ctx, Location::Local);
+        fs::create_dir_all(mcp.parent().unwrap()).unwrap();
+        let corrupt = "{ not json";
+        fs::write(&mcp, corrupt).unwrap();
+        let entry = write_mcp_entry(&fx.ctx, Location::Local);
+        assert_eq!(entry.action, FileAction::Skipped);
+        assert_eq!(fs::read_to_string(&mcp).unwrap(), corrupt);
+    }
+
+    #[test]
+    fn preserves_sibling_server_on_install() {
+        let fx = TempKiro::new("preserve");
+        let target = KiroTarget;
+        let mcp = mcp_json_path(&fx.ctx, Location::Local);
+        fs::create_dir_all(mcp.parent().unwrap()).unwrap();
+        fs::write(
+            &mcp,
+            "{\n  \"mcpServers\": { \"other\": { \"command\": \"foo\" } }\n}\n",
+        )
+        .unwrap();
+        target.install(&fx.ctx, Location::Local, opts());
+        let json = fx.read(&mcp);
+        assert!(json["mcpServers"]["other"].is_object());
+        assert!(json["mcpServers"]["codegraph"].is_object());
+    }
+
+    #[test]
+    fn print_config_local_and_global_differ() {
+        let target = KiroTarget;
+        let ctx = ctx();
+        let local = target.print_config(&ctx, Location::Local);
+        assert!(local.contains("--path"));
+        assert!(local.contains("mcp.json"));
+
+        let global = target.print_config(&ctx, Location::Global);
+        assert!(global.contains(KIRO_GLOBAL_WHY));
+        assert!(global.contains(KIRO_GLOBAL_HOWTO));
+        let global_args = global.split("\"args\"").nth(1).expect("args block present");
+        assert!(
+            !global_args.contains("--path"),
+            "global entry args must not pin --path"
+        );
+    }
 }

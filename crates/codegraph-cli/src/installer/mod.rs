@@ -496,6 +496,7 @@ fn tildify(ctx: &InstallContext, path: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::installer::types::FileWrite;
     use std::fs;
     use std::sync::Mutex;
 
@@ -638,6 +639,197 @@ mod tests {
             !ctx.cwd.join(".kiro").exists() && !ctx.cwd.join(".cursor").exists(),
             "none must be a pure no-op"
         );
+
+        match prev_home {
+            Some(v) => unsafe { std::env::set_var(home_key, v) },
+            None => unsafe { std::env::remove_var(home_key) },
+        }
+        let _ = fs::remove_dir_all(base);
+    }
+
+    fn install_args(target: &str, location: &str) -> InstallArgs {
+        InstallArgs {
+            target: Some(target.to_string()),
+            location: Some(location.to_string()),
+            yes: true,
+            permissions: None,
+            front_load_hook: false,
+            print_config: None,
+        }
+    }
+
+    #[test]
+    fn run_install_with_ctx_installs_selected_target() {
+        let (ctx, base) = temp_ctx("run-install");
+        let cwd = ctx.cwd.clone();
+        run_install_with_ctx(ctx, install_args("gemini", "local")).unwrap();
+        assert!(cwd.join(".gemini").join("settings.json").exists());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn run_install_with_ctx_reports_already_configured_on_reinstall() {
+        let (ctx, base) = temp_ctx("run-reinstall");
+        run_install_with_ctx(ctx.clone(), install_args("gemini", "local")).unwrap();
+        run_install_with_ctx(ctx, install_args("gemini", "local")).unwrap();
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn run_install_with_ctx_skips_unsupported_location() {
+        let (ctx, base) = temp_ctx("run-skip");
+        run_install_with_ctx(ctx.clone(), install_args("codex", "local")).unwrap();
+        assert!(!ctx.home.join(".codex").exists());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn run_install_with_ctx_none_target_is_noop() {
+        let (ctx, base) = temp_ctx("run-none");
+        run_install_with_ctx(ctx, install_args("none", "global")).unwrap();
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn run_install_with_ctx_print_config_writes_nothing() {
+        let (ctx, base) = temp_ctx("run-print");
+        let home = ctx.home.clone();
+        let args = InstallArgs {
+            target: None,
+            location: Some("global".to_string()),
+            yes: false,
+            permissions: None,
+            front_load_hook: false,
+            print_config: Some("codex".to_string()),
+        };
+        run_install_with_ctx(ctx, args).unwrap();
+        assert!(!home.join(".codex").exists());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn run_install_with_ctx_print_config_unknown_errors() {
+        let (ctx, base) = temp_ctx("run-print-unknown");
+        let args = InstallArgs {
+            target: None,
+            location: None,
+            yes: false,
+            permissions: None,
+            front_load_hook: false,
+            print_config: Some("bogus".to_string()),
+        };
+        let result = run_install_with_ctx(ctx, args);
+        assert!(result.is_err());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn uninstall_targets_reports_removed_notconfigured_unsupported() {
+        let (ctx, base) = temp_ctx("uninstall-sweep");
+        let gemini = registry::get_target("gemini").unwrap();
+        let codex = registry::get_target("codex").unwrap();
+
+        gemini.install(
+            &ctx,
+            Location::Local,
+            InstallOptions {
+                auto_allow: false,
+                front_load_hook: false,
+            },
+        );
+
+        let reports = uninstall_targets(&ctx, &[gemini, codex], Location::Local);
+        assert!(matches!(reports[0].status, UninstallStatus::Removed));
+        assert!(!reports[0].removed_paths.is_empty());
+        assert!(matches!(reports[1].status, UninstallStatus::Unsupported));
+        assert!(!reports[1].notes.is_empty());
+
+        let again = uninstall_targets(&ctx, &[gemini], Location::Local);
+        assert!(matches!(again[0].status, UninstallStatus::NotConfigured));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn report_write_result_skips_notfound_and_kept() {
+        let (ctx, base) = temp_ctx("report");
+        let result = WriteResult {
+            files: vec![
+                FileWrite {
+                    path: ctx.home.join("a.json"),
+                    action: FileAction::Created,
+                },
+                FileWrite {
+                    path: ctx.home.join("b.json"),
+                    action: FileAction::NotFound,
+                },
+                FileWrite {
+                    path: ctx.home.join("c.json"),
+                    action: FileAction::Kept,
+                },
+            ],
+            notes: vec!["a note".to_string()],
+        };
+        report_write_result("Test", &ctx, &result);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn run_uninstall_with_ctx_via_public_paths() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (ctx, base) = temp_ctx("run-uninstall");
+        let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        let prev_home = std::env::var_os(home_key);
+        unsafe { std::env::set_var(home_key, &ctx.home) };
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", ctx.xdg_config_home.as_ref().unwrap()) };
+
+        run_uninstall(UninstallArgs {
+            target: Some("gemini".to_string()),
+            location: Some("global".to_string()),
+            yes: true,
+        })
+        .unwrap();
+
+        match prev_home {
+            Some(v) => unsafe { std::env::set_var(home_key, v) },
+            None => unsafe { std::env::remove_var(home_key) },
+        }
+        match prev_xdg {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn run_skill_install_and_uninstall_and_status_via_ctx() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (ctx, base) = temp_ctx("run-skill");
+        let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        let prev_home = std::env::var_os(home_key);
+        unsafe { std::env::set_var(home_key, &ctx.home) };
+
+        run_skill_install(SkillArgs {
+            target: Some("claude".to_string()),
+            location: Some("global".to_string()),
+            yes: true,
+            force: false,
+        })
+        .unwrap();
+        run_skill_status(SkillArgs {
+            target: Some("claude".to_string()),
+            location: Some("global".to_string()),
+            yes: false,
+            force: false,
+        })
+        .unwrap();
+        run_skill_uninstall(SkillArgs {
+            target: Some("claude".to_string()),
+            location: Some("global".to_string()),
+            yes: true,
+            force: false,
+        })
+        .unwrap();
 
         match prev_home {
             Some(v) => unsafe { std::env::set_var(home_key, v) },

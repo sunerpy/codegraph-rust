@@ -275,6 +275,244 @@ mod tests {
         }
     }
 
+    struct TempAg {
+        base: PathBuf,
+        ctx: InstallContext,
+    }
+
+    impl TempAg {
+        fn new(label: &str) -> Self {
+            let base = std::env::temp_dir().join(format!(
+                "cg-antigravity-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&base).unwrap();
+            let ctx = InstallContext {
+                home: base.join("home"),
+                cwd: base.join("cwd"),
+                app_data: None,
+                xdg_config_home: None,
+                hermes_home: None,
+            };
+            Self { base, ctx }
+        }
+        fn read(&self, p: &Path) -> Value {
+            serde_json::from_str(&fs::read_to_string(p).unwrap()).unwrap()
+        }
+    }
+
+    impl Drop for TempAg {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.base);
+        }
+    }
+
+    fn opts() -> InstallOptions {
+        InstallOptions {
+            auto_allow: false,
+            front_load_hook: false,
+        }
+    }
+
+    #[test]
+    fn install_fresh_writes_legacy_path_omitting_type() {
+        let fx = TempAg::new("install-fresh");
+        let target = AntigravityTarget;
+
+        let detect = target.detect(&fx.ctx, Location::Global);
+        assert!(!detect.installed);
+        assert!(!detect.already_configured);
+
+        let result = target.install(&fx.ctx, Location::Global, opts());
+        assert!(!result.files.is_empty());
+        assert!(!result.notes.is_empty());
+        let legacy = legacy_mcp_config_path(&fx.ctx);
+        assert!(legacy.exists(), "fresh install writes to legacy path");
+        let entry = &fx.read(&legacy)["mcpServers"]["codegraph"];
+        assert_eq!(entry["command"], "codegraph");
+        assert_eq!(entry["args"], serde_json::json!(["serve", "--mcp"]));
+        assert!(
+            entry.get("type").is_none(),
+            "Antigravity rejects type field"
+        );
+
+        let detect = target.detect(&fx.ctx, Location::Global);
+        assert!(detect.installed);
+        assert!(detect.already_configured);
+    }
+
+    #[test]
+    fn install_prefers_unified_path_when_migrated_marker_present() {
+        let fx = TempAg::new("install-migrated");
+        let target = AntigravityTarget;
+        let marker = migrated_marker_path(&fx.ctx);
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        fs::write(&marker, "").unwrap();
+
+        target.install(&fx.ctx, Location::Global, opts());
+        let unified = unified_mcp_config_path(&fx.ctx);
+        assert!(unified.exists(), "migrated marker routes to unified path");
+        assert!(fx.read(&unified)["mcpServers"]["codegraph"].is_object());
+    }
+
+    #[test]
+    fn install_prefers_unified_when_unified_file_exists() {
+        let fx = TempAg::new("install-unified-exists");
+        let target = AntigravityTarget;
+        let unified = unified_mcp_config_path(&fx.ctx);
+        fs::create_dir_all(unified.parent().unwrap()).unwrap();
+        fs::write(&unified, "{}\n").unwrap();
+        assert_eq!(preferred_mcp_config_path(&fx.ctx), unified);
+
+        target.install(&fx.ctx, Location::Global, opts());
+        assert!(fx.read(&unified)["mcpServers"]["codegraph"].is_object());
+    }
+
+    #[test]
+    fn install_is_idempotent() {
+        let fx = TempAg::new("idempotent");
+        let target = AntigravityTarget;
+        target.install(&fx.ctx, Location::Global, opts());
+        let legacy = legacy_mcp_config_path(&fx.ctx);
+        let first = fs::read_to_string(&legacy).unwrap();
+        target.install(&fx.ctx, Location::Global, opts());
+        assert_eq!(fs::read_to_string(&legacy).unwrap(), first);
+    }
+
+    #[test]
+    fn install_cleans_up_legacy_when_writing_unified() {
+        let fx = TempAg::new("cleanup-legacy");
+        let target = AntigravityTarget;
+        let legacy = legacy_mcp_config_path(&fx.ctx);
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(
+            &legacy,
+            "{\n  \"mcpServers\": { \"codegraph\": { \"command\": \"old\" } }\n}\n",
+        )
+        .unwrap();
+        let marker = migrated_marker_path(&fx.ctx);
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        fs::write(&marker, "").unwrap();
+
+        let result = target.install(&fx.ctx, Location::Global, opts());
+        let unified = unified_mcp_config_path(&fx.ctx);
+        assert!(fx.read(&unified)["mcpServers"]["codegraph"].is_object());
+        assert!(
+            fx.read(&legacy)["mcpServers"].get("codegraph").is_none(),
+            "legacy codegraph entry removed"
+        );
+        assert!(
+            result.files.iter().any(|f| f.action == FileAction::Removed),
+            "cleanup emits a Removed file"
+        );
+    }
+
+    #[test]
+    fn install_skips_unparseable_config() {
+        let fx = TempAg::new("unparseable");
+        let legacy = legacy_mcp_config_path(&fx.ctx);
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        let corrupt = "{ not json at all";
+        fs::write(&legacy, corrupt).unwrap();
+
+        let entry = write_mcp_entry(&fx.ctx);
+        assert_eq!(entry.action, FileAction::Skipped);
+        assert_eq!(fs::read_to_string(&legacy).unwrap(), corrupt);
+    }
+
+    #[test]
+    fn uninstall_removes_codegraph_preserving_siblings() {
+        let fx = TempAg::new("uninstall");
+        let target = AntigravityTarget;
+        let legacy = legacy_mcp_config_path(&fx.ctx);
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(
+            &legacy,
+            "{\n  \"mcpServers\": { \"other\": { \"command\": \"foo\" } }\n}\n",
+        )
+        .unwrap();
+        target.install(&fx.ctx, Location::Global, opts());
+
+        let result = target.uninstall(&fx.ctx, Location::Global);
+        assert!(result.files.iter().any(|f| f.action == FileAction::Removed));
+        let json = fx.read(&legacy);
+        assert!(json["mcpServers"].get("codegraph").is_none());
+        assert!(json["mcpServers"]["other"].is_object());
+    }
+
+    #[test]
+    fn uninstall_missing_config_is_not_found() {
+        let fx = TempAg::new("uninstall-missing");
+        let target = AntigravityTarget;
+        let result = target.uninstall(&fx.ctx, Location::Global);
+        assert_eq!(result.files[0].action, FileAction::NotFound);
+    }
+
+    #[test]
+    fn uninstall_config_without_codegraph_is_not_found() {
+        let fx = TempAg::new("uninstall-absent");
+        let legacy = legacy_mcp_config_path(&fx.ctx);
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(
+            &legacy,
+            "{\n  \"mcpServers\": { \"other\": { \"command\": \"foo\" } }\n}\n",
+        )
+        .unwrap();
+        let result = remove_codegraph_from_file(&legacy);
+        assert_eq!(result.action, FileAction::NotFound);
+    }
+
+    #[test]
+    fn local_location_is_rejected_for_mcp_ops() {
+        let fx = TempAg::new("local-reject");
+        let target = AntigravityTarget;
+        assert!(!target.supports_location(Location::Local));
+
+        let install = target.install(&fx.ctx, Location::Local, opts());
+        assert!(install.files.is_empty());
+        assert!(install.notes[0].contains("--location=global"));
+
+        let uninstall = target.uninstall(&fx.ctx, Location::Local);
+        assert!(uninstall.files.is_empty());
+
+        let detect = target.detect(&fx.ctx, Location::Local);
+        assert!(!detect.installed);
+
+        let printed = target.print_config(&fx.ctx, Location::Local);
+        assert!(printed.contains("--location=global"));
+    }
+
+    #[test]
+    fn print_config_global_shows_entry_without_type() {
+        let fx = TempAg::new("print");
+        let target = AntigravityTarget;
+        let out = target.print_config(&fx.ctx, Location::Global);
+        assert!(out.contains("mcpServers"));
+        assert!(out.contains("codegraph"));
+        assert!(out.contains("serve"));
+        assert!(!out.contains("\"type\""));
+    }
+
+    #[test]
+    fn preferred_path_defaults_to_legacy_without_markers() {
+        let fx = TempAg::new("preferred-default");
+        assert_eq!(
+            preferred_mcp_config_path(&fx.ctx),
+            legacy_mcp_config_path(&fx.ctx)
+        );
+    }
+
+    #[test]
+    fn resolve_command_is_bare_on_non_macos() {
+        if !cfg!(target_os = "macos") {
+            assert_eq!(resolve_codegraph_command(), "codegraph");
+        }
+    }
+
     #[test]
     fn antigravity_skills_decoupled_from_location_with_distinct_paths() {
         // Given the Antigravity target

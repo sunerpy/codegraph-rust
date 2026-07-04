@@ -140,4 +140,72 @@ mod tests {
         // Lingma was folded into Qoder; the stale id must not resolve.
         assert!(get_target("lingma").is_none());
     }
+
+    fn temp_ctx() -> InstallContext {
+        let base = std::env::temp_dir().join(format!(
+            "cg-registry-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        InstallContext {
+            home: base.join("home"),
+            cwd: base.join("cwd"),
+            app_data: None,
+            xdg_config_home: None,
+            hermes_home: None,
+        }
+    }
+
+    #[test]
+    fn resolve_none_yields_empty() {
+        let ctx = temp_ctx();
+        let resolved = resolve_target_flag(&ctx, "none", Location::Global).unwrap();
+        assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn resolve_all_yields_full_registry() {
+        let ctx = temp_ctx();
+        let resolved = resolve_target_flag(&ctx, "all", Location::Global).unwrap();
+        assert_eq!(resolved.len(), ALL_IDS.len());
+    }
+
+    #[test]
+    fn resolve_auto_falls_back_to_claude_when_none_detected() {
+        let ctx = temp_ctx();
+        let resolved = resolve_target_flag(&ctx, "auto", Location::Global).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].id().as_str(), "claude");
+    }
+
+    #[test]
+    fn resolve_csv_list_resolves_each() {
+        let ctx = temp_ctx();
+        let resolved =
+            resolve_target_flag(&ctx, "claude, cursor ,codex", Location::Global).unwrap();
+        let ids: Vec<&str> = resolved.iter().map(|t| t.id().as_str()).collect();
+        assert_eq!(ids, vec!["claude", "cursor", "codex"]);
+    }
+
+    #[test]
+    fn resolve_csv_with_unknown_id_errors() {
+        let ctx = temp_ctx();
+        let result = resolve_target_flag(&ctx, "claude,bogus", Location::Global);
+        let err = match result {
+            Ok(_) => panic!("unknown id must error"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("Unknown --target id(s): bogus"));
+    }
+
+    #[test]
+    fn detect_all_returns_one_entry_per_target() {
+        let ctx = temp_ctx();
+        let detections = detect_all(&ctx, Location::Global);
+        assert_eq!(detections.len(), ALL_IDS.len());
+        assert!(detections.iter().all(|(_, d)| !d.installed));
+    }
 }

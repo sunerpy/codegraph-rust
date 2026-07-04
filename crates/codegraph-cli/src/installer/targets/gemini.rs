@@ -157,6 +157,7 @@ pub static GEMINI_TARGET: GeminiTarget = GeminiTarget;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn ctx() -> InstallContext {
         InstallContext {
@@ -166,6 +167,185 @@ mod tests {
             xdg_config_home: None,
             hermes_home: None,
         }
+    }
+
+    struct TempGemini {
+        base: PathBuf,
+        ctx: InstallContext,
+    }
+
+    impl TempGemini {
+        fn new(label: &str) -> Self {
+            let base = std::env::temp_dir().join(format!(
+                "cg-gemini-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&base).unwrap();
+            let ctx = InstallContext {
+                home: base.join("home"),
+                cwd: base.join("cwd"),
+                app_data: None,
+                xdg_config_home: None,
+                hermes_home: None,
+            };
+            fs::create_dir_all(&ctx.cwd).unwrap();
+            Self { base, ctx }
+        }
+        fn read(&self, p: &PathBuf) -> serde_json::Value {
+            serde_json::from_str(&fs::read_to_string(p).unwrap()).unwrap()
+        }
+    }
+
+    impl Drop for TempGemini {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.base);
+        }
+    }
+
+    fn opts() -> InstallOptions {
+        InstallOptions {
+            auto_allow: false,
+            front_load_hook: false,
+        }
+    }
+
+    #[test]
+    fn install_global_writes_settings_and_instructions() {
+        let fx = TempGemini::new("install-global");
+        let target = GeminiTarget;
+        let settings = settings_json_path(&fx.ctx, Location::Global);
+        let md = instructions_path(&fx.ctx, Location::Global);
+
+        let detect = target.detect(&fx.ctx, Location::Global);
+        assert!(!detect.installed);
+        assert!(!detect.already_configured);
+
+        let result = target.install(&fx.ctx, Location::Global, opts());
+        assert_eq!(result.files.len(), 2);
+        let json = fx.read(&settings);
+        let entry = &json["mcpServers"]["codegraph"];
+        assert_eq!(entry["command"], "codegraph");
+        assert_eq!(entry["args"], serde_json::json!(["serve", "--mcp"]));
+        assert_eq!(entry["type"], "stdio");
+        assert!(md.ends_with("GEMINI.md"));
+        assert!(
+            fs::read_to_string(&md)
+                .unwrap()
+                .contains(CODEGRAPH_SECTION_START)
+        );
+
+        let detect = target.detect(&fx.ctx, Location::Global);
+        assert!(detect.installed);
+        assert!(detect.already_configured);
+    }
+
+    #[test]
+    fn install_local_uses_project_root_gemini_md() {
+        let fx = TempGemini::new("install-local");
+        let target = GeminiTarget;
+
+        target.install(&fx.ctx, Location::Local, opts());
+        let settings = settings_json_path(&fx.ctx, Location::Local);
+        assert!(settings.starts_with(&fx.ctx.cwd));
+        let md = instructions_path(&fx.ctx, Location::Local);
+        assert_eq!(md, fx.ctx.cwd.join("GEMINI.md"));
+        assert!(md.exists());
+        assert!(fx.read(&settings)["mcpServers"]["codegraph"].is_object());
+    }
+
+    #[test]
+    fn install_is_idempotent() {
+        let fx = TempGemini::new("idempotent");
+        let target = GeminiTarget;
+        let settings = settings_json_path(&fx.ctx, Location::Global);
+
+        target.install(&fx.ctx, Location::Global, opts());
+        let first = fs::read_to_string(&settings).unwrap();
+        target.install(&fx.ctx, Location::Global, opts());
+        assert_eq!(fs::read_to_string(&settings).unwrap(), first);
+    }
+
+    #[test]
+    fn install_preserves_sibling_mcp_server() {
+        let fx = TempGemini::new("preserve");
+        let target = GeminiTarget;
+        let settings = settings_json_path(&fx.ctx, Location::Global);
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        fs::write(
+            &settings,
+            "{\n  \"mcpServers\": { \"other\": { \"command\": \"foo\" } }\n}\n",
+        )
+        .unwrap();
+
+        target.install(&fx.ctx, Location::Global, opts());
+        let json = fx.read(&settings);
+        assert!(json["mcpServers"]["other"].is_object());
+        assert!(json["mcpServers"]["codegraph"].is_object());
+    }
+
+    #[test]
+    fn uninstall_removes_entry_and_instructions() {
+        let fx = TempGemini::new("uninstall");
+        let target = GeminiTarget;
+        let settings = settings_json_path(&fx.ctx, Location::Global);
+
+        target.install(&fx.ctx, Location::Global, opts());
+        let result = target.uninstall(&fx.ctx, Location::Global);
+        assert_eq!(result.files.len(), 2);
+        assert_eq!(result.files[0].action, FileAction::Removed);
+        let json = fx.read(&settings);
+        assert!(json.get("mcpServers").is_none());
+    }
+
+    #[test]
+    fn uninstall_missing_settings_is_not_found() {
+        let fx = TempGemini::new("uninstall-missing");
+        let target = GeminiTarget;
+        let result = target.uninstall(&fx.ctx, Location::Global);
+        assert_eq!(result.files[0].action, FileAction::NotFound);
+    }
+
+    #[test]
+    fn install_skips_unparseable_settings() {
+        let fx = TempGemini::new("unparseable");
+        let settings = settings_json_path(&fx.ctx, Location::Global);
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        let corrupt = "{ this is not json";
+        fs::write(&settings, corrupt).unwrap();
+
+        let entry = write_mcp_entry(&fx.ctx, Location::Global);
+        assert_eq!(entry.action, FileAction::Skipped);
+        assert_eq!(fs::read_to_string(&settings).unwrap(), corrupt);
+    }
+
+    #[test]
+    fn print_config_shows_settings_target() {
+        let target = GeminiTarget;
+        let ctx = ctx();
+        let out = target.print_config(&ctx, Location::Global);
+        assert!(out.contains("mcpServers"));
+        assert!(out.contains("codegraph"));
+        assert!(out.contains(".gemini/settings.json"));
+        assert!(out.contains("command"));
+    }
+
+    #[test]
+    fn config_and_instructions_paths_differ_by_location() {
+        let ctx = ctx();
+        assert!(config_dir(&ctx, Location::Global).ends_with(".gemini"));
+        assert!(config_dir(&ctx, Location::Local).starts_with(&ctx.cwd));
+        assert_eq!(
+            instructions_path(&ctx, Location::Global),
+            ctx.home.join(".gemini").join("GEMINI.md")
+        );
+        assert_eq!(
+            instructions_path(&ctx, Location::Local),
+            ctx.cwd.join("GEMINI.md")
+        );
     }
 
     #[test]

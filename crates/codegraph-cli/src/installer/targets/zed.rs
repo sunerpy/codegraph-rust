@@ -434,4 +434,43 @@ mod tests {
         assert!(!ZedTarget.supports_skills(Location::Global));
         assert!(!ZedTarget.supports_skills(Location::Local));
     }
+
+    #[test]
+    fn detect_reflects_config_presence_and_configuration() {
+        let (ctx, base) = temp_ctx("detect");
+        let before = ZedTarget.detect(&ctx, Location::Global);
+        assert!(!before.installed);
+        assert!(!before.already_configured);
+
+        run_install(&ctx, Location::Global);
+        let after = ZedTarget.detect(&ctx, Location::Global);
+        assert!(after.installed);
+        assert!(after.already_configured);
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn uninstall_missing_is_not_found() {
+        let (ctx, base) = temp_ctx("uninstall-missing");
+        let result = ZedTarget.uninstall(&ctx, Location::Local);
+        assert_eq!(result.files[0].action, FileAction::NotFound);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn print_config_local_and_global() {
+        let (ctx, base) = temp_ctx("print");
+        let local = ZedTarget.print_config(&ctx, Location::Local);
+        assert!(local.contains("context_servers"));
+        assert!(local.contains("--path"));
+        assert!(!local.contains("\"type\""));
+
+        let global = ZedTarget.print_config(&ctx, Location::Global);
+        assert!(global.contains("context_servers"));
+        assert!(global.contains(ZED_GLOBAL_WHY));
+        assert!(global.contains(ZED_GLOBAL_HOWTO));
+
+        let _ = fs::remove_dir_all(base);
+    }
 }

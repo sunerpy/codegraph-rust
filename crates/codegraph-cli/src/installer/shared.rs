@@ -590,6 +590,194 @@ mod tests {
     }
 
     #[test]
+    fn jsonc_preserves_escaped_quote_inside_string() {
+        let map = parse_json_object(r#"{ "a": "he said \"hi\" // x" }"#).expect("parse");
+        assert_eq!(
+            map.get("a"),
+            Some(&serde_json::json!("he said \"hi\" // x"))
+        );
+    }
+
+    #[test]
+    fn empty_text_parses_to_empty_map() {
+        assert_eq!(parse_json_object("   \n"), Some(Map::new()));
+    }
+
+    #[test]
+    fn to_upstream_json_renders_null_and_number() {
+        let value = serde_json::json!({ "n": null, "x": 42, "arr": [1, 2] });
+        let out = to_upstream_json(&value);
+        assert!(out.contains("\"n\": null"));
+        assert!(out.contains("\"x\": 42"));
+    }
+
+    #[test]
+    fn upsert_nested_key_via_cst_handles_null_and_number_values() {
+        let p = tmp_path("cst.json");
+        fs::write(&p, "{\n  \"cfg\": {}\n}\n").unwrap();
+        let value = serde_json::json!({ "n": null, "x": 7, "on": true, "name": "cg" });
+        let action = upsert_nested_key_jsonc(&p, "cfg", "codegraph", &value, None).unwrap();
+        assert_eq!(action, FileAction::Updated);
+        let out = fs::read_to_string(&p).unwrap();
+        assert!(out.contains("\"codegraph\""));
+        assert!(out.contains("null"));
+        assert!(out.contains('7'));
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn remove_nested_key_absent_is_not_found() {
+        let p = tmp_path("absent.json");
+        fs::write(&p, "{\n  \"other\": 1\n}\n").unwrap();
+        let action = remove_nested_key_jsonc(&p, "mcpServers", "codegraph").unwrap();
+        assert_eq!(action, FileAction::NotFound);
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn marked_section_created_then_updated_then_removed() {
+        let p = tmp_path("AGENTS.md");
+        let start = CODEGRAPH_SECTION_START;
+        let end = CODEGRAPH_SECTION_END;
+
+        let block_v1 = format!("{start}\nv1\n{end}");
+        let created = replace_or_append_marked_section(&p, &block_v1, start, end);
+        assert_eq!(created, FileAction::Created);
+
+        let unchanged = replace_or_append_marked_section(&p, &block_v1, start, end);
+        assert_eq!(unchanged, FileAction::Unchanged);
+
+        let block_v2 = format!("{start}\nv2\n{end}");
+        let updated = replace_or_append_marked_section(&p, &block_v2, start, end);
+        assert_eq!(updated, FileAction::Updated);
+        assert!(fs::read_to_string(&p).unwrap().contains("v2"));
+
+        let removed = remove_marked_section(&p, start, end);
+        assert_eq!(removed, FileAction::Removed);
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn marked_section_appends_to_existing_body() {
+        let p = tmp_path("doc.md");
+        fs::write(&p, "existing user content\n").unwrap();
+        let block = format!("{CODEGRAPH_SECTION_START}\nours\n{CODEGRAPH_SECTION_END}");
+        let action = replace_or_append_marked_section(
+            &p,
+            &block,
+            CODEGRAPH_SECTION_START,
+            CODEGRAPH_SECTION_END,
+        );
+        assert_eq!(action, FileAction::Updated);
+        let out = fs::read_to_string(&p).unwrap();
+        assert!(out.contains("existing user content"));
+        assert!(out.contains("ours"));
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn remove_marked_section_kept_when_missing_file() {
+        let p = tmp_path("nope.md");
+        assert_eq!(
+            remove_marked_section(&p, CODEGRAPH_SECTION_START, CODEGRAPH_SECTION_END),
+            FileAction::Kept
+        );
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn remove_marked_section_not_found_when_no_markers() {
+        let p = tmp_path("plain.md");
+        fs::write(&p, "no markers here\n").unwrap();
+        assert_eq!(
+            remove_marked_section(&p, CODEGRAPH_SECTION_START, CODEGRAPH_SECTION_END),
+            FileAction::NotFound
+        );
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn remove_codegraph_from_mcp_servers_variants() {
+        let mut absent = Map::new();
+        assert!(!remove_codegraph_from_mcp_servers(&mut absent));
+
+        let mut no_key: Map<String, Value> =
+            serde_json::from_str("{ \"mcpServers\": { \"other\": { \"command\": \"x\" } } }")
+                .unwrap();
+        assert!(!remove_codegraph_from_mcp_servers(&mut no_key));
+
+        let mut only_cg: Map<String, Value> =
+            serde_json::from_str("{ \"mcpServers\": { \"codegraph\": {} } }").unwrap();
+        assert!(remove_codegraph_from_mcp_servers(&mut only_cg));
+        assert!(
+            only_cg.get("mcpServers").is_none(),
+            "emptied wrapper pruned"
+        );
+
+        let mut with_sibling: Map<String, Value> =
+            serde_json::from_str("{ \"mcpServers\": { \"codegraph\": {}, \"other\": {} } }")
+                .unwrap();
+        assert!(remove_codegraph_from_mcp_servers(&mut with_sibling));
+        assert!(with_sibling["mcpServers"].get("other").is_some());
+    }
+
+    #[test]
+    fn toml_table_insert_replace_unchanged_remove() {
+        let block = build_toml_table(
+            "mcp_servers.codegraph",
+            &[
+                ("command", TomlValue::Str("codegraph")),
+                ("args", TomlValue::Array(vec!["serve", "--mcp"])),
+            ],
+        );
+        assert!(block.contains("[mcp_servers.codegraph]"));
+        assert!(block.contains("command = \"codegraph\""));
+        assert!(block.contains("args = [\"serve\", \"--mcp\"]"));
+
+        let (inserted, kind) = upsert_toml_table("", "mcp_servers.codegraph", &block);
+        assert_eq!(kind, TomlUpsert::Inserted);
+        assert!(inserted.contains("[mcp_servers.codegraph]"));
+
+        let (unchanged, kind) = upsert_toml_table(&inserted, "mcp_servers.codegraph", &block);
+        assert_eq!(kind, TomlUpsert::Unchanged);
+        assert_eq!(unchanged, inserted);
+
+        let stale = "[mcp_servers.codegraph]\ncommand = \"old\"\n\n[other]\nx = 1\n";
+        let (replaced, kind) = upsert_toml_table(stale, "mcp_servers.codegraph", &block);
+        assert_eq!(kind, TomlUpsert::Replaced);
+        assert!(replaced.contains("command = \"codegraph\""));
+        assert!(replaced.contains("[other]"));
+
+        let (removed, did_remove) = remove_toml_table(&replaced, "mcp_servers.codegraph");
+        assert!(did_remove);
+        assert!(!removed.contains("[mcp_servers.codegraph]"));
+        assert!(removed.contains("[other]"));
+
+        let (unchanged_remove, did_remove) =
+            remove_toml_table("[other]\nx = 1\n", "mcp_servers.codegraph");
+        assert!(!did_remove);
+        assert!(unchanged_remove.contains("[other]"));
+    }
+
+    #[test]
+    fn toml_string_escaping_quotes_and_backslashes() {
+        let block = build_toml_table("h", &[("path", TomlValue::Str("C:\\a\\\"b\""))]);
+        assert!(block.contains("\\\\"));
+        assert!(block.contains("\\\""));
+    }
+
+    #[test]
+    fn toml_next_header_skips_array_of_tables() {
+        // Skipping `\n[[` folds the `[[b]]` block into `[a]`, so removing `[a]`
+        // also removes `[[b]]`, stopping at `[c]`.
+        let content = "[a]\nx = 1\n\n[[b]]\ny = 2\n\n[c]\nz = 3\n";
+        let (removed, did) = remove_toml_table(content, "a");
+        assert!(did);
+        assert!(!removed.contains("[a]"));
+        assert!(removed.contains("[c]"));
+    }
+
+    #[test]
     fn read_outcome_missing_parsed_unparseable() {
         let dir = std::env::temp_dir().join(format!(
             "cg-shared-{}-{}",

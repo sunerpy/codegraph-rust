@@ -2170,8 +2170,9 @@ pub fn select_serve_mode(
 #[cfg(test)]
 mod serve_mode_tests {
     use super::{
-        ServeMode, debug_enabled, effective_log_level, guard_indexable_root, select_serve_mode,
-        should_run_daemon_services, should_run_serve_services,
+        ServeMode, debug_enabled, effective_log_level, emit_serve_startup_debug,
+        guard_indexable_root, select_serve_mode, should_run_daemon_services,
+        should_run_serve_services,
     };
     use std::path::Path;
     use std::sync::Mutex;
@@ -2343,6 +2344,21 @@ mod serve_mode_tests {
             None => unsafe { std::env::remove_var(home_key) },
         }
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn emit_serve_startup_debug_runs_for_every_mode() {
+        let root = std::env::temp_dir().join(format!("cg-serve-dbg-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        for mode in [
+            ServeMode::Direct,
+            ServeMode::BeDaemon,
+            ServeMode::SpawnOrProxy,
+        ] {
+            emit_serve_startup_debug(&root, true, false, &mode);
+            emit_serve_startup_debug(&root, false, true, &mode);
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 

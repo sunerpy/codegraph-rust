@@ -238,4 +238,135 @@ mod tests {
         assert!(!t.supports_location(Location::Local));
         assert!(t.supports_location(Location::Global));
     }
+
+    struct TempCodex {
+        base: PathBuf,
+        ctx: InstallContext,
+    }
+
+    impl TempCodex {
+        fn new(label: &str) -> Self {
+            let base = std::env::temp_dir().join(format!(
+                "cg-codex-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&base).unwrap();
+            let ctx = InstallContext {
+                home: base.join("home"),
+                cwd: base.join("cwd"),
+                app_data: None,
+                xdg_config_home: None,
+                hermes_home: None,
+            };
+            Self { base, ctx }
+        }
+    }
+
+    impl Drop for TempCodex {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.base);
+        }
+    }
+
+    fn opts() -> InstallOptions {
+        InstallOptions {
+            auto_allow: false,
+            front_load_hook: false,
+        }
+    }
+
+    #[test]
+    fn install_creates_toml_table_and_instructions_then_uninstall() {
+        let fx = TempCodex::new("lifecycle");
+        let target = CodexTarget;
+        let toml = toml_config_path(&fx.ctx);
+
+        let before = target.detect(&fx.ctx, Location::Global);
+        assert!(!before.installed);
+        assert!(!before.already_configured);
+
+        target.install(&fx.ctx, Location::Global, opts());
+        let content = fs::read_to_string(&toml).unwrap();
+        assert!(content.contains("[mcp_servers.codegraph]"));
+        assert!(content.contains("command = \"codegraph\""));
+        assert!(content.contains("args = [\"serve\", \"--mcp\"]"));
+        assert!(instructions_path(&fx.ctx).exists());
+
+        let after = target.detect(&fx.ctx, Location::Global);
+        assert!(after.installed);
+        assert!(after.already_configured);
+
+        let removed = target.uninstall(&fx.ctx, Location::Global);
+        assert_eq!(removed.files[0].action, FileAction::Removed);
+    }
+
+    #[test]
+    fn install_is_idempotent() {
+        let fx = TempCodex::new("idempotent");
+        let target = CodexTarget;
+        let toml = toml_config_path(&fx.ctx);
+        target.install(&fx.ctx, Location::Global, opts());
+        let first = fs::read_to_string(&toml).unwrap();
+        let again = write_mcp_entry(&fx.ctx);
+        assert_eq!(again.action, FileAction::Unchanged);
+        assert_eq!(fs::read_to_string(&toml).unwrap(), first);
+    }
+
+    #[test]
+    fn local_location_is_rejected() {
+        let fx = TempCodex::new("local-reject");
+        let target = CodexTarget;
+        let install = target.install(&fx.ctx, Location::Local, opts());
+        assert!(install.files.is_empty());
+        assert!(install.notes[0].contains("--location=global"));
+
+        let uninstall = target.uninstall(&fx.ctx, Location::Local);
+        assert!(uninstall.files.is_empty());
+
+        let detect = target.detect(&fx.ctx, Location::Local);
+        assert!(!detect.installed);
+
+        let printed = target.print_config(&fx.ctx, Location::Local);
+        assert!(printed.contains("--location=global"));
+    }
+
+    #[test]
+    fn uninstall_missing_config_is_not_found() {
+        let fx = TempCodex::new("uninstall-missing");
+        let target = CodexTarget;
+        let result = target.uninstall(&fx.ctx, Location::Global);
+        assert_eq!(result.files[0].action, FileAction::NotFound);
+    }
+
+    #[test]
+    fn uninstall_preserves_sibling_table() {
+        let fx = TempCodex::new("uninstall-sibling");
+        let target = CodexTarget;
+        let toml = toml_config_path(&fx.ctx);
+        target.install(&fx.ctx, Location::Global, opts());
+        let content = fs::read_to_string(&toml).unwrap();
+        fs::write(
+            &toml,
+            format!("{content}\n[mcp_servers.other]\ncommand = \"foo\"\n"),
+        )
+        .unwrap();
+
+        target.uninstall(&fx.ctx, Location::Global);
+        let content = fs::read_to_string(&toml).unwrap();
+        assert!(!content.contains("[mcp_servers.codegraph]"));
+        assert!(content.contains("[mcp_servers.other]"));
+    }
+
+    #[test]
+    fn print_config_global_shows_toml_block() {
+        let fx = TempCodex::new("print");
+        let target = CodexTarget;
+        let out = target.print_config(&fx.ctx, Location::Global);
+        assert!(out.contains("[mcp_servers.codegraph]"));
+        assert!(out.contains("config.toml"));
+    }
 }
