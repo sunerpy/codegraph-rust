@@ -12,6 +12,10 @@ bench/corpora/
 /codegraph
 dist/
 
+# Coverage artifacts (cargo-llvm-cov): lcov file + HTML report.
+lcov.info
+target/llvm-cov/
+
 # Per-project index DB written by `codegraph init` / `index`.
 .codegraph/
 

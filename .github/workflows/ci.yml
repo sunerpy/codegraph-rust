@@ -88,10 +88,53 @@ jobs:
       - name: Run cargo-audit
         run: cargo audit
 
+  # Coverage is INFORMATIONAL: it measures unit-test coverage and uploads to
+  # Codecov, but it is deliberately kept OUT of the `ci-success` gate's `needs:`
+  # so it can never block a merge. The Codecov status itself is also
+  # `informational: true` (see codecov.yml), so a below-target % (baseline
+  # ~72%, aspirational target 95%) never turns a PR red. This honors the iron
+  # rule "local green ⇒ CI green".
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Generate coverage (lcov)
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info --ignore-filename-regex 'codegraph-bench'
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          # Report-only: never fail CI on a Codecov upload/processing error.
+          fail_ci_if_error: false
+          # Public repo: tokenless upload works. A token is optional here (kept
+          # for reliability) and REQUIRED for private repos. Add CODECOV_TOKEN
+          # to repo Secrets to use it; harmless/ignored if unset on a public repo.
+          token: ${{ secrets.CODECOV_TOKEN }}
+
   ci-success:
     name: CI Success
     runs-on: ubuntu-latest
     if: always()
+    # NOTE: `coverage` is intentionally NOT listed here — coverage is
+    # informational and must never gate a merge.
     needs: [test, audit, windows]
     steps:
       - name: Check job status
