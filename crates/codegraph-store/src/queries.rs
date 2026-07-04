@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use codegraph_core::types::{
     Edge, EdgeKind, FileRecord, Language, Node, NodeKind, ReferenceSubkind, UnresolvedRef,
 };
-use rusqlite::{Connection, OptionalExtension, Row, ToSql, named_params, params};
+use rusqlite::{
+    Connection, OptionalExtension, Row, ToSql, TransactionBehavior, named_params, params,
+};
 use serde_json::Value;
 
 use crate::connection::Store;
@@ -436,9 +438,18 @@ impl Store {
             .iter()
             .flat_map(|edge| [edge.source.as_str(), edge.target.as_str()])
             .collect::<Vec<_>>();
-        let existing_node_ids = existing_node_ids(&self.conn, &endpoint_ids)?;
 
-        let tx = self.conn.transaction()?;
+        // Snapshot endpoint existence INSIDE a `BEGIN IMMEDIATE` transaction so the
+        // FK filter and the inserts observe one write-locked, delete-free view.
+        // Reading it before the transaction let a concurrent writer (daemon
+        // catch-up sync on one connection, watcher sync on another) delete an
+        // endpoint between the snapshot and the insert: the edge passed the stale
+        // filter but tripped `FOREIGN KEY constraint failed`, aborting the sync.
+        // Dropping a genuinely-absent endpoint stays byte-identical to before.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing_node_ids = existing_node_ids(&tx, &endpoint_ids)?;
         {
             let mut stmt = tx.prepare_cached(
                 r#"
@@ -596,9 +607,16 @@ impl Store {
             .iter()
             .map(|unresolved| unresolved.from_node_id.as_str())
             .collect::<Vec<_>>();
-        let existing_node_ids = existing_node_ids(&self.conn, &from_ids)?;
 
-        let tx = self.conn.transaction()?;
+        // Snapshot `from_node_id` existence INSIDE a `BEGIN IMMEDIATE` transaction
+        // (see `insert_edges`): a concurrent writer deleting the source node
+        // between an out-of-transaction snapshot and the insert would trip
+        // `FOREIGN KEY constraint failed` and abort the sync. Dropping a
+        // genuinely-absent source stays byte-identical to before.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing_node_ids = existing_node_ids(&tx, &from_ids)?;
         {
             let mut stmt = tx.prepare_cached(
                 r#"
@@ -1652,6 +1670,152 @@ mod tests {
         assert_eq!(
             store.get_project_metadata("root").unwrap(),
             Some("/tmp/project2".to_string())
+        );
+    }
+
+    #[test]
+    fn concurrent_endpoint_delete_does_not_abort_insert_edges() {
+        // Given: a db with two nodes and a second connection that deletes the
+        // edge's target, mimicking the daemon catch-up sync racing the watcher.
+        let path = temp_db_path("concurrent-edge-fk");
+        let mut store = Store::open(&path).unwrap();
+        store.upsert_file(&file("a.rs")).unwrap();
+        store
+            .upsert_nodes(&[
+                node("function:src", "src", "a.rs"),
+                node("function:dst", "dst", "a.rs"),
+            ])
+            .unwrap();
+
+        let deleter = Store::open(&path).unwrap();
+        deleter
+            .connection()
+            .execute("DELETE FROM nodes WHERE id = 'function:dst'", [])
+            .unwrap();
+
+        // When: inserting an edge whose target the other connection just removed.
+        let edge = Edge {
+            id: None,
+            source: "function:src".to_string(),
+            target: "function:dst".to_string(),
+            kind: EdgeKind::Calls,
+            metadata: None,
+            line: Some(1),
+            col: Some(0),
+            provenance: None,
+        };
+        let result = store.insert_edges(std::slice::from_ref(&edge));
+
+        // Then: the sync survives — the now-absent endpoint is dropped, not raised
+        // as `FOREIGN KEY constraint failed`.
+        assert!(
+            result.is_ok(),
+            "insert_edges aborted on a concurrently-deleted endpoint: {:?}",
+            result.err()
+        );
+        assert!(store.all_edges().unwrap().is_empty());
+    }
+
+    #[test]
+    fn concurrent_source_delete_does_not_abort_insert_unresolved_refs() {
+        // Given: a db with a node and a second connection that deletes it.
+        let path = temp_db_path("concurrent-ref-fk");
+        let mut store = Store::open(&path).unwrap();
+        store.upsert_file(&file("a.rs")).unwrap();
+        store
+            .upsert_nodes(&[node("function:src", "src", "a.rs")])
+            .unwrap();
+
+        let deleter = Store::open(&path).unwrap();
+        deleter
+            .connection()
+            .execute("DELETE FROM nodes WHERE id = 'function:src'", [])
+            .unwrap();
+
+        // When: inserting a ref whose source the other connection just removed.
+        let unresolved = UnresolvedRef {
+            id: None,
+            from_node_id: "function:src".to_string(),
+            reference_name: "gone".to_string(),
+            reference_kind: EdgeKind::Calls,
+            line: 1,
+            col: 0,
+            candidates: None,
+            file_path: "a.rs".to_string(),
+            language: Language::Rust,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+        let result = store.insert_unresolved_refs(std::slice::from_ref(&unresolved));
+
+        // Then: the orphan ref is dropped, the sync is not aborted by an FK error.
+        assert!(
+            result.is_ok(),
+            "insert_unresolved_refs aborted on a concurrently-deleted source: {:?}",
+            result.err()
+        );
+        assert!(store.all_unresolved_refs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn concurrent_writers_never_abort_insert_edges_with_stale_snapshot() {
+        // Given: two connections to one db racing the exact daemon-catch-up vs
+        // watcher-sync pattern — one repeatedly deletes and re-inserts the edge's
+        // target while the other repeatedly inserts an edge to it. Pre-fix the
+        // endpoint snapshot was read on an autocommit connection, so a delete
+        // committed between that read and the insert tripped `FOREIGN KEY
+        // constraint failed`; `BEGIN IMMEDIATE` serialises the writers so the
+        // snapshot and inserts see one consistent view.
+        let path = temp_db_path("concurrent-stale-snapshot");
+        {
+            let mut seed = Store::open(&path).unwrap();
+            seed.upsert_file(&file("a.rs")).unwrap();
+            seed.upsert_nodes(&[node("function:src", "src", "a.rs")])
+                .unwrap();
+        }
+
+        let churn_path = path.clone();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let churn_stop = std::sync::Arc::clone(&stop);
+        let churn = std::thread::spawn(move || {
+            let mut churner = Store::open(&churn_path).unwrap();
+            let dst = node("function:dst", "dst", "a.rs");
+            while !churn_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                // Lock contention against the writer's IMMEDIATE transaction is
+                // expected; a real concurrent writer just retries, so ignore it.
+                let _ = churner.upsert_nodes(std::slice::from_ref(&dst));
+                let _ = churner
+                    .connection()
+                    .execute("DELETE FROM nodes WHERE id = 'function:dst'", []);
+            }
+        });
+
+        // When: the other writer inserts an edge to the churned endpoint many times.
+        let mut writer = Store::open(&path).unwrap();
+        let edge = Edge {
+            id: None,
+            source: "function:src".to_string(),
+            target: "function:dst".to_string(),
+            kind: EdgeKind::Calls,
+            metadata: None,
+            line: Some(1),
+            col: Some(0),
+            provenance: None,
+        };
+        let mut aborted: Option<String> = None;
+        for _ in 0..2_000 {
+            if let Err(err) = writer.insert_edges(std::slice::from_ref(&edge)) {
+                aborted = Some(err.to_string());
+                break;
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        churn.join().unwrap();
+
+        // Then: no iteration ever aborted with a foreign-key error.
+        assert!(
+            aborted.is_none(),
+            "insert_edges aborted under a concurrent endpoint deleter: {aborted:?}"
         );
     }
 }
