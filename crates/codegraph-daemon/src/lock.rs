@@ -149,6 +149,26 @@ pub fn unlock_project(project_root: &Path) -> bool {
     clear_stale_daemon_lock(&pid_path, None)
 }
 
+/// Self-heal a project's stale daemon artifacts after a failed attach (Fix A):
+/// clears the pid lock AND removes the leftover `daemon.sock` at the RECORDED
+/// (fallback-aware) socket path, so the next `serve --mcp` spawns a fresh daemon
+/// instead of re-attaching to a dead socket that never answers.
+///
+/// Gated on liveness: returns `false` and touches nothing when the lock is held
+/// by a LIVE pid (`clear_stale_daemon_lock` refuses to remove a live lock).
+/// Returns `true` once the stale lock is cleared; socket removal is best-effort
+/// (a missing socket is already the desired end state).
+pub fn clear_stale_daemon_socket(project_root: &Path) -> bool {
+    let pid_path = daemon_pid_path(project_root);
+    let socket_path = recorded_socket_path(project_root);
+    // Liveness gate: only proceed once the owning pid is proven dead/absent.
+    if !clear_stale_daemon_lock(&pid_path, None) {
+        return false;
+    }
+    let _ = fs::remove_file(&socket_path);
+    true
+}
+
 pub(crate) fn cleanup_owned_lock(pid_path: &Path, pid: u32) {
     let owned = read_lock_info_tolerant(pid_path).is_some_and(|info| info.pid == pid);
     if owned {

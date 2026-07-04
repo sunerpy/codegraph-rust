@@ -5,6 +5,7 @@
 //! watchdogs, graceful shutdown, and stale-lock recovery. It deliberately does
 //! not implement task-25 file watching.
 
+pub mod http_registry;
 mod lock;
 mod paths;
 mod process;
@@ -24,16 +25,18 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use interprocess::local_socket::traits::Listener as _;
 pub use lock::{
-    AcquireResult, DaemonLockInfo, clear_stale_daemon_lock, decode_lock_info, encode_lock_info,
-    recorded_socket_path, try_acquire_daemon_lock, unlock_project,
+    AcquireResult, DaemonLockInfo, clear_stale_daemon_lock, clear_stale_daemon_socket,
+    decode_lock_info, encode_lock_info, recorded_socket_path, try_acquire_daemon_lock,
+    unlock_project,
 };
 pub use paths::{daemon_log_path, daemon_pid_path, daemon_socket_path};
 pub use process::{
     SupervisionState, current_ppid, is_process_alive, is_session_leader, supervision_lost_reason,
+    terminate_pid,
 };
 pub use proxy::{ProxyOutcome, run_proxy, verify_daemon_hello};
 pub use session::{SessionRegistry, read_daemon_hello, run_session_recv};
-pub use spawn::spawn_detached_daemon;
+pub use spawn::{CODEGRAPH_HTTP_DETACH_INTERNAL, spawn_detached_daemon, spawn_detached_http};
 use tracing::{debug, info, warn};
 
 use crate::lock::{cleanup_owned_lock, rewrite_lock_socket_path};
