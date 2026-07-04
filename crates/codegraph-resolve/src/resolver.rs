@@ -1935,3 +1935,1081 @@ fn capitalize(s: &str) -> String {
         None => String::new(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ImportMapping;
+    use codegraph_core::types::FileRecord;
+    use std::collections::HashMap;
+
+    // ---------------------------------------------------------------------
+    // Free-function units (no store needed)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn capitalize_units() {
+        assert_eq!(capitalize("foo"), "Foo");
+        assert_eq!(capitalize(""), "");
+        assert_eq!(capitalize("A"), "A");
+    }
+
+    #[test]
+    fn is_chain_language_covers_members_and_negatives() {
+        for lang in [
+            Language::Java,
+            Language::Kotlin,
+            Language::CSharp,
+            Language::Swift,
+            Language::Rust,
+            Language::Go,
+            Language::Scala,
+            Language::Dart,
+            Language::ObjC,
+            Language::Pascal,
+        ] {
+            assert!(is_chain_language(lang), "{lang:?} should chain");
+        }
+        assert!(!is_chain_language(Language::Python));
+        assert!(!is_chain_language(Language::TypeScript));
+    }
+
+    #[test]
+    fn is_scoped_chain_language_only_rust() {
+        assert!(is_scoped_chain_language(Language::Rust));
+        assert!(!is_scoped_chain_language(Language::Java));
+    }
+
+    #[test]
+    fn has_chain_shape_units() {
+        assert!(has_chain_shape("foo().bar"));
+        assert!(has_chain_shape("a.b().method_1"));
+        assert!(!has_chain_shape("plain"));
+        // empty inner before "()." fails.
+        assert!(!has_chain_shape("().bar"));
+        // empty method after "()." fails.
+        assert!(!has_chain_shape("foo()."));
+        // non-ident method char fails.
+        assert!(!has_chain_shape("foo().bar-baz"));
+    }
+
+    #[test]
+    fn builtin_sets_contain_expected_members() {
+        assert!(js_built_ins().contains("console"));
+        assert!(react_hooks().contains("useState"));
+        assert!(python_built_ins().contains("print"));
+        assert!(python_built_in_types().contains("dict"));
+        assert!(python_built_in_methods().contains("append"));
+        assert!(go_stdlib_packages().contains("fmt"));
+        assert!(go_built_ins().contains("make"));
+        assert!(pascal_built_ins().contains("WriteLn"));
+        assert!(c_built_ins().contains("printf"));
+        assert!(cpp_built_ins().contains("cout"));
+    }
+
+    #[test]
+    fn highest_confidence_picks_greater() {
+        let a = resolved_ref("a", 0.5);
+        let b = resolved_ref("b", 0.9);
+        assert_eq!(highest_confidence(a.clone(), b.clone()).target_node_id, "b");
+        // Ties keep the first argument (`best`).
+        let c = resolved_ref("c", 0.9);
+        assert_eq!(highest_confidence(b, c).target_node_id, "b");
+    }
+
+    #[test]
+    fn is_supertype_bearing_or_module_units() {
+        for k in [
+            NodeKind::Class,
+            NodeKind::Struct,
+            NodeKind::Interface,
+            NodeKind::Trait,
+            NodeKind::Protocol,
+            NodeKind::Enum,
+            NodeKind::Module,
+        ] {
+            assert!(is_supertype_bearing_or_module(k), "{k:?}");
+        }
+        assert!(!is_supertype_bearing_or_module(NodeKind::Function));
+    }
+
+    #[test]
+    fn to_ref_view_and_back_roundtrip() {
+        let stored = UnresolvedRef {
+            id: Some(7),
+            from_node_id: "from".to_string(),
+            reference_name: "X".to_string(),
+            reference_kind: EdgeKind::Calls,
+            line: 3,
+            col: 4,
+            candidates: None,
+            file_path: "a.ts".to_string(),
+            language: Language::TypeScript,
+            is_function_ref: true,
+            reference_subkind: None,
+        };
+        let view = to_ref_view(&stored);
+        assert_eq!(view.from_node_id, "from");
+        assert_eq!(view.line, 3);
+        assert_eq!(view.column, 4);
+        assert!(view.is_function_ref);
+        let back = ref_view_to_unresolved(&view);
+        assert_eq!(back.reference_name, "X");
+        assert_eq!(back.col, 4);
+        assert!(back.is_function_ref);
+        assert_eq!(back.id, None);
+    }
+
+    #[test]
+    fn build_edge_metadata_base_and_fn_ref() {
+        let mut r = resolved_ref("t", 0.75);
+        let base = build_edge_metadata(&r);
+        assert_eq!(base["confidence"].as_f64(), Some(0.75));
+        assert_eq!(base["resolvedBy"].as_str(), Some("import"));
+        assert!(base.get("fnRef").is_none());
+        r.original.is_function_ref = true;
+        let with_fn = build_edge_metadata(&r);
+        assert_eq!(with_fn["fnRef"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn build_edge_metadata_includes_subkind() {
+        let mut r = resolved_ref("t", 0.9);
+        r.original.reference_subkind = Some(codegraph_core::types::ReferenceSubkind::ScriptAttach);
+        let meta = build_edge_metadata(&r);
+        assert_eq!(meta["subkind"].as_str(), Some("script_attach"));
+    }
+
+    #[test]
+    fn applies_to_language_universal_and_scoped() {
+        assert!(applies_to_language(&ReactLike, Language::TypeScript));
+        assert!(!applies_to_language(&ReactLike, Language::Python));
+        assert!(applies_to_language(&Universal, Language::Python));
+    }
+
+    // ---------------------------------------------------------------------
+    // is_built_in_or_external / has_any_possible_match / gates via a resolver
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn is_built_in_or_external_js_family() {
+        let r = ReferenceResolver::new("/root");
+        assert!(r.is_built_in_or_external(&mk_ref(
+            "console",
+            EdgeKind::Calls,
+            Language::TypeScript
+        )));
+        assert!(r.is_built_in_or_external(&mk_ref(
+            "console.log",
+            EdgeKind::Calls,
+            Language::TypeScript
+        )));
+        assert!(r.is_built_in_or_external(&mk_ref(
+            "Math.max",
+            EdgeKind::Calls,
+            Language::JavaScript
+        )));
+        assert!(r.is_built_in_or_external(&mk_ref("useState", EdgeKind::Calls, Language::Tsx)));
+        assert!(!r.is_built_in_or_external(&mk_ref(
+            "myFunc",
+            EdgeKind::Calls,
+            Language::TypeScript
+        )));
+    }
+
+    #[test]
+    fn is_built_in_or_external_python_receiver_and_method() {
+        let r = ReferenceResolver::new("/root");
+        // built-in type receiver dict.get.
+        assert!(r.is_built_in_or_external(&mk_ref("dict.get", EdgeKind::Calls, Language::Python)));
+        // built-in method with unknown capitalized receiver -> external.
+        assert!(r.is_built_in_or_external(&mk_ref("x.append", EdgeKind::Calls, Language::Python)));
+        // bare built-in.
+        assert!(r.is_built_in_or_external(&mk_ref("print", EdgeKind::Calls, Language::Python)));
+        // bare built-in method with no known name -> external.
+        assert!(r.is_built_in_or_external(&mk_ref("append", EdgeKind::Calls, Language::Python)));
+    }
+
+    #[test]
+    fn is_built_in_or_external_python_method_known_type_not_external() {
+        let mut r = ReferenceResolver::new("/root");
+        // If the capitalized receiver IS a known name, x.append is NOT external.
+        let mut known = BTreeSet::new();
+        known.insert("X".to_string());
+        r.known_names = Some(known);
+        assert!(!r.is_built_in_or_external(&mk_ref("x.append", EdgeKind::Calls, Language::Python)));
+    }
+
+    #[test]
+    fn is_built_in_or_external_go_pascal_c_cpp() {
+        let mut r = ReferenceResolver::new("/root");
+        assert!(r.is_built_in_or_external(&mk_ref("fmt.Println", EdgeKind::Calls, Language::Go)));
+        assert!(r.is_built_in_or_external(&mk_ref("make", EdgeKind::Calls, Language::Go)));
+        assert!(r.is_built_in_or_external(&mk_ref(
+            "System.SysUtils",
+            EdgeKind::Imports,
+            Language::Pascal
+        )));
+        assert!(r.is_built_in_or_external(&mk_ref("WriteLn", EdgeKind::Calls, Language::Pascal)));
+        assert!(r.is_built_in_or_external(&mk_ref("std::vector", EdgeKind::Calls, Language::Cpp)));
+        // A C built-in is external only when it has NO possible match; a warmed
+        // (empty) known-set makes has_any_possible_match false, so printf is external.
+        r.known_names = Some(BTreeSet::new());
+        assert!(r.is_built_in_or_external(&mk_ref("printf", EdgeKind::Calls, Language::C)));
+    }
+
+    #[test]
+    fn has_any_possible_match_none_known_returns_true() {
+        // Without warmed caches, everything is a possible match.
+        let r = ReferenceResolver::new("/root");
+        assert!(r.has_any_possible_match("anything"));
+    }
+
+    #[test]
+    fn has_any_possible_match_dotted_scoped_and_slash() {
+        let mut r = ReferenceResolver::new("/root");
+        let mut known = BTreeSet::new();
+        known.insert("Foo".to_string());
+        known.insert("bar".to_string());
+        known.insert("Widget".to_string());
+        known.insert("helper".to_string());
+        r.known_names = Some(known);
+        // direct.
+        assert!(r.has_any_possible_match("Foo"));
+        // dotted receiver known.
+        assert!(r.has_any_possible_match("Foo.method"));
+        // dotted member known.
+        assert!(r.has_any_possible_match("obj.bar"));
+        // capitalized receiver known (foo -> Foo).
+        assert!(r.has_any_possible_match("foo.thing"));
+        // scoped receiver/member.
+        assert!(r.has_any_possible_match("Widget::render"));
+        assert!(r.has_any_possible_match("thing::helper"));
+        // slash tail known.
+        assert!(r.has_any_possible_match("path/to/Foo"));
+        // nothing known.
+        assert!(!r.has_any_possible_match("unrelated.symbol"));
+    }
+
+    // ---------------------------------------------------------------------
+    // Store-driven: create_edges promotions + resolve_all/persist paths
+    // ---------------------------------------------------------------------
+
+    fn temp_db(slug: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        p.push(format!(
+            "codegraph-resolver-ut-{slug}-{}-{nanos}.db",
+            std::process::id()
+        ));
+        p
+    }
+
+    #[test]
+    fn create_edges_promotes_extends_to_implements_and_calls_to_instantiates() {
+        let mut store = Store::open(&temp_db("promote")).expect("open");
+        // Interface + non-interface source -> extends promotes to implements.
+        let iface = mk_node("interface:I", NodeKind::Interface, "I", "a.ts");
+        let cls = mk_node("class:C", NodeKind::Class, "C", "a.ts");
+        // A class target for calls->instantiates.
+        let target_cls = mk_node("class:D", NodeKind::Class, "D", "a.ts");
+        let caller = mk_node("function:f", NodeKind::Function, "f", "a.ts");
+        store
+            .upsert_nodes(&[
+                iface.clone(),
+                cls.clone(),
+                target_cls.clone(),
+                caller.clone(),
+            ])
+            .expect("upsert");
+
+        let resolver = ReferenceResolver::new("/root");
+
+        let extends = ResolvedRef {
+            original: RefView {
+                from_node_id: cls.id.clone(),
+                reference_name: "I".to_string(),
+                reference_kind: EdgeKind::Extends,
+                line: 1,
+                column: 0,
+                file_path: "a.ts".to_string(),
+                language: Language::TypeScript,
+                is_function_ref: false,
+                reference_subkind: None,
+            },
+            target_node_id: iface.id.clone(),
+            confidence: 0.9,
+            resolved_by: ResolvedBy::Import,
+        };
+        let calls = ResolvedRef {
+            original: RefView {
+                from_node_id: caller.id.clone(),
+                reference_name: "D".to_string(),
+                reference_kind: EdgeKind::Calls,
+                line: 2,
+                column: 0,
+                file_path: "a.ts".to_string(),
+                language: Language::TypeScript,
+                is_function_ref: false,
+                reference_subkind: None,
+            },
+            target_node_id: target_cls.id.clone(),
+            confidence: 0.9,
+            resolved_by: ResolvedBy::Import,
+        };
+        let edges = resolver.create_edges(&[extends, calls], &store);
+        assert_eq!(edges.len(), 2);
+        assert!(edges.iter().any(|e| e.kind == EdgeKind::Implements));
+        assert!(edges.iter().any(|e| e.kind == EdgeKind::Instantiates));
+    }
+
+    #[test]
+    fn resolve_all_reports_stats_and_skips_built_ins() {
+        let mut store = Store::open(&temp_db("resolveall")).expect("open");
+        let add = mk_node("function:add", NodeKind::Function, "add", "math.ts");
+        store
+            .upsert_nodes(std::slice::from_ref(&add))
+            .expect("upsert");
+        let mut resolver = ReferenceResolver::new("/root");
+
+        let refs = vec![
+            // resolvable by name match.
+            UnresolvedRef {
+                id: Some(1),
+                from_node_id: "function:caller".to_string(),
+                reference_name: "add".to_string(),
+                reference_kind: EdgeKind::Calls,
+                line: 1,
+                col: 0,
+                candidates: None,
+                file_path: "app.ts".to_string(),
+                language: Language::TypeScript,
+                is_function_ref: false,
+                reference_subkind: None,
+            },
+            // built-in, skipped (unresolved).
+            UnresolvedRef {
+                id: Some(2),
+                from_node_id: "function:caller".to_string(),
+                reference_name: "console".to_string(),
+                reference_kind: EdgeKind::Calls,
+                line: 2,
+                col: 0,
+                candidates: None,
+                file_path: "app.ts".to_string(),
+                language: Language::TypeScript,
+                is_function_ref: false,
+                reference_subkind: None,
+            },
+        ];
+        let ctx = crate::context::StoreResolutionContext::new(&store, "/root");
+        let result = resolver.resolve_all(&refs, &ctx);
+        assert_eq!(result.stats.total, 2);
+        assert_eq!(result.stats.resolved, 1);
+        assert_eq!(result.stats.unresolved, 1);
+    }
+
+    #[test]
+    fn resolve_and_persist_batched_matches_serial_edge_count() {
+        // Build the same tiny graph twice; the serial and batched persist paths
+        // must produce the same number of resolved edges.
+        let serial = run_persist(false);
+        let batched = run_persist(true);
+        assert_eq!(serial, batched);
+        assert!(serial > 0, "expected at least one resolved edge");
+    }
+
+    fn run_persist(batched: bool) -> usize {
+        let slug = if batched { "batched" } else { "serial" };
+        let mut store = Store::open(&temp_db(slug)).expect("open");
+        let add = mk_node("function:add", NodeKind::Function, "add", "math.ts");
+        let caller = mk_node("function:run", NodeKind::Function, "run", "app.ts");
+        store.upsert_file(&file_rec("math.ts")).expect("file");
+        store.upsert_file(&file_rec("app.ts")).expect("file");
+        store
+            .upsert_nodes(&[add.clone(), caller.clone()])
+            .expect("nodes");
+        store
+            .insert_unresolved_refs(&[UnresolvedRef {
+                id: None,
+                from_node_id: caller.id.clone(),
+                reference_name: "add".to_string(),
+                reference_kind: EdgeKind::Calls,
+                line: 1,
+                col: 0,
+                candidates: None,
+                file_path: "app.ts".to_string(),
+                language: Language::TypeScript,
+                is_function_ref: false,
+                reference_subkind: None,
+            }])
+            .expect("refs");
+        let mut resolver = ReferenceResolver::new("/root");
+        if batched {
+            resolver
+                .resolve_and_persist_batched(&mut store, 10)
+                .expect("batched");
+        } else {
+            resolver.resolve_and_persist(&mut store).expect("serial");
+        }
+        store
+            .edges_by_source_kind(&caller.id, Some(EdgeKind::Calls))
+            .expect("edges")
+            .len()
+    }
+
+    #[test]
+    fn resolve_and_persist_batched_reports_progress() {
+        let mut store = Store::open(&temp_db("progress")).expect("open");
+        let add = mk_node("function:add", NodeKind::Function, "add", "math.ts");
+        let caller = mk_node("function:run", NodeKind::Function, "run", "app.ts");
+        store.upsert_file(&file_rec("math.ts")).expect("file");
+        store.upsert_file(&file_rec("app.ts")).expect("file");
+        store.upsert_nodes(&[add, caller.clone()]).expect("nodes");
+        store
+            .insert_unresolved_refs(&[UnresolvedRef {
+                id: None,
+                from_node_id: caller.id,
+                reference_name: "add".to_string(),
+                reference_kind: EdgeKind::Calls,
+                line: 1,
+                col: 0,
+                candidates: None,
+                file_path: "app.ts".to_string(),
+                language: Language::TypeScript,
+                is_function_ref: false,
+                reference_subkind: None,
+            }])
+            .expect("refs");
+        let mut resolver = ReferenceResolver::new("/root");
+        let mut last_total = 0u64;
+        resolver
+            .resolve_and_persist_batched_with_progress(&mut store, 10, |_processed, total| {
+                last_total = total;
+            })
+            .expect("batched");
+        assert_eq!(last_total, 1);
+    }
+
+    #[test]
+    fn resolve_incremental_and_persist_resolves_scope_file() {
+        let mut store = Store::open(&temp_db("incremental")).expect("open");
+        let add = mk_node("function:add", NodeKind::Function, "add", "math.ts");
+        let caller = mk_node("function:run", NodeKind::Function, "run", "app.ts");
+        store.upsert_file(&file_rec("math.ts")).expect("file");
+        store.upsert_file(&file_rec("app.ts")).expect("file");
+        store.upsert_nodes(&[add, caller.clone()]).expect("nodes");
+        store
+            .insert_unresolved_refs(&[UnresolvedRef {
+                id: None,
+                from_node_id: caller.id.clone(),
+                reference_name: "add".to_string(),
+                reference_kind: EdgeKind::Calls,
+                line: 1,
+                col: 0,
+                candidates: None,
+                file_path: "app.ts".to_string(),
+                language: Language::TypeScript,
+                is_function_ref: false,
+                reference_subkind: None,
+            }])
+            .expect("refs");
+        let mut resolver = ReferenceResolver::new("/root");
+        let mut scope = std::collections::HashSet::new();
+        scope.insert("app.ts".to_string());
+        let names = std::collections::HashSet::new();
+        let result = resolver
+            .resolve_incremental_and_persist(&mut store, &scope, &names)
+            .expect("incremental");
+        assert_eq!(result.stats.resolved, 1);
+    }
+
+    #[test]
+    fn has_framework_resolvers_and_initialize() {
+        let mut resolver = ReferenceResolver::new("/root");
+        assert!(!resolver.has_framework_resolvers());
+        assert_eq!(resolver.project_root(), "/root");
+        let ctx = MinimalCtx {
+            files: HashMap::from([(
+                "package.json".to_string(),
+                r#"{"dependencies":{"react":"18"}}"#.to_string(),
+            )]),
+        };
+        resolver.initialize(&ctx);
+        assert!(resolver.has_framework_resolvers());
+    }
+
+    #[test]
+    fn run_post_extract_and_extract_frameworks_noop_without_detection() {
+        let mut store = Store::open(&temp_db("noframework")).expect("open");
+        let resolver = ReferenceResolver::new("/root");
+        assert_eq!(resolver.run_post_extract(&mut store).expect("post"), 0);
+        assert!(
+            resolver
+                .extract_and_persist_frameworks(&mut store, &["a.ts".to_string()])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn deferred_passes_empty_are_noops() {
+        let mut store = Store::open(&temp_db("deferred")).expect("open");
+        let resolver = ReferenceResolver::new("/root");
+        assert_eq!(
+            resolver
+                .resolve_deferred_this_member_refs(&mut store)
+                .expect("deferred"),
+            0
+        );
+        assert_eq!(
+            resolver
+                .resolve_chained_calls_via_conformance(&mut store)
+                .expect("chain"),
+            0
+        );
+    }
+
+    #[test]
+    fn gate_language_none_passthrough_and_family_drop() {
+        let mut store = Store::open(&temp_db("gate")).expect("open");
+        let py_node = mk_node2(
+            "function:py",
+            NodeKind::Function,
+            "py",
+            "a.py",
+            Language::Python,
+        );
+        store
+            .upsert_nodes(std::slice::from_ref(&py_node))
+            .expect("nodes");
+        let resolver = ReferenceResolver::new("/root");
+        let ctx = crate::context::StoreResolutionContext::new(&store, "/root");
+        // None input -> None.
+        assert!(
+            resolver
+                .gate_language(
+                    None,
+                    &mk_ref("x", EdgeKind::References, Language::TypeScript),
+                    &ctx
+                )
+                .is_none()
+        );
+        // References ref to a Python target from a TS source -> dropped (different family).
+        let candidate = ResolvedRef {
+            original: mk_ref("py", EdgeKind::References, Language::TypeScript),
+            target_node_id: py_node.id.clone(),
+            confidence: 0.8,
+            resolved_by: ResolvedBy::Import,
+        };
+        assert!(
+            resolver
+                .gate_language(
+                    Some(candidate),
+                    &mk_ref("py", EdgeKind::References, Language::TypeScript),
+                    &ctx
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_one_this_member_resolves_to_own_class_method() {
+        // A `this.helper()` function_ref inside a class method resolves to the
+        // class's own `helper` method (resolve_this_member_fn_ref_pure hit).
+        let mut store = Store::open(&temp_db("thismember")).expect("open");
+        let cls = mk_node2(
+            "class:C",
+            NodeKind::Class,
+            "C",
+            "a.ts",
+            Language::TypeScript,
+        );
+        let mut helper = mk_node2(
+            "method:helper",
+            NodeKind::Method,
+            "helper",
+            "a.ts",
+            Language::TypeScript,
+        );
+        helper.qualified_name = "a.ts::C::helper".to_string();
+        helper.start_line = 5;
+        let mut caller = mk_node2(
+            "method:run",
+            NodeKind::Method,
+            "run",
+            "a.ts",
+            Language::TypeScript,
+        );
+        caller.qualified_name = "a.ts::C::run".to_string();
+        caller.start_line = 2;
+        store
+            .upsert_nodes(&[cls, helper.clone(), caller.clone()])
+            .expect("nodes");
+        let mut resolver = ReferenceResolver::new("/root");
+        resolver.warm_caches(&crate::context::StoreResolutionContext::new(
+            &store, "/root",
+        ));
+        let ctx = crate::context::StoreResolutionContext::new(&store, "/root");
+        let reference = RefView {
+            from_node_id: caller.id.clone(),
+            reference_name: "this.helper".to_string(),
+            reference_kind: EdgeKind::References,
+            line: 3,
+            column: 0,
+            file_path: "a.ts".to_string(),
+            language: Language::TypeScript,
+            is_function_ref: true,
+            reference_subkind: None,
+        };
+        let resolved = resolver.resolve_one(&reference, &ctx).expect("resolves");
+        assert_eq!(resolved.target_node_id, helper.id);
+        assert_eq!(resolved.resolved_by, ResolvedBy::FunctionRef);
+    }
+
+    #[test]
+    fn resolve_one_this_member_missing_defers_then_noop_without_supertypes() {
+        // `this.absent` is not on the class; resolve_one defers it. Running the
+        // #808 pass with no implements/extends edges resolves nothing.
+        let mut store = Store::open(&temp_db("thisdefer")).expect("open");
+        let cls = mk_node2(
+            "class:C",
+            NodeKind::Class,
+            "C",
+            "a.ts",
+            Language::TypeScript,
+        );
+        let mut caller = mk_node2(
+            "method:run",
+            NodeKind::Method,
+            "run",
+            "a.ts",
+            Language::TypeScript,
+        );
+        caller.qualified_name = "a.ts::C::run".to_string();
+        store.upsert_nodes(&[cls, caller.clone()]).expect("nodes");
+        let mut resolver = ReferenceResolver::new("/root");
+        resolver.warm_caches(&crate::context::StoreResolutionContext::new(
+            &store, "/root",
+        ));
+        {
+            let ctx = crate::context::StoreResolutionContext::new(&store, "/root");
+            let reference = RefView {
+                from_node_id: caller.id.clone(),
+                reference_name: "this.absent".to_string(),
+                reference_kind: EdgeKind::References,
+                line: 3,
+                column: 0,
+                file_path: "a.ts".to_string(),
+                language: Language::TypeScript,
+                is_function_ref: true,
+                reference_subkind: None,
+            };
+            assert!(resolver.resolve_one(&reference, &ctx).is_none());
+        }
+        assert_eq!(
+            resolver
+                .resolve_deferred_this_member_refs(&mut store)
+                .expect("pass"),
+            0
+        );
+    }
+
+    #[test]
+    fn resolve_one_function_ref_via_import_target_kind() {
+        // A bare function_ref (not this.*) resolves through match_function_ref to
+        // the function node in the same file.
+        let mut store = Store::open(&temp_db("fnref")).expect("open");
+        let onblur = mk_node2(
+            "function:onBlur",
+            NodeKind::Function,
+            "onBlur",
+            "a.ts",
+            Language::TypeScript,
+        );
+        let caller = mk_node2(
+            "function:setup",
+            NodeKind::Function,
+            "setup",
+            "a.ts",
+            Language::TypeScript,
+        );
+        store
+            .upsert_nodes(&[onblur.clone(), caller.clone()])
+            .expect("nodes");
+        let mut resolver = ReferenceResolver::new("/root");
+        resolver.warm_caches(&crate::context::StoreResolutionContext::new(
+            &store, "/root",
+        ));
+        let ctx = crate::context::StoreResolutionContext::new(&store, "/root");
+        let reference = RefView {
+            from_node_id: caller.id.clone(),
+            reference_name: "onBlur".to_string(),
+            reference_kind: EdgeKind::References,
+            line: 2,
+            column: 0,
+            file_path: "a.ts".to_string(),
+            language: Language::TypeScript,
+            is_function_ref: true,
+            reference_subkind: None,
+        };
+        let resolved = resolver.resolve_one(&reference, &ctx).expect("resolves");
+        assert_eq!(resolved.target_node_id, onblur.id);
+    }
+
+    #[test]
+    fn helper_stubs_are_exercised() {
+        // Drives the test-only ReactLike / Universal / MinimalCtx stub methods so
+        // they are not counted as uncovered noise.
+        let ctx = MinimalCtx {
+            files: HashMap::from([("f.ts".to_string(), "x".to_string())]),
+        };
+        for f in [ReactLike.name().to_string(), Universal.name().to_string()] {
+            assert!(!f.is_empty());
+        }
+        assert!(ReactLike.languages().is_some());
+        assert!(Universal.languages().is_none());
+        assert!(ReactLike.detect(&ctx));
+        assert!(Universal.detect(&ctx));
+        assert!(
+            ReactLike
+                .resolve(&mk_ref("x", EdgeKind::Calls, Language::TypeScript), &ctx)
+                .is_none()
+        );
+        assert!(
+            Universal
+                .resolve(&mk_ref("x", EdgeKind::Calls, Language::TypeScript), &ctx)
+                .is_none()
+        );
+        assert!(ctx.get_nodes_in_file("f.ts").is_empty());
+        assert!(ctx.get_nodes_by_name("x").is_empty());
+        assert!(ctx.get_nodes_by_qualified_name("x").is_empty());
+        assert!(ctx.get_nodes_by_kind(NodeKind::Function).is_empty());
+        assert!(ctx.file_exists("f.ts"));
+        assert_eq!(ctx.read_file("f.ts").as_deref(), Some("x"));
+        assert_eq!(ctx.get_project_root(), "/root");
+        assert_eq!(ctx.get_all_files().len(), 1);
+        assert!(ctx.get_nodes_by_lower_name("x").is_empty());
+        assert!(ctx.get_node_by_id("x").is_none());
+        assert!(
+            ctx.get_import_mappings("f.ts", Language::TypeScript)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn has_any_possible_match_deep_tail_branches() {
+        let mut r = ReferenceResolver::new("/root");
+        let mut known = BTreeSet::new();
+        known.insert("leaf".to_string());
+        known.insert("Scoped".to_string());
+        r.known_names = Some(known);
+        // Dotted chain a.b.leaf: none of head/cap match, but the last-dot tail does.
+        assert!(r.has_any_possible_match("a.b.leaf"));
+        // Scoped chain a::b::Scoped: last-colon tail matches.
+        assert!(r.has_any_possible_match("a::b::Scoped"));
+        // Neither head nor any tail known.
+        assert!(!r.has_any_possible_match("a.b.c"));
+        assert!(!r.has_any_possible_match("a::b::c"));
+    }
+
+    #[test]
+    fn extract_and_persist_frameworks_runs_when_detected() {
+        // With a react project detected, extract_and_persist_frameworks reads the
+        // relative file and persists any framework nodes/refs it emits.
+        let dir = std::env::temp_dir().join(format!(
+            "codegraph-fw-extract-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("pages")).expect("mkdir");
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"dependencies":{"react":"18"}}"#,
+        )
+        .expect("pkg");
+        // The react resolver's languages() is [JavaScript, TypeScript]; a `.tsx`
+        // maps to Language::Tsx (not applicable), so use a `.ts` page whose Next.js
+        // route branch still fires on `export default`.
+        std::fs::write(
+            dir.join("pages/about.ts"),
+            "export default function About() { return 1; }",
+        )
+        .expect("page");
+        let mut store = Store::open(&temp_db("fwextract")).expect("open");
+        let mut resolver = ReferenceResolver::new(dir.to_string_lossy().to_string());
+        {
+            let ctx = crate::context::StoreResolutionContext::new(
+                &store,
+                resolver.project_root().to_string(),
+            );
+            resolver.initialize(&ctx);
+        }
+        assert!(resolver.has_framework_resolvers());
+        resolver
+            .extract_and_persist_frameworks(&mut store, &["pages/about.ts".to_string()])
+            .expect("extract");
+        let routes = store.nodes_by_kind(NodeKind::Route).expect("routes");
+        assert!(routes.iter().any(|n| n.name == "/about"), "got {routes:#?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn conformance_pass_resolves_inherited_this_member() {
+        // Sub has no `greet`; its supertype Base does. A deferred `this.greet`
+        // resolves via find_inherited_member's BFS once extends edges exist.
+        let mut store = Store::open(&temp_db("inherit")).expect("open");
+        let base = mk_node2(
+            "class:Base",
+            NodeKind::Class,
+            "Base",
+            "base.ts",
+            Language::TypeScript,
+        );
+        let mut greet = mk_node2(
+            "method:greet",
+            NodeKind::Method,
+            "greet",
+            "base.ts",
+            Language::TypeScript,
+        );
+        greet.qualified_name = "base.ts::Base::greet".to_string();
+        let sub = mk_node2(
+            "class:Sub",
+            NodeKind::Class,
+            "Sub",
+            "sub.ts",
+            Language::TypeScript,
+        );
+        let mut run = mk_node2(
+            "method:run",
+            NodeKind::Method,
+            "run",
+            "sub.ts",
+            Language::TypeScript,
+        );
+        run.qualified_name = "sub.ts::Sub::run".to_string();
+        store
+            .upsert_nodes(&[base.clone(), greet.clone(), sub.clone(), run.clone()])
+            .expect("nodes");
+        // contains edges: Base -> greet ; extends edge: Sub -> Base.
+        store
+            .insert_edges(&[
+                Edge {
+                    id: None,
+                    source: base.id.clone(),
+                    target: greet.id.clone(),
+                    kind: EdgeKind::Contains,
+                    metadata: None,
+                    line: Some(1),
+                    col: Some(0),
+                    provenance: None,
+                },
+                Edge {
+                    id: None,
+                    source: sub.id.clone(),
+                    target: base.id.clone(),
+                    kind: EdgeKind::Extends,
+                    metadata: None,
+                    line: Some(1),
+                    col: Some(0),
+                    provenance: None,
+                },
+            ])
+            .expect("edges");
+        let target = find_inherited_member(
+            &store,
+            "Sub",
+            "greet",
+            &RefView {
+                from_node_id: run.id.clone(),
+                reference_name: "this.greet".to_string(),
+                reference_kind: EdgeKind::References,
+                line: 2,
+                column: 0,
+                file_path: "sub.ts".to_string(),
+                language: Language::TypeScript,
+                is_function_ref: true,
+                reference_subkind: None,
+            },
+        );
+        assert_eq!(target.as_deref(), Some(greet.id.as_str()));
+    }
+
+    #[test]
+    fn find_inherited_member_none_when_no_supertype_has_member() {
+        // Class exists but neither it nor its (absent) supertypes declare `gone`.
+        let mut store = Store::open(&temp_db("inherit-none")).expect("open");
+        let cls = mk_node2(
+            "class:C",
+            NodeKind::Class,
+            "C",
+            "a.ts",
+            Language::TypeScript,
+        );
+        store
+            .upsert_nodes(std::slice::from_ref(&cls))
+            .expect("nodes");
+        let target = find_inherited_member(
+            &store,
+            "C",
+            "gone",
+            &RefView {
+                from_node_id: "x".to_string(),
+                reference_name: "this.gone".to_string(),
+                reference_kind: EdgeKind::References,
+                line: 1,
+                column: 0,
+                file_path: "a.ts".to_string(),
+                language: Language::TypeScript,
+                is_function_ref: true,
+                reference_subkind: None,
+            },
+        );
+        assert!(target.is_none());
+    }
+
+    // ---------------------------------------------------------------------
+    // helpers
+    // ---------------------------------------------------------------------
+
+    struct ReactLike;
+    impl FrameworkResolver for ReactLike {
+        fn name(&self) -> &str {
+            "react-like"
+        }
+        fn languages(&self) -> Option<&[Language]> {
+            const L: [Language; 1] = [Language::TypeScript];
+            Some(&L)
+        }
+        fn detect(&self, _c: &dyn ResolutionContext) -> bool {
+            true
+        }
+        fn resolve(&self, _r: &RefView, _c: &dyn ResolutionContext) -> Option<ResolvedRef> {
+            None
+        }
+    }
+
+    struct Universal;
+    impl FrameworkResolver for Universal {
+        fn name(&self) -> &str {
+            "universal"
+        }
+        fn detect(&self, _c: &dyn ResolutionContext) -> bool {
+            true
+        }
+        fn resolve(&self, _r: &RefView, _c: &dyn ResolutionContext) -> Option<ResolvedRef> {
+            None
+        }
+    }
+
+    struct MinimalCtx {
+        files: HashMap<String, String>,
+    }
+    impl ResolutionContext for MinimalCtx {
+        fn get_nodes_in_file(&self, _f: &str) -> Vec<Node> {
+            Vec::new()
+        }
+        fn get_nodes_by_name(&self, _n: &str) -> Vec<Node> {
+            Vec::new()
+        }
+        fn get_nodes_by_qualified_name(&self, _q: &str) -> Vec<Node> {
+            Vec::new()
+        }
+        fn get_nodes_by_kind(&self, _k: NodeKind) -> Vec<Node> {
+            Vec::new()
+        }
+        fn file_exists(&self, f: &str) -> bool {
+            self.files.contains_key(f)
+        }
+        fn read_file(&self, f: &str) -> Option<String> {
+            self.files.get(f).cloned()
+        }
+        fn get_project_root(&self) -> &str {
+            "/root"
+        }
+        fn get_all_files(&self) -> Vec<String> {
+            self.files.keys().cloned().collect()
+        }
+        fn get_nodes_by_lower_name(&self, _n: &str) -> Vec<Node> {
+            Vec::new()
+        }
+        fn get_node_by_id(&self, _id: &str) -> Option<Node> {
+            None
+        }
+        fn get_import_mappings(&self, _f: &str, _l: Language) -> Vec<ImportMapping> {
+            Vec::new()
+        }
+    }
+
+    fn mk_ref(name: &str, kind: EdgeKind, lang: Language) -> RefView {
+        RefView {
+            from_node_id: "from".to_string(),
+            reference_name: name.to_string(),
+            reference_kind: kind,
+            line: 1,
+            column: 0,
+            file_path: "a.ts".to_string(),
+            language: lang,
+            is_function_ref: false,
+            reference_subkind: None,
+        }
+    }
+
+    fn resolved_ref(target: &str, confidence: f64) -> ResolvedRef {
+        ResolvedRef {
+            original: mk_ref("x", EdgeKind::Calls, Language::TypeScript),
+            target_node_id: target.to_string(),
+            confidence,
+            resolved_by: ResolvedBy::Import,
+        }
+    }
+
+    fn mk_node(id: &str, kind: NodeKind, name: &str, file: &str) -> Node {
+        mk_node2(id, kind, name, file, Language::TypeScript)
+    }
+
+    fn mk_node2(id: &str, kind: NodeKind, name: &str, file: &str, lang: Language) -> Node {
+        Node {
+            id: id.to_string(),
+            kind,
+            name: name.to_string(),
+            qualified_name: format!("{file}::{name}"),
+            file_path: file.to_string(),
+            language: lang,
+            start_line: 1,
+            end_line: 1,
+            start_column: 0,
+            end_column: 0,
+            docstring: None,
+            signature: None,
+            visibility: None,
+            is_exported: false,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+            decorators: Vec::new(),
+            type_parameters: Vec::new(),
+            return_type: None,
+            updated_at: 0,
+        }
+    }
+
+    fn file_rec(path: &str) -> FileRecord {
+        FileRecord {
+            path: path.to_string(),
+            content_hash: "h".to_string(),
+            language: Language::TypeScript,
+            size: 0,
+            modified_at: 0,
+            indexed_at: 0,
+            node_count: 0,
+            errors: Vec::new(),
+        }
+    }
+}

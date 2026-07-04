@@ -519,4 +519,311 @@ mod tests {
         assert!(out.trim_end().ends_with("let b = 2;"));
         assert!(!out.contains("inner"));
     }
+
+    /// The blanking always keeps the same length and preserves `\n` positions,
+    /// so line counts and byte offsets are stable across every language.
+    fn assert_offsets_preserved(input: &str, out: &str) {
+        assert_eq!(out.chars().count(), input.chars().count());
+        let in_nl: Vec<usize> = input
+            .char_indices()
+            .filter(|(_, c)| *c == '\n')
+            .map(|(i, _)| i)
+            .collect();
+        let out_nl: Vec<usize> = out
+            .char_indices()
+            .filter(|(_, c)| *c == '\n')
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(in_nl, out_nl);
+    }
+
+    #[test]
+    fn python_triple_quoted_string_blanked() {
+        let input = "a = 1\nx = \"\"\"multi\nline # not comment\n\"\"\"\nb = 2";
+        let out = strip_comments_for_regex(input, CommentLang::Python);
+        assert_offsets_preserved(input, &out);
+        assert!(out.starts_with("a = 1\n"));
+        assert!(out.trim_end().ends_with("b = 2"));
+        assert!(!out.contains("multi"));
+        assert!(!out.contains("not comment"));
+        assert_eq!(out.lines().count(), input.lines().count());
+    }
+
+    #[test]
+    fn python_triple_quoted_single_quotes_and_escapes() {
+        let input = "x = '''a\\'''b'''c";
+        let out = strip_comments_for_regex(input, CommentLang::Python);
+        assert_offsets_preserved(input, &out);
+        assert!(out.ends_with('c'));
+    }
+
+    #[test]
+    fn python_single_line_string_with_hash_inside() {
+        let input = "url = \"http://x#frag\"  # real comment";
+        let out = strip_comments_for_regex(input, CommentLang::Python);
+        assert_offsets_preserved(input, &out);
+        // The `#frag` inside the string is not treated as a comment; the string
+        // itself is kept intact (single-line strings are NOT blanked in python).
+        assert!(out.contains("http://x#frag"));
+        // The trailing real comment IS blanked.
+        assert!(!out.contains("real comment"));
+    }
+
+    #[test]
+    fn python_string_escape_and_unterminated() {
+        let input = "s = \"esc\\\"still\ncode = 1";
+        let out = strip_comments_for_regex(input, CommentLang::Python);
+        assert_offsets_preserved(input, &out);
+        assert!(out.contains("code = 1"));
+    }
+
+    #[test]
+    fn python_single_quote_string_kept() {
+        let input = "a = 'literal' # c";
+        let out = strip_comments_for_regex(input, CommentLang::Python);
+        assert!(out.contains("'literal'"));
+        assert!(!out.contains("# c") || out.contains("   "));
+    }
+
+    #[test]
+    fn ruby_begin_end_block_comment_blanked() {
+        let input = "x = 1\n=begin\nthis is\na comment\n=end\ny = 2";
+        let out = strip_comments_for_regex(input, CommentLang::Ruby);
+        assert_offsets_preserved(input, &out);
+        assert!(out.starts_with("x = 1\n"));
+        assert!(out.trim_end().ends_with("y = 2"));
+        assert!(!out.contains("this is"));
+        assert!(!out.contains("comment"));
+    }
+
+    #[test]
+    fn ruby_begin_end_indented_end() {
+        let input = "=begin\ndoc\n  =end\nreal = 3";
+        let out = strip_comments_for_regex(input, CommentLang::Ruby);
+        assert_offsets_preserved(input, &out);
+        assert!(out.contains("real = 3"));
+        assert!(!out.contains("doc"));
+    }
+
+    #[test]
+    fn ruby_line_comment_and_string() {
+        let input = "name = \"foo#bar\" # trailing";
+        let out = strip_comments_for_regex(input, CommentLang::Ruby);
+        assert_offsets_preserved(input, &out);
+        assert!(out.contains("\"foo#bar\""));
+        assert!(!out.contains("trailing"));
+    }
+
+    #[test]
+    fn ruby_string_escape_and_newline_break() {
+        let input = "a = 'x\\'y'\nb = \"unterminated\nc = 1";
+        let out = strip_comments_for_regex(input, CommentLang::Ruby);
+        assert_offsets_preserved(input, &out);
+        assert!(out.contains("c = 1"));
+    }
+
+    #[test]
+    fn ruby_whitespace_before_hash_not_line_start() {
+        // A `#` not at line start after code is still a line comment.
+        let input = "  code # note";
+        let out = strip_comments_for_regex(input, CommentLang::Ruby);
+        assert!(out.contains("code"));
+        assert!(!out.contains("note"));
+    }
+
+    #[test]
+    fn js_block_and_line_comments() {
+        let input = "let a = 1; /* block */ let b = 2; // line\nlet c = 3;";
+        let out = strip_comments_for_regex(input, CommentLang::JavaScript);
+        assert_offsets_preserved(input, &out);
+        assert!(!out.contains("block"));
+        assert!(!out.contains("line"));
+        assert!(out.contains("let c = 3;"));
+    }
+
+    #[test]
+    fn js_template_literal_multiline_skipped_not_treated_as_comment() {
+        let input = "const t = `line1\nline2 // not comment`;\nx = 1";
+        let out = strip_comments_for_regex(input, CommentLang::TypeScript);
+        assert_offsets_preserved(input, &out);
+        // String literals are SKIPPED (advanced past) but not blanked, so the
+        // template body survives; the point is the inner `//` is not a comment.
+        assert!(out.contains("not comment"));
+        assert!(out.contains("x = 1"));
+    }
+
+    #[test]
+    fn js_single_quote_allowed() {
+        let input = "let s = 'a//b'; // c";
+        let out = strip_comments_for_regex(input, CommentLang::JavaScript);
+        assert_offsets_preserved(input, &out);
+        assert!(!out.contains("c"));
+    }
+
+    #[test]
+    fn java_single_quote_not_a_string() {
+        // For Java, single quotes are NOT string delimiters (char literal path
+        // is not enabled), so a `'` is a plain char in the scan.
+        let input = "char c = 'x'; // note";
+        let out = strip_comments_for_regex(input, CommentLang::Java);
+        assert_offsets_preserved(input, &out);
+        assert!(!out.contains("note"));
+    }
+
+    #[test]
+    fn c_style_unterminated_block_comment() {
+        let input = "code /* never closed";
+        let out = strip_comments_for_regex(input, CommentLang::CSharp);
+        assert_offsets_preserved(input, &out);
+        assert!(out.starts_with("code "));
+        assert!(!out.contains("never"));
+    }
+
+    #[test]
+    fn c_style_string_escape_and_double_quote() {
+        let input = "let s = \"esc\\\"quote\"; // trailing";
+        let out = strip_comments_for_regex(input, CommentLang::Swift);
+        assert_offsets_preserved(input, &out);
+        assert!(!out.contains("trailing"));
+    }
+
+    #[test]
+    fn php_all_comment_styles() {
+        let input = "<?php\n$a = 1; // slash\n$b = 2; # hash\n/* block */ $c = 3;";
+        let out = strip_comments_for_regex(input, CommentLang::Php);
+        assert_offsets_preserved(input, &out);
+        assert!(!out.contains("slash"));
+        assert!(!out.contains("hash"));
+        assert!(!out.contains("block"));
+        assert!(out.contains("$c = 3;"));
+    }
+
+    #[test]
+    fn php_string_and_backtick() {
+        let input = "$s = \"a#b\"; $t = `cmd`; # c";
+        let out = strip_comments_for_regex(input, CommentLang::Php);
+        assert_offsets_preserved(input, &out);
+        assert!(out.contains("\"a#b\""));
+        assert!(!out.contains("# c") || out.trim_end().ends_with("`;"));
+    }
+
+    #[test]
+    fn php_unterminated_block_and_escape() {
+        let input = "$x = \"esc\\\"y\";\n/* open";
+        let out = strip_comments_for_regex(input, CommentLang::Php);
+        assert_offsets_preserved(input, &out);
+        assert!(!out.contains("open"));
+    }
+
+    #[test]
+    fn php_string_newline_break() {
+        let input = "$s = 'unterminated\n$y = 1";
+        let out = strip_comments_for_regex(input, CommentLang::Php);
+        assert_offsets_preserved(input, &out);
+        assert!(out.contains("$y = 1"));
+    }
+
+    #[test]
+    fn go_raw_string_backtick_kept() {
+        // Go raw strings (backticks) are NOT blanked — contents preserved.
+        let input = "s := `raw // not comment`\nx := 1";
+        let out = strip_comments_for_regex(input, CommentLang::Go);
+        assert_offsets_preserved(input, &out);
+        assert!(out.contains("raw // not comment"));
+        assert!(out.contains("x := 1"));
+    }
+
+    #[test]
+    fn go_block_line_and_double_string() {
+        let input = "/* b */ s := \"a//b\" // trailing\nx := 1";
+        let out = strip_comments_for_regex(input, CommentLang::Go);
+        assert_offsets_preserved(input, &out);
+        assert!(!out.contains(" b "));
+        assert!(!out.contains("trailing"));
+        assert!(out.contains("x := 1"));
+    }
+
+    #[test]
+    fn go_rune_single_quote_literal() {
+        let input = "r := 'x' // note";
+        let out = strip_comments_for_regex(input, CommentLang::Go);
+        assert_offsets_preserved(input, &out);
+        assert!(!out.contains("note"));
+    }
+
+    #[test]
+    fn go_string_escapes_and_unterminated() {
+        let input = "s := \"esc\\\"y\"\nt := 'a\\'b'\nu := \"open\nv := 1";
+        let out = strip_comments_for_regex(input, CommentLang::Go);
+        assert_offsets_preserved(input, &out);
+        assert!(out.contains("v := 1"));
+    }
+
+    #[test]
+    fn go_unterminated_backtick_and_rune() {
+        let input = "s := `open\nr := 'z";
+        let out = strip_comments_for_regex(input, CommentLang::Go);
+        assert_offsets_preserved(input, &out);
+    }
+
+    #[test]
+    fn rust_line_comment_and_string() {
+        let input = "let s = \"a//b\"; // trailing\nlet x = 1;";
+        let out = strip_comments_for_regex(input, CommentLang::Rust);
+        assert_offsets_preserved(input, &out);
+        assert!(out.contains("\"a//b\""));
+        assert!(!out.contains("trailing"));
+        assert!(out.contains("let x = 1;"));
+    }
+
+    #[test]
+    fn rust_char_literal_and_escape() {
+        let input = "let c = 'x'; let s = \"esc\\\"y\"; // note";
+        let out = strip_comments_for_regex(input, CommentLang::Rust);
+        assert_offsets_preserved(input, &out);
+        assert!(!out.contains("note"));
+    }
+
+    #[test]
+    fn rust_unterminated_block_and_string() {
+        let input = "code /* open /* nested\nlet s = \"open";
+        let out = strip_comments_for_regex(input, CommentLang::Rust);
+        assert_offsets_preserved(input, &out);
+        assert!(out.starts_with("code "));
+    }
+
+    #[test]
+    fn rust_char_newline_break() {
+        let input = "let c = 'a\nlet x = 1;";
+        let out = strip_comments_for_regex(input, CommentLang::Rust);
+        assert_offsets_preserved(input, &out);
+        assert!(out.contains("let x = 1;"));
+    }
+
+    #[test]
+    fn empty_input_all_langs() {
+        for lang in [
+            CommentLang::Python,
+            CommentLang::Ruby,
+            CommentLang::JavaScript,
+            CommentLang::TypeScript,
+            CommentLang::Php,
+            CommentLang::Java,
+            CommentLang::CSharp,
+            CommentLang::Swift,
+            CommentLang::Go,
+            CommentLang::Rust,
+        ] {
+            assert_eq!(strip_comments_for_regex("", lang), "");
+        }
+    }
+
+    #[test]
+    fn comment_lang_derives() {
+        let a = CommentLang::Rust;
+        let b = a;
+        assert_eq!(a, b);
+        assert_ne!(CommentLang::Go, CommentLang::Rust);
+        assert!(format!("{a:?}").contains("Rust"));
+    }
 }

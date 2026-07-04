@@ -1981,3 +1981,1720 @@ fn resolve_lua_require(
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::path_aliases::{AliasMap, AliasPattern};
+    use crate::types::{GoModule, ImportMapping, ReExport, RefView, ResolutionContext};
+    use crate::workspace_packages::WorkspacePackages;
+    use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// A fully configurable in-memory [`ResolutionContext`] for unit-testing the
+    /// import resolver in isolation (no Store, no filesystem). Every collection
+    /// is a plain field so each test builds exactly the graph it needs.
+    #[derive(Default)]
+    struct TestContext {
+        project_root: String,
+        existing_files: BTreeSet<String>,
+        file_contents: BTreeMap<String, String>,
+        nodes: Vec<Node>,
+        import_mappings: BTreeMap<String, Vec<ImportMapping>>,
+        re_exports: BTreeMap<String, Vec<ReExport>>,
+        project_aliases: Option<AliasMap>,
+        workspace_packages: Option<WorkspacePackages>,
+        go_module: Option<GoModule>,
+        cpp_include_dirs: Vec<String>,
+    }
+
+    impl ResolutionContext for TestContext {
+        fn get_nodes_in_file(&self, file_path: &str) -> Vec<Node> {
+            self.nodes
+                .iter()
+                .filter(|n| n.file_path == file_path)
+                .cloned()
+                .collect()
+        }
+        fn get_nodes_by_name(&self, name: &str) -> Vec<Node> {
+            self.nodes
+                .iter()
+                .filter(|n| n.name == name)
+                .cloned()
+                .collect()
+        }
+        fn get_nodes_by_qualified_name(&self, qualified_name: &str) -> Vec<Node> {
+            self.nodes
+                .iter()
+                .filter(|n| n.qualified_name == qualified_name)
+                .cloned()
+                .collect()
+        }
+        fn get_nodes_by_kind(&self, kind: NodeKind) -> Vec<Node> {
+            self.nodes
+                .iter()
+                .filter(|n| n.kind == kind)
+                .cloned()
+                .collect()
+        }
+        fn file_exists(&self, file_path: &str) -> bool {
+            self.existing_files.contains(file_path)
+        }
+        fn read_file(&self, file_path: &str) -> Option<String> {
+            self.file_contents.get(file_path).cloned()
+        }
+        fn get_project_root(&self) -> &str {
+            &self.project_root
+        }
+        fn get_all_files(&self) -> Vec<String> {
+            self.existing_files.iter().cloned().collect()
+        }
+        fn get_nodes_by_lower_name(&self, lower_name: &str) -> Vec<Node> {
+            self.nodes
+                .iter()
+                .filter(|n| n.name.to_lowercase() == lower_name)
+                .cloned()
+                .collect()
+        }
+        fn get_node_by_id(&self, id: &str) -> Option<Node> {
+            self.nodes.iter().find(|n| n.id == id).cloned()
+        }
+        fn get_import_mappings(&self, file_path: &str, _language: Language) -> Vec<ImportMapping> {
+            self.import_mappings
+                .get(file_path)
+                .cloned()
+                .unwrap_or_default()
+        }
+        fn get_project_aliases(&self) -> Option<AliasMap> {
+            self.project_aliases.clone()
+        }
+        fn get_workspace_packages(&self) -> Option<WorkspacePackages> {
+            self.workspace_packages.clone()
+        }
+        fn get_go_module(&self) -> Option<GoModule> {
+            self.go_module.clone()
+        }
+        fn get_re_exports(&self, file_path: &str, _language: Language) -> Vec<ReExport> {
+            self.re_exports.get(file_path).cloned().unwrap_or_default()
+        }
+        fn get_cpp_include_dirs(&self) -> Vec<String> {
+            self.cpp_include_dirs.clone()
+        }
+    }
+
+    fn node(id: &str, name: &str, kind: NodeKind, file_path: &str, language: Language) -> Node {
+        Node {
+            id: id.to_string(),
+            kind,
+            name: name.to_string(),
+            qualified_name: name.to_string(),
+            file_path: file_path.to_string(),
+            language,
+            start_line: 1,
+            end_line: 1,
+            start_column: 0,
+            end_column: 0,
+            docstring: None,
+            signature: None,
+            visibility: None,
+            is_exported: false,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+            decorators: Vec::new(),
+            type_parameters: Vec::new(),
+            return_type: None,
+            updated_at: 0,
+        }
+    }
+
+    fn exported(mut n: Node) -> Node {
+        n.is_exported = true;
+        n
+    }
+
+    fn file_node(file_path: &str, language: Language) -> Node {
+        node(
+            &format!("file:{file_path}"),
+            pathutil::basename(file_path),
+            NodeKind::File,
+            file_path,
+            language,
+        )
+    }
+
+    fn reference(name: &str, kind: EdgeKind, file_path: &str, language: Language) -> RefView {
+        RefView {
+            from_node_id: "function:caller".to_string(),
+            reference_name: name.to_string(),
+            reference_kind: kind,
+            line: 1,
+            column: 0,
+            file_path: file_path.to_string(),
+            language,
+            is_function_ref: false,
+            reference_subkind: None,
+        }
+    }
+
+    fn mapping(local: &str, exported: &str, source: &str) -> ImportMapping {
+        ImportMapping {
+            local_name: local.to_string(),
+            exported_name: exported.to_string(),
+            source: source.to_string(),
+            is_default: false,
+            is_namespace: false,
+        }
+    }
+
+    #[test]
+    fn extension_resolution_covers_all_language_arms() {
+        assert!(extension_resolution(Language::TypeScript).contains(&".ts"));
+        assert!(extension_resolution(Language::JavaScript).contains(&".js"));
+        assert!(extension_resolution(Language::Tsx).contains(&".tsx"));
+        assert!(extension_resolution(Language::Jsx).contains(&".jsx"));
+        assert!(extension_resolution(Language::Svelte).contains(&".svelte"));
+        assert!(extension_resolution(Language::Vue).contains(&".vue"));
+        assert_eq!(
+            extension_resolution(Language::Python),
+            &[".py", "/__init__.py"]
+        );
+        assert_eq!(extension_resolution(Language::Go), &[".go"]);
+        assert_eq!(extension_resolution(Language::Rust), &[".rs", "/mod.rs"]);
+        assert_eq!(extension_resolution(Language::Java), &[".java"]);
+        assert!(extension_resolution(Language::C).contains(&".h"));
+        assert!(extension_resolution(Language::Cpp).contains(&".cpp"));
+        assert_eq!(extension_resolution(Language::CSharp), &[".cs"]);
+        assert_eq!(extension_resolution(Language::Php), &[".php"]);
+        assert_eq!(extension_resolution(Language::Ruby), &[".rb"]);
+        assert!(extension_resolution(Language::ObjC).contains(&".m"));
+        assert!(extension_resolution(Language::Yaml).is_empty());
+    }
+
+    #[test]
+    fn is_word_recognizes_identifiers() {
+        assert!(is_word("foo_bar123"));
+        assert!(!is_word(""));
+        assert!(!is_word("foo-bar"));
+        assert!(!is_word("a.b"));
+    }
+
+    #[test]
+    fn parse_as_alias_extracts_orig_and_alias() {
+        assert_eq!(
+            parse_as_alias("Foo as Bar"),
+            Some(("Foo".to_string(), "Bar".to_string()))
+        );
+        assert_eq!(parse_as_alias("Foo"), None);
+    }
+
+    #[test]
+    fn parse_colon_alias_extracts_orig_and_alias() {
+        assert_eq!(
+            parse_colon_alias("foo: bar"),
+            Some(("foo".to_string(), "bar".to_string()))
+        );
+        assert_eq!(parse_colon_alias("foo"), None);
+    }
+
+    #[test]
+    fn extract_import_mappings_dispatches_unknown_language_to_empty() {
+        assert!(extract_import_mappings("anything", Language::Yaml).is_empty());
+    }
+
+    #[test]
+    fn extract_js_imports_default_named_and_namespace() {
+        let content = r#"
+import Foo from './foo';
+import { a, b as c } from './bar';
+import * as ns from './baz';
+"#;
+        let m = extract_import_mappings(content, Language::TypeScript);
+        assert!(m.iter().any(|x| x.local_name == "Foo"
+            && x.exported_name == "default"
+            && x.is_default
+            && x.source == "./foo"));
+        assert!(
+            m.iter()
+                .any(|x| x.local_name == "a" && x.exported_name == "a" && !x.is_default)
+        );
+        assert!(
+            m.iter()
+                .any(|x| x.local_name == "c" && x.exported_name == "b")
+        );
+        assert!(
+            m.iter()
+                .any(|x| x.local_name == "ns" && x.exported_name == "*" && x.is_namespace)
+        );
+    }
+
+    #[test]
+    fn extract_js_imports_require_forms() {
+        let content = r#"
+const def = require('./mod');
+const { x, y: z } = require('./other');
+"#;
+        let m = extract_import_mappings(content, Language::JavaScript);
+        assert!(
+            m.iter()
+                .any(|x| x.local_name == "def" && x.is_default && x.source == "./mod")
+        );
+        assert!(
+            m.iter()
+                .any(|x| x.local_name == "x" && x.exported_name == "x")
+        );
+        assert!(
+            m.iter()
+                .any(|x| x.local_name == "z" && x.exported_name == "y")
+        );
+    }
+
+    #[test]
+    fn extract_python_imports_from_and_bare() {
+        let content = "from pkg.mod import a, b as c, *\nimport os.path as osp\nimport sys\n";
+        let m = extract_import_mappings(content, Language::Python);
+        assert!(
+            m.iter()
+                .any(|x| x.local_name == "a" && x.source == "pkg.mod")
+        );
+        assert!(
+            m.iter()
+                .any(|x| x.local_name == "c" && x.exported_name == "b")
+        );
+        assert!(!m.iter().any(|x| x.local_name == "*"));
+        assert!(
+            m.iter()
+                .any(|x| x.local_name == "osp" && x.source == "os.path" && x.is_namespace)
+        );
+        assert!(
+            m.iter()
+                .any(|x| x.local_name == "sys" && x.source == "sys" && x.is_namespace)
+        );
+    }
+
+    #[test]
+    fn extract_go_imports_single_and_block_with_alias() {
+        let single = r#"import "fmt""#;
+        let m = extract_import_mappings(single, Language::Go);
+        assert!(
+            m.iter()
+                .any(|x| x.local_name == "fmt" && x.source == "fmt" && x.is_namespace)
+        );
+
+        let block = "import (\n\t\"os\"\n\talias \"github.com/x/y\"\n)\n";
+        let m2 = extract_import_mappings(block, Language::Go);
+        assert!(m2.iter().any(|x| x.local_name == "os"));
+        assert!(
+            m2.iter()
+                .any(|x| x.local_name == "alias" && x.source == "github.com/x/y")
+        );
+    }
+
+    #[test]
+    fn extract_java_imports_strips_comments_and_skips_wildcard() {
+        let content = "/* block import java.util.Bad; */\n// line import java.io.AlsoBad;\nimport java.util.List;\nimport static com.x.Util.foo;\nimport java.util.*;\n";
+        let m = extract_import_mappings(content, Language::Java);
+        assert!(
+            m.iter()
+                .any(|x| x.local_name == "List" && x.source == "java.util.List")
+        );
+        assert!(m.iter().any(|x| x.local_name == "foo"));
+        assert!(!m.iter().any(|x| x.source.ends_with(".*")));
+        assert!(
+            !m.iter()
+                .any(|x| x.local_name == "Bad" || x.local_name == "AlsoBad")
+        );
+    }
+
+    #[test]
+    fn extract_php_imports_use_and_alias() {
+        let content = "use App\\Models\\User;\nuse App\\Service as Svc;\n";
+        let m = extract_import_mappings(content, Language::Php);
+        assert!(m.iter().any(|x| x.local_name == "User"
+            && x.exported_name == "User"
+            && x.source == "App\\Models\\User"));
+        assert!(
+            m.iter()
+                .any(|x| x.local_name == "Svc" && x.exported_name == "Service")
+        );
+    }
+
+    #[test]
+    fn extract_cpp_imports_include_forms() {
+        let content = "#include <vector>\n#include \"foo/bar.hpp\"\n";
+        let m = extract_import_mappings(content, Language::Cpp);
+        assert!(
+            m.iter()
+                .any(|x| x.local_name == "vector" && x.source == "vector")
+        );
+        assert!(
+            m.iter()
+                .any(|x| x.local_name == "bar" && x.source == "foo/bar.hpp")
+        );
+    }
+
+    #[test]
+    fn strip_js_comments_removes_comments_preserving_strings() {
+        let src = r#"const a = 1; // line comment
+/* block
+comment */ const b = "http://not-a-comment";
+const c = 'has // slashes';
+const d = `tpl \` escaped`;"#;
+        let out = strip_js_comments(src);
+        assert!(!out.contains("line comment"));
+        assert!(!out.contains("block"));
+        assert!(out.contains("http://not-a-comment"));
+        assert!(out.contains("has // slashes"));
+        assert!(out.contains("escaped"));
+    }
+
+    #[test]
+    fn extract_re_exports_non_js_language_is_empty() {
+        assert!(extract_re_exports("export * from './x'", Language::Python).is_empty());
+    }
+
+    #[test]
+    fn extract_re_exports_wildcard_and_named() {
+        let content = r#"
+export * from './all';
+export * as ns from './ns';
+export { Foo, Bar as Baz } from './named';
+export { } from './empty';
+"#;
+        let out = extract_re_exports(content, Language::TypeScript);
+        assert!(
+            out.iter()
+                .any(|r| matches!(r, ReExport::Wildcard { source } if source == "./all"))
+        );
+        assert!(
+            out.iter()
+                .any(|r| matches!(r, ReExport::Wildcard { source } if source == "./ns"))
+        );
+        assert!(out.iter().any(|r| matches!(
+            r,
+            ReExport::Named { exported_name, original_name, source }
+                if exported_name == "Foo" && original_name == "Foo" && source == "./named"
+        )));
+        assert!(out.iter().any(|r| matches!(
+            r,
+            ReExport::Named { exported_name, original_name, .. }
+                if exported_name == "Baz" && original_name == "Bar"
+        )));
+    }
+
+    #[test]
+    fn is_external_import_relative_is_local() {
+        let ctx = TestContext::default();
+        assert!(!is_external_import("./foo", Language::TypeScript, &ctx));
+    }
+
+    #[test]
+    fn is_external_import_node_builtin_is_external() {
+        let ctx = TestContext::default();
+        assert!(is_external_import("fs", Language::TypeScript, &ctx));
+        assert!(is_external_import("path", Language::JavaScript, &ctx));
+    }
+
+    #[test]
+    fn is_external_import_bare_specifier_is_external() {
+        let ctx = TestContext::default();
+        assert!(is_external_import("lodash", Language::TypeScript, &ctx));
+    }
+
+    #[test]
+    fn is_external_import_alias_prefixes_are_local() {
+        let ctx = TestContext::default();
+        assert!(!is_external_import("@/foo", Language::TypeScript, &ctx));
+        assert!(!is_external_import("~/foo", Language::TypeScript, &ctx));
+        assert!(!is_external_import("src/foo", Language::TypeScript, &ctx));
+    }
+
+    #[test]
+    fn is_external_import_project_alias_prefix_is_local() {
+        let ctx = TestContext {
+            project_aliases: Some(AliasMap {
+                base_url: String::new(),
+                patterns: vec![AliasPattern {
+                    prefix: "@app/".to_string(),
+                    suffix: String::new(),
+                    has_wildcard: true,
+                    replacements: vec!["app/".to_string()],
+                }],
+            }),
+            ..Default::default()
+        };
+        assert!(!is_external_import("@app/x", Language::TypeScript, &ctx));
+    }
+
+    #[test]
+    fn is_external_import_workspace_member_is_local() {
+        let mut by_name = BTreeMap::new();
+        by_name.insert("@scope/ui".to_string(), "packages/ui".to_string());
+        let ctx = TestContext {
+            workspace_packages: Some(WorkspacePackages { by_name }),
+            ..Default::default()
+        };
+        assert!(!is_external_import(
+            "@scope/ui/x",
+            Language::TypeScript,
+            &ctx
+        ));
+    }
+
+    #[test]
+    fn is_external_import_python_stdlib_is_external() {
+        let ctx = TestContext::default();
+        assert!(is_external_import("os.path", Language::Python, &ctx));
+        assert!(is_external_import("json", Language::Python, &ctx));
+        assert!(!is_external_import("mypkg.mod", Language::Python, &ctx));
+    }
+
+    #[test]
+    fn is_external_import_go_module_and_internal() {
+        let ctx = TestContext {
+            go_module: Some(GoModule {
+                module_path: "example.com/proj".to_string(),
+            }),
+            ..Default::default()
+        };
+        assert!(!is_external_import("example.com/proj", Language::Go, &ctx));
+        assert!(!is_external_import(
+            "example.com/proj/sub",
+            Language::Go,
+            &ctx
+        ));
+        assert!(!is_external_import("x/internal/y", Language::Go, &ctx));
+        assert!(is_external_import(
+            "github.com/other/pkg",
+            Language::Go,
+            &ctx
+        ));
+    }
+
+    #[test]
+    fn is_external_import_go_without_module_is_external() {
+        let ctx = TestContext::default();
+        assert!(is_external_import("github.com/x/y", Language::Go, &ctx));
+    }
+
+    #[test]
+    fn is_external_import_c_cpp_stdlib_headers() {
+        let ctx = TestContext::default();
+        assert!(is_external_import("stdio.h", Language::C, &ctx));
+        assert!(is_external_import("vector", Language::Cpp, &ctx));
+        assert!(is_external_import("string.h", Language::C, &ctx));
+        assert!(!is_external_import("myheader.h", Language::C, &ctx));
+    }
+
+    #[test]
+    fn resolve_import_path_external_returns_none() {
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            ..Default::default()
+        };
+        assert!(resolve_import_path("lodash", "src/a.ts", Language::TypeScript, &ctx).is_none());
+    }
+
+    #[test]
+    fn resolve_import_path_relative_with_extension() {
+        let mut existing = BTreeSet::new();
+        existing.insert("src/foo.ts".to_string());
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_import_path("./foo", "src/a.ts", Language::TypeScript, &ctx),
+            Some("src/foo.ts".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_import_path_relative_index_file() {
+        let mut existing = BTreeSet::new();
+        existing.insert("src/dir/index.ts".to_string());
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_import_path("./dir", "src/a.ts", Language::TypeScript, &ctx),
+            Some("src/dir/index.ts".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_import_path_relative_exact_no_ext() {
+        let mut existing = BTreeSet::new();
+        existing.insert("src/data.json".to_string());
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_import_path("./data.json", "src/a.ts", Language::TypeScript, &ctx),
+            Some("src/data.json".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_import_path_relative_unresolved_is_none() {
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            ..Default::default()
+        };
+        assert!(resolve_import_path("./missing", "src/a.ts", Language::TypeScript, &ctx).is_none());
+    }
+
+    #[test]
+    fn resolve_import_path_python_dotted_relative() {
+        let mut existing = BTreeSet::new();
+        existing.insert("pkg/sub/mod.py".to_string());
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_import_path(".sub.mod", "pkg/app.py", Language::Python, &ctx),
+            Some("pkg/sub/mod.py".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_import_path_python_dotted_package_dir() {
+        let mut existing = BTreeSet::new();
+        existing.insert("pkg/sub".to_string());
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_import_path(".sub", "pkg/app.py", Language::Python, &ctx),
+            Some("pkg/sub".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_import_path_python_parent_relative() {
+        let mut existing = BTreeSet::new();
+        existing.insert("pkg/other.py".to_string());
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_import_path("..other", "pkg/sub/app.py", Language::Python, &ctx),
+            Some("pkg/other.py".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_import_path_fallback_alias() {
+        let mut existing = BTreeSet::new();
+        existing.insert("src/util.ts".to_string());
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_import_path("@/util", "src/a.ts", Language::TypeScript, &ctx),
+            Some("src/util.ts".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_import_path_project_alias_map() {
+        let mut existing = BTreeSet::new();
+        existing.insert("lib/thing.ts".to_string());
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            project_aliases: Some(AliasMap {
+                base_url: "/proj".to_string(),
+                patterns: vec![AliasPattern {
+                    prefix: "@lib/".to_string(),
+                    suffix: String::new(),
+                    has_wildcard: true,
+                    replacements: vec!["lib/*".to_string()],
+                }],
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_import_path("@lib/thing", "src/a.ts", Language::TypeScript, &ctx),
+            Some("lib/thing.ts".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_import_path_workspace_package() {
+        let mut existing = BTreeSet::new();
+        existing.insert("packages/ui/index.ts".to_string());
+        let mut by_name = BTreeMap::new();
+        by_name.insert("@scope/ui".to_string(), "packages/ui".to_string());
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            workspace_packages: Some(WorkspacePackages { by_name }),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_import_path("@scope/ui", "src/a.ts", Language::TypeScript, &ctx),
+            Some("packages/ui/index.ts".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_import_path_cpp_include_dir_search() {
+        let mut existing = BTreeSet::new();
+        existing.insert("include/lib/header.h".to_string());
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            cpp_include_dirs: vec!["include".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_import_path("lib/header.h", "src/a.cpp", Language::Cpp, &ctx),
+            Some("include/lib/header.h".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_import_path_cpp_include_dir_with_extension_inference() {
+        let mut existing = BTreeSet::new();
+        existing.insert("include/foo.h".to_string());
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            cpp_include_dirs: vec!["include".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_import_path("foo", "src/a.c", Language::C, &ctx),
+            Some("include/foo.h".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_import_path_cpp_include_not_found() {
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            cpp_include_dirs: vec!["include".to_string()],
+            ..Default::default()
+        };
+        assert!(resolve_import_path("missing.h", "src/a.cpp", Language::Cpp, &ctx).is_none());
+    }
+
+    #[test]
+    fn is_php_include_path_ref_detection() {
+        let with_slash = reference("lib/foo", EdgeKind::Imports, "a.php", Language::Php);
+        assert!(is_php_include_path_ref(&with_slash));
+        let with_dot = reference("foo.php", EdgeKind::Imports, "a.php", Language::Php);
+        assert!(is_php_include_path_ref(&with_dot));
+        let namespace_use = reference("Foo", EdgeKind::Imports, "a.php", Language::Php);
+        assert!(!is_php_include_path_ref(&namespace_use));
+        let not_import = reference("lib/foo", EdgeKind::Calls, "a.php", Language::Php);
+        assert!(!is_php_include_path_ref(&not_import));
+        let not_php = reference("lib/foo", EdgeKind::Imports, "a.ts", Language::TypeScript);
+        assert!(!is_php_include_path_ref(&not_php));
+    }
+
+    #[test]
+    fn resolve_jvm_import_single_candidate() {
+        let target = node(
+            "class:1",
+            "MyClass",
+            NodeKind::Class,
+            "com/example/MyClass.java",
+            Language::Java,
+        );
+        let ctx = TestContext {
+            nodes: vec![{
+                let mut n = target.clone();
+                n.qualified_name = "com.example::MyClass".to_string();
+                n
+            }],
+            ..Default::default()
+        };
+        let r = reference(
+            "com.example.MyClass",
+            EdgeKind::Imports,
+            "Other.java",
+            Language::Java,
+        );
+        let resolved = resolve_jvm_import(&r, &ctx).expect("resolves");
+        assert_eq!(resolved.target_node_id, "class:1");
+        assert_eq!(resolved.confidence, 0.95);
+        assert_eq!(resolved.resolved_by, ResolvedBy::Import);
+    }
+
+    #[test]
+    fn resolve_jvm_import_rejects_non_import_and_non_jvm() {
+        let ctx = TestContext::default();
+        let not_import = reference("a.B", EdgeKind::Calls, "X.java", Language::Java);
+        assert!(resolve_jvm_import(&not_import, &ctx).is_none());
+        let not_jvm = reference("a.B", EdgeKind::Imports, "X.ts", Language::TypeScript);
+        assert!(resolve_jvm_import(&not_jvm, &ctx).is_none());
+    }
+
+    #[test]
+    fn resolve_jvm_import_rejects_no_dot_leading_dot_and_wildcard() {
+        let ctx = TestContext::default();
+        let no_dot = reference("Bare", EdgeKind::Imports, "X.java", Language::Java);
+        assert!(resolve_jvm_import(&no_dot, &ctx).is_none());
+        let leading = reference(".B", EdgeKind::Imports, "X.java", Language::Java);
+        assert!(resolve_jvm_import(&leading, &ctx).is_none());
+        let wildcard = reference("com.example.*", EdgeKind::Imports, "X.java", Language::Java);
+        assert!(resolve_jvm_import(&wildcard, &ctx).is_none());
+    }
+
+    #[test]
+    fn resolve_jvm_import_no_candidates_is_none() {
+        let ctx = TestContext::default();
+        let r = reference(
+            "com.example.Missing",
+            EdgeKind::Imports,
+            "X.java",
+            Language::Java,
+        );
+        assert!(resolve_jvm_import(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn resolve_jvm_import_picks_closest_by_proximity() {
+        let near = {
+            let mut n = node(
+                "class:near",
+                "Svc",
+                NodeKind::Class,
+                "com/example/app/Svc.java",
+                Language::Java,
+            );
+            n.qualified_name = "com.example::Svc".to_string();
+            n
+        };
+        let far = {
+            let mut n = node(
+                "class:far",
+                "Svc",
+                NodeKind::Class,
+                "org/other/Svc.java",
+                Language::Java,
+            );
+            n.qualified_name = "com.example::Svc".to_string();
+            n
+        };
+        let ctx = TestContext {
+            nodes: vec![far, near],
+            ..Default::default()
+        };
+        let r = reference(
+            "com.example.Svc",
+            EdgeKind::Imports,
+            "com/example/app/Caller.java",
+            Language::Java,
+        );
+        let resolved = resolve_jvm_import(&r, &ctx).expect("resolves");
+        assert_eq!(resolved.target_node_id, "class:near");
+    }
+
+    #[test]
+    fn resolve_jvm_import_prefers_expect_decorator_on_tie() {
+        let plain = {
+            let mut n = node(
+                "class:plain",
+                "Svc",
+                NodeKind::Class,
+                "com/example/Svc.java",
+                Language::Java,
+            );
+            n.qualified_name = "com.example::Svc".to_string();
+            n
+        };
+        let expected = {
+            let mut n = node(
+                "class:expect",
+                "Svc",
+                NodeKind::Class,
+                "com/example/Svc.java",
+                Language::Java,
+            );
+            n.qualified_name = "com.example::Svc".to_string();
+            n.decorators = vec!["expect".to_string()];
+            n
+        };
+        let ctx = TestContext {
+            nodes: vec![plain, expected],
+            ..Default::default()
+        };
+        let r = reference(
+            "com.example.Svc",
+            EdgeKind::Imports,
+            "com/example/Caller.java",
+            Language::Java,
+        );
+        let resolved = resolve_jvm_import(&r, &ctx).expect("resolves");
+        assert_eq!(resolved.target_node_id, "class:expect");
+    }
+
+    #[test]
+    fn resolve_via_import_cpp_sibling_include() {
+        let sibling = file_node("src/util.h", Language::Cpp);
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            nodes: vec![sibling],
+            ..Default::default()
+        };
+        let r = reference("util.h", EdgeKind::Imports, "src/main.cpp", Language::Cpp);
+        let resolved = resolve_via_import(&r, &ctx).expect("resolves");
+        assert_eq!(resolved.target_node_id, "file:src/util.h");
+        assert_eq!(resolved.confidence, 0.92);
+    }
+
+    #[test]
+    fn resolve_via_import_cpp_via_resolve_import_path() {
+        let mut existing = BTreeSet::new();
+        existing.insert("include/lib.h".to_string());
+        let file = file_node("include/lib.h", Language::Cpp);
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            nodes: vec![file],
+            cpp_include_dirs: vec!["include".to_string()],
+            ..Default::default()
+        };
+        let r = reference("lib.h", EdgeKind::Imports, "src/main.cpp", Language::Cpp);
+        let resolved = resolve_via_import(&r, &ctx).expect("resolves");
+        assert_eq!(resolved.target_node_id, "file:include/lib.h");
+        assert_eq!(resolved.confidence, 0.9);
+    }
+
+    #[test]
+    fn resolve_via_import_cpp_unresolved_is_none() {
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            ..Default::default()
+        };
+        let r = reference(
+            "missing.h",
+            EdgeKind::Imports,
+            "src/main.cpp",
+            Language::Cpp,
+        );
+        assert!(resolve_via_import(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn resolve_via_import_php_include_path() {
+        let mut existing = BTreeSet::new();
+        existing.insert("lib/helper.php".to_string());
+        let file = file_node("lib/helper.php", Language::Php);
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            nodes: vec![file],
+            ..Default::default()
+        };
+        let r = reference(
+            "lib/helper.php",
+            EdgeKind::Imports,
+            "app.php",
+            Language::Php,
+        );
+        let resolved = resolve_via_import(&r, &ctx).expect("resolves");
+        assert_eq!(resolved.target_node_id, "file:lib/helper.php");
+        assert_eq!(resolved.confidence, 0.9);
+    }
+
+    #[test]
+    fn resolve_via_import_php_include_unresolved_is_none() {
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            ..Default::default()
+        };
+        let r = reference(
+            "lib/missing.php",
+            EdgeKind::Imports,
+            "app.php",
+            Language::Php,
+        );
+        assert!(resolve_via_import(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn resolve_via_import_empty_imports_and_unreadable_file_is_none() {
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            ..Default::default()
+        };
+        let r = reference("foo", EdgeKind::Calls, "src/a.ts", Language::TypeScript);
+        assert!(resolve_via_import(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn resolve_via_import_generic_named_symbol() {
+        let mut existing = BTreeSet::new();
+        existing.insert("src/foo.ts".to_string());
+        let mut import_mappings = BTreeMap::new();
+        import_mappings.insert("src/a.ts".to_string(), vec![mapping("bar", "bar", "./foo")]);
+        let target = exported(node(
+            "function:bar",
+            "bar",
+            NodeKind::Function,
+            "src/foo.ts",
+            Language::TypeScript,
+        ));
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            import_mappings,
+            nodes: vec![target],
+            ..Default::default()
+        };
+        let r = reference("bar", EdgeKind::Calls, "src/a.ts", Language::TypeScript);
+        let resolved = resolve_via_import(&r, &ctx).expect("resolves");
+        assert_eq!(resolved.target_node_id, "function:bar");
+        assert_eq!(resolved.confidence, 0.9);
+    }
+
+    #[test]
+    fn resolve_via_import_generic_default_import() {
+        let mut existing = BTreeSet::new();
+        existing.insert("src/foo.ts".to_string());
+        let mut import_mappings = BTreeMap::new();
+        import_mappings.insert(
+            "src/a.ts".to_string(),
+            vec![ImportMapping {
+                local_name: "Foo".to_string(),
+                exported_name: "default".to_string(),
+                source: "./foo".to_string(),
+                is_default: true,
+                is_namespace: false,
+            }],
+        );
+        let target = exported(node(
+            "function:foo",
+            "foo",
+            NodeKind::Function,
+            "src/foo.ts",
+            Language::TypeScript,
+        ));
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            import_mappings,
+            nodes: vec![target],
+            ..Default::default()
+        };
+        let r = reference("Foo", EdgeKind::Calls, "src/a.ts", Language::TypeScript);
+        let resolved = resolve_via_import(&r, &ctx).expect("resolves");
+        assert_eq!(resolved.target_node_id, "function:foo");
+    }
+
+    #[test]
+    fn resolve_via_import_namespace_member() {
+        let mut existing = BTreeSet::new();
+        existing.insert("src/ns.ts".to_string());
+        let mut import_mappings = BTreeMap::new();
+        import_mappings.insert(
+            "src/a.ts".to_string(),
+            vec![ImportMapping {
+                local_name: "ns".to_string(),
+                exported_name: "*".to_string(),
+                source: "./ns".to_string(),
+                is_default: false,
+                is_namespace: true,
+            }],
+        );
+        let target = exported(node(
+            "function:helper",
+            "helper",
+            NodeKind::Function,
+            "src/ns.ts",
+            Language::TypeScript,
+        ));
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            import_mappings,
+            nodes: vec![target],
+            ..Default::default()
+        };
+        let r = reference(
+            "ns.helper",
+            EdgeKind::Calls,
+            "src/a.ts",
+            Language::TypeScript,
+        );
+        let resolved = resolve_via_import(&r, &ctx).expect("resolves");
+        assert_eq!(resolved.target_node_id, "function:helper");
+    }
+
+    #[test]
+    fn resolve_via_import_static_member_descent() {
+        let mut existing = BTreeSet::new();
+        existing.insert("src/factory.ts".to_string());
+        let mut import_mappings = BTreeMap::new();
+        import_mappings.insert(
+            "src/a.ts".to_string(),
+            vec![mapping("Factory", "Factory", "./factory")],
+        );
+        let class_node = {
+            let mut n = exported(node(
+                "class:Factory",
+                "Factory",
+                NodeKind::Class,
+                "src/factory.ts",
+                Language::TypeScript,
+            ));
+            n.qualified_name = "Factory".to_string();
+            n
+        };
+        let method = {
+            let mut n = node(
+                "method:create",
+                "create",
+                NodeKind::Method,
+                "src/factory.ts",
+                Language::TypeScript,
+            );
+            n.qualified_name = "Factory::create".to_string();
+            n
+        };
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            import_mappings,
+            nodes: vec![class_node, method],
+            ..Default::default()
+        };
+        let r = reference(
+            "Factory.create",
+            EdgeKind::Calls,
+            "src/a.ts",
+            Language::TypeScript,
+        );
+        let resolved = resolve_via_import(&r, &ctx).expect("resolves");
+        assert_eq!(resolved.target_node_id, "method:create");
+    }
+
+    #[test]
+    fn resolve_module_import_to_file_namespace() {
+        let mut existing = BTreeSet::new();
+        existing.insert("src/ns.ts".to_string());
+        let mut import_mappings = BTreeMap::new();
+        import_mappings.insert(
+            "src/a.ts".to_string(),
+            vec![ImportMapping {
+                local_name: "ns".to_string(),
+                exported_name: "*".to_string(),
+                source: "./ns".to_string(),
+                is_default: false,
+                is_namespace: true,
+            }],
+        );
+        let file = file_node("src/ns.ts", Language::TypeScript);
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            import_mappings,
+            nodes: vec![file],
+            ..Default::default()
+        };
+        let r = reference("ns", EdgeKind::Imports, "src/a.ts", Language::TypeScript);
+        let resolved = resolve_via_import(&r, &ctx).expect("resolves");
+        assert_eq!(resolved.target_node_id, "file:src/ns.ts");
+    }
+
+    #[test]
+    fn resolve_go_cross_package_reference_resolves_exported_member() {
+        let mut import_mappings = BTreeMap::new();
+        import_mappings.insert(
+            "main.go".to_string(),
+            vec![ImportMapping {
+                local_name: "pkga".to_string(),
+                exported_name: "*".to_string(),
+                source: "example.com/proj/pkga".to_string(),
+                is_default: false,
+                is_namespace: true,
+            }],
+        );
+        let target = {
+            let mut n = exported(node(
+                "function:FuncX",
+                "FuncX",
+                NodeKind::Function,
+                "pkga/x.go",
+                Language::Go,
+            ));
+            n.is_exported = true;
+            n
+        };
+        let mut existing = BTreeSet::new();
+        existing.insert("pkga/x.go".to_string());
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            file_contents: {
+                let mut m = BTreeMap::new();
+                m.insert("main.go".to_string(), "package main".to_string());
+                m
+            },
+            import_mappings,
+            nodes: vec![target],
+            go_module: Some(GoModule {
+                module_path: "example.com/proj".to_string(),
+            }),
+            ..Default::default()
+        };
+        let r = reference("pkga.FuncX", EdgeKind::Calls, "main.go", Language::Go);
+        let resolved = resolve_via_import(&r, &ctx).expect("resolves");
+        assert_eq!(resolved.target_node_id, "function:FuncX");
+    }
+
+    #[test]
+    fn resolve_python_module_member_resolves() {
+        let mut existing = BTreeSet::new();
+        existing.insert("pkg/mod.py".to_string());
+        let mut import_mappings = BTreeMap::new();
+        import_mappings.insert(
+            "app.py".to_string(),
+            vec![ImportMapping {
+                local_name: "mod".to_string(),
+                exported_name: "*".to_string(),
+                source: "pkg.mod".to_string(),
+                is_default: false,
+                is_namespace: true,
+            }],
+        );
+        let helper = node(
+            "function:helper",
+            "helper",
+            NodeKind::Function,
+            "pkg/mod.py",
+            Language::Python,
+        );
+        let mod_file = {
+            let mut n = file_node("pkg/mod.py", Language::Python);
+            n.name = "mod.py".to_string();
+            n
+        };
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            file_contents: {
+                let mut m = BTreeMap::new();
+                m.insert("app.py".to_string(), "import mod".to_string());
+                m
+            },
+            import_mappings,
+            nodes: vec![helper, mod_file],
+            ..Default::default()
+        };
+        let r = reference("mod.helper", EdgeKind::Calls, "app.py", Language::Python);
+        let resolved = resolve_via_import(&r, &ctx).expect("resolves");
+        assert_eq!(resolved.target_node_id, "function:helper");
+        assert_eq!(resolved.confidence, 0.85);
+    }
+
+    #[test]
+    fn resolve_python_absolute_module_import() {
+        let mod_file = file_node("a/b/c.py", Language::Python);
+        let name_file = {
+            let mut n = mod_file.clone();
+            n.name = "c.py".to_string();
+            n
+        };
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            file_contents: {
+                let mut m = BTreeMap::new();
+                m.insert("app.py".to_string(), "import a.b.c".to_string());
+                m
+            },
+            nodes: vec![name_file],
+            ..Default::default()
+        };
+        let r = reference("a.b.c", EdgeKind::Imports, "app.py", Language::Python);
+        let resolved = resolve_via_import(&r, &ctx).expect("resolves");
+        assert_eq!(resolved.target_node_id, "file:a/b/c.py");
+    }
+
+    #[test]
+    fn resolve_rust_path_reference_via_crate_root() {
+        let mut existing = BTreeSet::new();
+        existing.insert("src/lib.rs".to_string());
+        existing.insert("src/utils.rs".to_string());
+        let leaf = node(
+            "function:helper",
+            "helper",
+            NodeKind::Function,
+            "src/utils.rs",
+            Language::Rust,
+        );
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            file_contents: {
+                let mut m = BTreeMap::new();
+                m.insert(
+                    "src/main_mod.rs".to_string(),
+                    "use crate::utils::helper;".to_string(),
+                );
+                m
+            },
+            nodes: vec![leaf],
+            ..Default::default()
+        };
+        let r = reference(
+            "crate::utils::helper",
+            EdgeKind::Calls,
+            "src/main_mod.rs",
+            Language::Rust,
+        );
+        let resolved = resolve_via_import(&r, &ctx).expect("resolves");
+        assert_eq!(resolved.target_node_id, "function:helper");
+    }
+
+    #[test]
+    fn resolve_lua_require_dotted_module() {
+        let mut existing = BTreeSet::new();
+        existing.insert("game/lib/mod.lua".to_string());
+        let file = file_node("game/lib/mod.lua", Language::Lua);
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            file_contents: {
+                let mut m = BTreeMap::new();
+                m.insert(
+                    "game/main.lua".to_string(),
+                    "require('lib.mod')".to_string(),
+                );
+                m
+            },
+            nodes: vec![file],
+            ..Default::default()
+        };
+        let r = reference(
+            "game.lib.mod",
+            EdgeKind::Imports,
+            "game/main.lua",
+            Language::Lua,
+        );
+        let resolved = resolve_via_import(&r, &ctx).expect("resolves");
+        assert_eq!(resolved.target_node_id, "file:game/lib/mod.lua");
+    }
+
+    #[test]
+    fn resolve_java_imported_reference_qualified_member() {
+        let mut import_mappings = BTreeMap::new();
+        import_mappings.insert(
+            "Caller.java".to_string(),
+            vec![mapping("Utils", "Utils", "com.example.Utils")],
+        );
+        let member = node(
+            "method:doIt",
+            "doIt",
+            NodeKind::Method,
+            "com/example/Utils.java",
+            Language::Java,
+        );
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            file_contents: {
+                let mut m = BTreeMap::new();
+                m.insert(
+                    "Caller.java".to_string(),
+                    "import com.example.Utils;".to_string(),
+                );
+                m
+            },
+            import_mappings,
+            nodes: vec![member],
+            ..Default::default()
+        };
+        let r = reference("Utils.doIt", EdgeKind::Calls, "Caller.java", Language::Java);
+        let resolved = resolve_via_import(&r, &ctx).expect("resolves");
+        assert_eq!(resolved.target_node_id, "method:doIt");
+    }
+
+    #[test]
+    fn find_exported_symbol_follows_named_reexport_chain() {
+        let mut existing = BTreeSet::new();
+        existing.insert("src/index.ts".to_string());
+        existing.insert("src/impl.ts".to_string());
+        let mut re_exports = BTreeMap::new();
+        re_exports.insert(
+            "src/index.ts".to_string(),
+            vec![ReExport::Named {
+                exported_name: "Widget".to_string(),
+                original_name: "Widget".to_string(),
+                source: "./impl".to_string(),
+            }],
+        );
+        let target = exported(node(
+            "class:Widget",
+            "Widget",
+            NodeKind::Class,
+            "src/impl.ts",
+            Language::TypeScript,
+        ));
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            re_exports,
+            nodes: vec![target],
+            ..Default::default()
+        };
+        let want = Want {
+            is_default: false,
+            is_namespace: false,
+            exported_name: "Widget".to_string(),
+            member_name: None,
+        };
+        let found = find_exported_symbol(
+            "src/index.ts",
+            &want,
+            Language::TypeScript,
+            &ctx,
+            &mut BTreeSet::new(),
+            0,
+        )
+        .expect("found via re-export");
+        assert_eq!(found.id, "class:Widget");
+    }
+
+    #[test]
+    fn find_exported_symbol_follows_wildcard_reexport() {
+        let mut existing = BTreeSet::new();
+        existing.insert("src/index.ts".to_string());
+        existing.insert("src/impl.ts".to_string());
+        let mut re_exports = BTreeMap::new();
+        re_exports.insert(
+            "src/index.ts".to_string(),
+            vec![ReExport::Wildcard {
+                source: "./impl".to_string(),
+            }],
+        );
+        let target = exported(node(
+            "function:go",
+            "go",
+            NodeKind::Function,
+            "src/impl.ts",
+            Language::TypeScript,
+        ));
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            re_exports,
+            nodes: vec![target],
+            ..Default::default()
+        };
+        let want = Want {
+            is_default: false,
+            is_namespace: false,
+            exported_name: "go".to_string(),
+            member_name: None,
+        };
+        let found = find_exported_symbol(
+            "src/index.ts",
+            &want,
+            Language::TypeScript,
+            &ctx,
+            &mut BTreeSet::new(),
+            0,
+        )
+        .expect("found via wildcard");
+        assert_eq!(found.id, "function:go");
+    }
+
+    #[test]
+    fn find_exported_symbol_respects_depth_and_visited_guards() {
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            ..Default::default()
+        };
+        let want = Want {
+            is_default: false,
+            is_namespace: false,
+            exported_name: "x".to_string(),
+            member_name: None,
+        };
+        assert!(
+            find_exported_symbol(
+                "src/a.ts",
+                &want,
+                Language::TypeScript,
+                &ctx,
+                &mut BTreeSet::new(),
+                REEXPORT_MAX_DEPTH + 1,
+            )
+            .is_none()
+        );
+
+        let mut visited = BTreeSet::new();
+        visited.insert("src/a.ts".to_string());
+        assert!(
+            find_exported_symbol(
+                "src/a.ts",
+                &want,
+                Language::TypeScript,
+                &ctx,
+                &mut visited,
+                0,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn find_exported_symbol_default_and_namespace_hits() {
+        let comp = exported(node(
+            "component:C",
+            "C",
+            NodeKind::Component,
+            "src/c.tsx",
+            Language::Tsx,
+        ));
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            nodes: vec![comp],
+            ..Default::default()
+        };
+        let want_default = Want {
+            is_default: true,
+            is_namespace: false,
+            exported_name: "default".to_string(),
+            member_name: None,
+        };
+        let found = find_exported_symbol(
+            "src/c.tsx",
+            &want_default,
+            Language::Tsx,
+            &ctx,
+            &mut BTreeSet::new(),
+            0,
+        )
+        .expect("default hit");
+        assert_eq!(found.id, "component:C");
+
+        let member = exported(node(
+            "function:m",
+            "m",
+            NodeKind::Function,
+            "src/ns.ts",
+            Language::TypeScript,
+        ));
+        let ctx2 = TestContext {
+            project_root: "/proj".to_string(),
+            nodes: vec![member],
+            ..Default::default()
+        };
+        let want_ns = Want {
+            is_default: false,
+            is_namespace: true,
+            exported_name: "*".to_string(),
+            member_name: Some("m".to_string()),
+        };
+        let found2 = find_exported_symbol(
+            "src/ns.ts",
+            &want_ns,
+            Language::TypeScript,
+            &ctx2,
+            &mut BTreeSet::new(),
+            0,
+        )
+        .expect("namespace member hit");
+        assert_eq!(found2.id, "function:m");
+    }
+
+    #[test]
+    fn resolve_static_member_declines_non_container() {
+        let container = node(
+            "function:f",
+            "f",
+            NodeKind::Function,
+            "src/a.ts",
+            Language::TypeScript,
+        );
+        let ctx = TestContext::default();
+        let r = reference("f.x", EdgeKind::Calls, "src/a.ts", Language::TypeScript);
+        assert!(resolve_static_member(&container, &r, "f", &ctx).is_none());
+    }
+
+    #[test]
+    fn resolve_static_member_prefers_callable_for_calls() {
+        let container = {
+            let mut n = node(
+                "class:C",
+                "C",
+                NodeKind::Class,
+                "src/c.ts",
+                Language::TypeScript,
+            );
+            n.qualified_name = "C".to_string();
+            n
+        };
+        let method = {
+            let mut n = node(
+                "method:m",
+                "m",
+                NodeKind::Method,
+                "src/c.ts",
+                Language::TypeScript,
+            );
+            n.qualified_name = "C::m".to_string();
+            n
+        };
+        let prop = {
+            let mut n = node(
+                "variable:m",
+                "m",
+                NodeKind::Variable,
+                "src/c.ts",
+                Language::TypeScript,
+            );
+            n.qualified_name = "C::m".to_string();
+            n
+        };
+        let ctx = TestContext {
+            nodes: vec![prop, method],
+            ..Default::default()
+        };
+        let r = reference("C.m", EdgeKind::Calls, "src/x.ts", Language::TypeScript);
+        let resolved = resolve_static_member(&container, &r, "C", &ctx).expect("resolves");
+        assert_eq!(resolved.kind, NodeKind::Method);
+    }
+
+    #[test]
+    fn resolve_static_member_no_match_is_none() {
+        let container = {
+            let mut n = node(
+                "class:C",
+                "C",
+                NodeKind::Class,
+                "src/c.ts",
+                Language::TypeScript,
+            );
+            n.qualified_name = "C".to_string();
+            n
+        };
+        let ctx = TestContext::default();
+        let r = reference(
+            "C.missing",
+            EdgeKind::Calls,
+            "src/x.ts",
+            Language::TypeScript,
+        );
+        assert!(resolve_static_member(&container, &r, "C", &ctx).is_none());
+    }
+
+    #[test]
+    fn is_static_member_container_classification() {
+        assert!(is_static_member_container(NodeKind::Class));
+        assert!(is_static_member_container(NodeKind::Struct));
+        assert!(is_static_member_container(NodeKind::Interface));
+        assert!(is_static_member_container(NodeKind::Enum));
+        assert!(is_static_member_container(NodeKind::Trait));
+        assert!(is_static_member_container(NodeKind::Protocol));
+        assert!(!is_static_member_container(NodeKind::Function));
+    }
+
+    #[test]
+    fn drop_last_segment_behavior() {
+        assert_eq!(drop_last_segment("a/b/c"), vec!["a", "b"]);
+        assert_eq!(drop_last_segment("only"), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn find_python_module_file_via_module_and_init() {
+        let mod_file = {
+            let mut n = file_node("a/b/c.py", Language::Python);
+            n.name = "c.py".to_string();
+            n
+        };
+        let ctx = TestContext {
+            nodes: vec![mod_file],
+            ..Default::default()
+        };
+        assert_eq!(
+            find_python_module_file("a.b.c", &ctx, "app.py"),
+            Some("a/b/c.py".to_string())
+        );
+
+        let init_file = {
+            let mut n = file_node("a/b/__init__.py", Language::Python);
+            n.name = "__init__.py".to_string();
+            n
+        };
+        let ctx2 = TestContext {
+            nodes: vec![init_file],
+            ..Default::default()
+        };
+        assert_eq!(
+            find_python_module_file("a.b", &ctx2, "app.py"),
+            Some("a/b/__init__.py".to_string())
+        );
+    }
+
+    #[test]
+    fn find_python_module_file_rejects_empty_and_relative() {
+        let ctx = TestContext::default();
+        assert!(find_python_module_file("", &ctx, "app.py").is_none());
+        assert!(find_python_module_file(".rel", &ctx, "app.py").is_none());
+    }
+
+    #[test]
+    fn rust_self_module_dir_variants() {
+        assert_eq!(rust_self_module_dir("src/mod.rs"), "src");
+        assert_eq!(rust_self_module_dir("src/lib.rs"), "src");
+        assert_eq!(rust_self_module_dir("src/foo.rs"), "src/foo");
+        assert_eq!(rust_self_module_dir("foo.rs"), "foo");
+    }
+
+    #[test]
+    fn rust_crate_root_dir_walks_up() {
+        let mut existing = BTreeSet::new();
+        existing.insert("src/lib.rs".to_string());
+        let ctx = TestContext {
+            existing_files: existing,
+            ..Default::default()
+        };
+        assert_eq!(
+            rust_crate_root_dir("src/deep/mod.rs", &ctx),
+            Some("src".to_string())
+        );
+
+        let empty_ctx = TestContext::default();
+        assert!(rust_crate_root_dir("src/deep/mod.rs", &empty_ctx).is_none());
+    }
+
+    #[test]
+    fn resolve_rust_module_file_self_super_and_bare() {
+        let mut existing = BTreeSet::new();
+        existing.insert("src/lib.rs".to_string());
+        existing.insert("src/app/sub.rs".to_string());
+        existing.insert("src/sibling.rs".to_string());
+        let ctx = TestContext {
+            existing_files: existing,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_rust_module_file(&["self", "sub"], "src/app.rs", &ctx),
+            Some("src/app/sub.rs".to_string())
+        );
+        assert_eq!(
+            resolve_rust_module_file(&["super", "sibling"], "src/app/mod.rs", &ctx),
+            Some("src/sibling.rs".to_string())
+        );
+        assert!(resolve_rust_module_file(&[], "src/app.rs", &ctx).is_none());
+    }
+}

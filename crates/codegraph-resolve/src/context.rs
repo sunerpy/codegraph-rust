@@ -377,3 +377,291 @@ fn load_go_module(project_root: &str) -> Option<GoModule> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codegraph_core::types::{Edge, FileRecord, NodeKind};
+
+    fn temp_root(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let mut p = std::env::temp_dir();
+        p.push(format!("cg-ctx-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&p).expect("mkdir");
+        p
+    }
+
+    fn open_store(root: &std::path::Path) -> Store {
+        Store::open(&root.join("index.db")).expect("open store")
+    }
+
+    fn node(id: &str, name: &str, kind: NodeKind, file: &str, line: i64, col: i64) -> Node {
+        Node {
+            id: id.to_string(),
+            kind,
+            name: name.to_string(),
+            qualified_name: name.to_string(),
+            file_path: file.to_string(),
+            language: Language::TypeScript,
+            start_line: line,
+            end_line: line,
+            start_column: col,
+            end_column: col,
+            docstring: None,
+            signature: None,
+            visibility: None,
+            is_exported: false,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+            decorators: Vec::new(),
+            type_parameters: Vec::new(),
+            return_type: None,
+            updated_at: 0,
+        }
+    }
+
+    fn file_record(path: &str, count: i64) -> FileRecord {
+        FileRecord {
+            path: path.to_string(),
+            content_hash: "h".to_string(),
+            language: Language::TypeScript,
+            size: 0,
+            modified_at: 0,
+            indexed_at: 0,
+            node_count: count,
+            errors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn is_js_family_path_matches_extensions() {
+        for p in [
+            "a.ts", "a.tsx", "a.d.ts", "a.cts", "a.mts", "a.js", "a.jsx", "a.cjs", "a.mjs",
+        ] {
+            assert!(is_js_family_path(p), "{p} should be js-family");
+        }
+        assert!(is_js_family_path("A.TS"));
+        assert!(!is_js_family_path("a.py"));
+        assert!(!is_js_family_path("a.rs"));
+    }
+
+    #[test]
+    fn order_candidates_sorts_by_file_line_col_id() {
+        let mut nodes = vec![
+            node("z", "n", NodeKind::Function, "b.ts", 5, 0),
+            node("a", "n", NodeKind::Function, "a.ts", 2, 3),
+            node("b", "n", NodeKind::Function, "a.ts", 2, 1),
+            node("c", "n", NodeKind::Function, "a.ts", 1, 0),
+        ];
+        order_candidates(&mut nodes);
+        let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, vec!["c", "b", "a", "z"]);
+    }
+
+    #[test]
+    fn load_go_module_reads_module_line() {
+        let root = temp_root("gomod");
+        std::fs::write(root.join("go.mod"), "module example.com/proj\n\ngo 1.22\n").unwrap();
+        let gm = load_go_module(root.to_str().unwrap()).expect("go module");
+        assert_eq!(gm.module_path, "example.com/proj");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn load_go_module_none_when_absent_or_empty() {
+        let root = temp_root("nogomod");
+        assert!(load_go_module(root.to_str().unwrap()).is_none());
+        std::fs::write(root.join("go.mod"), "module\n").unwrap();
+        assert!(load_go_module(root.to_str().unwrap()).is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn store_context_node_lookups_and_caching() {
+        let root = temp_root("lookups");
+        let mut store = open_store(&root);
+        store.upsert_file(&file_record("a.ts", 2)).unwrap();
+        store
+            .upsert_nodes(&[
+                node("f1", "foo", NodeKind::Function, "a.ts", 1, 0),
+                node("c1", "Widget", NodeKind::Class, "a.ts", 5, 0),
+            ])
+            .unwrap();
+
+        let ctx = StoreResolutionContext::new(&store, root.to_str().unwrap());
+        assert_eq!(ctx.get_nodes_in_file("a.ts").len(), 2);
+        // Second call hits the cache path.
+        assert_eq!(ctx.get_nodes_in_file("a.ts").len(), 2);
+        assert_eq!(ctx.get_nodes_by_name("foo").len(), 1);
+        assert_eq!(ctx.get_nodes_by_name("foo").len(), 1);
+        assert_eq!(ctx.get_nodes_by_qualified_name("Widget").len(), 1);
+        assert_eq!(ctx.get_nodes_by_qualified_name("Widget").len(), 1);
+        assert_eq!(ctx.get_nodes_by_kind(NodeKind::Function).len(), 1);
+        assert_eq!(ctx.get_nodes_by_lower_name("foo").len(), 1);
+        assert_eq!(ctx.get_nodes_by_lower_name("foo").len(), 1);
+        assert!(ctx.get_node_by_id("f1").is_some());
+        assert!(ctx.get_node_by_id("missing").is_none());
+        assert!(ctx.known_node_names().contains(&"foo".to_string()));
+        assert_eq!(ctx.get_project_root(), root.to_str().unwrap());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn store_context_file_exists_and_read_file() {
+        let root = temp_root("files");
+        let store = open_store(&root);
+        store.upsert_file(&file_record("known.ts", 0)).unwrap();
+        std::fs::write(root.join("ondisk.ts"), "export const x = 1;\n").unwrap();
+
+        let ctx = StoreResolutionContext::new(&store, root.to_str().unwrap());
+        assert!(ctx.file_exists("known.ts"));
+        assert!(ctx.file_exists("ondisk.ts"));
+        assert!(!ctx.file_exists("nowhere.ts"));
+
+        let content = ctx.read_file("ondisk.ts").expect("read");
+        assert!(content.contains("export const x"));
+        // Cached second read.
+        assert!(ctx.read_file("ondisk.ts").is_some());
+        assert!(ctx.read_file("missing.ts").is_none());
+        assert!(ctx.read_file("missing.ts").is_none());
+
+        assert!(ctx.get_all_files().contains(&"known.ts".to_string()));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn store_context_import_mappings_and_re_exports() {
+        let root = temp_root("imports");
+        let store = open_store(&root);
+        std::fs::write(
+            root.join("a.ts"),
+            "import { foo } from './b';\nexport { foo } from './b';\nexport * from './c';\n",
+        )
+        .unwrap();
+        let ctx = StoreResolutionContext::new(&store, root.to_str().unwrap());
+        let mappings = ctx.get_import_mappings("a.ts", Language::TypeScript);
+        assert!(!mappings.is_empty());
+        // Cached second call.
+        assert!(
+            !ctx.get_import_mappings("a.ts", Language::TypeScript)
+                .is_empty()
+        );
+        let re = ctx.get_re_exports("a.ts", Language::TypeScript);
+        assert!(!re.is_empty());
+        assert!(!ctx.get_re_exports("a.ts", Language::TypeScript).is_empty());
+        // Missing file yields empty.
+        assert!(
+            ctx.get_import_mappings("gone.ts", Language::TypeScript)
+                .is_empty()
+        );
+        assert!(
+            ctx.get_re_exports("gone.ts", Language::TypeScript)
+                .is_empty()
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn store_context_project_config_caches() {
+        let root = temp_root("config");
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "paths": { "@/*": ["src/*"] } } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "workspaces": ["packages/*"] }"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("packages/ui")).unwrap();
+        std::fs::write(
+            root.join("packages/ui/package.json"),
+            r#"{ "name": "@app/ui" }"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("go.mod"), "module example.com/x\n").unwrap();
+
+        let store = open_store(&root);
+        let ctx = StoreResolutionContext::new(&store, root.to_str().unwrap());
+        assert!(ctx.get_project_aliases().is_some());
+        assert!(ctx.get_project_aliases().is_some());
+        assert!(ctx.get_workspace_packages().is_some());
+        assert!(ctx.get_workspace_packages().is_some());
+        assert!(ctx.get_go_module().is_some());
+        assert!(ctx.get_go_module().is_some());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn store_context_get_supertypes_reads_edges() {
+        let root = temp_root("supertypes");
+        let mut store = open_store(&root);
+        store.upsert_file(&file_record("a.ts", 2)).unwrap();
+        store
+            .upsert_nodes(&[
+                node("child", "Child", NodeKind::Class, "a.ts", 1, 0),
+                node("base", "Base", NodeKind::Interface, "a.ts", 5, 0),
+            ])
+            .unwrap();
+        store
+            .insert_edges(&[Edge {
+                id: None,
+                source: "child".to_string(),
+                target: "base".to_string(),
+                kind: EdgeKind::Implements,
+                metadata: None,
+                line: Some(1),
+                col: Some(0),
+                provenance: None,
+            }])
+            .unwrap();
+
+        let ctx = StoreResolutionContext::new(&store, root.to_str().unwrap());
+        let supers = ctx.get_supertypes("Child", Language::TypeScript);
+        assert_eq!(supers, vec!["Base".to_string()]);
+        // Unknown type yields empty.
+        assert!(ctx.get_supertypes("Nope", Language::TypeScript).is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn store_context_clear_caches_resets() {
+        let root = temp_root("clear");
+        let mut store = open_store(&root);
+        store.upsert_file(&file_record("a.ts", 1)).unwrap();
+        store
+            .upsert_nodes(&[node("f1", "foo", NodeKind::Function, "a.ts", 1, 0)])
+            .unwrap();
+        let ctx = StoreResolutionContext::new(&store, root.to_str().unwrap());
+        assert_eq!(ctx.get_nodes_by_name("foo").len(), 1);
+        ctx.clear_caches();
+        // Still correct after clearing (re-reads from store).
+        assert_eq!(ctx.get_nodes_by_name("foo").len(), 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pub_crate_helpers_delegate() {
+        let mut nodes = vec![
+            node("b", "n", NodeKind::Function, "b.ts", 1, 0),
+            node("a", "n", NodeKind::Function, "a.ts", 1, 0),
+        ];
+        order_candidates_pub(&mut nodes);
+        assert_eq!(nodes[0].id, "a");
+        assert!(is_js_family_path_pub("x.ts"));
+        assert!(!is_js_family_path_pub("x.py"));
+
+        let root = temp_root("helper-go");
+        std::fs::write(root.join("go.mod"), "module m/n\n").unwrap();
+        assert_eq!(
+            load_go_module_pub(root.to_str().unwrap()).map(|g| g.module_path),
+            Some("m/n".to_string())
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+}

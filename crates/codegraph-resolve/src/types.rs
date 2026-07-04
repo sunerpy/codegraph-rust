@@ -260,3 +260,267 @@ pub trait ResolutionContext {
 pub struct GoModule {
     pub module_path: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codegraph_core::types::{Language, Node, NodeKind};
+
+    #[test]
+    fn resolved_by_as_str_all_variants() {
+        assert_eq!(ResolvedBy::ExactMatch.as_str(), "exact-match");
+        assert_eq!(ResolvedBy::Import.as_str(), "import");
+        assert_eq!(ResolvedBy::QualifiedName.as_str(), "qualified-name");
+        assert_eq!(ResolvedBy::Framework.as_str(), "framework");
+        assert_eq!(ResolvedBy::Fuzzy.as_str(), "fuzzy");
+        assert_eq!(ResolvedBy::InstanceMethod.as_str(), "instance-method");
+        assert_eq!(ResolvedBy::FilePath.as_str(), "file-path");
+        assert_eq!(ResolvedBy::FunctionRef.as_str(), "function-ref");
+    }
+
+    #[test]
+    fn resolved_by_derives() {
+        let a = ResolvedBy::Import;
+        let b = a;
+        assert_eq!(a, b);
+        assert_ne!(ResolvedBy::Fuzzy, ResolvedBy::Import);
+        assert!(format!("{a:?}").contains("Import"));
+    }
+
+    fn sample_ref() -> RefView {
+        RefView {
+            from_node_id: "fn:1".to_string(),
+            reference_name: "foo".to_string(),
+            reference_kind: EdgeKind::Calls,
+            line: 3,
+            column: 5,
+            file_path: "src/a.ts".to_string(),
+            language: Language::TypeScript,
+            is_function_ref: false,
+            reference_subkind: None,
+        }
+    }
+
+    #[test]
+    fn ref_view_constructs_and_derives() {
+        let r = sample_ref();
+        assert_eq!(r.clone(), r);
+        assert_eq!(r.reference_kind, EdgeKind::Calls);
+        assert!(format!("{r:?}").contains("RefView"));
+    }
+
+    #[test]
+    fn ref_view_with_subkind() {
+        let mut r = sample_ref();
+        r.reference_subkind = Some(ReferenceSubkind::ScriptAttach);
+        r.is_function_ref = true;
+        assert_eq!(r.reference_subkind, Some(ReferenceSubkind::ScriptAttach));
+        assert!(r.is_function_ref);
+    }
+
+    #[test]
+    fn resolved_ref_constructs() {
+        let rr = ResolvedRef {
+            original: sample_ref(),
+            target_node_id: "fn:2".to_string(),
+            confidence: 0.75,
+            resolved_by: ResolvedBy::ExactMatch,
+        };
+        assert_eq!(rr.clone(), rr);
+        assert!((rr.confidence - 0.75).abs() < f64::EPSILON);
+        assert_eq!(rr.resolved_by, ResolvedBy::ExactMatch);
+    }
+
+    #[test]
+    fn resolution_stats_default_and_by_method() {
+        let mut stats = ResolutionStats::default();
+        assert_eq!(stats.total, 0);
+        stats.total = 10;
+        stats.resolved = 7;
+        stats.unresolved = 3;
+        stats.by_method.insert("import".to_string(), 4);
+        assert_eq!(stats.by_method.get("import"), Some(&4));
+        assert_eq!(stats.clone(), stats);
+    }
+
+    #[test]
+    fn resolution_result_default() {
+        let res = ResolutionResult::default();
+        assert!(res.resolved.is_empty());
+        assert!(res.unresolved.is_empty());
+        assert_eq!(res.stats.total, 0);
+    }
+
+    #[test]
+    fn import_mapping_constructs() {
+        let im = ImportMapping {
+            local_name: "X".to_string(),
+            exported_name: "Y".to_string(),
+            source: "./mod".to_string(),
+            is_default: true,
+            is_namespace: false,
+        };
+        assert_eq!(im.clone(), im);
+        assert!(im.is_default);
+        assert!(format!("{im:?}").contains("ImportMapping"));
+    }
+
+    #[test]
+    fn re_export_named_and_wildcard() {
+        let named = ReExport::Named {
+            exported_name: "A".to_string(),
+            original_name: "B".to_string(),
+            source: "./x".to_string(),
+        };
+        let wild = ReExport::Wildcard {
+            source: "./y".to_string(),
+        };
+        assert_eq!(named.clone(), named);
+        assert_ne!(named, wild);
+        assert!(format!("{wild:?}").contains("Wildcard"));
+    }
+
+    #[test]
+    fn framework_extraction_result_default() {
+        let r = FrameworkResolverExtractionResult::default();
+        assert!(r.nodes.is_empty());
+        assert!(r.references.is_empty());
+        let r2 = FrameworkResolverExtractionResult {
+            nodes: Vec::new(),
+            references: vec![sample_ref()],
+        };
+        assert_eq!(r2.references.len(), 1);
+    }
+
+    #[test]
+    fn go_module_constructs_and_derives() {
+        let gm = GoModule {
+            module_path: "example.com/mod".to_string(),
+        };
+        assert_eq!(gm.clone(), gm);
+        assert_eq!(gm.module_path, "example.com/mod");
+        assert!(format!("{gm:?}").contains("GoModule"));
+    }
+
+    fn node(name: &str, kind: NodeKind) -> Node {
+        Node {
+            id: format!("{kind:?}:{name}"),
+            kind,
+            name: name.to_string(),
+            qualified_name: name.to_string(),
+            file_path: "src/a.ts".to_string(),
+            language: Language::TypeScript,
+            start_line: 1,
+            end_line: 2,
+            start_column: 0,
+            end_column: 0,
+            docstring: None,
+            signature: None,
+            visibility: None,
+            is_exported: false,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+            decorators: Vec::new(),
+            type_parameters: Vec::new(),
+            return_type: None,
+            updated_at: 0,
+        }
+    }
+
+    /// Minimal context exercising the trait's DEFAULT method bodies (the
+    /// `known_node_names` loop and the always-empty optional-method defaults),
+    /// which the store/snapshot contexts override and so never cover.
+    struct MiniContext {
+        nodes: Vec<Node>,
+    }
+
+    impl ResolutionContext for MiniContext {
+        fn get_nodes_in_file(&self, _file_path: &str) -> Vec<Node> {
+            Vec::new()
+        }
+        fn get_nodes_by_name(&self, name: &str) -> Vec<Node> {
+            self.nodes
+                .iter()
+                .filter(|n| n.name == name)
+                .cloned()
+                .collect()
+        }
+        fn get_nodes_by_qualified_name(&self, _qualified_name: &str) -> Vec<Node> {
+            Vec::new()
+        }
+        fn get_nodes_by_kind(&self, kind: NodeKind) -> Vec<Node> {
+            self.nodes
+                .iter()
+                .filter(|n| n.kind == kind)
+                .cloned()
+                .collect()
+        }
+        fn file_exists(&self, _file_path: &str) -> bool {
+            false
+        }
+        fn read_file(&self, _file_path: &str) -> Option<String> {
+            None
+        }
+        fn get_project_root(&self) -> &str {
+            "/proj"
+        }
+        fn get_all_files(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn get_nodes_by_lower_name(&self, _lower_name: &str) -> Vec<Node> {
+            Vec::new()
+        }
+        fn get_node_by_id(&self, _id: &str) -> Option<Node> {
+            None
+        }
+        fn get_import_mappings(&self, _file_path: &str, _language: Language) -> Vec<ImportMapping> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn default_known_node_names_loops_all_kinds() {
+        let ctx = MiniContext {
+            nodes: vec![
+                node("Foo", NodeKind::Class),
+                node("bar", NodeKind::Function),
+            ],
+        };
+        let mut names = ctx.known_node_names();
+        names.sort();
+        assert_eq!(names, vec!["Foo".to_string(), "bar".to_string()]);
+    }
+
+    #[test]
+    fn default_optional_methods_return_empty() {
+        let ctx = MiniContext { nodes: Vec::new() };
+        assert!(ctx.get_supertypes("T", Language::TypeScript).is_empty());
+        assert!(ctx.get_project_aliases().is_none());
+        assert!(ctx.get_workspace_packages().is_none());
+        assert!(ctx.get_go_module().is_none());
+        assert!(ctx.get_re_exports("f.ts", Language::TypeScript).is_empty());
+        assert!(ctx.get_cpp_include_dirs().is_empty());
+    }
+
+    #[test]
+    fn mini_context_required_methods_exercised() {
+        let ctx = MiniContext {
+            nodes: vec![node("Foo", NodeKind::Class)],
+        };
+        assert!(ctx.get_nodes_in_file("a.ts").is_empty());
+        assert_eq!(ctx.get_nodes_by_name("Foo").len(), 1);
+        assert!(ctx.get_nodes_by_qualified_name("Foo").is_empty());
+        assert_eq!(ctx.get_nodes_by_kind(NodeKind::Class).len(), 1);
+        assert!(!ctx.file_exists("a.ts"));
+        assert!(ctx.read_file("a.ts").is_none());
+        assert_eq!(ctx.get_project_root(), "/proj");
+        assert!(ctx.get_all_files().is_empty());
+        assert!(ctx.get_nodes_by_lower_name("foo").is_empty());
+        assert!(ctx.get_node_by_id("x").is_none());
+        assert!(
+            ctx.get_import_mappings("a.ts", Language::TypeScript)
+                .is_empty()
+        );
+    }
+}

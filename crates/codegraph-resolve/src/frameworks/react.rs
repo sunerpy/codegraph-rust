@@ -643,3 +643,578 @@ fn page_ext_strip_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"/page\.(tsx?|jsx?)$").expect("page strip"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ImportMapping;
+    use codegraph_core::types::Node;
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct Ctx {
+        files: HashMap<String, String>,
+        nodes: Vec<Node>,
+    }
+
+    impl Ctx {
+        fn file(mut self, path: &str, content: &str) -> Self {
+            self.files.insert(path.to_string(), content.to_string());
+            self
+        }
+        fn node(mut self, n: Node) -> Self {
+            self.nodes.push(n);
+            self
+        }
+    }
+
+    impl ResolutionContext for Ctx {
+        fn get_nodes_in_file(&self, file_path: &str) -> Vec<Node> {
+            self.nodes
+                .iter()
+                .filter(|n| n.file_path == file_path)
+                .cloned()
+                .collect()
+        }
+        fn get_nodes_by_name(&self, name: &str) -> Vec<Node> {
+            self.nodes
+                .iter()
+                .filter(|n| n.name == name)
+                .cloned()
+                .collect()
+        }
+        fn get_nodes_by_qualified_name(&self, q: &str) -> Vec<Node> {
+            self.nodes
+                .iter()
+                .filter(|n| n.qualified_name == q)
+                .cloned()
+                .collect()
+        }
+        fn get_nodes_by_kind(&self, kind: NodeKind) -> Vec<Node> {
+            self.nodes
+                .iter()
+                .filter(|n| n.kind == kind)
+                .cloned()
+                .collect()
+        }
+        fn file_exists(&self, file_path: &str) -> bool {
+            self.files.contains_key(file_path)
+        }
+        fn read_file(&self, file_path: &str) -> Option<String> {
+            self.files.get(file_path).cloned()
+        }
+        fn get_project_root(&self) -> &str {
+            "/project"
+        }
+        fn get_all_files(&self) -> Vec<String> {
+            self.files.keys().cloned().collect()
+        }
+        fn get_nodes_by_lower_name(&self, lower: &str) -> Vec<Node> {
+            self.nodes
+                .iter()
+                .filter(|n| n.name.to_lowercase() == lower)
+                .cloned()
+                .collect()
+        }
+        fn get_node_by_id(&self, id: &str) -> Option<Node> {
+            self.nodes.iter().find(|n| n.id == id).cloned()
+        }
+        fn get_import_mappings(&self, _f: &str, _l: Language) -> Vec<ImportMapping> {
+            Vec::new()
+        }
+    }
+
+    fn mk_node(id: &str, kind: NodeKind, name: &str, file: &str, lang: Language) -> Node {
+        Node {
+            id: id.to_string(),
+            kind,
+            name: name.to_string(),
+            qualified_name: format!("{file}::{name}"),
+            file_path: file.to_string(),
+            language: lang,
+            start_line: 1,
+            end_line: 1,
+            start_column: 0,
+            end_column: 0,
+            docstring: None,
+            signature: None,
+            visibility: None,
+            is_exported: false,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+            decorators: Vec::new(),
+            type_parameters: Vec::new(),
+            return_type: None,
+            updated_at: 0,
+        }
+    }
+
+    fn a_ref(name: &str, kind: EdgeKind, file: &str, lang: Language) -> RefView {
+        RefView {
+            from_node_id: format!("from:{file}"),
+            reference_name: name.to_string(),
+            reference_kind: kind,
+            line: 1,
+            column: 0,
+            file_path: file.to_string(),
+            language: lang,
+            is_function_ref: false,
+            reference_subkind: None,
+        }
+    }
+
+    // -- pure-helper units --------------------------------------------------
+
+    #[test]
+    fn is_pascal_case_matches_and_rejects() {
+        assert!(is_pascal_case("Button"));
+        assert!(is_pascal_case("A"));
+        assert!(!is_pascal_case("button"));
+        assert!(!is_pascal_case("_X"));
+        assert!(!is_pascal_case(""));
+    }
+
+    #[test]
+    fn is_built_in_type_flags_known_and_passes_others() {
+        assert!(is_built_in_type("React"));
+        assert!(is_built_in_type("Fragment"));
+        assert!(!is_built_in_type("Button"));
+    }
+
+    #[test]
+    fn is_component_kind_covers_variants() {
+        assert!(is_component_kind(NodeKind::Component));
+        assert!(is_component_kind(NodeKind::Function));
+        assert!(is_component_kind(NodeKind::Class));
+        assert!(!is_component_kind(NodeKind::Variable));
+    }
+
+    #[test]
+    fn dir_of_and_line_of() {
+        assert_eq!(dir_of("src/a/b.tsx"), "src/a");
+        assert_eq!(dir_of("top.tsx"), "");
+        assert_eq!(line_of("a\nb\nc", 4), 3);
+        assert_eq!(line_of("abc", 0), 1);
+    }
+
+    #[test]
+    fn strip_context_suffix_cases() {
+        assert_eq!(strip_context_suffix("AuthContext"), "Auth");
+        assert_eq!(strip_context_suffix("ThemeProvider"), "Theme");
+        assert_eq!(strip_context_suffix("Plain"), "Plain");
+    }
+
+    // -- dep_present via detect --------------------------------------------
+
+    #[test]
+    fn detect_via_dev_dependency() {
+        let ctx = Ctx::default().file("package.json", r#"{"devDependencies":{"next":"14"}}"#);
+        assert!(ReactResolver.detect(&ctx));
+    }
+
+    #[test]
+    fn detect_via_react_native_dependency() {
+        let ctx = Ctx::default().file("package.json", r#"{"dependencies":{"react-native":"0.7"}}"#);
+        assert!(ReactResolver.detect(&ctx));
+    }
+
+    #[test]
+    fn detect_malformed_package_json_falls_through_to_file_scan() {
+        // Unparseable package.json is ignored; a .jsx file still triggers detection.
+        let ctx = Ctx::default()
+            .file("package.json", "not json {{{")
+            .file("src/App.jsx", "export default function App(){}");
+        assert!(ReactResolver.detect(&ctx));
+    }
+
+    #[test]
+    fn detect_false_when_no_signal() {
+        let ctx = Ctx::default().file("src/index.ts", "export const x = 1;");
+        assert!(!ReactResolver.detect(&ctx));
+    }
+
+    // -- resolve: hook directory preference --------------------------------
+
+    #[test]
+    fn resolve_hook_falls_back_to_first_when_no_hooks_dir() {
+        // No hooks/ directory, so the first candidate wins (react.ts:342).
+        let hook = mk_node(
+            "fn:src/util.ts:useThing:1",
+            NodeKind::Function,
+            "useThing",
+            "src/util.ts",
+            Language::TypeScript,
+        );
+        let ctx = Ctx::default().node(hook.clone());
+        let reference = a_ref("useThing", EdgeKind::Calls, "src/Page.tsx", Language::Tsx);
+        let r = ReactResolver.resolve(&reference, &ctx).expect("resolves");
+        assert_eq!(r.target_node_id, hook.id);
+        assert_eq!(r.confidence, 0.85);
+    }
+
+    #[test]
+    fn resolve_hook_none_when_not_a_use_function() {
+        // Candidate exists but is not a `use*` function -> no hook resolution.
+        let notf = mk_node(
+            "class:src/useThing.ts:useThing:1",
+            NodeKind::Class,
+            "useThing",
+            "src/useThing.ts",
+            Language::TypeScript,
+        );
+        let ctx = Ctx::default().node(notf);
+        let reference = a_ref("useThing", EdgeKind::Calls, "src/Page.tsx", Language::Tsx);
+        assert!(ReactResolver.resolve(&reference, &ctx).is_none());
+    }
+
+    #[test]
+    fn resolve_hook_short_use_name_skipped() {
+        // "use" alone (len == 3) is not a hook name.
+        let ctx = Ctx::default();
+        let reference = a_ref("use", EdgeKind::Calls, "src/Page.tsx", Language::Tsx);
+        assert!(ReactResolver.resolve(&reference, &ctx).is_none());
+    }
+
+    #[test]
+    fn resolve_context_strips_suffix_when_no_direct_match() {
+        // No `AuthProvider` node, but a base `Auth` node exists -> suffix strip
+        // fallback resolves to it (react.ts:351-357).
+        let base = mk_node(
+            "var:src/Auth.tsx:Auth:1",
+            NodeKind::Variable,
+            "Auth",
+            "src/Auth.tsx",
+            Language::Tsx,
+        );
+        let ctx = Ctx::default().node(base.clone());
+        let reference = a_ref(
+            "AuthProvider",
+            EdgeKind::References,
+            "src/App.tsx",
+            Language::Tsx,
+        );
+        let r = ReactResolver.resolve(&reference, &ctx).expect("resolves");
+        assert_eq!(r.target_node_id, base.id);
+    }
+
+    #[test]
+    fn resolve_context_prefers_context_dir() {
+        let far = mk_node(
+            "var:src/other/AuthContext.tsx:AuthContext:1",
+            NodeKind::Variable,
+            "AuthContext",
+            "src/other/AuthContext.tsx",
+            Language::Tsx,
+        );
+        let near = mk_node(
+            "var:src/context/AuthContext.tsx:AuthContext:1",
+            NodeKind::Variable,
+            "AuthContext",
+            "src/context/AuthContext.tsx",
+            Language::Tsx,
+        );
+        let ctx = Ctx::default().node(far).node(near.clone());
+        let reference = a_ref(
+            "AuthContext",
+            EdgeKind::References,
+            "src/App.tsx",
+            Language::Tsx,
+        );
+        let r = ReactResolver.resolve(&reference, &ctx).expect("resolves");
+        assert_eq!(r.target_node_id, near.id);
+    }
+
+    #[test]
+    fn resolve_context_none_when_no_candidate_and_no_base() {
+        let ctx = Ctx::default();
+        let reference = a_ref(
+            "MissingProvider",
+            EdgeKind::References,
+            "src/App.tsx",
+            Language::Tsx,
+        );
+        assert!(ReactResolver.resolve(&reference, &ctx).is_none());
+    }
+
+    #[test]
+    fn resolve_component_prefers_component_dir_over_ambiguous() {
+        // Two candidates in unrelated dirs, one under /components/ -> that wins.
+        let a = mk_node(
+            "component:src/a/Button.tsx:Button:1",
+            NodeKind::Component,
+            "Button",
+            "src/a/Button.tsx",
+            Language::Tsx,
+        );
+        let b = mk_node(
+            "component:src/components/Button.tsx:Button:1",
+            NodeKind::Component,
+            "Button",
+            "src/components/Button.tsx",
+            Language::Tsx,
+        );
+        let ctx = Ctx::default().node(a).node(b.clone());
+        let reference = a_ref(
+            "Button",
+            EdgeKind::References,
+            "src/z/Page.tsx",
+            Language::Tsx,
+        );
+        let r = ReactResolver.resolve(&reference, &ctx).expect("resolves");
+        assert_eq!(r.target_node_id, b.id);
+    }
+
+    #[test]
+    fn resolve_component_ambiguous_multiple_returns_none() {
+        // Two non-preferred candidates in different dirs -> ambiguous, None.
+        let a = mk_node(
+            "component:src/a/Button.tsx:Button:1",
+            NodeKind::Component,
+            "Button",
+            "src/a/Button.tsx",
+            Language::Tsx,
+        );
+        let b = mk_node(
+            "component:src/b/Button.tsx:Button:1",
+            NodeKind::Component,
+            "Button",
+            "src/b/Button.tsx",
+            Language::Tsx,
+        );
+        let ctx = Ctx::default().node(a).node(b);
+        let reference = a_ref(
+            "Button",
+            EdgeKind::References,
+            "src/z/Page.tsx",
+            Language::Tsx,
+        );
+        assert!(ReactResolver.resolve(&reference, &ctx).is_none());
+    }
+
+    #[test]
+    fn resolve_component_none_when_no_component_kind() {
+        let v = mk_node(
+            "var:src/Button.tsx:Button:1",
+            NodeKind::Variable,
+            "Button",
+            "src/Button.tsx",
+            Language::Tsx,
+        );
+        let ctx = Ctx::default().node(v);
+        let reference = a_ref(
+            "Button",
+            EdgeKind::References,
+            "src/Page.tsx",
+            Language::Tsx,
+        );
+        assert!(ReactResolver.resolve(&reference, &ctx).is_none());
+    }
+
+    #[test]
+    fn resolve_built_in_type_component_skipped() {
+        // PascalCase but a built-in type -> pattern 1 does not fire.
+        let ctx = Ctx::default();
+        let reference = a_ref("React", EdgeKind::References, "src/Page.tsx", Language::Tsx);
+        assert!(ReactResolver.resolve(&reference, &ctx).is_none());
+    }
+
+    // -- extract: component variants + JSX gate -----------------------------
+
+    #[test]
+    fn extract_arrow_component_with_jsx() {
+        let content = "export const Card = () => { return <div/>; };";
+        let result = ReactResolver
+            .extract("src/Card.jsx", content, "")
+            .expect("extract");
+        assert!(
+            result
+                .nodes
+                .iter()
+                .any(|n| n.kind == NodeKind::Component && n.name == "Card")
+        );
+    }
+
+    #[test]
+    fn extract_component_without_jsx_is_skipped() {
+        // A PascalCase function that returns no JSX must NOT be a component node.
+        let content = "export function Helper() { return 42; }";
+        let result = ReactResolver
+            .extract("src/Helper.tsx", content, "")
+            .expect("extract");
+        assert!(!result.nodes.iter().any(|n| n.kind == NodeKind::Component));
+    }
+
+    #[test]
+    fn extract_forward_ref_and_memo_components() {
+        let content =
+            "const Fancy = React.forwardRef(() => <div/>);\nconst Wrapped = memo(() => <span/>);";
+        let result = ReactResolver
+            .extract("src/W.tsx", content, "")
+            .expect("extract");
+        let names: Vec<&str> = result
+            .nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Component)
+            .map(|n| n.name.as_str())
+            .collect();
+        assert!(names.contains(&"Fancy"), "got {names:?}");
+        assert!(names.contains(&"Wrapped"), "got {names:?}");
+    }
+
+    #[test]
+    fn extract_custom_hook_node() {
+        let content = "export function useCounter() { return 0; }";
+        let result = ReactResolver
+            .extract("src/useCounter.ts", content, "")
+            .expect("extract");
+        let hook = result
+            .nodes
+            .iter()
+            .find(|n| n.name == "useCounter")
+            .expect("hook node");
+        assert_eq!(hook.kind, NodeKind::Function);
+        assert_eq!(hook.language, Language::TypeScript);
+        assert!(hook.is_exported);
+    }
+
+    #[test]
+    fn extract_hook_js_language_for_plain_js() {
+        let content = "const useX = () => 1;";
+        let result = ReactResolver
+            .extract("src/useX.js", content, "")
+            .expect("extract");
+        let hook = result
+            .nodes
+            .iter()
+            .find(|n| n.name == "useX")
+            .expect("hook");
+        assert_eq!(hook.language, Language::JavaScript);
+    }
+
+    #[test]
+    fn extract_route_element_attribute_variant() {
+        // <Route ... element={<Home/>}/> uses the element attr branch.
+        let content = "<Route path=\"/x\" element={<Home/>}/>";
+        let result = ReactResolver
+            .extract("src/App.tsx", content, "")
+            .expect("extract");
+        let route = result
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Route)
+            .expect("route");
+        assert_eq!(route.name, "/x");
+        assert!(result.references.iter().any(|r| r.reference_name == "Home"));
+    }
+
+    #[test]
+    fn extract_route_without_path_is_skipped() {
+        let content = "<Route element={<Home/>}/>";
+        let result = ReactResolver
+            .extract("src/App.tsx", content, "")
+            .expect("extract");
+        assert!(!result.nodes.iter().any(|n| n.kind == NodeKind::Route));
+    }
+
+    #[test]
+    fn extract_data_router_object_routes() {
+        let content =
+            "const r = createBrowserRouter([\n  { path: '/dash', element: <Dashboard/> },\n]);";
+        let result = ReactResolver
+            .extract("src/routes.tsx", content, "")
+            .expect("extract");
+        let route = result
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Route)
+            .expect("route");
+        assert_eq!(route.name, "/dash");
+        assert!(
+            result
+                .references
+                .iter()
+                .any(|r| r.reference_name == "Dashboard")
+        );
+    }
+
+    #[test]
+    fn extract_data_router_empty_path_becomes_root() {
+        let content = "createBrowserRouter([{ path: '', Component: Index }]);";
+        let result = ReactResolver
+            .extract("src/routes.tsx", content, "")
+            .expect("extract");
+        let route = result
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Route)
+            .expect("route");
+        assert_eq!(route.name, "/");
+    }
+
+    #[test]
+    fn extract_data_router_path_without_component_skipped() {
+        let content = "createBrowserRouter([{ path: '/only' }]);";
+        let result = ReactResolver
+            .extract("src/routes.tsx", content, "")
+            .expect("extract");
+        assert!(!result.nodes.iter().any(|n| n.kind == NodeKind::Route));
+    }
+
+    #[test]
+    fn extract_nextjs_app_page_route() {
+        let content = "export default function Page() { return <div/>; }";
+        let result = ReactResolver
+            .extract("app/blog/page.tsx", content, "")
+            .expect("extract");
+        let route = result
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Route)
+            .expect("route");
+        assert_eq!(route.name, "/blog");
+    }
+
+    #[test]
+    fn extract_nextjs_without_export_default_no_route() {
+        let content = "export function NotDefault() { return <div/>; }";
+        let result = ReactResolver
+            .extract("pages/x.tsx", content, "")
+            .expect("extract");
+        assert!(!result.nodes.iter().any(|n| n.kind == NodeKind::Route));
+    }
+
+    // -- file_path_to_route pure branches -----------------------------------
+
+    #[test]
+    fn file_path_to_route_pages_index_and_param() {
+        assert_eq!(file_path_to_route("pages/index.tsx").as_deref(), Some("/"));
+        assert_eq!(
+            file_path_to_route("pages/users/[id].tsx").as_deref(),
+            Some("/users/:id")
+        );
+    }
+
+    #[test]
+    fn file_path_to_route_app_page_and_missing_page() {
+        assert_eq!(
+            file_path_to_route("app/settings/page.tsx").as_deref(),
+            Some("/settings")
+        );
+        // app/ path but not a page.* file -> None.
+        assert_eq!(file_path_to_route("app/settings/layout.tsx"), None);
+    }
+
+    #[test]
+    fn file_path_to_route_underscore_and_config_and_nonpage() {
+        assert_eq!(file_path_to_route("pages/_app.tsx"), None);
+        assert_eq!(file_path_to_route("pages/next.config.js"), None);
+        // Neither pages/ nor app/ segment.
+        assert_eq!(file_path_to_route("src/routes/home.tsx"), None);
+    }
+
+    #[test]
+    fn file_path_to_route_app_index_becomes_root() {
+        assert_eq!(file_path_to_route("app/page.tsx").as_deref(), Some("/"));
+    }
+}

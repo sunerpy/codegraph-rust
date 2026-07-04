@@ -101,3 +101,90 @@ pub fn relative(from: &str, to: &str) -> String {
     }
     out.join("/")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_collapses_dot_and_dotdot() {
+        assert_eq!(normalize("a/./b/../c"), "a/c");
+        assert_eq!(normalize("a/b/../../c"), "c");
+        assert_eq!(normalize("./a/b"), "a/b");
+    }
+
+    #[test]
+    fn normalize_preserves_leading_dotdot_when_relative() {
+        assert_eq!(normalize("../a"), "../a");
+        assert_eq!(normalize("../../a/b"), "../../a/b");
+        assert_eq!(normalize("a/../../b"), "../b");
+    }
+
+    #[test]
+    fn normalize_absolute_drops_escaping_dotdot() {
+        assert_eq!(normalize("/a/b/../c"), "/a/c");
+        assert_eq!(normalize("/../a"), "/a");
+        assert_eq!(normalize("/a/../.."), "/");
+    }
+
+    #[test]
+    fn normalize_empty_and_dot_yield_dot() {
+        assert_eq!(normalize(""), ".");
+        assert_eq!(normalize("."), ".");
+        assert_eq!(normalize("a/.."), ".");
+    }
+
+    #[test]
+    fn normalize_root_only() {
+        assert_eq!(normalize("/"), "/");
+    }
+
+    #[test]
+    fn dirname_variants() {
+        assert_eq!(dirname("a/b/c"), "a/b");
+        assert_eq!(dirname("/a"), "/");
+        assert_eq!(dirname("noslash"), "");
+        assert_eq!(dirname("/a/b"), "/a");
+    }
+
+    #[test]
+    fn basename_variants() {
+        assert_eq!(basename("a/b/c"), "c");
+        assert_eq!(basename("/a"), "a");
+        assert_eq!(basename("noslash"), "noslash");
+        assert_eq!(basename("a/b/"), "");
+    }
+
+    #[test]
+    fn resolve_absolute_relative_wins() {
+        assert_eq!(resolve("/base/dir", "/abs/path"), "/abs/path");
+        assert_eq!(resolve("/base", "/abs/../x"), "/x");
+    }
+
+    #[test]
+    fn resolve_joins_and_normalizes() {
+        assert_eq!(resolve("base", "sub/file"), "base/sub/file");
+        assert_eq!(resolve("base/", "sub"), "base/sub");
+        assert_eq!(resolve("base/dir", "../other"), "base/other");
+    }
+
+    #[test]
+    fn resolve_empty_base_uses_relative() {
+        assert_eq!(resolve("", "a/b"), "a/b");
+        assert_eq!(resolve("", "./a"), "a");
+    }
+
+    #[test]
+    fn relative_computes_updots_and_forward() {
+        assert_eq!(relative("a/b", "a/c"), "../c");
+        assert_eq!(relative("a/b/c", "a/b"), "..");
+        assert_eq!(relative("a", "a/b/c"), "b/c");
+        assert_eq!(relative("a/b", "a/b"), "");
+    }
+
+    #[test]
+    fn relative_ignores_dot_and_empty_segments() {
+        assert_eq!(relative("./a/b", "a/c"), "../c");
+        assert_eq!(relative("a//b", "a/b"), "");
+    }
+}
