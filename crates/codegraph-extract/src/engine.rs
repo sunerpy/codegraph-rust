@@ -468,4 +468,121 @@ mod tests {
 
         fs::remove_dir_all(&project).ok();
     }
+
+    #[test]
+    fn extract_file_reads_and_parses_a_real_source_file() {
+        let project = unique_project("extract_file");
+        touch(&project, "src/lib.rs", "pub fn run() -> i32 { helper() }\n");
+        let result = extract_file(&project, "src/lib.rs").expect("extract file");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(
+            result.nodes.iter().any(|n| n.name == "run"),
+            "expected the run fn node: {:#?}",
+            result.nodes
+        );
+        fs::remove_dir_all(&project).ok();
+    }
+
+    #[test]
+    fn extract_project_merges_nodes_serially_and_in_parallel() {
+        let project = unique_project("extract_project");
+        touch(&project, "a.rs", "pub fn a() {}\n");
+        touch(&project, "b.rs", "pub fn b() {}\n");
+
+        let serial = ExtractOptions {
+            parallel: false,
+            ..ExtractOptions::default()
+        };
+        let merged = extract_project(&project, &serial).expect("serial extract");
+        assert!(merged.nodes.iter().any(|n| n.name == "a"));
+        assert!(merged.nodes.iter().any(|n| n.name == "b"));
+
+        let parallel = ExtractOptions::default();
+        let merged_par = extract_project(&project, &parallel).expect("parallel extract");
+        assert!(merged_par.nodes.iter().any(|n| n.name == "a"));
+        assert!(merged_par.nodes.iter().any(|n| n.name == "b"));
+
+        fs::remove_dir_all(&project).ok();
+    }
+
+    #[test]
+    fn extract_project_skips_over_size_limit_file_with_error() {
+        let project = unique_project("extract_project_big");
+        touch(&project, "small.rs", "pub fn ok() {}\n");
+        touch(&project, "big.rs", &"// x\n".repeat(64));
+
+        let options = ExtractOptions {
+            max_file_size: 8,
+            parallel: false,
+            ..ExtractOptions::default()
+        };
+        let merged = extract_project(&project, &options).expect("extract");
+        assert!(
+            merged.errors.iter().any(|e| e.contains("exceeds max size")),
+            "expected a size-skip error: {:?}",
+            merged.errors
+        );
+        fs::remove_dir_all(&project).ok();
+    }
+
+    #[test]
+    fn detect_language_unknown_for_extensionless_and_foreign_extensions() {
+        assert_eq!(detect_language("README"), Language::Unknown);
+        assert_eq!(detect_language("data.bin"), Language::Unknown);
+        assert_eq!(detect_language("project.godot"), Language::GodotProject);
+        assert_eq!(detect_language("src/lib.rs"), Language::Rust);
+    }
+
+    #[test]
+    fn extract_source_unknown_language_yields_empty_no_error() {
+        let result = extract_source("mystery.unknownext", "content", None);
+        assert!(result.nodes.is_empty());
+        assert!(
+            result.errors.is_empty(),
+            "unknown language must be silent: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn extract_source_file_level_only_language_is_empty() {
+        let result = extract_source("config.yaml", "a: 1\nb: 2\n", Some(Language::Yaml));
+        assert!(result.nodes.is_empty());
+        assert!(result.edges.is_empty());
+        assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn size_skip_result_formats_the_error_and_is_empty() {
+        let skip = size_skip_result("huge.rs", 100, 50);
+        assert!(skip.nodes.is_empty());
+        assert_eq!(skip.errors.len(), 1);
+        assert!(skip.errors[0].contains("100 > 50"));
+        assert!(skip.errors[0].contains("huge.rs"));
+    }
+
+    #[test]
+    fn is_ignored_by_patterns_matches_dir_prefix_and_suffix_forms() {
+        let patterns = vec!["dist/".to_string(), "gen".to_string(), "tmp*".to_string()];
+        assert!(is_ignored_by_patterns("dist/app.js", &patterns));
+        assert!(is_ignored_by_patterns("gen", &patterns));
+        assert!(is_ignored_by_patterns("src/gen", &patterns));
+        assert!(is_ignored_by_patterns("tmpfile.txt", &patterns));
+        assert!(!is_ignored_by_patterns("src/app.js", &patterns));
+    }
+
+    #[test]
+    fn scan_project_honors_root_gitignore() {
+        let project = unique_project("gitignore");
+        touch(&project, ".gitignore", "# comment\nvendor/\n\n*.log\n");
+        touch(&project, "src/main.rs", "fn main() {}\n");
+        touch(&project, "vendor/dep.rs", "pub fn dep() {}\n");
+        let files = scan_project(&project, &ExtractOptions::default()).expect("scan");
+        assert!(files.contains(&"src/main.rs".to_string()));
+        assert!(
+            !files.iter().any(|f| f.starts_with("vendor/")),
+            ".gitignore vendor/ must be skipped: {files:?}"
+        );
+        fs::remove_dir_all(&project).ok();
+    }
 }

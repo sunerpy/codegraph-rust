@@ -454,4 +454,168 @@ mod tests {
             "[codegraph debug] tool=codegraph_node projectPath_raw=(none) resolved=(unresolved) db=(none) db_exists=false cwd=(none) default_project=(none)"
         );
     }
+
+    #[test]
+    fn adopt_from_roots_result_uses_path_key_fallback() {
+        let project = indexed_project("path-key");
+        let home = home_dir().unwrap_or_else(std::env::temp_dir);
+        let mut default_project = Some(home);
+        let adopted = WorkspaceRoots::new().adopt_from_roots_result(
+            &mut default_project,
+            None,
+            Some(&json!({
+                "roots": [{ "path": project.path().display().to_string(), "name": "p" }]
+            })),
+        );
+        assert_eq!(adopted.as_deref(), Some(project.path()));
+        assert_eq!(default_project.as_deref(), Some(project.path()));
+    }
+
+    #[test]
+    fn adopt_from_roots_result_skips_root_without_uri_or_path() {
+        let project = indexed_project("skip-first");
+        let home = home_dir().unwrap_or_else(std::env::temp_dir);
+        let mut default_project = Some(home);
+        let adopted = WorkspaceRoots::new().adopt_from_roots_result(
+            &mut default_project,
+            None,
+            Some(&json!({
+                "roots": [
+                    { "name": "no-locator-here" },
+                    { "uri": format!("file://{}", project.path().display()), "name": "p" }
+                ]
+            })),
+        );
+        assert_eq!(adopted.as_deref(), Some(project.path()));
+    }
+
+    #[test]
+    fn adopt_from_roots_result_none_when_missing_roots_array() {
+        let mut default_project: Option<PathBuf> = None;
+        assert_eq!(
+            WorkspaceRoots::new().adopt_from_roots_result(
+                &mut default_project,
+                None,
+                Some(&json!({ "not_roots": [] })),
+            ),
+            None
+        );
+        assert_eq!(
+            WorkspaceRoots::new().adopt_from_roots_result(&mut default_project, None, None),
+            None
+        );
+    }
+
+    #[test]
+    fn adopt_path_returns_none_when_default_already_equals_path() {
+        let project = indexed_project("already");
+        let mut default_project = Some(project.path().to_path_buf());
+        let adopted = WorkspaceRoots::new().adopt_from_roots_result(
+            &mut default_project,
+            None,
+            Some(&json!({
+                "roots": [{ "uri": format!("file://{}", project.path().display()), "name": "p" }]
+            })),
+        );
+        assert_eq!(adopted, None, "re-adopting the current path is a no-op");
+        assert_eq!(default_project.as_deref(), Some(project.path()));
+    }
+
+    #[test]
+    fn adopt_from_initialize_root_path_key_adopts() {
+        let project = indexed_project("root-path");
+        let home = home_dir().unwrap_or_else(std::env::temp_dir);
+        let mut default_project = Some(home);
+        WorkspaceRoots::new().adopt_from_initialize(
+            &mut default_project,
+            None,
+            Some(&json!({ "rootPath": project.path().display().to_string() })),
+        );
+        assert_eq!(default_project.as_deref(), Some(project.path()));
+    }
+
+    #[test]
+    fn adopt_from_initialize_none_params_is_none() {
+        let mut default_project: Option<PathBuf> = None;
+        assert_eq!(
+            WorkspaceRoots::new().adopt_from_initialize(&mut default_project, None, None),
+            None
+        );
+    }
+
+    #[test]
+    fn adopt_from_initialize_empty_root_path_is_ignored() {
+        let mut default_project: Option<PathBuf> = None;
+        WorkspaceRoots::new().adopt_from_initialize(
+            &mut default_project,
+            None,
+            Some(&json!({ "rootPath": "" })),
+        );
+        assert_eq!(default_project, None, "empty rootPath yields no locator");
+    }
+
+    #[test]
+    fn should_request_roots_false_after_marked_requested() {
+        let home = home_dir().unwrap_or_else(std::env::temp_dir);
+        let mut roots = WorkspaceRoots::new();
+        roots.mark_roots_list_requested();
+        assert!(!roots.should_request_roots(
+            Some(&home),
+            None,
+            Some(&json!({ "capabilities": { "roots": {} } }))
+        ));
+    }
+
+    #[test]
+    fn should_request_roots_false_without_roots_capability() {
+        let home = home_dir().unwrap_or_else(std::env::temp_dir);
+        let roots = WorkspaceRoots::new();
+        assert!(!roots.should_request_roots(
+            Some(&home),
+            None,
+            Some(&json!({ "capabilities": { "sampling": {} } }))
+        ));
+    }
+
+    #[test]
+    fn file_uri_to_path_handles_authority_and_percent_encoding() {
+        assert_eq!(
+            file_uri_to_path("file://localhost/a%20b/c"),
+            Some(PathBuf::from("/a b/c"))
+        );
+        assert_eq!(
+            file_uri_to_path("file:///abs/path"),
+            Some(PathBuf::from("/abs/path"))
+        );
+    }
+
+    #[test]
+    fn file_uri_to_path_rejects_non_file_and_empty() {
+        assert_eq!(file_uri_to_path("http://example.com/x"), None);
+        assert_eq!(
+            file_uri_to_path("file://"),
+            None,
+            "empty path decodes to None"
+        );
+    }
+
+    #[test]
+    fn percent_decode_passes_through_invalid_and_trailing_percent() {
+        assert_eq!(percent_decode("plain"), "plain");
+        assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(percent_decode("a%"), "a%");
+        assert_eq!(percent_decode("a%2"), "a%2");
+        assert_eq!(percent_decode("%41%42"), "AB");
+    }
+
+    #[test]
+    fn db_path_for_honors_codegraph_dir_default() {
+        let p = Path::new("/proj");
+        let db = db_path_for(p);
+        assert!(
+            db.ends_with("codegraph.db"),
+            "db path ends with codegraph.db"
+        );
+        assert!(db.starts_with("/proj"), "under the project root");
+    }
 }

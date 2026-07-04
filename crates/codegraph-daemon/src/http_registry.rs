@@ -455,4 +455,97 @@ mod tests {
             candidate
         }
     }
+
+    #[test]
+    fn http_mode_as_str_matches_lowercase_variants() {
+        assert_eq!(HttpMode::Pinned.as_str(), "pinned");
+        assert_eq!(HttpMode::Global.as_str(), "global");
+    }
+
+    #[test]
+    fn now_millis_is_nonzero_and_monotonic_enough() {
+        let a = now_millis();
+        assert!(a > 0);
+        let b = now_millis();
+        assert!(b >= a);
+    }
+
+    #[test]
+    fn read_entry_absent_addr_returns_none() {
+        let _reg = TempRegistry::new("read-absent");
+        assert!(read_entry("127.0.0.1:65000").is_none());
+    }
+
+    #[test]
+    fn live_entries_prunes_dead_and_returns_only_live() {
+        let _reg = TempRegistry::new("live-entries");
+        write_entry(&sample(
+            "127.0.0.1:19020",
+            std::process::id(),
+            HttpMode::Pinned,
+        ))
+        .unwrap();
+        write_entry(&sample(
+            "127.0.0.1:19021",
+            pick_dead_pid(),
+            HttpMode::Global,
+        ))
+        .unwrap();
+        let live = live_entries();
+        let addrs: Vec<String> = live.into_iter().map(|i| i.addr).collect();
+        assert_eq!(addrs, vec!["127.0.0.1:19020".to_string()]);
+    }
+
+    #[test]
+    fn prune_dead_removes_unparseable_files() {
+        let reg = TempRegistry::new("prune-corrupt");
+        let corrupt = reg.dir.join("garbage.json");
+        fs::write(&corrupt, b"{ not valid json").unwrap();
+        prune_dead();
+        assert!(!corrupt.exists(), "corrupt registry file must be removed");
+    }
+
+    #[test]
+    fn list_entries_empty_when_registry_dir_missing() {
+        let _reg = TempRegistry::new("list-empty");
+        let _ = fs::remove_dir_all(&_reg.dir);
+        assert!(list_entries().is_empty());
+        assert!(prune_dead().is_empty());
+    }
+
+    #[test]
+    fn remove_entry_missing_returns_false() {
+        let _reg = TempRegistry::new("remove-missing");
+        assert!(!remove_entry("127.0.0.1:65001"));
+    }
+
+    #[test]
+    fn ensure_registry_dir_creates_the_directory() {
+        let _reg = TempRegistry::new("ensure-dir");
+        let _ = fs::remove_dir_all(&_reg.dir);
+        let dir = ensure_registry_dir().unwrap();
+        assert!(dir.exists());
+    }
+
+    #[test]
+    fn registry_dir_ignores_empty_override_env() {
+        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os(CODEGRAPH_HTTP_REGISTRY_DIR);
+        // SAFETY: guarded by ENV_LOCK; single-threaded within the guard.
+        unsafe { std::env::set_var(CODEGRAPH_HTTP_REGISTRY_DIR, "") };
+        let dir = registry_dir();
+        assert!(
+            dir.ends_with("http"),
+            "empty override falls back: {}",
+            dir.display()
+        );
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(CODEGRAPH_HTTP_REGISTRY_DIR, v),
+                None => std::env::remove_var(CODEGRAPH_HTTP_REGISTRY_DIR),
+            }
+        }
+        drop(guard);
+    }
 }

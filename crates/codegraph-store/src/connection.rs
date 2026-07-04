@@ -108,6 +108,17 @@ fn configure_connection(conn: &Connection) -> rusqlite::Result<()> {
 mod tests {
     use super::*;
 
+    fn temp_db_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "codegraph-conn-{label}-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
     #[test]
     fn pragmas_match_upstream_connection_settings() {
         let conn = Connection::open_in_memory().unwrap();
@@ -133,5 +144,65 @@ mod tests {
                 .unwrap(),
             2
         );
+    }
+
+    #[test]
+    fn open_creates_parent_dir_migrates_and_exposes_accessors() {
+        let base = std::env::temp_dir().join(format!(
+            "codegraph-conn-open-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db_path = base.join("nested").join("graph.db");
+        let store = Store::open(&db_path).expect("open creates nested dirs and migrates");
+
+        assert!(db_path.exists(), "db file created");
+        assert_eq!(store.path(), db_path.as_path());
+        assert_eq!(
+            store.schema_version().unwrap(),
+            crate::migrations::CURRENT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            store
+                .connection()
+                .query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
+                .unwrap()
+                .to_lowercase(),
+            "wal"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn reopening_existing_db_keeps_schema_version() {
+        let db_path = temp_db_path("reopen");
+        let v1 = Store::open(&db_path).unwrap().schema_version().unwrap();
+        let v2 = Store::open(&db_path).unwrap().schema_version().unwrap();
+        assert_eq!(v1, v2);
+        assert_eq!(v1, crate::migrations::CURRENT_SCHEMA_VERSION);
+
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", db_path.display()));
+        }
+    }
+
+    #[test]
+    fn open_on_unwritable_path_surfaces_open_error() {
+        let bogus = Path::new("/proc/definitely-not-writable/graph.db");
+        match Store::open(bogus) {
+            Ok(_) => panic!("open must fail on an unwritable location"),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    matches!(err, StoreError::CreateDir { .. } | StoreError::Open { .. }),
+                    "unexpected error variant: {msg}"
+                );
+            }
+        }
     }
 }

@@ -1218,3 +1218,598 @@ fn unvisited_neighbor_ids(edges: &[Edge], node_id: &str, visited: &HashSet<Strin
         .filter(|id| !visited.contains(id))
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db_path(test_name: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        path.push(format!(
+            "codegraph-graph-mod-{test_name}-{}-{nanos}.db",
+            std::process::id()
+        ));
+        path
+    }
+
+    fn node(id: &str, kind: NodeKind, name: &str, file_path: &str) -> Node {
+        Node {
+            id: id.to_string(),
+            kind,
+            name: name.to_string(),
+            qualified_name: name.to_string(),
+            file_path: file_path.to_string(),
+            language: Language::TypeScript,
+            start_line: 1,
+            end_line: 2,
+            start_column: 0,
+            end_column: 0,
+            docstring: None,
+            signature: None,
+            visibility: None,
+            is_exported: false,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+            decorators: Vec::new(),
+            type_parameters: Vec::new(),
+            return_type: None,
+            updated_at: 1,
+        }
+    }
+
+    fn edge(source: &str, target: &str, kind: EdgeKind) -> Edge {
+        Edge {
+            id: None,
+            source: source.to_string(),
+            target: target.to_string(),
+            kind,
+            metadata: None,
+            line: Some(3),
+            col: Some(0),
+            provenance: None,
+        }
+    }
+
+    fn id_set<I: IntoIterator<Item = String>>(ids: I) -> HashSet<String> {
+        ids.into_iter().collect()
+    }
+
+    #[test]
+    fn subgraph_ordered_nodes_follows_insertion_order() {
+        let mut graph = Subgraph::empty();
+        graph.set_node(node("b", NodeKind::Function, "b", "src/x.ts"));
+        graph.set_node(node("a", NodeKind::Function, "a", "src/x.ts"));
+        // Re-inserting an existing id does not reorder or duplicate.
+        graph.set_node(node("b", NodeKind::Function, "b", "src/x.ts"));
+
+        let ids: Vec<&str> = graph
+            .ordered_nodes()
+            .iter()
+            .map(|n| n.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["b", "a"]);
+    }
+
+    fn hierarchy_store(test_name: &str) -> Store {
+        // Base <- Middle <- Leaf via `extends`; Middle implements Iface.
+        let mut store = Store::open(&temp_db_path(test_name)).expect("open store");
+        store
+            .upsert_nodes(&[
+                node("class:base", NodeKind::Class, "Base", "src/h.ts"),
+                node("class:middle", NodeKind::Class, "Middle", "src/h.ts"),
+                node("class:leaf", NodeKind::Class, "Leaf", "src/h.ts"),
+                node("interface:iface", NodeKind::Interface, "Iface", "src/h.ts"),
+            ])
+            .expect("insert nodes");
+        store
+            .insert_edges(&[
+                edge("class:middle", "class:base", EdgeKind::Extends),
+                edge("class:leaf", "class:middle", EdgeKind::Extends),
+                edge("class:middle", "interface:iface", EdgeKind::Implements),
+            ])
+            .expect("insert edges");
+        store
+    }
+
+    #[test]
+    fn type_hierarchy_walks_ancestors_and_descendants() {
+        let store = hierarchy_store("hierarchy");
+        let traverser = GraphTraverser::new(&store);
+
+        // Upstream getTypeHierarchy shares ONE visited set between the ancestor
+        // and descendant walks, marking the focal node visited during the
+        // ancestor pass — so the descendant pass on the focal returns early and
+        // its own children are NOT re-discovered. This mirrors that contract:
+        // from Middle we get its ancestors (Base via extends, Iface via
+        // implements) plus the focal, but Leaf (a descendant of Middle) is not.
+        let graph = traverser
+            .get_type_hierarchy("class:middle")
+            .expect("hierarchy");
+        let got = id_set(graph.nodes.keys().cloned());
+        let want = id_set(["class:middle", "class:base", "interface:iface"].map(str::to_string));
+        assert_eq!(got, want);
+        assert_eq!(graph.roots, vec!["class:middle".to_string()]);
+    }
+
+    #[test]
+    fn type_hierarchy_from_ancestor_discovers_descendants() {
+        let store = hierarchy_store("hierarchy-desc");
+        let traverser = GraphTraverser::new(&store);
+
+        // Rooted at Leaf (a pure descendant), the ancestor walk climbs Middle ->
+        // Base and Middle's Iface; the descendant pass on Leaf then returns early
+        // (Leaf is already visited), which is the intended shared-visited contract.
+        let graph = traverser
+            .get_type_hierarchy("class:leaf")
+            .expect("hierarchy");
+        let got = id_set(graph.nodes.keys().cloned());
+        assert!(got.contains("class:leaf"));
+        assert!(got.contains("class:middle"));
+        assert!(got.contains("class:base"));
+        assert!(got.contains("interface:iface"));
+    }
+
+    #[test]
+    fn type_hierarchy_missing_node_is_empty() {
+        let store = hierarchy_store("hierarchy-missing");
+        let traverser = GraphTraverser::new(&store);
+        let graph = traverser.get_type_hierarchy("class:ghost").expect("empty");
+        assert!(graph.nodes.is_empty());
+        assert!(graph.roots.is_empty());
+    }
+
+    #[test]
+    fn find_usages_returns_all_incoming_sources() {
+        let mut store = Store::open(&temp_db_path("usages")).expect("open store");
+        store
+            .upsert_nodes(&[
+                node("function:target", NodeKind::Function, "target", "src/t.ts"),
+                node("function:c1", NodeKind::Function, "c1", "src/t.ts"),
+                node("function:c2", NodeKind::Function, "c2", "src/t.ts"),
+            ])
+            .expect("insert nodes");
+        store
+            .insert_edges(&[
+                edge("function:c1", "function:target", EdgeKind::Calls),
+                edge("function:c2", "function:target", EdgeKind::References),
+            ])
+            .expect("insert edges");
+
+        let traverser = GraphTraverser::new(&store);
+        let usages = traverser.find_usages("function:target").expect("usages");
+        let got = id_set(usages.iter().map(|u| u.node.id.clone()));
+        assert_eq!(
+            got,
+            id_set(["function:c1", "function:c2"].map(str::to_string))
+        );
+
+        // A symbol nobody references yields an empty usage list.
+        let none = traverser.find_usages("function:c1").expect("no usages");
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn get_call_graph_includes_focal_callers_and_callees() {
+        let mut store = Store::open(&temp_db_path("callgraph")).expect("open store");
+        store
+            .upsert_nodes(&[
+                node("function:caller", NodeKind::Function, "caller", "src/g.ts"),
+                node("function:focal", NodeKind::Function, "focal", "src/g.ts"),
+                node("function:callee", NodeKind::Function, "callee", "src/g.ts"),
+            ])
+            .expect("insert nodes");
+        store
+            .insert_edges(&[
+                edge("function:caller", "function:focal", EdgeKind::Calls),
+                edge("function:focal", "function:callee", EdgeKind::Calls),
+            ])
+            .expect("insert edges");
+
+        let traverser = GraphTraverser::new(&store);
+        let graph = traverser.get_call_graph("function:focal", 2).expect("cg");
+        let got = id_set(graph.nodes.keys().cloned());
+        assert_eq!(
+            got,
+            id_set(["function:caller", "function:focal", "function:callee"].map(str::to_string))
+        );
+
+        // Missing focal node yields an empty call graph.
+        let empty = traverser
+            .get_call_graph("function:ghost", 2)
+            .expect("empty");
+        assert!(empty.nodes.is_empty());
+    }
+
+    #[test]
+    fn dfs_node_kinds_filter_excludes_unwanted_kinds() {
+        let mut store = Store::open(&temp_db_path("dfs-filter")).expect("open store");
+        store
+            .upsert_nodes(&[
+                node("file:src/m.ts", NodeKind::File, "m.ts", "src/m.ts"),
+                node("function:fn", NodeKind::Function, "fn", "src/m.ts"),
+                node("class:cls", NodeKind::Class, "Cls", "src/m.ts"),
+            ])
+            .expect("insert nodes");
+        store
+            .insert_edges(&[
+                edge("file:src/m.ts", "function:fn", EdgeKind::Contains),
+                edge("file:src/m.ts", "class:cls", EdgeKind::Contains),
+            ])
+            .expect("insert edges");
+
+        let traverser = GraphTraverser::new(&store);
+        let opts = TraversalOptions {
+            node_kinds: vec![NodeKind::Function],
+            ..TraversalOptions::default()
+        };
+        // Only the Function child passes the node_kinds gate; Class is filtered.
+        let graph = traverser.traverse_dfs("file:src/m.ts", &opts).expect("dfs");
+        assert!(graph.nodes.contains_key("function:fn"));
+        assert!(!graph.nodes.contains_key("class:cls"));
+    }
+
+    #[test]
+    fn bfs_respects_limit_and_max_depth_and_incoming_direction() {
+        let mut store = Store::open(&temp_db_path("bfs-opts")).expect("open store");
+        store
+            .upsert_nodes(&[
+                node("function:a", NodeKind::Function, "a", "src/b.ts"),
+                node("function:b", NodeKind::Function, "b", "src/b.ts"),
+                node("function:c", NodeKind::Function, "c", "src/b.ts"),
+            ])
+            .expect("insert nodes");
+        store
+            .insert_edges(&[
+                edge("function:a", "function:b", EdgeKind::Calls),
+                edge("function:b", "function:c", EdgeKind::Calls),
+            ])
+            .expect("insert edges");
+
+        let traverser = GraphTraverser::new(&store);
+
+        // limit=1 stops after the start node is recorded.
+        let limited = traverser
+            .traverse_bfs(
+                "function:a",
+                &TraversalOptions {
+                    limit: 1,
+                    ..TraversalOptions::default()
+                },
+            )
+            .expect("bfs limit");
+        assert_eq!(limited.nodes.len(), 1);
+
+        // max_depth=1 reaches b but not c.
+        let depth1 = traverser
+            .traverse_bfs(
+                "function:a",
+                &TraversalOptions {
+                    max_depth: Some(1),
+                    ..TraversalOptions::default()
+                },
+            )
+            .expect("bfs depth");
+        assert!(depth1.nodes.contains_key("function:b"));
+        assert!(!depth1.nodes.contains_key("function:c"));
+
+        // Incoming direction from c reaches its caller b.
+        let incoming = traverser
+            .traverse_bfs(
+                "function:c",
+                &TraversalOptions {
+                    direction: Direction::Incoming,
+                    ..TraversalOptions::default()
+                },
+            )
+            .expect("bfs incoming");
+        assert!(incoming.nodes.contains_key("function:b"));
+
+        // Both direction from b reaches a (incoming) and c (outgoing).
+        let both = traverser
+            .traverse_bfs(
+                "function:b",
+                &TraversalOptions {
+                    direction: Direction::Both,
+                    ..TraversalOptions::default()
+                },
+            )
+            .expect("bfs both");
+        assert!(both.nodes.contains_key("function:a"));
+        assert!(both.nodes.contains_key("function:c"));
+    }
+
+    #[test]
+    fn bfs_exclude_start_node_omits_focal() {
+        let store = {
+            let mut s = Store::open(&temp_db_path("bfs-nostart")).expect("open store");
+            s.upsert_nodes(&[
+                node("function:a", NodeKind::Function, "a", "src/b.ts"),
+                node("function:b", NodeKind::Function, "b", "src/b.ts"),
+            ])
+            .expect("insert nodes");
+            s.insert_edges(&[edge("function:a", "function:b", EdgeKind::Calls)])
+                .expect("insert edges");
+            s
+        };
+        let traverser = GraphTraverser::new(&store);
+        let graph = traverser
+            .traverse_bfs(
+                "function:a",
+                &TraversalOptions {
+                    include_start: false,
+                    ..TraversalOptions::default()
+                },
+            )
+            .expect("bfs");
+        assert!(!graph.nodes.contains_key("function:a"));
+        assert!(graph.nodes.contains_key("function:b"));
+    }
+
+    #[test]
+    fn get_ancestors_missing_node_returns_empty() {
+        let store = Store::open(&temp_db_path("anc-missing")).expect("open store");
+        let traverser = GraphTraverser::new(&store);
+        let ancestors = traverser.get_ancestors("function:ghost").expect("anc");
+        assert!(ancestors.is_empty());
+    }
+
+    #[test]
+    fn get_children_of_leaf_is_empty() {
+        let mut store = Store::open(&temp_db_path("children-leaf")).expect("open store");
+        store
+            .upsert_nodes(&[node(
+                "function:leaf",
+                NodeKind::Function,
+                "leaf",
+                "src/x.ts",
+            )])
+            .expect("insert node");
+        let traverser = GraphTraverser::new(&store);
+        assert!(
+            traverser
+                .get_children("function:leaf")
+                .expect("kids")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn find_path_no_route_returns_none_and_missing_endpoints_none() {
+        let mut store = Store::open(&temp_db_path("path-none")).expect("open store");
+        store
+            .upsert_nodes(&[
+                node("function:x", NodeKind::Function, "x", "src/p.ts"),
+                node("function:y", NodeKind::Function, "y", "src/p.ts"),
+            ])
+            .expect("insert nodes");
+        let traverser = GraphTraverser::new(&store);
+        // No edge between x and y -> no path.
+        assert!(
+            traverser
+                .find_path("function:x", "function:y", &[])
+                .expect("path")
+                .is_none()
+        );
+        // Missing endpoints -> None.
+        assert!(
+            traverser
+                .find_path("function:ghost", "function:y", &[])
+                .expect("path")
+                .is_none()
+        );
+        assert!(
+            traverser
+                .find_path("function:x", "function:ghost", &[])
+                .expect("path")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn godot_dynamic_reach_signal_helpers() {
+        let empty = GodotDynamicReach::default();
+        assert!(!empty.is_dynamically_reachable());
+        assert!(!empty.has_any_signal());
+
+        let reached = GodotDynamicReach {
+            reached_by: vec![GodotReach::Autoload],
+            dynamic_unresolved: Vec::new(),
+        };
+        assert!(reached.is_dynamically_reachable());
+        assert!(reached.has_any_signal());
+
+        // Only unresolved sentinels: not reachable, but still carries a signal.
+        let sentinel = GodotDynamicReach {
+            reached_by: Vec::new(),
+            dynamic_unresolved: vec!["godot:dynamic:foo".to_string()],
+        };
+        assert!(!sentinel.is_dynamically_reachable());
+        assert!(sentinel.has_any_signal());
+    }
+
+    fn godot_node(
+        id: &str,
+        kind: NodeKind,
+        name: &str,
+        file_path: &str,
+        language: Language,
+    ) -> Node {
+        let mut n = node(id, kind, name, file_path);
+        n.language = language;
+        n
+    }
+
+    fn unresolved(
+        from_node_id: &str,
+        reference_name: &str,
+        file_path: &str,
+        language: Language,
+    ) -> codegraph_core::types::UnresolvedRef {
+        codegraph_core::types::UnresolvedRef {
+            id: None,
+            from_node_id: from_node_id.to_string(),
+            reference_name: reference_name.to_string(),
+            reference_kind: EdgeKind::References,
+            line: 1,
+            col: 0,
+            candidates: None,
+            file_path: file_path.to_string(),
+            language,
+            is_function_ref: false,
+            reference_subkind: None,
+        }
+    }
+
+    #[test]
+    fn godot_reachability_via_scene_name_link_and_dynamic_sentinel() {
+        let mut store = Store::open(&temp_db_path("godot-reach")).expect("open store");
+        // The symbol under test plus a source node the unresolved refs originate from.
+        store
+            .upsert_nodes(&[
+                godot_node(
+                    "method:on_hit",
+                    NodeKind::Method,
+                    "_on_hit",
+                    "src/player.gd",
+                    Language::Gdscript,
+                ),
+                godot_node(
+                    "file:scene",
+                    NodeKind::File,
+                    "main.tscn",
+                    "scenes/main.tscn",
+                    Language::GodotScene,
+                ),
+            ])
+            .expect("insert nodes");
+        // A scene-file unresolved ref name-matching the symbol -> SceneOrResourceLink.
+        // A godot:dynamic: sentinel originating from the symbol -> dynamic_unresolved.
+        store
+            .insert_unresolved_refs(&[
+                unresolved(
+                    "file:scene",
+                    "_on_hit",
+                    "scenes/main.tscn",
+                    Language::GodotScene,
+                ),
+                unresolved(
+                    "method:on_hit",
+                    "godot:dynamic:call_deferred",
+                    "src/player.gd",
+                    Language::Gdscript,
+                ),
+            ])
+            .expect("insert refs");
+
+        let traverser = GraphTraverser::new(&store);
+        let symbol = store.node_by_id("method:on_hit").unwrap().unwrap();
+        let reach = traverser
+            .godot_dynamic_reachability(&symbol)
+            .expect("reach");
+
+        assert!(reach.reached_by.contains(&GodotReach::SceneOrResourceLink));
+        assert!(reach.is_dynamically_reachable());
+        assert_eq!(
+            reach.dynamic_unresolved,
+            vec!["godot:dynamic:call_deferred".to_string()]
+        );
+    }
+
+    #[test]
+    fn godot_reachability_via_autoload_binding() {
+        let mut store = Store::open(&temp_db_path("godot-autoload")).expect("open store");
+        // A project.godot Constant whose signature binds an autoload to the symbol's file.
+        let mut autoload = godot_node(
+            "constant:autoload",
+            NodeKind::Constant,
+            "Game",
+            "project.godot",
+            Language::GodotProject,
+        );
+        autoload.signature = Some("autoload -> src/game.gd".to_string());
+        store
+            .upsert_nodes(&[
+                godot_node(
+                    "function:tick",
+                    NodeKind::Function,
+                    "tick",
+                    "src/game.gd",
+                    Language::Gdscript,
+                ),
+                autoload,
+            ])
+            .expect("insert nodes");
+
+        let traverser = GraphTraverser::new(&store);
+        let symbol = store.node_by_id("function:tick").unwrap().unwrap();
+        let reach = traverser
+            .godot_dynamic_reachability(&symbol)
+            .expect("reach");
+
+        assert!(reach.reached_by.contains(&GodotReach::Autoload));
+        assert!(reach.dynamic_unresolved.is_empty());
+    }
+
+    #[test]
+    fn godot_reachability_absent_for_plain_symbol() {
+        let mut store = Store::open(&temp_db_path("godot-none")).expect("open store");
+        store
+            .upsert_nodes(&[node(
+                "function:plain",
+                NodeKind::Function,
+                "plain",
+                "src/x.ts",
+            )])
+            .expect("insert node");
+        let traverser = GraphTraverser::new(&store);
+        let symbol = store.node_by_id("function:plain").unwrap().unwrap();
+        let reach = traverser
+            .godot_dynamic_reachability(&symbol)
+            .expect("reach");
+        assert!(!reach.has_any_signal());
+    }
+
+    #[test]
+    fn type_hierarchy_from_pure_ancestor_returns_only_focal() {
+        // Shared-visited contract: `type_ancestors(base)` marks base visited and
+        // finds no parents; `type_descendants(base)` then returns early because
+        // base is already visited. So a pure ancestor's hierarchy is just itself.
+        let store = hierarchy_store("descendants");
+        let traverser = GraphTraverser::new(&store);
+        let graph = traverser
+            .get_type_hierarchy("class:base")
+            .expect("hierarchy");
+        let got = id_set(graph.nodes.keys().cloned());
+        assert_eq!(got, id_set(["class:base"].map(str::to_string)));
+    }
+
+    #[test]
+    fn dfs_incoming_direction_walks_callers() {
+        let mut store = Store::open(&temp_db_path("dfs-incoming")).expect("open store");
+        store
+            .upsert_nodes(&[
+                node("function:a", NodeKind::Function, "a", "src/d.ts"),
+                node("function:b", NodeKind::Function, "b", "src/d.ts"),
+            ])
+            .expect("insert nodes");
+        store
+            .insert_edges(&[edge("function:a", "function:b", EdgeKind::Calls)])
+            .expect("insert edges");
+        let traverser = GraphTraverser::new(&store);
+        let graph = traverser
+            .traverse_dfs(
+                "function:b",
+                &TraversalOptions {
+                    direction: Direction::Incoming,
+                    ..TraversalOptions::default()
+                },
+            )
+            .expect("dfs");
+        assert!(graph.nodes.contains_key("function:a"));
+    }
+}

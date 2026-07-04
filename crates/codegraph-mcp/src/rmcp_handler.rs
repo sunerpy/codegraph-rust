@@ -829,3 +829,376 @@ mod timeout_tests {
         assert_eq!(parse_tool_timeout(Some("3.5")), default);
     }
 }
+
+#[cfg(test)]
+mod handler_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn unique_dir(tag: &str) -> TempDir {
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("cg-mcp-h-{tag}-{}-{seq}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        TempDir { path }
+    }
+
+    /// Write a placeholder (non-SQLite) db file so `db_path_for(p).is_file()` is
+    /// true — resolution treats the dir as indexed, but a real engine open fails.
+    fn placeholder_indexed(tag: &str) -> TempDir {
+        let dir = unique_dir(tag);
+        let db = db_path_for(&dir.path);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::fs::write(&db, b"not a real sqlite db").unwrap();
+        dir
+    }
+
+    #[test]
+    fn host_guard_from_env_open_when_unset_or_blank() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: serialized by ENV_LOCK; single-threaded within this body.
+        unsafe {
+            std::env::remove_var(ALLOWED_HOSTS_ENV);
+        }
+        assert_eq!(host_guard_from_env(), HostGuard::AllowAny);
+        unsafe {
+            std::env::set_var(ALLOWED_HOSTS_ENV, "   ");
+        }
+        assert_eq!(host_guard_from_env(), HostGuard::AllowAny, "blank is open");
+        unsafe {
+            std::env::remove_var(ALLOWED_HOSTS_ENV);
+        }
+    }
+
+    #[test]
+    fn host_guard_from_env_strict_when_concrete_list() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: serialized by ENV_LOCK; single-threaded within this body.
+        unsafe {
+            std::env::set_var(ALLOWED_HOSTS_ENV, "localhost,code-server:12025");
+        }
+        assert_eq!(
+            host_guard_from_env(),
+            HostGuard::Strict(vec![
+                "localhost".to_string(),
+                "code-server:12025".to_string()
+            ])
+        );
+        unsafe {
+            std::env::remove_var(ALLOWED_HOSTS_ENV);
+        }
+    }
+
+    #[test]
+    fn host_guard_from_env_star_is_open() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: serialized by ENV_LOCK; single-threaded within this body.
+        unsafe {
+            std::env::set_var(ALLOWED_HOSTS_ENV, "a,*,b");
+        }
+        assert_eq!(host_guard_from_env(), HostGuard::AllowAny);
+        unsafe {
+            std::env::remove_var(ALLOWED_HOSTS_ENV);
+        }
+    }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn build_http_config_allow_any_disables_guard() {
+        let addr: std::net::SocketAddr = "127.0.0.1:9100".parse().unwrap();
+        let cfg = build_http_config(addr, HostGuard::AllowAny);
+        assert!(
+            cfg.allowed_hosts.is_empty(),
+            "AllowAny must disable the allowlist"
+        );
+    }
+
+    #[test]
+    fn build_http_config_strict_carries_bind_and_loopback_defaults() {
+        let addr: std::net::SocketAddr = "0.0.0.0:12026".parse().unwrap();
+        let cfg = build_http_config(
+            addr,
+            HostGuard::Strict(vec!["code-server:12025".to_string()]),
+        );
+        let hosts = &cfg.allowed_hosts;
+        assert!(!hosts.is_empty(), "strict has an allowlist");
+        assert!(hosts.iter().any(|h| h == "0.0.0.0:12026"), "bind authority");
+        assert!(
+            hosts.iter().any(|h| h == "localhost:12026"),
+            "loopback:port"
+        );
+        assert!(hosts.iter().any(|h| h == "127.0.0.1:12026"));
+        assert!(hosts.iter().any(|h| h == "[::1]:12026"));
+        assert!(hosts.iter().any(|h| h == "localhost"));
+        assert!(hosts.iter().any(|h| h == "127.0.0.1"));
+        assert!(hosts.iter().any(|h| h == "::1"));
+        assert!(
+            hosts.iter().any(|h| h == "code-server:12025"),
+            "user host preserved"
+        );
+    }
+
+    #[test]
+    fn tool_result_to_call_result_maps_success_and_error() {
+        let ok = tool_result_to_call_result(&ToolResult::text("hello"));
+        assert_ne!(ok.is_error, Some(true), "text result is not an error");
+        assert_eq!(
+            ok.content
+                .iter()
+                .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+                .collect::<String>(),
+            "hello"
+        );
+
+        let err = tool_result_to_call_result(&ToolResult::error("boom"));
+        assert_eq!(err.is_error, Some(true), "error result flags isError");
+        let text: String = err
+            .content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect();
+        assert!(text.contains("boom"), "error text preserved: {text}");
+    }
+
+    #[test]
+    fn tools_from_schema_empty_on_non_array() {
+        assert!(tools_from_schema(json!({ "not": "an array" })).is_empty());
+        assert!(tools_from_schema(json!(null)).is_empty());
+    }
+
+    #[test]
+    fn tools_from_schema_builds_tool_with_annotations() {
+        let tools = tools_from_schema(json!([
+            {
+                "name": "t1",
+                "description": "d1",
+                "inputSchema": { "type": "object" },
+                "annotations": { "title": "T1", "readOnlyHint": true }
+            },
+            { "name": "t2" }
+        ]));
+        assert_eq!(tools.len(), 2);
+        assert_eq!(&*tools[0].name, "t1");
+        assert_eq!(tools[0].description.as_deref(), Some("d1"));
+        assert_eq!(&*tools[1].name, "t2");
+    }
+
+    #[test]
+    fn tools_from_schema_skips_entries_without_name() {
+        let tools = tools_from_schema(json!([
+            { "description": "no name here" },
+            { "name": "keep" }
+        ]));
+        assert_eq!(tools.len(), 1);
+        assert_eq!(&*tools[0].name, "keep");
+    }
+
+    #[test]
+    fn execute_owned_open_failure_returns_error_result() {
+        let project = placeholder_indexed("exec-open-fail");
+        let engines: EngineCache = Arc::new(Mutex::new(HashMap::new()));
+        let result = execute_owned(&engines, &project.path, "codegraph_search", &json!({}));
+        assert_eq!(result.is_error, Some(true));
+        let text: String = result.content.iter().map(|c| c.text.clone()).collect();
+        assert!(
+            text.contains("Failed to open project at"),
+            "open-failure message, got: {text}"
+        );
+    }
+
+    #[test]
+    fn new_sets_no_roots_and_snapshots_default() {
+        let project = placeholder_indexed("new-default");
+        let handler = CodeGraphHandler::new(Some(project.path.clone()));
+        assert!(handler.no_roots, "new() pins no_roots");
+        assert_eq!(
+            handler.default_project_snapshot().as_deref(),
+            Some(project.path.as_path())
+        );
+        assert!(handler.has_default_codegraph(), "placeholder db is indexed");
+    }
+
+    #[test]
+    fn http_constructor_pins_project() {
+        let project = placeholder_indexed("http-ctor");
+        let handler = CodeGraphHandler::http(project.path.clone());
+        assert!(handler.no_roots);
+        assert_eq!(
+            handler.default_project_snapshot().as_deref(),
+            Some(project.path.as_path())
+        );
+    }
+
+    #[test]
+    fn serve_with_roots_clears_no_roots() {
+        let handler = CodeGraphHandler::serve_with_roots(None, Some(PathBuf::from("/tmp")));
+        assert!(!handler.no_roots, "serve_with_roots enables adoption");
+    }
+
+    #[test]
+    fn has_default_codegraph_false_without_index() {
+        let dir = unique_dir("no-index");
+        let handler = CodeGraphHandler::new(Some(dir.path.clone()));
+        assert!(!handler.has_default_codegraph(), "no db file → not indexed");
+        let none = CodeGraphHandler::new(None);
+        assert!(!none.has_default_codegraph(), "no default → not indexed");
+    }
+
+    #[test]
+    fn resolve_project_arg_none_returns_indexed_default() {
+        let project = placeholder_indexed("resolve-none");
+        let handler = CodeGraphHandler::new_with_cwd(Some(project.path.clone()), None);
+        assert_eq!(
+            handler.resolve_project_arg(None).as_deref(),
+            Some(project.path.as_path())
+        );
+    }
+
+    #[test]
+    fn resolve_project_arg_none_unindexed_default_is_none() {
+        let dir = unique_dir("resolve-none-unidx");
+        let handler = CodeGraphHandler::new_with_cwd(Some(dir.path.clone()), None);
+        assert_eq!(handler.resolve_project_arg(None), None);
+    }
+
+    #[test]
+    fn resolve_project_arg_absolute_indexed_resolves() {
+        let project = placeholder_indexed("resolve-abs");
+        let raw = project.path.display().to_string();
+        let handler = CodeGraphHandler::new_with_cwd(None, None);
+        assert_eq!(
+            handler.resolve_project_arg(Some(&raw)).as_deref(),
+            Some(project.path.as_path())
+        );
+    }
+
+    #[test]
+    fn resolve_project_arg_relative_joins_cwd() {
+        let project = placeholder_indexed("resolve-rel");
+        let parent = project.path.parent().unwrap().to_path_buf();
+        let name = project.path.file_name().and_then(|s| s.to_str()).unwrap();
+        let handler = CodeGraphHandler::new_with_cwd(None, Some(parent));
+        assert_eq!(
+            handler.resolve_project_arg(Some(name)).as_deref(),
+            Some(project.path.as_path())
+        );
+    }
+
+    #[test]
+    fn resolve_project_arg_bare_basename_matches_default() {
+        let project = placeholder_indexed("resolve-basename");
+        let name = project
+            .path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap()
+            .to_string();
+        let cwd = std::env::temp_dir().join("cg-mcp-h-basename-elsewhere");
+        let handler = CodeGraphHandler::new_with_cwd(Some(project.path.clone()), Some(cwd));
+        assert_eq!(
+            handler.resolve_project_arg(Some(&name)).as_deref(),
+            Some(project.path.as_path())
+        );
+    }
+
+    #[test]
+    fn resolve_project_arg_bogus_is_none() {
+        let project = placeholder_indexed("resolve-bogus");
+        let handler = CodeGraphHandler::new_with_cwd(Some(project.path.clone()), None);
+        assert_eq!(
+            handler.resolve_project_arg(Some("no-such-project-xyz")),
+            None
+        );
+    }
+
+    #[test]
+    fn adopt_client_roots_adopts_indexed_root_and_returns_it() {
+        let project = placeholder_indexed("adopt-ok");
+        let handler = CodeGraphHandler::serve_with_roots(None, None);
+        let roots = json!({
+            "roots": [
+                { "uri": format!("file://{}", project.path.display()), "name": "p" }
+            ]
+        });
+        let adopted = handler.adopt_client_roots(&roots);
+        assert_eq!(adopted.as_deref(), Some(project.path.as_path()));
+        assert_eq!(
+            handler.default_project_snapshot().as_deref(),
+            Some(project.path.as_path()),
+            "default_project mutated in place"
+        );
+    }
+
+    #[test]
+    fn adopt_client_roots_returns_none_when_no_indexed_root() {
+        let handler = CodeGraphHandler::serve_with_roots(None, None);
+        let roots = json!({ "roots": [] });
+        assert_eq!(handler.adopt_client_roots(&roots), None);
+    }
+
+    fn workspace_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .canonicalize()
+            .expect("workspace root")
+    }
+
+    /// Materialize a real indexed project (golden mini db + fixture sources) so
+    /// `CodeGraphEngine::open` succeeds — the only way to reach the cache-insert
+    /// + `engine.execute` success arm of `execute_owned`.
+    fn real_indexed_project(tag: &str) -> TempDir {
+        let dir = unique_dir(tag);
+        let db = db_path_for(&dir.path);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let root = workspace_root();
+        std::fs::copy(root.join("reference/golden/mini/colby.db"), &db).unwrap();
+        let fixtures = root.join("crates/codegraph-bench/fixtures/mini");
+        for rel in ["src/app.ts", "src/math.ts"] {
+            let dst = dir.path.join(rel);
+            std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+            std::fs::copy(fixtures.join(rel), &dst).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn execute_owned_success_caches_engine_and_runs_tool() {
+        let project = real_indexed_project("exec-ok");
+        let engines: EngineCache = Arc::new(Mutex::new(HashMap::new()));
+        let first = execute_owned(
+            &engines,
+            &project.path,
+            "codegraph_search",
+            &json!({ "query": "add" }),
+        );
+        assert_ne!(first.is_error, Some(true), "search on indexed project");
+        assert!(
+            engines
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key(&project.path),
+            "engine cached after first open"
+        );
+        let second = execute_owned(
+            &engines,
+            &project.path,
+            "codegraph_search",
+            &json!({ "query": "add" }),
+        );
+        assert_ne!(second.is_error, Some(true), "cached engine reused");
+    }
+}

@@ -543,4 +543,185 @@ mod tests {
             "a pre-signaled wait must not park"
         );
     }
+
+    #[test]
+    fn verify_daemon_hello_accepts_matching_build() {
+        let hello = json!({
+            "codegraph": env!("CARGO_PKG_VERSION"),
+            "protocol": EXPECTED_PROTOCOL,
+        });
+        assert_eq!(verify_daemon_hello(&hello), None);
+    }
+
+    #[test]
+    fn verify_daemon_hello_rejects_version_or_protocol_divergence() {
+        let wrong_version = json!({ "codegraph": "0.0.0-nope", "protocol": EXPECTED_PROTOCOL });
+        assert_eq!(
+            verify_daemon_hello(&wrong_version),
+            Some(ProxyOutcome::VersionMismatch)
+        );
+        let wrong_protocol = json!({
+            "codegraph": env!("CARGO_PKG_VERSION"),
+            "protocol": EXPECTED_PROTOCOL + 1,
+        });
+        assert_eq!(
+            verify_daemon_hello(&wrong_protocol),
+            Some(ProxyOutcome::VersionMismatch)
+        );
+        let missing_fields = json!({ "unrelated": true });
+        assert_eq!(
+            verify_daemon_hello(&missing_fields),
+            Some(ProxyOutcome::VersionMismatch)
+        );
+    }
+
+    #[test]
+    fn reply_builds_jsonrpc_success_envelope() {
+        let line = reply(&json!(7), json!({ "ok": true }));
+        let parsed: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["jsonrpc"], json!("2.0"));
+        assert_eq!(parsed["id"], json!(7));
+        assert_eq!(parsed["result"]["ok"], json!(true));
+    }
+
+    #[test]
+    fn write_host_line_and_forward_to_daemon_frame_and_flush() {
+        let host_out = Arc::new(Mutex::new(Vec::<u8>::new()));
+        write_host_line(&host_out, "hello").unwrap();
+        let written = host_out.lock().unwrap().clone();
+        assert_eq!(String::from_utf8(written).unwrap(), "hello\n");
+
+        let mut daemon = Vec::<u8>::new();
+        forward_to_daemon(&mut daemon, "frame").unwrap();
+        assert_eq!(String::from_utf8(daemon).unwrap(), "frame\n");
+    }
+
+    #[test]
+    fn pump_host_to_daemon_answers_initialize_and_tools_list_locally() {
+        let host_in = std::io::Cursor::new(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n\
+             {\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n\
+             \n\
+             {\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\"}\n"
+                .as_bytes()
+                .to_vec(),
+        );
+        let mut daemon_sink = Vec::<u8>::new();
+        let host_out = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let suppressed: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+
+        pump_host_to_daemon(host_in, &mut daemon_sink, &host_out, &shutdown, &suppressed)
+            .expect("pump runs to host_in EOF");
+
+        let to_host = String::from_utf8(host_out.lock().unwrap().clone()).unwrap();
+        assert!(to_host.contains("\"id\":1"), "initialize answered locally");
+        assert!(to_host.contains("\"id\":2"), "tools/list answered locally");
+
+        let to_daemon = String::from_utf8(daemon_sink).unwrap();
+        assert!(
+            to_daemon.contains("initialize"),
+            "initialize forwarded to prime daemon"
+        );
+        assert!(to_daemon.contains("tools/call"), "other methods forwarded");
+        assert!(
+            !to_daemon.contains("tools/list"),
+            "tools/list not forwarded"
+        );
+
+        assert_eq!(
+            *suppressed.lock().unwrap(),
+            Some(json!(1)),
+            "the forwarded initialize id is recorded for reply suppression"
+        );
+    }
+
+    #[test]
+    fn pump_host_to_daemon_stops_when_shutdown_flagged() {
+        let host_in = std::io::Cursor::new(
+            "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"ping\"}\n"
+                .as_bytes()
+                .to_vec(),
+        );
+        let mut daemon_sink = Vec::<u8>::new();
+        let host_out = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let shutdown = Arc::new(AtomicBool::new(true));
+        let suppressed: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+
+        pump_host_to_daemon(host_in, &mut daemon_sink, &host_out, &shutdown, &suppressed)
+            .expect("pump exits promptly on a pre-set shutdown");
+        assert!(
+            daemon_sink.is_empty(),
+            "no line forwarded once shutdown is set"
+        );
+    }
+
+    #[test]
+    fn pump_daemon_to_host_suppresses_the_recorded_initialize_reply() {
+        let daemon_recv = std::io::Cursor::new(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"suppressed\":true}}\n\
+             {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"forwarded\":true}}\n\
+             \n"
+            .as_bytes()
+            .to_vec(),
+        );
+        let host_out = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let suppressed: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(Some(json!(1))));
+
+        pump_daemon_to_host(daemon_recv, &host_out, &suppressed).expect("drains to EOF");
+
+        let to_host = String::from_utf8(host_out.lock().unwrap().clone()).unwrap();
+        assert!(!to_host.contains("suppressed"), "id 1 reply is dropped");
+        assert!(to_host.contains("forwarded"), "id 3 reply is delivered");
+    }
+
+    #[test]
+    fn ppid_watchdog_guard_joins_cleanly_on_wake_signal() {
+        let wake = Arc::new(Shutdown::new());
+        let pump_shutdown = Arc::new(AtomicBool::new(false));
+        let guard = spawn_ppid_watchdog(Some(std::process::id()), Arc::clone(&wake), pump_shutdown);
+        wake.signal();
+        let start = Instant::now();
+        drop(guard);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "guard drop must join promptly after a wake signal"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_proxy_falls_back_on_version_mismatch_over_a_real_socket() {
+        use crate::transport::{Rendezvous, bind, connect};
+        use interprocess::local_socket::traits::Listener as _;
+        use std::io::Write as _;
+
+        let dir = std::env::temp_dir().join(format!(
+            "cg-proxy-mismatch-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket_path = dir.join("daemon.sock");
+        let rendezvous = Rendezvous::from_socket_path(&socket_path);
+        let listener = bind(&rendezvous).expect("bind listener");
+
+        let acceptor = thread::spawn(move || {
+            if let Ok(mut stream) = listener.accept() {
+                let hello = json!({ "codegraph": "0.0.0-wrong", "protocol": 1 }).to_string();
+                let _ = writeln!(stream, "{hello}");
+                let _ = stream.flush();
+            }
+        });
+
+        let host_in = std::io::Cursor::new(Vec::<u8>::new());
+        let host_out = Vec::<u8>::new();
+        let outcome = run_proxy(&socket_path, Some(std::process::id()), host_in, host_out)
+            .expect("proxy connects and reads the hello");
+        assert_eq!(outcome, ProxyOutcome::VersionMismatch);
+
+        let _ = acceptor.join();
+        let _ = connect(&rendezvous);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

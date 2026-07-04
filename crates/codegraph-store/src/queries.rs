@@ -1818,4 +1818,477 @@ mod tests {
             "insert_edges aborted under a concurrent endpoint deleter: {aborted:?}"
         );
     }
+
+    fn edge(source: &str, target: &str, kind: EdgeKind) -> Edge {
+        Edge {
+            id: None,
+            source: source.to_string(),
+            target: target.to_string(),
+            kind,
+            metadata: None,
+            line: None,
+            col: None,
+            provenance: None,
+        }
+    }
+
+    #[test]
+    fn node_lookups_by_kind_qualified_name_and_ids() {
+        let mut store = store("node-lookups");
+        let a = node("function:a", "alpha", "src/a.rs");
+        let mut b = node("class:b", "Beta", "src/b.rs");
+        b.kind = NodeKind::Class;
+        store.upsert_nodes(&[a.clone(), b.clone()]).unwrap();
+
+        assert_eq!(
+            store.nodes_by_kind(NodeKind::Function).unwrap(),
+            vec![a.clone()]
+        );
+        assert_eq!(
+            store.nodes_by_kind(NodeKind::Class).unwrap(),
+            vec![b.clone()]
+        );
+        assert!(store.nodes_by_kind(NodeKind::Enum).unwrap().is_empty());
+
+        assert_eq!(
+            store.nodes_by_qualified_name("src/a.rs::alpha").unwrap(),
+            vec![a.clone()]
+        );
+        assert!(store.nodes_by_qualified_name("missing").unwrap().is_empty());
+
+        assert!(store.nodes_by_ids(&[]).unwrap().is_empty());
+        let map = store
+            .nodes_by_ids(&[
+                "function:a".to_string(),
+                "class:b".to_string(),
+                "function:a".to_string(),
+                "does:not-exist".to_string(),
+            ])
+            .unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("function:a"), Some(&a));
+        assert_eq!(map.get("class:b"), Some(&b));
+
+        assert_eq!(store.node_count_by_file_path("src/a.rs").unwrap(), 1);
+        assert_eq!(store.node_count_by_file_path("nope").unwrap(), 0);
+    }
+
+    #[test]
+    fn all_node_names_returns_distinct_names() {
+        let mut store = store("all-names");
+        store
+            .upsert_nodes(&[
+                node("function:a", "shared", "src/a.rs"),
+                node("function:b", "shared", "src/b.rs"),
+                node("function:c", "unique", "src/c.rs"),
+            ])
+            .unwrap();
+        let mut names = store.all_node_names().unwrap();
+        names.sort();
+        assert_eq!(names, vec!["shared".to_string(), "unique".to_string()]);
+    }
+
+    #[test]
+    fn search_variants_filter_by_kind_and_language() {
+        let mut store = store("search-variants");
+        let mut func = node("function:f", "SearchTarget", "src/f.rs");
+        func.docstring = Some("primary target".to_string());
+        let mut class = node("class:c", "SearchTarget", "src/c.py");
+        class.kind = NodeKind::Class;
+        class.language = Language::Python;
+        store.upsert_nodes(&[func.clone(), class.clone()]).unwrap();
+
+        let filtered = store
+            .search_nodes_fts_filtered("SearchTarget", &[NodeKind::Function], &[], 10, 0)
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].node.id, "function:f");
+
+        let by_lang = store
+            .search_nodes_fts_filtered("SearchTarget", &[], &[Language::Python], 10, 0)
+            .unwrap();
+        assert_eq!(by_lang.len(), 1);
+        assert_eq!(by_lang[0].node.id, "class:c");
+
+        assert!(
+            store
+                .search_nodes_fts_filtered("", &[], &[], 10, 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.search_nodes_fts("   ", 10, 0).unwrap().is_empty());
+
+        let like = store.search_nodes_like("Search", &[], &[], 10, 0).unwrap();
+        assert_eq!(like.len(), 2);
+        assert!(like.iter().all(|r| r.score > 0.0));
+
+        let all = store
+            .search_all_by_filters(&[NodeKind::Function], &[], 10)
+            .unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].score, 1.0);
+        assert_eq!(all[0].node.id, "function:f");
+    }
+
+    #[test]
+    fn exact_name_lookups_nocase_and_filtered() {
+        let mut store = store("exact-name");
+        store
+            .upsert_nodes(&[
+                node("function:x", "Widget", "src/x.rs"),
+                node("function:y", "Widget", "src/y.rs"),
+            ])
+            .unwrap();
+
+        let nocase = store
+            .nodes_by_exact_name_nocase("widget", &[], &[])
+            .unwrap();
+        assert_eq!(nocase.len(), 2);
+
+        let filtered = store
+            .nodes_by_exact_name_filtered("Widget", &[NodeKind::Function], &[Language::Rust])
+            .unwrap();
+        assert_eq!(filtered.len(), 2);
+        assert!(
+            store
+                .nodes_by_exact_name_filtered("missing", &[], &[])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn edges_by_target_and_all_getters() {
+        let mut store = store("edges-target");
+        store
+            .upsert_nodes(&[
+                node("function:src", "src", "e.rs"),
+                node("function:dst", "dst", "e.rs"),
+            ])
+            .unwrap();
+        store
+            .insert_edges(&[
+                edge("function:src", "function:dst", EdgeKind::Calls),
+                edge("function:src", "function:dst", EdgeKind::References),
+            ])
+            .unwrap();
+
+        let incoming = store
+            .edges_by_target_kind("function:dst", Some(EdgeKind::Calls))
+            .unwrap();
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].kind, EdgeKind::Calls);
+        let all_incoming = store.edges_by_target_kind("function:dst", None).unwrap();
+        assert_eq!(all_incoming.len(), 2);
+        let all_outgoing = store.edges_by_source_kind("function:src", None).unwrap();
+        assert_eq!(all_outgoing.len(), 2);
+
+        assert_eq!(store.all_nodes().unwrap().len(), 2);
+        assert_eq!(store.all_edges().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn insert_edges_empty_is_noop() {
+        let mut store = store("edges-empty");
+        store.insert_edges(&[]).unwrap();
+        assert_eq!(store.all_edges().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn file_records_delete_and_aggregations() {
+        let mut store = store("files-agg");
+        store.upsert_file(&file("src/a.rs")).unwrap();
+        let mut py = file("src/b.py");
+        py.language = Language::Python;
+        store.upsert_file(&py).unwrap();
+        store
+            .upsert_nodes(&[node("function:a", "a", "src/a.rs")])
+            .unwrap();
+
+        let files = store.all_files().unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "src/a.rs");
+
+        let by_lang = store.file_counts_by_language().unwrap();
+        assert!(by_lang.contains(&("rust".to_string(), 1)));
+        assert!(by_lang.contains(&("python".to_string(), 1)));
+
+        let by_kind = store.node_counts_by_kind().unwrap();
+        assert_eq!(by_kind, vec![("function".to_string(), 1)]);
+
+        store.delete_file_record("src/a.rs").unwrap();
+        assert_eq!(store.file_by_path("src/a.rs").unwrap(), None);
+        assert_eq!(store.node_count_by_file_path("src/a.rs").unwrap(), 0);
+        assert_eq!(store.all_files().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unresolved_ref_batch_and_multi_key_reads() {
+        let mut store = store("unresolved-batch");
+        store
+            .upsert_nodes(&[
+                node("function:src1", "src1", "a.rs"),
+                node("function:src2", "src2", "b.rs"),
+            ])
+            .unwrap();
+        let mk = |from: &str, name: &str, file: &str, lang: Language| UnresolvedRef {
+            id: None,
+            from_node_id: from.to_string(),
+            reference_name: name.to_string(),
+            reference_kind: EdgeKind::References,
+            line: 1,
+            col: 0,
+            candidates: None,
+            file_path: file.to_string(),
+            language: lang,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+        store
+            .insert_unresolved_refs(&[
+                mk("function:src1", "Target", "a.rs", Language::Rust),
+                mk("function:src2", "Other", "b.rs", Language::Rust),
+            ])
+            .unwrap();
+
+        assert_eq!(store.unresolved_refs_count().unwrap(), 2);
+
+        let first = store.unresolved_refs_batch(0, 1).unwrap();
+        assert_eq!(first.len(), 1);
+        let after = store
+            .unresolved_refs_batch(first[0].id.unwrap(), 10)
+            .unwrap();
+        assert_eq!(after.len(), 1);
+
+        assert!(store.unresolved_refs_by_files(&[]).unwrap().is_empty());
+        assert!(store.unresolved_refs_by_names(&[]).unwrap().is_empty());
+        let by_files = store
+            .unresolved_refs_by_files(&["a.rs".to_string(), "b.rs".to_string(), "a.rs".to_string()])
+            .unwrap();
+        assert_eq!(by_files.len(), 2);
+        let by_names = store
+            .unresolved_refs_by_names(&["Target".to_string()])
+            .unwrap();
+        assert_eq!(by_names.len(), 1);
+        assert_eq!(by_names[0].reference_name, "Target");
+    }
+
+    #[test]
+    fn function_ref_flag_round_trips_through_unresolved_refs() {
+        let mut store = store("fn-ref");
+        store
+            .upsert_nodes(&[node("function:src", "src", "a.rs")])
+            .unwrap();
+        let unresolved = UnresolvedRef {
+            id: None,
+            from_node_id: "function:src".to_string(),
+            reference_name: "callback".to_string(),
+            reference_kind: EdgeKind::References,
+            line: 1,
+            col: 0,
+            candidates: None,
+            file_path: "a.rs".to_string(),
+            language: Language::Rust,
+            is_function_ref: true,
+            reference_subkind: Some(ReferenceSubkind::Autoload),
+        };
+        store
+            .insert_unresolved_refs(std::slice::from_ref(&unresolved))
+            .unwrap();
+        let read = store.all_unresolved_refs().unwrap();
+        assert_eq!(read.len(), 1);
+        assert!(read[0].is_function_ref);
+        assert_eq!(read[0].reference_kind, EdgeKind::References);
+        assert_eq!(read[0].reference_subkind, Some(ReferenceSubkind::Autoload));
+    }
+
+    #[test]
+    fn insert_unresolved_refs_empty_is_noop() {
+        let mut store = store("unresolved-empty");
+        store.insert_unresolved_refs(&[]).unwrap();
+        assert_eq!(store.unresolved_refs_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn delete_resolved_refs_precise_and_bounded() {
+        let mut store = store("delete-resolved");
+        store
+            .upsert_nodes(&[node("function:src", "src", "a.rs")])
+            .unwrap();
+        let mk = |name: &str| UnresolvedRef {
+            id: None,
+            from_node_id: "function:src".to_string(),
+            reference_name: name.to_string(),
+            reference_kind: EdgeKind::Calls,
+            line: 1,
+            col: 0,
+            candidates: None,
+            file_path: "a.rs".to_string(),
+            language: Language::Rust,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+        store
+            .insert_unresolved_refs(&[mk("Alpha"), mk("Beta"), mk("Gamma")])
+            .unwrap();
+        assert_eq!(store.unresolved_refs_count().unwrap(), 3);
+
+        store.delete_resolved_unresolved_refs(&[]).unwrap();
+        store
+            .delete_resolved_unresolved_refs_up_to(&[], 100)
+            .unwrap();
+        assert_eq!(store.unresolved_refs_count().unwrap(), 3);
+
+        store
+            .delete_resolved_unresolved_refs(&[(
+                "function:src".to_string(),
+                "Alpha".to_string(),
+                EdgeKind::Calls,
+            )])
+            .unwrap();
+        assert_eq!(store.unresolved_refs_count().unwrap(), 2);
+
+        let rows = store.all_unresolved_refs().unwrap();
+        let max_id = rows.iter().map(|r| r.id.unwrap()).min().unwrap();
+        store
+            .delete_resolved_unresolved_refs_up_to(
+                &[(
+                    "function:src".to_string(),
+                    "Beta".to_string(),
+                    EdgeKind::Calls,
+                )],
+                max_id,
+            )
+            .unwrap();
+        assert!(store.unresolved_refs_count().unwrap() <= 2);
+    }
+
+    #[test]
+    fn dependency_and_dependent_file_paths_cross_file_only() {
+        let mut store = store("file-deps");
+        store
+            .upsert_nodes(&[
+                node("function:caller", "caller", "a.rs"),
+                node("function:callee", "callee", "b.rs"),
+                node("function:local", "local", "a.rs"),
+            ])
+            .unwrap();
+        store
+            .insert_edges(&[
+                edge("function:caller", "function:callee", EdgeKind::Calls),
+                edge("function:caller", "function:local", EdgeKind::Contains),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            store.dependent_file_paths("b.rs").unwrap(),
+            vec!["a.rs".to_string()]
+        );
+        assert_eq!(
+            store.dependency_file_paths("a.rs").unwrap(),
+            vec!["b.rs".to_string()]
+        );
+        assert!(store.dependent_file_paths("a.rs").unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_resolved_edges_and_named_target_sources() {
+        let mut store = store("resolved-edges");
+        store
+            .upsert_nodes(&[
+                node("function:caller", "caller", "a.rs"),
+                node("function:callee", "callee", "b.rs"),
+            ])
+            .unwrap();
+        store
+            .insert_edges(&[
+                edge("function:caller", "function:callee", EdgeKind::Calls),
+                edge("function:caller", "function:callee", EdgeKind::Contains),
+            ])
+            .unwrap();
+
+        assert!(
+            store
+                .source_files_of_edges_to_named_targets(&[])
+                .unwrap()
+                .is_empty()
+        );
+        let sources = store
+            .source_files_of_edges_to_named_targets(&["callee".to_string()])
+            .unwrap();
+        assert_eq!(sources, vec!["a.rs".to_string()]);
+
+        let removed = store.delete_resolved_edges_from_file("a.rs").unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(store.all_edges().unwrap().len(), 1);
+        assert_eq!(store.all_edges().unwrap()[0].kind, EdgeKind::Contains);
+    }
+
+    #[test]
+    fn counts_reflects_nodes_edges_files() {
+        let mut store = store("counts");
+        store.upsert_file(&file("a.rs")).unwrap();
+        store
+            .upsert_nodes(&[
+                node("function:a", "a", "a.rs"),
+                node("function:b", "b", "a.rs"),
+            ])
+            .unwrap();
+        store
+            .insert_edges(&[edge("function:a", "function:b", EdgeKind::Calls)])
+            .unwrap();
+        let counts = store.counts().unwrap();
+        assert_eq!(counts.node_count, 2);
+        assert_eq!(counts.edge_count, 1);
+        assert_eq!(counts.file_count, 1);
+    }
+
+    #[test]
+    fn compact_and_bulk_pragmas_preserve_content() {
+        let mut store = store("compact");
+        store
+            .upsert_nodes(&[node("function:a", "a", "a.rs")])
+            .unwrap();
+        store.set_bulk_index_pragmas().unwrap();
+        store.restore_default_pragmas().unwrap();
+        store.compact().unwrap();
+        assert_eq!(store.counts().unwrap().node_count, 1);
+    }
+
+    #[test]
+    fn upsert_node_updates_existing_row_in_place() {
+        let mut store = store("upsert-update");
+        let mut n = node("function:u", "before", "u.rs");
+        store.upsert_nodes(std::slice::from_ref(&n)).unwrap();
+        n.name = "after".to_string();
+        n.qualified_name = "u.rs::after".to_string();
+        n.return_type = Some("i32".to_string());
+        store.upsert_nodes(std::slice::from_ref(&n)).unwrap();
+        assert_eq!(store.counts().unwrap().node_count, 1);
+        let read = store.node_by_id("function:u").unwrap().unwrap();
+        assert_eq!(read.name, "after");
+        assert_eq!(read.return_type, Some("i32".to_string()));
+    }
+
+    #[test]
+    fn delete_nodes_by_file_path_removes_all_file_nodes() {
+        let mut store = store("delete-by-file");
+        store
+            .upsert_nodes(&[
+                node("function:a", "a", "x.rs"),
+                node("function:b", "b", "x.rs"),
+                node("function:c", "c", "y.rs"),
+            ])
+            .unwrap();
+        let removed = store.delete_nodes_by_file_path("x.rs").unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(store.node_count_by_file_path("x.rs").unwrap(), 0);
+        assert_eq!(store.node_count_by_file_path("y.rs").unwrap(), 1);
+    }
+
+    #[test]
+    fn node_by_id_missing_returns_none() {
+        let store = store("missing-node");
+        assert_eq!(store.node_by_id("nope").unwrap(), None);
+    }
 }

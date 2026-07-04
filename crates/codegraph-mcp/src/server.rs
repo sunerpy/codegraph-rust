@@ -904,4 +904,406 @@ mod tests {
         assert_eq!(server.resolve_project_arg(None), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    fn one_line(server: &mut McpServer, request: Value) -> Vec<Value> {
+        let line = format!("{request}\n");
+        let mut out = Vec::new();
+        server
+            .run_until_adoption(Cursor::new(line.into_bytes()), Cursor::new(&mut out))
+            .unwrap();
+        parse_json_lines(&out)
+    }
+
+    #[test]
+    fn ping_request_replies_empty_object() {
+        let mut server = McpServer::new(None);
+        let out = one_line(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "id": 5, "method": "ping" }),
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["id"], json!(5));
+        assert_eq!(out[0]["result"], json!({}));
+    }
+
+    #[test]
+    fn resources_list_replies_empty_array() {
+        let mut server = McpServer::new(None);
+        let out = one_line(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "id": 6, "method": "resources/list" }),
+        );
+        assert_eq!(out[0]["result"], json!({ "resources": [] }));
+    }
+
+    #[test]
+    fn resources_templates_list_replies_empty_array() {
+        let mut server = McpServer::new(None);
+        let out = one_line(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "id": 7, "method": "resources/templates/list" }),
+        );
+        assert_eq!(out[0]["result"], json!({ "resourceTemplates": [] }));
+    }
+
+    #[test]
+    fn prompts_list_replies_empty_array() {
+        let mut server = McpServer::new(None);
+        let out = one_line(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "id": 8, "method": "prompts/list" }),
+        );
+        assert_eq!(out[0]["result"], json!({ "prompts": [] }));
+    }
+
+    #[test]
+    fn unknown_method_request_yields_method_not_found() {
+        let mut server = McpServer::new(None);
+        let out = one_line(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "id": 9, "method": "does/not/exist" }),
+        );
+        assert_eq!(
+            out[0]["error"]["code"],
+            json!(error_codes::METHOD_NOT_FOUND)
+        );
+        assert!(
+            out[0]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Method not found"),
+            "message should name the method"
+        );
+    }
+
+    #[test]
+    fn notification_without_id_produces_no_response() {
+        let mut server = McpServer::new(None);
+        let out = one_line(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        );
+        assert!(out.is_empty(), "notification produces no output");
+    }
+
+    #[test]
+    fn initialized_notification_is_swallowed() {
+        let mut server = McpServer::new(None);
+        let out = one_line(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "method": "initialized" }),
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn unknown_notification_without_id_is_swallowed() {
+        let mut server = McpServer::new(None);
+        let out = one_line(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "method": "some/random/notification" }),
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn parse_error_line_yields_minus_32700_with_null_id() {
+        let mut server = McpServer::new(None);
+        let mut out = Vec::new();
+        server
+            .run_until_adoption(
+                Cursor::new(b"{ this is not json\n".to_vec()),
+                Cursor::new(&mut out),
+            )
+            .unwrap();
+        let responses = parse_json_lines(&out);
+        assert_eq!(responses[0]["id"], Value::Null);
+        assert_eq!(
+            responses[0]["error"]["code"],
+            json!(error_codes::PARSE_ERROR)
+        );
+    }
+
+    #[test]
+    fn valid_json_missing_method_is_treated_as_response_not_request() {
+        let mut server = McpServer::new(None);
+        let out = one_line(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "id": 42, "result": { "anything": true } }),
+        );
+        assert!(out.is_empty(), "a client response yields no reply line");
+    }
+
+    #[test]
+    fn blank_lines_are_skipped_then_eof() {
+        let mut server = McpServer::new(None);
+        let mut out = Vec::new();
+        let outcome = server
+            .run_until_adoption(Cursor::new(b"\n   \n".to_vec()), Cursor::new(&mut out))
+            .unwrap();
+        assert!(matches!(outcome, RunUntilAdoption::Eof));
+        assert!(out.is_empty(), "blank lines produce no output");
+    }
+
+    #[test]
+    fn tools_call_missing_name_yields_invalid_params() {
+        let mut server = McpServer::new(None);
+        let out = one_line(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "tools/call",
+                "params": { "arguments": {} }
+            }),
+        );
+        assert_eq!(out[0]["error"]["code"], json!(error_codes::INVALID_PARAMS));
+        assert_eq!(out[0]["error"]["message"], json!("Missing tool name"));
+    }
+
+    #[test]
+    fn tools_call_unknown_tool_yields_invalid_params() {
+        let mut server = McpServer::new(None);
+        let out = one_line(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 12,
+                "method": "tools/call",
+                "params": { "name": "codegraph_not_a_tool", "arguments": {} }
+            }),
+        );
+        assert_eq!(out[0]["error"]["code"], json!(error_codes::INVALID_PARAMS));
+        assert!(
+            out[0]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Unknown tool: codegraph_not_a_tool")
+        );
+    }
+
+    #[test]
+    fn tools_call_unresolved_project_returns_tool_error_result() {
+        let mut server = McpServer::new(None);
+        let out = one_line(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 13,
+                "method": "tools/call",
+                "params": { "name": "codegraph_search", "arguments": { "query": "x" } }
+            }),
+        );
+        assert!(
+            out[0]["error"].is_null(),
+            "must be a Reply, not a JSON-RPC error"
+        );
+        assert_eq!(out[0]["result"]["isError"], json!(true));
+        let text = out[0]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("No indexed project resolved"),
+            "unresolved (raw=None) message, got: {text}"
+        );
+    }
+
+    #[test]
+    fn tools_call_bogus_project_path_returns_actionable_error_result() {
+        let mut server = McpServer::new(None);
+        let out = one_line(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 14,
+                "method": "tools/call",
+                "params": {
+                    "name": "codegraph_search",
+                    "arguments": { "query": "x", "projectPath": "/no/such/indexed/project/xyz" }
+                }
+            }),
+        );
+        assert_eq!(out[0]["result"]["isError"], json!(true));
+        let text = out[0]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("No indexed project found for projectPath"),
+            "raw-project message, got: {text}"
+        );
+    }
+
+    #[test]
+    fn tools_call_open_failure_returns_engine_error_result() {
+        let project = indexed_project("open-fail");
+        let raw = project.path().display().to_string();
+        let mut server = McpServer::new(None);
+        let out = one_line(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 15,
+                "method": "tools/call",
+                "params": {
+                    "name": "codegraph_search",
+                    "arguments": { "query": "x", "projectPath": raw }
+                }
+            }),
+        );
+        assert_eq!(out[0]["result"]["isError"], json!(true));
+        let text = out[0]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("Failed to open project at"),
+            "engine open-failure message, got: {text}"
+        );
+    }
+
+    #[test]
+    fn tools_list_no_default_marks_project_path_required() {
+        let mut server = McpServer::new(None);
+        assert!(!server.has_default_codegraph());
+        let out = one_line(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "id": 16, "method": "tools/list" }),
+        );
+        let tools = out[0]["result"]["tools"].as_array().unwrap();
+        assert!(!tools.is_empty());
+        for tool in tools {
+            let required = tool["inputSchema"]["required"].as_array().unwrap();
+            assert!(required.iter().any(|v| v == "projectPath"));
+        }
+    }
+
+    #[test]
+    fn tools_list_with_indexed_default_keeps_project_path_optional() {
+        let project = indexed_project("tools-list-default");
+        let mut server = McpServer::new_with_cwd(Some(project.path().to_path_buf()), None);
+        assert!(server.has_default_codegraph());
+        let out = one_line(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "id": 17, "method": "tools/list" }),
+        );
+        let tools = out[0]["result"]["tools"].as_array().unwrap();
+        for tool in tools {
+            let has_pp = tool["inputSchema"]["required"]
+                .as_array()
+                .map(|r| r.iter().any(|v| v == "projectPath"))
+                .unwrap_or(false);
+            assert!(!has_pp, "indexed default keeps projectPath optional");
+        }
+    }
+
+    #[test]
+    fn no_roots_mode_initialize_never_requests_roots() {
+        let mut server = McpServer::new(None);
+        server.no_roots = true;
+        let out = one_line(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 18,
+                "method": "initialize",
+                "params": { "capabilities": { "roots": { "listChanged": true } } }
+            }),
+        );
+        assert_eq!(
+            out.len(),
+            1,
+            "no_roots initialize replies once, no roots/list"
+        );
+        assert_eq!(out[0]["id"], json!(18));
+        assert_eq!(out[0]["result"]["serverInfo"]["name"], json!(SERVER_NAME));
+    }
+
+    #[test]
+    fn initialize_adopts_root_uri_and_returns_reply_with_adoption() {
+        let project = indexed_project("init-adopt");
+        let uri = format!("file://{}", project.path().display());
+        let mut server = McpServer::new(None);
+        let out = one_line(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 19,
+                "method": "initialize",
+                "params": { "rootUri": uri }
+            }),
+        );
+        assert_eq!(out.len(), 1, "adoption still replies once");
+        assert_eq!(out[0]["id"], json!(19));
+        assert_eq!(server.default_project(), Some(project.path()));
+    }
+
+    #[test]
+    fn json_response_serialization_wraps_error_object() {
+        let value = json_response(JsonRpcResponse::error(
+            json!(1),
+            error_codes::INTERNAL_ERROR,
+            "boom",
+        ));
+        assert_eq!(value["error"]["code"], json!(error_codes::INTERNAL_ERROR));
+        assert_eq!(value["error"]["message"], json!("boom"));
+    }
+
+    #[test]
+    fn close_cached_handles_forces_reopen_counter() {
+        let before = reopen_count();
+        let mut server = McpServer::new(None);
+        server.close_cached_handles();
+        assert!(reopen_count() >= before);
+    }
+
+    #[test]
+    fn line_with_method_but_invalid_shape_yields_invalid_request() {
+        let mut server = McpServer::new(None);
+        let out = one_line(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "id": 20, "method": 123 }),
+        );
+        assert_eq!(out[0]["id"], Value::Null);
+        assert_eq!(out[0]["error"]["code"], json!(error_codes::INVALID_REQUEST));
+        assert_eq!(out[0]["error"]["message"], json!("Invalid Request"));
+    }
+
+    #[test]
+    fn response_with_non_roots_id_is_ignored_without_adoption() {
+        let project = indexed_project("nonroots-resp");
+        let mut server = McpServer::new(Some(project.path().to_path_buf()));
+        let out = one_line(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "some-other-request-id",
+                "result": {
+                    "roots": [{ "uri": format!("file://{}", project.path().display()), "name": "p" }]
+                }
+            }),
+        );
+        assert!(out.is_empty(), "a non-roots response yields no reply");
+    }
+
+    #[test]
+    fn roots_response_with_no_indexed_root_returns_none_adoption() {
+        let unindexed = std::env::temp_dir().join(format!(
+            "cg-mcp-noidx-resp-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&unindexed).unwrap();
+        let mut server = McpServer::new(None);
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": ROOTS_LIST_REQUEST_ID,
+            "result": {
+                "roots": [{ "uri": format!("file://{}", unindexed.display()), "name": "empty" }]
+            }
+        });
+        let outcome = server
+            .run_until_adoption(
+                Cursor::new(format!("{response}\n").into_bytes()),
+                Cursor::new(&mut Vec::new()),
+            )
+            .unwrap();
+        assert!(
+            matches!(outcome, RunUntilAdoption::Eof),
+            "an all-unindexed roots response adopts nothing → loop runs to EOF"
+        );
+        let _ = std::fs::remove_dir_all(&unindexed);
+    }
 }

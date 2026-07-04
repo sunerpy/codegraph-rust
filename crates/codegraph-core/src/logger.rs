@@ -269,22 +269,29 @@ mod tests {
         let temp_dir = std::env::temp_dir().join("codegraph_test_logs");
         let _ = fs::remove_dir_all(&temp_dir);
 
+        // Only one init_logger succeeds per process (global OnceLock), so this
+        // single test enables every sink + json + location + RUST_LOG to cover
+        // the layer-builder and RUST_LOG branches no other test can reach.
+        unsafe { std::env::set_var("RUST_LOG", "info") };
         let cfg = LoggerConfig {
             level: "info".to_string(),
             directory: temp_dir.clone(),
             file_prefix: "test".to_string(),
-            stdout: false,
-            stderr: false,
+            stdout: true,
+            stderr: true,
             file: true,
-            json: false,
-            show_location: false,
+            json: true,
+            show_location: true,
         };
 
         let result = init_logger(&cfg);
         assert!(result.is_ok(), "init_logger should succeed");
         assert!(temp_dir.exists(), "log directory should be created");
 
-        // Clean up
+        set_log_level("debug").expect("reload against our own init");
+        assert_eq!(current_log_level().as_deref(), Some("debug"));
+
+        unsafe { std::env::remove_var("RUST_LOG") };
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
@@ -319,5 +326,51 @@ mod tests {
 
         // If RUST_LOG were set, EnvFilter::try_from_default_env() would pick it up
         // (we don't actually set it here to keep tests isolated)
+    }
+
+    #[test]
+    fn build_fmt_layer_and_local_timer_cover_json_and_text_paths() {
+        use tracing_subscriber::Registry;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let _timer = local_timer();
+
+        let text_cfg = LoggerConfig {
+            json: false,
+            show_location: false,
+            ..LoggerConfig::default()
+        };
+        let text_layer = build_fmt_layer(
+            fmt::layer().with_writer(std::io::stdout),
+            &text_cfg,
+            local_timer(),
+        );
+        let _text = Registry::default().with(text_layer);
+
+        let json_cfg = LoggerConfig {
+            json: true,
+            show_location: true,
+            ..LoggerConfig::default()
+        };
+        let json_layer = build_fmt_layer(
+            fmt::layer().with_writer(std::io::stderr),
+            &json_cfg,
+            local_timer(),
+        );
+        let _json = Registry::default().with(json_layer);
+    }
+
+    #[test]
+    fn set_and_current_log_level_operate_on_the_shared_handle() {
+        if set_log_level("debug").is_ok() {
+            assert_eq!(current_log_level().as_deref(), Some("debug"));
+            set_log_level("nonsense").expect("unknown level falls back, never errors");
+            assert_eq!(current_log_level().as_deref(), Some("info"));
+        } else {
+            assert!(
+                current_log_level().is_none(),
+                "an uninitialized handle reports no level and refuses reload"
+            );
+        }
     }
 }

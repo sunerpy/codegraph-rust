@@ -703,4 +703,128 @@ mod tests {
         assert_eq!(as_json[7], json!("function"));
         assert_eq!(as_json[15], json!("type_alias"));
     }
+
+    #[test]
+    fn every_node_kind_as_str_display_and_serde_agree() {
+        for (kind, expected) in NodeKind::ALL.iter().copied().zip(NODE_KIND_STRINGS) {
+            assert_eq!(kind.as_str(), expected);
+            assert_eq!(kind.to_string(), expected);
+            assert_eq!(serde_json::to_value(kind).unwrap(), json!(expected));
+            let back: NodeKind = serde_json::from_value(json!(expected)).unwrap();
+            assert_eq!(back, kind);
+        }
+    }
+
+    #[test]
+    fn every_edge_kind_as_str_display_and_serde_agree() {
+        for (kind, expected) in EdgeKind::ALL.iter().copied().zip(EDGE_KIND_STRINGS) {
+            assert_eq!(kind.as_str(), expected);
+            assert_eq!(kind.to_string(), expected);
+            assert_eq!(serde_json::to_value(kind).unwrap(), json!(expected));
+            let back: EdgeKind = serde_json::from_value(json!(expected)).unwrap();
+            assert_eq!(back, kind);
+        }
+    }
+
+    #[test]
+    fn every_language_as_str_display_and_serde_agree() {
+        for (language, expected) in Language::ALL.iter().copied().zip(LANGUAGE_STRINGS) {
+            assert_eq!(language.as_str(), expected);
+            assert_eq!(language.to_string(), expected);
+            assert_eq!(serde_json::to_value(language).unwrap(), json!(expected));
+            let back: Language = serde_json::from_value(json!(expected)).unwrap();
+            assert_eq!(back, language);
+        }
+    }
+
+    #[test]
+    fn is_godot_non_script_file_only_for_scene_resource_project() {
+        assert!(Language::GodotScene.is_godot_non_script_file());
+        assert!(Language::GodotResource.is_godot_non_script_file());
+        assert!(Language::GodotProject.is_godot_non_script_file());
+        assert!(!Language::Gdscript.is_godot_non_script_file());
+        assert!(!Language::Rust.is_godot_non_script_file());
+    }
+
+    #[test]
+    fn every_reference_subkind_as_str_display_and_serde_agree() {
+        let all = [
+            (ReferenceSubkind::ScriptAttach, "script_attach"),
+            (ReferenceSubkind::SceneInstance, "scene_instance"),
+            (ReferenceSubkind::ExtResource, "ext_resource"),
+            (ReferenceSubkind::GroupMember, "group_member"),
+            (ReferenceSubkind::SignalMethod, "signal_method"),
+            (ReferenceSubkind::GdscriptLoadPath, "gdscript_load_path"),
+            (ReferenceSubkind::Autoload, "autoload"),
+        ];
+        for (subkind, expected) in all {
+            assert_eq!(subkind.as_str(), expected);
+            assert_eq!(subkind.to_string(), expected);
+            assert_eq!(serde_json::to_value(subkind).unwrap(), json!(expected));
+            let back: ReferenceSubkind = serde_json::from_value(json!(expected)).unwrap();
+            assert_eq!(back, subkind);
+        }
+    }
+
+    #[test]
+    fn unresolved_ref_skips_default_flags_but_round_trips_full() {
+        let minimal = UnresolvedRef {
+            id: None,
+            from_node_id: "function:a".to_string(),
+            reference_name: "x".to_string(),
+            reference_kind: EdgeKind::Calls,
+            line: 1,
+            col: 2,
+            candidates: None,
+            file_path: "a.rs".to_string(),
+            language: Language::Rust,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+        let value = serde_json::to_value(&minimal).unwrap();
+        let object = value.as_object().unwrap();
+        assert!(!object.contains_key("isFunctionRef"));
+        assert!(!object.contains_key("referenceSubkind"));
+
+        let full = UnresolvedRef {
+            is_function_ref: true,
+            reference_subkind: Some(ReferenceSubkind::ScriptAttach),
+            ..minimal
+        };
+        let full_value = serde_json::to_value(&full).unwrap();
+        assert_eq!(full_value["isFunctionRef"], json!(true));
+        assert_eq!(full_value["referenceSubkind"], json!("script_attach"));
+        let back: UnresolvedRef = serde_json::from_value(full_value).unwrap();
+        assert_eq!(back, full);
+    }
+
+    #[test]
+    fn extraction_result_round_trips_with_camel_case_keys() {
+        let result = ExtractionResult {
+            nodes: vec![sample_node()],
+            edges: vec![Edge {
+                id: None,
+                source: "function:a".to_string(),
+                target: "function:b".to_string(),
+                kind: EdgeKind::Calls,
+                metadata: None,
+                line: None,
+                col: None,
+                provenance: None,
+            }],
+            unresolved_references: Vec::new(),
+            errors: vec!["oops".to_string()],
+            duration_ms: 12,
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert!(
+            value
+                .as_object()
+                .unwrap()
+                .contains_key("unresolvedReferences")
+        );
+        assert_eq!(value["durationMs"], json!(12));
+        let back: ExtractionResult = serde_json::from_value(value).unwrap();
+        assert_eq!(back, result);
+    }
 }

@@ -516,3 +516,169 @@ fn spawn_catch_up(project_root: &Path) -> Arc<AtomicBool> {
     });
     done
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn resolve_ms_env_defaults_when_unset_or_empty() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let key = "CODEGRAPH_TEST_MS_UNSET";
+        // SAFETY: guarded by ENV_LOCK; single-threaded within the guard.
+        unsafe { std::env::remove_var(key) };
+        assert_eq!(resolve_ms_env(key, 100, 10, 1000), 100);
+        unsafe { std::env::set_var(key, "") };
+        assert_eq!(resolve_ms_env(key, 100, 10, 1000), 100);
+        unsafe { std::env::set_var(key, "not-a-number") };
+        assert_eq!(resolve_ms_env(key, 100, 10, 1000), 100);
+        unsafe { std::env::remove_var(key) };
+    }
+
+    #[test]
+    fn resolve_ms_env_clamps_to_range() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let key = "CODEGRAPH_TEST_MS_CLAMP";
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe { std::env::set_var(key, "5") };
+        assert_eq!(resolve_ms_env(key, 100, 10, 1000), 10);
+        unsafe { std::env::set_var(key, "9999") };
+        assert_eq!(resolve_ms_env(key, 100, 10, 1000), 1000);
+        unsafe { std::env::set_var(key, "500") };
+        assert_eq!(resolve_ms_env(key, 100, 10, 1000), 500);
+        unsafe { std::env::remove_var(key) };
+    }
+
+    #[test]
+    fn idle_and_sweep_resolvers_return_clamped_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for key in [
+            CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS,
+            CODEGRAPH_DAEMON_MAX_IDLE_MS,
+            CODEGRAPH_DAEMON_CLIENT_SWEEP_MS,
+        ] {
+            // SAFETY: guarded by ENV_LOCK.
+            unsafe { std::env::remove_var(key) };
+        }
+        assert_eq!(resolve_idle_timeout_ms(), DEFAULT_IDLE_TIMEOUT_MS);
+        assert_eq!(resolve_max_idle_ms(), DEFAULT_MAX_IDLE_MS);
+        assert_eq!(resolve_client_sweep_ms(), DEFAULT_CLIENT_SWEEP_MS);
+    }
+
+    #[test]
+    fn changed_paths_tail_formats_empty_short_and_overflow() {
+        assert_eq!(changed_paths_tail(&[]), "");
+        assert_eq!(
+            changed_paths_tail(&["a.rs".to_string(), "b.rs".to_string()]),
+            " — a.rs, b.rs"
+        );
+        let many: Vec<String> = (0..12).map(|i| format!("f{i}.rs")).collect();
+        let tail = changed_paths_tail(&many);
+        assert!(tail.starts_with(" — f0.rs, "));
+        assert!(tail.ends_with("(+2 more)"), "overflow suffix: {tail}");
+        let exactly_ten: Vec<String> = (0..10).map(|i| format!("f{i}.rs")).collect();
+        assert!(!changed_paths_tail(&exactly_ten).contains("more"));
+    }
+
+    #[test]
+    fn daemon_options_default_enables_mcp_and_watch() {
+        let options = DaemonOptions::default();
+        assert!(options.run_mcp);
+        assert!(options.watch);
+        assert_eq!(options.parent_pid, None);
+        assert_eq!(options.host_pid, None);
+        assert_eq!(options.watchdog_interval, DEFAULT_WATCHDOG_INTERVAL);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_candidate_chain_puts_preferred_first_and_dedups() {
+        let root = Path::new("/tmp/cg-candidate-chain");
+        let preferred = daemon_socket_path(root);
+        let chain = socket_candidate_chain(root, preferred.clone());
+        assert_eq!(chain[0], preferred);
+        let mut deduped = chain.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(deduped.len(), chain.len());
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "cg-daemon-lifecycle-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn quiet_options() -> DaemonOptions {
+        DaemonOptions {
+            run_mcp: false,
+            watch: false,
+            ..DaemonOptions::default()
+        }
+    }
+
+    #[test]
+    fn start_or_attach_starts_a_daemon_and_handle_reports_state() {
+        let root = temp_root("start");
+        let started = start_or_attach(&root, quiet_options()).expect("start a fresh daemon");
+        let StartOrAttach::Started(handle) = started else {
+            panic!("a fresh project must start (not attach) a daemon");
+        };
+        assert!(!handle.socket_path().as_os_str().is_empty());
+        assert_eq!(handle.active_sessions(), 0);
+        handle.stop().expect("stop joins the accept thread cleanly");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn second_start_attaches_to_the_running_daemon() {
+        let root = temp_root("attach");
+        let started = start_or_attach(&root, quiet_options()).expect("first start");
+        let StartOrAttach::Started(handle) = started else {
+            panic!("first call must start the daemon");
+        };
+
+        match start_or_attach(&root, quiet_options()).expect("second call resolves") {
+            StartOrAttach::Attached(client) => {
+                assert!(
+                    client.hello.get("codegraph").is_some(),
+                    "hello carries version"
+                );
+            }
+            StartOrAttach::Started(second) => {
+                second.stop().ok();
+                panic!("second call must attach to the live daemon, not start a new one");
+            }
+        }
+
+        handle.stop().expect("stop the daemon");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn run_foreground_errors_when_a_daemon_already_serves() {
+        let root = temp_root("foreground-busy");
+        let started = start_or_attach(&root, quiet_options()).expect("start daemon");
+        let StartOrAttach::Started(handle) = started else {
+            panic!("expected a started daemon");
+        };
+        let err = run_foreground(&root, quiet_options())
+            .expect_err("a second foreground serve must refuse when one is already running");
+        assert!(
+            err.to_string().contains("already running"),
+            "unexpected error: {err}"
+        );
+        handle.stop().expect("stop the daemon");
+        let _ = fs::remove_dir_all(&root);
+    }
+}

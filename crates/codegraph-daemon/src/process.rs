@@ -219,4 +219,34 @@ mod tests {
             Some("host pid 20 exited".to_string())
         );
     }
+
+    #[test]
+    fn is_process_alive_true_for_self_false_for_zero_and_absent() {
+        assert!(is_process_alive(std::process::id()));
+        assert!(!is_process_alive(0));
+        assert!(!is_process_alive(4_000_000_000));
+    }
+
+    #[test]
+    fn terminate_pid_rejects_zero_and_absent_pids() {
+        assert!(!terminate_pid(0));
+        assert!(!terminate_pid(4_000_000_000));
+    }
+
+    #[test]
+    fn is_session_leader_and_current_ppid_do_not_panic() {
+        let _ = is_session_leader();
+        let _ = current_ppid();
+    }
+
+    #[test]
+    fn supervision_returns_none_when_supervisor_intact() {
+        let state = SupervisionState {
+            original_ppid: 10,
+            current_ppid: 10,
+            host_pid: Some(20),
+            session_leader: false,
+        };
+        assert_eq!(supervision_lost_reason(&state, |_| true), None);
+    }
 }

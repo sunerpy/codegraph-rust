@@ -482,6 +482,112 @@ pub fn read_daemon_hello(stream: &mut Stream) -> Result<serde_json::Value> {
     result
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_client_hello_line_extracts_host_pid_from_valid_json() {
+        assert_eq!(parse_client_hello_line("{\"hostPid\":4242}"), Some(4242));
+        assert_eq!(parse_client_hello_line("  {\"hostPid\": 7}  \n"), Some(7));
+    }
+
+    #[test]
+    fn parse_client_hello_line_rejects_non_hello_lines() {
+        assert_eq!(parse_client_hello_line(""), None);
+        assert_eq!(parse_client_hello_line("   "), None);
+        assert_eq!(parse_client_hello_line("not json"), None);
+        assert_eq!(
+            parse_client_hello_line("{\"jsonrpc\":\"2.0\",\"id\":1}"),
+            None
+        );
+        let too_long = format!(
+            "{{\"hostPid\":1,\"pad\":\"{}\"}}",
+            "x".repeat(MAX_HELLO_LINE_BYTES)
+        );
+        assert_eq!(parse_client_hello_line(&too_long), None);
+    }
+
+    #[test]
+    fn run_session_recv_with_run_mcp_false_fires_none_pid_and_returns_none() {
+        let reader = std::io::Cursor::new(Vec::<u8>::new());
+        let writer = Vec::<u8>::new();
+        let mut fired: Option<Option<u32>> = None;
+        let result =
+            run_session_recv_with(reader, writer, PathBuf::from("/tmp/unused"), false, |pid| {
+                fired = Some(pid)
+            })
+            .expect("run_mcp=false short-circuits without serving");
+        assert_eq!(result, None);
+        assert_eq!(fired, Some(None));
+    }
+
+    #[test]
+    fn session_registry_tracks_active_count_and_pid_and_dead_ids() {
+        let registry = SessionRegistry::default();
+        assert_eq!(registry.active_count(), 0);
+
+        let guard = registry.start_session();
+        let id = guard.session_id();
+        assert_eq!(registry.active_count(), 1);
+
+        registry.set_pid(id, 1234);
+        let dead = registry.dead_session_ids(|pid| pid != 1234);
+        assert_eq!(dead, vec![id]);
+        let alive = registry.dead_session_ids(|_| true);
+        assert!(alive.is_empty());
+
+        drop(guard);
+        assert_eq!(registry.active_count(), 0);
+    }
+
+    #[test]
+    fn session_registry_millis_since_active_advances_over_time() {
+        let registry = SessionRegistry::default();
+        let first = registry.millis_since_active();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let later = registry.millis_since_active();
+        assert!(later >= first);
+    }
+
+    #[test]
+    fn session_registry_start_bumps_last_active_to_recent() {
+        let registry = SessionRegistry::default();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let guard = registry.start_session();
+        assert!(
+            registry.millis_since_active() < 10,
+            "starting a session resets last-active to now"
+        );
+        drop(guard);
+    }
+
+    #[test]
+    fn session_registry_debug_reports_active_count() {
+        let registry = SessionRegistry::default();
+        let debug = format!("{registry:?}");
+        assert!(debug.contains("SessionRegistry"));
+        assert!(debug.contains("active"));
+    }
+
+    #[test]
+    fn set_pid_on_unknown_session_is_a_noop() {
+        let registry = SessionRegistry::default();
+        registry.set_pid(9999, 1);
+        assert_eq!(registry.active_count(), 0);
+    }
+
+    #[test]
+    fn read_first_line_bounded_stops_at_newline_and_on_eof() {
+        use std::io::BufReader;
+        let mut reader = BufReader::new(std::io::Cursor::new(b"hello\nworld".to_vec()));
+        let first = read_first_line_bounded(&mut reader, 64);
+        assert_eq!(first, b"hello\n");
+        let mut empty = BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+        assert!(read_first_line_bounded(&mut empty, 64).is_empty());
+    }
+}
+
 #[cfg(all(test, unix))]
 mod hello_timeout_tests {
     use std::thread;

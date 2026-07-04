@@ -562,4 +562,154 @@ mod tests {
             "`$HOME/.` must normalize to `$HOME` and be disabled"
         );
     }
+
+    #[test]
+    fn watch_disabled_when_no_watch_flag_is_set() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture();
+        let project = crate::sync::tests::TestDir::new("watch-policy-flag");
+        unsafe { std::env::remove_var(CODEGRAPH_NO_WATCH) };
+
+        // The explicit `no_watch` parameter wins even for a normal project dir.
+        let reason = watch_disabled_reason(project.path(), true);
+        assert_eq!(reason.as_deref(), Some("CODEGRAPH_NO_WATCH=1 is set"));
+    }
+
+    #[test]
+    fn watch_disabled_when_no_watch_env_is_set() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture();
+        let project = crate::sync::tests::TestDir::new("watch-policy-env");
+        unsafe { std::env::set_var(CODEGRAPH_NO_WATCH, "1") };
+
+        let reason = watch_disabled_reason(project.path(), false);
+        assert_eq!(reason.as_deref(), Some("CODEGRAPH_NO_WATCH=1 is set"));
+    }
+
+    #[test]
+    fn gitignore_comments_and_blank_lines_are_skipped() {
+        // A .gitignore with comments and blank lines contributes only real rules.
+        let dir = crate::sync::tests::TestDir::new("watch-policy-comments");
+        fs::write(
+            dir.path().join(".gitignore"),
+            "# a comment line\n\n   \nbuildcache/\n",
+        )
+        .unwrap();
+        let policy = WatchPolicy::new(dir.path());
+        assert!(
+            !policy.should_watch_dir("buildcache"),
+            "the single real rule from .gitignore is honored"
+        );
+        assert!(
+            policy.should_watch_dir("src"),
+            "commented/blank lines add no spurious rules"
+        );
+    }
+
+    #[test]
+    fn star_glob_rule_matches_on_basename_prefix_and_suffix() {
+        // A slashless gitignore glob like `*.log` matches by basename
+        // prefix/suffix (the `split_once('*')` branch), so a matching leaf file
+        // is ignored while a partial-name sibling is not.
+        let dir = crate::sync::tests::TestDir::new("watch-policy-glob");
+        fs::write(dir.path().join(".gitignore"), "*.log\ntmp*\n").unwrap();
+        let policy = WatchPolicy::new(dir.path());
+        assert!(!policy.allows_file_path("build.log"));
+        assert!(!policy.allows_file_path("logs/server.log"));
+        assert!(!policy.allows_file_path("tmpfile"));
+        assert!(policy.allows_file_path("src/app.ts"));
+    }
+
+    #[test]
+    fn exact_file_rule_matches_root_and_nested_suffix() {
+        // A gitignore rule without a trailing slash matches the exact relative
+        // path AND any `/name` suffix, but not a partial-segment name.
+        let dir = crate::sync::tests::TestDir::new("watch-policy-exact");
+        fs::write(dir.path().join(".gitignore"), "secret.env\n").unwrap();
+        let policy = WatchPolicy::new(dir.path());
+        assert!(!policy.allows_file_path("secret.env"));
+        assert!(!policy.allows_file_path("config/secret.env"));
+        assert!(policy.allows_file_path("secret.env.example"));
+    }
+
+    #[test]
+    fn always_ignored_covers_git_codegraph_and_variants() {
+        let dir = crate::sync::tests::TestDir::new("watch-policy-always");
+        let policy = WatchPolicy::new(dir.path());
+        assert!(!policy.should_watch_dir(".git"));
+        assert!(!policy.should_watch_dir(".git/objects"));
+        assert!(!policy.should_watch_dir(".codegraph"));
+        assert!(!policy.should_watch_dir(".codegraph-daemon"));
+        assert!(!policy.allows_file_path(".codegraph/codegraph.db"));
+    }
+
+    #[test]
+    fn normalize_relative_rejects_root_and_escaping_paths() {
+        let dir = crate::sync::tests::TestDir::new("watch-policy-normalize");
+        let policy = WatchPolicy::new(dir.path());
+        // An absolute path outside the root cannot be made relative.
+        assert_eq!(policy.normalize_relative("/etc/passwd"), None);
+        // The root itself normalizes to empty/".", which is rejected.
+        assert_eq!(policy.normalize_relative(dir.path()), None);
+        // A relative source file under the root normalizes cleanly.
+        assert_eq!(
+            policy.normalize_relative("src/app.ts").as_deref(),
+            Some("src/app.ts")
+        );
+    }
+
+    #[test]
+    fn normalize_path_converts_separators_and_collapses_dots() {
+        assert_eq!(normalize_path("a/./b"), "a/b");
+        assert_eq!(normalize_path("a/b/c"), "a/b/c");
+    }
+
+    #[test]
+    fn should_handle_file_requires_known_language() {
+        let dir = crate::sync::tests::TestDir::new("watch-policy-handle");
+        let policy = WatchPolicy::new(dir.path());
+        // A source extension is handled; a non-source file is allowed but not
+        // handled (it has no known language).
+        assert!(policy.should_handle_file("src/app.ts"));
+        assert!(!policy.should_handle_file("README.md"));
+        assert!(policy.allows_file_path("README.md"));
+    }
+
+    #[test]
+    fn force_watch_re_enables_a_wsl_drive_mount_path() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture();
+        let project = crate::sync::tests::TestDir::new("watch-policy-force");
+        let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        unsafe { std::env::set_var(home_key, project.path()) };
+        unsafe { std::env::remove_var(CODEGRAPH_NO_WATCH) };
+        unsafe { std::env::set_var("CODEGRAPH_FORCE_WATCH", "1") };
+
+        // A normal (non-home, non-root) project with FORCE_WATCH set returns
+        // None — the force escape short-circuits the WSL/mount check below it.
+        let nested = project.path().join("workspace/proj");
+        fs::create_dir_all(&nested).unwrap();
+        assert!(
+            watch_disabled_reason(&nested, false).is_none(),
+            "FORCE_WATCH must re-enable a normal project directory"
+        );
+    }
+
+    #[test]
+    fn is_windows_drive_mount_recognizes_mnt_drive_paths() {
+        // The `/mnt/<letter>` shape is a WSL Windows-drive mount; other paths
+        // (missing letter, multi-char, non-mnt root) are not.
+        assert!(is_windows_drive_mount(Path::new("/mnt/c")));
+        assert!(is_windows_drive_mount(Path::new("/mnt/d/project")));
+        assert!(!is_windows_drive_mount(Path::new("/mnt/abc/project")));
+        assert!(!is_windows_drive_mount(Path::new("/home/user/project")));
+        assert!(!is_windows_drive_mount(Path::new("/mnt")));
+    }
+
+    #[test]
+    fn is_filesystem_root_recognizes_unix_root_only() {
+        assert!(is_filesystem_root(Path::new("/")));
+        assert!(!is_filesystem_root(Path::new("/usr")));
+        assert!(!is_filesystem_root(Path::new("/home/user")));
+    }
 }
