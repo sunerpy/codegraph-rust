@@ -445,18 +445,23 @@ fn start_project_watcher(
     watch_options.on_sync_complete =
         Some(Arc::new(move |outcome: codegraph_watch::SyncOutcome| {
             let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
-            let ts = local_timestamp();
             let tail = changed_paths_tail(&outcome.changed_paths);
-            eprintln!(
-                "[{ts}] [watcher] sync #{n}: {} file(s) reindexed, {} removed{tail}",
-                outcome.files_reindexed, outcome.files_removed,
+            // The subscriber prepends the RFC3339 timestamp; this daemon's stderr
+            // is redirected to `.codegraph/daemon.log`, so events land there timed.
+            info!(
+                sync = n,
+                files_reindexed = outcome.files_reindexed,
+                files_removed = outcome.files_removed,
+                "watcher sync #{n}: {} file(s) reindexed, {} removed{tail}",
+                outcome.files_reindexed,
+                outcome.files_removed,
             );
         }));
     watch_options.on_degraded = Some(Arc::new(|reason: String| {
-        eprintln!("[CodeGraph MCP] File watcher degraded — {reason}");
+        warn!(%reason, "file watcher degraded");
     }));
     watch_options.on_sync_error = Some(Arc::new(|reason: String| {
-        eprintln!("[CodeGraph MCP] File watcher warning — {reason}");
+        warn!(%reason, "file watcher warning");
     }));
     match codegraph_watch::start_serve_watcher(project_root, watch_options) {
         Ok(watcher) => watcher,
@@ -465,17 +470,6 @@ fn start_project_watcher(
             None
         }
     }
-}
-
-/// RFC 3339 local timestamp, falling back local -> UTC -> empty so logging
-/// never panics on a missing TZ database.
-fn local_timestamp() -> String {
-    use time::OffsetDateTime;
-    use time::format_description::well_known::Rfc3339;
-    OffsetDateTime::now_local()
-        .unwrap_or_else(|_| OffsetDateTime::now_utc())
-        .format(&Rfc3339)
-        .unwrap_or_default()
 }
 
 /// Bounded inline file list ` — a, b`: first 10 paths, then ` (+N more)`, so a
@@ -510,9 +504,9 @@ fn spawn_catch_up(project_root: &Path) -> Arc<AtomicBool> {
             Ok(outcome) => {
                 let changed = outcome.files_reindexed + outcome.files_removed;
                 if changed > 0 {
-                    let ts = local_timestamp();
-                    eprintln!(
-                        "[{ts}] [CodeGraph MCP] Caught up {changed} file(s) changed since last run"
+                    info!(
+                        changed,
+                        "caught up {changed} file(s) changed since last run"
                     );
                 }
             }

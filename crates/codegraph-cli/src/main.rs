@@ -50,9 +50,16 @@ fn main() {
         }
     };
 
+    // Logs go to STDERR, never stdout: `serve --mcp` owns stdout for the
+    // JSON-RPC stream and a single log byte there corrupts the protocol. The
+    // detached daemon / HTTP children re-enter this same path and have their
+    // stderr redirected to a log file, so their events land there WITH the
+    // subscriber's RFC3339 timestamps. `file` stays off — the child fd
+    // redirect, not a second rolling file, is the on-disk sink.
     let logger_cfg = LoggerConfig {
-        level: config.app.log_level.clone(),
+        level: effective_log_level(&config.app.log_level),
         stdout: false,
+        stderr: true,
         file: false,
         ..Default::default()
     };
@@ -1213,13 +1220,33 @@ fn cmd_files(
     Ok(())
 }
 
-/// Whether `CODEGRAPH_DEBUG` is truthy (`"1"`/`"true"`), gating the
-/// `[codegraph debug]` stderr trace lines. Off ⇒ no new output.
+/// Whether `CODEGRAPH_DEBUG` is truthy (`"1"`/`"true"`). Retained ONLY as the
+/// back-compat translation into a debug log level (see [`effective_log_level`]);
+/// RUST_LOG is the primary knob. The old `[codegraph debug]` stderr traces are
+/// now `tracing::debug!` events that the EnvFilter gates, so this no longer
+/// gates any print directly.
 fn debug_enabled() -> bool {
     matches!(
         std::env::var("CODEGRAPH_DEBUG").as_deref(),
         Ok("1") | Ok("true")
     )
+}
+
+/// Resolve the effective base log level for the reloadable level filter. This
+/// value only sets the reload layer's floor; the EnvFilter (from RUST_LOG)
+/// filters on top. Because the two combine with AND, the base must never sit
+/// BELOW what RUST_LOG asks for — so when RUST_LOG is set we open the base to
+/// `trace` and let the EnvFilter be the sole gate. When RUST_LOG is unset,
+/// `CODEGRAPH_DEBUG=1` bumps the base to `debug` for back-compat with the old
+/// `[codegraph debug]` traces; otherwise the config level is used unchanged.
+fn effective_log_level(config_level: &str) -> String {
+    if std::env::var_os("RUST_LOG").is_some() {
+        return "trace".to_string();
+    }
+    if debug_enabled() {
+        return "debug".to_string();
+    }
+    config_level.to_string()
 }
 
 fn emit_serve_startup_debug(
@@ -1235,11 +1262,16 @@ fn emit_serve_startup_debug(
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "(unknown)".to_string());
     let db = db_path(project_root);
-    eprintln!(
-        "[codegraph debug] serve: exe={exe} cwd={cwd} explicit_path={explicit_path} default_project={} db={} db_exists={} has_codegraph_dir={has_codegraph} mode={mode:?}",
-        project_root.display(),
-        db.display(),
-        db.is_file(),
+    tracing::debug!(
+        %exe,
+        %cwd,
+        explicit_path,
+        default_project = %project_root.display(),
+        db = %db.display(),
+        db_exists = db.is_file(),
+        has_codegraph_dir = has_codegraph,
+        mode = ?mode,
+        "serve startup"
     );
 }
 
@@ -1279,16 +1311,15 @@ fn cmd_serve(
         // serve tools off any existing index but run NO daemon, watcher, or
         // catch-up. A real project nested under $HOME is unaffected.
         if let Some(reason) = codegraph_watch::too_broad_root_reason(&project_root) {
-            eprintln!(
-                "[CodeGraph MCP] No project root: {reason}. Tools still answer off an existing index if present."
+            tracing::info!(
+                %reason,
+                "no project root; tools still answer off an existing index if present"
             );
             return serve_direct_no_services(project, &project_root, no_watch);
         }
         let has_codegraph = codegraph_dir(&project_root).is_dir();
         let mode = select_serve_mode(daemon_opt_out(), is_daemon_internal(), has_codegraph);
-        if debug_enabled() {
-            emit_serve_startup_debug(&project_root, explicit_path, has_codegraph, &mode);
-        }
+        emit_serve_startup_debug(&project_root, explicit_path, has_codegraph, &mode);
         match mode {
             ServeMode::Direct => {
                 return serve_direct(project, &project_root, no_watch, explicit_path);
@@ -1422,16 +1453,16 @@ fn cmd_serve_http(path: Option<PathBuf>, http_addr: &str, detach: bool) -> Resul
     };
     let _ = http_registry::write_entry(&info);
     let _guard = HttpRegistryGuard::new(addr_key);
-    if debug_enabled() {
-        match &project {
-            Some(project) => eprintln!(
-                "[codegraph debug] serve --http (pinned): addr={addr} project={}",
-                project.display(),
-            ),
-            None => eprintln!(
-                "[codegraph debug] serve --http (global): addr={addr} per-call projectPath, no pinned default",
-            ),
-        }
+    match &project {
+        Some(project) => tracing::debug!(
+            %addr,
+            project = %project.display(),
+            "serve --http (pinned)"
+        ),
+        None => tracing::debug!(
+            %addr,
+            "serve --http (global): per-call projectPath, no pinned default"
+        ),
     }
     serve_http_impl(project, addr)
 }
@@ -1846,23 +1877,13 @@ where
     match codegraph_daemon::attach_to_daemon(&socket_path) {
         Ok(client) if codegraph_daemon::verify_daemon_hello(&client.hello).is_none() => {}
         Ok(_) => {
-            tracing::debug!("adopted project daemon version mismatch; serving direct");
-            if debug_enabled() {
-                eprintln!(
-                    "[codegraph debug] serve_adopted: daemon version mismatch; serving direct"
-                );
-            }
+            tracing::debug!("serve_adopted: daemon version mismatch; serving direct");
             return codegraph_mcp::rmcp_session::serve_session_rmcp(reader, writer, project_root)
                 .context("running rmcp MCP stdio server for adopted project");
         }
         Err(err) => {
-            tracing::debug!(error = %err, "adopted project daemon preflight failed; serving direct");
-            if debug_enabled() {
-                eprintln!(
-                    "[codegraph debug] serve_adopted: daemon preflight failed ({err}); serving direct"
-                );
-            }
-            heal_stale_daemon_if_dead(&project_root, debug_enabled());
+            tracing::debug!(error = %err, "serve_adopted: daemon preflight failed; serving direct");
+            heal_stale_daemon_if_dead(&project_root);
             return codegraph_mcp::rmcp_session::serve_session_rmcp(reader, writer, project_root)
                 .context("running rmcp MCP stdio server for adopted project");
         }
@@ -1877,11 +1898,8 @@ where
         Ok(codegraph_daemon::ProxyOutcome::Proxied) => Ok(()),
         Ok(codegraph_daemon::ProxyOutcome::VersionMismatch) => Ok(()),
         Err(err) => {
-            tracing::debug!(error = %err, "adopted project proxy attach failed");
-            if debug_enabled() {
-                eprintln!("[codegraph debug] serve_adopted: proxy attach failed ({err})");
-            }
-            heal_stale_daemon_if_dead(&project_root, debug_enabled());
+            tracing::debug!(error = %err, "serve_adopted: proxy attach failed");
+            heal_stale_daemon_if_dead(&project_root);
             Ok(())
         }
     }
@@ -1895,13 +1913,11 @@ fn start_daemon_for_adopted_root(project_root: &Path, no_watch: bool) -> Option<
         return None;
     }
     if daemon_already_running(project_root) {
-        if debug_enabled() {
-            eprintln!(
-                "[codegraph debug] adopted-root: attaching to existing daemon (pid_path={} socket_path={})",
-                codegraph_daemon::daemon_pid_path(project_root).display(),
-                codegraph_daemon::recorded_socket_path(project_root).display(),
-            );
-        }
+        tracing::debug!(
+            pid_path = %codegraph_daemon::daemon_pid_path(project_root).display(),
+            socket_path = %codegraph_daemon::recorded_socket_path(project_root).display(),
+            "adopted-root: attaching to existing daemon"
+        );
         return Some(codegraph_daemon::recorded_socket_path(project_root));
     }
     let Ok(exe) = std::env::current_exe() else {
@@ -1910,22 +1926,20 @@ fn start_daemon_for_adopted_root(project_root: &Path, no_watch: bool) -> Option<
     match codegraph_daemon::spawn_detached_daemon(&exe, project_root, no_watch) {
         Ok(()) => {
             poll_for_daemon_socket(project_root);
-            eprintln!(
-                "[CodeGraph MCP] Started shared daemon for adopted project root {}",
-                project_root.display()
+            tracing::info!(
+                project = %project_root.display(),
+                "started shared daemon for adopted project root"
             );
-            if debug_enabled() {
-                eprintln!(
-                    "[codegraph debug] adopted-root: spawned new daemon (pid_path={} socket_path={})",
-                    codegraph_daemon::daemon_pid_path(project_root).display(),
-                    codegraph_daemon::recorded_socket_path(project_root).display(),
-                );
-            }
+            tracing::debug!(
+                pid_path = %codegraph_daemon::daemon_pid_path(project_root).display(),
+                socket_path = %codegraph_daemon::recorded_socket_path(project_root).display(),
+                "adopted-root: spawned new daemon"
+            );
             let socket_path = codegraph_daemon::recorded_socket_path(project_root);
             socket_path.exists().then_some(socket_path)
         }
         Err(err) => {
-            eprintln!("[CodeGraph MCP] Adopted project daemon start failed: {err}");
+            tracing::warn!(error = %err, "adopted project daemon start failed");
             None
         }
     }
@@ -1964,11 +1978,14 @@ fn spawn_catch_up(project_root: &Path) -> Arc<AtomicBool> {
             Ok(outcome) => {
                 let changed = outcome.files_reindexed + outcome.files_removed;
                 if changed > 0 {
-                    eprintln!("[CodeGraph MCP] Caught up {changed} file(s) changed since last run");
+                    tracing::info!(
+                        changed,
+                        "caught up {changed} file(s) changed since last run"
+                    );
                 }
             }
             Err(err) => {
-                eprintln!("[CodeGraph MCP] Catch-up sync failed: {err}");
+                tracing::warn!(error = %err, "catch-up sync failed");
             }
         }
         thread_done.store(true, Ordering::SeqCst);
@@ -1984,31 +2001,34 @@ fn start_direct_watcher(
     opts.no_watch = no_watch;
     opts.on_sync_complete = Some(std::sync::Arc::new(
         |outcome: codegraph_watch::SyncOutcome| {
-            eprintln!(
-                "[CodeGraph MCP] Auto-synced {} file(s) in {}ms",
-                outcome.files_reindexed, outcome.duration_ms
+            tracing::info!(
+                files_reindexed = outcome.files_reindexed,
+                duration_ms = outcome.duration_ms,
+                "auto-synced {} file(s) in {}ms",
+                outcome.files_reindexed,
+                outcome.duration_ms
             );
         },
     ));
     opts.on_degraded = Some(std::sync::Arc::new(|reason: String| {
-        eprintln!("[CodeGraph MCP] File watcher degraded — {reason}");
+        tracing::warn!(%reason, "file watcher degraded");
     }));
     opts.on_sync_error = Some(std::sync::Arc::new(|reason: String| {
-        eprintln!("[CodeGraph MCP] File watcher warning — {reason}");
+        tracing::warn!(%reason, "file watcher warning");
     }));
     match codegraph_watch::start_serve_watcher(project_root, opts) {
         Ok(Some(watcher)) => {
-            eprintln!("[CodeGraph MCP] File watcher active — graph will auto-sync on changes");
+            tracing::info!("file watcher active — graph will auto-sync on changes");
             Some(watcher)
         }
         Ok(None) => {
             let reason = codegraph_watch::watch_disabled_reason(project_root, no_watch)
                 .unwrap_or_else(|| "watching disabled".to_string());
-            eprintln!("[CodeGraph MCP] File watcher disabled — {reason}");
+            tracing::info!(%reason, "file watcher disabled");
             None
         }
         Err(err) => {
-            eprintln!("[CodeGraph MCP] File watcher failed to start: {err}");
+            tracing::warn!(error = %err, "file watcher failed to start");
             None
         }
     }
@@ -2027,44 +2047,27 @@ fn spawn_or_proxy(
     project_root: &Path,
     no_watch: bool,
 ) -> Option<Result<()>> {
-    let dbg = debug_enabled();
-    if dbg {
-        eprintln!(
-            "[codegraph debug] spawn_or_proxy: pid_path={} socket_path={}",
-            codegraph_daemon::daemon_pid_path(project_root).display(),
-            codegraph_daemon::recorded_socket_path(project_root).display(),
-        );
-    }
+    tracing::debug!(
+        pid_path = %codegraph_daemon::daemon_pid_path(project_root).display(),
+        socket_path = %codegraph_daemon::recorded_socket_path(project_root).display(),
+        "spawn_or_proxy: begin"
+    );
     if daemon_already_running(project_root) {
-        if dbg {
-            eprintln!("[codegraph debug] spawn_or_proxy: attaching to existing daemon");
-        }
+        tracing::debug!("spawn_or_proxy: attaching to existing daemon");
     } else {
         match std::env::current_exe() {
             Ok(exe) => {
                 if let Err(err) =
                     codegraph_daemon::spawn_detached_daemon(&exe, project_root, no_watch)
                 {
-                    tracing::debug!(error = %err, "detached daemon spawn failed; serving direct");
-                    if dbg {
-                        eprintln!(
-                            "[codegraph debug] spawn_or_proxy: daemon spawn failed ({err}); falling back to direct"
-                        );
-                    }
+                    tracing::debug!(error = %err, "spawn_or_proxy: daemon spawn failed; falling back to direct");
                     return None;
                 }
-                if dbg {
-                    eprintln!("[codegraph debug] spawn_or_proxy: spawned new daemon");
-                }
+                tracing::debug!("spawn_or_proxy: spawned new daemon");
                 poll_for_daemon_socket(project_root);
             }
             Err(err) => {
-                tracing::debug!(error = %err, "current_exe unavailable; serving direct");
-                if dbg {
-                    eprintln!(
-                        "[codegraph debug] spawn_or_proxy: current_exe unavailable ({err}); falling back to direct"
-                    );
-                }
+                tracing::debug!(error = %err, "spawn_or_proxy: current_exe unavailable; falling back to direct");
                 return None;
             }
         }
@@ -2072,13 +2075,8 @@ fn spawn_or_proxy(
 
     let socket_path = codegraph_daemon::recorded_socket_path(project_root);
     if !socket_path.exists() {
-        tracing::debug!("daemon socket never appeared; serving direct");
-        if dbg {
-            eprintln!(
-                "[codegraph debug] spawn_or_proxy: daemon socket never appeared; falling back to direct"
-            );
-        }
-        heal_stale_daemon_if_dead(project_root, dbg);
+        tracing::debug!("spawn_or_proxy: daemon socket never appeared; falling back to direct");
+        heal_stale_daemon_if_dead(project_root);
         return None;
     }
 
@@ -2092,22 +2090,12 @@ fn spawn_or_proxy(
     ) {
         Ok(codegraph_daemon::ProxyOutcome::Proxied) => Some(Ok(())),
         Ok(codegraph_daemon::ProxyOutcome::VersionMismatch) => {
-            tracing::debug!("daemon version mismatch; serving direct");
-            if dbg {
-                eprintln!(
-                    "[codegraph debug] spawn_or_proxy: daemon version mismatch; falling back to direct"
-                );
-            }
+            tracing::debug!("spawn_or_proxy: daemon version mismatch; falling back to direct");
             None
         }
         Err(err) => {
-            tracing::debug!(error = %err, "proxy attach failed; serving direct");
-            if dbg {
-                eprintln!(
-                    "[codegraph debug] spawn_or_proxy: proxy attach failed ({err}); falling back to direct"
-                );
-            }
-            heal_stale_daemon_if_dead(project_root, dbg);
+            tracing::debug!(error = %err, "spawn_or_proxy: proxy attach failed; falling back to direct");
+            heal_stale_daemon_if_dead(project_root);
             None
         }
     }
@@ -2119,11 +2107,9 @@ fn spawn_or_proxy(
 /// instead of re-attaching to a socket that never answers. Liveness-gated — a
 /// LIVE daemon's artifacts are preserved — so it is safe on any attach failure;
 /// the current request still falls back to DIRECT serving regardless.
-fn heal_stale_daemon_if_dead(project_root: &Path, dbg: bool) {
-    if codegraph_daemon::clear_stale_daemon_socket(project_root) && dbg {
-        eprintln!(
-            "[codegraph debug] cleared stale daemon artifacts (dead pid) so the next start spawns fresh"
-        );
+fn heal_stale_daemon_if_dead(project_root: &Path) {
+    if codegraph_daemon::clear_stale_daemon_socket(project_root) {
+        tracing::debug!("cleared stale daemon artifacts (dead pid) so the next start spawns fresh");
     }
 }
 
@@ -2184,7 +2170,7 @@ pub fn select_serve_mode(
 #[cfg(test)]
 mod serve_mode_tests {
     use super::{
-        ServeMode, debug_enabled, guard_indexable_root, select_serve_mode,
+        ServeMode, debug_enabled, effective_log_level, guard_indexable_root, select_serve_mode,
         should_run_daemon_services, should_run_serve_services,
     };
     use std::path::Path;
@@ -2211,6 +2197,48 @@ mod serve_mode_tests {
         match prev {
             Some(v) => unsafe { std::env::set_var("CODEGRAPH_DEBUG", v) },
             None => unsafe { std::env::remove_var("CODEGRAPH_DEBUG") },
+        }
+    }
+
+    #[test]
+    fn effective_log_level_translates_codegraph_debug_and_defers_to_rust_log() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let prev_debug = std::env::var("CODEGRAPH_DEBUG").ok();
+        let prev_rust_log = std::env::var("RUST_LOG").ok();
+
+        // Given RUST_LOG unset and CODEGRAPH_DEBUG unset: config level is used verbatim.
+        unsafe { std::env::remove_var("RUST_LOG") };
+        unsafe { std::env::remove_var("CODEGRAPH_DEBUG") };
+        assert_eq!(
+            effective_log_level("info"),
+            "info",
+            "no knobs ⇒ config level"
+        );
+
+        // When CODEGRAPH_DEBUG=1 and RUST_LOG unset: level bumps to debug (back-compat).
+        unsafe { std::env::set_var("CODEGRAPH_DEBUG", "1") };
+        assert_eq!(
+            effective_log_level("info"),
+            "debug",
+            "CODEGRAPH_DEBUG=1 ⇒ debug"
+        );
+
+        // When RUST_LOG is set: the base opens to trace so the EnvFilter is the
+        // sole gate (the reload floor must not cap RUST_LOG upward).
+        unsafe { std::env::set_var("RUST_LOG", "warn") };
+        assert_eq!(
+            effective_log_level("info"),
+            "trace",
+            "RUST_LOG set ⇒ base opens to trace; EnvFilter owns the gate"
+        );
+
+        match prev_debug {
+            Some(v) => unsafe { std::env::set_var("CODEGRAPH_DEBUG", v) },
+            None => unsafe { std::env::remove_var("CODEGRAPH_DEBUG") },
+        }
+        match prev_rust_log {
+            Some(v) => unsafe { std::env::set_var("RUST_LOG", v) },
+            None => unsafe { std::env::remove_var("RUST_LOG") },
         }
     }
 

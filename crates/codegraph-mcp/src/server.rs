@@ -19,8 +19,7 @@ use crate::engine::CodeGraphEngine;
 use crate::instructions::SERVER_INSTRUCTIONS;
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse, ToolResult, error_codes};
 use crate::roots::{
-    ROOTS_LIST_REQUEST_ID, WorkspaceRoots, db_path_for, debug_enabled, format_tool_debug_line,
-    roots_list_request,
+    ROOTS_LIST_REQUEST_ID, WorkspaceRoots, db_path_for, format_tool_debug_line, roots_list_request,
 };
 use crate::schemas;
 
@@ -409,13 +408,11 @@ impl McpServer {
     }
 
     fn debug_roots_adopted(&self, adopted: &Path, old_default: Option<&Path>) {
-        if !debug_enabled() {
-            return;
-        }
         let was = old_default.map_or_else(|| "none".to_string(), |p| p.display().to_string());
-        eprintln!(
-            "[codegraph debug] roots: adopted {} (was default={was})",
-            adopted.display()
+        tracing::debug!(
+            adopted = %adopted.display(),
+            was = %was,
+            "roots: adopted workspace root"
         );
     }
 
@@ -442,18 +439,16 @@ impl McpServer {
 
         let raw_project = args.get("projectPath").and_then(Value::as_str);
         let resolved = self.resolve_project_arg(raw_project);
-        if debug_enabled() {
-            eprintln!(
-                "{}",
-                format_tool_debug_line(
-                    &tool_name,
-                    raw_project,
-                    resolved.as_deref(),
-                    self.cwd.as_deref(),
-                    self.default_project.as_deref(),
-                )
-            );
-        }
+        tracing::debug!(
+            "{}",
+            format_tool_debug_line(
+                &tool_name,
+                raw_project,
+                resolved.as_deref(),
+                self.cwd.as_deref(),
+                self.default_project.as_deref(),
+            )
+        );
         let project_path = match resolved {
             Some(p) => p,
             None => {

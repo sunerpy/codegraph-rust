@@ -40,7 +40,7 @@ use serde_json::{Value, json};
 use crate::engine::CodeGraphEngine;
 use crate::instructions::SERVER_INSTRUCTIONS;
 use crate::protocol::ToolResult;
-use crate::roots::{WorkspaceRoots, db_path_for, debug_enabled};
+use crate::roots::{WorkspaceRoots, db_path_for};
 use crate::schemas;
 
 const SERVER_NAME: &str = "codegraph";
@@ -227,15 +227,14 @@ impl CodeGraphHandler {
             self.cwd.as_deref(),
             Some(roots_result),
         );
-        if let Some(adopted) = &adopted
-            && debug_enabled()
-        {
+        if let Some(adopted) = &adopted {
             let was = old_default
                 .as_deref()
                 .map_or_else(|| "none".to_string(), |p| p.display().to_string());
-            eprintln!(
-                "[codegraph debug] roots: adopted {} (was default={was})",
-                adopted.display()
+            tracing::debug!(
+                adopted = %adopted.display(),
+                was = %was,
+                "roots: adopted workspace root"
             );
         }
         adopted
@@ -435,21 +434,19 @@ impl ServerHandler for CodeGraphHandler {
 
         // Handler half of the debug split (paired with the `debug_log_requests`
         // middleware): logs the resolved tool + projectPath — values already in
-        // hand here, so no request-body buffering is needed. Gated on
-        // `debug_enabled()`; STDERR only. The result `isError` is appended after
-        // execution below.
-        if debug_enabled() {
-            eprintln!(
-                "{}",
-                crate::roots::format_tool_debug_line(
-                    &tool_name,
-                    raw_project,
-                    Some(project_path.as_path()),
-                    self.cwd.as_deref(),
-                    self.default_project_snapshot().as_deref(),
-                )
-            );
-        }
+        // hand here, so no request-body buffering is needed. Emitted at debug
+        // level; the EnvFilter/RUST_LOG (and CODEGRAPH_DEBUG back-compat) gates
+        // it. The result `isError` is logged after execution below.
+        tracing::debug!(
+            "{}",
+            crate::roots::format_tool_debug_line(
+                &tool_name,
+                raw_project,
+                Some(project_path.as_path()),
+                self.cwd.as_deref(),
+                self.default_project_snapshot().as_deref(),
+            )
+        );
 
         // Decision 10: open+execute+render entirely inside ONE spawn_blocking
         // closure returning an OWNED ToolResult; nothing borrows &self.
@@ -463,7 +460,7 @@ impl ServerHandler for CodeGraphHandler {
         // unblocked fast with an isError result; the orphaned thread drains
         // on its own. `tool_timeout() == None` (env `0`) opts out entirely.
         let engines = Arc::clone(&self.engines);
-        let debug_tool = debug_enabled().then(|| tool_name.clone());
+        let outcome_tool = tool_name.clone();
         let join_future = tokio::task::spawn_blocking(move || {
             execute_owned(&engines, &project_path, &tool_name, &args)
         });
@@ -501,15 +498,14 @@ impl ServerHandler for CodeGraphHandler {
                 ));
             }
         };
-        // Handler-half outcome line (STDERR, debug-only): tool + isError, the
-        // per-call result the middleware envelope cannot see.
-        if let Some(tool) = debug_tool {
-            eprintln!(
-                "[codegraph debug] tool={tool} isError={}{}",
-                result.is_error == Some(true),
-                if timed_out { " (timed out)" } else { "" }
-            );
-        }
+        // Handler-half outcome line: tool + isError, the per-call result the
+        // HTTP middleware envelope cannot see. EnvFilter/RUST_LOG gates it.
+        tracing::debug!(
+            tool = %outcome_tool,
+            is_error = result.is_error == Some(true),
+            timed_out,
+            "tool call complete"
+        );
         Ok(tool_result_to_call_result(&result))
     }
 }
@@ -543,11 +539,11 @@ pub fn serve_stdio_rmcp(project: Option<PathBuf>) -> anyhow::Result<()> {
     })
 }
 
-/// axum middleware logging one line per HTTP request to STDERR: method, path,
-/// `Host` header, response status, and elapsed time. Attached to the
-/// streamable-HTTP router ONLY when [`debug_enabled`] is true (see
-/// [`serve_http`]), so it is a pure passthrough that never runs — and never
-/// changes output — when debug is off.
+/// axum middleware logging one line per HTTP request at debug level: method,
+/// path, `Host` header, response status, and elapsed time. Always attached to
+/// the streamable-HTTP router (see [`serve_http`]); the debug event is a no-op
+/// unless the EnvFilter/RUST_LOG (or CODEGRAPH_DEBUG back-compat) enables debug,
+/// so it produces no output when debug is off.
 ///
 /// It deliberately does NOT read the request body: an axum `Request` body is a
 /// stream, so parsing `projectPath` / the tool name here would mean buffering
@@ -568,10 +564,13 @@ pub async fn debug_log_requests(
         .to_string();
     let started = std::time::Instant::now();
     let resp = next.run(req).await;
-    eprintln!(
-        "[codegraph debug] http {method} {path} host={host} -> {} ({} ms)",
-        resp.status().as_u16(),
-        started.elapsed().as_millis(),
+    tracing::debug!(
+        %method,
+        %path,
+        %host,
+        status = resp.status().as_u16(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "http request"
     );
     resp
 }
@@ -630,28 +629,30 @@ pub fn serve_http(
         match &default_project {
             Some(project) => {
                 let db = db_path_for(project);
-                eprintln!(
-                    "[CodeGraph MCP] streamable-HTTP serving on http://{addr}/mcp (project={}, db={}, db_exists={})",
-                    project.display(),
-                    db.display(),
-                    db.is_file(),
+                tracing::info!(
+                    %addr,
+                    project = %project.display(),
+                    db = %db.display(),
+                    db_exists = db.is_file(),
+                    "streamable-HTTP serving on http://{addr}/mcp"
                 );
             }
             None => {
-                eprintln!(
-                    "[CodeGraph MCP] streamable-HTTP serving (global, per-call projectPath) on http://{addr}/mcp",
+                tracing::info!(
+                    %addr,
+                    "streamable-HTTP serving (global, per-call projectPath) on http://{addr}/mcp"
                 );
             }
         }
 
         let guard = host_guard_from_env();
         match &guard {
-            HostGuard::AllowAny => eprintln!(
-                "[CodeGraph MCP] host guard: OPEN (all hosts) — set {ALLOWED_HOSTS_ENV}=localhost,<host> to restrict",
+            HostGuard::AllowAny => tracing::info!(
+                "host guard: OPEN (all hosts) — set {ALLOWED_HOSTS_ENV}=localhost,<host> to restrict"
             ),
-            HostGuard::Strict(hosts) => eprintln!(
-                "[CodeGraph MCP] host guard: strict (allowed: {})",
-                hosts.join(", "),
+            HostGuard::Strict(hosts) => tracing::info!(
+                allowed = %hosts.join(", "),
+                "host guard: strict"
             ),
         }
 
@@ -664,18 +665,13 @@ pub fn serve_http(
             );
 
         let router = axum::Router::new().nest_service("/mcp", service);
-        // Debug logging is a two-part split, both gated on `debug_enabled()`:
-        //   - THIS middleware logs the HTTP request/response envelope
-        //     (method/path/Host/status/timing) — the connection-level view;
-        //   - `call_tool` logs the resolved tool + projectPath + isError — the
-        //     handler-level view — where those values are already in hand
-        //     (no request-body buffering in the middleware).
-        // Attached ONLY when debug is on, so debug-off output is byte-identical.
-        let router = if debug_enabled() {
-            router.layer(axum::middleware::from_fn(debug_log_requests))
-        } else {
-            router
-        };
+        // Two-part debug split, both emitted at debug level (EnvFilter/RUST_LOG,
+        // plus CODEGRAPH_DEBUG back-compat, gates them): THIS middleware logs the
+        // HTTP request/response envelope (method/path/Host/status/timing);
+        // `call_tool` logs the resolved tool + projectPath + isError. The layer
+        // is always attached; its event is a no-op unless debug is enabled, so
+        // debug-off produces no HTTP-log output.
+        let router = router.layer(axum::middleware::from_fn(debug_log_requests));
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|e| anyhow::anyhow!("binding streamable-HTTP listener on {addr}: {e}"))?;

@@ -426,12 +426,28 @@ fn spawn_pinned_server_stderr_to(
     cmd.spawn().expect("spawn serve --http (stderr capture)")
 }
 
-/// (6) DEBUG ON: with `CODEGRAPH_DEBUG=1`, each POST to `/mcp` logs a per-request
-/// line `[codegraph debug] http POST /mcp host=... -> <status> (<n> ms)` on
-/// STDERR, and a `tools/call` logs a handler line naming the tool +
-/// resolved projectPath. STDOUT stays pure protocol (the JSON-RPC responses come
-/// back over the socket, not stdout — asserted by (1)). RED before the middleware
-/// + handler debug line exist.
+fn poll_stderr_for(err_path: &Path, needle: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if std::fs::read_to_string(err_path)
+            .map(|s| s.contains(needle))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// (6) DEBUG ON: with `CODEGRAPH_DEBUG=1` (which bumps the base log level to
+/// debug when RUST_LOG is unset), each POST to `/mcp` logs a per-request
+/// `http request` event (method=POST path=/mcp ...) on STDERR, and a
+/// `tools/call` logs a handler line naming the tool + resolved projectPath.
+/// STDOUT stays pure protocol (the JSON-RPC responses come back over the
+/// socket, not stdout — asserted by (1)).
 #[test]
 fn serve_http_debug_on_logs_per_request_lines_to_stderr() {
     let home = TestDir::new("dbg-on");
@@ -444,27 +460,31 @@ fn serve_http_debug_on_logs_per_request_lines_to_stderr() {
     let reachable = wait_reachable(&addr);
     // Drive a tools/call so the handler debug line also fires.
     let _ = call_search(&addr, "McpServer", None);
-    std::thread::sleep(Duration::from_millis(300));
+    // Poll the redirected stderr for BOTH the middleware event and the handler
+    // tool line BEFORE killing — a hard kill can truncate buffered stderr, and
+    // re-reading the file after the kill can race with that truncation, so we
+    // capture the settled contents from the poll itself.
+    let saw_request = poll_stderr_for(&err_path, "http request", Duration::from_secs(5));
+    let saw_tool = poll_stderr_for(&err_path, "tool=codegraph_search", Duration::from_secs(5));
+    let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
 
     let _ = child.kill();
     let _ = child.wait();
 
-    let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
-
     assert!(reachable, "serve --http (debug on) must start");
     assert!(
-        stderr.contains("[codegraph debug] http POST /mcp"),
-        "debug-on stderr must contain the per-request middleware line: {stderr}"
+        saw_request && stderr.contains("/mcp"),
+        "debug-on stderr must contain the per-request middleware event: {stderr}"
     );
     assert!(
-        stderr.contains("[codegraph debug] tool=codegraph_search"),
+        saw_tool,
         "debug-on stderr must contain the handler tool line naming the tool: {stderr}"
     );
 }
 
-/// (7) DEBUG OFF: with `CODEGRAPH_DEBUG` unset, NO per-request lines appear on
-/// STDERR (byte-identical to the pre-feature behavior — only the one startup
-/// line). Guards the "off by default, zero new output" contract.
+/// (7) DEBUG OFF: with `CODEGRAPH_DEBUG` unset (and no RUST_LOG), the base level
+/// stays at the config default (info), so NO per-request debug events appear on
+/// STDERR. Guards the "off by default, zero new output" contract.
 #[test]
 fn serve_http_debug_off_emits_no_per_request_lines() {
     let home = TestDir::new("dbg-off");
@@ -485,11 +505,11 @@ fn serve_http_debug_off_emits_no_per_request_lines() {
 
     assert!(reachable, "serve --http (debug off) must start");
     assert!(
-        !stderr.contains("[codegraph debug] http"),
-        "debug-off stderr must NOT contain any per-request middleware line: {stderr}"
+        !stderr.contains("http request"),
+        "debug-off stderr must NOT contain any per-request middleware event: {stderr}"
     );
     assert!(
-        !stderr.contains("[codegraph debug] tool="),
+        !stderr.contains("tool=codegraph_search"),
         "debug-off stderr must NOT contain any handler tool line: {stderr}"
     );
 }

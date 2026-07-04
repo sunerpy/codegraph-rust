@@ -6,16 +6,6 @@ use serde_json::{Value, json};
 
 pub const ROOTS_LIST_REQUEST_ID: &str = "codegraph-roots-list-1";
 
-/// Whether `CODEGRAPH_DEBUG` is truthy (`"1"`/`"true"`), gating the
-/// `[codegraph debug]` stderr trace lines. Off ⇒ no new output (stdout stays
-/// pure JSON-RPC).
-pub fn debug_enabled() -> bool {
-    matches!(
-        std::env::var("CODEGRAPH_DEBUG").as_deref(),
-        Ok("1") | Ok("true")
-    )
-}
-
 /// Pure formatter for the per-tool `projectPath` resolution debug line
 /// (unit-tested without touching process state).
 pub fn format_tool_debug_line(
@@ -234,11 +224,9 @@ fn percent_decode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct TempProject {
         path: PathBuf,
@@ -438,32 +426,6 @@ mod tests {
             Some(explicit.path()),
             Some(&json!({ "capabilities": { "roots": { "listChanged": true } } }))
         ));
-    }
-
-    #[test]
-    fn debug_enabled_honors_truthy_values_only() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let prev = std::env::var("CODEGRAPH_DEBUG").ok();
-
-        unsafe { std::env::remove_var("CODEGRAPH_DEBUG") };
-        assert!(!debug_enabled(), "unset ⇒ off");
-
-        unsafe { std::env::set_var("CODEGRAPH_DEBUG", "1") };
-        assert!(debug_enabled(), "\"1\" ⇒ on");
-
-        unsafe { std::env::set_var("CODEGRAPH_DEBUG", "true") };
-        assert!(debug_enabled(), "\"true\" ⇒ on");
-
-        unsafe { std::env::set_var("CODEGRAPH_DEBUG", "0") };
-        assert!(!debug_enabled(), "\"0\" ⇒ off");
-
-        unsafe { std::env::set_var("CODEGRAPH_DEBUG", "yes") };
-        assert!(!debug_enabled(), "any other value ⇒ off");
-
-        match prev {
-            Some(v) => unsafe { std::env::set_var("CODEGRAPH_DEBUG", v) },
-            None => unsafe { std::env::remove_var("CODEGRAPH_DEBUG") },
-        }
     }
 
     #[test]

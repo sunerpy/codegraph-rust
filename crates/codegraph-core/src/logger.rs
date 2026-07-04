@@ -42,8 +42,13 @@ pub struct LoggerConfig {
     pub directory: PathBuf,
     /// File name prefix, e.g. "myapp" -> "myapp.2026-02-04".
     pub file_prefix: String,
-    /// Write logs to stdout (recommended for containers / dev).
+    /// Write logs to stdout (recommended for containers / dev). NEVER enable
+    /// this for a stdio-protocol server (`serve --mcp`): stdout carries the
+    /// JSON-RPC stream and a single log byte there corrupts the protocol.
     pub stdout: bool,
+    /// Write logs to stderr. The correct console sink for stdio-protocol
+    /// servers (MCP/LSP), which keep stdout log-free.
+    pub stderr: bool,
     /// Write logs to a rolling file in `directory`.
     pub file: bool,
     /// Emit JSON instead of human-readable lines (recommended for prod log shippers).
@@ -59,6 +64,7 @@ impl Default for LoggerConfig {
             directory: PathBuf::from("logs"),
             file_prefix: env!("CARGO_PKG_NAME").to_string(),
             stdout: true,
+            stderr: false,
             file: true,
             json: false,
             show_location: false,
@@ -130,7 +136,17 @@ where
 /// - Logger already initialized (RELOAD_HANDLE already set)
 /// - Cannot create the log directory
 pub fn init_logger(cfg: &LoggerConfig) -> Result<Option<WorkerGuard>, Box<dyn std::error::Error>> {
-    let base_level = parse_level(&cfg.level);
+    // When RUST_LOG is set, the EnvFilter below is the authority; the reloadable
+    // base level must not independently gate out what RUST_LOG admits (the two
+    // layers compose as AND). So seed the reloadable filter at TRACE when RUST_LOG
+    // is present, letting EnvFilter do the real per-target filtering; otherwise
+    // use the config level so `set_log_level` and the info default still hold.
+    let rust_log_set = std::env::var_os("RUST_LOG").is_some();
+    let base_level = if rust_log_set {
+        LevelFilter::TRACE
+    } else {
+        parse_level(&cfg.level)
+    };
 
     // Reloadable level filter -> enables runtime `set_log_level`.
     let (level_filter, reload_handle) = reload::Layer::new(base_level);
@@ -159,6 +175,18 @@ pub fn init_logger(cfg: &LoggerConfig) -> Result<Option<WorkerGuard>, Box<dyn st
         None
     };
 
+    // Stderr layer: the console sink for stdio-protocol servers (MCP/LSP), where
+    // stdout is reserved for the protocol stream and MUST stay log-free.
+    let stderr_layer = if cfg.stderr {
+        Some(build_fmt_layer(
+            fmt::layer().with_writer(std::io::stderr),
+            cfg,
+            timer.clone(),
+        ))
+    } else {
+        None
+    };
+
     // Rolling-file layer (daily rotation, non-blocking writes).
     let file_layer = if cfg.file {
         std::fs::create_dir_all(&cfg.directory)?;
@@ -179,6 +207,7 @@ pub fn init_logger(cfg: &LoggerConfig) -> Result<Option<WorkerGuard>, Box<dyn st
         .with(level_filter)
         .with(env_filter)
         .with(stdout_layer)
+        .with(stderr_layer)
         .with(file_layer)
         .init();
 
@@ -229,6 +258,7 @@ mod tests {
         assert_eq!(cfg.level, "info");
         assert_eq!(cfg.directory, PathBuf::from("logs"));
         assert!(cfg.stdout);
+        assert!(!cfg.stderr);
         assert!(cfg.file);
         assert!(!cfg.json);
         assert!(!cfg.show_location);
@@ -244,6 +274,7 @@ mod tests {
             directory: temp_dir.clone(),
             file_prefix: "test".to_string(),
             stdout: false,
+            stderr: false,
             file: true,
             json: false,
             show_location: false,
@@ -264,6 +295,7 @@ mod tests {
             directory: PathBuf::from("/tmp/custom_logs"),
             file_prefix: "custom".to_string(),
             stdout: true,
+            stderr: false,
             file: false,
             json: true,
             show_location: true,
