@@ -63,13 +63,18 @@ clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
 
 # Progress bars; major pinned to the one self_update resolves to avoid a duplicate copy.
-indicatif = { version = "0.17", features = ["rayon"] }
+indicatif = { version = "0.18", features = ["rayon"] }
 
 # JSONC config editing (preserve comments + key order on agent config writes)
 jsonc-parser = { version = "0.26", features = ["cst", "serde"] }
 
 # Self-update from GitHub Releases (mise-style `codegraph self-update`)
-self_update = { version = "0.42", default-features = false, features = ["archive-tar", "archive-zip", "compression-flate2", "compression-zip-deflate", "rustls"] }
+# self_update 0.43+ moved to quick-xml ^0.38 (fixes RUSTSEC-2026-0194/0195) and
+# indicatif ^0.18; the builder API used by cmd_self_update is unchanged (no break
+# until the 1.0.0-rc line). 0.44 also made the HTTP client optional: `reqwest` must
+# be listed explicitly, and `rustls` gates on it (`reqwest?/rustls`), so keep both
+# to get reqwest+rustls (no native-tls/OpenSSL) as before. Keep default-features=false.
+self_update = { version = "0.44", default-features = false, features = ["reqwest", "rustls", "archive-tar", "archive-zip", "compression-flate2", "compression-zip-deflate"] }
 
 # Benchmarking
 criterion = "0.7"

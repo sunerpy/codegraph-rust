@@ -86,7 +86,11 @@ jobs:
           tool: cargo-audit
 
       - name: Run cargo-audit
-        run: cargo audit
+        # --ignore rationale documented in audit.toml. quick-xml (RUSTSEC-2026-0194/0195)
+        # is transitive via self_update and only parses trusted GitHub release metadata —
+        # not reachable; no self_update release pins quick-xml >= 0.41 yet. number_prefix
+        # (RUSTSEC-2025-0119) is an unmaintained-crate warning.
+        run: cargo audit --ignore RUSTSEC-2025-0119 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
 
   # Coverage is INFORMATIONAL: it measures unit-test coverage and uploads to
   # Codecov, but it is deliberately kept OUT of the `ci-success` gate's `needs:`
