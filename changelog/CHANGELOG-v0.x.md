@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.25.0](https://github.com/sunerpy/codegraph-rust/compare/v0.24.0...v0.25.0) (2026-07-05)
+
+
+### Features
+
+* **mcp:** migrate to the official rmcp SDK with async daemon, HTTP mode, and 95% coverage ([#105](https://github.com/sunerpy/codegraph-rust/issues/105)) ([56f757b](https://github.com/sunerpy/codegraph-rust/commit/56f757b4990c57b3ae5647559f4c01d62e205f99))
+
 ## [0.24.0](https://github.com/sunerpy/codegraph-rust/compare/v0.23.1...v0.24.0) (2026-07-01)
 
 
