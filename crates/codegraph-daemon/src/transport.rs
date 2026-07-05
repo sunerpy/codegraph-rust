@@ -10,10 +10,10 @@ use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use interprocess::local_socket::ListenerNonblockingMode;
 use interprocess::local_socket::ListenerOptions;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use interprocess::local_socket::traits::Listener as _;
 use interprocess::local_socket::traits::Stream as _;
 #[cfg(unix)]
@@ -21,7 +21,7 @@ use interprocess::local_socket::{GenericFilePath, ToFsName};
 #[cfg(windows)]
 use interprocess::local_socket::{GenericNamespaced, ToNsName};
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub use interprocess::local_socket::Listener;
 pub use interprocess::local_socket::{SendHalf, Stream};
 
@@ -72,7 +72,7 @@ impl Rendezvous {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub fn bind(rendezvous: &Rendezvous) -> io::Result<Listener> {
     let listener = ListenerOptions::new()
         .name(rendezvous.name()?)
