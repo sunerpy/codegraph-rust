@@ -647,7 +647,9 @@ mod tests {
     fn normalize_relative_rejects_root_and_escaping_paths() {
         let dir = crate::sync::tests::TestDir::new("watch-policy-normalize");
         let policy = WatchPolicy::new(dir.path());
-        // An absolute path outside the root cannot be made relative.
+        // unix-absolute-path semantics: on Windows `/etc/passwd` is NOT absolute,
+        // so normalize_relative treats it as relative instead of rejecting it.
+        #[cfg(unix)]
         assert_eq!(policy.normalize_relative("/etc/passwd"), None);
         // The root itself normalizes to empty/".", which is rejected.
         assert_eq!(policy.normalize_relative(dir.path()), None);
