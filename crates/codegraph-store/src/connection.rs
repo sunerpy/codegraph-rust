@@ -192,6 +192,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn open_on_unwritable_path_surfaces_open_error() {
         let bogus = Path::new("/proc/definitely-not-writable/graph.db");
         match Store::open(bogus) {
