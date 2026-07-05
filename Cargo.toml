@@ -53,8 +53,9 @@ streaming-iterator = "0.1"
 # File watching
 notify = "6"
 
-# Cross-platform IPC (daemon local socket / named pipe)
-interprocess = "2.4"
+# Cross-platform IPC (daemon local socket / named pipe). The `tokio` feature
+# enables the async local-socket Listener/Stream used by the daemon accept loop.
+interprocess = { version = "2.4", features = ["tokio"] }
 rustix = { version = "0.38", features = ["process"] }
 
 # CLI

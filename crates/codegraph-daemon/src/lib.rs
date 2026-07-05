@@ -15,7 +15,6 @@ pub mod spawn;
 mod transport;
 
 use std::fs;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -23,7 +22,6 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use interprocess::local_socket::traits::Listener as _;
 pub use lock::{
     AcquireResult, DaemonLockInfo, clear_stale_daemon_lock, clear_stale_daemon_socket,
     decode_lock_info, encode_lock_info, recorded_socket_path, try_acquire_daemon_lock,
@@ -41,8 +39,8 @@ use tracing::{debug, info, warn};
 
 use crate::lock::{cleanup_owned_lock, rewrite_lock_socket_path};
 use crate::paths::codegraph_dir;
-use crate::session::serve_session;
-use crate::transport::{Listener, Rendezvous, bind, connect};
+use crate::session::serve_session_async;
+use crate::transport::{AsyncListener, Rendezvous, bind_tokio, connect};
 
 const DEFAULT_WATCHDOG_INTERVAL: Duration = Duration::from_millis(500);
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -261,7 +259,16 @@ fn start_with_lock(
 ) -> Result<DaemonHandle> {
     fs::create_dir_all(codegraph_dir(&project_root))
         .with_context(|| format!("creating {}", codegraph_dir(&project_root).display()))?;
-    let (listener, socket_path) = bind_with_fallback(&project_root, socket_path)?;
+
+    // The async interprocess Listener must be created inside a tokio runtime
+    // context, so build the runtime here and bind within it. The runtime is
+    // then moved into the accept-loop thread to drive the whole session model.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building daemon tokio runtime")?;
+    let (listener, socket_path) =
+        runtime.block_on(async { bind_with_fallback(&project_root, socket_path) })?;
     // The bind-fallback may have selected a candidate other than the one
     // recorded at acquire time; persist the CHOSEN socket so a client reading
     // the lock attaches to the socket actually bound (f83a1ec / D-Daemon).
@@ -277,7 +284,7 @@ fn start_with_lock(
     let thread_pid_path = pid_path.clone();
 
     let thread = thread::spawn(move || {
-        run_accept_loop(
+        runtime.block_on(run_accept_loop_async(
             listener,
             thread_project,
             thread_socket,
@@ -285,7 +292,7 @@ fn start_with_lock(
             thread_registry,
             thread_shutdown,
             options,
-        )
+        ))
     });
 
     Ok(DaemonHandle {
@@ -316,11 +323,12 @@ fn socket_candidate_chain(_project_root: &Path, preferred: PathBuf) -> Vec<PathB
 }
 
 /// Bind the daemon listener, falling through the deterministic socket-candidate
-/// chain on `bind()` failure (`f83a1ec`). `preferred` is the socket the lock
+/// chain on bind failure (`f83a1ec`). `preferred` is the socket the lock
 /// recorded; it is tried first, then any remaining
-/// [`daemon_socket_candidates`] in order. Returns the listener plus the socket
-/// that actually bound. Errors only when EVERY candidate fails.
-fn bind_with_fallback(project_root: &Path, preferred: PathBuf) -> Result<(Listener, PathBuf)> {
+/// [`daemon_socket_candidates`] in order. Returns the async listener plus the
+/// socket that actually bound. Errors only when EVERY candidate fails. Must be
+/// called inside a tokio runtime context (the async listener requires it).
+fn bind_with_fallback(project_root: &Path, preferred: PathBuf) -> Result<(AsyncListener, PathBuf)> {
     let candidates = socket_candidate_chain(project_root, preferred);
 
     let mut last_err = None;
@@ -332,7 +340,7 @@ fn bind_with_fallback(project_root: &Path, preferred: PathBuf) -> Result<(Listen
         {
             let _ = fs::remove_file(stale);
         }
-        match bind(&rendezvous) {
+        match bind_tokio(&rendezvous) {
             Ok(listener) => return Ok((listener, socket_path)),
             Err(err) => {
                 debug!(socket = %socket_path.display(), error = %err, "daemon socket bind failed; trying next candidate");
@@ -344,9 +352,17 @@ fn bind_with_fallback(project_root: &Path, preferred: PathBuf) -> Result<(Listen
     Err(err).with_context(|| format!("binding daemon socket {}", socket_path.display()))
 }
 
+/// Async accept loop (the fully-async session model). A `tokio::select!` races
+/// `listener.accept()` against a lifecycle-check interval; each accepted
+/// connection is served on a `tokio::spawn`ed [`serve_session_async`] task
+/// (unix) — no OS thread per connection, and each session hands rmcp a
+/// genuinely-async socket via the standard `serve(socket)`. The ONE shared
+/// watcher + catch-up stay owned by this scope (never per-connection). The idle
+/// / max-idle / sweep / supervision logic and its log lines are byte-identical
+/// to the former blocking loop; only the accept/wait mechanics changed.
 #[allow(clippy::too_many_arguments)]
-fn run_accept_loop(
-    listener: Listener,
+async fn run_accept_loop_async(
+    listener: AsyncListener,
     project_root: PathBuf,
     socket_path: PathBuf,
     pid_path: PathBuf,
@@ -354,52 +370,70 @@ fn run_accept_loop(
     shutdown: Arc<AtomicBool>,
     options: DaemonOptions,
 ) -> Result<()> {
+    use interprocess::local_socket::traits::tokio::Listener as _;
+
     let original_ppid = options.parent_pid.unwrap_or_else(current_ppid);
     let socket_display = socket_path.to_string_lossy().to_string();
     let idle_timeout_ms = resolve_idle_timeout_ms();
     let max_idle_ms = resolve_max_idle_ms();
     let client_sweep_ms = resolve_client_sweep_ms();
-    let mut last_sweep = std::time::Instant::now();
     info!(project = %project_root.display(), socket = %socket_path.display(), "daemon started");
 
     // ONE shared watcher per daemon process (issue-#411). Bound to a local so
     // its `Drop` stops the watch thread on shutdown. NEVER move this into
-    // `serve_session`: per-connection would spawn N watchers.
+    // the session task: per-connection would spawn N watchers.
     let _watcher = start_project_watcher(&project_root, &options);
 
     let _catch_up_done = spawn_catch_up(&project_root);
 
-    while !shutdown.load(Ordering::SeqCst) {
-        let state = SupervisionState {
-            original_ppid,
-            current_ppid: current_ppid(),
-            host_pid: options.host_pid,
-            session_leader: is_session_leader(),
-        };
-        if let Some(reason) = supervision_lost_reason(&state, is_process_alive) {
-            warn!(reason, "daemon watchdog stopping after supervisor loss");
-            break;
-        }
+    // Tick cadence for lifecycle checks: the client-sweep interval clamped to a
+    // responsive ceiling so idle-exit / supervision loss are observed promptly
+    // even when the sweep window is long. Same thresholds are evaluated per tick.
+    let tick_ms = client_sweep_ms.min(ACCEPT_POLL_INTERVAL.as_millis()).max(1) as u64;
+    let mut ticker = tokio::time::interval(Duration::from_millis(tick_ms));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_sweep = std::time::Instant::now();
 
-        match listener.accept() {
-            Ok(stream) => {
-                let session_project = project_root.clone();
-                let session_socket = socket_display.clone();
-                let session_registry = registry.clone();
-                let run_mcp = options.run_mcp;
-                thread::spawn(move || {
-                    if let Err(err) = serve_session(
-                        stream,
-                        session_project,
-                        session_socket,
-                        session_registry,
-                        run_mcp,
-                    ) {
-                        debug!(error = %err, "daemon session ended with error");
-                    }
-                });
-            }
-            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+    let stop_reason: Option<anyhow::Error> = loop {
+        if shutdown.load(Ordering::SeqCst) {
+            break None;
+        }
+        tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok(stream) => {
+                    let session_project = project_root.clone();
+                    let session_socket = socket_display.clone();
+                    let session_registry = registry.clone();
+                    let run_mcp = options.run_mcp;
+                    tokio::spawn(async move {
+                        if let Err(err) = serve_session_async(
+                            stream,
+                            session_project,
+                            session_socket,
+                            session_registry,
+                            run_mcp,
+                        )
+                        .await
+                        {
+                            debug!(error = %err, "daemon session ended with error");
+                        }
+                    });
+                }
+                Err(err) => {
+                    break Some(anyhow::Error::new(err).context("accepting daemon connection"));
+                }
+            },
+            _ = ticker.tick() => {
+                let state = SupervisionState {
+                    original_ppid,
+                    current_ppid: current_ppid(),
+                    host_pid: options.host_pid,
+                    session_leader: is_session_leader(),
+                };
+                if let Some(reason) = supervision_lost_reason(&state, is_process_alive) {
+                    warn!(reason, "daemon watchdog stopping after supervisor loss");
+                    break None;
+                }
                 if last_sweep.elapsed().as_millis() >= client_sweep_ms {
                     sweep_dead_clients(&registry);
                     last_sweep = std::time::Instant::now();
@@ -407,17 +441,15 @@ fn run_accept_loop(
                 let idle_ms = registry.millis_since_active();
                 if idle_ms > max_idle_ms {
                     info!(idle_ms, max_idle_ms, "daemon exiting on max-idle backstop");
-                    break;
+                    break None;
                 }
                 if registry.active_count() == 0 && idle_ms > idle_timeout_ms {
                     info!(idle_ms, idle_timeout_ms, "daemon idle-exit: no clients");
-                    break;
+                    break None;
                 }
-                thread::sleep(ACCEPT_POLL_INTERVAL);
             }
-            Err(err) => return Err(err).context("accepting daemon connection"),
         }
-    }
+    };
 
     cleanup_owned_lock(&pid_path, std::process::id());
     #[cfg(unix)]
@@ -425,7 +457,10 @@ fn run_accept_loop(
         let _ = fs::remove_file(stale);
     }
     info!(project = %project_root.display(), "daemon stopped");
-    Ok(())
+    match stop_reason {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 fn sweep_dead_clients(registry: &SessionRegistry) {
@@ -749,8 +784,8 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn bind_with_fallback_binds_the_preferred_socket_first() {
+    #[tokio::test]
+    async fn bind_with_fallback_binds_the_preferred_socket_first() {
         let root = temp_root("bind-fallback");
         fs::create_dir_all(paths::codegraph_dir(&root)).unwrap();
         let preferred = daemon_socket_path(&root);

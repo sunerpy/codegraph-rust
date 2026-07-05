@@ -10,14 +10,27 @@ use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 
-use interprocess::local_socket::traits::{Listener as _, Stream as _};
+#[cfg(test)]
+use interprocess::local_socket::ListenerNonblockingMode;
+use interprocess::local_socket::ListenerOptions;
+#[cfg(test)]
+use interprocess::local_socket::traits::Listener as _;
+use interprocess::local_socket::traits::Stream as _;
 #[cfg(unix)]
 use interprocess::local_socket::{GenericFilePath, ToFsName};
 #[cfg(windows)]
 use interprocess::local_socket::{GenericNamespaced, ToNsName};
-use interprocess::local_socket::{ListenerNonblockingMode, ListenerOptions};
 
-pub use interprocess::local_socket::{Listener, SendHalf, Stream};
+#[cfg(test)]
+pub use interprocess::local_socket::Listener;
+pub use interprocess::local_socket::{SendHalf, Stream};
+
+/// Async (tokio) local-socket types for the daemon accept loop. `AsyncListener`
+/// yields `AsyncStream`s whose split halves are `AsyncRead`/`AsyncWrite`, and on
+/// unix expose `AsFd` for the force-close reap handle.
+pub use interprocess::local_socket::tokio::{
+    Listener as AsyncListener, RecvHalf as AsyncRecvHalf, Stream as AsyncStream,
+};
 
 /// Resolved rendezvous address for a project daemon. On unix `socket_path` is
 /// the `.sock` filesystem path; on windows it holds the BARE namespaced name
@@ -59,6 +72,7 @@ impl Rendezvous {
     }
 }
 
+#[cfg(test)]
 pub fn bind(rendezvous: &Rendezvous) -> io::Result<Listener> {
     let listener = ListenerOptions::new()
         .name(rendezvous.name()?)
@@ -69,4 +83,13 @@ pub fn bind(rendezvous: &Rendezvous) -> io::Result<Listener> {
 
 pub fn connect(rendezvous: &Rendezvous) -> io::Result<Stream> {
     Stream::connect(rendezvous.name()?)
+}
+
+/// Bind the async (tokio) daemon listener at `rendezvous`. Mirrors [`bind`] but
+/// produces an [`AsyncListener`] whose `accept().await` yields async streams for
+/// the tokio accept loop. Must be called inside a tokio runtime context.
+pub fn bind_tokio(rendezvous: &Rendezvous) -> io::Result<AsyncListener> {
+    ListenerOptions::new()
+        .name(rendezvous.name()?)
+        .create_tokio()
 }
