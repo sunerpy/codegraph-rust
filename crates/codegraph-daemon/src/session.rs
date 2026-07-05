@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::Result;
+#[cfg(unix)]
 use interprocess::local_socket::traits::Stream as _;
 use interprocess::local_socket::traits::tokio::Stream as _;
 use serde::{Deserialize, Serialize};
