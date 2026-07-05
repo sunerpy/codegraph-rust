@@ -176,6 +176,8 @@ fn expand_workspace_glob(project_root: &str, pattern: &str) -> Vec<String> {
             format!("{base}/{name}")
         });
     }
+    // Deterministic order: read_dir is FS-ordered; sort so `or_insert` first-wins is stable.
+    out.sort();
     out
 }
 
