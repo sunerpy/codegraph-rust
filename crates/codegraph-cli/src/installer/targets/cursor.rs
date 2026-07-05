@@ -452,7 +452,7 @@ mod tests {
         assert!(out.contains("mcpServers"));
         assert!(out.contains("--path"));
         assert!(out.contains("${workspaceFolder}"));
-        assert!(out.contains(".cursor/mcp.json"));
+        assert!(out.replace('\\', "/").contains(".cursor/mcp.json"));
     }
 
     #[test]

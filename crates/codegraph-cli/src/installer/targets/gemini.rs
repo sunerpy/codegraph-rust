@@ -329,7 +329,7 @@ mod tests {
         let out = target.print_config(&ctx, Location::Global);
         assert!(out.contains("mcpServers"));
         assert!(out.contains("codegraph"));
-        assert!(out.contains(".gemini/settings.json"));
+        assert!(out.replace('\\', "/").contains(".gemini/settings.json"));
         assert!(out.contains("command"));
     }
 

@@ -794,7 +794,7 @@ mod tests {
     fn print_config_local_and_global_pattern() {
         let (ctx, base) = temp_ctx("print");
         let local = QoderTarget.print_config(&ctx, Location::Local);
-        assert!(local.contains(".qoder/mcp.json"));
+        assert!(local.replace('\\', "/").contains(".qoder/mcp.json"));
         assert!(local.contains("--path"));
 
         let global = QoderTarget.print_config(&ctx, Location::Global);

@@ -397,12 +397,32 @@ pub fn to_upstream_json(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_string())
 }
 
+// jsonc-parser 0.26 `CstStringLit::new_escaped` escapes only `"`, not `\` or
+// control chars, so a Windows path `C:\Users` emits invalid JSON `"C:\Users"`.
+// Pre-escape everything JSON-significant EXCEPT `"` (the library owns quotes).
+fn escape_for_cst_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn to_cst_input(value: &Value) -> CstInputValue {
     match value {
         Value::Null => CstInputValue::Null,
         Value::Bool(b) => CstInputValue::Bool(*b),
         Value::Number(n) => CstInputValue::Number(n.to_string()),
-        Value::String(s) => CstInputValue::String(s.clone()),
+        Value::String(s) => CstInputValue::String(escape_for_cst_string(s)),
         Value::Array(arr) => CstInputValue::Array(arr.iter().map(to_cst_input).collect()),
         Value::Object(map) => CstInputValue::Object(
             map.iter()
@@ -780,6 +800,29 @@ mod tests {
         assert!(out.contains("\"codegraph\""));
         assert!(out.contains("null"));
         assert!(out.contains('7'));
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn upsert_nested_key_via_cst_handles_backslash_and_control_chars() {
+        let p = tmp_path("cst-backslash.json");
+        fs::write(
+            &p,
+            "{\n  \"mcpServers\": { \"other\": { \"command\": \"foo\" } }\n}\n",
+        )
+        .unwrap();
+        let win = "C:\\Users\\me\\proj\"q\ttab";
+        let value = serde_json::json!({ "command": "codegraph", "args": ["--path", win] });
+        upsert_nested_key_jsonc(&p, "mcpServers", "codegraph", &value, None).unwrap();
+        let out = fs::read_to_string(&p).unwrap();
+        let reparsed = parse_json_object(&out).expect("emitted JSONC must re-parse");
+        assert_eq!(
+            reparsed["mcpServers"]["codegraph"]["args"][1]
+                .as_str()
+                .unwrap(),
+            win
+        );
+        assert!(reparsed["mcpServers"]["other"].is_object());
         let _ = fs::remove_dir_all(p.parent().unwrap());
     }
 

@@ -4361,6 +4361,7 @@ mod pure_helper_tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn normalize_impact_input_makes_absolute_under_project_relative() {
         assert_eq!(
             normalize_impact_input("/proj/scenes/x.tscn", Path::new("/proj")),

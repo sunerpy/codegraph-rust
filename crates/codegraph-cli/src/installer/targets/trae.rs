@@ -595,7 +595,7 @@ mod tests {
         assert!(out.contains("mcp.json"));
 
         let local = TraeTarget.print_config(&ctx, Location::Local);
-        assert!(local.contains(".trae/mcp.json"));
+        assert!(local.replace('\\', "/").contains(".trae/mcp.json"));
         let _ = fs::remove_dir_all(base);
     }
 }
