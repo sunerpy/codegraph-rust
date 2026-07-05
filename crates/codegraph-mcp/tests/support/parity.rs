@@ -1,17 +1,16 @@
-//! L1 behavioral-parity harness.
+//! Behavioral-parity harness.
 //!
 //! Runs one MCP request through the rmcp transport and returns the parsed
 //! response `Value`, then structurally compares it against the GOLDEN response.
 //! This is how "rmcp reproduces the golden" is PROVEN across the 15 fixtures
-//! (L2) rather than asserted:
+//! rather than asserted:
 //! - [`run_rmcp_stdio`] drives the `CodeGraphHandler` over a `tokio::io::duplex`
 //!   pair with a real rmcp client — exercising rmcp's REAL framing, NOT direct
 //!   method calls.
 //! - [`assert_parity`] applies the SAME structural comparison the golden suite
 //!   uses (type/isError/sorted-text-lines for tool results; names+order+schema
 //!   for tools/list; capabilities/serverInfo.name/instructions + negotiated
-//!   protocolVersion for initialize). The BASELINE is the golden JSON itself
-//!   (Phase E deleted the hand-rolled `run_old` server).
+//!   protocolVersion for initialize). The BASELINE is the golden JSON itself.
 //!
 //! Included via `#[path]` by the parity tests; not a standalone test binary.
 #![allow(dead_code)]

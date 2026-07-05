@@ -1,11 +1,11 @@
-//! rmcp `ServerHandler` for CodeGraph — the official-SDK stdio transport
-//! (Phase A), running ALONGSIDE the hand-rolled [`crate::McpServer`].
+//! rmcp `ServerHandler` for CodeGraph — the official-SDK stdio transport,
+//! running ALONGSIDE the hand-rolled [`crate::McpServer`].
 //!
 //! Reuses the sync engine + rendering layer verbatim: [`CodeGraphEngine`],
 //! [`crate::schemas`], [`crate::instructions::SERVER_INSTRUCTIONS`], and the
 //! `roots` project resolution. Only the transport/session shell is rmcp.
 //!
-//! ## Sync engine bridge (Decision 10)
+//! ## Sync engine bridge
 //!
 //! [`CodeGraphEngine`] wraps a `rusqlite::Connection` — `Send + !Sync`. rmcp
 //! handler futures are `Send + 'static`, so a `&CodeGraphEngine` borrowed
@@ -16,7 +16,7 @@
 //! clone of the cache + owned project path + owned args and returns an owned
 //! result. No engine borrow crosses the closure boundary.
 //!
-//! ## Panic isolation (Decision 9 / Q5-unwind)
+//! ## Panic isolation
 //!
 //! With `[profile.release] panic = "unwind"`, a panic inside the
 //! `spawn_blocking` closure surfaces as `JoinError::is_panic()`, which this maps
@@ -130,7 +130,7 @@ impl CodeGraphHandler {
         }
     }
 
-    /// Streamable-HTTP constructor (Phase C): the project is PINNED via
+    /// Streamable-HTTP constructor: the project is PINNED via
     /// `--path` and roots adoption is OFF (`no_roots`), mirroring
     /// [`crate::McpServer::http`]. Identical state to [`Self::new`] with the
     /// default project set; named separately to make the no_roots/pinned intent
@@ -139,7 +139,7 @@ impl CodeGraphHandler {
         Self::new(Some(project))
     }
 
-    /// Non-pinned stdio constructor (Phase B): `no_roots = false`, so
+    /// Non-pinned stdio constructor: `no_roots = false`, so
     /// `on_initialized` requests the client's roots and adopts an indexed one
     /// when the current default is displaceable (`roots::` adoption rules). This
     /// is the bare-`serve --mcp` / Zed-local case where `default_project` is a
@@ -345,7 +345,7 @@ impl ServerHandler for CodeGraphHandler {
 
     async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
         // HTTP / pinned (`no_roots`) mode NEVER requests roots — leave the pin
-        // exactly as Phase C. Only the non-pinned stdio path adopts.
+        // as-is. Only the non-pinned stdio path adopts.
         if self.no_roots {
             return;
         }
@@ -448,7 +448,7 @@ impl ServerHandler for CodeGraphHandler {
             )
         );
 
-        // Decision 10: open+execute+render entirely inside ONE spawn_blocking
+        // open+execute+render entirely inside ONE spawn_blocking
         // closure returning an OWNED ToolResult; nothing borrows &self.
         //
         // Per-request timeout (Kiro 2h-hang fix): the JoinHandle is a Future, so
@@ -486,7 +486,7 @@ impl ServerHandler for CodeGraphHandler {
             }
         };
 
-        // Decision 9 / Q5-unwind: a panic inside the closure surfaces as a
+        // A panic inside the closure surfaces as a
         // JoinError; map it to an isError result so the process survives.
         let result = match join {
             Ok(result) => result,
@@ -581,7 +581,7 @@ pub async fn debug_log_requests(
 /// signalled.
 ///
 /// `default_project` selects the mode: `Some(project)` PINS the server to one
-/// project (Phase C — the Zed-remote / single-project path), so a call without
+/// project (the Zed-remote / single-project path), so a call without
 /// `projectPath` resolves that pinned default. `None` is the GLOBAL mode: no
 /// pinned default, every tool call MUST carry its own `projectPath`, and one
 /// server serves many projects (the HTTP analog of the Kiro/Qoder bare global

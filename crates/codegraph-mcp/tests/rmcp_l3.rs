@@ -1,6 +1,6 @@
-//! L3 property / adversarial tests for the rmcp `CodeGraphHandler` (Phase A).
+//! Property / adversarial tests for the rmcp `CodeGraphHandler`.
 //!
-//! RED-first proofs for the risk areas the spike flagged:
+//! Proofs for the risk areas:
 //! (a) capabilities serialize to EXACTLY `{"tools":{}}`;
 //! (b) the NEGOTIATED initialize protocolVersion is `2024-11-05`;
 //! (c) an unknown tool → `error.code == -32602`;
@@ -8,7 +8,7 @@
 //!     runtime/process survives (Q5-unwind);
 //! (e) dynamic tools/list: indexed default → full surface; no indexed default →
 //!     the projectPath-required variant.
-// rmcp is the sole MCP transport (Phase E); this test exercises it unconditionally.
+// rmcp is the sole MCP transport; this test exercises it unconditionally.
 
 #[path = "support/parity.rs"]
 mod parity;

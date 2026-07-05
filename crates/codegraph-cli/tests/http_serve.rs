@@ -1,4 +1,4 @@
-//! Phase C — CLI arg wiring for `codegraph serve --http`.
+//! CLI arg wiring for `codegraph serve --http`.
 //!
 //! Exercises the real `codegraph` binary (built with `--features rmcp`, gated
 //! below) end-to-end:

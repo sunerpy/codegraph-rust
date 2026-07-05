@@ -4693,6 +4693,9 @@ mod formatter_and_env_tests {
     use super::*;
     use codegraph_core::types::{FileRecord, Language, NodeKind};
 
+    // Serializes tests that mutate process-global env (cargo test runs them concurrently).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn tmp(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
             "cg-cli-fmt-{tag}-{}-{}",
@@ -4904,6 +4907,7 @@ mod formatter_and_env_tests {
 
     #[test]
     fn home_dir_resolves_from_home_then_userprofile_then_errors() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev_home = std::env::var_os("HOME");
         let prev_up = std::env::var_os("USERPROFILE");
         unsafe { std::env::set_var("HOME", "/home/tester") };
@@ -4921,6 +4925,7 @@ mod formatter_and_env_tests {
 
     #[test]
     fn completion_target_paths_per_shell() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev_home = std::env::var_os("HOME");
         let prev_xdg = std::env::var_os("XDG_DATA_HOME");
         let prev_local = std::env::var_os("LOCALAPPDATA");
@@ -4971,6 +4976,7 @@ mod formatter_and_env_tests {
 
     #[test]
     fn powershell_profile_path_override_then_userprofile_then_error() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev_ps = std::env::var_os("CODEGRAPH_PS_PROFILE");
         let prev_up = std::env::var_os("USERPROFILE");
         let prev_home = std::env::var_os("HOME");
@@ -5111,6 +5117,7 @@ mod formatter_and_env_tests {
 
     #[test]
     fn install_completions_writes_zsh_fish_elvish_into_home() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tmp("install-comp");
         let prev_home = std::env::var_os("HOME");
         let prev_xdg = std::env::var_os("XDG_DATA_HOME");
@@ -5150,6 +5157,7 @@ mod formatter_and_env_tests {
 
     #[test]
     fn install_completions_powershell_writes_script_and_dot_sources_profile() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tmp("install-ps");
         let prev_local = std::env::var_os("LOCALAPPDATA");
         let prev_ps = std::env::var_os("CODEGRAPH_PS_PROFILE");

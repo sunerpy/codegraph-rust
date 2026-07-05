@@ -2,7 +2,7 @@
 //!
 //! The launcher process the MCP host actually spawns becomes a thin
 //! stdio<->socket bridge to the shared daemon. Unlike a raw byte pump, this is
-//! the LOCAL-HANDSHAKE proxy (colby `runLocalHandshakeProxy`, proxy.ts:204-378):
+//! the LOCAL-HANDSHAKE proxy (colby `runLocalHandshakeProxy`):
 //!
 //!   * `initialize` and `tools/list` are answered LOCALLY from this build's
 //!     static constants the instant the host asks, so tool registration is
@@ -17,9 +17,9 @@
 //! and `protocol` are verified against this build; a mismatch returns
 //! [`ProxyOutcome::VersionMismatch`] so the caller falls back to direct serving.
 //!
-//! A PPID watchdog (colby proxy.ts:380-401) forces the proxy to exit if the MCP
+//! A PPID watchdog (colby proxy.ts) forces the proxy to exit if the MCP
 //! host dies without closing stdin (SIGKILL on POSIX). The proxy does NOT send a
-//! client-hello yet — that is T9.
+//! client-hello yet.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -135,7 +135,7 @@ pub fn run_proxy<R: BufRead, W: Write + Send + 'static>(
     let host_out = Arc::new(Mutex::new(host_out));
 
     // PPID watchdog: a SIGKILL'd host never closes stdin on POSIX, so poll the
-    // host pid and flip shutdown when supervision is lost (colby proxy.ts:380).
+    // host pid and flip shutdown when supervision is lost (colby proxy.ts).
     let watchdog =
         spawn_ppid_watchdog(host_ppid, Arc::clone(&watchdog_wake), Arc::clone(&shutdown));
 
@@ -267,7 +267,7 @@ where
             Some("tools/list") => {
                 // Answer locally; do NOT forward (the daemon would re-answer it).
                 //
-                // Phase D decision: PRESERVE the static full-tool-surface answer
+                // PRESERVE the static full-tool-surface answer
                 // (`visible_tool_definitions`), NOT the dynamic
                 // required-projectPath variant. This is correct here — the daemon
                 // proxy path is only entered when the project has a `.codegraph/`

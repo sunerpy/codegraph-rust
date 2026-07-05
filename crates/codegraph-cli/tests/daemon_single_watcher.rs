@@ -1,5 +1,5 @@
-//! End-to-end test for T4: the DAEMON process owns ONE `ProjectWatcher` per
-//! project, shared by all N client connections (the issue-#411 win).
+//! End-to-end test: the DAEMON process owns ONE `ProjectWatcher` per
+//! project, shared by all N client connections.
 //!
 //! The watcher lives in a SEPARATE detached process, so an in-process
 //! `watcher_count()` hook is unreachable. We assert BEHAVIORALLY via the

@@ -1,6 +1,6 @@
-//! Phase B — roots-adoption behavior for the rmcp `CodeGraphHandler`.
+//! Roots-adoption behavior for the rmcp `CodeGraphHandler`.
 //!
-//! The Phase-0 spike established that the old wire-frame test (two frames from
+//! The old wire-frame test (two frames from
 //! one `run()`) CANNOT be mirrored over rmcp's owned read loop, so adoption is
 //! asserted at the BEHAVIOR level via a real rmcp client↔server pair over
 //! `tokio::io::duplex`:
@@ -17,10 +17,7 @@
 //!   - GUARD: an HTTP/`no_roots` handler (`CodeGraphHandler::http`) never
 //!     requests roots — even a roots-capable client leaves it unadopted, so a
 //!     tool call with NO projectPath against an unindexed pin errors.
-//!
-//! RED until `CodeGraphHandler` grows the non-pinned adoption path
-//! (`on_initialized` → `peer.list_roots()` → `roots::` adoption rules).
-// rmcp is the sole MCP transport (Phase E); this test exercises it unconditionally.
+// rmcp is the sole MCP transport; this test exercises it unconditionally.
 
 #[path = "support/parity.rs"]
 mod parity;
@@ -248,7 +245,7 @@ fn rmcp_does_not_adopt_unindexed_client_root() {
 
 /// GUARD: an HTTP/`no_roots` handler never requests roots. Even a roots-capable
 /// client that reports an INDEXED root leaves the unindexed HTTP pin unadopted,
-/// so a tool call with NO projectPath errors (parity with Phase C's no_roots).
+/// so a tool call with NO projectPath errors (parity with the pinned no_roots path).
 #[test]
 fn rmcp_http_no_roots_never_adopts() {
     rt().block_on(async {

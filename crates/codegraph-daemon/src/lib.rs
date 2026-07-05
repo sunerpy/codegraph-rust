@@ -121,7 +121,7 @@ pub struct DaemonOptions {
     pub watchdog_interval: Duration,
     pub run_mcp: bool,
     /// When true (default), the daemon owns ONE shared `ProjectWatcher` for the
-    /// project (issue-#411: N client inotify sets collapse to 1). Honors
+    /// project (N client inotify sets collapse to 1). Honors
     /// `watch_disabled_reason` (e.g. `CODEGRAPH_NO_WATCH=1`).
     pub watch: bool,
 }
@@ -379,7 +379,7 @@ async fn run_accept_loop_async(
     let client_sweep_ms = resolve_client_sweep_ms();
     info!(project = %project_root.display(), socket = %socket_path.display(), "daemon started");
 
-    // ONE shared watcher per daemon process (issue-#411). Bound to a local so
+    // ONE shared watcher per daemon process. Bound to a local so
     // its `Drop` stops the watch thread on shutdown. NEVER move this into
     // the session task: per-connection would spawn N watchers.
     let _watcher = start_project_watcher(&project_root, &options);

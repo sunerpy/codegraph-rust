@@ -1,19 +1,16 @@
-//! Phase D / Decision 12 — the daemon dead-client reap contract MUST survive
-//! the rmcp-backed session.
+//! The daemon dead-client reap contract MUST survive the rmcp-backed session.
 //!
 //! The daemon serves each connection on a per-connection blocking `std::thread`
 //! (`lib.rs` accept loop → `serve_session`). `shutdown_session` reaps a wedged
 //! client by half/full-closing its socket so the session thread hits EOF,
 //! returns, and drops its `SessionGuard` (which removes the registry entry).
 //!
-//! Phase A/B/C moved the transport to rmcp, whose async stdio serve runs on a
-//! `tokio` CURRENT-THREAD runtime INSIDE that blocking thread (Decision B5).
 //! This test proves the async-rmcp session STILL honors force-EOF reap: after a
 //! socket half-close, the session terminates and the registry drops to zero
 //! within a bounded timeout — the same contract `read_daemon_hello_times_out`
 //! does NOT cover.
 //!
-//! rmcp is the sole daemon-session transport (Phase E), so this exercises the
+//! rmcp is the sole daemon-session transport, so this exercises the
 //! shipped path directly.
 
 #![cfg(unix)]
@@ -68,7 +65,7 @@ fn read_initialize_reply<R: BufRead>(
 
 #[test]
 fn shutdown_reaps_rmcp_backed_session_on_socket_close() {
-    // The daemon session always routes through the rmcp serve path (Phase E).
+    // The daemon session always routes through the rmcp serve path.
     // Keep the daemon from spawning a watcher/catch-up that would touch the
     // empty temp project (run_mcp still true so the session actually serves).
     unsafe { std::env::set_var("CODEGRAPH_NO_WATCH", "1") };

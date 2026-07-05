@@ -1,4 +1,4 @@
-//! Phase C — streamable-HTTP integration for the rmcp `CodeGraphHandler`.
+//! Streamable-HTTP integration for the rmcp `CodeGraphHandler`.
 //!
 //! Starts an rmcp `StreamableHttpService` bound on `127.0.0.1:0` (ephemeral)
 //! serving `CodeGraphHandler::http(<mini indexed fixture>)` in no_roots/pinned
@@ -15,7 +15,7 @@
 //! The server runs in stateless `json_response` mode: every POST returns a
 //! single `application/json` body (no SSE), because no_roots mode never emits a
 //! server-initiated message — the exact shape a plain MCP url client consumes.
-// rmcp is the sole MCP transport (Phase E); this test exercises it unconditionally.
+// rmcp is the sole MCP transport; this test exercises it unconditionally.
 
 #[path = "support/parity.rs"]
 mod parity;

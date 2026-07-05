@@ -1,4 +1,4 @@
-//! Phase E — the CLI direct stdio serve path (`serve --mcp`) routes through the
+//! The CLI direct stdio serve path (`serve --mcp`) routes through the
 //! rmcp `CodeGraphHandler` (the sole MCP transport).
 //!
 //! Drives the real `codegraph` binary end-to-end from an INDEXED cwd with the

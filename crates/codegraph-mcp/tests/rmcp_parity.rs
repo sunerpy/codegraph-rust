@@ -1,10 +1,9 @@
-//! L2 parity: the 15 golden MCP fixtures through the rmcp stdio handler.
+//! Parity: the 15 golden MCP fixtures through the rmcp stdio handler.
 //!
 //! For EACH `reference/golden/mcp/*.json` fixture, drive the request through the
 //! rmcp stdio handler and assert structural parity against the GOLDEN response
 //! itself — `assert_parity(fixture, golden_response, run_rmcp_stdio(req))`. The
-//! golden JSON is the baseline now that the hand-rolled `run_old` server is
-//! deleted (Phase E); the SAME golden files remain the invariant, no new
+//! golden JSON is the baseline; the SAME golden files remain the invariant, no new
 //! fixtures are added.
 
 #[path = "support/parity.rs"]

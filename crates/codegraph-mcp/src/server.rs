@@ -228,7 +228,7 @@ impl McpServer {
     /// (or EOF). Reads `reader` line-by-line, writes one response line per
     /// request to `writer`. Notifications (no `id`) produce no output
     /// (`session.ts:118` gates every reply on `isRequest`). This is the ONE
-    /// retained hand-rolled path (Decision 11): the broad-root→daemon handoff
+    /// retained hand-rolled path: the broad-root→daemon handoff
     /// needs the raw reader back mid-session, which rmcp (owning its own read
     /// loop) cannot provide. All other serve paths go through the rmcp handler.
     pub fn run_until_adoption<R: BufRead, W: Write>(
