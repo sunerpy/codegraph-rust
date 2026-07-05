@@ -26,8 +26,8 @@ use std::path::PathBuf;
 use serde_json::{Value, json};
 
 use super::super::shared::{
-    ConfigRead, read_config_file, read_json_file, remove_nested_key_jsonc, to_upstream_json,
-    upsert_nested_key_jsonc, write_json_file,
+    ConfigRead, inject_zed_remote_comment, read_config_file, read_json_file,
+    remove_nested_key_jsonc, to_upstream_json, upsert_nested_key_jsonc, write_json_file,
 };
 use super::super::types::{
     AgentTarget, DetectionResult, FileAction, FileWrite, InstallContext, InstallOptions, Location,
@@ -136,11 +136,17 @@ impl AgentTarget for ZedTarget {
                 ctx_servers.insert("codegraph".to_string(), entry.clone());
                 config.insert("context_servers".to_string(), Value::Object(ctx_servers));
                 let _ = write_json_file(&file, &config);
+                inject_zed_remote_comment(&file);
                 FileAction::Created
             }
             ConfigRead::Parsed(_) => {
-                upsert_nested_key_jsonc(&file, "context_servers", "codegraph", &entry, None)
-                    .unwrap_or(FileAction::Skipped)
+                let action =
+                    upsert_nested_key_jsonc(&file, "context_servers", "codegraph", &entry, None)
+                        .unwrap_or(FileAction::Skipped);
+                if action != FileAction::Skipped {
+                    inject_zed_remote_comment(&file);
+                }
+                action
             }
         };
         let notes = match loc {
@@ -470,6 +476,104 @@ mod tests {
         assert!(global.contains("context_servers"));
         assert!(global.contains(ZED_GLOBAL_WHY));
         assert!(global.contains(ZED_GLOBAL_HOWTO));
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    fn read_text(ctx: &InstallContext, loc: Location) -> String {
+        fs::read_to_string(settings_path(ctx, loc)).unwrap()
+    }
+
+    fn assert_active_stdio_and_commented_alternatives(text: &str) {
+        let parsed =
+            super::super::super::shared::parse_json_object(text).expect("settings.json parses");
+        let entry = &parsed["context_servers"]["codegraph"];
+        assert_eq!(entry["command"], json!("codegraph"), "active stdio intact");
+        assert!(entry.get("url").is_none(), "active entry must stay stdio");
+        assert!(
+            text.contains(super::super::super::shared::ZED_REMOTE_COMMENT_SENTINEL),
+            "remote-alternatives sentinel missing:\n{text}"
+        );
+        assert!(
+            text.contains("\"command\": \"ssh\""),
+            "ssh remote alternative missing:\n{text}"
+        );
+        assert!(
+            text.contains("http://localhost:8111/mcp"),
+            "http alternative url missing:\n{text}"
+        );
+        assert!(
+            text.contains("RECOMMENDED for remote"),
+            "http must be marked recommended for remote:\n{text}"
+        );
+    }
+
+    // (ix) Fresh install → active stdio context_servers.codegraph AND commented
+    // ssh + http(recommended) alternatives; parses as JSONC. Covers both
+    // Global (missing-file seed) and Local (init-equivalent) paths.
+    #[test]
+    fn fresh_install_has_active_stdio_plus_commented_ssh_and_http_alternatives() {
+        for loc in [Location::Global, Location::Local] {
+            let (ctx, base) = temp_ctx("fresh-alt");
+            let result = run_install(&ctx, loc);
+            assert_eq!(result.files[0].action, FileAction::Created);
+            assert_active_stdio_and_commented_alternatives(&read_text(&ctx, loc));
+            let _ = fs::remove_dir_all(base);
+        }
+    }
+
+    // (x) Re-install is idempotent — no duplicated comment block, stdio intact.
+    #[test]
+    fn remote_comment_injection_is_idempotent() {
+        let (ctx, base) = temp_ctx("alt-idem");
+        run_install(&ctx, Location::Global);
+        let first = read_text(&ctx, Location::Global);
+
+        run_install(&ctx, Location::Global);
+        let second = read_text(&ctx, Location::Global);
+
+        assert_eq!(first, second, "re-install churned the file");
+        assert_eq!(
+            second
+                .matches(super::super::super::shared::ZED_REMOTE_COMMENT_SENTINEL)
+                .count(),
+            1,
+            "remote comment duplicated on re-run"
+        );
+        assert_active_stdio_and_commented_alternatives(&second);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    // (xi) Install into an existing settings.json preserves the user's other
+    // context_servers + settings + comments, and still injects the alternatives.
+    #[test]
+    fn install_into_existing_settings_preserves_user_content_and_injects() {
+        let (ctx, base) = temp_ctx("alt-existing");
+        let file = settings_path(&ctx, Location::Global);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(
+            &file,
+            "{\n  // user setting — must survive\n  \"theme\": \"One Dark\",\n  \"context_servers\": {\n    \"other\": { \"command\": \"other-mcp\", \"args\": [], \"env\": {} }\n  }\n}\n",
+        )
+        .unwrap();
+
+        run_install(&ctx, Location::Global);
+
+        let text = read_text(&ctx, Location::Global);
+        assert!(text.contains("// user setting — must survive"), "{text}");
+        assert!(text.contains("\"theme\""), "user setting lost:\n{text}");
+        let parsed =
+            super::super::super::shared::parse_json_object(&text).expect("still parses as JSONC");
+        assert_eq!(
+            parsed["context_servers"]["other"]["command"],
+            json!("other-mcp"),
+            "sibling context server lost"
+        );
+        assert_eq!(parsed["theme"], json!("One Dark"), "user setting lost");
+        assert_active_stdio_and_commented_alternatives(&text);
+
+        run_install(&ctx, Location::Global);
+        assert_eq!(read_text(&ctx, Location::Global), text, "second churned");
 
         let _ = fs::remove_dir_all(base);
     }

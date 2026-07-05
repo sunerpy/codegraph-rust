@@ -164,6 +164,138 @@ fn kiro_install_writes_stdio_plus_commented_http_localhost_alternative() {
     );
 }
 
+/// Zed's `settings.json` must keep the ACTIVE stdio `context_servers.codegraph`
+/// entry AND carry `//`-commented ssh-remote + HTTP(recommended-for-remote)
+/// alternatives — parseable as JSONC, idempotent, and non-corrupting of a user's
+/// pre-existing settings.
+#[test]
+fn zed_install_writes_stdio_plus_commented_ssh_and_http_alternatives() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+
+    let cfg = project.child(".zed/settings.json");
+    cfg.write_str(
+        "{\n  // user setting — must survive\n  \"theme\": \"One Dark\",\n  \"context_servers\": {\n    \"other\": { \"command\": \"other-mcp\", \"args\": [], \"env\": {} }\n  }\n}\n",
+    )
+    .unwrap();
+
+    run_install(&home, project.path(), "zed");
+
+    let after = std::fs::read_to_string(cfg.path()).unwrap();
+    assert!(
+        after.contains("// user setting — must survive"),
+        "user comment lost:\n{after}"
+    );
+    assert!(after.contains("\"theme\""), "user setting lost:\n{after}");
+    assert!(after.contains("\"other\""), "sibling lost:\n{after}");
+    assert!(
+        after.contains("\"codegraph\""),
+        "codegraph entry missing:\n{after}"
+    );
+    assert!(
+        after.contains("// Remote development alternatives"),
+        "remote-alternatives sentinel missing:\n{after}"
+    );
+    assert!(
+        after.contains("\"command\": \"ssh\""),
+        "ssh remote alternative missing:\n{after}"
+    );
+    assert!(
+        after.contains("http://localhost:8111/mcp"),
+        "http alternative url missing:\n{after}"
+    );
+    assert!(
+        after.contains("RECOMMENDED for remote"),
+        "http must be marked recommended for remote:\n{after}"
+    );
+    assert!(
+        after.contains("codegraph serve --http"),
+        "one-command HTTP start WHY note missing:\n{after}"
+    );
+
+    // Re-install is idempotent: byte-identical, single comment block.
+    run_install(&home, project.path(), "zed");
+    let second = std::fs::read_to_string(cfg.path()).unwrap();
+    assert_eq!(after, second, "re-install churned the file");
+    assert_eq!(
+        second.matches("// Remote development alternatives").count(),
+        1,
+        "remote comment duplicated:\n{second}"
+    );
+
+    // uninstall removes the active codegraph entry, leaving the sibling.
+    Command::cargo_bin("codegraph")
+        .unwrap()
+        .args(["uninstall", "--target=zed", "--local"])
+        .current_dir(project.path())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.child("xdg").path())
+        .env("HERMES_HOME", home.child("hermes").path())
+        .env_remove("APPDATA")
+        .assert()
+        .success();
+    let removed = std::fs::read_to_string(cfg.path()).unwrap();
+    let parsed: serde_json::Value = {
+        let stripped = removed
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        serde_json::from_str(&stripped).expect("post-uninstall settings still parse")
+    };
+    assert!(
+        parsed["context_servers"].get("codegraph").is_none(),
+        "active codegraph entry not removed:\n{removed}"
+    );
+    assert!(
+        parsed["context_servers"].get("other").is_some(),
+        "sibling lost on uninstall:\n{removed}"
+    );
+}
+
+/// `codegraph init --target=zed` (project-local) also injects the commented
+/// ssh + http alternatives alongside the active `--path`-pinned stdio entry.
+#[test]
+fn zed_init_injects_commented_alternatives() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    // A minimal source file so indexing has something to walk.
+    project
+        .child("main.rs")
+        .write_str("fn main() {}\n")
+        .unwrap();
+
+    Command::cargo_bin("codegraph")
+        .unwrap()
+        .args(["init", "--target=zed"])
+        .current_dir(project.path())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.child("xdg").path())
+        .env("HERMES_HOME", home.child("hermes").path())
+        .env_remove("APPDATA")
+        .assert()
+        .success();
+
+    let cfg = project.child(".zed/settings.json");
+    let after = std::fs::read_to_string(cfg.path()).unwrap();
+    assert!(
+        after.contains("--path"),
+        "init must pin an absolute --path:\n{after}"
+    );
+    assert!(
+        after.contains("// Remote development alternatives"),
+        "init did not inject remote alternatives:\n{after}"
+    );
+    assert!(
+        after.contains("\"command\": \"ssh\""),
+        "ssh alternative missing after init:\n{after}"
+    );
+    assert!(
+        after.contains("http://localhost:8111/mcp") && after.contains("RECOMMENDED for remote"),
+        "http(recommended) alternative missing after init:\n{after}"
+    );
+}
+
 #[test]
 fn version_subcommand_matches_flag() {
     let sub = Command::cargo_bin("codegraph")

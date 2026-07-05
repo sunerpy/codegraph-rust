@@ -58,26 +58,83 @@ pub fn kiro_http_comment_block() -> &'static str {
      // \"codegraph\": { \"url\": \"http://localhost:8111/mcp\" }"
 }
 
+/// Idempotency sentinel for [`zed_remote_comment_block`].
+pub const ZED_REMOTE_COMMENT_SENTINEL: &str = "// Remote development alternatives";
+
+/// The `//`-commented remote-development alternatives injected into Zed's JSONC
+/// `settings.json` alongside the active stdio `context_servers.codegraph` entry.
+///
+/// Two options: (1) SSH stdio — run codegraph on the remote host over `ssh -T`;
+/// (2) HTTP, marked RECOMMENDED for remote (a single `codegraph serve --http`
+/// avoids the extra ssh hop + stdio buffering fragility). Zed's HTTP context-
+/// server shape is a bare `{ "url": … }` (verified against Zed's MCP docs +
+/// source: untagged enum, `url` is the sole discriminator, no `type`/`source`).
+pub fn zed_remote_comment_block() -> &'static str {
+    "// Remote development alternatives (uncomment ONE; remove the stdio entry above):\n\
+     // 1) SSH stdio — run codegraph on the remote host over `ssh -T`:\n\
+     //    \"codegraph\": { \"command\": \"ssh\", \"args\": [\"-T\", \"<host>\", \"cd <project> && codegraph serve --mcp --path <project>\"], \"env\": {} }\n\
+     // 2) HTTP (RECOMMENDED for remote) — start `codegraph serve --http` (default\n\
+     //    127.0.0.1:8111) on the reachable host, or port-forward it, then point Zed\n\
+     //    at the url. HTTP avoids the extra ssh hop + stdio buffering that make\n\
+     //    ssh-stdio fragile over Zed remote development. Zed's HTTP context-server\n\
+     //    shape is a bare `url` (see https://zed.dev/docs/ai/mcp):\n\
+     //    \"codegraph\": { \"url\": \"http://localhost:8111/mcp\" }"
+}
+
 /// Best-effort idempotent injection of the [`kiro_http_comment_block`] after the
-/// active stdio `codegraph` entry inside `mcpServers`. No-op if the sentinel is
-/// already present, `mcpServers`/`codegraph` cannot be located, or the file is
-/// unreadable — the active stdio entry is never touched, existing bytes never
-/// corrupted (correctness over always injecting).
+/// active stdio `codegraph` entry inside `mcpServers`. See
+/// [`inject_commented_alternative`] for the shared mechanics.
 pub fn inject_kiro_http_comment(path: &Path) -> bool {
+    inject_commented_alternative(
+        path,
+        "mcpServers",
+        "codegraph",
+        KIRO_HTTP_COMMENT_SENTINEL,
+        kiro_http_comment_block(),
+    )
+}
+
+/// Best-effort idempotent injection of the [`zed_remote_comment_block`] after the
+/// active stdio `codegraph` entry inside `context_servers`.
+pub fn inject_zed_remote_comment(path: &Path) -> bool {
+    inject_commented_alternative(
+        path,
+        "context_servers",
+        "codegraph",
+        ZED_REMOTE_COMMENT_SENTINEL,
+        zed_remote_comment_block(),
+    )
+}
+
+/// Append a `//`-commented `comment_block` right after the active
+/// `<parent_key>.<entry_key>` object inside a JSONC file, matching the entry's
+/// indentation. Idempotent (no-op if `sentinel` is already present) and
+/// non-corrupting: no-op when the file is unreadable or the parent/entry cannot
+/// be located, and the active entry itself is never touched. Correctness over
+/// always injecting.
+pub fn inject_commented_alternative(
+    path: &Path,
+    parent_key: &str,
+    entry_key: &str,
+    sentinel: &str,
+    comment_block: &str,
+) -> bool {
     let Ok(text) = fs::read_to_string(path) else {
         return false;
     };
-    if text.contains(KIRO_HTTP_COMMENT_SENTINEL) {
+    if text.contains(sentinel) {
         return false;
     }
-    let Some(anchor) = text.find("\"mcpServers\"") else {
+    let parent_needle = format!("\"{parent_key}\"");
+    let Some(anchor) = text.find(&parent_needle) else {
         return false;
     };
     let Some(brace_rel) = text[anchor..].find('{') else {
         return false;
     };
     let obj_open = anchor + brace_rel;
-    let Some(cg_rel) = text[obj_open..].find("\"codegraph\"") else {
+    let entry_needle = format!("\"{entry_key}\"");
+    let Some(cg_rel) = text[obj_open..].find(&entry_needle) else {
         return false;
     };
     let cg_at = obj_open + cg_rel;
@@ -96,7 +153,7 @@ pub fn inject_kiro_http_comment(path: &Path) -> bool {
         .chars()
         .take_while(|c| *c == ' ' || *c == '\t')
         .collect();
-    let block = kiro_http_comment_block()
+    let block = comment_block
         .lines()
         .map(|l| format!("{indent}{l}"))
         .collect::<Vec<_>>()

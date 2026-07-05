@@ -60,6 +60,11 @@ serves tools read-only off any existing index, with the agent passing the projec
 `--path` for live watch. Kiro's `mcp.json` also carries a `//`-commented HTTP alternative alongside the
 active stdio entry (JSONC, idempotent, injected best-effort without corrupting existing files); it uses
 `http://localhost:8111/mcp` because Kiro allows `http` only for localhost (remote servers must be `https`).
+Zed's `settings.json` likewise carries `//`-commented remote-development alternatives after the active
+`context_servers.codegraph` stdio entry (both `install` global and `init` project-local): an SSH-stdio
+bridge and an HTTP server (`http://localhost:8111/mcp`, marked RECOMMENDED for remote); the shared
+JSONC-safe injector is `inject_commented_alternative(path, parent_key, entry_key, sentinel, block)` in
+`shared.rs`, used by both Kiro (`mcpServers`) and Zed (`context_servers`).
 Non-interactive, flag-driven (`--target`, `--global`/`--local`/`--location`,
 `--yes`, `--no-permissions`, `--print-config`); the config-writing logic (paths/keys/marker sections,
 idempotent upsert, uninstall removal) is CLI-only and additive — it does NOT touch
