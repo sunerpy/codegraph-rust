@@ -706,13 +706,35 @@ mod tests {
         let rendezvous = Rendezvous::from_socket_path(&socket_path);
         let listener = bind(&rendezvous).expect("bind listener");
 
+        // Readiness sync + loop-accept: the listener is non-blocking (bind sets
+        // ListenerNonblockingMode::Accept), so accept() returns WouldBlock until
+        // run_proxy connects; the acceptor loops over that, and the ready signal
+        // lets the main thread wait for the bound socket before run_proxy's
+        // one-shot connect fires — removing the accept<->connect race that flakes
+        // on a loaded CI runner (production run_proxy attaches to a live daemon).
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
         let acceptor = thread::spawn(move || {
-            if let Ok(mut stream) = listener.accept() {
-                let hello = json!({ "codegraph": "0.0.0-wrong", "protocol": 1 }).to_string();
-                let _ = writeln!(stream, "{hello}");
-                let _ = stream.flush();
+            let _ = ready_tx.send(());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok(mut stream) => {
+                        let hello =
+                            json!({ "codegraph": "0.0.0-wrong", "protocol": 1 }).to_string();
+                        let _ = writeln!(stream, "{hello}");
+                        let _ = stream.flush();
+                        return;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return,
+                }
             }
         });
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("acceptor thread signals readiness before accept");
 
         let host_in = std::io::Cursor::new(Vec::<u8>::new());
         let host_out = Vec::<u8>::new();
