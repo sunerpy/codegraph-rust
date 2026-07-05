@@ -604,7 +604,9 @@ mod tests {
         // path's backslashes are escaped as `\\` in the serialized output).
         let mcp = ctx.cwd.join(".kiro").join("settings").join("mcp.json");
         let written = fs::read_to_string(&mcp).expect("project mcp.json written");
-        let parsed: serde_json::Value = serde_json::from_str(&written).expect("valid mcp.json");
+        let parsed = serde_json::Value::Object(
+            crate::installer::shared::parse_json_object(&written).expect("valid jsonc mcp.json"),
+        );
         let args = parsed["mcpServers"]["codegraph"]["args"]
             .as_array()
             .expect("codegraph args array");

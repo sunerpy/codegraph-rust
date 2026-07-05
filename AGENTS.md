@@ -57,7 +57,10 @@ touches extraction/golden equivalence.
 one entry auto-follows each project window; Kiro and Qoder write a bare global entry (no `--path`) that
 serves tools read-only off any existing index, with the agent passing the project path per call — run
 `codegraph init --target=<ide>` inside each project to write a project-local config with an absolute
-`--path` for live watch. Non-interactive, flag-driven (`--target`, `--global`/`--local`/`--location`,
+`--path` for live watch. Kiro's `mcp.json` also carries a `//`-commented HTTP alternative alongside the
+active stdio entry (JSONC, idempotent, injected best-effort without corrupting existing files); it uses
+`http://localhost:8111/mcp` because Kiro allows `http` only for localhost (remote servers must be `https`).
+Non-interactive, flag-driven (`--target`, `--global`/`--local`/`--location`,
 `--yes`, `--no-permissions`, `--print-config`); the config-writing logic (paths/keys/marker sections,
 idempotent upsert, uninstall removal) is CLI-only and additive — it does NOT touch
 extraction/golden equivalence.

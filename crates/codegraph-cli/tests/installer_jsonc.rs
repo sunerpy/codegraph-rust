@@ -117,6 +117,53 @@ fn install_is_idempotent(#[case] target: &str, #[case] rel_path: &str, #[case] p
     );
 }
 
+/// Kiro's `mcp.json` must keep the ACTIVE stdio codegraph entry AND carry a
+/// `//`-commented HTTP localhost alternative — parseable as JSONC, idempotent,
+/// and non-corrupting of a user's pre-existing config.
+#[test]
+fn kiro_install_writes_stdio_plus_commented_http_localhost_alternative() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+
+    let cfg = project.child(".kiro/settings/mcp.json");
+    cfg.write_str(
+        "{\n  // user comment — must survive\n  \"mcpServers\": {\n    \"other\": { \"command\": \"foo\" }\n  }\n}\n",
+    )
+    .unwrap();
+
+    run_install(&home, project.path(), "kiro");
+
+    let after = std::fs::read_to_string(cfg.path()).unwrap();
+    assert!(
+        after.contains("\"codegraph\""),
+        "no codegraph entry:\n{after}"
+    );
+    assert!(after.contains("\"stdio\""), "stdio type missing:\n{after}");
+    assert!(after.contains("// user comment — must survive"), "{after}");
+    assert!(after.contains("\"other\""), "sibling lost:\n{after}");
+    assert!(
+        after.contains("// \"codegraph\": { \"url\": \"http://localhost:8111/mcp\" }"),
+        "commented localhost HTTP url missing:\n{after}"
+    );
+    assert!(
+        after.contains("codegraph serve --http"),
+        "WHY note missing:\n{after}"
+    );
+    assert!(
+        !after.contains("127.0.0.1:8111/mcp") && !after.contains("://0.0.0.0"),
+        "HTTP example must be localhost, not a LAN/loopback IP:\n{after}"
+    );
+
+    run_install(&home, project.path(), "kiro");
+    let second = std::fs::read_to_string(cfg.path()).unwrap();
+    assert_eq!(after, second, "re-install churned the file");
+    assert_eq!(
+        second.matches("// HTTP alternative").count(),
+        1,
+        "HTTP comment duplicated:\n{second}"
+    );
+}
+
 #[test]
 fn version_subcommand_matches_flag() {
     let sub = Command::cargo_bin("codegraph")

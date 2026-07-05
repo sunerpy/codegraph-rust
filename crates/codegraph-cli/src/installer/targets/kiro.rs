@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use serde_json::{Map, Value, json};
 
 use super::super::shared::{
-    ConfigRead, mcp_server_config, read_config_file, read_json_file,
+    ConfigRead, inject_kiro_http_comment, mcp_server_config, read_config_file, read_json_file,
     remove_codegraph_from_mcp_servers, to_upstream_json, upsert_nested_key_jsonc, write_json_file,
 };
 use super::super::types::{
@@ -185,6 +185,7 @@ fn write_mcp_entry(ctx: &InstallContext, loc: Location) -> FileWrite {
             let mut config = Map::new();
             upsert_mcp_server(&mut config, "codegraph", after);
             let _ = write_json_file(&file, &config);
+            inject_kiro_http_comment(&file);
             FileWrite {
                 path: file,
                 action: FileAction::Created,
@@ -193,6 +194,9 @@ fn write_mcp_entry(ctx: &InstallContext, loc: Location) -> FileWrite {
         ConfigRead::Parsed(_) => {
             let action = upsert_nested_key_jsonc(&file, "mcpServers", "codegraph", &after, None)
                 .unwrap_or(FileAction::Skipped);
+            if action != FileAction::Skipped {
+                inject_kiro_http_comment(&file);
+            }
             FileWrite { path: file, action }
         }
     }
@@ -218,6 +222,7 @@ pub static KIRO_TARGET: KiroTarget = KiroTarget;
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::shared::KIRO_HTTP_COMMENT_SENTINEL;
     use super::*;
 
     fn ctx() -> InstallContext {
@@ -352,7 +357,10 @@ mod tests {
             Self { base, ctx }
         }
         fn read(&self, p: &PathBuf) -> Value {
-            serde_json::from_str(&fs::read_to_string(p).unwrap()).unwrap()
+            Value::Object(
+                super::super::super::shared::parse_json_object(&fs::read_to_string(p).unwrap())
+                    .unwrap(),
+            )
         }
     }
 
@@ -458,6 +466,117 @@ mod tests {
         let json = fx.read(&mcp);
         assert!(json["mcpServers"]["other"].is_object());
         assert!(json["mcpServers"]["codegraph"].is_object());
+    }
+
+    fn read_text(fx: &TempKiro, loc: Location) -> String {
+        fs::read_to_string(mcp_json_path(&fx.ctx, loc)).unwrap()
+    }
+
+    #[test]
+    fn fresh_install_has_active_stdio_and_commented_http_localhost_alternative() {
+        // Given a fresh local Kiro install
+        let fx = TempKiro::new("http-comment");
+        let target = KiroTarget;
+
+        // When install runs
+        target.install(&fx.ctx, Location::Local, opts());
+
+        // Then the file still parses as JSONC with the ACTIVE stdio entry
+        let mcp = mcp_json_path(&fx.ctx, Location::Local);
+        let parsed = read_json_file(&mcp);
+        assert_eq!(parsed["mcpServers"]["codegraph"]["type"], json!("stdio"));
+        assert_eq!(
+            parsed["mcpServers"]["codegraph"]["command"],
+            json!("codegraph")
+        );
+
+        // And it contains the commented-out HTTP localhost alternative + WHY note
+        let text = read_text(&fx, Location::Local);
+        assert!(
+            text.contains(KIRO_HTTP_COMMENT_SENTINEL),
+            "HTTP alternative sentinel missing:\n{text}"
+        );
+        assert!(
+            text.contains("// \"codegraph\": { \"url\": \"http://localhost:8111/mcp\" }"),
+            "commented localhost HTTP url missing:\n{text}"
+        );
+        assert!(
+            text.contains("codegraph serve --http"),
+            "one-command HTTP start WHY note missing:\n{text}"
+        );
+        assert!(
+            !text.contains("127.0.0.1:8111/mcp") && !text.contains("://0.0.0.0"),
+            "HTTP example must use localhost, not a LAN/loopback IP url:\n{text}"
+        );
+    }
+
+    #[test]
+    fn http_comment_injection_is_idempotent() {
+        // Given a local Kiro install that already injected the HTTP comment
+        let fx = TempKiro::new("http-idem");
+        let target = KiroTarget;
+        target.install(&fx.ctx, Location::Local, opts());
+        let first = read_text(&fx, Location::Local);
+
+        // When install runs again
+        target.install(&fx.ctx, Location::Local, opts());
+
+        // Then the file is byte-identical (no duplicated comment, stdio intact)
+        let second = read_text(&fx, Location::Local);
+        assert_eq!(first, second, "re-install churned the file");
+        assert_eq!(
+            second.matches(KIRO_HTTP_COMMENT_SENTINEL).count(),
+            1,
+            "HTTP comment duplicated on re-run"
+        );
+        let parsed = read_json_file(&mcp_json_path(&fx.ctx, Location::Local));
+        assert_eq!(parsed["mcpServers"]["codegraph"]["type"], json!("stdio"));
+    }
+
+    #[test]
+    fn install_into_existing_config_preserves_user_content_and_injects_comment() {
+        // Given an existing mcp.json with a user's sibling server + comment
+        let fx = TempKiro::new("http-existing");
+        let target = KiroTarget;
+        let mcp = mcp_json_path(&fx.ctx, Location::Local);
+        fs::create_dir_all(mcp.parent().unwrap()).unwrap();
+        fs::write(
+            &mcp,
+            "{\n  // user comment — must survive\n  \"mcpServers\": {\n    \"other\": { \"command\": \"foo\" }\n  }\n}\n",
+        )
+        .unwrap();
+
+        // When install runs
+        target.install(&fx.ctx, Location::Local, opts());
+
+        // Then user content survives, stdio codegraph is active, HTTP comment added
+        let text = read_text(&fx, Location::Local);
+        assert!(text.contains("// user comment — must survive"), "{text}");
+        assert!(text.contains("\"other\""), "sibling server lost:\n{text}");
+        assert!(text.contains(KIRO_HTTP_COMMENT_SENTINEL), "{text}");
+        let parsed = read_json_file(&mcp);
+        assert!(parsed["mcpServers"]["other"].is_object());
+        assert_eq!(parsed["mcpServers"]["codegraph"]["type"], json!("stdio"));
+
+        // And re-install stays idempotent on the pre-existing file
+        target.install(&fx.ctx, Location::Local, opts());
+        assert_eq!(read_text(&fx, Location::Local), text);
+    }
+
+    #[test]
+    fn uninstall_removes_stdio_entry_after_http_comment_injected() {
+        // Given an installed Kiro config with the HTTP comment injected
+        let fx = TempKiro::new("http-uninstall");
+        let target = KiroTarget;
+        target.install(&fx.ctx, Location::Local, opts());
+
+        // When uninstall runs
+        let removed = target.uninstall(&fx.ctx, Location::Local);
+
+        // Then the codegraph entry is gone (wrapper pruned)
+        assert_eq!(removed.files[0].action, FileAction::Removed);
+        let parsed = read_json_file(&mcp_json_path(&fx.ctx, Location::Local));
+        assert!(parsed.get("mcpServers").is_none());
     }
 
     #[test]

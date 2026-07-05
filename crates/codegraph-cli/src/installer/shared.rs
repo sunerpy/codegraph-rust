@@ -41,6 +41,107 @@ pub fn mcp_server_config() -> Value {
     })
 }
 
+/// Idempotency sentinel: presence of this substring means the HTTP hint is
+/// already injected, so [`inject_kiro_http_comment`] becomes a no-op.
+pub const KIRO_HTTP_COMMENT_SENTINEL: &str = "// HTTP alternative";
+
+/// The `//`-commented HTTP alternative injected into Kiro's JSONC `mcp.json`
+/// alongside the active stdio entry. localhost is mandatory: Kiro allows http
+/// only for localhost (remote servers must be https; a non-local http url is
+/// silently rejected), and localhost also sidesteps HTTP_PROXY.
+pub fn kiro_http_comment_block() -> &'static str {
+    "// HTTP alternative — run `codegraph serve --http` (defaults to 127.0.0.1:8111),\n\
+     // then uncomment below and remove the stdio entry above. stdio is primary\n\
+     // (works out of the box; live watch when project-local). HTTP needs a\n\
+     // separate `codegraph serve --http`, and Kiro allows http ONLY for localhost\n\
+     // (remote servers must be https), so the url MUST use localhost:\n\
+     // \"codegraph\": { \"url\": \"http://localhost:8111/mcp\" }"
+}
+
+/// Best-effort idempotent injection of the [`kiro_http_comment_block`] after the
+/// active stdio `codegraph` entry inside `mcpServers`. No-op if the sentinel is
+/// already present, `mcpServers`/`codegraph` cannot be located, or the file is
+/// unreadable — the active stdio entry is never touched, existing bytes never
+/// corrupted (correctness over always injecting).
+pub fn inject_kiro_http_comment(path: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    if text.contains(KIRO_HTTP_COMMENT_SENTINEL) {
+        return false;
+    }
+    let Some(anchor) = text.find("\"mcpServers\"") else {
+        return false;
+    };
+    let Some(brace_rel) = text[anchor..].find('{') else {
+        return false;
+    };
+    let obj_open = anchor + brace_rel;
+    let Some(cg_rel) = text[obj_open..].find("\"codegraph\"") else {
+        return false;
+    };
+    let cg_at = obj_open + cg_rel;
+    let bytes = text.as_bytes();
+    let Some(val_open_rel) = text[cg_at..].find('{') else {
+        return false;
+    };
+    let Some(mut end) = balanced_object_end(bytes, cg_at + val_open_rel) else {
+        return false;
+    };
+    if bytes.get(end) == Some(&b',') {
+        end += 1;
+    }
+    let line_start = text[..cg_at].rfind('\n').map_or(0, |n| n + 1);
+    let indent: String = text[line_start..cg_at]
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect();
+    let block = kiro_http_comment_block()
+        .lines()
+        .map(|l| format!("{indent}{l}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut out = String::with_capacity(text.len() + block.len() + indent.len() + 2);
+    out.push_str(&text[..end]);
+    out.push('\n');
+    out.push_str(&block);
+    out.push_str(&text[end..]);
+    atomic_write_file(path, &out).is_ok()
+}
+
+/// Return the index just past the matching `}` for the object that opens at
+/// `open` (which must index a `{`), tracking string/escape state so braces
+/// inside string literals do not miscount. `None` if unbalanced.
+fn balanced_object_end(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut i = open;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+        } else if b == b'"' {
+            in_string = true;
+        } else if b == b'{' {
+            depth += 1;
+        } else if b == b'}' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i + 1);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Permissions list for Claude `settings.json`. Ports `getCodeGraphPermissions`
 /// (shared.ts:37) — order preserved.
 pub fn codegraph_permissions() -> Vec<&'static str> {
