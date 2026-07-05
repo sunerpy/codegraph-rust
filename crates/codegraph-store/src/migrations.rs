@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::schema::BASE_SCHEMA;
 
@@ -198,5 +198,77 @@ mod tests {
     fn empty_memory_connection_reports_version_zero() {
         let conn = Connection::open_in_memory().unwrap();
         assert_eq!(get_current_version(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn fresh_schema_sets_current_version_and_is_idempotent() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        ensure_schema_and_migrations(&mut conn).unwrap();
+        assert_eq!(get_current_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
+
+        ensure_schema_and_migrations(&mut conn).unwrap();
+        assert_eq!(get_current_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn analyze_runs_once_and_leaves_sqlite_stat1() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        assert!(!has_sqlite_stat1(&conn).unwrap());
+        ensure_schema_and_migrations(&mut conn).unwrap();
+        assert!(has_sqlite_stat1(&conn).unwrap());
+    }
+
+    #[test]
+    fn auto_vacuum_incremental_on_fresh_db_only() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure_auto_vacuum_for_fresh_db(&conn).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA auto_vacuum", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+
+        conn.execute_batch("CREATE TABLE t (id INTEGER)").unwrap();
+        configure_auto_vacuum_for_fresh_db(&conn).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA auto_vacuum", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn pending_migrations_apply_over_a_v1_schema() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_versions (version INTEGER PRIMARY KEY, applied_at INTEGER, description TEXT);
+             CREATE TABLE unresolved_refs (id INTEGER PRIMARY KEY AUTOINCREMENT, from_node_id TEXT, reference_name TEXT, reference_kind TEXT, line INTEGER, col INTEGER, candidates TEXT);
+             CREATE TABLE edges (id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT, target TEXT, kind TEXT);
+             CREATE TABLE nodes (id TEXT PRIMARY KEY, name TEXT);
+             CREATE INDEX idx_edges_source ON edges(source);
+             CREATE INDEX idx_edges_target ON edges(target);
+             INSERT INTO schema_versions (version, applied_at, description) VALUES (1, 0, 'base');",
+        )
+        .unwrap();
+        assert_eq!(get_current_version(&conn).unwrap(), 1);
+
+        run_pending_migrations(&mut conn).unwrap();
+
+        assert_eq!(get_current_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
+        assert!(has_column(&conn, "nodes", "return_type"));
+        assert!(has_column(&conn, "unresolved_refs", "reference_subkind"));
+        assert!(has_column(&conn, "unresolved_refs", "file_path"));
+    }
+
+    fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        names.iter().any(|n| n == column)
     }
 }

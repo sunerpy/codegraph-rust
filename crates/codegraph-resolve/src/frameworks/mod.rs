@@ -111,3 +111,49 @@ pub(crate) fn framework_node(
         updated_at: now_millis(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn js_language_for_all_branches() {
+        assert_eq!(js_language_for("a.tsx"), Language::Tsx);
+        assert_eq!(js_language_for("a.jsx"), Language::Jsx);
+        assert_eq!(js_language_for("a.ts"), Language::TypeScript);
+        assert_eq!(js_language_for("a.mts"), Language::TypeScript);
+        assert_eq!(js_language_for("a.cts"), Language::TypeScript);
+        assert_eq!(js_language_for("a.js"), Language::JavaScript);
+        assert_eq!(js_language_for("noext"), Language::JavaScript);
+    }
+
+    #[test]
+    fn now_millis_is_positive() {
+        assert!(now_millis() > 0);
+    }
+
+    #[test]
+    fn framework_node_populates_fields() {
+        let n = framework_node(
+            "route:x".to_string(),
+            NodeKind::Route,
+            "/x".to_string(),
+            "f::route:/x".to_string(),
+            "f.tsx".to_string(),
+            3,
+            4,
+            0,
+            9,
+            Language::Tsx,
+            true,
+        );
+        assert_eq!(n.id, "route:x");
+        assert_eq!(n.kind, NodeKind::Route);
+        assert_eq!(n.name, "/x");
+        assert_eq!(n.start_line, 3);
+        assert_eq!(n.end_line, 4);
+        assert_eq!(n.end_column, 9);
+        assert!(n.is_exported);
+        assert!(!n.is_async);
+    }
+}

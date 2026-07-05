@@ -379,3 +379,524 @@ fn param_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"\[([^\]]+)\]").expect("param"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ImportMapping;
+    use codegraph_core::types::Node;
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct Ctx {
+        files: HashMap<String, String>,
+        nodes: Vec<Node>,
+    }
+
+    impl Ctx {
+        fn file(mut self, path: &str, content: &str) -> Self {
+            self.files.insert(path.to_string(), content.to_string());
+            self
+        }
+        fn node(mut self, n: Node) -> Self {
+            self.nodes.push(n);
+            self
+        }
+    }
+
+    impl ResolutionContext for Ctx {
+        fn get_nodes_in_file(&self, file_path: &str) -> Vec<Node> {
+            self.nodes
+                .iter()
+                .filter(|n| n.file_path == file_path)
+                .cloned()
+                .collect()
+        }
+        fn get_nodes_by_name(&self, name: &str) -> Vec<Node> {
+            self.nodes
+                .iter()
+                .filter(|n| n.name == name)
+                .cloned()
+                .collect()
+        }
+        fn get_nodes_by_qualified_name(&self, q: &str) -> Vec<Node> {
+            self.nodes
+                .iter()
+                .filter(|n| n.qualified_name == q)
+                .cloned()
+                .collect()
+        }
+        fn get_nodes_by_kind(&self, kind: NodeKind) -> Vec<Node> {
+            self.nodes
+                .iter()
+                .filter(|n| n.kind == kind)
+                .cloned()
+                .collect()
+        }
+        fn file_exists(&self, file_path: &str) -> bool {
+            self.files.contains_key(file_path)
+        }
+        fn read_file(&self, file_path: &str) -> Option<String> {
+            self.files.get(file_path).cloned()
+        }
+        fn get_project_root(&self) -> &str {
+            "/project"
+        }
+        fn get_all_files(&self) -> Vec<String> {
+            self.files.keys().cloned().collect()
+        }
+        fn get_nodes_by_lower_name(&self, lower: &str) -> Vec<Node> {
+            self.nodes
+                .iter()
+                .filter(|n| n.name.to_lowercase() == lower)
+                .cloned()
+                .collect()
+        }
+        fn get_node_by_id(&self, id: &str) -> Option<Node> {
+            self.nodes.iter().find(|n| n.id == id).cloned()
+        }
+        fn get_import_mappings(&self, _f: &str, _l: Language) -> Vec<ImportMapping> {
+            Vec::new()
+        }
+    }
+
+    fn mk_node(id: &str, kind: NodeKind, name: &str, file: &str) -> Node {
+        Node {
+            id: id.to_string(),
+            kind,
+            name: name.to_string(),
+            qualified_name: format!("{file}::{name}"),
+            file_path: file.to_string(),
+            language: Language::Vue,
+            start_line: 1,
+            end_line: 1,
+            start_column: 0,
+            end_column: 0,
+            docstring: None,
+            signature: None,
+            visibility: None,
+            is_exported: false,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+            decorators: Vec::new(),
+            type_parameters: Vec::new(),
+            return_type: None,
+            updated_at: 0,
+        }
+    }
+
+    fn a_ref(name: &str, kind: EdgeKind, file: &str) -> RefView {
+        RefView {
+            from_node_id: format!("from:{file}"),
+            reference_name: name.to_string(),
+            reference_kind: kind,
+            line: 1,
+            column: 0,
+            file_path: file.to_string(),
+            language: Language::Vue,
+            is_function_ref: false,
+            reference_subkind: None,
+        }
+    }
+
+    // -- pure helpers -------------------------------------------------------
+
+    #[test]
+    fn is_pascal_case_units() {
+        assert!(is_pascal_case("MyComp"));
+        assert!(!is_pascal_case("myComp"));
+        assert!(!is_pascal_case(""));
+    }
+
+    #[test]
+    fn strip_extension_and_index_and_dir() {
+        assert_eq!(strip_extension("foo/bar.ts"), "foo/bar");
+        assert_eq!(strip_extension("no_ext"), "no_ext");
+        assert_eq!(strip_trailing_index("users/index"), "users");
+        assert_eq!(strip_trailing_index("users"), "users");
+        assert_eq!(dir_of("a/b/c.vue"), "a/b");
+        assert_eq!(dir_of("top.vue"), "");
+    }
+
+    // -- detect -------------------------------------------------------------
+
+    #[test]
+    fn detect_via_nuxt_dep_and_dev_dep() {
+        let ctx = Ctx::default().file("package.json", r#"{"devDependencies":{"nuxt":"3"}}"#);
+        assert!(VueResolver.detect(&ctx));
+        let ctx2 = Ctx::default().file("package.json", r#"{"dependencies":{"@nuxt/kit":"3"}}"#);
+        assert!(VueResolver.detect(&ctx2));
+    }
+
+    #[test]
+    fn detect_malformed_json_then_file_scan() {
+        let ctx = Ctx::default()
+            .file("package.json", "broken {")
+            .file("src/A.vue", "<template/>");
+        assert!(VueResolver.detect(&ctx));
+    }
+
+    #[test]
+    fn detect_false_when_no_signal() {
+        let ctx = Ctx::default().file("src/index.ts", "export const x=1;");
+        assert!(!VueResolver.detect(&ctx));
+    }
+
+    // -- resolve: compiler macro / auto-import / virtual module -------------
+
+    #[test]
+    fn resolve_nuxt_auto_import_self() {
+        let reference = a_ref("useFetch", EdgeKind::Calls, "src/App.vue");
+        let r = VueResolver
+            .resolve(&reference, &Ctx::default())
+            .expect("resolves");
+        assert_eq!(r.target_node_id, reference.from_node_id);
+        assert_eq!(r.confidence, 1.0);
+    }
+
+    #[test]
+    fn resolve_nuxt_virtual_module_import() {
+        let reference = a_ref("#imports", EdgeKind::Imports, "src/App.vue");
+        let r = VueResolver
+            .resolve(&reference, &Ctx::default())
+            .expect("resolves");
+        assert_eq!(r.confidence, 1.0);
+    }
+
+    #[test]
+    fn resolve_hash_import_unknown_virtual_module_none() {
+        // Starts with '#' but is not a known virtual module prefix.
+        let reference = a_ref("#unknown", EdgeKind::Imports, "src/App.vue");
+        assert!(VueResolver.resolve(&reference, &Ctx::default()).is_none());
+    }
+
+    // -- resolve: @/ and ~/ alias imports -----------------------------------
+
+    #[test]
+    fn resolve_at_alias_import_resolves_to_node() {
+        let target = mk_node(
+            "var:src/utils/x.ts:x:1",
+            NodeKind::Variable,
+            "x",
+            "src/utils/x.ts",
+        );
+        let ctx = Ctx::default()
+            .file("src/utils/x.ts", "export const x=1;")
+            .node(target.clone());
+        let reference = a_ref("@/utils/x", EdgeKind::Imports, "src/App.vue");
+        let r = VueResolver.resolve(&reference, &ctx).expect("resolves");
+        assert_eq!(r.target_node_id, target.id);
+        assert_eq!(r.confidence, 0.9);
+    }
+
+    #[test]
+    fn resolve_tilde_alias_import_via_index_ext() {
+        // The `~/` alias resolves through the /index.ts extension candidate.
+        let target = mk_node(
+            "var:src/lib/index.ts:y:1",
+            NodeKind::Variable,
+            "y",
+            "src/lib/index.ts",
+        );
+        let ctx = Ctx::default()
+            .file("src/lib/index.ts", "export const y=1;")
+            .node(target.clone());
+        let reference = a_ref("~/lib", EdgeKind::Imports, "src/App.vue");
+        let r = VueResolver.resolve(&reference, &ctx).expect("resolves");
+        assert_eq!(r.target_node_id, target.id);
+    }
+
+    #[test]
+    fn resolve_alias_import_missing_file_none() {
+        let ctx = Ctx::default();
+        let reference = a_ref("@/nope", EdgeKind::Imports, "src/App.vue");
+        assert!(VueResolver.resolve(&reference, &ctx).is_none());
+    }
+
+    #[test]
+    fn resolve_alias_file_exists_but_no_nodes_none() {
+        // File exists across all ext candidates but has no nodes -> None.
+        let ctx = Ctx::default().file("src/empty.ts", "// nothing");
+        let reference = a_ref("@/empty", EdgeKind::Imports, "src/App.vue");
+        assert!(VueResolver.resolve(&reference, &ctx).is_none());
+    }
+
+    // -- resolve: component call --------------------------------------------
+
+    #[test]
+    fn resolve_component_ambiguous_returns_none() {
+        // Two Button.vue files in different dirs, neither in the caller's dir.
+        let a = mk_node(
+            "component:x/Button.vue:Button:1",
+            NodeKind::Component,
+            "Button",
+            "x/Button.vue",
+        );
+        let b = mk_node(
+            "component:y/Button.vue:Button:1",
+            NodeKind::Component,
+            "Button",
+            "y/Button.vue",
+        );
+        let ctx = Ctx::default()
+            .file("x/Button.vue", "<template/>")
+            .file("y/Button.vue", "<template/>")
+            .node(a)
+            .node(b);
+        let reference = a_ref("Button", EdgeKind::Calls, "z/Page.vue");
+        assert!(VueResolver.resolve(&reference, &ctx).is_none());
+    }
+
+    #[test]
+    fn resolve_component_non_calls_kind_skipped() {
+        // PascalCase but reference_kind is References, not Calls -> pattern 6 skips.
+        let comp = mk_node(
+            "component:src/Button.vue:Button:1",
+            NodeKind::Component,
+            "Button",
+            "src/Button.vue",
+        );
+        let ctx = Ctx::default()
+            .file("src/Button.vue", "<template/>")
+            .node(comp);
+        let reference = a_ref("Button", EdgeKind::References, "src/Page.vue");
+        assert!(VueResolver.resolve(&reference, &ctx).is_none());
+    }
+
+    #[test]
+    fn resolve_component_no_matching_vue_file_none() {
+        let reference = a_ref("Missing", EdgeKind::Calls, "src/Page.vue");
+        assert!(VueResolver.resolve(&reference, &Ctx::default()).is_none());
+    }
+
+    // -- extract: nuxt route / api / middleware -----------------------------
+
+    #[test]
+    fn extract_nuxt_catch_all_route() {
+        let result = VueResolver
+            .extract("app/pages/[...slug].vue", "", "")
+            .expect("extract");
+        let route = result
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Route)
+            .expect("route");
+        assert_eq!(route.name, "/*slug");
+    }
+
+    #[test]
+    fn extract_nuxt_optional_param_route() {
+        let result = VueResolver
+            .extract("app/pages/[[maybe]].vue", "", "")
+            .expect("extract");
+        let route = result
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Route)
+            .expect("route");
+        assert_eq!(route.name, "/:maybe?");
+    }
+
+    #[test]
+    fn extract_nuxt_nested_index_route_strips_index() {
+        // `pages/users/index.vue` -> after_pages "users/index" -> strip /index -> "/users".
+        let result = VueResolver
+            .extract("app/pages/users/index.vue", "", "")
+            .expect("extract");
+        let route = result
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Route)
+            .expect("route");
+        assert_eq!(route.name, "/users");
+    }
+
+    #[test]
+    fn extract_api_route_strips_index_and_ext() {
+        // The matcher keys on a leading-slash "/server/api/", so the file needs a
+        // parent segment (app/server/api/...).
+        let result = VueResolver
+            .extract("app/server/api/users/index.ts", "", "")
+            .expect("extract");
+        let route = result
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Route)
+            .expect("route");
+        assert_eq!(route.name, "/api/users");
+        assert_eq!(route.language, Language::TypeScript);
+    }
+
+    #[test]
+    fn extract_middleware_node() {
+        // Leading-slash "/middleware/" match requires a parent segment.
+        let result = VueResolver
+            .extract("app/middleware/auth.ts", "", "")
+            .expect("extract");
+        let mw = result
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Function)
+            .expect("middleware");
+        assert_eq!(mw.name, "auth");
+        assert_eq!(mw.language, Language::TypeScript);
+    }
+
+    #[test]
+    fn extract_non_route_file_yields_no_nodes() {
+        let result = VueResolver
+            .extract("src/plain.ts", "", "")
+            .expect("extract");
+        assert!(result.nodes.is_empty());
+    }
+
+    #[test]
+    fn extract_backslash_paths_normalized() {
+        // Windows-style separators normalize so /pages/ still matches.
+        let result = VueResolver
+            .extract("app\\pages\\about.vue", "", "")
+            .expect("extract");
+        let route = result
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Route)
+            .expect("route");
+        assert_eq!(route.name, "/about");
+    }
+
+    #[test]
+    fn resolver_name_is_vue() {
+        assert_eq!(VueResolver.name(), "vue");
+    }
+
+    #[test]
+    fn resolve_tilde_alias_when_at_prefix_absent() {
+        // A `~/` import (the `@/` strip_prefix returns None first, then the `~/`
+        // branch resolves) lands on the aliased node.
+        let target = mk_node(
+            "var:src/helpers/fmt.ts:fmt:1",
+            NodeKind::Variable,
+            "fmt",
+            "src/helpers/fmt.ts",
+        );
+        let ctx = Ctx::default()
+            .file("src/helpers/fmt.ts", "export const fmt=1;")
+            .node(target.clone());
+        let reference = a_ref("~/helpers/fmt", EdgeKind::Imports, "src/App.vue");
+        let r = VueResolver.resolve(&reference, &ctx).expect("resolves");
+        assert_eq!(r.target_node_id, target.id);
+        assert_eq!(r.confidence, 0.9);
+    }
+
+    #[test]
+    fn resolve_component_same_dir_wins_over_other_dirs() {
+        // Two Button.vue files: one in the caller's dir, one elsewhere. The
+        // same-dir match resolves even though the basename is ambiguous.
+        let same_dir = mk_node(
+            "component:z/Button.vue:Button:1",
+            NodeKind::Component,
+            "Button",
+            "z/Button.vue",
+        );
+        let other = mk_node(
+            "component:x/Button.vue:Button:1",
+            NodeKind::Component,
+            "Button",
+            "x/Button.vue",
+        );
+        let ctx = Ctx::default()
+            .file("z/Button.vue", "<template/>")
+            .file("x/Button.vue", "<template/>")
+            .node(same_dir.clone())
+            .node(other);
+        let reference = a_ref("Button", EdgeKind::Calls, "z/Page.vue");
+        let r = VueResolver.resolve(&reference, &ctx).expect("resolves");
+        assert_eq!(r.target_node_id, same_dir.id, "same-dir component wins");
+        assert_eq!(r.confidence, 0.8);
+    }
+
+    #[test]
+    fn resolve_component_unique_basename_resolves() {
+        // A single matching Button.vue not in the caller's dir → unambiguous, so
+        // it resolves.
+        let comp = mk_node(
+            "component:widgets/Button.vue:Button:1",
+            NodeKind::Component,
+            "Button",
+            "widgets/Button.vue",
+        );
+        let ctx = Ctx::default()
+            .file("widgets/Button.vue", "<template/>")
+            .node(comp.clone());
+        let reference = a_ref("Button", EdgeKind::Calls, "pages/Home.vue");
+        let r = VueResolver.resolve(&reference, &ctx).expect("resolves");
+        assert_eq!(r.target_node_id, comp.id);
+    }
+
+    #[test]
+    fn resolve_component_matching_file_but_no_component_node_none() {
+        // A Button.vue exists and is unique, but has no Component node → None.
+        let ctx = Ctx::default().file("widgets/Button.vue", "<template/>");
+        let reference = a_ref("Button", EdgeKind::Calls, "pages/Home.vue");
+        assert!(VueResolver.resolve(&reference, &ctx).is_none());
+    }
+
+    #[test]
+    fn extract_pages_dot_vue_api_and_middleware_use_vue_language() {
+        // A `.vue` file under server/api and under middleware exercises the
+        // Language::Vue arm of both extract branches.
+        let api = VueResolver
+            .extract("app/server/api/ping.vue", "", "")
+            .expect("extract");
+        let api_route = api
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Route)
+            .expect("api route");
+        assert_eq!(api_route.name, "/api/ping");
+        assert_eq!(api_route.language, Language::Vue);
+
+        let mw = VueResolver
+            .extract("app/middleware/guard.vue", "", "")
+            .expect("extract");
+        let mw_node = mw
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Function)
+            .expect("middleware");
+        assert_eq!(mw_node.name, "guard");
+        assert_eq!(mw_node.language, Language::Vue);
+    }
+
+    #[test]
+    fn extract_root_pages_index_is_root_route() {
+        // `pages/index.vue` → after_pages "index"; strip_suffix("/index") does
+        // not match (no leading segment), so the route is "/index".
+        let result = VueResolver
+            .extract("app/pages/index.vue", "", "")
+            .expect("extract");
+        let route = result
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Route)
+            .expect("route");
+        assert_eq!(route.name, "/index");
+    }
+
+    #[test]
+    fn ctx_trait_accessors_exercise_all_lookup_paths() {
+        // Drive the MockContext lookup surface directly so its trait methods are
+        // exercised (get_nodes_by_* / get_node_by_id / import mappings).
+        let n = mk_node("var:a.ts:X:1", NodeKind::Variable, "X", "a.ts");
+        let ctx = Ctx::default().file("a.ts", "const X=1;").node(n.clone());
+        assert_eq!(ctx.get_nodes_by_name("X").len(), 1);
+        assert_eq!(ctx.get_nodes_by_qualified_name("a.ts::X").len(), 1);
+        assert_eq!(ctx.get_nodes_by_kind(NodeKind::Variable).len(), 1);
+        assert_eq!(ctx.get_nodes_by_lower_name("x").len(), 1);
+        assert_eq!(ctx.get_node_by_id(&n.id).as_ref(), Some(&n));
+        assert!(ctx.get_import_mappings("a.ts", Language::Vue).is_empty());
+        assert_eq!(ctx.get_project_root(), "/project");
+        assert_eq!(ctx.get_all_files(), vec!["a.ts".to_string()]);
+    }
+}

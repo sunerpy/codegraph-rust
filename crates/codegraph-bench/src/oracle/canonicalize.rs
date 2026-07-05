@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 use std::path::{Component, Path};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub type CanonicalRow = BTreeMap<String, Value>;
 

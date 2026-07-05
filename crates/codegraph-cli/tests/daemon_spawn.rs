@@ -109,10 +109,10 @@ fn read_pid_from_hello(socket: &Path) -> Option<u32> {
 fn poll_for_daemon_pid(socket: &Path, timeout: Duration) -> Option<u32> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if socket.exists() {
-            if let Some(pid) = read_pid_from_hello(socket) {
-                return Some(pid);
-            }
+        if socket.exists()
+            && let Some(pid) = read_pid_from_hello(socket)
+        {
+            return Some(pid);
         }
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -160,7 +160,7 @@ fn spawn_detached_daemon_listens_and_survives() {
     let log = project.join(".codegraph").join("daemon.log");
 
     // Spawn the detached daemon. The helper must RETURN without waiting.
-    spawn_detached_daemon(&bin(), &project).expect("spawn_detached_daemon");
+    spawn_detached_daemon(&bin(), &project, false).expect("spawn_detached_daemon");
 
     // (a)+(b): the socket appears within the poll window and the hello pid is alive.
     let pid = poll_for_daemon_pid(&socket, Duration::from_millis(2000))
@@ -201,7 +201,7 @@ fn spawn_detached_daemon_twice_no_stale_deadlock() {
     let (_dir, project) = indexed_project("twice");
     let socket = daemon_socket_path(&project);
 
-    spawn_detached_daemon(&bin(), &project).expect("first spawn");
+    spawn_detached_daemon(&bin(), &project, false).expect("first spawn");
     let pid1 = poll_for_daemon_pid(&socket, Duration::from_millis(2000)).expect("first daemon pid");
     assert!(is_process_alive(pid1));
 
@@ -219,7 +219,7 @@ fn spawn_detached_daemon_twice_no_stale_deadlock() {
     let _ = fs::remove_file(&socket);
 
     // Second spawn must come up cleanly (reuse-or-respawn), not deadlock.
-    spawn_detached_daemon(&bin(), &project).expect("second spawn");
+    spawn_detached_daemon(&bin(), &project, false).expect("second spawn");
     let pid2 = poll_for_daemon_pid(&socket, Duration::from_millis(2000))
         .expect("second daemon pid after respawn");
     assert!(is_process_alive(pid2), "respawned daemon should be alive");

@@ -493,6 +493,320 @@ mod tests {
         }
     }
 
+    struct TempHermes {
+        base: PathBuf,
+        ctx: InstallContext,
+    }
+
+    impl TempHermes {
+        fn new(label: &str) -> Self {
+            let base = std::env::temp_dir().join(format!(
+                "cg-hermes-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&base).unwrap();
+            let ctx = InstallContext {
+                home: base.join("home"),
+                cwd: base.join("cwd"),
+                app_data: None,
+                xdg_config_home: None,
+                hermes_home: Some(base.join("hermes")),
+            };
+            Self { base, ctx }
+        }
+        fn config(&self) -> PathBuf {
+            config_path(&self.ctx)
+        }
+        fn read(&self) -> String {
+            fs::read_to_string(self.config()).unwrap()
+        }
+    }
+
+    impl Drop for TempHermes {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.base);
+        }
+    }
+
+    #[test]
+    fn install_creates_config_with_mcp_server_and_toolset() {
+        let fx = TempHermes::new("install-create");
+        let target = HermesTarget;
+
+        let detect = target.detect(&fx.ctx, Location::Global);
+        assert!(!detect.installed);
+        assert!(!detect.already_configured);
+
+        let result = target.install(
+            &fx.ctx,
+            Location::Global,
+            InstallOptions {
+                auto_allow: false,
+                front_load_hook: false,
+            },
+        );
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.files[0].action, FileAction::Created);
+        assert!(!result.notes.is_empty());
+
+        let content = fx.read();
+        assert!(content.contains("mcp_servers:"));
+        assert!(content.contains("  codegraph:"));
+        assert!(content.contains("    command: codegraph"));
+        assert!(content.contains("      - serve"));
+        assert!(content.contains("      - --mcp"));
+        assert!(content.contains("platform_toolsets:"));
+        assert!(content.contains("    - hermes-cli"));
+        assert!(content.contains("    - mcp-codegraph"));
+        assert!(content.ends_with('\n'));
+
+        let detect = target.detect(&fx.ctx, Location::Global);
+        assert!(detect.installed);
+        assert!(detect.already_configured);
+    }
+
+    #[test]
+    fn install_is_idempotent() {
+        let fx = TempHermes::new("idempotent");
+        let target = HermesTarget;
+        let opts = InstallOptions {
+            auto_allow: false,
+            front_load_hook: false,
+        };
+
+        target.install(&fx.ctx, Location::Global, opts);
+        let first = fx.read();
+        let second_result = target.install(&fx.ctx, Location::Global, opts);
+        assert_eq!(second_result.files[0].action, FileAction::Unchanged);
+        assert_eq!(fx.read(), first, "re-install must not churn");
+        assert_eq!(first.matches("  codegraph:").count(), 1);
+        assert_eq!(first.matches("- mcp-codegraph").count(), 1);
+    }
+
+    #[test]
+    fn install_preserves_existing_config_and_adds_to_existing_sections() {
+        let fx = TempHermes::new("preserve");
+        let target = HermesTarget;
+        fs::create_dir_all(fx.config().parent().unwrap()).unwrap();
+        fs::write(
+            fx.config(),
+            "log_level: info\n\nmcp_servers:\n  other:\n    command: foo\n\nplatform_toolsets:\n  cli:\n    - hermes-cli\n",
+        )
+        .unwrap();
+
+        target.install(
+            &fx.ctx,
+            Location::Global,
+            InstallOptions {
+                auto_allow: false,
+                front_load_hook: false,
+            },
+        );
+        let content = fx.read();
+        assert!(content.contains("log_level: info"));
+        assert!(content.contains("  other:"));
+        assert!(content.contains("  codegraph:"));
+        assert!(content.contains("- hermes-cli"));
+        assert!(content.contains("- mcp-codegraph"));
+    }
+
+    #[test]
+    fn uninstall_removes_codegraph_preserving_siblings() {
+        let fx = TempHermes::new("uninstall");
+        let target = HermesTarget;
+        fs::create_dir_all(fx.config().parent().unwrap()).unwrap();
+        fs::write(fx.config(), "mcp_servers:\n  other:\n    command: foo\n").unwrap();
+
+        target.install(
+            &fx.ctx,
+            Location::Global,
+            InstallOptions {
+                auto_allow: false,
+                front_load_hook: false,
+            },
+        );
+        assert!(fx.read().contains("  codegraph:"));
+
+        let removed = target.uninstall(&fx.ctx, Location::Global);
+        assert_eq!(removed.files[0].action, FileAction::Removed);
+        let content = fx.read();
+        assert!(!content.contains("  codegraph:"));
+        assert!(!content.contains("- mcp-codegraph"));
+        assert!(content.contains("  other:"), "sibling server preserved");
+    }
+
+    #[test]
+    fn uninstall_missing_file_is_not_found() {
+        let fx = TempHermes::new("uninstall-missing");
+        let target = HermesTarget;
+        let result = target.uninstall(&fx.ctx, Location::Global);
+        assert_eq!(result.files[0].action, FileAction::NotFound);
+    }
+
+    #[test]
+    fn uninstall_config_without_codegraph_is_not_found() {
+        let fx = TempHermes::new("uninstall-absent");
+        let target = HermesTarget;
+        fs::create_dir_all(fx.config().parent().unwrap()).unwrap();
+        fs::write(fx.config(), "log_level: info\n").unwrap();
+        let result = target.uninstall(&fx.ctx, Location::Global);
+        assert_eq!(result.files[0].action, FileAction::NotFound);
+        assert_eq!(fx.read(), "log_level: info\n");
+    }
+
+    #[test]
+    fn local_location_is_rejected_for_all_ops() {
+        let fx = TempHermes::new("local-reject");
+        let target = HermesTarget;
+        assert!(!target.supports_location(Location::Local));
+
+        let install = target.install(
+            &fx.ctx,
+            Location::Local,
+            InstallOptions {
+                auto_allow: false,
+                front_load_hook: false,
+            },
+        );
+        assert!(install.files.is_empty());
+        assert!(install.notes[0].contains("--location=global"));
+
+        let uninstall = target.uninstall(&fx.ctx, Location::Local);
+        assert!(uninstall.files.is_empty());
+
+        let detect = target.detect(&fx.ctx, Location::Local);
+        assert!(!detect.installed);
+
+        let printed = target.print_config(&fx.ctx, Location::Local);
+        assert!(printed.contains("--location=global"));
+    }
+
+    #[test]
+    fn print_config_global_shows_block_and_toolset() {
+        let fx = TempHermes::new("print");
+        let target = HermesTarget;
+        let out = target.print_config(&fx.ctx, Location::Global);
+        assert!(out.contains("mcp_servers:"));
+        assert!(out.contains("codegraph:"));
+        assert!(out.contains("command: codegraph"));
+        assert!(out.contains("platform_toolsets:"));
+        assert!(out.contains("- hermes-cli"));
+        assert!(out.contains("- mcp-codegraph"));
+        assert!(out.contains(&config_path(&fx.ctx).display().to_string()));
+    }
+
+    #[test]
+    fn default_hermes_home_when_env_unset() {
+        let ctx = ctx_with_home(PathBuf::from("/tmp/h"));
+        assert_eq!(hermes_home(&ctx), PathBuf::from("/tmp/h/.hermes"));
+        assert_eq!(
+            config_path(&ctx),
+            PathBuf::from("/tmp/h/.hermes/config.yaml")
+        );
+    }
+
+    #[test]
+    fn crlf_input_is_normalized_to_lf() {
+        let out = upsert_codegraph_mcp_server("mcp_servers:\r\n  other:\r\n    command: foo\r\n");
+        assert!(!out.contains('\r'));
+        assert!(out.contains("  codegraph:"));
+        assert!(out.contains("  other:"));
+    }
+
+    #[test]
+    fn is_top_level_key_line_recognizes_shapes() {
+        assert!(is_top_level_key_line("mcp_servers:"));
+        assert!(is_top_level_key_line("key: # comment"));
+        assert!(is_top_level_key_line("_private:"));
+        assert!(is_top_level_key_line("with-dash:"));
+        assert!(!is_top_level_key_line("  indented:"));
+        assert!(!is_top_level_key_line("key: value"));
+        assert!(!is_top_level_key_line("- item"));
+        assert!(!is_top_level_key_line(""));
+        assert!(!is_top_level_key_line("1nvalid:"));
+        assert!(!is_top_level_key_line("nocolon"));
+    }
+
+    #[test]
+    fn upsert_mcp_server_replaces_divergent_existing() {
+        let existing = "mcp_servers:\n  codegraph:\n    command: OLD\n";
+        let out = upsert_codegraph_mcp_server(existing);
+        assert!(out.contains("    command: codegraph"));
+        assert!(!out.contains("OLD"));
+        assert_eq!(out.matches("  codegraph:").count(), 1);
+    }
+
+    #[test]
+    fn upsert_toolset_creates_cli_when_parent_lacks_it() {
+        let existing = "platform_toolsets:\n  other:\n    - thing\n";
+        let out = upsert_codegraph_toolset(existing);
+        assert!(out.contains("  cli:"));
+        assert!(out.contains("    - hermes-cli"));
+        assert!(out.contains("    - mcp-codegraph"));
+        assert!(out.contains("  other:"));
+    }
+
+    #[test]
+    fn upsert_toolset_appends_to_existing_cli_list() {
+        let existing = "platform_toolsets:\n  cli:\n    - hermes-cli\n";
+        let out = upsert_codegraph_toolset(existing);
+        assert_eq!(out.matches("- mcp-codegraph").count(), 1);
+        assert!(out.contains("- hermes-cli"));
+    }
+
+    #[test]
+    fn upsert_toolset_idempotent_when_entry_present() {
+        let existing = "platform_toolsets:\n  cli:\n    - hermes-cli\n    - mcp-codegraph\n";
+        let out = upsert_codegraph_toolset(existing);
+        assert_eq!(out.matches("- mcp-codegraph").count(), 1);
+    }
+
+    #[test]
+    fn remove_toolset_absent_entry_returns_unchanged() {
+        let existing = "platform_toolsets:\n  cli:\n    - hermes-cli\n";
+        assert_eq!(remove_codegraph_toolset(existing), existing);
+        assert_eq!(
+            remove_codegraph_toolset("log_level: info\n"),
+            "log_level: info\n"
+        );
+    }
+
+    #[test]
+    fn remove_mcp_server_absent_returns_unchanged() {
+        assert_eq!(
+            remove_codegraph_mcp_server("log_level: info\n"),
+            "log_level: info\n"
+        );
+        let no_child = "mcp_servers:\n  other:\n    command: foo\n";
+        assert_eq!(remove_codegraph_mcp_server(no_child), no_child);
+    }
+
+    #[test]
+    fn has_codegraph_mcp_server_detects_presence() {
+        assert!(has_codegraph_mcp_server(
+            "mcp_servers:\n  codegraph:\n    command: codegraph\n"
+        ));
+        assert!(!has_codegraph_mcp_server(
+            "mcp_servers:\n  other:\n    x: 1\n"
+        ));
+        assert!(!has_codegraph_mcp_server("log_level: info\n"));
+    }
+
+    #[test]
+    fn upsert_appends_block_when_no_top_level_key() {
+        let out = upsert_codegraph_mcp_server("log_level: info\n");
+        assert!(out.contains("log_level: info"));
+        assert!(out.contains("mcp_servers:"));
+        assert!(out.contains("  codegraph:"));
+        let toolset = upsert_codegraph_toolset(&out);
+        assert!(toolset.contains("platform_toolsets:"));
+        assert!(toolset.contains("- mcp-codegraph"));
+    }
+
     #[test]
     fn hermes_skills_are_global_only() {
         // Given the Hermes target with a default hermes_home (~/.hermes).

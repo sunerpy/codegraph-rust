@@ -512,12 +512,13 @@ fn matches_separator_test(lower_name: &str) -> bool {
     let stem = &lower_name[..dot];
     let stem_chars: Vec<char> = stem.chars().collect();
     for marker in ["test", "tests", "spec", "specs"] {
-        if let Some(pos) = stem.rfind(marker) {
-            if pos + marker.len() == stem.len() && pos > 0 {
-                let sep = stem_chars[pos - 1];
-                if sep == '.' || sep == '_' || sep == '-' {
-                    return true;
-                }
+        if let Some(pos) = stem.rfind(marker)
+            && pos + marker.len() == stem.len()
+            && pos > 0
+        {
+            let sep = stem_chars[pos - 1];
+            if sep == '.' || sep == '_' || sep == '-' {
+                return true;
             }
         }
     }
@@ -652,4 +653,239 @@ pub fn is_distinctive_identifier(token: &str) -> bool {
         return true;
     }
     token.chars().skip(1).any(|c| c.is_ascii_uppercase())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tokens(strs: &[&str]) -> HashSet<String> {
+        strs.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn normalize_name_token_lowercases_and_strips_non_alnum() {
+        assert_eq!(normalize_name_token("My-App_2!"), "myapp2");
+        assert_eq!(normalize_name_token(""), "");
+        assert_eq!(normalize_name_token("...--"), "");
+    }
+
+    #[test]
+    fn stem_variants_ing_drops_suffix_adds_e_and_dedup() {
+        // "running" > 5, ends ing → base "runn", "runne", plus doubled-consonant "run".
+        let v = get_stem_variants("running");
+        assert!(v.contains(&"runn".to_string()));
+        assert!(v.contains(&"runne".to_string()));
+        assert!(v.contains(&"run".to_string()));
+        // never returns the original term
+        assert!(!v.contains(&"running".to_string()));
+    }
+
+    #[test]
+    fn stem_variants_tion_sion_ment_and_plurals() {
+        assert!(get_stem_variants("creation").contains(&"creat".to_string()));
+        assert!(get_stem_variants("decision").contains(&"decis".to_string()));
+        assert!(get_stem_variants("agreement").contains(&"agree".to_string()));
+        // ies → y
+        assert!(get_stem_variants("queries").contains(&"query".to_string()));
+        // es → drop
+        assert!(get_stem_variants("boxes").contains(&"box".to_string()));
+        // trailing s (not ss) → drop
+        assert!(get_stem_variants("tokens").contains(&"token".to_string()));
+        // ss is NOT stripped
+        assert!(!get_stem_variants("class").contains(&"clas".to_string()));
+    }
+
+    #[test]
+    fn stem_variants_ed_and_ied_and_er() {
+        // ed (not eed): drops 1 and 2 → "walke"/"walk"
+        let ed = get_stem_variants("walked");
+        assert!(ed.contains(&"walk".to_string()));
+        // ied → y
+        assert!(get_stem_variants("copied").contains(&"copy".to_string()));
+        // er variants: "parser" → "pars"/"parse"
+        let er = get_stem_variants("parser");
+        assert!(er.contains(&"parse".to_string()));
+        // doubled-consonant "er": "runner" → "run"
+        assert!(get_stem_variants("runner").contains(&"run".to_string()));
+        // "eed" excluded
+        assert!(!get_stem_variants("feed").contains(&"fe".to_string()));
+    }
+
+    #[test]
+    fn stem_variants_too_short_returns_empty() {
+        assert!(get_stem_variants("ing").is_empty());
+        assert!(get_stem_variants("er").is_empty());
+    }
+
+    #[test]
+    fn extract_search_terms_splits_camel_snake_and_compound() {
+        // camelCase → get + user + data (compound "getUserData" too)
+        let t = extract_search_terms("getUserData", false);
+        assert!(t.contains(&"getuserdata".to_string()));
+        assert!(t.contains(&"user".to_string()));
+        assert!(t.contains(&"data".to_string()));
+    }
+
+    #[test]
+    fn extract_search_terms_snake_case_identifier() {
+        let t = extract_search_terms("parse_query_string", false);
+        assert!(t.contains(&"parse_query_string".to_string()));
+        assert!(t.contains(&"parse".to_string()));
+        assert!(t.contains(&"query".to_string()));
+        assert!(t.contains(&"string".to_string()));
+    }
+
+    #[test]
+    fn extract_search_terms_drops_stop_words_and_short_tokens() {
+        // "the" and "of" are stop words; "at" is < 3 chars.
+        let t = extract_search_terms("the size of at", false);
+        assert!(!t.contains(&"the".to_string()));
+        assert!(!t.contains(&"of".to_string()));
+        assert!(!t.contains(&"at".to_string()));
+        assert!(t.contains(&"size".to_string()));
+    }
+
+    #[test]
+    fn extract_search_terms_acronym_boundary_split() {
+        // "HTTPServer" → acronym boundary before "Server".
+        let t = extract_search_terms("HTTPServer", false);
+        assert!(t.contains(&"http".to_string()));
+        assert!(t.contains(&"server".to_string()));
+    }
+
+    #[test]
+    fn extract_search_terms_with_stems_adds_variants() {
+        let with = extract_search_terms("running", true);
+        let without = extract_search_terms("running", false);
+        assert!(with.len() >= without.len());
+        assert!(with.contains(&"run".to_string()));
+    }
+
+    #[test]
+    fn extract_search_terms_empty_query_is_empty() {
+        assert!(extract_search_terms("", false).is_empty());
+        assert!(extract_search_terms("   ", false).is_empty());
+    }
+
+    #[test]
+    fn score_path_relevance_filename_beats_dir_beats_path() {
+        let empty = HashSet::new();
+        // token in filename → +10
+        let fname = score_path_relevance("src/auth/login.ts", "login", &empty);
+        // token in dir → +5
+        let dir = score_path_relevance("src/login/handler.ts", "login", &empty);
+        assert!(
+            fname > dir,
+            "filename hit outranks dir hit: {fname} vs {dir}"
+        );
+        assert!(dir > 0.0);
+    }
+
+    #[test]
+    fn score_path_relevance_path_only_hit_scores_three() {
+        let empty = HashSet::new();
+        // "widget" appears only deep in the path segment, not filename/immediate dir.
+        let score = score_path_relevance("app/widget/nested/main.ts", "widget", &empty);
+        assert!(score >= 3.0);
+    }
+
+    #[test]
+    fn score_path_relevance_empty_query_is_zero() {
+        let empty = HashSet::new();
+        assert_eq!(score_path_relevance("src/a.ts", "", &empty), 0.0);
+        assert_eq!(score_path_relevance("src/a.ts", "   ", &empty), 0.0);
+    }
+
+    #[test]
+    fn score_path_relevance_test_file_penalized_unless_test_query() {
+        let empty = HashSet::new();
+        // Non-test query on a test file → -15 penalty pushes it negative.
+        let penalized = score_path_relevance("src/tests/foo.rs", "foo", &empty);
+        assert!(penalized < 10.0, "test file penalized: {penalized}");
+        // Test query on a test file → no penalty.
+        let ok = score_path_relevance("src/tests/foo.rs", "test foo", &empty);
+        assert!(ok >= penalized);
+    }
+
+    #[test]
+    fn score_path_relevance_project_tokens_filtered_out() {
+        // If every query word is a project token, fall back to all_words.
+        let project = tokens(&["myproj"]);
+        let s = score_path_relevance("src/myproj/login.ts", "myproj login", &project);
+        assert!(s > 0.0);
+    }
+
+    #[test]
+    fn is_test_file_prefix_and_separator_and_camel() {
+        assert!(is_test_file("test_foo.py"));
+        assert!(is_test_file("foo_test.go"));
+        assert!(is_test_file("foo.test.ts"));
+        assert!(is_test_file("foo-spec.js"));
+        assert!(is_test_file("FooTest.java"));
+        assert!(is_test_file("FooSpec.scala"));
+        assert!(is_test_file("MyTestCase.cs"));
+    }
+
+    #[test]
+    fn is_test_file_directory_markers() {
+        assert!(is_test_file("src/tests/mod.rs"));
+        assert!(is_test_file("a/__tests__/b.ts"));
+        assert!(is_test_file("spec/foo.rb"));
+        assert!(is_test_file("app/UnitTests/Thing.cs"));
+        assert!(is_test_file("examples/demo.rs"));
+        assert!(is_test_file("fixtures/data.json"));
+    }
+
+    #[test]
+    fn is_test_file_production_is_false() {
+        assert!(!is_test_file("src/main.rs"));
+        assert!(!is_test_file("lib/handler.ts"));
+        // "attest" contains "test" but is neither prefix nor separator-suffixed.
+        assert!(!is_test_file("src/attestation.rs"));
+    }
+
+    #[test]
+    fn name_match_bonus_exact_and_multiword_and_prefix() {
+        // exact (whitespace stripped) → 80
+        assert_eq!(name_match_bonus("getUser", "get user"), 80.0);
+        // multiword query, one token equals name → 60
+        assert_eq!(name_match_bonus("login", "the login flow"), 60.0);
+        // prefix match → 10 + 30*ratio
+        let pref = name_match_bonus("authenticate", "auth");
+        assert!(pref > 10.0 && pref < 40.0);
+    }
+
+    #[test]
+    fn name_match_bonus_all_terms_contained_and_substring_and_none() {
+        // multi-term all contained (not exact/prefix) → 15
+        assert_eq!(name_match_bonus("userProfileCard", "profile card"), 15.0);
+        // plain substring → 10
+        assert_eq!(name_match_bonus("handleLoginRequest", "login"), 10.0);
+        // no match → 0
+        assert_eq!(name_match_bonus("foo", "zzz"), 0.0);
+    }
+
+    #[test]
+    fn kind_bonus_covers_every_variant() {
+        for kind in NodeKind::ALL {
+            let b = kind_bonus(kind);
+            assert!((0.0..=10.0).contains(&b), "{kind:?} bonus in range");
+        }
+        assert_eq!(kind_bonus(NodeKind::Function), 10.0);
+        assert_eq!(kind_bonus(NodeKind::File), 0.0);
+        assert_eq!(kind_bonus(NodeKind::Interface), 9.0);
+    }
+
+    #[test]
+    fn is_distinctive_identifier_rules() {
+        assert!(!is_distinctive_identifier(""));
+        assert!(is_distinctive_identifier("snake_case"));
+        assert!(is_distinctive_identifier("var2"));
+        assert!(is_distinctive_identifier("camelCase"));
+        // all-lowercase, no digit/underscore → not distinctive
+        assert!(!is_distinctive_identifier("plain"));
+        // leading uppercase only → not distinctive (skip(1) finds no upper)
+        assert!(!is_distinctive_identifier("Plain"));
+    }
 }

@@ -70,7 +70,7 @@ use codegraph_core::types::{EdgeKind, Language, Node, NodeKind, ReferenceSubkind
 
 use super::framework_node;
 use super::godot_common::{map_res_path, quoted_strings, strip_quotes};
-use super::godot_dsl_config::{dsl_id_fields, dsl_resource_fields, IdFieldSpec};
+use super::godot_dsl_config::{IdFieldSpec, dsl_id_fields, dsl_resource_fields};
 use crate::types::{FrameworkResolverExtractionResult, RefView};
 
 /// The marker-node name used when a `.tres` has no `[gd_resource type="..."]`.

@@ -10,12 +10,12 @@
 use std::fs;
 use std::path::PathBuf;
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use super::super::shared::{
-    mcp_server_config, read_config_file, read_json_file, remove_codegraph_from_mcp_servers,
-    to_upstream_json, upsert_nested_key_jsonc, write_json_file, ConfigRead, CODEGRAPH_SECTION_END,
-    CODEGRAPH_SECTION_START,
+    CODEGRAPH_SECTION_END, CODEGRAPH_SECTION_START, ConfigRead, mcp_server_config,
+    read_config_file, read_json_file, remove_codegraph_from_mcp_servers, to_upstream_json,
+    upsert_nested_key_jsonc, write_json_file,
 };
 use super::super::types::{
     AgentTarget, DetectionResult, FileAction, FileWrite, InstallContext, InstallOptions, Location,
@@ -188,27 +188,26 @@ fn remove_rules_entry(ctx: &InstallContext) -> FileWrite {
     if let (Some(start_idx), Some(end_idx)) = (
         content.find(CODEGRAPH_SECTION_START),
         content.find(CODEGRAPH_SECTION_END),
-    ) {
-        if end_idx > start_idx {
-            let before = content[..start_idx].trim_end();
-            let after = content[end_idx + CODEGRAPH_SECTION_END.len()..].trim_start();
-            let sep = if !before.is_empty() && !after.is_empty() {
-                "\n\n"
-            } else {
-                ""
-            };
-            let remainder = format!("{before}{sep}{after}");
-            let remainder = remainder.trim();
-            if remainder.is_empty() || remainder == our_frontmatter {
-                let _ = fs::remove_file(&file);
-            } else {
-                let _ = super::super::shared::atomic_write_file(&file, &format!("{remainder}\n"));
-            }
-            return FileWrite {
-                path: file,
-                action: FileAction::Removed,
-            };
+    ) && end_idx > start_idx
+    {
+        let before = content[..start_idx].trim_end();
+        let after = content[end_idx + CODEGRAPH_SECTION_END.len()..].trim_start();
+        let sep = if !before.is_empty() && !after.is_empty() {
+            "\n\n"
+        } else {
+            ""
+        };
+        let remainder = format!("{before}{sep}{after}");
+        let remainder = remainder.trim();
+        if remainder.is_empty() || remainder == our_frontmatter {
+            let _ = fs::remove_file(&file);
+        } else {
+            let _ = super::super::shared::atomic_write_file(&file, &format!("{remainder}\n"));
         }
+        return FileWrite {
+            path: file,
+            action: FileAction::Removed,
+        };
     }
 
     if content.trim() == our_frontmatter {
@@ -239,6 +238,221 @@ mod tests {
             xdg_config_home: None,
             hermes_home: None,
         }
+    }
+
+    struct TempCursor {
+        base: PathBuf,
+        ctx: InstallContext,
+    }
+
+    impl TempCursor {
+        fn new(label: &str) -> Self {
+            let base = std::env::temp_dir().join(format!(
+                "cg-cursor-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&base).unwrap();
+            let ctx = InstallContext {
+                home: base.join("home"),
+                cwd: base.join("cwd"),
+                app_data: None,
+                xdg_config_home: None,
+                hermes_home: None,
+            };
+            fs::create_dir_all(&ctx.cwd).unwrap();
+            fs::create_dir_all(&ctx.home).unwrap();
+            Self { base, ctx }
+        }
+        fn read(&self, p: &PathBuf) -> Value {
+            serde_json::from_str(&fs::read_to_string(p).unwrap()).unwrap()
+        }
+    }
+
+    impl Drop for TempCursor {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.base);
+        }
+    }
+
+    fn opts() -> InstallOptions {
+        InstallOptions {
+            auto_allow: false,
+            front_load_hook: false,
+        }
+    }
+
+    fn args_of(json: &Value) -> Vec<Value> {
+        json["mcpServers"]["codegraph"]["args"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn local_install_injects_absolute_path_arg() {
+        let fx = TempCursor::new("local");
+        let target = CursorTarget;
+        let mcp = mcp_json_path(&fx.ctx, Location::Local);
+
+        let detect = target.detect(&fx.ctx, Location::Local);
+        assert!(!detect.installed);
+
+        target.install(&fx.ctx, Location::Local, opts());
+        let args = args_of(&fx.read(&mcp));
+        assert_eq!(args[0], "serve");
+        assert_eq!(args[1], "--mcp");
+        assert_eq!(args[2], "--path");
+        assert_eq!(args[3], fx.ctx.cwd.to_string_lossy().as_ref());
+
+        let detect = target.detect(&fx.ctx, Location::Local);
+        assert!(detect.installed);
+        assert!(detect.already_configured);
+    }
+
+    #[test]
+    fn global_install_uses_workspace_folder_placeholder() {
+        let fx = TempCursor::new("global");
+        let target = CursorTarget;
+        let mcp = mcp_json_path(&fx.ctx, Location::Global);
+        target.install(&fx.ctx, Location::Global, opts());
+        let args = args_of(&fx.read(&mcp));
+        assert_eq!(args[3], "${workspaceFolder}");
+    }
+
+    #[test]
+    fn install_is_idempotent_preserving_siblings() {
+        let fx = TempCursor::new("idempotent");
+        let target = CursorTarget;
+        let mcp = mcp_json_path(&fx.ctx, Location::Local);
+        fs::create_dir_all(mcp.parent().unwrap()).unwrap();
+        fs::write(
+            &mcp,
+            "{\n  \"mcpServers\": { \"other\": { \"command\": \"foo\" } }\n}\n",
+        )
+        .unwrap();
+
+        target.install(&fx.ctx, Location::Local, opts());
+        let first = fs::read_to_string(&mcp).unwrap();
+        target.install(&fx.ctx, Location::Local, opts());
+        assert_eq!(fs::read_to_string(&mcp).unwrap(), first);
+        let json = fx.read(&mcp);
+        assert!(json["mcpServers"]["other"].is_object());
+        assert!(json["mcpServers"]["codegraph"].is_object());
+    }
+
+    #[test]
+    fn uninstall_removes_entry_reports_removed() {
+        let fx = TempCursor::new("uninstall");
+        let target = CursorTarget;
+        let mcp = mcp_json_path(&fx.ctx, Location::Local);
+        target.install(&fx.ctx, Location::Local, opts());
+        let result = target.uninstall(&fx.ctx, Location::Local);
+        assert_eq!(result.files[0].action, FileAction::Removed);
+        let json = fx.read(&mcp);
+        assert!(json.get("mcpServers").is_none());
+    }
+
+    #[test]
+    fn uninstall_missing_is_not_found() {
+        let fx = TempCursor::new("uninstall-missing");
+        let target = CursorTarget;
+        let result = target.uninstall(&fx.ctx, Location::Global);
+        assert_eq!(result.files[0].action, FileAction::NotFound);
+    }
+
+    #[test]
+    fn install_skips_unparseable_config() {
+        let fx = TempCursor::new("unparseable");
+        let mcp = mcp_json_path(&fx.ctx, Location::Local);
+        fs::create_dir_all(mcp.parent().unwrap()).unwrap();
+        let corrupt = "{ not json";
+        fs::write(&mcp, corrupt).unwrap();
+        let entry = write_mcp_entry(&fx.ctx, Location::Local);
+        assert_eq!(entry.action, FileAction::Skipped);
+        assert_eq!(fs::read_to_string(&mcp).unwrap(), corrupt);
+    }
+
+    #[test]
+    fn install_local_sweeps_stale_rules_file() {
+        let fx = TempCursor::new("sweep-rules");
+        let target = CursorTarget;
+        let rules = rules_path(&fx.ctx);
+        fs::create_dir_all(rules.parent().unwrap()).unwrap();
+        fs::write(
+            &rules,
+            format!(
+                "{MDC_FRONTMATTER}\n\n{CODEGRAPH_SECTION_START}\nbody\n{CODEGRAPH_SECTION_END}\n"
+            ),
+        )
+        .unwrap();
+
+        let result = target.install(&fx.ctx, Location::Local, opts());
+        assert!(
+            result.files.iter().any(|f| f.action == FileAction::Removed),
+            "stale rules swept"
+        );
+        assert!(!rules.exists(), "rules file removed when only our content");
+    }
+
+    #[test]
+    fn remove_rules_entry_preserves_user_body() {
+        let fx = TempCursor::new("rules-keep");
+        let rules = rules_path(&fx.ctx);
+        fs::create_dir_all(rules.parent().unwrap()).unwrap();
+        fs::write(
+            &rules,
+            format!("user rule text\n\n{CODEGRAPH_SECTION_START}\nours\n{CODEGRAPH_SECTION_END}\n"),
+        )
+        .unwrap();
+        let result = remove_rules_entry(&fx.ctx);
+        assert_eq!(result.action, FileAction::Removed);
+        let remaining = fs::read_to_string(&rules).unwrap();
+        assert!(remaining.contains("user rule text"));
+        assert!(!remaining.contains(CODEGRAPH_SECTION_START));
+    }
+
+    #[test]
+    fn remove_rules_entry_deletes_bare_frontmatter_only_file() {
+        let fx = TempCursor::new("rules-frontmatter");
+        let rules = rules_path(&fx.ctx);
+        fs::create_dir_all(rules.parent().unwrap()).unwrap();
+        fs::write(&rules, format!("{MDC_FRONTMATTER}\n")).unwrap();
+        let result = remove_rules_entry(&fx.ctx);
+        assert_eq!(result.action, FileAction::Removed);
+        assert!(!rules.exists());
+    }
+
+    #[test]
+    fn remove_rules_entry_missing_is_not_found() {
+        let fx = TempCursor::new("rules-missing");
+        let result = remove_rules_entry(&fx.ctx);
+        assert_eq!(result.action, FileAction::NotFound);
+    }
+
+    #[test]
+    fn remove_rules_entry_foreign_file_is_not_found() {
+        let fx = TempCursor::new("rules-foreign");
+        let rules = rules_path(&fx.ctx);
+        fs::create_dir_all(rules.parent().unwrap()).unwrap();
+        fs::write(&rules, "totally unrelated rule\n").unwrap();
+        let result = remove_rules_entry(&fx.ctx);
+        assert_eq!(result.action, FileAction::NotFound);
+        assert!(rules.exists());
+    }
+
+    #[test]
+    fn print_config_shows_path_arg() {
+        let target = CursorTarget;
+        let ctx = ctx();
+        let out = target.print_config(&ctx, Location::Global);
+        assert!(out.contains("mcpServers"));
+        assert!(out.contains("--path"));
+        assert!(out.contains("${workspaceFolder}"));
+        assert!(out.replace('\\', "/").contains(".cursor/mcp.json"));
     }
 
     #[test]

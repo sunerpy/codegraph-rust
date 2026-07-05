@@ -1,6 +1,8 @@
 .omo
 .opencode
 /target/
+# Root /target/ is anchored and does not cover the isolated Zed extension crate.
+editors/zed/target/
 **/*.rs.bk
 
 # Benchmark corpora are fetched on demand (codegraph-bench), not committed.
@@ -9,6 +11,10 @@ bench/corpora/
 # Locally-built release binary (see README install/build instructions).
 /codegraph
 dist/
+
+# Coverage artifacts (cargo-llvm-cov): lcov file + HTML report.
+lcov.info
+target/llvm-cov/
 
 # Per-project index DB written by `codegraph init` / `index`.
 .codegraph/

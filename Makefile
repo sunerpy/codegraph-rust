@@ -1,6 +1,7 @@
 .PHONY: all build build-dev build-prod release release-target install uninstall \
         fmt fmt-rust fmt-oxfmt fmt-check fmt-rust-check fmt-oxfmt-check \
-        lint check test guardrail ci hooks setup-hooks clean size-compare help
+        lint check test guardrail ci hooks setup-hooks clean size-compare help \
+        coverage coverage-html coverage-lcov coverage-open coverage-clean
 
 # Project configuration
 PROJECT_NAME := codegraph-rs
@@ -134,6 +135,54 @@ guardrail:
 ci: fmt-check lint test guardrail
 	@echo "✅ All CI checks passed!"
 
+# ─── Test coverage (cargo-llvm-cov + Codecov) ───────────────────────────────
+# Coverage is a tracked-but-informational metric: the target is 95%+ but the CI
+# gate never turns red (baseline ~72%). See codecov.yml + AGENTS.md.
+# Every recipe first checks that cargo-llvm-cov is installed.
+LLVM_COV_INSTALL := Install with: cargo install cargo-llvm-cov --locked
+LLVM_COV_HTML    := $(TARGET_DIR)/llvm-cov/html/index.html
+
+define REQUIRE_LLVM_COV
+	@command -v cargo-llvm-cov >/dev/null 2>&1 || { \
+		echo "❌ cargo-llvm-cov not found. $(LLVM_COV_INSTALL)"; exit 1; }
+endef
+
+# Print a workspace coverage summary (line/region/function %) to stdout.
+coverage:
+	$(REQUIRE_LLVM_COV)
+	@echo "📈 Measuring workspace coverage (summary)..."
+	$(CARGO) llvm-cov --workspace --summary-only --ignore-filename-regex 'codegraph-bench'
+
+# Generate the browsable HTML report under target/llvm-cov/html/.
+coverage-html:
+	$(REQUIRE_LLVM_COV)
+	@echo "📈 Generating HTML coverage report..."
+	$(CARGO) llvm-cov --workspace --html --ignore-filename-regex 'codegraph-bench'
+	@echo "✅ HTML report: $(LLVM_COV_HTML)"
+
+# Produce lcov.info (the artifact CI uploads to Codecov).
+coverage-lcov:
+	$(REQUIRE_LLVM_COV)
+	@echo "📈 Generating lcov.info..."
+	$(CARGO) llvm-cov --workspace --lcov --output-path lcov.info --ignore-filename-regex 'codegraph-bench'
+	@echo "✅ Wrote lcov.info"
+
+# Build the HTML report and open it (best-effort; never fails if no opener).
+coverage-open: coverage-html
+	@if command -v xdg-open >/dev/null 2>&1; then \
+		xdg-open "$(LLVM_COV_HTML)" >/dev/null 2>&1 || true; \
+	elif command -v open >/dev/null 2>&1; then \
+		open "$(LLVM_COV_HTML)" >/dev/null 2>&1 || true; \
+	else \
+		echo "ℹ️  No opener found; open manually: $(LLVM_COV_HTML)"; \
+	fi
+
+# Clear coverage instrumentation/profraw data.
+coverage-clean:
+	$(REQUIRE_LLVM_COV)
+	@echo "🧹 Cleaning coverage data..."
+	$(CARGO) llvm-cov clean --workspace
+
 # Enable the version-controlled pre-push hook (run once per clone).
 # Points core.hooksPath at .githooks so `git push` runs the local quality gate
 # (fmt + clippy + test + guardrail) before anything reaches GitHub.
@@ -183,6 +232,13 @@ help:
 	@echo "    guardrail    - Run the scope guardrail (no AI/vector/LLM crates)"
 	@echo "    ci           - fmt-check + lint + test + guardrail"
 	@echo "    hooks        - Enable the pre-push git hook (run once after clone)"
+	@echo ""
+	@echo "  Coverage (cargo-llvm-cov + Codecov; target 95%, informational gate):"
+	@echo "    coverage       - Workspace coverage summary to stdout"
+	@echo "    coverage-html  - HTML report -> target/llvm-cov/html/index.html"
+	@echo "    coverage-lcov  - Write lcov.info (uploaded to Codecov in CI)"
+	@echo "    coverage-open  - Build HTML report and open it (best-effort)"
+	@echo "    coverage-clean - Clear coverage instrumentation data"
 	@echo ""
 	@echo "  Utilities:"
 	@echo "    clean        - Remove build artifacts and dist/"

@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use codegraph_core::node_id::hash_content;
 use codegraph_core::types::FileRecord;
-use codegraph_extract::{detect_language, extract_file, ExtractOptions};
+use codegraph_extract::{ExtractOptions, detect_language, extract_file};
 use codegraph_resolve::ReferenceResolver;
 use codegraph_store::Store;
 
@@ -259,11 +259,12 @@ fn sync_one(
     // which stays authoritative — keeping the DB byte-identical to `index
     // --force`. (The equivalence tests edit file content, which changes size
     // and/or mtime, so they correctly fall through and reindex.)
-    if let Some(file) = &stored {
-        if file.size == metadata.len() as i64 && file.modified_at == modified_millis(&metadata) {
-            outcome.files_skipped_unchanged += 1;
-            return Ok(false);
-        }
+    if let Some(file) = &stored
+        && file.size == metadata.len() as i64
+        && file.modified_at == modified_millis(&metadata)
+    {
+        outcome.files_skipped_unchanged += 1;
+        return Ok(false);
     }
 
     let source = fs::read_to_string(&full).with_context(|| format!("read {}", full.display()))?;
@@ -392,7 +393,11 @@ pub(crate) mod tests {
     impl TestDir {
         pub(crate) fn new(name: &str) -> Self {
             let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!("codegraph-{name}-{id}"));
+            // pid disambiguates parallel `cargo test` binaries; the in-process
+            // counter alone resets to 1 per process and would collide in the
+            // shared temp dir.
+            let path =
+                std::env::temp_dir().join(format!("codegraph-{name}-{}-{id}", std::process::id()));
             let _ = fs::remove_dir_all(&path);
             fs::create_dir_all(&path).unwrap();
             Self { path }
@@ -493,5 +498,244 @@ pub(crate) mod tests {
         // Then: nothing was reindexed, so changed_paths is empty.
         assert_eq!(second.files_reindexed, 0);
         assert!(second.changed_paths.is_empty());
+    }
+
+    #[test]
+    fn ignored_and_duplicate_paths_are_counted_and_deduped() {
+        // Given: a project with one real source file.
+        let dir = TestDir::new("watch-ignored-dup");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
+        fs::write(
+            dir.path().join("src/app.ts"),
+            "export function answer() { return 42; }\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("README.md"), "# docs\n").unwrap();
+        fs::write(
+            dir.path().join("node_modules/pkg/index.ts"),
+            "export const x = 1;\n",
+        )
+        .unwrap();
+        let db = default_db_path(dir.path());
+
+        // When: the input mixes an escaping path (ignored via normalize),
+        // a node_modules path (ignored via policy), a non-source file
+        // (README.md), and the same source file listed twice (deduped).
+        let outcome = sync_changed_paths(
+            dir.path(),
+            &db,
+            [
+                "../escape.ts",
+                "node_modules/pkg/index.ts",
+                "README.md",
+                "src/app.ts",
+                "src/app.ts",
+            ],
+        )
+        .unwrap();
+
+        // Then: the escaping path is ignored before the checked counter; the
+        // node_modules + README paths are checked-then-ignored; the duplicate
+        // source path is deduped; and exactly one file is reindexed.
+        assert_eq!(outcome.files_reindexed, 1);
+        assert!(
+            outcome.files_ignored >= 3,
+            "escape + node_modules + README should be ignored, got {}",
+            outcome.files_ignored
+        );
+        assert_eq!(outcome.changed_paths, vec!["src/app.ts".to_string()]);
+    }
+
+    #[test]
+    fn deleted_file_is_removed_from_store_on_sync() {
+        // Given: a source file indexed once.
+        let dir = TestDir::new("watch-delete");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        let file = dir.path().join("src/app.ts");
+        fs::write(&file, "export function answer() { return 42; }\n").unwrap();
+        let db = default_db_path(dir.path());
+        let first = sync_changed_paths(dir.path(), &db, ["src/app.ts"]).unwrap();
+        assert_eq!(first.files_reindexed, 1);
+
+        // When: the file is deleted on disk and re-synced by path.
+        fs::remove_file(&file).unwrap();
+        let second = sync_changed_paths(dir.path(), &db, ["src/app.ts"]).unwrap();
+
+        // Then: the sync takes the delete branch — one file removed, listed in
+        // changed_paths, and the store no longer tracks it.
+        assert_eq!(second.files_removed, 1);
+        assert!(second.changed_paths.contains(&"src/app.ts".to_string()));
+        let store = Store::open(&db).unwrap();
+        assert!(
+            store.file_by_path("src/app.ts").unwrap().is_none(),
+            "deleted file must be dropped from the store"
+        );
+    }
+
+    #[test]
+    fn dependent_file_is_re_resolved_when_its_import_target_changes() {
+        // Given: a helper module and a consumer that imports it, both indexed.
+        let dir = TestDir::new("watch-dependents");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("src/helper.ts"),
+            "export function help() { return 1; }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/consumer.ts"),
+            "import { help } from './helper';\nexport function use() { return help(); }\n",
+        )
+        .unwrap();
+        let db = default_db_path(dir.path());
+        sync_changed_paths(dir.path(), &db, ["src/helper.ts", "src/consumer.ts"]).unwrap();
+
+        // When: only the helper changes (adds a symbol) and is re-synced alone,
+        // driving the dependent-refresh path for the untouched consumer.
+        fs::write(
+            dir.path().join("src/helper.ts"),
+            "export function help() { return 2; }\nexport function extra() { return 3; }\n",
+        )
+        .unwrap();
+        let outcome = sync_changed_paths(dir.path(), &db, ["src/helper.ts"]).unwrap();
+
+        // Then: the helper is reindexed and the sync completes without error,
+        // having walked the dependents/refresh machinery.
+        assert_eq!(outcome.files_reindexed, 1);
+        assert_eq!(outcome.changed_paths, vec!["src/helper.ts".to_string()]);
+    }
+
+    /// `sync_project_once` reads the global config; initialize it once (the
+    /// global `OnceLock` tolerates a repeat set as an ignorable error).
+    fn ensure_config(project_root: &Path) {
+        let _ = codegraph_core::config::init_config(None, project_root);
+    }
+
+    #[test]
+    fn sync_project_once_scans_and_removes_absent_tracked_files() {
+        // Given: a project with two source files indexed via a full scan.
+        let dir = TestDir::new("watch-once");
+        ensure_config(dir.path());
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::create_dir_all(dir.path().join(".codegraph")).unwrap();
+        fs::write(
+            dir.path().join("src/a.ts"),
+            "export function a() { return 1; }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/b.ts"),
+            "export function b() { return 2; }\n",
+        )
+        .unwrap();
+        let first = sync_project_once(dir.path()).unwrap();
+        assert!(
+            first.files_reindexed >= 2,
+            "both files indexed on first scan"
+        );
+
+        // When: one file is deleted and a full cold sync runs again — the
+        // deletion is discovered by diffing tracked files against the scan set.
+        fs::remove_file(dir.path().join("src/b.ts")).unwrap();
+        let second = sync_project_once(dir.path()).unwrap();
+
+        // Then: the absent tracked file is removed and the surviving file is
+        // skipped as unchanged.
+        assert_eq!(second.files_removed, 1);
+        assert!(second.changed_paths.contains(&"src/b.ts".to_string()));
+    }
+
+    #[test]
+    fn sync_project_once_with_progress_reports_monotonic_progress() {
+        // Given: a project with a couple of source files.
+        let dir = TestDir::new("watch-progress");
+        ensure_config(dir.path());
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::create_dir_all(dir.path().join(".codegraph")).unwrap();
+        fs::write(
+            dir.path().join("src/a.ts"),
+            "export function a() { return 1; }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/b.ts"),
+            "export function b() { return 2; }\n",
+        )
+        .unwrap();
+
+        // When: a progress-reporting sync runs, recording each (done, total).
+        let updates = std::cell::RefCell::new(Vec::new());
+        sync_project_once_with_progress(dir.path(), |done, total| {
+            updates.borrow_mut().push((done, total));
+        })
+        .unwrap();
+
+        // Then: progress is non-empty, done never exceeds total, and the final
+        // done equals total (every candidate was reported).
+        let updates = updates.into_inner();
+        assert!(!updates.is_empty(), "progress callback must fire");
+        let total = updates[0].1;
+        assert!(updates.iter().all(|(done, t)| *done <= *t && *t == total));
+        assert_eq!(updates.last().unwrap().0, total);
+    }
+
+    #[test]
+    fn node_names_in_file_returns_stored_symbol_names() {
+        // Given: an indexed source file with a named export.
+        let dir = TestDir::new("watch-node-names");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("src/app.ts"),
+            "export function answer() { return 42; }\n",
+        )
+        .unwrap();
+        let db = default_db_path(dir.path());
+        sync_changed_paths(dir.path(), &db, ["src/app.ts"]).unwrap();
+
+        // When: the stored node names for that file are queried.
+        let store = Store::open(&db).unwrap();
+        let names = node_names_in_file(&store, "src/app.ts").unwrap();
+
+        // Then: the exported symbol name is present.
+        assert!(
+            names.contains("answer"),
+            "stored node names should include the exported symbol, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn deleting_an_imported_module_refreshes_its_dependents() {
+        // Given: a helper module and a consumer that resolves an import to it,
+        // both indexed so a resolved cross-file edge exists.
+        let dir = TestDir::new("watch-delete-dependents");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("src/helper.ts"),
+            "export function help() { return 1; }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/consumer.ts"),
+            "import { help } from './helper';\nexport function use() { return help(); }\n",
+        )
+        .unwrap();
+        let db = default_db_path(dir.path());
+        sync_changed_paths(dir.path(), &db, ["src/helper.ts", "src/consumer.ts"]).unwrap();
+
+        // When: the helper is deleted and re-synced, driving the delete branch
+        // which gathers dependents and refreshes the surviving consumer's refs.
+        fs::remove_file(dir.path().join("src/helper.ts")).unwrap();
+        let outcome = sync_changed_paths(dir.path(), &db, ["src/helper.ts"]).unwrap();
+
+        // Then: the helper is removed and the sync completes, having walked the
+        // dependent-refresh machinery for the untouched consumer.
+        assert_eq!(outcome.files_removed, 1);
+        assert!(outcome.changed_paths.contains(&"src/helper.ts".to_string()));
+        let store = Store::open(&db).unwrap();
+        assert!(
+            store.file_by_path("src/consumer.ts").unwrap().is_some(),
+            "the consumer must survive the helper's deletion"
+        );
     }
 }

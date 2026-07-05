@@ -33,11 +33,11 @@
 use std::fs;
 use std::path::PathBuf;
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use super::super::shared::{
-    mcp_server_config, read_config_file, read_json_file, remove_codegraph_from_mcp_servers,
-    to_upstream_json, upsert_nested_key_jsonc, write_json_file, ConfigRead,
+    ConfigRead, mcp_server_config, read_config_file, read_json_file,
+    remove_codegraph_from_mcp_servers, to_upstream_json, upsert_nested_key_jsonc, write_json_file,
 };
 use super::super::types::{
     AgentTarget, DetectionResult, FileAction, FileWrite, InstallContext, InstallOptions, Location,
@@ -135,11 +135,11 @@ fn qoder_local_mcp_json(ctx: &InstallContext) -> PathBuf {
 /// pins the absolute project path.
 fn build_qoder_mcp_config(ctx: &InstallContext, loc: Location) -> Value {
     let mut base = mcp_server_config();
-    if loc == Location::Local {
-        if let Some(args) = base.get_mut("args").and_then(|a| a.as_array_mut()) {
-            args.push(json!("--path"));
-            args.push(json!(ctx.cwd.to_string_lossy().to_string()));
-        }
+    if loc == Location::Local
+        && let Some(args) = base.get_mut("args").and_then(|a| a.as_array_mut())
+    {
+        args.push(json!("--path"));
+        args.push(json!(ctx.cwd.to_string_lossy().to_string()));
     }
     base
 }
@@ -719,5 +719,112 @@ mod tests {
     fn supports_skills_both_locations() {
         assert!(QoderTarget.supports_skills(Location::Global));
         assert!(QoderTarget.supports_skills(Location::Local));
+    }
+
+    fn opts() -> InstallOptions {
+        InstallOptions {
+            auto_allow: false,
+            front_load_hook: false,
+        }
+    }
+
+    #[test]
+    fn detect_global_reflects_resolution_and_configuration() {
+        let (ctx, base) = temp_ctx("detect-global");
+        let before = QoderTarget.detect(&ctx, Location::Global);
+        assert!(!before.installed);
+        assert!(!before.already_configured);
+
+        let mcp = qoder_base(&ctx)
+            .join("QoderCN")
+            .join("ID")
+            .join("SharedClientCache")
+            .join("mcp.json");
+        fs::create_dir_all(mcp.parent().unwrap()).unwrap();
+        fs::write(&mcp, "{\"mcpServers\":{}}").unwrap();
+        let mid = QoderTarget.detect(&ctx, Location::Global);
+        assert!(mid.installed);
+        assert!(!mid.already_configured);
+
+        QoderTarget.install(&ctx, Location::Global, opts());
+        let after = QoderTarget.detect(&ctx, Location::Global);
+        assert!(after.installed);
+        assert!(after.already_configured);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn detect_local_reflects_presence() {
+        let (ctx, base) = temp_ctx("detect-local");
+        let before = QoderTarget.detect(&ctx, Location::Local);
+        assert!(!before.installed);
+
+        QoderTarget.install(&ctx, Location::Local, opts());
+        let after = QoderTarget.detect(&ctx, Location::Local);
+        assert!(after.installed);
+        assert!(after.already_configured);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn local_install_is_idempotent() {
+        let (ctx, base) = temp_ctx("local-idempotent");
+        let file = qoder_local_mcp_json(&ctx);
+        QoderTarget.install(&ctx, Location::Local, opts());
+        let first = fs::read_to_string(&file).unwrap();
+        QoderTarget.install(&ctx, Location::Local, opts());
+        assert_eq!(fs::read_to_string(&file).unwrap(), first);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn install_skips_unparseable_local_config() {
+        let (ctx, base) = temp_ctx("unparseable");
+        let file = qoder_local_mcp_json(&ctx);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let corrupt = "{ not json";
+        fs::write(&file, corrupt).unwrap();
+        let entry = write_mcp_entry(&ctx, Location::Local, &file);
+        assert_eq!(entry.action, FileAction::Skipped);
+        assert_eq!(fs::read_to_string(&file).unwrap(), corrupt);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn print_config_local_and_global_pattern() {
+        let (ctx, base) = temp_ctx("print");
+        let local = QoderTarget.print_config(&ctx, Location::Local);
+        assert!(local.replace('\\', "/").contains(".qoder/mcp.json"));
+        assert!(local.contains("--path"));
+
+        let global = QoderTarget.print_config(&ctx, Location::Global);
+        assert!(global.contains("<machineId>"));
+        assert!(global.contains("launch Qoder first"));
+        assert!(global.contains("mcpServers"));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn print_config_global_uses_resolved_path_when_present() {
+        let (ctx, base) = temp_ctx("print-resolved");
+        let mcp = qoder_base(&ctx)
+            .join("QoderCN")
+            .join("ID")
+            .join("SharedClientCache")
+            .join("mcp.json");
+        fs::create_dir_all(mcp.parent().unwrap()).unwrap();
+        fs::write(&mcp, "{\"mcpServers\":{}}").unwrap();
+        let out = QoderTarget.print_config(&ctx, Location::Global);
+        assert!(out.contains(&mcp.display().to_string()));
+        assert!(!out.contains("<machineId>"));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn server_mode_falls_through_when_data_machine_missing() {
+        let (ctx, base) = temp_ctx("servermode-nofile");
+        fs::create_dir_all(ctx.home.join(".qoder-cn-server")).unwrap();
+        assert!(qoder_global_mcp_json(&ctx).is_none());
+        let _ = fs::remove_dir_all(base);
     }
 }

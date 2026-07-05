@@ -54,7 +54,7 @@ pub fn resolve_workspace_import(import_path: &str, ws: &WorkspacePackages) -> Op
     let mut best_name: Option<&str> = None;
     for name in ws.by_name.keys() {
         if import_path == name || import_path.starts_with(&format!("{name}/")) {
-            if best_name.map_or(true, |b| name.len() > b.len()) {
+            if best_name.is_none_or(|b| name.len() > b.len()) {
                 best_name = Some(name);
             }
         }
@@ -176,6 +176,8 @@ fn expand_workspace_glob(project_root: &str, pattern: &str) -> Vec<String> {
             format!("{base}/{name}")
         });
     }
+    // Deterministic order: read_dir is FS-ordered; sort so `or_insert` first-wins is stable.
+    out.sort();
     out
 }
 
@@ -188,4 +190,239 @@ fn read_package_name(dir_abs: &Path) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let mut p = std::env::temp_dir();
+        p.push(format!("cg-ws-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&p).expect("mkdir temp");
+        p
+    }
+
+    fn write_pkg(dir: &Path, name: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            format!("{{ \"name\": \"{name}\" }}"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn collapse_slashes_dedupes() {
+        assert_eq!(collapse_slashes("a//b///c"), "a/b/c");
+        assert_eq!(collapse_slashes("a/b"), "a/b");
+        assert_eq!(collapse_slashes("/a//"), "/a/");
+    }
+
+    #[test]
+    fn parse_pnpm_packages_extracts_list() {
+        let yaml = "packages:\n  - 'packages/*'\n  - \"apps/*\"\n  - libs/one\nother: x\n";
+        let out = parse_pnpm_packages(yaml);
+        assert_eq!(out, vec!["packages/*", "apps/*", "libs/one"]);
+    }
+
+    #[test]
+    fn parse_pnpm_packages_block_ends_on_dedent() {
+        let yaml = "packages:\n  - a/*\nnextkey:\n  - b/*\n";
+        let out = parse_pnpm_packages(yaml);
+        assert_eq!(out, vec!["a/*"]);
+    }
+
+    #[test]
+    fn parse_pnpm_packages_no_packages_key() {
+        assert!(parse_pnpm_packages("foo:\n  - bar\n").is_empty());
+    }
+
+    #[test]
+    fn expand_workspace_glob_exact_dir_no_star() {
+        let root = temp_dir("exact");
+        let out = expand_workspace_glob(root.to_str().unwrap(), "packages/ui");
+        assert_eq!(out, vec!["packages/ui"]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn expand_workspace_glob_expands_star() {
+        let root = temp_dir("star");
+        write_pkg(&root.join("packages/a"), "@s/a");
+        write_pkg(&root.join("packages/b"), "@s/b");
+        std::fs::create_dir_all(root.join("packages/node_modules")).unwrap();
+        std::fs::create_dir_all(root.join("packages/.hidden")).unwrap();
+        let mut out = expand_workspace_glob(root.to_str().unwrap(), "packages/*");
+        out.sort();
+        assert_eq!(out, vec!["packages/a", "packages/b"]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn expand_workspace_glob_star_at_root() {
+        let root = temp_dir("rootstar");
+        write_pkg(&root.join("alpha"), "alpha");
+        let mut out = expand_workspace_glob(root.to_str().unwrap(), "*");
+        out.sort();
+        assert!(out.contains(&"alpha".to_string()));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn expand_workspace_glob_missing_dir_empty() {
+        let root = temp_dir("missing");
+        let out = expand_workspace_glob(root.to_str().unwrap(), "nope/*");
+        assert!(out.is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn read_package_name_reads_and_filters_empty() {
+        let root = temp_dir("readname");
+        write_pkg(&root.join("p"), "mypkg");
+        assert_eq!(
+            read_package_name(&root.join("p")),
+            Some("mypkg".to_string())
+        );
+        std::fs::write(root.join("p").join("package.json"), r#"{ "name": "" }"#).unwrap();
+        assert!(read_package_name(&root.join("p")).is_none());
+        std::fs::write(root.join("p").join("package.json"), r#"{ }"#).unwrap();
+        assert!(read_package_name(&root.join("p")).is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn load_workspace_packages_from_package_json_array() {
+        let root = temp_dir("wsarr");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "workspaces": ["packages/*"] }"#,
+        )
+        .unwrap();
+        write_pkg(&root.join("packages/ui"), "@app/ui");
+        write_pkg(&root.join("packages/core"), "@app/core");
+        let ws = load_workspace_packages(root.to_str().unwrap()).expect("ws");
+        assert_eq!(ws.by_name.get("@app/ui"), Some(&"packages/ui".to_string()));
+        assert_eq!(
+            ws.by_name.get("@app/core"),
+            Some(&"packages/core".to_string())
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn load_workspace_packages_from_object_form() {
+        let root = temp_dir("wsobj");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "workspaces": { "packages": ["libs/*"] } }"#,
+        )
+        .unwrap();
+        write_pkg(&root.join("libs/x"), "x");
+        let ws = load_workspace_packages(root.to_str().unwrap()).expect("ws");
+        assert_eq!(ws.by_name.get("x"), Some(&"libs/x".to_string()));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn load_workspace_packages_from_pnpm_yaml() {
+        let root = temp_dir("wspnpm");
+        std::fs::write(
+            root.join("pnpm-workspace.yaml"),
+            "packages:\n  - 'apps/*'\n",
+        )
+        .unwrap();
+        write_pkg(&root.join("apps/web"), "web");
+        let ws = load_workspace_packages(root.to_str().unwrap()).expect("ws");
+        assert_eq!(ws.by_name.get("web"), Some(&"apps/web".to_string()));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn load_workspace_packages_none_for_single_repo() {
+        let root = temp_dir("single");
+        std::fs::write(root.join("package.json"), r#"{ "name": "solo" }"#).unwrap();
+        assert!(load_workspace_packages(root.to_str().unwrap()).is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn load_workspace_packages_none_when_members_have_no_name() {
+        let root = temp_dir("noname");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "workspaces": ["packages/*"] }"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("packages/nada")).unwrap();
+        assert!(load_workspace_packages(root.to_str().unwrap()).is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn load_workspace_packages_first_declaration_wins() {
+        let root = temp_dir("dup");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "workspaces": ["packages/*"] }"#,
+        )
+        .unwrap();
+        write_pkg(&root.join("packages/aaa"), "dup");
+        write_pkg(&root.join("packages/bbb"), "dup");
+        let ws = load_workspace_packages(root.to_str().unwrap()).expect("ws");
+        // BTreeMap iteration + `or_insert` = first key alphabetically wins.
+        assert_eq!(ws.by_name.get("dup"), Some(&"packages/aaa".to_string()));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    fn sample_ws() -> WorkspacePackages {
+        let mut by_name = BTreeMap::new();
+        by_name.insert("@app/ui".to_string(), "packages/ui".to_string());
+        by_name.insert("@app/ui-core".to_string(), "packages/ui-core".to_string());
+        WorkspacePackages { by_name }
+    }
+
+    #[test]
+    fn resolve_workspace_import_exact_name() {
+        assert_eq!(
+            resolve_workspace_import("@app/ui", &sample_ws()),
+            Some("packages/ui".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_import_subpath() {
+        assert_eq!(
+            resolve_workspace_import("@app/ui/widgets", &sample_ws()),
+            Some("packages/ui/widgets".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_import_longest_match_wins() {
+        assert_eq!(
+            resolve_workspace_import("@app/ui-core/x", &sample_ws()),
+            Some("packages/ui-core/x".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_import_no_match() {
+        assert!(resolve_workspace_import("react", &sample_ws()).is_none());
+        // Prefix but not a full segment boundary.
+        assert!(resolve_workspace_import("@app/uixyz", &sample_ws()).is_none());
+    }
+
+    #[test]
+    fn workspace_packages_derive_debug_clone_eq() {
+        let ws = sample_ws();
+        assert_eq!(ws.clone(), ws);
+        assert!(format!("{ws:?}").contains("WorkspacePackages"));
+    }
 }

@@ -1,0 +1,17 @@
+coverage:
+  status:
+    project:
+      default:
+        target: 95%
+        informational: true # report-only: never fails CI (baseline ~72%, iron rule: local green => CI green)
+    patch:
+      default:
+        target: 95%
+        informational: true # new code encouraged to 95%, still non-blocking
+
+comment:
+  layout: "reach, diff, flags, files"
+  behavior: default
+
+ignore:
+  - "crates/codegraph-bench/**"

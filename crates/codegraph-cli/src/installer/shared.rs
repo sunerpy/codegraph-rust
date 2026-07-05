@@ -6,8 +6,8 @@
 use std::fs;
 use std::path::Path;
 
-use jsonc_parser::cst::{CstInputValue, CstRootNode};
 use jsonc_parser::ParseOptions;
+use jsonc_parser::cst::{CstInputValue, CstRootNode};
 use serde_json::{Map, Value};
 
 use super::types::{FileAction, FileWrite};
@@ -39,6 +39,164 @@ pub fn mcp_server_config() -> Value {
         "command": "codegraph",
         "args": ["serve", "--mcp"],
     })
+}
+
+/// Idempotency sentinel: presence of this substring means the HTTP hint is
+/// already injected, so [`inject_kiro_http_comment`] becomes a no-op.
+pub const KIRO_HTTP_COMMENT_SENTINEL: &str = "// HTTP alternative";
+
+/// The `//`-commented HTTP alternative injected into Kiro's JSONC `mcp.json`
+/// alongside the active stdio entry. localhost is mandatory: Kiro allows http
+/// only for localhost (remote servers must be https; a non-local http url is
+/// silently rejected), and localhost also sidesteps HTTP_PROXY.
+pub fn kiro_http_comment_block() -> &'static str {
+    "// HTTP alternative — run `codegraph serve --http` (defaults to 127.0.0.1:8111),\n\
+     // then uncomment below and remove the stdio entry above. stdio is primary\n\
+     // (works out of the box; live watch when project-local). HTTP needs a\n\
+     // separate `codegraph serve --http`, and Kiro allows http ONLY for localhost\n\
+     // (remote servers must be https), so the url MUST use localhost:\n\
+     // \"codegraph\": { \"url\": \"http://localhost:8111/mcp\" }"
+}
+
+/// Idempotency sentinel for [`zed_remote_comment_block`].
+pub const ZED_REMOTE_COMMENT_SENTINEL: &str = "// Remote development alternatives";
+
+/// The `//`-commented remote-development alternatives injected into Zed's JSONC
+/// `settings.json` alongside the active stdio `context_servers.codegraph` entry.
+///
+/// Two options: (1) SSH stdio — run codegraph on the remote host over `ssh -T`;
+/// (2) HTTP, marked RECOMMENDED for remote (a single `codegraph serve --http`
+/// avoids the extra ssh hop + stdio buffering fragility). Zed's HTTP context-
+/// server shape is a bare `{ "url": … }` (verified against Zed's MCP docs +
+/// source: untagged enum, `url` is the sole discriminator, no `type`/`source`).
+pub fn zed_remote_comment_block() -> &'static str {
+    "// Remote development alternatives (uncomment ONE; remove the stdio entry above):\n\
+     // 1) SSH stdio — run codegraph on the remote host over `ssh -T`:\n\
+     //    \"codegraph\": { \"command\": \"ssh\", \"args\": [\"-T\", \"<host>\", \"cd <project> && codegraph serve --mcp --path <project>\"], \"env\": {} }\n\
+     // 2) HTTP (RECOMMENDED for remote) — start `codegraph serve --http` (default\n\
+     //    127.0.0.1:8111) on the reachable host, or port-forward it, then point Zed\n\
+     //    at the url. HTTP avoids the extra ssh hop + stdio buffering that make\n\
+     //    ssh-stdio fragile over Zed remote development. Zed's HTTP context-server\n\
+     //    shape is a bare `url` (see https://zed.dev/docs/ai/mcp):\n\
+     //    \"codegraph\": { \"url\": \"http://localhost:8111/mcp\" }"
+}
+
+/// Best-effort idempotent injection of the [`kiro_http_comment_block`] after the
+/// active stdio `codegraph` entry inside `mcpServers`. See
+/// [`inject_commented_alternative`] for the shared mechanics.
+pub fn inject_kiro_http_comment(path: &Path) -> bool {
+    inject_commented_alternative(
+        path,
+        "mcpServers",
+        "codegraph",
+        KIRO_HTTP_COMMENT_SENTINEL,
+        kiro_http_comment_block(),
+    )
+}
+
+/// Best-effort idempotent injection of the [`zed_remote_comment_block`] after the
+/// active stdio `codegraph` entry inside `context_servers`.
+pub fn inject_zed_remote_comment(path: &Path) -> bool {
+    inject_commented_alternative(
+        path,
+        "context_servers",
+        "codegraph",
+        ZED_REMOTE_COMMENT_SENTINEL,
+        zed_remote_comment_block(),
+    )
+}
+
+/// Append a `//`-commented `comment_block` right after the active
+/// `<parent_key>.<entry_key>` object inside a JSONC file, matching the entry's
+/// indentation. Idempotent (no-op if `sentinel` is already present) and
+/// non-corrupting: no-op when the file is unreadable or the parent/entry cannot
+/// be located, and the active entry itself is never touched. Correctness over
+/// always injecting.
+pub fn inject_commented_alternative(
+    path: &Path,
+    parent_key: &str,
+    entry_key: &str,
+    sentinel: &str,
+    comment_block: &str,
+) -> bool {
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    if text.contains(sentinel) {
+        return false;
+    }
+    let parent_needle = format!("\"{parent_key}\"");
+    let Some(anchor) = text.find(&parent_needle) else {
+        return false;
+    };
+    let Some(brace_rel) = text[anchor..].find('{') else {
+        return false;
+    };
+    let obj_open = anchor + brace_rel;
+    let entry_needle = format!("\"{entry_key}\"");
+    let Some(cg_rel) = text[obj_open..].find(&entry_needle) else {
+        return false;
+    };
+    let cg_at = obj_open + cg_rel;
+    let bytes = text.as_bytes();
+    let Some(val_open_rel) = text[cg_at..].find('{') else {
+        return false;
+    };
+    let Some(mut end) = balanced_object_end(bytes, cg_at + val_open_rel) else {
+        return false;
+    };
+    if bytes.get(end) == Some(&b',') {
+        end += 1;
+    }
+    let line_start = text[..cg_at].rfind('\n').map_or(0, |n| n + 1);
+    let indent: String = text[line_start..cg_at]
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect();
+    let block = comment_block
+        .lines()
+        .map(|l| format!("{indent}{l}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut out = String::with_capacity(text.len() + block.len() + indent.len() + 2);
+    out.push_str(&text[..end]);
+    out.push('\n');
+    out.push_str(&block);
+    out.push_str(&text[end..]);
+    atomic_write_file(path, &out).is_ok()
+}
+
+/// Return the index just past the matching `}` for the object that opens at
+/// `open` (which must index a `{`), tracking string/escape state so braces
+/// inside string literals do not miscount. `None` if unbalanced.
+fn balanced_object_end(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut i = open;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+        } else if b == b'"' {
+            in_string = true;
+        } else if b == b'{' {
+            depth += 1;
+        } else if b == b'}' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i + 1);
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Permissions list for Claude `settings.json`. Ports `getCodeGraphPermissions`
@@ -209,10 +367,10 @@ pub fn read_json_file(path: &Path) -> Map<String, Value> {
 /// Write a file atomically: write to `<path>.tmp.<pid>`, then rename.
 /// Ports `atomicWriteFileSync` (shared.ts:80).
 pub fn atomic_write_file(path: &Path, content: &str) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        if !dir.as_os_str().is_empty() {
-            fs::create_dir_all(dir)?;
-        }
+    if let Some(dir) = path.parent()
+        && !dir.as_os_str().is_empty()
+    {
+        fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     match fs::write(&tmp, content).and_then(|()| fs::rename(&tmp, path)) {
@@ -239,12 +397,32 @@ pub fn to_upstream_json(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_string())
 }
 
+// jsonc-parser 0.26 `CstStringLit::new_escaped` escapes only `"`, not `\` or
+// control chars, so a Windows path `C:\Users` emits invalid JSON `"C:\Users"`.
+// Pre-escape everything JSON-significant EXCEPT `"` (the library owns quotes).
+fn escape_for_cst_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn to_cst_input(value: &Value) -> CstInputValue {
     match value {
         Value::Null => CstInputValue::Null,
         Value::Bool(b) => CstInputValue::Bool(*b),
         Value::Number(n) => CstInputValue::Number(n.to_string()),
-        Value::String(s) => CstInputValue::String(s.clone()),
+        Value::String(s) => CstInputValue::String(escape_for_cst_string(s)),
         Value::Array(arr) => CstInputValue::Array(arr.iter().map(to_cst_input).collect()),
         Value::Object(map) => CstInputValue::Object(
             map.iter()
@@ -292,10 +470,10 @@ pub fn upsert_nested_key_jsonc(
             parent.append(leaf_key, to_cst_input(value));
         }
     }
-    if let Some(schema) = schema_url {
-        if root_obj.get("$schema").is_none() {
-            root_obj.insert(0, "$schema", CstInputValue::String(schema.to_string()));
-        }
+    if let Some(schema) = schema_url
+        && root_obj.get("$schema").is_none()
+    {
+        root_obj.insert(0, "$schema", CstInputValue::String(schema.to_string()));
     }
 
     let mut out = root.to_string();
@@ -333,10 +511,10 @@ pub fn remove_nested_key_jsonc(
         if let Some(prop) = parent.get(leaf_key) {
             prop.remove();
         }
-        if parent.properties().is_empty() {
-            if let Some(parent_prop) = root.object_value().and_then(|o| o.get(parent_key)) {
-                parent_prop.remove();
-            }
+        if parent.properties().is_empty()
+            && let Some(parent_prop) = root.object_value().and_then(|o| o.get(parent_key))
+        {
+            parent_prop.remove();
         }
     }
     let mut out = root.to_string();
@@ -361,18 +539,17 @@ pub fn replace_or_append_marked_section(
     };
 
     if let (Some(start_idx), Some(end_idx)) = (content.find(start_marker), content.find(end_marker))
+        && end_idx > start_idx
     {
-        if end_idx > start_idx {
-            let block_end = end_idx + end_marker.len();
-            let existing_block = &content[start_idx..block_end];
-            if existing_block == body {
-                return FileAction::Unchanged;
-            }
-            let before = &content[..start_idx];
-            let after = &content[block_end..];
-            let _ = atomic_write_file(path, &format!("{before}{body}{after}"));
-            return FileAction::Updated;
+        let block_end = end_idx + end_marker.len();
+        let existing_block = &content[start_idx..block_end];
+        if existing_block == body {
+            return FileAction::Unchanged;
         }
+        let before = &content[..start_idx];
+        let after = &content[block_end..];
+        let _ = atomic_write_file(path, &format!("{before}{body}{after}"));
+        return FileAction::Updated;
     }
 
     let trimmed = content.trim_end();
@@ -588,6 +765,217 @@ mod tests {
     #[test]
     fn truly_corrupt_text_is_unparseable() {
         assert!(parse_json_object("{ this is not json").is_none());
+    }
+
+    #[test]
+    fn jsonc_preserves_escaped_quote_inside_string() {
+        let map = parse_json_object(r#"{ "a": "he said \"hi\" // x" }"#).expect("parse");
+        assert_eq!(
+            map.get("a"),
+            Some(&serde_json::json!("he said \"hi\" // x"))
+        );
+    }
+
+    #[test]
+    fn empty_text_parses_to_empty_map() {
+        assert_eq!(parse_json_object("   \n"), Some(Map::new()));
+    }
+
+    #[test]
+    fn to_upstream_json_renders_null_and_number() {
+        let value = serde_json::json!({ "n": null, "x": 42, "arr": [1, 2] });
+        let out = to_upstream_json(&value);
+        assert!(out.contains("\"n\": null"));
+        assert!(out.contains("\"x\": 42"));
+    }
+
+    #[test]
+    fn upsert_nested_key_via_cst_handles_null_and_number_values() {
+        let p = tmp_path("cst.json");
+        fs::write(&p, "{\n  \"cfg\": {}\n}\n").unwrap();
+        let value = serde_json::json!({ "n": null, "x": 7, "on": true, "name": "cg" });
+        let action = upsert_nested_key_jsonc(&p, "cfg", "codegraph", &value, None).unwrap();
+        assert_eq!(action, FileAction::Updated);
+        let out = fs::read_to_string(&p).unwrap();
+        assert!(out.contains("\"codegraph\""));
+        assert!(out.contains("null"));
+        assert!(out.contains('7'));
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn upsert_nested_key_via_cst_handles_backslash_and_control_chars() {
+        let p = tmp_path("cst-backslash.json");
+        fs::write(
+            &p,
+            "{\n  \"mcpServers\": { \"other\": { \"command\": \"foo\" } }\n}\n",
+        )
+        .unwrap();
+        let win = "C:\\Users\\me\\proj\"q\ttab";
+        let value = serde_json::json!({ "command": "codegraph", "args": ["--path", win] });
+        upsert_nested_key_jsonc(&p, "mcpServers", "codegraph", &value, None).unwrap();
+        let out = fs::read_to_string(&p).unwrap();
+        let reparsed = parse_json_object(&out).expect("emitted JSONC must re-parse");
+        assert_eq!(
+            reparsed["mcpServers"]["codegraph"]["args"][1]
+                .as_str()
+                .unwrap(),
+            win
+        );
+        assert!(reparsed["mcpServers"]["other"].is_object());
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn remove_nested_key_absent_is_not_found() {
+        let p = tmp_path("absent.json");
+        fs::write(&p, "{\n  \"other\": 1\n}\n").unwrap();
+        let action = remove_nested_key_jsonc(&p, "mcpServers", "codegraph").unwrap();
+        assert_eq!(action, FileAction::NotFound);
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn marked_section_created_then_updated_then_removed() {
+        let p = tmp_path("AGENTS.md");
+        let start = CODEGRAPH_SECTION_START;
+        let end = CODEGRAPH_SECTION_END;
+
+        let block_v1 = format!("{start}\nv1\n{end}");
+        let created = replace_or_append_marked_section(&p, &block_v1, start, end);
+        assert_eq!(created, FileAction::Created);
+
+        let unchanged = replace_or_append_marked_section(&p, &block_v1, start, end);
+        assert_eq!(unchanged, FileAction::Unchanged);
+
+        let block_v2 = format!("{start}\nv2\n{end}");
+        let updated = replace_or_append_marked_section(&p, &block_v2, start, end);
+        assert_eq!(updated, FileAction::Updated);
+        assert!(fs::read_to_string(&p).unwrap().contains("v2"));
+
+        let removed = remove_marked_section(&p, start, end);
+        assert_eq!(removed, FileAction::Removed);
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn marked_section_appends_to_existing_body() {
+        let p = tmp_path("doc.md");
+        fs::write(&p, "existing user content\n").unwrap();
+        let block = format!("{CODEGRAPH_SECTION_START}\nours\n{CODEGRAPH_SECTION_END}");
+        let action = replace_or_append_marked_section(
+            &p,
+            &block,
+            CODEGRAPH_SECTION_START,
+            CODEGRAPH_SECTION_END,
+        );
+        assert_eq!(action, FileAction::Updated);
+        let out = fs::read_to_string(&p).unwrap();
+        assert!(out.contains("existing user content"));
+        assert!(out.contains("ours"));
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn remove_marked_section_kept_when_missing_file() {
+        let p = tmp_path("nope.md");
+        assert_eq!(
+            remove_marked_section(&p, CODEGRAPH_SECTION_START, CODEGRAPH_SECTION_END),
+            FileAction::Kept
+        );
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn remove_marked_section_not_found_when_no_markers() {
+        let p = tmp_path("plain.md");
+        fs::write(&p, "no markers here\n").unwrap();
+        assert_eq!(
+            remove_marked_section(&p, CODEGRAPH_SECTION_START, CODEGRAPH_SECTION_END),
+            FileAction::NotFound
+        );
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn remove_codegraph_from_mcp_servers_variants() {
+        let mut absent = Map::new();
+        assert!(!remove_codegraph_from_mcp_servers(&mut absent));
+
+        let mut no_key: Map<String, Value> =
+            serde_json::from_str("{ \"mcpServers\": { \"other\": { \"command\": \"x\" } } }")
+                .unwrap();
+        assert!(!remove_codegraph_from_mcp_servers(&mut no_key));
+
+        let mut only_cg: Map<String, Value> =
+            serde_json::from_str("{ \"mcpServers\": { \"codegraph\": {} } }").unwrap();
+        assert!(remove_codegraph_from_mcp_servers(&mut only_cg));
+        assert!(
+            only_cg.get("mcpServers").is_none(),
+            "emptied wrapper pruned"
+        );
+
+        let mut with_sibling: Map<String, Value> =
+            serde_json::from_str("{ \"mcpServers\": { \"codegraph\": {}, \"other\": {} } }")
+                .unwrap();
+        assert!(remove_codegraph_from_mcp_servers(&mut with_sibling));
+        assert!(with_sibling["mcpServers"].get("other").is_some());
+    }
+
+    #[test]
+    fn toml_table_insert_replace_unchanged_remove() {
+        let block = build_toml_table(
+            "mcp_servers.codegraph",
+            &[
+                ("command", TomlValue::Str("codegraph")),
+                ("args", TomlValue::Array(vec!["serve", "--mcp"])),
+            ],
+        );
+        assert!(block.contains("[mcp_servers.codegraph]"));
+        assert!(block.contains("command = \"codegraph\""));
+        assert!(block.contains("args = [\"serve\", \"--mcp\"]"));
+
+        let (inserted, kind) = upsert_toml_table("", "mcp_servers.codegraph", &block);
+        assert_eq!(kind, TomlUpsert::Inserted);
+        assert!(inserted.contains("[mcp_servers.codegraph]"));
+
+        let (unchanged, kind) = upsert_toml_table(&inserted, "mcp_servers.codegraph", &block);
+        assert_eq!(kind, TomlUpsert::Unchanged);
+        assert_eq!(unchanged, inserted);
+
+        let stale = "[mcp_servers.codegraph]\ncommand = \"old\"\n\n[other]\nx = 1\n";
+        let (replaced, kind) = upsert_toml_table(stale, "mcp_servers.codegraph", &block);
+        assert_eq!(kind, TomlUpsert::Replaced);
+        assert!(replaced.contains("command = \"codegraph\""));
+        assert!(replaced.contains("[other]"));
+
+        let (removed, did_remove) = remove_toml_table(&replaced, "mcp_servers.codegraph");
+        assert!(did_remove);
+        assert!(!removed.contains("[mcp_servers.codegraph]"));
+        assert!(removed.contains("[other]"));
+
+        let (unchanged_remove, did_remove) =
+            remove_toml_table("[other]\nx = 1\n", "mcp_servers.codegraph");
+        assert!(!did_remove);
+        assert!(unchanged_remove.contains("[other]"));
+    }
+
+    #[test]
+    fn toml_string_escaping_quotes_and_backslashes() {
+        let block = build_toml_table("h", &[("path", TomlValue::Str("C:\\a\\\"b\""))]);
+        assert!(block.contains("\\\\"));
+        assert!(block.contains("\\\""));
+    }
+
+    #[test]
+    fn toml_next_header_skips_array_of_tables() {
+        // Skipping `\n[[` folds the `[[b]]` block into `[a]`, so removing `[a]`
+        // also removes `[[b]]`, stopping at `[c]`.
+        let content = "[a]\nx = 1\n\n[[b]]\ny = 2\n\n[c]\nz = 3\n";
+        let (removed, did) = remove_toml_table(content, "a");
+        assert!(did);
+        assert!(!removed.contains("[a]"));
+        assert!(removed.contains("[c]"));
     }
 
     #[test]

@@ -295,3 +295,74 @@ fn has_descendant_kind(node: Node<'_>, kind: &str) -> bool {
     }
     false
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(src: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_swift::LANGUAGE.into())
+            .unwrap();
+        parser.parse(src, None).unwrap()
+    }
+
+    fn first_of_kind<'t>(node: Node<'t>, kind: &str) -> Option<Node<'t>> {
+        if node.kind() == kind {
+            return Some(node);
+        }
+        for i in 0..node.named_child_count() {
+            let child = node.named_child(i as u32)?;
+            if let Some(found) = first_of_kind(child, kind) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn trait_field_constants_are_stable() {
+        assert_eq!(SWIFT_SPEC.name_field(), "name");
+        assert_eq!(SWIFT_SPEC.body_field(), "body");
+        assert_eq!(SWIFT_SPEC.params_field(), "parameter");
+        assert_eq!(SWIFT_SPEC.return_field(), "return_type");
+    }
+
+    #[test]
+    fn static_keyword_modifier_is_static() {
+        let src = "class R {\n  static func s() {}\n}\n";
+        let tree = parse(src);
+        let func = first_of_kind(tree.root_node(), "function_declaration").unwrap();
+        assert!(SWIFT_SPEC.is_static(func, src));
+    }
+
+    #[test]
+    fn class_func_keyword_is_direct_child_not_a_modifier() {
+        let src = "class R {\n  class func c() {}\n}\n";
+        let tree = parse(src);
+        let func = first_of_kind(tree.root_node(), "function_declaration").unwrap();
+        assert!(!SWIFT_SPEC.is_static(func, src));
+    }
+
+    #[test]
+    fn get_signature_and_resolve_name_paths() {
+        let src = "func f(a: Int) -> Widget { return build() }\n";
+        let tree = parse(src);
+        let func = first_of_kind(tree.root_node(), "function_declaration").unwrap();
+        let _ = SWIFT_SPEC.get_signature(func, src);
+        assert_eq!(
+            SWIFT_SPEC.get_return_type(func, src).as_deref(),
+            Some("Widget")
+        );
+        assert!(SWIFT_SPEC.resolve_name(func, src).is_none());
+    }
+
+    #[test]
+    fn no_type_return_yields_none() {
+        let src = "func f() { let x = 1 }\n";
+        let tree = parse(src);
+        let func = first_of_kind(tree.root_node(), "function_declaration").unwrap();
+        assert!(SWIFT_SPEC.get_return_type(func, src).is_none());
+    }
+}

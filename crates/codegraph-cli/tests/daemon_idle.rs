@@ -98,10 +98,10 @@ fn indexed_project(label: &str) -> (TestDir, PathBuf) {
 /// `Command` (inside `spawn_detached_daemon`) snapshots env at spawn time, so
 /// setting it here is inherited by the daemon process.
 fn spawn_idle_daemon(project: &Path, idle_ms: &str) {
-    std::env::set_var("CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS", idle_ms);
-    std::env::set_var("CODEGRAPH_WATCH_DEBOUNCE_MS", "100");
-    spawn_detached_daemon(&bin(), project).expect("spawn_detached_daemon");
-    std::env::remove_var("CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS");
+    unsafe { std::env::set_var("CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS", idle_ms) };
+    unsafe { std::env::set_var("CODEGRAPH_WATCH_DEBOUNCE_MS", "100") };
+    spawn_detached_daemon(&bin(), project, false).expect("spawn_detached_daemon");
+    unsafe { std::env::remove_var("CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS") };
 }
 
 /// Connect a client, read+discard the hello line, and return the live stream so
@@ -131,10 +131,10 @@ fn read_pid_from_hello(socket: &Path) -> Option<u32> {
 fn poll_for_daemon_pid(socket: &Path, timeout: Duration) -> Option<u32> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if socket.exists() {
-            if let Some(pid) = read_pid_from_hello(socket) {
-                return Some(pid);
-            }
+        if socket.exists()
+            && let Some(pid) = read_pid_from_hello(socket)
+        {
+            return Some(pid);
         }
         std::thread::sleep(Duration::from_millis(25));
     }

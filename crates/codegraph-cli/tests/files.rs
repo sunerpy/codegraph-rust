@@ -135,14 +135,15 @@ fn unknown_language_yields_empty_result_and_no_stderr_hint() {
     // When files runs with a language no file uses,
     let (stdout, stderr, ok) = cli(&["files", "-p", p, "--language", "nosuchlang", "--json"]);
     assert!(ok, "files must still succeed: stderr={stderr}");
-    // Then the JSON result is empty and nothing is printed to stderr (no hint).
+    // Then the JSON result is empty and no unknown-language hint is printed to
+    // stderr (the one-time "logger initialized" line is not a hint).
     let value: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert!(
         value.as_array().expect("array").is_empty(),
         "unknown language must yield an empty result, got: {value}"
     );
     assert!(
-        stderr.is_empty(),
+        !stderr.contains("nosuchlang") && !stderr.to_lowercase().contains("language"),
         "unknown language must emit no stderr hint, got: {stderr:?}"
     );
 }

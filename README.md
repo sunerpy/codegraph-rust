@@ -1,6 +1,7 @@
 # CodeGraph-Rust
 
 [![CI](https://github.com/sunerpy/codegraph-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/sunerpy/codegraph-rust/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/sunerpy/codegraph-rust/branch/main/graph/badge.svg)](https://codecov.io/gh/sunerpy/codegraph-rust)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
 
 > A deterministic **code knowledge graph**: tree-sitter parsing persisted to
@@ -83,7 +84,7 @@ codegraph serve --mcp --path /path/to/project  # optional: pin to a specific pro
 ```
 
 Auto-register it into your agent's config (Claude Code, Cursor, Codex CLI,
-opencode, Hermes, Gemini CLI, Antigravity, Kiro):
+opencode, Hermes, Gemini CLI, Antigravity, Kiro, Trae, Qoder, Zed):
 
 ```bash
 codegraph install --yes              # detects installed agents and wires them up
@@ -184,7 +185,7 @@ See [`docs/mcp.md`](docs/mcp.md#project-resolution) for the full three-case
 breakdown.
 
 Supported agents: Claude Code, Cursor, Codex CLI, opencode, Hermes Agent,
-Gemini CLI, Antigravity IDE, Kiro, Trae, Qoder.
+Gemini CLI, Antigravity IDE, Kiro, Trae, Qoder, Zed.
 
 ```bash
 codegraph install --yes                          # auto-detect installed agents
@@ -214,8 +215,9 @@ codegraph skill uninstall --target=claude --yes       # remove from one agent
 codegraph skill status                     # show state for all detected agents
 ```
 
-All ten supported agents have a skill directory (Claude Code, Cursor, Codex
-CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, Trae, Qoder).
+Ten of the eleven install targets have a skill directory (Claude Code, Cursor,
+Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, Trae,
+Qoder; `zed` is MCP-only and has no skill directory).
 Default location is `--global`; pass `--local` to write into the project tree.
 Hermes supports global only.
 
@@ -234,20 +236,40 @@ Full reference including per-agent skill paths: [`docs/cli.md`](docs/cli.md).
 `codegraph install` registers the MCP server entry for each supported agent/IDE.
 How well the index stays live depends on whether the IDE expands `${workspaceFolder}`.
 
-| IDE / Agent | Global config strategy                                                                                                                                                                                                                                                                                                          | Live watch                     |
-| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------ |
-| **Cursor**  | Global `~/.cursor/mcp.json` uses `--path ${workspaceFolder}` — one config auto-follows every project window.                                                                                                                                                                                                                    | Live on save (daemon watcher). |
-| **Trae**    | Global config (`~/.trae-server/data/Machine/mcp.json` in server/remote mode, or `Trae/User/mcp.json` in desktop mode) uses `--path ${workspaceFolder}` — one config auto-follows every project window. Note: project-level `.trae/mcp.json` requires enabling **"Enable project-level MCP / 启用项目级 MCP"** in Trae settings. | Live on save (daemon watcher). |
-| **Kiro**    | Global `~/.kiro/settings/mcp.json` holds a bare `serve --mcp` entry (no `--path`). The agent passes the project path per tool call — tools work read-only off the existing index, but there is no live watch.                                                                                                                   | Manual only (see below).       |
-| **Qoder**   | Global entry (`<config_base>/QoderCN\|Qoder/<machineId>/SharedClientCache/mcp.json`) holds a bare `serve --mcp` entry. Tools work read-only off the existing index; the IDE does not expand `${workspaceFolder}` in this layout.                                                                                                | Manual only (see below).       |
+| IDE / Agent | Global config strategy                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | Live watch                                                                                              |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| **Cursor**  | Global `~/.cursor/mcp.json` uses `--path ${workspaceFolder}` — one config auto-follows every project window.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | Live on save (daemon watcher).                                                                          |
+| **Trae**    | Global config (`~/.trae-server/data/Machine/mcp.json` in server/remote mode, or `Trae/User/mcp.json` in desktop mode) uses `--path ${workspaceFolder}` — one config auto-follows every project window. Note: project-level `.trae/mcp.json` requires enabling **"Enable project-level MCP / 启用项目级 MCP"** in Trae settings.                                                                                                                                                                                                                                                                                                                                                                                                       | Live on save (daemon watcher).                                                                          |
+| **Kiro**    | Global `~/.kiro/settings/mcp.json` holds a bare `serve --mcp` entry (no `--path`). The agent passes the project path per tool call — tools work read-only off the existing index, but there is no live watch. The written `mcp.json` keeps **stdio as the primary, active transport** and also carries a `//`-commented HTTP alternative you can uncomment; Kiro requires `https` for remote MCP servers and allows `http` **only for localhost**, so that block uses `http://localhost:8111/mcp` (see [HTTP MCP server](#http-mcp-server-background-mode)).                                                                                                                                                                          | Manual only (see below).                                                                                |
+| **Qoder**   | Global entry (`<config_base>/QoderCN\|Qoder/<machineId>/SharedClientCache/mcp.json`) holds a bare `serve --mcp` entry. Tools work read-only off the existing index; the IDE does not expand `${workspaceFolder}` in this layout.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Manual only (see below).                                                                                |
+| **Zed**     | Global `~/.config/zed/settings.json` (Linux/macOS) or `%APPDATA%\Zed\settings.json` (Windows) holds a bare `context_servers.codegraph` entry (no `--path`). Zed's global config has no `${workspaceFolder}` expansion — tools work read-only off the existing index globally. The written `settings.json` keeps **stdio as the primary, active transport** and also carries `//`-commented **remote-development alternatives** you can uncomment: an **SSH stdio** bridge and an **HTTP** server (`http://localhost:8111/mcp`); for remote development HTTP is the **recommended** transport (a single `codegraph serve --http` avoids the extra ssh hop + stdio buffering). See [HTTP MCP server](#http-mcp-server-background-mode). | Manual/read-only globally; run `codegraph init --target=zed` per project for live per-project `--path`. |
 
-**Getting live auto-update in Kiro or Qoder.** Run `codegraph init --target=<ide>`
+**Getting live auto-update in Kiro, Qoder, or Zed.** Run `codegraph init --target=<ide>`
 once inside each project:
 
 ```bash
 cd /your/project
 codegraph init --target=kiro    # or --target=qoder
+codegraph init --target=zed     # writes .zed/settings.json with absolute --path
 ```
+
+For Zed specifically, this writes a project-level `.zed/settings.json` with an
+absolute `--path` — the **only** way to give Zed a per-project path, since Zed's
+global `context_servers` config cannot inject one.
+
+> **Zed Remote (SSH).** Zed runs MCP `context_servers` on the local client, not
+> on the remote host — even when a remote SSH project is open. If codegraph tools
+> return empty in a remote SSH session, use an `ssh` bridge command instead of
+> `command: "codegraph"` directly. The installer already writes both remote
+> options as `//`-commented alternatives inside your `settings.json` (uncomment
+> one; remove the stdio entry above): an **SSH stdio** bridge, and an **HTTP**
+> server (`http://localhost:8111/mcp`, started with a single `codegraph serve
+--http`) — **HTTP is the recommended remote transport** because it avoids the
+> extra ssh hop and stdio buffering that make ssh-stdio fragile. Zed's HTTP
+> context-server shape is a bare `{"url": …}` (verified against
+> [Zed's MCP docs](https://zed.dev/docs/ai/mcp)). See
+> [`docs/mcp.md` — Zed over SSH](docs/mcp.md#zed-over-ssh-remote-development)
+> for the config and full explanation.
 
 On a fresh (unindexed) project this builds the index and writes a project-level
 config with the absolute `--path`. On an already-indexed project it writes (or
@@ -259,6 +281,67 @@ Without a project-level config, the index only updates when you run
 `codegraph index` or `codegraph sync` manually. This mirrors upstream CodeGraph's
 behavior: clients that cannot report a workspace root rely on startup catch-up and
 manual reindex rather than per-call sync.
+
+---
+
+## CodeGraph for Zed (extension)
+
+A standalone Zed extension lives under [`editors/zed/`](editors/zed/). It
+registers CodeGraph as a `context_servers` context server inside Zed and
+downloads the right platform binary automatically — no separate install step
+needed.
+
+### Install (dev extension)
+
+1. Clone this repository.
+2. In Zed, open the command palette and run **`zed: install dev extension`**.
+3. Select the `editors/zed/` directory.
+
+Zed compiles the extension to WebAssembly and registers a `codegraph` context
+server. On first launch it downloads the latest CodeGraph release binary for your
+platform.
+
+### Auto-update
+
+The extension never pins a CodeGraph version. On each launch it resolves the
+**latest** `sunerpy/codegraph-rust` GitHub release, picks the asset matching your
+platform, downloads and extracts it, and caches it under a version-stamped path
+(`codegraph-<version>/codegraph`). When the CodeGraph CLI ships a new release the
+extension picks up the new binary automatically — **no extension re-publish or
+manual update required**.
+
+If you already have `codegraph` installed via the CLI, or want to pin a specific
+project path, add a `command` override in your project's `.zed/settings.json`:
+
+```jsonc
+{
+  "context_servers": {
+    "codegraph": {
+      "command": {
+        "path": "codegraph",
+        "args": ["serve", "--mcp", "--path", "/abs/path/to/project"],
+        "env": {},
+      },
+    },
+  },
+}
+```
+
+Or let the installer write it for you:
+
+```bash
+cd /your/project
+codegraph init --target=zed     # writes .zed/settings.json with absolute --path
+```
+
+See [`editors/zed/README.md`](editors/zed/README.md) for the full extension
+reference, and [`docs/mcp.md`](docs/mcp.md#zed----context_servers-config) for the
+Zed `context_servers` config shape.
+
+> **Publishing.** The extension is not yet published to the
+> [`zed-industries/extensions`](https://github.com/zed-industries/extensions)
+> registry. Dev-install via the step above works today; marketplace publish is a
+> later manual step.
 
 ---
 
@@ -314,7 +397,43 @@ The pid/lock file always stays at `.codegraph/daemon.pid`, and clients read the
 recorded socket from the lock, so they attach regardless of which candidate the
 daemon chose.
 
-### Indexing exclusions (`[indexing] exclude`)
+### HTTP MCP server (background mode)
+
+Besides the stdio transport, CodeGraph can serve MCP over streamable-HTTP for
+web/remote clients (`serve --http`). HTTP servers are keyed by **bind address**
+(not by project — a global server with no `--path` spans many projects), so they
+have their own address-keyed registry, separate from the per-project daemon.
+
+```bash
+codegraph serve --http                                       # one command — binds 127.0.0.1:8111 (default)
+codegraph serve --http --http-addr 127.0.0.1:8111            # foreground (blocks; default)
+codegraph serve --http --http-addr 127.0.0.1:8111 --detach   # background; prints pid + log, then exits
+codegraph http list                                          # table of running servers
+codegraph http status [<addr>]                               # detail for one, or all
+codegraph http stop 127.0.0.1:8111                           # terminate one by address
+```
+
+`codegraph serve --http` alone is the one-command start: `--http-addr` defaults
+to `127.0.0.1:8111`, so no address flag is needed. To point an MCP client (e.g.
+Kiro's commented alternative) at it, use `http://localhost:8111/mcp`.
+
+**Foreground stays the default** — `serve --http` blocks and serves until you
+stop it. Add `--detach` to run it in the background: the parent spawns a
+detached child, records it in the registry, prints `started HTTP MCP server on
+<addr> (pid N), logs: <path>`, and exits.
+
+**Multi-instance by address.** Two servers on **different** addresses coexist;
+starting a second one notes the others. Starting on an **address already in
+use** is refused with an error that lists the running instance — stop it with
+`codegraph http stop <addr>` or pick a different `--http-addr`.
+
+**Self-healing registry.** One JSON file per running server lives under the
+global state dir (`$XDG_STATE_HOME/codegraph/http/`, else
+`~/.local/state/codegraph/http/`; `%LOCALAPPDATA%\codegraph\http\` on Windows;
+override with `CODEGRAPH_HTTP_REGISTRY_DIR`). Detached-server logs are written
+to `<registry_dir>/<addr>.log`. Each entry records the server's pid; on the next
+`serve --http`, `http list`, or `http stop`, any entry whose process has died is
+pruned automatically, so a crash never leaves a phantom conflict.
 
 Beyond the default `ignore_dirs`, you can skip additional root-relative path
 patterns by listing them under `[indexing] exclude` in

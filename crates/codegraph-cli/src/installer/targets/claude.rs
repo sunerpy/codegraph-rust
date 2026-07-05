@@ -7,13 +7,12 @@
 use std::fs;
 use std::path::PathBuf;
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use super::super::shared::{
-    self, codegraph_permissions, mcp_server_config, read_config_file, read_json_file,
-    remove_codegraph_from_mcp_servers, to_upstream_json, upsert_instructions_entry,
-    upsert_nested_key_jsonc, write_json_file, ConfigRead, CODEGRAPH_SECTION_END,
-    CODEGRAPH_SECTION_START,
+    self, CODEGRAPH_SECTION_END, CODEGRAPH_SECTION_START, ConfigRead, codegraph_permissions,
+    mcp_server_config, read_config_file, read_json_file, remove_codegraph_from_mcp_servers,
+    to_upstream_json, upsert_instructions_entry, upsert_nested_key_jsonc, write_json_file,
 };
 use super::super::types::{
     AgentTarget, DetectionResult, FileAction, FileWrite, InstallContext, InstallOptions, Location,
@@ -74,10 +73,10 @@ impl AgentTarget for ClaudeCodeTarget {
     fn install(&self, ctx: &InstallContext, loc: Location, opts: InstallOptions) -> WriteResult {
         let mut files = Vec::new();
         files.push(write_mcp_entry(ctx, loc));
-        if loc == Location::Local {
-            if let Some(migrated) = cleanup_legacy_local_mcp(ctx) {
-                files.push(migrated);
-            }
+        if loc == Location::Local
+            && let Some(migrated) = cleanup_legacy_local_mcp(ctx)
+        {
+            files.push(migrated);
         }
         if opts.auto_allow {
             files.push(write_permissions_entry(ctx, loc));
@@ -111,10 +110,10 @@ impl AgentTarget for ClaudeCodeTarget {
             });
         }
 
-        if loc == Location::Local {
-            if let Some(migrated) = cleanup_legacy_local_mcp(ctx) {
-                files.push(migrated);
-            }
+        if loc == Location::Local
+            && let Some(migrated) = cleanup_legacy_local_mcp(ctx)
+        {
+            files.push(migrated);
         }
 
         files.push(remove_permissions_entry(ctx, loc));
@@ -257,7 +256,7 @@ fn remove_permissions_entry(ctx: &InstallContext, loc: Location) -> FileWrite {
         let before = allow.len();
         allow.retain(|p| {
             p.as_str()
-                .map_or(true, |s| !s.starts_with("mcp__codegraph__"))
+                .is_none_or(|s| !s.starts_with("mcp__codegraph__"))
         });
         if allow.len() == before {
             return Some(false);
@@ -442,5 +441,168 @@ mod tests {
         assert!(local.ends_with("skills"));
         assert!(local.parent().unwrap().ends_with(".claude"));
         assert_eq!(local, ctx.cwd.join(".claude").join("skills"));
+    }
+
+    struct TempClaude {
+        base: PathBuf,
+        ctx: InstallContext,
+    }
+
+    impl TempClaude {
+        fn new(label: &str) -> Self {
+            let base = std::env::temp_dir().join(format!(
+                "cg-claude-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&base).unwrap();
+            let ctx = InstallContext {
+                home: base.join("home"),
+                cwd: base.join("cwd"),
+                app_data: None,
+                xdg_config_home: None,
+                hermes_home: None,
+            };
+            fs::create_dir_all(&ctx.home).unwrap();
+            fs::create_dir_all(&ctx.cwd).unwrap();
+            Self { base, ctx }
+        }
+        fn read(&self, p: &PathBuf) -> Value {
+            serde_json::from_str(&fs::read_to_string(p).unwrap()).unwrap()
+        }
+    }
+
+    impl Drop for TempClaude {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.base);
+        }
+    }
+
+    fn opts(auto_allow: bool) -> InstallOptions {
+        InstallOptions {
+            auto_allow,
+            front_load_hook: false,
+        }
+    }
+
+    #[test]
+    fn detect_reflects_config_presence() {
+        let fx = TempClaude::new("detect");
+        let target = ClaudeCodeTarget;
+        let before = target.detect(&fx.ctx, Location::Local);
+        assert!(!before.installed);
+        assert!(!before.already_configured);
+
+        target.install(&fx.ctx, Location::Local, opts(false));
+        let after = target.detect(&fx.ctx, Location::Local);
+        assert!(after.installed);
+        assert!(after.already_configured);
+    }
+
+    #[test]
+    fn install_with_auto_allow_writes_permissions() {
+        let fx = TempClaude::new("perms");
+        let target = ClaudeCodeTarget;
+        target.install(&fx.ctx, Location::Local, opts(true));
+        let settings = settings_json_path(&fx.ctx, Location::Local);
+        let allow = fx.read(&settings)["permissions"]["allow"].clone();
+        let arr = allow.as_array().unwrap();
+        assert!(arr.contains(&Value::String("mcp__codegraph__codegraph_explore".into())));
+
+        let again = write_permissions_entry(&fx.ctx, Location::Local);
+        assert_eq!(again.action, FileAction::Unchanged);
+    }
+
+    #[test]
+    fn cleanup_legacy_local_mcp_migrates_old_entry() {
+        let fx = TempClaude::new("legacy");
+        let legacy = legacy_local_mcp_path(&fx.ctx);
+        fs::write(
+            &legacy,
+            "{\n  \"mcpServers\": { \"codegraph\": { \"command\": \"old\" }, \"other\": { \"command\": \"foo\" } }\n}\n",
+        )
+        .unwrap();
+
+        let migrated = cleanup_legacy_local_mcp(&fx.ctx).expect("legacy entry migrated");
+        assert_eq!(migrated.action, FileAction::Removed);
+        let json = fx.read(&legacy);
+        assert!(json["mcpServers"].get("codegraph").is_none());
+        assert!(json["mcpServers"]["other"].is_object());
+    }
+
+    #[test]
+    fn cleanup_legacy_local_mcp_deletes_file_when_emptied() {
+        let fx = TempClaude::new("legacy-empty");
+        let legacy = legacy_local_mcp_path(&fx.ctx);
+        fs::write(
+            &legacy,
+            "{\n  \"mcpServers\": { \"codegraph\": { \"command\": \"old\" } }\n}\n",
+        )
+        .unwrap();
+        let migrated = cleanup_legacy_local_mcp(&fx.ctx).expect("migrated");
+        assert_eq!(migrated.action, FileAction::Removed);
+        assert!(!legacy.exists(), "emptied legacy file removed");
+    }
+
+    #[test]
+    fn cleanup_legacy_local_mcp_none_when_absent() {
+        let fx = TempClaude::new("legacy-none");
+        assert!(cleanup_legacy_local_mcp(&fx.ctx).is_none());
+    }
+
+    #[test]
+    fn install_skips_unparseable_mcp_config() {
+        let fx = TempClaude::new("unparseable");
+        let mcp = mcp_json_path(&fx.ctx, Location::Local);
+        let corrupt = "{ not json";
+        fs::write(&mcp, corrupt).unwrap();
+        let entry = write_mcp_entry(&fx.ctx, Location::Local);
+        assert_eq!(entry.action, FileAction::Skipped);
+        assert_eq!(fs::read_to_string(&mcp).unwrap(), corrupt);
+    }
+
+    #[test]
+    fn remove_permissions_entry_not_found_when_absent() {
+        let fx = TempClaude::new("perms-absent");
+        let result = remove_permissions_entry(&fx.ctx, Location::Local);
+        assert_eq!(result.action, FileAction::NotFound);
+    }
+
+    #[test]
+    fn upsert_mcp_server_resets_non_object_wrapper() {
+        let mut config = Map::new();
+        config.insert("mcpServers".to_string(), json!("not an object"));
+        upsert_mcp_server(&mut config, "codegraph", json!({ "command": "codegraph" }));
+        assert!(config["mcpServers"]["codegraph"].is_object());
+    }
+
+    #[test]
+    fn print_config_shows_global_target_path() {
+        let fx = TempClaude::new("print");
+        let target = ClaudeCodeTarget;
+        let out = target.print_config(&fx.ctx, Location::Global);
+        assert!(out.contains("mcpServers"));
+        assert!(out.contains("codegraph"));
+        assert!(out.contains(".claude.json"));
+    }
+
+    #[test]
+    fn full_uninstall_removes_all_codegraph_artifacts() {
+        let fx = TempClaude::new("uninstall-full");
+        let target = ClaudeCodeTarget;
+        target.install(&fx.ctx, Location::Local, opts(true));
+        let mcp = mcp_json_path(&fx.ctx, Location::Local);
+        assert!(fx.read(&mcp)["mcpServers"]["codegraph"].is_object());
+
+        target.uninstall(&fx.ctx, Location::Local);
+        let json = fx.read(&mcp);
+        assert!(json.get("mcpServers").is_none());
+        let settings = settings_json_path(&fx.ctx, Location::Local);
+        if settings.exists() {
+            assert!(fx.read(&settings).get("permissions").is_none());
+        }
     }
 }

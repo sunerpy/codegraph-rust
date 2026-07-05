@@ -7,32 +7,32 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
-use clap_complete::{generate, Shell};
+use clap_complete::{Shell, generate};
 use codegraph_core::config::init_config;
-use codegraph_core::logger::{init_logger, LoggerConfig};
+use codegraph_core::logger::{LoggerConfig, init_logger};
 use codegraph_core::node_id::hash_content;
 use codegraph_core::types::{ExtractionResult, FileRecord, Language, Node, NodeKind};
-use codegraph_extract::{detect_language, extract_source, ExtractOptions};
+use codegraph_extract::{ExtractOptions, detect_language, extract_source};
 use codegraph_graph::graph::{GodotReach, GraphTraverser};
-use codegraph_graph::query::{search_nodes, SearchOptions};
+use codegraph_graph::query::{SearchOptions, search_nodes};
 use codegraph_mcp::{McpServer, RunUntilAdoption};
 use codegraph_resolve::ReferenceResolver;
-use codegraph_store::queries::SearchResult;
 use codegraph_store::Store;
+use codegraph_store::queries::SearchResult;
 use indicatif::{ParallelProgressIterator, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
 use serde::Serialize;
 use serde_json::json;
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 mod installer;
 
@@ -50,9 +50,16 @@ fn main() {
         }
     };
 
+    // Logs go to STDERR, never stdout: `serve --mcp` owns stdout for the
+    // JSON-RPC stream and a single log byte there corrupts the protocol. The
+    // detached daemon / HTTP children re-enter this same path and have their
+    // stderr redirected to a log file, so their events land there WITH the
+    // subscriber's RFC3339 timestamps. `file` stays off — the child fd
+    // redirect, not a second rolling file, is the on-disk sink.
     let logger_cfg = LoggerConfig {
-        level: config.app.log_level.clone(),
+        level: effective_log_level(&config.app.log_level),
         stdout: false,
+        stderr: true,
         file: false,
         ..Default::default()
     };
@@ -103,6 +110,7 @@ impl Cli {
             Command::Install { .. }
             | Command::Uninstall { .. }
             | Command::Skill { .. }
+            | Command::Http { .. }
             | Command::Version
             | Command::Completions { .. }
             | Command::SelfUpdate { .. } => None,
@@ -191,6 +199,28 @@ enum Command {
         mcp: bool,
         #[arg(long = "no-watch")]
         no_watch: bool,
+        /// Serve MCP over streamable-HTTP (rmcp) instead of stdio. With `--path`
+        /// it pins one already-indexed project; without `--path` it starts a
+        /// GLOBAL server where each call carries its own `projectPath`. The
+        /// DNS-rebinding host guard is OPEN by default — any `Host` is accepted
+        /// (MCP Inspector, Zed, curl connect out of the box). Restrict it by
+        /// setting `CODEGRAPH_HTTP_ALLOWED_HOSTS` to a comma list of allowed
+        /// hosts (e.g. `localhost,code-server:12025`); a `*` entry (or unset)
+        /// means allow all.
+        #[arg(long)]
+        http: bool,
+        /// Address to bind the streamable-HTTP server to (loopback or a real
+        /// interface such as `0.0.0.0`). The host guard is OPEN by default; when
+        /// restricted via `CODEGRAPH_HTTP_ALLOWED_HOSTS` the loopback defaults
+        /// plus this bind authority are always allowed alongside the listed hosts.
+        #[arg(long = "http-addr", default_value = "127.0.0.1:8111")]
+        http_addr: String,
+        /// Run the HTTP MCP server in the BACKGROUND (detached) instead of the
+        /// foreground. Only meaningful with `--http`; the parent registers the
+        /// server, prints its pid + log path, and exits. Without `--http` this
+        /// flag is a hard error.
+        #[arg(long)]
+        detach: bool,
     },
     // Upstream flags/output: upstream bin/codegraph.ts:1167-1169, 1173-1186.
     Unlock {
@@ -319,6 +349,11 @@ enum Command {
         #[command(subcommand)]
         action: SkillAction,
     },
+    /// Manage background HTTP MCP servers started with `serve --http --detach`.
+    Http {
+        #[command(subcommand)]
+        action: HttpAction,
+    },
     /// Print the codegraph version.
     Version,
     /// Generate shell completion scripts (bash, zsh, fish, powershell, elvish).
@@ -414,6 +449,16 @@ enum SkillAction {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum HttpAction {
+    /// List all running background HTTP MCP servers.
+    List,
+    /// Show status for one HTTP MCP server (by addr) or all when omitted.
+    Status { addr: Option<String> },
+    /// Stop the background HTTP MCP server bound to `addr`.
+    Stop { addr: String },
+}
+
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Init { path, target } => cmd_init(path, &target),
@@ -446,7 +491,10 @@ fn run(cli: Cli) -> Result<()> {
             path,
             mcp,
             no_watch,
-        } => cmd_serve(path, mcp, no_watch),
+            http,
+            http_addr,
+            detach,
+        } => cmd_serve(path, mcp, no_watch, http, http_addr, detach),
         Command::Unlock { path } => cmd_unlock(path),
         Command::Callers {
             symbol,
@@ -574,6 +622,11 @@ fn run(cli: Cli) -> Result<()> {
                 force: false,
             }),
         },
+        Command::Http { action } => match action {
+            HttpAction::List => cmd_http_list(),
+            HttpAction::Status { addr } => cmd_http_status(addr),
+            HttpAction::Stop { addr } => cmd_http_stop(&addr),
+        },
         Command::Version => {
             println!("codegraph {VERSION}");
             Ok(())
@@ -662,9 +715,13 @@ fn powershell_profile_path() -> Result<PathBuf> {
     if let Some(p) = env_path("CODEGRAPH_PS_PROFILE") {
         return Ok(p);
     }
-    let user = env_path("USERPROFILE").or_else(|| env_path("HOME")).ok_or_else(|| {
-        anyhow!("cannot resolve PowerShell profile (set CODEGRAPH_PS_PROFILE, USERPROFILE, or HOME)")
-    })?;
+    let user = env_path("USERPROFILE")
+        .or_else(|| env_path("HOME"))
+        .ok_or_else(|| {
+            anyhow!(
+                "cannot resolve PowerShell profile (set CODEGRAPH_PS_PROFILE, USERPROFILE, or HOME)"
+            )
+        })?;
     Ok(user.join("Documents/WindowsPowerShell/Microsoft.PowerShell_profile.ps1"))
 }
 
@@ -707,10 +764,14 @@ fn install_completions(shell: Shell) -> Result<()> {
                 );
             }
             println!("Restart your shell (or run `. $PROFILE`) to load completions.");
-            println!("Press Ctrl+Space to trigger menu completion (Set-PSReadLineKeyHandler -Key Tab -Function MenuComplete).");
+            println!(
+                "Press Ctrl+Space to trigger menu completion (Set-PSReadLineKeyHandler -Key Tab -Function MenuComplete)."
+            );
         }
         Shell::Zsh => {
-            println!("Add `fpath+=~/.zfunc` before `compinit` in your ~/.zshrc if it is not already there.");
+            println!(
+                "Add `fpath+=~/.zfunc` before `compinit` in your ~/.zshrc if it is not already there."
+            );
             println!("Restart your shell to load completions.");
         }
         Shell::Elvish => {
@@ -948,6 +1009,12 @@ fn cmd_sync(path: Option<PathBuf>, quiet: bool) -> Result<()> {
 fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
     let start = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
     let project = resolve_project_path_optional(&start);
+    let db = db_path(&project);
+    let db_exists = db.is_file();
+    let daemon_running = daemon_already_running(&project);
+    let daemon_pid_path = codegraph_daemon::daemon_pid_path(&project);
+    let daemon_socket_path = codegraph_daemon::recorded_socket_path(&project);
+    let daemon_log_path = codegraph_daemon::daemon_log_path(&project);
     if !is_initialized(&project) {
         if json_output {
             print_json(&json!({
@@ -956,10 +1023,21 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
                 "projectPath": project,
                 "indexPath": codegraph_dir(&project),
                 "lastIndexed": null,
+                "dbPath": db,
+                "dbExists": db_exists,
+                "daemonRunning": daemon_running,
+                "daemonPidPath": daemon_pid_path,
+                "daemonSocketPath": daemon_socket_path,
+                "daemonLogPath": daemon_log_path,
             }))?;
         } else {
             println!("\nCodeGraph Status\n");
             println!("Project: {}", project.display());
+            println!("DB Path: {}", db.display());
+            println!(
+                "Daemon:  {}",
+                if daemon_running { "running" } else { "stopped" }
+            );
             println!("Not initialized");
             println!("Run \"codegraph init\" to initialize");
         }
@@ -979,7 +1057,7 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
         .get_project_metadata("indexed_with_extraction_version")?
         .and_then(|v| v.parse::<i64>().ok());
     let reindex_recommended = last_indexed.is_some()
-        && built_with_extraction_version.map_or(true, |v| v < EXTRACTION_VERSION);
+        && built_with_extraction_version.is_none_or(|v| v < EXTRACTION_VERSION);
 
     if json_output {
         print_json(&json!({
@@ -1004,6 +1082,12 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
                 "currentExtractionVersion": EXTRACTION_VERSION,
                 "reindexRecommended": reindex_recommended,
             },
+            "dbPath": db,
+            "dbExists": db_exists,
+            "daemonRunning": daemon_running,
+            "daemonPidPath": daemon_pid_path,
+            "daemonSocketPath": daemon_socket_path,
+            "daemonLogPath": daemon_log_path,
         }))?;
         return Ok(());
     }
@@ -1017,6 +1101,11 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
     println!("  DB Size:   {:.2} MB", db_size as f64 / 1024.0 / 1024.0);
     println!("  Backend:   rusqlite - bundled SQLite");
     println!("  Journal:   {}\n", journal_mode(&store)?);
+    println!("  DB Path:   {}", db.display());
+    println!(
+        "  Daemon:    {}\n",
+        if daemon_running { "running" } else { "stopped" }
+    );
     println!("Nodes by Kind:");
     for (kind, count) in nodes_by_kind {
         println!("  {kind:15} {}", format_number(count));
@@ -1055,13 +1144,13 @@ fn cmd_query(
         },
         &project_name_tokens(&project),
     )?;
-    if results.iter().all(|r| r.node.name != search) {
-        if let Some(resolved) = resolve_gdscript_class_member(&store, &search)? {
-            results = resolved
-                .into_iter()
-                .map(|node| SearchResult { node, score: 1.0 })
-                .collect();
-        }
+    if results.iter().all(|r| r.node.name != search)
+        && let Some(resolved) = resolve_gdscript_class_member(&store, &search)?
+    {
+        results = resolved
+            .into_iter()
+            .map(|node| SearchResult { node, score: 1.0 })
+            .collect();
     }
     if json_output {
         let output = results.iter().map(SearchOutput::from).collect::<Vec<_>>();
@@ -1131,15 +1220,88 @@ fn cmd_files(
     Ok(())
 }
 
-fn cmd_serve(path: Option<PathBuf>, mcp: bool, no_watch: bool) -> Result<()> {
+/// Whether `CODEGRAPH_DEBUG` is truthy (`"1"`/`"true"`). Retained ONLY as the
+/// back-compat translation into a debug log level (see [`effective_log_level`]);
+/// RUST_LOG is the primary knob. The old `[codegraph debug]` stderr traces are
+/// now `tracing::debug!` events that the EnvFilter gates, so this no longer
+/// gates any print directly.
+fn debug_enabled() -> bool {
+    matches!(
+        std::env::var("CODEGRAPH_DEBUG").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
+/// Resolve the effective base log level for the reloadable level filter. This
+/// value only sets the reload layer's floor; the EnvFilter (from RUST_LOG)
+/// filters on top. Because the two combine with AND, the base must never sit
+/// BELOW what RUST_LOG asks for — so when RUST_LOG is set we open the base to
+/// `trace` and let the EnvFilter be the sole gate. When RUST_LOG is unset,
+/// `CODEGRAPH_DEBUG=1` bumps the base to `debug` for back-compat with the old
+/// `[codegraph debug]` traces; otherwise the config level is used unchanged.
+fn effective_log_level(config_level: &str) -> String {
+    if std::env::var_os("RUST_LOG").is_some() {
+        return "trace".to_string();
+    }
+    if debug_enabled() {
+        return "debug".to_string();
+    }
+    config_level.to_string()
+}
+
+fn emit_serve_startup_debug(
+    project_root: &Path,
+    explicit_path: bool,
+    has_codegraph: bool,
+    mode: &ServeMode,
+) {
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "(unknown)".to_string());
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "(unknown)".to_string());
+    let db = db_path(project_root);
+    tracing::debug!(
+        %exe,
+        %cwd,
+        explicit_path,
+        default_project = %project_root.display(),
+        db = %db.display(),
+        db_exists = db.is_file(),
+        has_codegraph_dir = has_codegraph,
+        mode = ?mode,
+        "serve startup"
+    );
+}
+
+fn cmd_serve(
+    path: Option<PathBuf>,
+    mcp: bool,
+    no_watch: bool,
+    http: bool,
+    http_addr: String,
+    detach: bool,
+) -> Result<()> {
+    if http && mcp {
+        anyhow::bail!(
+            "`--mcp` and `--http` are mutually exclusive: `--mcp` serves MCP over stdio, `--http` serves it over streamable-HTTP. Pick one."
+        );
+    }
+    if detach && !http {
+        anyhow::bail!(
+            "`--detach` is only meaningful with `--http` (background HTTP MCP server). For stdio `serve --mcp`, the shared daemon already runs in the background automatically."
+        );
+    }
+    if http {
+        return cmd_serve_http(path, &http_addr, detach);
+    }
     // Default the MCP project to cwd so `serve --mcp` (no --path, as the
     // installer injects) finds the index of the agent's project root.
+    let explicit_path = path.is_some();
     let project = Some(resolve_project_path_optional(&absolute_path(
         path.unwrap_or_else(|| PathBuf::from(".")),
     )));
-    if no_watch {
-        std::env::set_var("CODEGRAPH_NO_WATCH", "1");
-    }
     if mcp {
         let project_root = project.clone().unwrap_or_else(|| PathBuf::from("."));
         // Stop-the-bleed home guard: an IDE (e.g. Kiro) launches `serve --mcp`
@@ -1149,15 +1311,18 @@ fn cmd_serve(path: Option<PathBuf>, mcp: bool, no_watch: bool) -> Result<()> {
         // serve tools off any existing index but run NO daemon, watcher, or
         // catch-up. A real project nested under $HOME is unaffected.
         if let Some(reason) = codegraph_watch::too_broad_root_reason(&project_root) {
-            eprintln!(
-                "[CodeGraph MCP] No project root: {reason}. Tools still answer off an existing index if present."
+            tracing::info!(
+                %reason,
+                "no project root; tools still answer off an existing index if present"
             );
-            return serve_direct_no_services(project, &project_root);
+            return serve_direct_no_services(project, &project_root, no_watch);
         }
         let has_codegraph = codegraph_dir(&project_root).is_dir();
-        match select_serve_mode(daemon_opt_out(), is_daemon_internal(), has_codegraph) {
+        let mode = select_serve_mode(daemon_opt_out(), is_daemon_internal(), has_codegraph);
+        emit_serve_startup_debug(&project_root, explicit_path, has_codegraph, &mode);
+        match mode {
             ServeMode::Direct => {
-                return serve_direct(project, &project_root, no_watch);
+                return serve_direct(project, &project_root, no_watch, explicit_path);
             }
             ServeMode::BeDaemon => {
                 return codegraph_daemon::run_foreground(
@@ -1173,7 +1338,7 @@ fn cmd_serve(path: Option<PathBuf>, mcp: bool, no_watch: bool) -> Result<()> {
                 if let Some(result) = spawn_or_proxy(project.clone(), &project_root, no_watch) {
                     return result;
                 }
-                return serve_direct(project, &project_root, no_watch);
+                return serve_direct(project, &project_root, no_watch, explicit_path);
             }
         }
     }
@@ -1183,7 +1348,457 @@ fn cmd_serve(path: Option<PathBuf>, mcp: bool, no_watch: bool) -> Result<()> {
     Ok(())
 }
 
-fn serve_direct(project: Option<PathBuf>, project_root: &Path, no_watch: bool) -> Result<()> {
+/// `serve --http`: serve MCP over streamable-HTTP (rmcp). Two modes selected by
+/// `--path`. With `--path`: PINNED — resolve the project (find-up), REQUIRE an
+/// on-disk index (hard-error otherwise — never self-index), and pin it as the
+/// default. Without `--path`: GLOBAL — no pinned default, no startup index
+/// requirement; each tool call MUST carry its own `projectPath` (the HTTP analog
+/// of the Kiro/Qoder bare global entry).
+///
+/// HTTP servers are keyed by BIND ADDR in a GLOBAL registry (not `.codegraph/`),
+/// so this path also does self-healing conflict detection: prune dead entries,
+/// error out if a LIVE server already binds the same addr, and (when free) note
+/// any other running servers. `--detach` spawns a background child (via the
+/// generalized daemon detach primitive) and the parent registers it + exits;
+/// foreground (default) registers itself and blocks on `serve_http`.
+fn cmd_serve_http(path: Option<PathBuf>, http_addr: &str, detach: bool) -> Result<()> {
+    use codegraph_daemon::http_registry::{self, HttpMode, HttpServerInfo};
+
+    let addr = resolve_http_addr(http_addr)?;
+    let addr_key = addr.to_string();
+
+    let (project, mode) = match path {
+        Some(raw) => {
+            let project = resolve_project_path_optional(&absolute_path(raw));
+            let db = db_path(&project);
+            if !db.is_file() {
+                anyhow::bail!(
+                    "`serve --http --path` requires an indexed project, but no index was found at {}. Run `codegraph init {}` (or `codegraph index`) first.",
+                    db.display(),
+                    project.display(),
+                );
+            }
+            (Some(project), HttpMode::Pinned)
+        }
+        None => (None, HttpMode::Global),
+    };
+
+    // The detached child re-invokes this same command with the internal marker
+    // set. It IS the background server: register itself and run the foreground
+    // serve path (never re-detach, never re-run conflict detection — the parent
+    // already did that before spawning).
+    if is_http_detach_internal() {
+        let info = HttpServerInfo {
+            pid: std::process::id(),
+            addr: addr_key.clone(),
+            mode,
+            project: project.as_ref().map(|p| p.display().to_string()),
+            started_at: http_registry::now_millis(),
+            version: VERSION.to_string(),
+            log_file: Some(http_log_path(&addr_key).display().to_string()),
+        };
+        let _ = http_registry::write_entry(&info);
+        let _guard = HttpRegistryGuard::new(addr_key);
+        return serve_http_impl(project, addr);
+    }
+
+    // Parent path: self-heal the registry, then detect conflicts.
+    http_registry::prune_dead();
+    if let Some(existing) = http_registry::live_entry_for(&addr_key) {
+        print_http_conflict(&existing);
+        anyhow::bail!(
+            "an HTTP MCP server is already running on {addr_key} (pid {}, started {}); stop it with `codegraph http stop {addr_key}` or choose a different --http-addr",
+            existing.pid,
+            format_started_at(existing.started_at),
+        );
+    }
+    note_other_running_servers(&addr_key);
+
+    if detach {
+        let exe = std::env::current_exe().context("resolving current executable for --detach")?;
+        let log_file = http_log_path(&addr_key);
+        if let Some(parent) = log_file.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let pid =
+            codegraph_daemon::spawn_detached_http(&exe, &addr_key, project.as_deref(), &log_file)
+                .context("spawning detached HTTP MCP server")?;
+        let info = HttpServerInfo {
+            pid,
+            addr: addr_key.clone(),
+            mode,
+            project: project.as_ref().map(|p| p.display().to_string()),
+            started_at: http_registry::now_millis(),
+            version: VERSION.to_string(),
+            log_file: Some(log_file.display().to_string()),
+        };
+        http_registry::write_entry(&info).context("writing HTTP registry entry")?;
+        println!(
+            "started HTTP MCP server on {addr_key} (pid {pid}), logs: {}",
+            log_file.display()
+        );
+        return Ok(());
+    }
+
+    // Foreground (default): register self, run serve_http (blocking); the Drop
+    // guard best-effort removes the entry on graceful exit.
+    let info = HttpServerInfo {
+        pid: std::process::id(),
+        addr: addr_key.clone(),
+        mode,
+        project: project.as_ref().map(|p| p.display().to_string()),
+        started_at: http_registry::now_millis(),
+        version: VERSION.to_string(),
+        log_file: None,
+    };
+    let _ = http_registry::write_entry(&info);
+    let _guard = HttpRegistryGuard::new(addr_key);
+    match &project {
+        Some(project) => tracing::debug!(
+            %addr,
+            project = %project.display(),
+            "serve --http (pinned)"
+        ),
+        None => tracing::debug!(
+            %addr,
+            "serve --http (global): per-call projectPath, no pinned default"
+        ),
+    }
+    serve_http_impl(project, addr)
+}
+
+/// True when this process is the detached HTTP child (re-invoked by
+/// [`codegraph_daemon::spawn_detached_http`] with the internal marker set).
+fn is_http_detach_internal() -> bool {
+    std::env::var(codegraph_daemon::CODEGRAPH_HTTP_DETACH_INTERNAL).as_deref() == Ok("1")
+}
+
+/// Log-file path for a detached HTTP server: `<registry_dir>/<addr-sanitized>.log`.
+fn http_log_path(addr_key: &str) -> PathBuf {
+    codegraph_daemon::http_registry::registry_dir().join(format!(
+        "{}.log",
+        codegraph_daemon::http_registry::sanitize_addr(addr_key)
+    ))
+}
+
+/// Best-effort removal of this process's own registry entry on scope exit
+/// (graceful foreground shutdown / detached child exit). A crash is covered by
+/// the next-start prune, so this is a courtesy, not a correctness requirement.
+struct HttpRegistryGuard {
+    addr_key: String,
+}
+
+impl HttpRegistryGuard {
+    fn new(addr_key: String) -> Self {
+        Self { addr_key }
+    }
+}
+
+impl Drop for HttpRegistryGuard {
+    fn drop(&mut self) {
+        let _ = codegraph_daemon::http_registry::remove_entry(&self.addr_key);
+    }
+}
+
+/// Print a running instance's details for a same-addr conflict (pid, mode,
+/// project, started, log) so the user sees exactly what is holding the addr.
+fn print_http_conflict(info: &codegraph_daemon::http_registry::HttpServerInfo) {
+    eprintln!(
+        "  running: {} (pid {}, mode {}, project {}, started {}{})",
+        info.addr,
+        info.pid,
+        info.mode.as_str(),
+        info.project.as_deref().unwrap_or("<global>"),
+        format_started_at(info.started_at),
+        info.log_file
+            .as_deref()
+            .map(|l| format!(", log {l}"))
+            .unwrap_or_default(),
+    );
+}
+
+/// After confirming the requested addr is free, note any OTHER live servers so
+/// the user knows multiple instances are running.
+fn note_other_running_servers(addr_key: &str) {
+    let others: Vec<_> = codegraph_daemon::http_registry::live_entries()
+        .into_iter()
+        .filter(|info| info.addr != addr_key)
+        .collect();
+    if others.is_empty() {
+        return;
+    }
+    let list = others
+        .iter()
+        .map(|info| format!("{} (pid {})", info.addr, info.pid))
+        .collect::<Vec<_>>()
+        .join(", ");
+    eprintln!(
+        "Note: {} other HTTP MCP server(s) running: {list}",
+        others.len()
+    );
+}
+
+/// Format an epoch-ms timestamp as an RFC3339 local string, falling back to the
+/// raw millis when the time crate cannot render it.
+fn format_started_at(started_at_ms: u64) -> String {
+    let secs = i64::try_from(started_at_ms / 1000).unwrap_or(0);
+    OffsetDateTime::from_unix_timestamp(secs)
+        .ok()
+        .and_then(|dt| {
+            dt.to_offset(time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC))
+                .format(&Rfc3339)
+                .ok()
+        })
+        .unwrap_or_else(|| format!("{started_at_ms} ms"))
+}
+
+/// Resolve a `--http-addr` string to a bind `SocketAddr`, accepting IP literals
+/// (`127.0.0.1:8111`, `[::1]:8111`) AND hostnames (`localhost:8111`). Uses
+/// `ToSocketAddrs` so `localhost` resolves through the OS resolver; when it
+/// yields both IPv6 and IPv4 loopbacks the first IPv4 is preferred so a plain
+/// `localhost` binds `127.0.0.1` (keeping curl-to-127.0.0.1 predictable),
+/// falling back to the first resolved address otherwise.
+fn resolve_http_addr(http_addr: &str) -> Result<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+    let mut addrs = http_addr.to_socket_addrs().with_context(|| {
+        format!(
+            "invalid --http-addr {http_addr:?}: expected <host>:<port> (e.g. 127.0.0.1:8111 or localhost:8111)"
+        )
+    })?;
+    let first = addrs
+        .next()
+        .ok_or_else(|| anyhow!("--http-addr {http_addr:?} resolved to no socket address"))?;
+    if first.is_ipv4() {
+        return Ok(first);
+    }
+    Ok(addrs.find(std::net::SocketAddr::is_ipv4).unwrap_or(first))
+}
+
+/// Indirection to `codegraph_mcp::serve_http` (streamable-HTTP via rmcp, the
+/// sole HTTP transport).
+fn serve_http_impl(default_project: Option<PathBuf>, addr: std::net::SocketAddr) -> Result<()> {
+    codegraph_mcp::serve_http(default_project, addr).context("serving MCP over streamable-HTTP")
+}
+
+/// `codegraph http list`: prune dead entries, then print a table of the live
+/// background HTTP MCP servers (ADDR | PID | MODE | PROJECT | STARTED | LOG).
+fn cmd_http_list() -> Result<()> {
+    let servers = codegraph_daemon::http_registry::live_entries();
+    print_http_table(&servers);
+    Ok(())
+}
+
+/// `codegraph http status [<addr>]`: with an addr, print detail for that one
+/// server; without, behave like `list` plus a running-count note.
+fn cmd_http_status(addr: Option<String>) -> Result<()> {
+    let servers = codegraph_daemon::http_registry::live_entries();
+    match addr {
+        Some(addr) => match servers.iter().find(|info| info.addr == addr) {
+            Some(info) => {
+                println!("addr:    {}", info.addr);
+                println!("pid:     {}", info.pid);
+                println!("mode:    {}", info.mode.as_str());
+                println!("project: {}", info.project.as_deref().unwrap_or("<global>"));
+                println!("started: {}", format_started_at(info.started_at));
+                println!("version: {}", info.version);
+                println!("log:     {}", info.log_file.as_deref().unwrap_or("-"));
+            }
+            None => println!("No HTTP MCP server running on {addr}."),
+        },
+        None => {
+            print_http_table(&servers);
+            if !servers.is_empty() {
+                println!("({} HTTP MCP server(s) running)", servers.len());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `codegraph http stop <addr>`: find the live server on `addr`, send it a
+/// graceful terminate (SIGTERM on unix / TerminateProcess on windows), wait
+/// briefly, and remove its registry entry.
+fn cmd_http_stop(addr: &str) -> Result<()> {
+    let addr_key = resolve_http_addr(addr)
+        .map(|resolved| resolved.to_string())
+        .unwrap_or_else(|_| addr.to_string());
+    let info = codegraph_daemon::http_registry::live_entry_for(&addr_key)
+        .or_else(|| codegraph_daemon::http_registry::live_entry_for(addr));
+    let Some(info) = info else {
+        println!("No HTTP MCP server running on {addr}.");
+        return Ok(());
+    };
+    let delivered = codegraph_daemon::terminate_pid(info.pid);
+    for _ in 0..50 {
+        if !codegraph_daemon::is_process_alive(info.pid) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    codegraph_daemon::http_registry::remove_entry(&info.addr);
+    if delivered {
+        println!(
+            "stopped HTTP MCP server on {} (pid {})",
+            info.addr, info.pid
+        );
+    } else {
+        println!(
+            "removed stale registry entry for {} (pid {} did not accept the terminate signal)",
+            info.addr, info.pid
+        );
+    }
+    Ok(())
+}
+
+/// Render the running-servers table, or a "none" line when empty.
+fn print_http_table(servers: &[codegraph_daemon::http_registry::HttpServerInfo]) {
+    if servers.is_empty() {
+        println!("No HTTP MCP servers running.");
+        return;
+    }
+    println!(
+        "{:<22} {:>7} {:<7} {:<28} {:<25} LOG",
+        "ADDR", "PID", "MODE", "PROJECT", "STARTED"
+    );
+    for info in servers {
+        println!(
+            "{:<22} {:>7} {:<7} {:<28} {:<25} {}",
+            info.addr,
+            info.pid,
+            info.mode.as_str(),
+            truncate_field(info.project.as_deref().unwrap_or("<global>"), 28),
+            format_started_at(info.started_at),
+            info.log_file.as_deref().unwrap_or("-"),
+        );
+    }
+}
+
+/// Truncate a display field to `max` chars, appending `…` when clipped, so the
+/// table columns stay aligned for long project paths.
+fn truncate_field(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    let mut out: String = value.chars().take(keep).collect();
+    out.push('…');
+    out
+}
+
+#[cfg(test)]
+mod resolve_http_addr_tests {
+    use super::resolve_http_addr;
+    #[test]
+    fn localhost_with_port_resolves_to_loopback() {
+        let addr = resolve_http_addr("localhost:12025").expect("localhost:PORT must resolve");
+        assert_eq!(addr.port(), 12025);
+        assert!(
+            addr.ip().is_loopback(),
+            "localhost must resolve to a loopback address, got {addr}"
+        );
+    }
+
+    #[test]
+    fn ipv4_literal_resolves() {
+        let addr = resolve_http_addr("127.0.0.1:8111").expect("127.0.0.1:PORT must resolve");
+        assert_eq!(addr.port(), 8111);
+        assert!(addr.ip().is_ipv4());
+        assert!(addr.ip().is_loopback());
+    }
+
+    #[test]
+    fn ipv6_bracketed_literal_resolves() {
+        let addr = resolve_http_addr("[::1]:8111").expect("[::1]:PORT must resolve");
+        assert_eq!(addr.port(), 8111);
+        assert!(addr.ip().is_ipv6());
+        assert!(addr.ip().is_loopback());
+    }
+
+    #[test]
+    fn ipv6_unbracketed_literal_resolves() {
+        // `::1:8111` is accepted by std's ToSocketAddrs (parsed as [::1]:8111).
+        let addr = resolve_http_addr("::1:8111").expect("::1:8111 must resolve");
+        assert_eq!(addr.port(), 8111);
+        assert!(addr.ip().is_ipv6());
+    }
+
+    #[test]
+    fn bogus_host_errors_with_actionable_message() {
+        let err = resolve_http_addr("not a host").expect_err("bogus host must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--http-addr") && msg.contains("localhost"),
+            "error must be actionable (mention --http-addr + localhost form): {msg}"
+        );
+    }
+
+    #[test]
+    fn missing_port_errors() {
+        resolve_http_addr("localhost").expect_err("host with no port must error");
+    }
+}
+
+#[cfg(test)]
+mod normalize_lexical_tests {
+    use super::{absolute_path, normalize_lexical};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn cwd_dot_has_no_trailing_curdir_segment() {
+        let normalized = absolute_path(".");
+        assert!(
+            normalized.is_absolute(),
+            "absolute_path(.) must be absolute: {}",
+            normalized.display()
+        );
+        assert!(
+            !normalized.to_string_lossy().ends_with("/."),
+            "absolute_path(.) must not carry a trailing /. segment: {}",
+            normalized.display()
+        );
+        assert_eq!(
+            normalized,
+            std::env::current_dir().unwrap(),
+            "absolute_path(.) must equal the cwd verbatim"
+        );
+    }
+
+    #[test]
+    fn already_clean_absolute_path_is_unchanged() {
+        let clean = PathBuf::from("/tmp/codegraph-project");
+        assert_eq!(normalize_lexical(&clean), clean);
+    }
+
+    #[test]
+    fn strips_curdir_and_folds_parentdir() {
+        assert_eq!(
+            normalize_lexical(Path::new("/a/./b/../c")),
+            PathBuf::from("/a/c")
+        );
+        assert_eq!(
+            normalize_lexical(Path::new("/a/b/.")),
+            PathBuf::from("/a/b")
+        );
+    }
+}
+
+/// Whether `serve --mcp` should start background services (live watcher +
+/// catch-up sync) for `project_root`. They run when the path was EXPLICIT
+/// (`--path X` — the user opted into X) or the cwd is ALREADY indexed. A bare
+/// serve from an UNINDEXED cwd (the Zed case) returns false so catch-up never
+/// self-indexes the cwd — keeping it unindexed and therefore adoptable when the
+/// client reports its real workspace root via `roots/list`.
+fn should_run_serve_services(explicit_path: bool, project_root: &Path) -> bool {
+    explicit_path || codegraph_dir(project_root).is_dir()
+}
+
+fn serve_direct(
+    project: Option<PathBuf>,
+    project_root: &Path,
+    no_watch: bool,
+    explicit_path: bool,
+) -> Result<()> {
+    let run_services = should_run_serve_services(explicit_path, project_root);
     // Watcher startup stays here (pre-handshake). Layer A
     // (`watch_disabled_reason`) already refuses to walk HOME / the filesystem
     // root, so a home-rooted launch never exhausts inotify. Restarting the
@@ -1191,70 +1806,86 @@ fn serve_direct(project: Option<PathBuf>, project_root: &Path, no_watch: bool) -
     // (Layer B) would require McpServer to own the watcher lifecycle across
     // crates; it is deferred — the adopted root still serves tools and is
     // reconciled by the background catch-up sync, just without a live watch.
-    let _watcher = start_direct_watcher(project_root, no_watch);
+    // Skipped entirely for a bare serve from an unindexed cwd so the cwd is
+    // never self-indexed (keeps it adoptable via roots/list).
+    let _watcher = run_services.then(|| start_direct_watcher(project_root, no_watch));
     // Background catch-up of edits made while the server was down (#905). It runs
     // on a detached worker thread; `server.run` proceeds immediately so the FIRST
     // tools/call NEVER waits on the reconcile. Bind the flag to keep it alive (a
     // future status surface can read it); it is intentionally never awaited.
     // Skipped for a too-broad root ($HOME / filesystem root) — `sync_project_once`
-    // there walks the entire home tree and pegs a CPU at 99%.
-    let _catch_up_done =
-        should_run_daemon_services(project_root).then(|| spawn_catch_up(project_root));
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    let mut server = McpServer::new(project);
-    server
-        .run(BufReader::new(stdin.lock()), stdout.lock())
-        .context("running MCP stdio server")
+    // there walks the entire home tree and pegs a CPU at 99% — and for a bare
+    // serve from an unindexed cwd, where `Store::open` would otherwise create
+    // `.codegraph/` and race roots adoption (the real project root Zed reports
+    // would then be rejected as "already indexed cwd").
+    let _catch_up_done = (run_services && should_run_daemon_services(project_root))
+        .then(|| spawn_catch_up(project_root));
+    serve_direct_stdio(project)
+}
+
+/// Serve the direct (pinned) stdio path through the rmcp [`CodeGraphHandler`]
+/// (the sole MCP transport). Blocks until stdin EOF. The broad-root/unindexed-cwd
+/// adoption handoff keeps the hand-rolled path (`serve_direct_no_services` →
+/// [`McpServer::run_until_adoption`]), since rmcp owns its read loop and cannot
+/// hand the reader back for the daemon proxy.
+fn serve_direct_stdio(project: Option<PathBuf>) -> Result<()> {
+    codegraph_mcp::serve_stdio_rmcp(project).context("running rmcp MCP stdio server")
 }
 
 /// Serves MCP tools off any existing index WITHOUT starting the watcher,
 /// daemon, or catch-up sync. Used when the resolved root is too broad
 /// ($HOME / filesystem root), where background services would index the whole
 /// home tree.
-fn serve_direct_no_services(project: Option<PathBuf>, _project_root: &Path) -> Result<()> {
-    let stdin = io::stdin();
+fn serve_direct_no_services(
+    project: Option<PathBuf>,
+    _project_root: &Path,
+    no_watch: bool,
+) -> Result<()> {
+    // Owned `Stdin`/`Stdout` (both `Send + 'static`) so the reader handed back
+    // on adoption can move into the rmcp session's tokio runtime, which the
+    // borrowed `.lock()` guards (`!Send`) cannot.
+    let reader = BufReader::new(io::stdin());
     let stdout = io::stdout();
     let mut server = McpServer::new(project);
     match server
-        .run_until_adoption(BufReader::new(stdin.lock()), stdout.lock())
+        .run_until_adoption(reader, &stdout)
         .context("running MCP stdio server until workspace adoption")?
     {
         RunUntilAdoption::Eof => Ok(()),
         RunUntilAdoption::Adopted {
             project_root,
             reader,
-        } => serve_adopted_project(reader, stdout, project_root),
+        } => serve_adopted_project(reader, stdout, project_root, no_watch),
     }
 }
 
-fn serve_adopted_project<R: BufRead, W: Write + Send + 'static>(
+fn serve_adopted_project<R, W>(
     reader: R,
     writer: W,
     project_root: PathBuf,
-) -> Result<()> {
-    let Some(socket_path) = start_daemon_for_adopted_root(&project_root) else {
-        let mut server = McpServer::new(Some(project_root));
-        return server
-            .run(reader, writer)
-            .context("running MCP stdio server for adopted project");
+    no_watch: bool,
+) -> Result<()>
+where
+    R: BufRead + Send + 'static + Unpin,
+    W: Write + Send + 'static + Unpin,
+{
+    let Some(socket_path) = start_daemon_for_adopted_root(&project_root, no_watch) else {
+        return codegraph_mcp::rmcp_session::serve_session_rmcp(reader, writer, project_root)
+            .context("running rmcp MCP stdio server for adopted project");
     };
 
     match codegraph_daemon::attach_to_daemon(&socket_path) {
         Ok(client) if codegraph_daemon::verify_daemon_hello(&client.hello).is_none() => {}
         Ok(_) => {
-            tracing::debug!("adopted project daemon version mismatch; serving direct");
-            let mut server = McpServer::new(Some(project_root));
-            return server
-                .run(reader, writer)
-                .context("running MCP stdio server for adopted project");
+            tracing::debug!("serve_adopted: daemon version mismatch; serving direct");
+            return codegraph_mcp::rmcp_session::serve_session_rmcp(reader, writer, project_root)
+                .context("running rmcp MCP stdio server for adopted project");
         }
         Err(err) => {
-            tracing::debug!(error = %err, "adopted project daemon preflight failed; serving direct");
-            let mut server = McpServer::new(Some(project_root));
-            return server
-                .run(reader, writer)
-                .context("running MCP stdio server for adopted project");
+            tracing::debug!(error = %err, "serve_adopted: daemon preflight failed; serving direct");
+            heal_stale_daemon_if_dead(&project_root);
+            return codegraph_mcp::rmcp_session::serve_session_rmcp(reader, writer, project_root)
+                .context("running rmcp MCP stdio server for adopted project");
         }
     }
 
@@ -1267,13 +1898,14 @@ fn serve_adopted_project<R: BufRead, W: Write + Send + 'static>(
         Ok(codegraph_daemon::ProxyOutcome::Proxied) => Ok(()),
         Ok(codegraph_daemon::ProxyOutcome::VersionMismatch) => Ok(()),
         Err(err) => {
-            tracing::debug!(error = %err, "adopted project proxy attach failed");
+            tracing::debug!(error = %err, "serve_adopted: proxy attach failed");
+            heal_stale_daemon_if_dead(&project_root);
             Ok(())
         }
     }
 }
 
-fn start_daemon_for_adopted_root(project_root: &Path) -> Option<PathBuf> {
+fn start_daemon_for_adopted_root(project_root: &Path, no_watch: bool) -> Option<PathBuf> {
     if daemon_opt_out() || is_daemon_internal() || !should_run_daemon_services(project_root) {
         return None;
     }
@@ -1281,23 +1913,33 @@ fn start_daemon_for_adopted_root(project_root: &Path) -> Option<PathBuf> {
         return None;
     }
     if daemon_already_running(project_root) {
+        tracing::debug!(
+            pid_path = %codegraph_daemon::daemon_pid_path(project_root).display(),
+            socket_path = %codegraph_daemon::recorded_socket_path(project_root).display(),
+            "adopted-root: attaching to existing daemon"
+        );
         return Some(codegraph_daemon::recorded_socket_path(project_root));
     }
     let Ok(exe) = std::env::current_exe() else {
         return None;
     };
-    match codegraph_daemon::spawn_detached_daemon(&exe, project_root) {
+    match codegraph_daemon::spawn_detached_daemon(&exe, project_root, no_watch) {
         Ok(()) => {
             poll_for_daemon_socket(project_root);
-            eprintln!(
-                "[CodeGraph MCP] Started shared daemon for adopted project root {}",
-                project_root.display()
+            tracing::info!(
+                project = %project_root.display(),
+                "started shared daemon for adopted project root"
+            );
+            tracing::debug!(
+                pid_path = %codegraph_daemon::daemon_pid_path(project_root).display(),
+                socket_path = %codegraph_daemon::recorded_socket_path(project_root).display(),
+                "adopted-root: spawned new daemon"
             );
             let socket_path = codegraph_daemon::recorded_socket_path(project_root);
             socket_path.exists().then_some(socket_path)
         }
         Err(err) => {
-            eprintln!("[CodeGraph MCP] Adopted project daemon start failed: {err}");
+            tracing::warn!(error = %err, "adopted project daemon start failed");
             None
         }
     }
@@ -1336,11 +1978,14 @@ fn spawn_catch_up(project_root: &Path) -> Arc<AtomicBool> {
             Ok(outcome) => {
                 let changed = outcome.files_reindexed + outcome.files_removed;
                 if changed > 0 {
-                    eprintln!("[CodeGraph MCP] Caught up {changed} file(s) changed since last run");
+                    tracing::info!(
+                        changed,
+                        "caught up {changed} file(s) changed since last run"
+                    );
                 }
             }
             Err(err) => {
-                eprintln!("[CodeGraph MCP] Catch-up sync failed: {err}");
+                tracing::warn!(error = %err, "catch-up sync failed");
             }
         }
         thread_done.store(true, Ordering::SeqCst);
@@ -1356,31 +2001,34 @@ fn start_direct_watcher(
     opts.no_watch = no_watch;
     opts.on_sync_complete = Some(std::sync::Arc::new(
         |outcome: codegraph_watch::SyncOutcome| {
-            eprintln!(
-                "[CodeGraph MCP] Auto-synced {} file(s) in {}ms",
-                outcome.files_reindexed, outcome.duration_ms
+            tracing::info!(
+                files_reindexed = outcome.files_reindexed,
+                duration_ms = outcome.duration_ms,
+                "auto-synced {} file(s) in {}ms",
+                outcome.files_reindexed,
+                outcome.duration_ms
             );
         },
     ));
     opts.on_degraded = Some(std::sync::Arc::new(|reason: String| {
-        eprintln!("[CodeGraph MCP] File watcher degraded — {reason}");
+        tracing::warn!(%reason, "file watcher degraded");
     }));
     opts.on_sync_error = Some(std::sync::Arc::new(|reason: String| {
-        eprintln!("[CodeGraph MCP] File watcher warning — {reason}");
+        tracing::warn!(%reason, "file watcher warning");
     }));
     match codegraph_watch::start_serve_watcher(project_root, opts) {
         Ok(Some(watcher)) => {
-            eprintln!("[CodeGraph MCP] File watcher active — graph will auto-sync on changes");
+            tracing::info!("file watcher active — graph will auto-sync on changes");
             Some(watcher)
         }
         Ok(None) => {
             let reason = codegraph_watch::watch_disabled_reason(project_root, no_watch)
                 .unwrap_or_else(|| "watching disabled".to_string());
-            eprintln!("[CodeGraph MCP] File watcher disabled — {reason}");
+            tracing::info!(%reason, "file watcher disabled");
             None
         }
         Err(err) => {
-            eprintln!("[CodeGraph MCP] File watcher failed to start: {err}");
+            tracing::warn!(error = %err, "file watcher failed to start");
             None
         }
     }
@@ -1397,19 +2045,29 @@ const DAEMON_SOCKET_POLL_TIMEOUT: std::time::Duration = std::time::Duration::fro
 fn spawn_or_proxy(
     _project: Option<PathBuf>,
     project_root: &Path,
-    _no_watch: bool,
+    no_watch: bool,
 ) -> Option<Result<()>> {
-    if !daemon_already_running(project_root) {
+    tracing::debug!(
+        pid_path = %codegraph_daemon::daemon_pid_path(project_root).display(),
+        socket_path = %codegraph_daemon::recorded_socket_path(project_root).display(),
+        "spawn_or_proxy: begin"
+    );
+    if daemon_already_running(project_root) {
+        tracing::debug!("spawn_or_proxy: attaching to existing daemon");
+    } else {
         match std::env::current_exe() {
             Ok(exe) => {
-                if let Err(err) = codegraph_daemon::spawn_detached_daemon(&exe, project_root) {
-                    tracing::debug!(error = %err, "detached daemon spawn failed; serving direct");
+                if let Err(err) =
+                    codegraph_daemon::spawn_detached_daemon(&exe, project_root, no_watch)
+                {
+                    tracing::debug!(error = %err, "spawn_or_proxy: daemon spawn failed; falling back to direct");
                     return None;
                 }
+                tracing::debug!("spawn_or_proxy: spawned new daemon");
                 poll_for_daemon_socket(project_root);
             }
             Err(err) => {
-                tracing::debug!(error = %err, "current_exe unavailable; serving direct");
+                tracing::debug!(error = %err, "spawn_or_proxy: current_exe unavailable; falling back to direct");
                 return None;
             }
         }
@@ -1417,7 +2075,8 @@ fn spawn_or_proxy(
 
     let socket_path = codegraph_daemon::recorded_socket_path(project_root);
     if !socket_path.exists() {
-        tracing::debug!("daemon socket never appeared; serving direct");
+        tracing::debug!("spawn_or_proxy: daemon socket never appeared; falling back to direct");
+        heal_stale_daemon_if_dead(project_root);
         return None;
     }
 
@@ -1431,13 +2090,26 @@ fn spawn_or_proxy(
     ) {
         Ok(codegraph_daemon::ProxyOutcome::Proxied) => Some(Ok(())),
         Ok(codegraph_daemon::ProxyOutcome::VersionMismatch) => {
-            tracing::debug!("daemon version mismatch; serving direct");
+            tracing::debug!("spawn_or_proxy: daemon version mismatch; falling back to direct");
             None
         }
         Err(err) => {
-            tracing::debug!(error = %err, "proxy attach failed; serving direct");
+            tracing::debug!(error = %err, "spawn_or_proxy: proxy attach failed; falling back to direct");
+            heal_stale_daemon_if_dead(project_root);
             None
         }
+    }
+}
+
+/// Self-heal a project's stale daemon artifacts on a failed proxy attach when
+/// the recorded pid is not alive (Fix A): removes the dead daemon's leftover
+/// `daemon.sock` + pid lock so the NEXT `serve --mcp` spawns a fresh daemon
+/// instead of re-attaching to a socket that never answers. Liveness-gated — a
+/// LIVE daemon's artifacts are preserved — so it is safe on any attach failure;
+/// the current request still falls back to DIRECT serving regardless.
+fn heal_stale_daemon_if_dead(project_root: &Path) {
+    if codegraph_daemon::clear_stale_daemon_socket(project_root) {
+        tracing::debug!("cleared stale daemon artifacts (dead pid) so the next start spawns fresh");
     }
 }
 
@@ -1497,11 +2169,79 @@ pub fn select_serve_mode(
 
 #[cfg(test)]
 mod serve_mode_tests {
-    use super::{guard_indexable_root, select_serve_mode, should_run_daemon_services, ServeMode};
+    use super::{
+        ServeMode, debug_enabled, effective_log_level, emit_serve_startup_debug,
+        guard_indexable_root, select_serve_mode, should_run_daemon_services,
+        should_run_serve_services,
+    };
     use std::path::Path;
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn debug_enabled_honors_truthy_values_only() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("CODEGRAPH_DEBUG").ok();
+
+        unsafe { std::env::remove_var("CODEGRAPH_DEBUG") };
+        assert!(!debug_enabled(), "unset ⇒ off");
+        unsafe { std::env::set_var("CODEGRAPH_DEBUG", "1") };
+        assert!(debug_enabled(), "\"1\" ⇒ on");
+        unsafe { std::env::set_var("CODEGRAPH_DEBUG", "true") };
+        assert!(debug_enabled(), "\"true\" ⇒ on");
+        unsafe { std::env::set_var("CODEGRAPH_DEBUG", "0") };
+        assert!(!debug_enabled(), "\"0\" ⇒ off");
+        unsafe { std::env::set_var("CODEGRAPH_DEBUG", "yes") };
+        assert!(!debug_enabled(), "any other value ⇒ off");
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("CODEGRAPH_DEBUG", v) },
+            None => unsafe { std::env::remove_var("CODEGRAPH_DEBUG") },
+        }
+    }
+
+    #[test]
+    fn effective_log_level_translates_codegraph_debug_and_defers_to_rust_log() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let prev_debug = std::env::var("CODEGRAPH_DEBUG").ok();
+        let prev_rust_log = std::env::var("RUST_LOG").ok();
+
+        // Given RUST_LOG unset and CODEGRAPH_DEBUG unset: config level is used verbatim.
+        unsafe { std::env::remove_var("RUST_LOG") };
+        unsafe { std::env::remove_var("CODEGRAPH_DEBUG") };
+        assert_eq!(
+            effective_log_level("info"),
+            "info",
+            "no knobs ⇒ config level"
+        );
+
+        // When CODEGRAPH_DEBUG=1 and RUST_LOG unset: level bumps to debug (back-compat).
+        unsafe { std::env::set_var("CODEGRAPH_DEBUG", "1") };
+        assert_eq!(
+            effective_log_level("info"),
+            "debug",
+            "CODEGRAPH_DEBUG=1 ⇒ debug"
+        );
+
+        // When RUST_LOG is set: the base opens to trace so the EnvFilter is the
+        // sole gate (the reload floor must not cap RUST_LOG upward).
+        unsafe { std::env::set_var("RUST_LOG", "warn") };
+        assert_eq!(
+            effective_log_level("info"),
+            "trace",
+            "RUST_LOG set ⇒ base opens to trace; EnvFilter owns the gate"
+        );
+
+        match prev_debug {
+            Some(v) => unsafe { std::env::set_var("CODEGRAPH_DEBUG", v) },
+            None => unsafe { std::env::remove_var("CODEGRAPH_DEBUG") },
+        }
+        match prev_rust_log {
+            Some(v) => unsafe { std::env::set_var("RUST_LOG", v) },
+            None => unsafe { std::env::remove_var("RUST_LOG") },
+        }
+    }
 
     #[test]
     fn select_serve_mode_decision_order() {
@@ -1515,6 +2255,36 @@ mod serve_mode_tests {
     }
 
     #[test]
+    fn serve_services_gate_skips_unindexed_bare_cwd_but_runs_when_explicit_or_indexed() {
+        let seq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let unindexed =
+            std::env::temp_dir().join(format!("cg-serve-gate-unidx-{}-{seq}", std::process::id()));
+        let indexed =
+            std::env::temp_dir().join(format!("cg-serve-gate-idx-{}-{seq}", std::process::id()));
+        std::fs::create_dir_all(&unindexed).unwrap();
+        std::fs::create_dir_all(indexed.join(".codegraph")).unwrap();
+
+        assert!(
+            should_run_serve_services(true, &unindexed),
+            "explicit --path must run services even on an unindexed root"
+        );
+        assert!(
+            !should_run_serve_services(false, &unindexed),
+            "bare serve from an unindexed cwd must NOT run services (keeps cwd adoptable)"
+        );
+        assert!(
+            should_run_serve_services(false, &indexed),
+            "an already-indexed cwd must keep services"
+        );
+
+        let _ = std::fs::remove_dir_all(&unindexed);
+        let _ = std::fs::remove_dir_all(&indexed);
+    }
+
+    #[test]
     fn daemon_services_disabled_at_home_and_root_enabled_for_nested_project() {
         let _lock = ENV_LOCK.lock().unwrap();
         let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
@@ -1523,7 +2293,7 @@ mod serve_mode_tests {
         let tmp = std::env::temp_dir().join(format!("cg-serve-home-{}", std::process::id()));
         let nested = tmp.join("workspace/ProdDir/AI/codegraph-rust");
         std::fs::create_dir_all(&nested).unwrap();
-        std::env::set_var(home_key, &tmp);
+        unsafe { std::env::set_var(home_key, &tmp) };
 
         assert!(
             !should_run_daemon_services(&tmp),
@@ -1539,8 +2309,8 @@ mod serve_mode_tests {
         );
 
         match prev_home {
-            Some(v) => std::env::set_var(home_key, v),
-            None => std::env::remove_var(home_key),
+            Some(v) => unsafe { std::env::set_var(home_key, v) },
+            None => unsafe { std::env::remove_var(home_key) },
         }
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1554,7 +2324,7 @@ mod serve_mode_tests {
         let tmp = std::env::temp_dir().join(format!("cg-guard-home-{}", std::process::id()));
         let nested = tmp.join("workspace/proj");
         std::fs::create_dir_all(&nested).unwrap();
-        std::env::set_var(home_key, &tmp);
+        unsafe { std::env::set_var(home_key, &tmp) };
 
         assert!(
             guard_indexable_root(&tmp).is_err(),
@@ -1570,10 +2340,25 @@ mod serve_mode_tests {
         );
 
         match prev_home {
-            Some(v) => std::env::set_var(home_key, v),
-            None => std::env::remove_var(home_key),
+            Some(v) => unsafe { std::env::set_var(home_key, v) },
+            None => unsafe { std::env::remove_var(home_key) },
         }
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn emit_serve_startup_debug_runs_for_every_mode() {
+        let root = std::env::temp_dir().join(format!("cg-serve-dbg-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        for mode in [
+            ServeMode::Direct,
+            ServeMode::BeDaemon,
+            ServeMode::SpawnOrProxy,
+        ] {
+            emit_serve_startup_debug(&root, true, false, &mode);
+            emit_serve_startup_debug(&root, false, true, &mode);
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
@@ -1890,10 +2675,10 @@ fn normalize_impact_input(changed: &str, project: &Path) -> String {
     }
     let s = s.replace('\\', "/");
     let candidate = Path::new(&s);
-    if candidate.is_absolute() {
-        if let Ok(rel) = candidate.strip_prefix(project) {
-            return rel.to_string_lossy().replace('\\', "/");
-        }
+    if candidate.is_absolute()
+        && let Ok(rel) = candidate.strip_prefix(project)
+    {
+        return rel.to_string_lossy().replace('\\', "/");
     }
     s
 }
@@ -2835,12 +3620,11 @@ fn symbol_matches(store: &Store, project: &Path, symbol: &str) -> Result<Vec<Nod
     // node exists — this mirrors the committed T2 resolver
     // (`godot::resolve_class_member`). Returns the resolved nodes directly so
     // callers/impact/query all resolve the dotted form to the exact target.
-    if nodes.iter().all(|n| n.name != symbol) {
-        if let Some(resolved) = resolve_gdscript_class_member(store, symbol)? {
-            if !resolved.is_empty() {
-                return Ok(resolved);
-            }
-        }
+    if nodes.iter().all(|n| n.name != symbol)
+        && let Some(resolved) = resolve_gdscript_class_member(store, symbol)?
+        && !resolved.is_empty()
+    {
+        return Ok(resolved);
     }
     Ok(nodes)
 }
@@ -2951,13 +3735,41 @@ fn resolve_project_path_optional(start: &Path) -> PathBuf {
 
 fn absolute_path(path: impl AsRef<Path>) -> PathBuf {
     let path = path.as_ref();
-    if path.is_absolute() {
+    let joined = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(path)
+    };
+    normalize_lexical(&joined)
+}
+
+/// Lexically normalize a path WITHOUT touching the filesystem: drop `.`
+/// components and fold each `..` into the preceding component. Unlike
+/// [`std::fs::canonicalize`] it never reads the disk, never resolves symlinks,
+/// and never fails on a nonexistent path — so `serve --http` (which may point at
+/// a not-yet-indexed project) logs `<cwd>` and `<cwd>/.codegraph/codegraph.db`
+/// with no dangling `/.` segment from a `cwd.join(".")`.
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else {
+                    out.push(component);
+                }
+            }
+            other => out.push(other),
+        }
     }
+    if out.as_os_str().is_empty() {
+        out.push(Component::CurDir);
+    }
+    out
 }
 
 fn codegraph_dir(project: &Path) -> PathBuf {
@@ -3219,7 +4031,7 @@ fn print_files_tree(files: &[FileRecord], max_depth: Option<usize>) {
     println!("\nProject Structure ({} files):\n", files.len());
     for file in files {
         let depth = file.path.matches('/').count() + 1;
-        if max_depth.map_or(true, |max| depth <= max) {
+        if max_depth.is_none_or(|max| depth <= max) {
             println!(
                 "  {} ({}, {} symbols)",
                 file.path, file.language, file.node_count
@@ -3266,7 +4078,7 @@ mod self_update_tests {
 
 #[cfg(test)]
 mod reorder_tests {
-    use super::{should_block, ReorderBuffer};
+    use super::{ReorderBuffer, should_block};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::sync::{Arc, Condvar, Mutex};
@@ -3379,5 +4191,997 @@ mod reorder_tests {
         assert_eq!(out, vec![0, 1], "drains buffered prefix, stops at the gap");
         assert_eq!(next_expected, 2);
         assert_eq!(buffer.len(), 1, "index 3 stays buffered, never drained");
+    }
+}
+
+#[cfg(test)]
+mod pure_helper_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn tmp(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "cg-cli-ut-{tag}-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn node(name: &str) -> Node {
+        Node {
+            id: format!("function:{name}"),
+            kind: NodeKind::Function,
+            name: name.to_string(),
+            qualified_name: name.to_string(),
+            file_path: "a.rs".to_string(),
+            language: Language::Rust,
+            start_line: 1,
+            end_line: 2,
+            start_column: 0,
+            end_column: 0,
+            docstring: None,
+            signature: None,
+            visibility: None,
+            is_exported: false,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+            decorators: Vec::new(),
+            type_parameters: Vec::new(),
+            return_type: None,
+            updated_at: 0,
+        }
+    }
+
+    fn affected(from_file: &str, subkind: Option<&str>) -> codegraph_graph::graph::AffectedRef {
+        codegraph_graph::graph::AffectedRef {
+            from_file: from_file.to_string(),
+            line: 1,
+            edge_kind: "ext_resource".to_string(),
+            target: "res://player.gd".to_string(),
+            edge_subkind: subkind.map(str::to_string),
+        }
+    }
+
+    fn impact(
+        changed: &str,
+        affected: Vec<codegraph_graph::graph::AffectedRef>,
+    ) -> codegraph_graph::graph::ResourceImpact {
+        codegraph_graph::graph::ResourceImpact {
+            changed: changed.to_string(),
+            affected,
+        }
+    }
+
+    #[test]
+    fn location_flag_prefers_explicit_location() {
+        assert_eq!(
+            location_flag(Some("global".to_string()), true, true),
+            Some("global".to_string())
+        );
+    }
+
+    #[test]
+    fn location_flag_maps_global_then_local_then_none() {
+        assert_eq!(location_flag(None, true, false), Some("global".to_string()));
+        assert_eq!(location_flag(None, false, true), Some("local".to_string()));
+        assert_eq!(location_flag(None, false, false), None);
+    }
+
+    #[test]
+    fn truncate_field_leaves_short_values_unchanged() {
+        assert_eq!(truncate_field("abc", 5), "abc");
+        assert_eq!(truncate_field("abcde", 5), "abcde");
+    }
+
+    #[test]
+    fn truncate_field_clips_and_appends_ellipsis() {
+        assert_eq!(truncate_field("abcdef", 5), "abcd\u{2026}");
+    }
+
+    #[test]
+    fn truncate_field_counts_chars_not_bytes() {
+        let v = "\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}";
+        let out = truncate_field(v, 4);
+        assert_eq!(out.chars().count(), 4);
+        assert!(out.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn format_started_at_renders_epoch_ms_deterministically() {
+        let s = format_started_at(0);
+        assert!(
+            s.contains("1970-01-01") || s.ends_with("ms"),
+            "unexpected rendering: {s}"
+        );
+    }
+
+    #[test]
+    fn res_path_prefixes_res_scheme_and_normalizes_backslashes() {
+        assert_eq!(res_path("scenes/main.tscn"), "res://scenes/main.tscn");
+        assert_eq!(res_path("a\\b\\c.gd"), "res://a/b/c.gd");
+    }
+
+    #[test]
+    fn is_godot_resource_path_matches_known_extensions_case_insensitive() {
+        assert!(is_godot_resource_path("a.tres"));
+        assert!(is_godot_resource_path("a.TSCN"));
+        assert!(is_godot_resource_path("a.Res"));
+        assert!(is_godot_resource_path("a.gd"));
+        assert!(!is_godot_resource_path("a.rs"));
+        assert!(!is_godot_resource_path("a.txt"));
+    }
+
+    #[test]
+    fn audit_prefix_keep_no_filters_keeps_everything() {
+        assert!(audit_prefix_keep("src/a.gd", &[], &[]));
+    }
+
+    #[test]
+    fn audit_prefix_keep_include_requires_a_prefix_match() {
+        let include = vec!["src/".to_string()];
+        assert!(audit_prefix_keep("src/a.gd", &include, &[]));
+        assert!(!audit_prefix_keep("assets/a.gd", &include, &[]));
+    }
+
+    #[test]
+    fn audit_prefix_keep_exclude_drops_matching_prefix() {
+        let exclude = vec!["gen/".to_string()];
+        assert!(!audit_prefix_keep("gen/a.gd", &[], &exclude));
+        assert!(audit_prefix_keep("src/a.gd", &[], &exclude));
+    }
+
+    #[test]
+    fn audit_prefix_keep_normalizes_backslashes_on_both_sides() {
+        let include = vec!["src\\sub".to_string()];
+        assert!(audit_prefix_keep("src\\sub\\a.gd", &include, &[]));
+        assert!(audit_prefix_keep("src/sub/a.gd", &include, &[]));
+    }
+
+    #[test]
+    fn normalize_impact_input_strips_res_scheme() {
+        assert_eq!(
+            normalize_impact_input("res://scenes/main.tscn", Path::new("/proj")),
+            "scenes/main.tscn"
+        );
+    }
+
+    #[test]
+    fn normalize_impact_input_strips_leading_curdir_and_folds_backslashes() {
+        assert_eq!(
+            normalize_impact_input("./a\\b.gd", Path::new("/proj")),
+            "a/b.gd"
+        );
+        assert_eq!(
+            normalize_impact_input(".\\a\\b.gd", Path::new("/proj")),
+            "a/b.gd"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn normalize_impact_input_makes_absolute_under_project_relative() {
+        assert_eq!(
+            normalize_impact_input("/proj/scenes/x.tscn", Path::new("/proj")),
+            "scenes/x.tscn"
+        );
+    }
+
+    #[test]
+    fn normalize_impact_input_absolute_outside_project_passes_through() {
+        assert_eq!(
+            normalize_impact_input("/other/x.tscn", Path::new("/proj")),
+            "/other/x.tscn"
+        );
+    }
+
+    #[test]
+    fn empty_impact_note_none_when_affected_present() {
+        let i = impact("x.gd", vec![affected("a.tscn", None)]);
+        assert_eq!(empty_impact_note(&i), None);
+    }
+
+    #[test]
+    fn empty_impact_note_none_for_non_godot_path() {
+        let i = impact("src/lib.rs", Vec::new());
+        assert_eq!(empty_impact_note(&i), None);
+    }
+
+    #[test]
+    fn empty_impact_note_some_for_empty_godot_impact() {
+        let i = impact("scenes/main.tscn", Vec::new());
+        let note = empty_impact_note(&i).expect("godot path with empty impact yields a note");
+        assert!(note.contains("no static references"));
+    }
+
+    #[test]
+    fn verify_plan_view_categorizes_changed_and_affected_by_extension() {
+        let i = impact(
+            "player.gd",
+            vec![affected("scenes/a.tscn", Some("script")), {
+                let mut a = affected("data/b.tres", None);
+                a.line = 7;
+                a
+            }],
+        );
+        let plan = verify_plan_view(&i);
+        assert_eq!(plan.changed, "player.gd");
+        assert_eq!(plan.load_scripts, vec!["res://player.gd".to_string()]);
+        assert_eq!(plan.open_scenes, vec!["res://scenes/a.tscn".to_string()]);
+        assert_eq!(plan.load_resources, vec!["res://data/b.tres".to_string()]);
+        assert_eq!(plan.reasons.len(), 2);
+        assert_eq!(plan.reasons[0].edge_subkind.as_deref(), Some("script"));
+    }
+
+    #[test]
+    fn verify_plan_view_dedups_and_sorts_categories() {
+        let i = impact(
+            "scenes/main.tscn",
+            vec![
+                affected("z.gd", None),
+                affected("a.gd", None),
+                affected("a.gd", None),
+            ],
+        );
+        let plan = verify_plan_view(&i);
+        assert_eq!(
+            plan.load_scripts,
+            vec!["res://a.gd".to_string(), "res://z.gd".to_string()]
+        );
+        assert_eq!(plan.open_scenes, vec!["res://scenes/main.tscn".to_string()]);
+        assert_eq!(plan.reasons.len(), 3);
+    }
+
+    #[test]
+    fn exact_or_top_matches_prefers_exact_name() {
+        let matches = vec![node("other"), node("target"), node("more")];
+        let picked = exact_or_top_matches(&matches, "target");
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].name, "target");
+    }
+
+    #[test]
+    fn exact_or_top_matches_matches_dotted_and_colon_suffix() {
+        let matches = vec![node("Foo.target"), node("Bar::target")];
+        let picked = exact_or_top_matches(&matches, "target");
+        assert_eq!(picked.len(), 2);
+    }
+
+    #[test]
+    fn exact_or_top_matches_falls_back_to_first_when_no_exact() {
+        let matches = vec![node("alpha"), node("beta")];
+        let picked = exact_or_top_matches(&matches, "zzz");
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].name, "alpha");
+    }
+
+    #[test]
+    fn exact_or_top_matches_empty_input_yields_empty() {
+        let matches: Vec<Node> = Vec::new();
+        assert!(exact_or_top_matches(&matches, "x").is_empty());
+    }
+
+    #[test]
+    fn parse_node_kind_accepts_known_and_rejects_unknown() {
+        assert_eq!(parse_node_kind("function").unwrap(), NodeKind::Function);
+        assert!(parse_node_kind("not-a-kind").is_err());
+    }
+
+    #[test]
+    fn glob_matches_literal_star_and_question() {
+        assert!(glob_matches("abc", "abc"));
+        assert!(!glob_matches("abc", "abd"));
+        assert!(glob_matches("a*c", "axxxc"));
+        assert!(glob_matches("a?c", "abc"));
+        assert!(!glob_matches("a?c", "a/c"));
+        assert!(glob_matches("*", "anything"));
+        assert!(glob_matches("", ""));
+        assert!(!glob_matches("", "x"));
+    }
+
+    #[test]
+    fn is_test_file_honors_explicit_filter_glob() {
+        assert!(is_test_file("src/a.rs", Some("src/*")));
+        assert!(!is_test_file("lib/a.rs", Some("src/*")));
+    }
+
+    #[test]
+    fn is_test_file_default_heuristics() {
+        assert!(is_test_file("src/a.test.ts", None));
+        assert!(is_test_file("pkg/__tests__/a.js", None));
+        assert!(is_test_file("app/tests/mod.rs", None));
+        assert!(is_test_file("e2e/flow.spec.ts", None));
+        assert!(!is_test_file("src/main.rs", None));
+    }
+
+    #[test]
+    fn project_name_tokens_splits_lowercases_and_dedups() {
+        let tokens = project_name_tokens(Path::new("/x/My-Cool_Proj.v2"));
+        assert!(tokens.contains("my"));
+        assert!(tokens.contains("cool"));
+        assert!(tokens.contains("proj"));
+        assert!(tokens.contains("v2"));
+    }
+
+    #[test]
+    fn project_name_tokens_empty_for_root() {
+        assert!(project_name_tokens(Path::new("/")).is_empty());
+    }
+
+    #[test]
+    fn map_counts_builds_json_object() {
+        let v = map_counts(vec![("a".to_string(), 1), ("b".to_string(), 2)]);
+        assert_eq!(v["a"], serde_json::json!(1));
+        assert_eq!(v["b"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn format_number_inserts_thousands_separators() {
+        assert_eq!(format_number(0), "0");
+        assert_eq!(format_number(999), "999");
+        assert_eq!(format_number(1000), "1,000");
+        assert_eq!(format_number(1234567), "1,234,567");
+    }
+
+    #[test]
+    fn format_duration_scales_units() {
+        assert_eq!(format_duration(500), "500ms");
+        assert_eq!(format_duration(1500), "1.5s");
+        assert_eq!(format_duration(65_000), "1m 5s");
+    }
+
+    #[test]
+    fn iso_like_millis_renders_rfc3339_for_valid_epoch() {
+        assert!(iso_like_millis(0).starts_with("1970-01-01T00:00:00"));
+    }
+
+    #[test]
+    fn now_millis_is_positive() {
+        assert!(now_millis() > 0);
+    }
+
+    #[test]
+    fn modified_millis_reads_file_mtime() {
+        let dir = tmp("mtime");
+        let file = dir.join("f.txt");
+        fs::write(&file, b"x").unwrap();
+        let meta = fs::metadata(&file).unwrap();
+        assert!(modified_millis(&meta) > 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn db_path_is_under_codegraph_dir() {
+        if std::env::var("CODEGRAPH_DIR").is_err() {
+            let p = Path::new("/proj");
+            assert_eq!(db_path(p), PathBuf::from("/proj/.codegraph/codegraph.db"));
+            assert_eq!(codegraph_dir(p), PathBuf::from("/proj/.codegraph"));
+        }
+    }
+
+    #[test]
+    fn is_initialized_false_for_missing_db() {
+        let dir = tmp("init");
+        assert!(!is_initialized(&dir));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_required_project_errors_when_uninitialized() {
+        let dir = tmp("required");
+        let err = resolve_required_project(Some(dir.clone())).unwrap_err();
+        assert!(err.to_string().contains("not initialized"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_project_path_optional_returns_start_when_uninitialized() {
+        let dir = tmp("resolve");
+        assert_eq!(resolve_project_path_optional(&dir), dir);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn normalize_lexical_leading_parentdir_is_preserved() {
+        assert_eq!(
+            normalize_lexical(Path::new("../a/b")),
+            PathBuf::from("../a/b")
+        );
+    }
+
+    #[test]
+    fn normalize_lexical_empty_becomes_curdir() {
+        assert_eq!(normalize_lexical(Path::new("")), PathBuf::from("."));
+        assert_eq!(normalize_lexical(Path::new(".")), PathBuf::from("."));
+    }
+
+    #[test]
+    fn absolute_path_joins_relative_onto_cwd() {
+        let out = absolute_path("some/rel");
+        assert!(out.is_absolute());
+        assert!(out.ends_with("some/rel"));
+    }
+
+    #[test]
+    fn should_run_serve_services_true_when_explicit_false_when_bare_unindexed() {
+        let dir = tmp("serve-svc");
+        assert!(should_run_serve_services(true, &dir));
+        assert!(!should_run_serve_services(false, &dir));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn godot_honesty_empty_has_no_signal_and_null_json() {
+        let s = GodotHonestySummary::default();
+        assert!(!s.has_signal());
+        assert!(!s.is_dynamically_reachable());
+        assert_eq!(s.reachability_sources(), "");
+        assert_eq!(s.as_json(), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn godot_honesty_scene_and_autoload_sources() {
+        let s = GodotHonestySummary {
+            reached_via_scene: true,
+            reached_via_autoload: true,
+            dynamic_unresolved: vec!["call_deferred".to_string()],
+        };
+        assert!(s.has_signal());
+        assert!(s.is_dynamically_reachable());
+        assert_eq!(s.reachability_sources(), "signal/get_node/group/autoload");
+        let j = s.as_json();
+        assert_eq!(j["dynamicallyReachable"], serde_json::json!(true));
+        assert_eq!(j["reachedViaScene"], serde_json::json!(true));
+        assert_eq!(j["reachedViaAutoload"], serde_json::json!(true));
+        assert_eq!(j["dynamicUnresolved"], serde_json::json!(["call_deferred"]));
+    }
+
+    #[test]
+    fn godot_honesty_only_unresolved_has_signal_but_not_reachable() {
+        let s = GodotHonestySummary {
+            reached_via_scene: false,
+            reached_via_autoload: false,
+            dynamic_unresolved: vec!["x".to_string()],
+        };
+        assert!(s.has_signal());
+        assert!(!s.is_dynamically_reachable());
+        assert_eq!(s.reachability_sources(), "");
+        assert_ne!(s.as_json(), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn node_summary_from_node_copies_key_fields() {
+        let s = NodeSummary::from(&node("frobnicate"));
+        assert_eq!(s.name, "frobnicate");
+        assert_eq!(s.kind, NodeKind::Function);
+        assert_eq!(s.file_path, "a.rs");
+        assert_eq!(s.start_line, 1);
+    }
+
+    #[test]
+    fn generate_completion_bytes_are_non_empty_for_bash() {
+        let bytes = generate_completion_bytes(clap_complete::Shell::Bash);
+        assert!(!bytes.is_empty());
+        assert!(String::from_utf8_lossy(&bytes).contains("codegraph"));
+    }
+
+    #[test]
+    fn env_path_none_for_empty_or_unset_some_for_value() {
+        let key = "CODEGRAPH_TEST_ENV_PATH_UNSET_XYZ";
+        // SAFETY: the key is test-private and this test runs single-threaded within its own scope.
+        unsafe {
+            std::env::remove_var(key);
+        }
+        assert_eq!(env_path(key), None);
+        unsafe {
+            std::env::set_var(key, "");
+        }
+        assert_eq!(env_path(key), None);
+        unsafe {
+            std::env::set_var(key, "/some/where");
+        }
+        assert_eq!(env_path(key), Some(PathBuf::from("/some/where")));
+        unsafe {
+            std::env::remove_var(key);
+        }
+    }
+}
+
+#[cfg(test)]
+mod formatter_and_env_tests {
+    use super::*;
+    use codegraph_core::types::{FileRecord, Language, NodeKind};
+
+    // Serializes tests that mutate process-global env (cargo test runs them concurrently).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn tmp(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "cg-cli-fmt-{tag}-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn summary(name: &str, kind: NodeKind, file: &str, line: i64) -> NodeSummary {
+        NodeSummary {
+            name: name.to_string(),
+            kind,
+            file_path: file.to_string(),
+            start_line: line,
+        }
+    }
+
+    fn file_record(path: &str, language: Language, node_count: i64) -> FileRecord {
+        FileRecord {
+            path: path.to_string(),
+            content_hash: "hash".to_string(),
+            language,
+            size: 100,
+            modified_at: 0,
+            indexed_at: 0,
+            node_count,
+            errors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn codegraph_dir_and_db_path_default_layout() {
+        let prev = std::env::var_os("CODEGRAPH_DIR");
+        unsafe { std::env::remove_var("CODEGRAPH_DIR") };
+        let proj = Path::new("/tmp/proj");
+        assert_eq!(codegraph_dir(proj), proj.join(".codegraph"));
+        assert_eq!(db_path(proj), proj.join(".codegraph/codegraph.db"));
+        if let Some(v) = prev {
+            unsafe { std::env::set_var("CODEGRAPH_DIR", v) };
+        }
+    }
+
+    #[test]
+    fn file_output_from_file_record_copies_fields() {
+        let fr = file_record("src/x.rs", Language::Rust, 4);
+        let out = FileOutput::from(&fr);
+        assert_eq!(out.path, "src/x.rs");
+        assert_eq!(out.node_count, 4);
+        assert_eq!(out.size, 100);
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(json.contains("\"nodeCount\":4"));
+    }
+
+    #[test]
+    fn search_output_from_search_result_serializes_score() {
+        let n = Node {
+            id: "function:q".to_string(),
+            kind: NodeKind::Function,
+            name: "q".to_string(),
+            qualified_name: "q".to_string(),
+            file_path: "a.rs".to_string(),
+            language: Language::Rust,
+            start_line: 1,
+            end_line: 2,
+            start_column: 0,
+            end_column: 0,
+            docstring: None,
+            signature: None,
+            visibility: None,
+            is_exported: false,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+            decorators: Vec::new(),
+            type_parameters: Vec::new(),
+            return_type: None,
+            updated_at: 0,
+        };
+        let sr = SearchResult {
+            node: n,
+            score: 0.75,
+        };
+        let out = SearchOutput::from(&sr);
+        assert_eq!(out.score, 0.75);
+        assert_eq!(out.node.name, "q");
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(json.contains("\"score\":0.75"));
+    }
+
+    #[test]
+    fn print_index_result_covers_all_three_branches() {
+        print_index_result(&IndexSummary {
+            files_indexed: 5,
+            files_skipped: 2,
+            files_errored: 0,
+            nodes_created: 10,
+            edges_created: 3,
+            duration_ms: 1200,
+        });
+        print_index_result(&IndexSummary {
+            files_indexed: 0,
+            files_skipped: 0,
+            files_errored: 4,
+            nodes_created: 0,
+            edges_created: 0,
+            duration_ms: 5,
+        });
+        print_index_result(&IndexSummary {
+            files_indexed: 0,
+            files_skipped: 0,
+            files_errored: 0,
+            nodes_created: 0,
+            edges_created: 0,
+            duration_ms: 5,
+        });
+    }
+
+    #[test]
+    fn print_related_empty_and_nonempty_paths() {
+        print_related("Callers", "foo", &[]);
+        let nodes = vec![summary("foo", NodeKind::Function, "a.rs", 1)];
+        print_related("Callers", "foo", &nodes);
+    }
+
+    #[test]
+    fn print_by_file_groups_and_sorts() {
+        let nodes = vec![
+            summary("b", NodeKind::Function, "z.rs", 2),
+            summary("a", NodeKind::Function, "a.rs", 1),
+        ];
+        print_by_file(&nodes);
+    }
+
+    #[test]
+    fn print_files_flat_grouped_tree_smoke() {
+        let files = vec![
+            file_record("src/a.rs", Language::Rust, 3),
+            file_record("src/sub/b.gd", Language::Gdscript, 1),
+        ];
+        print_files_flat(&files);
+        print_files_grouped(&files);
+        print_files_tree(&files, None);
+        print_files_tree(&files, Some(1));
+    }
+
+    #[test]
+    fn print_audit_and_verify_plan_smoke() {
+        use codegraph_graph::graph::{AffectedRef, DanglingRef, OrphanResource, ResourceImpact};
+        print_audit_orphans(&[]);
+        print_audit_orphans(&[OrphanResource {
+            file_path: "x.tres".to_string(),
+            reason: "unused".to_string(),
+            confidence: "high".to_string(),
+            note: Some("maybe dynamic".to_string()),
+        }]);
+        print_audit_dangling(&[]);
+        print_audit_dangling(&[DanglingRef {
+            from_file: "a.tscn".to_string(),
+            target_path: "missing.png".to_string(),
+            line: 3,
+            kind: "ext_resource".to_string(),
+        }]);
+        let empty = ResourceImpact {
+            changed: "a.gd".to_string(),
+            affected: Vec::new(),
+        };
+        print_audit_impact(&empty);
+        let impact = ResourceImpact {
+            changed: "a.gd".to_string(),
+            affected: vec![
+                AffectedRef {
+                    from_file: "b.tscn".to_string(),
+                    line: 2,
+                    edge_kind: "instantiates".to_string(),
+                    target: "a.gd".to_string(),
+                    edge_subkind: Some("scene_instance".to_string()),
+                },
+                AffectedRef {
+                    from_file: "c.gd".to_string(),
+                    line: 4,
+                    edge_kind: "calls".to_string(),
+                    target: "a.gd".to_string(),
+                    edge_subkind: None,
+                },
+            ],
+        };
+        print_audit_impact(&impact);
+        print_verify_plan(&verify_plan_view(&impact));
+    }
+
+    #[test]
+    fn godot_honesty_print_cli_smoke() {
+        let s = GodotHonestySummary {
+            reached_via_scene: true,
+            dynamic_unresolved: vec!["emit_signal".to_string()],
+            ..Default::default()
+        };
+        s.print_cli(true);
+        s.print_cli(false);
+    }
+
+    #[test]
+    fn print_json_helpers_emit_valid_json() {
+        print_json(&json!({ "a": 1 })).unwrap();
+        print_json_pretty(&json!({ "b": [1, 2] })).unwrap();
+    }
+
+    #[test]
+    fn home_dir_resolves_from_home_then_userprofile_then_errors() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_home = std::env::var_os("HOME");
+        let prev_up = std::env::var_os("USERPROFILE");
+        unsafe { std::env::set_var("HOME", "/home/tester") };
+        assert_eq!(home_dir().unwrap(), PathBuf::from("/home/tester"));
+        unsafe { std::env::remove_var("HOME") };
+        unsafe { std::env::remove_var("USERPROFILE") };
+        assert!(home_dir().is_err());
+        if let Some(v) = prev_home {
+            unsafe { std::env::set_var("HOME", v) };
+        }
+        if let Some(v) = prev_up {
+            unsafe { std::env::set_var("USERPROFILE", v) };
+        }
+    }
+
+    #[test]
+    fn completion_target_paths_per_shell() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_home = std::env::var_os("HOME");
+        let prev_xdg = std::env::var_os("XDG_DATA_HOME");
+        let prev_local = std::env::var_os("LOCALAPPDATA");
+        unsafe { std::env::set_var("HOME", "/h") };
+        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        unsafe { std::env::remove_var("LOCALAPPDATA") };
+
+        assert_eq!(
+            completion_target(Shell::Bash).unwrap(),
+            PathBuf::from("/h/.local/share/bash-completion/completions/codegraph")
+        );
+        assert_eq!(
+            completion_target(Shell::Zsh).unwrap(),
+            PathBuf::from("/h/.zfunc/_codegraph")
+        );
+        assert_eq!(
+            completion_target(Shell::Fish).unwrap(),
+            PathBuf::from("/h/.config/fish/completions/codegraph.fish")
+        );
+        assert_eq!(
+            completion_target(Shell::PowerShell).unwrap(),
+            PathBuf::from("/h/.local/share/codegraph/completion.ps1")
+        );
+        assert_eq!(
+            completion_target(Shell::Elvish).unwrap(),
+            PathBuf::from("/h/.config/codegraph/completion.elv")
+        );
+        unsafe { std::env::set_var("XDG_DATA_HOME", "/xdg") };
+        assert_eq!(
+            completion_target(Shell::Bash).unwrap(),
+            PathBuf::from("/xdg/bash-completion/completions/codegraph")
+        );
+
+        if let Some(v) = prev_home {
+            unsafe { std::env::set_var("HOME", v) };
+        } else {
+            unsafe { std::env::remove_var("HOME") };
+        }
+        match prev_xdg {
+            Some(v) => unsafe { std::env::set_var("XDG_DATA_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_DATA_HOME") },
+        }
+        match prev_local {
+            Some(v) => unsafe { std::env::set_var("LOCALAPPDATA", v) },
+            None => unsafe { std::env::remove_var("LOCALAPPDATA") },
+        }
+    }
+
+    #[test]
+    fn powershell_profile_path_override_then_userprofile_then_error() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_ps = std::env::var_os("CODEGRAPH_PS_PROFILE");
+        let prev_up = std::env::var_os("USERPROFILE");
+        let prev_home = std::env::var_os("HOME");
+
+        unsafe { std::env::set_var("CODEGRAPH_PS_PROFILE", "/custom/profile.ps1") };
+        assert_eq!(
+            powershell_profile_path().unwrap(),
+            PathBuf::from("/custom/profile.ps1")
+        );
+        unsafe { std::env::remove_var("CODEGRAPH_PS_PROFILE") };
+        unsafe { std::env::set_var("USERPROFILE", "/up") };
+        assert_eq!(
+            powershell_profile_path().unwrap(),
+            PathBuf::from("/up/Documents/WindowsPowerShell/Microsoft.PowerShell_profile.ps1")
+        );
+        unsafe { std::env::remove_var("USERPROFILE") };
+        unsafe { std::env::remove_var("HOME") };
+        assert!(powershell_profile_path().is_err());
+
+        match prev_ps {
+            Some(v) => unsafe { std::env::set_var("CODEGRAPH_PS_PROFILE", v) },
+            None => unsafe { std::env::remove_var("CODEGRAPH_PS_PROFILE") },
+        }
+        match prev_up {
+            Some(v) => unsafe { std::env::set_var("USERPROFILE", v) },
+            None => unsafe { std::env::remove_var("USERPROFILE") },
+        }
+        match prev_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    #[test]
+    fn write_completion_file_creates_parent_and_writes() {
+        let dir = tmp("wcf");
+        let target = dir.join("nested/deep/codegraph");
+        write_completion_file(&target, b"# completion").unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "# completion");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_dot_source_once_is_idempotent() {
+        let dir = tmp("ads");
+        let profile = dir.join("profile.ps1");
+        let script = dir.join("completion.ps1");
+        assert!(append_dot_source_once(&profile, &script).unwrap());
+        assert!(!append_dot_source_once(&profile, &script).unwrap());
+        let body = fs::read_to_string(&profile).unwrap();
+        let line = format!(". \"{}\"", script.display());
+        assert_eq!(body.lines().filter(|l| l.trim() == line).count(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn http_log_path_lands_under_registry_dir() {
+        let dir = tmp("httplog");
+        let prev = std::env::var_os("CODEGRAPH_HTTP_REGISTRY_DIR");
+        unsafe { std::env::set_var("CODEGRAPH_HTTP_REGISTRY_DIR", &dir) };
+        let p = http_log_path("127.0.0.1:8111");
+        assert!(p.starts_with(&dir));
+        assert!(p.extension().is_some_and(|e| e == "log"));
+        match prev {
+            Some(v) => unsafe { std::env::set_var("CODEGRAPH_HTTP_REGISTRY_DIR", v) },
+            None => unsafe { std::env::remove_var("CODEGRAPH_HTTP_REGISTRY_DIR") },
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn print_http_table_empty_and_nonempty() {
+        use codegraph_daemon::http_registry::{HttpMode, HttpServerInfo};
+        print_http_table(&[]);
+        print_http_table(&[HttpServerInfo {
+            pid: 4242,
+            addr: "127.0.0.1:8111".to_string(),
+            mode: HttpMode::Global,
+            project: Some("/a/very/long/project/path/that/exceeds/the/column/width".to_string()),
+            started_at: 1_700_000_000_000,
+            version: VERSION.to_string(),
+            log_file: Some("/tmp/x.log".to_string()),
+        }]);
+    }
+
+    #[test]
+    fn print_http_conflict_and_note_others_isolated() {
+        use codegraph_daemon::http_registry::{HttpMode, HttpServerInfo};
+        let info = HttpServerInfo {
+            pid: 99,
+            addr: "127.0.0.1:9999".to_string(),
+            mode: HttpMode::Pinned,
+            project: Some("/proj".to_string()),
+            started_at: 1_700_000_000_000,
+            version: VERSION.to_string(),
+            log_file: Some("/tmp/y.log".to_string()),
+        };
+        print_http_conflict(&info);
+        let dir = tmp("noteothers");
+        let prev = std::env::var_os("CODEGRAPH_HTTP_REGISTRY_DIR");
+        unsafe { std::env::set_var("CODEGRAPH_HTTP_REGISTRY_DIR", &dir) };
+        note_other_running_servers("127.0.0.1:1234");
+        match prev {
+            Some(v) => unsafe { std::env::set_var("CODEGRAPH_HTTP_REGISTRY_DIR", v) },
+            None => unsafe { std::env::remove_var("CODEGRAPH_HTTP_REGISTRY_DIR") },
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_http_detach_internal_reads_env_marker() {
+        let key = codegraph_daemon::CODEGRAPH_HTTP_DETACH_INTERNAL;
+        let prev = std::env::var_os(key);
+        unsafe { std::env::remove_var(key) };
+        assert!(!is_http_detach_internal());
+        unsafe { std::env::set_var(key, "1") };
+        assert!(is_http_detach_internal());
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    #[test]
+    fn generate_completion_bytes_nonempty_for_each_shell() {
+        for shell in [
+            Shell::Bash,
+            Shell::Zsh,
+            Shell::Fish,
+            Shell::PowerShell,
+            Shell::Elvish,
+        ] {
+            let bytes = generate_completion_bytes(shell);
+            assert!(bytes.len() > 100);
+            assert!(String::from_utf8_lossy(&bytes).contains("codegraph"));
+        }
+    }
+
+    #[test]
+    fn install_completions_writes_zsh_fish_elvish_into_home() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tmp("install-comp");
+        let prev_home = std::env::var_os("HOME");
+        let prev_xdg = std::env::var_os("XDG_DATA_HOME");
+        unsafe { std::env::set_var("HOME", &dir) };
+        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+
+        install_completions(Shell::Zsh).unwrap();
+        assert!(dir.join(".zfunc/_codegraph").is_file());
+
+        install_completions(Shell::Fish).unwrap();
+        assert!(
+            dir.join(".config/fish/completions/codegraph.fish")
+                .is_file()
+        );
+
+        install_completions(Shell::Elvish).unwrap();
+        let elv = dir.join(".config/codegraph/completion.elv");
+        assert!(elv.is_file());
+        assert!(fs::read_to_string(&elv).unwrap().contains("codegraph"));
+
+        install_completions(Shell::Bash).unwrap();
+        assert!(
+            dir.join(".local/share/bash-completion/completions/codegraph")
+                .is_file()
+        );
+
+        match prev_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        match prev_xdg {
+            Some(v) => unsafe { std::env::set_var("XDG_DATA_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_DATA_HOME") },
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn install_completions_powershell_writes_script_and_dot_sources_profile() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tmp("install-ps");
+        let prev_local = std::env::var_os("LOCALAPPDATA");
+        let prev_ps = std::env::var_os("CODEGRAPH_PS_PROFILE");
+        let profile = dir.join("profile.ps1");
+        unsafe { std::env::set_var("LOCALAPPDATA", &dir) };
+        unsafe { std::env::set_var("CODEGRAPH_PS_PROFILE", &profile) };
+
+        install_completions(Shell::PowerShell).unwrap();
+        let script = dir.join("codegraph/completion.ps1");
+        assert!(script.is_file());
+        install_completions(Shell::PowerShell).unwrap();
+        let line = format!(". \"{}\"", script.display());
+        let body = fs::read_to_string(&profile).unwrap();
+        assert_eq!(body.lines().filter(|l| l.trim() == line).count(), 1);
+
+        match prev_local {
+            Some(v) => unsafe { std::env::set_var("LOCALAPPDATA", v) },
+            None => unsafe { std::env::remove_var("LOCALAPPDATA") },
+        }
+        match prev_ps {
+            Some(v) => unsafe { std::env::set_var("CODEGRAPH_PS_PROFILE", v) },
+            None => unsafe { std::env::remove_var("CODEGRAPH_PS_PROFILE") },
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 }

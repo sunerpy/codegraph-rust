@@ -241,3 +241,232 @@ pub fn apply_aliases(import_path: &str, aliases: &AliasMap, project_root: &str) 
     }
     Vec::new()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let mut p = std::env::temp_dir();
+        p.push(format!("cg-aliases-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&p).expect("mkdir temp");
+        p
+    }
+
+    #[test]
+    fn strip_jsonc_removes_line_and_block_comments() {
+        let src = "{\n  // line\n  \"a\": 1, /* block */ \"b\": 2\n}";
+        let out = strip_jsonc(src);
+        assert!(!out.contains("line"));
+        assert!(!out.contains("block"));
+        let parsed: Value = serde_json::from_str(&out).expect("valid json");
+        assert_eq!(parsed["a"], 1);
+        assert_eq!(parsed["b"], 2);
+    }
+
+    #[test]
+    fn strip_jsonc_keeps_slashes_inside_strings() {
+        let src = "{ \"url\": \"http://x/y\", \"c\": \"a//b\" }";
+        let out = strip_jsonc(src);
+        assert!(out.contains("http://x/y"));
+        assert!(out.contains("a//b"));
+    }
+
+    #[test]
+    fn strip_jsonc_handles_escaped_quote_in_string() {
+        let src = "{ \"a\": \"esc\\\"//still\" }";
+        let out = strip_jsonc(src);
+        assert!(out.contains("esc\\\"//still"));
+    }
+
+    #[test]
+    fn strip_trailing_commas_before_close() {
+        assert_eq!(strip_trailing_commas("[1, 2, ]"), "[1, 2 ]");
+        assert_eq!(strip_trailing_commas("{\"a\":1, }"), "{\"a\":1 }");
+        assert_eq!(strip_trailing_commas("[1,2]"), "[1,2]");
+    }
+
+    #[test]
+    fn split_wildcard_with_and_without_star() {
+        assert_eq!(
+            split_wildcard("@app/*"),
+            ("@app/".to_string(), String::new(), true)
+        );
+        assert_eq!(
+            split_wildcard("@lib"),
+            ("@lib".to_string(), String::new(), false)
+        );
+        assert_eq!(
+            split_wildcard("a/*.ext"),
+            ("a/".to_string(), ".ext".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn load_project_aliases_reads_tsconfig_paths() {
+        let root = temp_dir("ts");
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "baseUrl": "./src", "paths": { "@app/*": ["app/*"], "@lib": ["lib/index"] } } }"#,
+        )
+        .unwrap();
+        let map = load_project_aliases(root.to_str().unwrap()).expect("aliases");
+        assert!(map.base_url.ends_with("/src"));
+        // Longer prefix first (specificity sort): "@app/" (5) before "@lib" (4).
+        assert_eq!(map.patterns[0].prefix, "@app/");
+        assert!(map.patterns[0].has_wildcard);
+        assert_eq!(map.patterns[1].prefix, "@lib");
+        assert!(!map.patterns[1].has_wildcard);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn load_project_aliases_falls_back_to_jsconfig() {
+        let root = temp_dir("js");
+        std::fs::write(
+            root.join("jsconfig.json"),
+            r#"{ "compilerOptions": { "paths": { "~/*": ["./*"] } } }"#,
+        )
+        .unwrap();
+        let map = load_project_aliases(root.to_str().unwrap()).expect("aliases");
+        assert_eq!(map.patterns[0].prefix, "~/");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn load_project_aliases_none_when_no_config() {
+        let root = temp_dir("none");
+        assert!(load_project_aliases(root.to_str().unwrap()).is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn load_project_aliases_none_when_no_paths_key() {
+        let root = temp_dir("nopaths");
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "baseUrl": "." } }"#,
+        )
+        .unwrap();
+        assert!(load_project_aliases(root.to_str().unwrap()).is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn load_project_aliases_skips_empty_and_non_array_targets() {
+        let root = temp_dir("empty");
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "paths": { "a/*": [], "b": "notarray", "c/*": ["c/*"] } } }"#,
+        )
+        .unwrap();
+        let map = load_project_aliases(root.to_str().unwrap()).expect("aliases");
+        assert_eq!(map.patterns.len(), 1);
+        assert_eq!(map.patterns[0].prefix, "c/");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn load_project_aliases_default_baseurl_is_root() {
+        let root = temp_dir("defbase");
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "paths": { "@/*": ["src/*"] } } }"#,
+        )
+        .unwrap();
+        let map = load_project_aliases(root.to_str().unwrap()).expect("aliases");
+        assert_eq!(map.base_url, root.to_str().unwrap());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    fn wildcard_map() -> AliasMap {
+        AliasMap {
+            base_url: "/proj/src".to_string(),
+            patterns: vec![
+                AliasPattern {
+                    prefix: "@app/".to_string(),
+                    suffix: String::new(),
+                    has_wildcard: true,
+                    replacements: vec!["app/*".to_string(), "fallback/*".to_string()],
+                },
+                AliasPattern {
+                    prefix: "@lib".to_string(),
+                    suffix: String::new(),
+                    has_wildcard: false,
+                    replacements: vec!["lib/index".to_string()],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn apply_aliases_wildcard_expands_all_targets() {
+        let out = apply_aliases("@app/widgets/x", &wildcard_map(), "/proj");
+        assert_eq!(out, vec!["src/app/widgets/x", "src/fallback/widgets/x"]);
+    }
+
+    #[test]
+    fn apply_aliases_literal_exact_match() {
+        let out = apply_aliases("@lib", &wildcard_map(), "/proj");
+        assert_eq!(out, vec!["src/lib/index"]);
+    }
+
+    #[test]
+    fn apply_aliases_literal_no_partial_match() {
+        let out = apply_aliases("@libextra", &wildcard_map(), "/proj");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn apply_aliases_no_match_returns_empty() {
+        let out = apply_aliases("react", &wildcard_map(), "/proj");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn apply_aliases_skips_rewrites_escaping_root() {
+        let map = AliasMap {
+            base_url: "/proj/src".to_string(),
+            patterns: vec![AliasPattern {
+                prefix: "@up/".to_string(),
+                suffix: String::new(),
+                has_wildcard: true,
+                replacements: vec!["../../outside/*".to_string()],
+            }],
+        };
+        let out = apply_aliases("@up/x", &map, "/proj");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn apply_aliases_suffix_must_match() {
+        let map = AliasMap {
+            base_url: "/proj".to_string(),
+            patterns: vec![AliasPattern {
+                prefix: "a/".to_string(),
+                suffix: ".vue".to_string(),
+                has_wildcard: true,
+                replacements: vec!["comp/*.vue".to_string()],
+            }],
+        };
+        assert!(apply_aliases("a/Button.ts", &map, "/proj").is_empty());
+        assert_eq!(
+            apply_aliases("a/Button.vue", &map, "/proj"),
+            vec!["comp/Button.vue"]
+        );
+    }
+
+    #[test]
+    fn alias_types_derive_debug_clone_eq() {
+        let m = wildcard_map();
+        let cloned = m.clone();
+        assert_eq!(m, cloned);
+        assert!(format!("{m:?}").contains("AliasMap"));
+        assert!(format!("{:?}", m.patterns[0]).contains("AliasPattern"));
+    }
+}

@@ -13,12 +13,14 @@ use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::engine::CodeGraphEngine;
 use crate::instructions::SERVER_INSTRUCTIONS;
-use crate::protocol::{error_codes, JsonRpcRequest, JsonRpcResponse, ToolResult};
-use crate::roots::{db_path_for, roots_list_request, WorkspaceRoots, ROOTS_LIST_REQUEST_ID};
+use crate::protocol::{JsonRpcRequest, JsonRpcResponse, ToolResult, error_codes};
+use crate::roots::{
+    ROOTS_LIST_REQUEST_ID, WorkspaceRoots, db_path_for, format_tool_debug_line, roots_list_request,
+};
 use crate::schemas;
 
 /// `PROTOCOL_VERSION` (`session.ts:34`).
@@ -182,8 +184,6 @@ pub fn reopen_count() -> u64 {
     REOPEN_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-type AdoptionObserver = Box<dyn FnMut(&std::path::Path)>;
-
 pub enum RunUntilAdoption<R> {
     Eof,
     Adopted { project_root: PathBuf, reader: R },
@@ -195,30 +195,20 @@ pub enum RunUntilAdoption<R> {
 /// reopen when the database is REPLACED on disk (#925).
 pub struct McpServer {
     default_project: Option<PathBuf>,
+    cwd: Option<PathBuf>,
     engines: HashMap<PathBuf, CachedEngine>,
     workspace_roots: WorkspaceRoots,
-    adoption_observer: Option<AdoptionObserver>,
+    no_roots: bool,
 }
 
 impl McpServer {
     pub fn new(default_project: Option<PathBuf>) -> Self {
         Self {
             default_project,
+            cwd: std::env::current_dir().ok(),
             engines: HashMap::new(),
             workspace_roots: WorkspaceRoots::new(),
-            adoption_observer: None,
-        }
-    }
-
-    pub fn with_adoption_observer(
-        default_project: Option<PathBuf>,
-        adoption_observer: AdoptionObserver,
-    ) -> Self {
-        Self {
-            default_project,
-            engines: HashMap::new(),
-            workspace_roots: WorkspaceRoots::new(),
-            adoption_observer: Some(adoption_observer),
+            no_roots: false,
         }
     }
 
@@ -234,29 +224,13 @@ impl McpServer {
         db_path_for(project).is_file()
     }
 
-    /// Run the stdio loop until EOF. Reads `reader` line-by-line, writes one
-    /// response line per request to `writer`. Notifications (no `id`) produce no
-    /// output (`session.ts:118` gates every reply on `isRequest`).
-    pub fn run<R: BufRead, W: Write>(&mut self, reader: R, mut writer: W) -> anyhow::Result<()> {
-        let mut reader = reader;
-        loop {
-            let mut line = String::new();
-            if reader.read_line(&mut line)? == 0 {
-                break;
-            }
-            if line.trim().is_empty() {
-                continue;
-            }
-            let handled = self.handle_line(&line);
-            for response in handled.responses {
-                let serialized = serde_json::to_string(&response)?;
-                writeln!(writer, "{serialized}")?;
-                writer.flush()?;
-            }
-        }
-        Ok(())
-    }
-
+    /// Run the stdio loop until the broad-root daemon handoff adopts a project
+    /// (or EOF). Reads `reader` line-by-line, writes one response line per
+    /// request to `writer`. Notifications (no `id`) produce no output
+    /// (`session.ts:118` gates every reply on `isRequest`). This is the ONE
+    /// retained hand-rolled path: the broad-root→daemon handoff
+    /// needs the raw reader back mid-session, which rmcp (owning its own read
+    /// loop) cannot provide. All other serve paths go through the rmcp handler.
     pub fn run_until_adoption<R: BufRead, W: Write>(
         &mut self,
         mut reader: R,
@@ -314,32 +288,38 @@ impl McpServer {
                     Value::Null,
                     error_codes::INVALID_REQUEST,
                     "Invalid Request",
-                ))])
+                ))]);
             }
         };
+        let (responses, adopted) = self.dispatch_to_responses(&req);
+        HandledLine { responses, adopted }
+    }
+
+    fn dispatch_to_responses(&mut self, req: &JsonRpcRequest) -> (Vec<Value>, Option<PathBuf>) {
         let id = req.id.clone();
-        let handled = match self.dispatch(&req) {
-            Dispatch::Reply(value) => id
-                .map(|id| vec![json_response(JsonRpcResponse::result(id, value))])
-                .unwrap_or_default(),
-            Dispatch::ReplyWithAdoption { reply, adopted } => {
-                let responses = id
-                    .map(|id| vec![json_response(JsonRpcResponse::result(id, reply))])
-                    .unwrap_or_default();
-                return HandledLine {
-                    responses,
-                    adopted: Some(adopted),
-                };
-            }
-            Dispatch::ReplyAndRequest { reply, request } => id
-                .map(|id| vec![json_response(JsonRpcResponse::result(id, reply)), request])
-                .unwrap_or_default(),
-            Dispatch::Err(code, msg) => id
-                .map(|id| vec![json_response(JsonRpcResponse::error(id, code, msg))])
-                .unwrap_or_default(),
-            Dispatch::Notification => Vec::new(),
-        };
-        HandledLine::responses(handled)
+        match self.dispatch(req) {
+            Dispatch::Reply(value) => (
+                id.map(|id| vec![json_response(JsonRpcResponse::result(id, value))])
+                    .unwrap_or_default(),
+                None,
+            ),
+            Dispatch::ReplyWithAdoption { reply, adopted } => (
+                id.map(|id| vec![json_response(JsonRpcResponse::result(id, reply))])
+                    .unwrap_or_default(),
+                Some(adopted),
+            ),
+            Dispatch::ReplyAndRequest { reply, request } => (
+                id.map(|id| vec![json_response(JsonRpcResponse::result(id, reply)), request])
+                    .unwrap_or_default(),
+                None,
+            ),
+            Dispatch::Err(code, msg) => (
+                id.map(|id| vec![json_response(JsonRpcResponse::error(id, code, msg))])
+                    .unwrap_or_default(),
+                None,
+            ),
+            Dispatch::Notification => (Vec::new(), None),
+        }
     }
 
     /// Method dispatch, mirroring `session.ts:119-156`.
@@ -347,20 +327,27 @@ impl McpServer {
         let is_request = req.id.is_some();
         match req.method.as_str() {
             "initialize" if is_request => {
-                if let Some(adopted) = self
-                    .workspace_roots
-                    .adopt_from_initialize(&mut self.default_project, req.params.as_ref())
-                {
-                    self.notify_adopted(&adopted);
+                if self.no_roots {
+                    return Dispatch::Reply(initialize_result());
+                }
+                let cwd = self.cwd.clone();
+                let old_default = self.default_project.clone();
+                if let Some(adopted) = self.workspace_roots.adopt_from_initialize(
+                    &mut self.default_project,
+                    cwd.as_deref(),
+                    req.params.as_ref(),
+                ) {
+                    self.debug_roots_adopted(&adopted, old_default.as_deref());
                     return Dispatch::ReplyWithAdoption {
                         reply: initialize_result(),
                         adopted,
                     };
                 }
-                if self
-                    .workspace_roots
-                    .should_request_roots(self.default_project.as_ref(), req.params.as_ref())
-                {
+                if self.workspace_roots.should_request_roots(
+                    self.default_project.as_ref(),
+                    cwd.as_deref(),
+                    req.params.as_ref(),
+                ) {
                     self.workspace_roots.mark_roots_list_requested();
                     Dispatch::ReplyAndRequest {
                         reply: initialize_result(),
@@ -407,20 +394,26 @@ impl McpServer {
         if !is_roots_response {
             return None;
         }
-        if let Some(adopted) = self
-            .workspace_roots
-            .adopt_from_roots_result(&mut self.default_project, response.get("result"))
-        {
-            self.notify_adopted(&adopted);
+        let cwd = self.cwd.clone();
+        let old_default = self.default_project.clone();
+        if let Some(adopted) = self.workspace_roots.adopt_from_roots_result(
+            &mut self.default_project,
+            cwd.as_deref(),
+            response.get("result"),
+        ) {
+            self.debug_roots_adopted(&adopted, old_default.as_deref());
             return Some(adopted);
         }
         None
     }
 
-    fn notify_adopted(&mut self, path: &Path) {
-        if let Some(observer) = &mut self.adoption_observer {
-            observer(path);
-        }
+    fn debug_roots_adopted(&self, adopted: &Path, old_default: Option<&Path>) {
+        let was = old_default.map_or_else(|| "none".to_string(), |p| p.display().to_string());
+        tracing::debug!(
+            adopted = %adopted.display(),
+            was = %was,
+            "roots: adopted workspace root"
+        );
     }
 
     /// `handleToolsCall` (`session.ts:204-232`). Validates the tool name; an
@@ -430,7 +423,7 @@ impl McpServer {
         let tool_name = match params.get("name").and_then(Value::as_str) {
             Some(n) => n.to_string(),
             None => {
-                return Dispatch::Err(error_codes::INVALID_PARAMS, "Missing tool name".to_string())
+                return Dispatch::Err(error_codes::INVALID_PARAMS, "Missing tool name".to_string());
             }
         };
         if !schemas::is_known_tool(&tool_name) {
@@ -444,21 +437,31 @@ impl McpServer {
             .cloned()
             .unwrap_or_else(|| json!({}));
 
-        let project_path = args
-            .get("projectPath")
-            .and_then(Value::as_str)
-            .map(PathBuf::from)
-            .or_else(|| self.default_project.clone());
-
-        let project_path = match project_path {
+        let raw_project = args.get("projectPath").and_then(Value::as_str);
+        let resolved = self.resolve_project_arg(raw_project);
+        tracing::debug!(
+            "{}",
+            format_tool_debug_line(
+                &tool_name,
+                raw_project,
+                resolved.as_deref(),
+                self.cwd.as_deref(),
+                self.default_project.as_deref(),
+            )
+        );
+        let project_path = match resolved {
             Some(p) => p,
             None => {
+                let message = match raw_project {
+                    Some(raw) => format!(
+                        "No indexed project found for projectPath {raw:?}. Pass an absolute path to an indexed project, or run `codegraph init` there."
+                    ),
+                    None => "No indexed project resolved. Pass a `projectPath` argument, run `codegraph init` in the project, or start the server with `--path <project>`.".to_string(),
+                };
                 return Dispatch::Reply(
-                    serde_json::to_value(ToolResult::error(
-                        "No project path provided and no default project is configured. Pass `projectPath` or launch the server with a project root.",
-                    ))
-                    .expect("ToolResult serializes"),
-                )
+                    serde_json::to_value(ToolResult::error(message))
+                        .expect("ToolResult serializes"),
+                );
             }
         };
 
@@ -471,12 +474,59 @@ impl McpServer {
                         project_path.display()
                     )))
                     .expect("ToolResult serializes"),
-                )
+                );
             }
         };
 
         let result = engine.execute(&tool_name, &args);
         Dispatch::Reply(serde_json::to_value(result).expect("ToolResult serializes"))
+    }
+
+    /// Resolve a caller's `projectPath` argument to an INDEXED project dir (one
+    /// whose `.codegraph/codegraph.db` exists). A Zed agent may pass a bare
+    /// directory NAME ("codegraph-rust") or a relative path rather than an
+    /// absolute one; feeding that verbatim to [`Self::engine_for`] opens a
+    /// non-existent db and silently returns empty results. This maps such inputs
+    /// back to a real indexed project by trying candidates in priority order and
+    /// returning the FIRST that is indexed:
+    ///
+    /// - `raw = Some`: the absolute `raw`; then `cwd.join(raw)`; then bare `raw`;
+    ///   and — for the reported Zed case — the `default_project` when `raw`'s
+    ///   final component equals `default_project`'s basename (agent passed the
+    ///   NAME of the known indexed project).
+    /// - `raw = None`: the `default_project` (existing behavior).
+    ///
+    /// Honesty rule: when `raw` is given but resolves to nothing AND its basename
+    /// does not match `default_project`, this returns `None` rather than silently
+    /// falling back to `default_project` — a genuinely wrong path must surface an
+    /// error, not mask itself behind the default.
+    fn resolve_project_arg(&self, raw: Option<&str>) -> Option<PathBuf> {
+        let Some(raw) = raw else {
+            return self
+                .default_project
+                .clone()
+                .filter(|p| db_path_for(p).is_file());
+        };
+
+        let raw_path = PathBuf::from(raw);
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if raw_path.is_absolute() {
+            candidates.push(raw_path.clone());
+        } else {
+            if let Some(cwd) = &self.cwd {
+                candidates.push(cwd.join(&raw_path));
+            }
+            candidates.push(raw_path.clone());
+        }
+        if let Some(default) = &self.default_project
+            && raw_path.file_name() == default.file_name()
+        {
+            candidates.push(default.clone());
+        }
+
+        candidates
+            .into_iter()
+            .find(|candidate| db_path_for(candidate).is_file())
     }
 
     /// Open-on-demand + cache the engine for a project path
@@ -536,6 +586,20 @@ impl McpServer {
     pub fn default_project(&self) -> Option<&std::path::Path> {
         self.default_project.as_deref()
     }
+
+    /// Test-only: construct with an explicit cwd instead of `current_dir()`, so
+    /// the roots-adoption `default == cwd` discriminator is exercised without
+    /// mutating the process-global working directory.
+    #[doc(hidden)]
+    pub fn new_with_cwd(default_project: Option<PathBuf>, cwd: Option<PathBuf>) -> Self {
+        Self {
+            default_project,
+            cwd,
+            engines: HashMap::new(),
+            workspace_roots: WorkspaceRoots::new(),
+            no_roots: false,
+        }
+    }
 }
 
 enum Dispatch {
@@ -576,6 +640,7 @@ fn json_response(response: JsonRpcResponse) -> Value {
 
 /// The `initialize` result (`session.ts:182-187`).
 pub fn initialize_result() -> Value {
+    // NB: `roots` is a CLIENT capability (MCP spec) — never declared here.
     json!({
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": { "tools": {} },
@@ -589,7 +654,6 @@ mod tests {
     use super::*;
     use std::io::{Cursor, Read};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -619,6 +683,9 @@ mod tests {
         TempProject { path }
     }
 
+    /// Drive one `initialize` frame through the retained `run_until_adoption`
+    /// loop and capture every response line. `initialize` never adopts (adoption
+    /// only fires on a roots/list RESPONSE), so the loop runs to EOF.
     fn run_initialize_capture(server: &mut McpServer, params: Value) -> Vec<Value> {
         let request = json!({
             "jsonrpc": "2.0",
@@ -629,11 +696,14 @@ mod tests {
         let line = format!("{request}\n");
         let mut out = Vec::new();
         server
-            .run(Cursor::new(line.into_bytes()), Cursor::new(&mut out))
+            .run_until_adoption(Cursor::new(line.into_bytes()), Cursor::new(&mut out))
             .unwrap();
         parse_json_lines(&out)
     }
 
+    /// Feed a roots/list RESPONSE line through `run_until_adoption`; an indexed
+    /// root adopts (returns `Adopted`), an all-unindexed set runs to `Eof`.
+    /// Either way a JSON-RPC response produces no reply line.
     fn run_roots_list_response(server: &mut McpServer, roots: Value) {
         let response = json!({
             "jsonrpc": "2.0",
@@ -643,7 +713,7 @@ mod tests {
         let line = format!("{response}\n");
         let mut out = Vec::new();
         server
-            .run(Cursor::new(line.into_bytes()), Cursor::new(&mut out))
+            .run_until_adoption(Cursor::new(line.into_bytes()), Cursor::new(&mut out))
             .unwrap();
         assert!(out.is_empty(), "JSON-RPC responses produce no reply");
     }
@@ -694,30 +764,6 @@ mod tests {
     }
 
     #[test]
-    fn roots_list_response_notifies_adoption_observer() {
-        let project = indexed_project("observer");
-        let observed = Arc::new(Mutex::new(None));
-        let observed_for_callback = Arc::clone(&observed);
-        let mut server = McpServer::with_adoption_observer(
-            None,
-            Box::new(move |path| {
-                *observed_for_callback.lock().unwrap() = Some(path.to_path_buf());
-            }),
-        );
-        let _ = run_initialize_capture(
-            &mut server,
-            json!({ "capabilities": { "roots": { "listChanged": true } } }),
-        );
-
-        run_roots_list_response(
-            &mut server,
-            json!([{ "uri": format!("file://{}", project.path().display()), "name": "proj" }]),
-        );
-
-        assert_eq!(observed.lock().unwrap().as_deref(), Some(project.path()));
-    }
-
-    #[test]
     fn roots_list_adoption_returns_remaining_reader_for_proxy_handoff() {
         let project = indexed_project("handoff");
         let response = json!({
@@ -758,11 +804,506 @@ mod tests {
         let mut out = Vec::new();
         let mut server = McpServer::new(None);
         server
-            .run(Cursor::new(line.into_bytes()), Cursor::new(&mut out))
+            .run_until_adoption(Cursor::new(line.into_bytes()), Cursor::new(&mut out))
             .unwrap();
         let response: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(response["id"], json!(7));
         assert_eq!(response["result"]["serverInfo"]["name"], json!(SERVER_NAME));
         assert_eq!(server.default_project(), None);
+    }
+
+    // === projectPath resolution robustness (Zed bare-name fix) ==============
+
+    /// Case 1: a BARE BASENAME projectPath (e.g. "mini") whose final component
+    /// matches the basename of an indexed `default_project` resolves to that
+    /// default_project. This is the exact Zed-agent case: the client passes the
+    /// project NAME, not an absolute path.
+    #[test]
+    fn resolve_bare_basename_matching_default_resolves_to_default() {
+        let project = indexed_project("basename");
+        let name = project
+            .path()
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap()
+            .to_string();
+        // cwd deliberately elsewhere so ONLY the basename-match path can win.
+        let cwd = std::env::temp_dir().join("cg-mcp-basename-cwd-elsewhere");
+        let server = McpServer::new_with_cwd(Some(project.path().to_path_buf()), Some(cwd));
+        assert_eq!(
+            server.resolve_project_arg(Some(&name)).as_deref(),
+            Some(project.path()),
+        );
+    }
+
+    /// Case 2: a RELATIVE projectPath that joins with cwd to an indexed project
+    /// resolves via the cwd-join candidate.
+    #[test]
+    fn resolve_relative_path_joined_with_cwd_resolves() {
+        let project = indexed_project("relative");
+        // cwd = parent, raw = the project's dir name → cwd.join(raw) == project.
+        let parent = project.path().parent().unwrap().to_path_buf();
+        let name = project.path().file_name().and_then(|s| s.to_str()).unwrap();
+        // default_project unset so ONLY the cwd-join candidate can resolve.
+        let server = McpServer::new_with_cwd(None, Some(parent));
+        assert_eq!(
+            server.resolve_project_arg(Some(name)).as_deref(),
+            Some(project.path()),
+        );
+    }
+
+    /// Case 3: an ABSOLUTE indexed projectPath resolves unchanged.
+    #[test]
+    fn resolve_absolute_indexed_path_resolves() {
+        let project = indexed_project("absolute");
+        let raw = project.path().display().to_string();
+        let server = McpServer::new_with_cwd(None, None);
+        assert_eq!(
+            server.resolve_project_arg(Some(&raw)).as_deref(),
+            Some(project.path()),
+        );
+    }
+
+    /// Case 4: a bogus name matching NOTHING and != default_project's basename
+    /// resolves to None (→ the caller emits the actionable error, NOT a silent
+    /// default_project fallback).
+    #[test]
+    fn resolve_bogus_name_does_not_fall_back_to_default() {
+        let project = indexed_project("honest-default");
+        let cwd = std::env::temp_dir().join("cg-mcp-bogus-cwd-elsewhere");
+        let server = McpServer::new_with_cwd(Some(project.path().to_path_buf()), Some(cwd));
+        assert_eq!(
+            server.resolve_project_arg(Some("definitely-not-a-real-project-xyz")),
+            None,
+        );
+    }
+
+    /// Case 5: no projectPath + an indexed default_project resolves to the
+    /// default (regression: existing behavior preserved).
+    #[test]
+    fn resolve_none_falls_back_to_indexed_default() {
+        let project = indexed_project("none-default");
+        let server = McpServer::new_with_cwd(Some(project.path().to_path_buf()), None);
+        assert_eq!(
+            server.resolve_project_arg(None).as_deref(),
+            Some(project.path()),
+        );
+    }
+
+    /// Guard: an unindexed default_project with raw=None resolves to None (no
+    /// phantom project). Complements case 5.
+    #[test]
+    fn resolve_none_with_unindexed_default_resolves_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-mcp-unidx-default-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = McpServer::new_with_cwd(Some(dir.clone()), None);
+        assert_eq!(server.resolve_project_arg(None), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn one_line(server: &mut McpServer, request: Value) -> Vec<Value> {
+        let line = format!("{request}\n");
+        let mut out = Vec::new();
+        server
+            .run_until_adoption(Cursor::new(line.into_bytes()), Cursor::new(&mut out))
+            .unwrap();
+        parse_json_lines(&out)
+    }
+
+    #[test]
+    fn ping_request_replies_empty_object() {
+        let mut server = McpServer::new(None);
+        let out = one_line(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "id": 5, "method": "ping" }),
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["id"], json!(5));
+        assert_eq!(out[0]["result"], json!({}));
+    }
+
+    #[test]
+    fn resources_list_replies_empty_array() {
+        let mut server = McpServer::new(None);
+        let out = one_line(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "id": 6, "method": "resources/list" }),
+        );
+        assert_eq!(out[0]["result"], json!({ "resources": [] }));
+    }
+
+    #[test]
+    fn resources_templates_list_replies_empty_array() {
+        let mut server = McpServer::new(None);
+        let out = one_line(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "id": 7, "method": "resources/templates/list" }),
+        );
+        assert_eq!(out[0]["result"], json!({ "resourceTemplates": [] }));
+    }
+
+    #[test]
+    fn prompts_list_replies_empty_array() {
+        let mut server = McpServer::new(None);
+        let out = one_line(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "id": 8, "method": "prompts/list" }),
+        );
+        assert_eq!(out[0]["result"], json!({ "prompts": [] }));
+    }
+
+    #[test]
+    fn unknown_method_request_yields_method_not_found() {
+        let mut server = McpServer::new(None);
+        let out = one_line(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "id": 9, "method": "does/not/exist" }),
+        );
+        assert_eq!(
+            out[0]["error"]["code"],
+            json!(error_codes::METHOD_NOT_FOUND)
+        );
+        assert!(
+            out[0]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Method not found"),
+            "message should name the method"
+        );
+    }
+
+    #[test]
+    fn notification_without_id_produces_no_response() {
+        let mut server = McpServer::new(None);
+        let out = one_line(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        );
+        assert!(out.is_empty(), "notification produces no output");
+    }
+
+    #[test]
+    fn initialized_notification_is_swallowed() {
+        let mut server = McpServer::new(None);
+        let out = one_line(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "method": "initialized" }),
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn unknown_notification_without_id_is_swallowed() {
+        let mut server = McpServer::new(None);
+        let out = one_line(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "method": "some/random/notification" }),
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn parse_error_line_yields_minus_32700_with_null_id() {
+        let mut server = McpServer::new(None);
+        let mut out = Vec::new();
+        server
+            .run_until_adoption(
+                Cursor::new(b"{ this is not json\n".to_vec()),
+                Cursor::new(&mut out),
+            )
+            .unwrap();
+        let responses = parse_json_lines(&out);
+        assert_eq!(responses[0]["id"], Value::Null);
+        assert_eq!(
+            responses[0]["error"]["code"],
+            json!(error_codes::PARSE_ERROR)
+        );
+    }
+
+    #[test]
+    fn valid_json_missing_method_is_treated_as_response_not_request() {
+        let mut server = McpServer::new(None);
+        let out = one_line(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "id": 42, "result": { "anything": true } }),
+        );
+        assert!(out.is_empty(), "a client response yields no reply line");
+    }
+
+    #[test]
+    fn blank_lines_are_skipped_then_eof() {
+        let mut server = McpServer::new(None);
+        let mut out = Vec::new();
+        let outcome = server
+            .run_until_adoption(Cursor::new(b"\n   \n".to_vec()), Cursor::new(&mut out))
+            .unwrap();
+        assert!(matches!(outcome, RunUntilAdoption::Eof));
+        assert!(out.is_empty(), "blank lines produce no output");
+    }
+
+    #[test]
+    fn tools_call_missing_name_yields_invalid_params() {
+        let mut server = McpServer::new(None);
+        let out = one_line(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "tools/call",
+                "params": { "arguments": {} }
+            }),
+        );
+        assert_eq!(out[0]["error"]["code"], json!(error_codes::INVALID_PARAMS));
+        assert_eq!(out[0]["error"]["message"], json!("Missing tool name"));
+    }
+
+    #[test]
+    fn tools_call_unknown_tool_yields_invalid_params() {
+        let mut server = McpServer::new(None);
+        let out = one_line(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 12,
+                "method": "tools/call",
+                "params": { "name": "codegraph_not_a_tool", "arguments": {} }
+            }),
+        );
+        assert_eq!(out[0]["error"]["code"], json!(error_codes::INVALID_PARAMS));
+        assert!(
+            out[0]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Unknown tool: codegraph_not_a_tool")
+        );
+    }
+
+    #[test]
+    fn tools_call_unresolved_project_returns_tool_error_result() {
+        let mut server = McpServer::new(None);
+        let out = one_line(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 13,
+                "method": "tools/call",
+                "params": { "name": "codegraph_search", "arguments": { "query": "x" } }
+            }),
+        );
+        assert!(
+            out[0]["error"].is_null(),
+            "must be a Reply, not a JSON-RPC error"
+        );
+        assert_eq!(out[0]["result"]["isError"], json!(true));
+        let text = out[0]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("No indexed project resolved"),
+            "unresolved (raw=None) message, got: {text}"
+        );
+    }
+
+    #[test]
+    fn tools_call_bogus_project_path_returns_actionable_error_result() {
+        let mut server = McpServer::new(None);
+        let out = one_line(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 14,
+                "method": "tools/call",
+                "params": {
+                    "name": "codegraph_search",
+                    "arguments": { "query": "x", "projectPath": "/no/such/indexed/project/xyz" }
+                }
+            }),
+        );
+        assert_eq!(out[0]["result"]["isError"], json!(true));
+        let text = out[0]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("No indexed project found for projectPath"),
+            "raw-project message, got: {text}"
+        );
+    }
+
+    #[test]
+    fn tools_call_open_failure_returns_engine_error_result() {
+        let project = indexed_project("open-fail");
+        let raw = project.path().display().to_string();
+        let mut server = McpServer::new(None);
+        let out = one_line(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 15,
+                "method": "tools/call",
+                "params": {
+                    "name": "codegraph_search",
+                    "arguments": { "query": "x", "projectPath": raw }
+                }
+            }),
+        );
+        assert_eq!(out[0]["result"]["isError"], json!(true));
+        let text = out[0]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("Failed to open project at"),
+            "engine open-failure message, got: {text}"
+        );
+    }
+
+    #[test]
+    fn tools_list_no_default_marks_project_path_required() {
+        let mut server = McpServer::new(None);
+        assert!(!server.has_default_codegraph());
+        let out = one_line(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "id": 16, "method": "tools/list" }),
+        );
+        let tools = out[0]["result"]["tools"].as_array().unwrap();
+        assert!(!tools.is_empty());
+        for tool in tools {
+            let required = tool["inputSchema"]["required"].as_array().unwrap();
+            assert!(required.iter().any(|v| v == "projectPath"));
+        }
+    }
+
+    #[test]
+    fn tools_list_with_indexed_default_keeps_project_path_optional() {
+        let project = indexed_project("tools-list-default");
+        let mut server = McpServer::new_with_cwd(Some(project.path().to_path_buf()), None);
+        assert!(server.has_default_codegraph());
+        let out = one_line(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "id": 17, "method": "tools/list" }),
+        );
+        let tools = out[0]["result"]["tools"].as_array().unwrap();
+        for tool in tools {
+            let has_pp = tool["inputSchema"]["required"]
+                .as_array()
+                .map(|r| r.iter().any(|v| v == "projectPath"))
+                .unwrap_or(false);
+            assert!(!has_pp, "indexed default keeps projectPath optional");
+        }
+    }
+
+    #[test]
+    fn no_roots_mode_initialize_never_requests_roots() {
+        let mut server = McpServer::new(None);
+        server.no_roots = true;
+        let out = one_line(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 18,
+                "method": "initialize",
+                "params": { "capabilities": { "roots": { "listChanged": true } } }
+            }),
+        );
+        assert_eq!(
+            out.len(),
+            1,
+            "no_roots initialize replies once, no roots/list"
+        );
+        assert_eq!(out[0]["id"], json!(18));
+        assert_eq!(out[0]["result"]["serverInfo"]["name"], json!(SERVER_NAME));
+    }
+
+    #[test]
+    fn initialize_adopts_root_uri_and_returns_reply_with_adoption() {
+        let project = indexed_project("init-adopt");
+        let uri = format!("file://{}", project.path().display());
+        let mut server = McpServer::new(None);
+        let out = one_line(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 19,
+                "method": "initialize",
+                "params": { "rootUri": uri }
+            }),
+        );
+        assert_eq!(out.len(), 1, "adoption still replies once");
+        assert_eq!(out[0]["id"], json!(19));
+        assert_eq!(server.default_project(), Some(project.path()));
+    }
+
+    #[test]
+    fn json_response_serialization_wraps_error_object() {
+        let value = json_response(JsonRpcResponse::error(
+            json!(1),
+            error_codes::INTERNAL_ERROR,
+            "boom",
+        ));
+        assert_eq!(value["error"]["code"], json!(error_codes::INTERNAL_ERROR));
+        assert_eq!(value["error"]["message"], json!("boom"));
+    }
+
+    #[test]
+    fn close_cached_handles_forces_reopen_counter() {
+        let before = reopen_count();
+        let mut server = McpServer::new(None);
+        server.close_cached_handles();
+        assert!(reopen_count() >= before);
+    }
+
+    #[test]
+    fn line_with_method_but_invalid_shape_yields_invalid_request() {
+        let mut server = McpServer::new(None);
+        let out = one_line(
+            &mut server,
+            json!({ "jsonrpc": "2.0", "id": 20, "method": 123 }),
+        );
+        assert_eq!(out[0]["id"], Value::Null);
+        assert_eq!(out[0]["error"]["code"], json!(error_codes::INVALID_REQUEST));
+        assert_eq!(out[0]["error"]["message"], json!("Invalid Request"));
+    }
+
+    #[test]
+    fn response_with_non_roots_id_is_ignored_without_adoption() {
+        let project = indexed_project("nonroots-resp");
+        let mut server = McpServer::new(Some(project.path().to_path_buf()));
+        let out = one_line(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "some-other-request-id",
+                "result": {
+                    "roots": [{ "uri": format!("file://{}", project.path().display()), "name": "p" }]
+                }
+            }),
+        );
+        assert!(out.is_empty(), "a non-roots response yields no reply");
+    }
+
+    #[test]
+    fn roots_response_with_no_indexed_root_returns_none_adoption() {
+        let unindexed = std::env::temp_dir().join(format!(
+            "cg-mcp-noidx-resp-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&unindexed).unwrap();
+        let mut server = McpServer::new(None);
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": ROOTS_LIST_REQUEST_ID,
+            "result": {
+                "roots": [{ "uri": format!("file://{}", unindexed.display()), "name": "empty" }]
+            }
+        });
+        let outcome = server
+            .run_until_adoption(
+                Cursor::new(format!("{response}\n").into_bytes()),
+                Cursor::new(&mut Vec::new()),
+            )
+            .unwrap();
+        assert!(
+            matches!(outcome, RunUntilAdoption::Eof),
+            "an all-unindexed roots response adopts nothing → loop runs to EOF"
+        );
+        let _ = std::fs::remove_dir_all(&unindexed);
     }
 }

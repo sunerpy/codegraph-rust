@@ -1,7 +1,32 @@
 # cargo-audit configuration.
-# RUSTSEC-2025-0119: `number_prefix` is unmaintained. It is a transitive dependency
-# (codegraph-rs -> self_update -> indicatif -> number_prefix) with no fixed release;
-# this is an unmaintained-crate warning, not a vulnerability. Re-evaluate if indicatif
-# drops the dependency or a patched version appears.
+#
+# NOTE ON LOCATION: cargo-audit reads `.cargo/audit.toml` (relative to the working
+# directory) or `~/.cargo/audit.toml` — it does NOT read this repo-root
+# `audit.toml`. CI runs bare `cargo audit` from the repo root, so the file it
+# actually honors is `.cargo/audit.toml`. This repo-root copy is kept as the
+# human-facing reference and MUST be kept in sync with `.cargo/audit.toml`; the
+# `[advisories] ignore` list below mirrors it exactly.
+#
+# RUSTSEC-2025-0119: `number_prefix` was an unmaintained transitive dependency
+# (codegraph-rs -> self_update -> indicatif -> number_prefix). The indicatif 0.17
+# -> 0.18 bump replaced it with `unit-prefix`, so number_prefix is no longer in
+# the dependency tree; this ignore is now inert and can be dropped on the next
+# audit.toml cleanup. Kept for now to stay conservative.
+#
+# RUSTSEC-2026-0194 / RUSTSEC-2026-0195: two DoS advisories in `quick-xml`
+# (quadratic runtime on duplicate start-tag attribute names; unbounded
+# namespace-declaration allocation in `NsReader`). Both are patched only in
+# quick-xml >= 0.41.0. quick-xml is a transitive dependency ONLY via
+# `self_update -> quick-xml`, and NO published `self_update` release depends on
+# quick-xml >= 0.41 (0.44 and 1.0.0-rc.1 both pin `^0.38`), so cargo cannot
+# resolve quick-xml to a patched version without breaking self_update. We already
+# bumped self_update 0.42 -> 0.44 to move quick-xml off the 0.37 line to 0.38.4.
+# Reachability: quick-xml is used solely by self_update's GitHub backend
+# (cmd_self_update in crates/codegraph-cli/src/main.rs -> self_update::backends::github::Update
+# / get_latest_release) to parse GitHub Release METADATA fetched over TLS from the
+# trusted github.com API. CodeGraph never feeds untrusted or adversarial XML to
+# quick-xml, so neither DoS is reachable in this project's threat model.
+# Documented risk acceptance; DROP these two ignores once a self_update release
+# depends on quick-xml >= 0.41.
 [advisories]
-ignore = ["RUSTSEC-2025-0119"]
+ignore = ["RUSTSEC-2025-0119", "RUSTSEC-2026-0194", "RUSTSEC-2026-0195"]

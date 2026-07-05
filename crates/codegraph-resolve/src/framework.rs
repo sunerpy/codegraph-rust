@@ -91,3 +91,144 @@ pub trait FrameworkResolver: Sync {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codegraph_core::types::{EdgeKind, Node, NodeKind};
+
+    struct EmptyContext;
+
+    impl ResolutionContext for EmptyContext {
+        fn get_nodes_in_file(&self, _file_path: &str) -> Vec<Node> {
+            Vec::new()
+        }
+        fn get_nodes_by_name(&self, _name: &str) -> Vec<Node> {
+            Vec::new()
+        }
+        fn get_nodes_by_qualified_name(&self, _qualified_name: &str) -> Vec<Node> {
+            Vec::new()
+        }
+        fn get_nodes_by_kind(&self, _kind: NodeKind) -> Vec<Node> {
+            Vec::new()
+        }
+        fn file_exists(&self, _file_path: &str) -> bool {
+            false
+        }
+        fn read_file(&self, _file_path: &str) -> Option<String> {
+            None
+        }
+        fn get_project_root(&self) -> &str {
+            "/project"
+        }
+        fn get_all_files(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn get_nodes_by_lower_name(&self, _lower_name: &str) -> Vec<Node> {
+            Vec::new()
+        }
+        fn get_node_by_id(&self, _id: &str) -> Option<Node> {
+            None
+        }
+        fn get_import_mappings(&self, _file_path: &str, _language: Language) -> Vec<ImportMapping> {
+            Vec::new()
+        }
+    }
+
+    use crate::types::ImportMapping;
+
+    /// Overrides ONLY the two required methods so every defaulted method
+    /// (`languages`, `claims_reference`, `extract`, `post_extract`) runs its
+    /// trait-default body under test.
+    struct BareResolver;
+
+    impl FrameworkResolver for BareResolver {
+        fn name(&self) -> &str {
+            "bare"
+        }
+        fn detect(&self, _context: &dyn ResolutionContext) -> bool {
+            true
+        }
+        fn resolve(
+            &self,
+            _reference: &RefView,
+            _context: &dyn ResolutionContext,
+        ) -> Option<ResolvedRef> {
+            None
+        }
+    }
+
+    fn a_ref() -> RefView {
+        RefView {
+            from_node_id: "from".to_string(),
+            reference_name: "X".to_string(),
+            reference_kind: EdgeKind::Calls,
+            line: 1,
+            column: 0,
+            file_path: "a.ts".to_string(),
+            language: Language::TypeScript,
+            is_function_ref: false,
+            reference_subkind: None,
+        }
+    }
+
+    #[test]
+    fn bare_resolver_required_methods() {
+        let ctx = EmptyContext;
+        assert_eq!(BareResolver.name(), "bare");
+        assert!(BareResolver.detect(&ctx));
+        assert!(BareResolver.resolve(&a_ref(), &ctx).is_none());
+    }
+
+    #[test]
+    fn languages_default_is_none() {
+        // `languages()` default returns None (applies to all languages).
+        assert!(BareResolver.languages().is_none());
+    }
+
+    #[test]
+    fn claims_reference_default_is_false() {
+        // The default `claims_reference` returns false for any name.
+        assert!(!BareResolver.claims_reference("anything"));
+        assert!(!BareResolver.claims_reference(""));
+    }
+
+    #[test]
+    fn extract_default_is_none() {
+        // The default `extract` returns None (no per-file extraction).
+        assert!(BareResolver.extract("a.ts", "content", "/root").is_none());
+    }
+
+    #[test]
+    fn post_extract_default_is_none() {
+        // The default `post_extract` returns None (no finalization pass).
+        let ctx = EmptyContext;
+        assert!(BareResolver.post_extract(&ctx).is_none());
+    }
+
+    #[test]
+    fn resolver_is_usable_as_trait_object() {
+        // Boxing exercises the `Sync` bound + dynamic dispatch through the trait
+        // object the orchestrator holds.
+        let boxed: Box<dyn FrameworkResolver> = Box::new(BareResolver);
+        assert_eq!(boxed.name(), "bare");
+        assert!(boxed.languages().is_none());
+    }
+
+    #[test]
+    fn empty_context_methods_return_absent_values() {
+        // Drives every EmptyContext method so the helper stub is fully exercised.
+        let c = EmptyContext;
+        assert!(c.get_nodes_in_file("a").is_empty());
+        assert!(c.get_nodes_by_name("a").is_empty());
+        assert!(c.get_nodes_by_qualified_name("a").is_empty());
+        assert!(c.get_nodes_by_kind(NodeKind::Function).is_empty());
+        assert!(!c.file_exists("a"));
+        assert!(c.read_file("a").is_none());
+        assert_eq!(c.get_project_root(), "/project");
+        assert!(c.get_all_files().is_empty());
+        assert!(c.get_nodes_by_lower_name("a").is_empty());
+        assert!(c.get_node_by_id("a").is_none());
+        assert!(c.get_import_mappings("a", Language::TypeScript).is_empty());
+    }
+}

@@ -11,8 +11,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
-use crate::policy::{watch_disabled_reason, WatchPolicy};
-use crate::sync::{default_db_path, sync_changed_paths, SyncOutcome};
+use crate::policy::{WatchPolicy, watch_disabled_reason};
+use crate::sync::{SyncOutcome, default_db_path, sync_changed_paths};
 
 type SyncCallback = Arc<dyn Fn(SyncOutcome) + Send + Sync>;
 type SyncFn = Arc<dyn Fn(Vec<String>) -> Result<SyncOutcome> + Send + Sync>;
@@ -761,6 +761,40 @@ mod tests {
     }
 
     #[test]
+    fn classify_notify_error_maps_kinds() {
+        assert_eq!(
+            classify_notify_error(&notify_io(EMFILE)),
+            WatchErrorClass::Degrade
+        );
+        assert_eq!(
+            classify_notify_error(&notify::Error::new(notify::ErrorKind::MaxFilesWatch)),
+            WatchErrorClass::Warn
+        );
+        assert_eq!(
+            classify_notify_error(&notify::Error::new(notify::ErrorKind::WatchNotFound)),
+            WatchErrorClass::Other
+        );
+    }
+
+    #[test]
+    fn start_returns_none_when_watch_disabled_by_flag() {
+        let dir = crate::sync::tests::TestDir::new("watch-nowatch-flag");
+        let watcher = ProjectWatcher::start(
+            dir.path(),
+            WatchOptions {
+                no_watch: true,
+                inert_for_tests: true,
+                ..WatchOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            watcher.is_none(),
+            "no_watch=true must disable the watcher (start returns None)"
+        );
+    }
+
+    #[test]
     fn emfile_degrades_and_fires_on_degraded_exactly_once() {
         let state = Arc::new(DegradedState::default());
         let degraded_calls = Arc::new(AtomicUsize::new(0));
@@ -861,6 +895,160 @@ mod tests {
             SyncAttempt::Done(_) => panic!("expected non-degrading Error, got Done"),
             SyncAttempt::Degraded(_) => panic!("expected non-degrading Error, got Degraded"),
         }
+    }
+
+    #[test]
+    fn fresh_watcher_is_not_degraded_and_has_no_reason() {
+        // Given: an inert watcher that never hits a backend error.
+        let dir = crate::sync::tests::TestDir::new("watch-not-degraded");
+        let watcher = ProjectWatcher::start(
+            dir.path(),
+            WatchOptions {
+                inert_for_tests: true,
+                ..WatchOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        // Then: the degraded accessors report a healthy watcher.
+        assert!(!watcher.is_degraded());
+        assert!(watcher.degraded_reason().is_none());
+        watcher.stop();
+    }
+
+    #[test]
+    fn start_serve_watcher_returns_none_when_watching_is_disabled() {
+        // Given: a normal project but the no_watch flag forced on.
+        let dir = crate::sync::tests::TestDir::new("watch-serve-disabled");
+        // Then: the public wrapper returns Ok(None) (no watcher started).
+        let watcher = start_serve_watcher(
+            dir.path(),
+            WatchOptions {
+                no_watch: true,
+                inert_for_tests: true,
+                ..WatchOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            watcher.is_none(),
+            "start_serve_watcher must not start a watcher when disabled"
+        );
+    }
+
+    #[test]
+    fn start_serve_watcher_starts_an_inert_watcher_for_a_normal_project() {
+        // Given: a normal project directory.
+        let dir = crate::sync::tests::TestDir::new("watch-serve-start");
+        // Then: the public wrapper starts and returns an inert watcher.
+        let watcher = start_serve_watcher(
+            dir.path(),
+            WatchOptions {
+                inert_for_tests: true,
+                ..WatchOptions::default()
+            },
+        )
+        .unwrap()
+        .expect("watcher should start for a normal project");
+        assert!(!watcher.is_degraded());
+        watcher.stop();
+    }
+
+    #[test]
+    fn pending_files_snapshot_reflects_ingested_events_before_debounce() {
+        // Given: an inert watcher with a long debounce so events stay pending.
+        let dir = crate::sync::tests::TestDir::new("watch-pending");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        let db = crate::sync::default_db_path(dir.path());
+        let watcher = ProjectWatcher::start(
+            dir.path(),
+            WatchOptions {
+                debounce: Duration::from_secs(30),
+                inert_for_tests: true,
+                db_path: Some(db),
+                ..WatchOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        // When: two distinct source events are ingested.
+        watcher.ingest_event_for_tests("src/alpha.ts");
+        watcher.ingest_event_for_tests("src/beta.ts");
+        // Then: poll the snapshot until both land (the loop processes async).
+        let mut paths = Vec::new();
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(25));
+            paths = watcher
+                .pending_files()
+                .into_iter()
+                .map(|p| p.path)
+                .collect::<Vec<_>>();
+            if paths.len() == 2 {
+                break;
+            }
+        }
+        assert_eq!(
+            paths,
+            vec!["src/alpha.ts".to_string(), "src/beta.ts".to_string()]
+        );
+        for entry in watcher.pending_files() {
+            assert!(entry.first_seen_ms <= entry.last_seen_ms);
+        }
+        watcher.stop();
+    }
+
+    #[test]
+    fn event_loop_reports_non_degrading_sync_error_through_callback() {
+        // Given: an inert watcher whose injected sync_fn always fails with a
+        // non-contention error, plus recorders for both notice callbacks.
+        let dir = crate::sync::tests::TestDir::new("watch-loop-error");
+        let sync_errors = Arc::new(Mutex::new(Vec::<String>::new()));
+        let degraded_calls = Arc::new(AtomicUsize::new(0));
+        let se = Arc::clone(&sync_errors);
+        let dc = Arc::clone(&degraded_calls);
+        let sync_fn: SyncFn =
+            Arc::new(|_paths| Err(anyhow::anyhow!("parse error while re-extracting")));
+        let watcher = ProjectWatcher::start(
+            dir.path(),
+            WatchOptions {
+                debounce: Duration::from_millis(40),
+                inert_for_tests: true,
+                sync_fn: Some(sync_fn),
+                on_sync_error: Some(Arc::new(move |msg| se.lock().unwrap().push(msg))),
+                on_degraded: Some(Arc::new(move |_| {
+                    dc.fetch_add(1, AtomicOrdering::SeqCst);
+                })),
+                ..WatchOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        // When: a source event flushes through the debounce into the failing sync.
+        watcher.ingest_event_for_tests("src/app.ts");
+        let mut saw_error = false;
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(25));
+            if !sync_errors.lock().unwrap().is_empty() {
+                saw_error = true;
+                break;
+            }
+        }
+        watcher.stop();
+
+        // Then: the sync-error callback fired, the watcher did NOT degrade, and
+        // the error text is surfaced.
+        assert!(
+            saw_error,
+            "on_sync_error must fire for a non-contention error"
+        );
+        assert_eq!(degraded_calls.load(AtomicOrdering::SeqCst), 0);
+        assert!(
+            sync_errors.lock().unwrap()[0].contains("parse error"),
+            "the surfaced message must carry the underlying error"
+        );
     }
 
     #[test]

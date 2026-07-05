@@ -5,6 +5,7 @@
 //! watchdogs, graceful shutdown, and stale-lock recovery. It deliberately does
 //! not implement task-25 file watching.
 
+pub mod http_registry;
 mod lock;
 mod paths;
 mod process;
@@ -14,32 +15,32 @@ pub mod spawn;
 mod transport;
 
 use std::fs;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
-use interprocess::local_socket::traits::Listener as _;
+use anyhow::{Context, Result, bail};
 pub use lock::{
-    clear_stale_daemon_lock, decode_lock_info, encode_lock_info, recorded_socket_path,
-    try_acquire_daemon_lock, unlock_project, AcquireResult, DaemonLockInfo,
+    AcquireResult, DaemonLockInfo, clear_stale_daemon_lock, clear_stale_daemon_socket,
+    decode_lock_info, encode_lock_info, recorded_socket_path, try_acquire_daemon_lock,
+    unlock_project,
 };
 pub use paths::{daemon_log_path, daemon_pid_path, daemon_socket_path};
 pub use process::{
-    current_ppid, is_process_alive, is_session_leader, supervision_lost_reason, SupervisionState,
+    SupervisionState, current_ppid, is_process_alive, is_session_leader, supervision_lost_reason,
+    terminate_pid,
 };
-pub use proxy::{run_proxy, verify_daemon_hello, ProxyOutcome};
-pub use session::{read_daemon_hello, run_session_recv, SessionRegistry};
-pub use spawn::spawn_detached_daemon;
+pub use proxy::{ProxyOutcome, run_proxy, verify_daemon_hello};
+pub use session::{SessionRegistry, read_daemon_hello, run_session_recv};
+pub use spawn::{CODEGRAPH_HTTP_DETACH_INTERNAL, spawn_detached_daemon, spawn_detached_http};
 use tracing::{debug, info, warn};
 
 use crate::lock::{cleanup_owned_lock, rewrite_lock_socket_path};
 use crate::paths::codegraph_dir;
-use crate::session::serve_session;
-use crate::transport::{bind, connect, Listener, Rendezvous};
+use crate::session::serve_session_async;
+use crate::transport::{AsyncListener, Rendezvous, bind_tokio, connect};
 
 const DEFAULT_WATCHDOG_INTERVAL: Duration = Duration::from_millis(500);
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -120,7 +121,7 @@ pub struct DaemonOptions {
     pub watchdog_interval: Duration,
     pub run_mcp: bool,
     /// When true (default), the daemon owns ONE shared `ProjectWatcher` for the
-    /// project (issue-#411: N client inotify sets collapse to 1). Honors
+    /// project (N client inotify sets collapse to 1). Honors
     /// `watch_disabled_reason` (e.g. `CODEGRAPH_NO_WATCH=1`).
     pub watch: bool,
 }
@@ -258,7 +259,16 @@ fn start_with_lock(
 ) -> Result<DaemonHandle> {
     fs::create_dir_all(codegraph_dir(&project_root))
         .with_context(|| format!("creating {}", codegraph_dir(&project_root).display()))?;
-    let (listener, socket_path) = bind_with_fallback(&project_root, socket_path)?;
+
+    // The async interprocess Listener must be created inside a tokio runtime
+    // context, so build the runtime here and bind within it. The runtime is
+    // then moved into the accept-loop thread to drive the whole session model.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building daemon tokio runtime")?;
+    let (listener, socket_path) =
+        runtime.block_on(async { bind_with_fallback(&project_root, socket_path) })?;
     // The bind-fallback may have selected a candidate other than the one
     // recorded at acquire time; persist the CHOSEN socket so a client reading
     // the lock attaches to the socket actually bound (f83a1ec / D-Daemon).
@@ -274,7 +284,7 @@ fn start_with_lock(
     let thread_pid_path = pid_path.clone();
 
     let thread = thread::spawn(move || {
-        run_accept_loop(
+        runtime.block_on(run_accept_loop_async(
             listener,
             thread_project,
             thread_socket,
@@ -282,7 +292,7 @@ fn start_with_lock(
             thread_registry,
             thread_shutdown,
             options,
-        )
+        ))
     });
 
     Ok(DaemonHandle {
@@ -313,23 +323,24 @@ fn socket_candidate_chain(_project_root: &Path, preferred: PathBuf) -> Vec<PathB
 }
 
 /// Bind the daemon listener, falling through the deterministic socket-candidate
-/// chain on `bind()` failure (`f83a1ec`). `preferred` is the socket the lock
+/// chain on bind failure (`f83a1ec`). `preferred` is the socket the lock
 /// recorded; it is tried first, then any remaining
-/// [`daemon_socket_candidates`] in order. Returns the listener plus the socket
-/// that actually bound. Errors only when EVERY candidate fails.
-fn bind_with_fallback(project_root: &Path, preferred: PathBuf) -> Result<(Listener, PathBuf)> {
+/// [`daemon_socket_candidates`] in order. Returns the async listener plus the
+/// socket that actually bound. Errors only when EVERY candidate fails. Must be
+/// called inside a tokio runtime context (the async listener requires it).
+fn bind_with_fallback(project_root: &Path, preferred: PathBuf) -> Result<(AsyncListener, PathBuf)> {
     let candidates = socket_candidate_chain(project_root, preferred);
 
     let mut last_err = None;
     for socket_path in candidates {
         let rendezvous = Rendezvous::from_socket_path(&socket_path);
         #[cfg(unix)]
-        if let Some(stale) = rendezvous.cleanup_path() {
-            if stale.exists() {
-                let _ = fs::remove_file(stale);
-            }
+        if let Some(stale) = rendezvous.cleanup_path()
+            && stale.exists()
+        {
+            let _ = fs::remove_file(stale);
         }
-        match bind(&rendezvous) {
+        match bind_tokio(&rendezvous) {
             Ok(listener) => return Ok((listener, socket_path)),
             Err(err) => {
                 debug!(socket = %socket_path.display(), error = %err, "daemon socket bind failed; trying next candidate");
@@ -341,9 +352,17 @@ fn bind_with_fallback(project_root: &Path, preferred: PathBuf) -> Result<(Listen
     Err(err).with_context(|| format!("binding daemon socket {}", socket_path.display()))
 }
 
+/// Async accept loop (the fully-async session model). A `tokio::select!` races
+/// `listener.accept()` against a lifecycle-check interval; each accepted
+/// connection is served on a `tokio::spawn`ed [`serve_session_async`] task
+/// (unix) — no OS thread per connection, and each session hands rmcp a
+/// genuinely-async socket via the standard `serve(socket)`. The ONE shared
+/// watcher + catch-up stay owned by this scope (never per-connection). The idle
+/// / max-idle / sweep / supervision logic and its log lines are byte-identical
+/// to the former blocking loop; only the accept/wait mechanics changed.
 #[allow(clippy::too_many_arguments)]
-fn run_accept_loop(
-    listener: Listener,
+async fn run_accept_loop_async(
+    listener: AsyncListener,
     project_root: PathBuf,
     socket_path: PathBuf,
     pid_path: PathBuf,
@@ -351,52 +370,70 @@ fn run_accept_loop(
     shutdown: Arc<AtomicBool>,
     options: DaemonOptions,
 ) -> Result<()> {
+    use interprocess::local_socket::traits::tokio::Listener as _;
+
     let original_ppid = options.parent_pid.unwrap_or_else(current_ppid);
     let socket_display = socket_path.to_string_lossy().to_string();
     let idle_timeout_ms = resolve_idle_timeout_ms();
     let max_idle_ms = resolve_max_idle_ms();
     let client_sweep_ms = resolve_client_sweep_ms();
-    let mut last_sweep = std::time::Instant::now();
     info!(project = %project_root.display(), socket = %socket_path.display(), "daemon started");
 
-    // ONE shared watcher per daemon process (issue-#411). Bound to a local so
+    // ONE shared watcher per daemon process. Bound to a local so
     // its `Drop` stops the watch thread on shutdown. NEVER move this into
-    // `serve_session`: per-connection would spawn N watchers.
+    // the session task: per-connection would spawn N watchers.
     let _watcher = start_project_watcher(&project_root, &options);
 
     let _catch_up_done = spawn_catch_up(&project_root);
 
-    while !shutdown.load(Ordering::SeqCst) {
-        let state = SupervisionState {
-            original_ppid,
-            current_ppid: current_ppid(),
-            host_pid: options.host_pid,
-            session_leader: is_session_leader(),
-        };
-        if let Some(reason) = supervision_lost_reason(&state, is_process_alive) {
-            warn!(reason, "daemon watchdog stopping after supervisor loss");
-            break;
-        }
+    // Tick cadence for lifecycle checks: the client-sweep interval clamped to a
+    // responsive ceiling so idle-exit / supervision loss are observed promptly
+    // even when the sweep window is long. Same thresholds are evaluated per tick.
+    let tick_ms = client_sweep_ms.min(ACCEPT_POLL_INTERVAL.as_millis()).max(1) as u64;
+    let mut ticker = tokio::time::interval(Duration::from_millis(tick_ms));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_sweep = std::time::Instant::now();
 
-        match listener.accept() {
-            Ok(stream) => {
-                let session_project = project_root.clone();
-                let session_socket = socket_display.clone();
-                let session_registry = registry.clone();
-                let run_mcp = options.run_mcp;
-                thread::spawn(move || {
-                    if let Err(err) = serve_session(
-                        stream,
-                        session_project,
-                        session_socket,
-                        session_registry,
-                        run_mcp,
-                    ) {
-                        debug!(error = %err, "daemon session ended with error");
-                    }
-                });
-            }
-            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+    let stop_reason: Option<anyhow::Error> = loop {
+        if shutdown.load(Ordering::SeqCst) {
+            break None;
+        }
+        tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok(stream) => {
+                    let session_project = project_root.clone();
+                    let session_socket = socket_display.clone();
+                    let session_registry = registry.clone();
+                    let run_mcp = options.run_mcp;
+                    tokio::spawn(async move {
+                        if let Err(err) = serve_session_async(
+                            stream,
+                            session_project,
+                            session_socket,
+                            session_registry,
+                            run_mcp,
+                        )
+                        .await
+                        {
+                            debug!(error = %err, "daemon session ended with error");
+                        }
+                    });
+                }
+                Err(err) => {
+                    break Some(anyhow::Error::new(err).context("accepting daemon connection"));
+                }
+            },
+            _ = ticker.tick() => {
+                let state = SupervisionState {
+                    original_ppid,
+                    current_ppid: current_ppid(),
+                    host_pid: options.host_pid,
+                    session_leader: is_session_leader(),
+                };
+                if let Some(reason) = supervision_lost_reason(&state, is_process_alive) {
+                    warn!(reason, "daemon watchdog stopping after supervisor loss");
+                    break None;
+                }
                 if last_sweep.elapsed().as_millis() >= client_sweep_ms {
                     sweep_dead_clients(&registry);
                     last_sweep = std::time::Instant::now();
@@ -404,17 +441,15 @@ fn run_accept_loop(
                 let idle_ms = registry.millis_since_active();
                 if idle_ms > max_idle_ms {
                     info!(idle_ms, max_idle_ms, "daemon exiting on max-idle backstop");
-                    break;
+                    break None;
                 }
                 if registry.active_count() == 0 && idle_ms > idle_timeout_ms {
                     info!(idle_ms, idle_timeout_ms, "daemon idle-exit: no clients");
-                    break;
+                    break None;
                 }
-                thread::sleep(ACCEPT_POLL_INTERVAL);
             }
-            Err(err) => return Err(err).context("accepting daemon connection"),
         }
-    }
+    };
 
     cleanup_owned_lock(&pid_path, std::process::id());
     #[cfg(unix)]
@@ -422,7 +457,10 @@ fn run_accept_loop(
         let _ = fs::remove_file(stale);
     }
     info!(project = %project_root.display(), "daemon stopped");
-    Ok(())
+    match stop_reason {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 fn sweep_dead_clients(registry: &SessionRegistry) {
@@ -442,18 +480,23 @@ fn start_project_watcher(
     watch_options.on_sync_complete =
         Some(Arc::new(move |outcome: codegraph_watch::SyncOutcome| {
             let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
-            let ts = local_timestamp();
             let tail = changed_paths_tail(&outcome.changed_paths);
-            eprintln!(
-                "[{ts}] [watcher] sync #{n}: {} file(s) reindexed, {} removed{tail}",
-                outcome.files_reindexed, outcome.files_removed,
+            // The subscriber prepends the RFC3339 timestamp; this daemon's stderr
+            // is redirected to `.codegraph/daemon.log`, so events land there timed.
+            info!(
+                sync = n,
+                files_reindexed = outcome.files_reindexed,
+                files_removed = outcome.files_removed,
+                "watcher sync #{n}: {} file(s) reindexed, {} removed{tail}",
+                outcome.files_reindexed,
+                outcome.files_removed,
             );
         }));
     watch_options.on_degraded = Some(Arc::new(|reason: String| {
-        eprintln!("[CodeGraph MCP] File watcher degraded — {reason}");
+        warn!(%reason, "file watcher degraded");
     }));
     watch_options.on_sync_error = Some(Arc::new(|reason: String| {
-        eprintln!("[CodeGraph MCP] File watcher warning — {reason}");
+        warn!(%reason, "file watcher warning");
     }));
     match codegraph_watch::start_serve_watcher(project_root, watch_options) {
         Ok(watcher) => watcher,
@@ -462,17 +505,6 @@ fn start_project_watcher(
             None
         }
     }
-}
-
-/// RFC 3339 local timestamp, falling back local -> UTC -> empty so logging
-/// never panics on a missing TZ database.
-fn local_timestamp() -> String {
-    use time::format_description::well_known::Rfc3339;
-    use time::OffsetDateTime;
-    OffsetDateTime::now_local()
-        .unwrap_or_else(|_| OffsetDateTime::now_utc())
-        .format(&Rfc3339)
-        .unwrap_or_default()
 }
 
 /// Bounded inline file list ` — a, b`: first 10 paths, then ` (+N more)`, so a
@@ -507,9 +539,9 @@ fn spawn_catch_up(project_root: &Path) -> Arc<AtomicBool> {
             Ok(outcome) => {
                 let changed = outcome.files_reindexed + outcome.files_removed;
                 if changed > 0 {
-                    let ts = local_timestamp();
-                    eprintln!(
-                        "[{ts}] [CodeGraph MCP] Caught up {changed} file(s) changed since last run"
+                    info!(
+                        changed,
+                        "caught up {changed} file(s) changed since last run"
                     );
                 }
             }
@@ -518,4 +550,264 @@ fn spawn_catch_up(project_root: &Path) -> Arc<AtomicBool> {
         thread_done.store(true, Ordering::SeqCst);
     });
     done
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn resolve_ms_env_defaults_when_unset_or_empty() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let key = "CODEGRAPH_TEST_MS_UNSET";
+        // SAFETY: guarded by ENV_LOCK; single-threaded within the guard.
+        unsafe { std::env::remove_var(key) };
+        assert_eq!(resolve_ms_env(key, 100, 10, 1000), 100);
+        unsafe { std::env::set_var(key, "") };
+        assert_eq!(resolve_ms_env(key, 100, 10, 1000), 100);
+        unsafe { std::env::set_var(key, "not-a-number") };
+        assert_eq!(resolve_ms_env(key, 100, 10, 1000), 100);
+        unsafe { std::env::remove_var(key) };
+    }
+
+    #[test]
+    fn resolve_ms_env_clamps_to_range() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let key = "CODEGRAPH_TEST_MS_CLAMP";
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe { std::env::set_var(key, "5") };
+        assert_eq!(resolve_ms_env(key, 100, 10, 1000), 10);
+        unsafe { std::env::set_var(key, "9999") };
+        assert_eq!(resolve_ms_env(key, 100, 10, 1000), 1000);
+        unsafe { std::env::set_var(key, "500") };
+        assert_eq!(resolve_ms_env(key, 100, 10, 1000), 500);
+        unsafe { std::env::remove_var(key) };
+    }
+
+    #[test]
+    fn idle_and_sweep_resolvers_return_clamped_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for key in [
+            CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS,
+            CODEGRAPH_DAEMON_MAX_IDLE_MS,
+            CODEGRAPH_DAEMON_CLIENT_SWEEP_MS,
+        ] {
+            // SAFETY: guarded by ENV_LOCK.
+            unsafe { std::env::remove_var(key) };
+        }
+        assert_eq!(resolve_idle_timeout_ms(), DEFAULT_IDLE_TIMEOUT_MS);
+        assert_eq!(resolve_max_idle_ms(), DEFAULT_MAX_IDLE_MS);
+        assert_eq!(resolve_client_sweep_ms(), DEFAULT_CLIENT_SWEEP_MS);
+    }
+
+    #[test]
+    fn changed_paths_tail_formats_empty_short_and_overflow() {
+        assert_eq!(changed_paths_tail(&[]), "");
+        assert_eq!(
+            changed_paths_tail(&["a.rs".to_string(), "b.rs".to_string()]),
+            " — a.rs, b.rs"
+        );
+        let many: Vec<String> = (0..12).map(|i| format!("f{i}.rs")).collect();
+        let tail = changed_paths_tail(&many);
+        assert!(tail.starts_with(" — f0.rs, "));
+        assert!(tail.ends_with("(+2 more)"), "overflow suffix: {tail}");
+        let exactly_ten: Vec<String> = (0..10).map(|i| format!("f{i}.rs")).collect();
+        assert!(!changed_paths_tail(&exactly_ten).contains("more"));
+    }
+
+    #[test]
+    fn daemon_options_default_enables_mcp_and_watch() {
+        let options = DaemonOptions::default();
+        assert!(options.run_mcp);
+        assert!(options.watch);
+        assert_eq!(options.parent_pid, None);
+        assert_eq!(options.host_pid, None);
+        assert_eq!(options.watchdog_interval, DEFAULT_WATCHDOG_INTERVAL);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_candidate_chain_puts_preferred_first_and_dedups() {
+        let root = Path::new("/tmp/cg-candidate-chain");
+        let preferred = daemon_socket_path(root);
+        let chain = socket_candidate_chain(root, preferred.clone());
+        assert_eq!(chain[0], preferred);
+        let mut deduped = chain.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(deduped.len(), chain.len());
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "cg-daemon-lifecycle-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn quiet_options() -> DaemonOptions {
+        DaemonOptions {
+            run_mcp: false,
+            watch: false,
+            ..DaemonOptions::default()
+        }
+    }
+
+    #[test]
+    fn start_or_attach_starts_a_daemon_and_handle_reports_state() {
+        let root = temp_root("start");
+        let started = start_or_attach(&root, quiet_options()).expect("start a fresh daemon");
+        let StartOrAttach::Started(handle) = started else {
+            panic!("a fresh project must start (not attach) a daemon");
+        };
+        assert!(!handle.socket_path().as_os_str().is_empty());
+        assert_eq!(handle.active_sessions(), 0);
+        handle.stop().expect("stop joins the accept thread cleanly");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn second_start_attaches_to_the_running_daemon() {
+        let root = temp_root("attach");
+        let started = start_or_attach(&root, quiet_options()).expect("first start");
+        let StartOrAttach::Started(handle) = started else {
+            panic!("first call must start the daemon");
+        };
+
+        match start_or_attach(&root, quiet_options()).expect("second call resolves") {
+            StartOrAttach::Attached(client) => {
+                assert!(
+                    client.hello.get("codegraph").is_some(),
+                    "hello carries version"
+                );
+            }
+            StartOrAttach::Started(second) => {
+                second.stop().ok();
+                panic!("second call must attach to the live daemon, not start a new one");
+            }
+        }
+
+        handle.stop().expect("stop the daemon");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn run_foreground_errors_when_a_daemon_already_serves() {
+        let root = temp_root("foreground-busy");
+        let started = start_or_attach(&root, quiet_options()).expect("start daemon");
+        let StartOrAttach::Started(handle) = started else {
+            panic!("expected a started daemon");
+        };
+        let err = run_foreground(&root, quiet_options())
+            .expect_err("a second foreground serve must refuse when one is already running");
+        assert!(
+            err.to_string().contains("already running"),
+            "unexpected error: {err}"
+        );
+        handle.stop().expect("stop the daemon");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn handle_wait_returns_after_shutdown_and_reports_finished() {
+        let root = temp_root("wait");
+        let StartOrAttach::Started(handle) =
+            start_or_attach(&root, quiet_options()).expect("start a fresh daemon")
+        else {
+            panic!("a fresh project must start a daemon");
+        };
+        assert!(
+            !handle.is_finished(),
+            "a just-started daemon is not finished"
+        );
+        handle.shutdown.store(true, Ordering::SeqCst);
+        for _ in 0..200 {
+            if handle.is_finished() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(handle.is_finished(), "loop must observe the shutdown flag");
+        handle.wait().expect("wait joins the accept thread cleanly");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn start_or_attach_clears_a_stale_lock_with_a_dead_pid_and_restarts() {
+        let root = temp_root("stale-dead");
+        fs::create_dir_all(paths::codegraph_dir(&root)).unwrap();
+        let mut dead_pid = 999_999u32;
+        while is_process_alive(dead_pid) {
+            dead_pid -= 1;
+        }
+        let pid_path = daemon_pid_path(&root);
+        let stale = DaemonLockInfo {
+            pid: dead_pid,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            socket_path: daemon_socket_path(&root),
+            started_at: 1,
+        };
+        fs::write(&pid_path, encode_lock_info(&stale).unwrap()).unwrap();
+
+        let started = start_or_attach(&root, quiet_options())
+            .expect("a stale dead-pid lock must be cleared and a new daemon started");
+        let StartOrAttach::Started(handle) = started else {
+            panic!("a stale dead-pid lock must yield a freshly started daemon, not an attach");
+        };
+        assert_eq!(handle.active_sessions(), 0);
+        handle.stop().expect("stop the recovered daemon");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn start_or_attach_clears_a_garbage_lock_without_info_and_restarts() {
+        let root = temp_root("stale-garbage");
+        fs::create_dir_all(paths::codegraph_dir(&root)).unwrap();
+        let pid_path = daemon_pid_path(&root);
+        fs::write(&pid_path, b"not-json-at-all").unwrap();
+
+        let started = start_or_attach(&root, quiet_options())
+            .expect("an undecodable lock must be cleared and a new daemon started");
+        let StartOrAttach::Started(handle) = started else {
+            panic!("an undecodable lock must yield a freshly started daemon");
+        };
+        handle.stop().expect("stop the recovered daemon");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn bind_with_fallback_binds_the_preferred_socket_first() {
+        let root = temp_root("bind-fallback");
+        fs::create_dir_all(paths::codegraph_dir(&root)).unwrap();
+        let preferred = daemon_socket_path(&root);
+        let (_listener, bound) =
+            bind_with_fallback(&root, preferred.clone()).expect("preferred socket must bind");
+        assert_eq!(bound, preferred, "the preferred candidate binds first");
+        #[cfg(unix)]
+        if let Some(stale) = Rendezvous::from_socket_path(&bound).cleanup_path() {
+            let _ = fs::remove_file(stale);
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn attach_to_a_dead_socket_path_errors() {
+        let root = temp_root("attach-dead");
+        let socket = daemon_socket_path(&root);
+        let err = attach_to_daemon(&socket).expect_err("attaching to an unbound socket must fail");
+        assert!(
+            err.to_string().contains("connecting to daemon socket"),
+            "unexpected error: {err}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
 }

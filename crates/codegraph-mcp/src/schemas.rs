@@ -143,6 +143,11 @@ pub fn visible_tool_definitions_requiring_project_path() -> Value {
 mod tests {
     use super::*;
 
+    /// Serializes tests that read or mutate the process-global
+    /// `CODEGRAPH_MCP_TOOLS`, so an env value one test sets never bleeds into a
+    /// reader running in parallel under nextest's in-process threads.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn tools_list_has_upstream_eight_plus_additive_check() {
         let tools = tool_definitions();
@@ -218,6 +223,7 @@ mod tests {
 
     #[test]
     fn with_required_project_path_is_idempotent() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let once = with_required_project_path(visible_tool_definitions());
         let twice = with_required_project_path(once.clone());
         assert_eq!(once, twice, "applying twice equals applying once");
@@ -234,6 +240,7 @@ mod tests {
 
     #[test]
     fn visible_definitions_unchanged_by_required_transform() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let plain = visible_tool_definitions();
         let _ = visible_tool_definitions_requiring_project_path();
         assert_eq!(
@@ -252,5 +259,89 @@ mod tests {
                 tool["name"]
             );
         }
+    }
+
+    #[test]
+    fn is_known_tool_rejects_unknown_and_accepts_known() {
+        assert!(is_known_tool("codegraph_search"));
+        assert!(is_known_tool("codegraph_export"));
+        assert!(!is_known_tool("codegraph_trace"));
+        assert!(!is_known_tool(""));
+    }
+
+    #[test]
+    fn short_name_strips_prefix_and_passes_through() {
+        assert_eq!(short_name("codegraph_explore"), "explore");
+        assert_eq!(short_name("explore"), "explore");
+    }
+
+    #[test]
+    fn allowlist_env_restricts_visible_tools() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: serialized by ENV_LOCK; single-threaded within this body.
+        unsafe {
+            std::env::set_var("CODEGRAPH_MCP_TOOLS", "status,files");
+        }
+        let visible = visible_tool_definitions();
+        let names: Vec<&str> = visible
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["codegraph_status", "codegraph_files"]);
+        unsafe {
+            std::env::remove_var("CODEGRAPH_MCP_TOOLS");
+        }
+    }
+
+    #[test]
+    fn allowlist_env_accepts_full_names_and_ignores_blanks() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: serialized by ENV_LOCK; single-threaded within this body.
+        unsafe {
+            std::env::set_var("CODEGRAPH_MCP_TOOLS", " codegraph_search , , explore ");
+        }
+        let visible = visible_tool_definitions();
+        let names: Vec<&str> = visible
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"codegraph_search"));
+        assert!(names.contains(&"codegraph_explore"));
+        assert_eq!(names.len(), 2, "blanks dropped, only the two listed");
+        unsafe {
+            std::env::remove_var("CODEGRAPH_MCP_TOOLS");
+        }
+    }
+
+    #[test]
+    fn blank_allowlist_env_falls_back_to_default_surface() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: serialized by ENV_LOCK; single-threaded within this body.
+        unsafe {
+            std::env::set_var("CODEGRAPH_MCP_TOOLS", "   ");
+        }
+        let visible = visible_tool_definitions();
+        assert_eq!(
+            visible.as_array().unwrap().len(),
+            4,
+            "blank allowlist → default 4-tool surface"
+        );
+        unsafe {
+            std::env::remove_var("CODEGRAPH_MCP_TOOLS");
+        }
+    }
+
+    #[test]
+    fn with_required_project_path_non_array_passthrough() {
+        let value = serde_json::json!({ "not": "an array" });
+        assert_eq!(
+            with_required_project_path(value.clone()),
+            value,
+            "non-array input is returned unchanged"
+        );
     }
 }

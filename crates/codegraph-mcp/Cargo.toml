@@ -22,6 +22,48 @@ codegraph-store = { path = "../codegraph-store" }
 codegraph-graph = { path = "../codegraph-graph" }
 codegraph-resolve = { path = "../codegraph-resolve" }
 regex = "1.10"
+# rmcp is now the SOLE MCP transport (Phase E): a regular dependency, no longer
+# feature-gated. The shipped binary links rmcp + tokio + axum unconditionally.
+rmcp = { version = "2.1", features = [
+    "server",
+    "transport-io",
+    "transport-streamable-http-server",
+] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "io-util",
+    "net",
+    "sync",
+    "time",
+] }
+# axum: hosts the `StreamableHttpService` tower service for the streamable-HTTP
+# serve path and binds the listener.
+axum = { version = "0.8", default-features = false, features = [
+    "http1",
+    "tokio",
+] }
+tokio-util = { version = "0.7" }
+
+[features]
+# Enables the test-only tool seams (`__panic__`, `__sleep__`) in the rmcp
+# handler so integration tests can drive the panic-isolation and per-call
+# timeout paths. `cfg!(test)` is false in the library when it is linked as a
+# dependency of an integration test binary, so a Cargo feature (auto-enabled for
+# this crate's own dev/test builds via the dev-dependency self-reference below)
+# is the only reliable gate. NEVER enabled in the shipped binary.
+test-hooks = []
 
 [dev-dependencies]
+# Self-reference with `test-hooks` so the seams above are compiled into the lib
+# for THIS crate's test/integration builds only.
+codegraph-mcp = { path = ".", features = ["test-hooks"] }
 codegraph-extract = { path = "../codegraph-extract" }
+# rmcp `client` feature: dev-only, drives the handler over duplex in parity tests.
+rmcp = { version = "2.1", features = ["server", "client", "transport-io", "transport-streamable-http-server"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "sync", "time"] }
+# reqwest: dev-only HTTP client for the streamable-HTTP integration test.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# tower: dev-only, provides `ServiceExt::oneshot` to unit-test the debug
+# middleware's transparent passthrough without spawning a server.
+tower = { version = "0.5", features = ["util"] }

@@ -39,6 +39,7 @@ pub enum TargetId {
     Kiro,
     Trae,
     Qoder,
+    Zed,
 }
 
 impl TargetId {
@@ -54,6 +55,7 @@ impl TargetId {
             TargetId::Kiro => "kiro",
             TargetId::Trae => "trae",
             TargetId::Qoder => "qoder",
+            TargetId::Zed => "zed",
         }
     }
 }
@@ -353,6 +355,88 @@ mod tests {
     }
 
     #[test]
+    fn dummy_target_trait_methods_are_exercised() {
+        let (ctx, base) = temp_ctx("dummy-methods");
+        let opts = InstallOptions {
+            auto_allow: false,
+            front_load_hook: false,
+        };
+
+        let unsupported = UnsupportedTarget;
+        assert_eq!(unsupported.id(), TargetId::Claude);
+        assert_eq!(unsupported.display_name(), "Dummy Unsupported");
+        assert!(unsupported.supports_location(Location::Global));
+        assert!(!unsupported.detect(&ctx, Location::Global).installed);
+        assert!(
+            unsupported
+                .install(&ctx, Location::Global, opts)
+                .files
+                .is_empty()
+        );
+        assert!(
+            unsupported
+                .uninstall(&ctx, Location::Global)
+                .files
+                .is_empty()
+        );
+        assert!(unsupported.print_config(&ctx, Location::Global).is_empty());
+
+        let supporting = SupportingTarget {
+            skills_parent: base.join("skills"),
+        };
+        assert_eq!(supporting.id(), TargetId::Claude);
+        assert_eq!(supporting.display_name(), "Dummy Supporting");
+        assert!(supporting.supports_location(Location::Local));
+        assert!(!supporting.detect(&ctx, Location::Local).already_configured);
+        assert!(
+            supporting
+                .install(&ctx, Location::Local, opts)
+                .files
+                .is_empty()
+        );
+        assert!(supporting.uninstall(&ctx, Location::Local).files.is_empty());
+        assert!(supporting.print_config(&ctx, Location::Local).is_empty());
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn location_targetid_fileaction_string_forms() {
+        assert_eq!(Location::Global.as_str(), "global");
+        assert_eq!(Location::Local.as_str(), "local");
+
+        let target_pairs = [
+            (TargetId::Claude, "claude"),
+            (TargetId::Cursor, "cursor"),
+            (TargetId::Codex, "codex"),
+            (TargetId::Opencode, "opencode"),
+            (TargetId::Hermes, "hermes"),
+            (TargetId::Gemini, "gemini"),
+            (TargetId::Antigravity, "antigravity"),
+            (TargetId::Kiro, "kiro"),
+            (TargetId::Trae, "trae"),
+            (TargetId::Qoder, "qoder"),
+            (TargetId::Zed, "zed"),
+        ];
+        for (id, expected) in target_pairs {
+            assert_eq!(id.as_str(), expected);
+        }
+
+        let action_pairs = [
+            (FileAction::Created, "Created"),
+            (FileAction::Updated, "Updated"),
+            (FileAction::Unchanged, "Unchanged"),
+            (FileAction::Removed, "Removed"),
+            (FileAction::NotFound, "Not found"),
+            (FileAction::Kept, "Kept"),
+            (FileAction::Skipped, "Skipped (left unchanged)"),
+        ];
+        for (action, expected) in action_pairs {
+            assert_eq!(action.verb(), expected);
+        }
+    }
+
+    #[test]
     fn default_target_does_not_support_skills() {
         // Given a target that does not override the skill hooks
         let (ctx, base) = temp_ctx("unsupported");
@@ -366,13 +450,17 @@ mod tests {
         let install = target.install_skill(&ctx, Location::Global, false);
         assert!(install.files.is_empty());
         assert_eq!(install.notes.len(), 1);
-        assert!(install.notes[0]
-            .contains("skills not supported by Dummy Unsupported for --location=global"));
+        assert!(
+            install.notes[0]
+                .contains("skills not supported by Dummy Unsupported for --location=global")
+        );
 
         let uninstall = target.uninstall_skill(&ctx, Location::Global);
         assert!(uninstall.files.is_empty());
-        assert!(uninstall.notes[0]
-            .contains("skills not supported by Dummy Unsupported for --location=global"));
+        assert!(
+            uninstall.notes[0]
+                .contains("skills not supported by Dummy Unsupported for --location=global")
+        );
 
         let status = target.skill_status(&ctx, Location::Global);
         assert!(status.is_unsupported());
@@ -393,10 +481,11 @@ mod tests {
 
         // When installing for the first time → Created (via default delegation).
         let r1 = target.install_skill(&ctx, Location::Global, false);
-        assert!(r1
-            .files
-            .iter()
-            .any(|f| f.action == FileAction::Created && f.path.ends_with("SKILL.md")));
+        assert!(
+            r1.files
+                .iter()
+                .any(|f| f.action == FileAction::Created && f.path.ends_with("SKILL.md"))
+        );
         assert_eq!(
             target.skill_status(&ctx, Location::Global).status,
             Some(skill::SkillStatus::UpToDate)
@@ -423,10 +512,11 @@ mod tests {
 
         // When forcing → Updated, embedded content restored.
         let r4 = target.install_skill(&ctx, Location::Global, true);
-        assert!(r4
-            .files
-            .iter()
-            .any(|f| f.action == FileAction::Updated && f.path.ends_with("SKILL.md")));
+        assert!(
+            r4.files
+                .iter()
+                .any(|f| f.action == FileAction::Updated && f.path.ends_with("SKILL.md"))
+        );
         assert_eq!(fs::read_to_string(&skill_md).unwrap(), skill::SKILL_MD);
 
         // When uninstalling → files removed.

@@ -15,9 +15,12 @@ pub mod engine;
 pub mod explore_budget;
 pub mod instructions;
 pub mod protocol;
-mod roots;
+pub mod rmcp_handler;
+pub mod rmcp_session;
+pub(crate) mod roots;
 pub mod schemas;
 pub mod server;
 
 pub use engine::CodeGraphEngine;
-pub use server::{initialize_result, McpServer, RunUntilAdoption};
+pub use rmcp_handler::{serve_http, serve_stdio_rmcp};
+pub use server::{McpServer, RunUntilAdoption, initialize_result};

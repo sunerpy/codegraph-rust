@@ -23,12 +23,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use codegraph_daemon::{
-    current_ppid, daemon_socket_path, is_process_alive, run_proxy, spawn_detached_daemon,
-    unlock_project, ProxyOutcome,
+    ProxyOutcome, current_ppid, daemon_socket_path, is_process_alive, run_proxy,
+    spawn_detached_daemon, unlock_project,
 };
 use interprocess::local_socket::traits::Stream as _;
 use interprocess::local_socket::{GenericFilePath, Stream, ToFsName};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_codegraph"))
@@ -114,10 +114,10 @@ fn read_pid_from_hello(socket: &Path) -> Option<u32> {
 fn poll_for_daemon_pid(socket: &Path, timeout: Duration) -> Option<u32> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if socket.exists() {
-            if let Some(pid) = read_pid_from_hello(socket) {
-                return Some(pid);
-            }
+        if socket.exists()
+            && let Some(pid) = read_pid_from_hello(socket)
+        {
+            return Some(pid);
         }
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -208,7 +208,7 @@ fn proxy_local_handshake_and_forwarded_tool_call() {
     let (_dir, project) = indexed_project("handshake");
     let socket = daemon_socket_path(&project);
 
-    spawn_detached_daemon(&bin(), &project).expect("spawn detached daemon");
+    spawn_detached_daemon(&bin(), &project, false).expect("spawn detached daemon");
     let pid =
         poll_for_daemon_pid(&socket, Duration::from_millis(3000)).expect("daemon up with hello");
     assert!(is_process_alive(pid), "daemon pid {pid} alive");
@@ -216,7 +216,7 @@ fn proxy_local_handshake_and_forwarded_tool_call() {
     // initialize (id 1) -> tools/list (id 2) -> tools/call codegraph_search (id 3).
     let requests = format!(
         "{}\n{}\n{}\n",
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-test","version":"0"}}}),
         json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
         json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
                "params":{"name":"codegraph_search","arguments":{"query":"add"}}}),

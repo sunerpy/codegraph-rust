@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use codegraph_core::types::{
     Edge, EdgeKind, FileRecord, Language, Node, NodeKind, ReferenceSubkind, UnresolvedRef,
 };
-use rusqlite::{named_params, params, Connection, OptionalExtension, Row, ToSql};
+use rusqlite::{
+    Connection, OptionalExtension, Row, ToSql, TransactionBehavior, named_params, params,
+};
 use serde_json::Value;
 
 use crate::connection::Store;
@@ -188,8 +190,7 @@ impl Store {
         unique.sort_unstable();
         unique.dedup();
         for chunk in unique.chunks(SQLITE_PARAM_CHUNK_SIZE) {
-            let placeholders = std::iter::repeat("?")
-                .take(chunk.len())
+            let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!("SELECT * FROM nodes WHERE id IN ({placeholders})");
@@ -437,9 +438,18 @@ impl Store {
             .iter()
             .flat_map(|edge| [edge.source.as_str(), edge.target.as_str()])
             .collect::<Vec<_>>();
-        let existing_node_ids = existing_node_ids(&self.conn, &endpoint_ids)?;
 
-        let tx = self.conn.transaction()?;
+        // Snapshot endpoint existence INSIDE a `BEGIN IMMEDIATE` transaction so the
+        // FK filter and the inserts observe one write-locked, delete-free view.
+        // Reading it before the transaction let a concurrent writer (daemon
+        // catch-up sync on one connection, watcher sync on another) delete an
+        // endpoint between the snapshot and the insert: the edge passed the stale
+        // filter but tripped `FOREIGN KEY constraint failed`, aborting the sync.
+        // Dropping a genuinely-absent endpoint stays byte-identical to before.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing_node_ids = existing_node_ids(&tx, &endpoint_ids)?;
         {
             let mut stmt = tx.prepare_cached(
                 r#"
@@ -597,9 +607,16 @@ impl Store {
             .iter()
             .map(|unresolved| unresolved.from_node_id.as_str())
             .collect::<Vec<_>>();
-        let existing_node_ids = existing_node_ids(&self.conn, &from_ids)?;
 
-        let tx = self.conn.transaction()?;
+        // Snapshot `from_node_id` existence INSIDE a `BEGIN IMMEDIATE` transaction
+        // (see `insert_edges`): a concurrent writer deleting the source node
+        // between an out-of-transaction snapshot and the insert would trip
+        // `FOREIGN KEY constraint failed` and abort the sync. Dropping a
+        // genuinely-absent source stays byte-identical to before.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing_node_ids = existing_node_ids(&tx, &from_ids)?;
         {
             let mut stmt = tx.prepare_cached(
                 r#"
@@ -760,8 +777,7 @@ impl Store {
         unique.sort_unstable();
         unique.dedup();
         for chunk in unique.chunks(SQLITE_PARAM_CHUNK_SIZE) {
-            let placeholders = std::iter::repeat("?")
-                .take(chunk.len())
+            let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!("SELECT * FROM unresolved_refs WHERE file_path IN ({placeholders})");
@@ -793,8 +809,7 @@ impl Store {
         unique.sort_unstable();
         unique.dedup();
         for chunk in unique.chunks(SQLITE_PARAM_CHUNK_SIZE) {
-            let placeholders = std::iter::repeat("?")
-                .take(chunk.len())
+            let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(",");
             let sql =
@@ -1026,8 +1041,7 @@ impl Store {
         unique.sort_unstable();
         unique.dedup();
         for chunk in unique.chunks(SQLITE_PARAM_CHUNK_SIZE) {
-            let placeholders = std::iter::repeat("?")
-                .take(chunk.len())
+            let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!(
@@ -1334,8 +1348,7 @@ fn existing_node_ids(
     unique.sort_unstable();
     unique.dedup();
     for chunk in unique.chunks(SQLITE_PARAM_CHUNK_SIZE) {
-        let placeholders = std::iter::repeat("?")
-            .take(chunk.len())
+        let placeholders = std::iter::repeat_n("?", chunk.len())
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!("SELECT id FROM nodes WHERE id IN ({placeholders})");
@@ -1658,5 +1671,624 @@ mod tests {
             store.get_project_metadata("root").unwrap(),
             Some("/tmp/project2".to_string())
         );
+    }
+
+    #[test]
+    fn concurrent_endpoint_delete_does_not_abort_insert_edges() {
+        // Given: a db with two nodes and a second connection that deletes the
+        // edge's target, mimicking the daemon catch-up sync racing the watcher.
+        let path = temp_db_path("concurrent-edge-fk");
+        let mut store = Store::open(&path).unwrap();
+        store.upsert_file(&file("a.rs")).unwrap();
+        store
+            .upsert_nodes(&[
+                node("function:src", "src", "a.rs"),
+                node("function:dst", "dst", "a.rs"),
+            ])
+            .unwrap();
+
+        let deleter = Store::open(&path).unwrap();
+        deleter
+            .connection()
+            .execute("DELETE FROM nodes WHERE id = 'function:dst'", [])
+            .unwrap();
+
+        // When: inserting an edge whose target the other connection just removed.
+        let edge = Edge {
+            id: None,
+            source: "function:src".to_string(),
+            target: "function:dst".to_string(),
+            kind: EdgeKind::Calls,
+            metadata: None,
+            line: Some(1),
+            col: Some(0),
+            provenance: None,
+        };
+        let result = store.insert_edges(std::slice::from_ref(&edge));
+
+        // Then: the sync survives — the now-absent endpoint is dropped, not raised
+        // as `FOREIGN KEY constraint failed`.
+        assert!(
+            result.is_ok(),
+            "insert_edges aborted on a concurrently-deleted endpoint: {:?}",
+            result.err()
+        );
+        assert!(store.all_edges().unwrap().is_empty());
+    }
+
+    #[test]
+    fn concurrent_source_delete_does_not_abort_insert_unresolved_refs() {
+        // Given: a db with a node and a second connection that deletes it.
+        let path = temp_db_path("concurrent-ref-fk");
+        let mut store = Store::open(&path).unwrap();
+        store.upsert_file(&file("a.rs")).unwrap();
+        store
+            .upsert_nodes(&[node("function:src", "src", "a.rs")])
+            .unwrap();
+
+        let deleter = Store::open(&path).unwrap();
+        deleter
+            .connection()
+            .execute("DELETE FROM nodes WHERE id = 'function:src'", [])
+            .unwrap();
+
+        // When: inserting a ref whose source the other connection just removed.
+        let unresolved = UnresolvedRef {
+            id: None,
+            from_node_id: "function:src".to_string(),
+            reference_name: "gone".to_string(),
+            reference_kind: EdgeKind::Calls,
+            line: 1,
+            col: 0,
+            candidates: None,
+            file_path: "a.rs".to_string(),
+            language: Language::Rust,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+        let result = store.insert_unresolved_refs(std::slice::from_ref(&unresolved));
+
+        // Then: the orphan ref is dropped, the sync is not aborted by an FK error.
+        assert!(
+            result.is_ok(),
+            "insert_unresolved_refs aborted on a concurrently-deleted source: {:?}",
+            result.err()
+        );
+        assert!(store.all_unresolved_refs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn concurrent_writers_never_abort_insert_edges_with_stale_snapshot() {
+        // Given: two connections to one db racing the exact daemon-catch-up vs
+        // watcher-sync pattern — one repeatedly deletes and re-inserts the edge's
+        // target while the other repeatedly inserts an edge to it. Pre-fix the
+        // endpoint snapshot was read on an autocommit connection, so a delete
+        // committed between that read and the insert tripped `FOREIGN KEY
+        // constraint failed`; `BEGIN IMMEDIATE` serialises the writers so the
+        // snapshot and inserts see one consistent view.
+        let path = temp_db_path("concurrent-stale-snapshot");
+        {
+            let mut seed = Store::open(&path).unwrap();
+            seed.upsert_file(&file("a.rs")).unwrap();
+            seed.upsert_nodes(&[node("function:src", "src", "a.rs")])
+                .unwrap();
+        }
+
+        let churn_path = path.clone();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let churn_stop = std::sync::Arc::clone(&stop);
+        let churn = std::thread::spawn(move || {
+            let mut churner = Store::open(&churn_path).unwrap();
+            let dst = node("function:dst", "dst", "a.rs");
+            while !churn_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                // Lock contention against the writer's IMMEDIATE transaction is
+                // expected; a real concurrent writer just retries, so ignore it.
+                let _ = churner.upsert_nodes(std::slice::from_ref(&dst));
+                let _ = churner
+                    .connection()
+                    .execute("DELETE FROM nodes WHERE id = 'function:dst'", []);
+            }
+        });
+
+        // When: the other writer inserts an edge to the churned endpoint many times.
+        let mut writer = Store::open(&path).unwrap();
+        let edge = Edge {
+            id: None,
+            source: "function:src".to_string(),
+            target: "function:dst".to_string(),
+            kind: EdgeKind::Calls,
+            metadata: None,
+            line: Some(1),
+            col: Some(0),
+            provenance: None,
+        };
+        let mut aborted: Option<String> = None;
+        for _ in 0..2_000 {
+            if let Err(err) = writer.insert_edges(std::slice::from_ref(&edge)) {
+                aborted = Some(err.to_string());
+                break;
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        churn.join().unwrap();
+
+        // Then: no iteration ever aborted with a foreign-key error.
+        assert!(
+            aborted.is_none(),
+            "insert_edges aborted under a concurrent endpoint deleter: {aborted:?}"
+        );
+    }
+
+    fn edge(source: &str, target: &str, kind: EdgeKind) -> Edge {
+        Edge {
+            id: None,
+            source: source.to_string(),
+            target: target.to_string(),
+            kind,
+            metadata: None,
+            line: None,
+            col: None,
+            provenance: None,
+        }
+    }
+
+    #[test]
+    fn node_lookups_by_kind_qualified_name_and_ids() {
+        let mut store = store("node-lookups");
+        let a = node("function:a", "alpha", "src/a.rs");
+        let mut b = node("class:b", "Beta", "src/b.rs");
+        b.kind = NodeKind::Class;
+        store.upsert_nodes(&[a.clone(), b.clone()]).unwrap();
+
+        assert_eq!(
+            store.nodes_by_kind(NodeKind::Function).unwrap(),
+            vec![a.clone()]
+        );
+        assert_eq!(
+            store.nodes_by_kind(NodeKind::Class).unwrap(),
+            vec![b.clone()]
+        );
+        assert!(store.nodes_by_kind(NodeKind::Enum).unwrap().is_empty());
+
+        assert_eq!(
+            store.nodes_by_qualified_name("src/a.rs::alpha").unwrap(),
+            vec![a.clone()]
+        );
+        assert!(store.nodes_by_qualified_name("missing").unwrap().is_empty());
+
+        assert!(store.nodes_by_ids(&[]).unwrap().is_empty());
+        let map = store
+            .nodes_by_ids(&[
+                "function:a".to_string(),
+                "class:b".to_string(),
+                "function:a".to_string(),
+                "does:not-exist".to_string(),
+            ])
+            .unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("function:a"), Some(&a));
+        assert_eq!(map.get("class:b"), Some(&b));
+
+        assert_eq!(store.node_count_by_file_path("src/a.rs").unwrap(), 1);
+        assert_eq!(store.node_count_by_file_path("nope").unwrap(), 0);
+    }
+
+    #[test]
+    fn all_node_names_returns_distinct_names() {
+        let mut store = store("all-names");
+        store
+            .upsert_nodes(&[
+                node("function:a", "shared", "src/a.rs"),
+                node("function:b", "shared", "src/b.rs"),
+                node("function:c", "unique", "src/c.rs"),
+            ])
+            .unwrap();
+        let mut names = store.all_node_names().unwrap();
+        names.sort();
+        assert_eq!(names, vec!["shared".to_string(), "unique".to_string()]);
+    }
+
+    #[test]
+    fn search_variants_filter_by_kind_and_language() {
+        let mut store = store("search-variants");
+        let mut func = node("function:f", "SearchTarget", "src/f.rs");
+        func.docstring = Some("primary target".to_string());
+        let mut class = node("class:c", "SearchTarget", "src/c.py");
+        class.kind = NodeKind::Class;
+        class.language = Language::Python;
+        store.upsert_nodes(&[func.clone(), class.clone()]).unwrap();
+
+        let filtered = store
+            .search_nodes_fts_filtered("SearchTarget", &[NodeKind::Function], &[], 10, 0)
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].node.id, "function:f");
+
+        let by_lang = store
+            .search_nodes_fts_filtered("SearchTarget", &[], &[Language::Python], 10, 0)
+            .unwrap();
+        assert_eq!(by_lang.len(), 1);
+        assert_eq!(by_lang[0].node.id, "class:c");
+
+        assert!(
+            store
+                .search_nodes_fts_filtered("", &[], &[], 10, 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.search_nodes_fts("   ", 10, 0).unwrap().is_empty());
+
+        let like = store.search_nodes_like("Search", &[], &[], 10, 0).unwrap();
+        assert_eq!(like.len(), 2);
+        assert!(like.iter().all(|r| r.score > 0.0));
+
+        let all = store
+            .search_all_by_filters(&[NodeKind::Function], &[], 10)
+            .unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].score, 1.0);
+        assert_eq!(all[0].node.id, "function:f");
+    }
+
+    #[test]
+    fn exact_name_lookups_nocase_and_filtered() {
+        let mut store = store("exact-name");
+        store
+            .upsert_nodes(&[
+                node("function:x", "Widget", "src/x.rs"),
+                node("function:y", "Widget", "src/y.rs"),
+            ])
+            .unwrap();
+
+        let nocase = store
+            .nodes_by_exact_name_nocase("widget", &[], &[])
+            .unwrap();
+        assert_eq!(nocase.len(), 2);
+
+        let filtered = store
+            .nodes_by_exact_name_filtered("Widget", &[NodeKind::Function], &[Language::Rust])
+            .unwrap();
+        assert_eq!(filtered.len(), 2);
+        assert!(
+            store
+                .nodes_by_exact_name_filtered("missing", &[], &[])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn edges_by_target_and_all_getters() {
+        let mut store = store("edges-target");
+        store
+            .upsert_nodes(&[
+                node("function:src", "src", "e.rs"),
+                node("function:dst", "dst", "e.rs"),
+            ])
+            .unwrap();
+        store
+            .insert_edges(&[
+                edge("function:src", "function:dst", EdgeKind::Calls),
+                edge("function:src", "function:dst", EdgeKind::References),
+            ])
+            .unwrap();
+
+        let incoming = store
+            .edges_by_target_kind("function:dst", Some(EdgeKind::Calls))
+            .unwrap();
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].kind, EdgeKind::Calls);
+        let all_incoming = store.edges_by_target_kind("function:dst", None).unwrap();
+        assert_eq!(all_incoming.len(), 2);
+        let all_outgoing = store.edges_by_source_kind("function:src", None).unwrap();
+        assert_eq!(all_outgoing.len(), 2);
+
+        assert_eq!(store.all_nodes().unwrap().len(), 2);
+        assert_eq!(store.all_edges().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn insert_edges_empty_is_noop() {
+        let mut store = store("edges-empty");
+        store.insert_edges(&[]).unwrap();
+        assert_eq!(store.all_edges().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn file_records_delete_and_aggregations() {
+        let mut store = store("files-agg");
+        store.upsert_file(&file("src/a.rs")).unwrap();
+        let mut py = file("src/b.py");
+        py.language = Language::Python;
+        store.upsert_file(&py).unwrap();
+        store
+            .upsert_nodes(&[node("function:a", "a", "src/a.rs")])
+            .unwrap();
+
+        let files = store.all_files().unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "src/a.rs");
+
+        let by_lang = store.file_counts_by_language().unwrap();
+        assert!(by_lang.contains(&("rust".to_string(), 1)));
+        assert!(by_lang.contains(&("python".to_string(), 1)));
+
+        let by_kind = store.node_counts_by_kind().unwrap();
+        assert_eq!(by_kind, vec![("function".to_string(), 1)]);
+
+        store.delete_file_record("src/a.rs").unwrap();
+        assert_eq!(store.file_by_path("src/a.rs").unwrap(), None);
+        assert_eq!(store.node_count_by_file_path("src/a.rs").unwrap(), 0);
+        assert_eq!(store.all_files().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unresolved_ref_batch_and_multi_key_reads() {
+        let mut store = store("unresolved-batch");
+        store
+            .upsert_nodes(&[
+                node("function:src1", "src1", "a.rs"),
+                node("function:src2", "src2", "b.rs"),
+            ])
+            .unwrap();
+        let mk = |from: &str, name: &str, file: &str, lang: Language| UnresolvedRef {
+            id: None,
+            from_node_id: from.to_string(),
+            reference_name: name.to_string(),
+            reference_kind: EdgeKind::References,
+            line: 1,
+            col: 0,
+            candidates: None,
+            file_path: file.to_string(),
+            language: lang,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+        store
+            .insert_unresolved_refs(&[
+                mk("function:src1", "Target", "a.rs", Language::Rust),
+                mk("function:src2", "Other", "b.rs", Language::Rust),
+            ])
+            .unwrap();
+
+        assert_eq!(store.unresolved_refs_count().unwrap(), 2);
+
+        let first = store.unresolved_refs_batch(0, 1).unwrap();
+        assert_eq!(first.len(), 1);
+        let after = store
+            .unresolved_refs_batch(first[0].id.unwrap(), 10)
+            .unwrap();
+        assert_eq!(after.len(), 1);
+
+        assert!(store.unresolved_refs_by_files(&[]).unwrap().is_empty());
+        assert!(store.unresolved_refs_by_names(&[]).unwrap().is_empty());
+        let by_files = store
+            .unresolved_refs_by_files(&["a.rs".to_string(), "b.rs".to_string(), "a.rs".to_string()])
+            .unwrap();
+        assert_eq!(by_files.len(), 2);
+        let by_names = store
+            .unresolved_refs_by_names(&["Target".to_string()])
+            .unwrap();
+        assert_eq!(by_names.len(), 1);
+        assert_eq!(by_names[0].reference_name, "Target");
+    }
+
+    #[test]
+    fn function_ref_flag_round_trips_through_unresolved_refs() {
+        let mut store = store("fn-ref");
+        store
+            .upsert_nodes(&[node("function:src", "src", "a.rs")])
+            .unwrap();
+        let unresolved = UnresolvedRef {
+            id: None,
+            from_node_id: "function:src".to_string(),
+            reference_name: "callback".to_string(),
+            reference_kind: EdgeKind::References,
+            line: 1,
+            col: 0,
+            candidates: None,
+            file_path: "a.rs".to_string(),
+            language: Language::Rust,
+            is_function_ref: true,
+            reference_subkind: Some(ReferenceSubkind::Autoload),
+        };
+        store
+            .insert_unresolved_refs(std::slice::from_ref(&unresolved))
+            .unwrap();
+        let read = store.all_unresolved_refs().unwrap();
+        assert_eq!(read.len(), 1);
+        assert!(read[0].is_function_ref);
+        assert_eq!(read[0].reference_kind, EdgeKind::References);
+        assert_eq!(read[0].reference_subkind, Some(ReferenceSubkind::Autoload));
+    }
+
+    #[test]
+    fn insert_unresolved_refs_empty_is_noop() {
+        let mut store = store("unresolved-empty");
+        store.insert_unresolved_refs(&[]).unwrap();
+        assert_eq!(store.unresolved_refs_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn delete_resolved_refs_precise_and_bounded() {
+        let mut store = store("delete-resolved");
+        store
+            .upsert_nodes(&[node("function:src", "src", "a.rs")])
+            .unwrap();
+        let mk = |name: &str| UnresolvedRef {
+            id: None,
+            from_node_id: "function:src".to_string(),
+            reference_name: name.to_string(),
+            reference_kind: EdgeKind::Calls,
+            line: 1,
+            col: 0,
+            candidates: None,
+            file_path: "a.rs".to_string(),
+            language: Language::Rust,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+        store
+            .insert_unresolved_refs(&[mk("Alpha"), mk("Beta"), mk("Gamma")])
+            .unwrap();
+        assert_eq!(store.unresolved_refs_count().unwrap(), 3);
+
+        store.delete_resolved_unresolved_refs(&[]).unwrap();
+        store
+            .delete_resolved_unresolved_refs_up_to(&[], 100)
+            .unwrap();
+        assert_eq!(store.unresolved_refs_count().unwrap(), 3);
+
+        store
+            .delete_resolved_unresolved_refs(&[(
+                "function:src".to_string(),
+                "Alpha".to_string(),
+                EdgeKind::Calls,
+            )])
+            .unwrap();
+        assert_eq!(store.unresolved_refs_count().unwrap(), 2);
+
+        let rows = store.all_unresolved_refs().unwrap();
+        let max_id = rows.iter().map(|r| r.id.unwrap()).min().unwrap();
+        store
+            .delete_resolved_unresolved_refs_up_to(
+                &[(
+                    "function:src".to_string(),
+                    "Beta".to_string(),
+                    EdgeKind::Calls,
+                )],
+                max_id,
+            )
+            .unwrap();
+        assert!(store.unresolved_refs_count().unwrap() <= 2);
+    }
+
+    #[test]
+    fn dependency_and_dependent_file_paths_cross_file_only() {
+        let mut store = store("file-deps");
+        store
+            .upsert_nodes(&[
+                node("function:caller", "caller", "a.rs"),
+                node("function:callee", "callee", "b.rs"),
+                node("function:local", "local", "a.rs"),
+            ])
+            .unwrap();
+        store
+            .insert_edges(&[
+                edge("function:caller", "function:callee", EdgeKind::Calls),
+                edge("function:caller", "function:local", EdgeKind::Contains),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            store.dependent_file_paths("b.rs").unwrap(),
+            vec!["a.rs".to_string()]
+        );
+        assert_eq!(
+            store.dependency_file_paths("a.rs").unwrap(),
+            vec!["b.rs".to_string()]
+        );
+        assert!(store.dependent_file_paths("a.rs").unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_resolved_edges_and_named_target_sources() {
+        let mut store = store("resolved-edges");
+        store
+            .upsert_nodes(&[
+                node("function:caller", "caller", "a.rs"),
+                node("function:callee", "callee", "b.rs"),
+            ])
+            .unwrap();
+        store
+            .insert_edges(&[
+                edge("function:caller", "function:callee", EdgeKind::Calls),
+                edge("function:caller", "function:callee", EdgeKind::Contains),
+            ])
+            .unwrap();
+
+        assert!(
+            store
+                .source_files_of_edges_to_named_targets(&[])
+                .unwrap()
+                .is_empty()
+        );
+        let sources = store
+            .source_files_of_edges_to_named_targets(&["callee".to_string()])
+            .unwrap();
+        assert_eq!(sources, vec!["a.rs".to_string()]);
+
+        let removed = store.delete_resolved_edges_from_file("a.rs").unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(store.all_edges().unwrap().len(), 1);
+        assert_eq!(store.all_edges().unwrap()[0].kind, EdgeKind::Contains);
+    }
+
+    #[test]
+    fn counts_reflects_nodes_edges_files() {
+        let mut store = store("counts");
+        store.upsert_file(&file("a.rs")).unwrap();
+        store
+            .upsert_nodes(&[
+                node("function:a", "a", "a.rs"),
+                node("function:b", "b", "a.rs"),
+            ])
+            .unwrap();
+        store
+            .insert_edges(&[edge("function:a", "function:b", EdgeKind::Calls)])
+            .unwrap();
+        let counts = store.counts().unwrap();
+        assert_eq!(counts.node_count, 2);
+        assert_eq!(counts.edge_count, 1);
+        assert_eq!(counts.file_count, 1);
+    }
+
+    #[test]
+    fn compact_and_bulk_pragmas_preserve_content() {
+        let mut store = store("compact");
+        store
+            .upsert_nodes(&[node("function:a", "a", "a.rs")])
+            .unwrap();
+        store.set_bulk_index_pragmas().unwrap();
+        store.restore_default_pragmas().unwrap();
+        store.compact().unwrap();
+        assert_eq!(store.counts().unwrap().node_count, 1);
+    }
+
+    #[test]
+    fn upsert_node_updates_existing_row_in_place() {
+        let mut store = store("upsert-update");
+        let mut n = node("function:u", "before", "u.rs");
+        store.upsert_nodes(std::slice::from_ref(&n)).unwrap();
+        n.name = "after".to_string();
+        n.qualified_name = "u.rs::after".to_string();
+        n.return_type = Some("i32".to_string());
+        store.upsert_nodes(std::slice::from_ref(&n)).unwrap();
+        assert_eq!(store.counts().unwrap().node_count, 1);
+        let read = store.node_by_id("function:u").unwrap().unwrap();
+        assert_eq!(read.name, "after");
+        assert_eq!(read.return_type, Some("i32".to_string()));
+    }
+
+    #[test]
+    fn delete_nodes_by_file_path_removes_all_file_nodes() {
+        let mut store = store("delete-by-file");
+        store
+            .upsert_nodes(&[
+                node("function:a", "a", "x.rs"),
+                node("function:b", "b", "x.rs"),
+                node("function:c", "c", "y.rs"),
+            ])
+            .unwrap();
+        let removed = store.delete_nodes_by_file_path("x.rs").unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(store.node_count_by_file_path("x.rs").unwrap(), 0);
+        assert_eq!(store.node_count_by_file_path("y.rs").unwrap(), 1);
+    }
+
+    #[test]
+    fn node_by_id_missing_returns_none() {
+        let store = store("missing-node");
+        assert_eq!(store.node_by_id("nope").unwrap(), None);
     }
 }

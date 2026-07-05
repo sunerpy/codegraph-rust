@@ -35,10 +35,10 @@ where
             state.original_ppid, state.current_ppid
         ));
     }
-    if let Some(host_pid) = state.host_pid {
-        if !is_alive(host_pid) {
-            return Some(format!("host pid {host_pid} exited"));
-        }
+    if let Some(host_pid) = state.host_pid
+        && !is_alive(host_pid)
+    {
+        return Some(format!("host pid {host_pid} exited"));
     }
     None
 }
@@ -80,6 +80,20 @@ pub fn is_process_alive(pid: u32) -> bool {
     )
 }
 
+/// Send a graceful termination request to `pid` (SIGTERM on unix). Returns true
+/// when the signal was delivered. Used by `codegraph http stop` to stop a
+/// background HTTP MCP server by its recorded pid.
+#[cfg(unix)]
+pub fn terminate_pid(pid: u32) -> bool {
+    let Ok(raw) = i32::try_from(pid) else {
+        return false;
+    };
+    let Some(pid) = rustix::process::Pid::from_raw(raw) else {
+        return false;
+    };
+    rustix::process::kill_process(pid, rustix::process::Signal::Term).is_ok()
+}
+
 // Windows has no stable getppid; returning 0 makes the ppid-divergence branch
 // inert (it is `#[cfg(unix)]`-gated anyway — see `supervision_lost_reason`).
 #[cfg(windows)]
@@ -90,7 +104,7 @@ pub fn current_ppid() -> u32 {
 #[cfg(windows)]
 pub fn is_process_alive(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, ERROR_ACCESS_DENIED, FALSE, STILL_ACTIVE,
+        CloseHandle, ERROR_ACCESS_DENIED, FALSE, GetLastError, STILL_ACTIVE,
     };
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -113,6 +127,30 @@ pub fn is_process_alive(pid: u32) -> bool {
         let got = GetExitCodeProcess(handle, &mut code);
         CloseHandle(handle);
         got != FALSE && code == STILL_ACTIVE as u32
+    }
+}
+
+/// Send a termination request to `pid` (Windows: `TerminateProcess`). Returns
+/// true when the request was issued. Windows analog of the unix SIGTERM path
+/// used by `codegraph http stop`.
+#[cfg(windows)]
+pub fn terminate_pid(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, FALSE};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: OpenProcess/TerminateProcess/CloseHandle are FFI calls with no
+    // Rust-side aliasing. A null handle means the open failed (nothing to kill).
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+        if handle == 0 {
+            return false;
+        }
+        let ok = TerminateProcess(handle, 1);
+        CloseHandle(handle);
+        ok != FALSE
     }
 }
 
@@ -180,5 +218,35 @@ mod tests {
             supervision_lost_reason(&state, |pid| pid != 20),
             Some("host pid 20 exited".to_string())
         );
+    }
+
+    #[test]
+    fn is_process_alive_true_for_self_false_for_zero_and_absent() {
+        assert!(is_process_alive(std::process::id()));
+        assert!(!is_process_alive(0));
+        assert!(!is_process_alive(4_000_000_000));
+    }
+
+    #[test]
+    fn terminate_pid_rejects_zero_and_absent_pids() {
+        assert!(!terminate_pid(0));
+        assert!(!terminate_pid(4_000_000_000));
+    }
+
+    #[test]
+    fn is_session_leader_and_current_ppid_do_not_panic() {
+        let _ = is_session_leader();
+        let _ = current_ppid();
+    }
+
+    #[test]
+    fn supervision_returns_none_when_supervisor_intact() {
+        let state = SupervisionState {
+            original_ppid: 10,
+            current_ppid: 10,
+            host_pid: Some(20),
+            session_leader: false,
+        };
+        assert_eq!(supervision_lost_reason(&state, |_| true), None);
     }
 }

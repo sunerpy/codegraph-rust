@@ -330,4 +330,118 @@ max_file_size = 2097152
         assert!(cfg.watch.enabled);
         assert_eq!(cfg.watch.debounce_ms, 2000);
     }
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-config-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn from_path_reads_and_parses_a_toml_file() {
+        let dir = temp_dir("from-path");
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[app]\nname = \"disk-project\"\nlog_level = \"warn\"\n",
+        )
+        .unwrap();
+
+        let cfg = Config::from_path(&path).expect("from_path parses");
+        assert_eq!(cfg.app.name, "disk-project");
+        assert_eq!(cfg.app.log_level, "warn");
+        assert_eq!(cfg.indexing.max_file_size, default_max_file_size());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_path_errors_on_missing_and_malformed_files() {
+        let missing = Config::from_path("/tmp/cg-config-does-not-exist.toml");
+        assert!(missing.is_err());
+
+        let dir = temp_dir("malformed");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "this is not = valid toml [[[").unwrap();
+        assert!(Config::from_path(&path).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discover_prefers_explicit_cli_path() {
+        let dir = temp_dir("cli-path");
+        let path = dir.join("explicit.toml");
+        std::fs::write(&path, "[app]\nname = \"explicit\"\nlog_level = \"error\"\n").unwrap();
+
+        let cfg = Config::discover(Some(&path), Path::new("/tmp/ignored")).expect("discover");
+        assert_eq!(cfg.app.name, "explicit");
+        assert_eq!(cfg.app.log_level, "error");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discover_reads_project_root_codegraph_config() {
+        let project = temp_dir("project-root");
+        let cfg_dir = project.join(".codegraph");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            "[app]\nname = \"rooted\"\nlog_level = \"debug\"\n",
+        )
+        .unwrap();
+
+        let cfg = Config::discover(None, &project).expect("discover project config");
+        assert_eq!(cfg.app.name, "rooted");
+        assert_eq!(cfg.app.log_level, "debug");
+
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn indexing_config_default_carries_ignore_dirs_and_empty_exclude() {
+        let indexing = IndexingConfig::default();
+        assert_eq!(indexing.max_file_size, default_max_file_size());
+        assert!(indexing.ignore_dirs.contains(&"node_modules".to_string()));
+        assert!(indexing.ignore_dirs.contains(&"target".to_string()));
+        assert!(indexing.exclude.is_empty());
+
+        let watch = WatchConfig::default();
+        assert!(watch.enabled);
+        assert_eq!(watch.debounce_ms, default_watch_debounce_ms());
+    }
+    #[test]
+    fn init_and_get_config_share_the_global_singleton() {
+        let dir = std::env::temp_dir().join(format!(
+            "codegraph-config-init-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cg = dir.join(".codegraph");
+        std::fs::create_dir_all(&cg).unwrap();
+        std::fs::write(
+            cg.join("config.toml"),
+            "[app]\nname = \"global-singleton\"\n",
+        )
+        .unwrap();
+        let first = init_config(None, &dir).expect("first init succeeds");
+        assert_eq!(first.app.name, "global-singleton");
+        assert_eq!(get_config().app.name, "global-singleton");
+        assert!(
+            init_config(None, &dir).is_err(),
+            "a second init must fail (already initialized)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

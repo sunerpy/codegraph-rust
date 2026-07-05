@@ -99,12 +99,12 @@ fn indexed_project(label: &str) -> (TestDir, PathBuf) {
 /// Spawn the detached daemon with a SHORT sweep + idle window so the test is
 /// fast. `Command` snapshots env at spawn time, so the daemon inherits these.
 fn spawn_sweep_daemon(project: &Path) {
-    std::env::set_var("CODEGRAPH_DAEMON_CLIENT_SWEEP_MS", "200");
-    std::env::set_var("CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS", "500");
-    std::env::set_var("CODEGRAPH_WATCH_DEBOUNCE_MS", "100");
-    spawn_detached_daemon(&bin(), project).expect("spawn_detached_daemon");
-    std::env::remove_var("CODEGRAPH_DAEMON_CLIENT_SWEEP_MS");
-    std::env::remove_var("CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS");
+    unsafe { std::env::set_var("CODEGRAPH_DAEMON_CLIENT_SWEEP_MS", "200") };
+    unsafe { std::env::set_var("CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS", "500") };
+    unsafe { std::env::set_var("CODEGRAPH_WATCH_DEBOUNCE_MS", "100") };
+    spawn_detached_daemon(&bin(), project, false).expect("spawn_detached_daemon");
+    unsafe { std::env::remove_var("CODEGRAPH_DAEMON_CLIENT_SWEEP_MS") };
+    unsafe { std::env::remove_var("CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS") };
 }
 
 fn open_stream(socket: &Path) -> Option<Stream> {
@@ -149,10 +149,10 @@ fn read_pid_from_hello(socket: &Path) -> Option<u32> {
 fn poll_for_daemon_pid(socket: &Path, timeout: Duration) -> Option<u32> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if socket.exists() {
-            if let Some(pid) = read_pid_from_hello(socket) {
-                return Some(pid);
-            }
+        if socket.exists()
+            && let Some(pid) = read_pid_from_hello(socket)
+        {
+            return Some(pid);
         }
         std::thread::sleep(Duration::from_millis(25));
     }

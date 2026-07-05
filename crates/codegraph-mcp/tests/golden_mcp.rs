@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use codegraph_mcp::McpServer;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -108,19 +108,17 @@ fn roundtrip(project: &Path, mut request: Value) -> Value {
     if let Some(args) = request
         .get_mut("params")
         .and_then(|p| p.get_mut("arguments"))
+        && let Some(obj) = args.as_object_mut()
+        && obj.contains_key("projectPath")
     {
-        if let Some(obj) = args.as_object_mut() {
-            if obj.contains_key("projectPath") {
-                obj.insert("projectPath".to_string(), json!(project.to_str().unwrap()));
-            }
-        }
+        obj.insert("projectPath".to_string(), json!(project.to_str().unwrap()));
     }
     let frame = serde_json::to_string(&request).unwrap();
     let input = format!("{frame}\n");
     let mut output = Vec::new();
     let mut server = McpServer::new(Some(project.to_path_buf()));
     server
-        .run(Cursor::new(input.into_bytes()), &mut output)
+        .run_until_adoption(Cursor::new(input.into_bytes()), &mut output)
         .expect("server run");
     let text = String::from_utf8(output).expect("utf8 output");
     let line = text.lines().next().expect("one response line");
@@ -172,12 +170,12 @@ fn assert_tool_result_structural(golden: &Value, actual: &Value, ctx: &str) {
 /// For an explore `#### <file> — sym1, sym2, …` header, sort the symbol list so
 /// the header's internal symbol ordering is a documented text-formatting diff.
 fn normalize_header_line(line: String) -> String {
-    if let Some((head, syms)) = line.split_once(" — ") {
-        if head.starts_with("#### ") {
-            let mut parts: Vec<&str> = syms.split(", ").collect();
-            parts.sort_unstable();
-            return format!("{head} — {}", parts.join(", "));
-        }
+    if let Some((head, syms)) = line.split_once(" — ")
+        && head.starts_with("#### ")
+    {
+        let mut parts: Vec<&str> = syms.split(", ").collect();
+        parts.sort_unstable();
+        return format!("{head} — {}", parts.join(", "));
     }
     line
 }
@@ -317,7 +315,7 @@ fn default_project_indexed_serves_full_tools_list_after_initialize() {
     let mut output = Vec::new();
     let mut server = McpServer::new(Some(project.path().to_path_buf()));
     server
-        .run(Cursor::new(frames.into_bytes()), &mut output)
+        .run_until_adoption(Cursor::new(frames.into_bytes()), &mut output)
         .expect("server run");
     let text = String::from_utf8(output).expect("utf8 output");
     let tools_line = text.lines().nth(1).expect("tools/list response line");
@@ -360,7 +358,7 @@ fn default_project_unindexed_serves_tools_with_required_project_path() {
     let mut output = Vec::new();
     let mut server = McpServer::new(Some(base.clone()));
     server
-        .run(
+        .run_until_adoption(
             Cursor::new(
                 format!(
                     "{}\n",
@@ -416,7 +414,7 @@ fn no_default_project_exposes_tools_with_required_project_path() {
             .unwrap(),
     );
     server
-        .run(Cursor::new(frames.into_bytes()), &mut output)
+        .run_until_adoption(Cursor::new(frames.into_bytes()), &mut output)
         .expect("server run");
     let text = String::from_utf8(output).expect("utf8 output");
     let tools_line = text.lines().nth(1).expect("tools/list response line");
@@ -439,6 +437,105 @@ fn no_default_project_exposes_tools_with_required_project_path() {
             tool["name"]
         );
     }
+}
+
+#[test]
+fn zed_bare_serve_adopts_roots_and_resolves_tool_call() {
+    // GIVEN a bare `serve --mcp` (no --path) launched from an UNINDEXED cwd —
+    // the Zed case: the cwd-derived default is Some(cwd) but has no index.
+    // WHEN the client advertises `capabilities.roots`, later reports an INDEXED
+    // workspace via roots/list, then calls a tool with NO projectPath —
+    // THEN the server adopts the indexed root and the tool call resolves against
+    // it with a NON-EMPTY, non-error result.
+    let _env = lock_env();
+    let indexed = setup_mini_project();
+    let unindexed_cwd = std::env::temp_dir().join(format!(
+        "cg-mcp-zed-cwd-{}-{}",
+        std::process::id(),
+        TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&unindexed_cwd).unwrap();
+    let _cwd_guard = TestProject {
+        path: unindexed_cwd.clone(),
+    };
+
+    let mut server =
+        McpServer::new_with_cwd(Some(unindexed_cwd.clone()), Some(unindexed_cwd.clone()));
+
+    let init = serde_json::to_string(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "capabilities": { "roots": { "listChanged": true } } }
+    }))
+    .unwrap();
+    let mut init_out = Vec::new();
+    server
+        .run_until_adoption(Cursor::new(format!("{init}\n").into_bytes()), &mut init_out)
+        .expect("initialize run");
+    let init_lines: Vec<Value> = String::from_utf8(init_out)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(
+        init_lines.len(),
+        2,
+        "initialize must also request roots/list"
+    );
+    assert_eq!(init_lines[1]["method"], json!("roots/list"));
+
+    let roots_response = serde_json::to_string(&json!({
+        "jsonrpc": "2.0",
+        "id": "codegraph-roots-list-1",
+        "result": { "roots": [
+            { "uri": format!("file://{}", indexed.path().display()), "name": "proj" }
+        ] }
+    }))
+    .unwrap();
+    let mut roots_out = Vec::new();
+    server
+        .run_until_adoption(
+            Cursor::new(format!("{roots_response}\n").into_bytes()),
+            &mut roots_out,
+        )
+        .expect("roots/list response run");
+    assert!(roots_out.is_empty(), "a JSON-RPC response yields no reply");
+    assert_eq!(
+        server.default_project(),
+        Some(indexed.path()),
+        "the indexed workspace root must be adopted as the default project"
+    );
+
+    let call = serde_json::to_string(&json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": { "name": "codegraph_search", "arguments": { "query": "add" } }
+    }))
+    .unwrap();
+    let mut call_out = Vec::new();
+    server
+        .run_until_adoption(Cursor::new(format!("{call}\n").into_bytes()), &mut call_out)
+        .expect("tools/call run");
+    let call_resp: Value =
+        serde_json::from_str(String::from_utf8(call_out).unwrap().lines().next().unwrap()).unwrap();
+    let text = call_resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("tool content text");
+    assert_ne!(
+        call_resp["result"]["isError"],
+        json!(true),
+        "adopted-root tool call must not error: {text}"
+    );
+    assert!(
+        !text.contains("No indexed project resolved"),
+        "must not fall through to the no-project error: {text}"
+    );
+    assert!(
+        text.contains("add"),
+        "search against the adopted indexed root must return results: {text}"
+    );
 }
 
 #[test]

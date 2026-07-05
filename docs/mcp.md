@@ -41,7 +41,115 @@ regardless of cwd (e.g.
 `"args": ["serve", "--mcp", "-p", "/abs/path/to/project"]`).
 
 Supported agents: Claude Code, Cursor, Codex CLI, opencode, Hermes Agent,
-Gemini CLI, Antigravity IDE, Kiro.
+Gemini CLI, Antigravity IDE, Kiro, Trae, Qoder, Zed.
+
+---
+
+## Zed — `context_servers` config
+
+Zed uses a different MCP config shape than other agents. Instead of `mcpServers`,
+it uses a `context_servers` key, and the entry has **no `type` field**:
+
+```jsonc
+{
+  "context_servers": {
+    "codegraph": {
+      "command": "codegraph",
+      "args": ["serve", "--mcp"],
+      "env": {},
+    },
+  },
+}
+```
+
+**Global vs. project-level path constraint.** Zed's global user settings
+(`~/.config/zed/settings.json` on Linux and macOS; `%APPDATA%\Zed\settings.json`
+on Windows) cannot inject a per-project `--path` — there is no `${workspaceFolder}`
+expansion in Zed's `context_servers` args. A global entry therefore runs
+read-only off whatever index the working directory resolves to.
+
+To pin a project's server to an absolute path and get live per-project indexing,
+run `codegraph init --target=zed` inside the project. This writes a
+**project-level** `.zed/settings.json` with the absolute `--path` baked in:
+
+```jsonc
+{
+  "context_servers": {
+    "codegraph": {
+      "command": "codegraph",
+      "args": ["serve", "--mcp", "--path", "/absolute/path/to/project"],
+      "env": {},
+    },
+  },
+}
+```
+
+This is the **only** way to give Zed a per-project path. Without it the server
+falls back to home safe mode if Zed's CWD cannot find an indexed project via
+find-up.
+
+Run `codegraph install --target=zed` to write the bare global entry, or
+`codegraph init --target=zed` inside a project to write the project-level entry.
+
+### Zed over SSH (remote development)
+
+**Symptom.** You open a remote SSH project in Zed (Zed UI on your local machine,
+code and `.codegraph/` index on a remote Linux host). All codegraph MCP tools
+return empty — "No relevant code found" — even after the index built successfully.
+
+**Root cause.** Zed currently executes `context_servers` entries on the **local
+machine**, not on the remote host. This is true even when a remote SSH project is
+open: the `command: "codegraph"` runs locally, cannot reach the remote
+`.codegraph/` index, and returns nothing. Native remote MCP execution — running
+the server on the remote host — is not yet implemented in Zed (tracked in Zed's
+GitHub issues; status as of mid-2026).
+
+**Working workaround.** Make Zed's local `command` be `ssh` into the remote host
+and run codegraph there. SSH proxies stdin/stdout transparently, so the MCP
+JSON-RPC stream flows through the tunnel without any change to the codegraph
+binary itself.
+
+In your project's `.zed/settings.json` on the **local** machine:
+
+```jsonc
+{
+  "context_servers": {
+    "codegraph": {
+      "command": "ssh",
+      "args": [
+        "-T",
+        "<your-ssh-host-alias>",
+        "cd /abs/path/to/project && /abs/path/to/codegraph serve --mcp --path /abs/path/to/project",
+      ],
+      "env": {},
+    },
+  },
+}
+```
+
+**Why each part matters:**
+
+- `command: "ssh"` — runs on the local machine (satisfying Zed's
+  "MCP runs locally" constraint) while the actual codegraph process runs on the
+  remote host and reads the remote index.
+- `-T` — disables PTY allocation. Without it, SSH allocates a pseudo-terminal
+  whose control sequences corrupt the MCP JSON-RPC byte stream.
+- `<your-ssh-host-alias>` — use the host alias from your local `~/.ssh/config`
+  (e.g. `code-server`). An alias lets you keep key/port/ProxyJump options out of
+  this config and reuse an existing entry.
+- Absolute path to codegraph — a non-login SSH shell may not source
+  `~/.cargo/env`, so `~/.cargo/bin` is often absent from `PATH`. Use the full
+  path to the binary (e.g. `/config/.cargo/bin/codegraph` or wherever you
+  installed it on the remote host).
+- `--path /abs/path/to/project` — pins the server to the right project
+  explicitly, so resolution never depends on the remote cwd or the MCP roots
+  handshake over the tunnel.
+
+**Caveats.** Each Zed window opens a fresh SSH session (the shared daemon is not
+reused across them), so startup is slightly slower than a local connection. The
+remote codegraph daemon does still run for the duration of that session and serves
+queries normally. This is a bridge solution until Zed ships native remote MCP
+support.
 
 ---
 

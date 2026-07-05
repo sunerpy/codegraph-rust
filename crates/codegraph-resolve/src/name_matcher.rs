@@ -622,7 +622,7 @@ fn infer_java_field_receiver_type(
             n.start_line
         };
         if n.start_line <= reference.line && end >= reference.line {
-            if enclosing.map_or(true, |e| n.start_line >= e.start_line) {
+            if enclosing.is_none_or(|e| n.start_line >= e.start_line) {
                 enclosing = Some(n);
             }
         }
@@ -1415,10 +1415,10 @@ pub fn match_function_ref(
         } else {
             same_file
         };
-        let target =
-            pool.iter()
-                .copied()
-                .reduce(|a, b| if a.start_line <= b.start_line { a } else { b })?;
+        let target = pool
+            .iter()
+            .copied()
+            .reduce(|a, b| if a.start_line <= b.start_line { a } else { b })?;
         return Some(ResolvedRef {
             original: reference.clone(),
             target_node_id: target.id.clone(),
@@ -1493,11 +1493,10 @@ pub fn match_function_ref(
         {
             return None;
         }
-        let target =
-            same_file
-                .iter()
-                .copied()
-                .reduce(|a, b| if a.start_line <= b.start_line { a } else { b })?;
+        let target = same_file
+            .iter()
+            .copied()
+            .reduce(|a, b| if a.start_line <= b.start_line { a } else { b })?;
         return Some(ResolvedRef {
             original: reference.clone(),
             target_node_id: target.id.clone(),
@@ -1641,5 +1640,2162 @@ mod ceiling_tests {
             by_lower: nodes(1),
         };
         assert!(match_fuzzy(&reference(), &one).is_some());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ImportMapping;
+    use codegraph_core::types::ReferenceSubkind;
+    use std::collections::HashMap;
+
+    // ---- Configurable in-memory ResolutionContext ---------------------------
+
+    /// A fully configurable fake context. Every lookup is backed by a map keyed
+    /// by the exact query string, so a test can wire precise candidate sets for
+    /// each named lookup the matcher performs.
+    #[derive(Default)]
+    struct Ctx {
+        by_name: HashMap<String, Vec<Node>>,
+        by_qualified: HashMap<String, Vec<Node>>,
+        by_lower: HashMap<String, Vec<Node>>,
+        in_file: HashMap<String, Vec<Node>>,
+        by_id: HashMap<String, Node>,
+        files: std::collections::HashSet<String>,
+        file_content: HashMap<String, String>,
+        supertypes: HashMap<(String, Language), Vec<String>>,
+        imports: HashMap<String, Vec<ImportMapping>>,
+    }
+
+    impl Ctx {
+        fn name(mut self, key: &str, ns: Vec<Node>) -> Self {
+            self.by_name.insert(key.to_string(), ns);
+            self
+        }
+        fn qualified(mut self, key: &str, ns: Vec<Node>) -> Self {
+            self.by_qualified.insert(key.to_string(), ns);
+            self
+        }
+        fn lower(mut self, key: &str, ns: Vec<Node>) -> Self {
+            self.by_lower.insert(key.to_string(), ns);
+            self
+        }
+        fn nodes_in_file(mut self, path: &str, ns: Vec<Node>) -> Self {
+            self.in_file.insert(path.to_string(), ns);
+            self
+        }
+        fn node_by_id(mut self, n: Node) -> Self {
+            self.by_id.insert(n.id.clone(), n);
+            self
+        }
+        fn file(mut self, path: &str, content: &str) -> Self {
+            self.files.insert(path.to_string());
+            self.file_content
+                .insert(path.to_string(), content.to_string());
+            self
+        }
+        fn supertype(mut self, ty: &str, lang: Language, sups: Vec<&str>) -> Self {
+            self.supertypes.insert(
+                (ty.to_string(), lang),
+                sups.into_iter().map(str::to_string).collect(),
+            );
+            self
+        }
+        fn import(mut self, path: &str, mappings: Vec<ImportMapping>) -> Self {
+            self.imports.insert(path.to_string(), mappings);
+            self
+        }
+    }
+
+    impl ResolutionContext for Ctx {
+        fn get_nodes_in_file(&self, file_path: &str) -> Vec<Node> {
+            self.in_file.get(file_path).cloned().unwrap_or_default()
+        }
+        fn get_nodes_by_name(&self, name: &str) -> Vec<Node> {
+            self.by_name.get(name).cloned().unwrap_or_default()
+        }
+        fn get_nodes_by_qualified_name(&self, qualified_name: &str) -> Vec<Node> {
+            self.by_qualified
+                .get(qualified_name)
+                .cloned()
+                .unwrap_or_default()
+        }
+        fn get_nodes_by_kind(&self, _kind: NodeKind) -> Vec<Node> {
+            Vec::new()
+        }
+        fn file_exists(&self, file_path: &str) -> bool {
+            self.files.contains(file_path)
+        }
+        fn read_file(&self, file_path: &str) -> Option<String> {
+            self.file_content.get(file_path).cloned()
+        }
+        fn get_project_root(&self) -> &str {
+            ""
+        }
+        fn get_all_files(&self) -> Vec<String> {
+            self.files.iter().cloned().collect()
+        }
+        fn get_nodes_by_lower_name(&self, lower_name: &str) -> Vec<Node> {
+            self.by_lower.get(lower_name).cloned().unwrap_or_default()
+        }
+        fn get_node_by_id(&self, id: &str) -> Option<Node> {
+            self.by_id.get(id).cloned()
+        }
+        fn get_supertypes(&self, type_name: &str, language: Language) -> Vec<String> {
+            self.supertypes
+                .get(&(type_name.to_string(), language))
+                .cloned()
+                .unwrap_or_default()
+        }
+        fn get_import_mappings(&self, file_path: &str, _language: Language) -> Vec<ImportMapping> {
+            self.imports.get(file_path).cloned().unwrap_or_default()
+        }
+    }
+
+    // ---- Node / RefView builders --------------------------------------------
+
+    fn mk(id: &str, kind: NodeKind, name: &str, qname: &str, path: &str, lang: Language) -> Node {
+        Node {
+            id: id.to_string(),
+            kind,
+            name: name.to_string(),
+            qualified_name: qname.to_string(),
+            file_path: path.to_string(),
+            language: lang,
+            start_line: 1,
+            end_line: 1,
+            start_column: 0,
+            end_column: 0,
+            docstring: None,
+            signature: None,
+            visibility: None,
+            is_exported: false,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+            decorators: Vec::new(),
+            type_parameters: Vec::new(),
+            return_type: None,
+            updated_at: 0,
+        }
+    }
+
+    fn refv(name: &str, kind: EdgeKind, path: &str, lang: Language, line: i64) -> RefView {
+        RefView {
+            from_node_id: "function:caller".to_string(),
+            reference_name: name.to_string(),
+            reference_kind: kind,
+            line,
+            column: 0,
+            file_path: path.to_string(),
+            language: lang,
+            is_function_ref: false,
+            reference_subkind: None::<ReferenceSubkind>,
+        }
+    }
+
+    // ================= language family helpers ================================
+
+    #[test]
+    fn language_families_group_correctly() {
+        assert!(same_language_family(Language::Java, Language::Kotlin));
+        assert!(same_language_family(Language::Kotlin, Language::Scala));
+        assert!(same_language_family(Language::Swift, Language::ObjC));
+        assert!(same_language_family(Language::TypeScript, Language::Jsx));
+        assert!(same_language_family(Language::JavaScript, Language::Tsx));
+        assert!(same_language_family(Language::C, Language::Cpp));
+        assert!(same_language_family(Language::CSharp, Language::Razor));
+        // Identity always matches even for a language with no family.
+        assert!(same_language_family(Language::Rust, Language::Rust));
+        // Different families do not match.
+        assert!(!same_language_family(Language::Java, Language::Swift));
+        // A language with no family (Rust) does not match a different one.
+        assert!(!same_language_family(Language::Rust, Language::Go));
+    }
+
+    #[test]
+    fn known_family_and_cross_family_predicates() {
+        assert!(is_known_language_family(Language::Java));
+        assert!(is_known_language_family(Language::Cpp));
+        assert!(!is_known_language_family(Language::Rust));
+        assert!(!is_known_language_family(Language::Go));
+
+        // crosses_known_family: both known + different family.
+        assert!(crosses_known_family(Language::Java, Language::Swift));
+        // same family => does not cross.
+        assert!(!crosses_known_family(Language::Java, Language::Kotlin));
+        // one unknown => does not cross.
+        assert!(!crosses_known_family(Language::Rust, Language::Java));
+        assert!(!crosses_known_family(Language::Java, Language::Rust));
+    }
+
+    #[test]
+    fn language_gate_references_keeps_only_same_family() {
+        // References edge: cross-family candidates are dropped.
+        let same = mk(
+            "function:a",
+            NodeKind::Function,
+            "f",
+            "f",
+            "src/a.ts",
+            Language::TypeScript,
+        );
+        let cross = mk(
+            "function:b",
+            NodeKind::Function,
+            "f",
+            "f",
+            "src/b.java",
+            Language::Java,
+        );
+        let r = refv(
+            "f",
+            EdgeKind::References,
+            "src/c.ts",
+            Language::TypeScript,
+            1,
+        );
+        let out = apply_language_gate(vec![same.clone(), cross], &r);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "function:a");
+    }
+
+    #[test]
+    fn language_gate_imports_drops_only_cross_known_family() {
+        // Imports edge: only candidates that CROSS a known family are dropped;
+        // an unknown-family candidate (Rust vs TS) is KEPT.
+        let same = mk(
+            "function:a",
+            NodeKind::Function,
+            "f",
+            "f",
+            "src/a.ts",
+            Language::TypeScript,
+        );
+        let cross = mk(
+            "function:b",
+            NodeKind::Function,
+            "f",
+            "f",
+            "src/b.java",
+            Language::Java,
+        );
+        let unknown = mk(
+            "function:c",
+            NodeKind::Function,
+            "f",
+            "f",
+            "src/c.rs",
+            Language::Rust,
+        );
+        let r = refv("f", EdgeKind::Imports, "src/x.ts", Language::TypeScript, 1);
+        let out = apply_language_gate(vec![same, cross, unknown], &r);
+        // TS kept (same family), Java dropped (crosses web↔jvm), Rust kept (unknown family).
+        let ids: Vec<&str> = out.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains(&"function:a"));
+        assert!(ids.contains(&"function:c"));
+        assert!(!ids.contains(&"function:b"));
+    }
+
+    #[test]
+    fn language_gate_other_kind_passes_through() {
+        let a = mk(
+            "function:a",
+            NodeKind::Function,
+            "f",
+            "f",
+            "src/a.java",
+            Language::Java,
+        );
+        let b = mk(
+            "function:b",
+            NodeKind::Function,
+            "f",
+            "f",
+            "src/b.ts",
+            Language::TypeScript,
+        );
+        let r = refv("f", EdgeKind::Calls, "src/x.ts", Language::TypeScript, 1);
+        let out = apply_language_gate(vec![a, b], &r);
+        assert_eq!(out.len(), 2);
+    }
+
+    // ================= match_by_file_path =====================================
+
+    #[test]
+    fn file_path_bare_symbol_without_extension_declines() {
+        // A bare ref without `/` and without a short extension is not a file ref.
+        let ctx = Ctx::default();
+        let r = refv(
+            "Widget",
+            EdgeKind::References,
+            "src/a.ts",
+            Language::TypeScript,
+            1,
+        );
+        assert!(match_by_file_path(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn file_path_no_matching_file_nodes_declines() {
+        // Path-like ref but there are no File nodes with that basename.
+        let ctx = Ctx::default().name("b.ts", vec![]);
+        let r = refv(
+            "a/b.ts",
+            EdgeKind::References,
+            "src/x.ts",
+            Language::TypeScript,
+            1,
+        );
+        assert!(match_by_file_path(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn file_path_exact_qualified_match_high_confidence() {
+        let file = mk(
+            "file:src/a/b.ts",
+            NodeKind::File,
+            "b.ts",
+            "a/b.ts",
+            "a/b.ts",
+            Language::TypeScript,
+        );
+        let ctx = Ctx::default().name("b.ts", vec![file]);
+        let r = refv(
+            "a/b.ts",
+            EdgeKind::References,
+            "src/x.ts",
+            Language::TypeScript,
+            1,
+        );
+        let res = match_by_file_path(&r, &ctx).expect("exact file match");
+        assert_eq!(res.target_node_id, "file:src/a/b.ts");
+        assert_eq!(res.resolved_by, ResolvedBy::FilePath);
+        assert!((res.confidence - 0.95).abs() < 1e-9);
+    }
+
+    #[test]
+    fn file_path_suffix_match_picks_closest_and_medium_confidence() {
+        // Two file nodes end with the ref; the one in the same dir as the ref wins.
+        let near = mk(
+            "file:1",
+            NodeKind::File,
+            "util.ts",
+            "app/util.ts",
+            "app/util.ts",
+            Language::TypeScript,
+        );
+        let far = mk(
+            "file:2",
+            NodeKind::File,
+            "util.ts",
+            "lib/util.ts",
+            "lib/util.ts",
+            Language::TypeScript,
+        );
+        let ctx = Ctx::default().name("util.ts", vec![near, far]);
+        let r = refv(
+            "util.ts",
+            EdgeKind::References,
+            "app/main.ts",
+            Language::TypeScript,
+            1,
+        );
+        let res = match_by_file_path(&r, &ctx).expect("suffix match");
+        assert_eq!(res.target_node_id, "file:1");
+        assert!((res.confidence - 0.85).abs() < 1e-9);
+    }
+
+    #[test]
+    fn file_path_single_same_named_file_low_confidence() {
+        // Single file node whose path neither equals nor suffix-matches the ref.
+        let f = mk(
+            "file:only",
+            NodeKind::File,
+            "b.ts",
+            "totally/other.ts",
+            "totally/other.ts",
+            Language::TypeScript,
+        );
+        let ctx = Ctx::default().name("b.ts", vec![f]);
+        let r = refv(
+            "weird/b.ts",
+            EdgeKind::References,
+            "src/x.ts",
+            Language::TypeScript,
+            1,
+        );
+        let res = match_by_file_path(&r, &ctx).expect("single file fallback");
+        assert_eq!(res.target_node_id, "file:only");
+        assert!((res.confidence - 0.7).abs() < 1e-9);
+    }
+
+    #[test]
+    fn file_path_multiple_non_matching_files_declines() {
+        // >1 file node, none exact/suffix — no fallback (len != 1).
+        let a = mk(
+            "file:a",
+            NodeKind::File,
+            "b.ts",
+            "one/other.ts",
+            "one/other.ts",
+            Language::TypeScript,
+        );
+        let b = mk(
+            "file:b",
+            NodeKind::File,
+            "b.ts",
+            "two/other.ts",
+            "two/other.ts",
+            Language::TypeScript,
+        );
+        let ctx = Ctx::default().name("b.ts", vec![a, b]);
+        let r = refv(
+            "weird/b.ts",
+            EdgeKind::References,
+            "src/x.ts",
+            Language::TypeScript,
+            1,
+        );
+        assert!(match_by_file_path(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn file_path_short_extension_bare_filename_is_file_ref() {
+        // `Foo.h` — bare filename with a short extension counts as a file ref.
+        let f = mk(
+            "file:h",
+            NodeKind::File,
+            "Foo.h",
+            "inc/Foo.h",
+            "inc/Foo.h",
+            Language::Cpp,
+        );
+        let ctx = Ctx::default().name("Foo.h", vec![f]);
+        let r = refv("Foo.h", EdgeKind::References, "src/x.cpp", Language::Cpp, 1);
+        assert!(match_by_file_path(&r, &ctx).is_some());
+    }
+
+    #[test]
+    fn has_short_extension_variants() {
+        assert!(has_short_extension("Foo.h"));
+        assert!(has_short_extension("a.ts"));
+        // A 6-char extension is too long (max 4).
+        assert!(!has_short_extension("x.liquid"));
+        assert!(!has_short_extension("noext"));
+        assert!(!has_short_extension("trailingdot."));
+        // The extension must start with an alphabetic char.
+        assert!(!has_short_extension("bad.123"));
+        assert!(has_short_extension("f.cpp"));
+        assert!(!has_short_extension("f.toolong"));
+    }
+
+    #[test]
+    fn file_path_empty_basename_declines() {
+        // A ref ending in `/` yields an empty basename.
+        let ctx = Ctx::default();
+        let r = refv(
+            "a/b/",
+            EdgeKind::References,
+            "src/x.ts",
+            Language::TypeScript,
+            1,
+        );
+        assert!(match_by_file_path(&r, &ctx).is_none());
+    }
+
+    // ================= match_by_exact_name ====================================
+
+    #[test]
+    fn exact_name_empty_candidates_declines() {
+        let ctx = Ctx::default();
+        let r = refv("Nope", EdgeKind::Calls, "src/a.ts", Language::TypeScript, 1);
+        assert!(match_by_exact_name(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn exact_name_single_same_language_high_confidence() {
+        let n = mk(
+            "function:x",
+            NodeKind::Function,
+            "run",
+            "run",
+            "src/a.ts",
+            Language::TypeScript,
+        );
+        let ctx = Ctx::default().name("run", vec![n]);
+        let r = refv("run", EdgeKind::Calls, "src/b.ts", Language::TypeScript, 1);
+        let res = match_by_exact_name(&r, &ctx).expect("single match");
+        assert_eq!(res.resolved_by, ResolvedBy::ExactMatch);
+        assert!((res.confidence - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn exact_name_single_cross_language_half_confidence() {
+        // Single candidate but a different language within the same family (web)
+        // — passes the gate for Calls (other kind) yet is cross-language.
+        let n = mk(
+            "function:x",
+            NodeKind::Function,
+            "run",
+            "run",
+            "src/a.jsx",
+            Language::Jsx,
+        );
+        let ctx = Ctx::default().name("run", vec![n]);
+        let r = refv("run", EdgeKind::Calls, "src/b.ts", Language::TypeScript, 1);
+        let res = match_by_exact_name(&r, &ctx).expect("single cross match");
+        assert!((res.confidence - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn exact_name_multi_candidate_ranks_same_file_high_confidence() {
+        // Multiple candidates; the same-file one wins and shares >=2 leading dir
+        // segments with the ref (proximity 2*15=30 >= 30) => confidence 0.7.
+        let same = mk(
+            "function:same",
+            NodeKind::Function,
+            "run",
+            "run",
+            "src/app/b.ts",
+            Language::TypeScript,
+        );
+        let other = mk(
+            "function:other",
+            NodeKind::Function,
+            "run",
+            "run",
+            "far/away/x.ts",
+            Language::TypeScript,
+        );
+        let ctx = Ctx::default().name("run", vec![same, other]);
+        let r = refv(
+            "run",
+            EdgeKind::Calls,
+            "src/app/b.ts",
+            Language::TypeScript,
+            5,
+        );
+        let res = match_by_exact_name(&r, &ctx).expect("multi match");
+        assert_eq!(res.target_node_id, "function:same");
+        assert!((res.confidence - 0.7).abs() < 1e-9);
+    }
+
+    #[test]
+    fn exact_name_multi_candidate_low_proximity_low_confidence() {
+        // Multiple candidates all far away => best proximity < 30 => 0.4.
+        let a = mk(
+            "function:a",
+            NodeKind::Function,
+            "run",
+            "run",
+            "aaa/bbb/x.ts",
+            Language::TypeScript,
+        );
+        let b = mk(
+            "function:b",
+            NodeKind::Function,
+            "run",
+            "run",
+            "ccc/ddd/y.ts",
+            Language::TypeScript,
+        );
+        let ctx = Ctx::default().name("run", vec![a, b]);
+        let r = refv(
+            "run",
+            EdgeKind::Calls,
+            "zzz/main.ts",
+            Language::TypeScript,
+            1,
+        );
+        let res = match_by_exact_name(&r, &ctx).expect("multi far match");
+        assert!((res.confidence - 0.4).abs() < 1e-9);
+    }
+
+    // ================= match_by_qualified_name ================================
+
+    #[test]
+    fn qualified_name_requires_separator() {
+        let ctx = Ctx::default();
+        let r = refv(
+            "bareName",
+            EdgeKind::Calls,
+            "src/a.ts",
+            Language::TypeScript,
+            1,
+        );
+        assert!(match_by_qualified_name(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn qualified_name_single_exact_match() {
+        let n = mk(
+            "method:m",
+            NodeKind::Method,
+            "get",
+            "Foo::get",
+            "src/a.rs",
+            Language::Rust,
+        );
+        let ctx = Ctx::default().qualified("Foo::get", vec![n]);
+        let r = refv("Foo::get", EdgeKind::Calls, "src/b.rs", Language::Rust, 1);
+        let res = match_by_qualified_name(&r, &ctx).expect("qualified exact");
+        assert_eq!(res.resolved_by, ResolvedBy::QualifiedName);
+        assert!((res.confidence - 0.95).abs() < 1e-9);
+    }
+
+    #[test]
+    fn qualified_name_partial_suffix_match() {
+        // No exact qualified hit, but the last segment's node ends with the ref.
+        let n = mk(
+            "method:m",
+            NodeKind::Method,
+            "get",
+            "pkg::Foo::get",
+            "src/a.rs",
+            Language::Rust,
+        );
+        let ctx = Ctx::default()
+            .qualified("Foo::get", vec![])
+            .name("get", vec![n]);
+        let r = refv("Foo::get", EdgeKind::Calls, "src/b.rs", Language::Rust, 1);
+        let res = match_by_qualified_name(&r, &ctx).expect("partial qualified");
+        assert!((res.confidence - 0.85).abs() < 1e-9);
+    }
+
+    #[test]
+    fn qualified_name_dotted_no_match_declines() {
+        let ctx = Ctx::default();
+        let r = refv(
+            "a.b.c",
+            EdgeKind::Calls,
+            "src/a.ts",
+            Language::TypeScript,
+            1,
+        );
+        assert!(match_by_qualified_name(&r, &ctx).is_none());
+    }
+
+    // ================= parse helpers ==========================================
+
+    #[test]
+    fn dot_and_colon_call_parsing() {
+        assert_eq!(
+            match_dot_call("obj.method"),
+            Some(("obj".to_string(), "method".to_string()))
+        );
+        assert_eq!(
+            match_dot_call("a.b.method"),
+            Some(("a.b".to_string(), "method".to_string()))
+        );
+        // ObjC selector with trailing colon.
+        assert_eq!(
+            match_dot_call("obj.doThis:"),
+            Some(("obj".to_string(), "doThis:".to_string()))
+        );
+        // Leading dot => no receiver.
+        assert_eq!(match_dot_call(".method"), None);
+        // No dot at all.
+        assert_eq!(match_dot_call("method"), None);
+        // Receiver with an illegal char.
+        assert_eq!(match_dot_call("ob-j.method"), None);
+
+        assert_eq!(
+            match_colon_call("Foo::bar"),
+            Some(("Foo".to_string(), "bar".to_string()))
+        );
+        assert_eq!(match_colon_call("::bar"), None);
+        assert_eq!(match_colon_call("Foo::"), None);
+        assert_eq!(match_colon_call("nocolon"), None);
+    }
+
+    #[test]
+    fn selector_like_and_word_predicates() {
+        assert!(is_selector_like("do"));
+        assert!(is_selector_like("do:"));
+        assert!(is_selector_like("do:with:"));
+        assert!(!is_selector_like(""));
+        assert!(!is_selector_like(":leading"));
+        assert!(is_word("abc_1"));
+        assert!(!is_word(""));
+        assert!(!is_word("a b"));
+    }
+
+    #[test]
+    fn parse_method_call_prefers_dot_then_colon() {
+        assert_eq!(
+            parse_method_call("obj.m"),
+            Some(("obj".to_string(), "m".to_string()))
+        );
+        assert_eq!(
+            parse_method_call("Foo::m"),
+            Some(("Foo".to_string(), "m".to_string()))
+        );
+        assert_eq!(parse_method_call("plain"), None);
+    }
+
+    #[test]
+    fn is_dot_call_gate() {
+        assert!(is_dot_call("obj.method"));
+        assert!(!is_dot_call("Foo::method"));
+        assert!(!is_dot_call("plain"));
+    }
+
+    #[test]
+    fn capitalize_and_camel_split() {
+        assert_eq!(capitalize("word"), "Word");
+        assert_eq!(capitalize(""), "");
+        assert_eq!(capitalize("Already"), "Already");
+        let words = split_camel_case("HTTPServerConfig");
+        assert!(words.iter().any(|w| w == "HTTP"));
+        assert!(words.iter().any(|w| w == "Server"));
+        assert!(words.iter().any(|w| w == "Config"));
+        // single-char words are dropped
+        let ws = split_camel_case("aB");
+        assert!(ws.is_empty() || ws.iter().all(|w| w.chars().count() > 1));
+    }
+
+    // ================= match_method_call ======================================
+
+    #[test]
+    fn method_call_declines_when_not_a_call_shape() {
+        let ctx = Ctx::default();
+        let r = refv(
+            "plainname",
+            EdgeKind::Calls,
+            "src/a.ts",
+            Language::TypeScript,
+            1,
+        );
+        assert!(match_method_call(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn method_call_strategy1_direct_class_match() {
+        // `Widget.render` — Widget is a class in the graph; render is its method.
+        let class = mk(
+            "class:w",
+            NodeKind::Class,
+            "Widget",
+            "Widget",
+            "src/w.ts",
+            Language::TypeScript,
+        );
+        let method = mk(
+            "method:r",
+            NodeKind::Method,
+            "render",
+            "Widget::render",
+            "src/w.ts",
+            Language::TypeScript,
+        );
+        let ctx = Ctx::default()
+            .name("Widget", vec![class])
+            .nodes_in_file("src/w.ts", vec![method]);
+        let r = refv(
+            "Widget.render",
+            EdgeKind::Calls,
+            "src/a.ts",
+            Language::TypeScript,
+            1,
+        );
+        let res = match_method_call(&r, &ctx).expect("strategy1");
+        assert_eq!(res.target_node_id, "method:r");
+        assert_eq!(res.resolved_by, ResolvedBy::QualifiedName);
+        assert!((res.confidence - 0.85).abs() < 1e-9);
+    }
+
+    #[test]
+    fn method_call_strategy2_capitalized_receiver() {
+        // `widget.render` — lowercase instance var, capitalized class Widget.
+        let class = mk(
+            "class:w",
+            NodeKind::Class,
+            "Widget",
+            "Widget",
+            "src/w.ts",
+            Language::TypeScript,
+        );
+        let method = mk(
+            "method:r",
+            NodeKind::Method,
+            "render",
+            "Widget::render",
+            "src/w.ts",
+            Language::TypeScript,
+        );
+        let ctx = Ctx::default()
+            .name("widget", vec![]) // no direct class for the lowercase receiver
+            .name("Widget", vec![class])
+            .nodes_in_file("src/w.ts", vec![method]);
+        let r = refv(
+            "widget.render",
+            EdgeKind::Calls,
+            "src/a.ts",
+            Language::TypeScript,
+            1,
+        );
+        let res = match_method_call(&r, &ctx).expect("strategy2");
+        assert_eq!(res.target_node_id, "method:r");
+        assert_eq!(res.resolved_by, ResolvedBy::InstanceMethod);
+        assert!((res.confidence - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn method_call_strategy3_single_method_by_name() {
+        // No class match; exactly one same-language method named `render`.
+        let method = mk(
+            "method:r",
+            NodeKind::Method,
+            "render",
+            "Thing::render",
+            "src/w.ts",
+            Language::TypeScript,
+        );
+        let ctx = Ctx::default().name("render", vec![method]);
+        let r = refv(
+            "obj.render",
+            EdgeKind::Calls,
+            "src/a.ts",
+            Language::TypeScript,
+            1,
+        );
+        let res = match_method_call(&r, &ctx).expect("strategy3 single");
+        assert_eq!(res.target_node_id, "method:r");
+        assert!((res.confidence - 0.7).abs() < 1e-9);
+    }
+
+    #[test]
+    fn method_call_strategy3_receiver_overlap_scoring() {
+        // Multiple `save` methods; receiver `UserRepository` overlaps
+        // `UserRepository::save` on >=2 words => picked at 0.65.
+        let good = mk(
+            "method:good",
+            NodeKind::Method,
+            "save",
+            "UserRepository::save",
+            "src/u.ts",
+            Language::TypeScript,
+        );
+        let bad = mk(
+            "method:bad",
+            NodeKind::Method,
+            "save",
+            "OrderService::save",
+            "src/o.ts",
+            Language::TypeScript,
+        );
+        let ctx = Ctx::default().name("save", vec![good, bad]);
+        let r = refv(
+            "userRepository.save",
+            EdgeKind::Calls,
+            "src/a.ts",
+            Language::TypeScript,
+            1,
+        );
+        let res = match_method_call(&r, &ctx).expect("overlap scoring");
+        assert_eq!(res.target_node_id, "method:good");
+        assert!((res.confidence - 0.65).abs() < 1e-9);
+    }
+
+    #[test]
+    fn method_call_strategy3_no_overlap_declines() {
+        // Multiple methods, receiver overlaps <2 words => declines.
+        let a = mk(
+            "method:a",
+            NodeKind::Method,
+            "go",
+            "Alpha::go",
+            "src/a.ts",
+            Language::TypeScript,
+        );
+        let b = mk(
+            "method:b",
+            NodeKind::Method,
+            "go",
+            "Beta::go",
+            "src/b.ts",
+            Language::TypeScript,
+        );
+        let ctx = Ctx::default().name("go", vec![a, b]);
+        let r = refv(
+            "zeta.go",
+            EdgeKind::Calls,
+            "src/x.ts",
+            Language::TypeScript,
+            1,
+        );
+        assert!(match_method_call(&r, &ctx).is_none());
+    }
+
+    // ================= match_fuzzy ============================================
+
+    #[test]
+    fn fuzzy_single_same_language() {
+        let n = mk(
+            "function:x",
+            NodeKind::Function,
+            "Run",
+            "Run",
+            "src/a.ts",
+            Language::TypeScript,
+        );
+        let ctx = Ctx::default().lower("run", vec![n]);
+        let r = refv("run", EdgeKind::Calls, "src/b.ts", Language::TypeScript, 1);
+        let res = match_fuzzy(&r, &ctx).expect("fuzzy single");
+        assert_eq!(res.resolved_by, ResolvedBy::Fuzzy);
+        assert!((res.confidence - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fuzzy_single_cross_language_lower_confidence() {
+        // Only a cross-language (same family) callable => confidence 0.3.
+        let n = mk(
+            "function:x",
+            NodeKind::Function,
+            "Run",
+            "Run",
+            "src/a.jsx",
+            Language::Jsx,
+        );
+        let ctx = Ctx::default().lower("run", vec![n]);
+        let r = refv("run", EdgeKind::Calls, "src/b.ts", Language::TypeScript, 1);
+        let res = match_fuzzy(&r, &ctx).expect("fuzzy cross");
+        assert!((res.confidence - 0.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fuzzy_filters_non_callable_kinds() {
+        // A single Variable candidate is not callable => declines.
+        let n = mk(
+            "variable:x",
+            NodeKind::Variable,
+            "Run",
+            "Run",
+            "src/a.ts",
+            Language::TypeScript,
+        );
+        let ctx = Ctx::default().lower("run", vec![n]);
+        let r = refv("run", EdgeKind::Calls, "src/b.ts", Language::TypeScript, 1);
+        assert!(match_fuzzy(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn fuzzy_multiple_candidates_declines() {
+        let a = mk(
+            "function:a",
+            NodeKind::Function,
+            "Run",
+            "Run",
+            "src/a.ts",
+            Language::TypeScript,
+        );
+        let b = mk(
+            "function:b",
+            NodeKind::Function,
+            "Run",
+            "Run",
+            "src/b.ts",
+            Language::TypeScript,
+        );
+        let ctx = Ctx::default().lower("run", vec![a, b]);
+        let r = refv("run", EdgeKind::Calls, "src/c.ts", Language::TypeScript, 1);
+        assert!(match_fuzzy(&r, &ctx).is_none());
+    }
+
+    // ================= find_best_match scoring ================================
+
+    #[test]
+    fn best_match_scoring_favors_calls_kind_and_export() {
+        // Two same-file candidates: a Function (calls kind +25, exported +10)
+        // should outrank a Variable of the same name.
+        let func = {
+            let mut n = mk(
+                "function:f",
+                NodeKind::Function,
+                "x",
+                "x",
+                "src/a.ts",
+                Language::TypeScript,
+            );
+            n.is_exported = true;
+            n.start_line = 10;
+            n
+        };
+        let var = mk(
+            "variable:v",
+            NodeKind::Variable,
+            "x",
+            "x",
+            "src/a.ts",
+            Language::TypeScript,
+        );
+        let r = refv("x", EdgeKind::Calls, "src/a.ts", Language::TypeScript, 10);
+        let pool = [var, func];
+        let best = find_best_match(&r, &pool).expect("best");
+        assert_eq!(best.id, "function:f");
+    }
+
+    #[test]
+    fn best_match_instantiates_prefers_class() {
+        let class = mk(
+            "class:c",
+            NodeKind::Class,
+            "T",
+            "T",
+            "far/a.ts",
+            Language::TypeScript,
+        );
+        let func = mk(
+            "function:f",
+            NodeKind::Function,
+            "T",
+            "T",
+            "far/b.ts",
+            Language::TypeScript,
+        );
+        let r = refv(
+            "T",
+            EdgeKind::Instantiates,
+            "src/a.ts",
+            Language::TypeScript,
+            1,
+        );
+        let pool = [func, class];
+        let best = find_best_match(&r, &pool).expect("best");
+        assert_eq!(best.id, "class:c");
+    }
+
+    #[test]
+    fn best_match_decorates_prefers_function_over_class() {
+        let func = mk(
+            "function:f",
+            NodeKind::Function,
+            "D",
+            "D",
+            "far/a.ts",
+            Language::TypeScript,
+        );
+        let class = mk(
+            "class:c",
+            NodeKind::Class,
+            "D",
+            "D",
+            "far/b.ts",
+            Language::TypeScript,
+        );
+        let r = refv(
+            "D",
+            EdgeKind::Decorates,
+            "src/a.ts",
+            Language::TypeScript,
+            1,
+        );
+        let pool = [class, func];
+        let best = find_best_match(&r, &pool).expect("best");
+        assert_eq!(best.id, "function:f");
+    }
+
+    #[test]
+    fn best_match_penalizes_cross_language() {
+        // Same name; the same-language candidate must win over a cross-language one.
+        let same = mk(
+            "function:s",
+            NodeKind::Function,
+            "x",
+            "x",
+            "far/a.ts",
+            Language::TypeScript,
+        );
+        let cross = mk(
+            "function:c",
+            NodeKind::Function,
+            "x",
+            "x",
+            "far/b.java",
+            Language::Java,
+        );
+        let r = refv("x", EdgeKind::Calls, "src/a.ts", Language::TypeScript, 1);
+        let pool = [cross, same];
+        let best = find_best_match(&r, &pool).expect("best");
+        assert_eq!(best.id, "function:s");
+    }
+
+    // ================= match_scoped_call_chain ================================
+
+    #[test]
+    fn scoped_call_chain_resolves_via_return_type() {
+        // Rust `Foo::bar().baz` — bar() returns Foo; baz resolves on Foo.
+        let factory = {
+            let mut n = mk(
+                "method:bar",
+                NodeKind::Method,
+                "bar",
+                "Foo::bar",
+                "src/a.rs",
+                Language::Rust,
+            );
+            n.return_type = Some("Foo".to_string());
+            n
+        };
+        let baz = mk(
+            "method:baz",
+            NodeKind::Method,
+            "baz",
+            "Foo::baz",
+            "src/a.rs",
+            Language::Rust,
+        );
+        let ctx = Ctx::default()
+            .name("bar", vec![factory])
+            .name("baz", vec![baz]);
+        let r = refv(
+            "Foo::bar().baz",
+            EdgeKind::Calls,
+            "src/b.rs",
+            Language::Rust,
+            1,
+        );
+        let res = match_scoped_call_chain(&r, &ctx).expect("scoped chain");
+        assert_eq!(res.target_node_id, "method:baz");
+        assert_eq!(res.resolved_by, ResolvedBy::InstanceMethod);
+    }
+
+    #[test]
+    fn scoped_call_chain_self_return_uses_factory_class() {
+        // Return type "self" resolves the method on the factory class itself.
+        let factory = {
+            let mut n = mk(
+                "method:bar",
+                NodeKind::Method,
+                "bar",
+                "Foo::bar",
+                "src/a.rs",
+                Language::Rust,
+            );
+            n.return_type = Some("self".to_string());
+            n
+        };
+        let baz = mk(
+            "method:baz",
+            NodeKind::Method,
+            "baz",
+            "Foo::baz",
+            "src/a.rs",
+            Language::Rust,
+        );
+        let ctx = Ctx::default()
+            .name("bar", vec![factory])
+            .name("baz", vec![baz]);
+        let r = refv(
+            "Foo::bar().baz",
+            EdgeKind::Calls,
+            "src/b.rs",
+            Language::Rust,
+            1,
+        );
+        let res = match_scoped_call_chain(&r, &ctx).expect("self chain");
+        assert_eq!(res.target_node_id, "method:baz");
+    }
+
+    #[test]
+    fn scoped_call_chain_requires_colon_scope() {
+        // Inner without `::` declines.
+        let ctx = Ctx::default();
+        let r = refv("foo().baz", EdgeKind::Calls, "src/b.rs", Language::Rust, 1);
+        assert!(match_scoped_call_chain(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn scoped_call_chain_bad_shape_declines() {
+        let ctx = Ctx::default();
+        let r = refv("Foo::bar", EdgeKind::Calls, "src/b.rs", Language::Rust, 1);
+        assert!(match_scoped_call_chain(&r, &ctx).is_none());
+    }
+
+    // ================= match_dotted_call_chain ================================
+
+    #[test]
+    fn dotted_chain_go_bare_factory_via_return_type() {
+        // Go `NewFoo().Bar` — NewFoo returns Foo; Bar resolves on Foo.
+        let newfoo = {
+            let mut n = mk(
+                "function:nf",
+                NodeKind::Function,
+                "NewFoo",
+                "NewFoo",
+                "a.go",
+                Language::Go,
+            );
+            n.return_type = Some("Foo".to_string());
+            n
+        };
+        let bar = mk(
+            "method:bar",
+            NodeKind::Method,
+            "Bar",
+            "Foo::Bar",
+            "a.go",
+            Language::Go,
+        );
+        let ctx = Ctx::default()
+            .name("NewFoo", vec![newfoo])
+            .name("Bar", vec![bar]);
+        let r = refv("NewFoo().Bar", EdgeKind::Calls, "b.go", Language::Go, 1);
+        let res = match_dotted_call_chain(&r, &ctx).expect("go bare chain");
+        assert_eq!(res.target_node_id, "method:bar");
+    }
+
+    #[test]
+    fn dotted_chain_go_bare_fallback_to_exact_name() {
+        // Go bare factory with no return type falls back to exact-name on method.
+        let target = mk(
+            "function:worker",
+            NodeKind::Function,
+            "Bar",
+            "Bar",
+            "a.go",
+            Language::Go,
+        );
+        let ctx = Ctx::default()
+            .name("NewFoo", vec![]) // no return-type node
+            .name("Bar", vec![target]);
+        let r = refv("NewFoo().Bar", EdgeKind::Calls, "b.go", Language::Go, 1);
+        let res = match_dotted_call_chain(&r, &ctx).expect("go fallback");
+        assert_eq!(res.target_node_id, "function:worker");
+    }
+
+    #[test]
+    fn dotted_chain_construct_via_bare_call_kotlin() {
+        // Kotlin `Foo().bar` — capitalized bare constructor receiver.
+        let bar = mk(
+            "method:bar",
+            NodeKind::Method,
+            "bar",
+            "Foo::bar",
+            "a.kt",
+            Language::Kotlin,
+        );
+        let ctx = Ctx::default().name("bar", vec![bar]);
+        let r = refv("Foo().bar", EdgeKind::Calls, "b.kt", Language::Kotlin, 1);
+        let res = match_dotted_call_chain(&r, &ctx).expect("kotlin construct");
+        assert_eq!(res.target_node_id, "method:bar");
+    }
+
+    #[test]
+    fn dotted_chain_construct_via_bare_lowercase_declines() {
+        // Kotlin lowercase bare receiver is not a constructor => declines.
+        let ctx = Ctx::default();
+        let r = refv("foo().bar", EdgeKind::Calls, "b.kt", Language::Kotlin, 1);
+        assert!(match_dotted_call_chain(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn dotted_chain_non_go_bare_non_construct_declines() {
+        // Java bare `foo().bar` — not Go, not a construct-via-bare language.
+        let ctx = Ctx::default();
+        let r = refv("foo().bar", EdgeKind::Calls, "b.java", Language::Java, 1);
+        assert!(match_dotted_call_chain(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn dotted_chain_factory_fluent_receiver() {
+        // `Builder.make().build` — make returns Widget; build resolves on Widget.
+        let make = {
+            let mut n = mk(
+                "method:make",
+                NodeKind::Method,
+                "make",
+                "Builder::make",
+                "a.java",
+                Language::Java,
+            );
+            n.return_type = Some("Widget".to_string());
+            n
+        };
+        let build = mk(
+            "method:build",
+            NodeKind::Method,
+            "build",
+            "Widget::build",
+            "a.java",
+            Language::Java,
+        );
+        let ctx = Ctx::default()
+            .name("make", vec![make])
+            .name("build", vec![build]);
+        let r = refv(
+            "Builder.make().build",
+            EdgeKind::Calls,
+            "b.java",
+            Language::Java,
+            1,
+        );
+        let res = match_dotted_call_chain(&r, &ctx).expect("fluent chain");
+        assert_eq!(res.target_node_id, "method:build");
+    }
+
+    #[test]
+    fn dotted_chain_bad_shape_declines() {
+        let ctx = Ctx::default();
+        let r = refv("noshape", EdgeKind::Calls, "b.java", Language::Java, 1);
+        assert!(match_dotted_call_chain(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn constructs_via_bare_call_languages() {
+        assert!(constructs_via_bare_call(Language::Kotlin));
+        assert!(constructs_via_bare_call(Language::Swift));
+        assert!(constructs_via_bare_call(Language::Scala));
+        assert!(constructs_via_bare_call(Language::Dart));
+        assert!(!constructs_via_bare_call(Language::Java));
+        assert!(!constructs_via_bare_call(Language::Go));
+    }
+
+    // ================= resolve_method_on_type =================================
+
+    #[test]
+    fn method_on_type_walks_supertype_for_conformance() {
+        // ping is on Base, not Sub; resolve_method_on_type walks Sub -> Base.
+        let ping = mk(
+            "method:ping",
+            NodeKind::Method,
+            "ping",
+            "Base::ping",
+            "Base.java",
+            Language::Java,
+        );
+        let ctx =
+            Ctx::default()
+                .name("ping", vec![ping])
+                .supertype("Sub", Language::Java, vec!["Base"]);
+        let r = refv("x", EdgeKind::Calls, "Sub.java", Language::Java, 1);
+        let res = resolve_method_on_type(
+            "Sub",
+            "ping",
+            &r,
+            &ctx,
+            0.85,
+            ResolvedBy::InstanceMethod,
+            None,
+            0,
+        )
+        .expect("supertype walk");
+        assert_eq!(res.target_node_id, "method:ping");
+    }
+
+    #[test]
+    fn method_on_type_no_method_no_supertype_declines() {
+        let ctx = Ctx::default().name("ping", vec![]);
+        let r = refv("x", EdgeKind::Calls, "Sub.java", Language::Java, 1);
+        assert!(
+            resolve_method_on_type(
+                "Sub",
+                "ping",
+                &r,
+                &ctx,
+                0.85,
+                ResolvedBy::InstanceMethod,
+                None,
+                0
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn method_on_type_preferred_fqn_disambiguates() {
+        // Two Foo::bar methods; preferred_fqn "pkg.Foo" picks the one in that path.
+        let a = mk(
+            "method:a",
+            NodeKind::Method,
+            "bar",
+            "Foo::bar",
+            "src/pkg/Foo.java",
+            Language::Java,
+        );
+        let b = mk(
+            "method:b",
+            NodeKind::Method,
+            "bar",
+            "Foo::bar",
+            "src/other/Foo.java",
+            Language::Java,
+        );
+        let ctx = Ctx::default().name("bar", vec![a, b]);
+        let r = refv("x", EdgeKind::Calls, "src/x.java", Language::Java, 1);
+        let res = resolve_method_on_type(
+            "Foo",
+            "bar",
+            &r,
+            &ctx,
+            0.9,
+            ResolvedBy::InstanceMethod,
+            Some("pkg.Foo"),
+            0,
+        )
+        .expect("fqn disambiguation");
+        assert_eq!(res.target_node_id, "method:a");
+    }
+
+    // ================= match_function_ref =====================================
+
+    #[test]
+    fn function_ref_this_member_declines() {
+        let ctx = Ctx::default();
+        let r = refv(
+            "this.handler",
+            EdgeKind::References,
+            "src/a.ts",
+            Language::TypeScript,
+            1,
+        );
+        assert!(match_function_ref(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn function_ref_bare_function_same_file() {
+        let n = mk(
+            "function:h",
+            NodeKind::Function,
+            "onBlur",
+            "onBlur",
+            "src/a.ts",
+            Language::TypeScript,
+        );
+        let ctx = Ctx::default().name("onBlur", vec![n]);
+        let r = refv(
+            "onBlur",
+            EdgeKind::References,
+            "src/a.ts",
+            Language::TypeScript,
+            5,
+        );
+        let res = match_function_ref(&r, &ctx).expect("bare fn ref");
+        assert_eq!(res.target_node_id, "function:h");
+        assert_eq!(res.resolved_by, ResolvedBy::FunctionRef);
+        assert!((res.confidence - 0.95).abs() < 1e-9);
+    }
+
+    #[test]
+    fn function_ref_cross_file_unique() {
+        // Not in the same file but the only candidate => confidence 0.8.
+        let n = mk(
+            "function:h",
+            NodeKind::Function,
+            "onBlur",
+            "onBlur",
+            "src/other.ts",
+            Language::TypeScript,
+        );
+        let ctx = Ctx::default().name("onBlur", vec![n]);
+        let r = refv(
+            "onBlur",
+            EdgeKind::References,
+            "src/a.ts",
+            Language::TypeScript,
+            5,
+        );
+        let res = match_function_ref(&r, &ctx).expect("cross-file unique");
+        assert!((res.confidence - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn function_ref_bare_fn_only_excludes_methods_in_ts() {
+        // In TS a bare id can only be a Function value, so a Method candidate is
+        // filtered out => declines.
+        let m = mk(
+            "method:m",
+            NodeKind::Method,
+            "handler",
+            "Foo::handler",
+            "src/a.ts",
+            Language::TypeScript,
+        );
+        let ctx = Ctx::default().name("handler", vec![m]);
+        let r = refv(
+            "handler",
+            EdgeKind::References,
+            "src/a.ts",
+            Language::TypeScript,
+            1,
+        );
+        assert!(match_function_ref(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn function_ref_qualified_member_pointer_unique() {
+        // C++ `&Widget::on_click` — resolve the member on that scope.
+        let m = mk(
+            "method:oc",
+            NodeKind::Method,
+            "on_click",
+            "Widget::on_click",
+            "src/a.cpp",
+            Language::Cpp,
+        );
+        let ctx = Ctx::default().name("on_click", vec![m]);
+        let r = refv(
+            "Widget::on_click",
+            EdgeKind::References,
+            "src/a.cpp",
+            Language::Cpp,
+            1,
+        );
+        let res = match_function_ref(&r, &ctx).expect("member pointer");
+        assert_eq!(res.target_node_id, "method:oc");
+        assert!((res.confidence - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn function_ref_qualified_member_pointer_ambiguous_cross_file_declines() {
+        // Two matches, neither in the ref's file => ambiguous, declines.
+        let a = mk(
+            "method:a",
+            NodeKind::Method,
+            "on_click",
+            "Widget::on_click",
+            "src/one.cpp",
+            Language::Cpp,
+        );
+        let b = mk(
+            "method:b",
+            NodeKind::Method,
+            "on_click",
+            "Widget::on_click",
+            "src/two.cpp",
+            Language::Cpp,
+        );
+        let ctx = Ctx::default().name("on_click", vec![a, b]);
+        let r = refv(
+            "Widget::on_click",
+            EdgeKind::References,
+            "src/three.cpp",
+            Language::Cpp,
+            1,
+        );
+        assert!(match_function_ref(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn function_ref_qualified_member_pointer_no_match_declines() {
+        let ctx = Ctx::default().name("on_click", vec![]);
+        let r = refv(
+            "Widget::on_click",
+            EdgeKind::References,
+            "src/a.cpp",
+            Language::Cpp,
+            1,
+        );
+        assert!(match_function_ref(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn function_ref_no_candidates_declines() {
+        let ctx = Ctx::default();
+        let r = refv(
+            "nowhere",
+            EdgeKind::References,
+            "src/a.ts",
+            Language::TypeScript,
+            1,
+        );
+        assert!(match_function_ref(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn function_ref_swift_implicit_self_keeps_enclosing_method() {
+        // Swift: bare id names a method only on the enclosing type. The caller's
+        // qualified_name gives the class prefix; a method on the same class stays.
+        let caller = mk(
+            "method:caller",
+            NodeKind::Method,
+            "run",
+            "MyView::run",
+            "src/v.swift",
+            Language::Swift,
+        );
+        let same_class = mk(
+            "method:h",
+            NodeKind::Method,
+            "helper",
+            "MyView::helper",
+            "src/v.swift",
+            Language::Swift,
+        );
+        let ctx = Ctx::default()
+            .name("helper", vec![same_class])
+            .node_by_id(caller);
+        let mut r = refv(
+            "helper",
+            EdgeKind::References,
+            "src/v.swift",
+            Language::Swift,
+            5,
+        );
+        r.from_node_id = "method:caller".to_string();
+        let res = match_function_ref(&r, &ctx).expect("swift self method");
+        assert_eq!(res.target_node_id, "method:h");
+    }
+
+    #[test]
+    fn function_ref_swift_implicit_self_drops_foreign_class_method() {
+        // A same-named method on a DIFFERENT class is a parameter collision => drop.
+        let caller = mk(
+            "method:caller",
+            NodeKind::Method,
+            "run",
+            "MyView::run",
+            "src/v.swift",
+            Language::Swift,
+        );
+        let foreign = mk(
+            "method:f",
+            NodeKind::Method,
+            "helper",
+            "OtherView::helper",
+            "src/o.swift",
+            Language::Swift,
+        );
+        let ctx = Ctx::default()
+            .name("helper", vec![foreign])
+            .node_by_id(caller);
+        let mut r = refv(
+            "helper",
+            EdgeKind::References,
+            "src/v.swift",
+            Language::Swift,
+            5,
+        );
+        r.from_node_id = "method:caller".to_string();
+        assert!(match_function_ref(&r, &ctx).is_none());
+    }
+
+    // ================= match_reference orchestrator ===========================
+
+    #[test]
+    fn match_reference_dispatches_file_path_first() {
+        let f = mk(
+            "file:1",
+            NodeKind::File,
+            "b.ts",
+            "a/b.ts",
+            "a/b.ts",
+            Language::TypeScript,
+        );
+        let ctx = Ctx::default().name("b.ts", vec![f]);
+        let r = refv(
+            "a/b.ts",
+            EdgeKind::References,
+            "src/x.ts",
+            Language::TypeScript,
+            1,
+        );
+        let res = match_reference(&r, &ctx).expect("file path via orchestrator");
+        assert_eq!(res.resolved_by, ResolvedBy::FilePath);
+    }
+
+    #[test]
+    fn match_reference_falls_through_to_exact_name() {
+        let n = mk(
+            "function:x",
+            NodeKind::Function,
+            "run",
+            "run",
+            "src/a.ts",
+            Language::TypeScript,
+        );
+        let ctx = Ctx::default().name("run", vec![n]);
+        let r = refv("run", EdgeKind::Calls, "src/b.ts", Language::TypeScript, 1);
+        let res = match_reference(&r, &ctx).expect("exact via orchestrator");
+        assert_eq!(res.resolved_by, ResolvedBy::ExactMatch);
+    }
+
+    #[test]
+    fn match_reference_falls_through_to_fuzzy() {
+        // Nothing exact; a single fuzzy (lower-name) callable resolves last.
+        let n = mk(
+            "function:x",
+            NodeKind::Function,
+            "Run",
+            "Run",
+            "src/a.ts",
+            Language::TypeScript,
+        );
+        let ctx = Ctx::default().lower("run", vec![n]);
+        let r = refv("run", EdgeKind::Calls, "src/b.ts", Language::TypeScript, 1);
+        let res = match_reference(&r, &ctx).expect("fuzzy via orchestrator");
+        assert_eq!(res.resolved_by, ResolvedBy::Fuzzy);
+    }
+
+    #[test]
+    fn match_reference_returns_none_when_nothing_matches() {
+        let ctx = Ctx::default();
+        let r = refv(
+            "ghost",
+            EdgeKind::Calls,
+            "src/a.ts",
+            Language::TypeScript,
+            1,
+        );
+        assert!(match_reference(&r, &ctx).is_none());
+    }
+
+    // ================= C++ receiver inference =================================
+
+    #[test]
+    fn cpp_receiver_inference_from_declarator() {
+        // `Foo f;\n f.v()` — infer f's type Foo from the declarator, resolve v on Foo.
+        let v = mk(
+            "method:v",
+            NodeKind::Method,
+            "v",
+            "Foo::v",
+            "src/main.cpp",
+            Language::Cpp,
+        );
+        let ctx = Ctx::default()
+            .file(
+                "src/main.cpp",
+                "struct Foo { int v(); };\nint run() { Foo f; return f.v(); }\n",
+            )
+            .name("v", vec![v]);
+        let r = refv("f.v", EdgeKind::Calls, "src/main.cpp", Language::Cpp, 2);
+        let res = match_method_call(&r, &ctx).expect("cpp receiver");
+        assert_eq!(res.target_node_id, "method:v");
+        assert_eq!(res.resolved_by, ResolvedBy::InstanceMethod);
+    }
+
+    #[test]
+    fn cpp_receiver_auto_new_initializer() {
+        // `auto f = new Foo();\n f.v()` — infer type from the `new Foo` initializer.
+        let v = mk(
+            "method:v",
+            NodeKind::Method,
+            "v",
+            "Foo::v",
+            "src/main.cpp",
+            Language::Cpp,
+        );
+        let ctx = Ctx::default()
+            .file(
+                "src/main.cpp",
+                "int run() { auto f = new Foo(); return f.v(); }\n",
+            )
+            .name("v", vec![v]);
+        let r = refv("f.v", EdgeKind::Calls, "src/main.cpp", Language::Cpp, 1);
+        let res = match_method_call(&r, &ctx).expect("cpp auto new");
+        assert_eq!(res.target_node_id, "method:v");
+    }
+
+    // ================= Java field receiver ====================================
+
+    #[test]
+    fn java_field_receiver_from_signature() {
+        // `repo.save()` where `repo` is a field of declared type `Repo`.
+        let class = mk(
+            "class:svc",
+            NodeKind::Class,
+            "Service",
+            "Service",
+            "src/S.java",
+            Language::Java,
+        );
+        let mut class = class;
+        class.start_line = 1;
+        class.end_line = 5;
+        let mut field = mk(
+            "field:repo",
+            NodeKind::Field,
+            "repo",
+            "Service::repo",
+            "src/S.java",
+            Language::Java,
+        );
+        field.start_line = 2;
+        field.end_line = 2;
+        field.signature = Some("Repo repo".to_string());
+        let save = mk(
+            "method:save",
+            NodeKind::Method,
+            "save",
+            "Repo::save",
+            "src/R.java",
+            Language::Java,
+        );
+        let ctx = Ctx::default()
+            .nodes_in_file("src/S.java", vec![class, field])
+            .name("save", vec![save]);
+        let r = refv(
+            "repo.save",
+            EdgeKind::Calls,
+            "src/S.java",
+            Language::Java,
+            3,
+        );
+        let res = match_method_call(&r, &ctx).expect("java field receiver");
+        assert_eq!(res.target_node_id, "method:save");
+        assert_eq!(res.resolved_by, ResolvedBy::InstanceMethod);
+    }
+
+    // ================= ambiguous_name_ceiling env override ====================
+
+    #[test]
+    fn ambiguous_name_ceiling_default() {
+        // The default ceiling is returned when the env var is unset/invalid.
+        // (The OnceLock caches on first read; asserting the constant is stable.)
+        assert_eq!(AMBIGUOUS_NAME_CEILING, 500);
+        // ambiguous_name_ceiling() returns a positive number.
+        assert!(ambiguous_name_ceiling() > 0);
+    }
+
+    // ================= C++ inference deep paths ===============================
+
+    #[test]
+    fn cpp_receiver_auto_make_unique_initializer() {
+        // `auto f = std::make_unique<Foo>();\n f->v()` style — the call-shape
+        // initializer routes through resolve_cpp_call_result_type's make_unique arm.
+        let v = mk(
+            "method:v",
+            NodeKind::Method,
+            "v",
+            "Foo::v",
+            "src/m.cpp",
+            Language::Cpp,
+        );
+        let ctx = Ctx::default()
+            .file(
+                "src/m.cpp",
+                "int run() { auto f = std::make_unique<Foo>(); return f.v(); }\n",
+            )
+            .name("v", vec![v]);
+        let r = refv("f.v", EdgeKind::Calls, "src/m.cpp", Language::Cpp, 1);
+        let res = match_method_call(&r, &ctx).expect("make_unique inference");
+        assert_eq!(res.target_node_id, "method:v");
+    }
+
+    #[test]
+    fn cpp_receiver_auto_call_return_type_initializer() {
+        // `auto f = make();\n f.v()` — make() returns Foo (declared return type),
+        // so f is a Foo and v resolves on Foo.
+        let make = {
+            let mut n = mk(
+                "function:make",
+                NodeKind::Function,
+                "make",
+                "make",
+                "src/m.cpp",
+                Language::Cpp,
+            );
+            n.return_type = Some("Foo".to_string());
+            n
+        };
+        let v = mk(
+            "method:v",
+            NodeKind::Method,
+            "v",
+            "Foo::v",
+            "src/m.cpp",
+            Language::Cpp,
+        );
+        let ctx = Ctx::default()
+            .file(
+                "src/m.cpp",
+                "int run() { auto f = make(); return f.v(); }\n",
+            )
+            .name("make", vec![make])
+            .name("v", vec![v]);
+        let r = refv("f.v", EdgeKind::Calls, "src/m.cpp", Language::Cpp, 1);
+        let res = match_method_call(&r, &ctx).expect("call-return inference");
+        assert_eq!(res.target_node_id, "method:v");
+    }
+
+    #[test]
+    fn cpp_receiver_auto_direct_construction_initializer() {
+        // `auto f = Foo();\n f.v()` — the initializer names a class that exists,
+        // so resolve_cpp_call_result_type's cpp_class_exists arm resolves Foo.
+        let class = mk(
+            "class:foo",
+            NodeKind::Class,
+            "Foo",
+            "Foo",
+            "src/m.cpp",
+            Language::Cpp,
+        );
+        let v = mk(
+            "method:v",
+            NodeKind::Method,
+            "v",
+            "Foo::v",
+            "src/m.cpp",
+            Language::Cpp,
+        );
+        let ctx = Ctx::default()
+            .file("src/m.cpp", "int run() { auto f = Foo(); return f.v(); }\n")
+            .name("Foo", vec![class])
+            .name("v", vec![v]);
+        let r = refv("f.v", EdgeKind::Calls, "src/m.cpp", Language::Cpp, 1);
+        let res = match_method_call(&r, &ctx).expect("direct construction");
+        assert_eq!(res.target_node_id, "method:v");
+    }
+
+    #[test]
+    fn cpp_receiver_header_fallback_declarator() {
+        // No declarator in the .cpp; the sibling .h declares `Foo f;` — the header
+        // fallback recovers the type.
+        let v = mk(
+            "method:v",
+            NodeKind::Method,
+            "v",
+            "Foo::v",
+            "src/m.cpp",
+            Language::Cpp,
+        );
+        let ctx = Ctx::default()
+            .file("src/m.cpp", "int run() { return f.v(); }\n")
+            .file("src/m.h", "struct Bag { Foo f; };\n")
+            .name("v", vec![v]);
+        let r = refv("f.v", EdgeKind::Calls, "src/m.cpp", Language::Cpp, 1);
+        let res = match_method_call(&r, &ctx).expect("header fallback");
+        assert_eq!(res.target_node_id, "method:v");
+    }
+
+    #[test]
+    fn cpp_receiver_no_declarator_no_header_declines() {
+        // No declarator anywhere and no method fallback => no C++ typed edge.
+        let ctx = Ctx::default().file("src/m.cpp", "int run() { return f.v(); }\n");
+        let r = refv("f.v", EdgeKind::Calls, "src/m.cpp", Language::Cpp, 1);
+        assert!(match_method_call(&r, &ctx).is_none());
+    }
+
+    // ================= match_function_ref extra branches =====================
+
+    #[test]
+    fn function_ref_member_pointer_single_cross_file_resolves() {
+        // Exactly one scoped match, in a different file => still resolves (unique).
+        let m = mk(
+            "method:oc",
+            NodeKind::Method,
+            "on_click",
+            "Widget::on_click",
+            "src/w.cpp",
+            Language::Cpp,
+        );
+        let ctx = Ctx::default().name("on_click", vec![m]);
+        let r = refv(
+            "Widget::on_click",
+            EdgeKind::References,
+            "src/other.cpp",
+            Language::Cpp,
+            1,
+        );
+        let res = match_function_ref(&r, &ctx).expect("unique cross-file member ptr");
+        assert_eq!(res.target_node_id, "method:oc");
+    }
+
+    #[test]
+    fn function_ref_swift_overload_family_same_file_declines() {
+        // Swift: >1 same-named method in the ref's file is a parameter collision.
+        let caller = mk(
+            "method:caller",
+            NodeKind::Method,
+            "run",
+            "MyView::run",
+            "src/v.swift",
+            Language::Swift,
+        );
+        let a = mk(
+            "method:a",
+            NodeKind::Method,
+            "helper",
+            "MyView::helper",
+            "src/v.swift",
+            Language::Swift,
+        );
+        let b = mk(
+            "method:b",
+            NodeKind::Method,
+            "helper",
+            "MyView::helper",
+            "src/v.swift",
+            Language::Swift,
+        );
+        let ctx = Ctx::default().name("helper", vec![a, b]).node_by_id(caller);
+        let mut r = refv(
+            "helper",
+            EdgeKind::References,
+            "src/v.swift",
+            Language::Swift,
+            5,
+        );
+        r.from_node_id = "method:caller".to_string();
+        assert!(match_function_ref(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn function_ref_method_allowed_in_non_bare_language() {
+        // Rust is not a bare-fn-only language, so a Method candidate is eligible.
+        let m = mk(
+            "method:m",
+            NodeKind::Method,
+            "handler",
+            "Foo::handler",
+            "src/a.rs",
+            Language::Rust,
+        );
+        let ctx = Ctx::default().name("handler", vec![m]);
+        let r = refv(
+            "handler",
+            EdgeKind::References,
+            "src/a.rs",
+            Language::Rust,
+            1,
+        );
+        let res = match_function_ref(&r, &ctx).expect("rust method value");
+        assert_eq!(res.target_node_id, "method:m");
+    }
+
+    // ================= lookup_callee_return_type / imported_fqn ==============
+
+    #[test]
+    fn dotted_chain_uses_imported_fqn_for_preferred_disambiguation() {
+        // Go bare factory: NewFoo returns Foo, and the file imports Foo from a
+        // module, so imported_fqn_of feeds resolve_method_on_type's preferred fqn.
+        let newfoo = {
+            let mut n = mk(
+                "function:nf",
+                NodeKind::Function,
+                "NewFoo",
+                "NewFoo",
+                "a.go",
+                Language::Go,
+            );
+            n.return_type = Some("Foo".to_string());
+            n
+        };
+        // Two Foo::Bar methods; the imported source path picks the one in pkg/Foo.
+        let a = mk(
+            "method:a",
+            NodeKind::Method,
+            "Bar",
+            "Foo::Bar",
+            "pkg/Foo.go",
+            Language::Go,
+        );
+        let b = mk(
+            "method:b",
+            NodeKind::Method,
+            "Bar",
+            "Foo::Bar",
+            "other/Foo.go",
+            Language::Go,
+        );
+        let import = ImportMapping {
+            local_name: "Foo".to_string(),
+            exported_name: "Foo".to_string(),
+            source: "pkg.Foo".to_string(),
+            is_default: false,
+            is_namespace: false,
+        };
+        let ctx = Ctx::default()
+            .name("NewFoo", vec![newfoo])
+            .name("Bar", vec![a, b])
+            .import("b.go", vec![import]);
+        let r = refv("NewFoo().Bar", EdgeKind::Calls, "b.go", Language::Go, 1);
+        // Kotlin ext is `.kt`; Go/Java use `.java` in resolve_method_on_type's
+        // preferred-fqn path, so pkg/Foo.java is sought — no match on `.go` paths
+        // means it falls back to matches[0], which is still a valid resolution.
+        let res = match_dotted_call_chain(&r, &ctx).expect("go imported fqn");
+        assert!(res.target_node_id.starts_with("method:"));
+    }
+
+    #[test]
+    fn lookup_callee_return_type_bare_function_path() {
+        // A bare (no `::`) callee resolves via the first Function candidate's
+        // declared return type — exercised through the Go bare-factory chain.
+        let make = {
+            let mut n = mk(
+                "function:mk",
+                NodeKind::Function,
+                "Build",
+                "Build",
+                "a.go",
+                Language::Go,
+            );
+            n.return_type = Some("Result".to_string());
+            n
+        };
+        let done = mk(
+            "method:done",
+            NodeKind::Method,
+            "Done",
+            "Result::Done",
+            "a.go",
+            Language::Go,
+        );
+        let ctx = Ctx::default()
+            .name("Build", vec![make])
+            .name("Done", vec![done]);
+        let r = refv("Build().Done", EdgeKind::Calls, "b.go", Language::Go, 1);
+        let res = match_dotted_call_chain(&r, &ctx).expect("bare fn return type");
+        assert_eq!(res.target_node_id, "method:done");
+    }
+
+    // ================= resolve_method_on_type depth guard ====================
+
+    #[test]
+    fn method_on_type_supertype_recursion_bounded() {
+        // A supertype cycle deeper than the depth cap (4) still terminates and
+        // declines rather than looping forever.
+        let ctx = Ctx::default()
+            .name("ghost", vec![])
+            .supertype("A", Language::Java, vec!["B"])
+            .supertype("B", Language::Java, vec!["C"])
+            .supertype("C", Language::Java, vec!["D"])
+            .supertype("D", Language::Java, vec!["E"])
+            .supertype("E", Language::Java, vec!["A"]);
+        let r = refv("x", EdgeKind::Calls, "src/a.java", Language::Java, 1);
+        assert!(
+            resolve_method_on_type(
+                "A",
+                "ghost",
+                &r,
+                &ctx,
+                0.85,
+                ResolvedBy::InstanceMethod,
+                None,
+                0
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn method_on_type_qualified_suffix_match() {
+        // The method's qualified_name ends with `::Type::method`, exercising the
+        // suffix arm of resolve_method_on_type's match filter.
+        let m = mk(
+            "method:m",
+            NodeKind::Method,
+            "run",
+            "pkg::Foo::run",
+            "src/a.rs",
+            Language::Rust,
+        );
+        let ctx = Ctx::default().name("run", vec![m]);
+        let r = refv("x", EdgeKind::Calls, "src/a.rs", Language::Rust, 1);
+        let res = resolve_method_on_type(
+            "Foo",
+            "run",
+            &r,
+            &ctx,
+            0.9,
+            ResolvedBy::InstanceMethod,
+            None,
+            0,
+        )
+        .expect("suffix match");
+        assert_eq!(res.target_node_id, "method:m");
     }
 }

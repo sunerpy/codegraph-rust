@@ -169,11 +169,9 @@ fn read_reference_pin(workspace_root: &Path, heading: &str) -> Option<String> {
         if line.starts_with("## ") {
             in_section = line.contains(heading);
         }
-        if in_section {
-            if let Some(commit) = line.trim().strip_prefix("**Commit:** `") {
-                let commit = commit.trim_end_matches('`').trim_end_matches('`');
-                return Some(commit.to_string());
-            }
+        if in_section && let Some(commit) = line.trim().strip_prefix("**Commit:** `") {
+            let commit = commit.trim_end_matches('`').trim_end_matches('`');
+            return Some(commit.to_string());
         }
     }
     None

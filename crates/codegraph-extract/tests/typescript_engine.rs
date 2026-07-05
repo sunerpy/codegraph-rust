@@ -1,7 +1,7 @@
 use codegraph_core::types::{
     Edge, EdgeKind, ExtractionResult, Language, Node, NodeKind, UnresolvedRef,
 };
-use codegraph_extract::{extract_project, extract_source, ExtractOptions};
+use codegraph_extract::{ExtractOptions, extract_project, extract_source};
 use serde::Deserialize;
 use std::collections::{BTreeSet, HashMap};
 use std::fs;

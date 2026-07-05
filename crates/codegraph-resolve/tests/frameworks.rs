@@ -272,20 +272,24 @@ fn react_extract_component_and_route_reference() {
     let result = react::ReactResolver
         .extract("src/Home.tsx", content, "")
         .expect("extract result");
-    assert!(result
-        .nodes
-        .iter()
-        .any(|n| n.kind == NodeKind::Component && n.name == "Home"));
+    assert!(
+        result
+            .nodes
+            .iter()
+            .any(|n| n.kind == NodeKind::Component && n.name == "Home")
+    );
     let route = result
         .nodes
         .iter()
         .find(|n| n.kind == NodeKind::Route)
         .expect("route");
     assert_eq!(route.name, "/home");
-    assert!(result
-        .references
-        .iter()
-        .any(|r| r.reference_name == "Home" && r.reference_kind == EdgeKind::References));
+    assert!(
+        result
+            .references
+            .iter()
+            .any(|r| r.reference_name == "Home" && r.reference_kind == EdgeKind::References)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -415,10 +419,12 @@ fn nestjs_extract_http_route_joins_controller_prefix() {
         .find(|n| n.kind == NodeKind::Route)
         .expect("route node");
     assert_eq!(route.name, "GET /users/:id");
-    assert!(result
-        .references
-        .iter()
-        .any(|r| r.reference_name == "findOne" && r.reference_kind == EdgeKind::References));
+    assert!(
+        result
+            .references
+            .iter()
+            .any(|r| r.reference_name == "findOne" && r.reference_kind == EdgeKind::References)
+    );
 }
 
 #[test]

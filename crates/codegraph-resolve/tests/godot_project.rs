@@ -245,24 +245,129 @@ jump={
 }
 
 #[test]
+fn editor_plugins_emits_a_reference_per_enabled_plugin() {
+    // Given an [editor_plugins] enabled=PackedStringArray(...) with two plugins,
+    let content = "\
+[editor_plugins]
+
+enabled=PackedStringArray(\"res://addons/foo/plugin.cfg\", \"res://addons/bar/plugin.cfg\")
+";
+    // When extracting,
+    let result = extract("project.godot", content);
+
+    // Then a single `editor_plugins` node is emitted (first enabled plugin), and
+    // one References edge per plugin path (res:// stripped).
+    let plugin_node = result
+        .nodes
+        .iter()
+        .find(|n| n.name == "editor_plugins")
+        .expect("editor_plugins node");
+    assert_eq!(plugin_node.kind, NodeKind::Constant);
+    let targets: Vec<&str> = result
+        .references
+        .iter()
+        .map(|r| r.reference_name.as_str())
+        .collect();
+    assert!(
+        targets.contains(&"addons/foo/plugin.cfg"),
+        "got {targets:?}"
+    );
+    assert!(
+        targets.contains(&"addons/bar/plugin.cfg"),
+        "got {targets:?}"
+    );
+    // And every plugin edge originates from the one editor_plugins node.
+    for edge in result
+        .references
+        .iter()
+        .filter(|r| r.reference_name.ends_with("plugin.cfg"))
+    {
+        assert_eq!(edge.from_node_id, plugin_node.id);
+    }
+}
+
+#[test]
+fn editor_plugins_with_no_valid_paths_emits_nothing() {
+    // Given an [editor_plugins] enabled= array whose entries are not res:// paths,
+    let content = "[editor_plugins]\nenabled=PackedStringArray(\"user://x.cfg\")\n";
+    // When extracting,
+    let result = extract("project.godot", content);
+    // Then no editor_plugins node is emitted (the non-res path is filtered).
+    assert!(
+        !result.nodes.iter().any(|n| n.name == "editor_plugins"),
+        "no node for a non-res plugin path, got {:?}",
+        result.nodes
+    );
+    assert!(result.references.is_empty());
+}
+
+#[test]
+fn non_res_main_scene_skipped_but_input_action_still_emitted() {
+    // Given a non-res main_scene value (skipped) and a valid [input] action,
+    let content = "\
+[application]
+run/main_scene=\"user://not_a_res.tscn\"
+
+[input]
+ui_accept={
+\"deadzone\": 0.5
+}
+";
+    // When extracting,
+    let result = extract("project.godot", content);
+
+    // Then the main_scene ref is skipped (value is not a res:// path) so no
+    // main_scene node exists, but the input action node is emitted.
+    assert!(
+        !result.nodes.iter().any(|n| n.name == "main_scene"),
+        "non-res main_scene must be skipped, got {:?}",
+        result.nodes
+    );
+    assert!(
+        result.nodes.iter().any(|n| n.name == "ui_accept"),
+        "input action node must be emitted, got {:?}",
+        result.nodes
+    );
+}
+
+#[test]
+fn section_header_with_interior_bracket_is_not_a_section() {
+    // Given a `[bad]extra]` line (interior `]` → parse_section_header returns
+    // None), the line is treated as a non-header, non-kv line and skipped.
+    let content = "[autoload]\nGameState=\"res://x.gd\"\n[bad]extra]\nMusic=\"res://y.gd\"\n";
+    // When extracting (must not panic),
+    let result = extract("project.godot", content);
+    // Then the two autoloads before/after still parse (the malformed header does
+    // not terminate the [autoload] section since it is not a valid header).
+    let names: Vec<&str> = result.nodes.iter().map(|n| n.name.as_str()).collect();
+    assert!(names.contains(&"GameState"), "got {names:?}");
+}
+
+#[test]
 fn extract_returns_none_for_non_project_godot_file() {
     // A .gd file now routes to T6's GDScript dynamic parser (Some), not this
     // project parser.
-    assert!(GodotResolver
-        .extract("foo.gd", "extends Node\n", "")
-        .is_some());
+    assert!(
+        GodotResolver
+            .extract("foo.gd", "extends Node\n", "")
+            .is_some()
+    );
     // A genuinely unclaimed file → None.
     assert!(GodotResolver.extract("README.md", "# hi\n", "").is_none());
     // A .tres routes to T5's resource parser (Some, not this project parser).
-    assert!(GodotResolver
-        .extract("data/item.tres", "[gd_resource]\n", "")
-        .is_some());
+    assert!(
+        GodotResolver
+            .extract("data/item.tres", "[gd_resource]\n", "")
+            .is_some()
+    );
     // A nested path whose basename IS project.godot still dispatches.
-    assert!(GodotResolver
-        .extract(
-            "sub/dir/project.godot",
-            "[autoload]\nX=\"res://x.gd\"\n",
-            ""
-        )
-        .is_some());
+    assert!(
+        GodotResolver
+            .extract(
+                "sub/dir/project.godot",
+                "[autoload]\nX=\"res://x.gd\"\n",
+                ""
+            )
+            .is_some()
+    );
 }

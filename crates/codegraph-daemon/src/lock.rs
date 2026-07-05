@@ -149,6 +149,26 @@ pub fn unlock_project(project_root: &Path) -> bool {
     clear_stale_daemon_lock(&pid_path, None)
 }
 
+/// Self-heal a project's stale daemon artifacts after a failed attach (Fix A):
+/// clears the pid lock AND removes the leftover `daemon.sock` at the RECORDED
+/// (fallback-aware) socket path, so the next `serve --mcp` spawns a fresh daemon
+/// instead of re-attaching to a dead socket that never answers.
+///
+/// Gated on liveness: returns `false` and touches nothing when the lock is held
+/// by a LIVE pid (`clear_stale_daemon_lock` refuses to remove a live lock).
+/// Returns `true` once the stale lock is cleared; socket removal is best-effort
+/// (a missing socket is already the desired end state).
+pub fn clear_stale_daemon_socket(project_root: &Path) -> bool {
+    let pid_path = daemon_pid_path(project_root);
+    let socket_path = recorded_socket_path(project_root);
+    // Liveness gate: only proceed once the owning pid is proven dead/absent.
+    if !clear_stale_daemon_lock(&pid_path, None) {
+        return false;
+    }
+    let _ = fs::remove_file(&socket_path);
+    true
+}
+
 pub(crate) fn cleanup_owned_lock(pid_path: &Path, pid: u32) {
     let owned = read_lock_info_tolerant(pid_path).is_some_and(|info| info.pid == pid);
     if owned {
@@ -248,6 +268,166 @@ mod tests {
         assert_eq!(reloaded.pid, info.pid);
         assert_eq!(reloaded.version, info.version);
 
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    fn temp_base(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "cg-lock-{label}-{}-{}",
+            process::id(),
+            now_millis()
+        ))
+    }
+
+    #[test]
+    fn decode_lock_info_rejects_empty_and_zero_and_garbage() {
+        assert!(decode_lock_info("").is_none());
+        assert!(decode_lock_info("   \n").is_none());
+        assert!(decode_lock_info("0").is_none());
+        assert!(decode_lock_info("not-a-pid").is_none());
+    }
+
+    #[test]
+    fn encode_then_decode_round_trips_full_lock_info() {
+        let info = DaemonLockInfo {
+            pid: 4242,
+            version: "9.9.9".to_string(),
+            socket_path: PathBuf::from("/tmp/x.sock"),
+            started_at: 1_700_000_000_000,
+        };
+        let encoded = encode_lock_info(&info).unwrap();
+        assert!(encoded.ends_with('\n'));
+        assert_eq!(decode_lock_info(&encoded), Some(info));
+    }
+
+    #[test]
+    fn clear_stale_lock_returns_true_when_missing() {
+        let base = temp_base("clear-missing");
+        let pid_path = daemon_pid_path(&base);
+        assert!(clear_stale_daemon_lock(&pid_path, None));
+    }
+
+    #[test]
+    fn clear_stale_lock_refuses_to_remove_a_live_owned_lock() {
+        let base = temp_base("clear-live");
+        let AcquireResult::Acquired { pid_path, .. } =
+            try_acquire_daemon_lock(&base).expect("acquire")
+        else {
+            panic!("expected fresh acquire");
+        };
+        assert!(
+            !clear_stale_daemon_lock(&pid_path, None),
+            "a lock held by this live pid must never be cleared"
+        );
+        assert!(pid_path.exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn clear_stale_lock_removes_a_dead_pid_lock() {
+        let base = temp_base("clear-dead");
+        fs::create_dir_all(codegraph_dir(&base)).unwrap();
+        let pid_path = daemon_pid_path(&base);
+        let dead = DaemonLockInfo {
+            pid: 4_000_000_000,
+            version: "1.0.0".to_string(),
+            socket_path: PathBuf::from("/tmp/dead.sock"),
+            started_at: 0,
+        };
+        fs::write(&pid_path, encode_lock_info(&dead).unwrap()).unwrap();
+        assert!(clear_stale_daemon_lock(&pid_path, None));
+        assert!(!pid_path.exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn clear_stale_lock_refuses_when_expected_pid_mismatches() {
+        let base = temp_base("clear-mismatch");
+        fs::create_dir_all(codegraph_dir(&base)).unwrap();
+        let pid_path = daemon_pid_path(&base);
+        let dead = DaemonLockInfo {
+            pid: 4_000_000_000,
+            version: "1.0.0".to_string(),
+            socket_path: PathBuf::new(),
+            started_at: 0,
+        };
+        fs::write(&pid_path, encode_lock_info(&dead).unwrap()).unwrap();
+        assert!(
+            !clear_stale_daemon_lock(&pid_path, Some(12345)),
+            "an expected-dead-pid that mismatches the lock must not delete it"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn unlock_project_clears_a_dead_lock() {
+        let base = temp_base("unlock");
+        fs::create_dir_all(codegraph_dir(&base)).unwrap();
+        let pid_path = daemon_pid_path(&base);
+        let dead = DaemonLockInfo {
+            pid: 4_000_000_000,
+            version: "1.0.0".to_string(),
+            socket_path: PathBuf::new(),
+            started_at: 0,
+        };
+        fs::write(&pid_path, encode_lock_info(&dead).unwrap()).unwrap();
+        assert!(unlock_project(&base));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn recorded_socket_path_falls_back_to_default_when_lock_absent() {
+        let base = temp_base("recorded-absent");
+        assert_eq!(recorded_socket_path(&base), daemon_socket_path(&base));
+    }
+
+    #[test]
+    fn recorded_socket_path_reads_the_recorded_socket_from_the_lock() {
+        let base = temp_base("recorded-present");
+        let AcquireResult::Acquired { pid_path, .. } =
+            try_acquire_daemon_lock(&base).expect("acquire")
+        else {
+            panic!("expected fresh acquire");
+        };
+        let recorded = std::env::temp_dir().join("cg-recorded.sock");
+        rewrite_lock_socket_path(&pid_path, &recorded).unwrap();
+        assert_eq!(recorded_socket_path(&base), recorded);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn try_acquire_reports_taken_when_lock_held_by_live_pid() {
+        let base = temp_base("taken");
+        let AcquireResult::Acquired { .. } = try_acquire_daemon_lock(&base).expect("first acquire")
+        else {
+            panic!("first acquire should succeed");
+        };
+        match try_acquire_daemon_lock(&base).expect("second acquire") {
+            AcquireResult::Taken { existing, .. } => {
+                let info = existing.expect("existing lock info present");
+                assert_eq!(info.pid, process::id());
+            }
+            AcquireResult::Acquired { .. } => panic!("second acquire must report Taken"),
+        }
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn clear_stale_daemon_socket_removes_lock_and_socket_when_dead() {
+        let base = temp_base("socket-dead");
+        fs::create_dir_all(codegraph_dir(&base)).unwrap();
+        let pid_path = daemon_pid_path(&base);
+        let socket = daemon_socket_path(&base);
+        let dead = DaemonLockInfo {
+            pid: 4_000_000_000,
+            version: "1.0.0".to_string(),
+            socket_path: socket.clone(),
+            started_at: 0,
+        };
+        fs::write(&pid_path, encode_lock_info(&dead).unwrap()).unwrap();
+        let _ = fs::write(&socket, b"");
+        assert!(clear_stale_daemon_socket(&base));
+        assert!(!pid_path.exists());
         let _ = fs::remove_dir_all(&base);
     }
 }

@@ -294,27 +294,205 @@ groups = [\"players\"]
 #[test]
 fn extract_routes_only_tscn_not_gd_or_tres() {
     // A .tscn dispatches to T4.
-    assert!(GodotResolver
-        .extract("scenes/Main.tscn", "[gd_scene format=3]\n", "")
-        .is_some());
+    assert!(
+        GodotResolver
+            .extract("scenes/Main.tscn", "[gd_scene format=3]\n", "")
+            .is_some()
+    );
     // A nested path whose extension is .tscn still dispatches.
-    assert!(GodotResolver
-        .extract("a/b/c/Deep.tscn", "[gd_scene format=3]\n", "")
-        .is_some());
+    assert!(
+        GodotResolver
+            .extract("a/b/c/Deep.tscn", "[gd_scene format=3]\n", "")
+            .is_some()
+    );
 
     // A .gd file now routes to T6's GDScript dynamic parser (Some).
-    assert!(GodotResolver
-        .extract("player.gd", "extends Node\n", "")
-        .is_some());
+    assert!(
+        GodotResolver
+            .extract("player.gd", "extends Node\n", "")
+            .is_some()
+    );
     // A .tres routes to T5's resource parser (Some, via that parser, not this).
-    assert!(GodotResolver
-        .extract("data/item.tres", "[gd_resource format=3]\n", "")
-        .is_some());
+    assert!(
+        GodotResolver
+            .extract("data/item.tres", "[gd_resource format=3]\n", "")
+            .is_some()
+    );
     // project.godot still routes to T3 (not this parser) — it returns Some, but
     // via the project parser, so it is NOT None.
-    assert!(GodotResolver
-        .extract("project.godot", "[autoload]\nX=\"res://x.gd\"\n", "")
-        .is_some());
+    assert!(
+        GodotResolver
+            .extract("project.godot", "[autoload]\nX=\"res://x.gd\"\n", "")
+            .is_some()
+    );
+}
+
+#[test]
+fn ext_resource_without_id_or_path_is_ignored() {
+    // Given ext_resource declarations missing `id` and missing `path`, plus a
+    // node whose script references an id that was therefore never recorded,
+    let content = "\
+[gd_scene format=3]
+
+[ext_resource type=\"Script\" path=\"res://noid.gd\"]
+[ext_resource type=\"Script\" id=\"1\"]
+
+[node name=\"N\" type=\"Node\"]
+script = ExtResource(\"1\")
+";
+    // When extracting (must not panic),
+    let result = extract("scenes/N.tscn", content);
+
+    // Then the node parses but no script ref resolves (the id had no path).
+    assert!(result.nodes.iter().any(|n| n.name == "N"), "N node");
+    assert!(
+        result.references.is_empty(),
+        "no resolvable ext_resource, got {:?}",
+        result.references
+    );
+}
+
+#[test]
+fn node_without_name_is_skipped() {
+    // Given a `[node]` header with an empty name and a following valid node,
+    let content = "\
+[gd_scene format=3]
+
+[node name=\"\" type=\"Node\"]
+script = ExtResource(\"1\")
+
+[node name=\"Real\" type=\"Node\"]
+";
+    // When extracting,
+    let result = extract("scenes/S.tscn", content);
+    // Then only the named node is emitted.
+    let names: Vec<&str> = result.nodes.iter().map(|n| n.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["Real"],
+        "empty-name node skipped, got {names:?}"
+    );
+}
+
+#[test]
+fn empty_group_entries_are_skipped() {
+    // Given a `groups = ["", "real"]` with a blank entry,
+    let content = "\
+[gd_scene format=3]
+
+[node name=\"G\" type=\"Node\"]
+groups = [\"\", \"real\"]
+";
+    // When extracting,
+    let result = extract("scenes/G.tscn", content);
+    // Then only the non-empty group name yields a reference.
+    let groups: Vec<&str> = result
+        .references
+        .iter()
+        .map(|r| r.reference_name.as_str())
+        .collect();
+    assert_eq!(groups, vec!["real"], "blank group skipped, got {groups:?}");
+}
+
+#[test]
+fn connection_without_method_or_empty_method_emits_no_reference() {
+    // Given one connection with no `method` attr and one with an empty method,
+    let content = "\
+[gd_scene format=3]
+
+[node name=\"A\" type=\"Node\"]
+
+[connection signal=\"s\" from=\"A\" to=\".\"]
+[connection signal=\"s\" from=\"A\" to=\".\" method=\"\"]
+";
+    // When extracting (must not panic),
+    let result = extract("scenes/C.tscn", content);
+    // Then no handler reference is emitted (both are guarded out).
+    assert!(
+        result.references.is_empty(),
+        "no method → no ref, got {:?}",
+        result.references
+    );
+}
+
+#[test]
+fn connection_from_unknown_node_uses_marker_fallback() {
+    // Given a connection whose `from` names a node that does not exist and is
+    // not the self/root marker `.`,
+    let content = "\
+[gd_scene format=3]
+
+[node name=\"Root\" type=\"Node\"]
+
+[connection signal=\"pressed\" from=\"Ghost\" to=\".\" method=\"_on_pressed\"]
+";
+    // When extracting,
+    let result = extract("scenes/M.tscn", content);
+    // Then the handler ref is still emitted (anchored to a synthesized marker id
+    // so the method name is not lost).
+    let handler = result
+        .references
+        .iter()
+        .find(|r| r.reference_name == "_on_pressed")
+        .expect("handler ref emitted via marker fallback");
+    assert_eq!(handler.reference_kind, EdgeKind::References);
+}
+
+#[test]
+fn key_value_line_outside_any_node_block_is_skipped() {
+    // Given a `key = value` line before any `[node]` header (and a malformed
+    // no-`=` line inside a node),
+    let content = "\
+[gd_scene format=3]
+stray_key = 5
+
+[node name=\"N\" type=\"Node\"]
+no_equals_here
+unknown_prop = 7
+";
+    // When extracting (must not panic),
+    let result = extract("scenes/K.tscn", content);
+    // Then the node parses and no spurious references are produced.
+    assert!(result.nodes.iter().any(|n| n.name == "N"), "N node");
+    assert!(
+        result.references.is_empty(),
+        "no refs from stray/unknown kv"
+    );
+}
+
+#[test]
+fn bare_attribute_without_equals_in_header_is_tolerated() {
+    // Given a node header carrying a bare token with no `=` (parse_attrs skips
+    // it) alongside a valid quoted name,
+    let content = "\
+[gd_scene format=3]
+
+[node bareflag name=\"Widget\" type=\"Control\"]
+";
+    // When extracting (must not panic),
+    let result = extract("scenes/W.tscn", content);
+    // Then the node still parses by its name attribute.
+    assert!(
+        result.nodes.iter().any(|n| n.name == "Widget"),
+        "Widget node parsed past the bare token, got {:?}",
+        result.nodes.iter().map(|n| &n.name).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn empty_bracket_header_is_not_a_section() {
+    // Given a `[]` and a `[   ]` line (empty inner → parse_section_header None),
+    let content = "\
+[gd_scene format=3]
+[]
+[   ]
+
+[node name=\"Z\" type=\"Node\"]
+";
+    // When extracting (must not panic),
+    let result = extract("scenes/Z.tscn", content);
+    // Then the real node still parses.
+    assert!(result.nodes.iter().any(|n| n.name == "Z"), "Z node parsed");
 }
 
 #[test]

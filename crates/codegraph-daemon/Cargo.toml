@@ -24,6 +24,13 @@ time = { workspace = true }
 interprocess = { workspace = true }
 codegraph-mcp = { path = "../codegraph-mcp" }
 codegraph-watch = { path = "../codegraph-watch" }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "io-util",
+    "net",
+    "time",
+    "macros",
+] }
 
 # Unix process introspection (getppid, signal-0 liveness) + socket half-close
 [target.'cfg(unix)'.dependencies]

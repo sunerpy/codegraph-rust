@@ -28,16 +28,44 @@ The published crate is `codegraph-rs` (the `codegraph-cli` package); the install
 `codegraph`. The library crates publish as `codegraph-{core,store,extract,graph,resolve,mcp,daemon,watch}`.
 `codegraph-bench` is `publish = false`.
 
+## HTTP MCP server: background mode + addr-keyed registry
+
+`serve --mcp` (stdio) uses the PER-PROJECT daemon (`.codegraph/daemon.pid` + socket). `serve --http`
+(streamable-HTTP) is different: HTTP servers are keyed by BIND ADDR — a global server (no `--path`)
+spans many projects — so they use a GLOBAL, addr-keyed registry, NOT `.codegraph/`. The registry
+lives in `codegraph-daemon/src/http_registry.rs`: one `<addr-sanitized>.json` file per running server
+(`HttpServerInfo { pid, addr, mode, project, started_at, version, log_file }`) under
+`$XDG_STATE_HOME/codegraph/http` (else `~/.local/state/codegraph/http`; `%LOCALAPPDATA%\codegraph\http`
+on Windows; `CODEGRAPH_HTTP_REGISTRY_DIR` overrides). Entries are pruned when their pid is dead
+(self-heal, gated on `is_process_alive`).
+
+`serve --http` stays FOREGROUND by default; `serve --http --detach` runs in the BACKGROUND via
+`spawn::spawn_detached_http` (generalized from `spawn_detached_daemon` over the shared `detach()`
+primitive; the child carries `CODEGRAPH_HTTP_DETACH_INTERNAL=1` so it runs the foreground serve path
+and does NOT re-detach). On startup `serve --http` prunes dead entries, ERRORS on a live same-addr
+conflict (listing the running instance), and notes any other live servers when the addr is free. The
+`codegraph http {list, status, stop}` subcommand group inspects and terminates registered servers
+(`stop` uses `process::terminate_pid` — SIGTERM on unix / `TerminateProcess` on Windows). None of this
+touches extraction/golden equivalence.
+
 ## Agent installer (`codegraph install` / `uninstall`)
 
 `codegraph install` writes the codegraph MCP-server entry into each supported agent's config
-(Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, Trae, Qoder);
+(Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, Trae, Qoder, Zed);
 `uninstall` reverses it. The written command launches the binary (`command: "codegraph"`,
 `args: ["serve", "--mcp"]`). Cursor and Trae use `--path ${workspaceFolder}` in their global config so
 one entry auto-follows each project window; Kiro and Qoder write a bare global entry (no `--path`) that
 serves tools read-only off any existing index, with the agent passing the project path per call — run
 `codegraph init --target=<ide>` inside each project to write a project-local config with an absolute
-`--path` for live watch. Non-interactive, flag-driven (`--target`, `--global`/`--local`/`--location`,
+`--path` for live watch. Kiro's `mcp.json` also carries a `//`-commented HTTP alternative alongside the
+active stdio entry (JSONC, idempotent, injected best-effort without corrupting existing files); it uses
+`http://localhost:8111/mcp` because Kiro allows `http` only for localhost (remote servers must be `https`).
+Zed's `settings.json` likewise carries `//`-commented remote-development alternatives after the active
+`context_servers.codegraph` stdio entry (both `install` global and `init` project-local): an SSH-stdio
+bridge and an HTTP server (`http://localhost:8111/mcp`, marked RECOMMENDED for remote); the shared
+JSONC-safe injector is `inject_commented_alternative(path, parent_key, entry_key, sentinel, block)` in
+`shared.rs`, used by both Kiro (`mcpServers`) and Zed (`context_servers`).
+Non-interactive, flag-driven (`--target`, `--global`/`--local`/`--location`,
 `--yes`, `--no-permissions`, `--print-config`); the config-writing logic (paths/keys/marker sections,
 idempotent upsert, uninstall removal) is CLI-only and additive — it does NOT touch
 extraction/golden equivalence.
@@ -51,7 +79,24 @@ cargo test --workspace          # incl. golden oracle + sync equivalence
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 bash scripts/guardrail.sh
+make coverage    # workspace coverage summary (informational; `make coverage-html` for the full report)
 ```
+
+## Test coverage (tracked, informational)
+
+- Unit-test coverage is a tracked metric via `cargo llvm-cov` + Codecov.
+  Run `make coverage` for a summary; `make coverage-html` for the browsable
+  report; `make coverage-lcov` writes the `lcov.info` CI uploads.
+- **Target is 95%+** (aspirational). The CI gate is **informational /
+  non-blocking** — the `coverage` job is kept out of the `CI Success` gate and
+  the Codecov status is `informational: true` (`codecov.yml`), so a below-target
+  % never turns CI red. This honors the iron rule "local green ⇒ CI green".
+- **Baseline ~72% line coverage** — a known gap to close. Biggest gaps:
+  `codegraph-resolve/src/import_resolver.rs`, `codegraph-resolve/src/name_matcher.rs`,
+  and the 0%-covered `codegraph-watch/src/{git,worktree}.rs`.
+- **Enabling Codecov:** enable the repo at codecov.io. This repo is public, so
+  tokenless upload works (no `CODECOV_TOKEN` needed); a private repo would need
+  `CODECOV_TOKEN` in GitHub repo Secrets.
 
 ## CI, hooks & release
 

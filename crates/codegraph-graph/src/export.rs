@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use codegraph_core::types::{Node, NodeKind};
 use codegraph_store::Store;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::centrality::{self, Centrality};
 
@@ -92,4 +92,165 @@ fn node_to_link_node(node: &Node, centrality: Option<&Centrality>) -> Value {
         m.insert("out_degree".into(), json!(c.out_degree));
     }
     Value::Object(m)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codegraph_core::types::{Edge, EdgeKind, Language};
+
+    fn temp_db_path(test_name: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        path.push(format!(
+            "codegraph-graph-export-{test_name}-{}-{nanos}.db",
+            std::process::id()
+        ));
+        path
+    }
+
+    fn node(id: &str, kind: NodeKind, name: &str, file_path: &str) -> Node {
+        Node {
+            id: id.to_string(),
+            kind,
+            name: name.to_string(),
+            qualified_name: name.to_string(),
+            file_path: file_path.to_string(),
+            language: Language::TypeScript,
+            start_line: 1,
+            end_line: 3,
+            start_column: 0,
+            end_column: 0,
+            docstring: None,
+            signature: Some("(): void".to_string()),
+            visibility: None,
+            is_exported: false,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+            decorators: Vec::new(),
+            type_parameters: Vec::new(),
+            return_type: None,
+            updated_at: 1,
+        }
+    }
+
+    fn edge(source: &str, target: &str, kind: EdgeKind) -> Edge {
+        Edge {
+            id: None,
+            source: source.to_string(),
+            target: target.to_string(),
+            kind,
+            metadata: None,
+            line: Some(2),
+            col: Some(0),
+            provenance: None,
+        }
+    }
+
+    fn small_store(test_name: &str) -> Store {
+        let mut store = Store::open(&temp_db_path(test_name)).expect("open store");
+        store
+            .upsert_nodes(&[
+                node("file:src/a.ts", NodeKind::File, "a.ts", "src/a.ts"),
+                node("function:caller", NodeKind::Function, "caller", "src/a.ts"),
+                node("function:callee", NodeKind::Function, "callee", "src/a.ts"),
+            ])
+            .expect("insert nodes");
+        store
+            .insert_edges(&[
+                edge("file:src/a.ts", "function:caller", EdgeKind::Contains),
+                edge("function:caller", "function:callee", EdgeKind::Calls),
+            ])
+            .expect("insert edges");
+        store
+    }
+
+    #[test]
+    fn node_link_graph_with_centrality_has_full_shape_and_scores() {
+        let store = small_store("with-centrality");
+        let doc = node_link_graph(&store).expect("export");
+
+        assert_eq!(doc["directed"], json!(true));
+        assert_eq!(doc["multigraph"], json!(true));
+        assert!(doc["graph"].is_object());
+
+        let nodes = doc["nodes"].as_array().expect("nodes array");
+        assert_eq!(nodes.len(), 3);
+        // Every node with centrality carries the four score keys.
+        for n in nodes {
+            assert!(n["pagerank"].is_number(), "pagerank present");
+            assert!(n["god_score"].is_number(), "god_score aliases pagerank");
+            assert!(n["in_degree"].is_number());
+            assert!(n["out_degree"].is_number());
+        }
+
+        // `links` is canonical; `edges` is a duplicate alias — both present, equal.
+        let links = doc["links"].as_array().expect("links array");
+        let edges = doc["edges"].as_array().expect("edges array");
+        assert_eq!(links.len(), 2);
+        assert_eq!(links, edges);
+
+        // A resolved edge exposes both `relation` and `kind`, plus its line.
+        let calls = links
+            .iter()
+            .find(|l| l["source"] == json!("function:caller"))
+            .expect("calls link");
+        assert_eq!(calls["relation"], json!("calls"));
+        assert_eq!(calls["kind"], json!("calls"));
+        assert_eq!(calls["line"], json!(2));
+    }
+
+    #[test]
+    fn file_node_gets_file_type_code_node_gets_code_type() {
+        let store = small_store("file-type");
+        let doc = node_link_graph(&store).expect("export");
+        let nodes = doc["nodes"].as_array().expect("nodes");
+
+        let file = nodes
+            .iter()
+            .find(|n| n["id"] == json!("file:src/a.ts"))
+            .expect("file node");
+        assert_eq!(file["file_type"], json!("file"));
+        assert_eq!(file["kind"], json!("file"));
+
+        let func = nodes
+            .iter()
+            .find(|n| n["id"] == json!("function:caller"))
+            .expect("function node");
+        assert_eq!(func["file_type"], json!("code"));
+        // Signature is emitted when present.
+        assert_eq!(func["signature"], json!("(): void"));
+        assert_eq!(func["source_file"], json!("src/a.ts"));
+        assert_eq!(func["label"], json!("caller"));
+    }
+
+    #[test]
+    fn node_link_graph_opts_without_centrality_omits_scores() {
+        let store = small_store("no-centrality");
+        let doc = node_link_graph_opts(&store, false).expect("export");
+        let nodes = doc["nodes"].as_array().expect("nodes");
+        assert_eq!(nodes.len(), 3);
+        for n in nodes {
+            assert!(n["pagerank"].is_null(), "no pagerank without centrality");
+            assert!(n["god_score"].is_null());
+            assert!(n["in_degree"].is_null());
+            assert!(n["out_degree"].is_null());
+            // Core fields are still emitted.
+            assert!(n["id"].is_string());
+            assert!(n["language"].is_string());
+        }
+    }
+
+    #[test]
+    fn empty_store_exports_empty_node_and_link_arrays() {
+        let store = Store::open(&temp_db_path("empty")).expect("open store");
+        let doc = node_link_graph(&store).expect("export");
+        assert_eq!(doc["nodes"].as_array().expect("nodes").len(), 0);
+        assert_eq!(doc["links"].as_array().expect("links").len(), 0);
+        assert_eq!(doc["edges"].as_array().expect("edges").len(), 0);
+    }
 }

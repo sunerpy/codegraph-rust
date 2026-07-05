@@ -10,3 +10,4 @@ pub mod kiro;
 pub mod opencode;
 pub mod qoder;
 pub mod trae;
+pub mod zed;

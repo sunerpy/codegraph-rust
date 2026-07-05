@@ -27,9 +27,9 @@
 
 use crate::context::order_candidates_pub;
 use crate::import_resolver;
-use crate::path_aliases::{load_project_aliases, AliasMap};
+use crate::path_aliases::{AliasMap, load_project_aliases};
 use crate::types::{GoModule, ImportMapping, ReExport, ResolutionContext};
-use crate::workspace_packages::{load_workspace_packages, WorkspacePackages};
+use crate::workspace_packages::{WorkspacePackages, load_workspace_packages};
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use codegraph_store::Store;
 use std::collections::{HashMap, HashSet};
@@ -360,4 +360,199 @@ pub fn build_edge_adjacency(store: &Store) -> anyhow::Result<EdgeAdjacency> {
         }
     }
     Ok(Arc::new(adjacency))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codegraph_core::types::{Edge, FileRecord};
+
+    fn temp_root(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let mut p = std::env::temp_dir();
+        p.push(format!("cg-snap-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&p).expect("mkdir");
+        p
+    }
+
+    fn node(id: &str, name: &str, kind: NodeKind, file: &str, line: i64, col: i64) -> Node {
+        Node {
+            id: id.to_string(),
+            kind,
+            name: name.to_string(),
+            qualified_name: name.to_string(),
+            file_path: file.to_string(),
+            language: Language::TypeScript,
+            start_line: line,
+            end_line: line,
+            start_column: col,
+            end_column: col,
+            docstring: None,
+            signature: None,
+            visibility: None,
+            is_exported: false,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+            decorators: Vec::new(),
+            type_parameters: Vec::new(),
+            return_type: None,
+            updated_at: 0,
+        }
+    }
+
+    fn file_record(path: &str, count: i64) -> FileRecord {
+        FileRecord {
+            path: path.to_string(),
+            content_hash: "h".to_string(),
+            language: Language::TypeScript,
+            size: 0,
+            modified_at: 0,
+            indexed_at: 0,
+            node_count: count,
+            errors: Vec::new(),
+        }
+    }
+
+    fn populated_store(root: &std::path::Path) -> Store {
+        let mut store = Store::open(&root.join("index.db")).expect("open");
+        store.upsert_file(&file_record("a.ts", 2)).unwrap();
+        store
+            .upsert_nodes(&[
+                node("child", "Child", NodeKind::Class, "a.ts", 1, 0),
+                node("base", "Base", NodeKind::Interface, "a.ts", 5, 0),
+            ])
+            .unwrap();
+        store
+            .insert_edges(&[Edge {
+                id: None,
+                source: "child".to_string(),
+                target: "base".to_string(),
+                kind: EdgeKind::Implements,
+                metadata: None,
+                line: Some(1),
+                col: Some(0),
+                provenance: None,
+            }])
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn from_store_builds_node_lookups() {
+        let root = temp_root("build");
+        let store = populated_store(&root);
+        let ctx = SnapshotResolutionContext::from_store(&store, root.to_str().unwrap())
+            .expect("snapshot");
+
+        assert_eq!(ctx.get_nodes_in_file("a.ts").len(), 2);
+        assert_eq!(ctx.get_nodes_by_name("Child").len(), 1);
+        assert_eq!(ctx.get_nodes_by_qualified_name("Child").len(), 1);
+        assert_eq!(ctx.get_nodes_by_kind(NodeKind::Class).len(), 1);
+        assert_eq!(ctx.get_nodes_by_lower_name("child").len(), 1);
+        assert!(ctx.get_node_by_id("child").is_some());
+        assert!(ctx.get_node_by_id("missing").is_none());
+        assert!(ctx.known_node_names().contains(&"Child".to_string()));
+        assert_eq!(ctx.get_project_root(), root.to_str().unwrap());
+        assert!(ctx.get_nodes_in_file("nope.ts").is_empty());
+        assert!(ctx.get_nodes_by_name("Nope").is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn file_exists_uses_known_set_and_fs() {
+        let root = temp_root("exists");
+        let store = populated_store(&root);
+        std::fs::write(root.join("ondisk.ts"), "x").unwrap();
+        let ctx = SnapshotResolutionContext::from_store(&store, root.to_str().unwrap()).unwrap();
+        assert!(ctx.file_exists("a.ts"));
+        assert!(ctx.file_exists("ondisk.ts"));
+        assert!(!ctx.file_exists("nowhere.ts"));
+        assert!(ctx.get_all_files().contains(&"a.ts".to_string()));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn read_file_and_import_and_re_exports() {
+        let root = temp_root("read");
+        let store = Store::open(&root.join("index.db")).unwrap();
+        std::fs::write(
+            root.join("b.ts"),
+            "import { foo } from './c';\nexport { foo } from './c';\nexport * from './d';\n",
+        )
+        .unwrap();
+        let ctx = SnapshotResolutionContext::from_store(&store, root.to_str().unwrap()).unwrap();
+        assert!(ctx.read_file("b.ts").is_some());
+        assert!(ctx.read_file("missing.ts").is_none());
+        assert!(
+            !ctx.get_import_mappings("b.ts", Language::TypeScript)
+                .is_empty()
+        );
+        assert!(
+            ctx.get_import_mappings("gone.ts", Language::TypeScript)
+                .is_empty()
+        );
+        assert!(!ctx.get_re_exports("b.ts", Language::TypeScript).is_empty());
+        assert!(
+            ctx.get_re_exports("gone.ts", Language::TypeScript)
+                .is_empty()
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn get_supertypes_empty_without_edges() {
+        let root = temp_root("noedges");
+        let store = populated_store(&root);
+        let ctx = SnapshotResolutionContext::from_store(&store, root.to_str().unwrap()).unwrap();
+        // No edge adjacency installed yet → empty, matching the store context
+        // before edges are persisted.
+        assert!(ctx.get_supertypes("Child", Language::TypeScript).is_empty());
+        assert!(ctx.get_supertypes("Nope", Language::TypeScript).is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn get_supertypes_reads_installed_adjacency() {
+        let root = temp_root("edges");
+        let store = populated_store(&root);
+        let adjacency = build_edge_adjacency(&store).expect("adjacency");
+        assert!(adjacency.contains_key("child"));
+
+        let base = SnapshotResolutionContext::from_store(&store, root.to_str().unwrap()).unwrap();
+        // `with_edge_adjacency` shares the node snapshot but swaps the edge map.
+        let ctx = base.with_edge_adjacency(Arc::clone(&adjacency));
+        assert_eq!(
+            ctx.get_supertypes("Child", Language::TypeScript),
+            vec!["Base".to_string()]
+        );
+
+        // `set_edge_adjacency` mutates in place with the same effect.
+        let mut owned =
+            SnapshotResolutionContext::from_store(&store, root.to_str().unwrap()).unwrap();
+        owned.set_edge_adjacency(adjacency);
+        assert_eq!(
+            owned.get_supertypes("Child", Language::TypeScript),
+            vec!["Base".to_string()]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn build_edge_adjacency_empty_store() {
+        let root = temp_root("emptyadj");
+        let store = Store::open(&root.join("index.db")).unwrap();
+        let adjacency = build_edge_adjacency(&store).expect("adjacency");
+        assert!(adjacency.is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn snapshot_context_is_sync() {
+        fn assert_sync<T: Sync>() {}
+        assert_sync::<SnapshotResolutionContext>();
+    }
 }

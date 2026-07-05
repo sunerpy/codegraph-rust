@@ -22,11 +22,11 @@
 use std::fs;
 use std::path::PathBuf;
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use super::super::shared::{
-    mcp_server_config, read_config_file, read_json_file, remove_codegraph_from_mcp_servers,
-    to_upstream_json, upsert_nested_key_jsonc, write_json_file, ConfigRead,
+    ConfigRead, mcp_server_config, read_config_file, read_json_file,
+    remove_codegraph_from_mcp_servers, to_upstream_json, upsert_nested_key_jsonc, write_json_file,
 };
 use super::super::types::{
     AgentTarget, DetectionResult, FileAction, FileWrite, InstallContext, InstallOptions, Location,
@@ -500,5 +500,102 @@ mod tests {
     fn supports_skills_both_locations() {
         assert!(TraeTarget.supports_skills(Location::Global));
         assert!(TraeTarget.supports_skills(Location::Local));
+    }
+
+    fn opts() -> InstallOptions {
+        InstallOptions {
+            auto_allow: false,
+            front_load_hook: false,
+        }
+    }
+
+    #[test]
+    fn detect_reflects_presence_both_locations() {
+        let (mut ctx, base) = temp_ctx("detect");
+        ctx.xdg_config_home = Some(ctx.home.join(".config"));
+
+        let global_before = TraeTarget.detect(&ctx, Location::Global);
+        assert!(!global_before.installed);
+        assert!(!global_before.already_configured);
+
+        TraeTarget.install(&ctx, Location::Global, opts());
+        let global_after = TraeTarget.detect(&ctx, Location::Global);
+        assert!(global_after.installed);
+        assert!(global_after.already_configured);
+
+        let local_before = TraeTarget.detect(&ctx, Location::Local);
+        assert!(!local_before.installed);
+        TraeTarget.install(&ctx, Location::Local, opts());
+        let local_after = TraeTarget.detect(&ctx, Location::Local);
+        assert!(local_after.installed);
+        assert!(local_after.already_configured);
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn local_install_writes_dot_trae_with_project_notes() {
+        let (ctx, base) = temp_ctx("local-install");
+        let result = TraeTarget.install(&ctx, Location::Local, opts());
+        assert_eq!(result.files[0].action, FileAction::Created);
+        assert!(result.notes.iter().any(|n| n.contains("project-level MCP")));
+        let file = mcp_json_path(&ctx, Location::Local);
+        assert!(file.exists());
+        let config = read_json_file(&file);
+        assert!(config["mcpServers"]["codegraph"].is_object());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn global_install_notes_mention_workspace_folder() {
+        let (mut ctx, base) = temp_ctx("global-notes");
+        ctx.xdg_config_home = Some(ctx.home.join(".config"));
+        let result = TraeTarget.install(&ctx, Location::Global, opts());
+        assert!(
+            result
+                .notes
+                .iter()
+                .any(|n| n.contains("${workspaceFolder}"))
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn install_skips_unparseable_config() {
+        let (ctx, base) = temp_ctx("unparseable");
+        let file = mcp_json_path(&ctx, Location::Local);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let corrupt = "{ not json";
+        fs::write(&file, corrupt).unwrap();
+        let entry = write_mcp_entry(&ctx, Location::Local);
+        assert_eq!(entry.action, FileAction::Skipped);
+        assert_eq!(fs::read_to_string(&file).unwrap(), corrupt);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn install_is_idempotent() {
+        let (ctx, base) = temp_ctx("idempotent");
+        let file = mcp_json_path(&ctx, Location::Local);
+        TraeTarget.install(&ctx, Location::Local, opts());
+        let first = fs::read_to_string(&file).unwrap();
+        TraeTarget.install(&ctx, Location::Local, opts());
+        assert_eq!(fs::read_to_string(&file).unwrap(), first);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn print_config_shows_mcp_servers_and_path() {
+        let (mut ctx, base) = temp_ctx("print");
+        ctx.xdg_config_home = Some(ctx.home.join(".config"));
+        let out = TraeTarget.print_config(&ctx, Location::Global);
+        assert!(out.contains("mcpServers"));
+        assert!(out.contains("--path"));
+        assert!(out.contains("${workspaceFolder}"));
+        assert!(out.contains("mcp.json"));
+
+        let local = TraeTarget.print_config(&ctx, Location::Local);
+        assert!(local.replace('\\', "/").contains(".trae/mcp.json"));
+        let _ = fs::remove_dir_all(base);
     }
 }

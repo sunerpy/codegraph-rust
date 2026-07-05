@@ -1,11 +1,11 @@
-//! End-to-end test for T4: the DAEMON process owns ONE `ProjectWatcher` per
-//! project, shared by all N client connections (the issue-#411 win).
+//! End-to-end test: the DAEMON process owns ONE `ProjectWatcher` per
+//! project, shared by all N client connections.
 //!
 //! The watcher lives in a SEPARATE detached process, so an in-process
 //! `watcher_count()` hook is unreachable. We assert BEHAVIORALLY via the
 //! observable single-sync signal the daemon writes to `.codegraph/daemon.log`
 //! (its stdout/stderr is redirected there by the T2 detached spawn):
-//! `[watcher] sync #{n}: {files} file(s)`. Exactly ONE such line for a single
+//! `watcher sync #{n}: {files} file(s)`. Exactly ONE such line for a single
 //! change proves one watcher fired once, not N (one per connected client).
 
 #![cfg(unix)]
@@ -134,10 +134,10 @@ fn read_pid_from_hello(socket: &Path) -> Option<u32> {
 fn poll_for_daemon_pid(socket: &Path, timeout: Duration) -> Option<u32> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if socket.exists() {
-            if let Some(pid) = read_pid_from_hello(socket) {
-                return Some(pid);
-            }
+        if socket.exists()
+            && let Some(pid) = read_pid_from_hello(socket)
+        {
+            return Some(pid);
         }
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -181,7 +181,7 @@ fn daemon_log(project: &Path) -> PathBuf {
     project.join(".codegraph").join("daemon.log")
 }
 
-/// Read the daemon.log and count the `[watcher] sync #` lines.
+/// Read the daemon.log and count the watcher sync lines.
 fn count_sync_lines(log: &Path) -> usize {
     let mut contents = String::new();
     if let Ok(mut file) = fs::File::open(log) {
@@ -189,11 +189,11 @@ fn count_sync_lines(log: &Path) -> usize {
     }
     contents
         .lines()
-        .filter(|line| line.contains("[watcher] sync #"))
+        .filter(|line| line.contains("watcher sync #"))
         .count()
 }
 
-/// Return the first `[watcher] sync #` line in the daemon.log, if any.
+/// Return the first watcher sync line in the daemon.log, if any.
 fn first_sync_line(log: &Path) -> Option<String> {
     let mut contents = String::new();
     if let Ok(mut file) = fs::File::open(log) {
@@ -201,11 +201,11 @@ fn first_sync_line(log: &Path) -> Option<String> {
     }
     contents
         .lines()
-        .find(|line| line.contains("[watcher] sync #"))
+        .find(|line| line.contains("watcher sync #"))
         .map(str::to_string)
 }
 
-/// Poll the daemon.log up to `timeout` for AT LEAST one `[watcher] sync #` line,
+/// Poll the daemon.log up to `timeout` for AT LEAST one watcher sync line,
 /// returning the final count once at least one appears (or the deadline hits).
 fn poll_for_sync_lines(log: &Path, timeout: Duration) -> usize {
     let deadline = Instant::now() + timeout;
@@ -219,7 +219,7 @@ fn poll_for_sync_lines(log: &Path, timeout: Duration) -> usize {
 }
 
 /// HAPPY: a single source-file change, with TWO clients connected, produces
-/// EXACTLY ONE `[watcher] sync #` line — proving the daemon owns ONE watcher
+/// EXACTLY ONE `watcher sync #` line — proving the daemon owns ONE watcher
 /// shared by both clients (not one per connection).
 #[test]
 fn daemon_single_watcher_fires_once() {
@@ -232,9 +232,9 @@ fn daemon_single_watcher_fires_once() {
         // the parallel no-watch test cannot toggle CODEGRAPH_NO_WATCH while this
         // daemon is reading its inherited env at startup.
         let _env = env_guard();
-        std::env::set_var("CODEGRAPH_WATCH_DEBOUNCE_MS", "100");
-        std::env::remove_var("CODEGRAPH_NO_WATCH");
-        spawn_detached_daemon(&bin(), &project).expect("spawn_detached_daemon");
+        unsafe { std::env::set_var("CODEGRAPH_WATCH_DEBOUNCE_MS", "100") };
+        unsafe { std::env::remove_var("CODEGRAPH_NO_WATCH") };
+        spawn_detached_daemon(&bin(), &project, false).expect("spawn_detached_daemon");
         poll_for_daemon_pid(&socket, Duration::from_millis(3000))
             .expect("daemon socket + hello pid within poll window")
     };
@@ -267,19 +267,18 @@ fn daemon_single_watcher_fires_once() {
     assert_eq!(
         count,
         1,
-        "expected EXACTLY ONE `[watcher] sync #` line for a single change \
+        "expected EXACTLY ONE `watcher sync #` line for a single change \
          (one shared watcher), saw {count}; log:\n{}",
         fs::read_to_string(&log).unwrap_or_default()
     );
     assert!(gone, "daemon pid {pid} must be dead after teardown");
 
-    // The enriched sync line carries a timestamp token, the reindexed/removed
-    // counts, AND the changed filename — while keeping the `[watcher] sync #`
-    // prefix the count assertion above depends on.
-    let sync_line = first_sync_line(&log).expect("a `[watcher] sync #` line must exist");
+    // The subscriber prepends an RFC3339 timestamp; the sync event carries the
+    // reindexed/removed counts AND the changed filename.
+    let sync_line = first_sync_line(&log).expect("a `watcher sync #` line must exist");
     assert!(
-        sync_line.contains('T') && sync_line.starts_with('['),
-        "sync line must begin with a bracketed ISO-8601 timestamp token: {sync_line:?}"
+        sync_line.contains('T') && sync_line.contains(':'),
+        "sync line must carry the subscriber's RFC3339 timestamp: {sync_line:?}"
     );
     assert!(
         sync_line.contains("reindexed") && sync_line.contains("removed"),
@@ -292,7 +291,7 @@ fn daemon_single_watcher_fires_once() {
 }
 
 /// FAILURE: with `CODEGRAPH_NO_WATCH=1` in the daemon's env, the daemon serves
-/// but does NOT watch — no `[watcher] sync #` line ever appears, and the daemon
+/// but does NOT watch — no `watcher sync #` line ever appears, and the daemon
 /// stays alive (does not panic).
 #[test]
 fn daemon_no_watch_does_not_autosync() {
@@ -305,13 +304,13 @@ fn daemon_no_watch_does_not_autosync() {
         // BEFORE releasing the guard so the happy test's spawn never inherits
         // CODEGRAPH_NO_WATCH.
         let _env = env_guard();
-        std::env::set_var("CODEGRAPH_WATCH_DEBOUNCE_MS", "100");
-        std::env::set_var("CODEGRAPH_NO_WATCH", "1");
-        let spawn = spawn_detached_daemon(&bin(), &project);
+        unsafe { std::env::set_var("CODEGRAPH_WATCH_DEBOUNCE_MS", "100") };
+        unsafe { std::env::set_var("CODEGRAPH_NO_WATCH", "1") };
+        let spawn = spawn_detached_daemon(&bin(), &project, true);
         let pid = spawn
             .ok()
             .and_then(|()| poll_for_daemon_pid(&socket, Duration::from_millis(3000)));
-        std::env::remove_var("CODEGRAPH_NO_WATCH");
+        unsafe { std::env::remove_var("CODEGRAPH_NO_WATCH") };
         pid.expect("daemon socket + hello pid within poll window")
     };
 
@@ -334,7 +333,7 @@ fn daemon_no_watch_does_not_autosync() {
     assert_eq!(
         count,
         0,
-        "watching disabled (CODEGRAPH_NO_WATCH=1) must emit NO `[watcher] sync #` \
+        "watching disabled (CODEGRAPH_NO_WATCH=1) must emit NO `watcher sync #` \
          line, saw {count}; log:\n{}",
         fs::read_to_string(&log).unwrap_or_default()
     );
