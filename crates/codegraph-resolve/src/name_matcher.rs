@@ -267,26 +267,72 @@ pub fn match_by_qualified_name(
         });
     }
 
-    // Partial qualified name match (name-matcher.ts:234-249).
+    // Several symbols share this exact qualified name (an ODR clash / separate
+    // translation units): prefer the call site's own file before the partial
+    // fallback, else the first-indexed def wins (#1079).
+    if candidates.len() > 1 {
+        let ordered = prefer_call_site_file(candidates, &reference.file_path);
+        if ordered[0].file_path == reference.file_path {
+            return Some(ResolvedRef {
+                original: reference.clone(),
+                target_node_id: ordered[0].id.clone(),
+                confidence: 0.95,
+                resolved_by: ResolvedBy::QualifiedName,
+            });
+        }
+    }
+
+    // Partial qualified name match (name-matcher.ts:234-249), again preferring
+    // the call site's own file among the candidates whose qualified name ends
+    // with the reference (#1079).
     let parts: Vec<&str> = reference.reference_name.split([':', '.']).collect();
     if let Some(last_name) = parts.last().filter(|s| !s.is_empty()) {
-        let partial = context.get_nodes_by_name(last_name);
-        for candidate in partial {
-            if candidate
-                .qualified_name
-                .ends_with(&reference.reference_name)
-            {
-                return Some(ResolvedRef {
-                    original: reference.clone(),
-                    target_node_id: candidate.id,
-                    confidence: 0.85,
-                    resolved_by: ResolvedBy::QualifiedName,
-                });
-            }
+        let partial: Vec<Node> = context
+            .get_nodes_by_name(last_name)
+            .into_iter()
+            .filter(|c| c.qualified_name.ends_with(&reference.reference_name))
+            .collect();
+        if !partial.is_empty() {
+            let ordered = prefer_call_site_file(partial, &reference.file_path);
+            return Some(ResolvedRef {
+                original: reference.clone(),
+                target_node_id: ordered[0].id.clone(),
+                confidence: 0.85,
+                resolved_by: ResolvedBy::QualifiedName,
+            });
         }
     }
 
     None
+}
+
+/// Prefer the candidate(s) declared in the call site's own file, keeping the
+/// rest in their original order (`preferCallSiteFile`, name-matcher.ts:#1079).
+/// A same-file definition is the strongest language-agnostic signal for which
+/// of several same-named symbols a call means; without it, resolution collapses
+/// onto whichever was indexed first, so a call in `b/svc` wrongly targets
+/// `a/svc`. No-op when there are <2 candidates or none share the call site's
+/// file. The partition is STABLE (preserves within-group order), so edge output
+/// stays deterministic.
+fn prefer_call_site_file(nodes: Vec<Node>, call_site_file: &str) -> Vec<Node> {
+    if nodes.len() < 2 {
+        return nodes;
+    }
+    let mut same: Vec<Node> = Vec::new();
+    let mut other: Vec<Node> = Vec::new();
+    for n in nodes {
+        if n.file_path == call_site_file {
+            same.push(n);
+        } else {
+            other.push(n);
+        }
+    }
+    if same.is_empty() {
+        other
+    } else {
+        same.extend(other);
+        same
+    }
 }
 
 /// Resolve a method on a type, walking supertypes (`resolveMethodOnType`,
@@ -356,9 +402,14 @@ fn resolve_method_on_type(
         }
     }
 
+    // Language-agnostic ambiguity: several same-named methods survive (ODR clash
+    // / separate translation units). Prefer the call site's own file (#1079).
+    // Runs AFTER the preferred_fqn block, so Java/Kotlin import disambiguation
+    // (#314), whose target is intentionally in another file, is unaffected.
+    let ordered = prefer_call_site_file(matches, &reference.file_path);
     Some(ResolvedRef {
         original: reference.clone(),
-        target_node_id: matches[0].id.clone(),
+        target_node_id: ordered[0].id.clone(),
         confidence,
         resolved_by,
     })
@@ -672,26 +723,221 @@ fn infer_java_field_receiver_type(
     Some(last_part.to_string())
 }
 
+/// Tokens a loose receiver pattern might capture that are never a user-defined
+/// type (`NON_TYPE_RECEIVER_TOKENS`, name-matcher.ts:#1108).
+fn is_non_type_receiver_token(seg: &str) -> bool {
+    matches!(
+        seg,
+        "this"
+            | "self"
+            | "super"
+            | "new"
+            | "return"
+            | "await"
+            | "yield"
+            | "typeof"
+            | "null"
+            | "nil"
+            | "None"
+            | "true"
+            | "false"
+            | "True"
+            | "False"
+            | "undefined"
+    )
+}
+
+/// Normalize a captured type expression to a simple type name: drop generic
+/// args and pointer/ref markers, take the last `.`/`::`-qualified segment, and
+/// reject obvious non-types (`normalizeInferredTypeName`, name-matcher.ts:#1108).
+fn normalize_inferred_type_name(raw: &str) -> Option<String> {
+    static GENERICS: OnceLock<Regex> = OnceLock::new();
+    let generics = GENERICS.get_or_init(|| Regex::new(r"<[^>]*>").expect("inferred generics re"));
+    let cleaned = generics.replace_all(raw, "");
+    let cleaned = cleaned.replace(['&', '*'], "");
+    let seg = cleaned.split(['.', ':']).rfind(|s| !s.is_empty())?;
+    if is_non_type_receiver_token(seg) {
+        return None;
+    }
+    Some(seg.to_string())
+}
+
+/// Per-language patterns recovering a local variable's (or typed parameter's)
+/// declared type from its declaration/initializer line. Each regex captures the
+/// type in group 1; `r` is the already-escaped receiver name. Ordered
+/// most-specific first. The type-annotation / typed-parameter forms (#1125) are
+/// baked into the second pattern per language. Languages without a pattern set
+/// (the C++ path uses its own dedicated inferrer) return an empty vector.
+fn local_receiver_type_patterns(language: Language, r: &str) -> Vec<Regex> {
+    let build = |src: String| Regex::new(&src).ok();
+    let pats: Vec<String> = match language {
+        Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx => vec![
+            format!(r"\b{r}\b\s*=\s*new\s+([A-Za-z_$][\w.$]*)"),
+            format!(r"\b{r}\b\s*:\s*([A-Z][\w.$]*)"),
+        ],
+        Language::Python => vec![
+            format!(r"\b{r}\b\s*=\s*([A-Z][\w.]*)\s*\("),
+            format!(r"\b{r}\b\s*:\s*([A-Z][\w.]*)"),
+        ],
+        Language::Java => vec![
+            format!(r"\b{r}\b\s*=\s*new\s+([A-Za-z_][\w.]*)"),
+            format!(r"\b([A-Z][\w.]*)\s+{r}\b\s*[=;,)]"),
+        ],
+        Language::Kotlin => vec![
+            format!(r"\b{r}\b\s*=\s*([A-Z][\w.]*)\s*\("),
+            format!(r"\b{r}\b\s*:\s*([A-Z][\w.]*)"),
+        ],
+        Language::CSharp => vec![
+            format!(r"\b{r}\b\s*=\s*new\s+([A-Za-z_][\w.]*)"),
+            format!(r"\b([A-Z][\w.]*)\s+{r}\b\s*[=;,)]"),
+        ],
+        Language::Swift => vec![
+            format!(r"\b{r}\b\s*=\s*([A-Z][\w.]*)\s*\("),
+            format!(r"\b{r}\b\s*:\s*([A-Z][\w.]*)"),
+        ],
+        Language::Rust => vec![
+            format!(r"\blet\s+(?:mut\s+)?{r}\b(?:\s*:[^=]+)?=\s*&?(?:mut\s+)?([A-Z]\w*)"),
+            format!(r"\b{r}\s*:\s*&?(?:mut\s+)?([A-Z]\w*)"),
+        ],
+        Language::Go => vec![
+            format!(r"\b{r}\b\s*:=\s*&?([A-Za-z_][\w.]*)\s*\{{"),
+            format!(r"\bvar\s+{r}\s+\*?([A-Za-z_][\w.]*)"),
+            format!(r"\b{r}\s+\*?([A-Z][\w.]*)"),
+        ],
+        Language::Ruby => vec![format!(r"\b{r}\b\s*=\s*([A-Z][\w:]*)\.new\b")],
+        Language::Scala => vec![
+            format!(r"\b{r}\b\s*=\s*(?:new\s+)?([A-Z][\w.]*)"),
+            format!(r"\b{r}\b\s*:\s*([A-Z][\w.]*)"),
+        ],
+        Language::Dart => vec![
+            format!(r"\b{r}\b\s*=\s*([A-Z][\w.]*)\s*\("),
+            format!(r"\b([A-Z][\w.]*)\s+{r}\b\s*[=;,)]"),
+        ],
+        Language::Php => vec![
+            format!(r"\$?{r}\b\s*=\s*new\s+([A-Za-z_\\][\w\\]*)"),
+            format!(r"\b([A-Za-z_\\][\w\\]*)\s+&?\${r}\b"),
+        ],
+        Language::Lua | Language::Luau => vec![
+            format!(r"\b{r}\b\s*=\s*([A-Z]\w*)\.new\b"),
+            format!(r"\b{r}\b\s*=\s*([A-Z]\w*)\s*\("),
+            format!(r#"\b{r}\b\s*:\s*([A-Z][\w.]*)(?:[\w.]|\s*[({{"'\[])?"#),
+        ],
+        Language::R => vec![format!(r"\b{r}\b\s*(?:<-|<<-|=)\s*([A-Z][\w.]*)\$new\b")],
+        Language::Pascal => vec![
+            format!(r"\b{r}\b\s*:\s*([A-Z]\w*)"),
+            format!(r"\b{r}\b\s*:=\s*([A-Z][\w.]*)\.Create\b"),
+        ],
+        _ => Vec::new(),
+    };
+    pats.into_iter().filter_map(build).collect()
+}
+
+/// 1-based start line of the tightest function/method enclosing the call
+/// (`enclosingScopeStartLine`, name-matcher.ts:#1108). Bounds the backward scan
+/// so a same-named variable in another function can't leak in.
+fn enclosing_scope_start_line(reference: &RefView, context: &dyn ResolutionContext) -> i64 {
+    let mut start = 1i64;
+    for n in context.get_nodes_in_file(&reference.file_path) {
+        if !matches!(n.kind, NodeKind::Function | NodeKind::Method)
+            || n.language != reference.language
+        {
+            continue;
+        }
+        let end = if n.end_line != 0 {
+            n.end_line
+        } else {
+            n.start_line
+        };
+        if n.start_line <= reference.line && end >= reference.line && n.start_line >= start {
+            start = n.start_line;
+        }
+    }
+    start
+}
+
+/// Infer a receiver's type from its local declaration/initializer in the
+/// enclosing function body (`inferLocalReceiverType`, name-matcher.ts:#1108).
+/// Language-dispatched via `local_receiver_type_patterns`; returns `None` for
+/// languages without patterns or when no declaration is found. Bounded to the
+/// enclosing scope. The caller validates the method via `resolve_method_on_type`,
+/// so a mis-inference produces no edge.
+fn infer_local_receiver_type(
+    receiver_name: &str,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<String> {
+    let escaped = regex_escape(receiver_name);
+    let patterns = local_receiver_type_patterns(reference.language, &escaped);
+    if patterns.is_empty() {
+        return None;
+    }
+    let source = context.read_file(&reference.file_path)?;
+    let lines: Vec<&str> = source
+        .split('\n')
+        .map(|l| l.trim_end_matches('\r'))
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let call_idx = ((reference.line - 1).max(0) as usize).min(lines.len() - 1);
+    let start_idx = (enclosing_scope_start_line(reference, context) - 1).max(0) as usize;
+
+    for i in (start_idx..=call_idx).rev() {
+        let line = lines[i];
+        // A generated/minified line is not where a human declaration lives, and
+        // regexing multi-KB text per ref is pure waste — skip it.
+        if line.len() > 10_000 {
+            continue;
+        }
+        for re in &patterns {
+            if let Some(caps) = re.captures(line) {
+                if let Some(m) = caps.get(1) {
+                    if let Some(ty) = normalize_inferred_type_name(m.as_str()) {
+                        return Some(ty);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Try to resolve by method name on a class/object (`matchMethodCall`,
 /// `name-matcher.ts:930-1133`).
 ///
-/// C++ receiver-type inference (name-matcher.ts:953-968) and Java/Kotlin
-/// field-receiver inference (name-matcher.ts:975-996) run first as typed-receiver
-/// hooks; both validate the method via `resolve_method_on_type` so a wrong
-/// inference yields no edge. Strategies 1-3 (direct class match, capitalized
-/// receiver, receiver-overlap scoring) then cover the golden mini's instance-method
-/// edges.
+/// Local-variable / typed-parameter receiver-type inference (#1108/#1125) runs
+/// first: C++ keeps its dedicated inferrer (header scan + `auto`), every other
+/// language uses the shared source-based `infer_local_receiver_type`. Java/Kotlin
+/// then also try field-receiver inference (name-matcher.ts:975-996). All validate
+/// the method via `resolve_method_on_type` so a wrong inference yields no edge.
+/// Strategies 1-3 (direct class match, capitalized receiver, receiver-overlap
+/// scoring) then cover the remaining instance-method edges, each preferring the
+/// call site's own file among same-named candidates (#1079).
 pub fn match_method_call(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> Option<ResolvedRef> {
-    let parsed = parse_method_call(&reference.reference_name)?;
+    let parsed = parse_method_call(&reference.reference_name, reference.language)?;
     let (object_or_class, method_name) = parsed;
 
-    // C++ receiver inference (name-matcher.ts:953-968): only for the dotted
-    // `obj.method` shape (a `Class::method` colon-call is not an instance call).
-    if reference.language == Language::Cpp && is_dot_call(&reference.reference_name) {
-        if let Some(inferred) = infer_cpp_receiver_type(&object_or_class, reference, context, 0) {
+    // Receiver-type inference (#1108/#1125): only for a simple `obj.method` /
+    // `obj:method` (Lua) / `obj$method` (R) shape — a `Class::method` colon-call
+    // is not an instance call. C++ uses its dedicated inferrer; every other
+    // language uses the shared source-based inferrer.
+    if is_inferable_receiver_call(&reference.reference_name, reference.language) {
+        let inferred = if reference.language == Language::Cpp {
+            infer_cpp_receiver_type(&object_or_class, reference, context, 0)
+        } else {
+            infer_local_receiver_type(&object_or_class, reference, context)
+        };
+        if let Some(inferred) = inferred {
+            // Java/Kotlin: the file's import pins WHICH same-named class (#314);
+            // other languages disambiguate by call-site file in resolve_method_on_type.
+            let imported_fqn = if matches!(reference.language, Language::Java | Language::Kotlin) {
+                imported_fqn_of(&inferred, reference, context)
+            } else {
+                None
+            };
             if let Some(typed) = resolve_method_on_type(
                 &inferred,
                 &method_name,
@@ -699,7 +945,7 @@ pub fn match_method_call(
                 context,
                 0.9,
                 ResolvedBy::InstanceMethod,
-                None,
+                imported_fqn.as_deref(),
                 0,
             ) {
                 return Some(typed);
@@ -731,8 +977,13 @@ pub fn match_method_call(
         }
     }
 
-    // Strategy 1: direct class name match (name-matcher.ts:825-850).
-    for class_node in context.get_nodes_by_name(&object_or_class) {
+    // Strategy 1: direct class name match (name-matcher.ts:825-850). When the
+    // receiver names a class in several files, try the call site's own file
+    // first (#1079).
+    for class_node in prefer_call_site_file(
+        context.get_nodes_by_name(&object_or_class),
+        &reference.file_path,
+    ) {
         if matches!(
             class_node.kind,
             NodeKind::Class | NodeKind::Struct | NodeKind::Interface
@@ -752,10 +1003,13 @@ pub fn match_method_call(
     }
 
     // Strategy 2: instance-variable receiver → capitalized class
-    // (name-matcher.ts:852-880).
+    // (name-matcher.ts:852-880), call-site file first (#1079).
     let capitalized = capitalize(&object_or_class);
     if capitalized != object_or_class {
-        for class_node in context.get_nodes_by_name(&capitalized) {
+        for class_node in prefer_call_site_file(
+            context.get_nodes_by_name(&capitalized),
+            &reference.file_path,
+        ) {
             if matches!(
                 class_node.kind,
                 NodeKind::Class | NodeKind::Struct | NodeKind::Interface
@@ -779,6 +1033,11 @@ pub fn match_method_call(
     // Strategy 3: methods-by-name, receiver-overlap scoring
     // (name-matcher.ts:882-933).
     let method_candidates = context.get_nodes_by_name(&method_name);
+    // Ubiquitous-method ceiling (#999): bail before the O(K) scoring work when a
+    // method name is re-declared across a vendored theme/SDK.
+    if method_candidates.len() > ambiguous_name_ceiling() {
+        return None;
+    }
     let methods: Vec<Node> = method_candidates
         .into_iter()
         .filter(|n| n.kind == NodeKind::Method && n.name == method_name)
@@ -805,9 +1064,12 @@ pub fn match_method_call(
 
     if target_methods.len() > 1 {
         let receiver_words = split_camel_case(&object_or_class);
+        // Same-file candidates first, so a score tie (`score > best_score` keeps
+        // the first seen) resolves to the call site's own file (#1079).
+        let ordered = prefer_call_site_file(target_methods, &reference.file_path);
         let mut best_match: Option<&Node> = None;
         let mut best_score = 0i64;
-        for method in &target_methods {
+        for method in &ordered {
             let class_words = split_camel_case(&method.qualified_name);
             let mut score = receiver_words
                 .iter()
@@ -836,18 +1098,90 @@ pub fn match_method_call(
     None
 }
 
-/// Parse `obj.method` or `Class::method` (name-matcher.ts:770-778).
-fn parse_method_call(name: &str) -> Option<(String, String)> {
+/// Parse `obj.method`, `Class::method`, Lua/Luau `obj:method`, or R `obj$method`
+/// (name-matcher.ts:770-778 + #1112). The `:`/`$` separators are recognized ONLY
+/// for their owning language, so a `lg:log` ref elsewhere is not a call shape.
+fn parse_method_call(name: &str, language: Language) -> Option<(String, String)> {
     if let Some(captures) = match_dot_call(name) {
         return Some(captures);
     }
-    match_colon_call(name)
+    if let Some(captures) = match_colon_call(name) {
+        return Some(captures);
+    }
+    if matches!(language, Language::Lua | Language::Luau) {
+        if let Some(captures) = match_lua_colon_call(name) {
+            return Some(captures);
+        }
+    }
+    if language == Language::R {
+        if let Some(captures) = match_r_dollar_call(name) {
+            return Some(captures);
+        }
+    }
+    None
+}
+
+/// A simple `receiver.method` / `receiver:method` (Lua) / `receiver$method` (R)
+/// shape whose receiver type we can try to infer (`inferableReceiver`,
+/// name-matcher.ts:#1108/#1112). A `Class::method` colon-call is excluded — it is
+/// not an instance call.
+fn is_inferable_receiver_call(name: &str, language: Language) -> bool {
+    if match_dot_call(name).is_some() {
+        return true;
+    }
+    if matches!(language, Language::Lua | Language::Luau) && match_lua_colon_call(name).is_some() {
+        return true;
+    }
+    if language == Language::R && match_r_dollar_call(name).is_some() {
+        return true;
+    }
+    false
 }
 
 /// Did the ref match the dotted `obj.method` shape (the upstream `dotMatch` that
-/// gates the C++/Java typed-receiver hooks, name-matcher.ts:953/975)?
+/// gates the Java field-receiver hook, name-matcher.ts:975)?
 fn is_dot_call(name: &str) -> bool {
     match_dot_call(name).is_some()
+}
+
+/// Matches `/^([\w.]+):(\w+)$/` — a Lua/Luau method call `obj:method` (#1112).
+fn match_lua_colon_call(name: &str) -> Option<(String, String)> {
+    let idx = name.find(':')?;
+    let receiver = &name[..idx];
+    let method = &name[idx + 1..];
+    if receiver.is_empty() || method.is_empty() {
+        return None;
+    }
+    if !receiver
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+    {
+        return None;
+    }
+    if !is_word(method) {
+        return None;
+    }
+    Some((receiver.to_string(), method.to_string()))
+}
+
+/// Matches `/^([\w.]+)\$(\w+)$/` — an R method call `obj$method` (#1112).
+fn match_r_dollar_call(name: &str) -> Option<(String, String)> {
+    let idx = name.find('$')?;
+    let receiver = &name[..idx];
+    let method = &name[idx + 1..];
+    if receiver.is_empty() || method.is_empty() {
+        return None;
+    }
+    if !receiver
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+    {
+        return None;
+    }
+    if !is_word(method) {
+        return None;
+    }
+    Some((receiver.to_string(), method.to_string()))
 }
 
 /// Matches `/^([\w.]+)\.(\w+:?(?:\w+:)*)$/` (name-matcher.ts:770).
@@ -2325,14 +2659,26 @@ mod tests {
     #[test]
     fn parse_method_call_prefers_dot_then_colon() {
         assert_eq!(
-            parse_method_call("obj.m"),
+            parse_method_call("obj.m", Language::TypeScript),
             Some(("obj".to_string(), "m".to_string()))
         );
         assert_eq!(
-            parse_method_call("Foo::m"),
+            parse_method_call("Foo::m", Language::TypeScript),
             Some(("Foo".to_string(), "m".to_string()))
         );
-        assert_eq!(parse_method_call("plain"), None);
+        assert_eq!(parse_method_call("plain", Language::TypeScript), None);
+        // Lua colon separator only recognized for Lua/Luau.
+        assert_eq!(
+            parse_method_call("lg:log", Language::Lua),
+            Some(("lg".to_string(), "log".to_string()))
+        );
+        assert_eq!(parse_method_call("lg:log", Language::Rust), None);
+        // R dollar separator only recognized for R.
+        assert_eq!(
+            parse_method_call("lg$log", Language::R),
+            Some(("lg".to_string(), "log".to_string()))
+        );
+        assert_eq!(parse_method_call("lg$log", Language::TypeScript), None);
     }
 
     #[test]
@@ -3797,5 +4143,1304 @@ mod tests {
         )
         .expect("suffix match");
         assert_eq!(res.target_node_id, "method:m");
+    }
+
+    // ================= Round 5: prefer_call_site_file (#1079) =================
+
+    #[test]
+    fn prefer_call_site_file_partitions_same_file_first() {
+        // Two same-named nodes: the one in the call site's file is moved first,
+        // the rest keep their original order.
+        let a = mk(
+            "method:a",
+            NodeKind::Method,
+            "log",
+            "Logger::log",
+            "a/svc.cpp",
+            Language::Cpp,
+        );
+        let b = mk(
+            "method:b",
+            NodeKind::Method,
+            "log",
+            "Logger::log",
+            "b/svc.cpp",
+            Language::Cpp,
+        );
+        let c = mk(
+            "method:c",
+            NodeKind::Method,
+            "log",
+            "Logger::log",
+            "c/svc.cpp",
+            Language::Cpp,
+        );
+        let ordered = prefer_call_site_file(vec![a, b, c], "b/svc.cpp");
+        assert_eq!(ordered[0].id, "method:b");
+        assert_eq!(ordered[1].id, "method:a");
+        assert_eq!(ordered[2].id, "method:c");
+    }
+
+    #[test]
+    fn prefer_call_site_file_noop_when_lt_two() {
+        let a = mk(
+            "method:a",
+            NodeKind::Method,
+            "log",
+            "Logger::log",
+            "a/svc.cpp",
+            Language::Cpp,
+        );
+        let ordered = prefer_call_site_file(vec![a], "z/other.cpp");
+        assert_eq!(ordered.len(), 1);
+        assert_eq!(ordered[0].id, "method:a");
+    }
+
+    #[test]
+    fn prefer_call_site_file_noop_when_none_in_file() {
+        // No candidate shares the call site's file — original order preserved.
+        let a = mk(
+            "method:a",
+            NodeKind::Method,
+            "log",
+            "Logger::log",
+            "a/svc.cpp",
+            Language::Cpp,
+        );
+        let b = mk(
+            "method:b",
+            NodeKind::Method,
+            "log",
+            "Logger::log",
+            "b/svc.cpp",
+            Language::Cpp,
+        );
+        let ordered = prefer_call_site_file(vec![a, b], "z/other.cpp");
+        assert_eq!(ordered[0].id, "method:a");
+        assert_eq!(ordered[1].id, "method:b");
+    }
+
+    #[test]
+    fn method_on_type_prefers_call_site_file_when_ambiguous() {
+        // Two `Logger::log` methods (ODR clash). Call from b/svc.cpp resolves to
+        // the b/ one, NOT the first-indexed a/ one (#1079).
+        let a = mk(
+            "method:a",
+            NodeKind::Method,
+            "log",
+            "Logger::log",
+            "a/svc.cpp",
+            Language::Cpp,
+        );
+        let b = mk(
+            "method:b",
+            NodeKind::Method,
+            "log",
+            "Logger::log",
+            "b/svc.cpp",
+            Language::Cpp,
+        );
+        let ctx = Ctx::default().name("log", vec![a, b]);
+        let r = refv("x", EdgeKind::Calls, "b/svc.cpp", Language::Cpp, 1);
+        let res = resolve_method_on_type(
+            "Logger",
+            "log",
+            &r,
+            &ctx,
+            0.9,
+            ResolvedBy::InstanceMethod,
+            None,
+            0,
+        )
+        .expect("ambiguous method resolves to own file");
+        assert_eq!(res.target_node_id, "method:b");
+    }
+
+    #[test]
+    fn method_on_type_preferred_fqn_beats_call_site_file() {
+        // #314 must still win over #1079: the preferredFqn picks a DIFFERENT file
+        // than the call site (Java import disambiguation targets another file).
+        let a = mk(
+            "method:a",
+            NodeKind::Method,
+            "bar",
+            "Foo::bar",
+            "src/pkg/Foo.java",
+            Language::Java,
+        );
+        let b = mk(
+            "method:b",
+            NodeKind::Method,
+            "bar",
+            "Foo::bar",
+            "src/callsite/Foo.java",
+            Language::Java,
+        );
+        let ctx = Ctx::default().name("bar", vec![a, b]);
+        // Call site is src/callsite/... but the imported FQN pins pkg.Foo.
+        let r = refv(
+            "x",
+            EdgeKind::Calls,
+            "src/callsite/Caller.java",
+            Language::Java,
+            1,
+        );
+        let res = resolve_method_on_type(
+            "Foo",
+            "bar",
+            &r,
+            &ctx,
+            0.9,
+            ResolvedBy::InstanceMethod,
+            Some("pkg.Foo"),
+            0,
+        )
+        .expect("preferred fqn wins");
+        assert_eq!(res.target_node_id, "method:a");
+    }
+
+    #[test]
+    fn qualified_name_exact_ambiguous_prefers_call_site_file() {
+        // Two exact `Foo::get` qualified matches; the call site's own file wins (#1079).
+        let a = mk(
+            "method:a",
+            NodeKind::Method,
+            "get",
+            "Foo::get",
+            "a/foo.rs",
+            Language::Rust,
+        );
+        let b = mk(
+            "method:b",
+            NodeKind::Method,
+            "get",
+            "Foo::get",
+            "b/foo.rs",
+            Language::Rust,
+        );
+        let ctx = Ctx::default().qualified("Foo::get", vec![a, b]);
+        let r = refv("Foo::get", EdgeKind::Calls, "b/foo.rs", Language::Rust, 1);
+        let res = match_by_qualified_name(&r, &ctx).expect("ambiguous qualified own file");
+        assert_eq!(res.target_node_id, "method:b");
+        assert!((res.confidence - 0.95).abs() < 1e-9);
+    }
+
+    #[test]
+    fn qualified_name_exact_ambiguous_no_own_file_declines_to_partial() {
+        // Two exact matches, neither in the call site's file: the exact-ambiguous
+        // branch does NOT resolve (own file not first); falls through to partial.
+        let a = mk(
+            "method:a",
+            NodeKind::Method,
+            "get",
+            "Foo::get",
+            "a/foo.rs",
+            Language::Rust,
+        );
+        let b = mk(
+            "method:b",
+            NodeKind::Method,
+            "get",
+            "Foo::get",
+            "b/foo.rs",
+            Language::Rust,
+        );
+        // partial fallback: get-by-name candidates whose qualified_name ends with ref.
+        let ctx = Ctx::default()
+            .qualified("Foo::get", vec![a, b.clone()])
+            .name("get", vec![b]);
+        let r = refv("Foo::get", EdgeKind::Calls, "z/other.rs", Language::Rust, 1);
+        let res = match_by_qualified_name(&r, &ctx).expect("partial fallback");
+        // Partial path returns first candidate whose qname ends with the ref.
+        assert_eq!(res.target_node_id, "method:b");
+        assert!((res.confidence - 0.85).abs() < 1e-9);
+    }
+
+    #[test]
+    fn qualified_name_partial_prefers_call_site_file() {
+        // Partial qualified match with two candidates ending in the ref; own file wins.
+        let a = mk(
+            "method:a",
+            NodeKind::Method,
+            "get",
+            "pkg::Foo::get",
+            "a/foo.rs",
+            Language::Rust,
+        );
+        let b = mk(
+            "method:b",
+            NodeKind::Method,
+            "get",
+            "pkg::Foo::get",
+            "b/foo.rs",
+            Language::Rust,
+        );
+        let ctx = Ctx::default()
+            .qualified("Foo::get", vec![])
+            .name("get", vec![a, b]);
+        let r = refv("Foo::get", EdgeKind::Calls, "b/foo.rs", Language::Rust, 1);
+        let res = match_by_qualified_name(&r, &ctx).expect("partial own file");
+        assert_eq!(res.target_node_id, "method:b");
+    }
+
+    #[test]
+    fn method_call_strategy1_prefers_call_site_file() {
+        // `Logger.log` — two Logger classes in different files; the call site's own
+        // file class is tried first (#1079).
+        let class_a = mk(
+            "class:a",
+            NodeKind::Class,
+            "Logger",
+            "Logger",
+            "a/logger.ts",
+            Language::TypeScript,
+        );
+        let class_b = mk(
+            "class:b",
+            NodeKind::Class,
+            "Logger",
+            "Logger",
+            "b/logger.ts",
+            Language::TypeScript,
+        );
+        let method_a = mk(
+            "method:a",
+            NodeKind::Method,
+            "log",
+            "Logger::log",
+            "a/logger.ts",
+            Language::TypeScript,
+        );
+        let method_b = mk(
+            "method:b",
+            NodeKind::Method,
+            "log",
+            "Logger::log",
+            "b/logger.ts",
+            Language::TypeScript,
+        );
+        let ctx = Ctx::default()
+            .name("Logger", vec![class_a, class_b])
+            .nodes_in_file("a/logger.ts", vec![method_a])
+            .nodes_in_file("b/logger.ts", vec![method_b]);
+        let r = refv(
+            "Logger.log",
+            EdgeKind::Calls,
+            "b/logger.ts",
+            Language::TypeScript,
+            5,
+        );
+        let res = match_method_call(&r, &ctx).expect("strategy1 own file");
+        assert_eq!(res.target_node_id, "method:b");
+    }
+
+    #[test]
+    fn method_call_strategy3_prefers_call_site_file_on_tie() {
+        // Two `save` methods with equal receiver-word overlap; the call site's own
+        // file wins the tie because prefer_call_site_file reorders it first (#1079).
+        let good_a = mk(
+            "method:a",
+            NodeKind::Method,
+            "save",
+            "UserRepository::save",
+            "a/repo.ts",
+            Language::TypeScript,
+        );
+        let good_b = mk(
+            "method:b",
+            NodeKind::Method,
+            "save",
+            "UserRepository::save",
+            "b/repo.ts",
+            Language::TypeScript,
+        );
+        let ctx = Ctx::default().name("save", vec![good_a, good_b]);
+        let r = refv(
+            "userRepository.save",
+            EdgeKind::Calls,
+            "b/repo.ts",
+            Language::TypeScript,
+            1,
+        );
+        let res = match_method_call(&r, &ctx).expect("strategy3 tie own file");
+        assert_eq!(res.target_node_id, "method:b");
+        assert!((res.confidence - 0.65).abs() < 1e-9);
+    }
+
+    // ================= Round 5: #1108 local-var receiver inference ============
+
+    /// Build a ctx whose file `path` has `source`, plus an enclosing function
+    /// spanning the whole file (so the scope bound includes the call line).
+    fn ctx_with_scope(
+        path: &str,
+        source: &str,
+        lang: Language,
+        method: Node,
+        method_name: &str,
+    ) -> Ctx {
+        let mut fn_node = mk(
+            "function:scope",
+            NodeKind::Function,
+            "run",
+            "run",
+            path,
+            lang,
+        );
+        fn_node.start_line = 1;
+        fn_node.end_line = source.split('\n').count() as i64 + 1;
+        Ctx::default()
+            .file(path, source)
+            .nodes_in_file(path, vec![fn_node])
+            .name(method_name, vec![method])
+    }
+
+    #[test]
+    fn local_var_ts_new_constructor() {
+        // TS: `const lg = new Logger(); lg.log()` — infer lg: Logger, resolve log.
+        let m = mk(
+            "method:log",
+            NodeKind::Method,
+            "log",
+            "Logger::log",
+            "src/a.ts",
+            Language::TypeScript,
+        );
+        let ctx = ctx_with_scope(
+            "src/a.ts",
+            "function run() {\n  const lg = new Logger();\n  lg.log();\n}\n",
+            Language::TypeScript,
+            m,
+            "log",
+        );
+        let r = refv(
+            "lg.log",
+            EdgeKind::Calls,
+            "src/a.ts",
+            Language::TypeScript,
+            3,
+        );
+        let res = match_method_call(&r, &ctx).expect("ts new inference");
+        assert_eq!(res.target_node_id, "method:log");
+        assert_eq!(res.resolved_by, ResolvedBy::InstanceMethod);
+        assert!((res.confidence - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn local_var_ts_annotation() {
+        // TS: `const lg: Logger = get(); lg.log()` — infer from the annotation.
+        let m = mk(
+            "method:log",
+            NodeKind::Method,
+            "log",
+            "Logger::log",
+            "src/a.ts",
+            Language::TypeScript,
+        );
+        let ctx = ctx_with_scope(
+            "src/a.ts",
+            "function run() {\n  const lg: Logger = get();\n  lg.log();\n}\n",
+            Language::TypeScript,
+            m,
+            "log",
+        );
+        let r = refv(
+            "lg.log",
+            EdgeKind::Calls,
+            "src/a.ts",
+            Language::TypeScript,
+            3,
+        );
+        let res = match_method_call(&r, &ctx).expect("ts annotation inference");
+        assert_eq!(res.target_node_id, "method:log");
+    }
+
+    #[test]
+    fn local_var_python_construction() {
+        // Python: `lg = Logger()\n lg.log()`.
+        let m = mk(
+            "method:log",
+            NodeKind::Method,
+            "log",
+            "Logger::log",
+            "src/a.py",
+            Language::Python,
+        );
+        let ctx = ctx_with_scope(
+            "src/a.py",
+            "def run():\n    lg = Logger()\n    lg.log()\n",
+            Language::Python,
+            m,
+            "log",
+        );
+        let r = refv("lg.log", EdgeKind::Calls, "src/a.py", Language::Python, 3);
+        let res = match_method_call(&r, &ctx).expect("python construction inference");
+        assert_eq!(res.target_node_id, "method:log");
+    }
+
+    #[test]
+    fn local_var_python_annotation() {
+        // Python PEP 526: `lg: Logger` param/annotation.
+        let m = mk(
+            "method:log",
+            NodeKind::Method,
+            "log",
+            "Logger::log",
+            "src/a.py",
+            Language::Python,
+        );
+        let ctx = ctx_with_scope(
+            "src/a.py",
+            "def run(lg: Logger):\n    lg.log()\n",
+            Language::Python,
+            m,
+            "log",
+        );
+        let r = refv("lg.log", EdgeKind::Calls, "src/a.py", Language::Python, 2);
+        let res = match_method_call(&r, &ctx).expect("python annotation inference");
+        assert_eq!(res.target_node_id, "method:log");
+    }
+
+    #[test]
+    fn local_var_go_composite_literal() {
+        // Go: `lg := Logger{}\n lg.Log()`.
+        let m = mk(
+            "method:log",
+            NodeKind::Method,
+            "Log",
+            "Logger::Log",
+            "a.go",
+            Language::Go,
+        );
+        let ctx = ctx_with_scope(
+            "a.go",
+            "func run() {\n\tlg := Logger{}\n\tlg.Log()\n}\n",
+            Language::Go,
+            m,
+            "Log",
+        );
+        let r = refv("lg.Log", EdgeKind::Calls, "a.go", Language::Go, 3);
+        let res = match_method_call(&r, &ctx).expect("go composite literal inference");
+        assert_eq!(res.target_node_id, "method:log");
+    }
+
+    #[test]
+    fn local_var_go_var_decl() {
+        // Go: `var lg *Logger\n lg.Log()`.
+        let m = mk(
+            "method:log",
+            NodeKind::Method,
+            "Log",
+            "Logger::Log",
+            "a.go",
+            Language::Go,
+        );
+        let ctx = ctx_with_scope(
+            "a.go",
+            "func run() {\n\tvar lg *Logger\n\tlg.Log()\n}\n",
+            Language::Go,
+            m,
+            "Log",
+        );
+        let r = refv("lg.Log", EdgeKind::Calls, "a.go", Language::Go, 3);
+        let res = match_method_call(&r, &ctx).expect("go var decl inference");
+        assert_eq!(res.target_node_id, "method:log");
+    }
+
+    #[test]
+    fn local_var_rust_let_new() {
+        // Rust: `let lg = Logger::new(); lg.log()`.
+        let m = mk(
+            "method:log",
+            NodeKind::Method,
+            "log",
+            "Logger::log",
+            "src/a.rs",
+            Language::Rust,
+        );
+        let ctx = ctx_with_scope(
+            "src/a.rs",
+            "fn run() {\n    let lg = Logger::new();\n    lg.log();\n}\n",
+            Language::Rust,
+            m,
+            "log",
+        );
+        let r = refv("lg.log", EdgeKind::Calls, "src/a.rs", Language::Rust, 3);
+        let res = match_method_call(&r, &ctx).expect("rust let new inference");
+        assert_eq!(res.target_node_id, "method:log");
+    }
+
+    #[test]
+    fn local_var_rust_let_struct_literal() {
+        // Rust: `let lg = Logger { .. }; lg.log()`.
+        let m = mk(
+            "method:log",
+            NodeKind::Method,
+            "log",
+            "Logger::log",
+            "src/a.rs",
+            Language::Rust,
+        );
+        let ctx = ctx_with_scope(
+            "src/a.rs",
+            "fn run() {\n    let lg = Logger { level: 0 };\n    lg.log();\n}\n",
+            Language::Rust,
+            m,
+            "log",
+        );
+        let r = refv("lg.log", EdgeKind::Calls, "src/a.rs", Language::Rust, 3);
+        let res = match_method_call(&r, &ctx).expect("rust struct literal inference");
+        assert_eq!(res.target_node_id, "method:log");
+    }
+
+    #[test]
+    fn local_var_java_new() {
+        // Java: `Logger lg = new Logger(); lg.log()`.
+        let m = mk(
+            "method:log",
+            NodeKind::Method,
+            "log",
+            "Logger::log",
+            "src/A.java",
+            Language::Java,
+        );
+        let ctx = ctx_with_scope(
+            "src/A.java",
+            "void run() {\n    Logger lg = new Logger();\n    lg.log();\n}\n",
+            Language::Java,
+            m,
+            "log",
+        );
+        let r = refv("lg.log", EdgeKind::Calls, "src/A.java", Language::Java, 3);
+        let res = match_method_call(&r, &ctx).expect("java new inference");
+        assert_eq!(res.target_node_id, "method:log");
+    }
+
+    #[test]
+    fn local_var_csharp_new() {
+        // C#: `var lg = new Logger(); lg.Log()`.
+        let m = mk(
+            "method:log",
+            NodeKind::Method,
+            "Log",
+            "Logger::Log",
+            "src/A.cs",
+            Language::CSharp,
+        );
+        let ctx = ctx_with_scope(
+            "src/A.cs",
+            "void Run() {\n    var lg = new Logger();\n    lg.Log();\n}\n",
+            Language::CSharp,
+            m,
+            "Log",
+        );
+        let r = refv("lg.Log", EdgeKind::Calls, "src/A.cs", Language::CSharp, 3);
+        let res = match_method_call(&r, &ctx).expect("csharp new inference");
+        assert_eq!(res.target_node_id, "method:log");
+    }
+
+    #[test]
+    fn local_var_kotlin_construction() {
+        // Kotlin: `val lg = Logger()\n lg.log()`.
+        let m = mk(
+            "method:log",
+            NodeKind::Method,
+            "log",
+            "Logger::log",
+            "src/A.kt",
+            Language::Kotlin,
+        );
+        let ctx = ctx_with_scope(
+            "src/A.kt",
+            "fun run() {\n    val lg = Logger()\n    lg.log()\n}\n",
+            Language::Kotlin,
+            m,
+            "log",
+        );
+        let r = refv("lg.log", EdgeKind::Calls, "src/A.kt", Language::Kotlin, 3);
+        let res = match_method_call(&r, &ctx).expect("kotlin construction inference");
+        assert_eq!(res.target_node_id, "method:log");
+    }
+
+    #[test]
+    fn local_var_swift_construction() {
+        // Swift: `let lg = Logger()\n lg.log()`.
+        let m = mk(
+            "method:log",
+            NodeKind::Method,
+            "log",
+            "Logger::log",
+            "src/A.swift",
+            Language::Swift,
+        );
+        let ctx = ctx_with_scope(
+            "src/A.swift",
+            "func run() {\n    let lg = Logger()\n    lg.log()\n}\n",
+            Language::Swift,
+            m,
+            "log",
+        );
+        let r = refv("lg.log", EdgeKind::Calls, "src/A.swift", Language::Swift, 3);
+        let res = match_method_call(&r, &ctx).expect("swift construction inference");
+        assert_eq!(res.target_node_id, "method:log");
+    }
+
+    #[test]
+    fn local_var_scala_new() {
+        // Scala: `val lg = new Logger\n lg.log()`.
+        let m = mk(
+            "method:log",
+            NodeKind::Method,
+            "log",
+            "Logger::log",
+            "src/A.scala",
+            Language::Scala,
+        );
+        let ctx = ctx_with_scope(
+            "src/A.scala",
+            "def run() = {\n  val lg = new Logger\n  lg.log()\n}\n",
+            Language::Scala,
+            m,
+            "log",
+        );
+        let r = refv("lg.log", EdgeKind::Calls, "src/A.scala", Language::Scala, 3);
+        let res = match_method_call(&r, &ctx).expect("scala new inference");
+        assert_eq!(res.target_node_id, "method:log");
+    }
+
+    #[test]
+    fn local_var_dart_construction() {
+        // Dart: `var lg = Logger();\n lg.log()`.
+        let m = mk(
+            "method:log",
+            NodeKind::Method,
+            "log",
+            "Logger::log",
+            "src/a.dart",
+            Language::Dart,
+        );
+        let ctx = ctx_with_scope(
+            "src/a.dart",
+            "void run() {\n  var lg = Logger();\n  lg.log();\n}\n",
+            Language::Dart,
+            m,
+            "log",
+        );
+        let r = refv("lg.log", EdgeKind::Calls, "src/a.dart", Language::Dart, 3);
+        let res = match_method_call(&r, &ctx).expect("dart construction inference");
+        assert_eq!(res.target_node_id, "method:log");
+    }
+
+    #[test]
+    fn local_var_php_new() {
+        // PHP: `$lg = new Logger(); $lg->log()` — ref name is `lg.log`.
+        let m = mk(
+            "method:log",
+            NodeKind::Method,
+            "log",
+            "Logger::log",
+            "src/a.php",
+            Language::Php,
+        );
+        let ctx = ctx_with_scope(
+            "src/a.php",
+            "function run() {\n    $lg = new Logger();\n    $lg->log();\n}\n",
+            Language::Php,
+            m,
+            "log",
+        );
+        let r = refv("lg.log", EdgeKind::Calls, "src/a.php", Language::Php, 3);
+        let res = match_method_call(&r, &ctx).expect("php new inference");
+        assert_eq!(res.target_node_id, "method:log");
+    }
+
+    #[test]
+    fn local_var_ruby_new() {
+        // Ruby: `lg = Logger.new\n lg.log` (uses R4 receiver.method extraction).
+        let m = mk(
+            "method:log",
+            NodeKind::Method,
+            "log",
+            "Logger::log",
+            "src/a.rb",
+            Language::Ruby,
+        );
+        let ctx = ctx_with_scope(
+            "src/a.rb",
+            "def run\n  lg = Logger.new\n  lg.log\nend\n",
+            Language::Ruby,
+            m,
+            "log",
+        );
+        let r = refv("lg.log", EdgeKind::Calls, "src/a.rb", Language::Ruby, 3);
+        let res = match_method_call(&r, &ctx).expect("ruby new inference");
+        assert_eq!(res.target_node_id, "method:log");
+    }
+
+    // ================= Round 5: #1125 typed-parameter inference ===============
+
+    #[test]
+    fn typed_param_ts_generic_outer_type() {
+        // TS generic param: `function use(repo: Repository<User>) { repo.find() }`
+        // — infer outer type Repository.
+        let m = mk(
+            "method:find",
+            NodeKind::Method,
+            "find",
+            "Repository::find",
+            "src/a.ts",
+            Language::TypeScript,
+        );
+        let ctx = ctx_with_scope(
+            "src/a.ts",
+            "function use(repo: Repository<User>) {\n  repo.find();\n}\n",
+            Language::TypeScript,
+            m,
+            "find",
+        );
+        let r = refv(
+            "repo.find",
+            EdgeKind::Calls,
+            "src/a.ts",
+            Language::TypeScript,
+            2,
+        );
+        let res = match_method_call(&r, &ctx).expect("ts typed param generic");
+        assert_eq!(res.target_node_id, "method:find");
+    }
+
+    #[test]
+    fn typed_param_rust_ref() {
+        // Rust: `fn use(lg: &Logger) { lg.log() }` — strip `&`.
+        let m = mk(
+            "method:log",
+            NodeKind::Method,
+            "log",
+            "Logger::log",
+            "src/a.rs",
+            Language::Rust,
+        );
+        let ctx = ctx_with_scope(
+            "src/a.rs",
+            "fn r(lg: &Logger) {\n    lg.log();\n}\n",
+            Language::Rust,
+            m,
+            "log",
+        );
+        let r = refv("lg.log", EdgeKind::Calls, "src/a.rs", Language::Rust, 2);
+        let res = match_method_call(&r, &ctx).expect("rust typed ref param");
+        assert_eq!(res.target_node_id, "method:log");
+    }
+
+    #[test]
+    fn typed_param_go_receiver() {
+        // Go: `func use(lg Logger) { lg.Log() }`.
+        let m = mk(
+            "method:log",
+            NodeKind::Method,
+            "Log",
+            "Logger::Log",
+            "a.go",
+            Language::Go,
+        );
+        let ctx = ctx_with_scope(
+            "a.go",
+            "func use(lg Logger) {\n\tlg.Log()\n}\n",
+            Language::Go,
+            m,
+            "Log",
+        );
+        let r = refv("lg.Log", EdgeKind::Calls, "a.go", Language::Go, 2);
+        let res = match_method_call(&r, &ctx).expect("go typed param");
+        assert_eq!(res.target_node_id, "method:log");
+    }
+
+    #[test]
+    fn typed_param_dart() {
+        // Dart: `void use(Logger lg) { lg.log() }`.
+        let m = mk(
+            "method:log",
+            NodeKind::Method,
+            "log",
+            "Logger::log",
+            "src/a.dart",
+            Language::Dart,
+        );
+        let ctx = ctx_with_scope(
+            "src/a.dart",
+            "void use(Logger lg) {\n  lg.log();\n}\n",
+            Language::Dart,
+            m,
+            "log",
+        );
+        let r = refv("lg.log", EdgeKind::Calls, "src/a.dart", Language::Dart, 2);
+        let res = match_method_call(&r, &ctx).expect("dart typed param");
+        assert_eq!(res.target_node_id, "method:log");
+    }
+
+    #[test]
+    fn typed_param_php() {
+        // PHP: `function use(Logger $lg) { $lg->log() }`.
+        let m = mk(
+            "method:log",
+            NodeKind::Method,
+            "log",
+            "Logger::log",
+            "src/a.php",
+            Language::Php,
+        );
+        let ctx = ctx_with_scope(
+            "src/a.php",
+            "function use(Logger $lg) {\n    $lg->log();\n}\n",
+            Language::Php,
+            m,
+            "log",
+        );
+        let r = refv("lg.log", EdgeKind::Calls, "src/a.php", Language::Php, 2);
+        let res = match_method_call(&r, &ctx).expect("php typed param");
+        assert_eq!(res.target_node_id, "method:log");
+    }
+
+    // ================= Round 5: #1112 separators (Lua : / R $ / Pascal .) =====
+
+    #[test]
+    fn separator_lua_colon() {
+        // Lua: `local lg = Logger.new()\n lg:log()` — ref name is `lg:log`.
+        let m = mk(
+            "method:log",
+            NodeKind::Method,
+            "log",
+            "Logger::log",
+            "a.lua",
+            Language::Lua,
+        );
+        let ctx = ctx_with_scope(
+            "a.lua",
+            "function run()\n  local lg = Logger.new()\n  lg:log()\nend\n",
+            Language::Lua,
+            m,
+            "log",
+        );
+        let r = refv("lg:log", EdgeKind::Calls, "a.lua", Language::Lua, 3);
+        let res = match_method_call(&r, &ctx).expect("lua colon separator");
+        assert_eq!(res.target_node_id, "method:log");
+    }
+
+    #[test]
+    fn separator_r_dollar() {
+        // R: `lg <- Logger$new()\n lg$log()` — ref name is `lg$log`.
+        let m = mk(
+            "method:log",
+            NodeKind::Method,
+            "log",
+            "Logger::log",
+            "a.R",
+            Language::R,
+        );
+        let ctx = ctx_with_scope(
+            "a.R",
+            "run <- function() {\n  lg <- Logger$new()\n  lg$log()\n}\n",
+            Language::R,
+            m,
+            "log",
+        );
+        let r = refv("lg$log", EdgeKind::Calls, "a.R", Language::R, 3);
+        let res = match_method_call(&r, &ctx).expect("r dollar separator");
+        assert_eq!(res.target_node_id, "method:log");
+    }
+
+    #[test]
+    fn separator_pascal_dot() {
+        // Pascal: `var lg: TLogger; lg.Log()` — uses the `.` dot separator.
+        let m = mk(
+            "method:log",
+            NodeKind::Method,
+            "Log",
+            "TLogger::Log",
+            "a.pas",
+            Language::Pascal,
+        );
+        let ctx = ctx_with_scope(
+            "a.pas",
+            "procedure run;\nvar lg: TLogger;\nbegin\n  lg.Log();\nend;\n",
+            Language::Pascal,
+            m,
+            "Log",
+        );
+        let r = refv("lg.Log", EdgeKind::Calls, "a.pas", Language::Pascal, 4);
+        let res = match_method_call(&r, &ctx).expect("pascal dot separator");
+        assert_eq!(res.target_node_id, "method:log");
+    }
+
+    #[test]
+    fn separator_lua_colon_only_for_lua() {
+        // A `lg:log` ref in a non-Lua language is not a method-call shape → declines.
+        let m = mk(
+            "method:log",
+            NodeKind::Method,
+            "log",
+            "Logger::log",
+            "a.rs",
+            Language::Rust,
+        );
+        let ctx = Ctx::default().name("log", vec![m]);
+        let r = refv("lg:log", EdgeKind::Calls, "a.rs", Language::Rust, 1);
+        assert!(match_method_call(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn separator_r_dollar_only_for_r() {
+        // A `lg$log` ref outside R is not a call shape → declines.
+        let ctx = Ctx::default();
+        let r = refv("lg$log", EdgeKind::Calls, "a.ts", Language::TypeScript, 1);
+        assert!(match_method_call(&r, &ctx).is_none());
+    }
+
+    // ================= Round 5: negative cases (no wrong edge) ================
+
+    #[test]
+    fn local_var_wrong_type_stays_silent() {
+        // `lg = new Widget()` but the method `log` exists only on Logger — the
+        // inferred type Widget has no `log`, and there is no Logger receiver word
+        // overlap, so no edge is produced (validated-inference invariant).
+        let m = mk(
+            "method:log",
+            NodeKind::Method,
+            "log",
+            "Logger::log",
+            "src/a.ts",
+            Language::TypeScript,
+        );
+        let ctx = ctx_with_scope(
+            "src/a.ts",
+            "function run() {\n  const lg = new Widget();\n  lg.log();\n}\n",
+            Language::TypeScript,
+            m,
+            "log",
+        );
+        // Only ONE method named log exists → strategy3 single-candidate would
+        // resolve it. To make this a true negative, add a second same-lang method
+        // so strategy3 needs >=2 overlap which the receiver `lg` can't provide.
+        let m2 = mk(
+            "method:other",
+            NodeKind::Method,
+            "log",
+            "Other::log",
+            "src/b.ts",
+            Language::TypeScript,
+        );
+        let ctx = ctx.name(
+            "log",
+            vec![
+                mk(
+                    "method:log",
+                    NodeKind::Method,
+                    "log",
+                    "Logger::log",
+                    "src/a.ts",
+                    Language::TypeScript,
+                ),
+                m2,
+            ],
+        );
+        let r = refv(
+            "lg.log",
+            EdgeKind::Calls,
+            "src/a.ts",
+            Language::TypeScript,
+            3,
+        );
+        // Inference yields Widget → resolve_method_on_type(Widget, log) finds no
+        // Widget::log → falls to strategies; two `log` methods, `lg` overlaps
+        // neither by >=2 words → declines.
+        assert!(match_method_call(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn local_var_no_declaration_no_inference() {
+        // No local declaration for `lg`; with two ambiguous same-named methods and
+        // no overlap, inference finds nothing and strategy 3 declines.
+        let a = mk(
+            "method:a",
+            NodeKind::Method,
+            "log",
+            "Alpha::log",
+            "src/a.ts",
+            Language::TypeScript,
+        );
+        let b = mk(
+            "method:b",
+            NodeKind::Method,
+            "log",
+            "Beta::log",
+            "src/b.ts",
+            Language::TypeScript,
+        );
+        let ctx = ctx_with_scope(
+            "src/a.ts",
+            "function run() {\n  lg.log();\n}\n",
+            Language::TypeScript,
+            a,
+            "log",
+        )
+        .name(
+            "log",
+            vec![
+                mk(
+                    "method:a",
+                    NodeKind::Method,
+                    "log",
+                    "Alpha::log",
+                    "src/a.ts",
+                    Language::TypeScript,
+                ),
+                b,
+            ],
+        );
+        let r = refv(
+            "lg.log",
+            EdgeKind::Calls,
+            "src/a.ts",
+            Language::TypeScript,
+            2,
+        );
+        assert!(match_method_call(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn local_var_inference_bounded_to_enclosing_scope() {
+        // A `Logger` decl in function A must NOT leak into function B's call.
+        // Function B (lines 5-7) contains the call; the decl is in A (line 2).
+        let logger_log = mk(
+            "method:log",
+            NodeKind::Method,
+            "log",
+            "Logger::log",
+            "src/a.ts",
+            Language::TypeScript,
+        );
+        let widget_log = mk(
+            "method:wlog",
+            NodeKind::Method,
+            "log",
+            "Widget::log",
+            "src/w.ts",
+            Language::TypeScript,
+        );
+        let mut fn_a = mk(
+            "function:a",
+            NodeKind::Function,
+            "a",
+            "a",
+            "src/a.ts",
+            Language::TypeScript,
+        );
+        fn_a.start_line = 1;
+        fn_a.end_line = 3;
+        let mut fn_b = mk(
+            "function:b",
+            NodeKind::Function,
+            "b",
+            "b",
+            "src/a.ts",
+            Language::TypeScript,
+        );
+        fn_b.start_line = 5;
+        fn_b.end_line = 7;
+        let source =
+            "function a() {\n  const lg = new Logger();\n}\n\nfunction b() {\n  lg.log();\n}\n";
+        let ctx = Ctx::default()
+            .file("src/a.ts", source)
+            .nodes_in_file("src/a.ts", vec![fn_a, fn_b])
+            .name("log", vec![logger_log, widget_log]);
+        let r = refv(
+            "lg.log",
+            EdgeKind::Calls,
+            "src/a.ts",
+            Language::TypeScript,
+            6,
+        );
+        // In B's scope there is no `lg` decl → inference finds nothing; two `log`
+        // methods → strategy3 needs overlap `lg` can't give → declines.
+        assert!(match_method_call(&r, &ctx).is_none());
+    }
+
+    // ================= Round 5: branch coverage for helpers ===================
+
+    #[test]
+    fn non_type_receiver_token_rejects_keywords() {
+        assert!(is_non_type_receiver_token("this"));
+        assert!(is_non_type_receiver_token("self"));
+        assert!(is_non_type_receiver_token("undefined"));
+        assert!(!is_non_type_receiver_token("Logger"));
+    }
+
+    #[test]
+    fn normalize_inferred_type_name_strips_and_rejects() {
+        // Generics + pointer markers stripped, last segment kept.
+        assert_eq!(
+            normalize_inferred_type_name("Repository<User>").as_deref(),
+            Some("Repository")
+        );
+        assert_eq!(
+            normalize_inferred_type_name("pkg.mod.Logger").as_deref(),
+            Some("Logger")
+        );
+        assert_eq!(
+            normalize_inferred_type_name("&Logger").as_deref(),
+            Some("Logger")
+        );
+        // A non-type keyword is rejected.
+        assert_eq!(normalize_inferred_type_name("self"), None);
+        // An empty capture yields None.
+        assert_eq!(normalize_inferred_type_name(""), None);
+    }
+
+    #[test]
+    fn local_receiver_type_patterns_empty_for_unpatterned_language() {
+        // C/ObjC have no shared patterns (C++ uses its own inferrer) → empty.
+        assert!(local_receiver_type_patterns(Language::C, "lg").is_empty());
+        assert!(local_receiver_type_patterns(Language::ObjC, "lg").is_empty());
+        assert!(!local_receiver_type_patterns(Language::TypeScript, "lg").is_empty());
+    }
+
+    #[test]
+    fn infer_local_receiver_type_none_when_no_patterns() {
+        // C has no patterns → infer returns None regardless of source.
+        let ctx = Ctx::default().file("a.c", "int f() { Logger lg; lg.log(); }\n");
+        let r = refv("lg.log", EdgeKind::Calls, "a.c", Language::C, 1);
+        assert!(infer_local_receiver_type("lg", &r, &ctx).is_none());
+    }
+
+    #[test]
+    fn infer_local_receiver_type_none_when_file_unreadable() {
+        // TS has patterns but the file can't be read → None.
+        let ctx = Ctx::default();
+        let r = refv(
+            "lg.log",
+            EdgeKind::Calls,
+            "missing.ts",
+            Language::TypeScript,
+            1,
+        );
+        assert!(infer_local_receiver_type("lg", &r, &ctx).is_none());
+    }
+
+    #[test]
+    fn infer_local_receiver_type_none_when_no_declaration() {
+        // Readable source but no matching declaration for `lg` → None.
+        let ctx = Ctx::default().file("a.ts", "function f() {\n  lg.log();\n}\n");
+        let r = refv("lg.log", EdgeKind::Calls, "a.ts", Language::TypeScript, 2);
+        assert!(infer_local_receiver_type("lg", &r, &ctx).is_none());
+    }
+
+    #[test]
+    fn infer_local_receiver_type_skips_minified_line() {
+        // A >10k-char line is skipped rather than scanned; the real decl on the
+        // next line up is still found.
+        let long = "x".repeat(10_050);
+        let source =
+            format!("function f() {{\n  const lg = new Logger();\n  {long}\n  lg.log();\n}}\n");
+        let mut fn_node = mk(
+            "function:s",
+            NodeKind::Function,
+            "f",
+            "f",
+            "a.ts",
+            Language::TypeScript,
+        );
+        fn_node.start_line = 1;
+        fn_node.end_line = 6;
+        let ctx = Ctx::default()
+            .file("a.ts", &source)
+            .nodes_in_file("a.ts", vec![fn_node]);
+        let r = refv("lg.log", EdgeKind::Calls, "a.ts", Language::TypeScript, 4);
+        assert_eq!(
+            infer_local_receiver_type("lg", &r, &ctx).as_deref(),
+            Some("Logger")
+        );
+    }
+
+    #[test]
+    fn enclosing_scope_start_line_defaults_and_tightens() {
+        // No enclosing function → default 1. With one enclosing method spanning
+        // the call, its start line is returned.
+        let ctx = Ctx::default();
+        let r = refv("lg.log", EdgeKind::Calls, "a.ts", Language::TypeScript, 5);
+        assert_eq!(enclosing_scope_start_line(&r, &ctx), 1);
+
+        let mut m = mk(
+            "method:x",
+            NodeKind::Method,
+            "run",
+            "C::run",
+            "a.ts",
+            Language::TypeScript,
+        );
+        m.start_line = 3;
+        m.end_line = 9;
+        // A function in another language is ignored.
+        let mut other = mk(
+            "function:o",
+            NodeKind::Function,
+            "o",
+            "o",
+            "a.ts",
+            Language::Python,
+        );
+        other.start_line = 1;
+        other.end_line = 20;
+        let ctx = Ctx::default().nodes_in_file("a.ts", vec![m, other]);
+        assert_eq!(enclosing_scope_start_line(&r, &ctx), 3);
+    }
+
+    #[test]
+    fn enclosing_scope_start_line_uses_start_when_end_line_zero() {
+        // A node with end_line == 0 falls back to start_line for its span; a
+        // single-line function whose start == the call line still encloses it.
+        let mut m = mk(
+            "method:x",
+            NodeKind::Method,
+            "run",
+            "C::run",
+            "a.ts",
+            Language::TypeScript,
+        );
+        m.start_line = 5;
+        m.end_line = 0;
+        let ctx = Ctx::default().nodes_in_file("a.ts", vec![m]);
+        let r = refv("lg.log", EdgeKind::Calls, "a.ts", Language::TypeScript, 5);
+        assert_eq!(enclosing_scope_start_line(&r, &ctx), 5);
+    }
+
+    #[test]
+    fn lua_and_r_separator_reject_bad_shapes() {
+        // Empty receiver / method reject.
+        assert_eq!(match_lua_colon_call(":log"), None);
+        assert_eq!(match_lua_colon_call("lg:"), None);
+        // Illegal receiver char.
+        assert_eq!(match_lua_colon_call("l-g:log"), None);
+        // Non-word method.
+        assert_eq!(match_lua_colon_call("lg:lo g"), None);
+        // No colon.
+        assert_eq!(match_lua_colon_call("lglog"), None);
+
+        assert_eq!(match_r_dollar_call("$log"), None);
+        assert_eq!(match_r_dollar_call("lg$"), None);
+        assert_eq!(match_r_dollar_call("l-g$log"), None);
+        assert_eq!(match_r_dollar_call("lg$lo g"), None);
+        assert_eq!(match_r_dollar_call("lglog"), None);
+    }
+
+    #[test]
+    fn is_inferable_receiver_call_shapes() {
+        assert!(is_inferable_receiver_call("lg.log", Language::TypeScript));
+        assert!(is_inferable_receiver_call("lg:log", Language::Lua));
+        assert!(is_inferable_receiver_call("lg$log", Language::R));
+        // Colon-call `Class::method` is not inferable.
+        assert!(!is_inferable_receiver_call("Foo::log", Language::Rust));
+        // Lua separator not inferable outside Lua/Luau.
+        assert!(!is_inferable_receiver_call("lg:log", Language::Rust));
+        // R separator not inferable outside R.
+        assert!(!is_inferable_receiver_call("lg$log", Language::TypeScript));
     }
 }

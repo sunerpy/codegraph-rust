@@ -28,7 +28,7 @@
     "kind": "calls",
     "line": 11,
     "metadata": {
-      "confidence": 0.8,
+      "confidence": 0.9,
       "resolvedBy": "instance-method"
     },
     "provenance": null,
@@ -88,7 +88,7 @@
     "kind": "calls",
     "line": 5,
     "metadata": {
-      "confidence": 0.8,
+      "confidence": 0.9,
       "resolvedBy": "instance-method"
     },
     "provenance": null,
@@ -112,7 +112,7 @@
     "kind": "calls",
     "line": 6,
     "metadata": {
-      "confidence": 0.8,
+      "confidence": 0.9,
       "resolvedBy": "instance-method"
     },
     "provenance": null,
