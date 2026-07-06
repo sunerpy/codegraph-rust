@@ -143,6 +143,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         } else if has_type(self.spec.variable_types(), node_type)
             && !self.is_inside_class_like_node()
         {
+            self.maybe_cpp_construction(node);
             self.extract_variable(node);
             self.scan_fn_ref_subtree(node, 0);
             skip_children = true;
@@ -1010,7 +1011,57 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         Some(new_node)
     }
 
+    // #1061 — recover an export/visibility-macro class that tree-sitter
+    // misparses as a function (`class X_API C : Base { ... }`). Rebuild the real
+    // class node, its single plain base link, and its members. Returns true when
+    // it fired so the caller skips the bogus function extraction. C/C++ only.
+    fn try_recover_export_macro_class(&mut self, node: SyntaxNode<'tree>) -> bool {
+        let Some(recovered) = crate::lang::detect_export_macro_class(node, self.source) else {
+            return false;
+        };
+        let crate::lang::ExportMacroClass {
+            name,
+            base,
+            body,
+            is_struct,
+        } = recovered;
+        let class_name = node_text(name, self.source);
+        let kind = if is_struct {
+            NodeKind::Struct
+        } else {
+            NodeKind::Class
+        };
+        let Some(class_node) = self.create_node(
+            kind,
+            &class_name,
+            name,
+            NodeExtra {
+                is_exported: true,
+                ..NodeExtra::default()
+            },
+        ) else {
+            return false;
+        };
+        if let Some(base) = base {
+            self.push_ref(
+                &class_node.id,
+                &node_text(base, self.source),
+                EdgeKind::Extends,
+                base,
+            );
+        }
+        self.node_stack.push(class_node.id);
+        self.visit_named_children(body);
+        self.node_stack.pop();
+        true
+    }
+
     fn extract_function(&mut self, node: SyntaxNode<'tree>, name_override: Option<String>) {
+        if matches!(self.spec.language(), Language::C | Language::Cpp)
+            && self.try_recover_export_macro_class(node)
+        {
+            return;
+        }
         if self.spec.get_receiver_type(node, self.source).is_some() {
             self.extract_method(node);
             return;
@@ -1078,6 +1129,14 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     }
 
     fn extract_class(&mut self, node: SyntaxNode<'tree>, kind: NodeKind) {
+        // #1093 — a bodiless C/C++ `class Foo;` is a forward declaration, not a
+        // definition; indexing it buries the real definition. Skip it for C/C++
+        // only — in Kotlin/Scala a bodiless `class Empty` is a complete class.
+        if matches!(self.spec.language(), Language::C | Language::Cpp)
+            && self.resolve_body(node).is_none()
+        {
+            return;
+        }
         let name = self.extract_name(node);
         let class_node = self.create_node(
             kind,
@@ -2108,6 +2167,38 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
     }
 
+    // #1035 — C/C++ stack/brace construction (`Calc c(0)`, `W w{1, 2}`) records
+    // an Instantiates edge, matching the existing heap `new_expression` path.
+    // Gated to a user `type_identifier` (not a `primitive_type`) so `int y(5)`
+    // never fires; the init_declarator must carry a call- or brace-initializer.
+    fn maybe_cpp_construction(&mut self, node: SyntaxNode<'tree>) {
+        if !matches!(self.spec.language(), Language::C | Language::Cpp) {
+            return;
+        }
+        let Some(type_node) = child_by_field(node, "type") else {
+            return;
+        };
+        if type_node.kind() != "type_identifier" {
+            return;
+        }
+        let has_construction = node.named_children(&mut node.walk()).any(|child| {
+            child.kind() == "init_declarator"
+                && child
+                    .named_children(&mut child.walk())
+                    .any(|grand| matches!(grand.kind(), "argument_list" | "initializer_list"))
+        });
+        if !has_construction {
+            return;
+        }
+        let Some(from_id) = self.node_stack.last().cloned() else {
+            return;
+        };
+        let class_name = node_text(type_node, self.source).trim().to_string();
+        if !class_name.is_empty() {
+            self.push_ref(&from_id, &class_name, EdgeKind::Instantiates, type_node);
+        }
+    }
+
     fn visit_function_body(&mut self, body: SyntaxNode<'tree>) {
         self.visit_body_node(body);
     }
@@ -2138,6 +2229,10 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             if let Some(owner_id) = self.node_stack.last().cloned() {
                 self.extract_variable_type_annotation(node, &owner_id);
             }
+        }
+
+        if node_type == "declaration" {
+            self.maybe_cpp_construction(node);
         }
 
         if has_type(self.spec.function_types(), node_type) {
@@ -2375,6 +2470,14 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
         if let Some(name_node) = child_by_field(node, self.spec.name_field()) {
             let resolved = unwrap_declarator_name(name_node);
+            if resolved.kind() == "operator_cast" {
+                if let Some(type_id) = resolved
+                    .named_children(&mut resolved.walk())
+                    .find(|c| c.kind() == "type_identifier")
+                {
+                    return format!("operator {}", node_text(type_id, self.source));
+                }
+            }
             if resolved.kind() == "dot_index_expression" {
                 if let Some(field) = child_by_field(resolved, "field") {
                     return node_text(field, self.source);
@@ -4006,6 +4109,313 @@ void Widget::render() {}
 "#;
         let (nodes, _) = run("w.cpp", src, Language::Cpp);
         assert!(has_node(&nodes, NodeKind::Class, "Widget"));
+    }
+
+    // ---- Round 3: C++ extraction-quality batch (#1093/#1096/#1061/#1035/#1100-1103) ----
+
+    // #1093 — skip bodiless C++ forward declarations.
+    #[test]
+    fn cpp_bodiless_forward_class_is_skipped() {
+        let src = r#"
+class Foo;
+class Bar { public: void x(); };
+"#;
+        let (nodes, _) = run("f.cpp", src, Language::Cpp);
+        // The bodiless forward declaration must NOT be indexed as a class node.
+        assert!(
+            !has_node(&nodes, NodeKind::Class, "Foo"),
+            "bodiless `class Foo;` should be skipped"
+        );
+        // The real definition with a body is still indexed.
+        assert!(has_node(&nodes, NodeKind::Class, "Bar"));
+    }
+
+    #[test]
+    fn c_bodiless_forward_struct_is_skipped() {
+        // C forward struct decl already skipped via extract_struct's body gate;
+        // guard that a bodiless C++ struct fwd-decl is skipped too and the real
+        // one kept (struct gate is language-agnostic, this locks it).
+        let src = r#"
+struct Foo;
+struct Bar { int x; };
+"#;
+        let (nodes, _) = run("f.cpp", src, Language::Cpp);
+        assert!(!has_node(&nodes, NodeKind::Struct, "Foo"));
+        assert!(has_node(&nodes, NodeKind::Struct, "Bar"));
+    }
+
+    // #1093 NEGATIVE — a bodiless class in a language where that is a COMPLETE
+    // definition (Kotlin `class Empty`) must still be indexed.
+    #[test]
+    fn kotlin_bodiless_class_is_still_indexed() {
+        let src = r#"
+class Empty
+class WithBody { fun x() {} }
+"#;
+        let (nodes, _) = run("E.kt", src, Language::Kotlin);
+        assert!(
+            has_node(&nodes, NodeKind::Class, "Empty"),
+            "Kotlin `class Empty` is a complete definition, must be kept"
+        );
+        assert!(has_node(&nodes, NodeKind::Class, "WithBody"));
+    }
+
+    #[test]
+    fn scala_bodiless_class_is_still_indexed() {
+        let src = r#"
+class Empty
+class WithBody { def x(): Int = 1 }
+"#;
+        let (nodes, _) = run("E.scala", src, Language::Scala);
+        assert!(
+            has_node(&nodes, NodeKind::Class, "Empty"),
+            "Scala `class Empty` is a complete definition, must be kept"
+        );
+        assert!(has_node(&nodes, NodeKind::Class, "WithBody"));
+    }
+
+    // #1096 — conversion-operator name (`operator EState() const` -> `operator EState`).
+    #[test]
+    fn cpp_conversion_operator_name_recovered() {
+        let src = r#"
+class S {
+public:
+    operator EALSMovementState() const { return state; }
+};
+"#;
+        let (nodes, _) = run("s.cpp", src, Language::Cpp);
+        assert!(
+            has_node(&nodes, NodeKind::Method, "operator EALSMovementState"),
+            "conversion operator name should be `operator EALSMovementState`, got: {:?}",
+            nodes
+                .iter()
+                .filter(|n| n.kind == NodeKind::Method)
+                .map(|n| n.name.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // #1061 — export/visibility-macro class recovery (name, base, members).
+    #[test]
+    fn cpp_export_macro_class_recovered() {
+        let src = r#"
+class MYMODULE_API UMyComponent : public UActorComponent {
+public:
+    void tick();
+};
+"#;
+        let (nodes, refs) = run("c.cpp", src, Language::Cpp);
+        assert!(
+            has_node(&nodes, NodeKind::Class, "UMyComponent"),
+            "export-macro class should be recovered as `UMyComponent`, got: {:?}",
+            nodes
+                .iter()
+                .map(|n| (n.kind, n.name.as_str()))
+                .collect::<Vec<_>>()
+        );
+        // The bogus function (`UActorComponent` misread as a fn) must not appear.
+        assert!(!has_node(&nodes, NodeKind::Function, "UActorComponent"));
+        // Direct inheritance link recovered.
+        assert!(
+            has_ref(&refs, EdgeKind::Extends, "UActorComponent"),
+            "recovered class should Extends its base UActorComponent"
+        );
+    }
+
+    #[test]
+    fn cpp_export_macro_class_members_recovered() {
+        // Members inside the recovered class are extracted (a struct is
+        // default-public, so its members parse cleanly after recovery).
+        let src = r#"
+struct MYLIB_EXPORT Config {
+    void reset() {}
+};
+"#;
+        let (nodes, _) = run("m.cpp", src, Language::Cpp);
+        assert!(has_node(&nodes, NodeKind::Struct, "Config"));
+        assert!(
+            has_node(&nodes, NodeKind::Method, "reset"),
+            "recovered class member method should be extracted, got: {:?}",
+            nodes
+                .iter()
+                .map(|n| (n.kind, n.name.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn cpp_export_macro_class_no_base() {
+        let src = r#"
+struct MYLIB_EXPORT Config {
+    int value;
+    void reset() {}
+};
+"#;
+        let (nodes, _) = run("cfg.cpp", src, Language::Cpp);
+        assert!(has_node(&nodes, NodeKind::Struct, "Config"));
+        assert!(!has_node(&nodes, NodeKind::Function, "Config"));
+        assert!(has_node(&nodes, NodeKind::Method, "reset"));
+    }
+
+    // #1035 — stack/brace construction records an Instantiates edge.
+    #[test]
+    fn cpp_stack_construction_records_instantiates() {
+        let src = r#"
+class Calculator {};
+class Widget {};
+void f() {
+    Calculator calc(0);
+    Widget w{1, 2};
+}
+"#;
+        let (_, refs) = run("f.cpp", src, Language::Cpp);
+        assert!(
+            has_ref(&refs, EdgeKind::Instantiates, "Calculator"),
+            "stack construction `Calculator calc(0)` should Instantiate Calculator"
+        );
+        assert!(
+            has_ref(&refs, EdgeKind::Instantiates, "Widget"),
+            "brace construction `Widget w{{1, 2}}` should Instantiate Widget"
+        );
+    }
+
+    #[test]
+    fn cpp_heap_new_still_instantiates() {
+        // Guard: the existing new_expression path is unchanged.
+        let src = r#"
+class Calculator {};
+void f() { Calculator* c = new Calculator(0); }
+"#;
+        let (_, refs) = run("h.cpp", src, Language::Cpp);
+        assert!(has_ref(&refs, EdgeKind::Instantiates, "Calculator"));
+    }
+
+    #[test]
+    fn cpp_primitive_declaration_no_instantiates() {
+        // NEGATIVE: a plain primitive/local declaration must not create an edge.
+        let src = r#"
+void f() {
+    int x = 0;
+    int y(5);
+}
+"#;
+        let (_, refs) = run("p.cpp", src, Language::Cpp);
+        assert!(!has_ref(&refs, EdgeKind::Instantiates, "int"));
+        assert!(!has_ref(&refs, EdgeKind::Instantiates, "x"));
+        assert!(!has_ref(&refs, EdgeKind::Instantiates, "y"));
+    }
+
+    // #1100-1103 — inline-specifier-macro return-type recovery + generic name.
+    #[test]
+    fn cpp_forceinline_macro_return_type_recovered() {
+        let src = r#"
+FORCEINLINE FString GetEnumerationToString(int x) { return x; }
+"#;
+        let (nodes, _) = run("m.cpp", src, Language::Cpp);
+        let f = node(&nodes, NodeKind::Function, "GetEnumerationToString");
+        assert_eq!(
+            f.return_type.as_deref(),
+            Some("FString"),
+            "FORCEINLINE macro should be stripped and real return type FString recovered"
+        );
+    }
+
+    #[test]
+    fn cpp_godot_force_inline_macro_return_type_recovered() {
+        let src = r#"
+_FORCE_INLINE_ Vector2 get_pos() { return {}; }
+"#;
+        let (nodes, _) = run("g.cpp", src, Language::Cpp);
+        let f = node(&nodes, NodeKind::Function, "get_pos");
+        assert_eq!(f.return_type.as_deref(), Some("Vector2"));
+    }
+
+    #[test]
+    fn cpp_forceinline_method_return_type_recovered() {
+        let src = r#"
+class C {
+public:
+    FORCEINLINE FString GetName(int x) { return x; }
+};
+"#;
+        let (nodes, _) = run("cm.cpp", src, Language::Cpp);
+        let m = node(&nodes, NodeKind::Method, "GetName");
+        assert_eq!(m.return_type.as_deref(), Some("FString"));
+    }
+
+    #[test]
+    fn cpp_generic_unknown_macro_name_recovered_no_bogus_return() {
+        // #1102: an UNKNOWN macro must not pollute the return type with the macro
+        // token; the real name is preserved. Name-only recovery — the return type
+        // must NOT be the macro `SOME_LIBRARY_MACRO`.
+        let src = r#"
+SOME_LIBRARY_MACRO ReturnType doWork(int a) { return a; }
+"#;
+        let (nodes, _) = run("u.cpp", src, Language::Cpp);
+        let f = node(&nodes, NodeKind::Function, "doWork");
+        assert_ne!(
+            f.return_type.as_deref(),
+            Some("SOME_LIBRARY_MACRO"),
+            "unknown macro must not be recorded as the return type"
+        );
+    }
+
+    // #1100-1103 NEGATIVE — a normal C++ function without any macro is unchanged.
+    #[test]
+    fn cpp_normal_function_return_type_unchanged() {
+        let src = r#"
+FString GetName(int x) { return x; }
+"#;
+        let (nodes, _) = run("n.cpp", src, Language::Cpp);
+        let f = node(&nodes, NodeKind::Function, "GetName");
+        assert_eq!(f.return_type.as_deref(), Some("FString"));
+    }
+
+    #[test]
+    fn cpp_abi_suffix_export_macro_class_recovered() {
+        // Exercises the `_ABI` suffix branch of the export-visibility gate.
+        let src = r#"
+struct MYRT_ABI Handle {
+    void close() {}
+};
+"#;
+        let (nodes, _) = run("a.cpp", src, Language::Cpp);
+        assert!(has_node(&nodes, NodeKind::Struct, "Handle"));
+        assert!(has_node(&nodes, NodeKind::Method, "close"));
+    }
+
+    #[test]
+    fn cpp_windows_calling_convention_macro_return_type_recovered() {
+        // WINAPI is a listed macro; the real return type must be recovered.
+        let src = r#"
+WINAPI HRESULT DoThing(int x) { return x; }
+"#;
+        let (nodes, _) = run("win.cpp", src, Language::Cpp);
+        let f = node(&nodes, NodeKind::Function, "DoThing");
+        assert_ne!(f.return_type.as_deref(), Some("WINAPI"));
+    }
+
+    #[test]
+    fn cpp_listed_macro_without_error_yields_no_return_type() {
+        // Listed macro that tree-sitter parses cleanly as the sole `type` (no
+        // ERROR sibling): the macro must not be recorded as the return type.
+        let src = r#"
+FORCEINLINE f() {}
+"#;
+        let (nodes, _) = run("le.cpp", src, Language::Cpp);
+        let f = node(&nodes, NodeKind::Function, "f");
+        assert_eq!(f.return_type.as_deref(), None);
+    }
+
+    #[test]
+    fn cpp_non_export_macro_class_misparse_not_recovered() {
+        // A non-export leading token before the class name is NOT an export
+        // macro, so the export-macro recovery must decline (no false Class).
+        let src = r#"
+class Plain C { void x() {} };
+"#;
+        let (nodes, _) = run("pl.cpp", src, Language::Cpp);
+        assert!(!has_node(&nodes, NodeKind::Class, "C"));
     }
 
     #[test]
