@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.25.3](https://github.com/sunerpy/codegraph-rust/compare/v0.25.2...v0.25.3) (2026-07-06)
+
+
+### Bug Fixes
+
+* **cli:** stop nonsensical query score %, exclude Android res/, back off failing auto-sync ([#111](https://github.com/sunerpy/codegraph-rust/issues/111)) ([14d1004](https://github.com/sunerpy/codegraph-rust/commit/14d10041cc5a45f540989201d0f10896b9e2cca8))
+
 ## [0.25.2](https://github.com/sunerpy/codegraph-rust/compare/v0.25.1...v0.25.2) (2026-07-06)
 
 
