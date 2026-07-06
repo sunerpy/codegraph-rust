@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.25.6](https://github.com/sunerpy/codegraph-rust/compare/v0.25.5...v0.25.6) (2026-07-06)
+
+
+### Bug Fixes
+
+* **extract:** extract Ruby receiver.method calls and record .new instantiation ([#1110](https://github.com/sunerpy/codegraph-rust/issues/1110)) ([#117](https://github.com/sunerpy/codegraph-rust/issues/117)) ([468446a](https://github.com/sunerpy/codegraph-rust/commit/468446a4ea1646074e14b7b1d09c8abaad04390d))
+
 ## [0.25.5](https://github.com/sunerpy/codegraph-rust/compare/v0.25.4...v0.25.5) (2026-07-06)
 
 
