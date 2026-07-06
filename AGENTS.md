@@ -10,8 +10,11 @@ Protocol) stdio server. No AI / vector / LLM anywhere in the binary — output i
 - **Golden `.schema` byte-stability** — verified by `crates/codegraph-bench/tests/equivalence.rs`
   against the fixed golden artifacts under `reference/golden/`. Fixtures: the existing upstream
   corpus plus `reference/golden/godot/` (corpus `crates/codegraph-bench/fixtures/godot/`;
-  guards F1 autoload-call edges + F2 signal-handler edges byte-for-byte).
-  Regen recipe: `docs/equivalence.md` "Godot fixture" section.
+  guards F1 autoload-call edges + F2 signal-handler edges byte-for-byte) and
+  `reference/golden/ruby/` (corpus `crates/codegraph-bench/fixtures/ruby/`; guards #1110
+  Ruby `receiver.method` extraction — instance/class-method Calls, `Const.new` Instantiates,
+  bare `include` Implements — byte-for-byte).
+  Regen recipe: `docs/equivalence.md` "Godot fixture" / "Ruby fixture" sections.
 - **node-id formula**: `{kind}:{sha256("{filePath}:{kind}:{name}:{line}").hex[:32]}`; file nodes are the
   literal `file:{relpath}`; lines are 1-based; paths relative with `/`.
 - **No AI / vector / LLM crates** — enforced by `scripts/guardrail.sh` (CI gate):

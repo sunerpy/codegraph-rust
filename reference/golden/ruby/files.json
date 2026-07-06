@@ -1,0 +1,18 @@
+[
+  {
+    "content_hash": "3a65be1da08f0b766455700e321bd9edb858cc78e21915e8bfaf3e49b5364f22",
+    "errors": null,
+    "language": "ruby",
+    "node_count": 5,
+    "path": "logger.rb",
+    "size": 131
+  },
+  {
+    "content_hash": "053a1a3cfdfe31ecabb5071c79aadd1b5939b20403e8681efcc0b138076bde79",
+    "errors": null,
+    "language": "ruby",
+    "node_count": 6,
+    "path": "service.rb",
+    "size": 214
+  }
+]

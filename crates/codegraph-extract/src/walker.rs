@@ -227,8 +227,18 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     }
 
     fn visit_ruby_node(&mut self, node: SyntaxNode<'tree>) -> bool {
-        if node.kind() != "call" || child_by_field(node, "receiver").is_some() {
+        if node.kind() != "call" {
             return false;
+        }
+        if child_by_field(node, "receiver").is_some() {
+            self.ruby_receiver_call(node);
+            if let Some(args) = child_by_field(node, "arguments") {
+                self.visit_named_children(args);
+            }
+            if let Some(receiver) = child_by_field(node, "receiver") {
+                self.visit_node(receiver);
+            }
+            return true;
         }
         let Some(method) = child_by_field(node, "method") else {
             return false;
@@ -257,6 +267,49 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             }
         }
         true
+    }
+
+    /// #1110 — emit the edge for a receiver-bearing Ruby `call` (`logger.log(x)`,
+    /// `Foo.bar`, `Foo.new`). The generic `extract_call` mis-reads Ruby's field
+    /// layout (`receiver`/`method`, no `function` field) and would emit the
+    /// receiver text as the callee, dropping the method name. Emit from the
+    /// `method` field here instead: `Const.new` → Instantiates the receiver
+    /// class; every other `.method` → Calls the method name. The caller
+    /// (`visit_ruby_node` / `visit_body_node`) suppresses that fall-through and
+    /// owns descending into the arguments/receiver subtrees.
+    fn ruby_receiver_call(&mut self, node: SyntaxNode<'tree>) {
+        let (Some(receiver), Some(method), Some(parent_id)) = (
+            child_by_field(node, "receiver"),
+            child_by_field(node, "method"),
+            self.node_stack.last().cloned(),
+        ) else {
+            return;
+        };
+        let method_name = node_text(method, self.source);
+        if method_name.is_empty() {
+            return;
+        }
+        if method_name == "new" && matches!(receiver.kind(), "constant" | "scope_resolution") {
+            let mut class_name = node_text(receiver, self.source);
+            if let Some(idx) = class_name.rfind(':') {
+                class_name = class_name[idx + 1..].to_string();
+            }
+            let class_name = class_name.trim();
+            if !class_name.is_empty() {
+                self.push_ref(&parent_id, class_name, EdgeKind::Instantiates, node);
+            }
+            return;
+        }
+        self.push_ref(&parent_id, &method_name, EdgeKind::Calls, node);
+    }
+
+    fn visit_ruby_call_arguments(&mut self, node: SyntaxNode<'tree>) {
+        if let Some(args) = child_by_field(node, "arguments") {
+            self.visit_body_node(args);
+        }
+        if let Some(receiver) = child_by_field(node, "receiver") {
+            self.visit_body_node(receiver);
+        }
     }
 
     fn visit_php_node(&mut self, node: SyntaxNode<'tree>) -> bool {
@@ -2213,6 +2266,18 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         if self.spec.language() == Language::Gdscript && self.visit_gdscript_node(node) {
             return;
         }
+        // A Ruby method body reaches calls through this body walker, which never
+        // dispatches the language hook. Route receiver-bearing `call`s through
+        // the #1110 handler first so the method-name edge wins over the generic
+        // extract_call fall-through (which would emit the receiver text).
+        if self.spec.language() == Language::Ruby
+            && node_type == "call"
+            && child_by_field(node, "receiver").is_some()
+        {
+            self.ruby_receiver_call(node);
+            self.visit_ruby_call_arguments(node);
+            return;
+        }
         if is_jsx_element_kind(node_type) {
             self.extract_jsx_component_ref(node);
         } else if has_type(self.spec.call_types(), node_type) {
@@ -3864,6 +3929,217 @@ end
         let (_, refs) = run("c.rb", src, Language::Ruby);
         assert!(has_ref(&refs, EdgeKind::Implements, "M1"));
         assert!(has_ref(&refs, EdgeKind::Implements, "M2"));
+    }
+
+    // ---- Ruby receiver.method extraction (#1110) ----
+
+    #[test]
+    fn ruby_instance_method_call_records_calls_to_method() {
+        // `logger.log(msg)` → a Calls edge to the METHOD name (`log`), not the
+        // receiver (`logger`). Regression: the pre-#1110 fall-through emitted the
+        // receiver text as the callee.
+        let src = r#"
+def run(logger, msg)
+  logger.log(msg)
+end
+"#;
+        let (_, refs) = run("i.rb", src, Language::Ruby);
+        assert!(
+            has_ref(&refs, EdgeKind::Calls, "log"),
+            "expected Calls edge to method `log`, got: {refs:?}"
+        );
+        assert!(
+            !has_ref(&refs, EdgeKind::Calls, "logger"),
+            "receiver `logger` must not be recorded as the callee: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn ruby_class_method_call_records_calls_to_method() {
+        // `Foo.bar` (constant receiver = class-method call) → Calls edge to `bar`.
+        let src = r#"
+def run
+  Foo.bar(1)
+end
+"#;
+        let (_, refs) = run("cm.rb", src, Language::Ruby);
+        assert!(
+            has_ref(&refs, EdgeKind::Calls, "bar"),
+            "expected Calls edge to class method `bar`, got: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn ruby_new_construction_records_instantiates() {
+        // `Foo.new` / `Foo.new(1)` (Ruby construction) → Instantiates edge to the
+        // receiver class (`Foo`), NOT a Calls edge to `new`.
+        let src = r#"
+def build
+  a = Foo.new
+  b = Bar.new(1, 2)
+  [a, b]
+end
+"#;
+        let (_, refs) = run("n.rb", src, Language::Ruby);
+        assert!(
+            has_ref(&refs, EdgeKind::Instantiates, "Foo"),
+            "expected Instantiates edge to `Foo`, got: {refs:?}"
+        );
+        assert!(
+            has_ref(&refs, EdgeKind::Instantiates, "Bar"),
+            "expected Instantiates edge to `Bar`, got: {refs:?}"
+        );
+        assert!(
+            !has_ref(&refs, EdgeKind::Calls, "new"),
+            "`.new` construction must not emit a Calls edge to `new`: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn ruby_namespaced_new_construction_uses_last_segment() {
+        // `Foo::Bar.new` → Instantiates the qualified receiver's LAST segment
+        // (`Bar`), mirroring extract_instantiation's `.`/`:` truncation.
+        let src = r#"
+def build
+  Foo::Bar.new
+end
+"#;
+        let (_, refs) = run("ns.rb", src, Language::Ruby);
+        assert!(
+            has_ref(&refs, EdgeKind::Instantiates, "Bar"),
+            "expected Instantiates edge to `Bar`, got: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn ruby_instance_new_is_calls_not_instantiates() {
+        // A NON-constant receiver `.new` (`factory.new`) is an ordinary method
+        // call, not a construction — Calls `new`, never Instantiates.
+        let src = r#"
+def build(factory)
+  factory.new
+end
+"#;
+        let (_, refs) = run("in.rb", src, Language::Ruby);
+        assert!(
+            has_ref(&refs, EdgeKind::Calls, "new"),
+            "expected Calls edge to `new`, got: {refs:?}"
+        );
+        assert!(
+            !has_ref(&refs, EdgeKind::Instantiates, "factory"),
+            "instance `.new` must not Instantiate the receiver: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn ruby_chained_call_records_last_method() {
+        // `a.b.c(x)`: receiver is itself a `call` (`a.b`); the OUTER method `c`
+        // is recorded as a Calls edge.
+        let src = r#"
+def run(a, x)
+  a.b.c(x)
+end
+"#;
+        let (_, refs) = run("ch.rb", src, Language::Ruby);
+        assert!(
+            has_ref(&refs, EdgeKind::Calls, "c"),
+            "expected Calls edge to `c`, got: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn ruby_bare_include_extend_prepend_unchanged() {
+        // Regression: receiver-less `include`/`extend`/`prepend` still record
+        // Implements edges and must NOT be turned into Calls edges by the new
+        // receiver.method path.
+        let src = r#"
+module M1; end
+module M2; end
+module M3; end
+class C
+  include M1
+  extend M2
+  prepend M3
+end
+"#;
+        let (_, refs) = run("b.rb", src, Language::Ruby);
+        assert!(has_ref(&refs, EdgeKind::Implements, "M1"));
+        assert!(has_ref(&refs, EdgeKind::Implements, "M2"));
+        assert!(has_ref(&refs, EdgeKind::Implements, "M3"));
+        assert!(
+            !has_ref(&refs, EdgeKind::Calls, "M1"),
+            "bare include must not emit a Calls edge: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn ruby_bare_receiverless_call_unchanged() {
+        // A bare receiver-less method call (`puts x`) still flows through the
+        // generic call path and records a Calls edge to the bare name.
+        let src = r#"
+def run(x)
+  helper(x)
+end
+"#;
+        let (_, refs) = run("br.rb", src, Language::Ruby);
+        assert!(
+            has_ref(&refs, EdgeKind::Calls, "helper"),
+            "expected Calls edge to bare `helper`, got: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn ruby_top_level_receiver_call_records_edge() {
+        // A receiver-bearing call at FILE scope (not inside a method body) flows
+        // through visit_node → visit_ruby_node, exercising the top-level descent
+        // path: `Foo.new` Instantiates, and its nested argument call is walked.
+        let src = r#"
+Registry.register(Widget.new)
+"#;
+        let (_, refs) = run("top.rb", src, Language::Ruby);
+        assert!(
+            has_ref(&refs, EdgeKind::Calls, "register"),
+            "expected Calls edge to `register`, got: {refs:?}"
+        );
+        assert!(
+            has_ref(&refs, EdgeKind::Instantiates, "Widget"),
+            "nested `Widget.new` argument must be walked → Instantiates: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn ruby_nested_call_in_arguments_is_walked() {
+        // `logger.log(other.format(x))` inside a method body: the outer call
+        // records `log`, and the nested argument call `format` is still walked
+        // via visit_ruby_call_arguments.
+        let src = r#"
+def run(logger, other, x)
+  logger.log(other.format(x))
+end
+"#;
+        let (_, refs) = run("na.rb", src, Language::Ruby);
+        assert!(has_ref(&refs, EdgeKind::Calls, "log"), "outer: {refs:?}");
+        assert!(
+            has_ref(&refs, EdgeKind::Calls, "format"),
+            "nested argument call `format` must be walked: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn ruby_nested_call_in_receiver_is_walked() {
+        // `factory.build.run`: the receiver of the outer `.run` is itself the
+        // call `factory.build`; walking the receiver records `build` too.
+        let src = r#"
+def go(factory)
+  factory.build.run
+end
+"#;
+        let (_, refs) = run("nr.rb", src, Language::Ruby);
+        assert!(has_ref(&refs, EdgeKind::Calls, "run"), "outer: {refs:?}");
+        assert!(
+            has_ref(&refs, EdgeKind::Calls, "build"),
+            "nested receiver call `build` must be walked: {refs:?}"
+        );
     }
 
     #[test]
