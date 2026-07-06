@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.25.4](https://github.com/sunerpy/codegraph-rust/compare/v0.25.3...v0.25.4) (2026-07-06)
+
+
+### Bug Fixes
+
+* **graph:** complete edge sets and correct node limits in traversal ([#1086](https://github.com/sunerpy/codegraph-rust/issues/1086), [#1087](https://github.com/sunerpy/codegraph-rust/issues/1087), [#1089](https://github.com/sunerpy/codegraph-rust/issues/1089), [#1090](https://github.com/sunerpy/codegraph-rust/issues/1090)) ([#113](https://github.com/sunerpy/codegraph-rust/issues/113)) ([58b25d2](https://github.com/sunerpy/codegraph-rust/commit/58b25d2517149a18cd91e019d608779775bf0868))
+
 ## [0.25.3](https://github.com/sunerpy/codegraph-rust/compare/v0.25.2...v0.25.3) (2026-07-06)
 
 
