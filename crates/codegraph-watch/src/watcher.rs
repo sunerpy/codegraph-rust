@@ -38,6 +38,14 @@ const ENOSPC: i32 = 28; // inotify max_user_watches exhausted (Linux)
 /// `sync/watcher.ts` caps the retry sleep at 30s before degrading).
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
+/// How many CONSECUTIVE non-contention sync errors are tolerated before
+/// auto-sync is disabled (upstream #1127). A repeatable persistent error (schema
+/// mismatch, permission denied, corrupt DB) would otherwise retry forever every
+/// debounce; after this many in a row the watcher degrades with an actionable
+/// message. A single success resets the count, so a transient hiccup is
+/// unaffected.
+const MAX_CONSECUTIVE_SYNC_ERRORS: u32 = 5;
+
 /// How a backend watch error is handled.
 ///
 /// * `Degrade` — fd / file-table exhaustion (`EMFILE`/`ENFILE`): the watcher can
@@ -449,6 +457,7 @@ fn event_loop(ctx: EventLoopCtx) {
     } = ctx;
     let mut pending = BTreeMap::<String, PendingInfo>::new();
     let mut deadline = None::<Instant>;
+    let mut consecutive_sync_errors = 0u32;
     loop {
         let message = match deadline {
             Some(when) => match rx.recv_timeout(when.saturating_duration_since(Instant::now())) {
@@ -509,26 +518,31 @@ fn event_loop(ctx: EventLoopCtx) {
                 let paths = pending.keys().cloned().collect::<Vec<_>>();
                 pending.clear();
                 deadline = None;
-                match run_sync_with_backoff(&sync_fn, paths) {
+                let attempt = run_sync_with_backoff(&sync_fn, paths);
+                let decision = classify_persistent_failure(&attempt, &mut consecutive_sync_errors);
+                match attempt {
                     SyncAttempt::Done(outcome) => {
                         if let Some(callback) = &on_sync_complete {
                             callback(outcome);
                         }
-                    }
-                    SyncAttempt::Degraded(reason) => {
-                        if !degraded.is_degraded() {
-                            degraded.mark(reason.clone());
-                            if let Some(cb) = &on_degraded {
-                                cb(reason);
-                            }
-                        }
-                        break;
                     }
                     SyncAttempt::Error(reason) => {
                         if let Some(cb) = &on_sync_error {
                             cb(reason);
                         }
                     }
+                    SyncAttempt::Degraded(_) => {}
+                }
+                if let PersistentFailure::Degrade(reason) | PersistentFailure::Disable(reason) =
+                    decision
+                {
+                    if !degraded.is_degraded() {
+                        degraded.mark(reason.clone());
+                        if let Some(cb) = &on_degraded {
+                            cb(reason);
+                        }
+                    }
+                    break;
                 }
             }
         }
@@ -568,6 +582,48 @@ enum SyncAttempt {
     Done(SyncOutcome),
     Degraded(String),
     Error(String),
+}
+
+/// What the event loop should do with a completed [`SyncAttempt`], after the
+/// consecutive-error counter has been folded in (upstream #1127).
+#[derive(Debug)]
+enum PersistentFailure {
+    /// Keep running: report the outcome via the usual callbacks, if any.
+    Surface,
+    /// Lock-contention degrade — pass the reason straight through unchanged.
+    Degrade(String),
+    /// Auto-sync has failed persistently; degrade with this actionable message.
+    Disable(String),
+}
+
+/// Fold a [`SyncAttempt`] into the consecutive-error counter and decide the
+/// event loop's next move (upstream #1127). A `Done` resets the counter; an
+/// `Error` increments it and, once [`MAX_CONSECUTIVE_SYNC_ERRORS`] in a row is
+/// reached, escalates to [`PersistentFailure::Disable`] with a message that
+/// names the underlying error and points at `codegraph sync`. Contention
+/// (`Degraded`) is passed through untouched and never counts as a failure.
+fn classify_persistent_failure(
+    attempt: &SyncAttempt,
+    consecutive_errors: &mut u32,
+) -> PersistentFailure {
+    match attempt {
+        SyncAttempt::Done(_) => {
+            *consecutive_errors = 0;
+            PersistentFailure::Surface
+        }
+        SyncAttempt::Degraded(reason) => PersistentFailure::Degrade(reason.clone()),
+        SyncAttempt::Error(reason) => {
+            *consecutive_errors += 1;
+            if *consecutive_errors >= MAX_CONSECUTIVE_SYNC_ERRORS {
+                PersistentFailure::Disable(format!(
+                    "auto-sync disabled after {MAX_CONSECUTIVE_SYNC_ERRORS} consecutive failures \
+                     ({reason}); run `codegraph sync` to reindex once the cause is fixed"
+                ))
+            } else {
+                PersistentFailure::Surface
+            }
+        }
+    }
 }
 
 /// Run `sync_fn`, retrying on write-lock contention with bounded exponential
@@ -898,6 +954,80 @@ mod tests {
     }
 
     #[test]
+    fn persistent_errors_disable_auto_sync_after_threshold() {
+        // #1127: a repeatable non-contention error retries a bounded number of
+        // times, then escalates to a disabled state with an actionable message.
+        let mut consecutive = 0u32;
+        let outcome = SyncAttempt::Error("sync failed: schema mismatch".to_string());
+        for _ in 1..MAX_CONSECUTIVE_SYNC_ERRORS {
+            match classify_persistent_failure(&outcome, &mut consecutive) {
+                PersistentFailure::Surface => {}
+                PersistentFailure::Disable(_) => {
+                    panic!("must not disable before {MAX_CONSECUTIVE_SYNC_ERRORS} errors")
+                }
+                PersistentFailure::Degrade(_) => {
+                    panic!("non-contention must not report contention")
+                }
+            }
+        }
+        match classify_persistent_failure(&outcome, &mut consecutive) {
+            PersistentFailure::Disable(message) => {
+                assert!(
+                    message.contains("schema mismatch"),
+                    "message must name the underlying error: {message}"
+                );
+                assert!(
+                    message.contains("codegraph sync"),
+                    "message must point at the manual recovery command: {message}"
+                );
+            }
+            other => panic!("expected Disable at the threshold, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_single_success_resets_the_error_counter() {
+        // #1127: a transient hiccup must not accumulate toward disable — one
+        // successful sync resets the consecutive-error count.
+        let mut consecutive = 0u32;
+        let err = SyncAttempt::Error("sync failed: transient".to_string());
+        for _ in 0..(MAX_CONSECUTIVE_SYNC_ERRORS - 1) {
+            classify_persistent_failure(&err, &mut consecutive);
+        }
+        assert_eq!(consecutive, MAX_CONSECUTIVE_SYNC_ERRORS - 1);
+
+        let outcome = SyncOutcome::default();
+        let done = SyncAttempt::Done(outcome);
+        assert!(matches!(
+            classify_persistent_failure(&done, &mut consecutive),
+            PersistentFailure::Surface
+        ));
+        assert_eq!(consecutive, 0, "one success must reset the counter");
+
+        // After the reset the very next error is surfaced, NOT disabled.
+        assert!(matches!(
+            classify_persistent_failure(&err, &mut consecutive),
+            PersistentFailure::Surface
+        ));
+    }
+
+    #[test]
+    fn contention_degrade_path_is_unchanged_by_persistent_failure() {
+        // #1127 must not touch the lock-contention degrade path: a Degraded
+        // outcome passes straight through and never counts as a persistent error.
+        let mut consecutive = 7u32;
+        let outcome = SyncAttempt::Degraded("sync write-lock contention exceeded".to_string());
+        match classify_persistent_failure(&outcome, &mut consecutive) {
+            PersistentFailure::Degrade(reason) => assert!(reason.contains("contention")),
+            other => panic!("contention must map to Degrade, got {other:?}"),
+        }
+        assert_eq!(
+            consecutive, 7,
+            "the contention path must not disturb the error counter"
+        );
+    }
+
+    #[test]
     fn fresh_watcher_is_not_degraded_and_has_no_reason() {
         // Given: an inert watcher that never hits a backend error.
         let dir = crate::sync::tests::TestDir::new("watch-not-degraded");
@@ -1048,6 +1178,57 @@ mod tests {
         assert!(
             sync_errors.lock().unwrap()[0].contains("parse error"),
             "the surfaced message must carry the underlying error"
+        );
+    }
+
+    #[test]
+    fn event_loop_disables_auto_sync_after_persistent_errors() {
+        // #1127: an injected sync_fn that always fails with the SAME
+        // non-contention error must, after MAX_CONSECUTIVE_SYNC_ERRORS flushes,
+        // degrade the watcher with an actionable message and stop retrying.
+        let dir = crate::sync::tests::TestDir::new("watch-loop-disable");
+        let degrade_msgs = Arc::new(Mutex::new(Vec::<String>::new()));
+        let dm = Arc::clone(&degrade_msgs);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&attempts);
+        let sync_fn: SyncFn = Arc::new(move |_paths| {
+            counter.fetch_add(1, AtomicOrdering::SeqCst);
+            Err(anyhow::anyhow!("schema version mismatch"))
+        });
+        let watcher = ProjectWatcher::start(
+            dir.path(),
+            WatchOptions {
+                debounce: Duration::from_millis(20),
+                inert_for_tests: true,
+                sync_fn: Some(sync_fn),
+                on_degraded: Some(Arc::new(move |msg| dm.lock().unwrap().push(msg))),
+                ..WatchOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        for i in 0..MAX_CONSECUTIVE_SYNC_ERRORS {
+            watcher.ingest_event_for_tests(format!("src/app{i}.ts"));
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        let mut degraded = false;
+        for _ in 0..40 {
+            if watcher.is_degraded() {
+                degraded = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        watcher.stop();
+
+        assert!(degraded, "watcher must degrade after persistent failures");
+        let msgs = degrade_msgs.lock().unwrap();
+        assert_eq!(msgs.len(), 1, "on_degraded must fire exactly once");
+        assert!(
+            msgs[0].contains("schema version mismatch") && msgs[0].contains("codegraph sync"),
+            "disable message must name the error and point at the fix: {}",
+            msgs[0]
         );
     }
 

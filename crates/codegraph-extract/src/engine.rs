@@ -22,6 +22,7 @@ use crate::walker::TreeSitterWalker;
 pub struct ExtractOptions {
     pub max_file_size: u64,
     pub ignore_dirs: Vec<String>,
+    pub ignore_paths: Vec<String>,
     pub exclude: Vec<String>,
     pub parallel: bool,
 }
@@ -32,6 +33,7 @@ impl Default for ExtractOptions {
         Self {
             max_file_size: indexing.max_file_size,
             ignore_dirs: indexing.ignore_dirs,
+            ignore_paths: indexing.ignore_paths,
             exclude: indexing.exclude,
             parallel: true,
         }
@@ -228,14 +230,10 @@ pub fn scan_project(root: &Path, options: &ExtractOptions) -> Result<Vec<String>
         .map(String::as_str)
         .collect::<HashSet<_>>();
     let gitignore = read_root_gitignore(root);
-    scan_dir(
-        root,
-        root,
-        &ignored_dirs,
-        &gitignore,
-        &options.exclude,
-        &mut files,
-    )?;
+    // Evaluated in order (default paths → config exclude → .gitignore), so a
+    // later `!pattern` negation re-includes a path an earlier set excluded.
+    let pattern_sets: Vec<&[String]> = vec![&options.ignore_paths, &options.exclude, &gitignore];
+    scan_dir(root, root, &ignored_dirs, &pattern_sets, &mut files)?;
     files.sort();
     Ok(files)
 }
@@ -244,8 +242,7 @@ fn scan_dir(
     root: &Path,
     dir: &Path,
     ignored_dirs: &HashSet<&str>,
-    gitignore: &[String],
-    exclude: &[String],
+    pattern_sets: &[&[String]],
     files: &mut Vec<String>,
 ) -> Result<()> {
     let entries = fs::read_dir(dir).with_context(|| format!("read dir {}", dir.display()))?;
@@ -258,14 +255,12 @@ fn scan_dir(
             continue;
         }
         let relative = normalize_path(path.strip_prefix(root).unwrap_or(&path));
-        if is_ignored_by_patterns(&relative, gitignore)
-            || is_ignored_by_patterns(&relative, exclude)
-        {
+        if is_path_ignored(&relative, pattern_sets) {
             continue;
         }
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            scan_dir(root, &path, ignored_dirs, gitignore, exclude, files)?;
+            scan_dir(root, &path, ignored_dirs, pattern_sets, files)?;
         } else if file_type.is_file() && is_extractable_source_path(&relative) {
             files.push(relative);
         }
@@ -315,16 +310,35 @@ fn read_root_gitignore(root: &Path) -> Vec<String> {
         .collect()
 }
 
-fn is_ignored_by_patterns(relative: &str, patterns: &[String]) -> bool {
-    patterns.iter().any(|pattern| {
-        if let Some(dir) = pattern.strip_suffix('/') {
-            relative == dir || relative.starts_with(&format!("{dir}/"))
-        } else if let Some(prefix) = pattern.strip_suffix('*') {
-            relative.starts_with(prefix)
-        } else {
-            relative == pattern || relative.ends_with(&format!("/{pattern}"))
+/// Evaluate ordered `.gitignore`-style pattern sets with last-match-wins
+/// negation: a `!pattern` line un-ignores a path an earlier pattern excluded.
+/// Sets are scanned in order, patterns within a set in order, and the final
+/// matching pattern decides — so a later `!res/values/` re-includes what a
+/// default `res/values*` excluded.
+fn is_path_ignored(relative: &str, pattern_sets: &[&[String]]) -> bool {
+    let mut ignored = false;
+    for set in pattern_sets {
+        for pattern in set.iter() {
+            if let Some(negated) = pattern.strip_prefix('!') {
+                if pattern_matches(relative, negated) {
+                    ignored = false;
+                }
+            } else if pattern_matches(relative, pattern) {
+                ignored = true;
+            }
         }
-    })
+    }
+    ignored
+}
+
+fn pattern_matches(relative: &str, pattern: &str) -> bool {
+    if let Some(dir) = pattern.strip_suffix('/') {
+        relative == dir || relative.starts_with(&format!("{dir}/"))
+    } else if let Some(prefix) = pattern.strip_suffix('*') {
+        relative.starts_with(prefix)
+    } else {
+        relative == pattern || relative.ends_with(&format!("/{pattern}"))
+    }
 }
 
 fn is_extractable_source_path(relative: &str) -> bool {
@@ -563,12 +577,103 @@ mod tests {
 
     #[test]
     fn is_ignored_by_patterns_matches_dir_prefix_and_suffix_forms() {
-        let patterns = vec!["dist/".to_string(), "gen".to_string(), "tmp*".to_string()];
-        assert!(is_ignored_by_patterns("dist/app.js", &patterns));
-        assert!(is_ignored_by_patterns("gen", &patterns));
-        assert!(is_ignored_by_patterns("src/gen", &patterns));
-        assert!(is_ignored_by_patterns("tmpfile.txt", &patterns));
-        assert!(!is_ignored_by_patterns("src/app.js", &patterns));
+        assert!(pattern_matches("dist/app.js", "dist/"));
+        assert!(pattern_matches("gen", "gen"));
+        assert!(pattern_matches("src/gen", "gen"));
+        assert!(pattern_matches("tmpfile.txt", "tmp*"));
+        assert!(!pattern_matches("src/app.js", "dist/"));
+        assert!(!pattern_matches("src/app.js", "gen"));
+        assert!(!pattern_matches("src/app.js", "tmp*"));
+    }
+
+    #[test]
+    fn scan_excludes_android_res_variants_by_default() {
+        // #1047: standard Android res/ subdirs (and their locale/density
+        // variants) are excluded by default; real code stays indexed.
+        let project = unique_project("android_res");
+        touch(&project, "src/main/java/App.java", "class App {}");
+        touch(&project, "res/values/strings.xml", "<resources/>");
+        touch(&project, "res/values-es/strings.xml", "<resources/>");
+        touch(&project, "res/drawable/ic.xml", "<vector/>");
+        touch(&project, "res/drawable-hdpi/ic.xml", "<vector/>");
+        touch(&project, "res/layout/main.xml", "<LinearLayout/>");
+        touch(&project, "res/menu/m.xml", "<menu/>");
+
+        let files = scan_project(&project, &ExtractOptions::default()).expect("scan");
+        assert!(
+            files.contains(&"src/main/java/App.java".to_string()),
+            "first-party Java must be indexed: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f.starts_with("res/")),
+            "Android res/ variants must be excluded by default: {files:?}"
+        );
+        fs::remove_dir_all(&project).ok();
+    }
+
+    #[test]
+    fn scan_keeps_res_raw_and_src_main_resources_by_default() {
+        // #1047 preservation: res/raw/ holds real assets and MyBatis mapper XML
+        // under src/main/resources/ carries code symbols — neither is excluded.
+        let project = unique_project("android_keep");
+        touch(&project, "res/raw/data.xml", "<data/>");
+        touch(
+            &project,
+            "src/main/resources/mapper/UserMapper.xml",
+            "<mapper/>",
+        );
+        touch(&project, "res/values/strings.xml", "<resources/>");
+
+        let files = scan_project(&project, &ExtractOptions::default()).expect("scan");
+        assert!(
+            files.contains(&"res/raw/data.xml".to_string()),
+            "res/raw/ must be kept: {files:?}"
+        );
+        assert!(
+            files.contains(&"src/main/resources/mapper/UserMapper.xml".to_string()),
+            "src/main/resources/ MyBatis mappers must be kept: {files:?}"
+        );
+        assert!(
+            !files.contains(&"res/values/strings.xml".to_string()),
+            "res/values/ still excluded alongside the kept dirs: {files:?}"
+        );
+        fs::remove_dir_all(&project).ok();
+    }
+
+    #[test]
+    fn gitignore_negation_reincludes_default_excluded_res_dir() {
+        // #1047: a user can re-include a default-excluded res/ dir with a
+        // .gitignore negation (`!res/values/`).
+        let project = unique_project("android_negation");
+        touch(&project, ".gitignore", "!res/values/\n");
+        touch(&project, "res/values/strings.xml", "<resources/>");
+        touch(&project, "res/drawable/ic.xml", "<vector/>");
+
+        let files = scan_project(&project, &ExtractOptions::default()).expect("scan");
+        assert!(
+            files.contains(&"res/values/strings.xml".to_string()),
+            "negation must re-include res/values/: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f.starts_with("res/drawable")),
+            "un-negated res/drawable stays excluded: {files:?}"
+        );
+        fs::remove_dir_all(&project).ok();
+    }
+
+    #[test]
+    fn is_path_ignored_negation_is_last_match_wins() {
+        let defaults = vec!["res/values*".to_string()];
+        let user = vec!["!res/values/".to_string()];
+        assert!(is_path_ignored("res/values/strings.xml", &[&defaults]));
+        assert!(!is_path_ignored(
+            "res/values/strings.xml",
+            &[&defaults, &user]
+        ));
+        assert!(is_path_ignored(
+            "res/values-es/strings.xml",
+            &[&defaults, &user]
+        ));
     }
 
     #[test]

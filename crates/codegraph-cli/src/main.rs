@@ -1162,12 +1162,7 @@ fn cmd_query(
     } else {
         println!("\nSearch Results for \"{search}\":\n");
         for result in results {
-            println!(
-                "{:<12}{} ({:.0}%)",
-                result.node.kind,
-                result.node.name,
-                result.score * 100.0
-            );
+            println!("{}", format_query_result_line(&result));
             println!("  {}:{}", result.node.file_path, result.node.start_line);
             if let Some(signature) = &result.node.signature {
                 println!("  {signature}");
@@ -1176,6 +1171,14 @@ fn cmd_query(
         }
     }
     Ok(())
+}
+
+/// Human-readable one-line summary of a search hit. Results are listed
+/// best-match-first, so the raw FTS `score` (not a 0..1 fraction) is NOT shown —
+/// rendering `score * 100` produced nonsensical values like `12042%` (upstream
+/// #1045). The score stays in the `--json` output for sorting/thresholding.
+fn format_query_result_line(result: &SearchResult) -> String {
+    format!("{:<12}{}", result.node.kind, result.node.name)
 }
 
 fn cmd_files(
@@ -2980,6 +2983,7 @@ fn index_project_inner(
     let options = ExtractOptions {
         max_file_size: config.indexing.max_file_size,
         ignore_dirs: config.indexing.ignore_dirs.clone(),
+        ignore_paths: config.indexing.ignore_paths.clone(),
         exclude: config.indexing.exclude.clone(),
         parallel: true,
     };
@@ -4811,6 +4815,72 @@ mod formatter_and_env_tests {
         assert_eq!(out.node.name, "q");
         let json = serde_json::to_string(&out).unwrap();
         assert!(json.contains("\"score\":0.75"));
+    }
+
+    #[test]
+    fn query_human_result_line_has_no_percentage() {
+        // #1045: the raw FTS score is not a percentage; multiplying by 100 emits
+        // nonsensical values like "12042%". Results are already best-match-first,
+        // so the human-readable line must NOT print any percentage at all.
+        let n = query_test_node("myFunc");
+        let sr = SearchResult {
+            node: n,
+            score: 120.42,
+        };
+        let line = format_query_result_line(&sr);
+        assert!(
+            !line.contains('%'),
+            "human query output must not contain a percentage: {line:?}"
+        );
+        assert!(
+            line.contains(&NodeKind::Function.to_string()),
+            "kind must be shown: {line:?}"
+        );
+        assert!(line.contains("myFunc"), "name must be shown: {line:?}");
+    }
+
+    #[test]
+    fn query_json_output_still_carries_raw_score() {
+        // #1045: the percentage is dropped from the HUMAN output only. The
+        // machine-readable --json output keeps the raw score for
+        // sorting/thresholding, exactly as upstream does.
+        let n = query_test_node("myFunc");
+        let sr = SearchResult {
+            node: n,
+            score: 120.42,
+        };
+        let out = SearchOutput::from(&sr);
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(
+            json.contains("\"score\":120.42"),
+            "json must retain the raw score: {json}"
+        );
+    }
+
+    fn query_test_node(name: &str) -> Node {
+        Node {
+            id: format!("function:{name}"),
+            kind: NodeKind::Function,
+            name: name.to_string(),
+            qualified_name: name.to_string(),
+            file_path: "src/a.rs".to_string(),
+            language: Language::Rust,
+            start_line: 42,
+            end_line: 43,
+            start_column: 0,
+            end_column: 0,
+            docstring: None,
+            signature: None,
+            visibility: None,
+            is_exported: false,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+            decorators: Vec::new(),
+            type_parameters: Vec::new(),
+            return_type: None,
+            updated_at: 0,
+        }
     }
 
     #[test]

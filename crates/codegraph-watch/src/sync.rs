@@ -42,6 +42,7 @@ pub fn sync_project_once_with_progress(
     let options = ExtractOptions {
         max_file_size: config.indexing.max_file_size,
         ignore_dirs: config.indexing.ignore_dirs.clone(),
+        ignore_paths: config.indexing.ignore_paths.clone(),
         exclude: config.indexing.exclude.clone(),
         parallel: true,
     };
