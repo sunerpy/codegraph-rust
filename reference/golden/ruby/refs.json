@@ -1,0 +1,22 @@
+[
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "logger.rb",
+    "from_node_id": "method:802cce700d42a7eb7209b354d3dddec7",
+    "language": "ruby",
+    "line": 9,
+    "reference_kind": "calls",
+    "reference_name": "upcase"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "logger.rb",
+    "from_node_id": "method:fb94e9aad5122a4f49414ebab9facc1e",
+    "language": "ruby",
+    "line": 3,
+    "reference_kind": "calls",
+    "reference_name": "puts"
+  }
+]

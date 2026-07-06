@@ -1,0 +1,143 @@
+[
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:service.rb",
+    "target": "import:cfeb23f671da6d64db48c4b52c899be0"
+  },
+  {
+    "col": 14,
+    "kind": "instantiates",
+    "line": 10,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:c9df49a652ee59e545b4fa4500c471e4",
+    "target": "class:5f20f7c9609d23d12f8de3f9bb665c29"
+  },
+  {
+    "col": 2,
+    "kind": "implements",
+    "line": 7,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "class:00719212ba234c481107c674f52dddc3",
+    "target": "module:cdcd54df6a1942a758f90411e3b77667"
+  },
+  {
+    "col": 4,
+    "kind": "calls",
+    "line": 14,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:ac1efceb37c260d79e9bbe3f76828698",
+    "target": "method:fb94e9aad5122a4f49414ebab9facc1e"
+  },
+  {
+    "col": 4,
+    "kind": "calls",
+    "line": 15,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:ac1efceb37c260d79e9bbe3f76828698",
+    "target": "method:802cce700d42a7eb7209b354d3dddec7"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:00719212ba234c481107c674f52dddc3",
+    "target": "method:ac1efceb37c260d79e9bbe3f76828698"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:00719212ba234c481107c674f52dddc3",
+    "target": "method:c9df49a652ee59e545b4fa4500c471e4"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:5f20f7c9609d23d12f8de3f9bb665c29",
+    "target": "method:fb94e9aad5122a4f49414ebab9facc1e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:df596ba5f1f91ca7319d035e74179ec1",
+    "target": "method:802cce700d42a7eb7209b354d3dddec7"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:logger.rb",
+    "target": "class:5f20f7c9609d23d12f8de3f9bb665c29"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:logger.rb",
+    "target": "class:df596ba5f1f91ca7319d035e74179ec1"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:service.rb",
+    "target": "class:00719212ba234c481107c674f52dddc3"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:service.rb",
+    "target": "import:cfeb23f671da6d64db48c4b52c899be0"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:service.rb",
+    "target": "module:cdcd54df6a1942a758f90411e3b77667"
+  }
+]

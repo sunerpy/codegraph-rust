@@ -41,6 +41,26 @@ fn upstream_db_is_self_equivalent_to_godot_golden() {
 }
 
 #[test]
+fn generated_golden_matches_committed_ruby_fixture() {
+    // Guards Ruby #1110 receiver.method extraction (instance-call → Calls,
+    // class-method call → Calls, `Const.new` → Instantiates, bare include →
+    // Implements) against byte-drift: regenerating the canonical golden from the
+    // committed ruby db must reproduce the committed JSON exactly.
+    let tempdir = TestDir::new("generated-golden-ruby");
+    write_golden(&ruby_db(), tempdir.path()).unwrap();
+
+    let expected = load_golden(&ruby_golden_dir()).unwrap();
+    let actual = load_golden(tempdir.path()).unwrap();
+
+    diff_canonical(&expected, &actual, None).unwrap();
+}
+
+#[test]
+fn upstream_db_is_self_equivalent_to_ruby_golden() {
+    assert_equivalent(&ruby_db(), &ruby_golden_dir()).unwrap();
+}
+
+#[test]
 fn tier1_node_drift_is_reported() {
     let expected = load_golden(&mini_golden_dir()).unwrap();
     let mut actual = expected.clone();
@@ -100,6 +120,14 @@ fn godot_db() -> PathBuf {
 
 fn godot_golden_dir() -> PathBuf {
     workspace_root().join("reference/golden/godot")
+}
+
+fn ruby_db() -> PathBuf {
+    workspace_root().join("reference/golden/ruby/colby.db")
+}
+
+fn ruby_golden_dir() -> PathBuf {
+    workspace_root().join("reference/golden/ruby")
 }
 
 struct TestDir {

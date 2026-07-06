@@ -192,6 +192,50 @@ parallel CRUD work. It preserves `.schema` statement order, strips optional
 whitespace, removes blank lines, joins statements with `;\n`, and enforces a
 final `;\n`.
 
+### Ruby fixture
+
+A third golden fixture, `reference/golden/ruby/`, guards Ruby `receiver.method`
+extraction (upstream #1110) that the other fixtures cannot reach — there are no
+`.rb` files in `mini`/`godot`. It captures the four receiver-bearing-call edge
+shapes:
+
+- **instance-method call** — `@logger.log(message)` resolving to `Logger#log`
+  (a `Calls` edge to the METHOD name, not the receiver).
+- **class-method call** — `Formatter.shout(message)` resolving to
+  `Formatter.shout` (a `Calls` edge to the method name).
+- **`Const.new` construction** — `Logger.new` recorded as an `Instantiates` edge
+  to the receiver class `Logger`, not a `Calls` edge to `new`.
+- **bare `include`** — `include Greeting` still records an `Implements` edge
+  (regression guard: the receiver.method path must not disturb it).
+
+The minimal source corpus lives at `crates/codegraph-bench/fixtures/ruby/`
+(`service.rb`, `logger.rb`).
+
+Regenerate the committed database + canonical JSON reproducibly from the corpus:
+
+```bash
+# 1. Copy the corpus to a clean directory (keeps the workspace .codegraph/ out of it).
+rm -rf /tmp/cg-fixture-ruby
+cp -r crates/codegraph-bench/fixtures/ruby /tmp/cg-fixture-ruby
+
+# 2. Index it with OUR binary (never hand-write the golden).
+cargo build --release -p codegraph-rs
+CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
+  ./target/release/codegraph init /tmp/cg-fixture-ruby
+
+# 3. Commit the produced database as the fixture's colby.db.
+cp /tmp/cg-fixture-ruby/.codegraph/codegraph.db reference/golden/ruby/colby.db
+
+# 4. Dump the canonical golden JSON + schema from that database.
+cargo run -p codegraph-bench --bin bench -- \
+  --gen-golden reference/golden/ruby/colby.db reference/golden/ruby
+```
+
+Like the Godot fixture, both the index and the dump are byte-stable, and the
+`generated_golden_matches_committed_ruby_fixture` and
+`upstream_db_is_self_equivalent_to_ruby_golden` tests in
+`crates/codegraph-bench/tests/equivalence.rs` enforce it.
+
 ### KNOWN_DIFFS.md format
 
 Tier-3 differences are allowlisted by grep-able lines in repo-root
