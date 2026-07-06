@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.25.2](https://github.com/sunerpy/codegraph-rust/compare/v0.25.1...v0.25.2) (2026-07-06)
+
+
+### Bug Fixes
+
+* **store:** dedup edges with a UNIQUE identity index ([#1034](https://github.com/sunerpy/codegraph-rust/issues/1034)) ([#109](https://github.com/sunerpy/codegraph-rust/issues/109)) ([a7d4883](https://github.com/sunerpy/codegraph-rust/commit/a7d4883ab43832cf09e3ff230323b32fcbd87f76))
+
 ## [0.25.1](https://github.com/sunerpy/codegraph-rust/compare/v0.25.0...v0.25.1) (2026-07-06)
 
 
