@@ -55,6 +55,13 @@ pub struct IndexingConfig {
     pub max_file_size: u64,
     #[serde(default = "default_ignore_dirs")]
     pub ignore_dirs: Vec<String>,
+    /// Root-relative path patterns excluded by default, expressed in the
+    /// `.gitignore`-style matcher (see [`default_ignore_paths`]). Unlike
+    /// [`ignore_dirs`] (single directory basenames matched anywhere), these are
+    /// PATH patterns so an Android `res/values` subtree can be excluded while a
+    /// same-named component elsewhere is not. Overridable in `config.toml`.
+    #[serde(default = "default_ignore_paths")]
+    pub ignore_paths: Vec<String>,
     /// Root-relative path patterns skipped during the walk, alongside
     /// `ignore_dirs`/`.gitignore`. Same matcher as `.gitignore` (`static/`,
     /// `docs/gen`, `gen*`); honored by index and sync. Off by default.
@@ -145,11 +152,40 @@ fn default_ignore_dirs() -> Vec<String> {
     ]
 }
 
+/// Root-relative `.gitignore`-style path patterns excluded by default.
+///
+/// #1047: Android `res/` resource subdirs hold no code symbols but often make up
+/// the bulk of an Android project's files, bloating the index. Each standard
+/// subdir is excluded via a `res/<kind>*` prefix pattern so the SAME rule also
+/// swallows locale/density variants (`res/values-es/`, `res/drawable-hdpi/`).
+///
+/// Deliberately NOT excluded: `res/raw/` (real assets) and MyBatis mapper XML
+/// under `src/main/resources/` — the per-subdir `res/<kind>` prefixes never
+/// match either. Re-include any of these with a `.gitignore` negation
+/// (`!res/values/`).
+fn default_ignore_paths() -> Vec<String> {
+    [
+        "res/layout",
+        "res/values",
+        "res/drawable",
+        "res/menu",
+        "res/mipmap",
+        "res/anim",
+        "res/color",
+        "res/xml",
+        "res/navigation",
+    ]
+    .iter()
+    .map(|stem| format!("{stem}*"))
+    .collect()
+}
+
 impl Default for IndexingConfig {
     fn default() -> Self {
         Self {
             max_file_size: default_max_file_size(),
             ignore_dirs: default_ignore_dirs(),
+            ignore_paths: default_ignore_paths(),
             exclude: Vec::new(),
         }
     }
@@ -417,6 +453,68 @@ max_file_size = 2097152
         let watch = WatchConfig::default();
         assert!(watch.enabled);
         assert_eq!(watch.debounce_ms, default_watch_debounce_ms());
+    }
+
+    #[test]
+    fn default_ignore_paths_cover_android_res_dirs() {
+        // #1047: Android res/ resource subdirs hold no code symbols and bloat the
+        // index. Each standard subdir is excluded by default via a prefix pattern
+        // whose form also swallows locale/density variants (res/values-es, ...).
+        let paths = default_ignore_paths();
+        for stem in [
+            "res/layout",
+            "res/values",
+            "res/drawable",
+            "res/menu",
+            "res/mipmap",
+            "res/anim",
+            "res/color",
+            "res/xml",
+            "res/navigation",
+        ] {
+            assert!(
+                paths.iter().any(|p| p == &format!("{stem}*")),
+                "expected a `{stem}*` default ignore pattern, got: {paths:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_ignore_paths_preserve_res_raw_and_resources() {
+        // #1047 exclusions to PRESERVE: res/raw/ holds real assets, and MyBatis
+        // mapper XML lives under src/main/resources/ (NOT res/). No default
+        // pattern may match either.
+        let paths = default_ignore_paths();
+        assert!(
+            !paths.iter().any(|p| p.contains("res/raw")),
+            "res/raw must never be excluded: {paths:?}"
+        );
+        assert!(
+            !paths
+                .iter()
+                .any(|p| p.starts_with("res*") || p == "res/" || p == "res"),
+            "a bare res/ rule would wrongly catch resources/: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn indexing_config_default_carries_android_res_ignore_paths() {
+        let indexing = IndexingConfig::default();
+        assert!(indexing.ignore_paths.contains(&"res/values*".to_string()));
+        assert!(indexing.ignore_paths.contains(&"res/drawable*".to_string()));
+    }
+
+    #[test]
+    fn ignore_paths_parses_and_overrides_default() {
+        let with_override = r#"
+[app]
+name = "p"
+
+[indexing]
+ignore_paths = ["custom/gen*"]
+"#;
+        let cfg: Config = toml::from_str(with_override).expect("should parse");
+        assert_eq!(cfg.indexing.ignore_paths, vec!["custom/gen*"]);
     }
     #[test]
     fn init_and_get_config_share_the_global_singleton() {
