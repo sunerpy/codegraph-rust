@@ -247,6 +247,14 @@ impl<'store> GraphTraverser<'store> {
             let neighbor_nodes = self.store.nodes_by_ids(&want_ids)?;
 
             for adj_edge in &adjacent {
+                // #1089/#1090: enforce the hard node cap PER INSERTION so a
+                // high-fan-out symbol whose neighbors are added in one batch can
+                // never push the subgraph past `options.limit`. Checked before
+                // each `set_node`, on the deterministic `structural_priority`
+                // frontier order, so the truncation point is stable.
+                if graph.nodes.len() >= options.limit {
+                    break;
+                }
                 let next_id = neighbor_id(adj_edge, &node.id);
                 if visited.contains(next_id) {
                     continue;
@@ -309,6 +317,11 @@ impl<'store> GraphTraverser<'store> {
         let neighbor_nodes = self.store.nodes_by_ids(&want_ids)?;
 
         for edge in &adjacent {
+            // #1089/#1090: enforce the hard node cap PER INSERTION (mirror of the
+            // BFS fix) so a high-fan-out node cannot overshoot `options.limit`.
+            if graph.nodes.len() >= options.limit {
+                break;
+            }
             let next_id = neighbor_id(edge, &node.id);
             if visited.contains(next_id) {
                 continue;
@@ -378,14 +391,27 @@ impl<'store> GraphTraverser<'store> {
         let source_ids: Vec<String> = incoming.iter().map(|e| e.source.clone()).collect();
         let caller_nodes = self.store.nodes_by_ids(&source_ids)?;
 
+        // #1087 vs #1088: emit one NodeEdge per DISTINCT (caller, edge-kind) so a
+        // caller linked by several kinds (Calls AND References) surfaces BOTH
+        // (#1087), while repeated SAME-kind sites of one caller still collapse to
+        // a single row (#1088). `visited` gates only the RECURSION (cycle safety),
+        // never the emission — so the node is still walked at most once.
+        let mut emitted: HashSet<(String, EdgeKind)> = HashSet::new();
         for edge in incoming {
-            if let Some(caller) = caller_nodes.get(&edge.source)
-                && !visited.contains(&caller.id)
-            {
-                let caller = caller.clone();
+            if let Some(caller) = caller_nodes.get(&edge.source) {
+                if !emitted.insert((caller.id.clone(), edge.kind)) {
+                    continue;
+                }
+                let recurse = !visited.contains(&caller.id);
                 let caller_id = caller.id.clone();
-                result.push(NodeEdge { node: caller, edge });
-                self.callers_recursive(&caller_id, max_depth, current_depth + 1, result, visited)?;
+                let next_depth = current_depth + 1;
+                result.push(NodeEdge {
+                    node: caller.clone(),
+                    edge,
+                });
+                if recurse {
+                    self.callers_recursive(&caller_id, max_depth, next_depth, result, visited)?;
+                }
             }
         }
         Ok(())
@@ -486,14 +512,25 @@ impl<'store> GraphTraverser<'store> {
         let target_ids: Vec<String> = outgoing.iter().map(|e| e.target.clone()).collect();
         let callee_nodes = self.store.nodes_by_ids(&target_ids)?;
 
+        // #1087 vs #1088: mirror of `callers_recursive` — one NodeEdge per
+        // DISTINCT (callee, edge-kind) keeps multi-kind pairs while collapsing
+        // repeated same-kind sites; `visited` gates only recursion.
+        let mut emitted: HashSet<(String, EdgeKind)> = HashSet::new();
         for edge in outgoing {
-            if let Some(callee) = callee_nodes.get(&edge.target)
-                && !visited.contains(&callee.id)
-            {
-                let callee = callee.clone();
+            if let Some(callee) = callee_nodes.get(&edge.target) {
+                if !emitted.insert((callee.id.clone(), edge.kind)) {
+                    continue;
+                }
+                let recurse = !visited.contains(&callee.id);
                 let callee_id = callee.id.clone();
-                result.push(NodeEdge { node: callee, edge });
-                self.callees_recursive(&callee_id, max_depth, current_depth + 1, result, visited)?;
+                let next_depth = current_depth + 1;
+                result.push(NodeEdge {
+                    node: callee.clone(),
+                    edge,
+                });
+                if recurse {
+                    self.callees_recursive(&callee_id, max_depth, next_depth, result, visited)?;
+                }
             }
         }
         Ok(())
@@ -709,14 +746,22 @@ impl<'store> GraphTraverser<'store> {
         )?;
 
         for edge in incoming {
-            if let Some(source) = sources.get(&edge.source)
-                && !graph.nodes.contains_key(&source.id)
-            {
-                let source = source.clone();
+            if let Some(source) = sources.get(&edge.source) {
+                // #1086: the direct-dependency edge is recorded unconditionally —
+                // even when `source` is already in the subgraph via another path,
+                // the edge between the two endpoints is a real dependency and must
+                // survive. Only the NODE addition + recursion is guarded so we
+                // neither duplicate the node nor re-walk an already-visited source.
+                let already_present = graph.nodes.contains_key(&source.id);
                 let source_id = source.id.clone();
-                graph.set_node(source);
+                let next_depth = current_depth + 1;
+                if !already_present {
+                    graph.set_node(source.clone());
+                }
                 graph.edges.push(edge);
-                self.impact_recursive(&source_id, max_depth, current_depth + 1, graph, visited)?;
+                if !already_present {
+                    self.impact_recursive(&source_id, max_depth, next_depth, graph, visited)?;
+                }
             }
         }
         Ok(())

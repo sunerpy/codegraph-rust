@@ -582,3 +582,518 @@ fn find_circular_dependencies_acyclic_is_empty() {
     let cycles = traverser.find_circular_dependencies().expect("cycles");
     assert!(cycles.is_empty(), "acyclic graph has no cycles");
 }
+
+// ---------------------------------------------------------------------------
+// Round 2 — graph-traversal completeness / dedup / bounds (upstream #1086-1090)
+// ---------------------------------------------------------------------------
+
+fn r2_node(id: &str, name: &str) -> Node {
+    node(
+        id,
+        NodeKind::Function,
+        name,
+        name,
+        "src/r2.ts",
+        Language::TypeScript,
+        1,
+        2,
+    )
+}
+
+/// Count the edges in a subgraph whose (source, target, kind) matches.
+fn count_edges(edges: &[Edge], source: &str, target: &str, kind: EdgeKind) -> usize {
+    edges
+        .iter()
+        .filter(|e| e.source == source && e.target == target && e.kind == kind)
+        .count()
+}
+
+/// #1086 — impact must record a direct dependency edge between two nodes even
+/// when the source node was ALREADY reached through another path.
+///
+/// Graph (edges are INCOMING dependents; impact walks callers of `target`):
+///     A --Calls--> target        (A depends on target — direct)
+///     A --Calls--> B             (A depends on B)
+///     B --Calls--> target        (B depends on target — direct)
+/// Walking impact of `target`: incoming = {A, B}. Suppose B is visited first and
+/// pulls in A (A depends on B). When the outer loop then reaches the A->target
+/// edge, A is already in the subgraph, so the OLD code dropped the A->target
+/// edge. Both direct edges (A->target AND B->target) must appear.
+#[test]
+fn impact_keeps_direct_edge_to_already_reached_node() {
+    let mut store = Store::open(&temp_db_path("r2-impact-direct")).expect("open store");
+    store
+        .upsert_nodes(&[
+            r2_node("function:target", "target"),
+            r2_node("function:a", "a"),
+            r2_node("function:b", "b"),
+        ])
+        .expect("insert nodes");
+    store
+        .insert_edges(&[
+            edge(
+                "function:a",
+                "function:target",
+                EdgeKind::Calls,
+                Some(1),
+                Some(0),
+            ),
+            edge(
+                "function:b",
+                "function:target",
+                EdgeKind::Calls,
+                Some(2),
+                Some(0),
+            ),
+            edge(
+                "function:a",
+                "function:b",
+                EdgeKind::Calls,
+                Some(3),
+                Some(0),
+            ),
+        ])
+        .expect("insert edges");
+
+    let traverser = GraphTraverser::new(&store);
+    let impact = traverser
+        .get_impact_radius("function:target", 5)
+        .expect("impact");
+
+    // Both A and B are in the subgraph.
+    let got = id_set(impact.nodes.keys().cloned());
+    let want = id_set(["function:target", "function:a", "function:b"].map(str::to_string));
+    assert_eq!(got, want, "impact node set");
+
+    // Both DIRECT dependency edges onto `target` must be present, regardless of
+    // visit order — this is the #1086 regression.
+    assert_eq!(
+        count_edges(
+            &impact.edges,
+            "function:a",
+            "function:target",
+            EdgeKind::Calls
+        ),
+        1,
+        "A->target direct edge dropped (edges: {:?})",
+        impact.edges
+    );
+    assert_eq!(
+        count_edges(
+            &impact.edges,
+            "function:b",
+            "function:target",
+            EdgeKind::Calls
+        ),
+        1,
+        "B->target direct edge dropped (edges: {:?})",
+        impact.edges
+    );
+    // The A->B edge is also recorded exactly once.
+    assert_eq!(
+        count_edges(&impact.edges, "function:a", "function:b", EdgeKind::Calls),
+        1,
+        "A->B edge count (edges: {:?})",
+        impact.edges
+    );
+}
+
+/// #1087 — callers must surface BOTH edges when a caller connects to the target
+/// by two DIFFERENT edge kinds (Calls AND References). Collapsing by node-id
+/// silently drops the second relationship.
+#[test]
+fn callers_keep_multiple_edge_kinds_between_same_pair() {
+    let mut store = Store::open(&temp_db_path("r2-callers-multikind")).expect("open store");
+    store
+        .upsert_nodes(&[
+            r2_node("function:callee", "callee"),
+            r2_node("function:caller", "caller"),
+        ])
+        .expect("insert nodes");
+    // Same (caller -> callee) pair via BOTH Calls and References.
+    store
+        .insert_edges(&[
+            edge(
+                "function:caller",
+                "function:callee",
+                EdgeKind::Calls,
+                Some(1),
+                Some(0),
+            ),
+            edge(
+                "function:caller",
+                "function:callee",
+                EdgeKind::References,
+                Some(2),
+                Some(0),
+            ),
+        ])
+        .expect("insert edges");
+
+    let traverser = GraphTraverser::new(&store);
+    let callers = traverser
+        .get_callers("function:callee", 3)
+        .expect("callers");
+
+    // The caller node appears once per distinct edge kind — TWO NodeEdges.
+    let calls = callers
+        .iter()
+        .filter(|c| c.node.id == "function:caller" && c.edge.kind == EdgeKind::Calls)
+        .count();
+    let refs = callers
+        .iter()
+        .filter(|c| c.node.id == "function:caller" && c.edge.kind == EdgeKind::References)
+        .count();
+    assert_eq!(calls, 1, "Calls edge missing (callers: {callers:?})");
+    assert_eq!(
+        refs, 1,
+        "References edge dropped — #1087 (callers: {callers:?})"
+    );
+    assert_eq!(callers.len(), 2, "exactly two multi-kind caller edges");
+}
+
+/// #1087 (mirror) — callees must likewise keep multi-kind edges to the same pair.
+#[test]
+fn callees_keep_multiple_edge_kinds_between_same_pair() {
+    let mut store = Store::open(&temp_db_path("r2-callees-multikind")).expect("open store");
+    store
+        .upsert_nodes(&[
+            r2_node("function:caller", "caller"),
+            r2_node("function:callee", "callee"),
+        ])
+        .expect("insert nodes");
+    store
+        .insert_edges(&[
+            edge(
+                "function:caller",
+                "function:callee",
+                EdgeKind::Calls,
+                Some(1),
+                Some(0),
+            ),
+            edge(
+                "function:caller",
+                "function:callee",
+                EdgeKind::References,
+                Some(2),
+                Some(0),
+            ),
+        ])
+        .expect("insert edges");
+
+    let traverser = GraphTraverser::new(&store);
+    let callees = traverser
+        .get_callees("function:caller", 3)
+        .expect("callees");
+
+    let calls = callees
+        .iter()
+        .filter(|c| c.node.id == "function:callee" && c.edge.kind == EdgeKind::Calls)
+        .count();
+    let refs = callees
+        .iter()
+        .filter(|c| c.node.id == "function:callee" && c.edge.kind == EdgeKind::References)
+        .count();
+    assert_eq!(calls, 1, "Calls edge missing (callees: {callees:?})");
+    assert_eq!(
+        refs, 1,
+        "References edge dropped — #1087 (callees: {callees:?})"
+    );
+    assert_eq!(callees.len(), 2, "exactly two multi-kind callee edges");
+}
+
+/// #1087/#1088 (transitive) — a multi-kind pair at depth 1 keeps BOTH edges AND
+/// the deeper caller is still recursed into (exercising the recursion branch),
+/// while a same-kind repeat at depth 2 collapses. Guards that the per-frame
+/// `(node, kind)` dedup does not leak across recursion levels.
+#[test]
+fn callers_multikind_recurse_into_transitive_caller() {
+    let mut store = Store::open(&temp_db_path("r2-callers-transitive")).expect("open store");
+    store
+        .upsert_nodes(&[
+            r2_node("function:leaf", "leaf"),
+            r2_node("function:mid", "mid"),
+            r2_node("function:top", "top"),
+        ])
+        .expect("insert nodes");
+    store
+        .insert_edges(&[
+            edge(
+                "function:mid",
+                "function:leaf",
+                EdgeKind::Calls,
+                Some(1),
+                Some(0),
+            ),
+            edge(
+                "function:mid",
+                "function:leaf",
+                EdgeKind::References,
+                Some(2),
+                Some(0),
+            ),
+            edge(
+                "function:top",
+                "function:mid",
+                EdgeKind::Calls,
+                Some(3),
+                Some(0),
+            ),
+        ])
+        .expect("insert edges");
+
+    let traverser = GraphTraverser::new(&store);
+    let callers = traverser.get_callers("function:leaf", 5).expect("callers");
+
+    let mid_calls = callers
+        .iter()
+        .filter(|c| c.node.id == "function:mid" && c.edge.kind == EdgeKind::Calls)
+        .count();
+    let mid_refs = callers
+        .iter()
+        .filter(|c| c.node.id == "function:mid" && c.edge.kind == EdgeKind::References)
+        .count();
+    let top = callers
+        .iter()
+        .filter(|c| c.node.id == "function:top")
+        .count();
+    assert_eq!(mid_calls, 1, "mid Calls edge (callers: {callers:?})");
+    assert_eq!(
+        mid_refs, 1,
+        "mid References edge kept (callers: {callers:?})"
+    );
+    assert_eq!(
+        top, 1,
+        "transitive top caller reached (callers: {callers:?})"
+    );
+}
+
+/// #1087/#1088 (mirror, transitive) — callees recurse into the deeper callee
+/// after keeping a multi-kind pair at depth 1.
+#[test]
+fn callees_multikind_recurse_into_transitive_callee() {
+    let mut store = Store::open(&temp_db_path("r2-callees-transitive")).expect("open store");
+    store
+        .upsert_nodes(&[
+            r2_node("function:top", "top"),
+            r2_node("function:mid", "mid"),
+            r2_node("function:leaf", "leaf"),
+        ])
+        .expect("insert nodes");
+    store
+        .insert_edges(&[
+            edge(
+                "function:top",
+                "function:mid",
+                EdgeKind::Calls,
+                Some(1),
+                Some(0),
+            ),
+            edge(
+                "function:top",
+                "function:mid",
+                EdgeKind::References,
+                Some(2),
+                Some(0),
+            ),
+            edge(
+                "function:mid",
+                "function:leaf",
+                EdgeKind::Calls,
+                Some(3),
+                Some(0),
+            ),
+        ])
+        .expect("insert edges");
+
+    let traverser = GraphTraverser::new(&store);
+    let callees = traverser.get_callees("function:top", 5).expect("callees");
+
+    let mid_calls = callees
+        .iter()
+        .filter(|c| c.node.id == "function:mid" && c.edge.kind == EdgeKind::Calls)
+        .count();
+    let mid_refs = callees
+        .iter()
+        .filter(|c| c.node.id == "function:mid" && c.edge.kind == EdgeKind::References)
+        .count();
+    let leaf = callees
+        .iter()
+        .filter(|c| c.node.id == "function:leaf")
+        .count();
+    assert_eq!(mid_calls, 1, "mid Calls edge (callees: {callees:?})");
+    assert_eq!(
+        mid_refs, 1,
+        "mid References edge kept (callees: {callees:?})"
+    );
+    assert_eq!(
+        leaf, 1,
+        "transitive leaf callee reached (callees: {callees:?})"
+    );
+}
+
+/// #1086 (transitive) — impact recurses into a NEWLY-added source while still
+/// recording the direct edge onto an ALREADY-reached one, exercising both arms
+/// of the `already_present` guard.
+#[test]
+fn impact_recurses_new_source_and_keeps_edge_to_reached() {
+    let mut store = Store::open(&temp_db_path("r2-impact-transitive")).expect("open store");
+    store
+        .upsert_nodes(&[
+            r2_node("function:target", "target"),
+            r2_node("function:a", "a"),
+            r2_node("function:c", "c"),
+        ])
+        .expect("insert nodes");
+    // a depends on target; c depends on a (new, recursed) and on target (direct).
+    store
+        .insert_edges(&[
+            edge(
+                "function:a",
+                "function:target",
+                EdgeKind::Calls,
+                Some(1),
+                Some(0),
+            ),
+            edge(
+                "function:c",
+                "function:a",
+                EdgeKind::Calls,
+                Some(2),
+                Some(0),
+            ),
+            edge(
+                "function:c",
+                "function:target",
+                EdgeKind::Calls,
+                Some(3),
+                Some(0),
+            ),
+        ])
+        .expect("insert edges");
+
+    let traverser = GraphTraverser::new(&store);
+    let impact = traverser
+        .get_impact_radius("function:target", 5)
+        .expect("impact");
+
+    let got = id_set(impact.nodes.keys().cloned());
+    let want = id_set(["function:target", "function:a", "function:c"].map(str::to_string));
+    assert_eq!(got, want, "impact node set");
+    assert_eq!(
+        count_edges(
+            &impact.edges,
+            "function:c",
+            "function:target",
+            EdgeKind::Calls
+        ),
+        1,
+        "c->target direct edge kept (edges: {:?})",
+        impact.edges
+    );
+    assert_eq!(
+        count_edges(&impact.edges, "function:c", "function:a", EdgeKind::Calls),
+        1,
+        "c->a edge recorded (edges: {:?})",
+        impact.edges
+    );
+}
+
+/// #1089/#1090 — the returned subgraph node count must NEVER exceed
+/// `options.limit`, even on a high-fan-out symbol whose neighbors are added in a
+/// single batch. Bound must be enforced per-insertion, deterministically.
+#[test]
+fn bfs_respects_hard_limit_on_high_fan_out() {
+    let mut store = Store::open(&temp_db_path("r2-bfs-limit")).expect("open store");
+    let mut nodes = vec![r2_node("function:hub", "hub")];
+    let mut edges = Vec::new();
+    // 20 leaves, all reached in one batch from the hub.
+    for i in 0..20 {
+        let id = format!("function:leaf{i}");
+        nodes.push(r2_node(&id, &format!("leaf{i}")));
+        edges.push(edge(
+            "function:hub",
+            &id,
+            EdgeKind::Calls,
+            Some(i as i64 + 1),
+            Some(0),
+        ));
+    }
+    store.upsert_nodes(&nodes).expect("insert nodes");
+    store.insert_edges(&edges).expect("insert edges");
+
+    let traverser = GraphTraverser::new(&store);
+    let opts = TraversalOptions {
+        direction: Direction::Outgoing,
+        limit: 5,
+        ..TraversalOptions::default()
+    };
+    let bfs = traverser.traverse_bfs("function:hub", &opts).expect("bfs");
+    assert!(
+        bfs.nodes.len() <= 5,
+        "BFS returned {} nodes, exceeds limit 5 — #1089/#1090",
+        bfs.nodes.len()
+    );
+
+    // Determinism: same options → identical node ordering across runs.
+    let bfs2 = traverser.traverse_bfs("function:hub", &opts).expect("bfs2");
+    assert_eq!(
+        bfs.node_order, bfs2.node_order,
+        "BFS ordering must be stable"
+    );
+
+    let dfs = traverser.traverse_dfs("function:hub", &opts).expect("dfs");
+    assert!(
+        dfs.nodes.len() <= 5,
+        "DFS returned {} nodes, exceeds limit 5 — #1089/#1090",
+        dfs.nodes.len()
+    );
+}
+
+/// #1088 (LOCK) — a caller reached via TWO call sites of the SAME edge kind is
+/// counted ONCE (node-id `visited` dedup). This pins the existing behaviour so a
+/// future refactor of the #1087 fix cannot silently reintroduce double-counting.
+#[test]
+fn callers_dedup_same_kind_multiple_sites_counted_once() {
+    let mut store = Store::open(&temp_db_path("r2-callers-dedup")).expect("open store");
+    store
+        .upsert_nodes(&[
+            r2_node("function:callee", "callee"),
+            r2_node("function:caller", "caller"),
+        ])
+        .expect("insert nodes");
+    // Same caller calls callee at TWO different lines — same Calls kind.
+    store
+        .insert_edges(&[
+            edge(
+                "function:caller",
+                "function:callee",
+                EdgeKind::Calls,
+                Some(1),
+                Some(0),
+            ),
+            edge(
+                "function:caller",
+                "function:callee",
+                EdgeKind::Calls,
+                Some(2),
+                Some(0),
+            ),
+        ])
+        .expect("insert edges");
+
+    let traverser = GraphTraverser::new(&store);
+    let callers = traverser
+        .get_callers("function:callee", 3)
+        .expect("callers");
+
+    // Exactly ONE NodeEdge for the caller — two same-kind call sites collapse.
+    let count = callers
+        .iter()
+        .filter(|c| c.node.id == "function:caller")
+        .count();
+    assert_eq!(
+        count, 1,
+        "same-kind repeated call site must dedup to one — #1088 (callers: {callers:?})"
+    );
+}
