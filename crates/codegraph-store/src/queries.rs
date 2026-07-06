@@ -997,6 +997,51 @@ impl Store {
         rows.collect()
     }
 
+    /// The Godot path-keyed reverse-dependency lane for `dependent_file_paths`:
+    /// files carrying an `unresolved_refs` row whose normalized `reference_name`
+    /// targets `file_path`, restricted to the Godot structural subkinds
+    /// (`script_attach`/`scene_instance`/`ext_resource`/`group_member`/
+    /// `signal_method`/`autoload`). Reuses the `resource_impact` (`audit --impact`)
+    /// data source: a `.tscn`/`.tres`/`project.godot` owns no `file:` node so its
+    /// refs never reach `edges`. A non-Godot ref has `reference_subkind = NULL` and
+    /// is never returned, so other languages stay byte-unchanged; `gdscript_load_path`
+    /// is excluded because those refs already resolve to real `edges`.
+    /// Golden-neutral; returns DISTINCT referrers in scan order (caller sorts/dedups).
+    pub fn dependent_file_paths_unresolved(
+        &self,
+        file_path: &str,
+    ) -> rusqlite::Result<Vec<String>> {
+        let target = strip_res_scheme(&file_path.replace('\\', "/")).to_string();
+        let allow: [&str; 6] = [
+            ReferenceSubkind::ScriptAttach.as_str(),
+            ReferenceSubkind::SceneInstance.as_str(),
+            ReferenceSubkind::ExtResource.as_str(),
+            ReferenceSubkind::GroupMember.as_str(),
+            ReferenceSubkind::SignalMethod.as_str(),
+            ReferenceSubkind::Autoload.as_str(),
+        ];
+        let placeholders = std::iter::repeat_n("?", allow.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT DISTINCT file_path, reference_name FROM unresolved_refs \
+             WHERE reference_subkind IN ({placeholders})"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params = allow.iter().map(|s| s as &dyn ToSql).collect::<Vec<_>>();
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (from_file, reference_name) = row?;
+            if strip_res_scheme(&reference_name.replace('\\', "/")) == target {
+                out.push(from_file);
+            }
+        }
+        Ok(out)
+    }
+
     /// Delete every resolution-produced edge whose SOURCE node lives in
     /// `file_path`. Every non-`contains` edge is produced by reference resolution
     /// (it carries `metadata.resolvedBy`); `contains` edges come only from
@@ -1275,6 +1320,10 @@ fn parse_reference_subkind(value: Option<String>) -> rusqlite::Result<Option<Ref
         _ => return Err(enum_error(text, "reference subkind")),
     };
     Ok(Some(subkind))
+}
+
+fn strip_res_scheme(s: &str) -> &str {
+    s.strip_prefix("res://").unwrap_or(s)
 }
 
 fn parse_language(value: String) -> rusqlite::Result<Language> {
@@ -2189,6 +2238,135 @@ mod tests {
             vec!["b.rs".to_string()]
         );
         assert!(store.dependent_file_paths("a.rs").unwrap().is_empty());
+    }
+
+    #[test]
+    fn dependent_file_paths_unresolved_matches_godot_subkinds_only() {
+        let mut store = store("unresolved-deps");
+        store
+            .upsert_nodes(&[
+                node("godot:scene", "CharacterBase", "scenes/character_base.tscn"),
+                node("godot:scene2", "EyeDragon", "scenes/EyeDragon.tscn"),
+                node("godot:project", "project", "project.godot"),
+                node("function:rust", "user", "src/main.rs"),
+            ])
+            .unwrap();
+        let mk = |from: &str,
+                  name: &str,
+                  file: &str,
+                  lang: Language,
+                  subkind: Option<ReferenceSubkind>| UnresolvedRef {
+            id: None,
+            from_node_id: from.to_string(),
+            reference_name: name.to_string(),
+            reference_kind: EdgeKind::References,
+            line: 1,
+            col: 0,
+            candidates: None,
+            file_path: file.to_string(),
+            language: lang,
+            is_function_ref: false,
+            reference_subkind: subkind,
+        };
+        store
+            .insert_unresolved_refs(&[
+                mk(
+                    "godot:scene",
+                    "Scripts/Component/health_component.gd",
+                    "scenes/character_base.tscn",
+                    Language::GodotScene,
+                    Some(ReferenceSubkind::ScriptAttach),
+                ),
+                mk(
+                    "godot:scene2",
+                    "res://Scripts/Component/health_component.gd",
+                    "scenes/EyeDragon.tscn",
+                    Language::GodotScene,
+                    Some(ReferenceSubkind::ScriptAttach),
+                ),
+                mk(
+                    "godot:project",
+                    "Scripts/Component/health_component.gd",
+                    "project.godot",
+                    Language::GodotProject,
+                    Some(ReferenceSubkind::Autoload),
+                ),
+                mk(
+                    "function:rust",
+                    "Scripts/Component/health_component.gd",
+                    "src/main.rs",
+                    Language::Rust,
+                    None,
+                ),
+            ])
+            .unwrap();
+
+        let mut referrers = store
+            .dependent_file_paths_unresolved("Scripts/Component/health_component.gd")
+            .unwrap();
+        referrers.sort();
+        referrers.dedup();
+        assert_eq!(
+            referrers,
+            vec![
+                "project.godot".to_string(),
+                "scenes/EyeDragon.tscn".to_string(),
+                "scenes/character_base.tscn".to_string(),
+            ],
+            "res:// scheme normalized and all Godot subkinds matched; the Rust ref (NULL subkind) excluded"
+        );
+
+        assert!(
+            store
+                .dependent_file_paths_unresolved("Scripts/Component/other.gd")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn dependent_file_paths_unresolved_excludes_gdscript_load_path_and_non_godot() {
+        let mut store = store("unresolved-deps-exclude");
+        store
+            .upsert_nodes(&[
+                node("function:gd", "loader", "scripts/loader.gd"),
+                node("function:py", "importer", "app/importer.py"),
+            ])
+            .unwrap();
+        let mk = |from: &str, file: &str, lang: Language, subkind: Option<ReferenceSubkind>| {
+            UnresolvedRef {
+                id: None,
+                from_node_id: from.to_string(),
+                reference_name: "scripts/target.gd".to_string(),
+                reference_kind: EdgeKind::References,
+                line: 1,
+                col: 0,
+                candidates: None,
+                file_path: file.to_string(),
+                language: lang,
+                is_function_ref: false,
+                reference_subkind: subkind,
+            }
+        };
+        store
+            .insert_unresolved_refs(&[
+                mk(
+                    "function:gd",
+                    "scripts/loader.gd",
+                    Language::Gdscript,
+                    Some(ReferenceSubkind::GdscriptLoadPath),
+                ),
+                mk("function:py", "app/importer.py", Language::Python, None),
+            ])
+            .unwrap();
+
+        assert!(
+            store
+                .dependent_file_paths_unresolved("scripts/target.gd")
+                .unwrap()
+                .is_empty(),
+            "gdscript_load_path (already an edge) and non-Godot refs must not be returned"
+        );
     }
 
     #[test]

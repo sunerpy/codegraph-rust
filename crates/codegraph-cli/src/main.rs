@@ -2435,6 +2435,7 @@ fn cmd_impact(
     let traverser = GraphTraverser::new(&store);
     let mut nodes = HashMap::new();
     let mut edge_keys = HashSet::new();
+    let mut godot_files: Vec<String> = Vec::new();
     for node in exact_or_top_matches(&matches, &symbol) {
         let impact = traverser.get_impact_radius(&node.id, depth)?;
         for (id, node) in impact.nodes {
@@ -2443,8 +2444,28 @@ fn cmd_impact(
         for edge in impact.edges {
             edge_keys.insert((edge.source, edge.target, edge.kind));
         }
+        if node.kind == NodeKind::File
+            && is_godot_resource_path(&node.file_path)
+            && !godot_files.contains(&node.file_path)
+        {
+            godot_files.push(node.file_path.clone());
+        }
     }
-    let affected = nodes.values().map(NodeSummary::from).collect::<Vec<_>>();
+    let mut affected = nodes.values().map(NodeSummary::from).collect::<Vec<_>>();
+    let mut godot_referrers: Vec<String> = Vec::new();
+    for file in &godot_files {
+        godot_referrers.extend(store.dependent_file_paths_unresolved(file)?);
+    }
+    godot_referrers.sort();
+    godot_referrers.dedup();
+    for from_file in godot_referrers {
+        affected.push(NodeSummary {
+            name: from_file.clone(),
+            kind: NodeKind::File,
+            file_path: from_file,
+            start_line: 0,
+        });
+    }
     let godot = godot_honesty_for_symbol(&store, &project, &symbol)?;
     if json_output {
         print_json_pretty(&json!({
@@ -2492,7 +2513,11 @@ fn cmd_affected(
             if current_depth >= depth {
                 continue;
             }
-            for dependent in store.dependent_file_paths(&current)? {
+            let mut dependents = store.dependent_file_paths(&current)?;
+            dependents.extend(store.dependent_file_paths_unresolved(&current)?);
+            dependents.sort();
+            dependents.dedup();
+            for dependent in dependents {
                 if !visited.insert(dependent.clone()) {
                     continue;
                 }

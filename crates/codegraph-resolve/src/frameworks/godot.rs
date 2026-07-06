@@ -110,10 +110,33 @@ impl FrameworkResolver for GodotResolver {
     /// short-circuits Strategy 1 in `resolve_one_pure` before the name-matcher,
     /// guaranteeing no competing/duplicate edge.
     fn resolve(&self, reference: &RefView, context: &dyn ResolutionContext) -> Option<ResolvedRef> {
-        if reference.language != Language::Gdscript
-            || reference
-                .reference_name
-                .starts_with(godot_script::DYNAMIC_PREFIX)
+        if reference.language != Language::Gdscript {
+            return None;
+        }
+
+        // F1: an autoload-method-call candidate (`godot:autoload_call:Recv.member`).
+        // Roster-gated resolution to the UNIQUE same-named `func` in the receiver's
+        // bound script; returns `None` (no edge) unless exactly one func matches.
+        if let Some(access) = reference
+            .reference_name
+            .strip_prefix(godot_script::AUTOLOAD_CALL_PREFIX)
+        {
+            if reference.reference_kind == EdgeKind::Calls {
+                if let Some(target) = resolve_autoload_func(context, access) {
+                    return Some(ResolvedRef {
+                        original: reference.clone(),
+                        target_node_id: target.id,
+                        confidence: 0.9,
+                        resolved_by: ResolvedBy::Framework,
+                    });
+                }
+            }
+            return None;
+        }
+
+        if reference
+            .reference_name
+            .starts_with(godot_script::DYNAMIC_PREFIX)
         {
             return None;
         }
@@ -229,6 +252,8 @@ impl FrameworkResolver for GodotResolver {
             let mut result = godot_script::parse_gdscript_dynamics(file_path, content);
             let candidates = godot_script::parse_autoload_candidates(file_path, content);
             result.references.extend(candidates.references);
+            let func_candidates = godot_script::parse_autoload_func_candidates(file_path, content);
+            result.references.extend(func_candidates.references);
             return Some(result);
         }
         None
@@ -351,6 +376,40 @@ fn resolve_class_member(
     Some(first)
 }
 
+/// Resolve an autoload method call `access` (`Receiver.member`) to the UNIQUE
+/// same-named `func` in the receiver's bound script (F1). Returns `None` — no
+/// edge — unless every determinism rule holds:
+///
+/// 1. Single binding source: the target script is ONLY the `res://` path bound to
+///    `Receiver` in `project.godot`'s `[autoload]` section (via
+///    [`autoload_script_bindings`]). A receiver that is not a real `res://`-bound
+///    autoload (a built-in like `Vector2`, a `uid://`-bound autoload, a class
+///    global) has no binding here → `None`. No global cross-file matching.
+/// 2. Unique-candidate-only: `member` is searched for as a GDScript `Function`
+///    ONLY inside that one bound script. Exactly one match → resolve to it; zero
+///    or two-or-more matches → `None` (ambiguity/absence left unresolved, never
+///    guessed).
+fn resolve_autoload_func(context: &dyn ResolutionContext, access: &str) -> Option<Node> {
+    let (receiver, member) = access.split_once('.')?;
+    if receiver.is_empty() || member.is_empty() {
+        return None;
+    }
+    let bindings = autoload_script_bindings(context);
+    let script_path = bindings.get(receiver)?;
+
+    let mut matches = context
+        .get_nodes_in_file(script_path)
+        .into_iter()
+        .filter(|n| {
+            n.kind == NodeKind::Function && n.language == Language::Gdscript && n.name == member
+        });
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(first)
+}
+
 /// Find the autoload singleton node whose name EXACTLY equals `name`.
 ///
 /// This is the roster gate for [`GodotResolver::resolve`]: a receiver only
@@ -393,4 +452,524 @@ fn autoload_script_bindings(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the F1 autoload-resolution DEFENSIVE branches of
+    //! `GodotResolver::resolve` / `resolve_autoload_func` / `resolve_class_member`
+    //! / `autoload_script_bindings` / `post_extract`. A hand-rolled in-memory
+    //! [`ResolutionContext`] (`Ctx`) lets each malformed / ambiguous / absent
+    //! input be constructed exactly, so every early-`None` and skip path is hit
+    //! with a meaningful behavioral assertion (no edge fabricated, no guess).
+    use super::*;
+    use crate::types::{ImportMapping, RefView};
+    use codegraph_core::types::Language;
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct Ctx {
+        files: HashMap<String, String>,
+        nodes: Vec<Node>,
+    }
+
+    impl Ctx {
+        fn file(mut self, path: &str, content: &str) -> Self {
+            self.files.insert(path.to_string(), content.to_string());
+            self
+        }
+        fn node(mut self, n: Node) -> Self {
+            self.nodes.push(n);
+            self
+        }
+    }
+
+    impl ResolutionContext for Ctx {
+        fn get_nodes_in_file(&self, file_path: &str) -> Vec<Node> {
+            self.nodes
+                .iter()
+                .filter(|n| n.file_path == file_path)
+                .cloned()
+                .collect()
+        }
+        fn get_nodes_by_name(&self, name: &str) -> Vec<Node> {
+            self.nodes
+                .iter()
+                .filter(|n| n.name == name)
+                .cloned()
+                .collect()
+        }
+        fn get_nodes_by_qualified_name(&self, q: &str) -> Vec<Node> {
+            self.nodes
+                .iter()
+                .filter(|n| n.qualified_name == q)
+                .cloned()
+                .collect()
+        }
+        fn get_nodes_by_kind(&self, kind: NodeKind) -> Vec<Node> {
+            self.nodes
+                .iter()
+                .filter(|n| n.kind == kind)
+                .cloned()
+                .collect()
+        }
+        fn file_exists(&self, file_path: &str) -> bool {
+            self.files.contains_key(file_path)
+        }
+        fn read_file(&self, file_path: &str) -> Option<String> {
+            self.files.get(file_path).cloned()
+        }
+        fn get_project_root(&self) -> &str {
+            "/project"
+        }
+        fn get_all_files(&self) -> Vec<String> {
+            let mut files: Vec<String> = self.files.keys().cloned().collect();
+            files.sort();
+            files
+        }
+        fn get_nodes_by_lower_name(&self, lower: &str) -> Vec<Node> {
+            self.nodes
+                .iter()
+                .filter(|n| n.name.to_lowercase() == lower)
+                .cloned()
+                .collect()
+        }
+        fn get_node_by_id(&self, id: &str) -> Option<Node> {
+            self.nodes.iter().find(|n| n.id == id).cloned()
+        }
+        fn get_import_mappings(&self, _f: &str, _l: Language) -> Vec<ImportMapping> {
+            Vec::new()
+        }
+    }
+
+    fn gd_node(id: &str, kind: NodeKind, name: &str, file: &str, lang: Language) -> Node {
+        Node {
+            id: id.to_string(),
+            kind,
+            name: name.to_string(),
+            qualified_name: format!("{file}::{name}"),
+            file_path: file.to_string(),
+            language: lang,
+            start_line: 1,
+            end_line: 1,
+            start_column: 0,
+            end_column: 0,
+            docstring: None,
+            signature: None,
+            visibility: None,
+            is_exported: false,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+            decorators: Vec::new(),
+            type_parameters: Vec::new(),
+            return_type: None,
+            updated_at: 0,
+        }
+    }
+
+    fn gd_ref(name: &str, kind: EdgeKind) -> RefView {
+        RefView {
+            from_node_id: "from:caller.gd".to_string(),
+            reference_name: name.to_string(),
+            reference_kind: kind,
+            line: 4,
+            column: 0,
+            file_path: "caller.gd".to_string(),
+            language: Language::Gdscript,
+            is_function_ref: false,
+            reference_subkind: None,
+        }
+    }
+
+    /// A `project.godot` whose `[autoload]` binds `GameFlow` to `game_flow.gd`.
+    fn project_with_gameflow() -> String {
+        "config_version=5\n\n[autoload]\n\nGameFlow=\"*res://game_flow.gd\"\n".to_string()
+    }
+
+    #[test]
+    fn resolve_non_gdscript_reference_is_none() {
+        let ctx = Ctx::default();
+        let mut r = gd_ref("X.y", EdgeKind::Calls);
+        r.language = Language::TypeScript;
+        assert!(GodotResolver.resolve(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn resolve_autoload_call_prefix_with_no_func_returns_none() {
+        // An `autoload_call:` prefixed ref whose bound script has NO matching
+        // func → resolve_autoload_func yields None → resolve returns None
+        // (never falls through to the singleton path for a prefixed name).
+        let ctx = Ctx::default()
+            .file("project.godot", &project_with_gameflow())
+            .node(gd_node(
+                "function:other",
+                NodeKind::Function,
+                "other",
+                "game_flow.gd",
+                Language::Gdscript,
+            ));
+        let name = format!(
+            "{}GameFlow.return_to_map",
+            godot_script::AUTOLOAD_CALL_PREFIX
+        );
+        let r = gd_ref(&name, EdgeKind::Calls);
+        assert!(
+            GodotResolver.resolve(&r, &ctx).is_none(),
+            "no same-named func → no edge, and a prefixed ref never uses the singleton path"
+        );
+    }
+
+    #[test]
+    fn resolve_autoload_call_prefix_but_not_calls_kind_returns_none() {
+        // A prefixed ref whose kind is NOT Calls skips the func lookup and
+        // returns None at the end of the prefix block.
+        let ctx = Ctx::default().file("project.godot", &project_with_gameflow());
+        let name = format!(
+            "{}GameFlow.return_to_map",
+            godot_script::AUTOLOAD_CALL_PREFIX
+        );
+        let r = gd_ref(&name, EdgeKind::References);
+        assert!(GodotResolver.resolve(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn resolve_dynamic_prefix_reference_is_none() {
+        // A `godot:dynamic:*` sentinel is never resolvable by construction.
+        let ctx = Ctx::default();
+        let name = format!("{}connect", godot_script::DYNAMIC_PREFIX);
+        let r = gd_ref(&name, EdgeKind::Calls);
+        assert!(GodotResolver.resolve(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn resolve_bare_name_no_dot_no_autoload_is_none() {
+        // A bare (no-dot) receiver name that is not a known autoload singleton
+        // → the split yields (name, None), and with no singleton it is None.
+        let ctx = Ctx::default();
+        let r = gd_ref("SomeName", EdgeKind::Calls);
+        assert!(GodotResolver.resolve(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn resolve_empty_receiver_is_none() {
+        // A reference name beginning with `.` splits to an EMPTY receiver, which
+        // the guard rejects with None (no fabricated resolution).
+        let ctx = Ctx::default();
+        let r = gd_ref(".member", EdgeKind::Calls);
+        assert!(GodotResolver.resolve(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn resolve_class_member_resolves_to_function_in_class_file() {
+        // A `Class.member()` Calls ref where `Class` is a real GDScript Class
+        // node resolves to the uniquely-named Function in that class's file.
+        let ctx = Ctx::default()
+            .node(gd_node(
+                "class:Weapon",
+                NodeKind::Class,
+                "Weapon",
+                "weapon.gd",
+                Language::Gdscript,
+            ))
+            .node(gd_node(
+                "function:fire",
+                NodeKind::Function,
+                "fire",
+                "weapon.gd",
+                Language::Gdscript,
+            ));
+        let r = gd_ref("Weapon.fire", EdgeKind::Calls);
+        let resolved = GodotResolver
+            .resolve(&r, &ctx)
+            .expect("class member must resolve");
+        assert_eq!(resolved.target_node_id, "function:fire");
+        assert_eq!(resolved.resolved_by, ResolvedBy::Framework);
+    }
+
+    #[test]
+    fn resolve_class_member_ambiguous_two_functions_is_none() {
+        // Two file-level funcs named `fire` in the class file → ambiguous →
+        // resolve_class_member returns None (never guesses).
+        let ctx = Ctx::default()
+            .node(gd_node(
+                "class:Weapon",
+                NodeKind::Class,
+                "Weapon",
+                "weapon.gd",
+                Language::Gdscript,
+            ))
+            .node(gd_node(
+                "function:fire1",
+                NodeKind::Function,
+                "fire",
+                "weapon.gd",
+                Language::Gdscript,
+            ))
+            .node(gd_node(
+                "function:fire2",
+                NodeKind::Function,
+                "fire",
+                "weapon.gd",
+                Language::Gdscript,
+            ));
+        let r = gd_ref("Weapon.fire", EdgeKind::Calls);
+        assert!(
+            GodotResolver.resolve(&r, &ctx).is_none(),
+            "ambiguous class member must not resolve"
+        );
+    }
+
+    #[test]
+    fn resolve_class_member_no_class_node_is_none() {
+        // Receiver names no Class node → resolve_class_member None; and with no
+        // autoload singleton either, resolve is None.
+        let ctx = Ctx::default().node(gd_node(
+            "function:fire",
+            NodeKind::Function,
+            "fire",
+            "weapon.gd",
+            Language::Gdscript,
+        ));
+        let r = gd_ref("Weapon.fire", EdgeKind::Calls);
+        assert!(GodotResolver.resolve(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn resolve_autoload_func_empty_receiver_or_member_is_none() {
+        // `resolve_autoload_func` rejects an access with an empty receiver or an
+        // empty member before touching the bindings.
+        let ctx = Ctx::default().file("project.godot", &project_with_gameflow());
+        assert!(resolve_autoload_func(&ctx, ".member").is_none());
+        assert!(resolve_autoload_func(&ctx, "GameFlow.").is_none());
+        assert!(resolve_autoload_func(&ctx, "no_dot").is_none());
+    }
+
+    #[test]
+    fn resolve_autoload_func_unique_match_resolves() {
+        // Exactly one same-named func in the bound script → resolves to it.
+        let ctx = Ctx::default()
+            .file("project.godot", &project_with_gameflow())
+            .node(gd_node(
+                "function:rtm",
+                NodeKind::Function,
+                "return_to_map",
+                "game_flow.gd",
+                Language::Gdscript,
+            ));
+        let target = resolve_autoload_func(&ctx, "GameFlow.return_to_map")
+            .expect("unique func must resolve");
+        assert_eq!(target.id, "function:rtm");
+    }
+
+    #[test]
+    fn resolve_autoload_func_two_matches_is_none() {
+        // Two same-named funcs → ambiguous → None.
+        let ctx = Ctx::default()
+            .file("project.godot", &project_with_gameflow())
+            .node(gd_node(
+                "function:rtm1",
+                NodeKind::Function,
+                "return_to_map",
+                "game_flow.gd",
+                Language::Gdscript,
+            ))
+            .node(gd_node(
+                "function:rtm2",
+                NodeKind::Function,
+                "return_to_map",
+                "game_flow.gd",
+                Language::Gdscript,
+            ));
+        assert!(resolve_autoload_func(&ctx, "GameFlow.return_to_map").is_none());
+    }
+
+    #[test]
+    fn autoload_script_bindings_skips_unreadable_project_file() {
+        // A `project.godot` listed by get_all_files but whose content is
+        // unreadable (read_file → None) is skipped without panic; the map stays
+        // empty. `get_all_files` reports the path; `read_file` does not hold it.
+        struct UnreadableCtx;
+        impl ResolutionContext for UnreadableCtx {
+            fn get_nodes_in_file(&self, _f: &str) -> Vec<Node> {
+                Vec::new()
+            }
+            fn get_nodes_by_name(&self, _n: &str) -> Vec<Node> {
+                Vec::new()
+            }
+            fn get_nodes_by_qualified_name(&self, _q: &str) -> Vec<Node> {
+                Vec::new()
+            }
+            fn get_nodes_by_kind(&self, _k: NodeKind) -> Vec<Node> {
+                Vec::new()
+            }
+            fn file_exists(&self, _f: &str) -> bool {
+                false
+            }
+            fn read_file(&self, _f: &str) -> Option<String> {
+                None
+            }
+            fn get_project_root(&self) -> &str {
+                "/project"
+            }
+            fn get_all_files(&self) -> Vec<String> {
+                vec!["project.godot".to_string()]
+            }
+            fn get_nodes_by_lower_name(&self, _l: &str) -> Vec<Node> {
+                Vec::new()
+            }
+            fn get_node_by_id(&self, _id: &str) -> Option<Node> {
+                None
+            }
+            fn get_import_mappings(&self, _f: &str, _l: Language) -> Vec<ImportMapping> {
+                Vec::new()
+            }
+        }
+        let bindings = autoload_script_bindings(&UnreadableCtx);
+        assert!(
+            bindings.is_empty(),
+            "an unreadable project.godot yields no bindings"
+        );
+    }
+
+    #[test]
+    fn autoload_script_bindings_dedups_repeated_project_file() {
+        // A context whose get_all_files() reports the SAME project.godot twice
+        // must be visited once (the seen_files dedup `continue`); the binding is
+        // recorded exactly once, not duplicated.
+        struct DupCtx;
+        impl ResolutionContext for DupCtx {
+            fn get_nodes_in_file(&self, _f: &str) -> Vec<Node> {
+                Vec::new()
+            }
+            fn get_nodes_by_name(&self, _n: &str) -> Vec<Node> {
+                Vec::new()
+            }
+            fn get_nodes_by_qualified_name(&self, _q: &str) -> Vec<Node> {
+                Vec::new()
+            }
+            fn get_nodes_by_kind(&self, _k: NodeKind) -> Vec<Node> {
+                Vec::new()
+            }
+            fn file_exists(&self, _f: &str) -> bool {
+                true
+            }
+            fn read_file(&self, _f: &str) -> Option<String> {
+                Some("[autoload]\n\nGameFlow=\"*res://game_flow.gd\"\n".to_string())
+            }
+            fn get_project_root(&self) -> &str {
+                "/project"
+            }
+            fn get_all_files(&self) -> Vec<String> {
+                vec!["project.godot".to_string(), "project.godot".to_string()]
+            }
+            fn get_nodes_by_lower_name(&self, _l: &str) -> Vec<Node> {
+                Vec::new()
+            }
+            fn get_node_by_id(&self, _id: &str) -> Option<Node> {
+                None
+            }
+            fn get_import_mappings(&self, _f: &str, _l: Language) -> Vec<ImportMapping> {
+                Vec::new()
+            }
+        }
+        let bindings = autoload_script_bindings(&DupCtx);
+        assert_eq!(
+            bindings.len(),
+            1,
+            "the repeated project file is visited once"
+        );
+        assert_eq!(
+            bindings.get("GameFlow").map(String::as_str),
+            Some("game_flow.gd")
+        );
+    }
+
+    #[test]
+    fn resolve_class_member_none_falls_through_to_singleton_path() {
+        // A `Class.member` Calls ref where resolve_class_member returns None
+        // (no Class node) must FALL THROUGH the class-member block and reach the
+        // autoload-singleton lookup — which, with a matching singleton, resolves
+        // to the singleton node (exercising the post-class-member fall-through).
+        let ctx = Ctx::default()
+            .file("project.godot", &project_with_gameflow())
+            .node(gd_node(
+                "const:GameFlow",
+                NodeKind::Constant,
+                "GameFlow",
+                "project.godot",
+                Language::GodotProject,
+            ));
+        let r = gd_ref("GameFlow.some_method", EdgeKind::Calls);
+        let resolved = GodotResolver
+            .resolve(&r, &ctx)
+            .expect("falls through to singleton");
+        assert_eq!(resolved.target_node_id, "const:GameFlow");
+    }
+
+    #[test]
+    fn post_extract_skips_singleton_with_no_binding() {
+        // A `project.godot` Constant singleton whose name has NO `[autoload]`
+        // script binding is left untouched (the `continue` at the missing-binding
+        // guard). Here the file binds `GameFlow` but the singleton is `Orphan`.
+        let ctx = Ctx::default()
+            .file("project.godot", &project_with_gameflow())
+            .node(gd_node(
+                "const:Orphan",
+                NodeKind::Constant,
+                "Orphan",
+                "project.godot",
+                Language::GodotProject,
+            ));
+        let updates = GodotResolver.post_extract(&ctx).expect("post_extract Some");
+        assert!(
+            updates.is_empty(),
+            "a singleton with no binding is not stamped, got {updates:?}"
+        );
+    }
+
+    #[test]
+    fn post_extract_is_idempotent_when_already_stamped() {
+        // A singleton already carrying the confirmed signature is skipped (the
+        // idempotency guard), so a second pass produces zero updates.
+        let mut singleton = gd_node(
+            "const:GameFlow",
+            NodeKind::Constant,
+            "GameFlow",
+            "project.godot",
+            Language::GodotProject,
+        );
+        singleton.signature = Some("autoload -> game_flow.gd".to_string());
+        let ctx = Ctx::default()
+            .file("project.godot", &project_with_gameflow())
+            .file("game_flow.gd", "extends Node\n")
+            .node(singleton);
+        let updates = GodotResolver.post_extract(&ctx).expect("post_extract Some");
+        assert!(
+            updates.is_empty(),
+            "an already-stamped singleton is not re-stamped, got {updates:?}"
+        );
+    }
+
+    #[test]
+    fn post_extract_stamps_confirmed_binding() {
+        // Control: an unstamped singleton whose bound script exists gets the
+        // confirmed signature stamped.
+        let ctx = Ctx::default()
+            .file("project.godot", &project_with_gameflow())
+            .file("game_flow.gd", "extends Node\n")
+            .node(gd_node(
+                "const:GameFlow",
+                NodeKind::Constant,
+                "GameFlow",
+                "project.godot",
+                Language::GodotProject,
+            ));
+        let updates = GodotResolver.post_extract(&ctx).expect("post_extract Some");
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            updates[0].signature.as_deref(),
+            Some("autoload -> game_flow.gd")
+        );
+    }
 }

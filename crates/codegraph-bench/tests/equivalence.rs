@@ -22,6 +22,25 @@ fn upstream_db_is_self_equivalent_to_mini_golden() {
 }
 
 #[test]
+fn generated_golden_matches_committed_godot_fixture() {
+    // Guards Godot extraction (F1 autoload-call→func + F2 signal-handler edges)
+    // against byte-drift: regenerating the canonical golden from the committed
+    // godot db must reproduce the committed JSON exactly.
+    let tempdir = TestDir::new("generated-golden-godot");
+    write_golden(&godot_db(), tempdir.path()).unwrap();
+
+    let expected = load_golden(&godot_golden_dir()).unwrap();
+    let actual = load_golden(tempdir.path()).unwrap();
+
+    diff_canonical(&expected, &actual, None).unwrap();
+}
+
+#[test]
+fn upstream_db_is_self_equivalent_to_godot_golden() {
+    assert_equivalent(&godot_db(), &godot_golden_dir()).unwrap();
+}
+
+#[test]
 fn tier1_node_drift_is_reported() {
     let expected = load_golden(&mini_golden_dir()).unwrap();
     let mut actual = expected.clone();
@@ -73,6 +92,14 @@ fn mini_db() -> PathBuf {
 
 fn mini_golden_dir() -> PathBuf {
     workspace_root().join("reference/golden/mini")
+}
+
+fn godot_db() -> PathBuf {
+    workspace_root().join("reference/golden/godot/colby.db")
+}
+
+fn godot_golden_dir() -> PathBuf {
+    workspace_root().join("reference/golden/godot")
 }
 
 struct TestDir {

@@ -2,19 +2,20 @@
 name: codegraph
 description: >
   Use CodeGraph for ALL codebase navigation and code research on any indexed
-  project — "how does X work", "who calls X", "what breaks if I change X",
-  "where is X defined", tracing a flow, onboarding an unfamiliar repo,
-  surveying an area, or any whole-project analysis request: "analyze the
+  project. Reach for it — even when the user doesn't say "codegraph" — on any
+  of these intents: "how does X work", "who calls X", "what breaks if I change
+  X", "where is X defined", tracing a call flow, onboarding an unfamiliar
+  repo, surveying an area, or any whole-project analysis: "analyze the
   project", "analyze the code", "understand the codebase", "explain the
   architecture", "give me an overview of this repo", "what does this project
-  do", "survey the code" — and the Chinese equivalents: "分析项目代码",
-  "分析项目结构", "分析这个仓库", "看看这个项目", "梳理代码", "项目结构",
-  "代码分析", "这个项目是做什么的", "介绍下这个项目". PREFER the codegraph_*
-  tools over grep, find, or the Read tool whenever source files are involved,
-  even if the user doesn't say "codegraph". One codegraph call beats dozens of
-  grep+read round-trips: it returns verbatim source plus the structural graph
-  in a single response. Also trigger when the user asks to index or initialize
-  a codebase for an agent, or when .codegraph/ is present in the repo root.
+  do", "survey the code". Also trigger when the user asks to index or
+  initialize a codebase for an agent, or when .codegraph/ is present in the
+  repo root. Prefer the codegraph_* tools over grep, find, or the Read tool
+  whenever source files are involved — one codegraph call returns verbatim
+  source plus the structural graph and replaces dozens of grep+read
+  round-trips. Chinese equivalents that should also trigger this skill:
+  "分析项目代码", "分析项目结构", "分析这个仓库", "看看这个项目", "梳理代码",
+  "项目结构", "代码分析", "这个项目是做什么的", "介绍下这个项目".
 ---
 
 # CodeGraph — Agent Skill
@@ -104,9 +105,9 @@ Pick your entry point based on what you're trying to answer:
 ### `codegraph_explore` — start here
 
 For a whole-project overview ("analyze the project", "explain the architecture",
-"介绍下这个项目"), start with `codegraph_explore` (architecture survey) rather
-than reading files one by one — one call maps the landscape; follow up only for
-specific symbols that need deeper detail.
+"what does this project do"), start with `codegraph_explore` (architecture
+survey) rather than reading files one by one — one call maps the landscape;
+follow up only for specific symbols that need deeper detail.
 
 Call this first for any open-ended question: architecture, a flow, "how does
 indexing work", "show me the auth layer". One call returns the symbols most

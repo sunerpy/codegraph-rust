@@ -17,6 +17,28 @@ No AI/LLM anywhere inside the binary — output is byte-stable and deterministic
 
 ---
 
+## Table of Contents
+
+- [Quickstart](#quickstart)
+- [Installation](#installation)
+  - [One-liner install (scripts)](#one-liner-install-scripts)
+  - [Prebuilt binaries](#prebuilt-binaries)
+  - [With cargo (from git)](#with-cargo-from-git)
+- [MCP Quick-Register](#mcp-quick-register)
+- [Install the Agent Skill](#install-the-agent-skill-codegraph-skill)
+- [Using CodeGraph in IDEs](#using-codegraph-in-ides)
+- [CodeGraph for Zed (extension)](#codegraph-for-zed-extension)
+- [Using CodeGraph with an LLM](#using-codegraph-with-an-llm)
+- [Daemon, Watch & Configuration](#daemon-watch--configuration)
+- [CLI Subcommands](#cli-subcommands)
+- [Shell Completion](#shell-completion)
+- [What CodeGraph Does (and Doesn't)](#what-codegraph-does-and-doesnt)
+- [Supported Languages](#supported-languages)
+- [Documentation](#documentation)
+- [License](#license)
+
+---
+
 ## Quickstart
 
 **Install (Linux / macOS):**
@@ -34,7 +56,7 @@ irm https://raw.githubusercontent.com/sunerpy/codegraph-rust/main/scripts/instal
 **Index a project and query it:**
 
 ```bash
-codegraph init  /path/to/project          # create .codegraph/ and run the first index
+codegraph init  /path/to/project                 # create .codegraph/ and run the first index
 codegraph query "<symbol>" -p /path/to/project   # full-text search
 codegraph serve --mcp --path /path/to/project    # MCP server (--path optional, defaults to cwd)
 ```
@@ -168,21 +190,14 @@ automatically):
 }
 ```
 
-**Default (no `-p`):** `tools/list` always returns the full tool surface, even
-before a project is resolved. When the server resolves a default project — the
-working directory is at or inside an indexed project (find-up), or the client
-sends `rootUri`/`workspaceFolders`/`roots` — all tools work with `projectPath`
-optional, so one config works for all your projects (each just needs to be
-indexed with `codegraph index`). When it cannot resolve one (a roots-less client
-launched from a fixed directory not inside any project, e.g. a shared global
-config using the home directory as cwd), tools are still listed but `projectPath`
-is marked required in each tool's schema; the agent must then pass it per call.
-**Optional `-p <path>` / `--path <path>`:** pin the server to one fixed project
-regardless of cwd — the simpler choice for single-project setups (e.g.
-`"args": ["serve", "--mcp", "-p", "/abs/path/to/project"]`).
+**Default (no `-p`):** one config works for all your projects — each just needs
+`codegraph index` first. The server resolves the project from the client's working
+directory or `rootUri`/`workspaceFolders`/`roots`. When it can't resolve one,
+`projectPath` is marked required per tool call.
+**Optional `-p <path>`:** pin to one fixed project
+(e.g. `"args": ["serve", "--mcp", "-p", "/abs/path/to/project"]`).
 
-See [`docs/mcp.md`](docs/mcp.md#project-resolution) for the full three-case
-breakdown.
+See [`docs/mcp.md`](docs/mcp.md#project-resolution) for the full three-case breakdown.
 
 Supported agents: Claude Code, Cursor, Codex CLI, opencode, Hermes Agent,
 Gemini CLI, Antigravity IDE, Kiro, Trae, Qoder, Zed.
@@ -234,53 +249,22 @@ Full reference including per-agent skill paths: [`docs/cli.md`](docs/cli.md).
 ## Using CodeGraph in IDEs
 
 `codegraph install` registers the MCP server entry for each supported agent/IDE.
-How well the index stays live depends on whether the IDE expands `${workspaceFolder}`.
+Run it once and every indexed project is immediately available. How well the index
+stays live depends on whether the IDE expands `${workspaceFolder}`:
 
-| IDE / Agent | Global config strategy                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | Live watch                                                                                              |
-| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| **Cursor**  | Global `~/.cursor/mcp.json` uses `--path ${workspaceFolder}` — one config auto-follows every project window.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | Live on save (daemon watcher).                                                                          |
-| **Trae**    | Global config (`~/.trae-server/data/Machine/mcp.json` in server/remote mode, or `Trae/User/mcp.json` in desktop mode) uses `--path ${workspaceFolder}` — one config auto-follows every project window. Note: project-level `.trae/mcp.json` requires enabling **"Enable project-level MCP / 启用项目级 MCP"** in Trae settings.                                                                                                                                                                                                                                                                                                                                                                                                       | Live on save (daemon watcher).                                                                          |
-| **Kiro**    | Global `~/.kiro/settings/mcp.json` holds a bare `serve --mcp` entry (no `--path`). The agent passes the project path per tool call — tools work read-only off the existing index, but there is no live watch. The written `mcp.json` keeps **stdio as the primary, active transport** and also carries a `//`-commented HTTP alternative you can uncomment; Kiro requires `https` for remote MCP servers and allows `http` **only for localhost**, so that block uses `http://localhost:8111/mcp` (see [HTTP MCP server](#http-mcp-server-background-mode)).                                                                                                                                                                          | Manual only (see below).                                                                                |
-| **Qoder**   | Global entry (`<config_base>/QoderCN\|Qoder/<machineId>/SharedClientCache/mcp.json`) holds a bare `serve --mcp` entry. Tools work read-only off the existing index; the IDE does not expand `${workspaceFolder}` in this layout.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Manual only (see below).                                                                                |
-| **Zed**     | Global `~/.config/zed/settings.json` (Linux/macOS) or `%APPDATA%\Zed\settings.json` (Windows) holds a bare `context_servers.codegraph` entry (no `--path`). Zed's global config has no `${workspaceFolder}` expansion — tools work read-only off the existing index globally. The written `settings.json` keeps **stdio as the primary, active transport** and also carries `//`-commented **remote-development alternatives** you can uncomment: an **SSH stdio** bridge and an **HTTP** server (`http://localhost:8111/mcp`); for remote development HTTP is the **recommended** transport (a single `codegraph serve --http` avoids the extra ssh hop + stdio buffering). See [HTTP MCP server](#http-mcp-server-background-mode). | Manual/read-only globally; run `codegraph init --target=zed` per project for live per-project `--path`. |
+- **Cursor / Trae** — global config uses `--path ${workspaceFolder}`, so one entry auto-follows every project window. Live watch enabled.
+- **Kiro / Qoder** — global entry without `--path`; tools work read-only off the existing index. Run `codegraph init --target=kiro` (or `--target=qoder`) inside each project for live watch.
+- **Zed** — global `settings.json` entry without `--path`. Run `codegraph init --target=zed` inside each project to write a `.zed/settings.json` with an absolute `--path` — the only way to give Zed a per-project path. The installer also writes `//`-commented HTTP and SSH alternatives for remote-development use.
+- **Other agents** (Claude Code, Codex CLI, opencode, Hermes, Gemini CLI, Antigravity) — standard `mcpServers` entry; live watch where the daemon can reach the project.
 
-**Getting live auto-update in Kiro, Qoder, or Zed.** Run `codegraph init --target=<ide>`
-once inside each project:
+> **Zed Remote (SSH).** Zed runs MCP `context_servers` on the local client, not on
+> the remote host. If codegraph tools return empty in a remote SSH session, use the
+> `//`-commented SSH bridge or HTTP alternative the installer wrote into your
+> `settings.json`. HTTP (`codegraph serve --http`, then `http://localhost:8111/mcp`)
+> is the recommended remote transport. See
+> [`docs/mcp.md` — Zed over SSH](docs/mcp.md#zed-over-ssh-remote-development).
 
-```bash
-cd /your/project
-codegraph init --target=kiro    # or --target=qoder
-codegraph init --target=zed     # writes .zed/settings.json with absolute --path
-```
-
-For Zed specifically, this writes a project-level `.zed/settings.json` with an
-absolute `--path` — the **only** way to give Zed a per-project path, since Zed's
-global `context_servers` config cannot inject one.
-
-> **Zed Remote (SSH).** Zed runs MCP `context_servers` on the local client, not
-> on the remote host — even when a remote SSH project is open. If codegraph tools
-> return empty in a remote SSH session, use an `ssh` bridge command instead of
-> `command: "codegraph"` directly. The installer already writes both remote
-> options as `//`-commented alternatives inside your `settings.json` (uncomment
-> one; remove the stdio entry above): an **SSH stdio** bridge, and an **HTTP**
-> server (`http://localhost:8111/mcp`, started with a single `codegraph serve
---http`) — **HTTP is the recommended remote transport** because it avoids the
-> extra ssh hop and stdio buffering that make ssh-stdio fragile. Zed's HTTP
-> context-server shape is a bare `{"url": …}` (verified against
-> [Zed's MCP docs](https://zed.dev/docs/ai/mcp)). See
-> [`docs/mcp.md` — Zed over SSH](docs/mcp.md#zed-over-ssh-remote-development)
-> for the config and full explanation.
-
-On a fresh (unindexed) project this builds the index and writes a project-level
-config with the absolute `--path`. On an already-indexed project it writes (or
-refreshes) the project-level config and relies on the daemon's file watcher and
-startup catch-up to keep it live. Either way, once the local config is in place
-the index stays current as you edit.
-
-Without a project-level config, the index only updates when you run
-`codegraph index` or `codegraph sync` manually. This mirrors upstream CodeGraph's
-behavior: clients that cannot report a workspace root rely on startup catch-up and
-manual reindex rather than per-call sync.
+Full per-IDE config details and the `${workspaceFolder}` matrix: [`docs/mcp.md`](docs/mcp.md).
 
 ---
 
@@ -291,7 +275,20 @@ registers CodeGraph as a `context_servers` context server inside Zed and
 downloads the right platform binary automatically — no separate install step
 needed.
 
-### Install (dev extension)
+### Install
+
+**Preferred — official registry (once published):**
+
+Search for **"CodeGraph"** in Zed's extension registry (`zed: extensions` from the
+command palette) and click Install. The extension auto-downloads the CodeGraph
+binary for your platform on first launch.
+
+> The extension is being submitted to the
+> [`zed-industries/extensions`](https://github.com/zed-industries/extensions)
+> registry. Once accepted it will be searchable there. Until then, use the
+> dev-install path below.
+
+**Dev install (before publication / for local development):**
 
 1. Clone this repository.
 2. In Zed, open the command palette and run **`zed: install dev extension`**.
@@ -301,17 +298,39 @@ Zed compiles the extension to WebAssembly and registers a `codegraph` context
 server. On first launch it downloads the latest CodeGraph release binary for your
 platform.
 
-### Auto-update
+### Auto-update and binary cache location
 
 The extension never pins a CodeGraph version. On each launch it resolves the
 **latest** `sunerpy/codegraph-rust` GitHub release, picks the asset matching your
-platform, downloads and extracts it, and caches it under a version-stamped path
-(`codegraph-<version>/codegraph`). When the CodeGraph CLI ships a new release the
-extension picks up the new binary automatically — **no extension re-publish or
-manual update required**.
+platform, downloads and extracts it, then caches the binary at:
+
+```
+codegraph-<version>/codegraph        # Linux / macOS
+codegraph-<version>/codegraph.exe    # Windows
+```
+
+This path is **relative to the extension's working directory** that Zed manages
+(inside Zed's extensions data directory, typically
+`~/.local/share/zed/extensions/installed/codegraph/` on Linux,
+`~/Library/Application Support/Zed/extensions/installed/codegraph/` on macOS, or
+`%APPDATA%\Zed\extensions\installed\codegraph\` on Windows).
+
+For example, after downloading version `v0.25.0` on Linux the binary lives at:
+
+```
+~/.local/share/zed/extensions/installed/codegraph/codegraph-v0.25.0/codegraph
+```
+
+When the CodeGraph CLI ships a new release the extension picks up the new binary
+automatically on the next launch — **no extension re-publish or manual update
+required**. If the GitHub API is unreachable, the extension falls back to the
+newest cached binary it finds.
+
+### Override with your own binary
 
 If you already have `codegraph` installed via the CLI, or want to pin a specific
-project path, add a `command` override in your project's `.zed/settings.json`:
+project path, add a `command` override in your project's `.zed/settings.json`.
+The extension uses it verbatim and skips the download:
 
 ```jsonc
 {
@@ -338,11 +357,6 @@ See [`editors/zed/README.md`](editors/zed/README.md) for the full extension
 reference, and [`docs/mcp.md`](docs/mcp.md#zed----context_servers-config) for the
 Zed `context_servers` config shape.
 
-> **Publishing.** The extension is not yet published to the
-> [`zed-industries/extensions`](https://github.com/zed-industries/extensions)
-> registry. Dev-install via the step above works today; marketplace publish is a
-> later manual step.
-
 ---
 
 ## Using CodeGraph with an LLM
@@ -368,139 +382,28 @@ LLM library _inside_ the codegraph binary itself.
 
 ## Daemon, Watch & Configuration
 
-### Shared detached daemon
+CodeGraph spawns a shared background daemon for each indexed project when you run
+`codegraph serve --mcp`. Multiple MCP clients (terminal tabs, agents) share that
+one daemon via a Unix socket (`.codegraph/daemon.sock`). It exits once all clients
+disconnect and the idle timeout elapses.
 
-When you run `codegraph serve --mcp` in a project that has a `.codegraph/`
-directory, CodeGraph automatically spawns a single shared background daemon
-instead of running in-process. Every MCP client that connects to the same project
-(multiple terminal tabs, multiple agents) shares that one daemon via a Unix socket
-(`.codegraph/daemon.sock`). The daemon exits on its own once all clients have
-disconnected and the idle timeout elapses.
-
-**Logs and stale locks.** The daemon appends stdout and stderr to
-`.codegraph/daemon.log`. If a daemon crashes and leaves a stale lock, run:
+Key operations:
 
 ```bash
-codegraph unlock [path]   # clears the stale lock; live daemon pids are preserved
+codegraph unlock [path]        # clear a stale daemon lock (keeps live pids)
+codegraph serve --http         # HTTP MCP transport, binds 127.0.0.1:8111 by default
+codegraph http list            # table of running HTTP servers
+codegraph http stop <addr>     # terminate one HTTP server by address
 ```
 
-**Skipping the daemon.** Set `CODEGRAPH_NO_DAEMON=1` to force foreground
-(direct) mode regardless of project state. Useful in CI or scripts where you
-don't want a background process.
+Set `CODEGRAPH_NO_DAEMON=1` to force foreground mode (useful in CI). The daemon
+watches files with a 2 s debounce; pass `--no-watch` or set `CODEGRAPH_NO_WATCH=1`
+to disable. Custom extension mapping goes in `.codegraph/codegraph.json`; exclude
+patterns in `.codegraph/config.toml` under `[indexing] exclude`.
 
-**Filesystems that can't bind a socket.** On ExFAT/FAT, some network mounts,
-and WSL DrvFs, binding an `AF_UNIX` socket inside the project directory fails.
-The daemon then falls back through a deterministic candidate chain — the
-project-dir `.codegraph/daemon.sock` first, then a hashed socket under the
-system temp dir — and records the socket it actually bound in the lock file.
-The pid/lock file always stays at `.codegraph/daemon.pid`, and clients read the
-recorded socket from the lock, so they attach regardless of which candidate the
-daemon chose.
-
-### HTTP MCP server (background mode)
-
-Besides the stdio transport, CodeGraph can serve MCP over streamable-HTTP for
-web/remote clients (`serve --http`). HTTP servers are keyed by **bind address**
-(not by project — a global server with no `--path` spans many projects), so they
-have their own address-keyed registry, separate from the per-project daemon.
-
-```bash
-codegraph serve --http                                       # one command — binds 127.0.0.1:8111 (default)
-codegraph serve --http --http-addr 127.0.0.1:8111            # foreground (blocks; default)
-codegraph serve --http --http-addr 127.0.0.1:8111 --detach   # background; prints pid + log, then exits
-codegraph http list                                          # table of running servers
-codegraph http status [<addr>]                               # detail for one, or all
-codegraph http stop 127.0.0.1:8111                           # terminate one by address
-```
-
-`codegraph serve --http` alone is the one-command start: `--http-addr` defaults
-to `127.0.0.1:8111`, so no address flag is needed. To point an MCP client (e.g.
-Kiro's commented alternative) at it, use `http://localhost:8111/mcp`.
-
-**Foreground stays the default** — `serve --http` blocks and serves until you
-stop it. Add `--detach` to run it in the background: the parent spawns a
-detached child, records it in the registry, prints `started HTTP MCP server on
-<addr> (pid N), logs: <path>`, and exits.
-
-**Multi-instance by address.** Two servers on **different** addresses coexist;
-starting a second one notes the others. Starting on an **address already in
-use** is refused with an error that lists the running instance — stop it with
-`codegraph http stop <addr>` or pick a different `--http-addr`.
-
-**Self-healing registry.** One JSON file per running server lives under the
-global state dir (`$XDG_STATE_HOME/codegraph/http/`, else
-`~/.local/state/codegraph/http/`; `%LOCALAPPDATA%\codegraph\http\` on Windows;
-override with `CODEGRAPH_HTTP_REGISTRY_DIR`). Detached-server logs are written
-to `<registry_dir>/<addr>.log`. Each entry records the server's pid; on the next
-`serve --http`, `http list`, or `http stop`, any entry whose process has died is
-pruned automatically, so a crash never leaves a phantom conflict.
-
-Beyond the default `ignore_dirs`, you can skip additional root-relative path
-patterns by listing them under `[indexing] exclude` in
-`.codegraph/config.toml`:
-
-```toml
-[indexing]
-exclude = ["static/", "docs/generated", "gen*"]
-```
-
-Patterns use the same matcher as `.gitignore` (`static/` for a directory,
-`gen*` for a prefix, `docs/generated` for an exact/suffix path) and are honored
-by both `index` and `sync`. The list is empty by default, so an existing config
-without `exclude` behaves identically.
-
-### Live file watch
-
-The daemon watches your project for file changes and re-indexes automatically.
-The debounce window defaults to 2 s (`CODEGRAPH_WATCH_DEBOUNCE_MS`). On WSL2,
-watching files under `/mnt/` is auto-disabled (recursive `fs.watch` is too slow
-on those paths); set `CODEGRAPH_FORCE_WATCH=1` to override that. To disable
-watching entirely, pass `--no-watch` or set `CODEGRAPH_NO_WATCH=1`.
-
-### Environment variables
-
-| Variable                           | Default   | Clamp range  | Meaning                                                        |
-| ---------------------------------- | --------- | ------------ | -------------------------------------------------------------- |
-| `CODEGRAPH_NO_DAEMON`              | —         | —            | Force foreground direct mode; never spawn/proxy a daemon       |
-| `CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS` | `300000`  | 1000–3600000 | Exit after this long with no connected clients                 |
-| `CODEGRAPH_DAEMON_MAX_IDLE_MS`     | `1800000` | 1000–3600000 | Hard cap on total daemon lifetime when idle                    |
-| `CODEGRAPH_DAEMON_CLIENT_SWEEP_MS` | `30000`   | 50–600000    | How often the daemon sweeps for dead clients                   |
-| `CODEGRAPH_WATCH_DEBOUNCE_MS`      | `2000`    | 100–60000    | File-change debounce before re-index triggers                  |
-| `CODEGRAPH_NO_WATCH`               | —         | —            | Disable the live file watcher (equiv. `serve --no-watch`)      |
-| `CODEGRAPH_FORCE_WATCH`            | —         | —            | Override WSL2 `/mnt/` auto-disable (won't override `NO_WATCH`) |
-
-Full launcher decision order and deeper reference: [`docs/cli.md`](docs/cli.md#daemon-watch--environment-variables).
-
-### Custom extension mapping (`.codegraph/codegraph.json`)
-
-To tell CodeGraph how to parse files with non-standard extensions, add a config
-file at `.codegraph/codegraph.json`:
-
-```jsonc
-{
-  "extensions": {
-    ".x": "lua",
-    ".blade": "php",
-  },
-}
-```
-
-Keys are dot-stripped and lowercased before matching. Unknown language names are
-silently skipped. When multiple configs exist up the directory tree, the nearest
-one wins. A malformed file is ignored (logged).
-
-### Opt-in Claude prompt hook
-
-`codegraph install --prompt-hook` writes a `UserPromptSubmit` hook into Claude
-Code's config. Before each prompt, the hook calls `codegraph prompt-hook`, which
-runs `codegraph_explore` against the nearest index and prepends relevant context
-to the prompt automatically. This is **off by default** and is never implied by
-`--yes`. Other agents are unaffected.
-
-```bash
-codegraph install --prompt-hook          # add the hook to Claude Code only
-codegraph install --yes --prompt-hook    # wire all agents + add Claude hook
-```
+Full env-var table, HTTP server details, filesystem fallback behavior, and the
+Claude prompt-hook: [`docs/mcp.md`](docs/mcp.md) and
+[`docs/cli.md`](docs/cli.md#daemon-watch--environment-variables).
 
 ---
 
@@ -509,13 +412,28 @@ codegraph install --yes --prompt-hook    # wire all agents + add Claude hook
 Core commands: `init`, `index`, `sync`, `query`, `files`, `status`, `serve`,
 `callers`, `callees`, `impact`, `affected`, `check`, `export`, `unlock`.
 
-Agent / install commands: `install`, `uninstall`, `skill`, `self-update`, `completions` (`--install` sets up Tab completion for bash/zsh/fish/powershell/elvish).
+Agent / install commands: `install`, `uninstall`, `skill`, `self-update`,
+`completions` (`--install` sets up tab completion for bash/zsh/fish/powershell/elvish).
 
-> **Full reference with flags:** [`docs/cli.md`](docs/cli.md)
+Path convention: most traversal commands accept the project path as a positional
+argument or `-p/--path`; `query`/`files`/`serve` use `-p/--path`.
 
-Path convention: most traversal commands (`init`/`index`/`status`/`callers`/etc.)
-accept the project path as a positional argument or `-p/--path`; `query`/`files`/
-`serve` use `-p/--path`.
+> **Full reference with all flags:** [`docs/cli.md`](docs/cli.md)
+
+---
+
+## Shell Completion
+
+```bash
+codegraph completions bash --install        # Bash
+codegraph completions zsh --install         # Zsh
+codegraph completions fish --install        # Fish
+codegraph completions powershell --install  # PowerShell
+codegraph completions elvish --install      # Elvish
+```
+
+Omit `--install` to print to stdout. Full per-shell install paths and notes:
+[`docs/cli.md`](docs/cli.md).
 
 ---
 
@@ -536,18 +454,11 @@ beyond the fixed `LANGUAGES` set.
 
 ## Supported Languages
 
-CodeGraph supports **32 languages** grouped by extraction depth:
+CodeGraph supports **32 languages** grouped by extraction depth. Quick overview:
 
-**Tier 1 — Full symbol extraction (23):** TypeScript, TSX, JavaScript, JSX,
-Python, Go, Rust, Java, C, C++, C#, PHP, Ruby, Swift, Kotlin, Dart, Scala, Lua,
-Luau, Objective-C, R, GDScript, Pascal.
-
-**Tier 2 — Embedded / template extraction (6):** Vue (delegates `<script>` to
-TS/JS), Svelte (delegates script blocks), Astro, Razor/`.cshtml`, Liquid
-(Shopify templates + sections), XML/MyBatis mapper.
-
-**Tier 3 — File-level only (3):** YAML, Twig, Properties — indexed as file
-nodes; no symbol extraction.
+- **Tier 1 — Full symbol extraction (23):** TypeScript, TSX, JavaScript, JSX, Python, Go, Rust, Java, C, C++, C#, PHP, Ruby, Swift, Kotlin, Dart, Scala, Lua, Luau, Objective-C, R, GDScript, Pascal.
+- **Tier 2 — Embedded / template extraction (6):** Vue, Svelte, Astro, Razor/`.cshtml`, Liquid, XML/MyBatis mapper.
+- **Tier 3 — File-level only (3):** YAML, Twig, Properties.
 
 Full list with extensions and per-language notes: [`docs/languages.md`](docs/languages.md).
 
@@ -571,8 +482,9 @@ Full list with extensions and per-language notes: [`docs/languages.md`](docs/lan
 - [`docs/cli.md`](docs/cli.md) — full CLI subcommand reference (22 subcommands,
   all flags).
 - [`docs/mcp.md`](docs/mcp.md) — MCP server protocol, all 10 tools, JSON-RPC
-  details.
+  details, IDE per-agent config matrix, HTTP server, env-var reference.
 - [`examples/`](examples/) — codegraph + LLM orchestration example.
+- [`editors/zed/README.md`](editors/zed/README.md) — Zed extension reference.
 - [`docs/readme/README.zh-CN.md`](docs/readme/README.zh-CN.md) — 中文说明.
 
 ---

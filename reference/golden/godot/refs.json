@@ -1,0 +1,74 @@
+[
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "main.tscn",
+    "from_node_id": "constant:1f0edde6ec0613b93a439aba2a90c68e",
+    "language": "godot_scene",
+    "line": 6,
+    "reference_kind": "references",
+    "reference_name": "stage_manager.gd",
+    "reference_subkind": "script_attach"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "project.godot",
+    "from_node_id": "constant:f89784c51d837f372217e3a0acd6e728",
+    "language": "godot_project",
+    "line": 9,
+    "reference_kind": "references",
+    "reference_name": "game_flow.gd",
+    "reference_subkind": "autoload"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "stage_manager.gd",
+    "from_node_id": "function:1f948ab9675bc7bfad6e4e9296fe0017",
+    "language": "gdscript",
+    "line": 4,
+    "reference_kind": "calls",
+    "reference_name": "Button.new"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "stage_manager.gd",
+    "from_node_id": "function:1f948ab9675bc7bfad6e4e9296fe0017",
+    "language": "gdscript",
+    "line": 4,
+    "reference_kind": "calls",
+    "reference_name": "godot:autoload_call:Button.new"
+  },
+  {
+    "candidates": null,
+    "col": 26,
+    "file_path": "stage_manager.gd",
+    "from_node_id": "function:1f948ab9675bc7bfad6e4e9296fe0017",
+    "language": "gdscript",
+    "line": 6,
+    "reference_kind": "calls",
+    "reference_name": "Callable"
+  },
+  {
+    "candidates": null,
+    "col": 8,
+    "file_path": "game_flow.gd",
+    "from_node_id": "file:game_flow.gd",
+    "language": "gdscript",
+    "line": 1,
+    "reference_kind": "extends",
+    "reference_name": "Node"
+  },
+  {
+    "candidates": null,
+    "col": 8,
+    "file_path": "stage_manager.gd",
+    "from_node_id": "file:stage_manager.gd",
+    "language": "gdscript",
+    "line": 1,
+    "reference_kind": "extends",
+    "reference_name": "Node"
+  }
+]

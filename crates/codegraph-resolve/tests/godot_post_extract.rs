@@ -325,3 +325,260 @@ fn pipeline_is_deterministic_across_runs() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The GDScript `Function` node id named `name` in the given file (F1 target).
+fn func_id_in_file(store: &Store, file: &str, name: &str) -> String {
+    store
+        .nodes_by_name(name)
+        .expect("nodes by name")
+        .into_iter()
+        .find(|n| {
+            n.kind == NodeKind::Function
+                && n.language == codegraph_core::types::Language::Gdscript
+                && n.file_path == file
+        })
+        .unwrap_or_else(|| panic!("expected GDScript func {name} in {file}"))
+        .id
+}
+
+#[test]
+fn autoload_call_resolves_to_unique_func_in_bound_script() {
+    // Given GameFlow bound to game_flow.gd with a single func return_to_map(),
+    // and a caller GameFlow.return_to_map(),
+    let dir = unique_dir("f1-func-pos");
+    std::fs::write(
+        dir.join("project.godot"),
+        "config_version=5\n\n[autoload]\n\nGameFlow=\"*res://game_flow.gd\"\n",
+    )
+    .expect("write project.godot");
+    std::fs::write(
+        dir.join("game_flow.gd"),
+        "extends Node\n\nfunc return_to_map() -> void:\n\tpass\n",
+    )
+    .expect("write game_flow.gd");
+    std::fs::write(
+        dir.join("stage_manager.gd"),
+        "extends Node\n\nfunc _goto_map():\n\tGameFlow.return_to_map()\n",
+    )
+    .expect("write stage_manager.gd");
+
+    // When the full pipeline runs,
+    let (store, edges) = run_pipeline(
+        "f1-func-pos",
+        &dir,
+        &["project.godot", "game_flow.gd", "stage_manager.gd"],
+    );
+
+    // Then a resolved Calls edge points at the func in the bound script,
+    let func = func_id_in_file(&store, "game_flow.gd", "return_to_map");
+    let to_func: Vec<&Edge> = edges
+        .iter()
+        .filter(|e| e.target == func && e.kind == EdgeKind::Calls)
+        .collect();
+    assert!(
+        !to_func.is_empty(),
+        "expected a Calls edge to the return_to_map func, got: {edges:#?}"
+    );
+    assert_eq!(
+        to_func[0]
+            .metadata
+            .as_ref()
+            .and_then(|m| m["resolvedBy"].as_str()),
+        Some("framework"),
+    );
+
+    // And the singleton edge still coexists (F1 ADDS, never replaces).
+    let singleton = autoload_singleton_id_named(&store, "GameFlow");
+    let to_singleton: Vec<&Edge> = edges.iter().filter(|e| e.target == singleton).collect();
+    assert!(
+        !to_singleton.is_empty(),
+        "the pre-existing singleton edge must still be present"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn autoload_call_builds_no_func_edge_when_zero_candidates() {
+    // Given a bound script with NO same-named func,
+    let dir = unique_dir("f1-func-zero");
+    std::fs::write(
+        dir.join("project.godot"),
+        "config_version=5\n\n[autoload]\n\nGameFlow=\"*res://game_flow.gd\"\n",
+    )
+    .expect("write project.godot");
+    std::fs::write(
+        dir.join("game_flow.gd"),
+        "extends Node\n\nfunc other() -> void:\n\tpass\n",
+    )
+    .expect("write game_flow.gd");
+    std::fs::write(
+        dir.join("stage_manager.gd"),
+        "extends Node\n\nfunc _goto_map():\n\tGameFlow.return_to_map()\n",
+    )
+    .expect("write stage_manager.gd");
+
+    // When the pipeline runs,
+    let (store, edges) = run_pipeline(
+        "f1-func-zero",
+        &dir,
+        &["project.godot", "game_flow.gd", "stage_manager.gd"],
+    );
+
+    // Then NO func named return_to_map exists, so no edge can target it; and the
+    // caller's line-4 ref produces only the singleton edge, never a func edge.
+    let stray: Vec<&Edge> = edges
+        .iter()
+        .filter(|e| {
+            e.metadata.as_ref().and_then(|m| m["resolvedBy"].as_str()) == Some("framework")
+                && e.target.starts_with("function:")
+        })
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "zero same-named funcs must produce NO function-target edge, got: {stray:#?}"
+    );
+    // The singleton edge is still there (current behavior untouched).
+    let singleton = autoload_singleton_id_named(&store, "GameFlow");
+    assert!(
+        edges.iter().any(|e| e.target == singleton),
+        "singleton edge must still be produced"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn autoload_call_builds_no_func_edge_when_two_candidates() {
+    // Given a bound script with TWO same-named funcs (ambiguous),
+    let dir = unique_dir("f1-func-two");
+    std::fs::write(
+        dir.join("project.godot"),
+        "config_version=5\n\n[autoload]\n\nGameFlow=\"*res://game_flow.gd\"\n",
+    )
+    .expect("write project.godot");
+    // Two file-level funcs named return_to_map (illegal in real Godot but a
+    // deterministic ambiguity the resolver must refuse to guess).
+    std::fs::write(
+        dir.join("game_flow.gd"),
+        "extends Node\n\nfunc return_to_map() -> void:\n\tpass\n\nfunc return_to_map() -> void:\n\tpass\n",
+    )
+    .expect("write game_flow.gd");
+    std::fs::write(
+        dir.join("stage_manager.gd"),
+        "extends Node\n\nfunc _goto_map():\n\tGameFlow.return_to_map()\n",
+    )
+    .expect("write stage_manager.gd");
+
+    // When the pipeline runs,
+    let (_store, edges) = run_pipeline(
+        "f1-func-two",
+        &dir,
+        &["project.godot", "game_flow.gd", "stage_manager.gd"],
+    );
+
+    // Then the ambiguity leaves the func unresolved — no func-target edge.
+    let to_func: Vec<&Edge> = edges
+        .iter()
+        .filter(|e| {
+            e.kind == EdgeKind::Calls
+                && e.target.starts_with("function:")
+                && e.metadata.as_ref().and_then(|m| m["resolvedBy"].as_str()) == Some("framework")
+        })
+        .collect();
+    assert!(
+        to_func.is_empty(),
+        "two same-named funcs must produce NO edge (no guess), got: {to_func:#?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn non_autoload_receiver_builds_no_func_edge() {
+    // Given a func-shaped call whose receiver is NOT a res:// autoload,
+    let dir = unique_dir("f1-func-nonautoload");
+    std::fs::write(
+        dir.join("project.godot"),
+        "config_version=5\n\n[autoload]\n\nGameFlow=\"*res://game_flow.gd\"\n",
+    )
+    .expect("write project.godot");
+    std::fs::write(
+        dir.join("game_flow.gd"),
+        "extends Node\n\nfunc return_to_map() -> void:\n\tpass\n",
+    )
+    .expect("write game_flow.gd");
+    // `Other` is not an autoload; it happens to name a member equal to a real func.
+    std::fs::write(
+        dir.join("stage_manager.gd"),
+        "extends Node\n\nfunc _goto_map():\n\tOther.return_to_map()\n",
+    )
+    .expect("write stage_manager.gd");
+
+    // When the pipeline runs,
+    let (store, edges) = run_pipeline(
+        "f1-func-nonautoload",
+        &dir,
+        &["project.godot", "game_flow.gd", "stage_manager.gd"],
+    );
+
+    // Then the non-autoload receiver produces NO func edge (single binding source).
+    let func = func_id_in_file(&store, "game_flow.gd", "return_to_map");
+    let fabricated: Vec<&Edge> = edges
+        .iter()
+        .filter(|e| {
+            e.target == func
+                && e.metadata.as_ref().and_then(|m| m["resolvedBy"].as_str()) == Some("framework")
+        })
+        .collect();
+    assert!(
+        fabricated.is_empty(),
+        "a non-autoload receiver must never bind to a func by name, got: {fabricated:#?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn uid_bound_autoload_builds_no_func_edge() {
+    // Given an autoload bound via uid:// (not res://) whose script the resolver
+    // cannot map to a repo-relative path,
+    let dir = unique_dir("f1-func-uid");
+    std::fs::write(
+        dir.join("project.godot"),
+        "config_version=5\n\n[autoload]\n\nGameFlow=\"*uid://abc123\"\n",
+    )
+    .expect("write project.godot");
+    std::fs::write(
+        dir.join("game_flow.gd"),
+        "extends Node\n\nfunc return_to_map() -> void:\n\tpass\n",
+    )
+    .expect("write game_flow.gd");
+    std::fs::write(
+        dir.join("stage_manager.gd"),
+        "extends Node\n\nfunc _goto_map():\n\tGameFlow.return_to_map()\n",
+    )
+    .expect("write stage_manager.gd");
+
+    // When the pipeline runs,
+    let (store, edges) = run_pipeline(
+        "f1-func-uid",
+        &dir,
+        &["project.godot", "game_flow.gd", "stage_manager.gd"],
+    );
+
+    // Then the uid-bound autoload has no res:// script path → NO func edge.
+    let func = func_id_in_file(&store, "game_flow.gd", "return_to_map");
+    assert!(
+        !edges.iter().any(|e| e.target == func),
+        "a uid://-bound autoload must not synthesize a func edge"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The autoload singleton `Constant` node id named `name`.
+fn autoload_singleton_id_named(store: &Store, name: &str) -> String {
+    store
+        .nodes_by_name(name)
+        .expect("nodes by name")
+        .into_iter()
+        .find(|n| n.kind == NodeKind::Constant)
+        .unwrap_or_else(|| panic!("expected autoload singleton {name}"))
+        .id
+}
