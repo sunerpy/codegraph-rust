@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.26.0](https://github.com/sunerpy/codegraph-rust/compare/v0.25.6...v0.26.0) (2026-07-06)
+
+
+### Features
+
+* **resolve:** infer method-call receiver types across languages and prefer same-file targets ([#119](https://github.com/sunerpy/codegraph-rust/issues/119)) ([d807080](https://github.com/sunerpy/codegraph-rust/commit/d807080d98b2ae3eb50be1a85df918e3cebd03f2))
+
 ## [0.25.6](https://github.com/sunerpy/codegraph-rust/compare/v0.25.5...v0.25.6) (2026-07-06)
 
 
