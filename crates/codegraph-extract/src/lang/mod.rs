@@ -33,6 +33,7 @@ use crate::spec::LanguageSpec;
 
 pub use c::C_SPEC;
 pub use cpp::CPP_SPEC;
+pub(crate) use cpp::{ExportMacroClass, detect_export_macro_class};
 pub use csharp::CSHARP_SPEC;
 pub use dart::DART_SPEC;
 pub use gdscript::GDSCRIPT_SPEC;
