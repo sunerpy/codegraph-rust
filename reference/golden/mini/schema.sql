@@ -113,3 +113,5 @@ value TEXT NOT NULL,
 updated_at INTEGER NOT NULL
 );
 CREATE TABLE sqlite_stat1(tbl,idx,stat);
+CREATE UNIQUE INDEX idx_edges_identity
+ON edges(source, target, kind, IFNULL(line, -1), IFNULL(col, -1));

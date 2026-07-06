@@ -2044,6 +2044,76 @@ mod tests {
     }
 
     #[test]
+    fn insert_edges_dedups_identical_edge_identity() {
+        let mut store = store("edges-dedup");
+        store
+            .upsert_nodes(&[
+                node("function:src", "src", "e.rs"),
+                node("function:dst", "dst", "e.rs"),
+            ])
+            .unwrap();
+
+        let mut e = edge("function:src", "function:dst", EdgeKind::Calls);
+        e.line = Some(5);
+        e.col = Some(3);
+        store.insert_edges(std::slice::from_ref(&e)).unwrap();
+        store.insert_edges(std::slice::from_ref(&e)).unwrap();
+
+        assert_eq!(
+            store.all_edges().unwrap().len(),
+            1,
+            "same edge identity inserted twice must collapse to one row"
+        );
+    }
+
+    #[test]
+    fn insert_edges_dedups_null_coordinate_edge_identity() {
+        let mut store = store("edges-dedup-null");
+        store
+            .upsert_nodes(&[
+                node("file:e.rs", "e.rs", "e.rs"),
+                node("function:dst", "dst", "e.rs"),
+            ])
+            .unwrap();
+
+        let e = edge("file:e.rs", "function:dst", EdgeKind::Contains);
+        store.insert_edges(std::slice::from_ref(&e)).unwrap();
+        store.insert_edges(std::slice::from_ref(&e)).unwrap();
+
+        assert_eq!(
+            store.all_edges().unwrap().len(),
+            1,
+            "coordinate-less edge (NULL line/col) identity must dedup via IFNULL folding"
+        );
+    }
+
+    #[test]
+    fn insert_edges_keeps_distinct_identities_apart() {
+        let mut store = store("edges-distinct");
+        store
+            .upsert_nodes(&[
+                node("function:src", "src", "e.rs"),
+                node("function:dst", "dst", "e.rs"),
+            ])
+            .unwrap();
+
+        let mut a = edge("function:src", "function:dst", EdgeKind::Calls);
+        a.line = Some(5);
+        a.col = Some(3);
+        let mut b = edge("function:src", "function:dst", EdgeKind::Calls);
+        b.line = Some(6);
+        b.col = Some(3);
+        let c = edge("function:src", "function:dst", EdgeKind::References);
+        store.insert_edges(&[a, b, c]).unwrap();
+
+        assert_eq!(
+            store.all_edges().unwrap().len(),
+            3,
+            "differing line, or differing kind, are distinct edge identities"
+        );
+    }
+
+    #[test]
     fn file_records_delete_and_aggregations() {
         let mut store = store("files-agg");
         store.upsert_file(&file("src/a.rs")).unwrap();
