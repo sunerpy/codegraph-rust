@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.25.1](https://github.com/sunerpy/codegraph-rust/compare/v0.25.0...v0.25.1) (2026-07-06)
+
+
+### Bug Fixes
+
+* **godot:** resolve autoload calls and signal handlers, unify impact with audit ([#107](https://github.com/sunerpy/codegraph-rust/issues/107)) ([2d933a5](https://github.com/sunerpy/codegraph-rust/commit/2d933a5b38afe48358ae55687e65061314fb1a1b))
+
 ## [0.25.0](https://github.com/sunerpy/codegraph-rust/compare/v0.24.0...v0.25.0) (2026-07-05)
 
 
