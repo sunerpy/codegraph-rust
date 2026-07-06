@@ -237,6 +237,14 @@ pub fn current_log_level() -> Option<String> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::Mutex;
+
+    // Process-wide test serialization lock to prevent concurrent access to:
+    // - RUST_LOG environment variable (set_var/remove_var)
+    // - Global RELOAD_HANDLE OnceLock (one-shot init_logger call)
+    // Without this, parallel test runs race on env mutations and global state,
+    // causing intermittent failures (the logger can only be initialized once per process).
+    static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_parse_level_forgiving() {
@@ -266,6 +274,8 @@ mod tests {
 
     #[test]
     fn test_init_logger_creates_directory() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         let temp_dir = std::env::temp_dir().join("codegraph_test_logs");
         let _ = fs::remove_dir_all(&temp_dir);
 
@@ -315,6 +325,8 @@ mod tests {
 
     #[test]
     fn test_env_filter_override() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         // This test demonstrates RUST_LOG precedence:
         // If RUST_LOG is set, it overrides config level.
         // We test this by checking that parse_level respects the config,
@@ -362,6 +374,8 @@ mod tests {
 
     #[test]
     fn set_and_current_log_level_operate_on_the_shared_handle() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         if set_log_level("debug").is_ok() {
             assert_eq!(current_log_level().as_deref(), Some("debug"));
             set_log_level("nonsense").expect("unknown level falls back, never errors");

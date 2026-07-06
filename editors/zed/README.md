@@ -9,7 +9,20 @@ does changing X break", "where is X", "how does this area work") in one
 sub-millisecond query instead of dozens of grep + file reads. It has no
 AI/LLM inside it — pure pre-computed structure for your agent to consume.
 
-## Install (dev extension)
+## Install
+
+### Preferred — official registry (once published)
+
+Search for **"CodeGraph"** in Zed's extension registry (`zed: extensions` from
+the command palette) and click Install. The extension auto-downloads the
+CodeGraph binary for your platform on first launch.
+
+> The extension is being submitted to the
+> [`zed-industries/extensions`](https://github.com/zed-industries/extensions)
+> registry. Once accepted it will be searchable there. Until then, use the
+> dev-install path below.
+
+### Dev install (before publication / for local development)
 
 1. Clone this repository.
 2. In Zed, run **`zed: install dev extension`** from the command palette.
@@ -19,7 +32,7 @@ Zed compiles the extension to WebAssembly and registers a `codegraph` context
 server. On first launch the extension downloads the latest CodeGraph release
 binary for your platform (see below).
 
-## Auto-update (tracks the latest CodeGraph release)
+## Auto-update and binary cache location
 
 The extension never pins a CodeGraph version. On each launch it:
 
@@ -28,8 +41,27 @@ The extension never pins a CodeGraph version. On each launch it:
 2. Otherwise resolves the **latest** GitHub release of
    `sunerpy/codegraph-rust`, picks the asset matching your platform
    (`x86_64`/`aarch64` × `unknown-linux-musl` / `apple-darwin` /
-   `pc-windows-msvc`), downloads and extracts it, and caches it under a
-   version-stamped path (`codegraph-<version>/codegraph`).
+   `pc-windows-msvc`), downloads and extracts it, then caches the binary at:
+
+```
+codegraph-<version>/codegraph        # Linux / macOS
+codegraph-<version>/codegraph.exe    # Windows
+```
+
+This path is **relative to the extension's working directory** that Zed manages
+(inside Zed's extensions data directory). The full on-disk location is:
+
+| Platform | Full path                                                                                        |
+| -------- | ------------------------------------------------------------------------------------------------ |
+| Linux    | `~/.local/share/zed/extensions/installed/codegraph/codegraph-<version>/codegraph`                |
+| macOS    | `~/Library/Application Support/Zed/extensions/installed/codegraph/codegraph-<version>/codegraph` |
+| Windows  | `%APPDATA%\Zed\extensions\installed\codegraph\codegraph-<version>\codegraph.exe`                 |
+
+For example, after downloading version `v0.25.0` on Linux the binary lives at:
+
+```
+~/.local/share/zed/extensions/installed/codegraph/codegraph-v0.25.0/codegraph
+```
 
 Because the cache is keyed on the release version, when the CodeGraph CLI ships
 a new release the extension picks up the new binary automatically on the next
@@ -104,14 +136,68 @@ Use an absolute path to the codegraph binary on the remote host (non-login SSH
 shells often lack `~/.cargo/bin` on `PATH`). The `-T` flag disables PTY
 allocation, which would otherwise corrupt the JSON-RPC byte stream.
 
-For the full explanation of each argument and the known caveats, see
+**Workaround — HTTP transport (recommended).** Start `codegraph serve --http` on
+the remote host (or forward a port) and point Zed at the local port:
+
+```jsonc
+{
+  "context_servers": {
+    "codegraph": {
+      "url": "http://localhost:8111/mcp",
+    },
+  },
+}
+```
+
+For the full explanation of each approach and the known caveats, see
 [`docs/mcp.md` — Zed over SSH](../../docs/mcp.md#zed-over-ssh-remote-development).
 
-## Publishing
+## Publishing to the Zed registry
 
-Publishing this extension to the public
+To submit this extension to the official
 [`zed-industries/extensions`](https://github.com/zed-industries/extensions)
-registry is a separate, later step and is not done here.
+registry so users can install it via `zed: extensions`, follow these steps:
+
+1. **Bump the version** in `editors/zed/extension.toml` to match the current
+   CodeGraph release (e.g. `version = "0.2.0"`).
+
+2. **Fork** [`zed-industries/extensions`](https://github.com/zed-industries/extensions).
+
+3. **Add this repo as a git submodule** under `extensions/codegraph/`:
+
+   ```bash
+   git submodule add https://github.com/sunerpy/codegraph-rust extensions/codegraph
+   ```
+
+   The registry expects the extension root (containing `extension.toml`) at
+   `extensions/codegraph/editors/zed/`, so point the submodule at the repo root
+   and Zed's tooling walks for the manifest.
+
+   > Alternatively, if the registry requires the extension root at the submodule
+   > root, extract just `editors/zed/` into a dedicated repo first and submodule
+   > that instead.
+
+4. **Add an entry** to the top-level `extensions.toml` in the
+   `zed-industries/extensions` repo:
+
+   ```toml
+   [codegraph]
+   submodule = "extensions/codegraph"
+   version = "0.2.0"
+   ```
+
+   The `id` field (`codegraph`) must match the `id` in `extension.toml`.
+
+5. **Open a pull request** against `zed-industries/extensions`. The Zed team
+   reviews and merges it; once merged the extension becomes searchable in Zed's
+   built-in registry.
+
+6. **Subsequent releases**: bump `version` in `extension.toml`, tag the
+   codegraph-rust repo, then open another PR to `zed-industries/extensions`
+   updating the submodule ref and `extensions.toml` version. The CodeGraph
+   binary itself auto-updates via the GitHub release mechanism regardless of
+   when the extension version is bumped — so a version bump is only needed when
+   the extension's WASM logic changes.
 
 ## License
 

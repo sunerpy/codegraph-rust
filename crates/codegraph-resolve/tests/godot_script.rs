@@ -12,7 +12,7 @@
 use codegraph_core::types::EdgeKind;
 use codegraph_resolve::framework::FrameworkResolver;
 use codegraph_resolve::frameworks::godot::GodotResolver;
-use codegraph_resolve::frameworks::godot_script::DYNAMIC_PREFIX;
+use codegraph_resolve::frameworks::godot_script::{AUTOLOAD_CALL_PREFIX, DYNAMIC_PREFIX};
 use codegraph_resolve::types::{FrameworkResolverExtractionResult, RefView};
 
 /// Run `extract()` and unwrap the result (panics if the resolver returned
@@ -455,4 +455,220 @@ fn extract_routes_gd_to_t6_and_others_correctly() {
     );
     // A non-Godot file the resolver doesn't claim → None.
     assert!(GodotResolver.extract("README.md", "# hi\n", "").is_none());
+}
+
+#[test]
+fn connect_bound_handler_emits_call_to_handler_before_bind() {
+    // Given `.connect(_handler.bind(x))` (a bound Callable),
+    let content = "\
+func _ready():
+\tnode.gui_input.connect(_on_rect_input.bind(i))
+";
+    // When extracting,
+    let result = extract("map_select.gd", content);
+
+    // Then the handler NAME before `.bind(` is a resolved Call, not a dynamic sentinel.
+    let r = find(&result, "_on_rect_input").expect("ref to _on_rect_input handler");
+    assert_eq!(r.reference_kind, EdgeKind::Calls);
+    assert!(
+        find(&result, &format!("{DYNAMIC_PREFIX}connect")).is_none(),
+        "a plain-ident bound handler must not fall back to the dynamic sentinel"
+    );
+}
+
+#[test]
+fn connect_bound_self_member_handler_takes_trailing_ident() {
+    // Given a bound handler whose head is `self._on_x`,
+    let content = "\
+func _ready():
+\tsig.connect(self._on_died.bind(child))
+";
+    // When extracting,
+    let result = extract("stage_manager.gd", content);
+
+    // Then the trailing `.`-segment `_on_died` is the resolved Call target.
+    let r = find(&result, "_on_died").expect("ref to _on_died handler");
+    assert_eq!(r.reference_kind, EdgeKind::Calls);
+}
+
+#[test]
+fn connect_callable_self_emits_call_to_string_method() {
+    // Given `Callable(self, "handler")`,
+    let content = "\
+func _ready():
+\tsig.connect(Callable(self, \"_on_pressed\"))
+";
+    // When extracting,
+    let result = extract("button.gd", content);
+
+    // Then the string-literal method name is a resolved Call.
+    let r = find(&result, "_on_pressed").expect("ref to _on_pressed handler");
+    assert_eq!(r.reference_kind, EdgeKind::Calls);
+    assert!(find(&result, &format!("{DYNAMIC_PREFIX}connect")).is_none());
+}
+
+#[test]
+fn connect_callable_this_emits_call_to_string_method() {
+    // Given `Callable(this, "handler")` (the `this` receiver form),
+    let content = "\
+func _ready():
+\tsig.connect(Callable(this, \"_on_pressed\"))
+";
+    // When extracting,
+    let result = extract("button.gd", content);
+
+    // Then the string-literal method name is a resolved Call.
+    let r = find(&result, "_on_pressed").expect("ref to _on_pressed handler");
+    assert_eq!(r.reference_kind, EdgeKind::Calls);
+}
+
+#[test]
+fn connect_callable_other_receiver_is_dynamic() {
+    // Given `Callable(other_obj, "m")` — a receiver that is NOT self/this,
+    let content = "\
+func _ready():
+\tsig.connect(Callable(other_obj, \"_on_pressed\"))
+";
+    // When extracting,
+    let result = extract("button.gd", content);
+
+    // Then the cross-object callable is NOT resolved; it stays dynamic.
+    assert!(
+        find(&result, "_on_pressed").is_none(),
+        "a non-self/this receiver must not produce a resolved handler Call"
+    );
+    let r = find(&result, &format!("{DYNAMIC_PREFIX}connect"))
+        .expect("cross-object Callable stays the dynamic sentinel");
+    assert_eq!(r.reference_kind, EdgeKind::Calls);
+}
+
+#[test]
+fn connect_bound_plain_ident_head_resolves() {
+    // Given a `.bind` chain whose head is a plain identifier,
+    let content = "\
+func wire(cb):
+\tsig.connect(cb.bind(1))
+";
+    // When extracting,
+    let result = extract("wiring.gd", content);
+
+    // Then the plain-ident head `cb` resolves as a Call (a plain ident is a valid
+    // method-ref head by rule); no dynamic sentinel is emitted here.
+    let r = find(&result, "cb").expect("plain-ident bound head resolves to cb");
+    assert_eq!(r.reference_kind, EdgeKind::Calls);
+}
+
+#[test]
+fn connect_bind_head_non_ident_stays_dynamic() {
+    // Given a `.bind` chain whose head is NOT a plain identifier,
+    let content = "\
+func _ready():
+\tsig.connect(get_cb().bind(1))
+";
+    // When extracting,
+    let result = extract("wiring.gd", content);
+
+    // Then it keeps the dynamic sentinel (the head `get_cb()` is a call, not a ref).
+    let r = find(&result, &format!("{DYNAMIC_PREFIX}connect"))
+        .expect("non-ident bind head stays dynamic");
+    assert_eq!(r.reference_kind, EdgeKind::Calls);
+}
+
+#[test]
+fn connect_callable_non_literal_method_stays_dynamic() {
+    // Given `Callable(self, method_var)` with a non-literal method name,
+    let content = "\
+func wire(method_var):
+\tsig.connect(Callable(self, method_var))
+";
+    // When extracting,
+    let result = extract("wiring.gd", content);
+
+    // Then the non-literal method name is not resolved; it stays dynamic.
+    let r = find(&result, &format!("{DYNAMIC_PREFIX}connect"))
+        .expect("non-literal Callable method stays dynamic");
+    assert_eq!(r.reference_kind, EdgeKind::Calls);
+}
+
+#[test]
+fn connect_bare_and_self_handler_unchanged_regression() {
+    // Given the already-working bare + self.member handler forms,
+    let content = "\
+func _ready():
+\tsig.timeout.connect(_on_health_changed)
+\tother.connect(self._on_ready)
+";
+    // When extracting,
+    let result = extract("health_bar.gd", content);
+
+    // Then both still emit resolved Calls (F2 must not regress bare-ident behavior).
+    let a = find(&result, "_on_health_changed").expect("bare handler still resolves");
+    assert_eq!(a.reference_kind, EdgeKind::Calls);
+    let b = find(&result, "_on_ready").expect("self.member handler still resolves");
+    assert_eq!(b.reference_kind, EdgeKind::Calls);
+    assert!(
+        find(&result, &format!("{DYNAMIC_PREFIX}connect")).is_none(),
+        "no dynamic sentinel for the already-working forms"
+    );
+}
+
+#[test]
+fn autoload_call_emits_both_singleton_and_func_candidates() {
+    // Given an `Uppercase.member()` access,
+    let content = "\
+func _goto_map():
+\tGameFlow.return_to_map()
+";
+    // When extracting,
+    let result = extract("stage_manager.gd", content);
+
+    // Then a plain `Receiver.member` singleton candidate is emitted (unchanged),
+    let plain = find(&result, "GameFlow.return_to_map").expect("plain singleton candidate");
+    assert_eq!(plain.reference_kind, EdgeKind::Calls);
+    // And a distinct AUTOLOAD_CALL_PREFIX func candidate is emitted alongside it.
+    let func_name = format!("{AUTOLOAD_CALL_PREFIX}GameFlow.return_to_map");
+    let func = find(&result, &func_name).expect("autoload-func candidate");
+    assert_eq!(func.reference_kind, EdgeKind::Calls);
+}
+
+#[test]
+fn autoload_func_candidate_emitted_for_every_uppercase_receiver() {
+    // Given a built-in uppercase access (not a real autoload),
+    let content = "\
+func _ready():
+\tvar v = Vector2.ZERO
+";
+    // When extracting,
+    let result = extract("thing.gd", content);
+
+    // Then the func candidate is STILL emitted (over-emit by design); the roster
+    // gate in the resolver — not the extractor — rejects non-autoload receivers.
+    let func_name = format!("{AUTOLOAD_CALL_PREFIX}Vector2.ZERO");
+    assert!(
+        find(&result, &func_name).is_some(),
+        "the extractor over-emits; the resolver roster-gates"
+    );
+}
+
+#[test]
+fn autoload_func_candidate_skips_lowercase_and_chained_receivers() {
+    // Given a lowercase instance receiver and a chained `a.B.c`,
+    let content = "\
+func run():
+\tplayer.move()
+\ta.Bee.buzz()
+";
+    // When extracting,
+    let result = extract("caller.gd", content);
+
+    // Then no autoload-func candidate is emitted for the lowercase receiver,
+    assert!(
+        find(&result, &format!("{AUTOLOAD_CALL_PREFIX}player.move")).is_none(),
+        "lowercase receiver is an instance call, never an autoload"
+    );
+    // Nor for the non-leftmost `B` in a chain.
+    assert!(
+        find(&result, &format!("{AUTOLOAD_CALL_PREFIX}Bee.buzz")).is_none(),
+        "only the leftmost receiver in a chain can be an autoload"
+    );
 }

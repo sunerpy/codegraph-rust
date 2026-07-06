@@ -141,6 +141,50 @@ stored paths are relative `/` paths, ignores `edges.id` and
 `unresolved_refs.id`, and normalizes `.schema` text with the same rules used by
 `crates/codegraph-store/tests/schema_parity.rs`.
 
+### Godot fixture
+
+A second golden fixture, `reference/golden/godot/`, guards Godot-specific
+extraction that the mini fixture cannot reach — there are no `.gd`/`.tscn`/
+`project.godot` files in `mini`. It captures the framework-resolver output for:
+
+- **F1** — an autoload call (`GameFlow.return_to_map()`) resolving to the unique
+  same-named `func` in the bound script (a `framework`-resolved `Calls` edge),
+  alongside the coexisting singleton-constant edge.
+- **F2** — signal-handler connections (`.connect(_on_pressed.bind(button))` and
+  `.connect(Callable(self, "_on_input"))`) resolving to the handler `func`s
+  (`Calls` edges).
+- **F3** — a `.tscn` `ExtResource` script attachment (`main.tscn` →
+  `stage_manager.gd`), captured as a `script_attach` unresolved-ref subkind.
+
+The minimal source corpus lives at `crates/codegraph-bench/fixtures/godot/`
+(`project.godot`, `game_flow.gd`, `stage_manager.gd`, `main.tscn`).
+
+Regenerate the committed database + canonical JSON reproducibly from the corpus:
+
+```bash
+# 1. Copy the corpus to a clean directory (keeps the workspace .codegraph/ out of it).
+rm -rf /tmp/cg-fixture-godot
+cp -r crates/codegraph-bench/fixtures/godot /tmp/cg-fixture-godot
+
+# 2. Index it with OUR binary (never hand-write the golden).
+cargo build --release -p codegraph-rs
+CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
+  ./target/release/codegraph init /tmp/cg-fixture-godot
+
+# 3. Commit the produced database as the fixture's colby.db.
+cp /tmp/cg-fixture-godot/.codegraph/codegraph.db reference/golden/godot/colby.db
+
+# 4. Dump the canonical golden JSON + schema from that database.
+cargo run -p codegraph-bench --bin bench -- \
+  --gen-golden reference/golden/godot/colby.db reference/golden/godot
+```
+
+The extraction and `--gen-golden` steps are both byte-stable: re-running the
+index or the dump reproduces identical `nodes.json`/`edges.json`/`refs.json`/
+`files.json`/`schema.sql`. The `generated_golden_matches_committed_godot_fixture`
+and `upstream_db_is_self_equivalent_to_godot_golden` tests in
+`crates/codegraph-bench/tests/equivalence.rs` enforce this.
+
 The schema normalization helper is replicated inside `codegraph-bench` rather
 than extracted into `codegraph-store` to avoid changing store source during the
 parallel CRUD work. It preserves `.schema` statement order, strips optional

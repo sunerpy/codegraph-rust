@@ -1,0 +1,9 @@
+config_version=5
+
+[application]
+
+config/name="CodeGraph Godot Fixture"
+
+[autoload]
+
+GameFlow="*res://game_flow.gd"

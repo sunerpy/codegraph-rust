@@ -1,0 +1,104 @@
+[
+  {
+    "col": 0,
+    "kind": "calls",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:1f948ab9675bc7bfad6e4e9296fe0017",
+    "target": "function:3e7258a7b719c0eecf053f21cadf499b"
+  },
+  {
+    "col": 0,
+    "kind": "calls",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:1f948ab9675bc7bfad6e4e9296fe0017",
+    "target": "function:ded3bac40c3278b2e878c84f6fd25097"
+  },
+  {
+    "col": 0,
+    "kind": "calls",
+    "line": 9,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "function:e7d6028e334cefe390f5a7b17d18c2de",
+    "target": "constant:f89784c51d837f372217e3a0acd6e728"
+  },
+  {
+    "col": 0,
+    "kind": "calls",
+    "line": 9,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "function:e7d6028e334cefe390f5a7b17d18c2de",
+    "target": "function:0dba39278ee3bc0185ce741223429845"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:game_flow.gd",
+    "target": "function:0dba39278ee3bc0185ce741223429845"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:stage_manager.gd",
+    "target": "function:1f948ab9675bc7bfad6e4e9296fe0017"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:stage_manager.gd",
+    "target": "function:3e7258a7b719c0eecf053f21cadf499b"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:stage_manager.gd",
+    "target": "function:ded3bac40c3278b2e878c84f6fd25097"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:stage_manager.gd",
+    "target": "function:e7d6028e334cefe390f5a7b17d18c2de"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "function:1f948ab9675bc7bfad6e4e9296fe0017",
+    "target": "variable:e439d4b47ff7a3dd283430e6a525b9f8"
+  }
+]

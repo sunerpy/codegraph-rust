@@ -1,0 +1,34 @@
+[
+  {
+    "content_hash": "40f411be7a8b9048869b5a8902243a44fcb645c67e3c1d2fb05b0f20b5c7075c",
+    "errors": null,
+    "language": "gdscript",
+    "node_count": 2,
+    "path": "game_flow.gd",
+    "size": 50
+  },
+  {
+    "content_hash": "fca10c3b36f6310276b07105d034d82d7f54f132283b460939dd05b213b2abf7",
+    "errors": null,
+    "language": "godot_scene",
+    "node_count": 0,
+    "path": "main.tscn",
+    "size": 170
+  },
+  {
+    "content_hash": "2c29a56104c250f916b6eefdf70d900e4c59febb9f13bf6b76d0545022c0789b",
+    "errors": null,
+    "language": "godot_project",
+    "node_count": 0,
+    "path": "project.godot",
+    "size": 115
+  },
+  {
+    "content_hash": "0d871d1bfe4a545bb3c40492a9215e9927a0e7a32b946cb4fd30140b22ce2b19",
+    "errors": null,
+    "language": "gdscript",
+    "node_count": 6,
+    "path": "stage_manager.gd",
+    "size": 302
+  }
+]

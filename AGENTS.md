@@ -8,7 +8,10 @@ Protocol) stdio server. No AI / vector / LLM anywhere in the binary — output i
 ## Hard invariants (never break)
 
 - **Golden `.schema` byte-stability** — verified by `crates/codegraph-bench/tests/equivalence.rs`
-  against the fixed golden artifacts under `reference/golden/`.
+  against the fixed golden artifacts under `reference/golden/`. Fixtures: the existing upstream
+  corpus plus `reference/golden/godot/` (corpus `crates/codegraph-bench/fixtures/godot/`;
+  guards F1 autoload-call edges + F2 signal-handler edges byte-for-byte).
+  Regen recipe: `docs/equivalence.md` "Godot fixture" section.
 - **node-id formula**: `{kind}:{sha256("{filePath}:{kind}:{name}:{line}").hex[:32]}`; file nodes are the
   literal `file:{relpath}`; lines are 1-based; paths relative with `/`.
 - **No AI / vector / LLM crates** — enforced by `scripts/guardrail.sh` (CI gate):
@@ -19,7 +22,7 @@ Protocol) stdio server. No AI / vector / LLM anywhere in the binary — output i
 
 `codegraph-core` (types/config/logger) · `codegraph-store` (SQLite+FTS5) · `codegraph-extract`
 (tree-sitter walker + embedded + custom extractors) · `codegraph-graph` (traversal + FTS search) ·
-`codegraph-resolve` (import + name matcher + FrameworkResolver extension point) · `codegraph-mcp`
+`codegraph-resolve` (import + name matcher + FrameworkResolver; concrete `GodotResolver` impl — autoload-call + signal-handler resolution) · `codegraph-mcp`
 (stdio JSON-RPC) · `codegraph-cli` (single binary, owns logger; also hosts the `install`/`uninstall`
 agent-config installer in `src/installer/`) · `codegraph-daemon` ·
 `codegraph-watch` · `codegraph-bench` (benchmark harness + golden oracle).
@@ -27,6 +30,39 @@ agent-config installer in `src/installer/`) · `codegraph-daemon` ·
 The published crate is `codegraph-rs` (the `codegraph-cli` package); the installed binary is
 `codegraph`. The library crates publish as `codegraph-{core,store,extract,graph,resolve,mcp,daemon,watch}`.
 `codegraph-bench` is `publish = false`.
+
+## Godot framework resolver (`codegraph-resolve`)
+
+The `GodotResolver` is the first concrete `FrameworkResolver` impl. It fires on
+GDScript files and synthesizes edges that tree-sitter alone cannot produce. Three
+behaviors are active:
+
+- **F1 — autoload-call→func edges**: a call `Autoload.method()` in a `.gd` file
+  emits a `Calls` edge to the UNIQUE same-named `func` in the autoload's bound
+  target script (binding read from `project.godot` `[autoload]` section,
+  `Name="*res://path.gd"` form only). Determinism rule: edge built ONLY when
+  exactly one matching `func` exists in that script; 0 or ≥2 matches → no edge.
+  Files: `crates/codegraph-resolve/src/frameworks/godot.rs`,
+  `crates/codegraph-resolve/src/frameworks/godot_script.rs`.
+
+- **F2 — signal handler extraction**: `connect_handler` now extracts handlers
+  from `.connect(_h.bind(x))` (head segment before `.bind(`) and
+  `Callable(self,"h")`/`Callable(this,"h")` forms, in addition to bare
+  `.connect(_h)`. Other receivers, variable handlers, or non-literal method
+  names stay dynamic sentinels (unresolved). File:
+  `crates/codegraph-resolve/src/frameworks/godot_script.rs`.
+
+- **F3 — impact/affected↔audit unification**: `codegraph impact` (file-node
+  targets) and `codegraph affected` now also consume path-keyed `unresolved_refs`
+  restricted to Godot `ReferenceSubkind`s (`script_attach`, `ext_resource`,
+  `scene_instance`, `group_member`, `signal_method`, `autoload`), so their
+  output agrees with `codegraph audit --impact`. Query-side only; zero extraction
+  change. New function: `dependent_file_paths_unresolved` in
+  `crates/codegraph-store/src/queries.rs`; CLI wired in
+  `crates/codegraph-cli/src/main.rs`.
+
+Full Godot static-analysis scope, static-vs-runtime boundary, and honesty signals:
+[`docs/godot.md`](docs/godot.md).
 
 ## HTTP MCP server: background mode + addr-keyed registry
 

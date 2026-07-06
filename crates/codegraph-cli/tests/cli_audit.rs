@@ -254,3 +254,93 @@ fn audit_exclude_filter_drops_matching_prefixes() {
         run.stdout
     );
 }
+
+// F3: `audit --impact`, `impact`, and `affected` must AGREE on the underlying
+// impact set for a Godot script that a scene mounts via `script = ExtResource`.
+// `main.tscn` has no tree-sitter grammar, so its `ext_resource path="res://player.gd"`
+// ref lives ONLY in `unresolved_refs` (path-keyed) — the lane `audit` already reads
+// and the lane `impact`/`affected` now UNION in. All three surface `main.tscn`.
+#[test]
+fn f3_impact_affected_audit_agree_on_godot_script_attach() {
+    let dir = TestDir::new("f3-godot-agree");
+    let project = indexed_project(&dir);
+    let p = project.to_str().unwrap();
+
+    let audit = run_in(
+        dir.path(),
+        &["audit", "-p", p, "--impact", "player.gd", "--json"],
+    );
+    assert!(audit.ok, "audit --impact must succeed: {}", audit.stderr);
+    let audit_json: serde_json::Value =
+        serde_json::from_str(&audit.stdout).expect("audit emits JSON");
+    let audit_hits_scene = audit_json["impact"]["affected"]
+        .as_array()
+        .expect("impact.affected array")
+        .iter()
+        .any(|a| a["fromFile"].as_str() == Some("main.tscn"));
+    assert!(
+        audit_hits_scene,
+        "audit --impact player.gd must list main.tscn: {}",
+        audit.stdout
+    );
+
+    let impact = run_in(dir.path(), &["impact", "player.gd", "-p", p, "--json"]);
+    assert!(impact.ok, "impact must succeed: {}", impact.stderr);
+    let impact_json: serde_json::Value =
+        serde_json::from_str(&impact.stdout).expect("impact emits JSON");
+    let impact_hits_scene = impact_json["affected"]
+        .as_array()
+        .expect("affected array")
+        .iter()
+        .any(|a| a["filePath"].as_str() == Some("main.tscn"));
+    assert!(
+        impact_hits_scene,
+        "impact player.gd must now surface main.tscn (path-keyed referrer): {}",
+        impact.stdout
+    );
+
+    let affected = run_in(
+        dir.path(),
+        &["affected", "player.gd", "-p", p, "--depth", "5"],
+    );
+    assert!(affected.ok, "affected must succeed: {}", affected.stderr);
+    let affected_json: serde_json::Value =
+        serde_json::from_str(&affected.stdout).expect("affected emits JSON");
+    let traversed = affected_json["totalDependentsTraversed"]
+        .as_u64()
+        .expect("totalDependentsTraversed");
+    assert!(
+        traversed >= 1,
+        "affected player.gd --depth 5 must traverse the main.tscn referrer: {}",
+        affected.stdout
+    );
+}
+
+// F3 no-pollution guard: the path-keyed referrer fold-in fires ONLY when the
+// impact target resolves to a script FILE node, never for a symbol INSIDE a
+// script. Querying the `_on_Close_pressed` function (not the `player.gd` file)
+// must return only its own symbol graph — no synthetic `.tscn`/File rows.
+#[test]
+fn f3_non_godot_impact_unaffected_by_path_keyed_lane() {
+    let dir = TestDir::new("f3-non-godot");
+    let project = indexed_project(&dir);
+    let p = project.to_str().unwrap();
+
+    let impact = run_in(
+        dir.path(),
+        &["impact", "_on_Close_pressed", "-p", p, "--json"],
+    );
+    assert!(impact.ok, "impact must succeed: {}", impact.stderr);
+    let impact_json: serde_json::Value =
+        serde_json::from_str(&impact.stdout).expect("impact emits JSON");
+    let has_file_row = impact_json["affected"]
+        .as_array()
+        .expect("affected array")
+        .iter()
+        .any(|a| a["kind"].as_str() == Some("file"));
+    assert!(
+        !has_file_row,
+        "a symbol-level impact target must not fold in path-keyed File referrers: {}",
+        impact.stdout
+    );
+}
