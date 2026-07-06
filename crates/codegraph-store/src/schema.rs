@@ -135,6 +135,17 @@ CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(kind);
 CREATE INDEX IF NOT EXISTS idx_edges_source_kind ON edges(source, kind);
 CREATE INDEX IF NOT EXISTS idx_edges_target_kind ON edges(target, kind);
 
+-- Edge identity uniqueness (#1034). An edge IS uniquely
+-- (source, target, kind, line, col); insert_edges uses `INSERT OR IGNORE`, but
+-- without something UNIQUE to conflict on it behaved like a plain INSERT, so two
+-- passes emitting the same edge produced byte-identical duplicate rows that
+-- inflated counts and flowed into callers/impact. IFNULL folds the nullable
+-- line/col so coordinate-less edges (synthesized / file-level) dedup too —
+-- SQLite treats each NULL as distinct otherwise. Migration v7 dedups existing
+-- rows and adds this on older databases.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_identity
+  ON edges(source, target, kind, IFNULL(line, -1), IFNULL(col, -1));
+
 -- File indexes
 CREATE INDEX IF NOT EXISTS idx_files_language ON files(language);
 CREATE INDEX IF NOT EXISTS idx_files_modified_at ON files(modified_at);

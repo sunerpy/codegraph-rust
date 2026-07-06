@@ -100,6 +100,8 @@ END;
 CREATE INDEX idx_edges_kind ON edges(kind);
 CREATE INDEX idx_edges_source_kind ON edges(source, kind);
 CREATE INDEX idx_edges_target_kind ON edges(target, kind);
+CREATE UNIQUE INDEX idx_edges_identity
+  ON edges(source, target, kind, IFNULL(line, -1), IFNULL(col, -1));
 CREATE INDEX idx_files_language ON files(language);
 CREATE INDEX idx_files_modified_at ON files(modified_at);
 CREATE INDEX idx_unresolved_from_node ON unresolved_refs(from_node_id);

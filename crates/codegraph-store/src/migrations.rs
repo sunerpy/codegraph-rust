@@ -2,7 +2,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::schema::BASE_SCHEMA;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 6;
+pub const CURRENT_SCHEMA_VERSION: i64 = 7;
 pub const FRESH_SCHEMA_DESCRIPTION: &str = "Initial schema includes all migrations";
 
 const MIGRATIONS: &[Migration] = &[
@@ -49,6 +49,19 @@ const MIGRATIONS: &[Migration] = &[
         description: "Add unresolved_refs.reference_subkind — structural extraction label (Godot edge subkind)",
         sql: r#"
         ALTER TABLE unresolved_refs ADD COLUMN reference_subkind TEXT;
+      "#,
+    },
+    Migration {
+        version: 7,
+        description: "Dedup duplicate edge rows and add a UNIQUE identity index so INSERT OR IGNORE actually dedups (#1034)",
+        sql: r#"
+        DELETE FROM edges
+        WHERE id NOT IN (
+          SELECT MIN(id) FROM edges
+          GROUP BY source, target, kind, IFNULL(line, -1), IFNULL(col, -1)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_identity
+          ON edges(source, target, kind, IFNULL(line, -1), IFNULL(col, -1));
       "#,
     },
 ];
@@ -243,7 +256,7 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE schema_versions (version INTEGER PRIMARY KEY, applied_at INTEGER, description TEXT);
              CREATE TABLE unresolved_refs (id INTEGER PRIMARY KEY AUTOINCREMENT, from_node_id TEXT, reference_name TEXT, reference_kind TEXT, line INTEGER, col INTEGER, candidates TEXT);
-             CREATE TABLE edges (id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT, target TEXT, kind TEXT);
+             CREATE TABLE edges (id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT, target TEXT, kind TEXT, metadata TEXT, line INTEGER, col INTEGER);
              CREATE TABLE nodes (id TEXT PRIMARY KEY, name TEXT);
              CREATE INDEX idx_edges_source ON edges(source);
              CREATE INDEX idx_edges_target ON edges(target);
@@ -270,5 +283,123 @@ mod tests {
             .filter_map(Result::ok)
             .collect();
         names.iter().any(|n| n == column)
+    }
+
+    fn has_index(conn: &Connection, name: &str) -> bool {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+            params![name],
+            |_| Ok(()),
+        )
+        .optional()
+        .unwrap()
+        .is_some()
+    }
+
+    fn edge_ids(conn: &Connection) -> Vec<i64> {
+        let mut stmt = conn.prepare("SELECT id FROM edges ORDER BY id").unwrap();
+        stmt.query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
+    }
+
+    #[test]
+    fn fresh_schema_dedups_duplicate_edge_identities() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        ensure_schema_and_migrations(&mut conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO nodes (id, kind, name, qualified_name, file_path, language, start_line, end_line, start_column, end_column, updated_at)
+             VALUES ('function:a','function','a','a','a.rs','rust',1,1,0,0,0),
+                    ('function:b','function','b','b','a.rs','rust',2,2,0,0,0);",
+        )
+        .unwrap();
+
+        let stmt = "INSERT OR IGNORE INTO edges (source, target, kind, metadata, line, col, provenance) VALUES ('function:a','function:b','calls',NULL,5,3,NULL)";
+        conn.execute_batch(stmt).unwrap();
+        conn.execute_batch(stmt).unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "INSERT OR IGNORE must dedup identical edge identity"
+        );
+    }
+
+    #[test]
+    fn fresh_schema_dedups_null_coordinate_edge_identities() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        ensure_schema_and_migrations(&mut conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO nodes (id, kind, name, qualified_name, file_path, language, start_line, end_line, start_column, end_column, updated_at)
+             VALUES ('file:a.rs','file','a.rs','a.rs','a.rs','rust',1,1,0,0,0),
+                    ('function:a','function','a','a','a.rs','rust',2,2,0,0,0);",
+        )
+        .unwrap();
+
+        let stmt = "INSERT OR IGNORE INTO edges (source, target, kind, metadata, line, col, provenance) VALUES ('file:a.rs','function:a','contains',NULL,NULL,NULL,NULL)";
+        conn.execute_batch(stmt).unwrap();
+        conn.execute_batch(stmt).unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "IFNULL folding must dedup coordinate-less (NULL line/col) edges"
+        );
+    }
+
+    #[test]
+    fn migration_v7_dedups_existing_edges_keeping_lowest_id() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        seed_v6_schema_with_duplicate_edges(&conn);
+        assert_eq!(get_current_version(&conn).unwrap(), 6);
+        assert!(!has_index(&conn, "idx_edges_identity"));
+
+        run_pending_migrations(&mut conn).unwrap();
+
+        assert_eq!(get_current_version(&conn).unwrap(), 7);
+        assert!(has_index(&conn, "idx_edges_identity"));
+
+        assert_eq!(
+            edge_ids(&conn),
+            vec![1, 3, 5],
+            "dedup keeps the lowest id per identity group deterministically"
+        );
+    }
+
+    #[test]
+    fn migration_v7_is_idempotent_on_already_unique_edges() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        ensure_schema_and_migrations(&mut conn).unwrap();
+        assert_eq!(get_current_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
+        assert!(has_index(&conn, "idx_edges_identity"));
+
+        ensure_schema_and_migrations(&mut conn).unwrap();
+        assert_eq!(get_current_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
+    }
+
+    // Builds a v6-shaped DB (edges table with no UNIQUE identity index) holding
+    // three identity groups, each with a duplicate at a HIGHER id, so the v7
+    // dedup's "keep MIN(id)" behaviour is observable. One group has NULL line/col
+    // to exercise the IFNULL folding in the GROUP BY.
+    fn seed_v6_schema_with_duplicate_edges(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE schema_versions (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL, description TEXT);
+             CREATE TABLE nodes (id TEXT PRIMARY KEY, name TEXT);
+             CREATE TABLE edges (id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, target TEXT NOT NULL, kind TEXT NOT NULL, metadata TEXT, line INTEGER, col INTEGER, provenance TEXT DEFAULT NULL);
+             INSERT INTO schema_versions (version, applied_at, description) VALUES (6, 0, 'v6');
+             INSERT INTO edges (id, source, target, kind, line, col) VALUES
+               (1,'a','b','calls',5,3),
+               (2,'a','b','calls',5,3),
+               (3,'a','b','references',5,3),
+               (4,'a','b','references',5,3),
+               (5,'f','g','contains',NULL,NULL),
+               (6,'f','g','contains',NULL,NULL);",
+        )
+        .unwrap();
     }
 }
