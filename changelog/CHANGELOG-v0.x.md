@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.25.5](https://github.com/sunerpy/codegraph-rust/compare/v0.25.4...v0.25.5) (2026-07-06)
+
+
+### Bug Fixes
+
+* **extract:** recover garbled C++ names, skip forward decls, and record stack construction ([#115](https://github.com/sunerpy/codegraph-rust/issues/115)) ([530270c](https://github.com/sunerpy/codegraph-rust/commit/530270ca289a10f18cf954fc535d9493fadb24c3))
+
 ## [0.25.4](https://github.com/sunerpy/codegraph-rust/compare/v0.25.3...v0.25.4) (2026-07-06)
 
 
