@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.28.0](https://github.com/sunerpy/codegraph-rust/compare/v0.27.0...v0.28.0) (2026-07-07)
+
+
+### Features
+
+* **mcp:** rescue a callable's buried signature types in explore ([#1064](https://github.com/sunerpy/codegraph-rust/issues/1064)) ([#123](https://github.com/sunerpy/codegraph-rust/issues/123)) ([7afa2f9](https://github.com/sunerpy/codegraph-rust/commit/7afa2f90fda2adc7e96170989339dcd4b8df67c2))
+
 ## [0.27.0](https://github.com/sunerpy/codegraph-rust/compare/v0.26.0...v0.27.0) (2026-07-07)
 
 
