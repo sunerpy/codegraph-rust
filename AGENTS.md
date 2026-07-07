@@ -67,7 +67,12 @@ behaviors are active:
   output agrees with `codegraph audit --impact`. Query-side only; zero extraction
   change. New function: `dependent_file_paths_unresolved` in
   `crates/codegraph-store/src/queries.rs`; CLI wired in
-  `crates/codegraph-cli/src/main.rs`.
+  `crates/codegraph-cli/src/main.rs`. `codegraph affected` additionally emits an
+  `affectedFiles` key — the sorted+deduped union of every traversed dependent
+  plus the test-file set (`affectedFiles ⊇ affectedTests`) — so it LISTS the
+  complete affected set instead of only counting it via
+  `totalDependentsTraversed`. Additive: `changedFiles`, `affectedTests`,
+  `totalDependentsTraversed` are byte-for-byte unchanged.
 
 Full Godot static-analysis scope, static-vs-runtime boundary, and honesty signals:
 [`docs/godot.md`](docs/godot.md).

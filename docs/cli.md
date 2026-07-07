@@ -54,6 +54,15 @@
 > would be enormous and would make a home-launched `serve --mcp` peg a CPU. Run
 > these commands inside a specific project directory.
 
+> **`affected` output fields.** `codegraph affected` always emits JSON on stdout
+> (there is no `--json` flag). Its keys are `changedFiles` (the input files),
+> `affectedTests` (only the traversed dependents that look like test files, per
+> `--filter` or the default test-path heuristics), `affectedFiles` (the
+> sorted+deduped union of ALL traversed dependents plus the test set, so
+> `affectedFiles ⊇ affectedTests`), and `totalDependentsTraversed` (the traversal
+> count). `affectedFiles` LISTS the complete affected set — agreeing with
+> `impact` / `audit --impact` — where previously only the count was surfaced.
+
 ---
 
 ## `codegraph install` / `uninstall` — wire up AI agents
