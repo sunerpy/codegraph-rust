@@ -13,8 +13,11 @@ Protocol) stdio server. No AI / vector / LLM anywhere in the binary — output i
   guards F1 autoload-call edges + F2 signal-handler edges byte-for-byte) and
   `reference/golden/ruby/` (corpus `crates/codegraph-bench/fixtures/ruby/`; guards #1110
   Ruby `receiver.method` extraction — instance/class-method Calls, `Const.new` Instantiates,
-  bare `include` Implements — byte-for-byte).
-  Regen recipe: `docs/equivalence.md` "Godot fixture" / "Ruby fixture" sections.
+  bare `include` Implements — byte-for-byte) and `reference/golden/cpp/`
+  (corpus `crates/codegraph-bench/fixtures/cpp/`; guards #1043 C++ class/struct
+  inheritance incl. templated-base stripping byte-for-byte, and retroactively
+  the earlier C++ extraction work).
+  Regen recipe: `docs/equivalence.md` "Godot fixture" / "Ruby fixture" / "C++ fixture" sections.
 - **node-id formula**: `{kind}:{sha256("{filePath}:{kind}:{name}:{line}").hex[:32]}`; file nodes are the
   literal `file:{relpath}`; lines are 1-based; paths relative with `/`.
 - **No AI / vector / LLM crates** — enforced by `scripts/guardrail.sh` (CI gate):
@@ -24,9 +27,11 @@ Protocol) stdio server. No AI / vector / LLM anywhere in the binary — output i
 ## Workspace layout (10 crates)
 
 `codegraph-core` (types/config/logger) · `codegraph-store` (SQLite+FTS5) · `codegraph-extract`
-(tree-sitter walker + embedded + custom extractors) · `codegraph-graph` (traversal + FTS search) ·
+(tree-sitter walker + embedded + custom extractors; incl. C++ `base_class_clause` → `Extends`
+inheritance extraction with templated-base stripping, #1043) · `codegraph-graph` (traversal + FTS search) ·
 `codegraph-resolve` (import + name matcher + FrameworkResolver; concrete `GodotResolver` impl — autoload-call + signal-handler resolution) · `codegraph-mcp`
-(stdio JSON-RPC) · `codegraph-cli` (single binary, owns logger; also hosts the `install`/`uninstall`
+(stdio JSON-RPC; `codegraph_explore` runs a change-surface rescue, #1064, that surfaces a
+callable's buried parameter/return-type files into the explored subgraph) · `codegraph-cli` (single binary, owns logger; also hosts the `install`/`uninstall`
 agent-config installer in `src/installer/`) · `codegraph-daemon` ·
 `codegraph-watch` · `codegraph-bench` (benchmark harness + golden oracle).
 
