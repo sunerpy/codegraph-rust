@@ -4,7 +4,7 @@
 //! keep the `WorkerGuard` alive, then run the requested command. Library crates
 //! only emit tracing events.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -2533,11 +2533,19 @@ fn cmd_affected(
             }
         }
     }
-    let mut sorted = affected.into_iter().collect::<Vec<_>>();
+    let mut sorted = affected.iter().cloned().collect::<Vec<_>>();
     sorted.sort();
+    let affected_files = traversed
+        .iter()
+        .chain(affected.iter())
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
     print_json_pretty(&json!({
         "changedFiles": files,
         "affectedTests": sorted,
+        "affectedFiles": affected_files,
         "totalDependentsTraversed": traversed.len(),
     }))?;
     Ok(())

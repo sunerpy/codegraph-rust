@@ -252,6 +252,14 @@ on incoming graph edges.
 [res:// .tscn], reasons: [{file, line, edgeKind, edgeSubkind?}] }`. A pure CLI
   reshape of the impact data — useful for "what must I reload/reopen after
   editing this resource?".
+- **Affected** (`codegraph affected <path>`) — the file-level counterpart of
+  impact for changed files. It always emits JSON on stdout (no `--json` flag)
+  with `changedFiles`, `affectedTests` (traversed dependents that look like test
+  files), `affectedFiles`, and `totalDependentsTraversed`. `affectedFiles` is the
+  sorted+deduped union of every traversed dependent plus the test set
+  (`affectedFiles ⊇ affectedTests`), so for a Godot project with no test files it
+  still LISTS the dependent scenes/resources instead of only counting them —
+  bringing `affected` into agreement with `impact` / `audit --impact`.
 
 This is a static structural report. Runtime `ResourceLoader` load-verification is
 out of scope (that is Godot MCP Pro's job). See [`cli.md`](cli.md) for the full
