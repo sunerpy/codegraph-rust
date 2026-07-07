@@ -1,0 +1,12 @@
+[
+  {
+    "candidates": null,
+    "col": 17,
+    "file_path": "derived.cpp",
+    "from_node_id": "class:b28eae813de1699c6b7d7727db856721",
+    "language": "cpp",
+    "line": 22,
+    "reference_kind": "extends",
+    "reference_name": "ns::Tpl"
+  }
+]
