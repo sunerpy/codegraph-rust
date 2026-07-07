@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.27.0](https://github.com/sunerpy/codegraph-rust/compare/v0.26.0...v0.27.0) (2026-07-07)
+
+
+### Features
+
+* **extract:** extract C++ class/struct inheritance incl. templated bases ([#1043](https://github.com/sunerpy/codegraph-rust/issues/1043)) ([#121](https://github.com/sunerpy/codegraph-rust/issues/121)) ([3657f15](https://github.com/sunerpy/codegraph-rust/commit/3657f1573c4a9195b55dc67caea74ef6e3d1a0f5))
+
 ## [0.26.0](https://github.com/sunerpy/codegraph-rust/compare/v0.25.6...v0.26.0) (2026-07-06)
 
 
