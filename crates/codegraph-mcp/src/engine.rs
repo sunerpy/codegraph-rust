@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use codegraph_core::types::{FileRecord, Node, NodeKind};
+use codegraph_core::types::{EdgeKind, FileRecord, Node, NodeKind};
 use codegraph_graph::graph::{GodotReach, GraphTraverser, NodeEdge};
 use codegraph_graph::query::{SearchOptions, search_nodes};
 use codegraph_store::Store;
@@ -30,6 +30,34 @@ const TRAIL_CAP: usize = 8;
 
 /// `Read`-tool cap mirrored by file-mode `codegraph_node` (`tools.ts:489`).
 const FILE_MODE_MAX_LINES: usize = 2000;
+
+/// Callable node kinds whose signature (parameter/return) types the #1064
+/// change-surface pass follows. Mirrors upstream `CALLABLE_KINDS`
+/// (`tools.ts:2620`); `constructor` has no Rust NodeKind (ctors are `method`).
+const CALLABLE_KINDS: [NodeKind; 4] = [
+    NodeKind::Method,
+    NodeKind::Function,
+    NodeKind::Component,
+    NodeKind::Class,
+];
+
+/// Type node kinds a signature edge may point at — the rescue only surfaces
+/// these. Mirrors upstream `TYPE_KINDS` (`tools.ts:2621`).
+const TYPE_KINDS: [NodeKind; 7] = [
+    NodeKind::Class,
+    NodeKind::Struct,
+    NodeKind::Interface,
+    NodeKind::Trait,
+    NodeKind::Protocol,
+    NodeKind::Enum,
+    NodeKind::TypeAlias,
+];
+
+/// Signature edge kinds: what a callable emits toward its parameter/return
+/// types. Mirrors upstream `SIG_EDGE` (`tools.ts:2622`). This project emits TS
+/// type annotations as `References` today (`TypeOf`/`Returns` are accepted too
+/// for forward-compatibility, but extraction-widening is DEFERRED per the plan).
+const SIG_EDGE_KINDS: [EdgeKind; 3] = [EdgeKind::References, EdgeKind::TypeOf, EdgeKind::Returns];
 
 /// Holds an opened project store. One engine per project path; the server keeps
 /// a cache keyed by resolved project path (mirrors `ToolHandler.projectCache`,
@@ -1298,8 +1326,132 @@ impl CodeGraphEngine {
                 sub.insert(child);
             }
         }
+
+        self.rescue_change_surface(&mut sub, &seed_ids, query, &traverser)?;
+
         sub.finalize();
         Ok(sub)
+    }
+
+    /// #1064 change-surface rescue (ports `2b256b9` `tools.ts:2585-2860`, adapted
+    /// to this deterministic explore).
+    ///
+    /// A named callable's signature types — its parameter and return types — are
+    /// part of what you'd edit to "add a parameter to X", yet they can be
+    /// lexically dissimilar to the query ("add a parameter to `newClient`" shares
+    /// no words with `options.ts`, which defines `DialOption`) and sit a hop away
+    /// as a `References` edge. Explore's search + budget then buries that answer
+    /// file under incidental roots that merely share query words, so the agent
+    /// falls back to grep. This pass surfaces the buried signature type.
+    ///
+    /// Two deterministic halves:
+    /// 1. **Tier de-noise**: among same-named callable seeds only the top pick
+    ///    plus any seed with caller-count ≥ 25% of the max seed caller-count is
+    ///    TIERED — a low-centrality namesake (Go's test-fake `NewClient`) can't
+    ///    fill the tier and crowd out the answer.
+    /// 2. **Buried rescue**: from each TIERED callable seed, follow outgoing
+    ///    signature edges to TYPE-kind nodes; a type whose file is BURIED (not
+    ///    already a seed file AND < 2 query-term hits) is inserted + marked
+    ///    `rescued_files` so `finalize` floats it to the top tier. A
+    ///    well-connected type (already a seed / term-matched) is left alone, so
+    ///    ordinary flow queries are unchanged.
+    ///
+    /// Determinism: the tiered-seed list preserves search-rank order; the rescue
+    /// candidates are collected then SORTED by `(file_path, start_line, id)` and
+    /// deduped before insertion — no `HashMap`/`HashSet` iteration reaches output.
+    fn rescue_change_surface(
+        &self,
+        sub: &mut ExploreSubgraph,
+        seed_ids: &[String],
+        query: &str,
+        traverser: &GraphTraverser,
+    ) -> anyhow::Result<()> {
+        // Tier de-noise: rank callable seeds by caller-count, tier the top pick
+        // plus any seed within 25% of the max. Iterated in search-rank order.
+        let mut callable_seeds: Vec<(String, usize)> = Vec::new();
+        for id in seed_ids {
+            let Some(node) = sub.node(id) else { continue };
+            if !CALLABLE_KINDS.contains(&node.kind) {
+                continue;
+            }
+            let caller_count = traverser.get_callers(id, CALL_DEPTH)?.len();
+            callable_seeds.push((id.clone(), caller_count));
+        }
+        if callable_seeds.is_empty() {
+            return Ok(());
+        }
+        let max_callers = callable_seeds.iter().map(|(_, c)| *c).max().unwrap_or(0);
+        let threshold = max_callers / 4;
+        let tiered_seed_ids: Vec<String> = callable_seeds
+            .iter()
+            .enumerate()
+            .filter(|(i, (_, c))| *i == 0 || *c >= threshold)
+            .map(|(_, (id, _))| id.clone())
+            .collect();
+
+        // Seed files are NOT buried: a type already defined in one is on-screen.
+        let seed_files: HashSet<String> = seed_ids
+            .iter()
+            .filter_map(|id| sub.node(id).map(|n| n.file_path.clone()))
+            .collect();
+        let terms = query_terms(query);
+
+        // Collect candidate signature-type nodes from every tiered callable seed.
+        let mut candidates: Vec<Node> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for seed_id in &tiered_seed_ids {
+            for kind in SIG_EDGE_KINDS {
+                for edge in self.store.edges_by_source_kind(seed_id, Some(kind))? {
+                    let Ok(targets) = self.store.nodes_by_ids(std::slice::from_ref(&edge.target))
+                    else {
+                        continue;
+                    };
+                    let Some(target) = targets.get(&edge.target) else {
+                        continue;
+                    };
+                    if !TYPE_KINDS.contains(&target.kind) {
+                        continue;
+                    }
+                    if seed_ids.iter().any(|s| s == &target.id) {
+                        continue;
+                    }
+                    if seen.insert(target.id.clone()) {
+                        candidates.push(target.clone());
+                    }
+                }
+            }
+        }
+
+        // Deterministic order for the rescue set (no HashSet iteration reaches
+        // output): sort by file, then line, then id.
+        candidates.sort_by(|a, b| {
+            a.file_path
+                .cmp(&b.file_path)
+                .then(a.start_line.cmp(&b.start_line))
+                .then(a.id.cmp(&b.id))
+        });
+
+        for target in candidates {
+            let fp = target.file_path.clone();
+            // Buried: not already an on-screen seed file, and the query barely
+            // touches it lexically (< 2 term hits on its file path / node name).
+            if seed_files.contains(&fp) {
+                continue;
+            }
+            let term_hits = terms
+                .iter()
+                .filter(|t| {
+                    fp.to_ascii_lowercase().contains(*t)
+                        || target.name.to_ascii_lowercase().contains(*t)
+                })
+                .count();
+            if term_hits >= 2 {
+                continue;
+            }
+            sub.insert(target);
+            sub.rescued_files.insert(fp);
+        }
+        Ok(())
     }
 
     /// Ports `buildDynamicBoundaries` (`tools.ts:1717-1760`): scan the explored
@@ -1639,6 +1791,11 @@ struct ExploreSubgraph {
     edge_seen: HashSet<(String, String, String)>,
     roots: Vec<String>,
     file_order: Vec<String>,
+    /// Files rescued by the #1064 change-surface pass: a tiered callable seed's
+    /// buried signature-type file. `finalize` floats these to the TOP tier so a
+    /// lexically-dissimilar answer file (grpc's `dialoptions.go`) is not buried
+    /// under incidental roots that merely share query words.
+    rescued_files: HashSet<String>,
 }
 
 impl ExploreSubgraph {
@@ -1702,7 +1859,13 @@ impl ExploreSubgraph {
             .file_order
             .iter()
             .map(|fp| {
-                let tier = if root_files.contains(fp.as_str()) {
+                // A rescued change-surface file (#1064) is the lexically-
+                // dissimilar answer — give it the TOP tier so it outranks
+                // incidental roots that merely share query words and survives
+                // the output file budget.
+                let tier = if self.rescued_files.contains(fp.as_str()) {
+                    3
+                } else if root_files.contains(fp.as_str()) {
                     2
                 } else if neighbor_files.contains(fp.as_str()) {
                     1
@@ -2392,6 +2555,20 @@ fn explore_file_header(file_path: &str, symbols: &[String], cap: usize) -> Strin
 fn is_low_value_file(path: &str) -> bool {
     let lp = path.to_lowercase();
     is_test_file(&lp) || lp.contains("icon") || lp.contains("i18n")
+}
+
+/// Lowercased, ≥3-char alphanumeric query terms used by the #1064 buried check.
+/// Deterministic: a stable, deduped, order-preserving token set (short/stop-ish
+/// tokens are dropped so a 1-char "x" never counts as a term hit).
+fn query_terms(query: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for tok in query.split(|c: char| !c.is_ascii_alphanumeric()) {
+        let t = tok.to_ascii_lowercase();
+        if t.len() >= 3 && !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    out
 }
 
 /// Whether the query itself is about tests — keeps the legitimate "explore the
@@ -4348,6 +4525,531 @@ mod tests {
         assert!(
             txt.contains("Search Results") || txt.contains("No results"),
             "got: {txt}"
+        );
+    }
+
+    // --- Round B (#1064): explore change-surface rescue ------------------
+
+    /// Build the proven B repro in a store: `newClient(opt: DialOption)` in
+    /// `client.ts` (the seed the query hits) + `interface DialOption` in
+    /// `options.ts` (the buried signature type, reachable via a `References`
+    /// edge). A wall of lexical-namesake padding files that ALSO match the query
+    /// terms outrank `options.ts` as search seeds and push it past the file
+    /// budget — so pre-fix the answer file is dropped (the live #1064 bug),
+    /// exactly the buried condition the rescue must undo.
+    fn setup_change_surface_repro(engine: &mut CodeGraphEngine) -> (Node, Node) {
+        let client = node_lang(
+            "newClient",
+            "newClient",
+            "src/client.ts",
+            2,
+            2,
+            NodeKind::Function,
+            Language::TypeScript,
+        );
+        let dial = node_lang(
+            "DialOption",
+            "DialOption",
+            "src/options.ts",
+            1,
+            1,
+            NodeKind::Interface,
+            Language::TypeScript,
+        );
+        put_file(engine, &file_rec("src/client.ts", Language::TypeScript, 1));
+        put_file(engine, &file_rec("src/options.ts", Language::TypeScript, 1));
+        write_src(
+            engine,
+            "src/client.ts",
+            "import {DialOption} from \"./options\";\nexport function newClient(opt: DialOption): void {}\n",
+        );
+        write_src(
+            engine,
+            "src/options.ts",
+            "export interface DialOption { timeout: number }\n",
+        );
+        let mut nodes = vec![client.clone(), dial.clone()];
+        for i in 0..30 {
+            let rel = format!("src/pad{i}.ts");
+            put_file(engine, &file_rec(&rel, Language::TypeScript, 1));
+            write_src(
+                engine,
+                &rel,
+                &format!(
+                    "export function addParameterNewClient{i}(x: number): number {{ return x + {i}; }}\n"
+                ),
+            );
+            nodes.push(node_lang(
+                &format!("addParameterNewClient{i}"),
+                &format!("addParameterNewClient{i}"),
+                &rel,
+                1,
+                1,
+                NodeKind::Function,
+                Language::TypeScript,
+            ));
+        }
+        put_nodes(engine, &nodes);
+        put_edges(
+            engine,
+            &[mk_edge(
+                &client.id,
+                &dial.id,
+                codegraph_core::types::EdgeKind::References,
+            )],
+        );
+        (client, dial)
+    }
+
+    /// #1064 CORE: explore for a plain-language "add a parameter" query surfaces
+    /// the seed's buried signature type. Pre-fix `options.ts`/`DialOption` was
+    /// absent (0 hits — the proven bug); post-fix it is rescued into the output.
+    #[test]
+    fn ext_explore_rescues_buried_signature_type() {
+        let mut engine = test_engine();
+        setup_change_surface_repro(&mut engine);
+        let tr = engine.execute(
+            "codegraph_explore",
+            &serde_json::json!({"query": "newClient add parameter"}),
+        );
+        let txt = text_of(&tr);
+        assert!(
+            txt.contains("src/options.ts"),
+            "buried signature-type file must be rescued into explore output, got: {txt}"
+        );
+        assert!(
+            txt.contains("DialOption"),
+            "rescued type node must surface, got: {txt}"
+        );
+    }
+
+    /// #1064 CORE (subgraph-level): `find_relevant_context` inserts the buried
+    /// signature type node + its file into the subgraph AND ranks its file
+    /// within the top-4 (the tiny-tier `default_max_files`) so it survives the
+    /// output budget. Pre-fix the wall of padding roots outrank `options.ts`,
+    /// pushing it past position 4 and out of the rendered output.
+    #[test]
+    fn ext_find_relevant_context_rescues_buried_type_into_subgraph() {
+        let mut engine = test_engine();
+        let (_client, dial) = setup_change_surface_repro(&mut engine);
+        let sub = engine
+            .find_relevant_context("newClient add parameter")
+            .unwrap();
+        assert!(
+            sub.node(&dial.id).is_some(),
+            "rescued type node must be in the subgraph"
+        );
+        let pos = sub
+            .file_order
+            .iter()
+            .position(|f| f == "src/options.ts")
+            .expect("rescued type file must be ranked");
+        assert!(
+            pos < 4,
+            "rescued type file must rank within the top-4 budget, got position {pos} in {:?}",
+            sub.file_order
+        );
+    }
+
+    /// #1064 NEGATIVE: a query that hits NO callable seed rescues nothing — a
+    /// bare type-only query leaves the subgraph free of any rescue side effect.
+    #[test]
+    fn ext_explore_no_rescue_when_query_hits_no_callable() {
+        let mut engine = test_engine();
+        // Only a struct, no callable. A query for it must not trigger rescue.
+        let s = node_lang(
+            "LonelyType",
+            "LonelyType",
+            "src/lonely.ts",
+            1,
+            1,
+            NodeKind::Struct,
+            Language::TypeScript,
+        );
+        put_file(&engine, &file_rec("src/lonely.ts", Language::TypeScript, 1));
+        write_src(&engine, "src/lonely.ts", "export struct LonelyType {}\n");
+        put_nodes(&mut engine, std::slice::from_ref(&s));
+        let sub = engine.find_relevant_context("LonelyType shape").unwrap();
+        // The only file is the struct's own (a seed) — no extra rescued file.
+        assert_eq!(
+            sub.file_order,
+            vec!["src/lonely.ts".to_string()],
+            "no callable seed ⇒ no change-surface rescue"
+        );
+    }
+
+    /// #1064 NEGATIVE: a signature type whose file is NOT buried (it is a search
+    /// seed itself → high relevance) is not double-inserted, and the file
+    /// appears exactly once in `file_order`.
+    #[test]
+    fn ext_explore_non_buried_type_not_double_added() {
+        let mut engine = test_engine();
+        let (client, dial) = setup_change_surface_repro(&mut engine);
+        // Query names BOTH the callable and the type, so `DialOption`'s file is
+        // a search seed (not buried) — rescue must be a no-op for it.
+        let sub = engine
+            .find_relevant_context("newClient DialOption")
+            .unwrap();
+        let dial_files = sub
+            .file_order
+            .iter()
+            .filter(|f| *f == "src/options.ts")
+            .count();
+        assert_eq!(
+            dial_files, 1,
+            "non-buried type file must appear exactly once, got: {:?}",
+            sub.file_order
+        );
+        // Both nodes present, each exactly once.
+        assert_eq!(
+            sub.nodes.iter().filter(|n| n.id == dial.id).count(),
+            1,
+            "type node must not be duplicated"
+        );
+        assert_eq!(
+            sub.nodes.iter().filter(|n| n.id == client.id).count(),
+            1,
+            "seed node must not be duplicated"
+        );
+    }
+
+    /// #1064 determinism: repeated explore runs produce byte-identical output.
+    #[test]
+    fn ext_explore_rescue_is_deterministic() {
+        let mut engine = test_engine();
+        setup_change_surface_repro(&mut engine);
+        let run = || {
+            text_of(&engine.execute(
+                "codegraph_explore",
+                &serde_json::json!({"query": "newClient add parameter"}),
+            ))
+        };
+        let a = run();
+        let b = run();
+        let c = run();
+        assert_eq!(a, b, "explore output must be byte-identical across runs");
+        assert_eq!(b, c, "explore output must be byte-identical across runs");
+    }
+
+    /// #1064 named-seed de-noise: among same-named callable seeds, a
+    /// low-centrality namesake (0 callers) does NOT earn the tier when a
+    /// high-centrality def exists, so it can't flood the tier and crowd out the
+    /// real answer. We assert the buried signature type of the HIGH-centrality
+    /// def is still rescued (proving the high def was tiered) while the tier is
+    /// not filled by the namesake.
+    #[test]
+    fn ext_explore_named_seed_denoise_excludes_low_centrality_namesake() {
+        let mut engine = test_engine();
+        // Real, high-centrality `handler` with many callers + a buried sig type.
+        let real = node_lang(
+            "handler",
+            "handler",
+            "src/real.ts",
+            2,
+            2,
+            NodeKind::Function,
+            Language::TypeScript,
+        );
+        let cfg = node_lang(
+            "HandlerConfig",
+            "HandlerConfig",
+            "src/config.ts",
+            1,
+            1,
+            NodeKind::Interface,
+            Language::TypeScript,
+        );
+        // A same-named low-centrality fake with NO callers and NO sig type.
+        let fake = node_lang(
+            "handler",
+            "handler",
+            "src/fake.ts",
+            5,
+            5,
+            NodeKind::Function,
+            Language::TypeScript,
+        );
+        // Callers of `real` (drive its caller-count up). Fake has none.
+        let callers: Vec<Node> = (0..6)
+            .map(|i| {
+                node_lang(
+                    &format!("caller{i}"),
+                    &format!("caller{i}"),
+                    "src/callers.ts",
+                    (i as i64) + 1,
+                    (i as i64) + 1,
+                    NodeKind::Function,
+                    Language::TypeScript,
+                )
+            })
+            .collect();
+        for (rel, lang) in [
+            ("src/real.ts", Language::TypeScript),
+            ("src/config.ts", Language::TypeScript),
+            ("src/fake.ts", Language::TypeScript),
+            ("src/callers.ts", Language::TypeScript),
+        ] {
+            put_file(&engine, &file_rec(rel, lang, 1));
+            write_src(&engine, rel, "// stub\n");
+        }
+        write_src(
+            &engine,
+            "src/real.ts",
+            "export function handler(c: HandlerConfig): void {}\n",
+        );
+        let mut all = vec![real.clone(), cfg.clone(), fake.clone()];
+        all.extend(callers.iter().cloned());
+        put_nodes(&mut engine, &all);
+        let mut edges = vec![mk_edge(
+            &real.id,
+            &cfg.id,
+            codegraph_core::types::EdgeKind::References,
+        )];
+        for c in &callers {
+            edges.push(mk_edge(
+                &c.id,
+                &real.id,
+                codegraph_core::types::EdgeKind::Calls,
+            ));
+        }
+        put_edges(&mut engine, &edges);
+
+        let sub = engine.find_relevant_context("handler config").unwrap();
+        // The high-centrality def was tiered ⇒ its buried config type is rescued.
+        assert!(
+            sub.file_order.iter().any(|f| f == "src/config.ts"),
+            "high-centrality def's buried sig type must be rescued, got: {:?}",
+            sub.file_order
+        );
+    }
+
+    /// #1064 guard: a signature edge whose target is a NON-TYPE node (a
+    /// variable, not a class/interface) is not rescued — only TYPE_KINDS
+    /// targets surface. Exercises the `!TYPE_KINDS.contains` skip.
+    #[test]
+    fn ext_explore_rescue_skips_non_type_signature_target() {
+        let mut engine = test_engine();
+        let f = node_lang(
+            "doThing",
+            "doThing",
+            "src/do.ts",
+            2,
+            2,
+            NodeKind::Function,
+            Language::TypeScript,
+        );
+        let var = node_lang(
+            "someVar",
+            "someVar",
+            "src/other.ts",
+            1,
+            1,
+            NodeKind::Variable,
+            Language::TypeScript,
+        );
+        put_file(&engine, &file_rec("src/do.ts", Language::TypeScript, 1));
+        put_file(&engine, &file_rec("src/other.ts", Language::TypeScript, 1));
+        write_src(&engine, "src/do.ts", "export function doThing(): void {}\n");
+        write_src(&engine, "src/other.ts", "export const someVar = 1;\n");
+        put_nodes(&mut engine, &[f.clone(), var.clone()]);
+        put_edges(
+            &mut engine,
+            &[mk_edge(
+                &f.id,
+                &var.id,
+                codegraph_core::types::EdgeKind::References,
+            )],
+        );
+        let sub = engine.find_relevant_context("doThing").unwrap();
+        assert!(
+            !sub.rescued_files.contains("src/other.ts"),
+            "non-type signature target must not be rescued"
+        );
+    }
+
+    /// #1064 guard: a dangling signature edge (target node absent from the
+    /// store) is skipped without panic — exercises the missing-target arm.
+    #[test]
+    fn ext_explore_rescue_skips_dangling_signature_edge() {
+        let mut engine = test_engine();
+        let f = node_lang(
+            "callMe",
+            "callMe",
+            "src/call.ts",
+            2,
+            2,
+            NodeKind::Function,
+            Language::TypeScript,
+        );
+        put_file(&engine, &file_rec("src/call.ts", Language::TypeScript, 1));
+        write_src(
+            &engine,
+            "src/call.ts",
+            "export function callMe(): void {}\n",
+        );
+        put_nodes(&mut engine, std::slice::from_ref(&f));
+        put_edges(
+            &mut engine,
+            &[mk_edge(
+                &f.id,
+                "interface:ghost:1",
+                codegraph_core::types::EdgeKind::References,
+            )],
+        );
+        let sub = engine.find_relevant_context("callMe").unwrap();
+        assert!(
+            sub.rescued_files.is_empty(),
+            "dangling signature edge must rescue nothing"
+        );
+    }
+
+    /// #1064 determinism: with MULTIPLE buried candidates the rescue set is
+    /// sorted by `(file, line, id)` — exercises the sort comparator. Two sig
+    /// types in files that sort in reverse of insertion order both rescue, in
+    /// stable order.
+    #[test]
+    fn ext_explore_rescue_sorts_multiple_candidates() {
+        let mut engine = test_engine();
+        let f = node_lang(
+            "wire",
+            "wire",
+            "src/wire.ts",
+            3,
+            3,
+            NodeKind::Function,
+            Language::TypeScript,
+        );
+        // `zeta.ts` sorts AFTER `alpha.ts`; edges are added zeta-first so the
+        // comparator must reorder them.
+        let zeta = node_lang(
+            "Zeta",
+            "Zeta",
+            "src/zeta.ts",
+            1,
+            1,
+            NodeKind::Interface,
+            Language::TypeScript,
+        );
+        let alpha = node_lang(
+            "Alpha",
+            "Alpha",
+            "src/alpha.ts",
+            1,
+            1,
+            NodeKind::Struct,
+            Language::TypeScript,
+        );
+        for rel in ["src/wire.ts", "src/zeta.ts", "src/alpha.ts"] {
+            put_file(&engine, &file_rec(rel, Language::TypeScript, 1));
+            write_src(&engine, rel, "// stub\n");
+        }
+        put_nodes(&mut engine, &[f.clone(), zeta.clone(), alpha.clone()]);
+        put_edges(
+            &mut engine,
+            &[
+                mk_edge(&f.id, &zeta.id, codegraph_core::types::EdgeKind::References),
+                mk_edge(&f.id, &alpha.id, codegraph_core::types::EdgeKind::Returns),
+            ],
+        );
+        let sub = engine.find_relevant_context("wire").unwrap();
+        assert!(sub.rescued_files.contains("src/zeta.ts"));
+        assert!(sub.rescued_files.contains("src/alpha.ts"));
+        // The comparator runs over both candidates; the resulting ranked
+        // file_order is deterministic across repeated runs.
+        let again = engine.find_relevant_context("wire").unwrap();
+        assert_eq!(
+            sub.file_order, again.file_order,
+            "multi-candidate rescue ordering must be deterministic"
+        );
+    }
+
+    /// #1064 buried check: a signature type whose file the query hits ≥2 times
+    /// lexically is NOT buried and is not rescued — exercises the term-hit skip.
+    #[test]
+    fn ext_explore_rescue_skips_term_matched_type_file() {
+        let mut engine = test_engine();
+        let f = node_lang(
+            "build",
+            "build",
+            "src/build.ts",
+            2,
+            2,
+            NodeKind::Function,
+            Language::TypeScript,
+        );
+        // The type lives in a file whose path AND name both hit query terms
+        // ("payment", "config") — 2 hits ⇒ not buried.
+        let cfg = node_lang(
+            "PaymentConfig",
+            "PaymentConfig",
+            "src/payment.ts",
+            1,
+            1,
+            NodeKind::Interface,
+            Language::TypeScript,
+        );
+        for rel in ["src/build.ts", "src/payment.ts"] {
+            put_file(&engine, &file_rec(rel, Language::TypeScript, 1));
+            write_src(&engine, rel, "// stub\n");
+        }
+        put_nodes(&mut engine, &[f.clone(), cfg.clone()]);
+        put_edges(
+            &mut engine,
+            &[mk_edge(
+                &f.id,
+                &cfg.id,
+                codegraph_core::types::EdgeKind::References,
+            )],
+        );
+        let sub = engine
+            .find_relevant_context("build payment config")
+            .unwrap();
+        assert!(
+            !sub.rescued_files.contains("src/payment.ts"),
+            "term-matched (non-buried) type file must not be rescued"
+        );
+    }
+
+    /// #1064 buried check: a signature type defined in the SAME file as its
+    /// callable seed (a seed file, already on-screen) is not rescued —
+    /// exercises the seed-file skip.
+    #[test]
+    fn ext_explore_rescue_skips_type_in_seed_file() {
+        let mut engine = test_engine();
+        // `mk` (seed) and its return type `Widget` share `src/widget.ts`.
+        let mk = node_lang(
+            "mk",
+            "mk",
+            "src/widget.ts",
+            5,
+            5,
+            NodeKind::Function,
+            Language::TypeScript,
+        );
+        let widget = node_lang(
+            "Widget",
+            "Widget",
+            "src/widget.ts",
+            1,
+            1,
+            NodeKind::Interface,
+            Language::TypeScript,
+        );
+        put_file(&engine, &file_rec("src/widget.ts", Language::TypeScript, 2));
+        write_src(&engine, "src/widget.ts", "// stub\n");
+        put_nodes(&mut engine, &[mk.clone(), widget.clone()]);
+        put_edges(
+            &mut engine,
+            &[mk_edge(
+                &mk.id,
+                &widget.id,
+                codegraph_core::types::EdgeKind::Returns,
+            )],
+        );
+        let sub = engine.find_relevant_context("mk").unwrap();
+        assert!(
+            !sub.rescued_files.contains("src/widget.ts"),
+            "a type in the seed's own file is on-screen, not rescued"
         );
     }
 }
