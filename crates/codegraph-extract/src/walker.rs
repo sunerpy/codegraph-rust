@@ -2410,6 +2410,22 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             if child.kind() == "class_heritage" {
                 self.extract_inheritance(child, class_id);
             }
+            // #1043 — C++ `class D : public Base<int>, ns::Tpl<T>`: base_class_clause
+            // (a C++-grammar-only node kind) holds base refs as type_identifier /
+            // qualified_identifier / template_type. access_specifier (public/…),
+            // `virtual`, and attribute_declaration are naturally skipped by keying
+            // on the accepted kinds. Template args are stripped to the base name.
+            if child.kind() == "base_class_clause" {
+                for base in child.named_children(&mut child.walk()) {
+                    if matches!(
+                        base.kind(),
+                        "type_identifier" | "qualified_identifier" | "template_type"
+                    ) {
+                        let name = strip_cpp_template_args(&node_text(base, self.source));
+                        self.push_ref(class_id, &name, EdgeKind::Extends, base);
+                    }
+                }
+            }
         }
     }
 
@@ -3157,6 +3173,20 @@ fn is_builtin_type(name: &str) -> bool {
     )
 }
 
+fn strip_cpp_template_args(name: &str) -> String {
+    let mut depth: i32 = 0;
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        match ch {
+            '<' => depth += 1,
+            '>' if depth > 0 => depth -= 1,
+            _ if depth == 0 => out.push(ch),
+            _ => {}
+        }
+    }
+    out.trim().to_string()
+}
+
 fn first_descendant_kind<'tree>(node: SyntaxNode<'tree>, kind: &str) -> Option<SyntaxNode<'tree>> {
     for child in node.named_children(&mut node.walk()) {
         if child.kind() == kind {
@@ -3327,6 +3357,7 @@ mod tests {
     //! `tests/batch_*_languages.rs` construction pattern). Each test targets a
     //! branch-heavy dispatch arm in `visit_node` / `visit_*_node` / the call and
     //! import extractors.
+    use super::strip_cpp_template_args;
     use crate::extract_source;
     use codegraph_core::types::{EdgeKind, Language, Node, NodeKind, UnresolvedRef};
 
@@ -4783,5 +4814,230 @@ extension (s: String)
 "#;
         let (_, refs) = run("ext.scala", src, Language::Scala);
         assert!(has_ref(&refs, EdgeKind::Calls, "M.helper"));
+    }
+
+    // ---- Round A: #1043 — C++ general inheritance from base_class_clause ----
+
+    // `class D : public Base {}` → Extends Base (the base_class_clause arm; the
+    // `public` access_specifier is naturally skipped, not in the accepted set).
+    #[test]
+    fn cpp_class_public_base_extends() {
+        let src = r#"
+class Base { public: void a(); };
+class D : public Base {
+public:
+    void b();
+};
+"#;
+        let (nodes, refs) = run("d.cpp", src, Language::Cpp);
+        assert!(has_node(&nodes, NodeKind::Class, "D"));
+        assert!(
+            has_ref(&refs, EdgeKind::Extends, "Base"),
+            "`class D : public Base` should Extends Base, refs: {:?}",
+            refs.iter()
+                .map(|r| (r.reference_kind, r.reference_name.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // `class T : public Base<int> {}` → Extends Base (template args stripped).
+    #[test]
+    fn cpp_class_templated_base_extends_stripped() {
+        let src = r#"
+class Base { public: void a(); };
+class T : public Base<int> {
+public:
+    void b();
+};
+"#;
+        let (_, refs) = run("t.cpp", src, Language::Cpp);
+        assert!(
+            has_ref(&refs, EdgeKind::Extends, "Base"),
+            "`class T : public Base<int>` should Extends Base (stripped), refs: {:?}",
+            refs.iter()
+                .map(|r| (r.reference_kind, r.reference_name.as_str()))
+                .collect::<Vec<_>>()
+        );
+        // The un-stripped `Base<int>` must NOT be recorded as a ref.
+        assert!(
+            !has_ref(&refs, EdgeKind::Extends, "Base<int>"),
+            "templated base must be stripped to `Base`, not `Base<int>`"
+        );
+    }
+
+    // `class Both : public Base<char>, public Plain {}` → Extends Base + Plain
+    // (multiple inheritance = multiple edges; each accepted child emits one).
+    #[test]
+    fn cpp_class_multiple_inheritance_extends_all() {
+        let src = r#"
+class Base { public: void a(); };
+class Plain { public: void c(); };
+class Both : public Base<char>, public Plain {
+public:
+    void b();
+};
+"#;
+        let (_, refs) = run("both.cpp", src, Language::Cpp);
+        assert!(
+            has_ref(&refs, EdgeKind::Extends, "Base"),
+            "multiple inheritance should Extends Base"
+        );
+        assert!(
+            has_ref(&refs, EdgeKind::Extends, "Plain"),
+            "multiple inheritance should Extends Plain"
+        );
+    }
+
+    // `struct S : Base<double> {}` → Extends Base (struct is covered because
+    // extract_struct also calls extract_inheritance).
+    #[test]
+    fn cpp_struct_templated_base_extends_stripped() {
+        let src = r#"
+struct Base { void a(); };
+struct S : Base<double> {
+    void b();
+};
+"#;
+        let (nodes, refs) = run("s.cpp", src, Language::Cpp);
+        assert!(has_node(&nodes, NodeKind::Struct, "S"));
+        assert!(
+            has_ref(&refs, EdgeKind::Extends, "Base"),
+            "`struct S : Base<double>` should Extends Base (stripped)"
+        );
+    }
+
+    // `class C : public ns::Tpl<int> {}` → Extends ns::Tpl (qualified head kept,
+    // template args stripped; the `::`-qualified name is preserved).
+    #[test]
+    fn cpp_class_qualified_templated_base_extends() {
+        let src = r#"
+class D : public ns::Tpl<int> {
+public:
+    void b();
+};
+"#;
+        let (_, refs) = run("q.cpp", src, Language::Cpp);
+        assert!(
+            has_ref(&refs, EdgeKind::Extends, "ns::Tpl"),
+            "`: public ns::Tpl<int>` should Extends ns::Tpl (qualified head kept), refs: {:?}",
+            refs.iter()
+                .map(|r| (r.reference_kind, r.reference_name.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !has_ref(&refs, EdgeKind::Extends, "ns::Tpl<int>"),
+            "qualified templated base must be stripped to `ns::Tpl`"
+        );
+    }
+
+    // NEGATIVE: a plain `class Base : public Other` — the access specifier
+    // (`public`) and `virtual` keyword must NOT produce a ref of their own.
+    #[test]
+    fn cpp_access_specifier_and_virtual_not_a_ref() {
+        let src = r#"
+class Base { public: void a(); };
+class D : virtual public Base {
+public:
+    void b();
+};
+"#;
+        let (_, refs) = run("v.cpp", src, Language::Cpp);
+        assert!(
+            has_ref(&refs, EdgeKind::Extends, "Base"),
+            "virtual public base still Extends Base"
+        );
+        assert!(
+            !has_ref(&refs, EdgeKind::Extends, "public"),
+            "access specifier `public` must not be a base ref"
+        );
+        assert!(
+            !has_ref(&refs, EdgeKind::Extends, "private"),
+            "access specifier must not be a base ref"
+        );
+        assert!(
+            !has_ref(&refs, EdgeKind::Extends, "virtual"),
+            "`virtual` keyword must not be a base ref"
+        );
+    }
+
+    // NEGATIVE: a C++ class with NO base clause produces no Extends edge.
+    #[test]
+    fn cpp_class_no_base_no_extends() {
+        let src = r#"
+class Solo {
+public:
+    void a();
+};
+"#;
+        let (nodes, refs) = run("solo.cpp", src, Language::Cpp);
+        assert!(has_node(&nodes, NodeKind::Class, "Solo"));
+        assert!(
+            !refs.iter().any(|r| r.reference_kind == EdgeKind::Extends),
+            "a class with no base clause must produce no Extends edge, refs: {:?}",
+            refs.iter()
+                .map(|r| (r.reference_kind, r.reference_name.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // NEGATIVE: a non-C++ language that has a `:`-bearing construct must be
+    // unaffected by the base_class_clause arm (Go struct embedding is NOT a
+    // base_class_clause and does not emit Extends via this path).
+    #[test]
+    fn go_struct_unaffected_by_cpp_base_arm() {
+        let src = r#"
+package main
+type Base struct{}
+type D struct {
+    Base
+}
+"#;
+        let (_, refs) = run("d.go", src, Language::Go);
+        // No C++ base_class_clause exists in Go; the arm must not fire.
+        assert!(
+            !has_ref(&refs, EdgeKind::Extends, "Base"),
+            "Go struct embedding must not go through the C++ base arm"
+        );
+    }
+
+    // The #1061 export-macro path and the general base arm must NOT double-emit:
+    // an export-macro class with a base is misparsed as a function and recovered
+    // by try_recover_export_macro_class (which returns early), so extract_class /
+    // extract_inheritance never runs for it — exactly one Extends edge.
+    #[test]
+    fn cpp_export_macro_class_with_base_single_extends() {
+        let src = r#"
+class MYMODULE_API UMyComponent : public UActorComponent {
+public:
+    void tick();
+};
+"#;
+        let (_, refs) = run("em.cpp", src, Language::Cpp);
+        let extends_base = refs
+            .iter()
+            .filter(|r| {
+                r.reference_kind == EdgeKind::Extends && r.reference_name == "UActorComponent"
+            })
+            .count();
+        assert_eq!(
+            extends_base,
+            1,
+            "export-macro class base must be emitted exactly once (no double-emit), refs: {:?}",
+            refs.iter()
+                .map(|r| (r.reference_kind, r.reference_name.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn strip_cpp_template_args_cases() {
+        assert_eq!(strip_cpp_template_args("Base"), "Base");
+        assert_eq!(strip_cpp_template_args("Base<int>"), "Base");
+        assert_eq!(strip_cpp_template_args("ns::Tpl<Foo<int>>"), "ns::Tpl");
+        assert_eq!(strip_cpp_template_args("Outer<int>::Inner"), "Outer::Inner");
+        assert_eq!(strip_cpp_template_args("ns::Plain"), "ns::Plain");
+        assert_eq!(strip_cpp_template_args(""), "");
+        // Trailing/interior whitespace around stripped args is trimmed.
+        assert_eq!(strip_cpp_template_args("Base <int> "), "Base");
     }
 }

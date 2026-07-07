@@ -236,6 +236,54 @@ Like the Godot fixture, both the index and the dump are byte-stable, and the
 `upstream_db_is_self_equivalent_to_ruby_golden` tests in
 `crates/codegraph-bench/tests/equivalence.rs` enforce it.
 
+### C++ fixture
+
+A fourth golden fixture, `reference/golden/cpp/`, guards C++ `base_class_clause`
+inheritance extraction (upstream #1043) that the other fixtures cannot reach —
+there are no `.cpp`/`.hpp` files in `mini`/`godot`/`ruby`. It captures the
+general C++ inheritance shapes plus templated-base stripping:
+
+- **single public base** — `class D : public Base` resolving to `Base`
+  (an `Extends` edge; the `public` access specifier is skipped).
+- **templated base (stripped)** — `class T : public Container<int>` resolving to
+  `Container` (template args stripped to the base name).
+- **multiple inheritance** — `class Both : public Container<char>, public Plain`
+  emitting two `Extends` edges (to `Container` and `Plain`).
+- **struct base** — `struct S : Container<double>` resolving to `Container`
+  (struct inheritance goes through the same path as class inheritance).
+- **`::`-qualified templated base** — `class Q : public ns::Tpl<int>` recording
+  an `Extends` ref to `ns::Tpl` (qualified head kept, template args stripped);
+  captured as an unresolved ref in `refs.json`.
+
+The minimal source corpus lives at `crates/codegraph-bench/fixtures/cpp/`
+(`base.hpp`, `derived.cpp`). The base classes live in a `.hpp` file (not `.h`,
+which maps to `Language::C` where `class` is not valid syntax).
+
+Regenerate the committed database + canonical JSON reproducibly from the corpus:
+
+```bash
+# 1. Copy the corpus to a clean directory (keeps the workspace .codegraph/ out of it).
+rm -rf /tmp/cg-fixture-cpp
+cp -r crates/codegraph-bench/fixtures/cpp /tmp/cg-fixture-cpp
+
+# 2. Index it with OUR binary (never hand-write the golden).
+cargo build --release -p codegraph-rs
+CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
+  ./target/release/codegraph init /tmp/cg-fixture-cpp
+
+# 3. Commit the produced database as the fixture's colby.db.
+cp /tmp/cg-fixture-cpp/.codegraph/codegraph.db reference/golden/cpp/colby.db
+
+# 4. Dump the canonical golden JSON + schema from that database.
+cargo run -p codegraph-bench --bin bench -- \
+  --gen-golden reference/golden/cpp/colby.db reference/golden/cpp
+```
+
+Like the Ruby fixture, both the index and the dump are byte-stable, and the
+`generated_golden_matches_committed_cpp_fixture` and
+`cpp_db_is_self_equivalent_to_cpp_golden` tests in
+`crates/codegraph-bench/tests/equivalence.rs` enforce it.
+
 ### KNOWN_DIFFS.md format
 
 Tier-3 differences are allowlisted by grep-able lines in repo-root

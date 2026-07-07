@@ -61,6 +61,25 @@ fn upstream_db_is_self_equivalent_to_ruby_golden() {
 }
 
 #[test]
+fn generated_golden_matches_committed_cpp_fixture() {
+    // Guards C++ #1043 base_class_clause inheritance (general Extends extraction
+    // + templated-base stripping) against byte-drift: regenerating the canonical
+    // golden from the committed cpp db must reproduce the committed JSON exactly.
+    let tempdir = TestDir::new("generated-golden-cpp");
+    write_golden(&cpp_db(), tempdir.path()).unwrap();
+
+    let expected = load_golden(&cpp_golden_dir()).unwrap();
+    let actual = load_golden(tempdir.path()).unwrap();
+
+    diff_canonical(&expected, &actual, None).unwrap();
+}
+
+#[test]
+fn cpp_db_is_self_equivalent_to_cpp_golden() {
+    assert_equivalent(&cpp_db(), &cpp_golden_dir()).unwrap();
+}
+
+#[test]
 fn tier1_node_drift_is_reported() {
     let expected = load_golden(&mini_golden_dir()).unwrap();
     let mut actual = expected.clone();
@@ -128,6 +147,14 @@ fn ruby_db() -> PathBuf {
 
 fn ruby_golden_dir() -> PathBuf {
     workspace_root().join("reference/golden/ruby")
+}
+
+fn cpp_db() -> PathBuf {
+    workspace_root().join("reference/golden/cpp/colby.db")
+}
+
+fn cpp_golden_dir() -> PathBuf {
+    workspace_root().join("reference/golden/cpp")
 }
 
 struct TestDir {

@@ -1,0 +1,245 @@
+[
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.92,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:derived.cpp",
+    "target": "file:base.hpp"
+  },
+  {
+    "col": 11,
+    "kind": "extends",
+    "line": 18,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "struct:418731e230da99cc3237d0e7e35385f1",
+    "target": "class:e436be77a00102552decf9de5d7cc052"
+  },
+  {
+    "col": 17,
+    "kind": "extends",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "class:0c060877c79717f6f299b28b7a70963d",
+    "target": "class:8d69d653dc95cdd3c552158090518169"
+  },
+  {
+    "col": 17,
+    "kind": "extends",
+    "line": 8,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "class:76beb6e8a8a91371f90602d5b477891f",
+    "target": "class:e436be77a00102552decf9de5d7cc052"
+  },
+  {
+    "col": 20,
+    "kind": "extends",
+    "line": 13,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "class:1f9695d61900e851f6609231a60ccd9a",
+    "target": "class:e436be77a00102552decf9de5d7cc052"
+  },
+  {
+    "col": 44,
+    "kind": "extends",
+    "line": 13,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "class:1f9695d61900e851f6609231a60ccd9a",
+    "target": "class:a314922ccab0b69f3b0ef9ac4aa03899"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:0c060877c79717f6f299b28b7a70963d",
+    "target": "method:f117ad9d184827c90a6c7fd6c2d6b797"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:11306345dc1e400be056c1416040177a",
+    "target": "method:e0f5e5ea48590fb4caffb59bfd259002"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:1f9695d61900e851f6609231a60ccd9a",
+    "target": "method:2c00ba8af8cccb7ba6a0a4c0a07098c1"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:76beb6e8a8a91371f90602d5b477891f",
+    "target": "method:752d570e8d732f0eb4cc536d72123612"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:8d69d653dc95cdd3c552158090518169",
+    "target": "method:bc467effab2fddf273bc6e710c1820bb"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:a314922ccab0b69f3b0ef9ac4aa03899",
+    "target": "method:b419aa2669dde2e77fd28e0c83f50803"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:b28eae813de1699c6b7d7727db856721",
+    "target": "method:c3338e5d52c4d38bfa7dd8dce45aa47d"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:e436be77a00102552decf9de5d7cc052",
+    "target": "method:a6af941ba6640f7d90fbc15666e6ba07"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:base.hpp",
+    "target": "class:11306345dc1e400be056c1416040177a"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:base.hpp",
+    "target": "class:8d69d653dc95cdd3c552158090518169"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:base.hpp",
+    "target": "class:a314922ccab0b69f3b0ef9ac4aa03899"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:base.hpp",
+    "target": "class:e436be77a00102552decf9de5d7cc052"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:derived.cpp",
+    "target": "class:0c060877c79717f6f299b28b7a70963d"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:derived.cpp",
+    "target": "class:1f9695d61900e851f6609231a60ccd9a"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:derived.cpp",
+    "target": "class:76beb6e8a8a91371f90602d5b477891f"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:derived.cpp",
+    "target": "class:b28eae813de1699c6b7d7727db856721"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:derived.cpp",
+    "target": "import:4313410da7099c710ba65de541fcc021"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:derived.cpp",
+    "target": "struct:418731e230da99cc3237d0e7e35385f1"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:418731e230da99cc3237d0e7e35385f1",
+    "target": "method:eaf644a1dae18b22184dd0d0b882e1bd"
+  }
+]

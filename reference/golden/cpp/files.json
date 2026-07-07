@@ -1,0 +1,18 @@
+[
+  {
+    "content_hash": "918ff675ba5d4bc2916b5f0b01a6efe803acec492ab71f0bf83c593be612a202",
+    "errors": null,
+    "language": "cpp",
+    "node_count": 9,
+    "path": "base.hpp",
+    "size": 270
+  },
+  {
+    "content_hash": "7866bdbba877acfa0b4b8e7e4be58875893da925ac91aa333a4c3658bea64e69",
+    "errors": null,
+    "language": "cpp",
+    "node_count": 12,
+    "path": "derived.cpp",
+    "size": 363
+  }
+]
