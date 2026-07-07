@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.28.1](https://github.com/sunerpy/codegraph-rust/compare/v0.28.0...v0.28.1) (2026-07-07)
+
+
+### Bug Fixes
+
+* **cli:** list affected files in codegraph affected output ([#125](https://github.com/sunerpy/codegraph-rust/issues/125)) ([e32620f](https://github.com/sunerpy/codegraph-rust/commit/e32620fde6724b46b1ea3ad1e63d05f6d3516a32))
+
 ## [0.28.0](https://github.com/sunerpy/codegraph-rust/compare/v0.27.0...v0.28.0) (2026-07-07)
 
 
