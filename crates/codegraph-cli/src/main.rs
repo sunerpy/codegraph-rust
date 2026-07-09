@@ -813,6 +813,30 @@ fn should_skip_update(current: &str, latest: &str, force: bool, has_explicit_tag
     !self_update::version::bump_is_greater(current, latest).unwrap_or(false)
 }
 
+/// Resolve a GitHub API token via injected env-getter: `GITHUB_TOKEN` then
+/// `GH_TOKEN` (the `gh` CLI convention). Empty/whitespace values are rejected so
+/// `GITHUB_TOKEN=` sends no broken auth header; `None` preserves anonymous mode.
+/// Getter is injected (not `std::env` directly) to stay testable without
+/// `set_var`, which is unsafe in edition 2024.
+fn resolve_github_token(get: impl Fn(&str) -> Option<String>) -> Option<String> {
+    for key in ["GITHUB_TOKEN", "GH_TOKEN"] {
+        if let Some(value) = get(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_owned());
+            }
+        }
+    }
+    None
+}
+
+/// Actionable hint appended on any GitHub-API failure. A 403 is almost always
+/// rate-limit exhaustion; we always surface this (rather than fragile-parsing
+/// the status out of the error string) so the user learns the exact remedy.
+fn self_update_rate_limit_hint() -> &'static str {
+    "if this is a GitHub API rate limit, authenticate with:\n  GITHUB_TOKEN=$(gh auth token) codegraph self-update"
+}
+
 fn cmd_self_update(check: bool, force: bool, tag: Option<String>) -> Result<()> {
     use self_update::cargo_crate_version;
 
@@ -825,6 +849,10 @@ fn cmd_self_update(check: bool, force: bool, tag: Option<String>) -> Result<()> 
             .current_version(cargo_crate_version!())
             .show_download_progress(true)
             .no_confirm(force);
+        // Auth all builders uniformly (self_update ignores GITHUB_TOKEN/GH_TOKEN).
+        if let Some(token) = resolve_github_token(|k| std::env::var(k).ok()) {
+            builder.auth_token(&token);
+        }
         builder
     };
 
@@ -833,9 +861,12 @@ fn cmd_self_update(check: bool, force: bool, tag: Option<String>) -> Result<()> 
         let updater = configure()
             .build()
             .context("configuring the self-update backend")?;
-        let latest = updater
-            .get_latest_release()
-            .context("querying the latest GitHub release")?;
+        let latest = updater.get_latest_release().with_context(|| {
+            format!(
+                "querying the latest GitHub release\n\nhint: {}",
+                self_update_rate_limit_hint()
+            )
+        })?;
         let current = cargo_crate_version!();
         if self_update::version::bump_is_greater(current, &latest.version).unwrap_or(false) {
             println!("codegraph {current} -> {} available", latest.version);
@@ -860,9 +891,12 @@ fn cmd_self_update(check: bool, force: bool, tag: Option<String>) -> Result<()> 
             let probe = configure()
                 .build()
                 .context("configuring the self-update backend")?;
-            let latest = probe
-                .get_latest_release()
-                .context("querying the latest GitHub release")?;
+            let latest = probe.get_latest_release().with_context(|| {
+                format!(
+                    "querying the latest GitHub release\n\nhint: {}",
+                    self_update_rate_limit_hint()
+                )
+            })?;
             let current = cargo_crate_version!();
             if should_skip_update(current, &latest.version, force, false) {
                 println!("codegraph {current} is already up to date");
@@ -878,7 +912,12 @@ fn cmd_self_update(check: bool, force: bool, tag: Option<String>) -> Result<()> 
         .build()
         .context("configuring the self-update backend")?;
 
-    let status = updater.update().context("performing the self-update")?;
+    let status = updater.update().with_context(|| {
+        format!(
+            "performing the self-update\n\nhint: {}",
+            self_update_rate_limit_hint()
+        )
+    })?;
     if status.updated() {
         println!("Updated codegraph to {}", status.version());
     } else {
@@ -4079,7 +4118,18 @@ fn print_files_tree(files: &[FileRecord], max_depth: Option<usize>) {
 
 #[cfg(test)]
 mod self_update_tests {
-    use super::{latest_update_tag, should_skip_update};
+    use super::{
+        latest_update_tag, resolve_github_token, self_update_rate_limit_hint, should_skip_update,
+    };
+    use std::collections::HashMap;
+
+    fn getter(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        move |k: &str| map.get(k).cloned()
+    }
 
     #[test]
     fn formats_bare_semver_as_v_prefixed_tag() {
@@ -4110,6 +4160,47 @@ mod self_update_tests {
     #[test]
     fn explicit_tag_never_skips() {
         assert!(!should_skip_update("0.23.0", "0.23.0", false, true));
+    }
+
+    #[test]
+    fn github_token_wins_over_gh_token() {
+        let get = getter(&[("GITHUB_TOKEN", "primary"), ("GH_TOKEN", "fallback")]);
+        assert_eq!(resolve_github_token(get), Some("primary".to_owned()));
+    }
+
+    #[test]
+    fn gh_token_used_when_github_token_absent() {
+        let get = getter(&[("GH_TOKEN", "fallback")]);
+        assert_eq!(resolve_github_token(get), Some("fallback".to_owned()));
+    }
+
+    #[test]
+    fn empty_or_whitespace_token_treated_as_absent() {
+        let get = getter(&[("GITHUB_TOKEN", "   "), ("GH_TOKEN", "real")]);
+        assert_eq!(resolve_github_token(get), Some("real".to_owned()));
+
+        let empty = getter(&[("GITHUB_TOKEN", ""), ("GH_TOKEN", "")]);
+        assert_eq!(resolve_github_token(empty), None);
+    }
+
+    #[test]
+    fn no_token_set_resolves_to_none() {
+        let get = getter(&[]);
+        assert_eq!(resolve_github_token(get), None);
+    }
+
+    #[test]
+    fn token_value_is_trimmed() {
+        let get = getter(&[("GITHUB_TOKEN", "  padded\t")]);
+        assert_eq!(resolve_github_token(get), Some("padded".to_owned()));
+    }
+
+    #[test]
+    fn hint_contains_authenticate_command() {
+        assert!(
+            self_update_rate_limit_hint()
+                .contains("GITHUB_TOKEN=$(gh auth token) codegraph self-update")
+        );
     }
 }
 
