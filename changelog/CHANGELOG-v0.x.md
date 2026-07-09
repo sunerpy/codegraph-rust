@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.28.2](https://github.com/sunerpy/codegraph-rust/compare/v0.28.1...v0.28.2) (2026-07-09)
+
+
+### Bug Fixes
+
+* **cli:** authenticate self-update with GITHUB_TOKEN/GH_TOKEN and hint on rate limit ([#127](https://github.com/sunerpy/codegraph-rust/issues/127)) ([e62dc5c](https://github.com/sunerpy/codegraph-rust/commit/e62dc5cdd5a7506b345ae1d851373c67506a29d1))
+
 ## [0.28.1](https://github.com/sunerpy/codegraph-rust/compare/v0.28.0...v0.28.1) (2026-07-07)
 
 
