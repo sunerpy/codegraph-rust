@@ -1042,6 +1042,34 @@ impl Store {
         Ok(out)
     }
 
+    /// Godot loader-side reverse-dependency lane. A GDScript
+    /// `preload/load("res://X")` RESOLVES to an `import:` node whose `name` is the
+    /// `res://` path and whose `file_path` is the LOADER script. When `X` is a
+    /// scene/resource it owns no `file:` node, so the resolved `imports` edge
+    /// terminates on that `import:` node and `dependent_file_paths` (which keys on
+    /// a target `file:` node) never surfaces the loader. This matches `import:`
+    /// nodes whose `res://`-stripped, `/`-normalized name equals `file_path` and
+    /// returns their owning loader paths. Only names carrying the `res://` scheme
+    /// match, so non-Godot import nodes are never returned and other languages stay
+    /// byte-unchanged. Golden-neutral; returns referrers in scan order (caller
+    /// sorts/dedups).
+    pub fn dependent_file_paths_via_import_name(
+        &self,
+        file_path: &str,
+    ) -> rusqlite::Result<Vec<String>> {
+        let target = file_path.replace('\\', "/");
+        let mut out = Vec::new();
+        for node in self.nodes_by_kind(NodeKind::Import)? {
+            let Some(stripped) = node.name.strip_prefix("res://") else {
+                continue;
+            };
+            if stripped.replace('\\', "/") == target {
+                out.push(node.file_path);
+            }
+        }
+        Ok(out)
+    }
+
     /// Delete every resolution-produced edge whose SOURCE node lives in
     /// `file_path`. Every non-`contains` edge is produced by reference resolution
     /// (it carries `metadata.resolvedBy`); `contains` edges come only from
@@ -2436,6 +2464,36 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "gdscript_load_path (already an edge) and non-Godot refs must not be returned"
+        );
+    }
+
+    #[test]
+    fn dependent_file_paths_via_import_name_surfaces_res_loaders_only() {
+        let mut store = store("import-name-loaders");
+        let mut scene_loader = node("import:scene", "res://Scenes/BaseStage.tscn", "loader.gd");
+        scene_loader.kind = NodeKind::Import;
+        let mut other_loader = node("import:other", "res://Scenes/Other.tscn", "other.gd");
+        other_loader.kind = NodeKind::Import;
+        let mut bare_import = node("import:bare", "Scenes/BaseStage.tscn", "bare.gd");
+        bare_import.kind = NodeKind::Import;
+        store
+            .upsert_nodes(&[scene_loader, other_loader, bare_import])
+            .unwrap();
+
+        let mut referrers = store
+            .dependent_file_paths_via_import_name("Scenes/BaseStage.tscn")
+            .unwrap();
+        referrers.sort();
+        assert_eq!(
+            referrers,
+            vec!["loader.gd".to_string()],
+            "only the res://-scheme import node whose name equals the target surfaces its loader"
+        );
+        assert!(
+            store
+                .dependent_file_paths_via_import_name("Scenes/Missing.tscn")
+                .unwrap()
+                .is_empty()
         );
     }
 

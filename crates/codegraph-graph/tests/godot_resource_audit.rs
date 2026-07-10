@@ -544,6 +544,49 @@ fn main_scene_ref_is_not_tagged_autoload() {
 }
 
 #[test]
+fn impact_lists_project_godot_for_uid_main_scene() {
+    // Given a project.godot whose run/main_scene is a uid:// handle, and a
+    // main.tscn whose gd_scene header carries that same uid,
+    let dir = unique_dir("impact-uid-main-scene");
+    write(
+        &dir,
+        "project.godot",
+        "config_version=5\n\n[application]\nrun/main_scene=\"uid://dr6r06q24gfti\"\n",
+    );
+    write(
+        &dir,
+        "main.tscn",
+        "[gd_scene format=3 uid=\"uid://dr6r06q24gfti\"]\n\n[node name=\"Root\" type=\"Node\"]\n",
+    );
+    // When impact is computed for the main scene,
+    let store = run_pipeline(
+        "impact-uid-main-scene",
+        &dir,
+        &["project.godot", "main.tscn"],
+    );
+    let impact = GraphTraverser::new(&store)
+        .resource_impact("main.tscn")
+        .expect("impact");
+    // Then project.godot is listed as a referrer (uid resolved to the scene).
+    assert!(
+        impact
+            .affected
+            .iter()
+            .any(|a| a.from_file == "project.godot"),
+        "uid main_scene must surface project.godot in impact, got: {impact:?}"
+    );
+    // And it is NOT tagged autoload (shares the untagged reference path).
+    assert!(
+        !impact
+            .affected
+            .iter()
+            .any(|a| a.edge_subkind == Some("autoload".to_string())),
+        "uid main-scene ref must NOT be tagged autoload, got: {impact:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn impact_surfaces_gdscript_preload_via_imports_edge() {
     // Given a .gd that `preload`s another .gd (a resolved `imports` edge tagged
     // gdscript_load_path by the walker),
@@ -579,6 +622,84 @@ fn impact_surfaces_gdscript_preload_via_imports_edge() {
         row.edge_subkind,
         Some("gdscript_load_path".to_string()),
         "imports edge must carry the gdscript_load_path subkind, got: {row:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn impact_surfaces_gdscript_preload_of_scene_via_import_node() {
+    // Given a .gd that `load`s a .tscn scene: the ref RESOLVES to an `import:`
+    // node (owned by the loader) rather than an edge into a .tscn `file:` node,
+    // which does not exist for scenes/resources.
+    let dir = unique_dir("impact-preload-scene");
+    write(&dir, "project.godot", PROJECT_GODOT);
+    write(&dir, "scenes/Foo.tscn", "[gd_scene format=3]\n");
+    write(
+        &dir,
+        "loader.gd",
+        "extends Node\n\nfunc _ready():\n\tvar s = load(\"res://scenes/Foo.tscn\")\n",
+    );
+    // When impact is computed for the loaded scene,
+    let store = run_pipeline(
+        "impact-preload-scene",
+        &dir,
+        &["project.godot", "scenes/Foo.tscn", "loader.gd"],
+    );
+    let impact = GraphTraverser::new(&store)
+        .resource_impact("scenes/Foo.tscn")
+        .expect("impact");
+    // Then the loading script surfaces via its res:// import node.
+    let row = impact
+        .affected
+        .iter()
+        .find(|a| a.from_file == "loader.gd")
+        .unwrap_or_else(|| panic!("expected loader.gd in impact, got: {impact:?}"));
+    assert_eq!(
+        row.edge_kind, "imports",
+        "scene load must surface as an imports edge, got: {row:?}"
+    );
+    assert_eq!(
+        row.edge_subkind,
+        Some("gdscript_load_path".to_string()),
+        "imports edge must carry the gdscript_load_path subkind, got: {row:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn impact_without_preload_resource_edge_is_unchanged_by_the_import_lane() {
+    // M1 regression: a project with NO `preload/load(res://X)` import node whose
+    // name matches the changed resource must be byte-identical to the pre-lane
+    // output. Here `data.tres` references `target.tres` only via an ExtResource
+    // path (an unresolved-ref lane match) — there is no `import:` node, so the
+    // new import-name lane must contribute ZERO extra rows.
+    let dir = unique_dir("impact-no-preload-lane");
+    write(&dir, "project.godot", PROJECT_GODOT);
+    write(&dir, "target.tres", PLAIN_RESOURCE);
+    write(&dir, "data.tres", &referencing_resource("target.tres"));
+    let store = run_pipeline(
+        "impact-no-preload-lane",
+        &dir,
+        &["project.godot", "target.tres", "data.tres"],
+    );
+    let impact = GraphTraverser::new(&store)
+        .resource_impact("target.tres")
+        .expect("impact");
+    // Then every affected row comes from the pre-existing lanes (the ExtResource
+    // path ref), and NONE is a spurious import-name (`imports`/gdscript_load_path)
+    // row — the import lane is inert when no matching import node exists.
+    assert!(
+        impact.affected.iter().all(|a| a.from_file == "data.tres"),
+        "only the ExtResource referrer must appear, got: {impact:?}"
+    );
+    assert!(
+        !impact.affected.iter().any(|a| a.edge_kind == "imports"
+            || a.edge_subkind == Some("gdscript_load_path".to_string())),
+        "no preload import node exists, so the import lane must add no rows, got: {impact:?}"
+    );
+    assert!(
+        !impact.affected.is_empty(),
+        "the ExtResource path ref must still surface data.tres, got: {impact:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

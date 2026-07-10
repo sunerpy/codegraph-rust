@@ -240,7 +240,11 @@ impl FrameworkResolver for GodotResolver {
         project_root: &str,
     ) -> Option<FrameworkResolverExtractionResult> {
         if godot_project::is_project_godot(file_path) {
-            return Some(godot_project::parse_project_godot(file_path, content));
+            return Some(godot_project::parse_project_godot(
+                file_path,
+                content,
+                project_root,
+            ));
         }
         if godot_scene::is_tscn(file_path) {
             return Some(godot_scene::parse_tscn(file_path, content));

@@ -103,7 +103,9 @@ impl Cli {
             | Command::Impact { path, .. }
             | Command::Affected { path, .. }
             | Command::Check { path, .. }
-            | Command::Audit { path, .. } => path.clone(),
+            | Command::Audit { path, .. }
+            | Command::Explore { path, .. }
+            | Command::Node { path, .. } => path.clone(),
             Command::Export { path, .. } => path.clone(),
             Command::PromptHook { path, .. } => path.clone(),
             // install/uninstall/skill are not project-scoped — bootstrap from cwd.
@@ -310,6 +312,36 @@ enum Command {
         out: Option<PathBuf>,
         #[arg(long = "no-centrality")]
         no_centrality: bool,
+    },
+    /// Explore an area of the codebase (the shell equivalent of the MCP
+    /// `codegraph_explore` tool). Runs the SAME deterministic engine and prints
+    /// the same output — relevant symbols' verbatim source grouped by file plus
+    /// the call paths between them. NO LLM.
+    Explore {
+        /// Symbol names or a natural-language question to explore.
+        query: String,
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+        /// Max number of files to include source from (clamped 1..=20).
+        #[arg(long = "max-files")]
+        max_files: Option<usize>,
+        #[arg(short = 'j', long = "json")]
+        json: bool,
+    },
+    /// Read one symbol or file (the shell equivalent of the MCP `codegraph_node`
+    /// tool). Runs the SAME engine: for a symbol it prints its source plus the
+    /// caller/callee trail; for a file it prints the line-numbered source plus
+    /// which files depend on it. NO LLM.
+    Node {
+        /// A symbol name, or a file path/basename to read.
+        target: String,
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+        /// Symbol mode: return just the file's symbol map instead of source.
+        #[arg(long = "symbols-only")]
+        symbols_only: bool,
+        #[arg(short = 'j', long = "json")]
+        json: bool,
     },
     // Upstream flags/output: upstream bin/codegraph.ts:1864-1870, 1871-1920.
     // `--global`/`--local` are convenience aliases for `--location` (task spec).
@@ -545,6 +577,18 @@ fn run(cli: Cli) -> Result<()> {
             out,
             no_centrality,
         } => cmd_export(path, out, no_centrality),
+        Command::Explore {
+            query,
+            path,
+            max_files,
+            json,
+        } => cmd_explore(query, path, max_files, json),
+        Command::Node {
+            target,
+            path,
+            symbols_only,
+            json,
+        } => cmd_node(target, path, symbols_only, json),
         Command::Install {
             target,
             location,
@@ -2600,6 +2644,89 @@ fn cmd_impact(
     Ok(())
 }
 
+fn cmd_explore(
+    query: String,
+    path: Option<PathBuf>,
+    max_files: Option<usize>,
+    json_output: bool,
+) -> Result<()> {
+    let project = resolve_required_project(path)?;
+    let engine = codegraph_mcp::CodeGraphEngine::open(&project)?;
+    let mut args = json!({ "query": query });
+    if let Some(max_files) = max_files {
+        args["maxFiles"] = json!(max_files);
+    }
+    let result = engine.execute("codegraph_explore", &args);
+    print_engine_result("explore", &query, &result, json_output)
+}
+
+fn cmd_node(
+    target: String,
+    path: Option<PathBuf>,
+    symbols_only: bool,
+    json_output: bool,
+) -> Result<()> {
+    let project = resolve_required_project(path)?;
+    let engine = codegraph_mcp::CodeGraphEngine::open(&project)?;
+    let args = if node_target_is_file(&engine, &target) {
+        json!({ "file": target, "symbolsOnly": symbols_only })
+    } else {
+        json!({ "symbol": target, "includeCode": true })
+    };
+    let result = engine.execute("codegraph_node", &args);
+    print_engine_result("node", &target, &result, json_output)
+}
+
+/// Decide whether a `codegraph node <target>` argument names an indexed FILE (→
+/// file-view mode) or a SYMBOL (→ symbol mode). A path separator or a match
+/// against an indexed file path means file mode; a bare identifier is a symbol.
+fn node_target_is_file(engine: &codegraph_mcp::CodeGraphEngine, target: &str) -> bool {
+    if target.contains(['/', '\\']) {
+        return true;
+    }
+    engine
+        .indexed_file_paths()
+        .map(|paths| {
+            paths
+                .iter()
+                .any(|p| p == target || p.rsplit('/').next() == Some(target))
+        })
+        .unwrap_or(false)
+}
+
+/// Render an MCP-engine `ToolResult` for a CLI subcommand: the plain rendered
+/// text (matching the MCP tool byte-for-byte), or a `{command, query, output,
+/// isError}` JSON envelope under `--json`. A tool-level error exits non-zero so
+/// scripts can detect a failed lookup.
+fn print_engine_result(
+    command: &str,
+    query: &str,
+    result: &codegraph_mcp::protocol::ToolResult,
+    json_output: bool,
+) -> Result<()> {
+    let text = result
+        .content
+        .iter()
+        .map(|c| c.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let is_error = result.is_error.unwrap_or(false);
+    if json_output {
+        print_json_pretty(&json!({
+            "command": command,
+            "query": query,
+            "output": text,
+            "isError": is_error,
+        }))?;
+    } else {
+        println!("{text}");
+    }
+    if is_error {
+        bail!("codegraph {command} failed: {text}");
+    }
+    Ok(())
+}
+
 fn cmd_affected(
     files: Vec<String>,
     path: Option<PathBuf>,
@@ -2627,6 +2754,7 @@ fn cmd_affected(
             }
             let mut dependents = store.dependent_file_paths(&current)?;
             dependents.extend(store.dependent_file_paths_unresolved(&current)?);
+            dependents.extend(store.dependent_file_paths_via_import_name(&current)?);
             dependents.sort();
             dependents.dedup();
             for dependent in dependents {
