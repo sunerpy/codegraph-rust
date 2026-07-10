@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.29.0](https://github.com/sunerpy/codegraph-rust/compare/v0.28.4...v0.29.0) (2026-07-10)
+
+
+### Features
+
+* complete Godot static-graph reverse edges and add CLI explore/node ([#133](https://github.com/sunerpy/codegraph-rust/issues/133)) ([158a1e0](https://github.com/sunerpy/codegraph-rust/commit/158a1e0988c38cf9f8b6e330bf71e3af6ef2b6b0))
+
 ## [0.28.4](https://github.com/sunerpy/codegraph-rust/compare/v0.28.3...v0.28.4) (2026-07-10)
 
 
