@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.28.3](https://github.com/sunerpy/codegraph-rust/compare/v0.28.2...v0.28.3) (2026-07-10)
+
+
+### Bug Fixes
+
+* **cli:** serve MCP handshake immediately on cold start ([#129](https://github.com/sunerpy/codegraph-rust/issues/129)) ([d0d7298](https://github.com/sunerpy/codegraph-rust/commit/d0d72986fe6617b7cc0730cb26bedc6d5f37098f))
+
 ## [0.28.2](https://github.com/sunerpy/codegraph-rust/compare/v0.28.1...v0.28.2) (2026-07-09)
 
 
