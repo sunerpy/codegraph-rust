@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.28.4](https://github.com/sunerpy/codegraph-rust/compare/v0.28.3...v0.28.4) (2026-07-10)
+
+
+### Bug Fixes
+
+* **ci:** gate release publish on the tag commit's CI and de-flake reopen test ([#131](https://github.com/sunerpy/codegraph-rust/issues/131)) ([81fcb83](https://github.com/sunerpy/codegraph-rust/commit/81fcb8387d08ff572f40366f88bab07df33c51af))
+
 ## [0.28.3](https://github.com/sunerpy/codegraph-rust/compare/v0.28.2...v0.28.3) (2026-07-10)
 
 
