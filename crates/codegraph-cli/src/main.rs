@@ -1377,10 +1377,7 @@ fn cmd_serve(
                 .context("running as detached MCP daemon");
             }
             ServeMode::SpawnOrProxy => {
-                if let Some(result) = spawn_or_proxy(project.clone(), &project_root, no_watch) {
-                    return result;
-                }
-                return serve_direct(project, &project_root, no_watch, explicit_path);
+                return serve_spawn_or_proxy(project, &project_root, no_watch, explicit_path);
             }
         }
     }
@@ -2079,45 +2076,81 @@ fn start_direct_watcher(
 const DAEMON_SOCKET_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 const DAEMON_SOCKET_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(400);
 
-/// Spawn the shared daemon if needed, poll for its socket, then run the real
-/// proxy. Returns `Some(Ok(()))` when the proxy bridged the session (caller
-/// must NOT also serve direct), or `None` when the proxy could not attach
-/// (daemon spawn failed, socket never appeared, or a version mismatch) — the
-/// caller then transparently falls back to direct serving.
-fn spawn_or_proxy(
-    _project: Option<PathBuf>,
+/// What a `SpawnOrProxy` serve should do given whether a shared daemon is
+/// already live for this project. Split out as a pure decision so the cold vs
+/// warm handshake behavior is unit-testable without touching sockets/processes.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ColdStartAction {
+    /// A daemon is ALREADY running: attach to it via the real proxy (the proxy
+    /// answers `initialize`/`tools/list` locally and forwards tool calls). Fast.
+    ProxyToRunningDaemon,
+    /// COLD start (no live daemon): spawn the shared daemon FIRE-AND-FORGET for
+    /// the NEXT session's warm attach, but serve THIS session DIRECT immediately
+    /// so the MCP handshake is answered without waiting on daemon readiness.
+    SpawnDaemonAndServeDirect,
+}
+
+/// Decide the `SpawnOrProxy` handshake strategy. WARM (daemon live) proxies;
+/// COLD spawns the shared daemon fire-and-forget and serves this session direct.
+pub fn cold_start_action(daemon_running: bool) -> ColdStartAction {
+    if daemon_running {
+        ColdStartAction::ProxyToRunningDaemon
+    } else {
+        ColdStartAction::SpawnDaemonAndServeDirect
+    }
+}
+
+/// `SpawnOrProxy` serve entry point. On a WARM start (a shared daemon is already
+/// live) it attaches via [`run_proxy`], falling back to direct serving only if
+/// the attach fails. On a COLD start (no live daemon) it spawns the shared
+/// daemon FIRE-AND-FORGET — so the NEXT session attaches warm — and immediately
+/// serves THIS session DIRECT, answering the MCP `initialize`/`tools/list`
+/// handshake without blocking on daemon socket readiness. This is the fix for
+/// the cold-start handshake race (opencode marking codegraph `failed` when the
+/// spawn→poll→proxy→heal prelude exceeded its MCP init timeout under load).
+fn serve_spawn_or_proxy(
+    project: Option<PathBuf>,
     project_root: &Path,
     no_watch: bool,
-) -> Option<Result<()>> {
+    explicit_path: bool,
+) -> Result<()> {
     tracing::debug!(
         pid_path = %codegraph_daemon::daemon_pid_path(project_root).display(),
         socket_path = %codegraph_daemon::recorded_socket_path(project_root).display(),
-        "spawn_or_proxy: begin"
+        "serve_spawn_or_proxy: begin"
     );
-    if daemon_already_running(project_root) {
-        tracing::debug!("spawn_or_proxy: attaching to existing daemon");
-    } else {
-        match std::env::current_exe() {
-            Ok(exe) => {
-                if let Err(err) =
-                    codegraph_daemon::spawn_detached_daemon(&exe, project_root, no_watch)
-                {
-                    tracing::debug!(error = %err, "spawn_or_proxy: daemon spawn failed; falling back to direct");
-                    return None;
-                }
-                tracing::debug!("spawn_or_proxy: spawned new daemon");
-                poll_for_daemon_socket(project_root);
+    match cold_start_action(daemon_already_running(project_root)) {
+        ColdStartAction::ProxyToRunningDaemon => {
+            tracing::debug!("serve_spawn_or_proxy: attaching to existing daemon (warm)");
+            if let Some(result) = proxy_to_running_daemon(project_root) {
+                return result;
             }
-            Err(err) => {
-                tracing::debug!(error = %err, "spawn_or_proxy: current_exe unavailable; falling back to direct");
-                return None;
-            }
+            serve_direct(project, project_root, no_watch, explicit_path)
+        }
+        ColdStartAction::SpawnDaemonAndServeDirect => {
+            // Cold: kick off the shared daemon for FUTURE sessions, then serve
+            // this session direct immediately. The spawn is best-effort and
+            // idempotent — `start_or_attach` (via the daemon's pid lock) makes N
+            // concurrent cold sessions converge on at most one daemon, and a
+            // failed/lost race just means this session serves direct (which it
+            // does anyway). We deliberately do NOT poll or proxy here: that
+            // prelude is exactly what blew past opencode's handshake timeout.
+            spawn_shared_daemon_best_effort(project_root, no_watch);
+            serve_direct(project, project_root, no_watch, explicit_path)
         }
     }
+}
 
+/// Attach to an ALREADY-running shared daemon via the real proxy. Returns
+/// `Some(Ok(()))` when the proxy bridged the session (caller must NOT also serve
+/// direct), or `None` when it could not attach (socket gone, version mismatch,
+/// or connect error) — the caller then falls back to direct serving. Unchanged
+/// proxy semantics: `run_proxy` answers `initialize`/`tools/list` locally and
+/// forwards tool calls; its fd half-close / ppid-watchdog teardown is untouched.
+fn proxy_to_running_daemon(project_root: &Path) -> Option<Result<()>> {
     let socket_path = codegraph_daemon::recorded_socket_path(project_root);
     if !socket_path.exists() {
-        tracing::debug!("spawn_or_proxy: daemon socket never appeared; falling back to direct");
+        tracing::debug!("proxy_to_running_daemon: daemon socket missing; falling back to direct");
         heal_stale_daemon_if_dead(project_root);
         return None;
     }
@@ -2132,13 +2165,36 @@ fn spawn_or_proxy(
     ) {
         Ok(codegraph_daemon::ProxyOutcome::Proxied) => Some(Ok(())),
         Ok(codegraph_daemon::ProxyOutcome::VersionMismatch) => {
-            tracing::debug!("spawn_or_proxy: daemon version mismatch; falling back to direct");
+            tracing::debug!(
+                "proxy_to_running_daemon: daemon version mismatch; falling back to direct"
+            );
             None
         }
         Err(err) => {
-            tracing::debug!(error = %err, "spawn_or_proxy: proxy attach failed; falling back to direct");
+            tracing::debug!(error = %err, "proxy_to_running_daemon: proxy attach failed; falling back to direct");
             heal_stale_daemon_if_dead(project_root);
             None
+        }
+    }
+}
+
+/// Fire-and-forget spawn of the shared daemon on a cold start so subsequent
+/// sessions attach warm. Best-effort: errors are logged and swallowed (this
+/// session serves direct regardless), and the daemon's own pid lock guarantees
+/// N concurrent cold starts do not produce N daemons. Does NOT block on socket
+/// readiness — that would reintroduce the handshake stall this fix removes.
+fn spawn_shared_daemon_best_effort(project_root: &Path, no_watch: bool) {
+    match std::env::current_exe() {
+        Ok(exe) => match codegraph_daemon::spawn_detached_daemon(&exe, project_root, no_watch) {
+            Ok(()) => {
+                tracing::debug!("serve_spawn_or_proxy: spawned shared daemon (fire-and-forget)");
+            }
+            Err(err) => {
+                tracing::debug!(error = %err, "serve_spawn_or_proxy: daemon spawn failed; serving direct only");
+            }
+        },
+        Err(err) => {
+            tracing::debug!(error = %err, "serve_spawn_or_proxy: current_exe unavailable; serving direct only");
         }
     }
 }
@@ -2212,9 +2268,9 @@ pub fn select_serve_mode(
 #[cfg(test)]
 mod serve_mode_tests {
     use super::{
-        ServeMode, debug_enabled, effective_log_level, emit_serve_startup_debug,
-        guard_indexable_root, select_serve_mode, should_run_daemon_services,
-        should_run_serve_services,
+        ColdStartAction, ServeMode, cold_start_action, debug_enabled, effective_log_level,
+        emit_serve_startup_debug, guard_indexable_root, select_serve_mode,
+        should_run_daemon_services, should_run_serve_services,
     };
     use std::path::Path;
     use std::sync::Mutex;
@@ -2293,6 +2349,20 @@ mod serve_mode_tests {
         assert_eq!(
             select_serve_mode(false, false, true),
             ServeMode::SpawnOrProxy
+        );
+    }
+
+    #[test]
+    fn cold_start_action_warm_proxies_cold_spawns_then_serves_direct() {
+        assert_eq!(
+            cold_start_action(true),
+            ColdStartAction::ProxyToRunningDaemon,
+            "a live daemon ⇒ attach via proxy (warm path unchanged)"
+        );
+        assert_eq!(
+            cold_start_action(false),
+            ColdStartAction::SpawnDaemonAndServeDirect,
+            "no live daemon ⇒ fire-and-forget spawn + serve direct immediately (no blocking proxy)"
         );
     }
 
