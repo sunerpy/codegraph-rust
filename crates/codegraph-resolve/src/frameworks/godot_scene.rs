@@ -60,7 +60,8 @@
 //! quote, or an `ExtResource("id")` whose id has no matching `ext_resource`
 //! declaration is skipped, never panics. An empty file yields an empty result.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 
 use codegraph_core::node_id::generate_node_id;
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind, ReferenceSubkind};
@@ -169,6 +170,96 @@ pub(crate) fn parse_tscn(file_path: &str, content: &str) -> FrameworkResolverExt
     }
 
     FrameworkResolverExtractionResult { nodes, references }
+}
+
+/// Parse the scene's own UID from its `[gd_scene ... uid="uid://…"]` header
+/// line. Godot stamps every saved `.tscn` with a stable `uid="uid://<id>"`
+/// attribute on the opening `gd_scene` header; this is the id a
+/// `project.godot` `run/main_scene="uid://<id>"` (and `[ext_resource
+/// uid="uid://…"]` handles) point at.
+///
+/// Returns the FULL `uid://<id>` string (scheme kept, matching how it appears in
+/// `run/main_scene`), or `None` when the file has no `gd_scene` header or no
+/// `uid` attribute. Scans only the header — resource contents are not
+/// interpreted (static-format parse only, in scope per the doc).
+pub(crate) fn parse_scene_uid(content: &str) -> Option<String> {
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || is_comment(line) {
+            continue;
+        }
+        let header = parse_section_header(line)?;
+        if header.name != "gd_scene" {
+            // The first non-blank header of a `.tscn` is always `[gd_scene …]`;
+            // if the first header is anything else there is no scene uid.
+            return None;
+        }
+        let uid = attr(&header.attrs, "uid")?.trim();
+        if uid.is_empty() {
+            return None;
+        }
+        return Some(uid.to_string());
+    }
+    None
+}
+
+/// Build a deterministic `uid://<id>` → repo-relative `.tscn` path map by
+/// reading every `.tscn` under `project_root`.
+///
+/// Determinism: the discovered files are sorted lexicographically before
+/// parsing, and the map is FIRST-WRITE-WINS on a duplicate uid (mirroring the
+/// `[autoload]` dup rule in `godot_project::autoload_script_paths`), so the
+/// result is independent of directory-iteration order. A file with no
+/// `gd_scene`/`uid` header contributes nothing. An empty or unreadable
+/// `project_root` yields an empty map.
+pub(crate) fn scene_uid_map(project_root: &str) -> BTreeMap<String, String> {
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    if project_root.is_empty() {
+        return out;
+    }
+    let root = Path::new(project_root);
+    let mut tscn_files: Vec<PathBuf> = Vec::new();
+    collect_tscn_files(root, &mut tscn_files);
+    tscn_files.sort();
+    for full in tscn_files {
+        let Ok(rel) = full.strip_prefix(root) else {
+            continue;
+        };
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        let Ok(content) = std::fs::read_to_string(&full) else {
+            continue;
+        };
+        if let Some(uid) = parse_scene_uid(&content) {
+            out.entry(uid).or_insert(rel);
+        }
+    }
+    out
+}
+
+/// Recursively collect `.tscn` files under `dir`, skipping the engine-managed
+/// `.godot/` cache and any hidden dir (`.git`, etc.). Errors are ignored
+/// (tolerant walk); ordering is imposed by the caller's sort.
+fn collect_tscn_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            let skip = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with('.'));
+            if !skip {
+                collect_tscn_files(&path, out);
+            }
+        } else if is_tscn(&path.to_string_lossy()) {
+            out.push(path);
+        }
+    }
 }
 
 /// The scene node a `key = value` block currently belongs to.
@@ -528,4 +619,87 @@ fn quote(unquoted: &str) -> String {
     // somehow still carries quotes.
     let bare = strip_quotes(unquoted);
     format!("\"{bare}\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_scene_uid_reads_gd_scene_header() {
+        let content = "[gd_scene load_steps=2 format=3 uid=\"uid://dr6r06q24gfti\"]\n\n[node name=\"Root\" type=\"Node\"]\n";
+        assert_eq!(
+            parse_scene_uid(content).as_deref(),
+            Some("uid://dr6r06q24gfti")
+        );
+    }
+
+    #[test]
+    fn parse_scene_uid_none_without_uid_attr() {
+        let content = "[gd_scene format=3]\n\n[node name=\"Root\" type=\"Node\"]\n";
+        assert!(parse_scene_uid(content).is_none());
+    }
+
+    #[test]
+    fn parse_scene_uid_none_when_first_header_is_not_gd_scene() {
+        let content = "[node name=\"Root\" type=\"Node\"]\n";
+        assert!(parse_scene_uid(content).is_none());
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-sceneuid-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    #[test]
+    fn scene_uid_map_maps_uid_to_relative_path() {
+        let dir = temp_dir("basic");
+        std::fs::create_dir_all(dir.join("Scenes")).unwrap();
+        std::fs::write(
+            dir.join("Scenes/menu.tscn"),
+            "[gd_scene format=3 uid=\"uid://xyz\"]\n",
+        )
+        .unwrap();
+        let map = scene_uid_map(&dir.to_string_lossy());
+        assert_eq!(
+            map.get("uid://xyz").map(String::as_str),
+            Some("Scenes/menu.tscn")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn scene_uid_map_first_write_wins_on_dup_uid() {
+        let dir = temp_dir("dup");
+        std::fs::write(
+            dir.join("a.tscn"),
+            "[gd_scene format=3 uid=\"uid://same\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b.tscn"),
+            "[gd_scene format=3 uid=\"uid://same\"]\n",
+        )
+        .unwrap();
+        let map = scene_uid_map(&dir.to_string_lossy());
+        assert_eq!(
+            map.get("uid://same").map(String::as_str),
+            Some("a.tscn"),
+            "sorted walk + first-write-wins picks the lexicographically first path"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn scene_uid_map_empty_root_is_empty() {
+        assert!(scene_uid_map("").is_empty());
+    }
 }

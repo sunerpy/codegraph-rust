@@ -83,6 +83,19 @@ impl CodeGraphEngine {
         HashSet::new()
     }
 
+    /// Indexed file paths (repo-relative). Exposed for the CLI `node`
+    /// subcommand, which uses it to decide whether a bare argument names a file
+    /// (file-view mode) or a symbol — the CLI has one positional where the MCP
+    /// tool has separate `file`/`symbol` params.
+    pub fn indexed_file_paths(&self) -> anyhow::Result<Vec<String>> {
+        Ok(self
+            .store
+            .all_files()?
+            .into_iter()
+            .map(|f| f.path)
+            .collect())
+    }
+
     // === Tool dispatch ===================================================
 
     /// Dispatch by tool name. Mirrors `ToolHandler.execute` switch

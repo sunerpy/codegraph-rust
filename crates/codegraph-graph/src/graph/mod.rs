@@ -1114,6 +1114,27 @@ impl<'store> GraphTraverser<'store> {
             }
         }
 
+        for node in self.store.nodes_by_kind(NodeKind::Import)? {
+            let Some(stripped) = node.name.strip_prefix("res://") else {
+                continue;
+            };
+            if strip_res_prefix(&normalize_rel(stripped)) != changed {
+                continue;
+            }
+            let import_edges = self
+                .store
+                .edges_by_target_kind(&node.id, Some(EdgeKind::Imports))?;
+            for edge in import_edges {
+                affected.push(AffectedRef {
+                    from_file: node.file_path.clone(),
+                    line: edge.line.unwrap_or(node.start_line),
+                    edge_kind: edge.kind.as_str().to_string(),
+                    target: changed.clone(),
+                    edge_subkind: edge_metadata_subkind(&edge),
+                });
+            }
+        }
+
         affected.sort_by(|a, b| {
             a.from_file
                 .cmp(&b.from_file)

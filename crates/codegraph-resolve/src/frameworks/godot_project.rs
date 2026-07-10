@@ -74,9 +74,16 @@ pub(crate) fn is_project_godot(file_path: &str) -> bool {
 pub(crate) fn parse_project_godot(
     file_path: &str,
     content: &str,
+    project_root: &str,
 ) -> FrameworkResolverExtractionResult {
     let mut nodes: Vec<Node> = Vec::new();
     let mut references: Vec<RefView> = Vec::new();
+
+    // `run/main_scene` may be a `uid://…` (Godot 4.x default) rather than a
+    // `res://…` path. Resolving it needs the project-wide `uid → .tscn path`
+    // map, built lazily on first `uid://` main_scene so a project without one
+    // pays nothing.
+    let mut scene_uids: Option<std::collections::BTreeMap<String, String>> = None;
 
     let mut section: Option<Section> = None;
     // Track whether we are inside a multi-line `key={ ... }` value so its inner
@@ -119,7 +126,15 @@ pub(crate) fn parse_project_godot(
             }
             Section::Application => {
                 if key == "run/main_scene" {
-                    emit_main_scene(file_path, line_no, value, &mut nodes, &mut references);
+                    emit_main_scene(
+                        file_path,
+                        line_no,
+                        value,
+                        project_root,
+                        &mut scene_uids,
+                        &mut nodes,
+                        &mut references,
+                    );
                 }
             }
             Section::Input => {
@@ -231,20 +246,50 @@ fn emit_autoload(
 }
 
 /// Emit a main-scene marker node + a `References` edge to the scene path.
+///
+/// `run/main_scene` is either a `res://…` path (mapped directly) or, in Godot
+/// 4.x by default, a `uid://…` handle that must be resolved through the
+/// project-wide scene `uid → path` map (built lazily into `scene_uids` on first
+/// need). Either way the emitted edge is an UNTAGGED `References` edge (subkind
+/// `None`) — identical to the existing `res://` path, since the reverse-consume
+/// lane (`resource_impact`) already surfaces untagged Godot `References` refs by
+/// path. A `uid://…` with no mapped scene yields NO edge (unknown-uid → no
+/// panic, no guess).
 fn emit_main_scene(
     file_path: &str,
     line_no: i64,
     value: &str,
+    project_root: &str,
+    scene_uids: &mut Option<std::collections::BTreeMap<String, String>>,
     nodes: &mut Vec<Node>,
     references: &mut Vec<RefView>,
 ) {
-    let Some(target) = map_res_path(value) else {
+    let Some(target) = resolve_main_scene(value, project_root, scene_uids) else {
         return;
     };
     let node = constant_node(file_path, line_no, "main_scene");
     let node_id = node.id.clone();
     nodes.push(node);
     references.push(reference(node_id, target, line_no, file_path));
+}
+
+/// Resolve a `run/main_scene` value to a repo-relative scene path. A `res://…`
+/// value maps via the shared [`map_res_path`]; a `uid://…` value is looked up in
+/// the lazily-built scene uid map. Any other form yields `None`.
+fn resolve_main_scene(
+    value: &str,
+    project_root: &str,
+    scene_uids: &mut Option<std::collections::BTreeMap<String, String>>,
+) -> Option<String> {
+    if let Some(target) = map_res_path(value) {
+        return Some(target);
+    }
+    let uid = super::godot_common::strip_quotes(value).trim();
+    if !uid.starts_with("uid://") {
+        return None;
+    }
+    let map = scene_uids.get_or_insert_with(|| super::godot_scene::scene_uid_map(project_root));
+    map.get(uid).cloned()
 }
 
 /// Emit a node per input action name (the key). The value (a dictionary
@@ -434,5 +479,75 @@ X=\"res://x.gd\"
     #[test]
     fn autoload_script_paths_empty_when_no_autoload() {
         assert!(autoload_script_paths("; comment\nconfig_version=5\n").is_empty());
+    }
+
+    #[test]
+    fn resolve_main_scene_maps_res_path_without_uid_map() {
+        let mut uids: Option<std::collections::BTreeMap<String, String>> = None;
+        let got = resolve_main_scene("\"res://main.tscn\"", "", &mut uids);
+        assert_eq!(got.as_deref(), Some("main.tscn"));
+        assert!(uids.is_none(), "res:// path must not build the uid map");
+    }
+
+    #[test]
+    fn resolve_main_scene_non_res_non_uid_is_none() {
+        let mut uids: Option<std::collections::BTreeMap<String, String>> = None;
+        assert!(resolve_main_scene("\"user://x.tscn\"", "", &mut uids).is_none());
+        assert!(uids.is_none());
+    }
+
+    #[test]
+    fn emit_main_scene_uid_resolves_via_scene_map() {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-mainscene-uid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("Scenes/MainMenu")).expect("mkdir");
+        std::fs::write(
+            dir.join("Scenes/MainMenu/main_menu.tscn"),
+            "[gd_scene load_steps=2 format=3 uid=\"uid://abc123\"]\n\n[node name=\"Root\" type=\"Node\"]\n",
+        )
+        .expect("write tscn");
+        let root = dir.to_string_lossy().to_string();
+
+        let content = "config_version=5\n\n[application]\nrun/main_scene=\"uid://abc123\"\n";
+        let result = parse_project_godot("project.godot", content, &root);
+
+        assert_eq!(result.references.len(), 1, "one main_scene ref emitted");
+        let r = &result.references[0];
+        assert_eq!(r.reference_name, "Scenes/MainMenu/main_menu.tscn");
+        assert_eq!(r.reference_kind, EdgeKind::References);
+        assert_eq!(
+            r.reference_subkind, None,
+            "uid main_scene ref must be untagged, like the res:// path"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn emit_main_scene_unknown_uid_yields_no_ref() {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-mainscene-uid-miss-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let root = dir.to_string_lossy().to_string();
+
+        let content = "config_version=5\n\n[application]\nrun/main_scene=\"uid://missing\"\n";
+        let result = parse_project_godot("project.godot", content, &root);
+        assert!(
+            result.references.is_empty(),
+            "unknown uid must emit no ref, got: {:?}",
+            result.references
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

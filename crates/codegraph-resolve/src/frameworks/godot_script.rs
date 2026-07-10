@@ -407,11 +407,17 @@ fn scan_call_with_string_arg(
     }
 }
 
-/// `X.connect(handler)` / `sig.timeout.connect(_on_timeout)` — the handler is the
-/// FIRST argument and is normally a bare identifier (a method reference), not a
-/// quoted string. A literal identifier first arg → reference to the handler NAME
-/// ([`EdgeKind::Calls`]); a call-expression or non-identifier first arg →
-/// dynamic-unresolved sentinel.
+/// `X.connect(handler)` / `sig.timeout.connect(_on_timeout)` — the Godot 4
+/// signal-as-object form, where the handler is the FIRST argument (a bare method
+/// reference, not a quoted string).
+///
+/// Also handles the STRING 2-arg form `X.connect("<signal>", <handler>)` (the
+/// classic `Object.connect(signal_name, callable)` API): when the FIRST arg is a
+/// string literal (the signal NAME), the handler is the SECOND arg. That second
+/// arg is classified by the SAME [`connect_handler`] used for the object form, so
+/// both emit the identical [`EdgeKind::Calls`] edge shape (a literal identifier
+/// handler → reference to the handler NAME; a call-expression / non-identifier /
+/// cross-object callable → dynamic-unresolved sentinel).
 fn scan_connect(file_path: &str, line_no: i64, line: &str, from: &str, out: &mut Vec<RefView>) {
     let mut search_from = 0usize;
     while let Some(rel) = line[search_from..].find(".connect(") {
@@ -419,8 +425,17 @@ fn scan_connect(file_path: &str, line_no: i64, line: &str, from: &str, out: &mut
         let after = dot + ".connect(".len();
         search_from = after;
         let args = &line[after..];
-        let target = first_arg(args);
-        match connect_handler(target) {
+        let first = first_arg(args);
+        // The classic string 2-arg form `connect("<signal>", <handler>)`: a
+        // string-literal FIRST arg is the signal NAME, so the handler is the
+        // SECOND arg. The object form `connect(<handler>)` has a non-string first
+        // arg and remains the handler itself. Route the correct arg through the
+        // shared `connect_handler` so both forms emit the same edge shape.
+        let handler_arg = match literal_or_dynamic(first) {
+            ArgKind::Literal(_) => second_arg(args),
+            ArgKind::Dynamic => first,
+        };
+        match connect_handler(handler_arg) {
             ArgKind::Literal(name) if !name.is_empty() => {
                 out.push(reference(from, name, EdgeKind::Calls, line_no, file_path));
             }
@@ -808,6 +823,42 @@ fn first_arg(args: &str) -> &str {
     args.trim()
 }
 
+/// Extract the SECOND argument substring from a call's argument list (the text
+/// after the opening `(`). Skips the first arg up to the top-level `,`, then
+/// returns the next arg via [`first_arg`] on the remainder. Empty when there is
+/// no second argument. Paren/quote depth is tracked exactly like [`first_arg`] so
+/// a nested call/array/string in the first arg does not split it early.
+fn second_arg(args: &str) -> &str {
+    let bytes = args.as_bytes();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            if b == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                if depth == 0 {
+                    return "";
+                }
+                depth -= 1;
+            }
+            b',' if depth == 0 => return first_arg(&args[i + 1..]),
+            _ => {}
+        }
+        i += 1;
+    }
+    ""
+}
+
 /// Parse a `func <name>(...)` header → the function name. Returns `None` for any
 /// line that is not a function header. Handles `static func`, leading
 /// annotations are on their own line so not considered here.
@@ -1025,6 +1076,140 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].reference_name, dynamic_name("connect"));
         assert_eq!(out[0].reference_kind, EdgeKind::Calls);
+    }
+
+    // ---- scan_connect: object-form REGRESSION GUARD (m1) ----
+    // These pin the pre-existing non-string `.connect(<handler>)` classifications
+    // as byte-identical after adding the string 2-arg branch: the string-form
+    // change must NOT alter the object-form output.
+
+    #[test]
+    fn scan_connect_object_form_bind_head_unchanged() {
+        // `sig.connect(cb.bind(x))` — object form, bind-head handler. The first
+        // arg is NOT a string, so the branch keeps it as the handler; classifies
+        // to the bind head `cb`. Byte-identical to before the string-form edit.
+        let mut out = Vec::new();
+        scan_connect(
+            "a.gd",
+            5,
+            "\tsig.connect(_on_died.bind(c))",
+            "file:a.gd",
+            &mut out,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].reference_name, "_on_died");
+        assert_eq!(out[0].reference_kind, EdgeKind::Calls);
+    }
+
+    #[test]
+    fn scan_connect_object_form_callable_self_unchanged() {
+        // `sig.connect(Callable(self, "m"))` — object form, Callable handler. The
+        // first arg starts with `Callable(`, not a string literal, so it stays the
+        // handler and resolves to the method name. Guard against regression.
+        let mut out = Vec::new();
+        scan_connect(
+            "a.gd",
+            6,
+            "\tsig.connect(Callable(self, \"_on_pressed\"))",
+            "file:a.gd",
+            &mut out,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].reference_name, "_on_pressed");
+        assert_eq!(out[0].reference_kind, EdgeKind::Calls);
+    }
+
+    // ---- scan_connect: NEW string 2-arg form `connect("<sig>", <handler>)` ----
+
+    #[test]
+    fn scan_connect_string_form_bind_handler_is_literal() {
+        // `wp.connect("destroyed", _on_x.bind(wp))` — the string first arg is the
+        // signal name, so the handler is the SECOND arg; its bind head `_on_x`
+        // resolves to a literal Calls reference (same edge as the object form).
+        let mut out = Vec::new();
+        scan_connect(
+            "a.gd",
+            7,
+            "\twp.connect(\"destroyed\", _on_x.bind(wp))",
+            "file:a.gd",
+            &mut out,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].reference_name, "_on_x");
+        assert_eq!(out[0].reference_kind, EdgeKind::Calls);
+    }
+
+    #[test]
+    fn scan_connect_string_form_bare_ident_handler_is_literal() {
+        // `b.connect("pressed", _on_y)` — bare-ident second-arg handler.
+        let mut out = Vec::new();
+        scan_connect(
+            "a.gd",
+            8,
+            "\tb.connect(\"pressed\", _on_y)",
+            "file:a.gd",
+            &mut out,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].reference_name, "_on_y");
+        assert_eq!(out[0].reference_kind, EdgeKind::Calls);
+    }
+
+    #[test]
+    fn scan_connect_string_form_call_expr_handler_is_dynamic() {
+        // `o.connect("sig", some_expr())` — the second-arg handler is a call
+        // expression → dynamic sentinel (determinism contract preserved).
+        let mut out = Vec::new();
+        scan_connect(
+            "a.gd",
+            9,
+            "\to.connect(\"sig\", some_expr())",
+            "file:a.gd",
+            &mut out,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].reference_name, dynamic_name("connect"));
+        assert_eq!(out[0].reference_kind, EdgeKind::Calls);
+    }
+
+    #[test]
+    fn scan_connect_string_form_cross_object_callable_is_dynamic() {
+        // `o.connect("sig", Callable(other, "m"))` — a cross-object callable
+        // second-arg handler stays dynamic (non-self/this receiver).
+        let mut out = Vec::new();
+        scan_connect(
+            "a.gd",
+            10,
+            "\to.connect(\"sig\", Callable(other, \"m\"))",
+            "file:a.gd",
+            &mut out,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].reference_name, dynamic_name("connect"));
+        assert_eq!(out[0].reference_kind, EdgeKind::Calls);
+    }
+
+    // ---- second_arg: extraction primitive ----
+
+    #[test]
+    fn second_arg_plain() {
+        assert_eq!(
+            second_arg("\"destroyed\", _on_x.bind(wp))"),
+            "_on_x.bind(wp)"
+        );
+    }
+
+    #[test]
+    fn second_arg_none_when_single_arg() {
+        // No top-level comma → no second argument → empty.
+        assert_eq!(second_arg("_on_timeout)"), "");
+    }
+
+    #[test]
+    fn second_arg_ignores_comma_inside_first_arg() {
+        // A comma nested in the first arg's parens/string must not split early.
+        assert_eq!(second_arg("f(a, b), _on_y)"), "_on_y");
+        assert_eq!(second_arg("\"a,b\", _on_y)"), "_on_y");
     }
 
     // ---- connect_handler: every classification arm ----
