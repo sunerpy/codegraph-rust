@@ -20,6 +20,8 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  # verify-ci's `gh api` calls read the CI workflow's runs + jobs.
+  actions: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -71,6 +73,106 @@ jobs:
             echo "tag_name=${{ steps.release.outputs.tag_name }}" >> "$GITHUB_OUTPUT"
             echo "version=${{ steps.release.outputs.version }}" >> "$GITHUB_OUTPUT"
           fi
+
+  # ----------------------------------------------------------------
+  # verify-ci: gate the release on the SAME tag commit's CI result.
+  #
+  # We do NOT re-run cargo tests here — we QUERY the existing `CI` workflow
+  # run for the exact tag commit SHA (event=push, branch=main) and wait for
+  # its `CI Success` job to conclude. Gating on that single job (which itself
+  # needs test/audit/windows) is the right wait point: it excludes the slow
+  # informational Coverage job.
+  #
+  # Topology: this runs IN PARALLEL with build-binaries (build-binaries needs
+  # only release-please), so the ~430s cross-compile overlaps with the CI wait.
+  # The gate is enforced downstream at upload-assets (which lists verify-ci in
+  # `needs`) — the first public-facing step that touches the GitHub Release.
+  # build-binaries only produces throwaway artifacts (retention-days: 1), so a
+  # failed/timed-out verify-ci blocks upload-assets + publish-release and leaves
+  # the Release a DRAFT, without weakening the gate.
+  #
+  # This job ALWAYS RUNS when a tag was cut (build_artifacts=='true'); it must
+  # never be SKIPPED, because upload-assets lists it in `needs` and a skipped
+  # needed job would cascade-skip upload-assets. On the workflow_dispatch
+  # (manual re-attach) path there is no new CI run, so the job short-circuits
+  # to success as a no-op; the polling steps run only on the push path.
+  # ----------------------------------------------------------------
+  verify-ci:
+    name: Verify CI Passed
+    needs: release-please
+    if: needs.release-please.outputs.build_artifacts == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Manual re-attach — skip CI gate (no-op success)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          echo "workflow_dispatch: re-attaching binaries to an existing tag; no new CI run to gate on — passing."
+
+      - name: Checkout tag
+        if: github.event_name == 'push'
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - name: Resolve tag commit SHA
+        id: sha
+        if: github.event_name == 'push'
+        run: echo "sha=$(git rev-list -n1 '${{ needs.release-please.outputs.tag_name }}')" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for CI Success on the tag commit
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ steps.sha.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # Bounded poll: ~25 min cap (100 iterations x 15s) inside timeout-minutes: 30.
+          max_iters=100
+          sleep_secs=15
+          run_id=""
+          for i in $(seq 1 "$max_iters"); do
+            # Select the CI workflow's push run on main for the exact tag SHA;
+            # if several exist, take the most recent by created_at.
+            run_id=$(gh api "repos/${REPO}/actions/runs?head_sha=${HEAD_SHA}&event=push&branch=main&per_page=100" \
+              --jq '[.workflow_runs[] | select(.name == "CI")] | sort_by(.created_at) | last | .id // empty')
+            if [ -n "$run_id" ]; then
+              echo "Found CI run ${run_id} for ${HEAD_SHA}"
+              break
+            fi
+            echo "No CI run for ${HEAD_SHA} yet (attempt ${i}/${max_iters}); sleeping ${sleep_secs}s..."
+            sleep "$sleep_secs"
+          done
+          if [ -z "$run_id" ]; then
+            echo "❌ Timed out waiting for a CI run on ${HEAD_SHA}; leaving release as draft."
+            exit 1
+          fi
+          for i in $(seq 1 "$max_iters"); do
+            status=$(gh api "repos/${REPO}/actions/runs/${run_id}/jobs?per_page=100" \
+              --jq '.jobs[] | select(.name == "CI Success") | .status')
+            conclusion=$(gh api "repos/${REPO}/actions/runs/${run_id}/jobs?per_page=100" \
+              --jq '.jobs[] | select(.name == "CI Success") | .conclusion // ""')
+            if [ -z "$status" ]; then
+              echo "CI Success job not present in run ${run_id} yet (attempt ${i}/${max_iters}); sleeping ${sleep_secs}s..."
+              sleep "$sleep_secs"
+              continue
+            fi
+            if [ "$status" != "completed" ]; then
+              echo "CI Success job status=${status} (attempt ${i}/${max_iters}); sleeping ${sleep_secs}s..."
+              sleep "$sleep_secs"
+              continue
+            fi
+            if [ "$conclusion" = "success" ]; then
+              echo "✅ CI Success passed for ${HEAD_SHA}."
+              exit 0
+            fi
+            echo "❌ CI Success concluded '${conclusion}' for ${HEAD_SHA}; blocking release (draft preserved)."
+            exit 1
+          done
+          echo "❌ Timed out waiting for CI Success to complete on ${HEAD_SHA}; leaving release as draft."
+          exit 1
 
   # ----------------------------------------------------------------
   # build-binaries: cross-compile release artifacts for all targets.
@@ -182,7 +284,7 @@ jobs:
   # ----------------------------------------------------------------
   upload-assets:
     name: Upload Release Assets
-    needs: [release-please, build-binaries]
+    needs: [release-please, build-binaries, verify-ci]
     if: needs.release-please.outputs.build_artifacts == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15

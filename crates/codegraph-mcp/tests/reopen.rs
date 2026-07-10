@@ -134,31 +134,34 @@ fn reopens_cached_engine_when_db_replaced_with_new_inode() {
     );
     let reopens_before = reopen_count();
 
-    // When: the db is REPLACED on disk with a fresh index (new identity) whose
-    // content differs (a new symbol `betaSymbol`). The cached engine still holds
-    // an open WAL connection, which on windows blocks deleting the db dir
-    // (OS error 32). Drop the live connections first — `close_cached_handles`
-    // keeps the cache RECORD (with its old identity) while releasing the file
-    // handle, so the next call still detects the identity change and counts
-    // exactly one reopen. Removing the dir first guarantees a freshly built db.
-    let id_before = db_identity(project.path());
+    // When: the db is REPLACED on disk with a fresh index whose content differs
+    // (a new symbol `betaSymbol`). The cached engine still holds an open WAL
+    // connection, which on windows blocks deleting the db dir (OS error 32).
+    // Drop the live connections first — `close_cached_handles` releases the file
+    // handle while keeping the cache RECORD, so the next call reopens exactly
+    // once and re-reads the freshly built db from disk. Removing the dir first
+    // guarantees a freshly built db.
+    //
+    // We deliberately do NOT assert the raw `DbIdentity` changed here. On unix
+    // the identity is the inode, and the OS is free to RECYCLE the just-deleted
+    // db's inode for the rebuilt file (observed under `cargo llvm-cov`: both =
+    // 1343671), so an `assert_ne!(id_before, id_after)` gambles on an OS
+    // implementation detail that delete+rebuild does not guarantee. That inode
+    // assertion was the sole flake source and is redundant with #925's real
+    // contract, which is the BEHAVIORAL outcome asserted below and does not
+    // depend on inode luck: the SAME cached server reopens its engine and serves
+    // the NEW on-disk content. Serving `betaSymbol` (not `alphaSymbol`, not an
+    // open error) is itself the proof the engine reopened against the fresh db.
     server.close_cached_handles();
     fs::remove_dir_all(project.path().join(".codegraph")).unwrap();
     index_into(
         project.path(),
         &[("src/b.ts", "export function betaSymbol() {}\n")],
     );
-    let id_after = db_identity(project.path());
-    assert_ne!(
-        id_before, id_after,
-        "replace must change DbIdentity (inode on unix; \
-         len/creation_time/header-sig fold on non-unix — the rebuild changes \
-         the SQLite page count + schema cookie deterministically)"
-    );
 
     // Then: the SAME server's SAME tool call must REOPEN the engine — without the
-    // #925 fix the cached engine keeps serving inode A and `reopen_count` never
-    // advances (this delta is the deterministic RED probe).
+    // #925 fix the cached engine keeps serving the old db and `reopen_count`
+    // never advances (this delta is the deterministic RED probe).
     let after = search(&mut server, project.path(), "betaSymbol");
     let reopens_after = reopen_count();
     assert_eq!(
