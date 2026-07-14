@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.30.1](https://github.com/sunerpy/codegraph-rust/compare/v0.30.0...v0.30.1) (2026-07-14)
+
+
+### Bug Fixes
+
+* **php:** resolve method calls through $this-&gt; property on its declared type ([#139](https://github.com/sunerpy/codegraph-rust/issues/139)) ([9581bc2](https://github.com/sunerpy/codegraph-rust/commit/9581bc2ed96b034d1980585a88c6cb74f1391c86))
+
 ## [0.30.0](https://github.com/sunerpy/codegraph-rust/compare/v0.29.1...v0.30.0) (2026-07-14)
 
 
