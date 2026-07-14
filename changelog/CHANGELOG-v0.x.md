@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.31.1](https://github.com/sunerpy/codegraph-rust/compare/v0.31.0...v0.31.1) (2026-07-14)
+
+
+### Performance Improvements
+
+* **resolve:** bound resolution-tail memory on very large graphs ([#143](https://github.com/sunerpy/codegraph-rust/issues/143)) ([696c681](https://github.com/sunerpy/codegraph-rust/commit/696c681ca0e95dbb8ec6d53a9509c295e4ad380c))
+
 ## [0.31.0](https://github.com/sunerpy/codegraph-rust/compare/v0.30.1...v0.31.0) (2026-07-14)
 
 
