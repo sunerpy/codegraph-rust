@@ -73,6 +73,45 @@ fn has_chain_shape(name: &str) -> bool {
         && method.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
+/// Node-count threshold at/above which batched resolution switches from the
+/// whole-graph [`SnapshotResolutionContext`] + rayon path to the memory-bounded
+/// STREAMING FALLBACK (a per-batch [`StoreResolutionContext`](crate::context::StoreResolutionContext)
+/// over the live store, resolved serially) — the applicable Rust port of upstream
+/// #1212's whole-graph-snapshot OOM fix. The default is set VERY HIGH (1M nodes) so
+/// normal projects ALWAYS keep the unchanged snapshot path (byte-identical output,
+/// every golden fixture exercises it); the streaming fallback only engages at
+/// kernel-scale graphs (upstream's failure was 2.05M nodes). Override for tests via
+/// [`resolve_streaming_threshold`].
+const RESOLVE_STREAMING_NODE_THRESHOLD: usize = 1_000_000;
+
+/// Env override for [`RESOLVE_STREAMING_NODE_THRESHOLD`]
+/// (`CODEGRAPH_RESOLVE_STREAMING_THRESHOLD`). A value of `0` forces the streaming
+/// fallback on any non-empty graph, letting the dual-path equivalence test exercise
+/// it on a tiny fixture. Empty / non-numeric falls back to the default, so production
+/// behavior is unchanged unless the operator explicitly sets it.
+fn resolve_streaming_threshold() -> usize {
+    match std::env::var("CODEGRAPH_RESOLVE_STREAMING_THRESHOLD") {
+        Ok(raw) if !raw.is_empty() => raw
+            .parse::<usize>()
+            .unwrap_or(RESOLVE_STREAMING_NODE_THRESHOLD),
+        _ => RESOLVE_STREAMING_NODE_THRESHOLD,
+    }
+}
+
+/// Test-visible telemetry from a single batched-resolution run: how many batches
+/// the rowid cursor iterated, whether the STREAMING FALLBACK path was taken, and
+/// how many times the WAL valve TRUNCATE-folded DURING the resolution-batch write
+/// loop (attributing the checkpoint to the resolution tail specifically, not
+/// spill-replay/finalization). Returned by
+/// [`ReferenceResolver::resolve_and_persist_batched_inner`]; the public wrappers
+/// discard it, so it changes no production behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct BatchedRunTelemetry {
+    pub batches: usize,
+    pub streaming: bool,
+    pub wal_checkpoints: usize,
+}
+
 /// JS/TS built-in identifiers (`JS_BUILT_INS`, `index.ts:67-73`).
 fn js_built_ins() -> &'static BTreeSet<&'static str> {
     static SET: OnceLock<BTreeSet<&'static str>> = OnceLock::new();
@@ -1297,8 +1336,49 @@ impl ReferenceResolver {
         &mut self,
         store: &mut Store,
         batch_size: usize,
-        mut on_progress: impl FnMut(u64, u64),
+        on_progress: impl FnMut(u64, u64),
     ) -> anyhow::Result<ResolutionResult> {
+        let (result, _telemetry) = self.resolve_and_persist_batched_inner(
+            store,
+            batch_size,
+            resolve_streaming_threshold(),
+            codegraph_store::wal_valve_threshold_bytes(),
+            on_progress,
+        )?;
+        Ok(result)
+    }
+
+    /// Batched-resolution engine shared by the public wrappers, parameterized on
+    /// the streaming-fallback node threshold and the WAL-valve fold size so tests
+    /// can force either path and observe [`BatchedRunTelemetry`]. Production always
+    /// passes [`resolve_streaming_threshold`] + [`codegraph_store::wal_valve_threshold_bytes`],
+    /// so behavior is byte-identical to before this parameterization.
+    ///
+    /// Two resolution paths produce IDENTICAL ordered output; only the memory
+    /// profile differs:
+    ///
+    /// * SNAPSHOT + rayon (node count `<` threshold — the unchanged default path):
+    ///   one whole-graph [`SnapshotResolutionContext`] built lazily on first chunk,
+    ///   each chunk resolved in parallel with a forward-folded in-memory adjacency.
+    /// * STREAMING FALLBACK (node count `>=` threshold): NO whole-graph snapshot and
+    ///   NO `build_edge_adjacency`; each chunk is resolved SERIALLY through a
+    ///   per-batch [`StoreResolutionContext`](crate::context::StoreResolutionContext)
+    ///   over the LIVE store (bounded LRUs). Because prior batches' `implements`/
+    ///   `extends` edges are COMMITTED to the store before the next batch reads it,
+    ///   `get_supertypes` sees the same cross-batch edge growth the snapshot path's
+    ///   folded adjacency provides — so the resolved graph is byte-identical.
+    ///
+    /// Both paths share the SAME rowid cursor, `create_edges`→`insert_edges` order,
+    /// `delete_resolved_unresolved_refs_up_to` deletion, incomplete-resolution
+    /// marker, and post-loop #750/#808 passes.
+    pub(crate) fn resolve_and_persist_batched_inner(
+        &mut self,
+        store: &mut Store,
+        batch_size: usize,
+        streaming_threshold: usize,
+        wal_valve_bytes: u64,
+        mut on_progress: impl FnMut(u64, u64),
+    ) -> anyhow::Result<(ResolutionResult, BatchedRunTelemetry)> {
         // Incomplete-resolution marker (#1187): armed BEFORE the first batch and
         // cleared only after the deferred passes complete below. An interrupted
         // run (crash / Ctrl-C / #1122 watchdog kill) leaves it set, so the next
@@ -1313,8 +1393,19 @@ impl ReferenceResolver {
         let total_refs = store.unresolved_refs_count()? as u64;
         let mut processed: u64 = 0;
 
+        // Streaming decision made ONCE up front (before the loop) on the current
+        // node count, so every batch of a run takes the same path (#1212 port).
+        let node_count = store.counts()?.node_count as usize;
+        let streaming = node_count >= streaming_threshold;
+        let mut telemetry = BatchedRunTelemetry {
+            batches: 0,
+            streaming,
+            wal_checkpoints: 0,
+        };
+
         // Built lazily on first-chunk entry, AFTER framework extraction injected
         // its nodes — never in `new`/`initialize` (would miss framework nodes).
+        // Unused on the streaming path.
         let mut node_snapshot: Option<SnapshotResolutionContext> = None;
         // Implements/Extends adjacency for `get_supertypes`, seeded once from the
         // store and folded forward per chunk. `create_edges` is the sole producer
@@ -1347,21 +1438,30 @@ impl ReferenceResolver {
                 .max()
                 .unwrap_or(cursor);
 
-            let base = match &node_snapshot {
-                Some(snapshot) => snapshot,
-                None => {
-                    base_adjacency = (*build_edge_adjacency(store)?).clone();
-                    node_snapshot.insert(SnapshotResolutionContext::from_store(
-                        store,
-                        &self.project_root,
-                    )?)
-                }
+            let result = if streaming {
+                // STREAMING FALLBACK: resolve serially over a per-batch live-store
+                // context. Prior batches' inheritance edges are already committed
+                // (persisted at the bottom of this loop), so `get_supertypes`
+                // reads them straight from the store — no snapshot, no adjacency.
+                let context =
+                    crate::context::StoreResolutionContext::new(store, &self.project_root);
+                self.resolve_all(&batch, &context)
+            } else {
+                let base = match &node_snapshot {
+                    Some(snapshot) => snapshot,
+                    None => {
+                        base_adjacency = (*build_edge_adjacency(store)?).clone();
+                        node_snapshot.insert(SnapshotResolutionContext::from_store(
+                            store,
+                            &self.project_root,
+                        )?)
+                    }
+                };
+                // Install the adjacency from chunks 0..N-1 BEFORE resolving chunk N
+                // (matches the old per-chunk full rebuild's observable state).
+                let chunk_ctx = base.with_edge_adjacency(Arc::new(base_adjacency.clone()));
+                self.resolve_chunk_parallel(&batch, &chunk_ctx)
             };
-            // Install the adjacency from chunks 0..N-1 BEFORE resolving chunk N
-            // (matches the old per-chunk full rebuild's observable state).
-            let chunk_ctx = base.with_edge_adjacency(Arc::new(base_adjacency.clone()));
-
-            let result = self.resolve_chunk_parallel(&batch, &chunk_ctx);
 
             let edges = self.create_edges(&result.resolved, store);
             if !edges.is_empty() {
@@ -1369,13 +1469,16 @@ impl ReferenceResolver {
             }
             // Fold this chunk's NEW Implements/Extends edges into the adjacency
             // AFTER inserting them, so chunk N+1 sees chunks 0..N — the same
-            // forward visibility the per-chunk rebuild produced.
-            for edge in &edges {
-                if matches!(edge.kind, EdgeKind::Implements | EdgeKind::Extends) {
-                    base_adjacency
-                        .entry(edge.source.clone())
-                        .or_default()
-                        .push((edge.target.clone(), edge.kind));
+            // forward visibility the per-chunk rebuild produced. No-op on the
+            // streaming path (the store commit above IS the visibility source).
+            if !streaming {
+                for edge in &edges {
+                    if matches!(edge.kind, EdgeKind::Implements | EdgeKind::Extends) {
+                        base_adjacency
+                            .entry(edge.source.clone())
+                            .or_default()
+                            .push((edge.target.clone(), edge.kind));
+                    }
                 }
             }
 
@@ -1399,6 +1502,16 @@ impl ReferenceResolver {
                 store.delete_resolved_unresolved_refs_up_to(&batch_keys, cursor)?;
             }
 
+            // WAL valve in the resolution write loop (#1212 port / resolution-loop
+            // half of #1231): fold the WAL back into the main DB once it grows past
+            // `wal_valve_bytes`, bounding WAL growth through the resolution tail too
+            // — not just spill-replay. TRUNCATE is row-neutral, so index output stays
+            // byte-identical. `CODEGRAPH_NO_WAL_DEFER=1` keeps SQLite's default
+            // autocheckpoint; the valve is then a cheap size check.
+            if store.checkpoint_wal_if_over(wal_valve_bytes)? {
+                telemetry.wal_checkpoints += 1;
+            }
+
             aggregate.stats.total += result.stats.total;
             aggregate.stats.resolved += result.stats.resolved;
             aggregate.stats.unresolved += result.stats.unresolved;
@@ -1406,6 +1519,7 @@ impl ReferenceResolver {
                 *aggregate.stats.by_method.entry(method).or_insert(0) += count;
             }
 
+            telemetry.batches += 1;
             processed += batch.len() as u64;
             on_progress(processed, total_refs);
         }
@@ -1418,7 +1532,7 @@ impl ReferenceResolver {
         // Full pass completed: clear the #1187 marker set at the top.
         store.clear_resolution_incomplete()?;
 
-        Ok(aggregate)
+        Ok((aggregate, telemetry))
     }
 
     /// Resolve one chunk's refs in parallel over the `Sync` snapshot context,
@@ -2385,6 +2499,232 @@ mod tests {
             .edges_by_source_kind(&caller.id, Some(EdgeKind::Calls))
             .expect("edges")
             .len()
+    }
+
+    // -----------------------------------------------------------------
+    // #1212 PORT: streaming-fallback dual-path equivalence + WAL valve
+    // -----------------------------------------------------------------
+
+    fn fresh_fixture_dir(slug: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("cg-stream-{slug}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).expect("mkdir fixture");
+        dir
+    }
+
+    /// Write the cross-batch inheritance fixture used by the dual-path test:
+    /// `Sub extends Base`, `Base` owns `ping()`, and `App.run` calls
+    /// `sub.ping()`. Resolving `sub.ping()` requires the `Sub -> Base` extends
+    /// edge to already be persisted — the exact cross-batch-visibility property
+    /// the streaming fallback must uphold via the live store.
+    fn write_cross_batch_fixture(dir: &std::path::Path) -> Vec<&'static str> {
+        std::fs::write(
+            dir.join("src/Base.java"),
+            "class Base {\n    public void ping() {}\n}\n",
+        )
+        .expect("write Base.java");
+        std::fs::write(dir.join("src/Sub.java"), "class Sub extends Base {}\n")
+            .expect("write Sub.java");
+        std::fs::write(
+            dir.join("src/App.java"),
+            "class App {\n    void run() {\n        Sub sub = new Sub();\n        sub.ping();\n    }\n}\n",
+        )
+        .expect("write App.java");
+        // Insertion order fixes rowid order: Sub.java (the `extends` ref) BEFORE
+        // App.java (the `sub.ping()` call), so with batch_size 1 the extends edge
+        // resolves in an earlier batch than the call that consumes it.
+        vec!["src/Base.java", "src/Sub.java", "src/App.java"]
+    }
+
+    fn index_java_fixture(
+        slug: &str,
+        root: &std::path::Path,
+        relative_files: &[&str],
+    ) -> (Store, std::path::PathBuf) {
+        let db = temp_db(slug);
+        let mut store = Store::open(&db).expect("open store");
+        for &relative in relative_files {
+            let result = codegraph_extract::extract_file(root, relative).expect("extract");
+            store
+                .upsert_file(&FileRecord {
+                    path: relative.to_string(),
+                    content_hash: "fixture".to_string(),
+                    language: Language::Java,
+                    size: 0,
+                    modified_at: 0,
+                    indexed_at: 0,
+                    node_count: result.nodes.len() as i64,
+                    errors: Vec::new(),
+                })
+                .expect("upsert file");
+            store.upsert_nodes(&result.nodes).expect("upsert nodes");
+            store.insert_edges(&result.edges).expect("insert edges");
+            store
+                .insert_unresolved_refs(&result.unresolved_references)
+                .expect("insert refs");
+        }
+        (store, db)
+    }
+
+    /// Ordered, byte-comparable dump of the whole resolved graph.
+    fn dump_graph(store: &Store) -> (String, String, String) {
+        let nodes = store
+            .all_nodes()
+            .expect("all_nodes")
+            .iter()
+            .map(|n| format!("{}|{:?}|{}|{}", n.id, n.kind, n.name, n.file_path))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let edges = store
+            .all_edges()
+            .expect("all_edges")
+            .iter()
+            .map(|e| format!("{}|{:?}|{}", e.source, e.kind, e.target))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut refs = store
+            .all_unresolved_refs()
+            .expect("all_unresolved_refs")
+            .iter()
+            .map(|r| {
+                format!(
+                    "{}|{}|{:?}|{}:{}",
+                    r.from_node_id, r.reference_name, r.reference_kind, r.line, r.col
+                )
+            })
+            .collect::<Vec<_>>();
+        refs.sort();
+        (nodes, edges, refs.join("\n"))
+    }
+
+    #[test]
+    fn streaming_fallback_matches_snapshot_across_multiple_batches() {
+        let dir = fresh_fixture_dir("dualpath");
+        let files = write_cross_batch_fixture(&dir);
+        let root = dir.to_string_lossy().to_string();
+
+        // Force batch_size 1 so resolution splits across >=2 batches.
+        let (mut snap_store, snap_db) = index_java_fixture("dualpath-snap", &dir, &files);
+        let mut snap_resolver = ReferenceResolver::new(root.clone());
+        let (_snap_result, snap_tel) = snap_resolver
+            .resolve_and_persist_batched_inner(&mut snap_store, 1, usize::MAX, u64::MAX, |_, _| {})
+            .expect("snapshot path");
+
+        let (mut stream_store, stream_db) = index_java_fixture("dualpath-stream", &dir, &files);
+        let mut stream_resolver = ReferenceResolver::new(root.clone());
+        let (_stream_result, stream_tel) = stream_resolver
+            .resolve_and_persist_batched_inner(&mut stream_store, 1, 0, u64::MAX, |_, _| {})
+            .expect("streaming path");
+
+        assert!(
+            !snap_tel.streaming,
+            "usize::MAX threshold must keep the snapshot path"
+        );
+        assert!(
+            stream_tel.streaming,
+            "threshold 0 must take the streaming fallback"
+        );
+        assert!(
+            snap_tel.batches >= 2,
+            "expected >=2 batches on the snapshot path, got {}",
+            snap_tel.batches
+        );
+        assert!(
+            stream_tel.batches >= 2,
+            "expected >=2 batches on the streaming path, got {}",
+            stream_tel.batches
+        );
+
+        let snap_dump = dump_graph(&snap_store);
+        let stream_dump = dump_graph(&stream_store);
+        assert_eq!(snap_dump.0, stream_dump.0, "nodes differ between paths");
+        assert_eq!(snap_dump.1, stream_dump.1, "edges differ between paths");
+        assert_eq!(
+            snap_dump.2, stream_dump.2,
+            "unresolved_refs differ between paths"
+        );
+
+        // Prove the cross-batch edge was actually consumed: `sub.ping()` (a later
+        // batch) resolved to `Base::ping` only because the `Sub -> Base` extends
+        // edge (an earlier batch) was visible. Both paths must show the Extends
+        // edge AND a Calls edge landing on the Base.ping method.
+        let has_extends = stream_store
+            .all_edges()
+            .expect("edges")
+            .iter()
+            .any(|e| e.kind == EdgeKind::Extends);
+        assert!(has_extends, "expected a persisted Sub -> Base extends edge");
+        let ping_id = stream_store
+            .all_nodes()
+            .expect("nodes")
+            .into_iter()
+            .find(|n| n.kind == NodeKind::Method && n.name == "ping")
+            .map(|n| n.id)
+            .expect("Base.ping method node");
+        let ping_consumed = stream_store
+            .all_edges()
+            .expect("edges")
+            .iter()
+            .any(|e| e.kind == EdgeKind::Calls && e.target == ping_id);
+        assert!(
+            ping_consumed,
+            "sub.ping() must resolve to Base.ping via the cross-batch extends edge"
+        );
+
+        let _ = std::fs::remove_file(&snap_db);
+        let _ = std::fs::remove_file(&stream_db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wal_valve_fires_during_resolution_batch_writes() {
+        let dir = fresh_fixture_dir("walvalve");
+        let files = write_cross_batch_fixture(&dir);
+        let root = dir.to_string_lossy().to_string();
+
+        // Valve forced ON (threshold 0): every batch's post-write size check
+        // trips TRUNCATE, so the checkpoint fires DURING the resolution loop.
+        let (mut on_store, on_db) = index_java_fixture("walvalve-on", &dir, &files);
+        let mut on_resolver = ReferenceResolver::new(root.clone());
+        let (_on_result, on_tel) = on_resolver
+            .resolve_and_persist_batched_inner(&mut on_store, 1, usize::MAX, 0, |_, _| {})
+            .expect("valve on");
+        assert!(
+            on_tel.batches >= 2,
+            "need >=2 batches to attribute the valve"
+        );
+        assert!(
+            on_tel.wal_checkpoints >= 1,
+            "WAL valve must fire during the resolution-batch loop (got {})",
+            on_tel.wal_checkpoints
+        );
+
+        // Valve effectively OFF (huge threshold): no checkpoint fires.
+        let (mut off_store, off_db) = index_java_fixture("walvalve-off", &dir, &files);
+        let mut off_resolver = ReferenceResolver::new(root.clone());
+        let (_off_result, off_tel) = off_resolver
+            .resolve_and_persist_batched_inner(&mut off_store, 1, usize::MAX, u64::MAX, |_, _| {})
+            .expect("valve off");
+        assert_eq!(
+            off_tel.wal_checkpoints, 0,
+            "no checkpoint should fire when the threshold is never crossed"
+        );
+
+        // Row-neutral: the valve only folds the WAL into the main DB, so the
+        // resolved graph is byte-identical with the valve on vs off.
+        let on_dump = dump_graph(&on_store);
+        let off_dump = dump_graph(&off_store);
+        assert_eq!(on_dump.0, off_dump.0, "valve changed nodes");
+        assert_eq!(on_dump.1, off_dump.1, "valve changed edges");
+        assert_eq!(on_dump.2, off_dump.2, "valve changed unresolved_refs");
+
+        let _ = std::fs::remove_file(&on_db);
+        let _ = std::fs::remove_file(&off_db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
