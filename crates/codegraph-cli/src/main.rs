@@ -35,6 +35,9 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 mod installer;
+mod segment_match;
+mod segments;
+mod structural_gate;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const EXTRACTION_VERSION: i64 = 1;
@@ -970,45 +973,162 @@ fn cmd_self_update(check: bool, force: bool, tag: Option<String>) -> Result<()> 
     Ok(())
 }
 
+/// Claude Code `UserPromptSubmit` payload piped on stdin: `{"prompt", "cwd"}`
+/// (upstream `bin/codegraph.ts:1199-1201`). Permissive: extra fields are
+/// ignored and a non-JSON body is handled by the raw-string fallback in
+/// [`cmd_prompt_hook`], so this never fails the hook.
+#[derive(Debug, Default, serde::Deserialize)]
+struct PromptHookPayload {
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+/// Cap on the HIGH-tier explore injection so a large-repo explore can't flood
+/// the prompt (upstream `MAX = 16000`).
+const PROMPT_HOOK_MAX_INJECT: usize = 16000;
+
+/// `codegraph prompt-hook` — the Claude `UserPromptSubmit` hook entry point,
+/// now a confidence-tiered gate (upstream #1126 + #1136, telemetry EXCLUDED):
+///
+/// - HIGH — a structural keyword (any of ~29 covered languages) OR a code-shaped
+///   token verified in the index → full `codegraph_explore` injection.
+/// - MEDIUM — no keyword/token, but prose words match indexed symbol-name
+///   segments → a short symbol-pointer hint; the agent writes the explore query.
+/// - silent — nothing verified → zero-cost no-op.
+///
+/// Input: an explicit `--query`/positional arg (raw-string path) wins; else
+/// stdin is parsed as the `{prompt,cwd}` JSON payload, falling back to treating
+/// the raw stdin as the literal query. Project resolution: payload `.cwd` →
+/// `--path` → cwd. Honors the `CODEGRAPH_NO_PROMPT_HOOK`/`CODEGRAPH_PROMPT_HOOK`
+/// kill-switch. Degradable by contract: every failure path exits 0 silently.
 fn cmd_prompt_hook(path: Option<PathBuf>, query: Option<String>) -> Result<()> {
-    let query = match query {
-        Some(q) if !q.trim().is_empty() => q,
+    if matches!(std::env::var("CODEGRAPH_NO_PROMPT_HOOK"), Ok(v) if v == "1")
+        || matches!(std::env::var("CODEGRAPH_PROMPT_HOOK"), Ok(v) if v == "0")
+    {
+        return Ok(());
+    }
+
+    // Resolve the query and the payload-supplied cwd.
+    let (query, payload_cwd) = match query {
+        Some(q) if !q.trim().is_empty() => (q, None),
         _ => {
             let mut buf = String::new();
             io::stdin().read_to_string(&mut buf).ok();
-            buf
+            match serde_json::from_str::<PromptHookPayload>(&buf) {
+                Ok(payload) => match payload.prompt {
+                    Some(p) if !p.trim().is_empty() => (p, payload.cwd),
+                    _ => (buf, None),
+                },
+                Err(_) => (buf, None),
+            }
         }
     };
     let query = query.trim();
     if query.is_empty() {
-        println!("[codegraph] No query provided — nothing to explore.");
         return Ok(());
     }
 
-    let start = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
+    // Gate BEFORE opening the index: a prompt that clears none of the three
+    // tiers is a zero-cost no-op with no filesystem work.
+    let keyworded = structural_gate::has_structural_keyword(query);
+    let code_tokens = if keyworded {
+        Vec::new()
+    } else {
+        structural_gate::extract_code_tokens(query)
+    };
+    let prose_words = if keyworded {
+        Vec::new()
+    } else {
+        segments::extract_prose_candidates(query)
+    };
+    if !keyworded && code_tokens.is_empty() && prose_words.is_empty() {
+        return Ok(());
+    }
+
+    // Project resolution: payload .cwd → --path → cwd.
+    let start = match payload_cwd {
+        Some(c) if !c.trim().is_empty() => absolute_path(PathBuf::from(c)),
+        _ => absolute_path(path.unwrap_or_else(|| PathBuf::from("."))),
+    };
     let project = resolve_project_path_optional(&start);
     if !is_initialized(&project) {
-        println!(
-            "[codegraph] No .codegraph index found near {} — run `codegraph init` to enable context.",
-            start.display()
-        );
         return Ok(());
     }
 
     let engine = match codegraph_mcp::CodeGraphEngine::open(&project) {
         Ok(engine) => engine,
-        Err(err) => {
-            println!(
-                "[codegraph] Could not open the index at {}: {err}",
-                project.display()
-            );
+        Err(_) => return Ok(()),
+    };
+
+    // HIGH: structural keyword, or a code token verified as a real symbol here.
+    let token_verified = !keyworded
+        && code_tokens
+            .iter()
+            .any(|t| matches!(engine.store_nodes_by_name(t), Ok(nodes) if !nodes.is_empty()));
+
+    if keyworded || token_verified {
+        let result = engine.execute("codegraph_explore", &json!({ "query": query }));
+        if result.is_error == Some(true) {
             return Ok(());
         }
-    };
-    let result = engine.execute("codegraph_explore", &json!({ "query": query }));
-    for content in &result.content {
-        println!("{}", content.text);
+        let text = result
+            .content
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.trim().is_empty() {
+            return Ok(());
+        }
+        let body = if text.len() > PROMPT_HOOK_MAX_INJECT {
+            let mut cut = PROMPT_HOOK_MAX_INJECT;
+            while !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            format!(
+                "{}\n\u{2026}(truncated; call codegraph_explore for the rest)",
+                &text[..cut]
+            )
+        } else {
+            text
+        };
+        println!(
+            "<codegraph_context note=\"Structural context from CodeGraph for this prompt \u{2014} treat returned source as already read; call codegraph_explore for more.\">\n{body}\n</codegraph_context>"
+        );
+        return Ok(());
     }
+
+    // MEDIUM: prose words → indexed symbol-name segments. Name the matching
+    // symbols and let the agent write the explore query — never run explore, so
+    // a fuzzy match can't inject a full explore of the wrong feature.
+    let related = segment_match::get_segment_matches(engine.store(), &prose_words, 6);
+    if related.is_empty() {
+        return Ok(());
+    }
+    let lines = related
+        .iter()
+        .map(|m| {
+            format!(
+                "  - {} ({} \u{2014} {}:{})",
+                m.name,
+                m.kind.as_str(),
+                m.file_path,
+                m.start_line
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let example_query = related
+        .iter()
+        .take(3)
+        .map(|m| m.name.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    println!(
+        "<codegraph_context note=\"CodeGraph found indexed symbols matching this prompt \u{2014} query the graph before searching files.\">\nThis project's CodeGraph index contains symbols matching this request:\n{lines}\nCall codegraph_explore ONCE with the relevant names in one query (e.g. \"{example_query}\") to get their source, call paths, and blast radius \u{2014} cheaper and more complete than Read/Grep.\n</codegraph_context>"
+    );
     Ok(())
 }
 

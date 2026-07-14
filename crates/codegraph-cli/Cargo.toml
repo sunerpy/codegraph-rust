@@ -28,6 +28,8 @@ codegraph-watch = { path = "../codegraph-watch" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha1_smol = { workspace = true }
+regex = "1.10"
+unicode-normalization = "0.1"
 jsonc-parser = { workspace = true }
 self_update = { workspace = true }
 toml = { workspace = true }

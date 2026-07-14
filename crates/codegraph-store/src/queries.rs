@@ -458,6 +458,27 @@ impl Store {
         rows.collect()
     }
 
+    /// Distinct segmentable node names (kind is neither `file` nor `import`) —
+    /// the query-time source for the prompt-hook MEDIUM tier, the golden-neutral
+    /// substitution for upstream's index-time `name_segment_vocab` table (#1136,
+    /// #1144 `isSegmentableKind`). `file`/`import` are excluded (no prose signal;
+    /// can't be surfaced as a real symbol). `ORDER BY name` keeps it
+    /// deterministic; the `MIN(kind)` representative is advisory (the caller
+    /// re-verifies via [`Store::nodes_by_name`]).
+    pub fn distinct_non_file_node_names(&self) -> rusqlite::Result<Vec<(String, NodeKind)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, MIN(kind) AS kind FROM nodes \
+             WHERE kind != 'file' AND kind != 'import' \
+             GROUP BY name ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let name = row.get::<_, String>("name")?;
+            let kind = parse_node_kind(row.get::<_, String>("kind")?)?;
+            Ok((name, kind))
+        })?;
+        rows.collect()
+    }
+
     /// Ports `insertEdge` / `insertEdges` from `upstream db/queries.ts:1255-1298`.
     /// Inserts in one transaction, skips edges whose endpoints are absent, and uses `INSERT OR IGNORE`.
     pub fn insert_edges(&mut self, edges: &[Edge]) -> rusqlite::Result<()> {
@@ -2082,6 +2103,23 @@ mod tests {
         let mut names = store.all_node_names().unwrap();
         names.sort();
         assert_eq!(names, vec!["shared".to_string(), "unique".to_string()]);
+    }
+
+    #[test]
+    fn distinct_non_file_node_names_omits_file_and_import() {
+        let mut store = store("distinct-non-file");
+        store.upsert_file(&file("src/svc.rs")).unwrap();
+        let mut file_node = node("file:src/svc.rs", "svc.rs", "src/svc.rs");
+        file_node.kind = NodeKind::File;
+        let mut import_node = node("import:react", "React", "src/svc.rs");
+        import_node.kind = NodeKind::Import;
+        let svc = node("function:svc", "CheckoutService", "src/svc.rs");
+        store.upsert_nodes(&[file_node, import_node, svc]).unwrap();
+
+        let names = store.distinct_non_file_node_names().unwrap();
+        let just_names: Vec<String> = names.iter().map(|(n, _)| n.clone()).collect();
+        assert_eq!(just_names, vec!["CheckoutService".to_string()]);
+        assert_eq!(names[0].1, NodeKind::Function);
     }
 
     #[test]

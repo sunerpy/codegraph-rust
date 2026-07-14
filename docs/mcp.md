@@ -315,6 +315,43 @@ intervals, watch settings — see [`docs/cli.md`](cli.md).
 
 ---
 
+## Claude prompt-hook (confidence-tiered gate)
+
+`codegraph install --prompt-hook` writes a Claude Code `UserPromptSubmit` hook
+that pipes each user prompt into `codegraph prompt-hook` on stdin. Claude sends a
+JSON payload — `{prompt, cwd}` (the `"prompt"`/`"cwd"` object) — so the hook reads
+`.prompt` as the query and resolves the project from `.cwd` (falling back to
+`--path`, then the process cwd). A raw-string argument or raw-string stdin still
+works for direct invocation (`codegraph prompt-hook "how does X work"`).
+
+The hook is a **three-tier confidence gate** — it decides not just _whether_ to
+inject context but _how much_:
+
+- **Structural question or named symbol → full context.** A structural /
+  flow / impact / "where-how" question in any of ~29 covered languages (across
+  Latin, Cyrillic, Greek, CJK, Hangul, Arabic, Hebrew, Thai, and Devanagari
+  scripts), OR a code-shaped token (`getUserId`, `get_user`, `Counter()`,
+  `user.login`) that is verified as a real symbol in the index, runs
+  `codegraph_explore` and injects its full output (capped at 16000 bytes).
+- **Plain words matching indexed symbols → short hint.** When the prompt has no
+  structural keyword or verified token but its prose words match indexed
+  symbol-name segments (e.g. `checkout state machine` → `CheckoutStateMachine`),
+  the hook injects a short **pointer** naming the matching symbols and letting the
+  agent write the explore query itself — it never runs explore, so a fuzzy match
+  can't flood the prompt with the wrong feature's source.
+- **Everything else → silent.** Ordinary prose (`please fix this typo`) is a
+  zero-cost **silent no-op** — nothing is printed.
+
+The gate is a pure, deterministic function of the prompt plus the current
+indexed node-name set: the plain-words tier is derived at query time from the
+existing symbol names (no extra table, no schema change), and there is **no
+telemetry or tracking of any kind**. Set `CODEGRAPH_NO_PROMPT_HOOK=1` (or
+`CODEGRAPH_PROMPT_HOOK=0`) to disable the hook without editing the config. Every
+failure path — kill-switch, non-matching prompt, no index, engine error — exits 0
+with no output; the hook is degradable by contract and never breaks the prompt.
+
+---
+
 ## Stale Index Warning
 
 If indexed files are out of date (the file watcher has not yet caught up), tool
