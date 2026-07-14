@@ -49,11 +49,12 @@ pub const EDGE_KIND_STRINGS: [&str; 12] = [
     "decorates",
 ];
 
-pub const LANGUAGE_STRINGS: [&str; 36] = [
+pub const LANGUAGE_STRINGS: [&str; 37] = [
     "typescript",
     "javascript",
     "tsx",
     "jsx",
+    "arkts",
     "python",
     "go",
     "rust",
@@ -274,6 +275,8 @@ pub enum Language {
     Tsx,
     #[serde(rename = "jsx")]
     Jsx,
+    #[serde(rename = "arkts")]
+    ArkTs,
     #[serde(rename = "python")]
     Python,
     #[serde(rename = "go")]
@@ -341,11 +344,12 @@ pub enum Language {
 }
 
 impl Language {
-    pub const ALL: [Self; 36] = [
+    pub const ALL: [Self; 37] = [
         Self::TypeScript,
         Self::JavaScript,
         Self::Tsx,
         Self::Jsx,
+        Self::ArkTs,
         Self::Python,
         Self::Go,
         Self::Rust,
@@ -386,6 +390,7 @@ impl Language {
             Self::JavaScript => "javascript",
             Self::Tsx => "tsx",
             Self::Jsx => "jsx",
+            Self::ArkTs => "arkts",
             Self::Python => "python",
             Self::Go => "go",
             Self::Rust => "rust",

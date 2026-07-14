@@ -1,0 +1,80 @@
+[
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "file:component.ets",
+    "target": "import:eca17bdaf3571afb1380fcbafbd2f969"
+  },
+  {
+    "col": 2,
+    "kind": "calls",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:3ccec0adbbb469e92ba0541ff466fb6c",
+    "target": "function:190c728c90d859bafe85fc2d9d2aea72"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:component.ets",
+    "target": "class:aa3d6482b1bf9e80c79908cd6c508866"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:component.ets",
+    "target": "function:190c728c90d859bafe85fc2d9d2aea72"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:component.ets",
+    "target": "function:3ccec0adbbb469e92ba0541ff466fb6c"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:component.ets",
+    "target": "import:eca17bdaf3571afb1380fcbafbd2f969"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:component.ets",
+    "target": "struct:bcf7186acd3422af32e5f0c6f566b4e2"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:bcf7186acd3422af32e5f0c6f566b4e2",
+    "target": "method:1ae7cb887c6ff76065390c4dd3100c38"
+  }
+]

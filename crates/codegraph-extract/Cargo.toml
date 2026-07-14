@@ -23,6 +23,7 @@ codegraph-core = { path = "../codegraph-core" }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 
+tree-sitter-arkts = "0.2.0"
 tree-sitter-c = "0.24.2"
 tree-sitter-c-sharp = "0.23.5"
 tree-sitter-cpp = "0.23.4"
