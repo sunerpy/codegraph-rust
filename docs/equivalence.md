@@ -406,6 +406,56 @@ The `generated_golden_matches_committed_arkts_fixture` and
 `arkts_db_is_self_equivalent_to_arkts_golden` tests in
 `crates/codegraph-bench/tests/equivalence.rs` enforce byte-stability.
 
+### Solidity fixture
+
+An eighth golden fixture, `reference/golden/solidity/`, guards Solidity (`.sol`)
+extraction (upstream #1170 / `1441933`). Solidity is a **new `Language::Solidity`
+variant** backed by a **dedicated `tree-sitter-solidity` grammar**. `.sol` maps to
+`Language::Solidity`. The corpus (`crates/codegraph-bench/fixtures/solidity/`) has
+an `IERC20.sol` interface and a `Token.sol` that imports it, declares a file-level
+`error` and a file-level `constant`, and a `contract Token is IERC20` carrying a
+state variable, an `event`, an `enum`, a `struct`, a `modifier`, a `constructor`,
+`fallback`/`receive`, and a `transfer` function guarded by the modifier that
+`emit`s the event, plus a `library Math`. What it guards:
+
+- both `.sol` files with `"language": "solidity"`;
+- `contract Token` / `library Math` as `NodeKind::Class`, `interface IERC20` as
+  `NodeKind::Interface`, `struct Holder` as `NodeKind::Struct`, `enum Status` as
+  `NodeKind::Enum` with its `Active`/`Closed` members (bare-text `enum_value`);
+- functions/modifiers/methods, including the synthetic `constructor` / `fallback`
+  / `receive` method names (nameless grammar nodes);
+- state variable / struct member / `event` / `error` as `NodeKind::Field` name
+  nodes (direct-`name` field, no `variable_declarator`), including the file-level
+  `Unauthorized` error and the file-level `MAX_SUPPLY` constant;
+- the `./IERC20.sol` import node + `imports` edge;
+- `is`-inheritance emitted as an `Extends` ref, promoted by the EXISTING resolver
+  to an `Implements` edge `Token → IERC20` (interface target, present in-corpus);
+- `emit`/header `modifier_invocation` `Calls` edges (`transfer → Transfer`,
+  `transfer → onlyOwner`), resolved to same-file targets.
+
+Because the fixture is fully self-contained, every ref resolves in-corpus, so
+`refs.json` is empty and `edges.json` holds only RESOLVED edges — the expected
+post-resolution state. No `FrameworkResolver` impl is involved; the
+`Extends → Implements` promotion is the same path Java/C# use
+(`resolver.rs:1231-1247`). Adding the variant is byte-neutral for
+`colby.schema.sql` (language is a stored TEXT value, not DDL) and for the seven
+existing goldens (none holds a `.sol` file).
+
+Regenerate reproducibly (identical recipe to the ArkTS fixture, substituting
+`solidity`):
+
+```bash
+rm -rf /tmp/cg-fixture-solidity && cp -r crates/codegraph-bench/fixtures/solidity /tmp/cg-fixture-solidity
+cargo build --release -p codegraph-rs
+CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-solidity
+cp /tmp/cg-fixture-solidity/.codegraph/codegraph.db reference/golden/solidity/colby.db
+cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/solidity/colby.db reference/golden/solidity
+```
+
+The `generated_golden_matches_committed_solidity_fixture` and
+`solidity_db_is_self_equivalent_to_solidity_golden` tests in
+`crates/codegraph-bench/tests/equivalence.rs` enforce byte-stability.
+
 ### KNOWN_DIFFS.md format
 
 Tier-3 differences are allowlisted by grep-able lines in repo-root

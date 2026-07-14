@@ -136,6 +136,27 @@ fn arkts_db_is_self_equivalent_to_arkts_golden() {
 }
 
 #[test]
+fn generated_golden_matches_committed_solidity_fixture() {
+    // Guards Solidity extraction (upstream #1170): the `.sol`->Solidity mapping,
+    // contract/library->Class + interface->Interface + struct->Struct +
+    // enum->Enum, synthetic constructor/fallback/receive method names,
+    // state-var/struct-member/event/error->Field, `is`-inheritance->Extends
+    // (resolver promotes to Implements), and emit/modifier-guard call edges.
+    let tempdir = TestDir::new("generated-golden-solidity");
+    write_golden(&solidity_db(), tempdir.path()).unwrap();
+
+    let expected = load_golden(&solidity_golden_dir()).unwrap();
+    let actual = load_golden(tempdir.path()).unwrap();
+
+    diff_canonical(&expected, &actual, None).unwrap();
+}
+
+#[test]
+fn solidity_db_is_self_equivalent_to_solidity_golden() {
+    assert_equivalent(&solidity_db(), &solidity_golden_dir()).unwrap();
+}
+
+#[test]
 fn tier1_node_drift_is_reported() {
     let expected = load_golden(&mini_golden_dir()).unwrap();
     let mut actual = expected.clone();
@@ -235,6 +256,14 @@ fn arkts_db() -> PathBuf {
 
 fn arkts_golden_dir() -> PathBuf {
     workspace_root().join("reference/golden/arkts")
+}
+
+fn solidity_db() -> PathBuf {
+    workspace_root().join("reference/golden/solidity/colby.db")
+}
+
+fn solidity_golden_dir() -> PathBuf {
+    workspace_root().join("reference/golden/solidity")
 }
 
 struct TestDir {

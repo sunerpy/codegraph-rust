@@ -432,7 +432,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-bench"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -447,7 +447,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-core"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -463,7 +463,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-daemon"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -483,7 +483,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-extract"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -518,6 +518,7 @@ dependencies = [
  "tree-sitter-ruby",
  "tree-sitter-rust",
  "tree-sitter-scala",
+ "tree-sitter-solidity",
  "tree-sitter-swift",
  "tree-sitter-typescript",
  "tree-sitter-xml",
@@ -526,7 +527,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-graph"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -540,7 +541,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-mcp"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -563,7 +564,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-resolve"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -577,7 +578,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-rs"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -613,7 +614,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-store"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -625,7 +626,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-watch"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -3663,6 +3664,16 @@ name = "tree-sitter-scala"
 version = "0.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "de5a4a7ff23a55474ce6a741d52aaeca7a82fe9421bb982b86e98c6ac8629397"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-solidity"
+version = "1.2.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4eacf8875b70879f0cb670c60b233ad0b68752d9e1474e6c3ef168eea8a90b25"
 dependencies = [
  "cc",
  "tree-sitter-language",

@@ -49,7 +49,7 @@ pub const EDGE_KIND_STRINGS: [&str; 12] = [
     "decorates",
 ];
 
-pub const LANGUAGE_STRINGS: [&str; 37] = [
+pub const LANGUAGE_STRINGS: [&str; 38] = [
     "typescript",
     "javascript",
     "tsx",
@@ -78,6 +78,7 @@ pub const LANGUAGE_STRINGS: [&str; 37] = [
     "luau",
     "objc",
     "r",
+    "solidity",
     "yaml",
     "twig",
     "xml",
@@ -323,6 +324,8 @@ pub enum Language {
     ObjC,
     #[serde(rename = "r")]
     R,
+    #[serde(rename = "solidity")]
+    Solidity,
     #[serde(rename = "yaml")]
     Yaml,
     #[serde(rename = "twig")]
@@ -344,7 +347,7 @@ pub enum Language {
 }
 
 impl Language {
-    pub const ALL: [Self; 37] = [
+    pub const ALL: [Self; 38] = [
         Self::TypeScript,
         Self::JavaScript,
         Self::Tsx,
@@ -373,6 +376,7 @@ impl Language {
         Self::Luau,
         Self::ObjC,
         Self::R,
+        Self::Solidity,
         Self::Yaml,
         Self::Twig,
         Self::Xml,
@@ -414,6 +418,7 @@ impl Language {
             Self::Luau => "luau",
             Self::ObjC => "objc",
             Self::R => "r",
+            Self::Solidity => "solidity",
             Self::Yaml => "yaml",
             Self::Twig => "twig",
             Self::Xml => "xml",

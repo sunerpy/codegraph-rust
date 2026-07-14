@@ -24,6 +24,7 @@ mod r;
 mod ruby;
 mod rust;
 mod scala;
+mod solidity;
 mod swift;
 mod tsx;
 mod typescript;
@@ -54,6 +55,7 @@ pub use r::R_SPEC;
 pub use ruby::RUBY_SPEC;
 pub use rust::RUST_SPEC;
 pub use scala::SCALA_SPEC;
+pub use solidity::SOLIDITY_SPEC;
 pub use swift::SWIFT_SPEC;
 pub use tsx::TSX_SPEC;
 pub use typescript::TYPESCRIPT_SPEC;
@@ -83,6 +85,7 @@ pub fn spec_for_language(language: Language) -> Option<&'static dyn LanguageSpec
         Language::Pascal => Some(&PASCAL_SPEC),
         Language::ObjC => Some(&OBJC_SPEC),
         Language::R => Some(&R_SPEC),
+        Language::Solidity => Some(&SOLIDITY_SPEC),
         Language::Gdscript => Some(&GDSCRIPT_SPEC),
         _ => None,
     }

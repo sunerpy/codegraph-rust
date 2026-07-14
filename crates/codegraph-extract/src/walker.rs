@@ -228,8 +228,37 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             Language::R => self.visit_r_node(node),
             Language::Gdscript => self.visit_gdscript_node(node),
             Language::Cpp => self.visit_cpp_node(node),
+            Language::Solidity => self.visit_solidity_node(node),
             _ => false,
         }
+    }
+
+    fn visit_solidity_node(&mut self, node: SyntaxNode<'tree>) -> bool {
+        // #1170 — upstream `solidityExtractor.visitNode` emits a `field` node for
+        // `event_definition` / `error_declaration` UNCONDITIONALLY, file-level
+        // included. The generic field dispatch is class-like-scope-gated, so a
+        // FREE (top-level) event/error is dropped. Emit the Field here only when
+        // NOT inside a class-like scope; inside a contract, return false so the D5
+        // field path owns it (no double-emit).
+        if matches!(node.kind(), "event_definition" | "error_declaration")
+            && !self.is_inside_class_like_node()
+        {
+            if let Some(name_node) = child_by_field(node, "name") {
+                let name = node_text(name_node, self.source);
+                let signature = property_or_field_signature(node, &name, self.source);
+                self.create_node(
+                    NodeKind::Field,
+                    &name,
+                    node,
+                    NodeExtra {
+                        signature,
+                        ..NodeExtra::default()
+                    },
+                );
+            }
+            return true;
+        }
+        false
     }
 
     fn visit_cpp_node(&mut self, node: SyntaxNode<'tree>) -> bool {
@@ -1441,6 +1470,17 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 }
             }
         }
+        // #1170 — Solidity `enum_value` is a LEAF named node (no name field, no id
+        // child); its own text is the member name. Emit from the node text when
+        // the name-field / id-child paths above found nothing.
+        if node.kind() == "enum_value" {
+            self.create_node(
+                NodeKind::EnumMember,
+                &node_text(node, self.source),
+                node,
+                NodeExtra::default(),
+            );
+        }
     }
 
     fn extract_type_alias(&mut self, node: SyntaxNode<'tree>) {
@@ -1530,6 +1570,29 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
         if self.spec.language() == Language::Go {
             self.extract_go_variable(node);
+            return;
+        }
+        if self.spec.language() == Language::Solidity {
+            // #1170 — file-scope `constant_variable_declaration` (`uint256 constant
+            // MAX = 100;`) carries a direct `name` field. Emit a Constant (const)
+            // else Variable. `state_variable_declaration` is always a contract
+            // member (handled as a Field), so it never reaches this top-level arm.
+            if let Some(name_node) = child_by_field(node, "name") {
+                let kind = if self.spec.is_const(node) {
+                    NodeKind::Constant
+                } else {
+                    NodeKind::Variable
+                };
+                self.create_node(
+                    kind,
+                    &node_text(name_node, self.source),
+                    node,
+                    NodeExtra {
+                        docstring: self.preceding_docstring(node),
+                        ..NodeExtra::default()
+                    },
+                );
+            }
             return;
         }
         if !matches!(
@@ -1758,6 +1821,29 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
 
     fn extract_field(&mut self, node: SyntaxNode<'tree>) {
         let declarators = field_declarators(node).collect::<Vec<_>>();
+        if declarators.is_empty() && self.spec.language() == Language::Solidity {
+            // #1170 — Solidity `state_variable_declaration` / `struct_member` /
+            // `event_definition` / `error_declaration` carry the name in a DIRECT
+            // `name` field, not a `variable_declarator`, so `field_declarators`
+            // finds nothing. Emit one Field from the `name` field.
+            if let Some(name_node) = child_by_field(node, "name") {
+                let name = node_text(name_node, self.source);
+                let signature = property_or_field_signature(node, &name, self.source);
+                if let Some(field_node) = self.create_node(
+                    NodeKind::Field,
+                    &name,
+                    node,
+                    NodeExtra {
+                        signature,
+                        visibility: self.spec.get_visibility(node),
+                        ..NodeExtra::default()
+                    },
+                ) {
+                    self.extract_type_annotations(node, &field_node.id);
+                }
+            }
+            return;
+        }
         if declarators.is_empty() && self.spec.language() == Language::Php {
             for elem in node
                 .named_children(&mut node.walk())
@@ -2440,6 +2526,29 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                         type_id,
                     );
                 }
+                // #1170 — Solidity `contract Token is IERC20, Ownable`: the
+                // inheritance_specifier's `ancestor` field is a `user_defined_type`
+                // (not the Swift `user_type`), whose LAST `identifier` descendant is
+                // the base name. Shape-guarded on `user_defined_type` so the Swift
+                // path above is untouched. The resolver promotes Extends→Implements
+                // for interface targets.
+                if let Some(base) = child
+                    .named_children(&mut child.walk())
+                    .find(|c| c.kind() == "user_defined_type")
+                {
+                    if let Some(name_node) = base
+                        .named_children(&mut base.walk())
+                        .filter(|c| c.kind() == "identifier")
+                        .last()
+                    {
+                        self.push_ref(
+                            class_id,
+                            &node_text(name_node, self.source),
+                            EdgeKind::Extends,
+                            name_node,
+                        );
+                    }
+                }
             }
             if child.kind() == "class_heritage" {
                 self.extract_inheritance(child, class_id);
@@ -2504,6 +2613,23 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     fn extract_decorators_for(&mut self, decl_node: SyntaxNode<'tree>, decorated_id: &str) {
         for child in decl_node.named_children(&mut decl_node.walk()) {
             self.consider_decorator(child, decorated_id);
+            // #1170 — a Solidity header `modifier_invocation` (`function f() onlyOwner`,
+            // `constructor() ERC20(...)`) is a named child of the decl outside the
+            // `body` field, so the body walker never reaches it. Emit a Calls ref
+            // (NOT Decorates) named by its first identifier so flow traversal rides
+            // the modifier guard / base-constructor chain. Shape-guarded so other
+            // languages are untouched.
+            if child.kind() == "modifier_invocation" {
+                if let Some(ident) = child
+                    .named_children(&mut child.walk())
+                    .find(|c| c.kind() == "identifier")
+                {
+                    let name = node_text(ident, self.source);
+                    if !name.is_empty() {
+                        self.push_ref(decorated_id, &name, EdgeKind::Calls, child);
+                    }
+                }
+            }
             // tree-sitter.ts:2940-2948 — Java/Kotlin/C#/Swift annotations and
             // attributes nest INSIDE a `modifiers` child; descend one level so
             // they are not silently dropped.
@@ -3539,6 +3665,134 @@ class Model {}
         assert!(has_node(&nodes, NodeKind::Import, "../foo"));
         assert!(has_ref(&refs, EdgeKind::Imports, "../foo"));
         assert!(has_ref(&refs, EdgeKind::Calls, "helper"));
+    }
+
+    // ---- Solidity (.sol) extraction tier (#1170) ----
+
+    #[test]
+    fn solidity_contract_is_records_extends() {
+        let src = "contract MyToken is Token, IERC20 { }";
+        let (_, refs) = run("A.sol", src, Language::Solidity);
+        assert!(has_ref(&refs, EdgeKind::Extends, "Token"));
+        assert!(has_ref(&refs, EdgeKind::Extends, "IERC20"));
+    }
+
+    #[test]
+    fn solidity_state_var_and_struct_member_are_fields() {
+        let src = r#"
+contract C {
+    uint256 public total;
+    struct S { uint256 a; }
+}
+"#;
+        let (nodes, _) = run("C.sol", src, Language::Solidity);
+        assert!(has_node(&nodes, NodeKind::Field, "total"));
+        assert!(has_node(&nodes, NodeKind::Field, "a"));
+    }
+
+    #[test]
+    fn solidity_event_error_are_field_nodes() {
+        let src = r#"
+contract C {
+    event Transfer(address to, uint256 v);
+    error Bad(uint256 code);
+}
+"#;
+        let (nodes, _) = run("C.sol", src, Language::Solidity);
+        assert!(has_node(&nodes, NodeKind::Field, "Transfer"));
+        assert!(has_node(&nodes, NodeKind::Field, "Bad"));
+    }
+
+    #[test]
+    fn solidity_enum_values_are_members() {
+        let src = "contract C { enum Status { Active, Closed } }";
+        let (nodes, _) = run("C.sol", src, Language::Solidity);
+        assert!(has_node(&nodes, NodeKind::EnumMember, "Active"));
+        assert!(has_node(&nodes, NodeKind::EnumMember, "Closed"));
+    }
+
+    #[test]
+    fn solidity_modifier_guard_is_call() {
+        let src = r#"
+contract C {
+    modifier onlyOwner() { _; }
+    function withdraw() public onlyOwner { }
+}
+"#;
+        let (_, refs) = run("C.sol", src, Language::Solidity);
+        assert!(has_ref(&refs, EdgeKind::Calls, "onlyOwner"));
+        assert!(
+            !refs
+                .iter()
+                .any(|r| r.reference_name == "onlyOwner"
+                    && r.reference_kind == EdgeKind::Decorates),
+            "modifier guard must be a Calls ref, not Decorates"
+        );
+    }
+
+    #[test]
+    fn solidity_top_level_constant_is_constant() {
+        let src = "uint256 constant MAX = 100;";
+        let (nodes, _) = run("C.sol", src, Language::Solidity);
+        assert!(has_node(&nodes, NodeKind::Constant, "MAX"));
+    }
+
+    #[test]
+    fn solidity_file_level_event_error_are_fields() {
+        let src = r#"
+event Bar(uint256 x);
+error Foo(address a);
+"#;
+        let (nodes, _) = run("free.sol", src, Language::Solidity);
+        assert!(has_node(&nodes, NodeKind::Field, "Bar"));
+        assert!(has_node(&nodes, NodeKind::Field, "Foo"));
+    }
+
+    #[test]
+    fn solidity_top_level_event_error_do_not_double_emit_inside_contract() {
+        let src = "contract C { event E(uint256 x); }";
+        let (nodes, _) = run("C.sol", src, Language::Solidity);
+        let count = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Field && n.name == "E")
+            .count();
+        assert_eq!(count, 1, "in-contract event must emit exactly one Field");
+    }
+
+    #[test]
+    fn solidity_extracts_contract_interface_struct_fn_field_event_import_call() {
+        let src = r#"
+import "./IERC20.sol";
+
+interface IERC20 {
+    function transfer(address to, uint256 v) external returns (bool);
+}
+
+contract Token is IERC20 {
+    event Transfer(address to, uint256 v);
+    modifier onlyOwner() { _; }
+    constructor() { }
+    function transfer(address to, uint256 v) public onlyOwner returns (bool) {
+        emit Transfer(to, v);
+        return true;
+    }
+}
+
+library Math {
+    function add(uint256 a, uint256 b) internal pure returns (uint256) { return a + b; }
+}
+"#;
+        let (nodes, refs) = run("Token.sol", src, Language::Solidity);
+        assert!(has_node(&nodes, NodeKind::Class, "Token"));
+        assert!(has_node(&nodes, NodeKind::Interface, "IERC20"));
+        assert!(has_node(&nodes, NodeKind::Class, "Math"));
+        assert!(has_node(&nodes, NodeKind::Method, "transfer"));
+        assert!(has_node(&nodes, NodeKind::Method, "constructor"));
+        assert!(has_node(&nodes, NodeKind::Field, "Transfer"));
+        assert!(has_node(&nodes, NodeKind::Import, "./IERC20.sol"));
+        assert!(has_ref(&refs, EdgeKind::Extends, "IERC20"));
+        assert!(has_ref(&refs, EdgeKind::Calls, "onlyOwner"));
+        assert!(has_ref(&refs, EdgeKind::Calls, "Transfer"));
     }
 
     // ---- Lua / Luau require variants ----
