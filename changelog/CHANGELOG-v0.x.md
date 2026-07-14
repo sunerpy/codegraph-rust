@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.34.0](https://github.com/sunerpy/codegraph-rust/compare/v0.33.0...v0.34.0) (2026-07-14)
+
+
+### Features
+
+* **extraction:** index ArkTS (.ets) at the extraction tier ([#149](https://github.com/sunerpy/codegraph-rust/issues/149)) ([9a65702](https://github.com/sunerpy/codegraph-rust/commit/9a657025fd51a911a053852e93efe8f9520c9408))
+
 ## [0.33.0](https://github.com/sunerpy/codegraph-rust/compare/v0.32.0...v0.33.0) (2026-07-14)
 
 
