@@ -3,6 +3,7 @@
 //! Wave 1c intentionally wires only TypeScript. The module boundary is the
 //! mechanical porting seam for tasks 14-17.
 
+mod arkts;
 mod c;
 mod cpp;
 mod csharp;
@@ -31,6 +32,7 @@ use codegraph_core::types::Language;
 
 use crate::spec::LanguageSpec;
 
+pub use arkts::ARKTS_SPEC;
 pub use c::C_SPEC;
 pub use cpp::CPP_SPEC;
 pub(crate) use cpp::{ExportMacroClass, detect_export_macro_class};
@@ -62,6 +64,7 @@ pub fn spec_for_language(language: Language) -> Option<&'static dyn LanguageSpec
         Language::Tsx => Some(&TSX_SPEC),
         Language::JavaScript => Some(&JAVASCRIPT_SPEC),
         Language::Jsx => Some(&JSX_SPEC),
+        Language::ArkTs => Some(&ARKTS_SPEC),
         Language::Python => Some(&PYTHON_SPEC),
         Language::Go => Some(&GO_SPEC),
         Language::Rust => Some(&RUST_SPEC),

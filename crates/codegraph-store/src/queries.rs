@@ -1500,6 +1500,7 @@ fn parse_language(value: String) -> rusqlite::Result<Language> {
         "javascript" => Language::JavaScript,
         "tsx" => Language::Tsx,
         "jsx" => Language::Jsx,
+        "arkts" => Language::ArkTs,
         "python" => Language::Python,
         "go" => Language::Go,
         "rust" => Language::Rust,

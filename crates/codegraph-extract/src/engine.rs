@@ -52,6 +52,8 @@ pub fn builtin_language_for_ext(ext: &str) -> Option<Language> {
         "tsx" => Language::Tsx,
         "js" | "mjs" | "cjs" | "xsjs" | "xsjslib" => Language::JavaScript,
         "jsx" => Language::Jsx,
+        // Only `.ets` maps to ArkTS; plain `.ts` stays TypeScript (matching upstream).
+        "ets" => Language::ArkTs,
         "py" | "pyw" => Language::Python,
         "go" => Language::Go,
         "rs" => Language::Rust,
@@ -868,7 +870,17 @@ mod tests {
         assert_eq!(detect_language("s.metal"), Language::Cpp);
         assert_eq!(detect_language("k.cu"), Language::Cpp);
         assert_eq!(detect_language("k.cuh"), Language::Cpp);
-        assert_eq!(Language::ALL.len(), 36);
+        assert_eq!(Language::ALL.len(), 37);
+    }
+
+    #[test]
+    fn arkts_extension_maps_to_arkts() {
+        assert_eq!(detect_language("view.ets"), Language::ArkTs);
+    }
+
+    #[test]
+    fn plain_ts_stays_typescript() {
+        assert_eq!(detect_language("m.ts"), Language::TypeScript);
     }
 
     #[test]

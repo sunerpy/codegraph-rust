@@ -117,6 +117,25 @@ fn cuda_db_is_self_equivalent_to_cuda_golden() {
 }
 
 #[test]
+fn generated_golden_matches_committed_arkts_fixture() {
+    // Guards ArkTS extraction (upstream #1186, extraction slice only): the
+    // `.ets`->ArkTs mapping, `@Component struct`->NodeKind::Struct via the
+    // dedicated tree-sitter-arkts grammar, function/class/import/call extraction.
+    let tempdir = TestDir::new("generated-golden-arkts");
+    write_golden(&arkts_db(), tempdir.path()).unwrap();
+
+    let expected = load_golden(&arkts_golden_dir()).unwrap();
+    let actual = load_golden(tempdir.path()).unwrap();
+
+    diff_canonical(&expected, &actual, None).unwrap();
+}
+
+#[test]
+fn arkts_db_is_self_equivalent_to_arkts_golden() {
+    assert_equivalent(&arkts_db(), &arkts_golden_dir()).unwrap();
+}
+
+#[test]
 fn tier1_node_drift_is_reported() {
     let expected = load_golden(&mini_golden_dir()).unwrap();
     let mut actual = expected.clone();
@@ -208,6 +227,14 @@ fn cuda_db() -> PathBuf {
 
 fn cuda_golden_dir() -> PathBuf {
     workspace_root().join("reference/golden/cuda")
+}
+
+fn arkts_db() -> PathBuf {
+    workspace_root().join("reference/golden/arkts/colby.db")
+}
+
+fn arkts_golden_dir() -> PathBuf {
+    workspace_root().join("reference/golden/arkts")
 }
 
 struct TestDir {

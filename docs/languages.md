@@ -4,7 +4,7 @@ CodeGraph extracts code structure deterministically using tree-sitter grammars a
 embedded extractors. No AI, vectors, or embeddings are involved. The output is byte-stable
 across runs.
 
-**32 concrete languages** are supported, grouped into three extraction tiers based on what
+**33 concrete languages** are supported, grouped into three extraction tiers based on what
 the extractor produces.
 
 > **Note on TypeScript/JavaScript variants:** `typescript` and `tsx`, and `javascript` and
@@ -14,7 +14,7 @@ the extractor produces.
 
 ---
 
-## Tier 1 — Full symbol extraction (23 languages)
+## Tier 1 — Full symbol extraction (24 languages)
 
 Tree-sitter parses the file and extracts all symbols (functions, classes, structs, methods,
 variables, imports, etc.) plus call and dependency edges. This is the richest extraction
@@ -26,6 +26,7 @@ level.
 | TSX         | `.tsx`                                      | Full tree-sitter          | TypeScript grammar, JSX syntax                                                                                                                                                                                    |
 | JavaScript  | `.js` `.mjs` `.cjs` `.xsjs` `.xsjslib`      | Full tree-sitter          |                                                                                                                                                                                                                   |
 | JSX         | `.jsx`                                      | Full tree-sitter          | JavaScript grammar, JSX syntax                                                                                                                                                                                    |
+| ArkTS       | `.ets`                                      | Full tree-sitter          | HarmonyOS / OpenHarmony; `tree-sitter-arkts` grammar. `@Component struct` → struct symbol. ArkUI dynamic-dispatch bridges deferred. Plain `.ts` stays TypeScript                                                  |
 | Python      | `.py` `.pyw`                                | Full tree-sitter          |                                                                                                                                                                                                                   |
 | Go          | `.go`                                       | Full tree-sitter          |                                                                                                                                                                                                                   |
 | Rust        | `.rs`                                       | Full tree-sitter          |                                                                                                                                                                                                                   |

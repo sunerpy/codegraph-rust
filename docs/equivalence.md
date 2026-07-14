@@ -366,6 +366,46 @@ The `generated_golden_matches_committed_{metal,cuda}_fixture` and
 `{metal,cuda}_db_is_self_equivalent_to_{metal,cuda}_golden` tests in
 `crates/codegraph-bench/tests/equivalence.rs` enforce byte-stability.
 
+### ArkTS fixture
+
+A seventh golden fixture, `reference/golden/arkts/`, guards ArkTS (HarmonyOS /
+OpenHarmony `.ets`) extraction (the extraction slice of upstream #1186 /
+`9915221`). Unlike Metal/CUDA, ArkTS is a **new `Language::ArkTs` variant** backed
+by a **dedicated `tree-sitter-arkts` grammar** — a TypeScript-superset fork that
+understands the ArkUI `@Component struct` syntax `tree-sitter-typescript` cannot
+parse. `.ets` maps to `Language::ArkTs`; plain `.ts` stays TypeScript. The corpus
+(`crates/codegraph-bench/fixtures/arkts/component.ets`) has an `import`, a global
+`function helper`, a `function driver` that calls `helper`, a `@Component struct
+MyView` with a `build()` method, and a plain `class Model`. The golden must show:
+
+- `component.ets` with `"language": "arkts"`;
+- `MyView` as a `NodeKind::Struct` with its `build` method as a member (via the
+  existing `extract_struct` path — no walker change);
+- `helper`/`driver` functions, the `Model` class, and the `../foo` import node;
+- the `driver` → `helper` `Calls` edge (plain `call_expression`).
+
+The ArkUI dynamic-dispatch / callback-synthesizer bridges are DEFERRED — the
+port has no callback synthesizer. So `ARKTS_SPEC` uses `call_types =
+["call_expression"]` only (no `arkui_component_expression` component-instantiation
+edges) and does NOT override `extract_modifiers` (the decorator hook). Adding the
+variant is byte-neutral for `colby.schema.sql` (language is a stored TEXT value,
+not DDL) and for the six existing goldens (none holds a `.ets` file).
+
+Regenerate reproducibly (identical recipe to the C++ fixture, substituting
+`arkts`):
+
+```bash
+rm -rf /tmp/cg-fixture-arkts && cp -r crates/codegraph-bench/fixtures/arkts /tmp/cg-fixture-arkts
+cargo build --release -p codegraph-rs
+CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-arkts
+cp /tmp/cg-fixture-arkts/.codegraph/codegraph.db reference/golden/arkts/colby.db
+cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/arkts/colby.db reference/golden/arkts
+```
+
+The `generated_golden_matches_committed_arkts_fixture` and
+`arkts_db_is_self_equivalent_to_arkts_golden` tests in
+`crates/codegraph-bench/tests/equivalence.rs` enforce byte-stability.
+
 ### KNOWN_DIFFS.md format
 
 Tier-3 differences are allowlisted by grep-able lines in repo-root

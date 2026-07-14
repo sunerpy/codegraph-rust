@@ -3510,6 +3510,37 @@ var topVar: String = "x"
         assert!(has_node(&nodes, NodeKind::Variable, "topVar"));
     }
 
+    // ---- ArkTS (.ets) extraction tier ----
+
+    #[test]
+    fn arkts_extracts_struct_function_class_import_call() {
+        let src = r#"
+import { Foo } from '../foo';
+
+function helper(): void {}
+
+function driver(): void {
+  helper()
+}
+
+@Component
+struct MyView {
+  build() {
+    helper()
+  }
+}
+
+class Model {}
+"#;
+        let (nodes, refs) = run("src/component.ets", src, Language::ArkTs);
+        assert!(has_node(&nodes, NodeKind::Struct, "MyView"));
+        assert!(has_node(&nodes, NodeKind::Function, "helper"));
+        assert!(has_node(&nodes, NodeKind::Class, "Model"));
+        assert!(has_node(&nodes, NodeKind::Import, "../foo"));
+        assert!(has_ref(&refs, EdgeKind::Imports, "../foo"));
+        assert!(has_ref(&refs, EdgeKind::Calls, "helper"));
+    }
+
     // ---- Lua / Luau require variants ----
 
     #[test]
