@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.31.0](https://github.com/sunerpy/codegraph-rust/compare/v0.30.1...v0.31.0) (2026-07-14)
+
+
+### Features
+
+* **cpp:** namespace-qualified names, template-arg calls, UE class recovery, .h detection ([#141](https://github.com/sunerpy/codegraph-rust/issues/141)) ([1dbc1d5](https://github.com/sunerpy/codegraph-rust/commit/1dbc1d56b1bd05473ebb5d29c2aa2c4a28d6b223))
+
 ## [0.30.1](https://github.com/sunerpy/codegraph-rust/compare/v0.30.0...v0.30.1) (2026-07-14)
 
 
