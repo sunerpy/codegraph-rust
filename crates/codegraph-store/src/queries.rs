@@ -1524,6 +1524,7 @@ fn parse_language(value: String) -> rusqlite::Result<Language> {
         "luau" => Language::Luau,
         "objc" => Language::ObjC,
         "r" => Language::R,
+        "solidity" => Language::Solidity,
         "yaml" => Language::Yaml,
         "twig" => Language::Twig,
         "xml" => Language::Xml,

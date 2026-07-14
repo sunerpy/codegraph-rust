@@ -1,0 +1,239 @@
+[
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "file-path"
+    },
+    "provenance": null,
+    "source": "file:Token.sol",
+    "target": "file:IERC20.sol"
+  },
+  {
+    "col": 18,
+    "kind": "implements",
+    "line": 10,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "class:cbe42c3edda8b791e2f65c50de43bf90",
+    "target": "interface:cc05f27c43c35cc4ab3d86bb6f06872c"
+  },
+  {
+    "col": 56,
+    "kind": "calls",
+    "line": 39,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:1c8a7b45450c9d4eed6e478286852ad3",
+    "target": "method:d56cce424b1c30328b00f0b981df8233"
+  },
+  {
+    "col": 8,
+    "kind": "calls",
+    "line": 40,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:1c8a7b45450c9d4eed6e478286852ad3",
+    "target": "field:55aa8c4f588a7ddd89448639dd5cc613"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:6a57b726319c85287cd5966662055efd",
+    "target": "method:01522a942d17de1001d5a8e65bbe316a"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:cbe42c3edda8b791e2f65c50de43bf90",
+    "target": "enum:18a0bcec3e0b273f8ca328dc05fc7c62"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:cbe42c3edda8b791e2f65c50de43bf90",
+    "target": "field:55aa8c4f588a7ddd89448639dd5cc613"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:cbe42c3edda8b791e2f65c50de43bf90",
+    "target": "field:620dcea68e269e5d25084e930b381daa"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:cbe42c3edda8b791e2f65c50de43bf90",
+    "target": "method:069c78f8d4d5c513593c3c944014a0b0"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:cbe42c3edda8b791e2f65c50de43bf90",
+    "target": "method:1c8a7b45450c9d4eed6e478286852ad3"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:cbe42c3edda8b791e2f65c50de43bf90",
+    "target": "method:46d4bf9937e477f5bd270bb05b6696f0"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:cbe42c3edda8b791e2f65c50de43bf90",
+    "target": "method:768b3877a930b3ee9c3b24466c601f38"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:cbe42c3edda8b791e2f65c50de43bf90",
+    "target": "method:d56cce424b1c30328b00f0b981df8233"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:cbe42c3edda8b791e2f65c50de43bf90",
+    "target": "struct:6879c4fba147cd44c382552884de5563"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "enum:18a0bcec3e0b273f8ca328dc05fc7c62",
+    "target": "enum_member:433d4857330d95a2c514d9a3e682a08b"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "enum:18a0bcec3e0b273f8ca328dc05fc7c62",
+    "target": "enum_member:e933e9c8a19aefff4e435ab2db55b0ae"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:IERC20.sol",
+    "target": "interface:cc05f27c43c35cc4ab3d86bb6f06872c"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:Token.sol",
+    "target": "class:6a57b726319c85287cd5966662055efd"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:Token.sol",
+    "target": "class:cbe42c3edda8b791e2f65c50de43bf90"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:Token.sol",
+    "target": "constant:2e4331f08e0c9bb2d6c0c9de9f696935"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:Token.sol",
+    "target": "field:4df8f64fd61911a088da5b8596f81045"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:Token.sol",
+    "target": "import:a2e94e572fe1823c82b046dd0a3030d9"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "interface:cc05f27c43c35cc4ab3d86bb6f06872c",
+    "target": "method:14e6265384fe621344552d55e10f8466"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:6879c4fba147cd44c382552884de5563",
+    "target": "field:ee915f379fbf10ac1ed613b353ccabc0"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:6879c4fba147cd44c382552884de5563",
+    "target": "field:fcc8c476605ce6c1cdd89fdf53a1f4fc"
+  }
+]

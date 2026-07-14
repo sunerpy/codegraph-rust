@@ -1,0 +1,18 @@
+[
+  {
+    "content_hash": "bef3d1355e28323c5eaeeac93fd3693297706de47dd276566eee9d64a4568d6f",
+    "errors": null,
+    "language": "solidity",
+    "node_count": 3,
+    "path": "IERC20.sol",
+    "size": 152
+  },
+  {
+    "content_hash": "c8976b8cc5a7ea552da5c19efd79afa395873bd8a1253ebe9282b538e4c9a8e3",
+    "errors": null,
+    "language": "solidity",
+    "node_count": 20,
+    "path": "Token.sol",
+    "size": 841
+  }
+]
