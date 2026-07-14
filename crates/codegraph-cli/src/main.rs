@@ -1424,11 +1424,14 @@ fn cmd_serve(
                 return serve_direct(project, &project_root, no_watch, explicit_path);
             }
             ServeMode::BeDaemon => {
+                let cfg = codegraph_core::config::get_config();
                 return codegraph_daemon::run_foreground(
                     &project_root,
                     codegraph_daemon::DaemonOptions {
                         run_mcp: true,
                         host_pid: codegraph_daemon::host_pid_from_env(),
+                        include: cfg.indexing.include.clone(),
+                        exclude: cfg.indexing.exclude.clone(),
                         ..Default::default()
                     },
                 )
@@ -2096,6 +2099,9 @@ fn start_direct_watcher(
 ) -> Option<codegraph_watch::ProjectWatcher> {
     let mut opts = codegraph_watch::WatchOptions::default();
     opts.no_watch = no_watch;
+    let cfg = codegraph_core::config::get_config();
+    opts.include = cfg.indexing.include.clone();
+    opts.exclude = cfg.indexing.exclude.clone();
     opts.on_sync_complete = Some(std::sync::Arc::new(
         |outcome: codegraph_watch::SyncOutcome| {
             tracing::info!(
@@ -3244,6 +3250,7 @@ fn index_project_inner(
         ignore_dirs: config.indexing.ignore_dirs.clone(),
         ignore_paths: config.indexing.ignore_paths.clone(),
         exclude: config.indexing.exclude.clone(),
+        include: config.indexing.include.clone(),
         parallel: true,
     };
     if !quiet {

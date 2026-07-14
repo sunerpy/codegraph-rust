@@ -166,6 +166,11 @@ pub struct DaemonOptions {
     /// project (N client inotify sets collapse to 1). Honors
     /// `watch_disabled_reason` (e.g. `CODEGRAPH_NO_WATCH=1`).
     pub watch: bool,
+    /// `config.toml` `include`/`exclude` path patterns (#1063), passed through
+    /// to the shared `ProjectWatcher` so its scope matches the scan's. The CLI
+    /// (which owns the config singleton) populates these; empty = pre-#1063.
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
 }
 
 impl Default for DaemonOptions {
@@ -176,6 +181,8 @@ impl Default for DaemonOptions {
             watchdog_interval: DEFAULT_WATCHDOG_INTERVAL,
             run_mcp: true,
             watch: true,
+            include: Vec::new(),
+            exclude: Vec::new(),
         }
     }
 }
@@ -555,6 +562,8 @@ fn start_project_watcher(
     let counter = Arc::new(AtomicUsize::new(0));
     let mut watch_options = codegraph_watch::WatchOptions::default();
     watch_options.no_watch = !options.watch;
+    watch_options.include = options.include.clone();
+    watch_options.exclude = options.exclude.clone();
     watch_options.on_sync_complete =
         Some(Arc::new(move |outcome: codegraph_watch::SyncOutcome| {
             let n = counter.fetch_add(1, Ordering::SeqCst) + 1;

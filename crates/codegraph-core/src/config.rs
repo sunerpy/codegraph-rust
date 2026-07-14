@@ -67,6 +67,18 @@ pub struct IndexingConfig {
     /// `docs/gen`, `gen*`); honored by index and sync. Off by default.
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// Root-relative path patterns for first-party source to force INTO the
+    /// index even when `.gitignore` (or the default `ignore_paths`) would drop
+    /// it — the case being a project under a second VCS (SVN, Perforce) that
+    /// `.gitignore`s its own real source out of Git yet still wants it indexed.
+    /// Same matcher as `.gitignore`/`exclude` (`Tools/`, `Local/ts/`, `gen*`),
+    /// matched against root-relative paths. Complements `exclude` (its
+    /// opposite). Precedence: a built-in `ignore_dirs` skip
+    /// (`node_modules`/`dist`/…) is NEVER re-included, and an explicit
+    /// `exclude` still wins over `include`. Off by default (empty = today's
+    /// behavior byte-identical). #1063.
+    #[serde(default)]
+    pub include: Vec<String>,
 }
 
 fn default_max_file_size() -> u64 {
@@ -187,6 +199,7 @@ impl Default for IndexingConfig {
             ignore_dirs: default_ignore_dirs(),
             ignore_paths: default_ignore_paths(),
             exclude: Vec::new(),
+            include: Vec::new(),
         }
     }
 }
@@ -355,6 +368,31 @@ max_file_size = 2097152
 "#;
         let cfg: Config = toml::from_str(without).expect("should parse");
         assert!(cfg.indexing.exclude.is_empty());
+    }
+
+    #[test]
+    fn test_include_parses_and_defaults_empty() {
+        let with_include = r#"
+[app]
+name = "p"
+
+[indexing]
+include = ["Tools/", "Local/ts/"]
+"#;
+        let cfg: Config = toml::from_str(with_include).expect("should parse");
+        assert_eq!(cfg.indexing.include, vec!["Tools/", "Local/ts/"]);
+
+        let without = r#"
+[app]
+name = "p"
+
+[indexing]
+max_file_size = 2097152
+"#;
+        let cfg: Config = toml::from_str(without).expect("should parse");
+        assert!(cfg.indexing.include.is_empty());
+
+        assert!(IndexingConfig::default().include.is_empty());
     }
 
     #[test]

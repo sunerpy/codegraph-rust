@@ -12,7 +12,7 @@ use anyhow::Result;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::policy::{WatchPolicy, watch_disabled_reason};
-use crate::sync::{SyncOutcome, default_db_path, sync_changed_paths};
+use crate::sync::{SyncOutcome, default_db_path, sync_changed_paths_with_patterns};
 
 type SyncCallback = Arc<dyn Fn(SyncOutcome) + Send + Sync>;
 type SyncFn = Arc<dyn Fn(Vec<String>) -> Result<SyncOutcome> + Send + Sync>;
@@ -215,6 +215,11 @@ pub struct WatchOptions {
     /// Called for a non-degrading watch/sync error (e.g. inotify watch-count
     /// exhaustion). May fire more than once; the watcher keeps running.
     pub on_sync_error: Option<NoticeCallback>,
+    /// `codegraph.json`/`config.toml` `include`/`exclude` path patterns (#1063).
+    /// Threaded into the [`WatchPolicy`] and the default incremental-sync fn so
+    /// the watcher's scope matches the scan's. Empty = pre-#1063 behavior.
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
     sync_fn: Option<SyncFn>,
 }
 
@@ -230,6 +235,8 @@ impl Default for WatchOptions {
             on_sync_complete: None,
             on_degraded: None,
             on_sync_error: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
             sync_fn: None,
         }
     }
@@ -262,14 +269,18 @@ impl ProjectWatcher {
         if watch_disabled_reason(&project_root, options.no_watch).is_some() {
             return Ok(None);
         }
-        let policy = WatchPolicy::new(&project_root);
+        let policy = WatchPolicy::with_config(&project_root, &options.include, &options.exclude);
         let db_path = options
             .db_path
             .clone()
             .unwrap_or_else(|| default_db_path(&project_root));
         let sync_fn = options.sync_fn.clone().unwrap_or_else(|| {
             let project_root = project_root.clone();
-            Arc::new(move |paths| sync_changed_paths(&project_root, &db_path, paths))
+            let include = options.include.clone();
+            let exclude = options.exclude.clone();
+            Arc::new(move |paths| {
+                sync_changed_paths_with_patterns(&project_root, &db_path, paths, &include, &exclude)
+            })
         });
         let (tx, rx) = mpsc::channel();
         let degraded = Arc::new(DegradedState::default());
