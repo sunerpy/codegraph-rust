@@ -10,8 +10,9 @@
 use crate::framework::FrameworkResolver;
 use crate::import_resolver::{is_php_include_path_ref, resolve_jvm_import, resolve_via_import};
 use crate::name_matcher::{
-    crosses_known_family, match_dotted_call_chain, match_function_ref, match_reference,
-    match_scoped_call_chain, same_language_family,
+    crosses_known_family, is_php_property_receiver_shape, match_dotted_call_chain,
+    match_function_ref, match_method_call, match_reference, match_scoped_call_chain,
+    same_language_family,
 };
 use crate::snapshot_context::{SnapshotResolutionContext, build_edge_adjacency};
 use crate::types::{
@@ -986,6 +987,16 @@ impl ReferenceResolver {
             {
                 return (None, Some(DeferredIntent::ChainRef(reference.clone())));
             }
+            // PHP `$this->prop->method()` (encoded `this->prop.method`): its
+            // method may live on the property's declared supertype, resolvable
+            // only once implements/extends edges exist — defer to the same
+            // conformance pass (index.ts:925-933 / #1220).
+            if reference.reference_kind == EdgeKind::Calls
+                && reference.language == Language::Php
+                && is_php_property_receiver_shape(&reference.reference_name)
+            {
+                return (None, Some(DeferredIntent::ChainRef(reference.clone())));
+            }
             return (None, None);
         }
 
@@ -1142,9 +1153,15 @@ impl ReferenceResolver {
             deferred
                 .iter()
                 .filter_map(|reference| {
-                    // `::`-receiver languages (Rust) split on `::`; dotted-receiver
-                    // languages on `.` (index.ts:890-892).
-                    let chain_match = if is_scoped_chain_language(reference.language) {
+                    // PHP `this->prop.method` resolves via match_method_call
+                    // (declared-type inference + resolve_method_on_type supertype
+                    // walk); `::`-receiver languages (Rust) split on `::`; other
+                    // dotted-receiver languages on `.` (index.ts:1129-1138 / #1220).
+                    let chain_match = if reference.language == Language::Php
+                        && is_php_property_receiver_shape(&reference.reference_name)
+                    {
+                        match_method_call(reference, &context)
+                    } else if is_scoped_chain_language(reference.language) {
                         match_scoped_call_chain(reference, &context)
                     } else {
                         match_dotted_call_chain(reference, &context)
