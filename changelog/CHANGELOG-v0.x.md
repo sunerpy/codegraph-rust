@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.30.0](https://github.com/sunerpy/codegraph-rust/compare/v0.29.1...v0.30.0) (2026-07-14)
+
+
+### Features
+
+* **config:** add `include` to force gitignored first-party source into the index ([#137](https://github.com/sunerpy/codegraph-rust/issues/137)) ([69a5a2b](https://github.com/sunerpy/codegraph-rust/commit/69a5a2b5fe24764b4d6b01b87c42d51306b13f20))
+
 ## [0.29.1](https://github.com/sunerpy/codegraph-rust/compare/v0.29.0...v0.29.1) (2026-07-14)
 
 
