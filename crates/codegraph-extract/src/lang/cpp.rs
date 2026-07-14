@@ -1,6 +1,9 @@
 //! C++ `LanguageSpec`, ported from `upstream extraction/languages/c-cpp.ts:144-213`.
 
+use std::sync::OnceLock;
+
 use codegraph_core::types::{Language, NodeKind};
+use regex::Regex;
 use tree_sitter::{Language as TsLanguage, Node};
 
 use crate::lang::c::{include_import, normalize_c_return_type};
@@ -113,6 +116,189 @@ impl LanguageSpec for CppSpec {
     fn extract_import(&self, node: Node<'_>, source: &str) -> Option<ImportInfo> {
         include_import(node, source)
     }
+    fn pre_parse(&self, source: &str) -> String {
+        pre_parse_cpp_source(source)
+    }
+}
+
+/// Offset-preserving C++ pre-parse: blank heavily-reflected Unreal-Engine markup
+/// (member-level `*_API` prefixes, line-leading no-semicolon annotation macros,
+/// mid-line `UMETA`/`UPARAM`/`UE_DEPRECATED`) so the enclosing class parses
+/// instead of collapsing into an ERROR node (#1158). Blanking replaces bytes with
+/// ASCII spaces — tree-sitter consumes byte offsets, and every blanked span lies
+/// on char boundaries, so byte length (and thus line/column) is preserved. Each
+/// pass is `contains`-gated, so macro-free C++ is returned byte-identical.
+fn pre_parse_cpp_source(source: &str) -> String {
+    let bytes = blank_cpp_annotation_macro_calls(blank_cpp_inline_annotation_macros(
+        blank_cpp_api_prefix_macros(source.as_bytes().to_vec()),
+    ));
+    String::from_utf8(bytes).unwrap_or_else(|_| source.to_string())
+}
+
+fn blank_span(bytes: &mut [u8], start: usize, end: usize) {
+    for b in bytes.iter_mut().take(end).skip(start) {
+        if *b != b'\n' && *b != b'\r' {
+            *b = b' ';
+        }
+    }
+}
+
+/// Scan a balanced `(...)` from `open` (the index of the `(`), skipping string
+/// and char literals so an embedded `)` cannot mis-close. All delimiters are
+/// ASCII and UTF-8 continuation bytes never match them, so a byte scan is safe.
+/// Returns the index just past the closing `)`, or `None` if unbalanced.
+fn balanced_paren_end(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = open;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'"' || c == b'\'' {
+            let quote = c;
+            i += 1;
+            while i < bytes.len() && bytes[i] != quote {
+                if bytes[i] == b'\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+        } else if c == b'(' {
+            depth += 1;
+        } else if c == b')' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i + 1);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Blank an export/visibility macro (`ENGINE_API`, `*_EXPORT`, `*_ABI`) in front
+/// of a member/method declaration (`ENGINE_API virtual void Tick()`). The upstream
+/// `(?=\s+[A-Za-z_])` look-ahead is reproduced in code (the `regex` crate has no
+/// look-ahead): a match is blanked only when followed by whitespace then a
+/// declaration token, so a value use (`x = FOO_API;`) survives.
+fn blank_cpp_api_prefix_macros(bytes: Vec<u8>) -> Vec<u8> {
+    let source = match std::str::from_utf8(&bytes) {
+        Ok(source) => source,
+        Err(_) => return bytes,
+    };
+    if !(source.contains("_API") || source.contains("_EXPORT") || source.contains("_ABI")) {
+        return bytes;
+    }
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"\b[A-Z][A-Z0-9_]*(?:_API|_EXPORT|_ABI)\b").expect("api-prefix regex")
+    });
+    let spans: Vec<(usize, usize)> = re
+        .find_iter(source)
+        .filter(|m| {
+            let mut saw_space = false;
+            for c in source[m.end()..].chars() {
+                if c.is_whitespace() {
+                    saw_space = true;
+                } else {
+                    return saw_space && (c.is_ascii_alphabetic() || c == '_');
+                }
+            }
+            false
+        })
+        .map(|m| (m.start(), m.end()))
+        .collect();
+    let mut bytes = bytes;
+    for (start, end) in spans {
+        blank_span(&mut bytes, start, end);
+    }
+    bytes
+}
+
+/// Blank a mid-line UE annotation macro (`UMETA(...)`, `UPARAM(...)`,
+/// `UE_DEPRECATED*(...)`) — the forms `blank_cpp_annotation_macro_calls` can't see
+/// because they are not line-leading. Keyed on an explicit UE-only name list (zero
+/// risk to non-UE sources); the whole `MACRO(...)` becomes spaces.
+fn blank_cpp_inline_annotation_macros(bytes: Vec<u8>) -> Vec<u8> {
+    let source = match std::str::from_utf8(&bytes) {
+        Ok(source) => source,
+        Err(_) => return bytes,
+    };
+    if !(source.contains("UMETA") || source.contains("UPARAM") || source.contains("UE_DEPRECATED"))
+    {
+        return bytes;
+    }
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"\b(?:UMETA|UPARAM|UE_DEPRECATED\w*)\s*\(").expect("inline-annotation regex")
+    });
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(m) = re.find_at(source, search_from) {
+        match balanced_paren_end(&bytes, m.end() - 1) {
+            Some(end) => {
+                spans.push((m.start(), end));
+                search_from = end;
+            }
+            None => break,
+        }
+    }
+    let mut bytes = bytes;
+    for (start, end) in spans {
+        blank_span(&mut bytes, start, end);
+    }
+    bytes
+}
+
+/// Blank a line-leading no-semicolon annotation macro call (`UPROPERTY(...)`,
+/// `UFUNCTION(...)`, `GENERATED_BODY()`, `DECLARE_DELEGATE_*(...)`) that decorates
+/// the following declaration. Name-list-FREE / structural: the macro must be the
+/// first non-whitespace token on its line, ALL-CAPS (`[A-Z][A-Z0-9_]{2,}`), and
+/// the char after the balanced `(...)` must START A DECLARATION (`[A-Za-z_~#]`) —
+/// so a statement call (`FOO(x);`) or expression fragment is never blanked.
+fn blank_cpp_annotation_macro_calls(bytes: Vec<u8>) -> Vec<u8> {
+    let source = match std::str::from_utf8(&bytes) {
+        Ok(source) => source,
+        Err(_) => return bytes,
+    };
+    static GATE: OnceLock<Regex> = OnceLock::new();
+    let gate = GATE.get_or_init(|| {
+        Regex::new(r"(?m)^[ \t]*[A-Z][A-Z0-9_]{2,}\s*\(").expect("annotation-gate regex")
+    });
+    if !gate.is_match(source) {
+        return bytes;
+    }
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"(?m)^([ \t]*)([A-Z][A-Z0-9_]{2,})(\s*)\(").expect("annotation-call regex")
+    });
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(caps) = re.captures_at(source, search_from) {
+        let whole = caps.get(0).expect("match 0");
+        let indent_len = caps.get(1).map_or(0, |g| g.as_str().len());
+        let end = match balanced_paren_end(&bytes, whole.end() - 1) {
+            Some(end) => end,
+            None => {
+                search_from = whole.end();
+                continue;
+            }
+        };
+        let mut j = end;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        let starts_decl = bytes
+            .get(j)
+            .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_' || *b == b'~' || *b == b'#');
+        if starts_decl {
+            spans.push((whole.start() + indent_len, end));
+        }
+        search_from = end;
+    }
+    let mut bytes = bytes;
+    for (start, end) in spans {
+        blank_span(&mut bytes, start, end);
+    }
+    bytes
 }
 
 fn declarator_qualified_id<'tree>(declarator: Node<'tree>) -> Option<Node<'tree>> {
@@ -327,4 +513,94 @@ pub(crate) fn detect_export_macro_class<'tree>(
         body,
         is_struct,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blank_cpp_api_prefix_member() {
+        let src = "ENGINE_API virtual void Tick();";
+        let out = pre_parse_cpp_source(src);
+        assert_eq!(out.len(), src.len());
+        assert!(out.starts_with("           virtual void Tick();"));
+    }
+
+    #[test]
+    fn blank_cpp_api_prefix_bare_value_untouched() {
+        let src = "int x = MY_API;";
+        let out = pre_parse_cpp_source(src);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn blank_cpp_annotation_macro_calls_ue() {
+        let src = "UPROPERTY(EditAnywhere)\nint X;";
+        let out = pre_parse_cpp_source(src);
+        assert_eq!(out.len(), src.len());
+        assert!(out.starts_with("                       \nint X;"));
+    }
+
+    #[test]
+    fn blank_cpp_annotation_statement_call_untouched() {
+        let src = "FOO(x);";
+        let out = pre_parse_cpp_source(src);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn blank_cpp_annotation_in_expression_untouched() {
+        let src = "if (CHECK(x)) {}";
+        let out = pre_parse_cpp_source(src);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn blank_cpp_inline_annotation_umeta() {
+        let src = "Foo UMETA(DisplayName=\"Foo\"),";
+        let out = pre_parse_cpp_source(src);
+        assert_eq!(out.len(), src.len());
+        assert!(out.starts_with("Foo "));
+        assert!(out.ends_with(","));
+        assert!(!out.contains("UMETA"));
+    }
+
+    #[test]
+    fn blank_cpp_inline_annotation_lowercase_untouched() {
+        let src = "auto v = meta(1);";
+        let out = pre_parse_cpp_source(src);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn cpp_pre_parse_is_offset_preserving() {
+        let src = r#"class ENGINE_API UFoo : public UObject
+{
+    GENERATED_BODY()
+    UPROPERTY(EditAnywhere)
+    ENGINE_API int X;
+    UFUNCTION()
+    void Bar();
+};
+"#;
+        let out = pre_parse_cpp_source(src);
+        assert_eq!(out.len(), src.len());
+        assert_eq!(
+            out.bytes().filter(|&b| b == b'\n').count(),
+            src.bytes().filter(|&b| b == b'\n').count()
+        );
+    }
+
+    #[test]
+    fn cpp_pre_parse_noop_on_plain_cpp() {
+        let src = r#"namespace ns {
+class Widget {
+public:
+    void render();
+};
+}
+"#;
+        assert_eq!(pre_parse_cpp_source(src), src);
+    }
 }

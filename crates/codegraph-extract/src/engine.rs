@@ -9,9 +9,11 @@ use codegraph_core::config::IndexingConfig;
 use codegraph_core::node_id::hash_content;
 use codegraph_core::types::{ExtractionResult, Language};
 use rayon::prelude::*;
+use regex::Regex;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Instant;
 use tree_sitter::Parser;
 
@@ -110,13 +112,58 @@ pub fn detect_language(file_path: impl AsRef<Path>) -> Language {
     Language::Unknown
 }
 
+/// A `.h` file maps to `Language::C` by extension, but may hold C++ or
+/// Objective-C. Match the upstream 8 KB-prefix content sniff (`grammars.ts`
+/// `looksLikeCpp`). The `class MACRO Name : Base` alternative recognizes an
+/// export-macro-annotated class whose only C++ signal is the macro — the
+/// two-token `<KW> <MACRO> <Name>` shape never occurs in valid C, so genuine C
+/// headers stay C. Lookahead-free (the `regex` crate has none).
+fn looks_like_cpp(source: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(
+            r"\bnamespace\b|\bclass\s+\w+\s*[:{]|\b(?:class|struct)\s+[A-Z][A-Z0-9_]+\s+\w+\s*(?:final\s*)?[:{]|\btemplate\s*<|\b(?:public|private|protected)\s*:|\bvirtual\b|\busing\s+(?:namespace\b|\w+\s*=)",
+        )
+        .expect("looks-like-cpp regex")
+    });
+    re.is_match(prefix_8k(source))
+}
+
+fn looks_like_objc(source: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"@(?:interface|implementation|protocol|synthesize)\b")
+            .expect("looks-like-objc regex")
+    });
+    re.is_match(prefix_8k(source))
+}
+
+fn prefix_8k(source: &str) -> &str {
+    match source.char_indices().nth(8192) {
+        Some((idx, _)) => &source[..idx],
+        None => source,
+    }
+}
+
 pub fn extract_source(
     file_path: &str,
     source: &str,
     language: Option<Language>,
 ) -> ExtractionResult {
     let start = Instant::now();
-    let language = language.unwrap_or_else(|| detect_language(file_path));
+    let mut language = language.unwrap_or_else(|| detect_language(file_path));
+    if language == Language::C
+        && Path::new(file_path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("h"))
+    {
+        if looks_like_cpp(source) {
+            language = Language::Cpp;
+        } else if looks_like_objc(source) {
+            language = Language::ObjC;
+        }
+    }
     if let Some(result) = crate::embedded::extract_embedded(file_path, source, language) {
         return result;
     }
@@ -973,5 +1020,46 @@ mod tests {
             "parallel extract merges both files: {:?}",
             merged.nodes.iter().map(|n| &n.name).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn looks_like_cpp_export_macro_class() {
+        assert!(looks_like_cpp(
+            "class ENGINE_API UFoo : public UObject { };"
+        ));
+    }
+
+    #[test]
+    fn looks_like_cpp_plain_c_false() {
+        assert!(!looks_like_cpp("struct Foo { int x; };\nvoid f(void);\n"));
+    }
+
+    #[test]
+    fn looks_like_objc_interface() {
+        assert!(looks_like_objc("@interface Foo\n@end\n"));
+    }
+
+    #[test]
+    fn dot_h_reclassified_to_cpp_by_content() {
+        let result = extract_source(
+            "F.h",
+            "class ENGINE_API UFoo : public UObject { GENERATED_BODY() };",
+            None,
+        );
+        assert!(
+            result.nodes.iter().any(|n| n.name == "UFoo"),
+            "a UE .h should be reclassified to C++ and yield a UFoo class node, got: {:?}",
+            result
+                .nodes
+                .iter()
+                .map(|n| (n.kind, n.name.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn dot_h_plain_c_stays_c() {
+        let result = extract_source("plain.h", "int add(int a, int b);\n", None);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
     }
 }

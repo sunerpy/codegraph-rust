@@ -40,6 +40,10 @@ pub struct TreeSitterWalker<'a, 'tree> {
     errors: Vec<String>,
     node_stack: Vec<String>,
     fn_ref_candidates: Vec<(crate::function_ref::FnRefCandidate, String)>,
+    /// C++ enclosing `namespace ns { … }` names, prefixed onto contained
+    /// symbols' `qualified_name`. Prefix-only (no namespace node) to avoid the
+    /// #1093 crowd-out; empty outside C++.
+    namespace_prefix: Vec<String>,
 }
 
 impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
@@ -60,6 +64,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             errors: Vec::new(),
             node_stack: Vec::new(),
             fn_ref_candidates: Vec::new(),
+            namespace_prefix: Vec::new(),
         }
     }
 
@@ -222,8 +227,25 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             Language::Php => self.visit_php_node(node),
             Language::R => self.visit_r_node(node),
             Language::Gdscript => self.visit_gdscript_node(node),
+            Language::Cpp => self.visit_cpp_node(node),
             _ => false,
         }
+    }
+
+    fn visit_cpp_node(&mut self, node: SyntaxNode<'tree>) -> bool {
+        if node.kind() != "namespace_definition" {
+            return false;
+        }
+        let ns_name = child_by_field(node, "name")
+            .map(|name| node_text(name, self.source))
+            .unwrap_or_default();
+        if ns_name.is_empty() {
+            return false;
+        }
+        self.namespace_prefix.push(ns_name);
+        self.visit_named_children(node);
+        self.namespace_prefix.pop();
+        true
     }
 
     fn visit_ruby_node(&mut self, node: SyntaxNode<'tree>) -> bool {
@@ -2107,8 +2129,20 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         if let Some(converted) = normalize_parenthesized_go_conversion(&callee_name) {
             callee_name = converted;
         }
+        callee_name = self.maybe_strip_cpp_template_call(callee_name);
         if !callee_name.is_empty() {
             self.push_ref(&caller_id, &callee_name, EdgeKind::Calls, node);
+        }
+    }
+
+    fn maybe_strip_cpp_template_call(&self, callee_name: String) -> String {
+        if matches!(self.spec.language(), Language::C | Language::Cpp)
+            && callee_name.contains('<')
+            && !callee_name.contains("operator")
+        {
+            strip_cpp_template_args(&callee_name)
+        } else {
+            callee_name
         }
     }
 
@@ -2610,7 +2644,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     }
 
     fn build_qualified_name(&self, name: &str) -> String {
-        let mut parts = Vec::new();
+        let mut parts: Vec<&str> = self.namespace_prefix.iter().map(String::as_str).collect();
         for node_id in &self.node_stack {
             if let Some(node) = self.nodes.iter().find(|node| &node.id == node_id) {
                 if node.kind != NodeKind::File {
@@ -4700,6 +4734,96 @@ WINAPI HRESULT DoThing(int x) { return x; }
         let (nodes, _) = run("win.cpp", src, Language::Cpp);
         let f = node(&nodes, NodeKind::Function, "DoThing");
         assert_ne!(f.return_type.as_deref(), Some("WINAPI"));
+    }
+
+    // ---- Release D: C++ namespace qualified names + template-arg calls (e1a8d88) ----
+
+    #[test]
+    fn cpp_namespace_prefixes_qualified_name() {
+        let src = "namespace ns { void fn() {} }";
+        let (nodes, _) = run("ns.cpp", src, Language::Cpp);
+        let f = node(&nodes, NodeKind::Function, "fn");
+        assert_eq!(f.qualified_name, "ns::fn");
+    }
+
+    #[test]
+    fn cpp_nested_namespace_and_class_qualified_name() {
+        let src = "namespace a { class C { public: void m() {} }; }";
+        let (nodes, _) = run("nc.cpp", src, Language::Cpp);
+        let m = node(&nodes, NodeKind::Method, "m");
+        assert_eq!(m.qualified_name, "a::C::m");
+    }
+
+    #[test]
+    fn cpp17_nested_namespace_qualified_name() {
+        let src = "namespace a::b { void f() {} }";
+        let (nodes, _) = run("ab.cpp", src, Language::Cpp);
+        let f = node(&nodes, NodeKind::Function, "f");
+        assert_eq!(f.qualified_name, "a::b::f");
+    }
+
+    #[test]
+    fn cpp_anonymous_namespace_leaves_bare_qualified_name() {
+        let src = "namespace { void f() {} }";
+        let (nodes, _) = run("anon.cpp", src, Language::Cpp);
+        let f = node(&nodes, NodeKind::Function, "f");
+        assert_eq!(f.qualified_name, "f");
+    }
+
+    #[test]
+    fn cpp_template_arg_call_strips_to_base() {
+        let src = r#"
+void fn() {}
+void caller() { fn<int, 256>(x); }
+"#;
+        let (_, refs) = run("tc.cpp", src, Language::Cpp);
+        assert!(
+            has_ref(&refs, EdgeKind::Calls, "fn"),
+            "templated call `fn<int, 256>(x)` should emit a Calls ref to `fn`, got: {:?}",
+            refs.iter()
+                .filter(|r| r.reference_kind == EdgeKind::Calls)
+                .map(|r| r.reference_name.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn cpp_operator_lt_call_not_stripped() {
+        let src = r#"
+void caller() { operator<<(a, b); }
+"#;
+        let (_, refs) = run("op.cpp", src, Language::Cpp);
+        assert!(
+            !has_ref(&refs, EdgeKind::Calls, "operator"),
+            "operator<< callee must not be template-stripped to `operator`"
+        );
+    }
+
+    #[test]
+    fn cpp_ue_reflected_class_recovered() {
+        let src = r#"
+class ENGINE_API UFoo : public UObject
+{
+    GENERATED_BODY()
+    UPROPERTY(EditAnywhere)
+    int X;
+    UFUNCTION()
+    void Bar();
+};
+"#;
+        let (nodes, refs) = run("ue.cpp", src, Language::Cpp);
+        assert!(
+            has_node(&nodes, NodeKind::Class, "UFoo"),
+            "heavily-reflected UE class UFoo should be recovered, got: {:?}",
+            nodes
+                .iter()
+                .map(|n| (n.kind, n.name.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            has_ref(&refs, EdgeKind::Extends, "UObject"),
+            "recovered UFoo should Extends UObject"
+        );
     }
 
     #[test]
