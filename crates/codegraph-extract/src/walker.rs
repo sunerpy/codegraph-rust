@@ -4631,6 +4631,63 @@ void f() { Calculator* c = new Calculator(0); }
         assert!(has_ref(&refs, EdgeKind::Instantiates, "Calculator"));
     }
 
+    // #1172 — CUDA kernel-launch call edge survives the `<<<…>>>` blank.
+    #[test]
+    fn cuda_kernel_launch_call_edge() {
+        let src = r#"
+__global__ void add_kernel(int* p) {}
+void host() {
+    int* p;
+    add_kernel<<<grid, block>>>(p);
+}
+"#;
+        let (nodes, refs) = run("k.cu", src, Language::Cpp);
+        assert!(has_node(&nodes, NodeKind::Function, "add_kernel"));
+        assert!(
+            has_ref(&refs, EdgeKind::Calls, "add_kernel"),
+            "host launch should Call add_kernel, got: {:?}",
+            refs.iter()
+                .map(|r| (r.reference_kind, r.reference_name.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn cuda_templated_launch_call_edge() {
+        let src = r#"
+template <typename T, int N>
+__global__ void scale_kernel(T* x) {}
+void host() {
+    float* x;
+    scale_kernel<float, 256><<<g, b>>>(x);
+}
+"#;
+        let (_, refs) = run("k.cu", src, Language::Cpp);
+        assert!(
+            has_ref(&refs, EdgeKind::Calls, "scale_kernel"),
+            "templated launch should Call scale_kernel (template args stripped), got: {:?}",
+            refs.iter()
+                .map(|r| (r.reference_kind, r.reference_name.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn cuda_macro_defined_kernel_recovered() {
+        let src = r#"
+DEFINE_FLASH_FORWARD_KERNEL(my_kernel, int n) { }
+"#;
+        let (nodes, _) = run("k.cu", src, Language::Cpp);
+        assert!(
+            has_node(&nodes, NodeKind::Function, "my_kernel"),
+            "macro-defined kernel should be named my_kernel, got: {:?}",
+            nodes
+                .iter()
+                .map(|n| (n.kind, n.name.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn cpp_primitive_declaration_no_instantiates() {
         // NEGATIVE: a plain primitive/local declaration must not create an edge.

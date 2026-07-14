@@ -58,6 +58,10 @@ pub fn builtin_language_for_ext(ext: &str) -> Option<Language> {
         "java" => Language::Java,
         "c" | "h" => Language::C,
         "cpp" | "cc" | "cxx" | "hpp" | "hxx" => Language::Cpp,
+        // Metal Shading Language (≈ C++14) and CUDA (≈ C++ + dialect tokens) both
+        // ride the C++ grammar with a dialect-specific pre-parse blank; no new
+        // `Language` variant (upstream maps all three to `cpp`).
+        "metal" | "cu" | "cuh" => Language::Cpp,
         "cs" => Language::CSharp,
         "php" | "module" | "install" | "theme" | "inc" => Language::Php,
         "rb" | "rake" => Language::Ruby,
@@ -203,7 +207,7 @@ pub fn extract_source(
             duration_ms: start.elapsed().as_millis() as i64,
         };
     }
-    let parsed_source = spec.pre_parse(source);
+    let parsed_source = spec.pre_parse(source, file_path);
     let Some(tree) = parser.parse(&parsed_source, None) else {
         return ExtractionResult {
             nodes: Vec::new(),
@@ -857,6 +861,14 @@ mod tests {
         assert_eq!(detect_language("data.bin"), Language::Unknown);
         assert_eq!(detect_language("project.godot"), Language::GodotProject);
         assert_eq!(detect_language("src/lib.rs"), Language::Rust);
+    }
+
+    #[test]
+    fn metal_cu_cuh_map_to_cpp() {
+        assert_eq!(detect_language("s.metal"), Language::Cpp);
+        assert_eq!(detect_language("k.cu"), Language::Cpp);
+        assert_eq!(detect_language("k.cuh"), Language::Cpp);
+        assert_eq!(Language::ALL.len(), 36);
     }
 
     #[test]

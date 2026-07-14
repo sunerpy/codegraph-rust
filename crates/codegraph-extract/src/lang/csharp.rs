@@ -71,7 +71,7 @@ impl LanguageSpec for CSharpSpec {
     fn return_field(&self) -> &'static str {
         "returns"
     }
-    fn pre_parse(&self, source: &str) -> String {
+    fn pre_parse(&self, source: &str, _file_path: &str) -> String {
         blank_csharp_preprocessor_directives(source)
     }
     fn get_return_type(&self, node: Node<'_>, source: &str) -> Option<String> {
