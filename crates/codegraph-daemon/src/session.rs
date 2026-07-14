@@ -169,6 +169,20 @@ impl SessionRegistry {
             .collect()
     }
 
+    /// Whether ANY connected session's host pid is KNOWN and provably alive per
+    /// `is_alive`. A session with no announced pid is the sole class the sweep
+    /// cannot verify (a phantom client whose socket-close was never delivered),
+    /// so it never counts as provably alive. Backs the #1200 inactivity-backstop
+    /// gate: the daemon must keep running while at least one client is provably
+    /// alive, no matter how long that client has been quiet.
+    pub(crate) fn has_provably_alive_client(&self, is_alive: impl Fn(u32) -> bool) -> bool {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .any(|entry| matches!(entry.pid, Some(pid) if is_alive(pid)))
+    }
+
     /// Force a dead session's reader to EOF by half-closing the read direction
     /// of its socket. The session thread, blocked in the rmcp serve loop, then sees
     /// EOF, returns, and drops its [`SessionGuard`] (which removes the entry +
@@ -219,7 +233,7 @@ pub(crate) struct SessionGuard {
 }
 
 impl SessionGuard {
-    fn session_id(&self) -> u64 {
+    pub(crate) fn session_id(&self) -> u64 {
         self.id
     }
 }
@@ -523,6 +537,30 @@ mod tests {
 
         drop(guard);
         assert_eq!(registry.active_count(), 0);
+    }
+
+    #[test]
+    fn has_provably_alive_client_only_counts_known_live_pids() {
+        let registry = SessionRegistry::default();
+        // No sessions: nothing is provably alive.
+        assert!(!registry.has_provably_alive_client(|_| true));
+
+        // A session with NO announced pid is never provably alive (the phantom
+        // class the sweep cannot verify) — even under an all-alive probe.
+        let no_pid = registry.start_session();
+        assert!(!registry.has_provably_alive_client(|_| true));
+
+        // A session whose pid the probe reports dead is not provably alive.
+        let dead = registry.start_session();
+        registry.set_pid(dead.session_id(), 4242);
+        assert!(!registry.has_provably_alive_client(|pid| pid != 4242));
+
+        // A session whose pid the probe reports alive IS provably alive.
+        let alive = registry.start_session();
+        registry.set_pid(alive.session_id(), 1234);
+        assert!(registry.has_provably_alive_client(|pid| pid == 1234));
+
+        drop((no_pid, dead, alive));
     }
 
     #[test]

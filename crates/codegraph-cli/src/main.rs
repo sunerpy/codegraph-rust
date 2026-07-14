@@ -1141,8 +1141,20 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
         .and_then(|v| v.parse::<i64>().ok());
     let reindex_recommended = last_indexed.is_some()
         && built_with_extraction_version.is_none_or(|v| v < EXTRACTION_VERSION);
+    let resolution_incomplete = store.is_resolution_incomplete()?;
 
     if json_output {
+        let mut index_obj = json!({
+            "builtWithVersion": built_with_version,
+            "builtWithExtractionVersion": built_with_extraction_version,
+            "currentExtractionVersion": EXTRACTION_VERSION,
+            "reindexRecommended": reindex_recommended,
+        });
+        // #1187: surface the interrupted-index state ONLY when the marker is set,
+        // so a healthy index's status JSON is byte-identical to a pre-#1187 build.
+        if resolution_incomplete {
+            index_obj["partial"] = json!(true);
+        }
         print_json(&json!({
             "initialized": true,
             "version": VERSION,
@@ -1159,12 +1171,7 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
             "languages": files_by_language.iter().filter(|(_, c)| *c > 0).map(|(l, _)| l).collect::<Vec<_>>(),
             "pendingChanges": { "added": 0, "modified": 0, "removed": 0 },
             "worktreeMismatch": null,
-            "index": {
-                "builtWithVersion": built_with_version,
-                "builtWithExtractionVersion": built_with_extraction_version,
-                "currentExtractionVersion": EXTRACTION_VERSION,
-                "reindexRecommended": reindex_recommended,
-            },
+            "index": index_obj,
             "dbPath": db,
             "dbExists": db_exists,
             "daemonRunning": daemon_running,
@@ -1197,7 +1204,13 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
     for (language, count) in files_by_language {
         println!("  {language:15} {}", format_number(count));
     }
-    println!("\nIndex is up to date\n");
+    if resolution_incomplete {
+        println!(
+            "\n⚠ Index is PARTIAL: a resolution pass was interrupted, so some call\n  edges are missing. Run `codegraph sync` to heal it.\n"
+        );
+    } else {
+        println!("\nIndex is up to date\n");
+    }
     Ok(())
 }
 
@@ -1415,6 +1428,7 @@ fn cmd_serve(
                     &project_root,
                     codegraph_daemon::DaemonOptions {
                         run_mcp: true,
+                        host_pid: codegraph_daemon::host_pid_from_env(),
                         ..Default::default()
                     },
                 )
@@ -3492,17 +3506,29 @@ fn index_project_inner(
     drop(pending_nodes);
     finish_phase(&pb, "Persisted nodes");
 
+    // WAL-valve fold threshold (#1231): with bulk autocheckpoint deferred
+    // (set_bulk_index_pragmas), fold the WAL back whenever it grows past this
+    // size so it never balloons unbounded across the edge/ref replay passes.
+    let wal_valve_bytes = codegraph_store::wal_valve_threshold_bytes();
     let mut spill = spill.into_reader()?;
     let pb = phase_spinner("Persisting edges", quiet);
     spill.replay_edges(EDGE_FLUSH_ROWS, |batch| {
-        store.insert_edges(batch).map_err(anyhow::Error::from)
+        store.insert_edges(batch).map_err(anyhow::Error::from)?;
+        store
+            .checkpoint_wal_if_over(wal_valve_bytes)
+            .map_err(anyhow::Error::from)?;
+        Ok(())
     })?;
     finish_phase(&pb, "Persisted edges");
     let pb = phase_spinner("Persisting references", quiet);
     spill.replay_refs(REF_FLUSH_ROWS, |batch| {
         store
             .insert_unresolved_refs(batch)
-            .map_err(anyhow::Error::from)
+            .map_err(anyhow::Error::from)?;
+        store
+            .checkpoint_wal_if_over(wal_valve_bytes)
+            .map_err(anyhow::Error::from)?;
+        Ok(())
     })?;
     finish_phase(&pb, "Persisted references");
     spill.cleanup();

@@ -12,6 +12,36 @@ use crate::connection::Store;
 
 const SQLITE_PARAM_CHUNK_SIZE: usize = 500;
 
+/// Env var name (#1231): set to `1` to opt out of bulk-index WAL-checkpoint
+/// deferral and keep SQLite's default `wal_autocheckpoint` interval.
+pub const CODEGRAPH_NO_WAL_DEFER: &str = "CODEGRAPH_NO_WAL_DEFER";
+
+/// Env var name (#1231): soft WAL-growth threshold in MB that triggers the
+/// bulk-index [`Store::checkpoint_wal_if_over`] fold. Non-numeric / non-positive
+/// falls back to [`DEFAULT_WAL_VALVE_MB`].
+pub const CODEGRAPH_WAL_VALVE_MB: &str = "CODEGRAPH_WAL_VALVE_MB";
+
+/// Default WAL-valve fold threshold in MB (#1231, mirrors upstream 256).
+pub const DEFAULT_WAL_VALVE_MB: u64 = 256;
+
+fn wal_defer_disabled() -> bool {
+    matches!(std::env::var(CODEGRAPH_NO_WAL_DEFER), Ok(v) if v == "1")
+}
+
+/// Resolve the WAL-valve fold threshold in BYTES from `CODEGRAPH_WAL_VALVE_MB`
+/// (#1231); non-numeric / non-positive → [`DEFAULT_WAL_VALVE_MB`].
+pub fn wal_valve_threshold_bytes() -> u64 {
+    let mb = match std::env::var(CODEGRAPH_WAL_VALVE_MB) {
+        Ok(raw) if !raw.is_empty() => raw
+            .parse::<u64>()
+            .ok()
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_WAL_VALVE_MB),
+        _ => DEFAULT_WAL_VALVE_MB,
+    };
+    mb * 1024 * 1024
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreCounts {
     pub node_count: i64,
@@ -877,22 +907,68 @@ impl Store {
     }
 
     /// Tune THIS connection for a from-scratch bulk index: drop `synchronous` to
-    /// `OFF` and grow the page cache and mmap window. This trades crash durability
+    /// `OFF`, grow the page cache and mmap window, and (unless opted out) DEFER WAL
+    /// auto-checkpointing for the whole run (#1231). This trades crash durability
     /// for throughput during the one-shot full index, which is always safe because
     /// the full-index path starts from an empty DB (`index --force` removes the file
     /// first) and is re-runnable from scratch on failure.
     ///
-    /// `synchronous` is a durability knob only: it never alters committed content,
-    /// so golden byte-equivalence is preserved. MUST be scoped to the CLI full-index
-    /// connection — never the shared `Store::open` defaults used by sync/daemon/watch.
-    /// Pair with [`Store::restore_default_pragmas`] (via a Drop guard) so the restore
-    /// runs on both the happy and the error path.
+    /// WAL deferral (`wal_autocheckpoint=0`): SQLite's default 1000-page
+    /// auto-checkpoint re-writes hot B-tree/FTS pages into the main DB file over and
+    /// over during a bulk index — the dominant disk cost on HDD-class storage. With
+    /// autocheckpoint off, the store becomes near-sequential WAL appends; WAL growth
+    /// is bounded instead by [`Store::checkpoint_wal_if_over`], and the final
+    /// [`Store::restore_default_pragmas`] / [`Store::compact`] folds the WAL back with
+    /// one `wal_checkpoint(TRUNCATE)`. Set `CODEGRAPH_NO_WAL_DEFER=1` to keep the
+    /// default autocheckpoint interval.
+    ///
+    /// `synchronous`, `cache_size`, `mmap_size`, and `wal_autocheckpoint` are all
+    /// durability/scheduling knobs only: none alters committed content, so golden
+    /// byte-equivalence is preserved. `wal_autocheckpoint` is a per-connection
+    /// setting, so a later reopen of this DB resets to the compiled default (1000).
+    /// MUST be scoped to the CLI full-index connection — never the shared
+    /// `Store::open` defaults used by sync/daemon/watch. Pair with
+    /// [`Store::restore_default_pragmas`] (via a Drop guard) so the restore runs on
+    /// both the happy and the error path.
     pub fn set_bulk_index_pragmas(&self) -> rusqlite::Result<()> {
         self.conn.pragma_update(None, "synchronous", "OFF")?;
         self.conn.pragma_update(None, "cache_size", -262_144)?;
         self.conn
             .pragma_update(None, "mmap_size", 1_073_741_824_i64)?;
+        if !wal_defer_disabled() {
+            self.conn.pragma_update(None, "wal_autocheckpoint", 0)?;
+        }
         Ok(())
+    }
+
+    /// Size in bytes of the `-wal` sidecar, or 0 when it does not exist (non-WAL
+    /// mode, in-memory DB, or nothing written since the last checkpoint+reset).
+    /// Drives the [`Store::checkpoint_wal_if_over`] valve (#1231).
+    pub fn wal_size_bytes(&self) -> u64 {
+        let mut wal = self.path().to_path_buf().into_os_string();
+        wal.push("-wal");
+        std::fs::metadata(wal).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// WAL-valve fold (#1231): when the `-wal` sidecar has grown past
+    /// `threshold_bytes`, fold it back into the main DB with one
+    /// `wal_checkpoint(TRUNCATE)` and report `true`; otherwise a cheap no-op
+    /// returning `false`. Called between bulk-write batches while
+    /// `wal_autocheckpoint=0` is in effect, so unbounded WAL growth (which fills
+    /// the disk and makes every later read page through a multi-GB WAL) is capped
+    /// without paying the default per-1000-page checkpoint churn. TRUNCATE is
+    /// content-preserving — it only relocates already-committed frames — so index
+    /// output stays byte-identical. Safe here because the bulk index holds the
+    /// sole connection (no concurrent reader pins the WAL).
+    ///
+    /// Must be called with no active transaction.
+    pub fn checkpoint_wal_if_over(&self, threshold_bytes: u64) -> rusqlite::Result<bool> {
+        if self.wal_size_bytes() <= threshold_bytes {
+            return Ok(false);
+        }
+        self.conn
+            .pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
+        Ok(true)
     }
 
     /// Undo [`Store::set_bulk_index_pragmas`]: checkpoint the WAL back into the main
@@ -926,6 +1002,49 @@ impl Store {
             "INSERT INTO project_metadata (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
             params![key, value, now_millis()],
         )
+    }
+
+    /// Delete a `project_metadata` row. Missing key is a no-op (returns 0).
+    /// Complements [`Self::set_project_metadata`] for flags whose ABSENCE is the
+    /// healthy state (see [`Self::clear_resolution_incomplete`]).
+    pub fn delete_project_metadata(&self, key: &str) -> rusqlite::Result<usize> {
+        self.conn
+            .execute("DELETE FROM project_metadata WHERE key = ?", [key])
+    }
+
+    /// `project_metadata` key for the incomplete-resolution MARKER (#1187).
+    ///
+    /// A full-index resolution pass SETS this at its start and DELETES it only on
+    /// successful completion. A crash / Ctrl-C / #1122 watchdog kill mid-resolve
+    /// therefore leaves the marker present, which is the signal that some
+    /// `unresolved_refs` were never processed into edges (the interrupted-index
+    /// "too-small blast radius" of the #1187 field report). This is deliberately
+    /// distinct from "rows at rest": Rust RETAINS unresolvable rows as live retry
+    /// state (#1240), so a bare row count is NOT a sound orphan signal here — the
+    /// marker is.
+    pub const RESOLUTION_INCOMPLETE_KEY: &'static str = "resolution_incomplete";
+
+    /// Set the incomplete-resolution marker (#1187). Called at the START of a
+    /// full-index resolution pass; cleared by [`Self::clear_resolution_incomplete`]
+    /// only when that pass completes.
+    pub fn set_resolution_incomplete(&self) -> rusqlite::Result<usize> {
+        self.set_project_metadata(Self::RESOLUTION_INCOMPLETE_KEY, "1")
+    }
+
+    /// Clear the incomplete-resolution marker (#1187). Absence of the row is the
+    /// healthy state, so this DELETEs rather than writing a sentinel — keeping the
+    /// healthy `project_metadata` set identical to a pre-#1187 index.
+    pub fn clear_resolution_incomplete(&self) -> rusqlite::Result<usize> {
+        self.delete_project_metadata(Self::RESOLUTION_INCOMPLETE_KEY)
+    }
+
+    /// Whether the incomplete-resolution marker is set (#1187). `true` means a
+    /// resolution pass was interrupted mid-run and the index is partial until the
+    /// next `sync` sweeps it.
+    pub fn is_resolution_incomplete(&self) -> rusqlite::Result<bool> {
+        Ok(self
+            .get_project_metadata(Self::RESOLUTION_INCOMPLETE_KEY)?
+            .is_some())
     }
 
     /// `getStats` node-kind aggregation

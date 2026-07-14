@@ -1282,6 +1282,12 @@ impl ReferenceResolver {
         batch_size: usize,
         mut on_progress: impl FnMut(u64, u64),
     ) -> anyhow::Result<ResolutionResult> {
+        // Incomplete-resolution marker (#1187): armed BEFORE the first batch and
+        // cleared only after the deferred passes complete below. An interrupted
+        // run (crash / Ctrl-C / #1122 watchdog kill) leaves it set, so the next
+        // `sync` knows to sweep the refs this run never reached into edges.
+        store.set_resolution_incomplete()?;
+
         {
             let context = crate::context::StoreResolutionContext::new(store, &self.project_root);
             self.warm_caches(&context);
@@ -1391,6 +1397,9 @@ impl ReferenceResolver {
         // edges exist (index.ts:508-511).
         self.resolve_chained_calls_via_conformance(store)?;
         self.resolve_deferred_this_member_refs(store)?;
+
+        // Full pass completed: clear the #1187 marker set at the top.
+        store.clear_resolution_incomplete()?;
 
         Ok(aggregate)
     }
@@ -2359,6 +2368,39 @@ mod tests {
             .edges_by_source_kind(&caller.id, Some(EdgeKind::Calls))
             .expect("edges")
             .len()
+    }
+
+    #[test]
+    fn batched_pass_clears_incomplete_marker_on_success() {
+        let mut store = Store::open(&temp_db("marker-clear")).expect("open");
+        let add = mk_node("function:add", NodeKind::Function, "add", "math.ts");
+        let caller = mk_node("function:run", NodeKind::Function, "run", "app.ts");
+        store.upsert_file(&file_rec("math.ts")).expect("file");
+        store.upsert_file(&file_rec("app.ts")).expect("file");
+        store.upsert_nodes(&[add, caller.clone()]).expect("nodes");
+        store
+            .insert_unresolved_refs(&[UnresolvedRef {
+                id: None,
+                from_node_id: caller.id,
+                reference_name: "add".to_string(),
+                reference_kind: EdgeKind::Calls,
+                line: 1,
+                col: 0,
+                candidates: None,
+                file_path: "app.ts".to_string(),
+                language: Language::TypeScript,
+                is_function_ref: false,
+                reference_subkind: None,
+            }])
+            .expect("refs");
+        let mut resolver = ReferenceResolver::new("/root");
+        resolver
+            .resolve_and_persist_batched(&mut store, 10)
+            .expect("batched");
+        assert!(
+            !store.is_resolution_incomplete().expect("marker read"),
+            "a completed batched pass must clear the #1187 incomplete marker"
+        );
     }
 
     #[test]
