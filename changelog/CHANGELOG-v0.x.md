@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.29.1](https://github.com/sunerpy/codegraph-rust/compare/v0.29.0...v0.29.1) (2026-07-14)
+
+
+### Bug Fixes
+
+* heal interrupted indexes on sync and harden daemon lifecycle + WAL ([#135](https://github.com/sunerpy/codegraph-rust/issues/135)) ([fe3d899](https://github.com/sunerpy/codegraph-rust/commit/fe3d89989347036974459607a34833e21799ca70))
+
 ## [0.29.0](https://github.com/sunerpy/codegraph-rust/compare/v0.28.4...v0.29.0) (2026-07-10)
 
 
