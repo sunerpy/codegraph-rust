@@ -1,0 +1,32 @@
+[
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "bar.nix",
+    "from_node_id": "file:bar.nix",
+    "language": "nix",
+    "line": 2,
+    "reference_kind": "calls",
+    "reference_name": "stdenv.mkDerivation"
+  },
+  {
+    "candidates": null,
+    "col": 19,
+    "file_path": "default.nix",
+    "from_node_id": "function:efd81fcc22ebb21765d9c3cc0793cb95",
+    "language": "nix",
+    "line": 12,
+    "reference_kind": "calls",
+    "reference_name": "pkgs.mkDerivation"
+  },
+  {
+    "candidates": null,
+    "col": 8,
+    "file_path": "default.nix",
+    "from_node_id": "file:default.nix",
+    "language": "nix",
+    "line": 4,
+    "reference_kind": "calls",
+    "reference_name": "pkgs.callPackage"
+  }
+]

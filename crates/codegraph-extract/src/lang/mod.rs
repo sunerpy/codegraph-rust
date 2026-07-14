@@ -16,6 +16,7 @@ mod jsx;
 mod kotlin;
 mod lua;
 mod luau;
+mod nix;
 mod objc;
 mod pascal;
 mod php;
@@ -47,6 +48,12 @@ pub use jsx::JSX_SPEC;
 pub use kotlin::KOTLIN_SPEC;
 pub use lua::LUA_SPEC;
 pub use luau::LUAU_SPEC;
+pub use nix::NIX_SPEC;
+pub(crate) use nix::{
+    format_function_signature, is_callpackage_name, is_returned_attrset_member,
+    is_static_project_path, nix_callee_name, nix_curried_params_and_body, nix_direct_callee_name,
+    nix_first_apply_argument, nix_inherited_attrs, nix_static_import_path,
+};
 pub use objc::OBJC_SPEC;
 pub use pascal::PASCAL_SPEC;
 pub use php::PHP_SPEC;
@@ -86,6 +93,7 @@ pub fn spec_for_language(language: Language) -> Option<&'static dyn LanguageSpec
         Language::ObjC => Some(&OBJC_SPEC),
         Language::R => Some(&R_SPEC),
         Language::Solidity => Some(&SOLIDITY_SPEC),
+        Language::Nix => Some(&NIX_SPEC),
         Language::Gdscript => Some(&GDSCRIPT_SPEC),
         _ => None,
     }

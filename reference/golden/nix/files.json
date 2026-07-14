@@ -1,0 +1,26 @@
+[
+  {
+    "content_hash": "7ea2d3f7da76e263d391b2ec6d7d99574db4c40cc9e4f33a5a305346c82ee3d5",
+    "errors": null,
+    "language": "nix",
+    "node_count": 3,
+    "path": "bar.nix",
+    "size": 72
+  },
+  {
+    "content_hash": "ed9b1d6a781e97666ec258cf392af57c8ab2cb1e818daac8ea099bef7e041a71",
+    "errors": null,
+    "language": "nix",
+    "node_count": 15,
+    "path": "default.nix",
+    "size": 290
+  },
+  {
+    "content_hash": "89378235fc3afa5147a2c9abeddc1fb5c31f736bb076c1ad13159b90791bce31",
+    "errors": null,
+    "language": "nix",
+    "node_count": 4,
+    "path": "foo.nix",
+    "size": 74
+  }
+]

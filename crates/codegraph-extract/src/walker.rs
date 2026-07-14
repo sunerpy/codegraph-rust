@@ -229,7 +229,230 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             Language::Gdscript => self.visit_gdscript_node(node),
             Language::Cpp => self.visit_cpp_node(node),
             Language::Solidity => self.visit_solidity_node(node),
+            Language::Nix => self.visit_nix_node(node),
             _ => false,
+        }
+    }
+
+    /// Nix extraction (upstream `nixExtractor.visitNode`, `nix.ts`, #1190 — the
+    /// extraction slice only). Nix's expression AST has no C-family type-set
+    /// node kinds, so `NIX_SPEC` returns `&[]` for every type-set and this
+    /// custom visitor (like `visit_gdscript_node`) owns the four handled kinds:
+    /// `binding` → Function|Variable, bare `function_expression` body descent,
+    /// `inherit`/`inherit_from` → Variable names, and `apply_expression` →
+    /// Calls / import-path Imports. Every other kind returns `false` → the
+    /// generic `visit_named_children` descent. Strictly `Language::Nix`-guarded.
+    fn visit_nix_node(&mut self, node: SyntaxNode<'tree>) -> bool {
+        match node.kind() {
+            "binding" => {
+                self.visit_nix_binding(node);
+                true
+            }
+            "function_expression" => {
+                // Bare lambda (not owned by a binding): visit the body (last
+                // named child) only. nix.ts:243-247.
+                if node.named_child_count() > 0 {
+                    if let Some(body) = node.named_child(node.named_child_count() as u32 - 1) {
+                        self.visit_node(body);
+                    }
+                }
+                true
+            }
+            "inherit" | "inherit_from" => {
+                self.visit_nix_inherit(node);
+                true
+            }
+            "apply_expression" => {
+                self.visit_nix_apply(node);
+                // Visit all named children (nix.ts:316-318).
+                self.visit_named_children(node);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn visit_nix_binding(&mut self, node: SyntaxNode<'tree>) {
+        let Some(attrpath) = child_by_field(node, "attrpath").or_else(|| node.named_child(0))
+        else {
+            return;
+        };
+        let name = node_text(attrpath, self.source).trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let Some(value) = child_by_field(node, "expression")
+            .or_else(|| child_by_field(node, "value"))
+            .or_else(|| node.named_child(1))
+        else {
+            return;
+        };
+
+        if value.kind() == "function_expression" {
+            let (params, body) = crate::lang::nix_curried_params_and_body(value, self.source);
+            let signature = crate::lang::format_function_signature(&params);
+            if let Some(func) = self.create_node(
+                NodeKind::Function,
+                &name,
+                node,
+                NodeExtra {
+                    signature: Some(signature),
+                    is_exported: crate::lang::is_returned_attrset_member(node),
+                    ..NodeExtra::default()
+                },
+            ) {
+                self.node_stack.push(func.id);
+                if let Some(body) = body {
+                    self.visit_node(body);
+                }
+                self.node_stack.pop();
+            }
+        } else {
+            let init_value = node_text(value, self.source);
+            let init_slice: String = init_value.chars().take(100).collect();
+            let signature = if init_slice.is_empty() {
+                None
+            } else {
+                let ellipsis = if init_value.chars().count() >= 100 {
+                    "..."
+                } else {
+                    ""
+                };
+                Some(format!("= {init_slice}{ellipsis}"))
+            };
+            self.create_node(
+                NodeKind::Variable,
+                &name,
+                node,
+                NodeExtra {
+                    signature,
+                    is_exported: crate::lang::is_returned_attrset_member(node),
+                    ..NodeExtra::default()
+                },
+            );
+
+            // NixOS/home-manager `imports = [ ./hardware.nix ]` (and flake-era
+            // `modules = [ ./configuration.nix ]`) reference files without an
+            // `import` call. Only literal `path_expression` entries count.
+            // nix.ts:225-235.
+            let final_segment = name.rsplit('.').next().unwrap_or(name.as_str());
+            if matches!(final_segment, "imports" | "modules") && value.kind() == "list_expression" {
+                for child in value.named_children(&mut value.walk()) {
+                    if child.kind() == "path_expression" {
+                        let entry = node_text(child, self.source).trim().to_string();
+                        if crate::lang::is_static_project_path(&entry) {
+                            self.emit_nix_file_import(&entry, child);
+                        }
+                    }
+                }
+            }
+
+            self.visit_node(value);
+        }
+    }
+
+    fn visit_nix_inherit(&mut self, node: SyntaxNode<'tree>) {
+        if let Some(attrs) = crate::lang::nix_inherited_attrs(node) {
+            for child in attrs.named_children(&mut attrs.walk()) {
+                let name = node_text(child, self.source).trim().to_string();
+                if !name.is_empty() {
+                    self.create_node(
+                        NodeKind::Variable,
+                        &name,
+                        child,
+                        NodeExtra {
+                            is_exported: crate::lang::is_returned_attrset_member(child),
+                            ..NodeExtra::default()
+                        },
+                    );
+                }
+            }
+        }
+        for child in node.named_children(&mut node.walk()) {
+            if child.kind() != "inherited_attrs" {
+                self.visit_node(child);
+            }
+        }
+    }
+
+    fn visit_nix_apply(&mut self, node: SyntaxNode<'tree>) {
+        let direct_callee = crate::lang::nix_direct_callee_name(node, self.source);
+        let is_direct_import = matches!(
+            direct_callee.as_deref(),
+            Some("import") | Some("builtins.import")
+        );
+
+        // Wrapper objects are re-created per access, so compare node identity
+        // (start/end byte span), never a fresh handle — otherwise every level of
+        // a curried chain (`f a b`) re-emits the same refs. nix.ts:274-278.
+        let is_callee_of_parent = node
+            .parent()
+            .filter(|p| p.kind() == "apply_expression")
+            .and_then(|p| {
+                p.child_by_field_name("function")
+                    .or_else(|| p.named_child(0))
+            })
+            .map(|parent_fn| {
+                parent_fn.start_byte() == node.start_byte()
+                    && parent_fn.end_byte() == node.end_byte()
+            })
+            .unwrap_or(false);
+
+        if is_callee_of_parent && !is_direct_import {
+            return;
+        }
+
+        if is_direct_import {
+            let arg = child_by_field(node, "argument").or_else(|| node.named_child(1));
+            if let Some(arg) = arg {
+                if let Some(path) = crate::lang::nix_static_import_path(arg, self.source) {
+                    self.emit_nix_file_import(&path, node);
+                }
+            }
+            return;
+        }
+
+        let callee = crate::lang::nix_callee_name(node, self.source);
+        if let Some(callee) = callee.as_deref() {
+            if callee != "import"
+                && callee != "builtins.import"
+                && let Some(from) = self.node_stack.last().cloned()
+            {
+                self.push_ref(&from, callee, EdgeKind::Calls, node);
+            }
+
+            // `callPackage ./pkg.nix { }` loads the file like `import` does; the
+            // first argument of the apply chain is the package file. Only a
+            // literal static path counts. nix.ts:303-312.
+            if crate::lang::is_callpackage_name(callee) {
+                if let Some(first_arg) = crate::lang::nix_first_apply_argument(node) {
+                    if let Some(path) = crate::lang::nix_static_import_path(first_arg, self.source)
+                    {
+                        self.emit_nix_file_import(&path, node);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Import node + unresolved `imports` ref for a static project path. Ports
+    /// `emitFileImport` (nix.ts:155-172).
+    fn emit_nix_file_import(&mut self, import_path: &str, anchor: SyntaxNode<'tree>) {
+        let anchor_text = node_text(anchor, self.source);
+        let signature: String = anchor_text.trim().chars().take(100).collect();
+        let created = self.create_node(
+            NodeKind::Import,
+            import_path,
+            anchor,
+            NodeExtra {
+                signature: Some(signature),
+                ..NodeExtra::default()
+            },
+        );
+        if created.is_some() {
+            if let Some(from) = self.node_stack.last().cloned() {
+                self.push_ref(&from, import_path, EdgeKind::Imports, anchor);
+            }
         }
     }
 
@@ -5505,5 +5728,68 @@ public:
         assert_eq!(strip_cpp_template_args(""), "");
         // Trailing/interior whitespace around stripped args is trimmed.
         assert_eq!(strip_cpp_template_args("Base <int> "), "Base");
+    }
+
+    // ---- Nix (custom visit_nix_node; NIX_SPEC has empty type-sets) ----
+
+    #[test]
+    fn nix_binding_lambda_is_function() {
+        let (nodes, _refs) = run("m.nix", "{ f = { pkgs }: pkgs.hello; }", Language::Nix);
+        let func = node(&nodes, NodeKind::Function, "f");
+        assert_eq!(func.signature.as_deref(), Some("{ pkgs }"));
+    }
+
+    #[test]
+    fn nix_binding_value_is_variable_or_field() {
+        let (nodes, _refs) = run("m.nix", "{ x = 42; }", Language::Nix);
+        assert!(has_node(&nodes, NodeKind::Variable, "x"));
+    }
+
+    #[test]
+    fn nix_apply_expression_is_call() {
+        let (_nodes, refs) = run("m.nix", "{ y = mkDerivation { }; }", Language::Nix);
+        assert!(has_ref(&refs, EdgeKind::Calls, "mkDerivation"));
+        let curried = run("m.nix", "{ z = foo a b; }", Language::Nix).1;
+        let count = curried
+            .iter()
+            .filter(|r| r.reference_kind == EdgeKind::Calls && r.reference_name == "foo")
+            .count();
+        assert_eq!(count, 1, "curried chain dedup: {curried:?}");
+    }
+
+    #[test]
+    fn nix_import_and_callpackage_are_imports() {
+        let (nodes, refs) = run(
+            "m.nix",
+            "{ a = import ./foo.nix; b = callPackage ./bar.nix {}; }",
+            Language::Nix,
+        );
+        assert!(has_node(&nodes, NodeKind::Import, "./foo.nix"));
+        assert!(has_node(&nodes, NodeKind::Import, "./bar.nix"));
+        assert!(has_ref(&refs, EdgeKind::Imports, "./foo.nix"));
+        assert!(has_ref(&refs, EdgeKind::Imports, "./bar.nix"));
+    }
+
+    #[test]
+    fn nix_imports_list_emits_file_imports() {
+        let (_nodes, refs) = run(
+            "m.nix",
+            "{ imports = [ ./hardware.nix ../common.nix pkgsVar ]; }",
+            Language::Nix,
+        );
+        assert!(has_ref(&refs, EdgeKind::Imports, "./hardware.nix"));
+        assert!(has_ref(&refs, EdgeKind::Imports, "../common.nix"));
+        let bare = refs
+            .iter()
+            .filter(|r| r.reference_kind == EdgeKind::Imports)
+            .count();
+        assert_eq!(bare, 2, "bare-variable entry emits no import: {refs:?}");
+    }
+
+    #[test]
+    fn nix_inherit_names_extracted() {
+        let (nodes, _refs) = run("m.nix", "{ inherit lib pkgs; }", Language::Nix);
+        assert!(has_node(&nodes, NodeKind::Variable, "lib"));
+        assert!(has_node(&nodes, NodeKind::Variable, "pkgs"));
     }
 }

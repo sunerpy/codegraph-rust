@@ -1,0 +1,221 @@
+[
+  {
+    "col": 11,
+    "kind": "imports",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "file-path"
+    },
+    "provenance": null,
+    "source": "file:default.nix",
+    "target": "file:foo.nix"
+  },
+  {
+    "col": 14,
+    "kind": "imports",
+    "line": 10,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "file-path"
+    },
+    "provenance": null,
+    "source": "file:default.nix",
+    "target": "file:foo.nix"
+  },
+  {
+    "col": 24,
+    "kind": "imports",
+    "line": 10,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "file-path"
+    },
+    "provenance": null,
+    "source": "file:default.nix",
+    "target": "file:bar.nix"
+  },
+  {
+    "col": 8,
+    "kind": "imports",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "file-path"
+    },
+    "provenance": null,
+    "source": "file:default.nix",
+    "target": "file:bar.nix"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:bar.nix",
+    "target": "variable:44d07e5e97a9eb169c8b5ff98fce1ab3"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:bar.nix",
+    "target": "variable:6cd992ebd6196831208b1a52f453db07"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:default.nix",
+    "target": "function:efd81fcc22ebb21765d9c3cc0793cb95"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:default.nix",
+    "target": "import:28bda77b3554035c8b80d465d5ca5ea6"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:default.nix",
+    "target": "import:9172fe6a41024c2ccb850e98721d523a"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:default.nix",
+    "target": "import:9fe67dad07458e7da8f22ab3af144ea4"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:default.nix",
+    "target": "import:cda00c0cb1b705c54a2ff7e084077bcb"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:default.nix",
+    "target": "variable:25db1fa61912f8976b97968eac1e508f"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:default.nix",
+    "target": "variable:42eabe8a9f2b3fcd2ad6e8e85f3ee9a2"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:default.nix",
+    "target": "variable:59312d0eb6e9b389e669ce3b8f196b90"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:default.nix",
+    "target": "variable:9addcb9072c75370f6e30031303105f6"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:default.nix",
+    "target": "variable:c6f664dc7d14514becf6026e5433db28"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:default.nix",
+    "target": "variable:d6de27bfea9dffedb1e66122f1f7a327"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:default.nix",
+    "target": "variable:f2f450017e009b920df0f28a08977b33"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:foo.nix",
+    "target": "function:ef79bf042d673a9aeda54c1b6f0551d4"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:foo.nix",
+    "target": "variable:a1cbe9b12b88bae3e7e7b9c254000901"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:foo.nix",
+    "target": "variable:b737f15346177f2dd9c3f909ffdbd14f"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "function:efd81fcc22ebb21765d9c3cc0793cb95",
+    "target": "variable:5652709e8a42bb2e9a078eb0dafd0f2a"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "function:efd81fcc22ebb21765d9c3cc0793cb95",
+    "target": "variable:6d6c846d384f81d48df540abaddbce5f"
+  }
+]

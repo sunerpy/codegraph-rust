@@ -1525,6 +1525,7 @@ fn parse_language(value: String) -> rusqlite::Result<Language> {
         "objc" => Language::ObjC,
         "r" => Language::R,
         "solidity" => Language::Solidity,
+        "nix" => Language::Nix,
         "yaml" => Language::Yaml,
         "twig" => Language::Twig,
         "xml" => Language::Xml,
@@ -2191,6 +2192,11 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn parse_language_accepts_nix() {
+        assert_eq!(parse_language("nix".to_string()).unwrap(), Language::Nix);
     }
 
     #[test]
