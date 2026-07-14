@@ -157,6 +157,29 @@ fn solidity_db_is_self_equivalent_to_solidity_golden() {
 }
 
 #[test]
+fn generated_golden_matches_committed_nix_fixture() {
+    // Guards Nix extraction (upstream #1190, extraction slice only): the
+    // `.nix`->Nix mapping, `binding`->Function|Variable, curried lambda->Function
+    // with a formatted signature, `inherit`->Variable names, `import`/
+    // `callPackage`/`imports`-list literal paths->Import node + Imports ref, and
+    // `apply_expression`->Calls ref with curried-chain dedup. The module-system
+    // synthesizer / lexical-scope gates / callback synthesizer / import-resolver
+    // wiring are DEFERRED, so path refs stay unresolved.
+    let tempdir = TestDir::new("generated-golden-nix");
+    write_golden(&nix_db(), tempdir.path()).unwrap();
+
+    let expected = load_golden(&nix_golden_dir()).unwrap();
+    let actual = load_golden(tempdir.path()).unwrap();
+
+    diff_canonical(&expected, &actual, None).unwrap();
+}
+
+#[test]
+fn nix_db_is_self_equivalent_to_nix_golden() {
+    assert_equivalent(&nix_db(), &nix_golden_dir()).unwrap();
+}
+
+#[test]
 fn tier1_node_drift_is_reported() {
     let expected = load_golden(&mini_golden_dir()).unwrap();
     let mut actual = expected.clone();
@@ -264,6 +287,14 @@ fn solidity_db() -> PathBuf {
 
 fn solidity_golden_dir() -> PathBuf {
     workspace_root().join("reference/golden/solidity")
+}
+
+fn nix_db() -> PathBuf {
+    workspace_root().join("reference/golden/nix/colby.db")
+}
+
+fn nix_golden_dir() -> PathBuf {
+    workspace_root().join("reference/golden/nix")
 }
 
 struct TestDir {

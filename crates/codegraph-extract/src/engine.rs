@@ -83,6 +83,7 @@ pub fn builtin_language_for_ext(ext: &str) -> Option<Language> {
         "m" | "mm" => Language::ObjC,
         "r" => Language::R,
         "sol" => Language::Solidity,
+        "nix" => Language::Nix,
         "yml" | "yaml" => Language::Yaml,
         "twig" => Language::Twig,
         "xml" => Language::Xml,
@@ -871,7 +872,7 @@ mod tests {
         assert_eq!(detect_language("s.metal"), Language::Cpp);
         assert_eq!(detect_language("k.cu"), Language::Cpp);
         assert_eq!(detect_language("k.cuh"), Language::Cpp);
-        assert_eq!(Language::ALL.len(), 38);
+        assert_eq!(Language::ALL.len(), 39);
     }
 
     #[test]
@@ -882,6 +883,11 @@ mod tests {
     #[test]
     fn sol_maps_to_solidity() {
         assert_eq!(detect_language("Token.sol"), Language::Solidity);
+    }
+
+    #[test]
+    fn nix_extension_maps_to_nix() {
+        assert_eq!(detect_language("flake.nix"), Language::Nix);
     }
 
     #[test]

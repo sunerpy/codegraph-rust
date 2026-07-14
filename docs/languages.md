@@ -4,7 +4,7 @@ CodeGraph extracts code structure deterministically using tree-sitter grammars a
 embedded extractors. No AI, vectors, or embeddings are involved. The output is byte-stable
 across runs.
 
-**34 concrete languages** are supported, grouped into three extraction tiers based on what
+**35 concrete languages** are supported, grouped into three extraction tiers based on what
 the extractor produces.
 
 > **Note on TypeScript/JavaScript variants:** `typescript` and `tsx`, and `javascript` and
@@ -14,7 +14,7 @@ the extractor produces.
 
 ---
 
-## Tier 1 — Full symbol extraction (25 languages)
+## Tier 1 — Full symbol extraction (26 languages)
 
 Tree-sitter parses the file and extracts all symbols (functions, classes, structs, methods,
 variables, imports, etc.) plus call and dependency edges. This is the richest extraction
@@ -45,6 +45,7 @@ level.
 | Objective-C | `.m` `.mm`                                  | Full tree-sitter          |                                                                                                                                                                                                                               |
 | R           | `.r`                                        | Full tree-sitter          |                                                                                                                                                                                                                               |
 | Solidity    | `.sol`                                      | Full tree-sitter          | `tree-sitter-solidity` grammar; contracts/libraries/interfaces, structs, enums, modifiers, events, errors; `is`-inheritance → Extends (resolver promotes to Implements for interfaces); emit/revert/modifier-guard call edges |
+| Nix         | `.nix`                                      | Full tree-sitter          | `tree-sitter-nix` grammar; `let`/attrset bindings, curried lambdas, `inherit`; `import`/`callPackage`/`imports`-list file imports; module-system option synthesizer deferred                                                  |
 | GDScript    | `.gd`                                       | Full tree-sitter          | Godot scripting; extracts functions, classes, enums, variables, signals, extends, preload. Dynamic dispatch edges (connect/get_node/$/%/call/group) added by the Godot resolver — see [`docs/godot.md`](godot.md)             |
 | Pascal      | `.pas` `.dpr` `.dpk` `.lpr` `.dfm` `.fmx`   | Full tree-sitter / custom | `.dfm`/`.fmx` form files use a custom path                                                                                                                                                                                    |
 

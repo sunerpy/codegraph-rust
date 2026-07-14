@@ -456,6 +456,54 @@ The `generated_golden_matches_committed_solidity_fixture` and
 `solidity_db_is_self_equivalent_to_solidity_golden` tests in
 `crates/codegraph-bench/tests/equivalence.rs` enforce byte-stability.
 
+### Nix fixture
+
+A ninth golden fixture, `reference/golden/nix/`, guards Nix (`.nix`) extraction
+(upstream #1190 / `7f32513`, the extraction slice only). Nix is a **new
+`Language::Nix` variant** backed by a **dedicated `tree-sitter-nix` grammar**.
+`.nix` maps to `Language::Nix`. Because Nix is an expression language with no
+C-family `class`/`struct`/`method`/`enum` node kinds, `NIX_SPEC` has all-empty
+type-sets and the extraction is driven by the `Language::Nix`-guarded
+`visit_nix_node` walker extension. The corpus
+(`crates/codegraph-bench/fixtures/nix/`) has a top-level lambda
+`{ pkgs, lib }: …`, a `let … in`, a returned attrset with bindings, an
+`import ./foo.nix`, a `pkgs.callPackage ./bar.nix { }`, an `inherit lib;`, an
+`imports = [ ./foo.nix ./bar.nix ]` module list, and a curried `build = { src }:
+…` lambda. What it guards:
+
+- all three `.nix` files with `"language": "nix"`;
+- a `binding` whose value is a lambda → `NodeKind::Function` with a formatted
+  curried-param signature (`build` → `{ src }`, `double` → `(x)`);
+- a non-lambda `binding` and each `inherit`ed name → `NodeKind::Variable`;
+- `import ./foo.nix`, `callPackage ./bar.nix { }`, and the literal
+  `imports`-list paths → `NodeKind::Import` nodes + `Imports` refs;
+- an `apply_expression` call → `Calls` ref, deduped across curried levels
+  (`pkgs.mkDerivation`, `pkgs.callPackage`, `stdenv.mkDerivation`).
+
+The `imports`/`callPackage` path refs to `./foo.nix` / `./bar.nix` resolve
+in-corpus (both files exist), so `refs.json` retains only the three unresolved
+`Calls` refs — the module-system option-path synthesizer, lexical-scope
+resolution gates, callback synthesizer, and import-resolver module-list wiring
+that upstream bundles with the same commit are **DEFERRED**, so no new Nix
+resolve code binds anything. Adding the variant is byte-neutral for
+`colby.schema.sql` (language is a stored TEXT value, not DDL) and for the eight
+existing goldens (none holds a `.nix` file).
+
+Regenerate reproducibly (identical recipe to the Solidity fixture, substituting
+`nix`):
+
+```bash
+rm -rf /tmp/cg-fixture-nix && cp -r crates/codegraph-bench/fixtures/nix /tmp/cg-fixture-nix
+cargo build --release -p codegraph-rs
+CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-nix
+cp /tmp/cg-fixture-nix/.codegraph/codegraph.db reference/golden/nix/colby.db
+cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/nix/colby.db reference/golden/nix
+```
+
+The `generated_golden_matches_committed_nix_fixture` and
+`nix_db_is_self_equivalent_to_nix_golden` tests in
+`crates/codegraph-bench/tests/equivalence.rs` enforce byte-stability.
+
 ### KNOWN_DIFFS.md format
 
 Tier-3 differences are allowlisted by grep-able lines in repo-root
