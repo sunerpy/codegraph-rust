@@ -44,6 +44,7 @@ pub fn sync_project_once_with_progress(
         ignore_dirs: config.indexing.ignore_dirs.clone(),
         ignore_paths: config.indexing.ignore_paths.clone(),
         exclude: config.indexing.exclude.clone(),
+        include: config.indexing.include.clone(),
         parallel: true,
     };
     let started = std::time::Instant::now();
@@ -63,7 +64,15 @@ pub fn sync_project_once_with_progress(
         }
     }
 
-    sync_paths_with_store(&mut store, project_root, candidates, started, on_progress)
+    sync_paths_with_store(
+        &mut store,
+        project_root,
+        candidates,
+        &config.indexing.include,
+        &config.indexing.exclude,
+        started,
+        on_progress,
+    )
 }
 
 pub fn sync_changed_paths(
@@ -71,21 +80,46 @@ pub fn sync_changed_paths(
     db_path: impl AsRef<Path>,
     paths: impl IntoIterator<Item = impl AsRef<Path>>,
 ) -> Result<SyncOutcome> {
+    sync_changed_paths_with_patterns(project_root, db_path, paths, &[], &[])
+}
+
+/// Like [`sync_changed_paths`] but threads the `codegraph.json`/`config.toml`
+/// `include`/`exclude` path patterns (#1063) so the watcher's incremental sync
+/// scopes files exactly as the full scan does — an included gitignored path is
+/// handled, a built-in skip is not, and an explicit `exclude` wins.
+pub fn sync_changed_paths_with_patterns(
+    project_root: impl AsRef<Path>,
+    db_path: impl AsRef<Path>,
+    paths: impl IntoIterator<Item = impl AsRef<Path>>,
+    include: &[String],
+    exclude: &[String],
+) -> Result<SyncOutcome> {
     let started = std::time::Instant::now();
     let project_root = project_root.as_ref();
     let db_path = db_path.as_ref();
     let mut store = Store::open(db_path).with_context(|| format!("open {}", db_path.display()))?;
-    sync_paths_with_store(&mut store, project_root, paths, started, |_, _| {})
+    sync_paths_with_store(
+        &mut store,
+        project_root,
+        paths,
+        include,
+        exclude,
+        started,
+        |_, _| {},
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sync_paths_with_store(
     store: &mut Store,
     project_root: &Path,
     paths: impl IntoIterator<Item = impl AsRef<Path>>,
+    include: &[String],
+    exclude: &[String],
     started: std::time::Instant,
     mut on_progress: impl FnMut(usize, usize),
 ) -> Result<SyncOutcome> {
-    let policy = WatchPolicy::new(project_root);
+    let policy = WatchPolicy::with_config(project_root, include, exclude);
     let mut outcome = SyncOutcome::default();
     let mut changed = false;
     let mut seen = HashSet::new();
@@ -906,6 +940,90 @@ pub(crate) mod tests {
             store.unresolved_refs_count().unwrap(),
             before.1,
             "unresolvable retry rows must survive a healthy sync"
+        );
+    }
+
+    #[test]
+    fn sync_project_once_indexes_gitignored_dir_named_in_include() {
+        // #1063: a gitignored first-party dir named in `[indexing] include` is
+        // indexed on a full `codegraph sync` (sync_project_once reads the config
+        // and threads include into both the scan and the WatchPolicy gate).
+        let dir = TestDir::new("watch-once-include");
+        fs::create_dir_all(dir.path().join(".codegraph")).unwrap();
+        fs::write(dir.path().join(".gitignore"), "Tools/\n").unwrap();
+        fs::write(
+            dir.path().join(".codegraph/config.toml"),
+            "[app]\nname = \"p\"\n\n[indexing]\ninclude = [\"Tools/\"]\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::create_dir_all(dir.path().join("Tools")).unwrap();
+        fs::write(
+            dir.path().join("src/app.ts"),
+            "export function a() { return 1; }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("Tools/helper.ts"),
+            "export function help() { return 2; }\n",
+        )
+        .unwrap();
+        // The config OnceLock is process-global; point it at THIS project (a
+        // repeat set is an ignorable error, but then it may hold another test's
+        // path). Guard: only assert when our config actually took effect.
+        let cfg = codegraph_core::config::init_config(None, dir.path());
+        if cfg
+            .map(|c| c.indexing.include.iter().any(|p| p == "Tools/"))
+            .unwrap_or(false)
+        {
+            let outcome = sync_project_once(dir.path()).unwrap();
+            assert!(
+                outcome
+                    .changed_paths
+                    .contains(&"Tools/helper.ts".to_string())
+            );
+            let store = Store::open(&default_db_path(dir.path())).unwrap();
+            assert!(
+                store.file_by_path("Tools/helper.ts").unwrap().is_some(),
+                "gitignored Tools/ named in include must be indexed on sync"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_changed_paths_with_patterns_handles_included_gitignored_file() {
+        // #1063: the watcher's incremental path uses
+        // sync_changed_paths_with_patterns; a gitignored file named in include is
+        // reindexed rather than ignored by the WatchPolicy gate.
+        let dir = TestDir::new("watch-incr-include");
+        fs::write(dir.path().join(".gitignore"), "Tools/\n").unwrap();
+        fs::create_dir_all(dir.path().join("Tools")).unwrap();
+        fs::write(
+            dir.path().join("Tools/helper.ts"),
+            "export function help() { return 1; }\n",
+        )
+        .unwrap();
+        let db = default_db_path(dir.path());
+
+        // Without include: the gitignored file is ignored by the policy gate.
+        let plain = sync_changed_paths(dir.path(), &db, ["Tools/helper.ts"]).unwrap();
+        assert_eq!(plain.files_reindexed, 0);
+        assert!(plain.files_ignored >= 1);
+
+        // With include: the same file is now handled and reindexed.
+        let included = sync_changed_paths_with_patterns(
+            dir.path(),
+            &db,
+            ["Tools/helper.ts"],
+            &["Tools/".to_string()],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(included.files_reindexed, 1);
+        assert!(
+            included
+                .changed_paths
+                .contains(&"Tools/helper.ts".to_string())
         );
     }
 

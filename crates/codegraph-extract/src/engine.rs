@@ -24,6 +24,7 @@ pub struct ExtractOptions {
     pub ignore_dirs: Vec<String>,
     pub ignore_paths: Vec<String>,
     pub exclude: Vec<String>,
+    pub include: Vec<String>,
     pub parallel: bool,
 }
 
@@ -35,6 +36,7 @@ impl Default for ExtractOptions {
             ignore_dirs: indexing.ignore_dirs,
             ignore_paths: indexing.ignore_paths,
             exclude: indexing.exclude,
+            include: indexing.include,
             parallel: true,
         }
     }
@@ -233,7 +235,15 @@ pub fn scan_project(root: &Path, options: &ExtractOptions) -> Result<Vec<String>
     // Evaluated in order (default paths → config exclude → .gitignore), so a
     // later `!pattern` negation re-includes a path an earlier set excluded.
     let pattern_sets: Vec<&[String]> = vec![&options.ignore_paths, &options.exclude, &gitignore];
-    scan_dir(root, root, &ignored_dirs, &pattern_sets, &mut files)?;
+    let include = IncludeSet::new(&options.include, &options.exclude);
+    scan_dir(
+        root,
+        root,
+        &ignored_dirs,
+        &pattern_sets,
+        &include,
+        &mut files,
+    )?;
     files.sort();
     Ok(files)
 }
@@ -243,6 +253,7 @@ fn scan_dir(
     dir: &Path,
     ignored_dirs: &HashSet<&str>,
     pattern_sets: &[&[String]],
+    include: &IncludeSet,
     files: &mut Vec<String>,
 ) -> Result<()> {
     let entries = fs::read_dir(dir).with_context(|| format!("read dir {}", dir.display()))?;
@@ -255,14 +266,26 @@ fn scan_dir(
             continue;
         }
         let relative = normalize_path(path.strip_prefix(root).unwrap_or(&path));
-        if is_path_ignored(&relative, pattern_sets) {
-            continue;
-        }
+        let ignored = is_path_ignored(&relative, pattern_sets);
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            scan_dir(root, &path, ignored_dirs, pattern_sets, files)?;
+            // A model-ignored dir is normally pruned before descent, so a FILE
+            // include under a gitignored ancestor would never be reached.
+            // Descend anyway when this dir is an ancestor of (or matches) an
+            // include pattern; files inside are still pruned unless force-included.
+            if ignored && !include.wants_descend(&relative) {
+                continue;
+            }
+            scan_dir(root, &path, ignored_dirs, pattern_sets, include, files)?;
         } else if file_type.is_file() && is_extractable_source_path(&relative) {
-            files.push(relative);
+            // Post-model include decision: a model-ignored file is force-included
+            // iff it matches `include` and is NOT overridden by an explicit
+            // `exclude` (checked inside `IncludeSet::forces`). Built-in dir skips
+            // are already handled structurally above, so include can never
+            // resurface node_modules/dist/.git/etc.
+            if !ignored || include.forces(&relative) {
+                files.push(relative);
+            }
         }
     }
     Ok(())
@@ -339,6 +362,117 @@ fn pattern_matches(relative: &str, pattern: &str) -> bool {
     } else {
         relative == pattern || relative.ends_with(&format!("/{pattern}"))
     }
+}
+
+/// Single source of truth for the `include`/`exclude` PATH-MATCH decision,
+/// shared with `codegraph-watch` so the live watcher's scope is byte-identical
+/// to the scan's (AGENTS.md "sync == index --force"). This is the WHOLE-relative
+/// path `.gitignore`-style semantics of [`pattern_matches`] — NOT the watcher's
+/// basename-glob `rule_matches`, which the two crates previously diverged on
+/// (`gen*` matched `gen/helper.ts` in the scan but not the watcher). Argument
+/// order is `(pattern, relative)` to read like "does this pattern match?".
+pub fn include_exclude_pattern_matches(pattern: &str, relative: &str) -> bool {
+    pattern_matches(relative, pattern)
+}
+
+/// The `include` force-inclusion decision (#1063), kept separate from the
+/// ordered `.gitignore`-style model so it can flip a model-ignored path back in
+/// AFTER that model returns its verdict. An explicit config `exclude` is checked
+/// here so `exclude` always wins over `include`. A built-in `ignore_dirs` skip is
+/// NOT re-checked — those are pruned structurally in `scan_dir` and can never
+/// reach an include decision. Empty `include` makes every method a cheap `false`,
+/// so the scan stays byte-identical to today.
+struct IncludeSet<'a> {
+    include: &'a [String],
+    exclude: &'a [String],
+}
+
+impl<'a> IncludeSet<'a> {
+    fn new(include: &'a [String], exclude: &'a [String]) -> Self {
+        Self { include, exclude }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.include.is_empty()
+    }
+
+    /// A model-ignored FILE is force-included iff it matches an `include`
+    /// pattern and is not knocked out by an explicit `exclude` (exclude wins).
+    fn forces(&self, relative: &str) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        self.include
+            .iter()
+            .any(|p| include_file_matches(relative, p))
+            && !self.exclude.iter().any(|p| pattern_matches(relative, p))
+    }
+
+    /// Whether a model-ignored DIRECTORY must still be descended: it either
+    /// matches an include pattern itself, or is an ANCESTOR of one (a nested
+    /// `Tools/gen/x.ts` include needs `Tools/` and `Tools/gen/` walked). An
+    /// explicit `exclude` on the directory prunes the whole subtree (exclude
+    /// wins), mirroring `forces`.
+    fn wants_descend(&self, relative: &str) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        if self.exclude.iter().any(|p| pattern_matches(relative, p)) {
+            return false;
+        }
+        self.include
+            .iter()
+            .any(|p| include_touches_dir(relative, p))
+    }
+}
+
+/// True when include `pattern` matches, or could match, something at or below
+/// the directory `dir` (root-relative, no trailing slash) — i.e. whether the
+/// ancestor dir of an included path must be descended. A bare name with no `/`
+/// (e.g. `local`) names a file that `pattern_matches` accepts at ANY depth, so
+/// like upstream's whole-tree walk it touches every dir. Otherwise the pattern
+/// has a static path stem (dropping a trailing `/` or `*`): the dir is touched
+/// when it is at/under the stem (`Tools` under `Tools/**`) or the stem is
+/// at/under the dir (`Tools/gen` under the ancestor `Tools`).
+fn include_touches_dir(dir: &str, pattern: &str) -> bool {
+    if !pattern.contains('/') && !pattern.ends_with('*') {
+        return true;
+    }
+    let stem = include_static_stem(pattern);
+    if stem.is_empty() {
+        return true;
+    }
+    dir == stem || dir.starts_with(&format!("{stem}/")) || stem.starts_with(&format!("{dir}/"))
+}
+
+/// The literal leading directory of an include `pattern`, trailing slash / `*` /
+/// `**` dropped: `Tools/` → `Tools`, `Tools/**` → `Tools`, `Local/ts/x.ts` →
+/// `Local/ts/x.ts` (no glob, so the whole thing is literal). Used only for the
+/// directory-descent ancestor test.
+fn include_static_stem(pattern: &str) -> &str {
+    let p = pattern.trim_end_matches('/');
+    match p.split_once('*') {
+        Some((prefix, _)) => prefix.trim_end_matches('/'),
+        None => p,
+    }
+}
+
+/// Whether an include `pattern` force-includes the FILE at root-relative
+/// `relative`. Extends `pattern_matches` with `**` support (`Tools/**` matches
+/// every file under `Tools/`), which the ordered-model matcher deliberately does
+/// not handle. A `dir/`-suffixed pattern matches any file under that dir; a
+/// trailing `/**` (or bare `**`) matches everything under its prefix; the
+/// remaining forms defer to `pattern_matches`.
+fn include_file_matches(relative: &str, pattern: &str) -> bool {
+    if let Some(prefix) = pattern
+        .strip_suffix("/**")
+        .or_else(|| if pattern == "**" { Some("") } else { None })
+    {
+        return prefix.is_empty()
+            || relative == prefix
+            || relative.starts_with(&format!("{prefix}/"));
+    }
+    pattern_matches(relative, pattern)
 }
 
 fn is_extractable_source_path(relative: &str) -> bool {
@@ -480,6 +614,137 @@ mod tests {
             "excluded gen must be skipped: {files:?}"
         );
 
+        fs::remove_dir_all(&project).ok();
+    }
+
+    /// #1063 (a): a `.gitignore`d dir named in `include` is force-indexed.
+    #[test]
+    fn scan_include_forces_gitignored_dir_into_index() {
+        let project = unique_project("include_dir");
+        touch(&project, ".gitignore", "Tools/\n");
+        touch(&project, "src/app.ts", "export const a = 1;");
+        touch(&project, "Tools/helper.ts", "export const b = 2;");
+
+        let options = ExtractOptions {
+            include: vec!["Tools/".to_string()],
+            ..ExtractOptions::default()
+        };
+        let files = scan_project(&project, &options).expect("scan project");
+        assert!(
+            files.contains(&"Tools/helper.ts".to_string()),
+            "gitignored Tools/ in include must be indexed: {files:?}"
+        );
+        assert!(files.contains(&"src/app.ts".to_string()));
+        fs::remove_dir_all(&project).ok();
+    }
+
+    /// #1063 (b): a built-in skip (`node_modules`) named in `include` stays
+    /// skipped — include can never resurface a built-in ignored dir.
+    #[test]
+    fn scan_include_never_reincludes_builtin_skip() {
+        let project = unique_project("include_builtin");
+        touch(&project, "src/app.ts", "export const a = 1;");
+        touch(&project, "node_modules/pkg/index.ts", "export const x = 1;");
+
+        let options = ExtractOptions {
+            include: vec!["node_modules/".to_string()],
+            ..ExtractOptions::default()
+        };
+        let files = scan_project(&project, &options).expect("scan project");
+        assert!(
+            !files.iter().any(|f| f.starts_with("node_modules/")),
+            "include must not resurface a built-in skip: {files:?}"
+        );
+        assert!(files.contains(&"src/app.ts".to_string()));
+        fs::remove_dir_all(&project).ok();
+    }
+
+    /// #1063 (c): a path in BOTH `include` and `exclude` is skipped — an
+    /// explicit `exclude` always wins over `include`.
+    #[test]
+    fn scan_exclude_wins_over_include() {
+        let project = unique_project("include_exclude");
+        touch(&project, ".gitignore", "Tools/\n");
+        touch(&project, "Tools/helper.ts", "export const b = 2;");
+
+        let options = ExtractOptions {
+            include: vec!["Tools/".to_string()],
+            exclude: vec!["Tools/".to_string()],
+            ..ExtractOptions::default()
+        };
+        let files = scan_project(&project, &options).expect("scan project");
+        assert!(
+            !files.iter().any(|f| f.starts_with("Tools/")),
+            "exclude must win over include: {files:?}"
+        );
+        fs::remove_dir_all(&project).ok();
+    }
+
+    /// #1063 (d): an `include` naming a SINGLE FILE (or nested `**` glob) under a
+    /// gitignored ANCESTOR is indexed — the ancestor dir is descended even though
+    /// the ordered model would prune it, while non-included siblings stay pruned.
+    #[test]
+    fn scan_include_reaches_file_under_gitignored_ancestor() {
+        let project = unique_project("include_ancestor");
+        touch(&project, ".gitignore", "Local/\n");
+        touch(&project, "Local/ts/wanted.ts", "export const w = 1;");
+        touch(&project, "Local/ts/other.ts", "export const o = 2;");
+        touch(&project, "Local/skip.ts", "export const s = 3;");
+
+        let options = ExtractOptions {
+            include: vec!["Local/ts/wanted.ts".to_string()],
+            ..ExtractOptions::default()
+        };
+        let files = scan_project(&project, &options).expect("scan project");
+        assert!(
+            files.contains(&"Local/ts/wanted.ts".to_string()),
+            "a file include under a gitignored ancestor must be indexed: {files:?}"
+        );
+        assert!(
+            !files.contains(&"Local/ts/other.ts".to_string())
+                && !files.contains(&"Local/skip.ts".to_string()),
+            "non-included siblings under the ancestor stay pruned: {files:?}"
+        );
+
+        let glob = ExtractOptions {
+            include: vec!["Local/ts/**".to_string()],
+            ..ExtractOptions::default()
+        };
+        let files = scan_project(&project, &glob).expect("scan project");
+        assert!(
+            files.contains(&"Local/ts/wanted.ts".to_string())
+                && files.contains(&"Local/ts/other.ts".to_string()),
+            "a nested ** include pulls in the whole subdir: {files:?}"
+        );
+        assert!(
+            !files.contains(&"Local/skip.ts".to_string()),
+            "the ** glob does not reach a sibling outside its dir: {files:?}"
+        );
+        fs::remove_dir_all(&project).ok();
+    }
+
+    /// #1063 (e): empty `include` leaves the scanned file set byte-identical.
+    #[test]
+    fn scan_empty_include_is_byte_identical() {
+        let project = unique_project("include_empty");
+        touch(&project, ".gitignore", "vendor/\n");
+        touch(&project, "src/app.ts", "export const a = 1;");
+        touch(&project, "vendor/dep.ts", "export const d = 2;");
+
+        let base = scan_project(&project, &ExtractOptions::default()).expect("scan");
+        let with_empty = scan_project(
+            &project,
+            &ExtractOptions {
+                include: Vec::new(),
+                ..ExtractOptions::default()
+            },
+        )
+        .expect("scan");
+        assert_eq!(
+            base, with_empty,
+            "empty include must not change the file set"
+        );
+        assert!(!base.iter().any(|f| f.starts_with("vendor/")));
         fs::remove_dir_all(&project).ok();
     }
 

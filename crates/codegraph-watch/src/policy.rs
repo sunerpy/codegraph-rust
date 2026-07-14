@@ -80,10 +80,25 @@ struct IgnoreRule {
 pub struct WatchPolicy {
     root: PathBuf,
     rules: Vec<IgnoreRule>,
+    /// Number of leading `rules` that are the built-in skip set (never
+    /// re-includable by `include`); the rest are `.gitignore`-derived.
+    builtin_rule_count: usize,
+    include: Vec<String>,
+    exclude: Vec<String>,
 }
 
 impl WatchPolicy {
     pub fn new(root: impl AsRef<Path>) -> Self {
+        Self::with_config(root, &[], &[])
+    }
+
+    /// Like [`new`](Self::new) but threads the `codegraph.json`/`config.toml`
+    /// `include` and `exclude` path patterns (#1063) so the watcher's scope
+    /// matches the scan's: an included gitignored dir is WATCHED and its file
+    /// events HANDLED, while a built-in skip is never re-watched and an explicit
+    /// `exclude` always wins. Empty `include`+`exclude` is byte-identical to the
+    /// pre-#1063 policy.
+    pub fn with_config(root: impl AsRef<Path>, include: &[String], exclude: &[String]) -> Self {
         // Mirrors the upstream built-in ignore seed and root .gitignore merge from
         // `upstream extraction/index.ts:117-161,242-246` so
         // `.gitignore` negations can opt default-excluded dirs back in.
@@ -109,8 +124,19 @@ impl WatchPolicy {
                 negated: false,
             },
         ]);
+        // The built-in DEFAULT_IGNORE_DIRS + egg/cmake/bazel rules are the
+        // "built-in skip" set that `include` must NEVER re-watch; count them so
+        // the include override below can tell a built-in skip from a `.gitignore`
+        // rule. Only `.gitignore` (and default-path) exclusions are overridable.
+        let builtin_rule_count = rules.len();
         rules.extend(read_gitignore_rules(&root));
-        Self { root, rules }
+        Self {
+            root,
+            rules,
+            builtin_rule_count,
+            include: include.to_vec(),
+            exclude: exclude.to_vec(),
+        }
     }
 
     pub fn normalize_relative(&self, path: impl AsRef<Path>) -> Option<String> {
@@ -149,14 +175,88 @@ impl WatchPolicy {
     }
 
     fn is_ignored(&self, relative: &str, is_dir: bool) -> bool {
+        let base = self.matches_rules(&self.rules, relative, is_dir);
+        // Empty include short-circuits the #1063 override → pre-#1063 behavior
+        // byte-identical (the override only ever flips an ignored path back in).
+        if self.include.is_empty() || !base {
+            return base;
+        }
+        // base == ignored: consider the include force-inclusion override.
+        // Precedence: a built-in skip is NEVER re-watched; an explicit `exclude`
+        // wins over `include`; otherwise an included dir (or an ancestor of an
+        // included path) is watched and an included file is handled.
+        if self.matches_rules(&self.rules[..self.builtin_rule_count], relative, is_dir) {
+            return true;
+        }
+        if self
+            .exclude
+            .iter()
+            .any(|pattern| codegraph_extract::include_exclude_pattern_matches(pattern, relative))
+        {
+            return true;
+        }
+        let force = if is_dir {
+            self.include
+                .iter()
+                .any(|pattern| include_touches_dir(relative, pattern))
+        } else {
+            self.include
+                .iter()
+                .any(|pattern| include_file_matches(relative, pattern))
+        };
+        !force
+    }
+
+    fn matches_rules(&self, rules: &[IgnoreRule], relative: &str, is_dir: bool) -> bool {
         let mut ignored = false;
-        for rule in &self.rules {
+        for rule in rules {
             if rule_matches(&rule.pattern, relative, is_dir) {
                 ignored = !rule.negated;
             }
         }
         ignored
     }
+}
+
+/// Whether an include `pattern` matches the FILE at root-relative `relative`
+/// (watcher side, byte-identical to the engine's `include_file_matches`): a
+/// `dir/**` (or bare `**`) matches every file under its prefix, and every other
+/// form defers to the SHARED whole-path matcher `include_exclude_pattern_matches`
+/// — NOT the watcher's basename-glob `rule_matches` — so `gen*` matches
+/// `gen/helper.ts` here exactly as it does in the scan.
+fn include_file_matches(relative: &str, pattern: &str) -> bool {
+    if let Some(prefix) = pattern
+        .strip_suffix("/**")
+        .or_else(|| (pattern == "**").then_some(""))
+    {
+        return prefix.is_empty()
+            || relative == prefix
+            || relative.starts_with(&format!("{prefix}/"));
+    }
+    codegraph_extract::include_exclude_pattern_matches(pattern, relative)
+}
+
+/// Whether an include `pattern` matches, or is an ancestor of, the DIRECTORY
+/// `relative` — so a gitignored ancestor of an included path is still watched
+/// (watcher side, mirroring the engine's `include_touches_dir`). A bare-name
+/// pattern matches at any depth, so it touches every dir.
+fn include_touches_dir(relative: &str, pattern: &str) -> bool {
+    if !pattern.contains('/') && !pattern.ends_with('*') {
+        return true;
+    }
+    let stem = {
+        let trimmed = pattern.trim_end_matches('/');
+        match trimmed.split_once('*') {
+            Some((prefix, _)) => prefix.trim_end_matches('/'),
+            None => trimmed,
+        }
+    };
+    if stem.is_empty() {
+        return true;
+    }
+    relative == stem
+        || relative.starts_with(&format!("{stem}/"))
+        || stem.starts_with(&format!("{relative}/"))
 }
 
 pub fn watch_disabled_reason(project_root: impl AsRef<Path>, no_watch: bool) -> Option<String> {
@@ -664,6 +764,53 @@ mod tests {
     fn normalize_path_converts_separators_and_collapses_dots() {
         assert_eq!(normalize_path("a/./b"), "a/b");
         assert_eq!(normalize_path("a/b/c"), "a/b/c");
+    }
+
+    #[test]
+    fn with_config_include_watches_gitignored_path_but_not_builtin_skip() {
+        // #1063: an included gitignored dir is watched and its files handled,
+        // while a built-in skip named in include stays pruned and an explicit
+        // exclude still wins.
+        let dir = crate::sync::tests::TestDir::new("watch-policy-include");
+        fs::write(dir.path().join(".gitignore"), "Tools/\nLocal/\n").unwrap();
+        let policy = WatchPolicy::with_config(
+            dir.path(),
+            &["Tools/".to_string(), "Local/ts/app.ts".to_string()],
+            &[],
+        );
+
+        // An included gitignored dir (and a file under it) is now watched/handled.
+        assert!(policy.should_watch_dir("Tools"));
+        assert!(policy.should_handle_file("Tools/helper.ts"));
+        // A file include under a gitignored ancestor: the ancestor is watched and
+        // the file handled, but a non-included sibling stays ignored.
+        assert!(policy.should_watch_dir("Local"));
+        assert!(policy.should_watch_dir("Local/ts"));
+        assert!(policy.should_handle_file("Local/ts/app.ts"));
+        assert!(!policy.should_handle_file("Local/ts/other.ts"));
+        // A built-in skip is NEVER re-watched, even if named in include.
+        let builtin = WatchPolicy::with_config(dir.path(), &["node_modules/".to_string()], &[]);
+        assert!(!builtin.should_watch_dir("node_modules"));
+        assert!(!builtin.should_handle_file("node_modules/pkg/index.ts"));
+        // An explicit exclude wins over include.
+        let excluded =
+            WatchPolicy::with_config(dir.path(), &["Tools/".to_string()], &["Tools/".to_string()]);
+        assert!(!excluded.should_watch_dir("Tools"));
+        assert!(!excluded.should_handle_file("Tools/helper.ts"));
+    }
+
+    #[test]
+    fn empty_include_leaves_policy_byte_identical() {
+        // #1063: WatchPolicy::new == with_config(root, &[], &[]); an empty include
+        // must not change any watch/handle decision vs the pre-#1063 policy.
+        let dir = crate::sync::tests::TestDir::new("watch-policy-include-empty");
+        fs::write(dir.path().join(".gitignore"), "vendor/\n").unwrap();
+        let policy = WatchPolicy::with_config(dir.path(), &[], &[]);
+        assert!(!policy.should_watch_dir("vendor"));
+        assert!(!policy.should_handle_file("vendor/dep.ts"));
+        assert!(!policy.should_watch_dir("node_modules"));
+        assert!(policy.should_watch_dir("src"));
+        assert!(policy.should_handle_file("src/app.ts"));
     }
 
     #[test]
