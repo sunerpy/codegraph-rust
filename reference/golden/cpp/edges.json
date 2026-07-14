@@ -12,6 +12,18 @@
     "target": "file:base.hpp"
   },
   {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.92,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:namespaced.cpp",
+    "target": "file:base.hpp"
+  },
+  {
     "col": 11,
     "kind": "extends",
     "line": 18,
@@ -22,6 +34,18 @@
     "provenance": null,
     "source": "struct:418731e230da99cc3237d0e7e35385f1",
     "target": "class:e436be77a00102552decf9de5d7cc052"
+  },
+  {
+    "col": 17,
+    "kind": "extends",
+    "line": 22,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "class:b28eae813de1699c6b7d7727db856721",
+    "target": "class:11306345dc1e400be056c1416040177a"
   },
   {
     "col": 17,
@@ -58,6 +82,30 @@
     "provenance": null,
     "source": "class:1f9695d61900e851f6609231a60ccd9a",
     "target": "class:e436be77a00102552decf9de5d7cc052"
+  },
+  {
+    "col": 4,
+    "kind": "calls",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:906472bb253d72948b69406881d785bf",
+    "target": "function:61cb788885161f5fe3ff59a749c7fd19"
+  },
+  {
+    "col": 4,
+    "kind": "calls",
+    "line": 8,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:8118a321a3f16f7898de2768139b459d",
+    "target": "function:a83447ac43eae44cd787ebbed1f221b2"
   },
   {
     "col": 44,
@@ -232,6 +280,60 @@
     "provenance": null,
     "source": "file:derived.cpp",
     "target": "struct:418731e230da99cc3237d0e7e35385f1"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:namespaced.cpp",
+    "target": "function:8118a321a3f16f7898de2768139b459d"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:namespaced.cpp",
+    "target": "function:a83447ac43eae44cd787ebbed1f221b2"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:namespaced.cpp",
+    "target": "import:d427e262bde770416cf520f12c124a85"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:templated_call.cpp",
+    "target": "function:61cb788885161f5fe3ff59a749c7fd19"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:templated_call.cpp",
+    "target": "function:906472bb253d72948b69406881d785bf"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:ue_actor.h",
+    "target": "class:ade92bd69bacb920c05c0d123d2a5130"
   },
   {
     "col": null,

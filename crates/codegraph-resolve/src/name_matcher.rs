@@ -769,7 +769,18 @@ fn normalize_inferred_type_name(raw: &str) -> Option<String> {
 /// baked into the second pattern per language. Languages without a pattern set
 /// (the C++ path uses its own dedicated inferrer) return an empty vector.
 fn local_receiver_type_patterns(language: Language, r: &str) -> Vec<Regex> {
-    let build = |src: String| Regex::new(&src).ok();
+    local_receiver_type_patterns_tagged(language, r)
+        .into_iter()
+        .map(|(re, _)| re)
+        .collect()
+}
+
+/// The bool tags the Lua/Luau `receiver: Type` ANNOTATION pattern, which needs a
+/// code-side self-match gate (#1124): `lg:Log()` is byte-identical to the Luau
+/// annotation `lg: Logger`, and the `regex` crate has no look-ahead to reject the
+/// call form, so `infer_local_receiver_type` post-checks the tagged capture.
+fn local_receiver_type_patterns_tagged(language: Language, r: &str) -> Vec<(Regex, bool)> {
+    let build = |src: String| Regex::new(&src).ok().map(|re| (re, false));
     let pats: Vec<String> = match language {
         Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx => vec![
             format!(r"\b{r}\b\s*=\s*new\s+([A-Za-z_$][\w.$]*)"),
@@ -817,11 +828,21 @@ fn local_receiver_type_patterns(language: Language, r: &str) -> Vec<Regex> {
             format!(r"\$?{r}\b\s*=\s*new\s+([A-Za-z_\\][\w\\]*)"),
             format!(r"\b([A-Za-z_\\][\w\\]*)\s+&?\${r}\b"),
         ],
-        Language::Lua | Language::Luau => vec![
-            format!(r"\b{r}\b\s*=\s*([A-Z]\w*)\.new\b"),
-            format!(r"\b{r}\b\s*=\s*([A-Z]\w*)\s*\("),
-            format!(r#"\b{r}\b\s*:\s*([A-Z][\w.]*)(?:[\w.]|\s*[({{"'\[])?"#),
-        ],
+        Language::Lua | Language::Luau => {
+            let mut out: Vec<(Regex, bool)> = Vec::new();
+            for src in [
+                format!(r"\b{r}\b\s*=\s*([A-Z]\w*)\.new\b"),
+                format!(r"\b{r}\b\s*=\s*([A-Z]\w*)\s*\("),
+            ] {
+                if let Some((re, _)) = build(src) {
+                    out.push((re, false));
+                }
+            }
+            if let Ok(re) = Regex::new(&format!(r"\b{r}\b\s*:\s*([A-Z][\w.]*)")) {
+                out.push((re, true));
+            }
+            return out;
+        }
         Language::R => vec![format!(r"\b{r}\b\s*(?:<-|<<-|=)\s*([A-Z][\w.]*)\$new\b")],
         Language::Pascal => vec![
             format!(r"\b{r}\b\s*:\s*([A-Z]\w*)"),
@@ -867,7 +888,7 @@ fn infer_local_receiver_type(
     context: &dyn ResolutionContext,
 ) -> Option<String> {
     let escaped = regex_escape(receiver_name);
-    let patterns = local_receiver_type_patterns(reference.language, &escaped);
+    let patterns = local_receiver_type_patterns_tagged(reference.language, &escaped);
     if patterns.is_empty() {
         return None;
     }
@@ -889,9 +910,12 @@ fn infer_local_receiver_type(
         if line.len() > 10_000 {
             continue;
         }
-        for re in &patterns {
+        for (re, is_lua_annotation) in &patterns {
             if let Some(caps) = re.captures(line) {
                 if let Some(m) = caps.get(1) {
+                    if *is_lua_annotation && lua_annotation_is_method_call(line, m.end()) {
+                        continue;
+                    }
                     if let Some(ty) = normalize_inferred_type_name(m.as_str()) {
                         return Some(ty);
                     }
@@ -900,6 +924,26 @@ fn infer_local_receiver_type(
         }
     }
     None
+}
+
+/// True when a Lua/Luau `receiver:Capitalized` annotation match is really a
+/// method call (`lg:Log()`, `lg:Log"s"`, `lg:Log{t}`, or a longer `lg:Log.More`
+/// token the annotation regex stopped short of), which must NOT be read as a type
+/// annotation (#1124). Reproduces upstream's `(?![\w.]|\s*[({"'\[])` look-ahead in
+/// code, since the `regex` crate has no look-ahead. `capture_end` is the byte
+/// offset just past the captured type on `line`.
+fn lua_annotation_is_method_call(line: &str, capture_end: usize) -> bool {
+    let rest = &line[capture_end..];
+    if let Some(next) = rest.chars().next() {
+        if next.is_alphanumeric() || next == '_' || next == '.' {
+            return true;
+        }
+    }
+    let trimmed = rest.trim_start();
+    trimmed
+        .chars()
+        .next()
+        .is_some_and(|c| matches!(c, '(' | '"' | '\'' | '[' | '{'))
 }
 
 /// The PHP `$this->prop->method()` receiver shape — encoded by the extractor as
@@ -5505,6 +5549,75 @@ mod tests {
         let r = refv("lg:log", EdgeKind::Calls, "a.lua", Language::Lua, 3);
         let res = match_method_call(&r, &ctx).expect("lua colon separator");
         assert_eq!(res.target_node_id, "method:log");
+    }
+
+    #[test]
+    fn lua_capitalized_method_call_not_self_matched() {
+        // #1124: `lg:Log()` is byte-identical to a Luau annotation `lg: Log`; the
+        // call line must NOT self-match `type=Log`. The scan continues to the real
+        // `local lg = Logger.new()` declaration and resolves to Logger::Log.
+        let m = mk(
+            "method:Log",
+            NodeKind::Method,
+            "Log",
+            "Logger::Log",
+            "a.lua",
+            Language::Lua,
+        );
+        let ctx = ctx_with_scope(
+            "a.lua",
+            "function run()\n  local lg = Logger.new()\n  lg:Log()\nend\n",
+            Language::Lua,
+            m,
+            "Log",
+        );
+        let r = refv("lg:Log", EdgeKind::Calls, "a.lua", Language::Lua, 3);
+        let res = match_method_call(&r, &ctx).expect("lua PascalCase call resolves");
+        assert_eq!(res.target_node_id, "method:Log");
+    }
+
+    #[test]
+    fn lua_annotation_still_resolves() {
+        let m = mk(
+            "method:Log",
+            NodeKind::Method,
+            "Log",
+            "Logger::Log",
+            "a.luau",
+            Language::Luau,
+        );
+        let ctx = ctx_with_scope(
+            "a.luau",
+            "function run()\n  local lg: Logger\n  lg:Log()\nend\n",
+            Language::Luau,
+            m,
+            "Log",
+        );
+        let r = refv("lg:Log", EdgeKind::Calls, "a.luau", Language::Luau, 3);
+        let res = match_method_call(&r, &ctx).expect("lua annotation resolves");
+        assert_eq!(res.target_node_id, "method:Log");
+    }
+
+    #[test]
+    fn luau_typed_param_annotation_preserved() {
+        let m = mk(
+            "method:Log",
+            NodeKind::Method,
+            "Log",
+            "Logger::Log",
+            "a.luau",
+            Language::Luau,
+        );
+        let ctx = ctx_with_scope(
+            "a.luau",
+            "function f(lg: Logger)\n  lg:Log()\nend\n",
+            Language::Luau,
+            m,
+            "Log",
+        );
+        let r = refv("lg:Log", EdgeKind::Calls, "a.luau", Language::Luau, 2);
+        let res = match_method_call(&r, &ctx).expect("luau typed param resolves");
+        assert_eq!(res.target_node_id, "method:Log");
     }
 
     #[test]

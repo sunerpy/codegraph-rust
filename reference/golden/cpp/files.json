@@ -14,5 +14,29 @@
     "node_count": 12,
     "path": "derived.cpp",
     "size": 363
+  },
+  {
+    "content_hash": "bfd6da256b748444e2bfdff365e7d56daa640afa638e50b294db94cca1f2a7f8",
+    "errors": null,
+    "language": "cpp",
+    "node_count": 4,
+    "path": "namespaced.cpp",
+    "size": 102
+  },
+  {
+    "content_hash": "e72bc5982add705d170ebd03d4a3db5286237e5b8ab662fc9ed35cd51da438c9",
+    "errors": null,
+    "language": "cpp",
+    "node_count": 3,
+    "path": "templated_call.cpp",
+    "size": 94
+  },
+  {
+    "content_hash": "5afecb82e36830d924845a28b9069f2fb7cc3d9b15d74f6bf6623fd737b3d265",
+    "errors": null,
+    "language": "c",
+    "node_count": 2,
+    "path": "ue_actor.h",
+    "size": 191
   }
 ]

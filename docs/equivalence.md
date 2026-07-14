@@ -252,12 +252,32 @@ general C++ inheritance shapes plus templated-base stripping:
 - **struct base** — `struct S : Container<double>` resolving to `Container`
   (struct inheritance goes through the same path as class inheritance).
 - **`::`-qualified templated base** — `class Q : public ns::Tpl<int>` recording
-  an `Extends` ref to `ns::Tpl` (qualified head kept, template args stripped);
-  captured as an unresolved ref in `refs.json`.
+  an `Extends` ref to `ns::Tpl` (qualified head kept, template args stripped).
+  Since the C++ namespace-prefix work (Release D) stores `Tpl`'s qualified name as
+  `ns::Tpl`, this ref now RESOLVES to a real `Extends` edge (`Q` → `ns::Tpl`) in
+  `edges.json` instead of remaining an unresolved ref.
+
+Three further files exercise the Release D C++ extraction gains:
+
+- **namespace prefix + `ns::fn()` resolution** — `namespaced.cpp` defines
+  `namespace ns { void compute() {} }` (qualified name `ns::compute`) and calls
+  `ns::compute()` from `run_namespaced`; the call resolves to a `Calls` edge via
+  the existing qualified-name matcher (no resolver change).
+- **template-argument call stripping** — `templated_call.cpp` defines
+  `template <typename T> void process(T)` and calls `process<int>(0)`; the
+  `<int>` template args are stripped at extraction so the call links to `process`.
+- **Unreal-Engine reflection-macro recovery + `.h` C++ detection** — `ue_actor.h`
+  is a lean UE header whose only C++ signal is `class ENGINE_API UFoo : public
+UObject` plus line-leading `GENERATED_BODY()`/`UPROPERTY(...)`/`UFUNCTION()`,
+  a member-level `ENGINE_API`, and no explicit `public:`. Content sniffing
+  reclassifies the `.h` to C++, and the offset-preserving pre-parse blanking
+  recovers the `UFoo` class + its `Extends UObject` clause (both dropped before).
 
 The minimal source corpus lives at `crates/codegraph-bench/fixtures/cpp/`
-(`base.hpp`, `derived.cpp`). The base classes live in a `.hpp` file (not `.h`,
-which maps to `Language::C` where `class` is not valid syntax).
+(`base.hpp`, `derived.cpp`, `namespaced.cpp`, `templated_call.cpp`,
+`ue_actor.h`). The inheritance base classes live in a `.hpp` file (not `.h`,
+which maps to `Language::C` by extension); `ue_actor.h` deliberately uses `.h` to
+guard the content-based C++ reclassification.
 
 Regenerate the committed database + canonical JSON reproducibly from the corpus:
 
