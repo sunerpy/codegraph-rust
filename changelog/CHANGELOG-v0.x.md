@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.33.0](https://github.com/sunerpy/codegraph-rust/compare/v0.32.0...v0.33.0) (2026-07-14)
+
+
+### Features
+
+* **extraction:** index Metal (.metal) and CUDA (.cu/.cuh) via the C++ grammar ([#147](https://github.com/sunerpy/codegraph-rust/issues/147)) ([dfd2b90](https://github.com/sunerpy/codegraph-rust/commit/dfd2b909f45284e7eec55db12887fb3000eda81e))
+
 ## [0.32.0](https://github.com/sunerpy/codegraph-rust/compare/v0.31.1...v0.32.0) (2026-07-14)
 
 
