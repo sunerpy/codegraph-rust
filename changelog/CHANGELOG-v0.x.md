@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.36.0](https://github.com/sunerpy/codegraph-rust/compare/v0.35.0...v0.36.0) (2026-07-14)
+
+
+### Features
+
+* **extraction:** index Nix (.nix) at the extraction tier ([#153](https://github.com/sunerpy/codegraph-rust/issues/153)) ([3e03e6a](https://github.com/sunerpy/codegraph-rust/commit/3e03e6a5cafff637f3ab7490d7c9fa56845b61b1))
+
 ## [0.35.0](https://github.com/sunerpy/codegraph-rust/compare/v0.34.0...v0.35.0) (2026-07-14)
 
 
