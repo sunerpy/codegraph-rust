@@ -1,13 +1,17 @@
 //! End-to-end tests for the hidden `codegraph prompt-hook` subcommand.
 //!
-//! `prompt-hook` emits `codegraph_explore`-equivalent DETERMINISTIC retrieval
-//! output (the SAME text the MCP explore tool produces — NO LLM/AI) to stdout
-//! for a given query, resolving the nearest `.codegraph/` (monorepo-aware).
+//! `prompt-hook` is a confidence-tiered gate (upstream #1126 multilingual gate
+//! + #1136 graph-derived MEDIUM tier, telemetry EXCLUDED):
+//! - HIGH — a structural keyword (any of ~29 covered languages) OR a code token
+//!   verified in the index → full `codegraph_explore` injection.
+//! - MEDIUM — prose words match indexed symbol-name segments → a short
+//!   symbol-pointer hint (never runs explore).
+//! - silent — nothing verified → zero-cost no-op.
+//!
 //! Mirrors the spawn-the-real-binary pattern of `sync_incremental.rs` /
 //! `installer.rs` via `CARGO_BIN_EXE_codegraph`.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -21,6 +25,10 @@ fn workspace_root() -> PathBuf {
 
 fn mini_fixture() -> PathBuf {
     workspace_root().join("crates/codegraph-bench/fixtures/mini")
+}
+
+fn medium_fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/prompt_hook_medium")
 }
 
 fn copy_tree(src: &Path, dst: &Path) {
@@ -78,8 +86,9 @@ fn cli(args: &[&str]) -> (String, String, bool) {
     )
 }
 
-/// Run `prompt-hook` feeding the query over stdin (no positional/flag arg).
+/// Run `prompt-hook` feeding text over stdin (no positional/flag arg).
 fn cli_stdin(args: &[&str], stdin_text: &str) -> (String, String, bool) {
+    use std::io::Write;
     let mut child = Command::new(env!("CARGO_BIN_EXE_codegraph"))
         .args(args)
         .stdin(Stdio::piped())
@@ -101,60 +110,295 @@ fn cli_stdin(args: &[&str], stdin_text: &str) -> (String, String, bool) {
     )
 }
 
-fn index_mini(label: &str) -> (TestDir, PathBuf) {
+fn index_fixture(fixture: &Path, subdir: &str, label: &str) -> (TestDir, PathBuf) {
     let dir = TestDir::new(label);
-    let project = dir.path().join("mini");
-    copy_tree(&mini_fixture(), &project);
+    let project = dir.path().join(subdir);
+    copy_tree(fixture, &project);
     let (out, err, ok) = cli(&["init", project.to_str().unwrap()]);
     assert!(ok, "init failed: stdout={out} stderr={err}");
     (dir, project)
 }
 
+fn index_mini(label: &str) -> (TestDir, PathBuf) {
+    index_fixture(&mini_fixture(), "mini", label)
+}
+
+fn index_medium(label: &str) -> (TestDir, PathBuf) {
+    index_fixture(&medium_fixture(), "medium", label)
+}
+
+// === HIGH tier: named-symbol code token (call form) =========================
+
 #[test]
-fn prompt_hook_emits_explore_output() {
+fn prompt_hook_high_tier_on_call_form() {
     let (_dir, project) = index_mini("emit");
 
-    // Query a symbol known to exist in the mini fixture (src/math.ts:
-    // `export class Counter`). The explore output must reference it. NO LLM is
-    // involved — this is codegraph's own deterministic retrieval text.
+    // `Counter()` is a code token (call form) — a bare `Counter` is NOT (no
+    // inner camelCase / underscore / `(` / `.`), so the HIGH named-symbol path
+    // must use the call form. The fixture defines `Counter` in src/math.ts.
     let (out, err, ok) = cli(&[
         "prompt-hook",
         "--path",
         project.to_str().unwrap(),
         "--query",
-        "Counter",
+        "Counter()",
     ]);
     assert!(ok, "prompt-hook failed: stdout={out} stderr={err}");
     assert!(
-        !out.trim().is_empty(),
-        "expected non-empty stdout, got empty"
-    );
-    assert!(
         out.contains("Counter"),
-        "expected explore output referencing the queried symbol, got:\n{out}"
+        "expected explore output referencing Counter, got:\n{out}"
     );
-    // It must be explore-style content (the explore renderer's headers), proving
-    // it is the same output the MCP explore tool produces.
     assert!(
         out.contains("Exploration:") || out.contains("Source Code"),
         "expected codegraph_explore-style content, got:\n{out}"
     );
+    assert!(
+        out.contains("<codegraph_context"),
+        "HIGH tier must wrap in <codegraph_context>, got:\n{out}"
+    );
 }
 
 #[test]
-fn prompt_hook_reads_query_from_stdin() {
+fn prompt_hook_call_form_from_stdin() {
     let (_dir, project) = index_mini("stdin");
 
     let (out, err, ok) = cli_stdin(
         &["prompt-hook", "--path", project.to_str().unwrap()],
-        "Counter",
+        "Counter()",
     );
     assert!(ok, "prompt-hook (stdin) failed: stdout={out} stderr={err}");
     assert!(
         out.contains("Counter"),
-        "expected stdin query to drive explore output, got:\n{out}"
+        "expected stdin call form to drive explore output, got:\n{out}"
     );
 }
+
+// === HIGH tier: structural keyword path =====================================
+
+#[test]
+fn gate_fires_on_calls_in_sentence() {
+    let (_dir, project) = index_mini("calls-sentence");
+    // "what calls Counter()" fires HIGH via the STRUCTURAL-KEYWORD path
+    // (`calls`), independent of the tokenizer (#1138 branch-local boundary).
+    let (out, err, ok) = cli(&[
+        "prompt-hook",
+        "--path",
+        project.to_str().unwrap(),
+        "--query",
+        "what calls Counter()",
+    ]);
+    assert!(ok, "failed: stdout={out} stderr={err}");
+    assert!(
+        out.contains("<codegraph_context"),
+        "expected context, got:\n{out}"
+    );
+    assert!(
+        out.contains("Counter"),
+        "expected Counter in output, got:\n{out}"
+    );
+}
+
+#[test]
+fn gate_fires_on_inflected_and_phrase() {
+    let (_dir, project) = index_mini("inflected");
+    for q in ["what are the data flows here", "why does the counter reset"] {
+        let (out, err, ok) = cli(&[
+            "prompt-hook",
+            "--path",
+            project.to_str().unwrap(),
+            "--query",
+            q,
+        ]);
+        assert!(ok, "failed for {q:?}: stdout={out} stderr={err}");
+        assert!(
+            out.contains("<codegraph_context"),
+            "inflected/phrase prompt {q:?} must emit context, got:\n{out}"
+        );
+    }
+}
+
+#[test]
+fn gate_fires_on_devanagari() {
+    let (_dir, project) = index_mini("devanagari");
+    // Hindi/Devanagari structural question (combining-mark entry, Blocker 1).
+    let (out, err, ok) = cli(&[
+        "prompt-hook",
+        "--path",
+        project.to_str().unwrap(),
+        "--query",
+        "यह कैसे काम करता है",
+    ]);
+    assert!(ok, "failed: stdout={out} stderr={err}");
+    assert!(
+        out.contains("<codegraph_context"),
+        "Devanagari structural prompt must emit context, got:\n{out}"
+    );
+}
+
+#[test]
+fn gate_fires_on_non_english() {
+    let (_dir, project) = index_mini("non-english");
+    for q in ["comment marche le compteur", "这个计数器如何工作"] {
+        let (out, err, ok) = cli(&[
+            "prompt-hook",
+            "--path",
+            project.to_str().unwrap(),
+            "--query",
+            q,
+        ]);
+        assert!(ok, "failed for {q:?}: stdout={out} stderr={err}");
+        assert!(
+            out.contains("<codegraph_context"),
+            "non-English structural prompt {q:?} must emit context, got:\n{out}"
+        );
+    }
+}
+
+// === silent tier ============================================================
+
+#[test]
+fn gate_silent_on_plain_prose() {
+    let (_dir, project) = index_mini("silent-prose");
+    let (out, err, ok) = cli(&[
+        "prompt-hook",
+        "--path",
+        project.to_str().unwrap(),
+        "--query",
+        "please fix this typo",
+    ]);
+    assert!(ok, "failed: stdout={out} stderr={err}");
+    assert!(
+        out.trim().is_empty(),
+        "plain prose must be silent, got:\n{out}"
+    );
+}
+
+#[test]
+fn gate_no_false_fire_on_ordinary_words() {
+    let (_dir, project) = index_mini("no-false-fire");
+    for q in ["about Connecticut weather", "i have a callus"] {
+        let (out, err, ok) = cli(&[
+            "prompt-hook",
+            "--path",
+            project.to_str().unwrap(),
+            "--query",
+            q,
+        ]);
+        assert!(ok, "failed for {q:?}: stdout={out} stderr={err}");
+        assert!(
+            out.trim().is_empty(),
+            "ordinary-word prompt {q:?} must not fire, got:\n{out}"
+        );
+    }
+}
+
+// === JSON payload parsing ====================================================
+
+#[test]
+fn prompt_hook_parses_userpromptsubmit_json() {
+    let (_dir, project) = index_mini("json-payload");
+    // Real Claude UserPromptSubmit payload — no --path, no arg. The gate must
+    // read `.prompt` (fires HIGH via `how`/`does`), resolve the project from
+    // `.cwd`, and NOT feed the literal `{"prompt"` blob into the gate.
+    let payload = format!(
+        r#"{{"prompt":"how does Counter work","cwd":"{}"}}"#,
+        project.to_str().unwrap().replace('\\', "\\\\")
+    );
+    let (out, err, ok) = cli_stdin(&["prompt-hook"], &payload);
+    assert!(ok, "failed: stdout={out} stderr={err}");
+    assert!(
+        out.contains("<codegraph_context"),
+        "JSON payload must emit context, got:\n{out}"
+    );
+    assert!(
+        out.contains("Counter"),
+        "must reference Counter (read .prompt), got:\n{out}"
+    );
+    assert!(
+        !out.contains("{\"prompt\""),
+        "must not treat the JSON blob as the query, got:\n{out}"
+    );
+}
+
+// === MEDIUM tier ============================================================
+
+#[test]
+fn medium_tier_emits_pointer_not_explore() {
+    let (_dir, project) = index_medium("medium-pointer");
+    // Non-structural bag-of-words prompt (NO gate word). Tier-A co-occurrence
+    // hits CheckoutStateMachine (covers `checkout` + `state`).
+    let (out, err, ok) = cli(&[
+        "prompt-hook",
+        "--path",
+        project.to_str().unwrap(),
+        "--query",
+        "checkout state machine",
+    ]);
+    assert!(ok, "failed: stdout={out} stderr={err}");
+    assert!(
+        !out.trim().is_empty(),
+        "MEDIUM must not be silent, got empty"
+    );
+    assert!(
+        out.contains("<codegraph_context"),
+        "MEDIUM must wrap in <codegraph_context>, got:\n{out}"
+    );
+    assert!(
+        out.contains("CheckoutStateMachine"),
+        "MEDIUM must name the matched symbol, got:\n{out}"
+    );
+    assert!(
+        out.contains("codegraph_explore ONCE"),
+        "MEDIUM must carry the pointer guidance, got:\n{out}"
+    );
+    // NOT a full explore render.
+    assert!(
+        !out.contains("Exploration:") && !out.contains("Source Code"),
+        "MEDIUM must NOT run full explore, got:\n{out}"
+    );
+}
+
+#[test]
+fn medium_tier_cooccurrence_matches() {
+    let (_dir, project) = index_medium("medium-cooccur");
+    let (out, err, ok) = cli(&[
+        "prompt-hook",
+        "--path",
+        project.to_str().unwrap(),
+        "--query",
+        "checkout state machine",
+    ]);
+    assert!(ok, "failed: stdout={out} stderr={err}");
+    assert!(
+        out.contains("CheckoutStateMachine"),
+        "Tier-A co-occurrence must surface CheckoutStateMachine, got:\n{out}"
+    );
+}
+
+#[test]
+fn medium_tier_rare_single_word() {
+    let (_dir, project) = index_medium("medium-rare");
+    // Single non-structural word: `checkout` clusters across ≥2 names
+    // (CheckoutService / CheckoutController / CheckoutStateMachine) → Tier B.
+    let (out, err, ok) = cli(&[
+        "prompt-hook",
+        "--path",
+        project.to_str().unwrap(),
+        "--query",
+        "checkout",
+    ]);
+    assert!(ok, "failed: stdout={out} stderr={err}");
+    assert!(
+        out.contains("<codegraph_context"),
+        "Tier-B must emit context, got:\n{out}"
+    );
+    assert!(
+        out.contains("Checkout"),
+        "Tier-B rare word must surface a checkout-segment name, got:\n{out}"
+    );
+}
+
+// === graceful degradation + hidden ==========================================
 
 #[test]
 fn prompt_hook_graceful_in_unindexed_dir() {
@@ -167,9 +411,8 @@ fn prompt_hook_graceful_in_unindexed_dir() {
         "--path",
         project.to_str().unwrap(),
         "--query",
-        "anything",
+        "how does anything work",
     ]);
-    // Graceful: exit 0, no panic, a notice (not a crash / non-zero).
     assert!(
         ok,
         "prompt-hook in unindexed dir must exit 0; stdout={out} stderr={err}"
@@ -182,12 +425,32 @@ fn prompt_hook_graceful_in_unindexed_dir() {
 
 #[test]
 fn prompt_hook_hidden_from_help() {
-    // Hidden subcommand: it must NOT appear in the top-level help listing, but
-    // must still be invocable (covered by the other tests).
     let (out, _err, ok) = cli(&["--help"]);
     assert!(ok, "help failed");
     assert!(
         !out.contains("prompt-hook"),
         "prompt-hook must be hidden from the main help, got:\n{out}"
+    );
+}
+
+#[test]
+fn prompt_hook_kill_switch_silences() {
+    let (_dir, project) = index_mini("kill-switch");
+    let output = Command::new(env!("CARGO_BIN_EXE_codegraph"))
+        .args([
+            "prompt-hook",
+            "--path",
+            project.to_str().unwrap(),
+            "--query",
+            "how does Counter work",
+        ])
+        .env("CODEGRAPH_NO_PROMPT_HOOK", "1")
+        .output()
+        .expect("run codegraph binary");
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "kill-switch run must exit 0");
+    assert!(
+        out.trim().is_empty(),
+        "kill-switch must silence output, got:\n{out}"
     );
 }

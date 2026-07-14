@@ -96,6 +96,18 @@ impl CodeGraphEngine {
             .collect())
     }
 
+    /// Read-only access to the underlying store, for the CLI prompt-hook gate's
+    /// query-time segment matching (`get_segment_matches`).
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+
+    /// Convenience passthrough to [`Store::nodes_by_name`] for the prompt-hook
+    /// gate's code-token verification (HIGH tier).
+    pub fn store_nodes_by_name(&self, name: &str) -> anyhow::Result<Vec<Node>> {
+        Ok(self.store.nodes_by_name(name)?)
+    }
+
     // === Tool dispatch ===================================================
 
     /// Dispatch by tool name. Mirrors `ToolHandler.execute` switch

@@ -416,32 +416,40 @@ fn init_on_already_initialized_is_idempotent() {
 }
 
 #[test]
-fn prompt_hook_without_index_prints_hint() {
+fn prompt_hook_without_index_is_silent() {
+    // Under the confidence-tiered gate, the hook is degradable-by-contract: an
+    // unindexed dir (or a non-matching prompt) exits 0 with NO output — the
+    // upstream silent no-op, not the old "[codegraph] no index" notice.
     let dir = TestDir::new("prompt-hook");
     let empty = dir.path().join("empty");
     std::fs::create_dir_all(&empty).unwrap();
     let run = run_in(
         dir.path(),
-        &["prompt-hook", "-p", empty.to_str().unwrap(), "some query"],
+        &[
+            "prompt-hook",
+            "-p",
+            empty.to_str().unwrap(),
+            "how does this work",
+        ],
     );
     assert!(run.ok, "prompt-hook must always succeed: {}", run.stderr);
     assert!(
-        run.stdout.contains("[codegraph]"),
-        "prompt-hook must print a codegraph-tagged line: {}",
+        run.stdout.trim().is_empty(),
+        "prompt-hook in an unindexed dir must be a silent no-op: {}",
         run.stdout
     );
 }
 
 #[test]
-fn prompt_hook_empty_query_reports_nothing_to_explore() {
+fn prompt_hook_empty_query_is_silent() {
     let dir = TestDir::new("prompt-hook-empty");
     let project = indexed_project(&dir);
     let p = project.to_str().unwrap();
     let run = run_in(dir.path(), &["prompt-hook", "-p", p, "   "]);
     assert!(run.ok, "prompt-hook must succeed: {}", run.stderr);
     assert!(
-        run.stdout.contains("No query provided"),
-        "blank query must report nothing to explore: {}",
+        run.stdout.trim().is_empty(),
+        "blank query must be a silent no-op: {}",
         run.stdout
     );
 }
