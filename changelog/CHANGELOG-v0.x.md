@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.35.0](https://github.com/sunerpy/codegraph-rust/compare/v0.34.0...v0.35.0) (2026-07-14)
+
+
+### Features
+
+* **extraction:** index Solidity (.sol) at the extraction tier ([#151](https://github.com/sunerpy/codegraph-rust/issues/151)) ([beebae7](https://github.com/sunerpy/codegraph-rust/commit/beebae778349102ed3bed47441797ffe70413e31))
+
 ## [0.34.0](https://github.com/sunerpy/codegraph-rust/compare/v0.33.0...v0.34.0) (2026-07-14)
 
 
