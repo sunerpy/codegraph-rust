@@ -164,6 +164,20 @@ fn sync_paths_with_store(
         // Cross-file framework finalization on every sync (upstream index.ts:464).
         resolver.run_post_extract(store)?;
     }
+
+    // Orphan sweep (#1187, upstream index.ts:645-682): a full-index resolution
+    // pass killed mid-run leaves the refs it never reached parked in
+    // unresolved_refs and sets the incomplete-resolution marker. The scoped
+    // incremental pass above only revisits changed files' refs, so those orphaned
+    // call edges stay missing until a full re-index. When the marker is present —
+    // INCLUDING on a no-change sync — grind the whole table down with the batched
+    // resolver, which heals the wedged index and clears the marker on success. A
+    // healthy index (marker absent) skips this entirely, so an ordinary sync is
+    // byte-for-byte unchanged.
+    if store.is_resolution_incomplete()? {
+        sweep_orphaned_refs(project_root, store)?;
+    }
+
     outcome.duration_ms = started.elapsed().as_millis();
     let mut changed_paths: Vec<String> = reindexed.into_iter().collect();
     changed_paths.sort();
@@ -220,6 +234,34 @@ fn refresh_dependent_refs(
     }
     Ok(())
 }
+
+/// Grind the whole `unresolved_refs` table with the batched resolver to heal an
+/// index whose full-resolution pass was interrupted (#1187 marker set). The
+/// batched pass re-arms and clears the marker itself, so on success the index is
+/// no longer flagged partial. Framework per-file extract is re-run first so any
+/// framework refs an interrupted run never re-injected are present for the sweep.
+fn sweep_orphaned_refs(project_root: &Path, store: &mut Store) -> Result<()> {
+    let mut resolver = ReferenceResolver::new(project_root.to_string_lossy());
+    {
+        let context =
+            codegraph_resolve::StoreResolutionContext::new(store, project_root.to_string_lossy());
+        resolver.initialize(&context);
+    }
+    // Framework extraction must not run in the sweep. The marker is set only
+    // inside the batched resolver, which runs AFTER a full index has already
+    // persisted its framework `unresolved_refs`, so those rows are present in the
+    // DB by the time the marker exists. Re-extracting them would re-inject
+    // duplicate rows (`unresolved_refs` has no UNIQUE constraint), which
+    // accumulate across interrupt→heal cycles and diverge from `index --force`.
+    // Re-resolving the existing rows alone heals the interrupted pass byte-equal.
+    resolver.resolve_and_persist_batched(store, ORPHAN_SWEEP_BATCH_ROWS)?;
+    resolver.run_post_extract(store)?;
+    Ok(())
+}
+
+/// Batch size for the #1187 orphan sweep, matching the CLI full-index batch
+/// (`RESOLVE_BATCH_ROWS`) so a healed index is byte-equal to `index --force`.
+const ORPHAN_SWEEP_BATCH_ROWS: usize = 5_000;
 
 pub(crate) fn default_db_path(project_root: &Path) -> PathBuf {
     project_root.join(".codegraph").join("codegraph.db")
@@ -614,6 +656,56 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn framework_sweep_does_not_grow_unresolved_refs_across_heal_cycles() {
+        // Given: an indexed Godot project (autoload + signal-handler refs produce
+        // framework `unresolved_refs`), with the #1187 marker set so every sync
+        // triggers the orphan sweep.
+        let dir = TestDir::new("watch-godot-sweep");
+        ensure_config(dir.path());
+        fs::create_dir_all(dir.path().join(".codegraph")).unwrap();
+        fs::write(
+            dir.path().join("project.godot"),
+            "config_version=5\n\n[application]\n\nconfig/name=\"Sweep Fixture\"\n\n[autoload]\n\nGameFlow=\"*res://game_flow.gd\"\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("game_flow.gd"),
+            "extends Node\n\nfunc return_to_map() -> void:\n\tpass\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("stage_manager.gd"),
+            "extends Node\n\nfunc _ready() -> void:\n\tvar button := Button.new()\n\tbutton.pressed.connect(_on_pressed.bind(button))\n\nfunc _goto_map() -> void:\n\tGameFlow.return_to_map()\n\nfunc _on_pressed(source) -> void:\n\tpass\n",
+        )
+        .unwrap();
+        let db = default_db_path(dir.path());
+        sync_project_once(dir.path()).unwrap();
+
+        let baseline = {
+            let store = Store::open(&db).unwrap();
+            store.set_resolution_incomplete().unwrap();
+            store.unresolved_refs_count().unwrap()
+        };
+
+        // When: two bare no-change syncs run the sweep back-to-back.
+        sync_project_once(dir.path()).unwrap();
+        let after_first = Store::open(&db).unwrap().unresolved_refs_count().unwrap();
+        sync_project_once(dir.path()).unwrap();
+        let after_second = Store::open(&db).unwrap().unresolved_refs_count().unwrap();
+
+        // Then: the row count never grows — the sweep re-resolves the existing
+        // framework refs instead of re-injecting duplicate ones.
+        assert_eq!(
+            after_first, baseline,
+            "first sweep must not grow unresolved_refs (no duplicate framework rows)"
+        );
+        assert_eq!(
+            after_second, baseline,
+            "repeated sweeps must stay idempotent (no accumulation across heal cycles)"
+        );
+    }
+
+    #[test]
     fn sync_project_once_scans_and_removes_absent_tracked_files() {
         // Given: a project with two source files indexed via a full scan.
         let dir = TestDir::new("watch-once");
@@ -702,6 +794,118 @@ pub(crate) mod tests {
         assert!(
             names.contains("answer"),
             "stored node names should include the exported symbol, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn interrupted_index_heals_on_bare_sync_and_clears_marker() {
+        use codegraph_core::types::{EdgeKind, Language, UnresolvedRef};
+
+        // Given: an index whose full-resolution pass was interrupted — a
+        // genuinely-resolvable ref is parked in unresolved_refs with no edge, and
+        // the #1187 incomplete-resolution marker is set (the crash signature).
+        let dir = TestDir::new("watch-heal-orphan");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("src/math.ts"),
+            "export function add(a: number, b: number): number { return a + b; }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/app.ts"),
+            "import { add } from './math';\nexport function run(): number { return add(1, 2); }\n",
+        )
+        .unwrap();
+        let db = default_db_path(dir.path());
+
+        // Index both files so nodes exist, then simulate the interruption by
+        // deleting the resolved Calls edge, re-parking its unresolved ref, and
+        // setting the marker.
+        sync_changed_paths(dir.path(), &db, ["src/math.ts", "src/app.ts"]).unwrap();
+        let caller_id = {
+            let store = Store::open(&db).unwrap();
+            store
+                .nodes_by_file_path("src/app.ts")
+                .unwrap()
+                .into_iter()
+                .find(|n| n.name == "run")
+                .expect("run node")
+                .id
+        };
+        {
+            let mut store = Store::open(&db).unwrap();
+            store.delete_resolved_edges_from_file("src/app.ts").unwrap();
+            store
+                .insert_unresolved_refs(&[UnresolvedRef {
+                    id: None,
+                    from_node_id: caller_id.clone(),
+                    reference_name: "add".to_string(),
+                    reference_kind: EdgeKind::Calls,
+                    line: 2,
+                    col: 0,
+                    candidates: None,
+                    file_path: "src/app.ts".to_string(),
+                    language: Language::TypeScript,
+                    is_function_ref: false,
+                    reference_subkind: None,
+                }])
+                .unwrap();
+            store.set_resolution_incomplete().unwrap();
+        }
+
+        // When: a bare no-change sync runs (no path is dirty on disk).
+        let outcome = sync_changed_paths(dir.path(), &db, Vec::<String>::new()).unwrap();
+        assert_eq!(outcome.files_reindexed, 0, "no file changed");
+
+        // Then: the orphaned ref is swept into a Calls edge and the marker clears.
+        let store = Store::open(&db).unwrap();
+        assert!(
+            !store.is_resolution_incomplete().unwrap(),
+            "sweep must clear the #1187 marker"
+        );
+        let edges = store
+            .edges_by_source_kind(&caller_id, Some(EdgeKind::Calls))
+            .unwrap();
+        assert!(
+            !edges.is_empty(),
+            "the orphaned add() call edge must be recovered by the sweep"
+        );
+    }
+
+    #[test]
+    fn healthy_sync_leaves_marker_absent_and_unresolvable_rows_parked() {
+        // Given: a healthy index (no marker) with a legitimately-unresolvable ref
+        // to an external symbol — Rust retains such rows as #1240 retry state.
+        let dir = TestDir::new("watch-healthy-noheal");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("src/app.ts"),
+            "export function run(): void { externalMissing(); }\n",
+        )
+        .unwrap();
+        let db = default_db_path(dir.path());
+        sync_changed_paths(dir.path(), &db, ["src/app.ts"]).unwrap();
+
+        // When: a bare no-change sync runs.
+        let before = {
+            let store = Store::open(&db).unwrap();
+            (
+                store.is_resolution_incomplete().unwrap(),
+                store.unresolved_refs_count().unwrap(),
+            )
+        };
+        let outcome = sync_changed_paths(dir.path(), &db, Vec::<String>::new()).unwrap();
+
+        // Then: no marker was set, nothing was swept, and the retained
+        // unresolvable rows are untouched (#1240 retry state preserved).
+        assert_eq!(outcome.files_reindexed, 0);
+        assert!(!before.0, "a healthy index must not carry the marker");
+        let store = Store::open(&db).unwrap();
+        assert!(!store.is_resolution_incomplete().unwrap());
+        assert_eq!(
+            store.unresolved_refs_count().unwrap(),
+            before.1,
+            "unresolvable retry rows must survive a healthy sync"
         );
     }
 

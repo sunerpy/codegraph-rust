@@ -66,6 +66,17 @@ pub const CODEGRAPH_DAEMON_MAX_IDLE_MS: &str = "CODEGRAPH_DAEMON_MAX_IDLE_MS";
 /// colby `DEFAULT_CLIENT_SWEEP_MS`.
 pub const CODEGRAPH_DAEMON_CLIENT_SWEEP_MS: &str = "CODEGRAPH_DAEMON_CLIENT_SWEEP_MS";
 
+/// Env var name: the real MCP host pid, threaded down by the launcher so the
+/// daemon watchdog polls the host directly (#1185). Unset/invalid/`0` → `None`,
+/// which preserves the pre-#1185 behavior of watching only the launcher.
+pub const CODEGRAPH_HOST_PPID: &str = "CODEGRAPH_HOST_PPID";
+
+/// Env var name: milliseconds a freshly-accepting daemon waits for its FIRST
+/// client request before assuming it was orphaned during startup and self-exits
+/// (#1185). Default 900000 (15 min); `0` disables. Disarmed on the first
+/// accepted connection, so a live session is never touched.
+pub const CODEGRAPH_STARTUP_HANDSHAKE_TIMEOUT_MS: &str = "CODEGRAPH_STARTUP_HANDSHAKE_TIMEOUT_MS";
+
 const DEFAULT_IDLE_TIMEOUT_MS: u128 = 300_000;
 const DEFAULT_MAX_IDLE_MS: u128 = 1_800_000;
 const MIN_IDLE_TIMEOUT_MS: u128 = 1_000;
@@ -74,6 +85,8 @@ const MAX_IDLE_TIMEOUT_MS: u128 = 3_600_000;
 const DEFAULT_CLIENT_SWEEP_MS: u128 = 30_000;
 const MIN_CLIENT_SWEEP_MS: u128 = 50;
 const MAX_CLIENT_SWEEP_MS: u128 = 600_000;
+
+const DEFAULT_STARTUP_HANDSHAKE_TIMEOUT_MS: u128 = 900_000;
 
 /// Parse + clamp the idle-timeout env var (mirror colby `resolveIdleTimeoutMs`):
 /// unset/empty/invalid -> default; otherwise clamp to [MIN, MAX].
@@ -112,6 +125,35 @@ fn resolve_client_sweep_ms() -> u128 {
         MIN_CLIENT_SWEEP_MS,
         MAX_CLIENT_SWEEP_MS,
     )
+}
+
+/// Read the real host pid from `CODEGRAPH_HOST_PPID` (#1185). Unset, empty,
+/// non-numeric, or `0` → `None` (watch only the launcher, pre-#1185 behavior).
+/// Exposed as [`host_pid_from_env`] so the CLI launch site can populate
+/// `DaemonOptions.host_pid` without duplicating the parse.
+fn resolve_host_pid_from_env() -> Option<u32> {
+    match std::env::var(CODEGRAPH_HOST_PPID) {
+        Ok(raw) if !raw.is_empty() => raw.parse::<u32>().ok().filter(|&pid| pid != 0),
+        _ => None,
+    }
+}
+
+/// Public accessor for the real host pid parsed from `CODEGRAPH_HOST_PPID`
+/// (#1185); see [`resolve_host_pid_from_env`].
+pub fn host_pid_from_env() -> Option<u32> {
+    resolve_host_pid_from_env()
+}
+
+/// Startup-handshake timeout (#1185): unset/empty/invalid → default; `0` disables.
+/// Unlike the idle timeouts this is NOT clamped to a floor — `0` must survive as
+/// the explicit disable signal.
+fn resolve_startup_handshake_timeout_ms() -> u128 {
+    match std::env::var(CODEGRAPH_STARTUP_HANDSHAKE_TIMEOUT_MS) {
+        Ok(raw) if !raw.is_empty() => raw
+            .parse::<u128>()
+            .unwrap_or(DEFAULT_STARTUP_HANDSHAKE_TIMEOUT_MS),
+        _ => DEFAULT_STARTUP_HANDSHAKE_TIMEOUT_MS,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -377,6 +419,15 @@ async fn run_accept_loop_async(
     let idle_timeout_ms = resolve_idle_timeout_ms();
     let max_idle_ms = resolve_max_idle_ms();
     let client_sweep_ms = resolve_client_sweep_ms();
+    // Startup-handshake backstop (#1185): a daemon whose launcher was killed
+    // mid-startup while its stdio pipes stayed open is orphaned — it received no
+    // client at all. Arm a one-shot timer from accept-loop entry and disarm it on
+    // the FIRST accepted connection; if it fires with zero connections the daemon
+    // self-exits. `0` disables. A live session that connects even once is never
+    // touched (the idle/max-idle/supervision paths own its later lifecycle).
+    let startup_handshake_ms = resolve_startup_handshake_timeout_ms();
+    let accept_loop_started = std::time::Instant::now();
+    let mut first_connection_seen = false;
     info!(project = %project_root.display(), socket = %socket_path.display(), "daemon started");
 
     // ONE shared watcher per daemon process. Bound to a local so
@@ -401,6 +452,7 @@ async fn run_accept_loop_async(
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok(stream) => {
+                    first_connection_seen = true;
                     let session_project = project_root.clone();
                     let session_socket = socket_display.clone();
                     let session_registry = registry.clone();
@@ -434,14 +486,27 @@ async fn run_accept_loop_async(
                     warn!(reason, "daemon watchdog stopping after supervisor loss");
                     break None;
                 }
+                if startup_handshake_ms > 0
+                    && !first_connection_seen
+                    && accept_loop_started.elapsed().as_millis() >= startup_handshake_ms
+                {
+                    warn!(
+                        startup_handshake_ms,
+                        "daemon exiting on startup-handshake backstop: no client connected"
+                    );
+                    break None;
+                }
                 if last_sweep.elapsed().as_millis() >= client_sweep_ms {
                     sweep_dead_clients(&registry);
                     last_sweep = std::time::Instant::now();
                 }
                 let idle_ms = registry.millis_since_active();
                 if idle_ms > max_idle_ms {
-                    info!(idle_ms, max_idle_ms, "daemon exiting on max-idle backstop");
-                    break None;
+                    sweep_dead_clients(&registry);
+                    if backstop_should_exit(&registry, is_process_alive) {
+                        info!(idle_ms, max_idle_ms, "daemon exiting on max-idle backstop");
+                        break None;
+                    }
                 }
                 if registry.active_count() == 0 && idle_ms > idle_timeout_ms {
                     info!(idle_ms, idle_timeout_ms, "daemon idle-exit: no clients");
@@ -468,6 +533,19 @@ fn sweep_dead_clients(registry: &SessionRegistry) {
         debug!(session = id, "sweeping session whose host pid is dead");
         registry.shutdown_session(id);
     }
+}
+
+/// #1200 max-idle-backstop decision, extracted for unit testing with an injected
+/// liveness probe (mirrors `dead_session_ids`). The backstop exists only to reap
+/// a PHANTOM client — one counted but gone whose socket-close was never
+/// delivered. After the inactivity window, the daemon may exit only when NO
+/// remaining client can be proven alive: every session is either gone (swept
+/// already) or an unverifiable no-pid connection, the sole phantom class the
+/// sweep cannot catch. One provably-alive client keeps the daemon up regardless
+/// of how long it has been quiet, so a genuinely-live editor session that simply
+/// has not queried in 30 min is never dropped to in-process mode.
+fn backstop_should_exit(registry: &SessionRegistry, is_alive: impl Fn(u32) -> bool) -> bool {
+    !registry.has_provably_alive_client(is_alive)
 }
 
 fn start_project_watcher(
@@ -626,6 +704,63 @@ mod tests {
         assert_eq!(options.parent_pid, None);
         assert_eq!(options.host_pid, None);
         assert_eq!(options.watchdog_interval, DEFAULT_WATCHDOG_INTERVAL);
+    }
+
+    #[test]
+    fn backstop_exits_only_when_no_client_is_provably_alive() {
+        let registry = SessionRegistry::default();
+        // Empty registry: no provably-alive client, so the backstop may exit.
+        assert!(backstop_should_exit(&registry, is_process_alive));
+
+        // A no-pid (unverifiable phantom) session does NOT keep the daemon up.
+        let phantom = registry.start_session();
+        assert!(backstop_should_exit(&registry, |_| true));
+
+        // A provably-alive client keeps the daemon up even at the max-idle window.
+        let live = registry.start_session();
+        registry.set_pid(live.session_id(), 1234);
+        assert!(!backstop_should_exit(&registry, |pid| pid == 1234));
+
+        // Once that client's pid is dead, the backstop may exit again.
+        assert!(backstop_should_exit(&registry, |pid| pid != 1234));
+
+        drop((phantom, live));
+    }
+
+    #[test]
+    fn resolve_host_pid_reads_env_and_defaults_to_none() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe { std::env::remove_var(CODEGRAPH_HOST_PPID) };
+        assert_eq!(resolve_host_pid_from_env(), None);
+        unsafe { std::env::set_var(CODEGRAPH_HOST_PPID, "4321") };
+        assert_eq!(resolve_host_pid_from_env(), Some(4321));
+        unsafe { std::env::set_var(CODEGRAPH_HOST_PPID, "not-a-pid") };
+        assert_eq!(resolve_host_pid_from_env(), None);
+        unsafe { std::env::set_var(CODEGRAPH_HOST_PPID, "0") };
+        assert_eq!(resolve_host_pid_from_env(), None);
+        unsafe { std::env::remove_var(CODEGRAPH_HOST_PPID) };
+    }
+
+    #[test]
+    fn resolve_startup_handshake_timeout_parses_and_disables() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: guarded by ENV_LOCK.
+        unsafe { std::env::remove_var(CODEGRAPH_STARTUP_HANDSHAKE_TIMEOUT_MS) };
+        assert_eq!(
+            resolve_startup_handshake_timeout_ms(),
+            DEFAULT_STARTUP_HANDSHAKE_TIMEOUT_MS
+        );
+        unsafe { std::env::set_var(CODEGRAPH_STARTUP_HANDSHAKE_TIMEOUT_MS, "0") };
+        assert_eq!(resolve_startup_handshake_timeout_ms(), 0);
+        unsafe { std::env::set_var(CODEGRAPH_STARTUP_HANDSHAKE_TIMEOUT_MS, "1500") };
+        assert_eq!(resolve_startup_handshake_timeout_ms(), 1500);
+        unsafe { std::env::set_var(CODEGRAPH_STARTUP_HANDSHAKE_TIMEOUT_MS, "bogus") };
+        assert_eq!(
+            resolve_startup_handshake_timeout_ms(),
+            DEFAULT_STARTUP_HANDSHAKE_TIMEOUT_MS
+        );
+        unsafe { std::env::remove_var(CODEGRAPH_STARTUP_HANDSHAKE_TIMEOUT_MS) };
     }
 
     #[cfg(unix)]

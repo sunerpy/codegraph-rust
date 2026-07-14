@@ -142,4 +142,52 @@ fn status_json_exposes_debug_fields_initialized() {
     assert_eq!(v["initialized"], Value::Bool(true), "must be initialized");
     assert_eq!(v["dbExists"], Value::Bool(true), "db must exist post-init");
     assert_debug_fields(&v);
+    // #1187: a healthy index must NOT carry the partial flag.
+    assert!(
+        v["index"].get("partial").is_none(),
+        "a healthy index must omit index.partial: {v}"
+    );
+}
+
+#[test]
+fn status_json_flags_partial_only_when_marker_set() {
+    use codegraph_store::Store;
+
+    // GIVEN an indexed project with the #1187 incomplete-resolution marker set,
+    // simulating an interrupted resolution pass.
+    let dir = TestDir::new("partial");
+    let project = dir.path().join("mini");
+    copy_tree(&mini_fixture(), &project);
+    let p = project.to_str().unwrap();
+    let (out, err, ok) = cli(&["init", p]);
+    assert!(ok, "init failed: stdout={out} stderr={err}");
+
+    let db = project.join(".codegraph").join("codegraph.db");
+    {
+        let store = Store::open(&db).unwrap();
+        store.set_resolution_incomplete().unwrap();
+    }
+
+    // WHEN `status --json` runs.
+    let (out, err, ok) = cli(&["status", "--json", p]);
+    assert!(ok, "status failed: stdout={out} stderr={err}");
+    let v: Value = serde_json::from_str(out.trim()).expect("valid JSON");
+
+    // THEN index.partial is true.
+    assert_eq!(
+        v["index"]["partial"],
+        Value::Bool(true),
+        "index.partial must be true when the marker is set: {v}"
+    );
+
+    // AND after a heal sync the flag is gone again.
+    let (out, err, ok) = cli(&["sync", p]);
+    assert!(ok, "sync failed: stdout={out} stderr={err}");
+    let (out, err, ok) = cli(&["status", "--json", p]);
+    assert!(ok, "status failed: stdout={out} stderr={err}");
+    let v: Value = serde_json::from_str(out.trim()).expect("valid JSON");
+    assert!(
+        v["index"].get("partial").is_none(),
+        "a healed index must drop index.partial: {v}"
+    );
 }

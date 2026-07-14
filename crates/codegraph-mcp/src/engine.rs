@@ -1130,6 +1130,18 @@ impl CodeGraphEngine {
                 lines.push(format!("- {lang}: {count}"));
             }
         }
+        // #1187: only appended when the interrupted-resolution marker is set, so a
+        // healthy status is byte-identical to a pre-#1187 build. Tells the agent
+        // the blast radius is incomplete until the next sync heals it.
+        if self.store.is_resolution_incomplete()? {
+            lines.push(String::new());
+            lines.push(
+                "**⚠ Index is PARTIAL:** a resolution pass was interrupted, so some \
+                 call edges are missing and the blast radius is incomplete. Run \
+                 `codegraph sync` to heal it."
+                    .to_string(),
+            );
+        }
         Ok(ToolResult::text(lines.join("\n")))
     }
 
