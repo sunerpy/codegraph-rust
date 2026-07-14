@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.32.0](https://github.com/sunerpy/codegraph-rust/compare/v0.31.1...v0.32.0) (2026-07-14)
+
+
+### Features
+
+* **prompt-hook:** gate context injection by confidence tier ([#145](https://github.com/sunerpy/codegraph-rust/issues/145)) ([9dd4557](https://github.com/sunerpy/codegraph-rust/commit/9dd45570a659e3d034afc620277f17765b08a519))
+
 ## [0.31.1](https://github.com/sunerpy/codegraph-rust/compare/v0.31.0...v0.31.1) (2026-07-14)
 
 
