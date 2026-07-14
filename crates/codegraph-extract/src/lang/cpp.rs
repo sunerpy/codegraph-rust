@@ -67,6 +67,9 @@ impl LanguageSpec for CppSpec {
         "type"
     }
     fn resolve_name(&self, node: Node<'_>, source: &str) -> Option<String> {
+        if let Some(name) = recover_cpp_macro_defined_name(node, source) {
+            return Some(name);
+        }
         let qid = declarator_qualified_id(child_by_field(node, "declarator")?)?;
         node_text(qid, source)
             .rsplit("::")
@@ -116,8 +119,8 @@ impl LanguageSpec for CppSpec {
     fn extract_import(&self, node: Node<'_>, source: &str) -> Option<ImportInfo> {
         include_import(node, source)
     }
-    fn pre_parse(&self, source: &str) -> String {
-        pre_parse_cpp_source(source)
+    fn pre_parse(&self, source: &str, file_path: &str) -> String {
+        pre_parse_cpp_source(source, file_path)
     }
 }
 
@@ -128,10 +131,133 @@ impl LanguageSpec for CppSpec {
 /// ASCII spaces — tree-sitter consumes byte offsets, and every blanked span lies
 /// on char boundaries, so byte length (and thus line/column) is preserved. Each
 /// pass is `contains`-gated, so macro-free C++ is returned byte-identical.
-fn pre_parse_cpp_source(source: &str) -> String {
+fn pre_parse_cpp_source(source: &str, file_path: &str) -> String {
     let bytes = blank_cpp_annotation_macro_calls(blank_cpp_inline_annotation_macros(
         blank_cpp_api_prefix_macros(source.as_bytes().to_vec()),
     ));
+    let lower = file_path.to_ascii_lowercase();
+    let bytes = if lower.ends_with(".metal") {
+        blank_metal_attributes(bytes)
+    } else if lower.ends_with(".cu") || lower.ends_with(".cuh") || looks_like_cuda_source(source) {
+        blank_cuda_constructs(bytes)
+    } else {
+        bytes
+    };
+    String::from_utf8(bytes).unwrap_or_else(|_| source.to_string())
+}
+
+/// Blank Metal Shading Language `[[attribute]]` annotations (`[[position]]`,
+/// `[[buffer(0)]]`, comma-lists like `[[buffer(0), raster_order_group(0)]]`) to
+/// equal-length spaces. MSL puts attributes AFTER the declarator
+/// (`float4 position [[position]];`), which tree-sitter-cpp misparses into a
+/// spurious `extends` ref from the struct to the field's own type (#1121).
+/// `[[`-gated fast-exit; offset-preserving. The `regex` crate is lookahead-free
+/// so the tight shape (after `[[`, an identifier then `]]`) alone excludes a
+/// subscripted lambda `arr[[]{…}()]`.
+fn blank_metal_attributes(bytes: Vec<u8>) -> Vec<u8> {
+    let source = match std::str::from_utf8(&bytes) {
+        Ok(source) => source,
+        Err(_) => return bytes,
+    };
+    if !source.contains("[[") {
+        return bytes;
+    }
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(
+            r"\[\[\s*[A-Za-z_]\w*(?:\s*\([^()\n]*\))?(?:\s*,\s*[A-Za-z_]\w*(?:\s*\([^()\n]*\))?)*\s*\]\]",
+        )
+        .expect("metal-attribute regex")
+    });
+    let spans: Vec<(usize, usize)> = re.find_iter(source).map(|m| (m.start(), m.end())).collect();
+    let mut bytes = bytes;
+    for (start, end) in spans {
+        blank_span(&mut bytes, start, end);
+    }
+    bytes
+}
+
+/// Blank CUDA-specific constructs (`.cu`/`.cuh` or content-detected) so the
+/// residual parses as plain C++ (#387, CUDA-lang parts of #1172):
+/// - `__launch_bounds__(...)` then execution-space/storage specifiers
+///   (`__global__` family) — gated by `__`; blanked to equal-length spaces.
+///   `__restrict__` is deliberately excluded (grammar parses it natively).
+/// - `<<<grid, block[, smem[, stream]]>>>` launch configs — gated by `<<<`;
+///   the chevrons otherwise lex as shift operators and destroy the host→kernel
+///   call edge. Blanking the span leaves a plain `kernel(args)` call. Only a
+///   BRACE-BALANCED match is blanked (a stray `<<<` from a merge-conflict marker
+///   opens braces it never closes and is left untouched), matching upstream's
+///   char-scan replacer. Offset-preserving.
+fn blank_cuda_constructs(bytes: Vec<u8>) -> Vec<u8> {
+    let source = match std::str::from_utf8(&bytes) {
+        Ok(source) => source,
+        Err(_) => return bytes,
+    };
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    if source.contains("__") {
+        static BOUNDS_RE: OnceLock<Regex> = OnceLock::new();
+        let bounds_re = BOUNDS_RE.get_or_init(|| {
+            Regex::new(r"\b__launch_bounds__\s*\([^()\n]*\)").expect("bounds regex")
+        });
+        static SPEC_RE: OnceLock<Regex> = OnceLock::new();
+        let spec_re = SPEC_RE.get_or_init(|| {
+            Regex::new(
+                r"\b__(?:global|device|host|constant|shared|managed|grid_constant|forceinline|noinline|launch_bounds)__\b",
+            )
+            .expect("specifier regex")
+        });
+        spans.extend(bounds_re.find_iter(source).map(|m| (m.start(), m.end())));
+        spans.extend(spec_re.find_iter(source).map(|m| (m.start(), m.end())));
+    }
+    if source.contains("<<<") {
+        static LAUNCH_RE: OnceLock<Regex> = OnceLock::new();
+        let launch_re =
+            LAUNCH_RE.get_or_init(|| Regex::new(r"<<<[^;]{0,400}?>>>").expect("launch regex"));
+        for m in launch_re.find_iter(source) {
+            if is_brace_balanced(m.as_str()) {
+                spans.push((m.start(), m.end()));
+            }
+        }
+    }
+    let mut bytes = bytes;
+    for (start, end) in spans {
+        blank_span(&mut bytes, start, end);
+    }
+    bytes
+}
+
+/// True when every `{` in `text` is matched by a later `}` and no `}` precedes
+/// its opener (net depth stays non-negative and ends at zero). Used to reject a
+/// launch-config match that spills across a merge-conflict marker.
+fn is_brace_balanced(text: &str) -> bool {
+    let mut depth: i32 = 0;
+    for b in text.bytes() {
+        if b == b'{' {
+            depth += 1;
+        } else if b == b'}' {
+            depth -= 1;
+            if depth < 0 {
+                return false;
+            }
+        }
+    }
+    depth == 0
+}
+
+/// Strong content markers for CUDA in files without a `.cu`/`.cuh` extension
+/// (much CUDA lives in `.h`/`.hpp`). The dunder specifiers are nvcc-only and
+/// `cudaStream_t` is the runtime stream handle; none is valid C++ anywhere, so
+/// a content-triggered blank on a non-CUDA file is inert. Weak markers (`dim3`,
+/// `<<<`) are deliberately excluded.
+pub(crate) fn looks_like_cuda_source(source: &str) -> bool {
+    source.contains("__global__")
+        || source.contains("__device__")
+        || source.contains("__constant__")
+        || source.contains("cudaStream_t")
+}
+
+pub(crate) fn blank_cuda_constructs_str(source: &str) -> String {
+    let bytes = blank_cuda_constructs(source.as_bytes().to_vec());
     String::from_utf8(bytes).unwrap_or_else(|_| source.to_string())
 }
 
@@ -299,6 +425,58 @@ fn blank_cpp_annotation_macro_calls(bytes: Vec<u8>) -> Vec<u8> {
         blank_span(&mut bytes, start, end);
     }
     bytes
+}
+
+/// Recover the real function name from the macro-definition idiom
+/// `MACRO_NAME(real_name, typed args…) { body }` (flash-attention's
+/// `DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_kernel, bool Is_dropout, …) { … }`):
+/// tree-sitter parses it as a `function_definition` named after the macro, so
+/// every such kernel collapses onto one name (#1172). Narrow gate — ALL of:
+/// the parsed name is macro-shaped (`^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$`); the
+/// first "parameter" is a LONE lowercase-bearing `type_identifier` (the name);
+/// ≥2 params and no OTHER param is a lone identifier (so gtest `TEST_F(Fixture,
+/// Name)` / `PYBIND11_MODULE(ext, m)` / `BENCHMARK_DEFINE_F(Fix, name)` bail).
+fn recover_cpp_macro_defined_name(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() != "function_definition" {
+        return None;
+    }
+    let declarator = child_by_field(node, "declarator")?;
+    if declarator.kind() != "function_declarator" {
+        return None;
+    }
+    let inner = child_by_field(declarator, "declarator")?;
+    if inner.kind() != "identifier" {
+        return None;
+    }
+    let macro_name = node_text(inner, source);
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE
+        .get_or_init(|| Regex::new(r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$").expect("macro-name regex"));
+    if !re.is_match(&macro_name) {
+        return None;
+    }
+    let params = child_by_field(declarator, "parameters")?;
+    let named: Vec<Node<'_>> = params.named_children(&mut params.walk()).collect();
+    if named.len() < 2 {
+        return None;
+    }
+    let lone_ident_text = |p: Node<'_>| -> Option<String> {
+        if p.kind() != "parameter_declaration" || p.named_child_count() != 1 {
+            return None;
+        }
+        let child = p.named_child(0)?;
+        (child.kind() == "type_identifier").then(|| node_text(child, source))
+    };
+    let name = lone_ident_text(named[0])?;
+    if !name.chars().any(|c| c.is_ascii_lowercase()) {
+        return None;
+    }
+    for p in &named[1..] {
+        if lone_ident_text(*p).is_some() {
+            return None;
+        }
+    }
+    Some(name)
 }
 
 fn declarator_qualified_id<'tree>(declarator: Node<'tree>) -> Option<Node<'tree>> {
@@ -522,7 +700,7 @@ mod tests {
     #[test]
     fn blank_cpp_api_prefix_member() {
         let src = "ENGINE_API virtual void Tick();";
-        let out = pre_parse_cpp_source(src);
+        let out = pre_parse_cpp_source(src, "t.cpp");
         assert_eq!(out.len(), src.len());
         assert!(out.starts_with("           virtual void Tick();"));
     }
@@ -530,14 +708,14 @@ mod tests {
     #[test]
     fn blank_cpp_api_prefix_bare_value_untouched() {
         let src = "int x = MY_API;";
-        let out = pre_parse_cpp_source(src);
+        let out = pre_parse_cpp_source(src, "t.cpp");
         assert_eq!(out, src);
     }
 
     #[test]
     fn blank_cpp_annotation_macro_calls_ue() {
         let src = "UPROPERTY(EditAnywhere)\nint X;";
-        let out = pre_parse_cpp_source(src);
+        let out = pre_parse_cpp_source(src, "t.cpp");
         assert_eq!(out.len(), src.len());
         assert!(out.starts_with("                       \nint X;"));
     }
@@ -545,21 +723,21 @@ mod tests {
     #[test]
     fn blank_cpp_annotation_statement_call_untouched() {
         let src = "FOO(x);";
-        let out = pre_parse_cpp_source(src);
+        let out = pre_parse_cpp_source(src, "t.cpp");
         assert_eq!(out, src);
     }
 
     #[test]
     fn blank_cpp_annotation_in_expression_untouched() {
         let src = "if (CHECK(x)) {}";
-        let out = pre_parse_cpp_source(src);
+        let out = pre_parse_cpp_source(src, "t.cpp");
         assert_eq!(out, src);
     }
 
     #[test]
     fn blank_cpp_inline_annotation_umeta() {
         let src = "Foo UMETA(DisplayName=\"Foo\"),";
-        let out = pre_parse_cpp_source(src);
+        let out = pre_parse_cpp_source(src, "t.cpp");
         assert_eq!(out.len(), src.len());
         assert!(out.starts_with("Foo "));
         assert!(out.ends_with(","));
@@ -569,7 +747,7 @@ mod tests {
     #[test]
     fn blank_cpp_inline_annotation_lowercase_untouched() {
         let src = "auto v = meta(1);";
-        let out = pre_parse_cpp_source(src);
+        let out = pre_parse_cpp_source(src, "t.cpp");
         assert_eq!(out, src);
     }
 
@@ -584,7 +762,7 @@ mod tests {
     void Bar();
 };
 "#;
-        let out = pre_parse_cpp_source(src);
+        let out = pre_parse_cpp_source(src, "t.cpp");
         assert_eq!(out.len(), src.len());
         assert_eq!(
             out.bytes().filter(|&b| b == b'\n').count(),
@@ -601,6 +779,117 @@ public:
 };
 }
 "#;
-        assert_eq!(pre_parse_cpp_source(src), src);
+        assert_eq!(pre_parse_cpp_source(src, "t.cpp"), src);
+    }
+
+    #[test]
+    fn blank_metal_attributes_blanks_field_attribute() {
+        let src = "float4 position [[position]];";
+        let out = blank_metal_attributes(src.as_bytes().to_vec());
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(out.len(), src.len());
+        assert_eq!(out, "float4 position             ;");
+        assert!(!out.contains("[["));
+    }
+
+    #[test]
+    fn blank_metal_attributes_ignores_no_double_bracket() {
+        let src = "float4 position;";
+        let out = blank_metal_attributes(src.as_bytes().to_vec());
+        assert_eq!(String::from_utf8(out).unwrap(), src);
+    }
+
+    #[test]
+    fn blank_metal_attributes_ignores_lambda_subscript() {
+        let src = "arr[[]{return 0;}()]";
+        let out = blank_metal_attributes(src.as_bytes().to_vec());
+        assert_eq!(String::from_utf8(out).unwrap(), src);
+    }
+
+    #[test]
+    fn metal_attribute_blanked_only_for_dot_metal() {
+        let metal = pre_parse_cpp_source("struct S { float4 p [[position]]; };", "s.metal");
+        assert!(!metal.contains("[[position]]"));
+        assert!(metal.contains("float4 p"));
+        let cpp = "[[nodiscard]] int f();";
+        assert_eq!(pre_parse_cpp_source(cpp, "s.cpp"), cpp);
+    }
+
+    #[test]
+    fn blank_cuda_specifier() {
+        let src = "__global__ void f() {}";
+        let out = blank_cuda_constructs(src.as_bytes().to_vec());
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(out.len(), src.len());
+        assert!(out.starts_with("           void f()"));
+        assert!(!out.contains("__global__"));
+    }
+
+    #[test]
+    fn blank_cuda_launch_config() {
+        let src = "f<<<g, b>>>(x);";
+        let out = blank_cuda_constructs(src.as_bytes().to_vec());
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(out.len(), src.len());
+        assert_eq!(out, "f          (x);");
+    }
+
+    #[test]
+    fn blank_cuda_launch_unbalanced_braces_untouched() {
+        let src = "a <<< b } c >>> d;";
+        let out = blank_cuda_constructs(src.as_bytes().to_vec());
+        assert_eq!(String::from_utf8(out).unwrap(), src);
+    }
+
+    #[test]
+    fn looks_like_cuda_source_markers() {
+        assert!(looks_like_cuda_source("__global__ void f();"));
+        assert!(looks_like_cuda_source("cudaStream_t s;"));
+        assert!(!looks_like_cuda_source("int main() { return 0; }"));
+    }
+
+    #[test]
+    fn cuda_blanked_for_dot_cu() {
+        let out = pre_parse_cpp_source("void h() { k<<<g, b>>>(x); }", "k.cu");
+        assert!(!out.contains("<<<"));
+        assert!(out.contains("k          (x);"));
+    }
+
+    #[test]
+    fn cuda_blanked_by_content_in_hpp() {
+        let out = pre_parse_cpp_source("__global__ void k() {}", "k.hpp");
+        assert!(!out.contains("__global__"));
+    }
+
+    #[test]
+    fn recover_macro_kernel_name() {
+        assert_eq!(
+            resolve_macro_name("DEFINE_KERNEL(my_kernel, int n) {}"),
+            Some("my_kernel".to_string())
+        );
+    }
+
+    #[test]
+    fn recover_macro_ignores_gtest_shape() {
+        assert_eq!(resolve_macro_name("TEST_F(Fixture, Name) {}"), None);
+    }
+
+    #[test]
+    fn recover_macro_ignores_lowercase_macro() {
+        assert_eq!(resolve_macro_name("define_x(a, int b) {}"), None);
+    }
+
+    fn resolve_macro_name(src: &str) -> Option<String> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let mut cursor = tree.root_node().walk();
+        let func = tree
+            .root_node()
+            .named_children(&mut cursor)
+            .find(|c| c.kind() == "function_definition")?;
+        recover_cpp_macro_defined_name(func, src)
     }
 }

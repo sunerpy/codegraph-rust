@@ -304,6 +304,68 @@ Like the Ruby fixture, both the index and the dump are byte-stable, and the
 `cpp_db_is_self_equivalent_to_cpp_golden` tests in
 `crates/codegraph-bench/tests/equivalence.rs` enforce it.
 
+### Metal fixture
+
+A fifth golden fixture, `reference/golden/metal/`, guards Metal Shading Language
+support (upstream #1121 / `cc89146`). MSL ≈ C++14 and rides the existing
+`tree-sitter-cpp` grammar — `.metal` maps to `Language::Cpp` with **no new
+`Language` variant**. It guards the `.metal`-gated `[[attribute]]` blank: MSL's
+post-declarator attributes (`float4 position [[position]];`) otherwise misparse a
+struct field into a spurious `extends` edge from the struct to the field's own
+type. The corpus (`crates/codegraph-bench/fixtures/metal/shader.metal`) defines
+`float4`/`float2` structs, a `VertexIn` struct whose fields carry
+`[[position]]`/`[[user(locn0)]]` attributes on those self-defined types, and a
+`vertex_main` function that calls a `tint` helper. The golden must show:
+
+- `shader.metal` with `"language": "cpp"`;
+- `VertexIn`/`float4`/`float2` as ordinary structs with **no `Extends` edge**
+  (the attribute blank prevents the spurious `VertexIn extends float4`);
+- the intra-shader `vertex_main` → `tint` `Calls` edge.
+
+The `[[attribute]]` blank fires ONLY for `.metal` files; a `.cpp`/`.hpp` with a
+regular `[[nodiscard]]` attribute is byte-identical through pre-parse (proven by
+the `metal_attribute_blanked_only_for_dot_metal` unit test in `lang/cpp.rs`).
+
+### CUDA fixture
+
+A sixth golden fixture, `reference/golden/cuda/`, guards CUDA support (the
+CUDA-language parts of upstream #1172 / `e1a8d88`). CUDA ≈ C++ + dialect tokens
+and likewise rides `tree-sitter-cpp` — `.cu`/`.cuh` map to `Language::Cpp` with
+**no new `Language` variant**. It guards the CUDA pre-parse blank (execution-space
+specifiers + `<<<grid, block>>>` launch configs, offset-preserving and
+brace-balance-checked) and macro-defined-kernel name recovery. The corpus
+(`crates/codegraph-bench/fixtures/cuda/kernel.cu`) defines a `__global__ void
+add_kernel`, a templated `__global__ scale_kernel`, a
+`DEFINE_FLASH_FORWARD_KERNEL(my_kernel, …)` macro-defined kernel, and a `launch`
+host function with a plain launch and a templated launch. The golden must show:
+
+- `kernel.cu` with `"language": "cpp"`;
+- `add_kernel`, `scale_kernel`, `my_kernel`, `launch` as functions — the
+  macro kernel under its real name `my_kernel`, NOT `DEFINE_FLASH_FORWARD_KERNEL`;
+- host→kernel `Calls` edges `launch` → `add_kernel` and `launch` → `scale_kernel`
+  (the `<<<…>>>` blank restores the call; the templated launch rides the
+  already-landed template-argument strip).
+
+The CUDA blank fires for `.cu`/`.cuh` files OR any C/C++-family file whose content
+carries a strong CUDA marker (`__global__`/`__device__`/`__constant__`/
+`cudaStream_t`), so CUDA living in `.h`/`.hpp` headers is recognized.
+
+Regenerate both new fixtures reproducibly (identical recipe to the C++ fixture,
+substituting `metal`/`cuda`):
+
+```bash
+rm -rf /tmp/cg-fixture-metal && cp -r crates/codegraph-bench/fixtures/metal /tmp/cg-fixture-metal
+cargo build --release -p codegraph-rs
+CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-metal
+cp /tmp/cg-fixture-metal/.codegraph/codegraph.db reference/golden/metal/colby.db
+cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/metal/colby.db reference/golden/metal
+# …and the same for cuda.
+```
+
+The `generated_golden_matches_committed_{metal,cuda}_fixture` and
+`{metal,cuda}_db_is_self_equivalent_to_{metal,cuda}_golden` tests in
+`crates/codegraph-bench/tests/equivalence.rs` enforce byte-stability.
+
 ### KNOWN_DIFFS.md format
 
 Tier-3 differences are allowlisted by grep-able lines in repo-root

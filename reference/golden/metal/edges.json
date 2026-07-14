@@ -1,0 +1,59 @@
+[
+  {
+    "col": 11,
+    "kind": "calls",
+    "line": 23,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:06d476406c9dac14172f0784bdcf3614",
+    "target": "function:0dd9c7c67cf2c6ae7a23bbbd5b2e5078"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:shader.metal",
+    "target": "function:06d476406c9dac14172f0784bdcf3614"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:shader.metal",
+    "target": "function:0dd9c7c67cf2c6ae7a23bbbd5b2e5078"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:shader.metal",
+    "target": "struct:71307e3c8493876bbef9b6575c1dabc4"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:shader.metal",
+    "target": "struct:ce73931d0e937bddde9dd6094c56cfad"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:shader.metal",
+    "target": "struct:ea772be38f713c9777b2e8c23ddf6638"
+  }
+]

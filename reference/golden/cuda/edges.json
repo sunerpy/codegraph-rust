@@ -1,0 +1,62 @@
+[
+  {
+    "col": 4,
+    "kind": "calls",
+    "line": 16,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:8fcfc4f43bf1b07028d15edababdbdf7",
+    "target": "function:290ca38de34bc728b62b2c22dce9be77"
+  },
+  {
+    "col": 4,
+    "kind": "calls",
+    "line": 17,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:8fcfc4f43bf1b07028d15edababdbdf7",
+    "target": "function:d566ed55561eb4c96162668d7f78d9fb"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:kernel.cu",
+    "target": "function:290ca38de34bc728b62b2c22dce9be77"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:kernel.cu",
+    "target": "function:8ad1cefc2328c8b073c2e06a7d984a1d"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:kernel.cu",
+    "target": "function:8fcfc4f43bf1b07028d15edababdbdf7"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:kernel.cu",
+    "target": "function:d566ed55561eb4c96162668d7f78d9fb"
+  }
+]

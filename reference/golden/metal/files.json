@@ -1,0 +1,10 @@
+[
+  {
+    "content_hash": "42a8ea57f43a0da7ea71ed53775560358fbfe499ed6414bb0be9a2cb43eeda30",
+    "errors": null,
+    "language": "cpp",
+    "node_count": 6,
+    "path": "shader.metal",
+    "size": 340
+  }
+]

@@ -57,7 +57,8 @@ pub trait LanguageSpec: Sync {
     fn params_field(&self) -> &'static str;
     fn return_field(&self) -> &'static str;
 
-    fn pre_parse(&self, source: &str) -> String {
+    fn pre_parse(&self, source: &str, file_path: &str) -> String {
+        let _ = file_path;
         source.to_string()
     }
 

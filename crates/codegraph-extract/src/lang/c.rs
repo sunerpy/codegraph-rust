@@ -79,6 +79,13 @@ impl LanguageSpec for CSpec {
     fn extract_import(&self, node: Node<'_>, source: &str) -> Option<ImportInfo> {
         include_import(node, source)
     }
+    fn pre_parse(&self, source: &str, _file_path: &str) -> String {
+        if crate::lang::cpp::looks_like_cuda_source(source) {
+            crate::lang::cpp::blank_cuda_constructs_str(source)
+        } else {
+            source.to_string()
+        }
+    }
 }
 
 pub(crate) fn include_import(node: Node<'_>, source: &str) -> Option<ImportInfo> {
@@ -176,4 +183,22 @@ fn valid_ident(text: &str) -> bool {
         .next()
         .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
         && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn c_header_cuda_content_blanked() {
+        let out = CSpec.pre_parse("__device__ int helper() { return 0; }", "h.h");
+        assert!(!out.contains("__device__"));
+        assert_eq!(out.len(), "__device__ int helper() { return 0; }".len());
+    }
+
+    #[test]
+    fn c_plain_untouched() {
+        let src = "int add(int a, int b) { return a + b; }";
+        assert_eq!(CSpec.pre_parse(src, "m.c"), src);
+    }
 }

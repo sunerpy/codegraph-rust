@@ -80,6 +80,43 @@ fn cpp_db_is_self_equivalent_to_cpp_golden() {
 }
 
 #[test]
+fn generated_golden_matches_committed_metal_fixture() {
+    // Guards Metal (#1121): `.metal`→cpp mapping + the `[[attribute]]` blank that
+    // prevents the spurious `VertexIn extends float4` inheritance edge.
+    let tempdir = TestDir::new("generated-golden-metal");
+    write_golden(&metal_db(), tempdir.path()).unwrap();
+
+    let expected = load_golden(&metal_golden_dir()).unwrap();
+    let actual = load_golden(tempdir.path()).unwrap();
+
+    diff_canonical(&expected, &actual, None).unwrap();
+}
+
+#[test]
+fn metal_db_is_self_equivalent_to_metal_golden() {
+    assert_equivalent(&metal_db(), &metal_golden_dir()).unwrap();
+}
+
+#[test]
+fn generated_golden_matches_committed_cuda_fixture() {
+    // Guards CUDA (#1172 CUDA-lang parts): `.cu`→cpp mapping, the `<<<…>>>`
+    // launch-config blank that preserves the host→kernel Calls edge (plain +
+    // templated), and macro-defined-kernel name recovery (`my_kernel`).
+    let tempdir = TestDir::new("generated-golden-cuda");
+    write_golden(&cuda_db(), tempdir.path()).unwrap();
+
+    let expected = load_golden(&cuda_golden_dir()).unwrap();
+    let actual = load_golden(tempdir.path()).unwrap();
+
+    diff_canonical(&expected, &actual, None).unwrap();
+}
+
+#[test]
+fn cuda_db_is_self_equivalent_to_cuda_golden() {
+    assert_equivalent(&cuda_db(), &cuda_golden_dir()).unwrap();
+}
+
+#[test]
 fn tier1_node_drift_is_reported() {
     let expected = load_golden(&mini_golden_dir()).unwrap();
     let mut actual = expected.clone();
@@ -155,6 +192,22 @@ fn cpp_db() -> PathBuf {
 
 fn cpp_golden_dir() -> PathBuf {
     workspace_root().join("reference/golden/cpp")
+}
+
+fn metal_db() -> PathBuf {
+    workspace_root().join("reference/golden/metal/colby.db")
+}
+
+fn metal_golden_dir() -> PathBuf {
+    workspace_root().join("reference/golden/metal")
+}
+
+fn cuda_db() -> PathBuf {
+    workspace_root().join("reference/golden/cuda/colby.db")
+}
+
+fn cuda_golden_dir() -> PathBuf {
+    workspace_root().join("reference/golden/cuda")
 }
 
 struct TestDir {
