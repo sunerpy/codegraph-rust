@@ -123,6 +123,7 @@ fn resolve_fixture(test_name: &str, root: &Path, relative_files: &[&str]) -> Vec
             Some("py") => Language::Python,
             Some("java") => Language::Java,
             Some("cpp") => Language::Cpp,
+            Some("php") => Language::Php,
             other => panic!("unexpected fixture extension {other:?}"),
         };
         store
@@ -584,5 +585,85 @@ fn conformance_pass_resolves_chained_call_via_supertype() {
             * 1000.0)
             .round() as i64,
         850
+    );
+}
+
+#[test]
+fn php_this_prop_typed_property_resolves_in_pass_one() {
+    // #1220: `$this->dep->handle()` with a typed property `private Foo $dep;`
+    // resolves to Foo::handle in pass 1 (the property's own type, no supertype
+    // walk needed) at 0.9 instance-method.
+    let dir = fresh_fixture_dir("php-thisprop-typed");
+    std::fs::write(
+        dir.join("src/Foo.php"),
+        "<?php\nclass Foo {\n    function handle() {}\n}\n",
+    )
+    .expect("write Foo.php");
+    std::fs::write(
+        dir.join("src/Svc.php"),
+        "<?php\nclass Svc {\n    private Foo $dep;\n    function run() {\n        $this->dep->handle();\n    }\n}\n",
+    )
+    .expect("write Svc.php");
+
+    let resolved = resolve_fixture("php-thisprop-typed", &dir, &["src/Foo.php", "src/Svc.php"]);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let handle_call = resolved.iter().find(|e| {
+        e.kind == codegraph_core::types::EdgeKind::Calls
+            && e.target.starts_with("method:")
+            && e.metadata.as_ref().and_then(|m| m["resolvedBy"].as_str()) == Some("instance-method")
+    });
+    assert!(
+        handle_call.is_some(),
+        "expected run→Foo::handle instance-method edge, got: {resolved:#?}"
+    );
+    assert_eq!(
+        (handle_call.unwrap().metadata.as_ref().expect("metadata")["confidence"]
+            .as_f64()
+            .expect("confidence")
+            * 1000.0)
+            .round() as i64,
+        900
+    );
+}
+
+#[test]
+fn php_this_prop_interface_typed_resolves_via_conformance() {
+    // #1220: `$this->dep->handle()` where `$dep` is typed to an interface and
+    // `handle()` lives on that interface. The method is not on any concrete class
+    // reachable in pass 1 — it resolves ONLY after the conformance pass walks the
+    // property's declared type to its supertype (the interface).
+    let dir = fresh_fixture_dir("php-thisprop-iface");
+    std::fs::write(
+        dir.join("src/Handler.php"),
+        "<?php\ninterface Handler {\n    function handle();\n}\n",
+    )
+    .expect("write Handler.php");
+    std::fs::write(
+        dir.join("src/Impl.php"),
+        "<?php\nclass Impl implements Handler {\n    function handle() {}\n}\n",
+    )
+    .expect("write Impl.php");
+    std::fs::write(
+        dir.join("src/Svc.php"),
+        "<?php\nclass Svc {\n    private Handler $dep;\n    function run() {\n        $this->dep->handle();\n    }\n}\n",
+    )
+    .expect("write Svc.php");
+
+    let resolved = resolve_fixture(
+        "php-thisprop-iface",
+        &dir,
+        &["src/Handler.php", "src/Impl.php", "src/Svc.php"],
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let handle_call = resolved.iter().find(|e| {
+        e.kind == codegraph_core::types::EdgeKind::Calls
+            && e.target.starts_with("method:")
+            && e.metadata.as_ref().and_then(|m| m["resolvedBy"].as_str()) == Some("instance-method")
+    });
+    assert!(
+        handle_call.is_some(),
+        "expected run→Handler::handle conformance edge, got: {resolved:#?}"
     );
 }

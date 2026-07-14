@@ -902,6 +902,174 @@ fn infer_local_receiver_type(
     None
 }
 
+/// The PHP `$this->prop->method()` receiver shape — encoded by the extractor as
+/// `this->prop.method` (a SINGLE property segment, no `()`). Matches the upstream
+/// `PHP_PROP_SHAPE = /^this->\w+\.\w+$/` (`index.ts:47`). Deeper chains
+/// (`this->a->b.method`) and non-`this` receivers do NOT match, so they stay
+/// unlinked exactly as before.
+pub(crate) fn is_php_property_receiver_shape(name: &str) -> bool {
+    static SHAPE: OnceLock<Regex> = OnceLock::new();
+    SHAPE
+        .get_or_init(|| Regex::new(r"^this->\w+\.\w+$").expect("php prop shape re"))
+        .is_match(name)
+}
+
+/// Capture form of the PHP property receiver shape: `^(this->\w+)\.(\w+)$` —
+/// group 1 the `this->prop` receiver, group 2 the method (`phpThisPropMatch`,
+/// `name-matcher.ts:1477`).
+fn php_this_prop_call_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^(this->\w+)\.(\w+)$").expect("php this-prop call re"))
+}
+
+/// Patterns that recover a PHP class property's declared type for a `$this->prop`
+/// receiver (`phpPropertyTypePatterns`, `name-matcher.ts:1367-1384`). Deliberately
+/// NOT `local_receiver_type_patterns`: only PROPERTY-shaped declarations qualify —
+/// a modifier-prefixed typed declaration (covering both a typed property
+/// `private ?Foo $prop;` and a promoted constructor parameter
+/// `private readonly Foo $prop`), and the pseudoconstructor assignment
+/// `$this->prop = new Foo(...)`. A bare `X $prop` parameter or `$prop = new X()`
+/// local elsewhere in the file must NOT match — those variables can never alias
+/// `$this->prop`. Union-typed properties (`Foo|Bar $prop`) yield no match and thus
+/// no edge (silent beats wrong). The classic untyped-property-assigned-in-constructor
+/// shape is handled by `infer_php_assigned_property_type` instead. `escaped_prop`
+/// is already regex-escaped; the type is captured in group 1.
+fn php_property_type_patterns(escaped_prop: &str) -> Vec<Regex> {
+    let build = |src: String| Regex::new(&src).ok();
+    [
+        // private readonly ?Foo $prop  (typed property / promoted ctor param)
+        format!(
+            r"\b(?:(?:private|protected|public|readonly|static|final)(?:\(set\))?\s+)+\??([A-Za-z_\\][\w\\]*)\s+&?\${escaped_prop}\b"
+        ),
+        // $this->prop = new Foo()
+        format!(r"\$this->{escaped_prop}\b\s*=\s*new\s+([A-Za-z_\\][\w\\]*)"),
+    ]
+    .into_iter()
+    .filter_map(build)
+    .collect()
+}
+
+/// Second-chance typing for a PHP `$this->prop` receiver whose property
+/// declaration carries no static type (classic pre-7.4 style): find the
+/// `$this->prop = $var` assignment, then recover `$var`'s type from its own
+/// declaration WITHIN the assignment's function — the constructor's (possibly
+/// multi-line) parameter list, a typed setter's parameter, or a `= new X()`
+/// local. The backward scan stops at the enclosing `function` line (checked for a
+/// match first — a single-line `__construct(Foo $var) { ... }` carries the typed
+/// parameter itself), so a same-named variable in another method can never type
+/// the property. Ports `inferPhpAssignedPropertyType` (`name-matcher.ts:1396-1445`).
+fn infer_php_assigned_property_type(
+    escaped_prop: &str,
+    lines: &[&str],
+    call_idx: usize,
+) -> Option<String> {
+    let assign_re = Regex::new(&format!(r"\$this->{escaped_prop}\b\s*=\s*\$(\w+)\b")).ok()?;
+    let assign_at = |i: usize| -> Option<String> {
+        let line = lines.get(i)?;
+        if line.len() > 10_000 {
+            return None;
+        }
+        assign_re
+            .captures(line)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string())
+    };
+
+    // The assignment is position-independent relative to the call — nearest-
+    // backward first, then sweep forward, same order as the componentScoped scan.
+    let mut assign_idx: Option<usize> = None;
+    let mut var_name: Option<String> = None;
+    for i in (0..=call_idx.min(lines.len().saturating_sub(1))).rev() {
+        if let Some(v) = assign_at(i) {
+            assign_idx = Some(i);
+            var_name = Some(v);
+            break;
+        }
+    }
+    if var_name.is_none() {
+        for i in (call_idx + 1)..lines.len() {
+            if let Some(v) = assign_at(i) {
+                assign_idx = Some(i);
+                var_name = Some(v);
+                break;
+            }
+        }
+    }
+    let (assign_idx, var_name) = (assign_idx?, var_name?);
+
+    let var_patterns = local_receiver_type_patterns(Language::Php, &regex_escape(&var_name));
+    static FUNCTION_RE: OnceLock<Regex> = OnceLock::new();
+    let function_re =
+        FUNCTION_RE.get_or_init(|| Regex::new(r"\bfunction\b").expect("php function re"));
+    for i in (0..=assign_idx).rev() {
+        let line = lines[i];
+        if line.len() <= 10_000 {
+            for re in &var_patterns {
+                if let Some(caps) = re.captures(line) {
+                    if let Some(m) = caps.get(1) {
+                        if let Some(ty) = normalize_inferred_type_name(m.as_str()) {
+                            return Some(ty);
+                        }
+                    }
+                }
+            }
+        }
+        if function_re.is_match(line) {
+            break;
+        }
+    }
+    None
+}
+
+/// Infer a PHP `$this->prop` receiver's DECLARED type from PROPERTY-shaped
+/// declarations only (the PHP `$this->prop` branch of `inferLocalReceiverType`,
+/// `name-matcher.ts:1283-1359`). `receiver_with_prefix` is the raw `this->prop`
+/// receiver; the `this->` prefix is stripped, and the scan widens to the WHOLE
+/// FILE (the property/ctor declaration lives outside the calling method), unlike
+/// the scope-bounded `infer_local_receiver_type`. Only `php_property_type_patterns`
+/// are consulted (a same-named local/param can never mistype the property); when
+/// no property-shaped declaration matches, the classic-ctor assignment
+/// second-chance (`infer_php_assigned_property_type`) runs. Returns `None` when
+/// the type can't be recovered → the caller produces NO edge (never guessed).
+fn infer_php_property_receiver_type(
+    receiver_with_prefix: &str,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<String> {
+    let prop = receiver_with_prefix.strip_prefix("this->")?;
+    let escaped = regex_escape(prop);
+    let patterns = php_property_type_patterns(&escaped);
+    let source = context.read_file(&reference.file_path)?;
+    let lines: Vec<&str> = source
+        .split('\n')
+        .map(|l| l.trim_end_matches('\r'))
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let call_idx = ((reference.line - 1).max(0) as usize).min(lines.len() - 1);
+
+    for line in &lines {
+        // A generated/minified line is not where a human declaration lives, and
+        // regexing multi-KB text per ref is pure waste — skip it.
+        if line.len() > 10_000 {
+            continue;
+        }
+        for re in &patterns {
+            if let Some(caps) = re.captures(line) {
+                if let Some(m) = caps.get(1) {
+                    if let Some(ty) = normalize_inferred_type_name(m.as_str()) {
+                        return Some(ty);
+                    }
+                }
+            }
+        }
+    }
+
+    // Classic pre-7.4 untyped-property-assigned-in-constructor second chance.
+    infer_php_assigned_property_type(&escaped, &lines, call_idx)
+}
+
 /// Try to resolve by method name on a class/object (`matchMethodCall`,
 /// `name-matcher.ts:930-1133`).
 ///
@@ -917,6 +1085,31 @@ pub fn match_method_call(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> Option<ResolvedRef> {
+    // PHP property receiver: `$this->prop->method()` reaches the resolver as
+    // `this->prop.method` (extractor records the receiver's raw text, leading `$`
+    // stripped). Resolve it EXCLUSIVELY through declared-type inference +
+    // resolve_method_on_type — the name-similarity strategies below must NEVER see
+    // this shape, so a property whose type can't be recovered stays unlinked
+    // rather than guessed. Returns unconditionally (`Some` or `None`), mirroring
+    // the upstream `phpThisPropMatch` early return (name-matcher.ts:1475-1500).
+    if reference.language == Language::Php {
+        if let Some(caps) = php_this_prop_call_re().captures(&reference.reference_name) {
+            let receiver = caps.get(1)?.as_str();
+            let php_method = caps.get(2)?.as_str();
+            let inferred = infer_php_property_receiver_type(receiver, reference, context)?;
+            return resolve_method_on_type(
+                &inferred,
+                php_method,
+                reference,
+                context,
+                0.9,
+                ResolvedBy::InstanceMethod,
+                imported_fqn_of(&inferred, reference, context).as_deref(),
+                0,
+            );
+        }
+    }
+
     let parsed = parse_method_call(&reference.reference_name, reference.language)?;
     let (object_or_class, method_name) = parsed;
 
@@ -4851,6 +5044,295 @@ mod tests {
         let r = refv("lg.log", EdgeKind::Calls, "src/a.php", Language::Php, 3);
         let res = match_method_call(&r, &ctx).expect("php new inference");
         assert_eq!(res.target_node_id, "method:log");
+    }
+
+    // ============ #1220 PHP `$this->prop->method()` property resolution ========
+
+    fn php_prop_method(qname: &str) -> Node {
+        mk(
+            "method:handle",
+            NodeKind::Method,
+            "handle",
+            qname,
+            "src/svc.php",
+            Language::Php,
+        )
+    }
+
+    fn php_prop_ctx(source: &str, method: Node) -> Ctx {
+        Ctx::default()
+            .file("src/svc.php", source)
+            .name("handle", vec![method])
+    }
+
+    #[test]
+    fn php_property_receiver_shape_matches() {
+        assert!(is_php_property_receiver_shape("this->dep.method"));
+        assert!(!is_php_property_receiver_shape("this->a->b.method"));
+        assert!(!is_php_property_receiver_shape("dep.method"));
+        assert!(!is_php_property_receiver_shape("this->dep"));
+        assert!(!is_php_property_receiver_shape("Foo::bar"));
+    }
+
+    #[test]
+    fn infer_php_property_typed() {
+        let src = "<?php\nclass C {\n    private Foo $dep;\n    function run() {\n        $this->dep->handle();\n    }\n}\n";
+        let ctx = Ctx::default().file("src/svc.php", src);
+        let r = refv(
+            "this->dep.handle",
+            EdgeKind::Calls,
+            "src/svc.php",
+            Language::Php,
+            5,
+        );
+        assert_eq!(
+            infer_php_property_receiver_type("this->dep", &r, &ctx),
+            Some("Foo".to_string())
+        );
+    }
+
+    #[test]
+    fn infer_php_property_promoted_ctor() {
+        let src = "<?php\nclass C {\n    function __construct(private Foo $dep) {}\n    function run() {\n        $this->dep->handle();\n    }\n}\n";
+        let ctx = Ctx::default().file("src/svc.php", src);
+        let r = refv(
+            "this->dep.handle",
+            EdgeKind::Calls,
+            "src/svc.php",
+            Language::Php,
+            5,
+        );
+        assert_eq!(
+            infer_php_property_receiver_type("this->dep", &r, &ctx),
+            Some("Foo".to_string())
+        );
+    }
+
+    #[test]
+    fn infer_php_property_pseudoctor_new() {
+        let src = "<?php\nclass C {\n    function __construct() {\n        $this->dep = new Foo();\n    }\n    function run() {\n        $this->dep->handle();\n    }\n}\n";
+        let ctx = Ctx::default().file("src/svc.php", src);
+        let r = refv(
+            "this->dep.handle",
+            EdgeKind::Calls,
+            "src/svc.php",
+            Language::Php,
+            7,
+        );
+        assert_eq!(
+            infer_php_property_receiver_type("this->dep", &r, &ctx),
+            Some("Foo".to_string())
+        );
+    }
+
+    #[test]
+    fn infer_php_property_union_untypable() {
+        let src = "<?php\nclass C {\n    private Foo|Bar $dep;\n    function run() {\n        $this->dep->handle();\n    }\n}\n";
+        let ctx = Ctx::default().file("src/svc.php", src);
+        let r = refv(
+            "this->dep.handle",
+            EdgeKind::Calls,
+            "src/svc.php",
+            Language::Php,
+            5,
+        );
+        assert_eq!(
+            infer_php_property_receiver_type("this->dep", &r, &ctx),
+            None
+        );
+    }
+
+    #[test]
+    fn infer_php_assigned_property_classic_ctor() {
+        let src = "<?php\nclass C {\n    private $dep;\n    function __construct(Foo $dep) {\n        $this->dep = $dep;\n    }\n    function run() {\n        $this->dep->handle();\n    }\n}\n";
+        let ctx = Ctx::default().file("src/svc.php", src);
+        let r = refv(
+            "this->dep.handle",
+            EdgeKind::Calls,
+            "src/svc.php",
+            Language::Php,
+            8,
+        );
+        assert_eq!(
+            infer_php_property_receiver_type("this->dep", &r, &ctx),
+            Some("Foo".to_string())
+        );
+    }
+
+    #[test]
+    fn php_this_prop_typed_property_resolves() {
+        let src = "<?php\nclass Svc {\n    private Foo $dep;\n    function run() {\n        $this->dep->handle();\n    }\n}\n";
+        let ctx = php_prop_ctx(src, php_prop_method("Foo::handle"));
+        let r = refv(
+            "this->dep.handle",
+            EdgeKind::Calls,
+            "src/svc.php",
+            Language::Php,
+            5,
+        );
+        let res = match_method_call(&r, &ctx).expect("php typed property resolves");
+        assert_eq!(res.target_node_id, "method:handle");
+        assert_eq!(res.resolved_by, ResolvedBy::InstanceMethod);
+        assert!((res.confidence - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn php_this_prop_promoted_ctor_resolves() {
+        let src = "<?php\nclass Svc {\n    function __construct(private Foo $dep) {}\n    function run() {\n        $this->dep->handle();\n    }\n}\n";
+        let ctx = php_prop_ctx(src, php_prop_method("Foo::handle"));
+        let r = refv(
+            "this->dep.handle",
+            EdgeKind::Calls,
+            "src/svc.php",
+            Language::Php,
+            5,
+        );
+        let res = match_method_call(&r, &ctx).expect("php promoted ctor resolves");
+        assert_eq!(res.target_node_id, "method:handle");
+    }
+
+    #[test]
+    fn php_this_prop_classic_ctor_assignment_resolves() {
+        let src = "<?php\nclass Svc {\n    private $dep;\n    function __construct(\n        Foo $dep\n    ) {\n        $this->dep = $dep;\n    }\n    function run() {\n        $this->dep->handle();\n    }\n}\n";
+        let ctx = php_prop_ctx(src, php_prop_method("Foo::handle"));
+        let r = refv(
+            "this->dep.handle",
+            EdgeKind::Calls,
+            "src/svc.php",
+            Language::Php,
+            10,
+        );
+        let res = match_method_call(&r, &ctx).expect("php classic ctor assignment resolves");
+        assert_eq!(res.target_node_id, "method:handle");
+    }
+
+    #[test]
+    fn php_this_prop_typed_setter_injection_resolves() {
+        let src = "<?php\nclass Svc {\n    private $dep;\n    function setDep(Foo $dep) {\n        $this->dep = $dep;\n    }\n    function run() {\n        $this->dep->handle();\n    }\n}\n";
+        let ctx = php_prop_ctx(src, php_prop_method("Foo::handle"));
+        let r = refv(
+            "this->dep.handle",
+            EdgeKind::Calls,
+            "src/svc.php",
+            Language::Php,
+            8,
+        );
+        let res = match_method_call(&r, &ctx).expect("php typed setter injection resolves");
+        assert_eq!(res.target_node_id, "method:handle");
+    }
+
+    #[test]
+    fn php_this_prop_interface_typed_resolves_via_supertype() {
+        let src = "<?php\nclass Svc {\n    private LoggerInterface $dep;\n    function run() {\n        $this->dep->handle();\n    }\n}\n";
+        let method = mk(
+            "method:handle",
+            NodeKind::Method,
+            "handle",
+            "LoggerInterface::handle",
+            "src/iface.php",
+            Language::Php,
+        );
+        let ctx = Ctx::default()
+            .file("src/svc.php", src)
+            .name("handle", vec![method])
+            .supertype("LoggerInterface", Language::Php, vec!["LoggerInterface"]);
+        let r = refv(
+            "this->dep.handle",
+            EdgeKind::Calls,
+            "src/svc.php",
+            Language::Php,
+            5,
+        );
+        let res = match_method_call(&r, &ctx).expect("php interface-typed resolves");
+        assert_eq!(res.target_node_id, "method:handle");
+    }
+
+    #[test]
+    fn php_this_prop_inherited_method_resolves() {
+        let src = "<?php\nclass Svc {\n    private Child $dep;\n    function run() {\n        $this->dep->handle();\n    }\n}\n";
+        let method = mk(
+            "method:handle",
+            NodeKind::Method,
+            "handle",
+            "Parent::handle",
+            "src/parent.php",
+            Language::Php,
+        );
+        let ctx = Ctx::default()
+            .file("src/svc.php", src)
+            .name("handle", vec![method])
+            .supertype("Child", Language::Php, vec!["Parent"]);
+        let r = refv(
+            "this->dep.handle",
+            EdgeKind::Calls,
+            "src/svc.php",
+            Language::Php,
+            5,
+        );
+        let res = match_method_call(&r, &ctx).expect("php inherited method resolves");
+        assert_eq!(res.target_node_id, "method:handle");
+    }
+
+    #[test]
+    fn php_this_prop_same_named_local_does_not_mistype() {
+        let src = "<?php\nclass Svc {\n    private Foo $dep;\n    function other() {\n        $dep = new Wrong();\n        $dep->handle();\n    }\n    function run() {\n        $this->dep->handle();\n    }\n}\n";
+        let foo = mk(
+            "method:foo_handle",
+            NodeKind::Method,
+            "handle",
+            "Foo::handle",
+            "src/svc.php",
+            Language::Php,
+        );
+        let wrong = mk(
+            "method:wrong_handle",
+            NodeKind::Method,
+            "handle",
+            "Wrong::handle",
+            "src/svc.php",
+            Language::Php,
+        );
+        let ctx = Ctx::default()
+            .file("src/svc.php", src)
+            .name("handle", vec![foo, wrong]);
+        let r = refv(
+            "this->dep.handle",
+            EdgeKind::Calls,
+            "src/svc.php",
+            Language::Php,
+            9,
+        );
+        let res = match_method_call(&r, &ctx).expect("php property typed, not the local");
+        assert_eq!(res.target_node_id, "method:foo_handle");
+    }
+
+    #[test]
+    fn php_this_prop_untypable_stays_unlinked() {
+        let src =
+            "<?php\nclass Svc {\n    function run() {\n        $this->dep->handle();\n    }\n}\n";
+        let ctx = php_prop_ctx(src, php_prop_method("Foo::handle"));
+        let r = refv(
+            "this->dep.handle",
+            EdgeKind::Calls,
+            "src/svc.php",
+            Language::Php,
+            4,
+        );
+        assert!(match_method_call(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn php_this_prop_deep_chain_stays_unlinked() {
+        let src = "<?php\nclass Svc {\n    private Foo $a;\n    function run() {\n        $this->a->b->handle();\n    }\n}\n";
+        let ctx = php_prop_ctx(src, php_prop_method("Foo::handle"));
+        let r = refv(
+            "this->a->b.handle",
+            EdgeKind::Calls,
+            "src/svc.php",
+            Language::Php,
+            5,
+        );
+        assert!(match_method_call(&r, &ctx).is_none());
     }
 
     #[test]
