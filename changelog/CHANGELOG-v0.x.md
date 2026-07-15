@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.37.0](https://github.com/sunerpy/codegraph-rust/compare/v0.36.0...v0.37.0) (2026-07-15)
+
+
+### Features
+
+* **extraction:** index Terraform/HCL (.tf/.tfvars/.tofu) at the extraction tier ([#155](https://github.com/sunerpy/codegraph-rust/issues/155)) ([456b316](https://github.com/sunerpy/codegraph-rust/commit/456b3167c731b2cd5d640bf8722b6230baffa365))
+
 ## [0.36.0](https://github.com/sunerpy/codegraph-rust/compare/v0.35.0...v0.36.0) (2026-07-14)
 
 
