@@ -230,7 +230,149 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             Language::Cpp => self.visit_cpp_node(node),
             Language::Solidity => self.visit_solidity_node(node),
             Language::Nix => self.visit_nix_node(node),
+            Language::Terraform => self.visit_terraform_node(node),
             _ => false,
+        }
+    }
+
+    /// Terraform/HCL extraction (upstream `terraformExtractor.visitNode`,
+    /// `terraform.ts`, #1173 — the extraction slice only). HCL's AST has no
+    /// C-family type-set node kinds — EVERY top-level construct is a `block`
+    /// distinguished only by its first `identifier` child — so `TERRAFORM_SPEC`
+    /// returns `&[]` for every type-set and this custom visitor (like
+    /// `visit_nix_node`) is the SOLE owner of the `block` kind. Every other kind
+    /// returns `false` → generic `visit_named_children` descent (so
+    /// `config_file`/`body` are walked into automatically, reaching each
+    /// `block`). Strictly `Language::Terraform`-guarded.
+    ///
+    /// Block-type dispatch: `resource`/`data` → Class, `module` → Module,
+    /// `variable`/`output` → Variable, `provider` → Namespace, `locals` →
+    /// Constant per attribute; body attribute-expression traversal refs
+    /// (`var.X`/`local.X`/`module.M`/`data.T.N`/`<type>.<name>`) →
+    /// `EdgeKind::References` with built-ins skipped. The `emitModuleWiring`
+    /// `:`-scoped refs and the `.tfvars` var ref are DEFERRED (they feed the
+    /// deferred `TerraformResolver`).
+    fn visit_terraform_node(&mut self, node: SyntaxNode<'tree>) -> bool {
+        if node.kind() != "block" {
+            // .tfvars top-level-assignment `var.X` ref DEFERRED — no special
+            // case; let the generic walker descend.
+            return false;
+        }
+
+        let Some((block_type, labels)) =
+            crate::lang::read_terraform_block_header(node, self.source)
+        else {
+            return false;
+        };
+        let body = crate::lang::terraform_block_body(node);
+
+        // locals: every body attribute becomes its own Constant.
+        if block_type == "locals" && labels.is_empty() {
+            self.visit_terraform_locals(body);
+            return true;
+        }
+
+        // terraform { ... } settings block — no symbols, no refs.
+        if block_type == "terraform" && labels.is_empty() {
+            return true;
+        }
+
+        // resource / data / module / variable / output / provider.
+        let Some(decl) = crate::lang::describe_terraform_block(&block_type, &labels) else {
+            // Unknown top-level block — generic descent.
+            return false;
+        };
+        let crate::lang::TerraformBlockDecl {
+            kind,
+            name,
+            qualified_name,
+            signature,
+        } = decl;
+        let is_exported = kind == NodeKind::Variable;
+        if let Some(created) = self.create_node(
+            kind,
+            &name,
+            node,
+            NodeExtra {
+                signature: Some(signature),
+                is_exported,
+                qualified_name: Some(qualified_name),
+                ..NodeExtra::default()
+            },
+        ) {
+            self.node_stack.push(created.id);
+            if let Some(body) = body {
+                self.emit_terraform_references_in_body(body);
+            }
+            // emitModuleWiring for `module` blocks DEFERRED.
+            self.node_stack.pop();
+        }
+        true
+    }
+
+    /// `locals { k = … }` → one `NodeKind::Constant` per body `attribute`
+    /// (qualified `local.<k>`), plus traversal refs inside each attr's
+    /// `expression`. Ports `emitLocals` (terraform.ts:437-524).
+    fn visit_terraform_locals(&mut self, body: Option<SyntaxNode<'tree>>) {
+        let Some(body) = body else {
+            return;
+        };
+        for attr in body.named_children(&mut body.walk()) {
+            if attr.kind() != "attribute" {
+                continue;
+            }
+            let Some(id_node) = attr
+                .named_children(&mut attr.walk())
+                .find(|c| c.kind() == "identifier")
+            else {
+                continue;
+            };
+            let name = node_text(id_node, self.source);
+            if let Some(created) = self.create_node(
+                NodeKind::Constant,
+                &name,
+                attr,
+                NodeExtra {
+                    signature: Some(format!("local.{name}")),
+                    qualified_name: Some(format!("local.{name}")),
+                    ..NodeExtra::default()
+                },
+            ) {
+                if let Some(expr) = attr
+                    .named_children(&mut attr.walk())
+                    .find(|c| c.kind() == "expression")
+                {
+                    let refs = crate::lang::collect_terraform_references(expr, self.source);
+                    for (qname, _line, _col) in refs {
+                        self.push_ref(&created.id, &qname, EdgeKind::References, expr);
+                    }
+                }
+            }
+        }
+    }
+
+    /// BFS the block body; when a node's kind is `expression`, run
+    /// `collect_terraform_references` and push each ref from the current owner,
+    /// then DON'T descend into that expression (the collector already walked
+    /// it). Ports `emitReferencesInBody` (terraform.ts:526-550).
+    fn emit_terraform_references_in_body(&mut self, body: SyntaxNode<'tree>) {
+        let Some(from_id) = self.node_stack.last().cloned() else {
+            return;
+        };
+        let mut queue: std::collections::VecDeque<SyntaxNode<'tree>> =
+            std::collections::VecDeque::new();
+        queue.push_back(body);
+        while let Some(node) = queue.pop_front() {
+            if node.kind() == "expression" {
+                let refs = crate::lang::collect_terraform_references(node, self.source);
+                for (qname, _line, _col) in refs {
+                    self.push_ref(&from_id, &qname, EdgeKind::References, node);
+                }
+                continue;
+            }
+            for child in node.named_children(&mut node.walk()) {
+                queue.push_back(child);
+            }
         }
     }
 
@@ -5791,5 +5933,117 @@ public:
         let (nodes, _refs) = run("m.nix", "{ inherit lib pkgs; }", Language::Nix);
         assert!(has_node(&nodes, NodeKind::Variable, "lib"));
         assert!(has_node(&nodes, NodeKind::Variable, "pkgs"));
+    }
+
+    // ---- Terraform / HCL (hook-driven; block-type dispatch) ----
+
+    #[test]
+    fn terraform_resource_is_class_qualified() {
+        let (nodes, _refs) = run(
+            "main.tf",
+            "resource \"aws_s3_bucket\" \"b\" {}",
+            Language::Terraform,
+        );
+        let n = node(&nodes, NodeKind::Class, "aws_s3_bucket.b");
+        assert_eq!(n.qualified_name, "aws_s3_bucket.b");
+    }
+
+    #[test]
+    fn terraform_variable_is_variable() {
+        let (nodes, _refs) = run("main.tf", "variable \"region\" {}", Language::Terraform);
+        let n = node(&nodes, NodeKind::Variable, "region");
+        assert_eq!(n.qualified_name, "var.region");
+        assert!(n.is_exported);
+    }
+
+    #[test]
+    fn terraform_output_is_variable_with_ref() {
+        let (nodes, refs) = run(
+            "main.tf",
+            "output \"arn\" { value = aws_s3_bucket.b.arn }",
+            Language::Terraform,
+        );
+        let n = node(&nodes, NodeKind::Variable, "arn");
+        assert_eq!(n.qualified_name, "output.arn");
+        assert!(has_ref(&refs, EdgeKind::References, "aws_s3_bucket.b"));
+    }
+
+    #[test]
+    fn terraform_module_is_module_no_scoped_ref() {
+        let (nodes, refs) = run(
+            "main.tf",
+            "module \"vpc\" { source = \"./vpc\" }",
+            Language::Terraform,
+        );
+        let n = node(&nodes, NodeKind::Module, "vpc");
+        assert_eq!(n.qualified_name, "module.vpc");
+        assert!(
+            !refs.iter().any(|r| r.reference_name.contains(':')),
+            "no :-scoped module wiring ref (emitModuleWiring DEFERRED): {refs:?}"
+        );
+    }
+
+    #[test]
+    fn terraform_provider_is_namespace() {
+        let (nodes, _refs) = run("main.tf", "provider \"aws\" {}", Language::Terraform);
+        let n = node(&nodes, NodeKind::Namespace, "aws");
+        assert_eq!(n.qualified_name, "provider.aws");
+    }
+
+    #[test]
+    fn terraform_locals_emit_constants() {
+        let (nodes, refs) = run(
+            "main.tf",
+            "locals {\n  name   = \"x\"\n  region = var.r\n}",
+            Language::Terraform,
+        );
+        assert_eq!(
+            node(&nodes, NodeKind::Constant, "name").qualified_name,
+            "local.name"
+        );
+        assert_eq!(
+            node(&nodes, NodeKind::Constant, "region").qualified_name,
+            "local.region"
+        );
+        assert!(has_ref(&refs, EdgeKind::References, "var.r"));
+    }
+
+    #[test]
+    fn terraform_body_ref_var() {
+        let (_nodes, refs) = run(
+            "main.tf",
+            "resource \"aws_s3_bucket\" \"b\" { bucket = var.name }",
+            Language::Terraform,
+        );
+        assert!(has_ref(&refs, EdgeKind::References, "var.name"));
+    }
+
+    #[test]
+    fn terraform_module_output_ref_is_plain() {
+        let (_nodes, refs) = run(
+            "main.tf",
+            "output \"vpc_id\" { value = module.vpc.id }",
+            Language::Terraform,
+        );
+        assert!(has_ref(&refs, EdgeKind::References, "module.vpc"));
+        assert!(
+            !refs.iter().any(|r| r.reference_name.contains(':')),
+            "the module.vpc:output.id scoped half is DEFERRED: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn terraform_builtins_skipped() {
+        let (_nodes, refs) = run(
+            "main.tf",
+            "resource \"x\" \"y\" {\n  a = each.key\n  b = count.index\n  c = path.module\n}",
+            Language::Terraform,
+        );
+        assert!(
+            !refs
+                .iter()
+                .any(|r| r.reference_kind == EdgeKind::References),
+            "built-in heads (each/count/path) emit no ref: {refs:?}"
+        );
     }
 }

@@ -432,7 +432,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-bench"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -447,7 +447,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-core"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -463,7 +463,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-daemon"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -483,7 +483,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-extract"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -502,6 +502,7 @@ dependencies = [
  "tree-sitter-dart",
  "tree-sitter-gdscript",
  "tree-sitter-go",
+ "tree-sitter-hcl",
  "tree-sitter-html",
  "tree-sitter-java",
  "tree-sitter-javascript",
@@ -528,7 +529,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-graph"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -542,7 +543,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-mcp"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -565,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-resolve"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -579,7 +580,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-rs"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -615,7 +616,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-store"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -627,7 +628,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-watch"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -3499,6 +3500,16 @@ name = "tree-sitter-go"
 version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8560a4d2f835cc0d4d2c2e03cbd0dde2f6114b43bc491164238d333e28b16ea"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-hcl"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a7b2cc3d7121553b84309fab9d11b3ff3d420403eef9ae50f9fd1cd9d9cf012"
 dependencies = [
  "cc",
  "tree-sitter-language",

@@ -49,7 +49,7 @@ pub const EDGE_KIND_STRINGS: [&str; 12] = [
     "decorates",
 ];
 
-pub const LANGUAGE_STRINGS: [&str; 39] = [
+pub const LANGUAGE_STRINGS: [&str; 40] = [
     "typescript",
     "javascript",
     "tsx",
@@ -80,6 +80,7 @@ pub const LANGUAGE_STRINGS: [&str; 39] = [
     "r",
     "solidity",
     "nix",
+    "terraform",
     "yaml",
     "twig",
     "xml",
@@ -329,6 +330,8 @@ pub enum Language {
     Solidity,
     #[serde(rename = "nix")]
     Nix,
+    #[serde(rename = "terraform")]
+    Terraform,
     #[serde(rename = "yaml")]
     Yaml,
     #[serde(rename = "twig")]
@@ -350,7 +353,7 @@ pub enum Language {
 }
 
 impl Language {
-    pub const ALL: [Self; 39] = [
+    pub const ALL: [Self; 40] = [
         Self::TypeScript,
         Self::JavaScript,
         Self::Tsx,
@@ -381,6 +384,7 @@ impl Language {
         Self::R,
         Self::Solidity,
         Self::Nix,
+        Self::Terraform,
         Self::Yaml,
         Self::Twig,
         Self::Xml,
@@ -424,6 +428,7 @@ impl Language {
             Self::R => "r",
             Self::Solidity => "solidity",
             Self::Nix => "nix",
+            Self::Terraform => "terraform",
             Self::Yaml => "yaml",
             Self::Twig => "twig",
             Self::Xml => "xml",

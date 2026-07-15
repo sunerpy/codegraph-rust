@@ -1,0 +1,143 @@
+[
+  {
+    "col": 10,
+    "kind": "references",
+    "line": 25,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "variable:60a98b4d776ea6b99ec109f16565e238",
+    "target": "class:9ea649776b48847a71f06911daf0119e"
+  },
+  {
+    "col": 10,
+    "kind": "references",
+    "line": 29,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "variable:20d776b47f45d7da835d4d4e82010d17",
+    "target": "module:6387ce4b696974e8905686ae83527943"
+  },
+  {
+    "col": 11,
+    "kind": "references",
+    "line": 21,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "module:6387ce4b696974e8905686ae83527943",
+    "target": "variable:161a5352b21594f9a56b14df3143a6c4"
+  },
+  {
+    "col": 11,
+    "kind": "references",
+    "line": 9,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "constant:60a0bf4de8e88ec795bc637f794b133e",
+    "target": "variable:161a5352b21594f9a56b14df3143a6c4"
+  },
+  {
+    "col": 15,
+    "kind": "references",
+    "line": 15,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "class:9ea649776b48847a71f06911daf0119e",
+    "target": "variable:161a5352b21594f9a56b14df3143a6c4"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:main.tf",
+    "target": "class:4dd4b9246c74373ca3146282f84872bd"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:main.tf",
+    "target": "class:9ea649776b48847a71f06911daf0119e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:main.tf",
+    "target": "constant:30d18d17f1263f980b13bb367101b29e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:main.tf",
+    "target": "constant:60a0bf4de8e88ec795bc637f794b133e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:main.tf",
+    "target": "module:6387ce4b696974e8905686ae83527943"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:main.tf",
+    "target": "namespace:97d1ebc29d6e37a70a7ade3c6e6441c5"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:main.tf",
+    "target": "variable:161a5352b21594f9a56b14df3143a6c4"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:main.tf",
+    "target": "variable:20d776b47f45d7da835d4d4e82010d17"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:main.tf",
+    "target": "variable:60a98b4d776ea6b99ec109f16565e238"
+  }
+]

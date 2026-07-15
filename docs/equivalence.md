@@ -504,6 +504,59 @@ The `generated_golden_matches_committed_nix_fixture` and
 `nix_db_is_self_equivalent_to_nix_golden` tests in
 `crates/codegraph-bench/tests/equivalence.rs` enforce byte-stability.
 
+### Terraform fixture
+
+A tenth golden fixture, `reference/golden/terraform/`, guards Terraform/OpenTofu
+(HCL) extraction (upstream #1173 / `6c24f4b`, the extraction slice only).
+Terraform is a **new `Language::Terraform` variant** backed by a **dedicated
+`tree-sitter-hcl` grammar** (`.tf`/`.tfvars`/`.tofu` → `Language::Terraform`).
+HCL is intentionally generic — every top-level construct is a `block`
+distinguished only by its first `identifier` child — so `TERRAFORM_SPEC` has
+all-empty type-sets and extraction is driven by the `Language::Terraform`-guarded
+`visit_terraform_node` walker extension. The corpus
+(`crates/codegraph-bench/fixtures/terraform/main.tf`) is a single deterministic
+file with a `terraform {}` settings block, a `provider "aws"`, a
+`variable "region"`, a `locals` block, a `data "aws_ami" "ubuntu"`, a
+`resource "aws_s3_bucket" "b"`, a `module "vpc"`, and two `output` blocks. What
+it guards:
+
+- the `.tf` file with `"language": "terraform"`;
+- block-type dispatch: `resource`/`data` → `NodeKind::Class` (qualified `T.N` /
+  `data.T.N`), `module` → `NodeKind::Module` (`module.M`), `variable`/`output` →
+  `NodeKind::Variable` (`var.V` / `output.O`, `is_exported`), `provider` →
+  `NodeKind::Namespace` (`provider.P`), `locals` attributes → `NodeKind::Constant`
+  per attribute (`local.k`);
+- plain attribute-expression traversal refs
+  (`var.X`/`local.X`/`module.M`/`data.T.N`/`<type>.<name>`) → `References`, with
+  built-in heads (`each`/`count`/`self`/`path`/`terraform`) skipped.
+
+The plain traversal refs with a unique same-file target resolve via the existing
+generic qualified-name matcher: `var.region` ×3 → `variable "region"`,
+`aws_s3_bucket.b` → the resource, `module.vpc` → the module (each an EDGE, absent
+from `refs.json`). The undeclared `aws_kms_key.logs` stays the sole unresolved
+`refs.json` row. The module-boundary `TerraformResolver`, `emitModuleWiring`'s
+`:`-scoped refs (`module.M:file`/`:var.X`/`:output.X`), the `.tfvars`
+top-level-assignment `var.X` ref, and the `module.M:output.<out>` scoped half of
+`qualifyReference` are all **DEFERRED** — the port keeps its single
+`GodotResolver` — so no `:`-scoped ref is emitted. Adding the variant is
+byte-neutral for `colby.schema.sql` (language is a stored TEXT value, not DDL)
+and for the nine existing goldens (none holds a `.tf`/`.tfvars`/`.tofu` file).
+
+Regenerate reproducibly (identical recipe to the Nix fixture, substituting
+`terraform`):
+
+```bash
+rm -rf /tmp/cg-fixture-terraform && cp -r crates/codegraph-bench/fixtures/terraform /tmp/cg-fixture-terraform
+cargo build --release -p codegraph-rs
+CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-terraform
+cp /tmp/cg-fixture-terraform/.codegraph/codegraph.db reference/golden/terraform/colby.db
+cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/terraform/colby.db reference/golden/terraform
+```
+
+The `generated_golden_matches_committed_terraform_fixture` and
+`terraform_db_is_self_equivalent_to_terraform_golden` tests in
+`crates/codegraph-bench/tests/equivalence.rs` enforce byte-stability.
+
 ### KNOWN_DIFFS.md format
 
 Tier-3 differences are allowlisted by grep-able lines in repo-root

@@ -1,0 +1,12 @@
+[
+  {
+    "candidates": null,
+    "col": 15,
+    "file_path": "main.tf",
+    "from_node_id": "class:9ea649776b48847a71f06911daf0119e",
+    "language": "terraform",
+    "line": 16,
+    "reference_kind": "references",
+    "reference_name": "aws_kms_key.logs"
+  }
+]
