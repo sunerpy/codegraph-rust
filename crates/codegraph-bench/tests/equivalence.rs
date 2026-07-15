@@ -180,6 +180,31 @@ fn nix_db_is_self_equivalent_to_nix_golden() {
 }
 
 #[test]
+fn generated_golden_matches_committed_terraform_fixture() {
+    // Guards Terraform/HCL extraction (upstream #1173, extraction slice only):
+    // the `.tf`/`.tfvars`/`.tofu`->Terraform mapping, block-type dispatch
+    // (resource/data->Class, module->Module, variable/output->Variable,
+    // provider->Namespace, locals->Constant per attr) with qualified names, and
+    // plain attribute-expression traversal refs
+    // (var.X/local.X/module.M/data.T.N/<type>.<name>)->References with built-ins
+    // skipped. The module-boundary TerraformResolver, emitModuleWiring's
+    // :-scoped refs, and the .tfvars var ref are DEFERRED, so no :-scoped ref is
+    // emitted; the undeclared aws_kms_key.logs stays unresolved.
+    let tempdir = TestDir::new("generated-golden-terraform");
+    write_golden(&terraform_db(), tempdir.path()).unwrap();
+
+    let expected = load_golden(&terraform_golden_dir()).unwrap();
+    let actual = load_golden(tempdir.path()).unwrap();
+
+    diff_canonical(&expected, &actual, None).unwrap();
+}
+
+#[test]
+fn terraform_db_is_self_equivalent_to_terraform_golden() {
+    assert_equivalent(&terraform_db(), &terraform_golden_dir()).unwrap();
+}
+
+#[test]
 fn tier1_node_drift_is_reported() {
     let expected = load_golden(&mini_golden_dir()).unwrap();
     let mut actual = expected.clone();
@@ -295,6 +320,14 @@ fn nix_db() -> PathBuf {
 
 fn nix_golden_dir() -> PathBuf {
     workspace_root().join("reference/golden/nix")
+}
+
+fn terraform_db() -> PathBuf {
+    workspace_root().join("reference/golden/terraform/colby.db")
+}
+
+fn terraform_golden_dir() -> PathBuf {
+    workspace_root().join("reference/golden/terraform")
 }
 
 struct TestDir {

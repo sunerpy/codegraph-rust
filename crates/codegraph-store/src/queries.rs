@@ -1526,6 +1526,7 @@ fn parse_language(value: String) -> rusqlite::Result<Language> {
         "r" => Language::R,
         "solidity" => Language::Solidity,
         "nix" => Language::Nix,
+        "terraform" => Language::Terraform,
         "yaml" => Language::Yaml,
         "twig" => Language::Twig,
         "xml" => Language::Xml,
@@ -2197,6 +2198,14 @@ mod tests {
     #[test]
     fn parse_language_accepts_nix() {
         assert_eq!(parse_language("nix".to_string()).unwrap(), Language::Nix);
+    }
+
+    #[test]
+    fn parse_language_accepts_terraform() {
+        assert_eq!(
+            parse_language("terraform".to_string()).unwrap(),
+            Language::Terraform
+        );
     }
 
     #[test]

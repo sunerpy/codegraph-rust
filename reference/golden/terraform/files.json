@@ -1,0 +1,10 @@
+[
+  {
+    "content_hash": "7df7854f67b585b19f9fb67712ff48434fc209255e89d426d2036200cd4d960c",
+    "errors": null,
+    "language": "terraform",
+    "node_count": 10,
+    "path": "main.tf",
+    "size": 387
+  }
+]
