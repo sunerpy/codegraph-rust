@@ -1,0 +1,6 @@
+component extends="Base" {
+  property name="x";
+  public function doThing() {
+    helper();
+  }
+}

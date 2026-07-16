@@ -4,7 +4,7 @@ CodeGraph extracts code structure deterministically using tree-sitter grammars a
 embedded extractors. No AI, vectors, or embeddings are involved. The output is byte-stable
 across runs.
 
-**37 concrete languages** are supported, grouped into three extraction tiers based on what
+**38 concrete languages** are supported, grouped into three extraction tiers based on what
 the extractor produces.
 
 > **Note on TypeScript/JavaScript variants:** `typescript` and `tsx`, and `javascript` and
@@ -14,7 +14,7 @@ the extractor produces.
 
 ---
 
-## Tier 1 — Full symbol extraction (28 languages)
+## Tier 1 — Full symbol extraction (29 languages)
 
 Tree-sitter parses the file and extracts all symbols (functions, classes, structs, methods,
 variables, imports, etc.) plus call and dependency edges. This is the richest extraction
@@ -50,6 +50,7 @@ level.
 | Erlang      | `.erl` `.hrl`                               | Full tree-sitter          | `tree-sitter-erlang` grammar (WhatsApp/ELP); `-module`→namespace (functions qualify as `m::f`), multi-clause `fun_decl`→one function (clause-merge), `-record`→struct+fields, `-define`→constant, `-type`/`-opaque`→type alias, `-include`→import; local/remote `mod:f`→calls, `fun f/1`/record usages→references; `-spec`/`-callback` type bodies mint no bogus refs; behaviour/gen_server/spawn MFA resolver bridges deferred |
 | GDScript    | `.gd`                                       | Full tree-sitter          | Godot scripting; extracts functions, classes, enums, variables, signals, extends, preload. Dynamic dispatch edges (connect/get_node/$/%/call/group) added by the Godot resolver — see [`docs/godot.md`](godot.md)                                                                                                                                                                                                               |
 | Pascal      | `.pas` `.dpr` `.dpk` `.lpr` `.dfm` `.fmx`   | Full tree-sitter / custom | `.dfm`/`.fmx` form files use a custom path                                                                                                                                                                                                                                                                                                                                                                                      |
+| CFML        | `.cfc` `.cfm` `.cfs`                        | Full tree-sitter          | ColdFusion; dual-grammar `tree-sitter-cfml` (cfscript + cfml tag), dialect chosen by first-token sniff. Bare-script `component`→class (name from file) + `extends`→extends; tag `<cfcomponent>`→class (name attr) + `<cffunction>`→method + `extends`/`implements`→refs. `<cfscript>`-in-tag body delegation and cfquery SQL-body extraction deferred                                                                           |
 
 ---
 

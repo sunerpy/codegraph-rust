@@ -20,6 +20,15 @@ pub trait LanguageSpec: Sync {
     fn language(&self) -> Language;
     fn tree_sitter_language(&self) -> TsLanguage;
 
+    /// Select the tree-sitter grammar for a specific file's SOURCE, defaulting
+    /// to [`Self::tree_sitter_language`]. Only the dual-grammar CFML spec
+    /// overrides this (cfscript vs cfml tag grammar, chosen by a first-token
+    /// dialect sniff); every other spec inherits the default so its parse path
+    /// is byte-identical.
+    fn tree_sitter_language_for_source(&self, _source: &str) -> TsLanguage {
+        self.tree_sitter_language()
+    }
+
     fn function_types(&self) -> &'static [&'static str];
     fn class_types(&self) -> &'static [&'static str];
     fn method_types(&self) -> &'static [&'static str];
