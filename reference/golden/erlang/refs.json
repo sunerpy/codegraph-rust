@@ -1,0 +1,12 @@
+[
+  {
+    "candidates": null,
+    "col": 10,
+    "file_path": "m.erl",
+    "from_node_id": "function:743aa71cb79a0e4ccf698e6157e258dd",
+    "language": "erlang",
+    "line": 17,
+    "reference_kind": "calls",
+    "reference_name": "other::h"
+  }
+]

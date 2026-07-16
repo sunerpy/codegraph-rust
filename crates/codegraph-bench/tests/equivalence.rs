@@ -205,6 +205,32 @@ fn terraform_db_is_self_equivalent_to_terraform_golden() {
 }
 
 #[test]
+fn generated_golden_matches_committed_erlang_fixture() {
+    // Guards Erlang extraction (upstream #1165, extraction slice only): the
+    // `.erl`/`.hrl`->Erlang mapping, `-module`->Namespace (so functions qualify
+    // as `m::f`), clause-merge dedup (a 2-clause `f/1`->one Function),
+    // `record_decl`->Struct + Field children, `-define`->Constant,
+    // `type_alias`/`opaque`->TypeAlias, `-include`->Import + file edge, local
+    // `call`->Calls and remote `mod:f()`->Calls `mod::f`, `fun f/1` value and
+    // `#state{}` usage->References (not calls). The `-spec`/`-callback` and
+    // record-field type-position `call` nodes mint NO bogus type call refs. The
+    // `-behaviour`, gen_server, spawn/apply MFA, and `.app` resource-tuple
+    // bridges are DEFERRED, so `other::h` (other module absent) stays unresolved.
+    let tempdir = TestDir::new("generated-golden-erlang");
+    write_golden(&erlang_db(), tempdir.path()).unwrap();
+
+    let expected = load_golden(&erlang_golden_dir()).unwrap();
+    let actual = load_golden(tempdir.path()).unwrap();
+
+    diff_canonical(&expected, &actual, None).unwrap();
+}
+
+#[test]
+fn erlang_db_is_self_equivalent_to_erlang_golden() {
+    assert_equivalent(&erlang_db(), &erlang_golden_dir()).unwrap();
+}
+
+#[test]
 fn tier1_node_drift_is_reported() {
     let expected = load_golden(&mini_golden_dir()).unwrap();
     let mut actual = expected.clone();
@@ -328,6 +354,14 @@ fn terraform_db() -> PathBuf {
 
 fn terraform_golden_dir() -> PathBuf {
     workspace_root().join("reference/golden/terraform")
+}
+
+fn erlang_db() -> PathBuf {
+    workspace_root().join("reference/golden/erlang/colby.db")
+}
+
+fn erlang_golden_dir() -> PathBuf {
+    workspace_root().join("reference/golden/erlang")
 }
 
 struct TestDir {

@@ -85,6 +85,7 @@ pub fn builtin_language_for_ext(ext: &str) -> Option<Language> {
         "sol" => Language::Solidity,
         "nix" => Language::Nix,
         "tf" | "tfvars" | "tofu" => Language::Terraform,
+        "erl" | "hrl" => Language::Erlang,
         "yml" | "yaml" => Language::Yaml,
         "twig" => Language::Twig,
         "xml" => Language::Xml,
@@ -873,7 +874,7 @@ mod tests {
         assert_eq!(detect_language("s.metal"), Language::Cpp);
         assert_eq!(detect_language("k.cu"), Language::Cpp);
         assert_eq!(detect_language("k.cuh"), Language::Cpp);
-        assert_eq!(Language::ALL.len(), 40);
+        assert_eq!(Language::ALL.len(), 41);
     }
 
     #[test]
@@ -896,6 +897,12 @@ mod tests {
         assert_eq!(detect_language("main.tf"), Language::Terraform);
         assert_eq!(detect_language("prod.tfvars"), Language::Terraform);
         assert_eq!(detect_language("main.tofu"), Language::Terraform);
+    }
+
+    #[test]
+    fn erlang_extensions_map_to_erlang() {
+        assert_eq!(detect_language("m.erl"), Language::Erlang);
+        assert_eq!(detect_language("defs.hrl"), Language::Erlang);
     }
 
     #[test]

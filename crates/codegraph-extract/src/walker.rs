@@ -44,6 +44,11 @@ pub struct TreeSitterWalker<'a, 'tree> {
     /// symbols' `qualified_name`. Prefix-only (no namespace node) to avoid the
     /// #1093 crowd-out; empty outside C++.
     namespace_prefix: Vec<String>,
+    /// Erlang clause-merge state: the previously-emitted function's name and
+    /// node id. A `fun_decl` whose clause repeats that name is a continuation
+    /// clause and attaches to the existing node. Empty outside Erlang.
+    erlang_last_fn_name: Option<String>,
+    erlang_last_fn_id: Option<String>,
 }
 
 impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
@@ -65,6 +70,8 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             node_stack: Vec::new(),
             fn_ref_candidates: Vec::new(),
             namespace_prefix: Vec::new(),
+            erlang_last_fn_name: None,
+            erlang_last_fn_id: None,
         }
     }
 
@@ -231,7 +238,246 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             Language::Solidity => self.visit_solidity_node(node),
             Language::Nix => self.visit_nix_node(node),
             Language::Terraform => self.visit_terraform_node(node),
+            Language::Erlang => self.visit_erlang_node(node),
             _ => false,
+        }
+    }
+
+    /// Erlang extraction (upstream `erlangExtractor.visitNode`, `erlang.ts`,
+    /// #1165 — the extraction slice only). Erlang is form-based, so `ERLANG_SPEC`
+    /// returns `&[]` for the C-family type-sets and this custom visitor owns the
+    /// symbol-bearing forms and the call/reference edges. Every unhandled kind
+    /// returns `false` → the generic `visit_named_children` descent (so
+    /// `source_file`/`function_clause` bodies are walked into automatically, and
+    /// `module_attribute`/`import_attribute`/`pp_include`/`pp_include_lib` fall
+    /// through to the generic package/import machinery). Strictly
+    /// `Language::Erlang`-guarded + shape-guarded.
+    ///
+    /// Form dispatch: `fun_decl` → merged Function (clause-merge dedup);
+    /// `record_decl` → Struct + Field children; `type_alias`/`opaque` →
+    /// TypeAlias; `pp_define` → Constant. Call/reference edges: a `call` →
+    /// `Calls` (remote qualified `mod::f`); `internal_fun`/`external_fun` and the
+    /// four record-expression forms → `References` (function VALUES / record
+    /// USAGES, not calls). `spec`/`callback`/`type_alias`/`opaque`/`record_decl`
+    /// are consumed WITHOUT descending into their type-position `call` children,
+    /// so `-spec f(integer()) -> integer().` mints no bogus `integer` call ref.
+    /// The `-behaviour`, gen_server, spawn/apply MFA, and `.app` resource-tuple
+    /// bridges are DEFERRED.
+    fn visit_erlang_node(&mut self, node: SyntaxNode<'tree>) -> bool {
+        match node.kind() {
+            "fun_decl" => {
+                self.visit_erlang_fun_decl(node);
+                true
+            }
+            "record_decl" => {
+                self.visit_erlang_record_decl(node);
+                true
+            }
+            "type_alias" | "opaque" => {
+                // Type-position bodies are `call` nodes; consume without descent
+                // so no bogus type call refs are minted.
+                if let Some(name) = crate::lang::erlang_type_alias_name(node, self.source) {
+                    let signature: String =
+                        crate::lang::erlang_collapse_ws(&node_text(node, self.source))
+                            .chars()
+                            .take(200)
+                            .collect();
+                    self.create_node(
+                        NodeKind::TypeAlias,
+                        &name,
+                        node,
+                        NodeExtra {
+                            signature: Some(signature),
+                            ..NodeExtra::default()
+                        },
+                    );
+                }
+                true
+            }
+            "pp_define" => {
+                if let Some(name) = crate::lang::erlang_macro_name(node, self.source) {
+                    let signature: String =
+                        crate::lang::erlang_collapse_ws(&node_text(node, self.source))
+                            .chars()
+                            .take(200)
+                            .collect();
+                    self.create_node(
+                        NodeKind::Constant,
+                        &name,
+                        node,
+                        NodeExtra {
+                            signature: Some(signature),
+                            ..NodeExtra::default()
+                        },
+                    );
+                }
+                // The replacement's call attribution to the macro node is
+                // DEFERRED (macro_call_expr use-site linking); consume the
+                // subtree so its type-position/expression children don't mint
+                // spurious refs from file scope.
+                true
+            }
+            // -spec / -callback: their type expressions parse as `call` nodes;
+            // consume the subtree so the walker doesn't mint bogus type call
+            // refs to `integer()`/`term()`/etc.
+            "spec" | "callback" => true,
+            // Call / reference edges.
+            "call" => {
+                self.visit_erlang_call(node);
+                // Descend so nested calls in the argument list are captured.
+                self.visit_named_children(node);
+                true
+            }
+            "remote" => {
+                // The remote-call `Calls` edge is emitted when the inner `call`
+                // is visited (it reads the module qualifier from this parent).
+                // Descend so the inner `call` (and its args) are reached.
+                false
+            }
+            "internal_fun" | "external_fun" => {
+                if let Some(name) = crate::lang::erlang_fun_value_ref_name(node, self.source) {
+                    if let Some(from) = self.node_stack.last().cloned() {
+                        self.push_ref(&from, &name, EdgeKind::References, node);
+                    }
+                }
+                true
+            }
+            "record_expr" | "record_update_expr" | "record_index_expr" | "record_field_expr" => {
+                if let Some(name) = crate::lang::erlang_record_ref_name(node, self.source) {
+                    if let Some(from) = self.node_stack.last().cloned() {
+                        self.push_ref(&from, &name, EdgeKind::References, node);
+                    }
+                }
+                // Descend so nested expressions (field values, base exprs) are
+                // walked for further refs.
+                self.visit_named_children(node);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// `fun_decl` → merged Function with the clause-merge dedup rule: the grammar
+    /// emits one `fun_decl` per clause, so a `fun_decl` whose clause name equals
+    /// the previously-emitted function's name is a CONTINUATION — no new symbol;
+    /// its clause bodies' refs attribute to the existing function id. A clause
+    /// with no static name (macro-templated) is skipped. Ports `handleFunDecl`
+    /// (erlang.ts:99-143).
+    fn visit_erlang_fun_decl(&mut self, node: SyntaxNode<'tree>) {
+        let clauses = crate::lang::erlang_function_clauses(node);
+        let Some(first) = clauses.first().copied() else {
+            return; // macro-templated clause — no static name
+        };
+        let Some(name) = crate::lang::erlang_clause_name(first, self.source) else {
+            return;
+        };
+
+        // Continuation clause: extend the existing node's span and attribute
+        // this clause's refs to it.
+        if self.erlang_last_fn_name.as_deref() == Some(name.as_str()) {
+            if let Some(existing_id) = self.erlang_last_fn_id.clone() {
+                let end_line = node.end_position().row as i64 + 1;
+                if let Some(existing) = self.nodes.iter_mut().find(|n| n.id == existing_id) {
+                    if end_line > existing.end_line {
+                        existing.end_line = end_line;
+                    }
+                }
+                self.node_stack.push(existing_id);
+                for clause in &clauses {
+                    self.visit_named_children(*clause);
+                }
+                self.node_stack.pop();
+                return;
+            }
+        }
+
+        let spec = crate::lang::erlang_preceding_spec(node, &name, self.source);
+        let signature = match spec {
+            Some(spec_node) => Some(
+                crate::lang::erlang_collapse_ws(&node_text(spec_node, self.source))
+                    .chars()
+                    .take(300)
+                    .collect::<String>(),
+            ),
+            None => crate::lang::erlang_clause_header(first, self.source),
+        };
+        let docstring = self.preceding_docstring(spec.unwrap_or(node));
+        let exports = crate::lang::erlang_module_exports(self.root, self.source);
+        let is_exported = exports.contains(&name);
+
+        let Some(func) = self.create_node(
+            NodeKind::Function,
+            &name,
+            node,
+            NodeExtra {
+                docstring,
+                signature,
+                is_exported,
+                ..NodeExtra::default()
+            },
+        ) else {
+            return;
+        };
+        self.node_stack.push(func.id.clone());
+        // The whole clause is walked (not just the body) so record patterns in
+        // the arguments and guard calls contribute references too.
+        for clause in &clauses {
+            self.visit_named_children(*clause);
+        }
+        self.node_stack.pop();
+        self.erlang_last_fn_name = Some(name);
+        self.erlang_last_fn_id = Some(func.id);
+    }
+
+    /// `record_decl` → Struct + one Field per `record_field` direct child. Ports
+    /// `handleRecordDecl` (erlang.ts:145-162). Field types/defaults are
+    /// type-position exprs — NOT descended.
+    fn visit_erlang_record_decl(&mut self, node: SyntaxNode<'tree>) {
+        let Some(name_node) = child_by_field(node, "name") else {
+            return;
+        };
+        let name = crate::lang::erlang_atom_text(name_node, self.source);
+        if name.is_empty() {
+            return;
+        }
+        let signature: String = crate::lang::erlang_collapse_ws(&node_text(node, self.source))
+            .chars()
+            .take(300)
+            .collect();
+        let docstring = self.preceding_docstring(node);
+        let Some(rec) = self.create_node(
+            NodeKind::Struct,
+            &name,
+            node,
+            NodeExtra {
+                docstring,
+                signature: Some(signature),
+                ..NodeExtra::default()
+            },
+        ) else {
+            return;
+        };
+        self.node_stack.push(rec.id);
+        for field in node.named_children(&mut node.walk()) {
+            if field.kind() != "record_field" {
+                continue;
+            }
+            if let Some(field_name) = crate::lang::erlang_record_field_name(field, self.source) {
+                self.create_node(NodeKind::Field, &field_name, field, NodeExtra::default());
+            }
+        }
+        self.node_stack.pop();
+    }
+
+    /// A `call` node → a `Calls` edge to the (possibly remote-qualified) callee.
+    /// A dynamic (var/macro-module) target emits nothing. Ports the `call` arm
+    /// of the erlang `extractCall` branch (tree-sitter.ts:3684-3690), MINUS the
+    /// DEFERRED gen_server / MFA-argument lifts.
+    fn visit_erlang_call(&mut self, node: SyntaxNode<'tree>) {
+        if let Some(name) = crate::lang::erlang_call_ref_name(node, self.source) {
+            if let Some(from) = self.node_stack.last().cloned() {
+                self.push_ref(&from, &name, EdgeKind::Calls, node);
+            }
         }
     }
 
@@ -6045,5 +6291,112 @@ public:
                 .any(|r| r.reference_kind == EdgeKind::References),
             "built-in heads (each/count/path) emit no ref: {refs:?}"
         );
+    }
+
+    // ---- Erlang (form-based; visit_erlang_node-driven) ----
+
+    const ERLANG_SAMPLE: &str = "-module(m).\n\
+-export([f/1, g/0]).\n\
+-record(state, {a, b}).\n\
+-define(X, 1).\n\
+-include(\"foo.hrl\").\n\
+-spec f(integer()) -> integer().\n\
+f(0) -> 0;\n\
+f(N) -> f(N-1).\n\
+g() ->\n\
+    _F = fun f/1,\n\
+    _S = #state{a=1},\n\
+    other:h(),\n\
+    g().\n\
+-callback c(term()) -> ok.\n";
+
+    #[test]
+    fn erlang_multiclause_merges_to_one_symbol() {
+        let (nodes, _refs) = run("m.erl", ERLANG_SAMPLE, Language::Erlang);
+        let fs: Vec<_> = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Function && n.name == "f")
+            .collect();
+        assert_eq!(
+            fs.len(),
+            1,
+            "two clauses of f/1 merge to one Function: {fs:?}"
+        );
+    }
+
+    #[test]
+    fn erlang_spec_does_not_mint_type_call_ref() {
+        let (_nodes, refs) = run("m.erl", ERLANG_SAMPLE, Language::Erlang);
+        assert!(
+            !has_ref(&refs, EdgeKind::Calls, "integer"),
+            "-spec integer() must not mint a Calls ref: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn erlang_callback_does_not_mint_type_call_ref() {
+        let src = "-module(m).\n-callback c(term()) -> ok.\n";
+        let (_nodes, refs) = run("m.erl", src, Language::Erlang);
+        assert!(
+            !has_ref(&refs, EdgeKind::Calls, "term"),
+            "-callback term() must not mint a Calls ref: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn erlang_remote_call_is_qualified_mod_fn() {
+        let (_nodes, refs) = run("m.erl", ERLANG_SAMPLE, Language::Erlang);
+        assert!(
+            has_ref(&refs, EdgeKind::Calls, "other::h"),
+            "remote other:h() → Calls other::h: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn erlang_local_call_extracted() {
+        let (_nodes, refs) = run("m.erl", ERLANG_SAMPLE, Language::Erlang);
+        assert!(
+            has_ref(&refs, EdgeKind::Calls, "g"),
+            "local g() → Calls g: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn erlang_fun_value_and_record_usage_are_references() {
+        let (_nodes, refs) = run("m.erl", ERLANG_SAMPLE, Language::Erlang);
+        assert!(
+            has_ref(&refs, EdgeKind::References, "f"),
+            "fun f/1 → References f: {refs:?}"
+        );
+        assert!(
+            has_ref(&refs, EdgeKind::References, "state"),
+            "#state{{}} → References state: {refs:?}"
+        );
+        assert!(
+            !has_ref(&refs, EdgeKind::Calls, "state"),
+            "record usage is a reference, not a call: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn erlang_record_and_fields_extracted() {
+        let (nodes, _refs) = run("m.erl", ERLANG_SAMPLE, Language::Erlang);
+        assert!(has_node(&nodes, NodeKind::Struct, "state"));
+        assert!(has_node(&nodes, NodeKind::Field, "a"));
+        assert!(has_node(&nodes, NodeKind::Field, "b"));
+    }
+
+    #[test]
+    fn erlang_include_is_file_import() {
+        let (nodes, refs) = run("m.erl", ERLANG_SAMPLE, Language::Erlang);
+        assert!(has_node(&nodes, NodeKind::Import, "foo.hrl"));
+        assert!(has_ref(&refs, EdgeKind::Imports, "foo.hrl"));
+    }
+
+    #[test]
+    fn erlang_macro_and_module_extracted() {
+        let (nodes, _refs) = run("m.erl", ERLANG_SAMPLE, Language::Erlang);
+        assert!(has_node(&nodes, NodeKind::Constant, "X"));
+        assert!(has_node(&nodes, NodeKind::Namespace, "m"));
     }
 }
