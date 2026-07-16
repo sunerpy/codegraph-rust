@@ -439,7 +439,7 @@ Omit `--install` to print to stdout. Full per-shell install paths and notes:
 
 ## What CodeGraph Does (and Doesn't)
 
-**Does:** deterministic code-structure extraction across 37 languages (TypeScript,
+**Does:** deterministic code-structure extraction across 38 languages (TypeScript,
 Python, Go, Rust, Java, C/C++, C#, Vue, Svelte, GDScript, and more — see
 [`docs/languages.md`](docs/languages.md)), cross-file resolution (including
 Godot project graphs), graph traversal, FTS5 search, whole-graph export with
@@ -454,9 +454,9 @@ beyond the fixed `LANGUAGES` set.
 
 ## Supported Languages
 
-CodeGraph supports **37 languages** grouped by extraction depth. Quick overview:
+CodeGraph supports **38 languages** grouped by extraction depth. Quick overview:
 
-- **Tier 1 — Full symbol extraction (28):** TypeScript, TSX, JavaScript, JSX, ArkTS, Python, Go, Rust, Java, C, C++, C#, PHP, Ruby, Swift, Kotlin, Dart, Scala, Lua, Luau, Objective-C, R, Solidity, Nix, Terraform, Erlang, GDScript, Pascal.
+- **Tier 1 — Full symbol extraction (29):** TypeScript, TSX, JavaScript, JSX, ArkTS, Python, Go, Rust, Java, C, C++, C#, PHP, Ruby, Swift, Kotlin, Dart, Scala, Lua, Luau, Objective-C, R, Solidity, Nix, Terraform, Erlang, CFML, GDScript, Pascal.
 - **Tier 2 — Embedded / template extraction (6):** Vue, Svelte, Astro, Razor/`.cshtml`, Liquid, XML/MyBatis mapper.
 - **Tier 3 — File-level only (3):** YAML, Twig, Properties.
 

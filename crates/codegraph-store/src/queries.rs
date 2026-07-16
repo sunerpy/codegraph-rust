@@ -1528,6 +1528,7 @@ fn parse_language(value: String) -> rusqlite::Result<Language> {
         "nix" => Language::Nix,
         "terraform" => Language::Terraform,
         "erlang" => Language::Erlang,
+        "cfml" => Language::Cfml,
         "yaml" => Language::Yaml,
         "twig" => Language::Twig,
         "xml" => Language::Xml,
@@ -2215,6 +2216,11 @@ mod tests {
             parse_language("erlang".to_string()).unwrap(),
             Language::Erlang
         );
+    }
+
+    #[test]
+    fn parse_language_accepts_cfml() {
+        assert_eq!(parse_language("cfml".to_string()).unwrap(), Language::Cfml);
     }
 
     #[test]

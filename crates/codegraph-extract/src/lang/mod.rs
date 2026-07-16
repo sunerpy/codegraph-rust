@@ -5,6 +5,7 @@
 
 mod arkts;
 mod c;
+mod cfml;
 mod cpp;
 mod csharp;
 mod dart;
@@ -38,6 +39,10 @@ use crate::spec::LanguageSpec;
 
 pub use arkts::ARKTS_SPEC;
 pub use c::C_SPEC;
+pub use cfml::CFML_SPEC;
+pub(crate) use cfml::{
+    cfml_component_name_from_path, cfml_string_attr_value, cfml_tag_attr, is_bare_script_cfml,
+};
 pub use cpp::CPP_SPEC;
 pub(crate) use cpp::{ExportMacroClass, detect_export_macro_class};
 pub use csharp::CSHARP_SPEC;
@@ -110,6 +115,7 @@ pub fn spec_for_language(language: Language) -> Option<&'static dyn LanguageSpec
         Language::Nix => Some(&NIX_SPEC),
         Language::Terraform => Some(&TERRAFORM_SPEC),
         Language::Erlang => Some(&ERLANG_SPEC),
+        Language::Cfml => Some(&CFML_SPEC),
         Language::Gdscript => Some(&GDSCRIPT_SPEC),
         _ => None,
     }

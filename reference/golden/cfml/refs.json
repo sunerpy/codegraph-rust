@@ -1,0 +1,12 @@
+[
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "Gadget.cfs",
+    "from_node_id": "method:5f4b8da59fedd244e30807cbc03a66b3",
+    "language": "cfml",
+    "line": 4,
+    "reference_kind": "calls",
+    "reference_name": "helper"
+  }
+]

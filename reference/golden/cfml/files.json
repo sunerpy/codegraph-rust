@@ -1,0 +1,26 @@
+[
+  {
+    "content_hash": "1def57c4a549fb3f0100b4c1a3da65eb5d88d7048a030d66004ce46d157b1aa2",
+    "errors": null,
+    "language": "cfml",
+    "node_count": 3,
+    "path": "Base.cfc",
+    "size": 62
+  },
+  {
+    "content_hash": "9fe3c477ccee5efc741c301c391bf45a9b153bf9e2c02593f310d452280699c2",
+    "errors": null,
+    "language": "cfml",
+    "node_count": 4,
+    "path": "Gadget.cfs",
+    "size": 98
+  },
+  {
+    "content_hash": "c618667f944b633d15c80bf1e274aac80504af2fb2a82266f54ec5c819f76d6e",
+    "errors": null,
+    "language": "cfml",
+    "node_count": 3,
+    "path": "Widget.cfm",
+    "size": 156
+  }
+]

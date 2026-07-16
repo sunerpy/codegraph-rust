@@ -86,6 +86,7 @@ pub fn builtin_language_for_ext(ext: &str) -> Option<Language> {
         "nix" => Language::Nix,
         "tf" | "tfvars" | "tofu" => Language::Terraform,
         "erl" | "hrl" => Language::Erlang,
+        "cfc" | "cfm" | "cfs" => Language::Cfml,
         "yml" | "yaml" => Language::Yaml,
         "twig" => Language::Twig,
         "xml" => Language::Xml,
@@ -203,7 +204,15 @@ pub fn extract_source(
     };
 
     let mut parser = Parser::new();
-    let ts_language = spec.tree_sitter_language();
+    // Run `pre_parse` first so the grammar selection can see the (possibly
+    // rewritten) source. Only CFML overrides `tree_sitter_language_for_source`
+    // to pick between its cfscript / cfml tag grammars per file dialect; every
+    // other spec inherits the default (`tree_sitter_language`), so this is a
+    // behavior-neutral reorder (their `pre_parse` is the identity default, and
+    // the two that override it — C++/embedded — don't override the grammar
+    // hook, so their parse path is byte-identical).
+    let parsed_source = spec.pre_parse(source, file_path);
+    let ts_language = spec.tree_sitter_language_for_source(&parsed_source);
     if let Err(error) = parser.set_language(&ts_language) {
         return ExtractionResult {
             nodes: Vec::new(),
@@ -213,7 +222,6 @@ pub fn extract_source(
             duration_ms: start.elapsed().as_millis() as i64,
         };
     }
-    let parsed_source = spec.pre_parse(source, file_path);
     let Some(tree) = parser.parse(&parsed_source, None) else {
         return ExtractionResult {
             nodes: Vec::new(),
@@ -874,7 +882,7 @@ mod tests {
         assert_eq!(detect_language("s.metal"), Language::Cpp);
         assert_eq!(detect_language("k.cu"), Language::Cpp);
         assert_eq!(detect_language("k.cuh"), Language::Cpp);
-        assert_eq!(Language::ALL.len(), 41);
+        assert_eq!(Language::ALL.len(), 42);
     }
 
     #[test]
@@ -903,6 +911,13 @@ mod tests {
     fn erlang_extensions_map_to_erlang() {
         assert_eq!(detect_language("m.erl"), Language::Erlang);
         assert_eq!(detect_language("defs.hrl"), Language::Erlang);
+    }
+
+    #[test]
+    fn cfml_extensions_map_to_cfml() {
+        assert_eq!(detect_language("Widget.cfc"), Language::Cfml);
+        assert_eq!(detect_language("page.cfm"), Language::Cfml);
+        assert_eq!(detect_language("Gadget.cfs"), Language::Cfml);
     }
 
     #[test]

@@ -49,6 +49,11 @@ pub struct TreeSitterWalker<'a, 'tree> {
     /// clause and attaches to the existing node. Empty outside Erlang.
     erlang_last_fn_name: Option<String>,
     erlang_last_fn_id: Option<String>,
+    /// CFML tag-dialect state: the byte offset up to which a
+    /// `cf_component_open_tag`'s following siblings (the implicit-end-tag
+    /// component body) have already been consumed, so the top-level `program`
+    /// walk skips them instead of re-visiting. 0 outside CFML tag files.
+    cfml_consumed_until: usize,
 }
 
 impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
@@ -72,6 +77,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             namespace_prefix: Vec::new(),
             erlang_last_fn_name: None,
             erlang_last_fn_id: None,
+            cfml_consumed_until: 0,
         }
     }
 
@@ -239,6 +245,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             Language::Nix => self.visit_nix_node(node),
             Language::Terraform => self.visit_terraform_node(node),
             Language::Erlang => self.visit_erlang_node(node),
+            Language::Cfml => self.visit_cfml_node(node),
             _ => false,
         }
     }
@@ -263,6 +270,168 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     /// so `-spec f(integer()) -> integer().` mints no bogus `integer` call ref.
     /// The `-behaviour`, gen_server, spawn/apply MFA, and `.app` resource-tuple
     /// bridges are DEFERRED.
+    /// CFML extraction (upstream `CfmlExtractor`, `cfml-extractor.ts`, #1153 —
+    /// scope-B extraction slice). A first-token sniff (`is_bare_script_cfml`)
+    /// selects the dialect. Bare-script: the cfscript type-set config drives the
+    /// generic dispatch, so this visitor owns only the unnamed script
+    /// `component`/`interface` (file-name rename + script-style `extends`). Tag:
+    /// owns `cf_component_open_tag`/`cf_function_tag`; `cf_script_tag`/
+    /// `cf_query_tag` inner-body delegation is DEFERRED. `Language::Cfml`-guarded.
+    fn visit_cfml_node(&mut self, node: SyntaxNode<'tree>) -> bool {
+        if crate::lang::is_bare_script_cfml(self.source) {
+            match node.kind() {
+                "component" | "interface" => {
+                    self.emit_cfml_script_component(node);
+                    true
+                }
+                _ => false,
+            }
+        } else {
+            if self.cfml_consumed_until > 0 && node.end_byte() <= self.cfml_consumed_until {
+                return true;
+            }
+            match node.kind() {
+                "cf_component_open_tag" => {
+                    self.emit_cfml_tag_component(node);
+                    true
+                }
+                "cf_function_tag" => {
+                    self.emit_cfml_tag_function(node, false);
+                    true
+                }
+                "cf_script_tag" | "cf_query_tag" => true,
+                _ => false,
+            }
+        }
+    }
+
+    /// Ports `extractBareScript`: the unnamed script `component`/`interface` is
+    /// named from the FILE, qualified `{file}::{name}`; script-style `extends`
+    /// becomes an `Extends` ref; the body is walked for the generic dispatch.
+    fn emit_cfml_script_component(&mut self, node: SyntaxNode<'tree>) {
+        let source = self.source;
+        let name = crate::lang::cfml_component_name_from_path(self.file_path);
+        let kind = match self.spec.classify_class_node(node) {
+            NodeKind::Interface => NodeKind::Interface,
+            _ => NodeKind::Class,
+        };
+        let qualified_name = format!("{}::{}", self.file_path, name);
+        let Some(created) = self.create_node(
+            kind,
+            &name,
+            node,
+            NodeExtra {
+                qualified_name: Some(qualified_name),
+                ..NodeExtra::default()
+            },
+        ) else {
+            return;
+        };
+        if let Some(extends) = crate::lang::cfml_string_attr_value(node, "extends", source) {
+            self.push_ref(&created.id, &extends, EdgeKind::Extends, node);
+        }
+        self.node_stack.push(created.id);
+        self.visit_named_children(node);
+        self.node_stack.pop();
+    }
+
+    /// Ports `extractComponent`: Class from the `name` tag-attr else file;
+    /// `extends`/`implements` tag-attr refs; the implicit-end-tag body is the
+    /// open tag's FOLLOWING SIBLINGS, walked to `cf_component_close_tag` with
+    /// each `cf_function_tag` a Method. `cfml_consumed_until` marks the consumed
+    /// range so the top-level walk skips it.
+    fn emit_cfml_tag_component(&mut self, node: SyntaxNode<'tree>) {
+        let source = self.source;
+        let name = crate::lang::cfml_tag_attr(node, "name", source)
+            .unwrap_or_else(|| crate::lang::cfml_component_name_from_path(self.file_path));
+        let qualified_name = format!("{}::{}", self.file_path, name);
+        let extends = crate::lang::cfml_tag_attr(node, "extends", source);
+        let implements = crate::lang::cfml_tag_attr(node, "implements", source);
+        let Some(created) = self.create_node(
+            NodeKind::Class,
+            &name,
+            node,
+            NodeExtra {
+                is_exported: true,
+                qualified_name: Some(qualified_name),
+                ..NodeExtra::default()
+            },
+        ) else {
+            return;
+        };
+        if let Some(extends) = extends {
+            let extends = extends.trim();
+            if !extends.is_empty() {
+                self.push_ref(&created.id, extends, EdgeKind::Extends, node);
+            }
+        }
+        if let Some(implements) = implements {
+            for iface in implements.split(',') {
+                let iface = iface.trim();
+                if !iface.is_empty() {
+                    self.push_ref(&created.id, iface, EdgeKind::Implements, node);
+                }
+            }
+        }
+        self.node_stack.push(created.id);
+        let mut consumed_end = node.end_byte();
+        let mut sibling = node.next_named_sibling();
+        while let Some(current) = sibling {
+            if current.kind() == "cf_component_close_tag" {
+                consumed_end = current.end_byte();
+                break;
+            }
+            if current.kind() == "cf_function_tag" {
+                self.emit_cfml_tag_function(current, true);
+            }
+            consumed_end = current.end_byte();
+            sibling = current.next_named_sibling();
+        }
+        self.node_stack.pop();
+        self.cfml_consumed_until = consumed_end;
+    }
+
+    /// Ports `extractFunctionTag`: Method (in a component) or Function
+    /// (top-level) from the `name` tag-attr (skip if absent), visibility from
+    /// `access`, return type from `returntype`; the body is walked for calls.
+    fn emit_cfml_tag_function(&mut self, node: SyntaxNode<'tree>, is_method: bool) {
+        let source = self.source;
+        let Some(name) = crate::lang::cfml_tag_attr(node, "name", source) else {
+            return;
+        };
+        let visibility = crate::lang::cfml_tag_attr(node, "access", source).and_then(|access| {
+            match access.trim().to_ascii_lowercase().as_str() {
+                "private" => Some("private".to_string()),
+                "package" => Some("internal".to_string()),
+                "remote" | "public" => Some("public".to_string()),
+                _ => None,
+            }
+        });
+        let return_type = crate::lang::cfml_tag_attr(node, "returntype", source)
+            .map(|rt| rt.trim().to_string())
+            .filter(|rt| !rt.is_empty());
+        let kind = if is_method {
+            NodeKind::Method
+        } else {
+            NodeKind::Function
+        };
+        let Some(created) = self.create_node(
+            kind,
+            &name,
+            node,
+            NodeExtra {
+                visibility,
+                return_type,
+                ..NodeExtra::default()
+            },
+        ) else {
+            return;
+        };
+        self.node_stack.push(created.id);
+        self.visit_named_children(node);
+        self.node_stack.pop();
+    }
+
     fn visit_erlang_node(&mut self, node: SyntaxNode<'tree>) -> bool {
         match node.kind() {
             "fun_decl" => {
@@ -6398,5 +6567,103 @@ g() ->\n\
         let (nodes, _refs) = run("m.erl", ERLANG_SAMPLE, Language::Erlang);
         assert!(has_node(&nodes, NodeKind::Constant, "X"));
         assert!(has_node(&nodes, NodeKind::Namespace, "m"));
+    }
+
+    // ---- CFML (dual-grammar: cfscript for bare-script, cfml for tag) ----
+
+    #[test]
+    fn cfml_script_component_from_file_name() {
+        let (nodes, _refs) = run(
+            "Gadget.cfs",
+            "component { public function doThing(){} }",
+            Language::Cfml,
+        );
+        assert!(has_node(&nodes, NodeKind::Class, "Gadget"));
+        assert!(!has_node(&nodes, NodeKind::Class, "<anonymous>"));
+        assert!(
+            has_node(&nodes, NodeKind::Method, "doThing")
+                || has_node(&nodes, NodeKind::Function, "doThing")
+        );
+    }
+
+    #[test]
+    fn cfml_tag_component_is_class() {
+        let (nodes, refs) = run(
+            "Widget.cfm",
+            "<cfcomponent name=\"Widget\" extends=\"Base\"><cffunction name=\"doThing\" access=\"public\"></cffunction></cfcomponent>",
+            Language::Cfml,
+        );
+        assert!(has_node(&nodes, NodeKind::Class, "Widget"));
+        assert!(has_ref(&refs, EdgeKind::Extends, "Base"));
+    }
+
+    #[test]
+    fn cfml_tag_function_is_method() {
+        let (nodes, _refs) = run(
+            "Widget.cfm",
+            "<cfcomponent name=\"Widget\"><cffunction name=\"doThing\" access=\"public\"></cffunction></cfcomponent>",
+            Language::Cfml,
+        );
+        assert!(has_node(&nodes, NodeKind::Method, "doThing"));
+    }
+
+    #[test]
+    fn cfml_script_extends_is_extends() {
+        let (_nodes, refs) = run(
+            "Gadget.cfs",
+            "component extends=\"Base\" { }",
+            Language::Cfml,
+        );
+        assert!(has_ref(&refs, EdgeKind::Extends, "Base"));
+    }
+
+    #[test]
+    fn cfml_script_property_is_property() {
+        let (nodes, _refs) = run(
+            "Gadget.cfs",
+            "component { property name=\"x\"; }",
+            Language::Cfml,
+        );
+        assert!(
+            has_node(&nodes, NodeKind::Property, "x") || has_node(&nodes, NodeKind::Field, "x")
+        );
+    }
+
+    #[test]
+    fn cfml_call_is_calls() {
+        let (_nodes, refs) = run(
+            "Gadget.cfs",
+            "component { public function doThing(){ helper(); } }",
+            Language::Cfml,
+        );
+        assert!(has_ref(&refs, EdgeKind::Calls, "helper"));
+    }
+
+    #[test]
+    fn cfml_implements_splits() {
+        let (_nodes, refs) = run(
+            "Widget.cfm",
+            "<cfcomponent name=\"W\" implements=\"IFoo,IBar\"></cfcomponent>",
+            Language::Cfml,
+        );
+        assert!(has_ref(&refs, EdgeKind::Implements, "IFoo"));
+        assert!(has_ref(&refs, EdgeKind::Implements, "IBar"));
+    }
+
+    #[test]
+    fn cfml_import_is_import() {
+        let (nodes, refs) = run(
+            "Gadget.cfs",
+            "component { import com.foo.Bar; include \"sub.cfm\"; }",
+            Language::Cfml,
+        );
+        assert!(
+            has_node(&nodes, NodeKind::Import, "com.foo.Bar")
+                || has_ref(&refs, EdgeKind::Imports, "com.foo.Bar")
+        );
+        assert!(
+            has_node(&nodes, NodeKind::Import, "sub.cfm")
+                || has_ref(&refs, EdgeKind::Imports, "sub.cfm")
+        );
     }
 }

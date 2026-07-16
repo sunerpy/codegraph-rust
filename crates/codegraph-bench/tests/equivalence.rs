@@ -231,6 +231,31 @@ fn erlang_db_is_self_equivalent_to_erlang_golden() {
 }
 
 #[test]
+fn generated_golden_matches_committed_cfml_fixture() {
+    // Guards CFML extraction (upstream #1153, scope-B extraction slice): the
+    // `.cfc`/`.cfm`/`.cfs`->Cfml mapping, the dual-grammar dialect switch
+    // (`is_bare_script_cfml`: cfscript for bare-script, cfml tag grammar for
+    // tag files), a bare-script `component`->Class named from the FILE (unnamed
+    // in the grammar) + script-style `extends`->Extends, a tag
+    // `<cfcomponent>`->Class from `name` attr + `<cffunction>`->Method with
+    // access/returntype + tag `extends`->Extends. Both extends resolve to
+    // `Base.cfc`; `helper()` stays unresolved. The `<cfscript>`-in-tag delegation
+    // + cfquery SQL-body extraction + framework resolvers are DEFERRED.
+    let tempdir = TestDir::new("generated-golden-cfml");
+    write_golden(&cfml_db(), tempdir.path()).unwrap();
+
+    let expected = load_golden(&cfml_golden_dir()).unwrap();
+    let actual = load_golden(tempdir.path()).unwrap();
+
+    diff_canonical(&expected, &actual, None).unwrap();
+}
+
+#[test]
+fn cfml_db_is_self_equivalent_to_cfml_golden() {
+    assert_equivalent(&cfml_db(), &cfml_golden_dir()).unwrap();
+}
+
+#[test]
 fn tier1_node_drift_is_reported() {
     let expected = load_golden(&mini_golden_dir()).unwrap();
     let mut actual = expected.clone();
@@ -362,6 +387,14 @@ fn erlang_db() -> PathBuf {
 
 fn erlang_golden_dir() -> PathBuf {
     workspace_root().join("reference/golden/erlang")
+}
+
+fn cfml_db() -> PathBuf {
+    workspace_root().join("reference/golden/cfml/colby.db")
+}
+
+fn cfml_golden_dir() -> PathBuf {
+    workspace_root().join("reference/golden/cfml")
 }
 
 struct TestDir {

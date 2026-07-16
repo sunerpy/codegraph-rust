@@ -616,6 +616,53 @@ The `generated_golden_matches_committed_erlang_fixture` and
 `erlang_db_is_self_equivalent_to_erlang_golden` tests in
 `crates/codegraph-bench/tests/equivalence.rs` enforce byte-stability.
 
+### CFML fixture
+
+A twelfth golden fixture, `reference/golden/cfml/`, guards CFML / ColdFusion
+extraction (upstream #1153 / `816bacb`, the scope-B extraction slice only). CFML
+is a **new `Language::Cfml` variant** backed by the **dual-grammar
+`tree-sitter-cfml`** crate (`.cfc`/`.cfm`/`.cfs` → `Language::Cfml`). A file's
+dialect is picked by a first-token sniff (`is_bare_script_cfml`): script files
+parse with the bundled `cfscript` grammar and drive the generic type-set
+dispatch; tag files parse with the `cfml` tag grammar and are handled by the
+`Language::Cfml`-guarded `visit_cfml_node` walker extension. The corpus
+(`crates/codegraph-bench/fixtures/cfml/`) has three deterministic files — a
+script `Base.cfc`, a tag `Widget.cfm`, and a bare-script `Gadget.cfs`. What it
+guards:
+
+- all three files with `"language": "cfml"`;
+- `Base.cfc` (script) → `NodeKind::Class` `Base` (named from the FILE — the
+  cfscript `component` is unnamed) + `NodeKind::Function` `ping`;
+- `Widget.cfm` (tag) → `NodeKind::Class` `Widget` (from the `name` tag-attr) +
+  `NodeKind::Method` `doThing` (access `public`, returntype `void`), and a tag
+  `extends="Base"` → `Extends`;
+- `Gadget.cfs` (bare script) → `NodeKind::Class` `Gadget` (from the FILE) +
+  `NodeKind::Property` `x` + `NodeKind::Function` `doThing`, and a script-style
+  `extends="Base"` (`component_attribute`) → `Extends`;
+- both `extends Base` refs RESOLVE to the `Base.cfc` component (edges);
+  `Gadget.doThing`'s `helper()` call → an unresolved `helper` ref.
+
+The `<cfscript>`-in-tag-body re-parse delegation, the `cfquery` SQL-body
+extraction (`LANGUAGE_CFQUERY`), and the CFML framework RESOLVER bridges
+(FW/1 / ColdBox / CFWheels, dotted/relative inheritance, receiver-type inference)
+are all **DEFERRED**. Adding the variant is byte-neutral for `colby.schema.sql`
+(language is a stored TEXT value, not DDL) and for the eleven existing goldens
+(none holds a `.cfc`/`.cfm`/`.cfs` file).
+
+Regenerate reproducibly (identical recipe, substituting `cfml`):
+
+```bash
+rm -rf /tmp/cg-fixture-cfml && cp -r crates/codegraph-bench/fixtures/cfml /tmp/cg-fixture-cfml
+cargo build --release -p codegraph-rs
+CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-cfml
+cp /tmp/cg-fixture-cfml/.codegraph/codegraph.db reference/golden/cfml/colby.db
+cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/cfml/colby.db reference/golden/cfml
+```
+
+The `generated_golden_matches_committed_cfml_fixture` and
+`cfml_db_is_self_equivalent_to_cfml_golden` tests in
+`crates/codegraph-bench/tests/equivalence.rs` enforce byte-stability.
+
 ### KNOWN_DIFFS.md format
 
 Tier-3 differences are allowlisted by grep-able lines in repo-root

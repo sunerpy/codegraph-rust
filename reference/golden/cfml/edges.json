@@ -1,0 +1,89 @@
+[
+  {
+    "col": 0,
+    "kind": "extends",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "class:93c39257dd3c90eb320fcd02f5ddbc01",
+    "target": "class:7b249660730529f301c3db8163759969"
+  },
+  {
+    "col": 0,
+    "kind": "extends",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "class:b60688d316d54e324299d22677269906",
+    "target": "class:7b249660730529f301c3db8163759969"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:7b249660730529f301c3db8163759969",
+    "target": "method:54e7b7c2fdf0c76f0984142661a54479"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:93c39257dd3c90eb320fcd02f5ddbc01",
+    "target": "method:c432989f1e6e8a738827b8c560f31059"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:b60688d316d54e324299d22677269906",
+    "target": "method:5f4b8da59fedd244e30807cbc03a66b3"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:b60688d316d54e324299d22677269906",
+    "target": "property:0625c36d63c08952c8612ee18a665fe2"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:Base.cfc",
+    "target": "class:7b249660730529f301c3db8163759969"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:Gadget.cfs",
+    "target": "class:b60688d316d54e324299d22677269906"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:Widget.cfm",
+    "target": "class:93c39257dd3c90eb320fcd02f5ddbc01"
+  }
+]
