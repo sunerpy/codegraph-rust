@@ -8,6 +8,7 @@ mod c;
 mod cpp;
 mod csharp;
 mod dart;
+mod erlang;
 mod gdscript;
 mod go;
 mod java;
@@ -41,6 +42,13 @@ pub use cpp::CPP_SPEC;
 pub(crate) use cpp::{ExportMacroClass, detect_export_macro_class};
 pub use csharp::CSHARP_SPEC;
 pub use dart::DART_SPEC;
+pub use erlang::ERLANG_SPEC;
+pub(crate) use erlang::{
+    erlang_atom_text, erlang_call_ref_name, erlang_clause_header, erlang_clause_name,
+    erlang_collapse_ws, erlang_fun_value_ref_name, erlang_function_clauses, erlang_macro_name,
+    erlang_module_exports, erlang_preceding_spec, erlang_record_field_name, erlang_record_ref_name,
+    erlang_type_alias_name,
+};
 pub use gdscript::GDSCRIPT_SPEC;
 pub use go::GO_SPEC;
 pub use java::JAVA_SPEC;
@@ -101,6 +109,7 @@ pub fn spec_for_language(language: Language) -> Option<&'static dyn LanguageSpec
         Language::Solidity => Some(&SOLIDITY_SPEC),
         Language::Nix => Some(&NIX_SPEC),
         Language::Terraform => Some(&TERRAFORM_SPEC),
+        Language::Erlang => Some(&ERLANG_SPEC),
         Language::Gdscript => Some(&GDSCRIPT_SPEC),
         _ => None,
     }

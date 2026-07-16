@@ -557,6 +557,65 @@ The `generated_golden_matches_committed_terraform_fixture` and
 `terraform_db_is_self_equivalent_to_terraform_golden` tests in
 `crates/codegraph-bench/tests/equivalence.rs` enforce byte-stability.
 
+### Erlang fixture
+
+An eleventh golden fixture, `reference/golden/erlang/`, guards Erlang extraction
+(upstream #1165 / `6511722`, the extraction slice only). Erlang is a **new
+`Language::Erlang` variant** backed by a **dedicated `tree-sitter-erlang`
+grammar** (`.erl`/`.hrl` → `Language::Erlang`). Erlang is form-based — a
+function's name lives on its `function_clause`, the grammar emits one `fun_decl`
+per clause, `record_decl` carries fields as direct children, and
+`-spec`/`-callback`/type bodies parse as `call` nodes — so `ERLANG_SPEC` has
+all-empty C-family type-sets (only `package_types`/`import_types` are wired, as
+upstream) and extraction is driven by the `Language::Erlang`-guarded
+`visit_erlang_node` walker extension. The corpus
+(`crates/codegraph-bench/fixtures/erlang/m.erl`) is a single deterministic file
+with `-module(m)`, `-export([f/1, g/0])`, `-include("foo.hrl")`, `-define(X, 1)`,
+`-record(state, {a, b})`, a `-spec f(integer()) -> integer().`, a two-clause
+`f/1`, and a `g/0` that references `fun f/1`, constructs `#state{}`, calls the
+remote `other:h()`, and self-calls `g()`. What it guards:
+
+- the `.erl` file with `"language": "erlang"`;
+- `-module(m)` → `NodeKind::Namespace` (so every function's qualified name is
+  `m::f` — the shape the remote-call branch emits, so `mod:f(...)` resolves
+  through the standard qualified-name matcher);
+- clause-merge dedup: the two `f/1` clauses merge to exactly ONE
+  `NodeKind::Function` `f`;
+- `-record(state, {a, b})` → `NodeKind::Struct` `state` with `NodeKind::Field`
+  children `a` and `b`;
+- `-define(X, 1)` → `NodeKind::Constant` `X`;
+- `-include("foo.hrl")` → `NodeKind::Import` + an `Imports` file edge;
+- local `g()` → a `Calls` edge, remote `other:h()` → a `Calls` ref `other::h`;
+- `fun f/1` (function value) and `#state{}` (record usage) → `References`, NOT
+  `Calls`;
+- the `-spec f(integer()) -> integer().` and `-callback` / record-field
+  type-position `call` nodes mint NO bogus type call refs (no `integer` call).
+
+The local `g()` self-call and the `foo.hrl` include resolve; `other::h` (the
+`other` module is absent from the fixture) is the sole unresolved `refs.json`
+row. The non-Godot framework bridges — `-behaviour` callback contracts,
+`gen_server:call/cast(?MODULE|?SERVER)` → `handle_call`/`handle_cast`, the
+`spawn`/`apply`/`proc_lib`/`timer`/`rpc` MFA-argument callee lift, var-module
+dispatch, and `.app`/`.app.src` resource-tuple wiring — are all **DEFERRED**, so
+none of those edges is emitted. Adding the variant is byte-neutral for
+`colby.schema.sql` (language is a stored TEXT value, not DDL) and for the ten
+existing goldens (none holds a `.erl`/`.hrl` file).
+
+Regenerate reproducibly (identical recipe to the Terraform fixture, substituting
+`erlang`):
+
+```bash
+rm -rf /tmp/cg-fixture-erlang && cp -r crates/codegraph-bench/fixtures/erlang /tmp/cg-fixture-erlang
+cargo build --release -p codegraph-rs
+CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-erlang
+cp /tmp/cg-fixture-erlang/.codegraph/codegraph.db reference/golden/erlang/colby.db
+cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/erlang/colby.db reference/golden/erlang
+```
+
+The `generated_golden_matches_committed_erlang_fixture` and
+`erlang_db_is_self_equivalent_to_erlang_golden` tests in
+`crates/codegraph-bench/tests/equivalence.rs` enforce byte-stability.
+
 ### KNOWN_DIFFS.md format
 
 Tier-3 differences are allowlisted by grep-able lines in repo-root

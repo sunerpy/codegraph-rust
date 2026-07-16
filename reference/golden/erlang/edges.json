@@ -1,0 +1,134 @@
+[
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "namespace:998d8cbb5759a2fdb05d10d3a9fc6bd9",
+    "target": "import:5b8fe7f4d9d9c305e6f7961f26c5eec9"
+  },
+  {
+    "col": 4,
+    "kind": "calls",
+    "line": 18,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:743aa71cb79a0e4ccf698e6157e258dd",
+    "target": "function:743aa71cb79a0e4ccf698e6157e258dd"
+  },
+  {
+    "col": 8,
+    "kind": "calls",
+    "line": 12,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:261c4eb3cb44f198c8a9fac01c1c4a92",
+    "target": "function:261c4eb3cb44f198c8a9fac01c1c4a92"
+  },
+  {
+    "col": 9,
+    "kind": "references",
+    "line": 15,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:743aa71cb79a0e4ccf698e6157e258dd",
+    "target": "function:261c4eb3cb44f198c8a9fac01c1c4a92"
+  },
+  {
+    "col": 9,
+    "kind": "references",
+    "line": 16,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:743aa71cb79a0e4ccf698e6157e258dd",
+    "target": "struct:fdd937b44066af5032c24c2151ccf004"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:m.erl",
+    "target": "namespace:998d8cbb5759a2fdb05d10d3a9fc6bd9"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:998d8cbb5759a2fdb05d10d3a9fc6bd9",
+    "target": "constant:bba6427954007a70d8fbc2968df63405"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:998d8cbb5759a2fdb05d10d3a9fc6bd9",
+    "target": "function:261c4eb3cb44f198c8a9fac01c1c4a92"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:998d8cbb5759a2fdb05d10d3a9fc6bd9",
+    "target": "function:743aa71cb79a0e4ccf698e6157e258dd"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:998d8cbb5759a2fdb05d10d3a9fc6bd9",
+    "target": "import:5b8fe7f4d9d9c305e6f7961f26c5eec9"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "namespace:998d8cbb5759a2fdb05d10d3a9fc6bd9",
+    "target": "struct:fdd937b44066af5032c24c2151ccf004"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:fdd937b44066af5032c24c2151ccf004",
+    "target": "field:7adabd440e82b9253824033c75ec8be9"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:fdd937b44066af5032c24c2151ccf004",
+    "target": "field:d58536e0b8c25d7d881da6c6a4f60201"
+  }
+]
