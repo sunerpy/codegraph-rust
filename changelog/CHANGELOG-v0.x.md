@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.38.0](https://github.com/sunerpy/codegraph-rust/compare/v0.37.0...v0.38.0) (2026-07-16)
+
+
+### Features
+
+* **extraction:** index Erlang (.erl/.hrl) at the extraction tier ([#157](https://github.com/sunerpy/codegraph-rust/issues/157)) ([a6f2ad7](https://github.com/sunerpy/codegraph-rust/commit/a6f2ad7c2a1768e2e00baf67033e6c674a187425))
+
 ## [0.37.0](https://github.com/sunerpy/codegraph-rust/compare/v0.36.0...v0.37.0) (2026-07-15)
 
 
