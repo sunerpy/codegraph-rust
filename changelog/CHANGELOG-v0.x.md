@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.39.0](https://github.com/sunerpy/codegraph-rust/compare/v0.38.0...v0.39.0) (2026-07-16)
+
+
+### Features
+
+* **extraction:** index CFML (.cfc/.cfm/.cfs) at the extraction tier ([#159](https://github.com/sunerpy/codegraph-rust/issues/159)) ([8bb07fa](https://github.com/sunerpy/codegraph-rust/commit/8bb07fafcff1a14d02c796774e76eaab9692c281))
+
 ## [0.38.0](https://github.com/sunerpy/codegraph-rust/compare/v0.37.0...v0.38.0) (2026-07-16)
 
 
