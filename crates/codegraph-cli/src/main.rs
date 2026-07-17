@@ -176,6 +176,9 @@ enum Command {
         kind: Option<String>,
         #[arg(short = 'j', long = "json")]
         json: bool,
+        /// Exit non-zero when no result is found (default exits 0).
+        #[arg(long)]
+        strict: bool,
     },
     // Upstream flags/output shape: upstream bin/codegraph.ts:903-911, 939-1013.
     Files {
@@ -240,6 +243,9 @@ enum Command {
         limit: usize,
         #[arg(short = 'j', long = "json")]
         json: bool,
+        /// Exit non-zero when no callers are found (default exits 0).
+        #[arg(long)]
+        strict: bool,
     },
     // Upstream flags/output shape: upstream bin/codegraph.ts:1280-1284, 1298-1345.
     Callees {
@@ -250,6 +256,9 @@ enum Command {
         limit: usize,
         #[arg(short = 'j', long = "json")]
         json: bool,
+        /// Exit non-zero when no callees are found (default exits 0).
+        #[arg(long)]
+        strict: bool,
     },
     // Upstream flags/output shape: upstream bin/codegraph.ts:1358-1362, 1374-1439.
     Impact {
@@ -260,6 +269,9 @@ enum Command {
         depth: usize,
         #[arg(short = 'j', long = "json")]
         json: bool,
+        /// Exit non-zero when the symbol is not found (default exits 0).
+        #[arg(long)]
+        strict: bool,
     },
     // Upstream flags/output shape: upstream bin/codegraph.ts:1462-1469, 1479-1582.
     Affected {
@@ -268,7 +280,8 @@ enum Command {
         path: Option<PathBuf>,
         #[arg(short, long, default_value_t = 5)]
         depth: usize,
-        #[arg(short, long)]
+        /// glob used to classify affectedTests; does NOT filter affectedFiles. Example: tests/*
+        #[arg(short, long, value_name = "GLOB")]
         filter: Option<String>,
     },
     // New analysis surface (not in the v1.0.1 pin): forward file-dependency
@@ -345,6 +358,9 @@ enum Command {
         symbols_only: bool,
         #[arg(short = 'j', long = "json")]
         json: bool,
+        /// Exit non-zero when the symbol/file is not found (default exits 0).
+        #[arg(long)]
+        strict: bool,
     },
     // Upstream flags/output: upstream bin/codegraph.ts:1864-1870, 1871-1920.
     // `--global`/`--local` are convenience aliases for `--location` (task spec).
@@ -512,7 +528,8 @@ fn run(cli: Cli) -> Result<()> {
             limit,
             kind,
             json,
-        } => cmd_query(search, path, limit, kind, json),
+            strict,
+        } => cmd_query(search, path, limit, kind, json, strict),
         Command::Files {
             path,
             filter,
@@ -536,19 +553,22 @@ fn run(cli: Cli) -> Result<()> {
             path,
             limit,
             json,
-        } => cmd_callers(symbol, path, limit, json),
+            strict,
+        } => cmd_callers(symbol, path, limit, json, strict),
         Command::Callees {
             symbol,
             path,
             limit,
             json,
-        } => cmd_callees(symbol, path, limit, json),
+            strict,
+        } => cmd_callees(symbol, path, limit, json, strict),
         Command::Impact {
             symbol,
             path,
             depth,
             json,
-        } => cmd_impact(symbol, path, depth, json),
+            strict,
+        } => cmd_impact(symbol, path, depth, json, strict),
         Command::Affected {
             files,
             path,
@@ -591,7 +611,8 @@ fn run(cli: Cli) -> Result<()> {
             path,
             symbols_only,
             json,
-        } => cmd_node(target, path, symbols_only, json),
+            strict,
+        } => cmd_node(target, path, symbols_only, json, strict),
         Command::Install {
             target,
             location,
@@ -1340,6 +1361,7 @@ fn cmd_query(
     limit: i64,
     kind: Option<String>,
     json_output: bool,
+    strict: bool,
 ) -> Result<()> {
     let project = resolve_required_project(path)?;
     let store = open_store(&project)?;
@@ -1368,12 +1390,11 @@ fn cmd_query(
             .map(|node| SearchResult { node, score: 1.0 })
             .collect();
     }
+    let is_empty = results.is_empty();
     if json_output {
         let output = results.iter().map(SearchOutput::from).collect::<Vec<_>>();
         print_json_pretty(&output)?;
-        return Ok(());
-    }
-    if results.is_empty() {
+    } else if is_empty {
         println!("No results found for \"{search}\"");
     } else {
         println!("\nSearch Results for \"{search}\":\n");
@@ -1385,6 +1406,9 @@ fn cmd_query(
             }
             println!();
         }
+    }
+    if strict && is_empty {
+        bail!("codegraph query: no results found for \"{search}\"");
     }
     Ok(())
 }
@@ -2679,6 +2703,7 @@ fn cmd_callers(
     path: Option<PathBuf>,
     limit: usize,
     json_output: bool,
+    strict: bool,
 ) -> Result<()> {
     let project = resolve_required_project(path)?;
     let store = open_store(&project)?;
@@ -2694,6 +2719,9 @@ fn cmd_callers(
         print_related("Callers", &symbol, &nodes);
         godot.print_cli(nodes.is_empty());
     }
+    if strict && nodes.is_empty() {
+        bail!("codegraph callers: no callers found for \"{symbol}\"");
+    }
     Ok(())
 }
 
@@ -2702,6 +2730,7 @@ fn cmd_callees(
     path: Option<PathBuf>,
     limit: usize,
     json_output: bool,
+    strict: bool,
 ) -> Result<()> {
     let project = resolve_required_project(path)?;
     let store = open_store(&project)?;
@@ -2711,7 +2740,25 @@ fn cmd_callees(
     } else {
         print_related("Callees", &symbol, &nodes);
     }
+    if strict && nodes.is_empty() {
+        bail!("codegraph callees: no callees found for \"{symbol}\"");
+    }
     Ok(())
+}
+
+/// The shared Godot reverse-referrer fan-out for `impact` and `affected`. A
+/// `.tscn`/`.tres`/`project.godot` target owns no `file:` node, so its
+/// referrers live only in the path-keyed reverse lanes. Fanning out to all
+/// three — the 6-subkind `unresolved_refs` lane, the untagged `main_scene`
+/// lane, and the loader `import:`-name lane — behind ONE helper keeps `impact`
+/// and `affected` from diverging. Sorted + deduped; deterministic.
+fn godot_reverse_referrers(store: &Store, file: &str) -> Result<Vec<String>> {
+    let mut referrers = store.dependent_file_paths_unresolved(file)?;
+    referrers.extend(store.dependent_file_paths_via_import_name(file)?);
+    referrers.extend(store.dependent_file_paths_main_scene(file)?);
+    referrers.sort();
+    referrers.dedup();
+    Ok(referrers)
 }
 
 fn cmd_impact(
@@ -2719,6 +2766,7 @@ fn cmd_impact(
     path: Option<PathBuf>,
     depth: usize,
     json_output: bool,
+    strict: bool,
 ) -> Result<()> {
     let project = resolve_required_project(path)?;
     let store = open_store(&project)?;
@@ -2726,6 +2774,9 @@ fn cmd_impact(
     let matches = symbol_matches(&store, &project, &symbol)?;
     if matches.is_empty() {
         println!("Symbol \"{symbol}\" not found");
+        if strict {
+            bail!("codegraph impact: symbol \"{symbol}\" not found");
+        }
         return Ok(());
     }
     let traverser = GraphTraverser::new(&store);
@@ -2740,17 +2791,14 @@ fn cmd_impact(
         for edge in impact.edges {
             edge_keys.insert((edge.source, edge.target, edge.kind));
         }
-        if node.kind == NodeKind::File
-            && is_godot_resource_path(&node.file_path)
-            && !godot_files.contains(&node.file_path)
-        {
+        if is_godot_resource_target_node(node) && !godot_files.contains(&node.file_path) {
             godot_files.push(node.file_path.clone());
         }
     }
     let mut affected = nodes.values().map(NodeSummary::from).collect::<Vec<_>>();
     let mut godot_referrers: Vec<String> = Vec::new();
     for file in &godot_files {
-        godot_referrers.extend(store.dependent_file_paths_unresolved(file)?);
+        godot_referrers.extend(godot_reverse_referrers(&store, file)?);
     }
     godot_referrers.sort();
     godot_referrers.dedup();
@@ -2797,7 +2845,7 @@ fn cmd_explore(
         args["maxFiles"] = json!(max_files);
     }
     let result = engine.execute("codegraph_explore", &args);
-    print_engine_result("explore", &query, &result, json_output)
+    print_engine_result("explore", &query, &result, json_output, false)
 }
 
 fn cmd_node(
@@ -2805,6 +2853,7 @@ fn cmd_node(
     path: Option<PathBuf>,
     symbols_only: bool,
     json_output: bool,
+    strict: bool,
 ) -> Result<()> {
     let project = resolve_required_project(path)?;
     let engine = codegraph_mcp::CodeGraphEngine::open(&project)?;
@@ -2814,7 +2863,7 @@ fn cmd_node(
         json!({ "symbol": target, "includeCode": true })
     };
     let result = engine.execute("codegraph_node", &args);
-    print_engine_result("node", &target, &result, json_output)
+    print_engine_result("node", &target, &result, json_output, strict)
 }
 
 /// Decide whether a `codegraph node <target>` argument names an indexed FILE (→
@@ -2843,6 +2892,7 @@ fn print_engine_result(
     query: &str,
     result: &codegraph_mcp::protocol::ToolResult,
     json_output: bool,
+    strict: bool,
 ) -> Result<()> {
     let text = result
         .content
@@ -2863,6 +2913,9 @@ fn print_engine_result(
     }
     if is_error {
         bail!("codegraph {command} failed: {text}");
+    }
+    if strict && result.not_found.unwrap_or(false) {
+        bail!("codegraph {command}: \"{query}\" not found");
     }
     Ok(())
 }
@@ -2893,8 +2946,7 @@ fn cmd_affected(
                 continue;
             }
             let mut dependents = store.dependent_file_paths(&current)?;
-            dependents.extend(store.dependent_file_paths_unresolved(&current)?);
-            dependents.extend(store.dependent_file_paths_via_import_name(&current)?);
+            dependents.extend(godot_reverse_referrers(&store, &current)?);
             dependents.sort();
             dependents.dedup();
             for dependent in dependents {
@@ -3166,6 +3218,25 @@ fn is_godot_resource_path(path: &str) -> bool {
         || lower.ends_with(".tscn")
         || lower.ends_with(".res")
         || lower.ends_with(".gd")
+}
+
+/// Whether a matched `impact` node names a Godot RESOURCE whose reverse
+/// referrers should fold into the impact set — as opposed to a symbol that
+/// merely lives in a Godot file. A `.tscn`/`.tres`/`.res` owns no `file:` node,
+/// so its ONLY node is a scene-level `Constant` (the whole-resource target); a
+/// `.gd` folds only when the matched node is its `file:` node (a whole-file
+/// target), never when it is a symbol (function/class) inside that script — that
+/// would wrongly attach the script's scene/autoload referrers to a symbol-level
+/// query.
+fn is_godot_resource_target_node(node: &codegraph_core::types::Node) -> bool {
+    if !is_godot_resource_path(&node.file_path) {
+        return false;
+    }
+    let lower = node.file_path.to_ascii_lowercase();
+    if lower.ends_with(".gd") {
+        return node.kind == NodeKind::File;
+    }
+    true
 }
 
 fn print_audit_orphans(orphans: &[codegraph_graph::graph::OrphanResource]) {

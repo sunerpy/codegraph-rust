@@ -14,6 +14,28 @@
     "candidates": null,
     "col": 0,
     "file_path": "project.godot",
+    "from_node_id": "constant:49315a6865ec360838012645ac4e5037",
+    "language": "godot_project",
+    "line": 10,
+    "reference_kind": "references",
+    "reference_name": "effect_manager.gd",
+    "reference_subkind": "autoload"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "project.godot",
+    "from_node_id": "constant:6e80876e97762b0f0a93037c431cf364",
+    "language": "godot_project",
+    "line": 11,
+    "reference_kind": "references",
+    "reference_name": "combo_ui.tscn",
+    "reference_subkind": "autoload"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "project.godot",
     "from_node_id": "constant:f89784c51d837f372217e3a0acd6e728",
     "language": "godot_project",
     "line": 9,
@@ -50,6 +72,16 @@
     "line": 6,
     "reference_kind": "calls",
     "reference_name": "Callable"
+  },
+  {
+    "candidates": null,
+    "col": 8,
+    "file_path": "effect_manager.gd",
+    "from_node_id": "file:effect_manager.gd",
+    "language": "gdscript",
+    "line": 1,
+    "reference_kind": "extends",
+    "reference_name": "Node"
   },
   {
     "candidates": null,

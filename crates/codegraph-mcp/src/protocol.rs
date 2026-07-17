@@ -91,6 +91,14 @@ pub struct ToolResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "isError")]
     pub is_error: Option<bool>,
+    /// Structured "the lookup found nothing" signal for a non-error result — set
+    /// at the engine's genuine not-found/empty branches so callers can gate on
+    /// it (`--strict`) WITHOUT substring-matching the rendered text, which would
+    /// misfire on a matched node whose source body contains a sentinel phrase.
+    /// Skipped when None, so the MCP wire shape is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "notFound")]
+    pub not_found: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -109,6 +117,17 @@ impl ToolResult {
                 text: text.into(),
             }],
             is_error: None,
+            not_found: None,
+        }
+    }
+
+    /// A non-error result whose text is a genuine "found nothing" sentinel;
+    /// flags `not_found` so `--strict` callers gate on it without inspecting the
+    /// text. Wire shape matches [`Self::text`] (the flag is skipped when None).
+    pub fn not_found_text(text: impl Into<String>) -> Self {
+        Self {
+            not_found: Some(true),
+            ..Self::text(text)
         }
     }
 
@@ -121,6 +140,7 @@ impl ToolResult {
                 text: format!("Error: {message}"),
             }],
             is_error: Some(true),
+            not_found: None,
         }
     }
 }

@@ -2,6 +2,30 @@
   {
     "col": 0,
     "kind": "calls",
+    "line": 10,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "function:e7d6028e334cefe390f5a7b17d18c2de",
+    "target": "constant:49315a6865ec360838012645ac4e5037"
+  },
+  {
+    "col": 0,
+    "kind": "calls",
+    "line": 10,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "function:e7d6028e334cefe390f5a7b17d18c2de",
+    "target": "function:579892a37e71bddf1fd52a37ca2f0738"
+  },
+  {
+    "col": 0,
+    "kind": "calls",
     "line": 5,
     "metadata": {
       "confidence": 0.9,
@@ -9,7 +33,7 @@
     },
     "provenance": null,
     "source": "function:1f948ab9675bc7bfad6e4e9296fe0017",
-    "target": "function:3e7258a7b719c0eecf053f21cadf499b"
+    "target": "function:2fd9ae68b8cdbe2953bf12997d1e790d"
   },
   {
     "col": 0,
@@ -21,7 +45,7 @@
     },
     "provenance": null,
     "source": "function:1f948ab9675bc7bfad6e4e9296fe0017",
-    "target": "function:ded3bac40c3278b2e878c84f6fd25097"
+    "target": "function:9b775f9daa70467ddf403b28c920ad70"
   },
   {
     "col": 0,
@@ -53,6 +77,15 @@
     "line": null,
     "metadata": null,
     "provenance": null,
+    "source": "file:effect_manager.gd",
+    "target": "function:579892a37e71bddf1fd52a37ca2f0738"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
     "source": "file:game_flow.gd",
     "target": "function:0dba39278ee3bc0185ce741223429845"
   },
@@ -72,7 +105,7 @@
     "metadata": null,
     "provenance": null,
     "source": "file:stage_manager.gd",
-    "target": "function:3e7258a7b719c0eecf053f21cadf499b"
+    "target": "function:2fd9ae68b8cdbe2953bf12997d1e790d"
   },
   {
     "col": null,
@@ -81,7 +114,7 @@
     "metadata": null,
     "provenance": null,
     "source": "file:stage_manager.gd",
-    "target": "function:ded3bac40c3278b2e878c84f6fd25097"
+    "target": "function:9b775f9daa70467ddf403b28c920ad70"
   },
   {
     "col": null,

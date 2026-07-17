@@ -7,6 +7,7 @@ func _ready() -> void:
 
 func _goto_map() -> void:
 	GameFlow.return_to_map()
+	EffectManager.apply_effect()
 
 func _on_pressed(source) -> void:
 	pass

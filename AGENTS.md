@@ -10,7 +10,9 @@ Protocol) stdio server. No AI / vector / LLM anywhere in the binary — output i
 - **Golden `.schema` byte-stability** — verified by `crates/codegraph-bench/tests/equivalence.rs`
   against the fixed golden artifacts under `reference/golden/`. Fixtures: the existing upstream
   corpus plus `reference/golden/godot/` (corpus `crates/codegraph-bench/fixtures/godot/`;
-  guards F1 autoload-call edges + F2 signal-handler edges byte-for-byte) and
+  guards F1 autoload-call edges + F2 signal-handler edges + UID-form autoloads
+  — a sidecar-UID script autoload (`*.gd.uid`) and a header-UID scene autoload
+  (`.tscn` `uid=`) — byte-for-byte) and
   `reference/golden/ruby/` (corpus `crates/codegraph-bench/fixtures/ruby/`; guards #1110
   Ruby `receiver.method` extraction — instance/class-method Calls, `Const.new` Instantiates,
   bare `include` Implements — byte-for-byte) and `reference/golden/cpp/`

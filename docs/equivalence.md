@@ -155,9 +155,17 @@ extraction that the mini fixture cannot reach — there are no `.gd`/`.tscn`/
   (`Calls` edges).
 - **F3** — a `.tscn` `ExtResource` script attachment (`main.tscn` →
   `stage_manager.gd`), captured as a `script_attach` unresolved-ref subkind.
+- **UID-form autoloads** — a sidecar-UID SCRIPT autoload
+  (`EffectManager="*uid://…"` resolved through `effect_manager.gd.uid` →
+  `effect_manager.gd`, with an `EffectManager.apply_effect()` F1 method edge) and
+  a header-UID SCENE autoload (`ComboUi="*uid://…"` resolved through
+  `combo_ui.tscn`'s `uid=` header, registration-only). Both emit an
+  `Autoload`-subkind UNRESOLVED ref; the `.gd.uid` sidecar is NOT indexed (it maps
+  to `Language::Unknown`, so it is neither a file record nor a node).
 
 The minimal source corpus lives at `crates/codegraph-bench/fixtures/godot/`
-(`project.godot`, `game_flow.gd`, `stage_manager.gd`, `main.tscn`).
+(`project.godot`, `game_flow.gd`, `stage_manager.gd`, `main.tscn`,
+`effect_manager.gd`, `effect_manager.gd.uid`, `combo_ui.tscn`).
 
 Regenerate the committed database + canonical JSON reproducibly from the corpus:
 

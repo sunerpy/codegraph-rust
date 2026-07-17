@@ -96,6 +96,31 @@ fn affected_json(p: &str, file: &str, extra: &[&str]) -> serde_json::Value {
     serde_json::from_str(&stdout).expect("affected emits valid JSON on stdout")
 }
 
+#[test]
+fn impact_and_affected_of_main_scene_list_project_godot() {
+    // Given the indexed godot_audit fixture, where project.godot declares
+    // `run/main_scene="res://main.tscn"` (an untagged main_scene ref).
+    let (_dir, project) = indexed_project("main-scene");
+    let p = project.to_str().unwrap();
+
+    // When impact runs on the main scene, project.godot is surfaced as a
+    // referrer (P2 — the untagged main_scene reverse lane).
+    let (impact_out, err, ok) = cli(&["impact", "main.tscn", "-p", p]);
+    assert!(ok, "impact failed: stdout={impact_out} stderr={err}");
+    assert!(
+        impact_out.contains("project.godot"),
+        "impact main.tscn must list project.godot: {impact_out}"
+    );
+
+    // And affected agrees at its own entrypoint (both route the shared helper).
+    let value = affected_json(p, "main.tscn", &["--depth", "5"]);
+    let affected_files = string_array(&value, "affectedFiles");
+    assert!(
+        affected_files.contains(&"project.godot".to_string()),
+        "affected main.tscn must list project.godot: {affected_files:?}"
+    );
+}
+
 fn string_array(value: &serde_json::Value, key: &str) -> Vec<String> {
     value[key]
         .as_array()

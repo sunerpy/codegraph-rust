@@ -191,7 +191,7 @@ impl CodeGraphEngine {
         };
         let results = search_nodes(&self.store, &query, &options, &self.project_name_tokens())?;
         if results.is_empty() {
-            return Ok(ToolResult::text(format!(
+            return Ok(ToolResult::not_found_text(format!(
                 "No results found for \"{query}\""
             )));
         }
@@ -223,7 +223,7 @@ impl CodeGraphEngine {
 
         let all_matches = self.find_all_symbols(&symbol)?;
         if all_matches.nodes.is_empty() {
-            return Ok(ToolResult::text(format!(
+            return Ok(ToolResult::not_found_text(format!(
                 "Symbol \"{symbol}\" not found in the codebase"
             )));
         }
@@ -253,7 +253,7 @@ impl CodeGraphEngine {
                 CallDir::Callers => "callers",
                 CallDir::Callees => "callees",
             };
-            return Ok(ToolResult::text(format!(
+            return Ok(ToolResult::not_found_text(format!(
                 "No {label} found for \"{symbol}\"{}{}",
                 all_matches.note,
                 godot.annotation(true)
@@ -287,7 +287,7 @@ impl CodeGraphEngine {
 
         let all_matches = self.find_all_symbols(&symbol)?;
         if all_matches.nodes.is_empty() {
-            return Ok(ToolResult::text(format!(
+            return Ok(ToolResult::not_found_text(format!(
                 "Symbol \"{symbol}\" not found in the codebase"
             )));
         }
@@ -354,7 +354,7 @@ impl CodeGraphEngine {
 
         let matches = self.find_symbol_matches(symbol)?;
         if matches.is_empty() {
-            return Ok(ToolResult::text(format!(
+            return Ok(ToolResult::not_found_text(format!(
                 "Symbol \"{symbol}\" not found in the codebase"
             )));
         }
@@ -507,7 +507,7 @@ impl CodeGraphEngine {
 
         let files = self.store.all_files()?;
         if files.is_empty() {
-            return Ok(ToolResult::text(
+            return Ok(ToolResult::not_found_text(
                 "No files indexed. Run `codegraph index` first.",
             ));
         }
@@ -516,7 +516,7 @@ impl CodeGraphEngine {
         let file_path = match candidates.as_slice() {
             [one] => one.clone(),
             [] => {
-                return Ok(ToolResult::text(format!(
+                return Ok(ToolResult::not_found_text(format!(
                     "No indexed file matches \"{file_arg}\". Codegraph indexes source files; configs/docs it doesn't parse won't appear — Read those directly."
                 )));
             }
