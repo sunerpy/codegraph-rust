@@ -1,5 +1,21 @@
 [
   {
+    "content_hash": "33a6ab1ac82701bd870b22dd52e8677fc23e4099d38947face8b931780fd20bc",
+    "errors": null,
+    "language": "godot_scene",
+    "node_count": 0,
+    "path": "combo_ui.tscn",
+    "size": 81
+  },
+  {
+    "content_hash": "6f5b810b12eeba2d908d628a74a55dd5da8997f2775681cc26c584650d7d5581",
+    "errors": null,
+    "language": "gdscript",
+    "node_count": 2,
+    "path": "effect_manager.gd",
+    "size": 49
+  },
+  {
     "content_hash": "40f411be7a8b9048869b5a8902243a44fcb645c67e3c1d2fb05b0f20b5c7075c",
     "errors": null,
     "language": "gdscript",
@@ -16,19 +32,19 @@
     "size": 170
   },
   {
-    "content_hash": "2c29a56104c250f916b6eefdf70d900e4c59febb9f13bf6b76d0545022c0789b",
+    "content_hash": "b01662a4255e8445a808378889ccf8b38b49d012cd8ed933fa540b5f9e097d60",
     "errors": null,
     "language": "godot_project",
     "node_count": 0,
     "path": "project.godot",
-    "size": 115
+    "size": 183
   },
   {
-    "content_hash": "0d871d1bfe4a545bb3c40492a9215e9927a0e7a32b946cb4fd30140b22ce2b19",
+    "content_hash": "5410c79a7bb764595c01f175fb3533956a84c884801660428bc032b000a01131",
     "errors": null,
     "language": "gdscript",
     "node_count": 6,
     "path": "stage_manager.gd",
-    "size": 302
+    "size": 332
   }
 ]

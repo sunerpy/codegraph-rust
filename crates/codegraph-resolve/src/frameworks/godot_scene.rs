@@ -240,6 +240,72 @@ pub(crate) fn scene_uid_map(project_root: &str) -> BTreeMap<String, String> {
 /// `.godot/` cache and any hidden dir (`.git`, etc.). Errors are ignored
 /// (tolerant walk); ordering is imposed by the caller's sort.
 fn collect_tscn_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    collect_files_with_suffix(dir, ".tscn", out);
+}
+
+/// Build a deterministic `uid://<id>` → repo-relative `.gd` script-path map by
+/// reading every `<script>.gd.uid` SIDECAR under `project_root`.
+///
+/// Godot writes a `<script>.gd.uid` sidecar next to each GDScript, whose sole
+/// content is that script's `uid://<id>` handle — the id an `[autoload]`
+/// `Name="*uid://<id>"` (script autoload) points at. This mirrors
+/// [`scene_uid_map`]: the discovered sidecars are sorted lexicographically
+/// before parsing and the map is FIRST-WRITE-WINS on a duplicate uid, so the
+/// result is independent of directory-iteration order. Each entry maps the uid
+/// to the sidecar's own path with the trailing `.uid` stripped (the `.gd`),
+/// repo-relative with `/`. An unreadable sidecar, or one whose content is not a
+/// `uid://…` line, contributes nothing. An empty or unreadable `project_root`
+/// yields an empty map.
+pub(crate) fn gd_uid_sidecar_map(project_root: &str) -> BTreeMap<String, String> {
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    if project_root.is_empty() {
+        return out;
+    }
+    let root = Path::new(project_root);
+    let mut uid_files: Vec<PathBuf> = Vec::new();
+    collect_files_with_suffix(root, ".gd.uid", &mut uid_files);
+    uid_files.sort();
+    for full in uid_files {
+        let Ok(rel) = full.strip_prefix(root) else {
+            continue;
+        };
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        let Some(gd_path) = rel.strip_suffix(".uid") else {
+            continue;
+        };
+        let Ok(content) = std::fs::read_to_string(&full) else {
+            continue;
+        };
+        if let Some(uid) = parse_uid_sidecar(&content) {
+            out.entry(uid).or_insert_with(|| gd_path.to_string());
+        }
+    }
+    out
+}
+
+/// Parse a `<script>.gd.uid` sidecar's content into its `uid://<id>` handle.
+/// The sidecar's only meaningful line is the full `uid://<id>` string; the
+/// first non-blank, non-comment line starting with `uid://` is returned (scheme
+/// kept, matching how the id appears in `[autoload]`). Any other content yields
+/// `None`.
+fn parse_uid_sidecar(content: &str) -> Option<String> {
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || is_comment(line) {
+            continue;
+        }
+        if line.starts_with("uid://") {
+            return Some(line.to_string());
+        }
+        return None;
+    }
+    None
+}
+
+/// Recursively collect files whose name ends in `suffix` under `dir`, skipping
+/// any hidden dir (`.godot/`, `.git`, etc.). Errors are ignored (tolerant
+/// walk); ordering is imposed by the caller's sort.
+fn collect_files_with_suffix(dir: &Path, suffix: &str, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -254,9 +320,9 @@ fn collect_tscn_files(dir: &Path, out: &mut Vec<PathBuf>) {
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.starts_with('.'));
             if !skip {
-                collect_tscn_files(&path, out);
+                collect_files_with_suffix(&path, suffix, out);
             }
-        } else if is_tscn(&path.to_string_lossy()) {
+        } else if path.to_string_lossy().ends_with(suffix) {
             out.push(path);
         }
     }
@@ -701,5 +767,57 @@ mod tests {
     #[test]
     fn scene_uid_map_empty_root_is_empty() {
         assert!(scene_uid_map("").is_empty());
+    }
+
+    #[test]
+    fn gd_uid_sidecar_map_reads_uid_and_maps_to_gd() {
+        let dir = temp_dir("sidecar-basic");
+        std::fs::create_dir_all(dir.join("Scripts/Autoloads")).unwrap();
+        std::fs::write(
+            dir.join("Scripts/Autoloads/effect_manager.gd"),
+            "extends Node\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("Scripts/Autoloads/effect_manager.gd.uid"),
+            "uid://bb1ewunp0bc47\n",
+        )
+        .unwrap();
+        let map = gd_uid_sidecar_map(&dir.to_string_lossy());
+        assert_eq!(
+            map.get("uid://bb1ewunp0bc47").map(String::as_str),
+            Some("Scripts/Autoloads/effect_manager.gd")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gd_uid_sidecar_map_first_write_wins_on_dup() {
+        let dir = temp_dir("sidecar-dup");
+        std::fs::write(dir.join("a.gd.uid"), "uid://same\n").unwrap();
+        std::fs::write(dir.join("b.gd.uid"), "uid://same\n").unwrap();
+        let map = gd_uid_sidecar_map(&dir.to_string_lossy());
+        assert_eq!(
+            map.get("uid://same").map(String::as_str),
+            Some("a.gd"),
+            "sorted walk + first-write-wins picks the lexicographically first path"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gd_uid_sidecar_map_unknown_uid_absent() {
+        let dir = temp_dir("sidecar-empty");
+        std::fs::write(dir.join("noise.gd.uid"), "not-a-uid-line\n").unwrap();
+        let map = gd_uid_sidecar_map(&dir.to_string_lossy());
+        assert!(
+            !map.contains_key("uid://missing"),
+            "an absent uid maps to nothing"
+        );
+        assert!(
+            map.is_empty(),
+            "a sidecar without a uid:// line contributes nothing"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

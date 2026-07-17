@@ -878,6 +878,18 @@ mod tests {
     }
 
     #[test]
+    fn gd_uid_sidecar_never_becomes_file_record() {
+        assert_eq!(
+            detect_language("Scripts/effect_manager.gd.uid"),
+            Language::Unknown
+        );
+        assert!(
+            !is_extractable_source_path("Scripts/effect_manager.gd.uid"),
+            ".gd.uid sidecar must never be scanned into a file record"
+        );
+    }
+
+    #[test]
     fn metal_cu_cuh_map_to_cpp() {
         assert_eq!(detect_language("s.metal"), Language::Cpp);
         assert_eq!(detect_language("k.cu"), Language::Cpp);

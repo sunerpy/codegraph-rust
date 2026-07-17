@@ -349,6 +349,20 @@ having no DSL config at all.
 
 ## Limitations
 
+- **UID-input edits need `index --force`, not incremental `sync`.** Autoload and
+  `run/main_scene` values may be `uid://…` handles resolved through the project's
+  `*.gd.uid` sidecars and `.tscn` `uid=` headers. Those UID inputs are read at
+  index time; `.gd.uid` sidecars are unindexed, so an incremental `codegraph
+sync` that touches only a `.gd.uid`, a `.tscn` uid header, or a file rename does
+  NOT re-extract `project.godot` and the UID→target edge can go stale. Re-run
+  `codegraph index --force` after editing autoload or main-scene UIDs. Tracked as
+  follow-up `godot-uid-incremental-invalidation` (covers both the autoload UID and
+  the pre-existing main_scene UID).
+- **Scene-backed autoloads are registration-only.** A `uid://…` autoload that
+  resolves to a `.tscn` (scene autoload) emits the `project.godot → .tscn`
+  registration reference but no F1 `Autoload.method()` binding to the scene's
+  attached script. Script autoloads (a `.gd.uid` sidecar or a `res://…` `.gd`
+  path) keep full F1 method binding.
 - **Computed targets are unresolved, not fabricated.** `get_node(var)`,
   `call(method_name_var)`, and similar patterns where the argument is not a
   string literal cannot be resolved statically. They appear as

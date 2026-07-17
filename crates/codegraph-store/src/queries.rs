@@ -1182,6 +1182,42 @@ impl Store {
         Ok(out)
     }
 
+    /// The Godot `run/main_scene` reverse-dependency lane. The main-scene ref is
+    /// emitted UNTAGGED (`reference_subkind = NULL`), so
+    /// [`Self::dependent_file_paths_unresolved`]'s 6-subkind allow-list — which
+    /// guards other-language byte-stability — deliberately excludes it. This
+    /// dedicated lane surfaces it without loosening that allow-list: it matches
+    /// only `unresolved_refs` rows whose OWNING file is a `project.godot`
+    /// (basename gate) AND whose `reference_subkind IS NULL` AND whose
+    /// `res://`-stripped, `/`-normalized `reference_name` equals `file_path`. The
+    /// `project.godot` origin gate means a non-Godot None-subkind ref is never
+    /// returned, so other languages stay byte-unchanged. Golden-neutral; returns
+    /// DISTINCT referrers in scan order (caller sorts/dedups).
+    pub fn dependent_file_paths_main_scene(
+        &self,
+        file_path: &str,
+    ) -> rusqlite::Result<Vec<String>> {
+        let target = strip_res_scheme(&file_path.replace('\\', "/")).to_string();
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT file_path, reference_name FROM unresolved_refs \
+             WHERE reference_subkind IS NULL",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (from_file, reference_name) = row?;
+            if !is_project_godot_path(&from_file) {
+                continue;
+            }
+            if strip_res_scheme(&reference_name.replace('\\', "/")) == target {
+                out.push(from_file);
+            }
+        }
+        Ok(out)
+    }
+
     /// Godot loader-side reverse-dependency lane. A GDScript
     /// `preload/load("res://X")` RESOLVES to an `import:` node whose `name` is the
     /// `res://` path and whose `file_path` is the LOADER script. When `X` is a
@@ -1492,6 +1528,12 @@ fn parse_reference_subkind(value: Option<String>) -> rusqlite::Result<Option<Ref
 
 fn strip_res_scheme(s: &str) -> &str {
     s.strip_prefix("res://").unwrap_or(s)
+}
+
+fn is_project_godot_path(path: &str) -> bool {
+    path.rsplit(['/', '\\'])
+        .next()
+        .is_some_and(|base| base == "project.godot")
 }
 
 fn parse_language(value: String) -> rusqlite::Result<Language> {
@@ -2683,6 +2725,70 @@ mod tests {
                 .dependent_file_paths_via_import_name("Scenes/Missing.tscn")
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn dependent_file_paths_main_scene_surfaces_untagged_project_godot_only() {
+        let mut store = store("main-scene-lane");
+        store
+            .upsert_nodes(&[
+                node("godot:project", "project", "project.godot"),
+                node("function:rust", "user", "src/main.rs"),
+            ])
+            .unwrap();
+        let mk = |from: &str,
+                  name: &str,
+                  file: &str,
+                  lang: Language,
+                  subkind: Option<ReferenceSubkind>| UnresolvedRef {
+            id: None,
+            from_node_id: from.to_string(),
+            reference_name: name.to_string(),
+            reference_kind: EdgeKind::References,
+            line: 1,
+            col: 0,
+            candidates: None,
+            file_path: file.to_string(),
+            language: lang,
+            is_function_ref: false,
+            reference_subkind: subkind,
+        };
+        store
+            .insert_unresolved_refs(&[
+                mk(
+                    "godot:project",
+                    "res://scenes/main_menu.tscn",
+                    "project.godot",
+                    Language::GodotProject,
+                    None,
+                ),
+                mk(
+                    "function:rust",
+                    "scenes/main_menu.tscn",
+                    "src/main.rs",
+                    Language::Rust,
+                    None,
+                ),
+            ])
+            .unwrap();
+
+        let referrers = store
+            .dependent_file_paths_main_scene("scenes/main_menu.tscn")
+            .unwrap();
+        assert_eq!(
+            referrers,
+            vec!["project.godot".to_string()],
+            "the untagged main_scene ref surfaces its project.godot origin; the non-Godot None ref is excluded by the origin gate"
+        );
+
+        let mut unresolved = store
+            .dependent_file_paths_unresolved("scenes/main_menu.tscn")
+            .unwrap();
+        unresolved.sort();
+        assert!(
+            unresolved.is_empty(),
+            "the 6-subkind allow-list still excludes the untagged main_scene ref (byte-unchanged)"
         );
     }
 

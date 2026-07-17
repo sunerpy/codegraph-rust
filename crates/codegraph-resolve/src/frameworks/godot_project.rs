@@ -48,11 +48,13 @@
 //! header), an unterminated value, or an unknown section is skipped, never
 //! panics. An empty or sectionless file yields an empty result.
 
+use std::collections::BTreeMap;
+
 use codegraph_core::node_id::generate_node_id;
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind, ReferenceSubkind};
 
 use super::framework_node;
-use super::godot_common::{map_res_path, map_res_path_inner, quoted_strings};
+use super::godot_common::{map_res_path, map_res_path_inner, quoted_strings, strip_quotes};
 use crate::types::{FrameworkResolverExtractionResult, RefView};
 
 /// The marker basename this parser handles.
@@ -79,11 +81,13 @@ pub(crate) fn parse_project_godot(
     let mut nodes: Vec<Node> = Vec::new();
     let mut references: Vec<RefView> = Vec::new();
 
-    // `run/main_scene` may be a `uid://…` (Godot 4.x default) rather than a
-    // `res://…` path. Resolving it needs the project-wide `uid → .tscn path`
-    // map, built lazily on first `uid://` main_scene so a project without one
-    // pays nothing.
-    let mut scene_uids: Option<std::collections::BTreeMap<String, String>> = None;
+    // `run/main_scene` and `[autoload]` values may be a `uid://…` (Godot 4.x
+    // default) rather than a `res://…` path. A scene uid resolves through the
+    // project-wide `uid → .tscn path` map; an autoload SCRIPT uid resolves
+    // through the `uid → .gd path` sidecar map. Both are built lazily on first
+    // `uid://` need so a project without one pays nothing.
+    let mut scene_uids: Option<BTreeMap<String, String>> = None;
+    let mut script_uids: Option<BTreeMap<String, String>> = None;
 
     let mut section: Option<Section> = None;
     // Track whether we are inside a multi-line `key={ ... }` value so its inner
@@ -121,9 +125,17 @@ pub(crate) fn parse_project_godot(
         };
 
         match section {
-            Section::Autoload => {
-                emit_autoload(file_path, line_no, key, value, &mut nodes, &mut references)
-            }
+            Section::Autoload => emit_autoload(
+                file_path,
+                line_no,
+                key,
+                value,
+                project_root,
+                &mut scene_uids,
+                &mut script_uids,
+                &mut nodes,
+                &mut references,
+            ),
             Section::Application => {
                 if key == "run/main_scene" {
                     emit_main_scene(
@@ -161,10 +173,11 @@ pub(crate) fn parse_project_godot(
 /// [`parse_project_godot`] uses, but yields only `(name, path)` pairs (no nodes
 /// / no clock), so it is pure and deterministic. An entry whose value is not a
 /// `res://` path is skipped. First-write-wins on a duplicate name.
-pub(crate) fn autoload_script_paths(content: &str) -> Vec<(String, String)> {
+pub(crate) fn autoload_script_paths(content: &str, project_root: &str) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     let mut section: Option<Section> = None;
     let mut brace_depth: i32 = 0;
+    let mut script_uids: Option<BTreeMap<String, String>> = None;
 
     for raw_line in content.lines() {
         let line = raw_line.trim();
@@ -188,7 +201,8 @@ pub(crate) fn autoload_script_paths(content: &str) -> Vec<(String, String)> {
         match section {
             Section::Autoload => {
                 if !key.is_empty() {
-                    if let Some(path) = map_res_path(value) {
+                    if let Some(path) = autoload_script_path(value, project_root, &mut script_uids)
+                    {
                         if !out.iter().any(|(n, _)| n == key) {
                             out.push((key.to_string(), path));
                         }
@@ -200,6 +214,29 @@ pub(crate) fn autoload_script_paths(content: &str) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// Resolve an `[autoload]` value to a repo-relative SCRIPT path for F1 binding.
+/// A `res://…` value maps via [`map_res_path`]; a `uid://…` value resolves ONLY
+/// through the `.gd.uid` sidecar map (a script autoload). A scene-backed uid
+/// (`.tscn` header) yields `None` here — F1 binds to a script's own `func`s, and
+/// a scene autoload has no such backing script (registration-only per the plan).
+fn autoload_script_path(
+    value: &str,
+    project_root: &str,
+    script_uids: &mut Option<BTreeMap<String, String>>,
+) -> Option<String> {
+    if let Some(path) = map_res_path(value) {
+        return Some(path);
+    }
+    let unquoted = strip_quotes(value).trim();
+    let uid = unquoted.strip_prefix('*').unwrap_or(unquoted);
+    if !uid.starts_with("uid://") {
+        return None;
+    }
+    let scripts =
+        script_uids.get_or_insert_with(|| super::godot_scene::gd_uid_sidecar_map(project_root));
+    scripts.get(uid).cloned()
 }
 
 /// The sections L1 understands.
@@ -225,11 +262,23 @@ impl Section {
 }
 
 /// Emit a singleton node + a `References` edge to its target script/scene.
+///
+/// A `res://…` value maps directly via [`map_res_path`]. A `uid://…` value
+/// (Godot 4.x default) resolves through a combined uid lookup: the `.gd.uid`
+/// SIDECAR map FIRST (a SCRIPT autoload), then the scene `uid → .tscn` map (a
+/// scene-backed autoload). Either resolution emits the SAME
+/// `Autoload`-subkind reference the `res://` form emits, so it enters the
+/// reverse-consume lanes with zero query change. An unresolvable uid emits the
+/// singleton node but NO reference (unknown-uid → no guess).
+#[allow(clippy::too_many_arguments)]
 fn emit_autoload(
     file_path: &str,
     line_no: i64,
     name: &str,
     value: &str,
+    project_root: &str,
+    scene_uids: &mut Option<BTreeMap<String, String>>,
+    script_uids: &mut Option<BTreeMap<String, String>>,
     nodes: &mut Vec<Node>,
     references: &mut Vec<RefView>,
 ) {
@@ -240,9 +289,36 @@ fn emit_autoload(
     let node_id = node.id.clone();
     nodes.push(node);
 
-    if let Some(target) = map_res_path(value) {
+    if let Some(target) = resolve_autoload_target(value, project_root, scene_uids, script_uids) {
         references.push(autoload_reference(node_id, target, line_no, file_path));
     }
+}
+
+/// Resolve an `[autoload]` value to a repo-relative target path. A `res://…`
+/// value maps via the shared [`map_res_path`]; a `uid://…` value is resolved
+/// through the `.gd.uid` sidecar map (script autoload) first, then the scene
+/// `uid → .tscn` map (scene-backed autoload). Any other form yields `None`.
+fn resolve_autoload_target(
+    value: &str,
+    project_root: &str,
+    scene_uids: &mut Option<BTreeMap<String, String>>,
+    script_uids: &mut Option<BTreeMap<String, String>>,
+) -> Option<String> {
+    if let Some(target) = map_res_path(value) {
+        return Some(target);
+    }
+    let unquoted = strip_quotes(value).trim();
+    let uid = unquoted.strip_prefix('*').unwrap_or(unquoted);
+    if !uid.starts_with("uid://") {
+        return None;
+    }
+    let scripts =
+        script_uids.get_or_insert_with(|| super::godot_scene::gd_uid_sidecar_map(project_root));
+    if let Some(path) = scripts.get(uid) {
+        return Some(path.clone());
+    }
+    let scenes = scene_uids.get_or_insert_with(|| super::godot_scene::scene_uid_map(project_root));
+    scenes.get(uid).cloned()
 }
 
 /// Emit a main-scene marker node + a `References` edge to the scene path.
@@ -433,7 +509,7 @@ mod tests {
     fn autoload_script_paths_maps_name_to_repo_relative() {
         let content =
             "[autoload]\nGameState=\"*res://globals/state.gd\"\nMusic=\"res://audio/m.gd\"\n";
-        let got = autoload_script_paths(content);
+        let got = autoload_script_paths(content, "");
         assert_eq!(
             got,
             vec![
@@ -446,14 +522,14 @@ mod tests {
     #[test]
     fn autoload_script_paths_first_write_wins_on_dup_name() {
         let content = "[autoload]\nX=\"res://a.gd\"\nX=\"res://b.gd\"\n";
-        let got = autoload_script_paths(content);
+        let got = autoload_script_paths(content, "");
         assert_eq!(got, vec![("X".to_string(), "a.gd".to_string())]);
     }
 
     #[test]
     fn autoload_script_paths_skips_non_res_value() {
         let content = "[autoload]\nX=\"user://a.gd\"\n";
-        assert!(autoload_script_paths(content).is_empty());
+        assert!(autoload_script_paths(content, "").is_empty());
     }
 
     #[test]
@@ -471,14 +547,14 @@ run/main_scene=\"res://main.tscn\"
 X=\"res://x.gd\"
 ";
         assert_eq!(
-            autoload_script_paths(content),
+            autoload_script_paths(content, ""),
             vec![("X".to_string(), "x.gd".to_string())]
         );
     }
 
     #[test]
     fn autoload_script_paths_empty_when_no_autoload() {
-        assert!(autoload_script_paths("; comment\nconfig_version=5\n").is_empty());
+        assert!(autoload_script_paths("; comment\nconfig_version=5\n", "").is_empty());
     }
 
     #[test]
@@ -547,6 +623,150 @@ X=\"res://x.gd\"
             result.references.is_empty(),
             "unknown uid must emit no ref, got: {:?}",
             result.references
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn autoload_temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-autoload-uid-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    #[test]
+    fn emit_autoload_uid_sidecar_form_emits_reference() {
+        let dir = autoload_temp_dir("sidecar");
+        std::fs::create_dir_all(dir.join("Scripts/Autoloads")).unwrap();
+        std::fs::write(
+            dir.join("Scripts/Autoloads/effect_manager.gd"),
+            "extends Node\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("Scripts/Autoloads/effect_manager.gd.uid"),
+            "uid://bb1ewunp0bc47\n",
+        )
+        .unwrap();
+        let root = dir.to_string_lossy().to_string();
+
+        let content = "[autoload]\nEffectManager=\"*uid://bb1ewunp0bc47\"\n";
+        let result = parse_project_godot("project.godot", content, &root);
+
+        assert_eq!(result.references.len(), 1, "one autoload ref emitted");
+        let r = &result.references[0];
+        assert_eq!(r.reference_name, "Scripts/Autoloads/effect_manager.gd");
+        assert_eq!(r.reference_subkind, Some(ReferenceSubkind::Autoload));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn emit_autoload_uid_scene_form_emits_reference() {
+        let dir = autoload_temp_dir("scene");
+        std::fs::create_dir_all(dir.join("Entities/UI")).unwrap();
+        std::fs::write(
+            dir.join("Entities/UI/ComboUI.tscn"),
+            "[gd_scene format=3 uid=\"uid://bddoi8q2q2olp\"]\n",
+        )
+        .unwrap();
+        let root = dir.to_string_lossy().to_string();
+
+        let content = "[autoload]\nComboUi=\"*uid://bddoi8q2q2olp\"\n";
+        let result = parse_project_godot("project.godot", content, &root);
+
+        assert_eq!(result.references.len(), 1, "one autoload ref emitted");
+        let r = &result.references[0];
+        assert_eq!(r.reference_name, "Entities/UI/ComboUI.tscn");
+        assert_eq!(r.reference_subkind, Some(ReferenceSubkind::Autoload));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gd_uid_collision_sidecar_wins_over_scene() {
+        let dir = autoload_temp_dir("collision");
+        std::fs::create_dir_all(dir.join("Scripts")).unwrap();
+        std::fs::write(dir.join("Scripts/effect_manager.gd"), "extends Node\n").unwrap();
+        std::fs::write(dir.join("Scripts/effect_manager.gd.uid"), "uid://collide\n").unwrap();
+        std::fs::write(
+            dir.join("Scripts/ComboUI.tscn"),
+            "[gd_scene format=3 uid=\"uid://collide\"]\n",
+        )
+        .unwrap();
+        let root = dir.to_string_lossy().to_string();
+
+        let content = "[autoload]\nShared=\"*uid://collide\"\n";
+        let result = parse_project_godot("project.godot", content, &root);
+
+        assert_eq!(result.references.len(), 1, "one autoload ref emitted");
+        assert_eq!(
+            result.references[0].reference_name, "Scripts/effect_manager.gd",
+            "on a uid present in BOTH the sidecar and the scene map, the sidecar .gd wins"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn emit_autoload_unknown_uid_no_reference() {
+        let dir = autoload_temp_dir("miss");
+        let root = dir.to_string_lossy().to_string();
+
+        let content = "[autoload]\nGhost=\"*uid://nope\"\n";
+        let result = parse_project_godot("project.godot", content, &root);
+
+        assert_eq!(result.nodes.len(), 1, "singleton node still emitted");
+        assert!(
+            result.references.is_empty(),
+            "unknown uid emits no reference, got: {:?}",
+            result.references
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn autoload_script_paths_resolves_uid_sidecar_form() {
+        let dir = autoload_temp_dir("scriptpaths");
+        std::fs::create_dir_all(dir.join("Scripts")).unwrap();
+        std::fs::write(dir.join("Scripts/effect_manager.gd"), "extends Node\n").unwrap();
+        std::fs::write(
+            dir.join("Scripts/effect_manager.gd.uid"),
+            "uid://bb1ewunp0bc47\n",
+        )
+        .unwrap();
+        let root = dir.to_string_lossy().to_string();
+
+        let content = "[autoload]\nEffectManager=\"*uid://bb1ewunp0bc47\"\n";
+        let got = autoload_script_paths(content, &root);
+        assert_eq!(
+            got,
+            vec![(
+                "EffectManager".to_string(),
+                "Scripts/effect_manager.gd".to_string()
+            )]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn autoload_script_paths_skips_scene_backed_uid() {
+        let dir = autoload_temp_dir("scriptpaths-scene");
+        std::fs::create_dir_all(dir.join("Entities")).unwrap();
+        std::fs::write(
+            dir.join("Entities/ComboUI.tscn"),
+            "[gd_scene format=3 uid=\"uid://bddoi8q2q2olp\"]\n",
+        )
+        .unwrap();
+        let root = dir.to_string_lossy().to_string();
+
+        let content = "[autoload]\nComboUi=\"*uid://bddoi8q2q2olp\"\n";
+        assert!(
+            autoload_script_paths(content, &root).is_empty(),
+            "scene-backed uid autoload has no F1 script binding"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

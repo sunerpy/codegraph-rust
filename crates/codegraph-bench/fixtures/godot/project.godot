@@ -7,3 +7,5 @@ config/name="CodeGraph Godot Fixture"
 [autoload]
 
 GameFlow="*res://game_flow.gd"
+EffectManager="*uid://bb1ewunp0bc47"
+ComboUi="*uid://bddoi8q2q2olp"

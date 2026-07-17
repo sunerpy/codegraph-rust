@@ -384,10 +384,13 @@ fn resolve_class_member(
 /// same-named `func` in the receiver's bound script (F1). Returns `None` — no
 /// edge — unless every determinism rule holds:
 ///
-/// 1. Single binding source: the target script is ONLY the `res://` path bound to
-///    `Receiver` in `project.godot`'s `[autoload]` section (via
-///    [`autoload_script_bindings`]). A receiver that is not a real `res://`-bound
-///    autoload (a built-in like `Vector2`, a `uid://`-bound autoload, a class
+/// 1. Single binding source: the target script is the path bound to `Receiver`
+///    in `project.godot`'s `[autoload]` section (via
+///    [`autoload_script_bindings`]) — a `res://` `.gd` path or a sidecar-UID
+///    (`*.gd.uid`) script autoload, both of which get full F1 binding. A
+///    scene-header-UID autoload is registration-only (bound to a `.tscn`, no F1
+///    binding to its attached script). A receiver that is not a real script-bound
+///    autoload (a built-in like `Vector2`, a scene-backed autoload, a class
 ///    global) has no binding here → `None`. No global cross-file matching.
 /// 2. Unique-candidate-only: `member` is searched for as a GDScript `Function`
 ///    ONLY inside that one bound script. Exactly one match → resolve to it; zero
@@ -451,7 +454,9 @@ fn autoload_script_bindings(
         let Some(content) = context.read_file(&file) else {
             continue;
         };
-        for (name, path) in godot_project::autoload_script_paths(&content) {
+        for (name, path) in
+            godot_project::autoload_script_paths(&content, context.get_project_root())
+        {
             out.entry(name).or_insert(path);
         }
     }

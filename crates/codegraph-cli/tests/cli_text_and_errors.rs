@@ -315,6 +315,127 @@ fn affected_with_filter_treats_matches_as_tests() {
 }
 
 #[test]
+fn node_missing_is_zero_but_strict_is_nonzero() {
+    let dir = TestDir::new("strict-node");
+    let project = indexed_project(&dir);
+    let p = project.to_str().unwrap();
+
+    let lax = run_in(dir.path(), &["node", "no_such_symbol_zzz", "-p", p]);
+    assert!(lax.ok, "node of a missing symbol must exit 0 by default");
+
+    let strict = run_in(
+        dir.path(),
+        &["node", "no_such_symbol_zzz", "-p", p, "--strict"],
+    );
+    assert!(
+        !strict.ok,
+        "node --strict of a missing symbol must exit non-zero: {}",
+        strict.stdout
+    );
+
+    let hit = run_in(dir.path(), &["node", "add", "-p", p, "--strict"]);
+    assert!(
+        hit.ok,
+        "node --strict of an existing symbol must exit 0: {}",
+        hit.stderr
+    );
+}
+
+#[test]
+fn query_and_impact_strict_flags_gate_exit_code() {
+    let dir = TestDir::new("strict-query-impact");
+    let project = indexed_project(&dir);
+    let p = project.to_str().unwrap();
+
+    let q_lax = run_in(dir.path(), &["query", "no_such_symbol_zzz", "-p", p]);
+    assert!(q_lax.ok, "query of a missing symbol must exit 0 by default");
+    let q_strict = run_in(
+        dir.path(),
+        &["query", "no_such_symbol_zzz", "-p", p, "--strict"],
+    );
+    assert!(
+        !q_strict.ok,
+        "query --strict must exit non-zero on no results"
+    );
+
+    let i_lax = run_in(dir.path(), &["impact", "no_such_symbol_zzz", "-p", p]);
+    assert!(
+        i_lax.ok,
+        "impact of a missing symbol must exit 0 by default"
+    );
+    let i_strict = run_in(
+        dir.path(),
+        &["impact", "no_such_symbol_zzz", "-p", p, "--strict"],
+    );
+    assert!(
+        !i_strict.ok,
+        "impact --strict must exit non-zero when not found"
+    );
+}
+
+#[test]
+fn node_strict_found_symbol_with_sentinel_body_exits_zero() {
+    let dir = TestDir::new("strict-sentinel-body");
+    let project = dir.path().join("mini");
+    copy_tree(&mini_fixture(), &project);
+    std::fs::write(
+        project.join("sentinel.ts"),
+        "export function sentinelCarrier(): string {\n  return \"No results found and not found in the codebase\";\n}\n",
+    )
+    .unwrap();
+    let p = project.to_str().unwrap();
+    let init = run_in(dir.path(), &["init", p]);
+    assert!(init.ok, "init failed: {} {}", init.stdout, init.stderr);
+    let idx = run_in(dir.path(), &["index", "--force", p]);
+    assert!(idx.ok, "index failed: {} {}", idx.stdout, idx.stderr);
+
+    let strict = run_in(
+        dir.path(),
+        &["node", "sentinelCarrier", "-p", p, "--strict"],
+    );
+    assert!(
+        strict.ok,
+        "node --strict of a FOUND symbol must exit 0 even when its source body contains a not-found sentinel phrase: {}",
+        strict.stdout
+    );
+}
+
+#[test]
+fn node_strict_missing_file_exits_nonzero() {
+    let dir = TestDir::new("strict-missing-file");
+    let project = indexed_project(&dir);
+    let p = project.to_str().unwrap();
+
+    let run = run_in(
+        dir.path(),
+        &["node", "some/missing_file.rs", "-p", p, "--strict"],
+    );
+    assert!(
+        !run.ok,
+        "node --strict of a missing file must exit non-zero (the missing-file sentinel is now flagged): {}",
+        run.stdout
+    );
+}
+
+#[test]
+fn affected_help_documents_the_filter_glob() {
+    let dir = TestDir::new("affected-help");
+    let run = run_in(dir.path(), &["affected", "--help"]);
+    assert!(run.ok, "affected --help must succeed: {}", run.stderr);
+    assert!(
+        run.stdout.contains("GLOB"),
+        "affected --help must show the GLOB value name: {}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("affectedTests")
+            && run.stdout.contains("does NOT filter affectedFiles"),
+        "affected --help must document that --filter classifies affectedTests only: {}",
+        run.stdout
+    );
+}
+
+#[test]
 fn index_without_init_errors() {
     let dir = TestDir::new("index-noinit");
     let bare = dir.path().join("bare");
