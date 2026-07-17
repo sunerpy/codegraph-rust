@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.40.0](https://github.com/sunerpy/codegraph-rust/compare/v0.39.0...v0.40.0) (2026-07-17)
+
+
+### Features
+
+* **godot:** resolve UID-form autoloads and unify resource impact queries ([#161](https://github.com/sunerpy/codegraph-rust/issues/161)) ([b005a18](https://github.com/sunerpy/codegraph-rust/commit/b005a180285946934216ccdca1eb3bcdf6e9b981))
+
 ## [0.39.0](https://github.com/sunerpy/codegraph-rust/compare/v0.38.0...v0.39.0) (2026-07-16)
 
 
