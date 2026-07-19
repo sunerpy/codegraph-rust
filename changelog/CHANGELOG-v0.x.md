@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.40.1](https://github.com/sunerpy/codegraph-rust/compare/v0.40.0...v0.40.1) (2026-07-19)
+
+
+### Bug Fixes
+
+* **installer:** trim codegraph skill description under Codex's 1024-char limit ([#163](https://github.com/sunerpy/codegraph-rust/issues/163)) ([bc7fc3b](https://github.com/sunerpy/codegraph-rust/commit/bc7fc3b1c716c63f58ba674f6f47f496b208a30d))
+
 ## [0.40.0](https://github.com/sunerpy/codegraph-rust/compare/v0.39.0...v0.40.0) (2026-07-17)
 
 
