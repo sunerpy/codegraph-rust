@@ -396,6 +396,97 @@ mod tests {
         );
     }
 
+    // --- Codex MAX_DESCRIPTION_LEN guard --------------------------------------
+
+    /// Codex's `core-skills/src/loader.rs` rejects any skill whose YAML
+    /// front-matter `description`, after `sanitize_single_line` (split on
+    /// whitespace and rejoin with single spaces), exceeds `MAX_DESCRIPTION_LEN`
+    /// (1024 chars). An over-limit description is an `InvalidField` parse
+    /// error, which routes the skill into `outcome.errors` (not
+    /// `outcome.skills`) with NO warning surfaced to the user — the skill just
+    /// silently disappears from the agent's skill list. This test fails
+    /// closed: it asserts the front-matter fence, the single folded
+    /// `description: >` block, and its extracted content are all present and
+    /// non-empty before checking the length, so a change in shape (e.g. losing
+    /// the fence or the scalar) fails the test rather than the assertion being
+    /// skipped.
+    #[test]
+    fn skill_description_within_codex_limit() {
+        let content = SKILL_MD;
+        assert!(
+            content.starts_with("---\n"),
+            "SKILL.md must open with a YAML front-matter fence"
+        );
+        let after_open = &content[4..];
+        let close_idx = after_open
+            .find("\n---")
+            .expect("SKILL.md must have a closing front-matter fence");
+        let front_matter = &after_open[..close_idx];
+
+        let lines: Vec<&str> = front_matter.lines().collect();
+        let desc_start = lines
+            .iter()
+            .position(|line| {
+                let trimmed = line.trim_start();
+                trimmed.starts_with("description:") && trimmed["description:".len()..].trim() == ">"
+            })
+            .expect("front-matter must have exactly one `description: >` folded scalar");
+        assert!(
+            lines
+                .iter()
+                .filter(|line| line.trim_start().starts_with("description:"))
+                .count()
+                == 1,
+            "expected exactly one `description:` key in the front-matter"
+        );
+
+        let key_re_is_top_level = |line: &str| -> bool {
+            let mut chars = line.chars();
+            match chars.next() {
+                Some(c) if c.is_ascii_alphanumeric() || c == '_' || c == '-' => {}
+                _ => return false,
+            }
+            line.contains(':')
+                && line
+                    .split(':')
+                    .next()
+                    .unwrap()
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        };
+
+        let mut block_lines = Vec::new();
+        for line in &lines[desc_start + 1..] {
+            if key_re_is_top_level(line) {
+                break;
+            }
+            block_lines.push(*line);
+        }
+        assert!(
+            !block_lines.is_empty(),
+            "description block must not be empty (extraction failed closed)"
+        );
+
+        // Replicates Codex's `sanitize_single_line`: split on whitespace, join
+        // with single spaces. For a `description: >` folded scalar this is
+        // identical to what YAML parsing + sanitize would produce.
+        let joined = block_lines.join(" ");
+        let folded = joined.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let len = folded.chars().count();
+        assert!(
+            len <= 1024,
+            "description folds to {len} chars, exceeding Codex's \
+             MAX_DESCRIPTION_LEN=1024 — the skill would be silently dropped \
+             from Codex's skill list"
+        );
+        assert!(
+            len <= 950,
+            "description folds to {len} chars, exceeding the 950-char \
+             maintenance margin kept below Codex's 1024 hard limit"
+        );
+    }
+
     // --- decide(): all six branches ------------------------------------------
 
     #[test]
