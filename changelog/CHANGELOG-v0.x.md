@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.40.2](https://github.com/sunerpy/codegraph-rust/compare/v0.40.1...v0.40.2) (2026-07-20)
+
+
+### Bug Fixes
+
+* **watch:** prevent native watcher handle leaks ([#165](https://github.com/sunerpy/codegraph-rust/issues/165)) ([a469ae4](https://github.com/sunerpy/codegraph-rust/commit/a469ae4d811a7d35a7036b73fddbac5f6157fccd))
+
 ## [0.40.1](https://github.com/sunerpy/codegraph-rust/compare/v0.40.0...v0.40.1) (2026-07-19)
 
 
