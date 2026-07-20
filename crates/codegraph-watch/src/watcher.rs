@@ -87,6 +87,42 @@ fn classify_notify_error(err: &notify::Error) -> WatchErrorClass {
     }
 }
 
+// Each production target constructs exactly one variant; unit tests exercise both.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchBackend {
+    NativeRecursive,
+    PerDirNonRecursive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchRegistration {
+    SingleRootRecursive,
+    PerDirNonRecursive,
+}
+
+#[cfg(windows)]
+fn platform_watch_backend() -> WatchBackend {
+    WatchBackend::NativeRecursive
+}
+
+#[cfg(target_os = "macos")]
+fn platform_watch_backend() -> WatchBackend {
+    WatchBackend::NativeRecursive
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn platform_watch_backend() -> WatchBackend {
+    WatchBackend::PerDirNonRecursive
+}
+
+fn watch_registration(backend: WatchBackend) -> WatchRegistration {
+    match backend {
+        WatchBackend::NativeRecursive => WatchRegistration::SingleRootRecursive,
+        WatchBackend::PerDirNonRecursive => WatchRegistration::PerDirNonRecursive,
+    }
+}
+
 /// Walk `root` and collect every directory that should be watched, PRUNING any
 /// subtree the [`WatchPolicy`] excludes.
 ///
@@ -146,22 +182,54 @@ fn collect_watch_dirs(root: &Path, policy: &WatchPolicy) -> Vec<PathBuf> {
     dirs
 }
 
+fn initial_watch_targets(
+    backend: WatchBackend,
+    project_root: &Path,
+    policy: &WatchPolicy,
+) -> Vec<(PathBuf, RecursiveMode)> {
+    match watch_registration(backend) {
+        WatchRegistration::SingleRootRecursive => {
+            vec![(project_root.to_path_buf(), RecursiveMode::Recursive)]
+        }
+        WatchRegistration::PerDirNonRecursive => collect_watch_dirs(project_root, policy)
+            .into_iter()
+            .map(|dir| (dir, RecursiveMode::NonRecursive))
+            .collect(),
+    }
+}
+
+fn register_new_dirs_with(
+    backend: WatchBackend,
+    policy: &WatchPolicy,
+    new_dir: &Path,
+    mut register: impl FnMut(&Path, RecursiveMode),
+) {
+    if watch_registration(backend) == WatchRegistration::SingleRootRecursive {
+        return;
+    }
+    for dir in collect_watch_dirs(new_dir, policy) {
+        register(&dir, RecursiveMode::NonRecursive);
+    }
+}
+
 /// Register a NonRecursive watch for a newly-created directory `new_dir` and all
 /// of its non-ignored descendants (a `mkdir -p a/b/c` surfaces one create event,
-/// so the subtree must be re-walked). Reuses `collect_watch_dirs`' pruning rules
-/// via the SAME policy, and silently tolerates a poisoned lock, a stopped watcher
-/// (`None`), or a per-dir watch error — a best-effort top-up that must never panic
-/// the event loop.
+/// so the subtree must be re-walked) on per-directory backends. Windows and macOS
+/// use one native recursive root watch, so this is intentionally a no-op there.
 fn register_new_dirs(watcher: &SharedWatcher, policy: &WatchPolicy, new_dir: &Path) {
+    let backend = platform_watch_backend();
+    if watch_registration(backend) == WatchRegistration::SingleRootRecursive {
+        return;
+    }
     let Ok(mut guard) = watcher.lock() else {
         return;
     };
     let Some(watcher) = guard.as_mut() else {
         return;
     };
-    for dir in collect_watch_dirs(new_dir, policy) {
-        let _ = watcher.watch(&dir, RecursiveMode::NonRecursive);
-    }
+    register_new_dirs_with(backend, policy, new_dir, |dir, mode| {
+        let _ = watcher.watch(dir, mode);
+    });
 }
 
 /// Double `prev` for the next backoff step, saturating at [`MAX_BACKOFF`].
@@ -301,26 +369,16 @@ impl ProjectWatcher {
                         let _ = callback_tx.send(LoopMessage::WatchError(err));
                     }
                 })?;
-            // Register a NON-recursive watch per surviving directory instead of one
-            // blanket `RecursiveMode::Recursive` on the root. On Linux that recursive
-            // mode makes notify register an inotify watch for EVERY subdirectory —
-            // including node_modules/.venv/__pycache__/site-packages/.godot — which
-            // exhausts the kernel `max_user_watches` limit and stalls startup on a
-            // large root. `collect_watch_dirs` prunes ignored subtrees up front, so
-            // we only watch source dirs.
-            //
-            // Platform note: notify v6 honors `NonRecursive` on Linux (inotify, one
-            // watch per dir, exactly what we want). On macOS (FSEvents) and Windows
-            // (ReadDirectoryChangesW) the backend is natively recursive; using
-            // `NonRecursive` there yields per-dir watches that still cover the pruned
-            // set, and any event from an ignored subtree (had we over-watched) is
-            // dropped by the `WatchPolicy` filter in the event loop. So this single
-            // strategy is correct on Linux (the platform with the bug) and safe
-            // elsewhere, with no `#[cfg]` split needed.
-            let dirs = collect_watch_dirs(&project_root, &policy);
+            // Windows ReadDirectoryChangesW and macOS FSEvents cover descendants
+            // with one recursive root watch. Registering every directory separately
+            // is both redundant and expensive on Windows (one 16 KiB buffer plus OS
+            // handles per registration in notify v6). Other targets retain the
+            // pruned per-directory NonRecursive strategy that prevents Linux
+            // inotify exhaustion.
+            let targets = initial_watch_targets(platform_watch_backend(), &project_root, &policy);
             let mut watch_err: Option<notify::Error> = None;
-            for dir in &dirs {
-                if let Err(err) = watcher.watch(dir, RecursiveMode::NonRecursive) {
+            for (dir, mode) in &targets {
+                if let Err(err) = watcher.watch(dir, *mode) {
                     let is_root = dir == &project_root;
                     match classify_notify_error(&err) {
                         // fd/file-table exhaustion can never recover: degrade once.
@@ -1332,6 +1390,67 @@ mod tests {
         let mut sorted = dirs.clone();
         sorted.sort();
         assert_eq!(dirs, sorted, "collect_watch_dirs must be sorted");
+    }
+
+    #[test]
+    fn native_recursive_backend_registers_only_the_root() {
+        // Given: a backend whose OS watcher covers descendants natively.
+        let dir = crate::sync::tests::TestDir::new("watch-native-targets");
+        fs::create_dir_all(dir.path().join("src/nested")).unwrap();
+        let policy = WatchPolicy::new(dir.path());
+
+        // When: the initial watch targets are calculated.
+        let targets = initial_watch_targets(WatchBackend::NativeRecursive, dir.path(), &policy);
+
+        // Then: exactly one recursive root registration is selected.
+        assert_eq!(
+            targets,
+            vec![(dir.path().to_path_buf(), RecursiveMode::Recursive)]
+        );
+    }
+
+    #[test]
+    fn per_dir_backend_registers_the_pruned_non_recursive_set() {
+        // Given: retained source directories and an ignored subtree.
+        let dir = crate::sync::tests::TestDir::new("watch-per-dir-targets");
+        fs::create_dir_all(dir.path().join("src/nested")).unwrap();
+        fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
+        let policy = WatchPolicy::new(dir.path());
+
+        // When: the initial watch targets are calculated.
+        let targets = initial_watch_targets(WatchBackend::PerDirNonRecursive, dir.path(), &policy);
+
+        // Then: every retained directory is non-recursive and ignored dirs are absent.
+        assert_eq!(
+            targets,
+            vec![
+                (dir.path().to_path_buf(), RecursiveMode::NonRecursive),
+                (dir.path().join("src"), RecursiveMode::NonRecursive),
+                (dir.path().join("src/nested"), RecursiveMode::NonRecursive),
+            ]
+        );
+    }
+
+    #[test]
+    fn native_recursive_registration_does_not_top_up_new_directories() {
+        // Given: a new directory under a native-recursive watch and an injected
+        // registration callback that records every attempted `.watch()` call.
+        let dir = crate::sync::tests::TestDir::new("watch-native-new-dir");
+        let new_dir = dir.path().join("feature");
+        fs::create_dir_all(new_dir.join("nested")).unwrap();
+        let policy = WatchPolicy::new(dir.path());
+        let mut registrations = Vec::new();
+
+        // When: the create-event top-up path runs for the new directory.
+        register_new_dirs_with(
+            WatchBackend::NativeRecursive,
+            &policy,
+            &new_dir,
+            |path, mode| registrations.push((path.to_path_buf(), mode)),
+        );
+
+        // Then: the native root watch grows by zero registrations.
+        assert!(registrations.is_empty());
     }
 
     fn normalize_relative_for_test(relative: &Path) -> String {
