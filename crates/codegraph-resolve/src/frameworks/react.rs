@@ -93,8 +93,7 @@ impl FrameworkResolver for ReactResolver {
                 let line = line_of(content, full.start());
 
                 let after_start = full.end();
-                let after_end = (after_start + 500).min(content.len());
-                let after = &content[after_start..after_end];
+                let after = byte_window(content, after_start, 500);
                 let has_jsx = after.contains('<') && (after.contains("/>") || after.contains("</"));
                 if !has_jsx {
                     continue;
@@ -152,8 +151,7 @@ impl FrameworkResolver for ReactResolver {
 
         // React Router <Route .../> (v5/v6) (react.ts:158-198).
         for tag in route_tag_regex().find_iter(content) {
-            let window_end = (tag.start() + 400).min(content.len());
-            let window = &content[tag.start()..window_end];
+            let window = byte_window(content, tag.start(), 400);
             let Some(path_match) = route_path_attr().captures(window) else {
                 continue;
             };
@@ -187,8 +185,7 @@ impl FrameworkResolver for ReactResolver {
         if data_router_regex().is_match(content) {
             for m in obj_path_regex().captures_iter(content) {
                 let whole = m.get(0).expect("group 0");
-                let win_end = (whole.start() + 300).min(content.len());
-                let win = &content[whole.start()..win_end];
+                let win = byte_window(content, whole.start(), 300);
                 let comp = obj_element_attr()
                     .captures(win)
                     .or_else(|| obj_component_attr().captures(win))
@@ -512,6 +509,14 @@ fn dir_of(file: &str) -> String {
 /// 1-based line number of `byte_index` (`slice(0, idx).split('\n').length`).
 fn line_of(content: &str, byte_index: usize) -> i64 {
     content[..byte_index].matches('\n').count() as i64 + 1
+}
+
+fn byte_window(content: &str, start: usize, max_bytes: usize) -> &str {
+    let mut end = start.saturating_add(max_bytes).min(content.len());
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    &content[start..end]
 }
 
 fn component_patterns() -> &'static [Regex] {
@@ -1036,6 +1041,25 @@ mod tests {
     }
 
     #[test]
+    fn extract_component_handles_utf8_at_lookahead_boundary() {
+        let mut content = String::from("function Card(");
+        content.push_str("<div/>");
+        content.push_str(&"a".repeat(493));
+        content.push('é');
+
+        let result = ReactResolver
+            .extract("src/Card.tsx", &content, "")
+            .expect("extract");
+
+        assert!(
+            result
+                .nodes
+                .iter()
+                .any(|n| n.kind == NodeKind::Component && n.name == "Card")
+        );
+    }
+
+    #[test]
     fn extract_component_without_jsx_is_skipped() {
         // A PascalCase function that returns no JSX must NOT be a component node.
         let content = "export function Helper() { return 42; }";
@@ -1109,6 +1133,25 @@ mod tests {
     }
 
     #[test]
+    fn extract_route_handles_utf8_at_lookahead_boundary() {
+        let mut content = String::from("<Route path=\"/utf8\" element={<Home/>} ");
+        content.push_str(&"a".repeat(399 - content.len()));
+        content.push('é');
+
+        let result = ReactResolver
+            .extract("src/App.tsx", &content, "")
+            .expect("extract");
+        let route = result
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Route)
+            .expect("route");
+
+        assert_eq!(route.name, "/utf8");
+        assert!(result.references.iter().any(|r| r.reference_name == "Home"));
+    }
+
+    #[test]
     fn extract_route_without_path_is_skipped() {
         let content = "<Route element={<Home/>}/>";
         let result = ReactResolver
@@ -1136,6 +1179,28 @@ mod tests {
                 .iter()
                 .any(|r| r.reference_name == "Dashboard")
         );
+    }
+
+    #[test]
+    fn extract_data_router_handles_utf8_at_lookahead_boundary() {
+        let mut content =
+            String::from("const routes = createBrowserRouter([{ path: '/utf8', element: <Home/> ");
+        let path_start = content.find("path:").expect("path attribute");
+        let utf8_start = path_start + 299;
+        content.push_str(&"a".repeat(utf8_start - content.len()));
+        content.push('é');
+
+        let result = ReactResolver
+            .extract("src/routes.tsx", &content, "")
+            .expect("extract");
+        let route = result
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Route)
+            .expect("route");
+
+        assert_eq!(route.name, "/utf8");
+        assert!(result.references.iter().any(|r| r.reference_name == "Home"));
     }
 
     #[test]
