@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.40.4](https://github.com/sunerpy/codegraph-rust/compare/v0.40.3...v0.40.4) (2026-07-24)
+
+
+### Bug Fixes
+
+* **watch:** clear ambient git env so repo detection honors current_dir ([#171](https://github.com/sunerpy/codegraph-rust/issues/171)) ([9a9e67f](https://github.com/sunerpy/codegraph-rust/commit/9a9e67fca7629f2d39741ab62af7ce48a2643d4a))
+
 ## [0.40.3](https://github.com/sunerpy/codegraph-rust/compare/v0.40.2...v0.40.3) (2026-07-24)
 
 
