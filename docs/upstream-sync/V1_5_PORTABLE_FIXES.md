@@ -107,3 +107,79 @@ original black-box Red as the behavioral evidence. Every Red entry must identify
 the expected failing assertion, root ID, or behavior gate. Compile failures,
 setup failures, fixture/network failures, and unrelated failures are never valid
 Red evidence.
+
+## E2 workspace-version gate (first Cargo invocation)
+
+This section records the E2 prerequisite: `scripts/check-workspace-versions.sh`
+plus its fixture harness `scripts/tests/check-workspace-versions.test.sh`, both
+authored WITHOUT invoking Cargo. Executing the gate against the repository is the
+first Cargo invocation of the whole v1.5 implementation, and that gate's first
+Cargo subprocess is `cargo metadata --locked --no-deps --format-version 1`. No
+Batch M / behavioral Red or other Cargo command may run before this gate
+succeeds. This is not a behavioral Red; it is the release-invariant gate whose
+Green output authorizes all later Cargo use.
+
+### Cargo-ordering proof
+
+- Test-first commit landed with ZERO prior Cargo: the implementation worktree had
+  no `target/` directory and no Cargo command had run when
+  `test(release): add workspace version gate`
+  (`06d315eb24f51345d56752ea2eb6c3502d74e27b`) was committed on top of the
+  bootstrap `a877aa30269e2fcfe7d3a484540ab05fe60da27a`.
+- First-ever Cargo invocation of the task = the gate run below. A logging Cargo
+  shim placed first on `PATH` captured exactly one Cargo call during a gate run,
+  and it was the metadata command:
+
+  ```text
+  CARGO_INVOCATION: cargo metadata --locked --no-deps --format-version 1 --manifest-path /tmp/opencode/codegraph-rust-v15-impl/Cargo.toml
+  ```
+
+  That is the ONLY Cargo subprocess the gate spawns, and it is non-mutating.
+
+### First real gate run — repository Green
+
+- Command: `scripts/check-workspace-versions.sh` (no arg → repository root).
+- Exit status: `0`.
+- `Cargo.lock` SHA-256 pre-run:
+  `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`
+- `Cargo.lock` SHA-256 post-run:
+  `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`
+  (byte-for-byte unchanged; the EXIT trap re-hashes and enforces this on every
+  exit path.)
+- Four version surfaces, all equal to `0.40.4`:
+  - root `Cargo.toml` `[workspace.package] version` = `0.40.4`
+  - `version.txt` = `0.40.4`
+  - `.release-please-manifest.json` `"."` = `0.40.4`
+  - every source-less `Cargo.lock` package version = `0.40.4`
+- Ten source-less workspace packages identified (identical between
+  `cargo metadata --no-deps` and the source-less `Cargo.lock` entries):
+  `codegraph-bench`, `codegraph-core`, `codegraph-daemon`, `codegraph-extract`,
+  `codegraph-graph`, `codegraph-mcp`, `codegraph-resolve`, `codegraph-rs`,
+  `codegraph-store`, `codegraph-watch`.
+
+### Fixture harness — five scenarios, all as expected
+
+`scripts/tests/check-workspace-versions.test.sh` builds dependency-free temporary
+workspaces so their locks are trivially consistent (`cargo metadata --locked`
+accepts them), then drives the gate. Result: `5 passed, 0 failed`. Every failure
+scenario exits nonzero on a precise business assertion (never a
+compile/setup/environment failure), and every scenario leaves the fixture
+`Cargo.lock` byte-for-byte unchanged.
+
+| Scenario                   | Description                                                       | Expected | Observed exit | Diagnostic (business assertion)                                                                                              | Lock unchanged |
+| -------------------------- | ----------------------------------------------------------------- | -------- | ------------- | ---------------------------------------------------------------------------------------------------------------------------- | -------------- |
+| A `manifest_lock_drift`    | manifest `0.40.4` / lock members `0.40.3`                         | nonzero  | `1`           | `Cargo.lock package 'fixture-pa' = '0.40.3' != [workspace.package] version = '0.40.4'` (and `fixture-pb`)                    | yes            |
+| B `package_set_mismatch`   | extra source-less lock entry (`vendored` excluded from workspace) | nonzero  | `1`           | `workspace package set differs between cargo metadata and Cargo.lock (source-less)` … only in Cargo.lock: `fixture-vendored` | yes            |
+| C `stale_version_txt`      | `version.txt` = `0.40.3`, all else `0.40.4`                       | nonzero  | `1`           | `version.txt = '0.40.3' != [workspace.package] version = '0.40.4'`                                                           | yes            |
+| D `stale_release_manifest` | manifest `"."` = `0.40.3`, all else `0.40.4`                      | nonzero  | `1`           | `.release-please-manifest.json "." = '0.40.3' != [workspace.package] version = '0.40.4'`                                     | yes            |
+| E `repository_green`       | the real repository lock                                          | zero     | `0`           | `check-workspace-versions: OK`                                                                                               | yes            |
+
+### Scope note
+
+This task adds only the gate and its fixture harness. It does NOT begin Batch M,
+does NOT touch the release-please `GenericToml`/`codegraph*` selector, the pinned
+Action commit, any GitHub/AWS workflow, the `Makefile`, hooks, or CI wiring — all
+of which remain E2 follow-up work. No version value in `Cargo.toml`, `Cargo.lock`,
+`version.txt`, or `.release-please-manifest.json` was modified. No third-party
+dependency was added; the gate uses only `bash`, `awk`, `sed`, `jq`, and
+`sha256sum` already present in the repository's toolchain.
