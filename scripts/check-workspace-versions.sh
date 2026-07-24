@@ -61,8 +61,15 @@ LOCK_SHA_PRE="$(sha256sum "$CARGO_LOCK" | awk '{print $1}')"
 
 verify_lock_unchanged() {
     local rc=$?
-    local post
-    post="$(sha256sum "$CARGO_LOCK" 2>/dev/null | awk '{print $1}')"
+    local post=""
+    # Deterministic re-hash: a deleted or unreadable lock cannot match the
+    # snapshot, so treat any hashing failure as `post=<MISSING>` (i.e. changed).
+    # `|| true` keeps `set -e` from short-circuiting the trap before it can
+    # report exit 90.
+    if [ -f "$CARGO_LOCK" ] && [ -r "$CARGO_LOCK" ]; then
+        post="$(sha256sum "$CARGO_LOCK" 2>/dev/null | awk '{print $1}')" || post=""
+    fi
+    [ -n "$post" ] || post="<MISSING-OR-UNREADABLE>"
     if [ "$post" != "$LOCK_SHA_PRE" ]; then
         printf 'check-workspace-versions: CRITICAL: Cargo.lock mutated during gate\n' >&2
         printf '  pre : %s\n' "$LOCK_SHA_PRE" >&2
@@ -75,14 +82,16 @@ trap verify_lock_unchanged EXIT
 
 # ---------------------------------------------------------------------------
 # FIRST CARGO SUBPROCESS: cargo metadata --locked --no-deps --format-version 1
-# Non-mutating; yields the authoritative workspace package set. If the lock is
-# stale relative to the manifests, --locked makes Cargo refuse (drift), which is
-# itself a version-consistency failure this gate must surface.
+# Run from the workspace root (cwd) so the argv is EXACTLY that — no
+# `--manifest-path` — while still working from any caller cwd. Non-mutating;
+# yields the authoritative workspace package set. If the lock is stale relative
+# to the manifests, --locked makes Cargo refuse (drift), which is itself a
+# version-consistency failure this gate must surface.
 # ---------------------------------------------------------------------------
 META_JSON=""
 META_ERR=""
-if ! META_JSON="$(cargo metadata --locked --no-deps --format-version 1 \
-    --manifest-path "$CARGO_TOML" 2>/tmp/cwv_meta_err.$$)"; then
+if ! META_JSON="$(cd "$WORKSPACE_ROOT" && \
+    cargo metadata --locked --no-deps --format-version 1 2>/tmp/cwv_meta_err.$$)"; then
     META_ERR="$(cat "/tmp/cwv_meta_err.$$" 2>/dev/null || true)"
     rm -f "/tmp/cwv_meta_err.$$"
     printf 'check-workspace-versions: FAIL: cargo metadata --locked refused — Cargo.lock is\n' >&2

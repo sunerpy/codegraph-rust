@@ -126,15 +126,23 @@ Green output authorizes all later Cargo use.
   `test(release): add workspace version gate`
   (`06d315eb24f51345d56752ea2eb6c3502d74e27b`) was committed on top of the
   bootstrap `a877aa30269e2fcfe7d3a484540ab05fe60da27a`.
-- First-ever Cargo invocation of the task = the gate run below. A logging Cargo
+- First-ever Cargo invocation of the task = the gate run below. The gate runs
+  Cargo with the workspace root as its current working directory (`cd
+"$WORKSPACE_ROOT"`), so the argv carries NO `--manifest-path`. A logging Cargo
   shim placed first on `PATH` captured exactly one Cargo call during a gate run,
-  and it was the metadata command:
+  and the captured argv was exactly:
 
   ```text
-  CARGO_INVOCATION: cargo metadata --locked --no-deps --format-version 1 --manifest-path /tmp/opencode/codegraph-rust-v15-impl/Cargo.toml
+  metadata --locked --no-deps --format-version 1
   ```
 
-  That is the ONLY Cargo subprocess the gate spawns, and it is non-mutating.
+  That is the ONLY Cargo subprocess the gate spawns, it is non-mutating, and the
+  argv is byte-exact — no `--manifest-path` or other extra argument. The gate
+  works from any caller cwd: it derives the workspace root (positional arg, else
+  the script's parent dir) and changes into it only to run this one command. The
+  fixture harness scenario `F_exact_cargo_argv` invokes the gate from a caller
+  cwd OTHER than the repo root and asserts this exact argv (one call, no
+  `--manifest-path`) mechanically.
 
 ### First real gate run — repository Green
 
@@ -157,22 +165,27 @@ Green output authorizes all later Cargo use.
   `codegraph-graph`, `codegraph-mcp`, `codegraph-resolve`, `codegraph-rs`,
   `codegraph-store`, `codegraph-watch`.
 
-### Fixture harness — five scenarios, all as expected
+### Fixture harness — eight scenarios, all as expected
 
 `scripts/tests/check-workspace-versions.test.sh` builds dependency-free temporary
 workspaces so their locks are trivially consistent (`cargo metadata --locked`
-accepts them), then drives the gate. Result: `5 passed, 0 failed`. Every failure
+accepts them), then drives the gate. Result: `8 passed, 0 failed`. Every failure
 scenario exits nonzero on a precise business assertion (never a
-compile/setup/environment failure), and every scenario leaves the fixture
-`Cargo.lock` byte-for-byte unchanged.
+compile/setup/environment failure), and every scenario leaves its
+`Cargo.lock` byte-for-byte unchanged (the trap-regression scenarios G/H mutate or
+delete a TEMP fixture lock on purpose, and the harness verifies the REAL
+repository lock is never touched).
 
-| Scenario                   | Description                                                       | Expected | Observed exit | Diagnostic (business assertion)                                                                                              | Lock unchanged |
-| -------------------------- | ----------------------------------------------------------------- | -------- | ------------- | ---------------------------------------------------------------------------------------------------------------------------- | -------------- |
-| A `manifest_lock_drift`    | manifest `0.40.4` / lock members `0.40.3`                         | nonzero  | `1`           | `Cargo.lock package 'fixture-pa' = '0.40.3' != [workspace.package] version = '0.40.4'` (and `fixture-pb`)                    | yes            |
-| B `package_set_mismatch`   | extra source-less lock entry (`vendored` excluded from workspace) | nonzero  | `1`           | `workspace package set differs between cargo metadata and Cargo.lock (source-less)` … only in Cargo.lock: `fixture-vendored` | yes            |
-| C `stale_version_txt`      | `version.txt` = `0.40.3`, all else `0.40.4`                       | nonzero  | `1`           | `version.txt = '0.40.3' != [workspace.package] version = '0.40.4'`                                                           | yes            |
-| D `stale_release_manifest` | manifest `"."` = `0.40.3`, all else `0.40.4`                      | nonzero  | `1`           | `.release-please-manifest.json "." = '0.40.3' != [workspace.package] version = '0.40.4'`                                     | yes            |
-| E `repository_green`       | the real repository lock                                          | zero     | `0`           | `check-workspace-versions: OK`                                                                                               | yes            |
+| Scenario                   | Description                                                       | Expected  | Observed exit | Diagnostic / assertion                                                                                                       | Lock unchanged |
+| -------------------------- | ----------------------------------------------------------------- | --------- | ------------- | ---------------------------------------------------------------------------------------------------------------------------- | -------------- |
+| A `manifest_lock_drift`    | manifest `0.40.4` / lock members `0.40.3`                         | nonzero   | `1`           | `Cargo.lock package 'fixture-pa' = '0.40.3' != [workspace.package] version = '0.40.4'` (and `fixture-pb`)                    | yes            |
+| B `package_set_mismatch`   | extra source-less lock entry (`vendored` excluded from workspace) | nonzero   | `1`           | `workspace package set differs between cargo metadata and Cargo.lock (source-less)` … only in Cargo.lock: `fixture-vendored` | yes            |
+| C `stale_version_txt`      | `version.txt` = `0.40.3`, all else `0.40.4`                       | nonzero   | `1`           | `version.txt = '0.40.3' != [workspace.package] version = '0.40.4'`                                                           | yes            |
+| D `stale_release_manifest` | manifest `"."` = `0.40.3`, all else `0.40.4`                      | nonzero   | `1`           | `.release-please-manifest.json "." = '0.40.3' != [workspace.package] version = '0.40.4'`                                     | yes            |
+| E `repository_green`       | the real repository lock                                          | zero      | `0`           | `check-workspace-versions: OK`                                                                                               | yes            |
+| F `exact_cargo_argv`       | argv shim + caller cwd ≠ repo root                                | argv-only | `0`           | captured Cargo argv is exactly `metadata --locked --no-deps --format-version 1` — one call, no `--manifest-path`             | yes (repo)     |
+| G `trap_mutation`          | shim appends bytes to a TEMP fixture lock mid-gate                | `90`      | `90`          | `CRITICAL: Cargo.lock mutated during gate`                                                                                   | repo untouched |
+| H `trap_deletion`          | shim deletes a TEMP fixture lock mid-gate (under `set -e`)        | `90`      | `90`          | `CRITICAL: Cargo.lock mutated during gate` + `MISSING-OR-UNREADABLE` (trap not short-circuited)                              | repo untouched |
 
 ### Scope note
 

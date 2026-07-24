@@ -31,6 +31,11 @@ V="0.40.4"
 
 [ -x "$GATE" ] || { printf 'harness: gate not executable: %s\n' "$GATE" >&2; exit 2; }
 
+# Absolute path to the REAL cargo, resolved BEFORE any shim dir is prepended to
+# PATH, so shims can delegate without a recursive PATH lookup.
+REAL_CARGO="$(command -v cargo)"
+[ -n "$REAL_CARGO" ] || { printf 'harness: cargo not found on PATH\n' >&2; exit 2; }
+
 WORK="$(mktemp -d)"
 cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
@@ -141,9 +146,10 @@ make_base_workspace "$DIR_A" "$V"
 sed -i 's/^version = "0.40.4"$/version = "0.40.3"/' "$DIR_A/Cargo.lock"
 run_scenario "A_manifest_lock_drift" "$DIR_A" 1 "out of date|MISMATCH|0\.40\.3"
 
-# Scenario B — package-set mismatch: a source-less vendored crate exists in the
-# lock and is a path dependency of pa, but is NOT a workspace member, so
-# `cargo metadata --no-deps` omits it while the lock lists it.
+# Scenario B — package-set mismatch: a source-less vendored crate is listed in
+# Cargo.lock and is a path dependency of pa, but its directory is `exclude`d from
+# the workspace, so `cargo metadata --no-deps` omits it while the lock lists it.
+# The gate must flag the extra source-less lock entry.
 DIR_B="$WORK/pkgset"
 make_base_workspace "$DIR_B" "$V"
 mkdir -p "$DIR_B/vendored/src"
@@ -154,6 +160,15 @@ version = "$V"
 edition = "2021"
 EOF
 printf '// fixture\n' > "$DIR_B/vendored/src/lib.rs"
+cat > "$DIR_B/Cargo.toml" <<EOF
+[workspace]
+members = ["pa", "pb"]
+exclude = ["vendored"]
+resolver = "2"
+
+[workspace.package]
+version = "$V"
+EOF
 cat > "$DIR_B/pa/Cargo.toml" <<'EOF'
 [package]
 name = "fixture-pa"
@@ -199,6 +214,110 @@ run_scenario "D_stale_release_manifest" "$DIR_D" 1 "release-please-manifest"
 
 # Scenario E — the real repository lock (Green and unchanged).
 run_scenario "E_repository_green" "$REPO_ROOT" 0 "check-workspace-versions: OK"
+
+# ---------------------------------------------------------------------------
+# Scenario F — exact Cargo argv. A logging shim first on PATH records argv then
+# delegates to the ABSOLUTE real cargo (no recursive PATH lookup). Run the gate
+# from a caller cwd OTHER than the repo root (here: a temp dir) while passing the
+# repo root, and assert the captured first (and only) Cargo argv is exactly
+# `metadata --locked --no-deps --format-version 1` with NO `--manifest-path`.
+# ---------------------------------------------------------------------------
+SHIM_DIR="$WORK/shim"
+CARGO_LOG="$WORK/cargo-argv.log"
+mkdir -p "$SHIM_DIR"
+cat > "$SHIM_DIR/cargo" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$CARGO_LOG"
+exec "$REAL_CARGO" "\$@"
+EOF
+chmod +x "$SHIM_DIR/cargo"
+: > "$CARGO_LOG"
+
+f_pre="$(sha256sum "$REPO_ROOT/Cargo.lock" | awk '{print $1}')"
+f_ok=1
+# Deliberately invoke from a caller cwd that is NOT the repo root.
+( cd "$WORK" && PATH="$SHIM_DIR:$PATH" "$GATE" "$REPO_ROOT" ) >"$WORK/F.out" 2>"$WORK/F.err" || {
+    bad "F_exact_cargo_argv: gate exited nonzero"; note "stderr: $(tr '\n' '|' < "$WORK/F.err")"; f_ok=0;
+}
+f_post="$(sha256sum "$REPO_ROOT/Cargo.lock" | awk '{print $1}')"
+first_argv="$(head -1 "$CARGO_LOG")"
+argv_count="$(grep -c . "$CARGO_LOG" || true)"
+if [ "$first_argv" != "metadata --locked --no-deps --format-version 1" ]; then
+    bad "F_exact_cargo_argv: first argv was '$first_argv' (expected exactly 'metadata --locked --no-deps --format-version 1')"; f_ok=0
+fi
+if grep -q -- '--manifest-path' "$CARGO_LOG"; then
+    bad "F_exact_cargo_argv: --manifest-path appeared in captured Cargo argv"; f_ok=0
+fi
+if [ "$argv_count" -ne 1 ]; then
+    bad "F_exact_cargo_argv: expected exactly 1 Cargo call, captured $argv_count"; f_ok=0
+fi
+if [ "$f_pre" != "$f_post" ]; then
+    bad "F_exact_cargo_argv: repository Cargo.lock changed (pre=$f_pre post=$f_post)"; f_ok=0
+fi
+[ "$f_ok" -eq 1 ] && ok "F_exact_cargo_argv (argv='$first_argv', calls=$argv_count, from cwd=$WORK)"
+
+# ---------------------------------------------------------------------------
+# Scenario G — EXIT-trap mutation detection. A shim MUTATES a TEMP fixture's
+# Cargo.lock mid-gate (after the snapshot, during the metadata call), then
+# delegates to the real cargo. The gate's EXIT trap must detect the changed lock
+# and exit 90 with the CRITICAL message. Operates ONLY on the temp fixture; the
+# repository lock is never touched.
+# ---------------------------------------------------------------------------
+DIR_G="$WORK/trap_mutate"
+make_base_workspace "$DIR_G" "$V"
+SHIM_G="$WORK/shim_g"
+mkdir -p "$SHIM_G"
+cat > "$SHIM_G/cargo" <<EOF
+#!/usr/bin/env bash
+# Mutate the fixture lock AFTER the gate snapshotted it, then run real cargo.
+printf '\n# mutated by trap-regression shim\n' >> "$DIR_G/Cargo.lock"
+exec "$REAL_CARGO" "\$@"
+EOF
+chmod +x "$SHIM_G/cargo"
+g_ok=1
+set +e
+PATH="$SHIM_G:$PATH" "$GATE" "$DIR_G" >"$WORK/G.out" 2>"$WORK/G.err"
+g_rc=$?
+set -e
+if [ "$g_rc" -ne 90 ]; then
+    bad "G_trap_mutation: expected exit 90, got $g_rc"; note "stderr: $(tr '\n' '|' < "$WORK/G.err")"; g_ok=0
+fi
+if ! grep -q 'CRITICAL: Cargo.lock mutated during gate' "$WORK/G.err"; then
+    bad "G_trap_mutation: missing CRITICAL mutation diagnostic"; g_ok=0
+fi
+[ "$g_ok" -eq 1 ] && ok "G_trap_mutation (exit=$g_rc, CRITICAL reported)"
+
+# ---------------------------------------------------------------------------
+# Scenario H — EXIT-trap DELETION detection under `set -e`. A shim DELETES a
+# TEMP fixture's Cargo.lock mid-gate. The trap must treat the missing/unhashable
+# lock as changed and still deterministically exit 90 (not be short-circuited by
+# `set -e`). Operates ONLY on the temp fixture.
+# ---------------------------------------------------------------------------
+DIR_H="$WORK/trap_delete"
+make_base_workspace "$DIR_H" "$V"
+SHIM_H="$WORK/shim_h"
+mkdir -p "$SHIM_H"
+cat > "$SHIM_H/cargo" <<EOF
+#!/usr/bin/env bash
+rm -f "$DIR_H/Cargo.lock"
+exec "$REAL_CARGO" "\$@"
+EOF
+chmod +x "$SHIM_H/cargo"
+h_ok=1
+set +e
+PATH="$SHIM_H:$PATH" "$GATE" "$DIR_H" >"$WORK/H.out" 2>"$WORK/H.err"
+h_rc=$?
+set -e
+if [ "$h_rc" -ne 90 ]; then
+    bad "H_trap_deletion: expected exit 90, got $h_rc"; note "stderr: $(tr '\n' '|' < "$WORK/H.err")"; h_ok=0
+fi
+if ! grep -q 'CRITICAL: Cargo.lock mutated during gate' "$WORK/H.err"; then
+    bad "H_trap_deletion: missing CRITICAL diagnostic"; h_ok=0
+fi
+if ! grep -q 'MISSING-OR-UNREADABLE' "$WORK/H.err"; then
+    bad "H_trap_deletion: missing/unreadable lock not reported as changed"; h_ok=0
+fi
+[ "$h_ok" -eq 1 ] && ok "H_trap_deletion (exit=$h_rc, missing lock → 90)"
 
 printf '=== harness result: %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
