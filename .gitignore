@@ -20,9 +20,7 @@ target/llvm-cov/
 
 # Per-project index DB written by `codegraph init` / `index`.
 .codegraph/
-
-# Local upstream-sync ledger (colby-upstream-sync skill); not part of the repo.
-docs/upstream-sync/
+.codegraph-v2/
 
 # AWS CodeBuild local config (sensitive — never commit)
 .aws/codebuild.env
