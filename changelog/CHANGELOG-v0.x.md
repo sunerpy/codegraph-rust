@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.40.3](https://github.com/sunerpy/codegraph-rust/compare/v0.40.2...v0.40.3) (2026-07-24)
+
+
+### Bug Fixes
+
+* **react:** avoid UTF-8 boundary panics ([#167](https://github.com/sunerpy/codegraph-rust/issues/167)) ([ff0d504](https://github.com/sunerpy/codegraph-rust/commit/ff0d504662f835d04fa3ae56ce4390c1780d8f87))
+
 ## [0.40.2](https://github.com/sunerpy/codegraph-rust/compare/v0.40.1...v0.40.2) (2026-07-20)
 
 
