@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeIndexMismatch {
@@ -9,9 +8,8 @@ pub struct WorktreeIndexMismatch {
 }
 
 pub fn git_worktree_root(dir: impl AsRef<Path>) -> Option<PathBuf> {
-    let out = Command::new("git")
+    let out = crate::git::git_command(dir.as_ref())
         .args(["rev-parse", "--show-toplevel"])
-        .current_dir(dir.as_ref())
         .output()
         .ok()?
         .stdout;
@@ -69,9 +67,8 @@ mod tests {
     use crate::sync::tests::TestDir;
 
     fn git_init(dir: &Path) -> bool {
-        Command::new("git")
+        crate::git::git_command(dir)
             .args(["init"])
-            .current_dir(dir)
             .output()
             .map(|out| out.status.success())
             .unwrap_or(false)

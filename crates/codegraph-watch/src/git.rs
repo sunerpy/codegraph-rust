@@ -25,6 +25,37 @@ pub fn is_git_repo(project_root: impl AsRef<Path>) -> bool {
     .is_some_and(|out| out.trim() == "true")
 }
 
+/// Git repo-selection environment variables that, when inherited, make `git`
+/// ignore the `current_dir` we set and instead operate on the ambient repo.
+///
+/// `codegraph` runs inside git hooks (`post-commit`/`post-merge`/`post-checkout`
+/// run `codegraph sync`), where git exports these — most notably `GIT_DIR` and
+/// `GIT_WORK_TREE`. Without clearing them, a query like "is THIS directory a
+/// repo?" is answered for the hook's repo, not the directory we asked about.
+/// Clearing them makes every git invocation resolve purely from its
+/// `current_dir`, which is the intended semantics here (and also insulates the
+/// test suite when it runs under a git pre-push hook).
+pub(crate) const GIT_REPO_SELECTION_ENV: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+];
+
+/// Build a `git` [`Command`] rooted at `dir` with the ambient repo-selection
+/// environment stripped, so discovery happens from `dir` alone.
+pub(crate) fn git_command(dir: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(dir);
+    for var in GIT_REPO_SELECTION_ENV {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 pub fn install_git_sync_hooks(project_root: impl AsRef<Path>) -> Result<GitHookResult> {
     let Some(hooks_dir) = git_hooks_dir(project_root.as_ref()) else {
         return Ok(skipped("not a git repository"));
@@ -111,9 +142,8 @@ fn git_hooks_dir(project_root: &Path) -> Option<PathBuf> {
 }
 
 fn git_output(project_root: &Path, args: &[&str]) -> Option<String> {
-    Command::new("git")
+    git_command(project_root)
         .args(args)
-        .current_dir(project_root)
         .output()
         .ok()
         .filter(|out| out.status.success())
@@ -189,9 +219,8 @@ mod tests {
     /// user so any commit-adjacent git command works; returns whether git init
     /// succeeded (tests skip themselves cleanly if git is unavailable).
     fn git_init(dir: &Path) -> bool {
-        let ok = Command::new("git")
+        let ok = git_command(dir)
             .args(["init"])
-            .current_dir(dir)
             .output()
             .map(|out| out.status.success())
             .unwrap_or(false);
@@ -200,7 +229,7 @@ mod tests {
                 ["config", "user.email", "test@example.com"],
                 ["config", "user.name", "Test"],
             ] {
-                let _ = Command::new("git").args(args).current_dir(dir).output();
+                let _ = git_command(dir).args(args).output();
             }
         }
         ok
