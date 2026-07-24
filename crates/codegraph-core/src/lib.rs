@@ -2,9 +2,11 @@
 
 pub mod config;
 pub mod errors;
+pub mod index_paths;
 pub mod logger;
 pub mod node_id;
 pub mod traits;
 pub mod types;
 
 pub use errors::{CodeGraphError, Result};
+pub use index_paths::{IndexPaths, IndexPathsError};
