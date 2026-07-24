@@ -196,3 +196,87 @@ of which remain E2 follow-up work. No version value in `Cargo.toml`, `Cargo.lock
 `version.txt`, or `.release-please-manifest.json` was modified. No third-party
 dependency was added; the gate uses only `bash`, `awk`, `sed`, `jq`, and
 `sha256sum` already present in the repository's toolchain.
+
+## Batch M initial black-box Red — isolated v2 namespace
+
+This is the INITIAL black-box behavioral Red for Batch M, exactly as scoped by the
+frozen plan (`upstream-v1.5-portable-fixes.md`) at line 805: "Batch M starts with
+behaviorally failing black-box CLI/MCP/process tests that use only existing public
+surfaces and filesystem artifacts." It is NOT a later API-level refinement; it
+imports no proposed Green type (`IndexPaths`, `IndexLease`, `open_for_*`), which
+plan lines 806-807 explicitly mark as Green design, not compile-time Red
+prerequisites. No production/Green code was written.
+
+### Pre-Red gates (all passed, in order)
+
+- Final pre-Red base gate (plan lines 87-91): `git fetch origin main`; peeled
+  remote tip `origin/main`, branch merge-base `HEAD..origin/main`, and reviewed
+  base all equal `aba40799ecacb94515f7e1690914d2accc4c8973`. Local `HEAD` before
+  Red = `10352ba0943622e665b0ff96c5b5f57589448c9c` (branch tip; its base is
+  `aba4079`). No divergence → Red authorized.
+- Network provenance gate (plan lines 40-47): fresh
+  `git clone https://github.com/colbymchenry/codegraph.git`; boundary commits
+  `ecc8b307ac2f8a7d06bff02ee513c4ea2380b2f8..ea72e1b190921232aa7bd02e96bef5bbe4fe0ab6`
+  present; `git log --reverse --format='%H|%s'` over the two boundary SHAs yields
+  exactly **86** rows; formatting each row as a numbered-free markdown table row
+  `| \`<short7>\` | <subject> |\n`(backticked seven-lowercase-hex short SHA +
+subject) reproduces source-list SHA-256`60746f77a9ce721c10b83bc5bb8804c153f7da84217c4afb96f26645c6aa33f7`. Match.
+- Frozen identities still match: plan SHA
+  `5b64aa335fb32cd228d98404c2e44153e9134d26a912ecb02d71fcf5c5798450`; immutable
+  manifest SHA `1bf8a9022b7702368a66f0159ce84dc6ba846e5aa9c8db32f3e2ecf83affbc96`;
+  `.gitignore` `beb58777556b1e37354e5adb3ec15834683edaaba95f15bfed13d92dda42c13a`;
+  `.oxfmtignore` `7fb05bd0552e6e383434d7b807f836eb8e1474e08e84adfaab09c8cd8553f103`;
+  `UPSTREAM.md` `e99826c37572235266299f49d206f7c441f822297cc2e5d66745a275d6bf129f`;
+  `KNOWN_DIFFS.md` `2c973b6f1407b409131c20849de44f15dc9989c1b47bb278e836daf3c682c07d`.
+- Workspace-version gate `bash scripts/check-workspace-versions.sh` → exit `0`
+  ("check-workspace-versions: OK", workspace version `0.40.4`) run before Cargo
+  test discovery; repository `Cargo.lock` SHA-256 unchanged before/after every
+  Cargo invocation:
+  `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`.
+
+Legacy v0.40.4 asset fixture (plan lines 685-693) was NOT needed for this initial
+boundary: the selected Red proves the namespace-placement gap using only the
+current in-tree binary (`codegraph init`) and the committed `mini` corpus, with no
+downloaded legacy executable. The downloaded-asset manifest is reserved for the
+later legacy-isolation Red (plan tests 3/4) that actually runs the v0.40.4 binary.
+
+### Test added
+
+`crates/codegraph-cli/tests/batch_m_v2_namespace.rs` ::
+`init_writes_isolated_v2_namespace_not_legacy_codegraph`. Black-box: drives the
+shipped `codegraph init` against a private temp copy of the `mini` fixture, with
+isolated `CODEGRAPH_HTTP_REGISTRY_DIR` and `CODEGRAPH_NO_DAEMON=1`, then inspects
+filesystem artifacts only. The setup step (`init` succeeds) and a non-empty
+built-DB byte snapshot both reach the assertion, so the failure is behavioral, not
+a compile/setup/panic/network failure. The snapshot preserves the built DB bytes
+that later Green asserts remain a byte-usable legacy graph.
+
+### Discovery + execution
+
+- Owner discovery: `cargo test -p codegraph-rs --locked --test batch_m_v2_namespace -- --list`
+  → lists `init_writes_isolated_v2_namespace_not_legacy_codegraph: test`
+  (`1 test, 0 benchmarks`), confirming the test binary compiles and the target
+  owns the test (package `codegraph-rs`, test target `batch_m_v2_namespace`, per
+  plan line 1273 "M CLI").
+- Red run:
+  `cargo test -p codegraph-rs --locked --test batch_m_v2_namespace init_writes_isolated_v2_namespace_not_legacy_codegraph -- --exact`
+  → process exit `101` (`test result: FAILED. 0 passed; 1 failed`).
+- Exact failing assertion (behavioral, plan line 262 + lines 805-817):
+  "Batch M: `init` must create the isolated v2 namespace at
+  `<tmp>/mini/.codegraph-v2/codegraph.db` (a sibling of the legacy root, per plan
+  line 262), but no v2 DB exists; current v0.40.4 behavior wrote the legacy
+  namespace instead (.codegraph/codegraph.db present=true)". This is precisely the
+  Red-evidence requirement of plan lines 811-812 ("Red evidence must demonstrate
+  the current fixed legacy path …").
+
+### Classification
+
+Initial black-box behavioral Red (plan lines 805-809), NOT a later API-level
+refinement. Remaining Batch M Red is NOT yet landed and is explicitly deferred to
+subsequent commits: stale-row serving / hash-skip migration (tests 2, 9),
+extension-filtered folder delete (test 18), stamp/finalizer gap (test 8),
+absent typed/lease/path gates (tests 6, 7), legacy-binary storage isolation
+(tests 3, 4) which require the downloaded v0.40.4 asset fixture, and every
+lease/lifecycle/uninit-state test (tests 5, 11, 12, 13, 15, 16, 20, 21) whose
+deterministic form needs the minimal compiling Green scaffolding. This commit
+lands only the initial black-box namespace boundary.
