@@ -1,4 +1,5 @@
 pub mod connection;
+mod file_identity;
 pub mod index_lease;
 pub mod index_state;
 pub mod migrations;

@@ -1113,3 +1113,88 @@ codegraph-store --target x86_64-pc-windows-msvc --all-targets --locked` —
 The terminal `make ci` is run only after these final ledger bytes are formatted;
 its exact result is reported with the resulting commit so the evidence does not
 create the stale-post-validation formatting trap.
+
+## Batch M — `IndexLease` lock-identity correction (2026-07-25)
+
+### Rejected boundary and behavioral Red
+
+Manual review rejected commit `b772e0f519ce4ebc731e141f846ea321e5078789`:
+`acquire_existing` opened `<current-root>/index.lock` directly, so Unix followed
+a static symlink and the lease never proved that the fixed path still named the
+opened and locked file before returning authority. Initial creation also used
+`create(true)`, allowing a competing entry installed after root creation to be
+reopened and accepted.
+
+The correction began with compiling Linux behavioral tests against that code.
+`cargo test -p codegraph-store --test index_lease --locked` exited 101: the
+static-symlink test demonstrated that the old lease kernel-locked the external
+target, while the directory test did not receive the required typed
+`NonRegularLock` rejection. This was behavioral failure after compilation, not a
+setup or API failure. The deterministic private-checkpoint tests were added with
+the minimum test seam: they replace `index.lock` immediately after initial
+validation and immediately after kernel acquisition, without sleeps.
+
+### Correction
+
+- A private `file_identity` module now supplies the lease and state reader with
+  one cross-platform identity implementation. Unix identity is exact
+  `(st_dev, st_ino)`. Windows rejects `FILE_ATTRIBUTE_REPARSE_POINT` and obtains
+  exact `(volume serial, 128-bit file ID)` values from live handles through
+  stable raw `GetFileInformationByHandleEx(FileIdInfo)` FFI; it does not use the
+  unstable Rust metadata file-index accessors. Other targets retain the existing
+  conservative metadata fallback without claiming the Unix/Windows guarantee.
+- Existing acquisition performs no-follow metadata first, rejects a symlink /
+  reparse point as typed `AliasedLock` and a directory/socket/other entry as
+  typed `NonRegularLock`, opens the lock once for authority, compares the initial
+  identity with that opened handle, acquires only through `try_lock*`, then
+  re-reads no-follow metadata and corroborates the final fixed path against the
+  same locked handle. Any disappearance, type change, alias, or exact identity
+  drift returns typed `LockChangedDuringAcquisition`; no `IndexLease` is built.
+- A post-lock rejection drops the local handle. The deterministic replacement
+  test then locks the displaced original and acquires the final fixed lock with a
+  fresh contender, proving that neither the failed capability nor its kernel
+  lock leaked.
+- Explicit initial creation still requires a genuinely absent root, but now
+  creates `index.lock` with `create_new(true)`. A regular or symlink entry that
+  wins after root creation returns typed `LockCreationConflict`; it is never
+  followed, reopened, repaired, or locked. The external symlink target's complete
+  bytes remain identical and an independent handle can lock it.
+- Existing lease semantics remain unchanged: private mode and exact DB-parent
+  identity, `Arc<LeaseInner>` final-owner unlock, monotonic bounded deadlines,
+  cancellation checks, nonblocking `try_lock*`, nontruncating existing opens,
+  and no PID, stale-file deletion, or lock repair protocol.
+
+The identity helper also replaces the state reader's duplicated platform code;
+classifier order and public semantics are unchanged. No dependency, schema,
+golden, node ID, version, SQLite/Store integration, publication, migration,
+uninit, daemon/watch/MCP/CLI lifecycle, `UPSTREAM.md`, or `KNOWN_DIFFS.md` changed.
+
+### Verification before the terminal CI gate
+
+Every Cargo batch was preceded by `bash scripts/check-workspace-versions.sh`
+(exit 0, workspace version `0.40.4`):
+
+- Corrected targeted tests: 12 `index_lease` integration tests, four private
+  deterministic lease tests, and 20 `index_state` tests passed with zero failures.
+- `cargo check -p codegraph-store --all-targets --locked` passed.
+- `cargo clippy -p codegraph-store --all-targets --locked -- -D warnings` passed.
+- `LIBSQLITE3_SYS_USE_PKG_CONFIG=1 SQLITE3_LIB_DIR=/tmp/opencode cargo check -p
+codegraph-store --target x86_64-pc-windows-msvc --all-targets --locked` passed.
+  This is Linux-host cross-compilation evidence only; no native Windows runtime
+  behavior is claimed.
+- LSP diagnostics could not attach to the external `/tmp` worktree (`file path
+must be inside request cwd`), so the clean Cargo check/Clippy/test diagnostics
+  are the documented fallback.
+- `Cargo.lock` remains required to match
+  `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`.
+
+Per the documented format trap, repository formatting and the terminal
+`make ci` run occur only after this final ledger byte. The resulting commit is
+created only if that post-format gate exits zero.
+
+The first post-format `make ci` attempt reached the workspace tests after clean
+format and Clippy gates, then failed only at the repository's previously recorded
+`daemon_single_watcher_fires_once` timing assertion: watcher sync #1 reported
+`0 file(s) reindexed` instead of naming the changed file. No lease/store test
+failed. This historical attempt is retained honestly; after formatting this
+append, one fresh terminal retry is the authoritative final gate.

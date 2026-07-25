@@ -754,85 +754,13 @@ fn slot_changed(index: u8, path: &Path, detail: &str) -> RawSlot {
     })
 }
 
-#[cfg(unix)]
 fn same_file_identity(left: &Metadata, right: &Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(windows)]
-fn same_file_identity(left: &Metadata, right: &Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt as _;
-
-    // Rust 1.96 still gates MetadataExt's volume/file-index accessors as
-    // unstable. Stable fields cheaply corroborate pre/open/post observations;
-    // the exact final object-identity proof follows through two live handles.
-    left.file_attributes() == right.file_attributes()
-        && left.creation_time() == right.creation_time()
-        && left.last_write_time() == right.last_write_time()
-        && left.file_size() == right.file_size()
+    crate::file_identity::metadata_observation_matches(left, right)
 }
 
 #[cfg(windows)]
 fn path_still_names_opened_file(opened: &File, path: &Path) -> io::Result<bool> {
-    const FILE_ID_INFO_CLASS: i32 = 18;
-
-    #[repr(C)]
-    struct FileIdInfo {
-        volume_serial_number: u64,
-        file_id: [u8; 16],
-    }
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetFileInformationByHandleEx(
-            h_file: isize,
-            file_information_class: i32,
-            lp_file_information: *mut core::ffi::c_void,
-            dw_buffer_size: u32,
-        ) -> i32;
-    }
-
-    fn file_id(file: &File) -> io::Result<(u64, [u8; 16])> {
-        use std::os::windows::io::AsRawHandle as _;
-
-        let mut info = FileIdInfo {
-            volume_serial_number: 0,
-            file_id: [0; 16],
-        };
-        // SAFETY: `file` owns a live Windows handle and `info` is a correctly
-        // sized writable FILE_ID_INFO buffer for FileIdInfo.
-        let ok = unsafe {
-            GetFileInformationByHandleEx(
-                file.as_raw_handle() as isize,
-                FILE_ID_INFO_CLASS,
-                (&mut info as *mut FileIdInfo).cast(),
-                core::mem::size_of::<FileIdInfo>() as u32,
-            )
-        };
-        if ok == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok((info.volume_serial_number, info.file_id))
-    }
-
-    // Open a second handle after the final no-follow metadata check. The fixed
-    // path must still identify the exact object whose first handle supplied the
-    // bytes; a replacement produces a different volume/file ID.
-    let final_handle = File::open(path)?;
-    Ok(file_id(opened)? == file_id(&final_handle)?)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn same_file_identity(left: &Metadata, right: &Metadata) -> bool {
-    // std exposes no stable object ID on this platform. This fallback is
-    // deliberately conservative about observable metadata, but cannot exclude a
-    // replacement engineered with identical attributes; callers must not claim
-    // the Unix/Windows identity guarantee here.
-    left.len() == right.len()
-        && left.permissions().readonly() == right.permissions().readonly()
-        && left.modified().ok() == right.modified().ok()
-        && left.created().ok() == right.created().ok()
+    crate::file_identity::path_still_names_file(path, opened)
 }
 
 /// Semantically validate ONE parsed slot into a [`SlotOutcome`].

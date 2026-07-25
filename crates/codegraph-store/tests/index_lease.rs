@@ -71,6 +71,83 @@ fn lock_bytes(paths: &IndexPaths) -> Vec<u8> {
     std::fs::read(paths.permanent_lock()).expect("read permanent lock bytes")
 }
 
+#[cfg(unix)]
+#[test]
+fn static_symlink_lock_is_rejected_without_using_the_external_target_as_authority() {
+    use std::os::unix::fs::symlink;
+
+    let project = TempProject::new("static-symlink");
+    let paths = project.paths();
+    std::fs::create_dir_all(paths.current_root()).expect("create current root fixture");
+    let external = project.path().join("external.lock");
+    std::fs::write(&external, LOCK_BYTES).expect("write external lock target");
+    symlink(&external, paths.permanent_lock()).expect("stage malicious lock symlink");
+
+    let result =
+        IndexLease::acquire_exclusive_existing(&paths, deadline_after(CHILD_WAIT), || false);
+    match result {
+        Err(IndexLeaseError::AliasedLock { path }) => {
+            assert_eq!(path, paths.permanent_lock());
+            let external_handle = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&external)
+                .expect("open external target independently");
+            external_handle
+                .try_lock()
+                .expect("rejected alias never became this namespace's lock authority");
+            external_handle.unlock().expect("unlock external target");
+        }
+        Ok(lease) => {
+            let external_handle = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&external)
+                .expect("open external target independently");
+            assert!(
+                matches!(
+                    external_handle.try_lock(),
+                    Err(std::fs::TryLockError::WouldBlock)
+                ),
+                "the defective lease must demonstrably hold the external target"
+            );
+            drop(lease);
+            panic!("static symlink was accepted as permanent lock authority");
+        }
+        Err(other) => panic!("wrong typed error for lock alias: {other:?}"),
+    }
+
+    assert_eq!(std::fs::read(&external).unwrap(), LOCK_BYTES);
+    assert!(
+        std::fs::symlink_metadata(paths.permanent_lock())
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "existing-only rejection must not mutate the alias entry"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn socket_lock_entry_is_rejected_as_non_regular() {
+    use std::os::unix::net::UnixListener;
+
+    let socket_project = TempProject::new("lock-socket");
+    let socket_paths = socket_project.paths();
+    std::fs::create_dir_all(socket_paths.current_root()).expect("create socket fixture root");
+    let _listener = UnixListener::bind(socket_paths.permanent_lock()).expect("stage lock socket");
+    let error =
+        IndexLease::acquire_shared_existing(&socket_paths, deadline_after(CHILD_WAIT), || false)
+            .expect_err("a socket cannot be permanent lock authority");
+    assert!(matches!(
+        error,
+        IndexLeaseError::NonRegularLock {
+            path,
+            kind: "non-regular filesystem entry"
+        } if path == socket_paths.permanent_lock()
+    ));
+}
+
 #[test]
 fn existing_open_missing_is_nonmutating_and_never_creates() {
     let missing_root = TempProject::new("missing-root");
@@ -100,6 +177,27 @@ fn existing_open_missing_is_nonmutating_and_never_creates() {
         std::fs::read(paths.current_root().join("keep.bin")).unwrap(),
         before
     );
+}
+
+#[test]
+fn existing_open_rejects_a_directory_lock_without_mutation() {
+    let project = TempProject::new("directory-lock");
+    let paths = project.paths();
+    std::fs::create_dir_all(paths.permanent_lock()).expect("stage directory at lock path");
+    let marker = paths.permanent_lock().join("keep.bin");
+    std::fs::write(&marker, LOCK_BYTES).expect("stage directory marker");
+
+    let err = IndexLease::acquire_exclusive_existing(&paths, deadline_after(CHILD_WAIT), || false)
+        .expect_err("directory cannot be permanent lock authority");
+    assert!(matches!(
+        err,
+        IndexLeaseError::NonRegularLock {
+            path,
+            kind: "directory"
+        } if path == paths.permanent_lock()
+    ));
+    assert!(paths.permanent_lock().is_dir());
+    assert_eq!(std::fs::read(marker).unwrap(), LOCK_BYTES);
 }
 
 #[test]
