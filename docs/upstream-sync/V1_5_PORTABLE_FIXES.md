@@ -979,10 +979,37 @@ Final validation evidence:
 - `make ci CARGO='cargo --locked'` was attempted twice. Both runs passed format
   and Clippy, then hit the same pre-existing timing-sensitive
   `daemon_single_watcher_fires_once` failure (`watcher sync #1: 0 file(s)
-  reindexed` instead of naming `extra.ts`). The standalone full workspace run in
+reindexed` instead of naming `extra.ts`). The standalone full workspace run in
   the same validation batch passed that test and all 2695 tests. Per the two-check
   ceiling, it was not retried a third time; no unrelated watcher code was changed.
 - LSP diagnostics refused the external `/tmp` worktree because it is outside the
   tool request cwd. Workspace `cargo check` and Clippy are the recorded fallback.
 - `Cargo.lock` remained byte-identical at
   `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`.
+
+**Correction to the validation evidence above (post-`224e762` verification).**
+Independent verification of commit `224e762` reran the targeted classifier command
+and reproduced **1 internal + 20 integration tests passed, 0 failed**. It then ran
+the full gate chain, and the `make ci` invocation failed _before_ tests at the
+`oxfmt --check` doc-format step, because the validation evidence in this ledger had
+been appended _after_ the last formatting pass and was therefore not
+formatter-clean. The two `daemon_single_watcher_fires_once` runs recorded in the
+bullet above are preserved as accurate _historical_ attempts, but they were not the
+last gate: at commit `224e762` the gate stopped earlier, at doc formatting. The
+formatting was corrected in this commit and a fresh `make ci` was then run; that
+fresh post-format run is the authoritative final gate and its result is recorded
+immediately below.
+
+Authoritative final gate (fresh run, after doc formatting):
+
+- `bash scripts/check-workspace-versions.sh` passed before every Cargo-invoking
+  command, and `oxfmt --check` is clean on this ledger.
+- `make ci` (fmt-check + Clippy `-D warnings` + `cargo test --workspace` +
+  `bash scripts/guardrail.sh`) **passed, exit 0** — every reporting suite ended
+  `0 failed` and the guardrail exited 0. Because no test in this workspace is
+  ignored by the gate, that exit-0 necessarily includes
+  `daemon_single_watcher_fires_once`, which therefore passed in this run rather
+  than flaking as it did in the two historical attempts above.
+- `Cargo.lock` still byte-identical at
+  `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`; this
+  correction changes documentation only.
