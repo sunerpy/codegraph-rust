@@ -1198,3 +1198,33 @@ format and Clippy gates, then failed only at the repository's previously recorde
 `0 file(s) reindexed` instead of naming the changed file. No lease/store test
 failed. This historical attempt is retained honestly; after formatting this
 append, one fresh terminal retry is the authoritative final gate.
+
+### Correction (2026-07-25): authoritative final gate for the identity correction
+
+The retry promised above did happen and it passed, so this section closes the
+terminal-gate evidence for commit `8c19bce70cf8907f356ba0bb45e1188df00b00c9`.
+The failed first attempt recorded directly above is kept verbatim as history: it
+was a timing flake in an unrelated watcher test, not a lease or store
+regression, and deleting it would destroy that distinction.
+
+The parent then reran the whole gate independently on that exact HEAD, and it
+passed. The reproduced focused evidence was:
+
+- `index_lease` integration: 12 passed, 0 failed.
+- Private deterministic lease unit tests: 4 passed, 0 failed.
+- `index_state`: 20 passed, 0 failed.
+- `cargo check -p codegraph-store --all-targets --locked`: clean.
+- `cargo clippy -p codegraph-store --all-targets --locked -- -D warnings`: clean.
+- `x86_64-pc-windows-msvc` all-target check: clean. This is Linux-host
+  cross-compilation evidence only; no native Windows runtime behavior is
+  claimed anywhere in this Batch M work.
+
+The final parent command chain was
+`bash scripts/check-workspace-versions.sh && make ci && sha256sum Cargo.lock &&
+git status --short && git diff --check`, and it exited 0. That `make ci` run
+covered `fmt-check`, `clippy -D warnings`, the full `cargo test --workspace`
+suite, and `bash scripts/guardrail.sh`. `daemon_single_watcher_fires_once`
+carries no `#[ignore]`, so an exit-0 workspace run necessarily includes it: it
+passed in this authoritative run. `Cargo.lock` still hashes to
+`750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`, and the
+worktree was clean with no whitespace errors.
