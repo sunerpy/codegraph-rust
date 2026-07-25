@@ -313,16 +313,20 @@ fn configured_dot_alias_fails_closed_without_mutation_via_cli() {
     );
 }
 
-/// Recursively snapshot every file path + byte length under `root`, sorted, so a
-/// command can be proven byte-nonmutating by comparing the before/after set.
-fn tree_snapshot(root: &Path) -> Vec<(String, u64)> {
-    fn walk(dir: &Path, base: &Path, out: &mut Vec<(String, u64)>) {
+/// Recursively snapshot every file path plus its COMPLETE bytes under `root`,
+/// sorted, so a command can be proven byte-nonmutating by comparing the
+/// before/after set. The full byte content — not the file LENGTH — is captured:
+/// an equal-length in-place byte mutation leaves the length identical and would
+/// slip past a size-only snapshot, so size equality is NOT evidence of byte
+/// identity. Comparing the bytes themselves detects same-length content changes.
+fn tree_snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(dir: &Path, base: &Path, out: &mut Vec<(String, Vec<u8>)>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
         for entry in entries.filter_map(Result::ok) {
             let path = entry.path();
-            let meta = match entry.metadata() {
+            let meta = match std::fs::symlink_metadata(&path) {
                 Ok(m) => m,
                 Err(_) => continue,
             };
@@ -334,7 +338,8 @@ fn tree_snapshot(root: &Path) -> Vec<(String, u64)> {
                     .unwrap_or(&path)
                     .to_string_lossy()
                     .into_owned();
-                out.push((rel, meta.len()));
+                let bytes = std::fs::read(&path).unwrap_or_default();
+                out.push((rel, bytes));
             }
         }
     }
@@ -342,6 +347,43 @@ fn tree_snapshot(root: &Path) -> Vec<(String, u64)> {
     walk(root, root, &mut out);
     out.sort();
     out
+}
+
+/// Assert two [`tree_snapshot`]s are byte-identical, reporting only the CHANGED
+/// paths (added / removed / same-path-different-bytes). A bare `assert_eq!` on
+/// the snapshots would dump every file's full contents into the failure message;
+/// this compares the same complete bytes but names just the offending paths.
+fn assert_tree_bytes_unchanged(
+    before: &[(String, Vec<u8>)],
+    after: &[(String, Vec<u8>)],
+    context: &str,
+) {
+    let mut diffs: Vec<String> = Vec::new();
+    let before_map: std::collections::BTreeMap<&str, &Vec<u8>> =
+        before.iter().map(|(p, b)| (p.as_str(), b)).collect();
+    let after_map: std::collections::BTreeMap<&str, &Vec<u8>> =
+        after.iter().map(|(p, b)| (p.as_str(), b)).collect();
+    for (path, bytes) in &before_map {
+        match after_map.get(path) {
+            None => diffs.push(format!("removed: {path}")),
+            Some(other) if other != bytes => diffs.push(format!(
+                "bytes changed: {path} ({} -> {} bytes)",
+                bytes.len(),
+                other.len()
+            )),
+            Some(_) => {}
+        }
+    }
+    for path in after_map.keys() {
+        if !before_map.contains_key(path) {
+            diffs.push(format!("created: {path}"));
+        }
+    }
+    assert!(
+        diffs.is_empty(),
+        "{context}: project tree must be byte-for-byte unchanged (complete file \
+         bytes compared, NOT sizes), but changed: {diffs:?}"
+    );
 }
 
 /// `status` under an invalid/aliasing `CODEGRAPH_DIR` must FAIL CLOSED through
@@ -377,12 +419,59 @@ fn status_fails_closed_on_invalid_configured_root_without_mutation_via_cli() {
              default: stdout={}",
             run.stdout
         );
+        // The actionable `IndexPaths` diagnostic must reach the user (on stderr,
+        // where the CLI prints `Error: …`). Assert the STABLE reason phrasing —
+        // `.` aliases the project root — not merely "some error".
+        let combined = format!("{}{}", run.stdout, run.stderr);
+        assert!(
+            combined.contains("project root itself"),
+            "status (json={json}) must surface the stable unsafe-root diagnostic \
+             (the `.` alias resolves to the project root itself): stdout={} stderr={}",
+            run.stdout,
+            run.stderr
+        );
     }
 
     let after = tree_snapshot(&project);
+    assert_tree_bytes_unchanged(&before, &after, "a fail-closed `status`");
+}
+
+/// The byte snapshot must catch an EQUAL-LENGTH in-place mutation — the exact
+/// hole a size-only snapshot left open. Self-test of the harness: mutating one
+/// byte without changing any file length must be reported as changed.
+#[test]
+fn tree_snapshot_detects_equal_length_byte_mutation() {
+    let dir = TestDir::new("snap-selftest");
+    let project = dir.path().join("mini");
+    std::fs::create_dir_all(&project).unwrap();
+    let victim = project.join("a.txt");
+    std::fs::write(&victim, b"AAAA").unwrap();
+
+    let before = tree_snapshot(&project);
+    std::fs::write(&victim, b"AAAB").unwrap();
+    let after = tree_snapshot(&project);
+
     assert_eq!(
+        before.len(),
+        after.len(),
+        "sanity: the mutation must keep the file set identical"
+    );
+    assert_eq!(
+        before[0].1.len(),
+        after[0].1.len(),
+        "sanity: the mutation must keep the byte LENGTH identical, so only a \
+         full-byte comparison can detect it"
+    );
+    assert_ne!(
         before, after,
-        "a fail-closed `status` must leave the project tree byte-for-byte unchanged"
+        "a same-length byte mutation must change the snapshot"
+    );
+    let panicked = std::panic::catch_unwind(|| {
+        assert_tree_bytes_unchanged(&before, &after, "self-test");
+    });
+    assert!(
+        panicked.is_err(),
+        "the nonmutation assertion must FAIL on a same-length byte mutation"
     );
 }
 

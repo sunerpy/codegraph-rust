@@ -50,9 +50,173 @@ pub fn db_path_for(project_path: &Path) -> Option<PathBuf> {
 
 /// Whether `project_path` resolves to an existing current-namespace index DB.
 /// `false` for both an unresolvable configured root and a resolvable-but-absent
-/// index — the shared adoption/probe predicate.
+/// index — the shared adoption / `tools/list`-schema predicate. Adoption and the
+/// schema selector only ask "is there a usable index here?", so collapsing the
+/// invalid-config and absent cases to `false` is correct FOR THEM. A tool CALL
+/// needs the finer [`probe_root`] to tell an unsafe configured root apart from an
+/// absent index and surface the actionable diagnostic instead of a generic miss.
 pub fn db_exists_for(project_path: &Path) -> bool {
-    db_path_for(project_path).is_some_and(|db| db.is_file())
+    matches!(probe_root(project_path), RootStatus::Indexed)
+}
+
+/// Fail-closed classification of one project-root candidate under the current
+/// `CODEGRAPH_DIR`. Distinguishes an UNSAFE configured root (an
+/// [`codegraph_core::IndexPaths::resolve`] failure — the actionable diagnostic
+/// is carried verbatim, NEVER re-parsed from a rendered string) from a valid
+/// root whose DB is merely ABSENT, so a tool call can fail closed with the real
+/// configuration error rather than a generic "not indexed" miss that would let
+/// an invalid root masquerade as an un-init'd one.
+#[derive(Debug)]
+pub enum RootStatus {
+    /// Valid configured root AND its current-namespace DB exists on disk.
+    Indexed,
+    /// Valid configured root, but its current-namespace DB does not exist yet.
+    Absent,
+    /// The configured `CODEGRAPH_DIR` is unsafe/aliased/overlapping; the string
+    /// is the stable `IndexPaths` diagnostic (its `Display`).
+    Invalid(String),
+}
+
+/// Classify `project_path` via the single `IndexPaths` authority. NEVER
+/// reconstructs a default path on a resolve failure — an invalid configured root
+/// yields [`RootStatus::Invalid`], not a fabricated `.codegraph-v2` fallback that
+/// could open an unrelated project's database.
+pub fn probe_root(project_path: &Path) -> RootStatus {
+    classify_resolve(codegraph_core::IndexPaths::resolve(
+        project_path,
+        std::env::var("CODEGRAPH_DIR").ok().as_deref(),
+    ))
+}
+
+/// Pure classifier for an [`codegraph_core::IndexPaths::resolve`] outcome, split
+/// out so the invalid/absent decision is unit-tested WITHOUT mutating the
+/// process-global `CODEGRAPH_DIR`.
+fn classify_resolve(
+    resolved: Result<codegraph_core::IndexPaths, codegraph_core::IndexPathsError>,
+) -> RootStatus {
+    use codegraph_core::IndexPathsError;
+    match resolved {
+        Ok(paths) => {
+            if paths.current_db().is_file() {
+                RootStatus::Indexed
+            } else {
+                RootStatus::Absent
+            }
+        }
+        // A project directory that cannot be canonicalized is MISSING, not a bad
+        // configuration — a bogus `projectPath` must stay a generic "not indexed"
+        // miss (the `codegraph init` case), never an "invalid CODEGRAPH_DIR"
+        // error. Every OTHER variant is a genuinely unsafe/aliased/overlapping
+        // configured root and fails closed with its stable diagnostic.
+        Err(IndexPathsError::ProjectInaccessible { .. }) => RootStatus::Absent,
+        Err(err) => RootStatus::Invalid(err.to_string()),
+    }
+}
+
+/// The outcome of resolving a tool call's `projectPath` argument to a project
+/// directory, preserving the invalid-config vs absent-index distinction the
+/// caller needs to emit an actionable error rather than a generic miss.
+#[derive(Debug)]
+pub enum ProjectArg {
+    /// Resolved to an indexed project directory.
+    Resolved(PathBuf),
+    /// A candidate's configured `CODEGRAPH_DIR` is unsafe/aliased/overlapping;
+    /// carries the stable `IndexPaths` diagnostic. Fail closed with this rather
+    /// than masking it as a generic miss.
+    InvalidConfig(String),
+    /// Nothing resolved to an existing index (valid roots with absent DBs, or no
+    /// candidate matched) — the genuine "run `codegraph init`" case.
+    NotIndexed,
+}
+
+impl ProjectArg {
+    /// The resolved indexed path, if any — for the debug trace and the existing
+    /// resolution unit tests (which only assert the resolved/none outcome).
+    pub fn resolved(&self) -> Option<&Path> {
+        match self {
+            ProjectArg::Resolved(p) => Some(p.as_path()),
+            _ => None,
+        }
+    }
+}
+
+/// Resolve a caller's `projectPath` to an INDEXED project dir, in the SAME
+/// candidate order both server front-ends use: absolute raw → cwd-join → bare
+/// raw → default-by-basename; `None` raw → the default project. An INDEXED
+/// candidate wins immediately (a valid configured root is honored even if an
+/// earlier candidate carried a bad config); otherwise the FIRST invalid-config
+/// diagnostic is surfaced (fail closed); otherwise [`ProjectArg::NotIndexed`].
+pub fn resolve_project_arg(
+    raw: Option<&str>,
+    cwd: Option<&Path>,
+    default_project: Option<&Path>,
+) -> ProjectArg {
+    resolve_project_arg_with(raw, cwd, default_project, &probe_root)
+}
+
+/// [`resolve_project_arg`] with the per-candidate classifier injected, so the
+/// candidate ORDER and the indexed/absent/invalid decision are unit-tested
+/// without mutating the process-global `CODEGRAPH_DIR`. Production callers use
+/// [`resolve_project_arg`], which injects [`probe_root`].
+fn resolve_project_arg_with(
+    raw: Option<&str>,
+    cwd: Option<&Path>,
+    default_project: Option<&Path>,
+    probe: &dyn Fn(&Path) -> RootStatus,
+) -> ProjectArg {
+    let Some(raw) = raw else {
+        return match default_project {
+            Some(p) => match probe(p) {
+                RootStatus::Indexed => ProjectArg::Resolved(p.to_path_buf()),
+                RootStatus::Invalid(detail) => ProjectArg::InvalidConfig(detail),
+                RootStatus::Absent => ProjectArg::NotIndexed,
+            },
+            None => ProjectArg::NotIndexed,
+        };
+    };
+
+    let raw_path = PathBuf::from(raw);
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if raw_path.is_absolute() {
+        candidates.push(raw_path.clone());
+    } else {
+        if let Some(cwd) = cwd {
+            candidates.push(cwd.join(&raw_path));
+        }
+        candidates.push(raw_path.clone());
+    }
+    if let Some(default) = default_project
+        && raw_path.file_name() == default.file_name()
+    {
+        candidates.push(default.to_path_buf());
+    }
+
+    let mut first_invalid: Option<String> = None;
+    for candidate in &candidates {
+        match probe(candidate) {
+            RootStatus::Indexed => return ProjectArg::Resolved(candidate.clone()),
+            RootStatus::Invalid(detail) if first_invalid.is_none() => {
+                first_invalid = Some(detail);
+            }
+            _ => {}
+        }
+    }
+    match first_invalid {
+        Some(detail) => ProjectArg::InvalidConfig(detail),
+        None => ProjectArg::NotIndexed,
+    }
+}
+
+/// The actionable tool-error text for an unsafe/aliased configured root, shared
+/// by both front-ends so the wording (and the "unsafe configured root" naming
+/// the regressions assert) stays identical.
+pub fn invalid_config_message(detail: &str) -> String {
+    format!(
+        "Invalid CODEGRAPH_DIR configuration: {detail}. The configured index root is \
+         unsafe — fix or unset CODEGRAPH_DIR (it must not alias the project root, an \
+         ancestor, a symlink/reparse component, or overlap the legacy `.codegraph` \
+         root), then re-run `codegraph init`."
+    )
 }
 
 pub struct WorkspaceRoots {
@@ -667,5 +831,177 @@ mod tests {
             !db_exists_for(&missing),
             "db_exists_for must be false when resolution fails"
         );
+    }
+
+    /// `classify_resolve` on a VALID configured root whose DB is present →
+    /// [`RootStatus::Indexed`]. Race-free: `IndexPaths::resolve` is called with an
+    /// explicit `codegraph_dir` argument, never the process-global env.
+    #[test]
+    fn classify_resolve_valid_present_is_indexed() {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-roots-classify-present-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = codegraph_core::IndexPaths::resolve(&dir, None).expect("resolve default");
+        let db = paths.current_db();
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::fs::write(&db, b"placeholder").unwrap();
+        assert!(matches!(
+            classify_resolve(codegraph_core::IndexPaths::resolve(&dir, None)),
+            RootStatus::Indexed
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `classify_resolve` on a VALID configured root whose DB is ABSENT →
+    /// [`RootStatus::Absent`] (the genuine un-init'd case, not an error).
+    #[test]
+    fn classify_resolve_valid_absent_is_absent() {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-roots-classify-absent-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(matches!(
+            classify_resolve(codegraph_core::IndexPaths::resolve(&dir, None)),
+            RootStatus::Absent
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `classify_resolve` on an UNSAFE configured root (`.` aliases the project
+    /// root) → [`RootStatus::Invalid`] carrying the stable diagnostic. Race-free:
+    /// the bad value is passed as an argument, not via the global env.
+    #[test]
+    fn classify_resolve_invalid_config_is_invalid_with_diagnostic() {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-roots-classify-invalid-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        match classify_resolve(codegraph_core::IndexPaths::resolve(&dir, Some("."))) {
+            RootStatus::Invalid(detail) => assert!(
+                detail.contains("project root"),
+                "invalid diagnostic must name the aliasing reason: {detail}"
+            ),
+            other => panic!("`.` alias must classify Invalid, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A MISSING project directory is not a bad configuration: it classifies
+    /// [`RootStatus::Absent`] (generic "not indexed"), never `Invalid`.
+    #[test]
+    fn classify_resolve_missing_project_is_absent_not_invalid() {
+        let missing = std::env::temp_dir().join(format!(
+            "cg-roots-classify-missing-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        assert!(!missing.exists(), "sanity: probe path must not exist");
+        assert!(matches!(
+            classify_resolve(codegraph_core::IndexPaths::resolve(&missing, None)),
+            RootStatus::Absent
+        ));
+    }
+
+    /// A stub classifier keyed by path, so candidate ORDER and the three typed
+    /// states are asserted without touching the filesystem or the env.
+    fn stub_probe(map: Vec<(PathBuf, RootStatus)>) -> impl Fn(&Path) -> RootStatus {
+        move |candidate: &Path| {
+            for (path, status) in &map {
+                if path == candidate {
+                    return match status {
+                        RootStatus::Indexed => RootStatus::Indexed,
+                        RootStatus::Absent => RootStatus::Absent,
+                        RootStatus::Invalid(d) => RootStatus::Invalid(d.clone()),
+                    };
+                }
+            }
+            RootStatus::Absent
+        }
+    }
+
+    /// `raw = None` + an INVALID default root ⇒ [`ProjectArg::InvalidConfig`]
+    /// carrying the diagnostic — NOT `NotIndexed`. This is the exact Failure-B
+    /// masking: a bad `CODEGRAPH_DIR` used to collapse into "no indexed project".
+    #[test]
+    fn resolve_project_arg_none_invalid_default_is_invalid_config() {
+        let default = PathBuf::from("/tmp/cg-stub-default");
+        let probe = stub_probe(vec![(
+            default.clone(),
+            RootStatus::Invalid("unsafe root: project root itself".to_string()),
+        )]);
+        match resolve_project_arg_with(None, None, Some(&default), &probe) {
+            ProjectArg::InvalidConfig(detail) => {
+                assert!(detail.contains("project root itself"), "{detail}")
+            }
+            other => panic!("invalid default must fail closed, got {other:?}"),
+        }
+    }
+
+    /// An INDEXED candidate wins over an EARLIER invalid one: a valid configured
+    /// root must still resolve, so the fail-closed behavior cannot regress into
+    /// refusing every call whenever any candidate happens to be misconfigured.
+    #[test]
+    fn resolve_project_arg_indexed_candidate_wins_over_earlier_invalid() {
+        let cwd = PathBuf::from("/tmp/cg-stub-cwd");
+        let bare = PathBuf::from("proj");
+        let joined = cwd.join(&bare);
+        let probe = stub_probe(vec![
+            (joined, RootStatus::Invalid("bad".to_string())),
+            (bare.clone(), RootStatus::Indexed),
+        ]);
+        assert_eq!(
+            resolve_project_arg_with(Some("proj"), Some(&cwd), None, &probe).resolved(),
+            Some(bare.as_path()),
+            "an indexed later candidate must win over an earlier invalid one"
+        );
+    }
+
+    /// With NO indexed candidate, the FIRST invalid diagnostic is surfaced (in
+    /// candidate order: cwd-join before bare raw), so the reported reason belongs
+    /// to the highest-priority misconfigured candidate.
+    #[test]
+    fn resolve_project_arg_reports_first_invalid_in_candidate_order() {
+        let cwd = PathBuf::from("/tmp/cg-stub-cwd2");
+        let bare = PathBuf::from("proj");
+        let joined = cwd.join(&bare);
+        let probe = stub_probe(vec![
+            (joined, RootStatus::Invalid("first-invalid".to_string())),
+            (bare, RootStatus::Invalid("second-invalid".to_string())),
+        ]);
+        match resolve_project_arg_with(Some("proj"), Some(&cwd), None, &probe) {
+            ProjectArg::InvalidConfig(detail) => assert_eq!(detail, "first-invalid"),
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    /// All-absent candidates stay the genuine [`ProjectArg::NotIndexed`] "run
+    /// `codegraph init`" case — an absent index is not a bad configuration.
+    #[test]
+    fn resolve_project_arg_all_absent_is_not_indexed() {
+        let probe = stub_probe(vec![]);
+        assert!(matches!(
+            resolve_project_arg_with(Some("/tmp/cg-stub-absolute"), None, None, &probe),
+            ProjectArg::NotIndexed
+        ));
+    }
+
+    /// The shared invalid-config message embeds the verbatim diagnostic AND the
+    /// actionable remedy both front-ends surface.
+    #[test]
+    fn invalid_config_message_carries_detail_and_remedy() {
+        let msg = invalid_config_message("refusing an unsafe index root /p: reason");
+        assert!(
+            msg.contains("refusing an unsafe index root /p: reason"),
+            "{msg}"
+        );
+        assert!(msg.contains("CODEGRAPH_DIR"), "{msg}");
+        assert!(msg.contains("unsafe"), "{msg}");
     }
 }

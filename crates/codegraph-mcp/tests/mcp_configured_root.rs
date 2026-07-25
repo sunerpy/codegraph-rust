@@ -15,10 +15,43 @@ use codegraph_mcp::McpServer;
 use serde_json::{Value, json};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
-// Both tests mutate the PROCESS-GLOBAL `CODEGRAPH_DIR`; cargo runs a binary's
-// tests multi-threaded in ONE process, so they must serialize the set→read→
-// restore window against each other.
+// Every test here mutates the PROCESS-GLOBAL `CODEGRAPH_DIR`; cargo runs a
+// binary's tests multi-threaded in ONE process, so they must serialize the
+// set→read→restore window against each other.
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// RAII guard for the process-global `CODEGRAPH_DIR`: sets it on construction and
+/// restores the PREVIOUS value (or removes it) in `Drop`. Manual restore lines
+/// are skipped when an assertion panics mid-test, leaking a bad `CODEGRAPH_DIR`
+/// into every later test in this binary; `Drop` runs on the unwind path too, so
+/// the restoration is panic-safe. Holds the [`ENV_LOCK`] for its whole lifetime.
+struct EnvGuard {
+    prev: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl EnvGuard {
+    fn set(value: &str) -> Self {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var_os("CODEGRAPH_DIR");
+        // SAFETY: the ENV_LOCK held for this guard's lifetime serializes every
+        // `CODEGRAPH_DIR` mutation in this test binary, and `Drop` restores the
+        // prior value on both the normal and the unwind path.
+        unsafe { std::env::set_var("CODEGRAPH_DIR", value) };
+        Self { prev, _lock: lock }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: still holding the ENV_LOCK, so no other test thread is reading
+        // or writing `CODEGRAPH_DIR` while it is restored.
+        match self.prev.take() {
+            Some(v) => unsafe { std::env::set_var("CODEGRAPH_DIR", v) },
+            None => unsafe { std::env::remove_var("CODEGRAPH_DIR") },
+        }
+    }
+}
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -85,14 +118,10 @@ fn tool_call_search(project: &Path, project_path_arg: &str) -> Value {
 /// return results — proving the MCP path opens the DB the CLI init would write.
 #[test]
 fn configured_relative_root_mcp_opens_identity_sibling_db() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let dir = unique_dir("rel");
     let base = &dir.path;
 
-    let prev = std::env::var_os("CODEGRAPH_DIR");
-    // SAFETY: this test binary runs single-threaded per test process; the env is
-    // set before any resolve/DB access and restored before returning.
-    unsafe { std::env::set_var("CODEGRAPH_DIR", "cache") };
+    let _env = EnvGuard::set("cache");
 
     let paths = codegraph_core::IndexPaths::resolve(base, Some("cache")).expect("resolve");
     stage_mini_db_at(&paths.current_db(), base);
@@ -102,11 +131,6 @@ fn configured_relative_root_mcp_opens_identity_sibling_db() {
     );
 
     let resp = tool_call_search(base, base.to_str().unwrap());
-
-    match prev {
-        Some(v) => unsafe { std::env::set_var("CODEGRAPH_DIR", v) },
-        None => unsafe { std::env::remove_var("CODEGRAPH_DIR") },
-    }
 
     let text = resp["result"]["content"][0]["text"]
         .as_str()
@@ -128,7 +152,6 @@ fn configured_relative_root_mcp_opens_identity_sibling_db() {
 /// shared absolute root.
 #[test]
 fn two_projects_sharing_absolute_root_cannot_cross_read_via_mcp() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let dir = unique_dir("abs");
     let holder = &dir.path;
     let project_a = holder.join("a");
@@ -138,10 +161,8 @@ fn two_projects_sharing_absolute_root_cannot_cross_read_via_mcp() {
     fs::create_dir_all(&project_b).unwrap();
     fs::create_dir_all(holder.join("shared")).unwrap();
 
-    let prev = std::env::var_os("CODEGRAPH_DIR");
     let shared_str = shared.to_string_lossy().into_owned();
-    // SAFETY: single-threaded test process; restored before returning.
-    unsafe { std::env::set_var("CODEGRAPH_DIR", &shared_str) };
+    let _env = EnvGuard::set(&shared_str);
 
     let paths_a = codegraph_core::IndexPaths::resolve(&project_a, Some(&shared_str)).expect("a");
     stage_mini_db_at(&paths_a.current_db(), &project_a);
@@ -160,11 +181,6 @@ fn two_projects_sharing_absolute_root_cannot_cross_read_via_mcp() {
     let resp_a = tool_call_search(&project_a, project_a.to_str().unwrap());
     let resp_b = tool_call_search(&project_b, project_b.to_str().unwrap());
 
-    match prev {
-        Some(v) => unsafe { std::env::set_var("CODEGRAPH_DIR", v) },
-        None => unsafe { std::env::remove_var("CODEGRAPH_DIR") },
-    }
-
     let text_a = resp_a["result"]["content"][0]["text"]
         .as_str()
         .unwrap_or("");
@@ -177,4 +193,220 @@ fn two_projects_sharing_absolute_root_cannot_cross_read_via_mcp() {
         !text_b.contains("Greeter") && !text_b.contains("Counter"),
         "project B must NOT surface project A's indexed symbols: {text_b}"
     );
+}
+
+/// Snapshot every file path plus its COMPLETE bytes under `root`, sorted — the
+/// nonmutation oracle. Full bytes, never lengths: an equal-length in-place write
+/// keeps the size identical and would slip past a size-only snapshot.
+fn tree_snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(dir: &Path, base: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.is_dir() {
+                walk(&path, base, out);
+            } else {
+                let rel = path
+                    .strip_prefix(base)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((rel, fs::read(&path).unwrap_or_default()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+/// An INVALID `CODEGRAPH_DIR` must fail closed on the REAL MCP public surface —
+/// it must not silently fall back to the default `.codegraph-v2` namespace.
+///
+/// A TRAP database is staged at the default location `<project>/.codegraph-v2/
+/// codegraph.db` (the very path a `.`-alias fallback would open) and
+/// `CODEGRAPH_DIR=.` is set, which `IndexPaths::resolve` refuses because it
+/// aliases the project root. A real `tools/call codegraph_search` must then:
+/// surface the actionable invalid-configuration diagnostic, NOT the generic "No
+/// indexed project" miss; serve NONE of the trap DB's symbols; and mutate zero
+/// bytes of the project tree (trap DB included).
+#[test]
+fn invalid_configured_root_mcp_fails_closed_and_never_serves_trap_default_db() {
+    let dir = unique_dir("trap");
+    let project = dir.path.join("mini");
+    fs::create_dir_all(&project).unwrap();
+
+    let trap_db = project
+        .join(codegraph_core::index_paths::DEFAULT_CURRENT_DIR)
+        .join("codegraph.db");
+    stage_mini_db_at(&trap_db, &project);
+    assert!(
+        trap_db.is_file(),
+        "sanity: the trap DB must exist at the default namespace a fallback would open"
+    );
+
+    let _env = EnvGuard::set(".");
+    assert!(
+        codegraph_core::IndexPaths::resolve(&project, Some(".")).is_err(),
+        "sanity: `CODEGRAPH_DIR=.` must be refused by the path authority"
+    );
+
+    let before = tree_snapshot(&project);
+    let resp = tool_call_search(&project, project.to_str().unwrap());
+    let after = tree_snapshot(&project);
+
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let whole = serde_json::to_string(&resp).unwrap();
+
+    assert_eq!(
+        resp["result"]["isError"],
+        json!(true),
+        "an invalid configured root must make the tool call fail closed: {whole}"
+    );
+    assert!(
+        text.contains("CODEGRAPH_DIR"),
+        "the error must name the offending configuration: {text}"
+    );
+    assert!(
+        text.contains("project root itself"),
+        "the error must carry the STABLE `IndexPaths` reason (the `.` alias \
+         resolves to the project root itself), not a generic message: {text}"
+    );
+    assert!(
+        !text.contains("No indexed project"),
+        "an invalid configuration must NOT masquerade as an un-init'd project: {text}"
+    );
+    assert!(
+        !whole.contains("Counter") && !whole.contains("increment") && !whole.contains("math.ts"),
+        "the trap DB at the default namespace must NEVER be served: {whole}"
+    );
+
+    let mut diffs: Vec<String> = Vec::new();
+    let before_map: std::collections::BTreeMap<&str, &Vec<u8>> =
+        before.iter().map(|(p, b)| (p.as_str(), b)).collect();
+    let after_map: std::collections::BTreeMap<&str, &Vec<u8>> =
+        after.iter().map(|(p, b)| (p.as_str(), b)).collect();
+    for (path, bytes) in &before_map {
+        match after_map.get(path) {
+            None => diffs.push(format!("removed: {path}")),
+            Some(other) if other != bytes => diffs.push(format!("bytes changed: {path}")),
+            Some(_) => {}
+        }
+    }
+    for path in after_map.keys() {
+        if !before_map.contains_key(path) {
+            diffs.push(format!("created: {path}"));
+        }
+    }
+    assert!(
+        diffs.is_empty(),
+        "a fail-closed tool call must leave the project tree (trap DB included) \
+         byte-for-byte unchanged, but changed: {diffs:?}"
+    );
+}
+
+/// The rmcp front-end (the SHIPPED transport) must fail closed identically: the
+/// same trap DB at the default namespace, the same refused `CODEGRAPH_DIR=.`, a
+/// real rmcp `tools/call` over a duplex transport. Proves the invalid-config
+/// state survives BOTH tool-call paths, not just the hand-rolled one.
+#[test]
+fn invalid_configured_root_rmcp_fails_closed_and_never_serves_trap_default_db() {
+    let dir = unique_dir("trap-rmcp");
+    let project = dir.path.join("mini");
+    fs::create_dir_all(&project).unwrap();
+    stage_mini_db_at(
+        &project
+            .join(codegraph_core::index_paths::DEFAULT_CURRENT_DIR)
+            .join("codegraph.db"),
+        &project,
+    );
+
+    let _env = EnvGuard::set(".");
+
+    let before = tree_snapshot(&project);
+    let resp = rmcp_tool_call_search(&project);
+    let after = tree_snapshot(&project);
+
+    let whole = serde_json::to_string(&resp).unwrap();
+    assert_eq!(
+        resp["isError"],
+        json!(true),
+        "rmcp must fail closed on an invalid configured root: {whole}"
+    );
+    let text = resp["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("CODEGRAPH_DIR") && text.contains("project root itself"),
+        "rmcp must surface the actionable IndexPaths diagnostic: {text}"
+    );
+    assert!(
+        !text.contains("No indexed project"),
+        "rmcp must not mask an invalid configuration as an un-init'd project: {text}"
+    );
+    assert!(
+        !whole.contains("Counter") && !whole.contains("increment") && !whole.contains("math.ts"),
+        "rmcp must NEVER serve the trap DB at the default namespace: {whole}"
+    );
+    assert_eq!(
+        before, after,
+        "a fail-closed rmcp tool call must mutate zero project bytes"
+    );
+}
+
+/// Drive ONE real rmcp `tools/call codegraph_search` against `project` over a
+/// `tokio::io::duplex` transport, returning the serialized `CallToolResult`.
+fn rmcp_tool_call_search(project: &Path) -> Value {
+    use rmcp::ServiceExt;
+    use rmcp::model::{
+        CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation, ProtocolVersion,
+    };
+
+    let project = project.to_path_buf();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    rt.block_on(async move {
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let handler =
+            codegraph_mcp::rmcp_handler::CodeGraphHandler::new(Some(project.to_path_buf()));
+        let server = tokio::spawn(async move {
+            if let Ok(running) = handler.serve(server_io).await {
+                let _ = running.waiting().await;
+            }
+        });
+        let client = ClientInfo::new(
+            ClientCapabilities::default(),
+            Implementation::new("cfgroot", "0"),
+        )
+        .with_protocol_version(ProtocolVersion::V_2024_11_05)
+        .serve(client_io)
+        .await
+        .expect("rmcp handshake");
+
+        let mut args = serde_json::Map::new();
+        args.insert("query".to_string(), json!("add"));
+        args.insert(
+            "projectPath".to_string(),
+            json!(project.to_str().expect("utf8 project path")),
+        );
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new("codegraph_search".to_string()).with_arguments(args),
+            )
+            .await
+            .expect("rmcp call_tool");
+        let value = serde_json::to_value(&result).expect("serialize CallToolResult");
+        let _ = client.cancel().await;
+        let _ = server.await;
+        value
+    })
 }

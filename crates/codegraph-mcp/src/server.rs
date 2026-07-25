@@ -445,14 +445,22 @@ impl McpServer {
             format_tool_debug_line(
                 &tool_name,
                 raw_project,
-                resolved.as_deref(),
+                resolved.resolved(),
                 self.cwd.as_deref(),
                 self.default_project.as_deref(),
             )
         );
         let project_path = match resolved {
-            Some(p) => p,
-            None => {
+            crate::roots::ProjectArg::Resolved(p) => p,
+            crate::roots::ProjectArg::InvalidConfig(detail) => {
+                return Dispatch::Reply(
+                    serde_json::to_value(ToolResult::error(crate::roots::invalid_config_message(
+                        &detail,
+                    )))
+                    .expect("ToolResult serializes"),
+                );
+            }
+            crate::roots::ProjectArg::NotIndexed => {
                 let message = match raw_project {
                     Some(raw) => format!(
                         "No indexed project found for projectPath {raw:?}. Pass an absolute path to an indexed project, or run `codegraph init` there."
@@ -498,33 +506,14 @@ impl McpServer {
     /// - `raw = None`: the `default_project` (existing behavior).
     ///
     /// Honesty rule: when `raw` is given but resolves to nothing AND its basename
-    /// does not match `default_project`, this returns `None` rather than silently
-    /// falling back to `default_project` — a genuinely wrong path must surface an
-    /// error, not mask itself behind the default.
-    fn resolve_project_arg(&self, raw: Option<&str>) -> Option<PathBuf> {
-        let Some(raw) = raw else {
-            return self.default_project.clone().filter(|p| db_exists_for(p));
-        };
-
-        let raw_path = PathBuf::from(raw);
-        let mut candidates: Vec<PathBuf> = Vec::new();
-        if raw_path.is_absolute() {
-            candidates.push(raw_path.clone());
-        } else {
-            if let Some(cwd) = &self.cwd {
-                candidates.push(cwd.join(&raw_path));
-            }
-            candidates.push(raw_path.clone());
-        }
-        if let Some(default) = &self.default_project
-            && raw_path.file_name() == default.file_name()
-        {
-            candidates.push(default.clone());
-        }
-
-        candidates
-            .into_iter()
-            .find(|candidate| db_exists_for(candidate))
+    /// does not match `default_project`, this yields `NotIndexed` rather than
+    /// silently falling back to `default_project` — a genuinely wrong path must
+    /// surface an error, not mask itself behind the default. An unsafe configured
+    /// root yields `InvalidConfig` (the Failure-B fix), not a generic miss.
+    /// Delegates to the shared [`crate::roots::resolve_project_arg`] so this
+    /// front-end and the rmcp handler stay byte-identical.
+    fn resolve_project_arg(&self, raw: Option<&str>) -> crate::roots::ProjectArg {
+        crate::roots::resolve_project_arg(raw, self.cwd.as_deref(), self.default_project.as_deref())
     }
 
     /// Open-on-demand + cache the engine for a project path
@@ -839,7 +828,7 @@ mod tests {
         let cwd = std::env::temp_dir().join("cg-mcp-basename-cwd-elsewhere");
         let server = McpServer::new_with_cwd(Some(project.path().to_path_buf()), Some(cwd));
         assert_eq!(
-            server.resolve_project_arg(Some(&name)).as_deref(),
+            server.resolve_project_arg(Some(&name)).resolved(),
             Some(project.path()),
         );
     }
@@ -855,7 +844,7 @@ mod tests {
         // default_project unset so ONLY the cwd-join candidate can resolve.
         let server = McpServer::new_with_cwd(None, Some(parent));
         assert_eq!(
-            server.resolve_project_arg(Some(name)).as_deref(),
+            server.resolve_project_arg(Some(name)).resolved(),
             Some(project.path()),
         );
     }
@@ -867,7 +856,7 @@ mod tests {
         let raw = project.path().display().to_string();
         let server = McpServer::new_with_cwd(None, None);
         assert_eq!(
-            server.resolve_project_arg(Some(&raw)).as_deref(),
+            server.resolve_project_arg(Some(&raw)).resolved(),
             Some(project.path()),
         );
     }
@@ -881,7 +870,9 @@ mod tests {
         let cwd = std::env::temp_dir().join("cg-mcp-bogus-cwd-elsewhere");
         let server = McpServer::new_with_cwd(Some(project.path().to_path_buf()), Some(cwd));
         assert_eq!(
-            server.resolve_project_arg(Some("definitely-not-a-real-project-xyz")),
+            server
+                .resolve_project_arg(Some("definitely-not-a-real-project-xyz"))
+                .resolved(),
             None,
         );
     }
@@ -893,7 +884,7 @@ mod tests {
         let project = indexed_project("none-default");
         let server = McpServer::new_with_cwd(Some(project.path().to_path_buf()), None);
         assert_eq!(
-            server.resolve_project_arg(None).as_deref(),
+            server.resolve_project_arg(None).resolved(),
             Some(project.path()),
         );
     }
@@ -909,7 +900,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let server = McpServer::new_with_cwd(Some(dir.clone()), None);
-        assert_eq!(server.resolve_project_arg(None), None);
+        assert_eq!(server.resolve_project_arg(None).resolved(), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

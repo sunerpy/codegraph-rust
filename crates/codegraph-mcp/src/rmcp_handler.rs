@@ -181,33 +181,17 @@ impl CodeGraphHandler {
             .is_some_and(|p| db_exists_for(p))
     }
 
-    /// Resolve a caller's `projectPath` to an INDEXED project dir, byte-for-byte
-    /// the same candidate order as [`crate::McpServer`]'s `resolve_project_arg`
-    /// (server.rs:568): absolute raw → cwd-join → bare raw → default-by-basename;
-    /// `None` raw → the indexed default. Returns `None` when nothing resolves.
-    fn resolve_project_arg(&self, raw: Option<&str>) -> Option<PathBuf> {
-        let default_project = self.default_project_snapshot();
-        let Some(raw) = raw else {
-            return default_project.filter(|p| db_exists_for(p));
-        };
-        let raw_path = PathBuf::from(raw);
-        let mut candidates: Vec<PathBuf> = Vec::new();
-        if raw_path.is_absolute() {
-            candidates.push(raw_path.clone());
-        } else {
-            if let Some(cwd) = &self.cwd {
-                candidates.push(cwd.join(&raw_path));
-            }
-            candidates.push(raw_path.clone());
-        }
-        if let Some(default) = &default_project
-            && raw_path.file_name() == default.file_name()
-        {
-            candidates.push(default.clone());
-        }
-        candidates
-            .into_iter()
-            .find(|candidate| db_exists_for(candidate))
+    /// Resolve a caller's `projectPath` through the shared
+    /// [`crate::roots::resolve_project_arg`], so both front-ends agree on
+    /// candidate order AND on the invalid-config vs absent-index distinction: an
+    /// unsafe configured root fails closed with the real diagnostic instead of a
+    /// generic miss (the Failure-B fix).
+    fn resolve_project_arg(&self, raw: Option<&str>) -> crate::roots::ProjectArg {
+        crate::roots::resolve_project_arg(
+            raw,
+            self.cwd.as_deref(),
+            self.default_project_snapshot().as_deref(),
+        )
     }
 
     /// Adopt an indexed client workspace root when the current default is
@@ -420,8 +404,13 @@ impl ServerHandler for CodeGraphHandler {
 
         let raw_project = args.get("projectPath").and_then(Value::as_str);
         let project_path = match self.resolve_project_arg(raw_project) {
-            Some(p) => p,
-            None => {
+            crate::roots::ProjectArg::Resolved(p) => p,
+            crate::roots::ProjectArg::InvalidConfig(detail) => {
+                return Ok(tool_result_to_call_result(&ToolResult::error(
+                    crate::roots::invalid_config_message(&detail),
+                )));
+            }
+            crate::roots::ProjectArg::NotIndexed => {
                 let message = match raw_project {
                     Some(raw) => format!(
                         "No indexed project found for projectPath {raw:?}. Pass an absolute path to an indexed project, or run `codegraph init` there."
@@ -1066,7 +1055,7 @@ mod handler_tests {
         let project = placeholder_indexed("resolve-none");
         let handler = CodeGraphHandler::new_with_cwd(Some(project.path.clone()), None);
         assert_eq!(
-            handler.resolve_project_arg(None).as_deref(),
+            handler.resolve_project_arg(None).resolved(),
             Some(project.path.as_path())
         );
     }
@@ -1075,7 +1064,7 @@ mod handler_tests {
     fn resolve_project_arg_none_unindexed_default_is_none() {
         let dir = unique_dir("resolve-none-unidx");
         let handler = CodeGraphHandler::new_with_cwd(Some(dir.path.clone()), None);
-        assert_eq!(handler.resolve_project_arg(None), None);
+        assert_eq!(handler.resolve_project_arg(None).resolved(), None);
     }
 
     #[test]
@@ -1084,7 +1073,7 @@ mod handler_tests {
         let raw = project.path.display().to_string();
         let handler = CodeGraphHandler::new_with_cwd(None, None);
         assert_eq!(
-            handler.resolve_project_arg(Some(&raw)).as_deref(),
+            handler.resolve_project_arg(Some(&raw)).resolved(),
             Some(project.path.as_path())
         );
     }
@@ -1096,7 +1085,7 @@ mod handler_tests {
         let name = project.path.file_name().and_then(|s| s.to_str()).unwrap();
         let handler = CodeGraphHandler::new_with_cwd(None, Some(parent));
         assert_eq!(
-            handler.resolve_project_arg(Some(name)).as_deref(),
+            handler.resolve_project_arg(Some(name)).resolved(),
             Some(project.path.as_path())
         );
     }
@@ -1113,7 +1102,7 @@ mod handler_tests {
         let cwd = std::env::temp_dir().join("cg-mcp-h-basename-elsewhere");
         let handler = CodeGraphHandler::new_with_cwd(Some(project.path.clone()), Some(cwd));
         assert_eq!(
-            handler.resolve_project_arg(Some(&name)).as_deref(),
+            handler.resolve_project_arg(Some(&name)).resolved(),
             Some(project.path.as_path())
         );
     }
@@ -1123,7 +1112,9 @@ mod handler_tests {
         let project = placeholder_indexed("resolve-bogus");
         let handler = CodeGraphHandler::new_with_cwd(Some(project.path.clone()), None);
         assert_eq!(
-            handler.resolve_project_arg(Some("no-such-project-xyz")),
+            handler
+                .resolve_project_arg(Some("no-such-project-xyz"))
+                .resolved(),
             None
         );
     }

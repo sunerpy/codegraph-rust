@@ -605,3 +605,142 @@ status-fail-closed / MCP-configured-root regressions, and `codegraph-bench`
 golden byte-stability); `bash scripts/guardrail.sh` exit 0. No plan-level
 architecture change was required; state-slot / lease / Store `open_for_*` /
 uninit lifecycle and Batches A–E remain out of scope.
+
+## Batch M — path-authority correction #3: byte-proof snapshots + reachable invalid-config state (2026-07-25)
+
+### Why this follow-up exists
+
+Verification of correction #2 (commit `7652267`) rejected TWO of its claims as
+overclaims. This entry SUPERSEDES those two claims; nothing above is erased, and
+commits `b5a66f2`, `8aeefc4`, `f6ff9e2`, `7652267` all stay intact — this is a
+NEW correction commit (no amend). Frozen plan/manifest/support hashes,
+`UPSTREAM.md`, `KNOWN_DIFFS.md`, goldens, schema, and node-id logic are
+untouched; `Cargo.lock` is still `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`.
+
+### Superseded overclaims
+
+1. **"mutate zero bytes" was not byte proof.** Correction #2's
+   `status_fails_closed_on_invalid_configured_root_without_mutation_via_cli`
+   compared a `tree_snapshot` of `(relative path, byte LENGTH)` pairs. An
+   equal-length in-place write leaves every length identical, so the assertion
+   could not distinguish "unchanged" from "same-size content swap": size equality
+   is NOT evidence of byte identity. The prior wording claiming the command
+   "mutates zero bytes" therefore claimed more than the oracle proved.
+
+2. **The invalid-`CODEGRAPH_DIR` state was still masked on the MCP surface.**
+   Correction #2 made `roots::db_path_for` return `None` on a resolve failure and
+   routed both MCP front-ends through the `db_exists_for` predicate, which
+   collapsed "unsafe configured root" and "valid root, absent DB" into one
+   `false`. Both `McpServer::handle_tools_call` and the rmcp
+   `CodeGraphHandler::call_tool` consumed that boolean BEFORE
+   `CodeGraphEngine::open` could run, so an invalid root emitted the generic
+   `No indexed project …, or run codegraph init there.` message and the
+   actionable `IndexPaths` diagnostic was unreachable through either front-end.
+   Correction #2's claim that the fail-closed error "is surfaced by
+   `CodeGraphEngine::open` when a tool actually runs" was therefore false for the
+   invalid-config case: the call never reached `open`.
+
+### Fixes
+
+1. **Byte-complete nonmutation oracle.** `tree_snapshot` (CLI
+   `batch_m_v2_namespace.rs`) now captures `(relative path, COMPLETE file bytes)`
+   using `symlink_metadata` (a symlink is recorded as an entry, never followed).
+   The comparison moved into `assert_tree_bytes_unchanged`, which diffs the byte
+   maps and reports only the offending paths (created / removed / bytes changed)
+   instead of dumping every file's contents into the failure message. New harness
+   self-test `tree_snapshot_detects_equal_length_byte_mutation` flips ONE byte
+   without changing any length and asserts (via `catch_unwind`) that the
+   nonmutation assertion FAILS — proving the oracle now detects exactly the
+   mutation class the size-only snapshot missed.
+
+2. **Typed root state, reachable through both front-ends.** `roots.rs` gained
+   `RootStatus { Indexed, Absent, Invalid(String) }` and `probe_root`, built on a
+   pure `classify_resolve` over the `IndexPaths::resolve` RESULT — the state is
+   discriminated by the error VARIANT, never by parsing a rendered string. An
+   `IndexPathsError::ProjectInaccessible` stays `Absent` (a bogus `projectPath` is
+   a missing project, not a bad configuration); every other variant is
+   `Invalid`, carrying the stable diagnostic verbatim. `db_exists_for` is now
+   `matches!(probe_root(..), Indexed)`, so adoption and the `tools/list` schema
+   selector keep their unchanged boolean semantics.
+
+   `roots::resolve_project_arg` is the single shared resolver both front-ends
+   call, returning `ProjectArg { Resolved, InvalidConfig(String), NotIndexed }`.
+   Candidate ORDER is preserved exactly (absolute raw → cwd-join → bare raw →
+   default-by-basename; `None` raw → default): an INDEXED candidate still wins
+   immediately, so a valid configured root resolves normally even when an earlier
+   candidate is misconfigured; only when NO candidate is indexed is the FIRST
+   invalid diagnostic surfaced (fail closed), and an all-absent candidate set
+   stays the genuine `NotIndexed` "run `codegraph init`" case.
+   `McpServer::handle_tools_call` and the rmcp `call_tool` both map
+   `InvalidConfig` to the shared `roots::invalid_config_message`, which embeds the
+   verbatim `IndexPaths` reason plus the remedy. `server.rs` / `rmcp_handler.rs`
+   deleted their duplicated candidate loops in favor of the shared resolver, so
+   the two front-ends cannot drift.
+
+3. **Real public-surface trap-DB regressions.** `mcp_configured_root.rs` gained
+   a panic-safe RAII `EnvGuard` that holds the `ENV_LOCK` and restores the prior
+   `CODEGRAPH_DIR` in `Drop` (the previous manual restore lines were skipped on an
+   assertion panic, leaking a bad value into every later test in the binary); both
+   pre-existing tests were converted to it. Two new tests stage a TRAP copy of the
+   golden mini DB at the DEFAULT namespace `<project>/.codegraph-v2/codegraph.db`
+   — precisely the path a silent fallback would open — set the refused
+   `CODEGRAPH_DIR=.`, and drive a real `codegraph_search` tool call:
+   `invalid_configured_root_mcp_fails_closed_and_never_serves_trap_default_db`
+   (hand-rolled `McpServer` over stdio) and
+   `invalid_configured_root_rmcp_fails_closed_and_never_serves_trap_default_db`
+   (the SHIPPED rmcp handler over a duplex transport with a real rmcp client).
+   Each asserts `isError == true`; that the text carries the stable reason
+   (`CODEGRAPH_DIR` + `project root itself`); that it is NOT the generic
+   `No indexed project` message; that NONE of the trap DB's symbols
+   (`Counter`, `increment`, `math.ts`) appear in the response; and that the whole
+   project tree — trap DB included — is byte-for-byte unchanged.
+
+   Both trap tests were confirmed to be REAL regressions: reverting
+   `classify_resolve`'s non-`ProjectInaccessible` arm to `Absent` makes both fail
+   with the exact pre-fix `No indexed project found for projectPath …` text, and
+   restoring the arm makes them pass.
+
+4. **Race-free unit coverage for the typed states.** `roots.rs` added a
+   `resolve_project_arg_with` seam taking the per-candidate classifier as an
+   argument, so candidate order and the three states are asserted with a stub
+   probe — no filesystem, no `CODEGRAPH_DIR` mutation. New tests:
+   `classify_resolve_{valid_present_is_indexed, valid_absent_is_absent,
+invalid_config_is_invalid_with_diagnostic, missing_project_is_absent_not_invalid}`,
+   `resolve_project_arg_none_invalid_default_is_invalid_config`,
+   `resolve_project_arg_indexed_candidate_wins_over_earlier_invalid`,
+   `resolve_project_arg_reports_first_invalid_in_candidate_order`,
+   `resolve_project_arg_all_absent_is_not_indexed`, and
+   `invalid_config_message_carries_detail_and_remedy`.
+
+No existing test was weakened or deleted; the pre-existing resolution unit tests
+were adapted to the typed return via `ProjectArg::resolved()`, keeping their
+original assertions. No dependency was added. State slots, `IndexLease`, Store
+`open_for_*`, migration, uninit/daemon lifecycle, project-scoped `Config`,
+extension/Godot config relocation, and Batches A–E all remain out of scope.
+
+### Verification
+
+All commands run in the implementation worktree on
+`feat/upstream-v1.5-portable-fixes`, each Cargo batch preceded by
+`bash scripts/check-workspace-versions.sh` (OK at 0.40.4 every time):
+
+- `cargo fmt --all --check` — clean.
+- `cargo test -p codegraph-rs --test batch_m_v2_namespace --locked` — 7 passed,
+  0 failed (incl. the new byte-oracle self-test).
+- `cargo test -p codegraph-mcp --test mcp_configured_root --locked` — 4 passed,
+  0 failed (incl. both new trap-DB regressions).
+- `cargo test -p codegraph-mcp --lib --locked` — 256 passed, 0 failed.
+- `cargo check --workspace --all-targets --locked` — clean.
+- `cargo check -p codegraph-core --target x86_64-pc-windows-msvc --all-targets
+--locked` — clean. CROSS-COMPILATION ONLY; no native Windows runtime coverage
+  is claimed.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` — clean.
+- `cargo test --workspace --locked` — exit 0; 105 suites reporting
+  `test result: ok`, 2671 tests passed, 0 failures (incl. the preserved initial
+  black-box Red and `codegraph-bench` golden byte-stability).
+- `bash scripts/guardrail.sh` — exit 0.
+- `sha256sum Cargo.lock` — `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`
+  (byte-identical).
+
+Red-proof for the invalid-config fix is recorded in Fix 3 above (temporary revert
+⇒ both trap tests fail with the pre-fix generic message; revert restored ⇒ pass).
