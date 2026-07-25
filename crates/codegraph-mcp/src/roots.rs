@@ -37,8 +37,10 @@ pub fn format_tool_debug_line(
 /// [`crate::CodeGraphEngine::open`]. Returns `None` when the configured root is
 /// unsafe/aliased/overlapping (a `resolve` failure): callers treat that as "not
 /// an indexed project", which is DISTINCT from a reconstructed default path that
-/// could shadow another project. The authoritative fail-closed error is surfaced
-/// by `CodeGraphEngine::open` when a tool actually runs.
+/// could shadow another project. This helper is for path DISPLAY only and
+/// deliberately drops the reason; the authoritative fail-closed diagnostic comes
+/// from the typed [`probe_root`] / [`resolve_project_arg`] states, which reject
+/// an invalid configured root BEFORE any engine is opened.
 pub fn db_path_for(project_path: &Path) -> Option<PathBuf> {
     codegraph_core::IndexPaths::resolve(
         project_path,

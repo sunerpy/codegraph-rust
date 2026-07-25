@@ -313,33 +313,129 @@ fn configured_dot_alias_fails_closed_without_mutation_via_cli() {
     );
 }
 
-/// Recursively snapshot every file path plus its COMPLETE bytes under `root`,
-/// sorted, so a command can be proven byte-nonmutating by comparing the
-/// before/after set. The full byte content — not the file LENGTH — is captured:
-/// an equal-length in-place byte mutation leaves the length identical and would
-/// slip past a size-only snapshot, so size equality is NOT evidence of byte
-/// identity. Comparing the bytes themselves detects same-length content changes.
-fn tree_snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
-    fn walk(dir: &Path, base: &Path, out: &mut Vec<(String, Vec<u8>)>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.filter_map(Result::ok) {
+/// The exact, deterministic representation of ONE filesystem entry in the
+/// nonmutation oracle. Every supported entry kind carries its complete payload,
+/// so equality of two snapshots is real evidence — not a proxy:
+///
+/// - [`EntryKind::Directory`] — presence itself is the payload, so creating or
+///   removing an EMPTY directory is detectable (a file-only snapshot misses it).
+/// - [`EntryKind::RegularFile`] — the COMPLETE bytes, never the length: an
+///   equal-length in-place write keeps the size identical, so size equality is
+///   NOT evidence of byte identity.
+/// - [`EntryKind::Symlink`] — the link TARGET, read with `read_link`; the link
+///   is never followed, so the oracle neither reads through it nor mistakes a
+///   change of the pointed-to file for a mutation of this tree.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum EntryKind {
+    Directory,
+    RegularFile(Vec<u8>),
+    Symlink(PathBuf),
+}
+
+/// One snapshot entry: the OS-native relative path (a [`PathBuf`], so the
+/// equality key is never a lossy `to_string_lossy` rendering) plus its exact
+/// payload.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TreeEntry {
+    rel: PathBuf,
+    kind: EntryKind,
+}
+
+/// A bounded, byte-free label for a failure message: names the KIND (and a
+/// length or link target), never the file contents.
+fn kind_label(kind: &EntryKind) -> String {
+    match kind {
+        EntryKind::Directory => "directory".to_string(),
+        EntryKind::RegularFile(bytes) => format!("file[{} bytes]", bytes.len()),
+        EntryKind::Symlink(target) => format!("symlink -> {}", target.display()),
+    }
+}
+
+/// Recursively snapshot EVERY filesystem entry under `root` — directories,
+/// regular files (complete bytes), and symlinks (their targets) — sorted, so a
+/// command can be proven nonmutating by comparing the before/after sets.
+///
+/// FAIL-CLOSED: every I/O step is unwrapped with an explicit panic instead of
+/// being skipped or defaulted. A swallowed `read_dir`/entry error would silently
+/// drop a whole subtree from BOTH snapshots (making a mutation inside it
+/// invisible), and `fs::read(..).unwrap_or_default()` would map an unreadable
+/// file to empty bytes on both sides — each turns a real mutation into a false
+/// "unchanged". An entry kind with no deterministic exact representation (fifo,
+/// socket, device, …) panics rather than being silently omitted.
+fn tree_snapshot(root: &Path) -> Vec<TreeEntry> {
+    fn walk(dir: &Path, base: &Path, out: &mut Vec<TreeEntry>) {
+        let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
+            panic!(
+                "nonmutation oracle: read_dir({}) failed: {e} — the oracle must fail \
+                 loudly, never silently skip a subtree",
+                dir.display()
+            )
+        });
+        for entry in entries {
+            let entry = entry.unwrap_or_else(|e| {
+                panic!(
+                    "nonmutation oracle: a directory entry of {} could not be read: {e}",
+                    dir.display()
+                )
+            });
             let path = entry.path();
-            let meta = match std::fs::symlink_metadata(&path) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if meta.is_dir() {
+            let rel = path
+                .strip_prefix(base)
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "nonmutation oracle: {} is not under the snapshot base {}",
+                        path.display(),
+                        base.display()
+                    )
+                })
+                .to_path_buf();
+            // `symlink_metadata` describes the LINK itself, so a symlink is never
+            // resolved to its destination here.
+            let meta = std::fs::symlink_metadata(&path).unwrap_or_else(|e| {
+                panic!(
+                    "nonmutation oracle: symlink_metadata({}) failed: {e}",
+                    path.display()
+                )
+            });
+            let file_type = meta.file_type();
+            if file_type.is_symlink() {
+                let target = std::fs::read_link(&path).unwrap_or_else(|e| {
+                    panic!(
+                        "nonmutation oracle: read_link({}) failed: {e}",
+                        path.display()
+                    )
+                });
+                out.push(TreeEntry {
+                    rel,
+                    kind: EntryKind::Symlink(target),
+                });
+            } else if file_type.is_dir() {
+                // Record the directory ITSELF before descending, so an empty
+                // directory's creation/removal is visible.
+                out.push(TreeEntry {
+                    rel,
+                    kind: EntryKind::Directory,
+                });
                 walk(&path, base, out);
+            } else if file_type.is_file() {
+                let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+                    panic!(
+                        "nonmutation oracle: read({}) failed: {e} — an unreadable file \
+                         must not be recorded as empty bytes",
+                        path.display()
+                    )
+                });
+                out.push(TreeEntry {
+                    rel,
+                    kind: EntryKind::RegularFile(bytes),
+                });
             } else {
-                let rel = path
-                    .strip_prefix(base)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .into_owned();
-                let bytes = std::fs::read(&path).unwrap_or_default();
-                out.push((rel, bytes));
+                panic!(
+                    "nonmutation oracle: unsupported entry kind at {} ({file_type:?}); no \
+                     deterministic exact representation exists, so the oracle refuses to \
+                     omit it",
+                    path.display()
+                );
             }
         }
     }
@@ -349,40 +445,47 @@ fn tree_snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
     out
 }
 
-/// Assert two [`tree_snapshot`]s are byte-identical, reporting only the CHANGED
-/// paths (added / removed / same-path-different-bytes). A bare `assert_eq!` on
-/// the snapshots would dump every file's full contents into the failure message;
-/// this compares the same complete bytes but names just the offending paths.
-fn assert_tree_bytes_unchanged(
-    before: &[(String, Vec<u8>)],
-    after: &[(String, Vec<u8>)],
-    context: &str,
-) {
+/// Assert two [`tree_snapshot`]s are EXACTLY equal, reporting only the CHANGED
+/// entries (created / removed / same-path-different-payload). A bare `assert_eq!`
+/// on the snapshots would dump every file's full contents into the failure
+/// message; this compares the same exact payloads but names just the offending
+/// paths and kinds.
+fn assert_tree_bytes_unchanged(before: &[TreeEntry], after: &[TreeEntry], context: &str) {
     let mut diffs: Vec<String> = Vec::new();
-    let before_map: std::collections::BTreeMap<&str, &Vec<u8>> =
-        before.iter().map(|(p, b)| (p.as_str(), b)).collect();
-    let after_map: std::collections::BTreeMap<&str, &Vec<u8>> =
-        after.iter().map(|(p, b)| (p.as_str(), b)).collect();
-    for (path, bytes) in &before_map {
+    let before_map: std::collections::BTreeMap<&Path, &EntryKind> =
+        before.iter().map(|e| (e.rel.as_path(), &e.kind)).collect();
+    let after_map: std::collections::BTreeMap<&Path, &EntryKind> =
+        after.iter().map(|e| (e.rel.as_path(), &e.kind)).collect();
+    for (path, kind) in &before_map {
         match after_map.get(path) {
-            None => diffs.push(format!("removed: {path}")),
-            Some(other) if other != bytes => diffs.push(format!(
-                "bytes changed: {path} ({} -> {} bytes)",
-                bytes.len(),
-                other.len()
+            None => diffs.push(format!(
+                "removed: {} ({})",
+                path.display(),
+                kind_label(kind)
+            )),
+            Some(other) if other != kind => diffs.push(format!(
+                "changed: {} ({} -> {})",
+                path.display(),
+                kind_label(kind),
+                kind_label(other)
             )),
             Some(_) => {}
         }
     }
-    for path in after_map.keys() {
+    for (path, kind) in &after_map {
         if !before_map.contains_key(path) {
-            diffs.push(format!("created: {path}"));
+            diffs.push(format!(
+                "created: {} ({})",
+                path.display(),
+                kind_label(kind)
+            ));
         }
     }
     assert!(
         diffs.is_empty(),
-        "{context}: project tree must be byte-for-byte unchanged (complete file \
-         bytes compared, NOT sizes), but changed: {diffs:?}"
+        "{context}: project tree must be EXACTLY unchanged (complete file bytes, \
+         directory presence, and symlink targets compared — never sizes), but \
+         changed: {diffs:?}"
     );
 }
 
@@ -456,9 +559,13 @@ fn tree_snapshot_detects_equal_length_byte_mutation() {
         after.len(),
         "sanity: the mutation must keep the file set identical"
     );
+    let byte_len = |entry: &TreeEntry| match &entry.kind {
+        EntryKind::RegularFile(bytes) => bytes.len(),
+        other => panic!("sanity: the victim must be a regular file, got {other:?}"),
+    };
     assert_eq!(
-        before[0].1.len(),
-        after[0].1.len(),
+        byte_len(&before[0]),
+        byte_len(&after[0]),
         "sanity: the mutation must keep the byte LENGTH identical, so only a \
          full-byte comparison can detect it"
     );
@@ -466,12 +573,132 @@ fn tree_snapshot_detects_equal_length_byte_mutation() {
         before, after,
         "a same-length byte mutation must change the snapshot"
     );
-    let panicked = std::panic::catch_unwind(|| {
-        assert_tree_bytes_unchanged(&before, &after, "self-test");
+    assert_oracle_rejects(&before, &after, "a same-length byte mutation");
+}
+
+/// The oracle must FAIL on the mutation described by `what`. Wrapped in
+/// `catch_unwind` because [`assert_tree_bytes_unchanged`] proves itself by
+/// panicking; a silent pass here would mean the oracle degraded again.
+fn assert_oracle_rejects(before: &[TreeEntry], after: &[TreeEntry], what: &str) {
+    let outcome = std::panic::catch_unwind(|| {
+        assert_tree_bytes_unchanged(before, after, "self-test");
     });
     assert!(
-        panicked.is_err(),
-        "the nonmutation assertion must FAIL on a same-length byte mutation"
+        outcome.is_err(),
+        "the nonmutation assertion must FAIL on {what}"
+    );
+}
+
+/// Creating or removing an EMPTY directory must be detected. A file-only
+/// snapshot records nothing for an empty directory, so such a mutation would be
+/// invisible — the oracle therefore snapshots directories themselves.
+#[test]
+fn tree_snapshot_detects_empty_directory_mutation() {
+    let dir = TestDir::new("snap-emptydir");
+    let project = dir.path().join("mini");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("a.txt"), b"AAAA").unwrap();
+
+    let before = tree_snapshot(&project);
+    let empty = project.join("scratch");
+    std::fs::create_dir(&empty).unwrap();
+    let after_create = tree_snapshot(&project);
+
+    assert_ne!(
+        before, after_create,
+        "creating an EMPTY directory must change the snapshot (no file changed)"
+    );
+    assert_oracle_rejects(&before, &after_create, "an empty-directory creation");
+
+    std::fs::remove_dir(&empty).unwrap();
+    let after_remove = tree_snapshot(&project);
+    assert_eq!(
+        before, after_remove,
+        "removing the empty directory must restore the exact snapshot"
+    );
+    assert_oracle_rejects(&after_create, &after_remove, "an empty-directory removal");
+}
+
+/// A symlink is snapshotted as its TARGET, never followed. Retargeting the link
+/// mutates this tree and must be detected; and because the link is not followed,
+/// a change to the pointed-to file OUTSIDE the tree must NOT be reported as a
+/// mutation of the tree.
+#[cfg(unix)]
+#[test]
+fn tree_snapshot_detects_symlink_target_mutation_without_following() {
+    let dir = TestDir::new("snap-symlink");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let target_a = outside.join("a.bin");
+    let target_b = outside.join("b.bin");
+    std::fs::write(&target_a, b"AAAA").unwrap();
+    std::fs::write(&target_b, b"BBBB").unwrap();
+
+    let project = dir.path().join("mini");
+    std::fs::create_dir_all(&project).unwrap();
+    let link = project.join("link");
+    std::os::unix::fs::symlink(&target_a, &link).unwrap();
+
+    let before = tree_snapshot(&project);
+    assert_eq!(
+        before,
+        vec![TreeEntry {
+            rel: PathBuf::from("link"),
+            kind: EntryKind::Symlink(target_a.clone()),
+        }],
+        "a symlink must be recorded as its target, not as the pointed-to bytes"
+    );
+
+    // Retarget the link: the tree itself changed.
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&target_b, &link).unwrap();
+    let retargeted = tree_snapshot(&project);
+    assert_ne!(
+        before, retargeted,
+        "retargeting a symlink must change the snapshot"
+    );
+    assert_oracle_rejects(&before, &retargeted, "a symlink retarget");
+
+    // Mutating the pointed-to file outside the tree must NOT read through the
+    // link, so the tree snapshot stays identical.
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&target_a, &link).unwrap();
+    let restored = tree_snapshot(&project);
+    assert_eq!(before, restored, "sanity: the link points at A again");
+    std::fs::write(&target_a, b"ZZZZ").unwrap();
+    let after_outside_write = tree_snapshot(&project);
+    assert_eq!(
+        restored, after_outside_write,
+        "the oracle must NOT follow the link: an outside-the-tree write is not a \
+         mutation of this tree"
+    );
+    assert_tree_bytes_unchanged(&restored, &after_outside_write, "self-test");
+}
+
+/// An entry with no deterministic exact representation must make the oracle
+/// PANIC, never be silently omitted: a skipped entry disappears from BOTH
+/// snapshots, so a mutation of it would read as "unchanged". A unix domain
+/// socket file is the portable-in-std way to create such an entry.
+#[cfg(unix)]
+#[test]
+fn tree_snapshot_fails_loudly_on_unsupported_entry_kind() {
+    let dir = TestDir::new("snap-special");
+    let project = dir.path().join("mini");
+    std::fs::create_dir_all(&project).unwrap();
+    let sock = project.join("s.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+    let outcome = std::panic::catch_unwind(|| tree_snapshot(&project));
+    let message = outcome
+        .err()
+        .map(|payload| match payload.downcast::<String>() {
+            Ok(s) => *s,
+            Err(_) => "<non-string panic>".to_string(),
+        })
+        .expect("the oracle must PANIC on an unsupported entry kind, not skip it");
+    assert!(
+        message.contains("unsupported entry kind"),
+        "the panic must name the unsupported entry kind: {message}"
     );
 }
 

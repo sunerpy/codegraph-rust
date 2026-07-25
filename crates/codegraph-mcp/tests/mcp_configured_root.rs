@@ -2,9 +2,11 @@
 //!
 //! Isolated in its OWN test binary (a separate process) because these tests set
 //! the process-global `CODEGRAPH_DIR`; keeping them out of `golden_mcp.rs` avoids
-//! racing that binary's env-sensitive default-surface readers. Each test drives
-//! the REAL `McpServer` over an in-memory stdio pipe and proves the MCP request
-//! path opens the SAME identity-suffixed DB the CLI `init` writes.
+//! racing that binary's env-sensitive default-surface readers. The tests drive a
+//! REAL server front-end — most over an in-memory stdio pipe against `McpServer`,
+//! and one against the SHIPPED rmcp handler over a duplex transport — and prove
+//! the MCP request path opens the SAME identity-suffixed DB the CLI `init`
+//! writes, and fails closed identically on an invalid configured root.
 
 use std::fs;
 use std::io::Cursor;
@@ -195,28 +197,116 @@ fn two_projects_sharing_absolute_root_cannot_cross_read_via_mcp() {
     );
 }
 
-/// Snapshot every file path plus its COMPLETE bytes under `root`, sorted — the
-/// nonmutation oracle. Full bytes, never lengths: an equal-length in-place write
-/// keeps the size identical and would slip past a size-only snapshot.
-fn tree_snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
-    fn walk(dir: &Path, base: &Path, out: &mut Vec<(String, Vec<u8>)>) {
-        let Ok(entries) = fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.filter_map(Result::ok) {
+/// The exact payload of ONE filesystem entry in the nonmutation oracle: a
+/// directory's mere presence (so an EMPTY directory's creation/removal is
+/// detectable), a regular file's COMPLETE bytes (never its length — an
+/// equal-length in-place write keeps the size identical), or a symlink's TARGET
+/// (the link is never followed).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum EntryKind {
+    Directory,
+    RegularFile(Vec<u8>),
+    Symlink(PathBuf),
+}
+
+/// One snapshot entry keyed by its OS-native relative path, so the equality key
+/// is never a lossy `to_string_lossy` rendering.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TreeEntry {
+    rel: PathBuf,
+    kind: EntryKind,
+}
+
+fn kind_label(kind: &EntryKind) -> String {
+    match kind {
+        EntryKind::Directory => "directory".to_string(),
+        EntryKind::RegularFile(bytes) => format!("file[{} bytes]", bytes.len()),
+        EntryKind::Symlink(target) => format!("symlink -> {}", target.display()),
+    }
+}
+
+/// Snapshot EVERY filesystem entry under `root` — directories, regular files
+/// (complete bytes) and symlinks (their targets) — sorted; the nonmutation
+/// oracle, identical in semantics to the CLI-side one.
+///
+/// FAIL-CLOSED: every I/O step panics on error instead of skipping or
+/// defaulting. A swallowed `read_dir`/entry error would drop a whole subtree
+/// from BOTH snapshots and `fs::read(..).unwrap_or_default()` would record an
+/// unreadable file as empty on both sides — each turns a real mutation into a
+/// false "unchanged". An entry kind with no deterministic exact representation
+/// panics rather than being silently omitted.
+fn tree_snapshot(root: &Path) -> Vec<TreeEntry> {
+    fn walk(dir: &Path, base: &Path, out: &mut Vec<TreeEntry>) {
+        let entries = fs::read_dir(dir).unwrap_or_else(|e| {
+            panic!(
+                "nonmutation oracle: read_dir({}) failed: {e} — the oracle must fail \
+                 loudly, never silently skip a subtree",
+                dir.display()
+            )
+        });
+        for entry in entries {
+            let entry = entry.unwrap_or_else(|e| {
+                panic!(
+                    "nonmutation oracle: a directory entry of {} could not be read: {e}",
+                    dir.display()
+                )
+            });
             let path = entry.path();
-            let Ok(meta) = fs::symlink_metadata(&path) else {
-                continue;
-            };
-            if meta.is_dir() {
+            let rel = path
+                .strip_prefix(base)
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "nonmutation oracle: {} is not under the snapshot base {}",
+                        path.display(),
+                        base.display()
+                    )
+                })
+                .to_path_buf();
+            // `symlink_metadata` describes the LINK itself, so a symlink is never
+            // resolved to its destination here.
+            let meta = fs::symlink_metadata(&path).unwrap_or_else(|e| {
+                panic!(
+                    "nonmutation oracle: symlink_metadata({}) failed: {e}",
+                    path.display()
+                )
+            });
+            let file_type = meta.file_type();
+            if file_type.is_symlink() {
+                let target = fs::read_link(&path).unwrap_or_else(|e| {
+                    panic!(
+                        "nonmutation oracle: read_link({}) failed: {e}",
+                        path.display()
+                    )
+                });
+                out.push(TreeEntry {
+                    rel,
+                    kind: EntryKind::Symlink(target),
+                });
+            } else if file_type.is_dir() {
+                out.push(TreeEntry {
+                    rel,
+                    kind: EntryKind::Directory,
+                });
                 walk(&path, base, out);
+            } else if file_type.is_file() {
+                let bytes = fs::read(&path).unwrap_or_else(|e| {
+                    panic!(
+                        "nonmutation oracle: read({}) failed: {e} — an unreadable file \
+                         must not be recorded as empty bytes",
+                        path.display()
+                    )
+                });
+                out.push(TreeEntry {
+                    rel,
+                    kind: EntryKind::RegularFile(bytes),
+                });
             } else {
-                let rel = path
-                    .strip_prefix(base)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .into_owned();
-                out.push((rel, fs::read(&path).unwrap_or_default()));
+                panic!(
+                    "nonmutation oracle: unsupported entry kind at {} ({file_type:?}); no \
+                     deterministic exact representation exists, so the oracle refuses to \
+                     omit it",
+                    path.display()
+                );
             }
         }
     }
@@ -224,6 +314,48 @@ fn tree_snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
     walk(root, root, &mut out);
     out.sort();
     out
+}
+
+/// Assert two [`tree_snapshot`]s are EXACTLY equal, naming only the changed
+/// entries: a bare `assert_eq!` would dump every file's contents (the golden DB
+/// included) into the failure message.
+fn assert_tree_unchanged(before: &[TreeEntry], after: &[TreeEntry], context: &str) {
+    let mut diffs: Vec<String> = Vec::new();
+    let before_map: std::collections::BTreeMap<&Path, &EntryKind> =
+        before.iter().map(|e| (e.rel.as_path(), &e.kind)).collect();
+    let after_map: std::collections::BTreeMap<&Path, &EntryKind> =
+        after.iter().map(|e| (e.rel.as_path(), &e.kind)).collect();
+    for (path, kind) in &before_map {
+        match after_map.get(path) {
+            None => diffs.push(format!(
+                "removed: {} ({})",
+                path.display(),
+                kind_label(kind)
+            )),
+            Some(other) if other != kind => diffs.push(format!(
+                "changed: {} ({} -> {})",
+                path.display(),
+                kind_label(kind),
+                kind_label(other)
+            )),
+            Some(_) => {}
+        }
+    }
+    for (path, kind) in &after_map {
+        if !before_map.contains_key(path) {
+            diffs.push(format!(
+                "created: {} ({})",
+                path.display(),
+                kind_label(kind)
+            ));
+        }
+    }
+    assert!(
+        diffs.is_empty(),
+        "{context}: the project tree must be EXACTLY unchanged (complete file bytes, \
+         directory presence, and symlink targets compared — never sizes), but \
+         changed: {diffs:?}"
+    );
 }
 
 /// An INVALID `CODEGRAPH_DIR` must fail closed on the REAL MCP public surface —
@@ -290,27 +422,10 @@ fn invalid_configured_root_mcp_fails_closed_and_never_serves_trap_default_db() {
         "the trap DB at the default namespace must NEVER be served: {whole}"
     );
 
-    let mut diffs: Vec<String> = Vec::new();
-    let before_map: std::collections::BTreeMap<&str, &Vec<u8>> =
-        before.iter().map(|(p, b)| (p.as_str(), b)).collect();
-    let after_map: std::collections::BTreeMap<&str, &Vec<u8>> =
-        after.iter().map(|(p, b)| (p.as_str(), b)).collect();
-    for (path, bytes) in &before_map {
-        match after_map.get(path) {
-            None => diffs.push(format!("removed: {path}")),
-            Some(other) if other != bytes => diffs.push(format!("bytes changed: {path}")),
-            Some(_) => {}
-        }
-    }
-    for path in after_map.keys() {
-        if !before_map.contains_key(path) {
-            diffs.push(format!("created: {path}"));
-        }
-    }
-    assert!(
-        diffs.is_empty(),
-        "a fail-closed tool call must leave the project tree (trap DB included) \
-         byte-for-byte unchanged, but changed: {diffs:?}"
+    assert_tree_unchanged(
+        &before,
+        &after,
+        "a fail-closed tool call must leave the project tree (trap DB included) unchanged",
     );
 }
 
@@ -355,9 +470,10 @@ fn invalid_configured_root_rmcp_fails_closed_and_never_serves_trap_default_db() 
         !whole.contains("Counter") && !whole.contains("increment") && !whole.contains("math.ts"),
         "rmcp must NEVER serve the trap DB at the default namespace: {whole}"
     );
-    assert_eq!(
-        before, after,
-        "a fail-closed rmcp tool call must mutate zero project bytes"
+    assert_tree_unchanged(
+        &before,
+        &after,
+        "a fail-closed rmcp tool call must mutate zero project bytes",
     );
 }
 

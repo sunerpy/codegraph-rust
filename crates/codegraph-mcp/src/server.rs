@@ -523,8 +523,12 @@ impl McpServer {
     /// one (inode/file-index changed). An in-place write keeps the same identity,
     /// so the common path returns the cached engine without reopening.
     fn engine_for(&mut self, project_path: &PathBuf) -> anyhow::Result<&CodeGraphEngine> {
-        // A resolvable configured root yields its DB path; an invalid one fails
-        // closed here (Engine::open re-resolves and surfaces the stable error).
+        // A resolvable configured root yields its DB path. An invalid one is
+        // already rejected upstream by `roots::resolve_project_arg`, which carries
+        // the stable `IndexPaths` diagnostic to the caller before a tool call ever
+        // reaches here; this arm is the defensive backstop for an unresolved DB
+        // path (e.g. a non-tool-call caller), so it fails closed rather than
+        // reconstructing a default namespace.
         let db_path = db_path_for(project_path).ok_or_else(|| {
             anyhow::anyhow!(
                 "invalid CODEGRAPH_DIR configuration for project {}",

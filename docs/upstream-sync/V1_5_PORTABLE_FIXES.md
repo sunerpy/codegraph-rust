@@ -744,3 +744,142 @@ All commands run in the implementation worktree on
 
 Red-proof for the invalid-config fix is recorded in Fix 3 above (temporary revert
 ⇒ both trap tests fail with the pre-fix generic message; revert restored ⇒ pass).
+
+## Batch M — path-authority correction #4: fail-closed nonmutation oracle + stale-doc cleanup (2026-07-25)
+
+### Why this follow-up exists
+
+Manual review of commit `7d95634` (correction #3) found the byte-nonmutation
+oracle it introduced was still not fail-closed, and that correction #3 left two
+superseded `Engine::open` claims in the source docs. This is an APPEND-ONLY
+correction; `7d95634` and every earlier commit are preserved unamended.
+
+### Superseded overclaims (from correction #3)
+
+1. **"a symlink is recorded as an entry, never followed" — FALSE.** The helper
+   stat'd with `symlink_metadata` but then read the payload with
+   `fs::read(&path)`, which FOLLOWS the link. A symlink's recorded bytes were the
+   pointed-to file's bytes, so an out-of-tree write showed up as a mutation of
+   the tree, while a retarget between two same-content files did not.
+
+2. **"whole-tree byte proof" — TOO STRONG.** Four holes could each produce a
+   FALSE "unchanged":
+   - `let Ok(entries) = read_dir(dir) else { return }` silently dropped an entire
+     subtree from BOTH snapshots.
+   - `entries.filter_map(Result::ok)` silently dropped individual entries.
+   - `fs::read(..).unwrap_or_default()` recorded an unreadable file as EMPTY
+     bytes on both sides.
+   - Only FILES were recorded, so creating or removing an EMPTY directory was
+     invisible.
+     Special entry kinds (fifo, socket, device) also fell into the "else" file arm
+     and were read as bytes or silently defaulted.
+
+3. **`roots::db_path_for` rustdoc and `McpServer::engine_for` comment** still
+   said the authoritative fail-closed error "is surfaced by
+   `CodeGraphEngine::open` when a tool actually runs". Correction #3 itself moved
+   that rejection EARLIER, into the shared typed resolver, so the sentences
+   described behavior that no longer exists.
+
+4. **`mcp_configured_root.rs` module doc** said "Each test drives the REAL
+   `McpServer` over an in-memory stdio pipe", but correction #3 added an rmcp
+   handler test over a duplex transport.
+
+### Fixes
+
+1. **Typed, exact, fail-closed snapshot entries.** Both oracles (CLI
+   `batch_m_v2_namespace.rs` and MCP `mcp_configured_root.rs`) now build
+   `Vec<TreeEntry>` where `TreeEntry { rel: PathBuf, kind: EntryKind }` and
+   `EntryKind ∈ { Directory, RegularFile(Vec<u8>), Symlink(PathBuf) }`:
+   - `rel` is an OS-native `PathBuf`, so the equality key is never a lossy
+     `to_string_lossy()` rendering.
+   - `Directory` records presence itself, so an EMPTY directory's creation or
+     removal is detectable.
+   - `RegularFile` carries the COMPLETE bytes (never a length).
+   - `Symlink` carries the target from `read_link`; the link is NEVER read
+     through, so an out-of-tree write to the target is correctly NOT a mutation
+     of this tree, and a retarget IS.
+
+2. **Fail loudly, never skip.** Every I/O step (`read_dir`, each entry,
+   `symlink_metadata`, `read_link`, `read`, `strip_prefix`) now panics with a
+   path-naming message instead of `return` / `filter_map(Result::ok)` /
+   `unwrap_or_default()`. An entry kind with no deterministic exact
+   representation panics rather than being omitted.
+
+3. **Bounded failure messages.** `assert_tree_bytes_unchanged` (CLI) and the new
+   `assert_tree_unchanged` (MCP) diff the typed maps and report only
+   `created/removed/changed: <path> (<kind label>)`, where the label is
+   `directory` / `file[N bytes]` / `symlink -> <target>` — never file contents.
+   The MCP trap tests' inline diff loop and the rmcp test's bare
+   `assert_eq!(before, after)` (which would have dumped the whole golden DB into
+   a failure message) both now call that helper.
+
+4. **New oracle self-tests** (CLI), each proving a property mechanically:
+   - `tree_snapshot_detects_empty_directory_mutation` — creating an empty
+     directory changes the snapshot and the assertion FAILS; removing it restores
+     the exact snapshot.
+   - `tree_snapshot_detects_symlink_target_mutation_without_following`
+     (`#[cfg(unix)]`) — the link is recorded as `Symlink(target)`; a retarget
+     FAILS the assertion; a write to the pointed-to file OUTSIDE the tree leaves
+     the snapshot identical (proving no follow).
+   - `tree_snapshot_fails_loudly_on_unsupported_entry_kind` (`#[cfg(unix)]`) — a
+     unix-socket file makes `tree_snapshot` PANIC with "unsupported entry kind".
+   - The pre-existing `tree_snapshot_detects_equal_length_byte_mutation` is
+     preserved, now asserting the byte length through `EntryKind::RegularFile`.
+     The `#[cfg(unix)]` gating keeps portable compilation intact; no Windows
+     runtime behavior is claimed.
+
+5. **Stale docs corrected.** `roots::db_path_for`'s rustdoc now says it is for
+   path DISPLAY only and that the authoritative diagnostic comes from the typed
+   `probe_root` / `resolve_project_arg` states, which reject an invalid configured
+   root BEFORE any engine is opened. `McpServer::engine_for`'s comment now says
+   the invalid root is already rejected upstream by `roots::resolve_project_arg`
+   and that this arm is the defensive backstop for an unresolved DB path.
+   `mcp_configured_root.rs`'s module doc now describes both front-ends.
+
+No production behavior changed: fixes 1–4 are test-only and fix 5 is comments
+plus rustdoc. No dependency was added, no assertion was weakened, and no
+extraction / schema / node-id / golden surface was touched.
+
+### Red proof for the new oracle properties
+
+Each property was proven to be a REAL regression by temporarily reverting the
+production arm and observing the failure, then restoring it:
+
+- Removing the `EntryKind::Directory` push (pre-fix file-only walk) ⇒
+  `tree_snapshot_detects_empty_directory_mutation` FAILS with
+  `assertion left != right failed: creating an EMPTY directory must change the
+snapshot (no file changed)`, both sides `[TreeEntry { rel: "a.txt", … }]`.
+- Restoring the pre-fix follow-the-link read (`fs::read` in the symlink arm,
+  `unwrap_or_default`) ⇒
+  `tree_snapshot_detects_symlink_target_mutation_without_following` FAILS with
+  `left: [TreeEntry { rel: "link", kind: RegularFile([65, 65, 65, 65]) }]` vs
+  `right: [… kind: Symlink("…/outside/a.bin") }]` — the verbatim evidence that
+  the old helper read THROUGH the link.
+- Both reverts were undone; the full suite is green below.
+
+### Verification
+
+All commands run in the implementation worktree on
+`feat/upstream-v1.5-portable-fixes`, each Cargo batch preceded by
+`bash scripts/check-workspace-versions.sh` (OK at 0.40.4 every time):
+
+- `cargo fmt --all --check` — clean.
+- `cargo test -p codegraph-rs --test batch_m_v2_namespace --locked` — 10 passed,
+  0 failed (7 pre-existing + 3 new oracle self-tests).
+- `cargo test -p codegraph-mcp --test mcp_configured_root --locked` — 4 passed,
+  0 failed.
+- `cargo test -p codegraph-mcp --lib --locked` — 256 passed, 0 failed.
+- `cargo check --workspace --all-targets --locked` — clean.
+- `cargo check -p codegraph-core --target x86_64-pc-windows-msvc --all-targets
+--locked` — clean. CROSS-COMPILATION ONLY; no native Windows runtime coverage is
+  claimed. (A wider Windows `--all-targets` check across `codegraph-rs` /
+  `codegraph-mcp` is not runnable in this environment: their C dependencies need
+  the MSVC `lib.exe`, absent on this Linux host.)
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` — clean.
+- `cargo test --workspace --locked` — exit 0; 105 suites reporting
+  `test result: ok`, 2674 tests passed, 0 failures (2671 before + the 3 new
+  oracle self-tests), incl. the preserved initial black-box Red and
+  `codegraph-bench` golden byte-stability.
+- `bash scripts/guardrail.sh` — exit 0.
+- `sha256sum Cargo.lock` — `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`
+  (byte-identical before and after).
