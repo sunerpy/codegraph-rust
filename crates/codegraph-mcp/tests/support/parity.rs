@@ -83,10 +83,11 @@ pub fn setup_mini_project() -> TestProject {
         "cg-mcp-parity-{}-{nanos}-{seq}",
         std::process::id()
     ));
-    fs::create_dir_all(base.join(".codegraph")).unwrap();
+    // Batch M: the MCP engine now opens the isolated v2 namespace.
+    fs::create_dir_all(base.join(".codegraph-v2")).unwrap();
     copy_with_retry(
         &root.join("reference/golden/mini/colby.db"),
-        &base.join(".codegraph").join("codegraph.db"),
+        &base.join(".codegraph-v2").join("codegraph.db"),
     );
 
     let fixtures = root.join("crates/codegraph-bench/fixtures/mini");

@@ -298,7 +298,7 @@ fn unlock_removes_existing_lock_file() {
     let dir = TestDir::new("unlock-lock");
     let project = indexed_project(&dir);
     let p = project.to_str().unwrap();
-    let lock = project.join(".codegraph/codegraph.lock");
+    let lock = project.join(".codegraph-v2/codegraph.lock");
     std::fs::write(&lock, b"stale").unwrap();
     let run = run_in(dir.path(), &["unlock", p]);
     assert!(run.ok, "unlock must succeed: {}", run.stderr);
@@ -325,16 +325,16 @@ fn uninit_requires_force_then_removes() {
         refused.stderr
     );
     assert!(
-        project.join(".codegraph").exists(),
+        project.join(".codegraph-v2").exists(),
         "uninit without --force must not delete the index"
     );
 
-    // With --force: removes .codegraph.
+    // With --force: removes the v2 index root.
     let done = run_in(dir.path(), &["uninit", "--force", p]);
     assert!(done.ok, "uninit --force must succeed: {}", done.stderr);
     assert!(
-        !project.join(".codegraph").exists(),
-        "uninit --force must remove .codegraph"
+        !project.join(".codegraph-v2").exists(),
+        "uninit --force must remove .codegraph-v2"
     );
 }
 

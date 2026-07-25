@@ -57,7 +57,8 @@ fn pipeline_project(files: &[(&str, &str)]) -> TestProject {
         fs::write(&dst, src).unwrap();
     }
 
-    let mut store = Store::open(&base.join(".codegraph").join("codegraph.db")).unwrap();
+    // Batch M: the MCP engine reads the isolated v2 namespace (`.codegraph-v2`).
+    let mut store = Store::open(&base.join(".codegraph-v2").join("codegraph.db")).unwrap();
     for (rel, src) in files {
         let result = extract_file(&base, rel).unwrap();
         store

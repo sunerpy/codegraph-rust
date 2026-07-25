@@ -327,7 +327,13 @@ fn scan_dir(
         let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name == ".git" || name == ".codegraph" || ignored_dirs.contains(name.as_ref()) {
+        // Skip `.git`, the fixed legacy `.codegraph`, and every `.codegraph-*`
+        // sibling (including the isolated `.codegraph-v2` current root, Batch M)
+        // so a project's own index storage is never scanned back into the graph.
+        if name == ".git"
+            || codegraph_core::IndexPaths::is_reserved_index_dir(name.as_ref())
+            || ignored_dirs.contains(name.as_ref())
+        {
             continue;
         }
         let relative = normalize_path(path.strip_prefix(root).unwrap_or(&path));

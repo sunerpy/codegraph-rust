@@ -68,10 +68,16 @@ pub struct CodeGraphEngine {
 }
 
 impl CodeGraphEngine {
-    /// Open the store at `<project_root>/.codegraph/codegraph.db`
-    /// (`upstream directory.ts`; learnings Task 4).
+    /// Open the store at the project's current (v2) index DB
+    /// (`<project_root>/.codegraph-v2/codegraph.db` by default; `CODEGRAPH_DIR`
+    /// override honored). Routed through the single `codegraph-core::IndexPaths`
+    /// path authority (Batch M) so the MCP request path reads the same namespace
+    /// `codegraph init` writes.
     pub fn open(project_root: &Path) -> anyhow::Result<Self> {
-        let db_path = project_root.join(".codegraph").join("codegraph.db");
+        let db_path = codegraph_core::IndexPaths::current_db_lenient(
+            project_root,
+            std::env::var("CODEGRAPH_DIR").ok().as_deref(),
+        );
         let store = Store::open(&db_path)?;
         Ok(Self {
             store,
@@ -3865,9 +3871,10 @@ mod tests {
             std::process::id(),
             TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::create_dir_all(base.join(".codegraph")).unwrap();
+        // Batch M: `CodeGraphEngine::open` reads the isolated v2 namespace.
+        std::fs::create_dir_all(base.join(".codegraph-v2")).unwrap();
         {
-            let db = base.join(".codegraph").join("codegraph.db");
+            let db = base.join(".codegraph-v2").join("codegraph.db");
             Store::open(&db).unwrap();
         }
         let engine = CodeGraphEngine::open(&base).unwrap();

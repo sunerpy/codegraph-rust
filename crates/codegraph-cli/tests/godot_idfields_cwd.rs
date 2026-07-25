@@ -95,7 +95,9 @@ fn cli_from(cwd: &Path, args: &[&str]) -> (String, String, bool) {
 }
 
 fn unresolved_ref_names(project: &Path) -> Vec<String> {
-    let db = project.join(".codegraph").join("codegraph.db");
+    // Batch M: the index DB moved to the isolated v2 namespace. The opt-in DSL
+    // config (`.codegraph/codegraph.json`) is still read by the ancestor walker.
+    let db = project.join(".codegraph-v2").join("codegraph.db");
     let store = Store::open(&db).expect("open store");
     store
         .all_unresolved_refs()

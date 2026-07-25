@@ -298,7 +298,13 @@ fn sweep_orphaned_refs(project_root: &Path, store: &mut Store) -> Result<()> {
 const ORPHAN_SWEEP_BATCH_ROWS: usize = 5_000;
 
 pub(crate) fn default_db_path(project_root: &Path) -> PathBuf {
-    project_root.join(".codegraph").join("codegraph.db")
+    // Route through the single `codegraph-core::IndexPaths` path authority
+    // (Batch M) so watcher sync writes the same v2 namespace `codegraph init`
+    // and MCP reads (`.codegraph-v2/codegraph.db` by default).
+    codegraph_core::IndexPaths::current_db_lenient(
+        project_root,
+        std::env::var("CODEGRAPH_DIR").ok().as_deref(),
+    )
 }
 
 fn sync_one(

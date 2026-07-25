@@ -63,7 +63,8 @@ fn index_into(base: &Path, files: &[(&str, &str)]) {
         fs::create_dir_all(dst.parent().unwrap()).unwrap();
         fs::write(&dst, src).unwrap();
     }
-    let mut store = Store::open(&base.join(".codegraph").join("codegraph.db")).unwrap();
+    // Batch M: the MCP engine reads the isolated v2 namespace (`.codegraph-v2`).
+    let mut store = Store::open(&base.join(".codegraph-v2").join("codegraph.db")).unwrap();
     let mut all_edges = Vec::new();
     for (rel, src) in files {
         let result = extract_file(base, rel).unwrap();
@@ -153,7 +154,7 @@ fn reopens_cached_engine_when_db_replaced_with_new_inode() {
     // the NEW on-disk content. Serving `betaSymbol` (not `alphaSymbol`, not an
     // open error) is itself the proof the engine reopened against the fresh db.
     server.close_cached_handles();
-    fs::remove_dir_all(project.path().join(".codegraph")).unwrap();
+    fs::remove_dir_all(project.path().join(".codegraph-v2")).unwrap();
     index_into(
         project.path(),
         &[("src/b.ts", "export function betaSymbol() {}\n")],
@@ -203,7 +204,7 @@ fn does_not_reopen_when_inode_is_unchanged() {
     // in-place mtime bump (a normal WAL write) — that must NOT be treated as a
     // replace. First prove the identity itself is content-neutral under a pure
     // mtime touch (the header bytes are unchanged, so the signature holds).
-    let db = project.path().join(".codegraph").join("codegraph.db");
+    let db = project.path().join(".codegraph-v2").join("codegraph.db");
     let id_before_touch = db_identity(project.path());
     filetouch(&db);
     assert_eq!(
@@ -232,7 +233,7 @@ fn does_not_reopen_when_inode_is_unchanged() {
 /// slices (`[16..24]`, `[28..32]`, `[40..44]`) — NO mtime, so a pure mtime touch
 /// leaves it unchanged while a rebuild changes it.
 fn db_identity(project: &Path) -> u128 {
-    let db = project.join(".codegraph").join("codegraph.db");
+    let db = project.join(".codegraph-v2").join("codegraph.db");
     let meta = fs::metadata(&db).expect("db metadata");
     #[cfg(unix)]
     {

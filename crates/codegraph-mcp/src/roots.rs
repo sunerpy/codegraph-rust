@@ -32,11 +32,15 @@ pub fn format_tool_debug_line(
     )
 }
 
-/// The relative `.codegraph/codegraph.db` path under a project root, honoring
-/// the `CODEGRAPH_DIR` override.
+/// The current (v2) index DB path under a project root
+/// (`<project_path>/.codegraph-v2/codegraph.db` by default; `CODEGRAPH_DIR`
+/// override honored). Routed through the single `codegraph-core::IndexPaths`
+/// path authority (Batch M) so project resolution and the served DB agree.
 pub fn db_path_for(project_path: &Path) -> PathBuf {
-    let dir = std::env::var("CODEGRAPH_DIR").unwrap_or_else(|_| ".codegraph".to_string());
-    project_path.join(dir).join("codegraph.db")
+    codegraph_core::IndexPaths::current_db_lenient(
+        project_path,
+        std::env::var("CODEGRAPH_DIR").ok().as_deref(),
+    )
 }
 
 pub struct WorkspaceRoots {

@@ -2585,7 +2585,8 @@ mod serve_mode_tests {
         let indexed =
             std::env::temp_dir().join(format!("cg-serve-gate-idx-{}-{seq}", std::process::id()));
         std::fs::create_dir_all(&unindexed).unwrap();
-        std::fs::create_dir_all(indexed.join(".codegraph")).unwrap();
+        // Batch M: the serve-services gate keys on the v2 current root.
+        std::fs::create_dir_all(indexed.join(".codegraph-v2")).unwrap();
 
         assert!(
             should_run_serve_services(true, &unindexed),
@@ -4270,12 +4271,23 @@ fn normalize_lexical(path: &Path) -> PathBuf {
     out
 }
 
+/// The current (v2) index root for `project`. Defaults to the isolated
+/// `.codegraph-v2` sibling (Batch M, plan line 262); a `CODEGRAPH_DIR` override
+/// keeps its existing simple-join semantics. Routed through the single
+/// `codegraph-core::IndexPaths` path authority so no CLI code reconstructs the
+/// `.codegraph-v2` literal itself.
 fn codegraph_dir(project: &Path) -> PathBuf {
-    project.join(std::env::var("CODEGRAPH_DIR").unwrap_or_else(|_| ".codegraph".to_string()))
+    codegraph_core::IndexPaths::current_root_lenient(
+        project,
+        std::env::var("CODEGRAPH_DIR").ok().as_deref(),
+    )
 }
 
 fn db_path(project: &Path) -> PathBuf {
-    codegraph_dir(project).join("codegraph.db")
+    codegraph_core::IndexPaths::current_db_lenient(
+        project,
+        std::env::var("CODEGRAPH_DIR").ok().as_deref(),
+    )
 }
 
 fn remove_db_files(project: &Path) -> Result<()> {
@@ -5106,8 +5118,11 @@ mod pure_helper_tests {
     fn db_path_is_under_codegraph_dir() {
         if std::env::var("CODEGRAPH_DIR").is_err() {
             let p = Path::new("/proj");
-            assert_eq!(db_path(p), PathBuf::from("/proj/.codegraph/codegraph.db"));
-            assert_eq!(codegraph_dir(p), PathBuf::from("/proj/.codegraph"));
+            assert_eq!(
+                db_path(p),
+                PathBuf::from("/proj/.codegraph-v2/codegraph.db")
+            );
+            assert_eq!(codegraph_dir(p), PathBuf::from("/proj/.codegraph-v2"));
         }
     }
 
@@ -5284,8 +5299,8 @@ mod formatter_and_env_tests {
         let prev = std::env::var_os("CODEGRAPH_DIR");
         unsafe { std::env::remove_var("CODEGRAPH_DIR") };
         let proj = Path::new("/tmp/proj");
-        assert_eq!(codegraph_dir(proj), proj.join(".codegraph"));
-        assert_eq!(db_path(proj), proj.join(".codegraph/codegraph.db"));
+        assert_eq!(codegraph_dir(proj), proj.join(".codegraph-v2"));
+        assert_eq!(db_path(proj), proj.join(".codegraph-v2/codegraph.db"));
         if let Some(v) = prev {
             unsafe { std::env::set_var("CODEGRAPH_DIR", v) };
         }

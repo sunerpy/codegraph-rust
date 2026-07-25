@@ -280,3 +280,144 @@ absent typed/lease/path gates (tests 6, 7), legacy-binary storage isolation
 lease/lifecycle/uninit-state test (tests 5, 11, 12, 13, 15, 16, 20, 21) whose
 deterministic form needs the minimal compiling Green scaffolding. This commit
 lands only the initial black-box namespace boundary.
+
+## Batch M — IndexPaths path authority + init writes isolated v2 namespace (2026-07-25)
+
+### Scope
+
+First minimal vertical Green of Batch M's path layer: establish
+`codegraph-core::IndexPaths` as the single current/legacy path authority, and
+move the default index storage root that public `codegraph init` writes from the
+fixed legacy `<project>/.codegraph` to the isolated sibling
+`<project>/.codegraph-v2`. This turns the already-committed initial black-box Red
+`init_writes_isolated_v2_namespace_not_legacy_codegraph` green. This slice is the
+PATH LAYER + init data-plane wiring ONLY; the state-slot / `IndexLease` / Store
+`open_for_*` protocol, tombstone/lock consumers, daemon/watch/MCP lifecycle,
+project-scoped `Config` refactor, extension/Godot DSL project-scoping, and
+`uninit` remain later Batch M tasks.
+
+### TDD evidence
+
+- Preserved Red (unchanged): `crates/codegraph-cli/tests/batch_m_v2_namespace.rs`
+  `init_writes_isolated_v2_namespace_not_legacy_codegraph`. Pre-Green failing
+  command:
+  `cargo test -p codegraph-rs --locked --test batch_m_v2_namespace -- init_writes_isolated_v2_namespace_not_legacy_codegraph --exact`
+  → exit 101, `test result: FAILED. 0 passed; 1 failed`; failing assertion at
+  `batch_m_v2_namespace.rs:157` — v2 DB `<tmp>/mini/.codegraph-v2/codegraph.db`
+  absent while legacy `.codegraph/codegraph.db` present (current v0.40.4 wrote
+  legacy). Re-verified once more on this task's HEAD before the Green wiring.
+- API-refinement tests (plan lines 805-809 distinction): committed FIRST, before
+  the data-plane wiring, as the `codegraph-core::index_paths::tests` module in
+  commit `b5a66f2`. They exercise the new exported API surface directly
+  (defaults, relative/absolute `CODEGRAPH_DIR`, two-project collision resistance
+  on shared/escaping roots, root/dot/parent rejection, symlink alias rejection,
+  legacy overlap, and every derived artifact path). Because that commit added the
+  compiling API surface AND its behavioral tests together, the API tests compiled
+  and passed at introduction — the compile-time Red prerequisite the plan forbids
+  is satisfied by the separately preserved black-box Red above, which is the
+  behavioral failure evidence; the API tests are the refinement layer.
+- Post-Green: the exact black-box command now exits 0
+  (`test result: ok. 1 passed`); the 18 `codegraph-core` `index_paths` unit tests
+  pass.
+
+### Commits
+
+- `b5a66f2` `feat(core): add IndexPaths v2 namespace path authority` —
+  `crates/codegraph-core/src/index_paths.rs` (new) + `src/lib.rs` export. Path
+  layer + unit tests only; no data-plane consumer touched.
+- (this task's Green) `feat(index): route init/default index root to isolated
+.codegraph-v2 via IndexPaths` — data-plane wiring + directly-affected test
+  updates (see below).
+
+### `IndexPaths` contract landed
+
+`IndexPaths::resolve(project, CODEGRAPH_DIR)` returns: canonical `project`;
+`project_identity` (full lowercase SHA-256 of a versioned binary payload —
+`st_dev`/`st_ino` on Unix, volume serial + 128-bit `GetFileInformationByHandleEx(FileIdInfo)`
+on Windows via a compiled `cfg(windows)` raw-kernel32 block, NO lexical fallback,
+unsupported filesystems fail closed); the normalized `legacy_roots` set (fixed
+`<project>/.codegraph` plus the configured old CLI root when `CODEGRAPH_DIR` is
+set); the isolated `current_root` (`.codegraph-v2` by default; a
+`<name>-v2-<projectIdentity>` sibling of the configured legacy root); and the
+derived `current_db`, `permanent_lock`, two `state_slots`, `tombstone`,
+`config_toml`, `extension_config`, `daemon_pid`/`daemon_log`/`daemon_socket`.
+This slice supplies the path VALUES only; no protocol consumer of the state-slot,
+tombstone, or lock paths is implemented yet. Fail-closed: empty/root/dot/parent
+aliases, symlink/reparse components below the canonical nearest-existing
+ancestor, legacy equality, and ancestor/descendant overlap. Two distinct physical
+projects given the same configured root receive distinct identity-suffixed
+current roots. Infallible transitional helpers `current_root_lenient` /
+`current_db_lenient` (used by the data plane in this slice; a not-yet-created
+project must stay infallible) centralize the `.codegraph-v2` default so no
+consumer reconstructs the literal; `is_reserved_index_dir` centralizes the
+scanner/watcher `.codegraph`/`.codegraph-*` skip.
+
+### Data-plane consumers routed through IndexPaths in THIS slice
+
+- `crates/codegraph-cli/src/main.rs` `codegraph_dir` / `db_path` → default
+  `.codegraph-v2`. This is the central helper for init, index, sync, status,
+  unlock, and every `open_store`/`is_initialized`/`remove_db_files`/`SpillWriter`
+  call site, so the whole CLI DB flow moved together.
+- `crates/codegraph-mcp/src/engine.rs` `CodeGraphEngine::open` and
+  `crates/codegraph-mcp/src/roots.rs` `db_path_for` → `.codegraph-v2`, so the
+  stdio/HTTP/daemon MCP request path reads the SAME namespace init writes (this
+  is why the serve/query integration tests stay green).
+- `crates/codegraph-watch/src/sync.rs` `default_db_path` → `.codegraph-v2`, so
+  watcher/catch-up sync targets the v2 DB.
+- `crates/codegraph-extract/src/engine.rs` `scan_dir` now skips the whole
+  reserved `.codegraph`/`.codegraph-*` family via `IndexPaths::is_reserved_index_dir`,
+  so a project never scans its own `.codegraph-v2` back into the graph.
+
+### Directly-affected tests updated (moved DB namespace only)
+
+`crates/codegraph-cli/tests/{sync_incremental,parallel_index,status_debug_fields,godot_idfields_cwd,godot_idfields_determinism,cli_commands}.rs`,
+`crates/codegraph-daemon/tests/{rmcp_tools_call,async_model}.rs`,
+`crates/codegraph-mcp/tests/{golden_mcp,support/parity,godot_honesty_mcp,reopen}.rs`,
+plus the `CodeGraphEngine` test helper and the `serve_services_gate` unit test in
+`main.rs`. Each switched the DB (and CLI-owned lock/uninit-root) path from
+`.codegraph` to `.codegraph-v2` to match the moved data plane. Daemon rendezvous
+paths (`daemon.pid`/`daemon.sock`/`daemon.log`) and the MCP "must NOT self-index"
+assertions in `http_serve.rs`/`zed_bare_serve.rs` were deliberately KEPT on
+`.codegraph`.
+
+### Remaining Batch M path consumers for the next integration task
+
+These still hardcode `.codegraph` and are NOT part of this init-only slice
+(listed for the follow-up integration task, per the "do not claim repo-wide
+migration" rule):
+
+- `crates/codegraph-daemon/src/paths.rs` `codegraph_dir` (and thus
+  `daemon_pid_path`/`daemon_log_path`/`daemon_socket_path`/candidates) — daemon
+  rendezvous still lives under `.codegraph`; moving it to the current root (with
+  the v2 socket/pipe discriminator) is a later lifecycle task.
+- `crates/codegraph-core/src/config.rs` `Config::discover` — still reads
+  `<project>/.codegraph/config.toml` and the CWD fallback; the project-scoped
+  `<current-root>/config.toml` move + migration gate is a later task (kept
+  unchanged here to avoid deepening global-config bleed the plan later removes).
+- `crates/codegraph-extract/src/ext_config.rs` and
+  `crates/codegraph-resolve/src/frameworks/godot_dsl_config.rs` — still walk
+  ancestor `.codegraph/codegraph.json`; project-scoped `extension_config` wiring
+  is a later task. The two Godot idfields CLI tests therefore still write the DSL
+  config under `.codegraph/` while reading the DB from `.codegraph-v2/`.
+- `crates/codegraph-bench/src/pipeline.rs` `db_path` (benchmark oracle vs the
+  legacy upstream CLI) — intentionally legacy; not a v2 consumer.
+- The full `IndexPaths::resolve` fail-closed authority (identity-suffixed
+  configured-root sibling, symlink/overlap rejection) is implemented and unit
+  tested but NOT yet wired into the infallible data-plane helpers; the data plane
+  uses `current_root_lenient` (simple join for a configured `CODEGRAPH_DIR`) in
+  this slice. Wiring `resolve` into the state/lease protocol is the next task.
+
+### Verification
+
+`bash scripts/check-workspace-versions.sh` (OK, lock `750ee84b…` unchanged),
+`cargo check --workspace --all-targets --locked` (clean),
+`cargo clippy` across all touched crates `-D warnings` (clean),
+`cargo fmt --all --check` (clean), `bash scripts/guardrail.sh` (exit 0). Targeted
+green: the exact black-box Red; `codegraph-core`/`extract`/`watch` suites;
+`codegraph-mcp` golden/godot/reopen/rmcp_roots/rmcp_http/rmcp_l3/rmcp_parity +
+lib; `codegraph-rs` bin (353) + cli_commands/sync_incremental/parallel_index/
+status_debug_fields, both `godot_idfields` CLI tests, http_serve, zed_bare_serve,
+proxy_e2e, live_update_direct, stdout_purity, rmcp_serve_direct, both `explore`
+CLI tests, prompt_hook, catch_up;
+`codegraph-daemon` rmcp_tools_call/async_model; `codegraph-bench` (golden oracle,
+byte-stability) all pass. No plan-level architecture change was required.

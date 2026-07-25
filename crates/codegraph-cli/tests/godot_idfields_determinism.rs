@@ -109,7 +109,11 @@ fn cli_cwd(cwd: &Path, args: &[&str]) -> (String, String, bool) {
 }
 
 fn db_path(project: &Path) -> PathBuf {
-    project.join(".codegraph").join("codegraph.db")
+    // Batch M: the index DB moved to the isolated v2 namespace. The opt-in DSL
+    // config (`.codegraph/codegraph.json`) is still read by the ancestor walker
+    // (its project-scoped move is a later Batch M task), so only the DB path
+    // changes here.
+    project.join(".codegraph-v2").join("codegraph.db")
 }
 
 /// (i) `sync` after an edit to the `.tres` must equal a full `index --force`
