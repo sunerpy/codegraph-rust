@@ -7,20 +7,26 @@
 //! the persisted state-slot contract, plus the classifier that turns the two
 //! fixed slots into an [`ExtractionStatus`].
 //!
-//! # Scope of this slice: READ-ONLY
+//! # Scope of the classifier: READ-ONLY
 //!
-//! This slice is deliberately NONMUTATING and self-contained:
+//! The classifier in this module is deliberately NONMUTATING and self-contained:
 //!
 //! - it never creates, truncates, renames, or deletes any file or directory
 //!   (not the current root, the permanent lock, a state slot, a temp file, the
 //!   database, a sidecar, or the tombstone);
 //! - it never opens SQLite, so it cannot run schema setup, migrations, WAL
 //!   changes, or `ANALYZE`;
-//! - it exposes NO publication API. State publication, `IndexLease`,
+//! - it exposes NO state-slot publication API. State publication, `IndexLease`,
 //!   `Store::open_for_read` / `open_for_status` / `open_for_write`,
 //!   `Store::stamp_extraction_version`, DB-stamp corroboration, migration mode,
 //!   uninit lifecycle, and the daemon/watcher lifecycle all land in LATER Batch M
 //!   slices and are NOT implemented here.
+//!
+//! This classifier boundary is narrower than the commit series containing it:
+//! existing CLI indexing still writes `project_metadata`, but now takes that
+//! metadata key and extraction version (`2`) from this store-owned module. That
+//! pre-existing DB stamping is not state-slot publication and is not performed by
+//! this classifier.
 //!
 //! [`checksum_hex`] and [`canonical_checksum_payload`] are pure functions (no
 //! I/O); they define the byte representation a future publisher must reproduce,
@@ -60,8 +66,9 @@
 //! # Classification order (deterministic, typed, never string-matched)
 //!
 //! 1. **Structural defects dominate.** A present slot that cannot be stat'd or
-//!    read, is not a regular file (a directory or symlink at a fixed slot path is
-//!    an INVALID slot, never followed), or whose bytes are not a JSON object with
+//!    read, is not a regular file (a directory or a statically observed symlink at
+//!    a fixed slot path is an INVALID slot), changes identity while being read, or
+//!    whose bytes are not a JSON object with
 //!    the six canonical fields at their canonical types ⇒ [`ExtractionStatus::Corrupt`].
 //!    A present invalid slot is NEVER ignored because the other slot is valid:
 //!    a future writer may have authored it, so it is security-relevant.
@@ -93,7 +100,8 @@
 //! `Display` renderings exist for operator messages only and are never parsed.
 
 use std::fmt;
-use std::io;
+use std::fs::{File, Metadata};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use codegraph_core::IndexPaths;
@@ -267,6 +275,17 @@ pub enum CorruptReason {
         /// The observed entry kind.
         kind: &'static str,
     },
+    /// The fixed slot path stopped naming the same regular filesystem entry
+    /// between the initial no-follow metadata check, opening the read handle,
+    /// and the post-read no-follow corroboration.
+    SlotChangedDuringRead {
+        /// Slot index (0 or 1).
+        slot: u8,
+        /// Slot path.
+        path: PathBuf,
+        /// Stable diagnostic without platform-specific identity values.
+        detail: String,
+    },
     /// The bytes are not a JSON object carrying the six canonical fields at
     /// their canonical JSON types.
     MalformedJson {
@@ -367,6 +386,11 @@ impl fmt::Display for CorruptReason {
             Self::NotARegularFile { slot, path, kind } => write!(
                 f,
                 "index state slot {slot} ({}) is a {kind}, not a regular file",
+                path.display()
+            ),
+            Self::SlotChangedDuringRead { slot, path, detail } => write!(
+                f,
+                "index state slot {slot} ({}) changed while being read: {detail}",
                 path.display()
             ),
             Self::MalformedJson { slot, path, detail } => write!(
@@ -596,7 +620,21 @@ struct WireSlot {
 }
 
 fn read_slot(index: u8, path: &Path) -> RawSlot {
-    let meta = match std::fs::symlink_metadata(path) {
+    read_slot_with(index, path, |_| {})
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadCheckpoint {
+    InitialMetadataValidated,
+    HandleOpened,
+    BytesRead,
+}
+
+/// Read one fixed slot from one opened handle and corroborate that the path
+/// still names the same entry. The callback is private and exists solely so the
+/// unit test can replace a slot at an exact checkpoint without a timing race.
+fn read_slot_with(index: u8, path: &Path, mut checkpoint: impl FnMut(ReadCheckpoint)) -> RawSlot {
+    let initial = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return RawSlot::Absent,
         Err(err) => {
@@ -607,7 +645,7 @@ fn read_slot(index: u8, path: &Path) -> RawSlot {
             });
         }
     };
-    let file_type = meta.file_type();
+    let file_type = initial.file_type();
     if !file_type.is_file() {
         let kind = if file_type.is_dir() {
             "directory"
@@ -622,8 +660,10 @@ fn read_slot(index: u8, path: &Path) -> RawSlot {
             kind,
         });
     }
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
+    checkpoint(ReadCheckpoint::InitialMetadataValidated);
+
+    let mut file = match File::open(path) {
+        Ok(file) => file,
         Err(err) => {
             return RawSlot::Invalid(CorruptReason::UnreadableSlot {
                 slot: index,
@@ -632,6 +672,51 @@ fn read_slot(index: u8, path: &Path) -> RawSlot {
             });
         }
     };
+    let opened = match file.metadata() {
+        Ok(meta) => meta,
+        Err(err) => {
+            return RawSlot::Invalid(CorruptReason::UnreadableSlot {
+                slot: index,
+                path: path.to_path_buf(),
+                detail: format!("opened-handle metadata failed: {err}"),
+            });
+        }
+    };
+    if !opened.is_file() {
+        return slot_changed(index, path, "opened handle is not a regular file");
+    }
+    if !same_file_identity(&initial, &opened) {
+        return slot_changed(index, path, "entry identity changed before open");
+    }
+    checkpoint(ReadCheckpoint::HandleOpened);
+
+    let mut bytes = Vec::new();
+    if let Err(err) = file.read_to_end(&mut bytes) {
+        return RawSlot::Invalid(CorruptReason::UnreadableSlot {
+            slot: index,
+            path: path.to_path_buf(),
+            detail: err.to_string(),
+        });
+    }
+    checkpoint(ReadCheckpoint::BytesRead);
+
+    let final_meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) => {
+            return slot_changed(
+                index,
+                path,
+                &format!("path disappeared or became unreadable after read: {err}"),
+            );
+        }
+    };
+    if !final_meta.file_type().is_file() {
+        return slot_changed(index, path, "path no longer names a regular file");
+    }
+    if !same_file_identity(&opened, &final_meta) {
+        return slot_changed(index, path, "entry identity changed during read");
+    }
+
     match serde_json::from_slice::<WireSlot>(&bytes) {
         Ok(wire) => RawSlot::Parsed { wire, bytes },
         Err(err) => RawSlot::Invalid(CorruptReason::MalformedJson {
@@ -640,6 +725,47 @@ fn read_slot(index: u8, path: &Path) -> RawSlot {
             detail: err.to_string(),
         }),
     }
+}
+
+fn slot_changed(index: u8, path: &Path, detail: &str) -> RawSlot {
+    RawSlot::Invalid(CorruptReason::SlotChangedDuringRead {
+        slot: index,
+        path: path.to_path_buf(),
+        detail: detail.to_string(),
+    })
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &Metadata, right: &Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(windows)]
+fn same_file_identity(left: &Metadata, right: &Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+    matches!(
+        (
+            left.volume_serial_number(),
+            left.file_index(),
+            right.volume_serial_number(),
+            right.file_index(),
+        ),
+        (Some(left_volume), Some(left_index), Some(right_volume), Some(right_index))
+            if left_volume == right_volume && left_index == right_index
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file_identity(left: &Metadata, right: &Metadata) -> bool {
+    // std exposes no stable object ID on this platform. This fallback is
+    // deliberately conservative about observable metadata, but cannot exclude a
+    // replacement engineered with identical attributes; callers must not claim
+    // the Unix/Windows identity guarantee here.
+    left.len() == right.len()
+        && left.permissions().readonly() == right.permissions().readonly()
+        && left.modified().ok() == right.modified().ok()
+        && left.created().ok() == right.created().ok()
 }
 
 /// Semantically validate ONE parsed slot into a [`SlotOutcome`].
@@ -892,4 +1018,38 @@ fn pick_highest<'a>(
         }
     }
     best
+}
+
+#[cfg(test)]
+mod read_tests {
+    use super::*;
+
+    #[test]
+    fn regular_slot_replaced_after_validation_is_typed_corruption() {
+        let root = std::env::temp_dir().join(format!(
+            "codegraph-slot-replacement-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir(&root).expect("create replacement test root");
+        let slot = root.join("index-state.0.json");
+        let replacement = root.join("replacement.json");
+        std::fs::write(&slot, b"original").expect("write original slot");
+        std::fs::write(&replacement, b"replacement").expect("write replacement slot");
+
+        let mut replaced = false;
+        let observed = read_slot_with(0, &slot, |point| {
+            if point == ReadCheckpoint::InitialMetadataValidated && !replaced {
+                std::fs::remove_file(&slot).expect("remove validated slot");
+                std::fs::rename(&replacement, &slot).expect("install replacement slot");
+                replaced = true;
+            }
+        });
+
+        assert!(matches!(
+            observed,
+            RawSlot::Invalid(CorruptReason::SlotChangedDuringRead { slot: 0, .. })
+        ));
+        std::fs::remove_dir_all(&root).expect("remove replacement test root");
+    }
 }

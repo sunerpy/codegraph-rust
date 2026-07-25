@@ -886,12 +886,15 @@ All commands run in the implementation worktree on
 
 ## Batch M — read-only dual-slot state classifier (2026-07-25)
 
-This slice adds only the store-owned READ-ONLY state classifier. Store now owns
+This slice adds the store-owned READ-ONLY state classifier. Store now owns
 storage protocol `2`, extraction version `2`, and metadata key
 `indexed_with_extraction_version`. The classifier reads exactly the two
-`IndexPaths::state_slots()` regular files, never follows a slot symlink, never
-opens SQLite, and never creates, truncates, renames, deletes, or rewrites any
-namespace byte.
+`IndexPaths::state_slots()` regular files, never opens SQLite, and never creates,
+truncates, renames, deletes, or rewrites any namespace byte. The same commit
+series also routes the CLI's PRE-EXISTING `project_metadata` extraction stamp
+through the store-owned key/version and therefore changes that DB stamp from `1`
+to `2`; that existing CLI mutation is outside the classifier and means the whole
+slice must not be described as mutation-free.
 
 The six protocol-stable JSON fields are required at their exact types; unknown
 fields are tolerated. Owner and checksum must each be exactly 64 lowercase hex
@@ -920,3 +923,66 @@ was restored before verification.
 **Strict scope boundary:** atomic publication, `IndexLease`, Store `open_for_*`
 APIs, DB stamping/corroboration, migration/finalization, uninit and daemon/watcher
 lifecycle remain unimplemented. This slice exposes no publication or lease API.
+
+## Batch M — read-only classifier correction: byte proof + replacement detection (2026-07-25)
+
+Verification of commit `4d5a39c` found three focused defects; that commit remains
+intact and this correction is additive:
+
+1. The fail-closed tree snapshot wrapped only one ordinary `Current` call, so it
+   did not mechanically prove nonmutation on malformed-plus-valid,
+   checksum/owner corruption, either future/current sequence direction, all four
+   equal-sequence classes, current/future maximum sequence, or current
+   `uninitialized`. The integration tests now use one
+   generic `classify_unchanged` helper that snapshots immediately before and
+   after every named `classify`/`classify_slots` call. The single oracle still
+   records directories, complete regular
+   file bytes, and unfollowed symlink targets under native `PathBuf` keys; every
+   I/O/unsupported kind panics, and changed-path output is bounded to 16 paths.
+   Its equal-length mutation and Unix non-following self-tests remain green.
+2. `read_slot` previously paired `symlink_metadata(path)` with `fs::read(path)`.
+   A fixed slot replaced after the no-follow stat could therefore be consumed
+   through a symlink or as a different file. It now opens one `File`, verifies
+   the opened handle is regular, reads only from that handle, and corroborates
+   pre-open/handle/post-read identity. A static symlink remains
+   `NotARegularFile`; disappearance, type change, or identity mismatch is the new
+   typed `SlotChangedDuringRead` corruption and is never accepted. Unix compares
+   `MetadataExt::{dev, ino}`; Windows uses std's volume serial plus file index.
+   Other targets conservatively compare available metadata attributes and do NOT
+   claim stable-identity exclusion. This is pre/open/post corroboration, not a
+   claim that portable std provides an atomic no-follow open on every OS.
+3. The prior ledger said the slice "adds only the classifier". That was too broad:
+   the classifier itself is read-only, but `main.rs` also moved the existing CLI
+   metadata key/version source into `codegraph-store` and now stamps extraction
+   version `2`. There is still no state-slot publication, `IndexLease`, Store
+   open/stamp API, migration/finalizer, or uninit/daemon/watch lifecycle here.
+
+Deterministic Red evidence for defect 2: the private read-checkpoint test replaces
+the regular slot at `InitialMetadataValidated`, with no sleeps. Temporarily
+making Unix identity comparison always return true caused
+`regular_slot_replaced_after_validation_is_typed_corruption` to fail its expected
+`SlotChangedDuringRead` assertion; restoring `dev`/`ino` comparison made it pass.
+The targeted command
+`cargo test -p codegraph-store --locked index_state -- --nocapture` (after the
+workspace-version gate) reports **1 internal + 20 integration tests passed, 0
+failed**. Full final gate outputs are recorded below after completion.
+
+Final validation evidence:
+
+- `cargo fmt --all --check`, workspace/all-target `cargo check --locked`, the
+  required `codegraph-core` MSVC cross-check, and workspace/all-target Clippy with
+  `-D warnings` all passed. The MSVC result is compilation only; no native Windows
+  runtime coverage is claimed.
+- Standalone `cargo test --workspace --locked` passed **2695 tests across 106
+  reporting suites, 0 failed**. `bash scripts/guardrail.sh` passed. Every Cargo
+  batch was preceded by `bash scripts/check-workspace-versions.sh`.
+- `make ci CARGO='cargo --locked'` was attempted twice. Both runs passed format
+  and Clippy, then hit the same pre-existing timing-sensitive
+  `daemon_single_watcher_fires_once` failure (`watcher sync #1: 0 file(s)
+  reindexed` instead of naming `extra.ts`). The standalone full workspace run in
+  the same validation batch passed that test and all 2695 tests. Per the two-check
+  ceiling, it was not retried a third time; no unrelated watcher code was changed.
+- LSP diagnostics refused the external `/tmp` worktree because it is outside the
+  tool request cwd. Workspace `cargo check` and Clippy are the recorded fallback.
+- `Cargo.lock` remained byte-identical at
+  `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`.

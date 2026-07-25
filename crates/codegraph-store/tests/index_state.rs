@@ -1,6 +1,6 @@
 //! Public-surface contract tests for the read-only dual-slot classifier.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -167,7 +167,10 @@ fn index_state_current_protocol_maps_each_phase() {
             phase,
             OWNER,
         );
-        assert_eq!(classify_slots(&tree.slots(), OWNER).status(), &expected);
+        assert_eq!(
+            classify_unchanged(tree.path(), || classify_slots(&tree.slots(), OWNER)).status(),
+            &expected
+        );
     }
 }
 
@@ -243,7 +246,7 @@ fn index_state_missing_and_wrong_typed_required_fields_are_malformed() {
     ] {
         let tree = TempTree::new("malformed-shape");
         write_bytes(&tree.slots()[0], &serde_json::to_vec(&value).unwrap());
-        let result = classify_slots(&tree.slots(), OWNER);
+        let result = classify_unchanged(tree.path(), || classify_slots(&tree.slots(), OWNER));
         assert_corrupt(&result, |reason| {
             matches!(reason, CorruptReason::MalformedJson { .. })
         });
@@ -259,7 +262,7 @@ fn index_state_bad_owner_and_checksum_shapes_are_typed_corruption() {
     for owner in bad_owners {
         let tree = TempTree::new("bad-owner-shape");
         write_wire(&tree.slots()[0], 1, 3, 2, "future-phase", owner);
-        let result = classify_slots(&tree.slots(), OWNER);
+        let result = classify_unchanged(tree.path(), || classify_slots(&tree.slots(), OWNER));
         assert_corrupt(&result, |reason| {
             matches!(reason, CorruptReason::InvalidOwnerEncoding { .. })
         });
@@ -286,14 +289,18 @@ fn index_state_checksum_and_owner_mismatch_are_corrupt_even_for_future_protocol(
         &checksum_tree.slots()[0],
         &serde_json::to_vec(&value).unwrap(),
     );
-    let result = classify_slots(&checksum_tree.slots(), OWNER);
+    let result = classify_unchanged(checksum_tree.path(), || {
+        classify_slots(&checksum_tree.slots(), OWNER)
+    });
     assert_corrupt(&result, |reason| {
         matches!(reason, CorruptReason::ChecksumMismatch { .. })
     });
 
     let owner_tree = TempTree::new("owner-mismatch");
     write_wire(&owner_tree.slots()[0], 1, 3, 2, "future-phase", OTHER_OWNER);
-    let result = classify_slots(&owner_tree.slots(), OWNER);
+    let result = classify_unchanged(owner_tree.path(), || {
+        classify_slots(&owner_tree.slots(), OWNER)
+    });
     assert_corrupt(&result, |reason| {
         matches!(reason, CorruptReason::OwnerMismatch { .. })
     });
@@ -337,7 +344,7 @@ fn index_state_any_malformed_present_slot_dominates_a_valid_companion() {
     let tree = TempTree::new("invalid-dominance");
     write_bytes(&tree.slots()[0], b"not json");
     write_wire(&tree.slots()[1], 99, 2, 2, "current", OWNER);
-    let result = classify_slots(&tree.slots(), OWNER);
+    let result = classify_unchanged(tree.path(), || classify_slots(&tree.slots(), OWNER));
     assert_corrupt(&result, |reason| {
         matches!(reason, CorruptReason::MalformedJson { slot: 0, .. })
     });
@@ -348,7 +355,9 @@ fn index_state_any_malformed_present_slot_dominates_a_valid_companion() {
 fn index_state_non_regular_and_unreadable_slots_are_corrupt() {
     let directory = TempTree::new("slot-directory");
     std::fs::create_dir(&directory.slots()[0]).unwrap();
-    let result = classify_slots(&directory.slots(), OWNER);
+    let result = classify_unchanged(directory.path(), || {
+        classify_slots(&directory.slots(), OWNER)
+    });
     assert_corrupt(&result, |reason| {
         matches!(
             reason,
@@ -366,7 +375,7 @@ fn index_state_non_regular_and_unreadable_slots_are_corrupt() {
         let target = link.path().join("target.json");
         write_wire(&target, 1, 2, 2, "current", OWNER);
         symlink(&target, &link.slots()[0]).unwrap();
-        let result = classify_slots(&link.slots(), OWNER);
+        let result = classify_unchanged(link.path(), || classify_slots(&link.slots(), OWNER));
         assert_corrupt(&result, |reason| {
             matches!(
                 reason,
@@ -399,7 +408,7 @@ fn index_state_future_protocol_dominates_current_in_both_sequence_directions() {
             "future-phase",
             OWNER,
         );
-        let result = classify_slots(&tree.slots(), OWNER);
+        let result = classify_unchanged(tree.path(), || classify_slots(&tree.slots(), OWNER));
         assert_eq!(result.status(), &ExtractionStatus::Future { built: 77 });
         assert_eq!(result.authoritative().expect("future authority").index, 1);
     }
@@ -411,7 +420,9 @@ fn index_state_equal_current_sequences_are_corrupt_for_identical_and_reformatted
     let bytes = wire_bytes(7, 2, 2, "current", OWNER);
     write_bytes(&identical.slots()[0], &bytes);
     write_bytes(&identical.slots()[1], &bytes);
-    let result = classify_slots(&identical.slots(), OWNER);
+    let result = classify_unchanged(identical.path(), || {
+        classify_slots(&identical.slots(), OWNER)
+    });
     assert_corrupt(&result, |reason| {
         matches!(
             reason,
@@ -431,7 +442,9 @@ fn index_state_equal_current_sequences_are_corrupt_for_identical_and_reformatted
          \"storageProtocol\":2, \"sequence\":7 }}"
     );
     write_bytes(&reformatted.slots()[1], other.as_bytes());
-    let result = classify_slots(&reformatted.slots(), OWNER);
+    let result = classify_unchanged(reformatted.path(), || {
+        classify_slots(&reformatted.slots(), OWNER)
+    });
     assert_corrupt(&result, |reason| {
         matches!(
             reason,
@@ -448,7 +461,7 @@ fn index_state_equal_future_and_mixed_sequences_are_corrupt_before_future_domina
     let future = TempTree::new("equal-future");
     write_wire(&future.slots()[0], 8, 3, 9, "alpha", OWNER);
     write_wire(&future.slots()[1], 8, 4, 10, "beta", OWNER);
-    let result = classify_slots(&future.slots(), OWNER);
+    let result = classify_unchanged(future.path(), || classify_slots(&future.slots(), OWNER));
     assert_corrupt(&result, |reason| {
         matches!(reason, CorruptReason::EqualSequence { sequence: 8, .. })
     });
@@ -456,7 +469,7 @@ fn index_state_equal_future_and_mixed_sequences_are_corrupt_before_future_domina
     let mixed = TempTree::new("equal-mixed");
     write_wire(&mixed.slots()[0], 8, 2, 2, "current", OWNER);
     write_wire(&mixed.slots()[1], 8, 3, 10, "future-phase", OWNER);
-    let result = classify_slots(&mixed.slots(), OWNER);
+    let result = classify_unchanged(mixed.path(), || classify_slots(&mixed.slots(), OWNER));
     assert_corrupt(&result, |reason| {
         matches!(reason, CorruptReason::EqualSequence { sequence: 8, .. })
     });
@@ -474,7 +487,7 @@ fn index_state_selected_max_sequence_is_corrupt_before_status_mapping() {
             phase,
             OWNER,
         );
-        let result = classify_slots(&tree.slots(), OWNER);
+        let result = classify_unchanged(tree.path(), || classify_slots(&tree.slots(), OWNER));
         assert_corrupt(
             &result,
             |reason| matches!(reason, CorruptReason::SequenceExhausted { sequence } if *sequence == u64::MAX),
@@ -495,7 +508,7 @@ fn index_state_highest_ordinary_current_slot_is_authoritative_with_full_metadata
     let tree = TempTree::new("authority");
     write_wire(&tree.slots()[0], 4, 2, 1, "building", OWNER);
     write_wire(&tree.slots()[1], 5, 2, 2, "current", OWNER);
-    let result = classify_slots(&tree.slots(), OWNER);
+    let result = classify_unchanged(tree.path(), || classify_slots(&tree.slots(), OWNER));
     assert_eq!(result.status(), &ExtractionStatus::Current);
     let authority = result.authoritative().expect("authority");
     assert_eq!(authority.index, 1);
@@ -581,11 +594,29 @@ fn assert_snapshot_unchanged(
         .chain(after.keys())
         .filter(|path| before.get(*path) != after.get(*path))
         .cloned()
-        .collect::<Vec<_>>();
+        .collect::<BTreeSet<_>>();
+    let total = changed.len();
+    let bounded = changed.iter().take(16).cloned().collect::<Vec<_>>();
     assert!(
         changed.is_empty(),
-        "filesystem snapshot changed at {changed:?}"
+        "filesystem snapshot changed at {bounded:?}{}",
+        if total > bounded.len() {
+            format!(" (and {} more paths)", total - bounded.len())
+        } else {
+            String::new()
+        }
     );
+}
+
+fn classify_unchanged(
+    root: &Path,
+    classify_once: impl FnOnce() -> codegraph_store::IndexStateClassification,
+) -> codegraph_store::IndexStateClassification {
+    let before = snapshot_tree(root);
+    let classification = classify_once();
+    let after = snapshot_tree(root);
+    assert_snapshot_unchanged(&before, &after);
+    classification
 }
 
 #[test]
@@ -606,11 +637,8 @@ fn index_state_classifier_is_exactly_byte_nonmutating_and_never_opens_sqlite() {
     #[cfg(unix)]
     std::os::unix::fs::symlink("codegraph.db", paths.current_root().join("db-link")).unwrap();
 
-    let before = snapshot_tree(project.path());
-    let result = classify(&paths);
-    let after = snapshot_tree(project.path());
+    let result = classify_unchanged(project.path(), || classify(&paths));
     assert_eq!(result.status(), &ExtractionStatus::Current);
-    assert_snapshot_unchanged(&before, &after);
 }
 
 #[test]
