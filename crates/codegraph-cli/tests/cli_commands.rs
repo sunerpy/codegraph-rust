@@ -9,6 +9,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use codegraph_core::IndexPaths;
+use codegraph_store::{ExtractionStatus, Store};
+
 fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_codegraph"))
 }
@@ -311,7 +314,7 @@ fn unlock_removes_existing_lock_file() {
 }
 
 #[test]
-fn uninit_requires_force_then_removes() {
+fn uninit_requires_force_then_preserves_recovery_state() {
     let dir = TestDir::new("uninit");
     let project = indexed_project(&dir);
     let p = project.to_str().unwrap();
@@ -329,13 +332,23 @@ fn uninit_requires_force_then_removes() {
         "uninit without --force must not delete the index"
     );
 
-    // With --force: removes the v2 index root.
+    // With --force: removes mutable v2 data but preserves the authenticated
+    // interrupted-uninit namespace needed by explicit recovery.
     let done = run_in(dir.path(), &["uninit", "--force", p]);
     assert!(done.ok, "uninit --force must succeed: {}", done.stderr);
-    assert!(
-        !project.join(".codegraph-v2").exists(),
-        "uninit --force must remove .codegraph-v2"
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 lifecycle paths");
+    assert_eq!(
+        Store::extraction_status(&paths),
+        ExtractionStatus::Uninitialized
     );
+    assert!(
+        paths.current_root().is_dir(),
+        "uninit --force must preserve the v2 lifecycle root"
+    );
+    assert!(paths.permanent_lock().is_file());
+    assert!(paths.tombstone().is_file());
+    assert!(paths.state_slots().iter().all(|slot| slot.is_file()));
+    assert!(!paths.current_db().exists());
 }
 
 #[test]

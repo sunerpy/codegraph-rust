@@ -1170,14 +1170,20 @@ fn cmd_init(path: Option<PathBuf>, target: &str) -> Result<()> {
 }
 
 fn cmd_uninit(path: Option<PathBuf>, force: bool) -> Result<()> {
-    let project = resolve_required_project(path)?;
+    let project = resolve_required_rebuild_project(path)?;
     if !force {
         bail!("refusing to delete .codegraph without --force");
     }
-    let index_root = codegraph_dir(&project)?;
-    fs::remove_dir_all(&index_root)
-        .with_context(|| format!("removing {}", index_root.display()))?;
+    let paths = index_paths(&project)?;
+    let outcome = codegraph_store::uninit_index(
+        &paths,
+        std::time::Instant::now() + REBUILD_LEASE_TIMEOUT,
+        || false,
+    )?;
     println!("Removed CodeGraph from {}", project.display());
+    if outcome.legacy_index_present {
+        println!("Legacy CodeGraph index remains untouched");
+    }
     Ok(())
 }
 
@@ -1209,7 +1215,11 @@ fn cmd_index(path: Option<PathBuf>, force: bool, quiet: bool, verbose: bool) -> 
 }
 
 fn cmd_sync(path: Option<PathBuf>, quiet: bool) -> Result<()> {
-    let project = resolve_required_project(path)?;
+    // Sync must discover authenticated Outdated/Building state so its Store gate
+    // can migrate it under one retained exclusive lease. Uninitialized remains
+    // discoverable only to reach the typed under-lease rejection; it is never
+    // authorized to sync or recreate residue.
+    let project = resolve_required_rebuild_project(path)?;
     // True single-file incremental sync (P0, docs/optimization-analysis.md §1).
     // sync_project_once self-discovers candidate files via scan_project, so it works
     // for a cold CLI invocation with no daemon. Hash-gated skip + per-file delete/reinsert
@@ -1243,8 +1253,16 @@ fn cmd_sync(path: Option<PathBuf>, quiet: bool) -> Result<()> {
 }
 
 fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
+    let explicit = path.is_some();
     let start = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
-    let project = resolve_project_path_optional(&start);
+    let project = if configured_root_is_absolute() {
+        if !explicit && !is_initialized(&start) {
+            bail!("CODEGRAPH_DIR is absolute; pass the project root explicitly");
+        }
+        start
+    } else {
+        resolve_project_path_optional(&start)
+    };
     // Fail closed on an unsafe/aliased/overlapping configured root: status must
     // surface the stable diagnostic, NOT mask an invalid `CODEGRAPH_DIR` as a
     // default `.codegraph-v2` layout (which would report a bogus "not
@@ -1254,6 +1272,14 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
     let index_root = resolved.current_root().to_path_buf();
     let db = resolved.current_db();
     let db_exists = db.is_file();
+    let extraction_status = Store::extraction_status(&resolved);
+    let legacy_index_paths = resolved
+        .legacy_roots()
+        .iter()
+        .filter(|path| path.exists())
+        .cloned()
+        .collect::<Vec<_>>();
+    let legacy_index_present = !legacy_index_paths.is_empty();
     let daemon_running = daemon_already_running(&project);
     let daemon_pid_path = codegraph_daemon::daemon_pid_path(&project);
     let daemon_socket_path = codegraph_daemon::recorded_socket_path(&project);
@@ -1268,6 +1294,10 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
                 "lastIndexed": null,
                 "dbPath": db,
                 "dbExists": db_exists,
+                "extractionStatus": extraction_status_name(&extraction_status),
+                "extractionStatusDetail": extraction_status.to_string(),
+                "legacyIndexPresent": legacy_index_present,
+                "legacyIndexPaths": legacy_index_paths,
                 "daemonRunning": daemon_running,
                 "daemonPidPath": daemon_pid_path,
                 "daemonSocketPath": daemon_socket_path,
@@ -1277,6 +1307,13 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
             println!("\nCodeGraph Status\n");
             println!("Project: {}", project.display());
             println!("DB Path: {}", db.display());
+            println!("State:   {extraction_status}");
+            if legacy_index_present {
+                println!("Legacy index: present and untouched");
+                for path in &legacy_index_paths {
+                    println!("  {}", path.display());
+                }
+            }
             println!(
                 "Daemon:  {}",
                 if daemon_running { "running" } else { "stopped" }
@@ -1331,9 +1368,13 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
             "pendingChanges": { "added": 0, "modified": 0, "removed": 0 },
             "worktreeMismatch": null,
             "index": index_obj,
-            "dbPath": db,
-            "dbExists": db_exists,
-            "daemonRunning": daemon_running,
+                "dbPath": db,
+                "dbExists": db_exists,
+                "extractionStatus": extraction_status_name(&extraction_status),
+                "extractionStatusDetail": extraction_status.to_string(),
+                "legacyIndexPresent": legacy_index_present,
+                "legacyIndexPaths": legacy_index_paths,
+                "daemonRunning": daemon_running,
             "daemonPidPath": daemon_pid_path,
             "daemonSocketPath": daemon_socket_path,
             "daemonLogPath": daemon_log_path,
@@ -1371,6 +1412,18 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
         println!("\nIndex is up to date\n");
     }
     Ok(())
+}
+
+fn extraction_status_name(status: &codegraph_store::ExtractionStatus) -> &'static str {
+    match status {
+        codegraph_store::ExtractionStatus::Current => "current",
+        codegraph_store::ExtractionStatus::Building { .. } => "building",
+        codegraph_store::ExtractionStatus::Uninitialized => "uninitialized",
+        codegraph_store::ExtractionStatus::Missing => "missing",
+        codegraph_store::ExtractionStatus::Outdated { .. } => "outdated",
+        codegraph_store::ExtractionStatus::Future { .. } => "future",
+        codegraph_store::ExtractionStatus::Corrupt { .. } => "corrupt",
+    }
 }
 
 fn cmd_query(
@@ -4293,7 +4346,11 @@ fn open_store(project: &Path) -> Result<Store> {
 /// project discovery keeps walking; the mutating command paths independently
 /// re-resolve fail-closed via [`db_path`]/[`codegraph_dir`] before touching disk.
 fn is_initialized(project: &Path) -> bool {
-    db_path(project).map(|p| p.exists()).unwrap_or(false)
+    let Ok(paths) = index_paths(project) else {
+        return false;
+    };
+    Store::extraction_status(&paths) == codegraph_store::ExtractionStatus::Current
+        && paths.current_db().is_file()
 }
 
 /// Explicit init's early-return condition is a fully corroborated readable
@@ -4328,9 +4385,34 @@ fn has_rebuild_namespace(project: &Path) -> bool {
         || paths.current_db().exists()
 }
 
+/// Authenticated lifecycle state is a discovery marker for default and relative
+/// roots even when the namespace is not readable. A permanent lock or raw DB by
+/// itself is deliberately not a marker: neither authenticates an owner-bound
+/// project state.
+fn has_lifecycle_namespace(project: &Path) -> bool {
+    let Ok(paths) = index_paths(project) else {
+        return false;
+    };
+    Store::extraction_status(&paths) != codegraph_store::ExtractionStatus::Missing
+}
+
+fn configured_root_is_absolute() -> bool {
+    std::env::var_os("CODEGRAPH_DIR")
+        .filter(|value| !value.is_empty())
+        .is_some_and(|value| Path::new(&value).is_absolute())
+}
+
 fn resolve_required_project(path: Option<PathBuf>) -> Result<PathBuf> {
+    let explicit = path.is_some();
     let start = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
-    let project = resolve_project_path_optional(&start);
+    let project = if configured_root_is_absolute() {
+        if !explicit && !is_initialized(&start) {
+            bail!("CODEGRAPH_DIR is absolute; pass the project root explicitly");
+        }
+        start
+    } else {
+        resolve_project_path_optional(&start)
+    };
     if !is_initialized(&project) {
         bail!("CodeGraph not initialized in {}", project.display());
     }
@@ -4338,9 +4420,16 @@ fn resolve_required_project(path: Option<PathBuf>) -> Result<PathBuf> {
 }
 
 fn resolve_required_rebuild_project(path: Option<PathBuf>) -> Result<PathBuf> {
+    let explicit = path.is_some();
     let start = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
     if has_rebuild_namespace(&start) {
         return Ok(start);
+    }
+    if configured_root_is_absolute() {
+        if !explicit {
+            bail!("CODEGRAPH_DIR is absolute; pass the project root explicitly");
+        }
+        bail!("CodeGraph not initialized in {}", start.display());
     }
     let mut current = start.as_path();
     while let Some(parent) = current.parent() {
@@ -4356,7 +4445,7 @@ fn resolve_required_rebuild_project(path: Option<PathBuf>) -> Result<PathBuf> {
 }
 
 fn resolve_project_path_optional(start: &Path) -> PathBuf {
-    if is_initialized(start) {
+    if configured_root_is_absolute() || has_lifecycle_namespace(start) {
         return start.to_path_buf();
     }
     let mut current = start;
@@ -4364,7 +4453,7 @@ fn resolve_project_path_optional(start: &Path) -> PathBuf {
         if parent == current {
             break;
         }
-        if is_initialized(parent) {
+        if has_lifecycle_namespace(parent) {
             return parent.to_path_buf();
         }
         current = parent;

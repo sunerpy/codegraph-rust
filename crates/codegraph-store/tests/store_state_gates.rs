@@ -606,7 +606,7 @@ fn write_purpose_matrix_is_typed_and_rejected_pairs_are_nonmutating() {
         (
             FixtureStatus::Building,
             StoreWritePurpose::UninitContinuation,
-            "reject",
+            "uninit",
         ),
         (
             FixtureStatus::Outdated,
@@ -671,7 +671,7 @@ fn write_purpose_matrix_is_typed_and_rejected_pairs_are_nonmutating() {
             }
             ("uninit", Ok(StoreWriteOpen::UninitContinuation(authorization))) => {
                 assert_eq!(authorization.purpose(), purpose);
-                assert_eq!(authorization.status(), &ExtractionStatus::Uninitialized);
+                assert_eq!(authorization.status(), &expected_status(status));
                 assert!(authorization.retains_exclusive_lease());
                 assert_eq!(
                     run_exclusive_probe(project.path(), SHORT_DEADLINE),
@@ -707,15 +707,18 @@ fn current_state_accepts_only_current_mutation_or_explicit_full_rebuild() {
     let uninit_lease = IndexLease::acquire_exclusive_existing(&paths, deadline(), || false)
         .expect("acquire Current continuation rejection lease");
     let before = snapshot_tree(project.path());
-    let error = Store::open_for_write(&paths, uninit_lease, StoreWritePurpose::UninitContinuation)
-        .expect_err("a continuation purpose cannot start a new Current-state uninit");
-    assert!(matches!(
-        error,
-        StoreError::WritePurposeRejected {
-            purpose: StoreWritePurpose::UninitContinuation,
-            status: ExtractionStatus::Current
-        }
-    ));
+    let StoreWriteOpen::UninitContinuation(authorization) =
+        Store::open_for_write(&paths, uninit_lease, StoreWritePurpose::UninitContinuation)
+            .expect("Current state authorizes a new uninit under the retained lease")
+    else {
+        panic!("Current uninit must return opaque authorization");
+    };
+    assert_eq!(authorization.status(), &ExtractionStatus::Current);
+    assert_eq!(
+        authorization.purpose(),
+        StoreWritePurpose::UninitContinuation
+    );
+    drop(authorization);
     assert_snapshot_unchanged(&before, &snapshot_tree(project.path()));
 }
 

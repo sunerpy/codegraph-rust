@@ -1902,3 +1902,182 @@ These bytes are the input to the parent's final `make fmt` and single
 authoritative `make ci CARGO='cargo --locked'`. No later documentation edit is
 permitted; completion is decided by that post-format gate and the subsequent
 lock-hash/diff/status audit.
+
+## Batch M item 11 — interrupted uninit Red (2026-07-26)
+
+Scope was checked before mutation. Acceptance item 10,
+`interrupted_v2_rebuild_remains_fail_closed_and_legacy_untouched`, is already
+covered by the committed rebuild finalizer's deterministic pre-Current fault
+matrix (`every_rebuild_fault_leaves_building_or_missing_and_unreadable`), its
+fixed-lock replacement/refusal tests, and the rebuild implementation that removes
+only the resolved v2 DB/WAL/SHM paths. This slice therefore adds no separate
+item-10 implementation; it reuses those primitives only where item 11 shares the
+same lease-validation boundary.
+
+The item-11 public behavioral Red was added as
+`crates/codegraph-cli/tests/batch_m_uninit.rs` ::
+`interrupted_uninit_state_slot_is_recoverable_not_corrupt`. Exact command, after
+the required successful version gate:
+
+```text
+bash scripts/check-workspace-versions.sh && cargo test -p codegraph-rs --locked --test batch_m_uninit interrupted_uninit_state_slot_is_recoverable_not_corrupt -- --exact
+```
+
+Observed exit status: `101`; compilation and fixture setup succeeded, including a
+successful real `codegraph init`. The sole business assertion then failed with
+`left: Missing`, `right: Uninitialized`: existing `cmd_uninit` recursively removed
+the entire v2 root instead of durably publishing `phase=uninitialized` and
+preserving the permanent lock, tombstone, and fixed slots. This is a lifecycle
+behavior failure, not a compile, setup, fixture, or unrelated-test failure.
+
+## Batch M item 11 — interrupted uninit focused Green (2026-07-26)
+
+The Store now owns one crash-recoverable uninit lifecycle. It performs a
+nonmutating visible-state probe, acquires the pre-existing permanent lock
+exclusively without repairing it, reclassifies and authorizes under that retained
+lease, publishes a newer owner-bound `phase=uninitialized` slot, ensures the
+tombstone, and removes only the resolved v2 DB/WAL/SHM, config, and runtime
+children. The permanent lock, tombstone, both fixed state slots, parent directory,
+and every legacy-root byte remain untouched. A repeated `uninit --force`
+publishes another monotonic `uninitialized` sequence before continuing cleanup,
+as required by frozen Revision 14 lines 409-429.
+
+Current-state uninit corroborates the checkpointed main database extraction stamp
+while permitting live WAL/SHM residue. This is intentionally the same narrow
+writer-side distinction already used by incremental sync: a live reader may
+legitimately recreate sidecars, and uninit must first authenticate Current,
+publish `Uninitialized`, and only then delete those sidecars. Read and publication
+paths remain sidecar-free.
+
+Deterministic Store tests inject failure after state publication, tombstone
+creation, each DB/sidecar removal, and each config/runtime removal. Every result
+classifies `Uninitialized`, retains both slots and the permanent lock, and leaves
+legacy bytes unchanged. A complete 16-combination DB/WAL/SHM/tombstone residue
+matrix stays typed `Uninitialized`; Future, Corrupt, owner-mismatch, and
+missing-lock fixtures are byte-nonmutating refusals. The snapshot oracle records
+directories, complete regular-file bytes, and symlink targets, and its self-test
+detects equal-length replacement.
+
+Focused commands, each preceded by the successful workspace-version gate:
+
+```text
+cargo test -p codegraph-store --locked uninit -- --nocapture
+# 5 passed; 0 failed
+
+cargo test -p codegraph-rs --locked --test batch_m_uninit -- --nocapture
+# 1 passed; 0 failed
+```
+
+The public CLI acceptance runs real `init -> uninit --force -> status --json`,
+proves `initialized:false`, `extractionStatus:"uninitialized"`, and untouched
+legacy presence, then proves `sync`, forced/plain `index`, and graph reads all
+fail without changing either state slot. A repeated uninit succeeds with sequence
+`N+1`; explicit `init` then publishes `building` and `current`, rebuilds the DB,
+removes the tombstone only after Current publication, and again preserves legacy
+bytes. Status now exposes stable `extractionStatus`, detail, legacy-presence, and
+legacy-path fields for both initialized and non-initialized output.
+
+All eight changed Rust files returned `No diagnostics found` from
+`lsp_diagnostics`. Because the implementation worktree is outside the request
+CWD, diagnostics were run against a detached same-HEAD worktree with the exact
+tracked diff and both new Rust files copied byte-for-byte. Native Windows runtime
+or crash behavior remains unavailable on this Linux host and is not claimed.
+
+These bytes precede the final format and single authoritative locked CI gate; no
+CI success is claimed in this section.
+
+## Batch M item 11 — first full-gate correction (2026-07-26)
+
+The first authoritative `make ci CARGO='cargo --locked'` attempt passed formatting,
+Clippy, and all earlier workspace suites before failing two existing
+`batch_m_outdated_migration` tests. Both failures were exact CLI policy regressions:
+`sync` returned `CodeGraph not initialized` for authenticated `Outdated` state, so
+the already-implemented under-lease migration gate was unreachable. No uninit,
+Store, publisher, or golden test failed.
+
+Root cause was the item-11 change from DB-presence initialization to typed Current
+initialization while `cmd_sync` still called `resolve_required_project`. The fix is
+to use `resolve_required_rebuild_project` for sync discovery, matching the frozen
+command matrix: authenticated Outdated/Building reaches migration;
+Uninitialized reaches the Store gate only to receive its typed nonmutating refusal.
+No authorization was widened.
+
+Focused correction command, after the workspace-version gate:
+
+```text
+cargo test -p codegraph-rs --locked --test batch_m_outdated_migration --test batch_m_uninit -- --nocapture
+# batch_m_outdated_migration: 5 passed; 0 failed
+# batch_m_uninit: 1 passed; 0 failed
+```
+
+This correction is included before the final formatting pass and the one remaining
+full-gate retry; that retry's result is not claimed here.
+
+## Batch M item 11 — second full-gate result and stale-test correction (2026-07-26)
+
+The second and final permitted `make ci CARGO='cargo --locked'` attempt passed the
+workspace-version gate, formatting, Clippy, and all workspace tests reached through
+the new Store/CLI uninit suites, Outdated migration, v2 namespace, and related CLI
+coverage. It then stopped at one pre-existing `cli_commands` assertion named
+`uninit_requires_force_then_removes`: the test still required the entire
+`.codegraph-v2` root to disappear. That expectation directly contradicted frozen
+Revision 14, which requires preserving the root, permanent lock, tombstone, and
+both fixed state slots after successful cleanup. No production behavior failed at
+that point.
+
+The stale test was updated, not weakened: it still proves uninit without `--force`
+is refused and nonmutating, then proves forced uninit succeeds, classifies
+`Uninitialized`, preserves the lifecycle root/lock/tombstone/two slots, and removes
+the v2 database. The test is renamed
+`uninit_requires_force_then_preserves_recovery_state` to state the protocol
+contract accurately.
+
+Per the two-check ceiling, no third complete CI run is claimed. Closure uses one
+post-format targeted command covering the corrected existing CLI suite together
+with the new item-11 acceptance suite, followed by the lock-hash and scoped-diff
+audit; its actual result is reported in the task handoff rather than retroactively
+represented as a full-CI success.
+
+## Batch M item 11 — independent-review blocker correction (2026-07-26)
+
+An independent review rejected the preceding candidate on four concrete defects;
+this append preserves the prior evidence and records the corrective implementation
+without claiming another full workspace CI run.
+
+1. SQLite sidecar paths no longer pass through `Path::display()`. Store uninit and
+   rebuild append `-wal` / `-shm` directly to the database's native `OsString`, and
+   every item-11 test helper uses the same lossless construction. A Unix-only
+   regression creates a non-UTF-8 project path, proves the true native WAL/SHM are
+   removed, and proves the distinct lossy-rendered lookalike WAL survives.
+2. An absolute `CODEGRAPH_DIR` is exact-project-only for implicit CLI discovery.
+   From a nested directory, `uninit --force` now fails with the stable remedy
+   `pass the project root explicitly` and a complete namespace snapshot proves no
+   byte or entry changed; the same command with the explicit project root remains
+   accepted. Default/relative roots retain ancestor discovery.
+3. Status ancestor discovery now uses authenticated lifecycle state rather than
+   readable-Current alone. Nested status reports parent `Uninitialized`,
+   `Outdated`, `Building`, `Future`, and `Corrupt` state, while a lock-only parent
+   remains a non-marker. Discovery still never opens SQLite or authorizes a
+   mutation; those decisions remain in Store's typed state gates. Outdated sync
+   migration reachability and Uninitialized sync refusal are unchanged.
+4. The public negative command matrix now compares a fail-closed whole-namespace
+   snapshot: directory presence, complete regular-file bytes, symlink targets,
+   and native `PathBuf` keys. Every I/O/unsupported-kind failure panics, comparison
+   diagnostics list only changed paths, and an equal-length replacement self-test
+   proves the oracle catches same-size mutation.
+
+The Store uninit fault matrix now pins the exact `Interrupted.step`, exact
+tombstone state, and exact ordered deletion frontier at every checkpoint while
+also requiring the retained root, permanent lock, two fixed slots, unchanged
+legacy namespace, and `Uninitialized` classification. Rebuild fault evidence now
+independently interrupts explicit-init recovery immediately after Building and
+Current publication. Building interruption retains the tombstone and remains
+Building; Current interruption retains the tombstone and remains Current; both
+keep two valid slots, never become accidental Corrupt, and a later explicit init
+successfully reaches Current before removing the tombstone.
+
+Focused tests for each correction passed during implementation, each after the
+workspace-version gate. Final affected-package tests, diagnostics, formatting,
+Clippy, and lock/scope audit are recorded in the task handoff after their actual
+execution. Native Windows runtime/crash coverage remains unavailable on this Linux
+host and is not claimed.

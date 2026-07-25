@@ -443,7 +443,10 @@ fn validate_transition(
         (current, requested),
         (ExtractionStatus::Missing, StatePhase::Building)
             | (ExtractionStatus::Outdated { .. }, StatePhase::Building)
-            | (ExtractionStatus::Uninitialized, StatePhase::Building)
+            | (
+                ExtractionStatus::Uninitialized,
+                StatePhase::Building | StatePhase::Uninitialized
+            )
             | (
                 ExtractionStatus::Current,
                 StatePhase::Building | StatePhase::Uninitialized
@@ -674,7 +677,10 @@ mod tests {
                     (&current, requested),
                     (ExtractionStatus::Missing, StatePhase::Building)
                         | (ExtractionStatus::Outdated { .. }, StatePhase::Building)
-                        | (ExtractionStatus::Uninitialized, StatePhase::Building)
+                        | (
+                            ExtractionStatus::Uninitialized,
+                            StatePhase::Building | StatePhase::Uninitialized
+                        )
                         | (
                             ExtractionStatus::Current,
                             StatePhase::Building | StatePhase::Uninitialized
@@ -705,6 +711,7 @@ mod tests {
         let allowed = [
             (PriorStatus::Outdated, StatePhase::Building),
             (PriorStatus::Uninitialized, StatePhase::Building),
+            (PriorStatus::Uninitialized, StatePhase::Uninitialized),
             (PriorStatus::Current, StatePhase::Building),
             (PriorStatus::Current, StatePhase::Uninitialized),
             (PriorStatus::Building, StatePhase::Building),

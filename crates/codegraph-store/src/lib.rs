@@ -7,6 +7,7 @@ pub mod migrations;
 pub mod queries;
 pub mod rebuild;
 pub mod schema;
+pub mod uninit;
 
 pub use connection::{
     ExtractionStampIssue, Store, StoreError, StoreStatusOpen, StoreWriteAuthorization,
@@ -28,3 +29,4 @@ pub use rebuild::{
     ActiveFullRebuild, FullRebuild, RebuildError, RebuildKind, begin_full_rebuild,
     resume_full_rebuild,
 };
+pub use uninit::{UninitError, UninitOutcome, uninit_index};

@@ -662,7 +662,9 @@ fn acquire_outer_exclusive(
 fn remove_database_files(paths: &IndexPaths, lease: &IndexLease) -> Result<(), RebuildError> {
     let db = paths.current_db();
     for suffix in ["", "-wal", "-shm"] {
-        let path = PathBuf::from(format!("{}{suffix}", db.display()));
+        let mut native = db.as_os_str().to_os_string();
+        native.push(suffix);
+        let path = PathBuf::from(native);
         lease.validate_exclusive(paths)?;
         match std::fs::remove_file(&path) {
             Ok(()) => {}
@@ -833,7 +835,11 @@ mod tests {
         let db = paths.current_db();
         ["-wal", "-shm"]
             .into_iter()
-            .map(|suffix| PathBuf::from(format!("{}{suffix}", db.display())))
+            .map(|suffix| {
+                let mut native = db.as_os_str().to_os_string();
+                native.push(suffix);
+                PathBuf::from(native)
+            })
             .filter(|path| path.exists())
             .collect()
     }
@@ -1027,6 +1033,78 @@ mod tests {
                 Store::extraction_status(&paths),
                 ExtractionStatus::Current,
                 "fault={checkpoint:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_init_recovery_publication_faults_leave_only_protocol_valid_states() {
+        for (checkpoint, expected_step, expected_status) in [
+            (
+                RebuildCheckpoint::BuildingPublished,
+                "publish phase=building",
+                ExtractionStatus::Building {
+                    built: CURRENT_EXTRACTION_VERSION,
+                },
+            ),
+            (
+                RebuildCheckpoint::CurrentPublished,
+                "publish phase=current",
+                ExtractionStatus::Current,
+            ),
+        ] {
+            let project = TempProject::new("explicit-init-recovery-fault");
+            let paths = project.paths();
+            run_successful_rebuild(&paths, RebuildKind::ExplicitInit);
+            stage_interrupted_uninit(&paths);
+            let mut fault = FailAt(checkpoint);
+
+            let begun = begin_full_rebuild_with(
+                &paths,
+                RebuildKind::ExplicitInit,
+                deadline(),
+                || false,
+                &mut fault,
+            );
+            let error = match begun {
+                Err(error) => error,
+                Ok(rebuild) => {
+                    let rebuild = rebuild
+                        .open_store()
+                        .expect("open explicit-init recovery writer");
+                    build_graph(&rebuild);
+                    rebuild
+                        .finish_with(&mut fault)
+                        .expect_err("publication checkpoint must interrupt recovery")
+                }
+            };
+            match error {
+                RebuildError::Interrupted { step, source } => {
+                    assert_eq!(step, expected_step, "checkpoint={checkpoint:?}");
+                    assert_eq!(source.kind(), io::ErrorKind::Other);
+                }
+                other => panic!("checkpoint={checkpoint:?}: unexpected error {other:?}"),
+            }
+
+            assert_eq!(
+                Store::extraction_status(&paths),
+                expected_status,
+                "checkpoint={checkpoint:?} must publish a complete protocol state"
+            );
+            assert!(
+                paths.tombstone().is_file(),
+                "checkpoint={checkpoint:?}: recovery interruption retains tombstone"
+            );
+            assert!(
+                paths.state_slots().iter().all(|slot| slot.is_file()),
+                "checkpoint={checkpoint:?}: both crash-safe slots remain present"
+            );
+
+            run_successful_rebuild(&paths, RebuildKind::ExplicitInit);
+            assert_eq!(Store::extraction_status(&paths), ExtractionStatus::Current);
+            assert!(
+                !paths.tombstone().exists(),
+                "a later successful explicit init removes the retained tombstone"
             );
         }
     }

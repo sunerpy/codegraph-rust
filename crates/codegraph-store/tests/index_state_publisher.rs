@@ -312,7 +312,6 @@ fn invalid_lifecycle_transitions_are_byte_nonmutating() {
         (PriorStatus::Outdated, StatePhase::Current),
         (PriorStatus::Outdated, StatePhase::Uninitialized),
         (PriorStatus::Uninitialized, StatePhase::Current),
-        (PriorStatus::Uninitialized, StatePhase::Uninitialized),
         (PriorStatus::Current, StatePhase::Current),
     ];
 

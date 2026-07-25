@@ -56,7 +56,9 @@ pub enum StoreWritePurpose {
     /// escalates to a forced migration under the SAME exclusive lease. An
     /// interrupted-`uninit` namespace stays reserved for an explicit `init`.
     IncrementalSync,
-    /// Retain exclusive authority for a later interrupted-uninit continuation.
+    /// Retain exclusive authority for a new uninit or an interrupted-uninit
+    /// continuation. Only `Current`, recoverable `Building`, or
+    /// `Uninitialized` may issue this capability.
     UninitContinuation,
 }
 
@@ -528,7 +530,26 @@ impl Store {
                     },
                 ))
             }
-            StoreWritePurpose::UninitContinuation if status == ExtractionStatus::Uninitialized => {
+            StoreWritePurpose::UninitContinuation
+                if matches!(
+                    status,
+                    ExtractionStatus::Current
+                        | ExtractionStatus::Building { .. }
+                        | ExtractionStatus::Uninitialized
+                ) =>
+            {
+                if status == ExtractionStatus::Current {
+                    // A live reader may legitimately have recreated WAL/SHM on a
+                    // still-Current namespace. Uninit owns the exclusive lease,
+                    // corroborates the checkpointed main-file extraction stamp,
+                    // then publishes Uninitialized before deleting those
+                    // sidecars. Rejecting them here would make that required
+                    // cleanup path unreachable.
+                    let (corroboration, source_conn) =
+                        corroborate_current_database_options(paths, false, true)?;
+                    drop(corroboration);
+                    drop(source_conn);
+                }
                 Ok(StoreWriteOpen::UninitContinuation(
                     StoreWriteAuthorization {
                         status,
