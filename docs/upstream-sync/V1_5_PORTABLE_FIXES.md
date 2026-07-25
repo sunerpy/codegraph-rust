@@ -1415,3 +1415,81 @@ final ledger/notepad bytes, the mandatory closing order is `make fmt`, then one
 fresh `bash scripts/check-workspace-versions.sh && make ci`, then the exact
 `Cargo.lock` SHA-256 check and scoped status/diff inspection. No final Green is
 claimed in this entry before that post-documentation gate actually passes.
+
+## Batch M — lease-retaining state-gated `Store` opens (2026-07-25)
+
+### Scope and behavioral Red
+
+This isolated `codegraph-store` slice adds
+`Store::{extraction_status,open_for_read,open_for_status,open_for_write,stamp_extraction_version}`
+and their typed public result/error surfaces. It preserves legacy `Store::open`
+unchanged and does not migrate production CLI, MCP, watch, daemon, index,
+rebuild/finalizer, or uninit call sites.
+
+The compiling behavioral Red called the proposed `open_for_read` through a
+minimal fallback to legacy `Store::open`. The targeted test reached the public
+call, exited 101, and failed the exact assertion `Missing state must reject a
+safe read open`: legacy fallback returned success and created SQLite in a
+Missing namespace. This was missing state-gated behavior, not a compile, setup,
+fixture, or network failure.
+
+### Accepted behavior
+
+- `extraction_status` delegates only to the accepted dual-slot classifier and
+  never opens SQLite or mutates namespace bytes.
+- `open_for_read` acquires and retains a bounded shared `IndexLease`, accepts
+  only `Current`, rejects a tombstone, and corroborates the store-owned
+  extraction stamp without creating SQLite or `-wal`/`-shm` artifacts. It opens
+  the real DB with exactly `SQLITE_OPEN_READ_ONLY`, retains that source
+  connection, copies the checkpointed main-file bytes into a separate read-only
+  deserialized SQLite image, and queries only the private image. WAL header
+  bytes 18/19 are normalized only in that private allocation; disk bytes remain
+  exact. `SQLITE_DESERIALIZE_FREEONCLOSE` ownership follows SQLite's documented
+  rule: SQLite frees the allocation on both successful close and failed
+  `sqlite3_deserialize`, so the Rust failure path does not double-free it.
+- `open_for_status` treats shared-lease timeout as typed status data
+  (`rebuilding=true`, no SQLite open), reports stable non-Current states without
+  SQLite, and uses the same retained read-only corroboration for `Current`.
+- `open_for_write` validates the injected exact exclusive lease before
+  classification. `Future` and `Corrupt` fail closed; `Missing` plus any DB,
+  WAL, or SHM artifact is typed corruption at the Store boundary. Only
+  `CurrentMutation + Current` opens SQLite read-write after read-only stamp
+  corroboration. `FullRebuild` and valid `UninitContinuation` return opaque
+  authorizations that retain the exclusive lease without opening SQLite;
+  unauthorized purpose/state pairs are typed rejections.
+- `stamp_extraction_version` is available only on a state-gated write Store and
+  revalidates the retained fixed lock immediately before metadata mutation.
+  Legacy/read/status Stores cannot stamp. `Store` declares SQLite connections
+  before its lease field so both connections drop before the final lease owner
+  unlocks.
+- Stamp failures distinguish missing, noncanonical/malformed decimal, and exact
+  version mismatch. Public APIs export only the purpose/status observations
+  required by later lifecycle slices; callers cannot forge a lease-backed
+  authorization.
+
+### Focused verification before the terminal gate
+
+Every Cargo command used `--locked` and the batch was preceded by
+`bash scripts/check-workspace-versions.sh`:
+
+- `store_state_gates`: 17 passed, 0 failed, covering read/status/write state
+  matrices, sidecar-free byte snapshots, stamp failures, timeout status,
+  cross-process lease retention/drop, wrong/shared/replaced leases, tombstones,
+  Missing-plus-artifact refusal, and write-purpose authorization.
+- Accepted publisher integration: 14 passed; lease integration: 12 passed;
+  classifier integration: 20 passed; store unit tests: 66 passed; all with zero
+  failures.
+- `cargo check -p codegraph-store --all-targets --locked` and
+  `cargo clippy -p codegraph-store --all-targets --locked -- -D warnings` passed.
+- `LIBSQLITE3_SYS_USE_PKG_CONFIG=1 SQLITE3_LIB_DIR=/tmp/opencode cargo check -p
+codegraph-store --all-targets --target x86_64-pc-windows-msvc --locked`
+  passed. This is Linux-host MSVC compilation only; no native Windows runtime
+  behavior is claimed.
+- LSP diagnostics cannot attach to this external `/tmp` worktree, so the clean
+  targeted Cargo diagnostics are the recorded fallback.
+
+No dependency, schema, node-id formula, extraction output, or golden artifact
+changed. `Cargo.lock` remains required at
+`750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`.
+These evidence bytes are written before formatting and the single final CI run;
+no terminal Green is claimed until that post-documentation gate passes.

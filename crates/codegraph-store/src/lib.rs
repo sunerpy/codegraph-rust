@@ -7,7 +7,10 @@ pub mod migrations;
 pub mod queries;
 pub mod schema;
 
-pub use connection::Store;
+pub use connection::{
+    ExtractionStampIssue, Store, StoreError, StoreStatusOpen, StoreWriteAuthorization,
+    StoreWriteOpen, StoreWritePurpose,
+};
 pub use index_lease::{IndexLease, IndexLeaseError, IndexLeaseValidationError};
 pub use index_state::{
     AuthoritativeSlot, CURRENT_EXTRACTION_VERSION, CURRENT_STORAGE_PROTOCOL, CorruptReason,

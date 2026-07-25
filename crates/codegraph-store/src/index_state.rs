@@ -19,10 +19,10 @@
 //! - publication lives in the separate `index_state_publisher` module and
 //!   consumes this classifier without weakening its aggregate ordering. This
 //!   classifier itself remains strictly read-only;
-//! - `Store::open_for_read` / `open_for_status` / `open_for_write`,
-//!   `Store::stamp_extraction_version`, DB-stamp corroboration, migration mode,
-//!   uninit lifecycle, and the daemon/watcher lifecycle all land in LATER Batch M
-//!   slices and are NOT implemented here.
+//! - `Store::open_for_read` / `open_for_status` / `open_for_write` and
+//!   `Store::stamp_extraction_version` consume this classifier without changing
+//!   it. Migration mode, uninit lifecycle, and the daemon/watcher lifecycle land
+//!   in later Batch M slices.
 //!
 //! This classifier boundary is narrower than the commit series containing it:
 //! existing CLI indexing still writes `project_metadata`, but now takes that
