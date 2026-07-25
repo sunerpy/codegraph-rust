@@ -1,10 +1,12 @@
 pub mod connection;
+pub mod index_lease;
 pub mod index_state;
 pub mod migrations;
 pub mod queries;
 pub mod schema;
 
 pub use connection::Store;
+pub use index_lease::{IndexLease, IndexLeaseError, IndexLeaseValidationError};
 pub use index_state::{
     AuthoritativeSlot, CURRENT_EXTRACTION_VERSION, CURRENT_STORAGE_PROTOCOL, CorruptReason,
     EXTRACTION_VERSION_KEY, ExtractionStatus, IndexStateClassification, SlotOutcome, StatePhase,

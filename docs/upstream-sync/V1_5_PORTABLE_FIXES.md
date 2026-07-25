@@ -1013,3 +1013,103 @@ Authoritative final gate (fresh run, after doc formatting):
 - `Cargo.lock` still byte-identical at
   `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`; this
   correction changes documentation only.
+
+## Batch M — reusable `IndexLease` capability (2026-07-25)
+
+### Scope
+
+This slice adds only `codegraph-store`'s reusable v2 lease capability and its
+behavioral tests. It does not wire leases into `Store`, SQLite, CLI, MCP, watch,
+daemon, state publication, migration/finalization, or uninit. The capability is
+derived only from resolved `IndexPaths::permanent_lock()` and the physical
+`current_db()` parent.
+
+### Behavioral Red
+
+The API-level refinement tests were added against minimal compiling scaffolding
+whose acquisition methods opened the lock file but deliberately did not call the
+kernel lock APIs. This preserved the earlier Batch M black-box Red distinction
+while producing a real lease-behavior Red rather than a compile/setup failure.
+
+- Gate: `bash scripts/check-workspace-versions.sh` → exit 0.
+- Command: `cargo test -p codegraph-store --test index_lease --locked` → exit
+  101; 4 passed, 4 failed.
+- Exact missing behavior: all incompatible child-process probes returned
+  `ACQUIRED` instead of `TIMED_OUT`; an in-process exclusive holder likewise did
+  not force timeout. The failing tests were
+  `shared_processes_coexist_but_shared_blocks_exclusive`,
+  `exclusive_process_blocks_shared_and_exclusive`,
+  `a_clone_keeps_the_single_lock_alive_until_the_final_drop`, and
+  `timeout_and_post_contention_cancellation_preserve_lock_bytes`.
+- The child holder printed `READY` only after acquisition and the parent waited
+  through a channel before launching a contender. Release used a stdin control
+  byte. Thus contention order did not depend on a sleep.
+
+### Green behavior
+
+- `IndexLease` keeps private `LeaseMode::{Shared, Exclusive}` plus the normalized
+  v2 DB-parent `PathBuf`; callers can observe mode/match and validate an exact
+  exclusive capability but cannot construct or mutate either identity.
+- Existing-open APIs use `OpenOptions` without `create` and therefore cannot
+  create an absent root/lock. The separate `create_exclusive` entry point is only
+  for a genuinely absent root, opens the permanent lock with
+  `create(true).truncate(false)`, and rejects an existing namespace rather than
+  repairing it.
+- Acquisition uses Rust 1.96 `File::try_lock_shared` / `File::try_lock` in a
+  monotonic-deadline loop, checking cancellation before open, before every
+  attempt, and immediately after contention. It never calls blocking `lock()`.
+- One locked `File` lives in `Arc<LeaseInner>`. Clone drops cannot unlock; only
+  final `LeaseInner::drop` calls `unlock`, then the `File` closes exactly once.
+- Typed validation rejects `SharedLease` and `WrongDbParent`. Typed acquisition
+  errors distinguish missing lock, non-absent initial namespace, open/create I/O,
+  timeout, cancellation, and other kernel-lock errors.
+- The lock file is permanent protocol state only: no PID is written/read, no
+  stale-file deletion occurs, and tests preserve sentinel bytes through
+  successful opens, contention timeout, cancellation, and validation.
+
+Targeted Green: after implementing kernel acquisition,
+`cargo test -p codegraph-store --test index_lease --locked` passed all tests. The
+final required check/MSVC/clippy/CI results are recorded below after the last
+documentation formatting pass. LSP diagnostics could not attach to this external
+`/tmp` worktree (`file path must be inside request cwd`); Cargo diagnostics are
+the accepted fallback. Native Windows runtime is unavailable, so only an MSVC
+cross-compilation result is claimed.
+
+The first store-wide MSVC check exposed a defect in the previously accepted
+state reader: Rust 1.96 still marks
+`MetadataExt::{volume_serial_number,file_index}` unstable. This task replaces
+those calls with stable metadata corroboration plus a stronger Windows-only final
+proof: a second live handle for the fixed slot path is compared with the opened
+read handle through raw kernel32
+`GetFileInformationByHandleEx(FileIdInfo)`. The byte read still uses exactly one
+opened handle; the second handle only corroborates that the fixed path still
+names that object. This adds no dependency and does not alter classifier ordering
+or state semantics.
+
+### Verification before the terminal CI gate
+
+Every Cargo batch below was preceded by
+`bash scripts/check-workspace-versions.sh` (exit 0, workspace version `0.40.4`):
+
+- `cargo test -p codegraph-store --test index_lease --locked` — 9 passed, 0
+  failed, including process-level shared/exclusive contention, timeout,
+  post-contention cancellation, clone/final-drop ownership, nontruncation, and
+  capability validation.
+- `cargo test -p codegraph-store --test index_state --locked` — 20 passed, 0
+  failed after the Windows identity compatibility correction.
+- `cargo check -p codegraph-store --all-targets --locked` — clean.
+- `LIBSQLITE3_SYS_USE_PKG_CONFIG=1 SQLITE3_LIB_DIR=/tmp/opencode cargo check -p
+codegraph-store --target x86_64-pc-windows-msvc --all-targets --locked` —
+  clean. The environment variables make `libsqlite3-sys` emit external link
+  metadata instead of requiring unavailable Linux-host `lib.exe`; `cargo check`
+  does not link. This proves the store's Rust MSVC target compiles, not that the
+  lock behavior ran natively on Windows.
+- `cargo clippy -p codegraph-store --all-targets --locked -- -D warnings` —
+  clean.
+- `make fmt-check` — Rust and the repository-scoped oxfmt set are clean.
+- `Cargo.lock` remains byte-identical at
+  `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`.
+
+The terminal `make ci` is run only after these final ledger bytes are formatted;
+its exact result is reported with the resulting commit so the evidence does not
+create the stale-post-validation formatting trap.

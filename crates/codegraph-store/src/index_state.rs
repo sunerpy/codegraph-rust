@@ -717,6 +717,25 @@ fn read_slot_with(index: u8, path: &Path, mut checkpoint: impl FnMut(ReadCheckpo
         return slot_changed(index, path, "entry identity changed during read");
     }
 
+    #[cfg(windows)]
+    match path_still_names_opened_file(&file, path) {
+        Ok(true) => {}
+        Ok(false) => {
+            return slot_changed(
+                index,
+                path,
+                "entry identity changed during Windows handle corroboration",
+            );
+        }
+        Err(err) => {
+            return slot_changed(
+                index,
+                path,
+                &format!("Windows handle corroboration failed: {err}"),
+            );
+        }
+    }
+
     match serde_json::from_slice::<WireSlot>(&bytes) {
         Ok(wire) => RawSlot::Parsed { wire, bytes },
         Err(err) => RawSlot::Invalid(CorruptReason::MalformedJson {
@@ -744,16 +763,64 @@ fn same_file_identity(left: &Metadata, right: &Metadata) -> bool {
 #[cfg(windows)]
 fn same_file_identity(left: &Metadata, right: &Metadata) -> bool {
     use std::os::windows::fs::MetadataExt as _;
-    matches!(
-        (
-            left.volume_serial_number(),
-            left.file_index(),
-            right.volume_serial_number(),
-            right.file_index(),
-        ),
-        (Some(left_volume), Some(left_index), Some(right_volume), Some(right_index))
-            if left_volume == right_volume && left_index == right_index
-    )
+
+    // Rust 1.96 still gates MetadataExt's volume/file-index accessors as
+    // unstable. Stable fields cheaply corroborate pre/open/post observations;
+    // the exact final object-identity proof follows through two live handles.
+    left.file_attributes() == right.file_attributes()
+        && left.creation_time() == right.creation_time()
+        && left.last_write_time() == right.last_write_time()
+        && left.file_size() == right.file_size()
+}
+
+#[cfg(windows)]
+fn path_still_names_opened_file(opened: &File, path: &Path) -> io::Result<bool> {
+    const FILE_ID_INFO_CLASS: i32 = 18;
+
+    #[repr(C)]
+    struct FileIdInfo {
+        volume_serial_number: u64,
+        file_id: [u8; 16],
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandleEx(
+            h_file: isize,
+            file_information_class: i32,
+            lp_file_information: *mut core::ffi::c_void,
+            dw_buffer_size: u32,
+        ) -> i32;
+    }
+
+    fn file_id(file: &File) -> io::Result<(u64, [u8; 16])> {
+        use std::os::windows::io::AsRawHandle as _;
+
+        let mut info = FileIdInfo {
+            volume_serial_number: 0,
+            file_id: [0; 16],
+        };
+        // SAFETY: `file` owns a live Windows handle and `info` is a correctly
+        // sized writable FILE_ID_INFO buffer for FileIdInfo.
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle() as isize,
+                FILE_ID_INFO_CLASS,
+                (&mut info as *mut FileIdInfo).cast(),
+                core::mem::size_of::<FileIdInfo>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((info.volume_serial_number, info.file_id))
+    }
+
+    // Open a second handle after the final no-follow metadata check. The fixed
+    // path must still identify the exact object whose first handle supplied the
+    // bytes; a replacement produces a different volume/file ID.
+    let final_handle = File::open(path)?;
+    Ok(file_id(opened)? == file_id(&final_handle)?)
 }
 
 #[cfg(not(any(unix, windows)))]
