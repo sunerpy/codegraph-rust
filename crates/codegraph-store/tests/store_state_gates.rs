@@ -14,6 +14,7 @@ use codegraph_store::{
     ExtractionStampIssue, ExtractionStatus, IndexLease, IndexLeaseValidationError, Store,
     StoreError, StoreWriteOpen, StoreWritePurpose, checksum_hex,
 };
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::json;
 
 const CHILD_ACTION: &str = "CODEGRAPH_STORE_GATE_CHILD_ACTION";
@@ -144,6 +145,18 @@ fn stage_current(project: &TempProject, stamp: Option<&str>) -> IndexPaths {
         "current",
     );
     drop(lease);
+    paths
+}
+
+fn stage_state_without_lock(project: &TempProject, phase: &str) -> IndexPaths {
+    let paths = project.paths();
+    std::fs::create_dir_all(paths.current_root()).expect("create lockless state namespace");
+    write_state(
+        &paths,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION,
+        phase,
+    );
     paths
 }
 
@@ -323,6 +336,9 @@ fn read_open_rejects_every_non_current_state_without_opening_trap_sqlite() {
         let error = Store::open_for_read(&paths, deadline(), || false)
             .expect_err("every non-Current state must reject read open");
         match (status, error) {
+            (FixtureStatus::Missing, StoreError::MissingStateWithDatabase { path }) => {
+                assert_eq!(path, paths.current_db());
+            }
             (FixtureStatus::Corrupt, StoreError::StateRejected { status }) => {
                 assert!(matches!(status, ExtractionStatus::Corrupt { .. }));
             }
@@ -452,8 +468,16 @@ fn status_reports_non_current_states_without_opening_sqlite() {
         stage_non_current(&paths, status, true);
         let before = snapshot_tree(project.path());
 
-        let opened = Store::open_for_status(&paths, deadline(), || false)
-            .expect("non-Current status is typed data");
+        let result = Store::open_for_status(&paths, deadline(), || false);
+        if status == FixtureStatus::Missing {
+            assert!(matches!(
+                result,
+                Err(StoreError::MissingStateWithDatabase { path }) if path == paths.current_db()
+            ));
+            assert_snapshot_unchanged(&before, &snapshot_tree(project.path()));
+            continue;
+        }
+        let opened = result.expect("non-Current state with authenticated residue is typed data");
         assert!(!opened.rebuilding);
         assert!(opened.store().is_none());
         if status == FixtureStatus::Corrupt {
@@ -696,6 +720,83 @@ fn current_state_accepts_only_current_mutation_or_explicit_full_rebuild() {
 }
 
 #[test]
+fn current_full_rebuild_requires_the_same_database_corroboration_as_a_read() {
+    for (fixture, stamp, expected) in [
+        ("missing-db", None, "missing-db"),
+        ("tombstone", Some("2"), "tombstone"),
+        ("missing-stamp", None, "missing-stamp"),
+        ("malformed-stamp", Some("02"), "malformed-stamp"),
+        ("mismatched-stamp", Some("1"), "mismatched-stamp"),
+    ] {
+        let project = TempProject::new(fixture);
+        let paths = if fixture == "missing-db" {
+            let paths = project.paths();
+            let initial = create_namespace(&paths);
+            write_state(
+                &paths,
+                CURRENT_STORAGE_PROTOCOL,
+                CURRENT_EXTRACTION_VERSION,
+                "current",
+            );
+            drop(initial);
+            paths
+        } else {
+            let paths = stage_current(&project, stamp);
+            if fixture == "tombstone" {
+                std::fs::write(paths.tombstone(), b"interrupted uninit")
+                    .expect("stage Current tombstone contradiction");
+            }
+            paths
+        };
+        let lease = IndexLease::acquire_exclusive_existing(&paths, deadline(), || false)
+            .expect("acquire inconsistent Current rebuild lease");
+        let before = snapshot_tree(project.path());
+
+        let error = Store::open_for_write(&paths, lease, StoreWritePurpose::FullRebuild)
+            .expect_err("inconsistent Current artifacts must not authorize a full rebuild");
+        let matched = match expected {
+            "missing-db" => {
+                matches!(
+                    &error,
+                    StoreError::CurrentDatabaseMissing { path } if path == &paths.current_db()
+                )
+            }
+            "tombstone" => matches!(
+                &error,
+                StoreError::CurrentTombstoned { path } if path == &paths.tombstone()
+            ),
+            "missing-stamp" => matches!(
+                &error,
+                StoreError::InvalidExtractionStamp {
+                    issue: ExtractionStampIssue::Missing,
+                    ..
+                }
+            ),
+            "malformed-stamp" => matches!(
+                &error,
+                StoreError::InvalidExtractionStamp {
+                    issue: ExtractionStampIssue::Malformed { .. },
+                    ..
+                }
+            ),
+            "mismatched-stamp" => matches!(
+                &error,
+                StoreError::InvalidExtractionStamp {
+                    issue: ExtractionStampIssue::Mismatch {
+                        expected: CURRENT_EXTRACTION_VERSION,
+                        found: 1
+                    },
+                    ..
+                }
+            ),
+            other => panic!("unknown Current contradiction fixture {other}"),
+        };
+        assert!(matched, "unexpected {expected} rejection: {error:?}");
+        assert_snapshot_unchanged(&before, &snapshot_tree(project.path()));
+    }
+}
+
+#[test]
 fn current_writer_is_state_gated_retains_lease_and_stamps_the_exact_owned_value() {
     let project = TempProject::new("current-writer");
     let paths = stage_current(&project, Some(&CURRENT_EXTRACTION_VERSION.to_string()));
@@ -874,6 +975,135 @@ fn missing_state_with_any_existing_database_artifact_fails_closed() {
     }
 }
 
+#[test]
+fn missing_state_with_database_artifact_rejects_read_and_status_with_or_without_lock() {
+    for with_lock in [false, true] {
+        for suffix in ["", "-wal", "-shm"] {
+            let project = TempProject::new("missing-artifact-read-status");
+            let paths = project.paths();
+            if with_lock {
+                drop(create_namespace(&paths));
+            } else {
+                std::fs::create_dir_all(paths.current_root())
+                    .expect("create lockless artifact namespace");
+            }
+            let artifact = PathBuf::from(format!("{}{suffix}", paths.current_db().display()));
+            std::fs::write(&artifact, b"reserved unknown database artifact")
+                .expect("stage unknown database artifact");
+            let before = snapshot_tree(project.path());
+
+            for error in [
+                Store::open_for_read(&paths, deadline(), || false)
+                    .expect_err("Missing artifact must reject read"),
+                Store::open_for_status(&paths, deadline(), || false)
+                    .expect_err("Missing artifact must reject status"),
+            ] {
+                assert!(matches!(
+                    error,
+                    StoreError::MissingStateWithDatabase { path } if path == artifact
+                ));
+                assert_snapshot_unchanged(&before, &snapshot_tree(project.path()));
+            }
+        }
+    }
+}
+
+#[test]
+fn persisted_state_without_permanent_lock_is_typed_and_byte_nonmutating() {
+    for (phase, expected) in [
+        ("current", ExtractionStatus::Current),
+        (
+            "building",
+            ExtractionStatus::Building {
+                built: CURRENT_EXTRACTION_VERSION,
+            },
+        ),
+        ("uninitialized", ExtractionStatus::Uninitialized),
+    ] {
+        let project = TempProject::new("state-without-lock");
+        let paths = stage_state_without_lock(&project, phase);
+        let before = snapshot_tree(project.path());
+
+        for error in [
+            Store::open_for_read(&paths, deadline(), || false)
+                .expect_err("persisted lockless state must reject read"),
+            Store::open_for_status(&paths, deadline(), || false)
+                .expect_err("persisted lockless state must reject status"),
+        ] {
+            assert!(matches!(
+                error,
+                StoreError::StateWithoutPermanentLock { status, path }
+                    if status == expected && path == paths.permanent_lock()
+            ));
+            assert_snapshot_unchanged(&before, &snapshot_tree(project.path()));
+        }
+    }
+}
+
+#[test]
+fn current_with_committed_wal_fails_closed_without_ignoring_or_mutating_sidecars() {
+    let project = TempProject::new("current-committed-wal");
+    let paths = stage_current(&project, Some(&CURRENT_EXTRACTION_VERSION.to_string()));
+    run_crashed_current_writer(project.path());
+    let wal_path = PathBuf::from(format!("{}-wal", paths.current_db().display()));
+    assert!(
+        std::fs::metadata(&wal_path)
+            .expect("committed WAL exists")
+            .len()
+            > 0,
+        "fixture must carry committed WAL frames"
+    );
+    let live = Connection::open_with_flags(paths.current_db(), OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open live WAL-aware proof connection");
+    assert_eq!(
+        live.query_row(
+            "SELECT value FROM project_metadata WHERE key = 'wal_only_probe'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .expect("live SQLite observes committed WAL data"),
+        Some("committed".to_string())
+    );
+    drop(live);
+
+    let proof = TempProject::new("main-image-proof");
+    let main_only = proof.path().join("main-only.db");
+    let mut bytes = std::fs::read(paths.current_db()).expect("read checkpointed main DB image");
+    assert!(bytes.len() >= 20 && bytes.starts_with(b"SQLite format 3\0"));
+    bytes[18] = 1;
+    bytes[19] = 1;
+    std::fs::write(&main_only, bytes).expect("write private main-only proof image");
+    let main_conn = Connection::open_with_flags(&main_only, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open main-only proof image");
+    let main_value = main_conn
+        .query_row(
+            "SELECT value FROM project_metadata WHERE key = 'wal_only_probe'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .expect("query main-only proof image");
+    assert_eq!(
+        main_value, None,
+        "deserializing only main-file bytes would silently miss committed WAL data"
+    );
+
+    let before = snapshot_tree(project.path());
+    for error in [
+        Store::open_for_read(&paths, deadline(), || false)
+            .expect_err("Current with committed WAL must fail closed"),
+        Store::open_for_status(&paths, deadline(), || false)
+            .expect_err("Current status with committed WAL must fail closed"),
+    ] {
+        assert!(matches!(
+            error,
+            StoreError::CurrentWithDatabaseSidecar { path } if path == wal_path
+        ));
+        assert_snapshot_unchanged(&before, &snapshot_tree(project.path()));
+    }
+}
+
 /// Child-process entry point used by deterministic lock contention tests.
 #[test]
 fn store_gate_child_process() {
@@ -908,6 +1138,26 @@ fn store_gate_child_process() {
             Err(codegraph_store::IndexLeaseError::TimedOut { .. }) => println!("TIMED_OUT"),
             Err(error) => panic!("unexpected child probe error: {error}"),
         },
+        "write-current-wal-and-exit" => {
+            let lease = IndexLease::acquire_exclusive_existing(&paths, deadline(), || false)
+                .expect("crash fixture acquires exclusive lease");
+            let StoreWriteOpen::Current(store) =
+                Store::open_for_write(&paths, lease, StoreWritePurpose::CurrentMutation)
+                    .expect("crash fixture opens state-gated Current writer")
+            else {
+                panic!("Current mutation must return an open Store");
+            };
+            store
+                .connection()
+                .pragma_update(None, "wal_autocheckpoint", 0)
+                .expect("disable WAL autocheckpoint in crash fixture");
+            store
+                .set_project_metadata("wal_only_probe", "committed")
+                .expect("commit WAL-only probe through state-gated writer");
+            println!("WAL_COMMITTED");
+            std::io::stdout().flush().expect("flush WAL sentinel");
+            std::process::exit(91);
+        }
         other => panic!("unknown Store gate child action {other}"),
     }
 }
@@ -1024,6 +1274,36 @@ fn run_exclusive_probe(project: &Path, process_bound: Duration) -> String {
         .find(|line| matches!(*line, "ACQUIRED" | "TIMED_OUT"))
         .unwrap_or_else(|| panic!("probe emitted no result sentinel"))
         .to_string()
+}
+
+fn run_crashed_current_writer(project: &Path) {
+    let mut child = child_command(project, "write-current-wal-and-exit")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn state-gated WAL crash fixture");
+    let mut stdout = child.stdout.take().expect("WAL fixture stdout");
+    let (output_tx, output_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut output = String::new();
+        stdout
+            .read_to_string(&mut output)
+            .expect("read WAL fixture stdout");
+        output_tx.send(output).expect("send WAL fixture output");
+    });
+    let status = wait_bounded(&mut child, CHILD_WAIT);
+    assert_eq!(
+        status.code(),
+        Some(91),
+        "WAL fixture must terminate without running Rust/SQLite destructors"
+    );
+    let output = output_rx
+        .recv_timeout(CHILD_WAIT)
+        .expect("WAL fixture output before finite deadline");
+    assert!(
+        output.lines().any(|line| line == "WAL_COMMITTED"),
+        "WAL fixture emitted no commit sentinel: {output:?}"
+    );
 }
 
 fn wait_bounded(child: &mut Child, timeout: Duration) -> std::process::ExitStatus {

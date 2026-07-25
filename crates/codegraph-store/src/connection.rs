@@ -169,8 +169,17 @@ pub enum StoreError {
     },
     #[error("state is missing but a database artifact already exists at {path}")]
     MissingStateWithDatabase { path: PathBuf },
+    #[error("index state {status} exists without its permanent lock at {path}")]
+    StateWithoutPermanentLock {
+        status: ExtractionStatus,
+        path: PathBuf,
+    },
     #[error("Current index state is blocked by the uninitialized tombstone at {path}")]
     CurrentTombstoned { path: PathBuf },
+    #[error("Current index state has no SQLite database at {path}")]
+    CurrentDatabaseMissing { path: PathBuf },
+    #[error("Current index state has an unexpected SQLite sidecar at {path}")]
+    CurrentWithDatabaseSidecar { path: PathBuf },
     #[error("failed to inspect database artifact {path}: {source}")]
     InspectArtifact {
         path: PathBuf,
@@ -284,8 +293,15 @@ impl Store {
         deadline: Instant,
         cancelled: impl FnMut() -> bool,
     ) -> Result<Self> {
-        let lease = IndexLease::acquire_shared_existing(paths, deadline, cancelled)?;
+        let lease = match IndexLease::acquire_shared_existing(paths, deadline, cancelled) {
+            Ok(lease) => lease,
+            Err(IndexLeaseError::LockNotFound { .. }) => {
+                return Err(lockless_state_error(paths)?);
+            }
+            Err(error) => return Err(StoreError::Lease(error)),
+        };
         let status = Self::extraction_status(paths);
+        reject_missing_database_artifacts(paths, &status)?;
         if status != ExtractionStatus::Current {
             return Err(StoreError::StateRejected { status });
         }
@@ -313,20 +329,29 @@ impl Store {
             Err(IndexLeaseError::LockNotFound { .. }) => {
                 let status = Self::extraction_status(paths);
                 if status == ExtractionStatus::Missing {
+                    reject_missing_database_artifacts(paths, &status)?;
                     return Ok(StoreStatusOpen {
                         status: Some(status),
                         rebuilding: false,
                         store: None,
                     });
                 }
-                return Err(StoreError::Lease(IndexLeaseError::LockNotFound {
+                if matches!(
+                    status,
+                    ExtractionStatus::Future { .. } | ExtractionStatus::Corrupt { .. }
+                ) {
+                    return Err(StoreError::StateRejected { status });
+                }
+                return Err(StoreError::StateWithoutPermanentLock {
+                    status,
                     path: paths.permanent_lock(),
-                }));
+                });
             }
             Err(error) => return Err(StoreError::Lease(error)),
         };
 
         let status = Self::extraction_status(paths);
+        reject_missing_database_artifacts(paths, &status)?;
         let store = if status == ExtractionStatus::Current {
             Some(open_current_read_only(paths, lease)?)
         } else {
@@ -347,6 +372,15 @@ impl Store {
         paths: &IndexPaths,
         lease: IndexLease,
         purpose: StoreWritePurpose,
+    ) -> Result<StoreWriteOpen> {
+        Self::open_for_write_with(paths, lease, purpose, || {})
+    }
+
+    fn open_for_write_with(
+        paths: &IndexPaths,
+        lease: IndexLease,
+        purpose: StoreWritePurpose,
+        before_write_open: impl FnOnce(),
     ) -> Result<StoreWriteOpen> {
         lease.validate_exclusive(paths)?;
         let status = Self::extraction_status(paths);
@@ -370,6 +404,12 @@ impl Store {
                 let (corroboration, source_conn) = corroborate_current_database(paths)?;
                 drop(corroboration);
                 drop(source_conn);
+                before_write_open();
+                // The fixed lock path may be replaced after classification and
+                // read-only corroboration. Revalidate the exact held handle at
+                // the latest checkpoint, immediately before the first
+                // write-capable SQLite open.
+                lease.validate_exclusive(paths)?;
                 let db_path = paths.current_db();
                 let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
                     .map_err(|source| StoreError::Open {
@@ -389,13 +429,20 @@ impl Store {
                     lease: Some(lease),
                 })))
             }
-            StoreWritePurpose::FullRebuild => Ok(StoreWriteOpen::FullRebuildRequired(
-                StoreWriteAuthorization {
-                    status,
-                    purpose,
-                    lease,
-                },
-            )),
+            StoreWritePurpose::FullRebuild => {
+                if status == ExtractionStatus::Current {
+                    let (corroboration, source_conn) = corroborate_current_database(paths)?;
+                    drop(corroboration);
+                    drop(source_conn);
+                }
+                Ok(StoreWriteOpen::FullRebuildRequired(
+                    StoreWriteAuthorization {
+                        status,
+                        purpose,
+                        lease,
+                    },
+                ))
+            }
             StoreWritePurpose::UninitContinuation if status == ExtractionStatus::Uninitialized => {
                 Ok(StoreWriteOpen::UninitContinuation(
                     StoreWriteAuthorization {
@@ -465,6 +512,12 @@ fn corroborate_current_database(paths: &IndexPaths) -> Result<(Connection, Conne
             path: paths.tombstone(),
         });
     }
+    if !artifact_exists(&db_path)? {
+        return Err(StoreError::CurrentDatabaseMissing { path: db_path });
+    }
+    if let Some(path) = first_existing_database_sidecar(paths)? {
+        return Err(StoreError::CurrentWithDatabaseSidecar { path });
+    }
     let (conn, source_conn) = open_read_only_without_sidecars(&db_path)?;
     let stamp = conn
         .query_row(
@@ -518,7 +571,10 @@ fn open_read_only_without_sidecars(db_path: &Path) -> Result<(Connection, Connec
 fn deserialize_read_only(conn: &mut Connection, bytes: &[u8]) -> rusqlite::Result<()> {
     use std::ptr::NonNull;
 
-    let size = u64::try_from(bytes.len()).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let (size, deserialize_size) = deserialize_sizes(bytes.len())?;
+    // Keep every fallible size conversion above the ownership-bearing
+    // allocation. After sqlite3_malloc64 succeeds, no Rust `?` may return before
+    // sqlite3_deserialize assumes FREEONCLOSE ownership.
     // SAFETY: sqlite3_malloc64 returns an allocation suitable for
     // SQLITE_DESERIALIZE_FREEONCLOSE. The byte copy uses the exact allocation
     // length. Once sqlite3_deserialize is called, SQLite owns and frees the
@@ -552,8 +608,8 @@ fn deserialize_read_only(conn: &mut Connection, bytes: &[u8]) -> rusqlite::Resul
             conn.handle(),
             schema.as_ptr(),
             allocation.as_ptr(),
-            i64::try_from(bytes.len()).map_err(|_| rusqlite::Error::InvalidQuery)?,
-            i64::try_from(bytes.len()).map_err(|_| rusqlite::Error::InvalidQuery)?,
+            deserialize_size,
+            deserialize_size,
             rusqlite::ffi::SQLITE_DESERIALIZE_FREEONCLOSE
                 | rusqlite::ffi::SQLITE_DESERIALIZE_READONLY,
         )
@@ -567,6 +623,12 @@ fn deserialize_read_only(conn: &mut Connection, bytes: &[u8]) -> rusqlite::Resul
         ));
     }
     Ok(())
+}
+
+fn deserialize_sizes(len: usize) -> rusqlite::Result<(u64, i64)> {
+    let allocation_size = u64::try_from(len).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let image_size = i64::try_from(len).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    Ok((allocation_size, image_size))
 }
 
 fn validate_extraction_stamp(db_path: &Path, stamp: Option<String>) -> Result<()> {
@@ -617,6 +679,46 @@ fn first_existing_database_artifact(paths: &IndexPaths) -> Result<Option<PathBuf
     Ok(None)
 }
 
+fn first_existing_database_sidecar(paths: &IndexPaths) -> Result<Option<PathBuf>> {
+    let db = paths.current_db();
+    for path in [
+        PathBuf::from(format!("{}-wal", db.display())),
+        PathBuf::from(format!("{}-shm", db.display())),
+    ] {
+        if artifact_exists(&path)? {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+fn reject_missing_database_artifacts(paths: &IndexPaths, status: &ExtractionStatus) -> Result<()> {
+    if status == &ExtractionStatus::Missing
+        && let Some(path) = first_existing_database_artifact(paths)?
+    {
+        return Err(StoreError::MissingStateWithDatabase { path });
+    }
+    Ok(())
+}
+
+fn lockless_state_error(paths: &IndexPaths) -> Result<StoreError> {
+    let status = Store::extraction_status(paths);
+    if status == ExtractionStatus::Missing {
+        reject_missing_database_artifacts(paths, &status)?;
+        return Ok(StoreError::StateRejected { status });
+    }
+    if matches!(
+        status,
+        ExtractionStatus::Future { .. } | ExtractionStatus::Corrupt { .. }
+    ) {
+        return Ok(StoreError::StateRejected { status });
+    }
+    Ok(StoreError::StateWithoutPermanentLock {
+        status,
+        path: paths.permanent_lock(),
+    })
+}
+
 fn artifact_exists(path: &Path) -> Result<bool> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
@@ -644,6 +746,69 @@ fn configure_connection(conn: &Connection) -> rusqlite::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum SnapshotKind {
+        Directory,
+        File(Vec<u8>),
+        Symlink(PathBuf),
+    }
+
+    fn snapshot_tree(root: &Path) -> std::collections::BTreeMap<PathBuf, SnapshotKind> {
+        fn walk(
+            root: &Path,
+            directory: &Path,
+            out: &mut std::collections::BTreeMap<PathBuf, SnapshotKind>,
+        ) {
+            let mut paths = std::fs::read_dir(directory)
+                .unwrap_or_else(|error| {
+                    panic!("snapshot read_dir {}: {error}", directory.display())
+                })
+                .map(|entry| {
+                    entry
+                        .unwrap_or_else(|error| {
+                            panic!("snapshot entry in {}: {error}", directory.display())
+                        })
+                        .path()
+                })
+                .collect::<Vec<_>>();
+            paths.sort();
+            for path in paths {
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap_or_else(|error| panic!("snapshot strip {}: {error}", path.display()))
+                    .to_path_buf();
+                let metadata = std::fs::symlink_metadata(&path).unwrap_or_else(|error| {
+                    panic!("snapshot metadata {}: {error}", path.display())
+                });
+                let file_type = metadata.file_type();
+                let kind = if file_type.is_dir() {
+                    SnapshotKind::Directory
+                } else if file_type.is_file() {
+                    SnapshotKind::File(std::fs::read(&path).unwrap_or_else(|error| {
+                        panic!("snapshot read {}: {error}", path.display())
+                    }))
+                } else if file_type.is_symlink() {
+                    SnapshotKind::Symlink(std::fs::read_link(&path).unwrap_or_else(|error| {
+                        panic!("snapshot read_link {}: {error}", path.display())
+                    }))
+                } else {
+                    panic!("snapshot unsupported entry kind: {}", path.display());
+                };
+                assert!(
+                    out.insert(relative, kind).is_none(),
+                    "duplicate snapshot path"
+                );
+                if file_type.is_dir() {
+                    walk(root, &path, out);
+                }
+            }
+        }
+
+        let mut out = std::collections::BTreeMap::new();
+        walk(root, root, &mut out);
+        out
+    }
 
     fn temp_db_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -681,6 +846,15 @@ mod tests {
                 .unwrap(),
             2
         );
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn impossible_deserialize_size_is_rejected_before_ownership_bearing_allocation() {
+        assert!(matches!(
+            deserialize_sizes(usize::MAX),
+            Err(rusqlite::Error::InvalidQuery)
+        ));
     }
 
     #[test]
@@ -849,5 +1023,74 @@ mod tests {
             source: sql_err(),
         };
         assert!(migrate.to_string().contains("/tmp/x.db"));
+    }
+
+    #[test]
+    fn current_writer_revalidates_lock_at_the_last_pre_open_checkpoint() {
+        fn deadline() -> Instant {
+            Instant::now() + std::time::Duration::from_secs(5)
+        }
+
+        let base = std::env::temp_dir().join(format!(
+            "codegraph-conn-late-lock-replacement-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&base).unwrap();
+        let project = base.canonicalize().unwrap();
+        let paths = IndexPaths::resolve(&project, None).unwrap();
+        let initial = IndexLease::create_exclusive(&paths, deadline(), || false).unwrap();
+        let fixture = Store::open(&paths.current_db()).unwrap();
+        fixture
+            .set_project_metadata(
+                EXTRACTION_VERSION_KEY,
+                &CURRENT_EXTRACTION_VERSION.to_string(),
+            )
+            .unwrap();
+        fixture.restore_default_pragmas().unwrap();
+        drop(fixture);
+        let state = serde_json::json!({
+            "sequence": 1,
+            "storageProtocol": crate::CURRENT_STORAGE_PROTOCOL,
+            "extractionVersion": CURRENT_EXTRACTION_VERSION,
+            "phase": "current",
+            "projectIdentity": paths.project_identity(),
+            "checksum": crate::checksum_hex(
+                1,
+                crate::CURRENT_STORAGE_PROTOCOL,
+                CURRENT_EXTRACTION_VERSION,
+                "current",
+                paths.project_identity(),
+            ),
+        });
+        std::fs::write(&paths.state_slots()[0], serde_json::to_vec(&state).unwrap()).unwrap();
+        drop(initial);
+        let lease = IndexLease::acquire_exclusive_existing(&paths, deadline(), || false).unwrap();
+        let displaced = paths.current_root().join("displaced-at-write-open.lock");
+        let expected_after_replacement = std::cell::RefCell::new(None);
+
+        let error =
+            Store::open_for_write_with(&paths, lease, StoreWritePurpose::CurrentMutation, || {
+                std::fs::rename(paths.permanent_lock(), &displaced).unwrap();
+                std::fs::write(paths.permanent_lock(), b"late replacement").unwrap();
+                expected_after_replacement.replace(Some(snapshot_tree(&project)));
+            })
+            .expect_err("late lock replacement must prevent write-capable SQLite open");
+        assert!(matches!(
+            error,
+            StoreError::LeaseValidation(IndexLeaseValidationError::PermanentLockChanged { .. })
+        ));
+        assert_eq!(
+            snapshot_tree(&project),
+            expected_after_replacement
+                .into_inner()
+                .expect("checkpoint captured post-replacement tree"),
+            "rejection must not mutate any byte after the deterministic replacement checkpoint"
+        );
+
+        let _ = std::fs::remove_dir_all(base);
     }
 }

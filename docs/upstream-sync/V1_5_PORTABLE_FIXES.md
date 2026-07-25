@@ -1488,6 +1488,64 @@ codegraph-store --all-targets --target x86_64-pc-windows-msvc --locked`
 - LSP diagnostics cannot attach to this external `/tmp` worktree, so the clean
   targeted Cargo diagnostics are the recorded fallback.
 
+## Correction (2026-07-25): close reviewed Store state/artifact gates
+
+Independent review rejected the Store slice above on contradictions with frozen
+Revision 14. This append supersedes only those claims; it does not rewrite the
+earlier evidence and still does not migrate CLI, MCP, watch, daemon, index,
+rebuild/finalizer, or uninit production callers.
+
+The corrected Store boundary now applies one closed state/artifact contract.
+`Missing` plus any DB, WAL, or SHM artifact is a typed, full-tree-byte-nonmutating
+failure for read, status, and write, whether the permanent lock exists or not.
+A persisted Current, Building, Outdated, or Uninitialized state without the
+permanent lock reports `StateWithoutPermanentLock`; Future/slot-Corrupt dominance
+remains unchanged. `extraction_status` remains the same slot-only nonmutating
+classifier.
+
+`FullRebuild + Current` now receives the same DB/tombstone/extraction-stamp
+corroboration as Current reads before an opaque authorization is returned. The
+ordinary Current writer revalidates its exact fixed lock path and held handle a
+second time at the final deterministic checkpoint immediately before the first
+read-write SQLite open. A private test checkpoint replaces the lock at that exact
+point; no sleeps infer the race.
+
+Executable WAL evidence used a state-gated Current writer in a child process,
+disabled autocheckpoint, committed a unique metadata row, then exited without
+running Rust/SQLite destructors. SQLite's real read-only pager observed the row
+from the retained WAL, while a rollback-header copy of only the main DB did not.
+Therefore a public Current namespace could previously be protocol-classified
+while the private deserialized main image silently ignored committed data. The
+corrected read/status/Current-corroboration path fails closed on any WAL or SHM
+sidecar and preserves the complete namespace tree byte-for-byte; a finalized
+Current namespace is pinned as sidecar-free.
+
+Finally, both `u64` and `i64` deserialize length conversions now occur before
+`sqlite3_malloc64`. Once the ownership-bearing allocation succeeds, no fallible
+Rust conversion can return before `sqlite3_deserialize` accepts
+`SQLITE_DESERIALIZE_FREEONCLOSE`; the existing no-double-free failure rule is
+unchanged.
+
+Behavioral Red was captured from the landed implementation: Current full rebuild
+accepted a missing DB; status returned clean Missing for DB residue; lockless
+persisted states surfaced the old lock error; Current reads accepted committed
+WAL and returned a private image that omitted its unique row; and deterministic
+late lock replacement still opened write-capable SQLite. After the minimal
+implementation, `store_state_gates` passes 21/21. The remaining required package,
+MSVC cross-compile, and final locked repository gates are recorded only after they
+run below; LSP still rejects this external `/tmp` worktree, so Cargo diagnostics
+remain the fallback.
+
+Focused implementation gates then passed in the prescribed order, with
+`bash scripts/check-workspace-versions.sh` before every Cargo batch and `--locked`
+on every dependency-resolving command: Store gates 21/21, accepted publisher
+14/14, lease 12/12, classifier 20/20, store lib 68/68, package all-target check,
+package Clippy with `-D warnings`, and the Linux-host
+`x86_64-pc-windows-msvc` all-target cross-check. The MSVC result is compilation
+only, not native Windows runtime/crash evidence. These are the final evidence
+bytes before `make fmt`; the authoritative final sequence is format, workspace
+version gate, locked `make ci`, lock hash, `git diff --check`, and scoped status.
+
 No dependency, schema, node-id formula, extraction output, or golden artifact
 changed. `Cargo.lock` remains required at
 `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`.
