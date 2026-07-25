@@ -5,6 +5,7 @@ pub mod index_state;
 pub mod index_state_publisher;
 pub mod migrations;
 pub mod queries;
+pub mod rebuild;
 pub mod schema;
 
 pub use connection::{
@@ -23,3 +24,4 @@ pub use index_state_publisher::{
 pub use queries::{
     CODEGRAPH_NO_WAL_DEFER, CODEGRAPH_WAL_VALVE_MB, DEFAULT_WAL_VALVE_MB, wal_valve_threshold_bytes,
 };
+pub use rebuild::{ActiveFullRebuild, FullRebuild, RebuildError, RebuildKind, begin_full_rebuild};

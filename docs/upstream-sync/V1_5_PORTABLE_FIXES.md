@@ -1551,3 +1551,252 @@ changed. `Cargo.lock` remains required at
 `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`.
 These evidence bytes are written before formatting and the single final CI run;
 no terminal Green is claimed until that post-documentation gate passes.
+
+## Batch M — `full_sync_finalizer_publishes_current_last` (2026-07-25)
+
+Frozen plan lines 548-556 and test 8 (line 746) are now implemented: a destructive
+v2 rebuild becomes a readable `Current` namespace only after every SQLite
+finalization step succeeded under the ONE retained exclusive `IndexLease`.
+
+New `codegraph-store::rebuild` owns the whole rebuild lifecycle.
+`begin_full_rebuild(paths, kind, deadline, cancelled)` acquires the single outer
+exclusive lease (`create_exclusive` for a genuinely absent root,
+`acquire_exclusive_existing` otherwise — an existing lockless root is never
+repaired), refuses an interrupted-uninit namespace for anything but an explicit
+`init`, classifies through `Store::open_for_write(FullRebuild)` while retaining
+that authorization for the rebuild's whole lifetime, publishes `phase=building`
+BEFORE any destructive work, removes only v2 `codegraph.db`/`-wal`/`-shm`, and
+returns a `FullRebuild` handle. `FullRebuild::open_store` opens the fresh
+write-capable target through the new `Store::open_rebuild_target`, which
+revalidates `IndexLease::validate_exclusive` immediately before the first
+write-capable SQLite open.
+
+`FullRebuild::finish(store)` is the explicit fallible completion path, in exact
+order: restore default pragmas → final checkpoint + compaction → stamp extraction
+version 2 through the state-gated `Store::stamp_extraction_version` → checkpoint
+that stamp into the main database file (new `Store::checkpoint_wal_truncate`, so
+`Current` corroboration can read it from main-file bytes) → close the final SQLite
+connection (new `Store::close`, which propagates a close failure as typed
+`StoreError::Close` and drops the lease clone only after the connection is gone) →
+publish `phase=current` → remove the tombstone ONLY for a successful explicit
+`init`. Every step propagates. `finish` consumes the handle, so a caller cannot
+finalize twice; the handle's `Drop` performs NO publication at all, which is what
+keeps an abandoned rebuild at `phase=building`, unreadable and fail-closed.
+
+CLI wiring is the minimum coherent rebuild path. `BulkIndexPragmaGuard` no longer
+reopens the DB through legacy `Store::open` in `Drop`; it now owns the
+`FullRebuild` and exposes `begin`/`finish`. `index_project_inner` takes a
+`RebuildKind` instead of `clear_first`, no longer pre-creates the index root (the
+rebuild layer creates root + permanent lock under the lease), reads `counts()`
+before the connection closes, and finalizes through `pragma_guard.finish(store)`
+under a "Publishing index" phase line. `cmd_init` passes `ExplicitInit`;
+`cmd_index` passes `Reindex` and no longer removes the DB up front, because the
+destructive removal now happens after `phase=building` is durable. The unused
+`remove_db_files` helper and the redundant inline extraction-version stamp were
+deleted (the finalizer's state-gated stamp replaces the latter).
+
+Behavioral Red (compiling, public-surface, no sleeps): new
+`crates/codegraph-cli/tests/batch_m_finalizer.rs`
+`full_rebuild_publishes_readable_current_last_via_cli` drove the shipped
+`codegraph init` and then asked the accepted state gate. Command
+`cargo test -p codegraph-rs --locked --test batch_m_finalizer
+full_rebuild_publishes_readable_current_last_via_cli -- --exact` exited 101 with
+`0 passed; 1 failed` and the assertion
+`explicit init: the finished rebuild must publish phase=current as its LAST step
+(plan lines 548-556); observed Missing — left: Missing, right: Current`. Setup
+(`init` exit 0) and the non-empty v2 DB check both passed first, so this was
+behavioral, not a compile/setup/panic failure. The same command now exits 0.
+
+Deterministic fault matrix (private seams, unit-level, zero sleeps) in
+`rebuild.rs`: `every_rebuild_fault_leaves_building_or_missing_and_unreadable`
+injects a fault after each of Building publication, database removal, pragma
+restore, compaction, stamp, stamp checkpoint, connection close, and immediately
+before Current publication — every injection leaves `Building` or `Missing`, is
+unreadable through `Store::open_for_read`, and never classifies `Current`.
+`failed_current_publication_after_finalization_never_becomes_readable_current`
+replaces the fixed `index.lock` immediately before the publication, so the
+database is fully finalized and closed yet the publication fails with
+`PermanentLockChanged` and the namespace stays `phase=building` and unreadable —
+the case where publication itself fails after DB finalization.
+`faults_at_or_after_current_publication_have_already_published_current` pins the
+complementary direction. `dropping_an_unfinished_rebuild_never_publishes_current`
+proves `Drop` is emergency-only. `only_successful_explicit_init_removes_the_tombstone`
+stages a genuine interrupted-uninit namespace (authoritative `uninitialized` slot
+published first, then the tombstone) and proves a `Reindex` is refused outright,
+while a successful `ExplicitInit` removes the tombstone;
+`an_earlier_fault_never_removes_the_tombstone` proves an interrupted finalization
+never does. `a_successful_reindex_preserves_an_unrelated_tombstone_free_namespace`
+proves a reindex never creates one. `rebuild_retains_one_exclusive_lease_and_never_reacquires`
+proves a competing writer is blocked for the rebuild's whole life and succeeds only
+after the finished handle is dropped. `existing_root_without_a_permanent_lock_fails_closed`
+proves a lockless existing namespace is refused byte-nonmutating.
+
+Verification, with `bash scripts/check-workspace-versions.sh` (exit 0, workspace
+`0.40.4`) before every Cargo batch and `--locked` on every dependency-resolving
+command: `codegraph-store --lib rebuild` 10/10; full `cargo test -p
+codegraph-store` 155/0 across its seven suites; `cargo test -p codegraph-rs
+--locked --test batch_m_finalizer` 1/1; `cargo test --workspace --locked` exit 0
+with 2762 passed / 0 failed across 110 reporting suites (up from the 2695 recorded
+for the classifier correction, no test weakened, deleted, or filtered);
+`cargo check -p codegraph-store -p codegraph-rs --all-targets` clean;
+`cargo clippy -p codegraph-store -p codegraph-rs --all-targets -- -D warnings`
+clean; Linux-host `x86_64-pc-windows-msvc` all-target check clean for
+`codegraph-store` (the CLI package cannot be cross-checked here: its `--all-targets`
+build needs MSVC `lib.exe` for a C dependency, which is unavailable — the store
+result is compilation evidence only and no native Windows runtime, crash, or
+handle behavior is claimed).
+
+LSP diagnostics again rejected both changed Rust files because
+`/tmp/opencode/codegraph-rust-v15-impl` is outside the request cwd; Cargo
+check/Clippy/test remain the accepted fallback.
+
+Scope held: no daemon, watcher, MCP, uninit-continuation, project-scoped config, or
+extension-relocation work started; `sync`'s own migration-mode escalation remains a
+later slice. No dependency added, `Cargo.lock` untouched at
+`750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`, and no node-id
+formula, schema, extraction output, or golden artifact changed (the workspace run
+includes `codegraph-bench`'s golden byte-stability suites). These evidence bytes are
+written before `make fmt` and the single authoritative final locked `make ci`; no
+terminal Green is claimed until that post-documentation gate passes.
+
+## Batch M — rebuild finalizer correction (2026-07-26)
+
+Independent rereading of frozen Revision 14 (`5b64aa335fb32cd228d98404c2e44153e9134d26a912ecb02d71fcf5c5798450`)
+found six defects in the retained candidate above. This append-only correction
+supersedes only those claims; the original Red/Green history remains intact.
+
+1. CLI recovery no longer equates raw `codegraph.db` existence with a healthy
+   initialized namespace. `cmd_init` returns “Already initialized” only after a
+   typed `Current` classification is corroborated through `Store::open_for_read`.
+   `Current+tombstone` is explicitly retryable by `init`, while every other
+   Current inconsistency stays typed/fail-closed. `index` has a narrowly separate
+   discovery predicate that recognizes a durable non-Missing state even when an
+   interrupted Building rebuild already deleted the DB; actual authorization is
+   still decided later under the exclusive lease. Black-box regressions cover
+   `Building` with DB present and absent through both explicit `init` and
+   `index --force`, plus explicit-init recovery of `Current+tombstone` residue.
+2. `begin_full_rebuild` deleted the racy pre-authorization
+   `Store::extraction_status` decision. `Reindex` refusal now uses exactly
+   `StoreWriteAuthorization::status()`, the classification accepted by
+   `open_for_write` under the held lease. A deterministic checkpoint changes the
+   slot to `Uninitialized` before authorization and proves the accepted status,
+   not a stale precheck, controls refusal before DB mutation.
+3. The same retained lease is now revalidated immediately before every DB
+   artifact unlink, write-capable SQLite open, rebuild setup/final pragma,
+   checkpoint, compact, stamp, close, state publication (inside the accepted
+   publisher), and tombstone unlink boundary. The redundant `create_dir_all`
+   between validation and SQLite open is gone. Fresh lock-replacement tests cover
+   the write open and every destructive/finalization boundary without sleeps.
+4. `FullRebuild::open_store(&self) -> Store` was replaced by consuming typestate:
+   `FullRebuild::open_store(self) -> ActiveFullRebuild`. The active handle owns the
+   exact `IndexPaths`, retained capability/authorization, and sole final SQLite
+   writer. Its `finish(self)` accepts no caller-supplied Store, so a rebuild can
+   open at most one final writer and cannot publish after finalizing another
+   connection.
+5. Tombstone fault injection now fails at the actual `remove_file` operation with
+   `PermissionDenied`; the old after-success checkpoint is named only
+   `AfterTombstoneRemoval` and is not represented as a removal failure. The
+   operation failure leaves `Current+tombstone`, which remains unreadable and is
+   recoverable only through repeated explicit `init`; the retry rebuilds and then
+   removes the tombstone successfully.
+6. `ActiveFullRebuild::Drop` now implements the frozen emergency best-effort
+   cleanup: while retained authority still validates, it attempts default-pragma
+   restoration/checkpoint and compaction, then closes the owned writer. Its code
+   contains no state-publication or tombstone-removal path, so it structurally
+   cannot publish `Current`. The regression checks sidecar cleanup while the
+   authoritative state remains `Building` and unreadable.
+
+Valid correction Red: before the typestate change,
+`rebuild::tests::one_rebuild_handle_can_open_at_most_one_final_writer` compiled and
+failed because a second live SQLite writer opened successfully. The corrected
+focused batch is sleep-free and green: `cargo test -p codegraph-store --locked
+rebuild::tests -- --nocapture` reports 15 passed / 0 failed, and `cargo test -p
+codegraph-rs --locked --test batch_m_finalizer -- --nocapture` reports 4 passed /
+0 failed. `bash scripts/check-workspace-versions.sh` ran first and passed before
+each Cargo batch.
+
+Scope remains exactly the finalizer slice: no sync/watch migration escalation,
+uninit command/continuation implementation, daemon/MCP lifecycle relocation,
+project-scoped config, extension/Godot relocation, unlock, dependencies, schema,
+node-id, goldens, or Batches A-E. Final affected gates, MSVC store compile-only
+cross-check, formatter, and the one authoritative `make ci CARGO='cargo --locked'`
+are intentionally run only after these final evidence bytes land. Native Windows
+runtime/crash coverage is not claimed.
+
+## Batch M — emergency close-boundary correction (2026-07-26)
+
+Final review found that the emergency `ActiveFullRebuild::Drop` path described in
+correction item 6 above still relied on implicit field destruction for the final
+SQLite close. That was weaker than the frozen requirement: closing the last WAL
+connection is itself a mutation-capable SQLite boundary, so emergency cleanup
+must retain and revalidate the exact lease through the explicit close attempt.
+This append supersedes only the earlier implicit-close and sidecar-cleanup claims.
+
+`Store::close` is now the shared explicit state-gated close boundary. Its field
+order remains connection before lease, and it validates the retained capability
+immediately before `Connection::close`. The portable contract is deliberately
+narrow: validation and close are separate APIs, and neither Rust nor SQLite
+provides an atomic check-and-close primitive. `ActiveFullRebuild::Drop` performs
+best-effort pragma restoration/checkpoint and compaction, then calls that explicit
+close path and reports any error to stderr without panicking. It still contains
+no `publish_index_state` or tombstone-removal call, so an emergency drop cannot
+publish `Current`.
+
+The deterministic, sleep-free regression
+`emergency_cleanup_close_is_explicitly_state_gated` replaces `index.lock`
+immediately before `Store::close` and observes
+`IndexLeaseValidationError::PermanentLockChanged`. The focused rebuild batch now
+reports 16 passed / 0 failed; the CLI finalizer suite reports 4 passed / 0 failed;
+the complete `codegraph-store` package suite passes; affected-package all-target
+`cargo check` is clean; and affected-package all-target Clippy with `-D warnings`
+is clean. Every Cargo batch was preceded by
+`bash scripts/check-workspace-versions.sh` and used `--locked`.
+
+The attempted Linux-host `x86_64-pc-windows-msvc` all-target check did NOT
+produce compilation evidence: `libsqlite3-sys` rejected the available GNU
+compiler for that target and `cc-rs` failed to find `lib.exe` (`No such file or
+directory`). This is recorded as a host-toolchain limitation, not as a source
+failure, and no native Windows runtime/crash/handle claim is made. LSP likewise
+cannot attach to this external `/tmp` worktree (`LSP file path must be inside
+request cwd`); the clean targeted Cargo diagnostics are the fallback.
+
+These are pre-format evidence bytes. The terminal Green is recorded only after
+`make fmt`, one fresh authoritative `make ci CARGO='cargo --locked'`, the required
+`Cargo.lock` SHA-256 check, `git diff --check`, and scoped status inspection pass.
+
+## Batch M — finalizer authoritative gate handoff (2026-07-26)
+
+`full_sync_finalizer_publishes_current_last` is implemented and its verification is
+now closed except for one explicitly named gate. This append records the evidence
+actually observed; it supersedes no earlier claim and rewrites no historical
+failure.
+
+Delegated verification result (completed): focused rebuild batch 16 passed / 0
+failed; CLI finalizer suite 4 passed / 0 failed; the complete `codegraph-store`
+package suite green; affected-package all-target `cargo check` and Clippy with
+`-D warnings` green; and a delegated `make ci CARGO='cargo --locked'` green.
+
+Parent independent rerun (completed, not inherited): focused rebuild batch 16
+passed / 0 failed; CLI finalizer suite 4 passed / 0 failed; the full
+`codegraph-store` package green at 84 unit tests plus integration suites of 6, 12,
+20, 14, 4, and 21 tests; affected-package `cargo check` and Clippy green. No
+pre-existing test was weakened, deleted, filtered, or ignored.
+
+Parent hands-on CLI QA (completed): `codegraph --version` printed `0.40.4`; an
+unknown command exited nonzero; and on a fresh mini fixture, `init`, `status`,
+`index --force`, and a second `status` all succeeded, with each `status` reporting
+3 files, 13 nodes, 21 edges, the `.codegraph-v2/codegraph.db` path, and “Index is
+up to date”.
+
+Environment limitations, unchanged and still explicitly claimed as limitations:
+LSP diagnostics rejected every changed Rust file with `LSP file path must be
+inside request cwd`, so targeted Cargo diagnostics are the accepted fallback; and
+the attempted MSVC cross-check produced no evidence because `libsqlite3-sys` /
+`cc-rs` could not find `lib.exe`, so no native Windows runtime, crash, or handle
+behavior is claimed.
+
+These bytes are written BEFORE the parent's final `make fmt` and single
+authoritative `make ci CARGO='cargo --locked'`. That final run must cover these
+exact bytes, it is the sole remaining completion authority, and no later
+documentation edit is permitted. Apart from that one named gate, no validation for
+this item remains pending.

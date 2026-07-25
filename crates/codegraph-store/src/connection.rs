@@ -205,6 +205,20 @@ pub enum StoreError {
     },
     #[error("only a state-gated write Store may stamp the extraction version")]
     StampNotAuthorized,
+    #[error("only a state-gated write Store may be closed as a rebuild finalizer")]
+    CloseNotAuthorized,
+    #[error("failed to close the final SQLite connection for {path}: {source}")]
+    Close {
+        path: PathBuf,
+        #[source]
+        source: rusqlite::Error,
+    },
+    #[error("failed to checkpoint the SQLite write-ahead log for {path}: {source}")]
+    CheckpointWal {
+        path: PathBuf,
+        #[source]
+        source: rusqlite::Error,
+    },
     #[error("failed to stamp extraction version in SQLite database {path}: {source}")]
     StampExtractionVersion {
         path: PathBuf,
@@ -376,10 +390,32 @@ impl Store {
         Self::open_for_write_with(paths, lease, purpose, || {})
     }
 
+    /// Authorize the destructive rebuild used only by an explicit `init` retry.
+    /// Unlike an ordinary reindex, this narrow recovery surface may accept a
+    /// fully corroborated `Current` database whose tombstone remains after the
+    /// prior finalizer published Current but failed to remove that tombstone.
+    /// The namespace is still not readable until the explicit retry completes.
+    pub(crate) fn open_for_explicit_init_rebuild(
+        paths: &IndexPaths,
+        lease: IndexLease,
+    ) -> Result<StoreWriteOpen> {
+        Self::open_for_write_with_options(paths, lease, StoreWritePurpose::FullRebuild, true, || {})
+    }
+
     fn open_for_write_with(
         paths: &IndexPaths,
         lease: IndexLease,
         purpose: StoreWritePurpose,
+        before_write_open: impl FnOnce(),
+    ) -> Result<StoreWriteOpen> {
+        Self::open_for_write_with_options(paths, lease, purpose, false, before_write_open)
+    }
+
+    fn open_for_write_with_options(
+        paths: &IndexPaths,
+        lease: IndexLease,
+        purpose: StoreWritePurpose,
+        allow_current_tombstone: bool,
         before_write_open: impl FnOnce(),
     ) -> Result<StoreWriteOpen> {
         lease.validate_exclusive(paths)?;
@@ -431,7 +467,8 @@ impl Store {
             }
             StoreWritePurpose::FullRebuild => {
                 if status == ExtractionStatus::Current {
-                    let (corroboration, source_conn) = corroborate_current_database(paths)?;
+                    let (corroboration, source_conn) =
+                        corroborate_current_database_with(paths, allow_current_tombstone)?;
                     drop(corroboration);
                     drop(source_conn);
                 }
@@ -456,11 +493,124 @@ impl Store {
         }
     }
 
+    /// Open the fresh, write-capable target of an in-progress destructive
+    /// rebuild under a clone of the caller's already-validated exclusive lease.
+    ///
+    /// The caller (`crate::rebuild`) has already published `phase=building` and
+    /// removed the previous database files, so this deliberately CREATES the
+    /// database and runs schema setup. It is not a state-classifying entry point:
+    /// classification happened once, before publication, in
+    /// [`Self::open_for_write`].
+    pub(crate) fn open_rebuild_target_with(
+        paths: &IndexPaths,
+        lease: &IndexLease,
+        before_open: impl FnOnce(),
+    ) -> Result<Self> {
+        let db_path = paths.current_db();
+        // `IndexLease::create_exclusive` created the root for an initial
+        // namespace, while existing acquisition proved it already existed. Do
+        // not insert filesystem work between this immediate capability check and
+        // SQLite's write-capable open.
+        before_open();
+        lease.validate_exclusive(paths)?;
+        let mut conn = Connection::open(&db_path).map_err(|source| StoreError::Open {
+            path: db_path.clone(),
+            source,
+        })?;
+        lease.validate_exclusive(paths)?;
+        migrations::configure_auto_vacuum_for_fresh_db(&conn).map_err(|source| {
+            StoreError::Configure {
+                path: db_path.clone(),
+                source,
+            }
+        })?;
+        configure_connection_for_rebuild(&conn, paths, lease, &db_path)?;
+        lease.validate_exclusive(paths)?;
+        migrations::ensure_schema_and_migrations(&mut conn).map_err(|source| {
+            StoreError::Migrate {
+                path: db_path.clone(),
+                source,
+            }
+        })?;
+        Ok(Self {
+            conn,
+            _source_conn: None,
+            path: db_path,
+            access: StoreAccess::StateWrite,
+            guarded_paths: Some(paths.clone()),
+            lease: Some(lease.clone()),
+        })
+    }
+
+    /// Fold the write-ahead log back into the main database file and truncate the
+    /// `-wal` sidecar. Used by the rebuild finalizer to make the extraction stamp
+    /// durable in the main file that `Current` corroboration deserializes.
+    pub(crate) fn checkpoint_wal_truncate(&self) -> Result<()> {
+        self.validate_state_write_authority()?;
+        self.conn
+            .pragma_update(None, "wal_checkpoint", "TRUNCATE")
+            .map_err(|source| StoreError::CheckpointWal {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    /// Explicitly close the final SQLite connection of a state-gated writer,
+    /// propagating any close failure instead of discarding it in `Drop`. The
+    /// retained lease clone is released only after the connection is closed.
+    ///
+    /// Lease validation and SQLite close are necessarily separate API calls:
+    /// neither portable `std` nor SQLite exposes an atomic check-and-close
+    /// primitive. "Immediately before" therefore means that this method inserts
+    /// no other operation between the last capability validation and
+    /// [`Connection::close`]; it does not claim portable atomicity.
+    pub(crate) fn close(self) -> Result<()> {
+        if self.access != StoreAccess::StateWrite {
+            return Err(StoreError::CloseNotAuthorized);
+        }
+        // Closing a WAL connection may checkpoint or remove sidecars. Treat it
+        // as a finalization mutation boundary, not as an authority-free drop.
+        self.validate_state_write_authority()?;
+        let Self {
+            conn,
+            _source_conn,
+            path,
+            access: _,
+            guarded_paths: _,
+            lease,
+        } = self;
+        drop(_source_conn);
+        conn.close().map_err(|(_conn, source)| StoreError::Close {
+            path: path.clone(),
+            source,
+        })?;
+        // Explicit ordering: the lease clone is dropped only once no SQLite
+        // handle for this namespace remains open in this process.
+        drop(lease);
+        Ok(())
+    }
+
     /// Write the store-owned extraction metadata key and exact current decimal
     /// value. Read/status/legacy Stores are rejected before SQL execution.
     pub fn stamp_extraction_version(&self) -> Result<usize> {
+        self.validate_state_write_authority()
+            .map_err(|error| match error {
+                StoreError::CloseNotAuthorized => StoreError::StampNotAuthorized,
+                other => other,
+            })?;
+        self.set_project_metadata(
+            EXTRACTION_VERSION_KEY,
+            &CURRENT_EXTRACTION_VERSION.to_string(),
+        )
+        .map_err(|source| StoreError::StampExtractionVersion {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) fn validate_state_write_authority(&self) -> Result<()> {
         if self.access != StoreAccess::StateWrite || self.lease.is_none() {
-            return Err(StoreError::StampNotAuthorized);
+            return Err(StoreError::CloseNotAuthorized);
         }
         let paths = self
             .guarded_paths
@@ -470,14 +620,7 @@ impl Store {
             .as_ref()
             .expect("state-gated write Store always retains its lease")
             .validate_exclusive(paths)?;
-        self.set_project_metadata(
-            EXTRACTION_VERSION_KEY,
-            &CURRENT_EXTRACTION_VERSION.to_string(),
-        )
-        .map_err(|source| StoreError::StampExtractionVersion {
-            path: self.path.clone(),
-            source,
-        })
+        Ok(())
     }
 
     pub fn connection(&self) -> &Connection {
@@ -506,8 +649,15 @@ fn open_current_read_only(paths: &IndexPaths, lease: IndexLease) -> Result<Store
 }
 
 fn corroborate_current_database(paths: &IndexPaths) -> Result<(Connection, Connection)> {
+    corroborate_current_database_with(paths, false)
+}
+
+fn corroborate_current_database_with(
+    paths: &IndexPaths,
+    allow_tombstone: bool,
+) -> Result<(Connection, Connection)> {
     let db_path = paths.current_db();
-    if artifact_exists(&paths.tombstone())? {
+    if !allow_tombstone && artifact_exists(&paths.tombstone())? {
         return Err(StoreError::CurrentTombstoned {
             path: paths.tombstone(),
         });
@@ -740,6 +890,36 @@ fn configure_connection(conn: &Connection) -> rusqlite::Result<()> {
     conn.pragma_update(None, "cache_size", -64_000)?;
     conn.pragma_update(None, "temp_store", "MEMORY")?;
     conn.pragma_update(None, "mmap_size", 268_435_456_i64)?;
+    Ok(())
+}
+
+fn configure_connection_for_rebuild(
+    conn: &Connection,
+    paths: &IndexPaths,
+    lease: &IndexLease,
+    db_path: &Path,
+) -> Result<()> {
+    let configure = |result: rusqlite::Result<()>| {
+        result.map_err(|source| StoreError::Configure {
+            path: db_path.to_path_buf(),
+            source,
+        })
+    };
+
+    lease.validate_exclusive(paths)?;
+    configure(conn.busy_timeout(std::time::Duration::from_millis(5_000)))?;
+    lease.validate_exclusive(paths)?;
+    configure(conn.pragma_update(None, "foreign_keys", "ON"))?;
+    lease.validate_exclusive(paths)?;
+    configure(conn.pragma_update(None, "journal_mode", "WAL"))?;
+    lease.validate_exclusive(paths)?;
+    configure(conn.pragma_update(None, "synchronous", "NORMAL"))?;
+    lease.validate_exclusive(paths)?;
+    configure(conn.pragma_update(None, "cache_size", -64_000))?;
+    lease.validate_exclusive(paths)?;
+    configure(conn.pragma_update(None, "temp_store", "MEMORY"))?;
+    lease.validate_exclusive(paths)?;
+    configure(conn.pragma_update(None, "mmap_size", 268_435_456_i64))?;
     Ok(())
 }
 

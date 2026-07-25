@@ -1154,16 +1154,16 @@ fn cmd_prompt_hook(path: Option<PathBuf>, query: Option<String>) -> Result<()> {
 
 fn cmd_init(path: Option<PathBuf>, target: &str) -> Result<()> {
     let project = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
-    if is_initialized(&project) {
+    if explicit_init_observes_readable_current(&project)? {
         println!("Already initialized in {}", project.display());
         println!("Use \"codegraph index\" to re-index or \"codegraph sync\" to update");
         return installer::run_install_local_targets(project, target);
     }
     guard_indexable_root(&project)?;
-    let index_root = codegraph_dir(&project)?;
-    fs::create_dir_all(&index_root)
-        .with_context(|| format!("creating {}", index_root.display()))?;
-    let result = index_project(&project, true, false)?;
+    // The rebuild layer creates the current root and its permanent lock under the
+    // one outer exclusive lease; pre-creating it here would produce a lockless
+    // namespace that acquisition then refuses.
+    let result = index_project(&project, codegraph_store::RebuildKind::ExplicitInit)?;
     println!("Initialized in {}", project.display());
     print_index_result(&result);
     installer::run_install_local_targets(project, target)
@@ -1182,12 +1182,23 @@ fn cmd_uninit(path: Option<PathBuf>, force: bool) -> Result<()> {
 }
 
 fn cmd_index(path: Option<PathBuf>, force: bool, quiet: bool, verbose: bool) -> Result<()> {
-    let project = resolve_required_project(path)?;
+    // Index is the one ordinary CLI surface allowed to retry an authenticated
+    // interrupted Building rebuild. Resolve state slots as well as a DB artifact
+    // so the crash window after deletion but before final writer creation remains
+    // reachable; authorization is still decided later under the exclusive lease.
+    let project = resolve_required_rebuild_project(path)?;
     guard_indexable_root(&project)?;
-    if force {
-        remove_db_files(&project)?;
-    }
-    let result = index_project_inner(&project, true, verbose, quiet)?;
+    // `--force` no longer removes the DB up front: the rebuild layer performs the
+    // destructive removal itself, AFTER publishing `phase=building` under the one
+    // outer exclusive lease, so an interruption can never leave a bare DB with no
+    // state marker. Plain `index` takes the same full-rebuild path it always did.
+    let _ = force;
+    let result = index_project_inner(
+        &project,
+        codegraph_store::RebuildKind::Reindex,
+        verbose,
+        quiet,
+    )?;
     if !quiet {
         print_index_result(&result);
     }
@@ -3418,28 +3429,82 @@ fn finish_phase(bar: &ProgressBar, label: &str) {
     bar.abandon_with_message(format!("✓ {label} ({elapsed})"));
 }
 
-fn index_project(project: &Path, clear_first: bool, verbose: bool) -> Result<IndexSummary> {
-    index_project_inner(project, clear_first, verbose, false)
+fn index_project(project: &Path, kind: codegraph_store::RebuildKind) -> Result<IndexSummary> {
+    index_project_inner(project, kind, false, false)
 }
 
-/// Restores the shared `synchronous=NORMAL` durability (and truncates the WAL) when
-/// the full index finishes OR bails out early via `?`. Drop never panics: a failed
-/// restore is logged, not propagated.
+/// Owns one destructive v2 rebuild for the whole full-index body.
+///
+/// `begin` acquires the single outer exclusive `IndexLease`, classifies under it,
+/// publishes `phase=building`, removes the previous v2 database files, and opens
+/// the fresh write-capable target. [`Self::finish`] is the EXPLICIT FALLIBLE
+/// completion path required by the frozen plan (lines 548-556): under the same
+/// retained lease it restores the shared `synchronous=NORMAL` durability, runs the
+/// final checkpoint + compaction, stamps extraction version 2, checkpoints that
+/// stamp into the main database file, closes the final SQLite connection, and only
+/// then publishes `phase=current` (removing a tombstone solely for a successful
+/// explicit `init`). Every failure propagates.
+///
+/// `Drop` is emergency best-effort cleanup only: it can never publish `Current`,
+/// so an index that bails out early via `?` leaves the namespace `phase=building`
+/// — unreadable and fail-closed — and a rerun rebuilds it from scratch.
+/// `Self::finish` consumes the guard, which is what disarms that fallback.
 struct BulkIndexPragmaGuard {
-    db_path: PathBuf,
+    rebuild: Option<codegraph_store::ActiveFullRebuild>,
+}
+
+/// Bounded wall-clock budget for acquiring the one outer exclusive lease. Never a
+/// blocking wait: `IndexLease` polls `try_lock` against this monotonic deadline.
+const REBUILD_LEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl BulkIndexPragmaGuard {
+    fn begin(
+        paths: &codegraph_core::IndexPaths,
+        kind: codegraph_store::RebuildKind,
+    ) -> Result<Self> {
+        let deadline = std::time::Instant::now() + REBUILD_LEASE_TIMEOUT;
+        let rebuild = codegraph_store::begin_full_rebuild(paths, kind, deadline, || false)?;
+        let rebuild = rebuild.open_store()?;
+        Ok(Self {
+            rebuild: Some(rebuild),
+        })
+    }
+
+    fn finish(mut self) -> Result<()> {
+        let rebuild = self
+            .rebuild
+            .take()
+            .expect("a rebuild guard is finished at most once");
+        rebuild.finish().map_err(Into::into)
+    }
+}
+
+impl std::ops::Deref for BulkIndexPragmaGuard {
+    type Target = codegraph_store::ActiveFullRebuild;
+
+    fn deref(&self) -> &Self::Target {
+        self.rebuild
+            .as_ref()
+            .expect("the CLI guard owns its active rebuild until finish")
+    }
+}
+
+impl std::ops::DerefMut for BulkIndexPragmaGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.rebuild
+            .as_mut()
+            .expect("the CLI guard owns its active rebuild until finish")
+    }
 }
 
 impl Drop for BulkIndexPragmaGuard {
     fn drop(&mut self) {
-        let result = match Store::open(&self.db_path) {
-            Ok(store) => store.restore_default_pragmas().map_err(anyhow::Error::from),
-            Err(err) => Err(anyhow::Error::from(err)),
-        };
-        if let Err(err) = result {
+        if let Some(rebuild) = self.rebuild.take() {
+            // No publication happens here by construction: the namespace stays
+            // `phase=building`, so nothing can read a half-built graph.
             tracing::warn!(
-                error = %err,
-                db = %self.db_path.display(),
-                "failed to restore default pragmas after full index",
+                root = %rebuild.paths().current_root().display(),
+                "full index did not finalize; index remains phase=building and unreadable",
             );
         }
     }
@@ -3447,16 +3512,13 @@ impl Drop for BulkIndexPragmaGuard {
 
 fn index_project_inner(
     project: &Path,
-    clear_first: bool,
+    kind: codegraph_store::RebuildKind,
     verbose: bool,
     quiet: bool,
 ) -> Result<IndexSummary> {
     let started = std::time::Instant::now();
-    if clear_first {
-        remove_db_files(project)?;
-    }
-    let index_root = codegraph_dir(project)?;
-    fs::create_dir_all(&index_root)?;
+    let paths = index_paths(project)?;
+    let index_root = paths.current_root().to_path_buf();
     let config = codegraph_core::config::get_config();
     let options = ExtractOptions {
         max_file_size: config.indexing.max_file_size,
@@ -3471,16 +3533,18 @@ fn index_project_inner(
     }
     let files = codegraph_extract::engine::scan_project(project, &options)?;
 
+    // One destructive rebuild under ONE outer exclusive lease: classify, publish
+    // `phase=building`, remove the previous v2 DB files, then open the fresh
+    // write-capable target. The index root and DB are created by the rebuild
+    // layer, so nothing below reconstructs a path or reopens the namespace.
+    //
     // `synchronous=OFF` + a larger cache/mmap window speed up the from-scratch bulk
-    // index. The restore lives in a Drop guard, NOT a trailing statement, because
-    // every `?` below would skip a trailing restore and leave `synchronous=OFF`
-    // durable on the error path. Declared BEFORE `store` so it drops AFTER it: the
-    // guard's own connection then runs wal_checkpoint(TRUNCATE)+NORMAL with no WAL
-    // contention, leaving the file in the same shape a NORMAL run produces.
-    let _pragma_guard = BulkIndexPragmaGuard {
-        db_path: db_path(project)?,
-    };
-    let store = open_store(project)?;
+    // index. Their restore is part of the guard's EXPLICIT FALLIBLE `finish`, not a
+    // trailing statement, because every `?` below would skip a trailing restore.
+    // If the body bails out early, the guard's Drop only attempts state-gated
+    // pragma repair/compaction/close and publishes nothing: the namespace stays
+    // `phase=building` and unreadable.
+    let store = BulkIndexPragmaGuard::begin(&paths, kind)?;
     store.set_bulk_index_pragmas()?;
 
     let before = store.counts()?;
@@ -3807,14 +3871,15 @@ fn index_project_inner(
     resolver.run_post_extract(&mut store)?;
     finish_phase(&pb, "Finalized frameworks");
     store.set_project_metadata("indexed_with_version", VERSION)?;
-    store.set_project_metadata(
-        codegraph_store::EXTRACTION_VERSION_KEY,
-        &codegraph_store::CURRENT_EXTRACTION_VERSION.to_string(),
-    )?;
-    let pb = phase_spinner("Compacting database", quiet);
-    store.compact()?;
-    finish_phase(&pb, "Compacted database");
     let after = store.counts()?;
+    // Explicit fallible finalization: pragma restore -> checkpoint + compaction ->
+    // extraction stamp -> stamp checkpoint -> close the final connection ->
+    // publish `phase=current` (and remove a tombstone only for a successful
+    // explicit init). The namespace becomes readable at the LAST step, or not at
+    // all. Counts are read BEFORE the connection closes.
+    let pb = phase_spinner("Publishing index", quiet);
+    store.finish()?;
+    finish_phase(&pb, "Published index");
     Ok(IndexSummary {
         files_indexed,
         files_skipped,
@@ -4231,6 +4296,38 @@ fn is_initialized(project: &Path) -> bool {
     db_path(project).map(|p| p.exists()).unwrap_or(false)
 }
 
+/// Explicit init's early-return condition is a fully corroborated readable
+/// Current namespace, never raw DB existence. Current+tombstone is an expected
+/// retryable finalizer residue for explicit init, while every other Current
+/// inconsistency remains a typed error.
+fn explicit_init_observes_readable_current(project: &Path) -> Result<bool> {
+    let paths = index_paths(project)?;
+    if Store::extraction_status(&paths) != codegraph_store::ExtractionStatus::Current {
+        return Ok(false);
+    }
+    let deadline = std::time::Instant::now() + REBUILD_LEASE_TIMEOUT;
+    match Store::open_for_read(&paths, deadline, || false) {
+        Ok(store) => {
+            drop(store);
+            Ok(true)
+        }
+        Err(codegraph_store::StoreError::CurrentTombstoned { .. }) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Discovery predicate for the destructive `index` command. A durable state
+/// slot keeps an interrupted Building namespace discoverable even if the DB was
+/// already deleted. A raw DB remains discoverable only so the under-lease Store
+/// gate can reject Missing+DB as corruption; it is never interpreted as Current.
+fn has_rebuild_namespace(project: &Path) -> bool {
+    let Ok(paths) = index_paths(project) else {
+        return false;
+    };
+    Store::extraction_status(&paths) != codegraph_store::ExtractionStatus::Missing
+        || paths.current_db().exists()
+}
+
 fn resolve_required_project(path: Option<PathBuf>) -> Result<PathBuf> {
     let start = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
     let project = resolve_project_path_optional(&start);
@@ -4238,6 +4335,24 @@ fn resolve_required_project(path: Option<PathBuf>) -> Result<PathBuf> {
         bail!("CodeGraph not initialized in {}", project.display());
     }
     Ok(project)
+}
+
+fn resolve_required_rebuild_project(path: Option<PathBuf>) -> Result<PathBuf> {
+    let start = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
+    if has_rebuild_namespace(&start) {
+        return Ok(start);
+    }
+    let mut current = start.as_path();
+    while let Some(parent) = current.parent() {
+        if parent == current {
+            break;
+        }
+        if has_rebuild_namespace(parent) {
+            return Ok(parent.to_path_buf());
+        }
+        current = parent;
+    }
+    bail!("CodeGraph not initialized in {}", start.display())
 }
 
 fn resolve_project_path_optional(start: &Path) -> PathBuf {
@@ -4315,17 +4430,6 @@ fn codegraph_dir(project: &Path) -> Result<PathBuf> {
 /// The current (v2) index DB path for `project`. Fail-closed via [`index_paths`].
 fn db_path(project: &Path) -> Result<PathBuf> {
     Ok(index_paths(project)?.current_db())
-}
-
-fn remove_db_files(project: &Path) -> Result<()> {
-    let db = db_path(project)?;
-    for suffix in ["", "-wal", "-shm"] {
-        let path = PathBuf::from(format!("{}{}", db.display(), suffix));
-        if path.exists() {
-            fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
-        }
-    }
-    Ok(())
 }
 
 fn parse_node_kind(raw: &str) -> Result<NodeKind> {
