@@ -39,6 +39,7 @@ struct LeaseInner {
     file: File,
     mode: LeaseMode,
     db_parent: PathBuf,
+    lock_path: PathBuf,
 }
 
 struct PendingAcquisition {
@@ -122,6 +123,12 @@ pub enum IndexLeaseValidationError {
     /// The capability belongs to another resolved v2 database parent.
     #[error("index lease belongs to a different v2 database parent")]
     WrongDbParent,
+    /// The permanent fixed path no longer names the exact locked handle.
+    #[error("permanent index lock changed, disappeared, or became an alias: {path}")]
+    PermanentLockChanged {
+        /// Fixed permanent-lock path expected to name the held handle.
+        path: PathBuf,
+    },
 }
 
 impl IndexLease {
@@ -253,6 +260,14 @@ impl IndexLease {
         if !self.matches_db_parent(paths) {
             return Err(IndexLeaseValidationError::WrongDbParent);
         }
+        let expected_path = paths.permanent_lock();
+        if self.inner.lock_path != expected_path
+            || !path_still_names_file(&self.inner.lock_path, &self.inner.file).unwrap_or(false)
+        {
+            return Err(IndexLeaseValidationError::PermanentLockChanged {
+                path: expected_path,
+            });
+        }
         Ok(())
     }
 
@@ -355,6 +370,7 @@ impl IndexLease {
                             file,
                             mode,
                             db_parent,
+                            lock_path,
                         }),
                     });
                 }

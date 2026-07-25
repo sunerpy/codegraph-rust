@@ -1228,3 +1228,190 @@ carries no `#[ignore]`, so an exit-0 workspace run necessarily includes it: it
 passed in this authoritative run. `Cargo.lock` still hashes to
 `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`, and the
 worktree was clean with no whitespace errors.
+
+## Batch M — lease-gated atomic state publisher (2026-07-25)
+
+### Scope and behavioral Red
+
+This slice adds only the reusable publisher for the two fixed state slots. It
+does not integrate publication into `Store`, SQLite opens/stamps, CLI, MCP,
+watch, daemon, rebuild/finalizer, migration, or uninit flows.
+
+The compiling behavioral Red used a minimal public publisher scaffold plus the
+first-publication test. After the workspace-version gate passed, the command
+`cargo test -p codegraph-store --test index_state_publisher --locked --
+--nocapture` compiled and exited 101. Its sole test reached the behavioral call
+and failed with `initial state publication must succeed: Refused { status:
+Missing }`; result: 0 passed, 1 failed. This was missing publication behavior,
+not a compile, fixture, setup, or network failure.
+
+### Accepted publisher behavior
+
+- `publish_index_state` requires the exact `IndexLease` capability and calls
+  `validate_exclusive(paths)` before classification or mutation. Shared and
+  wrong-parent leases return typed validation errors; full-tree fail-closed
+  snapshots prove every directory, regular-file byte, and symlink target stays
+  unchanged.
+- The publisher immediately consumes the accepted `classify(paths)` result under
+  that lease. `Future` and every `Corrupt` case (malformed fixed slot, owner
+  mismatch, equal sequence, and `u64::MAX` exhaustion included) return typed
+  `Refused` before orphan cleanup or temp creation. It does not reimplement or
+  weaken classifier precedence.
+- A genuinely slot-absent namespace writes sequence 0 to fixed slot 0. Later
+  publications use checked `sequence + 1` and only the opposite, older or
+  missing inactive slot. The authoritative slot's complete bytes are preserved.
+  A typed `WireState` serializes the exact field order
+  `sequence,storageProtocol,extractionVersion,phase,projectIdentity,checksum`;
+  the first-publication test asserts the complete canonical JSON bytes and
+  checksum.
+- Temps are same-directory, publisher-owned names and are opened with bounded
+  `create_new(true)` retries. The publisher writes all bytes, flushes, calls
+  `sync_all`, removes only an older regular inactive slot when present, renames
+  the valid temp into that slot, and attempts parent-directory `sync_all`.
+  Explicit OS error sets report unsupported directory sync as
+  `ParentSyncStatus::Unsupported`; other failures remain typed I/O errors.
+- Orphan cleanup starts only after exact exclusive-lease validation and an
+  acceptable under-lease classification. It recognizes only the strict v2
+  publisher name grammar, validates regular-file identity before removal, and
+  leaves static aliases, non-regular entries, and unrelated names untouched.
+  Classifier scanning still reads only `IndexPaths::state_slots()`.
+
+### Deterministic fault and protocol matrix
+
+The private fault seam is inaccessible to normal callers. It injects after
+create, full write, flush, file `sync_all`, inactive delete/prepare, rename, and
+parent-sync attempt. The matrix covers all 3×3 prior/new phase pairs and all
+seven checkpoints (63 successor interruptions), plus all three initial phases at
+all seven checkpoints (21 initial interruptions). Before rename, classification
+is exactly the old authority (or `Missing` initially); after rename it is exactly
+the fully checksummed successor. The old authoritative slot's complete bytes
+remain unchanged at every successor checkpoint. This includes the explicit
+`building -> uninitialized` interrupted-uninit path. A separate deterministic
+checkpoint covers orphan-temp removal.
+
+Public tests additionally cover monotonic
+`building -> current -> uninitialized`, both-slot older replacement, missing
+inactive-slot recreation, malformed inactive refusal, equal-sequence refusal,
+owner mismatch, sequence exhaustion, strict temp names, regular orphan cleanup,
+and Unix temp-symlink non-following. A v3 future-protocol slot at a higher
+sequence than its v2 current companion still dominates and is byte-nonmutating;
+the v2 publisher cannot author arbitrary future records.
+
+### Green and platform evidence before the terminal gate
+
+Every Cargo batch was preceded by `bash scripts/check-workspace-versions.sh`:
+
+- Publisher integration tests: 9 passed, 0 failed.
+- Private deterministic publisher tests: 4 passed, 0 failed (including the 84
+  phase/checkpoint interruptions described above).
+- Accepted classifier tests: 20 passed, 0 failed; accepted lease integration
+  tests: 12 passed, 0 failed.
+- `cargo check -p codegraph-store --all-targets --locked` passed.
+- `cargo clippy -p codegraph-store --all-targets --locked -- -D warnings`
+  passed after correcting two lint-only findings.
+- `LIBSQLITE3_SYS_USE_PKG_CONFIG=1 SQLITE3_LIB_DIR=/tmp/opencode cargo check -p
+codegraph-store --target x86_64-pc-windows-msvc --all-targets --locked`
+  passed. This is Linux-host MSVC compilation only; native Windows runtime/crash
+  behavior is not claimed.
+- LSP diagnostics again refused this external `/tmp` worktree as outside the
+  request cwd. The targeted tests, package check, Clippy, and MSVC compilation
+  above are the diagnostics fallback.
+- `Cargo.lock` remained required at
+  `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`.
+
+These are the final documentation bytes for this publisher slice. Per the
+stale-documentation trap, they are formatted first; the authoritative terminal
+gate is then exactly `bash scripts/check-workspace-versions.sh && make ci &&
+sha256sum Cargo.lock && git diff --check`, with `CARGO='cargo --locked'` supplied
+to `make ci`. The scoped commit is created only if that post-documentation
+command chain exits 0, so no later evidence edit can invalidate it.
+
+### First terminal-gate attempt
+
+The first post-format terminal chain reached the full workspace tests after
+clean workspace-version, formatting, and Clippy gates, then failed only in the
+known timing-sensitive `daemon_single_watcher_fires_once` test: its first sync
+reported `0 file(s) reindexed` instead of naming the changed file. No publisher,
+classifier, or lease test failed. This failed attempt remains recorded; exactly
+one post-append, post-format retry remains under the two-check ceiling.
+
+## Correction (2026-07-25): rejected publisher protocol defects
+
+The publisher slice above was rejected by manual review despite its focused
+tests passing. This append supersedes, but does not erase, the earlier 3×3
+transition and orphan-cleanup claims. The correction remains publisher/lease
+only: it does not begin `Store`, SQLite, CLI, MCP, watch, daemon,
+rebuild/finalizer, migration, uninit, or Batches A–E integration.
+
+### Corrected protocol boundaries
+
+- One pure transition validator now admits exactly `Missing -> Building`,
+  `Outdated -> Building`, `Uninitialized -> Building`,
+  `Current -> Building|Uninitialized`, and
+  `Building -> Building|Current|Uninitialized`. Every other current-protocol
+  status/phase pair returns typed `StatePublishError::InvalidTransition` with a
+  cloned `ExtractionStatus` and requested `StatePhase`, before temp creation or
+  fixed-slot mutation. A unit matrix covers all three requested phases for
+  `Missing`, `Outdated`, `Uninitialized`, `Current`, `Building`, `Future`, and
+  `Corrupt`. `Future` and `Corrupt` still take the earlier typed `Refused` path,
+  preserving accepted classifier precedence. Initial slot 0 / sequence 0
+  publication is therefore possible only for `Missing -> Building`.
+- The successor fault matrix is no longer the unsafe 3×3 cross-product. It
+  covers every allowed successor transition at the seven retained checkpoints:
+  temp create, full write, flush, file sync, inactive-slot preparation, rename,
+  and parent-sync attempt. `Building -> Uninitialized` remains explicit. The
+  initial matrix covers only `Missing -> Building`. Successor slot and sequence
+  continue to derive solely from the accepted classifier authority, and every
+  pre-rename fault preserves the old authoritative bytes.
+- `IndexLease` now privately retains the fixed permanent-lock path. Writer
+  validation order is mode, exact DB parent, then
+  `file_identity::path_still_names_file`: the fixed path must still name the
+  exact held handle immediately before publisher classification. Replacement,
+  disappearance, aliasing, non-regular replacement, or identity-check I/O
+  failure maps to typed `PermanentLockChanged { path }`, without exposing
+  platform identities. The public replacement regression snapshots the full
+  tree around rejection and then proves a fresh lease can acquire the new fixed
+  lock; missing, directory, and Unix alias regressions pin the same pre-mutation
+  failure. Shared and wrong-parent precedence remains unchanged.
+- Automatic orphan-temp cleanup is removed completely, including its name
+  recognizer, directory scan, path unlink, and removal fault checkpoint. The
+  prior verify-handle-then-`remove_file(path)` design had an unavoidable
+  verify-to-unlink race: portable `std` supplies no atomic conditional unlink
+  that removes a path only if it still identifies the verified handle. Keeping
+  that cleanup could delete a replacement object, so the safe portable behavior
+  is to leave every preexisting temp-like entry untouched. Generated temp names
+  remain internal, bounded, collision-safe through `create_new(true)`, and
+  outside fixed-slot scanning. Successful-publication tests preserve a regular
+  orphan-like file, a directory and marker, an unrelated temp-like file, and on
+  Unix a symlink plus its external target bytes.
+
+### Focused verification before the final terminal gate
+
+Every Cargo batch below was preceded by
+`bash scripts/check-workspace-versions.sh`, and every Cargo command used
+`--locked`:
+
+- Publisher integration: 14 passed, 0 failed; store unit tests: 66 passed, 0
+  failed, including the exhaustive transition validator and both fault
+  matrices.
+- Lease integration: 12 passed, 0 failed; classifier integration: 20 passed, 0
+  failed.
+- `cargo check -p codegraph-store --all-targets --locked`: clean.
+- `cargo clippy -p codegraph-store --all-targets --locked -- -D warnings`:
+  clean.
+- `LIBSQLITE3_SYS_USE_PKG_CONFIG=1 SQLITE3_LIB_DIR=/tmp/opencode cargo check -p
+codegraph-store --target x86_64-pc-windows-msvc --all-targets --locked`:
+  clean. This is Linux-host cross-compilation only, not native Windows runtime
+  or crash evidence.
+- LSP again rejected the external `/tmp` worktree as outside its request cwd;
+  the clean targeted Cargo diagnostics are the accepted fallback.
+
+Two earlier terminal failures remain recorded honestly. The first publisher
+gate failed in the unrelated timing-sensitive
+`daemon_single_watcher_fires_once` test (`0 file(s) reindexed`). A later parent
+retry failed in the unrelated MCP tools-list expectation: expected 4 tools but
+observed 2. Neither failure is represented as Green or weakened. After these
+final ledger/notepad bytes, the mandatory closing order is `make fmt`, then one
+fresh `bash scripts/check-workspace-versions.sh && make ci`, then the exact
+`Cargo.lock` SHA-256 check and scoped status/diff inspection. No final Green is
+claimed in this entry before that post-documentation gate actually passes.

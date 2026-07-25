@@ -16,8 +16,10 @@
 //!   database, a sidecar, or the tombstone);
 //! - it never opens SQLite, so it cannot run schema setup, migrations, WAL
 //!   changes, or `ANALYZE`;
-//! - it exposes NO state-slot publication API. State publication, `IndexLease`,
-//!   `Store::open_for_read` / `open_for_status` / `open_for_write`,
+//! - publication lives in the separate `index_state_publisher` module and
+//!   consumes this classifier without weakening its aggregate ordering. This
+//!   classifier itself remains strictly read-only;
+//! - `Store::open_for_read` / `open_for_status` / `open_for_write`,
 //!   `Store::stamp_extraction_version`, DB-stamp corroboration, migration mode,
 //!   uninit lifecycle, and the daemon/watcher lifecycle all land in LATER Batch M
 //!   slices and are NOT implemented here.
@@ -29,8 +31,8 @@
 //! this classifier.
 //!
 //! [`checksum_hex`] and [`canonical_checksum_payload`] are pure functions (no
-//! I/O); they define the byte representation a future publisher must reproduce,
-//! and the tests use them to author fixture slots.
+//! I/O); they define the byte representation the publisher reproduces, and the
+//! tests use them to author protocol fixtures.
 //!
 //! # Persisted slot contract
 //!
