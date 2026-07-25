@@ -90,17 +90,31 @@ struct Run {
 }
 
 fn run_in(registry_dir: &Path, args: &[&str]) -> Run {
-    let output = Command::new(bin())
-        .args(args)
+    run_in_env(registry_dir, args, &[])
+}
+
+fn run_in_env(registry_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Run {
+    let mut cmd = Command::new(bin());
+    cmd.args(args)
         .env("CODEGRAPH_HTTP_REGISTRY_DIR", registry_dir)
-        .env("CODEGRAPH_NO_DAEMON", "1")
-        .output()
-        .expect("run codegraph binary");
+        .env("CODEGRAPH_NO_DAEMON", "1");
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let output = cmd.output().expect("run codegraph binary");
     Run {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         ok: output.status.success(),
     }
+}
+
+fn indexed_names(project: &Path) -> Vec<String> {
+    std::fs::read_dir(project)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect()
 }
 
 /// Initial Batch M black-box Red: `init` must build the index in the isolated
@@ -172,5 +186,129 @@ fn init_writes_isolated_v2_namespace_not_legacy_codegraph() {
         "Batch M: a new binary must not write the legacy namespace at {}; \
          the fixed legacy `.codegraph` root is read-only to new binaries",
         legacy_db.display()
+    );
+}
+
+/// The v2 current root for a relative `CODEGRAPH_DIR` must be the fail-closed
+/// `IndexPaths::resolve` identity-suffixed SIBLING `<name>-v2-<projectIdentity>`
+/// through the REAL CLI, never the old `<project>/<value>` simple-join. Proven
+/// by `status --json`'s `indexPath` and the on-disk DB placement after `init`.
+#[test]
+fn configured_relative_root_uses_identity_suffixed_sibling_via_cli() {
+    let dir = TestDir::new("cfg-rel");
+    let project = dir.path().join("mini");
+    copy_tree(&mini_fixture(), &project);
+    let p = project.to_str().unwrap();
+
+    let run = run_in_env(dir.path(), &["init", p], &[("CODEGRAPH_DIR", "cache")]);
+    assert!(run.ok, "init must succeed: {} {}", run.stdout, run.stderr);
+
+    let names = indexed_names(&project);
+    // The simple-join `<project>/cache/codegraph.db` MUST NOT exist.
+    assert!(
+        !project.join("cache").join("codegraph.db").is_file(),
+        "configured root must NOT use the old simple-join `cache/`: dir={names:?}"
+    );
+    // Exactly one identity-suffixed sibling `cache-v2-<64hex>` holds the DB.
+    let sibling = names
+        .iter()
+        .find(|n| n.starts_with("cache-v2-"))
+        .unwrap_or_else(|| panic!("expected a `cache-v2-<identity>` sibling, got {names:?}"));
+    assert_eq!(
+        sibling.len(),
+        "cache-v2-".len() + 64,
+        "sibling must carry a full 64-hex projectIdentity: {sibling}"
+    );
+    assert!(
+        project.join(sibling).join("codegraph.db").is_file(),
+        "the identity-suffixed sibling must hold the DB: {names:?}"
+    );
+
+    let status = run_in_env(
+        dir.path(),
+        &["status", "--json", p],
+        &[("CODEGRAPH_DIR", "cache")],
+    );
+    assert!(status.ok, "status must succeed: {}", status.stderr);
+    assert!(
+        status.stdout.contains(sibling.as_str()),
+        "status indexPath must name the identity sibling {sibling}: {}",
+        status.stdout
+    );
+}
+
+/// Two DISTINCT physical projects given the SAME absolute `CODEGRAPH_DIR` must
+/// receive DISTINCT identity-suffixed current roots through the REAL CLI, so one
+/// project can never open the other's index.
+#[test]
+fn two_projects_sharing_absolute_configured_root_get_distinct_roots_via_cli() {
+    let dir = TestDir::new("cfg-abs");
+    let project_a = dir.path().join("a/mini");
+    let project_b = dir.path().join("b/mini");
+    copy_tree(&mini_fixture(), &project_a);
+    copy_tree(&mini_fixture(), &project_b);
+    let shared = dir.path().join("shared/cg");
+    std::fs::create_dir_all(dir.path().join("shared")).unwrap();
+    let shared_str = shared.to_str().unwrap();
+
+    let ra = run_in_env(
+        dir.path(),
+        &["init", project_a.to_str().unwrap()],
+        &[("CODEGRAPH_DIR", shared_str)],
+    );
+    assert!(ra.ok, "init a must succeed: {} {}", ra.stdout, ra.stderr);
+    let rb = run_in_env(
+        dir.path(),
+        &["init", project_b.to_str().unwrap()],
+        &[("CODEGRAPH_DIR", shared_str)],
+    );
+    assert!(rb.ok, "init b must succeed: {} {}", rb.stdout, rb.stderr);
+
+    let parent = dir.path().join("shared");
+    let siblings: Vec<String> = std::fs::read_dir(&parent)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("cg-v2-"))
+        .collect();
+    assert_eq!(
+        siblings.len(),
+        2,
+        "two projects must produce two distinct identity siblings, got {siblings:?}"
+    );
+    assert_ne!(
+        siblings[0], siblings[1],
+        "the two current roots must differ"
+    );
+    // The shared simple-join `shared/cg/codegraph.db` must never exist.
+    assert!(
+        !shared.join("codegraph.db").is_file(),
+        "configured absolute root must NOT collapse two projects onto one simple-join DB"
+    );
+}
+
+/// A `CODEGRAPH_DIR` that aliases the project root (`.`) must fail closed
+/// through the REAL CLI, creating NO `<project>/codegraph.db` and NO legacy
+/// mutation — the fail-closed `resolve` contract, not the old simple-join.
+#[test]
+fn configured_dot_alias_fails_closed_without_mutation_via_cli() {
+    let dir = TestDir::new("cfg-dot");
+    let project = dir.path().join("mini");
+    copy_tree(&mini_fixture(), &project);
+    let p = project.to_str().unwrap();
+
+    let run = run_in_env(dir.path(), &["init", p], &[("CODEGRAPH_DIR", ".")]);
+    assert!(
+        !run.ok,
+        "init with CODEGRAPH_DIR=. must fail closed: stdout={} stderr={}",
+        run.stdout, run.stderr
+    );
+    assert!(
+        !project.join("codegraph.db").is_file(),
+        "a `.` alias must not write `<project>/codegraph.db`"
+    );
+    assert!(
+        !project.join(".codegraph").join("codegraph.db").is_file(),
+        "a `.` alias must not mutate the legacy namespace"
     );
 }

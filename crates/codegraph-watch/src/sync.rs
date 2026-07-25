@@ -50,7 +50,7 @@ pub fn sync_project_once_with_progress(
     let started = std::time::Instant::now();
     let mut candidates = codegraph_extract::engine::scan_project(project_root, &options)?;
 
-    let db_path = default_db_path(project_root);
+    let db_path = default_db_path(project_root)?;
     let mut store = Store::open(&db_path).with_context(|| format!("open {}", db_path.display()))?;
 
     // Cold CLI sync has no watcher event list, so deletions are found by diffing
@@ -297,14 +297,12 @@ fn sweep_orphaned_refs(project_root: &Path, store: &mut Store) -> Result<()> {
 /// (`RESOLVE_BATCH_ROWS`) so a healed index is byte-equal to `index --force`.
 const ORPHAN_SWEEP_BATCH_ROWS: usize = 5_000;
 
-pub(crate) fn default_db_path(project_root: &Path) -> PathBuf {
-    // Route through the single `codegraph-core::IndexPaths` path authority
-    // (Batch M) so watcher sync writes the same v2 namespace `codegraph init`
-    // and MCP reads (`.codegraph-v2/codegraph.db` by default).
-    codegraph_core::IndexPaths::current_db_lenient(
+pub(crate) fn default_db_path(project_root: &Path) -> Result<PathBuf> {
+    Ok(codegraph_core::IndexPaths::resolve(
         project_root,
         std::env::var("CODEGRAPH_DIR").ok().as_deref(),
-    )
+    )?
+    .current_db())
 }
 
 fn sync_one(
@@ -506,7 +504,7 @@ pub(crate) mod tests {
             "export function answer() { return 42; }\n",
         )
         .unwrap();
-        let db = default_db_path(dir.path());
+        let db = default_db_path(dir.path()).unwrap();
 
         let first = sync_changed_paths(dir.path(), &db, ["src/app.ts"]).unwrap();
         assert_eq!(first.files_reindexed, 1);
@@ -535,7 +533,7 @@ pub(crate) mod tests {
             "export function alpha() { return 2; }\n",
         )
         .unwrap();
-        let db = default_db_path(dir.path());
+        let db = default_db_path(dir.path()).unwrap();
 
         // When: a sync processes them in reverse-sorted input order.
         let first = sync_changed_paths(dir.path(), &db, ["src/zeta.ts", "src/alpha.ts"]).unwrap();
@@ -572,7 +570,7 @@ pub(crate) mod tests {
             "export function answer() { return 42; }\n",
         )
         .unwrap();
-        let db = default_db_path(dir.path());
+        let db = default_db_path(dir.path()).unwrap();
         let _ = sync_changed_paths(dir.path(), &db, ["src/app.ts"]).unwrap();
 
         // When: a sync re-checks the same unchanged file.
@@ -600,7 +598,7 @@ pub(crate) mod tests {
             "export const x = 1;\n",
         )
         .unwrap();
-        let db = default_db_path(dir.path());
+        let db = default_db_path(dir.path()).unwrap();
 
         // When: the input mixes an escaping path (ignored via normalize),
         // a node_modules path (ignored via policy), a non-source file
@@ -637,7 +635,7 @@ pub(crate) mod tests {
         fs::create_dir_all(dir.path().join("src")).unwrap();
         let file = dir.path().join("src/app.ts");
         fs::write(&file, "export function answer() { return 42; }\n").unwrap();
-        let db = default_db_path(dir.path());
+        let db = default_db_path(dir.path()).unwrap();
         let first = sync_changed_paths(dir.path(), &db, ["src/app.ts"]).unwrap();
         assert_eq!(first.files_reindexed, 1);
 
@@ -671,7 +669,7 @@ pub(crate) mod tests {
             "import { help } from './helper';\nexport function use() { return help(); }\n",
         )
         .unwrap();
-        let db = default_db_path(dir.path());
+        let db = default_db_path(dir.path()).unwrap();
         sync_changed_paths(dir.path(), &db, ["src/helper.ts", "src/consumer.ts"]).unwrap();
 
         // When: only the helper changes (adds a symbol) and is re-synced alone,
@@ -718,7 +716,7 @@ pub(crate) mod tests {
             "extends Node\n\nfunc _ready() -> void:\n\tvar button := Button.new()\n\tbutton.pressed.connect(_on_pressed.bind(button))\n\nfunc _goto_map() -> void:\n\tGameFlow.return_to_map()\n\nfunc _on_pressed(source) -> void:\n\tpass\n",
         )
         .unwrap();
-        let db = default_db_path(dir.path());
+        let db = default_db_path(dir.path()).unwrap();
         sync_project_once(dir.path()).unwrap();
 
         let baseline = {
@@ -823,7 +821,7 @@ pub(crate) mod tests {
             "export function answer() { return 42; }\n",
         )
         .unwrap();
-        let db = default_db_path(dir.path());
+        let db = default_db_path(dir.path()).unwrap();
         sync_changed_paths(dir.path(), &db, ["src/app.ts"]).unwrap();
 
         // When: the stored node names for that file are queried.
@@ -856,7 +854,7 @@ pub(crate) mod tests {
             "import { add } from './math';\nexport function run(): number { return add(1, 2); }\n",
         )
         .unwrap();
-        let db = default_db_path(dir.path());
+        let db = default_db_path(dir.path()).unwrap();
 
         // Index both files so nodes exist, then simulate the interruption by
         // deleting the resolved Calls edge, re-parking its unresolved ref, and
@@ -923,7 +921,7 @@ pub(crate) mod tests {
             "export function run(): void { externalMissing(); }\n",
         )
         .unwrap();
-        let db = default_db_path(dir.path());
+        let db = default_db_path(dir.path()).unwrap();
         sync_changed_paths(dir.path(), &db, ["src/app.ts"]).unwrap();
 
         // When: a bare no-change sync runs.
@@ -988,7 +986,7 @@ pub(crate) mod tests {
                     .changed_paths
                     .contains(&"Tools/helper.ts".to_string())
             );
-            let store = Store::open(&default_db_path(dir.path())).unwrap();
+            let store = Store::open(&default_db_path(dir.path()).unwrap()).unwrap();
             assert!(
                 store.file_by_path("Tools/helper.ts").unwrap().is_some(),
                 "gitignored Tools/ named in include must be indexed on sync"
@@ -1009,7 +1007,7 @@ pub(crate) mod tests {
             "export function help() { return 1; }\n",
         )
         .unwrap();
-        let db = default_db_path(dir.path());
+        let db = default_db_path(dir.path()).unwrap();
 
         // Without include: the gitignored file is ignored by the policy gate.
         let plain = sync_changed_paths(dir.path(), &db, ["Tools/helper.ts"]).unwrap();
@@ -1049,7 +1047,7 @@ pub(crate) mod tests {
             "import { help } from './helper';\nexport function use() { return help(); }\n",
         )
         .unwrap();
-        let db = default_db_path(dir.path());
+        let db = default_db_path(dir.path()).unwrap();
         sync_changed_paths(dir.path(), &db, ["src/helper.ts", "src/consumer.ts"]).unwrap();
 
         // When: the helper is deleted and re-synced, driving the delete branch

@@ -209,41 +209,39 @@ impl IndexPaths {
         })
     }
 
-    /// Infallible transitional current-root resolver for the data plane.
-    ///
-    /// [`IndexPaths::resolve`] is the fail-closed authority, but it canonicalizes
-    /// and therefore REQUIRES the project to already exist — CLI helpers such as
-    /// `status` on a not-yet-initialized directory must stay infallible. This
-    /// helper centralizes the default-root literal so no consumer reconstructs
-    /// `.codegraph-v2`:
-    ///
-    /// - No / empty `CODEGRAPH_DIR` → `<project>/.codegraph-v2` (the isolated v2
-    ///   default; this is the placement the Batch M black-box Red asserts).
-    /// - `CODEGRAPH_DIR=<value>` → `<project>/<value>` (the pre-v0.40.4 simple
-    ///   join, preserved byte-for-byte). The plan's identity-suffixed sibling for
-    ///   a configured root is fully implemented and tested in [`resolve`]; wiring
-    ///   that richer form into the infallible data-plane helpers is a later Batch
-    ///   M consumer task, so this slice keeps the configured-root override at its
-    ///   existing semantics rather than half-implementing the sibling here.
-    pub fn current_root_lenient(project: &Path, codegraph_dir: Option<&str>) -> PathBuf {
-        match codegraph_dir.filter(|value| !value.is_empty()) {
-            Some(value) => project.join(value),
-            None => project.join(DEFAULT_CURRENT_DIR),
+    /// Exact reserved index-root child-directory names the scanner/watcher must
+    /// exclude for `project`: the resolved physical root set (fixed + configured
+    /// legacy roots and the current root) reduced to basenames that are direct
+    /// children of the canonical project, always including the fixed
+    /// `.codegraph`. Exact names only — never a `.codegraph-*` prefix, so a user
+    /// `.codegraph-sources` stays scannable. On a `resolve` failure it degrades
+    /// to the safe fixed-legacy + default-current names rather than
+    /// reconstructing a configured-root path; the fail-closed DB contract is
+    /// enforced separately at the CLI/MCP/watch boundary by [`IndexPaths::resolve`].
+    pub fn reserved_child_dir_names(
+        project: &Path,
+        codegraph_dir: Option<&str>,
+    ) -> std::collections::BTreeSet<String> {
+        let mut names = std::collections::BTreeSet::new();
+        names.insert(LEGACY_DIR.to_string());
+        match Self::resolve(project, codegraph_dir) {
+            Ok(paths) => {
+                let canonical_project = paths.project();
+                let mut roots = paths.legacy_roots().to_vec();
+                roots.push(paths.current_root().to_path_buf());
+                for root in roots {
+                    if root.parent() == Some(canonical_project)
+                        && let Some(name) = root.file_name()
+                    {
+                        names.insert(name.to_string_lossy().into_owned());
+                    }
+                }
+            }
+            Err(_) => {
+                names.insert(DEFAULT_CURRENT_DIR.to_string());
+            }
         }
-    }
-
-    /// `<current_root_lenient>/codegraph.db` — the infallible transitional DB
-    /// path used by the data plane (CLI, MCP, watch) in this slice.
-    pub fn current_db_lenient(project: &Path, codegraph_dir: Option<&str>) -> PathBuf {
-        Self::current_root_lenient(project, codegraph_dir).join("codegraph.db")
-    }
-
-    /// Whether a directory basename is a reserved CodeGraph index root that the
-    /// scanner/watcher must never descend into: the fixed legacy `.codegraph`
-    /// and any `.codegraph-*` sibling (including the `.codegraph-v2` default).
-    /// Mirrors the watcher policy's existing `.codegraph-` prefix exclusion.
-    pub fn is_reserved_index_dir(name: &str) -> bool {
-        name == LEGACY_DIR || name.starts_with(".codegraph-")
+        names
     }
 
     /// Canonical project root.
@@ -288,13 +286,6 @@ impl IndexPaths {
             self.current_root.join("index-state.0.json"),
             self.current_root.join("index-state.1.json"),
         ]
-    }
-
-    /// A single fixed state slot by index (0 or 1); indices other than 0/1 are
-    /// clamped into range so callers cannot address a nonexistent slot.
-    pub fn state_slot(&self, slot: usize) -> PathBuf {
-        let [zero, one] = self.state_slots();
-        if slot.is_multiple_of(2) { zero } else { one }
     }
 
     /// `<current_root>/uninitialized` — the interrupted-uninit tombstone marker.
@@ -392,11 +383,27 @@ fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Whether `path` currently exists AND is a symlink / reparse point.
+/// Whether `path` currently exists AND is a symlink or reparse point.
+///
+/// On Windows `FileType::is_symlink` misses directory junctions and other
+/// reparse points, so the raw `FILE_ATTRIBUTE_REPARSE_POINT` attribute bit is
+/// checked as well; those are the alias forms an index root must refuse.
 fn is_symlink(path: &Path) -> bool {
-    path.symlink_metadata()
-        .map(|meta| meta.file_type().is_symlink())
-        .unwrap_or(false)
+    let Ok(meta) = path.symlink_metadata() else {
+        return false;
+    };
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    false
 }
 
 /// Physically normalize an index root: reject empty/root aliases, reject any
@@ -612,18 +619,18 @@ mod windows_identity {
                 core::mem::size_of::<FileIdInfo>() as u32,
             )
         };
+        // Capture the query's OS error BEFORE CloseHandle, which itself sets the
+        // thread-local last-error and would otherwise mask the real failure.
+        let query_err = (ok == 0).then(std::io::Error::last_os_error);
         // SAFETY: close the handle exactly once regardless of the query result.
         unsafe {
             CloseHandle(handle);
         }
 
-        if ok == 0 {
+        if let Some(err) = query_err {
             return Err(IndexPathsError::UnsupportedFilesystem {
                 path: path.to_path_buf(),
-                detail: format!(
-                    "GetFileInformationByHandleEx(FileIdInfo) failed: {}",
-                    std::io::Error::last_os_error()
-                ),
+                detail: format!("GetFileInformationByHandleEx(FileIdInfo) failed: {err}"),
             });
         }
         Ok((info.volume_serial_number, info.file_id))
@@ -692,11 +699,6 @@ mod tests {
                 root.join("index-state.1.json"),
             ]
         );
-        assert_eq!(paths.state_slot(0), root.join("index-state.0.json"));
-        assert_eq!(paths.state_slot(1), root.join("index-state.1.json"));
-        // Out-of-range slot indices clamp into [0, 1] rather than panicking.
-        assert_eq!(paths.state_slot(2), root.join("index-state.0.json"));
-        assert_eq!(paths.state_slot(3), root.join("index-state.1.json"));
         assert_eq!(paths.tombstone(), root.join("uninitialized"));
         assert_eq!(paths.config_toml(), root.join("config.toml"));
         assert_eq!(paths.extension_config(), root.join("codegraph.json"));
@@ -946,43 +948,43 @@ mod tests {
     }
 
     #[test]
-    fn current_root_lenient_defaults_to_codegraph_v2() {
-        let project = Path::new("/proj");
-        assert_eq!(
-            IndexPaths::current_root_lenient(project, None),
-            PathBuf::from("/proj/.codegraph-v2")
-        );
-        assert_eq!(
-            IndexPaths::current_db_lenient(project, None),
-            PathBuf::from("/proj/.codegraph-v2/codegraph.db")
-        );
-        // Empty override is treated as unset.
-        assert_eq!(
-            IndexPaths::current_root_lenient(project, Some("")),
-            PathBuf::from("/proj/.codegraph-v2")
-        );
+    fn reserved_child_names_default_are_exactly_legacy_and_v2() {
+        let project = temp_dir("reserved-default");
+        let names = IndexPaths::reserved_child_dir_names(&project, None);
+        assert!(names.contains(".codegraph"));
+        assert!(names.contains(".codegraph-v2"));
+        // A user source directory sharing the `.codegraph-` prefix is NOT
+        // reserved and must remain scannable.
+        assert!(!names.contains(".codegraph-sources"));
+        let _ = std::fs::remove_dir_all(&project);
     }
 
     #[test]
-    fn current_root_lenient_honors_codegraph_dir_override() {
-        let project = Path::new("/proj");
-        assert_eq!(
-            IndexPaths::current_root_lenient(project, Some("custom")),
-            PathBuf::from("/proj/custom")
+    fn reserved_child_names_include_relative_configured_sibling() {
+        let project = temp_dir("reserved-configured");
+        let names = IndexPaths::reserved_child_dir_names(&project, Some("cache"));
+        let identity = IndexPaths::resolve(&project, Some("cache"))
+            .unwrap()
+            .project_identity()
+            .to_string();
+        assert!(names.contains(".codegraph"), "{names:?}");
+        assert!(names.contains("cache"), "configured legacy root: {names:?}");
+        assert!(
+            names.contains(&format!("cache-v2-{identity}")),
+            "configured current sibling: {names:?}"
         );
-        assert_eq!(
-            IndexPaths::current_db_lenient(project, Some("custom")),
-            PathBuf::from("/proj/custom/codegraph.db")
-        );
+        assert!(!names.contains(".codegraph-sources"));
+        let _ = std::fs::remove_dir_all(&project);
     }
 
     #[test]
-    fn reserved_index_dir_matches_legacy_and_v2_siblings() {
-        assert!(IndexPaths::is_reserved_index_dir(".codegraph"));
-        assert!(IndexPaths::is_reserved_index_dir(".codegraph-v2"));
-        assert!(IndexPaths::is_reserved_index_dir(".codegraph-daemon"));
-        assert!(!IndexPaths::is_reserved_index_dir("src"));
-        assert!(!IndexPaths::is_reserved_index_dir(".codegraphx"));
-        assert!(!IndexPaths::is_reserved_index_dir(".git"));
+    fn reserved_child_names_degrade_to_defaults_on_invalid_configured_root() {
+        let project = temp_dir("reserved-invalid");
+        // `.` resolves to the project root itself — an invalid alias. Name
+        // derivation must degrade to the safe defaults, never error.
+        let names = IndexPaths::reserved_child_dir_names(&project, Some("."));
+        assert!(names.contains(".codegraph"));
+        assert!(names.contains(".codegraph-v2"));
+        let _ = std::fs::remove_dir_all(&project);
     }
 }

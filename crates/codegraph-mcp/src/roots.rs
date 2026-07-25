@@ -32,15 +32,23 @@ pub fn format_tool_debug_line(
     )
 }
 
-/// The current (v2) index DB path under a project root
-/// (`<project_path>/.codegraph-v2/codegraph.db` by default; `CODEGRAPH_DIR`
-/// override honored). Routed through the single `codegraph-core::IndexPaths`
-/// path authority (Batch M) so project resolution and the served DB agree.
+/// The current (v2) index DB path under a project root, resolved fail-closed
+/// through the single `codegraph-core::IndexPaths` authority so it agrees with
+/// [`crate::CodeGraphEngine::open`]. This is an EXISTENCE-probe helper (callers
+/// do `db_path_for(p).is_file()`), so an unsafe/aliased configured root degrades
+/// to the safe `.codegraph-v2` default whose file simply will not exist — it
+/// NEVER reconstructs a configured-root path that could shadow another project.
+/// The authoritative fail-closed rejection happens in `CodeGraphEngine::open`.
 pub fn db_path_for(project_path: &Path) -> PathBuf {
-    codegraph_core::IndexPaths::current_db_lenient(
+    match codegraph_core::IndexPaths::resolve(
         project_path,
         std::env::var("CODEGRAPH_DIR").ok().as_deref(),
-    )
+    ) {
+        Ok(paths) => paths.current_db(),
+        Err(_) => project_path
+            .join(codegraph_core::index_paths::DEFAULT_CURRENT_DIR)
+            .join("codegraph.db"),
+    }
 }
 
 pub struct WorkspaceRoots {

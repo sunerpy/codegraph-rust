@@ -61,10 +61,19 @@ pub fn spawn_detached_daemon(exe: &Path, root: &Path, no_watch: bool) -> Result<
 }
 
 fn log_target(root: &Path) -> Stdio {
+    let path = daemon_log_path(root);
+    // The rendezvous dir (`.codegraph`) is created by the daemon's lock layer in
+    // the CHILD, but this log redirect is set up in the PARENT before spawn. The
+    // current index namespace is the sibling `.codegraph-v2`, so `.codegraph`
+    // may not exist yet — create the log's parent here so the redirect lands in
+    // a file instead of silently falling back to a null sink.
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     OpenOptions::new()
         .create(true)
         .append(true)
-        .open(daemon_log_path(root))
+        .open(path)
         .map_or_else(|_| Stdio::null(), Stdio::from)
 }
 

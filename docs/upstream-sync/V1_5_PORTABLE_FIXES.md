@@ -421,3 +421,100 @@ proxy_e2e, live_update_direct, stdout_purity, rmcp_serve_direct, both `explore`
 CLI tests, prompt_hook, catch_up;
 `codegraph-daemon` rmcp_tools_call/async_model; `codegraph-bench` (golden oracle,
 byte-stability) all pass. No plan-level architecture change was required.
+
+## Batch M — path-authority correction: close the transitional bypass (2026-07-25)
+
+### Why this follow-up exists
+
+Manual verification of the prior two commits (`b5a66f2` + `8aeefc4`) REJECTED
+the transitional `current_root_lenient`/`current_db_lenient` bypass: for a
+configured `CODEGRAPH_DIR` those helpers did a raw `project.join(value)`
+simple-join, bypassing `IndexPaths::resolve`'s physical identity, alias
+validation, legacy disjointness, and the identity-suffixed sibling. That let
+`CODEGRAPH_DIR=.` select the project root and write `<project>/codegraph.db`,
+directly contradicting the frozen configured-root contract (plan lines 246-287,
+330-338). The earlier ledger's implication that the configured-root override was
+merely "deferred" was wrong; this commit CLOSES the bypass. Four correctness
+defects are fixed together.
+
+### Fixes
+
+1. **Production data plane now consumes fail-closed `IndexPaths::resolve`.**
+   Deleted `current_root_lenient`/`current_db_lenient`. CLI `codegraph_dir`/
+   `db_path` (main.rs) are now `Result`-returning wrappers over a new
+   `index_paths()` = `IndexPaths::resolve(project, CODEGRAPH_DIR)`; every
+   mutating/opening call site threads `?`. `codegraph-mcp`
+   `CodeGraphEngine::open` resolves fail-closed before `Store::open`.
+   `codegraph-watch` `default_db_path` returns `Result` and resolves fail-closed.
+   Consequently `CODEGRAPH_DIR=.`/`..`/root/overlap/symlink alias errors BEFORE
+   any root/DB creation and never mutates the legacy namespace; a configured
+   relative or absolute root gets the identity-suffixed sibling
+   `<name>-v2-<projectIdentity>` through the REAL CLI and MCP paths, and two
+   projects sharing one configured root get distinct roots. New black-box CLI
+   regressions in `batch_m_v2_namespace.rs` prove all three via `init` +
+   `status --json` on-disk placement.
+   - Deliberate non-fail-closed exceptions, both existence-probes that must stay
+     infallible and cannot open a wrong DB: CLI `is_initialized` (a `resolve`
+     failure ⇒ "not initialized", so discovery keeps walking; the mutating paths
+     re-resolve fail-closed before touching disk) and `status` (reports the safe
+     `.codegraph-v2` default when a configured root is unresolvable, so status
+     still answers). `codegraph-mcp` `roots::db_path_for` is likewise an
+     `is_file()` probe: on a `resolve` failure it degrades to the default whose
+     file simply won't exist, NEVER a reconstructed configured-root path that
+     could shadow another project — the authoritative rejection is in
+     `CodeGraphEngine::open`.
+
+2. **Scanner excludes only the EXACT resolved physical root set.** Deleted the
+   over-broad `is_reserved_index_dir(name.starts_with(".codegraph-"))`. New
+   `IndexPaths::reserved_child_dir_names(project, CODEGRAPH_DIR)` returns the
+   exact child-directory names of the resolved fixed/configured legacy roots and
+   current root (always including `.codegraph`); `scan_dir` excludes those names
+   ONLY as direct children of the project root. A user `.codegraph-sources/`
+   directory is now indexed; `.codegraph` and the resolved `.codegraph-v2` are
+   excluded. Proven by `scan_keeps_user_codegraph_prefixed_dir_but_excludes_reserved_roots`.
+
+3. **Windows reparse-point detection.** `is_symlink` now also checks the raw
+   `FILE_ATTRIBUTE_REPARSE_POINT` attribute bit under `cfg(windows)` (directory
+   junctions are not caught by `FileType::is_symlink`). Verified compilable via
+   `cargo check -p codegraph-core --target x86_64-pc-windows-msvc --all-targets
+--locked` (both windows targets are installed on this host; this is a
+   cross-compile check, NOT native Windows runtime validation).
+
+4. **FFI last-error ordering.** In the Windows `GetFileInformationByHandleEx`
+   path the query's `std::io::Error::last_os_error()` is now captured BEFORE
+   `CloseHandle`, which itself sets the thread-local last-error and would
+   otherwise mask the real failure diagnostic.
+
+5. **Removed the `state_slot(usize)` modulo alias.** It documented "clamp" but
+   implemented `is_multiple_of(2)` parity, silently aliasing `state_slot(2)` to
+   slot 0. It is not needed by this slice; `state_slots() -> [PathBuf; 2]` is the
+   exact contract. Dropped the API and its test.
+
+Also fixed a consequential parent-dir bug surfaced by moving init off
+`.codegraph`: the detached daemon's `log_target` (parent-side, pre-spawn) now
+creates the `.codegraph` rendezvous parent before opening `daemon.log`, since
+the current index namespace is the sibling `.codegraph-v2` and `.codegraph` may
+not exist yet (the child's lock layer creates it, but too late for the parent's
+stdout/stderr redirect). Daemon rendezvous stays under `.codegraph` by design.
+
+### Correction to the prior ledger entry
+
+The previous entry's "Remaining Batch M path consumers" bullet claiming the data
+plane "uses `current_root_lenient` (simple join for a configured `CODEGRAPH_DIR`)
+in this slice" is SUPERSEDED: that bypass is deleted. The data plane now honors
+the configured-root fail-closed contract in full. Still legitimately unchanged
+(NOT the DB data plane): daemon rendezvous paths, `Config::discover`,
+`ext_config`/`godot_dsl_config` ancestor `codegraph.json` walk, and the
+`codegraph-bench` legacy oracle — these remain later Batch M tasks.
+
+### Verification
+
+`bash scripts/check-workspace-versions.sh` (OK, lock `750ee84b…` unchanged);
+`cargo check --workspace --all-targets --locked` clean;
+`cargo check -p codegraph-core --target x86_64-pc-windows-msvc --all-targets --locked` clean;
+`cargo clippy` across all touched crates `-D warnings` clean;
+`cargo fmt --all --check` clean; `bash scripts/guardrail.sh` exit 0;
+`cargo test --workspace --locked` — 0 failures (incl. the preserved initial
+black-box Red, the new configured-root + `.` alias + scanner regressions, and
+`codegraph-bench` golden byte-stability). No plan-level architecture change was
+required.

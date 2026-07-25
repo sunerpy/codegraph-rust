@@ -68,16 +68,17 @@ pub struct CodeGraphEngine {
 }
 
 impl CodeGraphEngine {
-    /// Open the store at the project's current (v2) index DB
-    /// (`<project_root>/.codegraph-v2/codegraph.db` by default; `CODEGRAPH_DIR`
-    /// override honored). Routed through the single `codegraph-core::IndexPaths`
-    /// path authority (Batch M) so the MCP request path reads the same namespace
-    /// `codegraph init` writes.
+    /// Open the store at the project's current (v2) index DB, resolved
+    /// fail-closed through the single `codegraph-core::IndexPaths` authority
+    /// (`.codegraph-v2/codegraph.db` by default; a `<name>-v2-<projectIdentity>`
+    /// sibling for a configured `CODEGRAPH_DIR`). An unsafe/aliased/overlapping
+    /// configured root errors here rather than opening a reconstructed path.
     pub fn open(project_root: &Path) -> anyhow::Result<Self> {
-        let db_path = codegraph_core::IndexPaths::current_db_lenient(
+        let db_path = codegraph_core::IndexPaths::resolve(
             project_root,
             std::env::var("CODEGRAPH_DIR").ok().as_deref(),
-        );
+        )?
+        .current_db();
         let store = Store::open(&db_path)?;
         Ok(Self {
             store,

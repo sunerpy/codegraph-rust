@@ -1161,8 +1161,9 @@ fn cmd_init(path: Option<PathBuf>, target: &str) -> Result<()> {
         return installer::run_install_local_targets(project, target);
     }
     guard_indexable_root(&project)?;
-    fs::create_dir_all(codegraph_dir(&project))
-        .with_context(|| format!("creating {}", codegraph_dir(&project).display()))?;
+    let index_root = codegraph_dir(&project)?;
+    fs::create_dir_all(&index_root)
+        .with_context(|| format!("creating {}", index_root.display()))?;
     let result = index_project(&project, true, false)?;
     println!("Initialized in {}", project.display());
     print_index_result(&result);
@@ -1174,8 +1175,9 @@ fn cmd_uninit(path: Option<PathBuf>, force: bool) -> Result<()> {
     if !force {
         bail!("refusing to delete .codegraph without --force");
     }
-    fs::remove_dir_all(codegraph_dir(&project))
-        .with_context(|| format!("removing {}", codegraph_dir(&project).display()))?;
+    let index_root = codegraph_dir(&project)?;
+    fs::remove_dir_all(&index_root)
+        .with_context(|| format!("removing {}", index_root.display()))?;
     println!("Removed CodeGraph from {}", project.display());
     Ok(())
 }
@@ -1233,7 +1235,18 @@ fn cmd_sync(path: Option<PathBuf>, quiet: bool) -> Result<()> {
 fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
     let start = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
     let project = resolve_project_path_optional(&start);
-    let db = db_path(&project);
+    // Status inspects an existing project; a resolvable index root reports its
+    // real paths, an unresolvable/aliased configured root reports the safe
+    // default so status still answers instead of erroring.
+    let resolved = index_paths(&project).ok();
+    let index_root = resolved
+        .as_ref()
+        .map(|p| p.current_root().to_path_buf())
+        .unwrap_or_else(|| project.join(".codegraph-v2"));
+    let db = resolved
+        .as_ref()
+        .map(|p| p.current_db())
+        .unwrap_or_else(|| index_root.join("codegraph.db"));
     let db_exists = db.is_file();
     let daemon_running = daemon_already_running(&project);
     let daemon_pid_path = codegraph_daemon::daemon_pid_path(&project);
@@ -1245,7 +1258,7 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
                 "initialized": false,
                 "version": VERSION,
                 "projectPath": project,
-                "indexPath": codegraph_dir(&project),
+                "indexPath": index_root,
                 "lastIndexed": null,
                 "dbPath": db,
                 "dbExists": db_exists,
@@ -1272,9 +1285,7 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
     let counts = store.counts()?;
     let nodes_by_kind = store.node_counts_by_kind()?;
     let files_by_language = store.file_counts_by_language()?;
-    let db_size = fs::metadata(db_path(&project))
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let db_size = fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
     let last_indexed = latest_indexed_at(&store)?;
     let built_with_version = store.get_project_metadata("indexed_with_version")?;
     let built_with_extraction_version = store
@@ -1300,7 +1311,7 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
             "initialized": true,
             "version": VERSION,
             "projectPath": project,
-            "indexPath": codegraph_dir(&project),
+            "indexPath": index_root,
             "lastIndexed": last_indexed.map(iso_like_millis),
             "fileCount": counts.file_count,
             "nodeCount": counts.node_count,
@@ -1504,14 +1515,19 @@ fn emit_serve_startup_debug(
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "(unknown)".to_string());
-    let db = db_path(project_root);
+    let db = db_path(project_root).ok();
+    let db_display = db
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(unresolved)".to_string());
+    let db_exists = db.as_ref().map(|p| p.is_file()).unwrap_or(false);
     tracing::debug!(
         %exe,
         %cwd,
         explicit_path,
         default_project = %project_root.display(),
-        db = %db.display(),
-        db_exists = db.is_file(),
+        db = %db_display,
+        db_exists,
         has_codegraph_dir = has_codegraph,
         mode = ?mode,
         "serve startup"
@@ -1560,7 +1576,9 @@ fn cmd_serve(
             );
             return serve_direct_no_services(project, &project_root, no_watch);
         }
-        let has_codegraph = codegraph_dir(&project_root).is_dir();
+        let has_codegraph = codegraph_dir(&project_root)
+            .map(|d| d.is_dir())
+            .unwrap_or(false);
         let mode = select_serve_mode(daemon_opt_out(), is_daemon_internal(), has_codegraph);
         emit_serve_startup_debug(&project_root, explicit_path, has_codegraph, &mode);
         match mode {
@@ -1614,7 +1632,7 @@ fn cmd_serve_http(path: Option<PathBuf>, http_addr: &str, detach: bool) -> Resul
     let (project, mode) = match path {
         Some(raw) => {
             let project = resolve_project_path_optional(&absolute_path(raw));
-            let db = db_path(&project);
+            let db = db_path(&project)?;
             if !db.is_file() {
                 anyhow::bail!(
                     "`serve --http --path` requires an indexed project, but no index was found at {}. Run `codegraph init {}` (or `codegraph index`) first.",
@@ -2033,7 +2051,10 @@ mod normalize_lexical_tests {
 /// self-indexes the cwd — keeping it unindexed and therefore adoptable when the
 /// client reports its real workspace root via `roots/list`.
 fn should_run_serve_services(explicit_path: bool, project_root: &Path) -> bool {
-    explicit_path || codegraph_dir(project_root).is_dir()
+    explicit_path
+        || codegraph_dir(project_root)
+            .map(|d| d.is_dir())
+            .unwrap_or(false)
 }
 
 fn serve_direct(
@@ -2153,7 +2174,10 @@ fn start_daemon_for_adopted_root(project_root: &Path, no_watch: bool) -> Option<
     if daemon_opt_out() || is_daemon_internal() || !should_run_daemon_services(project_root) {
         return None;
     }
-    if !codegraph_dir(project_root).is_dir() {
+    if !codegraph_dir(project_root)
+        .map(|d| d.is_dir())
+        .unwrap_or(false)
+    {
         return None;
     }
     if daemon_already_running(project_root) {
@@ -2687,7 +2711,7 @@ fn cmd_unlock(path: Option<PathBuf>) -> Result<()> {
     let project = resolve_required_project(path)?;
     let daemon_lock = codegraph_daemon::daemon_pid_path(&project);
     let daemon_removed = daemon_lock.exists() && codegraph_daemon::unlock_project(&project);
-    let lock = codegraph_dir(&project).join("codegraph.lock");
+    let lock = codegraph_dir(&project)?.join("codegraph.lock");
     if !lock.exists() && !daemon_removed {
         println!("No lock file found - nothing to do");
         return Ok(());
@@ -3435,7 +3459,8 @@ fn index_project_inner(
     if clear_first {
         remove_db_files(project)?;
     }
-    fs::create_dir_all(codegraph_dir(project))?;
+    let index_root = codegraph_dir(project)?;
+    fs::create_dir_all(&index_root)?;
     let config = codegraph_core::config::get_config();
     let options = ExtractOptions {
         max_file_size: config.indexing.max_file_size,
@@ -3457,7 +3482,7 @@ fn index_project_inner(
     // guard's own connection then runs wal_checkpoint(TRUNCATE)+NORMAL with no WAL
     // contention, leaving the file in the same shape a NORMAL run produces.
     let _pragma_guard = BulkIndexPragmaGuard {
-        db_path: db_path(project),
+        db_path: db_path(project)?,
     };
     let store = open_store(project)?;
     store.set_bulk_index_pragmas()?;
@@ -3484,7 +3509,7 @@ fn index_project_inner(
     const REF_FLUSH_ROWS: usize = 20_000;
     const RESOLVE_BATCH_ROWS: usize = 5_000;
 
-    let spill = SpillWriter::new(codegraph_dir(project))?;
+    let spill = SpillWriter::new(index_root.clone())?;
     let pending_nodes: Vec<Node> = Vec::with_capacity(NODE_FLUSH_ROWS);
 
     let bar = progress_bar(
@@ -4199,11 +4224,15 @@ fn exact_or_top_matches<'a>(matches: &'a [Node], symbol: &str) -> Vec<&'a Node> 
 }
 
 fn open_store(project: &Path) -> Result<Store> {
-    Store::open(&db_path(project)).map_err(Into::into)
+    Store::open(&db_path(project)?).map_err(Into::into)
 }
 
+/// Whether `project` has a current-namespace index DB. An unsafe/aliased
+/// `CODEGRAPH_DIR` (a `resolve` failure) counts as NOT initialized here so
+/// project discovery keeps walking; the mutating command paths independently
+/// re-resolve fail-closed via [`db_path`]/[`codegraph_dir`] before touching disk.
 fn is_initialized(project: &Path) -> bool {
-    db_path(project).exists()
+    db_path(project).map(|p| p.exists()).unwrap_or(false)
 }
 
 fn resolve_required_project(path: Option<PathBuf>) -> Result<PathBuf> {
@@ -4271,28 +4300,31 @@ fn normalize_lexical(path: &Path) -> PathBuf {
     out
 }
 
-/// The current (v2) index root for `project`. Defaults to the isolated
-/// `.codegraph-v2` sibling (Batch M, plan line 262); a `CODEGRAPH_DIR` override
-/// keeps its existing simple-join semantics. Routed through the single
-/// `codegraph-core::IndexPaths` path authority so no CLI code reconstructs the
-/// `.codegraph-v2` literal itself.
-fn codegraph_dir(project: &Path) -> PathBuf {
-    codegraph_core::IndexPaths::current_root_lenient(
-        project,
-        std::env::var("CODEGRAPH_DIR").ok().as_deref(),
-    )
+/// Fail-closed resolution of the project's index paths through the single
+/// `codegraph-core::IndexPaths` authority, honoring `CODEGRAPH_DIR`. Errors on
+/// an unsafe/aliased/overlapping configured root or an inaccessible project;
+/// callers never fall back to a reconstructed path.
+fn index_paths(project: &Path) -> Result<codegraph_core::IndexPaths> {
+    codegraph_core::IndexPaths::resolve(project, std::env::var("CODEGRAPH_DIR").ok().as_deref())
+        .map_err(Into::into)
 }
 
-fn db_path(project: &Path) -> PathBuf {
-    codegraph_core::IndexPaths::current_db_lenient(
-        project,
-        std::env::var("CODEGRAPH_DIR").ok().as_deref(),
-    )
+/// The current (v2) index root for `project` (`.codegraph-v2` by default; a
+/// `<name>-v2-<projectIdentity>` sibling for a configured `CODEGRAPH_DIR`).
+/// Fail-closed via [`index_paths`].
+fn codegraph_dir(project: &Path) -> Result<PathBuf> {
+    Ok(index_paths(project)?.current_root().to_path_buf())
+}
+
+/// The current (v2) index DB path for `project`. Fail-closed via [`index_paths`].
+fn db_path(project: &Path) -> Result<PathBuf> {
+    Ok(index_paths(project)?.current_db())
 }
 
 fn remove_db_files(project: &Path) -> Result<()> {
+    let db = db_path(project)?;
     for suffix in ["", "-wal", "-shm"] {
-        let path = PathBuf::from(format!("{}{}", db_path(project).display(), suffix));
+        let path = PathBuf::from(format!("{}{}", db.display(), suffix));
         if path.exists() {
             fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
         }
@@ -5117,12 +5149,17 @@ mod pure_helper_tests {
     #[test]
     fn db_path_is_under_codegraph_dir() {
         if std::env::var("CODEGRAPH_DIR").is_err() {
-            let p = Path::new("/proj");
+            let dir = tmp("dbpath");
+            let canonical = dir.canonicalize().unwrap();
             assert_eq!(
-                db_path(p),
-                PathBuf::from("/proj/.codegraph-v2/codegraph.db")
+                db_path(&dir).unwrap(),
+                canonical.join(".codegraph-v2/codegraph.db")
             );
-            assert_eq!(codegraph_dir(p), PathBuf::from("/proj/.codegraph-v2"));
+            assert_eq!(
+                codegraph_dir(&dir).unwrap(),
+                canonical.join(".codegraph-v2")
+            );
+            let _ = fs::remove_dir_all(&dir);
         }
     }
 
@@ -5296,14 +5333,23 @@ mod formatter_and_env_tests {
 
     #[test]
     fn codegraph_dir_and_db_path_default_layout() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let prev = std::env::var_os("CODEGRAPH_DIR");
         unsafe { std::env::remove_var("CODEGRAPH_DIR") };
-        let proj = Path::new("/tmp/proj");
-        assert_eq!(codegraph_dir(proj), proj.join(".codegraph-v2"));
-        assert_eq!(db_path(proj), proj.join(".codegraph-v2/codegraph.db"));
+        let proj = tmp("default-layout");
+        let canonical = proj.canonicalize().unwrap();
+        assert_eq!(
+            codegraph_dir(&proj).unwrap(),
+            canonical.join(".codegraph-v2")
+        );
+        assert_eq!(
+            db_path(&proj).unwrap(),
+            canonical.join(".codegraph-v2/codegraph.db")
+        );
         if let Some(v) = prev {
             unsafe { std::env::set_var("CODEGRAPH_DIR", v) };
         }
+        let _ = fs::remove_dir_all(&proj);
     }
 
     #[test]

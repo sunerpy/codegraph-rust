@@ -301,10 +301,19 @@ pub fn scan_project(root: &Path, options: &ExtractOptions) -> Result<Vec<String>
     // later `!pattern` negation re-includes a path an earlier set excluded.
     let pattern_sets: Vec<&[String]> = vec![&options.ignore_paths, &options.exclude, &gitignore];
     let include = IncludeSet::new(&options.include, &options.exclude);
+    // The exact reserved index-root child names for THIS project (fixed legacy
+    // `.codegraph`, the configured legacy root, and the resolved current root),
+    // resolved once so scan_dir excludes only those directories — never an
+    // arbitrary `.codegraph-*`-prefixed user directory.
+    let reserved_roots = codegraph_core::IndexPaths::reserved_child_dir_names(
+        root,
+        std::env::var("CODEGRAPH_DIR").ok().as_deref(),
+    );
     scan_dir(
         root,
         root,
         &ignored_dirs,
+        &reserved_roots,
         &pattern_sets,
         &include,
         &mut files,
@@ -317,6 +326,7 @@ fn scan_dir(
     root: &Path,
     dir: &Path,
     ignored_dirs: &HashSet<&str>,
+    reserved_roots: &std::collections::BTreeSet<String>,
     pattern_sets: &[&[String]],
     include: &IncludeSet,
     files: &mut Vec<String>,
@@ -327,13 +337,13 @@ fn scan_dir(
         let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        // Skip `.git`, the fixed legacy `.codegraph`, and every `.codegraph-*`
-        // sibling (including the isolated `.codegraph-v2` current root, Batch M)
-        // so a project's own index storage is never scanned back into the graph.
-        if name == ".git"
-            || codegraph_core::IndexPaths::is_reserved_index_dir(name.as_ref())
-            || ignored_dirs.contains(name.as_ref())
-        {
+        // Skip `.git` and the exact reserved index roots (fixed/configured legacy
+        // + resolved current) — but ONLY when they are direct children of the
+        // project root, so a `.codegraph`-named directory deeper in the tree is
+        // still governed by the normal ignore rules, not this exclusion.
+        let is_reserved_root_here =
+            dir == root && (name == ".git" || reserved_roots.contains(name.as_ref()));
+        if is_reserved_root_here || ignored_dirs.contains(name.as_ref()) {
             continue;
         }
         let relative = normalize_path(path.strip_prefix(root).unwrap_or(&path));
@@ -347,7 +357,15 @@ fn scan_dir(
             if ignored && !include.wants_descend(&relative) {
                 continue;
             }
-            scan_dir(root, &path, ignored_dirs, pattern_sets, include, files)?;
+            scan_dir(
+                root,
+                &path,
+                ignored_dirs,
+                reserved_roots,
+                pattern_sets,
+                include,
+                files,
+            )?;
         } else if file_type.is_file() && is_extractable_source_path(&relative) {
             // Post-model include decision: a model-ignored file is force-included
             // iff it matches `include` and is NOT overridden by an explicit
@@ -597,6 +615,44 @@ mod tests {
         let path = root.join(relative);
         fs::create_dir_all(path.parent().unwrap()).expect("create parent dirs");
         fs::write(&path, contents).expect("write file");
+    }
+
+    /// The scanner excludes ONLY the exact reserved index roots (the fixed
+    /// legacy `.codegraph` and the resolved current `.codegraph-v2`), never an
+    /// arbitrary `.codegraph-*`-prefixed user directory. A first-party source
+    /// dir named `.codegraph-sources` must still be indexed.
+    #[test]
+    fn scan_keeps_user_codegraph_prefixed_dir_but_excludes_reserved_roots() {
+        let project = unique_project("reserved_roots");
+        touch(
+            &project,
+            ".codegraph-sources/kept.ts",
+            "export const a = 1;",
+        );
+        touch(&project, ".codegraph/codegraph.db", "reserved");
+        touch(&project, ".codegraph-v2/codegraph.db", "reserved");
+        touch(&project, "src/app.ts", "export const b = 2;");
+
+        let files = scan_project(&project, &ExtractOptions::default()).expect("scan project");
+
+        assert!(
+            files.contains(&".codegraph-sources/kept.ts".to_string()),
+            "a user `.codegraph-sources` dir must stay scannable: {files:?}"
+        );
+        assert!(
+            files.contains(&"src/app.ts".to_string()),
+            "ordinary source must be indexed: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f.starts_with(".codegraph/")),
+            "the fixed legacy `.codegraph` root must be excluded: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f.starts_with(".codegraph-v2/")),
+            "the resolved current `.codegraph-v2` root must be excluded: {files:?}"
+        );
+
+        fs::remove_dir_all(&project).ok();
     }
 
     /// A real directory scan of a Godot project skips the regenerated `.godot/`

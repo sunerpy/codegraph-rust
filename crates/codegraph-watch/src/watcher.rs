@@ -338,10 +338,10 @@ impl ProjectWatcher {
             return Ok(None);
         }
         let policy = WatchPolicy::with_config(&project_root, &options.include, &options.exclude);
-        let db_path = options
-            .db_path
-            .clone()
-            .unwrap_or_else(|| default_db_path(&project_root));
+        let db_path = match options.db_path.clone() {
+            Some(db) => db,
+            None => default_db_path(&project_root)?,
+        };
         let sync_fn = options.sync_fn.clone().unwrap_or_else(|| {
             let project_root = project_root.clone();
             let include = options.include.clone();
@@ -783,7 +783,7 @@ mod tests {
     fn rapid_save_burst_triggers_exactly_one_reindex() {
         let dir = crate::sync::tests::TestDir::new("watch-debounce");
         fs::create_dir_all(dir.path().join("src")).unwrap();
-        let db = crate::sync::default_db_path(dir.path());
+        let db = crate::sync::default_db_path(dir.path()).unwrap();
         let outcomes = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&outcomes);
         let watcher = ProjectWatcher::start(
@@ -1159,7 +1159,7 @@ mod tests {
         // Given: an inert watcher with a long debounce so events stay pending.
         let dir = crate::sync::tests::TestDir::new("watch-pending");
         fs::create_dir_all(dir.path().join("src")).unwrap();
-        let db = crate::sync::default_db_path(dir.path());
+        let db = crate::sync::default_db_path(dir.path()).unwrap();
         let watcher = ProjectWatcher::start(
             dir.path(),
             WatchOptions {
