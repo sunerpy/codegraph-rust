@@ -152,6 +152,29 @@ impl IndexLease {
         Self::acquire_existing(paths, LeaseMode::Exclusive, deadline, cancelled)
     }
 
+    /// Acquire the ONE outer exclusive capability of a namespace that may or may
+    /// not exist yet: an existing current root must already carry its permanent
+    /// lock (never repaired), while a genuinely absent root is created together
+    /// with its lock. This is the single entry point every writer that owns a
+    /// whole lifecycle operation uses, so no caller re-implements the
+    /// existing-vs-initial decision or acquires a second, nested lease.
+    pub fn acquire_or_create_exclusive(
+        paths: &IndexPaths,
+        deadline: Instant,
+        cancelled: impl FnMut() -> bool,
+    ) -> Result<Self, IndexLeaseError> {
+        match std::fs::symlink_metadata(paths.current_root()) {
+            Ok(_) => Self::acquire_exclusive_existing(paths, deadline, cancelled),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Self::create_exclusive(paths, deadline, cancelled)
+            }
+            Err(source) => Err(IndexLeaseError::CreateRoot {
+                path: paths.current_root().to_path_buf(),
+                source,
+            }),
+        }
+    }
+
     /// Explicitly create a genuinely absent current root and its permanent lock,
     /// then acquire the initial exclusive capability.
     pub fn create_exclusive(

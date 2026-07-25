@@ -298,6 +298,17 @@ pub fn init_config(cli_path: Option<&Path>, project_root: &Path) -> Result<&'sta
     Ok(CONFIG.get().expect("just set"))
 }
 
+/// Borrow the global config only if `init_config` has already run.
+///
+/// Non-panicking counterpart of [`get_config`], for library code that must stay
+/// alive on a path where no binary initialized the global config (for example a
+/// watcher thread that escalates to a full migration). Callers fall back to the
+/// documented defaults instead of aborting the process.
+#[must_use]
+pub fn try_get_config() -> Option<&'static Config> {
+    CONFIG.get()
+}
+
 /// Borrow the global config after `init_config` has run.
 /// Panics if not initialized; for library use, prefer init_config().
 pub fn get_config() -> &'static Config {

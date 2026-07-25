@@ -254,6 +254,64 @@ fn begin_full_rebuild_with(
         });
     }
 
+    begin_from_authorization(paths, lease, kind, authorization, fault)
+}
+
+/// Escalate an ALREADY-AUTHORIZED namespace to a destructive full rebuild using
+/// the exclusive lease the authorization still retains.
+///
+/// This is the migration entry point for an incremental sync that classified
+/// `Missing`, `Outdated`, or a recoverable `Building` under its one outer
+/// exclusive lease (frozen plan lines 557-565). No lease is acquired here: doing
+/// so would be a nested acquisition of a lock this process already holds. The
+/// retained authorization's status is the accepted classification, so no
+/// reclassification-after-precheck TOCTOU is possible.
+pub fn resume_full_rebuild(
+    paths: &IndexPaths,
+    authorization: crate::connection::StoreWriteAuthorization,
+) -> Result<FullRebuild, RebuildError> {
+    resume_full_rebuild_with(paths, authorization, &mut NoFault)
+}
+
+fn resume_full_rebuild_with(
+    paths: &IndexPaths,
+    authorization: crate::connection::StoreWriteAuthorization,
+    fault: &mut impl RebuildFault,
+) -> Result<FullRebuild, RebuildError> {
+    if authorization.purpose() != StoreWritePurpose::IncrementalSync {
+        return Err(RebuildError::Store(StoreError::WritePurposeRejected {
+            purpose: authorization.purpose(),
+            status: authorization.status().clone(),
+        }));
+    }
+    // Only the states the sync gate escalates may migrate. `Uninitialized` is
+    // never escalated: it is reserved for an explicit `init`.
+    match authorization.status() {
+        crate::ExtractionStatus::Missing
+        | crate::ExtractionStatus::Outdated { .. }
+        | crate::ExtractionStatus::Building { .. } => {}
+        other => {
+            return Err(RebuildError::Store(StoreError::WritePurposeRejected {
+                purpose: authorization.purpose(),
+                status: other.clone(),
+            }));
+        }
+    }
+    let lease = authorization.clone_lease();
+    lease.validate_exclusive(paths)?;
+    begin_from_authorization(paths, lease, RebuildKind::Reindex, authorization, fault)
+}
+
+/// Shared destructive prologue: publish `phase=building` BEFORE deleting any
+/// database byte, then remove only the v2 database files — all under the one
+/// already-held exclusive lease carried by `authorization`.
+fn begin_from_authorization(
+    paths: &IndexPaths,
+    lease: IndexLease,
+    kind: RebuildKind,
+    authorization: crate::connection::StoreWriteAuthorization,
+    fault: &mut impl RebuildFault,
+) -> Result<FullRebuild, RebuildError> {
     // `phase=building` is durable BEFORE any destructive database work, so an
     // interruption leaves an explicit, owner-bound marker instead of a bare DB.
     publish_index_state(paths, &lease, StatePhase::Building)?;
@@ -590,20 +648,13 @@ fn acquire_outer_exclusive(
     deadline: Instant,
     cancelled: impl FnMut() -> bool,
 ) -> Result<IndexLease, RebuildError> {
-    match std::fs::symlink_metadata(paths.current_root()) {
-        // An existing namespace is never repaired: its permanent lock must
-        // already exist, otherwise acquisition fails closed.
-        Ok(_) => Ok(IndexLease::acquire_exclusive_existing(
-            paths, deadline, cancelled,
-        )?),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            Ok(IndexLease::create_exclusive(paths, deadline, cancelled)?)
-        }
-        Err(source) => Err(RebuildError::InspectRoot {
-            path: paths.current_root().to_path_buf(),
-            source,
-        }),
-    }
+    // An existing namespace is never repaired: its permanent lock must already
+    // exist, otherwise acquisition fails closed. The existing-vs-initial
+    // decision itself lives in `IndexLease` so every lifecycle owner (rebuild,
+    // forced sync migration) takes the SAME one outer capability.
+    Ok(IndexLease::acquire_or_create_exclusive(
+        paths, deadline, cancelled,
+    )?)
 }
 
 /// Remove only the v2 `codegraph.db`, `-wal`, and `-shm`. The legacy sibling is
@@ -1419,6 +1470,172 @@ mod tests {
             !paths.current_db().exists(),
             "a refused rebuild must not create a database"
         );
+    }
+
+    /// Take the incremental-sync authorization the way a real sync does: ONE
+    /// outer exclusive lease, one classification under it.
+    fn incremental_sync_authorization(
+        paths: &IndexPaths,
+    ) -> Result<crate::connection::StoreWriteAuthorization, StoreError> {
+        let lease = IndexLease::acquire_or_create_exclusive(paths, deadline(), || false)
+            .expect("acquire the one outer exclusive lease");
+        match Store::open_for_write(paths, lease, StoreWritePurpose::IncrementalSync)? {
+            StoreWriteOpen::FullRebuildRequired(authorization) => Ok(authorization),
+            other => panic!("expected an escalation authorization, got {other:?}"),
+        }
+    }
+
+    /// A sync that classified `Outdated` escalates through the SAME retained
+    /// lease: `resume_full_rebuild` acquires nothing, publishes `phase=building`
+    /// before touching the database, and finalizes to a readable `Current`.
+    #[test]
+    fn resume_full_rebuild_migrates_outdated_under_the_retained_lease() {
+        let project = TempProject::new("resume-outdated");
+        let paths = project.paths();
+        run_successful_rebuild(&paths, RebuildKind::ExplicitInit);
+
+        // Stage an OLDER built version through the accepted publisher path, then
+        // rewrite only the version field of the authoritative slot.
+        let outdated = CURRENT_EXTRACTION_VERSION - 1;
+        let record = serde_json::json!({
+            "sequence": 99,
+            "storageProtocol": crate::CURRENT_STORAGE_PROTOCOL,
+            "extractionVersion": outdated,
+            "phase": "current",
+            "projectIdentity": paths.project_identity(),
+            "checksum": crate::checksum_hex(
+                99,
+                crate::CURRENT_STORAGE_PROTOCOL,
+                outdated,
+                "current",
+                paths.project_identity(),
+            ),
+        });
+        std::fs::write(
+            &paths.state_slots()[0],
+            serde_json::to_vec(&record).expect("serialize the outdated slot"),
+        )
+        .expect("stage the outdated slot");
+        let _ = std::fs::remove_file(&paths.state_slots()[1]);
+        assert_eq!(
+            Store::extraction_status(&paths),
+            ExtractionStatus::Outdated { built: outdated }
+        );
+
+        let authorization =
+            incremental_sync_authorization(&paths).expect("Outdated must authorize escalation");
+        assert!(
+            authorization.retains_exclusive_lease(),
+            "the escalation authorization must still own the one outer exclusive lease"
+        );
+        let rebuild = resume_full_rebuild(&paths, authorization).expect("resume the full rebuild");
+        // Publication precedes destruction, so an interruption here is Building.
+        assert_eq!(
+            Store::extraction_status(&paths),
+            ExtractionStatus::Building {
+                built: CURRENT_EXTRACTION_VERSION,
+            }
+        );
+        assert!(
+            !paths.current_db().exists(),
+            "the outdated database must be removed after phase=building is durable"
+        );
+        let rebuild = rebuild.open_store().expect("open the migration writer");
+        build_graph(&rebuild);
+        rebuild.finish().expect("finalize the migration");
+
+        assert_eq!(Store::extraction_status(&paths), ExtractionStatus::Current);
+        Store::open_for_read(&paths, deadline(), || false)
+            .expect("a finalized migration must be readable");
+    }
+
+    /// The incremental-sync gate is state-directed: only Missing/Outdated/
+    /// Building escalate. A corroborated Current opens the incremental writer,
+    /// and an interrupted-uninit namespace is refused outright.
+    #[test]
+    fn incremental_sync_gate_escalates_only_the_migratable_states() {
+        let missing = TempProject::new("gate-missing");
+        let missing_paths = missing.paths();
+        incremental_sync_authorization(&missing_paths)
+            .expect("Missing must authorize escalation, not a row-level update");
+
+        let current = TempProject::new("gate-current");
+        let current_paths = current.paths();
+        run_successful_rebuild(&current_paths, RebuildKind::ExplicitInit);
+        let lease = IndexLease::acquire_or_create_exclusive(&current_paths, deadline(), || false)
+            .expect("acquire exclusive over the Current namespace");
+        match Store::open_for_write(&current_paths, lease, StoreWritePurpose::IncrementalSync)
+            .expect("Current must authorize an incremental writer")
+        {
+            StoreWriteOpen::Current(_) => {}
+            other => panic!("Current must stay incremental, got {other:?}"),
+        }
+
+        let building = TempProject::new("gate-building");
+        let building_paths = building.paths();
+        let begun = begin_full_rebuild(&building_paths, RebuildKind::Reindex, deadline(), || false)
+            .expect("stage an interrupted Building namespace");
+        drop(begun);
+        incremental_sync_authorization(&building_paths)
+            .expect("a recoverable Building must authorize escalation");
+
+        let uninit = TempProject::new("gate-uninit");
+        let uninit_paths = uninit.paths();
+        run_successful_rebuild(&uninit_paths, RebuildKind::ExplicitInit);
+        stage_interrupted_uninit(&uninit_paths);
+        let error = incremental_sync_authorization(&uninit_paths)
+            .expect_err("an uninitialized namespace is reserved for an explicit init");
+        assert!(
+            matches!(
+                error,
+                StoreError::WritePurposeRejected {
+                    purpose: StoreWritePurpose::IncrementalSync,
+                    status: ExtractionStatus::Uninitialized,
+                }
+            ),
+            "unexpected refusal: {error}"
+        );
+    }
+
+    /// `resume_full_rebuild` refuses an authorization whose retained status it
+    /// did not accept for escalation, so no caller can smuggle a Current or
+    /// Uninitialized namespace into a destructive migration.
+    #[test]
+    fn resume_full_rebuild_refuses_a_non_migratable_authorization() {
+        let project = TempProject::new("resume-refuses");
+        let paths = project.paths();
+        run_successful_rebuild(&paths, RebuildKind::ExplicitInit);
+
+        // A FullRebuild-purpose authorization over a Current namespace is valid
+        // for `begin_full_rebuild` but is NOT a sync escalation.
+        let lease = IndexLease::acquire_or_create_exclusive(&paths, deadline(), || false)
+            .expect("acquire exclusive");
+        let authorization =
+            match Store::open_for_write(&paths, lease, StoreWritePurpose::FullRebuild)
+                .expect("Current authorizes a full rebuild")
+            {
+                StoreWriteOpen::FullRebuildRequired(authorization) => authorization,
+                other => panic!("unexpected open result {other:?}"),
+            };
+        let before = std::fs::read(paths.current_db()).expect("read the Current database bytes");
+        let error = resume_full_rebuild(&paths, authorization)
+            .expect_err("a Current authorization must not resume a migration");
+        assert!(
+            matches!(
+                error,
+                RebuildError::Store(StoreError::WritePurposeRejected {
+                    status: ExtractionStatus::Current,
+                    ..
+                })
+            ),
+            "unexpected refusal: {error}"
+        );
+        assert_eq!(
+            std::fs::read(paths.current_db()).expect("re-read the database bytes"),
+            before,
+            "a refused resume must not change one database byte"
+        );
+        assert_eq!(Store::extraction_status(&paths), ExtractionStatus::Current);
     }
 
     #[test]

@@ -1,16 +1,23 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use codegraph_core::IndexPaths;
 use codegraph_core::node_id::hash_content;
 use codegraph_core::types::FileRecord;
 use codegraph_extract::{ExtractOptions, detect_language, extract_file};
 use codegraph_resolve::ReferenceResolver;
-use codegraph_store::Store;
+use codegraph_store::{IndexLease, Store, StoreWriteOpen, StoreWritePurpose};
 
 use crate::policy::WatchPolicy;
+
+/// Bounded wall-clock budget for acquiring the ONE outer exclusive lease a sync
+/// owns. Never a blocking wait: `IndexLease` polls `try_lock` against this
+/// monotonic deadline, so a sync behind another writer fails with a typed
+/// timeout instead of hanging.
+const SYNC_LEASE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SyncOutcome {
@@ -35,44 +42,117 @@ pub fn sync_project_once(project_root: impl AsRef<Path>) -> Result<SyncOutcome> 
 /// result stays byte-equivalent to `index --force`.
 pub fn sync_project_once_with_progress(
     project_root: impl AsRef<Path>,
-    on_progress: impl FnMut(usize, usize),
+    mut on_progress: impl FnMut(usize, usize),
 ) -> Result<SyncOutcome> {
     let project_root = project_root.as_ref();
-    let config = codegraph_core::config::get_config();
-    let options = ExtractOptions {
+    let options = scan_options();
+    let include = options.include.clone();
+    let exclude = options.exclude.clone();
+    let started = Instant::now();
+    let paths = index_paths(project_root)?;
+
+    // CLASSIFY BEFORE MUTATING A ROW (frozen plan lines 557-565). The gate takes
+    // the ONE outer exclusive lease, classifies under it, and either hands back
+    // the incremental writer for a corroborated Current namespace or the
+    // lease-retaining authorization that escalates to a forced full migration.
+    // Future/Corrupt/unauthorized-Uninitialized fail here, before any byte moves.
+    match open_sync_writer(&paths)? {
+        SyncWriter::Incremental(mut store) => {
+            let mut candidates = codegraph_extract::engine::scan_project(project_root, &options)?;
+            // Cold CLI sync has no watcher event list, so deletions are found by
+            // diffing tracked files against scan_project's on-disk set; absent
+            // paths flow through sync_one's delete branch (upstream removal pass,
+            // index.ts:1436-1441). The `exists()` guard keeps a still-present file
+            // that merely became ignored.
+            let on_disk = candidates.iter().cloned().collect::<HashSet<_>>();
+            let mut absent = Vec::new();
+            for tracked in store.all_files()? {
+                if !on_disk.contains(&tracked.path) && !project_root.join(&tracked.path).exists() {
+                    absent.push(tracked.path);
+                }
+            }
+            // `all_files` is ordered by path, but sort explicitly so the appended
+            // tail is deterministic regardless of the query's ordering.
+            absent.sort();
+            candidates.extend(absent);
+
+            let outcome = sync_paths_with_store(
+                &mut store,
+                project_root,
+                candidates,
+                &include,
+                &exclude,
+                started,
+                on_progress,
+            )?;
+            store.finish_current_mutation()?;
+            Ok(outcome)
+        }
+        SyncWriter::MigrationRequired(authorization) => crate::migrate::migrate_project(
+            project_root,
+            &paths,
+            authorization,
+            &options,
+            started,
+            &mut on_progress,
+        ),
+    }
+}
+
+/// The scan/extract options one sync uses. The global config is the source of
+/// truth when a binary initialized it; a library caller that never did (a bare
+/// watcher thread) falls back to the documented defaults instead of panicking.
+fn scan_options() -> ExtractOptions {
+    let Some(config) = codegraph_core::config::try_get_config() else {
+        return ExtractOptions::default();
+    };
+    ExtractOptions {
         max_file_size: config.indexing.max_file_size,
         ignore_dirs: config.indexing.ignore_dirs.clone(),
         ignore_paths: config.indexing.ignore_paths.clone(),
         exclude: config.indexing.exclude.clone(),
         include: config.indexing.include.clone(),
         parallel: true,
-    };
-    let started = std::time::Instant::now();
-    let mut candidates = codegraph_extract::engine::scan_project(project_root, &options)?;
+    }
+}
 
-    let db_path = default_db_path(project_root)?;
-    let mut store = Store::open(&db_path).with_context(|| format!("open {}", db_path.display()))?;
+/// What the state gate authorized for ONE sync.
+enum SyncWriter {
+    /// A corroborated `Current` namespace, open for incremental mutation under
+    /// the retained exclusive lease. Boxed because the state gate already yields
+    /// a boxed `Store`, so this variant stays the same size as the authorization.
+    Incremental(Box<Store>),
+    /// A namespace that cannot be updated file-by-file. The opaque authorization
+    /// still owns the same exclusive lease, which the migration reuses.
+    MigrationRequired(codegraph_store::StoreWriteAuthorization),
+}
 
-    // Cold CLI sync has no watcher event list, so deletions are found by diffing
-    // tracked files against scan_project's on-disk set; absent paths flow through
-    // sync_one's delete branch (upstream removal pass, index.ts:1436-1441). The
-    // `exists()` guard keeps a still-present file that merely became ignored.
-    let on_disk = candidates.iter().cloned().collect::<HashSet<_>>();
-    for tracked in store.all_files()? {
-        if !on_disk.contains(&tracked.path) && !project_root.join(&tracked.path).exists() {
-            candidates.push(tracked.path);
+pub(crate) fn index_paths(project_root: &Path) -> Result<IndexPaths> {
+    Ok(IndexPaths::resolve(
+        project_root,
+        std::env::var("CODEGRAPH_DIR").ok().as_deref(),
+    )?)
+}
+
+/// Acquire the ONE outer exclusive lease and classify under it. The retained
+/// status decides policy; no precheck-then-reclassify happens anywhere.
+fn open_sync_writer(paths: &IndexPaths) -> Result<SyncWriter> {
+    let deadline = Instant::now() + SYNC_LEASE_TIMEOUT;
+    let lease = IndexLease::acquire_or_create_exclusive(paths, deadline, || false)?;
+    match Store::open_for_write(paths, lease, StoreWritePurpose::IncrementalSync)? {
+        StoreWriteOpen::Current(store) => Ok(SyncWriter::Incremental(store)),
+        StoreWriteOpen::FullRebuildRequired(authorization) => {
+            Ok(SyncWriter::MigrationRequired(authorization))
+        }
+        StoreWriteOpen::UninitContinuation(_) => {
+            // The gate never returns this for an incremental sync; keep it a
+            // typed refusal rather than an unreachable panic.
+            bail!(
+                "index namespace {} awaits an explicit `codegraph init`",
+                paths.current_root().display()
+            )
         }
     }
-
-    sync_paths_with_store(
-        &mut store,
-        project_root,
-        candidates,
-        &config.indexing.include,
-        &config.indexing.exclude,
-        started,
-        on_progress,
-    )
 }
 
 pub fn sync_changed_paths(
@@ -90,23 +170,58 @@ pub fn sync_changed_paths(
 pub fn sync_changed_paths_with_patterns(
     project_root: impl AsRef<Path>,
     db_path: impl AsRef<Path>,
-    paths: impl IntoIterator<Item = impl AsRef<Path>>,
+    changed: impl IntoIterator<Item = impl AsRef<Path>>,
     include: &[String],
     exclude: &[String],
 ) -> Result<SyncOutcome> {
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let project_root = project_root.as_ref();
     let db_path = db_path.as_ref();
-    let mut store = Store::open(db_path).with_context(|| format!("open {}", db_path.display()))?;
-    sync_paths_with_store(
-        &mut store,
-        project_root,
-        paths,
-        include,
-        exclude,
-        started,
-        |_, _| {},
-    )
+    let paths = index_paths(project_root)?;
+    // The caller-supplied database must BE this project's resolved v2 database.
+    // Accepting any other path would let a watcher mutate a namespace the state
+    // gate never classified, so a mismatch fails closed.
+    if db_path != paths.current_db() {
+        bail!(
+            "incremental sync target {} is not the resolved v2 database {}",
+            db_path.display(),
+            paths.current_db().display()
+        );
+    }
+
+    // Same classify-before-mutate gate as the cold full sync: a Current namespace
+    // stays incremental, while Missing/Outdated/recoverable Building escalate to a
+    // forced migration under the SAME retained exclusive lease.
+    match open_sync_writer(&paths)? {
+        SyncWriter::Incremental(mut store) => {
+            let outcome = sync_paths_with_store(
+                &mut store,
+                project_root,
+                changed,
+                include,
+                exclude,
+                started,
+                |_, _| {},
+            )?;
+            store.finish_current_mutation()?;
+            Ok(outcome)
+        }
+        SyncWriter::MigrationRequired(authorization) => {
+            let options = ExtractOptions {
+                include: include.to_vec(),
+                exclude: exclude.to_vec(),
+                ..scan_options()
+            };
+            crate::migrate::migrate_project(
+                project_root,
+                &paths,
+                authorization,
+                &options,
+                started,
+                |_, _| {},
+            )
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -444,7 +559,7 @@ fn delete_unresolved_refs_by_file(store: &Store, relative: &str) -> rusqlite::Re
     )
 }
 
-fn modified_millis(metadata: &fs::Metadata) -> i64 {
+pub(crate) fn modified_millis(metadata: &fs::Metadata) -> i64 {
     metadata
         .modified()
         .ok()
@@ -453,7 +568,7 @@ fn modified_millis(metadata: &fs::Metadata) -> i64 {
         .unwrap_or_else(now_millis)
 }
 
-fn now_millis() -> i64 {
+pub(crate) fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
@@ -481,6 +596,25 @@ pub(crate) mod tests {
                 std::env::temp_dir().join(format!("codegraph-{name}-{}-{id}", std::process::id()));
             let _ = fs::remove_dir_all(&path);
             fs::create_dir_all(&path).unwrap();
+            // State-gated fixture setup: a sync now CLASSIFIES before mutating a
+            // row, and a `Missing` namespace legitimately escalates to a forced
+            // full migration (frozen plan lines 557-565). Every incremental
+            // expectation below therefore starts from an EMPTY, published
+            // `Current` namespace, built through the shipped rebuild finalizer
+            // rather than by conjuring a raw database file.
+            let paths = index_paths(&path).expect("resolve the fixture v2 namespace");
+            let deadline = Instant::now() + Duration::from_secs(30);
+            codegraph_store::begin_full_rebuild(
+                &paths,
+                codegraph_store::RebuildKind::Reindex,
+                deadline,
+                || false,
+            )
+            .expect("begin the fixture namespace rebuild")
+            .open_store()
+            .expect("open the fixture namespace writer")
+            .finish()
+            .expect("publish the empty fixture namespace as Current");
             Self { path }
         }
 
@@ -1028,6 +1162,140 @@ pub(crate) mod tests {
             included
                 .changed_paths
                 .contains(&"Tools/helper.ts".to_string())
+        );
+    }
+
+    /// Rewrite the authoritative state slot's built version so the namespace
+    /// classifies `Outdated` while its database stays byte-identical.
+    fn stage_outdated(dir: &TestDir) -> u64 {
+        let paths = index_paths(dir.path()).unwrap();
+        let built = codegraph_store::CURRENT_EXTRACTION_VERSION - 1;
+        let identity = paths.project_identity();
+        let checksum = codegraph_store::checksum_hex(
+            77,
+            codegraph_store::CURRENT_STORAGE_PROTOCOL,
+            built,
+            "current",
+            identity,
+        );
+        let body = format!(
+            "{{\"sequence\":77,\"storageProtocol\":{},\"extractionVersion\":{built},\
+             \"phase\":\"current\",\"projectIdentity\":\"{identity}\",\"checksum\":\"{checksum}\"}}\n",
+            codegraph_store::CURRENT_STORAGE_PROTOCOL,
+        );
+        let [slot0, slot1] = paths.state_slots();
+        fs::write(&slot0, body).unwrap();
+        let _ = fs::remove_file(&slot1);
+        assert_eq!(
+            Store::extraction_status(&paths),
+            codegraph_store::ExtractionStatus::Outdated { built }
+        );
+        built
+    }
+
+    #[test]
+    fn watcher_sync_on_outdated_namespace_migrates_every_file_without_skips() {
+        // Given: an indexed project whose namespace is then marked as built by an
+        // OLDER extraction version, with every source byte unchanged.
+        let dir = TestDir::new("watch-outdated-migrate");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("src/alpha.ts"),
+            "export function alpha() { return 1; }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/beta.ts"),
+            "export function beta() { return 2; }\n",
+        )
+        .unwrap();
+        let db = default_db_path(dir.path()).unwrap();
+        let first = sync_changed_paths(dir.path(), &db, ["src/alpha.ts", "src/beta.ts"]).unwrap();
+        assert_eq!(first.files_reindexed, 2);
+        stage_outdated(&dir);
+
+        // When: the watcher's incremental entry point runs for ONE changed path.
+        let outcome = sync_changed_paths(dir.path(), &db, ["src/alpha.ts"]).unwrap();
+
+        // Then: it escalated to a full migration — every candidate was processed,
+        // nothing was skipped as unchanged, changed_paths is the sorted full set,
+        // and the namespace is a readable Current again.
+        assert_eq!(outcome.files_skipped_unchanged, 0);
+        assert_eq!(outcome.files_reindexed, 2);
+        assert_eq!(
+            outcome.changed_paths,
+            vec!["src/alpha.ts".to_string(), "src/beta.ts".to_string()]
+        );
+        let paths = index_paths(dir.path()).unwrap();
+        assert_eq!(
+            Store::extraction_status(&paths),
+            codegraph_store::ExtractionStatus::Current
+        );
+        let store =
+            Store::open_for_read(&paths, Instant::now() + Duration::from_secs(10), || false)
+                .unwrap();
+        assert!(store.file_by_path("src/beta.ts").unwrap().is_some());
+    }
+
+    #[test]
+    fn full_sync_on_outdated_namespace_migrates_and_drops_absent_files() {
+        // Given: two indexed files, one of which is then deleted, over a
+        // namespace marked Outdated.
+        let dir = TestDir::new("watch-outdated-full");
+        ensure_config(dir.path());
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("src/alpha.ts"),
+            "export function alpha() { return 1; }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/beta.ts"),
+            "export function beta() { return 2; }\n",
+        )
+        .unwrap();
+        sync_project_once(dir.path()).unwrap();
+        fs::remove_file(dir.path().join("src/beta.ts")).unwrap();
+        stage_outdated(&dir);
+
+        // When: the cold full sync runs.
+        let outcome = sync_project_once(dir.path()).unwrap();
+
+        // Then: migration re-extracted the surviving file with no skips and the
+        // absent file is gone from the fresh database.
+        assert_eq!(outcome.files_skipped_unchanged, 0);
+        assert_eq!(outcome.changed_paths, vec!["src/alpha.ts".to_string()]);
+        let paths = index_paths(dir.path()).unwrap();
+        let store =
+            Store::open_for_read(&paths, Instant::now() + Duration::from_secs(10), || false)
+                .unwrap();
+        assert!(store.file_by_path("src/beta.ts").unwrap().is_none());
+    }
+
+    #[test]
+    fn incremental_sync_rejects_a_database_outside_the_resolved_namespace() {
+        // Given: an initialized project and a database path that is NOT its
+        // resolved v2 database.
+        let dir = TestDir::new("watch-foreign-db");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("src/app.ts"),
+            "export function app() { return 1; }\n",
+        )
+        .unwrap();
+        let foreign = dir.path().join("elsewhere.db");
+
+        // When/Then: the sync refuses rather than mutating an unclassified file.
+        let error = sync_changed_paths(dir.path(), &foreign, ["src/app.ts"]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("is not the resolved v2 database"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !foreign.exists(),
+            "a refused sync must not create the foreign database"
         );
     }
 

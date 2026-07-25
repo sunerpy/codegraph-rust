@@ -49,6 +49,13 @@ pub enum StoreWritePurpose {
     /// Retain exclusive authority for a later destructive full rebuild or
     /// explicit init recovery. This slice does not perform that rebuild.
     FullRebuild,
+    /// One incremental sync that must CLASSIFY BEFORE MUTATING A ROW. A
+    /// corroborated `Current` namespace is opened for ordinary incremental
+    /// mutation; `Missing`, `Outdated`, and a recoverable `Building` instead
+    /// return the lease-retaining full-rebuild authorization so the caller
+    /// escalates to a forced migration under the SAME exclusive lease. An
+    /// interrupted-`uninit` namespace stays reserved for an explicit `init`.
+    IncrementalSync,
     /// Retain exclusive authority for a later interrupted-uninit continuation.
     UninitContinuation,
 }
@@ -58,6 +65,7 @@ impl std::fmt::Display for StoreWritePurpose {
         formatter.write_str(match self {
             Self::CurrentMutation => "current mutation",
             Self::FullRebuild => "full rebuild",
+            Self::IncrementalSync => "incremental sync",
             Self::UninitContinuation => "uninit continuation",
         })
     }
@@ -89,6 +97,14 @@ impl StoreWriteAuthorization {
     #[must_use]
     pub fn retains_exclusive_lease(&self) -> bool {
         self.lease.is_exclusive()
+    }
+
+    /// Clone the retained capability for a lifecycle operation this
+    /// authorization already authorizes. A clone NEVER unlocks (only the final
+    /// owner does), so handing one to the rebuild layer keeps the ONE outer
+    /// exclusive lease alive instead of releasing and reacquiring it.
+    pub(crate) fn clone_lease(&self) -> IndexLease {
+        self.lease.clone()
     }
 }
 
@@ -434,10 +450,19 @@ impl Store {
         }
 
         match purpose {
-            StoreWritePurpose::CurrentMutation if status == ExtractionStatus::Current => {
+            StoreWritePurpose::CurrentMutation | StoreWritePurpose::IncrementalSync
+                if status == ExtractionStatus::Current =>
+            {
                 // Corroborate through a separate read-only/no-create handle before
-                // any write-capable setup can alter pragmas or sidecars.
-                let (corroboration, source_conn) = corroborate_current_database(paths)?;
+                // any write-capable setup can alter pragmas or sidecars. An
+                // incremental sync tolerates a live reader's sidecars (see
+                // `corroborate_current_database_options`); the stamp still comes
+                // from the checkpointed main-file bytes.
+                let (corroboration, source_conn) = corroborate_current_database_options(
+                    paths,
+                    false,
+                    purpose == StoreWritePurpose::IncrementalSync,
+                )?;
                 drop(corroboration);
                 drop(source_conn);
                 before_write_open();
@@ -464,6 +489,29 @@ impl Store {
                     guarded_paths: Some(paths.clone()),
                     lease: Some(lease),
                 })))
+            }
+            // Frozen plan lines 557-565: an incremental sync classifies BEFORE
+            // row mutation. A namespace that is not a corroborated Current
+            // cannot be updated file-by-file, so Missing / Outdated / a
+            // recoverable Building escalate to a forced full migration through
+            // the SAME retained exclusive lease. Future/Corrupt were already
+            // refused above, and `Uninitialized` falls through to the catch-all
+            // rejection because only an explicit `init` may rebuild it.
+            StoreWritePurpose::IncrementalSync
+                if matches!(
+                    status,
+                    ExtractionStatus::Missing
+                        | ExtractionStatus::Outdated { .. }
+                        | ExtractionStatus::Building { .. }
+                ) =>
+            {
+                Ok(StoreWriteOpen::FullRebuildRequired(
+                    StoreWriteAuthorization {
+                        status,
+                        purpose,
+                        lease,
+                    },
+                ))
             }
             StoreWritePurpose::FullRebuild => {
                 if status == ExtractionStatus::Current {
@@ -540,6 +588,22 @@ impl Store {
             guarded_paths: Some(paths.clone()),
             lease: Some(lease.clone()),
         })
+    }
+
+    /// Explicit fallible completion of ONE state-gated incremental mutation of a
+    /// `Current` namespace: fold the write-ahead log back into the main database
+    /// file, then close the final SQLite connection (which releases this Store's
+    /// lease clone last). The namespace stays `Current` throughout — an
+    /// incremental sync republishes no state — so this attempts to restore the
+    /// checkpointed, sidecar-free artifact shape a new reader corroborates.
+    ///
+    /// The checkpoint is best-effort by SQLite's own contract: a concurrent
+    /// reader can leave the log un-truncated, which is reported as busy rather
+    /// than as an error. Any genuine failure propagates.
+    pub fn finish_current_mutation(self) -> Result<()> {
+        self.validate_state_write_authority()?;
+        self.checkpoint_wal_truncate()?;
+        self.close()
     }
 
     /// Fold the write-ahead log back into the main database file and truncate the
@@ -656,6 +720,26 @@ fn corroborate_current_database_with(
     paths: &IndexPaths,
     allow_tombstone: bool,
 ) -> Result<(Connection, Connection)> {
+    corroborate_current_database_options(paths, allow_tombstone, false)
+}
+
+/// Corroborate a `Current` namespace from its main-database bytes.
+///
+/// `allow_live_sidecar` relaxes ONLY the sidecar check, and only for a
+/// write-capable open. The sidecar-free rule is an artifact contract for the
+/// PUBLICATION and READ paths: the rebuild finalizer checkpoints the stamp into
+/// the main file and closes its connection before publishing `Current`, and a
+/// reader refuses a namespace whose sidecars reappeared without a state change.
+/// A live in-process reader (the MCP engine holds one for the server's whole
+/// life) legitimately recreates `-wal`/`-shm` on an untouched Current namespace,
+/// so demanding sidecar-freedom from an incremental WRITER would make every
+/// watcher sync inside `serve` fail. The stamp is still read from the
+/// already-checkpointed main-file bytes, so the version gate is unchanged.
+fn corroborate_current_database_options(
+    paths: &IndexPaths,
+    allow_tombstone: bool,
+    allow_live_sidecar: bool,
+) -> Result<(Connection, Connection)> {
     let db_path = paths.current_db();
     if !allow_tombstone && artifact_exists(&paths.tombstone())? {
         return Err(StoreError::CurrentTombstoned {
@@ -665,7 +749,7 @@ fn corroborate_current_database_with(
     if !artifact_exists(&db_path)? {
         return Err(StoreError::CurrentDatabaseMissing { path: db_path });
     }
-    if let Some(path) = first_existing_database_sidecar(paths)? {
+    if !allow_live_sidecar && let Some(path) = first_existing_database_sidecar(paths)? {
         return Err(StoreError::CurrentWithDatabaseSidecar { path });
     }
     let (conn, source_conn) = open_read_only_without_sidecars(&db_path)?;

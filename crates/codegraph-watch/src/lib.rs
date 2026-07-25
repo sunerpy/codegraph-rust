@@ -1,4 +1,5 @@
 mod git;
+mod migrate;
 mod policy;
 mod sync;
 mod watcher;

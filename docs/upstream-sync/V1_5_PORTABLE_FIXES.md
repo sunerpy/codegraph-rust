@@ -1800,3 +1800,105 @@ authoritative `make ci CARGO='cargo --locked'`. That final run must cover these
 exact bytes, it is the sole remaining completion authority, and no later
 documentation edit is permitted. Apart from that one named gate, no validation for
 this item remains pending.
+
+## Batch M — `incremental_sync_on_outdated_v2_forces_all_files` (2026-07-26)
+
+Frozen plan lines 557-565 and test 9 (lines 750-751). An incremental sync now
+CLASSIFIES BEFORE MUTATING A ROW and escalates a namespace it cannot repair
+file-by-file to a deterministic full from-source migration under the SAME
+retained exclusive lease.
+
+Behavior landed:
+
+- `StoreWritePurpose::IncrementalSync` classifies once under the already-held
+  exclusive lease. A corroborated `Current` yields the incremental writer;
+  `Missing`, `Outdated`, and a recoverable `Building` yield the lease-retaining
+  `FullRebuildRequired` authorization; `Future` / `Corrupt` are refused before
+  any byte moves; `Uninitialized` falls through to the typed
+  `WritePurposeRejected` refusal, because only an explicit `init` may rebuild it.
+- `codegraph_store::resume_full_rebuild(paths, authorization)` performs the
+  destructive prologue (publish `phase=building`, then remove only the v2
+  database files) using the lease clone the authorization already carries. It
+  acquires NO lease, so no nested acquisition of a lock this process holds is
+  possible, and it refuses any authorization whose retained status it did not
+  accept for escalation. `begin_full_rebuild` and `resume_full_rebuild` now share
+  one `begin_from_authorization` prologue, and the existing-vs-initial lease
+  decision moved into `IndexLease::acquire_or_create_exclusive` so every
+  lifecycle owner takes the same one outer capability.
+- `codegraph-watch`'s new `migrate` module runs the migration: sorted
+  `scan_project` candidates, no mtime/content-hash gate at all (so zero
+  `files_skipped_unchanged`), absent tracked files simply never enter the fresh
+  database, then framework extraction, batched resolution, cross-file
+  finalization, and the rebuild finalizer's `phase=current` publication last. The
+  persist order reproduces the CLI full index exactly (file row then nodes per
+  file, ALL nodes before ANY edge, then edges, then refs, with the same WAL-valve
+  folds and the same 10k/20k/20k/5k batch constants).
+- Both sync entry points (`sync_project_once_with_progress` and
+  `sync_changed_paths_with_patterns`) route through the gate, finish a `Current`
+  incremental mutation with an explicit checkpoint + state-gated close, and
+  refuse a `db_path` that is not this project's resolved v2 database.
+- `Current` corroboration gained an `allow_live_sidecar` option used ONLY by the
+  incremental writer. The sidecar-free rule remains the publication and read
+  contract; a live in-process MCP reader legitimately recreates `-wal`/`-shm` on
+  an untouched `Current` namespace, so requiring sidecar-freedom from an
+  incremental WRITER made every watcher sync inside `serve` fail. The stamp is
+  still validated from the already-checkpointed main-file bytes, so the version
+  gate is unchanged.
+- `codegraph_core::config::try_get_config` is the non-panicking accessor a
+  library sync path uses when no binary initialized the global config.
+
+Red evidence (recorded before Green): the new CLI suite
+`crates/codegraph-cli/tests/batch_m_outdated_migration.rs` compiled and failed on
+its business assertions — `incremental_sync_on_outdated_v2_forces_all_files`
+panicked with `an Outdated namespace must bypass every mtime/content-hash skip
+(plan lines 557-565); got 3 unchanged skips in: Synced: 0 reindexed, 3 skipped
+(unchanged), 0 removed`; `outdated_migration_drops_absent_tracked_files` panicked
+with `a migrated namespace must be readable: StateRejected { status: Outdated {
+built: 1 } }`; and both refusal tests panicked because the old sync happily
+reported `Synced: 0 reindexed, 3 skipped (unchanged), 0 removed` over `Future`,
+`Corrupt`, and `uninitialized` namespaces. Exit status: `test result: FAILED. 0
+passed; 4 failed`.
+
+Green evidence: the same CLI suite reports 5 passed / 0 failed (including the
+nonmutation-oracle self-test); focused rebuild tests report 17 passed / 0 failed;
+the Store state-gate suite reports 21 passed / 0 failed; the complete
+`codegraph-watch` package, including its unit and integration suites, passes; and
+the affected-package tests, all-target check, and all-target Clippy with
+`-D warnings` are clean. A development `cargo test --workspace --locked` run is
+green with no failures; `cargo fmt --all --check` is clean;
+`bash scripts/guardrail.sh` exits 0; `git diff --check` is clean; and `Cargo.lock`
+still hashes to
+`750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`. Every Cargo
+batch was preceded by `bash scripts/check-workspace-versions.sh` and used
+`--locked`.
+
+Canonical equality is proven by the new suite itself: after a forced migration the
+five canonical surfaces of the migrated database `diff_canonical`-match a fresh
+v2 `init` + `index --force` peer built from the same tree, both for the
+all-unchanged case and for the case where a tracked file was deleted.
+
+No pre-existing test was weakened, deleted, filtered, or ignored. Two existing
+`codegraph-watch` expectations needed state-gated fixture setup only: the shared
+`TestDir` now publishes an empty `Current` namespace through the shipped rebuild
+finalizer, because a `Missing` namespace legitimately escalates to a migration
+now, and the two ignored-path counters assert over an incremental sync.
+
+Environment limitations, unchanged and still claimed as limitations: LSP
+diagnostics rejected every changed Rust file with `LSP file path must be inside
+request cwd`, so targeted Cargo `check`/`clippy` diagnostics are the accepted
+fallback; and no native Windows runtime, crash, or handle behavior is claimed
+from this Linux host.
+
+Final review corrections are included in those results. `resume_full_rebuild`
+now accepts only an authorization issued specifically for
+`StoreWritePurpose::IncrementalSync`, in addition to checking its retained state,
+so another full-rebuild capability cannot be repurposed as sync migration
+authority. The refused-state byte oracle now snapshots directories, complete
+regular-file bytes, and symlink targets without following aliases, fails closed
+on every I/O or unsupported-kind error, and has a self-test proving that an
+equal-length byte replacement is detected.
+
+These bytes are the input to the parent's final `make fmt` and single
+authoritative `make ci CARGO='cargo --locked'`. No later documentation edit is
+permitted; completion is decided by that post-format gate and the subsequent
+lock-hash/diff/status audit.
