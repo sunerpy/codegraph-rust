@@ -883,3 +883,40 @@ All commands run in the implementation worktree on
 - `bash scripts/guardrail.sh` — exit 0.
 - `sha256sum Cargo.lock` — `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`
   (byte-identical before and after).
+
+## Batch M — read-only dual-slot state classifier (2026-07-25)
+
+This slice adds only the store-owned READ-ONLY state classifier. Store now owns
+storage protocol `2`, extraction version `2`, and metadata key
+`indexed_with_extraction_version`. The classifier reads exactly the two
+`IndexPaths::state_slots()` regular files, never follows a slot symlink, never
+opens SQLite, and never creates, truncates, renames, deletes, or rewrites any
+namespace byte.
+
+The six protocol-stable JSON fields are required at their exact types; unknown
+fields are tolerated. Owner and checksum must each be exactly 64 lowercase hex
+characters. The SHA-256 payload uses fixed ASCII labels and LF separators and
+hashes the raw phase text. These stable checks, checksum value, and owner equality
+are enforced before a future storage protocol is trusted; an unknown future phase
+is then accepted, while current protocol accepts only `building`, `current`, and
+`uninitialized`. Lower/zero protocols and every present malformed, unreadable,
+non-regular, checksum-invalid, or owner-mismatched slot are typed `Corrupt` and
+dominate a valid companion.
+
+Aggregation first rejects any invalid slot, then rejects equal sequence across
+all validated pairs (current/current, future/future, or mixed) independently of
+JSON byte formatting. A validated future-protocol record then dominates a current
+record regardless of sequence; otherwise the highest current record wins. The
+selected `u64::MAX` sequence is corruption before protocol/extraction status
+mapping. Public tests cover the complete matrix plus exact fail-closed filesystem
+snapshots (directories, complete file bytes, and unfollowed symlink targets keyed
+by `PathBuf`), including equal-length mutation and Unix symlink self-tests.
+
+Behavioral Red was established by temporarily weakening mixed equal-sequence
+rejection: `index_state_equal_future_and_mixed_sequences_are_corrupt_before_future_dominance`
+failed with `expected Corrupt, got Future { built: 9 }`; the production condition
+was restored before verification.
+
+**Strict scope boundary:** atomic publication, `IndexLease`, Store `open_for_*`
+APIs, DB stamping/corroboration, migration/finalization, uninit and daemon/watcher
+lifecycle remain unimplemented. This slice exposes no publication or lease API.

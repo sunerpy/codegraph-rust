@@ -40,7 +40,6 @@ mod segments;
 mod structural_gate;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const EXTRACTION_VERSION: i64 = 1;
 
 fn main() {
     let cli = Cli::parse();
@@ -1285,17 +1284,18 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
     let last_indexed = latest_indexed_at(&store)?;
     let built_with_version = store.get_project_metadata("indexed_with_version")?;
     let built_with_extraction_version = store
-        .get_project_metadata("indexed_with_extraction_version")?
-        .and_then(|v| v.parse::<i64>().ok());
+        .get_project_metadata(codegraph_store::EXTRACTION_VERSION_KEY)?
+        .and_then(|v| v.parse::<u64>().ok());
     let reindex_recommended = last_indexed.is_some()
-        && built_with_extraction_version.is_none_or(|v| v < EXTRACTION_VERSION);
+        && built_with_extraction_version
+            .is_none_or(|v| v < codegraph_store::CURRENT_EXTRACTION_VERSION);
     let resolution_incomplete = store.is_resolution_incomplete()?;
 
     if json_output {
         let mut index_obj = json!({
             "builtWithVersion": built_with_version,
             "builtWithExtractionVersion": built_with_extraction_version,
-            "currentExtractionVersion": EXTRACTION_VERSION,
+            "currentExtractionVersion": codegraph_store::CURRENT_EXTRACTION_VERSION,
             "reindexRecommended": reindex_recommended,
         });
         // #1187: surface the interrupted-index state ONLY when the marker is set,
@@ -3808,8 +3808,8 @@ fn index_project_inner(
     finish_phase(&pb, "Finalized frameworks");
     store.set_project_metadata("indexed_with_version", VERSION)?;
     store.set_project_metadata(
-        "indexed_with_extraction_version",
-        &EXTRACTION_VERSION.to_string(),
+        codegraph_store::EXTRACTION_VERSION_KEY,
+        &codegraph_store::CURRENT_EXTRACTION_VERSION.to_string(),
     )?;
     let pb = phase_spinner("Compacting database", quiet);
     store.compact()?;
