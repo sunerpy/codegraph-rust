@@ -16,14 +16,14 @@ pub fn format_tool_debug_line(
     default_project: Option<&Path>,
 ) -> String {
     let raw = raw_project.unwrap_or("(none)");
-    let (resolved_str, db_str, db_exists) = match resolved {
-        Some(p) => {
-            let db = db_path_for(p);
-            let exists = db.is_file();
-            (p.display().to_string(), db.display().to_string(), exists)
-        }
-        None => ("(unresolved)".to_string(), "(none)".to_string(), false),
-    };
+    let (resolved_str, db_str, db_exists) =
+        match resolved.and_then(|p| db_path_for(p).map(|db| (p, db))) {
+            Some((p, db)) => {
+                let exists = db.is_file();
+                (p.display().to_string(), db.display().to_string(), exists)
+            }
+            None => ("(unresolved)".to_string(), "(none)".to_string(), false),
+        };
     let cwd_str = cwd.map_or_else(|| "(none)".to_string(), |p| p.display().to_string());
     let default_str =
         default_project.map_or_else(|| "(none)".to_string(), |p| p.display().to_string());
@@ -34,21 +34,25 @@ pub fn format_tool_debug_line(
 
 /// The current (v2) index DB path under a project root, resolved fail-closed
 /// through the single `codegraph-core::IndexPaths` authority so it agrees with
-/// [`crate::CodeGraphEngine::open`]. This is an EXISTENCE-probe helper (callers
-/// do `db_path_for(p).is_file()`), so an unsafe/aliased configured root degrades
-/// to the safe `.codegraph-v2` default whose file simply will not exist — it
-/// NEVER reconstructs a configured-root path that could shadow another project.
-/// The authoritative fail-closed rejection happens in `CodeGraphEngine::open`.
-pub fn db_path_for(project_path: &Path) -> PathBuf {
-    match codegraph_core::IndexPaths::resolve(
+/// [`crate::CodeGraphEngine::open`]. Returns `None` when the configured root is
+/// unsafe/aliased/overlapping (a `resolve` failure): callers treat that as "not
+/// an indexed project", which is DISTINCT from a reconstructed default path that
+/// could shadow another project. The authoritative fail-closed error is surfaced
+/// by `CodeGraphEngine::open` when a tool actually runs.
+pub fn db_path_for(project_path: &Path) -> Option<PathBuf> {
+    codegraph_core::IndexPaths::resolve(
         project_path,
         std::env::var("CODEGRAPH_DIR").ok().as_deref(),
-    ) {
-        Ok(paths) => paths.current_db(),
-        Err(_) => project_path
-            .join(codegraph_core::index_paths::DEFAULT_CURRENT_DIR)
-            .join("codegraph.db"),
-    }
+    )
+    .ok()
+    .map(|paths| paths.current_db())
+}
+
+/// Whether `project_path` resolves to an existing current-namespace index DB.
+/// `false` for both an unresolvable configured root and a resolvable-but-absent
+/// index — the shared adoption/probe predicate.
+pub fn db_exists_for(project_path: &Path) -> bool {
+    db_path_for(project_path).is_some_and(|db| db.is_file())
 }
 
 pub struct WorkspaceRoots {
@@ -157,7 +161,7 @@ fn adopt_path(
     if !default_is_adoptable(default_project.as_ref(), cwd) {
         return None;
     }
-    if db_path_for(&path).is_file() {
+    if db_exists_for(&path) {
         let adopted = path.clone();
         *default_project = Some(path);
         return Some(adopted);
@@ -184,7 +188,7 @@ fn default_is_adoptable(default_project: Option<&PathBuf>, cwd: Option<&Path>) -
     let (Some(current), Some(cwd)) = (default_project, cwd) else {
         return false;
     };
-    !db_path_for(current).is_file() && canonicalize_lenient(current) == canonicalize_lenient(cwd)
+    !db_exists_for(current) && canonicalize_lenient(current) == canonicalize_lenient(cwd)
 }
 
 fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
@@ -260,7 +264,10 @@ mod tests {
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let path =
             std::env::temp_dir().join(format!("cg-mcp-roots-{tag}-{}-{seq}", std::process::id()));
-        let db = db_path_for(&path);
+        // The project dir must exist before `db_path_for` (which resolves the
+        // physical identity) can succeed.
+        std::fs::create_dir_all(&path).unwrap();
+        let db = db_path_for(&path).expect("default project resolves");
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         std::fs::write(&db, b"placeholder").unwrap();
         TempProject { path }
@@ -453,7 +460,7 @@ mod tests {
         let expected = format!(
             "[codegraph debug] tool=codegraph_search projectPath_raw=codegraph-rust resolved={} db={} db_exists=true cwd=/tmp/cwd default_project=/tmp/default",
             project.path().display(),
-            db_path_for(project.path()).display(),
+            db_path_for(project.path()).unwrap().display(),
         );
         assert_eq!(line, expected);
     }
@@ -622,12 +629,43 @@ mod tests {
 
     #[test]
     fn db_path_for_honors_codegraph_dir_default() {
-        let p = Path::new("/proj");
-        let db = db_path_for(p);
+        // A real dir so `resolve` (which canonicalizes) succeeds; the default
+        // current DB is `<project>/.codegraph-v2/codegraph.db`.
+        let dir = std::env::temp_dir().join(format!(
+            "cg-roots-dbpath-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = db_path_for(&dir).expect("resolve default");
         assert!(
-            db.ends_with("codegraph.db"),
-            "db path ends with codegraph.db"
+            db.ends_with(".codegraph-v2/codegraph.db"),
+            "default db is under .codegraph-v2: {}",
+            db.display()
         );
-        assert!(db.starts_with("/proj"), "under the project root");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `resolve` failure (here a nonexistent project) must yield `None`, not a
+    /// reconstructed `.codegraph-v2` default that could shadow another project.
+    /// Race-free: it never mutates the process-global `CODEGRAPH_DIR`, unlike an
+    /// env-set test. The invalid-`CODEGRAPH_DIR` path is covered end-to-end by
+    /// the real CLI/MCP black-box regressions.
+    #[test]
+    fn db_path_for_returns_none_on_resolve_failure() {
+        let missing = std::env::temp_dir().join(format!(
+            "cg-roots-dbpath-missing-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        assert!(!missing.exists(), "sanity: the probe path must not exist");
+        assert!(
+            db_path_for(&missing).is_none(),
+            "a resolve failure must not resolve to a reconstructed default path"
+        );
+        assert!(
+            !db_exists_for(&missing),
+            "db_exists_for must be false when resolution fails"
+        );
     }
 }

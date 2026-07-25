@@ -1235,18 +1235,14 @@ fn cmd_sync(path: Option<PathBuf>, quiet: bool) -> Result<()> {
 fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
     let start = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
     let project = resolve_project_path_optional(&start);
-    // Status inspects an existing project; a resolvable index root reports its
-    // real paths, an unresolvable/aliased configured root reports the safe
-    // default so status still answers instead of erroring.
-    let resolved = index_paths(&project).ok();
-    let index_root = resolved
-        .as_ref()
-        .map(|p| p.current_root().to_path_buf())
-        .unwrap_or_else(|| project.join(".codegraph-v2"));
-    let db = resolved
-        .as_ref()
-        .map(|p| p.current_db())
-        .unwrap_or_else(|| index_root.join("codegraph.db"));
+    // Fail closed on an unsafe/aliased/overlapping configured root: status must
+    // surface the stable diagnostic, NOT mask an invalid `CODEGRAPH_DIR` as a
+    // default `.codegraph-v2` layout (which would report a bogus "not
+    // initialized"). A genuinely absent index still resolves fine and reports
+    // uninitialized below.
+    let resolved = index_paths(&project)?;
+    let index_root = resolved.current_root().to_path_buf();
+    let db = resolved.current_db();
     let db_exists = db.is_file();
     let daemon_running = daemon_already_running(&project);
     let daemon_pid_path = codegraph_daemon::daemon_pid_path(&project);

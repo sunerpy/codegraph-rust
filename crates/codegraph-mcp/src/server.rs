@@ -19,7 +19,8 @@ use crate::engine::CodeGraphEngine;
 use crate::instructions::SERVER_INSTRUCTIONS;
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse, ToolResult, error_codes};
 use crate::roots::{
-    ROOTS_LIST_REQUEST_ID, WorkspaceRoots, db_path_for, format_tool_debug_line, roots_list_request,
+    ROOTS_LIST_REQUEST_ID, WorkspaceRoots, db_exists_for, db_path_for, format_tool_debug_line,
+    roots_list_request,
 };
 use crate::schemas;
 
@@ -221,7 +222,7 @@ impl McpServer {
         let Some(project) = &self.default_project else {
             return false;
         };
-        db_path_for(project).is_file()
+        db_exists_for(project)
     }
 
     /// Run the stdio loop until the broad-root daemon handoff adopts a project
@@ -502,10 +503,7 @@ impl McpServer {
     /// error, not mask itself behind the default.
     fn resolve_project_arg(&self, raw: Option<&str>) -> Option<PathBuf> {
         let Some(raw) = raw else {
-            return self
-                .default_project
-                .clone()
-                .filter(|p| db_path_for(p).is_file());
+            return self.default_project.clone().filter(|p| db_exists_for(p));
         };
 
         let raw_path = PathBuf::from(raw);
@@ -526,7 +524,7 @@ impl McpServer {
 
         candidates
             .into_iter()
-            .find(|candidate| db_path_for(candidate).is_file())
+            .find(|candidate| db_exists_for(candidate))
     }
 
     /// Open-on-demand + cache the engine for a project path
@@ -536,7 +534,14 @@ impl McpServer {
     /// one (inode/file-index changed). An in-place write keeps the same identity,
     /// so the common path returns the cached engine without reopening.
     fn engine_for(&mut self, project_path: &PathBuf) -> anyhow::Result<&CodeGraphEngine> {
-        let db_path = db_path_for(project_path);
+        // A resolvable configured root yields its DB path; an invalid one fails
+        // closed here (Engine::open re-resolves and surfaces the stable error).
+        let db_path = db_path_for(project_path).ok_or_else(|| {
+            anyhow::anyhow!(
+                "invalid CODEGRAPH_DIR configuration for project {}",
+                project_path.display()
+            )
+        })?;
         let current = DbIdentity::read(&db_path);
 
         let stale = match self.engines.get(project_path) {
@@ -677,7 +682,10 @@ mod tests {
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let path =
             std::env::temp_dir().join(format!("cg-mcp-init-{tag}-{}-{seq}", std::process::id()));
-        let db = db_path_for(&path);
+        // The project dir must exist before `db_path_for` (which resolves the
+        // physical identity) can succeed.
+        std::fs::create_dir_all(&path).unwrap();
+        let db = db_path_for(&path).expect("default project resolves");
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         std::fs::write(&db, b"placeholder").unwrap();
         TempProject { path }

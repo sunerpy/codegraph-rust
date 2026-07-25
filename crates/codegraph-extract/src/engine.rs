@@ -301,11 +301,13 @@ pub fn scan_project(root: &Path, options: &ExtractOptions) -> Result<Vec<String>
     // later `!pattern` negation re-includes a path an earlier set excluded.
     let pattern_sets: Vec<&[String]> = vec![&options.ignore_paths, &options.exclude, &gitignore];
     let include = IncludeSet::new(&options.include, &options.exclude);
-    // The exact reserved index-root child names for THIS project (fixed legacy
-    // `.codegraph`, the configured legacy root, and the resolved current root),
-    // resolved once so scan_dir excludes only those directories — never an
-    // arbitrary `.codegraph-*`-prefixed user directory.
-    let reserved_roots = codegraph_core::IndexPaths::reserved_child_dir_names(
+    // The EXACT resolved reserved index-root PATHS for THIS project (fixed
+    // legacy `.codegraph`, the configured legacy root, and the resolved current
+    // root — including nested configured roots at their true depth), resolved
+    // once. scan_dir prunes a directory iff its FULL path equals one of these,
+    // never by basename, so a user `.codegraph-sources/` stays scannable and an
+    // unrelated same-basename directory is never mis-excluded.
+    let reserved_roots = codegraph_core::IndexPaths::reserved_index_roots(
         root,
         std::env::var("CODEGRAPH_DIR").ok().as_deref(),
     );
@@ -326,7 +328,7 @@ fn scan_dir(
     root: &Path,
     dir: &Path,
     ignored_dirs: &HashSet<&str>,
-    reserved_roots: &std::collections::BTreeSet<String>,
+    reserved_roots: &std::collections::BTreeSet<PathBuf>,
     pattern_sets: &[&[String]],
     include: &IncludeSet,
     files: &mut Vec<String>,
@@ -337,12 +339,12 @@ fn scan_dir(
         let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        // Skip `.git` and the exact reserved index roots (fixed/configured legacy
-        // + resolved current) — but ONLY when they are direct children of the
-        // project root, so a `.codegraph`-named directory deeper in the tree is
-        // still governed by the normal ignore rules, not this exclusion.
+        // Skip `.git` (a direct child of the scan root) and any directory whose
+        // FULL path is a resolved reserved index root — matched at any depth, so
+        // a nested configured root like `<root>/cache/index` is pruned exactly,
+        // while a same-basename user directory elsewhere is not.
         let is_reserved_root_here =
-            dir == root && (name == ".git" || reserved_roots.contains(name.as_ref()));
+            (dir == root && name == ".git") || reserved_roots.contains(&path);
         if is_reserved_root_here || ignored_dirs.contains(name.as_ref()) {
             continue;
         }
@@ -650,6 +652,38 @@ mod tests {
         assert!(
             !files.iter().any(|f| f.starts_with(".codegraph-v2/")),
             "the resolved current `.codegraph-v2` root must be excluded: {files:?}"
+        );
+
+        fs::remove_dir_all(&project).ok();
+    }
+
+    /// Exclusion is by EXACT resolved root PATH, not basename: a directory that
+    /// merely SHARES the reserved basename but lives at a different path (nested
+    /// under a source subtree) is NOT a resolved root and stays scannable.
+    #[test]
+    fn scan_excludes_only_top_level_root_paths_not_same_named_nested_dirs() {
+        let project = unique_project("reserved_nested");
+        // A `.ts` under the real top-level reserved current root is excluded…
+        touch(&project, ".codegraph-v2/inner.ts", "export const r = 0;");
+        // …but a `.codegraph-v2`-named directory NESTED under `src/` is a user
+        // path (not the resolved current root) and must be indexed.
+        touch(
+            &project,
+            "src/.codegraph-v2/nested.ts",
+            "export const a = 1;",
+        );
+        touch(&project, "src/app.ts", "export const b = 2;");
+
+        let files = scan_project(&project, &ExtractOptions::default()).expect("scan project");
+
+        assert!(
+            files.contains(&"src/.codegraph-v2/nested.ts".to_string()),
+            "a same-basename dir nested off the root is NOT the reserved root: {files:?}"
+        );
+        assert!(files.contains(&"src/app.ts".to_string()), "{files:?}");
+        assert!(
+            !files.iter().any(|f| f.starts_with(".codegraph-v2/")),
+            "the top-level `.codegraph-v2` root is still excluded: {files:?}"
         );
 
         fs::remove_dir_all(&project).ok();

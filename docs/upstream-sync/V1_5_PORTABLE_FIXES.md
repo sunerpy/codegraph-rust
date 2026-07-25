@@ -518,3 +518,90 @@ the configured-root fail-closed contract in full. Still legitimately unchanged
 black-box Red, the new configured-root + `.` alias + scanner regressions, and
 `codegraph-bench` golden byte-stability). No plan-level architecture change was
 required.
+
+## Batch M — path-authority correction #2: close verification defects (2026-07-25)
+
+### Why this follow-up exists
+
+Verification REJECTED the prior correction (commit `f6ff9e2`) on five concrete
+defects. This commit closes each; the earlier claims are SUPERSEDED here, never
+erased. Commits `b5a66f2`, `8aeefc4`, `f6ff9e2` stay intact; this is a NEW
+correction commit (no amend). Frozen plan/manifest/support hashes, `UPSTREAM.md`,
+`KNOWN_DIFFS.md`, `.gitignore`, `.oxfmtignore`, and `Cargo.lock` are all
+untouched (`Cargo.lock` still `750ee84b…`).
+
+### Rejected defects and their fixes
+
+1. **External normalization checked only the nearest existing node, not every
+   existing component.** `physical_normalize`'s out-of-project arm rejected a
+   symlink only at `existing` (the nearest-existing ancestor), so an
+   intermediate-link-then-existing-child path such as
+   `<cache>/link/child/cg` (where `link` is a symlink to a real dir and `child`
+   is an ordinary directory reached THROUGH it) would follow the alias silently.
+   Fixed: the out-of-project arm now walks EVERY prefix component from the
+   filesystem root down to `existing` and rejects the first symlink / Windows
+   reparse-point component. The in-project arm already probed the whole tail
+   below the (already-canonical) project. Both spellings are now locked by tests
+   `rejects_external_configured_root_reached_through_intermediate_symlink` and
+   the new `rejects_in_project_root_reached_through_intermediate_symlink`.
+
+2. **Scanner exclusions were lossy / direct-child basename based.** The prior
+   `reserved_child_dir_names` reduced roots to basenames and `scan_dir` only
+   pruned them when `dir == root`, so a nested configured root
+   (`CODEGRAPH_DIR=cache/index` → `<project>/cache/index`) was never excluded at
+   its true depth, and a same-basename user dir could be mis-excluded. Fixed:
+   `IndexPaths::reserved_index_roots` now returns the EXACT resolved physical
+   root PATHS (full `PathBuf`s, re-anchored onto the caller's `project` spelling
+   for in-project roots, absolute for external ones); `scan_dir` prunes a
+   directory iff its FULL path equals one of them (at any depth), keeping the
+   `.git`-at-root rule. New tests: `reserved_roots_include_nested_configured_roots_at_true_depth`,
+   `scan_excludes_only_top_level_root_paths_not_same_named_nested_dirs`; the
+   default/relative/degrade tests were rewritten to assert full paths.
+
+3. **CLI/MCP fallbacks masked invalid configuration.** `cmd_status` degraded an
+   unresolvable/aliased `CODEGRAPH_DIR` to a default `.codegraph-v2` layout and
+   reported "not initialized"; `roots::db_path_for` returned a reconstructed
+   default path. Fixed: `cmd_status` now propagates the `IndexPaths::resolve`
+   error (fail closed) instead of masking it; `roots::db_path_for` returns
+   `Option<PathBuf>` (`None` on a resolve failure) with a shared
+   `db_exists_for` probe, and `server.rs engine_for` maps `None` to a stable
+   error rather than opening a reconstructed path. `is_initialized` stays an
+   infallible discovery probe by design (a resolve failure ⇒ "not initialized",
+   discovery keeps walking; the mutating/opening paths re-resolve fail-closed).
+   New CLI regression `status_fails_closed_on_invalid_configured_root_without_mutation_via_cli`
+   proves both text and `--json` status fail closed and mutate zero bytes.
+
+4. **Real MCP configured-root / cross-project tests were missing.** Added a
+   dedicated test binary `crates/codegraph-mcp/tests/mcp_configured_root.rs`
+   (separate process; serializes the process-global `CODEGRAPH_DIR` via an
+   `ENV_LOCK`): `configured_relative_root_mcp_opens_identity_sibling_db` proves a
+   real `McpServer` `tools/call` opens the identity-suffixed sibling DB (not the
+   simple-join), and `two_projects_sharing_absolute_root_cannot_cross_read_via_mcp`
+   proves two projects on ONE absolute configured root get distinct roots and
+   cannot cross-read. Added a CLI-surface counterpart
+   `two_projects_sharing_escaping_relative_root_get_distinct_roots_via_cli`.
+
+5. **A stale rustdoc link.** `DEFAULT_CURRENT_DIR`'s doc referenced the removed
+   `IndexPaths::current_root_lenient`; retargeted to `IndexPaths::resolve`.
+
+Also replaced the previous `db_path_for_returns_none_on_invalid_configured_root`
+unit test — which mutated the process-global `CODEGRAPH_DIR` and could race the
+crate's env-sensitive readers — with the race-free
+`db_path_for_returns_none_on_resolve_failure` (a nonexistent project triggers the
+same `resolve` failure without touching the env); the invalid-`CODEGRAPH_DIR`
+path is covered end-to-end by the real CLI/MCP black-box regressions. Removed the
+now-unused `ENV_LOCK` from `roots.rs`.
+
+### Verification
+
+`bash scripts/check-workspace-versions.sh` (OK, lock `750ee84b…` unchanged);
+`cargo fmt --all --check` clean; `cargo check --workspace --all-targets --locked`
+clean; `cargo check -p codegraph-core --target x86_64-pc-windows-msvc
+--all-targets --locked` clean (cross-compile only, NOT native Windows runtime);
+`cargo clippy --workspace --all-targets --locked -- -D warnings` clean;
+`cargo test --workspace --locked` — 0 failures across all 106 suites (incl. the
+preserved initial black-box Red, the new intermediate-symlink / nested-root /
+status-fail-closed / MCP-configured-root regressions, and `codegraph-bench`
+golden byte-stability); `bash scripts/guardrail.sh` exit 0. No plan-level
+architecture change was required; state-slot / lease / Store `open_for_*` /
+uninit lifecycle and Batches A–E remain out of scope.

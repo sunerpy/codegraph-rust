@@ -40,7 +40,7 @@ use serde_json::{Value, json};
 use crate::engine::CodeGraphEngine;
 use crate::instructions::SERVER_INSTRUCTIONS;
 use crate::protocol::ToolResult;
-use crate::roots::{WorkspaceRoots, db_path_for};
+use crate::roots::{WorkspaceRoots, db_exists_for, db_path_for};
 use crate::schemas;
 
 const SERVER_NAME: &str = "codegraph";
@@ -178,7 +178,7 @@ impl CodeGraphHandler {
     fn has_default_codegraph(&self) -> bool {
         self.default_project_snapshot()
             .as_ref()
-            .is_some_and(|p| db_path_for(p).is_file())
+            .is_some_and(|p| db_exists_for(p))
     }
 
     /// Resolve a caller's `projectPath` to an INDEXED project dir, byte-for-byte
@@ -188,7 +188,7 @@ impl CodeGraphHandler {
     fn resolve_project_arg(&self, raw: Option<&str>) -> Option<PathBuf> {
         let default_project = self.default_project_snapshot();
         let Some(raw) = raw else {
-            return default_project.filter(|p| db_path_for(p).is_file());
+            return default_project.filter(|p| db_exists_for(p));
         };
         let raw_path = PathBuf::from(raw);
         let mut candidates: Vec<PathBuf> = Vec::new();
@@ -207,7 +207,7 @@ impl CodeGraphHandler {
         }
         candidates
             .into_iter()
-            .find(|candidate| db_path_for(candidate).is_file())
+            .find(|candidate| db_exists_for(candidate))
     }
 
     /// Adopt an indexed client workspace root when the current default is
@@ -629,11 +629,15 @@ pub fn serve_http(
         match &default_project {
             Some(project) => {
                 let db = db_path_for(project);
+                let db_display = db
+                    .as_ref()
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_else(|| "(invalid CODEGRAPH_DIR)".to_string());
                 tracing::info!(
                     %addr,
                     project = %project.display(),
-                    db = %db.display(),
-                    db_exists = db.is_file(),
+                    db = %db_display,
+                    db_exists = db.as_ref().is_some_and(|d| d.is_file()),
                     "streamable-HTTP serving on http://{addr}/mcp"
                 );
             }
@@ -855,11 +859,11 @@ mod handler_tests {
         TempDir { path }
     }
 
-    /// Write a placeholder (non-SQLite) db file so `db_path_for(p).is_file()` is
-    /// true — resolution treats the dir as indexed, but a real engine open fails.
+    /// Write a placeholder (non-SQLite) db file so `db_exists_for(p)` is true —
+    /// resolution treats the dir as indexed, but a real engine open fails.
     fn placeholder_indexed(tag: &str) -> TempDir {
         let dir = unique_dir(tag);
-        let db = db_path_for(&dir.path);
+        let db = db_path_for(&dir.path).expect("default project resolves");
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         std::fs::write(&db, b"not a real sqlite db").unwrap();
         dir
@@ -1162,7 +1166,7 @@ mod handler_tests {
     /// + `engine.execute` success arm of `execute_owned`.
     fn real_indexed_project(tag: &str) -> TempDir {
         let dir = unique_dir(tag);
-        let db = db_path_for(&dir.path);
+        let db = db_path_for(&dir.path).expect("default project resolves");
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         let root = workspace_root();
         std::fs::copy(root.join("reference/golden/mini/colby.db"), &db).unwrap();

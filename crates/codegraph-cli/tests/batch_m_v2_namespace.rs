@@ -312,3 +312,129 @@ fn configured_dot_alias_fails_closed_without_mutation_via_cli() {
         "a `.` alias must not mutate the legacy namespace"
     );
 }
+
+/// Recursively snapshot every file path + byte length under `root`, sorted, so a
+/// command can be proven byte-nonmutating by comparing the before/after set.
+fn tree_snapshot(root: &Path) -> Vec<(String, u64)> {
+    fn walk(dir: &Path, base: &Path, out: &mut Vec<(String, u64)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.is_dir() {
+                walk(&path, base, out);
+            } else {
+                let rel = path
+                    .strip_prefix(base)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((rel, meta.len()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+/// `status` under an invalid/aliasing `CODEGRAPH_DIR` must FAIL CLOSED through
+/// the REAL CLI — surfacing the stable diagnostic instead of masking the bad
+/// configuration behind a default `.codegraph-v2` "not initialized" report — and
+/// must leave the project tree byte-for-byte unchanged (a read command never
+/// mutates). This is the CLI-side proof of the status fail-closed correction.
+#[test]
+fn status_fails_closed_on_invalid_configured_root_without_mutation_via_cli() {
+    let dir = TestDir::new("status-invalid");
+    let project = dir.path().join("mini");
+    copy_tree(&mini_fixture(), &project);
+    let p = project.to_str().unwrap();
+
+    let before = tree_snapshot(&project);
+
+    for json in [false, true] {
+        let mut args = vec!["status"];
+        if json {
+            args.push("--json");
+        }
+        args.push(p);
+        let run = run_in_env(dir.path(), &args, &[("CODEGRAPH_DIR", ".")]);
+        assert!(
+            !run.ok,
+            "status (json={json}) with CODEGRAPH_DIR=. must fail closed, not report a \
+             default layout: stdout={} stderr={}",
+            run.stdout, run.stderr
+        );
+        assert!(
+            !run.stdout.contains(".codegraph-v2"),
+            "status must NOT mask an invalid configured root as a `.codegraph-v2` \
+             default: stdout={}",
+            run.stdout
+        );
+    }
+
+    let after = tree_snapshot(&project);
+    assert_eq!(
+        before, after,
+        "a fail-closed `status` must leave the project tree byte-for-byte unchanged"
+    );
+}
+
+/// An escaping relative `CODEGRAPH_DIR` (`../shared/cg`) is a VALID configured
+/// root that escapes the project; two sibling projects given the same escaping
+/// value must each `init` into their own identity-suffixed sibling under the
+/// shared external parent, never a single shared simple-join DB — the REAL-CLI
+/// counterpart of the absolute-root isolation case.
+#[test]
+fn two_projects_sharing_escaping_relative_root_get_distinct_roots_via_cli() {
+    let dir = TestDir::new("cfg-escape");
+    let base = dir.path();
+    let project_a = base.join("a");
+    let project_b = base.join("b");
+    copy_tree(&mini_fixture(), &project_a);
+    copy_tree(&mini_fixture(), &project_b);
+    std::fs::create_dir_all(base.join("shared")).unwrap();
+
+    for project in [&project_a, &project_b] {
+        let run = run_in_env(
+            base,
+            &["init", project.to_str().unwrap()],
+            &[("CODEGRAPH_DIR", "../shared/cg")],
+        );
+        assert!(
+            run.ok,
+            "init with escaping CODEGRAPH_DIR must succeed for {}: {} {}",
+            project.display(),
+            run.stdout,
+            run.stderr
+        );
+    }
+
+    let shared_parent = base.join("shared");
+    let siblings: Vec<String> = std::fs::read_dir(&shared_parent)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("cg-v2-"))
+        .collect();
+    assert_eq!(
+        siblings.len(),
+        2,
+        "two projects sharing an escaping relative root must produce two distinct \
+         identity siblings, got {siblings:?}"
+    );
+    assert_ne!(
+        siblings[0], siblings[1],
+        "the two current roots must differ"
+    );
+    assert!(
+        !shared_parent.join("cg").join("codegraph.db").is_file(),
+        "the escaping simple-join `shared/cg/codegraph.db` must never exist"
+    );
+}
