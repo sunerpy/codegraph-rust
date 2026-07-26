@@ -2601,3 +2601,102 @@ changes no schema, node-ID formula, extraction or golden byte, `UPSTREAM.md`, or
 evidence bytes are written BEFORE repository formatting and the one authoritative
 `bash scripts/check-workspace-versions.sh && make ci CARGO='cargo --locked'` run
 over these exact final bytes; no final Green is claimed until that gate passes.
+
+## Batch M item 16 acceptance closure — long-lived MCP releases handles per request (2026-07-26)
+
+Frozen plan item 16 asks for `long_lived_v2_mcp_releases_handles_per_request`: a
+long-lived shipped MCP process must let the v2 main database be REPLACED on
+Windows without the compatibility close seam and then serve only the replacement
+graph, using a child-process ready/continue barrier around request completion and
+file replacement, explicitly selected in the native Windows CI job.
+
+The acceptance lands as one new query-side test target,
+`crates/codegraph-cli/tests/batch_m_long_lived_mcp.rs`, over the SHIPPED binary
+(`CARGO_BIN_EXE_codegraph`). No production byte changed: M15 already made MCP
+engines request-scoped, so this item is the behavioral proof of that ownership,
+not a new mechanism.
+
+The barrier is the MCP wire protocol, never a sleep. ONE
+`codegraph serve --mcp --no-watch --path <project>` child (daemon opted out via
+`CODEGRAPH_NO_DAEMON=1`, so the session is a single direct process rather than a
+proxy) is driven over stdio pipes. READY is the arrival of the framed JSON-RPC
+response for request 1 — rmcp writes that frame only after the request produced
+its owned, fully materialized result, so the frame proves end-to-end completion
+rather than mere SQL completion. The parent then acquires the namespace's
+EXCLUSIVE lease through `IndexLease::acquire_exclusive_existing`; a retained
+reader lease makes that acquisition fail, so it is the fail-closed observation
+that the child released everything. Still holding the lease, the parent
+`fs::rename`s a separately built database over the live main database file — the
+Windows-specific handle proof, since `MoveFileEx` + `REPLACE_EXISTING` fails with
+a sharing violation while any process holds an open handle on the destination.
+CONTINUE is the next request frame, which cannot have been read earlier because it
+had not been written. The 60s channel/lease deadlines are deadlock guards only; no
+assertion is satisfied by waiting, and neither mtime nor process exit is used as
+ordering evidence.
+
+Both databases come from the real `codegraph init`, so the replaced namespace
+keeps its own permanent lock, its own published `Current` state slots, and an
+exact extraction stamp in the replaced bytes. The test additionally asserts the
+replaced namespace stays sidecar-free and that the lock and state slots survive,
+so no state/sidecar/stamp/lease gate is weakened or repaired.
+
+The startup catch-up race identified in manual review is CLOSED with runtime
+evidence rather than documented as a caveat. `serve --mcp --path` spawns a
+one-shot catch-up sync on a detached thread and `--no-watch` does not disable it,
+so a reindex could otherwise satisfy (or later undo) the post-replacement
+assertions. The two distinguishing sources therefore live under a directory the
+served project's own root `.gitignore` excludes, and the test PROVES the exclusion
+with the shipped `codegraph_extract::engine::scan_project` — the same scanner a
+sync feeds from — before the acceptance runs: the neutral shared file is scanned,
+both supplied files are not. No sync can create those rows (the scanner never
+yields the paths) and none can delete them (the cold removal pass only considers a
+tracked path absent from disk, and both files stay present, which the test also
+asserts). The remaining scannable file is byte-identical in both graphs, so the
+catch-up is a proven no-op. The only way request 2 can see the replacement file is
+by reading the supplied bytes.
+
+The forbidden-seam invariant is kept and strengthened rather than weakened: it now
+inspects only NON-COMMENT lines of this file's own source for a needle assembled
+from two halves, so it detects a real invocation, an import, an alias, or a
+wrapper while the module docs may still name the seam in prose. A companion unit
+test proves the oracle sees a real call line and ignores a comment mentioning the
+same name, so it cannot pass vacuously.
+
+Three negative-control runs establish the assertions are load-bearing (each
+reverted immediately, file restored to SHA-256
+`773a23abf4dee6ddac8acd6cf7bee6a0600dd9203051c8efc22d9f7502f40731`): renaming the
+target onto itself instead of installing the replacement fails request 2 with
+`No results found for "hbtvancur"`; commenting out the `.gitignore` line fails the
+scan-freeze precondition, which is exactly the reindex loophole the design closes;
+and adding a real `server.close_cached_handles()` call makes the forbidden-seam
+oracle fail and name the offending line.
+
+Local Green on the integrated bytes, with
+`bash scripts/check-workspace-versions.sh` run before every Cargo batch and
+`--locked` on every Cargo command:
+`cargo test --locked -p codegraph-rs --test batch_m_long_lived_mcp` **3/3**,
+`cargo test --locked -p codegraph-rs --test lease_lifetime` **5/5**, and
+`cargo test --locked -p codegraph-mcp --test reopen` **3/3**. Workspace all-target
+check, Clippy with `-D warnings`, formatting, guardrail, and `git diff --check`
+also pass. Changed-file LSP diagnostics were attempted for the new target and the
+tool again rejected this required external worktree with
+`LSP file path must be inside request cwd`; locked Cargo diagnostics are the
+honest fallback and this ledger claims no LSP-clean result.
+
+Native Windows/MSVC runtime was NOT executed here and is not claimed — this Linux
+host cannot provide it. Windows coverage in this slice is CI WIRING: the existing
+native `windows-latest` job gains one additional step,
+`cargo test -p codegraph-rs --test batch_m_long_lived_mcp`, which selects this
+exact target explicitly so the replacement acceptance runs natively and is never
+reduced to compile-only or skipped. Every existing Windows step — including the
+M22 legacy-fixture wiring — is byte-preserved, and the surrounding jobs, action
+pins, and the `CI Success` gate are unchanged.
+
+This slice adds no dependency and changes no schema, node-ID formula, extraction
+or golden byte, `UPSTREAM.md`, or `KNOWN_DIFFS.md`; the frozen plan is untouched
+at SHA-256 `5b64aa335fb32cd228d98404c2e44153e9134d26a912ecb02d71fcf5c5798450` and
+`Cargo.lock` remains required at SHA-256
+`750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`. These
+evidence bytes are written BEFORE repository formatting and the one authoritative
+`bash scripts/check-workspace-versions.sh && make ci CARGO='cargo --locked'` run
+over these exact final bytes; no final Green is claimed until that gate passes.

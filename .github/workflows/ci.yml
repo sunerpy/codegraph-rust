@@ -87,6 +87,17 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --exclude codegraph-bench
 
+      # Batch M item 16 acceptance: ONE long-lived shipped `serve --mcp` process
+      # releases every SQLite handle when a request completes, so the v2 main
+      # database can be REPLACED (MoveFileEx + REPLACE_EXISTING) without the
+      # compatibility close seam, and the next request serves only the
+      # replacement graph. The replacement rename is the Windows-specific handle
+      # proof (a retained handle makes it fail with a sharing violation), so this
+      # target is selected EXPLICITLY here — never compile-only, never skipped —
+      # even though the workspace run above already covers it.
+      - name: Run Batch M item 16 native Windows replacement acceptance
+        run: cargo test -p codegraph-rs --test batch_m_long_lived_mcp
+
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
