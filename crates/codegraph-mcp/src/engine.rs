@@ -9,6 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use codegraph_core::types::{EdgeKind, FileRecord, Node, NodeKind};
 use codegraph_graph::graph::{GodotReach, GraphTraverser, NodeEdge};
@@ -59,27 +60,28 @@ const TYPE_KINDS: [NodeKind; 7] = [
 /// for forward-compatibility, but extraction-widening is DEFERRED per the plan).
 const SIG_EDGE_KINDS: [EdgeKind; 3] = [EdgeKind::References, EdgeKind::TypeOf, EdgeKind::Returns];
 
-/// Holds an opened project store. One engine per project path; the server keeps
-/// a cache keyed by resolved project path (mirrors `ToolHandler.projectCache`,
-/// `tools.ts:591`).
+/// Holds one request-scoped project store. Its retained shared lease remains
+/// live until the request has produced its final result.
 pub struct CodeGraphEngine {
     store: Store,
     project_root: PathBuf,
 }
 
 impl CodeGraphEngine {
+    const READ_LEASE_TIMEOUT: Duration = Duration::from_secs(30);
+
     /// Open the store at the project's current (v2) index DB, resolved
     /// fail-closed through the single `codegraph-core::IndexPaths` authority
     /// (`.codegraph-v2/codegraph.db` by default; a `<name>-v2-<projectIdentity>`
     /// sibling for a configured `CODEGRAPH_DIR`). An unsafe/aliased/overlapping
     /// configured root errors here rather than opening a reconstructed path.
     pub fn open(project_root: &Path) -> anyhow::Result<Self> {
-        let db_path = codegraph_core::IndexPaths::resolve(
+        let paths = codegraph_core::IndexPaths::resolve(
             project_root,
             std::env::var("CODEGRAPH_DIR").ok().as_deref(),
-        )?
-        .current_db();
-        let store = Store::open(&db_path)?;
+        )?;
+        let store =
+            Store::open_for_read(&paths, Instant::now() + Self::READ_LEASE_TIMEOUT, || false)?;
         Ok(Self {
             store,
             project_root: project_root.to_path_buf(),
@@ -3878,6 +3880,8 @@ mod tests {
             let db = base.join(".codegraph-v2").join("codegraph.db");
             Store::open(&db).unwrap();
         }
+        let paths = codegraph_core::IndexPaths::resolve(&base, None).unwrap();
+        codegraph_store::test_support::finalize_current_test_fixture(&paths).unwrap();
         let engine = CodeGraphEngine::open(&base).unwrap();
         let tr = engine.execute("codegraph_status", &serde_json::json!({}));
         assert!(text_of(&tr).contains("## CodeGraph Status"));

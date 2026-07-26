@@ -7,6 +7,8 @@ pub mod migrations;
 pub mod queries;
 pub mod rebuild;
 pub mod schema;
+#[cfg(feature = "test-hooks")]
+pub mod test_support;
 pub mod uninit;
 
 pub use connection::{

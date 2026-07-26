@@ -94,6 +94,8 @@ fn setup_mini_project() -> TestProject {
         &root.join("reference/golden/mini/colby.db"),
         &base.join(".codegraph-v2").join("codegraph.db"),
     );
+    let paths = codegraph_core::IndexPaths::resolve(&base, None).unwrap();
+    codegraph_store::test_support::finalize_current_test_fixture(&paths).unwrap();
 
     let fixtures = root.join("crates/codegraph-bench/fixtures/mini");
     for rel in ["src/app.ts", "src/math.ts", "tools/greeter.py"] {
@@ -772,6 +774,8 @@ fn index_fixture(files: &[(&str, &str)]) -> TestProject {
     }
     store.insert_edges(&all_edges).unwrap();
     drop(store);
+    let paths = codegraph_core::IndexPaths::resolve(&base, None).unwrap();
+    codegraph_store::test_support::finalize_current_test_fixture(&paths).unwrap();
     TestProject { path: base }
 }
 

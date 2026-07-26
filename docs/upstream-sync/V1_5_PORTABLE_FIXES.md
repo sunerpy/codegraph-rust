@@ -2441,3 +2441,64 @@ native Windows runtime validation was run and none is claimed.
 `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`.
 This evidence was appended before the closure's final `make fmt` and authoritative
 locked CI run so no post-CI documentation edit can invalidate formatting.
+
+## Batch M item 15 acceptance closure — request-scoped reader leases (2026-07-26)
+
+The CLI and both MCP request paths now open a state-gated `Store` through a
+request-scoped `CodeGraphEngine`. The retained shared `IndexLease` spans SQLite
+corroboration, query execution, and complete owned result materialization, then
+drops before the next request. No SQLite connection or lease remains cached in a
+long-lived MCP session. Status contention is reported as `rebuilding: true` and
+`initialized: false`; raw DB-path presence is not represented as a corroborated
+readable Current index.
+
+The deterministic cross-process acceptance barrier is feature-gated through
+`codegraph-store/test-hooks` and is feature-unified only into package test builds.
+It acknowledges shared or exclusive ownership only after kernel locking and
+final fixed-path corroboration, then waits on a bounded loopback socket rather
+than inferring ordering from sleeps. The reader acceptance covers CLI query,
+direct stdio MCP, the real daemon proxy, streamable HTTP MCP, and status. The
+writer acceptance holds the watcher's exclusive lease before SQLite open and
+proves that a new read and busy status neither open nor mutate DB/WAL/SHM bytes.
+The HTTP child uses a fixture-owned `CODEGRAPH_HTTP_REGISTRY_DIR`, which is
+explicitly removed and checked absent after child termination.
+
+The SQLite nonmutation oracle treats only typed `NotFound` as absence. Every
+other metadata, open, read, kind, length, or identity error fails closed. It
+rejects aliases and non-regular entries, reads complete bytes from one handle,
+and re-corroborates that the fixed path still names that handle. Unix uses
+device/inode identity; the Windows branch uses `FileIdInfo`. Executable self-tests
+prove rejection of a non-regular artifact and, on Unix, an alias without reading
+or changing its external target.
+
+Replacement freshness is behavioral rather than cache-seam dependent: one
+long-lived `McpServer` serves only the replacement graph on its next request
+without calling `close_cached_handles()`. The retained diagnostic counts observed
+DB identity changes between successful requests; it does not count engine or
+connection opens. The compatibility seam only clears identity observations and
+has a separate regression proving that it cannot synthesize a replacement event.
+Fixture builders used by MCP tests now finalize directly created/copied SQLite
+bytes with a permanent lock, extraction stamp, and `Building -> Current` state
+publication through the feature-gated test helper; production read gates remain
+strict.
+
+Focused tests on the reviewed bytes passed before this append, with
+`bash scripts/check-workspace-versions.sh` before Cargo batches and `--locked` on
+dependency-resolving commands: `lease_lifetime` passed **5/5** and `reopen`
+passed **3/3**. Targeted package check, Clippy with `-D warnings`, formatting, and
+`git diff --check` also passed. Changed-file LSP diagnostics were retried for all
+modified and new Rust files, but the tool rejected this required external
+worktree with `LSP file path must be inside request cwd`; locked Cargo diagnostics
+are the fallback, and this ledger does not claim LSP-clean results. Native Windows
+runtime validation was unavailable and is not claimed; Windows-only identity
+code remains compile/CI-owned evidence.
+
+The frozen Revision 14 plan remains required at SHA-256
+`5b64aa335fb32cd228d98404c2e44153e9134d26a912ecb02d71fcf5c5798450`, and
+`Cargo.lock` remains required at SHA-256
+`750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`.
+No schema, node-ID formula, extraction/golden byte, workflow, `UPSTREAM.md`, or
+`KNOWN_DIFFS.md` change belongs to this slice. These evidence bytes are written
+before formatting and the one authoritative
+`bash scripts/check-workspace-versions.sh && make ci CARGO='cargo --locked'` run;
+no final Green is claimed until that post-documentation gate passes.

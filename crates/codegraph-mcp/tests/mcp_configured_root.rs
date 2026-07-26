@@ -83,16 +83,18 @@ fn unique_dir(tag: &str) -> TempDir {
     TempDir { path }
 }
 
-fn stage_mini_db_at(db: &Path, project: &Path) {
+fn stage_mini_db_at(paths: &codegraph_core::IndexPaths, project: &Path) {
     let root = workspace_root();
+    let db = paths.current_db();
     fs::create_dir_all(db.parent().unwrap()).unwrap();
-    fs::copy(root.join("reference/golden/mini/colby.db"), db).unwrap();
+    fs::copy(root.join("reference/golden/mini/colby.db"), &db).unwrap();
     let fixtures = root.join("crates/codegraph-bench/fixtures/mini");
     for rel in ["src/app.ts", "src/math.ts"] {
         let dst = project.join(rel);
         fs::create_dir_all(dst.parent().unwrap()).unwrap();
         fs::copy(fixtures.join(rel), &dst).unwrap();
     }
+    codegraph_store::test_support::finalize_current_test_fixture(paths).unwrap();
 }
 
 fn tool_call_search(project: &Path, project_path_arg: &str) -> Value {
@@ -126,7 +128,7 @@ fn configured_relative_root_mcp_opens_identity_sibling_db() {
     let _env = EnvGuard::set("cache");
 
     let paths = codegraph_core::IndexPaths::resolve(base, Some("cache")).expect("resolve");
-    stage_mini_db_at(&paths.current_db(), base);
+    stage_mini_db_at(&paths, base);
     assert!(
         !base.join("cache").join("codegraph.db").is_file(),
         "configured root must resolve to the identity sibling, not the simple-join"
@@ -167,7 +169,7 @@ fn two_projects_sharing_absolute_root_cannot_cross_read_via_mcp() {
     let _env = EnvGuard::set(&shared_str);
 
     let paths_a = codegraph_core::IndexPaths::resolve(&project_a, Some(&shared_str)).expect("a");
-    stage_mini_db_at(&paths_a.current_db(), &project_a);
+    stage_mini_db_at(&paths_a, &project_a);
 
     let paths_b = codegraph_core::IndexPaths::resolve(&project_b, Some(&shared_str)).expect("b");
     assert_ne!(
@@ -374,10 +376,9 @@ fn invalid_configured_root_mcp_fails_closed_and_never_serves_trap_default_db() {
     let project = dir.path.join("mini");
     fs::create_dir_all(&project).unwrap();
 
-    let trap_db = project
-        .join(codegraph_core::index_paths::DEFAULT_CURRENT_DIR)
-        .join("codegraph.db");
-    stage_mini_db_at(&trap_db, &project);
+    let trap_paths = codegraph_core::IndexPaths::resolve(&project, None).unwrap();
+    let trap_db = trap_paths.current_db();
+    stage_mini_db_at(&trap_paths, &project);
     assert!(
         trap_db.is_file(),
         "sanity: the trap DB must exist at the default namespace a fallback would open"
@@ -438,12 +439,8 @@ fn invalid_configured_root_rmcp_fails_closed_and_never_serves_trap_default_db() 
     let dir = unique_dir("trap-rmcp");
     let project = dir.path.join("mini");
     fs::create_dir_all(&project).unwrap();
-    stage_mini_db_at(
-        &project
-            .join(codegraph_core::index_paths::DEFAULT_CURRENT_DIR)
-            .join("codegraph.db"),
-        &project,
-    );
+    let trap_paths = codegraph_core::IndexPaths::resolve(&project, None).unwrap();
+    stage_mini_db_at(&trap_paths, &project);
 
     let _env = EnvGuard::set(".");
 

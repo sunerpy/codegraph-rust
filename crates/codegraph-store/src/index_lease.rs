@@ -11,6 +11,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "test-hooks")]
+use std::io::{Read, Write};
+
 use codegraph_core::IndexPaths;
 use thiserror::Error;
 
@@ -388,14 +391,17 @@ impl IndexLease {
                         return Err(changed(&lock_path));
                     }
                     checkpoint(AcquireCheckpoint::FinalPathCorroborated);
-                    return Ok(Self {
+                    let lease = Self {
                         inner: Arc::new(LeaseInner {
                             file,
                             mode,
                             db_parent,
                             lock_path,
                         }),
-                    });
+                    };
+                    #[cfg(feature = "test-hooks")]
+                    lease_test_barrier(mode);
+                    return Ok(lease);
                 }
                 Err(std::fs::TryLockError::WouldBlock) => {
                     // Check cancellation after every observed contention, then
@@ -421,6 +427,52 @@ impl IndexLease {
             }
         }
     }
+}
+
+/// Deterministic cross-process checkpoint used only by integration-test builds.
+///
+/// A test child opts in by supplying a loopback listener address and the lease
+/// mode it wants to stop. The hook writes one acknowledged mode byte only after
+/// the kernel lock and final path corroboration both succeeded, then waits for a
+/// release byte with bounded socket timeouts. No corresponding strings or I/O
+/// path are compiled into normal/release builds.
+#[cfg(feature = "test-hooks")]
+fn lease_test_barrier(mode: LeaseMode) {
+    const ADDR_ENV: &str = "CODEGRAPH_TEST_LEASE_BARRIER_ADDR";
+    const MODE_ENV: &str = "CODEGRAPH_TEST_LEASE_BARRIER_MODE";
+    const WAIT: Duration = Duration::from_secs(10);
+
+    let expected = match std::env::var(MODE_ENV) {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    let (mode_name, marker) = match mode {
+        LeaseMode::Shared => ("shared", b'S'),
+        LeaseMode::Exclusive => ("exclusive", b'X'),
+    };
+    if expected != mode_name {
+        return;
+    }
+    let address = std::env::var(ADDR_ENV)
+        .unwrap_or_else(|_| panic!("{MODE_ENV} requires {ADDR_ENV}"))
+        .parse()
+        .unwrap_or_else(|error| panic!("invalid {ADDR_ENV}: {error}"));
+    let mut stream = std::net::TcpStream::connect_timeout(&address, WAIT)
+        .unwrap_or_else(|error| panic!("connect lease test barrier {address}: {error}"));
+    stream
+        .set_read_timeout(Some(WAIT))
+        .expect("set lease test barrier read timeout");
+    stream
+        .set_write_timeout(Some(WAIT))
+        .expect("set lease test barrier write timeout");
+    stream
+        .write_all(&[marker])
+        .expect("acknowledge lease test barrier arrival");
+    let mut release = [0_u8; 1];
+    stream
+        .read_exact(&mut release)
+        .expect("receive lease test barrier release");
+    assert_eq!(release, [b'R'], "invalid lease test barrier release byte");
 }
 
 fn validated_path_metadata(lock_path: &Path) -> Result<std::fs::Metadata, IndexLeaseError> {

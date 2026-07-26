@@ -44,6 +44,10 @@ time = { workspace = true }
 
 [dev-dependencies]
 codegraph-bench = { path = "../codegraph-bench" }
+# Feature-unifies the Store's lease barrier into `CARGO_BIN_EXE_codegraph` only
+# while this package's test targets are built. A normal binary build uses the
+# feature-free dependency declared above.
+codegraph-store = { path = "../codegraph-store", features = ["test-hooks"] }
 rstest = { workspace = true }
 assert_fs = { workspace = true }
 assert_cmd = { workspace = true }

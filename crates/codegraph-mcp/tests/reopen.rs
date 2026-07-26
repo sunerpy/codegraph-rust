@@ -1,10 +1,10 @@
-//! T6 (#925): `McpServer` reopens its cached `CodeGraphEngine` when the
-//! project's `.codegraph/codegraph.db` is REPLACED on disk, so a long-lived
-//! `serve` never keeps serving a stale database.
+//! T6 (#925): a long-lived `McpServer` serves replacement database contents
+//! without retaining a `CodeGraphEngine`, SQLite connection, or read lease
+//! between requests.
 //!
 //! The decision is keyed on the db file IDENTITY (unix inode / a content-based
 //! signature on non-unix), NOT on modified-time: an in-place WAL write bumps
-//! mtime but does not replace the file, so it must NOT trigger a reopen. On
+//! mtime but does not replace the file, so it must NOT record a change. On
 //! non-unix the signature is a hash of the WAL-stable SQLite header slices
 //! (page count + schema cookie + structural header), which is deterministic and
 //! mtime-independent — it changes only when the db is rebuilt.
@@ -13,16 +13,24 @@ use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use codegraph_core::types::FileRecord;
 use codegraph_extract::engine::{detect_language, extract_file};
 use codegraph_mcp::McpServer;
-use codegraph_mcp::server::reopen_count;
+use codegraph_mcp::server::db_identity_change_count;
 
 use codegraph_store::Store;
 use serde_json::{Value, json};
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn counter_test_guard() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Owns a temp project dir and removes it on drop.
 struct TestProject {
@@ -48,7 +56,7 @@ fn unique_base(tag: &str) -> PathBuf {
         .as_nanos();
     let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "cg-mcp-reopen-{tag}-{}-{nanos}-{seq}",
+        "cg-mcp-identity-{tag}-{}-{nanos}-{seq}",
         std::process::id()
     ))
 }
@@ -85,11 +93,13 @@ fn index_into(base: &Path, files: &[(&str, &str)]) {
     }
     store.insert_edges(&all_edges).unwrap();
     drop(store);
+    let paths = codegraph_core::IndexPaths::resolve(base, None).unwrap();
+    codegraph_store::test_support::finalize_current_test_fixture(&paths).unwrap();
 }
 
 /// Drive one `codegraph_search` `tools/call` against `server`, returning the
-/// rendered text body (NOT a fresh server — reuse the SAME server so its engine
-/// cache persists across calls, which is the whole point of the test).
+/// rendered text body. Reusing the SAME server proves request-scoped engines do
+/// not leave stale graph state attached to the long-lived protocol session.
 fn search(server: &mut McpServer, project: &Path, query: &str) -> String {
     let req = json!({
         "jsonrpc": "2.0",
@@ -115,7 +125,8 @@ fn search(server: &mut McpServer, project: &Path, query: &str) -> String {
 }
 
 #[test]
-fn reopens_cached_engine_when_db_replaced_with_new_inode() {
+fn same_server_reads_replacement_graph_without_close_helper() {
+    let _counter = counter_test_guard();
     // Given: an indexed project whose db (inode A) contains `alphaSymbol`.
     let project = TestProject {
         path: unique_base("replace"),
@@ -127,66 +138,60 @@ fn reopens_cached_engine_when_db_replaced_with_new_inode() {
 
     let mut server = McpServer::new(Some(project.path().to_path_buf()));
 
-    // Populate the engine cache against inode A.
     let first = search(&mut server, project.path(), "alphaSymbol");
     assert!(
         first.contains("alphaSymbol"),
         "first call should find the original symbol; got:\n{first}"
     );
-    let reopens_before = reopen_count();
+    let changes_before = db_identity_change_count();
+    let identity_before = db_identity(project.path());
 
     // When: the db is REPLACED on disk with a fresh index whose content differs
-    // (a new symbol `betaSymbol`). The cached engine still holds an open WAL
-    // connection, which on windows blocks deleting the db dir (OS error 32).
-    // Drop the live connections first — `close_cached_handles` releases the file
-    // handle while keeping the cache RECORD, so the next call reopens exactly
-    // once and re-reads the freshly built db from disk. Removing the dir first
-    // guarantees a freshly built db.
-    //
-    // We deliberately do NOT assert the raw `DbIdentity` changed here. On unix
-    // the identity is the inode, and the OS is free to RECYCLE the just-deleted
-    // db's inode for the rebuilt file (observed under `cargo llvm-cov`: both =
-    // 1343671), so an `assert_ne!(id_before, id_after)` gambles on an OS
-    // implementation detail that delete+rebuild does not guarantee. That inode
-    // assertion was the sole flake source and is redundant with #925's real
-    // contract, which is the BEHAVIORAL outcome asserted below and does not
-    // depend on inode luck: the SAME cached server reopens its engine and serves
-    // the NEW on-disk content. Serving `betaSymbol` (not `alphaSymbol`, not an
-    // open error) is itself the proof the engine reopened against the fresh db.
-    server.close_cached_handles();
+    // (a new symbol `betaSymbol`). No compatibility helper participates: every
+    // request must already have dropped its engine, SQLite handles, and lease.
     fs::remove_dir_all(project.path().join(".codegraph-v2")).unwrap();
     index_into(
         project.path(),
         &[("src/b.ts", "export function betaSymbol() {}\n")],
     );
+    let identity_after = db_identity(project.path());
 
-    // Then: the SAME server's SAME tool call must REOPEN the engine — without the
-    // #925 fix the cached engine keeps serving the old db and `reopen_count`
-    // never advances (this delta is the deterministic RED probe).
+    // Then: the SAME server's next request serves only the replacement graph.
     let after = search(&mut server, project.path(), "betaSymbol");
-    let reopens_after = reopen_count();
+    let changes_after = db_identity_change_count();
+    #[cfg(unix)]
     assert_eq!(
-        reopens_after - reopens_before,
-        1,
-        "a db replacement (new inode) must trigger exactly one reopen \
-         (before={reopens_before}, after={reopens_after})"
+        changes_after - changes_before,
+        u64::from(identity_before != identity_after),
+        "the observation counter must match the inode actually allocated \
+         (before={changes_before}, after={changes_after})"
+    );
+    #[cfg(not(unix))]
+    let _ = (
+        changes_before,
+        changes_after,
+        identity_before,
+        identity_after,
     );
 
-    // And: it returns FRESH data from inode B, not an open error.
     assert!(
         after.contains("betaSymbol"),
-        "after replacement the engine must reopen and serve the new index; got:\n{after}"
+        "after replacement the next request must serve the new index; got:\n{after}"
+    );
+    assert!(
+        !after.contains("alphaSymbol"),
+        "after replacement the old graph must not leak into the response; got:\n{after}"
     );
     assert!(
         !after.to_lowercase().contains("failed to open"),
-        "reopen must not surface an open error; got:\n{after}"
+        "the replacement request must not surface an open error; got:\n{after}"
     );
 }
 
 #[test]
-fn does_not_reopen_when_inode_is_unchanged() {
-    // Given: an indexed project; one tool call populates the cache (one open,
-    // which is NOT counted as a reopen).
+fn unchanged_identity_does_not_increment_observation_count() {
+    let _counter = counter_test_guard();
+    // Given: one request establishes the server's identity observation baseline.
     let project = TestProject {
         path: unique_base("stable"),
     };
@@ -198,7 +203,7 @@ fn does_not_reopen_when_inode_is_unchanged() {
     let mut server = McpServer::new(Some(project.path().to_path_buf()));
 
     let _ = search(&mut server, project.path(), "gammaSymbol");
-    let after_first = reopen_count();
+    let after_first = db_identity_change_count();
 
     // When: more calls run WITHOUT replacing the db (same file), even after an
     // in-place mtime bump (a normal WAL write) — that must NOT be treated as a
@@ -215,19 +220,44 @@ fn does_not_reopen_when_inode_is_unchanged() {
     for _ in 0..5 {
         let _ = search(&mut server, project.path(), "gammaSymbol");
     }
-    let after_many = reopen_count();
+    let after_many = db_identity_change_count();
 
-    // Then: the engine identity is stable — no reopen fired after the initial
-    // open, despite the changed mtime.
+    // Then: the stable identity produced no replacement observation.
     assert_eq!(
         after_first, after_many,
-        "a same-file (in-place) project must NOT trigger any reopen \
+        "a same-file (in-place) project must NOT record an identity change \
          (after_first_call={after_first}, after_many={after_many})"
     );
 }
 
+#[test]
+fn close_cached_handles_resets_diagnostics_without_forcing_replacement() {
+    let _counter = counter_test_guard();
+    let project = TestProject {
+        path: unique_base("close-diagnostic"),
+    };
+    index_into(
+        project.path(),
+        &[("src/a.ts", "export function deltaSymbol() {}\n")],
+    );
+    let mut server = McpServer::new(Some(project.path().to_path_buf()));
+    assert!(search(&mut server, project.path(), "deltaSymbol").contains("deltaSymbol"));
+    let before = db_identity_change_count();
+
+    server.close_cached_handles();
+    let after = search(&mut server, project.path(), "deltaSymbol");
+
+    assert!(after.contains("deltaSymbol"));
+    assert_eq!(
+        db_identity_change_count(),
+        before,
+        "clearing diagnostic identity state must not synthesize a replacement"
+    );
+}
+
 /// Mirror of the production `DbIdentity` for the project's db file, folded into
-/// a single `u128` so the replace test can assert the identity actually changed.
+/// a single `u128` so the replacement test can condition its metric assertion
+/// on the identity the filesystem actually allocated.
 /// Unix uses the inode; non-unix mirrors the production `(len, creation_time,
 /// header_sig)` fold where `header_sig` hashes the SAME WAL-stable SQLite header
 /// slices (`[16..24]`, `[28..32]`, `[40..44]`) — NO mtime, so a pure mtime touch

@@ -1272,7 +1272,6 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
     let index_root = resolved.current_root().to_path_buf();
     let db = resolved.current_db();
     let db_exists = db.is_file();
-    let extraction_status = Store::extraction_status(&resolved);
     let legacy_index_paths = resolved
         .legacy_roots()
         .iter()
@@ -1284,7 +1283,47 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
     let daemon_pid_path = codegraph_daemon::daemon_pid_path(&project);
     let daemon_socket_path = codegraph_daemon::recorded_socket_path(&project);
     let daemon_log_path = codegraph_daemon::daemon_log_path(&project);
-    if !is_initialized(&project) {
+    let status_open = Store::open_for_status(
+        &resolved,
+        std::time::Instant::now() + STATUS_LEASE_TIMEOUT,
+        || false,
+    )?;
+    if status_open.rebuilding {
+        if json_output {
+            print_json(&json!({
+                // The exclusive owner may be between lifecycle publications.
+                // DB presence alone cannot corroborate a readable Current index.
+                "initialized": false,
+                "version": VERSION,
+                "projectPath": project,
+                "indexPath": index_root,
+                "lastIndexed": null,
+                "rebuilding": true,
+                "dbPath": db,
+                "dbExists": db_exists,
+                "extractionStatus": null,
+                "extractionStatusDetail": "rebuilding",
+                "legacyIndexPresent": legacy_index_present,
+                "legacyIndexPaths": legacy_index_paths,
+                "daemonRunning": daemon_running,
+                "daemonPidPath": daemon_pid_path,
+                "daemonSocketPath": daemon_socket_path,
+                "daemonLogPath": daemon_log_path,
+            }))?;
+        } else {
+            println!("\nCodeGraph Status\n");
+            println!("Project: {}", project.display());
+            println!("DB Path: {}", db.display());
+            println!("State:   rebuilding");
+        }
+        return Ok(());
+    }
+    let extraction_status = status_open
+        .status
+        .clone()
+        .expect("a non-busy status probe always classifies the namespace");
+    let store = status_open.into_store();
+    if store.is_none() {
         if json_output {
             print_json(&json!({
                 "initialized": false,
@@ -1324,7 +1363,7 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
         return Ok(());
     }
 
-    let store = open_store(&project)?;
+    let store = store.expect("Current status retains its corroborated read store");
     let counts = store.counts()?;
     let nodes_by_kind = store.node_counts_by_kind()?;
     let files_by_language = store.file_counts_by_language()?;
@@ -3509,6 +3548,8 @@ struct BulkIndexPragmaGuard {
 /// Bounded wall-clock budget for acquiring the one outer exclusive lease. Never a
 /// blocking wait: `IndexLease` polls `try_lock` against this monotonic deadline.
 const REBUILD_LEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const READ_LEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const STATUS_LEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
 impl BulkIndexPragmaGuard {
     fn begin(
@@ -4338,7 +4379,13 @@ fn exact_or_top_matches<'a>(matches: &'a [Node], symbol: &str) -> Vec<&'a Node> 
 }
 
 fn open_store(project: &Path) -> Result<Store> {
-    Store::open(&db_path(project)?).map_err(Into::into)
+    let paths = index_paths(project)?;
+    Store::open_for_read(
+        &paths,
+        std::time::Instant::now() + READ_LEASE_TIMEOUT,
+        || false,
+    )
+    .map_err(Into::into)
 }
 
 /// Whether `project` has a current-namespace index DB. An unsafe/aliased
@@ -4544,6 +4591,18 @@ fn latest_indexed_at(store: &Store) -> Result<Option<i64>> {
 }
 
 fn journal_mode(store: &Store) -> Result<String> {
+    // A state-gated reader executes queries against a private deserialized
+    // in-memory image so it cannot create `-wal`/`-shm` sidecars. Its PRAGMA
+    // therefore reports `memory`, not the authoritative main database's mode.
+    // While the Store retains its shared lease, inspect SQLite's two format
+    // bytes instead: 2/2 is the durable WAL marker. Fall back to PRAGMA for
+    // legacy/non-WAL stores where the header cannot distinguish every rollback
+    // journal variant.
+    let mut header = [0_u8; 20];
+    fs::File::open(store.path())?.read_exact(&mut header)?;
+    if header.starts_with(b"SQLite format 3\0") && header[18] == 2 && header[19] == 2 {
+        return Ok("wal".to_string());
+    }
     store
         .connection()
         .query_row("PRAGMA journal_mode", [], |row| row.get(0))

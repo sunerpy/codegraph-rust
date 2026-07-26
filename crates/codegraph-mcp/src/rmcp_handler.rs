@@ -7,14 +7,11 @@
 //!
 //! ## Sync engine bridge
 //!
-//! [`CodeGraphEngine`] wraps a `rusqlite::Connection` — `Send + !Sync`. rmcp
-//! handler futures are `Send + 'static`, so a `&CodeGraphEngine` borrowed
-//! through the cache mutex may NOT cross an `.await`, and a `spawn_blocking`
-//! closure (`'static + Send`) cannot borrow `&self`. `call_tool` therefore does
-//! the WHOLE "open-or-get-cached engine + execute + render to an OWNED
-//! [`ToolResult`]" inside ONE `spawn_blocking` closure: it moves in an `Arc`
-//! clone of the cache + owned project path + owned args and returns an owned
-//! result. No engine borrow crosses the closure boundary.
+//! [`CodeGraphEngine`] wraps a `rusqlite::Connection` — `Send + !Sync` — and is
+//! deliberately request-scoped so its retained shared lease spans the complete
+//! query but never survives into the next request. `call_tool` therefore does
+//! the WHOLE "open + execute + render to an OWNED [`ToolResult`]" inside ONE
+//! `spawn_blocking` closure. No engine borrow crosses the closure boundary.
 //!
 //! ## Panic isolation
 //!
@@ -23,7 +20,6 @@
 //! to an `isError` [`CallToolResult`] — a tool bug returns an error and the
 //! process/runtime stays alive (parity with the sync stdio server).
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -101,20 +97,17 @@ fn tool_timeout() -> Option<Duration> {
     parse_tool_timeout(std::env::var(TOOL_TIMEOUT_ENV).ok().as_deref())
 }
 
-type EngineCache = Arc<Mutex<HashMap<PathBuf, CodeGraphEngine>>>;
-
 /// The default project may be DISPLACED at runtime by roots adoption
 /// (`on_initialized`, non-pinned mode), and adoption runs through a `&self`
 /// handler, so it lives behind a `Mutex` for interior mutability. In pinned /
 /// `no_roots` mode it never changes after construction.
 type DefaultProject = Arc<Mutex<Option<PathBuf>>>;
 
-/// rmcp handler state: the shared engine cache plus the default project /
-/// cwd used to resolve a per-call `projectPath`. `no_roots` mirrors the
+/// rmcp handler state: the default project / cwd used to resolve a per-call
+/// `projectPath`. `no_roots` mirrors the
 /// [`crate::McpServer::http`] pin — when set, roots adoption is OFF (HTTP /
 /// pinned mode); when clear, `on_initialized` may adopt an indexed client root.
 pub struct CodeGraphHandler {
-    engines: EngineCache,
     default_project: DefaultProject,
     cwd: Option<PathBuf>,
     no_roots: bool,
@@ -123,7 +116,6 @@ pub struct CodeGraphHandler {
 impl CodeGraphHandler {
     pub fn new(default_project: Option<PathBuf>) -> Self {
         Self {
-            engines: Arc::new(Mutex::new(HashMap::new())),
             default_project: Arc::new(Mutex::new(default_project)),
             cwd: std::env::current_dir().ok(),
             no_roots: true,
@@ -146,7 +138,6 @@ impl CodeGraphHandler {
     /// cwd-derived, possibly unindexed dir.
     pub fn serve_with_roots(default_project: Option<PathBuf>, cwd: Option<PathBuf>) -> Self {
         Self {
-            engines: Arc::new(Mutex::new(HashMap::new())),
             default_project: Arc::new(Mutex::new(default_project)),
             cwd,
             no_roots: false,
@@ -159,7 +150,6 @@ impl CodeGraphHandler {
     #[doc(hidden)]
     pub fn new_with_cwd(default_project: Option<PathBuf>, cwd: Option<PathBuf>) -> Self {
         Self {
-            engines: Arc::new(Mutex::new(HashMap::new())),
             default_project: Arc::new(Mutex::new(default_project)),
             cwd,
             no_roots: true,
@@ -274,16 +264,10 @@ fn tool_result_to_call_result(result: &ToolResult) -> CallToolResult {
     }
 }
 
-/// Open-or-get-cached engine + execute + render — the ENTIRE Decision-10 unit,
-/// run inside a `spawn_blocking` closure. Takes owned inputs (an `Arc` cache
-/// clone, owned project path, tool name, args) and returns an owned
-/// [`ToolResult`]; no `&self` / engine borrow crosses the closure boundary.
-fn execute_owned(
-    engines: &EngineCache,
-    project_path: &Path,
-    tool_name: &str,
-    args: &Value,
-) -> ToolResult {
+/// Open a request-scoped engine + execute + render inside a `spawn_blocking`
+/// closure. The engine (and therefore SQLite handle + shared lease) drops only
+/// after the owned result has been fully produced.
+fn execute_owned(project_path: &Path, tool_name: &str, args: &Value) -> ToolResult {
     #[cfg(feature = "test-hooks")]
     if tool_name == PANIC_TOOL {
         panic!("simulated tool handler panic (Q5-unwind test)");
@@ -296,23 +280,15 @@ fn execute_owned(
         return ToolResult::text(format!("slept {secs}s"));
     }
 
-    let mut guard = engines
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !guard.contains_key(project_path) {
-        match CodeGraphEngine::open(project_path) {
-            Ok(engine) => {
-                guard.insert(project_path.to_path_buf(), engine);
-            }
-            Err(e) => {
-                return ToolResult::error(format!(
-                    "Failed to open project at {}: {e}",
-                    project_path.display()
-                ));
-            }
+    let engine = match CodeGraphEngine::open(project_path) {
+        Ok(engine) => engine,
+        Err(e) => {
+            return ToolResult::error(format!(
+                "Failed to open project at {}: {e}",
+                project_path.display()
+            ));
         }
-    }
-    let engine = guard.get(project_path).expect("engine present after open");
+    };
     engine.execute(tool_name, args)
 }
 
@@ -448,11 +424,9 @@ impl ServerHandler for CodeGraphHandler {
         // work; interrupting sync SQLite mid-read is unsafe. The client is
         // unblocked fast with an isError result; the orphaned thread drains
         // on its own. `tool_timeout() == None` (env `0`) opts out entirely.
-        let engines = Arc::clone(&self.engines);
         let outcome_tool = tool_name.clone();
-        let join_future = tokio::task::spawn_blocking(move || {
-            execute_owned(&engines, &project_path, &tool_name, &args)
-        });
+        let join_future =
+            tokio::task::spawn_blocking(move || execute_owned(&project_path, &tool_name, &args));
 
         let timed_out;
         let join = match tool_timeout() {
@@ -499,7 +473,6 @@ impl ServerHandler for CodeGraphHandler {
     }
 }
 
-/// Serve `CodeGraphHandler` over stdio via rmcp, building a multi-thread tokio
 /// Serve `CodeGraphHandler` over stdio via rmcp, building a multi-thread tokio
 /// runtime (the sync engine work runs on `spawn_blocking` pool threads). Blocks
 /// until the client disconnects (EOF). This is the CLI `serve --mcp` direct
@@ -1002,8 +975,7 @@ mod handler_tests {
     #[test]
     fn execute_owned_open_failure_returns_error_result() {
         let project = placeholder_indexed("exec-open-fail");
-        let engines: EngineCache = Arc::new(Mutex::new(HashMap::new()));
-        let result = execute_owned(&engines, &project.path, "codegraph_search", &json!({}));
+        let result = execute_owned(&project.path, "codegraph_search", &json!({}));
         assert_eq!(result.is_error, Some(true));
         let text: String = result.content.iter().map(|c| c.text.clone()).collect();
         assert!(
@@ -1153,8 +1125,7 @@ mod handler_tests {
     }
 
     /// Materialize a real indexed project (golden mini db + fixture sources) so
-    /// `CodeGraphEngine::open` succeeds — the only way to reach the cache-insert
-    /// + `engine.execute` success arm of `execute_owned`.
+    /// `CodeGraphEngine::open` succeeds and `execute_owned` reaches tool dispatch.
     fn real_indexed_project(tag: &str) -> TempDir {
         let dir = unique_dir(tag);
         let db = db_path_for(&dir.path).expect("default project resolves");
@@ -1167,34 +1138,30 @@ mod handler_tests {
             std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
             std::fs::copy(fixtures.join(rel), &dst).unwrap();
         }
+        let paths = codegraph_core::IndexPaths::resolve(&dir.path, None).unwrap();
+        codegraph_store::test_support::finalize_current_test_fixture(&paths).unwrap();
         dir
     }
 
     #[test]
-    fn execute_owned_success_caches_engine_and_runs_tool() {
+    fn execute_owned_success_opens_request_scoped_engine_and_runs_tool() {
         let project = real_indexed_project("exec-ok");
-        let engines: EngineCache = Arc::new(Mutex::new(HashMap::new()));
         let first = execute_owned(
-            &engines,
             &project.path,
             "codegraph_search",
             &json!({ "query": "add" }),
         );
         assert_ne!(first.is_error, Some(true), "search on indexed project");
-        assert!(
-            engines
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .contains_key(&project.path),
-            "engine cached after first open"
-        );
         let second = execute_owned(
-            &engines,
             &project.path,
             "codegraph_search",
             &json!({ "query": "add" }),
         );
-        assert_ne!(second.is_error, Some(true), "cached engine reused");
+        assert_ne!(
+            second.is_error,
+            Some(true),
+            "second request reopens cleanly"
+        );
     }
 
     fn rt() -> tokio::runtime::Runtime {
