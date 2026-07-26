@@ -2,19 +2,19 @@
 //! must fire under the REAL `codegraph index` CLI even when the process CWD is
 //! NOT the project root.
 //!
-//! The pipeline (`extract_and_persist_frameworks`) hands the framework resolver
-//! a repo-RELATIVE `.tres` path; the DSL config reader used to resolve that path
-//! against the process CWD, so `$PROJECT/.codegraph/codegraph.json` was only
-//! found when the CLI happened to run with its CWD == the project root. The A3
-//! unit tests masked this by passing ABSOLUTE `.tres` paths. This test drives
-//! the binary from a DIFFERENT temp dir and asserts the `godot:id:*` (idFields)
-//! and the `resourceFields` literal sentinels land in `unresolved_refs` —
-//! proving config lookup now resolves against the project root.
+//! The pipeline (`extract_and_persist_frameworks`) hands the framework resolver a
+//! repo-RELATIVE `.tres` path plus the project's EXPLICITLY loaded DSL config,
+//! read from the addressed project's own index root — so the process CWD cannot
+//! influence which config is used. This test drives the binary from a DIFFERENT
+//! temp dir and asserts the `godot:id:*` (idFields) and `resourceFields` literal
+//! sentinels land in `unresolved_refs`; a companion target asserts a LEGACY
+//! `.codegraph/codegraph.json` is never adopted.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use codegraph_core::IndexPaths;
 use codegraph_store::Store;
 
 struct TestDir {
@@ -70,11 +70,17 @@ duration = 5.0
 ";
 
 fn write_godot_project(root: &Path) {
-    fs::create_dir_all(root.join(".codegraph")).unwrap();
-    fs::write(root.join(".codegraph").join("codegraph.json"), DSL_CONFIG).unwrap();
+    fs::create_dir_all(root).unwrap();
     fs::write(root.join("project.godot"), PROJECT_GODOT).unwrap();
     fs::create_dir_all(root.join("data")).unwrap();
     fs::write(root.join("data").join("spell.tres"), SPELL_TRES).unwrap();
+}
+
+/// Write the project's CURRENT-ROOT `codegraph.json` — the only DSL config a
+/// project-scoped run consults. Call after `init` published the namespace.
+fn write_dsl_config(root: &Path) {
+    let paths = IndexPaths::resolve(root, None).expect("resolve index paths");
+    fs::write(paths.extension_config(), DSL_CONFIG).unwrap();
 }
 
 /// Run the binary from `cwd` (a FOREIGN directory) against an absolute project
@@ -95,8 +101,8 @@ fn cli_from(cwd: &Path, args: &[&str]) -> (String, String, bool) {
 }
 
 fn unresolved_ref_names(project: &Path) -> Vec<String> {
-    // Batch M: the index DB moved to the isolated v2 namespace. The opt-in DSL
-    // config (`.codegraph/codegraph.json`) is still read by the ancestor walker.
+    // Batch M: both the index DB and the opt-in DSL config live in the isolated
+    // v2 namespace.
     let db = project.join(".codegraph-v2").join("codegraph.db");
     let store = Store::open(&db).expect("open store");
     store
@@ -124,6 +130,7 @@ fn idfields_dsl_fires_when_cwd_is_not_project_root() {
     let project_str = project.to_string_lossy().into_owned();
     let (out, err, ok) = cli_from(foreign.path(), &["init", &project_str]);
     assert!(ok, "init failed: stdout={out} stderr={err}");
+    write_dsl_config(&project);
     let (out, err, ok) = cli_from(foreign.path(), &["index", "--force", &project_str]);
     assert!(ok, "index --force failed: stdout={out} stderr={err}");
 
@@ -143,13 +150,10 @@ fn idfields_dsl_fires_when_cwd_is_not_project_root() {
 /// DSL config emits ZERO `godot:id:*` sentinels.
 #[test]
 fn no_config_emits_zero_id_sentinels_from_foreign_cwd() {
-    // Given a Godot project with NO `.codegraph/codegraph.json` DSL block,
+    // Given a Godot project with NO DSL config at all,
     let project_dir = TestDir::new("noconfig");
     let project = project_dir.path().join("game");
-    fs::create_dir_all(project.join(".codegraph")).unwrap();
-    fs::write(project.join("project.godot"), PROJECT_GODOT).unwrap();
-    fs::create_dir_all(project.join("data")).unwrap();
-    fs::write(project.join("data").join("spell.tres"), SPELL_TRES).unwrap();
+    write_godot_project(&project);
     let foreign = TestDir::new("noconfig-cwd");
 
     // When indexed from a foreign cwd,
@@ -164,5 +168,40 @@ fn no_config_emits_zero_id_sentinels_from_foreign_cwd() {
     assert!(
         !names.iter().any(|n| n.starts_with("godot:id:")),
         "off-by-default violated: godot:id:* sentinel present without config: {names:?}"
+    );
+}
+
+/// A LEGACY `.codegraph/codegraph.json` must NEVER supply the DSL config: with the
+/// same block written only there, the run emits zero sentinels.
+#[test]
+fn legacy_dsl_config_is_never_adopted() {
+    // Given a Godot project whose ONLY DSL config is the legacy one,
+    let project_dir = TestDir::new("legacy");
+    let project = project_dir.path().join("game");
+    write_godot_project(&project);
+    fs::create_dir_all(project.join(".codegraph")).unwrap();
+    fs::write(
+        project.join(".codegraph").join("codegraph.json"),
+        DSL_CONFIG,
+    )
+    .unwrap();
+    let foreign = TestDir::new("legacy-cwd");
+
+    // When indexed,
+    let project_str = project.to_string_lossy().into_owned();
+    let (out, err, ok) = cli_from(foreign.path(), &["init", &project_str]);
+    assert!(ok, "init failed: stdout={out} stderr={err}");
+    let (out, err, ok) = cli_from(foreign.path(), &["index", "--force", &project_str]);
+    assert!(ok, "index --force failed: stdout={out} stderr={err}");
+
+    // Then nothing fired: neither the id sentinel nor the resourceFields literal.
+    let names = unresolved_ref_names(&project);
+    assert!(
+        !names.iter().any(|n| n.starts_with("godot:id:")),
+        "a legacy DSL config must not emit id sentinels: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n == "Fireball"),
+        "a legacy DSL config must not emit resourceFields literals: {names:?}"
     );
 }

@@ -1,14 +1,20 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use codegraph_core::IndexPaths;
+use codegraph_core::config::Config;
 use codegraph_core::node_id::hash_content;
 use codegraph_core::types::FileRecord;
-use codegraph_extract::{ExtractOptions, detect_language, extract_file};
+use codegraph_extract::{
+    ExtensionOverrides, ExtractOptions, detect_language_with, extract_file_with_options,
+};
 use codegraph_resolve::ReferenceResolver;
+use codegraph_resolve::framework::FrameworkExtractionContext;
+use codegraph_resolve::frameworks::godot_dsl_config::GodotDslConfig;
 use codegraph_store::{IndexLease, Store, StoreWriteOpen, StoreWritePurpose};
 
 use crate::policy::WatchPolicy;
@@ -43,15 +49,23 @@ pub fn sync_project_once(project_root: impl AsRef<Path>) -> Result<SyncOutcome> 
 
 /// Whole-project sync using watcher-owned path patterns while preserving every
 /// other scan option from the normal sync path.
+///
+/// The watcher owns `include`/`exclude` because it derived them from the SAME
+/// project config when it started; every other option (size limit, ignore sets,
+/// extension overrides, framework config) is loaded here from the addressed
+/// project, so a watcher-triggered full sync scans exactly what a direct sync of
+/// that project scans.
 pub(crate) fn sync_project_once_with_patterns(
     project_root: impl AsRef<Path>,
     include: &[String],
     exclude: &[String],
 ) -> Result<SyncOutcome> {
-    let mut options = scan_options();
-    options.include = include.to_vec();
-    options.exclude = exclude.to_vec();
-    sync_project_once_with_options(project_root.as_ref(), options, |_, _| {})
+    let project_root = project_root.as_ref();
+    let paths = index_paths(project_root)?;
+    let mut scope = ProjectScope::load(project_root, &paths)?;
+    scope.options.include = include.to_vec();
+    scope.options.exclude = exclude.to_vec();
+    sync_project_once_with_scope(project_root, &paths, &scope, |_, _| {})
 }
 
 /// Like [`sync_project_once`] but invokes `on_progress(done, total)` after each
@@ -62,28 +76,31 @@ pub fn sync_project_once_with_progress(
     project_root: impl AsRef<Path>,
     on_progress: impl FnMut(usize, usize),
 ) -> Result<SyncOutcome> {
-    let options = scan_options();
-    sync_project_once_with_options(project_root.as_ref(), options, on_progress)
+    let project_root = project_root.as_ref();
+    let paths = index_paths(project_root)?;
+    let scope = ProjectScope::load(project_root, &paths)?;
+    sync_project_once_with_scope(project_root, &paths, &scope, on_progress)
 }
 
-fn sync_project_once_with_options(
+fn sync_project_once_with_scope(
     project_root: &Path,
-    options: ExtractOptions,
+    paths: &IndexPaths,
+    scope: &ProjectScope,
     mut on_progress: impl FnMut(usize, usize),
 ) -> Result<SyncOutcome> {
+    let options = &scope.options;
     let include = options.include.clone();
     let exclude = options.exclude.clone();
     let started = Instant::now();
-    let paths = index_paths(project_root)?;
 
     // CLASSIFY BEFORE MUTATING A ROW (frozen plan lines 557-565). The gate takes
     // the ONE outer exclusive lease, classifies under it, and either hands back
     // the incremental writer for a corroborated Current namespace or the
     // lease-retaining authorization that escalates to a forced full migration.
     // Future/Corrupt/unauthorized-Uninitialized fail here, before any byte moves.
-    match open_sync_writer(&paths)? {
+    match open_sync_writer(paths)? {
         SyncWriter::Incremental(mut store) => {
-            let mut candidates = codegraph_extract::engine::scan_project(project_root, &options)?;
+            let mut candidates = codegraph_extract::engine::scan_project(project_root, options)?;
             // Cold CLI sync has no watcher event list, so deletions are found by
             // diffing tracked files against scan_project's on-disk set; absent
             // paths flow through sync_one's delete branch (upstream removal pass,
@@ -105,6 +122,7 @@ fn sync_project_once_with_options(
                 &mut store,
                 project_root,
                 candidates,
+                scope,
                 &include,
                 &exclude,
                 started,
@@ -115,29 +133,40 @@ fn sync_project_once_with_options(
         }
         SyncWriter::MigrationRequired(authorization) => crate::migrate::migrate_project(
             project_root,
-            &paths,
+            paths,
             authorization,
-            &options,
+            scope,
             started,
             &mut on_progress,
         ),
     }
 }
 
-/// The scan/extract options one sync uses. The global config is the source of
-/// truth when a binary initialized it; a library caller that never did (a bare
-/// watcher thread) falls back to the documented defaults instead of panicking.
-fn scan_options() -> ExtractOptions {
-    let Some(config) = codegraph_core::config::try_get_config() else {
-        return ExtractOptions::default();
-    };
-    ExtractOptions {
-        max_file_size: config.indexing.max_file_size,
-        ignore_dirs: config.indexing.ignore_dirs.clone(),
-        ignore_paths: config.indexing.ignore_paths.clone(),
-        exclude: config.indexing.exclude.clone(),
-        include: config.indexing.include.clone(),
-        parallel: true,
+/// One project's immutable configuration for ONE sync operation.
+///
+/// Loaded from the addressed project's resolved [`IndexPaths`] — its current-root
+/// `config.toml` (scan/extract options) and current-root `codegraph.json`
+/// (extension overrides + Godot DSL fields). Nothing here reads a process-global
+/// value, a legacy `.codegraph` root, or the process working directory, so a
+/// watcher, a direct sync, and a startup catch-up on different projects inside one
+/// process each operate under their own settings.
+pub(crate) struct ProjectScope {
+    pub(crate) options: ExtractOptions,
+    pub(crate) framework: FrameworkExtractionContext,
+}
+
+impl ProjectScope {
+    pub(crate) fn load(project_root: &Path, paths: &IndexPaths) -> Result<Self> {
+        let config = Config::load_for_paths(None, paths)?;
+        let extensions = ExtensionOverrides::load_for_paths(paths);
+        let framework = FrameworkExtractionContext::new(
+            project_root.to_string_lossy().into_owned(),
+            GodotDslConfig::load_for_paths(paths),
+        );
+        Ok(Self {
+            options: ExtractOptions::for_project(&config, extensions),
+            framework,
+        })
     }
 }
 
@@ -214,6 +243,14 @@ pub fn sync_changed_paths_with_patterns(
         );
     }
 
+    // The addressed project's own immutable config drives extraction and any
+    // migration escalation; the caller-supplied `include`/`exclude` (the watcher's
+    // own patterns, derived from this same project config) override those two
+    // fields so watcher scope and scan scope stay identical.
+    let mut scope = ProjectScope::load(project_root, &paths)?;
+    scope.options.include = include.to_vec();
+    scope.options.exclude = exclude.to_vec();
+
     // Same classify-before-mutate gate as the cold full sync: a Current namespace
     // stays incremental, while Missing/Outdated/recoverable Building escalate to a
     // forced migration under the SAME retained exclusive lease.
@@ -223,6 +260,7 @@ pub fn sync_changed_paths_with_patterns(
                 &mut store,
                 project_root,
                 changed,
+                &scope,
                 include,
                 exclude,
                 started,
@@ -231,21 +269,14 @@ pub fn sync_changed_paths_with_patterns(
             store.finish_current_mutation()?;
             Ok(outcome)
         }
-        SyncWriter::MigrationRequired(authorization) => {
-            let options = ExtractOptions {
-                include: include.to_vec(),
-                exclude: exclude.to_vec(),
-                ..scan_options()
-            };
-            crate::migrate::migrate_project(
-                project_root,
-                &paths,
-                authorization,
-                &options,
-                started,
-                |_, _| {},
-            )
-        }
+        SyncWriter::MigrationRequired(authorization) => crate::migrate::migrate_project(
+            project_root,
+            &paths,
+            authorization,
+            &scope,
+            started,
+            |_, _| {},
+        ),
     }
 }
 
@@ -254,12 +285,14 @@ fn sync_paths_with_store(
     store: &mut Store,
     project_root: &Path,
     paths: impl IntoIterator<Item = impl AsRef<Path>>,
+    scope: &ProjectScope,
     include: &[String],
     exclude: &[String],
     started: std::time::Instant,
     mut on_progress: impl FnMut(usize, usize),
 ) -> Result<SyncOutcome> {
-    let policy = WatchPolicy::with_config(project_root, include, exclude);
+    let policy = WatchPolicy::with_config(project_root, include, exclude)
+        .with_extension_overrides(Arc::clone(&scope.options.extensions));
     let mut outcome = SyncOutcome::default();
     let mut changed = false;
     let mut seen = HashSet::new();
@@ -290,6 +323,7 @@ fn sync_paths_with_store(
             project_root,
             store,
             &relative,
+            scope,
             &mut outcome,
             &mut dependents,
             &mut changed_names,
@@ -310,6 +344,7 @@ fn sync_paths_with_store(
         refresh_dependent_refs(
             project_root,
             store,
+            scope,
             &dependents,
             &reindexed,
             &mut changed_names,
@@ -332,7 +367,12 @@ fn sync_paths_with_store(
         // nodes/refs were dropped on re-extraction (upstream tree-sitter.ts:4796-4819).
         if resolver.has_framework_resolvers() {
             let reindexed_files: Vec<String> = reindexed.iter().cloned().collect();
-            resolver.extract_and_persist_frameworks(store, &reindexed_files)?;
+            resolver.extract_and_persist_frameworks_with(
+                store,
+                &reindexed_files,
+                &scope.framework,
+                &scope.options.extensions,
+            )?;
         }
         resolver.resolve_incremental_and_persist(store, &scope_files, &changed_names)?;
         // Cross-file framework finalization on every sync (upstream index.ts:464).
@@ -377,6 +417,7 @@ fn sync_paths_with_store(
 fn refresh_dependent_refs(
     project_root: &Path,
     store: &mut Store,
+    scope: &ProjectScope,
     dependents: &HashSet<String>,
     already_reindexed: &HashSet<String>,
     changed_names: &mut HashSet<String>,
@@ -388,7 +429,7 @@ fn refresh_dependent_refs(
         if !project_root.join(relative).exists() {
             continue;
         }
-        let result = extract_file(project_root, relative)?;
+        let result = extract_file_with_options(project_root, relative, &scope.options)?;
         let node_ids = result
             .nodes
             .iter()
@@ -445,10 +486,12 @@ pub(crate) fn default_db_path(project_root: &Path) -> Result<PathBuf> {
     .current_db())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sync_one(
     project_root: &Path,
     store: &mut Store,
     relative: &str,
+    scope: &ProjectScope,
     outcome: &mut SyncOutcome,
     dependents: &mut HashSet<String>,
     changed_names: &mut HashSet<String>,
@@ -500,7 +543,7 @@ fn sync_one(
     for dependent in store.dependent_file_paths(relative)? {
         dependents.insert(dependent);
     }
-    reextract_into_store(project_root, store, relative, changed_names)?;
+    reextract_into_store(project_root, store, relative, scope, changed_names)?;
     outcome.files_reindexed += 1;
     Ok(true)
 }
@@ -509,12 +552,13 @@ fn reextract_into_store(
     project_root: &Path,
     store: &mut Store,
     relative: &str,
+    scope: &ProjectScope,
     changed_names: &mut HashSet<String>,
 ) -> Result<()> {
     let full = project_root.join(relative);
     let source = fs::read_to_string(&full).with_context(|| format!("read {}", full.display()))?;
     let metadata = fs::metadata(&full).with_context(|| format!("stat {}", full.display()))?;
-    let result = extract_file(project_root, relative)?;
+    let result = extract_file_with_options(project_root, relative, &scope.options)?;
     let node_ids = result
         .nodes
         .iter()
@@ -528,7 +572,7 @@ fn reextract_into_store(
     let file = FileRecord {
         path: relative.to_string(),
         content_hash: hash_content(&source),
-        language: detect_language(relative),
+        language: detect_language_with(relative, &scope.options.extensions),
         size: metadata.len() as i64,
         modified_at: modified_millis(&metadata),
         indexed_at: now_millis(),
@@ -846,19 +890,12 @@ pub(crate) mod tests {
         assert_eq!(outcome.changed_paths, vec!["src/helper.ts".to_string()]);
     }
 
-    /// `sync_project_once` reads the global config; initialize it once (the
-    /// global `OnceLock` tolerates a repeat set as an ignorable error).
-    fn ensure_config(project_root: &Path) {
-        let _ = codegraph_core::config::init_config(None, project_root);
-    }
-
     #[test]
     fn framework_sweep_does_not_grow_unresolved_refs_across_heal_cycles() {
         // Given: an indexed Godot project (autoload + signal-handler refs produce
         // framework `unresolved_refs`), with the #1187 marker set so every sync
         // triggers the orphan sweep.
         let dir = TestDir::new("watch-godot-sweep");
-        ensure_config(dir.path());
         fs::create_dir_all(dir.path().join(".codegraph")).unwrap();
         fs::write(
             dir.path().join("project.godot"),
@@ -906,7 +943,6 @@ pub(crate) mod tests {
     fn sync_project_once_scans_and_removes_absent_tracked_files() {
         // Given: a project with two source files indexed via a full scan.
         let dir = TestDir::new("watch-once");
-        ensure_config(dir.path());
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::create_dir_all(dir.path().join(".codegraph")).unwrap();
         fs::write(
@@ -940,7 +976,6 @@ pub(crate) mod tests {
     fn sync_project_once_with_progress_reports_monotonic_progress() {
         // Given: a project with a couple of source files.
         let dir = TestDir::new("watch-progress");
-        ensure_config(dir.path());
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::create_dir_all(dir.path().join(".codegraph")).unwrap();
         fs::write(
@@ -1106,19 +1141,27 @@ pub(crate) mod tests {
         );
     }
 
+    /// Write this project's CURRENT-ROOT `config.toml` — the only config a sync
+    /// consults.
+    fn write_project_config(project_root: &Path, contents: &str) {
+        let paths = index_paths(project_root).expect("resolve project paths");
+        fs::create_dir_all(paths.current_root()).unwrap();
+        fs::write(paths.config_toml(), contents).unwrap();
+    }
+
     #[test]
     fn sync_project_once_indexes_gitignored_dir_named_in_include() {
         // #1063: a gitignored first-party dir named in `[indexing] include` is
-        // indexed on a full `codegraph sync` (sync_project_once reads the config
-        // and threads include into both the scan and the WatchPolicy gate).
+        // indexed on a full `codegraph sync`. The config is THIS project's own
+        // current-root `config.toml`, loaded per operation, so the assertion is
+        // unconditional — no process-global singleton can hold another project's
+        // settings.
         let dir = TestDir::new("watch-once-include");
-        fs::create_dir_all(dir.path().join(".codegraph")).unwrap();
         fs::write(dir.path().join(".gitignore"), "Tools/\n").unwrap();
-        fs::write(
-            dir.path().join(".codegraph/config.toml"),
+        write_project_config(
+            dir.path(),
             "[app]\nname = \"p\"\n\n[indexing]\ninclude = [\"Tools/\"]\n",
-        )
-        .unwrap();
+        );
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::create_dir_all(dir.path().join("Tools")).unwrap();
         fs::write(
@@ -1131,26 +1174,117 @@ pub(crate) mod tests {
             "export function help() { return 2; }\n",
         )
         .unwrap();
-        // The config OnceLock is process-global; point it at THIS project (a
-        // repeat set is an ignorable error, but then it may hold another test's
-        // path). Guard: only assert when our config actually took effect.
-        let cfg = codegraph_core::config::init_config(None, dir.path());
-        if cfg
-            .map(|c| c.indexing.include.iter().any(|p| p == "Tools/"))
-            .unwrap_or(false)
-        {
-            let outcome = sync_project_once(dir.path()).unwrap();
-            assert!(
-                outcome
-                    .changed_paths
-                    .contains(&"Tools/helper.ts".to_string())
-            );
-            let store = Store::open(&default_db_path(dir.path()).unwrap()).unwrap();
-            assert!(
-                store.file_by_path("Tools/helper.ts").unwrap().is_some(),
-                "gitignored Tools/ named in include must be indexed on sync"
-            );
+
+        let outcome = sync_project_once(dir.path()).unwrap();
+        assert!(
+            outcome
+                .changed_paths
+                .contains(&"Tools/helper.ts".to_string())
+        );
+        let store = Store::open(&default_db_path(dir.path()).unwrap()).unwrap();
+        assert!(
+            store.file_by_path("Tools/helper.ts").unwrap().is_some(),
+            "gitignored Tools/ named in include must be indexed on sync"
+        );
+    }
+
+    /// A LEGACY `.codegraph/config.toml` must never influence a sync: with the
+    /// same `include` written only there, the gitignored dir stays unindexed.
+    #[test]
+    fn sync_project_once_ignores_a_legacy_project_config() {
+        let dir = TestDir::new("watch-once-legacy-config");
+        fs::write(dir.path().join(".gitignore"), "Tools/\n").unwrap();
+        fs::create_dir_all(dir.path().join(".codegraph")).unwrap();
+        fs::write(
+            dir.path().join(".codegraph/config.toml"),
+            "[app]\nname = \"legacy\"\n\n[indexing]\ninclude = [\"Tools/\"]\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("Tools")).unwrap();
+        fs::write(
+            dir.path().join("Tools/helper.ts"),
+            "export function help() { return 2; }\n",
+        )
+        .unwrap();
+
+        let outcome = sync_project_once(dir.path()).unwrap();
+        assert!(
+            !outcome
+                .changed_paths
+                .contains(&"Tools/helper.ts".to_string()),
+            "a legacy .codegraph/config.toml must not re-include a gitignored dir: {outcome:?}"
+        );
+    }
+
+    /// Two projects synced by ONE process use their OWN current-root configs:
+    /// only the project whose config names `Tools/` indexes its gitignored dir.
+    #[test]
+    fn two_projects_in_one_process_use_their_own_configs() {
+        let alpha = TestDir::new("watch-scope-alpha");
+        let beta = TestDir::new("watch-scope-beta");
+        for project in [alpha.path(), beta.path()] {
+            fs::write(project.join(".gitignore"), "Tools/\n").unwrap();
+            fs::create_dir_all(project.join("Tools")).unwrap();
+            fs::write(
+                project.join("Tools/helper.ts"),
+                "export function help() { return 2; }\n",
+            )
+            .unwrap();
         }
+        write_project_config(
+            alpha.path(),
+            "[app]\nname = \"alpha\"\n\n[indexing]\ninclude = [\"Tools/\"]\n",
+        );
+        write_project_config(beta.path(), "[app]\nname = \"beta\"\n");
+
+        let alpha_outcome = sync_project_once(alpha.path()).unwrap();
+        let beta_outcome = sync_project_once(beta.path()).unwrap();
+        assert!(
+            alpha_outcome
+                .changed_paths
+                .contains(&"Tools/helper.ts".to_string()),
+            "alpha's own include must apply: {alpha_outcome:?}"
+        );
+        assert!(
+            !beta_outcome
+                .changed_paths
+                .contains(&"Tools/helper.ts".to_string()),
+            "beta must not inherit alpha's include: {beta_outcome:?}"
+        );
+    }
+
+    /// A project-declared custom extension is indexed by a sync AND handled by
+    /// the incremental path, proving the current-root `codegraph.json` overrides
+    /// reach both scan and watcher gating.
+    #[test]
+    fn project_extension_overrides_reach_scan_and_incremental_sync() {
+        let dir = TestDir::new("watch-ext-override");
+        let paths = index_paths(dir.path()).expect("resolve project paths");
+        fs::create_dir_all(paths.current_root()).unwrap();
+        fs::write(
+            paths.extension_config(),
+            "{\"extensions\":{\".myext\":\"lua\"}}",
+        )
+        .unwrap();
+        fs::write(dir.path().join("plugin.myext"), "local x = 1\n").unwrap();
+
+        let full = sync_project_once(dir.path()).unwrap();
+        assert!(
+            full.changed_paths.contains(&"plugin.myext".to_string()),
+            "a project-declared extension must be indexed: {full:?}"
+        );
+
+        fs::write(dir.path().join("plugin.myext"), "local x = 2\n").unwrap();
+        let incremental = sync_changed_paths(
+            dir.path(),
+            default_db_path(dir.path()).unwrap(),
+            ["plugin.myext"],
+        )
+        .unwrap();
+        assert_eq!(
+            incremental.files_reindexed, 1,
+            "the incremental path must handle it too: {incremental:?}"
+        );
     }
 
     #[test]
@@ -1267,7 +1401,6 @@ pub(crate) mod tests {
         // Given: two indexed files, one of which is then deleted, over a
         // namespace marked Outdated.
         let dir = TestDir::new("watch-outdated-full");
-        ensure_config(dir.path());
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::write(
             dir.path().join("src/alpha.ts"),

@@ -78,7 +78,7 @@ impl FrameworkResolver for ReactResolver {
         &self,
         file_path: &str,
         content: &str,
-        _project_root: &str,
+        _context: &crate::framework::FrameworkExtractionContext,
     ) -> Option<FrameworkResolverExtractionResult> {
         let mut nodes = Vec::new();
         let mut references = Vec::new();
@@ -651,6 +651,11 @@ fn page_ext_strip_regex() -> &'static Regex {
 
 #[cfg(test)]
 mod tests {
+    /// Extraction context for a resolver that needs no project config.
+    fn test_extraction_context() -> crate::framework::FrameworkExtractionContext {
+        crate::framework::FrameworkExtractionContext::without_config("")
+    }
+
     use super::*;
     use crate::types::ImportMapping;
     use codegraph_core::types::Node;
@@ -1030,7 +1035,7 @@ mod tests {
     fn extract_arrow_component_with_jsx() {
         let content = "export const Card = () => { return <div/>; };";
         let result = ReactResolver
-            .extract("src/Card.jsx", content, "")
+            .extract("src/Card.jsx", content, &test_extraction_context())
             .expect("extract");
         assert!(
             result
@@ -1048,7 +1053,7 @@ mod tests {
         content.push('é');
 
         let result = ReactResolver
-            .extract("src/Card.tsx", &content, "")
+            .extract("src/Card.tsx", &content, &test_extraction_context())
             .expect("extract");
 
         assert!(
@@ -1064,7 +1069,7 @@ mod tests {
         // A PascalCase function that returns no JSX must NOT be a component node.
         let content = "export function Helper() { return 42; }";
         let result = ReactResolver
-            .extract("src/Helper.tsx", content, "")
+            .extract("src/Helper.tsx", content, &test_extraction_context())
             .expect("extract");
         assert!(!result.nodes.iter().any(|n| n.kind == NodeKind::Component));
     }
@@ -1074,7 +1079,7 @@ mod tests {
         let content =
             "const Fancy = React.forwardRef(() => <div/>);\nconst Wrapped = memo(() => <span/>);";
         let result = ReactResolver
-            .extract("src/W.tsx", content, "")
+            .extract("src/W.tsx", content, &test_extraction_context())
             .expect("extract");
         let names: Vec<&str> = result
             .nodes
@@ -1090,7 +1095,7 @@ mod tests {
     fn extract_custom_hook_node() {
         let content = "export function useCounter() { return 0; }";
         let result = ReactResolver
-            .extract("src/useCounter.ts", content, "")
+            .extract("src/useCounter.ts", content, &test_extraction_context())
             .expect("extract");
         let hook = result
             .nodes
@@ -1106,7 +1111,7 @@ mod tests {
     fn extract_hook_js_language_for_plain_js() {
         let content = "const useX = () => 1;";
         let result = ReactResolver
-            .extract("src/useX.js", content, "")
+            .extract("src/useX.js", content, &test_extraction_context())
             .expect("extract");
         let hook = result
             .nodes
@@ -1121,7 +1126,7 @@ mod tests {
         // <Route ... element={<Home/>}/> uses the element attr branch.
         let content = "<Route path=\"/x\" element={<Home/>}/>";
         let result = ReactResolver
-            .extract("src/App.tsx", content, "")
+            .extract("src/App.tsx", content, &test_extraction_context())
             .expect("extract");
         let route = result
             .nodes
@@ -1139,7 +1144,7 @@ mod tests {
         content.push('é');
 
         let result = ReactResolver
-            .extract("src/App.tsx", &content, "")
+            .extract("src/App.tsx", &content, &test_extraction_context())
             .expect("extract");
         let route = result
             .nodes
@@ -1155,7 +1160,7 @@ mod tests {
     fn extract_route_without_path_is_skipped() {
         let content = "<Route element={<Home/>}/>";
         let result = ReactResolver
-            .extract("src/App.tsx", content, "")
+            .extract("src/App.tsx", content, &test_extraction_context())
             .expect("extract");
         assert!(!result.nodes.iter().any(|n| n.kind == NodeKind::Route));
     }
@@ -1165,7 +1170,7 @@ mod tests {
         let content =
             "const r = createBrowserRouter([\n  { path: '/dash', element: <Dashboard/> },\n]);";
         let result = ReactResolver
-            .extract("src/routes.tsx", content, "")
+            .extract("src/routes.tsx", content, &test_extraction_context())
             .expect("extract");
         let route = result
             .nodes
@@ -1191,7 +1196,7 @@ mod tests {
         content.push('é');
 
         let result = ReactResolver
-            .extract("src/routes.tsx", &content, "")
+            .extract("src/routes.tsx", &content, &test_extraction_context())
             .expect("extract");
         let route = result
             .nodes
@@ -1207,7 +1212,7 @@ mod tests {
     fn extract_data_router_empty_path_becomes_root() {
         let content = "createBrowserRouter([{ path: '', Component: Index }]);";
         let result = ReactResolver
-            .extract("src/routes.tsx", content, "")
+            .extract("src/routes.tsx", content, &test_extraction_context())
             .expect("extract");
         let route = result
             .nodes
@@ -1221,7 +1226,7 @@ mod tests {
     fn extract_data_router_path_without_component_skipped() {
         let content = "createBrowserRouter([{ path: '/only' }]);";
         let result = ReactResolver
-            .extract("src/routes.tsx", content, "")
+            .extract("src/routes.tsx", content, &test_extraction_context())
             .expect("extract");
         assert!(!result.nodes.iter().any(|n| n.kind == NodeKind::Route));
     }
@@ -1230,7 +1235,7 @@ mod tests {
     fn extract_nextjs_app_page_route() {
         let content = "export default function Page() { return <div/>; }";
         let result = ReactResolver
-            .extract("app/blog/page.tsx", content, "")
+            .extract("app/blog/page.tsx", content, &test_extraction_context())
             .expect("extract");
         let route = result
             .nodes
@@ -1244,7 +1249,7 @@ mod tests {
     fn extract_nextjs_without_export_default_no_route() {
         let content = "export function NotDefault() { return <div/>; }";
         let result = ReactResolver
-            .extract("pages/x.tsx", content, "")
+            .extract("pages/x.tsx", content, &test_extraction_context())
             .expect("extract");
         assert!(!result.nodes.iter().any(|n| n.kind == NodeKind::Route));
     }

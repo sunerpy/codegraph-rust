@@ -134,7 +134,7 @@ impl FrameworkResolver for VueResolver {
         &self,
         file_path: &str,
         _content: &str,
-        _project_root: &str,
+        _context: &crate::framework::FrameworkExtractionContext,
     ) -> Option<FrameworkResolverExtractionResult> {
         let mut nodes = Vec::new();
         let normalized = file_path.replace('\\', "/");
@@ -382,6 +382,11 @@ fn param_regex() -> &'static Regex {
 
 #[cfg(test)]
 mod tests {
+    /// Extraction context for a resolver that needs no project config.
+    fn test_extraction_context() -> crate::framework::FrameworkExtractionContext {
+        crate::framework::FrameworkExtractionContext::without_config("")
+    }
+
     use super::*;
     use crate::types::ImportMapping;
     use codegraph_core::types::Node;
@@ -675,7 +680,7 @@ mod tests {
     #[test]
     fn extract_nuxt_catch_all_route() {
         let result = VueResolver
-            .extract("app/pages/[...slug].vue", "", "")
+            .extract("app/pages/[...slug].vue", "", &test_extraction_context())
             .expect("extract");
         let route = result
             .nodes
@@ -688,7 +693,7 @@ mod tests {
     #[test]
     fn extract_nuxt_optional_param_route() {
         let result = VueResolver
-            .extract("app/pages/[[maybe]].vue", "", "")
+            .extract("app/pages/[[maybe]].vue", "", &test_extraction_context())
             .expect("extract");
         let route = result
             .nodes
@@ -702,7 +707,7 @@ mod tests {
     fn extract_nuxt_nested_index_route_strips_index() {
         // `pages/users/index.vue` -> after_pages "users/index" -> strip /index -> "/users".
         let result = VueResolver
-            .extract("app/pages/users/index.vue", "", "")
+            .extract("app/pages/users/index.vue", "", &test_extraction_context())
             .expect("extract");
         let route = result
             .nodes
@@ -717,7 +722,11 @@ mod tests {
         // The matcher keys on a leading-slash "/server/api/", so the file needs a
         // parent segment (app/server/api/...).
         let result = VueResolver
-            .extract("app/server/api/users/index.ts", "", "")
+            .extract(
+                "app/server/api/users/index.ts",
+                "",
+                &test_extraction_context(),
+            )
             .expect("extract");
         let route = result
             .nodes
@@ -732,7 +741,7 @@ mod tests {
     fn extract_middleware_node() {
         // Leading-slash "/middleware/" match requires a parent segment.
         let result = VueResolver
-            .extract("app/middleware/auth.ts", "", "")
+            .extract("app/middleware/auth.ts", "", &test_extraction_context())
             .expect("extract");
         let mw = result
             .nodes
@@ -746,7 +755,7 @@ mod tests {
     #[test]
     fn extract_non_route_file_yields_no_nodes() {
         let result = VueResolver
-            .extract("src/plain.ts", "", "")
+            .extract("src/plain.ts", "", &test_extraction_context())
             .expect("extract");
         assert!(result.nodes.is_empty());
     }
@@ -755,7 +764,7 @@ mod tests {
     fn extract_backslash_paths_normalized() {
         // Windows-style separators normalize so /pages/ still matches.
         let result = VueResolver
-            .extract("app\\pages\\about.vue", "", "")
+            .extract("app\\pages\\about.vue", "", &test_extraction_context())
             .expect("extract");
         let route = result
             .nodes
@@ -847,7 +856,7 @@ mod tests {
         // A `.vue` file under server/api and under middleware exercises the
         // Language::Vue arm of both extract branches.
         let api = VueResolver
-            .extract("app/server/api/ping.vue", "", "")
+            .extract("app/server/api/ping.vue", "", &test_extraction_context())
             .expect("extract");
         let api_route = api
             .nodes
@@ -858,7 +867,7 @@ mod tests {
         assert_eq!(api_route.language, Language::Vue);
 
         let mw = VueResolver
-            .extract("app/middleware/guard.vue", "", "")
+            .extract("app/middleware/guard.vue", "", &test_extraction_context())
             .expect("extract");
         let mw_node = mw
             .nodes
@@ -874,7 +883,7 @@ mod tests {
         // `pages/index.vue` → after_pages "index"; strip_suffix("/index") does
         // not match (no leading segment), so the route is "/index".
         let result = VueResolver
-            .extract("app/pages/index.vue", "", "")
+            .extract("app/pages/index.vue", "", &test_extraction_context())
             .expect("extract");
         let route = result
             .nodes

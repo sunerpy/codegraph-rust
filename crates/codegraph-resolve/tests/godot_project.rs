@@ -10,11 +10,16 @@ use codegraph_resolve::framework::FrameworkResolver;
 use codegraph_resolve::frameworks::godot::GodotResolver;
 use codegraph_resolve::types::FrameworkResolverExtractionResult;
 
+/// Extraction context for a resolver call that needs no project configuration.
+fn no_project_config() -> codegraph_resolve::framework::FrameworkExtractionContext {
+    codegraph_resolve::framework::FrameworkExtractionContext::without_config("")
+}
+
 /// Run `extract()` and unwrap the result (panics if the resolver returned
 /// `None`, which for `project.godot` is itself a failure).
 fn extract(path: &str, content: &str) -> FrameworkResolverExtractionResult {
     GodotResolver
-        .extract(path, content, "")
+        .extract(path, content, &no_project_config())
         .expect("project.godot must produce Some(result)")
 }
 
@@ -349,15 +354,19 @@ fn extract_returns_none_for_non_project_godot_file() {
     // project parser.
     assert!(
         GodotResolver
-            .extract("foo.gd", "extends Node\n", "")
+            .extract("foo.gd", "extends Node\n", &no_project_config())
             .is_some()
     );
     // A genuinely unclaimed file → None.
-    assert!(GodotResolver.extract("README.md", "# hi\n", "").is_none());
+    assert!(
+        GodotResolver
+            .extract("README.md", "# hi\n", &no_project_config())
+            .is_none()
+    );
     // A .tres routes to T5's resource parser (Some, not this project parser).
     assert!(
         GodotResolver
-            .extract("data/item.tres", "[gd_resource]\n", "")
+            .extract("data/item.tres", "[gd_resource]\n", &no_project_config())
             .is_some()
     );
     // A nested path whose basename IS project.godot still dispatches.
@@ -366,7 +375,7 @@ fn extract_returns_none_for_non_project_godot_file() {
             .extract(
                 "sub/dir/project.godot",
                 "[autoload]\nX=\"res://x.gd\"\n",
-                ""
+                &no_project_config()
             )
             .is_some()
     );

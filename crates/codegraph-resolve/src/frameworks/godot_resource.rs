@@ -63,14 +63,13 @@
 //! (only the text `.tres`).
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
 
 use codegraph_core::node_id::generate_node_id;
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind, ReferenceSubkind};
 
 use super::framework_node;
 use super::godot_common::{map_res_path, quoted_strings, strip_quotes};
-use super::godot_dsl_config::{IdFieldSpec, dsl_id_fields, dsl_resource_fields};
+use super::godot_dsl_config::{GodotDslConfig, IdFieldSpec};
 use crate::types::{FrameworkResolverExtractionResult, RefView};
 
 /// The marker-node name used when a `.tres` has no `[gd_resource type="..."]`.
@@ -86,21 +85,6 @@ pub(crate) fn is_tres(file_path: &str) -> bool {
         .is_some_and(|base| base.ends_with(".tres"))
 }
 
-/// The path the DSL config reader walks up from. An absolute `file_path` is used
-/// as-is (test callers pass absolute paths; `find_config_path` walks from its
-/// parent). A relative `file_path` (the pipeline's repo-relative path) is joined
-/// onto `project_root` so the walk starts at the file's real on-disk location —
-/// independent of the process CWD. An empty `project_root` falls back to the
-/// `file_path` verbatim (the pre-fix behavior, for callers that supply none).
-fn config_lookup_path(file_path: &str, project_root: &str) -> PathBuf {
-    let p = Path::new(file_path);
-    if p.is_absolute() || project_root.is_empty() {
-        p.to_path_buf()
-    } else {
-        Path::new(project_root).join(file_path)
-    }
-}
-
 /// Parse a `.tres` resource into a resource marker node + its script/resource
 /// references.
 ///
@@ -111,31 +95,25 @@ fn config_lookup_path(file_path: &str, project_root: &str) -> PathBuf {
 pub(crate) fn parse_tres(
     file_path: &str,
     content: &str,
-    project_root: &str,
+    dsl: &GodotDslConfig,
 ) -> FrameworkResolverExtractionResult {
     let mut nodes: Vec<Node> = Vec::new();
     let mut references: Vec<RefView> = Vec::new();
 
-    // The DSL config is resolved against the project root, NOT `file_path`'s
-    // CWD-relative join: the pipeline passes a repo-RELATIVE `file_path` (used
-    // verbatim for golden-stable node/ref attribution below), so config lookup
-    // walks up from the file's ABSOLUTE location (`project_root` + `file_path`).
-    // A `file_path` that is already absolute is used as-is. This keeps
-    // attribution relative while letting `find_config_path` find the project's
-    // `.codegraph/codegraph.json` regardless of the process CWD.
-    let config_lookup_path = config_lookup_path(file_path, project_root);
-
     // OPT-IN DSL fields (T9): the `godot.dsl.resourceFields` list from the
-    // nearest `.codegraph/codegraph.json` (empty when absent — the off-by-default
-    // case, so zero DSL behavior). A `key = value` line whose key is in this list
-    // emits a reference to its value (string literal → the literal text).
-    let dsl_fields = dsl_resource_fields(&config_lookup_path);
+    // addressed project's EXPLICITLY loaded current-root `codegraph.json` (empty
+    // when it declares none — the off-by-default case, so zero DSL behavior). A
+    // `key = value` line whose key is in this list emits a reference to its value
+    // (string literal → the literal text). The config arrives as a parameter, so
+    // `file_path` stays purely an attribution path and no directory walk or
+    // process-CWD lookup can mislocate it.
+    let dsl_fields = dsl.resource_fields();
 
-    // OPT-IN ID fields (PR2): the `godot.dsl.idFields` spec map from the same
-    // nearest config (empty when absent — off-by-default). A `key = value` line
+    // OPT-IN ID fields (PR2): the `godot.dsl.idFields` spec map from the SAME
+    // project config (empty when absent — off-by-default). A `key = value` line
     // whose key is a spec key emits one `godot:id:<kind>:<value>` sentinel per
     // selected segment. Independent of `dsl_fields`: a line may match both.
-    let id_fields = dsl_id_fields(&config_lookup_path);
+    let id_fields = dsl.id_fields();
 
     // In-file ext_resource lookup: id → repo-relative path. Built top-down as
     // the file is scanned (Godot declares ext_resources before `[resource]`),
@@ -189,7 +167,7 @@ pub(crate) fn parse_tres(
         // values fall through to the opt-in DSL check.
         let target = match resolve_ext_resource(value, &ext_resources) {
             Some(resolved) => Some(resolved),
-            None => dsl_literal_target(key, value, &dsl_fields),
+            None => dsl_literal_target(key, value, dsl_fields),
         };
         if let Some(target) = target {
             let from = marker_id(&mut marker, &mut nodes, file_path, line_no, &resource_type);
@@ -198,7 +176,7 @@ pub(crate) fn parse_tres(
         // The opt-in PR2 ID edges: one `godot:id:<kind>:<value>` sentinel per
         // configured segment, emitted AFTER the standard edge so a line that
         // matches both keeps source-line order. Empty when `id_fields` is empty.
-        for sentinel in dsl_id_targets(key, value, &id_fields) {
+        for sentinel in dsl_id_targets(key, value, id_fields) {
             let from = marker_id(&mut marker, &mut nodes, file_path, line_no, &resource_type);
             references.push(reference(from, sentinel, line_no, file_path));
         }

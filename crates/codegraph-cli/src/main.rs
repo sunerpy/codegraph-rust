@@ -16,11 +16,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
-use codegraph_core::config::init_config;
+use codegraph_core::config::Config;
 use codegraph_core::logger::{LoggerConfig, init_logger};
 use codegraph_core::node_id::hash_content;
 use codegraph_core::types::{ExtractionResult, FileRecord, Language, Node, NodeKind};
-use codegraph_extract::{ExtractOptions, detect_language, extract_source};
+use codegraph_extract::{ExtractOptions, detect_language_with, extract_source_with};
 use codegraph_graph::graph::{GodotReach, GraphTraverser};
 use codegraph_graph::query::{SearchOptions, search_nodes};
 use codegraph_mcp::{McpServer, RunUntilAdoption};
@@ -43,8 +43,11 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() {
     let cli = Cli::parse();
-    let bootstrap_root = cli.bootstrap_project_root();
-    let config = match init_config(None, &bootstrap_root) {
+    // Process bootstrap has no addressed project yet, so this config is
+    // `APP_CONFIG`-or-defaults ONLY and may configure NOTHING but the logger
+    // below. Every project operation (index, sync, watch, an MCP request) loads
+    // the addressed project's own immutable config from its resolved index root.
+    let config = match Config::load_env_or_default(None) {
         Ok(config) => config,
         Err(err) => {
             eprintln!("CodeGraph config error: {err:#}");
@@ -86,42 +89,6 @@ fn main() {
 struct Cli {
     #[command(subcommand)]
     command: Command,
-}
-
-impl Cli {
-    fn bootstrap_project_root(&self) -> PathBuf {
-        let raw = match &self.command {
-            Command::Init { path, .. }
-            | Command::Uninit { path, .. }
-            | Command::Index { path, .. }
-            | Command::Sync { path, .. }
-            | Command::Status { path, .. }
-            | Command::Unlock { path } => path.clone(),
-            Command::Query { path, .. }
-            | Command::Files { path, .. }
-            | Command::Serve { path, .. }
-            | Command::Callers { path, .. }
-            | Command::Callees { path, .. }
-            | Command::Impact { path, .. }
-            | Command::Affected { path, .. }
-            | Command::Check { path, .. }
-            | Command::Audit { path, .. }
-            | Command::Explore { path, .. }
-            | Command::Node { path, .. } => path.clone(),
-            Command::Export { path, .. } => path.clone(),
-            Command::PromptHook { path, .. } => path.clone(),
-            // install/uninstall/skill are not project-scoped — bootstrap from cwd.
-            Command::Install { .. }
-            | Command::Uninstall { .. }
-            | Command::Skill { .. }
-            | Command::Http { .. }
-            | Command::Version
-            | Command::Completions { .. }
-            | Command::SelfUpdate { .. } => None,
-        };
-        let start = absolute_path(raw.unwrap_or_else(|| PathBuf::from(".")));
-        resolve_project_path_optional(&start)
-    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -1685,14 +1652,13 @@ fn cmd_serve(
                 return serve_direct(project, &project_root, no_watch, explicit_path);
             }
             ServeMode::BeDaemon => {
-                let cfg = codegraph_core::config::get_config();
+                // The daemon loads THIS project's own watch config itself, from
+                // the resolved index root, so nothing is passed down here.
                 return codegraph_daemon::run_foreground(
                     &project_root,
                     codegraph_daemon::DaemonOptions {
                         run_mcp: true,
                         host_pid: codegraph_daemon::host_pid_from_env(),
-                        include: cfg.indexing.include.clone(),
-                        exclude: cfg.indexing.exclude.clone(),
                         ..Default::default()
                     },
                 )
@@ -2364,11 +2330,18 @@ fn start_direct_watcher(
     project_root: &Path,
     no_watch: bool,
 ) -> Option<codegraph_watch::ProjectWatcher> {
-    let mut opts = codegraph_watch::WatchOptions::default();
-    opts.no_watch = no_watch;
-    let cfg = codegraph_core::config::get_config();
-    opts.include = cfg.indexing.include.clone();
-    opts.exclude = cfg.indexing.exclude.clone();
+    // Include/exclude, debounce, the enable flag, and extension overrides all come
+    // from THIS project's own config (its resolved index root), so a direct serve
+    // watches exactly the scope its own `index`/`sync` would.
+    let mut opts = match codegraph_watch::watch_options_for_project(project_root) {
+        Ok(opts) => opts,
+        Err(err) => {
+            tracing::warn!(error = %err, "could not load project watch config; watcher disabled");
+            return None;
+        }
+    };
+    // An explicit `--no-watch` still wins over the project's `watch.enabled`.
+    opts.no_watch = opts.no_watch || no_watch;
     opts.on_sync_complete = Some(std::sync::Arc::new(
         |outcome: codegraph_watch::SyncOutcome| {
             tracing::info!(
@@ -3613,15 +3586,16 @@ fn index_project_inner(
     let started = std::time::Instant::now();
     let paths = index_paths(project)?;
     let index_root = paths.current_root().to_path_buf();
-    let config = codegraph_core::config::get_config();
-    let options = ExtractOptions {
-        max_file_size: config.indexing.max_file_size,
-        ignore_dirs: config.indexing.ignore_dirs.clone(),
-        ignore_paths: config.indexing.ignore_paths.clone(),
-        exclude: config.indexing.exclude.clone(),
-        include: config.indexing.include.clone(),
-        parallel: true,
-    };
+    // THIS project's own immutable config + extension overrides, read from its
+    // resolved current index root. Nothing consults a process-global value, a
+    // legacy `.codegraph` root, or the process working directory.
+    let config = Config::load_for_paths(None, &paths)?;
+    let extensions = codegraph_extract::ExtensionOverrides::load_for_paths(&paths);
+    let options = ExtractOptions::for_project(&config, extensions);
+    let framework_context = codegraph_resolve::framework::FrameworkExtractionContext::new(
+        project.to_string_lossy().into_owned(),
+        codegraph_resolve::frameworks::godot_dsl_config::GodotDslConfig::load_for_paths(&paths),
+    );
     if !quiet {
         eprintln!("Scanning files…");
     }
@@ -3774,12 +3748,12 @@ fn index_project_inner(
                                 duration_ms: 0,
                             }
                         } else {
-                            extract_source(relative, &source, None)
+                            extract_source_with(relative, &source, None, &options_ref.extensions)
                         };
                         let file = FileRecord {
                             path: relative.clone(),
                             content_hash: hash_content(&source),
-                            language: detect_language(relative),
+                            language: detect_language_with(relative, &options_ref.extensions),
                             size: metadata.len() as i64,
                             modified_at: modified_millis(&metadata),
                             indexed_at: now_millis(),
@@ -3927,7 +3901,12 @@ fn index_project_inner(
             .into_iter()
             .map(|f| f.path)
             .collect::<Vec<_>>();
-        resolver.extract_and_persist_frameworks(&mut store, &relative_files)?;
+        resolver.extract_and_persist_frameworks_with(
+            &mut store,
+            &relative_files,
+            &framework_context,
+            &options.extensions,
+        )?;
     }
     finish_phase(&pb, "Detected frameworks");
     // Finished from INSIDE the callback on the final chunk so the retained line

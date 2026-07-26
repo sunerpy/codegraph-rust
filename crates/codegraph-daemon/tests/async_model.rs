@@ -97,7 +97,8 @@ fn handshake(stream: &mut Stream, id: i64) {
 }
 
 fn start_daemon(project: &Path) -> DaemonHandle {
-    let _ = codegraph_core::config::init_config(None, project);
+    // No process-global config to initialize: every project-scoped operation
+    // loads the addressed project's own immutable config on demand.
     let options = DaemonOptions {
         host_pid: None,
         watchdog_interval: Duration::from_millis(10),

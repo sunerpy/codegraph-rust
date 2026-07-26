@@ -17,6 +17,7 @@ pub mod spec;
 pub mod walker;
 
 pub use engine::{
-    ExtractOptions, detect_language, extract_file, extract_project, extract_source,
-    include_exclude_pattern_matches,
+    ExtractOptions, detect_language, detect_language_with, extract_file, extract_file_with_options,
+    extract_project, extract_source, extract_source_with, include_exclude_pattern_matches,
 };
+pub use ext_config::ExtensionOverrides;

@@ -1,134 +1,118 @@
-//! Reader for `.codegraph/codegraph.json` custom extension overrides:
+//! Reader for the PROJECT-SCOPED `codegraph.json` extension overrides:
 //! `{"extensions": {".x": "lua"}}`. Keys normalized (dot stripped, lowercased);
-//! languages parse via `Language` serde names (unknown skipped). The parsed map
-//! is mtime-cached per config-file path; "absent" is cached too, so a project
-//! with no codegraph.json pays no repeated I/O.
+//! languages parse via `Language` serde names (unknown skipped).
+//!
+//! The file read is ALWAYS the caller-supplied current-root
+//! [`IndexPaths::extension_config`](codegraph_core::IndexPaths::extension_config)
+//! path: nothing here walks the directory tree, consults the process working
+//! directory, or reads a legacy `.codegraph/codegraph.json`. The parsed result is
+//! an immutable [`ExtensionOverrides`] value that the caller threads through
+//! [`crate::ExtractOptions`], so two projects served by ONE process cannot see
+//! each other's overrides and no cache can go stale.
+//!
+//! Absence and malformed content stay tolerant (empty overrides, logged), which
+//! is the documented opt-in contract: a project with no `codegraph.json` behaves
+//! byte-identically to a build without the feature.
 
+use codegraph_core::IndexPaths;
 use codegraph_core::types::Language;
 use serde::Deserialize;
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::SystemTime;
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Debug, Deserialize)]
 struct CodegraphJson {
     #[serde(default)]
-    extensions: HashMap<String, String>,
+    extensions: BTreeMap<String, String>,
 }
 
-type ExtMap = HashMap<String, Language>;
-
-#[derive(Clone)]
-enum CacheEntry {
-    Absent,
-    Present { mtime: SystemTime, map: Arc<ExtMap> },
+/// One project's parsed extension overrides: lowercased dot-free extension →
+/// language. Empty when the project declares none.
+///
+/// Deterministic: the backing map is ordered, and the value is immutable once
+/// built, so every consumer of the same `Arc` observes identical bytes.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ExtensionOverrides {
+    map: BTreeMap<String, Language>,
 }
 
-fn cache() -> &'static Mutex<HashMap<PathBuf, CacheEntry>> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, CacheEntry>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Override language for `ext` (lowercased, no dot), resolving the nearest
-/// `.codegraph/codegraph.json` walking up from `path`. `None` when no config is
-/// reachable, parse failed, or the extension is unmapped.
-pub fn override_language_for(path: &Path, ext: &str) -> Option<Language> {
-    let config_path = find_config_path(path)?;
-    let map = load_cached(&config_path)?;
-    map.get(ext).copied()
-}
-
-fn find_config_path(file_path: &Path) -> Option<PathBuf> {
-    let start = if file_path.is_absolute() {
-        file_path.parent().map(Path::to_path_buf)
-    } else {
-        std::env::current_dir()
-            .ok()
-            .map(|cwd| cwd.join(file_path))
-            .and_then(|abs| abs.parent().map(Path::to_path_buf))
-    }?;
-    let mut dir: Option<&Path> = Some(start.as_path());
-    while let Some(current) = dir {
-        let candidate = current.join(".codegraph").join("codegraph.json");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        dir = current.parent();
-    }
-    None
-}
-
-fn load_cached(config_path: &Path) -> Option<Arc<ExtMap>> {
-    let current_mtime = std::fs::metadata(config_path)
-        .and_then(|m| m.modified())
-        .ok();
-    let mut guard = cache().lock().unwrap_or_else(|p| p.into_inner());
-
-    if let Some(entry) = guard.get(config_path) {
-        match (entry, current_mtime) {
-            (CacheEntry::Present { mtime, map }, Some(now)) if *mtime == now => {
-                return Some(Arc::clone(map));
-            }
-            (CacheEntry::Absent, None) => return None,
-            _ => {}
-        }
+impl ExtensionOverrides {
+    /// No overrides — the zero-config default.
+    #[must_use]
+    pub fn empty() -> Arc<Self> {
+        Arc::new(Self::default())
     }
 
-    let Some(mtime) = current_mtime else {
-        guard.insert(config_path.to_path_buf(), CacheEntry::Absent);
-        return None;
-    };
+    /// Load the overrides declared by ONE project's current index root.
+    ///
+    /// Reads exactly `paths.extension_config()`. A missing file yields empty
+    /// overrides; an unreadable or malformed file is tolerated as empty and
+    /// logged, matching the opt-in contract.
+    #[must_use]
+    pub fn load_for_paths(paths: &IndexPaths) -> Arc<Self> {
+        Self::load_from_file(&paths.extension_config())
+    }
 
-    let map = Arc::new(parse_config(config_path));
-    guard.insert(
-        config_path.to_path_buf(),
-        CacheEntry::Present {
-            mtime,
-            map: Arc::clone(&map),
-        },
-    );
-    Some(map)
-}
+    /// Load overrides from an explicit `codegraph.json` path. Exposed so a
+    /// caller that already resolved the file (or a test fixture) can supply it
+    /// directly; the tolerance rules are identical to [`Self::load_for_paths`].
+    #[must_use]
+    pub fn load_from_file(config_path: &Path) -> Arc<Self> {
+        let Ok(contents) = std::fs::read_to_string(config_path) else {
+            return Self::empty();
+        };
+        Arc::new(Self::parse(&contents, config_path))
+    }
 
-fn parse_config(config_path: &Path) -> ExtMap {
-    let Ok(contents) = std::fs::read_to_string(config_path) else {
-        return ExtMap::new();
-    };
-    let parsed: CodegraphJson = match serde_json::from_str(&contents) {
-        Ok(parsed) => parsed,
-        Err(error) => {
-            tracing::warn!(
-                target: "codegraph_extract::ext_config",
-                path = %config_path.display(),
-                %error,
-                "ignoring malformed .codegraph/codegraph.json"
-            );
-            return ExtMap::new();
-        }
-    };
-
-    let mut map = ExtMap::new();
-    for (raw_ext, raw_lang) in parsed.extensions {
-        let ext = normalize_ext(&raw_ext);
-        if ext.is_empty() {
-            continue;
-        }
-        match parse_language(&raw_lang) {
-            Some(language) => {
-                map.insert(ext, language);
-            }
-            None => {
+    fn parse(contents: &str, config_path: &Path) -> Self {
+        let parsed: CodegraphJson = match serde_json::from_str(contents) {
+            Ok(parsed) => parsed,
+            Err(error) => {
                 tracing::warn!(
                     target: "codegraph_extract::ext_config",
-                    extension = %raw_ext,
-                    language = %raw_lang,
-                    "ignoring unknown language in codegraph.json extensions"
+                    path = %config_path.display(),
+                    %error,
+                    "ignoring malformed codegraph.json"
                 );
+                return Self::default();
+            }
+        };
+
+        let mut map = BTreeMap::new();
+        for (raw_ext, raw_lang) in parsed.extensions {
+            let ext = normalize_ext(&raw_ext);
+            if ext.is_empty() {
+                continue;
+            }
+            match parse_language(&raw_lang) {
+                Some(language) => {
+                    map.insert(ext, language);
+                }
+                None => {
+                    tracing::warn!(
+                        target: "codegraph_extract::ext_config",
+                        extension = %raw_ext,
+                        language = %raw_lang,
+                        "ignoring unknown language in codegraph.json extensions"
+                    );
+                }
             }
         }
+        Self { map }
     }
-    map
+
+    /// `true` when the project declared no usable override.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// The override language for `ext` (lowercased, no leading dot), if any.
+    #[must_use]
+    pub fn language_for(&self, ext: &str) -> Option<Language> {
+        self.map.get(ext).copied()
+    }
 }
 
 fn normalize_ext(raw: &str) -> String {
@@ -142,4 +126,74 @@ fn parse_language(raw: &str) -> Option<Language> {
         return None;
     }
     Some(language)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn overrides(json: &str) -> ExtensionOverrides {
+        ExtensionOverrides::parse(json, Path::new("codegraph.json"))
+    }
+
+    #[test]
+    fn parses_normalized_keys_and_known_languages() {
+        let parsed = overrides(r#"{"extensions":{".MyExt":"lua","X":"go"}}"#);
+        assert_eq!(parsed.language_for("myext"), Some(Language::Lua));
+        assert_eq!(parsed.language_for("x"), Some(Language::Go));
+        assert!(!parsed.is_empty());
+    }
+
+    #[test]
+    fn skips_unknown_languages_and_empty_keys() {
+        let parsed = overrides(r#"{"extensions":{".foo":"klingon",".":"lua","  ":"go"}}"#);
+        assert_eq!(parsed.language_for("foo"), None);
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn malformed_json_yields_empty_overrides() {
+        assert!(overrides("{ not json ").is_empty());
+    }
+
+    #[test]
+    fn missing_file_yields_empty_overrides() {
+        let missing = std::env::temp_dir().join(format!(
+            "codegraph-ext-missing-{}-{}/codegraph.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(ExtensionOverrides::load_from_file(&missing).is_empty());
+    }
+
+    /// The reader consults the caller's current-root path only: a legacy
+    /// `.codegraph/codegraph.json` next to it is never adopted.
+    #[test]
+    fn load_for_paths_reads_only_the_current_root_config() {
+        let project = std::env::temp_dir().join(format!(
+            "codegraph-ext-scoped-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(project.join(".codegraph")).unwrap();
+        std::fs::write(
+            project.join(".codegraph/codegraph.json"),
+            r#"{"extensions":{".zz":"go"}}"#,
+        )
+        .unwrap();
+        let paths = IndexPaths::resolve(&project, None).expect("resolve paths");
+        std::fs::create_dir_all(paths.current_root()).unwrap();
+        std::fs::write(paths.extension_config(), r#"{"extensions":{".zz":"lua"}}"#).unwrap();
+
+        let loaded = ExtensionOverrides::load_for_paths(&paths);
+        assert_eq!(loaded.language_for("zz"), Some(Language::Lua));
+
+        let _ = std::fs::remove_dir_all(&project);
+    }
 }

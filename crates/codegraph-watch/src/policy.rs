@@ -1,7 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use codegraph_extract::detect_language;
+use codegraph_extract::{ExtensionOverrides, detect_language_with};
 
 pub const CODEGRAPH_NO_WATCH: &str = "CODEGRAPH_NO_WATCH";
 
@@ -85,6 +86,10 @@ pub struct WatchPolicy {
     builtin_rule_count: usize,
     include: Vec<String>,
     exclude: Vec<String>,
+    /// The addressed project's custom extension→language overrides, so a file the
+    /// project declared as source is HANDLED by the watcher exactly as the scan
+    /// indexes it. Empty by default (built-in detection only).
+    extensions: Arc<ExtensionOverrides>,
 }
 
 impl WatchPolicy {
@@ -136,7 +141,18 @@ impl WatchPolicy {
             builtin_rule_count,
             include: include.to_vec(),
             exclude: exclude.to_vec(),
+            extensions: ExtensionOverrides::empty(),
         }
+    }
+
+    /// Adopt the addressed project's extension overrides, so
+    /// [`should_handle_file`](Self::should_handle_file) treats a project-declared
+    /// custom extension as source. Without this the policy uses built-in
+    /// detection only, which is the zero-config behavior.
+    #[must_use]
+    pub fn with_extension_overrides(mut self, extensions: Arc<ExtensionOverrides>) -> Self {
+        self.extensions = extensions;
+        self
     }
 
     pub fn normalize_relative(&self, path: impl AsRef<Path>) -> Option<String> {
@@ -156,7 +172,8 @@ impl WatchPolicy {
     pub fn should_handle_file(&self, relative: &str) -> bool {
         !self.is_always_ignored(relative)
             && !self.is_ignored(relative, false)
-            && detect_language(relative) != codegraph_core::types::Language::Unknown
+            && detect_language_with(relative, &self.extensions)
+                != codegraph_core::types::Language::Unknown
     }
 
     pub fn allows_file_path(&self, relative: &str) -> bool {

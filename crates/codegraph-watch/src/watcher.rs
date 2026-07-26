@@ -12,6 +12,10 @@ use anyhow::Result;
 use notify::event::{EventKind, RemoveKind};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
+use codegraph_core::IndexPaths;
+use codegraph_core::config::Config;
+use codegraph_extract::ExtensionOverrides;
+
 use crate::policy::{WatchPolicy, watch_disabled_reason};
 use crate::sync::{
     SyncOutcome, default_db_path, sync_changed_paths_with_patterns, sync_project_once_with_patterns,
@@ -296,11 +300,15 @@ pub struct WatchOptions {
     /// Called for a non-degrading watch/sync error (e.g. inotify watch-count
     /// exhaustion). May fire more than once; the watcher keeps running.
     pub on_sync_error: Option<NoticeCallback>,
-    /// `codegraph.json`/`config.toml` `include`/`exclude` path patterns (#1063).
-    /// Threaded into the [`WatchPolicy`] and the default incremental-sync fn so
-    /// the watcher's scope matches the scan's. Empty = pre-#1063 behavior.
+    /// The addressed project's `config.toml` `include`/`exclude` path patterns
+    /// (#1063). Threaded into the [`WatchPolicy`] and the default incremental-sync
+    /// fn so the watcher's scope matches the scan's. Empty = pre-#1063 behavior.
     pub include: Vec<String>,
     pub exclude: Vec<String>,
+    /// The addressed project's custom extension→language overrides (its
+    /// current-root `codegraph.json`), so the watcher HANDLES a file the project
+    /// declared as source. Empty = built-in detection only.
+    pub extensions: Arc<ExtensionOverrides>,
     sync_fn: Option<SyncFn>,
     /// Override for the whole-project sync a removed directory escalates to.
     /// Defaults to [`crate::sync::sync_project_once`]; tests inject a counter.
@@ -321,8 +329,31 @@ impl Default for WatchOptions {
             on_sync_error: None,
             include: Vec::new(),
             exclude: Vec::new(),
+            extensions: ExtensionOverrides::empty(),
             sync_fn: None,
             full_sync_fn: None,
+        }
+    }
+}
+
+impl WatchOptions {
+    /// Build watch options from ONE project's immutable [`Config`] and its own
+    /// extension overrides.
+    ///
+    /// `include`/`exclude` and the debounce window come from that project, and
+    /// `watch.enabled = false` disables watching for it — so two projects served
+    /// by one process can watch different scopes (or one not at all). An explicit
+    /// `CODEGRAPH_WATCH_DEBOUNCE_MS` still wins, keeping the documented env escape
+    /// hatch authoritative over config.
+    #[must_use]
+    pub fn for_project(config: &Config, extensions: Arc<ExtensionOverrides>) -> Self {
+        Self {
+            debounce: debounce_from_env_or(config.watch.debounce_ms),
+            no_watch: !config.watch.enabled,
+            include: config.indexing.include.clone(),
+            exclude: config.indexing.exclude.clone(),
+            extensions,
+            ..Self::default()
         }
     }
 }
@@ -348,13 +379,31 @@ pub fn start_serve_watcher(
     ProjectWatcher::start(project_root, options)
 }
 
+/// Build [`WatchOptions`] from the ADDRESSED project's own immutable config.
+///
+/// Loads `<current_root>/config.toml` and `<current_root>/codegraph.json` through
+/// the resolved [`IndexPaths`], so a caller that serves several projects in one
+/// process (a shared daemon, a global HTTP server) gives each watcher that
+/// project's include/exclude, debounce, enable flag, and extension overrides —
+/// never another project's and never a process-global value.
+pub fn watch_options_for_project(project_root: impl AsRef<Path>) -> Result<WatchOptions> {
+    let paths = IndexPaths::resolve(
+        project_root.as_ref(),
+        std::env::var("CODEGRAPH_DIR").ok().as_deref(),
+    )?;
+    let config = Config::load_for_paths(None, &paths)?;
+    let extensions = ExtensionOverrides::load_for_paths(&paths);
+    Ok(WatchOptions::for_project(&config, extensions))
+}
+
 impl ProjectWatcher {
     pub fn start(project_root: impl AsRef<Path>, options: WatchOptions) -> Result<Option<Self>> {
         let project_root = project_root.as_ref().to_path_buf();
         if watch_disabled_reason(&project_root, options.no_watch).is_some() {
             return Ok(None);
         }
-        let policy = WatchPolicy::with_config(&project_root, &options.include, &options.exclude);
+        let policy = WatchPolicy::with_config(&project_root, &options.include, &options.exclude)
+            .with_extension_overrides(Arc::clone(&options.extensions));
         let db_path = match options.db_path.clone() {
             Some(db) => db,
             None => default_db_path(&project_root)?,
@@ -950,10 +999,17 @@ fn maybe_deleted_source(relative: &str) -> bool {
 }
 
 fn debounce_from_env() -> Duration {
+    debounce_from_env_or(2_000)
+}
+
+/// The debounce window: `CODEGRAPH_WATCH_DEBOUNCE_MS` when set (the documented
+/// env escape hatch), else `fallback_ms` (a project's `watch.debounce_ms`, or the
+/// upstream 2000ms default). Always clamped to [100ms, 60s].
+fn debounce_from_env_or(fallback_ms: u64) -> Duration {
     let millis = std::env::var("CODEGRAPH_WATCH_DEBOUNCE_MS")
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
-        .unwrap_or(2_000)
+        .unwrap_or(fallback_ms)
         .clamp(100, 60_000);
     Duration::from_millis(millis)
 }
@@ -1043,7 +1099,6 @@ mod tests {
         // full-project sync — the only pass that discovers every absent tracked
         // descendant — instead of an incremental path-scoped sync.
         let dir = crate::sync::tests::TestDir::new("watch-deleted-dir");
-        let _ = codegraph_core::config::init_config(None, dir.path());
         fs::write(dir.path().join(".gitignore"), "Tools/\n").unwrap();
         fs::create_dir_all(dir.path().join("Tools/feature")).unwrap();
         fs::create_dir_all(dir.path().join("src")).unwrap();

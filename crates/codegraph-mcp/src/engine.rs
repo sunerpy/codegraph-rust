@@ -9,8 +9,10 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use codegraph_core::config::Config;
 use codegraph_core::types::{EdgeKind, FileRecord, Node, NodeKind};
 use codegraph_graph::graph::{GodotReach, GraphTraverser, NodeEdge};
 use codegraph_graph::query::{SearchOptions, search_nodes};
@@ -65,6 +67,11 @@ const SIG_EDGE_KINDS: [EdgeKind; 3] = [EdgeKind::References, EdgeKind::TypeOf, E
 pub struct CodeGraphEngine {
     store: Store,
     project_root: PathBuf,
+    /// The ADDRESSED project's own immutable config, loaded per request from its
+    /// resolved current index root. A server that answers for many projects (a
+    /// global HTTP process) therefore honors each project's own settings, and
+    /// nothing here reads a process-global value or a legacy `.codegraph` config.
+    config: Arc<Config>,
 }
 
 impl CodeGraphEngine {
@@ -80,12 +87,35 @@ impl CodeGraphEngine {
             project_root,
             std::env::var("CODEGRAPH_DIR").ok().as_deref(),
         )?;
+        let config = Config::load_for_paths(None, &paths)?;
         let store =
             Store::open_for_read(&paths, Instant::now() + Self::READ_LEASE_TIMEOUT, || false)?;
         Ok(Self {
             store,
             project_root: project_root.to_path_buf(),
+            config,
         })
+    }
+
+    /// This project's own immutable configuration for the current request.
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// Read an indexed file's on-disk source, refusing anything larger than THIS
+    /// project's `indexing.max_file_size`.
+    ///
+    /// Extraction skips a file over that limit, so its symbols are not in the
+    /// graph; serving its full text through a graph tool would contradict the
+    /// project's own size policy. `None` therefore means "unreadable or beyond
+    /// this project's limit", and every rendering path treats it exactly as it
+    /// already treats an unreadable file.
+    fn read_project_source(&self, abs: &Path) -> Option<String> {
+        let metadata = fs::metadata(abs).ok()?;
+        if metadata.len() > self.config.indexing.max_file_size {
+            return None;
+        }
+        fs::read_to_string(abs).ok()
     }
 
     fn project_name_tokens(&self) -> HashSet<String> {
@@ -575,9 +605,9 @@ impl CodeGraphEngine {
         }
 
         let abs = self.project_root.join(&file_path);
-        let content = match fs::read_to_string(&abs) {
-            Ok(c) => c,
-            Err(_) => {
+        let content = match self.read_project_source(&abs) {
+            Some(c) => c,
+            None => {
                 let mut out = vec![
                     format!(
                         "**{file_path}** — could not read from disk (it may have moved since indexing). {dep_summary}"
@@ -740,9 +770,9 @@ impl CodeGraphEngine {
                 continue;
             }
             let abs = self.project_root.join(file_path);
-            let content = match fs::read_to_string(&abs) {
-                Ok(c) => c,
-                Err(_) => continue,
+            let content = match self.read_project_source(&abs) {
+                Some(c) => c,
+                None => continue,
             };
             let file_lines: Vec<&str> = content.split('\n').collect();
             let lang = subgraph.file_language(file_path);
@@ -1534,9 +1564,9 @@ impl CodeGraphEngine {
             }
             seen_node.insert(node.id.as_str());
             let abs = self.project_root.join(&node.file_path);
-            let content = match fs::read_to_string(&abs) {
-                Ok(c) => c,
-                Err(_) => continue,
+            let content = match self.read_project_source(&abs) {
+                Some(c) => c,
+                None => continue,
             };
             let file_lines: Vec<&str> = content.split('\n').collect();
             let start_idx = ((node.start_line - 1).max(0) as usize).min(file_lines.len());
@@ -1748,9 +1778,9 @@ impl CodeGraphEngine {
     /// out of the on-disk file (1-based inclusive).
     fn get_code(&self, node: &Node) -> anyhow::Result<Option<String>> {
         let abs = self.project_root.join(&node.file_path);
-        let content = match fs::read_to_string(&abs) {
-            Ok(c) => c,
-            Err(_) => return Ok(None),
+        let content = match self.read_project_source(&abs) {
+            Some(c) => c,
+            None => return Ok(None),
         };
         let lines: Vec<&str> = content.split('\n').collect();
         let start_idx = (node.start_line - 1).max(0) as usize;
@@ -2673,6 +2703,7 @@ mod tests {
         CodeGraphEngine {
             store,
             project_root: base,
+            config: Arc::new(Config::default()),
         }
     }
 

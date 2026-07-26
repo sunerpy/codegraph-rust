@@ -800,13 +800,33 @@ impl ReferenceResolver {
         store: &mut Store,
         relative_files: &[String],
     ) -> anyhow::Result<()> {
+        self.extract_and_persist_frameworks_with(
+            store,
+            relative_files,
+            &crate::framework::FrameworkExtractionContext::without_config(&self.project_root),
+            &codegraph_extract::ext_config::ExtensionOverrides::default(),
+        )
+    }
+
+    /// Like [`Self::extract_and_persist_frameworks`] but driven by the addressed
+    /// project's EXPLICITLY loaded configuration: `context` carries its framework
+    /// config (Godot DSL fields) and `extensions` its custom extension→language
+    /// overrides, so language gating and framework extraction both reflect that
+    /// one project and never another's.
+    pub fn extract_and_persist_frameworks_with(
+        &self,
+        store: &mut Store,
+        relative_files: &[String],
+        context: &crate::framework::FrameworkExtractionContext,
+        extensions: &codegraph_extract::ext_config::ExtensionOverrides,
+    ) -> anyhow::Result<()> {
         if self.framework_resolver_extensions.is_empty() {
             return Ok(());
         }
         let mut nodes: Vec<Node> = Vec::new();
         let mut refs: Vec<UnresolvedRef> = Vec::new();
         for relative in relative_files {
-            let language = codegraph_extract::detect_language(relative);
+            let language = codegraph_extract::detect_language_with(relative, extensions);
             let Some(content) =
                 std::fs::read_to_string(std::path::Path::new(&self.project_root).join(relative))
                     .ok()
@@ -817,7 +837,7 @@ impl ReferenceResolver {
                 if !applies_to_language(resolver.as_ref(), language) {
                     continue;
                 }
-                if let Some(result) = resolver.extract(relative, &content, &self.project_root) {
+                if let Some(result) = resolver.extract(relative, &content, context) {
                     nodes.extend(result.nodes);
                     for reference in result.references {
                         refs.push(ref_view_to_unresolved(&reference));

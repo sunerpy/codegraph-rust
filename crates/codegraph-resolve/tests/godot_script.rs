@@ -15,11 +15,16 @@ use codegraph_resolve::frameworks::godot::GodotResolver;
 use codegraph_resolve::frameworks::godot_script::{AUTOLOAD_CALL_PREFIX, DYNAMIC_PREFIX};
 use codegraph_resolve::types::{FrameworkResolverExtractionResult, RefView};
 
+/// Extraction context for a resolver call that needs no project configuration.
+fn no_project_config() -> codegraph_resolve::framework::FrameworkExtractionContext {
+    codegraph_resolve::framework::FrameworkExtractionContext::without_config("")
+}
+
 /// Run `extract()` and unwrap the result (panics if the resolver returned
 /// `None`, which for a `.gd` is itself a failure).
 fn extract(path: &str, content: &str) -> FrameworkResolverExtractionResult {
     GodotResolver
-        .extract(path, content, "")
+        .extract(path, content, &no_project_config())
         .expect(".gd must produce Some(result)")
 }
 
@@ -425,36 +430,52 @@ fn extract_routes_gd_to_t6_and_others_correctly() {
     // A .gd dispatches to T6 (Some).
     assert!(
         GodotResolver
-            .extract("player.gd", "extends Node\n", "")
+            .extract("player.gd", "extends Node\n", &no_project_config())
             .is_some()
     );
     // A nested path whose extension is .gd still dispatches.
     assert!(
         GodotResolver
-            .extract("a/b/c/Deep.gd", "extends Node\n", "")
+            .extract("a/b/c/Deep.gd", "extends Node\n", &no_project_config())
             .is_some()
     );
 
     // A .tscn routes to T4 (Some, via the scene parser).
     assert!(
         GodotResolver
-            .extract("scenes/Main.tscn", "[gd_scene format=3]\n", "")
+            .extract(
+                "scenes/Main.tscn",
+                "[gd_scene format=3]\n",
+                &no_project_config()
+            )
             .is_some()
     );
     // A .tres routes to T5 (Some, via the resource parser).
     assert!(
         GodotResolver
-            .extract("data/item.tres", "[gd_resource format=3]\n", "")
+            .extract(
+                "data/item.tres",
+                "[gd_resource format=3]\n",
+                &no_project_config()
+            )
             .is_some()
     );
     // project.godot routes to T3 (Some, via the project parser).
     assert!(
         GodotResolver
-            .extract("project.godot", "[autoload]\nX=\"res://x.gd\"\n", "")
+            .extract(
+                "project.godot",
+                "[autoload]\nX=\"res://x.gd\"\n",
+                &no_project_config()
+            )
             .is_some()
     );
     // A non-Godot file the resolver doesn't claim → None.
-    assert!(GodotResolver.extract("README.md", "# hi\n", "").is_none());
+    assert!(
+        GodotResolver
+            .extract("README.md", "# hi\n", &no_project_config())
+            .is_none()
+    );
 }
 
 #[test]

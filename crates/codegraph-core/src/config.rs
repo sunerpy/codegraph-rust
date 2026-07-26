@@ -16,16 +16,16 @@
 //! - watch.enabled: true
 //! - watch.debounce_ms: 2000
 //!
-//! The process-global [`init_config`] / [`get_config`] API remains temporarily for
-//! transitional bootstrap callers. New library code must use
-//! [`Config::load_for_paths`] and pass the returned [`Arc`] through project-scoped
-//! operations instead of consulting that singleton.
+//! There is NO process-global config. Every project-scoped operation loads its own
+//! immutable [`Config`] with [`Config::load_for_paths`] and passes the returned
+//! [`Arc`] down; process bootstrap (which has no addressed project yet) uses
+//! [`Config::load_env_or_default`], whose result may only configure the logger.
 
 use crate::IndexPaths;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 /// Top-level configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -296,71 +296,26 @@ impl Config {
         Ok(Arc::new(config))
     }
 
-    /// Transitional legacy discovery with a clear precedence:
-    ///   1. explicit `cli_path` (passed in directly)
-    ///   2. `APP_CONFIG` env var
-    ///   3. `./.codegraph/config.toml` (current working directory)
-    ///   4. `<project_root>/.codegraph/config.toml` (if provided)
+    /// Load the PROCESS-BOOTSTRAP config, before any project is addressed.
     ///
-    /// If no file is found, returns all defaults. New project-scoped callers
-    /// should use [`Config::load_for_paths`]; this compatibility path retains the
-    /// old `.codegraph` and CWD behavior only until downstream callers migrate.
-    pub fn discover(cli_path: Option<&Path>, project_root: &Path) -> Result<Self> {
-        if let Some(p) = cli_path {
-            return Self::from_path(p);
+    /// Precedence is exactly the project-independent prefix of
+    /// [`Config::load_for_paths`]: an explicit `cli_path`, then the process-wide
+    /// `APP_CONFIG` override, then all defaults. It never reads a project root,
+    /// a legacy `.codegraph/config.toml`, or the process working directory.
+    ///
+    /// The result may ONLY configure process-wide bootstrap concerns (the logger
+    /// level). It is never the configuration source for a project operation — a
+    /// global HTTP server, sync, watcher, or extraction pass loads the addressed
+    /// project's own config through [`Config::load_for_paths`].
+    pub fn load_env_or_default(cli_path: Option<&Path>) -> Result<Arc<Self>> {
+        if let Some(path) = cli_path {
+            return Self::from_path(path).map(Arc::new);
         }
-        if let Ok(p) = std::env::var("APP_CONFIG") {
-            return Self::from_path(p);
+        if let Some(path) = std::env::var_os("APP_CONFIG") {
+            return Self::from_path(PathBuf::from(path)).map(Arc::new);
         }
-
-        // Try .codegraph/config.toml relative to project root
-        let project_config = project_root.join(".codegraph").join("config.toml");
-        if project_config.exists() {
-            return Self::from_path(&project_config);
-        }
-
-        // Try ./.codegraph/config.toml (CWD)
-        let cwd_config = PathBuf::from(".codegraph/config.toml");
-        if cwd_config.exists() {
-            return Self::from_path(&cwd_config);
-        }
-
-        // No file found — return all defaults
-        Ok(Self::default())
+        Ok(Arc::new(Self::default()))
     }
-}
-
-static CONFIG: OnceLock<Config> = OnceLock::new();
-
-/// Initialize the transitional global config once, early in `main`.
-///
-/// This exists so unmigrated bootstrap callers continue to compile. New
-/// project-scoped operations must use [`Config::load_for_paths`] instead.
-pub fn init_config(cli_path: Option<&Path>, project_root: &Path) -> Result<&'static Config> {
-    let cfg = Config::discover(cli_path, project_root)?;
-    CONFIG
-        .set(cfg)
-        .map_err(|_| anyhow::anyhow!("config already initialized"))?;
-    Ok(CONFIG.get().expect("just set"))
-}
-
-/// Borrow the global config only if `init_config` has already run.
-///
-/// Non-panicking counterpart of [`get_config`], for library code that must stay
-/// alive on a path where no binary initialized the global config (for example a
-/// watcher thread that escalates to a full migration). Callers fall back to the
-/// documented defaults instead of aborting the process.
-#[must_use]
-pub fn try_get_config() -> Option<&'static Config> {
-    CONFIG.get()
-}
-
-/// Borrow the global config after `init_config` has run.
-/// Panics if not initialized; for library use, prefer init_config().
-pub fn get_config() -> &'static Config {
-    CONFIG
-        .get()
-        .expect("config not initialized; call init_config() first")
 }
 
 #[cfg(test)]
@@ -500,8 +455,7 @@ max_file_size = 2097152
     #[test]
     fn test_missing_file_returns_defaults() {
         let _env = AppConfigEnvGuard::unset();
-        let cfg = Config::discover(None, Path::new("/tmp/nonexistent"))
-            .expect("should not error on missing file");
+        let cfg = Config::load_env_or_default(None).expect("should not error on missing file");
         assert_eq!(cfg.app.log_level, "info");
         assert_eq!(cfg.indexing.max_file_size, 1048576);
         assert!(cfg.watch.enabled);
@@ -553,12 +507,12 @@ max_file_size = 2097152
     }
 
     #[test]
-    fn discover_prefers_explicit_cli_path() {
+    fn load_env_or_default_prefers_explicit_cli_path() {
         let dir = temp_dir("cli-path");
         let path = dir.join("explicit.toml");
         std::fs::write(&path, "[app]\nname = \"explicit\"\nlog_level = \"error\"\n").unwrap();
 
-        let cfg = Config::discover(Some(&path), Path::new("/tmp/ignored")).expect("discover");
+        let cfg = Config::load_env_or_default(Some(&path)).expect("bootstrap config");
         assert_eq!(cfg.app.name, "explicit");
         assert_eq!(cfg.app.log_level, "error");
 
@@ -566,22 +520,64 @@ max_file_size = 2097152
     }
 
     #[test]
-    fn discover_reads_project_root_codegraph_config() {
-        let _env = AppConfigEnvGuard::unset();
-        let project = temp_dir("project-root");
-        let cfg_dir = project.join(".codegraph");
-        std::fs::create_dir_all(&cfg_dir).unwrap();
+    fn load_env_or_default_honors_app_config_then_falls_back_to_defaults() {
+        let dir = temp_dir("bootstrap-env");
+        let path = dir.join("env.toml");
+        std::fs::write(&path, "[app]\nname = \"env\"\nlog_level = \"trace\"\n").unwrap();
+        {
+            let _env = AppConfigEnvGuard::set(Some(&path));
+            let cfg = Config::load_env_or_default(None).expect("bootstrap config");
+            assert_eq!(cfg.app.name, "env");
+            assert_eq!(cfg.app.log_level, "trace");
+        }
+        {
+            let _env = AppConfigEnvGuard::unset();
+            let cfg = Config::load_env_or_default(None).expect("bootstrap config");
+            assert_eq!(cfg.app.log_level, default_log_level());
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bootstrap must never adopt a project or CWD legacy `.codegraph/config.toml`:
+    /// with `APP_CONFIG` unset it is defaults-only, so it can never become the
+    /// configuration source for a later per-project operation.
+    #[test]
+    fn load_env_or_default_ignores_legacy_project_and_cwd_configs() {
+        const CHILD_MARKER: &str = "CODEGRAPH_CONFIG_BOOTSTRAP_CHILD";
+
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let cfg = Config::load_env_or_default(None).unwrap();
+            assert_eq!(cfg.app.name, "codegraph");
+            assert_eq!(cfg.app.log_level, default_log_level());
+            return;
+        }
+
+        let outer = temp_dir("bootstrap-no-legacy");
+        std::fs::create_dir_all(outer.join(".codegraph")).unwrap();
         std::fs::write(
-            cfg_dir.join("config.toml"),
-            "[app]\nname = \"rooted\"\nlog_level = \"debug\"\n",
+            outer.join(".codegraph/config.toml"),
+            "[app]\nname = \"legacy-cwd\"\nlog_level = \"error\"\n",
         )
         .unwrap();
 
-        let cfg = Config::discover(None, &project).expect("discover project config");
-        assert_eq!(cfg.app.name, "rooted");
-        assert_eq!(cfg.app.log_level, "debug");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("config::tests::load_env_or_default_ignores_legacy_project_and_cwd_configs")
+            .arg("--nocapture")
+            .current_dir(&outer)
+            .env(CHILD_MARKER, "1")
+            .env_remove("APP_CONFIG")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
 
-        let _ = std::fs::remove_dir_all(&project);
+        let _ = std::fs::remove_dir_all(outer);
     }
 
     fn project_paths(label: &str) -> (PathBuf, IndexPaths) {
@@ -838,31 +834,23 @@ ignore_paths = ["custom/gen*"]
         let cfg: Config = toml::from_str(with_override).expect("should parse");
         assert_eq!(cfg.indexing.ignore_paths, vec!["custom/gen*"]);
     }
+    /// Two loads of the SAME project return independent immutable values, so no
+    /// caller can observe (or mutate) a shared process-wide config instance.
     #[test]
-    fn init_and_get_config_share_the_global_singleton() {
+    fn repeated_loads_are_independent_immutable_values() {
         let _env = AppConfigEnvGuard::unset();
-        let dir = std::env::temp_dir().join(format!(
-            "codegraph-config-init-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let cg = dir.join(".codegraph");
-        std::fs::create_dir_all(&cg).unwrap();
-        std::fs::write(
-            cg.join("config.toml"),
-            "[app]\nname = \"global-singleton\"\n",
-        )
-        .unwrap();
-        let first = init_config(None, &dir).expect("first init succeeds");
-        assert_eq!(first.app.name, "global-singleton");
-        assert_eq!(get_config().app.name, "global-singleton");
+        let (project, paths) = project_paths("no-singleton");
+        write_current_config(&paths, "[app]\nname = \"scoped\"\n");
+
+        let first = Config::load_for_paths(None, &paths).unwrap();
+        let second = Config::load_for_paths(None, &paths).unwrap();
         assert!(
-            init_config(None, &dir).is_err(),
-            "a second init must fail (already initialized)"
+            !Arc::ptr_eq(&first, &second),
+            "load_for_paths must not hand back a cached/shared instance"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(first.app.name, "scoped");
+        assert_eq!(second.app.name, "scoped");
+
+        let _ = std::fs::remove_dir_all(project);
     }
 }

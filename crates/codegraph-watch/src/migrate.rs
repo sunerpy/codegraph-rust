@@ -36,11 +36,11 @@ use anyhow::{Context, Result};
 use codegraph_core::IndexPaths;
 use codegraph_core::node_id::hash_content;
 use codegraph_core::types::{Edge, FileRecord, Node, UnresolvedRef};
-use codegraph_extract::{ExtractOptions, detect_language, extract_source};
+use codegraph_extract::{detect_language_with, extract_source_with};
 use codegraph_resolve::ReferenceResolver;
 use codegraph_store::StoreWriteAuthorization;
 
-use crate::sync::{SyncOutcome, modified_millis, now_millis};
+use crate::sync::{ProjectScope, SyncOutcome, modified_millis, now_millis};
 
 /// Batch sizes and the resolver batch, matching the CLI full-index constants so a
 /// migrated index is byte-equal to `index --force`.
@@ -63,10 +63,13 @@ pub(crate) fn migrate_project(
     project_root: &Path,
     paths: &IndexPaths,
     authorization: StoreWriteAuthorization,
-    options: &ExtractOptions,
+    scope: &ProjectScope,
     started: Instant,
     mut on_progress: impl FnMut(usize, usize),
 ) -> Result<SyncOutcome> {
+    // The addressed project's own scan/extract options and framework config; the
+    // migration never consults a process-global value.
+    let options = &scope.options;
     // `scan_project` returns a SORTED list, and every downstream pass keeps that
     // order, so no HashSet iteration order can reach the database or the outcome.
     let candidates = codegraph_extract::engine::scan_project(project_root, options)?;
@@ -108,12 +111,12 @@ pub(crate) fn migrate_project(
                 duration_ms: 0,
             }
         } else {
-            extract_source(relative, &source, None)
+            extract_source_with(relative, &source, None, &options.extensions)
         };
         let file = FileRecord {
             path: relative.clone(),
             content_hash: hash_content(&source),
-            language: detect_language(relative),
+            language: detect_language_with(relative, &options.extensions),
             size: metadata.len() as i64,
             modified_at: modified_millis(&metadata),
             indexed_at: now_millis(),
@@ -174,7 +177,12 @@ pub(crate) fn migrate_project(
             .into_iter()
             .map(|file| file.path)
             .collect::<Vec<_>>();
-        resolver.extract_and_persist_frameworks(rebuild.store_mut(), &relative_files)?;
+        resolver.extract_and_persist_frameworks_with(
+            rebuild.store_mut(),
+            &relative_files,
+            &scope.framework,
+            &options.extensions,
+        )?;
     }
     resolver.resolve_and_persist_batched(rebuild.store_mut(), RESOLVE_BATCH_ROWS)?;
     resolver.run_post_extract(rebuild.store_mut())?;

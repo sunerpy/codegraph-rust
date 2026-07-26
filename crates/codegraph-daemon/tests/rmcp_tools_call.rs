@@ -91,10 +91,8 @@ fn real_client_tools_call_through_daemon_session_returns_result() {
     // golden mini db into the temp project's `.codegraph/`.
     let project = temp_indexed_project("rmcp-toolscall");
 
-    // In-process daemon must replicate the binary's `init_config` startup
-    // (main.rs) or tool execution panics on the uninitialized global config.
-    let _ = codegraph_core::config::init_config(None, &project);
-
+    // No process-global config to initialize: tool execution loads the addressed
+    // project's own config (or its documented defaults) per request.
     let options = DaemonOptions {
         host_pid: None,
         watchdog_interval: Duration::from_millis(10),

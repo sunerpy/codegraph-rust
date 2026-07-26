@@ -237,8 +237,9 @@ impl FrameworkResolver for GodotResolver {
         &self,
         file_path: &str,
         content: &str,
-        project_root: &str,
+        context: &crate::framework::FrameworkExtractionContext,
     ) -> Option<FrameworkResolverExtractionResult> {
+        let project_root = context.project_root();
         if godot_project::is_project_godot(file_path) {
             return Some(godot_project::parse_project_godot(
                 file_path,
@@ -250,7 +251,11 @@ impl FrameworkResolver for GodotResolver {
             return Some(godot_scene::parse_tscn(file_path, content));
         }
         if godot_resource::is_tres(file_path) {
-            return Some(godot_resource::parse_tres(file_path, content, project_root));
+            return Some(godot_resource::parse_tres(
+                file_path,
+                content,
+                context.godot_dsl(),
+            ));
         }
         if godot_script::is_gdscript(file_path) {
             let mut result = godot_script::parse_gdscript_dynamics(file_path, content);

@@ -15,7 +15,9 @@ pub use policy::{
 pub use sync::{
     SyncOutcome, sync_changed_paths, sync_project_once, sync_project_once_with_progress,
 };
-pub use watcher::{PendingFile, ProjectWatcher, WatchOptions, start_serve_watcher};
+pub use watcher::{
+    PendingFile, ProjectWatcher, WatchOptions, start_serve_watcher, watch_options_for_project,
+};
 pub use worktree::{
     WorktreeIndexMismatch, detect_worktree_index_mismatch, git_worktree_root,
     worktree_mismatch_notice, worktree_mismatch_warning,
