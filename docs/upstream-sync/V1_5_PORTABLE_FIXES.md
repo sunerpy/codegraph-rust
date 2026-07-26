@@ -2502,3 +2502,102 @@ No schema, node-ID formula, extraction/golden byte, workflow, `UPSTREAM.md`, or
 before formatting and the one authoritative
 `bash scripts/check-workspace-versions.sh && make ci CARGO='cargo --locked'` run;
 no final Green is claimed until that post-documentation gate passes.
+
+## Batch M item 22 acceptance closure — verified v0.40.4 legacy fixture (2026-07-26)
+
+Item 22 asserts two DIFFERENT claims about an unmodified old scanner, and keeps
+them apart. Source visibility is configuration-dependent: with the DEFAULT
+supported-extension configuration the published v0.40.4 `files` output is exactly
+`src/app.ts`, `src/math.ts`, and `tools/greeter.py`. Storage authority is
+configuration-independent: under an EXPLICIT legacy `.codegraph/codegraph.json`
+override for `.json`/`.toml`, the same binary additionally reports
+`.codegraph-v2/config.toml` and `.codegraph-v2/codegraph.json` as SOURCE — accepted
+and documented, because the user asked for those extensions — while every v2
+namespace byte stays identical, the v2-only symbol never enters the legacy
+database or graph, and the v2 reader still serves that symbol afterwards. Reading
+a v2 artifact's text is never the same thing as holding authority over v2 storage.
+
+Nothing in this slice is built from this worktree. The fixture executes the REAL
+published release: tag `v0.40.4`, commit
+`aba40799ecacb94515f7e1690914d2accc4c8973`, version stdout `codegraph 0.40.4`.
+Only the two natively-executed CI hosts are pinned, each running its own asset —
+no cross-execution and no emulation. Linux x86_64 musl: archive
+`10026272` bytes, archive SHA-256
+`b549c0980b0f52f6b753f529322cdbc8892e03ef3736ec227a9e8f49985a3bd2`, member
+`codegraph`, executable SHA-256
+`1a14d195be755b27d0e1625d7d7e4662412a07d77cc0d0e518793cd50f2182d1`. Windows
+x86_64 MSVC: archive `9988644` bytes, archive SHA-256
+`eda7cfd6d2d0cc85fd8bd6ba66be1d7130a9b00609255730ad155ce6fa1351db`, member
+`codegraph.exe`, executable SHA-256
+`e52703f3a3d5bef90997ce23d9a3b49c980e6bcc1a078fdb1245ad1305a5bc09`.
+
+`scripts/setup-legacy-fixture.sh` is the only sanctioned way to obtain that
+binary. It selects the CURRENT NATIVE host's asset, downloads over HTTPS, and
+verifies every declared field — archive size, archive SHA-256, extracted
+executable SHA-256, and the exact `--version` stdout — before printing a path.
+Exactly one archive member is extracted by name, so an archive-supplied path can
+never escape the destination. The cache is digest-addressed and revalidated on
+EVERY run, so a stale or corrupt entry is re-downloaded rather than trusted. An
+EXIT trap sweeps the staging directory and any partial archive, and never touches
+an executable that already passed full verification. There is no skip path: a
+missing network, a size or digest mismatch, a missing member, or a wrong
+`--version` all exit nonzero, and an unavailable fixture is a fixture-setup
+FAILURE rather than a skipped test.
+
+The manifest is the single authority for what the legacy binary must be; no
+executable digest or version string is duplicated in Rust. Asset-block uniqueness
+is STRUCTURAL: `[[asset]]` blocks are parsed as records so block cardinality
+survives the parse, exactly one block may name the requested target regardless of
+whether duplicate blocks carry a digest, that sole block must declare exactly one
+`executable_sha256`, and the digest must be exactly 64 lowercase hexadecimal
+characters. Missing target, duplicate target blocks, missing digest, duplicate
+digest fields, and malformed digests all fail loudly, each proven by a compact
+synthetic-manifest regression rather than by the production manifest.
+
+The nonmutation oracle fails closed. Only a typed `NotFound` root yields an empty
+snapshot; an existing root that is an alias, a Windows reparse point, or a
+non-directory is refused with a typed error. Root and nested directories are
+opened without following aliases, identity-corroborated against the fixed path
+before enumeration AND re-corroborated after enumeration, so collected children
+become usable only once the directory still proves to be the same object. Regular
+files are read completely through one opened handle, with the handle and the fixed
+path re-checked after the full read. Unix uses `(dev, ino)`; Windows uses raw
+`GetFileInformationByHandleEx(FileIdInfo)` — an exact identity on both platforms,
+never a size or timestamp approximation. The test-local SHA-256 is pinned to
+published NIST vectors, so the executable digest gate does not rest on an
+unverified hash. Deterministic checkpoint self-tests prove each gate: static root
+alias refusal without reading or modifying the alias target, root replacement,
+nested-directory replacement, and regular-file replacement.
+
+Linux runtime QA on the integrated bytes: a fresh-cache setup downloaded and
+verified `1a14d195…0f2182d1`; cache-only `--print` exited 0 on a valid cache and
+nonzero on both a missing cache and a cache corrupted by an appended byte; normal
+setup then re-downloaded and revalidated it back to the pinned digest, leaving
+only the executable in the slot; unknown and surplus arguments exited 2; and an
+offline attempt under `unshare -rn` against a fresh cache failed nonzero with the
+fixture-setup message and left no partial archive and no extraction residue.
+`bash -n` and `shellcheck` are clean.
+
+`cargo test --locked -p codegraph-rs --test batch_m_legacy_extension_override`
+passes **21/21** on the integrated bytes, with
+`bash scripts/check-workspace-versions.sh` run before every Cargo batch. Targeted
+package check, Clippy with `-D warnings`, formatting, guardrail, and
+`git diff --check` also pass. Changed-file LSP diagnostics were attempted for the
+new Rust target and the tool again rejected this required external worktree with
+`LSP file path must be inside request cwd`; locked Cargo diagnostics are the
+fallback and this ledger claims no LSP-clean result.
+
+Native Windows/MSVC runtime was NOT executed and is not claimed. Windows coverage
+in this slice is CI WIRING plus compile-gated code: the `windows-latest` job gains
+a `bash`-shell step that selects the Windows `.zip` asset, and the exact
+`FileIdInfo` identity, reparse-point refusal, and `FILE_FLAG_BACKUP_SEMANTICS`
+directory opens follow the repository-proven layout already used by
+`codegraph-store` and `codegraph-core`. The version-branch verifier self-test is
+Unix-gated and says so explicitly on other platforms, while production
+`--version` verification stays unconditional. This slice adds no dependency and
+changes no schema, node-ID formula, extraction or golden byte, `UPSTREAM.md`, or
+`KNOWN_DIFFS.md`; `Cargo.lock` remains required at SHA-256
+`750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`. These
+evidence bytes are written BEFORE repository formatting and the one authoritative
+`bash scripts/check-workspace-versions.sh && make ci CARGO='cargo --locked'` run
+over these exact final bytes; no final Green is claimed until that gate passes.

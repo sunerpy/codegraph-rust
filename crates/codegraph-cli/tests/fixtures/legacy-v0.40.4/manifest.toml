@@ -1,0 +1,52 @@
+# Frozen legacy-compatibility fixture manifest (Batch M).
+#
+# Legacy compatibility tests execute the PUBLISHED v0.40.4 release binary — the
+# last release whose index namespace was the fixed legacy `.codegraph` root — to
+# prove that an UNMODIFIED old scanner cannot reach v2 storage. Nothing here is
+# built from this worktree: the bytes below are the exact published artifacts.
+#
+# Provenance (GitHub release `v0.40.4` of sunerpy/codegraph-rust):
+#   tag    = v0.40.4
+#   commit = aba40799ecacb94515f7e1690914d2accc4c8973
+#
+# Every digest was taken from the real downloaded bytes, and
+# `expected_version_stdout` from the real `--version` run of the extracted
+# executable. `scripts/setup-legacy-fixture.sh` re-verifies all three
+# (archive digest, executable digest, `--version`) on EVERY use; a mismatch or a
+# missing network is a hard fixture-setup failure, never a skipped test.
+#
+# Only the two natively-executed CI hosts are pinned: Linux x86_64 and Windows
+# x86_64. Each CI job uses its OWN native asset — there is no cross-execution
+# and no emulation. A host outside this set has no pinned asset, and the test
+# suite says so explicitly instead of pretending coverage.
+
+[fixture]
+tag = "v0.40.4"
+commit = "aba40799ecacb94515f7e1690914d2accc4c8973"
+version = "0.40.4"
+expected_version_stdout = "codegraph 0.40.4"
+release_download_prefix = "https://github.com/sunerpy/codegraph-rust/releases/download/v0.40.4/"
+
+[[asset]]
+target = "x86_64-unknown-linux-musl"
+target_os = "linux"
+target_arch = "x86_64"
+url = "https://github.com/sunerpy/codegraph-rust/releases/download/v0.40.4/codegraph-0.40.4-x86_64-unknown-linux-musl.tar.gz"
+archive_name = "codegraph-0.40.4-x86_64-unknown-linux-musl.tar.gz"
+archive_format = "tar.gz"
+archive_size = 10026272
+archive_sha256 = "b549c0980b0f52f6b753f529322cdbc8892e03ef3736ec227a9e8f49985a3bd2"
+member = "codegraph"
+executable_sha256 = "1a14d195be755b27d0e1625d7d7e4662412a07d77cc0d0e518793cd50f2182d1"
+
+[[asset]]
+target = "x86_64-pc-windows-msvc"
+target_os = "windows"
+target_arch = "x86_64"
+url = "https://github.com/sunerpy/codegraph-rust/releases/download/v0.40.4/codegraph-0.40.4-x86_64-pc-windows-msvc.zip"
+archive_name = "codegraph-0.40.4-x86_64-pc-windows-msvc.zip"
+archive_format = "zip"
+archive_size = 9988644
+archive_sha256 = "eda7cfd6d2d0cc85fd8bd6ba66be1d7130a9b00609255730ad155ce6fa1351db"
+member = "codegraph.exe"
+executable_sha256 = "e52703f3a3d5bef90997ce23d9a3b49c980e6bcc1a078fdb1245ad1305a5bc09"
