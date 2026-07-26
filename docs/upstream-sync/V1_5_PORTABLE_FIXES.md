@@ -2833,3 +2833,148 @@ function signature (`build_graph_database`) and nothing else, so the committed
 target hashes
 `7d5ac54647c6bb5a66235a5ca1d8f0a3988d4630078d0db4b891a52e695b2f1f`; the assertions
 the controls exercised are byte-unchanged.
+
+## Batch M item 19 acceptance closure — global HTTP uses project-scoped v2 configs (2026-07-26)
+
+`global_http_uses_project_scoped_v2_configs` is now proven end to end, and the
+process-global configuration singleton is GONE from the codebase. M19's core
+prerequisite (`Config::load_for_paths`, commit `496afa2`) only added the API; this
+slice migrates every production consumer onto it, so configuration is an immutable
+`Arc<Config>` derived from the addressed project's resolved `IndexPaths` and threaded
+explicitly through the operation that uses it.
+
+What replaced the singleton. `codegraph-core::config` keeps exactly two loaders:
+`Config::load_for_paths` (project-scoped: explicit CLI path → `APP_CONFIG` →
+`IndexPaths::config_toml` → defaults) and the new `Config::load_env_or_default`
+(process bootstrap: explicit path → `APP_CONFIG` → defaults, and nothing else).
+`init_config`, `get_config`, `try_get_config`, `Config::discover`, and the `OnceLock`
+are deleted, so no code path can consult a project or CWD legacy
+`.codegraph/config.toml` and none can share one project's settings with another. The
+CLI's `main` now loads the bootstrap config for ONE purpose — the logger level — and
+`Cli::bootstrap_project_root` (which existed only to feed the singleton a project) is
+removed with it. A residual audit over `crates/` finds zero occurrences of
+`get_config`, `try_get_config`, `init_config`, or `Config::discover`.
+
+Extension overrides and the Godot DSL are now explicit values, not discoveries.
+`codegraph-extract::ext_config` becomes an immutable `ExtensionOverrides` loaded from
+`IndexPaths::extension_config`; the ancestor `.codegraph/codegraph.json` tree-walk,
+its process-CWD join, and its mtime cache are all deleted. The value rides
+`ExtractOptions.extensions` (built by the new `ExtractOptions::for_project`) into
+`scan_project`, `extract_project`, the new `extract_file_with_options`, and the new
+`detect_language_with` / `extract_source_with`; `detect_language` and `extract_file`
+remain as the override-free entry points for callers that address no project.
+`codegraph-resolve::frameworks::godot_dsl_config` becomes an immutable
+`GodotDslConfig` (`resourceFields` + `idFields`) loaded the same way, its two
+mtime caches and its own tree-walk deleted, and it reaches `.tres` parsing through a
+new `FrameworkExtractionContext` (project root + config) that replaces the bare
+`project_root: &str` parameter of `FrameworkResolver::extract`. Tolerance is
+preserved exactly: a missing, unreadable, or malformed `codegraph.json` still yields
+empty overrides / an empty DSL config, so an unconfigured project behaves
+byte-identically. Because nothing is cached, an edited config is observed on the next
+load with no mtime dependence — `custom_ext_reload_picks_up_changes_immediately`
+replaces the old sleep-based mtime-recache test and needs no sleep at all.
+
+Sync, watcher, and daemon. `codegraph-watch::sync` gains a per-operation
+`ProjectScope` (the project's `ExtractOptions` + its `FrameworkExtractionContext`),
+loaded once from the addressed `IndexPaths` at the top of every entry point —
+`sync_project_once`, `sync_project_once_with_progress`,
+`sync_project_once_with_patterns` (the watcher's removed-directory escalation),
+`sync_changed_paths`, and `sync_changed_paths_with_patterns` — and threaded into the
+scan, `extract_file_with_options`, `detect_language_with`, the framework pass, and
+`migrate_project`. The transitional `scan_options()` that read the singleton is gone.
+`WatchPolicy` now carries the project's overrides (`with_extension_overrides`) so
+`should_handle_file` agrees with the scan on a project-declared custom extension, and
+the new `WatchOptions::for_project` / `watch_options_for_project` derive
+include/exclude, debounce, and the enable flag from that project's own config (an
+explicit `CODEGRAPH_WATCH_DEBOUNCE_MS` and `--no-watch`/`CODEGRAPH_NO_WATCH` still
+win, so the documented escape hatches stay authoritative). `DaemonOptions.include` /
+`.exclude` are deleted: the daemon loads the project's watch config itself, so a
+daemon can no longer inherit whichever project its launcher started in. Startup
+catch-up is untouched and still runs; it simply goes through the same per-project
+load.
+
+MCP. `CodeGraphEngine` holds the addressed project's `Arc<Config>`, loaded per
+request beside the request-scoped store (M15's ownership model is unchanged), and its
+four on-disk source reads go through one `read_project_source` that refuses a file
+larger than THAT project's `indexing.max_file_size`. This is what makes the
+acceptance observable over HTTP: extraction already skips an oversized file, so
+serving its full text through a graph tool would contradict the project's own policy;
+the refusal reuses the existing unreadable-file rendering, so no new output shape is
+introduced.
+
+Behavioral Red (recorded before implementation, at the real public surface — the
+core API already existed, so an API-absence or compile failure would not qualify).
+Against clean `73833fa` with only the new acceptance target added,
+`cargo test --locked -p codegraph-rs --test global_http_project_scoped_config` fails
+2/2. The project-scoping half fails with
+`alpha's own include must force its gitignored Tools/ in: ["src/app.ts", "src/math.ts", "tools/greeter.py"]`
+— the process-global singleton, bootstrapped from whatever root the CLI resolved,
+never applied alpha's own current-root `include`. The `APP_CONFIG` control fails with
+`without APP_CONFIG beta must use its own config again: ["Tools/helper.ts", "src/app.ts", "src/math.ts", "tools/greeter.py"]`.
+A third, isolated Red run (temporary target, deleted afterwards) drove the ONE global
+HTTP process against clean HEAD and failed with
+`alpha's own 120-byte max_file_size must refuse src/app.ts` while the response body
+carried all ten lines of `src/app.ts` — the direct proof that one HTTP process served
+project A under a configuration A never declared.
+
+Green. `cargo test --locked -p codegraph-rs --test global_http_project_scoped_config`
+**2/2**. The acceptance target proves, in ONE process with `APP_CONFIG` unset and
+hostile LEGACY `.codegraph/config.toml` + `.codegraph/codegraph.json` planted in BOTH
+projects (each asking for the other's `include` and a 7-byte size cap): index and
+sync scope each project by its own config in both directions; the single global
+`serve --http` (no `--path`) honors alpha's 120-byte `max_file_size` and beta's
+default for the SAME `src/app.ts` — requested alpha → beta → alpha, so neither
+ordering nor reuse can hide a bleed; each project's `codegraph_files` listing carries
+only its own tree; and the live watcher auto-syncs a new `Tools/` file for alpha
+while never adopting it for beta. The control
+`app_config_overrides_both_projects_including_codegraph_dir_collision` proves
+`APP_CONFIG` INTENTIONALLY supersedes both projects' own configs, that pointing both
+projects at ONE absolute `CODEGRAPH_DIR` still yields distinct identity-suffixed
+current roots (root, DB, and `config.toml` all differ, both roots exist side by
+side), and that with `APP_CONFIG` unset again each project falls back to its own
+config — the override is process-wide, not sticky state on disk.
+
+Affected-package Green, with `bash scripts/check-workspace-versions.sh` before every
+Cargo batch and `--locked` on every Cargo command: `codegraph-core` **66**,
+`codegraph-extract` **all suites green** (349 unit + 17 integration suites, including
+the rewritten `custom_ext` 7/7 and `coverage_ext_config` 6/6), `codegraph-resolve`
+**642 unit + 12 integration suites**, `codegraph-watch` **98 unit + 2 integration**,
+`codegraph-mcp` **256 unit + integration suites green**, `codegraph-daemon` **all
+suites green**, and `codegraph-rs` **612 tests, 0 failures** across every target.
+Workspace `cargo check --locked --workspace --all-targets` and
+`cargo clippy --locked --workspace --all-targets -- -D warnings` pass.
+
+Existing coverage was migrated, never weakened. `custom_ext`,
+`coverage_ext_config`, `godot_dsl`, `godot_idfields_cwd`, and
+`godot_idfields_determinism` now write the config where production reads it (the
+project's current root) and load it explicitly; each gained a NEW negative control
+proving a legacy `.codegraph/codegraph.json` is never adopted
+(`legacy_codegraph_json_is_never_read`, `custom_ext_ignores_legacy_and_other_projects`,
+`legacy_dsl_config_is_never_adopted`). `codegraph-watch` gained
+`sync_project_once_ignores_a_legacy_project_config`,
+`two_projects_in_one_process_use_their_own_configs`, and
+`project_extension_overrides_reach_scan_and_incremental_sync`; the pre-existing
+`sync_project_once_indexes_gitignored_dir_named_in_include` lost its
+singleton-dependent `if` guard and now asserts unconditionally. The two daemon tests
+that replicated the binary's `init_config` startup no longer need to. No test was
+deleted, skipped, or weakened to pass.
+
+Determinism and caching. No path-keyed cache was introduced: every consumer loads an
+immutable per-operation value, which is why the two deleted mtime caches needed no
+replacement and why the golden byte-stability suite is unaffected (goldens,
+node-ID formula, schema, and extraction semantics are all untouched, and the
+`codegraph-bench` equivalence oracle passes as part of the workspace run).
+
+Limitations, stated honestly. Changed-file LSP diagnostics were attempted and the
+tool again rejected this required external worktree with
+`LSP file path must be inside request cwd`; locked Cargo check/Clippy/tests are the
+fallback and this ledger claims no LSP-clean result. Native Windows/MSVC runtime was
+NOT executed and is not claimed. This slice adds no dependency and changes no schema,
+node-ID formula, extraction or golden byte, `UPSTREAM.md`, or `KNOWN_DIFFS.md`; the
+frozen plan is untouched at SHA-256
+`5b64aa335fb32cd228d98404c2e44153e9134d26a912ecb02d71fcf5c5798450` and `Cargo.lock`
+remains required at SHA-256
+`750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`. These evidence
+bytes are written BEFORE repository formatting and the one authoritative
+`bash scripts/check-workspace-versions.sh && make ci CARGO='cargo --locked'` run over
+these exact final bytes; no final Green is claimed until that gate passes.
