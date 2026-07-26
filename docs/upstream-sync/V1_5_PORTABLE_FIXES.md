@@ -2700,3 +2700,136 @@ at SHA-256 `5b64aa335fb32cd228d98404c2e44153e9134d26a912ecb02d71fcf5c5798450` an
 evidence bytes are written BEFORE repository formatting and the one authoritative
 `bash scripts/check-workspace-versions.sh && make ci CARGO='cargo --locked'` run
 over these exact final bytes; no final Green is claimed until that gate passes.
+
+## Batch M item 17 acceptance closure — a failed engine open is not cached and the next request recovers (2026-07-26)
+
+Frozen plan item 17 asks for
+`failed_engine_open_is_not_cached_and_next_request_recovers`: one long-lived
+shipped MCP process must take a request whose engine/`Store` open FAILS for a real
+v2 state/artifact reason, survive it, retain nothing from it, and — after the
+namespace is repaired WITHOUT a restart — serve only the repaired graph on the
+next request in that same process.
+
+The acceptance lands as one new query-side test target,
+`crates/codegraph-cli/tests/batch_m_failed_open_recovery.rs`, over the SHIPPED
+binary (`CARGO_BIN_EXE_codegraph`). No production byte changed: M15 already made
+every MCP engine request-scoped and M16 proved the per-request handle release, so
+item 17 is the behavioral proof that the FAILURE path shares that ownership rather
+than a new mechanism.
+
+The staged failure is a genuine v2 inconsistency, never a stub. The served project
+is really indexed by the shipped `codegraph init`; then BOTH fixed state slots are
+removed and nothing else, so the namespace classifies `Missing` while its main
+database and its permanent lock are still present. `Store::open_for_read` refuses
+exactly that through `reject_missing_database_artifacts` with
+`state is missing but a database artifact already exists at <db>`, which the test
+asserts directly against the staged fixture BEFORE any server is involved. No gate
+is weakened, relaxed, or repaired to manufacture the failure.
+
+The failure is deliberately POST-RESOLUTION. Because the current-namespace DB file
+still exists, `roots::probe_root` classifies the project `Indexed` and
+`resolve_project_arg` resolves it, so request 1 fails inside the engine open. The
+test pins that distinction: the request-1 tool error must contain
+`Failed to open project at …` AND the missing-state-with-database diagnostic, and
+must NOT contain `No indexed project`. A resolution miss therefore cannot be
+mistaken for the engine-open failure this item is about. The failure also arrives
+as an `isError` tool result rather than a JSON-RPC transport error, which is the
+evidence the live session survived it.
+
+Determinism comes from protocol frames and fail-closed gates. READY is the arrival
+of request 1's complete JSON-RPC response frame — rmcp writes it only after the
+owned result materialized. The parent then acquires the namespace's EXCLUSIVE
+lease: a shared reader lease retained by the FAILED open makes that acquisition
+fail, so it is the fail-closed proof that the failed open released everything.
+Still under that lease the parent `fs::rename`s the separately built repaired
+database over the live main database file — on native Windows that fails with a
+sharing violation while any process holds an open handle on the destination, which
+is the Windows handle proof for the failure path. Repair is then COMPLETED by the
+protocol-aware `Missing -> Building -> Current` fixture finalizer
+(`codegraph_store::test_support::finalize_current_test_fixture`), and completion is
+observed from published state and artifact shape — status `Current`, a published
+state slot, the preserved permanent lock, a sidecar-free database — never from
+elapsed time. CONTINUE is request 2's frame, written only after all of that. The
+60s deadlines are deadlock guards only; no assertion is satisfied by waiting, by
+mtime, or by process exit, and the server is never restarted.
+
+Startup catch-up is excluded as an explanation for BOTH halves, with runtime
+evidence rather than a caveat. It cannot repair the staged namespace: a dedicated
+test, `catch_up_sync_refuses_missing_state_with_database_without_mutating_bytes`,
+drives the SAME `codegraph_watch::sync_project_once` entry point the catch-up
+thread calls against an identically staged namespace and proves it fails with the
+same state/artifact diagnostic while leaving the database bytes byte-identical, the
+state slots absent, no tombstone created, and the permanent lock intact — a gate,
+not a race. It also cannot invent the repaired rows: following M16's pattern the
+distinguishing sources live under a root-`.gitignore` directory and the exclusion
+is PROVEN in-test with the shipped `codegraph_extract::engine::scan_project`; all
+three supplied files stay present on disk so the cold removal pass cannot delete
+their rows either, and the single scannable neutral file is byte-identical in every
+graph so a catch-up is a proven no-op.
+
+Recovery is additionally proven not to be a silent legacy fallback: the project
+carries a legacy `.codegraph/codegraph.db` holding a TRAP symbol present in no
+other graph, and request 2 must neither surface the trap file nor resolve the trap
+symbol (`No results found`). Request 2 must also render real search results
+(`## Search Results (`) containing the repaired file, and the pre-repair symbol
+must resolve to nothing in the same session — absence observed through a lookup
+that finds nothing, not through a response that merely omits it.
+
+A second test, `in_process_engine_open_failure_leaves_no_cached_state_and_reopens_repaired`,
+pins the same seam in-process: `CodeGraphEngine::open` is the exact call
+`execute_owned` makes per request, so a failed open followed by the same legitimate
+repair must let a LATER open in the SAME process serve the repaired graph with no
+memoized error, lease, or handle in the way. The forbidden-seam oracle from M16 is
+carried over unchanged in spirit (structural, code-lines-only, two-half needle,
+with its own unit test), so the recovery flow provably never depends on
+`close_cached_handles`.
+
+Four negative-control runs establish the assertions are load-bearing (each
+reverted immediately, the file restored to SHA-256
+`263c6a76a3b2412c4434c5e4be9ce08772986d94ad8ead6b0d9d790ec181b756`). Memoizing the
+first failed open per project in `execute_owned` makes request 2 return the cached
+`Failed to open project at … state is missing but a database artifact already
+exists` error and the acceptance fails — this is the exact production regression the
+item forbids, and the test detects it. Holding an extra SHARED lease across the
+repair makes the exclusive acquisition time out with
+`TimedOut { path: …/index.lock }`, so the no-retained-lease proof is real rather
+than incidental. Skipping the protocol-aware republication leaves the namespace
+`Missing` and fails the repair-completion assertion, so recovery genuinely requires
+a legitimate `Current` publication. Leaving the state slots in place fails the
+staging assertion `removing both fixed state slots must classify the namespace
+Missing`, so the fixture cannot silently degrade into a happy-path test.
+
+Local Green on the integrated bytes, with
+`bash scripts/check-workspace-versions.sh` run before every Cargo batch and
+`--locked` on every Cargo command:
+`cargo test --locked -p codegraph-rs --test batch_m_failed_open_recovery` **5/5**,
+`cargo test --locked -p codegraph-rs --test lease_lifetime` **5/5**,
+`cargo test --locked -p codegraph-rs --test batch_m_long_lived_mcp` **3/3**, and
+`cargo test --locked -p codegraph-mcp --test reopen` **3/3**. Workspace all-target
+check and Clippy with `-D warnings` pass. Changed-file LSP diagnostics were
+attempted for the new target and the tool again rejected this required external
+worktree with `LSP file path must be inside request cwd`; locked Cargo diagnostics
+are the honest fallback and this ledger claims no LSP-clean result.
+
+Native Windows/MSVC runtime was NOT executed here and is not claimed — this Linux
+host cannot provide it. M16's explicit `windows-latest` selection and every other
+CI byte are preserved unchanged; item 17 adds no CI wiring, so its Windows
+`MoveFileEx` behavior is documented as unexecuted rather than asserted.
+
+This slice adds no dependency and changes no schema, node-ID formula, extraction or
+golden byte, `UPSTREAM.md`, or `KNOWN_DIFFS.md`; the frozen plan is untouched at
+SHA-256 `5b64aa335fb32cd228d98404c2e44153e9134d26a912ecb02d71fcf5c5798450` and
+`Cargo.lock` remains required at SHA-256
+`750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`. These evidence
+bytes are written BEFORE repository formatting and the one authoritative
+`bash scripts/check-workspace-versions.sh && make ci CARGO='cargo --locked'` run
+over these exact final bytes; no final Green is claimed until that gate passes.
+
+Addendum for exactness: the negative-control restore hash
+`263c6a76a3b2412c4434c5e4be9ce08772986d94ad8ead6b0d9d790ec181b756` is the
+pre-`make fmt` byte state of `batch_m_failed_open_recovery.rs`, which is what each
+control was reverted to. Repository formatting afterwards rewrapped exactly one
+function signature (`build_graph_database`) and nothing else, so the committed
+target hashes
+`7d5ac54647c6bb5a66235a5ca1d8f0a3988d4630078d0db4b891a52e695b2f1f`; the assertions
+the controls exercised are byte-unchanged.
