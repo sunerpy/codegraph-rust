@@ -10,7 +10,9 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use codegraph_core::IndexPaths;
-use codegraph_store::{IndexLease, IndexLeaseError, IndexLeaseValidationError};
+use codegraph_store::{
+    IndexLease, IndexLeaseError, IndexLeaseValidationError, RebuildKind, Store, begin_full_rebuild,
+};
 
 const CHILD_ACTION: &str = "CODEGRAPH_INDEX_LEASE_CHILD_ACTION";
 const CHILD_MODE: &str = "CODEGRAPH_INDEX_LEASE_CHILD_MODE";
@@ -341,6 +343,129 @@ fn a_clone_keeps_the_single_lock_alive_until_the_final_drop() {
         run_probe(project.path(), "shared", CHILD_WAIT),
         "ACQUIRED",
         "the final owner must release the kernel lock"
+    );
+}
+
+#[test]
+fn lease_mode_parent_and_clone_drop_order_are_enforced() {
+    // Use two clones so both the original parent and a clone are observed as
+    // non-final owners. Every contender is a separate process synchronized by
+    // its result sentinel; no same-process lock semantics or sleeps are evidence.
+    let shared_project = TempProject::new("shared-parent-clones");
+    let shared_paths = shared_project.paths();
+    stage_existing_lock(&shared_paths, LOCK_BYTES);
+    let shared_parent =
+        IndexLease::acquire_shared_existing(&shared_paths, deadline_after(CHILD_WAIT), || false)
+            .expect("acquire shared parent lease");
+    let shared_clone_a = shared_parent.clone();
+    let shared_clone_b = shared_parent.clone();
+
+    drop(shared_parent);
+    assert_eq!(
+        run_probe(shared_project.path(), "exclusive", SHORT_DEADLINE),
+        "TIMED_OUT",
+        "dropping a non-final shared parent must keep exclusives blocked"
+    );
+    drop(shared_clone_a);
+    assert_eq!(
+        run_probe(shared_project.path(), "exclusive", SHORT_DEADLINE),
+        "TIMED_OUT",
+        "dropping a non-final shared clone must keep exclusives blocked"
+    );
+    drop(shared_clone_b);
+    assert_eq!(
+        run_probe(shared_project.path(), "exclusive", SHORT_DEADLINE),
+        "ACQUIRED",
+        "the final shared owner must release immediately"
+    );
+
+    let exclusive_project = TempProject::new("exclusive-parent-clones");
+    let exclusive_paths = exclusive_project.paths();
+    stage_existing_lock(&exclusive_paths, LOCK_BYTES);
+    let exclusive_parent = IndexLease::acquire_exclusive_existing(
+        &exclusive_paths,
+        deadline_after(CHILD_WAIT),
+        || false,
+    )
+    .expect("acquire exclusive parent lease");
+    let exclusive_clone_a = exclusive_parent.clone();
+    let exclusive_clone_b = exclusive_parent.clone();
+
+    drop(exclusive_parent);
+    for mode in ["shared", "exclusive"] {
+        assert_eq!(
+            run_probe(exclusive_project.path(), mode, SHORT_DEADLINE),
+            "TIMED_OUT",
+            "dropping a non-final exclusive parent must keep {mode} contenders blocked"
+        );
+    }
+    drop(exclusive_clone_a);
+    for mode in ["shared", "exclusive"] {
+        assert_eq!(
+            run_probe(exclusive_project.path(), mode, SHORT_DEADLINE),
+            "TIMED_OUT",
+            "dropping a non-final exclusive clone must keep {mode} contenders blocked"
+        );
+    }
+    drop(exclusive_clone_b);
+    assert_eq!(
+        run_probe(exclusive_project.path(), "shared", SHORT_DEADLINE),
+        "ACQUIRED",
+        "the final exclusive owner must release immediately"
+    );
+
+    // Build a real Current namespace exclusively through public production APIs,
+    // then let Store own the final shared lease capability and both SQLite
+    // handles. Store's declared field order must close those handles before its
+    // retained lease drops and admits the next exclusive contender.
+    let store_project = TempProject::new("current-store-final-owner");
+    let store_paths = store_project.paths();
+    let rebuild = begin_full_rebuild(
+        &store_paths,
+        RebuildKind::ExplicitInit,
+        deadline_after(CHILD_WAIT),
+        || false,
+    )
+    .expect("begin Current Store fixture rebuild");
+    rebuild
+        .open_store()
+        .expect("open Current Store fixture writer")
+        .finish()
+        .expect("finish Current Store fixture");
+
+    #[cfg(windows)]
+    let replacement = {
+        let replacement = store_paths.current_root().join("replacement.db");
+        std::fs::copy(store_paths.current_db(), &replacement)
+            .expect("stage Windows database replacement");
+        replacement
+    };
+
+    let store = Store::open_for_read(&store_paths, deadline_after(CHILD_WAIT), || false)
+        .expect("open Current Store with retained shared lease");
+    assert_eq!(
+        run_probe(store_project.path(), "exclusive", SHORT_DEADLINE),
+        "TIMED_OUT",
+        "a live Current Store must retain its lease through its SQLite handles"
+    );
+    drop(store);
+
+    #[cfg(windows)]
+    {
+        // Windows refuses renaming an open SQLite database. Performing the
+        // replacement synchronously after Store::drop therefore proves its two
+        // connections closed before the final retained lease capability dropped.
+        let retired = store_paths.current_root().join("retired.db");
+        std::fs::rename(store_paths.current_db(), &retired)
+            .expect("final Current Store drop closes Windows database handles");
+        std::fs::rename(replacement, store_paths.current_db())
+            .expect("install Windows database replacement immediately after Store drop");
+    }
+
+    assert_eq!(
+        run_probe(store_project.path(), "exclusive", SHORT_DEADLINE),
+        "ACQUIRED",
+        "dropping the final Store owner must admit a fresh contender immediately"
     );
 }
 
