@@ -2081,3 +2081,195 @@ workspace-version gate. Final affected-package tests, diagnostics, formatting,
 Clippy, and lock/scope audit are recorded in the task handoff after their actual
 execution. Native Windows runtime/crash coverage remains unavailable on this Linux
 host and is not claimed.
+
+## Batch M item 12 — process writer serialization and crash recovery (2026-07-26)
+
+Production already owned the required one-outer-lease architecture, so item 12
+adds acceptance/regression evidence only. New integration target
+`crates/codegraph-store/tests/writer_process_lifecycle.rs` drives actual child
+processes through `begin_full_rebuild`: the holder reports `READY` only after
+that shipped full-writer entry point has acquired and retained the outer
+exclusive `IndexLease`, published Building, and completed its destructive
+prologue. The parent launches the losing production writer only after `READY`;
+the child accepts exactly `RebuildError::Lease(IndexLeaseError::TimedOut)` and
+reports `LEASE_TIMED_OUT`. Any acquisition or unrelated setup/state/config
+error fails the test.
+
+While the holder still owns the lease, the parent snapshots the complete v2
+namespace before the loser starts and compares it immediately after the loser
+exits. The fail-closed oracle keys entries by native `PathBuf` and records root
+and nested directories, complete regular-file bytes, and symlink targets without
+following aliases. Every traversal, metadata, read, or unsupported-entry error
+panics with bounded path/kind diagnostics; comparison never prints database
+bytes. `namespace_oracle_detects_equal_length_content_mutation` replaces four
+bytes with four different bytes and proves the oracle rejects the same-size
+mutation. A separately staged legacy namespace is byte-identical before and
+after contention, holder release, and crash recovery.
+
+The crash test sends the acknowledged holder an OS `SIGKILL` through
+`Child::kill`, asserts signal 9 rather than treating it as a harness failure,
+then starts a fresh child through the same `begin_full_rebuild` production path.
+That writer completes `ActiveFullRebuild::finish`, reports
+`RECOVERED_CURRENT`, and the parent independently requires both typed
+`ExtractionStatus::Current` and successful `Store::open_for_read`
+corroboration. This proves kernel release on abnormal process termination; no
+Rust `Drop` cleanup is involved in releasing the crashed holder's lease.
+
+Initial focused execution, after the workspace-version guard:
+
+```text
+cargo test -p codegraph-store --locked --test writer_process_lifecycle -- --nocapture --test-threads=1
+# 4 passed; 0 failed
+```
+
+The first compile attempt found two test-only pattern errors for the structured
+`Building { built }` status; the first behavioral execution then exposed a
+harness bug where the parent treated libtest's blank preamble as the READY line,
+dropped the fixture, and caused child publication I/O failures. Neither was
+counted as Red or production evidence. The READY reader now ignores all lines
+until the exact sentinel, matching the established `index_lease` harness. No
+production source, extraction, schema, node-id, golden, manifest, dependency, or
+lockfile byte changed. Native Windows runtime/crash behavior remains unavailable
+from this Linux environment and is not claimed.
+
+The guarded affected-package validation subsequently passed the exact item-12
+target (4/4), existing `index_lease` integration target (12/12), complete
+`codegraph-store` package (175 tests, 0 failures), all-target check, and
+all-target Clippy with `-D warnings`. The first trailing `cargo fmt --all --check`
+reported formatting-only diffs in the new test; no behavioral diagnostic failed.
+Those bytes were normalized before the final format/hash/scope audit. Direct LSP
+diagnostics were attempted and rejected with the exact environment error
+`LSP file path must be inside request cwd` because this required worktree is
+under `/tmp/opencode/codegraph-rust-v15-impl`; the clean Cargo check and Clippy
+results are the diagnostics fallback.
+
+## Batch M item 12 correction — fail-closed snapshot reads and joined holder output (2026-07-26)
+
+Manual review rejected two proof claims in the item-12 entry above and one
+harness-lifecycle detail. The earlier claim that every metadata/read error
+failed closed was false because `root.exists()` followed aliases and converted
+all root metadata failures into apparent absence. The claim that regular-file
+bytes were read without following aliases was also incomplete:
+`symlink_metadata(path)` followed by `fs::read(path)` left a check-then-path-read
+window. Finally, `Holder::crash` dropped the tail receiver without joining the
+stdout reader, so its detached `tail_tx.send(...).expect(...)` could panic after
+the holder was killed. The prior history remains intact; this section supersedes
+only those proof-harness claims. Production behavior is unchanged.
+
+The corrected Unix-only namespace oracle performs one no-follow
+`symlink_metadata(root)` and accepts absence only for the typed
+`io::ErrorKind::NotFound`; every other metadata error panics. A root symlink or
+non-directory is rejected before `read_dir`. For each regular file, the oracle
+records the initial no-follow regular-file identity `(st_dev, st_ino)`, opens the
+path once, requires the opened handle to be regular and have that identity,
+corroborates the fixed path with no-follow metadata immediately before reading,
+reads the complete bytes through that same handle, and corroborates the fixed
+path again afterward. Disappearance, alias replacement, kind drift, or identity
+drift returns the explicit test-only `PathChangedDuringRead(PathBuf)` result.
+This is pre/open/pre-read/post-read identity corroboration; it does not claim a
+portable atomic path-check-and-read primitive.
+
+The deterministic self-test
+`namespace_oracle_detects_regular_path_replaced_by_symlink_before_read` replaces
+the validated regular path with a symlink at the exact
+`RegularPathValidated` checkpoint, with no sleep or probabilistic race. Before
+the correction it failed because the snapshot returned the external target's
+complete bytes as `RegularFile`; afterward it receives the explicit changed-path
+result and proves the authoritative read-boundary checkpoint was never reached.
+The existing equal-length mutation self-test remains unchanged and effective. A
+second root-validation self-test proves typed NotFound absence and fail-closed
+rejection of a root symlink, regular root, and non-NotFound metadata error.
+
+Holder output is now owned by a `JoinHandle<Result<String, String>>`, not a
+detached sender. Normal release waits for the child and joins the reader before
+checking `RELEASED`; crash waits for SIGKILL termination and joins/drains the
+reader before dropping receiver state; defensive `Drop` also kills/reaps the
+child and joins any remaining reader. READY semantics are unchanged: the child
+emits it only after `begin_full_rebuild` returns with the production exclusive
+lease held.
+
+The corrected focused target passed 6/6 after the workspace-version gate,
+including the two real child-process behavior tests and both prior oracle tests.
+Locked validation then passed: corrected `writer_process_lifecycle` 6/6,
+existing `index_lease` 12/12, and complete `codegraph-store` 177/177 (94 unit +
+6 bulk-pragmas + 12 lease + 20 classifier + 14 publisher + 4 schema + 21 Store
+gate + 6 process-lifecycle; doc tests 0). Workspace all-target `cargo check` and
+all-target Clippy with `-D warnings` were clean. Every Cargo batch was preceded
+by `bash scripts/check-workspace-versions.sh`, and every dependency-resolving
+Cargo command used `--locked`. Rust formatting and the repository doc-format
+check passed after the final evidence bytes were written. Changed-file LSP was
+attempted and again rejected by the environment with
+`LSP file path must be inside request cwd` for the required external worktree;
+the clean workspace all-target Cargo check and Clippy are the recorded fallback,
+not an LSP-clean claim. No production source, manifest, dependency, schema, node
+ID, golden, workspace version, or `Cargo.lock` byte is changed.
+
+## Batch M item 12 correction #2 — directory identity-corroborated traversal (2026-07-26)
+
+Manual review rejected one remaining claim in the correction above: regular-file
+reads were identity-corroborated, but root and nested directories still went from
+`symlink_metadata(directory)` to path-based `read_dir(directory)` without proving
+that an opened directory handle and the fixed path identified the initially
+observed directory. A replacement external-directory symlink could therefore be
+enumerated before later entry checks. This append supersedes only that proof
+claim; the prior history remains intact and production code is unchanged.
+
+The Unix-only snapshot helper now captures `(st_dev, st_ino)` from the initial
+no-follow observation for the root and every discovered nested directory. It
+opens each directory once, requires the opened handle to be a directory with the
+same identity, and rechecks the no-follow fixed path against that identity before
+path-based enumeration, after the complete entry list is collected, and after
+the collected entries are processed. A disappearance, alias/type replacement,
+or identity drift returns `PathChangedDuringRead(PathBuf)`. A failed non-NotFound
+open, `read_dir`, or entry read still fails loudly after corroboration; only the
+initial root's typed NotFound maps to an empty namespace. Collected paths are not
+processed until the post-enumeration check passes, so failed corroboration cannot
+produce a successful authoritative snapshot.
+
+This is an honest identity-corroborated successful-return boundary around
+path-based `read_dir`, not a claim that portable `std` supplies atomic no-follow
+enumeration. Exact checkpoints distinguish initial no-follow directory validation,
+opened-handle plus fixed-path corroboration before enumeration, and successful
+post-enumeration corroboration.
+
+Two deterministic no-sleep tests cover both replacement frontiers. The root test
+replaces the root immediately after its initial no-follow validation; the nested
+test replaces an already opened/corroborated nested directory immediately before
+enumeration. Each replacement is a symlink to an external directory containing a
+unique sentinel entry, requires the exact changed directory in
+`PathChangedDuringRead`, and contains a fail-branch assertion that the sentinel
+cannot occur in any successful authoritative snapshot. The pre-existing regular
+file, equal-length mutation, typed root-validation, writer contention, and
+SIGKILL recovery tests remain unchanged. Focused implementation execution passed
+8/8 after the workspace-version gate. Final locked package/check/Clippy/format,
+LSP, lock-hash, and scope results are appended only after they run.
+
+### 2026-07-26 Batch M item 12 final-gate formatting correction
+
+The parent validation run for the directory-proof correction is recorded here
+exactly as it happened, superseding the pending-results sentence above without
+deleting it. After the workspace-version gate, the guarded locked runs passed in
+order: the focused item-12 target 8/8, the existing `index_lease` target 12/12,
+the complete `codegraph-store` package test suite, `cargo check --workspace
+--all-targets --locked`, and `cargo clippy --workspace --all-targets --locked -D
+warnings`. The chain then failed at `cargo fmt --all --check`, which reported a
+single formatting-only diff in
+`crates/codegraph-store/tests/writer_process_lifecycle.rs` at line 756: rustfmt
+requires the nested-directory replacement callback's
+`if path == nested && checkpoint == SnapshotCheckpoint::DirectoryHandleAndPathCorroborated`
+condition on one line instead of the manually wrapped multiline form. Because the
+commands were joined with `&&`, nothing after that check ran, so no `make
+fmt-check`, `git diff --check`, or lock-hash result from that attempt is claimed.
+
+The correction changes formatting only — no test name, assertion, checkpoint,
+child-process protocol, or oracle behavior is altered. After normalizing those
+bytes and appending this evidence, the reruns that actually executed and passed
+are: `bash scripts/check-workspace-versions.sh`, `cargo fmt --all --check`, `make
+fmt-check`, the guarded focused item-12 target, `cargo check --workspace
+--all-targets --locked`, `cargo clippy --workspace --all-targets --locked -D
+warnings`, `git diff --check`, and the frozen `Cargo.lock` SHA-256 audit. The
+changed-file LSP diagnostics attempt and its exact result are reported in the
+notepads; no LSP-clean claim is made when the request is rejected for being
+outside the request cwd. Native Windows runtime/crash coverage and portable
+atomic no-follow enumeration remain explicitly unclaimed, and the authoritative
+full locked CI gate remains the parent's.
