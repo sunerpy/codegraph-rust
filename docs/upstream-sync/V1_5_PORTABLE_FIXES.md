@@ -2334,3 +2334,110 @@ worktree is rejected with `LSP file path must be inside request cwd`; Cargo
 check, Clippy, tests, formatting, and the guardrail are the diagnostics fallback,
 not an LSP-clean claim. Native Windows runtime/crash validation remains
 unavailable and is not claimed.
+
+## Batch M acceptance closure — items 13, 14, 18, and item 19 config-core prerequisite (2026-07-26)
+
+This append records the parent-reviewed acceptance evidence for four frozen
+slices on implementation HEAD
+`3863c2694583564964c36b6953dfec96046c9ab3`. The parent reviewed the exact Rust
+bytes later committed by this closure; those bytes were not edited during the
+closure. Their pre-commit SHA-256 values were:
+
+| Slice    | File                                                | SHA-256                                                            |
+| -------- | --------------------------------------------------- | ------------------------------------------------------------------ |
+| M13      | `crates/codegraph-store/tests/index_lease.rs`       | `41a929b7ab0048ec8b385e90d3e00cead515ac79e877d7321433c0e5ece5963f` |
+| M14      | `crates/codegraph-store/tests/store_state_gates.rs` | `8948cc04f30c2335cb335f85d3c8c78d122c5c30a52e3e86ddaa66f38f8f7a53` |
+| M18      | `crates/codegraph-watch/src/sync.rs`                | `81705e5be3da7abea26dfb58710e2e93108707a0cd5b3f6d294746fa6ab4b2b2` |
+| M18      | `crates/codegraph-watch/src/watcher.rs`             | `e6bc6c2ef64f4db000e3a8bf66f68a44ed1daddcb5beca4f3168c34cff91fb18` |
+| M19-core | `crates/codegraph-core/src/config.rs`               | `e600ad0a3908655814be82e0246f01cc43f11696b4bee16276b5f3fe268d27cb` |
+
+The frozen Revision 14 plan remained unchanged at SHA-256
+`5b64aa335fb32cd228d98404c2e44153e9134d26a912ecb02d71fcf5c5798450`.
+No manifest, lockfile, golden, schema, node-ID formula, `UPSTREAM.md`, or
+`KNOWN_DIFFS.md` byte is part of these slices.
+
+### M13 — lease owner and Store drop ordering
+
+`index_lease` now proves shared and exclusive parent/clone ownership through
+separate synchronized contender processes. Dropping a non-final parent or clone
+keeps incompatible contenders blocked; dropping the final owner admits a fresh
+contender immediately. A real finalized Current namespace additionally proves
+that a live read `Store` retains its shared lease through both SQLite handles and
+that `Store` closes those handles before its final retained lease is released.
+The Windows-only replacement branch is compile/injected-branch evidence; it was
+not executed on native Windows.
+
+Parent focused result: `index_lease` **13/13 passed**. The M13 target acceptance
+passed on these exact bytes.
+
+### M14 — read/status opens never migrate
+
+`store_state_gates` stages a physically current SQLite schema whose recorded
+schema version is deliberately migration-eligible, plus exact metadata canaries.
+Both `Store::open_for_read` and `Store::open_for_status` must accept the Current
+namespace without running migration or metadata repair. The acceptance oracle
+checks the complete namespace snapshot, absence of WAL/SHM creation, SQLite
+schema rows, schema-version rows, and project-metadata rows before, during, and
+after Store lifetime. Stamp-mismatch refusal is covered through the same
+nonmutation oracle. SQLite sidecars are derived losslessly by appending to the
+native `OsString`, never through `display()`.
+
+Parent focused result: `store_state_gates` **22/22 passed**. The M14 target
+acceptance passed on these exact bytes.
+
+### M18 — removed directories escalate to a pattern-aware full sync
+
+The watcher now preserves notify removal classification through the debounce
+loop. Explicit `RemoveKind::Folder` is a directory removal; Windows
+`RemoveKind::Any` regains directory semantics only when its normalized path is in
+the watcher-owned known-directory set captured at startup and extended when new
+directories are registered. This avoids guessing from a missing path or filename
+extension and keeps extensionless file removals distinct.
+
+A removed watched directory dominates its debounce burst and schedules exactly
+one full-project sync so every absent tracked descendant can be removed. Ignored
+directory removals remain ignored. The default full-sync closure passes the
+watcher's own `WatchOptions.include` and `WatchOptions.exclude` into the scan,
+rather than falling back to process-global patterns; sorted/deduplicated trigger
+paths remain attached to the outcome.
+
+Parent focused result: all **5 focused removal tests passed**; the complete
+`codegraph-watch` package passed **95 unit + 2 integration tests**.
+
+### M19-core — project-scoped config API prerequisite only
+
+This is deliberately **M19-core, not complete item 19**. It adds
+`Config::load_for_paths(cli_path, paths) -> Result<Arc<Config>>` with precedence
+explicit CLI path → `APP_CONFIG` → the resolved project's
+`IndexPaths::config_toml()` → defaults. The API does not consult legacy
+`.codegraph/config.toml`, the process working directory, or another project's
+paths, and it does not cache across projects. Its seven focused tests cover
+explicit/environment/project precedence, missing defaults, malformed current
+config, two-project isolation, intentional shared override, and rejection of
+legacy/CWD discovery. The transitional global `init_config`/`get_config` and
+legacy `Config::discover` remain for unmigrated callers.
+
+Parent focused result: `codegraph-core` **65/65 passed**, including
+`load_for_paths` **7/7 passed**. Production CLI, MCP, daemon, and watch config
+plumbing has **not** migrated to this API and remains the downstream portion of
+item 19.
+
+### Parent authoritative verification and environment limits
+
+The parent ran the focused suites above, workspace all-target check, workspace
+Clippy with `-D warnings`, and formatting on these exact Rust bytes. It then ran
+`bash scripts/check-workspace-versions.sh && make ci CARGO='cargo --locked'`;
+the workspace-version gate, fmt-check, Clippy, complete workspace tests, and
+guardrail all passed, and the terminal printed `✅ All CI checks passed!`.
+
+Changed-file LSP diagnostics were attempted but the tool rejected this required
+external worktree with `LSP file path must be inside request cwd`. The clean
+locked Cargo check, Clippy, tests, and formatting are the diagnostics fallback;
+this ledger does not claim LSP-clean results. The platform-independent injected
+`RemoveKind::Any` branch tests cover Windows watcher classification logic, but no
+native Windows runtime validation was run and none is claimed.
+
+`Cargo.lock` remained byte-identical at SHA-256
+`750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`.
+This evidence was appended before the closure's final `make fmt` and authoritative
+locked CI run so no post-CI documentation edit can invalidate formatting.
