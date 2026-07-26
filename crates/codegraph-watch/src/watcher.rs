@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -9,13 +9,19 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use notify::event::{EventKind, RemoveKind};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::policy::{WatchPolicy, watch_disabled_reason};
-use crate::sync::{SyncOutcome, default_db_path, sync_changed_paths_with_patterns};
+use crate::sync::{
+    SyncOutcome, default_db_path, sync_changed_paths_with_patterns, sync_project_once_with_patterns,
+};
 
 type SyncCallback = Arc<dyn Fn(SyncOutcome) + Send + Sync>;
 type SyncFn = Arc<dyn Fn(Vec<String>) -> Result<SyncOutcome> + Send + Sync>;
+/// Whole-project sync, used when an event cannot be expressed as a path list —
+/// currently only a removed DIRECTORY (see [`RemovalHint`]).
+type FullSyncFn = Arc<dyn Fn() -> Result<SyncOutcome> + Send + Sync>;
 type NoticeCallback = Arc<dyn Fn(String) + Send + Sync>;
 
 /// The OS watcher, shared between [`ProjectWatcher`] (which owns its lifetime)
@@ -182,6 +188,13 @@ fn collect_watch_dirs(root: &Path, policy: &WatchPolicy) -> Vec<PathBuf> {
     dirs
 }
 
+fn known_directory_paths(root: &Path, policy: &WatchPolicy) -> BTreeSet<String> {
+    collect_watch_dirs(root, policy)
+        .into_iter()
+        .filter_map(|dir| policy.normalize_relative(dir))
+        .collect()
+}
+
 fn initial_watch_targets(
     backend: WatchBackend,
     project_root: &Path,
@@ -289,6 +302,9 @@ pub struct WatchOptions {
     pub include: Vec<String>,
     pub exclude: Vec<String>,
     sync_fn: Option<SyncFn>,
+    /// Override for the whole-project sync a removed directory escalates to.
+    /// Defaults to [`crate::sync::sync_project_once`]; tests inject a counter.
+    full_sync_fn: Option<FullSyncFn>,
 }
 
 impl Default for WatchOptions {
@@ -306,6 +322,7 @@ impl Default for WatchOptions {
             include: Vec::new(),
             exclude: Vec::new(),
             sync_fn: None,
+            full_sync_fn: None,
         }
     }
 }
@@ -350,8 +367,22 @@ impl ProjectWatcher {
                 sync_changed_paths_with_patterns(&project_root, &db_path, paths, &include, &exclude)
             })
         });
+        // A removed directory cannot be expressed as a path list (its tracked
+        // descendants are only discoverable by diffing the whole index against
+        // disk), so it escalates to the SAME full sync `codegraph sync` runs.
+        let full_sync_fn = options.full_sync_fn.clone().unwrap_or_else(|| {
+            let project_root = project_root.clone();
+            let include = options.include.clone();
+            let exclude = options.exclude.clone();
+            Arc::new(move || sync_project_once_with_patterns(&project_root, &include, &exclude))
+        });
         let (tx, rx) = mpsc::channel();
         let degraded = Arc::new(DegradedState::default());
+        // Capture directory identity before registering the backend. Windows emits
+        // `RemoveKind::Any` after deletion, so this pre-event snapshot is the only
+        // deterministic way to distinguish a known directory from an extensionless
+        // file without inspecting a path that no longer exists.
+        let known_dirs = known_directory_paths(&project_root, &policy);
 
         // Build the OS watcher and register the pruned watch set BEFORE spawning
         // the loop, so its create-event handler can share the same watcher to add
@@ -363,7 +394,10 @@ impl ProjectWatcher {
             let mut watcher =
                 notify::recommended_watcher(move |event: notify::Result<Event>| match event {
                     Ok(event) => {
-                        let _ = callback_tx.send(LoopMessage::Event(event.paths));
+                        let _ = callback_tx.send(LoopMessage::Event(WatchEventBatch::from_event(
+                            &event.kind,
+                            event.paths,
+                        )));
                     }
                     Err(err) => {
                         let _ = callback_tx.send(LoopMessage::WatchError(err));
@@ -432,11 +466,13 @@ impl ProjectWatcher {
                 policy: loop_policy,
                 debounce,
                 sync_fn,
+                full_sync_fn,
                 on_sync_complete,
                 on_degraded,
                 on_sync_error,
                 degraded: loop_degraded,
                 watcher: loop_watcher,
+                known_dirs,
             });
         });
 
@@ -457,7 +493,35 @@ impl ProjectWatcher {
     }
 
     pub fn ingest_event_for_tests(&self, relative: impl Into<PathBuf>) {
-        let _ = self.tx.send(LoopMessage::Event(vec![relative.into()]));
+        let _ = self.tx.send(LoopMessage::Event(WatchEventBatch::paths(vec![
+            relative.into(),
+        ])));
+    }
+
+    /// Feed a REMOVED-DIRECTORY event, the notify `Remove(RemoveKind::Folder)`
+    /// shape, without needing a real OS watcher.
+    pub fn ingest_removed_dir_for_tests(&self, relative: impl Into<PathBuf>) {
+        let _ = self.tx.send(LoopMessage::Event(WatchEventBatch::from_event(
+            &EventKind::Remove(RemoveKind::Folder),
+            vec![relative.into()],
+        )));
+    }
+
+    /// Feed the ambiguous removal shape emitted by Windows
+    /// `ReadDirectoryChangesW`, without requiring a native Windows runner.
+    pub fn ingest_ambiguous_remove_for_tests(&self, relative: impl Into<PathBuf>) {
+        let _ = self.tx.send(LoopMessage::Event(WatchEventBatch::from_event(
+            &EventKind::Remove(RemoveKind::Any),
+            vec![relative.into()],
+        )));
+    }
+
+    #[cfg(test)]
+    fn flush_for_tests(&self) {
+        let (tx, rx) = mpsc::channel();
+        let _ = self.tx.send(LoopMessage::Flush(tx));
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("event loop accepted deterministic flush");
     }
 
     pub fn pending_files(&self) -> Vec<PendingFile> {
@@ -488,10 +552,69 @@ impl Drop for ProjectWatcher {
 }
 
 enum LoopMessage {
-    Event(Vec<PathBuf>),
+    Event(WatchEventBatch),
     WatchError(notify::Error),
     Snapshot(Sender<Vec<PendingFile>>),
+    #[cfg(test)]
+    Flush(Sender<()>),
     Stop,
+}
+
+/// One notify event, reduced to exactly what the debounce loop needs: the paths,
+/// plus the backend's removal classification.
+///
+/// The distinction has to travel with the event because it cannot be recovered
+/// later: a removed directory is already gone from disk, so `path.is_dir()` is
+/// false and its extensionless name is indistinguishable from a deleted
+/// extensionless file. Carrying the notify `EventKind` forward keeps the
+/// escalation deterministic instead of guessing from a missing path.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct WatchEventBatch {
+    paths: Vec<PathBuf>,
+    removal: RemovalHint,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum RemovalHint {
+    #[default]
+    None,
+    Directory,
+    Ambiguous,
+}
+
+impl WatchEventBatch {
+    fn paths(paths: Vec<PathBuf>) -> Self {
+        Self {
+            paths,
+            removal: RemovalHint::None,
+        }
+    }
+
+    fn from_event(kind: &EventKind, paths: Vec<PathBuf>) -> Self {
+        let removal = match kind {
+            EventKind::Remove(RemoveKind::Folder) => RemovalHint::Directory,
+            EventKind::Remove(RemoveKind::Any) => RemovalHint::Ambiguous,
+            _ => RemovalHint::None,
+        };
+        Self { paths, removal }
+    }
+}
+
+fn classify_removed_directory(
+    hint: RemovalHint,
+    relative: &str,
+    known_dirs: &mut BTreeSet<String>,
+) -> bool {
+    let removed_dir = match hint {
+        RemovalHint::Directory => true,
+        RemovalHint::Ambiguous => known_dirs.contains(relative),
+        RemovalHint::None => false,
+    };
+    if removed_dir {
+        let descendant_prefix = format!("{relative}/");
+        known_dirs.retain(|known| known != relative && !known.starts_with(&descendant_prefix));
+    }
+    removed_dir
 }
 
 #[derive(Debug, Clone)]
@@ -505,11 +628,13 @@ struct EventLoopCtx {
     policy: WatchPolicy,
     debounce: Duration,
     sync_fn: SyncFn,
+    full_sync_fn: FullSyncFn,
     on_sync_complete: Option<SyncCallback>,
     on_degraded: Option<NoticeCallback>,
     on_sync_error: Option<NoticeCallback>,
     degraded: Arc<DegradedState>,
     watcher: SharedWatcher,
+    known_dirs: BTreeSet<String>,
 }
 
 fn event_loop(ctx: EventLoopCtx) {
@@ -518,15 +643,21 @@ fn event_loop(ctx: EventLoopCtx) {
         policy,
         debounce,
         sync_fn,
+        full_sync_fn,
         on_sync_complete,
         on_degraded,
         on_sync_error,
         degraded,
         watcher,
+        mut known_dirs,
     } = ctx;
     let mut pending = BTreeMap::<String, PendingInfo>::new();
     let mut deadline = None::<Instant>;
     let mut consecutive_sync_errors = 0u32;
+    // Set by a removed-directory event in the current burst. It DOMINATES the
+    // per-path list (one full sync instead of N incremental ones) yet still
+    // flushes exactly once, on the same debounce deadline.
+    let mut full_sync_pending = false;
     loop {
         let message = match deadline {
             Some(when) => match rx.recv_timeout(when.saturating_duration_since(Instant::now())) {
@@ -541,9 +672,30 @@ fn event_loop(ctx: EventLoopCtx) {
         };
 
         match message {
-            Some(LoopMessage::Event(paths)) => {
+            Some(LoopMessage::Event(batch)) => {
+                let WatchEventBatch { paths, removal } = batch;
                 for path in paths {
                     if let Some(relative) = policy.normalize_relative(&path) {
+                        // A removed DIRECTORY bypasses extension filtering: it has
+                        // no source extension, so the file gate below would drop it
+                        // and every tracked descendant would linger in the index
+                        // forever. The watch policy still applies (an ignored dir is
+                        // still ignored), and the removal escalates the burst to one
+                        // full sync — the only pass that can find those descendants.
+                        if classify_removed_directory(removal, &relative, &mut known_dirs) {
+                            if policy.should_watch_dir(&relative) {
+                                full_sync_pending = true;
+                                let now = epoch_millis();
+                                pending
+                                    .entry(relative)
+                                    .and_modify(|info| info.last_seen_ms = now)
+                                    .or_insert(PendingInfo {
+                                        first_seen_ms: now,
+                                        last_seen_ms: now,
+                                    });
+                            }
+                            continue;
+                        }
                         // A brand-new non-ignored directory holds no inotify watch
                         // yet (Linux watches are per-dir NonRecursive — see
                         // `collect_watch_dirs`). Register it (and any non-ignored
@@ -551,6 +703,7 @@ fn event_loop(ctx: EventLoopCtx) {
                         // edits inside it are seen without a server restart.
                         if path.is_dir() && policy.should_watch_dir(&relative) {
                             register_new_dirs(&watcher, &policy, &path);
+                            known_dirs.extend(known_directory_paths(&path, &policy));
                         }
                         if policy.should_handle_file(&relative)
                             || (policy.allows_file_path(&relative)
@@ -582,12 +735,24 @@ fn event_loop(ctx: EventLoopCtx) {
             Some(LoopMessage::Snapshot(reply)) => {
                 let _ = reply.send(snapshot(&pending));
             }
+            #[cfg(test)]
+            Some(LoopMessage::Flush(reply)) => {
+                if !pending.is_empty() {
+                    deadline = Some(Instant::now());
+                }
+                let _ = reply.send(());
+            }
             Some(LoopMessage::Stop) => break,
             None => {
                 let paths = pending.keys().cloned().collect::<Vec<_>>();
                 pending.clear();
                 deadline = None;
-                let attempt = run_sync_with_backoff(&sync_fn, paths.clone());
+                let full_sync = std::mem::take(&mut full_sync_pending);
+                let attempt = if full_sync {
+                    run_full_sync_with_backoff(&full_sync_fn)
+                } else {
+                    run_sync_with_backoff(&sync_fn, paths.clone())
+                };
                 let decision = classify_persistent_failure(&attempt, &mut consecutive_sync_errors);
                 match attempt {
                     SyncAttempt::Done(outcome) => {
@@ -712,18 +877,35 @@ fn run_sync_with_backoff(sync_fn: &SyncFn, paths: Vec<String>) -> SyncAttempt {
     run_sync_with_backoff_inner(sync_fn, paths, MAX_BACKOFF, thread::sleep)
 }
 
+/// Same bounded-backoff contract as [`run_sync_with_backoff`], for the
+/// whole-project sync a removed directory escalates to.
+fn run_full_sync_with_backoff(full_sync_fn: &FullSyncFn) -> SyncAttempt {
+    run_with_backoff(MAX_BACKOFF, thread::sleep, || full_sync_fn())
+}
+
 /// Inner retry loop with an injectable budget and sleeper so the cap can be
 /// unit-tested without sleeping a real 30 seconds.
 fn run_sync_with_backoff_inner(
     sync_fn: &SyncFn,
     paths: Vec<String>,
     budget: Duration,
+    sleeper: impl FnMut(Duration),
+) -> SyncAttempt {
+    run_with_backoff(budget, sleeper, || sync_fn(paths.clone()))
+}
+
+/// The shared retry policy: retry on write-lock contention with bounded
+/// exponential backoff capped at [`MAX_BACKOFF`], degrade once the cumulative
+/// sleep budget is spent, and surface any non-contention error immediately.
+fn run_with_backoff(
+    budget: Duration,
     mut sleeper: impl FnMut(Duration),
+    mut run: impl FnMut() -> Result<SyncOutcome>,
 ) -> SyncAttempt {
     let mut backoff = Duration::ZERO;
     let mut slept = Duration::ZERO;
     loop {
-        match sync_fn(paths.clone()) {
+        match run() {
             Ok(outcome) => return SyncAttempt::Done(outcome),
             Err(err) => {
                 if !is_lock_contention(&err) {
@@ -851,6 +1033,340 @@ mod tests {
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].files_reindexed, 1);
         assert_eq!(outcomes[0].files_checked, 1);
+    }
+
+    #[test]
+    fn deleted_directory_event_schedules_one_full_sync() {
+        // A removed DIRECTORY has no source extension, so extension-based event
+        // filtering drops it and every tracked descendant lingers in the index
+        // forever. The watcher must escalate the removal to exactly ONE
+        // full-project sync — the only pass that discovers every absent tracked
+        // descendant — instead of an incremental path-scoped sync.
+        let dir = crate::sync::tests::TestDir::new("watch-deleted-dir");
+        let _ = codegraph_core::config::init_config(None, dir.path());
+        fs::write(dir.path().join(".gitignore"), "Tools/\n").unwrap();
+        fs::create_dir_all(dir.path().join("Tools/feature")).unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("Tools/feature/alpha.ts"),
+            "export function alpha() { return 1; }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("Tools/feature/beta.ts"),
+            "export function beta() { return 2; }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("Tools/keep.ts"),
+            "export function includedBefore() { return 3; }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/excluded.ts"),
+            "export function excludedBefore() { return 4; }\n",
+        )
+        .unwrap();
+        let db = crate::sync::default_db_path(dir.path()).unwrap();
+        let indexed = crate::sync::sync_changed_paths_with_patterns(
+            dir.path(),
+            &db,
+            [
+                "Tools/feature/alpha.ts",
+                "Tools/feature/beta.ts",
+                "Tools/keep.ts",
+                "src/excluded.ts",
+            ],
+            &["Tools/".to_string()],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            indexed.files_reindexed, 4,
+            "all fixture files indexed first"
+        );
+
+        // The watcher-local patterns deliberately oppose the process-global/default
+        // full-sync scope: include the gitignored Tools tree, but exclude one normal
+        // source file. Both surviving files change before the directory removal so
+        // the resulting stored symbols prove which patterns the full sync used.
+        fs::write(
+            dir.path().join("Tools/keep.ts"),
+            "export function includedAfter() { return 30; }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/excluded.ts"),
+            "export function excludedAfter() { return 40; }\n",
+        )
+        .unwrap();
+
+        let (outcome_tx, outcome_rx) = mpsc::channel();
+        // An injected INCREMENTAL sync_fn that must never run: a directory
+        // removal is not a per-path event.
+        let incremental_calls = Arc::new(AtomicUsize::new(0));
+        let incremental = Arc::clone(&incremental_calls);
+        let sync_fn: SyncFn = Arc::new(move |_paths| {
+            incremental.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(SyncOutcome::default())
+        });
+        let watcher = ProjectWatcher::start(
+            dir.path(),
+            WatchOptions {
+                debounce: Duration::from_secs(30),
+                inert_for_tests: true,
+                db_path: Some(db.clone()),
+                sync_fn: Some(sync_fn),
+                include: vec!["Tools/".to_string()],
+                exclude: vec!["src/excluded.ts".to_string()],
+                on_sync_complete: Some(Arc::new(move |outcome| {
+                    outcome_tx.send(outcome).unwrap();
+                })),
+                ..WatchOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        // When: the directory disappears and the backend reports the ambiguous
+        // Windows removal shape. The watcher must recover directory identity from
+        // its startup registration state rather than inspecting the missing path.
+        fs::remove_dir_all(dir.path().join("Tools/feature")).unwrap();
+        watcher.ingest_ambiguous_remove_for_tests("Tools/feature");
+        watcher.flush_for_tests();
+        let outcome = outcome_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("removed-directory sync completion");
+        watcher.stop();
+
+        // Then: exactly one sync fired, it was the FULL sync (not the injected
+        // incremental one), it removed both tracked descendants, and the removed
+        // directory is reported as the trigger path.
+        assert!(outcome_rx.try_recv().is_err(), "only one sync may complete");
+        assert_eq!(
+            incremental_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "a directory removal must NOT take the incremental per-path sync"
+        );
+        assert_eq!(
+            outcome.files_removed, 2,
+            "the full sync must drop every tracked descendant of the missing dir"
+        );
+        assert_eq!(outcome.trigger_paths, vec!["Tools/feature".to_string()]);
+        let store = codegraph_store::Store::open(&db).unwrap();
+        for gone in ["Tools/feature/alpha.ts", "Tools/feature/beta.ts"] {
+            assert!(
+                store.file_by_path(gone).unwrap().is_none(),
+                "{gone} must be gone from the store after the directory removal"
+            );
+        }
+        let included_names = store
+            .nodes_by_file_path("Tools/keep.ts")
+            .unwrap()
+            .into_iter()
+            .map(|node| node.name)
+            .collect::<Vec<_>>();
+        assert!(
+            included_names.iter().any(|name| name == "includedAfter"),
+            "watcher-local include must let full sync refresh Tools/keep.ts: {included_names:?}"
+        );
+        let excluded_names = store
+            .nodes_by_file_path("src/excluded.ts")
+            .unwrap()
+            .into_iter()
+            .map(|node| node.name)
+            .collect::<Vec<_>>();
+        assert!(
+            excluded_names.iter().any(|name| name == "excludedBefore")
+                && !excluded_names.iter().any(|name| name == "excludedAfter"),
+            "watcher-local exclude must keep src/excluded.ts untouched: {excluded_names:?}"
+        );
+    }
+
+    #[test]
+    fn ambiguous_remove_of_known_directory_keeps_directory_semantics() {
+        // Windows ReadDirectoryChangesW reports directory deletion as Any. The
+        // current dirty implementation loses that identity unconditionally;
+        // the corrected classifier must corroborate it from the watcher's known
+        // directory state rather than from extension or the now-missing path.
+        let dir = crate::sync::tests::TestDir::new("watch-ambiguous-remove");
+        fs::create_dir_all(dir.path().join("src/feature")).unwrap();
+        fs::write(dir.path().join("src/README"), "extensionless file\n").unwrap();
+        let policy = WatchPolicy::new(dir.path());
+        let mut known_dirs = known_directory_paths(dir.path(), &policy);
+        fs::remove_dir_all(dir.path().join("src/feature")).unwrap();
+        fs::remove_file(dir.path().join("src/README")).unwrap();
+
+        let directory_batch = WatchEventBatch::from_event(
+            &EventKind::Remove(RemoveKind::Any),
+            vec![PathBuf::from("src/feature")],
+        );
+        assert!(
+            classify_removed_directory(directory_batch.removal, "src/feature", &mut known_dirs,),
+            "an ambiguous removal of a watcher-known directory must remain a directory removal"
+        );
+
+        let file_batch = WatchEventBatch::from_event(
+            &EventKind::Remove(RemoveKind::Any),
+            vec![PathBuf::from("src/README")],
+        );
+        assert!(
+            !classify_removed_directory(file_batch.removal, "src/README", &mut known_dirs),
+            "an extensionless deleted file must not be guessed to be a directory"
+        );
+    }
+
+    #[test]
+    fn real_watcher_classifies_a_removed_directory_as_a_full_sync() {
+        // End-to-end with a REAL notify watcher: proves the OS actually delivers
+        // either an explicit Folder removal or Windows' ambiguous Any removal,
+        // and that the watcher escalates the known directory to a full sync.
+        let dir = crate::sync::tests::TestDir::new("watch-real-deleted-dir");
+        fs::create_dir_all(dir.path().join("src/feature")).unwrap();
+        fs::write(
+            dir.path().join("src/feature/mod.ts"),
+            "export const x = 1;\n",
+        )
+        .unwrap();
+
+        let full_calls = Arc::new(AtomicUsize::new(0));
+        let full_counter = Arc::clone(&full_calls);
+        let full_sync_fn: FullSyncFn = Arc::new(move || {
+            full_counter.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(SyncOutcome::default())
+        });
+        let sync_fn: SyncFn = Arc::new(|_paths| Ok(SyncOutcome::default()));
+        let watcher = ProjectWatcher::start(
+            dir.path(),
+            WatchOptions {
+                debounce: Duration::from_millis(50),
+                sync_fn: Some(sync_fn),
+                full_sync_fn: Some(full_sync_fn),
+                ..WatchOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        std::thread::sleep(Duration::from_millis(150));
+        fs::remove_dir_all(dir.path().join("src/feature")).unwrap();
+
+        let mut saw_full = false;
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(50));
+            if full_calls.load(AtomicOrdering::SeqCst) > 0 {
+                saw_full = true;
+                break;
+            }
+        }
+        watcher.stop();
+        assert!(
+            saw_full,
+            "removing a watched directory must escalate to the full sync"
+        );
+    }
+
+    #[test]
+    fn directory_removal_burst_deduplicates_to_one_full_sync() {
+        // A `rm -rf` burst surfaces the folder removal AND each child removal.
+        // The full-sync escalation must dominate the per-file paths yet still
+        // collapse to ONE sync, with every event path retained as a trigger.
+        let dir = crate::sync::tests::TestDir::new("watch-deleted-dir-burst");
+        let full_calls = Arc::new(AtomicUsize::new(0));
+        let full_counter = Arc::clone(&full_calls);
+        let full_sync_fn: FullSyncFn = Arc::new(move || {
+            full_counter.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(SyncOutcome {
+                files_removed: 2,
+                ..Default::default()
+            })
+        });
+        let incremental_calls = Arc::new(AtomicUsize::new(0));
+        let incremental = Arc::clone(&incremental_calls);
+        let sync_fn: SyncFn = Arc::new(move |_paths| {
+            incremental.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(SyncOutcome::default())
+        });
+        let (outcome_tx, outcome_rx) = mpsc::channel();
+        let watcher = ProjectWatcher::start(
+            dir.path(),
+            WatchOptions {
+                debounce: Duration::from_secs(30),
+                inert_for_tests: true,
+                sync_fn: Some(sync_fn),
+                full_sync_fn: Some(full_sync_fn),
+                on_sync_complete: Some(Arc::new(move |outcome| {
+                    outcome_tx.send(outcome).unwrap();
+                })),
+                ..WatchOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        watcher.ingest_event_for_tests("src/feature/beta.ts");
+        watcher.ingest_removed_dir_for_tests("src/feature");
+        watcher.ingest_event_for_tests("src/feature/alpha.ts");
+        watcher.ingest_event_for_tests("src/feature/beta.ts");
+        watcher.flush_for_tests();
+        let outcome = outcome_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("burst sync completion");
+        assert!(watcher.pending_files().is_empty());
+        watcher.stop();
+
+        assert!(
+            outcome_rx.try_recv().is_err(),
+            "the burst must collapse to one sync"
+        );
+        assert_eq!(
+            full_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "the full sync must run exactly once for the burst"
+        );
+        assert_eq!(
+            incremental_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "a full-sync burst must not also run the incremental sync"
+        );
+        assert_eq!(
+            outcome.trigger_paths,
+            vec![
+                "src/feature".to_string(),
+                "src/feature/alpha.ts".to_string(),
+                "src/feature/beta.ts".to_string(),
+            ],
+            "every event path in the burst stays a sorted, deduped trigger path"
+        );
+    }
+
+    #[test]
+    fn removed_ignored_directory_does_not_schedule_a_full_sync() {
+        // The escalation honors the watch policy: an ignored directory removal
+        // is still dropped, so no sync is scheduled at all.
+        let dir = crate::sync::tests::TestDir::new("watch-deleted-dir-ignored");
+        let full_calls = Arc::new(AtomicUsize::new(0));
+        let full_counter = Arc::clone(&full_calls);
+        let full_sync_fn: FullSyncFn = Arc::new(move || {
+            full_counter.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(SyncOutcome::default())
+        });
+        let watcher = ProjectWatcher::start(
+            dir.path(),
+            WatchOptions {
+                debounce: Duration::from_secs(30),
+                inert_for_tests: true,
+                full_sync_fn: Some(full_sync_fn),
+                ..WatchOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        watcher.ingest_removed_dir_for_tests("node_modules/pkg");
+        watcher.flush_for_tests();
+        watcher.stop();
+        assert_eq!(full_calls.load(AtomicOrdering::SeqCst), 0);
     }
 
     #[test]

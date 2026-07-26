@@ -41,16 +41,36 @@ pub fn sync_project_once(project_root: impl AsRef<Path>) -> Result<SyncOutcome> 
     sync_project_once_with_progress(project_root, |_, _| {})
 }
 
+/// Whole-project sync using watcher-owned path patterns while preserving every
+/// other scan option from the normal sync path.
+pub(crate) fn sync_project_once_with_patterns(
+    project_root: impl AsRef<Path>,
+    include: &[String],
+    exclude: &[String],
+) -> Result<SyncOutcome> {
+    let mut options = scan_options();
+    options.include = include.to_vec();
+    options.exclude = exclude.to_vec();
+    sync_project_once_with_options(project_root.as_ref(), options, |_, _| {})
+}
+
 /// Like [`sync_project_once`] but invokes `on_progress(done, total)` after each
 /// candidate file is processed, letting a caller drive a progress bar. The
 /// callback is a pure side effect: it never gates or reorders work, so the
 /// result stays byte-equivalent to `index --force`.
 pub fn sync_project_once_with_progress(
     project_root: impl AsRef<Path>,
+    on_progress: impl FnMut(usize, usize),
+) -> Result<SyncOutcome> {
+    let options = scan_options();
+    sync_project_once_with_options(project_root.as_ref(), options, on_progress)
+}
+
+fn sync_project_once_with_options(
+    project_root: &Path,
+    options: ExtractOptions,
     mut on_progress: impl FnMut(usize, usize),
 ) -> Result<SyncOutcome> {
-    let project_root = project_root.as_ref();
-    let options = scan_options();
     let include = options.include.clone();
     let exclude = options.exclude.clone();
     let started = Instant::now();
