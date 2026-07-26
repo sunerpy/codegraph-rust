@@ -1,7 +1,8 @@
 //! Configuration module for CodeGraph.
 //!
-//! Reads `<project_root>/.codegraph/config.toml` via Pattern B (runtime discovery).
-//! Config is optional — missing file uses all defaults, matching the upstream zero-config UX.
+//! Project-scoped callers load immutable [`Config`] values from the current
+//! [`IndexPaths`] root. Config is optional — a missing current-root file uses all
+//! defaults, matching the upstream zero-config UX.
 //!
 //! ### Config Sources
 //! - `max_file_size`: upstream extraction/index.ts:101 (skip files >1MB)
@@ -15,13 +16,16 @@
 //! - watch.enabled: true
 //! - watch.debounce_ms: 2000
 //!
-//! Loaded once into a global OnceLock; consumers borrow &'static Config.
-//! For libraries: this module returns Result; the binary owns the failure policy.
+//! The process-global [`init_config`] / [`get_config`] API remains temporarily for
+//! transitional bootstrap callers. New library code must use
+//! [`Config::load_for_paths`] and pass the returned [`Arc`] through project-scoped
+//! operations instead of consulting that singleton.
 
+use crate::IndexPaths;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 /// Top-level configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -236,6 +240,19 @@ impl Default for WatchConfig {
     }
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            app: AppConfig {
+                name: "codegraph".to_string(),
+                log_level: default_log_level(),
+            },
+            indexing: IndexingConfig::default(),
+            watch: WatchConfig::default(),
+        }
+    }
+}
+
 impl Config {
     /// Read and parse a TOML file at `path`.
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
@@ -247,13 +264,47 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Discover the config file with a clear precedence:
+    /// Load an immutable config for one resolved project's current index root.
+    ///
+    /// Precedence is deliberately narrow and project-authoritative:
+    ///
+    /// 1. explicit `cli_path`;
+    /// 2. the process-wide `APP_CONFIG` override;
+    /// 3. [`IndexPaths::config_toml`] for this project.
+    ///
+    /// A missing current-root config returns defaults. An explicitly selected
+    /// CLI or environment path must exist and parse successfully. This API never
+    /// consults a legacy `.codegraph/config.toml`, the process working directory,
+    /// or another project's paths, and it does not cache across calls.
+    pub fn load_for_paths(cli_path: Option<&Path>, paths: &IndexPaths) -> Result<Arc<Self>> {
+        if let Some(path) = cli_path {
+            return Self::from_path(path).map(Arc::new);
+        }
+        if let Some(path) = std::env::var_os("APP_CONFIG") {
+            return Self::from_path(PathBuf::from(path)).map(Arc::new);
+        }
+
+        let project_config = paths.config_toml();
+        let config = if project_config
+            .try_exists()
+            .with_context(|| format!("checking config file: {}", project_config.display()))?
+        {
+            Self::from_path(project_config)?
+        } else {
+            Self::default()
+        };
+        Ok(Arc::new(config))
+    }
+
+    /// Transitional legacy discovery with a clear precedence:
     ///   1. explicit `cli_path` (passed in directly)
     ///   2. `APP_CONFIG` env var
     ///   3. `./.codegraph/config.toml` (current working directory)
     ///   4. `<project_root>/.codegraph/config.toml` (if provided)
     ///
-    /// If no file is found, returns all defaults.
+    /// If no file is found, returns all defaults. New project-scoped callers
+    /// should use [`Config::load_for_paths`]; this compatibility path retains the
+    /// old `.codegraph` and CWD behavior only until downstream callers migrate.
     pub fn discover(cli_path: Option<&Path>, project_root: &Path) -> Result<Self> {
         if let Some(p) = cli_path {
             return Self::from_path(p);
@@ -275,21 +326,16 @@ impl Config {
         }
 
         // No file found — return all defaults
-        Ok(Self {
-            app: AppConfig {
-                name: "codegraph".to_string(),
-                log_level: default_log_level(),
-            },
-            indexing: IndexingConfig::default(),
-            watch: WatchConfig::default(),
-        })
+        Ok(Self::default())
     }
 }
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
 
-/// Initialize the global config once, early in `main`. Returns the parsed config
-/// so `main` can react to errors before continuing.
+/// Initialize the transitional global config once, early in `main`.
+///
+/// This exists so unmigrated bootstrap callers continue to compile. New
+/// project-scoped operations must use [`Config::load_for_paths`] instead.
 pub fn init_config(cli_path: Option<&Path>, project_root: &Path) -> Result<&'static Config> {
     let cfg = Config::discover(cli_path, project_root)?;
     CONFIG
@@ -320,6 +366,51 @@ pub fn get_config() -> &'static Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static APP_CONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Panic-safe process-environment mutation for APP_CONFIG precedence tests.
+    /// The serialization lock is retained until after the previous value is
+    /// restored, including when an assertion unwinds through this guard.
+    struct AppConfigEnvGuard {
+        previous: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl AppConfigEnvGuard {
+        fn set(value: Option<&Path>) -> Self {
+            let lock = APP_CONFIG_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = std::env::var_os("APP_CONFIG");
+            // SAFETY: every APP_CONFIG read/mutation in this test module that can
+            // overlap these tests is serialized by APP_CONFIG_ENV_LOCK. Drop
+            // restores the prior value while the same lock is still held.
+            match value {
+                Some(path) => unsafe { std::env::set_var("APP_CONFIG", path) },
+                None => unsafe { std::env::remove_var("APP_CONFIG") },
+            }
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+
+        fn unset() -> Self {
+            Self::set(None)
+        }
+    }
+
+    impl Drop for AppConfigEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: the serialization guard is still held while restoring the
+            // process environment on both normal return and panic unwind.
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var("APP_CONFIG", value) },
+                None => unsafe { std::env::remove_var("APP_CONFIG") },
+            }
+        }
+    }
 
     #[test]
     fn test_default_config_parses() {
@@ -408,6 +499,7 @@ max_file_size = 2097152
 
     #[test]
     fn test_missing_file_returns_defaults() {
+        let _env = AppConfigEnvGuard::unset();
         let cfg = Config::discover(None, Path::new("/tmp/nonexistent"))
             .expect("should not error on missing file");
         assert_eq!(cfg.app.log_level, "info");
@@ -475,6 +567,7 @@ max_file_size = 2097152
 
     #[test]
     fn discover_reads_project_root_codegraph_config() {
+        let _env = AppConfigEnvGuard::unset();
         let project = temp_dir("project-root");
         let cfg_dir = project.join(".codegraph");
         std::fs::create_dir_all(&cfg_dir).unwrap();
@@ -489,6 +582,186 @@ max_file_size = 2097152
         assert_eq!(cfg.app.log_level, "debug");
 
         let _ = std::fs::remove_dir_all(&project);
+    }
+
+    fn project_paths(label: &str) -> (PathBuf, IndexPaths) {
+        let project = temp_dir(label);
+        let paths = IndexPaths::resolve(&project, None).expect("resolve project paths");
+        (project, paths)
+    }
+
+    fn write_current_config(paths: &IndexPaths, contents: &str) {
+        let path = paths.config_toml();
+        std::fs::create_dir_all(path.parent().expect("config has parent")).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn load_for_paths_prefers_explicit_cli_path_over_app_config_and_project() {
+        let (project, paths) = project_paths("scoped-explicit");
+        write_current_config(&paths, "[app]\nname = \"project\"\n");
+
+        let override_path = project.join("override.toml");
+        std::fs::write(&override_path, "[app]\nname = \"override\"\n").unwrap();
+        let explicit_path = project.join("explicit.toml");
+        std::fs::write(&explicit_path, "[app]\nname = \"explicit\"\n").unwrap();
+        let _env = AppConfigEnvGuard::set(Some(&override_path));
+
+        let config = Config::load_for_paths(Some(&explicit_path), &paths).unwrap();
+        assert_eq!(config.app.name, "explicit");
+
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn load_for_paths_reads_only_the_resolved_current_root() {
+        let _env = AppConfigEnvGuard::unset();
+        let (project, paths) = project_paths("scoped-current-root");
+        write_current_config(
+            &paths,
+            "[app]\nname = \"current-root\"\n[indexing]\nmax_file_size = 321\n",
+        );
+
+        let config = Config::load_for_paths(None, &paths).unwrap();
+        assert_eq!(config.app.name, "current-root");
+        assert_eq!(config.indexing.max_file_size, 321);
+
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn load_for_paths_missing_current_config_returns_defaults() {
+        let _env = AppConfigEnvGuard::unset();
+        let (project, paths) = project_paths("scoped-missing");
+
+        let config = Config::load_for_paths(None, &paths).unwrap();
+        assert_eq!(config.app.name, "codegraph");
+        assert_eq!(config.app.log_level, "info");
+        assert_eq!(config.indexing.max_file_size, default_max_file_size());
+        assert!(config.indexing.include.is_empty());
+        assert!(config.indexing.exclude.is_empty());
+
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn load_for_paths_reports_malformed_current_config() {
+        let _env = AppConfigEnvGuard::unset();
+        let (project, paths) = project_paths("scoped-malformed");
+        write_current_config(&paths, "this is not = valid toml [[[");
+
+        let error = Config::load_for_paths(None, &paths).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("parsing TOML"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains(&paths.config_toml().display().to_string()),
+            "error must name the project config: {message}"
+        );
+
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn load_for_paths_keeps_two_projects_isolated_without_app_config() {
+        let _env = AppConfigEnvGuard::unset();
+        let (alpha_project, alpha_paths) = project_paths("scoped-alpha");
+        let (beta_project, beta_paths) = project_paths("scoped-beta");
+        write_current_config(
+            &alpha_paths,
+            "[app]\nname = \"alpha\"\n[indexing]\nmax_file_size = 111\ninclude = [\"alpha/**\"]\nexclude = [\"beta/**\"]\n",
+        );
+        write_current_config(
+            &beta_paths,
+            "[app]\nname = \"beta\"\n[indexing]\nmax_file_size = 222\ninclude = [\"beta/**\"]\nexclude = [\"alpha/**\"]\n",
+        );
+
+        let alpha = Config::load_for_paths(None, &alpha_paths).unwrap();
+        let beta = Config::load_for_paths(None, &beta_paths).unwrap();
+        assert!(!Arc::ptr_eq(&alpha, &beta));
+        assert_eq!(alpha.indexing.max_file_size, 111);
+        assert_eq!(alpha.indexing.include, ["alpha/**"]);
+        assert_eq!(alpha.indexing.exclude, ["beta/**"]);
+        assert_eq!(beta.indexing.max_file_size, 222);
+        assert_eq!(beta.indexing.include, ["beta/**"]);
+        assert_eq!(beta.indexing.exclude, ["alpha/**"]);
+
+        let _ = std::fs::remove_dir_all(alpha_project);
+        let _ = std::fs::remove_dir_all(beta_project);
+    }
+
+    #[test]
+    fn load_for_paths_app_config_intentionally_overrides_two_projects() {
+        let (alpha_project, alpha_paths) = project_paths("override-alpha");
+        let (beta_project, beta_paths) = project_paths("override-beta");
+        write_current_config(&alpha_paths, "[app]\nname = \"alpha\"\n");
+        write_current_config(&beta_paths, "[app]\nname = \"beta\"\n");
+        let override_path = alpha_project.join("global-override.toml");
+        std::fs::write(
+            &override_path,
+            "[app]\nname = \"global\"\n[indexing]\nmax_file_size = 777\ninclude = [\"shared/**\"]\nexclude = [\"private/**\"]\n",
+        )
+        .unwrap();
+        let _env = AppConfigEnvGuard::set(Some(&override_path));
+
+        let alpha = Config::load_for_paths(None, &alpha_paths).unwrap();
+        let beta = Config::load_for_paths(None, &beta_paths).unwrap();
+        for config in [&alpha, &beta] {
+            assert_eq!(config.app.name, "global");
+            assert_eq!(config.indexing.max_file_size, 777);
+            assert_eq!(config.indexing.include, ["shared/**"]);
+            assert_eq!(config.indexing.exclude, ["private/**"]);
+        }
+
+        let _ = std::fs::remove_dir_all(alpha_project);
+        let _ = std::fs::remove_dir_all(beta_project);
+    }
+
+    #[test]
+    fn load_for_paths_ignores_legacy_project_and_cwd_configs() {
+        const CHILD_PROJECT: &str = "CODEGRAPH_CONFIG_CWD_CHILD_PROJECT";
+
+        if let Some(project) = std::env::var_os(CHILD_PROJECT) {
+            let paths = IndexPaths::resolve(Path::new(&project), None).unwrap();
+            let config = Config::load_for_paths(None, &paths).unwrap();
+            assert_eq!(config.app.name, "codegraph");
+            return;
+        }
+
+        let outer = temp_dir("scoped-no-legacy");
+        let project = outer.join("project");
+        std::fs::create_dir_all(project.join(".codegraph")).unwrap();
+        std::fs::write(
+            project.join(".codegraph/config.toml"),
+            "[app]\nname = \"legacy-project\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(outer.join(".codegraph")).unwrap();
+        std::fs::write(
+            outer.join(".codegraph/config.toml"),
+            "[app]\nname = \"legacy-cwd\"\n",
+        )
+        .unwrap();
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("config::tests::load_for_paths_ignores_legacy_project_and_cwd_configs")
+            .arg("--nocapture")
+            .current_dir(&outer)
+            .env(CHILD_PROJECT, &project)
+            .env_remove("APP_CONFIG")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let _ = std::fs::remove_dir_all(outer);
     }
 
     #[test]
@@ -567,6 +840,7 @@ ignore_paths = ["custom/gen*"]
     }
     #[test]
     fn init_and_get_config_share_the_global_singleton() {
+        let _env = AppConfigEnvGuard::unset();
         let dir = std::env::temp_dir().join(format!(
             "codegraph-config-init-{}-{}",
             std::process::id(),
