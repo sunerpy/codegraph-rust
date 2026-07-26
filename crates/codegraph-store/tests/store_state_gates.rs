@@ -122,16 +122,19 @@ fn create_database(paths: &IndexPaths, stamp: Option<&str>) {
 
 fn remove_sidecars(paths: &IndexPaths) {
     let db = paths.current_db();
-    for path in [
-        PathBuf::from(format!("{}-wal", db.display())),
-        PathBuf::from(format!("{}-shm", db.display())),
-    ] {
+    for path in [sqlite_sidecar(&db, "-wal"), sqlite_sidecar(&db, "-shm")] {
         match std::fs::remove_file(&path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => panic!("remove fixture sidecar {}: {error}", path.display()),
         }
     }
+}
+
+fn sqlite_sidecar(db: &Path, suffix: &str) -> PathBuf {
+    let mut path = db.as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
 }
 
 fn stage_current(project: &TempProject, stamp: Option<&str>) -> IndexPaths {
@@ -299,6 +302,202 @@ fn assert_snapshot_unchanged(
         .cloned()
         .collect::<BTreeSet<_>>();
     assert!(changed.is_empty(), "filesystem changed at {changed:?}");
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DatabaseObservation {
+    schema: Vec<(String, String, String, Option<String>)>,
+    schema_versions: Vec<(i64, i64, String)>,
+    project_metadata: Vec<(String, String, i64)>,
+}
+
+fn observe_database_without_touching_namespace(paths: &IndexPaths) -> DatabaseObservation {
+    let proof = TempProject::new("database-observation");
+    let copy = proof.path().join("observation.db");
+    let mut bytes = std::fs::read(paths.current_db()).unwrap_or_else(|error| {
+        panic!(
+            "read database observation source {}: {error}",
+            paths.current_db().display()
+        )
+    });
+    assert!(
+        bytes.len() >= 20 && bytes.starts_with(b"SQLite format 3\0"),
+        "database observation source is not a SQLite main file"
+    );
+    // A checkpointed WAL database keeps WAL format bytes in its main header.
+    // Normalize only this private copy so observation never asks SQLite's pager
+    // to inspect or author sidecars beside the authoritative database.
+    bytes[18] = 1;
+    bytes[19] = 1;
+    std::fs::write(&copy, bytes)
+        .unwrap_or_else(|error| panic!("write private database observation: {error}"));
+    let conn = Connection::open_with_flags(&copy, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open private database observation read-only");
+
+    let schema = conn
+        .prepare(
+            "SELECT type, name, tbl_name, sql FROM sqlite_schema \
+             ORDER BY type, name, tbl_name, sql",
+        )
+        .expect("prepare schema observation")
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .expect("query schema observation")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect schema observation");
+    let schema_versions = conn
+        .prepare(
+            "SELECT version, applied_at, description FROM schema_versions \
+             ORDER BY version, applied_at, description",
+        )
+        .expect("prepare schema-version observation")
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .expect("query schema-version observation")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect schema-version observation");
+    let project_metadata = conn
+        .prepare(
+            "SELECT key, value, updated_at FROM project_metadata \
+             ORDER BY key, value, updated_at",
+        )
+        .expect("prepare project-metadata observation")
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .expect("query project-metadata observation")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect project-metadata observation");
+
+    DatabaseObservation {
+        schema,
+        schema_versions,
+        project_metadata,
+    }
+}
+
+fn assert_read_open_did_not_mutate(
+    project: &TempProject,
+    paths: &IndexPaths,
+    before_tree: &BTreeMap<PathBuf, SnapshotKind>,
+    before_database: &DatabaseObservation,
+) {
+    for (label, path) in [
+        ("WAL", sqlite_sidecar(&paths.current_db(), "-wal")),
+        ("SHM", sqlite_sidecar(&paths.current_db(), "-shm")),
+    ] {
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => panic!(
+                "read/status open must not create a {label} sidecar at {}",
+                path.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("inspect {label} sidecar {}: {error}", path.display()),
+        }
+    }
+    assert_snapshot_unchanged(before_tree, &snapshot_tree(project.path()));
+    assert_eq!(
+        &observe_database_without_touching_namespace(paths),
+        before_database,
+        "read/status open changed SQLite schema or metadata rows"
+    );
+}
+
+#[test]
+fn read_and_status_open_are_sqlite_read_only_and_never_migrate() {
+    let project = TempProject::new("read-status-never-migrate");
+    let paths = stage_current(&project, Some(&CURRENT_EXTRACTION_VERSION.to_string()));
+    std::fs::write(
+        &paths.state_slots()[1],
+        wire_bytes(
+            0,
+            CURRENT_STORAGE_PROTOCOL,
+            CURRENT_EXTRACTION_VERSION,
+            "current",
+            paths.project_identity(),
+        ),
+    )
+    .expect("stage older valid Current state slot");
+
+    // Keep the physical schema at the latest shape but lower its recorded
+    // version. Any accidental call to the legacy migration path will insert a
+    // version-7 row and change both the logical and byte snapshots.
+    let conn = Connection::open_with_flags(paths.current_db(), OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .expect("open migration-canary fixture");
+    conn.execute(
+        "UPDATE schema_versions \
+         SET version = ?1, applied_at = ?2, description = ?3 \
+         WHERE version = ?4",
+        rusqlite::params![
+            codegraph_store::migrations::CURRENT_SCHEMA_VERSION - 1,
+            -7_i64,
+            "acceptance migration canary",
+            codegraph_store::migrations::CURRENT_SCHEMA_VERSION,
+        ],
+    )
+    .expect("stage migration-version canary");
+    conn.execute(
+        "INSERT INTO project_metadata (key, value, updated_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params!["acceptance_canary", "must-remain-byte-exact", -11_i64],
+    )
+    .expect("stage metadata-repair canary");
+    conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")
+        .expect("checkpoint migration-canary fixture");
+    drop(conn);
+    remove_sidecars(&paths);
+
+    let before_tree = snapshot_tree(project.path());
+    let before_database = observe_database_without_touching_namespace(&paths);
+    assert_eq!(
+        before_database.schema_versions.last(),
+        Some(&(
+            codegraph_store::migrations::CURRENT_SCHEMA_VERSION - 1,
+            -7,
+            "acceptance migration canary".to_string(),
+        )),
+        "fixture must be migration-eligible if a read path invokes maintenance"
+    );
+
+    let store = Store::open_for_read(&paths, deadline(), || false)
+        .expect("Current read accepts an intentionally migration-eligible schema");
+    assert_eq!(
+        store.schema_version().expect("observe canary version"),
+        codegraph_store::migrations::CURRENT_SCHEMA_VERSION - 1
+    );
+    assert_read_open_did_not_mutate(&project, &paths, &before_tree, &before_database);
+    drop(store);
+    assert_read_open_did_not_mutate(&project, &paths, &before_tree, &before_database);
+
+    let opened = Store::open_for_status(&paths, deadline(), || false)
+        .expect("Current status accepts an intentionally migration-eligible schema");
+    assert_eq!(opened.status, Some(ExtractionStatus::Current));
+    assert!(opened.store().is_some());
+    assert_read_open_did_not_mutate(&project, &paths, &before_tree, &before_database);
+    drop(opened);
+    assert_read_open_did_not_mutate(&project, &paths, &before_tree, &before_database);
+
+    for open in ["read", "status"] {
+        let mismatch = TempProject::new("read-status-stamp-mismatch");
+        let mismatch_paths = stage_current(&mismatch, Some("1"));
+        let before_tree = snapshot_tree(mismatch.path());
+        let before_database = observe_database_without_touching_namespace(&mismatch_paths);
+        let error = match open {
+            "read" => Store::open_for_read(&mismatch_paths, deadline(), || false)
+                .expect_err("Current/DB stamp mismatch rejects read"),
+            "status" => Store::open_for_status(&mismatch_paths, deadline(), || false)
+                .expect_err("Current/DB stamp mismatch rejects status"),
+            other => panic!("unknown acceptance open {other}"),
+        };
+        assert!(matches!(
+            error,
+            StoreError::InvalidExtractionStamp {
+                path,
+                issue: ExtractionStampIssue::Mismatch {
+                    expected: CURRENT_EXTRACTION_VERSION,
+                    found: 1,
+                },
+            } if path == mismatch_paths.current_db()
+        ));
+        assert_read_open_did_not_mutate(&mismatch, &mismatch_paths, &before_tree, &before_database);
+    }
 }
 
 #[test]
