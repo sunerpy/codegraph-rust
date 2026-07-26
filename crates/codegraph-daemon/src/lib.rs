@@ -567,7 +567,10 @@ fn start_project_watcher(
     watch_options.on_sync_complete =
         Some(Arc::new(move |outcome: codegraph_watch::SyncOutcome| {
             let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
-            let tail = changed_paths_tail(&outcome.changed_paths);
+            // Report the watcher event batch even when startup catch-up won the
+            // writer lease and already indexed it. `changed_paths` deliberately
+            // remains the set this particular sync actually mutated.
+            let tail = changed_paths_tail(&outcome.trigger_paths);
             // The subscriber prepends the RFC3339 timestamp; this daemon's stderr
             // is redirected to `.codegraph/daemon.log`, so events land there timed.
             info!(

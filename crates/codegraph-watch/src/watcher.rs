@@ -587,10 +587,15 @@ fn event_loop(ctx: EventLoopCtx) {
                 let paths = pending.keys().cloned().collect::<Vec<_>>();
                 pending.clear();
                 deadline = None;
-                let attempt = run_sync_with_backoff(&sync_fn, paths);
+                let attempt = run_sync_with_backoff(&sync_fn, paths.clone());
                 let decision = classify_persistent_failure(&attempt, &mut consecutive_sync_errors);
                 match attempt {
                     SyncAttempt::Done(outcome) => {
+                        // Preserve the event batch independently of actual DB
+                        // mutations. Startup catch-up can win the writer lease and
+                        // index the same file first; the watcher still handled this
+                        // event and its callback must be able to report that fact.
+                        let outcome = with_trigger_paths(outcome, paths);
                         if let Some(callback) = &on_sync_complete {
                             callback(outcome);
                         }
@@ -616,6 +621,11 @@ fn event_loop(ctx: EventLoopCtx) {
             }
         }
     }
+}
+
+fn with_trigger_paths(mut outcome: SyncOutcome, trigger_paths: Vec<String>) -> SyncOutcome {
+    outcome.trigger_paths = trigger_paths;
+    outcome
 }
 
 /// Apply the EMFILE/ENFILE → degrade-once, ENOSPC → warn classification to a
@@ -778,6 +788,21 @@ mod tests {
     use super::*;
     use std::fs;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn noop_watcher_completion_preserves_trigger_paths() {
+        let outcome = with_trigger_paths(
+            SyncOutcome::default(),
+            vec!["src/brand_new_symbol.ts".to_string()],
+        );
+
+        assert_eq!(outcome.files_reindexed, 0);
+        assert!(outcome.changed_paths.is_empty());
+        assert_eq!(
+            outcome.trigger_paths,
+            vec!["src/brand_new_symbol.ts".to_string()]
+        );
+    }
 
     #[test]
     fn rapid_save_burst_triggers_exactly_one_reindex() {

@@ -30,6 +30,11 @@ pub struct SyncOutcome {
     /// Reindexed or removed paths this sync, root-relative and SORTED — the
     /// source set is a `HashSet`, so sorting is required for a stable log line.
     pub changed_paths: Vec<String>,
+    /// Root-relative paths that triggered a watcher sync, sorted and deduplicated
+    /// by the watcher. Empty for direct/full sync callers. Unlike `changed_paths`,
+    /// this remains populated when another writer (for example startup catch-up)
+    /// indexed the same event first and this sync consequently skips it unchanged.
+    pub trigger_paths: Vec<String>,
 }
 
 pub fn sync_project_once(project_root: impl AsRef<Path>) -> Result<SyncOutcome> {

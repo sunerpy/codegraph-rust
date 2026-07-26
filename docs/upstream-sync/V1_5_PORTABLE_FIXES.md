@@ -2273,3 +2273,64 @@ notepads; no LSP-clean claim is made when the request is rejected for being
 outside the request cwd. Native Windows runtime/crash coverage and portable
 atomic no-follow enumeration remain explicitly unclaimed, and the authoritative
 full locked CI gate remains the parent's.
+
+## Daemon watcher startup catch-up race correction (2026-07-26)
+
+The pre-existing `daemon_single_watcher_fires_once` timing failure was reproduced
+before any production edit with the exact focused target. Its first daemon event
+was `watcher sync #1: 0 file(s) reindexed, 0 removed`, and the unchanged test then
+failed because that line did not name `brand_new_symbol.ts`. A diagnostic-only
+assertion-message expansion, which merely rebuilt the test binary, made the same
+target pass; this timing switch confirmed a startup-order race rather than an
+extraction defect.
+
+Source and call-path inspection proved the exact ordering: the daemon registers
+one shared `ProjectWatcher`, starts one full-project catch-up thread, and then
+accepts clients. Catch-up and a queued watcher event contend for the same
+exclusive writer. When catch-up wins, it indexes the new file first; the queued
+watcher sync subsequently sees identical content and correctly reports zero DB
+mutations. No second watcher exists, and the catch-up log is not the source of the
+failing `watcher sync` line.
+
+The correction preserves those two distinct facts. `SyncOutcome.changed_paths`
+still means paths actually reindexed or removed by that sync. A new sorted watcher
+event field, `trigger_paths`, records the exact debounced event batch even when a
+concurrent writer already applied the bytes. `event_loop` attaches that batch only
+to watcher completion outcomes, and the daemon's bounded filename tail now uses
+`trigger_paths`; reindexed/removed counters remain actual mutation counters.
+Direct/full sync callers retain an empty trigger set. The one-watcher topology,
+catch-up concurrency, immediate client handling, debounce, and `--no-watch`
+behavior are unchanged. A pure regression pins that a zero-mutation watcher
+completion still retains its trigger path; no sleep, retry-until-pass, assertion
+weakening, or test serialization was added.
+
+Validation was run once after the final implementation, with
+`bash scripts/check-workspace-versions.sh` first and `--locked` on every
+dependency-resolving Cargo command. The exact focused daemon test passed five
+consecutive runs; the complete `daemon_single_watcher` target passed 2/2,
+including `daemon_no_watch_does_not_autosync`. `codegraph-watch` passed 90 unit +
+2 integration tests, and `codegraph-daemon` passed all unit/integration targets.
+Workspace all-target `cargo check`, workspace all-target Clippy with
+`-D warnings`, `cargo fmt --all --check`, and `scripts/guardrail.sh` all passed.
+Changed-file LSP diagnostics were attempted for all three modified Rust files but
+the environment rejected the external worktree with `LSP file path must be inside
+request cwd`; the clean workspace Cargo check and Clippy are the recorded
+diagnostics fallback, not an LSP-clean claim. No dependency, schema, node-id
+formula, extraction/golden output, manifest, workspace version, or item-12
+process-lifecycle test was changed.
+
+### 2026-07-26 authoritative locked-CI closure
+
+After the complete item-12 acceptance and watcher correction bytes above were
+finalized and repository formatting was applied, the parent authoritative
+`bash scripts/check-workspace-versions.sh && make ci CARGO='cargo --locked'`
+completed successfully. That exact final-byte run passed fmt-check, workspace
+Clippy with `-D warnings`, the full workspace test suite including the Unix
+writer-process lifecycle and watcher/process targets, and the no-AI/vector/LLM
+guardrail. `Cargo.lock` remained frozen at SHA-256
+`750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`.
+Changed-file LSP diagnostics remain unavailable because this required external
+worktree is rejected with `LSP file path must be inside request cwd`; Cargo
+check, Clippy, tests, formatting, and the guardrail are the diagnostics fallback,
+not an LSP-clean claim. Native Windows runtime/crash validation remains
+unavailable and is not claimed.
