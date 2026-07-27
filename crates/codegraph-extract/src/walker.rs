@@ -2104,7 +2104,8 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 is_async: self.spec.is_async(node),
                 is_static: self.spec.is_static(node, self.source),
                 return_type: self.spec.get_return_type(node, self.source),
-                qualified_name: receiver_type.map(|receiver| format!("{receiver}::{name}")),
+                qualified_name: receiver_type
+                    .map(|receiver| self.compose_receiver_qualified_name(&receiver, &name)),
                 ..NodeExtra::default()
             },
         );
@@ -3557,6 +3558,37 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         self.spec
             .resolve_body(node, self.spec.body_field())
             .or_else(|| child_by_field(node, self.spec.body_field()))
+    }
+
+    /// Qualified name for a method defined out-of-line via a receiver qualifier
+    /// (`Type::method() {}`). The declarator spells the receiver RELATIVE to the
+    /// enclosing namespace, so the active C++ namespace prefix must compose in —
+    /// `namespace sim { Output ManifestStartup::Apply() {} }` otherwise indexes as
+    /// `ManifestStartup::Apply` while its own class node carries
+    /// `sim::ManifestStartup`, and qualified call sites never resolve (#1310).
+    ///
+    /// The source may legally re-spell part or all of the namespace path
+    /// (`namespace sim { void sim::M::f() {} }`), so the receiver is anchored at
+    /// the first prefix segment it names: everything before that anchor comes
+    /// from the prefix, the receiver supplies the rest. `namespace_prefix` is only
+    /// ever non-empty for C++, so every other receiver language (Go, Rust,
+    /// Kotlin, Lua) passes through unchanged.
+    fn compose_receiver_qualified_name(&self, receiver: &str, name: &str) -> String {
+        let base = format!("{receiver}::{name}");
+        if self.namespace_prefix.is_empty() {
+            return base;
+        }
+        let receiver_head = receiver.split("::").next().unwrap_or(receiver);
+        let anchor = self
+            .namespace_prefix
+            .iter()
+            .position(|segment| segment == receiver_head);
+        let prefix = &self.namespace_prefix[..anchor.unwrap_or(self.namespace_prefix.len())];
+        if prefix.is_empty() {
+            base
+        } else {
+            format!("{}::{base}", prefix.join("::"))
+        }
     }
 
     fn build_qualified_name(&self, name: &str) -> String {
@@ -5900,6 +5932,80 @@ WINAPI HRESULT DoThing(int x) { return x; }
         let (nodes, _) = run("anon.cpp", src, Language::Cpp);
         let f = node(&nodes, NodeKind::Function, "f");
         assert_eq!(f.qualified_name, "f");
+    }
+
+    // ---- Batch B3: namespaced out-of-line methods (upstream e437918) ----
+
+    #[test]
+    fn cpp_out_of_line_method_in_namespace_carries_namespace_prefix() {
+        let src = concat!(
+            "namespace simulator {\n",
+            "class ManifestStartup {\n",
+            "public:\n",
+            "    struct Input { int x; };\n",
+            "    struct Output { int y; };\n",
+            "    static Output Apply(const Input& input);\n",
+            "};\n",
+            "ManifestStartup::Output ManifestStartup::Apply(const Input& input) { return {}; }\n",
+            "}\n"
+        );
+        let (nodes, _) = run("manifest_startup.cpp", src, Language::Cpp);
+        let class = node(&nodes, NodeKind::Class, "ManifestStartup");
+        assert_eq!(class.qualified_name, "simulator::ManifestStartup");
+        let apply_qns: Vec<&str> = nodes
+            .iter()
+            .filter(|n| n.name == "Apply")
+            .map(|n| n.qualified_name.as_str())
+            .collect();
+        assert!(
+            apply_qns.contains(&"simulator::ManifestStartup::Apply"),
+            "the out-of-line definition must carry the namespace prefix, got: {apply_qns:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_receiver_that_respells_the_namespace_is_not_double_prefixed() {
+        let src = concat!(
+            "namespace sim {\n",
+            "class M { public: static void f(); static void g(); };\n",
+            "void sim::M::f() {}\n",
+            "void M::g() {}\n",
+            "}\n",
+            "void sim::M::f2() {}\n"
+        );
+        let (nodes, _) = run("m.cpp", src, Language::Cpp);
+        let qns: Vec<&str> = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Method)
+            .map(|n| n.qualified_name.as_str())
+            .collect();
+        for want in ["sim::M::f", "sim::M::g", "sim::M::f2"] {
+            assert!(
+                qns.contains(&want),
+                "missing `{want}` among method qualified names: {qns:?}"
+            );
+        }
+        assert!(
+            !qns.iter().any(|q| q.contains("sim::sim")),
+            "a re-spelled namespace must not be double-prefixed, got: {qns:?}"
+        );
+    }
+
+    #[test]
+    fn go_receiver_method_qualified_name_unaffected_by_namespace_composition() {
+        let src = concat!(
+            "package main\n",
+            "\n",
+            "type Server struct{}\n",
+            "\n",
+            "func (s *Server) Start() {}\n"
+        );
+        let (nodes, _) = run("srv.go", src, Language::Go);
+        let start = nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Method && n.name == "Start")
+            .expect("Start method");
+        assert_eq!(start.qualified_name, "Server::Start");
     }
 
     // ---- Batch B2: out-of-line template method receivers (upstream 4dd29ea) ----

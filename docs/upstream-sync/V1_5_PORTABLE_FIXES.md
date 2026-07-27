@@ -3753,3 +3753,85 @@ codegraph-bench` → exit 0, **1382 passed across 35 test binaries, 0 failed**,
 `lsp_diagnostics` remains unusable in this worktree (`LSP file path must be inside
 request cwd`), so locked Cargo is the fallback; no LSP-clean claim is made. No
 dependency, version or `Cargo.lock` byte changed.
+
+## Batch B3 — compose namespace prefix into out-of-line method qualified names (2026-07-28)
+
+Ports upstream `e437918` (`fix(cpp): compose namespace prefix into out-of-line
+method qualified names`, upstream #1310 / issue #1291). Behavior only.
+
+### Red (documented, with the actual wrong output)
+
+Two new C++ `#[test]`s plus one cross-language control in
+`crates/codegraph-extract/src/walker.rs` drive the REAL extraction path
+(`extract_source` → `Walker::extract_method` → the `receiver_type` →
+`qualified_name` composition). `cargo test --locked -p codegraph-extract --lib --
+cpp_out_of_line_method_in_namespace cpp_receiver_that_respells
+go_receiver_method_qualified` → **2 failed, 1 passed**:
+
+| assertion                                                                  | expected                                      | ACTUAL on pre-change bytes                                                                                        |
+| -------------------------------------------------------------------------- | --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `namespace simulator { … ManifestStartup::Apply(...) {} }`                 | `simulator::ManifestStartup::Apply`           | `["ManifestStartup::Apply"]` — the class node meanwhile carried `simulator::ManifestStartup`, so the two DIVERGED |
+| `namespace sim { void sim::M::f(){} void M::g(){} }` + global `sim::M::f2` | all of `sim::M::f`, `sim::M::g`, `sim::M::f2` | `["sim::M::f", "M::g", "sim::M::f2"]` — the RELATIVE form `M::g` lost its namespace                               |
+
+`go_receiver_method_qualified_name_unaffected_by_namespace_composition` (Go
+`func (s *Server) Start()` → `Server::Start`) passed pre-change and is the
+cross-language non-regression control, not a Red.
+
+### Green (minimal)
+
+New `Walker::compose_receiver_qualified_name(receiver, name)` in
+`crates/codegraph-extract/src/walker.rs`, called from the ONE
+`qualified_name: receiver_type.map(...)` site in `extract_method`. It prepends the
+active `namespace_prefix`, anchored at the first prefix segment the receiver
+re-spells, so `namespace sim { void sim::M::f() {} }` yields `sim::M::f` and never
+`sim::sim::M::f`. `namespace_prefix` is pushed only by `visit_cpp_node`, so it is
+empty for every other language and Go/Rust/Kotlin/Lua receivers pass through the
+identical `{receiver}::{name}` string.
+
+### Negative control, executed
+
+The single call site was reverted in place to the old
+`receiver_type.map(|receiver| format!("{receiver}::{name}"))` and BOTH C++ tests
+went RED again on the same wrong values while the Go control stayed green; the
+file was then restored and re-proved as SHA-256
+`2b7e3601743ed319d09a61a73f05246d5a17fa4b3b269bf389e190d0428990ab`, the
+pre-mutation hash.
+
+### Golden row delta (`reference/golden/cpp/`, additions only)
+
+Two new fixture files —
+`crates/codegraph-bench/fixtures/cpp/namespaced_member.hpp` (the namespaced class
+declaration) and `namespaced_member.cpp` (the out-of-line definition inside the
+same namespace block plus a fully-qualified call from OUTSIDE it). `git diff
+--numstat reference/golden/` showed ONLY `cpp/` paths: `files.json +16/-0`,
+`nodes.json +132/-0`, `edges.json +60/-0`, `colby.db` binary; `refs.json` and
+`schema.sql` byte-identical. Deleted-line count across the three JSON files:
+**0**.
+
+Added rows: 6 nodes — `file namespaced_member.hpp`, `class
+simulator::ManifestStartup` @4; `file namespaced_member.cpp`, its
+`import namespaced_member.hpp`, `method simulator::ManifestStartup::Apply` @4,
+`function run_manifest` @9 — and 6 edges: the `imports` edge (`resolvedBy=import`,
+0.92), four `contains` edges, and the decisive
+`calls run_manifest → simulator::ManifestStartup::Apply` with
+`resolvedBy=qualified-name` at confidence 0.85. Before this change the method
+indexed as `ManifestStartup::Apply`, the fully-qualified call site matched
+nothing, and that `Calls` edge did not exist.
+
+### Verification (actual exit statuses)
+
+- `bash scripts/check-workspace-versions.sh` → exit 0, before every Cargo batch;
+  every Cargo command used `--locked`.
+- `cargo build --locked --release -p codegraph-rs` → exit 0.
+- `cargo test --locked -p codegraph-extract --lib -- cpp_out_of_line_method_in_namespace
+cpp_receiver_that_respells go_receiver_method_qualified` → exit 0, **3 passed**.
+- `cargo test --locked -p codegraph-extract -p codegraph-resolve -p
+codegraph-bench` → exit 0, **1385 passed across 35 test binaries, 0 failed**,
+  including `generated_golden_matches_committed_cpp_fixture`,
+  `cpp_db_is_self_equivalent_to_cpp_golden`, and the untouched godot / ruby /
+  mini oracles.
+- `git diff --numstat reference/golden/` → only `cpp/` paths.
+
+`lsp_diagnostics` remains unusable in this worktree (`LSP file path must be inside
+request cwd`); locked Cargo is the fallback. No dependency, version or
+`Cargo.lock` byte changed.

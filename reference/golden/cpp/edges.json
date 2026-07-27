@@ -24,6 +24,30 @@
     "target": "file:base.hpp"
   },
   {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.92,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:namespaced_member.cpp",
+    "target": "file:namespaced_member.hpp"
+  },
+  {
+    "col": 11,
+    "kind": "calls",
+    "line": 10,
+    "metadata": {
+      "confidence": 0.85,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "function:87a31607b9531ae0a01b03caf6c870aa",
+    "target": "method:88f7e34ca2546972a11cca7ec68db568"
+  },
+  {
     "col": 11,
     "kind": "calls",
     "line": 13,
@@ -373,6 +397,42 @@
     "provenance": null,
     "source": "file:namespaced.cpp",
     "target": "import:d427e262bde770416cf520f12c124a85"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:namespaced_member.cpp",
+    "target": "function:87a31607b9531ae0a01b03caf6c870aa"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:namespaced_member.cpp",
+    "target": "import:eb20b34eecdb66508650588ab6131af3"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:namespaced_member.cpp",
+    "target": "method:88f7e34ca2546972a11cca7ec68db568"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:namespaced_member.hpp",
+    "target": "class:2e7e24e7488b3868c5b2924a018549c9"
   },
   {
     "col": null,

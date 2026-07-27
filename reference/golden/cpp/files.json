@@ -24,6 +24,22 @@
     "size": 102
   },
   {
+    "content_hash": "e4419194da0741856b7b23dbc977893cdfda9a926201018b685dce64efbd1f30",
+    "errors": null,
+    "language": "cpp",
+    "node_count": 4,
+    "path": "namespaced_member.cpp",
+    "size": 191
+  },
+  {
+    "content_hash": "3d4b5ad9e00d6934eea58bd6707b171b7a335458df91499966798385a5d09ad7",
+    "errors": null,
+    "language": "cpp",
+    "node_count": 2,
+    "path": "namespaced_member.hpp",
+    "size": 106
+  },
+  {
     "content_hash": "61ac8b93b7094d0633203791513f3394c7f76e2993a50d75b9f8e32454dcccf6",
     "errors": null,
     "language": "cpp",
