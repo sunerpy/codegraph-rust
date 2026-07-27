@@ -60,6 +60,13 @@ pub enum StoreWritePurpose {
     /// continuation. Only `Current`, recoverable `Building`, or
     /// `Uninitialized` may issue this capability.
     UninitContinuation,
+    /// Fold a PREVIOUS owner's un-checkpointed write-ahead log back into the
+    /// main database file of an otherwise fully corroborated `Current`
+    /// namespace, so the sidecar-free artifact shape the read gate requires is
+    /// restored instead of the namespace staying permanently unreadable. Only
+    /// [`Store::recover_stale_current_sidecars`] issues this purpose, and only
+    /// `Current` may authorize it.
+    StaleSidecarRecovery,
 }
 
 impl std::fmt::Display for StoreWritePurpose {
@@ -69,6 +76,7 @@ impl std::fmt::Display for StoreWritePurpose {
             Self::FullRebuild => "full rebuild",
             Self::IncrementalSync => "incremental sync",
             Self::UninitContinuation => "uninit continuation",
+            Self::StaleSidecarRecovery => "stale sidecar recovery",
         })
     }
 }
@@ -236,6 +244,14 @@ pub enum StoreError {
         path: PathBuf,
         #[source]
         source: rusqlite::Error,
+    },
+    #[error("write-ahead log {path} still holds {remaining} bytes after a truncating checkpoint")]
+    WalNotFolded { path: PathBuf, remaining: u64 },
+    #[error("failed to remove the checkpointed SQLite sidecar {path}: {source}")]
+    RemoveSidecar {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
     },
     #[error("failed to stamp extraction version in SQLite database {path}: {source}")]
     StampExtractionVersion {
@@ -452,18 +468,26 @@ impl Store {
         }
 
         match purpose {
-            StoreWritePurpose::CurrentMutation | StoreWritePurpose::IncrementalSync
+            StoreWritePurpose::CurrentMutation
+            | StoreWritePurpose::IncrementalSync
+            | StoreWritePurpose::StaleSidecarRecovery
                 if status == ExtractionStatus::Current =>
             {
                 // Corroborate through a separate read-only/no-create handle before
                 // any write-capable setup can alter pragmas or sidecars. An
                 // incremental sync tolerates a live reader's sidecars (see
                 // `corroborate_current_database_options`); the stamp still comes
-                // from the checkpointed main-file bytes.
+                // from the checkpointed main-file bytes. Stale-sidecar recovery
+                // exists precisely BECAUSE sidecars are present, so it tolerates
+                // them for the same reason — and folds them away afterwards.
                 let (corroboration, source_conn) = corroborate_current_database_options(
                     paths,
                     false,
-                    purpose == StoreWritePurpose::IncrementalSync,
+                    matches!(
+                        purpose,
+                        StoreWritePurpose::IncrementalSync
+                            | StoreWritePurpose::StaleSidecarRecovery
+                    ),
                 )?;
                 drop(corroboration);
                 drop(source_conn);
@@ -609,6 +633,70 @@ impl Store {
             guarded_paths: Some(paths.clone()),
             lease: Some(lease.clone()),
         })
+    }
+
+    /// Fold a DEAD previous owner's leftover write-ahead log back into the main
+    /// database file of an otherwise fully corroborated `Current` namespace and
+    /// remove the checkpointed `-wal`/`-shm` sidecars, so the sidecar-free
+    /// artifact shape [`Self::open_for_read`] requires is restored.
+    ///
+    /// A daemon SIGKILLed with an open SQLite connection leaves un-checkpointed
+    /// `-wal`/`-shm` behind. The read gate then refuses the namespace forever,
+    /// which is correct as a READ contract but leaves recovery impossible
+    /// without `codegraph init`. This is that recovery, and it never relaxes the
+    /// read gate: the fold happens under the ONE outer exclusive lease, the
+    /// `Current` contract (tombstone absence, database presence, exact
+    /// main-file extraction stamp) is corroborated first, and the caller then
+    /// re-enters the UNCHANGED strict read path.
+    ///
+    /// Reports `Ok(false)` — touching nothing — when there is nothing to
+    /// recover (no sidecar), when the namespace is not a tombstone-free
+    /// `Current`, or when the bounded exclusive acquisition loses to a LIVE
+    /// holder (a running daemon or a long-lived MCP reader legitimately owns
+    /// those sidecars). Callers must additionally prove the previous RENDEZVOUS
+    /// owner is not alive before calling: the lease excludes concurrent
+    /// cooperating writers, not a live daemon that is merely idle.
+    ///
+    /// A leftover rollback `-journal` is deliberately NOT unlinked here: the
+    /// write-capable open below is what lets SQLite itself replay and retire a
+    /// hot journal, and unlinking one by hand would discard committed pages.
+    /// `-shm` carries no durable content (it is a derived shared-memory index),
+    /// so it is removed once the log is proven folded.
+    pub fn recover_stale_current_sidecars(
+        paths: &IndexPaths,
+        deadline: Instant,
+        cancelled: impl FnMut() -> bool,
+    ) -> Result<bool> {
+        if Self::extraction_status(paths) != ExtractionStatus::Current {
+            return Ok(false);
+        }
+        if artifact_exists(&paths.tombstone())? {
+            return Ok(false);
+        }
+        if first_existing_database_sidecar(paths)?.is_none() {
+            return Ok(false);
+        }
+        let lease = match IndexLease::acquire_exclusive_existing(paths, deadline, cancelled) {
+            Ok(lease) => lease,
+            Err(IndexLeaseError::TimedOut { .. } | IndexLeaseError::Cancelled { .. }) => {
+                return Ok(false);
+            }
+            Err(error) => return Err(StoreError::Lease(error)),
+        };
+        let store = match Self::open_for_write(
+            paths,
+            lease.clone(),
+            StoreWritePurpose::StaleSidecarRecovery,
+        )? {
+            StoreWriteOpen::Current(store) => store,
+            other => {
+                unreachable!("stale sidecar recovery returned unexpected Store open: {other:?}")
+            }
+        };
+        store.finish_current_mutation()?;
+        remove_checkpointed_sidecars(paths, &lease)?;
+        drop(lease);
+        Ok(true)
     }
 
     /// Explicit fallible completion of ONE state-gated incremental mutation of a
@@ -932,6 +1020,55 @@ fn first_existing_database_artifact(paths: &IndexPaths) -> Result<Option<PathBuf
         }
     }
     Ok(None)
+}
+
+/// Remove the `-wal`/`-shm` pair AFTER the log is proven folded into the main
+/// file. A closing SQLite connection normally unlinks both itself, so this is
+/// usually a no-op; it exists so the post-recovery artifact shape is guaranteed
+/// rather than dependent on SQLite's cleanup succeeding.
+///
+/// A `-wal` that still carries bytes is refused instead of deleted: deleting an
+/// un-checkpointed log discards committed transactions.
+fn remove_checkpointed_sidecars(paths: &IndexPaths, lease: &IndexLease) -> Result<()> {
+    let db = paths.current_db();
+    let wal = database_sidecar_path(&db, "-wal");
+    if let Some(remaining) = artifact_len(&wal)?
+        && remaining > 0
+    {
+        return Err(StoreError::WalNotFolded {
+            path: wal,
+            remaining,
+        });
+    }
+    for path in [wal, database_sidecar_path(&db, "-shm")] {
+        lease.validate_exclusive(paths)?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(StoreError::RemoveSidecar { path, source }),
+        }
+    }
+    Ok(())
+}
+
+/// Append SQLite's sidecar suffix to the native database pathname without a
+/// Unicode rendering round-trip, so both Unix byte paths and Windows wide paths
+/// stay lossless.
+fn database_sidecar_path(db: &Path, suffix: &str) -> PathBuf {
+    let mut native = db.as_os_str().to_os_string();
+    native.push(suffix);
+    PathBuf::from(native)
+}
+
+fn artifact_len(path: &Path) -> Result<Option<u64>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata.len())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(StoreError::InspectArtifact {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 fn first_existing_database_sidecar(paths: &IndexPaths) -> Result<Option<PathBuf>> {

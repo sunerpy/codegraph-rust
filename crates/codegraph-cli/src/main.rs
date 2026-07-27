@@ -1176,8 +1176,83 @@ fn cmd_uninit(path: Option<PathBuf>, force: bool) -> Result<()> {
 /// The returned `Store` OWNS that same lease, so retaining it across pid/socket
 /// publication requires no second acquisition: there is no nested lock and no
 /// window between validation and publication for another writer to reclassify.
+/// Bounded budget for the ONE exclusive acquisition of the stale-sidecar
+/// recovery attempted before the strict startup read gate.
+///
+/// Deliberately much shorter than [`REBUILD_LEASE_TIMEOUT`]: this acquisition is
+/// a best-effort repair on the latency-critical daemon-startup path, and the ONLY
+/// legitimate reason it cannot be taken is that another cooperating holder (a
+/// live reader or writer) owns the namespace — in which case there is nothing to
+/// recover and startup must proceed to its unchanged verdict immediately instead
+/// of stalling behind a long-lived MCP reader's shared lease.
+const STALE_SIDECAR_RECOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Whether this project's PREVIOUS rendezvous owner may still be running.
+///
+/// Read-only by construction: unlike `clear_stale_daemon_lock`, which removes a
+/// stale record as a side effect, the startup gate must only OBSERVE liveness —
+/// the record is the single-instance exclusion `try_acquire_daemon_lock` claims
+/// moments later, so removing it here would open a double-start window.
+///
+/// Fail-closed: an unreadable or empty pid record is reported as LIVE. An empty
+/// record is an in-flight `create_new` placeholder whose rename has not landed,
+/// exactly as the daemon lock layer already treats it.
+fn previous_daemon_owner_may_be_live(project_root: &Path) -> bool {
+    let Ok(pid_path) = codegraph_daemon::daemon_pid_path(project_root) else {
+        return true;
+    };
+    match std::fs::read_to_string(&pid_path) {
+        Ok(raw) => match codegraph_daemon::decode_lock_info(&raw) {
+            Some(info) => info.pid > 0 && codegraph_daemon::is_process_alive(info.pid),
+            None => true,
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
+/// Recover a provably dead previous owner's leftover `-wal`/`-shm` before the
+/// strict gate runs.
+///
+/// A daemon killed with an open SQLite connection leaves an un-checkpointed
+/// write-ahead log behind, and the sidecar-freedom clause of the `Current` read
+/// contract then refuses EVERY later daemon start until `codegraph init` is
+/// re-run. The remedy is recovery, not permission: fold that log back into the
+/// main database under an exclusive lease and delete the checkpointed sidecars,
+/// then let the UNCHANGED gate decide. Nothing is relaxed — the gate below still
+/// demands sidecar-freedom, and a namespace this repair cannot fix is still
+/// refused.
+///
+/// Both guards must hold: the rendezvous owner is provably not alive AND the
+/// exclusive lease is obtainable within a short bound, so a live daemon's or a
+/// live MCP reader's sidecars are never folded underneath them. A failure here is
+/// swallowed to a log line: recovery is opportunistic, and the authoritative
+/// verdict is always the gate's.
+fn recover_dead_owner_sidecars(paths: &codegraph_core::IndexPaths, project_root: &Path) {
+    if previous_daemon_owner_may_be_live(project_root) {
+        return;
+    }
+    match Store::recover_stale_current_sidecars(
+        paths,
+        std::time::Instant::now() + STALE_SIDECAR_RECOVERY_TIMEOUT,
+        || false,
+    ) {
+        Ok(true) => tracing::info!(
+            project = %project_root.display(),
+            "folded a dead daemon's leftover write-ahead log back into the index"
+        ),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            project = %project_root.display(),
+            "could not recover leftover SQLite sidecars; the startup gate decides"
+        ),
+    }
+}
+
 fn authorize_daemon_startup(project_root: &Path) -> Result<codegraph_daemon::StartupAuthorization> {
     let paths = index_paths(project_root)?;
+    recover_dead_owner_sidecars(&paths, project_root);
     match Store::open_for_read(
         &paths,
         std::time::Instant::now() + REBUILD_LEASE_TIMEOUT,

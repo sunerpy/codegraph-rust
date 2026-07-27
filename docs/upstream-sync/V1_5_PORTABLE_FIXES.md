@@ -3393,3 +3393,178 @@ Windows/MSVC runtime is unavailable on this host and nothing about it is claimed
 dependency, version, `Cargo.lock`, schema, node-ID, golden, state-protocol, or
 permanent-index-lifecycle byte changed; `Cargo.lock` remains SHA-256
 `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`.
+
+## The killed-daemon sidecar defect — RECOVERY, not relaxation (2026-07-28)
+
+This closes the item the section above left explicitly OPEN: "whether the right answer is
+a sidecar-tolerant startup read, a checkpoint-and-clear on startup, or a narrower
+recovery path is undecided". The answer is checkpoint-and-clear under proven-dead
+ownership. The strict read gate is unchanged.
+
+### Confirmed Red, and a correction to the measured failure rate
+
+The orchestrator recorded 7 PASS / 1 FAIL over 8 locked runs of
+`spawn_detached_daemon_twice_no_stale_deadlock`. That was re-measured on this host before
+any code changed and **did NOT reproduce: 28 of 28 consecutive locked runs passed**
+(`cargo test --locked -p codegraph-rs --test daemon_spawn
+spawn_detached_daemon_twice_no_stale_deadlock -- --exact`, exit 0 each time). Running one
+test by name serializes what the earlier whole-file runs raced, and the residue survives
+only when the SIGKILL lands while a connection is open — so the earlier 3-in-10 and
+1-in-8 figures and this 0-in-28 are all consistent, and the honest statement is that the
+end-to-end test is an UNRELIABLE detector of this defect, not that the defect is absent.
+
+So the defect was instead confirmed DIRECTLY against the production daemon-start path,
+which is deterministic. A real `codegraph init` project was given a genuinely
+un-checkpointed log by a child process that opened the DB, set `wal_autocheckpoint=0`,
+committed one `project_metadata` row, and died without closing SQLite — leaving
+`codegraph.db-wal` at **8272 bytes** and `codegraph.db-shm` at **32768 bytes**. Running the
+real gate over it (`CODEGRAPH_DAEMON_INTERNAL=1 codegraph serve --mcp --path …`) refused
+verbatim:
+
+`Error: running as detached MCP daemon: refusing to start a daemon for …: Current index
+state has an unexpected SQLite sidecar at …/.codegraph-v2/codegraph.db-wal; index state is
+current and its uninitialized tombstone is absent. No daemon pid, socket, or log was
+published. Run `codegraph init` to rebuild.`
+
+That is the same refusal, reproduced 100% of the time, from residue that is a real dead
+writer's rather than a zero-byte placeholder.
+
+### Root cause
+
+`Store::open_for_read`'s `Current` contract requires sidecar-freedom, which is correct as
+a READ contract — the rebuild finalizer checkpoints and closes before publishing
+`Current`, so a reappeared `-wal` means something wrote outside the state protocol. But a
+SIGKILLed daemon's residue is indistinguishable from that at the artifact level, and the
+gate offered no way back: every later start was refused until `codegraph init` rebuilt the
+namespace, discarding the whole index over a recoverable log.
+
+### The fix, and why recovery beat relaxing the read gate
+
+`f691415` relaxed the gate (`open_for_daemon_startup` = read + `allow_live_sidecar`).
+That makes the daemon read a namespace whose main-file bytes are NOT the whole truth: the
+`-wal` may hold committed pages the deserialized main-file image cannot see, so the daemon
+would serve a silently stale graph, and the residue would persist indefinitely. Recovery
+instead makes the artifact shape match the contract, so the daemon reads through the
+identical strict path afterwards and the residue is gone for good.
+
+New `Store::recover_stale_current_sidecars(paths, deadline, cancelled) -> Result<bool>`
+(`crates/codegraph-store/src/connection.rs`):
+
+1. Refuses unless the state is `Current` and the tombstone is ABSENT — checked before any
+   lease, so a tombstoned or non-`Current` namespace is never touched.
+2. Reports `Ok(false)` immediately when no `-wal`/`-shm` exists (nothing to recover).
+3. Acquires the ONE outer EXCLUSIVE lease via the existing
+   `IndexLease::acquire_exclusive_existing`. A timeout or cancellation is `Ok(false)`,
+   not an error: a live holder means startup proceeds to its unchanged verdict.
+4. Opens through `Store::open_for_write` under a NEW narrow purpose
+   `StoreWritePurpose::StaleSidecarRecovery`, which corroborates the full `Current`
+   contract (tombstone, DB presence, exact main-file extraction stamp) and tolerates the
+   sidecars only because their presence is the reason it was called.
+   `StoreWritePurpose::IncrementalSync` was deliberately NOT reused: its semantics are
+   "one incremental sync", including escalation to a full rebuild for
+   `Missing`/`Outdated`/`Building`, none of which this repair may ever do.
+5. Calls the existing `finish_current_mutation` (`wal_checkpoint(TRUNCATE)` then an
+   explicit `close`), then `remove_checkpointed_sidecars`, which REFUSES with the new
+   `StoreError::WalNotFolded` if `-wal` still carries bytes. A non-empty log is never
+   unlinked; `-shm` is removed only after the log is proven folded, because it is derived
+   shared memory with no durable content. A leftover rollback `-journal` is left alone on
+   purpose — the write-capable open is what lets SQLite replay and retire a hot journal,
+   and hand-unlinking one discards committed pages.
+
+CLI side (`crates/codegraph-cli/src/main.rs`), before the UNCHANGED gate:
+
+- `previous_daemon_owner_may_be_live` is a READ-ONLY liveness predicate over the pid
+  record. `clear_stale_daemon_lock` was not reused because it REMOVES the record as a side
+  effect, and that record is the single-instance exclusion `try_acquire_daemon_lock`
+  claims moments later — removing it here would open a double-start window. Fail-closed:
+  a missing record is dead, an unreadable or EMPTY record is treated as LIVE (an empty
+  record is an in-flight `create_new` placeholder, matching the lock layer).
+- `recover_dead_owner_sidecars` runs the repair only when that predicate says dead, and
+  swallows any error to a `warn!`; the authoritative verdict is always the gate's.
+- `STALE_SIDECAR_RECOVERY_TIMEOUT = 500ms`, deliberately far below the 30s
+  `REBUILD_LEASE_TIMEOUT`. This is a best-effort repair on the latency-critical startup
+  path, and the only legitimate reason the exclusive lease is unavailable is that a live
+  cooperating holder owns the namespace — including a long-lived direct-mode MCP reader,
+  which holds a shared lease for its whole server lifetime and therefore blocks exclusive
+  acquisition on its own. In that case there is nothing to recover, so startup must reach
+  its normal verdict in half a second rather than stall for 30.
+- `crates/codegraph-daemon/src/lock.rs` is byte-for-byte untouched (SHA-256
+  `a14583b40c8695318f07552fc9633622fd4356581bec7c5ad16cfe89203814fe`), and nothing here
+  signals or kills any pid.
+
+`grep -rn "open_for_daemon_startup\|open_for_read_with_sidecar_policy" crates/` and
+`grep -rn "a_killed_daemons_live_sidecars" crates/` both return nothing (exit 1):
+`8c66848`'s revert stands, and no sidecar-tolerant READ path exists under any name.
+
+### New tests and the negative control
+
+`crates/codegraph-cli/tests/daemon_stale_wal_recovery.rs`:
+
+- `a_dead_owners_uncheckpointed_wal_is_recovered_on_daemon_startup` re-invokes the test
+  binary as a child that commits a row with `wal_autocheckpoint=0` and then `abort()`s, so
+  the residue is a REAL dead writer's. It asserts the `-wal` is NON-EMPTY before startup
+  and that the probe row is absent from a sidecar-free COPY of the main file, then drives
+  the production `spawn_detached_daemon` path and requires a published rendezvous. After
+  startup it re-reads that main-file-only copy and requires the probe row to be
+  PRESENT — proving the log was folded in, not discarded — and asserts the permanent lock
+  survives and the state is still `Current`.
+- `the_same_stale_residue_under_a_tombstone_is_still_refused` is the paired fail-closed
+  control: identical non-empty residue plus the tombstone still refuses, folds nothing
+  (the `-wal` is still non-empty afterwards), and publishes neither pid nor socket.
+
+Negative control, executed: the single `recover_dead_owner_sidecars` call site was
+disabled and the recovery test went RED on the real refusal text
+(`… unexpected SQLite sidecar at …/codegraph.db-wal`) while the tombstone control stayed
+green — so the test genuinely exercises the production path, not a helper. The call site
+was restored and `crates/codegraph-cli/src/main.rs` re-proved as SHA-256
+`3f745cf88dc30937adacf23341674974009a68861db016707fde1932e1736acf`, the pre-mutation
+hash.
+
+### Verification
+
+`bash scripts/check-workspace-versions.sh` was run before every Cargo batch (exit 0,
+workspace 0.40.4 across all 10 packages) and `--locked` was passed to every Cargo command.
+
+- `spawn_detached_daemon_twice_no_stale_deadlock`: **20 of 20** consecutive locked runs
+  green, zero failures (plus the 28 pre-change runs noted above).
+- `--test daemon_stale_wal_recovery`: 3/3 (both acceptances plus the child-process
+  helper).
+- `cargo clippy --locked --workspace --all-targets -- -D warnings`: exit 0.
+
+**Correction to the previous section's `make ci` statement.** That section said
+`make ci CARGO='cargo --locked'` is NOT reliably green over the reverted bytes, and it was
+right at `8c66848`: the sidecar defect was unfixed and the end-to-end test could hit it.
+That record stands as written for those bytes. Over THESE bytes the cause is removed —
+the daemon now recovers the residue instead of refusing forever — so the final gate's
+measured result is reported in the closeout summary for these exact committed bytes rather
+than inherited from that earlier measurement.
+
+Limitations. Changed-file LSP diagnostics were attempted on
+`crates/codegraph-store/src/connection.rs` and
+`crates/codegraph-cli/tests/daemon_stale_wal_recovery.rs`; both were refused with `LSP
+file path must be inside request cwd` (the worktree at
+`/config/workspace/ProdDir/AI/.cgworktrees/v15-impl` is outside the request cwd), so no
+LSP-clean result is claimed and locked Cargo build/Clippy/tests are the fallback. The new
+test file is `#![cfg(unix)]`: the child-abort WAL plant and the socket handshake are
+Unix-specific. On Windows the recovery itself is portable by inspection — it uses only
+`IndexLease`, SQLite pragmas, and `std::fs::remove_file`, and the sidecar paths are built
+with `OsString::push` so wide paths stay lossless — but native Windows/MSVC runtime is
+unavailable on this host and no Windows runtime claim is made. The remaining gap is that
+`spawn_detached_daemon_twice_no_stale_deadlock` stays a probabilistic detector of this
+defect; the deterministic coverage is the new file.
+
+A SEPARATE pre-existing intermittent failure was found while running the final gate and is
+recorded rather than left implicit: `make ci` failed once on
+`formatter_and_env_tests::install_completions_writes_zsh_fish_elvish_into_home`
+(`crates/codegraph-cli/src/main.rs:6209`, `assertion failed: elv.is_file()`).
+`cargo test --locked -p codegraph-rs --bin codegraph` reproduced it in **2 of 5** runs with
+these changes applied and in **4 of 8** runs with them fully STASHED away, i.e. on the
+untouched `8c66848` tree — so it is pre-existing and unrelated. It is an in-process
+`HOME`/`XDG_DATA_HOME` env race across `#[test]`s in the same binary; nothing here touches
+that code path, and no test was weakened, skipped, slept, or deleted over it. It is a
+known open item, not something this pass introduced or cured.
+
+No dependency, version, `Cargo.lock`,
+schema, node-ID, golden, state-protocol, or permanent-index-lifecycle byte changed;
+`Cargo.lock` remains SHA-256
+`750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`.
