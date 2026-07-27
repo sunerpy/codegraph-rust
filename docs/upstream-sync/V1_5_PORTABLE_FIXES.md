@@ -3138,3 +3138,116 @@ remains at SHA-256
 bytes are written BEFORE repository formatting and the one authoritative
 `bash scripts/check-workspace-versions.sh && make ci CARGO='cargo --locked'` run over
 these exact final bytes; no final Green is claimed until that gate passes.
+
+## Batch M item 20 correction — rendezvous cleanup ownership order (2026-07-27)
+
+Manual orchestrator review of the committed `df86a5a` found one remaining ownership
+race and rejected it. `cleanup_owned_rendezvous` called `cleanup_owned_lock` FIRST
+(which corroborates ownership and removes the pid record), then unlinked the socket.
+The published pid record IS the single-instance exclusion — `try_acquire_daemon_lock`
+claims it with `create_new` — so between those two operations the namespace was
+unowned: a replacement daemon could legitimately claim the record and bind the SAME
+socket path, and the departing process's later unlink then destroyed the LIVE
+daemon's socket while its record still advertised it. Every client would fail to
+attach with no artifact left to explain why.
+
+Correction: the order is inverted and ownership is re-corroborated at BOTH mutation
+boundaries. `cleanup_owned_rendezvous` now (1) corroborates that the record names
+this pid and LEAVES IT PUBLISHED, (2) unlinks the socket while that record still
+excludes every competing start, (3) removes the record only via `cleanup_owned_lock`,
+which re-reads ownership immediately before deleting. An owner mismatch observed on
+entry still preserves both the replacement record and its socket and reports `false`.
+No PID is signalled, no wait was introduced, and the permanent index lock, state
+slots, tombstone, and DB are never named by this path.
+
+Crash behavior is explicitly asymmetric and that asymmetry is why this order was
+chosen. A crash between (2) and (3) leaves a pid record naming a now-dead pid and no
+socket: a client's attach to the recorded socket fails fast (the bounded attach from
+Fix A, never a hang), and the next start clears the record through
+`clear_stale_daemon_lock` / `clear_stale_daemon_socket` because the recorded pid is
+provably not alive — self-healing residue. The old order's failure mode was the
+opposite and unrecoverable: a LIVE daemon with no socket, which nothing heals.
+
+Tests. A narrow, crate-local seam `cleanup_owned_rendezvous_with(..., checkpoint)`
+exposes the two boundaries (`OwnershipCorroborated`, `SocketRemoved`); production
+`cleanup_owned_rendezvous` passes a no-op, so no production behavior is conditional
+on a test. `a_replacement_start_at_the_cleanup_midpoint_keeps_its_own_rendezvous`
+drives a REAL `try_acquire_daemon_lock` from inside the callback at the former
+vulnerable midpoint — ordered by the call itself, with no sleep — and asserts the
+competing start is refused with `Taken { existing.pid == departing }`, that the
+socket is removed before the record, that the record is removed last, and that a
+second cleanup pass by the departed owner is refused after the replacement rebinds.
+`a_crash_between_cleanup_boundaries_leaves_only_self_healing_residue` asserts at the
+`SocketRemoved` boundary that the socket is gone while the record is STILL published,
+then proves `clear_stale_daemon_socket` clears that residue. The pre-existing
+`cleanup_owned_rendezvous_preserves_a_replacement_owners_record_and_socket`
+(mismatch-before-entry) is unchanged.
+
+Negative control, executed: reinstating the exact old pid-record-first body turns
+BOTH new tests red and nothing else — `a_replacement_start_...` fails with "a
+competing start must NOT be able to claim the record before the departing owner has
+finished unlinking its socket" (the competing `try_acquire` returned `Acquired`), and
+`a_crash_between_...` fails with "the record is STILL published as exclusion at this
+boundary". The corrected bytes were then restored exactly (`grep -c MUTANT` → 0) and
+the suite re-run 16/16.
+
+Verification, with `bash scripts/check-workspace-versions.sh` before every Cargo batch
+and `--locked` on every Cargo command: `codegraph-daemon` **100 unit + every
+integration suite green** (11 `test result: ok`, rc=0), `codegraph-rs`
+`batch_m_daemon_uninit_lifecycle` **3/3**, `cargo clippy --locked -p codegraph-daemon
+--all-targets -- -D warnings` clean, and the final authoritative
+`make ci CARGO='cargo --locked'` over these exact bytes.
+
+Limitations. Changed-file LSP diagnostics were attempted on
+`crates/codegraph-daemon/src/lock.rs` and refused again with
+`LSP file path must be inside request cwd` (external worktree); locked Cargo
+check/Clippy/tests are the fallback and no LSP-clean result is claimed. The race and
+its fix are exercised on the Unix filesystem-socket arm, which is where a socket path
+can be unlinked at all; Windows uses a namespaced pipe with no filesystem entry, so
+the `#[cfg(not(unix))]` arm removes nothing and only the record ordering applies —
+native Windows runtime was NOT executed and is not claimed. No dependency, version,
+`Cargo.lock`, schema, node-ID, golden, state-protocol, or permanent-index-lifecycle
+byte changed; `Cargo.lock` remains SHA-256
+`750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1` and the frozen
+plan is untouched at SHA-256
+`5b64aa335fb32cd228d98404c2e44153e9134d26a912ecb02d71fcf5c5798450`.
+
+### Same correction pass — the startup gate refused a killed daemon's live sidecars
+
+Verifying the cleanup fix surfaced a SECOND, independent defect introduced by
+`df86a5a`'s fifth correction. That correction routed `authorize_daemon_startup`
+through `Store::open_for_read`, whose `Current` contract demands a sidecar-FREE
+database. A daemon that is KILLED rather than closed leaves `-wal`/`-shm` behind on
+an otherwise untouched `Current` namespace, so every replacement start then failed
+with `Current index state has an unexpected SQLite sidecar at …/codegraph.db-wal`
+and published no rendezvous — exactly the recovery path `spawn_detached_daemon`
+exists for.
+
+This was NOT found by reading code. `make ci CARGO='cargo --locked'` failed on the
+pre-existing `spawn_detached_daemon_twice_no_stale_deadlock` (kill the first daemon,
+clear its stale artifacts, respawn) with "second daemon pid after respawn"; repeated
+`cargo test --locked -p codegraph-rs --test daemon_spawn` reproduced it in 2 of 6
+runs, and a hand-built repro confirmed the refusal message directly from a planted
+`codegraph.db-wal`. The intermittency is why it was mistaken for load flake earlier
+in this session: the sidecars survive only when the SIGKILL lands while a connection
+is open, so the same test passes whenever the kill happens to land between
+connections. That earlier "known flake" note was wrong, and this ledger corrects it.
+
+Fix: `Store::open_for_daemon_startup` — `open_for_read` with `allow_live_sidecar`,
+the SAME relaxation the incremental-sync writer and the uninit continuation already
+take, and for the same reason (the extraction stamp is read from the
+already-checkpointed MAIN-file bytes, so nothing about the version gate changes).
+Every other gate is untouched: owner-bound state slots, tombstone absence, DB
+presence, the exact stamp, and the retained shared lease held across pid/socket
+publication.
+
+New acceptance `a_killed_daemons_live_sidecars_do_not_block_a_replacement_start`
+plants both sidecars on a real indexed project, proves a replacement daemon
+publishes its v2 rendezvous, then — with those same sidecars still present — drains
+it via `uninit --force` and proves the now-tombstoned namespace is STILL refused.
+That second half is what shows the relaxation did not weaken the state contract.
+Negative control, executed: reverting the single call site to `Store::open_for_read`
+turns exactly this test red ("the daemon never published its v2 rendezvous at
+…/.codegraph-v2/daemon.pid") while the other three acceptances stay green; the
+corrected byte was then restored and the suite re-run 4/4. Repeated
+`--test daemon_spawn` is now 8/8 green where it was 4/6.

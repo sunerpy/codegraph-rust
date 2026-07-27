@@ -340,6 +340,58 @@ impl Store {
         open_current_read_only(paths, lease)
     }
 
+    /// The daemon-startup read gate: identical to [`Self::open_for_read`] except
+    /// that a LIVE SQLite sidecar is tolerated.
+    ///
+    /// `-wal`/`-shm` are legitimately present on an untouched `Current` namespace
+    /// whenever a long-lived reader holds a connection — the MCP engine does for a
+    /// whole request — and they SURVIVE a daemon that was killed rather than closed.
+    /// Demanding sidecar-freedom here would therefore refuse to start a replacement
+    /// daemon after any hard kill, which is precisely the recovery path
+    /// `spawn_detached_daemon` exists for. This is the same relaxation the
+    /// incremental-sync writer already takes (see
+    /// `corroborate_current_database_options`), and for the same reason: the
+    /// extraction stamp is still read from the already-checkpointed MAIN-file bytes,
+    /// so the version gate, tombstone gate, DB-presence gate, owner-bound state
+    /// slots, and the retained shared lease are all unchanged.
+    pub fn open_for_daemon_startup(
+        paths: &IndexPaths,
+        deadline: Instant,
+        cancelled: impl FnMut() -> bool,
+    ) -> Result<Self> {
+        Self::open_for_read_with_sidecar_policy(paths, deadline, cancelled, true)
+    }
+
+    fn open_for_read_with_sidecar_policy(
+        paths: &IndexPaths,
+        deadline: Instant,
+        cancelled: impl FnMut() -> bool,
+        allow_live_sidecar: bool,
+    ) -> Result<Self> {
+        let lease = match IndexLease::acquire_shared_existing(paths, deadline, cancelled) {
+            Ok(lease) => lease,
+            Err(IndexLeaseError::LockNotFound { .. }) => {
+                return Err(lockless_state_error(paths)?);
+            }
+            Err(error) => return Err(StoreError::Lease(error)),
+        };
+        let status = Self::extraction_status(paths);
+        reject_missing_database_artifacts(paths, &status)?;
+        if status != ExtractionStatus::Current {
+            return Err(StoreError::StateRejected { status });
+        }
+        let (conn, source_conn) =
+            corroborate_current_database_options(paths, false, allow_live_sidecar)?;
+        Ok(Store {
+            conn,
+            _source_conn: Some(source_conn),
+            path: paths.current_db(),
+            access: StoreAccess::StateRead,
+            guarded_paths: Some(paths.clone()),
+            lease: Some(lease),
+        })
+    }
+
     /// Probe status under a short shared lease. Contention is status data rather
     /// than an error and never opens SQLite. Non-Current states are reported
     /// without SQLite; Current is corroborated through [`Self::open_for_read`]'s

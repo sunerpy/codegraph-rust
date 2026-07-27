@@ -177,8 +177,13 @@ pub fn clear_stale_daemon_socket(project_root: &Path) -> bool {
     true
 }
 
+/// Whether the published pid record currently names `pid`.
+fn record_names(pid_path: &Path, pid: u32) -> bool {
+    read_lock_info_tolerant(pid_path).is_some_and(|info| info.pid == pid)
+}
+
 pub(crate) fn cleanup_owned_lock(pid_path: &Path, pid: u32) -> bool {
-    let owned = read_lock_info_tolerant(pid_path).is_some_and(|info| info.pid == pid);
+    let owned = record_names(pid_path, pid);
     if owned {
         let _ = fs::remove_file(pid_path);
     }
@@ -238,25 +243,60 @@ pub fn recorded_socket_path(project_root: &Path) -> Result<PathBuf> {
     }
 }
 
-/// Remove the rendezvous artifacts this daemon process itself published: its
-/// owner-bound pid record and, on Unix, its bound socket file.
+/// The two mutation boundaries of [`cleanup_owned_rendezvous`], exposed only so a
+/// test can drive a competing daemon start at an exact point with no timing
+/// assumption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RendezvousCleanupCheckpoint {
+    /// The pid record was just corroborated as ours and is STILL PUBLISHED. The
+    /// socket has not been touched.
+    OwnershipCorroborated,
+    /// Our socket is gone; the pid record is still published and still ours.
+    SocketRemoved,
+}
+
+/// Remove the rendezvous artifacts this daemon process itself published: on Unix
+/// its bound socket file, then its owner-bound pid record.
 ///
-/// Socket removal is CONDITIONAL on the pid record still naming this process. If
-/// the record was already replaced by a new owner (its own claim published a new
-/// record and rebound the same socket path), unlinking the socket here would strip
-/// the LIVE daemon's rendezvous while its record still advertises it, leaving
-/// every client unable to attach. In that case both the replacement record and its
-/// socket are preserved and this reports `false`. The permanent index lock is
-/// never named here.
+/// ORDER IS LOAD-BEARING. The published pid record IS the single-instance
+/// exclusion: `try_acquire_daemon_lock` claims it with `create_new`, so while our
+/// record exists a competing start reports `Taken` and never binds this socket
+/// path. Removing the record FIRST (as an earlier revision did) opens a window in
+/// which a replacement daemon legitimately claims the record and binds the same
+/// path — and the departing process's later unlink then destroys the LIVE
+/// daemon's socket while its record still advertises it. So the record is held as
+/// exclusion until our socket is unlinked, and only then is the record removed,
+/// re-corroborated against our pid.
+///
+/// Crash behavior between the two operations is fail-closed and self-healing: the
+/// namespace is left with a pid record naming a now-dead pid and no socket. A
+/// client's attach to the recorded socket fails fast (bounded, never hangs), and
+/// `clear_stale_daemon_lock` / `clear_stale_daemon_socket` clear that record on the
+/// next start because the recorded pid is provably not alive. The inverse order
+/// could instead leave a LIVE daemon with no socket, which nothing can heal.
+///
+/// An already-replaced record (an owner mismatch observed on entry) preserves BOTH
+/// the replacement record and its socket and reports `false`. The permanent index
+/// lock is never named here.
 pub(crate) fn cleanup_owned_rendezvous(pid_path: &Path, socket_path: &Path, pid: u32) -> bool {
-    let owned = cleanup_owned_lock(pid_path, pid);
-    if !owned {
+    cleanup_owned_rendezvous_with(pid_path, socket_path, pid, |_| {})
+}
+
+fn cleanup_owned_rendezvous_with(
+    pid_path: &Path,
+    socket_path: &Path,
+    pid: u32,
+    mut checkpoint: impl FnMut(RendezvousCleanupCheckpoint),
+) -> bool {
+    if !record_names(pid_path, pid) {
         debug!(
             pid_path = %pid_path.display(),
             "daemon rendezvous is owned by another process; leaving its record and socket intact"
         );
         return false;
     }
+    checkpoint(RendezvousCleanupCheckpoint::OwnershipCorroborated);
+
     #[cfg(unix)]
     if let Some(stale) = crate::transport::Rendezvous::from_socket_path(socket_path).cleanup_path()
     {
@@ -264,7 +304,11 @@ pub(crate) fn cleanup_owned_rendezvous(pid_path: &Path, socket_path: &Path, pid:
     }
     #[cfg(not(unix))]
     let _ = socket_path;
-    true
+    checkpoint(RendezvousCleanupCheckpoint::SocketRemoved);
+
+    // Re-corroborate at the second mutation boundary: only a record that STILL
+    // names this process may be removed.
+    cleanup_owned_lock(pid_path, pid)
 }
 
 fn now_millis() -> u128 {
@@ -513,6 +557,129 @@ mod tests {
         assert!(!pid_path.exists());
         #[cfg(unix)]
         assert!(!socket.exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// The former vulnerable midpoint. A competing start is driven at the EXACT
+    /// boundary where the old revision had already removed the pid record, and it
+    /// is allowed to claim the record and rebind the same socket path. The
+    /// departing owner must not destroy that replacement.
+    ///
+    /// Deterministic by construction: the replacement runs inside the checkpoint
+    /// callback, so it is ordered by the call itself, not by any sleep.
+    ///
+    /// Under the OLD pid-record-first order this test fails — `try_acquire` would
+    /// succeed (the record was gone), and the subsequent unlink would delete the
+    /// replacement's socket.
+    #[test]
+    fn a_replacement_start_at_the_cleanup_midpoint_keeps_its_own_rendezvous() {
+        let base = temp_base("cleanup-midpoint");
+        create_rendezvous_dir(&base);
+        let pid_path = pid_path_of(&base);
+        let socket = socket_path_of(&base);
+
+        // The DEPARTING owner: a distinct, provably dead pid, with its record
+        // published and its socket bound.
+        let mut departing = 4_000_000_000u32;
+        while departing == process::id() || is_process_alive(departing) {
+            departing -= 1;
+        }
+        let old = DaemonLockInfo {
+            pid: departing,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            socket_path: socket.clone(),
+            started_at: 1,
+        };
+        fs::write(&pid_path, encode_lock_info(&old).unwrap()).unwrap();
+        fs::write(&socket, b"old").unwrap();
+
+        let mut replacement_claim = None;
+        let cleaned = cleanup_owned_rendezvous_with(&pid_path, &socket, departing, |checkpoint| {
+            if checkpoint != RendezvousCleanupCheckpoint::OwnershipCorroborated {
+                return;
+            }
+            // A competing start races here. While OUR record is still published it
+            // must be refused, which is exactly what keeps the replacement from
+            // binding a socket the departing owner is about to unlink.
+            replacement_claim = Some(try_acquire_daemon_lock(&base).expect("competing start"));
+        });
+
+        match replacement_claim.expect("the competing start ran at the checkpoint") {
+            AcquireResult::Taken { existing, .. } => {
+                let existing = existing.expect("the departing record is readable");
+                assert_eq!(
+                    existing.pid, departing,
+                    "the published record must still be the departing owner's, so the \
+                     replacement is refused instead of binding a doomed socket"
+                );
+            }
+            AcquireResult::Acquired { .. } => panic!(
+                "a competing start must NOT be able to claim the record before the departing \
+                 owner has finished unlinking its socket"
+            ),
+        }
+
+        assert!(cleaned, "the departing owner cleans its own rendezvous");
+        assert!(!pid_path.exists(), "its record is removed last");
+        assert!(!socket.exists(), "its socket was removed first");
+
+        // The replacement can now claim a clean namespace and bind its own socket,
+        // and nothing left over can delete it.
+        let AcquireResult::Acquired { .. } =
+            try_acquire_daemon_lock(&base).expect("post-cleanup acquire")
+        else {
+            panic!("a cleaned namespace must be claimable");
+        };
+        fs::write(&socket, b"new").unwrap();
+        assert!(
+            !cleanup_owned_rendezvous(&pid_path, &socket, departing),
+            "a second cleanup pass by the departed owner must be refused"
+        );
+        assert!(pid_path.exists() && socket.exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// The socket is unlinked BEFORE the record, so a crash between the two
+    /// boundaries leaves a dead-pid record with no socket — the self-healing
+    /// residue `clear_stale_daemon_socket` is built to clear. The inverse order
+    /// would leave a live daemon with no socket, which nothing can heal.
+    #[test]
+    fn a_crash_between_cleanup_boundaries_leaves_only_self_healing_residue() {
+        let base = temp_base("cleanup-crash");
+        create_rendezvous_dir(&base);
+        let pid_path = pid_path_of(&base);
+        let socket = socket_path_of(&base);
+        let mut departing = 4_000_000_000u32;
+        while departing == process::id() || is_process_alive(departing) {
+            departing -= 1;
+        }
+        let old = DaemonLockInfo {
+            pid: departing,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            socket_path: socket.clone(),
+            started_at: 1,
+        };
+        fs::write(&pid_path, encode_lock_info(&old).unwrap()).unwrap();
+        fs::write(&socket, b"old").unwrap();
+
+        // Simulate the crash by panicking-free early return: run cleanup only up to
+        // the socket-removed boundary and drop the process there.
+        let mut reached_socket_removed = false;
+        let _ = cleanup_owned_rendezvous_with(&pid_path, &socket, departing, |checkpoint| {
+            if checkpoint == RendezvousCleanupCheckpoint::SocketRemoved {
+                reached_socket_removed = true;
+                assert!(!socket.exists(), "the socket is gone at this boundary");
+                assert!(
+                    pid_path.exists(),
+                    "the record is STILL published as exclusion at this boundary"
+                );
+            }
+        });
+        assert!(reached_socket_removed);
+
+        // The residue is exactly what the stale-socket self-heal clears.
+        assert!(clear_stale_daemon_socket(&base));
+        assert!(!pid_path.exists());
         let _ = fs::remove_dir_all(&base);
     }
 
