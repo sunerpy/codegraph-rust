@@ -3568,3 +3568,113 @@ No dependency, version, `Cargo.lock`,
 schema, node-ID, golden, state-protocol, or permanent-index-lifecycle byte changed;
 `Cargo.lock` remains SHA-256
 `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`.
+
+## Batch B1 — C++ explicit operator calls resolve to the operator method (2026-07-28)
+
+Ports upstream `6103f5e` (`fix(cpp): resolve explicit operator calls
+(a.operator+(b)) to the operator method`, upstream #1268 / issue #1247). Behavior
+only — the TypeScript regex/AST shapes were re-derived against
+`tree-sitter-cpp 0.23.4` in this workspace, not transliterated.
+
+### Red (documented, with the actual wrong output)
+
+Five new `#[test]`s in `crates/codegraph-extract/src/walker.rs` drive the REAL
+extraction path (`extract_source` → `Walker::extract_call`) and failed on the
+pre-change bytes. `cargo test --locked -p codegraph-extract --lib
+cpp_explicit_operator` → **5 failed, 1 passed** with these observed values:
+
+| assertion                                                 | expected              | ACTUAL on pre-change bytes |
+| --------------------------------------------------------- | --------------------- | -------------------------- |
+| `a.operator+(b)`                                          | ref `a.operator+`     | `["a"]`                    |
+| `p->operator+(b)`                                         | ref `p.operator+`     | `["p"]`                    |
+| `a.operator[](3)` / `a.operator()(1)` / `a.operator==(b)` | 3 operator refs       | `["a", "a", "a"]`          |
+| `a.operator == (b)` / `a.operator [] (3)` (spaced)        | compact operator refs | `["a", "a"]`               |
+| `this->operator+(*this)`                                  | bare ref `operator+`  | `["this"]`                 |
+
+The bare receiver name is exactly upstream's reported defect: the callee is read
+from the `function` field, but tree-sitter-cpp cannot parse an `operator_name` in
+field position, so the `operator_name` is stranded in an ERROR sibling and the
+`function` field holds only the receiver. `cpp_explicit_operator_call_drops_complex_receiver`
+passed pre-change for the WRONG reason (no operator ref existed at all), so it is
+a guard, not a Red.
+
+Two resolver `#[test]`s in `crates/codegraph-resolve/src/name_matcher.rs` were the
+second Red: `cpp_operator_dot_shape_is_a_method_call_shape` failed with
+`parse_method_call("a.operator+", Cpp)` returning **`None`** (expected
+`Some(("a","operator+"))`) — the operator's symbol chars fail `match_dot_call`'s
+selector-like method part — and
+`cpp_explicit_operator_call_resolves_via_receiver_type` failed at
+`.expect("explicit operator call resolves")`, i.e. `match_method_call` returned
+`None` even with the recovered name.
+
+### Green (minimal)
+
+- `crates/codegraph-extract/src/lang/cpp.rs`: new
+  `recover_explicit_operator_call` returning `ExplicitOperatorCall::{Callee,Drop}`.
+  It finds an `operator_name` inside an ERROR child of the `call_expression`,
+  compacts a spaced SYMBOLIC name (`operator ==` → `operator==`, word forms like
+  `operator new` keep their space), normalizes `->` to `.`, emits the bare
+  operator name for a `this` receiver, and returns `Drop` for a receiver that is
+  not a simple identifier/member chain (`w.obj()->operator+`) so exact-name
+  matching cannot guess among unrelated same-named operators.
+- `crates/codegraph-extract/src/walker.rs`: `extract_call` consults it first, for
+  `Language::Cpp` only.
+- `crates/codegraph-resolve/src/name_matcher.rs`: new
+  `match_cpp_operator_dot_call` admitted by `parse_method_call` and
+  `is_inferable_receiver_call` for `Language::{C,Cpp}` AFTER the plain dotted
+  pattern, so `a.operatorTable` is unaffected and `a.operator` (no symbol) stays
+  an ordinary dotted call.
+
+### Golden row delta (`reference/golden/cpp/`, additions only)
+
+New fixture `crates/codegraph-bench/fixtures/cpp/operators.cpp` (struct `Vec2`
+with `operator+`/`operator[]`/`get`, three explicit-operator call sites, one
+plain-member control). `git diff --numstat reference/golden/` showed ONLY `cpp/`
+paths: `files.json +8/-0`, `nodes.json +198/-0`, `edges.json +120/-0`,
+`colby.db` binary; `refs.json` and `schema.sql` byte-identical. Deleted-line
+count across the three JSON files: **0** — every pre-existing declaration keeps
+its node ID and row.
+
+Added rows: 9 `operators.cpp` nodes (file, `struct Vec2`, methods
+`Vec2::operator+` @3 / `Vec2::operator[]` @4 / `Vec2::get` @5, functions
+`explicit_operator_call` @8 / `explicit_subscript_call` @12 /
+`explicit_pointer_operator_call` @16 / `plain_member_call` @20) and 4 `Calls`
+edges, all `resolvedBy=instance-method` at confidence 0.9:
+`explicit_operator_call → Vec2::operator+`,
+`explicit_pointer_operator_call → Vec2::operator+`,
+`explicit_subscript_call → Vec2::operator[]`, and the control
+`plain_member_call → Vec2::get`. Before this change the three operator call sites
+produced an unresolved `a`/`p` ref and NO edge.
+
+Recipe fidelity: `docs/equivalence.md` says `cp
+/tmp/cg-fixture-cpp/.codegraph/codegraph.db`, but Batch M moved the index to the
+isolated v2 namespace, so the database is actually written to
+`/tmp/cg-fixture-cpp/.codegraph-v2/codegraph.db`. That path substitution is the
+ONLY deviation, and it was proven inert: re-running the documented recipe over
+the five PRE-EXISTING fixture files alone regenerated `nodes.json`, `edges.json`,
+`refs.json`, `files.json` and `schema.sql` byte-identical to the committed golden
+(`cmp -s` on all five → IDENTICAL) before `operators.cpp` was added.
+
+### Verification (actual exit statuses)
+
+- `bash scripts/check-workspace-versions.sh` → exit 0 (workspace 0.40.4, 10
+  packages), run before every Cargo batch; every Cargo command used `--locked`.
+- `cargo test --locked -p codegraph-extract --lib cpp_` → exit 0, **56 passed, 0
+  failed** (includes the 5 new Reds now green plus the pre-existing
+  `cpp_operator_lt_call_not_stripped`, `cpp_template_arg_call_strips_to_base`,
+  `strip_cpp_template_args_cases`, UE/export-macro and namespace tests).
+- `cargo test --locked -p codegraph-resolve --lib -- cpp_explicit_operator
+cpp_operator_dot` → exit 0, **2 passed**.
+- `cargo test --locked -p codegraph-bench --test equivalence` → exit 0, **26
+  passed, 0 failed**, including `generated_golden_matches_committed_cpp_fixture`
+  and `cpp_db_is_self_equivalent_to_cpp_golden`, and every non-cpp oracle
+  (`godot`, `ruby`, `mini`, `metal`, `cuda`, `arkts`, `solidity`, `nix`,
+  `terraform`, `erlang`, `cfml`).
+- `git diff --stat reference/golden/` → only `cpp/` paths; godot, ruby and the
+  original upstream corpus unchanged.
+
+`lsp_diagnostics` was NOT usable here: it has consistently refused this worktree
+with `LSP file path must be inside request cwd` (the worktree at
+`/config/workspace/ProdDir/AI/.cgworktrees/v15-impl` is outside the request cwd),
+so locked Cargo build/Clippy/test is the honest fallback and no LSP-clean result
+is claimed. No dependency, version or `Cargo.lock` byte changed.

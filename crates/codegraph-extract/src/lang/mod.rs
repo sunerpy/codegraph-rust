@@ -44,7 +44,10 @@ pub(crate) use cfml::{
     cfml_component_name_from_path, cfml_string_attr_value, cfml_tag_attr, is_bare_script_cfml,
 };
 pub use cpp::CPP_SPEC;
-pub(crate) use cpp::{ExportMacroClass, detect_export_macro_class};
+pub(crate) use cpp::{
+    ExplicitOperatorCall, ExportMacroClass, detect_export_macro_class,
+    recover_explicit_operator_call,
+};
 pub use csharp::CSHARP_SPEC;
 pub use dart::DART_SPEC;
 pub use erlang::ERLANG_SPEC;

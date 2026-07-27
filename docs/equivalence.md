@@ -281,9 +281,21 @@ UObject` plus line-leading `GENERATED_BODY()`/`UPROPERTY(...)`/`UFUNCTION()`,
   reclassifies the `.h` to C++, and the offset-preserving pre-parse blanking
   recovers the `UFoo` class + its `Extends UObject` clause (both dropped before).
 
+A further file exercises the Batch B explicit-operator gain (upstream #1268):
+
+- **explicit operator calls** — `operators.cpp` defines `struct Vec2` with
+  `operator+` / `operator[]` / a plain `get`, then calls each through the
+  EXPLICIT syntax (`a.operator+(b)`, `a.operator[](3)`, `p->operator+(b)`) plus
+  one plain `a.get()` control. tree-sitter-cpp strands the `operator_name` in an
+  ERROR child, so before the fix the extractor emitted the bare receiver (`a`)
+  and no edge existed; the golden now carries four `Calls` edges resolved by
+  `instance-method` at confidence 0.9 (`Vec2::operator+` twice,
+  `Vec2::operator[]`, `Vec2::get`).
+
 The minimal source corpus lives at `crates/codegraph-bench/fixtures/cpp/`
-(`base.hpp`, `derived.cpp`, `namespaced.cpp`, `templated_call.cpp`,
-`ue_actor.h`). The inheritance base classes live in a `.hpp` file (not `.h`,
+(`base.hpp`, `derived.cpp`, `namespaced.cpp`, `operators.cpp`,
+`templated_call.cpp`, `ue_actor.h`). The inheritance base classes live in a
+`.hpp` file (not `.h`,
 which maps to `Language::C` by extension); `ue_actor.h` deliberately uses `.h` to
 guard the content-based C++ reclassification.
 

@@ -1342,6 +1342,11 @@ fn parse_method_call(name: &str, language: Language) -> Option<(String, String)>
     if let Some(captures) = match_dot_call(name) {
         return Some(captures);
     }
+    if matches!(language, Language::C | Language::Cpp) {
+        if let Some(captures) = match_cpp_operator_dot_call(name) {
+            return Some(captures);
+        }
+    }
     if let Some(captures) = match_colon_call(name) {
         return Some(captures);
     }
@@ -1364,6 +1369,11 @@ fn parse_method_call(name: &str, language: Language) -> Option<(String, String)>
 /// not an instance call.
 fn is_inferable_receiver_call(name: &str, language: Language) -> bool {
     if match_dot_call(name).is_some() {
+        return true;
+    }
+    if matches!(language, Language::C | Language::Cpp)
+        && match_cpp_operator_dot_call(name).is_some()
+    {
         return true;
     }
     if matches!(language, Language::Lua | Language::Luau) && match_lua_colon_call(name).is_some() {
@@ -1437,6 +1447,37 @@ fn match_dot_call(name: &str) -> Option<(String, String)> {
         return None;
     }
     if !is_selector_like(method) {
+        return None;
+    }
+    Some((receiver.to_string(), method.to_string()))
+}
+
+/// Matches `/^([\w.]+)\.(operator[^\w\s.]+)$/` — a C++ explicit operator call
+/// (`a.operator+`, `it.operator[]`) reaching the resolver from the extraction
+/// recovery (#1268). The operator's symbol chars fail `match_dot_call`'s
+/// selector-like method part, so they are admitted here instead. At least one
+/// non-word char after `operator` is required, so `a.operatorTable` stays on the
+/// plain dotted pattern (tried first); every downstream strategy compares the
+/// method part by exact string equality, so a stray match cannot invent an edge.
+fn match_cpp_operator_dot_call(name: &str) -> Option<(String, String)> {
+    let idx = name.rfind(".operator")?;
+    if idx == 0 {
+        return None;
+    }
+    let receiver = &name[..idx];
+    let method = &name[idx + 1..];
+    if !receiver
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+    {
+        return None;
+    }
+    let symbol = method.strip_prefix("operator")?;
+    if symbol.is_empty()
+        || !symbol
+            .chars()
+            .all(|c| !c.is_alphanumeric() && c != '_' && c != '.' && !c.is_whitespace())
+    {
         return None;
     }
     Some((receiver.to_string(), method.to_string()))
@@ -3948,6 +3989,80 @@ mod tests {
         let res = match_method_call(&r, &ctx).expect("cpp receiver");
         assert_eq!(res.target_node_id, "method:v");
         assert_eq!(res.resolved_by, ResolvedBy::InstanceMethod);
+    }
+
+    #[test]
+    fn cpp_explicit_operator_call_resolves_via_receiver_type() {
+        // `const V& a; a.operator+(b)` reaches the resolver as `a.operator+`
+        // (#1268). `Aaa` declares the SAME operator and sorts first, so only
+        // receiver-type inference can pick `V`.
+        let v_op = mk(
+            "method:v_plus",
+            NodeKind::Method,
+            "operator+",
+            "V::operator+",
+            "src/optest.cpp",
+            Language::Cpp,
+        );
+        let decoy = mk(
+            "method:aaa_plus",
+            NodeKind::Method,
+            "operator+",
+            "Aaa::operator+",
+            "src/optest.cpp",
+            Language::Cpp,
+        );
+        let ctx = Ctx::default()
+            .file(
+                "src/optest.cpp",
+                "struct Aaa { Aaa operator+(const Aaa& o) const; };\nstruct V { V operator+(const V& o) const; };\nV add(const V& a, const V& b) { return a.operator+(b); }\n",
+            )
+            .name("operator+", vec![decoy, v_op]);
+        let r = refv(
+            "a.operator+",
+            EdgeKind::Calls,
+            "src/optest.cpp",
+            Language::Cpp,
+            3,
+        );
+        let res = match_method_call(&r, &ctx).expect("explicit operator call resolves");
+        assert_eq!(
+            res.target_node_id, "method:v_plus",
+            "receiver type V must win over the same-named Aaa::operator+"
+        );
+        assert_eq!(res.resolved_by, ResolvedBy::InstanceMethod);
+    }
+
+    #[test]
+    fn cpp_operator_dot_shape_is_a_method_call_shape() {
+        assert_eq!(
+            parse_method_call("a.operator+", Language::Cpp),
+            Some(("a".to_string(), "operator+".to_string()))
+        );
+        assert_eq!(
+            parse_method_call("it.operator[]", Language::Cpp),
+            Some(("it".to_string(), "operator[]".to_string()))
+        );
+        // Word-shaped names keep the plain dotted pattern.
+        assert_eq!(
+            parse_method_call("a.operatorTable", Language::Cpp),
+            Some(("a".to_string(), "operatorTable".to_string()))
+        );
+        // The symbolic form is C/C++-only.
+        assert_eq!(parse_method_call("a.operator+", Language::TypeScript), None);
+        // `operator` with no trailing symbol is NOT the operator shape; it stays
+        // an ordinary dotted call (handled by the plain pattern, tried first).
+        assert_eq!(match_cpp_operator_dot_call("a.operator"), None);
+        assert_eq!(
+            parse_method_call("a.operator", Language::Cpp),
+            Some(("a".to_string(), "operator".to_string()))
+        );
+        // A dotted receiver chain is accepted; a bare `.operator+` is not.
+        assert_eq!(
+            match_cpp_operator_dot_call("w.inner.operator=="),
+            Some(("w.inner".to_string(), "operator==".to_string()))
+        );
+        assert_eq!(match_cpp_operator_dot_call(".operator+"), None);
     }
 
     #[test]

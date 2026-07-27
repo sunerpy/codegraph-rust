@@ -2893,6 +2893,16 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 }
             }
         }
+        if self.spec.language() == Language::Cpp {
+            match crate::lang::recover_explicit_operator_call(node, self.source) {
+                Some(crate::lang::ExplicitOperatorCall::Callee(callee)) => {
+                    self.push_ref(&caller_id, &callee, EdgeKind::Calls, node);
+                    return;
+                }
+                Some(crate::lang::ExplicitOperatorCall::Drop) => return,
+                None => {}
+            }
+        }
         let mut callee_name = String::new();
         let func = child_by_field(node, "function").or_else(|| node.named_child(0));
         if let Some(func) = func {
@@ -5918,6 +5928,123 @@ void caller() { operator<<(a, b); }
         assert!(
             !has_ref(&refs, EdgeKind::Calls, "operator"),
             "operator<< callee must not be template-stripped to `operator`"
+        );
+    }
+
+    // ---- Batch B1: C++ explicit operator calls (upstream 6103f5e / #1268) ----
+
+    const CPP_OP_HEADER: &str = concat!(
+        "struct V {\n",
+        "  V operator+(const V& o) const;\n",
+        "  V operator[](int i) const;\n",
+        "  V operator()(int i) const;\n",
+        "  bool operator==(const V& o) const;\n",
+        "  int get() const;\n",
+        "};\n"
+    );
+
+    fn cpp_call_refs(body: &str) -> Vec<String> {
+        let src = format!("{CPP_OP_HEADER}{body}");
+        let (_, refs) = run("op.cpp", &src, Language::Cpp);
+        refs.iter()
+            .filter(|r| r.reference_kind == EdgeKind::Calls)
+            .map(|r| r.reference_name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn cpp_explicit_operator_call_recovers_receiver_operator() {
+        let refs = cpp_call_refs("V f(const V& a, const V& b) { return a.operator+(b); }\n");
+        assert!(
+            refs.iter().any(|r| r == "a.operator+"),
+            "explicit `a.operator+(b)` should emit a `a.operator+` Calls ref, got: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_explicit_operator_call_normalizes_arrow_receiver() {
+        let refs = cpp_call_refs("V f(const V* p, const V& b) { return p->operator+(b); }\n");
+        assert!(
+            refs.iter().any(|r| r == "p.operator+"),
+            "`p->operator+(b)` should normalize to `p.operator+`, got: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_explicit_operator_call_covers_symbolic_forms() {
+        let refs = cpp_call_refs(concat!(
+            "V f1(const V& a) { return a.operator[](3); }\n",
+            "V f2(V& a) { return a.operator()(1); }\n",
+            "bool f3(const V& a, const V& b) { return a.operator==(b); }\n"
+        ));
+        for want in ["a.operator[]", "a.operator()", "a.operator=="] {
+            assert!(
+                refs.iter().any(|r| r == want),
+                "missing `{want}` among explicit operator refs: {refs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cpp_explicit_operator_call_compacts_spaced_names() {
+        let refs = cpp_call_refs(concat!(
+            "bool f(const V& a, const V& b) { return a.operator == (b); }\n",
+            "V g(const V& a) { return a.operator [] (3); }\n"
+        ));
+        for want in ["a.operator==", "a.operator[]"] {
+            assert!(
+                refs.iter().any(|r| r == want),
+                "spaced call-site operator should compact to `{want}`, got: {refs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cpp_explicit_operator_call_drops_complex_receiver() {
+        let refs = cpp_call_refs(concat!(
+            "struct W { V* obj(); };\n",
+            "V f(W& w, const V& b) { return w.obj()->operator+(b); }\n"
+        ));
+        assert!(
+            !refs.iter().any(|r| r.contains("operator+")),
+            "a call-result receiver must not emit a guessable operator ref, got: {refs:?}"
+        );
+        assert!(
+            refs.iter().any(|r| r == "w.obj"),
+            "the inner `w.obj()` call must still ref normally, got: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_explicit_operator_call_this_receiver_is_bare() {
+        let src = concat!(
+            "struct V {\n",
+            "  V operator+(const V& o) const;\n",
+            "  V twice() const { return this->operator+(*this); }\n",
+            "};\n"
+        );
+        let (_, refs) = run("op.cpp", src, Language::Cpp);
+        let calls: Vec<&str> = refs
+            .iter()
+            .filter(|r| r.reference_kind == EdgeKind::Calls)
+            .map(|r| r.reference_name.as_str())
+            .collect();
+        assert!(
+            calls.contains(&"operator+"),
+            "`this->operator+(...)` should emit the bare `operator+`, got: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|r| r.contains("this")),
+            "no `this` receiver should leak into the ref name, got: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_plain_member_call_unaffected_by_operator_recovery() {
+        let refs = cpp_call_refs("int f(const V& a) { return a.get(); }\n");
+        assert!(
+            refs.iter().any(|r| r == "a.get"),
+            "plain member call must stay `a.get`, got: {refs:?}"
         );
     }
 

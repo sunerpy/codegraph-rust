@@ -24,6 +24,14 @@
     "size": 102
   },
   {
+    "content_hash": "61ac8b93b7094d0633203791513f3394c7f76e2993a50d75b9f8e32454dcccf6",
+    "errors": null,
+    "language": "cpp",
+    "node_count": 9,
+    "path": "operators.cpp",
+    "size": 513
+  },
+  {
     "content_hash": "e72bc5982add705d170ebd03d4a3db5286237e5b8ab662fc9ed35cd51da438c9",
     "errors": null,
     "language": "cpp",

@@ -25,6 +25,54 @@
   },
   {
     "col": 11,
+    "kind": "calls",
+    "line": 13,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "instance-method"
+    },
+    "provenance": null,
+    "source": "function:b936240196eda212ecaf615c810f2292",
+    "target": "method:1f046d99fc24f0c883d5df08d5f1d0d4"
+  },
+  {
+    "col": 11,
+    "kind": "calls",
+    "line": 17,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "instance-method"
+    },
+    "provenance": null,
+    "source": "function:231cb297b9449e906e38fd66e790340a",
+    "target": "method:533a20574d92cc309a832441bc372dbc"
+  },
+  {
+    "col": 11,
+    "kind": "calls",
+    "line": 21,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "instance-method"
+    },
+    "provenance": null,
+    "source": "function:977be8a56f253290743386f93328db8a",
+    "target": "method:1477fb78b06fcf85aa120eebf1b3dfd5"
+  },
+  {
+    "col": 11,
+    "kind": "calls",
+    "line": 9,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "instance-method"
+    },
+    "provenance": null,
+    "source": "function:549ae0829767e55cde7dd5ead99c67d1",
+    "target": "method:533a20574d92cc309a832441bc372dbc"
+  },
+  {
+    "col": 11,
     "kind": "extends",
     "line": 18,
     "metadata": {
@@ -314,6 +362,51 @@
     "line": null,
     "metadata": null,
     "provenance": null,
+    "source": "file:operators.cpp",
+    "target": "function:231cb297b9449e906e38fd66e790340a"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:operators.cpp",
+    "target": "function:549ae0829767e55cde7dd5ead99c67d1"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:operators.cpp",
+    "target": "function:977be8a56f253290743386f93328db8a"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:operators.cpp",
+    "target": "function:b936240196eda212ecaf615c810f2292"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:operators.cpp",
+    "target": "struct:a79c39917f9987d43250fce7bde68405"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
     "source": "file:templated_call.cpp",
     "target": "function:61cb788885161f5fe3ff59a749c7fd19"
   },
@@ -343,5 +436,32 @@
     "provenance": null,
     "source": "struct:418731e230da99cc3237d0e7e35385f1",
     "target": "method:eaf644a1dae18b22184dd0d0b882e1bd"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:a79c39917f9987d43250fce7bde68405",
+    "target": "method:1477fb78b06fcf85aa120eebf1b3dfd5"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:a79c39917f9987d43250fce7bde68405",
+    "target": "method:1f046d99fc24f0c883d5df08d5f1d0d4"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:a79c39917f9987d43250fce7bde68405",
+    "target": "method:533a20574d92cc309a832441bc372dbc"
   }
 ]
