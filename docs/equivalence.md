@@ -292,7 +292,10 @@ Five further files exercise the Batch B C/C++ gains:
   tree-sitter's C grammar reads the macro as the type and the real return type as
   the declarator, so before the fix these indexed under the RETURN TYPE's name
   (`VOID` / `UINT32`); the golden now pins all four under their real names with
-  their real return types.
+  their real return types. The blank fires ONLY because `#define SEC_ATTR
+__attribute__((section(".init")))` is visible IN THIS FILE — the pass demands
+  same-file `#define` proof that a leading token is attribute-like, so this fixture
+  also pins that evidence requirement, not just the macro's name.
 
 - **namespaced out-of-line method + fully-qualified call** (upstream #1310) —
   `namespaced_member.hpp` declares `namespace simulator { class ManifestStartup }`

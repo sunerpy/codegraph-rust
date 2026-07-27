@@ -5594,6 +5594,8 @@ struct Bar { int x; };
 
     // ---- Batch B4: C leading attribute macros (upstream b6a05d1) ----
 
+    const C_ATTR_DEFINE: &str = "#define SEC_ATTR __attribute__((section(\".init\")))\n";
+
     fn c_names(src: &str) -> Vec<String> {
         let (nodes, _) = run("attrs.c", src, Language::C);
         nodes
@@ -5603,23 +5605,90 @@ struct Bar { int x; };
             .collect()
     }
 
+    fn c_function_return_types(src: &str) -> Vec<(String, i64, String)> {
+        let (nodes, _) = run("attrs.c", src, Language::C);
+        let mut rows: Vec<(String, i64, String)> = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Function)
+            .map(|n| {
+                (
+                    n.name.clone(),
+                    n.start_line,
+                    n.return_type
+                        .clone()
+                        .unwrap_or_else(|| "<NULL>".to_string()),
+                )
+            })
+            .collect();
+        rows.sort_by_key(|(_, line, _)| *line);
+        rows
+    }
+
     #[test]
     fn c_leading_attr_macro_function_indexes_under_its_real_name() {
-        let names = c_names("SEC_ATTR UINT32 Foo (VOID) { return 0; }\n");
+        let names = c_names(&format!(
+            "{C_ATTR_DEFINE}SEC_ATTR UINT32 Foo (VOID) {{ return 0; }}\n"
+        ));
         assert_eq!(
             names,
             vec!["Foo".to_string()],
-            "a function behind a leading attribute macro must index as `Foo`"
+            "a function behind a same-file-proved attribute macro must index as `Foo`"
         );
     }
 
     #[test]
     fn c_leading_attr_macro_with_macro_return_type_indexes_under_its_real_name() {
-        let names = c_names("SEC_ATTR VOID Foo (VOID) { }\n");
+        let names = c_names(&format!("{C_ATTR_DEFINE}SEC_ATTR VOID Foo (VOID) {{ }}\n"));
         assert_eq!(
             names,
             vec!["Foo".to_string()],
             "a macro return type behind a leading attribute macro must not become the name"
+        );
+    }
+
+    // NEGATIVE CONTROL for the tightened rule (#1311 follow-up). Firmware-flavoured
+    // C where the leading ALL-CAPS token is a typedef'd RETURN TYPE or a
+    // keyword-alias macro, NOT an attribute macro. The earlier purely structural
+    // rule blanked the return type here (`EFI_STATUS`→`EFIAPI`, `STATIC`→dropped);
+    // the return types below are the ones extraction produced BEFORE any blanking
+    // existed, so this test fails under the permissive rule and passes under the
+    // `#define`-proved one. `SEC_ATTR`'s define is present so the pass is ACTIVE.
+    #[test]
+    fn c_leading_typedef_return_and_keyword_alias_macros_keep_their_return_types() {
+        let src = format!(
+            "{C_ATTR_DEFINE}{}",
+            concat!(
+                "EFI_STATUS EFIAPI DriverEntry (VOID) {\n",
+                "  return 0;\n",
+                "}\n",
+                "CONST CHAR8 *GetName (VOID) {\n",
+                "  return 0;\n",
+                "}\n",
+                "STATIC void helper (void) {\n",
+                "}\n",
+                "UINT32 Untouched (void) {\n",
+                "  return 0;\n",
+                "}\n"
+            )
+        );
+        assert_eq!(
+            c_function_return_types(&src),
+            vec![
+                ("DriverEntry".to_string(), 2, "EFI_STATUS".to_string()),
+                ("GetName".to_string(), 5, "CONST".to_string()),
+                ("helper".to_string(), 8, "STATIC".to_string()),
+                ("Untouched".to_string(), 10, "UINT32".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn c_leading_attr_macro_without_a_visible_define_is_left_untouched() {
+        assert_eq!(
+            c_function_return_types("SEC_ATTR UINT32 Foo (VOID) { return 0; }\n"),
+            vec![("UINT32".to_string(), 1, "SEC_ATTR".to_string())],
+            "with no same-file `#define` the source must parse exactly as it did \
+             before this pass existed — #1311 stays unfixed for header-defined macros"
         );
     }
 
@@ -5663,7 +5732,9 @@ struct Bar { int x; };
     fn c_plain_typedef_return_and_macro_call_shapes_unaffected() {
         assert_eq!(c_names("UINT32 helper (void) { return 0; }\n"), ["helper"]);
         assert_eq!(
-            c_names("SEC_ATTR unsigned int f(void) { return 0; }\n"),
+            c_names(&format!(
+                "{C_ATTR_DEFINE}SEC_ATTR unsigned int f(void) {{ return 0; }}\n"
+            )),
             ["f"]
         );
         let (nodes, _) = run("call.c", "void g(void) { MY_ASSERT(x); }\n", Language::C);

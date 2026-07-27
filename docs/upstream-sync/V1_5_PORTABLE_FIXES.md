@@ -3934,3 +3934,222 @@ codegraph-bench` → exit 0, **1393 passed across 35 test binaries, 0 failed**,
 `lsp_diagnostics` remains unusable in this worktree (`LSP file path must be inside
 request cwd`); locked Cargo is the fallback. No dependency, version or
 `Cargo.lock` byte changed.
+
+## Batch B4 CORRECTION — the leading-attr-macro blank over-triggered; tightened to require same-file `#define` proof (2026-07-28)
+
+The `e95072c` section ABOVE stands as the record of what was shipped and why it
+passed its own tests; it is left intact deliberately. This section corrects it.
+Orchestrator review REJECTED `e95072c`: its `blank_c_leading_attr_macros` over-fires
+and DAMAGES correct extraction of ordinary C. This is a follow-up commit; `e95072c`
+was NOT amended.
+
+### The measured regression (reproduced here, not re-derived)
+
+Probe file `/tmp/cprobe/edk.c` (firmware-flavoured C, NO `#define` in it):
+
+```c
+EFI_STATUS EFIAPI DriverEntry (VOID) { return 0; }
+CONST CHAR8 *GetName (VOID) { return 0; }
+STATIC void helper (void) { }
+UINT32 Untouched (void) { return 0; }
+```
+
+Method: build `target/debug/codegraph` at each commit's `lang/c.rs`, then
+`codegraph init /tmp/cprobe` and
+`sqlite3 /tmp/cprobe/.codegraph-v2/codegraph.db "select name, start_line,
+coalesce(return_type,'<NULL>') from nodes where kind='function' order by
+start_line;"`. Note the DB path is `.codegraph-v2/`, not `.codegraph/`.
+
+| source line                            | parent `288d892` | `e95072c` | verdict              |
+| -------------------------------------- | ---------------- | --------- | -------------------- |
+| `EFI_STATUS EFIAPI DriverEntry (VOID)` | `EFI_STATUS`     | `EFIAPI`  | **REGRESSION**       |
+| `CONST CHAR8 *GetName (VOID)`          | `CONST`          | `CHAR8`   | improvement          |
+| `STATIC void helper (void)`            | `STATIC`         | `<NULL>`  | **information lost** |
+| `UINT32 Untouched (void)`              | `UINT32`         | `UINT32`  | untouched, correct   |
+
+Raw output, verbatim:
+
+```
+===== PARENT 288d892 =====        ===== HEAD e95072c =====
+DriverEntry|1|EFI_STATUS          DriverEntry|1|EFIAPI
+GetName|5|CONST                   GetName|5|CHAR8
+helper|9|STATIC                   helper|9|<NULL>
+Untouched|12|UINT32               Untouched|12|UINT32
+```
+
+The function NAMES were already correct at the parent in all four rows
+(`DriverEntry`, `GetName`, `helper`, `Untouched`), so #1311's "name is lost"
+symptom does NOT occur for these shapes at all — `attr_macro.c` only reproduces it
+through the specific `VOID`/`UINT32` typedef spacing it was written around. A green
+suite proved nothing because the fixture encoded only the author's assumed world.
+
+### Root cause
+
+The regex was purely structural: `(?m)^[ \t]*([A-Z][A-Z0-9_]{2,})\s+[A-Za-z_]\w*[\s*]+[A-Za-z_]\w*\s*\(`
+— "line-leading ALL-CAPS token + two identifiers + `(`" ⇒ blank the first token.
+That shape ALSO matches `RETURN_TYPE CALLCONV name(` and `KEYWORD_ALIAS Ret name(`,
+where the token blanked is the return type itself. `EFI_STATUS` / `UINT32` /
+`CHAR8` are typedef'd return types; `STATIC` / `EXTERN` / `INLINE` / `CONST` are
+macro aliases for keywords. All are lexically identical to a true attribute macro,
+so no all-caps-plus-length heuristic can separate them. The token's SPELLING is not
+admissible evidence.
+
+### The tightened rule
+
+`blank_c_leading_attr_macros` now blanks a leading token ONLY when the SAME
+translation unit proves it is attribute-like: the file contains an OBJECT-LIKE
+`#define TOKEN …` whose replacement text is either EMPTY or contains an attribute
+construct (`__attribute__`, `__attribute`, `__declspec`, `__asm`, `__pragma`,
+`_Pragma`). New helper `attribute_like_defines(source) -> BTreeSet<&str>` collects
+that set (a `BTreeSet` keeps membership order-independent, so extraction stays
+deterministic); function-like `#define F(x) …` is rejected because it is never used
+as a bare leading token. When the set is empty the function returns the source
+unchanged, so the whole pass is inert on any file without such a `#define`.
+
+Unknown token ⇒ do nothing. Never blank on suspicion.
+
+Measured per-row behaviour of the tightened version on the SAME `edk.c` (no
+`#define` present, so the pass never activates):
+
+| source line                            | tightened    | reason                                                   |
+| -------------------------------------- | ------------ | -------------------------------------------------------- |
+| `EFI_STATUS EFIAPI DriverEntry (VOID)` | `EFI_STATUS` | no `#define EFI_STATUS` here ⇒ untouched, matches parent |
+| `CONST CHAR8 *GetName (VOID)`          | `CONST`      | no `#define CONST` here ⇒ untouched, matches parent      |
+| `STATIC void helper (void)`            | `STATIC`     | no `#define STATIC` here ⇒ untouched, matches parent     |
+| `UINT32 Untouched (void)`              | `UINT32`     | never matched the shape anyway                           |
+
+Byte-identical to `288d892` on all four rows — verified by re-running the same
+`codegraph init` + `sqlite3` probe with the tightened release binary:
+
+```
+===== TIGHTENED, no #define in edk.c =====
+DriverEntry|1|EFI_STATUS
+GetName|5|CONST
+helper|9|STATIC
+Untouched|12|UINT32
+```
+
+Honest note on `STATIC` and `CONST`: if a file DID carry `#define STATIC static`
+or `#define CONST const`, those replacements are neither empty nor attribute
+constructs, so `attribute_like_defines` still rejects them and the tokens stay
+untouched — pinned by
+`attribute_like_defines_rejects_types_keywords_and_function_like_macros`. They are
+only ever blanked if a project literally writes `#define STATIC` (empty) or
+`#define STATIC __attribute__((…))`, in which case blanking is correct.
+
+#1311's fixture still works because `#define SEC_ATTR
+__attribute__((section(".init")))` is visible INSIDE `attr_macro.c`: `SEC_ATTR` is
+still blanked and `LostName` still indexes under its real name. Confirmed on the
+regenerated fixture DB:
+
+```
+attr_macro.c|1|<NULL>      UINT32|4|<NULL>     GoodName|6|VOID
+LostName|9|UINT32          NoAttr|13|UINT32    PtrRet|17|UINT32
+```
+
+A cross-file probe (`/tmp/cprobe2/hdr_defined.c`, which carries the `SEC_ATTR`
+define AND the firmware shapes) shows both behaviours coexisting in one file:
+`LostName2` keeps its real name with `rt=UINT32` (macro blanked) while
+`DriverEntry2` keeps `EFI_STATUS` and `helper2` keeps `STATIC` (untouched).
+
+### Documented limitation (deliberate under-fix)
+
+`pre_parse` receives `(source, file_path)` and sees ONE file. A macro
+`#define SEC_ATTR __attribute__((…))` living in a HEADER and used in a `.c` yields
+NO evidence, so that source is left untouched and #1311's symptom PERSISTS for
+that (very common) layout. That is the honest behaviour: a cross-file macro table
+would be non-deterministic with respect to include order, and guessing from
+spelling is exactly what produced the regression above. Under-fixing is
+recoverable; corrupting ordinary C is not. Pinned by
+`c_leading_attr_macro_without_a_visible_define_is_left_untouched`, which asserts
+the pre-blank output (`name=UINT32`, `rt=SEC_ATTR`) rather than pretending it is
+fixed.
+
+### Negative control, EXECUTED both ways
+
+New walker test
+`c_leading_typedef_return_and_keyword_alias_macros_keep_their_return_types`
+encodes the four `edk.c` rows as an explicit table asserting the return types the
+parent commit produced (`EFI_STATUS`, `CONST`, `STATIC`, `UINT32`), with
+`#define SEC_ATTR __attribute__((…))` present so the pass is ACTIVE and the test
+is about the RULE, not about the pass being switched off.
+
+1. Old permissive regex temporarily restored in place (`[A-Z][A-Z0-9_]{2,}` capture,
+   no `attribute_like_defines` gate). `cargo test --locked -p codegraph-extract
+--lib -- c_leading_typedef_return_and_keyword_alias_macros_keep_their_return_types`
+   → **exit 101, 1 failed**:
+
+   ```
+   left:  [("DriverEntry", 2, "EFIAPI"), ("GetName", 5, "CHAR8"),
+           ("helper", 8, "<NULL>"),      ("Untouched", 10, "UINT32")]
+   right: [("DriverEntry", 2, "EFI_STATUS"), ("GetName", 5, "CONST"),
+           ("helper", 8, "STATIC"),          ("Untouched", 10, "UINT32")]
+   ```
+
+   The `left` column reproduces the shipped regression exactly.
+
+2. Tightened version restored from the pre-mutation copy; file SHA-256 re-proved as
+   `067baf6a609931b9cbd62cd0449cdc782c105bf59e1f79923914788961214616`. Same test →
+   exit 0, **1 passed**.
+
+The four `e95072c` walker tests were also retargeted: they now include the
+`#define` line, because without it the tightened rule (correctly) does nothing —
+they were previously green only by virtue of the over-permissive regex.
+
+### Golden row delta
+
+**ZERO.** `git diff --numstat reference/golden/` → EMPTY output; no golden file
+changed by one byte, `cpp/` included. Every pre-existing node ID survives (nothing
+in any golden corpus has a leading token with an attribute-like same-file
+`#define`, so the tightening is inert there). Independently confirmed by
+regenerating the C++ fixture per the `docs/equivalence.md` recipe with the
+tightened release binary: the regenerated `nodes.json`, `edges.json`, `files.json`,
+`refs.json` and `schema.sql` are all byte-IDENTICAL to the committed ones
+(`cmp -s` → 0 for each). `colby.db` differs only in SQLite page-level bytes, which
+is why the oracle compares the canonical JSON, not the raw DB.
+
+### Verification (actual exit statuses)
+
+- `bash scripts/check-workspace-versions.sh` → exit 0, before every Cargo batch;
+  every Cargo command used `--locked`.
+- `cargo build --locked -p codegraph-extract` → exit 0.
+- `cargo build --locked --release -p codegraph-rs` → exit 0.
+- `cargo test --locked -p codegraph-extract --lib -- c_leading_typedef_return
+c_leading_attr_macro c_isolation_table c_plain_typedef blank_c_leading_attr_macro
+attribute_like_defines c_header_cuda c_plain_untouched` → exit 0, **16 passed**
+  (includes the pre-existing `c_header_cuda_content_blanked` and `c_plain_untouched`,
+  proving the CUDA path and plain C are undisturbed).
+- Negative control with the OLD regex restored → exit **101**, 1 failed (values above).
+- `cargo test --locked -p codegraph-bench` → exit 0, **26 passed** in
+  `tests/equivalence.rs`, including `generated_golden_matches_committed_cpp_fixture`,
+  `cpp_db_is_self_equivalent_to_cpp_golden`, and the untouched godot / ruby / mini /
+  metal / cuda / arkts / solidity / terraform / erlang / nix / cfml oracles.
+- `git diff --numstat reference/golden/` → EMPTY (zero golden bytes changed).
+- `make fmt` → exit 0 (ledger prose written BEFORE formatting, so `fmt-check` is
+  clean at CI time).
+- `make ci CARGO='cargo --locked'` → exit 0 as the FINAL gate, **2928 passed across
+  115 test binaries**, `✅ All CI checks passed!` (fmt-check + clippy `-D warnings`
+  - workspace test + `scripts/guardrail.sh`). No byte was changed after it.
+- `sha256sum Cargo.lock` →
+  `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`, unchanged.
+
+An EARLIER `make ci` attempt failed on ONE unrelated test,
+`codegraph-watch watcher::tests::begin_shutdown_is_nonblocking_and_detach_skips_the_join`
+(`Option::unwrap()` on `None` at `watcher.rs:1944` — `ProjectWatcher::start`
+returned `Ok(None)`, i.e. the in-process `HOME`/env mutation of a concurrently
+running `policy.rs` test made the watch policy refuse the temp root). Nothing in
+this change touches `codegraph-watch`; `git diff --stat` covers only
+`codegraph-extract` + two docs files. Re-run in isolation: the single test → exit 0
+five times in a row, and the whole `-p codegraph-watch --lib` suite → exit 0 six
+times in a row (100 passed each). It is the same class of in-process env race as
+the known `install_completions_writes_zsh_fish_elvish_into_home` flake and was NOT
+weakened, skipped or modified. The subsequent full `make ci` was green twice.
+
+That first failing run also left four untracked SQLite byproducts
+(`reference/golden/{arkts,godot}/colby.db-{wal,shm}`) from the equivalence oracle;
+they are not in `.gitignore`, so they were deleted before staging. The tracked
+golden files were never modified.
+
+`lsp_diagnostics` was attempted and again refused this worktree (`LSP file path must
+be inside request cwd`); locked Cargo is the fallback, as in every prior batch. No
+dependency, version or `Cargo.lock` byte changed.
