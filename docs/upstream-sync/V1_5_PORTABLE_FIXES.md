@@ -4153,3 +4153,90 @@ golden files were never modified.
 `lsp_diagnostics` was attempted and again refused this worktree (`LSP file path must
 be inside request cwd`); locked Cargo is the fallback, as in every prior batch. No
 dependency, version or `Cargo.lock` byte changed.
+
+## Batch C1 — calls through an imported singleton resolve to the method (2026-07-28)
+
+Ports upstream `2ec877b` (`fix(resolution): calls through an imported singleton
+resolve to the method`, upstream #1315 / issue #1292). Resolution behavior only;
+no extraction, schema or node-ID change.
+
+### Red (documented, with the actual wrong output)
+
+Five new `#[test]`s in `crates/codegraph-resolve/src/import_resolver.rs` drive the
+REAL production entry point `resolve_via_import` over the in-crate `TestContext`
+graph. The shape is upstream's exact repro: `src/store.ts` exports
+`class ReproStore { notifyJoinGuildStatus() }` plus
+`export const reproStore = new ReproStore();`, and `src/caller.ts` calls
+`reproStore.notifyJoinGuildStatus()` after `import { reproStore } from './store'`.
+
+`cargo test --locked -p codegraph-resolve --lib -- imported_singleton` on the
+pre-change bytes → **1 failed, 4 passed**:
+
+| assertion                                              | expected                       | ACTUAL on pre-change bytes |
+| ------------------------------------------------------ | ------------------------------ | -------------------------- |
+| `imported_singleton_call_resolves_to_the_class_method` | `method:notifyJoinGuildStatus` | `constant:reproStore`      |
+
+That is the defect verbatim: `find_exported_symbol` resolves the base to the
+exported CONSTANT and the `Calls` edge lands there, so `callers
+notifyJoinGuildStatus` misses every cross-file use while the identical same-file
+call resolves to the method through local-variable receiver inference (#1108).
+The other four tests are the guard set (member READ still targets the value;
+uninferable initializer keeps the constant; a member the type does not declare
+keeps the constant; a same-named local in another function must not donate a
+type) — they passed pre-change and must keep passing, so they are guards, not Reds.
+
+### Green (minimal)
+
+- `crates/codegraph-resolve/src/name_matcher.rs`: `resolve_method_on_type`,
+  `normalize_inferred_type_name`, `local_receiver_type_patterns` and
+  `regex_escape` widened from private to `pub(crate)`. No body changed — this
+  mirrors upstream's `export` of the same three helpers.
+- `crates/codegraph-resolve/src/import_resolver.rs`: new
+  `resolve_imported_instance_member`, consulted in the non-namespace branch of
+  `resolve_via_import`'s member-descend BEFORE `resolve_static_member`. It fires
+  only for `EdgeKind::Calls` on a `Constant`/`Variable` target, reads the value's
+  type from ITS OWN declaration lines (`value.start_line..=value.end_line`) via
+  the shared #1108 pattern table, and resolves the member through
+  `resolve_method_on_type` at confidence 0.85 / `ResolvedBy::InstanceMethod`.
+  Validation failure returns `None`, so the pre-existing constant edge stands —
+  a silent keep, never a fabricated edge. This is the same discipline as B1
+  (`1839504`): when the receiver cannot be typed, emit nothing rather than fall
+  through to bare-name guessing.
+
+The declaration-slice bound is why the line-6 local in
+`imported_singleton_type_is_read_only_from_its_own_declaration_lines` cannot type
+the line-9 constant.
+
+### Golden row delta
+
+NONE. `git diff --stat 87a46dc..HEAD -- reference/golden/` → **empty output**,
+and `git status --porcelain reference/golden/` → empty. Expected: the classification
+is golden-neutral, and the fixture corpus contains no imported-singleton call shape,
+so no golden row can move.
+
+### Negative control, executed
+
+Replaced the `return Some(instance_member)` with a discarding
+`let _ = resolve_imported_instance_member(...)` (call kept so the function stays
+live) and re-ran: `imported_singleton_call_resolves_to_the_class_method` went RED
+again with the SAME wrong value `constant:reproStore`; the four guards stayed
+green. Restored from the pre-control copy and verified
+`sha256sum -c` → `crates/codegraph-resolve/src/import_resolver.rs: OK`
+(`1a1743ff88e8d7682ea61b0aa6ef91cba42e9bb1cb38a9864c5addc2068efa51`).
+
+### Verification (actual exit statuses)
+
+- `bash scripts/check-workspace-versions.sh` → exit 0 (workspace 0.40.4, 10
+  packages), run before every Cargo batch; every Cargo command used `--locked`.
+- `cargo test --locked -p codegraph-resolve --lib -- imported_singleton` → exit 0,
+  **5 passed**.
+- `cargo test --locked -p codegraph-resolve --lib` → exit 0, **649 passed, 0
+  failed**.
+- `cargo clippy --locked -p codegraph-resolve --all-targets -- -D warnings` → exit 0.
+- `cargo test --locked -p codegraph-bench --test equivalence` → exit 0, **26
+  passed, 0 failed** (unchanged 26/26).
+- `git diff --stat 87a46dc..HEAD -- reference/golden/` → empty.
+
+`lsp_diagnostics` was attempted and again refused this worktree (`LSP file path
+must be inside request cwd`); locked Cargo clippy/test is the honest fallback and
+no LSP-clean result is claimed. No dependency, version or `Cargo.lock` byte changed.

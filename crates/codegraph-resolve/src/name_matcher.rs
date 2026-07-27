@@ -338,7 +338,7 @@ fn prefer_call_site_file(nodes: Vec<Node>, call_site_file: &str) -> Vec<Node> {
 /// Resolve a method on a type, walking supertypes (`resolveMethodOnType`,
 /// `name-matcher.ts:254-331`).
 #[allow(clippy::too_many_arguments)]
-fn resolve_method_on_type(
+pub(crate) fn resolve_method_on_type(
     type_name: &str,
     method_name: &str,
     reference: &RefView,
@@ -435,7 +435,7 @@ fn cpp_class_exists(name: &str, reference: &RefView, context: &dyn ResolutionCon
 
 /// Escape a receiver for embedding in a `Regex` (the JS
 /// `/[.*+?^${}()|[\]\\]/g` set, `name-matcher.ts:523`).
-fn regex_escape(s: &str) -> String {
+pub(crate) fn regex_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         if matches!(
@@ -750,7 +750,7 @@ fn is_non_type_receiver_token(seg: &str) -> bool {
 /// Normalize a captured type expression to a simple type name: drop generic
 /// args and pointer/ref markers, take the last `.`/`::`-qualified segment, and
 /// reject obvious non-types (`normalizeInferredTypeName`, name-matcher.ts:#1108).
-fn normalize_inferred_type_name(raw: &str) -> Option<String> {
+pub(crate) fn normalize_inferred_type_name(raw: &str) -> Option<String> {
     static GENERICS: OnceLock<Regex> = OnceLock::new();
     let generics = GENERICS.get_or_init(|| Regex::new(r"<[^>]*>").expect("inferred generics re"));
     let cleaned = generics.replace_all(raw, "");
@@ -768,7 +768,7 @@ fn normalize_inferred_type_name(raw: &str) -> Option<String> {
 /// most-specific first. The type-annotation / typed-parameter forms (#1125) are
 /// baked into the second pattern per language. Languages without a pattern set
 /// (the C++ path uses its own dedicated inferrer) return an empty vector.
-fn local_receiver_type_patterns(language: Language, r: &str) -> Vec<Regex> {
+pub(crate) fn local_receiver_type_patterns(language: Language, r: &str) -> Vec<Regex> {
     local_receiver_type_patterns_tagged(language, r)
         .into_iter()
         .map(|(re, _)| re)
