@@ -281,7 +281,18 @@ UObject` plus line-leading `GENERATED_BODY()`/`UPROPERTY(...)`/`UFUNCTION()`,
   reclassifies the `.h` to C++, and the offset-preserving pre-parse blanking
   recovers the `UFoo` class + its `Extends UObject` clause (both dropped before).
 
-Four further files exercise the Batch B C++ gains:
+Five further files exercise the Batch B C/C++ gains:
+
+- **C leading attribute macros** (upstream #1311) — `attr_macro.c` is the one `.c`
+  file in this corpus (extension-mapped to `Language::C`, so it guards the C
+  walker, not the C++ one). It `#define`s an attribute macro + a `VOID` macro,
+  `typedef`s `UINT32`, and declares four functions: two behind the macro
+  (`GoodName` with a macro return type, `LostName` with a typedef'd one), one
+  without it (`NoAttr`, the control), and one pointer-returning (`PtrRet`).
+  tree-sitter's C grammar reads the macro as the type and the real return type as
+  the declarator, so before the fix these indexed under the RETURN TYPE's name
+  (`VOID` / `UINT32`); the golden now pins all four under their real names with
+  their real return types.
 
 - **namespaced out-of-line method + fully-qualified call** (upstream #1310) —
   `namespaced_member.hpp` declares `namespace simulator { class ManifestStartup }`
@@ -314,12 +325,13 @@ A further file exercises the Batch B explicit-operator gain (upstream #1268):
   `Vec2::operator[]`, `Vec2::get`).
 
 The minimal source corpus lives at `crates/codegraph-bench/fixtures/cpp/`
-(`base.hpp`, `derived.cpp`, `namespaced.cpp`, `namespaced_member.cpp`,
-`namespaced_member.hpp`, `operators.cpp`, `template_method.cpp`,
-`templated_call.cpp`, `ue_actor.h`). The inheritance base classes live in a
-`.hpp` file (not `.h`,
+(`attr_macro.c`, `base.hpp`, `derived.cpp`, `namespaced.cpp`,
+`namespaced_member.cpp`, `namespaced_member.hpp`, `operators.cpp`,
+`template_method.cpp`, `templated_call.cpp`, `ue_actor.h`). The inheritance base
+classes live in a `.hpp` file (not `.h`,
 which maps to `Language::C` by extension); `ue_actor.h` deliberately uses `.h` to
-guard the content-based C++ reclassification.
+guard the content-based C++ reclassification, and `attr_macro.c` uses `.c` so the
+C walker (not the C++ one) is the thing under test.
 
 Regenerate the committed database + canonical JSON reproducibly from the corpus:
 

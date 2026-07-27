@@ -3835,3 +3835,102 @@ codegraph-bench` → exit 0, **1385 passed across 35 test binaries, 0 failed**,
 `lsp_diagnostics` remains unusable in this worktree (`LSP file path must be inside
 request cwd`); locked Cargo is the fallback. No dependency, version or
 `Cargo.lock` byte changed.
+
+## Batch B4 — blank leading C attribute macros so functions index under real names (2026-07-28)
+
+Ports upstream `b6a05d1` (`fix(c): blank leading attribute macros so functions
+index under real names`, upstream #1311 / issue #1211). Behavior only.
+
+### Red (documented, with the actual wrong output)
+
+Four new `#[test]`s in `crates/codegraph-extract/src/walker.rs` drive the REAL
+extraction path (`extract_source` for `Language::C` → `CSpec::pre_parse` → the
+walker). `cargo test --locked -p codegraph-extract --lib -- c_leading_attr_macro
+c_isolation_table c_plain_typedef_return` → **3 failed, 1 passed** on the
+pre-change bytes:
+
+| assertion                                                    | expected  | ACTUAL on pre-change bytes |
+| ------------------------------------------------------------ | --------- | -------------------------- |
+| `SEC_ATTR UINT32 Foo (VOID) { … }`                           | `["Foo"]` | `["UINT32"]`               |
+| `SEC_ATTR VOID Foo (VOID) { }`                               | `["Foo"]` | `["VOID"]`                 |
+| `SEC_ATTR unsigned int f(void)` (control, must be untouched) | `["f"]`   | `["int"]`                  |
+
+The name is the RETURN TYPE, not the function — exactly upstream's defect (their
+grammar/spacing lost the name into the parameter list, `"(VOID)"`; this Rust
+workspace's `tree-sitter-c 0.24.2` loses it into the return type instead). Either
+way the real symbol is unfindable.
+
+Honest scoping note: `c_isolation_table_functions_all_index_under_real_names`
+PASSED pre-change and is therefore a guard, not a Red. With `#define`/`typedef`
+lines present ahead of them, that particular multi-declaration shape already
+recovered the names in this grammar version; it is kept because it pins the whole
+issue table (including the `RawAttr` raw-`__attribute__` and `OneNamedArg`
+non-void-param rows) against future regressions. The `c_plain_typedef_return...`
+control's `SEC_ATTR unsigned int f(void)` row was ALSO red pre-change and is now
+green — a real gain, not just a control.
+
+### Green (minimal)
+
+New `blank_c_leading_attr_macros` in `crates/codegraph-extract/src/lang/c.rs`,
+called from `CSpec::pre_parse` BEFORE the existing content-gated CUDA blank. It is
+structural, not a curated macro list: a line-leading ALL-CAPS token of ≥3 chars
+followed by TWO identifier tokens (`*` allowed between them for pointer returns)
+and then `(` — the `MACRO Ret name(` definition shape. The macro is replaced with
+equal-length ASCII spaces, so byte offsets and therefore all line/column values
+are preserved, exactly like the C++ blanks. `MACRO name(` calls, `#define` lines
+(they start with `#`, which `^[ \t]*` cannot skip), and mid-line uses are rejected
+by construction; a source with no match is returned unchanged.
+
+Four unit tests in `lang/c.rs` pin the blank itself: the definition shape, byte
+and newline-count preservation, pointer returns, and five untouched shapes
+(plain typedef return, ALL-CAPS call, `#define` line, multi-word builtin return,
+mid-line use).
+
+### Negative control, executed
+
+`CSpec::pre_parse` was edited in place to skip the new blank
+(`let blanked = source.to_string();`). Both `c_leading_attr_macro_*` tests went RED
+again on the same wrong values (`["UINT32"]`, `["VOID"]`) while the four
+`blank_c_leading_attr_macro_*` unit tests stayed green — proving those unit tests
+alone do NOT cover the production path and the walker tests do. The file was
+restored and re-proved as SHA-256
+`d4735def134c9fa94d26fb132ec210bd67e2a993883488ee89b32e409a09aae7`, the
+pre-mutation hash.
+
+### Golden row delta (`reference/golden/cpp/`, additions only)
+
+New fixture `crates/codegraph-bench/fixtures/cpp/attr_macro.c` — the corpus's
+first `.c` file, so it exercises the C walker rather than the C++ one. `git diff
+--numstat reference/golden/` showed ONLY `cpp/` paths: `files.json +8/-0`,
+`nodes.json +132/-0`, `edges.json +45/-0`, `colby.db` binary; `refs.json` and
+`schema.sql` byte-identical. Deleted-line count across the three JSON files:
+**0**.
+
+Added rows: the `files.json` entry (`"language": "c"`, `node_count` 6) and 6
+nodes — `file attr_macro.c`, `type_alias UINT32` @4, and four functions with
+their REAL names and real return types: `GoodName` @6 (`rt=VOID`), `LostName` @9
+(`rt=UINT32`), `NoAttr` @13 (`rt=UINT32`, the no-macro control), `PtrRet` @17
+(`rt=UINT32`) — plus 5 `contains` edges from the file to each. Before this change
+`GoodName` would have indexed as `VOID` and `LostName`/`PtrRet` as `UINT32`,
+colliding on the return-type names and losing all three real symbols.
+
+### Verification (actual exit statuses)
+
+- `bash scripts/check-workspace-versions.sh` → exit 0, before every Cargo batch;
+  every Cargo command used `--locked`.
+- `cargo build --locked --release -p codegraph-rs` → exit 0.
+- `cargo test --locked -p codegraph-extract --lib -- blank_c_leading_attr_macro
+c_leading_attr_macro c_isolation_table c_plain_typedef_return c_header_cuda
+c_plain_untouched` → exit 0, **10 passed** (the pre-existing
+  `c_header_cuda_content_blanked` and `c_plain_untouched` prove the new blank did
+  not disturb the CUDA path or plain C).
+- `cargo test --locked -p codegraph-extract -p codegraph-resolve -p
+codegraph-bench` → exit 0, **1393 passed across 35 test binaries, 0 failed**,
+  including `generated_golden_matches_committed_cpp_fixture`,
+  `cpp_db_is_self_equivalent_to_cpp_golden`, and the untouched godot / ruby / mini
+  oracles.
+- `git diff --numstat reference/golden/` → only `cpp/` paths.
+
+`lsp_diagnostics` remains unusable in this worktree (`LSP file path must be inside
+request cwd`); locked Cargo is the fallback. No dependency, version or
+`Cargo.lock` byte changed.

@@ -5592,6 +5592,89 @@ struct Bar { int x; };
         assert!(has_node(&nodes, NodeKind::Struct, "Bar"));
     }
 
+    // ---- Batch B4: C leading attribute macros (upstream b6a05d1) ----
+
+    fn c_names(src: &str) -> Vec<String> {
+        let (nodes, _) = run("attrs.c", src, Language::C);
+        nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Function)
+            .map(|n| n.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn c_leading_attr_macro_function_indexes_under_its_real_name() {
+        let names = c_names("SEC_ATTR UINT32 Foo (VOID) { return 0; }\n");
+        assert_eq!(
+            names,
+            vec!["Foo".to_string()],
+            "a function behind a leading attribute macro must index as `Foo`"
+        );
+    }
+
+    #[test]
+    fn c_leading_attr_macro_with_macro_return_type_indexes_under_its_real_name() {
+        let names = c_names("SEC_ATTR VOID Foo (VOID) { }\n");
+        assert_eq!(
+            names,
+            vec!["Foo".to_string()],
+            "a macro return type behind a leading attribute macro must not become the name"
+        );
+    }
+
+    #[test]
+    fn c_isolation_table_functions_all_index_under_real_names() {
+        let src = concat!(
+            "#define SEC_ATTR __attribute__((section(\".init\")))\n",
+            "typedef unsigned int UINT32;\n",
+            "#define VOID void\n",
+            "\n",
+            "SEC_ATTR VOID   GoodName (VOID)  { }\n",
+            "SEC_ATTR UINT32 LostName (VOID)  { return 0; }\n",
+            "UINT32 NoAttr (void) { return 0; }\n",
+            "SEC_ATTR int BuiltinRet (void) { return 0; }\n",
+            "__attribute__((section(\".init\"))) UINT32 RawAttr (void) { return 0; }\n",
+            "SEC_ATTR UINT32 OneNamedArg (UINT32 x) { return x; }\n",
+            "SEC_ATTR UINT32 *PtrRet (VOID) { return 0; }\n"
+        );
+        let names = c_names(src);
+        for want in [
+            "GoodName",
+            "LostName",
+            "NoAttr",
+            "BuiltinRet",
+            "RawAttr",
+            "OneNamedArg",
+            "PtrRet",
+        ] {
+            assert!(
+                names.iter().any(|n| n == want),
+                "missing `{want}` among C function names: {names:?}"
+            );
+        }
+        assert!(
+            !names.iter().any(|n| n.contains('(')),
+            "no parameter list may be stored as a function name: {names:?}"
+        );
+    }
+
+    #[test]
+    fn c_plain_typedef_return_and_macro_call_shapes_unaffected() {
+        assert_eq!(c_names("UINT32 helper (void) { return 0; }\n"), ["helper"]);
+        assert_eq!(
+            c_names("SEC_ATTR unsigned int f(void) { return 0; }\n"),
+            ["f"]
+        );
+        let (nodes, _) = run("call.c", "void g(void) { MY_ASSERT(x); }\n", Language::C);
+        let names: Vec<&str> = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Function)
+            .map(|n| n.name.as_str())
+            .collect();
+        assert_eq!(names, ["g"]);
+    }
+
     // #1093 NEGATIVE — a bodiless class in a language where that is a COMPLETE
     // definition (Kotlin `class Empty`) must still be indexed.
     #[test]

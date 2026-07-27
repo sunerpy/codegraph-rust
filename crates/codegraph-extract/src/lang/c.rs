@@ -1,6 +1,9 @@
 //! C `LanguageSpec`, ported from `upstream extraction/languages/c-cpp.ts:98-142`.
 
+use std::sync::OnceLock;
+
 use codegraph_core::types::{Language, NodeKind};
+use regex::Regex;
 use tree_sitter::{Language as TsLanguage, Node};
 
 use crate::spec::{ImportInfo, LanguageSpec};
@@ -80,12 +83,55 @@ impl LanguageSpec for CSpec {
         include_import(node, source)
     }
     fn pre_parse(&self, source: &str, _file_path: &str) -> String {
-        if crate::lang::cpp::looks_like_cuda_source(source) {
-            crate::lang::cpp::blank_cuda_constructs_str(source)
+        let blanked = blank_c_leading_attr_macros(source);
+        if crate::lang::cpp::looks_like_cuda_source(&blanked) {
+            crate::lang::cpp::blank_cuda_constructs_str(&blanked)
         } else {
-            source.to_string()
+            blanked
         }
     }
+}
+
+/// Blank an unknown attribute macro sitting in front of a C function
+/// definition's return type: `SEC_ATTR UINT32 LostName(VOID) { … }` (a macro
+/// wrapping `__attribute__((…))`, common in embedded/kernel/firmware C).
+/// tree-sitter's C grammar reads the macro as the declaration's type and the real
+/// return type as the declarator, so the function indexes under the RETURN TYPE's
+/// name (`UINT32`) or, in other spacings, under its parameter list — the real name
+/// is lost and the symbol is unfindable (#1311).
+///
+/// Attribute macros are project-specific, so this keys on STRUCTURE, not a
+/// curated list, matched tightly: a line-leading (declaration-position) ALL-CAPS
+/// token of ≥3 chars, followed by TWO identifier tokens (return type, then name;
+/// `*` allowed between them for pointer returns) and then `(` — i.e. exactly the
+/// `MACRO Ret name(` definition shape. `MACRO name(` calls, `#define` lines (they
+/// start with `#`, which `^[ \t]*` cannot skip), multi-word builtin returns
+/// (`MACRO unsigned int f(`, where the grammar already keeps the name), and
+/// mid-line uses are all rejected by construction.
+///
+/// Blanking replaces the macro with equal-length ASCII spaces, so every byte
+/// offset — and therefore every line/column — is preserved, exactly like the C++
+/// blanks in `lang/cpp.rs`.
+fn blank_c_leading_attr_macros(source: &str) -> String {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"(?m)^[ \t]*([A-Z][A-Z0-9_]{2,})\s+[A-Za-z_]\w*[\s*]+[A-Za-z_]\w*\s*\(")
+            .expect("c-leading-attr-macro regex")
+    });
+    let spans: Vec<(usize, usize)> = re
+        .captures_iter(source)
+        .filter_map(|caps| caps.get(1).map(|m| (m.start(), m.end())))
+        .collect();
+    if spans.is_empty() {
+        return source.to_string();
+    }
+    let mut bytes = source.as_bytes().to_vec();
+    for (start, end) in spans {
+        for b in bytes.iter_mut().take(end).skip(start) {
+            *b = b' ';
+        }
+    }
+    String::from_utf8(bytes).unwrap_or_else(|_| source.to_string())
 }
 
 pub(crate) fn include_import(node: Node<'_>, source: &str) -> Option<ImportInfo> {
@@ -200,5 +246,46 @@ mod tests {
     fn c_plain_untouched() {
         let src = "int add(int a, int b) { return a + b; }";
         assert_eq!(CSpec.pre_parse(src, "m.c"), src);
+    }
+
+    #[test]
+    fn blank_c_leading_attr_macro_blanks_the_definition_shape() {
+        let src = "SEC_ATTR UINT32 f(void) {}";
+        let out = blank_c_leading_attr_macros(src);
+        assert_eq!(out, "         UINT32 f(void) {}");
+        assert_eq!(out.len(), src.len());
+    }
+
+    #[test]
+    fn blank_c_leading_attr_macro_is_offset_preserving() {
+        let src = "SEC_ATTR\nUINT32 f(void) {}\nSEC_ATTR VOID g(VOID) {}\n";
+        let out = blank_c_leading_attr_macros(src);
+        assert_eq!(out.len(), src.len());
+        assert_eq!(
+            out.bytes().filter(|&b| b == b'\n').count(),
+            src.bytes().filter(|&b| b == b'\n').count()
+        );
+    }
+
+    #[test]
+    fn blank_c_leading_attr_macro_leaves_other_shapes_untouched() {
+        for src in [
+            "UINT32 helper(void) {}",
+            "MY_ASSERT(x);",
+            "#define SEC_ATTR __attribute__((section(\".init\")))",
+            "SEC_ATTR unsigned int f(void) {}",
+            "x = SEC_ATTR UINT32 y(z);",
+        ] {
+            assert_eq!(blank_c_leading_attr_macros(src), src, "changed: {src}");
+        }
+    }
+
+    #[test]
+    fn blank_c_leading_attr_macro_handles_pointer_returns() {
+        let src = "SEC_ATTR UINT32 *f(void) {}";
+        assert_eq!(
+            blank_c_leading_attr_macros(src),
+            "         UINT32 *f(void) {}"
+        );
     }
 }
