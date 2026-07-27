@@ -1163,19 +1163,6 @@ fn cmd_uninit(path: Option<PathBuf>, force: bool) -> Result<()> {
     Ok(())
 }
 
-/// Daemon-startup gate (frozen plan lines 590-592, 603-604).
-///
-/// ONE bounded shared acquisition validates everything: `Store::open_for_read`
-/// acquires the shared `IndexLease` and, under it, corroborates the FULL `Current`
-/// contract — both owner-bound state slots (so `Future`, `Corrupt`, `Building`,
-/// `Uninitialized`, `Outdated`, and an owner mismatch are all refused), tombstone
-/// absence, database presence, sidecar-freedom, and the exact extraction stamp
-/// read from the checkpointed main-file bytes. Slot phase alone would let a
-/// `Current` slot with a deleted database or a stale stamp publish a rendezvous.
-///
-/// The returned `Store` OWNS that same lease, so retaining it across pid/socket
-/// publication requires no second acquisition: there is no nested lock and no
-/// window between validation and publication for another writer to reclassify.
 /// Bounded budget for the ONE exclusive acquisition of the stale-sidecar
 /// recovery attempted before the strict startup read gate.
 ///
@@ -1250,6 +1237,19 @@ fn recover_dead_owner_sidecars(paths: &codegraph_core::IndexPaths, project_root:
     }
 }
 
+/// Daemon-startup gate (frozen plan lines 590-592, 603-604).
+///
+/// ONE bounded shared acquisition validates everything: `Store::open_for_read`
+/// acquires the shared `IndexLease` and, under it, corroborates the FULL `Current`
+/// contract — both owner-bound state slots (so `Future`, `Corrupt`, `Building`,
+/// `Uninitialized`, `Outdated`, and an owner mismatch are all refused), tombstone
+/// absence, database presence, sidecar-freedom, and the exact extraction stamp
+/// read from the checkpointed main-file bytes. Slot phase alone would let a
+/// `Current` slot with a deleted database or a stale stamp publish a rendezvous.
+///
+/// The returned `Store` OWNS that same lease, so retaining it across pid/socket
+/// publication requires no second acquisition: there is no nested lock and no
+/// window between validation and publication for another writer to reclassify.
 fn authorize_daemon_startup(project_root: &Path) -> Result<codegraph_daemon::StartupAuthorization> {
     let paths = index_paths(project_root)?;
     recover_dead_owner_sidecars(&paths, project_root);
