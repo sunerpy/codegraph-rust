@@ -4123,7 +4123,7 @@ fn is_builtin_type(name: &str) -> bool {
     )
 }
 
-fn strip_cpp_template_args(name: &str) -> String {
+pub(crate) fn strip_cpp_template_args(name: &str) -> String {
     let mut depth: i32 = 0;
     let mut out = String::with_capacity(name.len());
     for ch in name.chars() {
@@ -5900,6 +5900,107 @@ WINAPI HRESULT DoThing(int x) { return x; }
         let (nodes, _) = run("anon.cpp", src, Language::Cpp);
         let f = node(&nodes, NodeKind::Function, "f");
         assert_eq!(f.qualified_name, "f");
+    }
+
+    // ---- Batch B2: out-of-line template method receivers (upstream 4dd29ea) ----
+
+    #[test]
+    fn cpp_out_of_line_template_method_receiver_strips_template_args() {
+        let src = concat!(
+            "template <typename T>\n",
+            "class Box {\n",
+            "public:\n",
+            "    T get() const;\n",
+            "    void set(T v);\n",
+            "};\n",
+            "\n",
+            "template <typename T> T Box<T>::get() const { return T(); }\n",
+            "template <typename T> void Box<T>::set(T v) {}\n"
+        );
+        let (nodes, _) = run("box.cpp", src, Language::Cpp);
+        let qns: Vec<&str> = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Method)
+            .map(|n| n.qualified_name.as_str())
+            .collect();
+        assert!(
+            qns.contains(&"Box::get"),
+            "out-of-line `Box<T>::get` should qualify as `Box::get`, got: {qns:?}"
+        );
+        assert!(
+            qns.contains(&"Box::set"),
+            "out-of-line `Box<T>::set` should qualify as `Box::set`, got: {qns:?}"
+        );
+        assert!(
+            !qns.iter().any(|q| q.contains('<')),
+            "no method qualified name may keep template args, got: {qns:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_multiline_template_parameter_list_cannot_leak_into_qualified_name() {
+        let src = concat!(
+            "template <typename CType,\n",
+            "          typename CPPType,\n",
+            "          int kSentinelConstantForTheHelperTemplateClassInstanceGuardLong>\n",
+            "class ApiHelper {\n",
+            "public:\n",
+            "    CPPType* validate();\n",
+            "};\n",
+            "\n",
+            "template <typename CType,\n",
+            "          typename CPPType,\n",
+            "          int kSentinelConstantForTheHelperTemplateClassInstanceGuardLong>\n",
+            "CPPType* ApiHelper<CType,\n",
+            "                   CPPType,\n",
+            "                   kSentinelConstantForTheHelperTemplateClassInstanceGuardLong>::validate() {\n",
+            "    return nullptr;\n",
+            "}\n"
+        );
+        let (nodes, _) = run("capi_helper.cpp", src, Language::Cpp);
+        let validate = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Method && n.name == "validate")
+            .find(|n| n.qualified_name.contains("::"))
+            .expect("out-of-line validate method");
+        assert_eq!(
+            validate.qualified_name, "ApiHelper::validate",
+            "multi-line template parameter list must not leak into the qualified name"
+        );
+        assert!(
+            !validate.qualified_name.contains(['<', '>', '\n']),
+            "qualified name must carry no template/newline bytes: {:?}",
+            validate.qualified_name
+        );
+        assert!(
+            validate.qualified_name.len() < 255,
+            "qualified name must stay under NAME_MAX, got {} bytes",
+            validate.qualified_name.len()
+        );
+    }
+
+    #[test]
+    fn cpp_out_of_line_template_method_links_to_its_class() {
+        let src = concat!(
+            "template <typename T>\n",
+            "class Box {\n",
+            "public:\n",
+            "    T get() const;\n",
+            "};\n",
+            "\n",
+            "template <typename T> T Box<T>::get() const { return T(); }\n"
+        );
+        let (nodes, _) = run("box_link.cpp", src, Language::Cpp);
+        let class = node(&nodes, NodeKind::Class, "Box");
+        let method = nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Method && n.name == "get")
+            .expect("get method");
+        assert_eq!(
+            method.qualified_name,
+            format!("{}::get", class.qualified_name),
+            "the out-of-line definition must share the class node's qualifier"
+        );
     }
 
     #[test]

@@ -3678,3 +3678,78 @@ with `LSP file path must be inside request cwd` (the worktree at
 `/config/workspace/ProdDir/AI/.cgworktrees/v15-impl` is outside the request cwd),
 so locked Cargo build/Clippy/test is the honest fallback and no LSP-clean result
 is claimed. No dependency, version or `Cargo.lock` byte changed.
+
+## Batch B2 — strip template args from out-of-line method receiver qualifiers (2026-07-28)
+
+Ports upstream `4dd29ea` (`fix(cpp): strip template args from out-of-line method
+receiver qualifiers`, upstream #1309 / issue #1286). Behavior only.
+
+### Red (documented, with the actual wrong output)
+
+Three new `#[test]`s in `crates/codegraph-extract/src/walker.rs` drive the REAL
+extraction path (`extract_source` → `Walker::extract_method` →
+`CppSpec::get_receiver_type`). `cargo test --locked -p codegraph-extract --lib --
+cpp_out_of_line cpp_multiline_template` → **3 failed, 0 passed**:
+
+| assertion                                            | expected                   | ACTUAL on pre-change bytes                                                                                                                   |
+| ---------------------------------------------------- | -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `template <typename T> T Box<T>::get()` + `set`      | `["Box::get", "Box::set"]` | `["Box<T>::get", "Box<T>::set"]`                                                                                                             |
+| out-of-line method shares its class node's qualifier | `Box::get`                 | `Box<T>::get` (class node is `Box`)                                                                                                          |
+| ICU-shaped multi-line parameter list                 | `ApiHelper::validate`      | `"ApiHelper<CType,\n                   CPPType,\n                   kSentinelConstantForTheHelperTemplateClassInstanceGuardLong>::validate"` |
+
+The third Red is the NAME_MAX shape upstream reports: the qualified name carried
+embedded newlines and the whole `<…>` block.
+
+### Green (minimal)
+
+`CppSpec::get_receiver_type` (`crates/codegraph-extract/src/lang/cpp.rs`) now runs
+the receiver qualifier through `strip_cpp_template_args` — the SAME normalization
+#1043 already applies to base-class refs — and returns `None` when stripping
+leaves nothing. `strip_cpp_template_args` was widened from private to
+`pub(crate)` in `walker.rs`; its body is unchanged, so the #1043 templated-base
+behavior is bit-identical.
+
+### Negative control, executed
+
+The single new call was reverted in place
+(`strip_cpp_template_args(&parts[..len-1].join("::"))` → `parts[..len-1].join("::")`)
+and all three tests went RED again on the same wrong values; the file was then
+restored and re-proved as SHA-256
+`42fcc019fe88ce2178a7ace9eec32e53778d65bfdddeeda2afbd21e16ff35a43`, the
+pre-mutation hash. The tests therefore exercise the production path, not a helper
+call.
+
+### Golden row delta (`reference/golden/cpp/`, additions only)
+
+New fixture `crates/codegraph-bench/fixtures/cpp/template_method.cpp`
+(`template <typename T> class Box` with `get`/`set` declared inline and defined
+out-of-line). `git diff --numstat reference/golden/` showed ONLY `cpp/` paths:
+`files.json +8/-0`, `nodes.json +88/-0`, `edges.json +45/-0`, `colby.db` binary;
+`refs.json` and `schema.sql` byte-identical (`git diff --stat` on both is empty).
+Deleted-line count across the three JSON files: **0**.
+
+Added rows: 4 `template_method.cpp` nodes (file, `class Box` @2, `method Box::get`
+@12, `method Box::set` @17) and 5 `contains` edges — `file → class Box`,
+`file → Box::get`, `file → Box::set`, and critically `class Box → Box::get` /
+`class Box → Box::set`. Those last two are the fix: with a `Box<T>::` qualifier
+the out-of-line definitions never matched the `Box` class node, so the
+class→method containment did not exist.
+
+### Verification (actual exit statuses)
+
+- `bash scripts/check-workspace-versions.sh` → exit 0, before every Cargo batch;
+  every Cargo command used `--locked`.
+- `cargo build --locked --release -p codegraph-rs` → exit 0 (golden regeneration
+  binary).
+- `cargo test --locked -p codegraph-extract --lib -- cpp_out_of_line
+cpp_multiline_template` → exit 0, **3 passed**.
+- `cargo test --locked -p codegraph-extract -p codegraph-resolve -p
+codegraph-bench` → exit 0, **1382 passed across 35 test binaries, 0 failed**,
+  including `generated_golden_matches_committed_cpp_fixture` and the untouched
+  `..._godot_fixture` / `..._ruby_fixture` / `..._mini_fixture` oracles.
+- `git diff --numstat reference/golden/` → only `cpp/` paths; godot, ruby and the
+  original upstream corpus unchanged.
+
+`lsp_diagnostics` remains unusable in this worktree (`LSP file path must be inside
+request cwd`), so locked Cargo is the fallback; no LSP-clean claim is made. No
+dependency, version or `Cargo.lock` byte changed.

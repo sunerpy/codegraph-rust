@@ -281,6 +281,16 @@ UObject` plus line-leading `GENERATED_BODY()`/`UPROPERTY(...)`/`UFUNCTION()`,
   reclassifies the `.h` to C++, and the offset-preserving pre-parse blanking
   recovers the `UFoo` class + its `Extends UObject` clause (both dropped before).
 
+Two further files exercise the Batch B C++ gains:
+
+- **out-of-line template method receivers** (upstream #1309) —
+  `template_method.cpp` declares `template <typename T> class Box` with `get` /
+  `set` and defines both OUT OF LINE (`template <typename T> T Box<T>::get()`).
+  The receiver qualifier carries `<T>`, which the class node never spells, so the
+  golden pins both methods at `Box::get` / `Box::set` (template args stripped)
+  plus the `contains` edges from `class Box` to each — the link that a `Box<T>::`
+  qualifier breaks.
+
 A further file exercises the Batch B explicit-operator gain (upstream #1268):
 
 - **explicit operator calls** — `operators.cpp` defines `struct Vec2` with
@@ -294,7 +304,8 @@ A further file exercises the Batch B explicit-operator gain (upstream #1268):
 
 The minimal source corpus lives at `crates/codegraph-bench/fixtures/cpp/`
 (`base.hpp`, `derived.cpp`, `namespaced.cpp`, `operators.cpp`,
-`templated_call.cpp`, `ue_actor.h`). The inheritance base classes live in a
+`template_method.cpp`, `templated_call.cpp`, `ue_actor.h`). The inheritance base
+classes live in a
 `.hpp` file (not `.h`,
 which maps to `Language::C` by extension); `ue_actor.h` deliberately uses `.h` to
 guard the content-based C++ reclassification.

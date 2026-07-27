@@ -8,7 +8,7 @@ use tree_sitter::{Language as TsLanguage, Node};
 
 use crate::lang::c::{include_import, normalize_c_return_type};
 use crate::spec::{ImportInfo, LanguageSpec};
-use crate::walker::{child_by_field, node_text};
+use crate::walker::{child_by_field, node_text, strip_cpp_template_args};
 
 pub struct CppSpec;
 
@@ -84,7 +84,18 @@ impl LanguageSpec for CppSpec {
             .filter(|part| !part.is_empty())
             .map(str::to_string)
             .collect::<Vec<_>>();
-        (parts.len() > 1).then(|| parts[..parts.len() - 1].join("::"))
+        if parts.len() <= 1 {
+            return None;
+        }
+        // An out-of-line template method definition spells the class's template
+        // parameter list in the qualifier (`template<typename T> T Box<T>::get()`)
+        // while the class node is indexed as bare `Box` — strip `<…>` so the
+        // receiver matches it, the same normalization #1043 applies to
+        // base-class refs. A multi-line parameter list otherwise leaks whole
+        // `<…>` blocks (newlines included) into `qualified_name`, which can
+        // exceed NAME_MAX (#1309).
+        let receiver = strip_cpp_template_args(&parts[..parts.len() - 1].join("::"));
+        (!receiver.is_empty()).then_some(receiver)
     }
     fn get_return_type(&self, node: Node<'_>, source: &str) -> Option<String> {
         recover_return_type(node, source)

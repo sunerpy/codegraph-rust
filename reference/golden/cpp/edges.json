@@ -236,6 +236,24 @@
     "line": null,
     "metadata": null,
     "provenance": null,
+    "source": "class:c4e79d14ebfa98f8a715418e5d9039ea",
+    "target": "method:34801631009cb62d1b5b49935d950e4b"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:c4e79d14ebfa98f8a715418e5d9039ea",
+    "target": "method:39b1fd1d8987dd97a48578bd976bee5a"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
     "source": "class:e436be77a00102552decf9de5d7cc052",
     "target": "method:a6af941ba6640f7d90fbc15666e6ba07"
   },
@@ -400,6 +418,33 @@
     "provenance": null,
     "source": "file:operators.cpp",
     "target": "struct:a79c39917f9987d43250fce7bde68405"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:template_method.cpp",
+    "target": "class:c4e79d14ebfa98f8a715418e5d9039ea"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:template_method.cpp",
+    "target": "method:34801631009cb62d1b5b49935d950e4b"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:template_method.cpp",
+    "target": "method:39b1fd1d8987dd97a48578bd976bee5a"
   },
   {
     "col": null,
