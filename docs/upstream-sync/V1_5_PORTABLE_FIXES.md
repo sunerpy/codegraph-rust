@@ -4240,3 +4240,148 @@ green. Restored from the pre-control copy and verified
 `lsp_diagnostics` was attempted and again refused this worktree (`LSP file path
 must be inside request cwd`); locked Cargo clippy/test is the honest fallback and
 no LSP-clean result is claimed. No dependency, version or `Cargo.lock` byte changed.
+
+## Batch C2 — literal-receiver builtins and nested locals stop fabricating call edges (2026-07-28)
+
+Ports upstream `c472cfb` (`fix(resolution): literal-receiver builtins and nested
+locals stop fabricating call edges`, upstream #1317 / issue #1230). Two
+independent defects, fixed independently in one behavior commit — exactly as
+upstream framed them, because the issue's repro needs both to stop producing the
+wrong edge.
+
+### Red (documented, with the actual wrong output)
+
+**Extraction half** — five new `#[test]`s in
+`crates/codegraph-extract/src/walker.rs` drive the REAL path
+(`extract_source` → `Walker::extract_call` / `extract_object_name_call`).
+`cargo test --locked -p codegraph-extract --lib -- literal_receiver identifier_receiver`
+on the pre-change bytes → **5 failed, 1 passed**:
+
+| assertion (language, shape)                                                                                    | expected      | ACTUAL on pre-change bytes                                    |
+| -------------------------------------------------------------------------------------------------------------- | ------------- | ------------------------------------------------------------- |
+| Python `", ".join(sorted(x))`                                                                                  | no `join` ref | `["join", "sorted"]`                                          |
+| Python `[1,2].append`, `{'k':1}.keys`, `{1,2}.union`, `(1,2).count`, `1.5.hex`, `None.__str__`, `True.__str__` | no refs       | `["append","keys","union","count","hex","__str__","__str__"]` |
+| TS `"x".toUpperCase`, `[1,2].map`, `` `t`.trim ``, `/re/.test`, `0xff.toString`, `true.toString`               | no refs       | `["toUpperCase","map","trim","test","toString","toString"]`   |
+| Java `"x".trim()`                                                                                              | no ref        | `["\"x\".trim"]`                                              |
+| PHP `"x"->foo()`                                                                                               | no ref        | `["\"x\".foo"]`                                               |
+
+`identifier_receiver_calls_are_unaffected_by_the_literal_guard` passed pre-change
+— it is the guard proving `sep.join` / `s.trim` survive, not a Red.
+
+**Resolution half** — five new `#[test]`s in
+`crates/codegraph-resolve/src/name_matcher.rs` drive `match_by_exact_name` over
+the in-crate `Ctx`. `cargo test --locked -p codegraph-resolve --lib -- nested_local
+class_member_candidate top_level_and_unparented` on the pre-change bytes →
+**2 failed, 3 passed**:
+
+| assertion                                           | expected | ACTUAL on pre-change bytes                                           |
+| --------------------------------------------------- | -------- | -------------------------------------------------------------------- |
+| `nested_local_is_unreachable_from_another_function` | `None`   | `Some(target_node_id: "function:join", confidence: 0.9, ExactMatch)` |
+| `nested_local_is_unreachable_from_another_file`     | `None`   | `Some(target_node_id: "function:join", confidence: 0.9, ExactMatch)` |
+
+The three passing ones (`nested_local_resolves_from_inside_its_container`,
+`class_member_candidate_is_not_scope_filtered`,
+`top_level_and_unparented_candidates_are_not_scope_filtered`) are the
+must-not-regress guards, including the C++ namespace-prefix shape whose
+qualified name carries `::` with no container node.
+
+**End-to-end half (the load-bearing one)** — one new `#[test]` in
+`crates/codegraph-resolve/src/resolver.rs`,
+`literal_receiver_and_nested_local_produce_no_fabricated_call_edge`, indexes
+upstream's exact `repro.py` from disk through `codegraph_extract::extract_file`
+and runs the PRODUCTION `resolve_and_persist`, then reads persisted `edges`.
+The decoy is present by construction: the only project `join` is nested inside
+`format_fields`, so a bare-name fallback visibly binds `", ".join` to it. On the
+pre-change bytes the nested `join` had **three** callers
+(`["function:37f4985b…", "function:dd8ad4c1…", "function:f41fd935…"]` — itself
+via `"-".join`, its container, and `report_missing`) where exactly one is
+correct.
+
+### Green (minimal)
+
+- `crates/codegraph-extract/src/walker.rs`: new `LITERAL_RECEIVER_KINDS` +
+  `is_literal_receiver`, consulted at BOTH call-extraction receiver sites — the
+  generic member-expression arm in `extract_call` and the Java/Kotlin/PHP
+  `object`/`name` arm in `extract_object_name_call`. A literal receiver returns
+  early, emitting NOTHING. Nested calls in the arguments are visited
+  independently, which is why `sorted(...)` survives.
+  The kind list is upstream's, plus `encapsed_string`: this workspace's
+  `tree-sitter-php` reports a double-quoted literal receiver under that kind,
+  which upstream's set omits. That extra entry was derived by probing the real
+  grammars in this workspace across Python/TS/Java/PHP/Ruby/Kotlin/Swift/Rust/
+  Dart/Scala/C#/Go — testing shapes the fix was NOT designed for, per the Batch B
+  lesson — and every kind in the list was observed in receiver position by that
+  probe or is upstream's verbatim entry.
+- `crates/codegraph-resolve/src/name_matcher.rs`: new `is_lexically_reachable`,
+  applied as a filter on `match_by_exact_name`'s candidate list. A `Function`
+  candidate whose `qualified_name` parent resolves to a same-file
+  `Function`/`Method` that ENCLOSES it by line range survives only when the ref
+  is in that same file AND inside the container's line range. Class members
+  (parent is class-like), top-level symbols (no `::`) and C++ namespace prefixes
+  (no container node) are untouched.
+
+Same discipline as B1 (`1839504`) and C1: when a receiver cannot aid type
+inference, emit NOTHING rather than a bare name, because a bare name falls
+through to exact-name matching and guesses among unrelated same-named symbols.
+
+### Golden row delta
+
+NONE. `git diff --stat 87a46dc..HEAD -- reference/golden/` → **empty output**;
+`git status --porcelain reference/golden/` → empty. All 26 equivalence oracles
+pass unchanged, so no fixture in the corpus contains a literal-receiver call or a
+cross-scope nested-local call. (Upstream measured −27 edges on excalidraw and
+byte-identical output on `requests`; our fixture corpus lands in the
+byte-identical class.)
+
+### Negative control, EXECUTED both ways
+
+1. Extraction guard neutered (`if is_literal_receiver(...) { return; }` →
+   `let _ = is_literal_receiver(...);` at both sites, resolution filter intact):
+   all 5 extraction Reds went RED again with the SAME wrong ref lists, AND the
+   end-to-end resolver test went RED with the nested `join` back to 3 callers.
+   Restored; `sha256sum -c` → both files OK.
+2. Resolution filter neutered (`.filter(|n| is_lexically_reachable(...) || true)`,
+   extraction guard intact): the two nested-local Reds went RED again with the
+   SAME `Some(function:join, 0.9, ExactMatch)`; the end-to-end test stayed GREEN
+   (with literal receivers emitting nothing, `report_missing` no longer reaches
+   the decoy). Restored; `sha256sum -c` → both files OK.
+
+Green hashes: `walker.rs`
+`42834fe71029cbe6977c8a699f995940911fa6432d64707c38677785a57f132c`,
+`name_matcher.rs`
+`47724ae2a13ffdcf103260b1a2f66a426aafc81696c08da7bbfb227a42fefe51`.
+
+Control 2 is the honest reading of the two-defect split: the end-to-end test is
+load-bearing for the EXTRACTION half, and the two unit Reds are load-bearing for
+the RESOLUTION half. Neither half alone covers both, which is why both are
+committed together and both controls were run.
+
+### Verification (actual exit statuses)
+
+- `bash scripts/check-workspace-versions.sh` → exit 0, before every Cargo batch;
+  every Cargo command used `--locked`.
+- `cargo test --locked -p codegraph-extract` → exit 0 (382 lib + every
+  integration target green).
+- `cargo test --locked -p codegraph-resolve` → exit 0 (655 lib + integration
+  targets green).
+- `cargo clippy --locked --workspace --all-targets -- -D warnings` → exit 0.
+- `cargo test --locked -p codegraph-bench --test equivalence` → exit 0, **26
+  passed, 0 failed** (unchanged 26/26).
+- `cargo test --locked --workspace` → **exit 101 on the first run**, failing ONLY
+  `codegraph-rs formatter_and_env_tests::install_completions_writes_zsh_fish_elvish_into_home`
+  (`assertion failed: dir.join(".config/fish/completions/codegraph.fish").is_file()`
+  at `main.rs:6202`; the printed path shows fish completions written to a
+  DIFFERENT temp home — the known in-process `HOME`/`XDG_DATA_HOME` race). That
+  test is unrelated to resolution or extraction and was NOT weakened, skipped or
+  modified. Re-run in isolation via `-p codegraph-rs --bin codegraph` → exit 0
+  four times in a row (1 passed each). The full `cargo test --locked --workspace`
+  re-run → **exit 0**, 121 `test result: ok` lines, zero failures.
+- `git diff --stat 87a46dc..HEAD -- reference/golden/` → empty.
+
+The first workspace run also left two untracked SQLite byproducts
+(`reference/golden/cpp/colby.db-{wal,shm}`) from the oracle; they are not
+gitignored, so they were deleted before staging. No tracked golden file changed.
+
+`lsp_diagnostics` was attempted and again refused this worktree (`LSP file path
+must be inside request cwd`); locked Cargo clippy/test is the honest fallback and
+no LSP-clean result is claimed. No dependency, version or `Cargo.lock` byte changed.

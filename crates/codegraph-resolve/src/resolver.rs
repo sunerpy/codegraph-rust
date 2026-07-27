@@ -3431,4 +3431,106 @@ mod tests {
             errors: Vec::new(),
         }
     }
+
+    // ----------------------------------------------------------------------
+    // #1230 PORT: literal receivers + nested locals stop fabricating edges
+    // ----------------------------------------------------------------------
+
+    /// Upstream's exact repro, end-to-end through `resolve_and_persist`:
+    /// `format_fields` (lines 1-5) holds a NESTED `join`; `report_missing`
+    /// (lines 8-10) calls `", ".join(...)`. The nested `join` is the decoy — a
+    /// bare-name fallback binds the string builtin straight to it.
+    fn write_literal_and_nested_fixture(dir: &std::path::Path) -> &'static str {
+        std::fs::write(
+            dir.join("src/repro.py"),
+            concat!(
+                "def format_fields(values):\n",
+                "    def join(vals):\n",
+                "        return \"-\".join(sorted(vals))\n",
+                "\n",
+                "    return join(values)\n",
+                "\n",
+                "\n",
+                "def report_missing(unresolved):\n",
+                "    missing_list = \", \".join(sorted(unresolved))\n",
+                "    return missing_list\n",
+            ),
+        )
+        .expect("write repro.py");
+        "src/repro.py"
+    }
+
+    fn index_python_fixture(
+        slug: &str,
+        root: &std::path::Path,
+        relative: &str,
+    ) -> (Store, std::path::PathBuf) {
+        let db = temp_db(slug);
+        let mut store = Store::open(&db).expect("open store");
+        let result = codegraph_extract::extract_file(root, relative).expect("extract");
+        store
+            .upsert_file(&FileRecord {
+                path: relative.to_string(),
+                content_hash: "fixture".to_string(),
+                language: Language::Python,
+                size: 0,
+                modified_at: 0,
+                indexed_at: 0,
+                node_count: result.nodes.len() as i64,
+                errors: Vec::new(),
+            })
+            .expect("upsert file");
+        store.upsert_nodes(&result.nodes).expect("upsert nodes");
+        store.insert_edges(&result.edges).expect("insert edges");
+        store
+            .insert_unresolved_refs(&result.unresolved_references)
+            .expect("insert refs");
+        (store, db)
+    }
+
+    #[test]
+    fn literal_receiver_and_nested_local_produce_no_fabricated_call_edge() {
+        let dir = fresh_fixture_dir("lit-nested");
+        let relative = write_literal_and_nested_fixture(&dir);
+        let root = dir.to_string_lossy().to_string();
+        let (mut store, db) = index_python_fixture("lit-nested", &dir, relative);
+
+        let mut resolver = ReferenceResolver::new(root);
+        resolver
+            .resolve_and_persist(&mut store)
+            .expect("resolve_and_persist");
+
+        let nodes = store.all_nodes().expect("nodes");
+        let by_name = |name: &str| -> String {
+            nodes
+                .iter()
+                .find(|n| n.kind == NodeKind::Function && n.name == name)
+                .map(|n| n.id.clone())
+                .unwrap_or_else(|| panic!("missing function {name}"))
+        };
+        let join_id = by_name("join");
+        let format_fields_id = by_name("format_fields");
+        let report_missing_id = by_name("report_missing");
+
+        let edges = store.all_edges().expect("edges");
+        let callers_of_join: Vec<&str> = edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls && e.target == join_id)
+            .map(|e| e.source.as_str())
+            .collect();
+        assert_eq!(
+            callers_of_join,
+            vec![format_fields_id.as_str()],
+            "the nested `join` must have exactly ONE caller (its own container)"
+        );
+        assert!(
+            !edges
+                .iter()
+                .any(|e| e.kind == EdgeKind::Calls && e.source == report_missing_id),
+            "`report_missing` calls only string/`sorted` builtins, so it must have NO project callee"
+        );
+
+        let _ = std::fs::remove_file(&db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

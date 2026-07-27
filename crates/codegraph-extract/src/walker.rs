@@ -29,6 +29,71 @@ pub fn child_by_field<'tree>(node: SyntaxNode<'tree>, field: &str) -> Option<Syn
     node.child_by_field_name(field)
 }
 
+/// tree-sitter node kinds (across grammars) for a LITERAL expression sitting in
+/// method-call RECEIVER position. A literal's methods are the language's
+/// builtins — `", ".join`, `"x".toUpperCase()`, `5.times`, `[].concat` — never
+/// project symbols, so such a call must not emit a `calls` ref that the
+/// resolver's bare-name fallback could bind to an unrelated same-named project
+/// function (#1230 / upstream `c472cfb`). A silent miss beats a wrong edge.
+///
+/// `encapsed_string` extends upstream's list: tree-sitter-php reports a
+/// double-quoted literal receiver under that kind, which upstream's set omits.
+const LITERAL_RECEIVER_KINDS: &[&str] = &[
+    // strings
+    "string",
+    "string_literal",
+    "interpreted_string_literal",
+    "raw_string_literal",
+    "template_string",
+    "concatenated_string",
+    "formatted_string",
+    "f_string",
+    "line_string_literal",
+    "string_content",
+    "heredoc_body",
+    "encapsed_string",
+    // numbers
+    "number",
+    "number_literal",
+    "integer",
+    "integer_literal",
+    "float",
+    "float_literal",
+    "int_literal",
+    "decimal_integer_literal",
+    "real_literal",
+    // chars / runes / regex / booleans / null-likes
+    "char_literal",
+    "character_literal",
+    "rune_literal",
+    "regex",
+    "regex_literal",
+    "true",
+    "false",
+    "boolean_literal",
+    "bool_literal",
+    "none",
+    "null",
+    "nil",
+    "null_literal",
+    "undefined",
+    // collection literals
+    "list",
+    "list_literal",
+    "array",
+    "array_literal",
+    "array_creation_expression",
+    "dictionary",
+    "dict_literal",
+    "object",
+    "tuple",
+    "set",
+];
+
+fn is_literal_receiver(node: SyntaxNode<'_>) -> bool {
+    LITERAL_RECEIVER_KINDS.contains(&node.kind())
+}
+
 pub struct TreeSitterWalker<'a, 'tree> {
     file_path: &'a str,
     source: &'a str,
@@ -2939,6 +3004,9 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                         .or_else(|| child_by_field(func, "argument"))
                         .or_else(|| func.named_child(0));
                     if let Some(receiver) = receiver {
+                        if is_literal_receiver(receiver) {
+                            return;
+                        }
                         if matches!(
                             receiver.kind(),
                             "identifier" | "simple_identifier" | "field_identifier"
@@ -3036,6 +3104,9 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     ) {
         let method_name = node_text(name_field, self.source);
         if method_name.is_empty() {
+            return;
+        }
+        if is_literal_receiver(object_field) {
             return;
         }
 
@@ -7152,6 +7223,125 @@ g() ->\n\
         assert!(
             has_node(&nodes, NodeKind::Import, "sub.cfm")
                 || has_ref(&refs, EdgeKind::Imports, "sub.cfm")
+        );
+    }
+
+    // ---- Literal-receiver builtin calls (#1230 / upstream c472cfb) ----------
+
+    fn call_refs(file: &str, source: &str, lang: Language) -> Vec<String> {
+        let (_, refs) = run(file, source, lang);
+        refs.iter()
+            .filter(|r| r.reference_kind == EdgeKind::Calls)
+            .map(|r| r.reference_name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn python_literal_receiver_calls_emit_no_ref() {
+        let calls = call_refs(
+            "src/repro.py",
+            "def report_missing(unresolved):\n    return \", \".join(sorted(unresolved))\n",
+            Language::Python,
+        );
+        assert!(
+            !calls.iter().any(|c| c == "join"),
+            "`\", \".join(...)` is a str builtin and must emit NO call ref, got: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c == "sorted"),
+            "the nested `sorted(...)` call must still be extracted, got: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn python_collection_and_number_literal_receivers_emit_no_ref() {
+        let calls = call_refs(
+            "src/lits.py",
+            concat!(
+                "def f(x):\n",
+                "    [1, 2].append(3)\n",
+                "    {'k': 1}.keys()\n",
+                "    {1, 2}.union(x)\n",
+                "    (1, 2).count(1)\n",
+                "    1.5.hex()\n",
+                "    None.__str__()\n",
+                "    True.__str__()\n",
+            ),
+            Language::Python,
+        );
+        assert!(
+            calls.is_empty(),
+            "every literal-receiver builtin must emit NO call ref, got: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn typescript_literal_receiver_calls_emit_no_ref() {
+        let calls = call_refs(
+            "src/lits.ts",
+            concat!(
+                "export function f(): void {\n",
+                "  \"x\".toUpperCase();\n",
+                "  [1, 2].map((n) => n);\n",
+                "  `t`.trim();\n",
+                "  /re/.test(\"s\");\n",
+                "  0xff.toString();\n",
+                "  true.toString();\n",
+                "}\n",
+            ),
+            Language::TypeScript,
+        );
+        assert!(
+            calls.is_empty(),
+            "every literal-receiver builtin must emit NO call ref, got: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn java_string_literal_receiver_call_emits_no_ref() {
+        let calls = call_refs(
+            "src/C.java",
+            "class C { void f() { \"x\".trim(); } }\n",
+            Language::Java,
+        );
+        assert!(
+            calls.is_empty(),
+            "`\"x\".trim()` is a String builtin and must emit NO call ref, got: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn php_string_literal_receiver_call_emits_no_ref() {
+        let calls = call_refs(
+            "src/a.php",
+            "<?php\nfunction f() { \"x\"->foo(); }\n",
+            Language::Php,
+        );
+        assert!(
+            calls.is_empty(),
+            "a literal PHP receiver must emit NO call ref, got: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn identifier_receiver_calls_are_unaffected_by_the_literal_guard() {
+        let py = call_refs(
+            "src/ok.py",
+            "def f(sep, x):\n    return sep.join(sorted(x))\n",
+            Language::Python,
+        );
+        assert!(
+            py.iter().any(|c| c == "sep.join"),
+            "an identifier receiver must still emit `sep.join`, got: {py:?}"
+        );
+        let java = call_refs(
+            "src/D.java",
+            "class D { void f(String s) { s.trim(); } }\n",
+            Language::Java,
+        );
+        assert!(
+            java.iter().any(|c| c == "s.trim"),
+            "an identifier receiver must still emit `s.trim`, got: {java:?}"
         );
     }
 }
