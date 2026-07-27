@@ -3251,3 +3251,145 @@ turns exactly this test red ("the daemon never published its v2 rendezvous at
 …/.codegraph-v2/daemon.pid") while the other three acceptances stay green; the
 corrected byte was then restored and the suite re-run 4/4. Repeated
 `--test daemon_spawn` is now 8/8 green where it was 4/6.
+
+### Correction — the sidecar relaxation was REVERTED, and doing so re-exposed a real defect
+
+The section immediately above is superseded on the SCOPE question and CORRECTED on the
+evidence question. Two separate things happened in `f691415`, and only one was
+authorized.
+
+**Retained in full: the rendezvous-cleanup ownership-ordering fix.** `record_names`,
+`RendezvousCleanupCheckpoint`, `cleanup_owned_rendezvous_with`, the
+socket-before-record ordering, the second-boundary re-corroboration, and both
+`a_replacement_start_at_the_cleanup_midpoint_keeps_its_own_rendezvous` and
+`a_crash_between_cleanup_boundaries_leaves_only_self_healing_residue`.
+`crates/codegraph-daemon/src/lock.rs` is byte-identical to its `f691415` content,
+SHA-256 `a14583b40c8695318f07552fc9633622fd4356581bec7c5ad16cfe89203814fe`.
+
+Negative control, re-executed over these exact bytes. Reinstating the old
+pid-record-first body — `cleanup_owned_lock` called BEFORE the socket unlink and before
+the `OwnershipCorroborated` checkpoint, with no second-boundary re-corroboration —
+turned BOTH retained tests red in one run:
+`a_replacement_start_at_the_cleanup_midpoint_keeps_its_own_rendezvous` with "a competing
+start must NOT be able to claim the record before the departing owner has finished
+unlinking its socket" (`lock.rs:617`), and
+`a_crash_between_cleanup_boundaries_leaves_only_self_healing_residue` with "the record
+is STILL published as exclusion at this boundary" (`lock.rs:673`) — 98 passed, 2 failed.
+
+Worth recording precisely, because it shows the two tests guard different bytes: an
+INTERMEDIATE mutant that released the record early but left the `OwnershipCorroborated`
+checkpoint above it turned only the crash test red (99 passed, 1 failed) while the
+midpoint test still passed, since the competing start then ran before the release. Only
+the faithful old ordering — release first, checkpoint after — reproduces the original
+race the midpoint test was written for. The corrected bytes were then restored via
+`git checkout --` (`grep -c MUTANT` → 0, file SHA-256 back to
+`a14583b40c8695318f07552fc9633622fd4356581bec7c5ad16cfe89203814fe`) and
+`codegraph-daemon --lib` re-run **100/100**.
+
+**Reverted as out of scope: the daemon-startup SQLite sidecar relaxation.**
+`Store::open_for_daemon_startup` and its private `open_for_read_with_sidecar_policy`
+helper are removed from `crates/codegraph-store/src/connection.rs`;
+`authorize_daemon_startup` calls `Store::open_for_read` again and its doc comment
+again describes the full `Current` contract INCLUDING sidecar-freedom, exactly as at
+`df86a5a`; and the acceptance
+`a_killed_daemons_live_sidecars_do_not_block_a_replacement_start` is removed.
+`git diff df86a5a..HEAD` is empty for both `connection.rs` and `main.rs`, and
+`batch_m_daemon_uninit_lifecycle` is back to its original 3 tests, **3/3** green.
+
+The scope objection is upheld: relaxing a state/artifact contract that was verified at
+`df86a5a` is its own change with its own evidence, and it does not ride along inside a
+cleanup-ordering fix. The objection to the removed test also stands on its own terms —
+it planted two ZERO-BYTE sidecars, which is not what a killed daemon actually leaves,
+so it did not prove the relaxation was necessary.
+
+**But the underlying defect is REAL, and this pass measured it directly.** It was
+expected to stay open and unproven; it did not. Measurements taken on this Linux host
+over the reverted bytes:
+
+- The PRE-EXISTING acceptance `spawn_detached_daemon_twice_no_stale_deadlock` (kill the
+  first daemon, remove its stale pid/socket, respawn) fails **3 of 10** locked runs at
+  the default test-thread count, always on the same assertion, `second daemon pid after
+respawn` at `crates/codegraph-cli/tests/daemon_spawn.rs:227`. Two independent batches
+  of 10 gave 3 failures each (runs 3/5/7, then runs 1/2/5).
+- A 0.03 s-interval watcher captured the failing runs' own daemon log verbatim:
+  `Error: running as detached MCP daemon: refusing to start a daemon for
+/tmp/codegraph-daemon-spawn-twice-…/mini: Current index state has an unexpected SQLite
+sidecar at …/.codegraph-v2/codegraph.db-wal; index state is current and its
+uninitialized tombstone is absent. No daemon pid, socket, or log was published. Run
+`codegraph init` to rebuild.`
+- The same watcher captured the residue those runs actually left behind:
+  `codegraph.db-shm` at **32768 bytes** — non-empty, a live shared-memory header — and
+  `codegraph.db-wal` at 0 bytes. Contrast run: a PASSING run's namespace held
+  `codegraph.db` alone, no sidecars. So the failures correlate exactly with surviving
+  sidecars, and the residue is a real hard-killed daemon's, not a planted placeholder.
+- The intermittency is timing, not load. With `-- --test-threads=1` the same suite ran
+  **12 of 12** green; the failures only appear when the two tests in the file run
+  concurrently and the SIGKILL lands while a connection is open. A standalone
+  `serve --mcp` + `kill -9` loop with no client attached left NO sidecars in 10 of 10
+  iterations, which is why this was mistaken for load flake earlier. That earlier
+  "known flake" note was wrong, and it stays corrected.
+
+So the answer to "does a hard-killed daemon block a replacement start" is **YES,
+intermittently** — when the kill lands while a connection is open, the sidecars survive
+and the strict `Current` gate refuses every subsequent start until `codegraph init` is
+re-run.
+
+**This defect is PRE-EXISTING, not introduced by this revert — measured, not argued.**
+`daemon_spawn.rs`, `connection.rs`, and `main.rs` are all byte-identical to `df86a5a`,
+and the retained `lock.rs` cleanup ordering is not on this path (the test removes the pid
+record and socket itself, and the refusal happens in the store gate before any
+rendezvous is published). To close that off by measurement rather than reasoning,
+`lock.rs` was temporarily swapped to its `df86a5a` content (SHA-256
+`a25868072cfcf31477bad9d77376edda27f4727eae2f76a2eb3e00120463b35e`) — i.e. the tree with
+the retained fix REMOVED — and the same suite still failed **1 of 10** locked runs on the
+identical assertion at `daemon_spawn.rs:227`. The retained fix was then restored and
+`lock.rs` re-proved byte-identical to `f691415` (`a14583b4…`, empty
+`git diff f691415 -- crates/codegraph-daemon/src/lock.rs`). So the flake exists with and
+without the cleanup fix; the sidecar gate is its cause, and this pass neither introduced
+nor cured it.
+
+**Consequence, stated plainly rather than papered over:** over the reverted bytes,
+`make ci CARGO='cargo --locked'` is NOT reliably green — it fails whenever
+`spawn_detached_daemon_twice_no_stale_deadlock` hits the ~3-in-10 timing window. The
+reverted tree is honest about scope and carries a pre-existing intermittent red. No
+test was weakened, skipped, slept, or deleted to hide this, and no relaxation was
+re-introduced under another name.
+
+What remains genuinely OPEN is the FIX, not the defect: whether the right answer is a
+sidecar-tolerant startup read, a checkpoint-and-clear on startup, or a narrower
+recovery path is undecided and belongs to its own plan item with its own failing-first
+evidence. The measurements above are that item's starting evidence, and they replace
+the zero-byte-placeholder test that was removed.
+
+Verification of this correction, with `bash scripts/check-workspace-versions.sh` before
+every Cargo batch (exit 0, workspace 0.40.4 across all 10 packages) and `--locked` on
+every Cargo command: `codegraph-daemon --lib` **100/100** including both retained cleanup
+tests; `codegraph-rs --test batch_m_daemon_uninit_lifecycle` **3/3** (its original three);
+`codegraph-rs --test daemon_spawn` **2/2** on a single run and **12/12 runs** green at
+`--test-threads=1`, but **3 of 10 runs** red at the default thread count for the
+pre-existing sidecar reason measured above.
+
+The final gate, `bash scripts/check-workspace-versions.sh && make ci CARGO='cargo
+--locked'` over these exact bytes, was run **four** times: **exit 2, exit 0, exit 0,
+exit 2**. Both failures are the same single assertion, `daemon_spawn.rs:227 second daemon
+pid after respawn`; `fmt --check`, `clippy --workspace --all-targets -D warnings`, and
+`scripts/guardrail.sh` passed every time, and 76 other test-binary result lines were `ok`
+in the failing runs too. So this tree is **NOT reliably green**, and that is reported as a
+fact rather than smoothed over by re-running until a green appears: the gate is a coin
+flip on a pre-existing defect that predates both this correction and `f691415`.
+
+One further confirmation run of that same gate was executed after this ledger text was
+finalized, so that the last gate run covers these exact committed bytes; its exit code is
+reported in the closeout summary rather than restated here, since no code byte differs
+between it and the four runs above.
+
+Limitations. Changed-file LSP diagnostics were attempted on BOTH
+`crates/codegraph-store/src/connection.rs` and `crates/codegraph-cli/src/main.rs` and
+both were refused with `LSP file path must be inside request cwd` — the worktree at
+`/config/workspace/ProdDir/AI/.cgworktrees/v15-impl` is still outside the request cwd,
+even though it was expected to be inside it — so no LSP-clean result is claimed; locked
+Cargo build/Clippy/tests are the fallback. The sidecar measurements are Linux-only; native
+Windows/MSVC runtime is unavailable on this host and nothing about it is claimed. No
+dependency, version, `Cargo.lock`, schema, node-ID, golden, state-protocol, or
+permanent-index-lifecycle byte changed; `Cargo.lock` remains SHA-256
+`750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`.

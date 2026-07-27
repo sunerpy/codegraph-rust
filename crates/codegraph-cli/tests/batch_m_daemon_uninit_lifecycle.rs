@@ -510,69 +510,6 @@ fn uninit_shutdown_control_drains_without_pid_kill() {
     assert_recoverable_uninitialized(&paths, "after a drained uninit");
 }
 
-/// A daemon that was KILLED rather than closed leaves its SQLite `-wal`/`-shm`
-/// sidecars behind on an otherwise untouched `Current` namespace. The startup gate
-/// must still admit a replacement daemon, because refusing those sidecars would
-/// make the namespace unstartable after any hard kill — while every other part of
-/// the `Current` contract stays enforced (proved by the tombstone case below, which
-/// is refused with the very same sidecars present).
-#[test]
-fn a_killed_daemons_live_sidecars_do_not_block_a_replacement_start() {
-    let project = TestProject::indexed("live-sidecars");
-    let paths = project.paths();
-
-    let sidecars: Vec<PathBuf> = ["-wal", "-shm"]
-        .iter()
-        .map(|suffix| {
-            let mut path = paths.current_db().into_os_string();
-            path.push(suffix);
-            PathBuf::from(path)
-        })
-        .collect();
-    for sidecar in &sidecars {
-        fs::write(sidecar, b"").expect("plant a killed daemon's live sidecar");
-    }
-
-    let mut daemon = ChildGuard::new(
-        daemon_command(project.path())
-            .spawn()
-            .expect("spawn daemon"),
-    );
-    let pid = wait_for_owner_record(&paths);
-    assert!(
-        is_process_alive(pid),
-        "a replacement daemon must start despite a killed predecessor's sidecars"
-    );
-
-    // The same namespace WITH those sidecars is still refused once it carries a
-    // tombstone, so this relaxation did not weaken the state contract.
-    let output = uninit_force(project.path());
-    assert!(
-        output.status.success(),
-        "uninit --force must drain the replacement daemon; stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(daemon.wait_bounded("the drained daemon").code(), Some(0));
-    assert_recoverable_uninitialized(&paths, "after draining the replacement daemon");
-
-    let refused = ChildGuard::new(
-        daemon_command(project.path())
-            .spawn()
-            .expect("spawn daemon"),
-    )
-    .finish("the refused daemon start");
-    let stderr = String::from_utf8_lossy(&refused.stderr).to_string();
-    assert!(
-        !refused.status.success() && stderr.contains("tombstone"),
-        "a tombstoned namespace must still refuse a daemon start: {stderr}"
-    );
-    assert_no_rendezvous(
-        project.path(),
-        &paths,
-        "after the tombstoned start was refused",
-    );
-}
-
 #[test]
 fn unresponsive_daemon_leaves_recoverable_uninitialized_without_kill() {
     let project = TestProject::indexed("unresponsive");

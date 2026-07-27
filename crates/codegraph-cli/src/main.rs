@@ -1165,26 +1165,20 @@ fn cmd_uninit(path: Option<PathBuf>, force: bool) -> Result<()> {
 
 /// Daemon-startup gate (frozen plan lines 590-592, 603-604).
 ///
-/// ONE bounded shared acquisition validates everything:
-/// `Store::open_for_daemon_startup` acquires the shared `IndexLease` and, under it,
-/// corroborates the FULL `Current` contract — both owner-bound state slots (so
-/// `Future`, `Corrupt`, `Building`, `Uninitialized`, `Outdated`, and an owner
-/// mismatch are all refused), tombstone absence, database presence, and the exact
-/// extraction stamp read from the checkpointed main-file bytes. Slot phase alone
-/// would let a `Current` slot with a deleted database or a stale stamp publish a
-/// rendezvous.
-///
-/// A LIVE `-wal`/`-shm` sidecar is deliberately tolerated (the one difference from
-/// `Store::open_for_read`): a killed daemon leaves those behind on an otherwise
-/// untouched namespace, and refusing them would make a replacement daemon
-/// unstartable after any hard kill.
+/// ONE bounded shared acquisition validates everything: `Store::open_for_read`
+/// acquires the shared `IndexLease` and, under it, corroborates the FULL `Current`
+/// contract — both owner-bound state slots (so `Future`, `Corrupt`, `Building`,
+/// `Uninitialized`, `Outdated`, and an owner mismatch are all refused), tombstone
+/// absence, database presence, sidecar-freedom, and the exact extraction stamp
+/// read from the checkpointed main-file bytes. Slot phase alone would let a
+/// `Current` slot with a deleted database or a stale stamp publish a rendezvous.
 ///
 /// The returned `Store` OWNS that same lease, so retaining it across pid/socket
 /// publication requires no second acquisition: there is no nested lock and no
 /// window between validation and publication for another writer to reclassify.
 fn authorize_daemon_startup(project_root: &Path) -> Result<codegraph_daemon::StartupAuthorization> {
     let paths = index_paths(project_root)?;
-    match Store::open_for_daemon_startup(
+    match Store::open_for_read(
         &paths,
         std::time::Instant::now() + REBUILD_LEASE_TIMEOUT,
         || false,
