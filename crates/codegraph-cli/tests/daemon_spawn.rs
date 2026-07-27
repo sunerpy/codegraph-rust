@@ -156,8 +156,9 @@ fn wait_until_gone(pid: u32, timeout: Duration) -> bool {
 #[test]
 fn spawn_detached_daemon_listens_and_survives() {
     let (_dir, project) = indexed_project("survive");
-    let socket = daemon_socket_path(&project);
-    let log = project.join(".codegraph").join("daemon.log");
+    let socket = daemon_socket_path(&project).expect("resolve the v2 rendezvous socket identity");
+    let log =
+        codegraph_daemon::daemon_log_path(&project).expect("resolve the v2 rendezvous log path");
 
     // Spawn the detached daemon. The helper must RETURN without waiting.
     spawn_detached_daemon(&bin(), &project, false).expect("spawn_detached_daemon");
@@ -199,7 +200,7 @@ fn spawn_detached_daemon_listens_and_survives() {
 #[test]
 fn spawn_detached_daemon_twice_no_stale_deadlock() {
     let (_dir, project) = indexed_project("twice");
-    let socket = daemon_socket_path(&project);
+    let socket = daemon_socket_path(&project).expect("resolve the v2 rendezvous socket identity");
 
     spawn_detached_daemon(&bin(), &project, false).expect("first spawn");
     let pid1 = poll_for_daemon_pid(&socket, Duration::from_millis(2000)).expect("first daemon pid");
@@ -215,7 +216,9 @@ fn spawn_detached_daemon_twice_no_stale_deadlock() {
     // A zombie's lock cannot be cleared by signal-0 liveness, so remove the
     // stale pid/socket directly (the test owns this temp project) to prove the
     // respawn path comes up cleanly rather than deadlocking on a stale lock.
-    let _ = fs::remove_file(codegraph_daemon::daemon_pid_path(&project));
+    let _ = fs::remove_file(
+        codegraph_daemon::daemon_pid_path(&project).expect("resolve the v2 rendezvous pid path"),
+    );
     let _ = fs::remove_file(&socket);
 
     // Second spawn must come up cleanly (reuse-or-respawn), not deadlock.

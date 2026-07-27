@@ -18,7 +18,8 @@ use codegraph_extract::ExtensionOverrides;
 
 use crate::policy::{WatchPolicy, watch_disabled_reason};
 use crate::sync::{
-    SyncOutcome, default_db_path, sync_changed_paths_with_patterns, sync_project_once_with_patterns,
+    SyncCancellation, SyncOutcome, default_db_path, sync_changed_paths_with_patterns,
+    sync_project_once_with_patterns,
 };
 
 type SyncCallback = Arc<dyn Fn(SyncOutcome) + Send + Sync>;
@@ -313,6 +314,10 @@ pub struct WatchOptions {
     /// Override for the whole-project sync a removed directory escalates to.
     /// Defaults to [`crate::sync::sync_project_once`]; tests inject a counter.
     full_sync_fn: Option<FullSyncFn>,
+    /// Cooperative cancellation shared with the default sync closures, so a
+    /// shutdown can refuse queued lease loops and interrupt a running one
+    /// (frozen plan lines 598-601).
+    cancel: SyncCancellation,
 }
 
 impl Default for WatchOptions {
@@ -332,6 +337,7 @@ impl Default for WatchOptions {
             extensions: ExtensionOverrides::empty(),
             sync_fn: None,
             full_sync_fn: None,
+            cancel: SyncCancellation::new(),
         }
     }
 }
@@ -345,6 +351,14 @@ impl WatchOptions {
     /// by one process can watch different scopes (or one not at all). An explicit
     /// `CODEGRAPH_WATCH_DEBOUNCE_MS` still wins, keeping the documented env escape
     /// hatch authoritative over config.
+    /// Share `cancel` with this watcher's default sync closures so a shutdown
+    /// can cancel queued and running lease loops.
+    #[must_use]
+    pub fn with_cancellation(mut self, cancel: SyncCancellation) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
     #[must_use]
     pub fn for_project(config: &Config, extensions: Arc<ExtensionOverrides>) -> Self {
         Self {
@@ -370,6 +384,11 @@ pub struct ProjectWatcher {
     thread: Option<JoinHandle<()>>,
     watcher: SharedWatcher,
     degraded: Arc<DegradedState>,
+    cancel: SyncCancellation,
+    /// Set by the event-loop thread as its LAST action. Lets a caller observe
+    /// completion without joining, so a bounded shutdown never blocks on a
+    /// still-running sync (see [`Self::begin_shutdown`]).
+    finished: Arc<AtomicBool>,
 }
 
 pub fn start_serve_watcher(
@@ -408,12 +427,21 @@ impl ProjectWatcher {
             Some(db) => db,
             None => default_db_path(&project_root)?,
         };
+        let cancel = options.cancel.clone();
         let sync_fn = options.sync_fn.clone().unwrap_or_else(|| {
             let project_root = project_root.clone();
             let include = options.include.clone();
             let exclude = options.exclude.clone();
+            let cancel = cancel.clone();
             Arc::new(move |paths| {
-                sync_changed_paths_with_patterns(&project_root, &db_path, paths, &include, &exclude)
+                sync_changed_paths_with_patterns(
+                    &project_root,
+                    &db_path,
+                    paths,
+                    &include,
+                    &exclude,
+                    Some(&cancel),
+                )
             })
         });
         // A removed directory cannot be expressed as a path list (its tracked
@@ -423,7 +451,10 @@ impl ProjectWatcher {
             let project_root = project_root.clone();
             let include = options.include.clone();
             let exclude = options.exclude.clone();
-            Arc::new(move || sync_project_once_with_patterns(&project_root, &include, &exclude))
+            let cancel = cancel.clone();
+            Arc::new(move || {
+                sync_project_once_with_patterns(&project_root, &include, &exclude, Some(&cancel))
+            })
         });
         let (tx, rx) = mpsc::channel();
         let degraded = Arc::new(DegradedState::default());
@@ -509,6 +540,8 @@ impl ProjectWatcher {
         let debounce = options.debounce;
         let loop_degraded = Arc::clone(&degraded);
         let loop_watcher = Arc::clone(&watcher);
+        let finished = Arc::new(AtomicBool::new(false));
+        let loop_finished = Arc::clone(&finished);
         let thread = thread::spawn(move || {
             event_loop(EventLoopCtx {
                 rx,
@@ -523,6 +556,7 @@ impl ProjectWatcher {
                 watcher: loop_watcher,
                 known_dirs,
             });
+            loop_finished.store(true, Ordering::SeqCst);
         });
 
         Ok(Some(Self {
@@ -530,7 +564,53 @@ impl ProjectWatcher {
             thread: Some(thread),
             watcher,
             degraded,
+            cancel,
+            finished,
         }))
+    }
+
+    /// Begin shutdown WITHOUT joining: stop delivering new OS events, refuse
+    /// queued lease loops, interrupt a running one, and ask the event loop to
+    /// exit. Idempotent and never blocks.
+    ///
+    /// The join is deliberately separated from this signal. A running sync can
+    /// hold the event-loop thread for the whole extraction pass, so joining here
+    /// (as `stop`/`Drop` do) would block past any caller-side deadline and make a
+    /// bounded drain unbounded. Callers poll [`Self::is_finished`] against their
+    /// own budget and then either [`Self::stop`] (an instant join) or
+    /// [`Self::detach`].
+    pub fn begin_shutdown(&self) {
+        self.cancel.cancel();
+        if let Ok(mut guard) = self.watcher.lock() {
+            let _ = guard.take();
+        }
+        let _ = self.tx.send(LoopMessage::Stop);
+    }
+
+    /// Whether the event-loop thread has run to completion.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::SeqCst)
+    }
+
+    /// Give up ownership of the event-loop thread without joining it.
+    ///
+    /// Used only after a bounded shutdown deadline elapsed: the loop is already
+    /// cancelled and will exit on its own, and the caller has already reported an
+    /// INCOMPLETE drain, so nothing destructive proceeds behind it. Dropping the
+    /// `JoinHandle` detaches the thread, and the subsequent `Drop` finds no handle
+    /// to join.
+    pub fn detach(mut self) {
+        let _ = self.thread.take();
+    }
+
+    /// The watcher's cooperative cancellation handle. A shutdown cancels it so
+    /// queued lease loops refuse immediately and a running one returns a typed
+    /// error, then waits for [`SyncCancellation::active_syncs`] to reach zero
+    /// before considering the watcher drained.
+    #[must_use]
+    pub fn cancellation(&self) -> SyncCancellation {
+        self.cancel.clone()
     }
 
     pub fn is_degraded(&self) -> bool {
@@ -584,10 +664,9 @@ impl ProjectWatcher {
     }
 
     fn stop_inner(&mut self) {
-        if let Ok(mut guard) = self.watcher.lock() {
-            let _ = guard.take();
-        }
-        let _ = self.tx.send(LoopMessage::Stop);
+        // Signal first (never join without cancelling: the event-loop thread may be
+        // inside a bounded lease acquisition), then join.
+        self.begin_shutdown();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -1134,6 +1213,7 @@ mod tests {
             ],
             &["Tools/".to_string()],
             &[],
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1792,6 +1872,95 @@ mod tests {
             assert!(entry.first_seen_ms <= entry.last_seen_ms);
         }
         watcher.stop();
+    }
+
+    /// A watcher whose event loop is INSIDE a sync must not be forced to a join:
+    /// `begin_shutdown` returns immediately, `is_finished` truthfully stays false
+    /// while the sync runs, and `detach` releases the handle without blocking. This
+    /// is what lets the daemon's bounded drain report an INCOMPLETE result instead
+    /// of blocking past its budget inside `Drop`. The sync blocks on a barrier, so
+    /// "still running" is deterministic rather than timed.
+    #[test]
+    fn begin_shutdown_and_detach_never_block_on_a_running_sync() {
+        let dir = crate::sync::tests::TestDir::new("watch-running-sync");
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let entered = Arc::new(AtomicBool::new(false));
+        let sync_release = Arc::clone(&release);
+        let sync_entered = Arc::clone(&entered);
+        let watcher = ProjectWatcher::start(
+            dir.path(),
+            WatchOptions {
+                debounce: Duration::from_millis(1),
+                inert_for_tests: true,
+                sync_fn: Some(Arc::new(move |_paths| {
+                    sync_entered.store(true, AtomicOrdering::SeqCst);
+                    sync_release.wait();
+                    Ok(SyncOutcome::default())
+                })),
+                ..WatchOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        watcher.ingest_event_for_tests("src/app.ts");
+        while !entered.load(AtomicOrdering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let started = Instant::now();
+        watcher.begin_shutdown();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "begin_shutdown must not join a running sync"
+        );
+        assert!(
+            !watcher.is_finished(),
+            "a watcher inside a sync must report itself unfinished"
+        );
+
+        let started = Instant::now();
+        watcher.detach();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "detach must not join a running sync"
+        );
+        release.wait();
+    }
+
+    #[test]
+    fn begin_shutdown_is_nonblocking_and_detach_skips_the_join() {
+        // Given: an inert watcher whose event loop is idle.
+        let dir = crate::sync::tests::TestDir::new("watch-begin-shutdown");
+        let watcher = ProjectWatcher::start(
+            dir.path(),
+            WatchOptions {
+                inert_for_tests: true,
+                sync_fn: Some(Arc::new(|_paths| Ok(SyncOutcome::default()))),
+                ..WatchOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        // When: shutdown begins.
+        let cancel = watcher.cancellation();
+        watcher.begin_shutdown();
+
+        // Then: cancellation is observable immediately and the call did not join.
+        assert!(cancel.is_cancelled());
+        watcher.begin_shutdown();
+        for _ in 0..200 {
+            if watcher.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            watcher.is_finished(),
+            "the event loop must exit after begin_shutdown"
+        );
+        watcher.detach();
     }
 
     #[test]

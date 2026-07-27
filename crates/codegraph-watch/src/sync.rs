@@ -25,6 +25,62 @@ use crate::policy::WatchPolicy;
 /// timeout instead of hanging.
 const SYNC_LEASE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Cooperative cancellation for a sync's bounded lease loop.
+///
+/// Frozen plan lines 598-601: `uninit --force` signals cancellation to queued and
+/// running watcher lock loops and drains only after every cancellation-aware
+/// lease loop has exited. Without this, a watcher sync queued behind uninit's
+/// exclusive lease would spin its full [`SYNC_LEASE_TIMEOUT`] before the daemon
+/// could finish draining. Cancellation is observed by `IndexLease`'s bounded
+/// acquisition loop, so a cancelled sync returns a typed error and mutates
+/// nothing.
+#[derive(Clone, Debug, Default)]
+pub struct SyncCancellation {
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    running: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl SyncCancellation {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Refuse every queued lease loop and interrupt every running one.
+    pub fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many cancellation-aware lease loops are currently inside a sync.
+    /// A drain waits for this to reach zero after [`cancel`](Self::cancel).
+    #[must_use]
+    pub fn active_syncs(&self) -> usize {
+        self.running.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn enter(&self) -> SyncCancellationGuard<'_> {
+        self.running
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        SyncCancellationGuard(self)
+    }
+}
+
+struct SyncCancellationGuard<'a>(&'a SyncCancellation);
+
+impl Drop for SyncCancellationGuard<'_> {
+    fn drop(&mut self) {
+        self.0
+            .running
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SyncOutcome {
     pub files_checked: usize,
@@ -47,6 +103,19 @@ pub fn sync_project_once(project_root: impl AsRef<Path>) -> Result<SyncOutcome> 
     sync_project_once_with_progress(project_root, |_, _| {})
 }
 
+/// [`sync_project_once`] under a caller-owned [`SyncCancellation`], so a daemon
+/// shutdown can refuse this sync's queued lease loop and interrupt a running one
+/// instead of waiting out the full lease budget.
+pub fn sync_project_once_cancellable(
+    project_root: impl AsRef<Path>,
+    cancel: &SyncCancellation,
+) -> Result<SyncOutcome> {
+    let project_root = project_root.as_ref();
+    let paths = index_paths(project_root)?;
+    let scope = ProjectScope::load(project_root, &paths)?;
+    sync_project_once_with_scope(project_root, &paths, &scope, Some(cancel), |_, _| {})
+}
+
 /// Whole-project sync using watcher-owned path patterns while preserving every
 /// other scan option from the normal sync path.
 ///
@@ -59,13 +128,14 @@ pub(crate) fn sync_project_once_with_patterns(
     project_root: impl AsRef<Path>,
     include: &[String],
     exclude: &[String],
+    cancel: Option<&SyncCancellation>,
 ) -> Result<SyncOutcome> {
     let project_root = project_root.as_ref();
     let paths = index_paths(project_root)?;
     let mut scope = ProjectScope::load(project_root, &paths)?;
     scope.options.include = include.to_vec();
     scope.options.exclude = exclude.to_vec();
-    sync_project_once_with_scope(project_root, &paths, &scope, |_, _| {})
+    sync_project_once_with_scope(project_root, &paths, &scope, cancel, |_, _| {})
 }
 
 /// Like [`sync_project_once`] but invokes `on_progress(done, total)` after each
@@ -79,13 +149,14 @@ pub fn sync_project_once_with_progress(
     let project_root = project_root.as_ref();
     let paths = index_paths(project_root)?;
     let scope = ProjectScope::load(project_root, &paths)?;
-    sync_project_once_with_scope(project_root, &paths, &scope, on_progress)
+    sync_project_once_with_scope(project_root, &paths, &scope, None, on_progress)
 }
 
 fn sync_project_once_with_scope(
     project_root: &Path,
     paths: &IndexPaths,
     scope: &ProjectScope,
+    cancel: Option<&SyncCancellation>,
     mut on_progress: impl FnMut(usize, usize),
 ) -> Result<SyncOutcome> {
     let options = &scope.options;
@@ -98,7 +169,8 @@ fn sync_project_once_with_scope(
     // the incremental writer for a corroborated Current namespace or the
     // lease-retaining authorization that escalates to a forced full migration.
     // Future/Corrupt/unauthorized-Uninitialized fail here, before any byte moves.
-    match open_sync_writer(paths)? {
+    let _active = cancel.map(SyncCancellation::enter);
+    match open_sync_writer(paths, cancel)? {
         SyncWriter::Incremental(mut store) => {
             let mut candidates = codegraph_extract::engine::scan_project(project_root, options)?;
             // Cold CLI sync has no watcher event list, so deletions are found by
@@ -190,9 +262,18 @@ pub(crate) fn index_paths(project_root: &Path) -> Result<IndexPaths> {
 
 /// Acquire the ONE outer exclusive lease and classify under it. The retained
 /// status decides policy; no precheck-then-reclassify happens anywhere.
-fn open_sync_writer(paths: &IndexPaths) -> Result<SyncWriter> {
+fn open_sync_writer(paths: &IndexPaths, cancel: Option<&SyncCancellation>) -> Result<SyncWriter> {
+    if let Some(cancel) = cancel
+        && cancel.is_cancelled()
+    {
+        bail!(
+            "sync of {} was cancelled before acquiring the index lease",
+            paths.current_root().display()
+        );
+    }
     let deadline = Instant::now() + SYNC_LEASE_TIMEOUT;
-    let lease = IndexLease::acquire_or_create_exclusive(paths, deadline, || false)?;
+    let cancelled = || cancel.is_some_and(SyncCancellation::is_cancelled);
+    let lease = IndexLease::acquire_or_create_exclusive(paths, deadline, cancelled)?;
     match Store::open_for_write(paths, lease, StoreWritePurpose::IncrementalSync)? {
         StoreWriteOpen::Current(store) => Ok(SyncWriter::Incremental(store)),
         StoreWriteOpen::FullRebuildRequired(authorization) => {
@@ -214,7 +295,7 @@ pub fn sync_changed_paths(
     db_path: impl AsRef<Path>,
     paths: impl IntoIterator<Item = impl AsRef<Path>>,
 ) -> Result<SyncOutcome> {
-    sync_changed_paths_with_patterns(project_root, db_path, paths, &[], &[])
+    sync_changed_paths_with_patterns(project_root, db_path, paths, &[], &[], None)
 }
 
 /// Like [`sync_changed_paths`] but threads the `codegraph.json`/`config.toml`
@@ -227,6 +308,7 @@ pub fn sync_changed_paths_with_patterns(
     changed: impl IntoIterator<Item = impl AsRef<Path>>,
     include: &[String],
     exclude: &[String],
+    cancel: Option<&SyncCancellation>,
 ) -> Result<SyncOutcome> {
     let started = Instant::now();
     let project_root = project_root.as_ref();
@@ -254,7 +336,8 @@ pub fn sync_changed_paths_with_patterns(
     // Same classify-before-mutate gate as the cold full sync: a Current namespace
     // stays incremental, while Missing/Outdated/recoverable Building escalate to a
     // forced migration under the SAME retained exclusive lease.
-    match open_sync_writer(&paths)? {
+    let _active = cancel.map(SyncCancellation::enter);
+    match open_sync_writer(&paths, cancel)? {
         SyncWriter::Incremental(mut store) => {
             let outcome = sync_paths_with_store(
                 &mut store,
@@ -1314,6 +1397,7 @@ pub(crate) mod tests {
             ["Tools/helper.ts"],
             &["Tools/".to_string()],
             &[],
+            None,
         )
         .unwrap();
         assert_eq!(included.files_reindexed, 1);

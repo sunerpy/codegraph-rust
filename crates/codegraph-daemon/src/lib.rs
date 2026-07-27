@@ -5,6 +5,7 @@
 //! watchdogs, graceful shutdown, and stale-lock recovery. It deliberately does
 //! not implement task-25 file watching.
 
+pub mod control;
 pub mod http_registry;
 mod lock;
 mod paths;
@@ -22,6 +23,10 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+pub use control::{
+    CONTROL_PROTOCOL, ControlAck, ControlFrame, ShutdownOutcome, parse_control_frame,
+    request_daemon_shutdown,
+};
 pub use lock::{
     AcquireResult, DaemonLockInfo, clear_stale_daemon_lock, clear_stale_daemon_socket,
     decode_lock_info, encode_lock_info, recorded_socket_path, try_acquire_daemon_lock,
@@ -37,13 +42,19 @@ pub use session::{SessionRegistry, read_daemon_hello, run_session_recv};
 pub use spawn::{CODEGRAPH_HTTP_DETACH_INTERNAL, spawn_detached_daemon, spawn_detached_http};
 use tracing::{debug, info, warn};
 
-use crate::lock::{cleanup_owned_lock, rewrite_lock_socket_path};
-use crate::paths::codegraph_dir;
-use crate::session::serve_session_async;
+use crate::lock::{cleanup_owned_rendezvous, rewrite_lock_socket_path};
+use crate::session::{ControlHandle, ShutdownRequest, serve_session_async};
 use crate::transport::{AsyncListener, Rendezvous, bind_tokio, connect};
 
 const DEFAULT_WATCHDOG_INTERVAL: Duration = Duration::from_millis(500);
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Bounded budget for the post-control-frame drain: cancelled watcher/catch-up
+/// lease loops must exit and active sessions must close before the daemon removes
+/// its own rendezvous and ACKs. Exceeding it is reported and the daemon still
+/// tears its own rendezvous down, so the caller never has to signal a pid.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Env var name: when set to `"1"`, the process re-invoked by the launcher IS
 /// the detached daemon and must listen+serve, never re-spawn.
@@ -166,6 +177,12 @@ pub struct DaemonOptions {
     /// project (N client inotify sets collapse to 1). Honors
     /// `watch_disabled_reason` (e.g. `CODEGRAPH_NO_WATCH=1`).
     pub watch: bool,
+    /// Bounded budget for the post-shutdown drain: how long the daemon waits for
+    /// its cancelled watcher/catch-up lease loops and its actively-closed data
+    /// sessions to finish before reporting an INCOMPLETE drain. Exceeding it never
+    /// acknowledges success, so the caller fails closed. Defaults to
+    /// [`DRAIN_TIMEOUT`].
+    pub drain_budget: Duration,
 }
 
 impl Default for DaemonOptions {
@@ -176,9 +193,25 @@ impl Default for DaemonOptions {
             watchdog_interval: DEFAULT_WATCHDOG_INTERVAL,
             run_mcp: true,
             watch: true,
+            drain_budget: DRAIN_TIMEOUT,
         }
     }
 }
+
+/// The capability a startup gate returns and the daemon RETAINS across
+/// pid/socket publication (frozen plan lines 590-592: startup takes a shared
+/// index lease across state/owner/tombstone validation AND publication, and
+/// releases it only afterwards).
+///
+/// It is opaque here on purpose: the gate lives in the crate that owns the index
+/// state protocol, so this crate cannot reclassify a namespace itself or reach a
+/// store API behind the gate's back.
+pub type StartupAuthorization = Box<dyn std::any::Any + Send>;
+
+/// A startup gate: validate `project_root`'s namespace and return the capability
+/// to retain until the rendezvous is published. `Err` refuses the start, and the
+/// daemon then publishes NOTHING.
+pub type StartupGate<'a> = &'a (dyn Fn(&Path) -> Result<StartupAuthorization> + Sync);
 
 #[derive(Debug)]
 pub enum StartOrAttach {
@@ -246,13 +279,40 @@ pub fn start_or_attach(
     project_root: impl AsRef<Path>,
     options: DaemonOptions,
 ) -> Result<StartOrAttach> {
+    start_or_attach_gated(project_root, options, None)
+}
+
+/// [`start_or_attach`] with the caller-supplied startup gate.
+///
+/// The gate runs BEFORE the pid record is claimed and its returned capability is
+/// held until the socket is bound and the chosen rendezvous persisted, so a
+/// concurrent `uninit --force` can never interleave its own exclusive-lease work
+/// between validation and publication. A refused gate publishes nothing at all.
+pub fn start_or_attach_gated(
+    project_root: impl AsRef<Path>,
+    options: DaemonOptions,
+    gate: Option<StartupGate<'_>>,
+) -> Result<StartOrAttach> {
     let project_root = project_root.as_ref().to_path_buf();
+    let authorization = match gate {
+        Some(gate) => Some(gate(&project_root)?),
+        None => None,
+    };
     match try_acquire_daemon_lock(&project_root)? {
         AcquireResult::Acquired { pid_path, info } => {
-            let handle = start_with_lock(project_root, pid_path, info.socket_path, options)?;
+            let handle = start_with_lock(
+                project_root,
+                pid_path,
+                info.socket_path,
+                options,
+                authorization,
+            )?;
             Ok(StartOrAttach::Started(handle))
         }
         AcquireResult::Taken { existing, pid_path } => {
+            // Nothing will be published on this path, so release the startup
+            // capability before any recursion re-acquires it.
+            drop(authorization);
             if let Some(info) = existing {
                 if let Ok(client) = attach_to_daemon(&info.socket_path) {
                     return Ok(StartOrAttach::Attached(client));
@@ -260,7 +320,7 @@ pub fn start_or_attach(
                 if !clear_stale_daemon_lock(&pid_path, Some(info.pid)) {
                     bail!("daemon already running for this project (pid {})", info.pid);
                 }
-                return start_or_attach(project_root, options);
+                return start_or_attach_gated(project_root, options, gate);
             }
             if !clear_stale_daemon_lock(&pid_path, None) {
                 bail!(
@@ -268,13 +328,22 @@ pub fn start_or_attach(
                     pid_path.display()
                 );
             }
-            start_or_attach(project_root, options)
+            start_or_attach_gated(project_root, options, gate)
         }
     }
 }
 
 pub fn run_foreground(project_root: impl AsRef<Path>, options: DaemonOptions) -> Result<()> {
-    match start_or_attach(project_root, options)? {
+    run_foreground_gated(project_root, options, None)
+}
+
+/// [`run_foreground`] under a startup gate; see [`start_or_attach_gated`].
+pub fn run_foreground_gated(
+    project_root: impl AsRef<Path>,
+    options: DaemonOptions,
+    gate: Option<StartupGate<'_>>,
+) -> Result<()> {
+    match start_or_attach_gated(project_root, options, gate)? {
         StartOrAttach::Started(handle) => handle.wait(),
         StartOrAttach::Attached(client) => {
             bail!("daemon already running at {}", client.socket_path.display())
@@ -298,9 +367,14 @@ fn start_with_lock(
     pid_path: PathBuf,
     socket_path: PathBuf,
     options: DaemonOptions,
+    authorization: Option<StartupAuthorization>,
 ) -> Result<DaemonHandle> {
-    fs::create_dir_all(codegraph_dir(&project_root))
-        .with_context(|| format!("creating {}", codegraph_dir(&project_root).display()))?;
+    let rendezvous_dir = paths::rendezvous_dir(&project_root)?;
+    fs::create_dir_all(&rendezvous_dir)
+        .with_context(|| format!("creating {}", rendezvous_dir.display()))?;
+    let project_identity = paths::index_paths(&project_root)?
+        .project_identity()
+        .to_string();
 
     // The async interprocess Listener must be created inside a tokio runtime
     // context, so build the runtime here and bind within it. The runtime is
@@ -317,6 +391,9 @@ fn start_with_lock(
     if let Err(err) = rewrite_lock_socket_path(&pid_path, &socket_path) {
         debug!(error = %err, "could not persist chosen daemon socket into lock");
     }
+    // The rendezvous is published; the startup capability is released here, and
+    // every later data request takes its own shared lease.
+    drop(authorization);
     let registry = SessionRegistry::default();
     let shutdown = Arc::new(AtomicBool::new(false));
     let thread_registry = registry.clone();
@@ -329,6 +406,7 @@ fn start_with_lock(
         runtime.block_on(run_accept_loop_async(
             listener,
             thread_project,
+            project_identity,
             thread_socket,
             thread_pid_path,
             thread_registry,
@@ -349,19 +427,19 @@ fn start_with_lock(
 /// remaining unix fallback candidates (`f83a1ec`). On non-unix there is a single
 /// namespaced pipe name, so the chain is just `[preferred]`.
 #[cfg(unix)]
-fn socket_candidate_chain(project_root: &Path, preferred: PathBuf) -> Vec<PathBuf> {
+fn socket_candidate_chain(project_root: &Path, preferred: PathBuf) -> Result<Vec<PathBuf>> {
     let mut candidates = vec![preferred];
-    for candidate in paths::daemon_socket_candidates(project_root) {
+    for candidate in paths::daemon_socket_candidates(project_root)? {
         if !candidates.contains(&candidate) {
             candidates.push(candidate);
         }
     }
-    candidates
+    Ok(candidates)
 }
 
 #[cfg(not(unix))]
-fn socket_candidate_chain(_project_root: &Path, preferred: PathBuf) -> Vec<PathBuf> {
-    vec![preferred]
+fn socket_candidate_chain(_project_root: &Path, preferred: PathBuf) -> Result<Vec<PathBuf>> {
+    Ok(vec![preferred])
 }
 
 /// Bind the daemon listener, falling through the deterministic socket-candidate
@@ -371,7 +449,7 @@ fn socket_candidate_chain(_project_root: &Path, preferred: PathBuf) -> Vec<PathB
 /// socket that actually bound. Errors only when EVERY candidate fails. Must be
 /// called inside a tokio runtime context (the async listener requires it).
 fn bind_with_fallback(project_root: &Path, preferred: PathBuf) -> Result<(AsyncListener, PathBuf)> {
-    let candidates = socket_candidate_chain(project_root, preferred);
+    let candidates = socket_candidate_chain(project_root, preferred)?;
 
     let mut last_err = None;
     for socket_path in candidates {
@@ -406,6 +484,7 @@ fn bind_with_fallback(project_root: &Path, preferred: PathBuf) -> Result<(AsyncL
 async fn run_accept_loop_async(
     listener: AsyncListener,
     project_root: PathBuf,
+    project_identity: String,
     socket_path: PathBuf,
     pid_path: PathBuf,
     registry: SessionRegistry,
@@ -430,12 +509,24 @@ async fn run_accept_loop_async(
     let mut first_connection_seen = false;
     info!(project = %project_root.display(), socket = %socket_path.display(), "daemon started");
 
+    // ONE cooperative cancellation shared by the watcher's lease loops and the
+    // startup catch-up, so a shutdown control frame can refuse queued loops and
+    // interrupt a running one instead of waiting out its lease budget.
+    let lease_loops = codegraph_watch::SyncCancellation::new();
+
     // ONE shared watcher per daemon process. Bound to a local so
     // its `Drop` stops the watch thread on shutdown. NEVER move this into
     // the session task: per-connection would spawn N watchers.
-    let _watcher = start_project_watcher(&project_root, &options);
+    let watcher = start_project_watcher(&project_root, &options, &lease_loops);
 
-    let _catch_up_done = spawn_catch_up(&project_root);
+    let _catch_up_done = spawn_catch_up(&project_root, &lease_loops);
+
+    // The control channel is separate from the request path by construction: a
+    // session that reads a control frame never builds an engine and never takes a
+    // data-request shared lease.
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel::<ShutdownRequest>();
+    let control = ControlHandle::new(&project_identity, control_tx);
+    let mut pending_shutdown: Option<ShutdownRequest> = None;
 
     // Tick cadence for lifecycle checks: the client-sweep interval clamped to a
     // responsive ceiling so idle-exit / supervision loss are observed promptly
@@ -457,6 +548,7 @@ async fn run_accept_loop_async(
                     let session_socket = socket_display.clone();
                     let session_registry = registry.clone();
                     let run_mcp = options.run_mcp;
+                    let session_control = control.clone();
                     tokio::spawn(async move {
                         if let Err(err) = serve_session_async(
                             stream,
@@ -464,6 +556,7 @@ async fn run_accept_loop_async(
                             session_socket,
                             session_registry,
                             run_mcp,
+                            Some(session_control),
                         )
                         .await
                         {
@@ -475,6 +568,11 @@ async fn run_accept_loop_async(
                     break Some(anyhow::Error::new(err).context("accepting daemon connection"));
                 }
             },
+            Some(request) = control_rx.recv() => {
+                info!(project = %project_root.display(), "daemon shutting down on control frame");
+                pending_shutdown = Some(request);
+                break None;
+            }
             _ = ticker.tick() => {
                 let state = SupervisionState {
                     original_ppid,
@@ -516,15 +614,80 @@ async fn run_accept_loop_async(
         }
     };
 
-    cleanup_owned_lock(&pid_path, std::process::id());
-    #[cfg(unix)]
-    if let Some(stale) = Rendezvous::from_socket_path(&socket_path).cleanup_path() {
-        let _ = fs::remove_file(stale);
+    // Accepting has stopped (the loop exited and `listener` is dropped below with
+    // this scope). Drain in the plan's order: signal the watcher and cancel every
+    // queued/running lease loop, actively close every data session, wait for both
+    // to finish within the bounded budget, remove the rendezvous this process owns,
+    // and only then answer with the ACTUAL drain result.
+    //
+    // `begin_shutdown` deliberately does NOT join: a running sync can hold the
+    // event-loop thread for a whole extraction pass, so joining here would block
+    // past the budget and make the "incomplete drain" answer unreachable.
+    lease_loops.cancel();
+    if let Some(watcher) = &watcher {
+        watcher.begin_shutdown();
+    }
+    registry.close_all_sessions();
+    let watcher_done = {
+        let watcher = watcher.as_ref();
+        move || watcher.is_none_or(codegraph_watch::ProjectWatcher::is_finished)
+    };
+    let drained = drain_watcher_loops_and_sessions(
+        watcher_done,
+        &lease_loops,
+        &registry,
+        options.drain_budget,
+    )
+    .await;
+    // Past the deadline the watcher thread is already cancelled and exits on its
+    // own; detach it so no destructor re-introduces an unbounded join AFTER the
+    // incomplete result was computed.
+    match watcher {
+        Some(watcher) if drained => watcher.stop(),
+        Some(watcher) => watcher.detach(),
+        None => {}
+    }
+    cleanup_owned_rendezvous(&pid_path, &socket_path, std::process::id());
+    if let Some(request) = pending_shutdown {
+        if !drained {
+            warn!(
+                "daemon drain exceeded its bounded budget; reporting an INCOMPLETE drain so the \
+                 caller fails closed"
+            );
+        }
+        // The reply is written by the session task, which still owns its socket;
+        // wait for it so this runtime is not torn down mid-write.
+        if request.ack.send(drained).is_ok() {
+            let _ = tokio::time::timeout(DRAIN_TIMEOUT, request.done).await;
+        }
     }
     info!(project = %project_root.display(), "daemon stopped");
     match stop_reason {
         Some(err) => Err(err),
         None => Ok(()),
+    }
+}
+
+/// Wait for the watcher's event loop to finish, every cancellation-aware lease
+/// loop to exit, and every active session to close — all bounded by `budget` and
+/// observed by POLLING, never by a blocking join. Returns whether all three
+/// reached completion; `false` is reported to the caller as an INCOMPLETE drain
+/// and never acknowledged as success.
+async fn drain_watcher_loops_and_sessions(
+    watcher_done: impl Fn() -> bool,
+    lease_loops: &codegraph_watch::SyncCancellation,
+    registry: &SessionRegistry,
+    budget: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        if watcher_done() && lease_loops.active_syncs() == 0 && registry.active_count() == 0 {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
     }
 }
 
@@ -551,6 +714,7 @@ fn backstop_should_exit(registry: &SessionRegistry, is_alive: impl Fn(u32) -> bo
 fn start_project_watcher(
     project_root: &Path,
     options: &DaemonOptions,
+    lease_loops: &codegraph_watch::SyncCancellation,
 ) -> Option<codegraph_watch::ProjectWatcher> {
     let counter = Arc::new(AtomicUsize::new(0));
     // The watcher's scope comes from THIS project's own config (include/exclude,
@@ -568,6 +732,7 @@ fn start_project_watcher(
     };
     // An explicit `--no-watch` (or `CODEGRAPH_NO_WATCH`) still wins over config.
     watch_options.no_watch = watch_options.no_watch || !options.watch;
+    watch_options = watch_options.with_cancellation(lease_loops.clone());
     watch_options.on_sync_complete =
         Some(Arc::new(move |outcome: codegraph_watch::SyncOutcome| {
             let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
@@ -624,12 +789,16 @@ fn changed_paths_tail(paths: &[String]) -> String {
 /// daemon was down (#905). Returns an `Arc<AtomicBool>` flipped `true` on
 /// completion. Runs on a detached `std::thread`; the accept loop is never
 /// blocked on it, so the first client's first tool call does not wait.
-fn spawn_catch_up(project_root: &Path) -> Arc<AtomicBool> {
+fn spawn_catch_up(
+    project_root: &Path,
+    lease_loops: &codegraph_watch::SyncCancellation,
+) -> Arc<AtomicBool> {
     let done = Arc::new(AtomicBool::new(false));
     let thread_done = Arc::clone(&done);
     let root = project_root.to_path_buf();
+    let cancel = lease_loops.clone();
     thread::spawn(move || {
-        match codegraph_watch::sync_project_once(&root) {
+        match codegraph_watch::sync_project_once_cancellable(&root, &cancel) {
             Ok(outcome) => {
                 let changed = outcome.files_reindexed + outcome.files_removed;
                 if changed > 0 {
@@ -717,9 +886,63 @@ mod tests {
         let options = DaemonOptions::default();
         assert!(options.run_mcp);
         assert!(options.watch);
+        assert_eq!(options.drain_budget, DRAIN_TIMEOUT);
         assert_eq!(options.parent_pid, None);
         assert_eq!(options.host_pid, None);
         assert_eq!(options.watchdog_interval, DEFAULT_WATCHDOG_INTERVAL);
+    }
+
+    #[tokio::test]
+    async fn drain_reports_completion_only_when_loops_and_sessions_reach_zero() {
+        let lease_loops = codegraph_watch::SyncCancellation::new();
+        let registry = SessionRegistry::default();
+        // Nothing outstanding: the drain completes.
+        assert!(
+            drain_watcher_loops_and_sessions(
+                || true,
+                &lease_loops,
+                &registry,
+                Duration::from_millis(50)
+            )
+            .await
+        );
+
+        // A still-open session keeps the drain INCOMPLETE, which is what must
+        // travel to the caller as a refusal instead of a success acknowledgement.
+        let session = registry.start_session();
+        assert!(
+            !drain_watcher_loops_and_sessions(
+                || true,
+                &lease_loops,
+                &registry,
+                Duration::from_millis(50)
+            )
+            .await,
+            "an outstanding session must report an incomplete drain"
+        );
+        drop(session);
+        assert!(
+            drain_watcher_loops_and_sessions(
+                || true,
+                &lease_loops,
+                &registry,
+                Duration::from_millis(50)
+            )
+            .await
+        );
+
+        // An unfinished watcher ALONE also keeps the drain incomplete, and the wait
+        // returns at its deadline instead of joining the event-loop thread.
+        assert!(
+            !drain_watcher_loops_and_sessions(
+                || false,
+                &lease_loops,
+                &registry,
+                Duration::from_millis(50)
+            )
+            .await,
+            "an unfinished watcher event loop must report an incomplete drain"
+        );
     }
 
     #[test]
@@ -782,14 +1005,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn socket_candidate_chain_puts_preferred_first_and_dedups() {
-        let root = Path::new("/tmp/cg-candidate-chain");
-        let preferred = daemon_socket_path(root);
-        let chain = socket_candidate_chain(root, preferred.clone());
+        let root = temp_root("candidate-chain");
+        let preferred = socket_path_of(&root);
+        let chain = socket_candidate_chain(&root, preferred.clone()).expect("resolve candidates");
         assert_eq!(chain[0], preferred);
         let mut deduped = chain.clone();
         deduped.sort();
         deduped.dedup();
         assert_eq!(deduped.len(), chain.len());
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn temp_root(label: &str) -> PathBuf {
@@ -802,7 +1026,19 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&root).unwrap();
-        root
+        root.canonicalize().unwrap()
+    }
+
+    fn pid_path_of(root: &Path) -> PathBuf {
+        daemon_pid_path(root).expect("resolve the v2 rendezvous pid path")
+    }
+
+    fn socket_path_of(root: &Path) -> PathBuf {
+        daemon_socket_path(root).expect("resolve the v2 rendezvous socket identity")
+    }
+
+    fn create_rendezvous_dir(root: &Path) {
+        fs::create_dir_all(paths::rendezvous_dir(root).expect("resolve rendezvous dir")).unwrap();
     }
 
     fn quiet_options() -> DaemonOptions {
@@ -895,16 +1131,16 @@ mod tests {
     #[test]
     fn start_or_attach_clears_a_stale_lock_with_a_dead_pid_and_restarts() {
         let root = temp_root("stale-dead");
-        fs::create_dir_all(paths::codegraph_dir(&root)).unwrap();
+        create_rendezvous_dir(&root);
         let mut dead_pid = 999_999u32;
         while is_process_alive(dead_pid) {
             dead_pid -= 1;
         }
-        let pid_path = daemon_pid_path(&root);
+        let pid_path = pid_path_of(&root);
         let stale = DaemonLockInfo {
             pid: dead_pid,
             version: env!("CARGO_PKG_VERSION").to_string(),
-            socket_path: daemon_socket_path(&root),
+            socket_path: socket_path_of(&root),
             started_at: 1,
         };
         fs::write(&pid_path, encode_lock_info(&stale).unwrap()).unwrap();
@@ -922,8 +1158,8 @@ mod tests {
     #[test]
     fn start_or_attach_clears_a_garbage_lock_without_info_and_restarts() {
         let root = temp_root("stale-garbage");
-        fs::create_dir_all(paths::codegraph_dir(&root)).unwrap();
-        let pid_path = daemon_pid_path(&root);
+        create_rendezvous_dir(&root);
+        let pid_path = pid_path_of(&root);
         fs::write(&pid_path, b"not-json-at-all").unwrap();
 
         let started = start_or_attach(&root, quiet_options())
@@ -938,8 +1174,8 @@ mod tests {
     #[tokio::test]
     async fn bind_with_fallback_binds_the_preferred_socket_first() {
         let root = temp_root("bind-fallback");
-        fs::create_dir_all(paths::codegraph_dir(&root)).unwrap();
-        let preferred = daemon_socket_path(&root);
+        create_rendezvous_dir(&root);
+        let preferred = socket_path_of(&root);
         let (_listener, bound) =
             bind_with_fallback(&root, preferred.clone()).expect("preferred socket must bind");
         assert_eq!(bound, preferred, "the preferred candidate binds first");
@@ -953,7 +1189,7 @@ mod tests {
     #[test]
     fn attach_to_a_dead_socket_path_errors() {
         let root = temp_root("attach-dead");
-        let socket = daemon_socket_path(&root);
+        let socket = socket_path_of(&root);
         let err = attach_to_daemon(&socket).expect_err("attaching to an unbound socket must fail");
         assert!(
             err.to_string().contains("connecting to daemon socket"),

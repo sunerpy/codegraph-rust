@@ -7,7 +7,7 @@
 //! keeps being served. With `CODEGRAPH_DAEMON_CLIENT_SWEEP_MS=200` the sweep
 //! fires fast; we poll pid liveness / daemon exit against a clear deadline.
 //!
-//! The daemon is detached + logs to `.codegraph/daemon.log`, so lifecycle is
+//! The daemon is detached + logs to its v2 `daemon.log`, so lifecycle is
 //! asserted via the daemon pid (idle-exit once no live clients remain) — exactly
 //! the observable surface `daemon_idle.rs` uses.
 
@@ -203,7 +203,7 @@ fn spawn_throwaway_child() -> Child {
 #[test]
 fn dead_client_is_swept_and_daemon_idle_exits() {
     let (_dir, project) = indexed_project("dead");
-    let socket = daemon_socket_path(&project);
+    let socket = daemon_socket_path(&project).expect("resolve the v2 rendezvous socket identity");
 
     spawn_sweep_daemon(&project);
     let daemon_pid = poll_for_daemon_pid(&socket, Duration::from_millis(3000))
@@ -249,7 +249,7 @@ fn dead_client_is_swept_and_daemon_idle_exits() {
 #[test]
 fn client_without_hello_is_never_swept() {
     let (_dir, project) = indexed_project("nohello");
-    let socket = daemon_socket_path(&project);
+    let socket = daemon_socket_path(&project).expect("resolve the v2 rendezvous socket identity");
 
     spawn_sweep_daemon(&project);
     let daemon_pid = poll_for_daemon_pid(&socket, Duration::from_millis(3000))

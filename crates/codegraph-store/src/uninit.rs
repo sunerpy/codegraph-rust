@@ -58,6 +58,15 @@ pub enum UninitError {
         #[source]
         source: io::Error,
     },
+    /// A live daemon never acknowledged the owner-bound shutdown control frame.
+    /// Both durable markers already published, so the namespace stays recoverable
+    /// `Uninitialized` and no runtime child was removed. No pid is ever signalled.
+    #[error(
+        "uninit is incomplete: {detail}. The index is now uninitialized and its \
+         tombstone is published; rerun `codegraph uninit --force` once the daemon \
+         has exited, or run `codegraph init` to rebuild"
+    )]
+    DaemonNotDrained { detail: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +74,7 @@ enum UninitCheckpoint {
     BeforeAuthorization,
     StatePublished,
     TombstoneEnsured,
+    DaemonDrained,
     DatabaseRemoved,
     WalRemoved,
     ShmRemoved,
@@ -81,6 +91,7 @@ impl UninitCheckpoint {
             Self::BeforeAuthorization => "write authorization",
             Self::StatePublished => "uninitialized state publication",
             Self::TombstoneEnsured => "tombstone creation",
+            Self::DaemonDrained => "daemon drain",
             Self::DatabaseRemoved => "database removal",
             Self::WalRemoved => "WAL removal",
             Self::ShmRemoved => "SHM removal",
@@ -114,13 +125,34 @@ pub fn uninit_index(
     deadline: Instant,
     cancelled: impl FnMut() -> bool,
 ) -> Result<UninitOutcome, UninitError> {
-    uninit_index_with(paths, deadline, cancelled, &mut NoFault)
+    uninit_index_with_drain(paths, deadline, cancelled, || Ok(()))
+}
+
+/// [`uninit_index`] with the owner-bound daemon-drain step wired in.
+///
+/// `drain` runs INSIDE the retained exclusive lease, AFTER both durable markers
+/// (the authoritative `uninitialized` state slot, then the tombstone) have
+/// published and BEFORE any runtime child is removed — the exact order the frozen
+/// plan requires. It must send the versioned, project-identity-bound shutdown
+/// control frame and return only once the daemon has drained and removed its own
+/// rendezvous; an `Err(detail)` is fail-closed
+/// ([`UninitError::DaemonNotDrained`]), leaving the recoverable `Uninitialized`
+/// namespace and every runtime child in place. The store layer never learns how
+/// to reach a daemon, so it can never fall back to signalling a pid.
+pub fn uninit_index_with_drain(
+    paths: &IndexPaths,
+    deadline: Instant,
+    cancelled: impl FnMut() -> bool,
+    drain: impl FnOnce() -> Result<(), String>,
+) -> Result<UninitOutcome, UninitError> {
+    uninit_index_with(paths, deadline, cancelled, drain, &mut NoFault)
 }
 
 fn uninit_index_with(
     paths: &IndexPaths,
     deadline: Instant,
     cancelled: impl FnMut() -> bool,
+    drain: impl FnOnce() -> Result<(), String>,
     fault: &mut impl UninitFault,
 ) -> Result<UninitOutcome, UninitError> {
     let visible = Store::extraction_status(paths);
@@ -157,6 +189,12 @@ fn uninit_index_with(
     checkpoint(fault, UninitCheckpoint::StatePublished)?;
     ensure_tombstone(paths, &lease)?;
     checkpoint(fault, UninitCheckpoint::TombstoneEnsured)?;
+
+    // Both durable markers are published, so a failure from here on classifies as
+    // recoverable `Uninitialized` and is continuable by a repeated
+    // `uninit --force`.
+    drain().map_err(|detail| UninitError::DaemonNotDrained { detail })?;
+    checkpoint(fault, UninitCheckpoint::DaemonDrained)?;
 
     let db = paths.current_db();
     remove_child(paths, &lease, &db)?;
@@ -451,8 +489,14 @@ mod tests {
                 .expect("write legacy proof bytes");
             let legacy_before = snapshot(&legacy);
 
-            let error = uninit_index_with(&paths, deadline(), || false, &mut FailAfter(boundary))
-                .expect_err("fault checkpoint must interrupt uninit");
+            let error = uninit_index_with(
+                &paths,
+                deadline(),
+                || false,
+                || Ok(()),
+                &mut FailAfter(boundary),
+            )
+            .expect_err("fault checkpoint must interrupt uninit");
             match error {
                 UninitError::Interrupted { step, source } => {
                     assert_eq!(step, expected_step, "boundary={boundary:?}");
@@ -692,6 +736,104 @@ mod tests {
             Err(UninitError::Lease(IndexLeaseError::LockNotFound { .. }))
         ));
         assert_unchanged(&before, &snapshot(&project.0));
+    }
+
+    #[test]
+    fn an_undrained_daemon_leaves_recoverable_uninitialized_residue() {
+        let project = TempProject::new("drain-refused");
+        let paths = project.paths();
+        stage_building_with_all_residue(&paths);
+
+        let error = uninit_index_with_drain(
+            &paths,
+            deadline(),
+            || false,
+            || Err("daemon 4242 never acknowledged the shutdown control frame".to_string()),
+        )
+        .expect_err("an undrained daemon must fail closed");
+        match &error {
+            UninitError::DaemonNotDrained { detail } => {
+                assert!(detail.contains("4242"), "detail names the owner: {detail}");
+            }
+            other => panic!("unexpected uninit result: {other:?}"),
+        }
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("uninit is incomplete") && rendered.contains("uninit --force"),
+            "the error must state the incomplete uninit and its continuation: {rendered}"
+        );
+
+        // Both durable markers published BEFORE the drain, so the namespace is
+        // recoverable — never Corrupt — and no runtime child was removed.
+        assert_eq!(
+            Store::extraction_status(&paths),
+            ExtractionStatus::Uninitialized
+        );
+        assert_eq!(classify(&paths).status(), &ExtractionStatus::Uninitialized);
+        assert!(paths.tombstone().is_file());
+        assert!(paths.permanent_lock().is_file());
+        assert!(paths.state_slots().iter().all(|slot| slot.is_file()));
+        for artifact in [
+            paths.current_db(),
+            db_artifact(&paths, "-wal"),
+            db_artifact(&paths, "-shm"),
+            paths.config_toml(),
+            paths.extension_config(),
+            paths.daemon_pid(),
+            paths.daemon_log(),
+            paths.daemon_socket(),
+        ] {
+            assert!(
+                artifact.exists(),
+                "a fail-closed uninit removes no runtime child: {}",
+                artifact.display()
+            );
+        }
+
+        // The continuation resumes idempotently once the daemon is gone.
+        uninit_index(&paths, deadline(), || false).expect("uninit continuation");
+        assert!(!paths.current_db().exists());
+        assert!(!paths.daemon_pid().exists());
+        assert_eq!(
+            Store::extraction_status(&paths),
+            ExtractionStatus::Uninitialized
+        );
+    }
+
+    #[test]
+    fn the_drain_runs_after_both_markers_and_before_any_child_removal() {
+        let project = TempProject::new("drain-order");
+        let paths = project.paths();
+        stage_building_with_all_residue(&paths);
+
+        let mut observed = None;
+        uninit_index_with_drain(
+            &paths,
+            deadline(),
+            || false,
+            || {
+                observed = Some((
+                    Store::extraction_status(&paths),
+                    paths.tombstone().is_file(),
+                    paths.current_db().exists(),
+                    paths.daemon_pid().exists(),
+                ));
+                Ok(())
+            },
+        )
+        .expect("uninit with a draining daemon");
+
+        let (status, tombstone, db, pid) = observed.expect("the drain step ran exactly once");
+        assert_eq!(
+            status,
+            ExtractionStatus::Uninitialized,
+            "the authoritative slot publishes before the drain"
+        );
+        assert!(tombstone, "the tombstone publishes before the drain");
+        assert!(db, "no database is removed before the drain");
+        assert!(pid, "no runtime child is removed before the drain");
+        assert!(!paths.current_db().exists(), "cleanup follows the drain");
+        assert!(!paths.daemon_pid().exists());
     }
 
     #[test]

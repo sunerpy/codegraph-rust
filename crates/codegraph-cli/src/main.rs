@@ -1142,16 +1142,82 @@ fn cmd_uninit(path: Option<PathBuf>, force: bool) -> Result<()> {
         bail!("refusing to delete .codegraph without --force");
     }
     let paths = index_paths(&project)?;
-    let outcome = codegraph_store::uninit_index(
+    // The drain runs INSIDE uninit's retained exclusive lease, after both durable
+    // markers publish and before any runtime child is removed. It sends the
+    // versioned, project-identity-bound shutdown control frame — which bypasses
+    // data-request lease acquisition, the only way it can be answered while this
+    // command holds the namespace exclusively — and waits for the daemon's
+    // post-drain ACK. No pid is ever signalled: an unresponsive daemon makes uninit
+    // fail closed with the namespace left recoverable `Uninitialized`.
+    let identity = paths.project_identity().to_string();
+    let outcome = codegraph_store::uninit_index_with_drain(
         &paths,
         std::time::Instant::now() + REBUILD_LEASE_TIMEOUT,
         || false,
+        || drain_project_daemon(&project, &identity),
     )?;
     println!("Removed CodeGraph from {}", project.display());
     if outcome.legacy_index_present {
         println!("Legacy CodeGraph index remains untouched");
     }
     Ok(())
+}
+
+/// Daemon-startup gate (frozen plan lines 590-592, 603-604).
+///
+/// ONE bounded shared acquisition validates everything: `Store::open_for_read`
+/// acquires the shared `IndexLease` and, under it, corroborates the FULL `Current`
+/// contract — both owner-bound state slots (so `Future`, `Corrupt`, `Building`,
+/// `Uninitialized`, `Outdated`, and an owner mismatch are all refused), tombstone
+/// absence, database presence, sidecar-freedom, and the exact extraction stamp
+/// read from the checkpointed main-file bytes. Slot phase alone would let a
+/// `Current` slot with a deleted database or a stale stamp publish a rendezvous.
+///
+/// The returned `Store` OWNS that same lease, so retaining it across pid/socket
+/// publication requires no second acquisition: there is no nested lock and no
+/// window between validation and publication for another writer to reclassify.
+fn authorize_daemon_startup(project_root: &Path) -> Result<codegraph_daemon::StartupAuthorization> {
+    let paths = index_paths(project_root)?;
+    match Store::open_for_read(
+        &paths,
+        std::time::Instant::now() + REBUILD_LEASE_TIMEOUT,
+        || false,
+    ) {
+        Ok(store) => Ok(Box::new(store)),
+        Err(error) => {
+            // Re-read the observed markers for the operator-facing message only.
+            // The refusal itself is already decided by the gate above.
+            let status = Store::extraction_status(&paths);
+            let tombstone = if paths.tombstone().exists() {
+                "present"
+            } else {
+                "absent"
+            };
+            bail!(
+                "refusing to start a daemon for {}: {error}; index state is {status} and its \
+                 uninitialized tombstone is {tombstone}. No daemon pid, socket, or log was \
+                 published. Run `codegraph init` to rebuild.",
+                project_root.display()
+            )
+        }
+    }
+}
+
+/// Ask this project's daemon (if any) to stop accepting, cancel its watcher lease
+/// loops, drain, remove its own pid/socket, and ACK. `Err(detail)` is the
+/// fail-closed signal; the pid is only ever reported, never signalled.
+fn drain_project_daemon(project: &Path, project_identity: &str) -> Result<(), String> {
+    match codegraph_daemon::request_daemon_shutdown(project, project_identity) {
+        Ok(codegraph_daemon::ShutdownOutcome::NoDaemon) => Ok(()),
+        Ok(codegraph_daemon::ShutdownOutcome::Drained { pid }) => {
+            tracing::info!(pid, "daemon drained and removed its own rendezvous");
+            Ok(())
+        }
+        Ok(codegraph_daemon::ShutdownOutcome::Unresponsive { pid, detail }) => Err(format!(
+            "daemon {pid} did not acknowledge the shutdown control frame ({detail})"
+        )),
+        Err(error) => Err(format!("could not reach this project's daemon: {error:#}")),
+    }
 }
 
 fn cmd_index(path: Option<PathBuf>, force: bool, quiet: bool, verbose: bool) -> Result<()> {
@@ -1247,9 +1313,9 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
         .collect::<Vec<_>>();
     let legacy_index_present = !legacy_index_paths.is_empty();
     let daemon_running = daemon_already_running(&project);
-    let daemon_pid_path = codegraph_daemon::daemon_pid_path(&project);
-    let daemon_socket_path = codegraph_daemon::recorded_socket_path(&project);
-    let daemon_log_path = codegraph_daemon::daemon_log_path(&project);
+    let daemon_pid_path = codegraph_daemon::daemon_pid_path(&project)?;
+    let daemon_socket_path = codegraph_daemon::recorded_socket_path(&project)?;
+    let daemon_log_path = codegraph_daemon::daemon_log_path(&project)?;
     let status_open = Store::open_for_status(
         &resolved,
         std::time::Instant::now() + STATUS_LEASE_TIMEOUT,
@@ -1569,6 +1635,25 @@ fn effective_log_level(config_level: &str) -> String {
     config_level.to_string()
 }
 
+/// The project's rendezvous identities for one debug line, or the fail-closed
+/// diagnostic when the configured index root is unsafe. Debug output must never
+/// reconstruct a path the resolver refused.
+fn describe_rendezvous(project_root: &Path) -> String {
+    match (
+        codegraph_daemon::daemon_pid_path(project_root),
+        codegraph_daemon::recorded_socket_path(project_root),
+    ) {
+        (Ok(pid_path), Ok(socket_path)) => {
+            format!(
+                "pid={} socket={}",
+                pid_path.display(),
+                socket_path.display()
+            )
+        }
+        (Err(error), _) | (_, Err(error)) => format!("(unresolved: {error})"),
+    }
+}
+
 fn emit_serve_startup_debug(
     project_root: &Path,
     explicit_path: bool,
@@ -1653,14 +1738,19 @@ fn cmd_serve(
             }
             ServeMode::BeDaemon => {
                 // The daemon loads THIS project's own watch config itself, from
-                // the resolved index root, so nothing is passed down here.
-                return codegraph_daemon::run_foreground(
+                // the resolved index root, so nothing is passed down here. The
+                // startup gate below validates state/owner/tombstone under a
+                // bounded SHARED index lease and RETAINS it across pid/socket
+                // publication, so a concurrent `uninit --force` cannot interleave.
+                let gate = |root: &Path| authorize_daemon_startup(root);
+                return codegraph_daemon::run_foreground_gated(
                     &project_root,
                     codegraph_daemon::DaemonOptions {
                         run_mcp: true,
                         host_pid: codegraph_daemon::host_pid_from_env(),
                         ..Default::default()
                     },
+                    Some(&gate),
                 )
                 .context("running as detached MCP daemon");
             }
@@ -2246,12 +2336,12 @@ fn start_daemon_for_adopted_root(project_root: &Path, no_watch: bool) -> Option<
         return None;
     }
     if daemon_already_running(project_root) {
+        let socket_path = codegraph_daemon::recorded_socket_path(project_root).ok()?;
         tracing::debug!(
-            pid_path = %codegraph_daemon::daemon_pid_path(project_root).display(),
-            socket_path = %codegraph_daemon::recorded_socket_path(project_root).display(),
+            socket_path = %socket_path.display(),
             "adopted-root: attaching to existing daemon"
         );
-        return Some(codegraph_daemon::recorded_socket_path(project_root));
+        return Some(socket_path);
     }
     let Ok(exe) = std::env::current_exe() else {
         return None;
@@ -2263,12 +2353,11 @@ fn start_daemon_for_adopted_root(project_root: &Path, no_watch: bool) -> Option<
                 project = %project_root.display(),
                 "started shared daemon for adopted project root"
             );
+            let socket_path = codegraph_daemon::recorded_socket_path(project_root).ok()?;
             tracing::debug!(
-                pid_path = %codegraph_daemon::daemon_pid_path(project_root).display(),
-                socket_path = %codegraph_daemon::recorded_socket_path(project_root).display(),
+                socket_path = %socket_path.display(),
                 "adopted-root: spawned new daemon"
             );
-            let socket_path = codegraph_daemon::recorded_socket_path(project_root);
             socket_path.exists().then_some(socket_path)
         }
         Err(err) => {
@@ -2419,8 +2508,7 @@ fn serve_spawn_or_proxy(
     explicit_path: bool,
 ) -> Result<()> {
     tracing::debug!(
-        pid_path = %codegraph_daemon::daemon_pid_path(project_root).display(),
-        socket_path = %codegraph_daemon::recorded_socket_path(project_root).display(),
+        rendezvous = %describe_rendezvous(project_root),
         "serve_spawn_or_proxy: begin"
     );
     match cold_start_action(daemon_already_running(project_root)) {
@@ -2452,7 +2540,7 @@ fn serve_spawn_or_proxy(
 /// proxy semantics: `run_proxy` answers `initialize`/`tools/list` locally and
 /// forwards tool calls; its fd half-close / ppid-watchdog teardown is untouched.
 fn proxy_to_running_daemon(project_root: &Path) -> Option<Result<()>> {
-    let socket_path = codegraph_daemon::recorded_socket_path(project_root);
+    let socket_path = codegraph_daemon::recorded_socket_path(project_root).ok()?;
     if !socket_path.exists() {
         tracing::debug!("proxy_to_running_daemon: daemon socket missing; falling back to direct");
         heal_stale_daemon_if_dead(project_root);
@@ -2516,7 +2604,9 @@ fn heal_stale_daemon_if_dead(project_root: &Path) {
 }
 
 fn daemon_already_running(project_root: &Path) -> bool {
-    let pid_path = codegraph_daemon::daemon_pid_path(project_root);
+    let Ok(pid_path) = codegraph_daemon::daemon_pid_path(project_root) else {
+        return false;
+    };
     let Ok(raw) = fs::read_to_string(&pid_path) else {
         return false;
     };
@@ -2531,7 +2621,8 @@ fn poll_for_daemon_socket(project_root: &Path) {
         // Re-read the lock each tick: the daemon rewrites the recorded socket to
         // its bind-fallback choice during startup, so the path can change while
         // we poll (D-Daemon-b).
-        if codegraph_daemon::recorded_socket_path(project_root).exists() {
+        if codegraph_daemon::recorded_socket_path(project_root).is_ok_and(|socket| socket.exists())
+        {
             return;
         }
         std::thread::sleep(DAEMON_SOCKET_POLL_INTERVAL);
@@ -2781,7 +2872,7 @@ mod serve_mode_tests {
 
 fn cmd_unlock(path: Option<PathBuf>) -> Result<()> {
     let project = resolve_required_project(path)?;
-    let daemon_lock = codegraph_daemon::daemon_pid_path(&project);
+    let daemon_lock = codegraph_daemon::daemon_pid_path(&project)?;
     let daemon_removed = daemon_lock.exists() && codegraph_daemon::unlock_project(&project);
     let lock = codegraph_dir(&project)?.join("codegraph.lock");
     if !lock.exists() && !daemon_removed {

@@ -2,7 +2,7 @@
 //!
 //! The daemon lives in a SEPARATE detached process, so we assert lifecycle via
 //! pid liveness (`is_process_alive`) at timed checkpoints, not via stdout (it is
-//! detached + logs to `.codegraph/daemon.log`). With a multi-second
+//! detached + logs to its v2 `daemon.log`). With a multi-second
 //! `CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS` the daemon should LINGER while a client is
 //! connected and shortly after the LAST client disconnects, then EXIT once the
 //! idle window elapses with zero clients. De-flake by polling pid liveness
@@ -179,7 +179,7 @@ fn wait_until_gone(pid: u32, timeout: Duration) -> bool {
 #[test]
 fn daemon_idle_exits_after_last_client() {
     let (_dir, project) = indexed_project("exits");
-    let socket = daemon_socket_path(&project);
+    let socket = daemon_socket_path(&project).expect("resolve the v2 rendezvous socket identity");
 
     spawn_idle_daemon(&project, "2000");
     let pid = poll_for_daemon_pid(&socket, Duration::from_millis(3000))
@@ -226,7 +226,7 @@ fn daemon_idle_exits_after_last_client() {
 #[test]
 fn daemon_stays_alive_with_active_client() {
     let (_dir, project) = indexed_project("active");
-    let socket = daemon_socket_path(&project);
+    let socket = daemon_socket_path(&project).expect("resolve the v2 rendezvous socket identity");
 
     spawn_idle_daemon(&project, "500");
     let pid = poll_for_daemon_pid(&socket, Duration::from_millis(3000))

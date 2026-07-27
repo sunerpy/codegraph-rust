@@ -2978,3 +2978,163 @@ remains required at SHA-256
 bytes are written BEFORE repository formatting and the one authoritative
 `bash scripts/check-workspace-versions.sh && make ci CARGO='cargo --locked'` run over
 these exact final bytes; no final Green is claimed until that gate passes.
+
+## Batch M item 20 acceptance closure — daemon rendezvous lifecycle under `uninit --force` (2026-07-27)
+
+Frozen plan item 20 (lines 590-612, 787-797). Two named acceptances plus the paired
+fail-closed case now exist as real-process tests in
+`crates/codegraph-cli/tests/batch_m_daemon_uninit_lifecycle.rs`:
+`daemon_start_during_uninit_observes_uninitialized_and_tombstone_before_publish`,
+`uninit_shutdown_control_drains_without_pid_kill`, and
+`unresponsive_daemon_leaves_recoverable_uninitialized_without_kill`.
+
+Behavioral Red on the pre-change bytes (compiling test, real failures — not a build
+error and not a missing environment):
+`cargo test --locked -p codegraph-rs --test batch_m_daemon_uninit_lifecycle` →
+**0 passed, 3 failed**. `daemon_start_...` failed with "lease barrier was not reached
+before its finite deadline" (startup took NO shared lease at all, so it never reached
+the store's post-acquisition checkpoint); `uninit_shutdown_control_...` failed with
+"the daemon never published its v2 rendezvous at
+…/.codegraph-v2/daemon.pid" (the rendezvous was still written under the legacy
+`.codegraph` root); `unresponsive_daemon_...` failed because `uninit --force`
+SUCCEEDED while a live recorded owner had never been drained.
+
+Green: **3/3**. Ordering evidence is deterministic, never a sleep. The concurrent-start
+test publishes the authoritative `uninitialized` slot and then the tombstone while it
+still holds uninit's exclusive lease, and the competing `serve --mcp` child is stopped
+at the store's test-only post-acquisition SHARED-lease barrier; the "published nothing"
+snapshot is taken at that exact checkpoint and re-checked after the child exits,
+against BOTH the v2 identities and the legacy `.codegraph` spellings. The drain test
+asserts process exit status, `signal() == None`, removal of pid + socket, removal of
+the v2 database, and recoverable `Uninitialized`; the fail-closed test asserts the
+recorded live owner is still running, that NO runtime child was removed, and that a
+repeated `uninit --force` resumes the cleanup idempotently once the owner is gone.
+
+Production slice. `IndexPaths` is now the sole authority for every rendezvous path:
+`crates/codegraph-daemon/src/paths.rs` derives pid/log/socket from
+`IndexPaths::resolve` and every accessor is FALLIBLE, so an unsafe or unresolvable
+configured root fails closed instead of reconstructing a `.codegraph*` path (the
+out-of-root POSIX-tmpdir and Windows namespaced names are
+`sha256("codegraph-v2-" || projectIdentity)[..8]`, provably distinct from the legacy
+`sha256(path)` name). `crates/codegraph-daemon/src/control.rs` (new) owns the
+versioned, project-identity-bound control frame plus `request_daemon_shutdown`.
+`session.rs` answers a control frame at the hello seam, BEFORE any engine or
+data-request lease exists — which is exactly why it can be served while
+`uninit --force` holds the namespace exclusively. `lib.rs` gates startup through a
+caller-supplied `StartupGate` whose returned capability is retained across
+pid/socket publication and dropped only afterwards. `codegraph-store`'s
+`uninit_index_with_drain` runs the drain INSIDE the retained exclusive lease, after
+both durable markers and before any child removal; a drain error is
+`UninitError::DaemonNotDrained`, fail-closed. `codegraph-watch` gained
+`SyncCancellation` so a shutdown refuses queued lease loops and interrupts a running
+one instead of waiting out the 30s lease budget.
+
+### Orchestrator-caught defects and their corrections
+
+The orchestrator manually READ the M20 diff and rejected the first candidate even
+though `batch_m_daemon_uninit_lifecycle` was 3/3 and `control_shutdown` was 3/3. Both
+suites passed **with a hardcoded-success mutant still in the tree**: an un-restored
+negative control at `session.rs` wrote `shutdown_reply_line(true)` and the compiler's
+`unused variable: drained` was the only signal. The lesson recorded here is that a
+green suite is not evidence when no test observes the real call site — the incomplete
+case was covered only by a stub responder and by a direct unit call to
+`shutdown_reply_line(false)`, neither of which routes through `serve_control_frame`.
+
+Corrections, each with a load-bearing test:
+
+1. **Success ACK despite an incomplete drain.** `run_accept_loop_async` logged
+   `!drained` and still sent success. `ShutdownRequest::ack` now carries the drain
+   RESULT (`oneshot::Sender<bool>`), `serve_control_frame` serializes that value, and
+   `ControlAck::for_drain(false)` is what the caller maps to
+   `ShutdownOutcome::Unresponsive`. Pinned by
+   `an_exhausted_drain_budget_replies_incomplete_instead_of_success`, which drives a
+   REAL daemon with `DaemonOptions::drain_budget = 0` and a connected silent client:
+   it reads `drained: false` off the wire. Mutant proof — reinstating
+   `shutdown_reply_line(true)` (with `let _ = drained;`) turns exactly this test red
+   (`left: true, right: false`) while the other three stay green; the byte was then
+   restored and the suite re-run 4/4.
+2. **No active session close, and a Unix-only mechanism.** Shutdown merely waited.
+   `SessionRegistry` now owns a `tokio::sync::watch` closing signal
+   (`close_all_sessions` / `is_closing`), which is platform-independent; the Unix
+   raw-fd half-close remains only as an acceleration. Both the first-line read and the
+   rmcp serve loop race that signal, so a silent client and a long-lived rmcp client
+   are both ended by the daemon. `send_replace` (not `send`) is required: `send` fails
+   when no receiver exists yet, which would let a session accepted after the signal
+   start serving. Pinned by
+   `authorized_shutdown_closes_a_long_lived_session_before_acknowledging` (the silent
+   client's socket must EOF) — disabling `close_all_sessions` turns it red with
+   `drained: false`.
+3. **Unbounded watcher join before the bounded wait.** The old order was
+   `lease_loops.cancel(); drop(watcher); drain(...)`, and `ProjectWatcher::Drop →
+stop_inner → join` can block for a whole extraction pass, making the incomplete-ACK
+   path unreachable. `ProjectWatcher` now separates signalling from joining:
+   `begin_shutdown()` (stop OS events, cancel loops, ask the loop to exit; never
+   joins), `is_finished()` (a flag the loop sets as its last action), and `detach()`
+   (release the handle so no destructor re-introduces the join). The daemon calls
+   `begin_shutdown` → `close_all_sessions` → `drain_watcher_loops_and_sessions(...)`
+   → `stop()` only when drained, else `detach()`. Pinned by
+   `begin_shutdown_and_detach_never_block_on_a_running_sync` (a barrier-blocked sync,
+   so "still running" is deterministic) and by the daemon-side
+   `drain_reports_completion_only_when_loops_and_sessions_reach_zero`, which asserts
+   an unfinished watcher ALONE yields an incomplete drain.
+4. **Owned-rendezvous cleanup could unlink a replacement owner's socket.**
+   `cleanup_owned_lock` now RETURNS ownership and `cleanup_owned_rendezvous` removes
+   the socket only when the pid record still names this process; an owner mismatch
+   preserves both the replacement record and its socket. Pinned by
+   `cleanup_owned_rendezvous_preserves_a_replacement_owners_record_and_socket`.
+5. **Slot-only startup validation.** The gate previously checked
+   `Store::extraction_status == Current` plus tombstone absence, which would still
+   publish a rendezvous for a `Current` slot whose database was deleted, whose
+   sidecars reappeared, or whose extraction stamp is stale.
+   `authorize_daemon_startup` now uses `Store::open_for_read`, which acquires ONE
+   bounded shared lease and, under it, corroborates the full contract (owner-bound
+   slots, tombstone absence, DB presence, sidecar-freedom, exact stamp from the
+   checkpointed main file). The returned `Store` OWNS that same lease, so retaining it
+   across publication needs no second acquisition — no nested lock, no TOCTOU window.
+6. **Foreign control versions leaked into the data path.** `parse_control_frame`
+   rejected `codegraph_control == 0`, which would have routed those bytes into the
+   JSON-RPC executor. Every line that deserializes as a `ControlFrame` is now
+   recognized and refused explicitly; authorization stays the only gate. Pinned by
+   `a_foreign_protocol_version_is_never_authorized` (0, +1, `u8::MAX`) and by
+   `an_unauthorized_frame_is_refused_without_shutting_the_daemon_down`, which sends a
+   foreign identity, a foreign version, and a foreign action against a live daemon and
+   asserts each is answered `drained: false` with the rendezvous intact and the daemon
+   still serving.
+
+A finite caller-side wait is now honest on every platform: `interprocess`'s
+send/recv timeouts are Unix-only, so `request_daemon_shutdown` runs the exchange on a
+worker thread and bounds the WAIT with a monotonic channel deadline. No PID is ever
+signalled on any path; `uninit` only ever REPORTS the recorded pid.
+
+Migrated coverage, never weakened. Pre-existing daemon/CLI tests changed only because
+the rendezvous moved to the v2 current root: they now resolve pid/socket/log through
+`IndexPaths` instead of hardcoding `.codegraph/daemon.*`, and their project fixtures
+canonicalize a real directory because `IndexPaths` derives a PHYSICAL identity.
+`lease_lifetime.rs`'s barrier listener now accepts EVERY arrival instead of only the
+first, because a daemon legitimately reaches the shared-lease checkpoint twice (its
+startup capability, then a per-request lease) — the test releases the startup arrival
+and still asserts the per-request one, which strengthens rather than loosens it. No
+test was deleted, skipped, ignored, or timing-loosened.
+
+Verification, with `bash scripts/check-workspace-versions.sh` before every Cargo batch
+and `--locked` on every Cargo command: `codegraph-rs`
+`batch_m_daemon_uninit_lifecycle` **3/3**; `codegraph-daemon` `control_shutdown`
+**4/4** and the whole package green (98 unit + every integration suite);
+`codegraph-watch` **green**; `codegraph-store` uninit suite **8/8** including the two
+new drain tests; `codegraph-rs` **all targets green**;
+`cargo clippy --locked --workspace --all-targets -- -D warnings` clean.
+
+Limitations, stated honestly. Changed-file LSP diagnostics were attempted and the tool
+again rejected this external worktree with `LSP file path must be inside request cwd`;
+locked Cargo check/Clippy/tests are the fallback and no LSP-clean result is claimed.
+Native Windows/MSVC runtime was NOT executed: the cross-platform claim covers the
+mechanism (a `tokio::sync::watch` close signal and a thread-bounded caller wait, with
+no Unix-only primitive on the correctness path) and compilation, not a Windows run.
+This slice adds no dependency and changes no schema, node-ID formula, extraction or
+golden byte; the frozen plan is untouched at SHA-256
+`5b64aa335fb32cd228d98404c2e44153e9134d26a912ecb02d71fcf5c5798450` and `Cargo.lock`
+remains at SHA-256
+`750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`. These evidence
+bytes are written BEFORE repository formatting and the one authoritative
+`bash scripts/check-workspace-versions.sh && make ci CARGO='cargo --locked'` run over
+these exact final bytes; no final Green is claimed until that gate passes.

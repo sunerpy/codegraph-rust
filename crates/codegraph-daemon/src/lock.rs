@@ -7,8 +7,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
-use crate::paths::{codegraph_dir, daemon_pid_path, daemon_socket_path};
+use crate::paths::{daemon_pid_path, daemon_socket_path, rendezvous_dir};
 use crate::process::is_process_alive;
 
 const EMPTY_RETRY_DELAY: Duration = Duration::from_millis(20);
@@ -59,14 +60,14 @@ pub fn decode_lock_info(raw: &str) -> Option<DaemonLockInfo> {
 }
 
 pub fn try_acquire_daemon_lock(project_root: &Path) -> Result<AcquireResult> {
-    let pid_path = daemon_pid_path(project_root);
-    fs::create_dir_all(codegraph_dir(project_root))
-        .with_context(|| format!("creating {}", codegraph_dir(project_root).display()))?;
+    let pid_path = daemon_pid_path(project_root)?;
+    let dir = rendezvous_dir(project_root)?;
+    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
     let info = DaemonLockInfo {
         pid: process::id(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        socket_path: daemon_socket_path(project_root),
+        socket_path: daemon_socket_path(project_root)?,
         started_at: now_millis(),
     };
 
@@ -144,9 +145,12 @@ pub fn clear_stale_daemon_lock(pid_path: &Path, expected_dead_pid: Option<u32>) 
     fs::remove_file(pid_path).is_ok()
 }
 
+/// Clear a stale daemon lock for `project_root`. An unresolvable index root is
+/// reported as "not cleared" rather than reconstructing a rendezvous path.
 pub fn unlock_project(project_root: &Path) -> bool {
-    let pid_path = daemon_pid_path(project_root);
-    clear_stale_daemon_lock(&pid_path, None)
+    daemon_pid_path(project_root)
+        .map(|pid_path| clear_stale_daemon_lock(&pid_path, None))
+        .unwrap_or(false)
 }
 
 /// Self-heal a project's stale daemon artifacts after a failed attach (Fix A):
@@ -159,8 +163,12 @@ pub fn unlock_project(project_root: &Path) -> bool {
 /// Returns `true` once the stale lock is cleared; socket removal is best-effort
 /// (a missing socket is already the desired end state).
 pub fn clear_stale_daemon_socket(project_root: &Path) -> bool {
-    let pid_path = daemon_pid_path(project_root);
-    let socket_path = recorded_socket_path(project_root);
+    let Ok(pid_path) = daemon_pid_path(project_root) else {
+        return false;
+    };
+    let Ok(socket_path) = recorded_socket_path(project_root) else {
+        return false;
+    };
     // Liveness gate: only proceed once the owning pid is proven dead/absent.
     if !clear_stale_daemon_lock(&pid_path, None) {
         return false;
@@ -169,11 +177,12 @@ pub fn clear_stale_daemon_socket(project_root: &Path) -> bool {
     true
 }
 
-pub(crate) fn cleanup_owned_lock(pid_path: &Path, pid: u32) {
+pub(crate) fn cleanup_owned_lock(pid_path: &Path, pid: u32) -> bool {
     let owned = read_lock_info_tolerant(pid_path).is_some_and(|info| info.pid == pid);
     if owned {
         let _ = fs::remove_file(pid_path);
     }
+    owned
 }
 
 enum ReadOutcome {
@@ -218,12 +227,44 @@ fn read_lock_info_tolerant(pid_path: &Path) -> Option<DaemonLockInfo> {
 /// recorded socket (a legacy plain-pid lock). Reading the recorded path — not
 /// recomputing — is what lets a client attach to a daemon that bound a fallback
 /// candidate (e.g. the tmpdir socket on an ExFAT project dir).
-pub fn recorded_socket_path(project_root: &Path) -> PathBuf {
-    let pid_path = daemon_pid_path(project_root);
-    read_lock_info_tolerant(&pid_path)
+pub fn recorded_socket_path(project_root: &Path) -> Result<PathBuf> {
+    let pid_path = daemon_pid_path(project_root)?;
+    match read_lock_info_tolerant(&pid_path)
         .map(|info| info.socket_path)
         .filter(|socket| !socket.as_os_str().is_empty())
-        .unwrap_or_else(|| daemon_socket_path(project_root))
+    {
+        Some(recorded) => Ok(recorded),
+        None => daemon_socket_path(project_root),
+    }
+}
+
+/// Remove the rendezvous artifacts this daemon process itself published: its
+/// owner-bound pid record and, on Unix, its bound socket file.
+///
+/// Socket removal is CONDITIONAL on the pid record still naming this process. If
+/// the record was already replaced by a new owner (its own claim published a new
+/// record and rebound the same socket path), unlinking the socket here would strip
+/// the LIVE daemon's rendezvous while its record still advertises it, leaving
+/// every client unable to attach. In that case both the replacement record and its
+/// socket are preserved and this reports `false`. The permanent index lock is
+/// never named here.
+pub(crate) fn cleanup_owned_rendezvous(pid_path: &Path, socket_path: &Path, pid: u32) -> bool {
+    let owned = cleanup_owned_lock(pid_path, pid);
+    if !owned {
+        debug!(
+            pid_path = %pid_path.display(),
+            "daemon rendezvous is owned by another process; leaving its record and socket intact"
+        );
+        return false;
+    }
+    #[cfg(unix)]
+    if let Some(stale) = crate::transport::Rendezvous::from_socket_path(socket_path).cleanup_path()
+    {
+        let _ = fs::remove_file(stale);
+    }
+    #[cfg(not(unix))]
+    let _ = socket_path;
+    true
 }
 
 fn now_millis() -> u128 {
@@ -248,11 +289,7 @@ mod tests {
     fn rewrite_socket_path_updates_recorded_socket_and_keeps_pid() {
         // Given an acquired lock recording the default socket, rewriting the
         // recorded socket to a fallback path is what the client later reads.
-        let base = std::env::temp_dir().join(format!(
-            "cg-lock-rewrite-{}-{}",
-            process::id(),
-            now_millis()
-        ));
+        let base = temp_base("rewrite");
         let AcquireResult::Acquired { pid_path, info } =
             try_acquire_daemon_lock(&base).expect("acquire lock")
         else {
@@ -271,12 +308,30 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    /// A real, existing project directory. `IndexPaths` derives the physical
+    /// project identity from the filesystem object, so the project must exist
+    /// before any rendezvous path resolves.
     fn temp_base(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
+        let base = std::env::temp_dir().join(format!(
             "cg-lock-{label}-{}-{}",
             process::id(),
             now_millis()
-        ))
+        ));
+        fs::create_dir_all(&base).unwrap();
+        base.canonicalize().unwrap()
+    }
+
+    fn pid_path_of(base: &Path) -> PathBuf {
+        daemon_pid_path(base).expect("resolve the v2 rendezvous pid path")
+    }
+
+    fn socket_path_of(base: &Path) -> PathBuf {
+        daemon_socket_path(base).expect("resolve the v2 rendezvous socket identity")
+    }
+
+    fn create_rendezvous_dir(base: &Path) {
+        let dir = rendezvous_dir(base).expect("resolve the v2 rendezvous dir");
+        fs::create_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -303,7 +358,7 @@ mod tests {
     #[test]
     fn clear_stale_lock_returns_true_when_missing() {
         let base = temp_base("clear-missing");
-        let pid_path = daemon_pid_path(&base);
+        let pid_path = pid_path_of(&base);
         assert!(clear_stale_daemon_lock(&pid_path, None));
     }
 
@@ -326,8 +381,8 @@ mod tests {
     #[test]
     fn clear_stale_lock_removes_a_dead_pid_lock() {
         let base = temp_base("clear-dead");
-        fs::create_dir_all(codegraph_dir(&base)).unwrap();
-        let pid_path = daemon_pid_path(&base);
+        create_rendezvous_dir(&base);
+        let pid_path = pid_path_of(&base);
         let dead = DaemonLockInfo {
             pid: 4_000_000_000,
             version: "1.0.0".to_string(),
@@ -343,8 +398,8 @@ mod tests {
     #[test]
     fn clear_stale_lock_refuses_when_expected_pid_mismatches() {
         let base = temp_base("clear-mismatch");
-        fs::create_dir_all(codegraph_dir(&base)).unwrap();
-        let pid_path = daemon_pid_path(&base);
+        create_rendezvous_dir(&base);
+        let pid_path = pid_path_of(&base);
         let dead = DaemonLockInfo {
             pid: 4_000_000_000,
             version: "1.0.0".to_string(),
@@ -362,8 +417,8 @@ mod tests {
     #[test]
     fn unlock_project_clears_a_dead_lock() {
         let base = temp_base("unlock");
-        fs::create_dir_all(codegraph_dir(&base)).unwrap();
-        let pid_path = daemon_pid_path(&base);
+        create_rendezvous_dir(&base);
+        let pid_path = pid_path_of(&base);
         let dead = DaemonLockInfo {
             pid: 4_000_000_000,
             version: "1.0.0".to_string(),
@@ -378,7 +433,11 @@ mod tests {
     #[test]
     fn recorded_socket_path_falls_back_to_default_when_lock_absent() {
         let base = temp_base("recorded-absent");
-        assert_eq!(recorded_socket_path(&base), daemon_socket_path(&base));
+        assert_eq!(
+            recorded_socket_path(&base).expect("resolve recorded socket"),
+            socket_path_of(&base)
+        );
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -391,7 +450,10 @@ mod tests {
         };
         let recorded = std::env::temp_dir().join("cg-recorded.sock");
         rewrite_lock_socket_path(&pid_path, &recorded).unwrap();
-        assert_eq!(recorded_socket_path(&base), recorded);
+        assert_eq!(
+            recorded_socket_path(&base).expect("resolve recorded socket"),
+            recorded
+        );
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -413,11 +475,53 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_owned_rendezvous_preserves_a_replacement_owners_record_and_socket() {
+        let base = temp_base("cleanup-replaced");
+        create_rendezvous_dir(&base);
+        let pid_path = pid_path_of(&base);
+        let socket = socket_path_of(&base);
+        // A NEW owner already replaced the record and rebound the same socket.
+        let replacement = DaemonLockInfo {
+            pid: process::id(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            socket_path: socket.clone(),
+            started_at: 2,
+        };
+        fs::write(&pid_path, encode_lock_info(&replacement).unwrap()).unwrap();
+        fs::write(&socket, b"").unwrap();
+
+        // The DEPARTING daemon (a different pid) must strip neither artifact.
+        let mut departing = 4_000_000_000u32;
+        while departing == process::id() {
+            departing -= 1;
+        }
+        assert!(
+            !cleanup_owned_rendezvous(&pid_path, &socket, departing),
+            "an owner mismatch must report that nothing was cleaned"
+        );
+        assert!(
+            pid_path.exists(),
+            "the replacement owner's record must survive"
+        );
+        assert!(
+            socket.exists(),
+            "the replacement owner's socket must survive"
+        );
+
+        // The true owner cleans both.
+        assert!(cleanup_owned_rendezvous(&pid_path, &socket, process::id()));
+        assert!(!pid_path.exists());
+        #[cfg(unix)]
+        assert!(!socket.exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn clear_stale_daemon_socket_removes_lock_and_socket_when_dead() {
         let base = temp_base("socket-dead");
-        fs::create_dir_all(codegraph_dir(&base)).unwrap();
-        let pid_path = daemon_pid_path(&base);
-        let socket = daemon_socket_path(&base);
+        create_rendezvous_dir(&base);
+        let pid_path = pid_path_of(&base);
+        let socket = socket_path_of(&base);
         let dead = DaemonLockInfo {
             pid: 4_000_000_000,
             version: "1.0.0".to_string(),

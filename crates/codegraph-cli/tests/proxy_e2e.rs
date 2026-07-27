@@ -206,7 +206,7 @@ fn run_proxy_oneshot(
 #[test]
 fn proxy_local_handshake_and_forwarded_tool_call() {
     let (_dir, project) = indexed_project("handshake");
-    let socket = daemon_socket_path(&project);
+    let socket = daemon_socket_path(&project).expect("resolve the v2 rendezvous socket identity");
 
     spawn_detached_daemon(&bin(), &project, false).expect("spawn detached daemon");
     let pid =

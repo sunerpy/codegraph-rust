@@ -190,11 +190,11 @@ impl Drop for ServeProcess {
     }
 }
 
-/// Read the live daemon pid recorded under `<project>/.codegraph/daemon.pid`, if
-/// any. The cold path fire-and-forget spawns this daemon; we reap it in teardown
-/// so no orphan `codegraph` daemon process survives the test.
+/// Read the live daemon pid recorded in the project's v2 rendezvous, if any. The
+/// cold path fire-and-forget spawns this daemon; we reap it in teardown so no
+/// orphan `codegraph` daemon process survives the test.
 fn recorded_daemon_pid(project: &Path) -> Option<u32> {
-    let pid_path = codegraph_daemon::daemon_pid_path(project);
+    let pid_path = codegraph_daemon::daemon_pid_path(project).ok()?;
     let raw = fs::read_to_string(&pid_path).ok()?;
     codegraph_daemon::decode_lock_info(&raw)
         .filter(|info| info.pid > 0)

@@ -13,7 +13,8 @@ pub use policy::{
     CODEGRAPH_NO_WATCH, TooBroadRoot, WatchPolicy, too_broad_root_reason, watch_disabled_reason,
 };
 pub use sync::{
-    SyncOutcome, sync_changed_paths, sync_project_once, sync_project_once_with_progress,
+    SyncCancellation, SyncOutcome, sync_changed_paths, sync_project_once,
+    sync_project_once_cancellable, sync_project_once_with_progress,
 };
 pub use watcher::{
     PendingFile, ProjectWatcher, WatchOptions, start_serve_watcher, watch_options_for_project,

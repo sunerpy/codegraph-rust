@@ -102,16 +102,28 @@ impl LeaseBarrier {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind lease barrier");
         let address = listener.local_addr().expect("lease barrier address");
         let (arrived_tx, arrived_rx) = mpsc::channel();
+        // Accept EVERY arrival, not just the first: one process can reach the
+        // barrier more than once (a daemon takes a startup shared lease, then a
+        // separate per-request shared lease), and each arrival must be releasable
+        // in order rather than silently dropped.
         std::thread::spawn(move || {
-            let Ok((mut stream, _)) = listener.accept() else {
-                return;
-            };
-            let _ = stream.set_read_timeout(Some(WAIT));
-            let mut marker = [0_u8; 1];
-            if stream.read_exact(&mut marker).is_ok() {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    return;
+                };
+                let _ = stream.set_read_timeout(Some(WAIT));
+                let mut marker = [0_u8; 1];
+                if stream.read_exact(&mut marker).is_err() {
+                    return;
+                }
+                if marker[0] == b'C' {
+                    return;
+                }
                 // The receiver can be gone during failure cleanup. That is not a
                 // listener-thread failure and must not add a secondary panic.
-                let _ = arrived_tx.send((marker[0], stream));
+                if arrived_tx.send((marker[0], stream)).is_err() {
+                    return;
+                }
             }
         });
         Self {
@@ -317,7 +329,8 @@ fn send_http_tool_call(stream: &mut TcpStream, address: SocketAddr, project: &Pa
 fn wait_for_daemon(project: &Path) {
     let deadline = Instant::now() + WAIT;
     loop {
-        let socket = codegraph_daemon::recorded_socket_path(project);
+        let socket = codegraph_daemon::recorded_socket_path(project)
+            .expect("resolve the recorded v2 rendezvous socket");
         if codegraph_daemon::attach_to_daemon(&socket).is_ok() {
             return;
         }
@@ -765,11 +778,20 @@ fn reader_lease_spans_stamp_check_through_last_row() {
             .stderr(Stdio::piped());
         barrier.configure(&mut daemon_command, "shared");
         let mut daemon = ChildGuard::new(daemon_command.spawn().expect("spawn daemon reader"));
+        // The daemon's STARTUP shared lease (state/owner/tombstone validation held
+        // across pid/socket publication) reaches the same barrier first. Release it
+        // so the rendezvous can be published; the next arrival is the per-request
+        // lease this test is about, which proves the two acquisitions are distinct.
+        let mut startup_release = barrier.wait(b'S');
+        startup_release
+            .write_all(b"R")
+            .expect("release the daemon startup lease");
         wait_for_daemon(project.path());
 
         let output = Arc::new(Mutex::new(Vec::new()));
         let sink = SharedSink(Arc::clone(&output));
-        let socket = codegraph_daemon::recorded_socket_path(project.path());
+        let socket = codegraph_daemon::recorded_socket_path(project.path())
+            .expect("resolve the recorded v2 rendezvous socket");
         let frames = mcp_frames(project.path());
         let (done_tx, done_rx) = mpsc::channel();
         std::thread::spawn(move || {

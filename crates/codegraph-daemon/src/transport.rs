@@ -29,7 +29,8 @@ pub use interprocess::local_socket::{SendHalf, Stream};
 /// yields `AsyncStream`s whose split halves are `AsyncRead`/`AsyncWrite`, and on
 /// unix expose `AsFd` for the force-close reap handle.
 pub use interprocess::local_socket::tokio::{
-    Listener as AsyncListener, RecvHalf as AsyncRecvHalf, Stream as AsyncStream,
+    Listener as AsyncListener, RecvHalf as AsyncRecvHalf, SendHalf as AsyncSendHalf,
+    Stream as AsyncStream,
 };
 
 /// Resolved rendezvous address for a project daemon. On unix `socket_path` is

@@ -31,4 +31,4 @@ pub use rebuild::{
     ActiveFullRebuild, FullRebuild, RebuildError, RebuildKind, begin_full_rebuild,
     resume_full_rebuild,
 };
-pub use uninit::{UninitError, UninitOutcome, uninit_index};
+pub use uninit::{UninitError, UninitOutcome, uninit_index, uninit_index_with_drain};
