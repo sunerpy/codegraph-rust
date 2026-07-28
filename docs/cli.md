@@ -23,10 +23,10 @@
 | `skill update`    | Refresh the installed skill when unchanged by the user                                    | `-t/--target`, `--global`, `--local`, `--force`                                                                                            |
 | `skill uninstall` | Remove the skill from agent skill directories                                             | `-t/--target`, `--global`, `--local`, `-y/--yes`                                                                                           |
 | `skill status`    | Report install state per agent (up to date / locally modified / outdated / not installed) | `-t/--target`, `--global`, `--local`                                                                                                       |
-| `init`            | Initialize `.codegraph/` and run the first full index                                     | `[path]`, `-t/--target` (also write project-level MCP config; default `none`)                                                              |
-| `uninit`          | Delete the project's `.codegraph/` index                                                  | `[path]`, `-f/--force`                                                                                                                     |
+| `init`            | Initialize `.codegraph-v2/` and run the first full index                                  | `[path]`, `-t/--target` (also write project-level MCP config; default `none`)                                                              |
+| `uninit`          | Delete the project's `.codegraph-v2/` index                                               | `[path]`, `-f/--force`                                                                                                                     |
 | `index`           | (Re-)index in full                                                                        | `[path]`, `-f/--force`, `-q/--quiet`, `-v/--verbose`                                                                                       |
-| `sync`            | Sync changes (currently reuses the safe full-index path)                                  | `[path]`, `-q/--quiet`                                                                                                                     |
+| `sync`            | Incremental sync: re-index only changed files, drop deleted ones, re-resolve              | `[path]`, `-q/--quiet`                                                                                                                     |
 | `status`          | Print index stats (files/nodes/edges/DB size/journal)                                     | `[path]`, `-j/--json`                                                                                                                      |
 | `query`           | FTS5 + multi-signal scored search                                                         | `<search>`, `-p`, `-l/--limit`, `-k/--kind`, `-j/--json`                                                                                   |
 | `files`           | List indexed files (tree/flat/grouped)                                                    | `-p`, `--filter <DIR>`, `--language <LANG>`, `--pattern`, `--format`, `--max-depth`, `-j`                                                  |
@@ -149,7 +149,7 @@ codegraph init /path/to/proj -t auto  # index that project + wire detected edito
 directory. The skill teaches the agent to use CodeGraph for code research and
 project onboarding: reach for `codegraph_explore` before grep/read, use
 `codegraph_node` instead of a plain file read on indexed source, and run
-`codegraph init` when no `.codegraph/` index is present.
+`codegraph init` when no `.codegraph-v2/` index is present.
 
 Four actions:
 
@@ -547,7 +547,7 @@ codegraph completions elvish > ~/.config/codegraph/completion.elv
 The launcher selects a mode in this exact order:
 
 1. `CODEGRAPH_NO_DAEMON=1` is set → **Direct** (foreground, no daemon ever spawned)
-2. No `.codegraph/` directory in the project → **Direct** (nothing to share yet)
+2. No `.codegraph-v2/` directory in the project → **Direct** (nothing to share yet)
 3. Otherwise → **SpawnOrProxy**: spawn a new shared detached daemon, or proxy to one already running
 
 > `CODEGRAPH_DAEMON_INTERNAL=1` is **internal-only** — it is set automatically on
@@ -557,15 +557,15 @@ The launcher selects a mode in this exact order:
 
 When the daemon starts, it detaches from the parent process group (Unix:
 `process_group(0)`; Windows: `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`).
-Its stdout and stderr are appended to `.codegraph/daemon.log`. The Unix socket is
-at `.codegraph/daemon.sock`; the pid/lock file lives alongside it.
+Its stdout and stderr are appended to `.codegraph-v2/daemon.log`. The Unix socket
+is at `.codegraph-v2/daemon.sock`; the pid/lock file lives alongside it.
 
 On filesystems that reject binding an `AF_UNIX` socket inside the project
 directory (ExFAT/FAT, some network mounts, WSL DrvFs), the daemon falls back
 through a deterministic candidate chain — first the project-dir
-`.codegraph/daemon.sock`, then a hashed socket under the system temp dir — and
+`.codegraph-v2/daemon.sock`, then a hashed socket under the system temp dir — and
 records the socket it actually bound in the lock file. The pid/lock file always
-stays at `.codegraph/daemon.pid`, and clients read the recorded socket from the
+stays at `.codegraph-v2/daemon.pid`, and clients read the recorded socket from the
 lock, so they attach to whichever candidate the daemon chose.
 
 If the daemon crashes and leaves a stale lock:
@@ -589,8 +589,8 @@ those paths; the reason is surfaced in the log.
 
 The watcher registers per-directory watches only on non-ignored directories,
 pruning `node_modules`, `.venv`, `__pycache__`, `target`, `dist`, `.godot`,
-`.cache`, `.git`, `.codegraph`, and everything else in the default ignore set,
-plus any paths matched by the root `.gitignore`. This pruning applies at any
+`.cache`, `.git`, `.codegraph`, `.codegraph-v2`, and everything else in the
+default ignore set, plus any paths matched by the root `.gitignore`. This pruning applies at any
 nesting depth, so an `node_modules` buried several levels deep is never walked.
 This keeps the total watch count well inside the OS inotify limit on large trees
 and makes daemon startup fast. A newly-created non-ignored directory is picked up
@@ -632,9 +632,9 @@ Three escape hatches:
 
 Values outside the clamp range are silently clamped to the nearest bound.
 
-### Custom extension mapping (`.codegraph/codegraph.json`)
+### Custom extension mapping (`.codegraph-v2/codegraph.json`)
 
-Place a `codegraph.json` inside the `.codegraph/` directory of any project to
+Place a `codegraph.json` inside the `.codegraph-v2/` directory of any project to
 teach CodeGraph how to treat files with non-standard extensions:
 
 ```jsonc
@@ -652,9 +652,10 @@ Rules:
   is lowercased (so `.X` and `.x` are the same key).
 - Language names must match the internal `Language` enum (serde names). Unknown
   language names are **silently skipped**.
-- Config resolution walks up the directory tree from each source file; the nearest
-  `.codegraph/codegraph.json` wins. Results are mtime-cached — absent files are
-  cached too, so no repeated I/O on every lookup.
+- Exactly one file is read: the resolved project's own
+  `.codegraph-v2/codegraph.json`. There is no directory-tree walk and no
+  cross-project inheritance, so one project can never adopt another's overrides.
+  A legacy `.codegraph/codegraph.json` is ignored.
 - A malformed JSON file is ignored and the error is logged; it does not abort
   indexing.
 

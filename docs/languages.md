@@ -95,7 +95,7 @@ impact analysis at the file level.
 
 ## Adding custom extension mappings
 
-Non-standard extensions can be mapped to any supported language via `.codegraph/codegraph.json`:
+Non-standard extensions can be mapped to any supported language via `.codegraph-v2/codegraph.json`:
 
 ```jsonc
 {
@@ -107,7 +107,9 @@ Non-standard extensions can be mapped to any supported language via `.codegraph/
 ```
 
 Keys are dot-stripped and lowercased before matching. Unknown language names are silently
-skipped. The nearest config up the directory tree wins.
+skipped. Exactly one file is read — the resolved project's own
+`.codegraph-v2/codegraph.json`; there is no directory-tree walk, and a legacy
+`.codegraph/codegraph.json` is ignored.
 
 ---
 

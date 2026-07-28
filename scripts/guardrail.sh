@@ -22,7 +22,7 @@ done
 # strings — drift there is invisible until AFTER a release is published. This gate
 # lives here rather than in a Cargo test because it parses CI/shell/PowerShell
 # files, not Rust, and `guardrail` is the one step run by make ci, the pre-push
-# hook, AND both CI jobs.
+# hook, AND the CI `test` job (the `windows` job does NOT run it).
 if ! bash "$SCRIPT_DIR/check-asset-names.sh"; then
     echo "❌ RELEASE ASSET-NAME DRIFT: the release workflow and the installers disagree."
     EXIT_CODE=1

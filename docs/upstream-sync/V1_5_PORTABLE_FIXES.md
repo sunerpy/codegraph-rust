@@ -7472,3 +7472,197 @@ native Windows/MSVC runtime validation is claimed — every command above ran on
 Linux, and the Windows arm of `database_sidecar_path` is exercised only by
 inspection (`OsString::push` on a `PathBuf`'s `OsStr`, which is lossless on both
 platforms by construction).
+
+## F4 Blocker B3 — user-facing docs still pointed at the abandoned `.codegraph` root (2026-07-28)
+
+Batch M moved the per-project index to an isolated `.codegraph-v2` root that new
+binaries never open, migrate, or write. The shipped documentation was never
+updated, so a user following the README got a silent no-op (their `v0.40.4` index
+and config are ignored) and the golden regeneration recipe copied from a path that
+no longer exists. This is a documentation-only correction: no `.rs`, `Cargo.toml`,
+or `Cargo.lock` byte changed, and `scripts/guardrail.sh` changed by one COMMENT
+line with no behavior change (`bash -n` exit 0).
+
+### What the code actually says (read before writing any prose)
+
+- `index_paths.rs:46,48` — `DEFAULT_CURRENT_DIR = ".codegraph-v2"`,
+  `LEGACY_DIR = ".codegraph"`. `legacy_roots()`'s own doc comment states new
+  binaries never open, migrate, or write these.
+- EVERY per-file accessor hangs off `current_root`: `current_db`, `config_toml`,
+  `extension_config`, `permanent_lock`, `state_slots`, `tombstone`, AND
+  `daemon_pid` / `daemon_log` / `daemon_socket` (`index_paths.rs:266-331`).
+- `codegraph-daemon/src/paths.rs` — module doc: "Nothing here reconstructs a
+  `.codegraph*` path: every value comes from `IndexPaths::resolve`".
+  `rendezvous_dir` returns `current_root()`.
+- `config.rs:267-297` — `Config::load_for_paths` "never consults a legacy
+  `.codegraph/config.toml`".
+- `codegraph-extract/src/ext_config.rs:49-55` — `load_for_paths` "Reads exactly
+  `paths.extension_config()`". One file; no tree walk; no mtime cache.
+- `cmd_sync` (`main.rs:1330-1366`) → `sync_project_once_with_progress`:
+  hash-gated per-file skip, per-file delete/reinsert, full re-resolve; reports
+  `files_reindexed` / `files_skipped_unchanged` / `files_removed`.
+- `codegraph-watch/src/policy.rs:191` — the always-ignore rule skips `.git`,
+  `.codegraph`, AND any `.codegraph-*`, so BOTH spellings are correctly named in
+  the watcher-pruning prose.
+
+**The B3 brief's premise was wrong and is corrected here.** It stated `.codegraph/`
+is still the daemon rendezvous while only index and config moved. It is not — the
+rendezvous moved WITH the index. Verified empirically, not just by reading:
+
+```
+$ codegraph init /tmp/cg-fixture-godot     # exit 0; creates .codegraph-v2/ ONLY
+$ codegraph status /tmp/cg-fixture-godot --json
+  indexPath        = /tmp/cg-fixture-godot/.codegraph-v2/
+  dbPath           = …/.codegraph-v2/codegraph.db
+  daemonPidPath    = …/.codegraph-v2/daemon.pid
+  daemonSocketPath = …/.codegraph-v2/daemon.sock
+  daemonLogPath    = …/.codegraph-v2/daemon.log
+  legacyIndexPaths = []
+```
+
+### How index/config/rendezvous paths were distinguished from legitimate `.codegraph`
+
+Not by string replacement. Each site was classified against the accessor that
+produces it:
+
+1. **Live path → `.codegraph-v2/`.** Anything naming the index DB, `config.toml`,
+   `codegraph.json`, the indexed-project marker, or the daemon pid/socket/log —
+   all derived from `current_root`.
+2. **Watcher/scanner ignore set → BOTH spellings kept.** `policy.rs:191` skips
+   `.codegraph` and `.codegraph-*`, so `docs/cli.md`'s pruning list now names
+   `.codegraph` AND `.codegraph-v2`. Dropping the legacy name would have made the
+   doc contradict the code.
+3. **Deliberate legacy/historical discussion → `.codegraph/` retained.** The new
+   upgrade notes, and the "a legacy X is ignored" clauses, must name the old path
+   to be meaningful.
+
+### Stale sites found and corrected
+
+| File                          | Correction                                                                                                                                                                                                                                                                                                       |
+| ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `README.md`                   | 2× `init` comments, skill blurb, `daemon.sock`, extension+config paths; NEW "Upgrading from v0.40.4" section + TOC entry                                                                                                                                                                                         |
+| `docs/readme/README.zh-CN.md` | same five sites mirrored + NEW「从 v0.40.4 升级」section + TOC entry                                                                                                                                                                                                                                             |
+| `docs/cli.md`                 | `init`/`uninit` rows; **`sync` row rewritten** (was "currently reuses the safe full-index path"); serve-mode step 2; daemon log/socket/pid; watcher list now names both spellings; extension-config heading+body; **resolution rule corrected** (was "walks up the directory tree … mtime-cached" — wrong twice) |
+| `docs/mcp.md`                 | 5 sites: Zed-SSH ×2, indexed-project marker, find-up target, `daemon.log`                                                                                                                                                                                                                                        |
+| `skills/codegraph/SKILL.md`   | front-matter trigger, DB blurb, detect-index block + fence, `init` comment, fallback list; NEW legacy-root note                                                                                                                                                                                                  |
+| `docs/equivalence.md`         | 10 `cp` paths + 3 comments; NEW reproducibility caveats (below)                                                                                                                                                                                                                                                  |
+| `docs/architecture.md`        | subcommand count 13→26; removed `init_config` (now `Config::load_env_or_default`, logger-only); DB path; **`sync` rewritten**; rendezvous → current root                                                                                                                                                         |
+| `docs/data-model.md`          | fixture DB path ×2                                                                                                                                                                                                                                                                                               |
+| `docs/languages.md`           | extension-config path + resolution rule corrected (was "nearest config up the directory tree wins")                                                                                                                                                                                                              |
+| `editors/zed/README.md`       | remote-SSH index path                                                                                                                                                                                                                                                                                            |
+| `AGENTS.md`                   | rendezvous path; release surface 4-platform → **6**, naming `x86_64-pc-windows-msvc` (`windows-latest`) and `aarch64-pc-windows-msvc` (`windows-11-arm`) — verified against `release-please.yml:191-214`                                                                                                         |
+| `scripts/guardrail.sh`        | "AND both CI jobs" → "AND the CI `test` job (the `windows` job does NOT run it)" — verified: `ci.yml` runs guardrail only at line 76 in `test`                                                                                                                                                                   |
+
+### `docs/equivalence.md` — the recipe was verified end to end, not just path-edited
+
+Ran the corrected Godot recipe with the built binary. `cp` from
+`.codegraph-v2/codegraph.db` then `--gen-golden` (exit 0) reproduced
+`nodes.json`, `edges.json`, `refs.json`, `files.json` **byte-identically** to the
+committed golden. Two things the path fix ALONE would not have caught, both now
+documented as explicit non-claims:
+
+- **`colby.db` is NOT byte-reproducible.** A freshly indexed DB differs from the
+  committed one at byte 28 (SQLite header change counter) despite identical rows.
+- **`schema.sql` records `.schema` statement ORDER, which shifted.** A fresh DB
+  puts `idx_edges_identity` at `.schema` line 103; the committed `colby.db` has it
+  at line 116. Confirmed this is an artifact of WHICH BINARY created the DB, not of
+  the doc edit: re-dumping the COMMITTED `colby.db` reproduces the committed
+  `schema.sql` byte-identically (all 5 artifacts IDENTICAL), while a freshly
+  indexed DB yields the order-only diff. Steps 3+4 keep the committed pair
+  self-consistent because both come from the same database.
+
+`reference/golden/` is unchanged — the verification ran entirely in `/tmp`.
+
+### Out of scope, deliberately left alone
+
+`docs/godot.md` carries three `.codegraph/config.toml` / `codegraph.json` hits
+(lines 27, 275, 388). It is owned by a sibling task in this wave and was NOT
+touched. Those sites remain stale and need the same correction in a follow-up.
+`docs/upstream-sync/UPSTREAM.md` and the historical body of this ledger keep their
+`.codegraph` spellings by design: they describe what upstream or an earlier slice
+did at the time.
+
+### Commands and their REAL exit statuses
+
+Run individually, never `&&`-joined, so no tail is hidden.
+
+| Command                                         | Exit | Note                                                                        |
+| ----------------------------------------------- | ---- | --------------------------------------------------------------------------- |
+| `cargo build --locked -p codegraph-rs`          | 0    | binary used for every empirical check below                                 |
+| `codegraph init /tmp/cg-fixture-godot`          | 0    | created `.codegraph-v2/` ONLY; 6 files, 15 nodes, 13 edges                  |
+| `codegraph status /tmp/cg-fixture-godot --json` | 0    | all five paths under `.codegraph-v2/`; `legacyIndexPaths = []`              |
+| `--gen-golden` from a FRESH index               | 0    | 4 JSON artifacts IDENTICAL; `schema.sql` order-only diff; `.db` differs @28 |
+| `--gen-golden` from the COMMITTED `colby.db`    | 0    | all 5 artifacts IDENTICAL — isolates the diff to the creating binary        |
+| `bash -n scripts/guardrail.sh`                  | 0    | comment-only edit is syntactically inert                                    |
+| `make fmt`                                      | 0    | oxfmt, 23 docs files; run BEFORE the gates so `fmt-check` cannot trip       |
+| `bash scripts/check-workspace-versions.sh`      | 0    | workspace / `version.txt` / release manifest all `0.40.4`                   |
+| `make ci CARGO='cargo --locked'` (run 1)        | 2    | FAILED — see the flake note below                                           |
+| `make ci CARGO='cargo --locked'` (run 2)        | 0    | PASSED — `✅ All CI checks passed!`                                         |
+
+**Run 1 failure was the known pre-existing flake, reported honestly rather than
+hidden.** Two failures in `codegraph-rs`'s bin tests, 351 passed:
+
+- `install_completions_writes_zsh_fish_elvish_into_home` — `assert!(elv.is_file())`
+  at `main.rs:6220`. This is the documented in-process `HOME`/`XDG_DATA_HOME` race
+  (~4 failures in 8 runs on a clean commit). NOT weakened, NOT touched.
+- `codegraph_dir_and_db_path_default_layout` — `PoisonError` at `main.rs:5740`.
+  This is COLLATERAL, not an independent failure: it takes the same
+  `ENV_LOCK` (`main.rs:5704`) with a bare `.unwrap()`, so the first test's panic
+  while holding that mutex poisons it and fails this one too. The flaky test uses
+  `unwrap_or_else(|e| e.into_inner())` and so tolerates poisoning; this one does
+  not. Both passed in run 2.
+
+No source change was made to address either — they are pre-existing and outside
+this documentation task's scope.
+
+**A SECOND, DIFFERENT pre-existing flake surfaced on a later run** (`make ci` runs
+3 and 4, after the ledger prose was appended):
+
+| Command                                  | Exit | Note                                   |
+| ---------------------------------------- | ---- | -------------------------------------- |
+| `make ci CARGO='cargo --locked'` (run 3) | 2    | FAILED — `Text file busy` flake, below |
+| `make ci CARGO='cargo --locked'` (run 4) | 0    | PASSED — `✅ All CI checks passed!`    |
+
+`verify_legacy_binary_rejects_a_wrong_executable_version`
+(`batch_m_legacy_extension_override.rs:1804`, 20 passed / 1 failed) failed with
+`run configured legacy binary …/stub-legacy --version: Text file busy (os error
+26)` — ETXTBSY: the test writes an executable stub and immediately execs it, and
+on Linux the exec can race the writer's still-open fd. The assertion is intact and
+correct; it simply never reached the version branch. Distinct from the
+`install_completions` flake and likewise pre-existing: `git diff --name-only`
+matched NO `.rs` file at any point in this task (exit 1), so no test source was
+touched, weakened, or skipped. Run 4 passed with the identical tree.
+
+**Golden byte-stability.** `git diff --stat <base>..HEAD -- reference/golden/` is
+EMPTY. During `make ci` the test suite left two untracked SQLite sidecars
+(`reference/golden/ruby/colby.db-shm`, `-wal`) from opening the golden read-only;
+they were deleted, and `git status --porcelain reference/golden/` is empty. Every
+committed golden byte is untouched, `colby.db` included.
+
+**Scope proof.** `git diff --name-only <base>..HEAD | grep -E '\.rs$|Cargo\.(toml|lock)'`
+returns NOTHING (exit 1). `Cargo.lock` SHA-256 is unchanged at
+`750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`.
+
+**Not claimed.** No native Windows/MSVC validation — every command above ran on
+this Linux host. The six-platform release surface was verified by READING
+`release-please.yml:191-214`, not by building the Windows targets.
+
+### Final `.codegraph/` sweep
+
+`grep -rn '\.codegraph/' --include='*.md' .` (excluding `node_modules`,
+`reference/golden`, and this ledger's own historical body) leaves only CORRECT
+hits, each justified:
+
+- `README.md:69,72,77,78` + `docs/readme/README.zh-CN.md:64,66,71` — the new
+  upgrade notes. They MUST name the old root to tell a `v0.40.4` user what is
+  being ignored.
+- `skills/codegraph/SKILL.md:41` — the legacy-root note ("an index left by
+  `v0.40.4` or earlier … never read or migrated").
+- `docs/cli.md:658`, `docs/languages.md:112` — "a legacy `.codegraph/codegraph.json`
+  is ignored", the corrected resolution rule.
+- `docs/godot.md:27,275,388` — sibling-owned file, deliberately NOT touched; still
+  stale, tracked above as follow-up.
+
+`docs/cli.md`'s watcher-pruning list intentionally names BOTH `.codegraph` and
+`.codegraph-v2` (it is an ignore set covering both spellings, per
+`policy.rs:191`), so it does not appear as a `.codegraph/` hit but is correct.
