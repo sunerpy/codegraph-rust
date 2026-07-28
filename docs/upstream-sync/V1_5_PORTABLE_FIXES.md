@@ -4569,3 +4569,154 @@ hashes: `queries.rs`
 honest fallback and no LSP-clean result is claimed. No dependency, version or
 `Cargo.lock` byte changed. No Windows/MSVC runtime validation is claimed — this
 work ran on Linux only.
+
+---
+
+## Batch A1 — non-ASCII identifiers reach their definers through the real search surfaces (2026-07-28)
+
+Ports upstream issue #1372. Base for this entry: `29f635b` (Batch C3). One
+commit, scoring + a new CLI/MCP integration test.
+
+### What the current build ACTUALLY did (measured before any edit)
+
+The reported upstream symptom — `explore` returning _no relevant code_ for a
+pure-CJK query while `query` finds the file — does NOT reproduce here. Measured
+on the real binary (`target/debug/codegraph`, built from `29f635b`) against a
+throwaway project holding `示例模块.lua` (defining `M.示例函数`), `cafe.py`
+(`café_lookup`) and `uni.py` (`Ünicode`):
+
+```text
+$ codegraph query "示例模块"      → file 示例模块.lua           (found)
+$ codegraph query "示例函数"      → method 示例函数              (found)
+$ codegraph query "café_lookup"  → function café_lookup        (found)
+$ codegraph query "Ünicode"      → class Ünicode                (found)
+$ codegraph explore "示例模块"    → "## Exploration: 示例模块", 3 symbols,
+                                    the file's verbatim source
+```
+
+FTS5 tokenization is NOT the crux: `nodes_fts` is a `unicode61`-tokenized
+contentless-mirror table (`schema.rs:100`), and `unicode61` already treats CJK,
+Cyrillic, Greek, Kana, Hangul and accented Latin codepoints as token
+characters. Non-ASCII names are indexed and retrievable. So no FTS/schema
+change was made and none is needed — the golden `.schema` is untouched.
+
+The defect that IS present is in RANKING, one layer above FTS: the scoring
+tokenizer in `crates/codegraph-graph/src/query/scoring.rs` is ASCII-only, so a
+non-ASCII query word produces ZERO scoring tokens and therefore contributes
+NOTHING to `score_path_relevance`. Probe (throwaway test, reverted):
+
+```text
+word="示例模块" terms=[] path_relevance=0
+word="модуль"   terms=[] path_relevance=0
+word="μονάδα"   terms=[] path_relevance=0
+word="サンプル"  terms=[] path_relevance=0
+word="모듈"      terms=[] path_relevance=0
+word="café"      terms=["caf"]          path_relevance=13
+word="samplemodule" terms=["samplemodule"] path_relevance=13
+```
+
+`extract_search_terms` split on `!c.is_ascii_alphanumeric()`, so an entire
+non-ASCII word was discarded; `café` survived only as the truncated `caf`
+because `é` acted as a separator; `normalize_name_token` likewise erased
+non-ASCII, making project-name filtering meaningless for such repos.
+
+### Red (documented, with the actual wrong output)
+
+New test `crates/codegraph-cli/tests/unicode_search_cli.rs`, driving the REAL
+binary (`init`, then `query --json`, plus a `serve --mcp` stdio session). Each
+of SEVEN scripts gets a module file named in that script defining a function,
+paired with an ASCII-named DECOY file defining the SAME function name — so only
+path relevance can separate them — plus a two-character CJK case (`模块`, a
+whole word below the ASCII 3-char floor).
+
+`cargo test --locked -p codegraph-rs --test unicode_search_cli` → exit 101,
+2 of 4 failing. Verbatim, the wrong ranking:
+
+```text
+the query names the module file, so its definer must rank first:
+[cjk] query "示例模块" "handlercjk": definer 示例模块.py at Some(1), decoy zdecoy_cjk.py at Some(0)
+[cyr] query "модуль" "handlercyr": definer модуль.py at Some(1), decoy zdecoy_cyr.py at Some(0)
+[grk] query "μονάδα" "handlergrk": definer μονάδα.py at Some(1), decoy zdecoy_grk.py at Some(0)
+[kana] query "サンプル" "handlerkana": definer サンプル.py at Some(1), decoy zdecoy_kana.py at Some(0)
+[kor] query "모듈" "handlerkor": definer 모듈.py at Some(1), decoy zdecoy_kor.py at Some(0)
+[short] query "模块" "handlershort": definer 模块.py at Some(1), decoy zdecoy_short.py at Some(0)
+```
+
+and through the MCP `codegraph_search` contract over real stdio:
+
+```text
+MCP search must rank the named module's definer above its decoy:
+## Search Results (3 found)
+
+### handlercjk (function)
+zdecoy_cjk.py:1
+### handlercjk (function)
+示例模块.py:1
+```
+
+The ASCII control case (`samplemodule handlerascii`) PASSED before the fix —
+that is the point: the wrong answer was specific to non-ASCII input. Measured
+scores on the real binary: definer and decoy tied at exactly `75.8908` for CJK
+(the file name contributed 0), where the ASCII pair separated `88.8908` vs
+`75.8908`. The tie then resolved to whichever row FTS returned first, which is
+why the decoy won.
+
+### Green (minimal)
+
+`crates/codegraph-graph/src/query/scoring.rs`, three edits, no new dependency:
+
+- `extract_search_terms` word split: `!c.is_ascii_alphanumeric()` →
+  `!c.is_alphanumeric()`, so a non-ASCII word survives as one token and
+  `café_módulo` no longer shatters into `caf`/`dulo`.
+- New `meets_min_token_len` replaces the bare `< 3` check: ASCII keeps the
+  three-character floor byte-for-byte; a token containing any non-ASCII
+  character is admitted at two, because an unsegmented script packs a whole word
+  into two characters (`模块` IS "module").
+- `normalize_name_token`: `is_ascii_alphanumeric` → `is_alphanumeric`, so
+  project-name-token filtering sees non-ASCII repo names.
+
+The camel/acronym/compound/snake helpers were deliberately left ASCII-only —
+case humps are not a concept in unsegmented scripts, and widening them would
+change ASCII tokenization. No FTS query string, BM25 weight, tie-break or SQL
+was touched, so ranking stays a pure function of the index (proven by the
+repeat-query determinism test).
+
+### Golden row delta
+
+None. `git diff --stat 29f635b..HEAD -- reference/golden/` → EMPTY, and
+`git status --short reference/golden/` → empty.
+`cargo test --locked -p codegraph-bench --test equivalence` → exit 0,
+**26 passed, 0 failed** (unchanged 26/26).
+
+### Negative control, EXECUTED
+
+`git stash push -- crates/codegraph-graph/src/query/scoring.rs` (production
+change only; the new test kept) → `cargo test --locked -p codegraph-rs --test
+unicode_search_cli` → exit 101, exactly the two Red failures above. `git stash
+pop` restored it; restored-file SHA-256 of `scoring.rs`
+`2fcaaef957f8d20bcc530df7e50382dd8b451c105e8ea769e87532126b5ce34c` (before the
+clippy follow-up below), and with the fix re-applied the same command → exit 0,
+4 passed.
+
+### Verification (actual exit statuses)
+
+- `bash scripts/check-workspace-versions.sh` → exit 0, before every Cargo batch;
+  every Cargo command used `--locked`.
+- `cargo clippy --locked --workspace --all-targets -- -D warnings` → **first
+  attempt exit 101**: `needless_character_iteration` on
+  `token.chars().any(|c| !c.is_ascii())`. Rewritten to `!token.is_ascii()`
+  (identical semantics); re-run → exit 0.
+- `cargo test --locked -p codegraph-rs --test unicode_search_cli` → exit 0,
+  4 passed.
+- `cargo test --locked -p codegraph-graph` → exit 0 (all targets green,
+  including the pre-existing `extract_search_terms` / `score_path_relevance` /
+  `normalize_name_token` unit tests, which were NOT modified).
+- `cargo test --locked -p codegraph-mcp` → exit 0, including
+  `rmcp_parity` (15 golden MCP fixtures) and `golden_mcp`.
+- `cargo test --locked -p codegraph-bench --test equivalence` → exit 0, 26/26.
+
+`lsp_diagnostics` was attempted on `scoring.rs` and again refused this worktree
+(`LSP file path must be inside request cwd`); locked Cargo clippy/test is the
+honest fallback and no LSP-clean result is claimed. No dependency, version or
+`Cargo.lock` byte changed. No Windows/MSVC runtime validation is claimed — this
+work ran on Linux only.

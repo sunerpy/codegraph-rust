@@ -5,8 +5,23 @@ use codegraph_core::types::NodeKind;
 pub fn normalize_name_token(raw: &str) -> String {
     raw.to_lowercase()
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
+        .filter(|c| c.is_alphanumeric())
         .collect()
+}
+
+/// Minimum length for a scoring token (#1372).
+///
+/// An ASCII word shorter than three characters carries no retrieval signal
+/// ("of", "is", "at"), which is why the floor exists. An unsegmented script
+/// packs a whole word into two characters — `模块` IS "module" — so a token
+/// holding any non-ASCII character is admitted at two. ASCII tokens keep the
+/// original three-character floor byte-for-byte.
+fn meets_min_token_len(token: &str) -> bool {
+    let len = token.chars().count();
+    if len >= 3 {
+        return true;
+    }
+    len >= 2 && !token.is_ascii()
 }
 
 pub const STOP_WORDS: &[&str] = &[
@@ -336,12 +351,12 @@ pub fn extract_search_terms(query: &str, include_stems: bool) -> Vec<String> {
         .map(|c| if c == '_' || c == '.' { ' ' } else { c })
         .collect();
 
-    for word in normalised.split(|c: char| !c.is_ascii_alphanumeric()) {
+    for word in normalised.split(|c: char| !c.is_alphanumeric()) {
         if word.is_empty() {
             continue;
         }
         let lower = word.to_lowercase();
-        if lower.chars().count() < 3 {
+        if !meets_min_token_len(&lower) {
             continue;
         }
         if is_stop_word(&lower) {
