@@ -493,6 +493,7 @@ mod tests {
 
     fn a_ref(name: &str, kind: EdgeKind, file: &str) -> RefView {
         RefView {
+            row_id: None,
             from_node_id: format!("from:{file}"),
             reference_name: name.to_string(),
             reference_kind: kind,

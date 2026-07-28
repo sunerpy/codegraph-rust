@@ -274,6 +274,7 @@ fn route_reference(
     language: Language,
 ) -> RefView {
     RefView {
+        row_id: None,
         from_node_id,
         reference_name: name,
         reference_kind: EdgeKind::References,
@@ -762,6 +763,7 @@ mod tests {
 
     fn a_ref(name: &str, kind: EdgeKind, file: &str, lang: Language) -> RefView {
         RefView {
+            row_id: None,
             from_node_id: format!("from:{file}"),
             reference_name: name.to_string(),
             reference_kind: kind,

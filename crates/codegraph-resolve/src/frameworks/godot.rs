@@ -584,6 +584,7 @@ mod tests {
 
     fn gd_ref(name: &str, kind: EdgeKind) -> RefView {
         RefView {
+            row_id: None,
             from_node_id: "from:caller.gd".to_string(),
             reference_name: name.to_string(),
             reference_kind: kind,

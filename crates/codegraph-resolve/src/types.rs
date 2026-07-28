@@ -16,6 +16,16 @@ use codegraph_core::types::{EdgeKind, Language, Node, ReferenceSubkind};
 /// node when the row omitted them — `index.ts:522-531`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefView {
+    /// `unresolved_refs.id` of the PERSISTED row this view was read from
+    /// (`INTEGER PRIMARY KEY AUTOINCREMENT`, so unique per row), threaded through
+    /// resolution so cleanup can delete EXACTLY the row that resolved (#1269/#1270,
+    /// upstream `e871c49`).
+    ///
+    /// `None` for a view that was never persisted — a `FrameworkResolver`
+    /// synthesizes `RefView`s in memory, and a test may build one by hand. Such a
+    /// view identifies no row, so it must never delete anything; the cleanup path
+    /// skips it.
+    pub row_id: Option<i64>,
     /// ID of the source node containing the reference (`fromNodeId`).
     pub from_node_id: String,
     /// The name being referenced (`referenceName`).
@@ -289,6 +299,7 @@ mod tests {
 
     fn sample_ref() -> RefView {
         RefView {
+            row_id: None,
             from_node_id: "fn:1".to_string(),
             reference_name: "foo".to_string(),
             reference_kind: EdgeKind::Calls,

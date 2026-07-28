@@ -739,58 +739,29 @@ impl Store {
             .query_row("SELECT count(*) FROM unresolved_refs", [], |row| row.get(0))
     }
 
-    /// Ports `deleteSpecificResolvedReferences` from `upstream db/queries.ts:1716-1727`.
-    /// Deletes one row per `(from_node_id, reference_name, reference_kind)` tuple in a single
-    /// transaction, matching the upstream precise per-tuple delete so only actually-resolved refs go.
-    pub fn delete_resolved_unresolved_refs(
-        &mut self,
-        keys: &[(String, String, EdgeKind)],
-    ) -> rusqlite::Result<()> {
-        if keys.is_empty() {
+    /// Ports `deleteSpecificResolvedReferences` from `upstream db/queries.ts:1716-1727`
+    /// (row-id form, #1269/#1270 / upstream `e871c49`).
+    ///
+    /// Deletes EXACTLY the rows named by `row_ids` in a single transaction. `id` is
+    /// the table's `INTEGER PRIMARY KEY AUTOINCREMENT`, so each id addresses one
+    /// row and nothing else.
+    ///
+    /// The previous key — `(from_node_id, reference_name, reference_kind)` — is NOT
+    /// unique: two calls to the same name from the same enclosing node differ only
+    /// in `line`/`col`/`id`, and the tuple-keyed `DELETE` carried no `LIMIT`, so
+    /// resolving ONE of them deleted BOTH and the sibling's edge was silently lost.
+    /// Keying on the row id removes that whole class of loss, and with it the need
+    /// for any `id <= max_id` batch guard: an id from batch N cannot name a row in
+    /// batch N+1, so a per-batch caller is already precise.
+    pub fn delete_resolved_unresolved_refs(&mut self, row_ids: &[i64]) -> rusqlite::Result<()> {
+        if row_ids.is_empty() {
             return Ok(());
         }
         let tx = self.conn.transaction()?;
         {
-            let mut stmt = tx.prepare_cached(
-                "DELETE FROM unresolved_refs WHERE from_node_id = ? AND reference_name = ? AND reference_kind = ?",
-            )?;
-            for (from_node_id, reference_name, reference_kind) in keys {
-                stmt.execute(params![
-                    from_node_id,
-                    reference_name,
-                    reference_kind.as_str()
-                ])?;
-            }
-        }
-        tx.commit()
-    }
-
-    /// Per-batch variant of [`Self::delete_resolved_unresolved_refs`] bounded by
-    /// `max_id`: deletes only rows whose `id <= max_id`. The batched resolver
-    /// reads refs in ascending-`id` order, so a duplicate `(from,name,kind)`
-    /// tuple in a LATER batch has `id > max_id` and is preserved — letting the
-    /// caller drop each batch's keys immediately instead of accumulating every
-    /// resolved key for one final delete (bounds peak memory on large graphs).
-    pub fn delete_resolved_unresolved_refs_up_to(
-        &mut self,
-        keys: &[(String, String, EdgeKind)],
-        max_id: i64,
-    ) -> rusqlite::Result<()> {
-        if keys.is_empty() {
-            return Ok(());
-        }
-        let tx = self.conn.transaction()?;
-        {
-            let mut stmt = tx.prepare_cached(
-                "DELETE FROM unresolved_refs WHERE from_node_id = ? AND reference_name = ? AND reference_kind = ? AND id <= ?",
-            )?;
-            for (from_node_id, reference_name, reference_kind) in keys {
-                stmt.execute(params![
-                    from_node_id,
-                    reference_name,
-                    reference_kind.as_str(),
-                    max_id
-                ])?;
+            let mut stmt = tx.prepare_cached("DELETE FROM unresolved_refs WHERE id = ?")?;
+            for row_id in row_ids {
+                stmt.execute(params![row_id])?;
             }
         }
         tx.commit()
@@ -2487,18 +2458,22 @@ mod tests {
         assert_eq!(store.unresolved_refs_count().unwrap(), 0);
     }
 
+    /// Two sibling call sites — SAME `from_node_id`, SAME `reference_name`, SAME
+    /// `reference_kind`, differing only in `line` — must be independently
+    /// deletable. The old `(from,name,kind)` key could not tell them apart and,
+    /// carrying no `LIMIT`, removed both when one resolved (#1269/#1270).
     #[test]
-    fn delete_resolved_refs_precise_and_bounded() {
-        let mut store = store("delete-resolved");
+    fn delete_resolved_refs_by_row_id_removes_only_the_named_row() {
+        let mut store = store("delete-resolved-siblings");
         store
             .upsert_nodes(&[node("function:src", "src", "a.rs")])
             .unwrap();
-        let mk = |name: &str| UnresolvedRef {
+        let mk = |name: &str, line: i64| UnresolvedRef {
             id: None,
             from_node_id: "function:src".to_string(),
             reference_name: name.to_string(),
             reference_kind: EdgeKind::Calls,
-            line: 1,
+            line,
             col: 0,
             candidates: None,
             file_path: "a.rs".to_string(),
@@ -2507,38 +2482,40 @@ mod tests {
             reference_subkind: None,
         };
         store
-            .insert_unresolved_refs(&[mk("Alpha"), mk("Beta"), mk("Gamma")])
+            .insert_unresolved_refs(&[mk("helper", 2), mk("helper", 3), mk("Other", 4)])
             .unwrap();
         assert_eq!(store.unresolved_refs_count().unwrap(), 3);
 
         store.delete_resolved_unresolved_refs(&[]).unwrap();
-        store
-            .delete_resolved_unresolved_refs_up_to(&[], 100)
-            .unwrap();
         assert_eq!(store.unresolved_refs_count().unwrap(), 3);
 
-        store
-            .delete_resolved_unresolved_refs(&[(
-                "function:src".to_string(),
-                "Alpha".to_string(),
-                EdgeKind::Calls,
-            )])
-            .unwrap();
-        assert_eq!(store.unresolved_refs_count().unwrap(), 2);
+        let siblings: Vec<UnresolvedRef> = store
+            .all_unresolved_refs()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.reference_name == "helper")
+            .collect();
+        assert_eq!(siblings.len(), 2);
+        let first = siblings[0].id.unwrap();
+        let second = siblings[1].id.unwrap();
+        assert_ne!(first, second);
 
-        let rows = store.all_unresolved_refs().unwrap();
-        let max_id = rows.iter().map(|r| r.id.unwrap()).min().unwrap();
-        store
-            .delete_resolved_unresolved_refs_up_to(
-                &[(
-                    "function:src".to_string(),
-                    "Beta".to_string(),
-                    EdgeKind::Calls,
-                )],
-                max_id,
-            )
-            .unwrap();
-        assert!(store.unresolved_refs_count().unwrap() <= 2);
+        store.delete_resolved_unresolved_refs(&[first]).unwrap();
+
+        let remaining = store.all_unresolved_refs().unwrap();
+        assert_eq!(remaining.len(), 2);
+        let survivor = remaining
+            .iter()
+            .find(|r| r.reference_name == "helper")
+            .expect("the sibling `helper` row must survive its twin's deletion");
+        assert_eq!(survivor.id, Some(second));
+        assert_eq!(survivor.line, siblings[1].line);
+
+        store.delete_resolved_unresolved_refs(&[second]).unwrap();
+        assert_eq!(store.unresolved_refs_count().unwrap(), 1);
+
+        store.delete_resolved_unresolved_refs(&[second]).unwrap();
+        assert_eq!(store.unresolved_refs_count().unwrap(), 1);
     }
 
     #[test]

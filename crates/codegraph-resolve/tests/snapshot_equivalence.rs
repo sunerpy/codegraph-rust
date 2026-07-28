@@ -117,6 +117,7 @@ fn assert_contexts_equivalent(test_name: &str, root: &Path, relative_files: &[&s
     let mut mismatches: Vec<String> = Vec::new();
     for unresolved in &refs {
         let view = codegraph_resolve::RefView {
+            row_id: unresolved.id,
             from_node_id: unresolved.from_node_id.clone(),
             reference_name: unresolved.reference_name.clone(),
             reference_kind: unresolved.reference_kind,

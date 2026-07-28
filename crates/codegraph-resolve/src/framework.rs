@@ -207,6 +207,7 @@ mod tests {
 
     fn a_ref() -> RefView {
         RefView {
+            row_id: None,
             from_node_id: "from".to_string(),
             reference_name: "X".to_string(),
             reference_kind: EdgeKind::Calls,

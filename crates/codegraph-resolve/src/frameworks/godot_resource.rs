@@ -331,6 +331,7 @@ fn constant_node(file_path: &str, line_no: i64, name: &str) -> Node {
 /// repo-relative path.
 fn reference(from_node_id: String, target: String, line_no: i64, file_path: &str) -> RefView {
     RefView {
+        row_id: None,
         from_node_id,
         reference_name: target,
         reference_kind: EdgeKind::References,

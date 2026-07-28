@@ -129,6 +129,7 @@ fn node(id: &str, kind: NodeKind, name: &str, file_path: &str, lang: Language) -
 
 fn ref_view(name: &str, kind: EdgeKind, file_path: &str, lang: Language) -> RefView {
     RefView {
+        row_id: None,
         from_node_id: format!("from:{file_path}"),
         reference_name: name.to_string(),
         reference_kind: kind,

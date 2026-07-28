@@ -2253,6 +2253,7 @@ mod ceiling_tests {
 
     fn reference() -> RefView {
         RefView {
+            row_id: None,
             from_node_id: "function:caller".to_string(),
             reference_name: "doThing".to_string(),
             reference_kind: EdgeKind::Calls,
@@ -2445,6 +2446,7 @@ mod tests {
 
     fn refv(name: &str, kind: EdgeKind, path: &str, lang: Language, line: i64) -> RefView {
         RefView {
+            row_id: None,
             from_node_id: "function:caller".to_string(),
             reference_name: name.to_string(),
             reference_kind: kind,

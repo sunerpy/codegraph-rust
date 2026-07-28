@@ -2210,6 +2210,7 @@ mod tests {
 
     fn reference(name: &str, kind: EdgeKind, file_path: &str, language: Language) -> RefView {
         RefView {
+            row_id: None,
             from_node_id: "function:caller".to_string(),
             reference_name: name.to_string(),
             reference_kind: kind,

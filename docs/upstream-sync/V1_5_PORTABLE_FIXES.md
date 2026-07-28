@@ -4385,3 +4385,187 @@ gitignored, so they were deleted before staging. No tracked golden file changed.
 `lsp_diagnostics` was attempted and again refused this worktree (`LSP file path
 must be inside request cwd`); locked Cargo clippy/test is the honest fallback and
 no LSP-clean result is claimed. No dependency, version or `Cargo.lock` byte changed.
+
+## Batch C3 — resolved-ref cleanup keys on the row id, so batch boundaries stop dropping sibling call sites (2026-07-28)
+
+Ports upstream `e871c49` (#1269/#1270). Base for this entry: `285d591`
+(Batch C2). One commit, resolution/store only.
+
+### The old key, quoted verbatim
+
+`crates/codegraph-store/src/queries.rs` held two tuple-keyed deletes:
+
+```sql
+DELETE FROM unresolved_refs WHERE from_node_id = ? AND reference_name = ? AND reference_kind = ?
+```
+
+```sql
+DELETE FROM unresolved_refs WHERE from_node_id = ? AND reference_name = ? AND reference_kind = ? AND id <= ?
+```
+
+`(from_node_id, reference_name, reference_kind)` is NOT unique — the table has no
+UNIQUE constraint, and two calls to the same name from the same enclosing node
+differ only in `line`/`col`/`id`. Neither statement carried a `LIMIT`, so
+resolving ONE call site deleted EVERY row sharing its tuple.
+
+Two further facts made this reachable rather than theoretical. First, the
+`id <= max_id` guard on the batched variant proves the author already knew the
+tuple repeats — its own doc said a duplicate tuple in a LATER batch has
+`id > max_id` and is preserved. That guard protects ACROSS batches and does
+nothing WITHIN one, where every sibling satisfies `id <= max_id`. Second, the
+non-batched variant's doc claimed "Deletes one row per tuple", which was false;
+that sentence is corrected in this commit.
+
+The row id was available the whole time and simply discarded:
+`unresolved_refs.id` is `INTEGER PRIMARY KEY AUTOINCREMENT`,
+`row_to_unresolved_ref` already read it into `UnresolvedRef.id`, and
+`to_ref_view` then dropped it because `RefView` had no field to hold it — leaving
+the resolver able to rebuild only the coarse tuple.
+
+### Red (documented, with the actual observed drop)
+
+A throwaway probe module in `resolver.rs`, driven through the production path
+(`extract_file` → `upsert_nodes`/`insert_edges`/`insert_unresolved_refs` →
+`resolve_and_persist`), on this Python fixture:
+
+```python
+def run(thing):
+    thing.render()      # line 12 — `thing` not yet bound, does NOT resolve
+    thing = Widget()
+    thing.render()      # line 14 — resolves to Widget::render
+```
+
+Observed (`cargo test --locked -p codegraph-resolve --lib scratch_observe_sibling_rows
+-- --nocapture` → exit 0, printing):
+
+```text
+REF from=function:70b72f5… name=thing.render kind=Calls line=12
+REF from=function:70b72f5… name=thing.render kind=Calls line=14
+RESOLVED 2 UNRESOLVED 1
+  OK name=thing.render line=14 -> method:830ab53… by=InstanceMethod
+  NO name=thing.render line=12
+```
+
+and then, decisively, ZERO `REMAIN` lines: the store's `unresolved_refs` table was
+EMPTY. Resolution itself was correct — it reported line 12 unresolved — but
+cleanup of line 14 deleted line 12's row too. The unresolved sibling was
+silently erased from the table that exists to record it, so it can never be
+retried and its edge can never appear. The probe module was reverted
+(`git checkout --` → tree clean) before any fix; its observation is the Red.
+
+### Green (minimal)
+
+Thread the ROW ID from the stored row through resolution to cleanup. No coarse
+fallback key is retained anywhere — keeping one would reintroduce the defect.
+
+- `crates/codegraph-resolve/src/types.rs`: `RefView` gains
+  `row_id: Option<i64>`. `None` means "this view was never persisted" — a
+  `FrameworkResolver` synthesizes `RefView`s in memory and tests build them by
+  hand; such a view names no row and must delete nothing.
+- `crates/codegraph-resolve/src/resolver.rs`: `to_ref_view` populates
+  `row_id: reference.id`; `ref_view_to_unresolved` now carries it back
+  (`id: reference.row_id`) instead of hardcoding `None`, so the round-trip is
+  lossless while a framework-synthesized view still persists with `id: None`.
+  Both delete call sites collect `filter_map(|r| r.original.row_id)`, so an
+  unpersisted view is skipped rather than widened into a tuple.
+- `crates/codegraph-store/src/queries.rs`: `delete_resolved_unresolved_refs`
+  takes `&[i64]` and runs `DELETE FROM unresolved_refs WHERE id = ?`.
+  `delete_resolved_unresolved_refs_up_to` is REMOVED rather than re-signatured:
+  its entire reason for existing was the `id <= max_id` cross-batch guard, and an
+  id from batch N cannot name a row in batch N+1, so the batched caller is
+  already precise with the plain row-id delete. Its doc rationale moved onto the
+  surviving function, and the false "Deletes one row per tuple" sentence is
+  replaced with the actual guarantee plus why the old key was unsafe.
+- 47 `RefView` construction sites across `crates/codegraph-resolve/`
+  (frameworks, `name_matcher`, `import_resolver`, `framework`, both integration
+  tests) updated explicitly. `RefView` gained no `Default`, and no
+  `..Default::default()` was introduced, so the compiler had to see every site.
+  `snapshot_equivalence.rs` threads the real `unresolved.id`.
+
+The batched-resolution doc comment on `resolve_and_persist_batched` is corrected
+in the same commit: its byte-equivalence argument previously rested on the
+tuple-keyed delete being deferred; it now rests on the row-id key, which is
+strictly stronger (a batch can reach neither a later batch's row nor a sibling
+sharing its tuple).
+
+### Load-bearing tests
+
+- `codegraph-store` `delete_resolved_refs_by_row_id_removes_only_the_named_row`
+  SUPERSEDES `delete_resolved_refs_precise_and_bounded`. The old test used three
+  DISTINCT names (`Alpha`/`Beta`/`Gamma`), which is exactly why it never caught
+  this: with no tuple collision in the fixture, the missing `LIMIT` was
+  unobservable. The new test inserts TWO tuple-identical `helper` rows differing
+  only in `line`, deletes the first by id, and asserts the second survives with
+  its own id and line — then asserts a repeat delete of an already-gone id is a
+  no-op.
+- `codegraph-resolve` `resolving_one_call_site_keeps_its_tuple_identical_sibling_row`
+  drives the PRODUCTION path on the Red's fixture (pattern copied from C2's
+  accepted `literal_receiver_and_nested_local_produce_no_fabricated_call_edge`):
+  it asserts the fixture really seeds two tuple-identical rows, that exactly one
+  resolves, and that the UNRESOLVED sibling is still in `unresolved_refs`
+  afterwards at a different line.
+- `to_ref_view_and_back_roundtrip` extended to assert the id survives both
+  directions (`Some(7)`), plus a new
+  `ref_view_to_unresolved_keeps_framework_ref_row_id_absent` pinning the
+  never-persisted case at `None`.
+
+### Golden row delta
+
+NONE. `git diff --stat 285d591..HEAD -- reference/golden/` → **empty output**;
+`git status --porcelain reference/golden/` → empty. Expected: the manifest
+classifies C3 as "exact persisted row IDs; golden-neutral", and the change only
+narrows WHICH rows a delete removes — it never alters extraction, resolution
+decisions, edge construction, or insertion order. All 26 equivalence oracles pass
+unchanged. No golden was regenerated.
+
+### Negative control, EXECUTED
+
+Restored tuple semantics BEHIND the new row-id signature (each id looked up to
+its `(from,name,kind)` tuple, then the old tuple-keyed `DELETE` executed), so
+only the delete's precision changed and nothing else:
+
+- `cargo test --locked -p codegraph-store --lib delete_resolved_refs_by_row_id_removes_only_the_named_row`
+  → **exit 101**, `assertion left == right failed; left: 1, right: 2` at
+  `queries.rs:2522` — both `helper` rows gone, only `Other` left.
+- `cargo test --locked -p codegraph-resolve --lib resolving_one_call_site_keeps_its_tuple_identical_sibling_row`
+  → **exit 101**, `assertion failed: the UNRESOLVED sibling must survive cleanup
+of its resolved twin; left: 0, right: 1` at `resolver.rs:3626`.
+
+Both tests are load-bearing, at both layers. Restored from backup;
+`sha256sum -c` → `queries.rs: OK`, `resolver.rs: OK` (verify exit 0). Green
+hashes: `queries.rs`
+`42deaa32da2a6b0053ec974da5891d2af34386d3c219bdcb63fef54bed71d5f2`,
+`resolver.rs`
+`072c66b36f1b061d06c58809f7306b6358526eda88d6966d7eca62413d01090b`,
+`types.rs`
+`a7084d442d91708073a7e4ec44f72ad96da7e6df914b0cec4bc094b0065fbe8b`.
+
+### Verification (actual exit statuses)
+
+- `bash scripts/check-workspace-versions.sh` → exit 0, before every Cargo batch;
+  every Cargo command used `--locked`.
+- `cargo build --locked --workspace --all-targets` → first attempt exit 101
+  (`delete_resolved_unresolved_refs_up_to` not found — the superseded store test
+  still called it); after replacing that test, clean.
+- `cargo clippy --locked --workspace --all-targets -- -D warnings` → exit 0.
+- `cargo test --locked -p codegraph-store --lib delete_resolved_refs_by_row_id_removes_only_the_named_row`
+  → exit 0.
+- `cargo test --locked -p codegraph-resolve --lib resolving_one_call_site_keeps_its_tuple_identical_sibling_row`
+  → exit 0.
+- `cargo test --locked -p codegraph-bench --test equivalence` → exit 0, **26
+  passed, 0 failed** (unchanged 26/26).
+- `cargo test --locked --workspace` → **exit 101 on the first run**, failing ONLY
+  `codegraph-rs formatter_and_env_tests::install_completions_writes_zsh_fish_elvish_into_home`
+  — the KNOWN pre-existing in-process `HOME`/`XDG_DATA_HOME` race documented in
+  the Batch C2 entry, unrelated to resolution or the store. It was NOT weakened,
+  skipped, `#[ignore]`d or modified. Re-run in isolation → exit 0, 1 passed.
+- The first workspace run left two untracked SQLite byproducts
+  (`reference/golden/cfml/colby.db-{wal,shm}`) from the oracle; they are not
+  gitignored, so they were deleted before staging. No tracked golden changed.
+- `git diff --stat 285d591..HEAD -- reference/golden/` → empty.
+
+`lsp_diagnostics` was attempted on `queries.rs` and again refused this worktree
+(`LSP file path must be inside request cwd`); locked Cargo clippy/test is the
+honest fallback and no LSP-clean result is claimed. No dependency, version or
+`Cargo.lock` byte changed. No Windows/MSVC runtime validation is claimed — this
+work ran on Linux only.

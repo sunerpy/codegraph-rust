@@ -537,6 +537,7 @@ fn reference(
     subkind: ReferenceSubkind,
 ) -> RefView {
     RefView {
+        row_id: None,
         from_node_id,
         reference_name: target,
         reference_kind: kind,

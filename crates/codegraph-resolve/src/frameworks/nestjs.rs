@@ -378,6 +378,7 @@ fn add_route(
     nodes.push(node);
     if let Some(handler) = handler {
         references.push(RefView {
+            row_id: None,
             from_node_id: node_id,
             reference_name: handler,
             reference_kind: EdgeKind::References,
@@ -1158,6 +1159,7 @@ mod tests {
 
     fn a_ref(name: &str, file: &str) -> RefView {
         RefView {
+            row_id: None,
             from_node_id: format!("from:{file}"),
             reference_name: name.to_string(),
             reference_kind: EdgeKind::References,
