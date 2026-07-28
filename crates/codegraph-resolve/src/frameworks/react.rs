@@ -151,7 +151,7 @@ impl FrameworkResolver for ReactResolver {
 
         // React Router <Route .../> (v5/v6) (react.ts:158-198).
         for tag in route_tag_regex().find_iter(content) {
-            let window = byte_window(content, tag.start(), 400);
+            let window = route_opening_tag_window(content, tag.start());
             let Some(path_match) = route_path_attr().captures(window) else {
                 continue;
             };
@@ -518,6 +518,73 @@ fn byte_window(content: &str, start: usize, max_bytes: usize) -> &str {
         end -= 1;
     }
     &content[start..end]
+}
+
+/// Hard byte bound on how far the `<Route …>` opening-tag scan may look forward
+/// from the `<` (upstream issue #1348).
+///
+/// The scan normally stops at the tag's own `>` (see [`opening_tag_end`]), but a
+/// malformed or unterminated tag has no `>` to find, so the search itself must be
+/// capped: without a cap one stray `<Route` would drag the scan to end-of-file,
+/// and a file carrying many such tags would turn this pass quadratic.
+///
+/// 2048 bytes is the cap, sized off the longest opening tags actually measured
+/// rather than a guess. Measured reference points, each the true tag length up to
+/// its brace-aware terminator: a lazy, error-bounded v6 data route spread over
+/// six attribute lines is 278 bytes; the same route with `hydrateFallbackElement`,
+/// `shouldRevalidate` and a `handle={{…}}` object is 525 bytes; a prettier-wrapped
+/// tag carrying twelve extra `data-*` attributes is 700 bytes. 2048 is ~3x that
+/// widest measured tag, so a legitimate tag is never truncated, while the work per
+/// tag stays constant. It is also strictly wider than the fixed 400-byte window it
+/// replaces (`react.ts:114-123`), so no attribute the old window could reach is
+/// lost.
+const ROUTE_OPENING_TAG_SCAN_LIMIT: usize = 2048;
+
+/// The `<Route …>` opening tag's own text, starting at `start` (its `<`).
+///
+/// Replaces the upstream fixed 400-byte window (`react.ts:114-123`), which never
+/// cut at the tag's end and therefore let a parent or pathless route match a
+/// *sibling's* `path`/`element` (upstream issue #1348). The window is bounded
+/// twice over: by the tag terminator when the tag is well formed, and by
+/// [`ROUTE_OPENING_TAG_SCAN_LIMIT`] always — so an unterminated tag can never
+/// scan unboundedly. A malformed tag additionally stops at the next `<Route`, so
+/// even then it cannot borrow a sibling's attributes.
+fn route_opening_tag_window(content: &str, start: usize) -> &str {
+    let bounded = byte_window(content, start, ROUTE_OPENING_TAG_SCAN_LIMIT);
+    if let Some(end) = opening_tag_end(bounded) {
+        return &bounded[..end];
+    }
+    match bounded.get(1..).and_then(|rest| rest.find("<Route")) {
+        Some(idx) => &bounded[..idx + 1],
+        None => bounded,
+    }
+}
+
+/// Byte index just past the `>` closing the opening tag that starts at byte 0 of
+/// `text`, or `None` when the tag does not terminate inside `text`.
+///
+/// `{…}` expression containers and quoted attribute values are skipped, so the
+/// `>` inside `element={<Comp/>}` or `path="a>b"` does not end the tag early.
+fn opening_tag_end(text: &str) -> Option<usize> {
+    let mut brace_depth = 0usize;
+    let mut quote: Option<u8> = None;
+    for (index, byte) in text.as_bytes().iter().enumerate() {
+        match quote {
+            Some(open) => {
+                if *byte == open {
+                    quote = None;
+                }
+            }
+            None => match byte {
+                b'"' | b'\'' | b'`' => quote = Some(*byte),
+                b'{' => brace_depth += 1,
+                b'}' => brace_depth = brace_depth.saturating_sub(1),
+                b'>' if brace_depth == 0 => return Some(index + 1),
+                _ => {}
+            },
+        }
+    }
+    None
 }
 
 fn component_patterns() -> &'static [Regex] {

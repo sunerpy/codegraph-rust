@@ -5158,3 +5158,183 @@ by a unit test on Linux only.
 ```
 
 ```
+
+## Batch D1 — the `<Route>` opening-tag scan is bounded by the tag itself, not by 400 fixed bytes (2026-07-28)
+
+Ports upstream issue **#1348**. Investigated first, and the located scan was
+**NOT** already bounded in the sense the issue means: it had a fixed 400-byte
+forward window that never stopped at the tag's own end.
+
+### The located scan, quoted
+
+Not in `crates/codegraph-extract/src/embedded/` and not in the `lang/{jsx,tsx}.rs`
+specs (those only delegate to the JavaScript spec) — the scan is in the React
+framework resolver, `crates/codegraph-resolve/src/frameworks/react.rs:152-155`
+(pre-change):
+
+```rust
+// React Router <Route .../> (v5/v6) (react.ts:158-198).
+for tag in route_tag_regex().find_iter(content) {
+    let window = byte_window(content, tag.start(), 400);
+    let Some(path_match) = route_path_attr().captures(window) else {
+```
+
+with `byte_window` at `react.rs:515-521`:
+
+```rust
+fn byte_window(content: &str, start: usize, max_bytes: usize) -> &str {
+    let mut end = start.saturating_add(max_bytes).min(content.len());
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    &content[start..end]
+}
+```
+
+So the scan was byte-capped (no unbounded read, no quadratic blow-up) but
+**never cut at the opening tag's terminator**. That is the #1348 defect: the cap
+was the _only_ bound, so one tag's window bled into its siblings' attributes.
+The call site reached is real: `ReferenceResolver::extract_and_persist_frameworks_with`
+(`resolver.rs:836-845`) → `ReactResolver::extract`, driven from
+`codegraph-cli/src/main.rs:4081` and `codegraph-watch/src/sync.rs:453`.
+
+### Measured Red — real indexed project, ground truth read from SQLite
+
+Scratch project `/tmp/d1-red` (`package.json` with a `react` dep, `src/App.js`
+carrying the standard v6 nested shape from the issue: a parent `path="/dashboard"`
+that renders `<Outlet/>`, a pathless `index` child, and a `path="settings"`
+sibling). `target/debug/codegraph init .`, then
+`sqlite3 .codegraph-v2/codegraph.db`:
+
+    $ sqlite3 … "select kind,name,start_line from nodes where kind='route' order by start_line;"
+    route|/dashboard|9
+    route|settings|10        <- WRONG: this is the pathless index route; it borrowed
+    route|settings|11           its sibling's path, so `settings` is duplicated
+
+    $ sqlite3 … "select (select name from nodes where id=e.source),
+                        (select name from nodes where id=e.target), e.line
+                 from edges e where e.source like 'route:%';"
+    /dashboard|DashboardHome|9   <- WRONG: /dashboard has no element of its own
+    settings|DashboardHome|10    <- WRONG pair: index route mislabeled `settings`
+    settings|Settings|11         <- correct
+
+3 route nodes where 2 are right, and **2 of 3 route→component edges wrong**,
+matching the upstream report edge for edge. This is observed database state, not
+a compile or setup failure.
+
+Pathological input measured too: `/tmp/d1-path/src/patho.js` — an unterminated
+`<Route path="/a"` (no `>`), then a 200 000-character run of `<`, then a
+well-formed `<Route path="/b" element={<Comp/>} />` (200 129 bytes total). The
+byte cap meant the old code did NOT hang (0.317 s wall clock, `Indexed 1 files`),
+so the honest finding is: **no unbounded scan, but wrong attribution** — the `/a`
+tag reached `Comp` in the unit-level reproduction (see the negative control
+below, where lifting the cap yields `[("Comp", 2), ("Comp", 4)]` instead of
+`[("Comp", 4)]`).
+
+### Green
+
+`route_opening_tag_window` replaces the raw 400-byte window. It bounds the scan
+twice: `opening_tag_end` walks to the tag's own `>` (skipping `{…}` expression
+containers and quoted values, so `element={<Comp/>}` and `path="a>b"` do not end
+the tag early), and `ROUTE_OPENING_TAG_SCAN_LIMIT` caps the search itself so an
+unterminated tag can never scan to end-of-file. A malformed tag additionally
+stops at the next `<Route`, so even then it cannot borrow a sibling's attributes.
+
+Same project re-indexed with the rebuilt binary:
+
+    route|/dashboard|9
+    route|settings|11
+    settings|Settings|11
+
+Exactly the single correct edge the issue asks for.
+
+### The bound and why that number
+
+`ROUTE_OPENING_TAG_SCAN_LIMIT = 2048`, justified in its doc comment from tag
+lengths actually measured on this branch (true length to the brace-aware
+terminator, computed with a Python walker over each fixture):
+
+| Opening tag shape                                                           | Bytes |
+| --------------------------------------------------------------------------- | ----- |
+| lazy, error-bounded v6 data route over six attribute lines (`/tmp/d1-long`) | 278   |
+| the same plus `hydrateFallbackElement`, `shouldRevalidate`, `handle={{…}}`  | 525   |
+| prettier-wrapped tag with twelve extra `data-*` attributes (`/tmp/d1-wide`) | 700   |
+
+2048 is ~3x the widest measured tag, and strictly wider than the 400-byte window
+it replaces, so nothing the old code could reach is lost. The first draft used
+512; the 700-byte measurement showed 512 would truncate a legitimate tag, so the
+constant was raised before commit rather than after.
+
+### Tests
+
+Three new tests in `crates/codegraph-resolve/tests/frameworks.rs`, all driving
+the real `ReactResolver::extract`:
+
+- `react_route_window_stops_at_tag_end_not_at_sibling_routes` — the #1348 nested
+  shape; asserts the exact route-node list AND the exact reference list.
+- `react_route_window_is_bounded_for_unterminated_tag_and_bare_angle_run` — the
+  pathological input: unterminated `<Route path="/a"`, a 200 000-char run of `<`,
+  then a well-formed route; asserts `/a` does not reach the far-away element.
+- `react_route_window_keeps_long_multiline_opening_tag_intact` — a 705-byte
+  prettier-wrapped tag with twelve props; asserts the fixture exceeds 400 bytes
+  and that both its `path` and its `element` still extract. This pins the bound
+  from the outside: tightening the constant below the tag length reddens it.
+
+### Golden row delta
+
+None. `git diff --stat 7d0253b..HEAD -- reference/golden/` → EMPTY.
+`cargo test --locked -p codegraph-bench --test equivalence` → exit 0,
+**26 passed, 0 failed**. No golden fixture contains a `<Route`/`createBrowserRouter`
+construct (`grep -rn '<Route\|createBrowserRouter' reference/golden/ crates/codegraph-bench/fixtures/`
+→ no matches), so the new branch is unreachable for them. The equivalence run left
+untracked `reference/golden/godot/colby.db-{wal,shm}`; both were deleted before
+staging and no tracked golden changed.
+
+### Negative control, EXECUTED (three mutants)
+
+1. Production line reverted to `byte_window(content, tag.start(), 400)`, tests
+   untouched → `cargo test --locked -p codegraph-resolve --test frameworks` →
+   **exit 101**, 2 failed. Actual assertion output:
+
+       assertion `left == right` failed: the pathless index route must not borrow its sibling's path
+         left: [("/dashboard", 6), ("settings", 7), ("settings", 8)]
+        right: [("/dashboard", 6), ("settings", 8)]
+
+   plus `react_route_window_keeps_long_multiline_opening_tag_intact` FAILED.
+
+2. Cap lifted to `usize::MAX` (terminator logic kept) → **exit 101**, 1 failed:
+
+       assertion `left == right` failed: the unterminated /a tag must not reach the /b element 200KB later
+         left: [("Comp", 2), ("Comp", 4)]
+        right: [("Comp", 4)]
+
+   — proof the cap itself is load-bearing, not decoration.
+
+3. Cap tightened to `400` → **exit 101**, 1 failed:
+   `the element of a 705-byte opening tag must still be seen` — proof the bound
+   cannot be shrunk without truncating legitimate input.
+
+Restored after each mutant by copying back the green file; restored SHA-256 of
+`crates/codegraph-resolve/src/frameworks/react.rs`:
+`a4bbc7a36305bc8bd901b15daf867a3546b94ea76dc854afa86e90f263f8bb7d`.
+Re-run with the fix restored → exit 0, 31 passed.
+
+### Verification (actual exit statuses)
+
+- `bash scripts/check-workspace-versions.sh` → exit 0, run before every Cargo
+  batch; every Cargo command used `--locked`.
+- `cargo build --locked -p codegraph-rs` → exit 0 (binary used for the SQLite
+  ground-truth measurements above).
+- `cargo test --locked -p codegraph-resolve --test frameworks` → exit 0,
+  31 passed.
+- `cargo test --locked -p codegraph-bench --test equivalence` → exit 0, 26/26.
+- `make ci CARGO='cargo --locked'` → final gate, run after the last byte of this
+  commit (code, tests, this prose, then `make fmt`); result recorded below.
+- `sha256sum Cargo.lock` →
+  `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`, unchanged.
+
+`lsp_diagnostics` was attempted and again refused this worktree (`LSP file path
+must be inside request cwd`); locked Cargo clippy/test is the honest fallback and
+no LSP-clean result is claimed. No dependency, version or `Cargo.lock` byte
+changed. No native Windows/MSVC runtime validation is claimed — everything above
+ran on Linux.

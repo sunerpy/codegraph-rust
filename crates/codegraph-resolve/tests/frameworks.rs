@@ -298,6 +298,139 @@ fn react_extract_component_and_route_reference() {
     );
 }
 
+/// Nested v6 shape from upstream #1348: the parent route has a `path` but renders
+/// `<Outlet/>`, and the pathless `index` child must stay skipped. The unbounded
+/// 400-byte window let the parent borrow the child's `element` and let the `index`
+/// route borrow its sibling's `path`, producing `/dashboard -> DashboardHome`,
+/// a duplicate `settings` node, and `settings -> DashboardHome`.
+#[test]
+fn react_route_window_stops_at_tag_end_not_at_sibling_routes() {
+    let content = concat!(
+        "function DashboardHome() { return null; }\n",
+        "function Settings() { return null; }\n",
+        "export function App() {\n",
+        "  return (\n",
+        "    <Routes>\n",
+        "      <Route path=\"/dashboard\">\n",
+        "        <Route index element={<DashboardHome/>} />\n",
+        "        <Route path=\"settings\" element={<Settings/>} />\n",
+        "      </Route>\n",
+        "    </Routes>\n",
+        "  );\n",
+        "}\n",
+    );
+    let result = react::ReactResolver
+        .extract("src/App.tsx", content, &no_project_config())
+        .expect("extract result");
+
+    let routes: Vec<(String, i64)> = result
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Route)
+        .map(|n| (n.name.clone(), n.start_line))
+        .collect();
+    assert_eq!(
+        routes,
+        vec![("/dashboard".to_string(), 6), ("settings".to_string(), 8)],
+        "the pathless index route must not borrow its sibling's path"
+    );
+
+    let refs: Vec<(String, i64)> = result
+        .references
+        .iter()
+        .map(|r| (r.reference_name.clone(), r.line))
+        .collect();
+    assert_eq!(
+        refs,
+        vec![("Settings".to_string(), 8)],
+        "only the settings route owns an element; the parent renders <Outlet/>"
+    );
+}
+
+/// An unterminated `<Route path=…` followed by a long run of `<` must not let the
+/// scan run to end-of-file, and must not reach the well-formed route far below it.
+#[test]
+fn react_route_window_is_bounded_for_unterminated_tag_and_bare_angle_run() {
+    let mut content = String::from("function Comp() { return null; }\n<Route path=\"/a\"\n");
+    content.push_str(&"<".repeat(200_000));
+    content.push_str("\n<Route path=\"/b\" element={<Comp/>} />\n");
+
+    let result = react::ReactResolver
+        .extract("src/Patho.tsx", &content, &no_project_config())
+        .expect("extract result");
+
+    let routes: Vec<String> = result
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Route)
+        .map(|n| n.name.clone())
+        .collect();
+    assert_eq!(routes, vec!["/a".to_string(), "/b".to_string()]);
+
+    let refs: Vec<(String, i64)> = result
+        .references
+        .iter()
+        .map(|r| (r.reference_name.clone(), r.line))
+        .collect();
+    assert_eq!(
+        refs,
+        vec![("Comp".to_string(), 4)],
+        "the unterminated /a tag must not reach the /b element 200KB later"
+    );
+}
+
+/// Pins `ROUTE_OPENING_TAG_SCAN_LIMIT` from the outside: a 700-byte prettier-wrapped
+/// opening tag — wider than both the old 400-byte window and any tag measured while
+/// sizing the bound — still yields its `path` and its `element`, so the bound cannot
+/// be tightened to a value that truncates legitimate input.
+#[test]
+fn react_route_window_keeps_long_multiline_opening_tag_intact() {
+    let filler: String = (0..12)
+        .map(|i| format!("        data-attribute-number-{i:02}=\"filler-value-{i:02}\"\n"))
+        .collect();
+    let content = format!(
+        concat!(
+            "function DeepSettingsPage() {{ return null; }}\n",
+            "export function Router() {{\n",
+            "  return (\n",
+            "    <Routes>\n",
+            "      <Route\n",
+            "        path=\"/dashboard/settings\"\n",
+            "{filler}",
+            "        element={{<DeepSettingsPage/>}}\n",
+            "      />\n",
+            "    </Routes>\n",
+            "  );\n",
+            "}}\n",
+        ),
+        filler = filler
+    );
+    let tag_start = content.find("<Route").expect("route tag");
+    let tag_len = content[tag_start..].find("/>").expect("tag end") + 2;
+    assert!(
+        tag_len > 400,
+        "fixture must exceed the old 400-byte window, got {tag_len}"
+    );
+
+    let result = react::ReactResolver
+        .extract("src/Router.tsx", &content, &no_project_config())
+        .expect("extract result");
+
+    let route = result
+        .nodes
+        .iter()
+        .find(|n| n.kind == NodeKind::Route)
+        .expect("route node");
+    assert_eq!(route.name, "/dashboard/settings");
+    assert!(
+        result
+            .references
+            .iter()
+            .any(|r| r.reference_name == "DeepSettingsPage"),
+        "the element of a {tag_len}-byte opening tag must still be seen"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Vue
 // ---------------------------------------------------------------------------
