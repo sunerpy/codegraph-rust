@@ -5338,3 +5338,265 @@ must be inside request cwd`); locked Cargo clippy/test is the honest fallback an
 no LSP-clean result is claimed. No dependency, version or `Cargo.lock` byte
 changed. No native Windows/MSVC runtime validation is claimed — everything above
 ran on Linux.
+
+## Batch D2 — every DFM object closes at its own matching `end` (2026-07-28)
+
+Ports upstream issue **#1350**. Investigated first, then MEASURED against real
+indexed database state. Finding, split honestly in two halves:
+
+- **Nesting was ALREADY correct.** The extractor already keeps an `object … end`
+  stack and parents each new object to `stack.last()`, so a nested object never
+  attached to the file root. Measured to four levels deep with siblings at two
+  depths — every `contains` edge was already right. This half is a
+  **reclassification: no defect, pinned by a new regression test.**
+- **`end_line` was WRONG for every object.** Each component reported
+  `end_line == start_line`, i.e. a one-line span, so no container's span covered
+  its children and no object reached its own `end`. This half is a **real
+  defect, fixed.**
+
+### The located logic, quoted
+
+`crates/codegraph-extract/src/embedded/dfm.rs:59-131` (pre-change). The stack
+held bare id strings, so once an object was pushed there was no way back to its
+node to close it — the `end` branch popped and discarded:
+
+```rust
+let mut stack = vec![file_id.to_string()];
+…
+if let Some(captures) = object_re.captures(line) {
+    let name = captures.get(2).unwrap().as_str().to_string();
+    let type_name = captures.get(3).unwrap().as_str().to_string();
+    let mut node = default_node(
+        self.file_path,
+        Language::Pascal,
+        NodeKind::Component,
+        name.clone(),
+        format!("{}#{name}", self.file_path),
+        line_num,
+        line_num,   // <- end_line seeded to the HEADER line and never updated
+        0,
+        line.len() as i64,
+    );
+    node.signature = Some(type_name);
+    let node_id = node.id.clone();
+    result.nodes.push(node);
+    result
+        .edges
+        .push(contains_edge(stack.last().unwrap(), &node_id));
+    stack.push(node_id);
+    continue;
+}
+…
+if end_re.is_match(line) && stack.len() > 1 {
+    stack.pop();   // <- the matching `end` line is discarded
+}
+```
+
+### Measured Red — real indexed project, ground truth read from SQLite
+
+Scratch project `/tmp/d2-red` with two fixtures: `src/Deep.dfm` (four levels —
+`MainForm` > `TopPanel` > `InnerPanel` > `DeepButton` — plus sibling pairs at two
+depths and a multiline `Columns = <…>` block whose `end` / `end>` lines must not
+close anything) and `src/Broken.dfm` (truncated: three objects, zero `end`).
+Indexed with the pre-change `target/debug/codegraph`, then:
+
+    sqlite3 .codegraph-v2/codegraph.db \
+      "select kind, name, qualified_name, start_line, end_line, file_path \
+       from nodes order by file_path, start_line;"
+
+Observed (pre-change), verbatim:
+
+    file|Broken.dfm|src/Broken.dfm|1|7|src/Broken.dfm
+    component|BrokenForm|src/Broken.dfm#BrokenForm|1|1|src/Broken.dfm
+    component|OrphanPanel|src/Broken.dfm#OrphanPanel|3|3|src/Broken.dfm
+    component|LostButton|src/Broken.dfm#LostButton|5|5|src/Broken.dfm
+    file|Deep.dfm|src/Deep.dfm|1|34|src/Deep.dfm
+    component|MainForm|src/Deep.dfm#MainForm|1|1|src/Deep.dfm
+    component|TopPanel|src/Deep.dfm#TopPanel|4|4|src/Deep.dfm
+    component|InnerPanel|src/Deep.dfm#InnerPanel|6|6|src/Deep.dfm
+    component|DeepButton|src/Deep.dfm#DeepButton|8|8|src/Deep.dfm
+    component|DeepLabel|src/Deep.dfm#DeepLabel|12|12|src/Deep.dfm
+    component|SiblingButton|src/Deep.dfm#SiblingButton|16|16|src/Deep.dfm
+    component|BottomPanel|src/Deep.dfm#BottomPanel|20|20|src/Deep.dfm
+    component|Items|src/Deep.dfm#Items|22|22|src/Deep.dfm
+
+**Wrong rows: all 8 `Deep.dfm` components.** Every one reports
+`end_line == start_line`. Ground truth from `cat -n src/Deep.dfm`: `MainForm`
+ends at 33, `TopPanel` at 19, `InnerPanel` at 15, `DeepButton` at 11,
+`DeepLabel` at 14, `SiblingButton` at 18, `BottomPanel` at 32, `Items` at 31.
+So a caller asking "what lines is `TopPanel`?" was told line 4 only, and no
+container's span contained its children. This is observed database state, not a
+compile or setup failure.
+
+`qualified_name` was NOT flattened — it is `{file}#{name}` by upstream design
+(`dfm-extractor.ts`), and the existing test already pins that form, so it is not
+touched here.
+
+Nesting, measured in the same run:
+
+    contains|Broken.dfm@1|BrokenForm@1
+    contains|BrokenForm@1|OrphanPanel@3
+    contains|OrphanPanel@3|LostButton@5
+    contains|Deep.dfm@1|MainForm@1
+    contains|MainForm@1|TopPanel@4
+    contains|TopPanel@4|InnerPanel@6
+    contains|InnerPanel@6|DeepButton@8
+    contains|InnerPanel@6|DeepLabel@12
+    contains|TopPanel@4|SiblingButton@16
+    contains|MainForm@1|BottomPanel@20
+    contains|BottomPanel@20|Items@22
+
+Every edge correct, including at depth 3 and across the multiline block —
+**already right**, hence the reclassification above. Reported as measured rather
+than restated as a defect.
+
+### Green
+
+`OpenBlock { id, node_index }` replaces the bare id on the stack: the file root
+carries `node_index: None`, each real object carries its index in
+`result.nodes`. The `end` branch now closes the block it actually popped:
+
+```rust
+if end_re.is_match(line) && stack.len() > 1 {
+    let closed = stack.pop().unwrap();
+    if let Some(index) = closed.node_index {
+        result.nodes[index].end_line = line_num;
+    }
+}
+```
+
+Because the `end_line` is written from the popped frame, the value can only ever
+come from that object's own matching `end` — a sibling's terminator is
+structurally unreachable. Same project re-indexed with the rebuilt binary:
+
+    file|Broken.dfm|src/Broken.dfm|1|7|src/Broken.dfm
+    component|BrokenForm|src/Broken.dfm#BrokenForm|1|1|src/Broken.dfm
+    component|OrphanPanel|src/Broken.dfm#OrphanPanel|3|3|src/Broken.dfm
+    component|LostButton|src/Broken.dfm#LostButton|5|5|src/Broken.dfm
+    file|Deep.dfm|src/Deep.dfm|1|34|src/Deep.dfm
+    component|MainForm|src/Deep.dfm#MainForm|1|33|src/Deep.dfm
+    component|TopPanel|src/Deep.dfm#TopPanel|4|19|src/Deep.dfm
+    component|InnerPanel|src/Deep.dfm#InnerPanel|6|15|src/Deep.dfm
+    component|DeepButton|src/Deep.dfm#DeepButton|8|11|src/Deep.dfm
+    component|DeepLabel|src/Deep.dfm#DeepLabel|12|14|src/Deep.dfm
+    component|SiblingButton|src/Deep.dfm#SiblingButton|16|18|src/Deep.dfm
+    component|BottomPanel|src/Deep.dfm#BottomPanel|20|32|src/Deep.dfm
+    component|Items|src/Deep.dfm#Items|22|31|src/Deep.dfm
+
+All 8 spans now match `cat -n` exactly. The `contains` edge list is byte-identical
+to the Red run (re-queried and compared) — nesting was not disturbed.
+
+### Unterminated objects: honest omission, not a fabricated span
+
+`Broken.dfm`'s three objects never reach an `end`, so nothing pops them and their
+`end_line` stays at the header line. That is deliberate, following the precedent
+that an undeterminable target emits nothing rather than a guess: the extractor
+does not claim a span it never observed, does not borrow the file end (7), and
+does not panic. `result.errors` stays empty and the `contains` chain is still
+built, so the structure is still usable.
+
+### `start_line` invariance — node-ID safety
+
+Node IDs are `{kind}:{sha256("{filePath}:{kind}:{name}:{line}").hex[:32]}` where
+`line` is `start_line` (`shared::default_node` → `generate_node_id(file_path,
+kind, &name, start_line.max(1) as u32)`). **This change writes only `end_line`.**
+The `default_node(…)` call — including both line arguments and therefore the id —
+is untouched; the single new write is `result.nodes[index].end_line = line_num;`
+after the node already exists. No `start_line`, `name`, `kind`, `file_path` or
+`qualified_name` value changes, so **no node ID shifts**. Confirmed against the
+measured tables above: every `start_line` in the Green table equals the Red one.
+An earlier draft also updated `end_column`; that was reverted before commit to
+keep the diff to the one field the issue is about.
+
+### Tests
+
+Two new tests in `crates/codegraph-extract/tests/markup_risk_languages.rs`,
+driving the real `extract_source` through `extract_fixture`, plus two new
+fixtures (`DeepForm.dfm`, `BrokenForm.dfm`; no existing fixture reflowed, so no
+existing `start_line` moved):
+
+- `lang_markup_risk_dfm_spans_close_at_their_own_matching_end` — asserts the
+  EXACT `(name, start_line, end_line)` triple for all 8 objects, then repeats the
+  depth-2 (`InnerPanel` 6..15) and depth-3 (`DeepButton` 8..11) spans separately,
+  asserts the same-depth sibling pair (`DeepButton` 8..11 vs `DeepLabel` 12..14)
+  plus a non-overlap assertion so an off-by-one that swaps their terminators is
+  caught, pins `Items` 22..31 across the multiline `Columns = <…>` block, and
+  re-asserts all 8 `contains` edges and two handler reference lines.
+- `lang_markup_risk_dfm_unterminated_object_keeps_its_header_span` — the
+  truncated fixture; asserts the exact three spans (`1..1`, `3..3`, `5..5`), that
+  `errors` is empty (no panic, no error node), and that the `contains` chain is
+  still complete.
+
+The existing `lang_markup_risk_dfm_uses_custom_component_extractor` is unchanged
+and still green, so the ported behavior did not disturb `MainForm.dfm`.
+
+### Golden row delta
+
+None. `git diff --stat b7ff1f8..HEAD -- reference/golden/` → **EMPTY** (exit 0).
+`cargo test --locked -p codegraph-bench --test equivalence` → exit 0,
+**26 passed, 0 failed**. No golden corpus or bench fixture contains a `.dfm` or
+`.fmx` file (`find reference/golden crates/codegraph-bench/fixtures -iname '*.dfm'
+-o -iname '*.fmx'` → no matches), so the DFM extractor is unreachable for them,
+matching the frozen manifest's `#1350 → golden effect: none`. The equivalence run
+left untracked `reference/golden/ruby/colby.db-{wal,shm}`; both were deleted
+before staging and no tracked golden changed.
+
+### Negative control, EXECUTED (three mutants)
+
+Each mutant is a change to `dfm.rs` ONLY; the tests were never touched.
+
+1. `end_line` write removed (exact pre-#1350 behavior: pop and discard) →
+   `cargo test --locked -p codegraph-extract --test markup_risk_languages` →
+   **exit 101**, 1 failed:
+
+       assertion `left == right` failed: each object must span from its own header line to its own matching end
+         left: [("BottomPanel", 20, 20), ("DeepButton", 8, 8), ("DeepForm", 1, 1), ("DeepLabel", 12, 12), ("InnerPanel", 6, 6), ("Items", 22, 22), ("SiblingButton", 16, 16), ("TopPanel", 4, 4)]
+        right: [("BottomPanel", 20, 32), ("DeepButton", 8, 11), ("DeepForm", 1, 33), ("DeepLabel", 12, 14), ("InnerPanel", 6, 15), ("Items", 22, 31), ("SiblingButton", 16, 18), ("TopPanel", 4, 19)]
+
+2. `end_line = line_num - 1` (off-by-one at the terminator) → **exit 101**,
+   1 failed — proof the exact terminator line is pinned, not merely "some larger
+   number":
+
+       assertion `left == right` failed: each object must span from its own header line to its own matching end
+         left: [("BottomPanel", 20, 31), ("DeepButton", 8, 10), ("DeepForm", 1, 32), ("DeepLabel", 12, 13), ("InnerPanel", 6, 14), ("Items", 22, 30), ("SiblingButton", 16, 17), ("TopPanel", 4, 18)]
+        right: [("BottomPanel", 20, 32), ("DeepButton", 8, 11), ("DeepForm", 1, 33), ("DeepLabel", 12, 14), ("InnerPanel", 6, 15), ("Items", 22, 31), ("SiblingButton", 16, 18), ("TopPanel", 4, 19)]
+
+3. Unterminated objects post-patched to reach the file end (the tempting
+   "fill in a plausible span" design) → **exit 101**, and it reddens a
+   DIFFERENT test, so a partial regression cannot hide:
+
+       assertion `left == right` failed: an unterminated object must not fabricate a span
+         left: [("BrokenForm", 1, 8), ("LostButton", 5, 8), ("OrphanPanel", 3, 8)]
+        right: [("BrokenForm", 1, 1), ("LostButton", 5, 5), ("OrphanPanel", 3, 3)]
+
+Restored after each mutant by copying back the green file; restored SHA-256 of
+`crates/codegraph-extract/src/embedded/dfm.rs`:
+`a8c3db6949c395071b5ecabc7c74a80515927d23c84cd2d0b59afbaa4c1a86ab`.
+Re-run with the fix restored → exit 0, 9 passed.
+
+### Verification (actual exit statuses)
+
+- `bash scripts/check-workspace-versions.sh` → exit 0, run before every Cargo
+  batch; every Cargo command used `--locked`.
+- `cargo build --locked -p codegraph-rs` → exit 0 (binary used for the SQLite
+  ground-truth measurements above, pre- and post-change).
+- `cargo test --locked -p codegraph-extract --test markup_risk_languages` →
+  exit 0, 9 passed.
+- `cargo test --locked -p codegraph-extract` (whole crate) → exit 0, all suites
+  green (382 lib tests + integration suites).
+- `cargo test --locked -p codegraph-bench --test equivalence` → exit 0, 26/26.
+- `make ci CARGO='cargo --locked'` → final gate, run after the last byte of this
+  commit (code, tests, fixtures, this prose, then `make fmt`); result recorded
+  below.
+- `sha256sum Cargo.lock` →
+  `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`, unchanged.
+
+Determinism: the fix adds no map iteration and no new sort — objects are still
+emitted in source-line order and the `end_line` write targets an already-fixed
+index, so output ordering is unchanged.
+
+`lsp_diagnostics` was attempted and again refused this worktree (`LSP file path
+must be inside request cwd`); locked Cargo clippy/test is the honest fallback and
+no LSP-clean result is claimed. No dependency, version or `Cargo.lock` byte
+changed. No native Windows/MSVC runtime validation is claimed — everything above
+ran on Linux.
