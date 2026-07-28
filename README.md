@@ -476,6 +476,9 @@ Full list with extensions and per-language notes: [`docs/languages.md`](docs/lan
 - [`docs/godot.md`](docs/godot.md) — Godot static analysis: what CodeGraph
   extracts from `.tscn`/`.tres`/`project.godot`/`.gd`, the static-vs-runtime
   boundary, and honesty signals for dynamic reachability.
+- [`docs/godot-gdext-decision.md`](docs/godot-gdext-decision.md) — why `gdext`
+  (godot-rust GDExtension bindings) is rejected for Godot analysis, and the
+  engine-free alternatives.
 - [`docs/grammar-manifest.md`](docs/grammar-manifest.md) /
   [`docs/embedded-extraction.md`](docs/embedded-extraction.md) — language support
   and extraction tiers (engineering ABI detail).

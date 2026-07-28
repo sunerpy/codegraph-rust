@@ -392,6 +392,9 @@ sync` that touches only a `.gd.uid`, a `.tscn` uid header, or a file rename does
 
 ## See also
 
+- [`docs/godot-gdext-decision.md`](godot-gdext-decision.md) — why CodeGraph does
+  NOT use `gdext` (the godot-rust GDExtension bindings), and the engine-free
+  alternatives for the limitations above.
 - [`docs/languages.md`](languages.md) — GDScript (Tier 1), GodotScene,
   GodotResource, GodotProject file types.
 - [`docs/mcp.md`](mcp.md) — `codegraph_callers` and `codegraph_impact` tools
