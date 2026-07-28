@@ -127,7 +127,7 @@ do not appear as separate commits in the frozen `v1.4.1..v1.5.0` list.
 |---|---|---|---|
 | #1372 | PORT | Batch A1 Unicode search scoring + real CLI/MCP contracts | none |
 | #1359 | PORT | Batch A3 enqueue-once unit instrumentation | none |
-| #1348 | PORT | Batch D1 bounded React opening-tag scan | none |
+| #1348 | PORT | Batch D1 bounded React `<Route>` opening-tag scan + Batch F3 bounded data-router route-object walk | none |
 | #1350 | PORT | Batch D2 DFM nesting/end lines | none |
 | #1182/#1209 | PORT | Batch D3 MyBatis/iBatis forms and qualified refids | none |
 | #1349 | N/A | forbidden node-ID byte-offset/column discriminator | none |

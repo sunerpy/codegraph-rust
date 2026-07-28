@@ -185,10 +185,10 @@ impl FrameworkResolver for ReactResolver {
         if data_router_regex().is_match(content) {
             for m in obj_path_regex().captures_iter(content) {
                 let whole = m.get(0).expect("group 0");
-                let win = byte_window(content, whole.start(), 300);
+                let win = route_object_own_properties(content, whole.start());
                 let comp = obj_element_attr()
-                    .captures(win)
-                    .or_else(|| obj_component_attr().captures(win))
+                    .captures(&win)
+                    .or_else(|| obj_component_attr().captures(&win))
                     .map(|c| c.get(1).expect("comp group").as_str().to_string());
                 let Some(comp) = comp else { continue };
                 let route_path = {
@@ -558,6 +558,116 @@ fn route_opening_tag_window(content: &str, start: usize) -> &str {
         Some(idx) => &bounded[..idx + 1],
         None => bounded,
     }
+}
+
+/// Hard byte bound on how far the data-router route-object scan may walk forward
+/// from a `path:` key (upstream issue #1348, data-router half).
+///
+/// The walk normally stops at the `}` closing that route object (see
+/// [`route_object_own_properties`]), but a malformed or unterminated object literal
+/// has no matching `}` to find, so the walk itself must be capped: without a cap one
+/// stray `path:` would drag it to end-of-file, and a file carrying many such keys
+/// would turn this pass quadratic. This is the object-form twin of
+/// [`ROUTE_OPENING_TAG_SCAN_LIMIT`], and both invariants are the same: terminate at
+/// the construct's own end, and cap the search regardless.
+///
+/// 4096 bytes is the cap, sized off route objects actually measured rather than a
+/// guess. Measured reference points, each the raw walk distance from the object's
+/// `path:` key to its own closing `}` (nested children included, because the walk
+/// traverses and elides them rather than stopping at them): a minimal inline
+/// `{ path, element }` is 38 bytes; a typical v6.4 route with `loader` and
+/// `errorElement` is 142; the same plus `action`, `handle={…}` and
+/// `shouldRevalidate`, with `element` last, is 407; a wide enterprise route adding
+/// `hydrateFallbackElement` and a nested `handle` object is 611; a parent route
+/// whose `children` array holds eight loader-bearing child routes, with the parent's
+/// own `element` declared last — the worst realistic walk, since every child byte
+/// must be traversed before the parent's own `element` is reached — is 1503. 4096 is
+/// ~2.7x that widest measured object, so a legitimate object is never truncated,
+/// while the work per `path:` key stays constant. It is also strictly wider than the
+/// fixed 300-byte window it replaces (`react.ts:206`), so no property the old window
+/// could reach is lost.
+const ROUTE_OBJECT_SCAN_LIMIT: usize = 4096;
+
+/// The route object's OWN properties, as text, starting at the `path:` key that
+/// begins at `path_key_start`.
+///
+/// Replaces the upstream fixed 300-byte window (`react.ts:206`), which scanned
+/// blindly forward and took the FIRST `element`/`Component` it found — so a parent
+/// route with no `element` of its own silently borrowed a CHILD route's component,
+/// the same borrowing defect [`route_opening_tag_window`] fixes for the `<Route>`
+/// JSX form (upstream issue #1348).
+///
+/// Nested `{…}` / `[…]` groups are ELIDED, not merely stopped at: a `children: […]`
+/// array cannot leak its own `element` into the parent's text, and neither can a
+/// `handle: {…}` object. Quoted values are copied verbatim, so a `}` or `>` inside
+/// `path: 'a>b'` neither ends the object nor unbalances the depth. The walk is
+/// bounded twice over, exactly as the JSX form is: by the object's own closing `}`
+/// when the literal is well formed, and by [`ROUTE_OBJECT_SCAN_LIMIT`] always. A
+/// malformed object additionally stops at the next `path:` key, so even then it
+/// cannot borrow a following sibling's properties.
+fn route_object_own_properties(content: &str, path_key_start: usize) -> String {
+    let bounded = byte_window(content, path_key_start, ROUTE_OBJECT_SCAN_LIMIT);
+    let bytes = bounded.as_bytes();
+    let mut own = String::with_capacity(bounded.len());
+    // Start of the run of depth-0 bytes not yet copied into `own`. Every byte the
+    // walk inspects structurally is ASCII, so every boundary is a char boundary.
+    let mut segment_start = 0usize;
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+
+    for (index, byte) in bytes.iter().enumerate() {
+        match quote {
+            Some(open) => {
+                if *byte == open {
+                    quote = None;
+                }
+            }
+            None => match byte {
+                b'"' | b'\'' | b'`' => quote = Some(*byte),
+                b'{' | b'[' => {
+                    if depth == 0 {
+                        // Elide the nested group; a space keeps neighbouring tokens
+                        // from fusing across the hole.
+                        own.push_str(&bounded[segment_start..index]);
+                        own.push(' ');
+                    }
+                    depth += 1;
+                }
+                b'}' | b']' => {
+                    if depth == 0 {
+                        // This object's own end: nothing beyond it belongs to it.
+                        own.push_str(&bounded[segment_start..index]);
+                        return own;
+                    }
+                    depth -= 1;
+                    if depth == 0 {
+                        segment_start = index + 1;
+                    }
+                }
+                b'p' if depth == 0 && index > 0 && is_path_key_at(bounded, index) => {
+                    // Unterminated object: a second depth-0 `path:` can only be a
+                    // following sibling's, so stop rather than borrow from it.
+                    own.push_str(&bounded[segment_start..index]);
+                    return own;
+                }
+                _ => {}
+            },
+        }
+    }
+
+    if depth == 0 {
+        own.push_str(&bounded[segment_start..]);
+    }
+    own
+}
+
+/// Whether a `path` object key (`path` then optional whitespace then `:`) starts at
+/// `index` in `text`.
+fn is_path_key_at(text: &str, index: usize) -> bool {
+    let Some(rest) = text.get(index..).and_then(|r| r.strip_prefix("path")) else {
+        return false;
+    };
+    rest.trim_start().starts_with(':')
 }
 
 /// Byte index just past the `>` closing the opening tag that starts at byte 0 of
