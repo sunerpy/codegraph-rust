@@ -35,19 +35,28 @@ impl<'a> MyBatisExtractor<'a> {
         result
     }
 
+    /// Locates the mapper root element and its namespace.
+    ///
+    /// Both dialect forms are accepted: the MyBatis `<mapper namespace="…">`
+    /// root and the older iBatis 2 `<sqlMap namespace="…">` root (upstream
+    /// #1182). `\b` keeps `<sqlMapConfig>` — the iBatis *config* file, which
+    /// holds no statements — from being mistaken for a statement map. The
+    /// closing tag is derived from whichever root matched, so the body window
+    /// ends at the real root close instead of a hard-coded `</mapper>`.
     fn find_mapper_root(&self) -> Option<(String, usize, usize)> {
-        let open_re = Regex::new(r#"<mapper\b([^>]*)>"#).unwrap();
+        let open_re = Regex::new(r#"<(mapper|sqlMap)\b([^>]*)>"#).unwrap();
         let ns_re = Regex::new(r#"\bnamespace\s*=\s*"([^"]+)""#).unwrap();
-        let open = open_re.find(self.source)?;
-        let attrs = open_re
-            .captures(open.as_str())
-            .and_then(|cap| cap.get(1).map(|m| m.as_str().to_string()))?;
+        let open = open_re.captures(self.source)?;
+        let matched = open.get(0)?;
+        let root_tag = open.get(1)?.as_str();
+        let attrs = open.get(2).map_or("", |m| m.as_str());
         let namespace = ns_re
-            .captures(&attrs)
+            .captures(attrs)
             .and_then(|cap| cap.get(1).map(|m| m.as_str().to_string()))?;
-        let body_start = open.end();
+        let body_start = matched.end();
+        let close_tag = format!("</{root_tag}>");
         let body_end = self.source[body_start..]
-            .find("</mapper>")
+            .find(&close_tag)
             .map_or(self.source.len(), |idx| body_start + idx);
         Some((namespace, body_start, body_end))
     }
@@ -132,11 +141,7 @@ impl<'a> MyBatisExtractor<'a> {
         for cap in include_re.captures_iter(elem_body) {
             let full = cap.get(0).unwrap();
             let refid = cap.get(1).unwrap().as_str();
-            let ref_qualified = if refid.contains('.') {
-                refid.replace('.', "::")
-            } else {
-                format!("{namespace}::{refid}")
-            };
+            let ref_qualified = qualify_refid(namespace, refid);
             let line = line_number_for_offset(&self.line_starts, elem_body_abs + full.start());
             result.unresolved_references.push(unresolved_ref(
                 node_id,
@@ -148,6 +153,25 @@ impl<'a> MyBatisExtractor<'a> {
                 Language::Xml,
             ));
         }
+    }
+}
+
+/// Builds the `{namespace}::{id}` reference name a `<sql>` fragment node
+/// carries, from an `<include refid="…">` value (upstream #1209).
+///
+/// A bare `refid` is local to the enclosing mapper. A QUALIFIED `refid` names
+/// the owning namespace, and only its LAST dotted segment is the fragment id —
+/// the rest is the namespace, whose own dots are preserved, because that is
+/// exactly the `qualified_name` the fragment node stores
+/// (`com.example.UserMapper` + `::` + `baseColumns`). Rewriting every dot to
+/// `::` would produce a name no node carries, and dropping the namespace would
+/// let a same-`id` fragment in another namespace answer the include.
+fn qualify_refid(namespace: &str, refid: &str) -> String {
+    match refid.rsplit_once('.') {
+        Some((owner, fragment)) if !owner.is_empty() && !fragment.is_empty() => {
+            format!("{owner}::{fragment}")
+        }
+        _ => format!("{namespace}::{refid}"),
     }
 }
 

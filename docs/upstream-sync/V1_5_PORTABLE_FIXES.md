@@ -5600,3 +5600,314 @@ must be inside request cwd`); locked Cargo clippy/test is the honest fallback an
 no LSP-clean result is claimed. No dependency, version or `Cargo.lock` byte
 changed. No native Windows/MSVC runtime validation is claimed — everything above
 ran on Linux.
+
+## Batch D3 — both mapper dialects are recognized and a qualified `refid` keeps its namespace (2026-07-28)
+
+Ports upstream issues **#1182** (MyBatis/iBatis mapper forms) and **#1209**
+(qualified `<include refid>` resolution) as ONE commit: they share the single
+extractor `crates/codegraph-extract/src/embedded/mybatis.rs`, and the frozen
+manifest lists them as one row (`| #1182/#1209 | PORT | Batch D3 MyBatis/iBatis
+forms and qualified refids | none |`).
+
+Investigated first, then MEASURED against real indexed database state. BOTH
+halves were real defects — neither was already correct.
+
+### The located logic, quoted
+
+**Dialect detection** — `mybatis.rs:38-53` (pre-change). One literal root tag,
+and a hard-coded closing tag independent of it:
+
+```rust
+fn find_mapper_root(&self) -> Option<(String, usize, usize)> {
+    let open_re = Regex::new(r#"<mapper\b([^>]*)>"#).unwrap();
+    let ns_re = Regex::new(r#"\bnamespace\s*=\s*"([^"]+)""#).unwrap();
+    let open = open_re.find(self.source)?;
+    …
+    let body_end = self.source[body_start..]
+        .find("</mapper>")
+        .map_or(self.source.len(), |idx| body_start + idx);
+```
+
+`extract` calls it with `if let Some(…) = self.find_mapper_root()`, so a root
+that is not literally `<mapper` yields `None` and the whole mapper body is
+skipped — the file node is the only output.
+
+**`refid` matching** — `mybatis.rs:131-150` (pre-change). Any dot at all meant
+"rewrite every dot to `::`":
+
+```rust
+let ref_qualified = if refid.contains('.') {
+    refid.replace('.', "::")
+} else {
+    format!("{namespace}::{refid}")
+};
+```
+
+The nodes it must match are built at `mybatis.rs:95` as
+`let qualified = format!("{namespace}::{id}");` — the namespace keeps its OWN
+dots. So `com.example.UserMapper.baseColumns` became
+`com::example::UserMapper::baseColumns`, which no node carries.
+
+### The measured Red (SQLite ground truth, pre-change binary)
+
+Scratch project `/tmp/d3pre` — a MyBatis mapper with five statements (bare
+refid, self-qualified refid, foreign-namespace refid, a DECOY refid naming
+another namespace's same-`id` fragment, and an unresolvable refid), a second
+mapper owning the decoy, and an iBatis `<sqlMap>` file. Built from
+`crates/codegraph-extract/src/embedded/mybatis.rs` SHA-256
+`725e83497536a315463da4318dbd8417a50a0fde27d9117d32f7549e2fc9f0a4`.
+
+`select kind, name, qualified_name, start_line, end_line, file_path from nodes
+order by file_path, start_line;`
+
+```
+file|LegacySqlMap.xml|src/LegacySqlMap.xml|1|11|src/LegacySqlMap.xml
+file|OrderMapper.xml|src/OrderMapper.xml|1|10|src/OrderMapper.xml
+method|baseColumns|com.example.OrderMapper::baseColumns|3|5|src/OrderMapper.xml
+method|orderColumns|com.example.OrderMapper::orderColumns|6|8|src/OrderMapper.xml
+file|UserMapper.xml|src/UserMapper.xml|1|22|src/UserMapper.xml
+method|baseColumns|com.example.UserMapper::baseColumns|3|5|src/UserMapper.xml
+method|findLocal|com.example.UserMapper::findLocal|6|8|src/UserMapper.xml
+method|findQualified|com.example.UserMapper::findQualified|9|11|src/UserMapper.xml
+method|findCross|com.example.UserMapper::findCross|12|14|src/UserMapper.xml
+method|findDecoy|com.example.UserMapper::findDecoy|15|17|src/UserMapper.xml
+method|findMissing|com.example.UserMapper::findMissing|18|20|src/UserMapper.xml
+```
+
+RED #1 (#1182): `src/LegacySqlMap.xml` contributes ONLY a file node. Its
+`<sql id="legacyColumns">` and `<select id="legacySelect">` produce nothing —
+the iBatis form is invisible.
+
+`select kind, source, target, line from edges where kind!='contains' order by
+source;`
+
+```
+references|method:bf6ee95a109cb69fa818daa03aa4122e|method:828b1d45f6bc1f7b0562a33ab633f28a|7
+```
+
+RED #2 (#1209): exactly ONE include edge — the bare `refid` on line 7. All three
+namespace-qualified includes produce no edge at all.
+
+`select reference_name, line, file_path from unresolved_refs order by file_path,
+line;`
+
+```
+com::example::UserMapper::baseColumns|10|src/UserMapper.xml
+com::example::OrderMapper::orderColumns|13|src/UserMapper.xml
+com::example::OrderMapper::baseColumns|16|src/UserMapper.xml
+com::example::NopeMapper::baseColumns|19|src/UserMapper.xml
+```
+
+This is the direct proof of the mechanism: every qualified refid was rewritten to
+`com::example::…`, a name that matches no `qualified_name` in the graph, so all
+four stayed unresolved — including line 10, which names the fragment sitting three
+lines above it in the SAME file.
+
+### The Green (same fixtures, post-change binary)
+
+`crates/codegraph-extract/src/embedded/mybatis.rs` SHA-256
+`1550b1da1eaa6476c5b451e0f8b30aa2abe693eeccad70e08b4efa7d96f7f7ae`, scratch
+project `/tmp/d3post`, same sources.
+
+```
+file|LegacySqlMap.xml|src/LegacySqlMap.xml|1|11|src/LegacySqlMap.xml
+method|legacyColumns|Legacy::legacyColumns|4|6|src/LegacySqlMap.xml
+method|legacySelect|Legacy::legacySelect|7|9|src/LegacySqlMap.xml
+file|OrderMapper.xml|src/OrderMapper.xml|1|10|src/OrderMapper.xml
+method|baseColumns|com.example.OrderMapper::baseColumns|3|5|src/OrderMapper.xml
+method|orderColumns|com.example.OrderMapper::orderColumns|6|8|src/OrderMapper.xml
+file|UserMapper.xml|src/UserMapper.xml|1|22|src/UserMapper.xml
+method|baseColumns|com.example.UserMapper::baseColumns|3|5|src/UserMapper.xml
+method|findLocal|com.example.UserMapper::findLocal|6|8|src/UserMapper.xml
+method|findQualified|com.example.UserMapper::findQualified|9|11|src/UserMapper.xml
+method|findCross|com.example.UserMapper::findCross|12|14|src/UserMapper.xml
+method|findDecoy|com.example.UserMapper::findDecoy|15|17|src/UserMapper.xml
+method|findMissing|com.example.UserMapper::findMissing|18|20|src/UserMapper.xml
+```
+
+```
+references|method:45d8eacff46c2aeb1379cee54963b101|method:0b3a72ef37c2e01cfe46e661ff8f8df6|13
+references|method:bf6ee95a109cb69fa818daa03aa4122e|method:828b1d45f6bc1f7b0562a33ab633f28a|7
+references|method:c2ed2a8d2c281cada1850566cff7b94d|method:148f6dfc5ea8f4cef10862224874d23f|16
+references|method:d8364a506d91720a65866d24e14d1d03|method:376bcb423ecbaeef2d07eda51acfeb42|8
+references|method:d9d21bd0b97b87d2c1eff47088ee900a|method:828b1d45f6bc1f7b0562a33ab633f28a|10
+```
+
+```
+com.example.NopeMapper::baseColumns|19|src/UserMapper.xml
+```
+
+Read against the node table, each edge lands where it must:
+
+- line 7, bare `refid` → `method:828b1d45…` = `com.example.UserMapper::baseColumns`,
+  its OWN mapper's fragment, NOT the same-`id` decoy in OrderMapper.
+- line 10, self-qualified `refid` → the same `method:828b1d45…`. A bare refid and
+  the same fragment spelled out in full now name one node.
+- line 13, foreign `refid` → `method:0b3a72ef…` = `com.example.OrderMapper::orderColumns`,
+  crossing namespaces correctly.
+- line 16, the DECOY → `method:148f6dfc…` = `com.example.OrderMapper::baseColumns`.
+  The refid names OrderMapper, so OrderMapper's fragment wins over UserMapper's
+  identically-`id`'d one. A naive unqualified match cannot distinguish these two.
+- line 19, the unresolvable `refid` → **no edge**, and it stays in
+  `unresolved_refs`. It does NOT bind to either existing `baseColumns`. This
+  upholds the precedent already set by B1, C2 and A4: when the target cannot be
+  determined, emit NOTHING rather than guess among same-named candidates. A wrong
+  `include` edge is worse than a missing one.
+- `src/LegacySqlMap.xml` line 8 → `method:d8364a…` → `method:376bcb…`, the
+  iBatis fragment. The `<sqlMap>` file now contributes two method nodes
+  (`Legacy::legacyColumns`, `Legacy::legacySelect`) plus a working include.
+
+### Node-ID safety — explicit statement
+
+Node IDs are `{kind}:{sha256("{filePath}:{kind}:{name}:{line}").hex[:32]}` with
+`line` = `start_line`.
+
+**No `start_line` and no `name` changes for any node that existed before.** Diff
+the pre and post node tables above: every MyBatis node keeps its exact
+`start_line` and `name`, and the IDs are byte-identical across the two runs —
+`method:828b1d45f6bc1f7b0562a33ab633f28a`, `method:148f6dfc5ea8f4cef10862224874d23f`,
+`method:0b3a72ef37c2e01cfe46e661ff8f8df6`, `method:bf6ee95a109cb69fa818daa03aa4122e`,
+`method:45d8eacff46c2aeb1379cee54963b101`, `method:c2ed2a8d2c281cada1850566cff7b94d`,
+`method:9eb467f1b674a36bdd30b4585a09f0a9` all appear in BOTH runs.
+
+The dialect change only ADDS nodes, for `<sqlMap>` files that previously produced
+none, at their own real source lines. The refid change touches
+`unresolved_ref.reference_name` only — never a node's `name`, `start_line`, or
+kind. So this port is NOT golden-affecting, matching the frozen manifest's
+`none`.
+
+### Golden delta
+
+`GIT_MASTER=1 git diff --stat 1e1d259..HEAD -- reference/golden/` → **EMPTY**, as
+the manifest requires. No golden fixture was regenerated, and none needed to be:
+no golden corpus contains any `.xml` file (`find crates/codegraph-bench/fixtures
+-type f` yields extensions `c cfc cfm cfs cpp cu erl ets gd godot h hpp metal nix
+py rb sol tf ts tscn uid` — no `xml`), so the MyBatis extractor is not exercised
+by the equivalence oracle at all.
+`cargo test --locked -p codegraph-bench --test equivalence` → exit 0, **26/26**.
+
+### Tests added
+
+`crates/codegraph-extract/tests/embedded_languages.rs` (extraction shape):
+
+- `mybatis_accepts_the_ibatis_sqlmap_root_form` — the `<sqlMap>` fixture yields
+  its `<sql>`/`<select>`/`<update>` nodes on their real lines with
+  `Legacy.AccountMap::…` qualified names, plus a working bare-refid reference.
+- `mybatis_ignores_the_ibatis_sqlmapconfig_root` — `<sqlMapConfig>` (the iBatis
+  _config_ file, which declares no statements) must stay a file node only. The
+  fixture plants a stray `<select id="strayStatement">` inside it, so a root regex
+  without the word boundary would swallow the config as a statement map and
+  attribute that statement to it.
+- `mybatis_qualified_refid_keeps_its_namespace_and_only_splits_the_fragment_id` —
+  a qualified refid produces exactly the `{namespace}::{id}` a node carries; a
+  bare and a fully-written refid for the same fragment produce the SAME reference
+  name; no reference name starts with `com::example`.
+
+`crates/codegraph-resolve/tests/golden_resolution.rs` (end-to-end resolution
+through the real resolver):
+
+- `mybatis_qualified_refid_resolves_across_namespaces_and_rejects_the_decoy` —
+  asserts the resolved edge target node ID for each of the four cases: bare stays
+  home, foreign crosses over, the DECOY (a second `baseColumns` in another
+  namespace, asserted `assert_ne!` to be a genuinely different node) is picked by
+  namespace, and the unresolvable refid yields `None`.
+
+The resolve-side test needed `Some("xml") => Language::Xml` added to
+`resolve_fixture`'s extension map, which previously panicked on any non-listed
+extension.
+
+### Negative control, EXECUTED (three mutants, each reddening a DIFFERENT test)
+
+Each mutant is a change to `mybatis.rs` ONLY; no test was touched.
+
+1. **Dialect recognition reverted** (`<(mapper|sqlMap)\b…>` → `<(mapper)\b…>`,
+   i.e. the exact pre-#1182 root) →
+   `cargo test --locked -p codegraph-extract --test embedded_languages` →
+   **exit 101**, 1 failed —
+   `mybatis_accepts_the_ibatis_sqlmap_root_form`, and ONLY it:
+
+       panicked at crates/codegraph-extract/tests/embedded_languages.rs:264:13:
+       missing node kind=method name=legacyColumns; nodes=[
+           Node {
+               id: "file:a591d82f2d7e057a4033c2f6e60926d4",
+               kind: File,
+               name: "legacy_sqlmap.xml",
+               …
+           },
+       ]
+
+   (a single file node — the iBatis body is skipped entirely, reproducing RED #1).
+
+2. **Qualified-refid matching reverted** to the unqualified whole-string rewrite
+   (`refid.replace('.', "::")`, the exact pre-#1209 body) → reddens a DIFFERENT
+   test in each of the two suites:
+
+       panicked at crates/codegraph-extract/tests/embedded_languages.rs:278:13:
+       missing ref kind=references name=com.example.OrderMapper::orderColumns; refs=[
+           …
+           reference_name: "com::example::UserMapper::baseColumns",
+           line: 11,
+           …
+
+       panicked at crates/codegraph-resolve/tests/golden_resolution.rs:757:5:
+       assertion `left == right` failed: a qualified refid must cross into the named namespace; edges=[…]
+         left: None
+        right: Some("method:3165c21458b287c3528cdae44cbc71d4")
+
+   Both suites exit 101 with exactly 1 failure each, and neither is the test that
+   mutant 1 reddens — so a partial regression in either half cannot hide behind
+   the other.
+
+3. **Word boundary dropped** (`<(mapper|sqlMap)\b…>` → `<(mapper|sqlMap)…>`, the
+   tempting "looser is safer" design) → the two tests above still PASS, and it
+   reddens a THIRD test instead:
+
+       panicked at crates/codegraph-extract/tests/embedded_languages.rs:163:5:
+       assertion `left == right` failed: sqlMapConfig keeps only the file node; nodes=[…]
+         left: 2
+        right: 1
+
+   The extra node is the stray `<select>` inside `<sqlMapConfig>` — proof the
+   boundary is load-bearing, not decoration.
+
+Restored after each mutant by copying back the green file; restored SHA-256 of
+`crates/codegraph-extract/src/embedded/mybatis.rs`:
+`1550b1da1eaa6476c5b451e0f8b30aa2abe693eeccad70e08b4efa7d96f7f7ae`.
+Re-run with the fix restored → `embedded_languages` exit 0, 8 passed;
+`golden_resolution` exit 0, 13 passed.
+
+### Verification (actual exit statuses)
+
+- `bash scripts/check-workspace-versions.sh` → exit 0, run before every Cargo
+  batch; every Cargo command used `--locked`.
+- `cargo build --locked -p codegraph-rs` → exit 0 (the binary used for the
+  SQLite ground-truth measurements above, pre- and post-change; note the package
+  is `codegraph-rs`, not `codegraph-cli`).
+- `cargo test --locked -p codegraph-extract --test embedded_languages` → exit 0,
+  8 passed.
+- `cargo test --locked -p codegraph-resolve --test golden_resolution` → exit 0,
+  13 passed.
+- `cargo test --locked -p codegraph-bench --test equivalence` → exit 0, 26/26.
+- `make ci CARGO='cargo --locked'` → final gate, run after the last byte of this
+  commit (code, tests, fixtures, this prose, then `make fmt`); result recorded
+  below.
+- `sha256sum Cargo.lock` →
+  `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`, unchanged.
+
+Determinism: the change adds no map, no `HashMap` iteration and no new sort.
+Root detection is a single leftmost regex match; statement extraction still walks
+the body forward by byte offset; `qualify_refid` is a pure string split on the
+LAST dot. Cross-file fragment lookup is not performed in the extractor at all —
+it is the existing resolver's `match_by_qualified_name`, which already has a
+deterministic ordering rule, and the reference name this port hands it is
+identical for every run.
+
+The untracked `reference/golden/*/colby.db-{wal,shm}` files the equivalence
+oracle leaves behind were removed before staging; they are not gitignored and
+must never be committed.
+
+`lsp_diagnostics` was attempted and again refused this worktree (`LSP file path
+must be inside request cwd`); locked Cargo clippy/test is the honest fallback and
+no LSP-clean result is claimed. No dependency, version or `Cargo.lock` byte
+changed. No native Windows/MSVC runtime validation is claimed — everything above
+ran on Linux.

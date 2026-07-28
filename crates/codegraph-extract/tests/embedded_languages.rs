@@ -119,6 +119,105 @@ fn mybatis_extracts_mapper_methods_and_include_refs_on_original_lines() {
 }
 
 #[test]
+fn mybatis_accepts_the_ibatis_sqlmap_root_form() {
+    // Upstream #1182: the iBatis 2 `<sqlMap namespace="…">` root carries the same
+    // statement elements as MyBatis `<mapper>`; before this port the root regex
+    // only matched `<mapper`, so a `.xml` sqlMap produced ONLY a file node.
+    let result = extract_fixture("legacy_sqlmap.xml", Some(Language::Xml));
+    assert_no_errors(&result);
+
+    assert_node(&result, NodeKind::File, "legacy_sqlmap.xml", 1);
+    assert_node(&result, NodeKind::Method, "legacyColumns", 4);
+    assert_node(&result, NodeKind::Method, "legacySelect", 7);
+    assert_node(&result, NodeKind::Method, "legacyUpdate", 10);
+
+    let select = result
+        .nodes
+        .iter()
+        .find(|node| node.name == "legacySelect")
+        .expect("legacySelect node");
+    assert_eq!(select.qualified_name, "Legacy.AccountMap::legacySelect");
+    assert_ref(
+        &result,
+        EdgeKind::References,
+        "Legacy.AccountMap::legacyColumns",
+        8,
+    );
+}
+
+#[test]
+fn mybatis_ignores_the_ibatis_sqlmapconfig_root() {
+    // `<sqlMapConfig>` is the iBatis *config* file: it only points at the real
+    // statement maps, so the `\b` in the root regex must keep the `sqlMap` prefix
+    // of its name from being read as a statement-map root. The stray `<select>`
+    // is the hostile part: without the word boundary the config becomes a root
+    // whose body runs to EOF and that statement gets attributed to it.
+    let source = concat!(
+        "<sqlMapConfig namespace=\"Config\">\n",
+        "  <sqlMap resource=\"Legacy.xml\" />\n",
+        "  <select id=\"strayStatement\">SELECT 1</select>\n",
+        "</sqlMapConfig>\n",
+    );
+    let result = extract_source("sqlMapConfig.xml", source, Some(Language::Xml));
+    assert_no_errors(&result);
+    assert_eq!(
+        result.nodes.len(),
+        1,
+        "sqlMapConfig keeps only the file node; nodes={:#?}",
+        result.nodes
+    );
+    assert_eq!(result.nodes[0].kind, NodeKind::File);
+}
+
+#[test]
+fn mybatis_qualified_refid_keeps_its_namespace_and_only_splits_the_fragment_id() {
+    // Upstream #1209: a namespace-qualified `refid` must become the exact
+    // `{namespace}::{id}` the `<sql>` node carries — every dot BEFORE the last one
+    // belongs to the namespace. Rewriting them all to `::` produced
+    // `com::example::UserMapper::baseColumns`, a name no node has, so the include
+    // stayed unresolved.
+    let result = extract_fixture("qualified_mapper.xml", Some(Language::Xml));
+    assert_no_errors(&result);
+
+    assert_node(&result, NodeKind::Method, "baseColumns", 4);
+    assert_ref(
+        &result,
+        EdgeKind::References,
+        "com.example.UserMapper::baseColumns",
+        8,
+    );
+    assert_ref(
+        &result,
+        EdgeKind::References,
+        "com.example.OrderMapper::orderColumns",
+        14,
+    );
+
+    let bare = result
+        .unresolved_references
+        .iter()
+        .find(|reference| reference.line == 8)
+        .expect("bare refid on line 8");
+    let qualified = result
+        .unresolved_references
+        .iter()
+        .find(|reference| reference.line == 11)
+        .expect("qualified refid on line 11");
+    assert_eq!(
+        bare.reference_name, qualified.reference_name,
+        "a bare refid and the same fragment written out in full must name one node"
+    );
+    assert!(
+        !result
+            .unresolved_references
+            .iter()
+            .any(|reference| reference.reference_name.starts_with("com::example")),
+        "namespace dots must survive; refs={:#?}",
+        result.unresolved_references
+    );
+}
+
+#[test]
 fn astro_extracts_frontmatter_scripts_and_template_refs_on_original_lines() {
     // Mirrors upstream extraction/astro-extractor.ts:48-69,123-235.
     let result = extract_fixture("sample.astro", Some(Language::Astro));

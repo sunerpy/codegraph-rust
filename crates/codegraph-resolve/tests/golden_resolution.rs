@@ -124,6 +124,7 @@ fn resolve_fixture(test_name: &str, root: &Path, relative_files: &[&str]) -> Vec
             Some("java") => Language::Java,
             Some("cpp") => Language::Cpp,
             Some("php") => Language::Php,
+            Some("xml") => Language::Xml,
             other => panic!("unexpected fixture extension {other:?}"),
         };
         store
@@ -665,5 +666,106 @@ fn php_this_prop_interface_typed_resolves_via_conformance() {
     assert!(
         handle_call.is_some(),
         "expected run→Handler::handle conformance edge, got: {resolved:#?}"
+    );
+}
+
+#[test]
+fn mybatis_qualified_refid_resolves_across_namespaces_and_rejects_the_decoy() {
+    // #1209 end-to-end: an `<include refid="com.example.OrderMapper.orderColumns">`
+    // must reach the `<sql>` fragment in THAT namespace. The decoy is a second
+    // `baseColumns` fragment in OrderMapper carrying the same `id` as UserMapper's:
+    // a match on the bare id alone can pick either one, so the include that names
+    // OrderMapper explicitly must land on OrderMapper's node and the bare one must
+    // stay inside its own mapper.
+    let dir = fresh_fixture_dir("mybatis-qualified-refid");
+    std::fs::write(
+        dir.join("src/UserMapper.xml"),
+        concat!(
+            "<mapper namespace=\"com.example.UserMapper\">\n",
+            "  <sql id=\"baseColumns\">id, name</sql>\n",
+            "  <select id=\"findLocal\" resultType=\"User\">\n",
+            "    SELECT <include refid=\"baseColumns\"/> FROM users\n",
+            "  </select>\n",
+            "  <select id=\"findForeign\" resultType=\"User\">\n",
+            "    SELECT <include refid=\"com.example.OrderMapper.orderColumns\"/> FROM users\n",
+            "  </select>\n",
+            "  <select id=\"findDecoy\" resultType=\"User\">\n",
+            "    SELECT <include refid=\"com.example.OrderMapper.baseColumns\"/> FROM users\n",
+            "  </select>\n",
+            "  <select id=\"findMissing\" resultType=\"User\">\n",
+            "    SELECT <include refid=\"com.example.NopeMapper.baseColumns\"/> FROM users\n",
+            "  </select>\n",
+            "</mapper>\n",
+        ),
+    )
+    .expect("write UserMapper.xml");
+    std::fs::write(
+        dir.join("src/OrderMapper.xml"),
+        concat!(
+            "<mapper namespace=\"com.example.OrderMapper\">\n",
+            "  <sql id=\"baseColumns\">order_id, total</sql>\n",
+            "  <sql id=\"orderColumns\">order_id</sql>\n",
+            "</mapper>\n",
+        ),
+    )
+    .expect("write OrderMapper.xml");
+
+    let user = codegraph_extract::extract_file(&dir, "src/UserMapper.xml").expect("extract user");
+    let order =
+        codegraph_extract::extract_file(&dir, "src/OrderMapper.xml").expect("extract order");
+    let resolved = resolve_fixture(
+        "mybatis-qualified-refid",
+        &dir,
+        &["src/OrderMapper.xml", "src/UserMapper.xml"],
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let node_id = |result: &codegraph_core::types::ExtractionResult, qualified: &str| -> String {
+        result
+            .nodes
+            .iter()
+            .find(|n| n.qualified_name == qualified)
+            .unwrap_or_else(|| panic!("missing node {qualified}; nodes={:#?}", result.nodes))
+            .id
+            .clone()
+    };
+    let user_base = node_id(&user, "com.example.UserMapper::baseColumns");
+    let order_base = node_id(&order, "com.example.OrderMapper::baseColumns");
+    let order_columns = node_id(&order, "com.example.OrderMapper::orderColumns");
+    let find_local = node_id(&user, "com.example.UserMapper::findLocal");
+    let find_foreign = node_id(&user, "com.example.UserMapper::findForeign");
+    let find_decoy = node_id(&user, "com.example.UserMapper::findDecoy");
+    let find_missing = node_id(&user, "com.example.UserMapper::findMissing");
+    assert_ne!(
+        user_base, order_base,
+        "the decoy must be a genuinely different node than UserMapper's fragment"
+    );
+
+    let target_of = |source: &str| -> Option<String> {
+        resolved
+            .iter()
+            .find(|e| e.kind == codegraph_core::types::EdgeKind::References && e.source == source)
+            .map(|e| e.target.clone())
+    };
+
+    assert_eq!(
+        target_of(&find_local).as_deref(),
+        Some(user_base.as_str()),
+        "a bare refid stays inside its own mapper, not the same-id decoy; edges={resolved:#?}"
+    );
+    assert_eq!(
+        target_of(&find_foreign).as_deref(),
+        Some(order_columns.as_str()),
+        "a qualified refid must cross into the named namespace; edges={resolved:#?}"
+    );
+    assert_eq!(
+        target_of(&find_decoy).as_deref(),
+        Some(order_base.as_str()),
+        "the qualified refid names OrderMapper, so the OrderMapper fragment wins over the same-id UserMapper one; edges={resolved:#?}"
+    );
+    assert_eq!(
+        target_of(&find_missing),
+        None,
+        "a refid naming a namespace that does not exist must emit NO edge rather than binding an arbitrary same-named fragment; edges={resolved:#?}"
     );
 }

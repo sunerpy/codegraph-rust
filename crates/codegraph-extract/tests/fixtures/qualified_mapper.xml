@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.example.UserMapper">
+  <sql id="baseColumns">
+    id, name
+  </sql>
+  <select id="findLocal" resultType="User">
+    SELECT <include refid="baseColumns"/> FROM users
+  </select>
+  <select id="findSelfQualified" resultType="User">
+    SELECT <include refid="com.example.UserMapper.baseColumns"/> FROM users
+  </select>
+  <select id="findForeign" resultType="User">
+    SELECT <include refid="com.example.OrderMapper.orderColumns"/> FROM users
+  </select>
+</mapper>
