@@ -450,6 +450,41 @@ impl Store {
         rows.collect()
     }
 
+    /// Callable definitions whose name CONTAINS `needle` as a substring, fetched
+    /// as a SEPARATE batch from the FTS/LIKE ladder (upstream `1de7e8f` #1319
+    /// "kind whitelist" — hot single-word terms must not crowd definers out of
+    /// the length-ordered batch).
+    ///
+    /// `needle` is matched lowercase against both `lower(name)` and its
+    /// separator-stripped form, so a `user_profile_id` query reaches a
+    /// `userProfileId`-humped name and a `userProfileId` query reaches a
+    /// `user_profile_id`-separated one. Substring containment is only the
+    /// CANDIDATE gate; the caller still applies the segment-boundary filter, so
+    /// an incidental namesake never becomes a match. `ORDER BY` is fully
+    /// specified — shortest name first, then name/path/line — so the candidate
+    /// order never depends on SQLite's incidental row order.
+    pub fn callable_nodes_by_name_infix(
+        &self,
+        needle: &str,
+        limit: i64,
+    ) -> rusqlite::Result<Vec<Node>> {
+        let pattern = format!("%{}%", needle.to_lowercase());
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT * FROM nodes
+            WHERE kind IN ('function', 'method', 'component')
+              AND (
+                lower(name) LIKE ?
+                OR replace(replace(replace(lower(name), '_', ''), '-', ''), '.', '') LIKE ?
+              )
+            ORDER BY length(name) ASC, name ASC, file_path ASC, start_line ASC
+            LIMIT ?
+            "#,
+        )?;
+        let rows = stmt.query_map(params![pattern, pattern, limit], row_to_node)?;
+        rows.collect()
+    }
+
     /// Ports `getAllNodeNames` from `upstream db/queries.ts:1655-1661`.
     /// `SELECT DISTINCT name FROM nodes` — the candidate name set for fuzzy fallback.
     pub fn all_node_names(&self) -> rusqlite::Result<Vec<String>> {
@@ -2122,6 +2157,54 @@ mod tests {
         let mut names = store.all_node_names().unwrap();
         names.sort();
         assert_eq!(names, vec!["shared".to_string(), "unique".to_string()]);
+    }
+
+    #[test]
+    fn callable_infix_returns_callables_only_shortest_first_and_folds_separators() {
+        let mut store = store("callable-infix");
+        let mut cls = node("class:holder", "UserProfileIdHolder", "src/holder.rs");
+        cls.kind = NodeKind::Class;
+        let mut var = node("variable:v", "userProfileId", "src/var.rs");
+        var.kind = NodeKind::Variable;
+        store
+            .upsert_nodes(&[
+                node("function:long", "updateUserProfileIdMapping", "src/b.rs"),
+                node("function:short", "userProfileId2", "src/a.rs"),
+                node("function:snake", "read_user_profile_id", "src/c.rs"),
+                node("function:other", "unrelated", "src/d.rs"),
+                cls,
+                var,
+            ])
+            .unwrap();
+
+        let hits = store
+            .callable_nodes_by_name_infix("userprofileid", 50)
+            .unwrap();
+        let names: Vec<&str> = hits.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "userProfileId2",
+                "read_user_profile_id",
+                "updateUserProfileIdMapping"
+            ],
+            "callables only, shortest name first; the separator-stripped form matches snake_case"
+        );
+
+        assert!(
+            store
+                .callable_nodes_by_name_infix("userprofileid", 1)
+                .unwrap()
+                .len()
+                == 1,
+            "the limit is honoured"
+        );
+        assert!(
+            store
+                .callable_nodes_by_name_infix("nosuchneedle", 50)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

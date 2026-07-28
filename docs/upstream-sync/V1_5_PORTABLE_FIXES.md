@@ -4720,3 +4720,160 @@ clippy follow-up below), and with the fix re-applied the same command → exit 0
 honest fallback and no LSP-clean result is claimed. No dependency, version or
 `Cargo.lock` byte changed. No Windows/MSVC runtime validation is claimed — this
 work ran on Linux only.
+
+---
+
+## Batch A2 — multi-hump field-name queries reach their definers (2026-07-28)
+
+Ports upstream `1de7e8f` (#1319). Base for this entry: `8c80331` (Batch A1). One
+commit: a new store query, the query-layer seeding pass that consumes it, and a
+CLI integration test.
+
+### Red (documented, with the actual wrong output)
+
+New test `crates/codegraph-cli/tests/multi_hump_query_cli.rs`, driving the REAL
+binary (`init`, then `query --json`). The fixture holds, per query shape, three
+files:
+
+- the DEFINER `src/profileController.js` — `getProfileInfoV2`,
+  `updateUserProfileIdMapping`, `loadOrderStateSnapshot`;
+- a PROSE decoy `src/prose_decoy.js` — a constant whose signature/docstring
+  merely MENTIONS the words (`const NOTES = "profileInfo userProfileId …"`);
+- a NAME decoy `src/name_decoy.js` — callables whose lowercase names CONTAIN the
+  query run at NO segment boundary (`xxprofileinfoxx`, `xxuserprofileidxx`,
+  `xxorderstatexx`). This is the required decoy: a naive `LIKE %needle%` binds
+  to it, and would do so with a SHORTER name, i.e. it would win.
+
+`cargo test --locked -p codegraph-rs --test multi_hump_query_cli` → exit 101.
+Verbatim:
+
+```text
+multi-hump field-name queries must reach their definers:
+query "profileInfo": definer getProfileInfoV2 ABSENT; ranking was [("NOTES", "src/prose_decoy.js")]
+query "profile_info": definer getProfileInfoV2 ABSENT; ranking was [("NOTES", "src/prose_decoy.js")]
+query "ProfileInfo": definer getProfileInfoV2 ABSENT; ranking was [("NOTES", "src/prose_decoy.js")]
+query "userProfileId": definer updateUserProfileIdMapping ABSENT; ranking was [("NOTES", "src/prose_decoy.js")]
+query "user_profile_id": definer updateUserProfileIdMapping ABSENT; ranking was []
+query "orderState": definer loadOrderStateSnapshot ABSENT; ranking was [("NOTES", "src/prose_decoy.js")]
+```
+
+The definer was not merely mis-ranked, it was ABSENT: FTS5 matches whole tokens
+with a trailing prefix, so `"userProfileId"*` matches the STRING inside `NOTES`
+but never the INFIX inside `updateUserProfileIdMapping`. `user_profile_id`
+returned nothing at all. Ground truth from `sqlite3`, confirming the definers
+were in the index the whole time:
+
+```text
+sqlite> select nodes.name, nodes.file_path from nodes_fts join nodes
+        on nodes_fts.id=nodes.id where nodes_fts match '"profileInfo"*';
+NOTES|src/unrelated.js
+
+sqlite> select kind,name,file_path from nodes where lower(name) like '%userprofileid%';
+function|xxuserprofileidxx|src/name_decoy.js
+function|updateUserProfileIdMapping|src/profileController.js
+```
+
+That second row pair is exactly why substring containment alone is NOT the fix.
+
+### Green (minimal)
+
+Three pieces, no new dependency, no schema change:
+
+1. `crates/codegraph-store/src/queries.rs` — new
+   `callable_nodes_by_name_infix(needle, limit)`: callables only
+   (`function`/`method`/`component`, upstream's "kind whitelist" so hot
+   single-word terms can't crowd definers out of the length-ordered batch),
+   matching `lower(name) LIKE %needle%` OR the separator-stripped form (so
+   `user_profile_id` reaches `userProfileId` and vice-versa), ordered
+   `length(name), name, file_path, start_line` — fully specified, never
+   SQLite's incidental row order.
+2. `crates/codegraph-graph/src/query/scoring.rs` — `identifier_segments`,
+   `is_multi_segment_identifier`, `name_segments_contain_run`: the hump/acronym/
+   separator splitter and the CONTIGUOUS-segment-run filter.
+3. `crates/codegraph-graph/src/query/mod.rs` — `seed_multi_segment_definers`,
+   called after the exact-name supplement and before rescoring. It fires ONLY
+   for a multi-segment token that is not already an exact symbol name
+   (`nodes_by_lower_name` empty), caps candidates at 50 and seeds at most 3 per
+   token, and admits a candidate only when its own segments contain the query's
+   segment run contiguously.
+
+The boundary filter is what rejects `xxprofileinfoxx`: following the accepted
+Batch C precedent, when a candidate cannot be shown to DEFINE the queried field,
+nothing is emitted rather than a guess. A silent miss beats a wrong answer.
+
+### A rejected first attempt, recorded
+
+The first Green also added `.then_with(|| a.node.id.cmp(&b.node.id))` as a
+tie-break in `sort_by_score_desc`. That made
+`cargo test --locked -p codegraph-graph` fail (exit 101) on the pre-existing
+golden search oracle:
+
+```text
+case `filter_only_kind_method` query `kind:method`: id ordering mismatch
+ got:  [3c01f33…, 89ae38f0…, d9785bc2…, f501ba98…]
+ want: [d9785bc2…, 3c01f33…, f501ba98…, 89ae38f0…]
+```
+
+All four score exactly `11`, and the golden order is the upstream's
+`ORDER BY name` (`__init__`, `greet`, `increment`, `value`) preserved by Rust's
+STABLE sort. An id tie-break would have replaced a meaningful order with a hash
+order. The tie-break was REVERTED; determinism is instead guaranteed by the
+fully-specified `ORDER BY` in the new store query plus the existing stable sort,
+and is asserted by `multi_hump_ranking_is_deterministic_across_repeated_queries`.
+The golden was NOT touched.
+
+### Golden row delta
+
+None. `git diff --stat 29f635b..HEAD -- reference/golden/` → EMPTY;
+`git status --short reference/golden/` → empty.
+`cargo test --locked -p codegraph-bench --test equivalence` → exit 0,
+**26 passed, 0 failed**.
+
+### Negative control, EXECUTED
+
+`git stash push` of the three production files (test kept) →
+`cargo test --locked -p codegraph-rs --test multi_hump_query_cli` → exit 101,
+exactly the six Red lines above. `git stash pop` restored them; restored SHA-256:
+
+- `crates/codegraph-graph/src/query/mod.rs`
+  `fed17893c2ea1f1ff6c7778bf06f0742c08a1bb82cb0002742e3f213ba5dcadd`
+- `crates/codegraph-graph/src/query/scoring.rs`
+  `af689c1df8224cb11909bd33048a798bdf34345e438d9e75b89ce424314e32bb`
+- `crates/codegraph-store/src/queries.rs`
+  `2b499860f476cdb1cb7245504928b4c78790aa7a2bf8cdd4bb5e63f18b39d2d2`
+
+With the fix re-applied the same command → exit 0, 4 passed.
+
+### Post-fix behaviour on the real binary
+
+```text
+$ codegraph query "profileInfo" --json
+  39.000 function getProfileInfoV2           src/profileController.js
+   4.736 constant NOTES                      src/unrelated.js
+$ codegraph query "user_profile_id" --json
+  39.000 function updateUserProfileIdMapping src/profileController.js
+```
+
+The name decoys are absent from both.
+
+### Verification (actual exit statuses)
+
+- `bash scripts/check-workspace-versions.sh` → exit 0, before every Cargo batch;
+  every Cargo command used `--locked`.
+- `cargo clippy --locked --workspace --all-targets -- -D warnings` → **first
+  attempt exit 101** (`doc_lazy_continuation` on the new test's module doc list);
+  a blank `//!` line was added and re-run → exit 0.
+- `cargo test --locked -p codegraph-rs --test multi_hump_query_cli` → exit 0,
+  4 passed.
+- `cargo test --locked -p codegraph-store --lib callable_infix…` → exit 0.
+- `cargo test --locked -p codegraph-graph --lib identifier_segments…` → exit 0.
+- `cargo test --locked -p codegraph-graph -p codegraph-store -p codegraph-mcp`
+  → exit 0 (after the tie-break revert above).
+- `cargo test --locked -p codegraph-rs --test multi_hump_query_cli --test
+unicode_search_cli --test explore_node_cli --test cli_commands` → exit 0.
+- `cargo test --locked -p codegraph-bench --test equivalence` → exit 0, 26/26.
+
+`lsp_diagnostics` again refused this worktree (`LSP file path must be inside
+request cwd`); locked Cargo clippy/test is the honest fallback and no LSP-clean
+result is claimed. No dependency, version or `Cargo.lock` byte changed. No
+Windows/MSVC runtime validation is claimed — this work ran on Linux only.
