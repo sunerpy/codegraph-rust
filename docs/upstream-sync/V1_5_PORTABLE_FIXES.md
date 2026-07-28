@@ -4877,3 +4877,121 @@ unicode_search_cli --test explore_node_cli --test cli_commands` → exit 0.
 request cwd`); locked Cargo clippy/test is the honest fallback and no LSP-clean
 result is claimed. No dependency, version or `Cargo.lock` byte changed. No
 Windows/MSVC runtime validation is claimed — this work ran on Linux only.
+
+---
+
+## Batch A3 — `find_path` enqueues each work item exactly once, and a test can prove it (2026-07-28)
+
+Ports upstream issue #1359. Base for this entry: `b20260ae` (Batch A2). One
+commit, `codegraph-graph` traversal only.
+
+### The defect, quoted verbatim from the pre-fix source
+
+`crates/codegraph-graph/src/graph/mod.rs`, `find_path`:
+
+```rust
+let mut visited = HashSet::new();
+...
+    if visited.contains(&node_id) { continue; }
+    visited.insert(node_id.clone());
+...
+    for edge in outgoing {
+        if !visited.contains(&edge.target)
+            && let Some(next_node) = next_nodes.get(&edge.target)
+        {
+            let mut next_path = path.clone();
+            ...
+            queue.push_back((edge.target.clone(), next_path));
+        }
+    }
+```
+
+`visited` is inserted at DEQUEUE, so it cannot stop a fan-in layer from pushing
+the same target once per predecessor. `traverse_bfs` in the same file already
+carries the separate enqueue-once guard from #1090 (`unvisited_neighbor_ids` +
+the per-insertion check); `find_path` never got it. Each redundant push also
+clones the whole `Vec<PathStep>`, so wasted work and peak memory scale with EDGE
+count rather than node count.
+
+The shortest path stays correct — duplicates are dropped at dequeue — so the
+defect is INVISIBLE from `find_path`'s return value. That is why the
+instrumentation is part of the fix.
+
+### Green (minimal)
+
+- New `PathSearchStats { enqueued, dequeued, duplicate_dequeues }` and
+  `find_path_instrumented`, which returns the path AND the queue accounting.
+  `find_path` is now a thin wrapper over it, so its signature and behaviour for
+  every existing caller are unchanged.
+- An `enqueued: HashSet<String>` seeded with `from_id`, consulted in BOTH the
+  `want_ids` prefilter and the per-edge push condition, and inserted at push
+  time — mirroring `traverse_bfs`'s #1090 shape.
+
+Counters live in the instrumented function only; no logging was added, so the
+contract is assertable from a test rather than eyeballed in output.
+
+### Red (documented, with the actual wrong output)
+
+New test `crates/codegraph-graph/tests/enqueue_once.rs` (4 tests). Red was
+produced by stripping ONLY the guard (seeding `enqueued` empty, dropping both
+checks and the insert) while KEEPING the instrumentation seam, so the failure is
+a real assertion on real counts, not a compile error:
+
+```text
+running 4 tests
+test find_path_does_not_re_enqueue_a_shared_successor_in_a_diamond ... FAILED
+test find_path_enqueues_each_work_item_exactly_once_over_a_fan_in_hub ... FAILED
+
+assertion `left == right` failed: a, b, c, d, e — `d` is reachable from both b
+and c but must be enqueued ONCE: PathSearchStats { enqueued: 6, dequeued: 6,
+duplicate_dequeues: 1 }
+  left: 6
+ right: 5
+
+each work item must be enqueued at most once: enqueued 74 for 18 reachable
+nodes (fan-in edges: 73) — stats PathSearchStats { enqueued: 74, dequeued: 74,
+duplicate_dequeues: 56 }
+```
+
+`74` pushes for `18` reachable nodes — the count tracked the 73 fan-in edges, exactly
+the quadratic the issue describes. With the guard restored: `18` pushes,
+`0` duplicate dequeues (`cargo test --locked -p codegraph-graph --test
+enqueue_once` → exit 0, 4 passed).
+
+The other two tests pin what must NOT change and passed both ways: the shortest
+of two routes still wins, an unreachable target still reports no path, and a
+3-cycle still terminates with exactly 3 pushes.
+
+### Golden row delta
+
+None. `git diff --stat 29f635b..HEAD -- reference/golden/` → EMPTY.
+`cargo test --locked -p codegraph-bench --test equivalence` → exit 0,
+**26 passed, 0 failed**. The oracle run left two untracked SQLite byproducts
+(`reference/golden/metal/colby.db-{wal,shm}`), not gitignored; deleted before
+staging. No tracked golden changed.
+
+### Negative control, EXECUTED
+
+The guard-strip above IS the negative control, run in both directions: guard
+removed → exit 101 with the two assertions quoted verbatim; guard restored from
+the saved copy → exit 0, 4 passed. Restored-file SHA-256 of
+`crates/codegraph-graph/src/graph/mod.rs`:
+`0a0a1d93dd1c5dd39f305c0c37ef66327791e547d5fbae46763ac06495c87c57`
+(measured with `sha256sum` after the restore).
+
+### Verification (actual exit statuses)
+
+- `bash scripts/check-workspace-versions.sh` → exit 0, before every Cargo batch;
+  every Cargo command used `--locked`.
+- `cargo build --locked -p codegraph-graph --all-targets` → exit 0.
+- `cargo clippy --locked --workspace --all-targets -- -D warnings` → exit 0.
+- `cargo test --locked -p codegraph-graph --test enqueue_once` → exit 0,
+  4 passed.
+- `cargo test --locked -p codegraph-graph -p codegraph-mcp -p codegraph-rs`
+  → exit 0 (63 `test result: ok` lines, no FAILED).
+- `cargo test --locked -p codegraph-bench --test equivalence` → exit 0, 26/26.
+
+`lsp_diagnostics` again refused this worktree (`LSP file path must be inside
+request cwd`); locked Cargo clippy/test is the honest fallback and no LSP-clean
+result is claimed. No dependency, version or `Cargo.lock` byte changed. No
+Windows/MSVC runtime validation is claimed — this work ran on Linux only.
