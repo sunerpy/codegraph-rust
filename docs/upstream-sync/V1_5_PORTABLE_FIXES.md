@@ -6173,3 +6173,263 @@ must be inside request cwd`); no LSP-clean result is claimed. The changed files
 are shell, PowerShell and YAML, which the Rust toolchain does not lint anyway —
 the honest checks for them are the executable harness, the YAML parse, and the
 replayed workflow step above.
+
+## Batch E1 — `KNOWN_DIFFS.md` becomes an executable, fail-closed oracle (2026-07-28)
+
+### The defect, in three layers
+
+`docs/upstream-sync/KNOWN_DIFFS.md` opened by claiming it "is parsed by
+`codegraph-bench::oracle::diff::KnownDiffs`". It was not. Three independent
+layers, each confirmed by reading the code at `ecd3641`:
+
+1. **The oracle was never wired.** `grep -rn "KnownDiffs::load" crates/` → exit
+   **1**, ZERO hits. The only `KNOWN_DIFFS` mention in the crate was a string
+   literal in an error message (`diff.rs:131`). `diff_canonical` applies the
+   allowlist (`entries.retain(|entry| !known_diffs.allows(entry))`), but EVERY
+   call site passed `None`: 18 in `crates/codegraph-bench/tests/equivalence.rs`,
+   one in `oracle/mod.rs::assert_equivalent`, plus the sites in
+   `crates/codegraph-cli/tests/{batch_m_outdated_migration,sync_incremental,
+parallel_index,godot_idfields_determinism}.rs`. The document had never
+   influenced a single decision.
+2. **`parse_rule` was not fail-closed.** `tier=1` / `tier=2` PARSED fine and were
+   discarded only later by `allows()` (`if entry.tier != Tier::Tier3 { return
+false }`), so the document's promise that Tier-1/Tier-2 are "never
+   allowlisted" held by downstream accident, not at parse time. A token lacking
+   `=` was silently dropped, so `RULE garbage tier=3 surface=nodes key=*
+justification=x` parsed clean. An unknown field name (`surfce=nodes`) was
+   dropped the same way. `fields` is a `BTreeMap`, so a duplicate field silently
+   kept the last occurrence.
+3. **`diff.rs` had NO `mod tests`.** `grep -c "mod tests"
+crates/codegraph-bench/src/oracle/diff.rs` → **0**. Nothing pinned "No Tier-3
+   rules are active yet."
+
+### A fourth layer the fail-closed parser exposed
+
+Wiring the parser to the REAL document immediately reddened, before any mutation:
+
+```text
+/…/docs/upstream-sync/KNOWN_DIFFS.md must parse: parsing KNOWN_DIFFS.md line 12:
+RULE tier=3 surface=<surface> key=<substring-or-*> justification=<short-token>:
+unknown surface <surface>; the differ reports ["nodes", "files", "schema", "edges",
+"unresolved_refs"]
+```
+
+Line 12 is the `RULE` TEMPLATE inside the "Rule format" ``text fence. The old
+parser accepted it as an ACTIVE Tier-3 rule with surface `<surface>` — an
+allowlist entry nobody wrote on purpose, inert only because that placeholder
+surface never matches a real diff. Had anyone ever passed `Some(&known_diffs)`,
+the committed document would have carried one bogus rule. Fix: `parse` now
+tracks ``-fences and skips their contents, and BAILS on an unterminated fence
+(otherwise every RULE after it would be silently skipped — the same
+silent-inertness failure in the other direction). A test pins that a rule AFTER
+a closed fence is still active, so fence tracking cannot degrade into "ignore
+everything".
+
+### What was wired, and where
+
+- `KnownDiffs::repo_doc_path()` resolves `docs/upstream-sync/KNOWN_DIFFS.md` from
+  `CARGO_MANIFEST_DIR`; `KnownDiffs::load_repo_doc()` parses it;
+  `KnownDiffs::rule_count()` exposes the active-rule count for pinning.
+- `oracle::mod::assert_equivalent` now loads the committed document and passes
+  `Some(&known_diffs)`. The load happens BEFORE any comparison, so an
+  unparseable file FAILS the assertion instead of being ignored. All 14
+  `assert_equivalent` golden tests therefore now adjudicate through the real
+  document.
+- `assert_equivalent_with_known_diffs(rust_db, golden_dir, known_diffs_path)` is
+  the injectable seam, used by the negative test that feeds a deliberately
+  invalid allowlist.
+- The `diff_canonical(..., None)` call sites were left alone on purpose: those
+  compare two RUST runs against each other (sync vs `index --force`, run-to-run
+  determinism, migration vs rebuild). An upstream-difference allowlist has no
+  business softening a self-consistency check, so they stay strict.
+
+### Fail-closed decisions, each justified
+
+| Rejection                                      | Silently-broken rule it prevents                                                                                                                                                                                               |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `tier=1` / `tier=2` rejected **at parse time** | The promise that Tier-1/Tier-2 are never allowlisted was enforced only downstream in `allows()`; a reader of a `tier=1` line had no way to know it was inert.                                                                  |
+| token without `=`                              | `RULE garbage tier=3 …` parsed clean; the garbage token was dropped.                                                                                                                                                           |
+| unknown field name                             | `surfce=nodes` was dropped, so the rule fell through to "missing surface" or a stale value.                                                                                                                                    |
+| duplicate field                                | Two contradictory `key=` values resolved by `BTreeMap` insertion position alone.                                                                                                                                               |
+| empty key or value                             | `=nodes` / `surface=` produced a rule with an empty component.                                                                                                                                                                 |
+| `surface=` outside the differ's surfaces       | An inert typo'd rule is worse than a loud error: it sits in the document looking like an active, reviewed decision while allowing nothing. A loud error is fixed in one commit; an inert rule can mislead for a release cycle. |
+| unterminated ```-fence                         | Every RULE after it would be silently skipped.                                                                                                                                                                                 |
+
+The `DIFF_SURFACES` whitelist `["nodes", "files", "schema", "edges",
+"unresolved_refs"]` was ENUMERATED from the actual `compare_*` call sites in
+`diff_canonical` (`compare_tier1_rows` for nodes/files, `compare_schema` for
+schema, `compare_tier2_rows` for edges/unresolved_refs) — not guessed. A test
+asserts every one of the five is accepted, so the whitelist cannot drift out of
+sync with the differ without reddening.
+
+`Tier` keeps all three variants: a `DiffEntry` genuinely carries any tier
+(`diff_canonical` mints Tier-1 and Tier-2 entries today). The asymmetry — only
+Tier-3 may appear on a RULE line, only a Tier-3 entry can be allowed — is now
+documented on the enum and enforced in both `parse_rule` and `allows`.
+
+### Two-direction proof
+
+The entire risk of E1 is that wiring a previously-inert allowlist into golden
+adjudication waves a real difference through. Both directions are pinned:
+
+- ALLOWS: `tier3_rule_allows_its_matching_tier3_diff` — the Tier-3 rule
+  (`surface=nodes key=alpha`) allows a Tier-3 `nodes` entry with key
+  `function:alpha`.
+- DOES NOT ALLOW, four ways: `..._does_not_allow_a_different_surface` (`edges`),
+  `..._does_not_allow_a_non_matching_key` (`function:beta`),
+  `..._does_not_allow_the_same_key_at_tier1`, `..._does_not_allow_the_same_key_at_tier2`.
+- `wildcard_rule_never_allows_a_tier1_golden_difference` — even `key=*` allows
+  only the Tier-3 entry and never the Tier-1 one.
+- `tier1_entries_survive_the_allowlist_in_diff_canonical` — end-to-end through
+  `diff_canonical` with a `key=*` rule loaded: an injected Tier-1 node drift is
+  still reported. This is the assertion that matters most, since it exercises the
+  exact retain() the wiring turned on.
+
+### The zero-rules pin
+
+Two tests pin that the committed document has ZERO active Tier-3 rules:
+`oracle::diff::tests::committed_known_diffs_doc_parses_and_has_zero_active_rules`
+(unit) and `committed_known_diffs_doc_is_parsed_and_allowlists_nothing`
+(integration, next to the golden tests it protects). No Tier-3 rule was added to
+the document to exercise the mechanism — every rule in this commit lives in test
+strings. A future silent allowlist addition now fails CI in both places.
+
+### Unasserted prose — stated plainly
+
+`KNOWN_DIFFS.md` is mostly PROSE, and this commit does NOT make it executable.
+The deferred-colby-resolver list, the canonicalized-timestamp note
+(`nodes.updated_at`, `files.modified_at`, `files.indexed_at` — stripped in
+`canonicalize.rs`, never compared), the Dart/Pascal function_ref notes, and the
+Task-22 MCP text-formatting section remain unasserted documentation. That is
+acceptable and intentional: they are not allowlist rules and were never claimed
+to be. They describe behavior OUTSIDE the five SQLite surfaces the oracle
+compares (deferred resolution paths that no golden fixture exercises, timestamps
+removed before comparison, MCP text output the oracle does not read). Turning
+them into machine-checked assertions would require new fixtures and new
+comparison surfaces — out of scope for E1. What E1 makes executable is exactly
+the RULE grammar and the active-rule set; the prose is still prose.
+
+### Negative control — three mutants, three disjoint red sets
+
+Green baseline: lib **29 passed**, `--test equivalence` **28 passed**.
+
+1. **Restore `tier=1|2` acceptance** (`parse_rule` maps them back to
+   `Tier::Tier1` / `Tier::Tier2` instead of bailing):
+
+   ```text
+   ---- oracle::diff::tests::invalid_known_diffs_file_fails_to_load stdout ----
+   panicked at crates/codegraph-bench/src/oracle/diff.rs:626:63:
+   must fail: KnownDiffs { rules: [KnownDiffRule { tier: Tier1, surface: "nodes",
+   key_pattern: "*", justification: "sneaky" }] }
+
+   ---- oracle::diff::tests::tier1_and_tier2_rules_are_rejected_at_parse_time stdout ----
+   panicked at crates/codegraph-bench/src/oracle/diff.rs:443:45:
+   rule must be rejected: KnownDiffs { rules: [KnownDiffRule { tier: Tier1,
+   surface: "nodes", key_pattern: "*", justification: "must-not-be-allowed" }] }
+
+   test result: FAILED. 27 passed; 2 failed        (lib)
+   ```
+
+   and in the integration test:
+
+   ```text
+   ---- an_unparseable_known_diffs_file_fails_the_equivalence_assertion stdout ----
+   panicked at crates/codegraph-bench/tests/equivalence.rs:29:10:
+   an invalid allowlist must fail, not be ignored: ()
+
+   test result: FAILED. 27 passed; 1 failed        (equivalence)
+   ```
+
+2. **Make `allows()` ignore `surface`** (drop `rule.surface == entry.surface`):
+
+   ```text
+   ---- oracle::diff::tests::tier3_rule_does_not_allow_a_different_surface stdout ----
+   panicked at crates/codegraph-bench/src/oracle/diff.rs:457:9:
+   assertion failed: !known.allows(&tier3_entry("edges", "function:alpha"))
+
+   test result: FAILED. 28 passed; 1 failed        (lib)
+   test result: ok. 28 passed                       (equivalence — untouched)
+   ```
+
+3. **Remove the load wiring** (`assert_equivalent_with_known_diffs` uses
+   `KnownDiffs::default()` and ignores the path):
+
+   ```text
+   ---- an_unparseable_known_diffs_file_fails_the_equivalence_assertion stdout ----
+   panicked at crates/codegraph-bench/tests/equivalence.rs:29:10:
+   an invalid allowlist must fail, not be ignored: ()
+
+   test result: FAILED. 27 passed; 1 failed        (equivalence)
+   test result: ok. 29 passed                       (lib — untouched)
+   ```
+
+4. **Add a Tier-3 rule to the committed document** (`RULE tier=3 surface=nodes
+key=* justification=silently-added` appended to `KNOWN_DIFFS.md`) — the
+   scenario the pin exists for:
+
+   ```text
+   ---- oracle::diff::tests::committed_known_diffs_doc_parses_and_has_zero_active_rules stdout ----
+   panicked at crates/codegraph-bench/src/oracle/diff.rs:600:9:
+   assertion `left == right` failed: /…/KNOWN_DIFFS.md must have zero active
+   Tier-3 rules; adding one silently widens golden adjudication
+     left: 1
+    right: 0
+
+   ---- committed_known_diffs_doc_is_parsed_and_allowlists_nothing stdout ----
+   panicked at crates/codegraph-bench/tests/equivalence.rs:19:5:
+   assertion `left == right` failed: /…/KNOWN_DIFFS.md must stay empty
+     left: 1
+    right: 0
+   ```
+
+Mutant 2 reddens ONLY the lib surface-discrimination test; mutant 3 reddens ONLY
+the integration wiring test; mutant 1 reddens the parse-time gate in both; mutant
+4 reddens both zero-rules pins. No partial regression in this gate can hide
+behind another part of it.
+
+Each mutant was restored by copying back the green file. Restored SHA-256:
+`crates/codegraph-bench/src/oracle/diff.rs`
+`2b525ddca8af6c26cddc0b01d285b36fa2ca4472bc157fcd3ac5b2765e4a6089`,
+`crates/codegraph-bench/src/oracle/mod.rs`
+`fd560ea19fdb574b12268ce31d45790e7e07f8f638ff72f441c5da4d76d482f3`,
+`crates/codegraph-bench/tests/equivalence.rs`
+`a69bd5c0e7d0d207ec3ff92d97ac0a43305d9985cfc2b5780532c3d4d837b2f2`,
+`docs/upstream-sync/KNOWN_DIFFS.md`
+`2c973b6f1407b409131c20849de44f15dc9989c1b47bb278e836daf3c682c07d` (byte-identical
+to `ecd3641` — the document is NOT modified by this commit). Green re-confirmed
+after every restore.
+
+### Golden delta
+
+`GIT_MASTER=1 git diff --stat ecd3641..HEAD -- reference/golden/` → **EMPTY**. No
+golden was regenerated and none needed to be: this commit changes only the
+oracle's rule parser, its wiring, and tests. No extraction, resolution, or
+canonicalization byte changed. `KNOWN_DIFFS.md` itself is untouched.
+
+### Verification (actual exit statuses)
+
+- `grep -rn "KnownDiffs::load" crates/` on the pre-change tree → exit **1**, zero
+  hits (defect layer 1). `grep -c "mod tests" …/oracle/diff.rs` → **0** (layer 3).
+- `bash scripts/check-workspace-versions.sh` → exit **0** (`OK`, workspace
+  0.40.4), run before every Cargo batch. Every Cargo command used `--locked`.
+- `cargo test --locked -p codegraph-bench --lib` → exit 0, **29 passed, 0 failed**
+  (was 14 before; +15 new oracle tests).
+- `cargo test --locked -p codegraph-bench --test equivalence` → exit 0,
+  **28 passed, 0 failed** — the required floor is 26; the two added tests are
+  `committed_known_diffs_doc_is_parsed_and_allowlists_nothing` and
+  `an_unparseable_known_diffs_file_fails_the_equivalence_assertion`. All 26
+  pre-existing tests still pass, now adjudicating through the real document.
+- `cargo clippy --locked -p codegraph-bench --all-targets -- -D warnings` →
+  exit **0**.
+- `cargo test --locked -p codegraph-rs --test parallel_index` → exit 0,
+  **5 passed** (the other `assert_equivalent` consumer).
+- `make ci CARGO='cargo --locked'` → final gate, run after the last byte of this
+  prose; result recorded below.
+- `sha256sum Cargo.lock` →
+  `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`, unchanged.
+  No dependency, version, or lockfile byte changed.
+
+`lsp_diagnostics` was attempted on `crates/codegraph-bench/src/oracle/diff.rs`
+and refused this worktree again (`LSP file path must be inside request cwd`); no
+LSP-clean result is claimed. The equivalent evidence is the locked `clippy -D
+warnings` run above plus `make ci`.
