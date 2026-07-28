@@ -1306,6 +1306,246 @@ fn current_with_committed_wal_fails_closed_without_ignoring_or_mutating_sidecars
     }
 }
 
+/// Build a project whose DIRECTORY NAME carries bytes that are not valid UTF-8.
+///
+/// A Unix path is an arbitrary byte string, so `Path::display()` renders such a
+/// name LOSSILY (each invalid byte becomes U+FFFD) and every sidecar path built
+/// from that rendering names a file that does not exist. Windows is excluded
+/// from these fixtures because its paths are UTF-16 and the byte-oriented
+/// `OsString` constructors used here (`std::os::unix::ffi`) do not exist there.
+#[cfg(unix)]
+fn non_utf8_project(outer: &TempProject, label: &str) -> TempProject {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut name = OsString::from_vec(format!("{label}-").into_bytes());
+    name.push(OsString::from_vec(vec![0x80, 0xff]));
+    let path = outer.0.join(name);
+    std::fs::create_dir(&path)
+        .unwrap_or_else(|error| panic!("create non-UTF-8 project {}: {error}", path.display()));
+    TempProject(
+        path.canonicalize()
+            .unwrap_or_else(|error| panic!("canonicalize non-UTF-8 project: {error}")),
+    )
+}
+
+/// The path a LOSSY `Path::display()` round-trip would name. On a non-UTF-8
+/// project this is a different file from [`sqlite_sidecar`]'s native path, and
+/// nothing in production may read, write, or delete it.
+#[cfg(unix)]
+fn lossy_sidecar(db: &Path, suffix: &str) -> PathBuf {
+    PathBuf::from(format!("{}{suffix}", db.display()))
+}
+
+#[cfg(unix)]
+fn probe_row_is_folded_into_main_file(paths: &IndexPaths) -> bool {
+    observe_database_without_touching_namespace(paths)
+        .project_metadata
+        .iter()
+        .any(|(key, _, _)| key == "wal_only_probe")
+}
+
+/// The strict `Current` read gate must refuse a namespace whose committed
+/// write-ahead log sits beside a database under a NON-UTF-8 project path.
+///
+/// Detecting that sidecar through `Path::display()` looks at a path that does
+/// not exist, so the gate would conclude "sidecar-free", admit the namespace,
+/// and serve an index missing every row that lives only in the log.
+#[cfg(unix)]
+#[test]
+fn non_utf8_current_with_committed_wal_fails_closed() {
+    let outer = TempProject::new("non-utf8-wal-gate");
+    let project = non_utf8_project(&outer, "proj");
+    let paths = stage_current(&project, Some(&CURRENT_EXTRACTION_VERSION.to_string()));
+    run_crashed_current_writer(project.path());
+
+    let wal_path = sqlite_sidecar(&paths.current_db(), "-wal");
+    assert_ne!(
+        wal_path,
+        lossy_sidecar(&paths.current_db(), "-wal"),
+        "fixture must expose a lossy rendering distinct from the native path"
+    );
+    assert!(
+        std::fs::metadata(&wal_path)
+            .expect("committed WAL exists beside the non-UTF-8 database")
+            .len()
+            > 0,
+        "fixture must carry committed WAL frames"
+    );
+    assert!(
+        !probe_row_is_folded_into_main_file(&paths),
+        "the probe row must live ONLY in the write-ahead log"
+    );
+
+    let before = snapshot_tree(project.path());
+    for error in [
+        Store::open_for_read(&paths, deadline(), || false)
+            .expect_err("non-UTF-8 Current with committed WAL must fail closed"),
+        Store::open_for_status(&paths, deadline(), || false)
+            .expect_err("non-UTF-8 Current status with committed WAL must fail closed"),
+    ] {
+        assert!(
+            matches!(
+                &error,
+                StoreError::CurrentWithDatabaseSidecar { path } if path == &wal_path
+            ),
+            "unexpected non-UTF-8 sidecar refusal: {error:?}"
+        );
+        assert_snapshot_unchanged(&before, &snapshot_tree(project.path()));
+    }
+}
+
+/// The dead-owner recovery path must detect and FOLD a committed write-ahead log
+/// on a non-UTF-8 project path, so the row that existed only in that log becomes
+/// readable instead of being silently skipped by a stale main-file-only read.
+#[cfg(unix)]
+#[test]
+fn non_utf8_dead_owner_wal_is_folded_and_then_readable() {
+    let outer = TempProject::new("non-utf8-wal-recovery");
+    let project = non_utf8_project(&outer, "proj");
+    let paths = stage_current(&project, Some(&CURRENT_EXTRACTION_VERSION.to_string()));
+    run_crashed_current_writer(project.path());
+
+    let wal = sqlite_sidecar(&paths.current_db(), "-wal");
+    let shm = sqlite_sidecar(&paths.current_db(), "-shm");
+    assert!(
+        std::fs::metadata(&wal).expect("planted WAL exists").len() > 0,
+        "a zero-byte sidecar would prove nothing"
+    );
+    assert!(
+        !probe_row_is_folded_into_main_file(&paths),
+        "the probe row must live ONLY in the write-ahead log before recovery"
+    );
+
+    assert!(
+        Store::recover_stale_current_sidecars(&paths, deadline(), || false)
+            .expect("recovery over a dead owner's residue must not error"),
+        "a dead owner's committed WAL must be DETECTED on a non-UTF-8 path"
+    );
+    assert!(!wal.exists(), "checkpointed WAL must be removed");
+    assert!(!shm.exists(), "derived SHM must be removed");
+    assert!(
+        probe_row_is_folded_into_main_file(&paths),
+        "recovery must fold the log into the main database file, not discard it"
+    );
+
+    let store = Store::open_for_read(&paths, deadline(), || false)
+        .expect("strict gate admits the recovered non-UTF-8 namespace");
+    assert_eq!(
+        store
+            .get_project_metadata("wal_only_probe")
+            .expect("read the WAL-only probe row"),
+        Some("committed".to_string()),
+        "the WAL-only row must be visible through the strict read path"
+    );
+    drop(store);
+
+    assert!(
+        paths.permanent_lock().is_file(),
+        "the permanent index lock must survive recovery"
+    );
+    assert!(
+        paths.state_slots().iter().any(|slot| slot.is_file()),
+        "the published state must survive recovery"
+    );
+    assert!(
+        !paths.tombstone().exists(),
+        "recovery must not author a tombstone"
+    );
+    assert_eq!(Store::extraction_status(&paths), ExtractionStatus::Current);
+}
+
+/// Recovery must operate on the NATIVE sidecar only. A file whose name matches
+/// the LOSSY `display()` rendering is a different, unrelated file and must be
+/// neither checkpointed nor deleted.
+#[cfg(unix)]
+#[test]
+fn non_utf8_recovery_never_touches_the_lossy_lookalike_sidecars() {
+    let outer = TempProject::new("non-utf8-lookalike");
+    let project = non_utf8_project(&outer, "proj");
+    let paths = stage_current(&project, Some(&CURRENT_EXTRACTION_VERSION.to_string()));
+    run_crashed_current_writer(project.path());
+
+    let native_wal = sqlite_sidecar(&paths.current_db(), "-wal");
+    let lossy_wal = lossy_sidecar(&paths.current_db(), "-wal");
+    let lossy_shm = lossy_sidecar(&paths.current_db(), "-shm");
+    assert_ne!(
+        native_wal, lossy_wal,
+        "fixture must expose a lossy rendering distinct from the native path"
+    );
+    std::fs::create_dir_all(lossy_wal.parent().expect("lossy sidecar parent"))
+        .expect("create lossy-lookalike parent directory");
+    std::fs::write(&lossy_wal, b"lookalike WAL must survive").expect("write lookalike WAL");
+    std::fs::write(&lossy_shm, b"lookalike SHM must survive").expect("write lookalike SHM");
+
+    assert!(
+        Store::recover_stale_current_sidecars(&paths, deadline(), || false)
+            .expect("recovery over a dead owner's residue must not error"),
+        "a dead owner's committed WAL must be DETECTED on a non-UTF-8 path"
+    );
+
+    assert!(!native_wal.exists(), "native WAL must be checkpointed away");
+    assert_eq!(
+        std::fs::read(&lossy_wal).expect("read preserved lookalike WAL"),
+        b"lookalike WAL must survive",
+        "the lossy lookalike WAL must be untouched"
+    );
+    assert_eq!(
+        std::fs::read(&lossy_shm).expect("read preserved lookalike SHM"),
+        b"lookalike SHM must survive",
+        "the lossy lookalike SHM must be untouched"
+    );
+    Store::open_for_read(&paths, deadline(), || false)
+        .expect("strict gate admits the recovered non-UTF-8 namespace")
+        .get_project_metadata("wal_only_probe")
+        .expect("read the WAL-only probe row")
+        .expect("the folded WAL-only row must be readable");
+}
+
+/// The `Missing`-state artifact guard reads the same sidecar names, so it must
+/// also see them losslessly: an unexplained `-wal`/`-shm` beside a stateless
+/// namespace on a non-UTF-8 path is not a fresh writable namespace.
+#[cfg(unix)]
+#[test]
+fn missing_state_with_non_utf8_database_sidecar_fails_closed() {
+    for suffix in ["-wal", "-shm"] {
+        let outer = TempProject::new("non-utf8-missing-artifact");
+        let project = non_utf8_project(&outer, "proj");
+        let paths = project.paths();
+        drop(create_namespace(&paths));
+        let artifact = sqlite_sidecar(&paths.current_db(), suffix);
+        assert_ne!(
+            artifact,
+            lossy_sidecar(&paths.current_db(), suffix),
+            "fixture must expose a lossy rendering distinct from the native path"
+        );
+        std::fs::write(&artifact, b"reserved unknown database artifact")
+            .expect("stage unknown database artifact");
+        let before = snapshot_tree(project.path());
+
+        let lease = IndexLease::acquire_exclusive_existing(&paths, deadline(), || false)
+            .expect("acquire Missing fixture lease");
+        let write_error = Store::open_for_write(&paths, lease, StoreWritePurpose::FullRebuild)
+            .expect_err("Missing plus a DB sidecar is not a fresh writable namespace");
+        for error in [
+            write_error,
+            Store::open_for_read(&paths, deadline(), || false)
+                .expect_err("Missing artifact must reject read"),
+            Store::open_for_status(&paths, deadline(), || false)
+                .expect_err("Missing artifact must reject status"),
+        ] {
+            assert!(
+                matches!(
+                    &error,
+                    StoreError::MissingStateWithDatabase { path } if path == &artifact
+                ),
+                "unexpected non-UTF-8 Missing-artifact refusal: {error:?}"
+            );
+            assert_snapshot_unchanged(&before, &snapshot_tree(project.path()));
+        }
+    }
+}
+
 /// Child-process entry point used by deterministic lock contention tests.
 #[test]
 fn store_gate_child_process() {

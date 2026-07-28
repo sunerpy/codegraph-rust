@@ -7012,3 +7012,463 @@ ledger) and nothing else. That is the stricter reading, not a weaker one: it
 proves these five files alone are green against the recorded parent commit,
 without borrowing green from — or inheriting red from — a sibling's work in
 progress. The exit-0 above is that run's real status.
+
+## Batch F3 — the data-router route-object walk stops at that object's own `}`, not at 300 fixed bytes (2026-07-28)
+
+Completes upstream issue **#1348**, whose data-router half Batch D1 left untouched
+while the manifest already classified the issue as a full `PORT`. This batch fixes
+the behavior (Option A) rather than narrowing the claim (Option B), so both
+documents now describe a landing that exists.
+
+### The defect, at exact line numbers
+
+`crates/codegraph-resolve/src/frameworks/react.rs:188` (pre-change), inside the
+`// React Router data-router (v6.4+)` block that begins at line 184:
+
+```rust
+let win = byte_window(content, whole.start(), 300);
+let comp = obj_element_attr()
+    .captures(win)
+    .or_else(|| obj_component_attr().captures(win))
+    .map(|c| c.get(1).expect("comp group").as_str().to_string());
+```
+
+A fixed 300-byte window scanned forward from every `path:` key and took the FIRST
+`element:` / `Component:` it met. Nothing bounded it to the route object that owns
+that `path`, so a parent route with no `element` of its own silently borrowed a
+CHILD route's component out of `children: […]` — the same borrowing defect
+`route_opening_tag_window` (react.rs:552-561, Batch D1) fixes for the `<Route>` JSX
+form. The `<Route>` half was fixed; this half was not.
+
+Why Option A and not Option B: the object form is bounded by exactly the mechanism
+the JSX form already uses — walk forward tracking depth and quotes, stop at the
+construct's own terminator, keep a named byte backstop for malformed input. The JSX
+terminator is `>` at brace depth 0; the object terminator is `}` at depth 0. Nothing
+about the object form made that disproportionate, so narrowing the claim would have
+been the weaker choice.
+
+### Green — `route_object_own_properties` (react.rs:608-664)
+
+`route_object_own_properties(content, path_key_start)` returns the route object's
+OWN properties as text. It walks from the `path:` key and:
+
+- returns at the `}` / `]` that closes the object (depth 0) — nothing past it belongs
+  to this route;
+- **elides** nested `{…}` / `[…]` groups instead of merely tracking them, so a
+  `children: […]` array cannot leak its `element` into the parent's text and neither
+  can a `handle: {…}` object;
+- copies quoted values verbatim, so a `}` or `>` inside `path: 'a>b'` neither ends
+  the object nor unbalances the depth;
+- stops at the next depth-0 `path:` key (`is_path_key_at`, react.rs:666-672) when the
+  literal never closes, so even malformed input cannot borrow a following sibling's
+  properties;
+- is capped by `ROUTE_OBJECT_SCAN_LIMIT` regardless.
+
+This deliberately mirrors `opening_tag_end`'s invariants rather than inventing a
+second unrelated scanner: same brace/quote skipping, same "terminate at the
+construct's own end, cap the search anyway" pair. It cannot literally REUSE
+`opening_tag_end`, because the two forms differ in three ways — the object's
+terminator is `}`/`]` and not `>`; `[` must count toward depth for an array-valued
+`children`; and nested groups must be ELIDED from the returned text, not merely
+skipped over, which is why this function returns an owned `String` while
+`route_opening_tag_window` can return a `&str` slice. Their invariants are kept
+visibly parallel in the doc comments.
+
+Not fixed by raising 300: a larger fixed window moves the borrowing further away
+without removing it, and would newly break the long-object case in the opposite
+direction. The bound is structural first, byte-capped only as a backstop.
+
+### The bound and why that number
+
+`ROUTE_OBJECT_SCAN_LIMIT = 4096`, justified in its doc comment from route objects
+actually measured (raw walk distance from the object's `path:` key to its own closing
+`}`, nested children included because the walk traverses and elides them):
+
+| Route-object shape                                                                       | Bytes |
+| ---------------------------------------------------------------------------------------- | ----- |
+| minimal inline `{ path, element }`                                                       | 38    |
+| typical v6.4 route: `loader` + `errorElement` + `element`                                | 142   |
+| plus `action`, `handle: {…}`, `shouldRevalidate`, `element` LAST                         | 407   |
+| wide enterprise route: `hydrateFallbackElement` + nested `handle` object, `element` LAST | 611   |
+| parent with 8 loader-bearing children, own `element` declared LAST (worst realistic)     | 1503  |
+
+The 1503-byte case is the one that sizes the constant: every child byte must be
+traversed before the parent's own `element` is reached, so the walk length is driven
+by children count, not by the parent's own property count. 4096 is ~2.7x that, and
+strictly wider than the 300-byte window it replaces, so nothing the old code could
+reach is lost. Measured with a brace/quote-aware Python walker over each fixture, not
+guessed — the same discipline the D1 bound used after its first 512-byte draft was
+falsified by a real 700-byte tag.
+
+### Red — measured, before the fix
+
+The five new tests were written first and run against the pre-change 300-byte window
+(`cargo test --locked -p codegraph-resolve --test frameworks` → **exit 101**). Actual
+output, unabridged assertions:
+
+    ---- react_data_router_parent_without_element_does_not_borrow_from_children ----
+    assertion `left == right` failed: a parent route with no element of its own must emit no route->component pair
+      left: [("/dashboard", 3), ("settings", 6)]
+     right: [("settings", 6)]
+
+    ---- react_data_router_child_without_element_does_not_borrow_from_parent ----
+    assertion `left == right` failed: the element-less child must emit nothing; only the parent owns an element
+      left: [("/dashboard", 3), ("settings", 5)]
+     right: [("/dashboard", 3)]
+
+    ---- react_data_router_object_stops_at_next_path_key_when_unbraced ----
+    assertion `left == right` failed: the first path key has no element between it and the second key
+      left: ["/a", "/b"]
+     right: ["/b"]
+
+    ---- react_data_router_object_survives_angle_brackets_and_stops_at_sibling ----
+    assertion `left == right` failed: a `>` inside a quoted path or a braced expression must not end the object, and an element-less object must not borrow from its next sibling
+      left: [("/a>b", 2), ("/c>d", 3), ("/plain", 4)]
+     right: [("/a>b", 2), ("/plain", 4)]
+
+    ---- react_data_router_keeps_long_route_object_intact ----
+    panicked at crates/codegraph-resolve/tests/frameworks.rs:638:10: route node
+
+The first Red is the defect verbatim: `/dashboard` has no `element` of its own, yet
+it emitted a route→component pair by borrowing `DashboardHome` from its pathless
+`index` child. The last Red is the opposite failure mode — a legitimate 300+-byte
+route object whose own `element` sits past the window is dropped entirely, so no
+route node exists at all.
+
+### Tests
+
+Five new tests in `crates/codegraph-resolve/tests/frameworks.rs`, all driving the
+real `ReactResolver::extract`:
+
+- `react_data_router_parent_without_element_does_not_borrow_from_children` — the
+  #1348 data-router shape: parent `path` with NO `element`, a pathless `index` child
+  that HAS one, and a `path: 'settings'` child. Asserts the exact route-node list AND
+  the exact reference list: parent emits nothing, `settings` emits exactly its own.
+- `react_data_router_child_without_element_does_not_borrow_from_parent` — the mirror,
+  and the shape that makes the object's own `}` load-bearing: an element-less child
+  inside `children: […]` while the parent declares `element` AFTER the array.
+- `react_data_router_object_stops_at_next_path_key_when_unbraced` — two depth-0
+  `path:` keys with no brace between them; only the next-`path:` stop prevents the
+  first from borrowing the second's element.
+- `react_data_router_object_survives_angle_brackets_and_stops_at_sibling` — a `path`
+  string containing `>`, an `element` whose nested JSX expression contains `>` inside
+  braces (`<Spinner size={2 > 1 ? 8 : 4}/>`), and a following element-less sibling
+  that must not borrow forward. Shapes the 300-byte window mishandled.
+- `react_data_router_keeps_long_route_object_intact` — a route object with `loader`,
+  `action`, `errorElement`, `hydrateFallbackElement`, a nested `handle: {…}` and
+  `shouldRevalidate`, its own `element` declared LAST and asserted (in the test) to
+  sit past 300 bytes. Asserts the reference list is EXACTLY `["BillingSettingsPage"]`,
+  so neither the `errorElement` nor the `hydrateFallbackElement` may be mistaken for
+  the route's element. Pins the bound from the outside: tightening
+  `ROUTE_OBJECT_SCAN_LIMIT` below the object length reddens it.
+
+`react_data_router_object_walk_is_bounded_for_unterminated_literal` also lands here:
+an unterminated `{ path: '/a',` followed by 25 000 filler lines and then a
+well-formed `/b` route, asserting `/a` reaches neither end-of-file nor `/b`'s
+element. It passes both before and after the fix (the old 300-byte cap also bounded
+it), so it is recorded as a guard, NOT as Red evidence.
+
+### Negative control, EXECUTED (three mutants, each reddening a DIFFERENT test)
+
+1. Production line reverted to `byte_window(content, whole.start(), 300)`, tests
+   untouched → **exit 101**, 5 failed — the full Red block quoted above.
+
+2. Object-boundary terminator removed (the depth-0 `}`/`]` arm `continue`s instead of
+   returning), 4096 backstop and elision kept → **exit 101**, **1 failed**:
+
+       ---- react_data_router_child_without_element_does_not_borrow_from_parent ----
+       assertion `left == right` failed: the element-less child must emit nothing; only the parent owns an element
+         left: [("/dashboard", 3), ("settings", 5)]
+        right: [("/dashboard", 3)]
+
+   — a DIFFERENT test from mutants 1 and 3 in isolation, and proof the terminator is
+   load-bearing on its own: the child escaped its own `}` and took the parent's
+   `element`.
+
+3. Elision removed (nested `{…}`/`[…]` still counted for depth, but their bytes kept
+   in the returned text), terminator and backstop intact → **exit 101**,
+   **1 failed**:
+
+       ---- react_data_router_object_survives_angle_brackets_and_stops_at_sibling ----
+       assertion `left == right` failed: a `>` inside a quoted path or a braced expression must not end the object, and an element-less object must not borrow from its next sibling
+         left: [("/plain", 4)]
+        right: [("/a>b", 2), ("/plain", 4)]
+
+   — proof elision, not merely depth tracking, is what keeps a nested group's contents
+   out of the owning object's text.
+
+Restored after each mutant by copying back the green file; restored SHA-256 of
+`crates/codegraph-resolve/src/frameworks/react.rs`:
+`647e4a1e5504c479a937bdfe5ca1a05b402076ffac8528260af38885780fadbd`.
+Re-run with the fix restored → exit 0, 37 passed.
+
+### Golden row delta
+
+None. `git diff --stat 956cf32..HEAD -- reference/golden/` → EMPTY (956cf32 is the
+pre-task HEAD). No golden fixture contains a `<Route` or `createBrowserRouter`
+construct (`grep -rln 'createBrowserRouter\|createHashRouter\|createMemoryRouter\|createRoutesFromElements' reference/golden/ crates/codegraph-bench/fixtures/`
+→ exit 1, no matches), so the changed branch is unreachable for them.
+`cargo test --locked -p codegraph-bench --test equivalence` → exit 0,
+**28 passed, 0 failed**. `git status --short reference/golden/` → empty, so this run
+left no `colby.db-{wal,shm}` behind to clean.
+
+### Documentation accuracy
+
+- `V1_5_COMMIT_MANIFEST.md` #1348 row now reads
+  `Batch D1 bounded React <Route> opening-tag scan + Batch F3 bounded data-router route-object walk`
+  — the issue stays `PORT` because it is now genuinely a full behavioral landing, and
+  the row names both halves.
+- The Batch D1 section's "Exactly the single correct edge the issue asks for" is now
+  scoped to the `<Route>` JSX form and carries an inline scope-correction note stating
+  that D1 alone did not close #1348.
+
+### Verification (actual exit statuses)
+
+- `bash scripts/check-workspace-versions.sh` → exit 0, run before every Cargo batch;
+  every Cargo command used `--locked`.
+- `cargo test --locked -p codegraph-resolve --test frameworks` → exit 101 pre-fix
+  (Red, 5 failed), exit 0 post-fix, **37 passed** (31 before this task + 5 new + the
+  bounded-walk guard).
+- `cargo test --locked -p codegraph-bench --test equivalence` → exit 0, 28/28.
+- Mutants 1/2/3 → exit 101 each, reddening 5 / 1 / 1 tests respectively, with mutants
+  2 and 3 each reddening a different single test.
+- `make ci CARGO='cargo --locked'` → final gate, run after the last byte of this
+  commit (code, tests, this prose, then `make fmt`); result recorded below.
+- `sha256sum Cargo.lock` →
+  `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`, unchanged.
+
+`lsp_diagnostics` was attempted and again refused this worktree (`LSP file path must
+be inside request cwd`); locked Cargo clippy/test is the honest fallback and no
+LSP-clean result is claimed. No dependency, version or `Cargo.lock` byte changed. No
+native Windows/MSVC runtime validation is claimed — everything above ran on Linux.
+
+## Batch F2 — SQLite sidecar detection is byte-lossless, so a non-UTF-8 project path can no longer hide a committed WAL (2026-07-28)
+
+Fixes the highest-severity finding of the F1–F4 final review wave. This is silent
+data staleness, not a crash: on Unix a project path may carry arbitrary non-UTF-8
+bytes, and the sidecar-detection gates rendered that path through
+`Path::display()` — a LOSSY conversion. Every invalid byte became U+FFFD, so the
+constructed `-wal` / `-shm` name pointed at a file that does not exist while the
+REAL `codegraph.db-wal` sat undetected beside the database. The strict `Current`
+read gate therefore saw a "sidecar-free" namespace, admitted it, deserialized
+only the main-database bytes, and served an index missing every row that lived
+only in the log. That is exactly the stale-read risk commit `8c66848` reverted as
+unsafe, re-opened through a path-encoding hole.
+
+### The defect, at exact line numbers
+
+`crates/codegraph-store/src/connection.rs`, pre-change:
+
+```rust
+// 1010  fn first_existing_database_artifact(paths: &IndexPaths) -> Result<Option<PathBuf>> {
+// 1013      artifacts.push(PathBuf::from(format!("{}-wal", db.display())));
+// 1014      artifacts.push(PathBuf::from(format!("{}-shm", db.display())));
+
+// 1074  fn first_existing_database_sidecar(paths: &IndexPaths) -> Result<Option<PathBuf>> {
+// 1077          PathBuf::from(format!("{}-wal", db.display())),
+// 1078          PathBuf::from(format!("{}-shm", db.display())),
+```
+
+Traced consequences, all confirmed by reading the file:
+
+- `first_existing_database_sidecar` (1074) returns `Ok(None)` — "no sidecar" —
+  because it stat's the lossy lookalike.
+- The strict gate at `corroborate_current_database_options` (861) therefore never
+  raises `StoreError::CurrentWithDatabaseSidecar` and admits the namespace.
+- `open_read_only_without_sidecars` (880-912) then deserializes ONLY
+  `std::fs::read(db_path)`, so WAL-only rows are invisible. `Current`, stale, no
+  error.
+- `first_existing_database_artifact` (1010) feeds
+  `reject_missing_database_artifacts` (1087), so the `Missing`-state guard was
+  equally blind: an unexplained `-wal` beside a stateless namespace on a
+  non-UTF-8 path was accepted as a fresh writable namespace.
+
+The correct idiom was already present in this very crate: `sqlite_sidecar_path`
+(`crates/codegraph-store/src/uninit.rs:233`) builds sidecar names with
+`OsString::push`, and `connection.rs` itself already had the lossless
+`database_sidecar_path` (1057) — used by `remove_checkpointed_sidecars` (1032-1050)
+but NOT by either detection function. The removal path was lossless while the
+DETECTION path was lossy; that asymmetry is the whole bug.
+
+### The fix — one helper, every site
+
+`database_sidecar_path` is now the single source of every sidecar name in
+`connection.rs`. Three call sites changed; the helper's body is unchanged:
+
+- `first_existing_database_artifact` → `database_sidecar_path(&db, "-wal"/"-shm")`.
+- `first_existing_database_sidecar` → `database_sidecar_path(&db, "-wal"/"-shm")`.
+- the unit-test cleanup loop in `reopening_existing_db_keeps_schema_version`
+  (previously `format!("{}{ext}", db_path.display())`) → the same helper, so no
+  `Path::display()` path construction remains anywhere in the file.
+
+The helper's doc comment now states the invariant and the exact failure mode, so a
+future edit cannot reintroduce a lossy sibling without contradicting it.
+
+Nothing else moved. `Store::open_for_read` still defaults to
+`allow_live_sidecar = false`; no sidecar-tolerant read path exists under any name;
+the `Current` corroboration order (tombstone → database presence → sidecar
+freedom → main-file stamp) is byte-identical; recovery still refuses to delete a
+non-empty `-wal` (`StoreError::WalNotFolded`), still revalidates the exclusive
+lease before each unlink, still leaves the `-journal` for SQLite to replay, and
+still keeps its bounded 500ms lease deadline and its "dead owner proven first"
+precondition. No PID signalling was added. Recovery is now merely ABLE to see the
+residue it was always supposed to see.
+
+### Workspace-wide audit of the bug class
+
+`grep -rn 'display()' crates/ --include='*.rs' | wc -l` → **501 hits, exit 0**.
+Filtering for hits that actually construct a filesystem path
+(`PathBuf::from` / `Path::new` / `.push(` / a `format!` bound to a path variable)
+leaves eleven. Classification of every one:
+
+| Location                                                                               | Verdict                                                                                                                                                                                                                                                                                                                                                                                           |
+| -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `codegraph-store/src/connection.rs:1013,1014` (was)                                    | **BUG — PATH construction.** Fixed: `database_sidecar_path`.                                                                                                                                                                                                                                                                                                                                      |
+| `codegraph-store/src/connection.rs:1077,1078` (was)                                    | **BUG — PATH construction.** Fixed: `database_sidecar_path`.                                                                                                                                                                                                                                                                                                                                      |
+| `codegraph-store/src/connection.rs:1323` (was)                                         | **BUG (unit-test cleanup only) — PATH construction.** Fixed: same helper. Impact was a leaked temp file, not staleness, but it is the same class.                                                                                                                                                                                                                                                 |
+| `codegraph-store/src/uninit.rs:557`                                                    | **CORRECT BY DESIGN.** Inside `non_utf8_database_sidecars_are_removed_without_touching_lossy_lookalikes`; deliberately builds the lossy lookalike as the file that must SURVIVE.                                                                                                                                                                                                                  |
+| `codegraph-store/tests/store_state_gates.rs:1163,1192,1250`                            | **BENIGN — test fixtures on ASCII temp paths** (`std::env::temp_dir()` + an ASCII label), where `display()` is a lossless round-trip. Left unchanged so the pre-existing ASCII coverage keeps asserting the exact same bytes; the new non-UTF-8 tests use the lossless `sqlite_sidecar` helper that already existed at line 134.                                                                  |
+| `codegraph-store/tests/store_state_gates.rs:1337` (new)                                | **INTENTIONAL.** The new `lossy_sidecar` helper — it exists precisely to name the lookalike that must not be touched.                                                                                                                                                                                                                                                                             |
+| `codegraph-cli/tests/batch_m_finalizer.rs:135`                                         | **BENIGN — test fixture on an ASCII temp path.** Same reasoning.                                                                                                                                                                                                                                                                                                                                  |
+| `codegraph-watch/src/watcher.rs:502`                                                   | **FINE — message only** (`format!("watch {} failed: {err}", …)`, a human-readable reason string).                                                                                                                                                                                                                                                                                                 |
+| `codegraph-cli/src/main.rs:768,6112,6254` and `codegraph-cli/tests/completions.rs:104` | **FINE — shell-snippet TEXT, not a path used by this process.** `format!(". \"{}\"", script.display())` is a line PRINTED for the user to paste into their rc file. It is not opened, stat'd, or unlinked. A non-UTF-8 completion-script path would render imperfectly in that printed hint; no filesystem decision depends on it, so it is a display-quality nit and out of this commit's scope. |
+
+The remaining ~490 `display()` uses are all inside `panic!` / `assert!` /
+`expect` / `println!` / `tracing::` / `with_context` / `#[error]` message strings —
+formatting for humans, never a path this process then acts on. Two related lossy
+conversions were also checked and are NOT path construction that can go wrong the
+same way: `codegraph-core/src/index_paths.rs:179` (`to_string_lossy` on a
+configured-root file NAME, which is then hashed into a deterministic sibling
+directory name — a lossy rendering there produces a stable, still-unique name and
+is pre-existing published behavior, out of scope for this blocker), and
+`codegraph-cli/src/installer/{targets/kiro.rs:53,targets/qoder.rs:142,mod.rs:491}`
+(agent-config JSON values, i.e. text emitted for another program's config file).
+
+### Red — measured, before the fix
+
+`cargo test --locked -p codegraph-store --test store_state_gates` →
+**exit 101, 22 passed / 4 failed**. The four new tests, verbatim:
+
+    ---- non_utf8_current_with_committed_wal_fails_closed stdout ----
+    panicked at crates/codegraph-store/tests/store_state_gates.rs:1383:14:
+    non-UTF-8 Current with committed WAL must fail closed: Store { conn: Connection { path: Some("") }, …
+      path: "/tmp/…/proj-\x80\xFF/.codegraph-v2/codegraph.db", access: StateRead, … }
+
+    ---- non_utf8_dead_owner_wal_is_folded_and_then_readable stdout ----
+    panicked at crates/codegraph-store/tests/store_state_gates.rs:1423:5:
+    a dead owner's committed WAL must be DETECTED on a non-UTF-8 path
+
+    ---- non_utf8_recovery_never_touches_the_lossy_lookalike_sidecars stdout ----
+    panicked at crates/codegraph-store/tests/store_state_gates.rs:1502:10:
+    strict gate admits the recovered non-UTF-8 namespace: CurrentWithDatabaseSidecar { path: "/tmp/…/proj-��/.codegraph-v2/codegraph.db-wal" }
+
+    ---- missing_state_with_non_utf8_database_sidecar_fails_closed stdout ----
+    panicked at crates/codegraph-store/tests/store_state_gates.rs:1532:14:
+    Missing plus a DB sidecar is not a fresh writable namespace: FullRebuildRequired(StoreWriteAuthorization { status: Missing, purpose: FullRebuild, … })
+
+The first failure IS the blocker, stated as an assertion: `Store::open_for_read`
+RETURNED A READABLE `Store` over a namespace holding a committed, un-checkpointed
+write-ahead log. The third failure's message is the smoking gun in reverse — the
+error path names the U+FFFD-rendered `proj-��/…/codegraph.db-wal`, i.e. the gate
+was reporting a file that does not exist while the real one went unseen.
+
+### Green
+
+Same command after the fix → **exit 0, 26 passed, 0 failed** (22 pre-existing + 4
+new).
+
+### Tests added — `crates/codegraph-store/tests/store_state_gates.rs`
+
+All four are `#[cfg(unix)]`. The in-code comment states why: a Unix path is an
+arbitrary byte string, whereas Windows paths are UTF-16 and the byte-oriented
+constructors these fixtures need (`std::os::unix::ffi::OsStringExt::from_vec`) do
+not exist there. The non-UTF-8 project directory is built as
+`"<label>-" ++ [0x80, 0xFF]`, and every test asserts
+`native_path != lossy_path` FIRST, so a fixture that silently stopped being
+non-UTF-8 fails loudly instead of passing vacuously.
+
+1. `non_utf8_current_with_committed_wal_fails_closed` — the blocker's direct
+   inverse. Plants a REAL committed WAL by re-invoking the existing
+   `run_crashed_current_writer` child (which commits with `wal_autocheckpoint=0`
+   and then `exit(91)` without running destructors), asserts the log is non-empty
+   and that the probe row is absent from the main file, then asserts BOTH
+   `open_for_read` and `open_for_status` refuse with
+   `CurrentWithDatabaseSidecar { path }` where `path` is the NATIVE `-wal`, and
+   that the tree is byte-unchanged.
+2. `non_utf8_dead_owner_wal_is_folded_and_then_readable` — the recovery half.
+   `recover_stale_current_sidecars` must return `Ok(true)` (i.e. must SEE the
+   residue), both sidecars must be gone, the WAL-only row must now be in the main
+   file, and the strict gate must then admit the namespace and return
+   `wal_only_probe = "committed"`. It also asserts the permanent lock, the
+   published state slot, tombstone absence and `Current` status all survive.
+3. `non_utf8_recovery_never_touches_the_lossy_lookalike_sidecars` — the shape the
+   fix must NOT break. Plants real residue AND writes decoy files at the LOSSY
+   `-wal` / `-shm` names, then asserts recovery removes the native WAL while both
+   decoys keep their exact bytes. This is the test that would catch a "fix" that
+   merely swapped which wrong file it deletes.
+4. `missing_state_with_non_utf8_database_sidecar_fails_closed` — the second gate,
+   which the audit found shares the same construction. A `-wal`/`-shm` beside a
+   stateless namespace must yield `MissingStateWithDatabase { path }` (native
+   path) from write, read AND status opens, non-mutating.
+
+No existing test was weakened, skipped, `#[ignore]`d or deleted, and no sleep was
+added; the fixtures are child-process + polling based exactly as before.
+
+### Negative control, EXECUTED (two mutants, each reddening a DIFFERENT test set)
+
+Green SHA-256 of `crates/codegraph-store/src/connection.rs`:
+`f7c0884560e033d6858b7622ceb124efac1a8808f99b8b57eb2d1ad4230568b4`.
+
+1. `first_existing_database_sidecar` reverted to `display()` ONLY (the artifact
+   function left lossless) → **exit 101, 23 passed / 3 failed**:
+   `non_utf8_current_with_committed_wal_fails_closed`,
+   `non_utf8_dead_owner_wal_is_folded_and_then_readable`,
+   `non_utf8_recovery_never_touches_the_lossy_lookalike_sidecars`.
+   `missing_state_with_non_utf8_database_sidecar_fails_closed` stayed GREEN —
+   proof the two gates are covered independently.
+
+2. `first_existing_database_artifact` reverted to `display()` ONLY (the sidecar
+   function left lossless) → **exit 101, 25 passed / 1 failed**, the complement:
+
+       ---- missing_state_with_non_utf8_database_sidecar_fails_closed stdout ----
+       panicked at crates/codegraph-store/tests/store_state_gates.rs:1529:14:
+       Missing plus a DB sidecar is not a fresh writable namespace: FullRebuildRequired(StoreWriteAuthorization { status: Missing, purpose: FullRebuild, lease: IndexLease { … db_parent: "/tmp/…/proj-\x80\xFF/.codegraph-v2" … } })
+
+   — and the three `non_utf8_*` tests stayed GREEN. A partial regression of either
+   detection site therefore cannot hide behind the other.
+
+Restored after each mutant by copying back the green file; restored SHA-256 of
+`crates/codegraph-store/src/connection.rs` re-verified as
+`f7c0884560e033d6858b7622ceb124efac1a8808f99b8b57eb2d1ad4230568b4`.
+
+### Golden row delta
+
+None. This is a filesystem-path-construction change in the store's gate layer;
+extraction, resolution and serialization are untouched.
+`git diff --stat 956cf32..HEAD -- reference/golden/` → EMPTY (956cf32 is the
+pre-task HEAD). `cargo test --locked -p codegraph-bench --test equivalence` →
+exit 0, **28 passed, 0 failed**. Any untracked
+`reference/golden/*/colby.db-{wal,shm}` the oracle leaves behind was removed
+before staging (`git status --short reference/golden/` → empty).
+
+### Verification (actual exit statuses)
+
+- `bash scripts/check-workspace-versions.sh` → exit 0, run before every Cargo
+  batch; every Cargo command used `--locked`.
+- `cargo test --locked -p codegraph-store --test store_state_gates` → exit 101
+  pre-fix (Red, 4 failed), exit 0 post-fix, **26 passed**.
+- `cargo test --locked -p codegraph-store` (all targets) → recorded below.
+- `cargo test --locked -p codegraph-bench --test equivalence` → exit 0, 28/28.
+- Mutants 1/2 → exit 101 each, reddening 3 and 1 tests respectively — disjoint sets.
+- `make ci CARGO='cargo --locked'` → final gate, run after the last byte of this
+  commit (code, tests, this prose, then `make fmt`); result recorded below.
+- `sha256sum Cargo.lock` →
+  `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`, unchanged.
+
+`lsp_diagnostics` was attempted and again refused this worktree (`LSP file path must
+be inside request cwd`); locked Cargo clippy/test is the honest fallback and no
+LSP-clean result is claimed. No dependency, version or `Cargo.lock` byte changed. No
+native Windows/MSVC runtime validation is claimed — every command above ran on
+Linux, and the Windows arm of `database_sidecar_path` is exercised only by
+inspection (`OsString::push` on a `PathBuf`'s `OsStr`, which is lossless on both
+platforms by construction).

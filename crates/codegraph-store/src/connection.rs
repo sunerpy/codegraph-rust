@@ -1010,8 +1010,8 @@ fn validate_extraction_stamp(db_path: &Path, stamp: Option<String>) -> Result<()
 fn first_existing_database_artifact(paths: &IndexPaths) -> Result<Option<PathBuf>> {
     let db = paths.current_db();
     let mut artifacts = vec![db.clone()];
-    artifacts.push(PathBuf::from(format!("{}-wal", db.display())));
-    artifacts.push(PathBuf::from(format!("{}-shm", db.display())));
+    artifacts.push(database_sidecar_path(&db, "-wal"));
+    artifacts.push(database_sidecar_path(&db, "-shm"));
     for path in artifacts {
         match std::fs::symlink_metadata(&path) {
             Ok(_) => return Ok(Some(path)),
@@ -1054,6 +1054,13 @@ fn remove_checkpointed_sidecars(paths: &IndexPaths, lease: &IndexLease) -> Resul
 /// Append SQLite's sidecar suffix to the native database pathname without a
 /// Unicode rendering round-trip, so both Unix byte paths and Windows wide paths
 /// stay lossless.
+///
+/// Every sidecar path in this module MUST come from here. `Path::display()`
+/// replaces each byte that is not valid UTF-8 with U+FFFD, so a sidecar name
+/// built from that rendering points at a DIFFERENT file: the detection gates
+/// would see a sidecar-free namespace while a committed `-wal` sat undetected
+/// beside the database, and the strict `Current` read would then serve an index
+/// missing every row that lives only in that log.
 fn database_sidecar_path(db: &Path, suffix: &str) -> PathBuf {
     let mut native = db.as_os_str().to_os_string();
     native.push(suffix);
@@ -1074,8 +1081,8 @@ fn artifact_len(path: &Path) -> Result<Option<u64>> {
 fn first_existing_database_sidecar(paths: &IndexPaths) -> Result<Option<PathBuf>> {
     let db = paths.current_db();
     for path in [
-        PathBuf::from(format!("{}-wal", db.display())),
-        PathBuf::from(format!("{}-shm", db.display())),
+        database_sidecar_path(&db, "-wal"),
+        database_sidecar_path(&db, "-shm"),
     ] {
         if artifact_exists(&path)? {
             return Ok(Some(path));
@@ -1320,7 +1327,7 @@ mod tests {
         assert_eq!(v1, crate::migrations::CURRENT_SCHEMA_VERSION);
 
         for ext in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{ext}", db_path.display()));
+            let _ = std::fs::remove_file(database_sidecar_path(&db_path, ext));
         }
     }
 
