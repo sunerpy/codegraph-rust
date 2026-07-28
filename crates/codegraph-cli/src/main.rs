@@ -319,6 +319,10 @@ enum Command {
         target: String,
         #[arg(short, long)]
         path: Option<PathBuf>,
+        /// Pin an overloaded SYMBOL to the definition in this file (path or
+        /// basename). Its source body is returned, like the unpinned form.
+        #[arg(short = 'f', long = "file")]
+        file: Option<String>,
         /// Symbol mode: return just the file's symbol map instead of source.
         #[arg(long = "symbols-only")]
         symbols_only: bool,
@@ -575,10 +579,11 @@ fn run(cli: Cli) -> Result<()> {
         Command::Node {
             target,
             path,
+            file,
             symbols_only,
             json,
             strict,
-        } => cmd_node(target, path, symbols_only, json, strict),
+        } => cmd_node(target, path, file, symbols_only, json, strict),
         Command::Install {
             target,
             location,
@@ -3114,13 +3119,19 @@ fn cmd_explore(
 fn cmd_node(
     target: String,
     path: Option<PathBuf>,
+    file: Option<String>,
     symbols_only: bool,
     json_output: bool,
     strict: bool,
 ) -> Result<()> {
     let project = resolve_required_project(path)?;
     let engine = codegraph_mcp::CodeGraphEngine::open(&project)?;
-    let args = if node_target_is_file(&engine, &target) {
+    // #1314: `-f/--file` PINS an overloaded symbol to one file and must still
+    // carry `includeCode`, exactly like the bare-symbol branch below — the
+    // pinned definition's source body is the whole point of the pin.
+    let args = if let Some(file) = &file {
+        json!({ "symbol": target, "file": file, "includeCode": true })
+    } else if node_target_is_file(&engine, &target) {
         json!({ "file": target, "symbolsOnly": symbols_only })
     } else {
         json!({ "symbol": target, "includeCode": true })

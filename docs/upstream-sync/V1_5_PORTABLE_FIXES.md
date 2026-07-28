@@ -4995,3 +4995,166 @@ the saved copy → exit 0, 4 passed. Restored-file SHA-256 of
 request cwd`); locked Cargo clippy/test is the honest fallback and no LSP-clean
 result is claimed. No dependency, version or `Cargo.lock` byte changed. No
 Windows/MSVC runtime validation is claimed — this work ran on Linux only.
+
+---
+
+## Batch A4 — `node <symbol> -f <file>` returns the pinned definition's source body (2026-07-28)
+
+Ports upstream `ce983a0` (#1314). Base for this entry: `efc6fcd7` (Batch A3).
+One commit: the CLI flag, the engine's symbol+file pin, and tests.
+
+### Red (documented, with the actual wrong output)
+
+Two distinct defects, both measured on the real binary built from `efc6fcd7`
+against a temp project with TWO `setState` definitions (`src/alpha.ts` holding
+`ALPHA_MARKER`, `src/beta.ts` holding `BETA_MARKER`):
+
+1. **The CLI had no `-f` at all.** `codegraph node setState -f src/beta.ts`:
+
+```text
+error: unexpected argument '-f' found
+  tip: to pass '-f' as a value, use '-- -f'
+Usage: codegraph node [OPTIONS] <TARGET>
+```
+
+The tool's own `codegraph_node` schema says "pass `file`/`line` to pin one", and
+the ambiguity render tells the agent to pick one — but the shell had no way to.
+
+2. **The MCP tool IGNORED `file` when `symbol` was present.** `handle_node` only
+   consulted `file_hint` when `symbol` was ABSENT (`if symbol_raw.is_none() &&
+let Some(file_hint)`), so a pinned request fell through to the unpinned path.
+   Driven over real stdio with
+   `{"symbol":"setState","file":"src/beta.ts","includeCode":true}`:
+
+```text
+**2 definitions named "setState"**
+Returning 2 in full — pick the one you need (no Read required).
+
+## setState (function)
+**Location:** src/alpha.ts:1
+...  const ALPHA_MARKER = next + 1;
+---
+## setState (function)
+**Location:** src/beta.ts:1
+...  const BETA_MARKER = next + "!";
+```
+
+Both overloads, i.e. the pin did nothing. `cargo test --locked -p codegraph-rs
+--test node_file_pin_cli` → exit 101, 4 of 5 failing (the 5th pins the UNPINNED
+behaviour and passed both before and after).
+
+### Green (minimal)
+
+- `crates/codegraph-cli/src/main.rs`: new `-f/--file` on `Command::Node`, wired
+  through `cmd_node`. When present it sends
+  `{"symbol": target, "file": file, "includeCode": true}` — carrying
+  `includeCode` exactly like the bare-symbol branch, which is the upstream's
+  named root cause. File-view mode and the bare-symbol path are untouched.
+- `crates/codegraph-mcp/src/engine.rs`: `handle_node` now filters its matches by
+  the `file` hint when both `symbol` and `file` are given. One survivor renders
+  as a single definition (body + trail); several survivors render the ambiguity
+  view over the SURVIVORS only; zero survivors returns a not-found
+  `Symbol "X" not found in "<hint>"` rather than falling back to an arbitrary
+  overload — the same "silent miss beats a wrong answer" rule as Batch C.
+- New `file_path_matches_hint`: exact repo-relative path, a path suffix on a
+  SEGMENT boundary, or a bare basename; `\` normalized to `/` so a
+  Windows-style hint pins the same node. `src/myauth/session.ts` is NOT matched
+  by `auth/session.ts`, and `mysession.ts` is NOT matched by `session.ts`.
+
+### Proof through the REAL user-facing surface
+
+    $ codegraph node setState -f src/beta.ts
+    ## setState (function)
+    **Location:** src/beta.ts:1
+    **Signature:** `(next: string): string`
+    1	export function setState(next: string): string {
+    2	  const BETA_MARKER = next + "!";
+    3	  return BETA_MARKER;
+    4	}
+
+    $ codegraph node setState -f alpha.ts        # basename pin
+    ## setState (function)
+    **Location:** src/alpha.ts:1
+    1	export function setState(next: number): number {
+    2	  const ALPHA_MARKER = next + 1;
+    3	  return ALPHA_MARKER;
+    4	}
+
+    $ codegraph node setState -f src/nowhere.ts
+    Symbol "setState" not found in "src/nowhere.ts"
+
+The source body appears in stdout, and only the pinned overload's.
+
+### Golden row delta
+
+None. `git diff --stat 29f635b..HEAD -- reference/golden/` → EMPTY;
+`git status --short reference/golden/` → empty.
+`cargo test --locked -p codegraph-bench --test equivalence` → exit 0,
+**26 passed, 0 failed**. The 15 golden MCP fixtures still reach parity
+(`rmcp_parity`, `golden_mcp` green): none of them passes `symbol`+`file`, so the
+new branch is unreachable for them.
+
+### Negative control, EXECUTED
+
+`git stash push -- crates/codegraph-mcp/src/engine.rs
+crates/codegraph-cli/src/main.rs` (tests kept) →
+`cargo test --locked -p codegraph-rs --test node_file_pin_cli` → exit 101 with 4
+of 5 RED (the unpinned-behaviour test still ok). `git stash pop` restored both;
+restored SHA-256:
+
+- `crates/codegraph-mcp/src/engine.rs`
+  `ad925f79c47c3660b2a0406cf173018cf91560d046fb54f3a2282e1c82e0747a`
+- `crates/codegraph-cli/src/main.rs`
+  `aa580663f7c1ee8a7dc4f5cf41676a8c33946929ff89353c4ecee2c15b936231`
+
+Re-run with the fix restored → exit 0, 5 passed.
+
+### Verification (actual exit statuses)
+
+- `bash scripts/check-workspace-versions.sh` → exit 0, before every Cargo batch;
+  every Cargo command used `--locked`.
+- `cargo clippy --locked --workspace --all-targets -- -D warnings` → exit 0.
+- `cargo test --locked -p codegraph-rs --test node_file_pin_cli` → exit 0,
+  5 passed.
+- `cargo test --locked -p codegraph-mcp --lib file_path_matches_hint…` → exit 0.
+- `cargo test --locked -p codegraph-mcp --lib ext_node_symbol_plus_file…` →
+  exit 0.
+- `cargo test --locked -p codegraph-mcp -p codegraph-rs` → **exit 101**, failing
+  ONLY `codegraph-rs formatter_and_env_tests::install_completions_writes_zsh_
+fish_elvish_into_home` — the KNOWN pre-existing in-process `HOME`/
+  `XDG_DATA_HOME` race documented in the Batch C2/C3 entries, unrelated to the
+  `node` command. NOT weakened, skipped, `#[ignore]`d or modified. Re-run in
+  isolation (`--bin codegraph <that test>`) → exit 0, 1 passed.
+- `cargo test --locked -p codegraph-bench --test equivalence` → exit 0, 26/26.
+- `make ci CARGO='cargo --locked'` was run repeatedly as the final Batch A gate.
+  The LAST run, executed after the last byte of this commit (code, tests and this
+  prose, then `make fmt`), exited **0** with `✅ All CI checks passed!`. Earlier
+  runs in the same session hit two KNOWN pre-existing flakes, both reported here
+  rather than hidden:
+  - `codegraph-rs formatter_and_env_tests::install_completions_writes_zsh_fish_elvish_into_home`
+    — the in-process `HOME`/`XDG_DATA_HOME` race documented in the Batch C2/C3
+    entries (2 of 6 runs). Passes in isolation: exit 0, 1 passed.
+  - `codegraph-rs batch_m_legacy_extension_override::verify_legacy_binary_rejects_a_wrong_executable_version`
+    — fails with `run configured legacy binary …/stub-legacy --version: Text
+file busy (os error 26)` (2 of 6 runs). The test writes a stub executable
+    and immediately execs it; under a loaded multi-threaded workspace run the
+    write handle can still be open. Run in isolation SIX consecutive times: exit
+    0 every time, zero `Text file busy` hits. This test file is NOT in Batch A's
+    diff (`git diff --name-only 29f635b..HEAD` does not list it); its last commit
+    is `25b78a8`, before this batch.
+    Neither test was weakened, skipped, `#[ignore]`d, given a sleep, or modified in
+    any way. Gate runs left untracked SQLite byproducts under `reference/golden/`
+    (`metal/`, `solidity/` `colby.db-{wal,shm}`), which are not gitignored; they
+    were deleted before staging and no tracked golden changed.
+- `sha256sum Cargo.lock` →
+  `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`, unchanged.
+
+`lsp_diagnostics` again refused this worktree (`LSP file path must be inside
+request cwd`); locked Cargo clippy/test is the honest fallback and no LSP-clean
+result is claimed. No dependency, version or `Cargo.lock` byte changed. No
+Windows/MSVC runtime validation is claimed — the `\`-normalization is asserted
+by a unit test on Linux only.
+
+```
+
+```

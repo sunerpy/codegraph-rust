@@ -397,6 +397,29 @@ impl CodeGraphEngine {
                 "Symbol \"{symbol}\" not found in the codebase"
             )));
         }
+        // `symbol` + `file` (#1314): the schema promises `file` PINS an
+        // overloaded name to the definition in that file. A pin that matches
+        // nothing reports not-found rather than falling back to an arbitrary
+        // overload — a silent miss beats a wrong answer.
+        if let Some(file_hint) = file_hint {
+            let pinned: Vec<Node> = matches
+                .iter()
+                .filter(|n| file_path_matches_hint(&n.file_path, file_hint))
+                .cloned()
+                .collect();
+            if pinned.is_empty() {
+                return Ok(ToolResult::not_found_text(format!(
+                    "Symbol \"{symbol}\" not found in \"{file_hint}\""
+                )));
+            }
+            if pinned.len() == 1 {
+                let rendered = self.render_node_section(&pinned[0], include_code)?;
+                return Ok(ToolResult::text(truncate_output(&rendered)));
+            }
+            return Ok(ToolResult::text(truncate_output(
+                &self.render_ambiguous_node(symbol, &pinned, include_code)?,
+            )));
+        }
         if matches.len() == 1 {
             let rendered = self.render_node_section(&matches[0], include_code)?;
             return Ok(ToolResult::text(truncate_output(&rendered)));
@@ -2368,6 +2391,28 @@ fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+/// Whether an indexed `file_path` is the file a `codegraph_node` `file` hint
+/// names (#1314). Accepts the exact repo-relative path, a path suffix on a
+/// segment boundary (`auth/session.ts` for `src/auth/session.ts`), or a bare
+/// basename (`session.ts`). Separators are normalized so a Windows-style hint
+/// pins the same node as its POSIX form.
+fn file_path_matches_hint(file_path: &str, hint: &str) -> bool {
+    let normalize = |s: &str| s.replace('\\', "/").trim_start_matches("./").to_string();
+    let path = normalize(file_path);
+    let hint = normalize(hint);
+    if hint.is_empty() {
+        return false;
+    }
+    if path == hint {
+        return true;
+    }
+    if !hint.contains('/') {
+        return path.rsplit('/').next() == Some(hint.as_str());
+    }
+    path.strip_suffix(hint.as_str())
+        .is_some_and(|prefix| prefix.ends_with('/'))
+}
+
 /// `matchesSymbol` (`tools.ts:3175-3210`).
 fn matches_symbol(node: &Node, symbol: &str) -> bool {
     if node.name == symbol {
@@ -3143,6 +3188,90 @@ mod tests {
         let engine = test_engine();
         let tr = engine.execute("codegraph_impact", &serde_json::json!({}));
         assert_eq!(tr.is_error, Some(true));
+    }
+
+    #[test]
+    fn file_path_matches_hint_accepts_exact_suffix_and_basename_only() {
+        assert!(file_path_matches_hint(
+            "src/auth/session.ts",
+            "src/auth/session.ts"
+        ));
+        assert!(file_path_matches_hint(
+            "src/auth/session.ts",
+            "auth/session.ts"
+        ));
+        assert!(file_path_matches_hint("src/auth/session.ts", "session.ts"));
+        assert!(file_path_matches_hint(
+            "src/auth/session.ts",
+            "./src/auth/session.ts"
+        ));
+        // Windows-style hint pins the same node as its POSIX form.
+        assert!(file_path_matches_hint(
+            "src/auth/session.ts",
+            "auth\\session.ts"
+        ));
+        // A suffix that does not land on a segment boundary is NOT a match.
+        assert!(!file_path_matches_hint(
+            "src/myauth/session.ts",
+            "auth/session.ts"
+        ));
+        // A basename hint must match the basename, not a substring of it.
+        assert!(!file_path_matches_hint(
+            "src/auth/mysession.ts",
+            "session.ts"
+        ));
+        assert!(!file_path_matches_hint("src/auth/session.ts", "other.ts"));
+        assert!(!file_path_matches_hint("src/auth/session.ts", ""));
+    }
+
+    #[test]
+    fn ext_node_symbol_plus_file_pins_to_that_definition_and_reports_a_bad_pin() {
+        let mut engine = test_engine();
+        let alpha = node_lang(
+            "setState",
+            "setState",
+            "src/alpha.ts",
+            1,
+            4,
+            NodeKind::Function,
+            Language::TypeScript,
+        );
+        let beta = node_lang(
+            "setState",
+            "setState",
+            "src/beta.ts",
+            1,
+            4,
+            NodeKind::Function,
+            Language::TypeScript,
+        );
+        put_nodes(&mut engine, &[alpha, beta]);
+
+        let pinned = engine.execute(
+            "codegraph_node",
+            &serde_json::json!({"symbol": "setState", "file": "src/beta.ts", "includeCode": true}),
+        );
+        let txt = text_of(&pinned);
+        assert!(txt.contains("src/beta.ts"), "got: {txt}");
+        assert!(
+            !txt.contains("src/alpha.ts"),
+            "the pin must exclude the other overload: {txt}"
+        );
+        assert!(
+            !txt.contains("definitions named"),
+            "a resolved pin renders one definition, not the ambiguity list: {txt}"
+        );
+
+        let bad = engine.execute(
+            "codegraph_node",
+            &serde_json::json!({"symbol": "setState", "file": "src/nowhere.ts"}),
+        );
+        assert_eq!(bad.not_found, Some(true));
+        assert!(
+            text_of(&bad).contains("not found in \"src/nowhere.ts\""),
+            "got: {}",
+            text_of(&bad)
+        );
     }
 
     #[test]
