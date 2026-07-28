@@ -7666,3 +7666,129 @@ hits, each justified:
 `docs/cli.md`'s watcher-pruning list intentionally names BOTH `.codegraph` and
 `.codegraph-v2` (it is an ignore set covering both spellings, per
 `policy.rs:191`), so it does not appear as a `.codegraph/` hit but is correct.
+
+## Batch F1 — the gdext decision no longer rests on a false build-time claim (2026-07-29)
+
+`docs/godot-gdext-decision.md` (added by `956cf32`) argued the right conclusion
+from a verifiably wrong premise. An independent audit caught it. The verdict is
+unchanged — `gdext` is still rejected, and still unnecessary — but an argument a
+reader can falsify in five minutes discredits the whole record, so the premise is
+corrected rather than defended.
+
+### The incorrect claim, verbatim
+
+From "What gdext actually is":
+
+> Its type surface (`Node`, `Callable`, `NodePath`, …) is generated from
+> `extension_api.json`, which ships with a specific Godot build
+
+and, restating it, from disqualifier 1 ("It requires the engine; CodeGraph
+deliberately does not"):
+
+> `gdext` would make Godot analysis conditional on having a matching Godot binary
+> and its `extension_api.json` present at build time.
+
+### The official source that refutes it
+
+`https://docs.rs/godot/latest/godot/#cargo-features` (crate `godot`, version
+`0.5.4`, the `gdext` binding's public crate). Under _Godot version and
+configuration_ it documents `api-4-{minor}`, `api-custom` and `api-custom-json`
+together:
+
+> Sets the **API level** to the specified Godot version, or a custom-built local
+> binary. You can use at most one `api-*` feature. If absent, the current Godot
+> minor version is used, with patch level 0.
+>
+> `api-custom` feature requires specifying `GDRUST_GODOT_BIN` environment
+> variable with a path to your Godot4 binary.
+>
+> The `api-custom-json` feature requires specifying `GDRUST_GODOT_API_JSON`
+> environment variable with a path to your custom-defined `extension_api.json`.
+
+So a plain `gdext` dependency builds against an API description bundled with the
+crate and pinned by the crate version; an engine binary is needed only under
+`api-custom`, and a hand-supplied `extension_api.json` only under
+`api-custom-json`. `https://docs.rs/crate/godot/latest/features` corroborates the
+opt-in status: of 22 features exactly one (`__codegen-full`) is on by default —
+neither `api-custom` nor `api-custom-json` is.
+
+### What changed
+
+- "What gdext actually is" now says the type surface is generated from Godot's
+  `extension_api.json` and is only meaningful once the engine has initialized,
+  and adds an explicit paragraph stating that an earlier draft got the build step
+  wrong, quoting the docs.rs text and naming `api-custom` / `api-custom-json`
+  with their environment variables.
+- Disqualifier 1 is reframed from build time to **run** time: `gdext` code only
+  executes as a GDExtension loaded by a Godot process, so `codegraph index` would
+  stop being a self-contained command. That is the true and sufficient form of
+  the objection.
+- The verdict paragraph still opens with the rejection, now resting on the
+  load-bearing reason alone: no offline API for reading `.gd` / `.tscn` /
+  `.tres` / `project.godot`.
+- Former disqualifier 3 ("It solves none of the recorded gaps") is renumbered 2.
+
+Untouched and still valid: the four ranked alternatives and their ordering, the
+`unverified` marking on whether a newer `tree-sitter-gdscript` than the pinned
+`6.1.0` exists, the `godot:dynamic:*` sentinel defence, and the recommendation
+(not action) to widen `scripts/guardrail.sh`. No "Conclusion" section was added.
+
+### Why disqualifier 2 does not survive
+
+The dropped disqualifier claimed adopting `gdext` "breaks byte-stable
+determinism" because "[b]indings generated from a specific engine version make
+output a function of that version, so the same corpus could produce different
+goldens on different release runners". With the prebuilt default that premise is
+gone: the generated surface is fixed by the crate version, exactly as
+reproducible as any other pinned dependency, and it becomes runner-dependent only
+under `api-custom` (engine binary) or `api-custom-json` (local JSON) — features
+nobody proposed. Kept as written it would be a second false claim; narrowed to
+"true only for `api-custom`" it would be an objection to a configuration nobody
+suggested, i.e. filler. The verdict does not need three disqualifiers, so it is
+**dropped rather than kept for symmetry**. What replaces it is a sharper true
+observation folded into the corrected prose: the real determinism risk was never
+the bindings but that any output derived from a live engine's state is not a pure
+function of the corpus — which is the runtime problem disqualifier 1 already
+states.
+
+### Gates — real exit statuses
+
+Run in the mandated order, each separately (no `&&` chaining, so no tail is
+hidden):
+
+| Command                                       | Exit                               |
+| --------------------------------------------- | ---------------------------------- |
+| `make fmt`                                    | **0**                              |
+| `bash scripts/check-workspace-versions.sh`    | **0** (`OK`, workspace `0.40.4`)   |
+| `make ci CARGO='cargo --locked'` — final gate | **0** (`✅ All CI checks passed!`) |
+
+The final `make ci` above is the one taken after the last byte of this batch, and
+it exited 0. It was not the only run: `make ci` was invoked repeatedly here, once
+after the first ledger draft and again after each prose correction, and MORE THAN
+HALF of those invocations exited non-zero (`101` from `make: *** [Makefile:127:
+test] Error 101`, surfacing as `2` from `make ci` itself). Every single red run
+failed on the KNOWN pre-existing flake
+`formatter_and_env_tests::install_completions_writes_zsh_fish_elvish_into_home`
+and on nothing else: 352 passed / 1 failed every time, with the assertion landing
+on a different line from run to run (`main.rs:6213`, then `main.rs:6224`), and one
+log showing a completion actually written into the real
+`/config/.config/fish/completions/` instead of the test's temp `HOME`. That is the
+documented in-process `HOME`/`XDG_DATA_HOME` race, not a docs regression — this
+batch changes two Markdown files and no Rust at all. The flake is reproducing more
+often on this host than the ~4-in-8 previously recorded. The test was NOT
+weakened, skipped or ignored, and the red runs are recorded here rather than
+quietly discarded.
+
+The equivalence oracle also left untracked
+`reference/golden/{erlang,mini}/colby.db-{wal,shm}` behind on several runs; they
+are not gitignored and were deleted before staging, so the commit contains no
+golden-directory byte.
+
+**Scope.** `git diff --name-only e728937..HEAD` lists only
+`docs/godot-gdext-decision.md` and this ledger. `git diff --stat
+e728937..HEAD -- reference/golden/` is empty; `Cargo.lock` SHA-256 unchanged at
+`750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`.
+
+**Not claimed.** No native Windows/MSVC validation — every command ran on this
+Linux host. The docs.rs pages were read over the network as cited; no `gdext`
+build was attempted, and none is needed to verify a documented feature contract.

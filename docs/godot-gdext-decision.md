@@ -9,43 +9,61 @@ bindings — to improve Godot/GDScript analysis.
 ## Verdict
 
 **Rejected, and unnecessary.** `gdext` is a binding for Rust code running inside
-a live Godot engine, so adopting it would add an engine dependency to a
-standalone binary and make output depend on the engine version, while solving
-none of the gaps recorded in [`docs/godot.md`](godot.md#limitations) — those are
-either genuinely runtime-only or solvable with better static parsing.
+a live Godot engine. It exposes no offline API for reading `.gd`, `.tscn`,
+`.tres` or `project.godot`, so it cannot do the job CodeGraph does, and it
+solves none of the gaps recorded in
+[`docs/godot.md`](godot.md#limitations) — those are either genuinely runtime-only
+or solvable with better static parsing.
 
 ## What gdext actually is
 
 `gdext` compiles Rust into a GDExtension shared library that Godot loads at
 startup. Its type surface (`Node`, `Callable`, `NodePath`, …) is generated from
-`extension_api.json`, which ships with a specific Godot build, and those types
-are only meaningful once the engine has initialized. It is not a GDScript
-parser, not a `.tscn`/`.tres` reader, and offers no offline API for inspecting
-project files. Anything CodeGraph wanted from it would require launching Godot.
+Godot's `extension_api.json`, and those types are only meaningful once the engine
+has initialized — a `Gd<Node>` is a handle into a running engine's object
+database, not a description of a file on disk. It is not a GDScript parser, not
+a `.tscn`/`.tres` reader, and offers no offline API for inspecting project files.
+Anything CodeGraph wanted from it would require launching Godot.
+
+To be precise about the build step, because an earlier draft of this document got
+it wrong: a plain `gdext` dependency does **not** need a Godot binary present at
+build time. Per the crate docs
+([docs.rs/godot 0.5.4, "Cargo features"](https://docs.rs/godot/latest/godot/#cargo-features)),
+the `api-*` features "Set the **API level** to the specified Godot version, or a
+custom-built local binary… If absent, the current Godot minor version is used,
+with patch level 0" — i.e. the bindings are generated from an API description
+bundled with the crate and pinned by its version. Only the two opt-in features
+need an engine or a hand-supplied API: "`api-custom` feature requires specifying
+`GDRUST_GODOT_BIN` environment variable with a path to your Godot4 binary. The
+`api-custom-json` feature requires specifying `GDRUST_GODOT_API_JSON` environment
+variable with a path to your custom-defined `extension_api.json`." The engine
+requirement is at **run** time — Godot loads the produced library — and that is
+the part that disqualifies `gdext` here.
+
+An earlier draft also argued that `gdext` would break the golden `.schema`
+byte-stability invariant because its bindings vary with the installed engine.
+That argument does not survive the correction: with the default prebuilt API the
+generated surface is fixed by the crate version, so it is as reproducible as any
+other pinned dependency, and it would only become runner-dependent under
+`api-custom` (engine binary) or `api-custom-json` (hand-supplied JSON) — features
+nobody is proposing. The determinism objection is therefore dropped rather than
+kept for symmetry. The real determinism risk was never the bindings; it is that
+any output derived from a live engine's state is not a pure function of the
+corpus, which is the runtime problem stated above.
 
 ## Why it disqualifies itself
 
-**1. It requires the engine; CodeGraph deliberately does not.**
+**1. It requires the engine at runtime; CodeGraph deliberately requires none.**
 `docs/godot.md` opens by stating that CodeGraph parses Godot project files
 "— no engine required, no compilation, no runtime". Releases are standalone
 binaries, and README.md notes that "Linux builds are statically linked (musl) —
 no glibc or SQLite system dependency". Users indexing a Godot repo on CI, on a
 server, or on a machine without the editor installed are a supported case.
-`gdext` would make Godot analysis conditional on having a matching Godot binary
-and its `extension_api.json` present at build time.
+`gdext` code only executes as a GDExtension loaded by a Godot process, so
+reaching its types at all would mean shipping or locating an engine and starting
+it. `codegraph index` would stop being a self-contained command.
 
-**2. It breaks byte-stable determinism.**
-`AGENTS.md` lists as a hard invariant: "**Golden `.schema` byte-stability** —
-verified by `crates/codegraph-bench/tests/equivalence.rs` against the fixed
-golden artifacts under `reference/golden/`", with `reference/golden/godot/`
-guarding the autoload-call edges, signal-handler edges, and UID-form autoloads
-"byte-for-byte". `AGENTS.md` also requires "**Deterministic** extraction +
-resolution". Bindings generated from a specific engine version make output a
-function of that version, so the same corpus could produce different goldens on
-different release runners. That is not reconcilable with a fixed golden checked
-into the repository.
-
-**3. It solves none of the recorded gaps.**
+**2. It solves none of the recorded gaps.**
 The limitations in [`docs/godot.md`](godot.md#limitations) split cleanly, and
 neither half needs an engine binding:
 
