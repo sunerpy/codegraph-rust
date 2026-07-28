@@ -54,7 +54,18 @@ jobs:
       # (tree-sitter/libsqlite3-sys/ring) require MSVC tooling. Runtime
       # correctness is gated by the native windows-latest job below.
 
-      - name: Scope guardrail (no AI / vector / LLM crates)
+      # The guardrail's asset-name drift gate parses release-please.yml with
+      # yaml.safe_load, so PyYAML must be importable. Idempotent: installs only
+      # when the runner image does not already ship it. A missing PyYAML must
+      # never degrade the gate into a silent skip — the gate itself exits nonzero
+      # in that case, and this step fails loudly first.
+      - name: Ensure PyYAML (asset-name drift gate)
+        run: |
+          python3 -c 'import yaml' \
+            || python3 -m pip install --break-system-packages PyYAML \
+            || python3 -m pip install PyYAML
+
+      - name: Scope guardrail (no AI/vector/LLM crates + release asset-name drift)
         run: bash scripts/guardrail.sh
 
   windows:

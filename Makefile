@@ -126,7 +126,8 @@ test:
 	@echo "🧪 Running tests..."
 	$(CARGO) test --workspace
 
-# Scope guardrail: no AI / vector / LLM crates allowed in the workspace
+# Scope guardrail: no AI / vector / LLM crates in the workspace, and no drift
+# between the release workflow's asset names and what the installers download.
 guardrail:
 	@echo "🛡️  Running scope guardrail..."
 	bash scripts/guardrail.sh

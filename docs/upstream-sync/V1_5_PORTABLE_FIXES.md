@@ -6433,3 +6433,229 @@ canonicalization byte changed. `KNOWN_DIFFS.md` itself is untouched.
 and refused this worktree again (`LSP file path must be inside request cwd`); no
 LSP-clean result is claimed. The equivalent evidence is the locked `clippy -D
 warnings` run above plus `make ci`.
+
+## Batch E2 — the asset-name contract becomes machine-checked (2026-07-28)
+
+### The three-way verification came back CLEAN
+
+Before writing a line of code the three producers of the release archive name were
+read side by side and compared literally. They agree today:
+
+| surface                   | name expression                                                                                |
+| ------------------------- | ---------------------------------------------------------------------------------------------- |
+| workflow tar.gz packaging | `dist/${BINARY_NAME}-${{ needs.release-please.outputs.version }}-${{ matrix.target }}.tar.gz`  |
+| workflow zip packaging    | `dist/${env:BINARY_NAME}-${{ needs.release-please.outputs.version }}-${{ matrix.target }}.zip` |
+| artifact upload           | `name: dist-${{ matrix.target }}`, `path: dist/*`                                              |
+| `upload-assets` download  | `pattern: dist-*`, `merge-multiple: true`                                                      |
+| `scripts/install.sh`      | `BIN="codegraph"`, `asset="${BIN}-${version}-${target}.${ext}"`                                |
+| `scripts/install.ps1`     | `$Bin = 'codegraph'`, `$asset = "$Bin-$version-$target.$ext"`                                  |
+
+`env.BINARY_NAME` is `codegraph`, identical to `install.sh`'s `BIN` and
+`install.ps1`'s `$Bin`. `install.sh` builds `target="${arch_part}-${os_part}"`
+from `{x86_64, aarch64} x {unknown-linux-musl, apple-darwin}`, and `install.ps1`
+builds `"$archPart-pc-windows-msvc"` from `{x86_64, aarch64}` — together exactly
+the six matrix triples, no orphan on either side. The `aarch64-pc-windows-msvc`
+question was checked specifically, because it is the one target whose installer
+path is easy to get wrong: `install.ps1` matches `^(ARM64|aarch64)$` against
+`PROCESSOR_ARCHITEW6432` (falling back to `PROCESSOR_ARCHITECTURE`, then
+`RuntimeInformation.OSArchitecture`), so a Windows-on-ARM host does yield
+`aarch64-pc-windows-msvc`. **No defect was found there**; nothing in either
+installer needed changing, and neither installer's checksum logic was touched.
+
+So this commit fixes no bug. It closes a hole in the _process_.
+
+### The gap: agreement with no mechanism to keep it
+
+The agreement above is a property of the current bytes, not an enforced invariant.
+`tar -czf "dist/…"` in the workflow and `asset="…"` in `install.sh` are two
+independent string concatenations with nothing linking them. Change either one and
+`cargo test`, `clippy`, `fmt`, the guardrail, and all six cross-compiles still
+pass — CI has no opinion about it. The failure surfaces only _after_ a release: the
+archives are already public, `SHA256SUMS` is already generated over the
+differently-named files, `publish-release` has already flipped the Release to
+`draft=false`, and the one-liner installers 404. That is a real, foreseeable
+failure path with, until now, zero protection. E3 made the _contents_ of a release
+verifiable; E2 makes the _names_ verifiable.
+
+### What was added
+
+`scripts/check-asset-names.sh` — a standalone gate that re-derives all three names
+**from the real files** on every run (`.github/workflows/release-please.yml` via
+`yaml.safe_load`, `scripts/install.sh` and `scripts/install.ps1` via anchored
+regexes over their actual source). It hard-codes no expected asset name: the only
+literal it owns is the canonical skeleton `<bin>-<version>-<target>.<ext>`, which
+is a _shape_, not a copy of any side's value. A hard-coded duplicate of the
+expected names would itself drift and turn the gate into decoration.
+
+Seven assertions, each naming the side at fault when it trips:
+
+1. `binary-name` — `env.BINARY_NAME` == `BIN` == `$Bin`.
+2. asset skeleton — all four name expressions (workflow tar.gz, workflow zip,
+   `install.sh`, `install.ps1`) normalize to the same skeleton.
+3. `extension(unix|windows)` — the workflow's packaged extension per family
+   equals the extension the matching installer downloads.
+4. `target-coverage` — every matrix target is producible by **exactly one**
+   installer's platform detection, with that installer's extension; and no
+   installer can ask for a target the matrix never builds (both directions).
+5. `artifact-plumbing` — the rendered `upload-artifact` `name:` matches the
+   `download-artifact` `pattern:`, `merge-multiple` is `true`, and `path:` covers
+   the packaged archives.
+6. `release-files` — every rendered archive, plus the `SHA256SUMS` name both
+   installers fetch, is covered by a release `files:` glob.
+7. `archive-member` — the workflow tars/zips the same in-archive binary name the
+   installers extract (`codegraph` / `codegraph.exe`).
+
+### Granularity — the deliberate trade-off
+
+Comparison is on the **normalized skeleton**, not on raw source bytes. Each side's
+expression is parsed and its interpolations are replaced by canonical placeholders
+(`${BINARY_NAME}`/`${env:BINARY_NAME}`/`$Bin`/`${BIN}` → `<bin>`,
+`${{ needs.*.outputs.version }}`/`$version`/`${version}` → `<version>`, and so on),
+then all four must reduce to `<bin>-<version>-<target>.<ext>`.
+
+- Too strict (exact source-string comparison) would redden on YAML re-indentation,
+  a renamed shell variable, or routing the version through a different workflow
+  expression — none of which change a single published byte. False alarms train
+  people to weaken the gate.
+- Too loose (e.g. "does the name contain the version somewhere") would miss field
+  reordering, a changed separator, or a stray prefix — the exact mutations that
+  break the installers.
+
+The skeleton sits between the two: blind to how a value is spelled, sensitive to
+field order, separators, affixes, and extension. Scenario C in the harness pins
+the loose end (a comment plus requoting `path: dist/*` → `path: "dist/*"` stays
+green); scenarios D and G pin the strict end (a `-` → `_` separator change and a
+`<version>`/`<target>` swap both go red). The globs (`pattern:`, `path:`,
+`files:`) are additionally matched against _concrete_ rendered names using
+`fnmatch`, so the plumbing that moves the archives is checked, not just the
+archives' names.
+
+Where the gate cannot parse a side, it **fails** (exit 2) rather than passing —
+an unverifiable contract is exactly when drift hides. Scenario J proves it.
+
+### Negative control, EXECUTED — four mutants, each blamed correctly
+
+Each mutant was applied to a throwaway copy of the three real files (the real
+repository tree was never modified) and the gate run against that fixture root.
+Real output:
+
+```text
+##### MUTANT m1 — workflow tar.gz separator `-` → `_` #####
+check-asset-names: MISMATCH [workflow(tar.gz)]: asset skeleton is '<bin>_<version>-<target>.<ext>' but the other sides use '<bin>-<version>-<target>.<ext>'
+check-asset-names: FAIL: 1 asset-name disagreement(s) between the release workflow and the installers
+EXIT=1
+
+##### MUTANT m2 — install.sh BIN="codegraph" → "codegraf" #####
+check-asset-names: MISMATCH [binary-name]: workflow env.BINARY_NAME='codegraph' vs install.sh BIN='codegraf' vs install.ps1 $Bin='codegraph'
+check-asset-names: FAIL: 1 asset-name disagreement(s) between the release workflow and the installers
+EXIT=1
+
+##### MUTANT m3 — upload-assets `pattern: dist-*` → `bins-*` #####
+check-asset-names: MISMATCH [artifact-plumbing]: upload-artifact name 'dist-x86_64-unknown-linux-musl' does not match upload-assets pattern 'bins-*'
+check-asset-names: MISMATCH [artifact-plumbing]: upload-artifact name 'dist-aarch64-unknown-linux-musl' does not match upload-assets pattern 'bins-*'
+check-asset-names: MISMATCH [artifact-plumbing]: upload-artifact name 'dist-x86_64-apple-darwin' does not match upload-assets pattern 'bins-*'
+check-asset-names: MISMATCH [artifact-plumbing]: upload-artifact name 'dist-aarch64-apple-darwin' does not match upload-assets pattern 'bins-*'
+check-asset-names: MISMATCH [artifact-plumbing]: upload-artifact name 'dist-x86_64-pc-windows-msvc' does not match upload-assets pattern 'bins-*'
+check-asset-names: MISMATCH [artifact-plumbing]: upload-artifact name 'dist-aarch64-pc-windows-msvc' does not match upload-assets pattern 'bins-*'
+check-asset-names: FAIL: 6 asset-name disagreement(s) between the release workflow and the installers
+EXIT=1
+
+##### MUTANT m4 — install.ps1 loses the `^(ARM64|aarch64)$` arm #####
+check-asset-names: MISMATCH [target-coverage]: matrix target 'aarch64-pc-windows-msvc' cannot be produced by either installer's platform detection (install.sh yields ['aarch64-apple-darwin', 'aarch64-unknown-linux-musl', 'x86_64-apple-darwin', 'x86_64-unknown-linux-musl']; install.ps1 yields ['x86_64-pc-windows-msvc'])
+check-asset-names: FAIL: 1 asset-name disagreement(s) between the release workflow and the installers
+EXIT=1
+```
+
+Each mutant names a **different** category — `workflow(tar.gz)`, `binary-name`,
+`artifact-plumbing`, `target-coverage` — and the harness additionally asserts the
+_absence_ of the other categories, so a mutant cannot pass by reddening something
+unrelated. The `m4` shape is the ARM64-coverage question from the audit above,
+inverted into a test: were the ARM64 arm ever dropped, the gate now says so by
+name.
+
+### Tests added — `scripts/tests/asset-name-drift.test.sh`
+
+Ten scenarios, no Cargo, no network, no repository file touched (each copies the
+three real files into a `mktemp -d` fixture and mutates one). Mutation anchors are
+asserted present before substitution, so a future refactor that moves an anchor
+makes the harness fail loudly instead of silently neutering a mutant into a no-op:
+
+| scenario              | mutation                                  | expect                                             |
+| --------------------- | ----------------------------------------- | -------------------------------------------------- |
+| A `pristine`          | none (verbatim copies)                    | `0`, all six targets listed with their owner       |
+| B `repository`        | none, run on the real repo root           | `0`, `check-asset-names: OK`                       |
+| C `cosmetic`          | comment + requote `path:`/`pattern:`      | `0` — churn is not drift                           |
+| D `workflow_tar_name` | tar.gz separator `-` → `_`                | `1`, blames `workflow(tar.gz)` only                |
+| E `install_sh_bin`    | `BIN="codegraf"`                          | `1`, blames `binary-name`, prints all three values |
+| F `download_pattern`  | `pattern: bins-*`                         | `1`, blames `artifact-plumbing`                    |
+| G `ps1_field_order`   | `$Bin-$target-$version.$ext`              | `1`, blames `install.ps1` only                     |
+| H `ps1_drops_arm64`   | delete the `^(ARM64\|aarch64)$` arm       | `1`, names `aarch64-pc-windows-msvc`               |
+| I `sums_unpublished`  | drop `dist/SHA256SUMS` from `files:`      | `1`, blames `release-files`                        |
+| J `unparsable`        | replace `tar -czf` with `bsdtar --create` | nonzero — fails CLOSED, never a silent pass        |
+
+Scenario I is the E2/E3 seam: E3's `SHA256SUMS` is only useful if it is actually
+published under the name both installers fetch, so an unpublished sums file is
+asset-name drift and reddens here. E3's own harness and the workflow's
+`Generate SHA256SUMS` step were not modified.
+
+### CI wiring — inside `scripts/guardrail.sh`, not a new `make ci` step
+
+The gate runs as a second block of `scripts/guardrail.sh` rather than as its own
+Makefile target. Reason: `guardrail` is the single step already invoked by **all
+four** enforcement paths — `make ci`, the `.githooks/pre-push` hook, the CI `test`
+job, and (transitively) the release workflow's `verify-ci` wait on `CI Success`. A
+new `make ci` target would be missed by the pre-push hook and by CI unless three
+more files were edited, and a check that only some paths run is not a gate. The
+guardrail is also the right conceptual home: both blocks assert repository-level
+invariants that no Rust test can express. `ci.yml` gains one idempotent step that
+ensures PyYAML is importable, so a missing parser can never degrade the gate into
+a skip (and the gate itself exits nonzero if the import fails anyway). The
+guardrail resolves the gate by `dirname "$0"`, so it works from any cwd —
+verified by running it from `/tmp`.
+
+### Windows — runtime-UNVERIFIED
+
+`install.ps1` is read, not executed: this host is Linux with no PowerShell. The
+`aarch64-pc-windows-msvc` conclusion above is a **code-reading argument** about
+`PROCESSOR_ARCHITEW6432` / `PROCESSOR_ARCHITECTURE` / `RuntimeInformation`, and the
+gate's knowledge of `install.ps1` is likewise static parsing of its source. No
+native Windows/MSVC runtime verification was performed or is claimed. The file's
+bytes are unchanged by this commit, so no new Windows risk is introduced.
+
+### Golden delta
+
+`GIT_MASTER=1 git diff --stat 5c585ec..HEAD -- reference/golden/` → **EMPTY**. This
+commit adds two shell scripts and edits `guardrail.sh`, `Makefile`, `ci.yml`,
+`.githooks/pre-push`, and this ledger. No extraction, resolution, or
+canonicalization code was touched, so no golden could change and none was
+regenerated.
+
+### Verification (actual exit statuses)
+
+- `bash scripts/check-asset-names.sh` → exit **0** (`check-asset-names: OK`, six
+  matrix targets, each owned by exactly one installer).
+- `bash scripts/tests/asset-name-drift.test.sh` → exit **0**, **10 passed, 0
+  failed**.
+- Four standalone mutants → exit **1**, **1**, **1**, **1** with the diagnostics
+  quoted verbatim above.
+- `bash scripts/guardrail.sh` → exit **0** from the repo root and exit **0** from
+  `/tmp` (cwd independence).
+- `python3 -c 'import yaml'` → exit **0** (PyYAML 6.0.3 on this host);
+  `yaml.safe_load` on the mutated `ci.yml` parses and lists the new step between
+  `Run tests …` and `Scope guardrail …`.
+- `bash scripts/check-workspace-versions.sh` → recorded below; run before the
+  Cargo-invoking gates. Every Cargo command used `--locked`.
+- `cargo test --locked -p codegraph-bench --test equivalence` → recorded below
+  (floor: 28 after E1).
+- `make ci CARGO='cargo --locked'` → final gate, run after the last byte of this
+  prose and `make fmt`; recorded below.
+- `sha256sum Cargo.lock` →
+  `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`, unchanged.
+  No dependency was added, no version byte moved; release-please still owns
+  versions.
+
+`lsp_diagnostics` was attempted and refused this worktree again (`LSP file path
+must be inside request cwd`); no LSP-clean result is claimed. The changed files are
+shell, YAML and Markdown, which the Rust toolchain does not lint — the honest
+checks for them are the executable harness, the four mutants, the YAML parse, and
+`make ci`.
