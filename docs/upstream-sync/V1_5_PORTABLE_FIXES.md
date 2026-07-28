@@ -7792,3 +7792,121 @@ e728937..HEAD -- reference/golden/` is empty; `Cargo.lock` SHA-256 unchanged at
 **Not claimed.** No native Windows/MSVC validation — every command ran on this
 Linux host. The docs.rs pages were read over the network as cited; no `gdext`
 build was attempted, and none is needed to verify a documented feature contract.
+
+## F4 round-two documentation blockers: two false statements corrected
+
+Round two of the F1–F4 review wave rejected F4 on four blockers. Two were false
+statements in committed documentation. Both are corrected here; the other two
+were adjudicated (a claimed daemon-path contract conflict rested on a
+mis-briefing, and the known test flakes predate this branch). Documentation only:
+no `.rs`, no `Cargo.*`, no workflow, no `scripts/`, no golden byte.
+
+### Blocker 1 — `docs/equivalence.md` named a file that does not exist
+
+The committed text, verbatim (`docs/equivalence.md:739-740` at `c8968ad`):
+
+> Tier-3 differences are allowlisted by grep-able lines in repo-root
+> `KNOWN_DIFFS.md`:
+
+`ls KNOWN_DIFFS.md` → `No such file or directory` (exit 2). The file that does
+exist is `docs/upstream-sync/KNOWN_DIFFS.md` (11133 bytes), and it is the ONLY
+path the oracle ever reads —
+`crates/codegraph-bench/src/oracle/diff.rs:141-147`:
+
+```rust
+pub fn repo_doc_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("codegraph-bench lives under crates/")
+        .join("docs/upstream-sync/KNOWN_DIFFS.md")
+}
+```
+
+The path is now named correctly, attributed to `KnownDiffs::repo_doc_path`.
+
+The surrounding section also still described only the pre-`5c585ec` permissive
+contract. Each added claim was read off `diff.rs` before it was written:
+
+- Tier gate on the query side — `allows` returns `false` for any
+  `entry.tier != Tier::Tier3` (`diff.rs:190-193`).
+- Tier gate at parse time — `tier=1`/`Tier1`/`tier1`/`2`/`Tier2`/`tier2` bail
+  with "may not be allowlisted"; any other value bails as "unknown tier"
+  (`diff.rs:234-240`).
+- Token shape — a token without `=` bails; an empty key or value bails
+  (`diff.rs:218-224`).
+- Unknown field — rejected against `RULE_FIELDS = ["tier", "surface", "key",
+"justification"]` (`diff.rs:21`, `225-227`).
+- Duplicate field — rejected (`diff.rs:228-230`).
+- Surface — rejected unless it is one of `DIFF_SURFACES = ["nodes", "files",
+"schema", "edges", "unresolved_refs"]` (`diff.rs:18`, `242-245`).
+- Missing field — all four of `tier`, `surface`, `key`, `justification` are
+  `.context("missing …")?` (`diff.rs:233`, `242`, `250-258`).
+- Fenced lines are documentation, and an unterminated fence is an error
+  (`diff.rs:166-188`).
+- Fail-closed loading — `load_repo_doc` propagates a parse error, so an
+  unparsable document fails the assertion instead of being ignored
+  (`diff.rs:149-154`).
+
+Nothing was asserted that `diff.rs` does not state. The wildcard semantics
+(`key_pattern == "*"` or `entry.key.contains(&rule.key_pattern)`,
+`diff.rs:194-198`) were left as the existing template already implies them.
+
+### Blocker 2 — `docs/godot.md` still pointed at the retired index root
+
+`ddd6b27` corrected eleven documents and missed this one. The three stale sites,
+verbatim (`docs/godot.md` at `c8968ad`):
+
+> in `.codegraph/config.toml`. That list replaces the default set entirely, so (line 27)
+
+> `.codegraph/codegraph.json`. List the `[resource]` property names that should (line 275)
+
+> `indexing.ignore_dirs` list in `.codegraph/config.toml`. See (line 388)
+
+All three describe live paths a user is told to create. The code puts both files
+under the current root: `IndexPaths::config_file` is
+`self.current_root.join("config.toml")` and `extension_config` is
+`self.current_root.join("codegraph.json")`
+(`crates/codegraph-core/src/index_paths.rs:304-312`), and `current_root`
+defaults to `DEFAULT_CURRENT_DIR = ".codegraph-v2"` (`index_paths.rs:46`).
+`.codegraph` survives only as `LEGACY_DIR` (`index_paths.rs:48`), a root that is
+ignored. All three now read `.codegraph-v2/…`.
+
+The daemon rendezvous is the same root, not a surviving `.codegraph/` role:
+`crates/codegraph-daemon/src/paths.rs:31-33` is
+`Ok(index_paths(project_root)?.current_root().to_path_buf())`, and that file's
+own test asserts the result `starts_with(project.join(".codegraph-v2"))`
+(`paths.rs:145-152`). `daemon_pid`, `daemon_log` and `daemon_socket` are all
+`current_root.join(…)` (`index_paths.rs:315-330`). An earlier review round was
+mis-briefed that the rendezvous stayed at `.codegraph/`; it does not, and no
+`.codegraph/` role was introduced here.
+
+`docs/godot.md` now has zero `.codegraph` hits that are not `.codegraph-v2`, so
+no legacy mention was kept in that file.
+
+### Final grep sweeps
+
+`grep -rn '\.codegraph/' --include='*.md' . | grep -v node_modules` — 35 hits
+remain, none of them a live-path instruction:
+
+- `README.md:69,72,77,78` and `docs/readme/README.zh-CN.md:64,66,71` — the
+  migration note. Every mention is explicitly the OLD root being ignored and not
+  carried over.
+- `skills/codegraph/SKILL.md:41` — "A `.codegraph/` directory is an index left by
+  `v0.40.4` or earlier", explicitly labelled legacy.
+- `docs/cli.md:658`, `docs/languages.md:112` — "A legacy
+  `.codegraph/codegraph.json` is ignored", explicitly labelled legacy.
+- `docs/upstream-sync/UPSTREAM.md:688,712,749,800,808` — the upstream porting
+  ledger, quoting upstream TypeScript behavior and this project's pre-migration
+  state. Historical record; rewriting it would falsify what was ported when.
+- `docs/upstream-sync/V1_5_PORTABLE_FIXES.md` (remaining hits) — this ledger's
+  own account of the migration and of the earlier sweep, including the sites it
+  admitted were stale. Historical by construction.
+
+`grep -rn 'repo-root .KNOWN_DIFFS' --include='*.md' .` — no output, exit 1. The
+false claim is gone and not reintroduced anywhere.
+
+### Commands and their real exit status
+
+Recorded in the section below, after the gates ran. Gates were run separately,
+never joined with `&&`, so no tail is hidden.

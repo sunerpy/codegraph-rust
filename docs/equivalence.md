@@ -736,12 +736,27 @@ The `generated_golden_matches_committed_cfml_fixture` and
 
 ### KNOWN_DIFFS.md format
 
-Tier-3 differences are allowlisted by grep-able lines in repo-root
-`KNOWN_DIFFS.md`:
+Tier-3 differences are allowlisted by grep-able lines in
+`docs/upstream-sync/KNOWN_DIFFS.md` — the single path
+`KnownDiffs::repo_doc_path` hardcodes
+(`crates/codegraph-bench/src/oracle/diff.rs`):
 
 ```text
 RULE tier=3 surface=<surface> key=<substring-or-*> justification=<short-token>
 ```
 
 Only Tier-3 entries can be allowed. Tier-1 byte mismatches and Tier-2 multiset
-mismatches always fail; the differ never weakens those tiers to pass.
+mismatches always fail; the differ never weakens those tiers to pass —
+`KnownDiffs::allows` returns `false` for anything that is not `Tier::Tier3`, and
+`parse_rule` rejects `tier=1` / `tier=2` before that, so a Tier-1/Tier-2 rule
+cannot even be written down.
+
+The parser is fail-closed: an unparsable document fails every equivalence
+assertion instead of being ignored. A `RULE` line is rejected when a token is
+not `key=value`, a key or value is empty, a field name is outside
+`tier`/`surface`/`key`/`justification`, a field is repeated, `tier` is anything
+other than Tier-3, `surface` is outside the five surfaces the differ reports
+(`nodes`, `files`, `schema`, `edges`, `unresolved_refs`), or any of the four
+fields is missing. Lines inside a fenced code block are documentation, not
+rules — including the template above — and an unterminated fence is an error,
+because every `RULE` after it would otherwise be skipped silently.
