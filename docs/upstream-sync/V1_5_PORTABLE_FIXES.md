@@ -5246,7 +5246,13 @@ Same project re-indexed with the rebuilt binary:
     route|settings|11
     settings|Settings|11
 
-Exactly the single correct edge the issue asks for.
+Exactly the single correct edge the issue asks for **for the `<Route>` JSX form**.
+
+> **Scope correction (added by Batch F3).** As committed, this batch fixed only the
+> `<Route>` JSX form. The data-router (`createBrowserRouter([…])`) form kept the same
+> borrowing defect behind a fixed 300-byte window, so #1348 was NOT fully ported by
+> Batch D1 alone. Batch F3 below closes that half; #1348 is complete only with both
+> batches. The sentence above is scoped accordingly.
 
 ### The bound and why that number
 
@@ -6659,3 +6665,350 @@ must be inside request cwd`); no LSP-clean result is claimed. The changed files 
 shell, YAML and Markdown, which the Rust toolchain does not lint — the honest
 checks for them are the executable harness, the four mutants, the YAML parse, and
 `make ci`.
+
+## Batch F4 — `CI Success` becomes a strict gate: only `success` passes (2026-07-28)
+
+### The defect (found by the F1–F4 review wave, confirmed by reading the file)
+
+`.github/workflows/ci.yml`, job `ci-success` (pre-fix lines **173–187**; the
+`run:` body at **182–187** and the offending condition on **line 183**) rejected
+exactly ONE result value:
+
+```yaml
+- name: Check job status
+  run: |
+    if [[ "${{ needs.test.result }}" == "failure" || "${{ needs.audit.result }}" == "failure" || "${{ needs.windows.result }}" == "failure" ]]; then
+      echo "❌ CI failed"
+      exit 1
+    fi
+    echo "✅ CI passed"
+```
+
+`needs.<job>.result` is not boolean. GitHub Actions sets it to `success`,
+`failure`, `cancelled`, or `skipped`. The expression above tests only for
+`failure`, so **`cancelled` and `skipped` both fell through to
+`echo "✅ CI passed"` and exit 0.**
+
+Three facts turn that from a latent typo into a release blocker:
+
+1. `ci.yml` line **13** sets `cancel-in-progress: true`. A second push to the
+   same ref cancels the in-flight run — the cancelled state is not exotic, it is
+   the routine outcome of pushing twice.
+2. `ci-success` runs `if: always()`, so it executes even when its needed jobs are
+   cancelled. It then printed `✅ CI passed`.
+3. `release-please.yml` line **124** (`Wait for CI Success on the tag commit`,
+   job `verify-ci`, lines **100–175**) gates the release on **that job's**
+   conclusion, and `upload-assets` (line **287**) lists `verify-ci` in `needs`.
+
+So the reachable path was: push, push again → CI run 1 cancelled → run 1's
+`CI Success` concludes **success** → a release cut against run 1's commit finds a
+green `CI Success` → `verify-ci` passes → assets upload → `publish-release`
+publishes. A release on a run whose tests never finished. That is precisely the
+half of the project's contract ("a release only fires on green CI") that this
+commit restores.
+
+### Old vs new expression, side by side
+
+**OLD** (the whole gate, one line):
+
+```bash
+if [[ "${{ needs.test.result }}" == "failure" || "${{ needs.audit.result }}" == "failure" || "${{ needs.windows.result }}" == "failure" ]]; then
+```
+
+**NEW** (the accept test, from the shipped body):
+
+```bash
+mapfile -t rows < <(
+  printf '%s' "$NEEDS_JSON" \
+    | jq -r 'to_entries | sort_by(.key)[] | "\(.key)\t\(.value.result // "<missing>")"'
+)
+...
+  if [ "$result" = "success" ]; then   # ← the ONLY accepting branch
+```
+
+Three changes of substance:
+
+- **Allow-list, not deny-list.** `= "success"` accepts one value; every other
+  value — `cancelled`, `skipped`, `neutral`, `timed_out`, an empty string, or any
+  value GitHub adds in the future — falls to the failing branch. Unknown is
+  treated as not-success, never tolerated.
+- **Results come from `${{ toJSON(needs) }}`** (env `NEEDS_JSON`), so the body
+  hardcodes no job name. Adding a job to `needs:` gates it with no script edit.
+  A `needs.<job>.result` interpolation reappearing in the body is now a guard
+  failure (scenario E below).
+- **Fails closed on a degenerate context.** An empty `NEEDS_JSON`, a non-object,
+  a `{}`, or a job whose `result` key is absent all exit 1 with an explicit
+  "failing closed" message, instead of iterating zero jobs and declaring success.
+
+### Actionable failure message (the point of the rewrite, not decoration)
+
+A maintainer reading a red `CI Success` now sees, per job, which one was not
+`success` and what it actually was — plus a GitHub `::error` annotation that
+surfaces in the run summary:
+
+```
+Required job results (only 'success' passes):
+  ✅ audit        success
+  ❌ test         cancelled
+  ✅ windows      success
+::error title=CI gate::required job 'test' concluded 'cancelled', not 'success'.
+❌ CI failed: 1 of 3 required job(s) did not conclude 'success' (see the ❌ rows above).
+```
+
+### The required set: `test`, `audit`, `windows` — verified against the file
+
+Enumerated from the real `ci.yml`, not from the audit note. `jobs` contains
+exactly five keys: `test` (line 20), `windows` (71), `audit` (112), `coverage`
+(145 pre-fix 138), `ci-success` (205 pre-fix 173). The gate requires
+`test, audit, windows`; the required set is **unchanged by this commit** — it was
+not widened or narrowed, only made strict.
+
+`coverage` remains deliberately EXCLUDED. `codecov.yml` marks both statuses
+`informational: true` (baseline ~72% line coverage against an aspirational 95%
+target), so coverage is report-only by design and must never redden a merge or
+block a release. That reasoning is now written where the exclusion lives
+(`ci.yml` `needs:` comment) **and mechanically tied to its premise**:
+`scripts/check-ci-gate.sh` fails if `codecov.yml` ever stops marking coverage
+informational while it is still excluded, so the exclusion cannot outlive its
+justification (harness scenario I).
+
+### "Robust to a job added later" — GitHub Actions cannot express it; the gap is made loud
+
+Stated plainly: **there is no in-workflow way to require every job.** The `needs`
+context contains ONLY the jobs listed in `needs:`. `toJSON(needs)` iterates
+whatever is there, so a job added to `ci.yml` and never added to
+`ci-success`'s `needs:` is invisible to the gate no matter how the expression is
+written. There is no `needs: [*]`, and `jobs.<id>.needs` accepts no wildcard.
+
+So the invariant is asserted from OUTSIDE the workflow, and made loud rather than
+silent: new script `scripts/check-ci-gate.sh` parses `ci.yml` and fails when
+`ci-success.needs` is not exactly `set(jobs) - {ci-success} - INFORMATIONAL`. Add
+a job without gating it and the guardrail turns red locally, at pre-push, and in
+CI, naming the ungated job (harness scenario H adds a `fuzz` job and gets
+`job(s) ['fuzz'] exist in ci.yml but are NOT in ci-success's needs:`). The
+allow-list is a single explicit set in that script with a per-entry
+justification function — widening it is a visible, reviewable edit, not an
+omission.
+
+The guard also asserts the gate's other structural preconditions: the job exists
+and is still named `CI Success` (the string branch protection and `verify-ci`
+both look for), it still runs `if: always()` (without it the gate is skipped when
+a needed job fails, so it never turns red), and it has exactly one `run:` step
+reading `${{ toJSON(needs) }}`.
+
+### `verify-ci` — audited, already strict, NOT changed
+
+Checked as required. `release-please.yml` lines **152–175** poll the `CI Success`
+job and accept exactly one conclusion:
+
+```bash
+if [ "$conclusion" = "success" ]; then
+  echo "✅ CI Success passed for ${HEAD_SHA}."
+  exit 0
+fi
+echo "❌ CI Success concluded '${conclusion}' for ${HEAD_SHA}; blocking release (draft preserved)."
+exit 1
+```
+
+That is already an allow-list: a `cancelled` conclusion on `CI Success` hits the
+`exit 1` and blocks the release. There is exactly one `exit 0` in the body and it
+is inside the `= "success"` branch. **No fix was needed and none was made** — the
+release-side gate was never the hole. The hole was upstream of it: `CI Success`
+itself reported `success` for a cancelled run, so `verify-ci` was correctly
+believing an incorrect input.
+
+`check-ci-gate.sh` now pins that shape too (single `exit 0`, inside the success
+branch, at least one `exit 1`, selects the `CI Success` job, and `upload-assets`
+still lists `verify-ci` in `needs` so the gate stays load-bearing) — harness
+scenarios J and K.
+
+### Negative control — old ADMITS `cancelled`/`skipped`, new REJECTS
+
+Both columns are produced by executing real bash locally: the OLD column runs the
+pre-fix body verbatim with `${{ needs.X.result }}` textually substituted the way
+the runner substitutes it; the NEW column extracts the shipped `run:` body
+straight out of `.github/workflows/ci.yml` with `yaml.safe_load` and runs it with
+a synthetic `NEEDS_JSON`. Actual output of
+`bash scripts/tests/ci-gate.test.sh`, scenario D:
+
+```
+  truth table — result | OLD exit | NEW exit | OLD verdict | NEW verdict
+    success    |    0     |    0     | ADMITS  | ADMITS
+    failure    |    1     |    1     | rejects | rejects
+    cancelled  |    0     |    1     | ADMITS  | rejects
+    skipped    |    0     |    1     | ADMITS  | rejects
+```
+
+Rows 3 and 4 ARE the defect and its fix. Rows 1 and 2 show the fix is not a
+behavior change for the cases that already worked.
+
+The wider table, run by the guard itself over the shipped body (actual output of
+`bash scripts/check-ci-gate.sh`):
+
+```
+check-ci-gate: truth table over the shipped gate body (3 required job(s))
+  all jobs success                               exit 0   OK
+  audit = failure                                exit 1   OK
+  audit = cancelled                              exit 1   OK
+  audit = skipped                                exit 1   OK
+  audit = neutral                                exit 1   OK
+  audit = timed_out                              exit 1   OK
+  audit = unknown_future_value                   exit 1   OK
+  audit = <empty-string>                         exit 1   OK
+  audit = cancelled (per-job coverage)           exit 1   OK
+  test = cancelled (per-job coverage)            exit 1   OK
+  windows = cancelled (per-job coverage)         exit 1   OK
+  all jobs cancelled                             exit 1   OK
+  empty needs context                            exit 1   OK
+  empty JSON object                              exit 1   OK
+  malformed JSON                                 exit 1   OK
+  result key missing                             exit 1   OK
+check-ci-gate: OK (16 truth-table cases; only all-success exits 0)
+```
+
+`unknown_future_value` is the forward-compatibility case: a value GitHub does not
+document today fails, because the gate allow-lists `success` rather than
+enumerating the failures.
+
+### Why a `scripts/tests/` harness — decided deliberately, added
+
+The precedent is exact. `scripts/check-asset-names.sh` (Batch E2) guards a
+CI/release contract that no Cargo test can express, ships a
+`scripts/tests/asset-name-drift.test.sh` mutation harness, and is wired into
+`scripts/guardrail.sh` so it runs in `make ci`, the pre-push hook, and CI. This
+defect is the same shape — a gate whose weakening leaves every test, lint, and
+build green — so it gets the same treatment rather than a new mechanism.
+
+The argument against (a workflow file is "just config", the fix is one
+expression) does not survive the evidence above: the previous one-expression gate
+looked correct to reviewers for the whole life of the file, and the mode of
+failure is silence. A guard that only asserted shape would also be weak, so the
+harness asserts BEHAVIOR: it extracts the shipped step body and executes it. If
+someone rewrites the gate in a different but equally strict way, the truth table
+still passes; if they rewrite it in a weaker way, it reddens.
+
+`scripts/tests/ci-gate.test.sh` — 12 scenarios, mutating ONE real file per
+scenario inside a throwaway fixture (the real tree is never touched):
+
+| scenario                 | mutation                                              | expect                                          |
+| ------------------------ | ----------------------------------------------------- | ----------------------------------------------- |
+| A `pristine`             | none (verbatim copies)                                | `0`, strict gate + truth table green            |
+| B `repository`           | none, run on the real repo root                       | `0`, `check-ci-gate: OK`                        |
+| C `cosmetic`             | reflow `needs:` inline list → block list, add comment | `0` — churn is not a gate change                |
+| D `negative_control`     | none; evaluates OLD and NEW bodies side by side       | old ADMITS `cancelled`/`skipped`, new rejects   |
+| E `legacy_expression`    | restore a `${{ needs.test.result }}` interpolation    | `1`, blames `gate-shape`, quotes the expression |
+| F `job_ungated`          | drop `windows` from `needs:`                          | `1`, names `['windows']`                        |
+| G `no_always`            | delete `if: always()`                                 | `1`, blames `gate-always`                       |
+| H `new_job_ungated`      | add a `fuzz` job, do not gate it                      | `1`, names `['fuzz']`                           |
+| I `coverage_blocking`    | `codecov.yml` → `informational: false`                | `1`, blames `gate-exclusion`                    |
+| J `release_gate_relaxed` | `verify-ci` → `[ "$conclusion" != "failure" ]`        | `1`, blames `release-gate`                      |
+| K `gate_not_wired`       | `upload-assets` drops `verify-ci` from `needs`        | `1`, blames `release-gate`                      |
+| L `unparsable`           | `jobs:` becomes a sequence                            | nonzero — fails CLOSED, never a silent pass     |
+
+### CI wiring — a third block of `scripts/guardrail.sh`
+
+Same home and same reasoning as Batch E2's asset-name gate: `guardrail` is the
+one step already invoked by `make ci`, `.githooks/pre-push`, and the CI `test`
+job, so a check placed there runs on every enforcement path without editing three
+more files. `ci.yml` gains one `jq --version` step before the guardrail so a
+missing `jq` (needed to evaluate the truth table) fails loudly instead of letting
+the gate degrade — the same fail-loud pattern as the existing PyYAML step.
+
+There is a deliberate ordering property worth naming: the guard runs inside the
+`test` job, which is itself one of the gated jobs. If someone weakens the gate,
+`test` goes red, so `ci-success` sees `test = failure` and — under the new strict
+logic — fails. The weakening cannot merge.
+
+### Scope
+
+Touched: `.github/workflows/ci.yml`, `scripts/guardrail.sh`, new
+`scripts/check-ci-gate.sh`, new `scripts/tests/ci-gate.test.sh`, and this ledger.
+Explicitly NOT touched: any file under `crates/`, the six-platform build matrix,
+the `Generate SHA256SUMS` step, the draft-until-all-green `publish-release`
+mechanism, `cancel-in-progress: true` (concurrency cancellation is intended —
+the bug was that a cancelled run reported success, not that cancellation
+happens), `verify-ci`'s already-strict polling logic, and every version /
+lockfile byte.
+
+### Honesty — what was and was NOT verified
+
+Validated by **local expression evaluation and YAML parsing only**:
+
+- the shipped `ci-success` step body was extracted from the real `ci.yml` with
+  `yaml.safe_load` and EXECUTED under `bash` against synthetic `needs` contexts;
+- the pre-fix body was executed the same way with the runner's textual
+  interpolation applied by hand;
+- both workflow files were parsed with `yaml.safe_load`.
+
+**No GitHub Actions run was triggered, cancelled, or observed.** No claim is made
+that a real cancelled run was pushed through this gate on GitHub's
+infrastructure. The `${{ toJSON(needs) }}` interpolation itself, and the exact
+set of values GitHub may place in `result`, are taken from GitHub's documented
+contract, not from an observed run — that is the one link in the chain this
+evidence cannot close locally, and it is the same link every workflow edit in
+this repository rests on.
+
+`lsp_diagnostics` is **not applicable**: the changed files are YAML, POSIX shell,
+Bash, and Markdown. No Rust source was touched, so there is no LSP result to
+report — clean or otherwise, and none is claimed.
+
+### Golden delta
+
+`GIT_MASTER=1 git diff --stat 956cf32..HEAD -- reference/golden/` → **EMPTY**.
+This commit adds two shell scripts and edits `ci.yml`, `guardrail.sh`, and this
+ledger. No extraction, resolution, or canonicalization code exists in the diff,
+so no golden could change and none was regenerated.
+
+### Verification (actual exit statuses)
+
+- `bash scripts/check-ci-gate.sh` → exit **0** (structure OK; 16 truth-table
+  cases, only all-success exits 0).
+- `bash scripts/tests/ci-gate.test.sh` → exit **0**, **12 passed, 0 failed**
+  (scenario L exits 2 — the fail-closed `die()` path — which the harness accepts
+  as nonzero).
+- `bash scripts/guardrail.sh` → exit **0** (all three blocks: forbidden crates,
+  asset-name contract, CI gate integrity).
+- `python3 -c "import yaml,sys; yaml.safe_load(open('.github/workflows/ci.yml'))"`
+  → exit **0**.
+- `python3 -c "import yaml,sys; yaml.safe_load(open('.github/workflows/release-please.yml'))"`
+  → exit **0**.
+- `bash scripts/check-workspace-versions.sh` → exit **0** (workspace 0.40.4 ==
+  `version.txt` == release manifest `.`; 10 source-less packages all at 0.40.4).
+- `make ci CARGO='cargo --locked'` → **exit 0** (`✅ All CI checks passed!`), with
+  the full chain green: `fmt-check` (rustfmt + oxfmt, "All matched files use the
+  correct format"), clippy `-D warnings`, `cargo test --workspace`, and all three
+  guardrail blocks.
+
+  **The known flake, reported honestly with BOTH results.** Across the runs on
+  that worktree, `make ci` came back green, then once **exit 101** with a single
+  failure — `formatter_and_env_tests::install_completions_writes_zsh_fish_elvish_into_home`
+  at `crates/codegraph-cli/src/main.rs:6213`,
+  `assertion failed: dir.join(".config/fish/completions/codegraph.fish").is_file()`,
+  **352 passed, 1 failed** — and then green again on the immediate re-run with no
+  code change in between. That is the documented pre-existing `HOME` /
+  `XDG_DATA_HOME` in-process race on this branch (~4 failures in 8 runs on a clean
+  commit), it lives in `crates/codegraph-cli`, which this commit does not touch,
+  and it was NOT weakened, ignored, skipped, or slowed down. Both outcomes are
+  recorded above rather than only the convenient one.
+
+  The final `make ci` — the one run after this prose and after `make fmt`, with no
+  byte written afterwards — has its actual exit status reported in this task's
+  closeout message. It is deliberately not backfilled here, because writing it
+  would mean editing the ledger AFTER the final gate, which the closeout order
+  forbids.
+
+- `sha256sum Cargo.lock` → `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`,
+  **unchanged**. No dependency added, no version byte moved; release-please still
+  owns versions.
+
+**Where `make ci` was run, and why that is the honest reading.** This task's
+worktree is shared with three sibling F-wave tasks, and at the time of the final
+gate a sibling's in-flight `crates/codegraph-resolve` edit left the tree failing
+clippy with `dead_code` on its own not-yet-wired helpers — a failure entirely
+inside `crates/`, which this task is forbidden to touch. So the final gate was run
+on a **clean detached worktree at `956cf32`** carrying EXACTLY this commit's five
+files (`ci.yml`, `guardrail.sh`, `check-ci-gate.sh`, `ci-gate.test.sh`, this
+ledger) and nothing else. That is the stricter reading, not a weaker one: it
+proves these five files alone are green against the recorded parent commit,
+without borrowing green from — or inheriting red from — a sibling's work in
+progress. The exit-0 above is that run's real status.

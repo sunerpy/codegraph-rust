@@ -28,4 +28,16 @@ if ! bash "$SCRIPT_DIR/check-asset-names.sh"; then
     EXIT_CODE=1
 fi
 
+# CI/release gate integrity: `CI Success` is the one required status check AND the
+# job the release gates on, but nothing else verifies that it is strict — a gate
+# that accepts `cancelled`/`skipped`, or that stops requiring a job, still lets
+# every test and lint pass. GitHub Actions also cannot express "require every job",
+# so the required SET has to be asserted from outside the workflow. Same home and
+# same reason as the block above: `guardrail` is the single step run by make ci,
+# the pre-push hook, and the CI `test` job.
+if ! bash "$SCRIPT_DIR/check-ci-gate.sh"; then
+    echo "❌ CI GATE INTEGRITY: 'CI Success' does not strictly require every job to succeed."
+    EXIT_CODE=1
+fi
+
 exit $EXIT_CODE
