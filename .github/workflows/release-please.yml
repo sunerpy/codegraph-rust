@@ -302,6 +302,30 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # Checksums are computed HERE, from the very same merged `dist/` that the
+      # attach step below uploads, so the sums provably describe the uploaded
+      # bytes. Determinism: `LC_ALL=C sort` on basenames gives a byte-order,
+      # locale-independent ordering; sha256sum is run with cwd=dist so each line
+      # carries the bare asset name (no `dist/` prefix); output is LF-only.
+      - name: Generate SHA256SUMS
+        shell: bash
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(*.tar.gz *.zip)
+          if [ "${#archives[@]}" -eq 0 ]; then
+            echo "::error::no release archives found in dist/" >&2
+            exit 1
+          fi
+          mapfile -t sorted < <(printf '%s\n' "${archives[@]}" | LC_ALL=C sort)
+          : > SHA256SUMS
+          for archive in "${sorted[@]}"; do
+            sha256sum "$archive" >> SHA256SUMS
+          done
+          echo "--- SHA256SUMS ---"
+          cat SHA256SUMS
+
       - name: Generate release notes
         uses: orhun/git-cliff-action@v4
         with:
@@ -321,6 +345,7 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.zip
+            dist/SHA256SUMS
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

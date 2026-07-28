@@ -5911,3 +5911,265 @@ must be inside request cwd`); locked Cargo clippy/test is the honest fallback an
 no LSP-clean result is claimed. No dependency, version or `Cargo.lock` byte
 changed. No native Windows/MSVC runtime validation is claimed — everything above
 ran on Linux.
+
+## Batch E3 — release artifacts carry a checksum authority and the installers refuse unverified binaries (2026-07-28)
+
+### The defect, confirmed not assumed
+
+Release artifacts shipped with **no checksums at all**, and both one-liner
+installers downloaded an archive and immediately executed the binary out of it.
+
+```
+$ grep -rniE 'sha256|checksum|shasum|Get-FileHash' \
+    .github/workflows/release-please.yml scripts/install.sh scripts/install.ps1
+$ echo $?
+1
+```
+
+Zero matches across all three files — the workflow published nothing to verify
+against, and neither installer had anything to verify with. Read against the
+code: `upload-assets` merged every `dist-*` artifact into `dist/` and attached
+`dist/*.tar.gz` + `dist/*.zip`, nothing else. `scripts/install.sh` went
+`download "$url" "$tmp/$asset"` → `tar -xzf` → `mv` → `chmod +x` →
+`"$install_dir/$BIN" --version`, executing whatever bytes arrived. `install.ps1`
+went `Invoke-WebRequest -OutFile $zipPath` → `Expand-Archive` → `& $exePath
+--version`. A corrupted download, a truncated transfer, or a substituted asset
+was indistinguishable from a good one, and the failure mode was _executing it_.
+
+### The fix
+
+Three coordinated changes, one commit:
+
+1. **`.github/workflows/release-please.yml` — a new `Generate SHA256SUMS` step**
+   inside `upload-assets`, placed after `Download artifacts` and before the
+   attach step, with `working-directory: dist`. It hashes the archives of that
+   very merged `dist/` and writes `dist/SHA256SUMS`; the same step's output is
+   echoed into the job log. `dist/SHA256SUMS` is then added to the existing
+   `softprops/action-gh-release@v2` step's `files:` list, so it lands on the SAME
+   still-draft Release as the archives it describes. No new job, no second
+   artifact download — the sums provably describe the uploaded bytes because they
+   are computed from them.
+
+2. **`scripts/install.sh` — an integrity gate before extraction.** It resolves a
+   hashing tool once (`sha256sum`, else `shasum -a 256`), derives
+   `sums_url="${release_base}/SHA256SUMS"` from the SAME `release_base` the
+   archive URL is built from (so the sums always come from the same tag), matches
+   its own asset's line, and compares. The gate sits between `download` and
+   `tar -xzf`: an unverified archive is never unpacked and its binary is never
+   executed.
+
+3. **`scripts/install.ps1` — the same gate** via `Get-FileHash -Algorithm
+SHA256`, placed between `Invoke-WebRequest` and `Expand-Archive`, with a
+   `Assert-CanSkipVerification` helper mirroring the shell `cannot_verify`.
+
+### Determinism of `SHA256SUMS` — how it is guaranteed
+
+- **Ordering**: the filename list is piped through **`LC_ALL=C sort`**. `LC_ALL=C`
+  forces byte-order collation, so the ordering does not depend on the runner's
+  locale (a `en_US.UTF-8` runner and a `C` runner produce the same sequence).
+  Shell glob order alone was not trusted for this.
+- **Names**: `sha256sum` is invoked with `working-directory: dist`, so every line
+  carries the bare asset basename. There is no `dist/` prefix and no absolute
+  path, which is exactly what a client that downloaded a single asset can match
+  against.
+- **Format**: plain `sha256sum` output — `<64-hex><two spaces><name>` — so the
+  file is directly consumable by `sha256sum -c SHA256SUMS`.
+- **Line endings**: LF only. The file is produced by `sha256sum` on an
+  `ubuntu-latest` runner and never round-tripped through a Windows tool.
+- **Empty input is an error, not an empty file**: `nullglob` plus an explicit
+  `${#archives[@]} -eq 0` check makes a missing-artifacts situation fail the job
+  with `::error::no release archives found in dist/`, instead of quietly
+  publishing an empty authority that every client would then treat as
+  "unverifiable".
+
+Proven locally by replaying the exact step body against a six-archive fake
+`dist/` (`/tmp/e3-dist`):
+
+```
+e06c0482dc6da332be84c68951e1756bac63cffedc12f5c1b31c6a533d35a386  codegraph-9.9.9-aarch64-apple-darwin.tar.gz
+1ff30088da0b1a6741a52e564af76c5bd670ade89785126af08210e4f94f1d81  codegraph-9.9.9-aarch64-pc-windows-msvc.zip
+5d8ed155c442b58ab95e0fb2f4bfa136ed1b13b077363a7ff3ae8989780e4e27  codegraph-9.9.9-aarch64-unknown-linux-musl.tar.gz
+929d1ee5ff7c3309238ce8c62b39d41bd3f5aad6132fad860a8454ced2949da8  codegraph-9.9.9-x86_64-apple-darwin.tar.gz
+d4db99a2ab23ae7a094367d227c56edfde05211e1d52f2295ef0098bfa949bd6  codegraph-9.9.9-x86_64-pc-windows-msvc.zip
+b88c456b823f476789e8fa7a8938314872cad3cc7131d4d1efd12021f88e7aa0  codegraph-9.9.9-x86_64-unknown-linux-musl.tar.gz
+```
+
+- run under `LC_ALL=C` and again under `LC_ALL=en_US.UTF-8` → `diff` **IDENTICAL**,
+  both files hashing to `5488b0cd60d0a592183bbd43f20ad0663a935addbdcd02eafb6353cd8f8d3e8f`.
+- `grep -c '/'` → **0** (no path prefix). `od -c | grep -c '\r'` → **0** (LF only).
+- `sha256sum -c SHA256SUMS` → 6× `OK`, **exit 0**.
+- the same body in an empty directory → **exit 1** with the `::error::` line.
+
+### Fail closed, and what that costs
+
+The gate is **fail-closed on every unverifiable condition**, not just on a
+mismatch:
+
+| condition                                                            | behaviour                                           |
+| -------------------------------------------------------------------- | --------------------------------------------------- |
+| digest matches                                                       | install proceeds                                    |
+| digest **differs**                                                   | **hard abort**, always — the opt-out does NOT apply |
+| no `sha256sum` and no `shasum` (POSIX) / no `Get-FileHash` (Windows) | refuse, unless opt-out                              |
+| `SHA256SUMS` absent (404)                                            | refuse, unless opt-out                              |
+| `SHA256SUMS` present but has no line for this asset                  | refuse, unless opt-out                              |
+
+The opt-out is **`CODEGRAPH_SKIP_CHECKSUM`** (any non-empty value), documented in
+the header comment of both scripts. It covers only "I cannot verify"; it never
+covers "verification failed". A mismatch aborts with the expected and actual
+digests printed, whatever the environment says.
+
+**The deliberate compatibility cost**: a release cut BEFORE this change has no
+`SHA256SUMS`, so the plain one-liner will now REFUSE to install it and print the
+opt-out instruction. That is a real regression in convenience for old tags, and
+it is the intended trade. Silently skipping verification when the authority is
+missing would mean an attacker who can suppress one small file downgrades every
+client back to the pre-E3 behaviour — the check would protect nobody. This
+upholds the precedent already set on this branch by B1, C2, A4 and D3: when
+correctness cannot be established, refuse rather than guess. Refusing to install
+is recoverable in one command; executing a tampered binary is not.
+
+### Tests added — `scripts/tests/install-checksum.test.sh`
+
+An executable, **network-free** harness in the shape of
+`scripts/tests/check-workspace-versions.test.sh` (same `PASS`/`FAIL`/`ok`/`bad`
+counters, same `mktemp -d` + `trap cleanup EXIT`, same "assert the business
+diagnostic, not just the exit code" style). It runs the REAL
+`scripts/install.sh` under `env -i` with:
+
+- a **`curl` shim** first on a sandboxed `PATH` that maps any URL to
+  `$CG_TEST_RELEASE_DIR/<basename>` and exits **22** (curl's HTTP-error code)
+  when the file is absent — so no scenario touches the network, and the script's
+  own `download`/`fetch` plumbing is exercised unchanged;
+- a **sandboxed `PATH`** built from symlinks to a fixed tool list, so the
+  "no hashing tool" scenario is a _genuine absence_ rather than a stubbed
+  failure;
+- a fake release holding a real `tar.gz` (with an executable `codegraph` stub)
+  plus a decoy Windows asset, so `SHA256SUMS` is never a one-line file and
+  picking the right line actually matters.
+
+Ten assertions across eight scenarios:
+
+- **A_match** — correct digest ⇒ exit 0, binary present at the install dir,
+  `sha256: OK` reported.
+- **B_mismatch** — one digest zeroed ⇒ nonzero exit, `checksum MISMATCH`, and
+  **the binary is NOT installed**.
+- **C_mismatch_optout** — same mismatch WITH `CODEGRAPH_SKIP_CHECKSUM=1` ⇒ still
+  aborts, still nothing installed. Proves the opt-out cannot launder a mismatch.
+- **D_truncated** — `SHA256SUMS` correct, archive truncated to 64 bytes (the
+  real-world corrupt-download shape, a form NOT designed for) ⇒ abort before
+  extraction.
+- **E_notool_refuse / E_notool_optout** — no `sha256sum` on PATH ⇒ explicit
+  refusal naming `CODEGRAPH_SKIP_CHECKSUM` and no install; with the opt-out set,
+  exit 0 with an `UNVERIFIED binary` warning.
+- **F_nosums_refuse / F_nosums_optout** — no `SHA256SUMS` published at all (the
+  pre-E3 release shape) ⇒ refusal; installable only under the opt-out.
+- **G_no_entry** — `SHA256SUMS` present and well-formed but with our asset's line
+  removed ⇒ refusal. A sums file that simply omits your asset must not read as a
+  pass.
+- **H_crlf** — correct digests with CRLF line endings ⇒ accepted. Line endings
+  must not silently turn a good release into an unverifiable one.
+
+D, G and H are deliberately shapes the implementation was not designed around,
+per the lesson that got an earlier commit on this branch rejected: a fixture
+holding only the author's intended shape proves nothing.
+
+### Negative control, EXECUTED — four mutants, each reddening a DIFFERENT scenario
+
+Each mutant edits `scripts/install.sh` only; no test file was touched.
+
+1. **Whole verification block deleted** (the exact pre-E3 flow: download then
+   `tar -xzf`) → **21 failures**, including the ones that matter most:
+
+       FAIL: B_mismatch: expected a NONZERO exit, got 0
+       FAIL: B_mismatch: binary WAS installed despite a failed verification
+       FAIL: G_no_entry: binary WAS installed despite a failed verification
+       FAIL: E_notool_refuse: binary WAS installed despite a failed verification
+       === harness result: 0 passed, 21 failed ===
+
+   `A_match` also loses its `sha256: OK` assertion. This is the defect itself,
+   reproduced.
+
+2. **`cannot_verify` downgraded to a silent `return 0`** — i.e. the FORBIDDEN
+   "just skip it if you can't check" design → the mismatch tests still pass, and
+   it reddens the three _unverifiable_ scenarios instead:
+
+       FAIL: E_notool_refuse: expected a NONZERO exit, got 0
+       FAIL: F_nosums_refuse: expected a NONZERO exit, got 0
+       FAIL: G_no_entry: expected a NONZERO exit, got 0
+       FAIL: G_no_entry: binary WAS installed despite a failed verification
+       === harness result: 7 passed, 10 failed ===
+
+3. **Mismatch routed through the opt-out** (a plausible "be lenient" change) →
+   the unverifiable scenarios stay green and it reddens a different trio:
+
+       FAIL: B_mismatch: expected diagnostic /checksum MISMATCH/ on stderr
+       FAIL: C_mismatch_optout: expected diagnostic /checksum MISMATCH/ on stderr
+       FAIL: D_truncated: expected diagnostic /checksum MISMATCH/ on stderr
+       === harness result: 7 passed, 3 failed ===
+
+4. **CRLF tolerance dropped** (`tr -d '\r'` removed — the "obviously
+   unnecessary" guard) → everything else stays green and exactly one scenario
+   goes red:
+
+       FAIL: H_crlf: expected exit 0, got 1
+         stderr: … error: cannot verify the download: SHA256SUMS has no entry for
+                 codegraph-9.9.9-x86_64-unknown-linux-musl.tar.gz | error: refusing
+                 to install an unverified binary. …
+       FAIL: H_crlf: expected the binary at …/H_crlf.dest/codegraph, it is absent
+       === harness result: 9 passed, 3 failed ===
+
+   Note the failure mode: a CRLF sums file would make a PERFECTLY GOOD release
+   look unverifiable and block every install. The `tr -d '\r'` is load-bearing.
+
+Four mutants, four disjoint red sets — no partial regression in this gate can
+hide behind another part of it. Restored by copying back the green file; restored
+`scripts/install.sh` SHA-256
+`5f35d096b95a2f2824cad06f8057b98a397a477988b421cd6a319722672e6418`, and the
+harness re-run green: **10 passed, 0 failed, exit 0**.
+
+### Windows — UNVERIFIED AT RUNTIME
+
+`scripts/install.ps1` was changed by **code inspection only**. This host is
+Linux; no PowerShell is available, so the `Get-FileHash` path, the
+`Invoke-WebRequest` 404 `catch`, and `Assert-CanSkipVerification` were NOT
+executed. No native Windows/MSVC runtime validation is claimed. What was checked
+by reading: the gate sits between `Invoke-WebRequest` and `Expand-Archive`;
+`$ErrorActionPreference = 'Stop'` plus `throw` gives the hard abort;
+`-ine` compares the hex case-insensitively (`Get-FileHash` returns UPPERCASE,
+`sha256sum` writes lowercase — a case-sensitive `-ne` here would have been a
+false mismatch on every single install); `Get-Content` drops the line ending so
+CRLF is handled, and `.TrimStart('*')` covers the BSD marker, mirroring the shell
+side. Runtime confirmation on Windows is deferred to the next real release run.
+
+### Golden delta
+
+`GIT_MASTER=1 git diff --stat 063604d..HEAD -- reference/golden/` → **EMPTY**.
+Nothing in this commit touches extraction, resolution, or any fixture: the diff
+is two shell/PowerShell installers, one workflow job step, one new test harness,
+and this prose. No golden was regenerated and none needed to be.
+`cargo test --locked -p codegraph-bench --test equivalence` → exit 0, **26/26**.
+
+### Verification (actual exit statuses)
+
+- `grep -rniE 'sha256|checksum|shasum|Get-FileHash' <workflow> <install.sh> <install.ps1>`
+  on the pre-change tree → exit **1**, zero matches (the defect proof above).
+- `bash scripts/tests/install-checksum.test.sh` → exit **0**, 10 passed, 0 failed.
+- `python3 -c "yaml.safe_load(...)"` on `release-please.yml` → parses; the
+  `upload-assets` step list is `Checkout code, Download artifacts, Generate
+SHA256SUMS, Generate release notes, Attach assets to GitHub Release` and
+  `files:` is `dist/*.tar.gz\ndist/*.zip\ndist/SHA256SUMS\n`.
+- `sha256sum -c SHA256SUMS` on the replayed six-archive `dist/` → exit **0**.
+- `bash scripts/check-workspace-versions.sh` → run before every Cargo batch;
+  result recorded below. Every Cargo command used `--locked`.
+- `cargo test --locked -p codegraph-bench --test equivalence` → recorded below.
+- `make ci CARGO='cargo --locked'` → final gate, run after the last byte of this
+  commit (code, tests, this prose, then `make fmt`); recorded below.
+- `sha256sum Cargo.lock` →
+  `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`, unchanged.
+  No dependency and no version byte changed; release-please still owns versions.
+
+`lsp_diagnostics` was attempted and again refused this worktree (`LSP file path
+must be inside request cwd`); no LSP-clean result is claimed. The changed files
+are shell, PowerShell and YAML, which the Rust toolchain does not lint anyway —
+the honest checks for them are the executable harness, the YAML parse, and the
+replayed workflow step above.
