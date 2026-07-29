@@ -499,25 +499,45 @@ fn sync_parent(_parent: &Path) -> Result<ParentSyncStatus, StatePublishError> {
     Ok(ParentSyncStatus::Unsupported)
 }
 
+/// EINVAL and EOPNOTSUPP/ENOTSUP are the conventional reports for a filesystem
+/// that cannot synchronize directory entries.
+#[cfg(any(unix, test))]
+const UNIX_DIRECTORY_SYNC_UNSUPPORTED: &[i32] = &[22, 95];
+
+/// Win32 statuses that mean this handle or filesystem exposes no directory
+/// flush primitive.
+///
+/// ERROR_INVALID_FUNCTION, ERROR_INVALID_HANDLE, ERROR_NOT_SUPPORTED, and
+/// ERROR_INVALID_PARAMETER are the explicit "no such primitive" reports.
+/// ERROR_ACCESS_DENIED belongs to the same class here and NOT to the class of
+/// genuine permission faults: `FlushFileBuffers` requires a handle carrying
+/// write access, an unprivileged process cannot obtain write access to a
+/// DIRECTORY handle, and this code path only ever reaches the flush after the
+/// directory open already succeeded. The denial is therefore a property of the
+/// platform's directory API, identical on every run, and never a signal that
+/// this specific namespace is unwritable — the writes that need the barrier are
+/// the file operations that already completed. Access errors from OPENING the
+/// directory stay hard failures; only the flush is downgraded.
+#[cfg(any(windows, test))]
+const WINDOWS_DIRECTORY_SYNC_UNSUPPORTED: &[i32] = &[1, 5, 6, 50, 87];
+
 #[cfg(any(unix, windows))]
 fn directory_sync_unsupported(error: &io::Error) -> bool {
-    if error.kind() == io::ErrorKind::Unsupported {
-        return true;
-    }
     #[cfg(unix)]
-    {
-        // EINVAL and EOPNOTSUPP/ENOTSUP are the conventional reports for a
-        // filesystem that cannot synchronize directory entries.
-        matches!(error.raw_os_error(), Some(22 | 95))
-    }
+    let unsupported = UNIX_DIRECTORY_SYNC_UNSUPPORTED;
     #[cfg(windows)]
-    {
-        // ERROR_INVALID_FUNCTION, ERROR_INVALID_HANDLE, ERROR_NOT_SUPPORTED,
-        // and ERROR_INVALID_PARAMETER explicitly mean this handle/filesystem
-        // does not expose a directory flush primitive. Access errors are NOT
-        // downgraded to unsupported.
-        matches!(error.raw_os_error(), Some(1 | 6 | 50 | 87))
-    }
+    let unsupported = WINDOWS_DIRECTORY_SYNC_UNSUPPORTED;
+    directory_sync_unsupported_in(error, unsupported)
+}
+
+/// Platform-independent classifier: an explicit [`io::ErrorKind::Unsupported`],
+/// or a raw OS status in this platform's "no directory flush primitive" set.
+#[cfg(any(unix, windows))]
+fn directory_sync_unsupported_in(error: &io::Error, unsupported: &[i32]) -> bool {
+    error.kind() == io::ErrorKind::Unsupported
+        || error
+            .raw_os_error()
+            .is_some_and(|code| unsupported.contains(&code))
 }
 
 #[cfg(test)]
@@ -767,6 +787,74 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn windows_directory_flush_denial_is_classified_unsupported_not_a_hard_failure() {
+        // ERROR_ACCESS_DENIED is the structural report for FlushFileBuffers on a
+        // directory handle, so it must not abort publication.
+        assert!(directory_sync_unsupported_in(
+            &io::Error::from_raw_os_error(5),
+            WINDOWS_DIRECTORY_SYNC_UNSUPPORTED
+        ));
+        for code in WINDOWS_DIRECTORY_SYNC_UNSUPPORTED {
+            assert!(
+                directory_sync_unsupported_in(
+                    &io::Error::from_raw_os_error(*code),
+                    WINDOWS_DIRECTORY_SYNC_UNSUPPORTED
+                ),
+                "win32 {code} must be classified unsupported"
+            );
+        }
+        for code in UNIX_DIRECTORY_SYNC_UNSUPPORTED {
+            assert!(
+                directory_sync_unsupported_in(
+                    &io::Error::from_raw_os_error(*code),
+                    UNIX_DIRECTORY_SYNC_UNSUPPORTED
+                ),
+                "errno {code} must be classified unsupported"
+            );
+        }
+        assert!(directory_sync_unsupported_in(
+            &io::Error::from(io::ErrorKind::Unsupported),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn directory_flush_codes_outside_the_platform_set_stay_hard_failures() {
+        // ERROR_DISK_FULL and ERROR_FILE_NOT_FOUND are genuine faults, and the
+        // per-platform sets must not leak into each other.
+        for code in [2, 112] {
+            assert!(!directory_sync_unsupported_in(
+                &io::Error::from_raw_os_error(code),
+                WINDOWS_DIRECTORY_SYNC_UNSUPPORTED
+            ));
+        }
+        assert!(!directory_sync_unsupported_in(
+            &io::Error::from_raw_os_error(5),
+            UNIX_DIRECTORY_SYNC_UNSUPPORTED
+        ));
+        assert!(!directory_sync_unsupported_in(
+            &io::Error::from_raw_os_error(1),
+            UNIX_DIRECTORY_SYNC_UNSUPPORTED
+        ));
+    }
+
+    #[test]
+    fn publication_reports_a_parent_sync_status_instead_of_failing() {
+        let project = TempProject::new("parent-sync-status");
+        let paths = project.paths();
+        let lease = IndexLease::create_exclusive(&paths, deadline(), || false)
+            .expect("create parent-sync lease");
+
+        let published = publish_index_state(&paths, &lease, StatePhase::Building)
+            .expect("publication must not fail on the parent-directory barrier");
+
+        assert!(matches!(
+            published.parent_sync,
+            ParentSyncStatus::Synced | ParentSyncStatus::Unsupported
+        ));
     }
 
     #[test]

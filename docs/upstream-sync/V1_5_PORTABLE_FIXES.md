@@ -8740,3 +8740,181 @@ gitignored and were removed before run 2 and before staging. Three files changed
 this ledger. No `reference/golden/`, `Cargo.toml`, `Cargo.lock`,
 `.github/workflows/`, `scripts/` or `.aws/` change. No test was skipped,
 `#[ignore]`d, weakened, given a sleep, or given a widened timeout.
+
+## PR #173 CI round 4 — the four `codegraph-mcp` windows test failures
+
+Run `30444938158`, job `Windows`, step `Run tests` (`cargo test --workspace
+--exclude codegraph-bench`). Its `codegraph-daemon` suite now passes `96/96`, so
+`a131aee` and `eb4b516` held. The next layer surfaced in `codegraph-mcp --lib`:
+`254 passed; 4 failed`, `error: test failed, to rerun pass -p codegraph-mcp --lib`.
+
+| CI location                                        | Test                                                                                           |
+| -------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `crates\codegraph-mcp\src\engine.rs:4044:78`       | `engine::tests::ext_open_reads_store_from_project_dir`                                         |
+| `crates\codegraph-mcp\src\rmcp_handler.rs:1142:78` | `rmcp_handler::handler_tests::call_tool_bad_project_path_returns_error_result`                 |
+| `crates\codegraph-mcp\src\rmcp_handler.rs:1142:78` | `rmcp_handler::handler_tests::call_tool_timeout_disabled_runs_unbounded_path`                  |
+| `crates\codegraph-mcp\src\rmcp_handler.rs:1142:78` | `rmcp_handler::handler_tests::execute_owned_success_opens_request_scoped_engine_and_runs_tool` |
+
+### What is unwrapped at each location
+
+Both are the SAME call, and it is neither a path nor a `Store`:
+
+- `engine.rs:4044` — inside `ext_open_reads_store_from_project_dir`, directly:
+  `codegraph_store::test_support::finalize_current_test_fixture(&paths).unwrap()`.
+- `rmcp_handler.rs:1142` — the LAST statement of the shared test helper
+  `real_indexed_project(tag: &str) -> TempDir`, which copies
+  `reference/golden/mini/colby.db` plus the two `fixtures/mini` sources into a
+  temp project and then calls the identical
+  `finalize_current_test_fixture(&paths).unwrap()`.
+
+`real_indexed_project` is the shared helper behind three of the four failures;
+`ext_open_reads_store_from_project_dir` calls the same store API inline. So all
+four are ONE cause, and the failing code is in **production**
+(`codegraph-store`), not in the tests.
+
+### Root cause — `FlushFileBuffers` on a DIRECTORY handle returns ERROR_ACCESS_DENIED
+
+The full CI error, recovered from the run log, is identical in all four:
+
+```
+called `Result::unwrap()` on an `Err` value: publish test fixture Building state
+Caused by:
+    0: cannot synchronize state-slot parent directory at \\?\C:\Users\runneradmin\AppData\Local\Temp\cg-mcp-open-8848-53\.codegraph-v2: Access is denied. (os error 5)
+    1: Access is denied. (os error 5)
+```
+
+with backtrace frames `codegraph_store::test_support::finalize_current_test_fixture`
+(`test_support.rs:63`, the `publish_index_state(..., StatePhase::Building)` line)
+→ `anyhow::context` → `codegraph_store::index_state_publisher::StatePublishError`.
+
+`publish_index_state` ends with a parent-directory durability barrier,
+`sync_parent` (`index_state_publisher.rs:480-495`): open the state-slot parent
+directory (`FILE_FLAG_BACKUP_SEMANTICS`, read-only access) and call
+`File::sync_all()` on it. `sync_all` is `FlushFileBuffers(handle)`.
+
+The behavioural difference: on unix `fsync(dirfd)` on a read-only directory
+descriptor is the documented way to make a rename durable and returns `0`. On
+windows `FlushFileBuffers` requires a handle carrying **write** access
+(`GENERIC_WRITE`/`FILE_WRITE_DATA`); a DIRECTORY handle obtained by an
+unprivileged process never carries it, so the call returns
+`ERROR_ACCESS_DENIED` (5). It is a property of the platform's directory API — it
+happens on every call on every windows machine, not on some machines or some
+paths. Note the temp path is a `\\?\` verbatim path, which is a red herring: the
+`open` succeeded, only the flush failed.
+
+`directory_sync_unsupported` downgraded only `1 | 6 | 50 | 87`
+(ERROR_INVALID_FUNCTION / INVALID_HANDLE / NOT_SUPPORTED / INVALID_PARAMETER) to
+`ParentSyncStatus::Unsupported`, with a comment stating "Access errors are NOT
+downgraded to unsupported". That policy is right for a FILE and wrong for a
+DIRECTORY: it turned the one windows-universal outcome into a hard
+`StatePublishError::Io`, so **every** `publish_index_state` call fails on windows.
+This is not a test defect. Production `codegraph-store` cannot publish index
+state on windows at all: `rebuild.rs:317`/`:496`/`:885` and `uninit.rs:188` take
+the same path, so `codegraph index`, its `Building -> Current` promotion, and
+`codegraph uninit` were all broken on windows. The four tests were the messengers.
+
+### The fix — one production change
+
+`ERROR_ACCESS_DENIED` (5) joins the windows "no directory flush primitive" set.
+The justification is narrow and is written into the code: this branch is reached
+only AFTER the directory open already succeeded, so the denial cannot mean the
+namespace is unwritable, and the writes the barrier protects (temp write, temp
+`sync_all` on a real FILE handle, and the rename) have all already completed and
+are unaffected. Access errors from OPENING the directory remain hard failures.
+Losing the barrier means a crash within the window after the rename could lose
+the slot rename on power loss — exactly the risk `ParentSyncStatus::Unsupported`
+already exists to report, and strictly better than the previous behaviour of
+never publishing at all.
+
+Two mechanical changes make it testable from linux: the per-platform code sets
+became named constants (`UNIX_DIRECTORY_SYNC_UNSUPPORTED`,
+`WINDOWS_DIRECTORY_SYNC_UNSUPPORTED`, both `cfg(any(<platform>, test))`), and the
+matching moved into a pure `directory_sync_unsupported_in(&io::Error, &[i32])`.
+`directory_sync_unsupported` is now a thin per-platform wrapper choosing its set.
+No behaviour changed on unix: the set is still `22 | 95`.
+
+Three unit tests were added, all runnable on linux:
+`windows_directory_flush_denial_is_classified_unsupported_not_a_hard_failure`
+(asserts win32 `5` classifies as unsupported, and every code in each platform
+set does), `directory_flush_codes_outside_the_platform_set_stay_hard_failures`
+(win32 `2`/`112` stay failures; the unix set does not accept `5` or `1`, so the
+sets cannot leak into each other), and
+`publication_reports_a_parent_sync_status_instead_of_failing`.
+
+**Negative control**: removing `5` from `WINDOWS_DIRECTORY_SYNC_UNSUPPORTED` and
+re-running reddens exactly the intended test —
+`assertion failed: directory_sync_unsupported_in(&io::Error::from_raw_os_error(5), WINDOWS_DIRECTORY_SYNC_UNSUPPORTED)`,
+`test result: FAILED. 5 passed; 1 failed`. The constant was restored and the file
+verified byte-identical afterwards.
+
+### No test was gated, and no coverage was lost
+
+All four failures were production defects, so nothing was `#[cfg]`-gated,
+`#[ignore]`d, weakened or slept. `crates/codegraph-mcp` is unchanged by this fix;
+so are all four test bodies.
+
+### Workspace-wide audit — the same defect class elsewhere
+
+Class: POSIX filesystem-durability / directory-handle / open-file semantics that
+differ on windows. Searched all of `crates/` for directory-handle `sync_all`,
+hard-coded `raw_os_error()` sets, `rename` over an existing or open destination,
+`remove_*` on an open handle, `/`-separator and non-canonicalised path
+assumptions, and exact `ErrorKind`/OS-message assertions.
+
+| file:line                                                                                        | assumes                                                                                            | fails on windows?        | reasoning                                                                                                                                                                                                                                                                     |
+| ------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------- | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `crates/codegraph-store/src/index_state_publisher.rs:490,519`                                    | a directory handle can `sync_all`, and only `1/6/50/87` mean unsupported                           | **yes — FIXED here**     | `FlushFileBuffers` on a directory returns `5`; set was missing it                                                                                                                                                                                                             |
+| `crates/codegraph-store/src/index_state_publisher.rs:473,511`                                    | unix directory `fsync`, unsupported errnos `22/95`                                                 | no                       | correct on the supported unix targets; `cfg(unix)`-only                                                                                                                                                                                                                       |
+| `crates/codegraph-watch/src/watcher.rs:81`                                                       | errno `23/24/28` classify watcher exhaustion                                                       | no                       | explicitly `cfg(unix)`; windows falls through to `Other`, a conservative downgrade                                                                                                                                                                                            |
+| `crates/codegraph-daemon/src/lock.rs:89`                                                         | `rename(tmp, pid_path)` over a just-`create_new`ed placeholder whose handle is still open in scope | no                       | rust's `fs::rename` uses `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`, and std opens files with `FILE_SHARE_DELETE`, so replacing an open target is permitted; CI corroborates — the whole `codegraph-daemon` suite passes `96/96` on windows and this is its normal acquire path |
+| `crates/codegraph-daemon/src/http_registry.rs:151`                                               | `rename(tmp, path)` overwrites an existing registry entry                                          | no                       | same `MOVEFILE_REPLACE_EXISTING` reasoning; no open handle on the target at all                                                                                                                                                                                               |
+| `crates/codegraph-cli/src/installer/shared.rs:376`                                               | `rename(tmp, path)` overwrites an existing agent config                                            | no                       | same; and windows installer tests pass in CI                                                                                                                                                                                                                                  |
+| `crates/codegraph-store/src/index_lease.rs:632,680`                                              | a locked, still-open lock file can be `rename`d away mid-acquisition (fault-injection tests)       | no                       | `MOVEFILE_REPLACE_EXISTING` + `FILE_SHARE_DELETE`; and these unit tests are in `codegraph-store --lib`, which passed on windows in this very run                                                                                                                              |
+| `crates/codegraph-store/tests/index_state_publisher.rs:385,415,439`                              | same, in integration tests                                                                         | uncertain — not observed | the `codegraph-store` integration targets did NOT run on windows in run `30444938158`: the job aborted at the first failing target (`codegraph-mcp --lib`), and `Running` lines for them never appear in the log. Unverified either way; NOT changed                          |
+| `crates/codegraph-store/tests/store_state_gates.rs:1051,1109`                                    | rename a retained-lease lock file                                                                  | uncertain — not observed | same: target never ran on windows                                                                                                                                                                                                                                             |
+| `crates/codegraph-cli/tests/batch_m_legacy_extension_override.rs:1625,1728`                      | rename over an open snapshot-read handle / move an open directory                                  | uncertain — not observed | `codegraph-cli` integration targets also never ran on windows in this run                                                                                                                                                                                                     |
+| `crates/codegraph-mcp/tests/golden_mcp.rs:51`, `crates/codegraph-mcp/tests/support/parity.rs:44` | transient windows file locking appears ONLY as raw os error `32` (`ERROR_SHARING_VIOLATION`)       | uncertain                | `32` is the dominant case, but AV/filter-driver interference can also surface as `5` or `33`. Widening it would be speculative and would weaken a retry predicate against evidence I do not have, so it is left alone and recorded                                            |
+
+Fixed: the one high-confidence entry, which is also the one CI actually proved.
+Not fixed, with reasoning: the `rename`-over-open-handle entries — the three
+"no" verdicts rest on rust's `MOVEFILE_REPLACE_EXISTING` + `FILE_SHARE_DELETE`
+implementation (read from `library/std/src/sys/fs/windows.rs`) plus positive CI
+evidence, and the "uncertain" ones sit in targets windows never reached because
+the job aborted earlier. Changing them now would be guessing. **Expect further
+layers**: once `codegraph-mcp --lib` is green, windows will run
+`codegraph-store`'s and `codegraph-cli`'s integration targets for the first time,
+and those uncertain rows are where the next failures would appear.
+
+### Gates and their REAL exit status
+
+Each run separately; none joined with `&&`.
+
+| Command                                                                         | Exit | Result                                                   |
+| ------------------------------------------------------------------------------- | ---- | -------------------------------------------------------- |
+| `gh run view 30444938158 --log` (recover the real windows message)              | 0    | all four `Caused by: ... Access is denied. (os error 5)` |
+| `cargo test --locked -p codegraph-store --lib index_state_publisher`            | 0    | 6 passed (3 new)                                         |
+| negative control: same, with `5` removed from the windows set                   | 101  | **1 failed** — the intended test only                    |
+| `cargo test --locked -p codegraph-store --lib index_state_publisher` (restored) | 0    | 6 passed                                                 |
+| `cargo test --locked -p codegraph-mcp`                                          | 0    | **258** lib + 65 across 9 integration targets, all `ok`  |
+| `cargo test --locked -p codegraph-store`                                        | 0    | **100** lib + 91 across 8 integration targets, all `ok`  |
+
+The remaining gates (`check-workspace-versions.sh`, `make fmt`, `make ci` twice,
+golden diff, `Cargo.lock` SHA) are recorded immediately below.
+
+### CI round 4 — final gate statuses
+
+| Command                                              | Exit  | Result                                                                         |
+| ---------------------------------------------------- | ----- | ------------------------------------------------------------------------------ |
+| `bash scripts/check-workspace-versions.sh`           | **0** | workspace / `version.txt` / manifest all `0.40.4`                              |
+| `make fmt`                                           | **0** | run AFTER this prose, BEFORE CI                                                |
+| `make ci CARGO='cargo --locked'` run 1               | **0** | `✅ All CI checks passed!`                                                     |
+| `make ci CARGO='cargo --locked'` run 2               | **0** | `✅ All CI checks passed!`                                                     |
+| `git diff --stat c7800ca..HEAD -- reference/golden/` | **0** | EMPTY — no golden byte changed                                                 |
+| `sha256sum Cargo.lock`                               | **0** | `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1` — unchanged |
+
+The equivalence oracle again left untracked
+`reference/golden/{cuda,solidity}/colby.db-{wal,shm}`; removed before run 2 and
+before staging. Two files changed:
+`crates/codegraph-store/src/index_state_publisher.rs` and this ledger. Windows was
+NOT validated locally — the two cross-compilation routes still fail exactly as
+recorded above and no C toolchain can be installed here.
