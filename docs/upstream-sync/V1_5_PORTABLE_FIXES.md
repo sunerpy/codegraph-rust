@@ -7910,3 +7910,98 @@ false claim is gone and not reintroduced anywhere.
 
 Recorded in the section below, after the gates ran. Gates were run separately,
 never joined with `&&`, so no tail is hidden.
+
+## F2 round-two finding, recorded as DEFERRED: the stale-heal path deletes the pid record before the socket (2026-07-29)
+
+**Status: NOT fixed in this release.** This section is the record, not a repair.
+The defect predates this branch, so it was adjudicated out of scope for the
+v1.5-portable-fixes work; recording it here keeps the evidence ledger the single
+place a maintainer looking at this release finds it. `KNOWN_DIFFS.md` was
+considered and rejected as the home: that file is the parsed Tier-3 oracle input
+plus prose about colby EQUIVALENCE differences, and this is neither an
+equivalence difference nor an allowlistable diff. No Tier-3 `RULE` line was
+added; that file still has zero active rules.
+
+### The function and the current order
+
+`clear_stale_daemon_socket` (`crates/codegraph-daemon/src/lock.rs:165-178`),
+verbatim at `26cca84`:
+
+```rust
+    // Liveness gate: only proceed once the owning pid is proven dead/absent.
+    if !clear_stale_daemon_lock(&pid_path, None) {
+        return false;
+    }
+    let _ = fs::remove_file(&socket_path);
+    true
+```
+
+The pid record goes first, the socket second.
+
+### Why the order matters
+
+The published pid record IS the single-instance exclusion token:
+`try_acquire_daemon_lock` claims it with `create_new`, so while a record exists a
+competing start reports `Taken` and never binds the recorded socket path. Once
+this cleaner has removed the record, a replacement daemon may legitimately claim
+it and bind the same path before the `remove_file(&socket_path)` line runs — and
+that unlink then destroys the LIVE replacement's socket. Observable end state: a
+pid record naming a live daemon with no socket. Later clients cannot self-heal
+out of it, because the liveness gate in `clear_stale_daemon_lock`
+(`lock.rs:141-143`) refuses to touch a record whose pid is alive.
+
+`clear_stale_daemon_lock` also returns `true` for a MISSING pidfile
+(`lock.rs:130`), so "cleared" does not imply this caller ever held exclusion —
+which widens the interleaving rather than narrowing it.
+
+### Production reachability
+
+Not test-only. `heal_stale_daemon_if_dead` (`crates/codegraph-cli/src/main.rs:2680`)
+calls it, and that helper is reached from three sites, including the failed warm
+attach inside `proxy_to_running_daemon` (`main.rs:2622-2627`, socket missing) and
+its post-`run_proxy` failure path (`main.rs:2647`). Two concurrent
+`serve --mcp` starts on one project can therefore run a cleaner against a
+replacement daemon's namespace.
+
+### It predates `aba4079`
+
+`git show aba4079:crates/codegraph-daemon/src/lock.rs` already contains the same
+function with the same order at its line 161:
+
+```rust
+pub fn clear_stale_daemon_socket(project_root: &Path) -> bool {
+    let pid_path = daemon_pid_path(project_root);
+    let socket_path = recorded_socket_path(project_root);
+    // Liveness gate: only proceed once the owning pid is proven dead/absent.
+    if !clear_stale_daemon_lock(&pid_path, None) {
+        return false;
+    }
+    let _ = fs::remove_file(&socket_path);
+    true
+}
+```
+
+This branch changed only its error handling, because `daemon_pid_path` and
+`recorded_socket_path` began returning `Result`. The deletion order is untouched.
+
+### Contrast with `f691415`
+
+`f691415` ("fix(daemon): remove the rendezvous socket before releasing its
+ownership record") fixed exactly this class of race in a DIFFERENT function,
+`cleanup_owned_rendezvous` (`lock.rs:281-312`): it removes the socket first while
+its own record still excludes competitors, then deletes the record only after
+re-corroborating ownership through `cleanup_owned_lock`. That function's doc
+comment states the reasoning ("ORDER IS LOAD-BEARING"). The stale-heal path never
+received the same treatment.
+
+### Why a naive order swap is not a fix
+
+Swapping the two deletions in `clear_stale_daemon_socket` is insufficient. Unlike
+`cleanup_owned_rendezvous`, this cleaner does not own the record it is deleting,
+so it has no ownership token to re-corroborate and nothing stops several
+concurrent cleaners from performing a delayed unlink after a replacement daemon
+has already bound the path. A correct fix needs either a serialization protocol
+shared by starters and cleaners, or the stale cleanup moved inside
+`start_or_attach_gated` (`crates/codegraph-daemon/src/lib.rs:291`) so it runs only
+once the new pid record is held. Neither is a documentation change, and neither
+was attempted here.
