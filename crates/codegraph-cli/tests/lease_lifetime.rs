@@ -400,6 +400,12 @@ impl Drop for LeaseHookEnv {
     }
 }
 
+/// Only the metadata-comparing arms of `assert_path_still_names_opened_file`
+/// (unix, portable) call this. The windows arm reopens the path with
+/// `FILE_FLAG_OPEN_REPARSE_POINT` and compares true `FILE_ID_INFO` handles,
+/// which subsumes both the alias check and the identity check — so widening
+/// this gate to include windows makes the item never-used there.
+#[cfg(not(windows))]
 fn existing_metadata(path: &Path, operation: &str) -> fs::Metadata {
     fs::symlink_metadata(path)
         .unwrap_or_else(|error| panic!("{operation} {} failed: {error}", path.display()))
