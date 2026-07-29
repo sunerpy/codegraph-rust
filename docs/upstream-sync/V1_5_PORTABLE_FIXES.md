@@ -8534,3 +8534,209 @@ Two files changed: `crates/codegraph-daemon/src/lock.rs` and this ledger. No
 `reference/golden/`, `Cargo.toml`, `Cargo.lock`, `.github/workflows/` or `scripts/`
 change. Test parallelism untouched — `--test-threads` was never passed, and no test
 was skipped, `#[ignore]`d, weakened, or given a sleep.
+
+## PR #173 CI blockers — three failures, two root causes (2026-07-29)
+
+Three test failures on PR #173 at HEAD `706d36a`. All three were treated as
+hypotheses needing proof, and each mechanism was established from code plus a
+runtime observation before anything was changed.
+
+| #   | Job            | Failure                                                                             | Root cause                     |
+| --- | -------------- | ----------------------------------------------------------------------------------- | ------------------------------ |
+| A   | `Test` (LINUX) | `an_exhausted_drain_budget_replies_incomplete_instead_of_success`                   | PRODUCTION defect              |
+| B   | `Windows`      | `lock::tests::a_crash_between_cleanup_boundaries_leaves_only_self_healing_residue`  | test premise absent on windows |
+| C   | `Windows`      | `lock::tests::a_replacement_start_at_the_cleanup_midpoint_keeps_its_own_rendezvous` | test premise absent on windows |
+
+### Failure A — the daemon reported a drain it never performed
+
+CI location: `Test` job, run `30430353283`,
+`panicked at crates/codegraph-daemon/tests/control_shutdown.rs:218:5`,
+`3 passed; 1 failed`.
+
+The dismissed hypothesis was "the silent client's session is not yet registered
+when the shutdown frame arrives". Instrumentation refutes it. Three probes were
+added temporarily to `run_accept_loop_async` — `active_count` immediately before
+`close_all_sessions`, immediately after it, and at the entry to
+`drain_watcher_loops_and_sessions` — and the failing runs report:
+
+```
+DBG before=1 after=0 entry=0 drained=true     <- every FAILING run
+DBG before=1 after=1 entry=1 drained=false    <- every PASSING run
+```
+
+`before=1` on the failures proves the session WAS registered. The registration
+race does not exist: `connect_silent_data_client` reads the daemon hello, and that
+hello is written by `serve_session_async` at line 384 — AFTER
+`registry.start_session()` at line 362. Completing the hello read is already
+positive proof of registration. (A `handle.active_sessions() >= 1` probe inserted
+into the test before the control frame never once fired across 40 runs, including
+runs that then failed the drain assertion in the same binary.)
+
+The actual defect is in production, in the shutdown path itself:
+
+1. `registry.close_all_sessions()` signals every session to stop;
+2. sessions retire on OTHER tokio worker threads;
+3. `drain_watcher_loops_and_sessions` then reads `active_count()` for the FIRST
+   time and returns `true` the instant it sees zero — even for
+   `drain_budget: ZERO`, which permits no waiting at all.
+
+So with a zero budget and one outstanding session, the answer was decided by
+whether a worker thread got scheduled between steps 1 and 3. When it did, the
+daemon answered `drained: true` for a drain it never waited for. `uninit --force`
+consumes that ack as permission to delete children. This is exactly the class of
+bug the test exists to prevent, and the test was right.
+
+**Fix** (`crates/codegraph-daemon/src/lib.rs`): new `close_sessions_and_drain`
+samples `watcher_done() && active_syncs() == 0 && active_count() == 0` BEFORE
+signalling, and a zero budget answers from that sample. A nonzero budget is
+byte-identical to before — it delegates to the unchanged
+`drain_watcher_loops_and_sessions`, whose own test still passes untouched.
+
+It is deliberately NOT an `async fn`: an `async fn` body does not execute until
+first poll, which would put the sample back on the scheduler's timeline. Sampling
+in a plain fn that returns the drain future pins the sample to the CALL. The new
+unit test `a_zero_budget_answers_from_the_state_at_the_shutdown_instant` asserts
+this by retiring the session BEFORE awaiting the returned future — the exact
+interleaving that used to answer `true`.
+
+No sleep, no budget change, no retry, no relaxed assertion. The integration test
+is unmodified.
+
+### Failure A reproduction rate, before and after
+
+Reproduced locally, and the constraint that reproduces it is CPU count.
+
+| Condition                              | Before fix         | After fix          |
+| -------------------------------------- | ------------------ | ------------------ |
+| unconstrained (30 cores), 50 runs      | **10 failed / 50** | 0 failed / 50      |
+| unconstrained, second 60-run batch     | 0 failed / 60      | —                  |
+| `taskset -c 0,1` (2 cores), 30 runs    | 1 failed / 30      | —                  |
+| `taskset -c 0,1` + 8 spinners, 50 runs | 3 failed / 50      | —                  |
+| `taskset -c 0` (1 core), 40 runs       | **5 failed / 40**  | **0 failed / 40**  |
+| `taskset -c 0` (1 core), 50 runs       | —                  | **50 passed / 50** |
+
+The 10/50 first batch and the 0/60 second on the same binary is itself the
+signature: the outcome tracks machine load, not the code path. `taskset -c 0`
+reproduces it reliably at ~12%, which is why the fix was verified there and not
+only on an idle 30-core host.
+
+### Per-test audit of `control_shutdown.rs`
+
+Every test was checked for the "assume the server already did something" shape.
+
+| Test                                                                    | Precondition it needs                                       | Established?                                                                                                    |
+| ----------------------------------------------------------------------- | ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `authorized_shutdown_closes_a_long_lived_session_before_acknowledging`  | session registered before the frame                         | YES — the hello read (written after `start_session`) proves it                                                  |
+| `an_unauthorized_frame_is_refused_without_shutting_the_daemon_down`     | daemon serving; each refusal answered on its own connection | YES — each `send_control_frame` completes a hello + reply round trip; the `is_finished` check follows the reply |
+| `an_exhausted_drain_budget_replies_incomplete_instead_of_success`       | session registered before the frame                         | YES — same hello proof; the failure was NOT a missing precondition                                              |
+| `an_incomplete_drain_reply_is_unresponsive_and_never_signals_the_owner` | stub listener bound before the request                      | YES — `ListenerOptions::create_sync()` returns after bind, on the test thread, before the thread is spawned     |
+
+`3 passed` was not luck. No test in this file waits on an unobserved server
+action, and none was changed.
+
+### Failures B and C — VERDICT: test premise, not a production defect
+
+CI location: `Windows` job, step `Run tests`,
+`panicked at crates\codegraph-daemon\src\lock.rs:761:17` and
+`crates\codegraph-daemon\src\lock.rs:714:9`, `93 passed; 2 failed`.
+
+The recorded hypothesis is confirmed by the code:
+
+- `paths::daemon_socket_path` under `#[cfg(windows)]` returns
+  `PathBuf::from(format!("{V2_RENDEZVOUS_PREFIX}{}", rendezvous_name(&paths)))` —
+  a BARE name like `codegraph-v2-1a2b3c4d5e6f7788`, no directory, no filesystem
+  entry (interprocess's `GenericNamespaced` prepends `\\.\pipe\` itself).
+- `Rendezvous::cleanup_path` exists only under `#[cfg(unix)]`, and
+  `cleanup_owned_rendezvous` unlinks only under `#[cfg(unix)]` (`lock.rs:390-396`).
+
+Both failing tests did `fs::write(&socket, b"old")` — creating a REAL file whose
+name is the pipe name, in the process CWD — and then asserted
+`!socket.exists()`. On windows nothing removes it, so the assertion fails. It is
+asserting a filesystem contract windows does not have.
+
+Production is CORRECT on windows, and deliberately so. A named pipe is a kernel
+object reclaimed when its last handle closes; there is no residue to unlink, and
+attempting one would be meaningless. The pid record — a real file — is what carries
+the single-instance exclusion, and `cleanup_owned_rendezvous` /
+`clear_stale_daemon_socket` operate on it identically on both platforms. Gating a
+test green here does not hide a broken production path; there is no windows path
+to break.
+
+**Fix** (`crates/codegraph-daemon/src/lock.rs`, test module only): three helpers
+— `publish_socket_file`, `assert_socket_file_present`, `assert_socket_file_absent`
+— perform the socket-FILE operations under `#[cfg(unix)]` and are no-ops
+elsewhere. The two tests keep their names, their structure, their checkpoint
+callbacks, and every ORDERING assertion on all platforms:
+
+- the pid record is STILL PUBLISHED at the `SocketRemoved` boundary (`f691415`'s
+  ordering invariant) — asserted on windows too;
+- a competing `try_acquire_daemon_lock` at `OwnershipCorroborated` is REFUSED and
+  still reads the departing owner's pid — asserted on windows too;
+- `cleanup_owned_rendezvous` returns `false` for a departed owner and `true` for
+  the true owner — asserted on windows too;
+- `clear_stale_daemon_socket` clears the crash residue — asserted on windows too.
+
+Only the `socket.exists()` / `fs::write(socket)` claims are unix-scoped. On unix
+the tests are byte-equivalent in behavior to before.
+
+**Windows coverage now unverified (known gap).** That the socket FILE is removed,
+and that it is removed BEFORE the pid record, is asserted on unix only. This is
+not a loss of real coverage — there is no socket file on windows — but it is
+recorded so no one later reads the gate as "windows cleanup is tested". The three
+stale-heal tests (`a_replacement_start_during_the_stale_heal_keeps_its_own_socket`,
+`the_stale_heal_holds_its_claim_across_the_unlink_and_releases_it_last`,
+`an_absent_record_is_claimed_before_its_leftover_socket_is_removed`) were NOT
+gated: they were not in the windows failure list, and `clear_stale_daemon_socket`
+calls `fs::remove_file(&socket_path)` unconditionally (`lock.rs:263`, no `cfg`), so
+a file they themselves created IS removed on windows. They are left exactly as
+`6b9861b` wrote them.
+
+### Windows was NOT validated locally — and cannot be here
+
+No windows verification is claimed. Both cross-compilation routes were retried and
+both fail, as previously recorded: `cargo clippy --target x86_64-pc-windows-msvc`
+exits 101 (23 `tree-sitter-*` crates fail their `cc-rs` build scripts), and
+`cargo xwin clippy` exits 101 (`failed to find tool "clang-cl"`). No clang /
+lld-link / zig / cargo-zigbuild is present, no package manager is available, and
+the process runs as uid 1000. `clang-cl` cannot be installed here. The B/C verdict
+therefore rests on reading `paths.rs`, `transport.rs` and `lock.rs`, not on a
+windows run. Real windows validation is the CodeBuild `codegraph-rs-windows`
+project, which was NOT touched.
+
+### Gates and their REAL exit status
+
+Each command was run separately; none joined with `&&`.
+
+| Command                                                                               | Exit      | Result                                                   |
+| ------------------------------------------------------------------------------------- | --------- | -------------------------------------------------------- |
+| `cargo test --locked -p codegraph-daemon` (before any fix, drain test alone, 50 runs) | 101 on 10 | the Red observation                                      |
+| `cargo build --locked -p codegraph-daemon --tests` (instrumented)                     | 0         | probe binary for the diagnosis                           |
+| `cargo clippy --locked -p codegraph-daemon --all-targets`                             | 0         | no warnings                                              |
+| `cargo test --locked -p codegraph-daemon --lib` (mid-fix, `async fn` form)            | 101       | 1 failed — proved the sample must precede the first poll |
+| `cargo test --locked -p codegraph-daemon`                                             | 0         | 105 lib + every integration target, 11 targets all `ok`  |
+| drain-budget test × 50, `taskset -c 0`                                                | 0         | **50 passed / 50**                                       |
+| drain-budget test × 50, unconstrained                                                 | 0         | **50 passed / 50**                                       |
+| the other three `control_shutdown` tests × 25 each, `taskset -c 0`                    | 0         | 0 failed / 75                                            |
+
+The remaining gates (`bash scripts/check-workspace-versions.sh`, `make fmt`,
+`make ci CARGO='cargo --locked'` twice, the golden-diff and `Cargo.lock` checks)
+are recorded immediately below with their real exit statuses.
+
+### PR #173 blockers — final gate statuses
+
+| Command                                              | Exit  | Result                                                                         |
+| ---------------------------------------------------- | ----- | ------------------------------------------------------------------------------ |
+| `bash scripts/check-workspace-versions.sh`           | **0** | workspace / `version.txt` / manifest all `0.40.4`                              |
+| `make fmt`                                           | **0** | run AFTER this prose, BEFORE CI                                                |
+| `make ci CARGO='cargo --locked'` run 1               | **0** | `✅ All CI checks passed!`                                                     |
+| `make ci CARGO='cargo --locked'` run 2               | **0** | `✅ All CI checks passed!`                                                     |
+| `git diff --stat 706d36a..HEAD -- reference/golden/` | **0** | EMPTY — no golden byte changed                                                 |
+| `sha256sum Cargo.lock`                               | **0** | `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1` — unchanged |
+
+The equivalence oracle left untracked
+`reference/golden/{cfml,cpp,solidity}/colby.db-{wal,shm}` after run 1; they are not
+gitignored and were removed before run 2 and before staging. Three files changed:
+`crates/codegraph-daemon/src/lib.rs`, `crates/codegraph-daemon/src/lock.rs`, and
+this ledger. No `reference/golden/`, `Cargo.toml`, `Cargo.lock`,
+`.github/workflows/`, `scripts/` or `.aws/` change. No test was skipped,
+`#[ignore]`d, weakened, given a sleep, or given a widened timeout.
