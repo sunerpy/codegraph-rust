@@ -39,6 +39,110 @@ mod segment_match;
 mod segments;
 mod structural_gate;
 
+/// Test-only: the ONE process-wide environment lock for this binary.
+///
+/// `cargo test` runs every unit test of this binary on threads of a SINGLE
+/// process, so `HOME`, `XDG_DATA_HOME`, `USERPROFILE`, … are shared mutable
+/// state. Two independent `ENV_LOCK` statics used to live in this file (one per
+/// test module) plus a third in `installer::tests`, and because distinct statics
+/// do not exclude each other, a test holding "the" lock could still have `HOME`
+/// swapped underneath it — which made `install_completions` write into the
+/// developer's REAL home directory. Every test in this binary that mutates a
+/// process-global env var must therefore go through [`test_env::EnvGuard`].
+#[cfg(test)]
+pub(crate) mod test_env {
+    use std::ffi::{OsStr, OsString};
+    use std::sync::{Mutex, MutexGuard};
+
+    /// The single env lock for the whole `codegraph` binary's test suite.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Holds [`ENV_LOCK`] for its whole lifetime, records every variable it
+    /// touched, and restores all of them on drop (panic-safe, so a failing
+    /// assertion cannot leak a temp `HOME` into the rest of the suite).
+    pub(crate) struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        saved: Vec<(String, Option<OsString>)>,
+        expected: Vec<(String, Option<OsString>)>,
+    }
+
+    /// Acquire the process-wide env lock. Poisoning is recovered so one failing
+    /// test does not cascade into every other env test.
+    pub(crate) fn env_guard() -> EnvGuard {
+        EnvGuard {
+            _lock: ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
+            saved: Vec::new(),
+            expected: Vec::new(),
+        }
+    }
+
+    impl EnvGuard {
+        fn remember(&mut self, key: &str) {
+            if !self.saved.iter().any(|(k, _)| k == key) {
+                self.saved.push((key.to_string(), std::env::var_os(key)));
+            }
+        }
+
+        fn expect(&mut self, key: &str, value: Option<OsString>) {
+            match self.expected.iter_mut().find(|(k, _)| k == key) {
+                Some(slot) => slot.1 = value,
+                None => self.expected.push((key.to_string(), value)),
+            }
+        }
+
+        /// Set `key`, then assert the write is observable — so a stolen variable
+        /// is a LOUD failure instead of a silent write to the real `$HOME`.
+        pub(crate) fn set(&mut self, key: &str, value: impl AsRef<OsStr>) -> &mut Self {
+            let value = value.as_ref().to_os_string();
+            self.remember(key);
+            // SAFETY: ENV_LOCK is held for this guard's whole lifetime, so no
+            // other test thread of this binary reads or writes env concurrently.
+            unsafe { std::env::set_var(key, &value) };
+            self.expect(key, Some(value));
+            self.assert_intact();
+            self
+        }
+
+        /// Unset `key` and assert it stays unset.
+        pub(crate) fn remove(&mut self, key: &str) -> &mut Self {
+            self.remember(key);
+            // SAFETY: as in `set` — serialized by ENV_LOCK.
+            unsafe { std::env::remove_var(key) };
+            self.expect(key, None);
+            self.assert_intact();
+            self
+        }
+
+        /// Panic if any variable this guard wrote has changed value since.
+        ///
+        /// This is the escape detector: if some future test mutates `HOME`
+        /// without taking [`ENV_LOCK`], the test that owns the guard fails with
+        /// a precise message instead of writing into the real home directory.
+        pub(crate) fn assert_intact(&self) {
+            for (key, want) in &self.expected {
+                assert_eq!(
+                    &std::env::var_os(key),
+                    want,
+                    "env var {key} changed underneath this guard: another test \
+                     mutated process-global env without holding the shared lock"
+                );
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..).rev() {
+                match value {
+                    // SAFETY: still holding ENV_LOCK; single-threaded here.
+                    Some(v) => unsafe { std::env::set_var(&key, v) },
+                    None => unsafe { std::env::remove_var(&key) },
+                }
+            }
+        }
+    }
+}
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() {
@@ -2747,42 +2851,32 @@ mod serve_mode_tests {
         emit_serve_startup_debug, guard_indexable_root, select_serve_mode,
         should_run_daemon_services, should_run_serve_services,
     };
+    use crate::test_env::env_guard;
     use std::path::Path;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn debug_enabled_honors_truthy_values_only() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let prev = std::env::var("CODEGRAPH_DEBUG").ok();
+        let mut env = env_guard();
 
-        unsafe { std::env::remove_var("CODEGRAPH_DEBUG") };
+        env.remove("CODEGRAPH_DEBUG");
         assert!(!debug_enabled(), "unset ⇒ off");
-        unsafe { std::env::set_var("CODEGRAPH_DEBUG", "1") };
+        env.set("CODEGRAPH_DEBUG", "1");
         assert!(debug_enabled(), "\"1\" ⇒ on");
-        unsafe { std::env::set_var("CODEGRAPH_DEBUG", "true") };
+        env.set("CODEGRAPH_DEBUG", "true");
         assert!(debug_enabled(), "\"true\" ⇒ on");
-        unsafe { std::env::set_var("CODEGRAPH_DEBUG", "0") };
+        env.set("CODEGRAPH_DEBUG", "0");
         assert!(!debug_enabled(), "\"0\" ⇒ off");
-        unsafe { std::env::set_var("CODEGRAPH_DEBUG", "yes") };
+        env.set("CODEGRAPH_DEBUG", "yes");
         assert!(!debug_enabled(), "any other value ⇒ off");
-
-        match prev {
-            Some(v) => unsafe { std::env::set_var("CODEGRAPH_DEBUG", v) },
-            None => unsafe { std::env::remove_var("CODEGRAPH_DEBUG") },
-        }
     }
 
     #[test]
     fn effective_log_level_translates_codegraph_debug_and_defers_to_rust_log() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let prev_debug = std::env::var("CODEGRAPH_DEBUG").ok();
-        let prev_rust_log = std::env::var("RUST_LOG").ok();
+        let mut env = env_guard();
 
         // Given RUST_LOG unset and CODEGRAPH_DEBUG unset: config level is used verbatim.
-        unsafe { std::env::remove_var("RUST_LOG") };
-        unsafe { std::env::remove_var("CODEGRAPH_DEBUG") };
+        env.remove("RUST_LOG");
+        env.remove("CODEGRAPH_DEBUG");
         assert_eq!(
             effective_log_level("info"),
             "info",
@@ -2790,7 +2884,7 @@ mod serve_mode_tests {
         );
 
         // When CODEGRAPH_DEBUG=1 and RUST_LOG unset: level bumps to debug (back-compat).
-        unsafe { std::env::set_var("CODEGRAPH_DEBUG", "1") };
+        env.set("CODEGRAPH_DEBUG", "1");
         assert_eq!(
             effective_log_level("info"),
             "debug",
@@ -2799,21 +2893,12 @@ mod serve_mode_tests {
 
         // When RUST_LOG is set: the base opens to trace so the EnvFilter is the
         // sole gate (the reload floor must not cap RUST_LOG upward).
-        unsafe { std::env::set_var("RUST_LOG", "warn") };
+        env.set("RUST_LOG", "warn");
         assert_eq!(
             effective_log_level("info"),
             "trace",
             "RUST_LOG set ⇒ base opens to trace; EnvFilter owns the gate"
         );
-
-        match prev_debug {
-            Some(v) => unsafe { std::env::set_var("CODEGRAPH_DEBUG", v) },
-            None => unsafe { std::env::remove_var("CODEGRAPH_DEBUG") },
-        }
-        match prev_rust_log {
-            Some(v) => unsafe { std::env::set_var("RUST_LOG", v) },
-            None => unsafe { std::env::remove_var("RUST_LOG") },
-        }
     }
 
     #[test]
@@ -2874,14 +2959,13 @@ mod serve_mode_tests {
 
     #[test]
     fn daemon_services_disabled_at_home_and_root_enabled_for_nested_project() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let mut env = env_guard();
         let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-        let prev_home = std::env::var_os(home_key);
 
         let tmp = std::env::temp_dir().join(format!("cg-serve-home-{}", std::process::id()));
         let nested = tmp.join("workspace/ProdDir/AI/codegraph-rust");
         std::fs::create_dir_all(&nested).unwrap();
-        unsafe { std::env::set_var(home_key, &tmp) };
+        env.set(home_key, &tmp);
 
         assert!(
             !should_run_daemon_services(&tmp),
@@ -2896,23 +2980,19 @@ mod serve_mode_tests {
             "a project nested under $HOME must keep daemon services"
         );
 
-        match prev_home {
-            Some(v) => unsafe { std::env::set_var(home_key, v) },
-            None => unsafe { std::env::remove_var(home_key) },
-        }
+        env.assert_intact();
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn guard_indexable_root_rejects_home_and_root_allows_nested_project() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let mut env = env_guard();
         let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-        let prev_home = std::env::var_os(home_key);
 
         let tmp = std::env::temp_dir().join(format!("cg-guard-home-{}", std::process::id()));
         let nested = tmp.join("workspace/proj");
         std::fs::create_dir_all(&nested).unwrap();
-        unsafe { std::env::set_var(home_key, &tmp) };
+        env.set(home_key, &tmp);
 
         assert!(
             guard_indexable_root(&tmp).is_err(),
@@ -2927,10 +3007,7 @@ mod serve_mode_tests {
             "a project nested under $HOME must be indexable"
         );
 
-        match prev_home {
-            Some(v) => unsafe { std::env::set_var(home_key, v) },
-            None => unsafe { std::env::remove_var(home_key) },
-        }
+        env.assert_intact();
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -5552,6 +5629,9 @@ mod pure_helper_tests {
 
     #[test]
     fn db_path_is_under_codegraph_dir() {
+        // Reads CODEGRAPH_DIR, which a sibling test unsets and restores, so it
+        // takes the same lock even though it never writes.
+        let _env = crate::test_env::env_guard();
         if std::env::var("CODEGRAPH_DIR").is_err() {
             let dir = tmp("dbpath");
             let canonical = dir.canonicalize().unwrap();
@@ -5675,33 +5755,22 @@ mod pure_helper_tests {
 
     #[test]
     fn env_path_none_for_empty_or_unset_some_for_value() {
+        let mut env = crate::test_env::env_guard();
         let key = "CODEGRAPH_TEST_ENV_PATH_UNSET_XYZ";
-        // SAFETY: the key is test-private and this test runs single-threaded within its own scope.
-        unsafe {
-            std::env::remove_var(key);
-        }
+        env.remove(key);
         assert_eq!(env_path(key), None);
-        unsafe {
-            std::env::set_var(key, "");
-        }
+        env.set(key, "");
         assert_eq!(env_path(key), None);
-        unsafe {
-            std::env::set_var(key, "/some/where");
-        }
+        env.set(key, "/some/where");
         assert_eq!(env_path(key), Some(PathBuf::from("/some/where")));
-        unsafe {
-            std::env::remove_var(key);
-        }
     }
 }
 
 #[cfg(test)]
 mod formatter_and_env_tests {
     use super::*;
+    use crate::test_env::env_guard;
     use codegraph_core::types::{FileRecord, Language, NodeKind};
-
-    // Serializes tests that mutate process-global env (cargo test runs them concurrently).
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn tmp(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
@@ -5737,9 +5806,8 @@ mod formatter_and_env_tests {
 
     #[test]
     fn codegraph_dir_and_db_path_default_layout() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let prev = std::env::var_os("CODEGRAPH_DIR");
-        unsafe { std::env::remove_var("CODEGRAPH_DIR") };
+        let mut env = env_guard();
+        env.remove("CODEGRAPH_DIR");
         let proj = tmp("default-layout");
         let canonical = proj.canonicalize().unwrap();
         assert_eq!(
@@ -5750,9 +5818,7 @@ mod formatter_and_env_tests {
             db_path(&proj).unwrap(),
             canonical.join(".codegraph-v2/codegraph.db")
         );
-        if let Some(v) = prev {
-            unsafe { std::env::set_var("CODEGRAPH_DIR", v) };
-        }
+        env.assert_intact();
         let _ = fs::remove_dir_all(&proj);
     }
 
@@ -5989,31 +6055,20 @@ mod formatter_and_env_tests {
 
     #[test]
     fn home_dir_resolves_from_home_then_userprofile_then_errors() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev_home = std::env::var_os("HOME");
-        let prev_up = std::env::var_os("USERPROFILE");
-        unsafe { std::env::set_var("HOME", "/home/tester") };
+        let mut env = env_guard();
+        env.set("HOME", "/home/tester");
         assert_eq!(home_dir().unwrap(), PathBuf::from("/home/tester"));
-        unsafe { std::env::remove_var("HOME") };
-        unsafe { std::env::remove_var("USERPROFILE") };
+        env.remove("HOME");
+        env.remove("USERPROFILE");
         assert!(home_dir().is_err());
-        if let Some(v) = prev_home {
-            unsafe { std::env::set_var("HOME", v) };
-        }
-        if let Some(v) = prev_up {
-            unsafe { std::env::set_var("USERPROFILE", v) };
-        }
     }
 
     #[test]
     fn completion_target_paths_per_shell() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev_home = std::env::var_os("HOME");
-        let prev_xdg = std::env::var_os("XDG_DATA_HOME");
-        let prev_local = std::env::var_os("LOCALAPPDATA");
-        unsafe { std::env::set_var("HOME", "/h") };
-        unsafe { std::env::remove_var("XDG_DATA_HOME") };
-        unsafe { std::env::remove_var("LOCALAPPDATA") };
+        let mut env = env_guard();
+        env.set("HOME", "/h");
+        env.remove("XDG_DATA_HOME");
+        env.remove("LOCALAPPDATA");
 
         assert_eq!(
             completion_target(Shell::Bash).unwrap(),
@@ -6035,61 +6090,31 @@ mod formatter_and_env_tests {
             completion_target(Shell::Elvish).unwrap(),
             PathBuf::from("/h/.config/codegraph/completion.elv")
         );
-        unsafe { std::env::set_var("XDG_DATA_HOME", "/xdg") };
+        env.set("XDG_DATA_HOME", "/xdg");
         assert_eq!(
             completion_target(Shell::Bash).unwrap(),
             PathBuf::from("/xdg/bash-completion/completions/codegraph")
         );
-
-        if let Some(v) = prev_home {
-            unsafe { std::env::set_var("HOME", v) };
-        } else {
-            unsafe { std::env::remove_var("HOME") };
-        }
-        match prev_xdg {
-            Some(v) => unsafe { std::env::set_var("XDG_DATA_HOME", v) },
-            None => unsafe { std::env::remove_var("XDG_DATA_HOME") },
-        }
-        match prev_local {
-            Some(v) => unsafe { std::env::set_var("LOCALAPPDATA", v) },
-            None => unsafe { std::env::remove_var("LOCALAPPDATA") },
-        }
     }
 
     #[test]
     fn powershell_profile_path_override_then_userprofile_then_error() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev_ps = std::env::var_os("CODEGRAPH_PS_PROFILE");
-        let prev_up = std::env::var_os("USERPROFILE");
-        let prev_home = std::env::var_os("HOME");
+        let mut env = env_guard();
 
-        unsafe { std::env::set_var("CODEGRAPH_PS_PROFILE", "/custom/profile.ps1") };
+        env.set("CODEGRAPH_PS_PROFILE", "/custom/profile.ps1");
         assert_eq!(
             powershell_profile_path().unwrap(),
             PathBuf::from("/custom/profile.ps1")
         );
-        unsafe { std::env::remove_var("CODEGRAPH_PS_PROFILE") };
-        unsafe { std::env::set_var("USERPROFILE", "/up") };
+        env.remove("CODEGRAPH_PS_PROFILE");
+        env.set("USERPROFILE", "/up");
         assert_eq!(
             powershell_profile_path().unwrap(),
             PathBuf::from("/up/Documents/WindowsPowerShell/Microsoft.PowerShell_profile.ps1")
         );
-        unsafe { std::env::remove_var("USERPROFILE") };
-        unsafe { std::env::remove_var("HOME") };
+        env.remove("USERPROFILE");
+        env.remove("HOME");
         assert!(powershell_profile_path().is_err());
-
-        match prev_ps {
-            Some(v) => unsafe { std::env::set_var("CODEGRAPH_PS_PROFILE", v) },
-            None => unsafe { std::env::remove_var("CODEGRAPH_PS_PROFILE") },
-        }
-        match prev_up {
-            Some(v) => unsafe { std::env::set_var("USERPROFILE", v) },
-            None => unsafe { std::env::remove_var("USERPROFILE") },
-        }
-        match prev_home {
-            Some(v) => unsafe { std::env::set_var("HOME", v) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
     }
 
     #[test]
@@ -6116,16 +6141,13 @@ mod formatter_and_env_tests {
 
     #[test]
     fn http_log_path_lands_under_registry_dir() {
+        let mut env = env_guard();
         let dir = tmp("httplog");
-        let prev = std::env::var_os("CODEGRAPH_HTTP_REGISTRY_DIR");
-        unsafe { std::env::set_var("CODEGRAPH_HTTP_REGISTRY_DIR", &dir) };
+        env.set("CODEGRAPH_HTTP_REGISTRY_DIR", &dir);
         let p = http_log_path("127.0.0.1:8111");
         assert!(p.starts_with(&dir));
         assert!(p.extension().is_some_and(|e| e == "log"));
-        match prev {
-            Some(v) => unsafe { std::env::set_var("CODEGRAPH_HTTP_REGISTRY_DIR", v) },
-            None => unsafe { std::env::remove_var("CODEGRAPH_HTTP_REGISTRY_DIR") },
-        }
+        env.assert_intact();
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -6157,29 +6179,22 @@ mod formatter_and_env_tests {
             log_file: Some("/tmp/y.log".to_string()),
         };
         print_http_conflict(&info);
+        let mut env = env_guard();
         let dir = tmp("noteothers");
-        let prev = std::env::var_os("CODEGRAPH_HTTP_REGISTRY_DIR");
-        unsafe { std::env::set_var("CODEGRAPH_HTTP_REGISTRY_DIR", &dir) };
+        env.set("CODEGRAPH_HTTP_REGISTRY_DIR", &dir);
         note_other_running_servers("127.0.0.1:1234");
-        match prev {
-            Some(v) => unsafe { std::env::set_var("CODEGRAPH_HTTP_REGISTRY_DIR", v) },
-            None => unsafe { std::env::remove_var("CODEGRAPH_HTTP_REGISTRY_DIR") },
-        }
+        env.assert_intact();
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn is_http_detach_internal_reads_env_marker() {
+        let mut env = env_guard();
         let key = codegraph_daemon::CODEGRAPH_HTTP_DETACH_INTERNAL;
-        let prev = std::env::var_os(key);
-        unsafe { std::env::remove_var(key) };
+        env.remove(key);
         assert!(!is_http_detach_internal());
-        unsafe { std::env::set_var(key, "1") };
+        env.set(key, "1");
         assert!(is_http_detach_internal());
-        match prev {
-            Some(v) => unsafe { std::env::set_var(key, v) },
-            None => unsafe { std::env::remove_var(key) },
-        }
     }
 
     #[test]
@@ -6199,70 +6214,58 @@ mod formatter_and_env_tests {
 
     #[test]
     fn install_completions_writes_zsh_fish_elvish_into_home() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = env_guard();
         let dir = tmp("install-comp");
-        let prev_home = std::env::var_os("HOME");
-        let prev_xdg = std::env::var_os("XDG_DATA_HOME");
-        unsafe { std::env::set_var("HOME", &dir) };
-        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        env.set("HOME", &dir);
+        env.remove("XDG_DATA_HOME");
 
+        // Every step re-asserts the guarded env BEFORE writing, so a stolen
+        // HOME fails here instead of installing into the real home directory.
+        env.assert_intact();
         install_completions(Shell::Zsh).unwrap();
         assert!(dir.join(".zfunc/_codegraph").is_file());
 
+        env.assert_intact();
         install_completions(Shell::Fish).unwrap();
         assert!(
             dir.join(".config/fish/completions/codegraph.fish")
                 .is_file()
         );
 
+        env.assert_intact();
         install_completions(Shell::Elvish).unwrap();
         let elv = dir.join(".config/codegraph/completion.elv");
         assert!(elv.is_file());
         assert!(fs::read_to_string(&elv).unwrap().contains("codegraph"));
 
+        env.assert_intact();
         install_completions(Shell::Bash).unwrap();
         assert!(
             dir.join(".local/share/bash-completion/completions/codegraph")
                 .is_file()
         );
 
-        match prev_home {
-            Some(v) => unsafe { std::env::set_var("HOME", v) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-        match prev_xdg {
-            Some(v) => unsafe { std::env::set_var("XDG_DATA_HOME", v) },
-            None => unsafe { std::env::remove_var("XDG_DATA_HOME") },
-        }
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn install_completions_powershell_writes_script_and_dot_sources_profile() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = env_guard();
         let dir = tmp("install-ps");
-        let prev_local = std::env::var_os("LOCALAPPDATA");
-        let prev_ps = std::env::var_os("CODEGRAPH_PS_PROFILE");
         let profile = dir.join("profile.ps1");
-        unsafe { std::env::set_var("LOCALAPPDATA", &dir) };
-        unsafe { std::env::set_var("CODEGRAPH_PS_PROFILE", &profile) };
+        env.set("LOCALAPPDATA", &dir);
+        env.set("CODEGRAPH_PS_PROFILE", &profile);
 
+        env.assert_intact();
         install_completions(Shell::PowerShell).unwrap();
         let script = dir.join("codegraph/completion.ps1");
         assert!(script.is_file());
+        env.assert_intact();
         install_completions(Shell::PowerShell).unwrap();
         let line = format!(". \"{}\"", script.display());
         let body = fs::read_to_string(&profile).unwrap();
         assert_eq!(body.lines().filter(|l| l.trim() == line).count(), 1);
 
-        match prev_local {
-            Some(v) => unsafe { std::env::set_var("LOCALAPPDATA", v) },
-            None => unsafe { std::env::remove_var("LOCALAPPDATA") },
-        }
-        match prev_ps {
-            Some(v) => unsafe { std::env::set_var("CODEGRAPH_PS_PROFILE", v) },
-            None => unsafe { std::env::remove_var("CODEGRAPH_PS_PROFILE") },
-        }
         let _ = fs::remove_dir_all(&dir);
     }
 }

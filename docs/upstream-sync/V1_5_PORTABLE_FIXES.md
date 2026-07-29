@@ -8005,3 +8005,287 @@ shared by starters and cleaners, or the stale cleanup moved inside
 `start_or_attach_gated` (`crates/codegraph-daemon/src/lib.rs:291`) so it runs only
 once the new pid record is held. Neither is a documentation change, and neither
 was attempted here.
+
+## Release blocker — the two `install_completions` / `removed_ignored_directory` failures were NOT unfixable flakes; they were one lock defect, now fixed (2026-07-29)
+
+**This section supersedes every earlier characterisation of these two failures in
+this ledger as "pre-existing", "known", "in-process `HOME`/`XDG_DATA_HOME` race",
+or otherwise unfixable environment flakes** (see the notes near the F1 and F4 gate
+tables above, and the run-1 note at `make ci` run 1 of the F1 batch). That
+characterisation was wrong. Both failures had a determinate root cause — test code
+that mutated process-global environment variables while holding mutexes that did
+not exclude each other — and a determinate fix. No production code was involved in
+either failure, and none was changed to fix them.
+
+### The defect: two DIFFERENT `ENV_LOCK` statics in one crate's test code
+
+`cargo test` runs every unit test of one binary/crate as THREADS OF A SINGLE
+PROCESS, so `HOME`, `XDG_DATA_HOME`, `USERPROFILE`, `LOCALAPPDATA`,
+`CODEGRAPH_NO_WATCH`, `CODEGRAPH_FORCE_WATCH` are shared mutable state. The CLI
+binary's test code declared THREE independent mutexes for that one piece of shared
+state (line numbers are the pre-fix `bb8097b` tree):
+
+| Static                                  | Declared at                                     | Used by tests at                             |
+| --------------------------------------- | ----------------------------------------------- | -------------------------------------------- |
+| `static ENV_LOCK: Mutex<()>`            | `crates/codegraph-cli/src/main.rs:2753`         | `main.rs:2757, 2779, 2877, 2908`             |
+| `static ENV_LOCK: std::sync::Mutex<()>` | `crates/codegraph-cli/src/main.rs:5704`         | `main.rs:5740, 5992, 6010, 6061, 6202, 6242` |
+| `static ENV_LOCK: Mutex<()>`            | `crates/codegraph-cli/src/installer/mod.rs:503` | `installer/mod.rs:592, 630, 780, 808`        |
+
+Distinct statics do not exclude each other AT ALL. A test in one group could set
+`HOME` to its temp dir while a test in another group was mid-way through its own
+`HOME` swap. Nothing in the code said "there is one env"; three separate comments
+each claimed their mutex serialized "tests that mutate process-global env".
+
+**And three env-mutating tests took NO lock at all**, including the `HOME` removal
+near the old `main.rs:6078`:
+
+- `main.rs:6117` `http_log_path_lands_under_registry_dir` — `CODEGRAPH_HTTP_REGISTRY_DIR`
+- `main.rs:6147` `print_http_conflict_and_note_others_isolated` — `CODEGRAPH_HTTP_REGISTRY_DIR`
+- `main.rs:6171` `is_http_detach_internal_reads_env_marker` — `CODEGRAPH_HTTP_DETACH_INTERNAL`
+
+(The unlocked `remove_var("HOME")` the triage flagged at `main.rs:6078` is inside
+`powershell_profile_path_override_then_userprofile_then_error`, which DID hold the
+`5704` lock at its line 6061 — but that lock did not exclude the `2753` group, so
+the effect was the same as being unlocked with respect to those four tests.)
+
+### The escape: the suite wrote into the developer's REAL home directory
+
+The failure is not merely a wrong assertion. Reproduced here on the untouched
+`bb8097b` tree, `cargo test --locked -q -p codegraph-rs --bin codegraph`, 12
+consecutive runs at default parallelism: **6 failed (exit 101), 6 passed** — runs
+2, 3, 6, 9, 10, 11 red, all at the same assertion:
+
+```
+thread 'formatter_and_env_tests::install_completions_writes_zsh_fish_elvish_into_home' panicked at crates/codegraph-cli/src/main.rs:6213:9:
+assertion failed: dir.join(".config/fish/completions/codegraph.fish").is_file()
+```
+
+The captured stdout of that test proves where the write actually landed:
+
+```
+Installed zsh completions to /tmp/cg-cli-fmt-install-comp-1713440-1785291188072/.zfunc/_codegraph
+Installed fish completions to /tmp/codegraph-installer-run-skill-1713440-1785291188076856474/home/.config/fish/completions/codegraph.fish
+```
+
+The zsh step wrote into ITS OWN temp `HOME`; by the fish step, `HOME` had been
+replaced by the `installer::tests` `run-skill` temp dir — a test holding a
+DIFFERENT mutex. So `install_completions` wrote a real file into whatever `HOME`
+happened to be at that instant. The same mechanism explains the earlier report of
+`Installed fish completions to /config/.config/fish/completions/codegraph.fish` —
+the REAL `$HOME` — when the interleaving landed between another test's restore and
+the next test's set.
+
+**Pollution outside the repository, recorded not deleted.**
+`/config/.config/fish/completions/codegraph.fish` exists on this host, 34177 bytes,
+mtime `2026-07-29 10:01:47 +0800`. It was created by an earlier run of this test
+suite escaping its temp `HOME`. It is OUTSIDE the repository, so it was left in
+place and is recorded here rather than removed.
+
+### The sibling defect in `codegraph-watch` — same root cause, fixed together
+
+`watcher::tests::removed_ignored_directory_does_not_schedule_a_full_sync` panicked
+at `watcher.rs:1499` unwrapping the `Option` from `ProjectWatcher::start`. Causal
+chain, all within one test process:
+
+1. `policy.rs`'s tests mutate `HOME`, `CODEGRAPH_NO_WATCH`, `CODEGRAPH_FORCE_WATCH`
+   under the `policy.rs:490` `ENV_LOCK`.
+2. `ProjectWatcher::start` (`watcher.rs:419-423`) calls
+   `watch_disabled_reason(&project_root, options.no_watch)`, which READS
+   `CODEGRAPH_NO_WATCH` (`policy.rs:282`) and `HOME` (`policy.rs:390`), returning
+   `Ok(None)` — no watcher — when they say "don't watch".
+3. The `watcher.rs` tests took NO lock, because they never write env. But they READ
+   it transitively, and `.unwrap()` on the returned `Option` turns "another test's
+   `CODEGRAPH_NO_WATCH=1` was visible" into a panic.
+
+Proof it is this and not something else: a positive control that widens the window
+without changing any assertion. Inserting a 6-second sleep after
+`unsafe { set_var(CODEGRAPH_NO_WATCH, "1") }` in
+`policy::tests::watch_disabled_when_no_watch_env_is_set`, then running only that
+test plus the watcher test:
+
+```
+cargo test --locked -q -p codegraph-watch --lib -- \
+  policy::tests::watch_disabled_when_no_watch_env_is_set \
+  watcher::tests::removed_ignored_directory_does_not_schedule_a_full_sync
+→ watcher::tests::removed_ignored_directory_does_not_schedule_a_full_sync --- FAILED
+  panicked at crates/codegraph-watch/src/watcher.rs:1499:10:
+  called `Option::unwrap()` on a `None` value
+  test result: FAILED. 1 passed; 1 failed
+```
+
+The sleep was a throwaway probe: `policy.rs` was restored from a pre-probe copy and
+verified byte-identical to `bb8097b` (`sha256
+a0cf200be0223631458d2f9fd2c7b2208f37f5a154f9eb03bd1bbc419d461274`, equal to
+`git show bb8097b:crates/codegraph-watch/src/policy.rs | sha256sum`). No sleep
+exists in the committed fix.
+
+### The fix — one lock per crate, an RAII guard, and an ACTIVE escape detector
+
+Test-only. `install_completions`, `completion_target`, `home_dir`,
+`powershell_profile_path`, `watch_disabled_reason`, `ProjectWatcher::start` and
+every other production path are byte-for-byte unchanged, as are the paths
+completions install to.
+
+- **One lock per test process.** `crates/codegraph-cli/src/main.rs` gains a
+  `#[cfg(test)] pub(crate) mod test_env` holding THE single `ENV_LOCK` for the
+  whole `codegraph` binary, reachable from `main.rs`'s five test modules AND from
+  `installer::tests` (a child module of the same binary). The three former statics
+  (`main.rs:2753`, `main.rs:5704`, `installer/mod.rs:503`) are deleted.
+  `crates/codegraph-watch/src/lib.rs` gains the same module for that crate's test
+  process; `policy.rs:490`'s static is deleted. Two processes, two locks — a lock
+  cannot span processes, so per-crate is the correct granularity, and each crate's
+  lock lives at the crate root where every test module can see it.
+- **RAII guard.** `env_guard()` returns an `EnvGuard` that holds the mutex for its
+  whole lifetime, records each variable's prior value on first touch, and restores
+  every one of them **in reverse order** on `Drop` — so a failing assertion cannot
+  leak a temp `HOME` into the rest of the suite. Poisoning is recovered
+  (`unwrap_or_else(|e| e.into_inner())`) so one failure does not cascade; that
+  removes the collateral `PoisonError` at the old `main.rs:5740` documented earlier
+  in this ledger.
+- **`assert_intact()` — the escape detector.** Every `set`/`remove` re-reads the
+  variable and asserts it equals what this guard wrote; the completions tests also
+  call it immediately BEFORE each `install_completions`. If any future test mutates
+  `HOME` without holding the lock, the guarded test fails LOUDLY with
+  `env var HOME changed underneath this guard: another test mutated process-global
+env without holding the shared lock` instead of silently writing into the real
+  home directory. This is what makes the escape impossible rather than unlikely.
+- **`EnvGuard::home_key()`** centralises the `USERPROFILE`-on-Windows /
+  `HOME`-elsewhere split that was duplicated at every call site. **This host is
+  Linux; the Windows branch is validated by code inspection only — no native
+  Windows/MSVC run was performed.**
+- **Read-only tests take the lock too.** `watcher.rs`'s 17 tests that call
+  `ProjectWatcher::start` / `start_serve_watcher`, and `main.rs`'s
+  `db_path_is_under_codegraph_dir` (reads `CODEGRAPH_DIR`), now hold the guard even
+  though they never write — reading shared state concurrently with a writer is the
+  same race.
+
+### Enumeration — every env-mutating test, before and after
+
+Produced by a script that walks each `#[test]`, collects `set_var`/`remove_var`
+calls and checks for a lock acquisition in the same body. All 28 pre-fix
+env-mutating tests, plus the read-only tests brought under the lock:
+
+| File:line (pre-fix)           | Test                                                                     | Keys mutated                                          | Before                   | After        |
+| ----------------------------- | ------------------------------------------------------------------------ | ----------------------------------------------------- | ------------------------ | ------------ |
+| `cli/main.rs:2755`            | `debug_enabled_honors_truthy_values_only`                                | `CODEGRAPH_DEBUG`                                     | lock A (`2753`)          | shared guard |
+| `cli/main.rs:2777`            | `effective_log_level_translates_codegraph_debug_and_defers_to_rust_log`  | `CODEGRAPH_DEBUG`, `RUST_LOG`                         | lock A                   | shared guard |
+| `cli/main.rs:2875`            | `daemon_services_disabled_at_home_and_root_enabled_for_nested_project`   | `HOME`/`USERPROFILE`                                  | lock A                   | shared guard |
+| `cli/main.rs:2906`            | `guard_indexable_root_rejects_home_and_root_allows_nested_project`       | `HOME`/`USERPROFILE`                                  | lock A                   | shared guard |
+| `cli/main.rs:5676`            | `env_path_none_for_empty_or_unset_some_for_value`                        | test-private key                                      | **none**                 | shared guard |
+| `cli/main.rs:5738`            | `codegraph_dir_and_db_path_default_layout`                               | `CODEGRAPH_DIR`                                       | lock B (`5704`)          | shared guard |
+| `cli/main.rs:5990`            | `home_dir_resolves_from_home_then_userprofile_then_errors`               | `HOME`, `USERPROFILE`                                 | lock B                   | shared guard |
+| `cli/main.rs:6008`            | `completion_target_paths_per_shell`                                      | `HOME`, `XDG_DATA_HOME`, `LOCALAPPDATA`               | lock B                   | shared guard |
+| `cli/main.rs:6059`            | `powershell_profile_path_override_then_userprofile_then_error`           | `CODEGRAPH_PS_PROFILE`, `USERPROFILE`, `HOME`         | lock B                   | shared guard |
+| `cli/main.rs:6117`            | `http_log_path_lands_under_registry_dir`                                 | `CODEGRAPH_HTTP_REGISTRY_DIR`                         | **none**                 | shared guard |
+| `cli/main.rs:6147`            | `print_http_conflict_and_note_others_isolated`                           | `CODEGRAPH_HTTP_REGISTRY_DIR`                         | **none**                 | shared guard |
+| `cli/main.rs:6171`            | `is_http_detach_internal_reads_env_marker`                               | `CODEGRAPH_HTTP_DETACH_INTERNAL`                      | **none**                 | shared guard |
+| `cli/main.rs:6200`            | `install_completions_writes_zsh_fish_elvish_into_home`                   | `HOME`, `XDG_DATA_HOME`                               | lock B                   | shared guard |
+| `cli/main.rs:6240`            | `install_completions_powershell_writes_script_and_dot_sources_profile`   | `CODEGRAPH_PS_PROFILE`, `LOCALAPPDATA`                | lock B                   | shared guard |
+| `cli/installer/mod.rs:589`    | `init_target_kiro_writes_project_local_mcp_with_concrete_path`           | `HOME`/`USERPROFILE`                                  | lock C (`503`)           | shared guard |
+| `cli/installer/mod.rs:627`    | `init_target_none_writes_nothing`                                        | `HOME`/`USERPROFILE`                                  | lock C                   | shared guard |
+| `cli/installer/mod.rs:778`    | `run_uninstall_with_ctx_via_public_paths`                                | `HOME`/`USERPROFILE`, `XDG_CONFIG_HOME`               | lock C                   | shared guard |
+| `cli/installer/mod.rs:806`    | `run_skill_install_and_uninstall_and_status_via_ctx`                     | `HOME`/`USERPROFILE`                                  | lock C                   | shared guard |
+| `watch/policy.rs:524`         | `watch_disabled_when_root_is_home`                                       | `HOME`, `CODEGRAPH_FORCE_WATCH`, `CODEGRAPH_NO_WATCH` | lock D (`policy.rs:490`) | shared guard |
+| `watch/policy.rs:539`         | `watch_disabled_for_home_even_with_force_watch`                          | same three                                            | lock D                   | shared guard |
+| `watch/policy.rs:555`         | `watch_disabled_when_root_is_filesystem_root`                            | `CODEGRAPH_FORCE_WATCH`, `CODEGRAPH_NO_WATCH`         | lock D                   | shared guard |
+| `watch/policy.rs:567`         | `watch_allowed_for_normal_project_subdir`                                | same three                                            | lock D                   | shared guard |
+| `watch/policy.rs:626`         | `too_broad_reason_flags_home_and_filesystem_root_but_not_nested_project` | `HOME`                                                | lock D                   | shared guard |
+| `watch/policy.rs:651`         | `too_broad_reason_normalizes_trailing_dot_to_home`                       | `HOME`                                                | lock D                   | shared guard |
+| `watch/policy.rs:666`         | `watch_disabled_when_root_is_home_with_trailing_dot`                     | same three                                            | lock D                   | shared guard |
+| `watch/policy.rs:683`         | `watch_disabled_when_no_watch_flag_is_set`                               | `CODEGRAPH_NO_WATCH`                                  | lock D                   | shared guard |
+| `watch/policy.rs:695`         | `watch_disabled_when_no_watch_env_is_set`                                | `CODEGRAPH_NO_WATCH`                                  | lock D                   | shared guard |
+| `watch/policy.rs:844`         | `force_watch_re_enables_a_wsl_drive_mount_path`                          | same three                                            | lock D                   | shared guard |
+| `watch/watcher.rs` (17 tests) | every test calling `ProjectWatcher::start` / `start_serve_watcher`       | reads `CODEGRAPH_NO_WATCH`, `HOME` transitively       | **none (reader)**        | shared guard |
+| `cli/main.rs:5553`            | `db_path_is_under_codegraph_dir`                                         | reads `CODEGRAPH_DIR`                                 | **none (reader)**        | shared guard |
+
+Post-fix grep confirms **zero** `set_var` / `remove_var` outside the two
+`test_env` modules in these files, and exactly one `ENV_LOCK` static per crate.
+
+Out of scope and deliberately untouched: the separate `ENV_LOCK`s in
+`codegraph-core`, `codegraph-daemon`, `codegraph-mcp`, `codegraph-store` and the
+integration-test binaries. Each is a DIFFERENT test process, so a lock there
+cannot interact with these two; none of them mutates `HOME`.
+
+### Negative control — the defect returns when the unification is reverted
+
+Re-introducing the two-lock defect (adding a second `ENV_LOCK_B` static and
+pointing the completions test at it, leaving everything else fixed), 4 runs at
+default parallelism: **run 1 RED, runs 2-4 green**:
+
+```
+assertion `left == right` failed: env var HOME changed underneath this guard:
+another test mutated process-global env without holding the shared lock
+test result: FAILED. 351 passed; 2 failed
+```
+
+Two things this proves. First, the defect is genuinely the two-lock split — undo
+only that and the failure returns. Second, it is PROBABILISTIC (1 red in 4), which
+is precisely why every earlier single green run "proved" nothing and why the
+failure was mis-filed as an environment flake for so long. `main.rs` was restored
+afterwards and verified (`7146875e689cedc4…`).
+
+Note also WHICH assertion reddened: not the old `is_file()` at `main.rs:6213`, but
+`assert_intact`'s message. The detector fires at the moment the variable is stolen,
+before any file is written — so even in the reverted state the suite no longer
+writes outside its temp dir silently.
+
+### Verification — every command with its REAL exit status
+
+| Command                                                                    | Exit         | Result                                                                                           |
+| -------------------------------------------------------------------------- | ------------ | ------------------------------------------------------------------------------------------------ |
+| `make ci CARGO='cargo --locked'` (pre-change reproduction)                 | 0            | passed on that attempt — the flake is probabilistic, hence the loops below                       |
+| `cargo test --locked -q -p codegraph-rs --bin codegraph` × 12 (pre-change) | 6× 0, 6× 101 | **defect reproduced**: runs 2,3,6,9,10,11 red at `main.rs:6213`                                  |
+| `cargo test --locked -q -p codegraph-watch --lib` × 15 (pre-change)        | 15× 0        | watcher defect did not surface unaided — hence the positive control                              |
+| positive control (6 s sleep probe, 2 tests only, pre-change)               | 101          | `watcher.rs:1499` `Option::unwrap()` on `None` — chain confirmed                                 |
+| `policy.rs` restored from pre-probe copy                                   | 0            | sha256 equals `git show bb8097b:…/policy.rs` — probe left no trace                               |
+| `cargo test --locked -q -p codegraph-rs --bin codegraph` × 8 (post-fix)    | 8× 0         | 353 passed each run                                                                              |
+| `cargo test --locked -q -p codegraph-watch --lib` (post-fix)               | 0            | 100 passed                                                                                       |
+| `cargo check --locked --workspace --all-targets`                           | 0            | clean                                                                                            |
+| 3 parallel post-fix rounds (`cli` + `watch`)                               | 0            | `cli 353/353`, `watch 100/100`, every round green                                                |
+| negative control (two-lock defect re-introduced) × 4                       | 1× 101, 3× 0 | **reddens**: `351 passed; 2 failed`, `assert_intact` message                                     |
+| `lsp_diagnostics`                                                          | n/a          | REFUSED in this worktree (`LSP file path must be inside request cwd`); fell back to locked Cargo |
+
+### Closeout — the first 5-run CI batch failed on a lint, not a test
+
+Reported rather than hidden. The FIRST batch of five `make ci CARGO='cargo --locked'`
+runs all exited **2**, every one at the `lint` target before any test ran:
+
+```
+error: items after a test module
+   --> crates/codegraph-watch/src/lib.rs:18:1
+    = note: `-D clippy::items-after-test-module` implied by `-D warnings`
+```
+
+`crates/codegraph-watch/src/lib.rs` had the new `#[cfg(test)] mod test_env` placed
+directly after the `mod` declarations and BEFORE the crate's `pub use` re-exports,
+which `clippy::items_after_test_module` forbids. Fixed by moving the module to the
+END of the file, after the last `pub use`. `codegraph-cli`'s `test_env` needed no
+move — `main.rs` has no trailing re-exports. Pure relocation: no logic, no test, no
+production line changed.
+
+| Command                                                             | Exit | Result                                            |
+| ------------------------------------------------------------------- | ---- | ------------------------------------------------- |
+| `make ci CARGO='cargo --locked'` (batch 1, runs 1-5)                | 5× 2 | FAILED at `lint` — `items_after_test_module`      |
+| `cargo clippy --locked -q --workspace --all-targets -- -D warnings` | 0    | clean after the relocation                        |
+| `cargo fmt --all --check`                                           | 0    | clean                                             |
+| `cargo test --locked -q -p codegraph-watch --lib`                   | 0    | 100 passed                                        |
+| `cargo test --locked -p codegraph-bench --test equivalence`         | 0    | **28 passed** — golden oracle unchanged           |
+| `make fmt`                                                          | 0    | oxfmt, 23 docs files, run BEFORE every CI batch   |
+| `bash scripts/check-workspace-versions.sh`                          | 0    | workspace / `version.txt` / manifest all `0.40.4` |
+| `make ci CARGO='cargo --locked'` (batch 2, run 1)                   | 0    | `✅ All CI checks passed!`                        |
+| `make ci CARGO='cargo --locked'` (batch 2, run 2)                   | 0    | `✅ All CI checks passed!`                        |
+| `make ci CARGO='cargo --locked'` (batch 2, run 3)                   | 0    | `✅ All CI checks passed!`                        |
+| `make ci CARGO='cargo --locked'` (batch 2, run 4)                   | 0    | `✅ All CI checks passed!`                        |
+| `make ci CARGO='cargo --locked'` (batch 2, run 5)                   | 0    | `✅ All CI checks passed!`                        |
+
+Five consecutive green runs at DEFAULT parallelism. `--test-threads=1` was never
+used, and neither `Makefile` nor `.cargo/config.toml` was touched — serializing the
+suite would have hidden the defect instead of fixing it. The `ETXTBSY`
+(`Text file busy`) flake noted earlier in this ledger did NOT recur in any of these
+runs.
+
+**Golden byte-stability.** `git diff --stat bb8097b..HEAD -- reference/golden/` is
+EMPTY; `git status --porcelain` showed no untracked
+`reference/golden/*/colby.db-{wal,shm}` after the batch. `Cargo.lock` SHA-256
+unchanged at `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`.
+Six files changed: the five test-side sources plus this ledger.

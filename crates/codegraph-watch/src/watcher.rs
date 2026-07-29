@@ -1123,6 +1123,7 @@ mod tests {
 
     #[test]
     fn rapid_save_burst_triggers_exactly_one_reindex() {
+        let _env = crate::test_env::env_guard();
         let dir = crate::sync::tests::TestDir::new("watch-debounce");
         fs::create_dir_all(dir.path().join("src")).unwrap();
         let db = crate::sync::default_db_path(dir.path()).unwrap();
@@ -1172,6 +1173,7 @@ mod tests {
 
     #[test]
     fn deleted_directory_event_schedules_one_full_sync() {
+        let _env = crate::test_env::env_guard();
         // A removed DIRECTORY has no source extension, so extension-based event
         // filtering drops it and every tracked descendant lingers in the index
         // forever. The watcher must escalate the removal to exactly ONE
@@ -1353,6 +1355,7 @@ mod tests {
 
     #[test]
     fn real_watcher_classifies_a_removed_directory_as_a_full_sync() {
+        let _env = crate::test_env::env_guard();
         // End-to-end with a REAL notify watcher: proves the OS actually delivers
         // either an explicit Folder removal or Windows' ambiguous Any removal,
         // and that the watcher escalates the known directory to a full sync.
@@ -1403,6 +1406,7 @@ mod tests {
 
     #[test]
     fn directory_removal_burst_deduplicates_to_one_full_sync() {
+        let _env = crate::test_env::env_guard();
         // A `rm -rf` burst surfaces the folder removal AND each child removal.
         // The full-sync escalation must dominate the per-file paths yet still
         // collapse to ONE sync, with every event path retained as a trigger.
@@ -1477,6 +1481,7 @@ mod tests {
 
     #[test]
     fn removed_ignored_directory_does_not_schedule_a_full_sync() {
+        let _env = crate::test_env::env_guard();
         // The escalation honors the watch policy: an ignored directory removal
         // is still dropped, so no sync is scheduled at all.
         let dir = crate::sync::tests::TestDir::new("watch-deleted-dir-ignored");
@@ -1506,6 +1511,7 @@ mod tests {
 
     #[test]
     fn ignored_directory_event_does_not_schedule_reindex() {
+        let _env = crate::test_env::env_guard();
         let dir = crate::sync::tests::TestDir::new("watch-ignore");
         fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
         fs::write(
@@ -1579,6 +1585,7 @@ mod tests {
 
     #[test]
     fn start_returns_none_when_watch_disabled_by_flag() {
+        let _env = crate::test_env::env_guard();
         let dir = crate::sync::tests::TestDir::new("watch-nowatch-flag");
         let watcher = ProjectWatcher::start(
             dir.path(),
@@ -1774,6 +1781,7 @@ mod tests {
 
     #[test]
     fn fresh_watcher_is_not_degraded_and_has_no_reason() {
+        let _env = crate::test_env::env_guard();
         // Given: an inert watcher that never hits a backend error.
         let dir = crate::sync::tests::TestDir::new("watch-not-degraded");
         let watcher = ProjectWatcher::start(
@@ -1794,6 +1802,7 @@ mod tests {
 
     #[test]
     fn start_serve_watcher_returns_none_when_watching_is_disabled() {
+        let _env = crate::test_env::env_guard();
         // Given: a normal project but the no_watch flag forced on.
         let dir = crate::sync::tests::TestDir::new("watch-serve-disabled");
         // Then: the public wrapper returns Ok(None) (no watcher started).
@@ -1814,6 +1823,7 @@ mod tests {
 
     #[test]
     fn start_serve_watcher_starts_an_inert_watcher_for_a_normal_project() {
+        let _env = crate::test_env::env_guard();
         // Given: a normal project directory.
         let dir = crate::sync::tests::TestDir::new("watch-serve-start");
         // Then: the public wrapper starts and returns an inert watcher.
@@ -1832,6 +1842,7 @@ mod tests {
 
     #[test]
     fn pending_files_snapshot_reflects_ingested_events_before_debounce() {
+        let _env = crate::test_env::env_guard();
         // Given: an inert watcher with a long debounce so events stay pending.
         let dir = crate::sync::tests::TestDir::new("watch-pending");
         fs::create_dir_all(dir.path().join("src")).unwrap();
@@ -1882,6 +1893,7 @@ mod tests {
     /// "still running" is deterministic rather than timed.
     #[test]
     fn begin_shutdown_and_detach_never_block_on_a_running_sync() {
+        let _env = crate::test_env::env_guard();
         let dir = crate::sync::tests::TestDir::new("watch-running-sync");
         let release = Arc::new(std::sync::Barrier::new(2));
         let entered = Arc::new(AtomicBool::new(false));
@@ -1930,6 +1942,7 @@ mod tests {
 
     #[test]
     fn begin_shutdown_is_nonblocking_and_detach_skips_the_join() {
+        let _env = crate::test_env::env_guard();
         // Given: an inert watcher whose event loop is idle.
         let dir = crate::sync::tests::TestDir::new("watch-begin-shutdown");
         let watcher = ProjectWatcher::start(
@@ -1965,6 +1978,7 @@ mod tests {
 
     #[test]
     fn event_loop_reports_non_degrading_sync_error_through_callback() {
+        let _env = crate::test_env::env_guard();
         // Given: an inert watcher whose injected sync_fn always fails with a
         // non-contention error, plus recorders for both notice callbacks.
         let dir = crate::sync::tests::TestDir::new("watch-loop-error");
@@ -2017,6 +2031,7 @@ mod tests {
 
     #[test]
     fn event_loop_disables_auto_sync_after_persistent_errors() {
+        let _env = crate::test_env::env_guard();
         // #1127: an injected sync_fn that always fails with the SAME
         // non-contention error must, after MAX_CONSECUTIVE_SYNC_ERRORS flushes,
         // degrade the watcher with an actionable message and stop retrying.
@@ -2301,6 +2316,7 @@ mod tests {
 
     #[test]
     fn editing_a_real_source_file_still_triggers_sync() {
+        let _env = crate::test_env::env_guard();
         // End-to-end with a REAL notify watcher (inert_for_tests = false), proving
         // the per-dir NonRecursive registration still delivers source edits to the
         // sync pipeline. `sync_fn` is injected so no real index is needed.
@@ -2365,6 +2381,7 @@ mod tests {
 
     #[test]
     fn newly_created_source_dir_is_watched_after_start() {
+        let _env = crate::test_env::env_guard();
         // A directory created AFTER start must be picked up (Linux NonRecursive:
         // the event loop registers a watch on the create event) so edits inside
         // it sync without a server restart.
