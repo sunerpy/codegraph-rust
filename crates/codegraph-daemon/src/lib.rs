@@ -627,18 +627,12 @@ async fn run_accept_loop_async(
     if let Some(watcher) = &watcher {
         watcher.begin_shutdown();
     }
-    registry.close_all_sessions();
     let watcher_done = {
         let watcher = watcher.as_ref();
         move || watcher.is_none_or(codegraph_watch::ProjectWatcher::is_finished)
     };
-    let drained = drain_watcher_loops_and_sessions(
-        watcher_done,
-        &lease_loops,
-        &registry,
-        options.drain_budget,
-    )
-    .await;
+    let drained =
+        close_sessions_and_drain(watcher_done, &lease_loops, &registry, options.drain_budget).await;
     // Past the deadline the watcher thread is already cancelled and exits on its
     // own; detach it so no destructor re-introduces an unbounded join AFTER the
     // incomplete result was computed.
@@ -665,6 +659,40 @@ async fn run_accept_loop_async(
     match stop_reason {
         Some(err) => Err(err),
         None => Ok(()),
+    }
+}
+
+/// Sample what is outstanding, signal every data session to close, then drain
+/// within `budget`.
+///
+/// SAMPLING BEFORE THE SIGNAL IS LOAD-BEARING. The signalled sessions retire on
+/// other tokio worker threads, so the first drain poll can already observe an
+/// EMPTIED registry — and then report a COMPLETED drain for a budget that
+/// permitted no waiting at all. A daemon must never report a drain it did not
+/// perform, so the zero-budget answer is decided by the state AT THE SHUTDOWN
+/// INSTANT, before any session can react, instead of by whichever thread the
+/// scheduler happened to run next.
+///
+/// A nonzero budget keeps its previous semantics exactly: sessions are given the
+/// whole budget to retire and the poll loop decides.
+/// This is deliberately NOT an `async fn`: the body of one does not run until the
+/// future is first polled, which would put the sample back on the scheduler's
+/// timeline. Sampling here, then returning the drain future, makes the sample
+/// happen at the CALL.
+fn close_sessions_and_drain<'a>(
+    watcher_done: impl Fn() -> bool + 'a,
+    lease_loops: &'a codegraph_watch::SyncCancellation,
+    registry: &'a SessionRegistry,
+    budget: Duration,
+) -> impl std::future::Future<Output = bool> + 'a {
+    let idle_at_shutdown =
+        watcher_done() && lease_loops.active_syncs() == 0 && registry.active_count() == 0;
+    registry.close_all_sessions();
+    async move {
+        if budget.is_zero() {
+            return idle_at_shutdown;
+        }
+        drain_watcher_loops_and_sessions(watcher_done, lease_loops, registry, budget).await
     }
 }
 
@@ -942,6 +970,36 @@ mod tests {
             )
             .await,
             "an unfinished watcher event loop must report an incomplete drain"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_zero_budget_answers_from_the_state_at_the_shutdown_instant() {
+        let lease_loops = codegraph_watch::SyncCancellation::new();
+
+        let idle = SessionRegistry::default();
+        assert!(
+            close_sessions_and_drain(|| true, &lease_loops, &idle, Duration::ZERO).await,
+            "a zero budget with nothing outstanding completes"
+        );
+
+        // Retiring the session BEFORE the drain can poll is the exact interleaving
+        // that used to answer `true`, so the guarantee must hold on that schedule.
+        let racing = SessionRegistry::default();
+        let leaving = racing.start_session();
+        let answer = close_sessions_and_drain(|| true, &lease_loops, &racing, Duration::ZERO);
+        drop(leaving);
+        assert_eq!(racing.active_count(), 0, "the session retired first");
+        assert!(
+            !answer.await,
+            "a session outstanding AT the shutdown instant must report an incomplete drain even \
+             when it retires before the drain is polled"
+        );
+
+        let empty = SessionRegistry::default();
+        assert!(
+            !close_sessions_and_drain(|| false, &lease_loops, &empty, Duration::ZERO).await,
+            "an unfinished watcher event loop at a zero budget is equally incomplete"
         );
     }
 
