@@ -9369,3 +9369,135 @@ untracked `reference/golden/*/colby.db-{wal,shm}` sidecars. **Windows was NOT
 validated locally** — no MSVC toolchain exists on this host (`cargo xwin` fails on
 a missing `clang-cl`), so only the `Windows` CI job can confirm Failure 1's fix.
 Failure 2's mechanism, by contrast, WAS reproduced and re-verified locally.
+
+## PR #173 CI round 7 — the proxy's teardown waited for a peer close that Windows named pipes can never deliver (2026-07-29)
+
+### The failure and where CI reported it
+
+GitHub Actions run `30460073159`, job `Windows`, the EIGHTH Windows-only failure
+on PR #173 and the only one left at commit `a0315da`:
+
+```
+test reader_lease_spans_stamp_check_through_last_row ... FAILED
+panicked at crates\codegraph-cli\tests\lease_lifetime.rs:820:14:
+proxy completed before deadline: Timeout
+test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.91s
+```
+
+The `expect` at `:820` is on the OUTER `Result` of
+`done_rx.recv_timeout(WAIT)` — a `mpsc::RecvTimeoutError::Timeout`. So
+`run_proxy` never sent a result at all within the 10s `WAIT`: it did not fail,
+it did not return; it never returned.
+
+### Diagnosis — `run_proxy`'s teardown blocked on a UNIX-only event
+
+`run_proxy` (`crates/codegraph-daemon/src/proxy.rs`) runs two pumps and then
+tears down in this order:
+
+```rust
+half_close_write(write_fd);
+let _ = down.join();          // <- the unbounded wait
+```
+
+`down` is the daemon->host pump. `pump_daemon_to_host` loops
+`for line in daemon_recv.lines()` and returns ONLY on EOF or a read error, i.e.
+only once the DAEMON closes its end of the connection. The daemon is made to
+close by `half_close_write`, which issues `shutdown(SHUT_WR)` on the socket fd so
+the daemon's session reader EOFs, flushes its last reply, and closes.
+
+Every step of that chain is unix-only:
+
+- `half_close_write` is `#[cfg(unix)] … rustix::net::shutdown(fd, Shutdown::Write)`,
+  and the `#[cfg(not(unix))]` arm is `fn half_close_write(_write_fd: Option<WriteFd>) {}` —
+  a no-op whose own doc comment already stated the fact: _"Windows named pipes
+  have no half-close; the proxy relies on the full-stream drop + the daemon's own
+  idle/sweep lifecycle instead."_
+- `write_raw_fd` likewise returns `None` on `#[cfg(not(unix))]`, so there is no
+  handle to act on even in principle.
+- Dropping the send half does not help either. interprocess's `split()` gives
+  both halves a refcount over the SAME kernel object
+  (`interprocess-2.4.2/src/os/windows/named_pipe/stream/impl.rs:35-41`:
+  `let (raw_ac, raw_a) = (self.raw.refclone(), self.raw)`, i.e. one
+  `Arc<RawPipeStream>` shared by recv and send). While the proxy's recv half
+  lives, the pipe handle is open, so the daemon never sees a disconnect.
+- The daemon side, meanwhile, is parked. `serve_session_async`
+  (`session.rs:434`) races the rmcp serve loop against its closing watch
+  channel; with neither an EOF nor a shutdown signal it simply awaits the next
+  frame forever.
+
+So on Windows: the proxy writes its frames, the daemon answers them, the proxy
+delivers the answers — and then `down.join()` waits for an EOF that nothing in
+the system will ever produce. `run_proxy` never returns, the test's channel
+times out at 10s, and the reported 11.91s is the test binary's own total, not a
+slow round trip.
+
+This also disproves the "the deadline is too short" hypothesis: the work the
+test measures had already completed. The proxy had received the `"id":2` reply
+before it wedged — the failure is strictly in teardown, and no `WAIT` value
+would fix an unbounded wait. `WAIT` was not touched; no sleep, retry, or
+conditional assertion was added.
+
+Why only this test caught it: `proxy_e2e.rs` is `#![cfg(unix)]`, so the only
+other test that drives `run_proxy` over a real rendezvous never runs on Windows.
+`lease_lifetime.rs` carries no cfg gate and is the sole Windows-visible caller.
+
+### Verdict: PRODUCTION defect, not a test premise
+
+The test's premise holds on Windows exactly as on Unix — a reader lease must
+span the stamp check through the last row, and the proxy did produce the last
+row. What is broken is `run_proxy`'s own liveness: a real MCP host on Windows
+whose stdin closes would leave the launcher process hung instead of exiting,
+holding its daemon session open. Nothing was gated; no Windows coverage was
+given up.
+
+### The fix — wait on what is OWED, not on the peer closing
+
+`run_proxy` now bounds teardown with a `ReplyLedger`: the set of forwarded
+request ids the host is still owed a reply for.
+
+- `pump_host_to_daemon` records an id when, and only when, it FORWARDS a request
+  carrying one. Notifications (no `id`) are never recorded; `initialize` and
+  `tools/list` are answered locally and are not owed by the daemon.
+- `pump_daemon_to_host` retires an id AFTER writing that reply to the host, so
+  the ledger settles only once the answer is genuinely in the host's hands.
+- Teardown replaces `down.join()` with `ledger.wait_until_settled(REPLY_DRAIN_BUDGET)`.
+  This is a `Condvar` wait that returns the instant nothing is owed, so the
+  common path is not slower than before on either platform.
+- When the daemon stream ends with replies still outstanding they can never be
+  answered, so the down pump calls `ledger.abandon()` on exit, waking the wait
+  immediately rather than burning the budget.
+- `down.join()` is now conditional on `HALF_CLOSE_EOFS_DAEMON` (`true` on unix,
+  `false` elsewhere) — joined where the pump is known to terminate, detached
+  where it is not. The detached thread holds only clones and ends when the daemon
+  closes the pipe via its own idle-exit/sweep/shutdown lifecycle.
+- `REPLY_DRAIN_BUDGET` (20s) is a last-resort bound against a daemon that
+  accepted the connection and then stalled forever; it is deliberately LONGER
+  than callers' own deadlines so a genuine stall still surfaces as the caller's
+  failure. Expiry returns `Err`, never a false `Proxied`.
+
+Byte semantics of both pumps are unchanged: the same lines are forwarded, the
+same initialize reply is suppressed, and the last reply is still delivered before
+teardown — that guarantee is now enforced by the ledger rather than inferred from
+a peer close.
+
+### Audit — every test that drives `run_proxy` or the rendezvous
+
+| test file                                                                     | platform gate              | drives                                      | same platform assumption?                          |
+| ----------------------------------------------------------------------------- | -------------------------- | ------------------------------------------- | -------------------------------------------------- |
+| `lease_lifetime.rs`                                                           | **none — runs on Windows** | `run_proxy` + `recorded_socket_path`        | **YES — this is the failure. FIXED in production** |
+| `proxy_e2e.rs`                                                                | `#![cfg(unix)]`            | `run_proxy` (11 sites)                      | never runs on Windows — no exposure                |
+| `daemon-crate` `proxy.rs`                                                     | `#![cfg(unix)]`            | proxy attach                                | never runs on Windows — no exposure                |
+| `proxy.rs` unit `run_proxy_falls_back_on_version_mismatch_over_a_real_socket` | `#[cfg(unix)]`             | `run_proxy` (mismatch arm)                  | returns BEFORE the split/teardown — unaffected     |
+| `daemon_idle.rs`                                                              | `#![cfg(unix)]`            | `recorded_socket_path`                      | never runs on Windows                              |
+| `daemon_single_watcher.rs`                                                    | `#![cfg(unix)]`            | `recorded_socket_path`                      | never runs on Windows                              |
+| `daemon_spawn.rs`                                                             | `#![cfg(unix)]`            | `daemon_socket_path`                        | never runs on Windows                              |
+| `daemon_stale_wal_recovery.rs`                                                | `#![cfg(unix)]`            | `recorded_socket_path`                      | never runs on Windows                              |
+| `daemon_sweep.rs`                                                             | `#![cfg(unix)]`            | `recorded_socket_path`                      | never runs on Windows                              |
+| `stale_socket.rs`                                                             | `#![cfg(unix)]`            | `daemon_socket_path` (9 sites)              | never runs on Windows                              |
+| `lifecycle.rs`                                                                | **none — runs on Windows** | `daemon_socket_path` for a lock record only | NO — writes a pid-lock file, never connects        |
+
+Only two Windows-visible files touch the rendezvous at all, and only
+`lease_lifetime.rs` connects through it. `lifecycle.rs` uses
+`daemon_socket_path` purely as a value inside a `DaemonLockInfo` it writes to
+disk, so it carries no transport assumption. Nothing else needed changing, and
+nothing was changed speculatively.
