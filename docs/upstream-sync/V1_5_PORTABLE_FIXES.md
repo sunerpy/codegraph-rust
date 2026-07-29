@@ -8918,3 +8918,239 @@ before staging. Two files changed:
 `crates/codegraph-store/src/index_state_publisher.rs` and this ledger. Windows was
 NOT validated locally — the two cross-compilation routes still fail exactly as
 recorded above and no C toolchain can be installed here.
+
+## PR #173 CI round 5 — the legacy fixture path crossed a shell boundary it could not survive (2026-07-29)
+
+Sixth consecutive windows-only layer, and the first one that is neither a lint
+nor a code defect: it is a CI-wiring defect between two processes that disagree
+about what an absolute path means.
+
+### The failure, with its exact CI location
+
+Run `30449004902`, job `Windows`, step `Run tests`:
+
+```
+test legacy_scan_with_runtime_extension_override_does_not_weaken_storage_safety ... FAILED
+panicked at crates\codegraph-cli\tests\batch_m_legacy_extension_override.rs:330:13:
+CODEGRAPH_LEGACY_BIN failed frozen fixture verification: inspect configured legacy binary
+/tmp/codegraph-legacy-fixture/e52703f3a3d5bef90997ce23d9a3b49c980e6bcc1a078fdb1245ad1305a5bc09/codegraph.exe:
+The system cannot find the path specified. (os error 3)
+test result: FAILED. 19 passed; 1 failed
+```
+
+Every other test in that binary passed. That is the shape of the bug: the fixture
+was downloaded, digest-verified and version-verified SUCCESSFULLY by the setup
+step — the failing verification is the SECOND one, performed by the test process
+against the path the setup step handed it.
+
+### The mechanism — a path-domain mismatch, confirmed
+
+The orchestrator's trace is correct. Confirmed against the real files:
+
+1. `.github/workflows/ci.yml:101-103` — the `windows` job's fixture step is the
+   only step in that job with `shell: bash`, and it runs
+   `echo "CODEGRAPH_LEGACY_BIN=$(bash scripts/setup-legacy-fixture.sh)" >> "$GITHUB_ENV"`.
+   On `windows-latest`, `shell: bash` is **Git Bash** — an MSYS2 runtime.
+2. `scripts/setup-legacy-fixture.sh:57` computes
+   `CACHE_ROOT="${CODEGRAPH_LEGACY_FIXTURE_CACHE:-${TMPDIR:-/tmp}/codegraph-legacy-fixture}"`.
+   `CODEGRAPH_LEGACY_FIXTURE_CACHE` is not set by CI, and `TMPDIR` is not set in
+   Git Bash on the runner, so `CACHE_ROOT` becomes the literal string
+   `/tmp/codegraph-legacy-fixture`.
+3. `/tmp` under MSYS is a **virtual mount**, not a filesystem path. The MSYS
+   runtime maps it to something like
+   `C:\Users\runneradmin\AppData\Local\Temp`. Every filesystem call the SCRIPT
+   makes goes through that runtime, so the download, the `mkdir -p`, the digest
+   check and `"$EXE" --version` all succeed — the script's own view is coherent.
+4. The script's final line printed that MSYS path verbatim, and the workflow put
+   it in `$GITHUB_ENV`. `$GITHUB_ENV` is a plain text file; nothing translates it.
+5. `cargo test` is a **native Win32 process**. It reads the variable as an opaque
+   string and resolves it through the Win32 API, which has no `/tmp` mount and no
+   MSYS runtime. `\tmp\codegraph-legacy-fixture\...` does not exist relative to
+   any drive → `ERROR_PATH_NOT_FOUND`, surfaced by Rust as `os error 3`, "The
+   system cannot find the path specified".
+
+So the file EXISTS and is the correct, digest-verified v0.40.4 binary. Two
+processes simply disagree about the namespace the string belongs to. The
+error message even proves the file was fine when the script saw it: the script's
+own `--version` check ran against it and passed, or the script would have exited
+nonzero and the workflow step would have failed instead.
+
+Why this is a fixture-WIRING defect and not a fixture-CONTENT defect: nothing
+about the frozen binary, the manifest, the digests, or the test's property
+changed. The property under test — an unmodified published v0.40.4 scanner
+cannot weaken v2 storage safety — is intact and must keep being proven on
+Windows.
+
+### The fix — option (a), the emitter owns its output contract
+
+`scripts/setup-legacy-fixture.sh` now translates the path it PRINTS into the
+consumer's domain, via a single new `emit_consumer_path` used by both exit routes
+(the revalidated-cache-hit route at what is now line 354 and the
+fresh-download route at the end).
+
+On a Windows shell (`uname -s` matching `MINGW*`/`MSYS*`/`CYGWIN*`/`Windows_NT`)
+it runs `cygpath -m -- "$path"`. Everywhere else it prints the path byte-for-byte
+and never invokes `cygpath` — which matters, because `cygpath` does not exist on
+Linux or macOS.
+
+Three deliberate choices:
+
+- **`-m`, not `-w`.** Both give a native absolute path; `-m` uses forward slashes
+  (`C:/Users/...`) and `-w` uses backslashes (`C:\Users\...`). Win32 accepts
+  both, and Rust's `Path` handles both. Forward slashes are chosen because the
+  string travels through `$GITHUB_ENV` and then through Rust string handling, and
+  a backslash path invites an escaping bug in any future consumer that does not
+  treat it as opaque. Forward slashes have no such failure mode.
+- **A missing or failing `cygpath` is FATAL, not a silent passthrough.** On a
+  Windows host, printing the untranslated path is exactly the bug being fixed;
+  degrading to it would reintroduce a failure 40 lines later with a much worse
+  error message. `cygpath` ships with Git Bash and with Cygwin, so its absence on
+  a Windows host is a broken environment, and a fixture that cannot be handed to
+  its consumer is a setup FAILURE — the same fail-closed stance the rest of this
+  script takes.
+- **Only the OUTPUT is translated.** `$EXE` keeps its shell-native form for every
+  internal use (`sha256_of`, `chmod`, `"$EXE" --version`, `rm -f`), because those
+  all run through the MSYS runtime and would BREAK if handed a `C:/...` path in
+  some contexts. The translation happens at the process boundary, which is where
+  the domain actually changes.
+
+Why not the alternatives:
+
+- **(b) convert in the workflow.** Works, but puts the knowledge in the caller.
+  The script has two callers already — the `test` job, the `windows` job — and a
+  third that is not a workflow at all (`legacy_bin()` in
+  `batch_m_legacy_extension_override.rs:335` shells out to the script directly
+  when `CODEGRAPH_LEGACY_BIN` is unset). That third caller is the decisive
+  argument: on a Windows developer machine running `cargo test` outside CI, the
+  fallback path spawns `bash scripts/setup-legacy-fixture.sh` from a NATIVE
+  process and parses its stdout. Fixing only the workflow leaves that route
+  broken. Fixing the script fixes every consumer at once.
+- **(c) make the test tolerate MSYS paths.** Rejected. It would teach production
+  test code about a CI shell's private namespace, and it would leave the same
+  trap armed for every other consumer of this script — including the local
+  Windows developer route above.
+
+### Cross-domain audit — every bash→native boundary in CI
+
+Enumerated mechanically (`yaml.safe_load` over both workflow files, listing each
+`run` step with its effective shell and its job's `runs-on`, including the
+release matrix's per-`os` entries). Neither workflow sets a workflow-level or
+job-level `defaults.shell`, so a step with no `shell:` key uses the runner
+default: `bash` on ubuntu/macos, **PowerShell** on windows.
+
+| location                                                                             | emits                            | consumed by                                 | domains match?                                                       | verdict                                                                                                        |
+| ------------------------------------------------------------------------------------ | -------------------------------- | ------------------------------------------- | -------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `ci.yml:103` windows fixture step (`shell: bash`)                                    | fixture exe path → `$GITHUB_ENV` | native `cargo test` (2 later steps)         | **NO — MSYS vs Win32**                                               | **the bug; FIXED** in the script                                                                               |
+| `ci.yml:48` linux fixture step (default bash)                                        | fixture exe path → `$GITHUB_ENV` | native `cargo test`                         | yes — one POSIX domain on ubuntu                                     | correct; output byte-identical after the fix                                                                   |
+| `batch_m_legacy_extension_override.rs:335` fallback                                  | script stdout → `PathBuf`        | the test process itself (native on windows) | **would NOT have matched on windows**                                | **also FIXED** by the same change — the reason the fix belongs in the script                                   |
+| `ci.yml` windows `Clippy lint`, `Run tests`, `Run Batch M item 16`                   | nothing; no paths emitted        | —                                           | n/a — PowerShell steps, cargo-relative                               | no boundary                                                                                                    |
+| `release-please.yml:255-260` `Package (unix tar.gz)` (`shell: bash`)                 | writes `dist/*.tar.gz`           | `upload-artifact` (`path: dist/*`)          | yes — gated `if: matrix.archive == 'tar.gz'`, i.e. ubuntu/macos only | no windows involvement                                                                                         |
+| `release-please.yml:263-269` `Package (windows zip)` (`shell: pwsh`)                 | writes `dist/*.zip`              | `upload-artifact`                           | yes — pwsh is native; repo-relative paths                            | correct by construction                                                                                        |
+| `release-please.yml:311-327` `Generate SHA256SUMS` (`shell: bash`)                   | `SHA256SUMS` in `dist/`          | `action-gh-release`                         | yes — `runs-on: ubuntu-latest`                                       | no windows shell in this job                                                                                   |
+| `release-please.yml:122` `sha=$(git rev-list ...)` → `$GITHUB_OUTPUT`                | a commit SHA, not a path         | later `run` in same ubuntu job              | n/a — not a path                                                     | no boundary                                                                                                    |
+| `release-please.yml:68-74` `build_artifacts`/`tag_name`/`version` → `$GITHUB_OUTPUT` | non-path scalars                 | matrix jobs incl. windows                   | n/a — not paths                                                      | no boundary                                                                                                    |
+| `ci.yml:236` `mapfile`/`jq` gate body                                                | job names, not paths             | same step                                   | n/a                                                                  | no boundary                                                                                                    |
+| `scripts/check-workspace-versions.sh:94-106` `/tmp/cwv_meta_err.$$`                  | a POSIX temp file                | itself only                                 | yes — same shell reads and deletes it                                | safe; and this gate runs only in `make ci`/pre-push/`test` job, never on windows                               |
+| `scripts/install.sh:116` `mktemp -d`                                                 | temp dir                         | itself only                                 | yes                                                                  | POSIX installer; the Windows installer is `install.ps1`, which uses `[System.IO.Path]::GetTempPath()` natively |
+| `scripts/tests/*.test.sh`                                                            | fixture roots                    | themselves                                  | yes                                                                  | never invoked by any workflow; local POSIX harnesses                                                           |
+
+Result: **exactly one** bash→native path boundary existed, plus the same defect
+on the script's non-CI fallback route. Both are closed by the one change. No
+other emitter in either workflow hands a path across a shell-domain boundary; the
+remaining `/tmp` uses are single-domain (a shell writing and reading its own temp
+file) or POSIX-only by construction.
+
+`GITHUB_PATH` is never written by either workflow, so there is no PATH-domain
+variant of this bug.
+
+Not fixed, with reasoning: nothing. Unlike round 4, this audit found no
+"uncertain" rows — a step's shell and its runner OS are both statically
+declared, so every boundary is decidable from the files without needing a CI
+observation.
+
+### Regression proof — the Windows branch is tested on Linux
+
+The translation only executes on Windows, which no local run can reach. That is
+precisely the code that rots. `scripts/tests/legacy-fixture-path-domain.test.sh`
+therefore extracts `emit_consumer_path` **verbatim** from the shipped script
+(never re-implementing it, so the harness cannot drift) and drives it with a
+stubbed `uname` and a stubbed `cygpath`, under the same `set -euo pipefail` and
+the same `die` shape as the real script.
+
+Ten assertions: Linux and Darwin pass the path through byte-for-byte and never
+consult `cygpath`; all four Windows `uname` spellings translate; `cygpath` is
+asserted to be invoked with `-m` and the result asserted to contain no
+backslash; a missing `cygpath`, a nonzero `cygpath`, and an empty `cygpath`
+result each fail loudly and emit NOTHING on stdout; and a static check asserts
+the shipped script has zero remaining raw `$EXE` emissions and exactly two
+translated ones, so regressing only ONE of the two exit routes — the way this
+class of bug hides — is caught.
+
+Two negative controls were run:
+
+- restoring `b71a5f1`'s pre-fix script → the harness exits **2** and reports it
+  cannot extract `emit_consumer_path`, i.e. the harness genuinely depends on the
+  fix existing;
+- keeping the translator but reverting ONLY the cache-hit emission to
+  `printf '%s\n' "$EXE"` → **9 passed, 2 failed**, both failures on the static
+  route check, exit **1**. The nine behavioral scenarios still pass, which is
+  exactly why the static check is there.
+
+### Linux/macOS output is unchanged — proven, not asserted
+
+The script was run before and after the change on this host, capturing stdout and
+stderr separately:
+
+| check                              | result                                                                                                   |
+| ---------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `uname -s` / `TMPDIR` on this host | `Linux` / **unset** (so `CACHE_ROOT` is `/tmp/codegraph-legacy-fixture`, same as the CI linux job)       |
+| `command -v cygpath`               | **absent** (exit 1) — confirming the guard must be, and is, a real platform check                        |
+| stdout before the change           | `/tmp/codegraph-legacy-fixture/1a14d195…/codegraph`                                                      |
+| stdout after the change            | identical; `diff` clean; both SHA-256 `63cca31136bc556a423eccb874f36d4ec20ed848c27ee8e31ec37392d2ffcdac` |
+| stderr before vs after             | `diff` clean                                                                                             |
+| `--print` mode after the change    | exit **0**, same path                                                                                    |
+
+macOS is not runnable here, but it takes the identical branch: `uname -s` returns
+`Darwin`, which falls into the non-Windows arm and prints verbatim without ever
+looking for `cygpath`. Harness scenario `B_darwin` exercises exactly that arm
+with a stubbed `Darwin` uname.
+
+### Gates and their REAL exit status
+
+Each run separately; none joined with `&&`.
+
+| Command                                                       | Exit  | Result                                                        |
+| ------------------------------------------------------------- | ----- | ------------------------------------------------------------- |
+| `bash scripts/setup-legacy-fixture.sh` (baseline, pre-change) | **0** | `/tmp/codegraph-legacy-fixture/1a14d195…/codegraph`           |
+| `bash scripts/setup-legacy-fixture.sh` (post-change)          | **0** | byte-identical stdout AND stderr                              |
+| `bash scripts/setup-legacy-fixture.sh --print` (post-change)  | **0** | same path                                                     |
+| `bash scripts/tests/legacy-fixture-path-domain.test.sh`       | **0** | **10 passed, 0 failed**                                       |
+| negative control: pre-fix script                              | **2** | harness cannot find `emit_consumer_path` — depends on the fix |
+| negative control: one emission site regressed                 | **1** | **9 passed, 2 failed**, both on the static route check        |
+
+The harness is a manual POSIX fixture harness, run the same way as
+`scripts/tests/install-checksum.test.sh`, `asset-name-drift.test.sh`,
+`ci-gate.test.sh` and `check-workspace-versions.test.sh` — none of the four are
+wired into `guardrail.sh`, `make ci` or any workflow, and this one follows that
+existing convention rather than changing it.
+
+### CI round 5 — final gate statuses
+
+| Command                                                                        | Exit  | Result                                                                         |
+| ------------------------------------------------------------------------------ | ----- | ------------------------------------------------------------------------------ |
+| `bash scripts/check-workspace-versions.sh`                                     | **0** | workspace / `version.txt` / manifest all `0.40.4`                              |
+| `cargo test --locked -p codegraph-rs --test batch_m_legacy_extension_override` | **0** | **21 passed, 0 failed** — incl. the test that fails on windows                 |
+| same, with `CODEGRAPH_LEGACY_BIN` exported from the fixed script               | **0** | **21 passed, 0 failed** — proves the emitted path is consumable                |
+| `make fmt`                                                                     | **0** | run AFTER this prose, BEFORE CI                                                |
+| re-ran the harness + the script after `make fmt`                               | **0** | 10 passed; emitted path still byte-identical to the baseline                   |
+| `make ci CARGO='cargo --locked'` run 1                                         | **0** | `✅ All CI checks passed!` — 125 `test result: ok`, zero `FAILED`              |
+| `make ci CARGO='cargo --locked'` run 2                                         | **0** | `✅ All CI checks passed!`                                                     |
+| `git diff --stat b71a5f1..HEAD -- reference/golden/`                           | **0** | EMPTY — no golden byte changed                                                 |
+| `sha256sum Cargo.lock`                                                         | **0** | `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1` — unchanged |
+
+The equivalence oracle left NO untracked `colby.db-{wal,shm}` sidecars this round;
+`git status --short` after both CI runs showed only the three intended files.
+Three files changed: `scripts/setup-legacy-fixture.sh`, the new
+`scripts/tests/legacy-fixture-path-domain.test.sh`, and this ledger. **Windows
+was NOT validated locally** — the whole point of this defect is that it only
+exists across a Windows shell boundary; only the `Windows` CI job can confirm it.

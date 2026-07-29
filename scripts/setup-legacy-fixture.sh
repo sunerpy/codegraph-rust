@@ -43,8 +43,20 @@
 # `--print` is the only accepted argument; anything else is a usage error.
 #
 # Output: the absolute path of the verified legacy executable on stdout (last
-# line). All diagnostics go to stderr. Tests consume the path via
-# CODEGRAPH_LEGACY_BIN, which this script's caller exports.
+# line), expressed in the path domain of the CONSUMER, not of this shell. All
+# diagnostics go to stderr. Tests consume the path via CODEGRAPH_LEGACY_BIN,
+# which this script's caller exports.
+#
+# WHY the output domain is called out: on Windows this script runs under an
+# MSYS/Cygwin bash (Git Bash on the CI runner), whose absolute paths — `/tmp/x`,
+# `/c/Users/...` — are a VIRTUAL namespace understood only by the MSYS runtime.
+# The consumer is a NATIVE Win32 process (`cargo test`), which resolves the
+# string literally through the Win32 API and cannot see that namespace: a
+# perfectly valid `/tmp/...` fixture path fails there with `os error 3`, "The
+# system cannot find the path specified". So the final path is translated to a
+# native Win32 form before it is printed; every INTERNAL use keeps the shell's
+# own form. On Linux and macOS there is one path domain and nothing is
+# translated.
 
 set -euo pipefail
 
@@ -238,6 +250,38 @@ extract_member() {
     STAGE_DIR=""
 }
 
+# emit_consumer_path PATH — print PATH in the path domain of the NATIVE consumer.
+#
+# Windows only, and only when `cygpath` is actually present: MSYS/Cygwin paths
+# are invisible to a Win32 process (see the header). `cygpath -m` yields a native
+# absolute path with FORWARD slashes (`C:/Users/...`), which Win32 accepts and
+# which needs no backslash escaping when it travels through $GITHUB_ENV and Rust
+# string handling. A missing or failing `cygpath` is fatal, not silently skipped:
+# emitting an MSYS path there would hand the consumer a path it cannot open, and
+# a fixture that cannot be verified is a setup FAILURE. Every other host has a
+# single path domain and prints the path verbatim.
+emit_consumer_path() {
+    local path="$1" native
+    case "$(uname -s 2>/dev/null || printf 'unknown')" in
+        MINGW* | MSYS* | CYGWIN* | Windows_NT) ;;
+        *)
+            printf '%s\n' "$path"
+            return 0
+            ;;
+    esac
+    command -v cygpath > /dev/null 2>&1 \
+        || die "cygpath not found on PATH.
+This shell reports a Windows host, so the fixture path must be translated from
+the MSYS/Cygwin namespace ('$path') into a native Win32 path before a NATIVE
+consumer such as 'cargo test' can open it. Without cygpath that translation
+cannot be performed, and emitting the untranslated path would fail later with
+'The system cannot find the path specified'."
+    native="$(cygpath -m -- "$path")" \
+        || die "cygpath could not translate the fixture path to a native Win32 path: $path"
+    [ -n "$native" ] || die "cygpath returned an empty native path for: $path"
+    printf '%s\n' "$native"
+}
+
 size_of() {
     local path="$1" size
     if size="$(wc -c <"$path" 2>/dev/null)"; then
@@ -307,7 +351,7 @@ revalidate() {
 }
 
 if revalidate; then
-    printf '%s\n' "$EXE"
+    emit_consumer_path "$EXE"
     exit 0
 fi
 
@@ -370,4 +414,4 @@ if [ "$observed_version" != "$EXPECTED_VERSION" ]; then
 fi
 printf 'setup-legacy-fixture: verified %s\n' "$EXE_SHA" >&2
 
-printf '%s\n' "$EXE"
+emit_consumer_path "$EXE"
