@@ -468,6 +468,36 @@ mod tests {
         fs::create_dir_all(dir).unwrap();
     }
 
+    /// A bound socket is a FILESYSTEM artifact only on unix. On windows
+    /// [`daemon_socket_path`] returns a bare namespaced pipe NAME
+    /// (`codegraph-v2-<hash16>`), a kernel object reclaimed when its last handle
+    /// closes — which is why [`cleanup_owned_rendezvous`] unlinks nothing there,
+    /// correctly. Writing that name as a file and then asserting it was removed
+    /// tests a premise windows does not have, so these helpers confine the
+    /// file-level claims to unix. The ORDERING guarantees stay asserted on EVERY
+    /// platform: the pid record as exclusion, a competing start refused at the
+    /// midpoint, and the crash residue the stale heal clears.
+    fn publish_socket_file(socket: &Path, contents: &[u8]) {
+        #[cfg(unix)]
+        fs::write(socket, contents).unwrap();
+        #[cfg(not(unix))]
+        let _ = (socket, contents);
+    }
+
+    fn assert_socket_file_present(socket: &Path, message: &str) {
+        #[cfg(unix)]
+        assert!(socket.exists(), "{message}");
+        #[cfg(not(unix))]
+        let _ = (socket, message);
+    }
+
+    fn assert_socket_file_absent(socket: &Path, message: &str) {
+        #[cfg(unix)]
+        assert!(!socket.exists(), "{message}");
+        #[cfg(not(unix))]
+        let _ = (socket, message);
+    }
+
     #[test]
     fn decode_lock_info_rejects_empty_and_zero_and_garbage() {
         assert!(decode_lock_info("").is_none());
@@ -681,7 +711,7 @@ mod tests {
             started_at: 1,
         };
         fs::write(&pid_path, encode_lock_info(&old).unwrap()).unwrap();
-        fs::write(&socket, b"old").unwrap();
+        publish_socket_file(&socket, b"old");
 
         let mut replacement_claim = None;
         let cleaned = cleanup_owned_rendezvous_with(&pid_path, &socket, departing, |checkpoint| {
@@ -711,7 +741,7 @@ mod tests {
 
         assert!(cleaned, "the departing owner cleans its own rendezvous");
         assert!(!pid_path.exists(), "its record is removed last");
-        assert!(!socket.exists(), "its socket was removed first");
+        assert_socket_file_absent(&socket, "its socket was removed first");
 
         // The replacement can now claim a clean namespace and bind its own socket,
         // and nothing left over can delete it.
@@ -720,12 +750,13 @@ mod tests {
         else {
             panic!("a cleaned namespace must be claimable");
         };
-        fs::write(&socket, b"new").unwrap();
+        publish_socket_file(&socket, b"new");
         assert!(
             !cleanup_owned_rendezvous(&pid_path, &socket, departing),
             "a second cleanup pass by the departed owner must be refused"
         );
-        assert!(pid_path.exists() && socket.exists());
+        assert!(pid_path.exists());
+        assert_socket_file_present(&socket, "the replacement's socket survives");
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -750,7 +781,7 @@ mod tests {
             started_at: 1,
         };
         fs::write(&pid_path, encode_lock_info(&old).unwrap()).unwrap();
-        fs::write(&socket, b"old").unwrap();
+        publish_socket_file(&socket, b"old");
 
         // Simulate the crash by panicking-free early return: run cleanup only up to
         // the socket-removed boundary and drop the process there.
@@ -758,7 +789,7 @@ mod tests {
         let _ = cleanup_owned_rendezvous_with(&pid_path, &socket, departing, |checkpoint| {
             if checkpoint == RendezvousCleanupCheckpoint::SocketRemoved {
                 reached_socket_removed = true;
-                assert!(!socket.exists(), "the socket is gone at this boundary");
+                assert_socket_file_absent(&socket, "the socket is gone at this boundary");
                 assert!(
                     pid_path.exists(),
                     "the record is STILL published as exclusion at this boundary"
