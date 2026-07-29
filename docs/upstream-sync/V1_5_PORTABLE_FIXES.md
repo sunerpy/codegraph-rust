@@ -9154,3 +9154,218 @@ Three files changed: `scripts/setup-legacy-fixture.sh`, the new
 `scripts/tests/legacy-fixture-path-domain.test.sh`, and this ledger. **Windows
 was NOT validated locally** — the whole point of this defect is that it only
 exists across a Windows shell boundary; only the `Windows` CI job can confirm it.
+
+## PR #173 CI round 6 — two failures, two unrelated root causes; the gate itself was innocent (2026-07-29)
+
+Run [30451206766](https://github.com/sunerpy/codegraph-rust/actions/runs/30451206766)
+on `5845f11`. `Test` (Linux) and `Security Audit` PASS. Two jobs red:
+
+| Job                                                                                              | Step                     | Failure                                                                       |
+| ------------------------------------------------------------------------------------------------ | ------------------------ | ----------------------------------------------------------------------------- |
+| `Windows`                                                                                        | Run tests                | `lock_only_parent_is_not_a_status_discovery_marker` — `batch_m_uninit.rs:558` |
+| [`Coverage`](https://github.com/sunerpy/codegraph-rust/actions/runs/30451206766/job/90573437980) | Generate coverage (lcov) | `daemon_idle_exits_after_last_client` — `daemon_idle.rs:218`, exit status 101 |
+| `CI Success`                                                                                     | Check job status         | consequence only: `windows` was the sole ❌ row                               |
+
+### The gate-membership question, answered first
+
+`Coverage` did NOT leak into the gate. `ci-success` in `.github/workflows/ci.yml`
+declares `needs: [test, audit, windows]` — three jobs, `coverage` deliberately
+absent. Two independent proofs:
+
+1. The failing run's own `NEEDS_JSON`, echoed by the step, contains exactly
+   `test`, `audit`, `windows` and nothing else; the printed table was
+   `✅ audit`, `✅ test`, `❌ windows`, and `❌ CI failed: 1 of 3 required job(s)`.
+   So `CI Success` failed because of `Windows` ALONE.
+2. `bash scripts/check-ci-gate.sh` exits **0** locally and prints
+   `required jobs : audit, test, windows` /
+   `excluded (informational, justified): coverage`, then runs 16 truth-table
+   cases over the shipped step body.
+
+The gate added in `ec93ef6` is intact and needs no change. `codecov.yml` still
+carries `informational: true`; `Coverage` stays non-blocking by design. Its
+redness is a REAL test failure worth fixing on its own merits — it is simply not
+what turned `CI Success` red.
+
+### Failure 1 — a TEST-side path-separator assumption, not a production defect
+
+`crates/codegraph-cli/tests/batch_m_uninit.rs:548` built its nested directory
+from a slash-containing literal:
+
+```rust
+let nested = project.join("a/b");
+```
+
+`Path::join` does not translate an embedded `/`. On Windows the resulting
+`PathBuf` therefore stringifies with MIXED separators — `…\project\a/b`. The CLI
+does not: `cmd_status` takes its start path through
+`absolute_path` → `normalize_lexical`, which rebuilds the path from
+`Path::components()`, and the Windows path parser treats `/` as a separator and
+re-emits it as `\`. So the reported `projectPath` is correctly `…\project\a\b`
+and the EXPECTATION was the malformed value. The CI panic shows exactly that
+asymmetry — `left` is the CLI's (correct) output, `right` the test's literal:
+
+```
+ left: String("C:\\Users\\RUNNER~1\\...\\project\\a\\b")
+right: "C:\\Users\\RUNNER~1\\...\\project\\a/b"
+```
+
+Why only this one test of the six: the sibling
+`nested_status_discovers_authenticated_non_current_parent_states` (line 490) uses
+the same `join("a/b")` but asserts `projectPath` against `project`, never against
+`nested`, so it never stringifies the mixed path.
+
+**Verdict: the test's platform assumption is the defect.** Production is right on
+Windows, so nothing was gated and no coverage was lost — the invariant (a
+lock-only parent is NOT a discovery marker, so status reports the INVOCATION dir
+and `extractionStatus: missing`) is asserted exactly as before, against a path
+built component-by-component in the native separator domain:
+
+```rust
+let nested = project.join("a").join("b");
+```
+
+### Failure 2 — a REAL race on BOTH platforms: a sibling's `remove_var` steals the idle window
+
+The `Coverage` job is not instrumentation-sensitive and the failure is not a
+`cargo llvm-cov`, lcov-write or Codecov-upload problem: the failing step is
+`Generate coverage (lcov)`, and it failed because
+`cargo test --tests … --workspace` under it exited 101 on a genuine assertion.
+
+`daemon_idle.rs` holds TWO `#[test]`s that both run in parallel in one binary,
+and both spawn a detached daemon through:
+
+```rust
+unsafe { std::env::set_var("CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS", idle_ms) };
+spawn_detached_daemon(&bin(), project, false)?;   // Command snapshots env HERE
+unsafe { std::env::remove_var("CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS") };
+```
+
+`std::env` is process-global and `Command` snapshots the environment INSIDE
+`spawn_detached_daemon`. When the sibling's `remove_var` lands between this
+test's `set_var` and that snapshot, the daemon inherits NO idle var, so
+`resolve_idle_timeout_ms` falls back to `DEFAULT_IDLE_TIMEOUT_MS` = **300 000 ms**
+and the process cannot possibly be gone inside `wait_until_gone(…, 10s)`.
+
+The CI log confirms the interleave: both projects were initialized 2 ms apart
+(`12:23:04.4153` / `12:23:04.4177`) so both tests were in flight, and
+`daemon_stays_alive_with_active_client` (which spawns with `"500"`) finished at
+`12:23:05.64` — squarely inside the other test's spawn window.
+
+Proof by direct reconstruction, spawning the daemon with the idle var ABSENT and
+everything else identical (`/tmp/opencode/repro3.py`, three runs):
+
+```
+daemon STILL ALIVE 12.0s after last client disconnected -> reproduces the CI assertion failure
+```
+
+and with the var present, both the plain and the instrumented binary idle-exit
+identically, so instrumentation is exonerated:
+
+```
+plain          rc=0  exit_after_disconnect=2.22s  loop_break->stopped=0.01s
+instrumented   rc=0  exit_after_disconnect=2.22s  loop_break->stopped=0.01s
+```
+
+Why it is newly red rather than always red: it is a scheduling race, not a
+deterministic break. 15 plain runs, 12 CPU-pinned runs, 3 instrumented runs and a
+full instrumented `--workspace` pass all went green here; the six earlier
+`Coverage` runs simply won the race. Nothing about coverage causes it — the same
+binary under plain `cargo test` is equally exposed.
+
+**Fix: the same `ENV_LOCK` shape already used by `daemon_single_watcher.rs`** —
+one `OnceLock<Mutex<()>>` per test binary, held across the whole
+set → spawn → restore region so the spawned daemon always inherits the window its
+own test chose. No sleep, no widened timeout, no `#[ignore]`, no weakened
+assertion; the 10 s ceiling and both assertions are untouched.
+`daemon_sweep.rs` carries the identical shape (two parallel tests, same
+set → spawn → remove sequence, `CODEGRAPH_DAEMON_CLIENT_SWEEP_MS` +
+`CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS`, defaults 30 000 / 300 000 ms) and was fixed
+in the same commit — it is the same bug, unfired.
+
+### Audit — the class behind each failure, swept across the workspace
+
+Failure 1's class: a test-built path string compared against a path the CLI
+printed. There are exactly THREE such comparisons in the whole workspace, all in
+`batch_m_uninit.rs`:
+
+| file:line               | assumption                                                     | Windows verdict                                                  |
+| ----------------------- | -------------------------------------------------------------- | ---------------------------------------------------------------- |
+| `batch_m_uninit.rs:503` | `projectPath == project` where `project = dir.join("project")` | SAFE — single component, no embedded `/`                         |
+| `batch_m_uninit.rs:539` | `projectPath == project` where `project = dir.join("mini")`    | SAFE — single component                                          |
+| `batch_m_uninit.rs:563` | `projectPath == nested` where `nested` came from `join("a/b")` | **BROKEN — the reported failure. FIXED** (`join("a").join("b")`) |
+
+Other `join("<x>/<y>")` sites exist but none is stringified for comparison — they
+are only used as filesystem paths, where the mixed form resolves identically on
+Windows:
+
+| file:line                                                                   | use of the slash-joined path                       | Windows verdict                                            |
+| --------------------------------------------------------------------------- | -------------------------------------------------- | ---------------------------------------------------------- |
+| `batch_m_uninit.rs:388`, `:490`, `:514`                                     | `create_dir_all` + `current_dir` only              | SAFE — never stringified for an equality assertion         |
+| `batch_m_v2_namespace.rs:246/247/250`                                       | project roots passed as CLI args                   | SAFE — consumed as paths, compared only via `is_file()`    |
+| `catch_up.rs:180`, `sync_incremental.rs:*`, `live_update_direct.rs:196/244` | `fs::write` targets                                | SAFE — filesystem-only                                     |
+| `installer.rs:*`, `skill_install.rs:*`, `completions.rs:70/97`              | config file paths, `exists()` / content assertions | SAFE — no path-string equality                             |
+| `global_http_project_scoped_config.rs:*`                                    | `format!("{}", …display())` into JSON args         | unix-only target (`#![cfg(unix)]`) — never runs on Windows |
+| `batch_m_legacy_extension_override.rs:335`                                  | `script.display()` in a panic message              | SAFE — diagnostic text, not an assertion                   |
+
+Failure 2's class: a `set_var` → spawn sequence in a multi-test binary. Four test
+binaries mutate env and spawn a child; two were already guarded, two were not:
+
+| file                       | env sites | guard before             | Windows/Linux verdict                         |
+| -------------------------- | --------- | ------------------------ | --------------------------------------------- |
+| `daemon_single_watcher.rs` | 3         | `env_guard()` ✅         | SAFE — this is the shape copied               |
+| `lease_lifetime.rs`        | 4         | `test_serial_guard()` ✅ | SAFE — restores under the guard               |
+| `daemon_idle.rs`           | 3         | **none**                 | **BROKEN on both platforms. FIXED**           |
+| `daemon_sweep.rs`          | 3         | **none**                 | **BROKEN on both platforms (unfired). FIXED** |
+
+Filesystem-residue / removability / `io::ErrorKind` assertions, the class behind
+layers 4-5, were re-swept: every test-side `ErrorKind` match is `NotFound`
+(portable), plus `WouldBlock`/`TimedOut`/`Interrupted`/`InvalidData` in
+socket/parse paths that carry no platform assumption. Four `remove_dir_all` calls
+assert success — `lease_lifetime.rs:871`, `reopen.rs:152`,
+`typescript_engine.rs:178/207`. All are Windows-visible and all PASSED on the
+Windows runner in this very run (`reopen` 3 passed, and the store/extract suites
+green), so no Windows handle-retention problem is latent there; left unchanged
+rather than speculatively touched.
+
+Coverage note on what the Windows job still has NOT proven: `cargo test` stops at
+the first failing target, so every CLI target alphabetically after
+`batch_m_uninit` never executed on Windows this round — 24 of them are
+Windows-visible (`batch_m_v2_namespace` … `unicode_search_cli`). This fix is what
+lets them run; further layers may surface behind it, exactly as layers 1-6 did.
+
+### Gates and their REAL exit status
+
+Run separately, never joined with `&&`.
+
+| Command                                                               | Exit  | Result                                                    |
+| --------------------------------------------------------------------- | ----- | --------------------------------------------------------- |
+| `gh run view 30451206766 --log-failed`                                | **0** | 6090 lines; only `Windows`, `Coverage`, `CI Success`      |
+| `bash scripts/check-ci-gate.sh`                                       | **0** | required = audit, test, windows; coverage excluded        |
+| `cargo test --locked -p codegraph-rs --test batch_m_uninit` (pre-fix) | **0** | 6 passed — the defect is Windows-only, invisible on Linux |
+| `python3 /tmp/opencode/repro3.py` ×3 (idle var absent)                | —     | daemon alive at 12.0s each time — Failure 2 reproduced    |
+
+### Round 6 — final gate statuses
+
+Prose written FIRST, then `make fmt`, then the gates, so `fmt-check` sees the
+formatted ledger. Each command run separately; the exit status below is the one
+the shell actually reported.
+
+| Command                                                                | Exit  | Result                                                                         |
+| ---------------------------------------------------------------------- | ----- | ------------------------------------------------------------------------------ |
+| `cargo test --locked -p codegraph-rs --test batch_m_uninit` (post-fix) | **0** | **6 passed, 0 failed** (twice)                                                 |
+| `cargo test --locked -p codegraph-rs --test daemon_idle`               | **0** | **2 passed, 0 failed**                                                         |
+| `cargo test --locked -p codegraph-rs --test daemon_sweep`              | **0** | **2 passed, 0 failed**                                                         |
+| `make fmt`                                                             | **0** | run after this prose, before the gates                                         |
+| `make ci CARGO='cargo --locked'` run 1                                 | **0** | `✅ All CI checks passed!` — 125 `test result: ok`, zero `FAILED`              |
+| `make ci CARGO='cargo --locked'` run 2                                 | **0** | `✅ All CI checks passed!` — 125 `test result: ok`, zero `FAILED`              |
+| `make ci CARGO='cargo --locked'` run 3                                 | **0** | `✅ All CI checks passed!` — final, with this ledger in the tree               |
+| `bash scripts/check-workspace-versions.sh`                             | **0** | workspace / `version.txt` / manifest all `0.40.4`                              |
+| `bash scripts/check-ci-gate.sh`                                        | **0** | 16 truth-table cases; required = audit, test, windows                          |
+| `git diff --stat 5845f11..HEAD -- reference/golden/`                   | **0** | EMPTY — no golden byte changed                                                 |
+| `sha256sum Cargo.lock`                                                 | **0** | `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1` — unchanged |
+
+`git status --short` after every CI run showed only the four intended files and no
+untracked `reference/golden/*/colby.db-{wal,shm}` sidecars. **Windows was NOT
+validated locally** — no MSVC toolchain exists on this host (`cargo xwin` fails on
+a missing `clang-cl`), so only the `Windows` CI job can confirm Failure 1's fix.
+Failure 2's mechanism, by contrast, WAS reproduced and re-verified locally.
