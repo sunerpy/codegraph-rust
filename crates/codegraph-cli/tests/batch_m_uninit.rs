@@ -545,7 +545,12 @@ fn nested_status_discovers_interrupted_uninit_with_relative_configured_root() {
 fn lock_only_parent_is_not_a_status_discovery_marker() {
     let dir = TestDir::new("lock-only");
     let project = dir.path().join("project");
-    let nested = project.join("a/b");
+    // NOT `join("a/b")`: `Path::join` keeps an embedded `/` verbatim, so on
+    // Windows that literal yields a MIXED `…\project\a/b`, while the CLI re-emits
+    // this path through `normalize_lexical` as `…\project\a\b`. The assertion
+    // below compares the reported `projectPath` to this value, so it must be
+    // built in the same native-separator domain the CLI prints.
+    let nested = project.join("a").join("b");
     std::fs::create_dir_all(&nested).expect("create nested project directory");
     let paths = IndexPaths::resolve(&project, None).expect("resolve lifecycle paths");
     std::fs::create_dir(paths.current_root()).expect("create current root");
