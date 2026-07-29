@@ -153,6 +153,22 @@ pub fn unlock_project(project_root: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// The mutation boundaries of [`clear_stale_daemon_socket`], exposed only so a
+/// test can drive a competing daemon start at an exact point with no timing
+/// assumption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StaleHealCheckpoint {
+    /// The stale (dead/absent-owner) pid record is gone and NOTHING is claimed:
+    /// the namespace is momentarily unowned and open to any starter. The socket
+    /// has not been touched.
+    StaleRecordCleared,
+    /// This cleaner WON the heal claim — its own pid record is published, so
+    /// every starter now reports `Taken`. The socket has not been touched.
+    HealClaimHeld,
+    /// The stale socket is gone; the heal claim is STILL published and still ours.
+    SocketRemoved,
+}
+
 /// Self-heal a project's stale daemon artifacts after a failed attach (Fix A):
 /// clears the pid lock AND removes the leftover `daemon.sock` at the RECORDED
 /// (fallback-aware) socket path, so the next `serve --mcp` spawns a fresh daemon
@@ -160,12 +176,58 @@ pub fn unlock_project(project_root: &Path) -> bool {
 ///
 /// Gated on liveness: returns `false` and touches nothing when the lock is held
 /// by a LIVE pid (`clear_stale_daemon_lock` refuses to remove a live lock).
-/// Returns `true` once the stale lock is cleared; socket removal is best-effort
-/// (a missing socket is already the desired end state).
+///
+/// OWNERSHIP IS LOAD-BEARING — this cleaner unlinks a socket it did not bind, so
+/// it must first BECOME the namespace's owner. The published pid record IS the
+/// single-instance exclusion token ([`try_acquire_daemon_lock`] claims it with
+/// `create_new`, and a daemon only ever binds after that claim succeeds). An
+/// earlier revision cleared the stale record and THEN unlinked, holding no token
+/// in between: a replacement daemon could legitimately claim the freed record and
+/// bind the same path, and this unlink then destroyed the LIVE replacement's
+/// socket — leaving a record naming a live daemon with no socket, which the
+/// liveness gate makes unhealable. Merely swapping the two deletions does not fix
+/// that, because an unlink performed while owning nothing is unsafe in either
+/// order.
+///
+/// So the sequence is claim-then-clean, and every step after the liveness gate is
+/// conditional on WINNING the claim:
+///
+/// 1. read the RECORDED socket (the record is the only place a fallback path is
+///    written down), then remove the stale record — liveness-gated, so a live
+///    owner's namespace is never entered;
+/// 2. re-claim the pid record via [`try_acquire_daemon_lock`], i.e. with the very
+///    same `create_new` token a starter uses. LOSING this claim means a
+///    replacement (or a competing cleaner) now owns the namespace, so this cleaner
+///    returns `false` and touches NOTHING — that is what closes the window rather
+///    than narrowing it;
+/// 3. unlink the stale socket while the claim excludes every starter, so no
+///    process can have bound that path in the meantime;
+/// 4. release the claim last, re-corroborated against our own pid
+///    ([`cleanup_owned_lock`]).
+///
+/// An ABSENT pid record is treated as an unowned namespace: `clear_stale_daemon_lock`
+/// reports it cleared, and step 2 then claims it, so the socket is still only ever
+/// removed under a held claim. A crash mid-heal leaves a record naming this
+/// now-dead process and no socket — exactly the self-healing residue the next
+/// heal clears.
+///
+/// On Windows the recorded "socket path" is a bare namespaced pipe name rather
+/// than a filesystem entry, so step 3's `remove_file` simply fails and is ignored
+/// (a pipe disappears with its owning process); steps 1, 2 and 4 operate on the
+/// real pid file and are what carry the exclusion there.
 pub fn clear_stale_daemon_socket(project_root: &Path) -> bool {
+    clear_stale_daemon_socket_with(project_root, |_| {})
+}
+
+fn clear_stale_daemon_socket_with(
+    project_root: &Path,
+    mut checkpoint: impl FnMut(StaleHealCheckpoint),
+) -> bool {
     let Ok(pid_path) = daemon_pid_path(project_root) else {
         return false;
     };
+    // Read the recorded socket BEFORE the stale record goes away: the record is
+    // the only place a bind-fallback path is written down.
     let Ok(socket_path) = recorded_socket_path(project_root) else {
         return false;
     };
@@ -173,8 +235,36 @@ pub fn clear_stale_daemon_socket(project_root: &Path) -> bool {
     if !clear_stale_daemon_lock(&pid_path, None) {
         return false;
     }
+    checkpoint(StaleHealCheckpoint::StaleRecordCleared);
+
+    // Become the owner before deleting anything in the namespace. A lost claim
+    // means somebody else owns it now; their socket is not ours to unlink.
+    let claim_pid = match try_acquire_daemon_lock(project_root) {
+        Ok(AcquireResult::Acquired { info, .. }) => info.pid,
+        Ok(AcquireResult::Taken { .. }) => {
+            debug!(
+                pid_path = %pid_path.display(),
+                "daemon rendezvous was re-claimed while healing; leaving its record and socket intact"
+            );
+            return false;
+        }
+        Err(err) => {
+            debug!(
+                pid_path = %pid_path.display(), error = %err,
+                "could not claim the daemon rendezvous for healing; leaving it untouched"
+            );
+            return false;
+        }
+    };
+    checkpoint(StaleHealCheckpoint::HealClaimHeld);
+
+    // Under the claim no starter can have bound this path, so the socket we see
+    // is provably the stale one.
     let _ = fs::remove_file(&socket_path);
-    true
+    checkpoint(StaleHealCheckpoint::SocketRemoved);
+
+    // Release the claim last, re-corroborated against our pid.
+    cleanup_owned_lock(&pid_path, claim_pid)
 }
 
 /// Whether the published pid record currently names `pid`.
@@ -680,6 +770,197 @@ mod tests {
         // The residue is exactly what the stale-socket self-heal clears.
         assert!(clear_stale_daemon_socket(&base));
         assert!(!pid_path.exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A dead pid whose record and socket are the stale residue to be healed.
+    fn dead_pid() -> u32 {
+        let mut candidate = 4_000_000_000u32;
+        while candidate == process::id() || is_process_alive(candidate) {
+            candidate -= 1;
+        }
+        candidate
+    }
+
+    fn publish_record(pid_path: &Path, pid: u32, socket: &Path) {
+        let info = DaemonLockInfo {
+            pid,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            socket_path: socket.to_path_buf(),
+            started_at: 1,
+        };
+        fs::write(pid_path, encode_lock_info(&info).unwrap()).unwrap();
+    }
+
+    /// The rendezvous-ownership race. A replacement daemon legitimately claims the
+    /// namespace at the EXACT point where the stale record is gone and nothing is
+    /// owned, and binds the same socket path. The cleaner must lose its claim and
+    /// destroy nothing.
+    ///
+    /// Deterministic by construction: the replacement runs inside the checkpoint
+    /// callback, so it is ordered by the call itself, not by any sleep.
+    ///
+    /// Under the OLD clear-record-then-unlink order this test fails — the unlink
+    /// was unconditional, so it deleted the LIVE replacement's socket.
+    #[test]
+    fn a_replacement_start_during_the_stale_heal_keeps_its_own_socket() {
+        let base = temp_base("heal-replaced");
+        create_rendezvous_dir(&base);
+        let pid_path = pid_path_of(&base);
+        let socket = socket_path_of(&base);
+        publish_record(&pid_path, dead_pid(), &socket);
+        fs::write(&socket, b"stale").unwrap();
+
+        let mut replacement_ran = false;
+        let healed = clear_stale_daemon_socket_with(&base, |checkpoint| {
+            if checkpoint != StaleHealCheckpoint::StaleRecordCleared {
+                return;
+            }
+            // A replacement start wins the freed namespace here: it claims the
+            // record with its own LIVE pid and binds the same socket path.
+            replacement_ran = true;
+            publish_record(&pid_path, process::id(), &socket);
+            fs::write(&socket, b"live-replacement").unwrap();
+        });
+
+        assert!(replacement_ran, "the replacement ran at the checkpoint");
+        assert!(
+            socket.exists(),
+            "the LIVE replacement's socket must survive the stale heal"
+        );
+        assert_eq!(
+            fs::read(&socket).unwrap(),
+            b"live-replacement",
+            "the surviving socket must be the replacement's, not the stale one"
+        );
+        assert!(
+            !healed,
+            "a cleaner that lost the namespace must report that it healed nothing"
+        );
+        let surviving =
+            read_lock_info_tolerant(&pid_path).expect("the replacement record survives");
+        assert_eq!(
+            surviving.pid,
+            process::id(),
+            "the replacement's record must be left exactly as published"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// The claim is what makes the unlink safe, so it must be PUBLISHED across the
+    /// unlink and released only afterwards. While it is held every starter is
+    /// excluded, which is why no process can have bound the path being unlinked.
+    #[test]
+    fn the_stale_heal_holds_its_claim_across_the_unlink_and_releases_it_last() {
+        let base = temp_base("heal-claim");
+        create_rendezvous_dir(&base);
+        let pid_path = pid_path_of(&base);
+        let socket = socket_path_of(&base);
+        publish_record(&pid_path, dead_pid(), &socket);
+        fs::write(&socket, b"stale").unwrap();
+
+        let mut competing_start = None;
+        let mut saw_socket_removed = false;
+        let healed = clear_stale_daemon_socket_with(&base, |checkpoint| match checkpoint {
+            StaleHealCheckpoint::HealClaimHeld => {
+                let claim =
+                    read_lock_info_tolerant(&pid_path).expect("the heal claim is published");
+                assert_eq!(
+                    claim.pid,
+                    process::id(),
+                    "the heal claim must name this cleaner"
+                );
+                assert!(socket.exists(), "the socket is untouched under the claim");
+                competing_start =
+                    Some(try_acquire_daemon_lock(&base).expect("competing start under the claim"));
+            }
+            StaleHealCheckpoint::SocketRemoved => {
+                saw_socket_removed = true;
+                assert!(
+                    !socket.exists(),
+                    "the stale socket is gone at this boundary"
+                );
+                assert!(
+                    pid_path.exists(),
+                    "the heal claim must STILL be published while the socket is unlinked"
+                );
+            }
+            StaleHealCheckpoint::StaleRecordCleared => {}
+        });
+
+        match competing_start.expect("a competing start ran under the claim") {
+            AcquireResult::Taken { existing, .. } => {
+                let existing = existing.expect("the heal claim is readable");
+                assert_eq!(
+                    existing.pid,
+                    process::id(),
+                    "a starter racing the heal must be refused BY the heal claim, so it \
+                     cannot bind the socket the cleaner is about to unlink"
+                );
+            }
+            AcquireResult::Acquired { .. } => panic!(
+                "a starter must NOT be able to claim the namespace while the cleaner holds \
+                 its heal claim"
+            ),
+        }
+        assert!(saw_socket_removed);
+        assert!(healed, "a genuinely stale namespace heals");
+        assert!(!pid_path.exists(), "the heal claim is released last");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Stale recovery still works: a dead owner's record AND socket are both gone
+    /// after the heal, so the next start spawns fresh.
+    #[test]
+    fn a_genuinely_stale_namespace_still_self_heals_both_artifacts() {
+        let base = temp_base("heal-stale");
+        create_rendezvous_dir(&base);
+        let pid_path = pid_path_of(&base);
+        let socket = socket_path_of(&base);
+        publish_record(&pid_path, dead_pid(), &socket);
+        fs::write(&socket, b"stale").unwrap();
+
+        assert!(clear_stale_daemon_socket(&base), "the stale residue heals");
+        assert!(!pid_path.exists(), "the stale record is gone");
+        assert!(!socket.exists(), "the stale socket is gone");
+        let AcquireResult::Acquired { .. } =
+            try_acquire_daemon_lock(&base).expect("post-heal acquire")
+        else {
+            panic!("a healed namespace must be claimable by a fresh start");
+        };
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// An ABSENT record means nobody owns the namespace, so a leftover socket may
+    /// be removed — but only after the cleaner has CLAIMED that namespace, exactly
+    /// as it does for a dead-owner record. Without the claim, an absent record
+    /// would be the widest interleaving of all: it names no pid to prove dead, so
+    /// an unlink under it could hit a daemon that bound between the two syscalls.
+    #[test]
+    fn an_absent_record_is_claimed_before_its_leftover_socket_is_removed() {
+        let base = temp_base("heal-absent");
+        create_rendezvous_dir(&base);
+        let pid_path = pid_path_of(&base);
+        let socket = socket_path_of(&base);
+        fs::write(&socket, b"orphan").unwrap();
+        assert!(!pid_path.exists(), "precondition: no record at all");
+
+        let mut claim_held_with_socket_present = false;
+        let healed = clear_stale_daemon_socket_with(&base, |checkpoint| {
+            if checkpoint == StaleHealCheckpoint::HealClaimHeld {
+                claim_held_with_socket_present =
+                    record_names(&pid_path, process::id()) && socket.exists();
+            }
+        });
+
+        assert!(
+            claim_held_with_socket_present,
+            "the leftover socket must still be present at the moment the claim is won, \
+             proving the removal happens UNDER the claim and not before it"
+        );
+        assert!(healed, "an unowned namespace with a leftover socket heals");
+        assert!(!socket.exists(), "the orphaned socket is removed");
+        assert!(!pid_path.exists(), "the heal claim is released");
         let _ = fs::remove_dir_all(&base);
     }
 

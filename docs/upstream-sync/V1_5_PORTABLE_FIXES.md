@@ -8289,3 +8289,248 @@ EMPTY; `git status --porcelain` showed no untracked
 `reference/golden/*/colby.db-{wal,shm}` after the batch. `Cargo.lock` SHA-256
 unchanged at `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`.
 Six files changed: the five test-side sources plus this ledger.
+
+## Correction to the F2 DEFERRED record — the stale-heal rendezvous ownership race is now FIXED (2026-07-29)
+
+**This section supersedes the status line of "F2 round-two finding, recorded as
+DEFERRED: the stale-heal path deletes the pid record before the socket" above.**
+That section's technical account remains accurate and is deliberately left
+in place as the historical record; only its verdict changed. It said
+"**Status: NOT fixed in this release.**" The user has since explicitly
+authorized the repair, so the defect it describes is now fixed on this branch.
+Its "out of scope because it predates the branch" adjudication no longer holds.
+
+### The defect, re-confirmed against the pre-fix tree
+
+`clear_stale_daemon_socket` at `4f910f2`, `crates/codegraph-daemon/src/lock.rs:165-178`:
+
+```rust
+pub fn clear_stale_daemon_socket(project_root: &Path) -> bool {
+    let Ok(pid_path) = daemon_pid_path(project_root) else { return false; };
+    let Ok(socket_path) = recorded_socket_path(project_root) else { return false; };
+    // Liveness gate: only proceed once the owning pid is proven dead/absent.
+    if !clear_stale_daemon_lock(&pid_path, None) {
+        return false;
+    }
+    let _ = fs::remove_file(&socket_path);
+    true
+}
+```
+
+The published pid record IS the single-instance exclusion token:
+`try_acquire_daemon_lock` (`lock.rs:83-101`) claims it with `create_new`, and a
+daemon binds its socket only after that claim succeeds. `clear_stale_daemon_lock`
+(`lock.rs:126-146`) DELETES that record as its side effect. Between
+`lock.rs:173` and `lock.rs:176` the namespace is therefore unowned: a replacement
+daemon can legitimately claim the record and bind the same recorded socket path,
+and line 176's unlink then destroys the LIVE replacement's socket. End state — a
+pid record naming a live daemon with no socket — is unhealable, because the
+liveness gate at `lock.rs:141-143` refuses to touch a record whose pid is alive.
+
+`clear_stale_daemon_lock` also returns `true` for a MISSING pidfile
+(`lock.rs:130`), so "cleared" never implied this caller held exclusion at all.
+
+Production-reachable: `heal_stale_daemon_if_dead`
+(`crates/codegraph-cli/src/main.rs:2784-2788`) is the only caller, reached from the
+socket-missing branch of `proxy_to_running_daemon` (`main.rs:2730`) and from its
+post-`run_proxy` failure branch (`main.rs:2751`). Two concurrent `serve --mcp`
+starts on one project can run a cleaner against a replacement daemon's namespace.
+
+It predates the branch: `git show aba4079:crates/codegraph-daemon/src/lock.rs`
+line 161 has the identical order.
+
+### The option chosen: (b) a serialization protocol every starter and cleaner already obeys
+
+Reviewer option **(a)** — drop proactive stale cleanup from the attach-failure path
+and let `start_or_attach_gated` clear the leftover socket once it holds the new pid
+record — was **rejected**, for two reasons found by reading the code rather than by
+preference:
+
+1. `start_or_attach_gated` (`crates/codegraph-daemon/src/lib.rs:291-334`) is NOT on
+   the path that needs healing. The CLI's warm/cold decision
+   (`serve_spawn_or_proxy`, `main.rs:2688-2718`) reaches
+   `heal_stale_daemon_if_dead` on a WARM start whose attach failed, and then serves
+   DIRECT; it never calls `start_or_attach_gated` in that flow. Moving the cleanup
+   there would leave the stale socket in place for exactly the failing case Fix A
+   was written for (the dead-daemon-with-leftover-socket hang), i.e. it would
+   silently delete a shipped behavior, not relocate it.
+2. `start_or_attach_gated`'s own successful path already binds through
+   `bind_with_fallback` (`lib.rs:451-473`), which unlinks a stale entry at each
+   candidate BEFORE binding it (`lib.rs:457-462`) — under its already-held pid
+   record. Option (a)'s "new owner clears the leftover socket" is therefore already
+   implemented there. The residual defect is specifically the CLEANER that owns
+   nothing, so that is where the fix belongs.
+
+Option **(b)** was taken, using the token that already exists instead of inventing
+a second one: `clear_stale_daemon_socket` now BECOMES the namespace owner before it
+deletes anything in the namespace.
+
+```
+1. read the RECORDED socket (the record is the only place a bind-fallback path is
+   written down), then clear the stale record — still liveness-gated, so a LIVE
+   owner's namespace is never entered;
+2. re-claim the record via try_acquire_daemon_lock — the very same `create_new`
+   token a starter uses. A LOST claim returns false and touches NOTHING;
+3. unlink the stale socket while the claim excludes every starter;
+4. release the claim last, re-corroborated against our own pid via
+   cleanup_owned_lock.
+```
+
+This is the same idiom `f691415` established for `cleanup_owned_rendezvous`
+(`lock.rs:281-312`) — mutate the namespace only while holding the record that
+excludes competitors, and re-corroborate ownership at the final boundary — adapted
+to a cleaner that must ACQUIRE ownership rather than already have it.
+`cleanup_owned_rendezvous` and its tests were not modified.
+
+### Why no residual window remains
+
+The claim is a mutual-exclusion token with an atomic acquire: `create_new` on the
+pid path is a single filesystem operation that exactly one of N concurrent
+claimants can win. Every party that can bind the recorded socket path — a daemon
+start via `start_or_attach_gated` → `try_acquire_daemon_lock` → `bind_with_fallback`
+— must hold that same token first. So the unlink at step 3 executes only inside an
+interval in which:
+
+- no starter can hold the token (we do), therefore no process can have bound the
+  path since we acquired it; and
+- no other cleaner can hold it either (they lose at step 2 and return `false`
+  having touched nothing), so the "several concurrent cleaners performing a
+  delayed unlink" shape the reviewer named is eliminated rather than shrunk — a
+  losing cleaner performs NO deletion at all, at any later time.
+
+A mere order swap would not achieve this: unlink-then-clear still unlinks while
+owning nothing, so a daemon that bound between the liveness read and the unlink
+still loses its socket. The property that closes the window is ownership, not
+order — and the order within the owned interval (socket first, record last) is what
+keeps a mid-heal crash fail-closed.
+
+Crash behavior: a crash between steps 2 and 4 leaves a record naming this
+now-dead process and no socket — precisely the self-healing residue the NEXT heal
+clears through its own liveness gate. It cannot leave a live daemon socketless,
+because a live daemon cannot be the record's subject while we hold the claim.
+
+Windows: the socket layer is cfg-split. On Windows the recorded "socket path" is a
+bare namespaced pipe name (`crates/codegraph-daemon/src/transport.rs:36-38,59-68`),
+not a filesystem entry, and `Rendezvous::cleanup_path` exists only under
+`#[cfg(unix)]` (`transport.rs:70-73`), so step 3's `remove_file` simply fails and
+is ignored there (a named pipe disappears with its owning process). Steps 1, 2 and
+4 act on the real pid file, which is what carries the exclusion on Windows. **This
+is by code inspection only — no native Windows/MSVC run was performed; the gates
+below all ran on Linux.**
+
+Callers: `clear_stale_daemon_socket` has exactly one production caller
+(`heal_stale_daemon_if_dead`, `main.rs:2785`) and its signature and `bool` contract
+are unchanged, so no call site needed adjusting. `git grep` confirmed the full set:
+that one caller, the `codegraph-daemon` unit tests, and
+`crates/codegraph-daemon/tests/stale_socket.rs`. The four pre-existing
+`stale_socket.rs` integration tests (incl. `..._preserves_live_pid_lock` and
+`..._removes_recorded_fallback_socket`) pass unchanged.
+
+### Red — the interleaving, failing on the pre-fix order
+
+`cargo test --locked -q -p codegraph-daemon --lib` with the ORIGINAL
+`clear_stale_daemon_lock`-then-`remove_file` body restored (checkpoints emitted so
+the new tests can run at all), exit **101**, 3 failed / 101 passed:
+
+```
+---- lock::tests::a_replacement_start_during_the_stale_heal_keeps_its_own_socket stdout ----
+thread '...' panicked at crates/codegraph-daemon/src/lock.rs:800:9:
+the LIVE replacement's socket must survive the stale heal
+
+---- lock::tests::the_stale_heal_holds_its_claim_across_the_unlink_and_releases_it_last stdout ----
+thread '...' panicked at crates/codegraph-daemon/src/lock.rs:838:64:
+the heal claim is published
+
+---- lock::tests::an_absent_record_is_claimed_before_its_leftover_socket_is_removed stdout ----
+thread '...' panicked at crates/codegraph-daemon/src/lock.rs:924:9:
+the leftover socket must still be present at the moment the claim is won, proving
+the removal happens UNDER the claim and not before it
+```
+
+`a_replacement_start_during_the_stale_heal_keeps_its_own_socket` is the exact
+interleaving: the cleaner passes its liveness gate, and at the
+`StaleRecordCleared` checkpoint a replacement publishes a record naming a LIVE pid
+(this test process) and writes its own socket bytes at the same path. On the
+pre-fix code the unconditional unlink destroys it. Ordering is by the checkpoint
+callback — the mutation happens inside the call — so there is **no sleep and no
+timing assumption**. `StaleHealCheckpoint` mirrors the `RendezvousCleanupCheckpoint`
+seam `f691415` introduced.
+
+### Green
+
+`cargo test --locked -q -p codegraph-daemon` — exit **0**, `104 passed` (lib) plus
+every integration target green (`6, 4, 3, 4, 5, 1, 1, 2, 5, 0` passed).
+
+### Negative controls — three mutants, each reddening a different assertion
+
+Each was applied to the green tree, run, then reverted; after every revert
+`sha256sum crates/codegraph-daemon/src/lock.rs` printed
+`c8c002ff6ab847c53cd70b43f3fa75ca4e86acd3cb6061b35ce481d51ec0ec19`.
+
+**NC1 — restore the original pid-record-then-socket order (no claim at all).**
+`cargo test --locked -q -p codegraph-daemon --lib`, exit **101**, 3 failed:
+the three assertions quoted under "Red" above (`lock.rs:800`, `838`, `924`).
+Primary reddened test: `a_replacement_start_during_the_stale_heal_keeps_its_own_socket`.
+
+**NC2 — release the claim BEFORE the unlink** (`cleanup_owned_lock` moved above
+`remove_file`, everything else intact). `cargo test --locked -q -p codegraph-daemon
+--lib`, exit **101**, 1 failed:
+
+```
+---- lock::tests::the_stale_heal_holds_its_claim_across_the_unlink_and_releases_it_last stdout ----
+thread '...' panicked at crates/codegraph-daemon/src/lock.rs:876:17:
+the heal claim must STILL be published while the socket is unlinked
+```
+
+A DIFFERENT test from NC1's primary, and it pins the load-bearing half of the fix:
+the claim must span the unlink, not merely precede it.
+
+**NC3 — let an ABSENT record short-circuit the claim** (absent record ⇒ unlink
+immediately and return `true`, the widest form of the original defect).
+`cargo test --locked -q -p codegraph-daemon --lib`, exit **101**, 1 failed:
+
+```
+---- lock::tests::an_absent_record_is_claimed_before_its_leftover_socket_is_removed stdout ----
+thread '...' panicked at crates/codegraph-daemon/src/lock.rs:957:9:
+the leftover socket must still be present at the moment the claim is won, proving
+the removal happens UNDER the claim and not before it
+```
+
+A third distinct test. This is the deliberate decision on the absent-record case:
+an absent record IS treated as an unowned namespace whose leftover socket may be
+removed — `clear_stale_daemon_lock` already reports it cleared — but the removal is
+gated on WINNING the claim exactly as for a dead-owner record. Refusing to heal an
+absent record would strand orphaned sockets that nothing else removes (nothing
+records them), while unlinking without the claim is the widest interleaving of all:
+an absent record names no pid that could be proven dead, so a daemon starting
+concurrently could bind the path between the two syscalls. Claiming first makes the
+two cases one code path with one safety argument.
+
+### Gates and their REAL exit status
+
+Every command below was run separately, never joined with `&&`.
+
+| Command                                                               | Exit | Result                                                                         |
+| --------------------------------------------------------------------- | ---- | ------------------------------------------------------------------------------ |
+| `bash scripts/check-workspace-versions.sh` (before every Cargo batch) | 0    | workspace / `version.txt` / manifest all `0.40.4`                              |
+| `cargo test --locked -q -p codegraph-daemon --lib` (NC1 mutant)       | 101  | 3 failed — the Red interleaving                                                |
+| `cargo test --locked -q -p codegraph-daemon` (green)                  | 0    | 104 lib + all integration targets passed                                       |
+| `cargo test --locked -q -p codegraph-daemon --lib` (NC2 mutant)       | 101  | 1 failed — claim released before the unlink                                    |
+| `cargo test --locked -q -p codegraph-daemon --lib` (NC3 mutant)       | 101  | 1 failed — absent record short-circuited the claim                             |
+| `cargo test --locked -p codegraph-bench --test equivalence`           | 0    | **28 passed** — golden oracle unchanged                                        |
+| `lsp_diagnostics` on `crates/codegraph-daemon/src/lock.rs`            | n/a  | REFUSED: `LSP file path must be inside request cwd`; fell back to locked Cargo |
+| `make fmt`                                                            | 0    | oxfmt, run AFTER this prose and BEFORE CI                                      |
+| `make ci CARGO='cargo --locked'` run 1                                | 0    | recorded below                                                                 |
+| `make ci CARGO='cargo --locked'` run 2                                | 0    | recorded below                                                                 |
+| `make ci CARGO='cargo --locked'` run 3                                | 0    | recorded below                                                                 |
+
+**Golden byte-stability.** `git diff --stat 4f910f2..HEAD -- reference/golden/` is
+EMPTY. The equivalence oracle left untracked
+`reference/golden/{cpp,nix,terraform}/colby.db-{wal,shm}`; they are not gitignored
+and were removed before staging. `Cargo.lock` SHA-256 unchanged at
+`750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1`.
+
+Two files changed: `crates/codegraph-daemon/src/lock.rs` and this ledger. No
+`reference/golden/`, `Cargo.toml`, `Cargo.lock`, `.github/workflows/` or `scripts/`
+change. Test parallelism untouched — `--test-threads` was never passed, and no test
+was skipped, `#[ignore]`d, weakened, or given a sleep.
