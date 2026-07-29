@@ -9559,3 +9559,89 @@ MSVC toolchain exists on this host. Confirmation comes from the `Windows` GitHub
 Actions job and from the CodeBuild `codegraph-rs-windows` project, which runs
 `cargo test --workspace` without stopping at the first failing crate and so
 reports the full remaining picture in one pass.
+
+### CodeBuild verification on a REAL Windows host — the fix is CONFIRMED
+
+Windows cannot be compiled on this host (`cargo xwin` fails on a missing
+`clang-cl`; no package manager; uid 1000), so the fix was validated on AWS
+CodeBuild (`us-east-2`, project `codegraph-rs-windows`), which runs
+`cargo test --workspace` and — unlike the GitHub `Windows` job's early exit —
+yields the COMPLETE remaining failure list in one pass.
+
+| Step                                                                  | Exit / Result                                                    |
+| --------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| `GIT_MASTER=1 git push cc feat/upstream-v1.5-portable-fixes`          | **0** — `5845f11..47ee705`, pre-push hook `✅ all checks passed` |
+| `aws codepipeline start-pipeline-execution --name codegraph-rust-ci`  | **0** — execution `f55f1270-9e07-43a6-a62f-df1666b1e009`         |
+| CodeBuild `codegraph-rs-windows:97aa74b8-d9b6-4759-aa9b-bd55f1311f13` | `FAILED` — but NOT on this fix; see below                        |
+
+The target under diagnosis PASSED:
+
+```
+Running tests\lease_lifetime.rs (target\debug\deps\lease_lifetime-7b5c80ba6d9b7683.exe)
+running 4 tests
+test lease_lifetime_child_process ... ok
+test writer_blocks_new_reads_without_sqlite_open ... ok
+test sqlite_snapshot_rejects_non_regular_artifact ... ok
+test reader_lease_spans_stamp_check_through_last_row ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.99s
+```
+
+2.99s for the whole binary, and 4s of wall clock between the target starting and
+finishing — against a 10s `WAIT`. That is the measured refutation of the
+"deadline too short" hypothesis: with the unbounded join removed, the Windows
+round trip fits inside the EXISTING deadline with room to spare. `WAIT` remains
+10s, untouched.
+
+This run also finally executed the whole workspace on Windows: **96 test targets
+ran, 105 `test result: ok`**, versus the GitHub job's early exit after the first
+failing crate. Everything the previous seven rounds could only hypothesize about
+is now measured.
+
+### The NINTH failure this unblocked (out of scope here, recorded for the next round)
+
+With the proxy no longer hanging, `cargo test --workspace` reached
+`-p codegraph-store --lib` and surfaced a NEW, unrelated Windows-only failure:
+
+```
+test connection::tests::current_writer_revalidates_lock_at_the_last_pre_open_checkpoint ... FAILED
+panicked at crates\codegraph-store\src\connection.rs:1218:25:
+snapshot read …\.codegraph-v2\displaced-at-write-open.lock:
+  The process cannot access the file because another process has locked a portion of the file. (os error 33)
+test result: FAILED. 93 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.07s
+```
+
+Mechanism, from the code: the test renames the STILL-LEASED permanent lock to
+`displaced-at-write-open.lock` (`connection.rs:1505`) and then snapshots the
+whole tree; `snapshot_tree`'s walk does `std::fs::read` on every regular file
+(`connection.rs:1217-1219`). The lease holds that file via
+`file.try_lock()` (`index_lease.rs:383`), which is `flock` on unix — ADVISORY,
+so a concurrent `read` succeeds — but `LockFileEx` on Windows, which is
+MANDATORY over a byte range, so the same `read` fails with
+`ERROR_LOCK_VIOLATION` (os error 33). The failure is in the test's snapshot
+oracle, not in the lease revalidation it is asserting (that assertion is never
+reached). This is a distinct root cause and is NOT addressed by this commit.
+
+### Round 7 — gate statuses, as the shell actually reported them
+
+Prose written FIRST, then `make fmt`, then the gates, so `fmt-check` sees the
+formatted ledger. Each command run separately, never joined with `&&`.
+
+| Command                                                     | Exit  | Result                                                                         |
+| ----------------------------------------------------------- | ----- | ------------------------------------------------------------------------------ |
+| `cargo build --locked -p codegraph-daemon`                  | **0** | clean                                                                          |
+| `cargo clippy --locked -p codegraph-daemon --all-targets`   | **0** | zero warnings                                                                  |
+| `cargo test --locked -p codegraph-daemon --lib`             | **0** | **109 passed, 0 failed** — incl. 4 new `reply_ledger_*` tests                  |
+| `cargo test --locked -p codegraph-rs --test lease_lifetime` | **0** | **5 passed, 0 failed** on Linux                                                |
+| `make fmt`                                                  | **0** | run after this prose, before the gates                                         |
+| `cargo fmt --all --check`                                   | **0** | clean                                                                          |
+| `make ci CARGO='cargo --locked'` run 1                      | **0** | `✅ All CI checks passed!` — 125 `test result: ok`, zero `FAILED`              |
+| `make ci CARGO='cargo --locked'` run 2                      | **0** | `✅ All CI checks passed!` — 125 `test result: ok`, zero `FAILED`              |
+| `bash scripts/check-workspace-versions.sh`                  | **0** | workspace / `version.txt` / manifest all `0.40.4`                              |
+| `bash scripts/check-ci-gate.sh`                             | **0** | 16 truth-table cases; required = audit, test, windows                          |
+| `git diff --stat a0315da..HEAD -- reference/golden/`        | **0** | EMPTY — no golden byte changed                                                 |
+| `sha256sum Cargo.lock`                                      | **0** | `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1` — unchanged |
+
+`git status --short` was clean before the work started (no foreign edits from
+another session) and after each CI run showed only the intended files, with no
+untracked `reference/golden/*/colby.db-{wal,shm}` sidecars. **Windows was NOT
+validated locally** — only the CodeBuild run above can and does confirm it.
