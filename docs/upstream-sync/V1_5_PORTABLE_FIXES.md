@@ -9501,3 +9501,61 @@ Only two Windows-visible files touch the rendezvous at all, and only
 `daemon_socket_path` purely as a value inside a `DaemonLockInfo` it writes to
 disk, so it carries no transport assumption. Nothing else needed changing, and
 nothing was changed speculatively.
+
+### Regression proof — four new unit tests, all platform-independent
+
+The defect is a Windows-only SYMPTOM of a platform-independent teardown
+condition, so the ledger that replaces it is testable on Linux. All four tests
+live in `crates/codegraph-daemon/src/proxy.rs`'s existing `#[cfg(test)] mod tests`
+and exercise `ReplyLedger` directly — no socket, no daemon, no timing luck.
+
+| test                                                                 | what it pins down                                                                                                                                                                                                                                             |
+| -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `reply_ledger_settles_on_the_last_delivered_reply_not_on_peer_close` | Two owed ids keep the ledger unsettled; a thread parked on a 10s budget is woken by the retirement of the last one and asserts `elapsed < 5s` — proving the wake is the RETIREMENT, not the budget expiring, which is exactly the substitution the fix makes. |
+| `reply_ledger_abandon_settles_an_unanswerable_wait`                  | A daemon stream that ends still owing id 4 can never answer it; `abandon()` settles a 10s wait in `< 500ms`.                                                                                                                                                  |
+| `reply_ledger_ignores_an_unrecorded_retirement`                      | Retiring an id that was never recorded (a daemon reply to something the proxy did not forward, e.g. the primed `initialize`) neither underflows the ledger nor falsely settles a wait that still owes id 1.                                                   |
+| `reply_ledger_reports_an_unsettled_budget_expiry`                    | A genuinely stalled daemon still yields `false` at the budget and takes at least the budget to do so — teardown is BOUNDED, and the caller sees `Err`, never a false `Proxied`.                                                                               |
+
+Three pre-existing pump tests were extended rather than replaced, so the ledger
+is also covered through its real call sites:
+`pump_host_to_daemon_answers_initialize_and_tools_list_locally` now asserts that
+ONLY the forwarded `tools/call` (id 3) is owed — the locally answered
+`initialize` (id 1) and `tools/list` (id 2) are deliberately not recorded, since
+recording either would leave the ledger permanently unsettled — and
+`pump_daemon_to_host_suppresses_the_recorded_initialize_reply` now asserts the
+ledger settles once the owed reply has been written to the host.
+
+The Windows path itself remains UNVERIFIED LOCALLY: no MSVC toolchain exists on
+this host (`cargo xwin` fails on a missing `clang-cl`, there is no package
+manager, and uid is 1000), so only the `Windows` CI job and the CodeBuild
+`codegraph-rs-windows` project can confirm that `run_proxy` now returns there.
+What IS proven locally is the mechanism the fix depends on, and that Linux
+behaviour is unchanged.
+
+### Round 7 — final gate statuses
+
+Prose written FIRST, then `make fmt`, then the gates, so `fmt-check` sees the
+formatted ledger. Each command run separately, never joined with `&&`; the exit
+status below is the one the shell actually reported.
+
+| Command                                                     | Exit  | Result                                                                           |
+| ----------------------------------------------------------- | ----- | -------------------------------------------------------------------------------- |
+| `make fmt`                                                  | **0** | run after this prose, before the gates                                           |
+| `bash scripts/check-workspace-versions.sh`                  | **0** | workspace / `version.txt` / manifest all `0.40.4`; 10 packages                   |
+| `bash scripts/check-ci-gate.sh`                             | **0** | 16 truth-table cases; required = audit, test, windows; coverage excluded         |
+| `cargo test --locked -p codegraph-daemon`                   | **0** | **140 passed, 0 failed** over 11 targets; all four `reply_ledger_*` tests `ok`   |
+| `cargo test --locked -p codegraph-rs --test lease_lifetime` | **0** | **5 passed, 0 failed** — incl. `reader_lease_spans_stamp_check_through_last_row` |
+| `make ci CARGO='cargo --locked'` run 1                      | **0** | `✅ All CI checks passed!` — 125 `test result: ok`, zero `FAILED`                |
+| `make ci CARGO='cargo --locked'` run 2                      | **0** | `✅ All CI checks passed!` — 125 `test result: ok`, zero `FAILED`                |
+| `git diff --stat a0315da..HEAD -- reference/golden/`        | **0** | EMPTY — no golden byte changed                                                   |
+| `sha256sum Cargo.lock`                                      | **0** | `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1` — unchanged   |
+
+The equivalence oracle left untracked `reference/golden/godot/colby.db-{wal,shm}`
+sidecars after each `make ci`; they are not gitignored and were removed before
+staging, so the working tree carried only the intended files at commit time.
+
+**Windows was NOT validated locally** and this ledger claims no such result — no
+MSVC toolchain exists on this host. Confirmation comes from the `Windows` GitHub
+Actions job and from the CodeBuild `codegraph-rs-windows` project, which runs
+`cargo test --workspace` without stopping at the first failing crate and so
+reports the full remaining picture in one pass.
