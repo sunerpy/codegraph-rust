@@ -15,6 +15,7 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use codegraph_daemon::{
@@ -94,10 +95,28 @@ fn indexed_project(label: &str) -> (TestDir, PathBuf) {
     (dir, project)
 }
 
+/// `std::env` is process-global and BOTH tests in this binary run in parallel,
+/// each setting `CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS` to its own window and then
+/// REMOVING it. `Command` snapshots env inside `spawn_detached_daemon`, so a
+/// sibling's `remove_var` landing between this test's `set_var` and that
+/// snapshot hands the daemon NO idle var — it falls back to the 300 000 ms
+/// default and outlives any per-test deadline. Serialize the whole
+/// set → spawn → restore region so the spawned daemon always inherits the
+/// window its own test chose.
+fn env_guard() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Spawn the detached daemon with a SHORT idle timeout so the test runs fast.
 /// `Command` (inside `spawn_detached_daemon`) snapshots env at spawn time, so
 /// setting it here is inherited by the daemon process.
 fn spawn_idle_daemon(project: &Path, idle_ms: &str) {
+    let _env = env_guard();
+    // SAFETY: the env_guard held for this whole body serializes every
+    // set/remove in this binary against the spawn that snapshots them.
     unsafe { std::env::set_var("CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS", idle_ms) };
     unsafe { std::env::set_var("CODEGRAPH_WATCH_DEBOUNCE_MS", "100") };
     spawn_detached_daemon(&bin(), project, false).expect("spawn_detached_daemon");
