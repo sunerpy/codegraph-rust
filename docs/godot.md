@@ -33,6 +33,24 @@ dropping `addons`:
 ignore_dirs = [".godot", "node_modules", "target", "dist", ".venv"]
 ```
 
+### Exact-name search recall
+
+When your query string equals a symbol's name — compared case-insensitively over
+the whole name, not as a substring — that symbol is returned as the **first**
+result, ahead of any row that would otherwise outscore it on file-path relevance
+or symbol kind. Long, precise GDScript names benefit most: querying
+`apply_status_effect` puts that `func` at the top instead of burying it under
+shorter partial matches from busier files.
+
+Two details worth knowing. The query has to be the name typed as-is; a multi-word
+paraphrase never satisfies the whole-name comparison, since a query containing
+whitespace cannot equal a symbol name that has none. And the rescue only lifts an
+exact match that was tied with or below the best non-exact result — a row already
+ranked first keeps its original score untouched. Ordering is deterministic, so
+repeating the same query returns the same order every time.
+
+This applies to every language CodeGraph indexes, not just Godot.
+
 ### `project.godot` — autoload singletons, input actions, plugins
 
 | Extracted item                   | Graph representation                                                       |
