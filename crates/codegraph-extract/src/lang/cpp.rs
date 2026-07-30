@@ -8,7 +8,7 @@ use tree_sitter::{Language as TsLanguage, Node};
 
 use crate::lang::c::{include_import, normalize_c_return_type};
 use crate::spec::{ImportInfo, LanguageSpec};
-use crate::walker::{child_by_field, node_text};
+use crate::walker::{child_by_field, node_text, strip_cpp_template_args};
 
 pub struct CppSpec;
 
@@ -84,7 +84,18 @@ impl LanguageSpec for CppSpec {
             .filter(|part| !part.is_empty())
             .map(str::to_string)
             .collect::<Vec<_>>();
-        (parts.len() > 1).then(|| parts[..parts.len() - 1].join("::"))
+        if parts.len() <= 1 {
+            return None;
+        }
+        // An out-of-line template method definition spells the class's template
+        // parameter list in the qualifier (`template<typename T> T Box<T>::get()`)
+        // while the class node is indexed as bare `Box` — strip `<…>` so the
+        // receiver matches it, the same normalization #1043 applies to
+        // base-class refs. A multi-line parameter list otherwise leaks whole
+        // `<…>` blocks (newlines included) into `qualified_name`, which can
+        // exceed NAME_MAX (#1309).
+        let receiver = strip_cpp_template_args(&parts[..parts.len() - 1].join("::"));
+        (!receiver.is_empty()).then_some(receiver)
     }
     fn get_return_type(&self, node: Node<'_>, source: &str) -> Option<String> {
         recover_return_type(node, source)
@@ -477,6 +488,91 @@ fn recover_cpp_macro_defined_name(node: Node<'_>, source: &str) -> Option<String
         }
     }
     Some(name)
+}
+
+/// What an explicit-operator `call_expression` should contribute as a `Calls`
+/// ref (#1268).
+pub(crate) enum ExplicitOperatorCall {
+    /// Emit this callee name (`a.operator+`, or the bare `operator+` for
+    /// `this->`).
+    Callee(String),
+    /// A receiver that cannot aid type inference (`w.obj()->operator+`): emit
+    /// NOTHING. A bare operator name would fall through to exact-name matching,
+    /// which guesses among unrelated same-named operators — a silent miss is
+    /// preferable to a wrong edge.
+    Drop,
+}
+
+/// Recover the callee of a C++ explicit operator call (`a.operator+(b)`,
+/// `p->operator+(b)`, `a.operator[](3)`) — upstream #1268.
+///
+/// tree-sitter-cpp cannot parse an `operator_name` in field position, so the
+/// `call_expression` carries `function: <receiver>` plus an ERROR child wrapping
+/// the `operator_name` instead of a `field_expression` callee. Reading the
+/// `function` field alone yields just the receiver (`a`), an unresolvable ref.
+///
+/// `None` means "not this shape" — the caller continues down the normal call
+/// path (which still owns `V::operator+(a, b)` and the `a.operator bool()` word
+/// form, both of which parse without a stranded `operator_name`).
+pub(crate) fn recover_explicit_operator_call(
+    node: Node<'_>,
+    source: &str,
+) -> Option<ExplicitOperatorCall> {
+    let operator_name = node
+        .named_children(&mut node.walk())
+        .filter(|child| child.kind() == "ERROR")
+        .find_map(|error| {
+            error
+                .named_children(&mut error.walk())
+                .find(|c| c.kind() == "operator_name")
+        })
+        .map(|op| compact_operator_name(&node_text(op, source)))?;
+    let func = child_by_field(node, "function").or_else(|| node.named_child(0))?;
+    let receiver: String = node_text(func, source)
+        .replace("->", ".")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    if receiver == "this" {
+        return Some(ExplicitOperatorCall::Callee(operator_name));
+    }
+    if !is_simple_receiver_chain(&receiver) {
+        return Some(ExplicitOperatorCall::Drop);
+    }
+    Some(ExplicitOperatorCall::Callee(format!(
+        "{receiver}.{operator_name}"
+    )))
+}
+
+/// Call sites may space a symbolic operator name (`it.operator * ()`,
+/// `other.operator < (*this)` in nlohmann/json) while the definition indexes
+/// compact (`operator*`). Squeeze the whitespace out of the SYMBOLIC forms only
+/// — the word forms (`operator new`, `operator bool`) need their space.
+fn compact_operator_name(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let Some(symbol) = trimmed.strip_prefix("operator") else {
+        return trimmed.to_string();
+    };
+    let symbol = symbol.trim();
+    let symbolic = symbol
+        .chars()
+        .next()
+        .is_some_and(|c| !c.is_alphanumeric() && c != '_');
+    if !symbolic {
+        return trimmed.to_string();
+    }
+    let squeezed: String = symbol.chars().filter(|c| !c.is_whitespace()).collect();
+    format!("operator{squeezed}")
+}
+
+/// `^[A-Za-z_][\w.]*$` — an identifier or plain member chain, the only receiver
+/// shapes downstream receiver-type inference can work with.
+fn is_simple_receiver_chain(receiver: &str) -> bool {
+    let mut chars = receiver.chars();
+    chars
+        .next()
+        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c == '.' || c.is_ascii_alphanumeric())
 }
 
 fn declarator_qualified_id<'tree>(declarator: Node<'tree>) -> Option<Node<'tree>> {

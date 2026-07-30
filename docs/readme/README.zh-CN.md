@@ -18,6 +18,7 @@ SQLite 数据库（含 FTS5 检索索引），并通过 CLI 与 MCP stdio 服务
 ## 目录
 
 - [快速上手](#快速上手)
+- [从 v0.40.4 升级](#从-v0404-升级)
 - [安装](#安装)
 - [MCP 快速注册](#mcp-快速注册)
 - [安装 Agent 技能](#安装-agent-技能codegraph-skill)
@@ -51,10 +52,31 @@ irm https://raw.githubusercontent.com/sunerpy/codegraph-rust/main/scripts/instal
 **索引项目并查询：**
 
 ```bash
-codegraph init  /path/to/project                   # 创建 .codegraph/ 并执行首次索引
+codegraph init  /path/to/project                   # 创建 .codegraph-v2/ 并执行首次索引
 codegraph query "<symbol>" -p /path/to/project     # 全文检索
 codegraph serve --mcp --path /path/to/project      # 为 AI 代理启动 MCP 服务器（--path 可选，默认 cwd）
 ```
+
+---
+
+## 从 v0.40.4 升级
+
+按项目的索引目录已从 `<project>/.codegraph/` 迁至隔离的 `<project>/.codegraph-v2/`。
+`v0.40.4` 留下的旧索引**既不迁移也不读取**：本版本二进制永不打开、迁移或写入旧根目录，
+已存在的 `.codegraph/` 会被直接忽略。由此有两点影响：
+
+- **每个项目需重新执行 `codegraph init`。** 在此之前该项目视为未索引：
+  `serve --mcp` 回退到直连模式且无索引可服务，查询类命令报
+  `CodeGraph not initialized`。
+- **旧配置不会自动继承。** `.codegraph/config.toml` 与 `.codegraph/codegraph.json`
+  均被忽略；若仍需沿用，请手动复制为 `.codegraph-v2/config.toml` 与
+  `.codegraph-v2/codegraph.json`。
+
+daemon 会合文件（`daemon.pid`、`daemon.sock`、`daemon.log`）随索引一同迁移，
+现在也位于 `.codegraph-v2/` 之下。
+
+`codegraph status` 会同时报告两个根目录：`indexPath` 为当前索引根，
+`legacyIndexPaths` 列出磁盘上仍存在的旧根。旧目录不会被改动，确认不再需要后可手动删除。
 
 ---
 
@@ -84,7 +106,7 @@ irm https://raw.githubusercontent.com/sunerpy/codegraph-rust/main/scripts/instal
 # 回退方案 —— 从源码构建（仅当你已有 Rust 工具链时）
 cargo install --git https://github.com/sunerpy/codegraph-rust codegraph-rs   # 二进制：`codegraph`
 
-codegraph init  /path/to/project     # 建立索引库（.codegraph/）
+codegraph init  /path/to/project     # 建立索引库（.codegraph-v2/）
 codegraph index /path/to/project     # 解析 + 构建图
 ```
 
@@ -200,7 +222,7 @@ codegraph install --target=auto --local          # 项目级配置
 除了写入 MCP 服务器配置，CodeGraph 还可以把一个 `SKILL.md` 直接安装到每个代理的
 技能目录中。该技能教会代理如何将 CodeGraph 用于代码研究与项目初始化：在 grep/read
 之前优先调用 `codegraph_explore`，对已索引的源码用 `codegraph_node` 代替直接读文件，
-以及在尚未建立 `.codegraph/` 索引时自动运行 `codegraph init`。
+以及在尚未建立 `.codegraph-v2/` 索引时自动运行 `codegraph init`。
 
 ```bash
 codegraph skill install --yes                         # 安装到所有已检测到的代理（全局）
@@ -356,7 +378,7 @@ python examples/llm_orchestration.py --repo . --query "how does indexing work"
 
 在已索引的项目中运行 `codegraph serve --mcp` 时，CodeGraph 会自动在后台启动一个
 **共享的、脱离终端的守护进程**。同一项目的多个 MCP 客户端通过 Unix socket
-（`.codegraph/daemon.sock`）共用该 daemon，所有客户端断开且空闲超时后自动退出。
+（`.codegraph-v2/daemon.sock`）共用该 daemon，所有客户端断开且空闲超时后自动退出。
 
 常用操作：
 
@@ -381,7 +403,7 @@ codegraph serve --http --detach  # 后台运行
 codegraph http list / stop       # 管理运行中的 HTTP 服务
 ```
 
-自定义扩展名映射写在 `.codegraph/codegraph.json`；可选的 Claude prompt hook
+自定义扩展名映射写在 `.codegraph-v2/codegraph.json`；可选的 Claude prompt hook
 通过 `codegraph install --prompt-hook` 启用。
 
 完整参考——守护进程生命周期、所有环境变量、HTTP 注册表、扩展名映射、Claude hook：

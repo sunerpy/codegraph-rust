@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE sqlMap PUBLIC "-//iBATIS.com//DTD SQL Map 2.0//EN" "http://ibatis.apache.org/dtd/sql-map-2.dtd">
+<sqlMap namespace="Legacy.AccountMap">
+  <sql id="legacyColumns">
+    account_id, balance
+  </sql>
+  <select id="legacySelect" parameterType="int" resultType="Account">
+    SELECT <include refid="legacyColumns"/> FROM accounts WHERE account_id = #{id}
+  </select>
+  <update id="legacyUpdate">
+    UPDATE accounts SET balance = #{balance} WHERE account_id = #{id}
+  </update>
+</sqlMap>

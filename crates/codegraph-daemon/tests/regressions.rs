@@ -24,6 +24,10 @@ use codegraph_daemon::{
     try_acquire_daemon_lock,
 };
 
+fn pid_path_of(project: &Path) -> PathBuf {
+    daemon_pid_path(project).expect("resolve the v2 rendezvous pid path")
+}
+
 // A pid that is not a live process on any sane Unix host; used to forge a
 // "stale" lock whose owner is provably dead.
 const DEAD_PID: u32 = 999_999_999;
@@ -91,7 +95,7 @@ fn concurrent_acquire_has_exactly_one_process_winner() {
 
     // The published pidfile is a full, valid lock record -- never the empty
     // create_new placeholder a torn write-then-publish would leave behind.
-    let pid_path = daemon_pid_path(&project);
+    let pid_path = pid_path_of(&project);
     let raw = fs::read_to_string(&pid_path).expect("winner published a pidfile");
     assert!(
         !raw.trim().is_empty(),
@@ -125,7 +129,7 @@ fn stop_flag_terminates_accept_loop_and_clears_pidfile() {
         StartOrAttach::Attached(_) => panic!("first start unexpectedly attached"),
     };
     assert!(
-        daemon_pid_path(&project).exists(),
+        pid_path_of(&project).exists(),
         "a started daemon must publish its pidfile"
     );
     assert!(
@@ -142,7 +146,7 @@ fn stop_flag_terminates_accept_loop_and_clears_pidfile() {
         "accept loop must stop within {SHUTDOWN_CEILING:?}, took {elapsed:?}"
     );
     assert!(
-        !daemon_pid_path(&project).exists(),
+        !pid_path_of(&project).exists(),
         "stopping the daemon must clean up its pidfile"
     );
     let _ = fs::remove_dir_all(project);
@@ -153,7 +157,7 @@ fn stop_flag_terminates_accept_loop_and_clears_pidfile() {
 #[test]
 fn dead_pid_lock_is_recovered_by_start_or_attach() {
     let project = temp_project("stale-dead-pid");
-    let pid_path = daemon_pid_path(&project);
+    let pid_path = pid_path_of(&project);
     write_lock(&pid_path, DEAD_PID);
 
     let handle = match start_or_attach(&project, test_options()).expect("recovers stale lock") {
@@ -177,7 +181,7 @@ fn dead_pid_lock_is_recovered_by_start_or_attach() {
 #[test]
 fn clear_stale_daemon_lock_removes_dead_pid_lock() {
     let project = temp_project("clear-dead-pid");
-    let pid_path = daemon_pid_path(&project);
+    let pid_path = pid_path_of(&project);
     write_lock(&pid_path, DEAD_PID);
 
     assert!(
@@ -195,7 +199,7 @@ fn clear_stale_daemon_lock_removes_dead_pid_lock() {
 #[test]
 fn empty_pidfile_is_not_deleted_by_reader() {
     let project = temp_project("empty-pidfile");
-    let pid_path = daemon_pid_path(&project);
+    let pid_path = pid_path_of(&project);
 
     // Durable 0-byte placeholder: `fs::write` can return before the directory
     // entry is flushed, so under load the guard's 20ms-later re-read
@@ -320,6 +324,11 @@ fn temp_project(name: &str) -> PathBuf {
         "codegraph-daemon-reg-{name}-{}-{nanos}-{seq}",
         std::process::id()
     ));
-    fs::create_dir_all(path.join(".codegraph")).expect("create project");
+    fs::create_dir_all(&path).expect("create project");
+    let path = path.canonicalize().expect("canonicalize project");
+    // Tests here write the pid record directly, so materialize the v2 rendezvous
+    // dir the daemon's lock layer would otherwise create.
+    fs::create_dir_all(pid_path_of(&path).parent().expect("rendezvous dir"))
+        .expect("create the v2 rendezvous dir");
     path
 }

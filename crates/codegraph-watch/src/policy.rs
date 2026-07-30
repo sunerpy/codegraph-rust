@@ -1,7 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use codegraph_extract::detect_language;
+use codegraph_extract::{ExtensionOverrides, detect_language_with};
 
 pub const CODEGRAPH_NO_WATCH: &str = "CODEGRAPH_NO_WATCH";
 
@@ -85,6 +86,10 @@ pub struct WatchPolicy {
     builtin_rule_count: usize,
     include: Vec<String>,
     exclude: Vec<String>,
+    /// The addressed project's custom extension→language overrides, so a file the
+    /// project declared as source is HANDLED by the watcher exactly as the scan
+    /// indexes it. Empty by default (built-in detection only).
+    extensions: Arc<ExtensionOverrides>,
 }
 
 impl WatchPolicy {
@@ -136,7 +141,18 @@ impl WatchPolicy {
             builtin_rule_count,
             include: include.to_vec(),
             exclude: exclude.to_vec(),
+            extensions: ExtensionOverrides::empty(),
         }
+    }
+
+    /// Adopt the addressed project's extension overrides, so
+    /// [`should_handle_file`](Self::should_handle_file) treats a project-declared
+    /// custom extension as source. Without this the policy uses built-in
+    /// detection only, which is the zero-config behavior.
+    #[must_use]
+    pub fn with_extension_overrides(mut self, extensions: Arc<ExtensionOverrides>) -> Self {
+        self.extensions = extensions;
+        self
     }
 
     pub fn normalize_relative(&self, path: impl AsRef<Path>) -> Option<String> {
@@ -156,7 +172,8 @@ impl WatchPolicy {
     pub fn should_handle_file(&self, relative: &str) -> bool {
         !self.is_always_ignored(relative)
             && !self.is_ignored(relative, false)
-            && detect_language(relative) != codegraph_core::types::Language::Unknown
+            && detect_language_with(relative, &self.extensions)
+                != codegraph_core::types::Language::Unknown
     }
 
     pub fn allows_file_path(&self, relative: &str) -> bool {
@@ -468,51 +485,15 @@ fn is_windows_drive_mount(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct EnvGuard {
-        home: Option<std::ffi::OsString>,
-        force: Option<std::ffi::OsString>,
-        no_watch: Option<std::ffi::OsString>,
-    }
-
-    impl EnvGuard {
-        fn capture() -> Self {
-            Self {
-                home: std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }),
-                force: std::env::var_os("CODEGRAPH_FORCE_WATCH"),
-                no_watch: std::env::var_os(CODEGRAPH_NO_WATCH),
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-            restore(home_key, self.home.take());
-            restore("CODEGRAPH_FORCE_WATCH", self.force.take());
-            restore(CODEGRAPH_NO_WATCH, self.no_watch.take());
-        }
-    }
-
-    fn restore(key: &str, value: Option<std::ffi::OsString>) {
-        match value {
-            Some(v) => unsafe { std::env::set_var(key, v) },
-            None => unsafe { std::env::remove_var(key) },
-        }
-    }
+    use crate::test_env::{EnvGuard, env_guard};
 
     #[test]
     fn watch_disabled_when_root_is_home() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let _guard = EnvGuard::capture();
+        let mut env = env_guard();
         let home = crate::sync::tests::TestDir::new("watch-policy-home");
-        let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-        unsafe { std::env::set_var(home_key, home.path()) };
-        unsafe { std::env::remove_var("CODEGRAPH_FORCE_WATCH") };
-        unsafe { std::env::remove_var(CODEGRAPH_NO_WATCH) };
+        env.set(EnvGuard::home_key(), home.path());
+        env.remove("CODEGRAPH_FORCE_WATCH");
+        env.remove(CODEGRAPH_NO_WATCH);
 
         let reason = watch_disabled_reason(home.path(), false);
         assert!(reason.is_some(), "watching HOME must be disabled");
@@ -521,13 +502,11 @@ mod tests {
 
     #[test]
     fn watch_disabled_for_home_even_with_force_watch() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let _guard = EnvGuard::capture();
+        let mut env = env_guard();
         let home = crate::sync::tests::TestDir::new("watch-policy-home-force");
-        let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-        unsafe { std::env::set_var(home_key, home.path()) };
-        unsafe { std::env::set_var("CODEGRAPH_FORCE_WATCH", "1") };
-        unsafe { std::env::remove_var(CODEGRAPH_NO_WATCH) };
+        env.set(EnvGuard::home_key(), home.path());
+        env.set("CODEGRAPH_FORCE_WATCH", "1");
+        env.remove(CODEGRAPH_NO_WATCH);
 
         assert!(
             watch_disabled_reason(home.path(), false).is_some(),
@@ -537,10 +516,9 @@ mod tests {
 
     #[test]
     fn watch_disabled_when_root_is_filesystem_root() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let _guard = EnvGuard::capture();
-        unsafe { std::env::remove_var("CODEGRAPH_FORCE_WATCH") };
-        unsafe { std::env::remove_var(CODEGRAPH_NO_WATCH) };
+        let mut env = env_guard();
+        env.remove("CODEGRAPH_FORCE_WATCH");
+        env.remove(CODEGRAPH_NO_WATCH);
 
         let reason = watch_disabled_reason(Path::new("/"), false);
         assert!(reason.is_some(), "watching `/` must be disabled");
@@ -549,13 +527,11 @@ mod tests {
 
     #[test]
     fn watch_allowed_for_normal_project_subdir() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let _guard = EnvGuard::capture();
+        let mut env = env_guard();
         let home = crate::sync::tests::TestDir::new("watch-policy-subdir-home");
-        let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-        unsafe { std::env::set_var(home_key, home.path()) };
-        unsafe { std::env::remove_var("CODEGRAPH_FORCE_WATCH") };
-        unsafe { std::env::remove_var(CODEGRAPH_NO_WATCH) };
+        env.set(EnvGuard::home_key(), home.path());
+        env.remove("CODEGRAPH_FORCE_WATCH");
+        env.remove(CODEGRAPH_NO_WATCH);
 
         let project = home.path().join("workspace/proj");
         fs::create_dir_all(&project).unwrap();
@@ -608,11 +584,9 @@ mod tests {
 
     #[test]
     fn too_broad_reason_flags_home_and_filesystem_root_but_not_nested_project() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let _guard = EnvGuard::capture();
+        let mut env = env_guard();
         let home = crate::sync::tests::TestDir::new("too-broad-home");
-        let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-        unsafe { std::env::set_var(home_key, home.path()) };
+        env.set(EnvGuard::home_key(), home.path());
 
         assert!(
             too_broad_root_reason(home.path()).is_some(),
@@ -633,11 +607,9 @@ mod tests {
 
     #[test]
     fn too_broad_reason_normalizes_trailing_dot_to_home() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let _guard = EnvGuard::capture();
+        let mut env = env_guard();
         let home = crate::sync::tests::TestDir::new("too-broad-home-dot");
-        let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-        unsafe { std::env::set_var(home_key, home.path()) };
+        env.set(EnvGuard::home_key(), home.path());
 
         let with_dot = home.path().join(".");
         assert!(
@@ -648,13 +620,11 @@ mod tests {
 
     #[test]
     fn watch_disabled_when_root_is_home_with_trailing_dot() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let _guard = EnvGuard::capture();
+        let mut env = env_guard();
         let home = crate::sync::tests::TestDir::new("watch-policy-home-dot");
-        let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-        unsafe { std::env::set_var(home_key, home.path()) };
-        unsafe { std::env::remove_var("CODEGRAPH_FORCE_WATCH") };
-        unsafe { std::env::remove_var(CODEGRAPH_NO_WATCH) };
+        env.set(EnvGuard::home_key(), home.path());
+        env.remove("CODEGRAPH_FORCE_WATCH");
+        env.remove(CODEGRAPH_NO_WATCH);
 
         let with_dot = home.path().join(".");
         assert!(
@@ -665,10 +635,9 @@ mod tests {
 
     #[test]
     fn watch_disabled_when_no_watch_flag_is_set() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let _guard = EnvGuard::capture();
+        let mut env = env_guard();
         let project = crate::sync::tests::TestDir::new("watch-policy-flag");
-        unsafe { std::env::remove_var(CODEGRAPH_NO_WATCH) };
+        env.remove(CODEGRAPH_NO_WATCH);
 
         // The explicit `no_watch` parameter wins even for a normal project dir.
         let reason = watch_disabled_reason(project.path(), true);
@@ -677,10 +646,9 @@ mod tests {
 
     #[test]
     fn watch_disabled_when_no_watch_env_is_set() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let _guard = EnvGuard::capture();
+        let mut env = env_guard();
         let project = crate::sync::tests::TestDir::new("watch-policy-env");
-        unsafe { std::env::set_var(CODEGRAPH_NO_WATCH, "1") };
+        env.set(CODEGRAPH_NO_WATCH, "1");
 
         let reason = watch_disabled_reason(project.path(), false);
         assert_eq!(reason.as_deref(), Some("CODEGRAPH_NO_WATCH=1 is set"));
@@ -826,13 +794,11 @@ mod tests {
 
     #[test]
     fn force_watch_re_enables_a_wsl_drive_mount_path() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let _guard = EnvGuard::capture();
+        let mut env = env_guard();
         let project = crate::sync::tests::TestDir::new("watch-policy-force");
-        let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-        unsafe { std::env::set_var(home_key, project.path()) };
-        unsafe { std::env::remove_var(CODEGRAPH_NO_WATCH) };
-        unsafe { std::env::set_var("CODEGRAPH_FORCE_WATCH", "1") };
+        env.set(EnvGuard::home_key(), project.path());
+        env.remove(CODEGRAPH_NO_WATCH);
+        env.set("CODEGRAPH_FORCE_WATCH", "1");
 
         // A normal (non-home, non-root) project with FORCE_WATCH set returns
         // None — the force escape short-circuits the WSL/mount check below it.

@@ -100,6 +100,18 @@ pub struct PathStep {
     pub edge: Option<Edge>,
 }
 
+/// Queue accounting for one [`GraphTraverser::find_path_instrumented`] BFS
+/// (#1359). `enqueued` counts pushes, so a work item enqueued more than once is
+/// directly observable from a test; `duplicate_dequeues` counts items that were
+/// already `visited` when popped, i.e. wasted pushes that survived to the front
+/// of the queue.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct PathSearchStats {
+    pub enqueued: usize,
+    pub dequeued: usize,
+    pub duplicate_dequeues: usize,
+}
+
 /// Sentinel-prefix that L3's `godot_script` resolver stamps onto the
 /// `reference_name` of a computed (statically-unconfirmable) Godot call-site.
 /// Mirrors `codegraph_resolve::frameworks::godot_script::DYNAMIC_PREFIX`;
@@ -775,14 +787,37 @@ impl<'store> GraphTraverser<'store> {
         to_id: &str,
         edge_kinds: &[EdgeKind],
     ) -> rusqlite::Result<Option<Vec<PathStep>>> {
+        Ok(self.find_path_instrumented(from_id, to_id, edge_kinds)?.0)
+    }
+
+    /// [`GraphTraverser::find_path`] plus the [`PathSearchStats`] its BFS
+    /// accumulated (#1359).
+    ///
+    /// Enqueue counts are not observable from the returned path, so the
+    /// enqueue-once guard cannot be regression-tested through `find_path`
+    /// alone; this is the seam that makes it assertable instead of a log line
+    /// someone has to read.
+    pub fn find_path_instrumented(
+        &self,
+        from_id: &str,
+        to_id: &str,
+        edge_kinds: &[EdgeKind],
+    ) -> rusqlite::Result<(Option<Vec<PathStep>>, PathSearchStats)> {
+        let mut stats = PathSearchStats::default();
         let Some(from_node) = self.store.node_by_id(from_id)? else {
-            return Ok(None);
+            return Ok((None, stats));
         };
         if self.store.node_by_id(to_id)?.is_none() {
-            return Ok(None);
+            return Ok((None, stats));
         }
 
         let mut visited = HashSet::new();
+        // #1359: `visited` is set at DEQUEUE, so it cannot stop a fan-in layer
+        // from pushing the same target once per predecessor — up to k² entries
+        // (each carrying a cloned path) for a k-wide layer into k shared
+        // targets. `enqueued` is the separate enqueue-once guard, mirroring
+        // `traverse_bfs`'s #1090 fix, and is seeded with the start node.
+        let mut enqueued: HashSet<String> = HashSet::from([from_id.to_string()]);
         let mut queue: VecDeque<(String, Vec<PathStep>)> = VecDeque::new();
         queue.push_back((
             from_id.to_string(),
@@ -791,12 +826,15 @@ impl<'store> GraphTraverser<'store> {
                 edge: None,
             }],
         ));
+        stats.enqueued += 1;
 
         while let Some((node_id, path)) = queue.pop_front() {
+            stats.dequeued += 1;
             if node_id == to_id {
-                return Ok(Some(path));
+                return Ok((Some(path), stats));
             }
             if visited.contains(&node_id) {
+                stats.duplicate_dequeues += 1;
                 continue;
             }
             visited.insert(node_id.clone());
@@ -808,12 +846,13 @@ impl<'store> GraphTraverser<'store> {
             let want_ids: Vec<String> = outgoing
                 .iter()
                 .map(|e| e.target.clone())
-                .filter(|id| !visited.contains(id))
+                .filter(|id| !visited.contains(id) && !enqueued.contains(id))
                 .collect();
             let next_nodes = self.store.nodes_by_ids(&want_ids)?;
 
             for edge in outgoing {
                 if !visited.contains(&edge.target)
+                    && !enqueued.contains(&edge.target)
                     && let Some(next_node) = next_nodes.get(&edge.target)
                 {
                     let mut next_path = path.clone();
@@ -821,12 +860,14 @@ impl<'store> GraphTraverser<'store> {
                         node: next_node.clone(),
                         edge: Some(edge.clone()),
                     });
+                    enqueued.insert(edge.target.clone());
                     queue.push_back((edge.target.clone(), next_path));
+                    stats.enqueued += 1;
                 }
             }
         }
 
-        Ok(None)
+        Ok((None, stats))
     }
 
     /// Ports `getAncestors` from `upstream graph/traversal.ts:615-645`.

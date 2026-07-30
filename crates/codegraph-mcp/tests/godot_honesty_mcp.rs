@@ -57,7 +57,8 @@ fn pipeline_project(files: &[(&str, &str)]) -> TestProject {
         fs::write(&dst, src).unwrap();
     }
 
-    let mut store = Store::open(&base.join(".codegraph").join("codegraph.db")).unwrap();
+    // Batch M: the MCP engine reads the isolated v2 namespace (`.codegraph-v2`).
+    let mut store = Store::open(&base.join(".codegraph-v2").join("codegraph.db")).unwrap();
     for (rel, src) in files {
         let result = extract_file(&base, rel).unwrap();
         store
@@ -92,6 +93,8 @@ fn pipeline_project(files: &[(&str, &str)]) -> TestProject {
     resolver.resolve_and_persist(&mut store).unwrap();
     resolver.run_post_extract(&mut store).unwrap();
     drop(store);
+    let paths = codegraph_core::IndexPaths::resolve(&base, None).unwrap();
+    codegraph_store::test_support::finalize_current_test_fixture(&paths).unwrap();
 
     TestProject { path: base }
 }

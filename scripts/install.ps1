@@ -6,9 +6,18 @@
 .DESCRIPTION
     irm https://raw.githubusercontent.com/sunerpy/codegraph-rust/main/scripts/install.ps1 | iex
 
-    Env overrides:
+      Env overrides:
       CODEGRAPH_VERSION      pin a release (e.g. 0.4.0 or v0.4.0); default: latest
       CODEGRAPH_INSTALL_DIR  install destination; default: %LOCALAPPDATA%\Programs\codegraph
+      CODEGRAPH_SKIP_CHECKSUM
+                             set to any non-empty value to proceed when the
+                             download CANNOT be verified — i.e. Get-FileHash is
+                             unavailable, or the release has no usable
+                             SHA256SUMS (releases cut before checksums were
+                             published). Without it the installer REFUSES to
+                             install rather than run an unverified binary. It
+                             never bypasses a checksum MISMATCH — a mismatch
+                             always aborts.
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -59,8 +68,22 @@ if ($env:CODEGRAPH_VERSION) {
     $version = $tag -replace '^v', ''
 }
 
+$sums = 'SHA256SUMS'
 $asset = "$Bin-$version-$target.$ext"
-$url = "https://github.com/$Repo/releases/download/v$version/$asset"
+$releaseBase = "https://github.com/$Repo/releases/download/v$version"
+$url = "$releaseBase/$asset"
+$sumsUrl = "$releaseBase/$sums"
+
+# Fail closed unless the operator explicitly opted out.
+function Assert-CanSkipVerification([string]$Reason) {
+    if ($env:CODEGRAPH_SKIP_CHECKSUM) {
+        Write-Warning "Cannot verify download ($Reason)."
+        Write-Warning 'CODEGRAPH_SKIP_CHECKSUM is set — installing an UNVERIFIED binary.'
+        return
+    }
+    throw ("Cannot verify the download: $Reason. Refusing to install an unverified " +
+        'binary. To proceed anyway, set CODEGRAPH_SKIP_CHECKSUM=1.')
+}
 
 if ($env:CODEGRAPH_INSTALL_DIR) {
     $installDir = $env:CODEGRAPH_INSTALL_DIR
@@ -79,6 +102,42 @@ try {
     $zipPath = Join-Path $tmp $asset
     $headers = @{ 'User-Agent' = 'codegraph-installer' }
     Invoke-WebRequest -Uri $url -OutFile $zipPath -Headers $headers
+
+    # Integrity gate — runs BEFORE Expand-Archive, so an unverified archive is
+    # never unpacked and its binary is never executed.
+    if (-not (Get-Command Get-FileHash -ErrorAction SilentlyContinue)) {
+        Assert-CanSkipVerification 'Get-FileHash is unavailable'
+    } else {
+        $sumsPath = Join-Path $tmp $sums
+        $sumsOk = $true
+        try {
+            Invoke-WebRequest -Uri $sumsUrl -OutFile $sumsPath -Headers $headers
+        } catch {
+            $sumsOk = $false
+        }
+        if (-not $sumsOk) {
+            Assert-CanSkipVerification "could not download $sumsUrl"
+        } else {
+            # Each line is `<hex><sep><name>`; tolerate CRLF (Get-Content strips
+            # the line ending) and the BSD `*name` marker.
+            $expected = $null
+            foreach ($line in (Get-Content -LiteralPath $sumsPath)) {
+                $parts = $line.Trim() -split '\s+', 2
+                if ($parts.Count -ne 2) { continue }
+                if ($parts[1].TrimStart('*') -eq $asset) { $expected = $parts[0]; break }
+            }
+            if (-not $expected) {
+                Assert-CanSkipVerification "$sums has no entry for $asset"
+            } else {
+                $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $zipPath).Hash
+                if ($actual -ine $expected) {
+                    throw ("Checksum MISMATCH for ${asset}: expected $expected, actual $actual. " +
+                        'Refusing to install a corrupted or tampered archive.')
+                }
+                Write-Host "  sha256: OK ($actual)"
+            }
+        }
+    }
 
     Expand-Archive -Path $zipPath -DestinationPath $tmp -Force
 

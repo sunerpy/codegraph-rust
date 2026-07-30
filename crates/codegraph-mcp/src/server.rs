@@ -19,7 +19,8 @@ use crate::engine::CodeGraphEngine;
 use crate::instructions::SERVER_INSTRUCTIONS;
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse, ToolResult, error_codes};
 use crate::roots::{
-    ROOTS_LIST_REQUEST_ID, WorkspaceRoots, db_path_for, format_tool_debug_line, roots_list_request,
+    ROOTS_LIST_REQUEST_ID, WorkspaceRoots, db_exists_for, db_path_for, format_tool_debug_line,
+    roots_list_request,
 };
 use crate::schemas;
 
@@ -68,7 +69,7 @@ struct DbIdentity {
 ///
 /// Deliberately EXCLUDED:
 /// - bytes `[24..28]` — file change counter: increments on EVERY transaction
-///   including a plain WAL write, which would false-fire a reopen.
+///   including a plain WAL write, which would false-report a replacement.
 /// - bytes `[92..100]` — version-valid-for / SQLite version: mutate on writes.
 ///
 /// No timestamp (mtime) is involved, so a normal WAL write that
@@ -122,10 +123,9 @@ fn header_sig(db_path: &std::path::Path) -> u64 {
 }
 
 impl DbIdentity {
-    /// Identity of the db file, or `None` when it is missing — which the caller
-    /// treats as "must reopen". Honors "never miss a replace": a metadata error
-    /// yields `None` (reopen); a header read error degrades `header_sig` to `0`
-    /// (the slices simply do not contribute), never a panic.
+    /// Identity of the db file, or `None` when it cannot be observed. A header
+    /// read error degrades `header_sig` to `0` (the slices simply do not
+    /// contribute), never a panic.
     fn read(db_path: &std::path::Path) -> Option<Self> {
         let meta = std::fs::metadata(db_path).ok()?;
         #[cfg(unix)]
@@ -160,28 +160,26 @@ impl DbIdentity {
     }
 }
 
-/// A cached engine plus the db-file identity recorded when it was opened.
-///
-/// `engine` is `Option` so [`McpServer::close_cached_handles`] can drop the live
-/// DB connection (releasing the OS file handle) while keeping the recorded
-/// `identity`. [`McpServer::engine_for`] treats a `None` engine as stale, so it
-/// reopens and counts the reopen exactly as a replaced-on-disk db would. Normal
-/// serve flow always holds `Some`.
-struct CachedEngine {
-    engine: Option<CodeGraphEngine>,
-    identity: DbIdentity,
+/// Last successfully observed file identity for one project. SQLite connections
+/// and leases remain request-scoped and are never retained in this map.
+struct ObservedDbIdentity(DbIdentity);
+
+/// Process-global count of DB identity changes observed between successful
+/// requests. Request-scoped engines open on every call, so this metric does not
+/// count engine or connection opens. The first observation is not a change.
+static DB_IDENTITY_CHANGE_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Number of DB identity changes observed between successful requests since
+/// process start.
+pub fn db_identity_change_count() -> u64 {
+    DB_IDENTITY_CHANGE_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Process-global count of engine reopens (drop the cached engine + open a
-/// fresh one because the db file went missing or was replaced). The first open
-/// of a never-cached path is not a reopen. `tests/reopen.rs` reads it via
-/// [`reopen_count`] to prove a same-inode project triggers no needless reopen.
-static REOPEN_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Number of engine reopens since process start. Test-observability hook for
-/// the #925 replacement rule; cheap enough to keep unconditionally.
+/// Compatibility alias for the former cached-engine diagnostic name.
+#[doc(hidden)]
 pub fn reopen_count() -> u64 {
-    REOPEN_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+    db_identity_change_count()
 }
 
 pub enum RunUntilAdoption<R> {
@@ -189,14 +187,12 @@ pub enum RunUntilAdoption<R> {
     Adopted { project_root: PathBuf, reader: R },
 }
 
-/// Holds the default project path and a per-path engine cache (mirrors
-/// `ToolHandler.projectCache`, `tools.ts:591`). Each cached engine carries the
-/// db-file identity it was opened against, so [`McpServer::engine_for`] can
-/// reopen when the database is REPLACED on disk (#925).
+/// Holds the default project path and per-path DB identities used to observe
+/// replacements (#925). Every request opens and drops its own engine.
 pub struct McpServer {
     default_project: Option<PathBuf>,
     cwd: Option<PathBuf>,
-    engines: HashMap<PathBuf, CachedEngine>,
+    observed_identities: HashMap<PathBuf, ObservedDbIdentity>,
     workspace_roots: WorkspaceRoots,
     no_roots: bool,
 }
@@ -206,7 +202,7 @@ impl McpServer {
         Self {
             default_project,
             cwd: std::env::current_dir().ok(),
-            engines: HashMap::new(),
+            observed_identities: HashMap::new(),
             workspace_roots: WorkspaceRoots::new(),
             no_roots: false,
         }
@@ -221,7 +217,7 @@ impl McpServer {
         let Some(project) = &self.default_project else {
             return false;
         };
-        db_path_for(project).is_file()
+        db_exists_for(project)
     }
 
     /// Run the stdio loop until the broad-root daemon handoff adopts a project
@@ -444,14 +440,22 @@ impl McpServer {
             format_tool_debug_line(
                 &tool_name,
                 raw_project,
-                resolved.as_deref(),
+                resolved.resolved(),
                 self.cwd.as_deref(),
                 self.default_project.as_deref(),
             )
         );
         let project_path = match resolved {
-            Some(p) => p,
-            None => {
+            crate::roots::ProjectArg::Resolved(p) => p,
+            crate::roots::ProjectArg::InvalidConfig(detail) => {
+                return Dispatch::Reply(
+                    serde_json::to_value(ToolResult::error(crate::roots::invalid_config_message(
+                        &detail,
+                    )))
+                    .expect("ToolResult serializes"),
+                );
+            }
+            crate::roots::ProjectArg::NotIndexed => {
                 let message = match raw_project {
                     Some(raw) => format!(
                         "No indexed project found for projectPath {raw:?}. Pass an absolute path to an indexed project, or run `codegraph init` there."
@@ -497,88 +501,53 @@ impl McpServer {
     /// - `raw = None`: the `default_project` (existing behavior).
     ///
     /// Honesty rule: when `raw` is given but resolves to nothing AND its basename
-    /// does not match `default_project`, this returns `None` rather than silently
-    /// falling back to `default_project` — a genuinely wrong path must surface an
-    /// error, not mask itself behind the default.
-    fn resolve_project_arg(&self, raw: Option<&str>) -> Option<PathBuf> {
-        let Some(raw) = raw else {
-            return self
-                .default_project
-                .clone()
-                .filter(|p| db_path_for(p).is_file());
-        };
-
-        let raw_path = PathBuf::from(raw);
-        let mut candidates: Vec<PathBuf> = Vec::new();
-        if raw_path.is_absolute() {
-            candidates.push(raw_path.clone());
-        } else {
-            if let Some(cwd) = &self.cwd {
-                candidates.push(cwd.join(&raw_path));
-            }
-            candidates.push(raw_path.clone());
-        }
-        if let Some(default) = &self.default_project
-            && raw_path.file_name() == default.file_name()
-        {
-            candidates.push(default.clone());
-        }
-
-        candidates
-            .into_iter()
-            .find(|candidate| db_path_for(candidate).is_file())
+    /// does not match `default_project`, this yields `NotIndexed` rather than
+    /// silently falling back to `default_project` — a genuinely wrong path must
+    /// surface an error, not mask itself behind the default. An unsafe configured
+    /// root yields `InvalidConfig` (the Failure-B fix), not a generic miss.
+    /// Delegates to the shared [`crate::roots::resolve_project_arg`] so this
+    /// front-end and the rmcp handler stay byte-identical.
+    fn resolve_project_arg(&self, raw: Option<&str>) -> crate::roots::ProjectArg {
+        crate::roots::resolve_project_arg(raw, self.cwd.as_deref(), self.default_project.as_deref())
     }
 
-    /// Open-on-demand + cache the engine for a project path
-    /// (`ToolHandler.getCodeGraph`, `tools.ts`), reopening when the db file was
-    /// REPLACED on disk (#925). Before returning a cached engine, re-stat the db
-    /// path: reopen iff it is MISSING or its identity differs from the recorded
-    /// one (inode/file-index changed). An in-place write keeps the same identity,
-    /// so the common path returns the cached engine without reopening.
-    fn engine_for(&mut self, project_path: &PathBuf) -> anyhow::Result<&CodeGraphEngine> {
-        let db_path = db_path_for(project_path);
-        let current = DbIdentity::read(&db_path);
-
-        let stale = match self.engines.get(project_path) {
-            None => true,
-            Some(cached) => cached.engine.is_none() || current != Some(cached.identity),
-        };
-
-        if stale {
-            if self.engines.remove(project_path).is_some() {
-                REOPEN_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            let engine = CodeGraphEngine::open(project_path)?;
-            let identity = DbIdentity::read(&db_path).ok_or_else(|| {
-                anyhow::anyhow!("database vanished after open at {}", db_path.display())
-            })?;
-            self.engines.insert(
-                project_path.clone(),
-                CachedEngine {
-                    engine: Some(engine),
-                    identity,
-                },
-            );
-        }
-
-        Ok(self
-            .engines
+    /// Open one request-scoped engine and update the #925 identity-change
+    /// observation. No SQLite handle or lease is cached.
+    fn engine_for(&mut self, project_path: &PathBuf) -> anyhow::Result<CodeGraphEngine> {
+        // A resolvable configured root yields its DB path. An invalid one is
+        // already rejected upstream by `roots::resolve_project_arg`, which carries
+        // the stable `IndexPaths` diagnostic to the caller before a tool call ever
+        // reaches here; this arm is the defensive backstop for an unresolved DB
+        // path (e.g. a non-tool-call caller), so it fails closed rather than
+        // reconstructing a default namespace.
+        let db_path = db_path_for(project_path).ok_or_else(|| {
+            anyhow::anyhow!(
+                "invalid CODEGRAPH_DIR configuration for project {}",
+                project_path.display()
+            )
+        })?;
+        let previous = self
+            .observed_identities
             .get(project_path)
-            .and_then(|c| c.engine.as_ref())
-            .expect("engine present after open"))
+            .map(|observed| observed.0);
+        let engine = CodeGraphEngine::open(project_path)?;
+        let identity = DbIdentity::read(&db_path).ok_or_else(|| {
+            anyhow::anyhow!("database vanished after open at {}", db_path.display())
+        })?;
+        if previous.is_some_and(|recorded| recorded != identity) {
+            DB_IDENTITY_CHANGE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.observed_identities
+            .insert(project_path.clone(), ObservedDbIdentity(identity));
+        Ok(engine)
     }
 
-    /// Test/diagnostic only: drop every cached engine's live DB connection while
-    /// keeping its recorded identity, so the underlying db files can be replaced
-    /// on platforms (windows) where an open handle blocks delete/overwrite. The
-    /// next [`McpServer::engine_for`] reopens the still-recorded path and counts
-    /// it as a reopen, identical to a replaced-on-disk db. Normal serve flow
-    /// never calls this; the cache reopens on demand.
+    /// Backward-compatible diagnostic seam. There are no cached handles to close;
+    /// this forgets DB identity observations so the next request establishes a
+    /// new baseline without reporting a synthetic identity change.
     #[doc(hidden)]
     pub fn close_cached_handles(&mut self) {
-        for cached in self.engines.values_mut() {
-            cached.engine = None;
-        }
+        self.observed_identities.clear();
     }
 
     /// Test/diagnostic only: the currently adopted default project path.
@@ -595,7 +564,7 @@ impl McpServer {
         Self {
             default_project,
             cwd,
-            engines: HashMap::new(),
+            observed_identities: HashMap::new(),
             workspace_roots: WorkspaceRoots::new(),
             no_roots: false,
         }
@@ -677,7 +646,10 @@ mod tests {
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let path =
             std::env::temp_dir().join(format!("cg-mcp-init-{tag}-{}-{seq}", std::process::id()));
-        let db = db_path_for(&path);
+        // The project dir must exist before `db_path_for` (which resolves the
+        // physical identity) can succeed.
+        std::fs::create_dir_all(&path).unwrap();
+        let db = db_path_for(&path).expect("default project resolves");
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         std::fs::write(&db, b"placeholder").unwrap();
         TempProject { path }
@@ -831,7 +803,7 @@ mod tests {
         let cwd = std::env::temp_dir().join("cg-mcp-basename-cwd-elsewhere");
         let server = McpServer::new_with_cwd(Some(project.path().to_path_buf()), Some(cwd));
         assert_eq!(
-            server.resolve_project_arg(Some(&name)).as_deref(),
+            server.resolve_project_arg(Some(&name)).resolved(),
             Some(project.path()),
         );
     }
@@ -847,7 +819,7 @@ mod tests {
         // default_project unset so ONLY the cwd-join candidate can resolve.
         let server = McpServer::new_with_cwd(None, Some(parent));
         assert_eq!(
-            server.resolve_project_arg(Some(name)).as_deref(),
+            server.resolve_project_arg(Some(name)).resolved(),
             Some(project.path()),
         );
     }
@@ -859,7 +831,7 @@ mod tests {
         let raw = project.path().display().to_string();
         let server = McpServer::new_with_cwd(None, None);
         assert_eq!(
-            server.resolve_project_arg(Some(&raw)).as_deref(),
+            server.resolve_project_arg(Some(&raw)).resolved(),
             Some(project.path()),
         );
     }
@@ -873,7 +845,9 @@ mod tests {
         let cwd = std::env::temp_dir().join("cg-mcp-bogus-cwd-elsewhere");
         let server = McpServer::new_with_cwd(Some(project.path().to_path_buf()), Some(cwd));
         assert_eq!(
-            server.resolve_project_arg(Some("definitely-not-a-real-project-xyz")),
+            server
+                .resolve_project_arg(Some("definitely-not-a-real-project-xyz"))
+                .resolved(),
             None,
         );
     }
@@ -885,7 +859,7 @@ mod tests {
         let project = indexed_project("none-default");
         let server = McpServer::new_with_cwd(Some(project.path().to_path_buf()), None);
         assert_eq!(
-            server.resolve_project_arg(None).as_deref(),
+            server.resolve_project_arg(None).resolved(),
             Some(project.path()),
         );
     }
@@ -901,7 +875,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let server = McpServer::new_with_cwd(Some(dir.clone()), None);
-        assert_eq!(server.resolve_project_arg(None), None);
+        assert_eq!(server.resolve_project_arg(None).resolved(), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1242,11 +1216,15 @@ mod tests {
     }
 
     #[test]
-    fn close_cached_handles_forces_reopen_counter() {
-        let before = reopen_count();
-        let mut server = McpServer::new(None);
+    fn close_cached_handles_clears_only_identity_observations() {
+        let project = indexed_project("close-identity-observations");
+        let mut server = McpServer::new(Some(project.path().to_path_buf()));
+        server.observed_identities.insert(
+            project.path().to_path_buf(),
+            ObservedDbIdentity(DbIdentity::read(&db_path_for(project.path()).unwrap()).unwrap()),
+        );
         server.close_cached_handles();
-        assert!(reopen_count() >= before);
+        assert!(server.observed_identities.is_empty());
     }
 
     #[test]

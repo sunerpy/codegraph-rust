@@ -9,6 +9,10 @@ use codegraph_daemon::{
     start_or_attach, unlock_project,
 };
 
+fn pid_path_of(project: &Path) -> PathBuf {
+    daemon_pid_path(project).expect("resolve the v2 rendezvous pid path")
+}
+
 #[test]
 fn second_daemon_attaches_to_existing_project_daemon() {
     let project = temp_project("single-instance");
@@ -29,7 +33,7 @@ fn second_daemon_attaches_to_existing_project_daemon() {
     }
 
     first.stop().expect("daemon stops");
-    assert!(!daemon_pid_path(&project).exists());
+    assert!(!pid_path_of(&project).exists());
     let _ = fs::remove_dir_all(project);
 }
 
@@ -68,20 +72,21 @@ fn host_pid_watchdog_stops_daemon_after_parent_agent_exits() {
         "daemon did not stop after watched pid exited"
     );
     handle.stop().expect("finished daemon joins");
-    assert!(!daemon_pid_path(&project).exists());
+    assert!(!pid_path_of(&project).exists());
     let _ = fs::remove_dir_all(project);
 }
 
 #[test]
 fn unlock_project_removes_stale_daemon_lock() {
     let project = temp_project("unlock-stale");
-    let codegraph_dir = project.join(".codegraph");
-    fs::create_dir_all(&codegraph_dir).expect("create .codegraph");
-    let pid_path = daemon_pid_path(&project);
+    let pid_path = pid_path_of(&project);
+    fs::create_dir_all(pid_path.parent().expect("rendezvous dir"))
+        .expect("create the v2 rendezvous dir");
     let info = DaemonLockInfo {
         pid: 999_999_999,
         version: "test".to_string(),
-        socket_path: codegraph_dir.join("daemon.sock"),
+        socket_path: codegraph_daemon::daemon_socket_path(&project)
+            .expect("resolve the v2 rendezvous socket identity"),
         started_at: 1,
     };
     fs::write(&pid_path, encode_lock_info(&info).expect("serialize lock")).expect("write lock");
@@ -110,9 +115,12 @@ fn temp_project(name: &str) -> PathBuf {
         std::process::id()
     ));
     create_project(&path);
-    path
+    path.canonicalize().expect("canonicalize project")
 }
 
+/// A real project directory: `IndexPaths` derives the physical project identity
+/// from the filesystem object, so the project must exist before any rendezvous
+/// path resolves.
 fn create_project(path: &Path) {
-    fs::create_dir_all(path.join(".codegraph")).expect("create project");
+    fs::create_dir_all(path).expect("create project");
 }

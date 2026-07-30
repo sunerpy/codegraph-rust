@@ -70,6 +70,115 @@ fn lang_markup_risk_dfm_uses_custom_component_extractor() {
 }
 
 #[test]
+fn lang_markup_risk_dfm_spans_close_at_their_own_matching_end() {
+    // Upstream issue #1350: every DFM object must report the line of ITS OWN
+    // matching `end`, so a container's span covers its children and a sibling
+    // never inherits the neighbour's terminator. DeepForm.dfm nests four deep
+    // (DeepForm > TopPanel > InnerPanel > DeepButton) and puts sibling pairs at
+    // two different depths.
+    let result = extract_fixture("DeepForm.dfm", None);
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+
+    let mut spans: Vec<(&str, i64, i64)> = result
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::Component)
+        .map(|node| (node.name.as_str(), node.start_line, node.end_line))
+        .collect();
+    spans.sort();
+    assert_eq!(
+        spans,
+        vec![
+            ("BottomPanel", 20, 32),
+            ("DeepButton", 8, 11),
+            ("DeepForm", 1, 33),
+            ("DeepLabel", 12, 14),
+            ("InnerPanel", 6, 15),
+            ("Items", 22, 31),
+            ("SiblingButton", 16, 18),
+            ("TopPanel", 4, 19),
+        ],
+        "each object must span from its own header line to its own matching end"
+    );
+
+    // Depth >= 2 exact spans, stated separately so a regression that only
+    // breaks deep nesting cannot hide behind the aggregate above.
+    let inner = assert_node(&result, NodeKind::Component, "InnerPanel");
+    assert_eq!((inner.start_line, inner.end_line), (6, 15));
+    let deep_button = assert_node(&result, NodeKind::Component, "DeepButton");
+    assert_eq!((deep_button.start_line, deep_button.end_line), (8, 11));
+
+    // Sibling pair at the same depth: an off-by-one that hands DeepButton's
+    // `end` (11) to DeepLabel, or DeepLabel's (14) to DeepButton, reddens here.
+    let deep_label = assert_node(&result, NodeKind::Component, "DeepLabel");
+    assert_eq!((deep_label.start_line, deep_label.end_line), (12, 14));
+    assert!(
+        deep_button.end_line < deep_label.start_line,
+        "siblings must not overlap: {:?} vs {:?}",
+        (deep_button.start_line, deep_button.end_line),
+        (deep_label.start_line, deep_label.end_line)
+    );
+
+    // The multiline `Columns = <...>` block ends with `end>` and `end` lines
+    // that must NOT close the enclosing objects (dfm-extractor.ts:95-109).
+    let items = assert_node(&result, NodeKind::Component, "Items");
+    assert_eq!((items.start_line, items.end_line), (22, 31));
+
+    // Nesting is unchanged by the span fix: parents still contain their children.
+    let file = assert_node(&result, NodeKind::File, "DeepForm.dfm");
+    let form = assert_node(&result, NodeKind::Component, "DeepForm");
+    let top = assert_node(&result, NodeKind::Component, "TopPanel");
+    let sibling = assert_node(&result, NodeKind::Component, "SiblingButton");
+    let bottom = assert_node(&result, NodeKind::Component, "BottomPanel");
+    assert_contains(&result, &file.id, &form.id);
+    assert_contains(&result, &form.id, &top.id);
+    assert_contains(&result, &top.id, &inner.id);
+    assert_contains(&result, &inner.id, &deep_button.id);
+    assert_contains(&result, &inner.id, &deep_label.id);
+    assert_contains(&result, &top.id, &sibling.id);
+    assert_contains(&result, &form.id, &bottom.id);
+    assert_contains(&result, &bottom.id, &items.id);
+    assert_ref_at(&result, EdgeKind::References, "DeepButtonClick", 10);
+    assert_ref_at(&result, EdgeKind::References, "ItemsDblClick", 30);
+}
+
+#[test]
+fn lang_markup_risk_dfm_unterminated_object_keeps_its_header_span() {
+    // Upstream issue #1350, malformed half: a truncated DFM leaves objects with
+    // no matching `end`. The extractor must neither panic nor invent a span it
+    // did not see, so an unclosed object keeps its header line as end_line
+    // rather than borrowing the file end (7) or a sibling's terminator.
+    let result = extract_fixture("BrokenForm.dfm", None);
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+
+    let mut spans: Vec<(&str, i64, i64)> = result
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::Component)
+        .map(|node| (node.name.as_str(), node.start_line, node.end_line))
+        .collect();
+    spans.sort();
+    assert_eq!(
+        spans,
+        vec![
+            ("BrokenForm", 1, 1),
+            ("LostButton", 5, 5),
+            ("OrphanPanel", 3, 3),
+        ],
+        "an unterminated object must not fabricate a span"
+    );
+
+    let file = assert_node(&result, NodeKind::File, "BrokenForm.dfm");
+    let form = assert_node(&result, NodeKind::Component, "BrokenForm");
+    let panel = assert_node(&result, NodeKind::Component, "OrphanPanel");
+    let button = assert_node(&result, NodeKind::Component, "LostButton");
+    assert_contains(&result, &file.id, &form.id);
+    assert_contains(&result, &form.id, &panel.id);
+    assert_contains(&result, &panel.id, &button.id);
+    assert_ref_at(&result, EdgeKind::References, "LostButtonClick", 7);
+}
+
+#[test]
 fn lang_markup_risk_kotlin_extracts_upstream_symbol_set() {
     // Golden run: upstream extractFromSource on this exact fixture (kotlin.ts:71-308).
     let result = extract_fixture("Service.kt", None);

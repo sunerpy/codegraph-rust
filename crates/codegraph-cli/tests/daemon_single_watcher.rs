@@ -3,7 +3,7 @@
 //!
 //! The watcher lives in a SEPARATE detached process, so an in-process
 //! `watcher_count()` hook is unreachable. We assert BEHAVIORALLY via the
-//! observable single-sync signal the daemon writes to `.codegraph/daemon.log`
+//! observable single-sync signal the daemon writes to its v2 `daemon.log`
 //! (its stdout/stderr is redirected there by the T2 detached spawn):
 //! `watcher sync #{n}: {files} file(s)`. Exactly ONE such line for a single
 //! change proves one watcher fired once, not N (one per connected client).
@@ -178,7 +178,7 @@ fn wait_until_gone(pid: u32, timeout: Duration) -> bool {
 }
 
 fn daemon_log(project: &Path) -> PathBuf {
-    project.join(".codegraph").join("daemon.log")
+    codegraph_daemon::daemon_log_path(project).expect("resolve the v2 rendezvous log path")
 }
 
 /// Read the daemon.log and count the watcher sync lines.
@@ -224,7 +224,7 @@ fn poll_for_sync_lines(log: &Path, timeout: Duration) -> usize {
 #[test]
 fn daemon_single_watcher_fires_once() {
     let (_dir, project) = indexed_project("fires-once");
-    let socket = daemon_socket_path(&project);
+    let socket = daemon_socket_path(&project).expect("resolve the v2 rendezvous socket identity");
     let log = daemon_log(&project);
 
     let pid = {
@@ -296,7 +296,7 @@ fn daemon_single_watcher_fires_once() {
 #[test]
 fn daemon_no_watch_does_not_autosync() {
     let (_dir, project) = indexed_project("no-watch");
-    let socket = daemon_socket_path(&project);
+    let socket = daemon_socket_path(&project).expect("resolve the v2 rendezvous socket identity");
     let log = daemon_log(&project);
 
     let pid = {

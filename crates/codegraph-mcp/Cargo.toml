@@ -52,7 +52,7 @@ tokio-util = { version = "0.7" }
 # dependency of an integration test binary, so a Cargo feature (auto-enabled for
 # this crate's own dev/test builds via the dev-dependency self-reference below)
 # is the only reliable gate. NEVER enabled in the shipped binary.
-test-hooks = []
+test-hooks = ["codegraph-store/test-hooks"]
 
 [dev-dependencies]
 # Self-reference with `test-hooks` so the seams above are compiled into the lib

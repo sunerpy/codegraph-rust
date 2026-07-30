@@ -6,6 +6,10 @@
 //! mappings + re-exports, and turns import-shaped references into edges. Every
 //! ported branch cites its upstream source range.
 
+use crate::name_matcher::{
+    local_receiver_type_patterns, normalize_inferred_type_name, regex_escape,
+    resolve_method_on_type,
+};
 use crate::path_aliases::apply_aliases;
 use crate::pathutil;
 use crate::types::{ImportMapping, ReExport, RefView, ResolutionContext, ResolvedBy, ResolvedRef};
@@ -1246,6 +1250,22 @@ pub fn resolve_via_import(
                     // `calls`/etc. to `method:bar` rather than mislinking to the class
                     // (which `create_edges` would then mis-promote to `instantiates`).
                     // Ports import-resolver.ts:1298-1316 (upstream f7441f21 / #825).
+                    if !imp.is_namespace {
+                        // An imported VALUE called through a member —
+                        // `reproStore.notifyJoinGuildStatus()` after
+                        // `import { reproStore } from './store'`. Linking the
+                        // CALL to the constant hides the real callee, so
+                        // `callers <method>` misses every cross-file use
+                        // (#1292 / upstream 2ec877b).
+                        if let Some(instance_member) = resolve_imported_instance_member(
+                            &target_node,
+                            reference,
+                            &imp.local_name,
+                            context,
+                        ) {
+                            return Some(instance_member);
+                        }
+                    }
                     let resolved_target = if !imp.is_namespace {
                         resolve_static_member(&target_node, reference, &imp.local_name, context)
                             .unwrap_or(target_node)
@@ -1532,6 +1552,71 @@ fn find_exported_symbol(
         }
     }
 
+    None
+}
+
+/// Resolve a CALL through an imported VALUE to the method on the value's own
+/// type: `reproStore.notifyJoinGuildStatus()` where the exporting file declares
+/// `export const reproStore = new ReproStore()` (#1292, upstream `2ec877b`).
+///
+/// The same-file form of this call already resolves through local-variable
+/// receiver inference (#1108); this is the cross-file/import half. The type is
+/// recovered ONLY from the value's OWN declaration lines in the exporting file
+/// (the shared #1108 pattern table), so a same-named local elsewhere in that
+/// file cannot donate a type. The member is then resolved AND VALIDATED on that
+/// type by [`resolve_method_on_type`], so a failed inference or a type that does
+/// not declare the member returns `None` and the caller keeps its existing
+/// constant edge — never a fabricated one. Calls only: a plain member READ still
+/// references the value.
+fn resolve_imported_instance_member(
+    value: &Node,
+    reference: &RefView,
+    local_name: &str,
+    context: &dyn ResolutionContext,
+) -> Option<ResolvedRef> {
+    if reference.reference_kind != codegraph_core::types::EdgeKind::Calls {
+        return None;
+    }
+    if !matches!(value.kind, NodeKind::Constant | NodeKind::Variable) {
+        return None;
+    }
+    let prefix = format!("{local_name}.");
+    let remainder = reference.reference_name.strip_prefix(&prefix)?;
+    let member = remainder.split('.').next().filter(|s| !s.is_empty())?;
+
+    let source = context.read_file(&value.file_path)?;
+    let lines: Vec<&str> = source
+        .split('\n')
+        .map(|l| l.trim_end_matches('\r'))
+        .collect();
+    let start = (value.start_line.max(1) - 1) as usize;
+    let end = (value.end_line.max(value.start_line) as usize).min(lines.len());
+    if start >= end {
+        return None;
+    }
+    let decl_slice = lines[start..end].join("\n");
+
+    let escaped = regex_escape(&value.name);
+    for pattern in local_receiver_type_patterns(value.language, &escaped) {
+        let Some(captured) = pattern.captures(&decl_slice).and_then(|c| c.get(1)) else {
+            continue;
+        };
+        let Some(type_name) = normalize_inferred_type_name(captured.as_str()) else {
+            continue;
+        };
+        if let Some(resolved) = resolve_method_on_type(
+            &type_name,
+            member,
+            reference,
+            context,
+            0.85,
+            ResolvedBy::InstanceMethod,
+            None,
+            0,
+        ) {
+            return Some(resolved);
+        }
+    }
     None
 }
 
@@ -2125,6 +2210,7 @@ mod tests {
 
     fn reference(name: &str, kind: EdgeKind, file_path: &str, language: Language) -> RefView {
         RefView {
+            row_id: None,
             from_node_id: "function:caller".to_string(),
             reference_name: name.to_string(),
             reference_kind: kind,
@@ -3696,5 +3782,159 @@ export { } from './empty';
             Some("src/sibling.rs".to_string())
         );
         assert!(resolve_rust_module_file(&[], "src/app.rs", &ctx).is_none());
+    }
+
+    // ---- Imported-singleton instance-method calls (#1292 / upstream 2ec877b) --
+
+    /// The exporting file's source. `reproStore` is the singleton constant on
+    /// line 7; `ReproStore::notifyJoinGuildStatus` is its method.
+    const SINGLETON_STORE_SRC: &str = "export class ReproStore {\n  notifyJoinGuildStatus(): void {\n    console.log('notified');\n  }\n}\n\nexport const reproStore = new ReproStore();\n";
+
+    /// Graph + context for `reproStore.<member>` called from `src/caller.ts`
+    /// through `import { reproStore } from './store'`. `decl_line` places the
+    /// constant's declaration span so the inferrer reads only those lines.
+    fn singleton_ctx(decl_line: i64, source: &str) -> TestContext {
+        let mut existing = BTreeSet::new();
+        existing.insert("src/store.ts".to_string());
+        let mut file_contents = BTreeMap::new();
+        file_contents.insert("src/store.ts".to_string(), source.to_string());
+        let mut import_mappings = BTreeMap::new();
+        import_mappings.insert(
+            "src/caller.ts".to_string(),
+            vec![mapping("reproStore", "reproStore", "./store")],
+        );
+
+        let class_node = {
+            let mut n = exported(node(
+                "class:ReproStore",
+                "ReproStore",
+                NodeKind::Class,
+                "src/store.ts",
+                Language::TypeScript,
+            ));
+            n.qualified_name = "ReproStore".to_string();
+            n
+        };
+        let method = {
+            let mut n = node(
+                "method:notifyJoinGuildStatus",
+                "notifyJoinGuildStatus",
+                NodeKind::Method,
+                "src/store.ts",
+                Language::TypeScript,
+            );
+            n.qualified_name = "ReproStore::notifyJoinGuildStatus".to_string();
+            n.start_line = 2;
+            n.end_line = 4;
+            n
+        };
+        let singleton = {
+            let mut n = exported(node(
+                "constant:reproStore",
+                "reproStore",
+                NodeKind::Constant,
+                "src/store.ts",
+                Language::TypeScript,
+            ));
+            n.start_line = decl_line;
+            n.end_line = decl_line;
+            n
+        };
+
+        TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            file_contents,
+            import_mappings,
+            nodes: vec![class_node, method, singleton],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn imported_singleton_call_resolves_to_the_class_method() {
+        let ctx = singleton_ctx(7, SINGLETON_STORE_SRC);
+        let r = reference(
+            "reproStore.notifyJoinGuildStatus",
+            EdgeKind::Calls,
+            "src/caller.ts",
+            Language::TypeScript,
+        );
+        let resolved = resolve_via_import(&r, &ctx).expect("resolves");
+        assert_eq!(
+            resolved.target_node_id, "method:notifyJoinGuildStatus",
+            "a call through an imported singleton must reach the METHOD, not the constant"
+        );
+        assert_eq!(resolved.resolved_by, ResolvedBy::InstanceMethod);
+        assert_eq!(resolved.confidence, 0.85);
+    }
+
+    #[test]
+    fn imported_singleton_member_read_still_references_the_value() {
+        let ctx = singleton_ctx(7, SINGLETON_STORE_SRC);
+        let r = reference(
+            "reproStore.notifyJoinGuildStatus",
+            EdgeKind::References,
+            "src/caller.ts",
+            Language::TypeScript,
+        );
+        let resolved = resolve_via_import(&r, &ctx).expect("resolves");
+        assert_eq!(
+            resolved.target_node_id, "constant:reproStore",
+            "a plain member READ still points at the imported value"
+        );
+        assert_eq!(resolved.resolved_by, ResolvedBy::Import);
+    }
+
+    #[test]
+    fn imported_singleton_call_keeps_constant_when_type_is_uninferable() {
+        // `= makeStore()` matches no declaration pattern, so no type is
+        // recovered and the existing constant edge stands — never a guess.
+        let src = "export class ReproStore {\n  notifyJoinGuildStatus(): void {}\n}\n\nexport const reproStore = makeStore();\n";
+        let ctx = singleton_ctx(5, src);
+        let r = reference(
+            "reproStore.notifyJoinGuildStatus",
+            EdgeKind::Calls,
+            "src/caller.ts",
+            Language::TypeScript,
+        );
+        let resolved = resolve_via_import(&r, &ctx).expect("resolves");
+        assert_eq!(resolved.target_node_id, "constant:reproStore");
+        assert_eq!(resolved.resolved_by, ResolvedBy::Import);
+    }
+
+    #[test]
+    fn imported_singleton_call_keeps_constant_when_method_is_not_on_the_type() {
+        // The type infers to `ReproStore`, but `ReproStore` declares no
+        // `somethingElse`, so resolve_method_on_type validation fails.
+        let ctx = singleton_ctx(7, SINGLETON_STORE_SRC);
+        let r = reference(
+            "reproStore.somethingElse",
+            EdgeKind::Calls,
+            "src/caller.ts",
+            Language::TypeScript,
+        );
+        let resolved = resolve_via_import(&r, &ctx).expect("resolves");
+        assert_eq!(resolved.target_node_id, "constant:reproStore");
+        assert_eq!(resolved.resolved_by, ResolvedBy::Import);
+    }
+
+    #[test]
+    fn imported_singleton_type_is_read_only_from_its_own_declaration_lines() {
+        // A same-named local in ANOTHER function must not donate a type: the
+        // constant's own declaration span is line 9 only.
+        let src = "export class ReproStore {\n  notifyJoinGuildStatus(): void {}\n}\n\nexport function unrelated(): void {\n  const reproStore = new ReproStore();\n}\n\nexport const reproStore = pickStore();\n";
+        let ctx = singleton_ctx(9, src);
+        let r = reference(
+            "reproStore.notifyJoinGuildStatus",
+            EdgeKind::Calls,
+            "src/caller.ts",
+            Language::TypeScript,
+        );
+        let resolved = resolve_via_import(&r, &ctx).expect("resolves");
+        assert_eq!(
+            resolved.target_node_id, "constant:reproStore",
+            "the line-6 local must not type the line-9 constant"
+        );
     }
 }

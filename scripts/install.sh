@@ -6,6 +6,15 @@
 # Env overrides:
 #   CODEGRAPH_VERSION      pin a release (e.g. 0.4.0 or v0.4.0); default: latest
 #   CODEGRAPH_INSTALL_DIR  install destination; default: $HOME/.local/bin
+#   CODEGRAPH_SKIP_CHECKSUM
+#                          set to any non-empty value to proceed when the
+#                          download CANNOT be verified — i.e. no sha256 tool is
+#                          available, or the release has no usable SHA256SUMS
+#                          (releases cut before checksums were published).
+#                          This is an explicit opt-out: without it the installer
+#                          REFUSES to install rather than run an unverified
+#                          binary. It never bypasses a checksum MISMATCH — a
+#                          mismatch always aborts.
 set -eu
 
 REPO="sunerpy/codegraph-rust"
@@ -32,6 +41,34 @@ else
 fi
 
 command -v tar >/dev/null 2>&1 || err "need tar to extract the release archive"
+
+# Pick a SHA-256 tool once, expose `sha256_of <file>` printing the bare lowercase
+# hex digest. `sha256sum` is coreutils (Linux); `shasum -a 256` is the macOS/perl
+# fallback. If neither exists, sha256_tool stays empty and verification is
+# impossible — handled explicitly at verify time, never silently skipped.
+if command -v sha256sum >/dev/null 2>&1; then
+	sha256_tool="sha256sum"
+	sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
+elif command -v shasum >/dev/null 2>&1; then
+	sha256_tool="shasum"
+	sha256_of() { shasum -a 256 "$1" | cut -d' ' -f1; }
+else
+	sha256_tool=""
+	sha256_of() { err "internal: sha256_of called with no hashing tool"; }
+fi
+
+# cannot_verify REASON — fail closed unless the operator explicitly opted out.
+cannot_verify() {
+	if [ "${CODEGRAPH_SKIP_CHECKSUM:-}" != "" ]; then
+		info "WARNING: cannot verify download ($1)."
+		info "WARNING: CODEGRAPH_SKIP_CHECKSUM is set — installing an UNVERIFIED binary."
+		return 0
+	fi
+	printf 'error: cannot verify the download: %s\n' "$1" >&2
+	printf 'error: refusing to install an unverified binary.\n' >&2
+	printf 'error: to proceed anyway, re-run with CODEGRAPH_SKIP_CHECKSUM=1\n' >&2
+	exit 1
+}
 
 # Detect OS.
 os=$(uname -s)
@@ -63,8 +100,11 @@ else
 	version=$(printf '%s' "$tag" | sed 's/^v//')
 fi
 
+SUMS="SHA256SUMS"
 asset="${BIN}-${version}-${target}.${ext}"
-url="https://github.com/${REPO}/releases/download/v${version}/${asset}"
+release_base="https://github.com/${REPO}/releases/download/v${version}"
+url="${release_base}/${asset}"
+sums_url="${release_base}/${SUMS}"
 
 install_dir="${CODEGRAPH_INSTALL_DIR:-$HOME/.local/bin}"
 
@@ -77,6 +117,34 @@ tmp=$(mktemp -d 2>/dev/null || mktemp -d -t codegraph)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
 download "$url" "$tmp/$asset" || err "download failed: $url"
+
+# Integrity gate — runs BEFORE extraction, so an unverified archive is never
+# unpacked and its binary is never executed.
+if [ "$sha256_tool" = "" ]; then
+	cannot_verify "no sha256sum or shasum on PATH"
+elif ! download "$sums_url" "$tmp/$SUMS" 2>/dev/null; then
+	cannot_verify "could not download $sums_url"
+else
+	# Match the asset's own line. Tolerate CRLF (a SHA256SUMS that travelled
+	# through a Windows editor) and both the `sha256sum` two-space and the
+	# `shasum`/BSD single-space-star separators.
+	expected=$(tr -d '\r' < "$tmp/$SUMS" | awk -v want="$asset" '
+		{ name = $2; sub(/^\*/, "", name); if (name == want) { print $1; exit } }')
+	if [ "${expected:-}" = "" ]; then
+		cannot_verify "$SUMS has no entry for $asset"
+	else
+		actual=$(sha256_of "$tmp/$asset")
+		if [ "$actual" != "$expected" ]; then
+			printf 'error: checksum MISMATCH for %s\n' "$asset" >&2
+			printf 'error:   expected %s\n' "$expected" >&2
+			printf 'error:   actual   %s\n' "$actual" >&2
+			printf 'error: refusing to install a corrupted or tampered archive.\n' >&2
+			exit 1
+		fi
+		info "  sha256: OK (${actual})"
+	fi
+fi
+
 tar -xzf "$tmp/$asset" -C "$tmp" || err "failed to extract $asset"
 
 [ -f "$tmp/$BIN" ] || err "archive did not contain expected binary '$BIN'"

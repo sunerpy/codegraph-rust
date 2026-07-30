@@ -5,11 +5,9 @@
 //!
 //! This is the A5 counterpart to `sync_incremental.rs` / `parallel_index.rs`,
 //! but exercises the `.tres` framework-extraction path that emits
-//! `godot:id:<kind>:<value>` sentinels — i.e. it stresses the mtime-cached
-//! `dsl_id_fields` reader + `find_config_path` tree-walk under both the
-//! incremental (`sync`) and full (`index --force`) code paths, and under both
-//! the rayon parallel parse and a single-threaded (`RAYON_NUM_THREADS=1`)
-//! parse.
+//! `godot:id:<kind>:<value>` sentinels — i.e. it stresses the project-scoped DSL
+//! config load under both the incremental (`sync`) and full (`index --force`)
+//! code paths, and under the rayon parallel parse.
 //!
 //! Comparisons use the codegraph-bench canonical oracle (order-independent
 //! edge/ref multisets + `.schema`), so "identical" means content + `.schema`,
@@ -22,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use codegraph_bench::oracle::{canonicalize_db, diff_canonical};
+use codegraph_core::IndexPaths;
 
 struct TestDir {
     path: PathBuf,
@@ -75,25 +74,25 @@ skill_effect = \"a:b:9015:c:7005:1000\"
 duration = 5.0
 ";
 
-/// Lay down a Godot project (project.godot + a `.tres` + an idFields config)
-/// under `root`.
+/// Lay down a Godot project (project.godot + a `.tres`) under `root`.
 fn write_godot_project(root: &Path) {
-    fs::create_dir_all(root.join(".codegraph")).unwrap();
-    fs::write(
-        root.join(".codegraph").join("codegraph.json"),
-        IDFIELDS_CONFIG,
-    )
-    .unwrap();
+    fs::create_dir_all(root).unwrap();
     fs::write(root.join("project.godot"), PROJECT_GODOT).unwrap();
     fs::create_dir_all(root.join("data")).unwrap();
     fs::write(root.join("data").join("strength.tres"), BUFF_TRES).unwrap();
 }
 
-/// Run the binary with `cwd` as the working directory. The config reader walks
-/// up from each `.tres`'s relative path joined onto cwd, so the project must be
-/// the cwd for the opt-in `idFields` config to be discovered — exactly how a
-/// user runs `codegraph` from inside their project. `CODEGRAPH_NO_DAEMON` keeps
-/// the run foreground so the test never blocks on a background daemon.
+/// Write the project's CURRENT-ROOT `codegraph.json` — the only DSL config a
+/// project-scoped run consults. Call after `init` published the namespace.
+fn write_idfields_config(root: &Path) {
+    let paths = IndexPaths::resolve(root, None).expect("resolve index paths");
+    fs::write(paths.extension_config(), IDFIELDS_CONFIG).unwrap();
+}
+
+/// Run the binary with `cwd` as the working directory — how a user runs
+/// `codegraph` from inside their project. The DSL config is resolved from the
+/// project's own index root, not the cwd. `CODEGRAPH_NO_DAEMON` keeps the run
+/// foreground so the test never blocks on a background daemon.
 fn cli_cwd(cwd: &Path, args: &[&str]) -> (String, String, bool) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_codegraph"));
     cmd.current_dir(cwd);
@@ -109,7 +108,9 @@ fn cli_cwd(cwd: &Path, args: &[&str]) -> (String, String, bool) {
 }
 
 fn db_path(project: &Path) -> PathBuf {
-    project.join(".codegraph").join("codegraph.db")
+    // Batch M: both the index DB and the opt-in DSL config live in the isolated
+    // v2 namespace.
+    project.join(".codegraph-v2").join("codegraph.db")
 }
 
 /// (i) `sync` after an edit to the `.tres` must equal a full `index --force`
@@ -123,6 +124,9 @@ fn idfields_sync_after_edit_equals_index_force_from_scratch() {
     write_godot_project(&project);
     let (out, err, ok) = cli_cwd(&project, &["init", "."]);
     assert!(ok, "init failed: stdout={out} stderr={err}");
+    write_idfields_config(&project);
+    let (out, err, ok) = cli_cwd(&project, &["index", "--force", "."]);
+    assert!(ok, "configured index failed: stdout={out} stderr={err}");
 
     // When the `.tres` is edited (a new idField line added) and synced,
     let edited = "\
@@ -144,6 +148,7 @@ duration = 9.0
     fs::write(scratch_project.join("data").join("strength.tres"), edited).unwrap();
     let (out, err, ok) = cli_cwd(&scratch_project, &["init", "."]);
     assert!(ok, "scratch init failed: stdout={out} stderr={err}");
+    write_idfields_config(&scratch_project);
     let (out, err, ok) = cli_cwd(&scratch_project, &["index", "--force", "."]);
     assert!(ok, "index --force failed: stdout={out} stderr={err}");
 
@@ -156,8 +161,8 @@ duration = 9.0
 
 /// (ii) Two independent parallel `index --force` runs of the same idFields
 /// Godot project must be canonically identical — proving the rayon-parallel
-/// framework-extraction path (with the mtime-cached config reader shared across
-/// threads) converges on ONE fixed canonical form regardless of thread
+/// framework-extraction path (with the project's config loaded once and shared
+/// immutably across threads) converges on ONE fixed canonical form regardless of thread
 /// scheduling. This mirrors `parallel_index.rs`'s determinism property, applied
 /// to the `godot:id:*` sentinel-emitting path. (A single-threaded run via
 /// `RAYON_NUM_THREADS=1` is deliberately NOT used: the CLI bulk-index pipeline
@@ -172,12 +177,14 @@ fn idfields_parallel_index_is_deterministic_across_runs() {
     write_godot_project(&first_project);
     let (out, err, ok) = cli_cwd(&first_project, &["init", "."]);
     assert!(ok, "first init failed: stdout={out} stderr={err}");
+    write_idfields_config(&first_project);
 
     let second = TestDir::new("parallel-b");
     let second_project = second.path().join("game");
     write_godot_project(&second_project);
     let (out, err, ok) = cli_cwd(&second_project, &["init", "."]);
     assert!(ok, "second init failed: stdout={out} stderr={err}");
+    write_idfields_config(&second_project);
 
     // When each is independently indexed with the default rayon parallelism,
     let (out, err, ok) = cli_cwd(&first_project, &["index", "--force", "."]);

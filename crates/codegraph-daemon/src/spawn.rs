@@ -35,6 +35,9 @@ const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 /// file watcher, exactly as if the flag had been inherited — but without any
 /// global-env mutation in the parent.
 pub fn spawn_detached_daemon(exe: &Path, root: &Path, no_watch: bool) -> Result<()> {
+    // Resolved once, fail-closed: the log target must be the project's own v2
+    // rendezvous log, never a reconstructed path.
+    let log_path = daemon_log_path(root)?;
     let mut command = Command::new(exe);
     command
         .arg("serve")
@@ -43,8 +46,8 @@ pub fn spawn_detached_daemon(exe: &Path, root: &Path, no_watch: bool) -> Result<
         .arg(root)
         .env(CODEGRAPH_DAEMON_INTERNAL, "1")
         .stdin(Stdio::null())
-        .stdout(log_target(root))
-        .stderr(log_target(root));
+        .stdout(log_target(&log_path))
+        .stderr(log_target(&log_path));
     if no_watch {
         command.env(CODEGRAPH_NO_WATCH, "1");
     }
@@ -60,11 +63,18 @@ pub fn spawn_detached_daemon(exe: &Path, root: &Path, no_watch: bool) -> Result<
     Ok(())
 }
 
-fn log_target(root: &Path) -> Stdio {
+/// The rendezvous dir is created by the daemon's lock layer in the CHILD, but
+/// this log redirect is set up in the PARENT before spawn, so the parent creates
+/// the log's parent directory here — otherwise the redirect silently falls back
+/// to a null sink and the child's stderr is lost.
+fn log_target(path: &Path) -> Stdio {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     OpenOptions::new()
         .create(true)
         .append(true)
-        .open(daemon_log_path(root))
+        .open(path)
         .map_or_else(|_| Stdio::null(), Stdio::from)
 }
 

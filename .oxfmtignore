@@ -9,6 +9,11 @@ changelog/
 .release-please-manifest.json
 release-please-config.json
 
+# Frozen/hash-addressed upstream-sync provenance. These bytes are reviewed and
+# verified by SHA rather than rewritten by the general Markdown formatter.
+docs/upstream-sync/UPSTREAM.md
+docs/upstream-sync/V1_5_COMMIT_MANIFEST.md
+
 # Golden artifacts are byte-compared by the equivalence/golden oracle tests
 # (include_str! / fs::read). Reformatting them breaks the test suite.
 reference/

@@ -5,8 +5,23 @@ use codegraph_core::types::NodeKind;
 pub fn normalize_name_token(raw: &str) -> String {
     raw.to_lowercase()
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
+        .filter(|c| c.is_alphanumeric())
         .collect()
+}
+
+/// Minimum length for a scoring token (#1372).
+///
+/// An ASCII word shorter than three characters carries no retrieval signal
+/// ("of", "is", "at"), which is why the floor exists. An unsegmented script
+/// packs a whole word into two characters — `模块` IS "module" — so a token
+/// holding any non-ASCII character is admitted at two. ASCII tokens keep the
+/// original three-character floor byte-for-byte.
+fn meets_min_token_len(token: &str) -> bool {
+    let len = token.chars().count();
+    if len >= 3 {
+        return true;
+    }
+    len >= 2 && !token.is_ascii()
 }
 
 pub const STOP_WORDS: &[&str] = &[
@@ -336,12 +351,12 @@ pub fn extract_search_terms(query: &str, include_stems: bool) -> Vec<String> {
         .map(|c| if c == '_' || c == '.' { ' ' } else { c })
         .collect();
 
-    for word in normalised.split(|c: char| !c.is_ascii_alphanumeric()) {
+    for word in normalised.split(|c: char| !c.is_alphanumeric()) {
         if word.is_empty() {
             continue;
         }
         let lower = word.to_lowercase();
-        if lower.chars().count() < 3 {
+        if !meets_min_token_len(&lower) {
             continue;
         }
         if is_stop_word(&lower) {
@@ -645,6 +660,62 @@ pub fn kind_bonus(kind: NodeKind) -> f64 {
     }
 }
 
+/// Split an identifier into its lowercase word segments (#1319).
+///
+/// Non-alphanumerics separate runs (`user_profile_id`, `order-state`,
+/// `file.name`); inside a run, a lowercase/digit→uppercase transition is a
+/// camelCase hump (`orderState` → order|state) and an uppercase followed by
+/// uppercase+lowercase closes an acronym (`HTMLParser` → html|parser). Digits
+/// stay glued to their word (`getInfoV2` → get|info|v2).
+pub fn identifier_segments(raw: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for run in raw.split(|c: char| !c.is_alphanumeric()) {
+        if run.is_empty() {
+            continue;
+        }
+        let chars: Vec<char> = run.chars().collect();
+        let mut current = String::new();
+        for i in 0..chars.len() {
+            if i > 0 {
+                let prev = chars[i - 1];
+                let cur = chars[i];
+                let hump = (prev.is_lowercase() || prev.is_numeric()) && cur.is_uppercase();
+                let acronym = prev.is_uppercase()
+                    && cur.is_uppercase()
+                    && chars.get(i + 1).is_some_and(|n| n.is_lowercase());
+                if (hump || acronym) && !current.is_empty() {
+                    out.push(std::mem::take(&mut current).to_lowercase());
+                }
+            }
+            current.push(chars[i]);
+        }
+        if !current.is_empty() {
+            out.push(current.to_lowercase());
+        }
+    }
+    out
+}
+
+/// Whether a query token names a MULTI-SEGMENT field (#1319): `userProfileId`,
+/// `user_profile_id`, `ProfileInfo` — but not a bare word like `profile`, which
+/// must keep its natural-language stop-word guard.
+pub fn is_multi_segment_identifier(token: &str) -> bool {
+    identifier_segments(token).len() >= 2
+}
+
+/// Whether `name`'s segments CONTAIN the query's segment run contiguously
+/// (#1319) — the hump-boundary filter that separates a real definer
+/// (`getProfileInfoV2` for `profileInfo`) from an incidental namesake
+/// (`xxprofileinfoxx`, one unsegmented word).
+pub fn name_segments_contain_run(name: &str, query: &str) -> bool {
+    let want = identifier_segments(query);
+    if want.is_empty() {
+        return false;
+    }
+    let have = identifier_segments(name);
+    have.windows(want.len()).any(|w| w == want.as_slice())
+}
+
 pub fn is_distinctive_identifier(token: &str) -> bool {
     if token.is_empty() {
         return false;
@@ -875,6 +946,61 @@ mod tests {
         assert_eq!(kind_bonus(NodeKind::Function), 10.0);
         assert_eq!(kind_bonus(NodeKind::File), 0.0);
         assert_eq!(kind_bonus(NodeKind::Interface), 9.0);
+    }
+
+    #[test]
+    fn identifier_segments_splits_humps_snake_and_acronyms() {
+        assert_eq!(
+            identifier_segments("userProfileId"),
+            ["user", "profile", "id"]
+        );
+        assert_eq!(
+            identifier_segments("user_profile_id"),
+            ["user", "profile", "id"]
+        );
+        assert_eq!(identifier_segments("order-state"), ["order", "state"]);
+        assert_eq!(identifier_segments("HTMLParser"), ["html", "parser"]);
+        assert_eq!(identifier_segments("getInfoV2"), ["get", "info", "v2"]);
+        assert_eq!(identifier_segments("plain"), ["plain"]);
+        assert!(identifier_segments("").is_empty());
+        assert!(identifier_segments("__").is_empty());
+    }
+
+    #[test]
+    fn is_multi_segment_identifier_only_for_multi_segment_tokens() {
+        assert!(is_multi_segment_identifier("userProfileId"));
+        assert!(is_multi_segment_identifier("user_profile_id"));
+        assert!(is_multi_segment_identifier("ProfileInfo"));
+        assert!(!is_multi_segment_identifier("profile"));
+        assert!(!is_multi_segment_identifier("PROFILE"));
+        assert!(!is_multi_segment_identifier(""));
+    }
+
+    #[test]
+    fn name_segments_contain_run_requires_a_segment_boundary() {
+        // A real definer: the query's segment run appears contiguously.
+        assert!(name_segments_contain_run("getProfileInfoV2", "profileInfo"));
+        assert!(name_segments_contain_run(
+            "getProfileInfoV2",
+            "profile_info"
+        ));
+        assert!(name_segments_contain_run(
+            "updateUserProfileIdMapping",
+            "userProfileId"
+        ));
+        assert!(name_segments_contain_run("load_order_state", "orderState"));
+        // An incidental namesake: the lowercase run is there, the boundary is not.
+        assert!(!name_segments_contain_run("xxprofileinfoxx", "profileInfo"));
+        assert!(!name_segments_contain_run(
+            "xxuserprofileidxx",
+            "userProfileId"
+        ));
+        // Non-contiguous segments are not a match either.
+        assert!(!name_segments_contain_run(
+            "profileOtherInfo",
+            "profileInfo"
+        ));
+        assert!(!name_segments_contain_run("anything", ""));
     }
 
     #[test]

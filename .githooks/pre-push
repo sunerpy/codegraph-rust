@@ -10,7 +10,8 @@
 #   1. cargo fmt --all --check        (rustfmt)
 #   2. cargo clippy ... -D warnings    (lint, warnings are errors)
 #   3. cargo test --workspace          (incl. golden oracle + sync equivalence)
-#   4. scripts/guardrail.sh            (no AI / vector / LLM crates)
+#   4. scripts/guardrail.sh            (no AI/vector/LLM crates + no release
+#                                       asset-name drift)
 #
 # Enable once per clone:
 #   make hooks            # == git config core.hooksPath .githooks
@@ -45,11 +46,12 @@ if ! cargo test --workspace; then
     exit 1
 fi
 
-echo "==> [4/4] scripts/guardrail.sh (no AI/vector/LLM crates)"
+echo "==> [4/4] scripts/guardrail.sh (no AI/vector/LLM crates + asset-name drift)"
 if ! bash scripts/guardrail.sh; then
     echo "" >&2
-    echo "❌ Scope guardrail failed: a forbidden AI/vector/LLM crate was detected." >&2
-    echo "   This project is deterministic and ML-free by design. Push aborted." >&2
+    echo "❌ Scope guardrail failed: a forbidden AI/vector/LLM crate was detected," >&2
+    echo "   or the release workflow and the installers disagree on asset names." >&2
+    echo "   Read the diagnostics above; push aborted." >&2
     exit 1
 fi
 

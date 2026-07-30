@@ -86,7 +86,7 @@ graph LR
     RS -->|已解析边| ST
     ST --> GR[graph<br/>遍历 + FTS 打分]
     GR --> MCP[mcp 8 工具]
-    GR --> CLI[cli 13 子命令]
+    GR --> CLI[cli 26 子命令]
     ST --> MCP
     ST --> CLI
     DA[daemon] --> MCP
@@ -221,19 +221,22 @@ FTS5 候选（`search_nodes_fts_filtered`）→（空且文本≥2）LIKE 阶梯
 
 ## 7. CLI 表面 / CLI Surface（`codegraph-cli`）
 
-`codegraph` 单一二进制，clap 13 个子命令（见
-[README §CLI 子命令](../README.md#cli-子命令--cli-subcommands共-13-个)）。CLI 负责
-rust-base-convention bootstrap：解析命令取项目根 → `init_config` fail-fast（人类可读
-错误）→ `init_logger`（在 `main` 中持有 guard；CLI 进程关闭 stdout/file 输出，
-保证 JSON 输出干净）。
+`codegraph` 单一二进制，clap 26 个子命令（见
+[README §CLI 子命令](../README.md#cli-subcommands)）。CLI bootstrap：
+`Config::load_env_or_default` fail-fast（人类可读错误，只配置 logger，不代表任何项目）
+→ `init_logger`（在 `main` 中持有 guard；日志只走 stderr，`serve --mcp` 独占 stdout
+以免污染 JSON-RPC 流）。每个针对项目的操作再各自从该项目解析出的索引根加载其
+不可变配置。
 
 - 索引编排只用各 crate 公共 API：`extract::engine::{scan_project, extract_file}` →
   `store::Store` upsert/insert → `resolve::ReferenceResolver::resolve_and_persist`。
-  全量索引写 `.codegraph/codegraph.db`、文件记录、结构边、未解析引用、已解析边及
+  全量索引写 `.codegraph-v2/codegraph.db`、文件记录、结构边、未解析引用、已解析边及
   索引元数据。
 - `serve --mcp` 调用 `codegraph_mcp::McpServer` 公共入口（stdin/stdout）。
-- **`sync` 当前复用安全的全量索引路径**（`main.rs` 注释标明），即“增量”实为全量
-  重建——这是 daemon/watch 接线前的有意取舍，已在基准报告中如实记录。
+- **`sync` 为真正的单文件增量路径**：`codegraph_watch::sync_project_once_with_progress`
+  自行扫描候选文件，按内容哈希跳过未变更文件，对变更文件逐个删除并重新插入，
+  删除已消失的文件，最后整体重新解析，因此结果等价于 `index --force`。
+  输出报告 reindexed / skipped / removed 三个计数。
 
 子命令的输出/JSON 形状遵循固定的输出/JSON 契约（源码注释标注行号）。
 
@@ -275,8 +278,9 @@ serverInfo:{name:"codegraph",version}, instructions}`；`tools/list` 返回 8 �
   所有客户端断开且空闲超时后自动退出（`CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS`，
   默认 5 分钟）。另有 `run_foreground`/`attach_to_daemon`/`unlock_project`/
   `daemon_pid_path`/`daemon_socket_path`。
-- 会合文件位于 `<project>/.codegraph/`：`daemon.pid` 与 `daemon.sock`（socket 路径
-  过长时回落到哈希后的 tmpdir socket）。
+- 会合文件位于当前索引根 `<project>/.codegraph-v2/`：`daemon.pid`、`daemon.sock`
+  与 `daemon.log`，全部经 `IndexPaths` 派生（socket 路径过长时回落到哈希后的
+  tmpdir socket，其名称带 v2 判别前缀）。
 - 加锁逻辑（`daemon.ts:393-412`）：完整 JSON 锁信息先写私有临时文件，再原子
   hard-link 就位，避免空/半写 pidfile 竞争。
 - 陈旧解锁镜像 `daemon.ts:453-481`：删除前重读、已知 pid 时比对、**绝不**清除存活

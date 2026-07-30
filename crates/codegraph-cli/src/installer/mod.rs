@@ -497,10 +497,8 @@ fn tildify(ctx: &InstallContext, path: &std::path::Path) -> String {
 mod tests {
     use super::*;
     use crate::installer::types::FileWrite;
+    use crate::test_env::env_guard;
     use std::fs;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn temp_ctx(label: &str) -> (InstallContext, PathBuf) {
         let base = std::env::temp_dir().join(format!(
@@ -589,11 +587,10 @@ mod tests {
     #[test]
     fn init_target_kiro_writes_project_local_mcp_with_concrete_path() {
         // Given a temp HOME and an indexed project root
-        let _lock = ENV_LOCK.lock().unwrap();
+        let mut env = env_guard();
         let (ctx, base) = temp_ctx("init-kiro");
         let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-        let prev_home = std::env::var_os(home_key);
-        unsafe { std::env::set_var(home_key, &ctx.home) };
+        env.set(home_key, &ctx.home);
 
         // When init --target=kiro installs project-local config (run twice = idempotent)
         run_install_local_targets(ctx.cwd.clone(), "kiro").unwrap();
@@ -617,21 +614,17 @@ mod tests {
             "must pin concrete project path, got: {args:?}"
         );
 
-        match prev_home {
-            Some(v) => unsafe { std::env::set_var(home_key, v) },
-            None => unsafe { std::env::remove_var(home_key) },
-        }
+        env.assert_intact();
         let _ = fs::remove_dir_all(base);
     }
 
     #[test]
     fn init_target_none_writes_nothing() {
         // Given a temp HOME and a project root
-        let _lock = ENV_LOCK.lock().unwrap();
+        let mut env = env_guard();
         let (ctx, base) = temp_ctx("init-none");
         let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-        let prev_home = std::env::var_os(home_key);
-        unsafe { std::env::set_var(home_key, &ctx.home) };
+        env.set(home_key, &ctx.home);
 
         // When init runs with the default target (none)
         run_install_local_targets(ctx.cwd.clone(), "none").unwrap();
@@ -642,10 +635,7 @@ mod tests {
             "none must be a pure no-op"
         );
 
-        match prev_home {
-            Some(v) => unsafe { std::env::set_var(home_key, v) },
-            None => unsafe { std::env::remove_var(home_key) },
-        }
+        env.assert_intact();
         let _ = fs::remove_dir_all(base);
     }
 
@@ -777,13 +767,11 @@ mod tests {
 
     #[test]
     fn run_uninstall_with_ctx_via_public_paths() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let mut env = env_guard();
         let (ctx, base) = temp_ctx("run-uninstall");
         let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-        let prev_home = std::env::var_os(home_key);
-        unsafe { std::env::set_var(home_key, &ctx.home) };
-        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", ctx.xdg_config_home.as_ref().unwrap()) };
+        env.set(home_key, &ctx.home);
+        env.set("XDG_CONFIG_HOME", ctx.xdg_config_home.as_ref().unwrap());
 
         run_uninstall(UninstallArgs {
             target: Some("gemini".to_string()),
@@ -792,24 +780,16 @@ mod tests {
         })
         .unwrap();
 
-        match prev_home {
-            Some(v) => unsafe { std::env::set_var(home_key, v) },
-            None => unsafe { std::env::remove_var(home_key) },
-        }
-        match prev_xdg {
-            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
-            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
-        }
+        env.assert_intact();
         let _ = fs::remove_dir_all(base);
     }
 
     #[test]
     fn run_skill_install_and_uninstall_and_status_via_ctx() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let mut env = env_guard();
         let (ctx, base) = temp_ctx("run-skill");
         let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-        let prev_home = std::env::var_os(home_key);
-        unsafe { std::env::set_var(home_key, &ctx.home) };
+        env.set(home_key, &ctx.home);
 
         run_skill_install(SkillArgs {
             target: Some("claude".to_string()),
@@ -833,10 +813,7 @@ mod tests {
         })
         .unwrap();
 
-        match prev_home {
-            Some(v) => unsafe { std::env::set_var(home_key, v) },
-            None => unsafe { std::env::remove_var(home_key) },
-        }
+        env.assert_intact();
         let _ = fs::remove_dir_all(base);
     }
 }

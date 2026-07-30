@@ -43,6 +43,16 @@ const EXPECTED_PROTOCOL: u64 = 1;
 /// Poll cadence for the PPID watchdog (mirrors colby `DEFAULT_PPID_POLL_MS`).
 const PPID_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Last-resort bound on the post-host-EOF wait for the replies the host is still
+/// owed (see [`ReplyLedger`]). Never reached in normal operation — the ledger
+/// settles the instant the daemon answers the last forwarded request, or the
+/// instant the daemon stream ends. It exists only so a daemon that accepted the
+/// connection and then stalled forever cannot wedge the proxy's teardown; it is
+/// deliberately LONGER than any caller's own deadline, so a genuinely stalled
+/// daemon still surfaces as that caller's failure rather than being absorbed
+/// here.
+const REPLY_DRAIN_BUDGET: Duration = Duration::from_secs(20);
+
 /// Outcome of a proxy attempt.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ProxyOutcome {
@@ -100,15 +110,16 @@ pub fn run_proxy<R: BufRead, W: Write + Send + 'static>(
         return Ok(mismatch);
     }
 
-    // Split into independent recv/send halves. interprocess's sync UDS split
-    // hands BOTH halves an `Arc` over the SAME fd, so merely DROPPING the send
-    // half does not signal EOF to the daemon — the fd stays open via the recv
-    // half. We therefore capture the WRITE-side fd before moving `send` into the
-    // up pump and, once the host side is done, explicitly half-close it
-    // (shutdown(SHUT_WR)); that is what makes the daemon's session reader hit
-    // EOF, flush its last reply, and close — which in turn EOFs our recv pump so
-    // `down.join()` never hangs. The fd stays valid through teardown because the
-    // recv half keeps the shared socket open.
+    // Split into independent recv/send halves. interprocess's split hands BOTH
+    // halves a refcount over the SAME kernel object (an `Arc<RawPipeStream>` on
+    // windows, an `Arc` over one fd on unix), so merely DROPPING the send half
+    // does not signal EOF to the daemon — the object stays open via the recv
+    // half. On unix we therefore capture the WRITE-side fd before moving `send`
+    // into the up pump and, once the host side is done, explicitly half-close it
+    // (shutdown(SHUT_WR)), which makes the daemon's session reader hit EOF,
+    // flush its last reply, and close. Windows named pipes have NO half-close,
+    // so teardown there cannot depend on the daemon closing first; the reply
+    // ledger below is what bounds it on every platform.
     let (recv, mut send) = stream.split();
     let write_fd = write_raw_fd(&send);
 
@@ -125,6 +136,10 @@ pub fn run_proxy<R: BufRead, W: Write + Send + 'static>(
     // Shared shutdown flag flipped by the watchdog on host death and polled
     // per-line by the up pump. Its byte-for-byte pump semantics are unchanged.
     let shutdown = Arc::new(AtomicBool::new(false));
+    // What the host is still OWED: every forwarded request id, retired only once
+    // its reply has been written to the host. This is the platform-independent
+    // teardown condition — see `ReplyLedger`.
+    let ledger = Arc::new(ReplyLedger::default());
     // Event channel the watchdog parks on: lets teardown wake it the instant
     // shutdown is decided instead of after the remainder of a poll interval.
     let watchdog_wake = Arc::new(Shutdown::new());
@@ -144,27 +159,142 @@ pub fn run_proxy<R: BufRead, W: Write + Send + 'static>(
     let socket_reader = BufReader::new(recv);
     let down_suppressed = Arc::clone(&suppressed_id);
     let down_out = Arc::clone(&host_out);
-    let down =
-        thread::spawn(move || pump_daemon_to_host(socket_reader, &down_out, &down_suppressed));
+    let down_ledger = Arc::clone(&ledger);
+    let down = thread::spawn(move || {
+        let result = pump_daemon_to_host(socket_reader, &down_out, &down_suppressed, &down_ledger);
+        // The daemon stream ended: nothing further can ever arrive, so whatever is
+        // still outstanding will never be answered. Settle the ledger so a
+        // teardown parked on it wakes instead of waiting out the budget.
+        down_ledger.abandon();
+        result
+    });
 
     // host -> daemon pump (this thread): answer initialize/tools-list locally,
     // forward the rest. Runs to completion on host_in EOF.
-    let up_result = pump_host_to_daemon(host_in, send, &host_out, &shutdown, &suppressed_id);
+    let up_result =
+        pump_host_to_daemon(host_in, send, &host_out, &shutdown, &suppressed_id, &ledger);
 
-    // Host side is done. Half-close the write direction so the daemon reader
-    // EOFs (it flushes its final reply first); the down pump then drains those
-    // replies and exits on its own EOF. Do NOT flip `shutdown` before the join
-    // or it would race the drain and drop the last reply.
+    // Host side is done, but the daemon may still owe replies to requests we
+    // forwarded. Wait for the LEDGER to settle — every owed reply written, or the
+    // daemon stream gone — NOT for the down pump to exit.
+    //
+    // On unix we first half-close the write direction: the daemon reader EOFs,
+    // flushes its final reply, and closes, so the down pump reaches EOF on its
+    // own and `down.join()` returns. Windows named pipes have NO half-close
+    // (`half_close_write` is a documented no-op there), so the daemon's session
+    // reader NEVER EOFs while our recv half keeps the pipe open — its rmcp serve
+    // loop parks on the next frame, the pipe is never closed, and the down pump
+    // therefore never returns. Joining it unconditionally is an UNBOUNDED wait on
+    // windows; it is what made this function never return there.
     half_close_write(write_fd);
-    let _ = down.join();
+    let settled = ledger.wait_until_settled(REPLY_DRAIN_BUDGET);
     shutdown.store(true, Ordering::SeqCst);
     // Wake the watchdog at once so its join (in drop) returns promptly instead
     // of waiting out the remainder of a poll interval.
     watchdog_wake.signal();
     drop(watchdog);
+    // Join only when the down pump can actually be known to have finished: it
+    // exits on daemon EOF, which only the half-closing platform guarantees.
+    // Elsewhere it is detached — its thread ends when the daemon closes the pipe
+    // (idle-exit, sweep, or shutdown), and it holds only clones.
+    if HALF_CLOSE_EOFS_DAEMON {
+        let _ = down.join();
+    }
 
     up_result?;
+    anyhow::ensure!(
+        settled,
+        "daemon did not answer every forwarded request within {REPLY_DRAIN_BUDGET:?}"
+    );
     Ok(ProxyOutcome::Proxied)
+}
+
+/// Whether [`half_close_write`] actually makes the daemon's session reader see
+/// EOF. True on unix (`shutdown(SHUT_WR)` on the shared socket fd); FALSE on
+/// windows, where named pipes have no half-close, so the daemon keeps its
+/// session open and the daemon->host pump never reaches EOF on its own.
+#[cfg(unix)]
+const HALF_CLOSE_EOFS_DAEMON: bool = true;
+#[cfg(not(unix))]
+const HALF_CLOSE_EOFS_DAEMON: bool = false;
+
+/// The proxy's platform-independent teardown condition: the set of forwarded
+/// request ids the host is still OWED a reply for.
+///
+/// The proxy cannot tear down the instant the host's stdin closes — the daemon
+/// may still be computing the answer to a `tools/call` already in flight, and
+/// dropping it would lose the host's result. The ORIGINAL teardown waited for
+/// the daemon->host pump to hit EOF, which is only reachable when the proxy can
+/// half-close its write direction and make the daemon close first. That is a
+/// UNIX property: windows named pipes have no half-close, so on windows nothing
+/// ever ends that pump and the wait was unbounded.
+///
+/// A ledger replaces "wait for the peer to close" with "wait until nothing is
+/// owed", which holds on every platform: an id is recorded when its request is
+/// forwarded and retired when its reply is written to the host, so
+/// [`wait_until_settled`](Self::wait_until_settled) returns exactly when the last
+/// answer has been delivered. [`abandon`](Self::abandon) settles it when the
+/// daemon stream ends (nothing more can arrive), and notifications — which have
+/// no id and are never answered — are never recorded.
+#[derive(Default)]
+struct ReplyLedger {
+    state: Mutex<LedgerState>,
+    settled: Condvar,
+}
+
+#[derive(Default)]
+struct LedgerState {
+    outstanding: Vec<Value>,
+    abandoned: bool,
+}
+
+impl ReplyLedger {
+    fn record(&self, id: Value) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.outstanding.push(id);
+    }
+
+    fn retire(&self, id: &Value) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(at) = state.outstanding.iter().position(|owed| owed == id) {
+            state.outstanding.remove(at);
+        }
+        if state.outstanding.is_empty() {
+            self.settled.notify_all();
+        }
+    }
+
+    fn abandon(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.abandoned = true;
+        self.settled.notify_all();
+    }
+
+    /// Park until nothing is owed (or the daemon stream ended), bounded by
+    /// `budget`. `true` means settled; `false` means the budget ran out with
+    /// replies still owed.
+    fn wait_until_settled(&self, budget: Duration) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (state, _) = self
+            .settled
+            .wait_timeout_while(state, budget, |state| {
+                !state.abandoned && !state.outstanding.is_empty()
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.abandoned || state.outstanding.is_empty()
+    }
 }
 
 /// The write-side fd handle carried between `write_raw_fd` and
@@ -227,6 +357,7 @@ fn pump_host_to_daemon<R, S, W>(
     host_out: &Arc<Mutex<W>>,
     shutdown: &Arc<AtomicBool>,
     suppressed_id: &Arc<Mutex<Option<Value>>>,
+    ledger: &Arc<ReplyLedger>,
 ) -> Result<()>
 where
     R: BufRead,
@@ -285,7 +416,12 @@ where
             }
             _ => {
                 // Everything else (tools/call, ping, notifications, ...) is
-                // forwarded verbatim to the daemon.
+                // forwarded verbatim to the daemon. Only a REQUEST (one carrying
+                // an `id`) is ever answered, so only that owes the host a reply;
+                // a notification has no id and is deliberately not recorded.
+                if let Some(id) = id {
+                    ledger.record(id);
+                }
                 forward_to_daemon(&mut daemon_send, &line)?;
             }
         }
@@ -294,13 +430,16 @@ where
 }
 
 /// daemon -> host: forward each daemon line to the host, dropping the response
-/// to the suppressed-initialize id. Drains to socket EOF (NOT a `shutdown`
-/// flag): the daemon closes the socket only after flushing its last reply, so
-/// exiting on EOF alone guarantees the final `tools/call` answer is delivered.
+/// to the suppressed-initialize id and retiring each delivered reply from
+/// `ledger` — that retirement, not this pump's own EOF, is what releases the
+/// teardown, so the final `tools/call` answer is delivered on every platform
+/// including ones with no socket half-close. Still drains to EOF (NOT a
+/// `shutdown` flag) so a daemon that keeps talking is never cut off mid-reply.
 fn pump_daemon_to_host<S, W>(
     daemon_recv: S,
     host_out: &Arc<Mutex<W>>,
     suppressed_id: &Arc<Mutex<Option<Value>>>,
+    ledger: &Arc<ReplyLedger>,
 ) -> Result<()>
 where
     S: BufRead,
@@ -315,7 +454,9 @@ where
             continue;
         }
 
-        // Suppress the daemon's reply to the forwarded initialize id.
+        // Suppress the daemon's reply to the forwarded initialize id. That id is
+        // answered locally and never recorded as owed, so nothing is retired here.
+        let mut delivered_id = None;
         if let Ok(resp) = serde_json::from_str::<Value>(&line) {
             let is_reply = resp.get("result").is_some() || resp.get("error").is_some();
             if is_reply {
@@ -328,10 +469,16 @@ where
                 {
                     continue;
                 }
+                delivered_id = resp_id.cloned();
             }
         }
 
         write_host_line(host_out, &line)?;
+        // Retire AFTER the host write: the teardown may proceed the instant the
+        // ledger settles, so the reply must already be in the host's hands.
+        if let Some(id) = delivered_id {
+            ledger.retire(&id);
+        }
     }
     Ok(())
 }
@@ -610,9 +757,17 @@ mod tests {
         let host_out = Arc::new(Mutex::new(Vec::<u8>::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let suppressed: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let ledger = Arc::new(ReplyLedger::default());
 
-        pump_host_to_daemon(host_in, &mut daemon_sink, &host_out, &shutdown, &suppressed)
-            .expect("pump runs to host_in EOF");
+        pump_host_to_daemon(
+            host_in,
+            &mut daemon_sink,
+            &host_out,
+            &shutdown,
+            &suppressed,
+            &ledger,
+        )
+        .expect("pump runs to host_in EOF");
 
         let to_host = String::from_utf8(host_out.lock().unwrap().clone()).unwrap();
         assert!(to_host.contains("\"id\":1"), "initialize answered locally");
@@ -634,6 +789,20 @@ mod tests {
             Some(json!(1)),
             "the forwarded initialize id is recorded for reply suppression"
         );
+
+        // Only the FORWARDED request whose reply must come from the daemon (id 3)
+        // is owed. The locally answered initialize (id 1, suppressed) and
+        // tools/list (id 2, not forwarded) are already delivered, so recording
+        // them would leave the ledger permanently unsettled.
+        assert!(
+            !ledger.wait_until_settled(Duration::from_millis(0)),
+            "the forwarded tools/call still owes the host a reply"
+        );
+        ledger.retire(&json!(3));
+        assert!(
+            ledger.wait_until_settled(Duration::from_millis(0)),
+            "retiring the only owed id settles the ledger"
+        );
     }
 
     #[test]
@@ -647,9 +816,17 @@ mod tests {
         let host_out = Arc::new(Mutex::new(Vec::<u8>::new()));
         let shutdown = Arc::new(AtomicBool::new(true));
         let suppressed: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let ledger = Arc::new(ReplyLedger::default());
 
-        pump_host_to_daemon(host_in, &mut daemon_sink, &host_out, &shutdown, &suppressed)
-            .expect("pump exits promptly on a pre-set shutdown");
+        pump_host_to_daemon(
+            host_in,
+            &mut daemon_sink,
+            &host_out,
+            &shutdown,
+            &suppressed,
+            &ledger,
+        )
+        .expect("pump exits promptly on a pre-set shutdown");
         assert!(
             daemon_sink.is_empty(),
             "no line forwarded once shutdown is set"
@@ -667,12 +844,92 @@ mod tests {
         );
         let host_out = Arc::new(Mutex::new(Vec::<u8>::new()));
         let suppressed: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(Some(json!(1))));
+        let ledger = Arc::new(ReplyLedger::default());
+        ledger.record(json!(3));
 
-        pump_daemon_to_host(daemon_recv, &host_out, &suppressed).expect("drains to EOF");
+        pump_daemon_to_host(daemon_recv, &host_out, &suppressed, &ledger).expect("drains to EOF");
 
         let to_host = String::from_utf8(host_out.lock().unwrap().clone()).unwrap();
         assert!(!to_host.contains("suppressed"), "id 1 reply is dropped");
         assert!(to_host.contains("forwarded"), "id 3 reply is delivered");
+        assert!(
+            ledger.wait_until_settled(Duration::from_millis(0)),
+            "delivering the owed reply retires it from the ledger"
+        );
+    }
+
+    /// The teardown wait must be released by the LEDGER, not by the daemon
+    /// closing its end: a windows named pipe has no half-close, so the daemon
+    /// never EOFs while the proxy's recv half holds the pipe open. Waiting on the
+    /// ledger settles on the last reply DELIVERED, which happens on every
+    /// platform.
+    #[test]
+    fn reply_ledger_settles_on_the_last_delivered_reply_not_on_peer_close() {
+        let ledger = Arc::new(ReplyLedger::default());
+        ledger.record(json!(1));
+        ledger.record(json!("two"));
+        assert!(
+            !ledger.wait_until_settled(Duration::from_millis(0)),
+            "two owed replies keep the ledger unsettled"
+        );
+
+        let settler = Arc::clone(&ledger);
+        let parked = thread::spawn(move || {
+            let start = Instant::now();
+            let settled = settler.wait_until_settled(Duration::from_secs(10));
+            (settled, start.elapsed())
+        });
+
+        thread::sleep(Duration::from_millis(20));
+        ledger.retire(&json!(1));
+        ledger.retire(&json!("two"));
+
+        let (settled, elapsed) = parked.join().expect("waiter thread panicked");
+        assert!(settled, "the ledger settles once nothing is owed");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "settling must wake the waiter at once, not run out the budget; \
+             woke after {elapsed:?}"
+        );
+    }
+
+    /// A daemon stream that ends with replies still owed can never answer them,
+    /// so `abandon` settles the wait immediately instead of burning the budget.
+    #[test]
+    fn reply_ledger_abandon_settles_an_unanswerable_wait() {
+        let ledger = Arc::new(ReplyLedger::default());
+        ledger.record(json!(4));
+        ledger.abandon();
+        let start = Instant::now();
+        assert!(ledger.wait_until_settled(Duration::from_secs(10)));
+        assert!(start.elapsed() < Duration::from_millis(500));
+    }
+
+    /// Retiring an id that was never owed (a daemon reply to something the proxy
+    /// did not forward, e.g. the primed `initialize`) must not underflow the
+    /// ledger or falsely settle a wait that still owes another reply.
+    #[test]
+    fn reply_ledger_ignores_an_unrecorded_retirement() {
+        let ledger = ReplyLedger::default();
+        ledger.record(json!(1));
+        ledger.retire(&json!(99));
+        assert!(
+            !ledger.wait_until_settled(Duration::from_millis(0)),
+            "an unrelated retirement must not settle a ledger that still owes id 1"
+        );
+        ledger.retire(&json!(1));
+        assert!(ledger.wait_until_settled(Duration::from_millis(0)));
+    }
+
+    /// An unsettled ledger must still give up at its budget so teardown is
+    /// bounded even against a daemon that accepted the connection and stalled.
+    #[test]
+    fn reply_ledger_reports_an_unsettled_budget_expiry() {
+        let ledger = ReplyLedger::default();
+        ledger.record(json!(5));
+        let start = Instant::now();
+        assert!(!ledger.wait_until_settled(Duration::from_millis(40)));
+        assert!(start.elapsed() >= Duration::from_millis(40));
     }
 
     #[test]

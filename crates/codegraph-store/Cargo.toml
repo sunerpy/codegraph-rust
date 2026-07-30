@@ -12,6 +12,12 @@ rust-version.workspace = true
 description = "SQLite + FTS5 persistence layer for CodeGraph-rs (fixed, byte-stable schema)."
 readme = "../../README.md"
 
+[features]
+# Enables the deterministic lease-acquisition barrier used by cross-process
+# integration tests. Normal/release builds never enable this feature, so the
+# environment-controlled hook is absent from shipped binaries.
+test-hooks = []
+
 [dependencies]
 codegraph-core = { path = "../codegraph-core" }
 serde = { workspace = true }

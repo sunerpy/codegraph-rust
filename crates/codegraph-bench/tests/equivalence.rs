@@ -1,9 +1,40 @@
 use std::path::{Path, PathBuf};
 
 use codegraph_bench::oracle::{
-    Tier, assert_equivalent, canonicalize_db, diff_canonical, load_golden, write_golden,
+    KnownDiffs, Tier, assert_equivalent, assert_equivalent_with_known_diffs, canonicalize_db,
+    diff_canonical, load_golden, write_golden,
 };
 use serde_json::json;
+
+#[test]
+fn committed_known_diffs_doc_is_parsed_and_allowlists_nothing() {
+    // Every `assert_equivalent` in this file now adjudicates through the
+    // committed KNOWN_DIFFS.md, so it must parse AND stay empty: one active
+    // Tier-3 rule would silently widen every golden comparison below.
+    let path = KnownDiffs::repo_doc_path();
+    assert!(path.is_file(), "{} must exist", path.display());
+    let known = KnownDiffs::load(&path).unwrap_or_else(|error| {
+        panic!("{} must parse: {error:#}", path.display());
+    });
+    assert_eq!(known.rule_count(), 0, "{} must stay empty", path.display());
+}
+
+#[test]
+fn an_unparseable_known_diffs_file_fails_the_equivalence_assertion() {
+    let tempdir = TestDir::new("known-diffs-invalid");
+    let path = tempdir.path().join("KNOWN_DIFFS.md");
+    std::fs::write(
+        &path,
+        "RULE tier=1 surface=nodes key=* justification=sneaky\n",
+    )
+    .unwrap();
+
+    let error = assert_equivalent_with_known_diffs(&mini_db(), &mini_golden_dir(), &path)
+        .expect_err("an invalid allowlist must fail, not be ignored");
+    let message = format!("{error:#}");
+    println!("invalid KNOWN_DIFFS.md failure:\n{message}");
+    assert!(message.contains("may not be allowlisted"), "got: {message}");
+}
 
 #[test]
 fn generated_golden_matches_committed_mini_fixture() {

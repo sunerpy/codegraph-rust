@@ -947,6 +947,7 @@ fn reference(
     file_path: &str,
 ) -> RefView {
     RefView {
+        row_id: None,
         from_node_id: from_node_id.to_string(),
         reference_name: name.to_string(),
         reference_kind: kind,

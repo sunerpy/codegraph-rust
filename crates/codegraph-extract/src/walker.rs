@@ -29,6 +29,71 @@ pub fn child_by_field<'tree>(node: SyntaxNode<'tree>, field: &str) -> Option<Syn
     node.child_by_field_name(field)
 }
 
+/// tree-sitter node kinds (across grammars) for a LITERAL expression sitting in
+/// method-call RECEIVER position. A literal's methods are the language's
+/// builtins — `", ".join`, `"x".toUpperCase()`, `5.times`, `[].concat` — never
+/// project symbols, so such a call must not emit a `calls` ref that the
+/// resolver's bare-name fallback could bind to an unrelated same-named project
+/// function (#1230 / upstream `c472cfb`). A silent miss beats a wrong edge.
+///
+/// `encapsed_string` extends upstream's list: tree-sitter-php reports a
+/// double-quoted literal receiver under that kind, which upstream's set omits.
+const LITERAL_RECEIVER_KINDS: &[&str] = &[
+    // strings
+    "string",
+    "string_literal",
+    "interpreted_string_literal",
+    "raw_string_literal",
+    "template_string",
+    "concatenated_string",
+    "formatted_string",
+    "f_string",
+    "line_string_literal",
+    "string_content",
+    "heredoc_body",
+    "encapsed_string",
+    // numbers
+    "number",
+    "number_literal",
+    "integer",
+    "integer_literal",
+    "float",
+    "float_literal",
+    "int_literal",
+    "decimal_integer_literal",
+    "real_literal",
+    // chars / runes / regex / booleans / null-likes
+    "char_literal",
+    "character_literal",
+    "rune_literal",
+    "regex",
+    "regex_literal",
+    "true",
+    "false",
+    "boolean_literal",
+    "bool_literal",
+    "none",
+    "null",
+    "nil",
+    "null_literal",
+    "undefined",
+    // collection literals
+    "list",
+    "list_literal",
+    "array",
+    "array_literal",
+    "array_creation_expression",
+    "dictionary",
+    "dict_literal",
+    "object",
+    "tuple",
+    "set",
+];
+
+fn is_literal_receiver(node: SyntaxNode<'_>) -> bool {
+    LITERAL_RECEIVER_KINDS.contains(&node.kind())
+}
+
 pub struct TreeSitterWalker<'a, 'tree> {
     file_path: &'a str,
     source: &'a str,
@@ -2104,7 +2169,8 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 is_async: self.spec.is_async(node),
                 is_static: self.spec.is_static(node, self.source),
                 return_type: self.spec.get_return_type(node, self.source),
-                qualified_name: receiver_type.map(|receiver| format!("{receiver}::{name}")),
+                qualified_name: receiver_type
+                    .map(|receiver| self.compose_receiver_qualified_name(&receiver, &name)),
                 ..NodeExtra::default()
             },
         );
@@ -2893,6 +2959,16 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 }
             }
         }
+        if self.spec.language() == Language::Cpp {
+            match crate::lang::recover_explicit_operator_call(node, self.source) {
+                Some(crate::lang::ExplicitOperatorCall::Callee(callee)) => {
+                    self.push_ref(&caller_id, &callee, EdgeKind::Calls, node);
+                    return;
+                }
+                Some(crate::lang::ExplicitOperatorCall::Drop) => return,
+                None => {}
+            }
+        }
         let mut callee_name = String::new();
         let func = child_by_field(node, "function").or_else(|| node.named_child(0));
         if let Some(func) = func {
@@ -2928,6 +3004,9 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                         .or_else(|| child_by_field(func, "argument"))
                         .or_else(|| func.named_child(0));
                     if let Some(receiver) = receiver {
+                        if is_literal_receiver(receiver) {
+                            return;
+                        }
                         if matches!(
                             receiver.kind(),
                             "identifier" | "simple_identifier" | "field_identifier"
@@ -3025,6 +3104,9 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     ) {
         let method_name = node_text(name_field, self.source);
         if method_name.is_empty() {
+            return;
+        }
+        if is_literal_receiver(object_field) {
             return;
         }
 
@@ -3547,6 +3629,37 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         self.spec
             .resolve_body(node, self.spec.body_field())
             .or_else(|| child_by_field(node, self.spec.body_field()))
+    }
+
+    /// Qualified name for a method defined out-of-line via a receiver qualifier
+    /// (`Type::method() {}`). The declarator spells the receiver RELATIVE to the
+    /// enclosing namespace, so the active C++ namespace prefix must compose in —
+    /// `namespace sim { Output ManifestStartup::Apply() {} }` otherwise indexes as
+    /// `ManifestStartup::Apply` while its own class node carries
+    /// `sim::ManifestStartup`, and qualified call sites never resolve (#1310).
+    ///
+    /// The source may legally re-spell part or all of the namespace path
+    /// (`namespace sim { void sim::M::f() {} }`), so the receiver is anchored at
+    /// the first prefix segment it names: everything before that anchor comes
+    /// from the prefix, the receiver supplies the rest. `namespace_prefix` is only
+    /// ever non-empty for C++, so every other receiver language (Go, Rust,
+    /// Kotlin, Lua) passes through unchanged.
+    fn compose_receiver_qualified_name(&self, receiver: &str, name: &str) -> String {
+        let base = format!("{receiver}::{name}");
+        if self.namespace_prefix.is_empty() {
+            return base;
+        }
+        let receiver_head = receiver.split("::").next().unwrap_or(receiver);
+        let anchor = self
+            .namespace_prefix
+            .iter()
+            .position(|segment| segment == receiver_head);
+        let prefix = &self.namespace_prefix[..anchor.unwrap_or(self.namespace_prefix.len())];
+        if prefix.is_empty() {
+            base
+        } else {
+            format!("{}::{base}", prefix.join("::"))
+        }
     }
 
     fn build_qualified_name(&self, name: &str) -> String {
@@ -4113,7 +4226,7 @@ fn is_builtin_type(name: &str) -> bool {
     )
 }
 
-fn strip_cpp_template_args(name: &str) -> String {
+pub(crate) fn strip_cpp_template_args(name: &str) -> String {
     let mut depth: i32 = 0;
     let mut out = String::with_capacity(name.len());
     for ch in name.chars() {
@@ -5550,6 +5663,160 @@ struct Bar { int x; };
         assert!(has_node(&nodes, NodeKind::Struct, "Bar"));
     }
 
+    // ---- Batch B4: C leading attribute macros (upstream b6a05d1) ----
+
+    const C_ATTR_DEFINE: &str = "#define SEC_ATTR __attribute__((section(\".init\")))\n";
+
+    fn c_names(src: &str) -> Vec<String> {
+        let (nodes, _) = run("attrs.c", src, Language::C);
+        nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Function)
+            .map(|n| n.name.clone())
+            .collect()
+    }
+
+    fn c_function_return_types(src: &str) -> Vec<(String, i64, String)> {
+        let (nodes, _) = run("attrs.c", src, Language::C);
+        let mut rows: Vec<(String, i64, String)> = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Function)
+            .map(|n| {
+                (
+                    n.name.clone(),
+                    n.start_line,
+                    n.return_type
+                        .clone()
+                        .unwrap_or_else(|| "<NULL>".to_string()),
+                )
+            })
+            .collect();
+        rows.sort_by_key(|(_, line, _)| *line);
+        rows
+    }
+
+    #[test]
+    fn c_leading_attr_macro_function_indexes_under_its_real_name() {
+        let names = c_names(&format!(
+            "{C_ATTR_DEFINE}SEC_ATTR UINT32 Foo (VOID) {{ return 0; }}\n"
+        ));
+        assert_eq!(
+            names,
+            vec!["Foo".to_string()],
+            "a function behind a same-file-proved attribute macro must index as `Foo`"
+        );
+    }
+
+    #[test]
+    fn c_leading_attr_macro_with_macro_return_type_indexes_under_its_real_name() {
+        let names = c_names(&format!("{C_ATTR_DEFINE}SEC_ATTR VOID Foo (VOID) {{ }}\n"));
+        assert_eq!(
+            names,
+            vec!["Foo".to_string()],
+            "a macro return type behind a leading attribute macro must not become the name"
+        );
+    }
+
+    // NEGATIVE CONTROL for the tightened rule (#1311 follow-up). Firmware-flavoured
+    // C where the leading ALL-CAPS token is a typedef'd RETURN TYPE or a
+    // keyword-alias macro, NOT an attribute macro. The earlier purely structural
+    // rule blanked the return type here (`EFI_STATUS`→`EFIAPI`, `STATIC`→dropped);
+    // the return types below are the ones extraction produced BEFORE any blanking
+    // existed, so this test fails under the permissive rule and passes under the
+    // `#define`-proved one. `SEC_ATTR`'s define is present so the pass is ACTIVE.
+    #[test]
+    fn c_leading_typedef_return_and_keyword_alias_macros_keep_their_return_types() {
+        let src = format!(
+            "{C_ATTR_DEFINE}{}",
+            concat!(
+                "EFI_STATUS EFIAPI DriverEntry (VOID) {\n",
+                "  return 0;\n",
+                "}\n",
+                "CONST CHAR8 *GetName (VOID) {\n",
+                "  return 0;\n",
+                "}\n",
+                "STATIC void helper (void) {\n",
+                "}\n",
+                "UINT32 Untouched (void) {\n",
+                "  return 0;\n",
+                "}\n"
+            )
+        );
+        assert_eq!(
+            c_function_return_types(&src),
+            vec![
+                ("DriverEntry".to_string(), 2, "EFI_STATUS".to_string()),
+                ("GetName".to_string(), 5, "CONST".to_string()),
+                ("helper".to_string(), 8, "STATIC".to_string()),
+                ("Untouched".to_string(), 10, "UINT32".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn c_leading_attr_macro_without_a_visible_define_is_left_untouched() {
+        assert_eq!(
+            c_function_return_types("SEC_ATTR UINT32 Foo (VOID) { return 0; }\n"),
+            vec![("UINT32".to_string(), 1, "SEC_ATTR".to_string())],
+            "with no same-file `#define` the source must parse exactly as it did \
+             before this pass existed — #1311 stays unfixed for header-defined macros"
+        );
+    }
+
+    #[test]
+    fn c_isolation_table_functions_all_index_under_real_names() {
+        let src = concat!(
+            "#define SEC_ATTR __attribute__((section(\".init\")))\n",
+            "typedef unsigned int UINT32;\n",
+            "#define VOID void\n",
+            "\n",
+            "SEC_ATTR VOID   GoodName (VOID)  { }\n",
+            "SEC_ATTR UINT32 LostName (VOID)  { return 0; }\n",
+            "UINT32 NoAttr (void) { return 0; }\n",
+            "SEC_ATTR int BuiltinRet (void) { return 0; }\n",
+            "__attribute__((section(\".init\"))) UINT32 RawAttr (void) { return 0; }\n",
+            "SEC_ATTR UINT32 OneNamedArg (UINT32 x) { return x; }\n",
+            "SEC_ATTR UINT32 *PtrRet (VOID) { return 0; }\n"
+        );
+        let names = c_names(src);
+        for want in [
+            "GoodName",
+            "LostName",
+            "NoAttr",
+            "BuiltinRet",
+            "RawAttr",
+            "OneNamedArg",
+            "PtrRet",
+        ] {
+            assert!(
+                names.iter().any(|n| n == want),
+                "missing `{want}` among C function names: {names:?}"
+            );
+        }
+        assert!(
+            !names.iter().any(|n| n.contains('(')),
+            "no parameter list may be stored as a function name: {names:?}"
+        );
+    }
+
+    #[test]
+    fn c_plain_typedef_return_and_macro_call_shapes_unaffected() {
+        assert_eq!(c_names("UINT32 helper (void) { return 0; }\n"), ["helper"]);
+        assert_eq!(
+            c_names(&format!(
+                "{C_ATTR_DEFINE}SEC_ATTR unsigned int f(void) {{ return 0; }}\n"
+            )),
+            ["f"]
+        );
+        let (nodes, _) = run("call.c", "void g(void) { MY_ASSERT(x); }\n", Language::C);
+        let names: Vec<&str> = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Function)
+            .map(|n| n.name.as_str())
+            .collect();
+        assert_eq!(names, ["g"]);
+    }
+
     // #1093 NEGATIVE — a bodiless class in a language where that is a COMPLETE
     // definition (Kotlin `class Empty`) must still be indexed.
     #[test]
@@ -5892,6 +6159,181 @@ WINAPI HRESULT DoThing(int x) { return x; }
         assert_eq!(f.qualified_name, "f");
     }
 
+    // ---- Batch B3: namespaced out-of-line methods (upstream e437918) ----
+
+    #[test]
+    fn cpp_out_of_line_method_in_namespace_carries_namespace_prefix() {
+        let src = concat!(
+            "namespace simulator {\n",
+            "class ManifestStartup {\n",
+            "public:\n",
+            "    struct Input { int x; };\n",
+            "    struct Output { int y; };\n",
+            "    static Output Apply(const Input& input);\n",
+            "};\n",
+            "ManifestStartup::Output ManifestStartup::Apply(const Input& input) { return {}; }\n",
+            "}\n"
+        );
+        let (nodes, _) = run("manifest_startup.cpp", src, Language::Cpp);
+        let class = node(&nodes, NodeKind::Class, "ManifestStartup");
+        assert_eq!(class.qualified_name, "simulator::ManifestStartup");
+        let apply_qns: Vec<&str> = nodes
+            .iter()
+            .filter(|n| n.name == "Apply")
+            .map(|n| n.qualified_name.as_str())
+            .collect();
+        assert!(
+            apply_qns.contains(&"simulator::ManifestStartup::Apply"),
+            "the out-of-line definition must carry the namespace prefix, got: {apply_qns:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_receiver_that_respells_the_namespace_is_not_double_prefixed() {
+        let src = concat!(
+            "namespace sim {\n",
+            "class M { public: static void f(); static void g(); };\n",
+            "void sim::M::f() {}\n",
+            "void M::g() {}\n",
+            "}\n",
+            "void sim::M::f2() {}\n"
+        );
+        let (nodes, _) = run("m.cpp", src, Language::Cpp);
+        let qns: Vec<&str> = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Method)
+            .map(|n| n.qualified_name.as_str())
+            .collect();
+        for want in ["sim::M::f", "sim::M::g", "sim::M::f2"] {
+            assert!(
+                qns.contains(&want),
+                "missing `{want}` among method qualified names: {qns:?}"
+            );
+        }
+        assert!(
+            !qns.iter().any(|q| q.contains("sim::sim")),
+            "a re-spelled namespace must not be double-prefixed, got: {qns:?}"
+        );
+    }
+
+    #[test]
+    fn go_receiver_method_qualified_name_unaffected_by_namespace_composition() {
+        let src = concat!(
+            "package main\n",
+            "\n",
+            "type Server struct{}\n",
+            "\n",
+            "func (s *Server) Start() {}\n"
+        );
+        let (nodes, _) = run("srv.go", src, Language::Go);
+        let start = nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Method && n.name == "Start")
+            .expect("Start method");
+        assert_eq!(start.qualified_name, "Server::Start");
+    }
+
+    // ---- Batch B2: out-of-line template method receivers (upstream 4dd29ea) ----
+
+    #[test]
+    fn cpp_out_of_line_template_method_receiver_strips_template_args() {
+        let src = concat!(
+            "template <typename T>\n",
+            "class Box {\n",
+            "public:\n",
+            "    T get() const;\n",
+            "    void set(T v);\n",
+            "};\n",
+            "\n",
+            "template <typename T> T Box<T>::get() const { return T(); }\n",
+            "template <typename T> void Box<T>::set(T v) {}\n"
+        );
+        let (nodes, _) = run("box.cpp", src, Language::Cpp);
+        let qns: Vec<&str> = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Method)
+            .map(|n| n.qualified_name.as_str())
+            .collect();
+        assert!(
+            qns.contains(&"Box::get"),
+            "out-of-line `Box<T>::get` should qualify as `Box::get`, got: {qns:?}"
+        );
+        assert!(
+            qns.contains(&"Box::set"),
+            "out-of-line `Box<T>::set` should qualify as `Box::set`, got: {qns:?}"
+        );
+        assert!(
+            !qns.iter().any(|q| q.contains('<')),
+            "no method qualified name may keep template args, got: {qns:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_multiline_template_parameter_list_cannot_leak_into_qualified_name() {
+        let src = concat!(
+            "template <typename CType,\n",
+            "          typename CPPType,\n",
+            "          int kSentinelConstantForTheHelperTemplateClassInstanceGuardLong>\n",
+            "class ApiHelper {\n",
+            "public:\n",
+            "    CPPType* validate();\n",
+            "};\n",
+            "\n",
+            "template <typename CType,\n",
+            "          typename CPPType,\n",
+            "          int kSentinelConstantForTheHelperTemplateClassInstanceGuardLong>\n",
+            "CPPType* ApiHelper<CType,\n",
+            "                   CPPType,\n",
+            "                   kSentinelConstantForTheHelperTemplateClassInstanceGuardLong>::validate() {\n",
+            "    return nullptr;\n",
+            "}\n"
+        );
+        let (nodes, _) = run("capi_helper.cpp", src, Language::Cpp);
+        let validate = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Method && n.name == "validate")
+            .find(|n| n.qualified_name.contains("::"))
+            .expect("out-of-line validate method");
+        assert_eq!(
+            validate.qualified_name, "ApiHelper::validate",
+            "multi-line template parameter list must not leak into the qualified name"
+        );
+        assert!(
+            !validate.qualified_name.contains(['<', '>', '\n']),
+            "qualified name must carry no template/newline bytes: {:?}",
+            validate.qualified_name
+        );
+        assert!(
+            validate.qualified_name.len() < 255,
+            "qualified name must stay under NAME_MAX, got {} bytes",
+            validate.qualified_name.len()
+        );
+    }
+
+    #[test]
+    fn cpp_out_of_line_template_method_links_to_its_class() {
+        let src = concat!(
+            "template <typename T>\n",
+            "class Box {\n",
+            "public:\n",
+            "    T get() const;\n",
+            "};\n",
+            "\n",
+            "template <typename T> T Box<T>::get() const { return T(); }\n"
+        );
+        let (nodes, _) = run("box_link.cpp", src, Language::Cpp);
+        let class = node(&nodes, NodeKind::Class, "Box");
+        let method = nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Method && n.name == "get")
+            .expect("get method");
+        assert_eq!(
+            method.qualified_name,
+            format!("{}::get", class.qualified_name),
+            "the out-of-line definition must share the class node's qualifier"
+        );
+    }
+
     #[test]
     fn cpp_template_arg_call_strips_to_base() {
         let src = r#"
@@ -5918,6 +6360,123 @@ void caller() { operator<<(a, b); }
         assert!(
             !has_ref(&refs, EdgeKind::Calls, "operator"),
             "operator<< callee must not be template-stripped to `operator`"
+        );
+    }
+
+    // ---- Batch B1: C++ explicit operator calls (upstream 6103f5e / #1268) ----
+
+    const CPP_OP_HEADER: &str = concat!(
+        "struct V {\n",
+        "  V operator+(const V& o) const;\n",
+        "  V operator[](int i) const;\n",
+        "  V operator()(int i) const;\n",
+        "  bool operator==(const V& o) const;\n",
+        "  int get() const;\n",
+        "};\n"
+    );
+
+    fn cpp_call_refs(body: &str) -> Vec<String> {
+        let src = format!("{CPP_OP_HEADER}{body}");
+        let (_, refs) = run("op.cpp", &src, Language::Cpp);
+        refs.iter()
+            .filter(|r| r.reference_kind == EdgeKind::Calls)
+            .map(|r| r.reference_name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn cpp_explicit_operator_call_recovers_receiver_operator() {
+        let refs = cpp_call_refs("V f(const V& a, const V& b) { return a.operator+(b); }\n");
+        assert!(
+            refs.iter().any(|r| r == "a.operator+"),
+            "explicit `a.operator+(b)` should emit a `a.operator+` Calls ref, got: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_explicit_operator_call_normalizes_arrow_receiver() {
+        let refs = cpp_call_refs("V f(const V* p, const V& b) { return p->operator+(b); }\n");
+        assert!(
+            refs.iter().any(|r| r == "p.operator+"),
+            "`p->operator+(b)` should normalize to `p.operator+`, got: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_explicit_operator_call_covers_symbolic_forms() {
+        let refs = cpp_call_refs(concat!(
+            "V f1(const V& a) { return a.operator[](3); }\n",
+            "V f2(V& a) { return a.operator()(1); }\n",
+            "bool f3(const V& a, const V& b) { return a.operator==(b); }\n"
+        ));
+        for want in ["a.operator[]", "a.operator()", "a.operator=="] {
+            assert!(
+                refs.iter().any(|r| r == want),
+                "missing `{want}` among explicit operator refs: {refs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cpp_explicit_operator_call_compacts_spaced_names() {
+        let refs = cpp_call_refs(concat!(
+            "bool f(const V& a, const V& b) { return a.operator == (b); }\n",
+            "V g(const V& a) { return a.operator [] (3); }\n"
+        ));
+        for want in ["a.operator==", "a.operator[]"] {
+            assert!(
+                refs.iter().any(|r| r == want),
+                "spaced call-site operator should compact to `{want}`, got: {refs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cpp_explicit_operator_call_drops_complex_receiver() {
+        let refs = cpp_call_refs(concat!(
+            "struct W { V* obj(); };\n",
+            "V f(W& w, const V& b) { return w.obj()->operator+(b); }\n"
+        ));
+        assert!(
+            !refs.iter().any(|r| r.contains("operator+")),
+            "a call-result receiver must not emit a guessable operator ref, got: {refs:?}"
+        );
+        assert!(
+            refs.iter().any(|r| r == "w.obj"),
+            "the inner `w.obj()` call must still ref normally, got: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_explicit_operator_call_this_receiver_is_bare() {
+        let src = concat!(
+            "struct V {\n",
+            "  V operator+(const V& o) const;\n",
+            "  V twice() const { return this->operator+(*this); }\n",
+            "};\n"
+        );
+        let (_, refs) = run("op.cpp", src, Language::Cpp);
+        let calls: Vec<&str> = refs
+            .iter()
+            .filter(|r| r.reference_kind == EdgeKind::Calls)
+            .map(|r| r.reference_name.as_str())
+            .collect();
+        assert!(
+            calls.contains(&"operator+"),
+            "`this->operator+(...)` should emit the bare `operator+`, got: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|r| r.contains("this")),
+            "no `this` receiver should leak into the ref name, got: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_plain_member_call_unaffected_by_operator_recovery() {
+        let refs = cpp_call_refs("int f(const V& a) { return a.get(); }\n");
+        assert!(
+            refs.iter().any(|r| r == "a.get"),
+            "plain member call must stay `a.get`, got: {refs:?}"
         );
     }
 
@@ -6664,6 +7223,125 @@ g() ->\n\
         assert!(
             has_node(&nodes, NodeKind::Import, "sub.cfm")
                 || has_ref(&refs, EdgeKind::Imports, "sub.cfm")
+        );
+    }
+
+    // ---- Literal-receiver builtin calls (#1230 / upstream c472cfb) ----------
+
+    fn call_refs(file: &str, source: &str, lang: Language) -> Vec<String> {
+        let (_, refs) = run(file, source, lang);
+        refs.iter()
+            .filter(|r| r.reference_kind == EdgeKind::Calls)
+            .map(|r| r.reference_name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn python_literal_receiver_calls_emit_no_ref() {
+        let calls = call_refs(
+            "src/repro.py",
+            "def report_missing(unresolved):\n    return \", \".join(sorted(unresolved))\n",
+            Language::Python,
+        );
+        assert!(
+            !calls.iter().any(|c| c == "join"),
+            "`\", \".join(...)` is a str builtin and must emit NO call ref, got: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c == "sorted"),
+            "the nested `sorted(...)` call must still be extracted, got: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn python_collection_and_number_literal_receivers_emit_no_ref() {
+        let calls = call_refs(
+            "src/lits.py",
+            concat!(
+                "def f(x):\n",
+                "    [1, 2].append(3)\n",
+                "    {'k': 1}.keys()\n",
+                "    {1, 2}.union(x)\n",
+                "    (1, 2).count(1)\n",
+                "    1.5.hex()\n",
+                "    None.__str__()\n",
+                "    True.__str__()\n",
+            ),
+            Language::Python,
+        );
+        assert!(
+            calls.is_empty(),
+            "every literal-receiver builtin must emit NO call ref, got: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn typescript_literal_receiver_calls_emit_no_ref() {
+        let calls = call_refs(
+            "src/lits.ts",
+            concat!(
+                "export function f(): void {\n",
+                "  \"x\".toUpperCase();\n",
+                "  [1, 2].map((n) => n);\n",
+                "  `t`.trim();\n",
+                "  /re/.test(\"s\");\n",
+                "  0xff.toString();\n",
+                "  true.toString();\n",
+                "}\n",
+            ),
+            Language::TypeScript,
+        );
+        assert!(
+            calls.is_empty(),
+            "every literal-receiver builtin must emit NO call ref, got: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn java_string_literal_receiver_call_emits_no_ref() {
+        let calls = call_refs(
+            "src/C.java",
+            "class C { void f() { \"x\".trim(); } }\n",
+            Language::Java,
+        );
+        assert!(
+            calls.is_empty(),
+            "`\"x\".trim()` is a String builtin and must emit NO call ref, got: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn php_string_literal_receiver_call_emits_no_ref() {
+        let calls = call_refs(
+            "src/a.php",
+            "<?php\nfunction f() { \"x\"->foo(); }\n",
+            Language::Php,
+        );
+        assert!(
+            calls.is_empty(),
+            "a literal PHP receiver must emit NO call ref, got: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn identifier_receiver_calls_are_unaffected_by_the_literal_guard() {
+        let py = call_refs(
+            "src/ok.py",
+            "def f(sep, x):\n    return sep.join(sorted(x))\n",
+            Language::Python,
+        );
+        assert!(
+            py.iter().any(|c| c == "sep.join"),
+            "an identifier receiver must still emit `sep.join`, got: {py:?}"
+        );
+        let java = call_refs(
+            "src/D.java",
+            "class D { void f(String s) { s.trim(); } }\n",
+            Language::Java,
+        );
+        assert!(
+            java.iter().any(|c| c == "s.trim"),
+            "an identifier receiver must still emit `s.trim`, got: {java:?}"
         );
     }
 }

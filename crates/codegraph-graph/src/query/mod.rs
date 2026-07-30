@@ -9,6 +9,17 @@ use codegraph_store::queries::SearchResult;
 
 pub use parser::{ParsedQuery, bounded_edit_distance, parse_query};
 
+/// #1319 infix-seeding bounds: how many callable candidates the store returns
+/// per token, and how many survive the segment-boundary filter into the result
+/// set. Both are hard caps so a hot substring can never flood the ranking.
+const INFIX_CANDIDATE_CAP: i64 = 50;
+const INFIX_SEED_CAP: usize = 3;
+
+/// Base score for an infix-seeded definer. Deliberately small: the definer earns
+/// its rank from the `kind_bonus` + `name_match_bonus` pass that follows, so it
+/// can never outrank a genuine exact-name hit.
+const INFIX_SEED_SCORE: f64 = 1.0;
+
 #[derive(Debug, Clone, Default)]
 pub struct SearchOptions {
     pub kinds: Vec<NodeKind>,
@@ -92,6 +103,8 @@ pub fn search_nodes(
         }
     }
 
+    seed_multi_segment_definers(store, query, &kinds, &mut results)?;
+
     if !results.is_empty() && (!text.is_empty() || !query.is_empty()) {
         let scoring_query = if !text.is_empty() { &text } else { query };
         for result in &mut results {
@@ -133,6 +146,66 @@ fn sort_by_score_desc(results: &mut [SearchResult]) {
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+}
+
+/// Multi-hump field-name seeding (upstream `1de7e8f` #1319).
+///
+/// A query token that names a multi-SEGMENT field (`userProfileId`,
+/// `user_profile_id`, `ProfileInfo`) but matches no symbol EXACTLY is seeded
+/// with the callables that DEFINE it — the ones whose own segments contain the
+/// query's segment run contiguously. Scoped to multi-segment tokens so the
+/// natural-language guard on bare words is untouched, and applied only when the
+/// token is not already an exact symbol name so exact matches always win.
+///
+/// A candidate whose name merely CONTAINS the lowercase run without a segment
+/// boundary (`xxprofileinfoxx`) is rejected: a silent miss beats a wrong answer.
+fn seed_multi_segment_definers(
+    store: &Store,
+    query: &str,
+    kinds: &[NodeKind],
+    results: &mut Vec<SearchResult>,
+) -> rusqlite::Result<()> {
+    let mut existing: HashSet<String> = results.iter().map(|r| r.node.id.clone()).collect();
+    for token in query.split_whitespace() {
+        if !scoring::is_multi_segment_identifier(token) {
+            continue;
+        }
+        if results.iter().any(|r| r.node.name == token) {
+            continue;
+        }
+        if !store.nodes_by_lower_name(&token.to_lowercase())?.is_empty() {
+            continue;
+        }
+        let needle: String = token
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect::<String>()
+            .to_lowercase();
+        if needle.is_empty() {
+            continue;
+        }
+        let mut seeded = 0usize;
+        for node in store.callable_nodes_by_name_infix(&needle, INFIX_CANDIDATE_CAP)? {
+            if seeded >= INFIX_SEED_CAP {
+                break;
+            }
+            if !kinds.is_empty() && !kinds.contains(&node.kind) {
+                continue;
+            }
+            if !scoring::name_segments_contain_run(&node.name, token) {
+                continue;
+            }
+            if !existing.insert(node.id.clone()) {
+                continue;
+            }
+            results.push(SearchResult {
+                node,
+                score: INFIX_SEED_SCORE,
+            });
+            seeded += 1;
+        }
+    }
+    Ok(())
 }
 
 fn search_nodes_fuzzy(

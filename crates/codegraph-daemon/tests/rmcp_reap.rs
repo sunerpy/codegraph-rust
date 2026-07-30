@@ -148,6 +148,6 @@ fn temp_project(name: &str) -> PathBuf {
         "codegraph-daemon-{name}-{}-{nanos}-{seq}",
         std::process::id()
     ));
-    fs::create_dir_all(path.join(".codegraph")).expect("create project");
-    path
+    fs::create_dir_all(&path).expect("create project");
+    path.canonicalize().expect("canonicalize project")
 }

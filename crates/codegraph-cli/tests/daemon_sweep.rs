@@ -7,7 +7,7 @@
 //! keeps being served. With `CODEGRAPH_DAEMON_CLIENT_SWEEP_MS=200` the sweep
 //! fires fast; we poll pid liveness / daemon exit against a clear deadline.
 //!
-//! The daemon is detached + logs to `.codegraph/daemon.log`, so lifecycle is
+//! The daemon is detached + logs to its v2 `daemon.log`, so lifecycle is
 //! asserted via the daemon pid (idle-exit once no live clients remain) — exactly
 //! the observable surface `daemon_idle.rs` uses.
 
@@ -17,6 +17,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use codegraph_daemon::{
@@ -96,9 +97,24 @@ fn indexed_project(label: &str) -> (TestDir, PathBuf) {
     (dir, project)
 }
 
+/// Same process-global-env hazard as `daemon_idle.rs`: both tests here spawn a
+/// daemon through the set → spawn → remove sequence below, and `Command`
+/// snapshots env INSIDE `spawn_detached_daemon`. A sibling's `remove_var`
+/// landing in that window hands the daemon no sweep/idle vars, so it falls back
+/// to the 30 000 / 300 000 ms defaults and outlives the test's deadline.
+fn env_guard() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Spawn the detached daemon with a SHORT sweep + idle window so the test is
 /// fast. `Command` snapshots env at spawn time, so the daemon inherits these.
 fn spawn_sweep_daemon(project: &Path) {
+    let _env = env_guard();
+    // SAFETY: the env_guard held for this whole body serializes every
+    // set/remove in this binary against the spawn that snapshots them.
     unsafe { std::env::set_var("CODEGRAPH_DAEMON_CLIENT_SWEEP_MS", "200") };
     unsafe { std::env::set_var("CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS", "500") };
     unsafe { std::env::set_var("CODEGRAPH_WATCH_DEBOUNCE_MS", "100") };
@@ -203,7 +219,7 @@ fn spawn_throwaway_child() -> Child {
 #[test]
 fn dead_client_is_swept_and_daemon_idle_exits() {
     let (_dir, project) = indexed_project("dead");
-    let socket = daemon_socket_path(&project);
+    let socket = daemon_socket_path(&project).expect("resolve the v2 rendezvous socket identity");
 
     spawn_sweep_daemon(&project);
     let daemon_pid = poll_for_daemon_pid(&socket, Duration::from_millis(3000))
@@ -249,7 +265,7 @@ fn dead_client_is_swept_and_daemon_idle_exits() {
 #[test]
 fn client_without_hello_is_never_swept() {
     let (_dir, project) = indexed_project("nohello");
-    let socket = daemon_socket_path(&project);
+    let socket = daemon_socket_path(&project).expect("resolve the v2 rendezvous socket identity");
 
     spawn_sweep_daemon(&project);
     let daemon_pid = poll_for_daemon_pid(&socket, Duration::from_millis(3000))

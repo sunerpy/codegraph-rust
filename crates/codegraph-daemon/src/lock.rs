@@ -7,8 +7,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
-use crate::paths::{codegraph_dir, daemon_pid_path, daemon_socket_path};
+use crate::paths::{daemon_pid_path, daemon_socket_path, rendezvous_dir};
 use crate::process::is_process_alive;
 
 const EMPTY_RETRY_DELAY: Duration = Duration::from_millis(20);
@@ -59,14 +60,14 @@ pub fn decode_lock_info(raw: &str) -> Option<DaemonLockInfo> {
 }
 
 pub fn try_acquire_daemon_lock(project_root: &Path) -> Result<AcquireResult> {
-    let pid_path = daemon_pid_path(project_root);
-    fs::create_dir_all(codegraph_dir(project_root))
-        .with_context(|| format!("creating {}", codegraph_dir(project_root).display()))?;
+    let pid_path = daemon_pid_path(project_root)?;
+    let dir = rendezvous_dir(project_root)?;
+    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
     let info = DaemonLockInfo {
         pid: process::id(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        socket_path: daemon_socket_path(project_root),
+        socket_path: daemon_socket_path(project_root)?,
         started_at: now_millis(),
     };
 
@@ -144,9 +145,28 @@ pub fn clear_stale_daemon_lock(pid_path: &Path, expected_dead_pid: Option<u32>) 
     fs::remove_file(pid_path).is_ok()
 }
 
+/// Clear a stale daemon lock for `project_root`. An unresolvable index root is
+/// reported as "not cleared" rather than reconstructing a rendezvous path.
 pub fn unlock_project(project_root: &Path) -> bool {
-    let pid_path = daemon_pid_path(project_root);
-    clear_stale_daemon_lock(&pid_path, None)
+    daemon_pid_path(project_root)
+        .map(|pid_path| clear_stale_daemon_lock(&pid_path, None))
+        .unwrap_or(false)
+}
+
+/// The mutation boundaries of [`clear_stale_daemon_socket`], exposed only so a
+/// test can drive a competing daemon start at an exact point with no timing
+/// assumption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StaleHealCheckpoint {
+    /// The stale (dead/absent-owner) pid record is gone and NOTHING is claimed:
+    /// the namespace is momentarily unowned and open to any starter. The socket
+    /// has not been touched.
+    StaleRecordCleared,
+    /// This cleaner WON the heal claim — its own pid record is published, so
+    /// every starter now reports `Taken`. The socket has not been touched.
+    HealClaimHeld,
+    /// The stale socket is gone; the heal claim is STILL published and still ours.
+    SocketRemoved,
 }
 
 /// Self-heal a project's stale daemon artifacts after a failed attach (Fix A):
@@ -156,24 +176,108 @@ pub fn unlock_project(project_root: &Path) -> bool {
 ///
 /// Gated on liveness: returns `false` and touches nothing when the lock is held
 /// by a LIVE pid (`clear_stale_daemon_lock` refuses to remove a live lock).
-/// Returns `true` once the stale lock is cleared; socket removal is best-effort
-/// (a missing socket is already the desired end state).
+///
+/// OWNERSHIP IS LOAD-BEARING — this cleaner unlinks a socket it did not bind, so
+/// it must first BECOME the namespace's owner. The published pid record IS the
+/// single-instance exclusion token ([`try_acquire_daemon_lock`] claims it with
+/// `create_new`, and a daemon only ever binds after that claim succeeds). An
+/// earlier revision cleared the stale record and THEN unlinked, holding no token
+/// in between: a replacement daemon could legitimately claim the freed record and
+/// bind the same path, and this unlink then destroyed the LIVE replacement's
+/// socket — leaving a record naming a live daemon with no socket, which the
+/// liveness gate makes unhealable. Merely swapping the two deletions does not fix
+/// that, because an unlink performed while owning nothing is unsafe in either
+/// order.
+///
+/// So the sequence is claim-then-clean, and every step after the liveness gate is
+/// conditional on WINNING the claim:
+///
+/// 1. read the RECORDED socket (the record is the only place a fallback path is
+///    written down), then remove the stale record — liveness-gated, so a live
+///    owner's namespace is never entered;
+/// 2. re-claim the pid record via [`try_acquire_daemon_lock`], i.e. with the very
+///    same `create_new` token a starter uses. LOSING this claim means a
+///    replacement (or a competing cleaner) now owns the namespace, so this cleaner
+///    returns `false` and touches NOTHING — that is what closes the window rather
+///    than narrowing it;
+/// 3. unlink the stale socket while the claim excludes every starter, so no
+///    process can have bound that path in the meantime;
+/// 4. release the claim last, re-corroborated against our own pid
+///    ([`cleanup_owned_lock`]).
+///
+/// An ABSENT pid record is treated as an unowned namespace: `clear_stale_daemon_lock`
+/// reports it cleared, and step 2 then claims it, so the socket is still only ever
+/// removed under a held claim. A crash mid-heal leaves a record naming this
+/// now-dead process and no socket — exactly the self-healing residue the next
+/// heal clears.
+///
+/// On Windows the recorded "socket path" is a bare namespaced pipe name rather
+/// than a filesystem entry, so step 3's `remove_file` simply fails and is ignored
+/// (a pipe disappears with its owning process); steps 1, 2 and 4 operate on the
+/// real pid file and are what carry the exclusion there.
 pub fn clear_stale_daemon_socket(project_root: &Path) -> bool {
-    let pid_path = daemon_pid_path(project_root);
-    let socket_path = recorded_socket_path(project_root);
+    clear_stale_daemon_socket_with(project_root, |_| {})
+}
+
+fn clear_stale_daemon_socket_with(
+    project_root: &Path,
+    mut checkpoint: impl FnMut(StaleHealCheckpoint),
+) -> bool {
+    let Ok(pid_path) = daemon_pid_path(project_root) else {
+        return false;
+    };
+    // Read the recorded socket BEFORE the stale record goes away: the record is
+    // the only place a bind-fallback path is written down.
+    let Ok(socket_path) = recorded_socket_path(project_root) else {
+        return false;
+    };
     // Liveness gate: only proceed once the owning pid is proven dead/absent.
     if !clear_stale_daemon_lock(&pid_path, None) {
         return false;
     }
+    checkpoint(StaleHealCheckpoint::StaleRecordCleared);
+
+    // Become the owner before deleting anything in the namespace. A lost claim
+    // means somebody else owns it now; their socket is not ours to unlink.
+    let claim_pid = match try_acquire_daemon_lock(project_root) {
+        Ok(AcquireResult::Acquired { info, .. }) => info.pid,
+        Ok(AcquireResult::Taken { .. }) => {
+            debug!(
+                pid_path = %pid_path.display(),
+                "daemon rendezvous was re-claimed while healing; leaving its record and socket intact"
+            );
+            return false;
+        }
+        Err(err) => {
+            debug!(
+                pid_path = %pid_path.display(), error = %err,
+                "could not claim the daemon rendezvous for healing; leaving it untouched"
+            );
+            return false;
+        }
+    };
+    checkpoint(StaleHealCheckpoint::HealClaimHeld);
+
+    // Under the claim no starter can have bound this path, so the socket we see
+    // is provably the stale one.
     let _ = fs::remove_file(&socket_path);
-    true
+    checkpoint(StaleHealCheckpoint::SocketRemoved);
+
+    // Release the claim last, re-corroborated against our pid.
+    cleanup_owned_lock(&pid_path, claim_pid)
 }
 
-pub(crate) fn cleanup_owned_lock(pid_path: &Path, pid: u32) {
-    let owned = read_lock_info_tolerant(pid_path).is_some_and(|info| info.pid == pid);
+/// Whether the published pid record currently names `pid`.
+fn record_names(pid_path: &Path, pid: u32) -> bool {
+    read_lock_info_tolerant(pid_path).is_some_and(|info| info.pid == pid)
+}
+
+pub(crate) fn cleanup_owned_lock(pid_path: &Path, pid: u32) -> bool {
+    let owned = record_names(pid_path, pid);
     if owned {
         let _ = fs::remove_file(pid_path);
     }
+    owned
 }
 
 enum ReadOutcome {
@@ -218,12 +322,83 @@ fn read_lock_info_tolerant(pid_path: &Path) -> Option<DaemonLockInfo> {
 /// recorded socket (a legacy plain-pid lock). Reading the recorded path — not
 /// recomputing — is what lets a client attach to a daemon that bound a fallback
 /// candidate (e.g. the tmpdir socket on an ExFAT project dir).
-pub fn recorded_socket_path(project_root: &Path) -> PathBuf {
-    let pid_path = daemon_pid_path(project_root);
-    read_lock_info_tolerant(&pid_path)
+pub fn recorded_socket_path(project_root: &Path) -> Result<PathBuf> {
+    let pid_path = daemon_pid_path(project_root)?;
+    match read_lock_info_tolerant(&pid_path)
         .map(|info| info.socket_path)
         .filter(|socket| !socket.as_os_str().is_empty())
-        .unwrap_or_else(|| daemon_socket_path(project_root))
+    {
+        Some(recorded) => Ok(recorded),
+        None => daemon_socket_path(project_root),
+    }
+}
+
+/// The two mutation boundaries of [`cleanup_owned_rendezvous`], exposed only so a
+/// test can drive a competing daemon start at an exact point with no timing
+/// assumption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RendezvousCleanupCheckpoint {
+    /// The pid record was just corroborated as ours and is STILL PUBLISHED. The
+    /// socket has not been touched.
+    OwnershipCorroborated,
+    /// Our socket is gone; the pid record is still published and still ours.
+    SocketRemoved,
+}
+
+/// Remove the rendezvous artifacts this daemon process itself published: on Unix
+/// its bound socket file, then its owner-bound pid record.
+///
+/// ORDER IS LOAD-BEARING. The published pid record IS the single-instance
+/// exclusion: `try_acquire_daemon_lock` claims it with `create_new`, so while our
+/// record exists a competing start reports `Taken` and never binds this socket
+/// path. Removing the record FIRST (as an earlier revision did) opens a window in
+/// which a replacement daemon legitimately claims the record and binds the same
+/// path — and the departing process's later unlink then destroys the LIVE
+/// daemon's socket while its record still advertises it. So the record is held as
+/// exclusion until our socket is unlinked, and only then is the record removed,
+/// re-corroborated against our pid.
+///
+/// Crash behavior between the two operations is fail-closed and self-healing: the
+/// namespace is left with a pid record naming a now-dead pid and no socket. A
+/// client's attach to the recorded socket fails fast (bounded, never hangs), and
+/// `clear_stale_daemon_lock` / `clear_stale_daemon_socket` clear that record on the
+/// next start because the recorded pid is provably not alive. The inverse order
+/// could instead leave a LIVE daemon with no socket, which nothing can heal.
+///
+/// An already-replaced record (an owner mismatch observed on entry) preserves BOTH
+/// the replacement record and its socket and reports `false`. The permanent index
+/// lock is never named here.
+pub(crate) fn cleanup_owned_rendezvous(pid_path: &Path, socket_path: &Path, pid: u32) -> bool {
+    cleanup_owned_rendezvous_with(pid_path, socket_path, pid, |_| {})
+}
+
+fn cleanup_owned_rendezvous_with(
+    pid_path: &Path,
+    socket_path: &Path,
+    pid: u32,
+    mut checkpoint: impl FnMut(RendezvousCleanupCheckpoint),
+) -> bool {
+    if !record_names(pid_path, pid) {
+        debug!(
+            pid_path = %pid_path.display(),
+            "daemon rendezvous is owned by another process; leaving its record and socket intact"
+        );
+        return false;
+    }
+    checkpoint(RendezvousCleanupCheckpoint::OwnershipCorroborated);
+
+    #[cfg(unix)]
+    if let Some(stale) = crate::transport::Rendezvous::from_socket_path(socket_path).cleanup_path()
+    {
+        let _ = fs::remove_file(stale);
+    }
+    #[cfg(not(unix))]
+    let _ = socket_path;
+    checkpoint(RendezvousCleanupCheckpoint::SocketRemoved);
+
+    // Re-corroborate at the second mutation boundary: only a record that STILL
+    // names this process may be removed.
+    cleanup_owned_lock(pid_path, pid)
 }
 
 fn now_millis() -> u128 {
@@ -248,11 +423,7 @@ mod tests {
     fn rewrite_socket_path_updates_recorded_socket_and_keeps_pid() {
         // Given an acquired lock recording the default socket, rewriting the
         // recorded socket to a fallback path is what the client later reads.
-        let base = std::env::temp_dir().join(format!(
-            "cg-lock-rewrite-{}-{}",
-            process::id(),
-            now_millis()
-        ));
+        let base = temp_base("rewrite");
         let AcquireResult::Acquired { pid_path, info } =
             try_acquire_daemon_lock(&base).expect("acquire lock")
         else {
@@ -271,12 +442,60 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    /// A real, existing project directory. `IndexPaths` derives the physical
+    /// project identity from the filesystem object, so the project must exist
+    /// before any rendezvous path resolves.
     fn temp_base(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
+        let base = std::env::temp_dir().join(format!(
             "cg-lock-{label}-{}-{}",
             process::id(),
             now_millis()
-        ))
+        ));
+        fs::create_dir_all(&base).unwrap();
+        base.canonicalize().unwrap()
+    }
+
+    fn pid_path_of(base: &Path) -> PathBuf {
+        daemon_pid_path(base).expect("resolve the v2 rendezvous pid path")
+    }
+
+    fn socket_path_of(base: &Path) -> PathBuf {
+        daemon_socket_path(base).expect("resolve the v2 rendezvous socket identity")
+    }
+
+    fn create_rendezvous_dir(base: &Path) {
+        let dir = rendezvous_dir(base).expect("resolve the v2 rendezvous dir");
+        fs::create_dir_all(dir).unwrap();
+    }
+
+    /// A bound socket is a FILESYSTEM artifact only on unix. On windows
+    /// [`daemon_socket_path`] returns a bare namespaced pipe NAME
+    /// (`codegraph-v2-<hash16>`), a kernel object reclaimed when its last handle
+    /// closes — which is why [`cleanup_owned_rendezvous`] unlinks nothing there,
+    /// correctly. Writing that name as a file and then asserting it was removed
+    /// tests a premise windows does not have, so these helpers confine the
+    /// file-level claims to unix. The ORDERING guarantees stay asserted on EVERY
+    /// platform: the pid record as exclusion, a competing start refused at the
+    /// midpoint, and the crash residue the stale heal clears.
+    fn publish_socket_file(socket: &Path, contents: &[u8]) {
+        #[cfg(unix)]
+        fs::write(socket, contents).unwrap();
+        #[cfg(not(unix))]
+        let _ = (socket, contents);
+    }
+
+    fn assert_socket_file_present(socket: &Path, message: &str) {
+        #[cfg(unix)]
+        assert!(socket.exists(), "{message}");
+        #[cfg(not(unix))]
+        let _ = (socket, message);
+    }
+
+    fn assert_socket_file_absent(socket: &Path, message: &str) {
+        #[cfg(unix)]
+        assert!(!socket.exists(), "{message}");
+        #[cfg(not(unix))]
+        let _ = (socket, message);
     }
 
     #[test]
@@ -303,7 +522,7 @@ mod tests {
     #[test]
     fn clear_stale_lock_returns_true_when_missing() {
         let base = temp_base("clear-missing");
-        let pid_path = daemon_pid_path(&base);
+        let pid_path = pid_path_of(&base);
         assert!(clear_stale_daemon_lock(&pid_path, None));
     }
 
@@ -326,8 +545,8 @@ mod tests {
     #[test]
     fn clear_stale_lock_removes_a_dead_pid_lock() {
         let base = temp_base("clear-dead");
-        fs::create_dir_all(codegraph_dir(&base)).unwrap();
-        let pid_path = daemon_pid_path(&base);
+        create_rendezvous_dir(&base);
+        let pid_path = pid_path_of(&base);
         let dead = DaemonLockInfo {
             pid: 4_000_000_000,
             version: "1.0.0".to_string(),
@@ -343,8 +562,8 @@ mod tests {
     #[test]
     fn clear_stale_lock_refuses_when_expected_pid_mismatches() {
         let base = temp_base("clear-mismatch");
-        fs::create_dir_all(codegraph_dir(&base)).unwrap();
-        let pid_path = daemon_pid_path(&base);
+        create_rendezvous_dir(&base);
+        let pid_path = pid_path_of(&base);
         let dead = DaemonLockInfo {
             pid: 4_000_000_000,
             version: "1.0.0".to_string(),
@@ -362,8 +581,8 @@ mod tests {
     #[test]
     fn unlock_project_clears_a_dead_lock() {
         let base = temp_base("unlock");
-        fs::create_dir_all(codegraph_dir(&base)).unwrap();
-        let pid_path = daemon_pid_path(&base);
+        create_rendezvous_dir(&base);
+        let pid_path = pid_path_of(&base);
         let dead = DaemonLockInfo {
             pid: 4_000_000_000,
             version: "1.0.0".to_string(),
@@ -378,7 +597,11 @@ mod tests {
     #[test]
     fn recorded_socket_path_falls_back_to_default_when_lock_absent() {
         let base = temp_base("recorded-absent");
-        assert_eq!(recorded_socket_path(&base), daemon_socket_path(&base));
+        assert_eq!(
+            recorded_socket_path(&base).expect("resolve recorded socket"),
+            socket_path_of(&base)
+        );
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -391,7 +614,10 @@ mod tests {
         };
         let recorded = std::env::temp_dir().join("cg-recorded.sock");
         rewrite_lock_socket_path(&pid_path, &recorded).unwrap();
-        assert_eq!(recorded_socket_path(&base), recorded);
+        assert_eq!(
+            recorded_socket_path(&base).expect("resolve recorded socket"),
+            recorded
+        );
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -413,11 +639,368 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_owned_rendezvous_preserves_a_replacement_owners_record_and_socket() {
+        let base = temp_base("cleanup-replaced");
+        create_rendezvous_dir(&base);
+        let pid_path = pid_path_of(&base);
+        let socket = socket_path_of(&base);
+        // A NEW owner already replaced the record and rebound the same socket.
+        let replacement = DaemonLockInfo {
+            pid: process::id(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            socket_path: socket.clone(),
+            started_at: 2,
+        };
+        fs::write(&pid_path, encode_lock_info(&replacement).unwrap()).unwrap();
+        fs::write(&socket, b"").unwrap();
+
+        // The DEPARTING daemon (a different pid) must strip neither artifact.
+        let mut departing = 4_000_000_000u32;
+        while departing == process::id() {
+            departing -= 1;
+        }
+        assert!(
+            !cleanup_owned_rendezvous(&pid_path, &socket, departing),
+            "an owner mismatch must report that nothing was cleaned"
+        );
+        assert!(
+            pid_path.exists(),
+            "the replacement owner's record must survive"
+        );
+        assert!(
+            socket.exists(),
+            "the replacement owner's socket must survive"
+        );
+
+        // The true owner cleans both.
+        assert!(cleanup_owned_rendezvous(&pid_path, &socket, process::id()));
+        assert!(!pid_path.exists());
+        #[cfg(unix)]
+        assert!(!socket.exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// The former vulnerable midpoint. A competing start is driven at the EXACT
+    /// boundary where the old revision had already removed the pid record, and it
+    /// is allowed to claim the record and rebind the same socket path. The
+    /// departing owner must not destroy that replacement.
+    ///
+    /// Deterministic by construction: the replacement runs inside the checkpoint
+    /// callback, so it is ordered by the call itself, not by any sleep.
+    ///
+    /// Under the OLD pid-record-first order this test fails — `try_acquire` would
+    /// succeed (the record was gone), and the subsequent unlink would delete the
+    /// replacement's socket.
+    #[test]
+    fn a_replacement_start_at_the_cleanup_midpoint_keeps_its_own_rendezvous() {
+        let base = temp_base("cleanup-midpoint");
+        create_rendezvous_dir(&base);
+        let pid_path = pid_path_of(&base);
+        let socket = socket_path_of(&base);
+
+        // The DEPARTING owner: a distinct, provably dead pid, with its record
+        // published and its socket bound.
+        let mut departing = 4_000_000_000u32;
+        while departing == process::id() || is_process_alive(departing) {
+            departing -= 1;
+        }
+        let old = DaemonLockInfo {
+            pid: departing,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            socket_path: socket.clone(),
+            started_at: 1,
+        };
+        fs::write(&pid_path, encode_lock_info(&old).unwrap()).unwrap();
+        publish_socket_file(&socket, b"old");
+
+        let mut replacement_claim = None;
+        let cleaned = cleanup_owned_rendezvous_with(&pid_path, &socket, departing, |checkpoint| {
+            if checkpoint != RendezvousCleanupCheckpoint::OwnershipCorroborated {
+                return;
+            }
+            // A competing start races here. While OUR record is still published it
+            // must be refused, which is exactly what keeps the replacement from
+            // binding a socket the departing owner is about to unlink.
+            replacement_claim = Some(try_acquire_daemon_lock(&base).expect("competing start"));
+        });
+
+        match replacement_claim.expect("the competing start ran at the checkpoint") {
+            AcquireResult::Taken { existing, .. } => {
+                let existing = existing.expect("the departing record is readable");
+                assert_eq!(
+                    existing.pid, departing,
+                    "the published record must still be the departing owner's, so the \
+                     replacement is refused instead of binding a doomed socket"
+                );
+            }
+            AcquireResult::Acquired { .. } => panic!(
+                "a competing start must NOT be able to claim the record before the departing \
+                 owner has finished unlinking its socket"
+            ),
+        }
+
+        assert!(cleaned, "the departing owner cleans its own rendezvous");
+        assert!(!pid_path.exists(), "its record is removed last");
+        assert_socket_file_absent(&socket, "its socket was removed first");
+
+        // The replacement can now claim a clean namespace and bind its own socket,
+        // and nothing left over can delete it.
+        let AcquireResult::Acquired { .. } =
+            try_acquire_daemon_lock(&base).expect("post-cleanup acquire")
+        else {
+            panic!("a cleaned namespace must be claimable");
+        };
+        publish_socket_file(&socket, b"new");
+        assert!(
+            !cleanup_owned_rendezvous(&pid_path, &socket, departing),
+            "a second cleanup pass by the departed owner must be refused"
+        );
+        assert!(pid_path.exists());
+        assert_socket_file_present(&socket, "the replacement's socket survives");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// The socket is unlinked BEFORE the record, so a crash between the two
+    /// boundaries leaves a dead-pid record with no socket — the self-healing
+    /// residue `clear_stale_daemon_socket` is built to clear. The inverse order
+    /// would leave a live daemon with no socket, which nothing can heal.
+    #[test]
+    fn a_crash_between_cleanup_boundaries_leaves_only_self_healing_residue() {
+        let base = temp_base("cleanup-crash");
+        create_rendezvous_dir(&base);
+        let pid_path = pid_path_of(&base);
+        let socket = socket_path_of(&base);
+        let mut departing = 4_000_000_000u32;
+        while departing == process::id() || is_process_alive(departing) {
+            departing -= 1;
+        }
+        let old = DaemonLockInfo {
+            pid: departing,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            socket_path: socket.clone(),
+            started_at: 1,
+        };
+        fs::write(&pid_path, encode_lock_info(&old).unwrap()).unwrap();
+        publish_socket_file(&socket, b"old");
+
+        // Simulate the crash by panicking-free early return: run cleanup only up to
+        // the socket-removed boundary and drop the process there.
+        let mut reached_socket_removed = false;
+        let _ = cleanup_owned_rendezvous_with(&pid_path, &socket, departing, |checkpoint| {
+            if checkpoint == RendezvousCleanupCheckpoint::SocketRemoved {
+                reached_socket_removed = true;
+                assert_socket_file_absent(&socket, "the socket is gone at this boundary");
+                assert!(
+                    pid_path.exists(),
+                    "the record is STILL published as exclusion at this boundary"
+                );
+            }
+        });
+        assert!(reached_socket_removed);
+
+        // The residue is exactly what the stale-socket self-heal clears.
+        assert!(clear_stale_daemon_socket(&base));
+        assert!(!pid_path.exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A dead pid whose record and socket are the stale residue to be healed.
+    fn dead_pid() -> u32 {
+        let mut candidate = 4_000_000_000u32;
+        while candidate == process::id() || is_process_alive(candidate) {
+            candidate -= 1;
+        }
+        candidate
+    }
+
+    fn publish_record(pid_path: &Path, pid: u32, socket: &Path) {
+        let info = DaemonLockInfo {
+            pid,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            socket_path: socket.to_path_buf(),
+            started_at: 1,
+        };
+        fs::write(pid_path, encode_lock_info(&info).unwrap()).unwrap();
+    }
+
+    /// The rendezvous-ownership race. A replacement daemon legitimately claims the
+    /// namespace at the EXACT point where the stale record is gone and nothing is
+    /// owned, and binds the same socket path. The cleaner must lose its claim and
+    /// destroy nothing.
+    ///
+    /// Deterministic by construction: the replacement runs inside the checkpoint
+    /// callback, so it is ordered by the call itself, not by any sleep.
+    ///
+    /// Under the OLD clear-record-then-unlink order this test fails — the unlink
+    /// was unconditional, so it deleted the LIVE replacement's socket.
+    #[test]
+    fn a_replacement_start_during_the_stale_heal_keeps_its_own_socket() {
+        let base = temp_base("heal-replaced");
+        create_rendezvous_dir(&base);
+        let pid_path = pid_path_of(&base);
+        let socket = socket_path_of(&base);
+        publish_record(&pid_path, dead_pid(), &socket);
+        fs::write(&socket, b"stale").unwrap();
+
+        let mut replacement_ran = false;
+        let healed = clear_stale_daemon_socket_with(&base, |checkpoint| {
+            if checkpoint != StaleHealCheckpoint::StaleRecordCleared {
+                return;
+            }
+            // A replacement start wins the freed namespace here: it claims the
+            // record with its own LIVE pid and binds the same socket path.
+            replacement_ran = true;
+            publish_record(&pid_path, process::id(), &socket);
+            fs::write(&socket, b"live-replacement").unwrap();
+        });
+
+        assert!(replacement_ran, "the replacement ran at the checkpoint");
+        assert!(
+            socket.exists(),
+            "the LIVE replacement's socket must survive the stale heal"
+        );
+        assert_eq!(
+            fs::read(&socket).unwrap(),
+            b"live-replacement",
+            "the surviving socket must be the replacement's, not the stale one"
+        );
+        assert!(
+            !healed,
+            "a cleaner that lost the namespace must report that it healed nothing"
+        );
+        let surviving =
+            read_lock_info_tolerant(&pid_path).expect("the replacement record survives");
+        assert_eq!(
+            surviving.pid,
+            process::id(),
+            "the replacement's record must be left exactly as published"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// The claim is what makes the unlink safe, so it must be PUBLISHED across the
+    /// unlink and released only afterwards. While it is held every starter is
+    /// excluded, which is why no process can have bound the path being unlinked.
+    #[test]
+    fn the_stale_heal_holds_its_claim_across_the_unlink_and_releases_it_last() {
+        let base = temp_base("heal-claim");
+        create_rendezvous_dir(&base);
+        let pid_path = pid_path_of(&base);
+        let socket = socket_path_of(&base);
+        publish_record(&pid_path, dead_pid(), &socket);
+        fs::write(&socket, b"stale").unwrap();
+
+        let mut competing_start = None;
+        let mut saw_socket_removed = false;
+        let healed = clear_stale_daemon_socket_with(&base, |checkpoint| match checkpoint {
+            StaleHealCheckpoint::HealClaimHeld => {
+                let claim =
+                    read_lock_info_tolerant(&pid_path).expect("the heal claim is published");
+                assert_eq!(
+                    claim.pid,
+                    process::id(),
+                    "the heal claim must name this cleaner"
+                );
+                assert!(socket.exists(), "the socket is untouched under the claim");
+                competing_start =
+                    Some(try_acquire_daemon_lock(&base).expect("competing start under the claim"));
+            }
+            StaleHealCheckpoint::SocketRemoved => {
+                saw_socket_removed = true;
+                assert!(
+                    !socket.exists(),
+                    "the stale socket is gone at this boundary"
+                );
+                assert!(
+                    pid_path.exists(),
+                    "the heal claim must STILL be published while the socket is unlinked"
+                );
+            }
+            StaleHealCheckpoint::StaleRecordCleared => {}
+        });
+
+        match competing_start.expect("a competing start ran under the claim") {
+            AcquireResult::Taken { existing, .. } => {
+                let existing = existing.expect("the heal claim is readable");
+                assert_eq!(
+                    existing.pid,
+                    process::id(),
+                    "a starter racing the heal must be refused BY the heal claim, so it \
+                     cannot bind the socket the cleaner is about to unlink"
+                );
+            }
+            AcquireResult::Acquired { .. } => panic!(
+                "a starter must NOT be able to claim the namespace while the cleaner holds \
+                 its heal claim"
+            ),
+        }
+        assert!(saw_socket_removed);
+        assert!(healed, "a genuinely stale namespace heals");
+        assert!(!pid_path.exists(), "the heal claim is released last");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Stale recovery still works: a dead owner's record AND socket are both gone
+    /// after the heal, so the next start spawns fresh.
+    #[test]
+    fn a_genuinely_stale_namespace_still_self_heals_both_artifacts() {
+        let base = temp_base("heal-stale");
+        create_rendezvous_dir(&base);
+        let pid_path = pid_path_of(&base);
+        let socket = socket_path_of(&base);
+        publish_record(&pid_path, dead_pid(), &socket);
+        fs::write(&socket, b"stale").unwrap();
+
+        assert!(clear_stale_daemon_socket(&base), "the stale residue heals");
+        assert!(!pid_path.exists(), "the stale record is gone");
+        assert!(!socket.exists(), "the stale socket is gone");
+        let AcquireResult::Acquired { .. } =
+            try_acquire_daemon_lock(&base).expect("post-heal acquire")
+        else {
+            panic!("a healed namespace must be claimable by a fresh start");
+        };
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// An ABSENT record means nobody owns the namespace, so a leftover socket may
+    /// be removed — but only after the cleaner has CLAIMED that namespace, exactly
+    /// as it does for a dead-owner record. Without the claim, an absent record
+    /// would be the widest interleaving of all: it names no pid to prove dead, so
+    /// an unlink under it could hit a daemon that bound between the two syscalls.
+    #[test]
+    fn an_absent_record_is_claimed_before_its_leftover_socket_is_removed() {
+        let base = temp_base("heal-absent");
+        create_rendezvous_dir(&base);
+        let pid_path = pid_path_of(&base);
+        let socket = socket_path_of(&base);
+        fs::write(&socket, b"orphan").unwrap();
+        assert!(!pid_path.exists(), "precondition: no record at all");
+
+        let mut claim_held_with_socket_present = false;
+        let healed = clear_stale_daemon_socket_with(&base, |checkpoint| {
+            if checkpoint == StaleHealCheckpoint::HealClaimHeld {
+                claim_held_with_socket_present =
+                    record_names(&pid_path, process::id()) && socket.exists();
+            }
+        });
+
+        assert!(
+            claim_held_with_socket_present,
+            "the leftover socket must still be present at the moment the claim is won, \
+             proving the removal happens UNDER the claim and not before it"
+        );
+        assert!(healed, "an unowned namespace with a leftover socket heals");
+        assert!(!socket.exists(), "the orphaned socket is removed");
+        assert!(!pid_path.exists(), "the heal claim is released");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn clear_stale_daemon_socket_removes_lock_and_socket_when_dead() {
         let base = temp_base("socket-dead");
-        fs::create_dir_all(codegraph_dir(&base)).unwrap();
-        let pid_path = daemon_pid_path(&base);
-        let socket = daemon_socket_path(&base);
+        create_rendezvous_dir(&base);
+        let pid_path = pid_path_of(&base);
+        let socket = socket_path_of(&base);
         let dead = DaemonLockInfo {
             pid: 4_000_000_000,
             version: "1.0.0".to_string(),

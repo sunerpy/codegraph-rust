@@ -11,6 +11,11 @@ use codegraph_resolve::framework::FrameworkResolver;
 use codegraph_resolve::frameworks::{detect_frameworks, godot, nestjs, react, vue};
 use codegraph_resolve::types::{ImportMapping, RefView, ResolutionContext, ResolvedBy};
 
+/// Extraction context for a resolver call that needs no project configuration.
+fn no_project_config() -> codegraph_resolve::framework::FrameworkExtractionContext {
+    codegraph_resolve::framework::FrameworkExtractionContext::without_config("")
+}
+
 /// A self-contained, in-memory [`ResolutionContext`] for resolver tests.
 #[derive(Default)]
 struct MockContext {
@@ -124,6 +129,7 @@ fn node(id: &str, kind: NodeKind, name: &str, file_path: &str, lang: Language) -
 
 fn ref_view(name: &str, kind: EdgeKind, file_path: &str, lang: Language) -> RefView {
     RefView {
+        row_id: None,
         from_node_id: format!("from:{file_path}"),
         reference_name: name.to_string(),
         reference_kind: kind,
@@ -254,7 +260,7 @@ fn react_extract_emits_nextjs_page_route() {
         .extract(
             "pages/about.tsx",
             "export default function About() { return <div/>; }",
-            "",
+            &no_project_config(),
         )
         .expect("extract result");
     let route = result
@@ -270,7 +276,7 @@ fn react_extract_component_and_route_reference() {
     let content =
         "export function Home() { return <Layout/>; }\n<Route path=\"/home\" component={Home}/>";
     let result = react::ReactResolver
-        .extract("src/Home.tsx", content, "")
+        .extract("src/Home.tsx", content, &no_project_config())
         .expect("extract result");
     assert!(
         result
@@ -289,6 +295,397 @@ fn react_extract_component_and_route_reference() {
             .references
             .iter()
             .any(|r| r.reference_name == "Home" && r.reference_kind == EdgeKind::References)
+    );
+}
+
+/// Nested v6 shape from upstream #1348: the parent route has a `path` but renders
+/// `<Outlet/>`, and the pathless `index` child must stay skipped. The unbounded
+/// 400-byte window let the parent borrow the child's `element` and let the `index`
+/// route borrow its sibling's `path`, producing `/dashboard -> DashboardHome`,
+/// a duplicate `settings` node, and `settings -> DashboardHome`.
+#[test]
+fn react_route_window_stops_at_tag_end_not_at_sibling_routes() {
+    let content = concat!(
+        "function DashboardHome() { return null; }\n",
+        "function Settings() { return null; }\n",
+        "export function App() {\n",
+        "  return (\n",
+        "    <Routes>\n",
+        "      <Route path=\"/dashboard\">\n",
+        "        <Route index element={<DashboardHome/>} />\n",
+        "        <Route path=\"settings\" element={<Settings/>} />\n",
+        "      </Route>\n",
+        "    </Routes>\n",
+        "  );\n",
+        "}\n",
+    );
+    let result = react::ReactResolver
+        .extract("src/App.tsx", content, &no_project_config())
+        .expect("extract result");
+
+    let routes: Vec<(String, i64)> = result
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Route)
+        .map(|n| (n.name.clone(), n.start_line))
+        .collect();
+    assert_eq!(
+        routes,
+        vec![("/dashboard".to_string(), 6), ("settings".to_string(), 8)],
+        "the pathless index route must not borrow its sibling's path"
+    );
+
+    let refs: Vec<(String, i64)> = result
+        .references
+        .iter()
+        .map(|r| (r.reference_name.clone(), r.line))
+        .collect();
+    assert_eq!(
+        refs,
+        vec![("Settings".to_string(), 8)],
+        "only the settings route owns an element; the parent renders <Outlet/>"
+    );
+}
+
+/// An unterminated `<Route path=…` followed by a long run of `<` must not let the
+/// scan run to end-of-file, and must not reach the well-formed route far below it.
+#[test]
+fn react_route_window_is_bounded_for_unterminated_tag_and_bare_angle_run() {
+    let mut content = String::from("function Comp() { return null; }\n<Route path=\"/a\"\n");
+    content.push_str(&"<".repeat(200_000));
+    content.push_str("\n<Route path=\"/b\" element={<Comp/>} />\n");
+
+    let result = react::ReactResolver
+        .extract("src/Patho.tsx", &content, &no_project_config())
+        .expect("extract result");
+
+    let routes: Vec<String> = result
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Route)
+        .map(|n| n.name.clone())
+        .collect();
+    assert_eq!(routes, vec!["/a".to_string(), "/b".to_string()]);
+
+    let refs: Vec<(String, i64)> = result
+        .references
+        .iter()
+        .map(|r| (r.reference_name.clone(), r.line))
+        .collect();
+    assert_eq!(
+        refs,
+        vec![("Comp".to_string(), 4)],
+        "the unterminated /a tag must not reach the /b element 200KB later"
+    );
+}
+
+/// Pins `ROUTE_OPENING_TAG_SCAN_LIMIT` from the outside: a 700-byte prettier-wrapped
+/// opening tag — wider than both the old 400-byte window and any tag measured while
+/// sizing the bound — still yields its `path` and its `element`, so the bound cannot
+/// be tightened to a value that truncates legitimate input.
+#[test]
+fn react_route_window_keeps_long_multiline_opening_tag_intact() {
+    let filler: String = (0..12)
+        .map(|i| format!("        data-attribute-number-{i:02}=\"filler-value-{i:02}\"\n"))
+        .collect();
+    let content = format!(
+        concat!(
+            "function DeepSettingsPage() {{ return null; }}\n",
+            "export function Router() {{\n",
+            "  return (\n",
+            "    <Routes>\n",
+            "      <Route\n",
+            "        path=\"/dashboard/settings\"\n",
+            "{filler}",
+            "        element={{<DeepSettingsPage/>}}\n",
+            "      />\n",
+            "    </Routes>\n",
+            "  );\n",
+            "}}\n",
+        ),
+        filler = filler
+    );
+    let tag_start = content.find("<Route").expect("route tag");
+    let tag_len = content[tag_start..].find("/>").expect("tag end") + 2;
+    assert!(
+        tag_len > 400,
+        "fixture must exceed the old 400-byte window, got {tag_len}"
+    );
+
+    let result = react::ReactResolver
+        .extract("src/Router.tsx", &content, &no_project_config())
+        .expect("extract result");
+
+    let route = result
+        .nodes
+        .iter()
+        .find(|n| n.kind == NodeKind::Route)
+        .expect("route node");
+    assert_eq!(route.name, "/dashboard/settings");
+    assert!(
+        result
+            .references
+            .iter()
+            .any(|r| r.reference_name == "DeepSettingsPage"),
+        "the element of a {tag_len}-byte opening tag must still be seen"
+    );
+}
+
+/// The data-router half of upstream #1348: a PARENT route object carries a `path`
+/// but no `element` of its own, and the first `element` the fixed 300-byte window
+/// met belonged to a CHILD inside `children: [...]`. The parent must produce NO
+/// borrowed edge, and each child exactly its own.
+#[test]
+fn react_data_router_parent_without_element_does_not_borrow_from_children() {
+    let content = concat!(
+        "const router = createBrowserRouter([\n",
+        "  {\n",
+        "    path: '/dashboard',\n",
+        "    children: [\n",
+        "      { index: true, element: <DashboardHome/> },\n",
+        "      { path: 'settings', element: <Settings/> },\n",
+        "    ],\n",
+        "  },\n",
+        "]);\n",
+    );
+    let result = react::ReactResolver
+        .extract("src/routes.tsx", content, &no_project_config())
+        .expect("extract result");
+
+    let routes: Vec<(String, i64)> = result
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Route)
+        .map(|n| (n.name.clone(), n.start_line))
+        .collect();
+    assert_eq!(
+        routes,
+        vec![("settings".to_string(), 6)],
+        "a parent route with no element of its own must emit no route->component pair"
+    );
+
+    let refs: Vec<(String, i64)> = result
+        .references
+        .iter()
+        .map(|r| (r.reference_name.clone(), r.line))
+        .collect();
+    assert_eq!(
+        refs,
+        vec![("Settings".to_string(), 6)],
+        "/dashboard must not borrow DashboardHome from its pathless index child"
+    );
+}
+
+/// The mirror of the parent case, and the shape that makes the object's own closing
+/// `}` load-bearing: a pathless-of-its-own CHILD sits inside `children: [...]` while
+/// the PARENT declares its `element` AFTER the array. Walking past the child's `}`
+/// would hand the parent's component to the child.
+#[test]
+fn react_data_router_child_without_element_does_not_borrow_from_parent() {
+    let content = concat!(
+        "const router = createBrowserRouter([\n",
+        "  {\n",
+        "    path: '/dashboard',\n",
+        "    children: [\n",
+        "      { path: 'settings' },\n",
+        "    ],\n",
+        "    element: <DashboardLayout/>,\n",
+        "  },\n",
+        "]);\n",
+    );
+    let result = react::ReactResolver
+        .extract("src/routes.tsx", content, &no_project_config())
+        .expect("extract result");
+
+    let routes: Vec<(String, i64)> = result
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Route)
+        .map(|n| (n.name.clone(), n.start_line))
+        .collect();
+    assert_eq!(
+        routes,
+        vec![("/dashboard".to_string(), 3)],
+        "the element-less child must emit nothing; only the parent owns an element"
+    );
+
+    let refs: Vec<(String, i64)> = result
+        .references
+        .iter()
+        .map(|r| (r.reference_name.clone(), r.line))
+        .collect();
+    assert_eq!(
+        refs,
+        vec![("DashboardLayout".to_string(), 3)],
+        "the child must not escape its own closing brace to borrow the parent's element"
+    );
+}
+
+/// A malformed object carrying two depth-0 `path:` keys — no `{` and no `}` separates
+/// them, so only the next-`path:` stop can keep the first from borrowing the second's
+/// element.
+#[test]
+fn react_data_router_object_stops_at_next_path_key_when_unbraced() {
+    let content = "createBrowserRouter([{ path: '/a', path: '/b', element: <B/> }]);\n";
+    let result = react::ReactResolver
+        .extract("src/routes.tsx", content, &no_project_config())
+        .expect("extract result");
+
+    let routes: Vec<String> = result
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Route)
+        .map(|n| n.name.clone())
+        .collect();
+    assert_eq!(
+        routes,
+        vec!["/b".to_string()],
+        "the first path key has no element between it and the second key"
+    );
+
+    let refs: Vec<String> = result
+        .references
+        .iter()
+        .map(|r| r.reference_name.clone())
+        .collect();
+    assert_eq!(refs, vec!["B".to_string()]);
+}
+
+/// A route object whose `element` is a nested JSX expression containing `>` inside
+/// braces, and whose `path` string itself contains `>`. Neither `>` may end the
+/// object, and the following SIBLING object's element must not leak backwards.
+#[test]
+fn react_data_router_object_survives_angle_brackets_and_stops_at_sibling() {
+    let content = concat!(
+        "const router = createBrowserRouter([\n",
+        "  { path: '/a>b', element: <Guard fallback={<Spinner size={2 > 1 ? 8 : 4}/>}/> },\n",
+        "  { path: '/c>d' },\n",
+        "  { path: '/plain', element: <Plain/> },\n",
+        "]);\n",
+    );
+    let result = react::ReactResolver
+        .extract("src/routes.tsx", content, &no_project_config())
+        .expect("extract result");
+
+    let routes: Vec<(String, i64)> = result
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Route)
+        .map(|n| (n.name.clone(), n.start_line))
+        .collect();
+    assert_eq!(
+        routes,
+        vec![("/a>b".to_string(), 2), ("/plain".to_string(), 4)],
+        "a `>` inside a quoted path or a braced expression must not end the object, \
+         and an element-less object must not borrow from its next sibling"
+    );
+
+    let refs: Vec<(String, i64)> = result
+        .references
+        .iter()
+        .map(|r| (r.reference_name.clone(), r.line))
+        .collect();
+    assert_eq!(
+        refs,
+        vec![("Guard".to_string(), 2), ("Plain".to_string(), 4)],
+        "each object owns exactly its own element; no sibling leakage either way"
+    );
+}
+
+/// A route object that legitimately runs well past the old 300-byte window — `loader`,
+/// `action`, `errorElement`, `hydrateFallbackElement`, a nested `handle={{…}}` and a
+/// `shouldRevalidate`, with its own `element` declared LAST — must still be seen whole.
+/// This pins the new bound from the outside: tightening it below the object length
+/// reddens this test.
+#[test]
+fn react_data_router_keeps_long_route_object_intact() {
+    let content = concat!(
+        "const router = createBrowserRouter([\n",
+        "  {\n",
+        "    path: '/organisations/:organisationId/settings/billing',\n",
+        "    loader: billingSettingsLoader,\n",
+        "    action: billingSettingsAction,\n",
+        "    errorElement: <BillingSettingsErrorBoundary/>,\n",
+        "    hydrateFallbackElement: <BillingSettingsSkeleton/>,\n",
+        "    handle: {\n",
+        "      crumb: () => 'Billing settings',\n",
+        "      analytics: { screen: 'billing-settings', category: 'billing' },\n",
+        "      permissions: ['billing:read', 'billing:write'],\n",
+        "    },\n",
+        "    shouldRevalidate: ({ currentUrl, nextUrl }) => currentUrl.pathname !== nextUrl.pathname,\n",
+        "    element: <BillingSettingsPage/>,\n",
+        "  },\n",
+        "]);\n",
+    );
+    let path_key = content.find("path:").expect("path key");
+    let element_key = content
+        .find("element: <BillingSettings")
+        .expect("own element");
+    assert!(
+        element_key - path_key > 300,
+        "fixture must place its own element past the old 300-byte window, got {}",
+        element_key - path_key
+    );
+
+    let result = react::ReactResolver
+        .extract("src/routes.tsx", content, &no_project_config())
+        .expect("extract result");
+
+    let route = result
+        .nodes
+        .iter()
+        .find(|n| n.kind == NodeKind::Route)
+        .expect("route node");
+    assert_eq!(
+        route.name,
+        "/organisations/:organisationId/settings/billing"
+    );
+    assert_eq!(
+        result
+            .references
+            .iter()
+            .map(|r| r.reference_name.clone())
+            .collect::<Vec<_>>(),
+        vec!["BillingSettingsPage".to_string()],
+        "the own element of a {}-byte route object must still be seen, and the \
+         errorElement/hydrateFallbackElement must not be mistaken for it",
+        element_key - path_key
+    );
+}
+
+/// An unterminated route object followed by a well-formed one 200KB later: the walk
+/// must neither run to end-of-file nor reach that far-away element.
+#[test]
+fn react_data_router_object_walk_is_bounded_for_unterminated_literal() {
+    let mut content = String::from("createBrowserRouter([\n  { path: '/a',\n");
+    content.push_str(&"filler,\n".repeat(25_000));
+    content.push_str("  { path: '/b', element: <Comp/> },\n]);\n");
+
+    let result = react::ReactResolver
+        .extract("src/routes.tsx", &content, &no_project_config())
+        .expect("extract result");
+
+    let routes: Vec<String> = result
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Route)
+        .map(|n| n.name.clone())
+        .collect();
+    assert_eq!(
+        routes,
+        vec!["/b".to_string()],
+        "the unterminated /a object has no element of its own and must emit nothing"
+    );
+
+    let refs: Vec<String> = result
+        .references
+        .iter()
+        .map(|r| r.reference_name.clone())
+        .collect();
+    assert_eq!(
+        refs,
+        vec!["Comp".to_string()],
+        "the unterminated /a object must not reach the /b element 200KB later"
     );
 }
 
@@ -354,7 +751,7 @@ fn vue_extract_emits_nuxt_page_route() {
     // the upstream extract keys on `/pages/` (with leading slash), so the route file
     // must sit under a parent dir (vue.ts:198).
     let result = vue::VueResolver
-        .extract("app/pages/users/[id].vue", "", "")
+        .extract("app/pages/users/[id].vue", "", &no_project_config())
         .expect("extract result");
     let route = result
         .nodes
@@ -411,7 +808,11 @@ fn nestjs_resolves_service_provider_preferring_convention() {
 fn nestjs_extract_http_route_joins_controller_prefix() {
     let content = "@Controller('users')\nclass UsersController {\n  @Get(':id')\n  findOne() {}\n}";
     let result = nestjs::NestjsResolver
-        .extract("src/users/users.controller.ts", content, "")
+        .extract(
+            "src/users/users.controller.ts",
+            content,
+            &no_project_config(),
+        )
         .expect("extract result");
     let route = result
         .nodes

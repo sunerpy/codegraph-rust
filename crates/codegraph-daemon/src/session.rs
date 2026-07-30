@@ -11,7 +11,9 @@ use interprocess::local_socket::traits::Stream as _;
 use interprocess::local_socket::traits::tokio::Stream as _;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tracing::debug;
 
+use crate::control::{ControlAck, ControlFrame, encode_control_line, parse_control_frame};
 use crate::transport::{AsyncStream, Stream};
 
 /// Max milliseconds the PROXY waits for the daemon's one-line versioned hello
@@ -73,6 +75,11 @@ pub struct SessionRegistry {
     sessions: Arc<Mutex<HashMap<u64, SessionEntry>>>,
     next_id: Arc<AtomicU64>,
     last_active: Arc<Mutex<Instant>>,
+    /// Cross-platform "stop serving" signal for EVERY data session. A `watch`
+    /// channel (not a raw-fd shutdown, which exists only on Unix) is what lets the
+    /// control-frame drain actively close long-lived rmcp sessions on Windows too;
+    /// its retained value also refuses a session that connects after the signal.
+    closing: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 impl std::fmt::Debug for SessionRegistry {
@@ -89,6 +96,7 @@ impl Default for SessionRegistry {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(AtomicU64::new(1)),
             last_active: Arc::new(Mutex::new(Instant::now())),
+            closing: Arc::new(tokio::sync::watch::channel(false).0),
         }
     }
 }
@@ -183,6 +191,41 @@ impl SessionRegistry {
             .any(|entry| matches!(entry.pid, Some(pid) if is_alive(pid)))
     }
 
+    /// Signal every data session — current and future — to stop serving. Each
+    /// session races its serve loop against this signal, so its transport is
+    /// dropped and its socket closed on every platform. Idempotent.
+    pub(crate) fn close_all_sessions(&self) {
+        // `send_replace`, not `send`: `send` FAILS (and stores nothing) when no
+        // receiver exists yet, which would let a session accepted after the signal
+        // start serving. `send_replace` always updates the retained value.
+        self.closing.send_replace(true);
+        #[cfg(unix)]
+        {
+            // Additionally force EOF on the recorded recv fds: a session blocked in
+            // a read that has not yet reached an await point observes the close
+            // immediately rather than at its next poll.
+            let ids = self
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .keys()
+                .copied()
+                .collect::<Vec<_>>();
+            for id in ids {
+                self.shutdown_session(id);
+            }
+        }
+    }
+
+    /// Whether [`close_all_sessions`](Self::close_all_sessions) has fired.
+    pub(crate) fn is_closing(&self) -> bool {
+        *self.closing.borrow()
+    }
+
+    fn closing_signal(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.closing.subscribe()
+    }
+
     /// Force a dead session's reader to EOF by half-closing the read direction
     /// of its socket. The session thread, blocked in the rmcp serve loop, then sees
     /// EOF, returns, and drops its [`SessionGuard`] (which removes the entry +
@@ -249,6 +292,44 @@ impl Drop for SessionGuard {
     }
 }
 
+/// One accepted control-frame shutdown, handed from a session task to the accept
+/// loop. `ack` is signalled by the accept loop AFTER it has stopped accepting,
+/// cancelled its watcher lease loops, drained, and removed its own rendezvous;
+/// the session then writes the wire ACK and reports completion through `done` so
+/// the loop never tears its runtime down mid-write.
+pub(crate) struct ShutdownRequest {
+    /// Carries the DRAIN RESULT, not merely a wake: `false` means the bounded
+    /// drain did not complete, and the session must then answer with an UNDRAINED
+    /// ack so `uninit --force` fails closed instead of deleting children behind a
+    /// daemon that still holds work.
+    pub(crate) ack: tokio::sync::oneshot::Sender<bool>,
+    pub(crate) done: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// The session-side capability for the control channel: the FULL project identity
+/// a frame must name, plus the sender the accept loop listens on.
+#[derive(Clone)]
+pub(crate) struct ControlHandle {
+    identity: Arc<str>,
+    tx: tokio::sync::mpsc::UnboundedSender<ShutdownRequest>,
+}
+
+impl ControlHandle {
+    pub(crate) fn new(
+        identity: &str,
+        tx: tokio::sync::mpsc::UnboundedSender<ShutdownRequest>,
+    ) -> Self {
+        Self {
+            identity: Arc::from(identity),
+            tx,
+        }
+    }
+
+    fn authorizes(&self, frame: &ControlFrame) -> bool {
+        frame.authorizes_shutdown_of(&self.identity)
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DaemonHello<'a> {
@@ -276,6 +357,7 @@ pub(crate) async fn serve_session_async(
     socket_path: String,
     registry: SessionRegistry,
     run_mcp: bool,
+    control: Option<ControlHandle>,
 ) -> Result<()> {
     let guard = registry.start_session();
     let session_id = guard.session_id();
@@ -302,12 +384,39 @@ pub(crate) async fn serve_session_async(
     send.write_all(hello_line.as_bytes()).await?;
     send.flush().await?;
 
-    if !run_mcp {
+    if !run_mcp && control.is_none() {
         return Ok(());
     }
 
-    let (first, recv) = read_first_line_bounded_async(recv, MAX_HELLO_LINE_BYTES + 1).await;
+    // The first-line read parks until the peer speaks, so it must observe the
+    // registry's closing signal too — otherwise a connected-but-silent client would
+    // keep the session count nonzero for the whole drain budget on platforms with
+    // no raw-fd half-close.
+    if registry.is_closing() {
+        return Ok(());
+    }
+    let mut closing = registry.closing_signal();
+    // Mark the current value seen so `changed()` awaits the NEXT edge.
+    let _ = closing.borrow_and_update();
+    let (first, recv) = tokio::select! {
+        read = read_first_line_bounded_async(recv, MAX_HELLO_LINE_BYTES + 1) => read,
+        _ = closing.changed() => {
+            debug!("daemon session closed by shutdown drain before its first frame");
+            return Ok(());
+        }
+    };
     let line = String::from_utf8_lossy(&first);
+
+    // A CONTROL frame never reaches the request executor, so it never takes a
+    // data-request shared index lease — that is what lets it be answered while
+    // `uninit --force` holds the namespace's exclusive lease.
+    if let Some(frame) = parse_control_frame(&line) {
+        drop(guard);
+        return serve_control_frame(send, &frame, control.as_ref()).await;
+    }
+    if !run_mcp {
+        return Ok(());
+    }
     let pid = parse_client_hello_line(&line);
     if let Some(pid) = pid {
         registry.set_pid(session_id, pid);
@@ -319,8 +428,76 @@ pub(crate) async fn serve_session_async(
     let put_back: Vec<u8> = if pid.is_some() { Vec::new() } else { first };
     let chained = AsyncReadExt::chain(Cursor::new(put_back), recv);
     let transport = tokio::io::join(chained, send);
-    codegraph_mcp::rmcp_session::serve_session_rmcp_async(transport, project_root).await?;
+    // Race the session against the registry's closing signal so a shutdown
+    // control frame ACTIVELY ends this session (dropping the transport closes the
+    // socket) instead of waiting for the client to disconnect.
+    tokio::select! {
+        served = codegraph_mcp::rmcp_session::serve_session_rmcp_async(transport, project_root) => {
+            served?;
+        }
+        _ = closing.changed() => {
+            debug!("daemon session closed by shutdown drain");
+        }
+    }
     Ok(())
+}
+
+/// Answer one control frame on its own connection.
+///
+/// An unauthorized frame (foreign protocol version, unknown action, or another
+/// project's identity) is refused with an undrained ACK and changes nothing. An
+/// authorized frame hands the request to the accept loop, waits for the loop's
+/// post-drain signal, writes the ACK, and reports completion.
+async fn serve_control_frame(
+    mut send: crate::transport::AsyncSendHalf,
+    frame: &ControlFrame,
+    control: Option<&ControlHandle>,
+) -> Result<()> {
+    let Some(control) = control.filter(|control| control.authorizes(frame)) else {
+        send.write_all(refusal_line(frame).as_bytes()).await?;
+        send.flush().await?;
+        return Ok(());
+    };
+
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    if control
+        .tx
+        .send(ShutdownRequest {
+            ack: ack_tx,
+            done: done_rx,
+        })
+        .is_err()
+    {
+        anyhow::bail!("daemon accept loop is gone; shutdown control frame cannot be served");
+    }
+    let drained = ack_rx
+        .await
+        .map_err(|_| anyhow::anyhow!("daemon drain ended without acknowledging shutdown"))?;
+    // An incomplete drain answers with `drained: false`, which the caller treats as
+    // unresponsive and therefore fail-closed. A success ack is emitted ONLY when
+    // every session and lease loop actually finished.
+    send.write_all(shutdown_reply_line(drained).as_bytes())
+        .await?;
+    send.flush().await?;
+    let _ = done_tx.send(());
+    Ok(())
+}
+
+/// The wire reply for a completed (`true`) or INCOMPLETE (`false`) drain.
+fn shutdown_reply_line(drained: bool) -> String {
+    encode_control_line(&ControlAck::for_drain(drained))
+}
+
+/// The wire reply for an UNAUTHORIZED control frame: never drained, and the
+/// frame's own action is echoed so the caller can see what was refused. Nothing
+/// is mutated and no shutdown is scheduled.
+fn refusal_line(frame: &ControlFrame) -> String {
+    encode_control_line(&ControlAck {
+        codegraph_control: crate::control::CONTROL_PROTOCOL,
+        action: frame.action.clone(),
+        drained: false,
+    })
 }
 
 /// Async analog of [`read_first_line_bounded`]: read from `recv` up to and
@@ -561,6 +738,48 @@ mod tests {
         assert!(registry.has_provably_alive_client(|pid| pid == 1234));
 
         drop((no_pid, dead, alive));
+    }
+
+    #[test]
+    fn shutdown_reply_reports_the_drain_result_and_a_refusal_is_never_drained() {
+        let completed: ControlAck =
+            serde_json::from_str(shutdown_reply_line(true).trim()).expect("ack json");
+        assert!(
+            completed.accepted(),
+            "a completed drain acknowledges success"
+        );
+
+        let incomplete: ControlAck =
+            serde_json::from_str(shutdown_reply_line(false).trim()).expect("ack json");
+        assert!(
+            !incomplete.accepted(),
+            "an incomplete drain must NOT be acknowledged as success"
+        );
+
+        let foreign = ControlFrame::shutdown("another-project");
+        let refusal: ControlAck =
+            serde_json::from_str(refusal_line(&foreign).trim()).expect("refusal json");
+        assert!(!refusal.accepted());
+        assert_eq!(refusal.action, foreign.action);
+    }
+
+    #[test]
+    fn close_all_sessions_is_observable_and_idempotent() {
+        let registry = SessionRegistry::default();
+        assert!(!registry.is_closing());
+        let guard = registry.start_session();
+        registry.close_all_sessions();
+        assert!(
+            registry.is_closing(),
+            "the closing signal must be observable by every session"
+        );
+        // Idempotent: a second call is a no-op and a session that connects AFTER
+        // the signal still observes it.
+        registry.close_all_sessions();
+        assert!(registry.is_closing());
+        let late = registry.start_session();
+        assert!(registry.is_closing());
+        drop((guard, late));
     }
 
     #[test]

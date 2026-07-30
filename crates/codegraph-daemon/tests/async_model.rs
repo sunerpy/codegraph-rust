@@ -97,7 +97,8 @@ fn handshake(stream: &mut Stream, id: i64) {
 }
 
 fn start_daemon(project: &Path) -> DaemonHandle {
-    let _ = codegraph_core::config::init_config(None, project);
+    // No process-global config to initialize: every project-scoped operation
+    // loads the addressed project's own immutable config on demand.
     let options = DaemonOptions {
         host_pid: None,
         watchdog_interval: Duration::from_millis(10),
@@ -360,8 +361,10 @@ fn temp_indexed_project(name: &str) -> PathBuf {
         "codegraph-daemon-{name}-{}-{nanos}-{seq}",
         std::process::id()
     ));
-    let cg = path.join(".codegraph");
-    fs::create_dir_all(&cg).expect("create project .codegraph");
+    // Batch M: the served index DB moved to the isolated v2 namespace
+    // (`.codegraph-v2`); the daemon rendezvous still lives under `.codegraph`.
+    let cg = path.join(".codegraph-v2");
+    fs::create_dir_all(&cg).expect("create project .codegraph-v2");
     let root = workspace_root();
     fs::copy(
         root.join("reference/golden/mini/colby.db"),

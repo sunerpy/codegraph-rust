@@ -81,9 +81,10 @@ Full Godot static-analysis scope, static-vs-runtime boundary, and honesty signal
 
 ## HTTP MCP server: background mode + addr-keyed registry
 
-`serve --mcp` (stdio) uses the PER-PROJECT daemon (`.codegraph/daemon.pid` + socket). `serve --http`
+`serve --mcp` (stdio) uses the PER-PROJECT daemon (`.codegraph-v2/daemon.pid` + socket; the whole
+rendezvous is derived from `IndexPaths::current_root`). `serve --http`
 (streamable-HTTP) is different: HTTP servers are keyed by BIND ADDR — a global server (no `--path`)
-spans many projects — so they use a GLOBAL, addr-keyed registry, NOT `.codegraph/`. The registry
+spans many projects — so they use a GLOBAL, addr-keyed registry, NOT the per-project root. The registry
 lives in `codegraph-daemon/src/http_registry.rs`: one `<addr-sanitized>.json` file per running server
 (`HttpServerInfo { pid, addr, mode, project, started_at, version, log_file }`) under
 `$XDG_STATE_HOME/codegraph/http` (else `~/.local/state/codegraph/http`; `%LOCALAPPDATA%\codegraph\http`
@@ -158,9 +159,10 @@ make coverage    # workspace coverage summary (informational; `make coverage-htm
   `Security Audit` (cargo-audit) + `CI Success` gate, on push/PR to `main`.
 - **Release** (`.github/workflows/release-please.yml`): release-please opens a
   release PR; merging it cuts a `v<version>` tag and triggers the pipeline —
-  4-platform binaries (linux musl x86_64/aarch64 via cargo-zigbuild, macOS
-  x86_64/aarch64), git-cliff release notes, and a GitHub Release with the
-  binaries attached. The project is distributed via GitHub Releases +
+  6-platform binaries (linux musl x86_64/aarch64 via cargo-zigbuild, macOS
+  x86_64/aarch64, and Windows MSVC `x86_64-pc-windows-msvc` on `windows-latest`
+  plus `aarch64-pc-windows-msvc` on `windows-11-arm`), git-cliff release notes,
+  and a GitHub Release with the binaries attached. The project is distributed via GitHub Releases +
   `cargo install --git`; it is NOT published to crates.io. Version bumps are
   owned by release-please via `.release-please-manifest.json` — never bump by
   hand.

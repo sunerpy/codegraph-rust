@@ -1,6 +1,7 @@
-//! OPT-IN DSL config reader for Godot `.tres` resource fields (L5 / T9).
+//! OPT-IN DSL config for Godot `.tres` resource fields (L5 / T9).
 //!
-//! Reads an OPTIONAL, OFF-by-default block from `.codegraph/codegraph.json`:
+//! Reads an OPTIONAL, OFF-by-default block from ONE project's current-root
+//! `codegraph.json` ([`IndexPaths::extension_config`]):
 //!
 //! ```jsonc
 //! { "godot": { "dsl": { "resourceFields": ["skill_effect", "effect_on"] } } }
@@ -25,30 +26,27 @@
 //! } } } }
 //! ```
 //!
-//! Same off-by-default + tolerant-parse + mtime-cache discipline as
-//! `resourceFields`. All field names / kinds / separators / segment indices are
-//! project-supplied; nothing is hardcoded. See [`dsl_id_fields`] and
-//! [`super::godot_resource`]'s `dsl_id_targets`.
+//! # Explicit, project-scoped, cache-free
 //!
-//! # Mirrors `codegraph_extract::ext_config`
+//! The config is loaded ONCE per operation from the addressed project's resolved
+//! current root and threaded into extraction as an immutable
+//! [`GodotDslConfig`]. Nothing here walks up the directory tree, consults the
+//! process working directory, reads a legacy `.codegraph/codegraph.json`, or
+//! caches across calls — so two projects handled by one process can never see
+//! each other's DSL fields and no mtime cache can go stale.
 //!
-//! The reading strategy is intentionally identical to the existing
-//! `.codegraph/codegraph.json` extension-override reader: walk up the directory
-//! tree from the file being parsed to find the nearest config, parse it with
-//! `serde` using `#[serde(default)]` at every level (so any missing key yields
-//! the empty list), tolerate a malformed file (logged + ignored, never panics),
-//! and mtime-cache the parsed result per config-file path — caching "absent"
-//! too, so a project with no `godot.dsl` block pays no repeated I/O.
+//! Parsing stays tolerant (`#[serde(default)]` at every level, a malformed file
+//! yielding the empty config), preserving the documented opt-in contract.
 
+use codegraph_core::IndexPaths;
 use serde::Deserialize;
-use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::SystemTime;
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::Arc;
 
-/// Top-level `.codegraph/codegraph.json` shape — only the `godot` key matters
-/// here; other keys (e.g. `extensions`) are ignored. `#[serde(default)]` makes a
-/// file with no `godot` key parse to an empty config.
+/// Top-level `codegraph.json` shape — only the `godot` key matters here; other
+/// keys (e.g. `extensions`) are ignored. `#[serde(default)]` makes a file with no
+/// `godot` key parse to an empty config.
 #[derive(Debug, Default, Deserialize)]
 struct CodegraphJson {
     #[serde(default)]
@@ -59,13 +57,12 @@ struct CodegraphJson {
 #[derive(Debug, Default, Deserialize)]
 struct GodotConfig {
     #[serde(default)]
-    dsl: GodotDslConfig,
+    dsl: GodotDslConfigFile,
 }
 
-/// The `godot.dsl` block. `resourceFields` lists the `.tres` `[resource]`
-/// property names that should emit a reference edge from their value.
+/// The raw `godot.dsl` block as it appears on disk.
 #[derive(Debug, Default, Deserialize)]
-struct GodotDslConfig {
+struct GodotDslConfigFile {
     #[serde(default, rename = "resourceFields")]
     resource_fields: Vec<String>,
     #[serde(default, rename = "idFields")]
@@ -77,7 +74,7 @@ struct GodotDslConfig {
 ///
 /// `separator` + `id_segments` together select compound parts; with neither, the
 /// whole quote-stripped value is the single ID. All fields are project-supplied.
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
 pub struct IdFieldSpec {
     #[serde(default)]
     pub kind: String,
@@ -87,211 +84,167 @@ pub struct IdFieldSpec {
     pub id_segments: Option<Vec<usize>>,
 }
 
-/// The cached, parsed DSL field list for one config-file path.
-type DslFields = Vec<String>;
-
-#[derive(Clone)]
-enum CacheEntry {
-    Absent,
-    Present {
-        mtime: SystemTime,
-        fields: Arc<DslFields>,
-    },
+/// One project's parsed, immutable Godot DSL configuration: the `resourceFields`
+/// list and the `idFields` spec map. Both empty for a project that declares none
+/// (the off-by-default case).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct GodotDslConfig {
+    resource_fields: Vec<String>,
+    id_fields: BTreeMap<String, IdFieldSpec>,
 }
 
-fn cache() -> &'static Mutex<HashMap<PathBuf, CacheEntry>> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, CacheEntry>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// The configured DSL resource-field names for the `.tres` at `path`, resolving
-/// the nearest `.codegraph/codegraph.json` walking up from `path`. Returns an
-/// EMPTY list when no config is reachable, the file is malformed, or no
-/// `godot.dsl.resourceFields` block is present — i.e. the off-by-default case
-/// yields no DSL behavior.
-pub(crate) fn dsl_resource_fields(path: &Path) -> Arc<DslFields> {
-    let Some(config_path) = find_config_path(path) else {
-        return Arc::new(Vec::new());
-    };
-    load_cached(&config_path)
-}
-
-/// Walk up from `path` to the nearest `.codegraph/codegraph.json`. The starting
-/// directory is the file's own parent. `path` is expected to be ABSOLUTE — the
-/// pipeline resolves the `.tres` against the project root before calling
-/// (`godot_resource::config_lookup_path`), and the unit tests pass absolute
-/// paths. A relative `path` is still tolerated (joined onto the CWD, matching
-/// `ext_config::find_config_path`), but the pipeline never relies on that CWD
-/// join: doing so silently mislocated the config whenever the CLI ran with its
-/// CWD != the project root, which is the bug this resolution was hardened
-/// against.
-fn find_config_path(file_path: &Path) -> Option<PathBuf> {
-    let start = if file_path.is_absolute() {
-        file_path.parent().map(Path::to_path_buf)
-    } else {
-        std::env::current_dir()
-            .ok()
-            .map(|cwd| cwd.join(file_path))
-            .and_then(|abs| abs.parent().map(Path::to_path_buf))
-    }?;
-    let mut dir: Option<&Path> = Some(start.as_path());
-    while let Some(current) = dir {
-        let candidate = current.join(".codegraph").join("codegraph.json");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        dir = current.parent();
+impl GodotDslConfig {
+    /// The empty config — no DSL resource fields, no ID fields.
+    #[must_use]
+    pub fn empty() -> Arc<Self> {
+        Arc::new(Self::default())
     }
-    None
-}
 
-/// Return the cached DSL field list for `config_path`, re-parsing when the
-/// file's mtime changed. Mirrors `ext_config::load_cached`; "absent" (unreadable
-/// file) is cached as an empty list so it is not re-read.
-fn load_cached(config_path: &Path) -> Arc<DslFields> {
-    let current_mtime = std::fs::metadata(config_path)
-        .and_then(|m| m.modified())
-        .ok();
-    let mut guard = cache().lock().unwrap_or_else(|p| p.into_inner());
+    /// Load the DSL config declared by ONE project's current index root
+    /// (`<current_root>/codegraph.json`). A missing, unreadable, or malformed
+    /// file yields the empty config.
+    #[must_use]
+    pub fn load_for_paths(paths: &IndexPaths) -> Arc<Self> {
+        Self::load_from_file(&paths.extension_config())
+    }
 
-    if let Some(entry) = guard.get(config_path) {
-        match (entry, current_mtime) {
-            (CacheEntry::Present { mtime, fields }, Some(now)) if *mtime == now => {
-                return Arc::clone(fields);
-            }
-            (CacheEntry::Absent, None) => return Arc::new(Vec::new()),
-            _ => {}
+    /// Load from an explicit `codegraph.json` path, with the same tolerance as
+    /// [`Self::load_for_paths`].
+    #[must_use]
+    pub fn load_from_file(config_path: &Path) -> Arc<Self> {
+        let Ok(contents) = std::fs::read_to_string(config_path) else {
+            return Self::empty();
+        };
+        Arc::new(Self::parse(&contents))
+    }
+
+    /// Parse the `godot.dsl` block out of `contents`, tolerating any parse
+    /// failure as the empty config. Field names are trimmed; empty names are
+    /// dropped, and an `idFields` entry needs a non-empty key AND kind.
+    #[must_use]
+    pub fn parse(contents: &str) -> Self {
+        // A malformed config is swallowed silently (not logged):
+        // `codegraph-resolve` has no logging dependency, and the no-new-dep
+        // posture forbids adding one.
+        let Ok(parsed) = serde_json::from_str::<CodegraphJson>(contents) else {
+            return Self::default();
+        };
+        let resource_fields = parsed
+            .godot
+            .dsl
+            .resource_fields
+            .into_iter()
+            .map(|field| field.trim().to_string())
+            .filter(|field| !field.is_empty())
+            .collect();
+        let id_fields = parsed
+            .godot
+            .dsl
+            .id_fields
+            .into_iter()
+            .map(|(key, spec)| (key.trim().to_string(), spec))
+            .filter(|(key, spec)| !key.is_empty() && !spec.kind.trim().is_empty())
+            .collect();
+        Self {
+            resource_fields,
+            id_fields,
         }
     }
 
-    let Some(mtime) = current_mtime else {
-        guard.insert(config_path.to_path_buf(), CacheEntry::Absent);
-        return Arc::new(Vec::new());
-    };
-
-    let fields = Arc::new(parse_config(config_path));
-    guard.insert(
-        config_path.to_path_buf(),
-        CacheEntry::Present {
-            mtime,
-            fields: Arc::clone(&fields),
-        },
-    );
-    fields
-}
-
-/// Parse `godot.dsl.resourceFields` out of the config file, tolerating any
-/// read/parse failure as an empty list (logged). Field names are trimmed; empty
-/// names are dropped. Mirrors `ext_config::parse_config`'s tolerance.
-fn parse_config(config_path: &Path) -> DslFields {
-    let Ok(contents) = std::fs::read_to_string(config_path) else {
-        return Vec::new();
-    };
-    // Malformed config is swallowed silently (not logged): `codegraph-resolve`
-    // has no logging dependency, and the no-new-dep posture forbids adding one.
-    let Ok(parsed) = serde_json::from_str::<CodegraphJson>(&contents) else {
-        return Vec::new();
-    };
-
-    parsed
-        .godot
-        .dsl
-        .resource_fields
-        .into_iter()
-        .map(|f| f.trim().to_string())
-        .filter(|f| !f.is_empty())
-        .collect()
-}
-
-// ---------------------------------------------------------------------------
-// `idFields` reader — a second, independent opt-in block (PR2). Same shape as
-// the `resourceFields` reader above: tree-walk find_config_path + mtime cache +
-// tolerant parse + "absent" caching, kept separate so `resourceFields` behavior
-// is provably untouched.
-// ---------------------------------------------------------------------------
-
-/// The cached, parsed `idFields` spec map for one config-file path.
-type IdFields = BTreeMap<String, IdFieldSpec>;
-
-#[derive(Clone)]
-enum IdCacheEntry {
-    Absent,
-    Present {
-        mtime: SystemTime,
-        fields: Arc<IdFields>,
-    },
-}
-
-fn id_cache() -> &'static Mutex<HashMap<PathBuf, IdCacheEntry>> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, IdCacheEntry>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// The configured `idFields` spec map for the `.tres` at `path`, resolving the
-/// nearest `.codegraph/codegraph.json` walking up from `path`. Returns an EMPTY
-/// map when no config is reachable, the file is malformed, or no
-/// `godot.dsl.idFields` block is present — the off-by-default case yields no ID
-/// behavior.
-pub(crate) fn dsl_id_fields(path: &Path) -> Arc<IdFields> {
-    let Some(config_path) = find_config_path(path) else {
-        return Arc::new(BTreeMap::new());
-    };
-    load_cached_id(&config_path)
-}
-
-/// Return the cached `idFields` map for `config_path`, re-parsing when the
-/// file's mtime changed. Mirrors [`load_cached`]; "absent" is cached as an empty
-/// map so it is not re-read.
-fn load_cached_id(config_path: &Path) -> Arc<IdFields> {
-    let current_mtime = std::fs::metadata(config_path)
-        .and_then(|m| m.modified())
-        .ok();
-    let mut guard = id_cache().lock().unwrap_or_else(|p| p.into_inner());
-
-    if let Some(entry) = guard.get(config_path) {
-        match (entry, current_mtime) {
-            (IdCacheEntry::Present { mtime, fields }, Some(now)) if *mtime == now => {
-                return Arc::clone(fields);
-            }
-            (IdCacheEntry::Absent, None) => return Arc::new(BTreeMap::new()),
-            _ => {}
-        }
+    /// `true` when the project declared neither `resourceFields` nor `idFields`.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.resource_fields.is_empty() && self.id_fields.is_empty()
     }
 
-    let Some(mtime) = current_mtime else {
-        guard.insert(config_path.to_path_buf(), IdCacheEntry::Absent);
-        return Arc::new(BTreeMap::new());
-    };
+    /// The configured `.tres` `[resource]` property names whose value becomes a
+    /// reference target, in declaration order.
+    #[must_use]
+    pub fn resource_fields(&self) -> &[String] {
+        &self.resource_fields
+    }
 
-    let fields = Arc::new(parse_id_config(config_path));
-    guard.insert(
-        config_path.to_path_buf(),
-        IdCacheEntry::Present {
-            mtime,
-            fields: Arc::clone(&fields),
-        },
-    );
-    fields
+    /// The configured `idFields` spec map, keyed by property name.
+    #[must_use]
+    pub fn id_fields(&self) -> &BTreeMap<String, IdFieldSpec> {
+        &self.id_fields
+    }
 }
 
-/// Parse `godot.dsl.idFields` out of the config file, tolerating any read/parse
-/// failure as an empty map. Entry keys are trimmed; entries with an empty key or
-/// empty `kind` are dropped (a sentinel needs a non-empty key + kind). Mirrors
-/// [`parse_config`]'s tolerance.
-fn parse_id_config(config_path: &Path) -> IdFields {
-    let Ok(contents) = std::fs::read_to_string(config_path) else {
-        return BTreeMap::new();
-    };
-    let Ok(parsed) = serde_json::from_str::<CodegraphJson>(&contents) else {
-        return BTreeMap::new();
-    };
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    parsed
-        .godot
-        .dsl
-        .id_fields
-        .into_iter()
-        .map(|(k, spec)| (k.trim().to_string(), spec))
-        .filter(|(k, spec)| !k.is_empty() && !spec.kind.trim().is_empty())
-        .collect()
+    #[test]
+    fn parses_resource_and_id_fields() {
+        let config = GodotDslConfig::parse(
+            r#"{"godot":{"dsl":{"resourceFields":[" skill_effect ",""],
+               "idFields":{"buff_id":{"kind":"buff"},
+                           " skill ":{"kind":"skill","separator":":","idSegments":[0,2]},
+                           "bad":{"kind":"  "}}}}}"#,
+        );
+        assert_eq!(config.resource_fields(), ["skill_effect"]);
+        let ids = config.id_fields();
+        assert_eq!(ids.len(), 2, "empty-kind entries are dropped: {ids:?}");
+        assert_eq!(ids["buff_id"].kind, "buff");
+        assert_eq!(ids["skill"].separator.as_deref(), Some(":"));
+        assert_eq!(ids["skill"].id_segments.as_deref(), Some([0, 2].as_slice()));
+    }
+
+    #[test]
+    fn absent_block_and_malformed_json_are_empty() {
+        assert!(GodotDslConfig::parse(r#"{"extensions":{".zz":"lua"}}"#).is_empty());
+        assert!(GodotDslConfig::parse("{ not json ").is_empty());
+        assert!(GodotDslConfig::default().is_empty());
+    }
+
+    /// The reader consults ONLY the current-root config path; a legacy
+    /// `.codegraph/codegraph.json` beside it is never adopted.
+    #[test]
+    fn load_for_paths_reads_only_the_current_root_config() {
+        let project = std::env::temp_dir().join(format!(
+            "codegraph-godot-dsl-scoped-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(project.join(".codegraph")).unwrap();
+        std::fs::write(
+            project.join(".codegraph/codegraph.json"),
+            r#"{"godot":{"dsl":{"resourceFields":["legacy_field"]}}}"#,
+        )
+        .unwrap();
+        let paths = IndexPaths::resolve(&project, None).expect("resolve paths");
+        std::fs::create_dir_all(paths.current_root()).unwrap();
+        std::fs::write(
+            paths.extension_config(),
+            r#"{"godot":{"dsl":{"resourceFields":["current_field"]}}}"#,
+        )
+        .unwrap();
+
+        let config = GodotDslConfig::load_for_paths(&paths);
+        assert_eq!(config.resource_fields(), ["current_field"]);
+
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn missing_current_root_config_is_empty() {
+        let project = std::env::temp_dir().join(format!(
+            "codegraph-godot-dsl-absent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&project).unwrap();
+        let paths = IndexPaths::resolve(&project, None).expect("resolve paths");
+
+        assert!(GodotDslConfig::load_for_paths(&paths).is_empty());
+
+        let _ = std::fs::remove_dir_all(&project);
+    }
 }

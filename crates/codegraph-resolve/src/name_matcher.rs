@@ -203,16 +203,66 @@ fn apply_language_gate(candidates: Vec<Node>, reference: &RefView) -> Vec<Node> 
     }
 }
 
+/// A function nested inside another FUNCTION is only callable from within its
+/// container — Python, JS/TS and every closure language scope it lexically.
+/// Resolving a bare name from elsewhere to a nested local fabricates an edge
+/// scope already rules out: `join(...)` in one function must never bind to a
+/// `join` defined inside a DIFFERENT function (`isLexicallyReachable`, #1230 /
+/// upstream `c472cfb`).
+///
+/// A candidate whose `qualified_name` parent resolves to a same-file
+/// function/method ENCLOSING it is kept only when the ref originates inside that
+/// parent's line range. Class members are unaffected (their parent resolves to a
+/// class-like node), as are top-level symbols and C++ namespace-prefixed names
+/// (the prefix has no node).
+fn is_lexically_reachable(
+    candidate: &Node,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> bool {
+    if candidate.kind != NodeKind::Function {
+        return true;
+    }
+    let Some(sep) = candidate.qualified_name.rfind("::") else {
+        return true;
+    };
+    let parent_qualified = &candidate.qualified_name[..sep];
+    if parent_qualified.is_empty() {
+        return true;
+    }
+    let containers: Vec<Node> = context
+        .get_nodes_by_qualified_name(parent_qualified)
+        .into_iter()
+        .filter(|p| {
+            p.file_path == candidate.file_path
+                && matches!(p.kind, NodeKind::Function | NodeKind::Method)
+                && p.start_line <= candidate.start_line
+                && p.end_line >= candidate.end_line
+        })
+        .collect();
+    if containers.is_empty() {
+        return true;
+    }
+    reference.file_path == candidate.file_path
+        && containers
+            .iter()
+            .any(|p| reference.line >= p.start_line && reference.line <= p.end_line)
+}
+
 /// Try to resolve a reference by exact name match (`matchByExactName`,
 /// `name-matcher.ts:173-209`).
 pub fn match_by_exact_name(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> Option<ResolvedRef> {
-    let candidates = apply_language_gate(
+    let candidates: Vec<Node> = apply_language_gate(
         context.get_nodes_by_name(&reference.reference_name),
         reference,
-    );
+    )
+    .into_iter()
+    // Nested locals are only reachable from inside their container (#1230).
+    .filter(|n| is_lexically_reachable(n, reference, context))
+    .collect();
 
     if candidates.is_empty() {
         return None;
@@ -338,7 +388,7 @@ fn prefer_call_site_file(nodes: Vec<Node>, call_site_file: &str) -> Vec<Node> {
 /// Resolve a method on a type, walking supertypes (`resolveMethodOnType`,
 /// `name-matcher.ts:254-331`).
 #[allow(clippy::too_many_arguments)]
-fn resolve_method_on_type(
+pub(crate) fn resolve_method_on_type(
     type_name: &str,
     method_name: &str,
     reference: &RefView,
@@ -435,7 +485,7 @@ fn cpp_class_exists(name: &str, reference: &RefView, context: &dyn ResolutionCon
 
 /// Escape a receiver for embedding in a `Regex` (the JS
 /// `/[.*+?^${}()|[\]\\]/g` set, `name-matcher.ts:523`).
-fn regex_escape(s: &str) -> String {
+pub(crate) fn regex_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         if matches!(
@@ -750,7 +800,7 @@ fn is_non_type_receiver_token(seg: &str) -> bool {
 /// Normalize a captured type expression to a simple type name: drop generic
 /// args and pointer/ref markers, take the last `.`/`::`-qualified segment, and
 /// reject obvious non-types (`normalizeInferredTypeName`, name-matcher.ts:#1108).
-fn normalize_inferred_type_name(raw: &str) -> Option<String> {
+pub(crate) fn normalize_inferred_type_name(raw: &str) -> Option<String> {
     static GENERICS: OnceLock<Regex> = OnceLock::new();
     let generics = GENERICS.get_or_init(|| Regex::new(r"<[^>]*>").expect("inferred generics re"));
     let cleaned = generics.replace_all(raw, "");
@@ -768,7 +818,7 @@ fn normalize_inferred_type_name(raw: &str) -> Option<String> {
 /// most-specific first. The type-annotation / typed-parameter forms (#1125) are
 /// baked into the second pattern per language. Languages without a pattern set
 /// (the C++ path uses its own dedicated inferrer) return an empty vector.
-fn local_receiver_type_patterns(language: Language, r: &str) -> Vec<Regex> {
+pub(crate) fn local_receiver_type_patterns(language: Language, r: &str) -> Vec<Regex> {
     local_receiver_type_patterns_tagged(language, r)
         .into_iter()
         .map(|(re, _)| re)
@@ -1342,6 +1392,11 @@ fn parse_method_call(name: &str, language: Language) -> Option<(String, String)>
     if let Some(captures) = match_dot_call(name) {
         return Some(captures);
     }
+    if matches!(language, Language::C | Language::Cpp) {
+        if let Some(captures) = match_cpp_operator_dot_call(name) {
+            return Some(captures);
+        }
+    }
     if let Some(captures) = match_colon_call(name) {
         return Some(captures);
     }
@@ -1364,6 +1419,11 @@ fn parse_method_call(name: &str, language: Language) -> Option<(String, String)>
 /// not an instance call.
 fn is_inferable_receiver_call(name: &str, language: Language) -> bool {
     if match_dot_call(name).is_some() {
+        return true;
+    }
+    if matches!(language, Language::C | Language::Cpp)
+        && match_cpp_operator_dot_call(name).is_some()
+    {
         return true;
     }
     if matches!(language, Language::Lua | Language::Luau) && match_lua_colon_call(name).is_some() {
@@ -1437,6 +1497,37 @@ fn match_dot_call(name: &str) -> Option<(String, String)> {
         return None;
     }
     if !is_selector_like(method) {
+        return None;
+    }
+    Some((receiver.to_string(), method.to_string()))
+}
+
+/// Matches `/^([\w.]+)\.(operator[^\w\s.]+)$/` — a C++ explicit operator call
+/// (`a.operator+`, `it.operator[]`) reaching the resolver from the extraction
+/// recovery (#1268). The operator's symbol chars fail `match_dot_call`'s
+/// selector-like method part, so they are admitted here instead. At least one
+/// non-word char after `operator` is required, so `a.operatorTable` stays on the
+/// plain dotted pattern (tried first); every downstream strategy compares the
+/// method part by exact string equality, so a stray match cannot invent an edge.
+fn match_cpp_operator_dot_call(name: &str) -> Option<(String, String)> {
+    let idx = name.rfind(".operator")?;
+    if idx == 0 {
+        return None;
+    }
+    let receiver = &name[..idx];
+    let method = &name[idx + 1..];
+    if !receiver
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+    {
+        return None;
+    }
+    let symbol = method.strip_prefix("operator")?;
+    if symbol.is_empty()
+        || !symbol
+            .chars()
+            .all(|c| !c.is_alphanumeric() && c != '_' && c != '.' && !c.is_whitespace())
+    {
         return None;
     }
     Some((receiver.to_string(), method.to_string()))
@@ -2162,6 +2253,7 @@ mod ceiling_tests {
 
     fn reference() -> RefView {
         RefView {
+            row_id: None,
             from_node_id: "function:caller".to_string(),
             reference_name: "doThing".to_string(),
             reference_kind: EdgeKind::Calls,
@@ -2354,6 +2446,7 @@ mod tests {
 
     fn refv(name: &str, kind: EdgeKind, path: &str, lang: Language, line: i64) -> RefView {
         RefView {
+            row_id: None,
             from_node_id: "function:caller".to_string(),
             reference_name: name.to_string(),
             reference_kind: kind,
@@ -3948,6 +4041,80 @@ mod tests {
         let res = match_method_call(&r, &ctx).expect("cpp receiver");
         assert_eq!(res.target_node_id, "method:v");
         assert_eq!(res.resolved_by, ResolvedBy::InstanceMethod);
+    }
+
+    #[test]
+    fn cpp_explicit_operator_call_resolves_via_receiver_type() {
+        // `const V& a; a.operator+(b)` reaches the resolver as `a.operator+`
+        // (#1268). `Aaa` declares the SAME operator and sorts first, so only
+        // receiver-type inference can pick `V`.
+        let v_op = mk(
+            "method:v_plus",
+            NodeKind::Method,
+            "operator+",
+            "V::operator+",
+            "src/optest.cpp",
+            Language::Cpp,
+        );
+        let decoy = mk(
+            "method:aaa_plus",
+            NodeKind::Method,
+            "operator+",
+            "Aaa::operator+",
+            "src/optest.cpp",
+            Language::Cpp,
+        );
+        let ctx = Ctx::default()
+            .file(
+                "src/optest.cpp",
+                "struct Aaa { Aaa operator+(const Aaa& o) const; };\nstruct V { V operator+(const V& o) const; };\nV add(const V& a, const V& b) { return a.operator+(b); }\n",
+            )
+            .name("operator+", vec![decoy, v_op]);
+        let r = refv(
+            "a.operator+",
+            EdgeKind::Calls,
+            "src/optest.cpp",
+            Language::Cpp,
+            3,
+        );
+        let res = match_method_call(&r, &ctx).expect("explicit operator call resolves");
+        assert_eq!(
+            res.target_node_id, "method:v_plus",
+            "receiver type V must win over the same-named Aaa::operator+"
+        );
+        assert_eq!(res.resolved_by, ResolvedBy::InstanceMethod);
+    }
+
+    #[test]
+    fn cpp_operator_dot_shape_is_a_method_call_shape() {
+        assert_eq!(
+            parse_method_call("a.operator+", Language::Cpp),
+            Some(("a".to_string(), "operator+".to_string()))
+        );
+        assert_eq!(
+            parse_method_call("it.operator[]", Language::Cpp),
+            Some(("it".to_string(), "operator[]".to_string()))
+        );
+        // Word-shaped names keep the plain dotted pattern.
+        assert_eq!(
+            parse_method_call("a.operatorTable", Language::Cpp),
+            Some(("a".to_string(), "operatorTable".to_string()))
+        );
+        // The symbolic form is C/C++-only.
+        assert_eq!(parse_method_call("a.operator+", Language::TypeScript), None);
+        // `operator` with no trailing symbol is NOT the operator shape; it stays
+        // an ordinary dotted call (handled by the plain pattern, tried first).
+        assert_eq!(match_cpp_operator_dot_call("a.operator"), None);
+        assert_eq!(
+            parse_method_call("a.operator", Language::Cpp),
+            Some(("a".to_string(), "operator".to_string()))
+        );
+        // A dotted receiver chain is accepted; a bare `.operator+` is not.
+        assert_eq!(
+            match_cpp_operator_dot_call("w.inner.operator=="),
+            Some(("w.inner".to_string(), "operator==".to_string()))
+        );
+        assert_eq!(match_cpp_operator_dot_call(".operator+"), None);
     }
 
     #[test]
@@ -6037,5 +6204,171 @@ mod tests {
         assert!(!is_inferable_receiver_call("lg:log", Language::Rust));
         // R separator not inferable outside R.
         assert!(!is_inferable_receiver_call("lg$log", Language::TypeScript));
+    }
+
+    // ---- Nested-local lexical reachability (#1230 / upstream c472cfb) -------
+
+    /// `report_missing` (lines 5-8) calls `join`, but the ONLY project `join`
+    /// is nested inside `format_fields` (lines 1-3) — lexically unreachable.
+    fn nested_local_ctx() -> Ctx {
+        let outer = {
+            let mut n = mk(
+                "function:format_fields",
+                NodeKind::Function,
+                "format_fields",
+                "format_fields",
+                "src/repro.py",
+                Language::Python,
+            );
+            n.start_line = 1;
+            n.end_line = 3;
+            n
+        };
+        let nested = {
+            let mut n = mk(
+                "function:join",
+                NodeKind::Function,
+                "join",
+                "format_fields::join",
+                "src/repro.py",
+                Language::Python,
+            );
+            n.start_line = 2;
+            n.end_line = 3;
+            n
+        };
+        let caller = {
+            let mut n = mk(
+                "function:report_missing",
+                NodeKind::Function,
+                "report_missing",
+                "report_missing",
+                "src/repro.py",
+                Language::Python,
+            );
+            n.start_line = 5;
+            n.end_line = 8;
+            n
+        };
+        Ctx::default()
+            .name("join", vec![nested.clone()])
+            .qualified("format_fields", vec![outer.clone()])
+            .nodes_in_file("src/repro.py", vec![outer, nested, caller])
+    }
+
+    #[test]
+    fn nested_local_is_unreachable_from_another_function() {
+        let ctx = nested_local_ctx();
+        let reference = refv("join", EdgeKind::Calls, "src/repro.py", Language::Python, 6);
+        assert_eq!(
+            match_by_exact_name(&reference, &ctx),
+            None,
+            "a `join` nested in format_fields must NOT resolve from report_missing"
+        );
+    }
+
+    #[test]
+    fn nested_local_resolves_from_inside_its_container() {
+        let ctx = nested_local_ctx();
+        let reference = refv("join", EdgeKind::Calls, "src/repro.py", Language::Python, 3);
+        let resolved = match_by_exact_name(&reference, &ctx).expect("reachable from inside");
+        assert_eq!(resolved.target_node_id, "function:join");
+    }
+
+    #[test]
+    fn nested_local_is_unreachable_from_another_file() {
+        let ctx = nested_local_ctx();
+        let reference = refv("join", EdgeKind::Calls, "src/other.py", Language::Python, 2);
+        assert_eq!(
+            match_by_exact_name(&reference, &ctx),
+            None,
+            "a nested local is never reachable from a different file"
+        );
+    }
+
+    #[test]
+    fn class_member_candidate_is_not_scope_filtered() {
+        let cls = {
+            let mut n = mk(
+                "class:Fmt",
+                NodeKind::Class,
+                "Fmt",
+                "Fmt",
+                "src/fmt.py",
+                Language::Python,
+            );
+            n.start_line = 1;
+            n.end_line = 6;
+            n
+        };
+        let member = {
+            let mut n = mk(
+                "function:join",
+                NodeKind::Function,
+                "join",
+                "Fmt::join",
+                "src/fmt.py",
+                Language::Python,
+            );
+            n.start_line = 2;
+            n.end_line = 3;
+            n
+        };
+        let ctx = Ctx::default()
+            .name("join", vec![member.clone()])
+            .qualified("Fmt", vec![cls.clone()])
+            .nodes_in_file("src/fmt.py", vec![cls, member]);
+        let reference = refv("join", EdgeKind::Calls, "src/other.py", Language::Python, 9);
+        let resolved = match_by_exact_name(&reference, &ctx).expect("class members stay reachable");
+        assert_eq!(resolved.target_node_id, "function:join");
+    }
+
+    #[test]
+    fn top_level_and_unparented_candidates_are_not_scope_filtered() {
+        let top = mk(
+            "function:helper",
+            NodeKind::Function,
+            "helper",
+            "helper",
+            "src/top.py",
+            Language::Python,
+        );
+        let ctx = Ctx::default()
+            .name("helper", vec![top.clone()])
+            .nodes_in_file("src/top.py", vec![top]);
+        let reference = refv(
+            "helper",
+            EdgeKind::Calls,
+            "src/other.py",
+            Language::Python,
+            3,
+        );
+        assert_eq!(
+            match_by_exact_name(&reference, &ctx)
+                .expect("top-level symbol stays reachable")
+                .target_node_id,
+            "function:helper"
+        );
+
+        // A C++ namespace prefix has no node, so the qualified name still holds
+        // `::` but no container resolves — the candidate must survive.
+        let ns_fn = mk(
+            "function:emit",
+            NodeKind::Function,
+            "emit",
+            "sim::emit",
+            "src/sim.cpp",
+            Language::Cpp,
+        );
+        let ns_ctx = Ctx::default()
+            .name("emit", vec![ns_fn.clone()])
+            .nodes_in_file("src/sim.cpp", vec![ns_fn]);
+        let ns_ref = refv("emit", EdgeKind::Calls, "src/use.cpp", Language::Cpp, 4);
+        assert_eq!(
+            match_by_exact_name(&ns_ref, &ns_ctx)
+                .expect("namespace-prefixed symbol stays reachable")
+                .target_node_id,
+            "function:emit"
+        );
     }
 }

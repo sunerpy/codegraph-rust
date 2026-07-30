@@ -15,6 +15,17 @@ pub struct DfmExtractor<'a> {
     source: &'a str,
 }
 
+/// One entry of the `object … end` stack.
+///
+/// `id` is the node id used as the parent of the next `contains` edge. For the
+/// synthetic file root `node_index` is `None`; for a real `object`/`inherited`/
+/// `inline` block it is that node's index in `ExtractionResult::nodes`, so the
+/// matching `end` line can close the block's span (upstream issue #1350).
+struct OpenBlock {
+    id: String,
+    node_index: Option<usize>,
+}
+
 impl<'a> DfmExtractor<'a> {
     pub fn new(file_path: &'a str, source: &'a str) -> Self {
         Self { file_path, source }
@@ -63,7 +74,10 @@ impl<'a> DfmExtractor<'a> {
         let multiline_start_re = Regex::new(r"=\s*\(\s*$").unwrap();
         let multiline_item_start_re = Regex::new(r"=\s*<\s*$").unwrap();
 
-        let mut stack = vec![file_id.to_string()];
+        let mut stack = vec![OpenBlock {
+            id: file_id.to_string(),
+            node_index: None,
+        }];
         let mut in_multiline = false;
         let mut multiline_end = ')';
 
@@ -103,18 +117,22 @@ impl<'a> DfmExtractor<'a> {
                 );
                 node.signature = Some(type_name);
                 let node_id = node.id.clone();
+                let node_index = result.nodes.len();
                 result.nodes.push(node);
                 result
                     .edges
-                    .push(contains_edge(stack.last().unwrap(), &node_id));
-                stack.push(node_id);
+                    .push(contains_edge(&stack.last().unwrap().id, &node_id));
+                stack.push(OpenBlock {
+                    id: node_id,
+                    node_index: Some(node_index),
+                });
                 continue;
             }
 
             if let Some(captures) = event_re.captures(line) {
                 let method_name = captures.get(2).unwrap().as_str().to_string();
                 result.unresolved_references.push(unresolved_ref(
-                    stack.last().unwrap(),
+                    &stack.last().unwrap().id,
                     method_name,
                     EdgeKind::References,
                     line_num,
@@ -126,7 +144,10 @@ impl<'a> DfmExtractor<'a> {
             }
 
             if end_re.is_match(line) && stack.len() > 1 {
-                stack.pop();
+                let closed = stack.pop().unwrap();
+                if let Some(index) = closed.node_index {
+                    result.nodes[index].end_line = line_num;
+                }
             }
         }
     }

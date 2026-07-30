@@ -9,7 +9,10 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use codegraph_core::config::Config;
 use codegraph_core::types::{EdgeKind, FileRecord, Node, NodeKind};
 use codegraph_graph::graph::{GodotReach, GraphTraverser, NodeEdge};
 use codegraph_graph::query::{SearchOptions, search_nodes};
@@ -59,24 +62,60 @@ const TYPE_KINDS: [NodeKind; 7] = [
 /// for forward-compatibility, but extraction-widening is DEFERRED per the plan).
 const SIG_EDGE_KINDS: [EdgeKind; 3] = [EdgeKind::References, EdgeKind::TypeOf, EdgeKind::Returns];
 
-/// Holds an opened project store. One engine per project path; the server keeps
-/// a cache keyed by resolved project path (mirrors `ToolHandler.projectCache`,
-/// `tools.ts:591`).
+/// Holds one request-scoped project store. Its retained shared lease remains
+/// live until the request has produced its final result.
 pub struct CodeGraphEngine {
     store: Store,
     project_root: PathBuf,
+    /// The ADDRESSED project's own immutable config, loaded per request from its
+    /// resolved current index root. A server that answers for many projects (a
+    /// global HTTP process) therefore honors each project's own settings, and
+    /// nothing here reads a process-global value or a legacy `.codegraph` config.
+    config: Arc<Config>,
 }
 
 impl CodeGraphEngine {
-    /// Open the store at `<project_root>/.codegraph/codegraph.db`
-    /// (`upstream directory.ts`; learnings Task 4).
+    const READ_LEASE_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Open the store at the project's current (v2) index DB, resolved
+    /// fail-closed through the single `codegraph-core::IndexPaths` authority
+    /// (`.codegraph-v2/codegraph.db` by default; a `<name>-v2-<projectIdentity>`
+    /// sibling for a configured `CODEGRAPH_DIR`). An unsafe/aliased/overlapping
+    /// configured root errors here rather than opening a reconstructed path.
     pub fn open(project_root: &Path) -> anyhow::Result<Self> {
-        let db_path = project_root.join(".codegraph").join("codegraph.db");
-        let store = Store::open(&db_path)?;
+        let paths = codegraph_core::IndexPaths::resolve(
+            project_root,
+            std::env::var("CODEGRAPH_DIR").ok().as_deref(),
+        )?;
+        let config = Config::load_for_paths(None, &paths)?;
+        let store =
+            Store::open_for_read(&paths, Instant::now() + Self::READ_LEASE_TIMEOUT, || false)?;
         Ok(Self {
             store,
             project_root: project_root.to_path_buf(),
+            config,
         })
+    }
+
+    /// This project's own immutable configuration for the current request.
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// Read an indexed file's on-disk source, refusing anything larger than THIS
+    /// project's `indexing.max_file_size`.
+    ///
+    /// Extraction skips a file over that limit, so its symbols are not in the
+    /// graph; serving its full text through a graph tool would contradict the
+    /// project's own size policy. `None` therefore means "unreadable or beyond
+    /// this project's limit", and every rendering path treats it exactly as it
+    /// already treats an unreadable file.
+    fn read_project_source(&self, abs: &Path) -> Option<String> {
+        let metadata = fs::metadata(abs).ok()?;
+        if metadata.len() > self.config.indexing.max_file_size {
+            return None;
+        }
+        fs::read_to_string(abs).ok()
     }
 
     fn project_name_tokens(&self) -> HashSet<String> {
@@ -358,6 +397,29 @@ impl CodeGraphEngine {
                 "Symbol \"{symbol}\" not found in the codebase"
             )));
         }
+        // `symbol` + `file` (#1314): the schema promises `file` PINS an
+        // overloaded name to the definition in that file. A pin that matches
+        // nothing reports not-found rather than falling back to an arbitrary
+        // overload — a silent miss beats a wrong answer.
+        if let Some(file_hint) = file_hint {
+            let pinned: Vec<Node> = matches
+                .iter()
+                .filter(|n| file_path_matches_hint(&n.file_path, file_hint))
+                .cloned()
+                .collect();
+            if pinned.is_empty() {
+                return Ok(ToolResult::not_found_text(format!(
+                    "Symbol \"{symbol}\" not found in \"{file_hint}\""
+                )));
+            }
+            if pinned.len() == 1 {
+                let rendered = self.render_node_section(&pinned[0], include_code)?;
+                return Ok(ToolResult::text(truncate_output(&rendered)));
+            }
+            return Ok(ToolResult::text(truncate_output(
+                &self.render_ambiguous_node(symbol, &pinned, include_code)?,
+            )));
+        }
         if matches.len() == 1 {
             let rendered = self.render_node_section(&matches[0], include_code)?;
             return Ok(ToolResult::text(truncate_output(&rendered)));
@@ -566,9 +628,9 @@ impl CodeGraphEngine {
         }
 
         let abs = self.project_root.join(&file_path);
-        let content = match fs::read_to_string(&abs) {
-            Ok(c) => c,
-            Err(_) => {
+        let content = match self.read_project_source(&abs) {
+            Some(c) => c,
+            None => {
                 let mut out = vec![
                     format!(
                         "**{file_path}** — could not read from disk (it may have moved since indexing). {dep_summary}"
@@ -731,9 +793,9 @@ impl CodeGraphEngine {
                 continue;
             }
             let abs = self.project_root.join(file_path);
-            let content = match fs::read_to_string(&abs) {
-                Ok(c) => c,
-                Err(_) => continue,
+            let content = match self.read_project_source(&abs) {
+                Some(c) => c,
+                None => continue,
             };
             let file_lines: Vec<&str> = content.split('\n').collect();
             let lang = subgraph.file_language(file_path);
@@ -1525,9 +1587,9 @@ impl CodeGraphEngine {
             }
             seen_node.insert(node.id.as_str());
             let abs = self.project_root.join(&node.file_path);
-            let content = match fs::read_to_string(&abs) {
-                Ok(c) => c,
-                Err(_) => continue,
+            let content = match self.read_project_source(&abs) {
+                Some(c) => c,
+                None => continue,
             };
             let file_lines: Vec<&str> = content.split('\n').collect();
             let start_idx = ((node.start_line - 1).max(0) as usize).min(file_lines.len());
@@ -1739,9 +1801,9 @@ impl CodeGraphEngine {
     /// out of the on-disk file (1-based inclusive).
     fn get_code(&self, node: &Node) -> anyhow::Result<Option<String>> {
         let abs = self.project_root.join(&node.file_path);
-        let content = match fs::read_to_string(&abs) {
-            Ok(c) => c,
-            Err(_) => return Ok(None),
+        let content = match self.read_project_source(&abs) {
+            Some(c) => c,
+            None => return Ok(None),
         };
         let lines: Vec<&str> = content.split('\n').collect();
         let start_idx = (node.start_line - 1).max(0) as usize;
@@ -2329,6 +2391,28 @@ fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+/// Whether an indexed `file_path` is the file a `codegraph_node` `file` hint
+/// names (#1314). Accepts the exact repo-relative path, a path suffix on a
+/// segment boundary (`auth/session.ts` for `src/auth/session.ts`), or a bare
+/// basename (`session.ts`). Separators are normalized so a Windows-style hint
+/// pins the same node as its POSIX form.
+fn file_path_matches_hint(file_path: &str, hint: &str) -> bool {
+    let normalize = |s: &str| s.replace('\\', "/").trim_start_matches("./").to_string();
+    let path = normalize(file_path);
+    let hint = normalize(hint);
+    if hint.is_empty() {
+        return false;
+    }
+    if path == hint {
+        return true;
+    }
+    if !hint.contains('/') {
+        return path.rsplit('/').next() == Some(hint.as_str());
+    }
+    path.strip_suffix(hint.as_str())
+        .is_some_and(|prefix| prefix.ends_with('/'))
+}
+
 /// `matchesSymbol` (`tools.ts:3175-3210`).
 fn matches_symbol(node: &Node, symbol: &str) -> bool {
     if node.name == symbol {
@@ -2664,6 +2748,7 @@ mod tests {
         CodeGraphEngine {
             store,
             project_root: base,
+            config: Arc::new(Config::default()),
         }
     }
 
@@ -3103,6 +3188,90 @@ mod tests {
         let engine = test_engine();
         let tr = engine.execute("codegraph_impact", &serde_json::json!({}));
         assert_eq!(tr.is_error, Some(true));
+    }
+
+    #[test]
+    fn file_path_matches_hint_accepts_exact_suffix_and_basename_only() {
+        assert!(file_path_matches_hint(
+            "src/auth/session.ts",
+            "src/auth/session.ts"
+        ));
+        assert!(file_path_matches_hint(
+            "src/auth/session.ts",
+            "auth/session.ts"
+        ));
+        assert!(file_path_matches_hint("src/auth/session.ts", "session.ts"));
+        assert!(file_path_matches_hint(
+            "src/auth/session.ts",
+            "./src/auth/session.ts"
+        ));
+        // Windows-style hint pins the same node as its POSIX form.
+        assert!(file_path_matches_hint(
+            "src/auth/session.ts",
+            "auth\\session.ts"
+        ));
+        // A suffix that does not land on a segment boundary is NOT a match.
+        assert!(!file_path_matches_hint(
+            "src/myauth/session.ts",
+            "auth/session.ts"
+        ));
+        // A basename hint must match the basename, not a substring of it.
+        assert!(!file_path_matches_hint(
+            "src/auth/mysession.ts",
+            "session.ts"
+        ));
+        assert!(!file_path_matches_hint("src/auth/session.ts", "other.ts"));
+        assert!(!file_path_matches_hint("src/auth/session.ts", ""));
+    }
+
+    #[test]
+    fn ext_node_symbol_plus_file_pins_to_that_definition_and_reports_a_bad_pin() {
+        let mut engine = test_engine();
+        let alpha = node_lang(
+            "setState",
+            "setState",
+            "src/alpha.ts",
+            1,
+            4,
+            NodeKind::Function,
+            Language::TypeScript,
+        );
+        let beta = node_lang(
+            "setState",
+            "setState",
+            "src/beta.ts",
+            1,
+            4,
+            NodeKind::Function,
+            Language::TypeScript,
+        );
+        put_nodes(&mut engine, &[alpha, beta]);
+
+        let pinned = engine.execute(
+            "codegraph_node",
+            &serde_json::json!({"symbol": "setState", "file": "src/beta.ts", "includeCode": true}),
+        );
+        let txt = text_of(&pinned);
+        assert!(txt.contains("src/beta.ts"), "got: {txt}");
+        assert!(
+            !txt.contains("src/alpha.ts"),
+            "the pin must exclude the other overload: {txt}"
+        );
+        assert!(
+            !txt.contains("definitions named"),
+            "a resolved pin renders one definition, not the ambiguity list: {txt}"
+        );
+
+        let bad = engine.execute(
+            "codegraph_node",
+            &serde_json::json!({"symbol": "setState", "file": "src/nowhere.ts"}),
+        );
+        assert_eq!(bad.not_found, Some(true));
+        assert!(
+            text_of(&bad).contains("not found in \"src/nowhere.ts\""),
+            "got: {}",
+            text_of(&bad)
+        );
     }
 
     #[test]
@@ -3865,11 +4034,14 @@ mod tests {
             std::process::id(),
             TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::create_dir_all(base.join(".codegraph")).unwrap();
+        // Batch M: `CodeGraphEngine::open` reads the isolated v2 namespace.
+        std::fs::create_dir_all(base.join(".codegraph-v2")).unwrap();
         {
-            let db = base.join(".codegraph").join("codegraph.db");
+            let db = base.join(".codegraph-v2").join("codegraph.db");
             Store::open(&db).unwrap();
         }
+        let paths = codegraph_core::IndexPaths::resolve(&base, None).unwrap();
+        codegraph_store::test_support::finalize_current_test_fixture(&paths).unwrap();
         let engine = CodeGraphEngine::open(&base).unwrap();
         let tr = engine.execute("codegraph_status", &serde_json::json!({}));
         assert!(text_of(&tr).contains("## CodeGraph Status"));

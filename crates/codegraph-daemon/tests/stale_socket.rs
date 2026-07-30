@@ -13,6 +13,8 @@
 //!   2. The stale-socket self-heal helper clears the leftover `daemon.sock` +
 //!      `daemon.pid` when the recorded pid is dead, so the NEXT startup spawns a
 //!      fresh daemon cleanly.
+//!
+//! Both operate on the v2 rendezvous identities resolved through `IndexPaths`.
 
 #![cfg(unix)]
 
@@ -22,8 +24,8 @@ use std::process;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use codegraph_daemon::{
-    DaemonLockInfo, attach_to_daemon, clear_stale_daemon_socket, daemon_pid_path, encode_lock_info,
-    recorded_socket_path,
+    DaemonLockInfo, attach_to_daemon, clear_stale_daemon_socket, daemon_pid_path,
+    daemon_socket_path, encode_lock_info, recorded_socket_path,
 };
 
 // A pid that is not a live process on any sane Unix host.
@@ -39,7 +41,7 @@ const ATTACH_CEILING: Duration = Duration::from_secs(4);
 #[test]
 fn attach_to_orphaned_socket_returns_err_within_bound() {
     let project = temp_project("orphaned-sock");
-    let socket_path = project.join(".codegraph/daemon.sock");
+    let socket_path = socket_path_of(&project);
 
     // Bind a listener to create the .sock file, then DROP it: the filesystem
     // entry survives but nothing is accepting. A connect either refuses or
@@ -72,11 +74,11 @@ fn attach_to_orphaned_socket_returns_err_within_bound() {
 }
 
 /// 1b. A plain FILE at the `.sock` path (not even a socket) must also fail fast
-///     — this is the `touch .codegraph/daemon.sock` shape of the leftover.
+///     — this is the `touch <current-root>/daemon.sock` shape of the leftover.
 #[test]
 fn attach_to_plain_file_socket_returns_err_within_bound() {
     let project = temp_project("plain-file-sock");
-    let socket_path = project.join(".codegraph/daemon.sock");
+    let socket_path = socket_path_of(&project);
     fs::write(&socket_path, b"not a socket").expect("write plain file at sock path");
 
     let started = Instant::now();
@@ -101,8 +103,8 @@ fn attach_to_plain_file_socket_returns_err_within_bound() {
 #[test]
 fn clear_stale_daemon_socket_removes_dead_pid_sock_and_lock() {
     let project = temp_project("self-heal-dead");
-    let pid_path = daemon_pid_path(&project);
-    let socket_path = project.join(".codegraph/daemon.sock");
+    let pid_path = pid_path_of(&project);
+    let socket_path = socket_path_of(&project);
 
     write_lock(&pid_path, DEAD_PID, &socket_path);
     // Leave an orphaned socket file behind (the crashed daemon's residue).
@@ -141,8 +143,8 @@ fn clear_stale_daemon_socket_removes_dead_pid_sock_and_lock() {
 #[test]
 fn clear_stale_daemon_socket_preserves_live_pid_lock() {
     let project = temp_project("self-heal-live");
-    let pid_path = daemon_pid_path(&project);
-    let socket_path = project.join(".codegraph/daemon.sock");
+    let pid_path = pid_path_of(&project);
+    let socket_path = socket_path_of(&project);
 
     // Our own pid is alive — a live lock must never be cleared.
     write_lock(&pid_path, process::id(), &socket_path);
@@ -169,9 +171,18 @@ fn clear_stale_daemon_socket_preserves_live_pid_lock() {
 #[test]
 fn clear_stale_daemon_socket_removes_recorded_fallback_socket() {
     let project = temp_project("self-heal-recorded");
-    let pid_path = daemon_pid_path(&project);
-    // Record a DIFFERENT socket path than the default (a fallback-tmpdir shape).
-    let recorded = project.join(".codegraph/daemon-fallback.sock");
+    let pid_path = pid_path_of(&project);
+    // Record a DIFFERENT socket than the default: the tmpdir shape production
+    // falls back to when the in-root path exceeds the AF_UNIX limit. Keeping it
+    // in the tmpdir root is also what keeps THIS path bindable.
+    let recorded = std::env::temp_dir().join(format!(
+        "cg-v2-fallback-{}-{}.sock",
+        process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
     write_lock(&pid_path, DEAD_PID, &recorded);
     {
         let listener =
@@ -179,7 +190,7 @@ fn clear_stale_daemon_socket_removes_recorded_fallback_socket() {
         drop(listener);
     }
     assert_eq!(
-        recorded_socket_path(&project),
+        recorded_socket_path(&project).expect("resolve recorded socket"),
         recorded,
         "precondition: lock records the fallback socket"
     );
@@ -189,6 +200,7 @@ fn clear_stale_daemon_socket_removes_recorded_fallback_socket() {
     assert!(healed, "stale recorded socket + dead pid must heal");
     assert!(!recorded.exists(), "the RECORDED socket must be removed");
     assert!(!pid_path.exists(), "the stale pid must be removed");
+    let _ = fs::remove_file(&recorded);
 
     let _ = fs::remove_dir_all(project);
 }
@@ -200,10 +212,13 @@ fn write_lock(pid_path: &Path, pid: u32, socket_path: &Path) {
         socket_path: socket_path.to_path_buf(),
         started_at: 1,
     };
-    fs::create_dir_all(pid_path.parent().expect("pid parent")).expect("create .codegraph");
+    fs::create_dir_all(pid_path.parent().expect("pid parent")).expect("create the rendezvous dir");
     fs::write(pid_path, encode_lock_info(&info).expect("serialize lock")).expect("write lock");
 }
 
+/// A real project directory whose v2 rendezvous dir exists. `IndexPaths` derives
+/// the physical project identity from the filesystem object, so the project must
+/// exist before any rendezvous path resolves.
 fn temp_project(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -213,6 +228,18 @@ fn temp_project(name: &str) -> PathBuf {
         "codegraph-daemon-stale-{name}-{}-{nanos}",
         process::id()
     ));
-    fs::create_dir_all(path.join(".codegraph")).expect("create project");
+    fs::create_dir_all(&path).expect("create project");
+    let path = path.canonicalize().expect("canonicalize project");
+    let pid_path = pid_path_of(&path);
+    fs::create_dir_all(pid_path.parent().expect("rendezvous dir"))
+        .expect("create the v2 rendezvous dir");
     path
+}
+
+fn pid_path_of(project: &Path) -> PathBuf {
+    daemon_pid_path(project).expect("resolve the v2 rendezvous pid path")
+}
+
+fn socket_path_of(project: &Path) -> PathBuf {
+    daemon_socket_path(project).expect("resolve the v2 rendezvous socket identity")
 }

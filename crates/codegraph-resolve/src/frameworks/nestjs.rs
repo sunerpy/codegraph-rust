@@ -103,7 +103,7 @@ impl FrameworkResolver for NestjsResolver {
         &self,
         file_path: &str,
         content: &str,
-        _project_root: &str,
+        _context: &crate::framework::FrameworkExtractionContext,
     ) -> Option<FrameworkResolverExtractionResult> {
         if !nestjs_file_ext_regex().is_match(file_path) {
             return Some(FrameworkResolverExtractionResult::default());
@@ -378,6 +378,7 @@ fn add_route(
     nodes.push(node);
     if let Some(handler) = handler {
         references.push(RefView {
+            row_id: None,
             from_node_id: node_id,
             reference_name: handler,
             reference_kind: EdgeKind::References,
@@ -1046,6 +1047,11 @@ fn module_file_regex() -> &'static Regex {
 
 #[cfg(test)]
 mod tests {
+    /// Extraction context for a resolver that needs no project config.
+    fn test_extraction_context() -> crate::framework::FrameworkExtractionContext {
+        crate::framework::FrameworkExtractionContext::without_config("")
+    }
+
     use super::*;
     use crate::types::ImportMapping;
     use std::collections::HashMap;
@@ -1153,6 +1159,7 @@ mod tests {
 
     fn a_ref(name: &str, file: &str) -> RefView {
         RefView {
+            row_id: None,
             from_node_id: format!("from:{file}"),
             reference_name: name.to_string(),
             reference_kind: EdgeKind::References,
@@ -1357,7 +1364,7 @@ mod tests {
     #[test]
     fn extract_non_nest_extension_returns_default() {
         let result = NestjsResolver
-            .extract("src/styles.css", "body{}", "")
+            .extract("src/styles.css", "body{}", &test_extraction_context())
             .expect("extract");
         assert!(result.nodes.is_empty() && result.references.is_empty());
     }
@@ -1366,7 +1373,7 @@ mod tests {
     fn extract_graphql_query_inside_resolver() {
         let content = "@Resolver()\nclass UsersResolver {\n  @Query()\n  users() {}\n}";
         let result = NestjsResolver
-            .extract("src/users.resolver.ts", content, "")
+            .extract("src/users.resolver.ts", content, &test_extraction_context())
             .expect("extract");
         let route = result
             .nodes
@@ -1381,7 +1388,7 @@ mod tests {
         // @Query not inside an @Resolver class -> ignored.
         let content = "class Plain {\n  @Query()\n  q() {}\n}";
         let result = NestjsResolver
-            .extract("src/x.resolver.ts", content, "")
+            .extract("src/x.resolver.ts", content, &test_extraction_context())
             .expect("extract");
         assert!(!result.nodes.iter().any(|n| n.kind == NodeKind::Route));
     }
@@ -1390,7 +1397,7 @@ mod tests {
     fn extract_microservice_message_and_event_patterns() {
         let content = "class H {\n  @MessagePattern('cmd')\n  handle() {}\n  @EventPattern('evt')\n  onEvt() {}\n}";
         let result = NestjsResolver
-            .extract("src/h.controller.ts", content, "")
+            .extract("src/h.controller.ts", content, &test_extraction_context())
             .expect("extract");
         let names: Vec<&str> = result
             .nodes
@@ -1413,7 +1420,7 @@ mod tests {
         // No string arg -> the handler name is used as the path.
         let content = "class H {\n  @MessagePattern()\n  doThing() {}\n}";
         let result = NestjsResolver
-            .extract("src/h.controller.ts", content, "")
+            .extract("src/h.controller.ts", content, &test_extraction_context())
             .expect("extract");
         let route = result
             .nodes
@@ -1427,7 +1434,7 @@ mod tests {
     fn extract_websocket_handler_with_gateway_namespace() {
         let content = "@WebSocketGateway({ namespace: 'chat' })\nclass ChatGw {\n  @SubscribeMessage('msg')\n  onMsg() {}\n}";
         let result = NestjsResolver
-            .extract("src/chat.gateway.ts", content, "")
+            .extract("src/chat.gateway.ts", content, &test_extraction_context())
             .expect("extract");
         let route = result
             .nodes
@@ -1447,7 +1454,7 @@ mod tests {
     fn extract_websocket_without_namespace_uses_event() {
         let content = "class Gw {\n  @SubscribeMessage('ping')\n  onPing() {}\n}";
         let result = NestjsResolver
-            .extract("src/x.gateway.ts", content, "")
+            .extract("src/x.gateway.ts", content, &test_extraction_context())
             .expect("extract");
         let route = result
             .nodes
@@ -1462,7 +1469,7 @@ mod tests {
         // @Get outside any controller class -> prefix is empty.
         let content = "@Get('bare')\nfunction f() {}";
         let result = NestjsResolver
-            .extract("src/x.controller.ts", content, "")
+            .extract("src/x.controller.ts", content, &test_extraction_context())
             .expect("extract");
         let route = result
             .nodes
@@ -1638,7 +1645,11 @@ mod tests {
         // A `.controller.js` routes through the JavaScript comment-strip branch.
         let content = "@Controller('items')\nclass ItemsController {\n  @Get()\n  list() {}\n}";
         let result = NestjsResolver
-            .extract("src/items.controller.js", content, "")
+            .extract(
+                "src/items.controller.js",
+                content,
+                &test_extraction_context(),
+            )
             .expect("extract");
         let route = result
             .nodes
@@ -1654,7 +1665,11 @@ mod tests {
         // `@Controller({ path: 'admin' })` prefix joins onto the method path.
         let content = "@Controller({ path: 'admin' })\nclass AdminController {\n  @Get('users')\n  list() {}\n}";
         let result = NestjsResolver
-            .extract("src/admin.controller.ts", content, "")
+            .extract(
+                "src/admin.controller.ts",
+                content,
+                &test_extraction_context(),
+            )
             .expect("extract");
         let route = result
             .nodes
@@ -1670,7 +1685,7 @@ mod tests {
         // the explicit `name` field, not the handler.
         let content = "@Resolver()\nclass R {\n  @Query({ name: 'allUsers' })\n  fetch() {}\n}";
         let result = NestjsResolver
-            .extract("src/r.resolver.ts", content, "")
+            .extract("src/r.resolver.ts", content, &test_extraction_context())
             .expect("extract");
         let route = result
             .nodes
@@ -1685,7 +1700,7 @@ mod tests {
         // `@Mutation('doThing')` inside a resolver names by the leading string.
         let content = "@Resolver()\nclass R {\n  @Mutation('doThing')\n  run() {}\n}";
         let result = NestjsResolver
-            .extract("src/r.resolver.ts", content, "")
+            .extract("src/r.resolver.ts", content, &test_extraction_context())
             .expect("extract");
         let route = result
             .nodes
@@ -1700,7 +1715,7 @@ mod tests {
         // `@EventPattern()` with no string arg → path is the handler name.
         let content = "class H {\n  @EventPattern()\n  onEvt() {}\n}";
         let result = NestjsResolver
-            .extract("src/h.controller.ts", content, "")
+            .extract("src/h.controller.ts", content, &test_extraction_context())
             .expect("extract");
         let route = result
             .nodes
@@ -1716,7 +1731,7 @@ mod tests {
         // name → empty event, empty namespace → "WS ".
         let content = "class Gw {\n  @SubscribeMessage()\n}";
         let result = NestjsResolver
-            .extract("src/x.gateway.ts", content, "")
+            .extract("src/x.gateway.ts", content, &test_extraction_context())
             .expect("extract");
         let route = result
             .nodes

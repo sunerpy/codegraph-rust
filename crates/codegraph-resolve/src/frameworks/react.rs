@@ -78,7 +78,7 @@ impl FrameworkResolver for ReactResolver {
         &self,
         file_path: &str,
         content: &str,
-        _project_root: &str,
+        _context: &crate::framework::FrameworkExtractionContext,
     ) -> Option<FrameworkResolverExtractionResult> {
         let mut nodes = Vec::new();
         let mut references = Vec::new();
@@ -151,7 +151,7 @@ impl FrameworkResolver for ReactResolver {
 
         // React Router <Route .../> (v5/v6) (react.ts:158-198).
         for tag in route_tag_regex().find_iter(content) {
-            let window = byte_window(content, tag.start(), 400);
+            let window = route_opening_tag_window(content, tag.start());
             let Some(path_match) = route_path_attr().captures(window) else {
                 continue;
             };
@@ -185,10 +185,10 @@ impl FrameworkResolver for ReactResolver {
         if data_router_regex().is_match(content) {
             for m in obj_path_regex().captures_iter(content) {
                 let whole = m.get(0).expect("group 0");
-                let win = byte_window(content, whole.start(), 300);
+                let win = route_object_own_properties(content, whole.start());
                 let comp = obj_element_attr()
-                    .captures(win)
-                    .or_else(|| obj_component_attr().captures(win))
+                    .captures(&win)
+                    .or_else(|| obj_component_attr().captures(&win))
                     .map(|c| c.get(1).expect("comp group").as_str().to_string());
                 let Some(comp) = comp else { continue };
                 let route_path = {
@@ -274,6 +274,7 @@ fn route_reference(
     language: Language,
 ) -> RefView {
     RefView {
+        row_id: None,
         from_node_id,
         reference_name: name,
         reference_kind: EdgeKind::References,
@@ -519,6 +520,183 @@ fn byte_window(content: &str, start: usize, max_bytes: usize) -> &str {
     &content[start..end]
 }
 
+/// Hard byte bound on how far the `<Route …>` opening-tag scan may look forward
+/// from the `<` (upstream issue #1348).
+///
+/// The scan normally stops at the tag's own `>` (see [`opening_tag_end`]), but a
+/// malformed or unterminated tag has no `>` to find, so the search itself must be
+/// capped: without a cap one stray `<Route` would drag the scan to end-of-file,
+/// and a file carrying many such tags would turn this pass quadratic.
+///
+/// 2048 bytes is the cap, sized off the longest opening tags actually measured
+/// rather than a guess. Measured reference points, each the true tag length up to
+/// its brace-aware terminator: a lazy, error-bounded v6 data route spread over
+/// six attribute lines is 278 bytes; the same route with `hydrateFallbackElement`,
+/// `shouldRevalidate` and a `handle={{…}}` object is 525 bytes; a prettier-wrapped
+/// tag carrying twelve extra `data-*` attributes is 700 bytes. 2048 is ~3x that
+/// widest measured tag, so a legitimate tag is never truncated, while the work per
+/// tag stays constant. It is also strictly wider than the fixed 400-byte window it
+/// replaces (`react.ts:114-123`), so no attribute the old window could reach is
+/// lost.
+const ROUTE_OPENING_TAG_SCAN_LIMIT: usize = 2048;
+
+/// The `<Route …>` opening tag's own text, starting at `start` (its `<`).
+///
+/// Replaces the upstream fixed 400-byte window (`react.ts:114-123`), which never
+/// cut at the tag's end and therefore let a parent or pathless route match a
+/// *sibling's* `path`/`element` (upstream issue #1348). The window is bounded
+/// twice over: by the tag terminator when the tag is well formed, and by
+/// [`ROUTE_OPENING_TAG_SCAN_LIMIT`] always — so an unterminated tag can never
+/// scan unboundedly. A malformed tag additionally stops at the next `<Route`, so
+/// even then it cannot borrow a sibling's attributes.
+fn route_opening_tag_window(content: &str, start: usize) -> &str {
+    let bounded = byte_window(content, start, ROUTE_OPENING_TAG_SCAN_LIMIT);
+    if let Some(end) = opening_tag_end(bounded) {
+        return &bounded[..end];
+    }
+    match bounded.get(1..).and_then(|rest| rest.find("<Route")) {
+        Some(idx) => &bounded[..idx + 1],
+        None => bounded,
+    }
+}
+
+/// Hard byte bound on how far the data-router route-object scan may walk forward
+/// from a `path:` key (upstream issue #1348, data-router half).
+///
+/// The walk normally stops at the `}` closing that route object (see
+/// [`route_object_own_properties`]), but a malformed or unterminated object literal
+/// has no matching `}` to find, so the walk itself must be capped: without a cap one
+/// stray `path:` would drag it to end-of-file, and a file carrying many such keys
+/// would turn this pass quadratic. This is the object-form twin of
+/// [`ROUTE_OPENING_TAG_SCAN_LIMIT`], and both invariants are the same: terminate at
+/// the construct's own end, and cap the search regardless.
+///
+/// 4096 bytes is the cap, sized off route objects actually measured rather than a
+/// guess. Measured reference points, each the raw walk distance from the object's
+/// `path:` key to its own closing `}` (nested children included, because the walk
+/// traverses and elides them rather than stopping at them): a minimal inline
+/// `{ path, element }` is 38 bytes; a typical v6.4 route with `loader` and
+/// `errorElement` is 142; the same plus `action`, `handle={…}` and
+/// `shouldRevalidate`, with `element` last, is 407; a wide enterprise route adding
+/// `hydrateFallbackElement` and a nested `handle` object is 611; a parent route
+/// whose `children` array holds eight loader-bearing child routes, with the parent's
+/// own `element` declared last — the worst realistic walk, since every child byte
+/// must be traversed before the parent's own `element` is reached — is 1503. 4096 is
+/// ~2.7x that widest measured object, so a legitimate object is never truncated,
+/// while the work per `path:` key stays constant. It is also strictly wider than the
+/// fixed 300-byte window it replaces (`react.ts:206`), so no property the old window
+/// could reach is lost.
+const ROUTE_OBJECT_SCAN_LIMIT: usize = 4096;
+
+/// The route object's OWN properties, as text, starting at the `path:` key that
+/// begins at `path_key_start`.
+///
+/// Replaces the upstream fixed 300-byte window (`react.ts:206`), which scanned
+/// blindly forward and took the FIRST `element`/`Component` it found — so a parent
+/// route with no `element` of its own silently borrowed a CHILD route's component,
+/// the same borrowing defect [`route_opening_tag_window`] fixes for the `<Route>`
+/// JSX form (upstream issue #1348).
+///
+/// Nested `{…}` / `[…]` groups are ELIDED, not merely stopped at: a `children: […]`
+/// array cannot leak its own `element` into the parent's text, and neither can a
+/// `handle: {…}` object. Quoted values are copied verbatim, so a `}` or `>` inside
+/// `path: 'a>b'` neither ends the object nor unbalances the depth. The walk is
+/// bounded twice over, exactly as the JSX form is: by the object's own closing `}`
+/// when the literal is well formed, and by [`ROUTE_OBJECT_SCAN_LIMIT`] always. A
+/// malformed object additionally stops at the next `path:` key, so even then it
+/// cannot borrow a following sibling's properties.
+fn route_object_own_properties(content: &str, path_key_start: usize) -> String {
+    let bounded = byte_window(content, path_key_start, ROUTE_OBJECT_SCAN_LIMIT);
+    let bytes = bounded.as_bytes();
+    let mut own = String::with_capacity(bounded.len());
+    // Start of the run of depth-0 bytes not yet copied into `own`. Every byte the
+    // walk inspects structurally is ASCII, so every boundary is a char boundary.
+    let mut segment_start = 0usize;
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+
+    for (index, byte) in bytes.iter().enumerate() {
+        match quote {
+            Some(open) => {
+                if *byte == open {
+                    quote = None;
+                }
+            }
+            None => match byte {
+                b'"' | b'\'' | b'`' => quote = Some(*byte),
+                b'{' | b'[' => {
+                    if depth == 0 {
+                        // Elide the nested group; a space keeps neighbouring tokens
+                        // from fusing across the hole.
+                        own.push_str(&bounded[segment_start..index]);
+                        own.push(' ');
+                    }
+                    depth += 1;
+                }
+                b'}' | b']' => {
+                    if depth == 0 {
+                        // This object's own end: nothing beyond it belongs to it.
+                        own.push_str(&bounded[segment_start..index]);
+                        return own;
+                    }
+                    depth -= 1;
+                    if depth == 0 {
+                        segment_start = index + 1;
+                    }
+                }
+                b'p' if depth == 0 && index > 0 && is_path_key_at(bounded, index) => {
+                    // Unterminated object: a second depth-0 `path:` can only be a
+                    // following sibling's, so stop rather than borrow from it.
+                    own.push_str(&bounded[segment_start..index]);
+                    return own;
+                }
+                _ => {}
+            },
+        }
+    }
+
+    if depth == 0 {
+        own.push_str(&bounded[segment_start..]);
+    }
+    own
+}
+
+/// Whether a `path` object key (`path` then optional whitespace then `:`) starts at
+/// `index` in `text`.
+fn is_path_key_at(text: &str, index: usize) -> bool {
+    let Some(rest) = text.get(index..).and_then(|r| r.strip_prefix("path")) else {
+        return false;
+    };
+    rest.trim_start().starts_with(':')
+}
+
+/// Byte index just past the `>` closing the opening tag that starts at byte 0 of
+/// `text`, or `None` when the tag does not terminate inside `text`.
+///
+/// `{…}` expression containers and quoted attribute values are skipped, so the
+/// `>` inside `element={<Comp/>}` or `path="a>b"` does not end the tag early.
+fn opening_tag_end(text: &str) -> Option<usize> {
+    let mut brace_depth = 0usize;
+    let mut quote: Option<u8> = None;
+    for (index, byte) in text.as_bytes().iter().enumerate() {
+        match quote {
+            Some(open) => {
+                if *byte == open {
+                    quote = None;
+                }
+            }
+            None => match byte {
+                b'"' | b'\'' | b'`' => quote = Some(*byte),
+                b'{' => brace_depth += 1,
+                b'}' => brace_depth = brace_depth.saturating_sub(1),
+                b'>' if brace_depth == 0 => return Some(index + 1),
+                _ => {}
+            },
+        }
+    }
+    None
+}
+
 fn component_patterns() -> &'static [Regex] {
     static RE: OnceLock<Vec<Regex>> = OnceLock::new();
     RE.get_or_init(|| {
@@ -651,6 +829,11 @@ fn page_ext_strip_regex() -> &'static Regex {
 
 #[cfg(test)]
 mod tests {
+    /// Extraction context for a resolver that needs no project config.
+    fn test_extraction_context() -> crate::framework::FrameworkExtractionContext {
+        crate::framework::FrameworkExtractionContext::without_config("")
+    }
+
     use super::*;
     use crate::types::ImportMapping;
     use codegraph_core::types::Node;
@@ -757,6 +940,7 @@ mod tests {
 
     fn a_ref(name: &str, kind: EdgeKind, file: &str, lang: Language) -> RefView {
         RefView {
+            row_id: None,
             from_node_id: format!("from:{file}"),
             reference_name: name.to_string(),
             reference_kind: kind,
@@ -1030,7 +1214,7 @@ mod tests {
     fn extract_arrow_component_with_jsx() {
         let content = "export const Card = () => { return <div/>; };";
         let result = ReactResolver
-            .extract("src/Card.jsx", content, "")
+            .extract("src/Card.jsx", content, &test_extraction_context())
             .expect("extract");
         assert!(
             result
@@ -1048,7 +1232,7 @@ mod tests {
         content.push('é');
 
         let result = ReactResolver
-            .extract("src/Card.tsx", &content, "")
+            .extract("src/Card.tsx", &content, &test_extraction_context())
             .expect("extract");
 
         assert!(
@@ -1064,7 +1248,7 @@ mod tests {
         // A PascalCase function that returns no JSX must NOT be a component node.
         let content = "export function Helper() { return 42; }";
         let result = ReactResolver
-            .extract("src/Helper.tsx", content, "")
+            .extract("src/Helper.tsx", content, &test_extraction_context())
             .expect("extract");
         assert!(!result.nodes.iter().any(|n| n.kind == NodeKind::Component));
     }
@@ -1074,7 +1258,7 @@ mod tests {
         let content =
             "const Fancy = React.forwardRef(() => <div/>);\nconst Wrapped = memo(() => <span/>);";
         let result = ReactResolver
-            .extract("src/W.tsx", content, "")
+            .extract("src/W.tsx", content, &test_extraction_context())
             .expect("extract");
         let names: Vec<&str> = result
             .nodes
@@ -1090,7 +1274,7 @@ mod tests {
     fn extract_custom_hook_node() {
         let content = "export function useCounter() { return 0; }";
         let result = ReactResolver
-            .extract("src/useCounter.ts", content, "")
+            .extract("src/useCounter.ts", content, &test_extraction_context())
             .expect("extract");
         let hook = result
             .nodes
@@ -1106,7 +1290,7 @@ mod tests {
     fn extract_hook_js_language_for_plain_js() {
         let content = "const useX = () => 1;";
         let result = ReactResolver
-            .extract("src/useX.js", content, "")
+            .extract("src/useX.js", content, &test_extraction_context())
             .expect("extract");
         let hook = result
             .nodes
@@ -1121,7 +1305,7 @@ mod tests {
         // <Route ... element={<Home/>}/> uses the element attr branch.
         let content = "<Route path=\"/x\" element={<Home/>}/>";
         let result = ReactResolver
-            .extract("src/App.tsx", content, "")
+            .extract("src/App.tsx", content, &test_extraction_context())
             .expect("extract");
         let route = result
             .nodes
@@ -1139,7 +1323,7 @@ mod tests {
         content.push('é');
 
         let result = ReactResolver
-            .extract("src/App.tsx", &content, "")
+            .extract("src/App.tsx", &content, &test_extraction_context())
             .expect("extract");
         let route = result
             .nodes
@@ -1155,7 +1339,7 @@ mod tests {
     fn extract_route_without_path_is_skipped() {
         let content = "<Route element={<Home/>}/>";
         let result = ReactResolver
-            .extract("src/App.tsx", content, "")
+            .extract("src/App.tsx", content, &test_extraction_context())
             .expect("extract");
         assert!(!result.nodes.iter().any(|n| n.kind == NodeKind::Route));
     }
@@ -1165,7 +1349,7 @@ mod tests {
         let content =
             "const r = createBrowserRouter([\n  { path: '/dash', element: <Dashboard/> },\n]);";
         let result = ReactResolver
-            .extract("src/routes.tsx", content, "")
+            .extract("src/routes.tsx", content, &test_extraction_context())
             .expect("extract");
         let route = result
             .nodes
@@ -1191,7 +1375,7 @@ mod tests {
         content.push('é');
 
         let result = ReactResolver
-            .extract("src/routes.tsx", &content, "")
+            .extract("src/routes.tsx", &content, &test_extraction_context())
             .expect("extract");
         let route = result
             .nodes
@@ -1207,7 +1391,7 @@ mod tests {
     fn extract_data_router_empty_path_becomes_root() {
         let content = "createBrowserRouter([{ path: '', Component: Index }]);";
         let result = ReactResolver
-            .extract("src/routes.tsx", content, "")
+            .extract("src/routes.tsx", content, &test_extraction_context())
             .expect("extract");
         let route = result
             .nodes
@@ -1221,7 +1405,7 @@ mod tests {
     fn extract_data_router_path_without_component_skipped() {
         let content = "createBrowserRouter([{ path: '/only' }]);";
         let result = ReactResolver
-            .extract("src/routes.tsx", content, "")
+            .extract("src/routes.tsx", content, &test_extraction_context())
             .expect("extract");
         assert!(!result.nodes.iter().any(|n| n.kind == NodeKind::Route));
     }
@@ -1230,7 +1414,7 @@ mod tests {
     fn extract_nextjs_app_page_route() {
         let content = "export default function Page() { return <div/>; }";
         let result = ReactResolver
-            .extract("app/blog/page.tsx", content, "")
+            .extract("app/blog/page.tsx", content, &test_extraction_context())
             .expect("extract");
         let route = result
             .nodes
@@ -1244,7 +1428,7 @@ mod tests {
     fn extract_nextjs_without_export_default_no_route() {
         let content = "export function NotDefault() { return <div/>; }";
         let result = ReactResolver
-            .extract("pages/x.tsx", content, "")
+            .extract("pages/x.tsx", content, &test_extraction_context())
             .expect("extract");
         assert!(!result.nodes.iter().any(|n| n.kind == NodeKind::Route));
     }

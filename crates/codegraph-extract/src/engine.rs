@@ -5,7 +5,7 @@
 //! `tree-sitter.ts:4350-4425` maps to source dispatch.
 
 use anyhow::{Context, Result};
-use codegraph_core::config::IndexingConfig;
+use codegraph_core::config::{Config, IndexingConfig};
 use codegraph_core::node_id::hash_content;
 use codegraph_core::types::{ExtractionResult, Language};
 use rayon::prelude::*;
@@ -13,10 +13,11 @@ use regex::Regex;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tree_sitter::Parser;
 
+use crate::ext_config::ExtensionOverrides;
 use crate::lang::spec_for_language;
 use crate::walker::TreeSitterWalker;
 
@@ -28,6 +29,12 @@ pub struct ExtractOptions {
     pub exclude: Vec<String>,
     pub include: Vec<String>,
     pub parallel: bool,
+    /// The addressed project's custom extension→language overrides, loaded from
+    /// ITS current-root `codegraph.json` ([`ExtensionOverrides::load_for_paths`]).
+    /// Empty by default, so a project that declares none behaves exactly as
+    /// before. Passed explicitly instead of discovered, so two projects handled
+    /// by one process can never see each other's overrides.
+    pub extensions: Arc<ExtensionOverrides>,
 }
 
 impl Default for ExtractOptions {
@@ -40,6 +47,25 @@ impl Default for ExtractOptions {
             exclude: indexing.exclude,
             include: indexing.include,
             parallel: true,
+            extensions: ExtensionOverrides::empty(),
+        }
+    }
+}
+
+impl ExtractOptions {
+    /// Build the scan/extract options for ONE project from its own immutable
+    /// [`Config`] and extension overrides. This is the only shape production
+    /// callers use; nothing here consults a process-global value.
+    #[must_use]
+    pub fn for_project(config: &Config, extensions: Arc<ExtensionOverrides>) -> Self {
+        Self {
+            max_file_size: config.indexing.max_file_size,
+            ignore_dirs: config.indexing.ignore_dirs.clone(),
+            ignore_paths: config.indexing.ignore_paths.clone(),
+            exclude: config.indexing.exclude.clone(),
+            include: config.indexing.include.clone(),
+            parallel: true,
+            extensions,
         }
     }
 }
@@ -96,7 +122,25 @@ pub fn builtin_language_for_ext(ext: &str) -> Option<Language> {
     Some(language)
 }
 
+/// Built-in language detection with NO project extension overrides.
+///
+/// Use this only where no project is addressed (a bare path classification).
+/// Every pipeline path that indexes or syncs a project calls
+/// [`detect_language_with`] with that project's own overrides.
 pub fn detect_language(file_path: impl AsRef<Path>) -> Language {
+    detect_language_with(file_path, &ExtensionOverrides::default())
+}
+
+/// Detect `file_path`'s language, consulting `overrides` for extensions the
+/// built-in table and the embedded pre-pass leave unclaimed.
+///
+/// Golden safety: the override is consulted ONLY for extensions unclaimed by
+/// both the built-in match and the embedded pre-pass (both checked first), so
+/// empty overrides are byte-identical to the pre-override behavior.
+pub fn detect_language_with(
+    file_path: impl AsRef<Path>,
+    overrides: &ExtensionOverrides,
+) -> Language {
     let path = file_path.as_ref();
     let normalized = normalize_path(path);
     if let Some(language) = crate::embedded::detect_embedded_language(&normalized) {
@@ -114,10 +158,7 @@ pub fn detect_language(file_path: impl AsRef<Path>) -> Language {
     if let Some(language) = builtin_language_for_ext(&ext) {
         return language;
     }
-    // Golden safety: the override is consulted ONLY for extensions unclaimed by
-    // both the built-in match and the embedded pre-pass (both already checked
-    // above). Absent codegraph.json => no override => exact current behavior.
-    if let Some(language) = crate::ext_config::override_language_for(path, &ext) {
+    if let Some(language) = overrides.language_for(&ext) {
         return language;
     }
     Language::Unknown
@@ -156,13 +197,27 @@ fn prefix_8k(source: &str) -> &str {
     }
 }
 
+/// Extract `source` with NO project extension overrides. Equivalent to
+/// [`extract_source_with`] with empty overrides; used where `language` is already
+/// known (embedded delegation) or no project is addressed.
 pub fn extract_source(
     file_path: &str,
     source: &str,
     language: Option<Language>,
 ) -> ExtractionResult {
+    extract_source_with(file_path, source, language, &ExtensionOverrides::default())
+}
+
+/// Extract `source`, resolving an absent `language` through the addressed
+/// project's own extension `overrides`.
+pub fn extract_source_with(
+    file_path: &str,
+    source: &str,
+    language: Option<Language>,
+    overrides: &ExtensionOverrides,
+) -> ExtractionResult {
     let start = Instant::now();
-    let mut language = language.unwrap_or_else(|| detect_language(file_path));
+    let mut language = language.unwrap_or_else(|| detect_language_with(file_path, overrides));
     if language == Language::C
         && Path::new(file_path)
             .extension()
@@ -235,16 +290,30 @@ pub fn extract_source(
         .extract(start.elapsed().as_millis() as i64)
 }
 
+/// Extract one file under the DEFAULT options (no project config). Kept for
+/// callers that address no project; project pipelines use
+/// [`extract_file_with_options`] so the addressed project's `max_file_size` and
+/// extension overrides apply.
 pub fn extract_file(
     root: impl AsRef<Path>,
     relative_path: impl AsRef<Path>,
+) -> Result<ExtractionResult> {
+    extract_file_with_options(root, relative_path, &ExtractOptions::default())
+}
+
+/// Extract one file under ONE project's own `options` (size limit + extension
+/// overrides), so a per-project `max_file_size` and custom extension map apply
+/// to the incremental path exactly as they do to a full scan.
+pub fn extract_file_with_options(
+    root: impl AsRef<Path>,
+    relative_path: impl AsRef<Path>,
+    options: &ExtractOptions,
 ) -> Result<ExtractionResult> {
     let root = root.as_ref();
     let relative_path = normalize_path(relative_path.as_ref());
     let full_path = root.join(&relative_path);
     let metadata = fs::metadata(&full_path)
         .with_context(|| format!("stat source file {}", full_path.display()))?;
-    let options = ExtractOptions::default();
     if metadata.len() > options.max_file_size {
         return Ok(size_skip_result(
             &relative_path,
@@ -255,7 +324,12 @@ pub fn extract_file(
     let source = fs::read_to_string(&full_path)
         .with_context(|| format!("read source file {}", full_path.display()))?;
     let _content_hash = hash_content(&source);
-    Ok(extract_source(&relative_path, &source, None))
+    Ok(extract_source_with(
+        &relative_path,
+        &source,
+        None,
+        &options.extensions,
+    ))
 }
 
 pub fn extract_project(
@@ -278,7 +352,12 @@ pub fn extract_project(
         let source = fs::read_to_string(&full)
             .with_context(|| format!("read source file {}", full.display()))?;
         let _content_hash = hash_content(&source);
-        Ok(extract_source(relative, &source, None))
+        Ok(extract_source_with(
+            relative,
+            &source,
+            None,
+            &options.extensions,
+        ))
     };
 
     let mut results = if options.parallel {
@@ -301,24 +380,39 @@ pub fn scan_project(root: &Path, options: &ExtractOptions) -> Result<Vec<String>
     // later `!pattern` negation re-includes a path an earlier set excluded.
     let pattern_sets: Vec<&[String]> = vec![&options.ignore_paths, &options.exclude, &gitignore];
     let include = IncludeSet::new(&options.include, &options.exclude);
+    // The EXACT resolved reserved index-root PATHS for THIS project (fixed
+    // legacy `.codegraph`, the configured legacy root, and the resolved current
+    // root — including nested configured roots at their true depth), resolved
+    // once. scan_dir prunes a directory iff its FULL path equals one of these,
+    // never by basename, so a user `.codegraph-sources/` stays scannable and an
+    // unrelated same-basename directory is never mis-excluded.
+    let reserved_roots = codegraph_core::IndexPaths::reserved_index_roots(
+        root,
+        std::env::var("CODEGRAPH_DIR").ok().as_deref(),
+    );
     scan_dir(
         root,
         root,
         &ignored_dirs,
+        &reserved_roots,
         &pattern_sets,
         &include,
+        &options.extensions,
         &mut files,
     )?;
     files.sort();
     Ok(files)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_dir(
     root: &Path,
     dir: &Path,
     ignored_dirs: &HashSet<&str>,
+    reserved_roots: &std::collections::BTreeSet<PathBuf>,
     pattern_sets: &[&[String]],
     include: &IncludeSet,
+    overrides: &ExtensionOverrides,
     files: &mut Vec<String>,
 ) -> Result<()> {
     let entries = fs::read_dir(dir).with_context(|| format!("read dir {}", dir.display()))?;
@@ -327,7 +421,13 @@ fn scan_dir(
         let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name == ".git" || name == ".codegraph" || ignored_dirs.contains(name.as_ref()) {
+        // Skip `.git` (a direct child of the scan root) and any directory whose
+        // FULL path is a resolved reserved index root — matched at any depth, so
+        // a nested configured root like `<root>/cache/index` is pruned exactly,
+        // while a same-basename user directory elsewhere is not.
+        let is_reserved_root_here =
+            (dir == root && name == ".git") || reserved_roots.contains(&path);
+        if is_reserved_root_here || ignored_dirs.contains(name.as_ref()) {
             continue;
         }
         let relative = normalize_path(path.strip_prefix(root).unwrap_or(&path));
@@ -341,8 +441,17 @@ fn scan_dir(
             if ignored && !include.wants_descend(&relative) {
                 continue;
             }
-            scan_dir(root, &path, ignored_dirs, pattern_sets, include, files)?;
-        } else if file_type.is_file() && is_extractable_source_path(&relative) {
+            scan_dir(
+                root,
+                &path,
+                ignored_dirs,
+                reserved_roots,
+                pattern_sets,
+                include,
+                overrides,
+                files,
+            )?;
+        } else if file_type.is_file() && is_extractable_source_path(&relative, overrides) {
             // Post-model include decision: a model-ignored file is force-included
             // iff it matches `include` and is NOT overridden by an explicit
             // `exclude` (checked inside `IncludeSet::forces`). Built-in dir skips
@@ -540,8 +649,8 @@ fn include_file_matches(relative: &str, pattern: &str) -> bool {
     pattern_matches(relative, pattern)
 }
 
-fn is_extractable_source_path(relative: &str) -> bool {
-    let language = detect_language(relative);
+fn is_extractable_source_path(relative: &str, overrides: &ExtensionOverrides) -> bool {
+    let language = detect_language_with(relative, overrides);
     language != Language::Unknown
         && (crate::lang::spec_for_language(language).is_some()
             || crate::embedded::is_embedded_source_path(relative)
@@ -591,6 +700,76 @@ mod tests {
         let path = root.join(relative);
         fs::create_dir_all(path.parent().unwrap()).expect("create parent dirs");
         fs::write(&path, contents).expect("write file");
+    }
+
+    /// The scanner excludes ONLY the exact reserved index roots (the fixed
+    /// legacy `.codegraph` and the resolved current `.codegraph-v2`), never an
+    /// arbitrary `.codegraph-*`-prefixed user directory. A first-party source
+    /// dir named `.codegraph-sources` must still be indexed.
+    #[test]
+    fn scan_keeps_user_codegraph_prefixed_dir_but_excludes_reserved_roots() {
+        let project = unique_project("reserved_roots");
+        touch(
+            &project,
+            ".codegraph-sources/kept.ts",
+            "export const a = 1;",
+        );
+        touch(&project, ".codegraph/codegraph.db", "reserved");
+        touch(&project, ".codegraph-v2/codegraph.db", "reserved");
+        touch(&project, "src/app.ts", "export const b = 2;");
+
+        let files = scan_project(&project, &ExtractOptions::default()).expect("scan project");
+
+        assert!(
+            files.contains(&".codegraph-sources/kept.ts".to_string()),
+            "a user `.codegraph-sources` dir must stay scannable: {files:?}"
+        );
+        assert!(
+            files.contains(&"src/app.ts".to_string()),
+            "ordinary source must be indexed: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f.starts_with(".codegraph/")),
+            "the fixed legacy `.codegraph` root must be excluded: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f.starts_with(".codegraph-v2/")),
+            "the resolved current `.codegraph-v2` root must be excluded: {files:?}"
+        );
+
+        fs::remove_dir_all(&project).ok();
+    }
+
+    /// Exclusion is by EXACT resolved root PATH, not basename: a directory that
+    /// merely SHARES the reserved basename but lives at a different path (nested
+    /// under a source subtree) is NOT a resolved root and stays scannable.
+    #[test]
+    fn scan_excludes_only_top_level_root_paths_not_same_named_nested_dirs() {
+        let project = unique_project("reserved_nested");
+        // A `.ts` under the real top-level reserved current root is excluded…
+        touch(&project, ".codegraph-v2/inner.ts", "export const r = 0;");
+        // …but a `.codegraph-v2`-named directory NESTED under `src/` is a user
+        // path (not the resolved current root) and must be indexed.
+        touch(
+            &project,
+            "src/.codegraph-v2/nested.ts",
+            "export const a = 1;",
+        );
+        touch(&project, "src/app.ts", "export const b = 2;");
+
+        let files = scan_project(&project, &ExtractOptions::default()).expect("scan project");
+
+        assert!(
+            files.contains(&"src/.codegraph-v2/nested.ts".to_string()),
+            "a same-basename dir nested off the root is NOT the reserved root: {files:?}"
+        );
+        assert!(files.contains(&"src/app.ts".to_string()), "{files:?}");
+        assert!(
+            !files.iter().any(|f| f.starts_with(".codegraph-v2/")),
+            "the top-level `.codegraph-v2` root is still excluded: {files:?}"
+        );
+
+        fs::remove_dir_all(&project).ok();
     }
 
     /// A real directory scan of a Godot project skips the regenerated `.godot/`
@@ -884,7 +1063,10 @@ mod tests {
             Language::Unknown
         );
         assert!(
-            !is_extractable_source_path("Scripts/effect_manager.gd.uid"),
+            !is_extractable_source_path(
+                "Scripts/effect_manager.gd.uid",
+                &ExtensionOverrides::default()
+            ),
             ".gd.uid sidecar must never be scanned into a file record"
         );
     }

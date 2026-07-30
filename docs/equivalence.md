@@ -170,7 +170,7 @@ The minimal source corpus lives at `crates/codegraph-bench/fixtures/godot/`
 Regenerate the committed database + canonical JSON reproducibly from the corpus:
 
 ```bash
-# 1. Copy the corpus to a clean directory (keeps the workspace .codegraph/ out of it).
+# 1. Copy the corpus to a clean directory (keeps the workspace index out of it).
 rm -rf /tmp/cg-fixture-godot
 cp -r crates/codegraph-bench/fixtures/godot /tmp/cg-fixture-godot
 
@@ -180,7 +180,7 @@ CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
   ./target/release/codegraph init /tmp/cg-fixture-godot
 
 # 3. Commit the produced database as the fixture's colby.db.
-cp /tmp/cg-fixture-godot/.codegraph/codegraph.db reference/golden/godot/colby.db
+cp /tmp/cg-fixture-godot/.codegraph-v2/codegraph.db reference/golden/godot/colby.db
 
 # 4. Dump the canonical golden JSON + schema from that database.
 cargo run -p codegraph-bench --bin bench -- \
@@ -192,6 +192,20 @@ index or the dump reproduces identical `nodes.json`/`edges.json`/`refs.json`/
 `files.json`/`schema.sql`. The `generated_golden_matches_committed_godot_fixture`
 and `upstream_db_is_self_equivalent_to_godot_golden` tests in
 `crates/codegraph-bench/tests/equivalence.rs` enforce this.
+
+Two properties this recipe does NOT claim, for every fixture below as well:
+
+- **`colby.db` is not byte-reproducible.** SQLite's header carries a change
+  counter, so a freshly indexed database differs from the committed one in the
+  first page even when every row matches. Only the `--gen-golden` artifacts are
+  compared byte-for-byte; the `.db` is an input to that dump, not a golden.
+- **`schema.sql` records `.schema` statement ORDER, which can shift.** The order
+  reflects how the current binary creates its objects. Regenerating a fixture
+  whose committed `schema.sql` was produced by an earlier binary can therefore
+  reorder statements (e.g. `idx_edges_identity`) with no schema change. Always
+  regenerate `schema.sql` from the database you are committing — steps 3 and 4
+  do exactly that, which keeps the pair self-consistent — and review an
+  order-only diff as expected rather than as drift.
 
 The schema normalization helper is replicated inside `codegraph-bench` rather
 than extracted into `codegraph-store` to avoid changing store source during the
@@ -222,7 +236,7 @@ The minimal source corpus lives at `crates/codegraph-bench/fixtures/ruby/`
 Regenerate the committed database + canonical JSON reproducibly from the corpus:
 
 ```bash
-# 1. Copy the corpus to a clean directory (keeps the workspace .codegraph/ out of it).
+# 1. Copy the corpus to a clean directory (keeps the workspace index out of it).
 rm -rf /tmp/cg-fixture-ruby
 cp -r crates/codegraph-bench/fixtures/ruby /tmp/cg-fixture-ruby
 
@@ -232,7 +246,7 @@ CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
   ./target/release/codegraph init /tmp/cg-fixture-ruby
 
 # 3. Commit the produced database as the fixture's colby.db.
-cp /tmp/cg-fixture-ruby/.codegraph/codegraph.db reference/golden/ruby/colby.db
+cp /tmp/cg-fixture-ruby/.codegraph-v2/codegraph.db reference/golden/ruby/colby.db
 
 # 4. Dump the canonical golden JSON + schema from that database.
 cargo run -p codegraph-bench --bin bench -- \
@@ -281,16 +295,65 @@ UObject` plus line-leading `GENERATED_BODY()`/`UPROPERTY(...)`/`UFUNCTION()`,
   reclassifies the `.h` to C++, and the offset-preserving pre-parse blanking
   recovers the `UFoo` class + its `Extends UObject` clause (both dropped before).
 
+Five further files exercise the Batch B C/C++ gains:
+
+- **C leading attribute macros** (upstream #1311) — `attr_macro.c` is the one `.c`
+  file in this corpus (extension-mapped to `Language::C`, so it guards the C
+  walker, not the C++ one). It `#define`s an attribute macro + a `VOID` macro,
+  `typedef`s `UINT32`, and declares four functions: two behind the macro
+  (`GoodName` with a macro return type, `LostName` with a typedef'd one), one
+  without it (`NoAttr`, the control), and one pointer-returning (`PtrRet`).
+  tree-sitter's C grammar reads the macro as the type and the real return type as
+  the declarator, so before the fix these indexed under the RETURN TYPE's name
+  (`VOID` / `UINT32`); the golden now pins all four under their real names with
+  their real return types. The blank fires ONLY because `#define SEC_ATTR
+__attribute__((section(".init")))` is visible IN THIS FILE — the pass demands
+  same-file `#define` proof that a leading token is attribute-like, so this fixture
+  also pins that evidence requirement, not just the macro's name.
+
+- **namespaced out-of-line method + fully-qualified call** (upstream #1310) —
+  `namespaced_member.hpp` declares `namespace simulator { class ManifestStartup }`
+  with a static `Apply`, and `namespaced_member.cpp` defines it OUT OF LINE inside
+  the same namespace block, then calls it through the fully-qualified path
+  (`simulator::ManifestStartup::Apply(1)`) from a function OUTSIDE the namespace.
+  The receiver qualifier is spelled relative to the namespace, so the golden pins
+  the method at `simulator::ManifestStartup::Apply` (matching the class node's
+  `simulator::ManifestStartup`) plus the `Calls` edge
+  `run_manifest → simulator::ManifestStartup::Apply` resolved by
+  `qualified-name` — the edge that a namespace-less qualifier loses.
+
+- **out-of-line template method receivers** (upstream #1309) —
+  `template_method.cpp` declares `template <typename T> class Box` with `get` /
+  `set` and defines both OUT OF LINE (`template <typename T> T Box<T>::get()`).
+  The receiver qualifier carries `<T>`, which the class node never spells, so the
+  golden pins both methods at `Box::get` / `Box::set` (template args stripped)
+  plus the `contains` edges from `class Box` to each — the link that a `Box<T>::`
+  qualifier breaks.
+
+A further file exercises the Batch B explicit-operator gain (upstream #1268):
+
+- **explicit operator calls** — `operators.cpp` defines `struct Vec2` with
+  `operator+` / `operator[]` / a plain `get`, then calls each through the
+  EXPLICIT syntax (`a.operator+(b)`, `a.operator[](3)`, `p->operator+(b)`) plus
+  one plain `a.get()` control. tree-sitter-cpp strands the `operator_name` in an
+  ERROR child, so before the fix the extractor emitted the bare receiver (`a`)
+  and no edge existed; the golden now carries four `Calls` edges resolved by
+  `instance-method` at confidence 0.9 (`Vec2::operator+` twice,
+  `Vec2::operator[]`, `Vec2::get`).
+
 The minimal source corpus lives at `crates/codegraph-bench/fixtures/cpp/`
-(`base.hpp`, `derived.cpp`, `namespaced.cpp`, `templated_call.cpp`,
-`ue_actor.h`). The inheritance base classes live in a `.hpp` file (not `.h`,
+(`attr_macro.c`, `base.hpp`, `derived.cpp`, `namespaced.cpp`,
+`namespaced_member.cpp`, `namespaced_member.hpp`, `operators.cpp`,
+`template_method.cpp`, `templated_call.cpp`, `ue_actor.h`). The inheritance base
+classes live in a `.hpp` file (not `.h`,
 which maps to `Language::C` by extension); `ue_actor.h` deliberately uses `.h` to
-guard the content-based C++ reclassification.
+guard the content-based C++ reclassification, and `attr_macro.c` uses `.c` so the
+C walker (not the C++ one) is the thing under test.
 
 Regenerate the committed database + canonical JSON reproducibly from the corpus:
 
 ```bash
-# 1. Copy the corpus to a clean directory (keeps the workspace .codegraph/ out of it).
+# 1. Copy the corpus to a clean directory (keeps the workspace index out of it).
 rm -rf /tmp/cg-fixture-cpp
 cp -r crates/codegraph-bench/fixtures/cpp /tmp/cg-fixture-cpp
 
@@ -300,7 +363,7 @@ CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
   ./target/release/codegraph init /tmp/cg-fixture-cpp
 
 # 3. Commit the produced database as the fixture's colby.db.
-cp /tmp/cg-fixture-cpp/.codegraph/codegraph.db reference/golden/cpp/colby.db
+cp /tmp/cg-fixture-cpp/.codegraph-v2/codegraph.db reference/golden/cpp/colby.db
 
 # 4. Dump the canonical golden JSON + schema from that database.
 cargo run -p codegraph-bench --bin bench -- \
@@ -365,7 +428,7 @@ substituting `metal`/`cuda`):
 rm -rf /tmp/cg-fixture-metal && cp -r crates/codegraph-bench/fixtures/metal /tmp/cg-fixture-metal
 cargo build --release -p codegraph-rs
 CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-metal
-cp /tmp/cg-fixture-metal/.codegraph/codegraph.db reference/golden/metal/colby.db
+cp /tmp/cg-fixture-metal/.codegraph-v2/codegraph.db reference/golden/metal/colby.db
 cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/metal/colby.db reference/golden/metal
 # …and the same for cuda.
 ```
@@ -406,7 +469,7 @@ Regenerate reproducibly (identical recipe to the C++ fixture, substituting
 rm -rf /tmp/cg-fixture-arkts && cp -r crates/codegraph-bench/fixtures/arkts /tmp/cg-fixture-arkts
 cargo build --release -p codegraph-rs
 CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-arkts
-cp /tmp/cg-fixture-arkts/.codegraph/codegraph.db reference/golden/arkts/colby.db
+cp /tmp/cg-fixture-arkts/.codegraph-v2/codegraph.db reference/golden/arkts/colby.db
 cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/arkts/colby.db reference/golden/arkts
 ```
 
@@ -456,7 +519,7 @@ Regenerate reproducibly (identical recipe to the ArkTS fixture, substituting
 rm -rf /tmp/cg-fixture-solidity && cp -r crates/codegraph-bench/fixtures/solidity /tmp/cg-fixture-solidity
 cargo build --release -p codegraph-rs
 CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-solidity
-cp /tmp/cg-fixture-solidity/.codegraph/codegraph.db reference/golden/solidity/colby.db
+cp /tmp/cg-fixture-solidity/.codegraph-v2/codegraph.db reference/golden/solidity/colby.db
 cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/solidity/colby.db reference/golden/solidity
 ```
 
@@ -504,7 +567,7 @@ Regenerate reproducibly (identical recipe to the Solidity fixture, substituting
 rm -rf /tmp/cg-fixture-nix && cp -r crates/codegraph-bench/fixtures/nix /tmp/cg-fixture-nix
 cargo build --release -p codegraph-rs
 CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-nix
-cp /tmp/cg-fixture-nix/.codegraph/codegraph.db reference/golden/nix/colby.db
+cp /tmp/cg-fixture-nix/.codegraph-v2/codegraph.db reference/golden/nix/colby.db
 cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/nix/colby.db reference/golden/nix
 ```
 
@@ -557,7 +620,7 @@ Regenerate reproducibly (identical recipe to the Nix fixture, substituting
 rm -rf /tmp/cg-fixture-terraform && cp -r crates/codegraph-bench/fixtures/terraform /tmp/cg-fixture-terraform
 cargo build --release -p codegraph-rs
 CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-terraform
-cp /tmp/cg-fixture-terraform/.codegraph/codegraph.db reference/golden/terraform/colby.db
+cp /tmp/cg-fixture-terraform/.codegraph-v2/codegraph.db reference/golden/terraform/colby.db
 cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/terraform/colby.db reference/golden/terraform
 ```
 
@@ -616,7 +679,7 @@ Regenerate reproducibly (identical recipe to the Terraform fixture, substituting
 rm -rf /tmp/cg-fixture-erlang && cp -r crates/codegraph-bench/fixtures/erlang /tmp/cg-fixture-erlang
 cargo build --release -p codegraph-rs
 CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-erlang
-cp /tmp/cg-fixture-erlang/.codegraph/codegraph.db reference/golden/erlang/colby.db
+cp /tmp/cg-fixture-erlang/.codegraph-v2/codegraph.db reference/golden/erlang/colby.db
 cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/erlang/colby.db reference/golden/erlang
 ```
 
@@ -663,7 +726,7 @@ Regenerate reproducibly (identical recipe, substituting `cfml`):
 rm -rf /tmp/cg-fixture-cfml && cp -r crates/codegraph-bench/fixtures/cfml /tmp/cg-fixture-cfml
 cargo build --release -p codegraph-rs
 CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-cfml
-cp /tmp/cg-fixture-cfml/.codegraph/codegraph.db reference/golden/cfml/colby.db
+cp /tmp/cg-fixture-cfml/.codegraph-v2/codegraph.db reference/golden/cfml/colby.db
 cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/cfml/colby.db reference/golden/cfml
 ```
 
@@ -673,12 +736,27 @@ The `generated_golden_matches_committed_cfml_fixture` and
 
 ### KNOWN_DIFFS.md format
 
-Tier-3 differences are allowlisted by grep-able lines in repo-root
-`KNOWN_DIFFS.md`:
+Tier-3 differences are allowlisted by grep-able lines in
+`docs/upstream-sync/KNOWN_DIFFS.md` — the single path
+`KnownDiffs::repo_doc_path` hardcodes
+(`crates/codegraph-bench/src/oracle/diff.rs`):
 
 ```text
 RULE tier=3 surface=<surface> key=<substring-or-*> justification=<short-token>
 ```
 
 Only Tier-3 entries can be allowed. Tier-1 byte mismatches and Tier-2 multiset
-mismatches always fail; the differ never weakens those tiers to pass.
+mismatches always fail; the differ never weakens those tiers to pass —
+`KnownDiffs::allows` returns `false` for anything that is not `Tier::Tier3`, and
+`parse_rule` rejects `tier=1` / `tier=2` before that, so a Tier-1/Tier-2 rule
+cannot even be written down.
+
+The parser is fail-closed: an unparsable document fails every equivalence
+assertion instead of being ignored. A `RULE` line is rejected when a token is
+not `key=value`, a key or value is empty, a field name is outside
+`tier`/`surface`/`key`/`justification`, a field is repeated, `tier` is anything
+other than Tier-3, `surface` is outside the five surfaces the differ reports
+(`nodes`, `files`, `schema`, `edges`, `unresolved_refs`), or any of the four
+fields is missing. Lines inside a fenced code block are documentation, not
+rules — including the template above — and an unterminated fence is an error,
+because every `RULE` after it would otherwise be skipped silently.

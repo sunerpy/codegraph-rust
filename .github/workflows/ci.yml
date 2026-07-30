@@ -39,6 +39,14 @@ jobs:
       - name: Clippy lint
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # Materializes the frozen v0.40.4 legacy CLI for the Batch M legacy
+      # compatibility tests, using THIS host's NATIVE asset (linux x86_64). The
+      # script verifies the archive digest, the extracted executable digest, and
+      # the real `--version` before exporting the path. A network or digest
+      # failure fails the job here — legacy tests are never skipped.
+      - name: Prepare legacy v0.40.4 fixture (native linux asset)
+        run: echo "CODEGRAPH_LEGACY_BIN=$(bash scripts/setup-legacy-fixture.sh)" >> "$GITHUB_ENV"
+
       - name: Run tests (incl. golden oracle + sync equivalence)
         run: cargo test --workspace
 
@@ -46,7 +54,25 @@ jobs:
       # (tree-sitter/libsqlite3-sys/ring) require MSVC tooling. Runtime
       # correctness is gated by the native windows-latest job below.
 
-      - name: Scope guardrail (no AI / vector / LLM crates)
+      # The guardrail's asset-name drift gate parses release-please.yml with
+      # yaml.safe_load, so PyYAML must be importable. Idempotent: installs only
+      # when the runner image does not already ship it. A missing PyYAML must
+      # never degrade the gate into a silent skip — the gate itself exits nonzero
+      # in that case, and this step fails loudly first.
+      - name: Ensure PyYAML (asset-name drift gate)
+        run: |
+          python3 -c 'import yaml' \
+            || python3 -m pip install --break-system-packages PyYAML \
+            || python3 -m pip install PyYAML
+
+      # The CI-gate integrity block of the guardrail runs the shipped `ci-success`
+      # step body over a synthetic needs context, which needs jq. Present on
+      # ubuntu-latest; asserted here so a missing jq fails loudly rather than
+      # letting the gate degrade.
+      - name: Ensure jq (CI gate-integrity check)
+        run: jq --version
+
+      - name: Scope guardrail (no AI/vector/LLM crates + release asset-name drift + CI gate integrity)
         run: bash scripts/guardrail.sh
 
   windows:
@@ -69,8 +95,26 @@ jobs:
         # codegraph-bench is a Unix-only dev harness (publish=false); excluded from the Windows job.
         run: cargo clippy --workspace --exclude codegraph-bench --all-targets -- -D warnings
 
+      # Same fixture step, but the script selects THIS host's NATIVE asset
+      # (windows x86_64 .zip). There is no cross-execution and no emulation:
+      # the Windows legacy proof runs only here, on a real Windows runner.
+      - name: Prepare legacy v0.40.4 fixture (native windows asset)
+        shell: bash
+        run: echo "CODEGRAPH_LEGACY_BIN=$(bash scripts/setup-legacy-fixture.sh)" >> "$GITHUB_ENV"
+
       - name: Run tests
         run: cargo test --workspace --exclude codegraph-bench
+
+      # Batch M item 16 acceptance: ONE long-lived shipped `serve --mcp` process
+      # releases every SQLite handle when a request completes, so the v2 main
+      # database can be REPLACED (MoveFileEx + REPLACE_EXISTING) without the
+      # compatibility close seam, and the next request serves only the
+      # replacement graph. The replacement rename is the Windows-specific handle
+      # proof (a retained handle makes it fail with a sharing violation), so this
+      # target is selected EXPLICITLY here — never compile-only, never skipped —
+      # even though the workspace run above already covers it.
+      - name: Run Batch M item 16 native Windows replacement acceptance
+        run: cargo test -p codegraph-rs --test batch_m_long_lived_mcp
 
   audit:
     name: Security Audit
@@ -133,18 +177,87 @@ jobs:
           # to repo Secrets to use it; harmless/ignored if unset on a public repo.
           token: ${{ secrets.CODECOV_TOKEN }}
 
+  # ci-success is the SINGLE required status check for branch protection AND the
+  # job the release workflow's `verify-ci` waits on before a release may leave
+  # draft. It must therefore be a STRICT gate: it passes only when every required
+  # job's result is exactly `success`.
+  #
+  # WHY strict (the bug this shape fixes): `needs.<job>.result` can be `success`,
+  # `failure`, `cancelled`, or `skipped`. The previous check rejected only
+  # `failure`, so `cancelled` and `skipped` both PASSED. Combined with
+  # `cancel-in-progress: true` above, a run cancelled by a newer push could still
+  # conclude `CI Success` — and release-please.yml's `verify-ci` gates the release
+  # on exactly that job. A release could then be cut on a run whose tests never
+  # finished. Anything other than `success` now fails, including any result value
+  # GitHub may add in the future (unknown values are not silently tolerated).
+  #
+  # WHY the results are read from `toJSON(needs)` rather than named one by one:
+  # the step body hardcodes no job name, so adding a job to `needs:` below
+  # automatically makes it required with no change to the script. GitHub Actions
+  # cannot make this fully automatic — the `needs` context contains ONLY the jobs
+  # listed in `needs:`, so a new job that is never added there is invisible to
+  # this gate no matter how the expression is written. That gap is closed OUTSIDE
+  # the workflow, loudly: `scripts/check-ci-gate.sh` (run by scripts/guardrail.sh
+  # in `make ci`, the pre-push hook, and the CI `test` job) asserts that
+  # `ci-success.needs` equals every job in this file minus an explicit
+  # informational allow-list, so forgetting to list a new job turns CI red
+  # instead of silently narrowing the gate.
   ci-success:
     name: CI Success
     runs-on: ubuntu-latest
     if: always()
     # NOTE: `coverage` is intentionally NOT listed here — coverage is
-    # informational and must never gate a merge.
+    # informational (codecov.yml sets `informational: true`, baseline ~72% vs an
+    # aspirational 95% target) and must never gate a merge or a release. It is
+    # the ONLY allowed exclusion; scripts/check-ci-gate.sh enforces that, and
+    # also enforces that codecov.yml still marks coverage informational, so the
+    # exclusion can never outlive its justification.
     needs: [test, audit, windows]
     steps:
       - name: Check job status
+        env:
+          # The whole needs context as JSON: {"test":{"result":"success",...},...}
+          NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
-          if [[ "${{ needs.test.result }}" == "failure" || "${{ needs.audit.result }}" == "failure" || "${{ needs.windows.result }}" == "failure" ]]; then
-            echo "❌ CI failed"
+          set -euo pipefail
+
+          if [ -z "${NEEDS_JSON:-}" ]; then
+            echo "::error title=CI gate::the needs context was empty; cannot prove any required job succeeded — failing closed."
             exit 1
           fi
-          echo "✅ CI passed"
+          if ! printf '%s' "$NEEDS_JSON" | jq -e 'type == "object" and length > 0' > /dev/null 2>&1; then
+            echo "::error title=CI gate::the needs context did not parse as a non-empty JSON object — failing closed."
+            printf 'needs context was: %s\n' "$NEEDS_JSON"
+            exit 1
+          fi
+
+          # One row per required job: "<job>\t<result>". A job whose `result` key
+          # is absent renders as <missing> and fails, never passes.
+          mapfile -t rows < <(
+            printf '%s' "$NEEDS_JSON" \
+              | jq -r 'to_entries | sort_by(.key)[] | "\(.key)\t\(.value.result // "<missing>")"'
+          )
+          if [ "${#rows[@]}" -eq 0 ]; then
+            echo "::error title=CI gate::no required jobs were found in the needs context — failing closed."
+            exit 1
+          fi
+
+          echo "Required job results (only 'success' passes):"
+          offenders=0
+          for row in "${rows[@]}"; do
+            job="${row%%$'\t'*}"
+            result="${row#*$'\t'}"
+            if [ "$result" = "success" ]; then
+              printf '  ✅ %-12s %s\n' "$job" "$result"
+            else
+              printf '  ❌ %-12s %s\n' "$job" "$result"
+              echo "::error title=CI gate::required job '${job}' concluded '${result}', not 'success'."
+              offenders=$((offenders + 1))
+            fi
+          done
+
+          if [ "$offenders" -ne 0 ]; then
+            echo "❌ CI failed: ${offenders} of ${#rows[@]} required job(s) did not conclude 'success' (see the ❌ rows above)."
+            exit 1
+          fi
+          echo "✅ CI passed: all ${#rows[@]} required job(s) concluded 'success'."

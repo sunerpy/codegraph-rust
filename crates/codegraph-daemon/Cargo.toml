@@ -22,6 +22,7 @@ tracing = { workspace = true }
 time = { workspace = true }
 # Cross-platform IPC (local socket on unix, named pipe on windows)
 interprocess = { workspace = true }
+codegraph-core = { path = "../codegraph-core" }
 codegraph-mcp = { path = "../codegraph-mcp" }
 codegraph-watch = { path = "../codegraph-watch" }
 tokio = { version = "1", features = [
@@ -30,6 +31,7 @@ tokio = { version = "1", features = [
     "net",
     "time",
     "macros",
+    "sync",
 ] }
 
 # Unix process introspection (getppid, signal-0 liveness) + socket half-close

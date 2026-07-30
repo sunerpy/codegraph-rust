@@ -800,13 +800,33 @@ impl ReferenceResolver {
         store: &mut Store,
         relative_files: &[String],
     ) -> anyhow::Result<()> {
+        self.extract_and_persist_frameworks_with(
+            store,
+            relative_files,
+            &crate::framework::FrameworkExtractionContext::without_config(&self.project_root),
+            &codegraph_extract::ext_config::ExtensionOverrides::default(),
+        )
+    }
+
+    /// Like [`Self::extract_and_persist_frameworks`] but driven by the addressed
+    /// project's EXPLICITLY loaded configuration: `context` carries its framework
+    /// config (Godot DSL fields) and `extensions` its custom extension→language
+    /// overrides, so language gating and framework extraction both reflect that
+    /// one project and never another's.
+    pub fn extract_and_persist_frameworks_with(
+        &self,
+        store: &mut Store,
+        relative_files: &[String],
+        context: &crate::framework::FrameworkExtractionContext,
+        extensions: &codegraph_extract::ext_config::ExtensionOverrides,
+    ) -> anyhow::Result<()> {
         if self.framework_resolver_extensions.is_empty() {
             return Ok(());
         }
         let mut nodes: Vec<Node> = Vec::new();
         let mut refs: Vec<UnresolvedRef> = Vec::new();
         for relative in relative_files {
-            let language = codegraph_extract::detect_language(relative);
+            let language = codegraph_extract::detect_language_with(relative, extensions);
             let Some(content) =
                 std::fs::read_to_string(std::path::Path::new(&self.project_root).join(relative))
                     .ok()
@@ -817,7 +837,7 @@ impl ReferenceResolver {
                 if !applies_to_language(resolver.as_ref(), language) {
                     continue;
                 }
-                if let Some(result) = resolver.extract(relative, &content, &self.project_root) {
+                if let Some(result) = resolver.extract(relative, &content, context) {
                     nodes.extend(result.nodes);
                     for reference in result.references {
                         refs.push(ref_view_to_unresolved(&reference));
@@ -1304,11 +1324,12 @@ impl ReferenceResolver {
     /// instead of materializing the whole graph. Byte-equivalence rests on four
     /// invariants: `warm_caches` runs ONCE over the full node set; the cursor reads
     /// refs in ascending rowid order so edges insert in the same global order with
-    /// identical autoinc ids; resolved-row deletion is DEFERRED to after the loop so
-    /// the tuple-keyed delete never removes a not-yet-read duplicate row from a later
-    /// batch (which would lose its edge — `unresolved_refs` rows have no UNIQUE
-    /// constraint, so the same `(from,name,kind)` tuple recurs across batches); and
-    /// only resolved rows are deleted, leaving the same final `unresolved_refs` table.
+    /// identical autoinc ids; resolved-row deletion is keyed on `unresolved_refs.id`,
+    /// so a batch deletes exactly the rows it resolved and can reach neither a
+    /// not-yet-read row from a later batch nor a sibling call site sharing its
+    /// `(from,name,kind)` tuple (`unresolved_refs` has no UNIQUE constraint, so that
+    /// tuple repeats both within and across batches); and only resolved rows are
+    /// deleted, leaving the same final `unresolved_refs` table.
     ///
     /// Each chunk's refs are resolved IN PARALLEL via an order-preserving
     /// `par_iter().map().collect()` over a `Sync` [`SnapshotResolutionContext`],
@@ -1482,24 +1503,17 @@ impl ReferenceResolver {
                 }
             }
 
-            // Delete THIS batch's resolved rows immediately, bounded by the
-            // batch's max id, instead of accumulating every resolved key for a
-            // single end-of-loop delete (peak-memory bound on large graphs). The
-            // `id <= cursor` guard preserves any duplicate tuple in a later batch
-            // (ascending-id read order ⇒ its id > cursor) — same final table.
-            let batch_keys: Vec<(String, String, EdgeKind)> = result
+            // Per-batch deletion (peak-memory bound on large graphs) is precise
+            // because the key is `row_id`: a batch can only delete rows it read, so
+            // neither a later batch's row nor a sibling call site sharing this
+            // row's (from,name,kind) tuple is reachable from here.
+            let batch_row_ids: Vec<i64> = result
                 .resolved
                 .iter()
-                .map(|reference| {
-                    (
-                        reference.original.from_node_id.clone(),
-                        reference.original.reference_name.clone(),
-                        reference.original.reference_kind,
-                    )
-                })
+                .filter_map(|reference| reference.original.row_id)
                 .collect();
-            if !batch_keys.is_empty() {
-                store.delete_resolved_unresolved_refs_up_to(&batch_keys, cursor)?;
+            if !batch_row_ids.is_empty() {
+                store.delete_resolved_unresolved_refs(&batch_row_ids)?;
             }
 
             // WAL valve in the resolution write loop (#1212 port / resolution-loop
@@ -1893,6 +1907,7 @@ impl ReferenceResolver {
 /// Denormalize a stored [`UnresolvedRef`] into a [`RefView`] (`index.ts:522-531`).
 fn to_ref_view(reference: &UnresolvedRef) -> RefView {
     RefView {
+        row_id: reference.id,
         from_node_id: reference.from_node_id.clone(),
         reference_name: reference.reference_name.clone(),
         reference_kind: reference.reference_kind,
@@ -1909,7 +1924,7 @@ fn to_ref_view(reference: &UnresolvedRef) -> RefView {
 /// for persistence (inverse of [`to_ref_view`]).
 fn ref_view_to_unresolved(reference: &RefView) -> UnresolvedRef {
     UnresolvedRef {
-        id: None,
+        id: reference.row_id,
         from_node_id: reference.from_node_id.clone(),
         reference_name: reference.reference_name.clone(),
         reference_kind: reference.reference_kind,
@@ -2054,17 +2069,8 @@ fn highest_confidence(best: ResolvedRef, curr: ResolvedRef) -> ResolvedRef {
 /// Delete resolved rows from `unresolved_refs`
 /// (`deleteSpecificResolvedReferences`, `index.ts:811-817`).
 fn delete_resolved_rows(store: &mut Store, resolved: &[ResolvedRef]) -> anyhow::Result<()> {
-    let keys: Vec<(String, String, EdgeKind)> = resolved
-        .iter()
-        .map(|r| {
-            (
-                r.original.from_node_id.clone(),
-                r.original.reference_name.clone(),
-                r.original.reference_kind,
-            )
-        })
-        .collect();
-    store.delete_resolved_unresolved_refs(&keys)?;
+    let row_ids: Vec<i64> = resolved.iter().filter_map(|r| r.original.row_id).collect();
+    store.delete_resolved_unresolved_refs(&row_ids)?;
     Ok(())
 }
 
@@ -2193,11 +2199,29 @@ mod tests {
         assert_eq!(view.line, 3);
         assert_eq!(view.column, 4);
         assert!(view.is_function_ref);
+        assert_eq!(view.row_id, Some(7));
         let back = ref_view_to_unresolved(&view);
         assert_eq!(back.reference_name, "X");
         assert_eq!(back.col, 4);
         assert!(back.is_function_ref);
-        assert_eq!(back.id, None);
+        assert_eq!(back.id, Some(7));
+    }
+
+    #[test]
+    fn ref_view_to_unresolved_keeps_framework_ref_row_id_absent() {
+        let synthesized = RefView {
+            row_id: None,
+            from_node_id: "from".to_string(),
+            reference_name: "Autoload.ping".to_string(),
+            reference_kind: EdgeKind::Calls,
+            line: 1,
+            column: 0,
+            file_path: "a.gd".to_string(),
+            language: Language::Gdscript,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+        assert_eq!(ref_view_to_unresolved(&synthesized).id, None);
     }
 
     #[test]
@@ -2370,6 +2394,7 @@ mod tests {
 
         let extends = ResolvedRef {
             original: RefView {
+                row_id: None,
                 from_node_id: cls.id.clone(),
                 reference_name: "I".to_string(),
                 reference_kind: EdgeKind::Extends,
@@ -2386,6 +2411,7 @@ mod tests {
         };
         let calls = ResolvedRef {
             original: RefView {
+                row_id: None,
                 from_node_id: caller.id.clone(),
                 reference_name: "D".to_string(),
                 reference_kind: EdgeKind::Calls,
@@ -2953,6 +2979,7 @@ mod tests {
         ));
         let ctx = crate::context::StoreResolutionContext::new(&store, "/root");
         let reference = RefView {
+            row_id: None,
             from_node_id: caller.id.clone(),
             reference_name: "this.helper".to_string(),
             reference_kind: EdgeKind::References,
@@ -2996,6 +3023,7 @@ mod tests {
         {
             let ctx = crate::context::StoreResolutionContext::new(&store, "/root");
             let reference = RefView {
+                row_id: None,
                 from_node_id: caller.id.clone(),
                 reference_name: "this.absent".to_string(),
                 reference_kind: EdgeKind::References,
@@ -3044,6 +3072,7 @@ mod tests {
         ));
         let ctx = crate::context::StoreResolutionContext::new(&store, "/root");
         let reference = RefView {
+            row_id: None,
             from_node_id: caller.id.clone(),
             reference_name: "onBlur".to_string(),
             reference_kind: EdgeKind::References,
@@ -3226,6 +3255,7 @@ mod tests {
             "Sub",
             "greet",
             &RefView {
+                row_id: None,
                 from_node_id: run.id.clone(),
                 reference_name: "this.greet".to_string(),
                 reference_kind: EdgeKind::References,
@@ -3259,6 +3289,7 @@ mod tests {
             "C",
             "gone",
             &RefView {
+                row_id: None,
                 from_node_id: "x".to_string(),
                 reference_name: "this.gone".to_string(),
                 reference_kind: EdgeKind::References,
@@ -3348,6 +3379,7 @@ mod tests {
 
     fn mk_ref(name: &str, kind: EdgeKind, lang: Language) -> RefView {
         RefView {
+            row_id: None,
             from_node_id: "from".to_string(),
             reference_name: name.to_string(),
             reference_kind: kind,
@@ -3410,5 +3442,192 @@ mod tests {
             node_count: 0,
             errors: Vec::new(),
         }
+    }
+
+    // ----------------------------------------------------------------------
+    // #1230 PORT: literal receivers + nested locals stop fabricating edges
+    // ----------------------------------------------------------------------
+
+    /// Upstream's exact repro, end-to-end through `resolve_and_persist`:
+    /// `format_fields` (lines 1-5) holds a NESTED `join`; `report_missing`
+    /// (lines 8-10) calls `", ".join(...)`. The nested `join` is the decoy — a
+    /// bare-name fallback binds the string builtin straight to it.
+    fn write_literal_and_nested_fixture(dir: &std::path::Path) -> &'static str {
+        std::fs::write(
+            dir.join("src/repro.py"),
+            concat!(
+                "def format_fields(values):\n",
+                "    def join(vals):\n",
+                "        return \"-\".join(sorted(vals))\n",
+                "\n",
+                "    return join(values)\n",
+                "\n",
+                "\n",
+                "def report_missing(unresolved):\n",
+                "    missing_list = \", \".join(sorted(unresolved))\n",
+                "    return missing_list\n",
+            ),
+        )
+        .expect("write repro.py");
+        "src/repro.py"
+    }
+
+    fn index_python_fixture(
+        slug: &str,
+        root: &std::path::Path,
+        relative: &str,
+    ) -> (Store, std::path::PathBuf) {
+        let db = temp_db(slug);
+        let mut store = Store::open(&db).expect("open store");
+        let result = codegraph_extract::extract_file(root, relative).expect("extract");
+        store
+            .upsert_file(&FileRecord {
+                path: relative.to_string(),
+                content_hash: "fixture".to_string(),
+                language: Language::Python,
+                size: 0,
+                modified_at: 0,
+                indexed_at: 0,
+                node_count: result.nodes.len() as i64,
+                errors: Vec::new(),
+            })
+            .expect("upsert file");
+        store.upsert_nodes(&result.nodes).expect("upsert nodes");
+        store.insert_edges(&result.edges).expect("insert edges");
+        store
+            .insert_unresolved_refs(&result.unresolved_references)
+            .expect("insert refs");
+        (store, db)
+    }
+
+    #[test]
+    fn literal_receiver_and_nested_local_produce_no_fabricated_call_edge() {
+        let dir = fresh_fixture_dir("lit-nested");
+        let relative = write_literal_and_nested_fixture(&dir);
+        let root = dir.to_string_lossy().to_string();
+        let (mut store, db) = index_python_fixture("lit-nested", &dir, relative);
+
+        let mut resolver = ReferenceResolver::new(root);
+        resolver
+            .resolve_and_persist(&mut store)
+            .expect("resolve_and_persist");
+
+        let nodes = store.all_nodes().expect("nodes");
+        let by_name = |name: &str| -> String {
+            nodes
+                .iter()
+                .find(|n| n.kind == NodeKind::Function && n.name == name)
+                .map(|n| n.id.clone())
+                .unwrap_or_else(|| panic!("missing function {name}"))
+        };
+        let join_id = by_name("join");
+        let format_fields_id = by_name("format_fields");
+        let report_missing_id = by_name("report_missing");
+
+        let edges = store.all_edges().expect("edges");
+        let callers_of_join: Vec<&str> = edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls && e.target == join_id)
+            .map(|e| e.source.as_str())
+            .collect();
+        assert_eq!(
+            callers_of_join,
+            vec![format_fields_id.as_str()],
+            "the nested `join` must have exactly ONE caller (its own container)"
+        );
+        assert!(
+            !edges
+                .iter()
+                .any(|e| e.kind == EdgeKind::Calls && e.source == report_missing_id),
+            "`report_missing` calls only string/`sorted` builtins, so it must have NO project callee"
+        );
+
+        let _ = std::fs::remove_file(&db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ----------------------------------------------------------------------
+    // #1269/#1270 PORT: cleanup by row id keeps sibling call sites
+    // ----------------------------------------------------------------------
+
+    /// `run` calls `thing.render()` TWICE (lines 12 and 14) — two
+    /// `unresolved_refs` rows agreeing on `from_node_id`, `reference_name` and
+    /// `reference_kind`, differing only in `line`. Only the line-14 call resolves
+    /// (`thing = Widget()` precedes it), so cleanup must remove exactly that row
+    /// and leave line 12's for the next resolve pass.
+    fn write_sibling_call_sites_fixture(dir: &std::path::Path) -> &'static str {
+        std::fs::write(
+            dir.join("src/siblings.py"),
+            concat!(
+                "class Widget:\n",
+                "    def render(self):\n",
+                "        return 1\n",
+                "\n",
+                "\n",
+                "class Gadget:\n",
+                "    def render(self):\n",
+                "        return 2\n",
+                "\n",
+                "\n",
+                "def run(thing):\n",
+                "    thing.render()\n",
+                "    thing = Widget()\n",
+                "    thing.render()\n",
+            ),
+        )
+        .expect("write siblings.py");
+        "src/siblings.py"
+    }
+
+    #[test]
+    fn resolving_one_call_site_keeps_its_tuple_identical_sibling_row() {
+        let dir = fresh_fixture_dir("sibling-rows");
+        let relative = write_sibling_call_sites_fixture(&dir);
+        let root = dir.to_string_lossy().to_string();
+        let (mut store, db) = index_python_fixture("sibling-rows", &dir, relative);
+
+        let seeded = store.all_unresolved_refs().expect("seeded refs");
+        let seeded_siblings: Vec<&UnresolvedRef> = seeded
+            .iter()
+            .filter(|r| r.reference_name == "thing.render")
+            .collect();
+        assert_eq!(
+            seeded_siblings.len(),
+            2,
+            "fixture must seed TWO tuple-identical rows, got {seeded:?}"
+        );
+
+        let mut resolver = ReferenceResolver::new(root);
+        let result = resolver
+            .resolve_and_persist(&mut store)
+            .expect("resolve_and_persist");
+
+        let resolved_siblings: Vec<&ResolvedRef> = result
+            .resolved
+            .iter()
+            .filter(|r| r.original.reference_name == "thing.render")
+            .collect();
+        assert_eq!(
+            resolved_siblings.len(),
+            1,
+            "exactly ONE of the two call sites resolves"
+        );
+        let resolved_line = resolved_siblings[0].original.line;
+
+        let survivors: Vec<UnresolvedRef> = store
+            .all_unresolved_refs()
+            .expect("remaining refs")
+            .into_iter()
+            .filter(|r| r.reference_name == "thing.render")
+            .collect();
+        assert_eq!(
+            survivors.len(),
+            1,
+            "the UNRESOLVED sibling must survive cleanup of its resolved twin"
+        );
+        assert_ne!(survivors[0].line, resolved_line);
+
+        let _ = std::fs::remove_file(&db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

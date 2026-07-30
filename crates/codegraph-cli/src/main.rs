@@ -16,11 +16,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
-use codegraph_core::config::init_config;
+use codegraph_core::config::Config;
 use codegraph_core::logger::{LoggerConfig, init_logger};
 use codegraph_core::node_id::hash_content;
 use codegraph_core::types::{ExtractionResult, FileRecord, Language, Node, NodeKind};
-use codegraph_extract::{ExtractOptions, detect_language, extract_source};
+use codegraph_extract::{ExtractOptions, detect_language_with, extract_source_with};
 use codegraph_graph::graph::{GodotReach, GraphTraverser};
 use codegraph_graph::query::{SearchOptions, search_nodes};
 use codegraph_mcp::{McpServer, RunUntilAdoption};
@@ -39,13 +39,119 @@ mod segment_match;
 mod segments;
 mod structural_gate;
 
+/// Test-only: the ONE process-wide environment lock for this binary.
+///
+/// `cargo test` runs every unit test of this binary on threads of a SINGLE
+/// process, so `HOME`, `XDG_DATA_HOME`, `USERPROFILE`, … are shared mutable
+/// state. Two independent `ENV_LOCK` statics used to live in this file (one per
+/// test module) plus a third in `installer::tests`, and because distinct statics
+/// do not exclude each other, a test holding "the" lock could still have `HOME`
+/// swapped underneath it — which made `install_completions` write into the
+/// developer's REAL home directory. Every test in this binary that mutates a
+/// process-global env var must therefore go through [`test_env::EnvGuard`].
+#[cfg(test)]
+pub(crate) mod test_env {
+    use std::ffi::{OsStr, OsString};
+    use std::sync::{Mutex, MutexGuard};
+
+    /// The single env lock for the whole `codegraph` binary's test suite.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Holds [`ENV_LOCK`] for its whole lifetime, records every variable it
+    /// touched, and restores all of them on drop (panic-safe, so a failing
+    /// assertion cannot leak a temp `HOME` into the rest of the suite).
+    pub(crate) struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        saved: Vec<(String, Option<OsString>)>,
+        expected: Vec<(String, Option<OsString>)>,
+    }
+
+    /// Acquire the process-wide env lock. Poisoning is recovered so one failing
+    /// test does not cascade into every other env test.
+    pub(crate) fn env_guard() -> EnvGuard {
+        EnvGuard {
+            _lock: ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
+            saved: Vec::new(),
+            expected: Vec::new(),
+        }
+    }
+
+    impl EnvGuard {
+        fn remember(&mut self, key: &str) {
+            if !self.saved.iter().any(|(k, _)| k == key) {
+                self.saved.push((key.to_string(), std::env::var_os(key)));
+            }
+        }
+
+        fn expect(&mut self, key: &str, value: Option<OsString>) {
+            match self.expected.iter_mut().find(|(k, _)| k == key) {
+                Some(slot) => slot.1 = value,
+                None => self.expected.push((key.to_string(), value)),
+            }
+        }
+
+        /// Set `key`, then assert the write is observable — so a stolen variable
+        /// is a LOUD failure instead of a silent write to the real `$HOME`.
+        pub(crate) fn set(&mut self, key: &str, value: impl AsRef<OsStr>) -> &mut Self {
+            let value = value.as_ref().to_os_string();
+            self.remember(key);
+            // SAFETY: ENV_LOCK is held for this guard's whole lifetime, so no
+            // other test thread of this binary reads or writes env concurrently.
+            unsafe { std::env::set_var(key, &value) };
+            self.expect(key, Some(value));
+            self.assert_intact();
+            self
+        }
+
+        /// Unset `key` and assert it stays unset.
+        pub(crate) fn remove(&mut self, key: &str) -> &mut Self {
+            self.remember(key);
+            // SAFETY: as in `set` — serialized by ENV_LOCK.
+            unsafe { std::env::remove_var(key) };
+            self.expect(key, None);
+            self.assert_intact();
+            self
+        }
+
+        /// Panic if any variable this guard wrote has changed value since.
+        ///
+        /// This is the escape detector: if some future test mutates `HOME`
+        /// without taking [`ENV_LOCK`], the test that owns the guard fails with
+        /// a precise message instead of writing into the real home directory.
+        pub(crate) fn assert_intact(&self) {
+            for (key, want) in &self.expected {
+                assert_eq!(
+                    &std::env::var_os(key),
+                    want,
+                    "env var {key} changed underneath this guard: another test \
+                     mutated process-global env without holding the shared lock"
+                );
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..).rev() {
+                match value {
+                    // SAFETY: still holding ENV_LOCK; single-threaded here.
+                    Some(v) => unsafe { std::env::set_var(&key, v) },
+                    None => unsafe { std::env::remove_var(&key) },
+                }
+            }
+        }
+    }
+}
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const EXTRACTION_VERSION: i64 = 1;
 
 fn main() {
     let cli = Cli::parse();
-    let bootstrap_root = cli.bootstrap_project_root();
-    let config = match init_config(None, &bootstrap_root) {
+    // Process bootstrap has no addressed project yet, so this config is
+    // `APP_CONFIG`-or-defaults ONLY and may configure NOTHING but the logger
+    // below. Every project operation (index, sync, watch, an MCP request) loads
+    // the addressed project's own immutable config from its resolved index root.
+    let config = match Config::load_env_or_default(None) {
         Ok(config) => config,
         Err(err) => {
             eprintln!("CodeGraph config error: {err:#}");
@@ -87,42 +193,6 @@ fn main() {
 struct Cli {
     #[command(subcommand)]
     command: Command,
-}
-
-impl Cli {
-    fn bootstrap_project_root(&self) -> PathBuf {
-        let raw = match &self.command {
-            Command::Init { path, .. }
-            | Command::Uninit { path, .. }
-            | Command::Index { path, .. }
-            | Command::Sync { path, .. }
-            | Command::Status { path, .. }
-            | Command::Unlock { path } => path.clone(),
-            Command::Query { path, .. }
-            | Command::Files { path, .. }
-            | Command::Serve { path, .. }
-            | Command::Callers { path, .. }
-            | Command::Callees { path, .. }
-            | Command::Impact { path, .. }
-            | Command::Affected { path, .. }
-            | Command::Check { path, .. }
-            | Command::Audit { path, .. }
-            | Command::Explore { path, .. }
-            | Command::Node { path, .. } => path.clone(),
-            Command::Export { path, .. } => path.clone(),
-            Command::PromptHook { path, .. } => path.clone(),
-            // install/uninstall/skill are not project-scoped — bootstrap from cwd.
-            Command::Install { .. }
-            | Command::Uninstall { .. }
-            | Command::Skill { .. }
-            | Command::Http { .. }
-            | Command::Version
-            | Command::Completions { .. }
-            | Command::SelfUpdate { .. } => None,
-        };
-        let start = absolute_path(raw.unwrap_or_else(|| PathBuf::from(".")));
-        resolve_project_path_optional(&start)
-    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -353,6 +423,10 @@ enum Command {
         target: String,
         #[arg(short, long)]
         path: Option<PathBuf>,
+        /// Pin an overloaded SYMBOL to the definition in this file (path or
+        /// basename). Its source body is returned, like the unpinned form.
+        #[arg(short = 'f', long = "file")]
+        file: Option<String>,
         /// Symbol mode: return just the file's symbol map instead of source.
         #[arg(long = "symbols-only")]
         symbols_only: bool,
@@ -609,10 +683,11 @@ fn run(cli: Cli) -> Result<()> {
         Command::Node {
             target,
             path,
+            file,
             symbols_only,
             json,
             strict,
-        } => cmd_node(target, path, symbols_only, json, strict),
+        } => cmd_node(target, path, file, symbols_only, json, strict),
         Command::Install {
             target,
             location,
@@ -1155,38 +1230,198 @@ fn cmd_prompt_hook(path: Option<PathBuf>, query: Option<String>) -> Result<()> {
 
 fn cmd_init(path: Option<PathBuf>, target: &str) -> Result<()> {
     let project = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
-    if is_initialized(&project) {
+    if explicit_init_observes_readable_current(&project)? {
         println!("Already initialized in {}", project.display());
         println!("Use \"codegraph index\" to re-index or \"codegraph sync\" to update");
         return installer::run_install_local_targets(project, target);
     }
     guard_indexable_root(&project)?;
-    fs::create_dir_all(codegraph_dir(&project))
-        .with_context(|| format!("creating {}", codegraph_dir(&project).display()))?;
-    let result = index_project(&project, true, false)?;
+    // The rebuild layer creates the current root and its permanent lock under the
+    // one outer exclusive lease; pre-creating it here would produce a lockless
+    // namespace that acquisition then refuses.
+    let result = index_project(&project, codegraph_store::RebuildKind::ExplicitInit)?;
     println!("Initialized in {}", project.display());
     print_index_result(&result);
     installer::run_install_local_targets(project, target)
 }
 
 fn cmd_uninit(path: Option<PathBuf>, force: bool) -> Result<()> {
-    let project = resolve_required_project(path)?;
+    let project = resolve_required_rebuild_project(path)?;
     if !force {
         bail!("refusing to delete .codegraph without --force");
     }
-    fs::remove_dir_all(codegraph_dir(&project))
-        .with_context(|| format!("removing {}", codegraph_dir(&project).display()))?;
+    let paths = index_paths(&project)?;
+    // The drain runs INSIDE uninit's retained exclusive lease, after both durable
+    // markers publish and before any runtime child is removed. It sends the
+    // versioned, project-identity-bound shutdown control frame — which bypasses
+    // data-request lease acquisition, the only way it can be answered while this
+    // command holds the namespace exclusively — and waits for the daemon's
+    // post-drain ACK. No pid is ever signalled: an unresponsive daemon makes uninit
+    // fail closed with the namespace left recoverable `Uninitialized`.
+    let identity = paths.project_identity().to_string();
+    let outcome = codegraph_store::uninit_index_with_drain(
+        &paths,
+        std::time::Instant::now() + REBUILD_LEASE_TIMEOUT,
+        || false,
+        || drain_project_daemon(&project, &identity),
+    )?;
     println!("Removed CodeGraph from {}", project.display());
+    if outcome.legacy_index_present {
+        println!("Legacy CodeGraph index remains untouched");
+    }
     Ok(())
 }
 
-fn cmd_index(path: Option<PathBuf>, force: bool, quiet: bool, verbose: bool) -> Result<()> {
-    let project = resolve_required_project(path)?;
-    guard_indexable_root(&project)?;
-    if force {
-        remove_db_files(&project)?;
+/// Bounded budget for the ONE exclusive acquisition of the stale-sidecar
+/// recovery attempted before the strict startup read gate.
+///
+/// Deliberately much shorter than [`REBUILD_LEASE_TIMEOUT`]: this acquisition is
+/// a best-effort repair on the latency-critical daemon-startup path, and the ONLY
+/// legitimate reason it cannot be taken is that another cooperating holder (a
+/// live reader or writer) owns the namespace — in which case there is nothing to
+/// recover and startup must proceed to its unchanged verdict immediately instead
+/// of stalling behind a long-lived MCP reader's shared lease.
+const STALE_SIDECAR_RECOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Whether this project's PREVIOUS rendezvous owner may still be running.
+///
+/// Read-only by construction: unlike `clear_stale_daemon_lock`, which removes a
+/// stale record as a side effect, the startup gate must only OBSERVE liveness —
+/// the record is the single-instance exclusion `try_acquire_daemon_lock` claims
+/// moments later, so removing it here would open a double-start window.
+///
+/// Fail-closed: an unreadable or empty pid record is reported as LIVE. An empty
+/// record is an in-flight `create_new` placeholder whose rename has not landed,
+/// exactly as the daemon lock layer already treats it.
+fn previous_daemon_owner_may_be_live(project_root: &Path) -> bool {
+    let Ok(pid_path) = codegraph_daemon::daemon_pid_path(project_root) else {
+        return true;
+    };
+    match std::fs::read_to_string(&pid_path) {
+        Ok(raw) => match codegraph_daemon::decode_lock_info(&raw) {
+            Some(info) => info.pid > 0 && codegraph_daemon::is_process_alive(info.pid),
+            None => true,
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
     }
-    let result = index_project_inner(&project, true, verbose, quiet)?;
+}
+
+/// Recover a provably dead previous owner's leftover `-wal`/`-shm` before the
+/// strict gate runs.
+///
+/// A daemon killed with an open SQLite connection leaves an un-checkpointed
+/// write-ahead log behind, and the sidecar-freedom clause of the `Current` read
+/// contract then refuses EVERY later daemon start until `codegraph init` is
+/// re-run. The remedy is recovery, not permission: fold that log back into the
+/// main database under an exclusive lease and delete the checkpointed sidecars,
+/// then let the UNCHANGED gate decide. Nothing is relaxed — the gate below still
+/// demands sidecar-freedom, and a namespace this repair cannot fix is still
+/// refused.
+///
+/// Both guards must hold: the rendezvous owner is provably not alive AND the
+/// exclusive lease is obtainable within a short bound, so a live daemon's or a
+/// live MCP reader's sidecars are never folded underneath them. A failure here is
+/// swallowed to a log line: recovery is opportunistic, and the authoritative
+/// verdict is always the gate's.
+fn recover_dead_owner_sidecars(paths: &codegraph_core::IndexPaths, project_root: &Path) {
+    if previous_daemon_owner_may_be_live(project_root) {
+        return;
+    }
+    match Store::recover_stale_current_sidecars(
+        paths,
+        std::time::Instant::now() + STALE_SIDECAR_RECOVERY_TIMEOUT,
+        || false,
+    ) {
+        Ok(true) => tracing::info!(
+            project = %project_root.display(),
+            "folded a dead daemon's leftover write-ahead log back into the index"
+        ),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            project = %project_root.display(),
+            "could not recover leftover SQLite sidecars; the startup gate decides"
+        ),
+    }
+}
+
+/// Daemon-startup gate (frozen plan lines 590-592, 603-604).
+///
+/// ONE bounded shared acquisition validates everything: `Store::open_for_read`
+/// acquires the shared `IndexLease` and, under it, corroborates the FULL `Current`
+/// contract — both owner-bound state slots (so `Future`, `Corrupt`, `Building`,
+/// `Uninitialized`, `Outdated`, and an owner mismatch are all refused), tombstone
+/// absence, database presence, sidecar-freedom, and the exact extraction stamp
+/// read from the checkpointed main-file bytes. Slot phase alone would let a
+/// `Current` slot with a deleted database or a stale stamp publish a rendezvous.
+///
+/// The returned `Store` OWNS that same lease, so retaining it across pid/socket
+/// publication requires no second acquisition: there is no nested lock and no
+/// window between validation and publication for another writer to reclassify.
+fn authorize_daemon_startup(project_root: &Path) -> Result<codegraph_daemon::StartupAuthorization> {
+    let paths = index_paths(project_root)?;
+    recover_dead_owner_sidecars(&paths, project_root);
+    match Store::open_for_read(
+        &paths,
+        std::time::Instant::now() + REBUILD_LEASE_TIMEOUT,
+        || false,
+    ) {
+        Ok(store) => Ok(Box::new(store)),
+        Err(error) => {
+            // Re-read the observed markers for the operator-facing message only.
+            // The refusal itself is already decided by the gate above.
+            let status = Store::extraction_status(&paths);
+            let tombstone = if paths.tombstone().exists() {
+                "present"
+            } else {
+                "absent"
+            };
+            bail!(
+                "refusing to start a daemon for {}: {error}; index state is {status} and its \
+                 uninitialized tombstone is {tombstone}. No daemon pid, socket, or log was \
+                 published. Run `codegraph init` to rebuild.",
+                project_root.display()
+            )
+        }
+    }
+}
+
+/// Ask this project's daemon (if any) to stop accepting, cancel its watcher lease
+/// loops, drain, remove its own pid/socket, and ACK. `Err(detail)` is the
+/// fail-closed signal; the pid is only ever reported, never signalled.
+fn drain_project_daemon(project: &Path, project_identity: &str) -> Result<(), String> {
+    match codegraph_daemon::request_daemon_shutdown(project, project_identity) {
+        Ok(codegraph_daemon::ShutdownOutcome::NoDaemon) => Ok(()),
+        Ok(codegraph_daemon::ShutdownOutcome::Drained { pid }) => {
+            tracing::info!(pid, "daemon drained and removed its own rendezvous");
+            Ok(())
+        }
+        Ok(codegraph_daemon::ShutdownOutcome::Unresponsive { pid, detail }) => Err(format!(
+            "daemon {pid} did not acknowledge the shutdown control frame ({detail})"
+        )),
+        Err(error) => Err(format!("could not reach this project's daemon: {error:#}")),
+    }
+}
+
+fn cmd_index(path: Option<PathBuf>, force: bool, quiet: bool, verbose: bool) -> Result<()> {
+    // Index is the one ordinary CLI surface allowed to retry an authenticated
+    // interrupted Building rebuild. Resolve state slots as well as a DB artifact
+    // so the crash window after deletion but before final writer creation remains
+    // reachable; authorization is still decided later under the exclusive lease.
+    let project = resolve_required_rebuild_project(path)?;
+    guard_indexable_root(&project)?;
+    // `--force` no longer removes the DB up front: the rebuild layer performs the
+    // destructive removal itself, AFTER publishing `phase=building` under the one
+    // outer exclusive lease, so an interruption can never leave a bare DB with no
+    // state marker. Plain `index` takes the same full-rebuild path it always did.
+    let _ = force;
+    let result = index_project_inner(
+        &project,
+        codegraph_store::RebuildKind::Reindex,
+        verbose,
+        quiet,
+    )?;
     if !quiet {
         print_index_result(&result);
     }
@@ -1197,7 +1432,11 @@ fn cmd_index(path: Option<PathBuf>, force: bool, quiet: bool, verbose: bool) -> 
 }
 
 fn cmd_sync(path: Option<PathBuf>, quiet: bool) -> Result<()> {
-    let project = resolve_required_project(path)?;
+    // Sync must discover authenticated Outdated/Building state so its Store gate
+    // can migrate it under one retained exclusive lease. Uninitialized remains
+    // discoverable only to reach the typed under-lease rejection; it is never
+    // authorized to sync or recreate residue.
+    let project = resolve_required_rebuild_project(path)?;
     // True single-file incremental sync (P0, docs/optimization-analysis.md §1).
     // sync_project_once self-discovers candidate files via scan_project, so it works
     // for a cold CLI invocation with no daemon. Hash-gated skip + per-file delete/reinsert
@@ -1231,24 +1470,58 @@ fn cmd_sync(path: Option<PathBuf>, quiet: bool) -> Result<()> {
 }
 
 fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
+    let explicit = path.is_some();
     let start = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
-    let project = resolve_project_path_optional(&start);
-    let db = db_path(&project);
+    let project = if configured_root_is_absolute() {
+        if !explicit && !is_initialized(&start) {
+            bail!("CODEGRAPH_DIR is absolute; pass the project root explicitly");
+        }
+        start
+    } else {
+        resolve_project_path_optional(&start)
+    };
+    // Fail closed on an unsafe/aliased/overlapping configured root: status must
+    // surface the stable diagnostic, NOT mask an invalid `CODEGRAPH_DIR` as a
+    // default `.codegraph-v2` layout (which would report a bogus "not
+    // initialized"). A genuinely absent index still resolves fine and reports
+    // uninitialized below.
+    let resolved = index_paths(&project)?;
+    let index_root = resolved.current_root().to_path_buf();
+    let db = resolved.current_db();
     let db_exists = db.is_file();
+    let legacy_index_paths = resolved
+        .legacy_roots()
+        .iter()
+        .filter(|path| path.exists())
+        .cloned()
+        .collect::<Vec<_>>();
+    let legacy_index_present = !legacy_index_paths.is_empty();
     let daemon_running = daemon_already_running(&project);
-    let daemon_pid_path = codegraph_daemon::daemon_pid_path(&project);
-    let daemon_socket_path = codegraph_daemon::recorded_socket_path(&project);
-    let daemon_log_path = codegraph_daemon::daemon_log_path(&project);
-    if !is_initialized(&project) {
+    let daemon_pid_path = codegraph_daemon::daemon_pid_path(&project)?;
+    let daemon_socket_path = codegraph_daemon::recorded_socket_path(&project)?;
+    let daemon_log_path = codegraph_daemon::daemon_log_path(&project)?;
+    let status_open = Store::open_for_status(
+        &resolved,
+        std::time::Instant::now() + STATUS_LEASE_TIMEOUT,
+        || false,
+    )?;
+    if status_open.rebuilding {
         if json_output {
             print_json(&json!({
+                // The exclusive owner may be between lifecycle publications.
+                // DB presence alone cannot corroborate a readable Current index.
                 "initialized": false,
                 "version": VERSION,
                 "projectPath": project,
-                "indexPath": codegraph_dir(&project),
+                "indexPath": index_root,
                 "lastIndexed": null,
+                "rebuilding": true,
                 "dbPath": db,
                 "dbExists": db_exists,
+                "extractionStatus": null,
+                "extractionStatusDetail": "rebuilding",
+                "legacyIndexPresent": legacy_index_present,
+                "legacyIndexPaths": legacy_index_paths,
                 "daemonRunning": daemon_running,
                 "daemonPidPath": daemon_pid_path,
                 "daemonSocketPath": daemon_socket_path,
@@ -1258,6 +1531,45 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
             println!("\nCodeGraph Status\n");
             println!("Project: {}", project.display());
             println!("DB Path: {}", db.display());
+            println!("State:   rebuilding");
+        }
+        return Ok(());
+    }
+    let extraction_status = status_open
+        .status
+        .clone()
+        .expect("a non-busy status probe always classifies the namespace");
+    let store = status_open.into_store();
+    if store.is_none() {
+        if json_output {
+            print_json(&json!({
+                "initialized": false,
+                "version": VERSION,
+                "projectPath": project,
+                "indexPath": index_root,
+                "lastIndexed": null,
+                "dbPath": db,
+                "dbExists": db_exists,
+                "extractionStatus": extraction_status_name(&extraction_status),
+                "extractionStatusDetail": extraction_status.to_string(),
+                "legacyIndexPresent": legacy_index_present,
+                "legacyIndexPaths": legacy_index_paths,
+                "daemonRunning": daemon_running,
+                "daemonPidPath": daemon_pid_path,
+                "daemonSocketPath": daemon_socket_path,
+                "daemonLogPath": daemon_log_path,
+            }))?;
+        } else {
+            println!("\nCodeGraph Status\n");
+            println!("Project: {}", project.display());
+            println!("DB Path: {}", db.display());
+            println!("State:   {extraction_status}");
+            if legacy_index_present {
+                println!("Legacy index: present and untouched");
+                for path in &legacy_index_paths {
+                    println!("  {}", path.display());
+                }
+            }
             println!(
                 "Daemon:  {}",
                 if daemon_running { "running" } else { "stopped" }
@@ -1268,27 +1580,26 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
         return Ok(());
     }
 
-    let store = open_store(&project)?;
+    let store = store.expect("Current status retains its corroborated read store");
     let counts = store.counts()?;
     let nodes_by_kind = store.node_counts_by_kind()?;
     let files_by_language = store.file_counts_by_language()?;
-    let db_size = fs::metadata(db_path(&project))
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let db_size = fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
     let last_indexed = latest_indexed_at(&store)?;
     let built_with_version = store.get_project_metadata("indexed_with_version")?;
     let built_with_extraction_version = store
-        .get_project_metadata("indexed_with_extraction_version")?
-        .and_then(|v| v.parse::<i64>().ok());
+        .get_project_metadata(codegraph_store::EXTRACTION_VERSION_KEY)?
+        .and_then(|v| v.parse::<u64>().ok());
     let reindex_recommended = last_indexed.is_some()
-        && built_with_extraction_version.is_none_or(|v| v < EXTRACTION_VERSION);
+        && built_with_extraction_version
+            .is_none_or(|v| v < codegraph_store::CURRENT_EXTRACTION_VERSION);
     let resolution_incomplete = store.is_resolution_incomplete()?;
 
     if json_output {
         let mut index_obj = json!({
             "builtWithVersion": built_with_version,
             "builtWithExtractionVersion": built_with_extraction_version,
-            "currentExtractionVersion": EXTRACTION_VERSION,
+            "currentExtractionVersion": codegraph_store::CURRENT_EXTRACTION_VERSION,
             "reindexRecommended": reindex_recommended,
         });
         // #1187: surface the interrupted-index state ONLY when the marker is set,
@@ -1300,7 +1611,7 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
             "initialized": true,
             "version": VERSION,
             "projectPath": project,
-            "indexPath": codegraph_dir(&project),
+            "indexPath": index_root,
             "lastIndexed": last_indexed.map(iso_like_millis),
             "fileCount": counts.file_count,
             "nodeCount": counts.node_count,
@@ -1313,9 +1624,13 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
             "pendingChanges": { "added": 0, "modified": 0, "removed": 0 },
             "worktreeMismatch": null,
             "index": index_obj,
-            "dbPath": db,
-            "dbExists": db_exists,
-            "daemonRunning": daemon_running,
+                "dbPath": db,
+                "dbExists": db_exists,
+                "extractionStatus": extraction_status_name(&extraction_status),
+                "extractionStatusDetail": extraction_status.to_string(),
+                "legacyIndexPresent": legacy_index_present,
+                "legacyIndexPaths": legacy_index_paths,
+                "daemonRunning": daemon_running,
             "daemonPidPath": daemon_pid_path,
             "daemonSocketPath": daemon_socket_path,
             "daemonLogPath": daemon_log_path,
@@ -1353,6 +1668,18 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
         println!("\nIndex is up to date\n");
     }
     Ok(())
+}
+
+fn extraction_status_name(status: &codegraph_store::ExtractionStatus) -> &'static str {
+    match status {
+        codegraph_store::ExtractionStatus::Current => "current",
+        codegraph_store::ExtractionStatus::Building { .. } => "building",
+        codegraph_store::ExtractionStatus::Uninitialized => "uninitialized",
+        codegraph_store::ExtractionStatus::Missing => "missing",
+        codegraph_store::ExtractionStatus::Outdated { .. } => "outdated",
+        codegraph_store::ExtractionStatus::Future { .. } => "future",
+        codegraph_store::ExtractionStatus::Corrupt { .. } => "corrupt",
+    }
 }
 
 fn cmd_query(
@@ -1492,6 +1819,25 @@ fn effective_log_level(config_level: &str) -> String {
     config_level.to_string()
 }
 
+/// The project's rendezvous identities for one debug line, or the fail-closed
+/// diagnostic when the configured index root is unsafe. Debug output must never
+/// reconstruct a path the resolver refused.
+fn describe_rendezvous(project_root: &Path) -> String {
+    match (
+        codegraph_daemon::daemon_pid_path(project_root),
+        codegraph_daemon::recorded_socket_path(project_root),
+    ) {
+        (Ok(pid_path), Ok(socket_path)) => {
+            format!(
+                "pid={} socket={}",
+                pid_path.display(),
+                socket_path.display()
+            )
+        }
+        (Err(error), _) | (_, Err(error)) => format!("(unresolved: {error})"),
+    }
+}
+
 fn emit_serve_startup_debug(
     project_root: &Path,
     explicit_path: bool,
@@ -1504,14 +1850,19 @@ fn emit_serve_startup_debug(
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "(unknown)".to_string());
-    let db = db_path(project_root);
+    let db = db_path(project_root).ok();
+    let db_display = db
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(unresolved)".to_string());
+    let db_exists = db.as_ref().map(|p| p.is_file()).unwrap_or(false);
     tracing::debug!(
         %exe,
         %cwd,
         explicit_path,
         default_project = %project_root.display(),
-        db = %db.display(),
-        db_exists = db.is_file(),
+        db = %db_display,
+        db_exists,
         has_codegraph_dir = has_codegraph,
         mode = ?mode,
         "serve startup"
@@ -1560,7 +1911,9 @@ fn cmd_serve(
             );
             return serve_direct_no_services(project, &project_root, no_watch);
         }
-        let has_codegraph = codegraph_dir(&project_root).is_dir();
+        let has_codegraph = codegraph_dir(&project_root)
+            .map(|d| d.is_dir())
+            .unwrap_or(false);
         let mode = select_serve_mode(daemon_opt_out(), is_daemon_internal(), has_codegraph);
         emit_serve_startup_debug(&project_root, explicit_path, has_codegraph, &mode);
         match mode {
@@ -1568,16 +1921,20 @@ fn cmd_serve(
                 return serve_direct(project, &project_root, no_watch, explicit_path);
             }
             ServeMode::BeDaemon => {
-                let cfg = codegraph_core::config::get_config();
-                return codegraph_daemon::run_foreground(
+                // The daemon loads THIS project's own watch config itself, from
+                // the resolved index root, so nothing is passed down here. The
+                // startup gate below validates state/owner/tombstone under a
+                // bounded SHARED index lease and RETAINS it across pid/socket
+                // publication, so a concurrent `uninit --force` cannot interleave.
+                let gate = |root: &Path| authorize_daemon_startup(root);
+                return codegraph_daemon::run_foreground_gated(
                     &project_root,
                     codegraph_daemon::DaemonOptions {
                         run_mcp: true,
                         host_pid: codegraph_daemon::host_pid_from_env(),
-                        include: cfg.indexing.include.clone(),
-                        exclude: cfg.indexing.exclude.clone(),
                         ..Default::default()
                     },
+                    Some(&gate),
                 )
                 .context("running as detached MCP daemon");
             }
@@ -1614,7 +1971,7 @@ fn cmd_serve_http(path: Option<PathBuf>, http_addr: &str, detach: bool) -> Resul
     let (project, mode) = match path {
         Some(raw) => {
             let project = resolve_project_path_optional(&absolute_path(raw));
-            let db = db_path(&project);
+            let db = db_path(&project)?;
             if !db.is_file() {
                 anyhow::bail!(
                     "`serve --http --path` requires an indexed project, but no index was found at {}. Run `codegraph init {}` (or `codegraph index`) first.",
@@ -2033,7 +2390,10 @@ mod normalize_lexical_tests {
 /// self-indexes the cwd — keeping it unindexed and therefore adoptable when the
 /// client reports its real workspace root via `roots/list`.
 fn should_run_serve_services(explicit_path: bool, project_root: &Path) -> bool {
-    explicit_path || codegraph_dir(project_root).is_dir()
+    explicit_path
+        || codegraph_dir(project_root)
+            .map(|d| d.is_dir())
+            .unwrap_or(false)
 }
 
 fn serve_direct(
@@ -2153,16 +2513,19 @@ fn start_daemon_for_adopted_root(project_root: &Path, no_watch: bool) -> Option<
     if daemon_opt_out() || is_daemon_internal() || !should_run_daemon_services(project_root) {
         return None;
     }
-    if !codegraph_dir(project_root).is_dir() {
+    if !codegraph_dir(project_root)
+        .map(|d| d.is_dir())
+        .unwrap_or(false)
+    {
         return None;
     }
     if daemon_already_running(project_root) {
+        let socket_path = codegraph_daemon::recorded_socket_path(project_root).ok()?;
         tracing::debug!(
-            pid_path = %codegraph_daemon::daemon_pid_path(project_root).display(),
-            socket_path = %codegraph_daemon::recorded_socket_path(project_root).display(),
+            socket_path = %socket_path.display(),
             "adopted-root: attaching to existing daemon"
         );
-        return Some(codegraph_daemon::recorded_socket_path(project_root));
+        return Some(socket_path);
     }
     let Ok(exe) = std::env::current_exe() else {
         return None;
@@ -2174,12 +2537,11 @@ fn start_daemon_for_adopted_root(project_root: &Path, no_watch: bool) -> Option<
                 project = %project_root.display(),
                 "started shared daemon for adopted project root"
             );
+            let socket_path = codegraph_daemon::recorded_socket_path(project_root).ok()?;
             tracing::debug!(
-                pid_path = %codegraph_daemon::daemon_pid_path(project_root).display(),
-                socket_path = %codegraph_daemon::recorded_socket_path(project_root).display(),
+                socket_path = %socket_path.display(),
                 "adopted-root: spawned new daemon"
             );
-            let socket_path = codegraph_daemon::recorded_socket_path(project_root);
             socket_path.exists().then_some(socket_path)
         }
         Err(err) => {
@@ -2241,11 +2603,18 @@ fn start_direct_watcher(
     project_root: &Path,
     no_watch: bool,
 ) -> Option<codegraph_watch::ProjectWatcher> {
-    let mut opts = codegraph_watch::WatchOptions::default();
-    opts.no_watch = no_watch;
-    let cfg = codegraph_core::config::get_config();
-    opts.include = cfg.indexing.include.clone();
-    opts.exclude = cfg.indexing.exclude.clone();
+    // Include/exclude, debounce, the enable flag, and extension overrides all come
+    // from THIS project's own config (its resolved index root), so a direct serve
+    // watches exactly the scope its own `index`/`sync` would.
+    let mut opts = match codegraph_watch::watch_options_for_project(project_root) {
+        Ok(opts) => opts,
+        Err(err) => {
+            tracing::warn!(error = %err, "could not load project watch config; watcher disabled");
+            return None;
+        }
+    };
+    // An explicit `--no-watch` still wins over the project's `watch.enabled`.
+    opts.no_watch = opts.no_watch || no_watch;
     opts.on_sync_complete = Some(std::sync::Arc::new(
         |outcome: codegraph_watch::SyncOutcome| {
             tracing::info!(
@@ -2323,8 +2692,7 @@ fn serve_spawn_or_proxy(
     explicit_path: bool,
 ) -> Result<()> {
     tracing::debug!(
-        pid_path = %codegraph_daemon::daemon_pid_path(project_root).display(),
-        socket_path = %codegraph_daemon::recorded_socket_path(project_root).display(),
+        rendezvous = %describe_rendezvous(project_root),
         "serve_spawn_or_proxy: begin"
     );
     match cold_start_action(daemon_already_running(project_root)) {
@@ -2356,7 +2724,7 @@ fn serve_spawn_or_proxy(
 /// proxy semantics: `run_proxy` answers `initialize`/`tools/list` locally and
 /// forwards tool calls; its fd half-close / ppid-watchdog teardown is untouched.
 fn proxy_to_running_daemon(project_root: &Path) -> Option<Result<()>> {
-    let socket_path = codegraph_daemon::recorded_socket_path(project_root);
+    let socket_path = codegraph_daemon::recorded_socket_path(project_root).ok()?;
     if !socket_path.exists() {
         tracing::debug!("proxy_to_running_daemon: daemon socket missing; falling back to direct");
         heal_stale_daemon_if_dead(project_root);
@@ -2420,7 +2788,9 @@ fn heal_stale_daemon_if_dead(project_root: &Path) {
 }
 
 fn daemon_already_running(project_root: &Path) -> bool {
-    let pid_path = codegraph_daemon::daemon_pid_path(project_root);
+    let Ok(pid_path) = codegraph_daemon::daemon_pid_path(project_root) else {
+        return false;
+    };
     let Ok(raw) = fs::read_to_string(&pid_path) else {
         return false;
     };
@@ -2435,7 +2805,8 @@ fn poll_for_daemon_socket(project_root: &Path) {
         // Re-read the lock each tick: the daemon rewrites the recorded socket to
         // its bind-fallback choice during startup, so the path can change while
         // we poll (D-Daemon-b).
-        if codegraph_daemon::recorded_socket_path(project_root).exists() {
+        if codegraph_daemon::recorded_socket_path(project_root).is_ok_and(|socket| socket.exists())
+        {
             return;
         }
         std::thread::sleep(DAEMON_SOCKET_POLL_INTERVAL);
@@ -2480,42 +2851,32 @@ mod serve_mode_tests {
         emit_serve_startup_debug, guard_indexable_root, select_serve_mode,
         should_run_daemon_services, should_run_serve_services,
     };
+    use crate::test_env::env_guard;
     use std::path::Path;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn debug_enabled_honors_truthy_values_only() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let prev = std::env::var("CODEGRAPH_DEBUG").ok();
+        let mut env = env_guard();
 
-        unsafe { std::env::remove_var("CODEGRAPH_DEBUG") };
+        env.remove("CODEGRAPH_DEBUG");
         assert!(!debug_enabled(), "unset ⇒ off");
-        unsafe { std::env::set_var("CODEGRAPH_DEBUG", "1") };
+        env.set("CODEGRAPH_DEBUG", "1");
         assert!(debug_enabled(), "\"1\" ⇒ on");
-        unsafe { std::env::set_var("CODEGRAPH_DEBUG", "true") };
+        env.set("CODEGRAPH_DEBUG", "true");
         assert!(debug_enabled(), "\"true\" ⇒ on");
-        unsafe { std::env::set_var("CODEGRAPH_DEBUG", "0") };
+        env.set("CODEGRAPH_DEBUG", "0");
         assert!(!debug_enabled(), "\"0\" ⇒ off");
-        unsafe { std::env::set_var("CODEGRAPH_DEBUG", "yes") };
+        env.set("CODEGRAPH_DEBUG", "yes");
         assert!(!debug_enabled(), "any other value ⇒ off");
-
-        match prev {
-            Some(v) => unsafe { std::env::set_var("CODEGRAPH_DEBUG", v) },
-            None => unsafe { std::env::remove_var("CODEGRAPH_DEBUG") },
-        }
     }
 
     #[test]
     fn effective_log_level_translates_codegraph_debug_and_defers_to_rust_log() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let prev_debug = std::env::var("CODEGRAPH_DEBUG").ok();
-        let prev_rust_log = std::env::var("RUST_LOG").ok();
+        let mut env = env_guard();
 
         // Given RUST_LOG unset and CODEGRAPH_DEBUG unset: config level is used verbatim.
-        unsafe { std::env::remove_var("RUST_LOG") };
-        unsafe { std::env::remove_var("CODEGRAPH_DEBUG") };
+        env.remove("RUST_LOG");
+        env.remove("CODEGRAPH_DEBUG");
         assert_eq!(
             effective_log_level("info"),
             "info",
@@ -2523,7 +2884,7 @@ mod serve_mode_tests {
         );
 
         // When CODEGRAPH_DEBUG=1 and RUST_LOG unset: level bumps to debug (back-compat).
-        unsafe { std::env::set_var("CODEGRAPH_DEBUG", "1") };
+        env.set("CODEGRAPH_DEBUG", "1");
         assert_eq!(
             effective_log_level("info"),
             "debug",
@@ -2532,21 +2893,12 @@ mod serve_mode_tests {
 
         // When RUST_LOG is set: the base opens to trace so the EnvFilter is the
         // sole gate (the reload floor must not cap RUST_LOG upward).
-        unsafe { std::env::set_var("RUST_LOG", "warn") };
+        env.set("RUST_LOG", "warn");
         assert_eq!(
             effective_log_level("info"),
             "trace",
             "RUST_LOG set ⇒ base opens to trace; EnvFilter owns the gate"
         );
-
-        match prev_debug {
-            Some(v) => unsafe { std::env::set_var("CODEGRAPH_DEBUG", v) },
-            None => unsafe { std::env::remove_var("CODEGRAPH_DEBUG") },
-        }
-        match prev_rust_log {
-            Some(v) => unsafe { std::env::set_var("RUST_LOG", v) },
-            None => unsafe { std::env::remove_var("RUST_LOG") },
-        }
     }
 
     #[test]
@@ -2585,7 +2937,8 @@ mod serve_mode_tests {
         let indexed =
             std::env::temp_dir().join(format!("cg-serve-gate-idx-{}-{seq}", std::process::id()));
         std::fs::create_dir_all(&unindexed).unwrap();
-        std::fs::create_dir_all(indexed.join(".codegraph")).unwrap();
+        // Batch M: the serve-services gate keys on the v2 current root.
+        std::fs::create_dir_all(indexed.join(".codegraph-v2")).unwrap();
 
         assert!(
             should_run_serve_services(true, &unindexed),
@@ -2606,14 +2959,13 @@ mod serve_mode_tests {
 
     #[test]
     fn daemon_services_disabled_at_home_and_root_enabled_for_nested_project() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let mut env = env_guard();
         let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-        let prev_home = std::env::var_os(home_key);
 
         let tmp = std::env::temp_dir().join(format!("cg-serve-home-{}", std::process::id()));
         let nested = tmp.join("workspace/ProdDir/AI/codegraph-rust");
         std::fs::create_dir_all(&nested).unwrap();
-        unsafe { std::env::set_var(home_key, &tmp) };
+        env.set(home_key, &tmp);
 
         assert!(
             !should_run_daemon_services(&tmp),
@@ -2628,23 +2980,19 @@ mod serve_mode_tests {
             "a project nested under $HOME must keep daemon services"
         );
 
-        match prev_home {
-            Some(v) => unsafe { std::env::set_var(home_key, v) },
-            None => unsafe { std::env::remove_var(home_key) },
-        }
+        env.assert_intact();
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn guard_indexable_root_rejects_home_and_root_allows_nested_project() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let mut env = env_guard();
         let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-        let prev_home = std::env::var_os(home_key);
 
         let tmp = std::env::temp_dir().join(format!("cg-guard-home-{}", std::process::id()));
         let nested = tmp.join("workspace/proj");
         std::fs::create_dir_all(&nested).unwrap();
-        unsafe { std::env::set_var(home_key, &tmp) };
+        env.set(home_key, &tmp);
 
         assert!(
             guard_indexable_root(&tmp).is_err(),
@@ -2659,10 +3007,7 @@ mod serve_mode_tests {
             "a project nested under $HOME must be indexable"
         );
 
-        match prev_home {
-            Some(v) => unsafe { std::env::set_var(home_key, v) },
-            None => unsafe { std::env::remove_var(home_key) },
-        }
+        env.assert_intact();
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -2684,9 +3029,9 @@ mod serve_mode_tests {
 
 fn cmd_unlock(path: Option<PathBuf>) -> Result<()> {
     let project = resolve_required_project(path)?;
-    let daemon_lock = codegraph_daemon::daemon_pid_path(&project);
+    let daemon_lock = codegraph_daemon::daemon_pid_path(&project)?;
     let daemon_removed = daemon_lock.exists() && codegraph_daemon::unlock_project(&project);
-    let lock = codegraph_dir(&project).join("codegraph.lock");
+    let lock = codegraph_dir(&project)?.join("codegraph.lock");
     if !lock.exists() && !daemon_removed {
         println!("No lock file found - nothing to do");
         return Ok(());
@@ -2851,13 +3196,19 @@ fn cmd_explore(
 fn cmd_node(
     target: String,
     path: Option<PathBuf>,
+    file: Option<String>,
     symbols_only: bool,
     json_output: bool,
     strict: bool,
 ) -> Result<()> {
     let project = resolve_required_project(path)?;
     let engine = codegraph_mcp::CodeGraphEngine::open(&project)?;
-    let args = if node_target_is_file(&engine, &target) {
+    // #1314: `-f/--file` PINS an overloaded symbol to one file and must still
+    // carry `includeCode`, exactly like the bare-symbol branch below — the
+    // pinned definition's source body is the whole point of the pin.
+    let args = if let Some(file) = &file {
+        json!({ "symbol": target, "file": file, "includeCode": true })
+    } else if node_target_is_file(&engine, &target) {
         json!({ "file": target, "symbolsOnly": symbols_only })
     } else {
         json!({ "symbol": target, "includeCode": true })
@@ -3397,28 +3748,84 @@ fn finish_phase(bar: &ProgressBar, label: &str) {
     bar.abandon_with_message(format!("✓ {label} ({elapsed})"));
 }
 
-fn index_project(project: &Path, clear_first: bool, verbose: bool) -> Result<IndexSummary> {
-    index_project_inner(project, clear_first, verbose, false)
+fn index_project(project: &Path, kind: codegraph_store::RebuildKind) -> Result<IndexSummary> {
+    index_project_inner(project, kind, false, false)
 }
 
-/// Restores the shared `synchronous=NORMAL` durability (and truncates the WAL) when
-/// the full index finishes OR bails out early via `?`. Drop never panics: a failed
-/// restore is logged, not propagated.
+/// Owns one destructive v2 rebuild for the whole full-index body.
+///
+/// `begin` acquires the single outer exclusive `IndexLease`, classifies under it,
+/// publishes `phase=building`, removes the previous v2 database files, and opens
+/// the fresh write-capable target. [`Self::finish`] is the EXPLICIT FALLIBLE
+/// completion path required by the frozen plan (lines 548-556): under the same
+/// retained lease it restores the shared `synchronous=NORMAL` durability, runs the
+/// final checkpoint + compaction, stamps extraction version 2, checkpoints that
+/// stamp into the main database file, closes the final SQLite connection, and only
+/// then publishes `phase=current` (removing a tombstone solely for a successful
+/// explicit `init`). Every failure propagates.
+///
+/// `Drop` is emergency best-effort cleanup only: it can never publish `Current`,
+/// so an index that bails out early via `?` leaves the namespace `phase=building`
+/// — unreadable and fail-closed — and a rerun rebuilds it from scratch.
+/// `Self::finish` consumes the guard, which is what disarms that fallback.
 struct BulkIndexPragmaGuard {
-    db_path: PathBuf,
+    rebuild: Option<codegraph_store::ActiveFullRebuild>,
+}
+
+/// Bounded wall-clock budget for acquiring the one outer exclusive lease. Never a
+/// blocking wait: `IndexLease` polls `try_lock` against this monotonic deadline.
+const REBUILD_LEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const READ_LEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const STATUS_LEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+
+impl BulkIndexPragmaGuard {
+    fn begin(
+        paths: &codegraph_core::IndexPaths,
+        kind: codegraph_store::RebuildKind,
+    ) -> Result<Self> {
+        let deadline = std::time::Instant::now() + REBUILD_LEASE_TIMEOUT;
+        let rebuild = codegraph_store::begin_full_rebuild(paths, kind, deadline, || false)?;
+        let rebuild = rebuild.open_store()?;
+        Ok(Self {
+            rebuild: Some(rebuild),
+        })
+    }
+
+    fn finish(mut self) -> Result<()> {
+        let rebuild = self
+            .rebuild
+            .take()
+            .expect("a rebuild guard is finished at most once");
+        rebuild.finish().map_err(Into::into)
+    }
+}
+
+impl std::ops::Deref for BulkIndexPragmaGuard {
+    type Target = codegraph_store::ActiveFullRebuild;
+
+    fn deref(&self) -> &Self::Target {
+        self.rebuild
+            .as_ref()
+            .expect("the CLI guard owns its active rebuild until finish")
+    }
+}
+
+impl std::ops::DerefMut for BulkIndexPragmaGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.rebuild
+            .as_mut()
+            .expect("the CLI guard owns its active rebuild until finish")
+    }
 }
 
 impl Drop for BulkIndexPragmaGuard {
     fn drop(&mut self) {
-        let result = match Store::open(&self.db_path) {
-            Ok(store) => store.restore_default_pragmas().map_err(anyhow::Error::from),
-            Err(err) => Err(anyhow::Error::from(err)),
-        };
-        if let Err(err) = result {
+        if let Some(rebuild) = self.rebuild.take() {
+            // No publication happens here by construction: the namespace stays
+            // `phase=building`, so nothing can read a half-built graph.
             tracing::warn!(
-                error = %err,
-                db = %self.db_path.display(),
-                "failed to restore default pragmas after full index",
+                root = %rebuild.paths().current_root().display(),
+                "full index did not finalize; index remains phase=building and unreadable",
             );
         }
     }
@@ -3426,39 +3833,40 @@ impl Drop for BulkIndexPragmaGuard {
 
 fn index_project_inner(
     project: &Path,
-    clear_first: bool,
+    kind: codegraph_store::RebuildKind,
     verbose: bool,
     quiet: bool,
 ) -> Result<IndexSummary> {
     let started = std::time::Instant::now();
-    if clear_first {
-        remove_db_files(project)?;
-    }
-    fs::create_dir_all(codegraph_dir(project))?;
-    let config = codegraph_core::config::get_config();
-    let options = ExtractOptions {
-        max_file_size: config.indexing.max_file_size,
-        ignore_dirs: config.indexing.ignore_dirs.clone(),
-        ignore_paths: config.indexing.ignore_paths.clone(),
-        exclude: config.indexing.exclude.clone(),
-        include: config.indexing.include.clone(),
-        parallel: true,
-    };
+    let paths = index_paths(project)?;
+    let index_root = paths.current_root().to_path_buf();
+    // THIS project's own immutable config + extension overrides, read from its
+    // resolved current index root. Nothing consults a process-global value, a
+    // legacy `.codegraph` root, or the process working directory.
+    let config = Config::load_for_paths(None, &paths)?;
+    let extensions = codegraph_extract::ExtensionOverrides::load_for_paths(&paths);
+    let options = ExtractOptions::for_project(&config, extensions);
+    let framework_context = codegraph_resolve::framework::FrameworkExtractionContext::new(
+        project.to_string_lossy().into_owned(),
+        codegraph_resolve::frameworks::godot_dsl_config::GodotDslConfig::load_for_paths(&paths),
+    );
     if !quiet {
         eprintln!("Scanning files…");
     }
     let files = codegraph_extract::engine::scan_project(project, &options)?;
 
+    // One destructive rebuild under ONE outer exclusive lease: classify, publish
+    // `phase=building`, remove the previous v2 DB files, then open the fresh
+    // write-capable target. The index root and DB are created by the rebuild
+    // layer, so nothing below reconstructs a path or reopens the namespace.
+    //
     // `synchronous=OFF` + a larger cache/mmap window speed up the from-scratch bulk
-    // index. The restore lives in a Drop guard, NOT a trailing statement, because
-    // every `?` below would skip a trailing restore and leave `synchronous=OFF`
-    // durable on the error path. Declared BEFORE `store` so it drops AFTER it: the
-    // guard's own connection then runs wal_checkpoint(TRUNCATE)+NORMAL with no WAL
-    // contention, leaving the file in the same shape a NORMAL run produces.
-    let _pragma_guard = BulkIndexPragmaGuard {
-        db_path: db_path(project),
-    };
-    let store = open_store(project)?;
+    // index. Their restore is part of the guard's EXPLICIT FALLIBLE `finish`, not a
+    // trailing statement, because every `?` below would skip a trailing restore.
+    // If the body bails out early, the guard's Drop only attempts state-gated
+    // pragma repair/compaction/close and publishes nothing: the namespace stays
+    // `phase=building` and unreadable.
+    let store = BulkIndexPragmaGuard::begin(&paths, kind)?;
     store.set_bulk_index_pragmas()?;
 
     let before = store.counts()?;
@@ -3483,7 +3891,7 @@ fn index_project_inner(
     const REF_FLUSH_ROWS: usize = 20_000;
     const RESOLVE_BATCH_ROWS: usize = 5_000;
 
-    let spill = SpillWriter::new(codegraph_dir(project))?;
+    let spill = SpillWriter::new(index_root.clone())?;
     let pending_nodes: Vec<Node> = Vec::with_capacity(NODE_FLUSH_ROWS);
 
     let bar = progress_bar(
@@ -3594,12 +4002,12 @@ fn index_project_inner(
                                 duration_ms: 0,
                             }
                         } else {
-                            extract_source(relative, &source, None)
+                            extract_source_with(relative, &source, None, &options_ref.extensions)
                         };
                         let file = FileRecord {
                             path: relative.clone(),
                             content_hash: hash_content(&source),
-                            language: detect_language(relative),
+                            language: detect_language_with(relative, &options_ref.extensions),
                             size: metadata.len() as i64,
                             modified_at: modified_millis(&metadata),
                             indexed_at: now_millis(),
@@ -3747,7 +4155,12 @@ fn index_project_inner(
             .into_iter()
             .map(|f| f.path)
             .collect::<Vec<_>>();
-        resolver.extract_and_persist_frameworks(&mut store, &relative_files)?;
+        resolver.extract_and_persist_frameworks_with(
+            &mut store,
+            &relative_files,
+            &framework_context,
+            &options.extensions,
+        )?;
     }
     finish_phase(&pb, "Detected frameworks");
     // Finished from INSIDE the callback on the final chunk so the retained line
@@ -3785,14 +4198,15 @@ fn index_project_inner(
     resolver.run_post_extract(&mut store)?;
     finish_phase(&pb, "Finalized frameworks");
     store.set_project_metadata("indexed_with_version", VERSION)?;
-    store.set_project_metadata(
-        "indexed_with_extraction_version",
-        &EXTRACTION_VERSION.to_string(),
-    )?;
-    let pb = phase_spinner("Compacting database", quiet);
-    store.compact()?;
-    finish_phase(&pb, "Compacted database");
     let after = store.counts()?;
+    // Explicit fallible finalization: pragma restore -> checkpoint + compaction ->
+    // extraction stamp -> stamp checkpoint -> close the final connection ->
+    // publish `phase=current` (and remove a tombstone only for a successful
+    // explicit init). The namespace becomes readable at the LAST step, or not at
+    // all. Counts are read BEFORE the connection closes.
+    let pb = phase_spinner("Publishing index", quiet);
+    store.finish()?;
+    finish_phase(&pb, "Published index");
     Ok(IndexSummary {
         files_indexed,
         files_skipped,
@@ -4198,24 +4612,120 @@ fn exact_or_top_matches<'a>(matches: &'a [Node], symbol: &str) -> Vec<&'a Node> 
 }
 
 fn open_store(project: &Path) -> Result<Store> {
-    Store::open(&db_path(project)).map_err(Into::into)
+    let paths = index_paths(project)?;
+    Store::open_for_read(
+        &paths,
+        std::time::Instant::now() + READ_LEASE_TIMEOUT,
+        || false,
+    )
+    .map_err(Into::into)
 }
 
+/// Whether `project` has a current-namespace index DB. An unsafe/aliased
+/// `CODEGRAPH_DIR` (a `resolve` failure) counts as NOT initialized here so
+/// project discovery keeps walking; the mutating command paths independently
+/// re-resolve fail-closed via [`db_path`]/[`codegraph_dir`] before touching disk.
 fn is_initialized(project: &Path) -> bool {
-    db_path(project).exists()
+    let Ok(paths) = index_paths(project) else {
+        return false;
+    };
+    Store::extraction_status(&paths) == codegraph_store::ExtractionStatus::Current
+        && paths.current_db().is_file()
+}
+
+/// Explicit init's early-return condition is a fully corroborated readable
+/// Current namespace, never raw DB existence. Current+tombstone is an expected
+/// retryable finalizer residue for explicit init, while every other Current
+/// inconsistency remains a typed error.
+fn explicit_init_observes_readable_current(project: &Path) -> Result<bool> {
+    let paths = index_paths(project)?;
+    if Store::extraction_status(&paths) != codegraph_store::ExtractionStatus::Current {
+        return Ok(false);
+    }
+    let deadline = std::time::Instant::now() + REBUILD_LEASE_TIMEOUT;
+    match Store::open_for_read(&paths, deadline, || false) {
+        Ok(store) => {
+            drop(store);
+            Ok(true)
+        }
+        Err(codegraph_store::StoreError::CurrentTombstoned { .. }) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Discovery predicate for the destructive `index` command. A durable state
+/// slot keeps an interrupted Building namespace discoverable even if the DB was
+/// already deleted. A raw DB remains discoverable only so the under-lease Store
+/// gate can reject Missing+DB as corruption; it is never interpreted as Current.
+fn has_rebuild_namespace(project: &Path) -> bool {
+    let Ok(paths) = index_paths(project) else {
+        return false;
+    };
+    Store::extraction_status(&paths) != codegraph_store::ExtractionStatus::Missing
+        || paths.current_db().exists()
+}
+
+/// Authenticated lifecycle state is a discovery marker for default and relative
+/// roots even when the namespace is not readable. A permanent lock or raw DB by
+/// itself is deliberately not a marker: neither authenticates an owner-bound
+/// project state.
+fn has_lifecycle_namespace(project: &Path) -> bool {
+    let Ok(paths) = index_paths(project) else {
+        return false;
+    };
+    Store::extraction_status(&paths) != codegraph_store::ExtractionStatus::Missing
+}
+
+fn configured_root_is_absolute() -> bool {
+    std::env::var_os("CODEGRAPH_DIR")
+        .filter(|value| !value.is_empty())
+        .is_some_and(|value| Path::new(&value).is_absolute())
 }
 
 fn resolve_required_project(path: Option<PathBuf>) -> Result<PathBuf> {
+    let explicit = path.is_some();
     let start = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
-    let project = resolve_project_path_optional(&start);
+    let project = if configured_root_is_absolute() {
+        if !explicit && !is_initialized(&start) {
+            bail!("CODEGRAPH_DIR is absolute; pass the project root explicitly");
+        }
+        start
+    } else {
+        resolve_project_path_optional(&start)
+    };
     if !is_initialized(&project) {
         bail!("CodeGraph not initialized in {}", project.display());
     }
     Ok(project)
 }
 
+fn resolve_required_rebuild_project(path: Option<PathBuf>) -> Result<PathBuf> {
+    let explicit = path.is_some();
+    let start = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
+    if has_rebuild_namespace(&start) {
+        return Ok(start);
+    }
+    if configured_root_is_absolute() {
+        if !explicit {
+            bail!("CODEGRAPH_DIR is absolute; pass the project root explicitly");
+        }
+        bail!("CodeGraph not initialized in {}", start.display());
+    }
+    let mut current = start.as_path();
+    while let Some(parent) = current.parent() {
+        if parent == current {
+            break;
+        }
+        if has_rebuild_namespace(parent) {
+            return Ok(parent.to_path_buf());
+        }
+        current = parent;
+    }
+    bail!("CodeGraph not initialized in {}", start.display())
+}
+
 fn resolve_project_path_optional(start: &Path) -> PathBuf {
-    if is_initialized(start) {
+    if configured_root_is_absolute() || has_lifecycle_namespace(start) {
         return start.to_path_buf();
     }
     let mut current = start;
@@ -4223,7 +4733,7 @@ fn resolve_project_path_optional(start: &Path) -> PathBuf {
         if parent == current {
             break;
         }
-        if is_initialized(parent) {
+        if has_lifecycle_namespace(parent) {
             return parent.to_path_buf();
         }
         current = parent;
@@ -4270,22 +4780,25 @@ fn normalize_lexical(path: &Path) -> PathBuf {
     out
 }
 
-fn codegraph_dir(project: &Path) -> PathBuf {
-    project.join(std::env::var("CODEGRAPH_DIR").unwrap_or_else(|_| ".codegraph".to_string()))
+/// Fail-closed resolution of the project's index paths through the single
+/// `codegraph-core::IndexPaths` authority, honoring `CODEGRAPH_DIR`. Errors on
+/// an unsafe/aliased/overlapping configured root or an inaccessible project;
+/// callers never fall back to a reconstructed path.
+fn index_paths(project: &Path) -> Result<codegraph_core::IndexPaths> {
+    codegraph_core::IndexPaths::resolve(project, std::env::var("CODEGRAPH_DIR").ok().as_deref())
+        .map_err(Into::into)
 }
 
-fn db_path(project: &Path) -> PathBuf {
-    codegraph_dir(project).join("codegraph.db")
+/// The current (v2) index root for `project` (`.codegraph-v2` by default; a
+/// `<name>-v2-<projectIdentity>` sibling for a configured `CODEGRAPH_DIR`).
+/// Fail-closed via [`index_paths`].
+fn codegraph_dir(project: &Path) -> Result<PathBuf> {
+    Ok(index_paths(project)?.current_root().to_path_buf())
 }
 
-fn remove_db_files(project: &Path) -> Result<()> {
-    for suffix in ["", "-wal", "-shm"] {
-        let path = PathBuf::from(format!("{}{}", db_path(project).display(), suffix));
-        if path.exists() {
-            fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
-        }
-    }
-    Ok(())
+/// The current (v2) index DB path for `project`. Fail-closed via [`index_paths`].
+fn db_path(project: &Path) -> Result<PathBuf> {
+    Ok(index_paths(project)?.current_db())
 }
 
 fn parse_node_kind(raw: &str) -> Result<NodeKind> {
@@ -4311,6 +4824,18 @@ fn latest_indexed_at(store: &Store) -> Result<Option<i64>> {
 }
 
 fn journal_mode(store: &Store) -> Result<String> {
+    // A state-gated reader executes queries against a private deserialized
+    // in-memory image so it cannot create `-wal`/`-shm` sidecars. Its PRAGMA
+    // therefore reports `memory`, not the authoritative main database's mode.
+    // While the Store retains its shared lease, inspect SQLite's two format
+    // bytes instead: 2/2 is the durable WAL marker. Fall back to PRAGMA for
+    // legacy/non-WAL stores where the header cannot distinguish every rollback
+    // journal variant.
+    let mut header = [0_u8; 20];
+    fs::File::open(store.path())?.read_exact(&mut header)?;
+    if header.starts_with(b"SQLite format 3\0") && header[18] == 2 && header[19] == 2 {
+        return Ok("wal".to_string());
+    }
     store
         .connection()
         .query_row("PRAGMA journal_mode", [], |row| row.get(0))
@@ -5104,10 +5629,21 @@ mod pure_helper_tests {
 
     #[test]
     fn db_path_is_under_codegraph_dir() {
+        // Reads CODEGRAPH_DIR, which a sibling test unsets and restores, so it
+        // takes the same lock even though it never writes.
+        let _env = crate::test_env::env_guard();
         if std::env::var("CODEGRAPH_DIR").is_err() {
-            let p = Path::new("/proj");
-            assert_eq!(db_path(p), PathBuf::from("/proj/.codegraph/codegraph.db"));
-            assert_eq!(codegraph_dir(p), PathBuf::from("/proj/.codegraph"));
+            let dir = tmp("dbpath");
+            let canonical = dir.canonicalize().unwrap();
+            assert_eq!(
+                db_path(&dir).unwrap(),
+                canonical.join(".codegraph-v2/codegraph.db")
+            );
+            assert_eq!(
+                codegraph_dir(&dir).unwrap(),
+                canonical.join(".codegraph-v2")
+            );
+            let _ = fs::remove_dir_all(&dir);
         }
     }
 
@@ -5219,33 +5755,22 @@ mod pure_helper_tests {
 
     #[test]
     fn env_path_none_for_empty_or_unset_some_for_value() {
+        let mut env = crate::test_env::env_guard();
         let key = "CODEGRAPH_TEST_ENV_PATH_UNSET_XYZ";
-        // SAFETY: the key is test-private and this test runs single-threaded within its own scope.
-        unsafe {
-            std::env::remove_var(key);
-        }
+        env.remove(key);
         assert_eq!(env_path(key), None);
-        unsafe {
-            std::env::set_var(key, "");
-        }
+        env.set(key, "");
         assert_eq!(env_path(key), None);
-        unsafe {
-            std::env::set_var(key, "/some/where");
-        }
+        env.set(key, "/some/where");
         assert_eq!(env_path(key), Some(PathBuf::from("/some/where")));
-        unsafe {
-            std::env::remove_var(key);
-        }
     }
 }
 
 #[cfg(test)]
 mod formatter_and_env_tests {
     use super::*;
+    use crate::test_env::env_guard;
     use codegraph_core::types::{FileRecord, Language, NodeKind};
-
-    // Serializes tests that mutate process-global env (cargo test runs them concurrently).
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn tmp(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
@@ -5281,14 +5806,20 @@ mod formatter_and_env_tests {
 
     #[test]
     fn codegraph_dir_and_db_path_default_layout() {
-        let prev = std::env::var_os("CODEGRAPH_DIR");
-        unsafe { std::env::remove_var("CODEGRAPH_DIR") };
-        let proj = Path::new("/tmp/proj");
-        assert_eq!(codegraph_dir(proj), proj.join(".codegraph"));
-        assert_eq!(db_path(proj), proj.join(".codegraph/codegraph.db"));
-        if let Some(v) = prev {
-            unsafe { std::env::set_var("CODEGRAPH_DIR", v) };
-        }
+        let mut env = env_guard();
+        env.remove("CODEGRAPH_DIR");
+        let proj = tmp("default-layout");
+        let canonical = proj.canonicalize().unwrap();
+        assert_eq!(
+            codegraph_dir(&proj).unwrap(),
+            canonical.join(".codegraph-v2")
+        );
+        assert_eq!(
+            db_path(&proj).unwrap(),
+            canonical.join(".codegraph-v2/codegraph.db")
+        );
+        env.assert_intact();
+        let _ = fs::remove_dir_all(&proj);
     }
 
     #[test]
@@ -5524,31 +6055,20 @@ mod formatter_and_env_tests {
 
     #[test]
     fn home_dir_resolves_from_home_then_userprofile_then_errors() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev_home = std::env::var_os("HOME");
-        let prev_up = std::env::var_os("USERPROFILE");
-        unsafe { std::env::set_var("HOME", "/home/tester") };
+        let mut env = env_guard();
+        env.set("HOME", "/home/tester");
         assert_eq!(home_dir().unwrap(), PathBuf::from("/home/tester"));
-        unsafe { std::env::remove_var("HOME") };
-        unsafe { std::env::remove_var("USERPROFILE") };
+        env.remove("HOME");
+        env.remove("USERPROFILE");
         assert!(home_dir().is_err());
-        if let Some(v) = prev_home {
-            unsafe { std::env::set_var("HOME", v) };
-        }
-        if let Some(v) = prev_up {
-            unsafe { std::env::set_var("USERPROFILE", v) };
-        }
     }
 
     #[test]
     fn completion_target_paths_per_shell() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev_home = std::env::var_os("HOME");
-        let prev_xdg = std::env::var_os("XDG_DATA_HOME");
-        let prev_local = std::env::var_os("LOCALAPPDATA");
-        unsafe { std::env::set_var("HOME", "/h") };
-        unsafe { std::env::remove_var("XDG_DATA_HOME") };
-        unsafe { std::env::remove_var("LOCALAPPDATA") };
+        let mut env = env_guard();
+        env.set("HOME", "/h");
+        env.remove("XDG_DATA_HOME");
+        env.remove("LOCALAPPDATA");
 
         assert_eq!(
             completion_target(Shell::Bash).unwrap(),
@@ -5570,61 +6090,31 @@ mod formatter_and_env_tests {
             completion_target(Shell::Elvish).unwrap(),
             PathBuf::from("/h/.config/codegraph/completion.elv")
         );
-        unsafe { std::env::set_var("XDG_DATA_HOME", "/xdg") };
+        env.set("XDG_DATA_HOME", "/xdg");
         assert_eq!(
             completion_target(Shell::Bash).unwrap(),
             PathBuf::from("/xdg/bash-completion/completions/codegraph")
         );
-
-        if let Some(v) = prev_home {
-            unsafe { std::env::set_var("HOME", v) };
-        } else {
-            unsafe { std::env::remove_var("HOME") };
-        }
-        match prev_xdg {
-            Some(v) => unsafe { std::env::set_var("XDG_DATA_HOME", v) },
-            None => unsafe { std::env::remove_var("XDG_DATA_HOME") },
-        }
-        match prev_local {
-            Some(v) => unsafe { std::env::set_var("LOCALAPPDATA", v) },
-            None => unsafe { std::env::remove_var("LOCALAPPDATA") },
-        }
     }
 
     #[test]
     fn powershell_profile_path_override_then_userprofile_then_error() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev_ps = std::env::var_os("CODEGRAPH_PS_PROFILE");
-        let prev_up = std::env::var_os("USERPROFILE");
-        let prev_home = std::env::var_os("HOME");
+        let mut env = env_guard();
 
-        unsafe { std::env::set_var("CODEGRAPH_PS_PROFILE", "/custom/profile.ps1") };
+        env.set("CODEGRAPH_PS_PROFILE", "/custom/profile.ps1");
         assert_eq!(
             powershell_profile_path().unwrap(),
             PathBuf::from("/custom/profile.ps1")
         );
-        unsafe { std::env::remove_var("CODEGRAPH_PS_PROFILE") };
-        unsafe { std::env::set_var("USERPROFILE", "/up") };
+        env.remove("CODEGRAPH_PS_PROFILE");
+        env.set("USERPROFILE", "/up");
         assert_eq!(
             powershell_profile_path().unwrap(),
             PathBuf::from("/up/Documents/WindowsPowerShell/Microsoft.PowerShell_profile.ps1")
         );
-        unsafe { std::env::remove_var("USERPROFILE") };
-        unsafe { std::env::remove_var("HOME") };
+        env.remove("USERPROFILE");
+        env.remove("HOME");
         assert!(powershell_profile_path().is_err());
-
-        match prev_ps {
-            Some(v) => unsafe { std::env::set_var("CODEGRAPH_PS_PROFILE", v) },
-            None => unsafe { std::env::remove_var("CODEGRAPH_PS_PROFILE") },
-        }
-        match prev_up {
-            Some(v) => unsafe { std::env::set_var("USERPROFILE", v) },
-            None => unsafe { std::env::remove_var("USERPROFILE") },
-        }
-        match prev_home {
-            Some(v) => unsafe { std::env::set_var("HOME", v) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
     }
 
     #[test]
@@ -5651,16 +6141,13 @@ mod formatter_and_env_tests {
 
     #[test]
     fn http_log_path_lands_under_registry_dir() {
+        let mut env = env_guard();
         let dir = tmp("httplog");
-        let prev = std::env::var_os("CODEGRAPH_HTTP_REGISTRY_DIR");
-        unsafe { std::env::set_var("CODEGRAPH_HTTP_REGISTRY_DIR", &dir) };
+        env.set("CODEGRAPH_HTTP_REGISTRY_DIR", &dir);
         let p = http_log_path("127.0.0.1:8111");
         assert!(p.starts_with(&dir));
         assert!(p.extension().is_some_and(|e| e == "log"));
-        match prev {
-            Some(v) => unsafe { std::env::set_var("CODEGRAPH_HTTP_REGISTRY_DIR", v) },
-            None => unsafe { std::env::remove_var("CODEGRAPH_HTTP_REGISTRY_DIR") },
-        }
+        env.assert_intact();
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -5692,29 +6179,22 @@ mod formatter_and_env_tests {
             log_file: Some("/tmp/y.log".to_string()),
         };
         print_http_conflict(&info);
+        let mut env = env_guard();
         let dir = tmp("noteothers");
-        let prev = std::env::var_os("CODEGRAPH_HTTP_REGISTRY_DIR");
-        unsafe { std::env::set_var("CODEGRAPH_HTTP_REGISTRY_DIR", &dir) };
+        env.set("CODEGRAPH_HTTP_REGISTRY_DIR", &dir);
         note_other_running_servers("127.0.0.1:1234");
-        match prev {
-            Some(v) => unsafe { std::env::set_var("CODEGRAPH_HTTP_REGISTRY_DIR", v) },
-            None => unsafe { std::env::remove_var("CODEGRAPH_HTTP_REGISTRY_DIR") },
-        }
+        env.assert_intact();
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn is_http_detach_internal_reads_env_marker() {
+        let mut env = env_guard();
         let key = codegraph_daemon::CODEGRAPH_HTTP_DETACH_INTERNAL;
-        let prev = std::env::var_os(key);
-        unsafe { std::env::remove_var(key) };
+        env.remove(key);
         assert!(!is_http_detach_internal());
-        unsafe { std::env::set_var(key, "1") };
+        env.set(key, "1");
         assert!(is_http_detach_internal());
-        match prev {
-            Some(v) => unsafe { std::env::set_var(key, v) },
-            None => unsafe { std::env::remove_var(key) },
-        }
     }
 
     #[test]
@@ -5734,70 +6214,58 @@ mod formatter_and_env_tests {
 
     #[test]
     fn install_completions_writes_zsh_fish_elvish_into_home() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = env_guard();
         let dir = tmp("install-comp");
-        let prev_home = std::env::var_os("HOME");
-        let prev_xdg = std::env::var_os("XDG_DATA_HOME");
-        unsafe { std::env::set_var("HOME", &dir) };
-        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        env.set("HOME", &dir);
+        env.remove("XDG_DATA_HOME");
 
+        // Every step re-asserts the guarded env BEFORE writing, so a stolen
+        // HOME fails here instead of installing into the real home directory.
+        env.assert_intact();
         install_completions(Shell::Zsh).unwrap();
         assert!(dir.join(".zfunc/_codegraph").is_file());
 
+        env.assert_intact();
         install_completions(Shell::Fish).unwrap();
         assert!(
             dir.join(".config/fish/completions/codegraph.fish")
                 .is_file()
         );
 
+        env.assert_intact();
         install_completions(Shell::Elvish).unwrap();
         let elv = dir.join(".config/codegraph/completion.elv");
         assert!(elv.is_file());
         assert!(fs::read_to_string(&elv).unwrap().contains("codegraph"));
 
+        env.assert_intact();
         install_completions(Shell::Bash).unwrap();
         assert!(
             dir.join(".local/share/bash-completion/completions/codegraph")
                 .is_file()
         );
 
-        match prev_home {
-            Some(v) => unsafe { std::env::set_var("HOME", v) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-        match prev_xdg {
-            Some(v) => unsafe { std::env::set_var("XDG_DATA_HOME", v) },
-            None => unsafe { std::env::remove_var("XDG_DATA_HOME") },
-        }
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn install_completions_powershell_writes_script_and_dot_sources_profile() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = env_guard();
         let dir = tmp("install-ps");
-        let prev_local = std::env::var_os("LOCALAPPDATA");
-        let prev_ps = std::env::var_os("CODEGRAPH_PS_PROFILE");
         let profile = dir.join("profile.ps1");
-        unsafe { std::env::set_var("LOCALAPPDATA", &dir) };
-        unsafe { std::env::set_var("CODEGRAPH_PS_PROFILE", &profile) };
+        env.set("LOCALAPPDATA", &dir);
+        env.set("CODEGRAPH_PS_PROFILE", &profile);
 
+        env.assert_intact();
         install_completions(Shell::PowerShell).unwrap();
         let script = dir.join("codegraph/completion.ps1");
         assert!(script.is_file());
+        env.assert_intact();
         install_completions(Shell::PowerShell).unwrap();
         let line = format!(". \"{}\"", script.display());
         let body = fs::read_to_string(&profile).unwrap();
         assert_eq!(body.lines().filter(|l| l.trim() == line).count(), 1);
 
-        match prev_local {
-            Some(v) => unsafe { std::env::set_var("LOCALAPPDATA", v) },
-            None => unsafe { std::env::remove_var("LOCALAPPDATA") },
-        }
-        match prev_ps {
-            Some(v) => unsafe { std::env::set_var("CODEGRAPH_PS_PROFILE", v) },
-            None => unsafe { std::env::remove_var("CODEGRAPH_PS_PROFILE") },
-        }
         let _ = fs::remove_dir_all(&dir);
     }
 }

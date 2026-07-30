@@ -23,8 +23,57 @@
 //! On a project where none are detected the orchestrator holds an empty list, so
 //! behavior is identical to the upstream with zero `FrameworkResolver`s detected.
 
+use crate::frameworks::godot_dsl_config::GodotDslConfig;
 use crate::types::{FrameworkResolverExtractionResult, RefView, ResolutionContext, ResolvedRef};
 use codegraph_core::types::Language;
+use std::sync::Arc;
+
+/// The per-project inputs a [`FrameworkResolver::extract`] pass may need beyond
+/// the file itself: the absolute project root, and the project's explicitly
+/// loaded framework configuration.
+///
+/// Project configuration is PASSED IN, never discovered: the pipeline loads it
+/// once from the addressed project's resolved current index root
+/// (`<current_root>/codegraph.json`) and hands the same immutable value to every
+/// file's extraction. No resolver walks the directory tree, reads a legacy
+/// `.codegraph/codegraph.json`, or caches config across projects, so one process
+/// serving several projects can never mix their configuration.
+#[derive(Debug, Clone)]
+pub struct FrameworkExtractionContext {
+    project_root: String,
+    godot_dsl: Arc<GodotDslConfig>,
+}
+
+impl FrameworkExtractionContext {
+    /// Build a context for `project_root` with the project's Godot DSL config.
+    #[must_use]
+    pub fn new(project_root: impl Into<String>, godot_dsl: Arc<GodotDslConfig>) -> Self {
+        Self {
+            project_root: project_root.into(),
+            godot_dsl,
+        }
+    }
+
+    /// Build a context for `project_root` with NO project configuration — the
+    /// off-by-default case (and what a caller that addresses no project uses).
+    #[must_use]
+    pub fn without_config(project_root: impl Into<String>) -> Self {
+        Self::new(project_root, GodotDslConfig::empty())
+    }
+
+    /// The absolute project root being indexed (may be empty for a caller that
+    /// supplies absolute file paths).
+    #[must_use]
+    pub fn project_root(&self) -> &str {
+        &self.project_root
+    }
+
+    /// The project's opt-in Godot DSL configuration (empty when it declares none).
+    #[must_use]
+    pub fn godot_dsl(&self) -> &GodotDslConfig {
+        &self.godot_dsl
+    }
+}
 
 /// A framework-specific resolution strategy (EXTENSION POINT).
 ///
@@ -64,18 +113,16 @@ pub trait FrameworkResolver: Sync {
     /// per-file extraction.
     ///
     /// `file_path` is the repo-RELATIVE path that MUST be used for all node /
-    /// reference attribution (preserving golden byte-stability). `project_root`
-    /// is the absolute project root the pipeline is indexing; resolvers that
-    /// read a per-project `.codegraph/codegraph.json` (e.g. Godot's opt-in DSL
-    /// config) MUST resolve that config against `project_root.join(file_path)`
-    /// rather than the process CWD — otherwise the config is only found when the
-    /// CLI happens to run with its CWD == the project root. Resolvers that need
-    /// no project config simply ignore `project_root`.
+    /// reference attribution (preserving golden byte-stability). `context`
+    /// carries the absolute project root plus the project's EXPLICITLY loaded
+    /// configuration (see [`FrameworkExtractionContext`]); a resolver that needs
+    /// per-project config reads it from there instead of discovering a file,
+    /// and one that needs none simply ignores it.
     fn extract(
         &self,
         _file_path: &str,
         _content: &str,
-        _project_root: &str,
+        _context: &FrameworkExtractionContext,
     ) -> Option<FrameworkResolverExtractionResult> {
         None
     }
@@ -160,6 +207,7 @@ mod tests {
 
     fn a_ref() -> RefView {
         RefView {
+            row_id: None,
             from_node_id: "from".to_string(),
             reference_name: "X".to_string(),
             reference_kind: EdgeKind::Calls,
@@ -196,7 +244,15 @@ mod tests {
     #[test]
     fn extract_default_is_none() {
         // The default `extract` returns None (no per-file extraction).
-        assert!(BareResolver.extract("a.ts", "content", "/root").is_none());
+        assert!(
+            BareResolver
+                .extract(
+                    "a.ts",
+                    "content",
+                    &FrameworkExtractionContext::without_config("/root")
+                )
+                .is_none()
+        );
     }
 
     #[test]

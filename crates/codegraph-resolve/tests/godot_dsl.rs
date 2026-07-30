@@ -1,23 +1,27 @@
 //! L5 Godot static-analysis tests: OPTIONAL, config-gated DSL resource-field
 //! reference edges (T9 of godot-static-analysis).
 //!
-//! The DSL hook is OFF by default. It fires ONLY when a `.codegraph/codegraph.json`
-//! up the directory tree from the `.tres` declares
+//! The DSL hook is OFF by default. It fires ONLY when the addressed project's own
+//! current-root `codegraph.json` (`IndexPaths::extension_config`) declares
 //! `godot.dsl.resourceFields = [...]`. Each listed `[resource]` property name `F`
 //! then makes its `F = <value>` line emit a [`EdgeKind::References`] edge from the
 //! resource marker to the value (a string literal → the literal text; an
 //! `ExtResource("id")` handle → the resolved repo-relative path, via the same
 //! id-table T5 uses for `script`/property bindings).
 //!
-//! These tests build a temp project dir (config + `.tres`) and drive the public
-//! [`FrameworkResolver::extract`] entry point with the ABSOLUTE `.tres` path, so
-//! the config reader can walk up to the config exactly as the pipeline does.
+//! These tests write the config into the project's resolved v2 root, load it
+//! EXPLICITLY through [`GodotDslConfig::load_for_paths`], and drive the public
+//! [`FrameworkResolver::extract`] entry point with that config in the extraction
+//! context — exactly as the pipeline does. No legacy `.codegraph/codegraph.json`
+//! is written, because it is no longer consulted.
 
 use std::path::{Path, PathBuf};
 
+use codegraph_core::IndexPaths;
 use codegraph_core::types::EdgeKind;
-use codegraph_resolve::framework::FrameworkResolver;
+use codegraph_resolve::framework::{FrameworkExtractionContext, FrameworkResolver};
 use codegraph_resolve::frameworks::godot::GodotResolver;
+use codegraph_resolve::frameworks::godot_dsl_config::GodotDslConfig;
 use codegraph_resolve::types::FrameworkResolverExtractionResult;
 
 /// A fresh, uniquely-named temp project directory.
@@ -34,15 +38,24 @@ fn unique_dir(slug: &str) -> PathBuf {
     dir
 }
 
-/// Write `.codegraph/codegraph.json` with the given JSON contents under `root`.
+/// Write the project's CURRENT-ROOT `codegraph.json` — the only config the DSL
+/// reader consults.
 fn write_config(root: &Path, json: &str) {
-    let cfg_dir = root.join(".codegraph");
-    std::fs::create_dir_all(&cfg_dir).expect("mkdir .codegraph");
-    std::fs::write(cfg_dir.join("codegraph.json"), json).expect("write codegraph.json");
+    let paths = IndexPaths::resolve(root, None).expect("resolve index paths");
+    std::fs::create_dir_all(paths.current_root()).expect("mkdir current root");
+    std::fs::write(paths.extension_config(), json).expect("write codegraph.json");
 }
 
-/// Write `rel` under `root` and return its ABSOLUTE path as a `/`-joined string
-/// (the config reader walks up from this path).
+/// The extraction context for `root`, carrying its EXPLICITLY loaded DSL config.
+fn project_config(root: &Path) -> FrameworkExtractionContext {
+    let paths = IndexPaths::resolve(root, None).expect("resolve index paths");
+    FrameworkExtractionContext::new(
+        root.to_string_lossy().into_owned(),
+        GodotDslConfig::load_for_paths(&paths),
+    )
+}
+
+/// Write `rel` under `root` and return its ABSOLUTE path as a `/`-joined string.
 fn write_tres(root: &Path, rel: &str, content: &str) -> String {
     let abs = root.join(rel);
     if let Some(parent) = abs.parent() {
@@ -52,10 +65,11 @@ fn write_tres(root: &Path, rel: &str, content: &str) -> String {
     abs.to_string_lossy().into_owned()
 }
 
-/// Extract a `.tres` at `abs_path` (panics if the resolver returned `None`).
-fn extract(abs_path: &str, content: &str) -> FrameworkResolverExtractionResult {
+/// Extract a `.tres` under `root`'s own loaded DSL config (panics if the resolver
+/// returned `None`).
+fn extract_in(root: &Path, abs_path: &str, content: &str) -> FrameworkResolverExtractionResult {
     GodotResolver
-        .extract(abs_path, content, "")
+        .extract(abs_path, content, &project_config(root))
         .expect(".tres must produce Some(result)")
 }
 
@@ -79,7 +93,7 @@ fn with_dsl_config_string_field_emits_reference_to_literal_value() {
     let tres = write_tres(&root, "data/strength.tres", SKILL_TRES);
 
     // When extracting the `.tres` that has `skill_effect = "Fireball"`,
-    let result = extract(&tres, SKILL_TRES);
+    let result = extract_in(&root, &tres, SKILL_TRES);
 
     // Then a reference edge to the literal value `Fireball` is emitted.
     let dsl_ref = result
@@ -114,7 +128,7 @@ fn without_dsl_config_same_tres_emits_no_dsl_edge() {
     let tres = write_tres(&root, "data/strength.tres", SKILL_TRES);
 
     // When extracting the SAME `.tres`,
-    let result = extract(&tres, SKILL_TRES);
+    let result = extract_in(&root, &tres, SKILL_TRES);
 
     // Then ZERO DSL edges are emitted — `skill_effect = "Fireball"` produces no
     // reference, because the config is the only trigger.
@@ -147,7 +161,7 @@ fn dsl_config_present_but_other_fields_listed_emits_no_edge() {
     let tres = write_tres(&root, "data/strength.tres", SKILL_TRES);
 
     // When extracting a `.tres` whose only DSL-shaped line is `skill_effect`,
-    let result = extract(&tres, SKILL_TRES);
+    let result = extract_in(&root, &tres, SKILL_TRES);
 
     // Then no DSL edge fires — the field list is honored exactly.
     assert!(
@@ -179,7 +193,7 @@ skill_effect = ExtResource(\"1\")
     let tres = write_tres(&root, "data/mage.tres", content);
 
     // When extracting,
-    let result = extract(&tres, content);
+    let result = extract_in(&root, &tres, content);
 
     // Then the DSL edge resolves the ExtResource id to the repo-relative path
     // (res:// stripped), exactly like T5's script/property bindings.
@@ -201,7 +215,7 @@ fn malformed_config_is_ignored_no_panic_no_dsl_edge() {
     let tres = write_tres(&root, "data/strength.tres", SKILL_TRES);
 
     // When extracting (must not panic),
-    let result = extract(&tres, SKILL_TRES);
+    let result = extract_in(&root, &tres, SKILL_TRES);
 
     // Then the malformed config is ignored — no DSL edge, as if absent.
     assert!(
@@ -231,8 +245,8 @@ effect_on = \"Enemy\"
     let tres = write_tres(&root, "data/spell.tres", content);
 
     // When extracting twice,
-    let a = extract(&tres, content);
-    let b = extract(&tres, content);
+    let a = extract_in(&root, &tres, content);
+    let b = extract_in(&root, &tres, content);
 
     // Then the parser-controlled fields (ids/names/kinds/targets/order) match.
     let nodes_a: Vec<(&str, &str)> = a
@@ -315,7 +329,7 @@ buff_id = 7005
     let tres = write_tres(&root, "data/strength.tres", content);
 
     // When extracting a `.tres` with a bare integer `buff_id = 7005`,
-    let result = extract(&tres, content);
+    let result = extract_in(&root, &tres, content);
 
     // Then exactly one `godot:id:buff:7005` sentinel is emitted, anchored on the
     // resource marker with EdgeKind::References.
@@ -349,7 +363,7 @@ skill_effect = \"a:b:9015:c:7005:1000\"
     let tres = write_tres(&root, "data/mage.tres", content);
 
     // When extracting the compound value,
-    let result = extract(&tres, content);
+    let result = extract_in(&root, &tres, content);
 
     // Then EXACTLY the 0-based segments 2 and 4 (9015, 7005) become sentinels —
     // not the whole string, not segment 5 (1000).
@@ -376,7 +390,7 @@ skill_effect = \"a:b:9015:c:7005:1000\"
     let tres = write_tres(&root, "data/strength.tres", content);
 
     // When extracting a `.tres` full of ID-shaped lines,
-    let result = extract(&tres, content);
+    let result = extract_in(&root, &tres, content);
 
     // Then ZERO id sentinels are emitted — the config is the only trigger, so a
     // non-configured project behaves byte-identically to pre-PR2.
@@ -412,7 +426,7 @@ duration = 5.0
     let tres = write_tres(&root, "data/strength.tres", content);
 
     // When extracting a `.tres` with no matching key,
-    let result = extract(&tres, content);
+    let result = extract_in(&root, &tres, content);
 
     // Then no sentinel fires — the spec map is matched by exact key.
     assert!(
@@ -441,7 +455,7 @@ pair = \"100:200\"
     let tres = write_tres(&root, "data/oob.tres", content);
 
     // When extracting a value with only two segments,
-    let result = extract(&tres, content);
+    let result = extract_in(&root, &tres, content);
 
     // Then the in-range segment yields a sentinel and the out-of-range index is
     // silently skipped (no panic, no error, no empty sentinel).
@@ -472,8 +486,8 @@ skill_effect = \"9015:c:7005\"
     let tres = write_tres(&root, "data/spell.tres", content);
 
     // When extracting twice,
-    let a = extract(&tres, content);
-    let b = extract(&tres, content);
+    let a = extract_in(&root, &tres, content);
+    let b = extract_in(&root, &tres, content);
 
     // Then the sentinel set, order, and edge sources are byte-stable, and follow
     // SOURCE-LINE order (buff_id line before skill_effect line), not config order.
