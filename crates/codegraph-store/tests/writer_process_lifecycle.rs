@@ -102,6 +102,42 @@ fn snapshot_namespace(root: &Path) -> BTreeMap<PathBuf, NamespaceEntry> {
         .expect("snapshot namespace without path replacement")
 }
 
+/// Windows `ERROR_LOCK_VIOLATION`.
+///
+/// A byte-range lock taken through `File::try_lock` is ADVISORY on Unix, so an
+/// unrelated read of the locked file always succeeds there. On Windows the same
+/// lock is MANDATORY and any overlapping read is refused with this code. The
+/// contention fixtures below snapshot a namespace whose zero-length `index.lock`
+/// is exclusively held by a live HOLDER CHILD PROCESS.
+const ERROR_LOCK_VIOLATION: i32 = 33;
+
+/// Read one already-corroborated namespace file's bytes, tolerating exactly one
+/// otherwise-fatal case: a mandatory Windows byte-range lock refusing a read of
+/// an EMPTY file.
+///
+/// `len` is the length of the very handle being read, taken from the metadata
+/// this walker already corroborated against the path. Metadata queries are not
+/// byte-range-locked, so the length stays observable while the lock is held, and
+/// a zero-length file has exactly one possible content. Recording it as empty is
+/// therefore byte-exact AND independent of whether the lock happened to be held
+/// at snapshot time, so a `before`/`after` pair still compares equal across a
+/// lock release. Creation, removal and kind changes stay detectable because the
+/// entry is still recorded as the regular file it is. Every other read error
+/// panics: an unreadable file is a real fault, and a non-empty locked file has
+/// content that cannot be observed at all.
+fn read_namespace_file_bytes(file: &mut File, path: &Path, len: u64) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    match file.read_to_end(&mut bytes) {
+        Ok(_) => bytes,
+        Err(error)
+            if cfg!(windows) && len == 0 && error.raw_os_error() == Some(ERROR_LOCK_VIOLATION) =>
+        {
+            Vec::new()
+        }
+        Err(error) => panic!("read opened namespace file {}: {error}", path.display()),
+    }
+}
+
 fn snapshot_namespace_with_checkpoint<F>(
     root: &Path,
     mut checkpoint: F,
@@ -265,10 +301,7 @@ where
                 }
 
                 checkpoint(&path, SnapshotCheckpoint::RegularHandleCorroborated);
-                let mut bytes = Vec::new();
-                file.read_to_end(&mut bytes).unwrap_or_else(|error| {
-                    panic!("read opened namespace file {}: {error}", path.display())
-                });
+                let bytes = read_namespace_file_bytes(&mut file, &path, before_read.len());
                 let after_read = match fs::symlink_metadata(&path) {
                     Ok(metadata) => metadata,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {

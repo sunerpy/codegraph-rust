@@ -111,6 +111,41 @@ enum SnapshotKind {
     Symlink(PathBuf),
 }
 
+/// Windows `ERROR_LOCK_VIOLATION`.
+///
+/// A byte-range lock taken through `File::try_lock` is ADVISORY on Unix, so an
+/// unrelated `read` of the locked file always succeeds there. On Windows the
+/// same lock is MANDATORY and any overlapping read is refused with this code.
+/// The publisher fixtures below hold a live EXCLUSIVE lease over the zero-length
+/// `index.lock` — including after renaming it aside, since the lock follows the
+/// handle — while they snapshot.
+const ERROR_LOCK_VIOLATION: i32 = 33;
+
+/// Read one regular file's bytes for a snapshot, tolerating exactly one
+/// otherwise-fatal case: a mandatory Windows byte-range lock refusing a read of
+/// an EMPTY file.
+///
+/// `len` is the length from the `symlink_metadata` already taken for this entry.
+/// Metadata queries are not byte-range-locked, so the length stays observable
+/// while the lock is held, and a zero-length file has exactly one possible
+/// content. Recording it as empty is therefore byte-exact AND independent of
+/// whether the lock happened to be held at snapshot time, so a `before`/`after`
+/// pair still compares equal across a lock release. Creation, removal and kind
+/// changes stay detectable because the entry is still recorded as the regular
+/// file it is. Every other read error panics: an unreadable file is a real fault,
+/// and a non-empty locked file has content that cannot be observed at all.
+fn snapshot_file_bytes(path: &Path, len: u64) -> Vec<u8> {
+    match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error)
+            if cfg!(windows) && len == 0 && error.raw_os_error() == Some(ERROR_LOCK_VIOLATION) =>
+        {
+            Vec::new()
+        }
+        Err(error) => panic!("snapshot read {}: {error}", path.display()),
+    }
+}
+
 fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, SnapshotKind> {
     fn walk(root: &Path, directory: &Path, out: &mut BTreeMap<PathBuf, SnapshotKind>) {
         let entries = std::fs::read_dir(directory)
@@ -133,22 +168,18 @@ fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, SnapshotKind> {
             let metadata = std::fs::symlink_metadata(&path)
                 .unwrap_or_else(|err| panic!("snapshot metadata {}: {err}", path.display()));
             let file_type = metadata.file_type();
-            let kind = if file_type.is_dir() {
-                SnapshotKind::Directory
-            } else if file_type.is_file() {
-                SnapshotKind::File(
-                    std::fs::read(&path)
-                        .unwrap_or_else(|err| panic!("snapshot read {}: {err}", path.display())),
-                )
-            } else if file_type.is_symlink() {
-                SnapshotKind::Symlink(
-                    std::fs::read_link(&path).unwrap_or_else(|err| {
+            let kind =
+                if file_type.is_dir() {
+                    SnapshotKind::Directory
+                } else if file_type.is_file() {
+                    SnapshotKind::File(snapshot_file_bytes(&path, metadata.len()))
+                } else if file_type.is_symlink() {
+                    SnapshotKind::Symlink(std::fs::read_link(&path).unwrap_or_else(|err| {
                         panic!("snapshot read_link {}: {err}", path.display())
-                    }),
-                )
-            } else {
-                panic!("snapshot unsupported entry kind: {}", path.display());
-            };
+                    }))
+                } else {
+                    panic!("snapshot unsupported entry kind: {}", path.display());
+                };
             assert!(
                 out.insert(relative, kind).is_none(),
                 "duplicate snapshot path"
