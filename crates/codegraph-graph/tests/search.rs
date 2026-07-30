@@ -460,3 +460,69 @@ fn search_parse_query_rust_qualifier_stays_in_text() {
     assert_eq!(parsed.text, "Counter::increment");
     assert!(parsed.kinds.is_empty());
 }
+
+#[test]
+fn search_exact_long_name_ranks_first_deterministically() {
+    let mut store = Store::open(&temp_db_path("exact-long-name-rank")).expect("open temp store");
+    store
+        .upsert_nodes(&[
+            node(
+                "parameter:exact",
+                NodeKind::Parameter,
+                "LoadProjectSettingsFromConfiguredGodotResourceIdentifierLookup",
+                "Runtime::parameter",
+                "tests/runtime.rs",
+                Language::Rust,
+                1,
+                1,
+                None,
+                None,
+                false,
+            ),
+            node(
+                "function:competing",
+                NodeKind::Function,
+                "LoadProjectSettingsFromConfiguredGodotResourceIdentifierLookupX",
+                "LoadProjectSettingsFromConfiguredGodotResourceIdentifierLookupX::function",
+                "loadprojectsettingsfromconfiguredgodotresourceidentifierlookup/loadprojectsettingsfromconfiguredgodotresourceidentifierlookup.rs",
+                Language::Rust,
+                1,
+                1,
+                None,
+                None,
+                false,
+            ),
+        ])
+        .expect("insert ranking corpus");
+
+    let project_tokens = HashSet::new();
+    let query = "LoadProjectSettingsFromConfiguredGodotResourceIdentifierLookup";
+    let first = search_nodes(&store, query, &SearchOptions::default(), &project_tokens)
+        .expect("first search");
+    let second = search_nodes(&store, query, &SearchOptions::default(), &project_tokens)
+        .expect("second search");
+
+    let ordered = |results: &[codegraph_store::queries::SearchResult]| {
+        results
+            .iter()
+            .map(|result| (result.node.id.clone(), result.score.to_bits()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ordered(&first), ordered(&second), "search ordering changed");
+
+    let exact_rank = first
+        .iter()
+        .position(|result| result.node.id == "parameter:exact")
+        .expect("exact symbol returned")
+        + 1;
+    let exact_score = first[exact_rank - 1].score;
+    let competing_score = first
+        .iter()
+        .find(|result| result.node.id == "function:competing")
+        .expect("competing symbol returned")
+        .score;
+    assert_eq!(
+        exact_rank, 1,
+        "exact symbol ranked {exact_rank} with score {exact_score}; competing row scored {competing_score}"
+    );
+}

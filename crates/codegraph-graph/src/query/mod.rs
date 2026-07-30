@@ -116,6 +116,26 @@ pub fn search_nodes(
                 )
                 + scoring::name_match_bonus(&result.node.name, scoring_query);
         }
+
+        // Preserve the established score ABI when an exact match already wins, but
+        // rescue any exact candidate that FTS (or exact-name injection) left below a
+        // non-exact row. The shared pass is intentionally source-independent, so it
+        // also covers candidates appended by multi-segment definer seeding.
+        let best_non_exact_score = results
+            .iter()
+            .filter(|result| scoring::exact_name_bonus(&result.node.name, scoring_query) == 0.0)
+            .map(|result| result.score)
+            .reduce(f64::max);
+        if let Some(best_non_exact_score) = best_non_exact_score {
+            for result in &mut results {
+                let exact_bonus = scoring::exact_name_bonus(&result.node.name, scoring_query);
+                if exact_bonus > 0.0 && result.score <= best_non_exact_score {
+                    // Cover any FTS base-score gap first; the arithmetic-derived bonus
+                    // then puts the exact row decisively above the best non-exact row.
+                    result.score += best_non_exact_score - result.score + exact_bonus;
+                }
+            }
+        }
         sort_by_score_desc(&mut results);
         if results.len() > limit as usize {
             results.truncate(limit as usize);

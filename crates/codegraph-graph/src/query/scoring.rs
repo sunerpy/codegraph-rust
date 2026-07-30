@@ -633,6 +633,31 @@ pub fn name_match_bonus(node_name: &str, query: &str) -> f64 {
     0.0
 }
 
+/// Return a source-independent rank rescue for a case-insensitive whole-name match.
+///
+/// A non-exact row can earn at most 80 from [`name_match_bonus`] and 10 from
+/// [`kind_bonus`]. [`score_path_relevance`] has no query-independent ceiling: for
+/// each whitespace-delimited query word it can add at most 10 for the filename
+/// plus 5 for the immediate directory (the test-file adjustment only subtracts).
+/// Scale that 15-point ceiling by the query length, then add one so an exact name
+/// strictly dominates every non-exact bonus above the best candidate's base score.
+pub fn exact_name_bonus(node_name: &str, query: &str) -> f64 {
+    if node_name.to_lowercase() != query.to_lowercase() {
+        return 0.0;
+    }
+
+    const MAX_NAME_MATCH_BONUS: f64 = 80.0;
+    const MAX_KIND_BONUS: f64 = 10.0;
+    const MAX_PATH_BONUS_PER_QUERY_WORD: f64 = 15.0;
+    const STRICT_DOMINANCE_MARGIN: f64 = 1.0;
+
+    let query_word_count = query.split_whitespace().count() as f64;
+    MAX_NAME_MATCH_BONUS
+        + MAX_KIND_BONUS
+        + MAX_PATH_BONUS_PER_QUERY_WORD * query_word_count
+        + STRICT_DOMINANCE_MARGIN
+}
+
 pub fn kind_bonus(kind: NodeKind) -> f64 {
     match kind {
         NodeKind::Function => 10.0,
@@ -935,6 +960,13 @@ mod tests {
         assert_eq!(name_match_bonus("handleLoginRequest", "login"), 10.0);
         // no match → 0
         assert_eq!(name_match_bonus("foo", "zzz"), 0.0);
+    }
+
+    #[test]
+    fn exact_name_bonus_is_case_insensitive_and_exceeds_other_bonus_ceilings() {
+        assert_eq!(exact_name_bonus("LongSymbol", "longsymbol"), 106.0);
+        assert_eq!(exact_name_bonus("Long Symbol", "LONG SYMBOL"), 121.0);
+        assert_eq!(exact_name_bonus("LongerSymbol", "longsymbol"), 0.0);
     }
 
     #[test]
