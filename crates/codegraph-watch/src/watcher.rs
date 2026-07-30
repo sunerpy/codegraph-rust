@@ -2290,15 +2290,15 @@ mod tests {
 
     #[test]
     fn collect_watch_dirs_honors_gitignore_pruning() {
-        // `.godot/` is not in DEFAULT_IGNORE_DIRS, but a real Godot project lists
-        // it in .gitignore, which WatchPolicy::new merges. This proves the watch
-        // set is pruned by the SAME merged policy (not a second hardcoded list),
-        // so project-specific ignores keep us out of generated trees too.
+        // `.generated/` is deliberately absent from the default ignores. This
+        // proves the watch set is pruned by the SAME merged policy (not a second
+        // hardcoded list), so project-specific ignores keep us out of generated
+        // trees too.
         let dir = crate::sync::tests::TestDir::new("watch-collect-gitignore");
         let root = dir.path();
-        fs::write(root.join(".gitignore"), ".godot/\n").unwrap();
+        fs::write(root.join(".gitignore"), ".generated/\n").unwrap();
         fs::create_dir_all(root.join("scenes")).unwrap();
-        fs::create_dir_all(root.join(".godot/imported")).unwrap();
+        fs::create_dir_all(root.join(".generated/cache")).unwrap();
 
         let policy = WatchPolicy::new(root);
         let dirs = collect_watch_dirs(root, &policy);
@@ -2309,8 +2309,8 @@ mod tests {
 
         assert!(got.contains(&"scenes".to_string()), "source dir kept");
         assert!(
-            !got.iter().any(|p| p.starts_with(".godot")),
-            ".godot subtree must be pruned via .gitignore, got {got:?}"
+            !got.iter().any(|p| p.starts_with(".generated")),
+            ".generated subtree must be pruned via .gitignore, got {got:?}"
         );
     }
 
