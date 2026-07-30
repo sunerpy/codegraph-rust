@@ -103,7 +103,19 @@ pub fn resolve_target_flag(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    /// Monotonic per-process serial that makes every [`temp_ctx`] base unique.
+    ///
+    /// A wall-clock timestamp alone is NOT sufficient. `SystemTime::now()` has
+    /// nanosecond resolution on Linux but is only updated at the system timer tick
+    /// on Windows (~15.6 ms), so two of this module's tests — run concurrently in
+    /// threads of ONE process, hence one pid — can observe the SAME `as_nanos()`
+    /// value and hand the installer the SAME `home`/`cwd`, letting one test read
+    /// the config the other wrote. The serial cannot collide by construction.
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
     /// The full registry id set, in load-bearing order (registry.rs:5-7).
     const ALL_IDS: &[&str] = &[
@@ -143,8 +155,9 @@ mod tests {
 
     fn temp_ctx() -> InstallContext {
         let base = std::env::temp_dir().join(format!(
-            "cg-registry-{}-{}",
+            "cg-registry-{}-{}-{}",
             std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

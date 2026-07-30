@@ -738,7 +738,20 @@ fn find_next_table_header(content: &str, from: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    /// Monotonic per-process serial that makes every [`tmp_path`] directory unique.
+    ///
+    /// A wall-clock timestamp alone is NOT sufficient. `SystemTime::now()` has
+    /// nanosecond resolution on Linux but is only updated at the system timer tick
+    /// on Windows (~15.6 ms), so two of this module's tests — run concurrently in
+    /// threads of ONE process, hence one pid — can observe the SAME `as_nanos()`
+    /// value and land in the SAME directory. `create_dir_all` does not error on
+    /// that, so the two tests silently share a directory and clobber each other's
+    /// fixture files. The serial cannot collide by construction.
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn parses_jsonc_with_line_and_block_comments() {
@@ -1018,8 +1031,9 @@ mod tests {
 
     fn tmp_path(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "cg-jsonc-{}-{}",
+            "cg-jsonc-{}-{}-{}",
             std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

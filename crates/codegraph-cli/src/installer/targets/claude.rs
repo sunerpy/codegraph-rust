@@ -400,12 +400,22 @@ pub static CLAUDE_TARGET: ClaudeCodeTarget = ClaudeCodeTarget;
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    /// Monotonic per-process serial that makes every [`temp_ctx`] base unique.
+    ///
+    /// See `installer::registry::tests::NEXT_TEMP` for why a wall-clock timestamp
+    /// is not enough on Windows. Only one test calls this helper today, so it
+    /// cannot collide yet; the serial keeps that true when a second one is added.
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
     fn temp_ctx() -> InstallContext {
         let base = std::env::temp_dir().join(format!(
-            "codegraph-claude-skill-{}-{}",
+            "codegraph-claude-skill-{}-{}-{}",
             std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
