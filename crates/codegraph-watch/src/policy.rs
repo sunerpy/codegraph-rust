@@ -19,8 +19,6 @@ const WATCH_ONLY_DEFAULT_IGNORE_DIRS: &[&str] = &[
     ".cache",
 ];
 
-const REINCLUDABLE_SCAN_DEFAULT_IGNORE_DIRS: &[&str] = &[".godot", "addons"];
-
 #[derive(Debug, Clone)]
 struct IgnoreRule {
     pattern: String,
@@ -44,25 +42,27 @@ pub struct WatchPolicy {
 
 impl WatchPolicy {
     pub fn new(root: impl AsRef<Path>) -> Self {
-        Self::with_config(root, &[], &[])
+        let indexing = codegraph_core::config::IndexingConfig::default();
+        Self::with_config(root, &indexing.ignore_dirs, &[], &[])
     }
 
-    /// Like [`new`](Self::new) but threads the `codegraph.json`/`config.toml`
-    /// `include` and `exclude` path patterns (#1063) so the watcher's scope
-    /// matches the scan's: an included gitignored dir is WATCHED and its file
-    /// events HANDLED, while a built-in skip is never re-watched and an explicit
-    /// `exclude` always wins. Empty `include`+`exclude` is byte-identical to the
-    /// pre-#1063 policy.
-    pub fn with_config(root: impl AsRef<Path>, include: &[String], exclude: &[String]) -> Self {
+    /// Like [`new`](Self::new) but threads the project's configured `ignore_dirs`,
+    /// `include`, and `exclude` scope into the watcher. Configured ignored dirs
+    /// mirror the scan's structural prune and cannot be re-included; an included
+    /// gitignored dir is watched, while an explicit `exclude` always wins.
+    pub fn with_config(
+        root: impl AsRef<Path>,
+        ignore_dirs: &[String],
+        include: &[String],
+        exclude: &[String],
+    ) -> Self {
         // Mirrors the upstream built-in ignore seed and root .gitignore merge from
         // `upstream extraction/index.ts:117-161,242-246` so
         // `.gitignore` negations can opt default-excluded dirs back in.
         let root = root.as_ref().to_path_buf();
-        let scan_ignore_dirs = codegraph_core::config::IndexingConfig::default().ignore_dirs;
-        let mut rules = scan_ignore_dirs
+        let mut rules = ignore_dirs
             .iter()
             .map(String::as_str)
-            .filter(|dir| !REINCLUDABLE_SCAN_DEFAULT_IGNORE_DIRS.contains(dir))
             .chain(WATCH_ONLY_DEFAULT_IGNORE_DIRS.iter().copied())
             .map(|dir| IgnoreRule {
                 pattern: format!("{dir}/"),
@@ -83,19 +83,9 @@ impl WatchPolicy {
                 negated: false,
             },
         ]);
-        // The hard scan defaults, watch-only defaults, and egg/cmake/bazel rules
-        // are the "built-in skip" set that `include` must NEVER re-watch. Godot's
-        // configurable defaults are appended after this boundary because the scan
-        // permits dropping them from `indexing.ignore_dirs`.
+        // The configured scan ignores, watch-only defaults, and egg/cmake/bazel
+        // rules are structural skips that `include` must NEVER re-watch.
         let builtin_rule_count = rules.len();
-        rules.extend(
-            REINCLUDABLE_SCAN_DEFAULT_IGNORE_DIRS
-                .iter()
-                .map(|dir| IgnoreRule {
-                    pattern: format!("{dir}/"),
-                    negated: false,
-                }),
-        );
         rules.extend(read_gitignore_rules(&root));
         Self {
             root,
@@ -542,26 +532,42 @@ mod tests {
     }
 
     #[test]
-    fn with_config_include_reincludes_addons_default_ignore() {
-        // Given: no `.gitignore`, and a first-party addon explicitly included by config.
+    fn with_config_include_does_not_reinclude_configured_ignore_dir() {
+        // Given: no `.gitignore`, the default ignored dirs, and a first-party addon
+        // explicitly included by config.
         let dir = crate::sync::tests::TestDir::new("watch-policy-addons-include");
         assert!(!dir.path().join(".gitignore").exists());
-        let default_policy = WatchPolicy::new(dir.path());
+        let ignore_dirs = codegraph_core::config::IndexingConfig::default().ignore_dirs;
         let include = ["addons/first_party/**".to_string()];
-        let included = WatchPolicy::with_config(dir.path(), &include, &[]);
-        // Excludes use the shared matcher, where `dir/` covers its subtree;
-        // unlike the include-only helper, that matcher does not expand `dir/**`.
-        let excluded =
-            WatchPolicy::with_config(dir.path(), &include, &["addons/first_party/".to_string()]);
+        let included = WatchPolicy::with_config(dir.path(), &ignore_dirs, &include, &[]);
 
-        // When/Then: the default is ignored, include opts in only its subtree,
-        // and an explicit exclude still wins over that include.
-        assert!(!default_policy.should_watch_dir("addons"));
-        assert!(included.should_watch_dir("addons"));
-        assert!(included.should_watch_dir("addons/first_party"));
-        assert!(included.should_handle_file("addons/first_party/tool.gd"));
+        // When/Then: configured ignored dirs are structural scan skips, so include
+        // cannot resurface the directory or any source file below it.
+        assert!(!included.should_watch_dir("addons"));
+        assert!(!included.should_watch_dir("addons/first_party"));
+        assert!(!included.should_handle_file("addons/first_party/tool.gd"));
         assert!(!included.should_handle_file("addons/vendor_plugin/plugin.gd"));
-        assert!(!excluded.should_handle_file("addons/first_party/tool.gd"));
+    }
+
+    #[test]
+    fn configured_ignore_dirs_override_reincludes_addons() {
+        // Given: the project drops `addons` from its configured ignore dirs while
+        // retaining `.godot`, mirroring the scan-side override contract.
+        let dir = crate::sync::tests::TestDir::new("watch-policy-addons-override");
+        assert!(!dir.path().join(".gitignore").exists());
+        let mut ignore_dirs = codegraph_core::config::IndexingConfig::default().ignore_dirs;
+        ignore_dirs.retain(|entry| entry != "addons");
+
+        // When: the watcher builds its policy from that project's configured list.
+        let policy = WatchPolicy::with_config(dir.path(), &ignore_dirs, &[], &[]);
+
+        // Then: first-party addons are watched, while the retained Godot cache skip
+        // remains structurally ignored.
+        assert!(policy.should_watch_dir("addons"));
+        assert!(policy.should_watch_dir("addons/first_party"));
+        assert!(policy.should_handle_file("addons/first_party/tool.gd"));
+        assert!(!policy.should_watch_dir(".godot"));
+        assert!(!policy.should_handle_file(".godot/cache_junk.gd"));
     }
 
     #[test]
@@ -744,8 +750,10 @@ mod tests {
         // exclude still wins.
         let dir = crate::sync::tests::TestDir::new("watch-policy-include");
         fs::write(dir.path().join(".gitignore"), "Tools/\nLocal/\n").unwrap();
+        let ignore_dirs = codegraph_core::config::IndexingConfig::default().ignore_dirs;
         let policy = WatchPolicy::with_config(
             dir.path(),
+            &ignore_dirs,
             &["Tools/".to_string(), "Local/ts/app.ts".to_string()],
             &[],
         );
@@ -760,23 +768,33 @@ mod tests {
         assert!(policy.should_handle_file("Local/ts/app.ts"));
         assert!(!policy.should_handle_file("Local/ts/other.ts"));
         // A built-in skip is NEVER re-watched, even if named in include.
-        let builtin = WatchPolicy::with_config(dir.path(), &["node_modules/".to_string()], &[]);
+        let builtin = WatchPolicy::with_config(
+            dir.path(),
+            &ignore_dirs,
+            &["node_modules/".to_string()],
+            &[],
+        );
         assert!(!builtin.should_watch_dir("node_modules"));
         assert!(!builtin.should_handle_file("node_modules/pkg/index.ts"));
         // An explicit exclude wins over include.
-        let excluded =
-            WatchPolicy::with_config(dir.path(), &["Tools/".to_string()], &["Tools/".to_string()]);
+        let excluded = WatchPolicy::with_config(
+            dir.path(),
+            &ignore_dirs,
+            &["Tools/".to_string()],
+            &["Tools/".to_string()],
+        );
         assert!(!excluded.should_watch_dir("Tools"));
         assert!(!excluded.should_handle_file("Tools/helper.ts"));
     }
 
     #[test]
     fn empty_include_leaves_policy_byte_identical() {
-        // #1063: WatchPolicy::new == with_config(root, &[], &[]); an empty include
-        // must not change any watch/handle decision vs the pre-#1063 policy.
+        // #1063: WatchPolicy::new equals with_config using the default ignore dirs
+        // and empty include/exclude; an empty include changes no policy decision.
         let dir = crate::sync::tests::TestDir::new("watch-policy-include-empty");
         fs::write(dir.path().join(".gitignore"), "vendor/\n").unwrap();
-        let policy = WatchPolicy::with_config(dir.path(), &[], &[]);
+        let ignore_dirs = codegraph_core::config::IndexingConfig::default().ignore_dirs;
+        let policy = WatchPolicy::with_config(dir.path(), &ignore_dirs, &[], &[]);
         assert!(!policy.should_watch_dir("vendor"));
         assert!(!policy.should_handle_file("vendor/dep.ts"));
         assert!(!policy.should_watch_dir("node_modules"));

@@ -66,7 +66,7 @@ fn scan_and_watch_agree_on_include_file_verdicts() {
             ..ExtractOptions::default()
         };
         let scanned = scan_project(&project, &options).expect("scan");
-        let policy = WatchPolicy::with_config(&project, &include, &[]);
+        let policy = WatchPolicy::with_config(&project, &options.ignore_dirs, &include, &[]);
 
         for file in candidate_files {
             let in_scan = scanned.iter().any(|f| f == file);
@@ -99,7 +99,7 @@ fn gen_glob_indexes_and_watches_gitignored_file() {
         "gen* must index gen/helper.ts: {scanned:?}"
     );
 
-    let policy = WatchPolicy::with_config(&project, &include, &[]);
+    let policy = WatchPolicy::with_config(&project, &options.ignore_dirs, &include, &[]);
     assert!(
         policy.should_handle_file("gen/helper.ts"),
         "gen* must watch gen/helper.ts (parity with scan)"
