@@ -73,6 +73,47 @@ fn lock_bytes(paths: &IndexPaths) -> Vec<u8> {
     std::fs::read(paths.permanent_lock()).expect("read permanent lock bytes")
 }
 
+/// Windows `ERROR_LOCK_VIOLATION`.
+///
+/// A byte-range lock taken through `File::try_lock` is ADVISORY on Unix, so an
+/// unrelated read of the locked file always succeeds there. On Windows the same
+/// lock is MANDATORY: a read overlapping an EXCLUSIVELY locked range is refused
+/// with this code, while a SHARED lock still permits reads and only denies
+/// writes.
+const ERROR_LOCK_VIOLATION: i32 = 33;
+
+/// Assert the permanent lock still carries `expected` while a lease may be live
+/// over it.
+///
+/// When the content is readable this is an exact byte comparison. When Windows
+/// refuses the read because the range is exclusively locked, the content cannot
+/// be observed at all, so this asserts the strongest thing that remains
+/// observable: the LENGTH, which `metadata` reports without taking the byte
+/// range. That is precisely the observation that refutes the failure mode these
+/// fixtures guard — an acquisition path truncating or rewriting the lock, which
+/// cannot preserve `expected.len()`. Each caller additionally re-asserts exact
+/// bytes through [`lock_bytes`] once the holder is released and no lock remains,
+/// so byte-exactness is still proven on every platform.
+fn assert_lock_bytes_preserved(paths: &IndexPaths, expected: &[u8]) {
+    let path = paths.permanent_lock();
+    match std::fs::read(&path) {
+        Ok(bytes) => assert_eq!(bytes, expected, "permanent lock bytes changed"),
+        Err(error) if cfg!(windows) && error.raw_os_error() == Some(ERROR_LOCK_VIOLATION) => {
+            let observed = std::fs::metadata(&path)
+                .unwrap_or_else(|error| {
+                    panic!("inspect exclusively locked permanent lock: {error}")
+                })
+                .len();
+            let expected_len = u64::try_from(expected.len()).expect("lock length fits u64");
+            assert_eq!(
+                observed, expected_len,
+                "permanent lock length changed while exclusively locked"
+            );
+        }
+        Err(error) => panic!("read permanent lock bytes: {error}"),
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn static_symlink_lock_is_rejected_without_using_the_external_target_as_authority() {
@@ -248,8 +289,9 @@ fn shared_processes_coexist_but_shared_blocks_exclusive() {
         run_probe(project.path(), "exclusive", SHORT_DEADLINE),
         "TIMED_OUT"
     );
-    assert_eq!(lock_bytes(&paths), LOCK_BYTES);
+    assert_lock_bytes_preserved(&paths, LOCK_BYTES);
     holder.release();
+    assert_eq!(lock_bytes(&paths), LOCK_BYTES);
 }
 
 #[test]
@@ -267,14 +309,16 @@ fn exclusive_process_blocks_shared_and_exclusive() {
         run_probe(project.path(), "exclusive", SHORT_DEADLINE),
         "TIMED_OUT"
     );
-    assert_eq!(lock_bytes(&paths), LOCK_BYTES);
+    assert_lock_bytes_preserved(&paths, LOCK_BYTES);
     holder.release();
+    assert_eq!(lock_bytes(&paths), LOCK_BYTES);
 
     assert_eq!(run_probe(project.path(), "shared", CHILD_WAIT), "ACQUIRED");
     assert_eq!(
         run_probe(project.path(), "exclusive", CHILD_WAIT),
         "ACQUIRED"
     );
+    assert_eq!(lock_bytes(&paths), LOCK_BYTES);
 }
 
 #[test]
@@ -288,7 +332,7 @@ fn timeout_and_post_contention_cancellation_preserve_lock_bytes() {
         IndexLease::acquire_shared_existing(&paths, deadline_after(SHORT_DEADLINE), || false)
             .expect_err("exclusive holder must force bounded timeout");
     assert!(matches!(timeout, IndexLeaseError::TimedOut { .. }));
-    assert_eq!(lock_bytes(&paths), LOCK_BYTES);
+    assert_lock_bytes_preserved(&paths, LOCK_BYTES);
 
     let checks = Cell::new(0_u8);
     let cancelled = IndexLease::acquire_shared_existing(&paths, deadline_after(CHILD_WAIT), || {
@@ -302,8 +346,9 @@ fn timeout_and_post_contention_cancellation_preserve_lock_bytes() {
         checks.get() >= 3,
         "the cancellation check must run after a busy try_lock"
     );
-    assert_eq!(lock_bytes(&paths), LOCK_BYTES);
+    assert_lock_bytes_preserved(&paths, LOCK_BYTES);
     holder.release();
+    assert_eq!(lock_bytes(&paths), LOCK_BYTES);
 }
 
 #[test]
