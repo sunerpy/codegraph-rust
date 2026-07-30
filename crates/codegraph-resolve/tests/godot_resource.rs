@@ -61,9 +61,59 @@ duration = 5.0
         .first()
         .expect("a resource marker node must exist");
     assert_eq!(marker.kind, NodeKind::Constant, "resource-marker kind");
+    assert_eq!(marker.name, "Buff", "script_class must name the marker");
     assert_eq!(
         script_ref.from_node_id, marker.id,
         "script ref must originate from the resource marker node"
+    );
+}
+
+#[test]
+fn resource_script_class_before_type_still_names_marker() {
+    // Given a `.tres` whose header lists script_class before type and a reference
+    // that causes its marker node to be created,
+    let content = "\
+[gd_resource script_class=\"Buff\" type=\"Resource\" load_steps=2 format=3]
+
+[ext_resource type=\"Script\" path=\"res://buff.gd\" id=\"1\"]
+
+[resource]
+script = ExtResource(\"1\")
+";
+    // When extracting,
+    let result = extract("data/reverse_order_buff.tres", content);
+
+    // Then script_class still wins regardless of its position in the header.
+    let marker = result
+        .nodes
+        .first()
+        .expect("a resource marker node must exist");
+    assert_eq!(marker.name, "Buff", "script_class must name the marker");
+}
+
+#[test]
+fn resource_without_script_class_uses_resource_type_for_marker_name() {
+    // Given a `.tres` with a resource type but no script_class and a reference
+    // that causes its marker node to be created,
+    let content = "\
+[gd_resource type=\"StatusEffect\" load_steps=2 format=3]
+
+[ext_resource type=\"Script\" path=\"res://status_effect.gd\" id=\"1\"]
+
+[resource]
+script = ExtResource(\"1\")
+";
+    // When extracting,
+    let result = extract("data/status_effect.tres", content);
+
+    // Then the existing type-derived fallback still names the marker.
+    let marker = result
+        .nodes
+        .first()
+        .expect("a resource marker node must exist");
+    assert_eq!(
+        marker.name, "StatusEffect",
+        "type must name the marker when script_class is absent"
     );
 }
 

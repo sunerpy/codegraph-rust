@@ -68,15 +68,16 @@ see [Honesty signals](#honesty-signals) below).
 
 ### `.tres` — text resources
 
-Each `.tres` file emits a single resource marker node (typed from the
-`[gd_resource type="..."]` header) and `References` edges for every
-`ExtResource(…)` it references:
+Each `.tres` file with an external reference emits a single resource marker node,
+named from a non-empty `script_class` first, then `type`, and finally the default
+`"resource"` (regardless of header attribute order), plus `References` edges for
+every `ExtResource(…)` it references:
 
-| Extracted item                  | Graph representation                                        |
-| ------------------------------- | ----------------------------------------------------------- |
-| `[gd_resource type="T"]`        | One `Constant` marker node named after the resource type    |
-| `script = ExtResource(…)`       | `References` edge: marker → repo-relative `.gd` path        |
-| Any property `= ExtResource(…)` | `References` edge: marker → referenced `.tres`/`.tscn` path |
+| Extracted item                            | Graph representation                                                  |
+| ----------------------------------------- | --------------------------------------------------------------------- |
+| `[gd_resource script_class="C" type="T"]` | One `Constant` marker named `C`; falls back to `T`, then `"resource"` |
+| `script = ExtResource(…)`                 | `References` edge: marker → repo-relative `.gd` path                  |
+| Any property `= ExtResource(…)`           | `References` edge: marker → referenced `.tres`/`.tscn` path           |
 
 A self-contained `.tres` with no external references produces no extra nodes and
 no edges — just the file node from ingestion.
