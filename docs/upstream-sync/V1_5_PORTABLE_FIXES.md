@@ -9902,3 +9902,110 @@ in this run and passed, so those verdicts are measured, not merely argued.
 
 **Windows was NOT validated locally** for this round-10 fix; only the next
 CodeBuild run can confirm it.
+
+## PR #173 CI round 9 — a temp-directory name that is unique on Linux and collidable on Windows (2026-07-31)
+
+### Status of the evidence, stated first
+
+This round is the ONE fix in this ledger that was **derived rather than observed**.
+No CodeBuild log line has yet shown `ERROR_ALREADY_EXISTS` for a codegraph temp
+directory. The round-8/10 lease-lock fix (`8389c9e`) had not been validated on
+Windows either when this round was written, so a single CodeBuild run now carries
+both. Nothing below claims Windows validation that has not happened; the gate
+table at the end records what actually ran.
+
+### The mechanism — clock RESOLUTION, not clock skew
+
+Several test helpers build a temp-directory name out of `std::process::id()` plus
+`SystemTime::now().duration_since(UNIX_EPOCH).as_nanos()`. On Linux that is
+effectively collision-proof: `clock_gettime(CLOCK_REALTIME)` is served from the
+vDSO with true nanosecond resolution, so two calls microseconds apart differ.
+
+On Windows the same call reads the system time, which is only advanced at the
+system timer tick — nominally 15.625 ms, and NOT made finer by asking for
+nanoseconds. `as_nanos()` therefore returns the SAME value for every call inside
+one tick. Two `#[test]` functions in ONE test binary run as threads of ONE
+process, so `process::id()` is identical too. Both halves of the name can be
+equal, and:
+
+- with `create_dir`, the second caller fails outright with `ERROR_ALREADY_EXISTS`;
+- with `create_dir_all`, nothing fails — the two tests silently SHARE a directory
+  and clobber each other's fixture files, which is the worse outcome because it
+  surfaces as an unrelated assertion failure.
+
+A monotonic per-process `AtomicU64` serial removes the failure mode by
+construction: `fetch_add` returns a distinct value to every caller in the process
+regardless of what the clock does. The timestamp is retained — it still separates
+successive RUNS of the same binary — but it is no longer what carries uniqueness.
+
+### The audit, and the predicate that makes it decidable
+
+The naive predicate ("name built from pid + a timestamp") flags 186 `format!`
+sites and is useless. The decidable predicate is:
+
+> Can the SAME formatted name be produced TWICE inside one process?
+
+That is true only when the builder has no per-callsite discriminator AND is
+reached more than once. It is false for a one-off name inside a single `#[test]`
+(that body executes exactly once per process) and false for a helper whose name
+embeds a `{label}` / `{tag}` / `{test_name}` that differs per caller.
+
+Applying it: 52 of the 186 sites carry no discriminator, and 46 of those 52 sit
+directly inside a single `#[test]` body, so they cannot collide with themselves.
+The `{label}`-bearing helpers were checked mechanically for the remaining hole —
+the same label passed twice — and **no helper in the workspace is ever called
+twice with the same label**, so none of them collides either.
+
+That leaves six sites, all of them fixed here:
+
+| File:line                                           | How the name is built                     | Reached from                        | Two tests collide on Windows?                                                        | Verdict                   |
+| --------------------------------------------------- | ----------------------------------------- | ----------------------------------- | ------------------------------------------------------------------------------------ | ------------------------- |
+| `codegraph-store/tests/schema_parity.rs:194`        | `pid` + `nanos`, `create_dir`             | `TestDir::new`, **6** `#[test]` fns | **YES** — second `create_dir` gets `ERROR_ALREADY_EXISTS`                            | **FIXED** (serial added)  |
+| `codegraph-store/tests/bulk_index_pragmas.rs:176`   | `pid` + `nanos`, `create_dir`             | `TestDir::new`, **7** `#[test]` fns | **YES** — same shape, same failure                                                   | **FIXED** (serial added)  |
+| `codegraph-cli/src/installer/shared.rs:1019`        | `pid` + `nanos`, `create_dir_all`         | `tmp_path`, **10** call sites       | **YES, silently** — dir is shared and `opencode.json` / `conf.json` are reused names | **FIXED** (serial added)  |
+| `codegraph-cli/src/installer/registry.rs:144`       | `pid` + `nanos`, dir created by installer | `temp_ctx`, **6** `#[test]` fns     | **YES, silently** — two tests get the same `home`/`cwd`                              | **FIXED** (serial added)  |
+| `codegraph-cli/src/installer/targets/claude.rs:405` | `pid` + `nanos`, dir created by installer | `temp_ctx`, **1** `#[test]` fn      | **not today** — one caller, so one execution                                         | hardened (helper shape)   |
+| `codegraph-store/src/connection.rs:1503`            | `pid` + `nanos`, `create_dir`             | one `#[test]` body, unique prefix   | **not today** — sibling builders all carry a `{label}`                               | hardened (named in brief) |
+
+The last two rows are stated as hardening, not as bug fixes, because the honest
+answer to the predicate is "no". They are cheap, they make the module uniform,
+and they stop the next caller added to either helper from reintroducing the
+class. Nothing else in the workspace was touched: adding serials to the 46
+single-execution sites would be churn with no failure mode behind it.
+
+### Why "it is only a test helper" was not assumed
+
+Two of the nine earlier layers in this ledger were PRODUCTION defects found under
+exactly that framing (`FlushFileBuffers` on a directory handle, `b71a5f1`; the
+named-pipe half-close that hung `run_proxy`, `47ee705`). Each of the six sites
+here was therefore checked for a production caller: all six are inside
+`#[cfg(test)]` modules or `tests/` targets, and `create_dir` / `create_dir_all`
+in production paths (`index_paths`, `rebuild`, `index_state_publisher`) either
+already carry a monotonic serial — `index_state_publisher::create_temp` uses
+`{serial:016x}` — or derive their names from the project identity rather than
+from a clock. No production name depends on clock resolution.
+
+### Round 9 — gate statuses, as the shell actually reported them
+
+| Command                                                      | Exit  | Result                                                         |
+| ------------------------------------------------------------ | ----- | -------------------------------------------------------------- |
+| `cargo test --locked -p codegraph-store`                     | **0** | **191 passed, 0 failed, 0 ignored** on Linux                   |
+| `cargo clippy --locked --workspace --all-targets -Dwarnings` | **0** | zero warnings                                                  |
+| `make ci CARGO='cargo --locked'` (1st)                       | **0** | `✅ All CI checks passed!` — **3021 passed, 0 failed** in 78 s |
+| `make ci CARGO='cargo --locked'` (2nd)                       | **0** | `✅ All CI checks passed!` — **3021 passed, 0 failed** in 59 s |
+| `bash scripts/check-workspace-versions.sh`                   | **0** | all crates on `0.40.4`                                         |
+| `bash scripts/check-ci-gate.sh`                              | **0** | 16 truth-table cases; only all-success exits 0                 |
+| `sha256sum Cargo.lock`                                       | **0** | `750ee84b…83de9bb1` — unchanged                                |
+| `git diff --stat cad3577..HEAD -- reference/golden/`         | **0** | **empty** — no golden byte moved                               |
+
+Ordering, stated so the exits above are not overread: both `make ci` runs executed
+on the code tree. The only change made afterwards was this table plus `make fmt`
+on it, re-verified by a third `make ci` recorded in the follow-up commit alongside
+the CodeBuild result. `make ci` leaves untracked `reference/golden/*/colby.db-{wal,shm}`
+sidecars behind (the equivalence oracle opens each golden DB); they are not
+gitignored and were removed before committing.
+
+**Windows is NOT validated locally** for this round; cross-compilation is
+unavailable in this environment (`cargo xwin` needs `clang-cl`, which cannot be
+installed here). Only a CodeBuild run on a real Windows host can confirm it, and
+that result is recorded in the follow-up commit.
