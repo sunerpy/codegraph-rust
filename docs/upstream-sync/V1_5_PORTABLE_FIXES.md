@@ -9960,8 +9960,8 @@ That leaves six sites, all of them fixed here:
 
 | File:line                                           | How the name is built                     | Reached from                        | Two tests collide on Windows?                                                        | Verdict                   |
 | --------------------------------------------------- | ----------------------------------------- | ----------------------------------- | ------------------------------------------------------------------------------------ | ------------------------- |
-| `codegraph-store/tests/schema_parity.rs:194`        | `pid` + `nanos`, `create_dir`             | `TestDir::new`, **6** `#[test]` fns | **YES** — second `create_dir` gets `ERROR_ALREADY_EXISTS`                            | **FIXED** (serial added)  |
-| `codegraph-store/tests/bulk_index_pragmas.rs:176`   | `pid` + `nanos`, `create_dir`             | `TestDir::new`, **7** `#[test]` fns | **YES** — same shape, same failure                                                   | **FIXED** (serial added)  |
+| `codegraph-store/tests/schema_parity.rs:194`        | `pid` + `nanos`, `create_dir`             | `TestDir::new`, **4** `#[test]` fns | **YES** — second `create_dir` gets `ERROR_ALREADY_EXISTS`                            | **FIXED** (serial added)  |
+| `codegraph-store/tests/bulk_index_pragmas.rs:176`   | `pid` + `nanos`, `create_dir`             | `TestDir::new`, **6** `#[test]` fns | **YES** — same shape, same failure                                                   | **FIXED** (serial added)  |
 | `codegraph-cli/src/installer/shared.rs:1019`        | `pid` + `nanos`, `create_dir_all`         | `tmp_path`, **10** call sites       | **YES, silently** — dir is shared and `opencode.json` / `conf.json` are reused names | **FIXED** (serial added)  |
 | `codegraph-cli/src/installer/registry.rs:144`       | `pid` + `nanos`, dir created by installer | `temp_ctx`, **6** `#[test]` fns     | **YES, silently** — two tests get the same `home`/`cwd`                              | **FIXED** (serial added)  |
 | `codegraph-cli/src/installer/targets/claude.rs:405` | `pid` + `nanos`, dir created by installer | `temp_ctx`, **1** `#[test]` fn      | **not today** — one caller, so one execution                                         | hardened (helper shape)   |
@@ -10009,3 +10009,62 @@ gitignored and were removed before committing.
 unavailable in this environment (`cargo xwin` needs `clang-cl`, which cannot be
 installed here). Only a CodeBuild run on a real Windows host can confirm it, and
 that result is recorded in the follow-up commit.
+
+### CodeBuild verification on a REAL Windows host — rounds 8/10 AND 9 are CONFIRMED
+
+Build `codegraph-rs-windows:d4d9c258-edfc-41c0-b2e5-57489afa6444`, resolved source
+version `ff9bf9f735a8cd062739eb87fa2fbef14cdfd320` — the exact tip pushed for this
+round — `buildStatus: SUCCEEDED`, 00:25:05 → 00:53:28 (+08:00), 28 minutes.
+
+Pipeline `codegraph-rust-ci` execution `ffad15d6-3959-4e79-85d6-7d21a7707faa`
+reached `Succeeded` after 28 `InProgress` polls. Every action succeeded:
+
+| Stage  | Action     | Status        |
+| ------ | ---------- | ------------- |
+| Source | CodeCommit | **Succeeded** |
+| Build  | Linux      | **Succeeded** |
+| Build  | Windows    | **Succeeded** |
+
+The COMPLETE list of `... FAILED` lines from the 4372-line Windows log is **EMPTY**
+— `grep -c FAILED` returned **0**. Aggregating all 125 `test result:` lines:
+**2927 passed, 0 failed, 0 ignored**, and not one of the 125 lines is anything
+other than `test result: ok`. This is the first Windows-green run on this branch;
+the previous nine rounds each ended with at least one `FAILED`.
+
+Both open rounds are settled by this single run:
+
+- **Round 8/10 (`8389c9e`) CONFIRMED.** The three fixtures that failed with
+  `ERROR_LOCK_VIOLATION` now pass: `timeout_and_post_contention_cancellation_preserve_lock_bytes
+... ok`, `exclusive_process_blocks_shared_and_exclusive ... ok`, and the
+  control `shared_processes_coexist_but_shared_blocks_exclusive ... ok`.
+  `tests\index_lease.rs` reports **11 passed / 0 failed** (13 on Linux; two are
+  `#[cfg(unix)]`).
+- **Round 9 (this round) CONFIRMED not to regress.** Every target holding a fixed
+  helper is green on Windows: `tests\schema_parity.rs` **4/0**,
+  `tests\bulk_index_pragmas.rs` **6/0**, `tests\installer.rs` **8/0**,
+  `tests\installer_jsonc.rs` **14/0**.
+
+An honest limit on what round 9 proves: because the collision needs two threads
+to land inside the same 15.6 ms tick, a green run does not prove the OLD names
+would have failed on this host — the defect was latent, and derived from the clock
+contract rather than observed in a log. What this run does establish is that the
+serial neither breaks nor perturbs anything, and that no name-collision failure
+remains in the workspace. The class is now closed by construction rather than by
+luck of scheduling.
+
+### Round 9 follow-up — gate statuses after the ledger update
+
+| Command                                              | Exit  | Result                                                          |
+| ---------------------------------------------------- | ----- | --------------------------------------------------------------- |
+| `make ci CARGO='cargo --locked'` (3rd, post-commit)  | **0** | `✅ All CI checks passed!` — **3021 passed, 0 failed** in 58 s  |
+| `GIT_MASTER=1 git push` (origin)                     | **0** | pre-push hook `✅ all checks passed`; `cad3577..ff9bf9f`        |
+| `GIT_MASTER=1 git push cc`                           | **0** | pre-push hook `✅ all checks passed`; `cad3577..ff9bf9f`        |
+| `aws codepipeline start-pipeline-execution`          | **0** | `ffad15d6-3959-4e79-85d6-7d21a7707faa`                          |
+| `aws codepipeline get-pipeline-execution` (29 polls) | **0** | `InProgress` ×28, then **`Succeeded`**                          |
+| `aws codepipeline list-action-executions`            | **0** | Source/Linux/**Windows** all `Succeeded`                        |
+| `aws codebuild batch-get-builds`                     | **0** | `SUCCEEDED` at `ff9bf9f7…`                                      |
+| `aws logs tail /aws/codebuild/codegraph-rs-windows`  | **0** | 4372 lines; **2927 passed / 0 failed**; **zero** `FAILED` lines |
+
+With Windows green, `CI Success` should now conclude for PR #173, whose other
+gates (`Test`, `Coverage`, `Security Audit`, `codecov/patch`, `codecov/project`)
+were already passing.
