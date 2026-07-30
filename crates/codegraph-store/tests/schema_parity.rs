@@ -1,8 +1,19 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use codegraph_store::Store;
 
 const GOLDEN_SCHEMA: &str = include_str!("../../../reference/golden/colby.schema.sql");
+
+/// Monotonic per-process serial that makes every [`TestDir`] name unique.
+///
+/// A wall-clock timestamp alone is NOT sufficient. `SystemTime::now()` has
+/// nanosecond resolution on Linux but is only updated at the system timer tick on
+/// Windows (~15.6 ms), so two of this target's tests — run concurrently in
+/// threads of ONE process, hence one pid — can observe the SAME `as_nanos()`
+/// value and derive the same directory name, making the second `create_dir` fail
+/// with `ERROR_ALREADY_EXISTS`. The serial cannot collide by construction.
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 #[test]
 fn fresh_database_schema_matches_upstream_golden() {
@@ -181,8 +192,9 @@ struct TestDir {
 impl TestDir {
     fn new() -> Self {
         let name = format!(
-            "codegraph-store-schema-parity-{}-{}",
+            "codegraph-store-schema-parity-{}-{}-{}",
             std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

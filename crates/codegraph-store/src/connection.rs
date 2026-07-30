@@ -1174,7 +1174,19 @@ fn configure_connection_for_rebuild(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    /// Monotonic per-process serial that keeps every temp name in this module unique.
+    ///
+    /// A wall-clock timestamp alone is NOT sufficient. `SystemTime::now()` has
+    /// nanosecond resolution on Linux but is only updated at the system timer tick
+    /// on Windows (~15.6 ms), so two tests running concurrently in threads of ONE
+    /// process, hence one pid, can observe the SAME `as_nanos()` value. Every
+    /// builder here already carries a per-callsite label EXCEPT the late-lock base
+    /// below, which the serial makes unique by construction.
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
     #[derive(Debug, PartialEq, Eq)]
     enum SnapshotKind {
@@ -1501,8 +1513,9 @@ mod tests {
         }
 
         let base = std::env::temp_dir().join(format!(
-            "codegraph-conn-late-lock-replacement-{}-{}",
+            "codegraph-conn-late-lock-replacement-{}-{}-{}",
             std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
