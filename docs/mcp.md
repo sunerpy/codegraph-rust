@@ -104,10 +104,56 @@ open: the `command: "codegraph"` runs locally, cannot reach the remote
 the server on the remote host — is not yet implemented in Zed (tracked in Zed's
 GitHub issues; status as of mid-2026).
 
-**Working workaround.** Make Zed's local `command` be `ssh` into the remote host
-and run codegraph there. SSH proxies stdin/stdout transparently, so the MCP
-JSON-RPC stream flows through the tunnel without any change to the codegraph
-binary itself.
+**Recommended fix — streamable-HTTP over a forwarded port.** Run the MCP server
+on the remote host with the HTTP transport, forward its port through SSH, and give
+Zed a `url` instead of a `command`. Zed then talks to a local port that SSH pipes
+to the remote server, so the process reading the index runs where the index lives.
+
+On the **remote** host:
+
+```bash
+codegraph serve --http --detach --path /abs/path/to/project
+```
+
+`--http` binds `127.0.0.1:8111` by default (override with
+`--http-addr <host>:<port>`); `--detach` runs it in the background and prints its
+pid and log path. `codegraph http list` shows running servers and
+`codegraph http stop 127.0.0.1:8111` terminates one. With `--path`, the project
+must already be indexed — run `codegraph init /abs/path/to/project` first.
+
+Forward the port from your **local** machine:
+
+```bash
+ssh -N -L 8111:127.0.0.1:8111 <your-ssh-host-alias>
+```
+
+Then in `.zed/settings.json` on the **local** machine:
+
+```jsonc
+{
+  "context_servers": {
+    "codegraph": {
+      "url": "http://localhost:8111/mcp",
+    },
+  },
+}
+```
+
+**Why forward rather than expose the port.** The default bind is loopback-only,
+so nothing is reachable from the network — the SSH tunnel is what makes the remote
+server visible, and it makes the endpoint genuinely _local_ from Zed's point of
+view. That matters because MCP hosts commonly permit plain `http` only for
+localhost and require `https` for anything remote (Kiro enforces exactly this).
+Forwarding keeps you on the localhost side of that rule without terminating TLS.
+
+`codegraph install --target=zed` writes this HTTP entry into your `settings.json`
+as a `//`-commented alternative next to the active stdio entry, marked RECOMMENDED
+for remote — uncomment it rather than typing it out.
+
+**Fallback — SSH stdio bridge.** If you cannot forward a port, make Zed's local
+`command` be `ssh` into the remote host and run codegraph there. SSH proxies
+stdin/stdout transparently, so the MCP JSON-RPC stream flows through the tunnel
+without any change to the codegraph binary itself.
 
 In your project's `.zed/settings.json` on the **local** machine:
 
@@ -145,11 +191,12 @@ In your project's `.zed/settings.json` on the **local** machine:
   explicitly, so resolution never depends on the remote cwd or the MCP roots
   handshake over the tunnel.
 
-**Caveats.** Each Zed window opens a fresh SSH session (the shared daemon is not
-reused across them), so startup is slightly slower than a local connection. The
+**Bridge caveats.** Each Zed window opens a fresh SSH session (the shared daemon is
+not reused across them), so startup is slightly slower than a local connection. The
 remote codegraph daemon does still run for the duration of that session and serves
-queries normally. This is a bridge solution until Zed ships native remote MCP
-support.
+queries normally. The HTTP transport avoids this — one detached server handles every
+window — which is why it is the recommended path. Both are stopgaps until Zed ships
+native remote MCP support.
 
 ---
 
