@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.41.0](https://github.com/sunerpy/codegraph-rust/compare/v0.40.4...v0.41.0) (2026-07-30)
+
+
+### Features
+
+* sync portable fixes from upstream colby v1.5.0 ([#173](https://github.com/sunerpy/codegraph-rust/issues/173)) ([5d795a5](https://github.com/sunerpy/codegraph-rust/commit/5d795a5729c98da0728ecfcf85c02523397297c9))
+
 ## [0.40.4](https://github.com/sunerpy/codegraph-rust/compare/v0.40.3...v0.40.4) (2026-07-24)
 
 
