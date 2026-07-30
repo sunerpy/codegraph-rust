@@ -9645,3 +9645,147 @@ formatted ledger. Each command run separately, never joined with `&&`.
 another session) and after each CI run showed only the intended files, with no
 untracked `reference/golden/*/colby.db-{wal,shm}` sidecars. **Windows was NOT
 validated locally** — only the CodeBuild run above can and does confirm it.
+
+## PR #173 CI round 8 — snapshot oracles read every file, and a Windows lease lock refuses that read (2026-07-30)
+
+### The failure and where CI reported it
+
+GitHub Actions run **30468205627**, `Windows` job, `cargo test --workspace`,
+`-p codegraph-store --lib`:
+
+```
+test connection::tests::current_writer_revalidates_lock_at_the_last_pre_open_checkpoint ... FAILED
+panicked at crates\codegraph-store\src\connection.rs:1218:25:
+snapshot read \\?\C:\…\.codegraph-v2\displaced-at-write-open.lock:
+  The process cannot access the file because another process has locked a portion of the file. (os error 33)
+test result: FAILED. 93 passed; 1 failed
+```
+
+The backtrace named `connection::tests::snapshot_tree::walk::closure$4` — the
+`std::fs::read` in `snapshot_tree`'s `SnapshotKind::File(...)` arm.
+
+### Diagnosis — advisory on Unix, MANDATORY on Windows
+
+Confirmed against the code, not assumed. Three facts compose:
+
+1. **What holds the lock.** `IndexLease::acquire_exclusive_existing` opens
+   `index.lock` and takes a kernel lock through `file.try_lock()`
+   (`crates/codegraph-store/src/index_lease.rs:383`). The locked `File` lives in
+   `LeaseInner` behind an `Arc`, and only `LeaseInner::drop` unlocks it
+   (`index_lease.rs:56-63`). So the lock is live for the whole lease lifetime.
+2. **Renaming does not release it.** The test renames the still-leased lock
+   (`connection.rs:1506`):
+   `std::fs::rename(paths.permanent_lock(), &displaced)`. A byte-range lock is a
+   property of the open file DESCRIPTION, not of the name, so the file now called
+   `displaced-at-write-open.lock` remains locked by the live lease.
+3. **The read is only legal on Unix.** `std::fs::File::try_lock` maps to
+   `flock`/`fcntl` on unix, whose locks are **ADVISORY** — an unrelated `read`
+   of a locked file always succeeds. On Windows it maps to `LockFileEx`, whose
+   locks are **MANDATORY** over a byte range: any read overlapping the locked
+   range is refused with `ERROR_LOCK_VIOLATION` (os error 33). `snapshot_tree`
+   reads the full content of every regular file it walks, so it necessarily
+   overlaps.
+
+The failing assertion was therefore never reached. The oracle died before the
+property under test (`open_for_write` revalidating the exact held handle at the
+last pre-open checkpoint) could be evaluated.
+
+### Verdict: TEST-ORACLE defect, not a production defect
+
+Unlike rounds 5 and 7, nothing in the shipped binary is wrong here. Production
+never reads the permanent lock's CONTENT — the lock file is a pure lock token.
+Verified by grep: the only `fs::read` of `paths.permanent_lock()` anywhere in the
+workspace is `index_lease.rs:768`, inside `#[cfg(test)]`, and it reads a
+COMPETING entry that the test asserts was never locked. Every non-test reference
+to `permanent_lock()` uses it for `open`/metadata/lock operations only, never for
+a content read.
+
+### The fix — normalize the one content a locked EMPTY file can have
+
+The lock file is zero bytes. A zero-length file has exactly ONE possible content,
+and `symlink_metadata` is not byte-range-locked, so the length stays observable
+even while the lock is held. The snapshot can therefore record `File(vec![])`
+without reading, and that record is byte-exact.
+
+Each affected walker gains a `snapshot_file_bytes(path, len)` helper that
+tolerates exactly one otherwise-fatal case:
+
+```rust
+fn snapshot_file_bytes(path: &Path, len: u64) -> Vec<u8> {
+    match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error)
+            if cfg!(windows) && len == 0 && error.raw_os_error() == Some(ERROR_LOCK_VIOLATION) =>
+        {
+            Vec::new()
+        }
+        Err(error) => panic!("snapshot read {}: {error}", path.display()),
+    }
+}
+```
+
+Three guards, each load-bearing:
+
+- `cfg!(windows)` — on unix the locks are advisory, so this refusal is
+  IMPOSSIBLE there. Tolerating it on unix would hide a real fault.
+- `len == 0` — the only length whose content is knowable without reading. A
+  non-empty locked file has content that genuinely cannot be observed;
+  substituting anything for it would be a lie, so it still panics.
+- `raw_os_error() == Some(33)` — the specific `ERROR_LOCK_VIOLATION`, not a
+  blanket error swallow. `PermissionDenied`, `NotFound`, a sharing violation, or
+  an I/O error all still panic.
+
+Why this preserves the assertion, which is the whole point: the equality compares
+a snapshot taken INSIDE the `before_write_open` hook (lease live, lock held) with
+one taken AFTER `open_for_write_with` returned `Err` and consumed-and-dropped
+that lease (lock released). Reading would give `Err`/`Ok(vec![])` respectively —
+asymmetric. Normalizing to `vec![]` makes both sides observe the same value, so
+the assertion still proves "the rejection mutated nothing", and still detects
+creation, removal, and file⇄dir⇄symlink kind changes because the entry is
+recorded exactly as the regular file it is. Content changes of readable files —
+notably the FRESH `permanent_lock` written with `b"late replacement"`, which is
+NOT locked — are compared by content, unchanged.
+
+None of `#[ignore]`, deleting the test, `#[cfg(unix)]`-gating it, sleeping,
+retrying, or releasing the lease early was used; the last would have destroyed
+the property under test.
+
+### Audit — every walk-and-read helper, checked for a live lock
+
+`snapshot_tree`-shaped walkers are duplicated per test target, so the class had
+to be swept rather than fixed once. Method: for every file containing
+`read_dir`, locate the content read, then determine whether an exclusive lease
+(in-process or cross-process) can be live over a file inside the walked root at
+snapshot time.
+
+| File:line                                                                                                                                                                                                          | What it reads                                   | Live lock possible?                                                                                                                                                                                                            | Verdict                    |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------- |
+| `codegraph-store/src/connection.rs:1217`                                                                                                                                                                           | every regular file under the project root       | **YES** — `lease` live inside `before_write_open`, then dropped by the rejected open                                                                                                                                           | **FIXED** (proven failure) |
+| `codegraph-store/tests/store_state_gates.rs:268`                                                                                                                                                                   | every regular file under the project root       | **YES** — 12 sites snapshot with a live `acquire_exclusive_existing` lease; `:1112` also renames it aside                                                                                                                      | **FIXED**                  |
+| `codegraph-store/tests/index_state_publisher.rs:137`                                                                                                                                                               | every regular file under the project root       | **YES** — `:378` renames the still-leased lock, then snapshots twice with the lease BORROWED                                                                                                                                   | **FIXED**                  |
+| `codegraph-store/tests/writer_process_lifecycle.rs:266`                                                                                                                                                            | every namespace file, via a corroborated handle | **YES** — `:783`/`:798` snapshot `current_root()` while a HOLDER CHILD PROCESS holds the lease                                                                                                                                 | **FIXED**                  |
+| `codegraph-store/src/uninit.rs:387`                                                                                                                                                                                | every regular file under the project root       | **NO** — every `snapshot(...)` call sits AFTER its `drop(lease)` (`:715→:716`, `:731→:733`); `:490` walks only the legacy namespace, which has no lock                                                                         | unchanged                  |
+| `codegraph-store/tests/index_state.rs:560`                                                                                                                                                                         | every regular file under a temp tree            | **NO** — the classifier fixtures write a `b"lock trap"` byte string as a PLAIN file and never acquire a lease                                                                                                                  | unchanged                  |
+| `codegraph-cli/tests/lease_lifetime.rs:633`                                                                                                                                                                        | `codegraph.db` + `-wal` + `-shm` ONLY           | **NO** — the lease lock is on `index.lock`, which this never touches; the `LeaseHookEnv` barrier stops the writer AFTER the kernel lock but BEFORE `Store::open_for_write` opens SQLite, so no SQLite range lock exists either | unchanged                  |
+| `codegraph-resolve/src/workspace_packages.rs`, `codegraph-extract/src/engine.rs`, `codegraph-bench/src/runner.rs`, `codegraph-cli/src/installer/targets/qoder.rs`, `codegraph-daemon/src/{spawn,http_registry}.rs` | source files / manifests / registry JSON        | **NO** — none walks an index namespace; no lease is ever live over their inputs                                                                                                                                                | unchanged                  |
+
+Residual risk, stated honestly: the four FIXED walkers are the ones where a live
+lock is reachable TODAY. The `codegraph-cli` integration tests have never been
+reached on Windows (`cargo test --workspace` had not gotten that far until round
+7), so if a future fixture snapshots a namespace while holding a lease, it will
+hit the same wall. The pattern to copy is `snapshot_file_bytes`.
+
+### Round 8 — gate statuses, as the shell actually reported them
+
+Prose written FIRST, then `make fmt`, then the gates, so `fmt-check` sees the
+formatted ledger. Each command run separately, never joined with `&&`.
+
+| Command                                                  | Exit  | Result                                                                         |
+| -------------------------------------------------------- | ----- | ------------------------------------------------------------------------------ |
+| `cargo test --locked -p codegraph-store --lib`           | **0** | **100 passed, 0 failed**                                                       |
+| `cargo test --locked -p codegraph-store`                 | **0** | **191 passed, 0 failed** across 9 targets                                      |
+| `cargo clippy --locked -p codegraph-store --all-targets` | **0** | zero warnings                                                                  |
+| `bash scripts/check-workspace-versions.sh`               | **0** | workspace / `version.txt` / manifest all `0.40.4`                              |
+| `bash scripts/check-ci-gate.sh`                          | **0** | 16 truth-table cases; only all-success exits 0                                 |
+| `git diff --stat 478575d..HEAD -- reference/golden/`     | **0** | EMPTY — no golden byte changed                                                 |
+| `sha256sum Cargo.lock`                                   | **0** | `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1` — unchanged |
