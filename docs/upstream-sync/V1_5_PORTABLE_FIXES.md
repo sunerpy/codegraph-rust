@@ -9789,3 +9789,116 @@ formatted ledger. Each command run separately, never joined with `&&`.
 | `bash scripts/check-ci-gate.sh`                          | **0** | 16 truth-table cases; only all-success exits 0                                 |
 | `git diff --stat 478575d..HEAD -- reference/golden/`     | **0** | EMPTY — no golden byte changed                                                 |
 | `sha256sum Cargo.lock`                                   | **0** | `750ee84b48ef1fc988bf9efd1a75828d243734f9bc516e8671c4294183de9bb1` — unchanged |
+
+### CodeBuild verification on a REAL Windows host — the round-8 fix is CONFIRMED
+
+Pipeline execution `0d78fb13-8b3b-471f-87c8-c5da32092c32`, build
+`codegraph-rs-windows:47108464-72f4-4e5f-9e2c-125e82cf921a`, log stream
+`47108464-72f4-4e5f-9e2c-125e82cf921a`. Pipeline status **Failed**; `Linux`
+action **Succeeded**, `Windows` action **Failed** at `cargo test --workspace`
+(exit 101).
+
+The target test PASSED. `-p codegraph-store --lib` reported
+
+```
+test result: ok. 94 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.85s
+```
+
+versus round 7's `93 passed; 1 failed` — the same suite, one more passing test,
+zero failures. `current_writer_revalidates_lock_at_the_last_pre_open_checkpoint`
+now reaches and evaluates its assertion on Windows.
+
+### The TENTH layer this exposed — and an AUDIT GAP it exposed in round 8
+
+The COMPLETE `... FAILED` list from the run was two lines, both in a different
+target:
+
+```
+test timeout_and_post_contention_cancellation_preserve_lock_bytes ... FAILED
+test exclusive_process_blocks_shared_and_exclusive ... FAILED
+test result: FAILED. 9 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.94s
+```
+
+Both panicked at the SAME line with the SAME os error:
+
+```
+panicked at crates\codegraph-store\tests\index_lease.rs:73:43:
+read permanent lock bytes: Os { code: 33, kind: Uncategorized,
+  message: "The process cannot access the file because another process has locked a portion of the file." }
+  4: index_lease::lock_bytes  at .\tests\index_lease.rs:73
+```
+
+Same root cause, same class — and the round-8 audit MISSED it. The audit swept
+files containing `read_dir`, because the known instance was a directory walker.
+`tests/index_lease.rs` has no walker: `lock_bytes` reads the permanent lock
+DIRECTLY. Recorded plainly because it is the lesson: the class is "reads the
+content of a file that a live lease may hold", NOT "walks a directory".
+
+Two additional facts the run settled empirically, neither of which was
+assumable:
+
+- **`metadata` really is not byte-range-locked on Windows.** The round-8 fix
+  reads `symlink_metadata(...).len()` on the exclusively locked file and the
+  suite passed, so the length observation is sound.
+- **A SHARED `LockFileEx` range permits reads.**
+  `shared_processes_coexist_but_shared_blocks_exclusive` does a full `fs::read`
+  of the lock while a SHARED holder is live and PASSED. Only the two
+  EXCLUSIVE-holder fixtures failed. A shared lock denies writes, not reads.
+
+### The round-10 fix — assert what stays observable, then re-assert bytes after release
+
+`LOCK_BYTES` is 34 bytes, so the round-8 `len == 0` normalization cannot apply:
+the content of a non-empty exclusively locked file is genuinely unobservable.
+
+A new `assert_lock_bytes_preserved(paths, expected)` therefore compares bytes
+exactly when the read succeeds and, when Windows refuses it with
+`ERROR_LOCK_VIOLATION`, asserts the LENGTH via `metadata` instead — the strongest
+remaining observation, and precisely the one that refutes the failure mode these
+fixtures guard: an acquisition path truncating or rewriting the lock cannot
+preserve `expected.len()`. Any other read error still panics.
+
+To keep byte-exactness proven on EVERY platform rather than traded away, each of
+the three holder fixtures now ALSO asserts exact bytes through the strict
+`lock_bytes` AFTER `holder.release()`, which waits for the holder child to exit,
+so no lock remains. `exclusive_process_blocks_shared_and_exclusive` additionally
+re-asserts after its two post-release probe children have acquired and exited.
+Nothing mutates between the locked assertion and the release, so the post-release
+read proves the same property — and this is strictly MORE than the pre-existing
+unix-only coverage, which never read the lock unlocked at all.
+
+Call sites deliberately left on the strict `lock_bytes`: lines 227/236 (leases
+already dropped), 321 (`an_already_expired_deadline...`, nothing ever locked),
+163/212/220/243 (the acquisition FAILED, so no lock was taken). Those must keep
+panicking on a refusal, because there a refusal would be a real fault.
+
+### Audit, redone by the correct predicate
+
+Predicate this time: "reads the CONTENT of a file that a live lease — in-process
+or cross-process — may hold", regardless of whether a directory walk is involved.
+
+| File:line                                                                                                            | What it reads                              | Live lock possible?                                                                                                          | Verdict                    |
+| -------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------- | -------------------------- |
+| `codegraph-store/tests/index_lease.rs:73` (`lock_bytes`)                                                             | `index.lock` content, directly             | **YES** — 3 fixtures read it while a `Holder` CHILD holds shared or exclusive                                                | **FIXED** (proven failure) |
+| `codegraph-store/src/index_lease.rs:768`                                                                             | a COMPETING regular entry at the lock path | **NO** — the test asserts creation LOST the race and never locked that entry                                                 | unchanged                  |
+| `codegraph-store/tests/index_lease.rs:163/212/220/243`                                                               | external target / sibling / marker         | **NO** — every one follows a FAILED acquisition, which holds nothing                                                         | unchanged                  |
+| `codegraph-cli/tests/batch_m_uninit.rs:145`                                                                          | every regular file under `current_root`    | **NO** — snapshots run in the PARENT after `run_in`'s child CLI exited; `stage_lifecycle_state` drops its lease at scope end | unchanged                  |
+| `codegraph-store/src/rebuild.rs:1698/1712`                                                                           | `codegraph.db` bytes                       | **NO** — a live `FullRebuildRequired` authorization locks `index.lock`, not the DB, and holds no SQLite connection           | unchanged (Windows-passed) |
+| `codegraph-cli/tests/batch_m_failed_open_recovery.rs:723/733`                                                        | `codegraph.db` bytes                       | **NO** — the refused `sync_project_once` opens no write-capable SQLite                                                       | unchanged (Windows-passed) |
+| `codegraph-store/src/index_state_publisher.rs:649/768`                                                               | state-slot JSON                            | **NO** — slots are never locked; only `index.lock` is                                                                        | unchanged                  |
+| `codegraph-watch/src/sync.rs`, `codegraph-cli/src/main.rs`, `codegraph-cli/tests/batch_m_daemon_uninit_lifecycle.rs` | source files / profiles / pid file         | **NO** — none is a lease target                                                                                              | unchanged                  |
+
+Everything in the "unchanged (Windows-passed)" rows actually EXECUTED on Windows
+in this run and passed, so those verdicts are measured, not merely argued.
+
+### Round 8/10 — gate statuses, as the shell actually reported them
+
+| Command                                                     | Exit  | Result                                                                       |
+| ----------------------------------------------------------- | ----- | ---------------------------------------------------------------------------- |
+| `cargo test --locked -p codegraph-store --test index_lease` | **0** | **13 passed, 0 failed** on Linux                                             |
+| `cargo clippy --locked -p codegraph-store --all-targets`    | **0** | zero warnings                                                                |
+| `aws codepipeline start-pipeline-execution` (round 8 fix)   | **0** | `0d78fb13-8b3b-471f-87c8-c5da32092c32`                                       |
+| `aws codepipeline get-pipeline-execution` (11 polls)        | **0** | `InProgress` ×10, then **`Failed`** — Windows only, on the TENTH layer       |
+| `aws logs tail /aws/codebuild/codegraph-rs-windows`         | **0** | 4048 lines; store lib **94 passed / 0 failed**; exactly 2 `FAILED`, both new |
+
+**Windows was NOT validated locally** for this round-10 fix; only the next
+CodeBuild run can confirm it.
