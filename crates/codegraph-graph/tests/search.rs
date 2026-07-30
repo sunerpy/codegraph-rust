@@ -526,3 +526,101 @@ fn search_exact_long_name_ranks_first_deterministically() {
         "exact symbol ranked {exact_rank} with score {exact_score}; competing row scored {competing_score}"
     );
 }
+
+#[test]
+fn search_multiple_exact_matches_preserve_score_order_deterministically() {
+    let mut store =
+        Store::open(&temp_db_path("multiple-exact-score-order")).expect("open temp store");
+    let query = "LoadProjectSettingsFromConfiguredGodotResourceIdentifierLookup";
+    let scoring_path = format!("{query}/{query}.rs");
+    store
+        .upsert_nodes(&[
+            node(
+                "function:strong-exact",
+                NodeKind::Function,
+                query,
+                "Runtime::strong_exact",
+                &scoring_path,
+                Language::Rust,
+                1,
+                1,
+                None,
+                None,
+                false,
+            ),
+            node(
+                "parameter:weak-exact",
+                NodeKind::Parameter,
+                &query.to_lowercase(),
+                "Runtime::weak_exact",
+                "tests/runtime.rs",
+                Language::Rust,
+                2,
+                2,
+                None,
+                None,
+                false,
+            ),
+            node(
+                "function:competing",
+                NodeKind::Function,
+                &format!("{query}X"),
+                "Runtime::competing",
+                &scoring_path,
+                Language::Rust,
+                3,
+                3,
+                None,
+                None,
+                false,
+            ),
+        ])
+        .expect("insert ranking corpus");
+
+    let project_tokens = HashSet::new();
+    let first = search_nodes(&store, query, &SearchOptions::default(), &project_tokens)
+        .expect("first search");
+    let second = search_nodes(&store, query, &SearchOptions::default(), &project_tokens)
+        .expect("second search");
+    let ordered = |results: &[codegraph_store::queries::SearchResult]| {
+        results
+            .iter()
+            .map(|result| (result.node.id.clone(), result.score.to_bits()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ordered(&first), ordered(&second), "search ordering changed");
+
+    let exact = first
+        .iter()
+        .filter(|result| result.node.name.eq_ignore_ascii_case(query))
+        .collect::<Vec<_>>();
+    assert_eq!(exact.len(), 2, "expected both exact-name rows");
+    assert_eq!(exact[0].node.id, "function:strong-exact");
+    assert_eq!(exact[1].node.id, "parameter:weak-exact");
+    assert!(
+        exact[0].score > exact[1].score,
+        "strong exact score {} must remain above weak exact score {}",
+        exact[0].score,
+        exact[1].score
+    );
+
+    let limited = search_nodes(
+        &store,
+        query,
+        &SearchOptions {
+            limit: Some(2),
+            ..SearchOptions::default()
+        },
+        &project_tokens,
+    )
+    .expect("limited search");
+    let limited_ids = limited
+        .iter()
+        .map(|result| result.node.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        limited_ids,
+        ["function:strong-exact", "parameter:weak-exact"],
+        "limit must retain exact rows in score order"
+    );
+}
