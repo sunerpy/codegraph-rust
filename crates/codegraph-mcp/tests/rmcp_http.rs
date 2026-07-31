@@ -125,6 +125,53 @@ async fn post_json_with_host(
         .expect("http post")
 }
 
+async fn post_json_with_mcp_headers(
+    client: &reqwest::Client,
+    url: &str,
+    body: &Value,
+    protocol_version: Option<&str>,
+    method: Option<&str>,
+    name: Option<&str>,
+) -> reqwest::Response {
+    let mut request = client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream");
+    if let Some(value) = protocol_version {
+        request = request.header("MCP-Protocol-Version", value);
+    }
+    if let Some(value) = method {
+        request = request.header("Mcp-Method", value);
+    }
+    if let Some(value) = name {
+        request = request.header("Mcp-Name", value);
+    }
+    request
+        .body(serde_json::to_string(body).unwrap())
+        .send()
+        .await
+        .expect("http post")
+}
+
+async fn assert_header_mismatch(response: reqwest::Response, expected_message: &str) {
+    assert_eq!(
+        response.status(),
+        400,
+        "header mismatch must return HTTP 400"
+    );
+    let body: Value = response.json().await.expect("header mismatch JSON body");
+    assert_eq!(
+        body["error"]["code"],
+        json!(-32020),
+        "header mismatch must use rmcp code -32020: {body}"
+    );
+    assert_eq!(
+        body["error"]["message"],
+        json!(expected_message),
+        "unexpected header mismatch message: {body}"
+    );
+}
+
 fn initialize_body() -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -201,6 +248,131 @@ fn http_initialize_negotiates_2024_11_05_and_no_roots() {
             "capabilities must be exactly {{\"tools\":{{}}}}, got {}",
             result["capabilities"]
         );
+
+        ct.cancel();
+    });
+}
+
+/// Structural goldens cannot observe HTTP response headers, so this locks the
+/// 2026 stateless initialize path to the absence of `Mcp-Session-Id`.
+#[test]
+fn http_2026_initialize_has_no_session_id() {
+    rt().block_on(async {
+        let project = setup_mini_project();
+        let (url, _addr, ct) = spawn_http_server(project.path().to_path_buf()).await;
+        let client = reqwest::Client::new();
+        let init = json!({
+            "jsonrpc": "2.0",
+            "id": 2026,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2026-07-28",
+                "capabilities": {},
+                "clientInfo": { "name": "http-test", "version": "0" }
+            }
+        });
+
+        let response = post_json(&client, &url, init).await;
+        assert_eq!(response.status(), 200, "initialize must return 200");
+        assert!(
+            response.headers().get("Mcp-Session-Id").is_none(),
+            "2026-07-28 HTTP must be stateless and omit Mcp-Session-Id: {:?}",
+            response.headers()
+        );
+        let body: Value = response.json().await.expect("json body");
+        assert_eq!(
+            body["result"]["protocolVersion"],
+            json!("2026-07-28"),
+            "initialize must negotiate 2026-07-28: {body}"
+        );
+
+        ct.cancel();
+    });
+}
+
+/// Structural goldens compare neither HTTP request headers nor top-level
+/// `resultType`, so exercise SEP-2243 success and rejection on the real wire.
+#[test]
+fn http_sep_2243_headers_accept_match_and_reject_missing_or_mismatched() {
+    rt().block_on(async {
+        let project = setup_mini_project();
+        let (url, _addr, ct) = spawn_http_server(project.path().to_path_buf()).await;
+        let client = reqwest::Client::new();
+        let call = json!({
+            "jsonrpc": "2.0",
+            "id": 2243,
+            "method": "tools/call",
+            "params": {
+                "name": "codegraph_search",
+                "arguments": { "query": "McpServer" },
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        });
+
+        let matching = post_json_with_mcp_headers(
+            &client,
+            &url,
+            &call,
+            Some("2026-07-28"),
+            Some("tools/call"),
+            Some("codegraph_search"),
+        )
+        .await;
+        assert_eq!(matching.status(), 200, "matching headers must succeed");
+        let matching_body: Value = matching.json().await.expect("matching JSON body");
+        assert_eq!(
+            matching_body["result"]["resultType"],
+            json!("complete"),
+            "matching 2026 headers must reach tools/call: {matching_body}"
+        );
+
+        let missing_protocol = post_json_with_mcp_headers(
+            &client,
+            &url,
+            &call,
+            None,
+            Some("tools/call"),
+            Some("codegraph_search"),
+        )
+        .await;
+        assert_header_mismatch(
+            missing_protocol,
+            "request _meta protocolVersion requires MCP-Protocol-Version header",
+        )
+        .await;
+
+        let mismatched_method = post_json_with_mcp_headers(
+            &client,
+            &url,
+            &call,
+            Some("2026-07-28"),
+            Some("tools/list"),
+            Some("codegraph_search"),
+        )
+        .await;
+        assert_header_mismatch(
+            mismatched_method,
+            "Mcp-Method header `tools/list` does not match body method `tools/call`",
+        )
+        .await;
+
+        let mismatched_name = post_json_with_mcp_headers(
+            &client,
+            &url,
+            &call,
+            Some("2026-07-28"),
+            Some("tools/call"),
+            Some("other_tool"),
+        )
+        .await;
+        assert_header_mismatch(
+            mismatched_name,
+            "Mcp-Name header `other_tool` does not match body value `codegraph_search`",
+        )
+        .await;
 
         ct.cancel();
     });

@@ -16,13 +16,23 @@ mod parity;
 use codegraph_mcp::rmcp_handler::CodeGraphHandler;
 use rmcp::ServiceExt;
 use rmcp::handler::server::ServerHandler;
-use rmcp::model::{CallToolRequestParams, PaginatedRequestParams};
+use rmcp::model::{CallToolRequestParams, PaginatedRequestParams, ProtocolVersion};
 use serde_json::json;
 
 use parity::{TestProject, golden_client, setup_mini_project, workspace_root};
 
 async fn connect(
     handler: CodeGraphHandler,
+) -> (
+    rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientInfo>,
+    tokio::task::JoinHandle<()>,
+) {
+    connect_with_protocol(handler, ProtocolVersion::V_2024_11_05).await
+}
+
+async fn connect_with_protocol(
+    handler: CodeGraphHandler,
+    protocol_version: ProtocolVersion,
 ) -> (
     rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientInfo>,
     tokio::task::JoinHandle<()>,
@@ -34,6 +44,7 @@ async fn connect(
         }
     });
     let client = golden_client()
+        .with_protocol_version(protocol_version)
         .serve(client_io)
         .await
         .expect("rmcp client handshake");
@@ -95,6 +106,84 @@ fn negotiated_protocol_version_is_2024_11_05() {
         let _ = client.cancel().await;
         let _ = task.await;
     });
+}
+
+#[test]
+fn known_protocol_versions_are_echoed_by_handshake() {
+    rt().block_on(async {
+        for (requested, expected) in [
+            (ProtocolVersion::V_2024_11_05, "2024-11-05"),
+            (ProtocolVersion::V_2025_11_25, "2025-11-25"),
+            (ProtocolVersion::V_2026_07_28, "2026-07-28"),
+        ] {
+            let project = setup_mini_project();
+            let handler = CodeGraphHandler::new(Some(project.path().to_path_buf()));
+            let (client, task) = connect_with_protocol(handler, requested).await;
+            let info = client.peer_info().expect("negotiated server info");
+            let value = serde_json::to_value(&*info).expect("serialize");
+            assert_eq!(
+                value["protocolVersion"],
+                json!(expected),
+                "negotiated protocolVersion must echo {expected}, got {}",
+                value["protocolVersion"]
+            );
+            let _ = client.cancel().await;
+            let _ = task.await;
+        }
+    });
+}
+
+/// The structural goldens never compare top-level `resultType`, so explicitly
+/// lock its 2026 presence and its pre-2026 omission for both tool result shapes.
+#[test]
+fn result_type_is_versioned_for_tools_list_and_call() {
+    rt().block_on(async {
+        for (requested, expected) in [
+            (ProtocolVersion::V_2024_11_05, None),
+            (ProtocolVersion::V_2025_11_25, None),
+            (ProtocolVersion::V_2026_07_28, Some("complete")),
+        ] {
+            let project = setup_mini_project();
+            let handler = CodeGraphHandler::new(Some(project.path().to_path_buf()));
+            let (client, task) = connect_with_protocol(handler, requested.clone()).await;
+
+            let listed = client.list_tools(paginated()).await.expect("list_tools");
+            let listed = serde_json::to_value(&listed).expect("serialize tools/list result");
+            assert_result_type(&listed, expected, &requested, "tools/list");
+
+            let called = client
+                .call_tool(call(
+                    "codegraph_search",
+                    json!({ "query": "add" }).as_object().cloned(),
+                ))
+                .await
+                .expect("tools/call");
+            let called = serde_json::to_value(&called).expect("serialize tools/call result");
+            assert_result_type(&called, expected, &requested, "tools/call");
+
+            let _ = client.cancel().await;
+            let _ = task.await;
+        }
+    });
+}
+
+fn assert_result_type(
+    result: &serde_json::Value,
+    expected: Option<&str>,
+    protocol_version: &ProtocolVersion,
+    method: &str,
+) {
+    match expected {
+        Some(expected) => assert_eq!(
+            result.get("resultType"),
+            Some(&json!(expected)),
+            "{method} at {protocol_version} must carry resultType={expected}: {result}"
+        ),
+        None => assert!(
+            result.get("resultType").is_none(),
+            "{method} at {protocol_version} must omit resultType entirely: {result}"
+        ),
+    }
 }
 
 /// (c) an unknown tool → JSON-RPC `-32602` (invalid_params), NOT the built-in
