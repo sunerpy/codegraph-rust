@@ -289,6 +289,14 @@ fn list_shows_every_live_stdio_server() {
         stdout.contains("kill"),
         "list must print the platform's stop command as GUIDANCE: {stdout}"
     );
+    // Liveness is checked by pid, never by process identity, so the stop command
+    // must not be offered as if the pid were proven to be codegraph.
+    let identity_probe = if cfg!(windows) { "tasklist" } else { "ps -p" };
+    assert!(
+        stdout.contains("reused") && stdout.contains(identity_probe),
+        "list must tell the user to confirm the pid really is codegraph before stopping it: \
+         {stdout}"
+    );
 
     assert!(server_a.shutdown(), "server a must exit on stdin EOF");
     assert!(server_b.shutdown(), "server b must exit on stdin EOF");

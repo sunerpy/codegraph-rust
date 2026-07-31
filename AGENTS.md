@@ -110,14 +110,22 @@ has no addr and no per-project rendezvous, several may serve one project, and on
 Registration fires from all THREE foreground exits in `cmd_serve` (`Direct`, `SpawnOrProxy`, and the
 too-broad-root home guard) and NEVER from `BeDaemon`, which already owns `.codegraph-v2/daemon.pid`.
 Reads go through `RegistryRead::{Available, Unavailable}` so a MISSING directory ("nobody registered
-yet", normal) is distinguishable from an unreadable one (an outage); dead-PID and unparseable entries
-are pruned on read. `codegraph mcp list [--json]` renders it, and `index` pre-warns when a registered
-server could reach the project it is about to rebuild. This registry is PURE OBSERVABILITY — there is no
-`mcp stop` and no `terminate_pid` import, because a stale entry's PID may have been reused and this
-workspace has no portable instance-identity primitive (`try_acquire_daemon_lock` is a `create_new`
-placeholder plus a recorded PID, not an OS advisory lock); `list` prints `kill <pid>` /
-`taskkill /PID <pid> /F` for a human instead. CLI/daemon only; extraction and golden equivalence
-untouched.
+yet", normal) is distinguishable from an unreadable one (an outage); `read_dir`'s `NotFound` only means
+MISSING when `fs::symlink_metadata` also fails, so a dangling symlink at the registry path reads as an
+outage instead of an empty registry. `list_entries` is the RAW on-disk view (stale entries included);
+`live_entries` filters its RETURN VALUE by `is_process_alive` rather than trusting `prune_dead`'s
+deletions to have landed, so a dead entry on an undeletable (read-only) registry is still never reported
+as running — dead-PID and unparseable files are pruned on read as best-effort disk self-heal only.
+`codegraph mcp list [--json]` renders it, and `index` pre-warns when a registered server could reach the
+project it is about to rebuild; the `RemoveDatabase` FAILURE path deliberately reports ALL live entries
+instead of narrowing by the failing artifact path, because with `CODEGRAPH_DIR` set the index root is a
+`<name>-v2-<projectIdentity>` sibling of the legacy root and can sit outside the project tree. This
+registry is PURE OBSERVABILITY — there is no `mcp stop` and no `terminate_pid` import, because a stale
+entry's PID may have been reused and this workspace has no portable instance-identity primitive
+(`try_acquire_daemon_lock` is a `create_new` placeholder plus a recorded PID, not an OS advisory lock);
+`list` asks a human to confirm the PID with `ps -p <pid> -o command=` / `tasklist /FI "PID eq <pid>"`
+before offering `kill <pid>` / `taskkill /PID <pid> /F`. CLI/daemon only; extraction and golden
+equivalence untouched.
 
 ## Agent installer (`codegraph install` / `uninstall`)
 

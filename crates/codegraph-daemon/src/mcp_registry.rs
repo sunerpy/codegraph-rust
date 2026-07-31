@@ -164,7 +164,23 @@ fn scan_registry_dir(dir: &Path) -> DirScan {
             files.sort();
             DirScan::Files(files)
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => DirScan::Missing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // `NotFound` is only the benign "nobody registered yet" state when
+            // NOTHING is at this path. `read_dir` also reports it when the path
+            // itself exists but cannot be resolved to a directory — a dangling
+            // symlink is the common case — and reporting a broken registry
+            // configuration as an empty registry would hide a real outage.
+            // `symlink_metadata` does not follow links, so it succeeds exactly
+            // when something IS there; it also covers other odd inodes for free.
+            if fs::symlink_metadata(dir).is_ok() {
+                DirScan::Failed(format!(
+                    "{error} (a filesystem object exists at this path but cannot be read as a \
+                     directory — a dangling symlink?)"
+                ))
+            } else {
+                DirScan::Missing
+            }
+        }
         // Anything else (a FILE where the dir should be, a permission denial, an
         // unreadable mount) is a genuine outage the caller must be able to tell
         // apart from "nothing registered".
@@ -174,6 +190,10 @@ fn scan_registry_dir(dir: &Path) -> DirScan {
 
 /// List EVERY registry entry (live or stale) without pruning. Sorted by pid for
 /// deterministic output.
+///
+/// This is the RAW on-disk view and makes no liveness claim: a stale entry left
+/// by a crashed process is still returned. Callers that mean "what is running
+/// now" want [`live_entries`], which filters by liveness.
 #[must_use]
 pub fn list_entries() -> RegistryRead {
     let dir = registry_dir();
@@ -226,14 +246,30 @@ pub fn prune_dead() -> Result<Vec<u32>> {
     Ok(pruned)
 }
 
-/// List entries after pruning dead ones — the canonical "what is running now".
+/// The canonical "what is running now": every registry entry whose pid is still
+/// alive, sorted by pid.
+///
+/// Liveness is enforced on the RETURNED SET, not by assuming [`prune_dead`]
+/// deleted the stale files. Pruning is disk self-heal and it can legitimately
+/// fail — a read-only or otherwise undeletable registry keeps a dead
+/// `<pid>.json` on disk — and a caller that trusted deletion would then report a
+/// process that no longer exists as running, naming a pid that may since have
+/// been reused. Correctness therefore never depends on the removal succeeding.
 #[must_use]
 pub fn live_entries() -> RegistryRead {
     // Pruning is best-effort here: [`list_entries`] below owns the
     // Available-vs-Unavailable classification, so an unreadable registry is
     // reported once, from one place, instead of twice with two error strings.
     let _ = prune_dead();
-    list_entries()
+    match list_entries() {
+        RegistryRead::Available(entries) => RegistryRead::Available(
+            entries
+                .into_iter()
+                .filter(|entry| is_process_alive(entry.pid))
+                .collect(),
+        ),
+        unavailable => unavailable,
+    }
 }
 
 /// Remove the registry entry for `pid` (best-effort; a missing file is already
@@ -349,6 +385,39 @@ mod tests {
         assert!(!registry_file(&registry.dir, dead_pid).exists());
     }
 
+    /// `live_entries` must filter its RETURN VALUE by liveness instead of
+    /// trusting `prune_dead` to have deleted the file. On a read-only registry
+    /// the deletion fails, the dead `<pid>.json` survives, and a caller would
+    /// otherwise report a process that no longer exists as RUNNING.
+    ///
+    /// A directory mode of `r-x` is what makes the deletion fail while still
+    /// allowing the scan. `root` ignores mode bits, so the file may vanish
+    /// anyway there; the assertion is therefore on the returned set — the
+    /// contract being fixed — and reports whether the file actually survived.
+    #[cfg(unix)]
+    #[test]
+    fn live_entries_omits_a_dead_entry_whose_file_cannot_be_deleted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let registry = TempRegistry::new("undeletable-dead");
+        let dead_pid = pick_dead_pid();
+        write_entry(&sample(dead_pid)).unwrap();
+        let path = registry_file(&registry.dir, dead_pid);
+        let restore = fs::metadata(&registry.dir).unwrap().permissions();
+        fs::set_permissions(&registry.dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let entries = available(live_entries());
+        let survived = path.exists();
+        fs::set_permissions(&registry.dir, restore).unwrap();
+
+        assert!(
+            !entries.iter().any(|entry| entry.pid == dead_pid),
+            "a dead pid must be absent from live_entries' return value (its file survived \
+             pruning: {survived}); reporting it would name a process that does not exist: \
+             {entries:?}"
+        );
+    }
+
     #[test]
     fn corrupt_pid_json_does_not_poison_the_whole_list() {
         let registry = TempRegistry::new("corrupt");
@@ -382,6 +451,26 @@ mod tests {
             }
             RegistryRead::Available(entries) => {
                 panic!("unreadable registry was reported as available: {entries:?}")
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_registry_symlink_reads_as_unavailable_not_empty() {
+        use std::os::unix::fs::symlink;
+
+        let registry = TempRegistry::new("dangling-symlink");
+        fs::remove_dir_all(&registry.dir).unwrap();
+        symlink(registry.dir.with_extension("missing-target"), &registry.dir).unwrap();
+
+        match live_entries() {
+            RegistryRead::Unavailable { path, error } => {
+                assert_eq!(path, registry.dir);
+                assert!(!error.is_empty());
+            }
+            RegistryRead::Available(entries) => {
+                panic!("dangling registry symlink was reported as available: {entries:?}")
             }
         }
     }

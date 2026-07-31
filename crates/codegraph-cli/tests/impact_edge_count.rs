@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -110,6 +111,60 @@ fn godot_resource_referrers_count_as_impact_edges() {
             .expect("resourceEdgeCount is a number"),
         resource_referrers
     );
+}
+
+#[test]
+fn godot_referrer_already_reached_by_graph_is_not_counted_twice() {
+    let dir = TestDir::new("godot-overlap");
+    let project = dir.path().join("godot");
+    fs::create_dir_all(project.join("scripts")).unwrap();
+    fs::create_dir_all(project.join("data")).unwrap();
+    fs::write(
+        project.join("project.godot"),
+        "[application]\nconfig/name=\"Impact edge overlap\"\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("scripts/target.gd"),
+        "class_name Target\nextends Resource\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("scripts/user.gd"),
+        "const TargetResource = preload(\"res://scripts/target.gd\")\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("data/one.tres"),
+        "[gd_resource type=\"Resource\" load_steps=2 format=3]\n\
+         \n\
+         [ext_resource type=\"Script\" path=\"res://scripts/target.gd\" id=\"1_script\"]\n\
+         \n\
+         [resource]\n\
+         script = ExtResource(\"1_script\")\n",
+    )
+    .unwrap();
+    index_project(&project);
+
+    let value = impact_json(&project, "target.gd");
+    let affected = value["affected"].as_array().expect("affected is an array");
+    let file_paths = affected
+        .iter()
+        .map(|node| {
+            node["filePath"]
+                .as_str()
+                .expect("every affected row has a filePath")
+        })
+        .collect::<Vec<_>>();
+    let distinct_file_paths = file_paths.iter().copied().collect::<HashSet<_>>();
+
+    assert_eq!(
+        distinct_file_paths.len(),
+        file_paths.len(),
+        "a graph-reached preload referrer must not be appended again: {value}"
+    );
+    assert_eq!(value["edgeCount"].as_u64(), Some(2), "{value}");
+    assert_eq!(value["resourceEdgeCount"].as_u64(), Some(1), "{value}");
 }
 
 #[test]

@@ -363,10 +363,12 @@ this:
 - **`resourceEdgeCount`** — just the resource share of that total. Code edges are
   therefore `edgeCount - resourceEdgeCount`; no third field is needed.
 
-The resource count comes from the same sorted+deduped referrer set that gets
-appended to `affected`, so the count and the list can never contradict each
-other. A pure-code target reports `resourceEdgeCount: 0` and an `edgeCount`
-identical to what earlier versions produced.
+The resource count comes from the same referrer set that gets appended to
+`affected` — sorted, deduped, and restricted to files the graph traversal did not
+already reach — so the count and the list can never contradict each other, and a
+referrer that also has a real graph edge (a GDScript `preload`, say) is counted
+once rather than twice. A pure-code target reports `resourceEdgeCount: 0` and an
+`edgeCount` identical to what earlier versions produced.
 
 This matters for Godot projects, where the referrers of a `.gd` script live in
 resource files that have no tree-sitter grammar and so no graph edges of their
@@ -626,8 +628,11 @@ is the whole reason. An entry that outlived a crash names a PID the OS may since
 have handed to an unrelated process, and codegraph has no portable way to prove
 process instance identity — the daemon lock is an atomic-create placeholder plus a
 recorded PID, not an OS advisory lock. Terminating by registered PID could kill an
-innocent process, so `list` prints the platform-appropriate command (`kill <pid>`
-on unix, `taskkill /PID <pid> /F` on Windows) and leaves the decision to a human.
+innocent process, so `list` leaves the decision to a human: it asks you to confirm
+the PID really is codegraph (`ps -p <pid> -o command=` on unix,
+`tasklist /FI "PID eq <pid>"` on Windows) and only then offers the stop command
+(`kill <pid>` on unix, `taskkill /PID <pid> /F` on Windows). A listed row means
+"registered, and that PID is alive" — never "that PID is proven to be codegraph".
 A `stop` subcommand is gated on landing instance-identity verification first, not
 on anything else. Closing the client that launched the server is cleaner than
 either way.
