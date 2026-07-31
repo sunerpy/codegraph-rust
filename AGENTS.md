@@ -240,9 +240,16 @@ make coverage    # workspace coverage summary (informational; `make coverage-htm
   non-blocking** — the `coverage` job is kept out of the `CI Success` gate and
   the Codecov status is `informational: true` (`codecov.yml`), so a below-target
   % never turns CI red. This honors the iron rule "local green ⇒ CI green".
-- **Baseline ~72% line coverage** — a known gap to close. Biggest gaps:
-  `codegraph-resolve/src/import_resolver.rs`, `codegraph-resolve/src/name_matcher.rs`,
-  and the 0%-covered `codegraph-watch/src/{git,worktree}.rs`.
+- **Measured 94.42% line / 94.12% region / 93.41% function** — close to the 95%
+  target but not yet there. Figure measured at `4fabc0b` (rmcp 3.0.1 round) via
+  `make coverage`; re-measure before quoting it, since it moves with every round.
+  The remaining gap is now concentrated in the **per-language extractors** rather
+  than the resolver or watch internals: 7 of the 10 lowest-covered files are
+  `codegraph-extract/src/lang/*` — `r.rs` 70.59%, `dart.rs` 72.75%,
+  `erlang.rs` 75.77%, `arkts.rs` 81.01%, `nix.rs` 82.21%, `jsx.rs` 82.61%,
+  `lua.rs` 85.94% — alongside `codegraph-watch/src/migrate.rs` 74.77%,
+  `codegraph-store/src/index_state.rs` 80.45%, and
+  `codegraph-store/src/connection.rs` 82.57%.
 - **Enabling Codecov:** enable the repo at codecov.io. This repo is public, so
   tokenless upload works (no `CODECOV_TOKEN` needed); a private repo would need
   `CODECOV_TOKEN` in GitHub repo Secrets.
