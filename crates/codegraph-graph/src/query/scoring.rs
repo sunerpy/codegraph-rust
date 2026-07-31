@@ -633,6 +633,17 @@ pub fn name_match_bonus(node_name: &str, query: &str) -> f64 {
     0.0
 }
 
+/// Whether `node_name` equals the WHOLE `query`, compared case-insensitively.
+///
+/// Used as a sort key, not a score: the search pass groups exact whole-name
+/// matches ahead of every non-exact row while leaving scores untouched, so a
+/// precise symbol cannot be out-ranked by a longer partial match that happens to
+/// earn more from [`kind_bonus`] or [`score_path_relevance`]. Whitespace is
+/// significant — a multi-word query never equals a whitespace-free name.
+pub fn is_exact_name_match(node_name: &str, query: &str) -> bool {
+    node_name.to_lowercase() == query.to_lowercase()
+}
+
 pub fn kind_bonus(kind: NodeKind) -> f64 {
     match kind {
         NodeKind::Function => 10.0,
@@ -935,6 +946,13 @@ mod tests {
         assert_eq!(name_match_bonus("handleLoginRequest", "login"), 10.0);
         // no match → 0
         assert_eq!(name_match_bonus("foo", "zzz"), 0.0);
+    }
+
+    #[test]
+    fn exact_name_match_is_full_string_and_case_insensitive() {
+        assert!(is_exact_name_match("LongSymbol", "longsymbol"));
+        assert!(is_exact_name_match("Long Symbol", "LONG SYMBOL"));
+        assert!(!is_exact_name_match("LongerSymbol", "longsymbol"));
     }
 
     #[test]

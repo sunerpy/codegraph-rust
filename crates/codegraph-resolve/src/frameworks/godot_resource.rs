@@ -120,8 +120,8 @@ pub(crate) fn parse_tres(
     // so a `key = ExtResource("id")` line resolves inline (same as T4).
     let mut ext_resources: HashMap<String, String> = HashMap::new();
 
-    // The resource's own type, from `[gd_resource type="..."]`, used to name the
-    // marker node. Defaults if absent or unnamed.
+    // The resource's declared class (falling back to its engine type), used to
+    // name the marker node. Defaults if both are absent or unnamed.
     let mut resource_type = DEFAULT_RESOURCE_NAME.to_string();
     // The marker node, created lazily on the first reference to anchor. Once
     // created it is reused for every subsequent reference.
@@ -145,6 +145,11 @@ pub(crate) fn parse_tres(
                     if let Some(ty) = attr(&header.attrs, "type") {
                         if !ty.is_empty() {
                             resource_type = ty.to_string();
+                        }
+                    }
+                    if let Some(script_class) = attr(&header.attrs, "script_class") {
+                        if !script_class.is_empty() {
+                            resource_type = script_class.to_string();
                         }
                     }
                 }

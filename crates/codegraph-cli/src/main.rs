@@ -182,6 +182,9 @@ fn main() {
 
     if let Err(err) = run(cli) {
         eprintln!("Error: {err:#}");
+        if let Some(guidance) = index_removal_holder_guidance(&err) {
+            eprint!("{guidance}");
+        }
         std::process::exit(1);
     }
 }
@@ -479,6 +482,11 @@ enum Command {
         #[command(subcommand)]
         action: HttpAction,
     },
+    /// Inspect the foreground stdio MCP processes started by `serve --mcp`.
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
+    },
     /// Print the codegraph version.
     Version,
     /// Generate shell completion scripts (bash, zsh, fish, powershell, elvish).
@@ -582,6 +590,20 @@ enum HttpAction {
     Status { addr: Option<String> },
     /// Stop the background HTTP MCP server bound to `addr`.
     Stop { addr: String },
+}
+
+/// Deliberately a single-variant enum: by decision A of the rev55 plan `stop` is
+/// absent this round (a PID-keyed entry whose pid was reused would let us
+/// terminate an innocent process), and the enum shape leaves room to add it once
+/// process instance identity can be proven portably.
+#[derive(Debug, Subcommand)]
+enum McpAction {
+    /// List the running foreground stdio MCP processes (`serve --mcp`).
+    List {
+        /// Emit machine-readable JSON instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn run(cli: Cli) -> Result<()> {
@@ -769,6 +791,9 @@ fn run(cli: Cli) -> Result<()> {
             HttpAction::List => cmd_http_list(),
             HttpAction::Status { addr } => cmd_http_status(addr),
             HttpAction::Stop { addr } => cmd_http_stop(&addr),
+        },
+        Command::Mcp { action } => match action {
+            McpAction::List { json } => cmd_mcp_list(json),
         },
         Command::Version => {
             println!("codegraph {VERSION}");
@@ -1411,6 +1436,9 @@ fn cmd_index(path: Option<PathBuf>, force: bool, quiet: bool, verbose: bool) -> 
     // reachable; authorization is still decided later under the exclusive lease.
     let project = resolve_required_rebuild_project(path)?;
     guard_indexable_root(&project)?;
+    if !quiet {
+        warn_if_stdio_mcp_may_hold_index(&project);
+    }
     // `--force` no longer removes the DB up front: the rebuild layer performs the
     // destructive removal itself, AFTER publishing `phase=building` under the one
     // outer exclusive lease, so an interruption can never leave a bare DB with no
@@ -1909,6 +1937,11 @@ fn cmd_serve(
                 %reason,
                 "no project root; tools still answer off an existing index if present"
             );
+            // A FOREGROUND stdio process like `Direct`: it answers tool calls off
+            // any existing index, opening the DB per request, so it must be
+            // visible to `codegraph mcp list` too — this is exactly the
+            // IDE-launched `CWD=$HOME` case that command exists to surface.
+            let _registry = register_stdio_mcp_process(project.as_deref(), explicit_path);
             return serve_direct_no_services(project, &project_root, no_watch);
         }
         let has_codegraph = codegraph_dir(&project_root)
@@ -1918,6 +1951,7 @@ fn cmd_serve(
         emit_serve_startup_debug(&project_root, explicit_path, has_codegraph, &mode);
         match mode {
             ServeMode::Direct => {
+                let _registry = register_stdio_mcp_process(project.as_deref(), explicit_path);
                 return serve_direct(project, &project_root, no_watch, explicit_path);
             }
             ServeMode::BeDaemon => {
@@ -1939,6 +1973,7 @@ fn cmd_serve(
                 .context("running as detached MCP daemon");
             }
             ServeMode::SpawnOrProxy => {
+                let _registry = register_stdio_mcp_process(project.as_deref(), explicit_path);
                 return serve_spawn_or_proxy(project, &project_root, no_watch, explicit_path);
             }
         }
@@ -1947,6 +1982,70 @@ fn cmd_serve(
     eprintln!("Daemon and watcher startup is wired here for tasks 24/25.");
     eprintln!("Use `codegraph serve --mcp` to start the committed MCP stdio server.");
     Ok(())
+}
+
+/// Register THIS process in the global PID-keyed MCP registry and return the
+/// guard that removes the entry when serving ends (stdin EOF is the ordinary
+/// shutdown path). Registered from all THREE foreground stdio exits — `Direct`,
+/// `SpawnOrProxy`, and the too-broad-root guard's `serve_direct_no_services` —
+/// the processes a user sees in their process list, and never from `BeDaemon`,
+/// which already holds the per-project `daemon.pid` lock and would otherwise be
+/// counted twice.
+///
+/// `project` is recorded ONLY when the user actually passed `--path`
+/// (`explicit_path`). A bare `serve --mcp` defaults `project` to its cwd, but cwd
+/// is merely where the process started: with nothing pinned it resolves a project
+/// per request, so recording cwd would claim a default it does not have. The field
+/// is purely informational either way — nothing filters on it, because a client
+/// can ask any server to open any indexed project — so an absent value is the
+/// honest one, and `codegraph mcp list` renders it as `<none>`.
+///
+/// A registry failure NEVER breaks `serve --mcp`: MCP availability outranks
+/// observability, so an unwritable state dir is warned about and serving
+/// continues unregistered. No signal handlers are installed either — a killed
+/// or crashed process leaves a stale entry on purpose, which is exactly what
+/// [`codegraph_daemon::mcp_registry::prune_dead`] self-heals on the next read.
+fn register_stdio_mcp_process(
+    project: Option<&Path>,
+    explicit_path: bool,
+) -> Option<McpRegistryGuard> {
+    use codegraph_daemon::mcp_registry::{self, McpServerInfo};
+
+    let pid = std::process::id();
+    let info = McpServerInfo {
+        pid,
+        project: explicit_path
+            .then_some(project)
+            .flatten()
+            .map(|path| path.display().to_string()),
+        transport: "stdio".to_string(),
+        started_at: mcp_registry::now_millis(),
+        version: VERSION.to_string(),
+    };
+    match mcp_registry::write_entry(&info) {
+        Ok(_) => Some(McpRegistryGuard { pid }),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "could not register this stdio MCP process; serving anyway (`codegraph mcp list` \
+                 will not show it)"
+            );
+            None
+        }
+    }
+}
+
+/// Best-effort removal of this process's own MCP registry entry on scope exit.
+/// A crash is covered by the next read's prune, so this is a courtesy, not a
+/// correctness requirement.
+struct McpRegistryGuard {
+    pid: u32,
+}
+
+impl Drop for McpRegistryGuard {
+    fn drop(&mut self) {
+        let _ = codegraph_daemon::mcp_registry::remove_entry(self.pid);
+    }
 }
 
 /// `serve --http`: serve MCP over streamable-HTTP (rmcp). Two modes selected by
@@ -2249,6 +2348,465 @@ fn cmd_http_stop(addr: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// `codegraph mcp list`: prune dead entries, then report the live FOREGROUND
+/// stdio MCP processes (`serve --mcp`) — pid, project, start time, version — so
+/// a user can tell WHO is holding an index and HOW to stop it.
+///
+/// We deliberately print stop GUIDANCE instead of offering `mcp stop` (decision
+/// A of the rev55 plan): entries are PID-keyed, so a stale entry whose pid was
+/// reused by an unrelated process would make us terminate an innocent process,
+/// and this workspace has no portable way to prove process instance identity.
+///
+/// Every branch exits 0, including the unreadable-registry one: this is a
+/// diagnostic command, and failing hard while the user is already debugging
+/// would be hostile.
+fn cmd_mcp_list(json: bool) -> Result<()> {
+    match codegraph_daemon::mcp_registry::live_entries() {
+        codegraph_daemon::mcp_registry::RegistryRead::Available(servers) => {
+            if json {
+                print_json_pretty(&json!({ "servers": servers }))
+            } else {
+                print_mcp_table(&servers);
+                Ok(())
+            }
+        }
+        codegraph_daemon::mcp_registry::RegistryRead::Unavailable { path, error } => {
+            let path = path.display().to_string();
+            if json {
+                // `servers` stays an array so a consumer never has to guess the
+                // shape; the extra key is what marks the outage.
+                print_json_pretty(&json!({
+                    "servers": [],
+                    "registryUnavailable": { "path": path, "error": error },
+                }))
+            } else {
+                println!("registry unavailable at {path}: {error}");
+                println!(
+                    "Cannot tell which stdio MCP servers are running. Find them with your OS \
+                     process tools (look for `codegraph serve --mcp`), then stop one with {}.",
+                    mcp_stop_command()
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Render the live stdio MCP processes, or a friendly empty state. LAUNCH PROJECT
+/// goes LAST and is never truncated: unlike the HTTP table (whose selector, ADDR,
+/// is both short and first), here the project path is the field a human reads to
+/// recognize a stale row, so clipping it would defeat the purpose.
+///
+/// The column is LAUNCH PROJECT, not PROJECT, because that is all the entry knows:
+/// it is the `--path` the server was started with (`<none>` for a bare launch),
+/// and a client can ask any server to open a different indexed project at any
+/// time. Nothing in the CLI treats it as a scope.
+fn print_mcp_table(servers: &[codegraph_daemon::mcp_registry::McpServerInfo]) {
+    if servers.is_empty() {
+        println!("No stdio MCP servers registered.");
+        println!(
+            "Note: older codegraph versions do not register; find those with your OS process \
+             tools (look for `codegraph serve --mcp`)."
+        );
+        return;
+    }
+    println!(
+        "{:>7} {:<27} {:<12} LAUNCH PROJECT",
+        "PID", "STARTED", "VERSION"
+    );
+    for info in servers {
+        println!(
+            "{:>7} {:<27} {:<12} {}",
+            info.pid,
+            format_started_at(info.started_at),
+            info.version,
+            info.project.as_deref().unwrap_or("<none>"),
+        );
+    }
+    println!(
+        "({} stdio MCP server(s) registered as running). LAUNCH PROJECT is the `--path` each \
+         server started with, not a limit on what it can open: any of them can be asked to open \
+         any indexed project. A pid can be reused, so confirm one is still codegraph with `{}` \
+         before stopping it with `{}` — closing the client that launched it is cleaner.",
+        servers.len(),
+        mcp_identity_check_command(),
+        mcp_stop_command()
+    );
+}
+
+/// The platform-appropriate command a HUMAN runs to stop a listed process. See
+/// [`cmd_mcp_list`] for why we only ever print this.
+fn mcp_stop_command() -> &'static str {
+    if cfg!(windows) {
+        "taskkill /PID <pid> /F"
+    } else {
+        "kill <pid>"
+    }
+}
+
+/// The platform-appropriate command that shows WHAT a pid actually is, printed
+/// wherever we offer [`mcp_stop_command`].
+///
+/// Registry entries are PID-keyed and liveness is checked by pid alone, never by
+/// process identity, so a stale entry whose pid was reused names an innocent
+/// process. Decision A of the rev55 plan refuses to terminate BECAUSE identity is
+/// unprovable here; presenting the pid as proven while handing over a stop
+/// command would contradict that, so the user is asked to confirm it first.
+fn mcp_identity_check_command() -> &'static str {
+    if cfg!(windows) {
+        "tasklist /FI \"PID eq <pid>\""
+    } else {
+        "ps -p <pid> -o command="
+    }
+}
+
+/// PURE text generator for "a stdio MCP server may be holding this index
+/// database" guidance. Inputs in, `String` out — no IO, no environment read, no
+/// clock — which is what makes every branch unit-testable even though one of its
+/// two call sites (the `RemoveDatabase` failure) cannot have its FAILURE driven
+/// from a test (decision B of the rev55 plan: `RebuildFault` exposes no DB
+/// removal hook, and a black-box attempt fails EARLIER, at database open).
+///
+/// `holders` is EVERY live registry entry, never a subset. A server's recorded
+/// project is only its launch-time DEFAULT, not a capability boundary:
+/// `crate::roots::resolve_project_arg` in `codegraph-mcp` probes an absolute
+/// per-call `projectPath` on its own merits and consults the launch default only
+/// when no path was passed, so any live server can be asked to open any indexed
+/// project's database. Narrowing by that field would therefore hide real holders —
+/// exactly the Windows rebuild failure this guidance exists to explain. Every row
+/// names its own launch project so a reader can still tell the rows apart.
+///
+/// `registry_unavailable` carries `(path, error)` when the registry could not be
+/// read at all. An unreadable registry deliberately renders the SAME branch as an
+/// empty one: informationally both mean "we found no holder and cannot prove there
+/// is none", so the actionable advice is identical. The outage only adds a line
+/// naming the path, so the user can still tell the two apart.
+///
+/// Timestamps are NOT rendered here: [`format_started_at`] reads the local UTC
+/// offset, which would make this function impure and its output TZ-dependent.
+/// The text points at `codegraph mcp list` for start times instead.
+fn index_holder_guidance(
+    holders: &[codegraph_daemon::mcp_registry::McpServerInfo],
+    registry_unavailable: Option<(&str, &str)>,
+) -> String {
+    let mut out = String::new();
+    if holders.is_empty() {
+        out.push_str(
+            "No codegraph stdio MCP server is registered at all, but that does not prove none is \
+             holding this index database:\n",
+        );
+        if let Some((path, error)) = registry_unavailable {
+            out.push_str(&format!(
+                "  - the stdio MCP registry at {path} could not be read ({error}), so this check \
+                 cannot tell either way;\n  - even a readable registry can be empty because \
+                 nothing has registered yet;\n"
+            ));
+        } else {
+            out.push_str("  - nothing has registered yet, so the registry is empty;\n");
+        }
+        out.push_str(
+            "  - codegraph 0.40.x and earlier never register at all, so they never appear here.\n",
+        );
+    } else {
+        out.push_str(
+            "Every registered codegraph stdio MCP server is listed below — any of them may be \
+             holding this index database open. Each row names the project the server was LAUNCHED \
+             for, which is only its default: a client can ask any server to open a different \
+             indexed project, so its launch project does not limit which index it may hold.\n",
+        );
+        for info in holders {
+            let launched_for = match info.project.as_deref() {
+                Some(project) => format!("launched for {project}"),
+                None => "launched without --path, so it has no default project".to_string(),
+            };
+            out.push_str(&format!(
+                "  - pid {} (codegraph {}) — {launched_for}\n",
+                info.pid, info.version
+            ));
+        }
+        out.push_str(
+            "That list only covers servers that register: codegraph 0.40.x and earlier never did.\n",
+        );
+    }
+    out.push_str(&format!(
+        "Look for `codegraph serve --mcp` with your OS process tools (`pgrep -af 'codegraph serve \
+         --mcp'` on unix, `tasklist` or Task Manager on Windows). A registered pid is not proof of \
+         identity — it may have been reused — so confirm it with `{}` before stopping the holder \
+         with `{}`; closing the client that launched it is cleaner. `codegraph mcp list` shows \
+         every registered server with its start time.\n",
+        mcp_identity_check_command(),
+        mcp_stop_command()
+    ));
+    out
+}
+
+/// Every live stdio MCP registry entry, plus `(path, error)` when the registry
+/// could not be read at all — the ONE read behind both holder diagnostics.
+///
+/// There is deliberately no project-narrowed variant. An entry's `project` is the
+/// path its `serve --mcp` was LAUNCHED with, not the set of databases it can open:
+/// a client passing an absolute `projectPath` reaches any indexed project
+/// (`codegraph-mcp/src/roots.rs`, `resolve_project_arg`). Filtering by that field
+/// would drop genuine holders, which is precisely how a Windows rebuild came to
+/// fail with no holder named.
+fn mcp_live_entries() -> (
+    Vec<codegraph_daemon::mcp_registry::McpServerInfo>,
+    Option<(String, String)>,
+) {
+    match codegraph_daemon::mcp_registry::live_entries() {
+        codegraph_daemon::mcp_registry::RegistryRead::Available(entries) => (entries, None),
+        codegraph_daemon::mcp_registry::RegistryRead::Unavailable { path, error } => {
+            (Vec::new(), Some((path.display().to_string(), error)))
+        }
+    }
+}
+
+/// Warn BEFORE the destructive rebuild when a registered stdio MCP server may
+/// hold this project's index database. Advisory only: it never fails, never
+/// changes the exit code, and prints nothing when there is no live server to name,
+/// so a successful `index` against an empty registry emits its previous bytes
+/// exactly.
+///
+/// Reports EVERY live server rather than the ones whose recorded project contains
+/// `project`. That field is a launch-time default, not a boundary — see
+/// [`mcp_live_entries`] — so narrowing by it silently drops the holder in the very
+/// scenario this warning exists for: a server launched in one project that a
+/// client has since asked to open this one. Over-warning costs a few stderr lines
+/// before a destructive rebuild, and only when a server is actually registered;
+/// under-warning costs the user the Windows failure with nobody named.
+///
+/// An unreadable registry stays SILENT here (a debug event only). It reports
+/// nothing about a holder, and a line on every single `index` run would be noise
+/// the user cannot act on; the same outage IS surfaced on the failure path, where
+/// it finally matters.
+fn warn_if_stdio_mcp_may_hold_index(project: &Path) {
+    let (holders, unavailable) = mcp_live_entries();
+    if holders.is_empty() {
+        if let Some((path, error)) = unavailable {
+            tracing::debug!(
+                %path,
+                %error,
+                "could not read the stdio MCP registry before rebuilding this index"
+            );
+        }
+        return;
+    }
+    eprintln!(
+        "Warning: rebuilding the index for {} deletes its database files, and a process still \
+         holding them makes that delete fail (the Windows failure mode).",
+        project.display()
+    );
+    eprint!("{}", index_holder_guidance(&holders, None));
+}
+
+/// Append holder guidance to the CLI's presentation of a `RemoveDatabase`
+/// failure — the exact Windows failure point, where `std::fs::remove_file` on an
+/// open `codegraph.db` cannot succeed. The store-layer message
+/// (`cannot remove v2 database artifact {path}: {source}`) is a statement of fact
+/// and is left untouched; this only adds "who may be holding it, and how to stop
+/// it" AFTER it, and the original error chain is neither wrapped nor swallowed.
+///
+/// Reports EVERY live registered server, exactly like the PRE-WARNING path — a
+/// server's recorded project is only its launch default, so neither path may
+/// filter on it (see [`mcp_live_entries`]). Two independent reasons converge here:
+/// all this error hands us is a database path, and a database path is not even a
+/// project root (with `CODEGRAPH_DIR` set the current index root is a
+/// `<name>-v2-<projectIdentity>` SIBLING of the normalized legacy root, so the
+/// artifact can live outside the project tree entirely). An over-inclusive list is
+/// strictly better than hiding the actual holder, and each row names its own
+/// launch project so a reader can still tell which is which.
+///
+/// Deliberately NOT integration-tested (decision B of the rev55 plan): the
+/// private `RebuildFault` hook cannot inject a DB removal failure, and a
+/// black-box attempt fails EARLIER, at database open. The text is covered by
+/// [`index_holder_guidance`]'s unit tests; this wiring is confirmed by a
+/// hands-on walk-through.
+fn index_removal_holder_guidance(err: &anyhow::Error) -> Option<String> {
+    err.chain().find_map(
+        |cause| match cause.downcast_ref::<codegraph_store::RebuildError>() {
+            Some(codegraph_store::RebuildError::RemoveDatabase { .. }) => Some(()),
+            _ => None,
+        },
+    )?;
+    let (holders, unavailable) = mcp_live_entries();
+    let unavailable = unavailable
+        .as_ref()
+        .map(|(path, error)| (path.as_str(), error.as_str()));
+    Some(index_holder_guidance(&holders, unavailable))
+}
+
+#[cfg(test)]
+mod index_holder_guidance_tests {
+    use super::{
+        index_holder_guidance, index_removal_holder_guidance, mcp_identity_check_command,
+        mcp_stop_command,
+    };
+    use codegraph_daemon::mcp_registry::McpServerInfo;
+    use std::path::PathBuf;
+
+    fn entry(pid: u32, project: Option<&str>) -> McpServerInfo {
+        McpServerInfo {
+            pid,
+            project: project.map(str::to_string),
+            transport: "stdio".to_string(),
+            started_at: 1_700_000_000_123,
+            version: "0.41.0".to_string(),
+        }
+    }
+
+    /// Branch A — every holder's PID is named, alongside the platform stop
+    /// command a HUMAN runs (decision A: we print it, we never run it).
+    #[test]
+    fn with_holders_names_every_pid_and_the_stop_command() {
+        let text =
+            index_holder_guidance(&[entry(4321, Some("/work/alpha")), entry(9876, None)], None);
+
+        assert!(
+            text.contains("4321") && text.contains("9876"),
+            "every holder pid must be named: {text:?}"
+        );
+        assert!(
+            text.contains(mcp_stop_command()),
+            "the platform stop command must be offered as guidance: {text:?}"
+        );
+        assert!(
+            text.contains("/work/alpha"),
+            "a pinned holder must name the project it serves: {text:?}"
+        );
+        assert!(
+            text.contains("--path"),
+            "a holder with no project must be explained (started without --path): {text:?}"
+        );
+        assert!(
+            text.contains("does not limit which index"),
+            "a row's project is the one its server was LAUNCHED for; presenting it as a limit on \
+             what that server can open is the defect this text must not repeat: {text:?}"
+        );
+        assert!(
+            text.contains("0.40.x"),
+            "the registered set is not exhaustive; legacy builds never register: {text:?}"
+        );
+        assert!(
+            !text.contains("does not prove"),
+            "the found-a-holder branch must not read like the nothing-found one: {text:?}"
+        );
+        assert!(
+            text.contains(mcp_identity_check_command()) && text.contains("reused"),
+            "a registered pid is not proof of identity, so the user must be told to confirm \
+             it before stopping it: {text:?}"
+        );
+        assert!(
+            text.ends_with('\n'),
+            "guidance is printed with `eprint!`, so it must end with a newline: {text:?}"
+        );
+    }
+
+    /// Branch B, readable-but-empty — must name BOTH causes at once: nothing has
+    /// registered yet, AND `<=0.40.x` never registers, so absence is not proof.
+    #[test]
+    fn without_holders_covers_empty_and_legacy_causes() {
+        let text = index_holder_guidance(&[], None);
+
+        assert!(
+            text.contains("does not prove"),
+            "absence of a registered holder must not be presented as proof: {text:?}"
+        );
+        assert!(
+            text.contains("registered yet"),
+            "cause 1: the registry may simply be empty: {text:?}"
+        );
+        assert!(
+            text.contains("0.40.x"),
+            "cause 2: legacy builds never register at all: {text:?}"
+        );
+        assert!(
+            text.contains("codegraph serve --mcp") && text.contains("OS process tools"),
+            "the user must be told what to look for, and with what: {text:?}"
+        );
+        assert!(
+            text.contains(mcp_stop_command()),
+            "the platform stop command must be offered here too: {text:?}"
+        );
+        assert!(
+            !text.contains("could not be read"),
+            "a readable-but-empty registry must not be reported as an outage: {text:?}"
+        );
+        assert!(text.ends_with('\n'), "must end with a newline: {text:?}");
+    }
+
+    /// Branch B, unreadable — same actionable advice, plus the registry path and
+    /// error so the outage is distinguishable from a genuinely empty registry.
+    /// All THREE causes are spelled out here (unreadable / possibly-empty /
+    /// legacy) so no reader concludes the check was authoritative.
+    #[test]
+    fn unreadable_registry_renders_the_nothing_found_branch_with_its_path() {
+        let text = index_holder_guidance(
+            &[],
+            Some(("/state/codegraph/mcp", "Not a directory (os error 20)")),
+        );
+
+        assert!(
+            text.contains("/state/codegraph/mcp") && text.contains("Not a directory (os error 20)"),
+            "the outage must name the registry path and the error: {text:?}"
+        );
+        assert!(
+            text.contains("could not be read"),
+            "the outage must be stated as an outage: {text:?}"
+        );
+        assert!(
+            text.contains("registered yet"),
+            "a readable registry could ALSO have been empty; say so: {text:?}"
+        );
+        assert!(
+            text.contains("0.40.x"),
+            "legacy builds never register at all, outage or not: {text:?}"
+        );
+        assert!(
+            text.contains("codegraph serve --mcp") && text.contains(mcp_stop_command()),
+            "the advice must stay actionable during an outage: {text:?}"
+        );
+        assert!(text.ends_with('\n'), "must end with a newline: {text:?}");
+    }
+
+    /// The FAILURE path must not narrow by the failing artifact's path. With
+    /// `CODEGRAPH_DIR` set, the current index root is a `<name>-v2-<identity>`
+    /// SIBLING of the normalized legacy root, so the database can live entirely
+    /// OUTSIDE the project tree; narrowing by it would then match no pinned entry
+    /// and wrongly report that no registered server matches. An over-inclusive
+    /// diagnostic beats hiding the actual holder — each row names its own project,
+    /// so a reader can still tell which is which.
+    #[test]
+    fn removal_guidance_reports_a_holder_pinned_outside_the_failing_artifact_path() {
+        let dir =
+            std::env::temp_dir().join(format!("cg-mcp-removal-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut env = crate::test_env::env_guard();
+        env.set(
+            codegraph_daemon::mcp_registry::CODEGRAPH_MCP_REGISTRY_DIR,
+            &dir,
+        );
+
+        let holder = entry(std::process::id(), Some("/unrelated/elsewhere"));
+        codegraph_daemon::mcp_registry::write_entry(&holder).unwrap();
+        let err = anyhow::Error::new(codegraph_store::RebuildError::RemoveDatabase {
+            path: PathBuf::from("/state/codegraph-v2-0f1e2d/codegraph.db"),
+            source: std::io::Error::other("the process cannot access the file"),
+        });
+
+        let text = index_removal_holder_guidance(&err);
+
+        drop(env);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let text = text.expect("a RemoveDatabase failure must carry holder guidance");
+        assert!(
+            text.contains(&holder.pid.to_string()) && text.contains("/unrelated/elsewhere"),
+            "a live registered server must be reported even though the failing artifact does not \
+             live under its project: {text:?}"
+        );
+    }
 }
 
 /// Render the running-servers table, or a "none" line when empty.
@@ -3140,13 +3698,22 @@ fn cmd_impact(
             godot_files.push(node.file_path.clone());
         }
     }
-    let mut affected = nodes.values().map(NodeSummary::from).collect::<Vec<_>>();
     let mut godot_referrers: Vec<String> = Vec::new();
     for file in &godot_files {
         godot_referrers.extend(godot_reverse_referrers(&store, file)?);
     }
     godot_referrers.sort();
     godot_referrers.dedup();
+    // A loader-side referrer may already be represented by a graph edge (for
+    // example, a GDScript `preload`). Keep the path-keyed resource lane
+    // structurally disjoint from traversal nodes before counting or rendering.
+    let traversal_file_paths = nodes
+        .values()
+        .map(|node| node.file_path.as_str())
+        .collect::<HashSet<_>>();
+    godot_referrers.retain(|file| !traversal_file_paths.contains(file.as_str()));
+    let resource_edge_count = godot_referrers.len();
+    let mut affected = nodes.values().map(NodeSummary::from).collect::<Vec<_>>();
     for from_file in godot_referrers {
         affected.push(NodeSummary {
             name: from_file.clone(),
@@ -3161,7 +3728,8 @@ fn cmd_impact(
             "symbol": symbol,
             "depth": depth,
             "nodeCount": affected.len(),
-            "edgeCount": edge_keys.len(),
+            "edgeCount": edge_keys.len() + resource_edge_count,
+            "resourceEdgeCount": resource_edge_count,
             "affected": affected,
             "godotDynamic": godot.as_json(),
         }))?;

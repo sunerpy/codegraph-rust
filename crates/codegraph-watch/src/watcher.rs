@@ -301,9 +301,10 @@ pub struct WatchOptions {
     /// Called for a non-degrading watch/sync error (e.g. inotify watch-count
     /// exhaustion). May fire more than once; the watcher keeps running.
     pub on_sync_error: Option<NoticeCallback>,
-    /// The addressed project's `config.toml` `include`/`exclude` path patterns
-    /// (#1063). Threaded into the [`WatchPolicy`] and the default incremental-sync
-    /// fn so the watcher's scope matches the scan's. Empty = pre-#1063 behavior.
+    /// The addressed project's `config.toml` indexing scope. Threaded into the
+    /// [`WatchPolicy`] and default sync functions so watcher scope matches scan.
+    pub ignore_dirs: Vec<String>,
+    pub ignore_paths: Vec<String>,
     pub include: Vec<String>,
     pub exclude: Vec<String>,
     /// The addressed project's custom extension→language overrides (its
@@ -322,6 +323,7 @@ pub struct WatchOptions {
 
 impl Default for WatchOptions {
     fn default() -> Self {
+        let indexing = codegraph_core::config::IndexingConfig::default();
         Self {
             // Upstream default debounce is 2000ms (`watch-policy.ts` notes and
             // `watcher.ts:86-90,220-223`); env override is clamped [100ms, 60s].
@@ -332,8 +334,10 @@ impl Default for WatchOptions {
             on_sync_complete: None,
             on_degraded: None,
             on_sync_error: None,
-            include: Vec::new(),
-            exclude: Vec::new(),
+            ignore_dirs: indexing.ignore_dirs,
+            ignore_paths: indexing.ignore_paths,
+            include: indexing.include,
+            exclude: indexing.exclude,
             extensions: ExtensionOverrides::empty(),
             sync_fn: None,
             full_sync_fn: None,
@@ -346,11 +350,9 @@ impl WatchOptions {
     /// Build watch options from ONE project's immutable [`Config`] and its own
     /// extension overrides.
     ///
-    /// `include`/`exclude` and the debounce window come from that project, and
-    /// `watch.enabled = false` disables watching for it — so two projects served
-    /// by one process can watch different scopes (or one not at all). An explicit
-    /// `CODEGRAPH_WATCH_DEBOUNCE_MS` still wins, keeping the documented env escape
-    /// hatch authoritative over config.
+    /// Indexing scope and the debounce window come from that project, and
+    /// `watch.enabled = false` disables watching for it. An explicit
+    /// `CODEGRAPH_WATCH_DEBOUNCE_MS` still wins over config.
     /// Share `cancel` with this watcher's default sync closures so a shutdown
     /// can cancel queued and running lease loops.
     #[must_use]
@@ -364,6 +366,8 @@ impl WatchOptions {
         Self {
             debounce: debounce_from_env_or(config.watch.debounce_ms),
             no_watch: !config.watch.enabled,
+            ignore_dirs: config.indexing.ignore_dirs.clone(),
+            ignore_paths: config.indexing.ignore_paths.clone(),
             include: config.indexing.include.clone(),
             exclude: config.indexing.exclude.clone(),
             extensions,
@@ -421,8 +425,14 @@ impl ProjectWatcher {
         if watch_disabled_reason(&project_root, options.no_watch).is_some() {
             return Ok(None);
         }
-        let policy = WatchPolicy::with_config(&project_root, &options.include, &options.exclude)
-            .with_extension_overrides(Arc::clone(&options.extensions));
+        let policy = WatchPolicy::with_config(
+            &project_root,
+            &options.ignore_dirs,
+            &options.ignore_paths,
+            &options.include,
+            &options.exclude,
+        )
+        .with_extension_overrides(Arc::clone(&options.extensions));
         let db_path = match options.db_path.clone() {
             Some(db) => db,
             None => default_db_path(&project_root)?,
@@ -2290,15 +2300,15 @@ mod tests {
 
     #[test]
     fn collect_watch_dirs_honors_gitignore_pruning() {
-        // `.godot/` is not in DEFAULT_IGNORE_DIRS, but a real Godot project lists
-        // it in .gitignore, which WatchPolicy::new merges. This proves the watch
-        // set is pruned by the SAME merged policy (not a second hardcoded list),
-        // so project-specific ignores keep us out of generated trees too.
+        // `.generated/` is deliberately absent from the default ignores. This
+        // proves the watch set is pruned by the SAME merged policy (not a second
+        // hardcoded list), so project-specific ignores keep us out of generated
+        // trees too.
         let dir = crate::sync::tests::TestDir::new("watch-collect-gitignore");
         let root = dir.path();
-        fs::write(root.join(".gitignore"), ".godot/\n").unwrap();
+        fs::write(root.join(".gitignore"), ".generated/\n").unwrap();
         fs::create_dir_all(root.join("scenes")).unwrap();
-        fs::create_dir_all(root.join(".godot/imported")).unwrap();
+        fs::create_dir_all(root.join(".generated/cache")).unwrap();
 
         let policy = WatchPolicy::new(root);
         let dirs = collect_watch_dirs(root, &policy);
@@ -2309,8 +2319,8 @@ mod tests {
 
         assert!(got.contains(&"scenes".to_string()), "source dir kept");
         assert!(
-            !got.iter().any(|p| p.starts_with(".godot")),
-            ".godot subtree must be pruned via .gitignore, got {got:?}"
+            !got.iter().any(|p| p.starts_with(".generated")),
+            ".generated subtree must be pruned via .gitignore, got {got:?}"
         );
     }
 

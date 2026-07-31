@@ -374,8 +374,14 @@ fn sync_paths_with_store(
     started: std::time::Instant,
     mut on_progress: impl FnMut(usize, usize),
 ) -> Result<SyncOutcome> {
-    let policy = WatchPolicy::with_config(project_root, include, exclude)
-        .with_extension_overrides(Arc::clone(&scope.options.extensions));
+    let policy = WatchPolicy::with_config(
+        project_root,
+        &scope.options.ignore_dirs,
+        &scope.options.ignore_paths,
+        include,
+        exclude,
+    )
+    .with_extension_overrides(Arc::clone(&scope.options.extensions));
     let mut outcome = SyncOutcome::default();
     let mut changed = false;
     let mut seen = HashSet::new();

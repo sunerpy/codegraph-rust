@@ -33,6 +33,24 @@ dropping `addons`:
 ignore_dirs = [".godot", "node_modules", "target", "dist", ".venv"]
 ```
 
+### Exact-name search recall
+
+When your query string equals a symbol's name — compared case-insensitively over
+the whole name, not as a substring — that symbol is returned as the **first**
+result, ahead of any row that would otherwise outscore it on file-path relevance
+or symbol kind. Long, precise GDScript names benefit most: querying
+`apply_status_effect` puts that `func` at the top instead of burying it under
+shorter partial matches from busier files.
+
+Two details worth knowing. The query has to be the name typed as-is; a multi-word
+paraphrase never satisfies the whole-name comparison, since a query containing
+whitespace cannot equal a symbol name that has none. And the rescue only lifts an
+exact match that was tied with or below the best non-exact result — a row already
+ranked first keeps its original score untouched. Ordering is deterministic, so
+repeating the same query returns the same order every time.
+
+This applies to every language CodeGraph indexes, not just Godot.
+
 ### `project.godot` — autoload singletons, input actions, plugins
 
 | Extracted item                   | Graph representation                                                       |
@@ -68,15 +86,16 @@ see [Honesty signals](#honesty-signals) below).
 
 ### `.tres` — text resources
 
-Each `.tres` file emits a single resource marker node (typed from the
-`[gd_resource type="..."]` header) and `References` edges for every
-`ExtResource(…)` it references:
+Each `.tres` file with an external reference emits a single resource marker node,
+named from a non-empty `script_class` first, then `type`, and finally the default
+`"resource"` (regardless of header attribute order), plus `References` edges for
+every `ExtResource(…)` it references:
 
-| Extracted item                  | Graph representation                                        |
-| ------------------------------- | ----------------------------------------------------------- |
-| `[gd_resource type="T"]`        | One `Constant` marker node named after the resource type    |
-| `script = ExtResource(…)`       | `References` edge: marker → repo-relative `.gd` path        |
-| Any property `= ExtResource(…)` | `References` edge: marker → referenced `.tres`/`.tscn` path |
+| Extracted item                            | Graph representation                                                  |
+| ----------------------------------------- | --------------------------------------------------------------------- |
+| `[gd_resource script_class="C" type="T"]` | One `Constant` marker named `C`; falls back to `T`, then `"resource"` |
+| `script = ExtResource(…)`                 | `References` edge: marker → repo-relative `.gd` path                  |
+| Any property `= ExtResource(…)`           | `References` edge: marker → referenced `.tres`/`.tscn` path           |
 
 A self-contained `.tres` with no external references produces no extra nodes and
 no edges — just the file node from ingestion.
@@ -260,6 +279,14 @@ on incoming graph edges.
   (`affectedFiles ⊇ affectedTests`), so for a Godot project with no test files it
   still LISTS the dependent scenes/resources instead of only counting them —
   bringing `affected` into agreement with `impact` / `audit --impact`.
+- **Edge counts** (`codegraph impact <symbol> --json`) — `edgeCount` now covers
+  **all** impact edges, the Godot static resource edges included, with a sibling
+  `resourceEdgeCount` reporting just the resource share (code edges are
+  `edgeCount - resourceEdgeCount`). Before this, a `.gd` referenced only from
+  `.tres` files reported `edgeCount: 0` while listing every referrer under
+  `affected` — those referrers have no tree-sitter grammar and so no graph edges
+  of their own to count. The resource count is drawn from the same sorted+deduped
+  referrer set appended to `affected`, so the count and the list always agree.
 
 This is a static structural report. Runtime `ResourceLoader` load-verification is
 out of scope (that is Godot MCP Pro's job). See [`cli.md`](cli.md) for the full

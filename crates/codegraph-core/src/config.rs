@@ -161,8 +161,10 @@ fn default_ignore_dirs() -> Vec<String> {
         ".dart_tool".to_string(),
         ".pub-cache".to_string(),
         // Godot — .godot is the regenerated engine import/cache dir (never source);
-        // addons holds vendored third-party editor plugins / GDScript. Both are
-        // re-includable via a .gitignore negation or a custom indexing.ignore_dirs.
+        // addons holds vendored third-party editor plugins / GDScript. Re-include
+        // either one by dropping it from a custom indexing.ignore_dirs; a
+        // .gitignore negation cannot, because scan_dir prunes every ignore_dirs
+        // entry before it evaluates any pattern set.
         ".godot".to_string(),
         "addons".to_string(),
     ]

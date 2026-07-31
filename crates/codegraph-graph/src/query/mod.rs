@@ -116,7 +116,8 @@ pub fn search_nodes(
                 )
                 + scoring::name_match_bonus(&result.node.name, scoring_query);
         }
-        sort_by_score_desc(&mut results);
+
+        sort_by_exact_name_then_score_desc(&mut results, scoring_query);
         if results.len() > limit as usize {
             results.truncate(limit as usize);
         }
@@ -145,6 +146,17 @@ fn sort_by_score_desc(results: &mut [SearchResult]) {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+    });
+}
+
+fn sort_by_exact_name_then_score_desc(results: &mut [SearchResult], query: &str) {
+    // Both sorts are stable: establish score order first, then group exact whole-name
+    // matches ahead of non-exact rows without mutating the externally visible scores.
+    sort_by_score_desc(results);
+    results.sort_by(|a, b| {
+        let a_is_exact = scoring::is_exact_name_match(&a.node.name, query);
+        let b_is_exact = scoring::is_exact_name_match(&b.node.name, query);
+        b_is_exact.cmp(&a_is_exact)
     });
 }
 
