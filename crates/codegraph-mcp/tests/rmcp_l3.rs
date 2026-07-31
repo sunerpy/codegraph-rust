@@ -113,6 +113,8 @@ fn known_protocol_versions_are_echoed_by_handshake() {
     rt().block_on(async {
         for (requested, expected) in [
             (ProtocolVersion::V_2024_11_05, "2024-11-05"),
+            (ProtocolVersion::V_2025_03_26, "2025-03-26"),
+            (ProtocolVersion::V_2025_06_18, "2025-06-18"),
             (ProtocolVersion::V_2025_11_25, "2025-11-25"),
             (ProtocolVersion::V_2026_07_28, "2026-07-28"),
         ] {
@@ -140,6 +142,8 @@ fn result_type_is_versioned_for_tools_list_and_call() {
     rt().block_on(async {
         for (requested, expected) in [
             (ProtocolVersion::V_2024_11_05, None),
+            (ProtocolVersion::V_2025_03_26, None),
+            (ProtocolVersion::V_2025_06_18, None),
             (ProtocolVersion::V_2025_11_25, None),
             (ProtocolVersion::V_2026_07_28, Some("complete")),
         ] {

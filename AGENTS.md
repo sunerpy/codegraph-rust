@@ -91,7 +91,7 @@ corrected. The 3.x breaking changes that bit third-party code were all CLIENT-si
 which touch a server `ServerHandler`. `Peer::list_roots` is still `#[deprecated]` (SEP-2577) with
 still no replacement, so the `#[allow(deprecated)]` at `rmcp_handler.rs:334` stays.
 
-**We serve three protocol revisions, and that is the SDK default rather than a choice.**
+**We serve five protocol revisions, and that is the SDK default rather than a choice.**
 `ProtocolVersion` is `struct ProtocolVersion(Cow<'static, str>)` plus associated constants (NOT an
 enum); rmcp's `negotiate_protocol_version` echoes back any client-requested version present in
 `KNOWN_VERSIONS`. So `get_info()`'s `.with_protocol_version(V_2024_11_05)` is only the FALLBACK for
@@ -100,6 +100,8 @@ an unknown client version — it is not a ceiling, and we do not pin or force 20
 | client requests | negotiated | `resultType` in results | HTTP session           |
 | --------------- | ---------- | ----------------------- | ---------------------- |
 | 2024-11-05      | 2024-11-05 | absent                  | no header (our config) |
+| 2025-03-26      | 2025-03-26 | absent                  | no header (our config) |
+| 2025-06-18      | 2025-06-18 | absent                  | no header (our config) |
 | 2025-11-25      | 2025-11-25 | absent                  | no header (our config) |
 | 2026-07-28      | 2026-07-28 | `"complete"`            | no header (per spec)   |
 
@@ -116,9 +118,14 @@ tool, while a missing protocol header or a mismatched `Mcp-Method` / `Mcp-Name` 
 HTTP 400 + JSON-RPC code `-32020`. Coverage lives in `tests/rmcp_l3.rs` (version echo, `resultType`
 presence/absence) and `tests/rmcp_http.rs` (no session header, SEP-2243 both branches).
 
-**Not implemented, deliberately:** Tasks (SEP-2663), MRTR / elicitation-in-tool, subscriptions, and
-discovery. These are capability-gated, so a 2026-07-28 server may legitimately omit them — we
-declare tools only and always return `Complete`.
+**Not implemented, deliberately:** Tasks (SEP-2663), MRTR / elicitation-in-tool, and subscriptions.
+We advertise only the tools capability and always return `CallToolResponse::Complete`; we never
+construct `Task` or `InputRequired`. `accepted_subscription_filter` keeps its `None` default, while
+legacy `subscribe` / `unsubscribe` return method-not-found. The request surface is not literally
+tools-only, however: we do not override `discover`, so rmcp's default answers with
+`supported_protocol_versions()` plus `get_info()`, and its default `complete` handler returns an
+empty `CompleteResult`. The default `set_level` handler returns method-not-found. These SDK defaults
+do not add advertised capabilities.
 
 **MCP golden fixtures are STRUCTURAL, not byte-stable.** `tests/support/parity.rs:244-300` and
 `tests/golden_mcp.rs` compare only NAMED fields — initialize: `protocolVersion`, `capabilities`,
