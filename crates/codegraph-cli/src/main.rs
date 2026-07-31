@@ -3147,6 +3147,7 @@ fn cmd_impact(
     }
     godot_referrers.sort();
     godot_referrers.dedup();
+    let resource_edge_count = godot_referrers.len();
     for from_file in godot_referrers {
         affected.push(NodeSummary {
             name: from_file.clone(),
@@ -3161,7 +3162,8 @@ fn cmd_impact(
             "symbol": symbol,
             "depth": depth,
             "nodeCount": affected.len(),
-            "edgeCount": edge_keys.len(),
+            "edgeCount": edge_keys.len() + resource_edge_count,
+            "resourceEdgeCount": resource_edge_count,
             "affected": affected,
             "godotDynamic": godot.as_json(),
         }))?;
