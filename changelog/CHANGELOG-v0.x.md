@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.42.0](https://github.com/sunerpy/codegraph-rust/compare/v0.41.0...v0.42.0) (2026-07-31)
+
+
+### Features
+
+* **mcp:** upgrade rmcp to 3.0.1 and serve MCP 2026-07-28 ([#177](https://github.com/sunerpy/codegraph-rust/issues/177)) ([e2604a5](https://github.com/sunerpy/codegraph-rust/commit/e2604a5b619946c4282db5abd90724ee6a0ab64f))
+* surface stdio MCP processes and fix Godot reading gaps ([#175](https://github.com/sunerpy/codegraph-rust/issues/175)) ([3e60eba](https://github.com/sunerpy/codegraph-rust/commit/3e60eba833f9c1f64e34e398d5ffd0c66b9d271d))
+
 ## [0.41.0](https://github.com/sunerpy/codegraph-rust/compare/v0.40.4...v0.41.0) (2026-07-30)
 
 
