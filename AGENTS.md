@@ -122,10 +122,14 @@ presence/absence) and `tests/rmcp_http.rs` (no session header, SEP-2243 both bra
 We advertise only the tools capability and always return `CallToolResponse::Complete`; we never
 construct `Task` or `InputRequired`. `accepted_subscription_filter` keeps its `None` default, while
 legacy `subscribe` / `unsubscribe` return method-not-found. The request surface is not literally
-tools-only, however: we do not override `discover`, so rmcp's default answers with
-`supported_protocol_versions()` plus `get_info()`, and its default `complete` handler returns an
-empty `CompleteResult`. The default `set_level` handler returns method-not-found. These SDK defaults
-do not add advertised capabilities.
+tools-only, however: SIX inherited defaults still answer `Ok`. `discover` returns real content
+(`supported_protocol_versions()` plus `get_info()`); `complete` returns an empty `CompleteResult`;
+`list_prompts` / `list_resources` / `list_resource_templates` (`handler/server.rs:362-383`) return
+EMPTY results, so `prompts/list`, `resources/list`, and `resources/templates/list` answer with
+nothing rather than method-not-found; and `ping` succeeds on the legacy revisions only
+(method-not-found at 2026-07-28, `handler/server.rs:112-118`). The `set_level`, `get_prompt`,
+`read_resource`, and task-lifecycle defaults return method-not-found. These are SDK defaults, not
+our implementations, and they add no advertised capabilities.
 
 **MCP golden fixtures are STRUCTURAL, not byte-stable.** `tests/support/parity.rs:244-300` and
 `tests/golden_mcp.rs` compare only NAMED fields — initialize: `protocolVersion`, `capabilities`,

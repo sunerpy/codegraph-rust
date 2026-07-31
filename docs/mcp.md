@@ -40,11 +40,16 @@ The server advertises only the **tools** capability, and every tool call returns
 a complete result; it never constructs the task or input-required response forms,
 so Tasks (SEP-2663) and MRTR / elicitation-in-tool are not implemented.
 Subscriptions are also unimplemented: the handler accepts no subscription filter,
-and the legacy subscribe methods return method-not-found. Two request-level SDK
-defaults remain callable despite that narrow capability advertisement: discovery
-returns rmcp's known protocol versions plus this server's `get_info()`, and
-completion returns an empty default result. Logging `setLevel` is not implemented
-and returns method-not-found.
+and the legacy subscribe methods return method-not-found. Six request-level SDK
+defaults still answer successfully despite that narrow capability advertisement:
+discovery returns rmcp's known protocol versions plus this server's `get_info()`;
+completion returns an empty default result; `prompts/list`, `resources/list`, and
+`resources/templates/list` each return an empty list rather than an error, so
+probing for prompts or resources gets a successful response with nothing in it;
+and `ping` succeeds on the legacy revisions (it is method-not-found at
+2026-07-28). None of these are our implementations — they are inherited SDK
+defaults we do not override, and they add no advertised capability. Logging
+`setLevel`, `prompts/get`, and `resources/read` return method-not-found.
 
 ---
 
