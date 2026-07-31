@@ -150,16 +150,56 @@ const GUIDANCE_VOCABULARY: [&str; 3] = ["stdio MCP", "0.40.x", "serve --mcp"];
 /// the subscriber's startup timestamp on stderr, and the elapsed-duration tail of
 /// the summary on stdout. What remains must match byte-for-byte, which is how the
 /// "successful output is unchanged" claim is checked without a stored baseline.
+///
+/// The duration is matched by the SUMMARY LINE'S SHAPE, not by the unit: the line
+/// `print_index_result` emits always reads `{n} nodes, {m} edges in {duration}`,
+/// while `format_duration` renders that duration in EITHER unit — `{}ms` below
+/// 1000ms, `{:.1}s` at or above. Keying off the unit (e.g. `ends_with("ms")`)
+/// silently stops normalizing on a loaded machine where the index crosses into
+/// seconds; keying off `ends_with('s')` instead would over-normalize ordinary
+/// prose. So: only lines carrying both summary fragments are truncated, at their
+/// LAST " in ".
 fn normalize(stream: &str) -> String {
     stream
         .lines()
         .filter(|line| !line.contains("logger initialized"))
-        .map(|line| match line.find(" in ") {
-            Some(at) if line.ends_with("ms") => line[..at].to_string(),
-            _ => line.to_string(),
+        .map(|line| {
+            let is_summary = line.contains(" nodes, ") && line.contains(" edges in ");
+            match line.rfind(" in ") {
+                Some(at) if is_summary => line[..at].to_string(),
+                _ => line.to_string(),
+            }
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// `normalize` must erase the duration in BOTH of `format_duration`'s units, and
+/// must not touch a non-summary line that merely happens to contain " in ".
+#[test]
+fn normalize_erases_the_duration_in_either_unit_and_nothing_else() {
+    assert_eq!(
+        normalize("Indexed 3 files\n13 nodes, 21 edges in 1.6s"),
+        normalize("Indexed 3 files\n13 nodes, 21 edges in 1.8s"),
+        "seconds-form durations must normalize equal"
+    );
+    assert_eq!(
+        normalize("Indexed 3 files\n13 nodes, 21 edges in 320ms"),
+        normalize("Indexed 3 files\n13 nodes, 21 edges in 410ms"),
+        "milliseconds-form durations must normalize equal"
+    );
+    assert_eq!(
+        normalize("13 nodes, 21 edges in 1.6s"),
+        "13 nodes, 21 edges",
+        "the summary must keep its counts and lose only the duration"
+    );
+
+    let prose = "wrote the report in triplicate for the archives";
+    assert_eq!(
+        normalize(prose),
+        prose,
+        "a non-summary line containing \" in \" must survive untouched"
+    );
 }
 
 /// A live server registered against THIS project is warned about before the
