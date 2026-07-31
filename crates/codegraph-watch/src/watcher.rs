@@ -304,6 +304,7 @@ pub struct WatchOptions {
     /// The addressed project's `config.toml` indexing scope. Threaded into the
     /// [`WatchPolicy`] and default sync functions so watcher scope matches scan.
     pub ignore_dirs: Vec<String>,
+    pub ignore_paths: Vec<String>,
     pub include: Vec<String>,
     pub exclude: Vec<String>,
     /// The addressed project's custom extension→language overrides (its
@@ -334,6 +335,7 @@ impl Default for WatchOptions {
             on_degraded: None,
             on_sync_error: None,
             ignore_dirs: indexing.ignore_dirs,
+            ignore_paths: indexing.ignore_paths,
             include: indexing.include,
             exclude: indexing.exclude,
             extensions: ExtensionOverrides::empty(),
@@ -365,6 +367,7 @@ impl WatchOptions {
             debounce: debounce_from_env_or(config.watch.debounce_ms),
             no_watch: !config.watch.enabled,
             ignore_dirs: config.indexing.ignore_dirs.clone(),
+            ignore_paths: config.indexing.ignore_paths.clone(),
             include: config.indexing.include.clone(),
             exclude: config.indexing.exclude.clone(),
             extensions,
@@ -425,6 +428,7 @@ impl ProjectWatcher {
         let policy = WatchPolicy::with_config(
             &project_root,
             &options.ignore_dirs,
+            &options.ignore_paths,
             &options.include,
             &options.exclude,
         )

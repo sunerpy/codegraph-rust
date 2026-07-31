@@ -66,7 +66,13 @@ fn scan_and_watch_agree_on_include_file_verdicts() {
             ..ExtractOptions::default()
         };
         let scanned = scan_project(&project, &options).expect("scan");
-        let policy = WatchPolicy::with_config(&project, &options.ignore_dirs, &include, &[]);
+        let policy = WatchPolicy::with_config(
+            &project,
+            &options.ignore_dirs,
+            &options.ignore_paths,
+            &include,
+            &[],
+        );
 
         for file in candidate_files {
             let in_scan = scanned.iter().any(|f| f == file);
@@ -99,7 +105,13 @@ fn gen_glob_indexes_and_watches_gitignored_file() {
         "gen* must index gen/helper.ts: {scanned:?}"
     );
 
-    let policy = WatchPolicy::with_config(&project, &options.ignore_dirs, &include, &[]);
+    let policy = WatchPolicy::with_config(
+        &project,
+        &options.ignore_dirs,
+        &options.ignore_paths,
+        &include,
+        &[],
+    );
     assert!(
         policy.should_handle_file("gen/helper.ts"),
         "gen* must watch gen/helper.ts (parity with scan)"
@@ -125,7 +137,13 @@ fn configured_exclude_applies_with_empty_include() {
         ..ExtractOptions::default()
     };
     let scanned = scan_project(&project, &options).expect("scan");
-    let policy = WatchPolicy::with_config(&project, &options.ignore_dirs, &[], &exclude);
+    let policy = WatchPolicy::with_config(
+        &project,
+        &options.ignore_dirs,
+        &options.ignore_paths,
+        &[],
+        &exclude,
+    );
 
     assert!(!scanned.iter().any(|file| file == "src/generated.ts"));
     assert!(
@@ -154,7 +172,13 @@ fn gitignore_negation_cannot_reinclude_a_configured_ignore_dir() {
         "this test needs `addons` to be a configured ignore dir"
     );
     let scanned = scan_project(&project, &options).expect("scan");
-    let policy = WatchPolicy::with_config(&project, &options.ignore_dirs, &[], &[]);
+    let policy = WatchPolicy::with_config(
+        &project,
+        &options.ignore_dirs,
+        &options.ignore_paths,
+        &[],
+        &[],
+    );
 
     assert!(scanned.iter().any(|file| file == "src/app.ts"));
     assert!(policy.should_handle_file("src/app.ts"));
@@ -174,6 +198,165 @@ fn gitignore_negation_cannot_reinclude_a_configured_ignore_dir() {
     );
 }
 
+/// The `ignore_paths` tier — the FIRST set in the scan's ordered `pattern_sets`
+/// (`ignore_paths` → `exclude` → `.gitignore`). XML is an extractable language
+/// here (Tier-2 embedded / MyBatis mapper), so without this tier the watcher
+/// would keep syncing an Android `res/values/strings.xml` that `index --force`
+/// never indexed — breaking "sync == index --force".
+#[test]
+fn default_ignore_paths_exclude_android_res_from_scan_and_watch() {
+    let project = unique_project("ignore_paths_res");
+    touch(&project, "src/main/java/App.java", "class App {}\n");
+    touch(
+        &project,
+        "res/values/strings.xml",
+        "<resources></resources>\n",
+    );
+
+    let options = ExtractOptions::default();
+    assert!(
+        options.ignore_paths.iter().any(|p| p == "res/values*"),
+        "this test needs the default `res/values*` ignore path: {:?}",
+        options.ignore_paths
+    );
+    let scanned = scan_project(&project, &options).expect("scan");
+    let policy = WatchPolicy::with_config(
+        &project,
+        &options.ignore_dirs,
+        &options.ignore_paths,
+        &[],
+        &[],
+    );
+
+    assert!(
+        scanned.iter().any(|file| file == "src/main/java/App.java"),
+        "a normal source file must still be indexed: {scanned:?}"
+    );
+    assert!(
+        policy.should_handle_file("src/main/java/App.java"),
+        "a normal source file must still be watched"
+    );
+    assert!(
+        !scanned.iter().any(|file| file == "res/values/strings.xml"),
+        "the default `res/values*` ignore path must exclude it from the scan: {scanned:?}"
+    );
+    assert!(
+        !policy.should_handle_file("res/values/strings.xml"),
+        "the default `res/values*` ignore path must also stop the watcher (parity with scan)"
+    );
+}
+
+/// The precision boundary of the tier above: `default_ignore_paths` deliberately
+/// preserves `res/raw/` (real assets) and MyBatis mapper XML under
+/// `src/main/resources/`. Guards against over-excluding with a broader rule.
+#[test]
+fn default_ignore_paths_preserve_res_raw_and_resources_in_scan_and_watch() {
+    let project = unique_project("ignore_paths_preserve");
+    touch(&project, "res/raw/config.xml", "<config></config>\n");
+    touch(
+        &project,
+        "src/main/resources/mapper/UserMapper.xml",
+        "<mapper></mapper>\n",
+    );
+
+    let options = ExtractOptions::default();
+    let scanned = scan_project(&project, &options).expect("scan");
+    let policy = WatchPolicy::with_config(
+        &project,
+        &options.ignore_dirs,
+        &options.ignore_paths,
+        &[],
+        &[],
+    );
+
+    for file in [
+        "res/raw/config.xml",
+        "src/main/resources/mapper/UserMapper.xml",
+    ] {
+        assert!(
+            scanned.iter().any(|scanned_file| scanned_file == file),
+            "{file} must stay indexed: {scanned:?}"
+        );
+        assert!(
+            policy.should_handle_file(file),
+            "{file} must stay watched (parity with scan)"
+        );
+    }
+}
+
+/// `ignore_paths` is a PATTERN SET, not a structural prune: it shares the
+/// negotiable last-match-wins stream with `.gitignore`, so a later `!res/values/`
+/// re-includes what the default `res/values*` dropped — on both sides.
+#[test]
+fn gitignore_negation_still_overrides_a_default_ignore_path() {
+    let project = unique_project("negate_ignore_path");
+    touch(&project, ".gitignore", "!res/values/\n");
+    touch(
+        &project,
+        "res/values/strings.xml",
+        "<resources></resources>\n",
+    );
+
+    let options = ExtractOptions::default();
+    let scanned = scan_project(&project, &options).expect("scan");
+    let policy = WatchPolicy::with_config(
+        &project,
+        &options.ignore_dirs,
+        &options.ignore_paths,
+        &[],
+        &[],
+    );
+
+    assert!(
+        scanned.iter().any(|file| file == "res/values/strings.xml"),
+        "`!res/values/` must override the default ignore path in the scan: {scanned:?}"
+    );
+    assert!(
+        policy.should_watch_dir("res/values"),
+        "`!res/values/` must keep the dir watchable for the watcher too"
+    );
+    assert!(
+        policy.should_handle_file("res/values/strings.xml"),
+        "`!res/values/` must override the default ignore path for the watcher too"
+    );
+}
+
+/// The other half of "pattern set, not structural prune": `include` force-inclusion
+/// still wins over an `ignore_paths` match, because `IncludeSet::forces` re-checks
+/// only `exclude`. A configured `ignore_dirs` entry stays non-re-includable.
+#[test]
+fn include_force_includes_a_default_ignore_path_match() {
+    let project = unique_project("include_ignore_path");
+    touch(
+        &project,
+        "res/values/strings.xml",
+        "<resources></resources>\n",
+    );
+
+    let include = vec!["res/values/**".to_string()];
+    let options = ExtractOptions {
+        include: include.clone(),
+        ..ExtractOptions::default()
+    };
+    let scanned = scan_project(&project, &options).expect("scan");
+    let policy = WatchPolicy::with_config(
+        &project,
+        &options.ignore_dirs,
+        &options.ignore_paths,
+        &include,
+        &[],
+    );
+
+    assert!(
+        scanned.iter().any(|file| file == "res/values/strings.xml"),
+        "`include` must force-include an ignore_paths match in the scan: {scanned:?}"
+    );
+    assert!(
+        policy.should_handle_file("res/values/strings.xml"),
+        "`include` must force-include an ignore_paths match for the watcher too"
+    );
+}
+
 /// The precision boundary of the rule above: `exclude` and `.gitignore` DO share
 /// one last-match-wins stream on both sides, so a later `!pattern` still
 /// overrides an earlier `exclude` match. Guards against over-correcting the
@@ -190,7 +373,13 @@ fn gitignore_negation_still_overrides_a_configured_exclude() {
         ..ExtractOptions::default()
     };
     let scanned = scan_project(&project, &options).expect("scan");
-    let policy = WatchPolicy::with_config(&project, &options.ignore_dirs, &[], &exclude);
+    let policy = WatchPolicy::with_config(
+        &project,
+        &options.ignore_dirs,
+        &options.ignore_paths,
+        &[],
+        &exclude,
+    );
 
     assert!(
         scanned.iter().any(|file| file == "Tools/helper.ts"),
