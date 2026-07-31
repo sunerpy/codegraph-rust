@@ -7,6 +7,10 @@
 //! non-empty, non-error tool result — proving the rmcp direct path serves the
 //! tools. Then closes stdin and confirms the process exits (stdin EOF → rmcp
 //! serve ends → block_on returns → exit).
+//!
+//! A second case reuses the same harness to cover the PID-keyed MCP registry: a
+//! LIVE `serve --mcp` publishes a `<pid>.json` entry describing itself, and
+//! stdin EOF removes it.
 #![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Write};
@@ -194,6 +198,92 @@ fn serve_mcp_direct_routes_through_rmcp_handler() {
     assert!(
         exited,
         "serve --mcp (rmcp) must exit after stdin EOF (rmcp serve loop must end on stream close)"
+    );
+}
+
+#[test]
+fn serve_mcp_direct_registers_its_pid_and_unregisters_on_stdin_eof() {
+    // GIVEN an indexed project served directly, with the PID-keyed MCP registry
+    // pointed at an isolated temp dir (never the developer's real state dir).
+    let home = TestDir::new("registry");
+    let indexed = indexed_project(&home);
+    let registry_dir = home.path().join("mcp-registry");
+
+    let mut child = Command::new(bin())
+        .args(["serve", "--mcp", "--path", indexed.to_str().unwrap()])
+        .env("CODEGRAPH_NO_DAEMON", "1")
+        .env("CODEGRAPH_NO_WATCH", "1")
+        .env("CODEGRAPH_MCP_REGISTRY_DIR", &registry_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn serve --mcp (rmcp)");
+
+    let pid = child.id();
+    let entry_path = registry_dir.join(format!("{pid}.json"));
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("child stdout"));
+    let deadline = Instant::now() + Duration::from_secs(20);
+
+    // WHEN the server has answered `initialize` — proof it is past startup, so
+    // registration (which happens before the serve loop) has already landed.
+    let init = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "rmcp-registry-test", "version": "0" }
+        }
+    });
+    writeln!(stdin, "{init}").unwrap();
+    stdin.flush().unwrap();
+    let init_resp = read_json_line_with_id(&mut stdout, 1, deadline).expect("initialize result");
+    assert_eq!(
+        init_resp["result"]["serverInfo"]["name"],
+        json!("codegraph")
+    );
+
+    // THEN a registry entry keyed by the live process's own pid describes it.
+    let raw = std::fs::read_to_string(&entry_path).unwrap_or_else(|error| {
+        panic!(
+            "a live `serve --mcp` must register {}: {error}",
+            entry_path.display()
+        )
+    });
+    let entry: Value = serde_json::from_str(&raw).expect("registry entry is valid JSON");
+    assert_eq!(
+        entry["pid"],
+        json!(pid),
+        "the entry must carry the serving process's own pid: {raw}"
+    );
+    assert_eq!(entry["transport"], json!("stdio"), "{raw}");
+    let project = entry["project"].as_str().unwrap_or_default();
+    assert!(
+        project.ends_with("mini"),
+        "the entry must record the resolved project path: {raw}"
+    );
+    assert!(
+        entry["version"].as_str().is_some_and(|v| !v.is_empty()),
+        "the entry must record the binary version: {raw}"
+    );
+    assert!(
+        entry["startedAt"].as_u64().is_some_and(|ms| ms > 0),
+        "startedAt is camelCase epoch millis: {raw}"
+    );
+
+    // AND closing stdin (EOF → serve ends → process exits) unregisters it.
+    drop(stdin);
+    assert!(
+        wait_with_timeout(&mut child, Duration::from_secs(10)),
+        "serve --mcp must exit after stdin EOF"
+    );
+    assert!(
+        !entry_path.exists(),
+        "the registry entry must be removed on graceful shutdown: {}",
+        entry_path.display()
     );
 }
 

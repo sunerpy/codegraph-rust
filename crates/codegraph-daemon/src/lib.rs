@@ -8,6 +8,7 @@
 pub mod control;
 pub mod http_registry;
 mod lock;
+pub mod mcp_registry;
 mod paths;
 mod process;
 pub mod proxy;

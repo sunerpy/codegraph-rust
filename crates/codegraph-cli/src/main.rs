@@ -1918,6 +1918,7 @@ fn cmd_serve(
         emit_serve_startup_debug(&project_root, explicit_path, has_codegraph, &mode);
         match mode {
             ServeMode::Direct => {
+                let _registry = register_stdio_mcp_process(project.as_deref());
                 return serve_direct(project, &project_root, no_watch, explicit_path);
             }
             ServeMode::BeDaemon => {
@@ -1939,6 +1940,7 @@ fn cmd_serve(
                 .context("running as detached MCP daemon");
             }
             ServeMode::SpawnOrProxy => {
+                let _registry = register_stdio_mcp_process(project.as_deref());
                 return serve_spawn_or_proxy(project, &project_root, no_watch, explicit_path);
             }
         }
@@ -1947,6 +1949,55 @@ fn cmd_serve(
     eprintln!("Daemon and watcher startup is wired here for tasks 24/25.");
     eprintln!("Use `codegraph serve --mcp` to start the committed MCP stdio server.");
     Ok(())
+}
+
+/// Register THIS process in the global PID-keyed MCP registry and return the
+/// guard that removes the entry when serving ends (stdin EOF is the ordinary
+/// shutdown path). Registered from `Direct` and `SpawnOrProxy` — the FOREGROUND
+/// stdio processes a user sees in their process list — and never from
+/// `BeDaemon`, which already holds the per-project `daemon.pid` lock and would
+/// otherwise be counted twice.
+///
+/// A registry failure NEVER breaks `serve --mcp`: MCP availability outranks
+/// observability, so an unwritable state dir is warned about and serving
+/// continues unregistered. No signal handlers are installed either — a killed
+/// or crashed process leaves a stale entry on purpose, which is exactly what
+/// [`codegraph_daemon::mcp_registry::prune_dead`] self-heals on the next read.
+fn register_stdio_mcp_process(project: Option<&Path>) -> Option<McpRegistryGuard> {
+    use codegraph_daemon::mcp_registry::{self, McpServerInfo};
+
+    let pid = std::process::id();
+    let info = McpServerInfo {
+        pid,
+        project: project.map(|path| path.display().to_string()),
+        transport: "stdio".to_string(),
+        started_at: mcp_registry::now_millis(),
+        version: VERSION.to_string(),
+    };
+    match mcp_registry::write_entry(&info) {
+        Ok(_) => Some(McpRegistryGuard { pid }),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "could not register this stdio MCP process; serving anyway (`codegraph mcp list` \
+                 will not show it)"
+            );
+            None
+        }
+    }
+}
+
+/// Best-effort removal of this process's own MCP registry entry on scope exit.
+/// A crash is covered by the next read's prune, so this is a courtesy, not a
+/// correctness requirement.
+struct McpRegistryGuard {
+    pid: u32,
+}
+
+impl Drop for McpRegistryGuard {
+    fn drop(&mut self) {
+        let _ = codegraph_daemon::mcp_registry::remove_entry(self.pid);
+    }
 }
 
 /// `serve --http`: serve MCP over streamable-HTTP (rmcp). Two modes selected by
