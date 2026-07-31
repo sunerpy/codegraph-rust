@@ -26,9 +26,9 @@ use std::time::Duration;
 
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ContentBlock, ErrorData, Implementation,
-    InitializeResult, JsonObject, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
-    ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
+    Implementation, InitializeResult, JsonObject, ListToolsResult, PaginatedRequestParams,
+    ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleServer};
 use serde_json::{Value, json};
@@ -295,7 +295,8 @@ fn execute_owned(project_path: &Path, tool_name: &str, args: &Value) -> ToolResu
 impl ServerHandler for CodeGraphHandler {
     fn get_info(&self) -> ServerInfo {
         // capabilities = exactly {"tools":{}} (enable_tools, NO list_changed);
-        // protocolVersion forced to V_2024_11_05 (rmcp defaults to LATEST);
+        // protocolVersion falls back to V_2024_11_05 for unknown client versions;
+        // rmcp negotiates and echoes known versions verbatim.
         // serverInfo{name,version=crate}; instructions reused verbatim.
         InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
@@ -329,9 +330,9 @@ impl ServerHandler for CodeGraphHandler {
         }
 
         // `Peer::list_roots` is `#[deprecated]` (SEP-2577); it is still THE
-        // mechanism in rmcp 2.1 for a server to ask the client for its roots and
-        // has no non-deprecated replacement, so the deprecation is allowed at
-        // this one call site (rmcp pinned to 2.1.x; revisit on upgrade).
+        // mechanism in rmcp 3.0.1 for a server to ask the client for its roots and
+        // still has no non-deprecated replacement, so the deprecation is allowed
+        // at this one call site.
         #[allow(deprecated)]
         let roots = match context.peer.list_roots().await {
             Ok(result) => result,
@@ -358,7 +359,7 @@ impl ServerHandler for CodeGraphHandler {
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
         let tool_name = request.name.to_string();
 
         // Unknown tool → JSON-RPC -32602 (keep our own lookup so rmcp's built-in
@@ -384,7 +385,8 @@ impl ServerHandler for CodeGraphHandler {
             crate::roots::ProjectArg::InvalidConfig(detail) => {
                 return Ok(tool_result_to_call_result(&ToolResult::error(
                     crate::roots::invalid_config_message(&detail),
-                )));
+                ))
+                .into());
             }
             crate::roots::ProjectArg::NotIndexed => {
                 let message = match raw_project {
@@ -393,7 +395,7 @@ impl ServerHandler for CodeGraphHandler {
                     ),
                     None => "No indexed project resolved. Pass a `projectPath` argument, run `codegraph init` in the project, or start the server with `--path <project>`.".to_string(),
                 };
-                return Ok(tool_result_to_call_result(&ToolResult::error(message)));
+                return Ok(tool_result_to_call_result(&ToolResult::error(message)).into());
             }
         };
 
@@ -469,7 +471,7 @@ impl ServerHandler for CodeGraphHandler {
             timed_out,
             "tool call complete"
         );
-        Ok(tool_result_to_call_result(&result))
+        Ok(tool_result_to_call_result(&result).into())
     }
 }
 
@@ -729,8 +731,10 @@ pub fn build_http_config(
 ) -> rmcp::transport::streamable_http_server::StreamableHttpServerConfig {
     use rmcp::transport::streamable_http_server::StreamableHttpServerConfig;
 
+    // This switch governs legacy protocol versions only; MCP 2026-07-28 is
+    // stateless unconditionally per SEP-2567.
     let base = StreamableHttpServerConfig::default()
-        .with_stateful_mode(false)
+        .with_legacy_session_mode(false)
         .with_json_response(true)
         .with_sse_keep_alive(None);
 
