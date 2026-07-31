@@ -182,6 +182,9 @@ fn main() {
 
     if let Err(err) = run(cli) {
         eprintln!("Error: {err:#}");
+        if let Some(guidance) = index_removal_holder_guidance(&err) {
+            eprint!("{guidance}");
+        }
         std::process::exit(1);
     }
 }
@@ -1433,6 +1436,9 @@ fn cmd_index(path: Option<PathBuf>, force: bool, quiet: bool, verbose: bool) -> 
     // reachable; authorization is still decided later under the exclusive lease.
     let project = resolve_required_rebuild_project(path)?;
     guard_indexable_root(&project)?;
+    if !quiet {
+        warn_if_stdio_mcp_may_hold_index(&project);
+    }
     // `--force` no longer removes the DB up front: the rebuild layer performs the
     // destructive removal itself, AFTER publishing `phase=building` under the one
     // outer exclusive lease, so an interruption can never leave a bare DB with no
@@ -2412,6 +2418,299 @@ fn mcp_stop_command() -> &'static str {
         "taskkill /PID <pid> /F"
     } else {
         "kill <pid>"
+    }
+}
+
+/// PURE text generator for "a stdio MCP server may be holding this index
+/// database" guidance. Inputs in, `String` out — no IO, no environment read, no
+/// clock — which is what makes both of its branches unit-testable even though
+/// one of its two call sites (the `RemoveDatabase` failure) cannot be driven
+/// from a test (decision B of the rev55 plan: `RebuildFault` exposes no DB
+/// removal hook, and a black-box attempt fails EARLIER, at database open).
+///
+/// `holders` is the caller's already-narrowed set of registry entries that could
+/// hold the database in question; `registry_unavailable` carries `(path, error)`
+/// when the registry could not be read at all.
+///
+/// An unreadable registry deliberately renders the SAME branch as an empty one:
+/// informationally both mean "we found no holder and cannot prove there is
+/// none", so the actionable advice is identical. The outage only adds a line
+/// naming the path, so the user can still tell the two apart.
+///
+/// Timestamps are NOT rendered here: [`format_started_at`] reads the local UTC
+/// offset, which would make this function impure and its output TZ-dependent.
+/// The text points at `codegraph mcp list` for start times instead.
+fn index_holder_guidance(
+    holders: &[codegraph_daemon::mcp_registry::McpServerInfo],
+    registry_unavailable: Option<(&str, &str)>,
+) -> String {
+    let mut out = String::new();
+    if holders.is_empty() {
+        out.push_str(
+            "No registered codegraph stdio MCP server matches this project, but that does not \
+             prove none is holding its index database:\n",
+        );
+        if let Some((path, error)) = registry_unavailable {
+            out.push_str(&format!(
+                "  - the stdio MCP registry at {path} could not be read ({error}), so this check \
+                 cannot tell either way;\n  - even a readable registry can be empty because \
+                 nothing has registered yet;\n"
+            ));
+        } else {
+            out.push_str("  - nothing has registered yet, so the registry is empty;\n");
+        }
+        out.push_str(
+            "  - codegraph 0.40.x and earlier never register at all, so they never appear here.\n",
+        );
+    } else {
+        out.push_str(
+            "Registered codegraph stdio MCP server(s) that may hold this project's index database \
+             open:\n",
+        );
+        for info in holders {
+            let scope = match info.project.as_deref() {
+                Some(project) => format!("project {project}"),
+                None => "any project (started without --path)".to_string(),
+            };
+            out.push_str(&format!(
+                "  - pid {} — {scope}, codegraph {}\n",
+                info.pid, info.version
+            ));
+        }
+        out.push_str(
+            "That list only covers servers that register: codegraph 0.40.x and earlier never did.\n",
+        );
+    }
+    out.push_str(&format!(
+        "Look for `codegraph serve --mcp` with your OS process tools (`pgrep -af 'codegraph serve \
+         --mcp'` on unix, `tasklist` or Task Manager on Windows) and stop the holder with `{}` — \
+         closing the client that launched it is cleaner. `codegraph mcp list` shows every \
+         registered server with its start time.\n",
+        mcp_stop_command()
+    ));
+    out
+}
+
+/// Resolve `path` through the filesystem when possible, falling back to its
+/// lexical form. `index` and `serve --mcp` both record LEXICALLY normalized
+/// absolute paths, so without this a symlinked ancestor (`/tmp` ->
+/// `/private/tmp`) would make one and the same project compare unequal.
+fn canonicalize_lenient(path: &Path) -> PathBuf {
+    path.canonicalize()
+        .unwrap_or_else(|_| path.components().collect::<PathBuf>())
+}
+
+/// The live stdio MCP registry entries that could be holding the index database
+/// at `target`, plus `(path, error)` when the registry could not be read at all.
+///
+/// An entry with NO project was launched without `--path` (the Kiro / Qoder
+/// shape): it resolves its project per request, so it can open ANY project's
+/// database and is always included — excluding it would hide exactly the launches
+/// this check exists to surface. A pinned entry can only reach databases at or
+/// under its own project root, so `target` must live beneath it;
+/// `Path::starts_with` compares whole components, so `/w/proj` never matches
+/// `/w/proj2`.
+fn mcp_index_holders(
+    target: &Path,
+) -> (
+    Vec<codegraph_daemon::mcp_registry::McpServerInfo>,
+    Option<(String, String)>,
+) {
+    let canonical_target = canonicalize_lenient(target);
+    match codegraph_daemon::mcp_registry::live_entries() {
+        codegraph_daemon::mcp_registry::RegistryRead::Available(entries) => {
+            let holders = entries
+                .into_iter()
+                .filter(|entry| match entry.project.as_deref() {
+                    None => true,
+                    Some(project) => {
+                        canonical_target.starts_with(canonicalize_lenient(Path::new(project)))
+                    }
+                })
+                .collect();
+            (holders, None)
+        }
+        codegraph_daemon::mcp_registry::RegistryRead::Unavailable { path, error } => {
+            (Vec::new(), Some((path.display().to_string(), error)))
+        }
+    }
+}
+
+/// Warn BEFORE the destructive rebuild when a registered stdio MCP server may
+/// hold this project's index database. Advisory only: it never fails, never
+/// changes the exit code, and prints nothing when there is no holder to name, so
+/// a successful `index` against an empty registry emits its previous bytes
+/// exactly.
+///
+/// An unreadable registry stays SILENT here (a debug event only). It reports
+/// nothing about a holder, and a line on every single `index` run would be noise
+/// the user cannot act on; the same outage IS surfaced on the failure path, where
+/// it finally matters.
+fn warn_if_stdio_mcp_may_hold_index(project: &Path) {
+    let (holders, unavailable) = mcp_index_holders(project);
+    if holders.is_empty() {
+        if let Some((path, error)) = unavailable {
+            tracing::debug!(
+                %path,
+                %error,
+                "could not read the stdio MCP registry before rebuilding this index"
+            );
+        }
+        return;
+    }
+    eprintln!(
+        "Warning: rebuilding this index deletes its database files, and a process still holding \
+         them makes that delete fail (the Windows failure mode)."
+    );
+    eprint!("{}", index_holder_guidance(&holders, None));
+}
+
+/// Append holder guidance to the CLI's presentation of a `RemoveDatabase`
+/// failure — the exact Windows failure point, where `std::fs::remove_file` on an
+/// open `codegraph.db` cannot succeed. The store-layer message
+/// (`cannot remove v2 database artifact {path}: {source}`) is a statement of fact
+/// and is left untouched; this only adds "who may be holding it, and how to stop
+/// it" AFTER it, and the original error chain is neither wrapped nor swallowed.
+///
+/// The holder set is narrowed with the failing artifact's own path, so a server
+/// pinned to an unrelated project is still excluded here.
+///
+/// Deliberately NOT integration-tested (decision B of the rev55 plan): the
+/// private `RebuildFault` hook cannot inject a DB removal failure, and a
+/// black-box attempt fails EARLIER, at database open. The text is covered by
+/// [`index_holder_guidance`]'s unit tests; this wiring is confirmed by a
+/// hands-on walk-through.
+fn index_removal_holder_guidance(err: &anyhow::Error) -> Option<String> {
+    let artifact = err.chain().find_map(|cause| {
+        match cause.downcast_ref::<codegraph_store::RebuildError>() {
+            Some(codegraph_store::RebuildError::RemoveDatabase { path, .. }) => Some(path.clone()),
+            _ => None,
+        }
+    })?;
+    let (holders, unavailable) = mcp_index_holders(&artifact);
+    let unavailable = unavailable
+        .as_ref()
+        .map(|(path, error)| (path.as_str(), error.as_str()));
+    Some(index_holder_guidance(&holders, unavailable))
+}
+
+#[cfg(test)]
+mod index_holder_guidance_tests {
+    use super::{index_holder_guidance, mcp_stop_command};
+    use codegraph_daemon::mcp_registry::McpServerInfo;
+
+    fn entry(pid: u32, project: Option<&str>) -> McpServerInfo {
+        McpServerInfo {
+            pid,
+            project: project.map(str::to_string),
+            transport: "stdio".to_string(),
+            started_at: 1_700_000_000_123,
+            version: "0.41.0".to_string(),
+        }
+    }
+
+    /// Branch A — every holder's PID is named, alongside the platform stop
+    /// command a HUMAN runs (decision A: we print it, we never run it).
+    #[test]
+    fn with_holders_names_every_pid_and_the_stop_command() {
+        let text =
+            index_holder_guidance(&[entry(4321, Some("/work/alpha")), entry(9876, None)], None);
+
+        assert!(
+            text.contains("4321") && text.contains("9876"),
+            "every holder pid must be named: {text:?}"
+        );
+        assert!(
+            text.contains(mcp_stop_command()),
+            "the platform stop command must be offered as guidance: {text:?}"
+        );
+        assert!(
+            text.contains("/work/alpha"),
+            "a pinned holder must name the project it serves: {text:?}"
+        );
+        assert!(
+            text.contains("--path"),
+            "a holder with no project must be explained (started without --path): {text:?}"
+        );
+        assert!(
+            text.contains("0.40.x"),
+            "the registered set is not exhaustive; legacy builds never register: {text:?}"
+        );
+        assert!(
+            !text.contains("does not prove"),
+            "the found-a-holder branch must not read like the nothing-found one: {text:?}"
+        );
+        assert!(
+            text.ends_with('\n'),
+            "guidance is printed with `eprint!`, so it must end with a newline: {text:?}"
+        );
+    }
+
+    /// Branch B, readable-but-empty — must name BOTH causes at once: nothing has
+    /// registered yet, AND `<=0.40.x` never registers, so absence is not proof.
+    #[test]
+    fn without_holders_covers_empty_and_legacy_causes() {
+        let text = index_holder_guidance(&[], None);
+
+        assert!(
+            text.contains("does not prove"),
+            "absence of a registered holder must not be presented as proof: {text:?}"
+        );
+        assert!(
+            text.contains("registered yet"),
+            "cause 1: the registry may simply be empty: {text:?}"
+        );
+        assert!(
+            text.contains("0.40.x"),
+            "cause 2: legacy builds never register at all: {text:?}"
+        );
+        assert!(
+            text.contains("codegraph serve --mcp") && text.contains("OS process tools"),
+            "the user must be told what to look for, and with what: {text:?}"
+        );
+        assert!(
+            text.contains(mcp_stop_command()),
+            "the platform stop command must be offered here too: {text:?}"
+        );
+        assert!(
+            !text.contains("could not be read"),
+            "a readable-but-empty registry must not be reported as an outage: {text:?}"
+        );
+        assert!(text.ends_with('\n'), "must end with a newline: {text:?}");
+    }
+
+    /// Branch B, unreadable — same actionable advice, plus the registry path and
+    /// error so the outage is distinguishable from a genuinely empty registry.
+    /// All THREE causes are spelled out here (unreadable / possibly-empty /
+    /// legacy) so no reader concludes the check was authoritative.
+    #[test]
+    fn unreadable_registry_renders_the_nothing_found_branch_with_its_path() {
+        let text = index_holder_guidance(
+            &[],
+            Some(("/state/codegraph/mcp", "Not a directory (os error 20)")),
+        );
+
+        assert!(
+            text.contains("/state/codegraph/mcp") && text.contains("Not a directory (os error 20)"),
+            "the outage must name the registry path and the error: {text:?}"
+        );
+        assert!(
+            text.contains("could not be read"),
+            "the outage must be stated as an outage: {text:?}"
+        );
+        assert!(
+            text.contains("registered yet"),
+            "a readable registry could ALSO have been empty; say so: {text:?}"
+        );
+        assert!(
+            text.contains("0.40.x"),
+            "legacy builds never register at all, outage or not: {text:?}"
+        );
+        assert!(
+            text.contains("codegraph serve --mcp") && text.contains(mcp_stop_command()),
+            "the advice must stay actionable during an outage: {text:?}"
+        );
+        assert!(text.ends_with('\n'), "must end with a newline: {text:?}");
     }
 }
 
