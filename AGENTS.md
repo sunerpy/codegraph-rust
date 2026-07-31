@@ -122,7 +122,10 @@ presence/absence) and `tests/rmcp_http.rs` (no session header, SEP-2243 both bra
 We advertise only the tools capability and always return `CallToolResponse::Complete`; we never
 construct `Task` or `InputRequired`. `accepted_subscription_filter` keeps its `None` default, while
 legacy `subscribe` / `unsubscribe` return method-not-found. The request surface is not literally
-tools-only, however: SIX inherited defaults still answer `Ok`. `discover` returns real content
+tools-only, however. Beyond the mandatory `initialize` handshake — itself an inherited default
+(`handler/server.rs:314-326`), which is why negotiation runs automatically over our `get_info()` and
+why the `V_2024_11_05` there is only a fallback — these inherited defaults also answer `Ok`.
+`discover` returns real content
 (`supported_protocol_versions()` plus `get_info()`); `complete` returns an empty `CompleteResult`;
 `list_prompts` / `list_resources` / `list_resource_templates` (`handler/server.rs:362-383`) return
 EMPTY results, so `prompts/list`, `resources/list`, and `resources/templates/list` answer with
