@@ -3,11 +3,39 @@
 `codegraph serve --mcp` runs a newline-delimited JSON-RPC MCP server over
 stdin/stdout. It does **not** use LSP `Content-Length` framing.
 
-Protocol handshake: `initialize` returns
-`protocolVersion: "2024-11-05"`, `serverInfo.name: "codegraph"`.
+Protocol handshake: `initialize` returns `serverInfo.name: "codegraph"`.
 `serverInfo.version` reports the running binary's crate version (from
 `CARGO_PKG_VERSION`), so it tracks releases automatically rather than being
 hardcoded.
+
+`protocolVersion` is negotiated, not fixed. The server (built on `rmcp` 3.0.1)
+echoes back whatever revision the client asks for, as long as it is one it knows:
+**2024-11-05**, **2025-11-25**, or **2026-07-28**. An unrecognized request falls
+back to `2024-11-05`. What the negotiated revision changes:
+
+| client requests | negotiated | `resultType` in results | streamable-HTTP session          |
+| --------------- | ---------- | ----------------------- | -------------------------------- |
+| 2024-11-05      | 2024-11-05 | absent                  | no `Mcp-Session-Id` (our config) |
+| 2025-11-25      | 2025-11-25 | absent                  | no `Mcp-Session-Id` (our config) |
+| 2026-07-28      | 2026-07-28 | `"complete"`            | no `Mcp-Session-Id` (per spec)   |
+
+Results carry the SEP-2322 discriminator `resultType: "complete"` only for a
+2026-07-28 peer; older peers get the key stripped, and per spec a missing
+`resultType` means `"complete"`. At 2026-07-28 the streamable-HTTP transport is
+stateless (SEP-2567): no `Mcp-Session-Id`, no standalone GET/DELETE stream, no
+`Last-Event-ID` resumption. At the two legacy revisions the spec would allow a
+session id, but this server is configured with legacy session mode off, so it
+sends none there either: don't write session-resumption handling against it. Only
+the cause differs — legacy statelessness is our configuration and could be
+reversed, while 2026-07-28 statelessness is mandated and cannot. That transport also
+validates the SEP-2243 standard headers — a request whose `MCP-Protocol-Version`
+is missing, or whose `Mcp-Method`
+or `Mcp-Name` disagrees with the body, is rejected with HTTP 400 and JSON-RPC
+error code `-32020`.
+
+The server declares **tools only**. Tasks (SEP-2663), MRTR / elicitation-in-tool,
+subscriptions, and discovery are capability-gated in the spec and are not
+implemented; every tool call returns a complete result.
 
 ---
 

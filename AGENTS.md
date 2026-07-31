@@ -79,6 +79,56 @@ behaviors are active:
 Full Godot static-analysis scope, static-vs-runtime boundary, and honesty signals:
 [`docs/godot.md`](docs/godot.md).
 
+## MCP protocol surface (`codegraph-mcp`, rmcp 3.0.1)
+
+`codegraph-mcp` builds on **rmcp 3.0.1** (`crates/codegraph-mcp/Cargo.toml`, dep and dev-dep;
+features `server`, `client`, `transport-io`, `transport-streamable-http-server`). The 2.1 → 3.0.1
+upgrade cost three lines in `rmcp_handler.rs`: `call_tool` returns the `#[non_exhaustive]`
+`CallToolResponse` enum instead of `CallToolResult` (we only ever build `Complete`, via `.into()`),
+`with_stateful_mode` became `with_legacy_session_mode`, and a stale `get_info()` comment was
+corrected. The 3.x breaking changes that bit third-party code were all CLIENT-side
+(`InitializeResult` → `ServerPeerInfo`, optional `server_info`, OAuth `resolve_metadata()`), none of
+which touch a server `ServerHandler`. `Peer::list_roots` is still `#[deprecated]` (SEP-2577) with
+still no replacement, so the `#[allow(deprecated)]` at `rmcp_handler.rs:334` stays.
+
+**We serve three protocol revisions, and that is the SDK default rather than a choice.**
+`ProtocolVersion` is `struct ProtocolVersion(Cow<'static, str>)` plus associated constants (NOT an
+enum); rmcp's `negotiate_protocol_version` echoes back any client-requested version present in
+`KNOWN_VERSIONS`. So `get_info()`'s `.with_protocol_version(V_2024_11_05)` is only the FALLBACK for
+an unknown client version — it is not a ceiling, and we do not pin or force 2024-11-05:
+
+| client requests | negotiated | `resultType` in results | HTTP session           |
+| --------------- | ---------- | ----------------------- | ---------------------- |
+| 2024-11-05      | 2024-11-05 | absent                  | no header (our config) |
+| 2025-11-25      | 2025-11-25 | absent                  | no header (our config) |
+| 2026-07-28      | 2026-07-28 | `"complete"`            | no header (per spec)   |
+
+`resultType` (SEP-2322) is absent for pre-2026 peers because upstream
+[#1038](https://github.com/modelcontextprotocol/rust-sdk/pull/1038) strips it for legacy peers, and
+2026-07-28 is stateless per SEP-2567 — no `Mcp-Session-Id` — unconditionally, regardless of
+`with_legacy_session_mode`, which now governs legacy versions only. We pass
+`with_legacy_session_mode(false)` (`rmcp_handler.rs:737`), so the legacy versions issue no
+`Mcp-Session-Id` either: THIS server never sends one at any revision. The two absences differ in
+cause, though — legacy is our configuration and would come back if that flag flipped to `true`,
+while 2026-07-28 is mandated and cannot be turned back on. SEP-2243 standard headers are
+validated in both directions: matching `MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name` reach the
+tool, while a missing protocol header or a mismatched `Mcp-Method` / `Mcp-Name` is rejected with
+HTTP 400 + JSON-RPC code `-32020`. Coverage lives in `tests/rmcp_l3.rs` (version echo, `resultType`
+presence/absence) and `tests/rmcp_http.rs` (no session header, SEP-2243 both branches).
+
+**Not implemented, deliberately:** Tasks (SEP-2663), MRTR / elicitation-in-tool, subscriptions, and
+discovery. These are capability-gated, so a 2026-07-28 server may legitimately omit them — we
+declare tools only and always return `Complete`.
+
+**MCP golden fixtures are STRUCTURAL, not byte-stable.** `tests/support/parity.rs:244-300` and
+`tests/golden_mcp.rs` compare only NAMED fields — initialize: `protocolVersion`, `capabilities`,
+`serverInfo.name`, `serverInfo.version`, `instructions`; tools/list: names + order + `inputSchema` +
+annotations; tool result: `content[0].type`, `isError`, and the sorted set of non-empty text lines;
+error: `code` + `message` — never whole-object equality. That is why an added top-level `resultType`
+could not drift the 15 existing fixtures, and equally why it needed its own explicit test. (The
+EXTRACTION goldens under `reference/golden/` are a different contract and genuinely ARE
+byte-stable — see "Hard invariants" above.)
+
 ## HTTP MCP server: background mode + addr-keyed registry
 
 `serve --mcp` (stdio) uses the PER-PROJECT daemon (`.codegraph-v2/daemon.pid` + socket; the whole
