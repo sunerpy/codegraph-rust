@@ -109,3 +109,99 @@ fn gen_glob_indexes_and_watches_gitignored_file() {
         "gen* must keep the gen/ dir watchable"
     );
 }
+
+#[test]
+fn configured_exclude_applies_with_empty_include() {
+    let project = unique_project("exclude_empty_include");
+    touch(
+        &project,
+        "src/generated.ts",
+        "export const generated = true;",
+    );
+
+    let exclude = vec!["src/generated.ts".to_string()];
+    let options = ExtractOptions {
+        exclude: exclude.clone(),
+        ..ExtractOptions::default()
+    };
+    let scanned = scan_project(&project, &options).expect("scan");
+    let policy = WatchPolicy::with_config(&project, &options.ignore_dirs, &[], &exclude);
+
+    assert!(!scanned.iter().any(|file| file == "src/generated.ts"));
+    assert!(
+        !policy.should_handle_file("src/generated.ts"),
+        "configured exclude must apply even when include is empty"
+    );
+}
+
+/// A configured `ignore_dirs` entry is STRUCTURAL: `scan_dir` prunes it with a
+/// bare `continue` before any pattern set is evaluated, so a `.gitignore`
+/// negation can never resurface it. The watcher must agree.
+#[test]
+fn gitignore_negation_cannot_reinclude_a_configured_ignore_dir() {
+    let project = unique_project("negate_ignore_dir");
+    touch(&project, ".gitignore", "!addons/\n");
+    touch(&project, "src/app.ts", "export const a = 1;");
+    touch(
+        &project,
+        "addons/vendor_plugin/plugin.ts",
+        "export const p = 1;",
+    );
+
+    let options = ExtractOptions::default();
+    assert!(
+        options.ignore_dirs.iter().any(|dir| dir == "addons"),
+        "this test needs `addons` to be a configured ignore dir"
+    );
+    let scanned = scan_project(&project, &options).expect("scan");
+    let policy = WatchPolicy::with_config(&project, &options.ignore_dirs, &[], &[]);
+
+    assert!(scanned.iter().any(|file| file == "src/app.ts"));
+    assert!(policy.should_handle_file("src/app.ts"));
+    assert!(
+        !scanned
+            .iter()
+            .any(|file| file == "addons/vendor_plugin/plugin.ts"),
+        "scan must keep pruning a configured ignore dir despite `!addons/`: {scanned:?}"
+    );
+    assert!(
+        !policy.should_watch_dir("addons"),
+        "a .gitignore negation must NOT re-include a configured ignore dir (parity with scan)"
+    );
+    assert!(
+        !policy.should_handle_file("addons/vendor_plugin/plugin.ts"),
+        "a .gitignore negation must NOT re-include files under a configured ignore dir"
+    );
+}
+
+/// The precision boundary of the rule above: `exclude` and `.gitignore` DO share
+/// one last-match-wins stream on both sides, so a later `!pattern` still
+/// overrides an earlier `exclude` match. Guards against over-correcting the
+/// structural rule into "nothing can ever be negated".
+#[test]
+fn gitignore_negation_still_overrides_a_configured_exclude() {
+    let project = unique_project("negate_exclude");
+    touch(&project, ".gitignore", "!Tools/\n");
+    touch(&project, "Tools/helper.ts", "export const t = 1;");
+
+    let exclude = vec!["Tools/".to_string()];
+    let options = ExtractOptions {
+        exclude: exclude.clone(),
+        ..ExtractOptions::default()
+    };
+    let scanned = scan_project(&project, &options).expect("scan");
+    let policy = WatchPolicy::with_config(&project, &options.ignore_dirs, &[], &exclude);
+
+    assert!(
+        scanned.iter().any(|file| file == "Tools/helper.ts"),
+        "a .gitignore negation must override an earlier exclude in the scan: {scanned:?}"
+    );
+    assert!(
+        policy.should_watch_dir("Tools"),
+        "a .gitignore negation must override an earlier exclude for the watcher too"
+    );
+    assert!(
+        policy.should_handle_file("Tools/helper.ts"),
+        "a .gitignore negation must override an earlier exclude for files as well"
+    );
+}
