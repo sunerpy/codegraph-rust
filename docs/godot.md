@@ -279,6 +279,14 @@ on incoming graph edges.
   (`affectedFiles ⊇ affectedTests`), so for a Godot project with no test files it
   still LISTS the dependent scenes/resources instead of only counting them —
   bringing `affected` into agreement with `impact` / `audit --impact`.
+- **Edge counts** (`codegraph impact <symbol> --json`) — `edgeCount` now covers
+  **all** impact edges, the Godot static resource edges included, with a sibling
+  `resourceEdgeCount` reporting just the resource share (code edges are
+  `edgeCount - resourceEdgeCount`). Before this, a `.gd` referenced only from
+  `.tres` files reported `edgeCount: 0` while listing every referrer under
+  `affected` — those referrers have no tree-sitter grammar and so no graph edges
+  of their own to count. The resource count is drawn from the same sorted+deduped
+  referrer set appended to `affected`, so the count and the list always agree.
 
 This is a static structural report. Runtime `ResourceLoader` load-verification is
 out of scope (that is Godot MCP Pro's job). See [`cli.md`](cli.md) for the full

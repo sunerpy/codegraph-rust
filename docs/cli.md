@@ -350,6 +350,32 @@ is out of scope (that is Godot MCP Pro's job).
 
 ---
 
+## `codegraph impact` — edge counts in `--json`
+
+`impact --json` emits `symbol`, `depth`, `nodeCount`, `edgeCount`,
+`resourceEdgeCount`, `affected`, and `godotDynamic`. The two counts split like
+this:
+
+- **`edgeCount`** — **all** impact edges: the graph-traversal edges reached from
+  the matched symbols, **plus** the Godot static resource edges (a `.tscn` /
+  `.tres` / `project.godot` referrer of the target file). It is the total, not
+  the code-only figure.
+- **`resourceEdgeCount`** — just the resource share of that total. Code edges are
+  therefore `edgeCount - resourceEdgeCount`; no third field is needed.
+
+The resource count comes from the same sorted+deduped referrer set that gets
+appended to `affected`, so the count and the list can never contradict each
+other. A pure-code target reports `resourceEdgeCount: 0` and an `edgeCount`
+identical to what earlier versions produced.
+
+This matters for Godot projects, where the referrers of a `.gd` script live in
+resource files that have no tree-sitter grammar and so no graph edges of their
+own. Such a target used to report `nodeCount: 13, edgeCount: 0` while listing 12
+referrers under `affected`; it now reports `edgeCount: 12` with
+`resourceEdgeCount: 12`. See [`godot.md`](godot.md#resource-audit-codegraph-audit).
+
+---
+
 ## `codegraph export` — whole-graph export + centrality
 
 Exports the entire code graph as **NetworkX node-link JSON**
@@ -540,6 +566,84 @@ codegraph completions elvish > ~/.config/codegraph/completion.elv
 
 ---
 
+## `codegraph mcp list` — see the running stdio MCP servers
+
+`serve --mcp` runs in the foreground, so several stdio MCP processes can be alive
+at once — one per client window — with nothing tying them to a project directory.
+Each foreground `serve --mcp` registers itself in a global, PID-keyed registry, and
+`mcp list` reads it back:
+
+```bash
+codegraph mcp list          # table
+codegraph mcp list --json   # machine-readable
+```
+
+The table columns are `PID`, `STARTED`, `VERSION`, `PROJECT`. `PROJECT` is last
+and never truncated — it is the field a human reads to recognize a stale row. A
+server launched without `--path` (the Kiro / Qoder shape, which resolves its
+project per request) shows `<none>`.
+
+Two other renderings:
+
+- Nothing registered: `No stdio MCP servers registered.` plus a note that older
+  codegraph versions do not register at all, so they never appear here — find
+  those with your OS process tools.
+- Registry unreadable: `registry unavailable at <path>: <error>` plus the same
+  process-tool fallback. A missing directory is **not** an outage; it is the
+  normal state before the first `serve --mcp` ever runs, and renders as the empty
+  case above.
+
+**Every branch exits 0**, the outage included. This is a diagnostic command, and
+failing it while someone is debugging would only get in the way.
+
+`--json` output always carries `servers` as an array, so a consumer never has to
+branch on shape:
+
+```jsonc
+{
+  "servers": [
+    {
+      "pid": 41287,
+      "project": "/w/proj",
+      "startedAt": 1753900000000,
+      "transport": "stdio",
+      "version": "0.41.0",
+    },
+  ],
+}
+```
+
+`project` is omitted when the server was started without `--path`. On an outage
+the array is empty and an extra `registryUnavailable` key appears:
+
+```jsonc
+{ "servers": [], "registryUnavailable": { "path": "…/codegraph/mcp", "error": "…" } }
+```
+
+**Why there is no `codegraph mcp stop`.** The HTTP registry is keyed by bind
+address and does offer `http stop`; this one is keyed by PID, and that difference
+is the whole reason. An entry that outlived a crash names a PID the OS may since
+have handed to an unrelated process, and codegraph has no portable way to prove
+process instance identity — the daemon lock is an atomic-create placeholder plus a
+recorded PID, not an OS advisory lock. Terminating by registered PID could kill an
+innocent process, so `list` prints the platform-appropriate command (`kill <pid>`
+on unix, `taskkill /PID <pid> /F` on Windows) and leaves the decision to a human.
+A `stop` subcommand is gated on landing instance-identity verification first, not
+on anything else. Closing the client that launched the server is cleaner than
+either way.
+
+**`index` pre-warning.** Before rebuilding an index — a destructive step that
+deletes `codegraph.db`, `-wal`, and `-shm` — `codegraph index` checks the same
+registry and warns when a registered stdio server could reach this project,
+naming each PID and the stop command. A process still holding those files makes
+the delete fail; that is the Windows-only failure mode, since unix can unlink an
+open file. The warning goes to stderr, respects `-q/--quiet`, never changes the
+exit code, and is silent when no holder is registered. The same guidance is
+appended when the delete does fail. It is observability, not a fix: registries
+only see servers that register, so an absent holder is not proof there is none.
+
+---
+
 ## Daemon, watch & environment variables
 
 ### How `serve --mcp` chooses a run mode
@@ -629,6 +733,7 @@ Three escape hatches:
 | `CODEGRAPH_WATCH_DEBOUNCE_MS`      | `2000`    | 100–60000    | File-change debounce window before a re-index triggers           |
 | `CODEGRAPH_NO_WATCH`               | —         | —            | Disable the live file watcher (equivalent to `serve --no-watch`) |
 | `CODEGRAPH_FORCE_WATCH`            | —         | —            | Override WSL2 `/mnt/` auto-disable; does not override `NO_WATCH` |
+| `CODEGRAPH_MCP_REGISTRY_DIR`       | —         | —            | Override the stdio MCP registry directory read by `mcp list`     |
 
 Values outside the clamp range are silently clamped to the nearest bound.
 

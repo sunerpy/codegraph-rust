@@ -100,6 +100,25 @@ conflict (listing the running instance), and notes any other live servers when t
 (`stop` uses `process::terminate_pid` — SIGTERM on unix / `TerminateProcess` on Windows). None of this
 touches extraction/golden equivalence.
 
+Foreground stdio `serve --mcp` gets a THIRD, PID-keyed registry
+(`codegraph-daemon/src/mcp_registry.rs`): one `<pid>.json`
+(`McpServerInfo { pid, project: Option<String>, transport: "stdio", started_at, version }`, camelCase on
+the wire) under the same GLOBAL state chain as the HTTP one but with an `mcp` leaf
+(`$XDG_STATE_HOME/codegraph/mcp`, else `~/.local/state/codegraph/mcp`, `%LOCALAPPDATA%\codegraph\mcp` on
+Windows; `CODEGRAPH_MCP_REGISTRY_DIR` overrides). PID keying is forced by the transport: a stdio process
+has no addr and no per-project rendezvous, several may serve one project, and one may serve none.
+Registration fires from all THREE foreground exits in `cmd_serve` (`Direct`, `SpawnOrProxy`, and the
+too-broad-root home guard) and NEVER from `BeDaemon`, which already owns `.codegraph-v2/daemon.pid`.
+Reads go through `RegistryRead::{Available, Unavailable}` so a MISSING directory ("nobody registered
+yet", normal) is distinguishable from an unreadable one (an outage); dead-PID and unparseable entries
+are pruned on read. `codegraph mcp list [--json]` renders it, and `index` pre-warns when a registered
+server could reach the project it is about to rebuild. This registry is PURE OBSERVABILITY — there is no
+`mcp stop` and no `terminate_pid` import, because a stale entry's PID may have been reused and this
+workspace has no portable instance-identity primitive (`try_acquire_daemon_lock` is a `create_new`
+placeholder plus a recorded PID, not an OS advisory lock); `list` prints `kill <pid>` /
+`taskkill /PID <pid> /F` for a human instead. CLI/daemon only; extraction and golden equivalence
+untouched.
+
 ## Agent installer (`codegraph install` / `uninstall`)
 
 `codegraph install` writes the codegraph MCP-server entry into each supported agent's config
