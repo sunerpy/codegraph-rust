@@ -116,10 +116,16 @@ outage instead of an empty registry. `list_entries` is the RAW on-disk view (sta
 `live_entries` filters its RETURN VALUE by `is_process_alive` rather than trusting `prune_dead`'s
 deletions to have landed, so a dead entry on an undeletable (read-only) registry is still never reported
 as running — dead-PID and unparseable files are pruned on read as best-effort disk self-heal only.
-`codegraph mcp list [--json]` renders it, and `index` pre-warns when a registered server could reach the
-project it is about to rebuild; the `RemoveDatabase` FAILURE path deliberately reports ALL live entries
-instead of narrowing by the failing artifact path, because with `CODEGRAPH_DIR` set the index root is a
-`<name>-v2-<projectIdentity>` sibling of the legacy root and can sit outside the project tree. This
+`project` records the launch `--path` and ONLY that: it is `Some` only when the user actually passed
+`--path` (a bare `serve --mcp` stores `None`, not its cwd), and it is purely INFORMATIONAL — never a
+capability boundary, because `roots::resolve_project_arg` probes an absolute per-call `projectPath` on its
+own merits and consults the launch default only when no path was passed, so any live server can be asked
+to open any indexed project's database. `codegraph mcp list [--json]` renders it as `LAUNCH PROJECT`, and
+BOTH holder diagnostics — `index`'s pre-warning and the `RemoveDatabase` FAILURE path — therefore report
+ALL live entries with no narrowing: filtering by `project` would drop the holder in the very case they
+exist for (a server launched elsewhere that a client has since pointed at this project), and the failure
+path additionally has only a DB path, which with `CODEGRAPH_DIR` set is a `<name>-v2-<projectIdentity>`
+sibling of the legacy root that can sit outside the project tree entirely. This
 registry is PURE OBSERVABILITY — there is no `mcp stop` and no `terminate_pid` import, because a stale
 entry's PID may have been reused and this workspace has no portable instance-identity primitive
 (`try_acquire_daemon_lock` is a `create_new` placeholder plus a recorded PID, not an OS advisory lock);

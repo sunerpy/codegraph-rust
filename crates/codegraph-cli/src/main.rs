@@ -1941,7 +1941,7 @@ fn cmd_serve(
             // any existing index, opening the DB per request, so it must be
             // visible to `codegraph mcp list` too — this is exactly the
             // IDE-launched `CWD=$HOME` case that command exists to surface.
-            let _registry = register_stdio_mcp_process(project.as_deref());
+            let _registry = register_stdio_mcp_process(project.as_deref(), explicit_path);
             return serve_direct_no_services(project, &project_root, no_watch);
         }
         let has_codegraph = codegraph_dir(&project_root)
@@ -1951,7 +1951,7 @@ fn cmd_serve(
         emit_serve_startup_debug(&project_root, explicit_path, has_codegraph, &mode);
         match mode {
             ServeMode::Direct => {
-                let _registry = register_stdio_mcp_process(project.as_deref());
+                let _registry = register_stdio_mcp_process(project.as_deref(), explicit_path);
                 return serve_direct(project, &project_root, no_watch, explicit_path);
             }
             ServeMode::BeDaemon => {
@@ -1973,7 +1973,7 @@ fn cmd_serve(
                 .context("running as detached MCP daemon");
             }
             ServeMode::SpawnOrProxy => {
-                let _registry = register_stdio_mcp_process(project.as_deref());
+                let _registry = register_stdio_mcp_process(project.as_deref(), explicit_path);
                 return serve_spawn_or_proxy(project, &project_root, no_watch, explicit_path);
             }
         }
@@ -1992,18 +1992,32 @@ fn cmd_serve(
 /// which already holds the per-project `daemon.pid` lock and would otherwise be
 /// counted twice.
 ///
+/// `project` is recorded ONLY when the user actually passed `--path`
+/// (`explicit_path`). A bare `serve --mcp` defaults `project` to its cwd, but cwd
+/// is merely where the process started: with nothing pinned it resolves a project
+/// per request, so recording cwd would claim a default it does not have. The field
+/// is purely informational either way — nothing filters on it, because a client
+/// can ask any server to open any indexed project — so an absent value is the
+/// honest one, and `codegraph mcp list` renders it as `<none>`.
+///
 /// A registry failure NEVER breaks `serve --mcp`: MCP availability outranks
 /// observability, so an unwritable state dir is warned about and serving
 /// continues unregistered. No signal handlers are installed either — a killed
 /// or crashed process leaves a stale entry on purpose, which is exactly what
 /// [`codegraph_daemon::mcp_registry::prune_dead`] self-heals on the next read.
-fn register_stdio_mcp_process(project: Option<&Path>) -> Option<McpRegistryGuard> {
+fn register_stdio_mcp_process(
+    project: Option<&Path>,
+    explicit_path: bool,
+) -> Option<McpRegistryGuard> {
     use codegraph_daemon::mcp_registry::{self, McpServerInfo};
 
     let pid = std::process::id();
     let info = McpServerInfo {
         pid,
-        project: project.map(|path| path.display().to_string()),
+        project: explicit_path
+            .then_some(project)
+            .flatten()
+            .map(|path| path.display().to_string()),
         transport: "stdio".to_string(),
         started_at: mcp_registry::now_millis(),
         version: VERSION.to_string(),
@@ -2380,10 +2394,15 @@ fn cmd_mcp_list(json: bool) -> Result<()> {
     }
 }
 
-/// Render the live stdio MCP processes, or a friendly empty state. PROJECT goes
-/// LAST and is never truncated: unlike the HTTP table (whose selector, ADDR, is
-/// both short and first), here the project path is the field a human reads to
+/// Render the live stdio MCP processes, or a friendly empty state. LAUNCH PROJECT
+/// goes LAST and is never truncated: unlike the HTTP table (whose selector, ADDR,
+/// is both short and first), here the project path is the field a human reads to
 /// recognize a stale row, so clipping it would defeat the purpose.
+///
+/// The column is LAUNCH PROJECT, not PROJECT, because that is all the entry knows:
+/// it is the `--path` the server was started with (`<none>` for a bare launch),
+/// and a client can ask any server to open a different indexed project at any
+/// time. Nothing in the CLI treats it as a scope.
 fn print_mcp_table(servers: &[codegraph_daemon::mcp_registry::McpServerInfo]) {
     if servers.is_empty() {
         println!("No stdio MCP servers registered.");
@@ -2393,7 +2412,10 @@ fn print_mcp_table(servers: &[codegraph_daemon::mcp_registry::McpServerInfo]) {
         );
         return;
     }
-    println!("{:>7} {:<27} {:<12} PROJECT", "PID", "STARTED", "VERSION");
+    println!(
+        "{:>7} {:<27} {:<12} LAUNCH PROJECT",
+        "PID", "STARTED", "VERSION"
+    );
     for info in servers {
         println!(
             "{:>7} {:<27} {:<12} {}",
@@ -2404,9 +2426,10 @@ fn print_mcp_table(servers: &[codegraph_daemon::mcp_registry::McpServerInfo]) {
         );
     }
     println!(
-        "({} stdio MCP server(s) registered as running). A pid can be reused, so confirm one is \
-         still codegraph with `{}` before stopping it with `{}` — closing the client that launched \
-         it is cleaner.",
+        "({} stdio MCP server(s) registered as running). LAUNCH PROJECT is the `--path` each \
+         server started with, not a limit on what it can open: any of them can be asked to open \
+         any indexed project. A pid can be reused, so confirm one is still codegraph with `{}` \
+         before stopping it with `{}` — closing the client that launched it is cleaner.",
         servers.len(),
         mcp_identity_check_command(),
         mcp_stop_command()
@@ -2439,17 +2462,6 @@ fn mcp_identity_check_command() -> &'static str {
     }
 }
 
-/// How the `holders` handed to [`index_holder_guidance`] were selected, which is
-/// all that changes in its wording.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HolderScope {
-    /// Narrowed to the servers that could reach ONE project's index — only sound
-    /// when the caller holds that project's root.
-    Project,
-    /// Every live registered server, unnarrowed.
-    AllRegistered,
-}
-
 /// PURE text generator for "a stdio MCP server may be holding this index
 /// database" guidance. Inputs in, `String` out — no IO, no environment read, no
 /// clock — which is what makes every branch unit-testable even though one of its
@@ -2457,13 +2469,19 @@ enum HolderScope {
 /// from a test (decision B of the rev55 plan: `RebuildFault` exposes no DB
 /// removal hook, and a black-box attempt fails EARLIER, at database open).
 ///
-/// `holders` is the caller's set of registry entries that could hold the database
-/// in question, selected as `scope` says; `registry_unavailable` carries
-/// `(path, error)` when the registry could not be read at all.
+/// `holders` is EVERY live registry entry, never a subset. A server's recorded
+/// project is only its launch-time DEFAULT, not a capability boundary:
+/// `crate::roots::resolve_project_arg` in `codegraph-mcp` probes an absolute
+/// per-call `projectPath` on its own merits and consults the launch default only
+/// when no path was passed, so any live server can be asked to open any indexed
+/// project's database. Narrowing by that field would therefore hide real holders —
+/// exactly the Windows rebuild failure this guidance exists to explain. Every row
+/// names its own launch project so a reader can still tell the rows apart.
 ///
-/// An unreadable registry deliberately renders the SAME branch as an empty one:
-/// informationally both mean "we found no holder and cannot prove there is
-/// none", so the actionable advice is identical. The outage only adds a line
+/// `registry_unavailable` carries `(path, error)` when the registry could not be
+/// read at all. An unreadable registry deliberately renders the SAME branch as an
+/// empty one: informationally both mean "we found no holder and cannot prove there
+/// is none", so the actionable advice is identical. The outage only adds a line
 /// naming the path, so the user can still tell the two apart.
 ///
 /// Timestamps are NOT rendered here: [`format_started_at`] reads the local UTC
@@ -2471,21 +2489,14 @@ enum HolderScope {
 /// The text points at `codegraph mcp list` for start times instead.
 fn index_holder_guidance(
     holders: &[codegraph_daemon::mcp_registry::McpServerInfo],
-    scope: HolderScope,
     registry_unavailable: Option<(&str, &str)>,
 ) -> String {
     let mut out = String::new();
     if holders.is_empty() {
-        out.push_str(match scope {
-            HolderScope::Project => {
-                "No registered codegraph stdio MCP server matches this project, but that does not \
-                 prove none is holding its index database:\n"
-            }
-            HolderScope::AllRegistered => {
-                "No codegraph stdio MCP server is registered at all, but that does not prove none \
-                 is holding this index database:\n"
-            }
-        });
+        out.push_str(
+            "No codegraph stdio MCP server is registered at all, but that does not prove none is \
+             holding this index database:\n",
+        );
         if let Some((path, error)) = registry_unavailable {
             out.push_str(&format!(
                 "  - the stdio MCP registry at {path} could not be read ({error}), so this check \
@@ -2499,23 +2510,19 @@ fn index_holder_guidance(
             "  - codegraph 0.40.x and earlier never register at all, so they never appear here.\n",
         );
     } else {
-        out.push_str(match scope {
-            HolderScope::Project => {
-                "Registered codegraph stdio MCP server(s) that may hold this project's index \
-                 database open:\n"
-            }
-            HolderScope::AllRegistered => {
-                "Every registered codegraph stdio MCP server is listed below — any of them may be \
-                 holding this index database open, and each row names the project it serves:\n"
-            }
-        });
+        out.push_str(
+            "Every registered codegraph stdio MCP server is listed below — any of them may be \
+             holding this index database open. Each row names the project the server was LAUNCHED \
+             for, which is only its default: a client can ask any server to open a different \
+             indexed project, so its launch project does not limit which index it may hold.\n",
+        );
         for info in holders {
-            let scope = match info.project.as_deref() {
-                Some(project) => format!("project {project}"),
-                None => "any project (started without --path)".to_string(),
+            let launched_for = match info.project.as_deref() {
+                Some(project) => format!("launched for {project}"),
+                None => "launched without --path, so it has no default project".to_string(),
             };
             out.push_str(&format!(
-                "  - pid {} — {scope}, codegraph {}\n",
+                "  - pid {} (codegraph {}) — {launched_for}\n",
                 info.pid, info.version
             ));
         }
@@ -2535,17 +2542,15 @@ fn index_holder_guidance(
     out
 }
 
-/// Resolve `path` through the filesystem when possible, falling back to its
-/// lexical form. `index` and `serve --mcp` both record LEXICALLY normalized
-/// absolute paths, so without this a symlinked ancestor (`/tmp` ->
-/// `/private/tmp`) would make one and the same project compare unequal.
-fn canonicalize_lenient(path: &Path) -> PathBuf {
-    path.canonicalize()
-        .unwrap_or_else(|_| path.components().collect::<PathBuf>())
-}
-
 /// Every live stdio MCP registry entry, plus `(path, error)` when the registry
-/// could not be read at all — the unnarrowed read both holder queries build on.
+/// could not be read at all — the ONE read behind both holder diagnostics.
+///
+/// There is deliberately no project-narrowed variant. An entry's `project` is the
+/// path its `serve --mcp` was LAUNCHED with, not the set of databases it can open:
+/// a client passing an absolute `projectPath` reaches any indexed project
+/// (`codegraph-mcp/src/roots.rs`, `resolve_project_arg`). Filtering by that field
+/// would drop genuine holders, which is precisely how a Windows rebuild came to
+/// fail with no holder named.
 fn mcp_live_entries() -> (
     Vec<codegraph_daemon::mcp_registry::McpServerInfo>,
     Option<(String, String)>,
@@ -2558,53 +2563,26 @@ fn mcp_live_entries() -> (
     }
 }
 
-/// The live stdio MCP registry entries that could be holding the index database
-/// of the PROJECT rooted at `project_root`, plus `(path, error)` when the
-/// registry could not be read at all.
-///
-/// An entry with NO project was launched without `--path` (the Kiro / Qoder
-/// shape): it resolves its project per request, so it can open ANY project's
-/// database and is always included — excluding it would hide exactly the launches
-/// this check exists to surface. A pinned entry can only reach databases at or
-/// under its own project root, so `project_root` must live beneath it;
-/// `Path::starts_with` compares whole components, so `/w/proj` never matches
-/// `/w/proj2`.
-///
-/// Only call this with a genuine PROJECT ROOT. An index ARTIFACT path is not
-/// interchangeable with one: with `CODEGRAPH_DIR` set the current index root is a
-/// `<name>-v2-<projectIdentity>` sibling of the normalized legacy root, so the
-/// database may sit outside the project tree entirely and would match no pinned
-/// entry. Use [`mcp_live_entries`] where the project root is not in hand.
-fn mcp_index_holders(
-    project_root: &Path,
-) -> (
-    Vec<codegraph_daemon::mcp_registry::McpServerInfo>,
-    Option<(String, String)>,
-) {
-    let canonical_root = canonicalize_lenient(project_root);
-    let (entries, unavailable) = mcp_live_entries();
-    let holders = entries
-        .into_iter()
-        .filter(|entry| match entry.project.as_deref() {
-            None => true,
-            Some(project) => canonical_root.starts_with(canonicalize_lenient(Path::new(project))),
-        })
-        .collect();
-    (holders, unavailable)
-}
-
 /// Warn BEFORE the destructive rebuild when a registered stdio MCP server may
 /// hold this project's index database. Advisory only: it never fails, never
-/// changes the exit code, and prints nothing when there is no holder to name, so
-/// a successful `index` against an empty registry emits its previous bytes
+/// changes the exit code, and prints nothing when there is no live server to name,
+/// so a successful `index` against an empty registry emits its previous bytes
 /// exactly.
+///
+/// Reports EVERY live server rather than the ones whose recorded project contains
+/// `project`. That field is a launch-time default, not a boundary — see
+/// [`mcp_live_entries`] — so narrowing by it silently drops the holder in the very
+/// scenario this warning exists for: a server launched in one project that a
+/// client has since asked to open this one. Over-warning costs a few stderr lines
+/// before a destructive rebuild, and only when a server is actually registered;
+/// under-warning costs the user the Windows failure with nobody named.
 ///
 /// An unreadable registry stays SILENT here (a debug event only). It reports
 /// nothing about a holder, and a line on every single `index` run would be noise
 /// the user cannot act on; the same outage IS surfaced on the failure path, where
 /// it finally matters.
 fn warn_if_stdio_mcp_may_hold_index(project: &Path) {
-    let (holders, unavailable) = mcp_index_holders(project);
+    let (holders, unavailable) = mcp_live_entries();
     if holders.is_empty() {
         if let Some((path, error)) = unavailable {
             tracing::debug!(
@@ -2616,13 +2594,11 @@ fn warn_if_stdio_mcp_may_hold_index(project: &Path) {
         return;
     }
     eprintln!(
-        "Warning: rebuilding this index deletes its database files, and a process still holding \
-         them makes that delete fail (the Windows failure mode)."
+        "Warning: rebuilding the index for {} deletes its database files, and a process still \
+         holding them makes that delete fail (the Windows failure mode).",
+        project.display()
     );
-    eprint!(
-        "{}",
-        index_holder_guidance(&holders, HolderScope::Project, None)
-    );
+    eprint!("{}", index_holder_guidance(&holders, None));
 }
 
 /// Append holder guidance to the CLI's presentation of a `RemoveDatabase`
@@ -2632,16 +2608,15 @@ fn warn_if_stdio_mcp_may_hold_index(project: &Path) {
 /// and is left untouched; this only adds "who may be holding it, and how to stop
 /// it" AFTER it, and the original error chain is neither wrapped nor swallowed.
 ///
-/// Reports EVERY live registered server rather than narrowing by the failing
-/// artifact's path. All this error hands us is a database path, and a database
-/// path is not a project root: with `CODEGRAPH_DIR` set the current index root is
-/// a `<name>-v2-<projectIdentity>` SIBLING of the normalized legacy root, so the
-/// artifact can live outside the project tree, match no pinned entry, and make
-/// this diagnostic claim no registered server is involved while one is. An
-/// over-inclusive list is strictly better than hiding the actual holder, and each
-/// row names its own project so a reader can still tell which is which. The
-/// PRE-WARNING path keeps its precise narrowing — it legitimately has the project
-/// root.
+/// Reports EVERY live registered server, exactly like the PRE-WARNING path — a
+/// server's recorded project is only its launch default, so neither path may
+/// filter on it (see [`mcp_live_entries`]). Two independent reasons converge here:
+/// all this error hands us is a database path, and a database path is not even a
+/// project root (with `CODEGRAPH_DIR` set the current index root is a
+/// `<name>-v2-<projectIdentity>` SIBLING of the normalized legacy root, so the
+/// artifact can live outside the project tree entirely). An over-inclusive list is
+/// strictly better than hiding the actual holder, and each row names its own
+/// launch project so a reader can still tell which is which.
 ///
 /// Deliberately NOT integration-tested (decision B of the rev55 plan): the
 /// private `RebuildFault` hook cannot inject a DB removal failure, and a
@@ -2659,18 +2634,14 @@ fn index_removal_holder_guidance(err: &anyhow::Error) -> Option<String> {
     let unavailable = unavailable
         .as_ref()
         .map(|(path, error)| (path.as_str(), error.as_str()));
-    Some(index_holder_guidance(
-        &holders,
-        HolderScope::AllRegistered,
-        unavailable,
-    ))
+    Some(index_holder_guidance(&holders, unavailable))
 }
 
 #[cfg(test)]
 mod index_holder_guidance_tests {
     use super::{
-        HolderScope, index_holder_guidance, index_removal_holder_guidance,
-        mcp_identity_check_command, mcp_stop_command,
+        index_holder_guidance, index_removal_holder_guidance, mcp_identity_check_command,
+        mcp_stop_command,
     };
     use codegraph_daemon::mcp_registry::McpServerInfo;
     use std::path::PathBuf;
@@ -2689,11 +2660,8 @@ mod index_holder_guidance_tests {
     /// command a HUMAN runs (decision A: we print it, we never run it).
     #[test]
     fn with_holders_names_every_pid_and_the_stop_command() {
-        let text = index_holder_guidance(
-            &[entry(4321, Some("/work/alpha")), entry(9876, None)],
-            HolderScope::Project,
-            None,
-        );
+        let text =
+            index_holder_guidance(&[entry(4321, Some("/work/alpha")), entry(9876, None)], None);
 
         assert!(
             text.contains("4321") && text.contains("9876"),
@@ -2710,6 +2678,11 @@ mod index_holder_guidance_tests {
         assert!(
             text.contains("--path"),
             "a holder with no project must be explained (started without --path): {text:?}"
+        );
+        assert!(
+            text.contains("does not limit which index"),
+            "a row's project is the one its server was LAUNCHED for; presenting it as a limit on \
+             what that server can open is the defect this text must not repeat: {text:?}"
         );
         assert!(
             text.contains("0.40.x"),
@@ -2734,7 +2707,7 @@ mod index_holder_guidance_tests {
     /// registered yet, AND `<=0.40.x` never registers, so absence is not proof.
     #[test]
     fn without_holders_covers_empty_and_legacy_causes() {
-        let text = index_holder_guidance(&[], HolderScope::Project, None);
+        let text = index_holder_guidance(&[], None);
 
         assert!(
             text.contains("does not prove"),
@@ -2771,7 +2744,6 @@ mod index_holder_guidance_tests {
     fn unreadable_registry_renders_the_nothing_found_branch_with_its_path() {
         let text = index_holder_guidance(
             &[],
-            HolderScope::Project,
             Some(("/state/codegraph/mcp", "Not a directory (os error 20)")),
         );
 

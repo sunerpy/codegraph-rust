@@ -278,7 +278,7 @@ fn list_shows_every_live_stdio_server() {
     );
     assert!(
         stdout.contains("mini-a") && stdout.contains("mini-b"),
-        "each row must name the project it serves: {stdout}"
+        "each row must name the project its server was LAUNCHED for: {stdout}"
     );
     assert!(
         stdout.contains(env!("CARGO_PKG_VERSION")),

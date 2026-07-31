@@ -139,8 +139,12 @@ fn run_index(registry_dir: &Path, project: &Path, extra: &[&str]) -> Run {
     }
 }
 
-/// The wording that only ever appears when a holder was found.
-const WARNING_MARKER: &str = "may hold this project's index database open";
+/// The wording that only ever appears when at least one live server was found.
+const WARNING_MARKER: &str = "may be holding this index database open";
+
+/// Vocabulary that belongs exclusively to the holder guidance, used to prove the
+/// pre-warning contributes ZERO bytes when nothing is registered.
+const GUIDANCE_VOCABULARY: [&str; 3] = ["stdio MCP", "0.40.x", "serve --mcp"];
 
 /// Drop the two fields that are volatile BETWEEN RUNS even without this feature:
 /// the subscriber's startup timestamp on stderr, and the elapsed-duration tail of
@@ -228,14 +232,64 @@ fn warns_for_a_server_with_no_pinned_project() {
     );
 }
 
-/// An EMPTY registry and a registry holding only an UNRELATED project's server
-/// both leave the successful `index` output unchanged — no warning, and the
-/// normalized streams match the empty-registry baseline byte-for-byte.
+/// A server registered for ANOTHER project must STILL be warned about. The
+/// registry's `project` field is only the launch-time default, never a capability
+/// boundary: `resolve_project_arg` (`codegraph-mcp/src/roots.rs`) pushes an
+/// absolute per-call `projectPath` straight into its candidate list and probes it
+/// on its own merits, consulting the launch default ONLY when no path was passed.
+/// A server launched in A therefore opens B's database the moment a client asks
+/// it to — which is exactly the partner-reported Windows rebuild failure. Warning
+/// about it is the whole point of this check, so over-warning is the correct bias.
 #[test]
-fn unrelated_project_and_empty_registry_leave_output_unchanged() {
-    let dir = TestDir::new("unrelated");
+fn warns_when_a_server_is_registered_for_another_project() {
+    let dir = TestDir::new("other-project");
+    let registry_dir = dir.path().join("mcp-registry");
     let project = indexed_project(&dir, "proj");
-    let unrelated = dir.path().join("other-proj");
+    let other = dir.path().join("other-proj");
+    let pid = std::process::id();
+    seed_entry(&registry_dir, pid, Some(other.to_str().unwrap()));
+
+    let run = run_index(&registry_dir, &project, &[]);
+
+    assert!(
+        run.success,
+        "the warning must NOT change the exit code: stdout={} stderr={}",
+        run.stdout, run.stderr
+    );
+    assert!(
+        run.stderr.contains(WARNING_MARKER),
+        "a server launched for another project can still be asked to open this one, so it must \
+         be warned about: stderr={}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains(&pid.to_string()),
+        "the warning must name the holder's pid ({pid}): stderr={}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("other-proj"),
+        "each row must name the project the server was launched for, so a reader can tell the \
+         rows apart: stderr={}",
+        run.stderr
+    );
+}
+
+/// An EMPTY registry and an UNREADABLE one both leave the successful `index`
+/// output byte-for-byte unchanged: the pre-warning is the only new emission and
+/// it is gated on a NON-EMPTY live set, so with nothing to name it adds zero
+/// bytes. An outage stays silent here too — it says nothing about a holder, and a
+/// line on every `index` run would be noise; it is surfaced on the FAILURE path
+/// instead, where it is actionable.
+///
+/// (Before the launch-project field was demoted to a mere default, this case also
+/// compared against a registry holding an unrelated project's server. That is no
+/// longer a no-holder scenario — see
+/// `warns_when_a_server_is_registered_for_another_project`.)
+#[test]
+fn empty_and_unreadable_registries_leave_the_success_path_unchanged() {
+    let dir = TestDir::new("no-holder");
+    let project = indexed_project(&dir, "proj");
 
     let empty_dir = dir.path().join("registry-empty");
     std::fs::create_dir_all(&empty_dir).unwrap();
@@ -245,36 +299,31 @@ fn unrelated_project_and_empty_registry_leave_output_unchanged() {
         "baseline index must succeed: stderr={}",
         baseline.stderr
     );
-    assert!(
-        !baseline.stderr.contains(WARNING_MARKER),
-        "an empty registry has nothing to say: stderr={}",
-        baseline.stderr
-    );
+    for marker in GUIDANCE_VOCABULARY {
+        assert!(
+            !baseline.stderr.contains(marker) && !baseline.stdout.contains(marker),
+            "an empty registry must contribute ZERO bytes, but {marker:?} appeared: \
+             stdout={} stderr={}",
+            baseline.stdout,
+            baseline.stderr
+        );
+    }
 
-    let seeded_dir = dir.path().join("registry-unrelated");
-    seed_entry(
-        &seeded_dir,
-        std::process::id(),
-        Some(unrelated.to_str().unwrap()),
-    );
-    let seeded = run_index(&seeded_dir, &project, &[]);
+    let unreadable_dir = dir.path().join("registry-unreadable");
+    std::fs::write(&unreadable_dir, b"not a directory").unwrap();
+    let outage = run_index(&unreadable_dir, &project, &[]);
     assert!(
-        seeded.success,
-        "index must succeed: stderr={}",
-        seeded.stderr
-    );
-    assert!(
-        !seeded.stderr.contains(WARNING_MARKER),
-        "a server for an UNRELATED project must not raise a false alarm: stderr={}",
-        seeded.stderr
+        outage.success,
+        "an unreadable registry must not fail the index: stderr={}",
+        outage.stderr
     );
     assert_eq!(
-        normalize(&seeded.stderr),
+        normalize(&outage.stderr),
         normalize(&baseline.stderr),
         "stderr must be unchanged when there is no holder to report"
     );
     assert_eq!(
-        normalize(&seeded.stdout),
+        normalize(&outage.stdout),
         normalize(&baseline.stdout),
         "stdout must be unchanged when there is no holder to report"
     );

@@ -79,8 +79,20 @@ fn copy_tree(src: &Path, dst: &Path) {
 }
 
 fn indexed_project(dir: &TestDir) -> PathBuf {
-    let project = dir.path().join("mini");
+    indexed_project_with(dir, "mini", None)
+}
+
+/// Copy the mini fixture to `<dir>/<name>` and index it. `extra` writes one more
+/// source file BEFORE indexing, which is how a second project gets a symbol the
+/// first one provably does not have.
+fn indexed_project_with(dir: &TestDir, name: &str, extra: Option<(&str, &str)>) -> PathBuf {
+    let project = dir.path().join(name);
     copy_tree(&mini_fixture(), &project);
+    if let Some((relative, contents)) = extra {
+        let file = project.join(relative);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, contents).unwrap();
+    }
     let status = Command::new(bin())
         .args(["init", project.to_str().unwrap()])
         .stdout(Stdio::null())
@@ -284,6 +296,199 @@ fn serve_mcp_direct_registers_its_pid_and_unregisters_on_stdin_eof() {
         !entry_path.exists(),
         "the registry entry must be removed on graceful shutdown: {}",
         entry_path.display()
+    );
+}
+
+/// Drive `initialize` + the spec-required `initialized` notification, so a test
+/// can go straight to `tools/call`. Answering `initialize` also proves the server
+/// is past startup, hence past registry registration.
+fn handshake(stdin: &mut impl Write, stdout: &mut impl BufRead, deadline: Instant, client: &str) {
+    let init = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": client, "version": "0" }
+        }
+    });
+    writeln!(stdin, "{init}").unwrap();
+    stdin.flush().unwrap();
+    let resp = read_json_line_with_id(stdout, 1, deadline).expect("initialize result");
+    assert_eq!(
+        resp["result"]["serverInfo"]["name"],
+        json!("codegraph"),
+        "the rmcp handler must identify as codegraph"
+    );
+    let initialized = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
+    writeln!(stdin, "{initialized}").unwrap();
+    stdin.flush().unwrap();
+}
+
+fn search(
+    stdin: &mut impl Write,
+    stdout: &mut impl BufRead,
+    deadline: Instant,
+    id: i64,
+    arguments: Value,
+) -> String {
+    let call = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": { "name": "codegraph_search", "arguments": arguments }
+    });
+    writeln!(stdin, "{call}").unwrap();
+    stdin.flush().unwrap();
+    let resp = read_json_line_with_id(stdout, id, deadline).expect("tools/call response");
+    resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// A `--path`-pinned server WILL open a DIFFERENT project's index when a client
+/// passes an absolute `projectPath` — so the launch path is a DEFAULT, not an
+/// access boundary. `resolve_project_arg` (`codegraph-mcp/src/roots.rs`) pushes an
+/// absolute per-call path straight into its candidate list and probes it on its
+/// own merits; the launch default is consulted only when no path was passed.
+///
+/// This is the premise the registry's `project` field must not be read as a
+/// capability boundary — which is why `index`'s pre-warning reports every live
+/// server instead of narrowing by that field. The existing
+/// `resolve_project_arg_absolute_indexed_resolves` unit test does NOT cover it: it
+/// builds the handler with `default_project = None`, so it never shows an absolute
+/// argument WINNING OVER a pinned default. This case drives the real binary
+/// end-to-end instead, and proves both directions at once.
+#[test]
+fn serve_mcp_resolves_an_absolute_project_path_outside_its_launch_path() {
+    // GIVEN two indexed projects where only the second defines `betamarker`, and a
+    // server pinned with `--path` to the first.
+    let home = TestDir::new("cross-project");
+    let pinned = indexed_project_with(&home, "mini-pinned", None);
+    let other = indexed_project_with(
+        &home,
+        "mini-other",
+        Some((
+            "src/beta.ts",
+            "export function betamarker(): number {\n  return 7;\n}\n",
+        )),
+    );
+
+    let mut child = Command::new(bin())
+        .args(["serve", "--mcp", "--path", pinned.to_str().unwrap()])
+        .env("CODEGRAPH_NO_DAEMON", "1")
+        .env("CODEGRAPH_NO_WATCH", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn serve --mcp (rmcp)");
+
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("child stdout"));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    handshake(&mut stdin, &mut stdout, deadline, "rmcp-cross-project-test");
+
+    // WHEN the pinned default answers, THEN the other project's symbol is absent —
+    // proving the two indexes are distinguishable.
+    let default_hit = search(
+        &mut stdin,
+        &mut stdout,
+        deadline,
+        2,
+        json!({ "query": "betamarker" }),
+    );
+    assert!(
+        default_hit.contains("No results found"),
+        "the pinned project must not contain the other project's symbol: {default_hit}"
+    );
+
+    // WHEN an absolute `projectPath` names the OTHER project, THEN the server
+    // opens THAT index despite having been launched with `--path` elsewhere.
+    let cross_hit = search(
+        &mut stdin,
+        &mut stdout,
+        deadline,
+        3,
+        json!({ "query": "betamarker", "projectPath": other.to_str().unwrap() }),
+    );
+    assert!(
+        !cross_hit.contains("No results found") && cross_hit.contains("beta.ts"),
+        "a `--path`-pinned server must still resolve an absolute projectPath to another indexed \
+         project — the launch path is a default, not a boundary: {cross_hit}"
+    );
+
+    drop(stdin);
+    assert!(
+        wait_with_timeout(&mut child, Duration::from_secs(10)),
+        "serve --mcp must exit after stdin EOF"
+    );
+}
+
+/// A BARE `serve --mcp` (no `--path`) records NO project. Its cwd is merely where
+/// it happened to start: with no path pinned it resolves a project per request, so
+/// recording cwd as "the project" would overstate what the entry knows. `mcp list`
+/// renders the absent field as `<none>`.
+#[test]
+fn serve_mcp_without_an_explicit_path_registers_without_a_project() {
+    // GIVEN a bare `serve --mcp` started INSIDE an indexed project.
+    let home = TestDir::new("bare-launch");
+    let indexed = indexed_project(&home);
+    let registry_dir = home.path().join("mcp-registry");
+
+    let mut child = Command::new(bin())
+        .args(["serve", "--mcp"])
+        .current_dir(&indexed)
+        .env("CODEGRAPH_NO_DAEMON", "1")
+        .env("CODEGRAPH_NO_WATCH", "1")
+        .env("CODEGRAPH_MCP_REGISTRY_DIR", &registry_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn bare serve --mcp");
+
+    let pid = child.id();
+    let entry_path = registry_dir.join(format!("{pid}.json"));
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("child stdout"));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    handshake(&mut stdin, &mut stdout, deadline, "rmcp-bare-launch-test");
+
+    // THEN the entry exists but carries no project.
+    let raw = std::fs::read_to_string(&entry_path).unwrap_or_else(|error| {
+        panic!(
+            "a live bare `serve --mcp` must still register {}: {error}",
+            entry_path.display()
+        )
+    });
+    let entry: Value = serde_json::from_str(&raw).expect("registry entry is valid JSON");
+    assert_eq!(entry["pid"], json!(pid), "{raw}");
+    assert!(
+        entry.get("project").is_none(),
+        "a bare `serve --mcp` has no pinned project, so the field must be absent rather than \
+         recording the cwd it happened to start in: {raw}"
+    );
+
+    // AND it still serves the cwd project — the demoted field is informational.
+    let hit = search(
+        &mut stdin,
+        &mut stdout,
+        deadline,
+        2,
+        json!({ "query": "add" }),
+    );
+    assert!(
+        hit.contains("add"),
+        "a bare launch must still resolve its cwd project per request: {hit}"
+    );
+
+    drop(stdin);
+    assert!(
+        wait_with_timeout(&mut child, Duration::from_secs(10)),
+        "serve --mcp must exit after stdin EOF"
     );
 }
 

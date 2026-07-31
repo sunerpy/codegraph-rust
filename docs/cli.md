@@ -580,10 +580,15 @@ codegraph mcp list          # table
 codegraph mcp list --json   # machine-readable
 ```
 
-The table columns are `PID`, `STARTED`, `VERSION`, `PROJECT`. `PROJECT` is last
-and never truncated — it is the field a human reads to recognize a stale row. A
-server launched without `--path` (the Kiro / Qoder shape, which resolves its
-project per request) shows `<none>`.
+The table columns are `PID`, `STARTED`, `VERSION`, `LAUNCH PROJECT`.
+`LAUNCH PROJECT` is last and never truncated — it is the field a human reads to
+recognize a stale row. A server launched without `--path` (the Kiro / Qoder shape)
+shows `<none>`.
+
+`LAUNCH PROJECT` is the `--path` the server started with, i.e. its **default** —
+not a limit on what it can open. A client that passes an absolute `projectPath`
+reaches any indexed project, so every live server is a potential holder of any
+index. Nothing in the CLI filters on this field; it is there to tell rows apart.
 
 Two other renderings:
 
@@ -615,8 +620,9 @@ branch on shape:
 }
 ```
 
-`project` is omitted when the server was started without `--path`. On an outage
-the array is empty and an extra `registryUnavailable` key appears:
+`project` is the launch `--path` and is omitted entirely when the server was
+started without one. On an outage the array is empty and an extra
+`registryUnavailable` key appears:
 
 ```jsonc
 { "servers": [], "registryUnavailable": { "path": "…/codegraph/mcp", "error": "…" } }
@@ -639,13 +645,19 @@ either way.
 
 **`index` pre-warning.** Before rebuilding an index — a destructive step that
 deletes `codegraph.db`, `-wal`, and `-shm` — `codegraph index` checks the same
-registry and warns when a registered stdio server could reach this project,
-naming each PID and the stop command. A process still holding those files makes
+registry and warns when **any** stdio server is registered, naming each PID, its
+launch project, and the stop command. A process still holding those files makes
 the delete fail; that is the Windows-only failure mode, since unix can unlink an
 open file. The warning goes to stderr, respects `-q/--quiet`, never changes the
-exit code, and is silent when no holder is registered. The same guidance is
-appended when the delete does fail. It is observability, not a fix: registries
-only see servers that register, so an absent holder is not proof there is none.
+exit code, and is silent when the registry holds nothing. The same guidance is
+appended when the delete does fail.
+
+The warning deliberately does **not** narrow to servers whose launch project
+contains the one being rebuilt. Since any server can be asked to open any indexed
+project, narrowing would hide the holder in exactly the case the check exists for —
+a server launched elsewhere that a client has since pointed at this project. It is
+observability, not a fix: registries only see servers that register, so an absent
+holder is still not proof there is none.
 
 ---
 
