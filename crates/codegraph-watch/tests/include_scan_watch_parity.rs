@@ -394,3 +394,140 @@ fn gitignore_negation_still_overrides_a_configured_exclude() {
         "a .gitignore negation must override an earlier exclude for files as well"
     );
 }
+
+/// `ignore_paths` is a `.gitignore`-STYLE ordered set, not a flat any-match:
+/// `is_path_ignored` strips a leading `!` in EVERY pattern set it folds, so a
+/// later `!gen/` re-includes what an earlier `gen/` in the SAME set dropped.
+#[test]
+fn negated_ignore_path_reincludes_within_the_same_set() {
+    let project = unique_project("negate_within_ignore_paths");
+    touch(&project, "gen/helper.ts", "export const g = 1;");
+
+    let ignore_paths = vec!["gen/".to_string(), "!gen/".to_string()];
+    let options = ExtractOptions {
+        ignore_paths,
+        ..ExtractOptions::default()
+    };
+    let scanned = scan_project(&project, &options).expect("scan");
+    let policy = WatchPolicy::with_config(
+        &project,
+        &options.ignore_dirs,
+        &options.ignore_paths,
+        &[],
+        &[],
+    );
+
+    assert!(
+        scanned.iter().any(|file| file == "gen/helper.ts"),
+        "a later `!gen/` in ignore_paths must re-include it in the scan: {scanned:?}"
+    );
+    assert!(
+        policy.should_watch_dir("gen"),
+        "a later `!gen/` in ignore_paths must keep the gen/ dir watchable (parity with scan)"
+    );
+    assert!(
+        policy.should_handle_file("gen/helper.ts"),
+        "a later `!gen/` in ignore_paths must re-include the file for the watcher too"
+    );
+}
+
+/// Same ordered-set contract for the SECOND pattern set: a `!` is honored inside
+/// `exclude` too, so `exclude = ["gen/", "!gen/"]` leaves `gen/helper.ts` in.
+#[test]
+fn negated_exclude_reincludes_within_the_same_set() {
+    let project = unique_project("negate_within_exclude");
+    touch(&project, "gen/helper.ts", "export const g = 1;");
+
+    let exclude = vec!["gen/".to_string(), "!gen/".to_string()];
+    let options = ExtractOptions {
+        exclude: exclude.clone(),
+        ..ExtractOptions::default()
+    };
+    let scanned = scan_project(&project, &options).expect("scan");
+    let policy = WatchPolicy::with_config(
+        &project,
+        &options.ignore_dirs,
+        &options.ignore_paths,
+        &[],
+        &exclude,
+    );
+
+    assert!(
+        scanned.iter().any(|file| file == "gen/helper.ts"),
+        "a later `!gen/` in exclude must re-include it in the scan: {scanned:?}"
+    );
+    assert!(
+        policy.should_watch_dir("gen"),
+        "a later `!gen/` in exclude must keep the gen/ dir watchable (parity with scan)"
+    );
+    assert!(
+        policy.should_handle_file("gen/helper.ts"),
+        "a later `!gen/` in exclude must re-include the file for the watcher too"
+    );
+}
+
+/// The set ORDER is observable, which a `||` of the two config sets cannot
+/// express: `ignore_paths` folds before `exclude`, so a `!` in `exclude`
+/// re-includes an `ignore_paths` match, while the mirrored config (`!` in
+/// `ignore_paths`, plain pattern in `exclude`) stays excluded.
+#[test]
+fn config_set_order_decides_which_negation_wins() {
+    let project = unique_project("negate_across_sets");
+    touch(&project, "gen/helper.ts", "export const g = 1;");
+    touch(&project, "out/helper.ts", "export const o = 1;");
+
+    let later_negation = ExtractOptions {
+        ignore_paths: vec!["gen/".to_string(), "out/".to_string()],
+        exclude: vec!["!gen/".to_string()],
+        ..ExtractOptions::default()
+    };
+    let scanned = scan_project(&project, &later_negation).expect("scan");
+    let policy = WatchPolicy::with_config(
+        &project,
+        &later_negation.ignore_dirs,
+        &later_negation.ignore_paths,
+        &[],
+        &later_negation.exclude,
+    );
+
+    assert!(
+        scanned.iter().any(|file| file == "gen/helper.ts"),
+        "a `!gen/` in the later exclude set must re-include the ignore_paths match: {scanned:?}"
+    );
+    assert!(
+        policy.should_handle_file("gen/helper.ts"),
+        "a `!gen/` in the later exclude set must re-include it for the watcher too"
+    );
+    assert!(
+        !scanned.iter().any(|file| file == "out/helper.ts"),
+        "the un-negated `out/` ignore path must stay excluded from the scan: {scanned:?}"
+    );
+    assert!(
+        !policy.should_handle_file("out/helper.ts"),
+        "the un-negated `out/` ignore path must stay excluded for the watcher too"
+    );
+
+    let earlier_negation = ExtractOptions {
+        ignore_paths: vec!["!gen/".to_string()],
+        exclude: vec!["gen/".to_string()],
+        ..ExtractOptions::default()
+    };
+    let scanned = scan_project(&project, &earlier_negation).expect("scan");
+    let policy = WatchPolicy::with_config(
+        &project,
+        &earlier_negation.ignore_dirs,
+        &earlier_negation.ignore_paths,
+        &[],
+        &earlier_negation.exclude,
+    );
+
+    assert!(
+        !scanned.iter().any(|file| file == "gen/helper.ts"),
+        "a `!gen/` in the EARLIER ignore_paths set must not survive the later exclude: {scanned:?}"
+    );
+    assert!(
+        !policy.should_handle_file("gen/helper.ts"),
+        "a `!gen/` in the EARLIER ignore_paths set must not survive the later exclude for the \
+         watcher either"
+    );
+}

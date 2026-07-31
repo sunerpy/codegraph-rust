@@ -196,15 +196,41 @@ impl WatchPolicy {
             .any(|pattern| rule_matches(pattern, relative, is_dir))
     }
 
-    /// Last-match-wins over `ignore_paths`, then `exclude`, then `.gitignore` —
-    /// the watcher's port of the scan's `is_path_ignored` over its ordered
-    /// `pattern_sets`. Each side keeps its own matcher: the two CONFIG sets use
-    /// the SHARED whole-path matcher the scan uses, `.gitignore` the watcher's
-    /// [`rule_matches`] glob semantics. The two config sets are combined with
-    /// `||` because neither is negation-bearing here, which makes their relative
-    /// order unobservable; only the `.gitignore` fold has to run last.
+    /// The watcher's port of the scan's `is_path_ignored` fold over its ordered
+    /// `pattern_sets`: ONE accumulator, sets in order (`ignore_paths` →
+    /// `exclude` → `.gitignore`), patterns within a set in order, and the LAST
+    /// matching pattern decides. A leading `!` is therefore honored in EVERY
+    /// set, not just `.gitignore` — `ignore_paths = ["gen/", "!gen/"]` keeps
+    /// `gen/helper.ts` — and the set order is observable, so a `!` in `exclude`
+    /// re-includes an `ignore_paths` match but not the reverse.
+    ///
+    /// The ONLY deviation from the scan is which matcher each set uses, and it
+    /// is LOAD-BEARING — do not "simplify" this into a single matcher:
+    /// the two CONFIG sets use the SHARED whole-path
+    /// [`codegraph_extract::include_exclude_pattern_matches`] the scan itself
+    /// uses (its trailing-`*` form is a whole-path prefix, so `res/values*`
+    /// matches `res/values/strings.xml`), while `.gitignore` keeps the
+    /// watcher's basename-glob [`rule_matches`]. A `!` in a config set is
+    /// stripped and then re-matched with that set's OWN matcher, mirroring how
+    /// the scan strips then calls `pattern_matches`. The config sets are also
+    /// matched WITHOUT `is_dir`, exactly as the scan feeds a bare `relative` to
+    /// `is_path_ignored`; only the `.gitignore` fold is `is_dir`-aware. The
+    /// `.gitignore` rules arrive pre-parsed into [`IgnoreRule`] by
+    /// [`read_gitignore_rules`], so their `!` is already split off, whereas the
+    /// config sets are raw patterns with the `!` still inline.
     fn matches_negotiable(&self, relative: &str, is_dir: bool) -> bool {
-        let mut ignored = self.matches_ignore_paths(relative) || self.matches_exclude(relative);
+        let mut ignored = false;
+        for set in [&self.ignore_paths, &self.exclude] {
+            for pattern in set {
+                if let Some(negated) = pattern.strip_prefix('!') {
+                    if codegraph_extract::include_exclude_pattern_matches(negated, relative) {
+                        ignored = false;
+                    }
+                } else if codegraph_extract::include_exclude_pattern_matches(pattern, relative) {
+                    ignored = true;
+                }
+            }
+        }
         for rule in &self.gitignore_rules {
             if rule_matches(&rule.pattern, relative, is_dir) {
                 ignored = !rule.negated;
@@ -213,15 +239,11 @@ impl WatchPolicy {
         ignored
     }
 
-    /// Deliberately matched WITHOUT `is_dir`, exactly as the scan feeds a bare
-    /// `relative` to `is_path_ignored`, so a `res/values*` prefix drops the
-    /// `res/values` DIRECTORY and its files on identical terms.
-    fn matches_ignore_paths(&self, relative: &str) -> bool {
-        self.ignore_paths
-            .iter()
-            .any(|pattern| codegraph_extract::include_exclude_pattern_matches(pattern, relative))
-    }
-
+    /// The scan's `IncludeSet::forces`/`wants_descend` knockout check, which is a
+    /// PLAIN any-match over the raw `exclude` patterns — no `!` stripping and no
+    /// ordering, unlike the negotiable fold above. Keep it that way: a negated
+    /// `exclude` entry already cleared `ignored` in the fold, so such a path
+    /// never reaches the include stage at all.
     fn matches_exclude(&self, relative: &str) -> bool {
         self.exclude
             .iter()
