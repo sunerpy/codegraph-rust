@@ -24,7 +24,7 @@ codegraph-resolve = { path = "../codegraph-resolve" }
 regex = "1.10"
 # rmcp is now the SOLE MCP transport (Phase E): a regular dependency, no longer
 # feature-gated. The shipped binary links rmcp + tokio + axum unconditionally.
-rmcp = { version = "2.1", features = [
+rmcp = { version = "3.0.1", features = [
     "server",
     "transport-io",
     "transport-streamable-http-server",
@@ -60,7 +60,7 @@ test-hooks = ["codegraph-store/test-hooks"]
 codegraph-mcp = { path = ".", features = ["test-hooks"] }
 codegraph-extract = { path = "../codegraph-extract" }
 # rmcp `client` feature: dev-only, drives the handler over duplex in parity tests.
-rmcp = { version = "2.1", features = ["server", "client", "transport-io", "transport-streamable-http-server"] }
+rmcp = { version = "3.0.1", features = ["server", "client", "transport-io", "transport-streamable-http-server"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "sync", "time"] }
 # reqwest: dev-only HTTP client for the streamable-HTTP integration test.
 reqwest = { version = "0.12", default-features = false, features = ["json"] }

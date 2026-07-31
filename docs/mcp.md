@@ -3,11 +3,55 @@
 `codegraph serve --mcp` runs a newline-delimited JSON-RPC MCP server over
 stdin/stdout. It does **not** use LSP `Content-Length` framing.
 
-Protocol handshake: `initialize` returns
-`protocolVersion: "2024-11-05"`, `serverInfo.name: "codegraph"`.
+Protocol handshake: `initialize` returns `serverInfo.name: "codegraph"`.
 `serverInfo.version` reports the running binary's crate version (from
 `CARGO_PKG_VERSION`), so it tracks releases automatically rather than being
 hardcoded.
+
+`protocolVersion` is negotiated, not fixed. The server (built on `rmcp` 3.0.1)
+echoes back whatever revision the client asks for, as long as it is one it knows:
+**2024-11-05**, **2025-03-26**, **2025-06-18**, **2025-11-25**, or
+**2026-07-28**. An unrecognized request falls back to `2024-11-05`. What the
+negotiated revision changes:
+
+| client requests | negotiated | `resultType` in results | streamable-HTTP session          |
+| --------------- | ---------- | ----------------------- | -------------------------------- |
+| 2024-11-05      | 2024-11-05 | absent                  | no `Mcp-Session-Id` (our config) |
+| 2025-03-26      | 2025-03-26 | absent                  | no `Mcp-Session-Id` (our config) |
+| 2025-06-18      | 2025-06-18 | absent                  | no `Mcp-Session-Id` (our config) |
+| 2025-11-25      | 2025-11-25 | absent                  | no `Mcp-Session-Id` (our config) |
+| 2026-07-28      | 2026-07-28 | `"complete"`            | no `Mcp-Session-Id` (per spec)   |
+
+Results carry the SEP-2322 discriminator `resultType: "complete"` only for a
+2026-07-28 peer; older peers get the key stripped, and per spec a missing
+`resultType` means `"complete"`. At 2026-07-28 the streamable-HTTP transport is
+stateless (SEP-2567): no `Mcp-Session-Id`, no standalone GET/DELETE stream, no
+`Last-Event-ID` resumption. At the four pre-2026 revisions the spec would allow a
+session id, but this server is configured with legacy session mode off, so it
+sends none there either: don't write session-resumption handling against it. Only
+the cause differs — legacy statelessness is our configuration and could be
+reversed, while 2026-07-28 statelessness is mandated and cannot. That transport also
+validates the SEP-2243 standard headers — a request whose `MCP-Protocol-Version`
+is missing, or whose `Mcp-Method`
+or `Mcp-Name` disagrees with the body, is rejected with HTTP 400 and JSON-RPC
+error code `-32020`.
+
+The server advertises only the **tools** capability, and every tool call returns
+a complete result; it never constructs the task or input-required response forms,
+so Tasks (SEP-2663) and MRTR / elicitation-in-tool are not implemented.
+Subscriptions are also unimplemented: the handler accepts no subscription filter,
+and the legacy subscribe methods return method-not-found. Beyond the mandatory
+`initialize` handshake — itself an inherited default, which is why version
+negotiation happens automatically on top of our `get_info()` and why the
+`2024-11-05` there is only a fallback — these inherited defaults also answer
+successfully despite that narrow capability advertisement: discovery returns rmcp's known protocol versions plus this server's `get_info()`;
+completion returns an empty default result; `prompts/list`, `resources/list`, and
+`resources/templates/list` each return an empty list rather than an error, so
+probing for prompts or resources gets a successful response with nothing in it;
+and `ping` succeeds on the legacy revisions (it is method-not-found at
+2026-07-28). None of these are our implementations — they are inherited SDK
+defaults we do not override, and they add no advertised capability. Logging
+`setLevel`, `prompts/get`, and `resources/read` return method-not-found.
 
 ---
 

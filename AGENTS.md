@@ -79,6 +79,70 @@ behaviors are active:
 Full Godot static-analysis scope, static-vs-runtime boundary, and honesty signals:
 [`docs/godot.md`](docs/godot.md).
 
+## MCP protocol surface (`codegraph-mcp`, rmcp 3.0.1)
+
+`codegraph-mcp` builds on **rmcp 3.0.1** (`crates/codegraph-mcp/Cargo.toml`, dep and dev-dep;
+features `server`, `client`, `transport-io`, `transport-streamable-http-server`). The 2.1 → 3.0.1
+upgrade cost three lines in `rmcp_handler.rs`: `call_tool` returns the `#[non_exhaustive]`
+`CallToolResponse` enum instead of `CallToolResult` (we only ever build `Complete`, via `.into()`),
+`with_stateful_mode` became `with_legacy_session_mode`, and a stale `get_info()` comment was
+corrected. The 3.x breaking changes that bit third-party code were all CLIENT-side
+(`InitializeResult` → `ServerPeerInfo`, optional `server_info`, OAuth `resolve_metadata()`), none of
+which touch a server `ServerHandler`. `Peer::list_roots` is still `#[deprecated]` (SEP-2577) with
+still no replacement, so the `#[allow(deprecated)]` at `rmcp_handler.rs:334` stays.
+
+**We serve five protocol revisions, and that is the SDK default rather than a choice.**
+`ProtocolVersion` is `struct ProtocolVersion(Cow<'static, str>)` plus associated constants (NOT an
+enum); rmcp's `negotiate_protocol_version` echoes back any client-requested version present in
+`KNOWN_VERSIONS`. So `get_info()`'s `.with_protocol_version(V_2024_11_05)` is only the FALLBACK for
+an unknown client version — it is not a ceiling, and we do not pin or force 2024-11-05:
+
+| client requests | negotiated | `resultType` in results | HTTP session           |
+| --------------- | ---------- | ----------------------- | ---------------------- |
+| 2024-11-05      | 2024-11-05 | absent                  | no header (our config) |
+| 2025-03-26      | 2025-03-26 | absent                  | no header (our config) |
+| 2025-06-18      | 2025-06-18 | absent                  | no header (our config) |
+| 2025-11-25      | 2025-11-25 | absent                  | no header (our config) |
+| 2026-07-28      | 2026-07-28 | `"complete"`            | no header (per spec)   |
+
+`resultType` (SEP-2322) is absent for pre-2026 peers because upstream
+[#1038](https://github.com/modelcontextprotocol/rust-sdk/pull/1038) strips it for legacy peers, and
+2026-07-28 is stateless per SEP-2567 — no `Mcp-Session-Id` — unconditionally, regardless of
+`with_legacy_session_mode`, which now governs legacy versions only. We pass
+`with_legacy_session_mode(false)` (`rmcp_handler.rs:737`), so the legacy versions issue no
+`Mcp-Session-Id` either: THIS server never sends one at any revision. The two absences differ in
+cause, though — legacy is our configuration and would come back if that flag flipped to `true`,
+while 2026-07-28 is mandated and cannot be turned back on. SEP-2243 standard headers are
+validated in both directions: matching `MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name` reach the
+tool, while a missing protocol header or a mismatched `Mcp-Method` / `Mcp-Name` is rejected with
+HTTP 400 + JSON-RPC code `-32020`. Coverage lives in `tests/rmcp_l3.rs` (version echo, `resultType`
+presence/absence) and `tests/rmcp_http.rs` (no session header, SEP-2243 both branches).
+
+**Not implemented, deliberately:** Tasks (SEP-2663), MRTR / elicitation-in-tool, and subscriptions.
+We advertise only the tools capability and always return `CallToolResponse::Complete`; we never
+construct `Task` or `InputRequired`. `accepted_subscription_filter` keeps its `None` default, while
+legacy `subscribe` / `unsubscribe` return method-not-found. The request surface is not literally
+tools-only, however. Beyond the mandatory `initialize` handshake — itself an inherited default
+(`handler/server.rs:314-326`), which is why negotiation runs automatically over our `get_info()` and
+why the `V_2024_11_05` there is only a fallback — these inherited defaults also answer `Ok`.
+`discover` returns real content
+(`supported_protocol_versions()` plus `get_info()`); `complete` returns an empty `CompleteResult`;
+`list_prompts` / `list_resources` / `list_resource_templates` (`handler/server.rs:362-383`) return
+EMPTY results, so `prompts/list`, `resources/list`, and `resources/templates/list` answer with
+nothing rather than method-not-found; and `ping` succeeds on the legacy revisions only
+(method-not-found at 2026-07-28, `handler/server.rs:112-118`). The `set_level`, `get_prompt`,
+`read_resource`, and task-lifecycle defaults return method-not-found. These are SDK defaults, not
+our implementations, and they add no advertised capabilities.
+
+**MCP golden fixtures are STRUCTURAL, not byte-stable.** `tests/support/parity.rs:244-300` and
+`tests/golden_mcp.rs` compare only NAMED fields — initialize: `protocolVersion`, `capabilities`,
+`serverInfo.name`, `serverInfo.version`, `instructions`; tools/list: names + order + `inputSchema` +
+annotations; tool result: `content[0].type`, `isError`, and the sorted set of non-empty text lines;
+error: `code` + `message` — never whole-object equality. That is why an added top-level `resultType`
+could not drift the 15 existing fixtures, and equally why it needed its own explicit test. (The
+EXTRACTION goldens under `reference/golden/` are a different contract and genuinely ARE
+byte-stable — see "Hard invariants" above.)
+
 ## HTTP MCP server: background mode + addr-keyed registry
 
 `serve --mcp` (stdio) uses the PER-PROJECT daemon (`.codegraph-v2/daemon.pid` + socket; the whole
@@ -176,9 +240,16 @@ make coverage    # workspace coverage summary (informational; `make coverage-htm
   non-blocking** — the `coverage` job is kept out of the `CI Success` gate and
   the Codecov status is `informational: true` (`codecov.yml`), so a below-target
   % never turns CI red. This honors the iron rule "local green ⇒ CI green".
-- **Baseline ~72% line coverage** — a known gap to close. Biggest gaps:
-  `codegraph-resolve/src/import_resolver.rs`, `codegraph-resolve/src/name_matcher.rs`,
-  and the 0%-covered `codegraph-watch/src/{git,worktree}.rs`.
+- **Measured 94.42% line / 94.12% region / 93.41% function** — close to the 95%
+  target but not yet there. Figure measured at `4fabc0b` (rmcp 3.0.1 round) via
+  `make coverage`; re-measure before quoting it, since it moves with every round.
+  The remaining gap is now concentrated in the **per-language extractors** rather
+  than the resolver or watch internals: 7 of the 10 lowest-covered files are
+  `codegraph-extract/src/lang/*` — `r.rs` 70.59%, `dart.rs` 72.75%,
+  `erlang.rs` 75.77%, `arkts.rs` 81.01%, `nix.rs` 82.21%, `jsx.rs` 82.61%,
+  `lua.rs` 85.94% — alongside `codegraph-watch/src/migrate.rs` 74.77%,
+  `codegraph-store/src/index_state.rs` 80.45%, and
+  `codegraph-store/src/connection.rs` 82.57%.
 - **Enabling Codecov:** enable the repo at codecov.io. This repo is public, so
   tokenless upload works (no `CODECOV_TOKEN` needed); a private repo would need
   `CODECOV_TOKEN` in GitHub repo Secrets.
