@@ -479,6 +479,11 @@ enum Command {
         #[command(subcommand)]
         action: HttpAction,
     },
+    /// Inspect the foreground stdio MCP processes started by `serve --mcp`.
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
+    },
     /// Print the codegraph version.
     Version,
     /// Generate shell completion scripts (bash, zsh, fish, powershell, elvish).
@@ -582,6 +587,20 @@ enum HttpAction {
     Status { addr: Option<String> },
     /// Stop the background HTTP MCP server bound to `addr`.
     Stop { addr: String },
+}
+
+/// Deliberately a single-variant enum: by decision A of the rev55 plan `stop` is
+/// absent this round (a PID-keyed entry whose pid was reused would let us
+/// terminate an innocent process), and the enum shape leaves room to add it once
+/// process instance identity can be proven portably.
+#[derive(Debug, Subcommand)]
+enum McpAction {
+    /// List the running foreground stdio MCP processes (`serve --mcp`).
+    List {
+        /// Emit machine-readable JSON instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn run(cli: Cli) -> Result<()> {
@@ -769,6 +788,9 @@ fn run(cli: Cli) -> Result<()> {
             HttpAction::List => cmd_http_list(),
             HttpAction::Status { addr } => cmd_http_status(addr),
             HttpAction::Stop { addr } => cmd_http_stop(&addr),
+        },
+        Command::Mcp { action } => match action {
+            McpAction::List { json } => cmd_mcp_list(json),
         },
         Command::Version => {
             println!("codegraph {VERSION}");
@@ -1909,6 +1931,11 @@ fn cmd_serve(
                 %reason,
                 "no project root; tools still answer off an existing index if present"
             );
+            // A FOREGROUND stdio process like `Direct`: it answers tool calls off
+            // any existing index, opening the DB per request, so it must be
+            // visible to `codegraph mcp list` too — this is exactly the
+            // IDE-launched `CWD=$HOME` case that command exists to surface.
+            let _registry = register_stdio_mcp_process(project.as_deref());
             return serve_direct_no_services(project, &project_root, no_watch);
         }
         let has_codegraph = codegraph_dir(&project_root)
@@ -1953,10 +1980,11 @@ fn cmd_serve(
 
 /// Register THIS process in the global PID-keyed MCP registry and return the
 /// guard that removes the entry when serving ends (stdin EOF is the ordinary
-/// shutdown path). Registered from `Direct` and `SpawnOrProxy` — the FOREGROUND
-/// stdio processes a user sees in their process list — and never from
-/// `BeDaemon`, which already holds the per-project `daemon.pid` lock and would
-/// otherwise be counted twice.
+/// shutdown path). Registered from all THREE foreground stdio exits — `Direct`,
+/// `SpawnOrProxy`, and the too-broad-root guard's `serve_direct_no_services` —
+/// the processes a user sees in their process list, and never from `BeDaemon`,
+/// which already holds the per-project `daemon.pid` lock and would otherwise be
+/// counted twice.
 ///
 /// A registry failure NEVER breaks `serve --mcp`: MCP availability outranks
 /// observability, so an unwritable state dir is warned about and serving
@@ -2300,6 +2328,91 @@ fn cmd_http_stop(addr: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// `codegraph mcp list`: prune dead entries, then report the live FOREGROUND
+/// stdio MCP processes (`serve --mcp`) — pid, project, start time, version — so
+/// a user can tell WHO is holding an index and HOW to stop it.
+///
+/// We deliberately print stop GUIDANCE instead of offering `mcp stop` (decision
+/// A of the rev55 plan): entries are PID-keyed, so a stale entry whose pid was
+/// reused by an unrelated process would make us terminate an innocent process,
+/// and this workspace has no portable way to prove process instance identity.
+///
+/// Every branch exits 0, including the unreadable-registry one: this is a
+/// diagnostic command, and failing hard while the user is already debugging
+/// would be hostile.
+fn cmd_mcp_list(json: bool) -> Result<()> {
+    match codegraph_daemon::mcp_registry::live_entries() {
+        codegraph_daemon::mcp_registry::RegistryRead::Available(servers) => {
+            if json {
+                print_json_pretty(&json!({ "servers": servers }))
+            } else {
+                print_mcp_table(&servers);
+                Ok(())
+            }
+        }
+        codegraph_daemon::mcp_registry::RegistryRead::Unavailable { path, error } => {
+            let path = path.display().to_string();
+            if json {
+                // `servers` stays an array so a consumer never has to guess the
+                // shape; the extra key is what marks the outage.
+                print_json_pretty(&json!({
+                    "servers": [],
+                    "registryUnavailable": { "path": path, "error": error },
+                }))
+            } else {
+                println!("registry unavailable at {path}: {error}");
+                println!(
+                    "Cannot tell which stdio MCP servers are running. Find them with your OS \
+                     process tools (look for `codegraph serve --mcp`), then stop one with {}.",
+                    mcp_stop_command()
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Render the live stdio MCP processes, or a friendly empty state. PROJECT goes
+/// LAST and is never truncated: unlike the HTTP table (whose selector, ADDR, is
+/// both short and first), here the project path is the field a human reads to
+/// recognize a stale row, so clipping it would defeat the purpose.
+fn print_mcp_table(servers: &[codegraph_daemon::mcp_registry::McpServerInfo]) {
+    if servers.is_empty() {
+        println!("No stdio MCP servers registered.");
+        println!(
+            "Note: older codegraph versions do not register; find those with your OS process \
+             tools (look for `codegraph serve --mcp`)."
+        );
+        return;
+    }
+    println!("{:>7} {:<27} {:<12} PROJECT", "PID", "STARTED", "VERSION");
+    for info in servers {
+        println!(
+            "{:>7} {:<27} {:<12} {}",
+            info.pid,
+            format_started_at(info.started_at),
+            info.version,
+            info.project.as_deref().unwrap_or("<none>"),
+        );
+    }
+    println!(
+        "({} stdio MCP server(s) running). To stop one: {} — closing the client that launched it \
+         is cleaner.",
+        servers.len(),
+        mcp_stop_command()
+    );
+}
+
+/// The platform-appropriate command a HUMAN runs to stop a listed process. See
+/// [`cmd_mcp_list`] for why we only ever print this.
+fn mcp_stop_command() -> &'static str {
+    if cfg!(windows) {
+        "taskkill /PID <pid> /F"
+    } else {
+        "kill <pid>"
+    }
 }
 
 /// Render the running-servers table, or a "none" line when empty.
