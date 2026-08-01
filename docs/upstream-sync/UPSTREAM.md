@@ -41,6 +41,87 @@
 
 ## Sync log
 
+### 2026-08-02 — AUDIT `1.4.1 → 1.5.0` + post-1.5.0 triage; batch 1 LANDED (tracked parity STAYS `1.4.1`)
+
+A full audit of the `1.4.1 → 1.5.0` range plus the 6 unreleased commits above
+`v1.5.0`, and a triage of colby's open issues. **Tracked parity deliberately does
+NOT advance**: by this ledger's own definition — "all portable in-scope behavior
+landed" — two portable items from the 1.5.0 range and four from the issue triage
+are still open. Parity advances only when they land or are re-classified with
+evidence.
+
+**A bookkeeping defect this audit found and is correcting:** PR #173
+(`5d795a5`, released in `v0.41.0`) landed a large slice of the 1.5.0 range with a
+10 070-line evidence ledger at `docs/upstream-sync/V1_5_PORTABLE_FIXES.md`, but
+**never recorded a disposition here**. The sync happened; the ledger entry did
+not. That is exactly the failure this file exists to prevent — the next sync would
+have re-investigated all 86 commits from scratch.
+
+#### `1.4.1 → 1.5.0`: 86 commits, bucketed (11 + 2 + 47 + 26 = 86)
+
+| bucket | count | notes |
+| - | - | - |
+| **COVERED** by a PR #173 batch | 11 | C++ operator calls / template-arg stripping / namespace prefixing (B1-B3), C attribute-macro blanking (B4), imported-singleton + literal-receiver resolution (C1-C2), row-id ref cleanup (C3), `node -f` source body (A4), multi-hump field queries (A2), plus `includeIgnored` and directory-delete watch semantics verified equivalent |
+| **NOT COVERED — portable** | 2 | `41c2029` Go field-chain validated type inference (no Go receiver inference in `codegraph-resolve`); `d6efd43` `NO_COLOR` / `--no-color` / piped-stdout policy (no such flag in `codegraph-cli`, though the CLI has **no colouring dependency at all**, so this may be "behavior naturally satisfied, flag absent" rather than a defect — verify before implementing) |
+| **NOT COVERED — N/A** | 47 | 21 docs/CI/chore/release; **10 `R7b <lang> walker`** commits that vendor tree-sitter grammars as C — violates this project's no-vendored-grammar invariant, and all 11 of those languages are already supported natively via crates.io grammars; 8 R1-R7a Node→napi-rs kernel migration; 8 upstream-only product/UI surfaces (`clack` UI, `node:sqlite` warnings, CodeGraph Pro signup, npm OIDC/provenance, Go route framework resolver we do not have) |
+| **NOT COVERED — DEFER** | 26 | 19 resolution/store/synthesis perf策略 + 7 sync/WAL scheduling策略, all tuned to upstream's Node/`node:sqlite` runtime (pool sizing, cgroup cache credit, macOS `vm_stat` budgets). Byte-identical to graph output, so not parity blockers. Re-derive from a Rust profile before porting; `2adc7f6` (WAL truncate only at parked barriers) becomes a CORRECTNESS item if we ever adopt timer-triggered truncation |
+
+R7b languages verified already present in `crates/codegraph-extract/src/lang/`:
+Dart, Scala, Lua, Luau, R, Kotlin, Swift, PHP, Ruby, C#, Rust — 11 of 29 total
+language extractors.
+
+#### Post-`v1.5.0` (6 unreleased upstream commits)
+
+| sha | disposition | rationale |
+| - | - | - |
+| `572d22b` TOML block finder preserves trailing `[[...]]` | **PORTED** — this batch, `88e7773` | Our `find_next_table_header` was the pre-fix logic verbatim, and reproduced with the shipped 0.42.0 binary: `uninstall --target codex` silently deleted a user's `[[mcp_servers.other.env]]` block |
+| `f2a5df3` never serve a mis-sliced body from a drifted file | **PORT — batch 2** | Our exposure is WORSE than upstream's was: `read_project_source` slices current bytes at indexed lines with no freshness check, and the staleness banner promised at `instructions.rs:63` has **no implementation anywhere** |
+| `f6ac7b3` blast radius follows caller chains | **PORT — batch 2** | `CALL_DEPTH = 1` plus an unconditional `"; ⚠️ no covering tests found"`; `codegraph affected` already BFSes correctly, the MCP renderer does not |
+| `02c0e2c` bound the WAL after a killed session | **PORT (partial) — batch 3** | No `journal_size_limit` on any connection and no heal-at-open; our #1231 valve is bulk-index-only and documents itself as "sole connection" safe. Part (c) (watchdog `progressPaths`) is N/A — no SIGKILL watchdog exists here |
+| `38580e0` Python bare class refs → `references` edges | **PORT — batch 4, ISOLATED** | All three gates are pre-fix. The ONLY item in this round that moves `reference/golden/`; land it alone so a golden diff has exactly one possible cause |
+| `0682137` Claude prompt hook as `codegraph.cmd` | **N/A (packaging-rooted)** | We ship a native `codegraph.exe` (`install.ps1:34,144-150`), never a `.cmd` shim; Git Bash resolves the bare name to `.exe` natively, so writing `codegraph.cmd` would name a nonexistent file |
+
+#### colby open-issue triage — 4 actionable, verified against our code
+
+- **#1473** callers/callees/impact silently answer for a DIFFERENT symbol —
+  **reproduced on CLI AND MCP**. `exact_or_top_matches` falls back to
+  `matches.first()` with no note, and `--strict` only fires on an EMPTY result, so
+  a substituted non-empty answer passes it. Highest-value: fails toward confident
+  wrongness, and it is the default. → batch 2.
+- **#1482 / #1482b** TS rename-through-alias loses caller/impact edges
+  (`export const a = fn`, `export { fn as a }`, `export default fn` all produce a
+  false zero), and `.js` specifiers never resolve to `.ts` because
+  `extension_resolution` only APPENDS. Golden-affecting. → later batch.
+- **#1495** Kotlin signatures always absent — our `get_signature` deliberately
+  mirrors upstream's `undefined` with `None`; the fix pattern already exists ten
+  lines away in the same file. Cheap, no Kotlin golden exists yet.
+- **ALREADY-HAVE, verified**: #1455 (exact-name ranking shipped in `v0.42.0` — but
+  it changed `search` RANKING, so it does NOT close #1473's separate resolution
+  path), #1451 (our sync gate is content-hash, no atime anywhere), #1447/#1445
+  (full Godot resolver + golden fixtures — we lead upstream here), #1464 (Qoder
+  installer target), #1441 (javadoc already in `node` output).
+- **TS-only**: #1443 (our binary is not inside a node-manager shim tree), #1465
+  (our MCP engine is request-scoped on `spawn_blocking`, not one event loop),
+  #1454 (our prompt hook walks UP only — N/A by absence), #1461 (no Spring route
+  extraction exists).
+
+#### Batch 1 — LANDED (`88e7773`)
+
+Ports `572d22b`, plus two further defects that hands-on QA surfaced in the same
+function. Both were **silent user-data loss**, and the second was made reachable
+by the first fix:
+
+- a col-0 `[mcp_servers.codegraph]` inside a user's `"""` was accepted as our
+  header, so the end scan started mid-string and deleted to EOF — 249 bytes → 167,
+  unterminated string, exit 0 with "Updated", on a bare `install --yes`;
+- an indented header was not matched at all, so install appended a duplicate and
+  the config stopped parsing (`duplicate key codegraph in table mcp_servers`) —
+  pre-existing, reproduced identically with the shipped 0.42.0.
+
+`make ci` 128 suites / 3097 passed / 0 failed (+26 tests), `reference/` untouched,
+scope confined to `crates/codegraph-cli/`. Four Final-Wave gates APPROVED; F3 ran
+a ~60-fixture matrix over three rounds and is what found both extra defects.
+
 ### 2026-07-17 — CLOSEOUT: 1.2.0 → 1.4.1 sync COMPLETE (tracked parity advanced to 1.4.1)
 
 The `1.2.0 → 1.4.1` sync program evaluated on 2026-07-10 is now finished. Every
