@@ -9,8 +9,8 @@ use std::path::PathBuf;
 
 use super::super::shared::{
     self, CODEGRAPH_SECTION_END, CODEGRAPH_SECTION_START, TomlUpsert, TomlValue, atomic_write_file,
-    build_toml_table, mcp_server_config, remove_toml_table, upsert_instructions_entry,
-    upsert_toml_table,
+    build_toml_table, contains_toml_table, mcp_server_config, remove_toml_table,
+    upsert_instructions_entry, upsert_toml_table,
 };
 use super::super::types::{
     AgentTarget, DetectionResult, FileAction, FileWrite, InstallContext, InstallOptions, Location,
@@ -67,7 +67,7 @@ impl AgentTarget for CodexTarget {
         }
         let toml_path = toml_config_path(ctx);
         let already_configured = fs::read_to_string(&toml_path)
-            .map(|c| c.contains(&format!("[{TOML_HEADER}]")))
+            .map(|content| contains_toml_table(&content, TOML_HEADER))
             .unwrap_or(false);
         DetectionResult {
             installed: config_dir(ctx).exists(),
@@ -321,6 +321,33 @@ mod tests {
         let again = write_mcp_entry(&fx.ctx);
         assert_eq!(again.action, FileAction::Unchanged);
         assert_eq!(fs::read_to_string(&toml).unwrap(), first);
+    }
+
+    #[test]
+    fn detect_uses_toml_lexer_for_real_and_decoy_headers() {
+        let fx = TempCodex::new("detect-toml-header");
+        let target = CodexTarget;
+        let toml = toml_config_path(&fx.ctx);
+        fs::create_dir_all(toml.parent().unwrap()).unwrap();
+        fs::write(
+            &toml,
+            concat!(
+                "[settings]\n",
+                "instructions = \"\"\"\n",
+                "  [mcp_servers.codegraph]\n",
+                "\"\"\"\n",
+            ),
+        )
+        .unwrap();
+
+        assert!(!target.detect(&fx.ctx, Location::Global).already_configured);
+
+        fs::write(
+            &toml,
+            "[settings]\nenabled = true\n\n  [mcp_servers.codegraph]\n  command = \"old\"\n",
+        )
+        .unwrap();
+        assert!(target.detect(&fx.ctx, Location::Global).already_configured);
     }
 
     #[test]

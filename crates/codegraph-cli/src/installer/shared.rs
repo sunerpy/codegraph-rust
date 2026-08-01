@@ -669,19 +669,19 @@ pub enum TomlUpsert {
 /// `upsertTomlTable` (toml.ts:64).
 pub fn upsert_toml_table(content: &str, header: &str, block: &str) -> (String, TomlUpsert) {
     let header_line = format!("[{header}]");
-    let Some(header_idx) = find_header_index(content, &header_line) else {
+    let Some(header_match) = find_header_index(content, &header_line) else {
         let trimmed = content.trim_end();
         let sep = if trimmed.is_empty() { "" } else { "\n\n" };
         return (format!("{trimmed}{sep}{block}\n"), TomlUpsert::Inserted);
     };
 
-    let block_end = find_next_table_header(content, header_idx + header_line.len());
-    let existing_block = content[header_idx..block_end].trim_end_matches('\n');
+    let block_end = find_next_table_header(content, header_match.line_end);
+    let existing_block = content[header_match.start..block_end].trim_end_matches('\n');
     if existing_block == block {
         return (content.to_string(), TomlUpsert::Unchanged);
     }
 
-    let before_clean = content[..header_idx].trim_end_matches('\n');
+    let before_clean = content[..header_match.start].trim_end_matches('\n');
     let after_clean = content[block_end..].trim_start_matches('\n');
     let sep_before = if before_clean.is_empty() { "" } else { "\n\n" };
     let sep_after = if after_clean.is_empty() { "\n" } else { "\n\n" };
@@ -695,11 +695,11 @@ pub fn upsert_toml_table(content: &str, header: &str, block: &str) -> (String, T
 /// (toml.ts:108).
 pub fn remove_toml_table(content: &str, header: &str) -> (String, bool) {
     let header_line = format!("[{header}]");
-    let Some(header_idx) = find_header_index(content, &header_line) else {
+    let Some(header_match) = find_header_index(content, &header_line) else {
         return (content.to_string(), false);
     };
-    let block_end = find_next_table_header(content, header_idx + header_line.len());
-    let before = content[..header_idx].trim_end_matches('\n');
+    let block_end = find_next_table_header(content, header_match.line_end);
+    let before = content[..header_match.start].trim_end_matches('\n');
     let after = content[block_end..].trim_start_matches('\n');
     let sep = if !before.is_empty() && !after.is_empty() {
         "\n\n"
@@ -709,10 +709,17 @@ pub fn remove_toml_table(content: &str, header: &str) -> (String, bool) {
     (format!("{before}{sep}{after}"), true)
 }
 
-/// Find our table header at a line start while ignoring header-shaped text inside
+struct TomlHeaderMatch {
+    start: usize,
+    line_end: usize,
+}
+
+/// Return our table header's line bounds while ignoring header-shaped text inside
 /// multiline values. This deliberately reuses the same lexer as the end scan so
-/// block start and end cannot disagree about TOML state.
-fn find_header_index(content: &str, header_line: &str) -> Option<usize> {
+/// block start and end cannot disagree about TOML state. The line end lets callers
+/// start the end scan after any leading indentation instead of assuming the bare
+/// header's byte length.
+fn find_header_index(content: &str, header_line: &str) -> Option<TomlHeaderMatch> {
     let mut state = TomlLexState::default();
     let mut line_start = 0;
 
@@ -726,10 +733,15 @@ fn find_header_index(content: &str, header_line: &str) -> Option<usize> {
         if state.multiline_string.is_none()
             && state.array_depth == 0
             && state.inline_table_depth == 0
-            && line.starts_with(header_line)
+            && line
+                .trim_start_matches(&[' ', '\t'][..])
+                .starts_with(header_line)
             && is_toml_table_header(line)
         {
-            return Some(line_start);
+            return Some(TomlHeaderMatch {
+                start: line_start,
+                line_end,
+            });
         }
 
         scan_toml_line(line, &mut state);
@@ -740,6 +752,10 @@ fn find_header_index(content: &str, header_line: &str) -> Option<usize> {
     }
 
     None
+}
+
+pub(super) fn contains_toml_table(content: &str, header: &str) -> bool {
+    find_header_index(content, &format!("[{header}]")).is_some()
 }
 
 /// Find the next `[...]` or `[[...]]` TOML table header. Ports
@@ -1122,6 +1138,88 @@ mod tests {
             remove_toml_table("[other]\nx = 1\n", "mcp_servers.codegraph");
         assert!(!did_remove);
         assert!(unchanged_remove.contains("[other]"));
+    }
+
+    #[test]
+    fn toml_upsert_replaces_indented_header_with_canonical_header() {
+        let content = concat!(
+            "# fixture — valid TOML\n",
+            "[[user.tools]]\n",
+            "name = \"keep\"\n",
+            "\n",
+            "  [mcp_servers.codegraph]\n",
+            "  command = \"old\"\n",
+        );
+        let block = concat!(
+            "[mcp_servers.codegraph]\n",
+            "command = \"codegraph\"\n",
+            "args = [\"serve\", \"--mcp\"]",
+        );
+        toml::from_str::<toml::Value>(content).expect("fixture must be valid TOML");
+
+        let (updated, action) = upsert_toml_table(content, "mcp_servers.codegraph", block);
+
+        toml::from_str::<toml::Value>(&updated)
+            .expect("install replacement must not create a duplicate TOML table");
+        assert_eq!(action, TomlUpsert::Replaced);
+        assert_eq!(updated.matches("[mcp_servers.codegraph]").count(), 1);
+        assert!(
+            updated
+                .lines()
+                .any(|line| line == "[mcp_servers.codegraph]")
+        );
+        assert!(
+            !updated
+                .lines()
+                .any(|line| line == "  [mcp_servers.codegraph]")
+        );
+        assert!(updated.contains("name = \"keep\""));
+    }
+
+    #[test]
+    fn toml_remove_removes_indented_header() {
+        let content = concat!(
+            "[[user.tools]]\n",
+            "name = \"keep\"\n",
+            "\n",
+            "  [mcp_servers.codegraph]\n",
+            "  command = \"old\"\n",
+        );
+
+        let (updated, removed) = remove_toml_table(content, "mcp_servers.codegraph");
+
+        assert!(removed);
+        assert!(!updated.contains("[mcp_servers.codegraph]"));
+        assert!(updated.contains("name = \"keep\""));
+        toml::from_str::<toml::Value>(&updated).expect("uninstall result must be valid TOML");
+    }
+
+    #[test]
+    fn toml_upsert_replaces_tab_indented_header() {
+        let content = "[user]\nname = \"keep\"\n\n\t[mcp_servers.codegraph]\ncommand = \"old\"\n";
+        let block = "[mcp_servers.codegraph]\ncommand = \"codegraph\"";
+
+        let (updated, action) = upsert_toml_table(content, "mcp_servers.codegraph", block);
+
+        assert_eq!(action, TomlUpsert::Replaced);
+        assert_eq!(updated.matches("[mcp_servers.codegraph]").count(), 1);
+        assert!(
+            updated
+                .lines()
+                .any(|line| line == "[mcp_servers.codegraph]")
+        );
+        toml::from_str::<toml::Value>(&updated).expect("updated TOML must stay valid");
+    }
+
+    #[test]
+    fn toml_upsert_still_replaces_column_zero_header() {
+        let content = "[mcp_servers.codegraph]\ncommand = \"old\"\n";
+        let block = "[mcp_servers.codegraph]\ncommand = \"codegraph\"";
+
+        let (updated, action) = upsert_toml_table(content, "mcp_servers.codegraph", block);
+
+        assert_eq!(action, TomlUpsert::Replaced);
+        assert_eq!(updated, format!("{block}\n"));
     }
 
     #[test]

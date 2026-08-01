@@ -213,6 +213,46 @@ fn codex_round_trip_preserves_trailing_array_of_tables() {
 }
 
 #[test]
+fn codex_replaces_indented_table_then_uninstalls_it() {
+    let fx = Fixture::new("codex-indented-table");
+    let toml = fx.home.join(".codex/config.toml");
+    let original = concat!(
+        "# fixture — valid TOML\n",
+        "[[user.tools]]\n",
+        "name = \"keep\"\n",
+        "\n",
+        "  [mcp_servers.codegraph]\n",
+        "  command = \"old\"\n",
+    );
+    fs::create_dir_all(toml.parent().unwrap()).unwrap();
+    fs::write(&toml, original).unwrap();
+    toml::from_str::<toml::Value>(original).expect("fixture must be valid TOML");
+
+    fx.run(&["install", "--target=codex", "--global", "--yes"]);
+    let installed = fs::read_to_string(&toml).unwrap();
+    toml::from_str::<toml::Value>(&installed)
+        .expect("install must replace the indented table without duplicating it");
+    assert_eq!(installed.matches("[mcp_servers.codegraph]").count(), 1);
+    assert!(
+        installed
+            .lines()
+            .any(|line| line == "[mcp_servers.codegraph]")
+    );
+    assert!(
+        !installed
+            .lines()
+            .any(|line| line == "  [mcp_servers.codegraph]")
+    );
+    assert!(installed.contains("name = \"keep\""));
+
+    fx.run(&["uninstall", "--target=codex", "--global"]);
+    let uninstalled = fs::read_to_string(&toml).unwrap();
+    toml::from_str::<toml::Value>(&uninstalled).expect("uninstall result must be valid TOML");
+    assert!(!uninstalled.contains("[mcp_servers.codegraph]"));
+    assert!(uninstalled.contains("name = \"keep\""));
+}
+
+#[test]
 fn opencode_local_uses_mcp_wrapper() {
     let fx = Fixture::new("opencode");
     let cfg = fx.project.join("opencode.jsonc");
