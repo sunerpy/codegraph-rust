@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.42.1](https://github.com/sunerpy/codegraph-rust/compare/v0.42.0...v0.42.1) (2026-08-01)
+
+
+### Bug Fixes
+
+* **installer:** stop the Codex TOML editor from destroying user config ([#178](https://github.com/sunerpy/codegraph-rust/issues/178)) ([88e7773](https://github.com/sunerpy/codegraph-rust/commit/88e77730c3ed61e17db56e601c11f46755daafd5))
+
 ## [0.42.0](https://github.com/sunerpy/codegraph-rust/compare/v0.41.0...v0.42.0) (2026-07-31)
 
 
