@@ -736,6 +736,7 @@ fn missing_required_arg_returns_tool_iserror() {
 /// in-test source files. Mirrors the CLI index order (`main.rs:683`): ALL nodes
 /// upsert before ANY edge, files last. Enough to drive explore; no resolution.
 fn index_fixture(files: &[(&str, &str)]) -> TestProject {
+    use codegraph_core::node_id::hash_content;
     use codegraph_core::types::FileRecord;
     use codegraph_extract::engine::{detect_language, extract_file};
     use codegraph_store::Store;
@@ -756,16 +757,23 @@ fn index_fixture(files: &[(&str, &str)]) -> TestProject {
     let mut store = Store::open(&base.join(".codegraph-v2").join("codegraph.db")).unwrap();
     let mut all_edges = Vec::new();
     for (rel, src) in files {
+        let metadata = fs::metadata(base.join(rel)).unwrap();
+        let modified_at = metadata
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
         let result = extract_file(&base, rel).unwrap();
         store.upsert_nodes(&result.nodes).unwrap();
         all_edges.extend(result.edges);
         store
             .upsert_file(&FileRecord {
                 path: (*rel).to_string(),
-                content_hash: String::new(),
+                content_hash: hash_content(src),
                 language: detect_language(rel),
-                size: src.len() as i64,
-                modified_at: 0,
+                size: metadata.len() as i64,
+                modified_at,
                 indexed_at: 0,
                 node_count: result.nodes.len() as i64,
                 errors: Vec::new(),

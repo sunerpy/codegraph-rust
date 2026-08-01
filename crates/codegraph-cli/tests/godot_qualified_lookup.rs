@@ -235,23 +235,27 @@ fn query_dotted_resolves_second_member() {
 }
 
 #[test]
-fn dotted_nonexistent_member_is_empty() {
+fn dotted_nonexistent_member_is_rejected() {
     // Given the indexed godot_qualified fixture,
     let (_dir, project) = indexed_project("neg-member");
     let p = project.to_str().unwrap();
 
     // When callers runs for a real class with a nonexistent member,
-    let dotted = run_json(&["callers", "DamageCalculator.nonexistent", "-p", p, "--json"]);
+    let (stdout, err, ok) = cli(&["callers", "DamageCalculator.nonexistent", "-p", p, "--json"]);
 
-    // Then no caller is fabricated.
+    // Then no caller is fabricated and the lookup fails with fuzzy-search guidance.
     assert!(
-        caller_names(&dotted).is_empty(),
-        "a nonexistent member must not resolve to any caller"
+        !ok,
+        "a nonexistent member must be rejected: stdout={stdout} stderr={err}"
+    );
+    assert!(
+        err.contains("not found") && err.contains("codegraph query DamageCalculator.nonexistent"),
+        "the rejection must be actionable: {err}"
     );
 }
 
 #[test]
-fn dotted_non_class_receiver_falls_through() {
+fn dotted_non_class_receiver_is_rejected() {
     // Given the indexed godot_qualified fixture,
     let (_dir, project) = indexed_project("neg-recv");
     let p = project.to_str().unwrap();
@@ -259,13 +263,14 @@ fn dotted_non_class_receiver_falls_through() {
     // When callers runs for a dotted symbol whose receiver is NOT a class node,
     let (stdout, err, ok) = cli(&["callers", "notaclass.calc_skill_damage", "-p", p, "--json"]);
 
-    // Then the command still succeeds (falls through to normal search, no crash)
-    assert!(ok, "non-class receiver lookup must not crash: stderr={err}");
-    let dotted: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
-    // And it does NOT spuriously resolve the class member.
+    // Then it does NOT spuriously resolve the class member and fails explicitly.
     assert!(
-        caller_names(&dotted).is_empty(),
-        "a non-class receiver must not trigger class-member resolution, got: {dotted}"
+        !ok,
+        "a non-class receiver must be rejected: stdout={stdout} stderr={err}"
+    );
+    assert!(
+        err.contains("not found") && err.contains("codegraph query notaclass.calc_skill_damage"),
+        "the rejection must be actionable: {err}"
     );
 }
 

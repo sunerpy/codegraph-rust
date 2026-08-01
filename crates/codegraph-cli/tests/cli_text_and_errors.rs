@@ -171,21 +171,29 @@ fn callers_callees_text_output_render() {
 }
 
 #[test]
-fn callers_of_unknown_symbol_render_empty_text() {
-    let dir = TestDir::new("callers-none");
+fn lookup_commands_refuse_fuzzy_only_symbol_matches() {
+    let dir = TestDir::new("lookup-fuzzy-refusal");
     let project = indexed_project(&dir);
     let p = project.to_str().unwrap();
-    let run = run_in(dir.path(), &["callers", "no_such_symbol_zzz", "-p", p]);
-    assert!(
-        run.ok,
-        "callers of missing symbol must succeed: {}",
-        run.stderr
-    );
-    assert!(
-        run.stdout.contains("No callers found for"),
-        "empty callers prints the no-callers line: {}",
-        run.stdout
-    );
+
+    for command in ["callers", "callees", "impact"] {
+        let run = run_in(dir.path(), &[command, "ad", "-p", p]);
+        assert!(
+            !run.ok,
+            "{command} must refuse the nonexistent prefix instead of substituting `add`: stdout={} stderr={}",
+            run.stdout, run.stderr
+        );
+        assert!(
+            !run.stdout.contains("add"),
+            "{command} must not return rows for the substituted `add` symbol: {}",
+            run.stdout
+        );
+        assert!(
+            run.stderr.contains("not found") && run.stderr.contains("codegraph query ad"),
+            "{command} must provide actionable fuzzy-search guidance: {}",
+            run.stderr
+        );
+    }
 }
 
 #[test]
@@ -204,14 +212,15 @@ fn impact_text_output_and_not_found_branch() {
 
     let miss = run_in(dir.path(), &["impact", "no_such_symbol_zzz", "-p", p]);
     assert!(
-        miss.ok,
-        "impact of missing symbol must succeed: {}",
+        !miss.ok,
+        "impact of missing symbol must fail: {}",
         miss.stderr
     );
     assert!(
-        miss.stdout.contains("not found"),
-        "missing symbol must print the not-found line: {}",
-        miss.stdout
+        miss.stderr.contains("not found")
+            && miss.stderr.contains("codegraph query no_such_symbol_zzz"),
+        "missing symbol must print actionable guidance: {}",
+        miss.stderr
     );
 }
 
@@ -360,8 +369,8 @@ fn query_and_impact_strict_flags_gate_exit_code() {
 
     let i_lax = run_in(dir.path(), &["impact", "no_such_symbol_zzz", "-p", p]);
     assert!(
-        i_lax.ok,
-        "impact of a missing symbol must exit 0 by default"
+        !i_lax.ok,
+        "impact of a missing symbol must fail by default independently of --strict"
     );
     let i_strict = run_in(
         dir.path(),
@@ -371,6 +380,41 @@ fn query_and_impact_strict_flags_gate_exit_code() {
         !i_strict.ok,
         "impact --strict must exit non-zero when not found"
     );
+}
+
+#[test]
+fn callers_strict_exact_match_with_zero_results_stays_nonzero() {
+    let dir = TestDir::new("strict-exact-zero-callers");
+    let project = dir.path().join("mini");
+    copy_tree(&mini_fixture(), &project);
+    std::fs::write(
+        project.join("isolated.ts"),
+        "export function isolatedLookupTarget(): void {}\n",
+    )
+    .unwrap();
+    let p = project.to_str().unwrap();
+    let init = run_in(dir.path(), &["init", p]);
+    assert!(init.ok, "init failed: {} {}", init.stdout, init.stderr);
+    let idx = run_in(dir.path(), &["index", "--force", p]);
+    assert!(idx.ok, "index failed: {} {}", idx.stdout, idx.stderr);
+
+    let default = run_in(dir.path(), &["callers", "isolatedLookupTarget", "-p", p]);
+    assert!(
+        default.ok,
+        "an exact symbol with zero callers must succeed by default: {}",
+        default.stderr
+    );
+    assert!(default.stdout.contains("No callers found"));
+
+    let strict = run_in(
+        dir.path(),
+        &["callers", "isolatedLookupTarget", "-p", p, "--strict"],
+    );
+    assert!(
+        !strict.ok,
+        "--strict must preserve its non-zero exit for an exact symbol with zero callers"
+    );
+    assert!(strict.stderr.contains("no callers found"));
 }
 
 #[test]

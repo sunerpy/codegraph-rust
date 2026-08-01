@@ -287,6 +287,23 @@ returns the symbols relevant to a query, their verbatim source grouped by file,
 plus the call/impact graph around them. Prefer it over individual `callers`/
 `callees` chains when surveying an unfamiliar area.
 
+The blast-radius block that `explore` prints reports **measured** test coverage.
+When no test file calls a root directly, codegraph walks UP the caller graph
+before saying anything — up to 3 hops (direct callers are hop 1), bounded by 64
+caller lookups per root. The three outcomes, verbatim:
+
+| Outcome                                | Suffix                                  |
+| -------------------------------------- | --------------------------------------- |
+| A test was reached through callers     | ``; tested via callers: `f1`, `f2` +N`` |
+| Nothing found, budget survived         | `; no tests found within 3 caller hops` |
+| Nothing found, lookup budget exhausted | `; no test calls this directly`         |
+
+At most two test file names are shown; the `+N` tail counts the rest. The
+traversal frontier itself is uncapped, so the display cap never hides a hop.
+Neither not-found form carries a warning glyph any more: the note states what was
+searched instead of implying the symbol is untested, which for anything reached
+through a helper it usually was not.
+
 **`codegraph_node`** accepts either a symbol ID (from a `search` result) or a
 file path. When given a file path it returns the file's source with line numbers,
 which is a more accurate alternative to a plain `Read` tool call.
@@ -445,7 +462,63 @@ with no output; the hook is degradable by contract and never breaks the prompt.
 
 ## Stale Index Warning
 
-If indexed files are out of date (the file watcher has not yet caught up), tool
-responses include a stale-file warning in the result. The index typically lags
-file writes by ~1 second when the daemon is running. Re-run `codegraph index` or
-wait for the watcher to sync if you see stale warnings on a hot codebase.
+The index typically lags file writes by ~1 second when the daemon is running. In
+that window a file's stored line ranges can point at the wrong bytes, so every
+tool that emits source first checks the file it is about to read.
+
+### What counts as drift
+
+A referenced file is compared against its stored record before its text is used.
+Freshness is fail-closed: **proven fresh** is an earned state, not the default:
+
+1. **The file record loads and size + millisecond mtime match** → proven fresh,
+   no hashing. This is the same fast path `codegraph sync` uses.
+2. **Stat mismatch** → the file's sha256 content hash is computed and compared.
+   A matching indexed hash also proves freshness; a hash mismatch is possibly
+   drifted.
+
+Every outcome that cannot prove either condition is **possibly drifted**: the
+file record is absent or unreadable, the source read fails, or an oversized file
+has a stat mismatch. Oversized files are never read or hashed, so only their
+size + millisecond mtime fast path can prove freshness.
+
+So a `touch`, or a rewrite that produces identical bytes, is not drift — the
+hash check absorbs it. The probe is memoized per tool call, so one `explore` never
+stats the same file twice.
+
+### A drifted file ships whole or not at all
+
+Stored line numbers are unsafe once the bytes moved, so codegraph will not slice a
+drifted file at them. Instead:
+
+- **`codegraph_node`** on a symbol in a drifted file emits the file's full
+  **current** source when it fits under the 2000-line whole-file cap
+  (`FILE_MODE_MAX_LINES`, the same ceiling normal file mode uses). Over the cap,
+  the body is omitted with a notice; the location and signature are still shown,
+  flagged as possibly shifted.
+- **`codegraph_explore`** flags a drifted file and disables adaptive, skeleton,
+  and cluster slicing for it. Whole-file rendering is correct by construction, so
+  a small file still comes back in full; a large one is omitted rather than
+  sliced.
+
+Byte size stays gated separately by `indexing.max_file_size` (1 MiB default) —
+a file over that limit was never extracted, so its text is not served either way.
+
+### The banner
+
+A response is prefixed with:
+
+```
+⚠️ Some files referenced below were edited since the last index sync — their codegraph entries may be stale:
+  - path/to/file.rs
+For accurate content of those specific files, Read them directly. The rest of this response is fresh.
+```
+
+only when that response actually serves or cites current bytes from a
+possibly-drifted file. An unreadable or oversized file whose content is omitted
+is still not treated as fresh, but it does **not** fabricate a banner entry for
+bytes the response never exposed. A response with no cited possibly-drifted bytes
+gets **no** banner, which is what makes "trust everything not listed" a real
+guarantee rather than an assumption — the agent instructions had described this
+banner before anything produced it. Re-run `codegraph index`, or wait for the
+watcher, if you see it on a hot codebase.

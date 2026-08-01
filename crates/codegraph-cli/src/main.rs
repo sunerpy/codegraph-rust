@@ -3676,17 +3676,22 @@ fn cmd_impact(
     let depth = depth.clamp(1, 10);
     let matches = symbol_matches(&store, &project, &symbol)?;
     if matches.is_empty() {
-        println!("Symbol \"{symbol}\" not found");
+        let message = lookup_symbol_not_found_message(&symbol);
+        println!("{message}");
         if strict {
             bail!("codegraph impact: symbol \"{symbol}\" not found");
         }
-        return Ok(());
+        bail!(message);
+    }
+    let exact_matches = exact_or_top_matches(&matches, &symbol);
+    if exact_matches.is_empty() {
+        bail!(lookup_symbol_not_found_message(&symbol));
     }
     let traverser = GraphTraverser::new(&store);
     let mut nodes = HashMap::new();
     let mut edge_keys = HashSet::new();
     let mut godot_files: Vec<String> = Vec::new();
-    for node in exact_or_top_matches(&matches, &symbol) {
+    for node in exact_matches {
         let impact = traverser.get_impact_radius(&node.id, depth)?;
         for (id, node) in impact.nodes {
             nodes.insert(id, node);
@@ -4961,13 +4966,14 @@ fn related_nodes_for_symbol(
     related: Related,
 ) -> Result<Vec<NodeSummary>> {
     let matches = symbol_matches(store, project, symbol)?;
-    if matches.is_empty() {
-        return Ok(Vec::new());
+    let exact_matches = exact_or_top_matches(&matches, symbol);
+    if exact_matches.is_empty() {
+        bail!(lookup_symbol_not_found_message(symbol));
     }
     let traverser = GraphTraverser::new(store);
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    for node in exact_or_top_matches(&matches, symbol) {
+    for node in exact_matches {
         let edges = match related {
             Related::Callers => traverser.get_callers(&node.id, 1)?,
             Related::Callees => traverser.get_callees(&node.id, 1)?,
@@ -5057,12 +5063,13 @@ fn godot_honesty_for_symbol(
 ) -> Result<GodotHonestySummary> {
     let matches = symbol_matches(store, project, symbol)?;
     let mut summary = GodotHonestySummary::default();
-    if matches.is_empty() {
-        return Ok(summary);
+    let exact_matches = exact_or_top_matches(&matches, symbol);
+    if exact_matches.is_empty() {
+        bail!(lookup_symbol_not_found_message(symbol));
     }
     let traverser = GraphTraverser::new(store);
     let mut seen = HashSet::new();
-    for node in exact_or_top_matches(&matches, symbol) {
+    for node in exact_matches {
         let reach = traverser.godot_dynamic_reachability(node)?;
         for r in &reach.reached_by {
             match r {
@@ -5101,9 +5108,12 @@ fn symbol_matches(store: &Store, project: &Path, symbol: &str) -> Result<Vec<Nod
     // (`godot::resolve_class_member`). Returns the resolved nodes directly so
     // callers/impact/query all resolve the dotted form to the exact target.
     if nodes.iter().all(|n| n.name != symbol)
-        && let Some(resolved) = resolve_gdscript_class_member(store, symbol)?
+        && let Some(mut resolved) = resolve_gdscript_class_member(store, symbol)?
         && !resolved.is_empty()
     {
+        for node in &mut resolved {
+            node.qualified_name = symbol.to_string();
+        }
         return Ok(resolved);
     }
     Ok(nodes)
@@ -5164,19 +5174,22 @@ fn resolve_gdscript_class_member(store: &Store, symbol: &str) -> Result<Option<V
 }
 
 fn exact_or_top_matches<'a>(matches: &'a [Node], symbol: &str) -> Vec<&'a Node> {
-    let exact = matches
+    matches
         .iter()
         .filter(|node| {
             node.name == symbol
+                || node.qualified_name == symbol
+                || (node.file_path == symbol && is_godot_resource_target_node(node))
                 || node.name.ends_with(&format!(".{symbol}"))
                 || node.name.ends_with(&format!("::{symbol}"))
         })
-        .collect::<Vec<_>>();
-    if exact.is_empty() {
-        matches.first().into_iter().collect()
-    } else {
-        exact
-    }
+        .collect()
+}
+
+fn lookup_symbol_not_found_message(symbol: &str) -> String {
+    format!(
+        "Symbol \"{symbol}\" not found. Run `codegraph query {symbol}` to search for fuzzy matches."
+    )
 }
 
 fn open_store(project: &Path) -> Result<Store> {
@@ -6093,11 +6106,21 @@ mod pure_helper_tests {
     }
 
     #[test]
-    fn exact_or_top_matches_falls_back_to_first_when_no_exact() {
+    fn exact_or_top_matches_refuses_fuzzy_only_matches() {
         let matches = vec![node("alpha"), node("beta")];
         let picked = exact_or_top_matches(&matches, "zzz");
+        assert!(picked.is_empty());
+    }
+
+    #[test]
+    fn exact_or_top_matches_accepts_exact_godot_resource_path() {
+        let mut scene = node("Main");
+        scene.file_path = "main.tscn".to_string();
+        scene.language = Language::GodotScene;
+        let matches = vec![scene];
+        let picked = exact_or_top_matches(&matches, "main.tscn");
         assert_eq!(picked.len(), 1);
-        assert_eq!(picked[0].name, "alpha");
+        assert_eq!(picked[0].file_path, "main.tscn");
     }
 
     #[test]
