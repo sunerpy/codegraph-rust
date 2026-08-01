@@ -709,13 +709,37 @@ pub fn remove_toml_table(content: &str, header: &str) -> (String, bool) {
     (format!("{before}{sep}{after}"), true)
 }
 
-/// Ports `findHeaderIndex` (toml.ts:127): header at BOL or right after a newline.
+/// Find our table header at a line start while ignoring header-shaped text inside
+/// multiline values. This deliberately reuses the same lexer as the end scan so
+/// block start and end cannot disagree about TOML state.
 fn find_header_index(content: &str, header_line: &str) -> Option<usize> {
-    if content.starts_with(header_line) {
-        return Some(0);
+    let mut state = TomlLexState::default();
+    let mut line_start = 0;
+
+    while line_start < content.len() {
+        let newline_idx = content[line_start..]
+            .find('\n')
+            .map(|relative| line_start + relative);
+        let line_end = newline_idx.unwrap_or(content.len());
+        let line = &content[line_start..line_end];
+
+        if state.multiline_string.is_none()
+            && state.array_depth == 0
+            && state.inline_table_depth == 0
+            && line.starts_with(header_line)
+            && is_toml_table_header(line)
+        {
+            return Some(line_start);
+        }
+
+        scan_toml_line(line, &mut state);
+        let Some(newline_idx) = newline_idx else {
+            break;
+        };
+        line_start = newline_idx + 1;
     }
-    let needle = format!("\n{header_line}");
-    content.find(&needle).map(|idx| idx + 1)
+
+    None
 }
 
 /// Find the next `[...]` or `[[...]]` TOML table header. Ports
@@ -1253,6 +1277,160 @@ x = 1
         assert_eq!(
             find_next_table_header(content, "[a]".len()),
             content.find("[real]").unwrap()
+        );
+    }
+
+    fn assert_decoy_upsert_preserves_user_data(content: &str) {
+        toml::from_str::<toml::Value>(content).expect("test fixture must be valid TOML");
+        let block = concat!(
+            "[mcp_servers.codegraph]\n",
+            "command = \"codegraph\"\n",
+            "args = [\"serve\", \"--mcp\"]",
+        );
+
+        let (updated, action) = upsert_toml_table(content, "mcp_servers.codegraph", block);
+
+        if !updated.contains("important-user-tool") {
+            let validity = match toml::from_str::<toml::Value>(&updated) {
+                Ok(_) => "resulting TOML unexpectedly remains valid".to_string(),
+                Err(error) => format!("resulting TOML is invalid: {error}"),
+            };
+            panic!(
+                "upsert silently removed trailing user data: input={} bytes, output={} bytes; {validity}\n{updated}",
+                content.len(),
+                updated.len(),
+            );
+        }
+
+        assert_eq!(action, TomlUpsert::Inserted);
+        assert!(updated.starts_with(content.trim_end()));
+        toml::from_str::<toml::Value>(&updated).expect("updated config must remain valid TOML");
+    }
+
+    #[test]
+    fn toml_upsert_ignores_column_zero_header_decoy_in_basic_multiline_string() {
+        let content = r#"model = "gpt-5"
+
+[settings]
+instructions = """
+To wire up codegraph, add this to your config:
+
+[mcp_servers.codegraph]
+command = "codegraph"
+args = ["serve", "--mcp"]
+"""
+
+[[mcp_servers.other.tools]]
+name = "important-user-tool"
+token = "keep-this"
+"#;
+
+        assert_decoy_upsert_preserves_user_data(content);
+    }
+
+    #[test]
+    fn toml_upsert_ignores_column_zero_header_decoy_in_literal_multiline_string() {
+        let content = r#"model = "gpt-5"
+
+[settings]
+instructions = '''
+To wire up codegraph, add this to your config:
+
+[mcp_servers.codegraph]
+command = "codegraph"
+args = ["serve", "--mcp"]
+'''
+
+[[mcp_servers.other.tools]]
+name = "important-user-tool"
+token = "keep-this"
+"#;
+
+        assert_decoy_upsert_preserves_user_data(content);
+    }
+
+    #[test]
+    fn toml_upsert_ignores_header_decoy_closed_on_same_content_line() {
+        let content = r#"model = "gpt-5"
+
+[settings]
+instructions = """
+To wire up codegraph, add this to your config:
+[mcp_servers.codegraph]"""
+
+[[mcp_servers.other.tools]]
+name = "important-user-tool"
+token = "keep-this"
+"#;
+
+        assert_decoy_upsert_preserves_user_data(content);
+    }
+
+    #[test]
+    fn toml_upsert_still_ignores_indented_header_decoy() {
+        let content = r#"[settings]
+instructions = """
+    [mcp_servers.codegraph]
+"""
+
+[[mcp_servers.other.tools]]
+name = "important-user-tool"
+"#;
+
+        assert_decoy_upsert_preserves_user_data(content);
+    }
+
+    #[test]
+    fn toml_upsert_still_ignores_header_decoy_in_comment() {
+        let content = r#"[settings]
+# [mcp_servers.codegraph]
+enabled = true
+
+[[mcp_servers.other.tools]]
+name = "important-user-tool"
+"#;
+
+        assert_decoy_upsert_preserves_user_data(content);
+    }
+
+    #[test]
+    fn toml_upsert_still_ignores_header_decoy_as_quoted_array_element() {
+        let content = r#"[settings]
+examples = [
+    "[mcp_servers.codegraph]",
+]
+
+[[mcp_servers.other.tools]]
+name = "important-user-tool"
+"#;
+
+        assert_decoy_upsert_preserves_user_data(content);
+    }
+
+    #[test]
+    fn toml_upsert_still_uses_real_header_before_multiline_decoy() {
+        let content = r#"[mcp_servers.codegraph]
+command = "old"
+
+[settings]
+instructions = """
+[mcp_servers.codegraph]
+"""
+
+[[mcp_servers.other.tools]]
+name = "important-user-tool"
+"#;
+        let block = "[mcp_servers.codegraph]\ncommand = \"codegraph\"";
+
+        let (updated, action) = upsert_toml_table(content, "mcp_servers.codegraph", block);
+
+        assert_eq!(action, TomlUpsert::Replaced);
+        assert!(updated.contains("important-user-tool"));
+        assert!(updated.contains("instructions = \"\"\"\n[mcp_servers.codegraph]\n\"\"\""));
+        let parsed = toml::from_str::<toml::Value>(&updated).expect("updated TOML must stay valid");
+        assert_eq!(
+            parsed["mcp_servers"]["codegraph"]["command"].as_str(),
+            Some("codegraph")
         );
     }
 

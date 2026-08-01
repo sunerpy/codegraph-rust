@@ -104,13 +104,20 @@ impl AgentTarget for CodexTarget {
         let mut files = Vec::new();
         let toml_path = toml_config_path(ctx);
         if let Ok(content) = fs::read_to_string(&toml_path) {
+            let line_ending = if content.contains("\r\n") {
+                "\r\n"
+            } else {
+                "\n"
+            };
             let (next_content, removed) = remove_toml_table(&content, TOML_HEADER);
             if removed {
                 if next_content.trim().is_empty() {
                     let _ = fs::remove_file(&toml_path);
                 } else {
-                    let _ =
-                        atomic_write_file(&toml_path, &format!("{}\n", next_content.trim_end()));
+                    let _ = atomic_write_file(
+                        &toml_path,
+                        &format!("{}{line_ending}", next_content.trim_end()),
+                    );
                 }
                 files.push(FileWrite {
                     path: toml_path,
@@ -359,6 +366,37 @@ mod tests {
         let content = fs::read_to_string(&toml).unwrap();
         assert!(!content.contains("[mcp_servers.codegraph]"));
         assert!(content.contains("[mcp_servers.other]"));
+    }
+
+    #[test]
+    fn uninstall_preserves_crlf_line_endings() {
+        let fx = TempCodex::new("uninstall-crlf");
+        let target = CodexTarget;
+        let toml = toml_config_path(&fx.ctx);
+        fs::create_dir_all(toml.parent().unwrap()).unwrap();
+        fs::write(
+            &toml,
+            concat!(
+                "[mcp_servers.codegraph]\r\n",
+                "command = \"codegraph\"\r\n",
+                "args = [\"serve\", \"--mcp\"]\r\n",
+                "\r\n",
+                "[mcp_servers.other]\r\n",
+                "name = \"keep-crlf\"\r\n",
+            ),
+        )
+        .unwrap();
+        let expected = b"[mcp_servers.other]\r\nname = \"keep-crlf\"\r\n";
+
+        target.uninstall(&fx.ctx, Location::Global);
+
+        let actual = fs::read(&toml).unwrap();
+        assert_eq!(
+            actual,
+            expected,
+            "uninstall must preserve CRLF bytes; got {:?}",
+            String::from_utf8_lossy(&actual)
+        );
     }
 
     #[test]
