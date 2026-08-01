@@ -15,6 +15,7 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use codegraph_core::node_id::hash_content;
 use codegraph_core::types::FileRecord;
 use codegraph_extract::{detect_language, extract_file};
 use codegraph_mcp::McpServer;
@@ -60,14 +61,21 @@ fn pipeline_project(files: &[(&str, &str)]) -> TestProject {
     // Batch M: the MCP engine reads the isolated v2 namespace (`.codegraph-v2`).
     let mut store = Store::open(&base.join(".codegraph-v2").join("codegraph.db")).unwrap();
     for (rel, src) in files {
+        let metadata = fs::metadata(base.join(rel)).unwrap();
+        let modified_at = metadata
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
         let result = extract_file(&base, rel).unwrap();
         store
             .upsert_file(&FileRecord {
                 path: (*rel).to_string(),
-                content_hash: String::new(),
+                content_hash: hash_content(src),
                 language: detect_language(rel),
-                size: src.len() as i64,
-                modified_at: 0,
+                size: metadata.len() as i64,
+                modified_at,
                 indexed_at: 0,
                 node_count: result.nodes.len() as i64,
                 errors: Vec::new(),

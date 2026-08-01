@@ -358,11 +358,11 @@ fuzzy search instead of silently substituting the highest-ranked result.
 `--strict` retains its separate contract: after an exact match, an empty result
 also exits non-zero.
 
-| Case | Default | `--strict` |
-| --- | --- | --- |
-| No exact match (symbol absent) | Fails | Fails |
-| Exact match with results | Succeeds | Succeeds |
-| Exact match with zero results | Succeeds and prints the empty result | Fails |
+| Case                           | Default                              | `--strict` |
+| ------------------------------ | ------------------------------------ | ---------- |
+| No exact match (symbol absent) | Fails                                | Fails      |
+| Exact match with results       | Succeeds                             | Succeeds   |
+| Exact match with zero results  | Succeeds and prints the empty result | Fails      |
 
 ---
 

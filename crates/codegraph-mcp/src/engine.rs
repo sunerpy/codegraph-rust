@@ -6,13 +6,15 @@
 //! here too — the server owns the loop. Each handler cites the upstream source
 //! file:line for its API call + output template.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use codegraph_core::config::Config;
+use codegraph_core::node_id::hash_content;
 use codegraph_core::types::{EdgeKind, FileRecord, Node, NodeKind};
 use codegraph_graph::graph::{GodotReach, GraphTraverser, NodeEdge};
 use codegraph_graph::query::{SearchOptions, search_nodes};
@@ -72,6 +74,9 @@ pub struct CodeGraphEngine {
     /// global HTTP process) therefore honors each project's own settings, and
     /// nothing here reads a process-global value or a legacy `.codegraph` config.
     config: Arc<Config>,
+    /// Request-local source/freshness memo. `execute` clears it before every tool
+    /// call so repeated render passes stat and read each referenced file once.
+    source_probes: RefCell<HashMap<String, SourceProbe>>,
 }
 
 impl CodeGraphEngine {
@@ -94,6 +99,7 @@ impl CodeGraphEngine {
             store,
             project_root: project_root.to_path_buf(),
             config,
+            source_probes: RefCell::new(HashMap::new()),
         })
     }
 
@@ -102,20 +108,88 @@ impl CodeGraphEngine {
         &self.config
     }
 
-    /// Read an indexed file's on-disk source, refusing anything larger than THIS
-    /// project's `indexing.max_file_size`.
+    /// Read an indexed file's on-disk source and compare it with the stored file
+    /// record, refusing anything larger than THIS project's
+    /// `indexing.max_file_size`.
     ///
     /// Extraction skips a file over that limit, so its symbols are not in the
     /// graph; serving its full text through a graph tool would contradict the
     /// project's own size policy. `None` therefore means "unreadable or beyond
     /// this project's limit", and every rendering path treats it exactly as it
     /// already treats an unreadable file.
-    fn read_project_source(&self, abs: &Path) -> Option<String> {
-        let metadata = fs::metadata(abs).ok()?;
-        if metadata.len() > self.config.indexing.max_file_size {
-            return None;
+    ///
+    /// Freshness follows the sync fast path: equal size + millisecond mtime is
+    /// accepted without hashing; any stat mismatch falls through to the indexed
+    /// sha256 content hash. The full probe is memoized for the current handler.
+    fn project_source(&self, file_path: &str) -> SourceProbe {
+        if let Some(cached) = self.source_probes.borrow().get(file_path).cloned() {
+            return cached;
         }
-        fs::read_to_string(abs).ok()
+
+        let abs = self.project_root.join(file_path);
+        let probe = match fs::metadata(&abs) {
+            Ok(metadata) if metadata.is_file() => {
+                let stored = self.store.file_by_path(file_path).ok().flatten();
+                if metadata.len() > self.config.indexing.max_file_size {
+                    SourceProbe {
+                        content: None,
+                        drifted: stored
+                            .as_ref()
+                            .is_some_and(|file| file.size != metadata.len() as i64),
+                    }
+                } else {
+                    match fs::read_to_string(&abs) {
+                        Ok(content) => {
+                            let drifted = stored.as_ref().is_some_and(|file| {
+                                let stat_matches = file.size == metadata.len() as i64
+                                    && metadata_modified_millis(&metadata)
+                                        .is_some_and(|mtime| file.modified_at == mtime);
+                                !stat_matches && file.content_hash != hash_content(&content)
+                            });
+                            SourceProbe {
+                                content: Some(Arc::<str>::from(content)),
+                                drifted,
+                            }
+                        }
+                        Err(_) => SourceProbe::default(),
+                    }
+                }
+            }
+            _ => SourceProbe::default(),
+        };
+        self.source_probes
+            .borrow_mut()
+            .insert(file_path.to_string(), probe.clone());
+        probe
+    }
+
+    fn with_staleness_banner(&self, mut result: ToolResult) -> ToolResult {
+        if result.is_error == Some(true) {
+            return result;
+        }
+        let mut drifted = self
+            .source_probes
+            .borrow()
+            .iter()
+            .filter(|(_, probe)| probe.drifted)
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        if drifted.is_empty() {
+            return result;
+        }
+        drifted.sort();
+        let files = drifted
+            .iter()
+            .map(|path| format!("  - {path}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let banner = format!(
+            "⚠️ Some files referenced below were edited since the last index sync — their codegraph entries may be stale:\n{files}\nFor accurate content of those specific files, Read them directly. The rest of this response is fresh."
+        );
+        if let Some(first) = result.content.first_mut() {
+            first.text = format!("{banner}\n\n{}", first.text);
+        }
+        result
     }
 
     fn project_name_tokens(&self) -> HashSet<String> {
@@ -154,6 +228,7 @@ impl CodeGraphEngine {
     /// (`tools.ts:1054-1055`); the SERVER rejects unknown names earlier with a
     /// JSON-RPC `-32602` (`session.ts:217-225`), so this branch is a backstop.
     pub fn execute(&self, tool_name: &str, args: &Value) -> ToolResult {
+        self.source_probes.borrow_mut().clear();
         let result = match tool_name {
             "codegraph_search" => self.handle_search(args),
             "codegraph_callers" => self.handle_callers(args),
@@ -168,7 +243,7 @@ impl CodeGraphEngine {
             other => return ToolResult::error(format!("Unknown tool: {other}")),
         };
         match result {
-            Ok(tr) => tr,
+            Ok(tr) => self.with_staleness_banner(tr),
             Err(e) => ToolResult::error(format!("Tool execution failed: {e}")),
         }
     }
@@ -432,6 +507,10 @@ impl CodeGraphEngine {
     /// `renderNodeSection` (`tools.ts:2802-2819`): container outline OR full
     /// body, then the trail.
     fn render_node_section(&self, node: &Node, include_code: bool) -> anyhow::Result<String> {
+        let source = self.project_source(&node.file_path);
+        if source.drifted {
+            return self.render_drifted_node_section(node, include_code, source.content.as_deref());
+        }
         let outline = if is_container(node.kind) {
             Some(self.build_container_outline(node)?)
         } else {
@@ -447,6 +526,64 @@ impl CodeGraphEngine {
             format_node_details(node, code.as_deref(), outline.as_deref()),
             self.format_trail(node)?
         ))
+    }
+
+    /// Render a node whose indexed line range no longer matches its file. Current
+    /// source is emitted only as a whole file; otherwise the body is omitted.
+    fn render_drifted_node_section(
+        &self,
+        node: &Node,
+        include_code: bool,
+        content: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let location = if node.start_line != 0 {
+            format!(":{}", node.start_line)
+        } else {
+            String::new()
+        };
+        let mut lines = vec![
+            format!("## {} ({})", node.name, node.kind.as_str()),
+            String::new(),
+            format!(
+                "**Location:** {}{} — ⚠ as of the last index sync; the file has changed on disk, so this line may be shifted",
+                node.file_path, location
+            ),
+        ];
+        if let Some(signature) = &node.signature {
+            lines.push(format!("**Signature:** `{signature}`"));
+        }
+        if let Some(doc) = &node.docstring
+            && doc.len() < 200
+        {
+            lines.push(String::new());
+            lines.push(doc.clone());
+        }
+        if include_code {
+            lines.push(String::new());
+            let body = content.map(|source| source.trim_end_matches('\n'));
+            let whole_file_fits =
+                body.is_some_and(|source| source.split('\n').count() <= FILE_MODE_MAX_LINES);
+            if whole_file_fits {
+                let body = body.unwrap_or_default();
+                lines.push(format!(
+                    "> ⚠ `{}` changed on disk after it was last indexed, so the indexed symbol range is unsafe. Showing the file's full CURRENT source instead (Read-parity — treat it as already Read):",
+                    node.file_path
+                ));
+                lines.push(String::new());
+                lines.push(format!("```{}", node.language.as_str()));
+                lines.push(number_source_lines_at(
+                    &body.split('\n').collect::<Vec<_>>(),
+                    1,
+                ));
+                lines.push("```".to_string());
+            } else {
+                lines.push(format!(
+                    "> ⚠ `{}` changed on disk after it was last indexed — source omitted because its indexed line ranges are unsafe and the current file exceeds the {}-line whole-file cap. Call codegraph_node with `file: \"{}\"` or Read it directly.",
+                    node.file_path, FILE_MODE_MAX_LINES, node.file_path
+                ));
+            }
+        }
+        Ok(format!("{}{}", lines.join("\n"), self.format_trail(node)?))
     }
 
     /// `buildContainerOutline` (`tools.ts:3387-3400`): the container's `contains`
@@ -627,8 +764,8 @@ impl CodeGraphEngine {
             return Ok(ToolResult::text(out.join("\n")));
         }
 
-        let abs = self.project_root.join(&file_path);
-        let content = match self.read_project_source(&abs) {
+        let source = self.project_source(&file_path);
+        let content = match source.content {
             Some(c) => c,
             None => {
                 let mut out = vec![
@@ -792,16 +929,22 @@ impl CodeGraphEngine {
                 excluded_files.push(file_path);
                 continue;
             }
-            let abs = self.project_root.join(file_path);
-            let content = match self.read_project_source(&abs) {
+            let source = self.project_source(file_path);
+            let content = match source.content {
                 Some(c) => c,
                 None => continue,
             };
             let file_lines: Vec<&str> = content.split('\n').collect();
             let lang = subgraph.file_language(file_path);
 
-            let section =
-                self.render_explore_file(&subgraph, file_path, &file_lines, &lang, &budget);
+            let section = self.render_explore_file(
+                &subgraph,
+                file_path,
+                &file_lines,
+                &lang,
+                &budget,
+                source.drifted,
+            );
             // Past the total cap an incidental file is skipped whole — the source
             // section never slices through a method body (`tools.ts:2888-2894`).
             if total_chars + section.len() + 200 > budget.max_output_chars {
@@ -884,10 +1027,28 @@ impl CodeGraphEngine {
         file_lines: &[&str],
         lang: &str,
         budget: &ExploreOutputBudget,
+        drifted: bool,
     ) -> String {
         let total_lines = file_lines.len();
         let content = file_lines.join("\n");
         let body = content.trim_end_matches('\n');
+
+        // Indexed symbol ranges are unsafe after a disk edit. A drifted file is
+        // therefore rendered from line 1 in full or represented by an omission
+        // notice; it never reaches the range-based clustering branches below.
+        if drifted {
+            let names =
+                subgraph.file_header_names_capped(file_path, budget.max_symbols_in_file_header);
+            if total_lines <= FILE_MODE_MAX_LINES {
+                let numbered = number_source_lines_at(&body.split('\n').collect::<Vec<_>>(), 1);
+                return format!(
+                    "#### {file_path} — {names} · ⚠ changed since last index sync; source below is the full current file\n\n```{lang}\n{numbered}\n```\n"
+                );
+            }
+            return format!(
+                "#### {file_path} — ⚠ changed on disk after the last index sync — source omitted because indexed line ranges are unsafe and the current file exceeds the {FILE_MODE_MAX_LINES}-line whole-file cap. Read this file directly.\n"
+            );
+        }
 
         // Whole-file rule (`tools.ts:2645-2672`): a relevant file small enough to
         // afford comes back ENTIRELY — clustering exists only to tame god-files.
@@ -1041,7 +1202,7 @@ impl CodeGraphEngine {
     /// `buildBlastRadiusSection` (`tools.ts:1441-1491`).
     fn build_blast_radius(&self, subgraph: &ExploreSubgraph) -> anyhow::Result<Option<String>> {
         const ROOT_CAP: usize = 5;
-        const FILE_CAP: usize = 4;
+        const DIRECT_CALLER_FILE_CAP: usize = 4;
         let traverser = GraphTraverser::new(&self.store);
         let roots: Vec<&Node> = subgraph
             .roots
@@ -1079,12 +1240,12 @@ impl CodeGraphEngine {
 
             let shown = non_test
                 .iter()
-                .take(FILE_CAP)
+                .take(DIRECT_CALLER_FILE_CAP)
                 .map(|f| format!("`{f}`"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let more = if non_test.len() > FILE_CAP {
-                format!(" +{} more", non_test.len() - FILE_CAP)
+            let more = if non_test.len() > DIRECT_CALLER_FILE_CAP {
+                format!(" +{} more", non_test.len() - DIRECT_CALLER_FILE_CAP)
             } else {
                 String::new()
             };
@@ -1096,18 +1257,18 @@ impl CodeGraphEngine {
             let tests = if !test_files.is_empty() {
                 let t = test_files
                     .iter()
-                    .take(FILE_CAP)
+                    .take(DIRECT_CALLER_FILE_CAP)
                     .map(|f| format!("`{f}`"))
                     .collect::<Vec<_>>()
                     .join(", ");
-                let tmore = if test_files.len() > FILE_CAP {
-                    format!(" +{}", test_files.len() - FILE_CAP)
+                let tmore = if test_files.len() > DIRECT_CALLER_FILE_CAP {
+                    format!(" +{}", test_files.len() - DIRECT_CALLER_FILE_CAP)
                 } else {
                     String::new()
                 };
                 format!("; tests: {t}{tmore}")
             } else {
-                "; ⚠️ no covering tests found".to_string()
+                self.indirect_test_note(&uniq)
             };
             entries.push(format!(
                 "- `{}` ({}:{}) — {} caller{}{where_clause}{tests}",
@@ -1128,6 +1289,78 @@ impl CodeGraphEngine {
         out.extend(entries);
         out.push(String::new());
         Ok(Some(out.join("\n")))
+    }
+
+    /// Search beyond direct callers before making a test-coverage claim. The
+    /// lookup budget bounds high-fan-in symbols; the display cap never prunes the
+    /// traversal frontier.
+    fn indirect_test_note(&self, direct_callers: &[&Node]) -> String {
+        const MAX_CALLER_HOPS: usize = 3;
+        const CALLER_LOOKUP_BUDGET: usize = 64;
+        const TEST_FILE_DISPLAY_CAP: usize = 2;
+
+        let traverser = GraphTraverser::new(&self.store);
+        let mut budget = CALLER_LOOKUP_BUDGET;
+        let mut visited = direct_callers
+            .iter()
+            .map(|node| node.id.clone())
+            .collect::<HashSet<_>>();
+        let mut frontier = direct_callers
+            .iter()
+            .map(|node| (*node).clone())
+            .collect::<Vec<_>>();
+
+        for _hop in 2..=MAX_CALLER_HOPS {
+            if frontier.is_empty() || budget == 0 {
+                break;
+            }
+            let mut next = Vec::new();
+            let mut found = Vec::new();
+            let mut found_set = HashSet::new();
+            for node in &frontier {
+                if budget == 0 {
+                    break;
+                }
+                budget -= 1;
+                let Ok(callers) = traverser.get_callers(&node.id, CALL_DEPTH) else {
+                    continue;
+                };
+                for caller in callers {
+                    let caller = caller.node;
+                    if !visited.insert(caller.id.clone()) {
+                        continue;
+                    }
+                    if is_test_file(&caller.file_path) {
+                        if found_set.insert(caller.file_path.clone()) {
+                            found.push(caller.file_path);
+                        }
+                    } else {
+                        next.push(caller);
+                    }
+                }
+            }
+            if !found.is_empty() {
+                let shown = found
+                    .iter()
+                    .take(TEST_FILE_DISPLAY_CAP)
+                    .map(|file| format!("`{file}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let more = if found.len() > TEST_FILE_DISPLAY_CAP {
+                    format!(" +{}", found.len() - TEST_FILE_DISPLAY_CAP)
+                } else {
+                    String::new()
+                };
+                return format!("; tested via callers: {shown}{more}");
+            }
+            frontier = next;
+        }
+
+        if budget > 0 {
+            format!("; no tests found within {MAX_CALLER_HOPS} caller hops")
+        } else {
+            "; no test calls this directly".to_string()
+        }
     }
 
     /// Relationship map (`tools.ts:2386-2414`): non-`contains` edges grouped by
@@ -1582,8 +1815,11 @@ impl CodeGraphEngine {
                 continue;
             }
             seen_node.insert(node.id.as_str());
-            let abs = self.project_root.join(&node.file_path);
-            let content = match self.read_project_source(&abs) {
+            let source = self.project_source(&node.file_path);
+            if source.drifted {
+                continue;
+            }
+            let content = match source.content {
                 Some(c) => c,
                 None => continue,
             };
@@ -1796,8 +2032,11 @@ impl CodeGraphEngine {
     /// `getCode` (`context/index.ts:1151-1191`): slice `[startLine, endLine]`
     /// out of the on-disk file (1-based inclusive).
     fn get_code(&self, node: &Node) -> anyhow::Result<Option<String>> {
-        let abs = self.project_root.join(&node.file_path);
-        let content = match self.read_project_source(&abs) {
+        let source = self.project_source(&node.file_path);
+        if source.drifted {
+            return Ok(None);
+        }
+        let content = match source.content {
             Some(c) => c,
             None => return Ok(None),
         };
@@ -1813,6 +2052,21 @@ impl CodeGraphEngine {
         let start_idx = start_idx.min(end_idx);
         Ok(Some(lines[start_idx..end_idx].join("\n")))
     }
+}
+
+#[derive(Clone, Default)]
+struct SourceProbe {
+    content: Option<Arc<str>>,
+    drifted: bool,
+}
+
+fn metadata_modified_millis(metadata: &fs::Metadata) -> Option<i64> {
+    metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis() as i64)
 }
 
 #[derive(Clone, Copy)]
@@ -2745,6 +2999,7 @@ mod tests {
             store,
             project_root: base,
             config: Arc::new(Config::default()),
+            source_probes: RefCell::new(HashMap::new()),
         }
     }
 
@@ -2803,7 +3058,7 @@ mod tests {
         let sg = subgraph_with(vec![real.clone(), stale], vec![real.id.clone()]);
         let budget = crate::explore_budget::get_explore_output_budget(200);
 
-        let out = engine.render_explore_file(&sg, file, &file_lines, "rust", &budget);
+        let out = engine.render_explore_file(&sg, file, &file_lines, "rust", &budget, false);
         assert!(
             out.contains(file),
             "stale-node render should still produce a file section, got: {out:?}"
@@ -2822,7 +3077,7 @@ mod tests {
         let sg = subgraph_with(vec![stale.clone()], vec![stale.id.clone()]);
         let budget = crate::explore_budget::get_explore_output_budget(200);
 
-        let out = engine.render_explore_file(&sg, file, &file_lines, "rust", &budget);
+        let out = engine.render_explore_file(&sg, file, &file_lines, "rust", &budget, false);
         assert!(out.contains(file), "should render a header, got: {out:?}");
     }
 
@@ -2839,7 +3094,7 @@ mod tests {
         let sg = subgraph_with(vec![f1.clone(), f2], vec![f1.id.clone()]);
         let budget = crate::explore_budget::get_explore_output_budget(200);
 
-        let out = engine.render_explore_file(&sg, file, &file_lines, "rust", &budget);
+        let out = engine.render_explore_file(&sg, file, &file_lines, "rust", &budget, false);
         assert!(out.contains("line 10"), "cluster source missing: {out:?}");
         assert!(out.contains("line 30"), "cluster source missing: {out:?}");
     }
@@ -2856,7 +3111,7 @@ mod tests {
         let sg = subgraph_with(vec![n.clone()], vec![n.id.clone()]);
         let budget = crate::explore_budget::get_explore_output_budget(200);
 
-        let out = engine.render_explore_file(&sg, file, &file_lines, "rust", &budget);
+        let out = engine.render_explore_file(&sg, file, &file_lines, "rust", &budget, false);
         let expected = {
             let numbered = number_source_lines_at(&file_lines, 1);
             format!("#### {file} — Small(struct)\n\n```rust\n{numbered}\n```\n")
@@ -2970,6 +3225,28 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(&abs, content).unwrap();
+    }
+
+    fn put_indexed_source(
+        engine: &CodeGraphEngine,
+        rel: &str,
+        content: &str,
+        language: Language,
+        node_count: i64,
+    ) {
+        write_src(engine, rel, content);
+        let metadata = std::fs::metadata(engine.project_root.join(rel)).unwrap();
+        let modified_at = metadata
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let mut file = file_rec(rel, language, node_count);
+        file.content_hash = codegraph_core::node_id::hash_content(content);
+        file.size = metadata.len() as i64;
+        file.modified_at = modified_at;
+        put_file(engine, &file);
     }
 
     #[test]
@@ -3384,6 +3661,112 @@ mod tests {
         assert!(txt.contains("line 10"));
         assert!(txt.contains("Trail"));
         assert!(txt.contains("Calls"));
+    }
+
+    #[test]
+    fn ext_node_drifted_large_file_never_returns_mis_sliced_body() {
+        let mut engine = test_engine();
+        let file = "src/drifted.rs";
+        let mut indexed_lines: Vec<String> = (1..=FILE_MODE_MAX_LINES + 1)
+            .map(|i| format!("line {i}"))
+            .collect();
+        indexed_lines[999] = "fn target() {".to_string();
+        indexed_lines[1000] = "    indexed_body();".to_string();
+        indexed_lines[1001] = "}".to_string();
+        let indexed = indexed_lines.join("\n");
+        put_indexed_source(&engine, file, &indexed, Language::Rust, 1);
+
+        let target = node_lang(
+            "target",
+            "target",
+            file,
+            1000,
+            1002,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        put_nodes(&mut engine, std::slice::from_ref(&target));
+
+        let mut current_lines = indexed_lines;
+        current_lines[999] = "fn different_symbol() {".to_string();
+        current_lines[1000] = "    WRONG_BODY_FROM_DIFFERENT_SYMBOL();".to_string();
+        current_lines[1001] = "}".to_string();
+        write_src(&engine, file, &current_lines.join("\n"));
+
+        let tr = engine.execute(
+            "codegraph_node",
+            &serde_json::json!({"symbol": "target", "includeCode": true}),
+        );
+        let txt = text_of(&tr);
+        assert!(
+            !txt.contains("WRONG_BODY_FROM_DIFFERENT_SYMBOL"),
+            "a drifted indexed range must never be sliced from current bytes: {txt}"
+        );
+        assert!(
+            txt.contains("source omitted"),
+            "a drifted file above the whole-file cap needs an explicit omission notice: {txt}"
+        );
+    }
+
+    #[test]
+    fn ext_node_staleness_banner_is_only_emitted_for_drifted_files() {
+        let mut engine = test_engine();
+
+        let drifted_file = "src/drifted_small.rs";
+        let indexed = "fn first() {}\nfn target() { indexed_body(); }\nfn last() {}\n";
+        put_indexed_source(&engine, drifted_file, indexed, Language::Rust, 1);
+        let drifted = node_lang(
+            "target",
+            "target",
+            drifted_file,
+            2,
+            2,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        put_nodes(&mut engine, std::slice::from_ref(&drifted));
+        write_src(
+            &engine,
+            drifted_file,
+            "fn inserted() {}\nfn first() {}\nfn target() { current_body(); }\nfn last() {}\n",
+        );
+
+        let stale = engine.execute(
+            "codegraph_node",
+            &serde_json::json!({"symbol": "target", "includeCode": true}),
+        );
+        let stale_text = text_of(&stale);
+        assert!(
+            stale_text.starts_with(
+                "⚠️ Some files referenced below were edited since the last index sync"
+            ),
+            "drifted responses need the promised banner prefix: {stale_text}"
+        );
+        assert!(stale_text.contains(drifted_file), "got: {stale_text}");
+
+        let fresh_file = "src/fresh.rs";
+        let fresh_source = "fn fresh_target() { current(); }\n";
+        put_indexed_source(&engine, fresh_file, fresh_source, Language::Rust, 1);
+        let fresh = node_lang(
+            "fresh_target",
+            "fresh_target",
+            fresh_file,
+            1,
+            1,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        put_nodes(&mut engine, std::slice::from_ref(&fresh));
+
+        let fresh_result = engine.execute(
+            "codegraph_node",
+            &serde_json::json!({"symbol": "fresh_target", "includeCode": true}),
+        );
+        assert!(
+            !text_of(&fresh_result).starts_with("⚠️ Some files referenced below"),
+            "fresh responses must not gain a banner: {}",
+            text_of(&fresh_result)
+        );
     }
 
     #[test]
@@ -4018,11 +4401,12 @@ mod tests {
     #[test]
     fn ext_explore_dynamic_boundaries_and_candidates() {
         let mut engine = test_engine();
-        put_file(&engine, &file_rec("bus.ts", Language::TypeScript, 2));
-        write_src(
+        put_indexed_source(
             &engine,
             "bus.ts",
             "function dispatchIt(m) {\n  return m.Send(new SaveCommand(x));\n}\n\nclass SaveCommandHandler {\n  handle(cmd) { return 1; }\n}\n",
+            Language::TypeScript,
+            2,
         );
         let root = node_lang(
             "dispatchIt",
@@ -4180,11 +4564,12 @@ mod tests {
     #[test]
     fn ext_boundary_candidates_shortlist_rendered() {
         let mut engine = test_engine();
-        put_file(&engine, &file_rec("bus.ts", Language::TypeScript, 4));
-        write_src(
+        put_indexed_source(
             &engine,
             "bus.ts",
             "function dispatchIt(m) {\n  return handlers['saveOrder'](x);\n}\n\nfunction handleSaveOrder(x) { return 1; }\n",
+            Language::TypeScript,
+            4,
         );
         let root = node_lang(
             "dispatchIt",
@@ -4421,11 +4806,12 @@ mod tests {
     #[test]
     fn ext_boundary_candidates_typed_bus_handler_class() {
         let mut engine = test_engine();
-        put_file(&engine, &file_rec("bus.ts", Language::TypeScript, 3));
-        write_src(
+        put_indexed_source(
             &engine,
             "bus.ts",
             "function run(m) {\n  return m.Send(new SaveCommand(x));\n}\n\nclass SaveCommandHandler {\n  handle(cmd) { return 1; }\n}\n",
+            Language::TypeScript,
+            3,
         );
         let root = node_lang(
             "run",
@@ -4673,17 +5059,150 @@ mod tests {
         );
         let tr = engine.execute("codegraph_explore", &serde_json::json!({"query": "solo"}));
         let txt = text_of(&tr);
-        assert!(txt.contains("no covering tests found"), "got: {txt}");
+        assert!(
+            txt.contains("no tests found within 3 caller hops"),
+            "the no-test claim must state the searched depth: {txt}"
+        );
+        assert!(
+            !txt.contains('⚠'),
+            "the measured claim is not a warning: {txt}"
+        );
+    }
+
+    #[test]
+    fn ext_blast_radius_finds_a_test_at_hop_three() {
+        let mut engine = test_engine();
+        write_src(&engine, "svc.rs", "fn target() {}\n");
+        let root = node_lang(
+            "target",
+            "target",
+            "svc.rs",
+            1,
+            1,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        let hop_one = node_lang(
+            "hop_one",
+            "hop_one",
+            "src/one.rs",
+            1,
+            1,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        let hop_two = node_lang(
+            "hop_two",
+            "hop_two",
+            "src/two.rs",
+            1,
+            1,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        let test = node_lang(
+            "covers_target",
+            "covers_target",
+            "tests/target_test.rs",
+            1,
+            1,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        put_nodes(
+            &mut engine,
+            &[root.clone(), hop_one.clone(), hop_two.clone(), test.clone()],
+        );
+        put_edges(
+            &mut engine,
+            &[
+                mk_edge(
+                    &hop_one.id,
+                    &root.id,
+                    codegraph_core::types::EdgeKind::Calls,
+                ),
+                mk_edge(
+                    &hop_two.id,
+                    &hop_one.id,
+                    codegraph_core::types::EdgeKind::Calls,
+                ),
+                mk_edge(
+                    &test.id,
+                    &hop_two.id,
+                    codegraph_core::types::EdgeKind::Calls,
+                ),
+            ],
+        );
+
+        let tr = engine.execute("codegraph_explore", &serde_json::json!({"query": "target"}));
+        let txt = text_of(&tr);
+        assert!(
+            txt.contains("tested via callers: `tests/target_test.rs`"),
+            "a hop-3 test must be reported as coverage: {txt}"
+        );
+        assert!(!txt.contains("no covering tests found"), "got: {txt}");
+    }
+
+    #[test]
+    fn ext_blast_radius_budget_exhaustion_uses_the_weaker_claim() {
+        let mut engine = test_engine();
+        write_src(&engine, "svc.rs", "fn budgeted() {}\n");
+        let root = node_lang(
+            "budgeted",
+            "budgeted",
+            "svc.rs",
+            1,
+            1,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        let callers: Vec<Node> = (0..64)
+            .map(|i| {
+                node_lang(
+                    &format!("caller_{i}"),
+                    &format!("caller_{i}"),
+                    &format!("src/caller_{i}.rs"),
+                    1,
+                    1,
+                    NodeKind::Function,
+                    Language::Rust,
+                )
+            })
+            .collect();
+        let mut nodes = Vec::with_capacity(callers.len() + 1);
+        nodes.push(root.clone());
+        nodes.extend(callers.iter().cloned());
+        put_nodes(&mut engine, &nodes);
+        let edges = callers
+            .iter()
+            .map(|caller| mk_edge(&caller.id, &root.id, codegraph_core::types::EdgeKind::Calls))
+            .collect::<Vec<_>>();
+        put_edges(&mut engine, &edges);
+
+        let tr = engine.execute(
+            "codegraph_explore",
+            &serde_json::json!({"query": "budgeted"}),
+        );
+        let txt = text_of(&tr);
+        assert!(
+            txt.contains("no test calls this directly"),
+            "an exhausted indirect search may claim only the direct-caller fact: {txt}"
+        );
+        assert!(
+            !txt.contains('⚠'),
+            "the weaker claim is not a warning: {txt}"
+        );
     }
 
     #[test]
     fn ext_boundary_candidates_generic_key_too_common() {
         let mut engine = test_engine();
-        put_file(&engine, &file_rec("bus.ts", Language::TypeScript, 20));
-        write_src(
+        put_indexed_source(
             &engine,
             "bus.ts",
             "function dispatchIt(m) {\n  return handlers['run'](x);\n}\n",
+            Language::TypeScript,
+            20,
         );
         let root = node_lang(
             "dispatchIt",

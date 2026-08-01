@@ -33,7 +33,11 @@ Protocol) stdio server. No AI / vector / LLM anywhere in the binary — output i
 inheritance extraction with templated-base stripping, #1043) · `codegraph-graph` (traversal + FTS search) ·
 `codegraph-resolve` (import + name matcher + FrameworkResolver; concrete `GodotResolver` impl — autoload-call + signal-handler resolution) · `codegraph-mcp`
 (stdio JSON-RPC; `codegraph_explore` runs a change-surface rescue, #1064, that surfaces a
-callable's buried parameter/return-type files into the explored subgraph) · `codegraph-cli` (single binary, owns logger; also hosts the `install`/`uninstall`
+callable's buried parameter/return-type files into the explored subgraph; every source-emitting
+path goes through a request-memoized freshness probe — size + ms-mtime, then sha256 on stat
+mismatch — so a drifted file is served whole under `FILE_MODE_MAX_LINES` or omitted, never sliced
+at stored line numbers, and the response carries the staleness banner only when it actually cites
+one) · `codegraph-cli` (single binary, owns logger; also hosts the `install`/`uninstall`
 agent-config installer in `src/installer/`) · `codegraph-daemon` ·
 `codegraph-watch` · `codegraph-bench` (benchmark harness + golden oracle).
 
