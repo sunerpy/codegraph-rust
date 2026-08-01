@@ -262,8 +262,8 @@ impl CodeGraphEngine {
 
         let all_matches = self.find_all_symbols(&symbol)?;
         if all_matches.nodes.is_empty() {
-            return Ok(ToolResult::not_found_text(format!(
-                "Symbol \"{symbol}\" not found in the codebase"
+            return Ok(ToolResult::error(format!(
+                "Symbol \"{symbol}\" not found in the codebase. Use codegraph_search with query \"{symbol}\" to find fuzzy matches."
             )));
         }
 
@@ -326,8 +326,8 @@ impl CodeGraphEngine {
 
         let all_matches = self.find_all_symbols(&symbol)?;
         if all_matches.nodes.is_empty() {
-            return Ok(ToolResult::not_found_text(format!(
-                "Symbol \"{symbol}\" not found in the codebase"
+            return Ok(ToolResult::error(format!(
+                "Symbol \"{symbol}\" not found in the codebase. Use codegraph_search with query \"{symbol}\" to find fuzzy matches."
             )));
         }
 
@@ -1314,12 +1314,8 @@ impl CodeGraphEngine {
             .cloned()
             .collect();
         if exact.len() <= 1 {
-            let node = exact
-                .into_iter()
-                .next()
-                .or_else(|| results.into_iter().next());
             return Ok(AllSymbols {
-                nodes: node.into_iter().collect(),
+                nodes: exact,
                 note: String::new(),
             });
         }
@@ -3038,7 +3034,9 @@ mod tests {
     fn ext_callers_symbol_not_found() {
         let engine = test_engine();
         let tr = engine.execute("codegraph_callers", &serde_json::json!({"symbol": "ghost"}));
+        assert_eq!(tr.is_error, Some(true), "got: {}", text_of(&tr));
         assert!(text_of(&tr).contains("not found in the codebase"));
+        assert!(text_of(&tr).contains("ghost"));
     }
 
     #[test]
@@ -3088,6 +3086,7 @@ mod tests {
         );
 
         let cr = engine.execute("codegraph_callers", &serde_json::json!({"symbol": "save"}));
+        assert_ne!(cr.is_error, Some(true));
         assert!(
             text_of(&cr).contains("Callers of save"),
             "got: {}",
@@ -3105,6 +3104,51 @@ mod tests {
             text_of(&ce)
         );
         assert!(text_of(&ce).contains("helper"));
+    }
+
+    #[test]
+    fn ext_lookup_handlers_refuse_fuzzy_only_symbol_matches() {
+        let mut engine = test_engine();
+        let target = node_lang(
+            "save_target",
+            "saveTarget",
+            "svc.rs",
+            10,
+            20,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        let caller = node_lang(
+            "caller_a",
+            "caller_a",
+            "svc.rs",
+            30,
+            40,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        put_nodes(&mut engine, &[target.clone(), caller.clone()]);
+        put_edges(
+            &mut engine,
+            &[mk_edge(
+                &caller.id,
+                &target.id,
+                codegraph_core::types::EdgeKind::Calls,
+            )],
+        );
+
+        for tool in ["codegraph_callers", "codegraph_impact"] {
+            let tr = engine.execute(tool, &serde_json::json!({"symbol": "saveTarge"}));
+            assert_eq!(
+                tr.is_error,
+                Some(true),
+                "{tool} must reject the prefix instead of returning `saveTarget` rows: {}",
+                text_of(&tr)
+            );
+            assert!(text_of(&tr).contains("saveTarge"));
+            assert!(text_of(&tr).contains("codegraph_search"));
+            assert!(!text_of(&tr).contains("caller_a"));
+        }
     }
 
     #[test]
@@ -3144,6 +3188,7 @@ mod tests {
     fn ext_impact_not_found_and_radius() {
         let mut engine = test_engine();
         let tr = engine.execute("codegraph_impact", &serde_json::json!({"symbol": "ghost"}));
+        assert_eq!(tr.is_error, Some(true), "got: {}", text_of(&tr));
         assert!(text_of(&tr).contains("not found in the codebase"));
 
         let core = node_lang(
@@ -3178,6 +3223,7 @@ mod tests {
             "codegraph_impact",
             &serde_json::json!({"symbol": "core", "depth": 2}),
         );
+        assert_ne!(ir.is_error, Some(true));
         let txt = text_of(&ir);
         assert!(txt.contains("Impact:"), "got: {txt}");
         assert!(txt.contains("dependent"));

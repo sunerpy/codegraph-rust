@@ -28,13 +28,13 @@
 | `index`           | (Re-)index in full                                                                        | `[path]`, `-f/--force`, `-q/--quiet`, `-v/--verbose`                                                                                       |
 | `sync`            | Incremental sync: re-index only changed files, drop deleted ones, re-resolve              | `[path]`, `-q/--quiet`                                                                                                                     |
 | `status`          | Print index stats (files/nodes/edges/DB size/journal)                                     | `[path]`, `-j/--json`                                                                                                                      |
-| `query`           | FTS5 + multi-signal scored search                                                         | `<search>`, `-p`, `-l/--limit`, `-k/--kind`, `-j/--json`                                                                                   |
+| `query`           | FTS5 + multi-signal scored search                                                         | `<search>`, `-p`, `-l/--limit`, `-k/--kind`, `-j/--json`, `--strict`                                                                       |
 | `files`           | List indexed files (tree/flat/grouped)                                                    | `-p`, `--filter <DIR>`, `--language <LANG>`, `--pattern`, `--format`, `--max-depth`, `-j`                                                  |
 | `serve`           | Start the server; `--mcp` enters MCP stdio mode                                           | `-p`, `--mcp`, `--no-watch`                                                                                                                |
 | `unlock`          | Clear a stale daemon lock (keeps live pids)                                               | `[path]`                                                                                                                                   |
-| `callers`         | Who calls a symbol (along calls/references/imports)                                       | `<symbol>`, `-p`, `-l`, `-j`                                                                                                               |
-| `callees`         | What a symbol calls                                                                       | `<symbol>`, `-p`, `-l`, `-j`                                                                                                               |
-| `impact`          | Blast radius of changing a symbol (incoming deps, transitive)                             | `<symbol>`, `-p`, `-d/--depth`, `-j`                                                                                                       |
+| `callers`         | Who calls a symbol (along calls/references/imports)                                       | `<symbol>`, `-p`, `-l`, `-j`, `--strict`                                                                                                   |
+| `callees`         | What a symbol calls                                                                       | `<symbol>`, `-p`, `-l`, `-j`, `--strict`                                                                                                   |
+| `impact`          | Blast radius of changing a symbol (incoming deps, transitive)                             | `<symbol>`, `-p`, `-d/--depth`, `-j`, `--strict`                                                                                           |
 | `affected`        | Given changed files, the affected symbol set                                              | `[files...]`, `-p`, `-d/--depth`, `--filter`                                                                                               |
 | `check`           | Detect circular dependencies (each cycle as `a.ts -> b.ts -> a.ts`)                       | `[path]`, `-j/--json`                                                                                                                      |
 | `audit`           | Read-only Godot resource audit: orphan resources, dangling references, impact             | `-p`, `--orphans`, `--dangling`, `--impact <path>` (≥1 required), `--verify-plan`, `--include <PREFIX>`, `--exclude <PREFIX>`, `-j/--json` |
@@ -347,6 +347,22 @@ resource's repo-relative **path** — the `files` row plus the path-shaped
 
 This is a static structural report. Runtime `ResourceLoader` load-verification
 is out of scope (that is Godot MCP Pro's job).
+
+---
+
+## Symbol lookup failures and `--strict`
+
+`callers`, `callees`, and `impact` require an exact symbol match. If the name
+does not exist, they exit non-zero and suggest `codegraph query <name>` for
+fuzzy search instead of silently substituting the highest-ranked result.
+`--strict` retains its separate contract: after an exact match, an empty result
+also exits non-zero.
+
+| Case | Default | `--strict` |
+| --- | --- | --- |
+| No exact match (symbol absent) | Fails | Fails |
+| Exact match with results | Succeeds | Succeeds |
+| Exact match with zero results | Succeeds and prints the empty result | Fails |
 
 ---
 
