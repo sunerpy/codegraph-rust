@@ -31,15 +31,48 @@ fn wal_defer_disabled() -> bool {
 /// Resolve the WAL-valve fold threshold in BYTES from `CODEGRAPH_WAL_VALVE_MB`
 /// (#1231); non-numeric / non-positive → [`DEFAULT_WAL_VALVE_MB`].
 pub fn wal_valve_threshold_bytes() -> u64 {
-    let mb = match std::env::var(CODEGRAPH_WAL_VALVE_MB) {
-        Ok(raw) if !raw.is_empty() => raw
-            .parse::<u64>()
-            .ok()
-            .filter(|&n| n > 0)
-            .unwrap_or(DEFAULT_WAL_VALVE_MB),
-        _ => DEFAULT_WAL_VALVE_MB,
-    };
-    mb * 1024 * 1024
+    let raw = std::env::var(CODEGRAPH_WAL_VALVE_MB).ok();
+    wal_valve_threshold_bytes_from_raw(raw.as_deref())
+}
+
+fn wal_valve_threshold_bytes_from_raw(raw: Option<&str>) -> u64 {
+    raw.and_then(|value| value.parse::<u64>().ok())
+        .filter(|&mb| mb > 0)
+        .and_then(|mb| mb.checked_mul(1024 * 1024))
+        .filter(|&bytes| i64::try_from(bytes).is_ok())
+        .unwrap_or(DEFAULT_WAL_VALVE_MB * 1024 * 1024)
+}
+
+#[cfg(test)]
+mod wal_valve_threshold_tests {
+    use super::{DEFAULT_WAL_VALVE_MB, wal_valve_threshold_bytes_from_raw};
+
+    #[test]
+    fn raw_threshold_resolver_accepts_positive_megabytes() {
+        assert_eq!(wal_valve_threshold_bytes_from_raw(Some("1")), 1024 * 1024);
+        assert_eq!(
+            wal_valve_threshold_bytes_from_raw(Some("64")),
+            64 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn raw_threshold_resolver_falls_back_for_invalid_values() {
+        let fallback = DEFAULT_WAL_VALVE_MB * 1024 * 1024;
+        for raw in [None, Some(""), Some("invalid"), Some("0")] {
+            assert_eq!(wal_valve_threshold_bytes_from_raw(raw), fallback);
+        }
+        let overflow = u64::MAX.to_string();
+        assert_eq!(
+            wal_valve_threshold_bytes_from_raw(Some(&overflow)),
+            fallback
+        );
+        let sqlite_integer_overflow = (i64::MAX as u64 / (1024 * 1024) + 1).to_string();
+        assert_eq!(
+            wal_valve_threshold_bytes_from_raw(Some(&sqlite_integer_overflow)),
+            fallback
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -971,10 +1004,8 @@ impl Store {
     /// Size in bytes of the `-wal` sidecar, or 0 when it does not exist (non-WAL
     /// mode, in-memory DB, or nothing written since the last checkpoint+reset).
     /// Drives the [`Store::checkpoint_wal_if_over`] valve (#1231).
-    pub fn wal_size_bytes(&self) -> u64 {
-        let mut wal = self.path().to_path_buf().into_os_string();
-        wal.push("-wal");
-        std::fs::metadata(wal).map(|m| m.len()).unwrap_or(0)
+    pub fn wal_size_bytes(&self) -> crate::connection::Result<u64> {
+        Self::wal_size_bytes_for_path(self.path())
     }
 
     /// WAL-valve fold (#1231): when the `-wal` sidecar has grown past
@@ -989,12 +1020,16 @@ impl Store {
     /// sole connection (no concurrent reader pins the WAL).
     ///
     /// Must be called with no active transaction.
-    pub fn checkpoint_wal_if_over(&self, threshold_bytes: u64) -> rusqlite::Result<bool> {
-        if self.wal_size_bytes() <= threshold_bytes {
+    pub fn checkpoint_wal_if_over(&self, threshold_bytes: u64) -> crate::connection::Result<bool> {
+        if self.wal_size_bytes()? <= threshold_bytes {
             return Ok(false);
         }
         self.conn
-            .pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
+            .pragma_update(None, "wal_checkpoint", "TRUNCATE")
+            .map_err(|source| crate::connection::StoreError::CheckpointWal {
+                path: self.path().to_path_buf(),
+                source,
+            })?;
         Ok(true)
     }
 

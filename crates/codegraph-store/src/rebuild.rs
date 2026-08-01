@@ -432,7 +432,7 @@ impl ActiveFullRebuild {
             .store
             .as_ref()
             .expect("an active rebuild owns its writer until finish");
-        if store.wal_size_bytes() <= threshold_bytes {
+        if store.wal_size_bytes()? <= threshold_bytes {
             return Ok(false);
         }
         store.validate_state_write_authority()?;
