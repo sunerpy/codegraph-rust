@@ -6,6 +6,7 @@
 //! `daemonPidPath`, `daemonSocketPath`, `daemonLogPath`) are present in BOTH
 //! the initialized and uninitialized JSON.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -142,6 +143,47 @@ fn status_json_exposes_debug_fields_initialized() {
     assert_eq!(v["initialized"], Value::Bool(true), "must be initialized");
     assert_eq!(v["dbExists"], Value::Bool(true), "db must exist post-init");
     assert_debug_fields(&v);
+    assert!(
+        v.get("walSizeBytes").is_none(),
+        "a healthy sidecar-free index must omit walSizeBytes: {v}"
+    );
+    let actual_keys = v
+        .as_object()
+        .expect("status JSON object")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let expected_keys = [
+        "backend",
+        "daemonLogPath",
+        "daemonPidPath",
+        "daemonRunning",
+        "daemonSocketPath",
+        "dbExists",
+        "dbPath",
+        "dbSizeBytes",
+        "edgeCount",
+        "extractionStatus",
+        "extractionStatusDetail",
+        "fileCount",
+        "index",
+        "indexPath",
+        "initialized",
+        "journalMode",
+        "languages",
+        "lastIndexed",
+        "legacyIndexPaths",
+        "legacyIndexPresent",
+        "nodeCount",
+        "nodesByKind",
+        "pendingChanges",
+        "projectPath",
+        "version",
+        "worktreeMismatch",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    assert_eq!(actual_keys, expected_keys, "healthy status key set changed");
     // #1187: a healthy index must NOT carry the partial flag.
     assert!(
         v["index"].get("partial").is_none(),

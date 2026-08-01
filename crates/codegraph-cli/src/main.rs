@@ -1366,7 +1366,7 @@ fn recover_dead_owner_sidecars(paths: &codegraph_core::IndexPaths, project_root:
         Err(error) => tracing::warn!(
             %error,
             project = %project_root.display(),
-            "could not recover leftover SQLite sidecars; the startup gate decides"
+            "could not recover leftover SQLite sidecars; the following state gate decides"
         ),
     }
 }
@@ -1436,6 +1436,8 @@ fn cmd_index(path: Option<PathBuf>, force: bool, quiet: bool, verbose: bool) -> 
     // reachable; authorization is still decided later under the exclusive lease.
     let project = resolve_required_rebuild_project(path)?;
     guard_indexable_root(&project)?;
+    let paths = index_paths(&project)?;
+    recover_dead_owner_sidecars(&paths, &project);
     if !quiet {
         warn_if_stdio_mcp_may_hold_index(&project);
     }
@@ -1465,6 +1467,8 @@ fn cmd_sync(path: Option<PathBuf>, quiet: bool) -> Result<()> {
     // discoverable only to reach the typed under-lease rejection; it is never
     // authorized to sync or recreate residue.
     let project = resolve_required_rebuild_project(path)?;
+    let paths = index_paths(&project)?;
+    recover_dead_owner_sidecars(&paths, &project);
     // True single-file incremental sync (P0, docs/optimization-analysis.md §1).
     // sync_project_once self-discovers candidate files via scan_project, so it works
     // for a cold CLI invocation with no daemon. Hash-gated skip + per-file delete/reinsert
@@ -1516,7 +1520,14 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
     let resolved = index_paths(&project)?;
     let index_root = resolved.current_root().to_path_buf();
     let db = resolved.current_db();
-    let db_exists = db.is_file();
+    let (db_exists, db_size) = match fs::metadata(&db) {
+        Ok(metadata) => (metadata.is_file(), metadata.len()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (false, 0),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", db.display()));
+        }
+    };
+    let wal_size = Store::wal_size_bytes_for_path(&db)?;
     let legacy_index_paths = resolved
         .legacy_roots()
         .iter()
@@ -1528,11 +1539,53 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
     let daemon_pid_path = codegraph_daemon::daemon_pid_path(&project)?;
     let daemon_socket_path = codegraph_daemon::recorded_socket_path(&project)?;
     let daemon_log_path = codegraph_daemon::daemon_log_path(&project)?;
-    let status_open = Store::open_for_status(
+    let status_open = match Store::open_for_status(
         &resolved,
         std::time::Instant::now() + STATUS_LEASE_TIMEOUT,
         || false,
-    )?;
+    ) {
+        Ok(status_open) => status_open,
+        Err(error @ codegraph_store::StoreError::CurrentWithDatabaseSidecar { .. }) => {
+            if json_output {
+                let mut status = json!({
+                    "initialized": false,
+                    "version": VERSION,
+                    "projectPath": project,
+                    "indexPath": index_root,
+                    "lastIndexed": null,
+                    "dbPath": db,
+                    "dbExists": db_exists,
+                    "dbSizeBytes": db_size,
+                    "extractionStatus": "current",
+                    "extractionStatusDetail": error.to_string(),
+                    "legacyIndexPresent": legacy_index_present,
+                    "legacyIndexPaths": legacy_index_paths,
+                    "daemonRunning": daemon_running,
+                    "daemonPidPath": daemon_pid_path,
+                    "daemonSocketPath": daemon_socket_path,
+                    "daemonLogPath": daemon_log_path,
+                });
+                if wal_size > 0 {
+                    status["walSizeBytes"] = json!(wal_size);
+                }
+                print_json(&status)?;
+            } else {
+                println!("\nCodeGraph Status\n");
+                println!("Project: {}\n", project.display());
+                println!("State:   current (blocked by SQLite sidecar)");
+                println!("Index Statistics:");
+                println!("  DB Size:   {:.2} MB", db_size as f64 / 1024.0 / 1024.0);
+                print_wal_status(wal_size, db_size);
+                println!("\n  DB Path:   {}", db.display());
+                println!(
+                    "  Daemon:    {}",
+                    if daemon_running { "running" } else { "stopped" }
+                );
+            }
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
     if status_open.rebuilding {
         if json_output {
             print_json(&json!({
@@ -1612,7 +1665,6 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
     let counts = store.counts()?;
     let nodes_by_kind = store.node_counts_by_kind()?;
     let files_by_language = store.file_counts_by_language()?;
-    let db_size = fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
     let last_indexed = latest_indexed_at(&store)?;
     let built_with_version = store.get_project_metadata("indexed_with_version")?;
     let built_with_extraction_version = store
@@ -1635,7 +1687,7 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
         if resolution_incomplete {
             index_obj["partial"] = json!(true);
         }
-        print_json(&json!({
+        let mut status = json!({
             "initialized": true,
             "version": VERSION,
             "projectPath": project,
@@ -1662,7 +1714,11 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
             "daemonPidPath": daemon_pid_path,
             "daemonSocketPath": daemon_socket_path,
             "daemonLogPath": daemon_log_path,
-        }))?;
+        });
+        if wal_size > 0 {
+            status["walSizeBytes"] = json!(wal_size);
+        }
+        print_json(&status)?;
         return Ok(());
     }
 
@@ -1673,6 +1729,7 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
     println!("  Nodes:     {}", format_number(counts.node_count));
     println!("  Edges:     {}", format_number(counts.edge_count));
     println!("  DB Size:   {:.2} MB", db_size as f64 / 1024.0 / 1024.0);
+    print_wal_status(wal_size, db_size);
     println!("  Backend:   rusqlite - bundled SQLite");
     println!("  Journal:   {}\n", journal_mode(&store)?);
     println!("  DB Path:   {}", db.display());
@@ -1696,6 +1753,17 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
         println!("\nIndex is up to date\n");
     }
     Ok(())
+}
+
+fn print_wal_status(wal_size: u64, db_size: u64) {
+    if wal_size > 0 {
+        println!("  WAL Size:  {:.2} MB", wal_size as f64 / 1024.0 / 1024.0);
+    }
+    if wal_size > codegraph_store::wal_valve_threshold_bytes().max(db_size) {
+        println!(
+            "⚠ WAL is larger than both the configured limit and the database; stop live CodeGraph processes, then run `codegraph sync` to recover it safely."
+        );
+    }
 }
 
 fn extraction_status_name(status: &codegraph_store::ExtractionStatus) -> &'static str {

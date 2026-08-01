@@ -12,9 +12,11 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use codegraph_daemon::{
@@ -27,6 +29,10 @@ use interprocess::local_socket::{GenericFilePath, Stream, ToFsName};
 /// Env var carrying the database a child process must plant a live write-ahead
 /// log into before dying.
 const PLANT_WAL_DB: &str = "CODEGRAPH_TEST_PLANT_WAL_DB";
+const PLANT_WAL_TARGET_BYTES: &str = "CODEGRAPH_TEST_PLANT_WAL_TARGET_BYTES";
+const BARRIER_ADDR: &str = "CODEGRAPH_TEST_LEASE_BARRIER_ADDR";
+const BARRIER_MODE: &str = "CODEGRAPH_TEST_LEASE_BARRIER_MODE";
+const BARRIER_WAIT: Duration = Duration::from_secs(10);
 
 /// The metadata key the planted row uses. It exists ONLY in the write-ahead log
 /// until something folds that log back into the main database file.
@@ -110,12 +116,13 @@ fn sidecar(db: &Path, suffix: &str) -> PathBuf {
 /// binary as a child that writes one row with WAL auto-checkpointing disabled and
 /// then dies without closing SQLite. A real dead process is the point: an
 /// in-process leak would keep the connection open and look like a LIVE owner.
-fn plant_unckeckpointed_wal(db: &Path) {
+fn plant_unckeckpointed_wal(db: &Path, target_bytes: u64) {
     let output = Command::new(std::env::current_exe().expect("current test binary"))
         .arg("--exact")
         .arg("plant_uncheckpointed_wal_child_process")
         .arg("--nocapture")
         .env(PLANT_WAL_DB, db)
+        .env(PLANT_WAL_TARGET_BYTES, target_bytes.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -137,6 +144,10 @@ fn plant_uncheckpointed_wal_child_process() {
     let Ok(db) = std::env::var(PLANT_WAL_DB) else {
         return;
     };
+    let target_bytes = std::env::var(PLANT_WAL_TARGET_BYTES)
+        .expect("WAL target bytes")
+        .parse::<u64>()
+        .expect("numeric WAL target bytes");
     let store = Store::open(Path::new(&db)).expect("open the planted database");
     store
         .connection()
@@ -145,7 +156,18 @@ fn plant_uncheckpointed_wal_child_process() {
     store
         .set_project_metadata(WAL_ONLY_KEY, "1")
         .expect("commit the WAL-only row");
-    println!("PLANTED");
+    let payload = "x".repeat(8192);
+    let mut sequence = 0_u64;
+    while Store::wal_size_bytes_for_path(Path::new(&db)).expect("stat planted WAL") < target_bytes {
+        store
+            .set_project_metadata(&format!("stale_wal_growth_probe_{sequence}"), &payload)
+            .expect("commit WAL growth row");
+        sequence += 1;
+    }
+    println!(
+        "PLANTED {}",
+        Store::wal_size_bytes_for_path(Path::new(&db)).expect("stat final planted WAL")
+    );
     // Die exactly like a SIGKILLed daemon: no SQLite close, no checkpoint, so the
     // committed row stays in the `-wal` sidecar only.
     std::process::abort();
@@ -164,6 +186,236 @@ fn metadata_in_main_file_only(db: &Path, label: &str) -> Option<String> {
         .expect("read the probe key");
     drop(store);
     value
+}
+
+struct LeaseBarrier {
+    address: SocketAddr,
+    arrived: mpsc::Receiver<(u8, TcpStream)>,
+}
+
+impl LeaseBarrier {
+    fn new() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind lease barrier");
+        let address = listener.local_addr().expect("lease barrier address");
+        let (arrived_tx, arrived_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    return;
+                };
+                let _ = stream.set_read_timeout(Some(BARRIER_WAIT));
+                let mut marker = [0_u8; 1];
+                if stream.read_exact(&mut marker).is_err() || marker[0] == b'C' {
+                    return;
+                }
+                if arrived_tx.send((marker[0], stream)).is_err() {
+                    return;
+                }
+            }
+        });
+        Self {
+            address,
+            arrived: arrived_rx,
+        }
+    }
+
+    fn configure(&self, command: &mut Command) {
+        command
+            .env(BARRIER_ADDR, self.address.to_string())
+            .env(BARRIER_MODE, "exclusive");
+    }
+
+    fn wait_for_exclusive(&self) -> TcpStream {
+        match self.arrived.recv_timeout(BARRIER_WAIT) {
+            Ok((marker, stream)) => {
+                assert_eq!(marker, b'X', "exclusive lease must reach the barrier");
+                stream
+            }
+            Err(error) => {
+                if let Ok(mut cancel) = TcpStream::connect(self.address) {
+                    let _ = cancel.write_all(b"C");
+                }
+                panic!("lease barrier was not reached before its finite deadline: {error}");
+            }
+        }
+    }
+}
+
+impl Drop for LeaseBarrier {
+    fn drop(&mut self) {
+        if let Ok(mut cancel) = TcpStream::connect(self.address) {
+            let _ = cancel.write_all(b"C");
+        }
+    }
+}
+
+struct ChildGuard(Option<Child>);
+
+impl ChildGuard {
+    fn finish(mut self) -> Output {
+        self.0
+            .take()
+            .expect("child still owned")
+            .wait_with_output()
+            .expect("collect command output")
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn assert_preheal_precedes_writer(project: &Path, subcommand: &str, extra_args: &[&str]) {
+    let paths = index_paths(project);
+    let db = paths.current_db();
+    let wal = sidecar(&db, "-wal");
+    plant_unckeckpointed_wal(&db, 2 * 1024 * 1024);
+    assert!(fs::metadata(&wal).expect("planted WAL").len() >= 2 * 1024 * 1024);
+    assert_eq!(metadata_in_main_file_only(&db, "before-command"), None);
+
+    let barrier = LeaseBarrier::new();
+    let mut command = Command::new(bin());
+    command
+        .arg(subcommand)
+        .args(extra_args)
+        .arg(project)
+        .env("CODEGRAPH_NO_DAEMON", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    barrier.configure(&mut command);
+    let child = ChildGuard(Some(command.spawn().expect("spawn mutation command")));
+
+    let mut preheal = barrier.wait_for_exclusive();
+    assert!(
+        wal.exists(),
+        "the first acquisition must pause before pre-heal"
+    );
+    assert_eq!(
+        metadata_in_main_file_only(&db, "at-preheal"),
+        None,
+        "the first acquisition must not have folded the WAL yet"
+    );
+    preheal.write_all(b"R").expect("release pre-heal lease");
+
+    let mut writer = barrier.wait_for_exclusive();
+    assert!(
+        !wal.exists(),
+        "pre-heal must remove the WAL before writer open"
+    );
+    assert_eq!(
+        metadata_in_main_file_only(&db, "at-writer").as_deref(),
+        Some("1"),
+        "the WAL-only row must be in the main file before writer open"
+    );
+    writer.write_all(b"R").expect("release writer lease");
+
+    let output = child.finish();
+    assert!(
+        output.status.success(),
+        "{subcommand} failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn sync_preheals_stale_wal_before_ordinary_writer_acquisition() {
+    let (_dir, project) = indexed_project("sync-preheal-order");
+    assert_preheal_precedes_writer(&project, "sync", &[]);
+}
+
+#[test]
+fn index_force_preheals_stale_wal_before_rebuild_writer_acquisition() {
+    let (_dir, project) = indexed_project("index-preheal-order");
+    assert_preheal_precedes_writer(&project, "index", &["--force"]);
+}
+
+#[test]
+fn status_reports_stale_wal_without_querying_or_healing_it() {
+    let (_dir, project) = indexed_project("status-observability");
+    let paths = index_paths(&project);
+    let db = paths.current_db();
+    let wal = sidecar(&db, "-wal");
+    let db_size = fs::metadata(&db).expect("indexed database").len();
+    let warning_floor = db_size.max(1024 * 1024);
+    plant_unckeckpointed_wal(&db, warning_floor + 4096);
+    let wal_size = fs::metadata(&wal).expect("planted WAL").len();
+    assert!(wal_size > warning_floor);
+    assert_eq!(metadata_in_main_file_only(&db, "before-status"), None);
+
+    let json_output = Command::new(bin())
+        .args(["status", "--json"])
+        .arg(&project)
+        .env("CODEGRAPH_NO_DAEMON", "1")
+        .output()
+        .expect("run status --json");
+    assert!(
+        json_output.status.success(),
+        "status --json must degrade successfully: stdout={} stderr={}",
+        String::from_utf8_lossy(&json_output.stdout),
+        String::from_utf8_lossy(&json_output.stderr)
+    );
+    let status: serde_json::Value =
+        serde_json::from_slice(&json_output.stdout).expect("status JSON");
+    assert_eq!(status["initialized"], false);
+    assert_eq!(status["walSizeBytes"], wal_size);
+    assert_eq!(status["extractionStatus"], "current");
+    assert!(
+        status["extractionStatusDetail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("unexpected SQLite sidecar"))
+    );
+    for key in ["fileCount", "nodeCount", "edgeCount", "journalMode"] {
+        assert!(
+            status.get(key).is_none(),
+            "blocked status must omit uncorroborated {key}: {status}"
+        );
+    }
+    assert_eq!(
+        fs::metadata(&wal).expect("WAL survives JSON status").len(),
+        wal_size
+    );
+    assert_eq!(metadata_in_main_file_only(&db, "after-json-status"), None);
+
+    let human_output = Command::new(bin())
+        .arg("status")
+        .arg(&project)
+        .env("CODEGRAPH_NO_DAEMON", "1")
+        .env("CODEGRAPH_WAL_VALVE_MB", "1")
+        .output()
+        .expect("run human status");
+    assert!(
+        human_output.status.success(),
+        "human status must degrade successfully: stdout={} stderr={}",
+        String::from_utf8_lossy(&human_output.stdout),
+        String::from_utf8_lossy(&human_output.stderr)
+    );
+    let human = String::from_utf8_lossy(&human_output.stdout);
+    assert!(
+        human.contains(&format!(
+            "  WAL Size:  {:.2} MB",
+            wal_size as f64 / 1024.0 / 1024.0
+        )),
+        "human status must print the exact WAL size line: {human}"
+    );
+    assert!(
+        human.contains("⚠ WAL is larger than both the configured limit and the database; stop live CodeGraph processes, then run `codegraph sync` to recover it safely."),
+        "human status must print the recovery warning: {human}"
+    );
+    assert!(
+        human.contains("State:   current (blocked by SQLite sidecar)"),
+        "human status must identify the blocked current state: {human}"
+    );
+    assert_eq!(
+        fs::metadata(&wal).expect("WAL survives human status").len(),
+        wal_size
+    );
+    assert_eq!(metadata_in_main_file_only(&db, "after-human-status"), None);
 }
 
 fn read_pid_from_hello(socket: &Path) -> Option<u32> {
@@ -227,7 +479,7 @@ fn a_dead_owners_uncheckpointed_wal_is_recovered_on_daemon_startup() {
     let db = paths.current_db();
     let wal = sidecar(&db, "-wal");
 
-    plant_unckeckpointed_wal(&db);
+    plant_unckeckpointed_wal(&db, 1);
 
     // The residue is REAL: a non-empty log holding a row the main file lacks.
     let planted = fs::metadata(&wal).expect("planted -wal exists").len();
@@ -279,7 +531,7 @@ fn the_same_stale_residue_under_a_tombstone_is_still_refused() {
     let db = paths.current_db();
     let wal = sidecar(&db, "-wal");
 
-    plant_unckeckpointed_wal(&db);
+    plant_unckeckpointed_wal(&db, 1);
     assert!(
         fs::metadata(&wal).expect("planted -wal exists").len() > 0,
         "the planted -wal must carry bytes"

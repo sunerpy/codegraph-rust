@@ -804,6 +804,13 @@ impl Store {
         &self.path
     }
 
+    /// Return the native `-wal` sidecar size without opening SQLite. A missing
+    /// sidecar is zero; every other filesystem inspection error remains typed.
+    pub fn wal_size_bytes_for_path(db_path: &Path) -> Result<u64> {
+        let wal = database_sidecar_path(db_path, "-wal");
+        Ok(artifact_len(&wal)?.unwrap_or(0))
+    }
+
     pub fn schema_version(&self) -> rusqlite::Result<i64> {
         migrations::get_current_version(&self.conn)
     }
@@ -1135,6 +1142,11 @@ fn configure_connection(conn: &Connection) -> rusqlite::Result<()> {
     conn.busy_timeout(std::time::Duration::from_millis(5_000))?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(
+        None,
+        "journal_size_limit",
+        crate::queries::wal_valve_threshold_bytes(),
+    )?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "cache_size", -64_000)?;
     conn.pragma_update(None, "temp_store", "MEMORY")?;
@@ -1161,6 +1173,12 @@ fn configure_connection_for_rebuild(
     configure(conn.pragma_update(None, "foreign_keys", "ON"))?;
     lease.validate_exclusive(paths)?;
     configure(conn.pragma_update(None, "journal_mode", "WAL"))?;
+    lease.validate_exclusive(paths)?;
+    configure(conn.pragma_update(
+        None,
+        "journal_size_limit",
+        crate::queries::wal_valve_threshold_bytes(),
+    ))?;
     lease.validate_exclusive(paths)?;
     configure(conn.pragma_update(None, "synchronous", "NORMAL"))?;
     lease.validate_exclusive(paths)?;
@@ -1318,6 +1336,11 @@ mod tests {
             1
         );
         assert_eq!(
+            conn.query_row("PRAGMA journal_size_limit", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            256 * 1024 * 1024
+        );
+        assert_eq!(
             conn.query_row("PRAGMA cache_size", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
             -64_000
@@ -1327,6 +1350,48 @@ mod tests {
                 .unwrap(),
             2
         );
+    }
+
+    #[test]
+    fn rebuild_connection_sets_journal_size_limit_under_exclusive_authority() {
+        let project = std::env::temp_dir().join(format!(
+            "codegraph-conn-rebuild-pragmas-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&project).unwrap();
+        let paths = IndexPaths::resolve(&project, None).unwrap();
+        let lease = IndexLease::acquire_or_create_exclusive(
+            &paths,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            || false,
+        )
+        .unwrap();
+        let db_path = paths.current_db();
+        let conn = Connection::open(&db_path).unwrap();
+
+        configure_connection_for_rebuild(&conn, &paths, &lease, &db_path).unwrap();
+
+        assert_eq!(
+            conn.query_row("PRAGMA journal_size_limit", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            256 * 1024 * 1024
+        );
+        drop(conn);
+        drop(lease);
+        std::fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
+    fn wal_size_path_stat_distinguishes_missing_from_inspection_failure() {
+        let missing = temp_db_path("missing-wal-stat");
+        assert_eq!(Store::wal_size_bytes_for_path(&missing).unwrap(), 0);
+
+        let invalid_db = PathBuf::from("\0");
+        assert!(matches!(
+            Store::wal_size_bytes_for_path(&invalid_db),
+            Err(StoreError::InspectArtifact { .. })
+        ));
     }
 
     #[test]

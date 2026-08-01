@@ -675,6 +675,32 @@ a server launched elsewhere that a client has since pointed at this project. It 
 observability, not a fix: registries only see servers that register, so an absent
 holder is still not proof there is none.
 
+## `codegraph status` — WAL diagnostics
+
+`status` reports the SQLite write-ahead log only when a non-empty `-wal` sidecar
+exists. Human output adds `WAL Size` immediately after `DB Size`; JSON adds the
+top-level integer `walSizeBytes` in raw bytes. A healthy sidecar-free index omits
+`walSizeBytes`, preserving the existing JSON key set.
+
+A leftover WAL blocks the strict `Current` read gate, so `status` switches to a
+read-only degraded diagnostic instead of querying uncorroborated database rows. It
+reports `initialized: false`, `extractionStatus: "current"`, the typed refusal in
+`extractionStatusDetail`, and the trustworthy path and DB/WAL size fields; it omits
+file/node/edge counts and `journalMode`. Human output identifies this as
+`current (blocked by SQLite sidecar)`. `status` never checkpoints, deletes, or
+otherwise heals the sidecar.
+
+When the WAL is larger than both the database and the configured WAL limit,
+`status` warns that live CodeGraph processes must be stopped before running:
+
+```bash
+codegraph sync /path/to/project
+```
+
+`sync` and `index` attempt the recovery synchronously before their ordinary writer
+acquisition, but only after the previous daemon owner is proven dead and a bounded
+exclusive lease succeeds. A live or contended owner is never folded underneath.
+
 ---
 
 ## Daemon, watch & environment variables
@@ -757,18 +783,22 @@ Three escape hatches:
 
 ### Environment variable reference
 
-| Variable                           | Default   | Clamp range  | Meaning                                                          |
-| ---------------------------------- | --------- | ------------ | ---------------------------------------------------------------- |
-| `CODEGRAPH_NO_DAEMON`              | —         | —            | Force foreground Direct mode; never spawn or proxy a daemon      |
-| `CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS` | `300000`  | 1000–3600000 | Exit after this long with no connected clients                   |
-| `CODEGRAPH_DAEMON_MAX_IDLE_MS`     | `1800000` | 1000–3600000 | Hard cap on total daemon lifetime when idle                      |
-| `CODEGRAPH_DAEMON_CLIENT_SWEEP_MS` | `30000`   | 50–600000    | How often the daemon sweeps for dead clients                     |
-| `CODEGRAPH_WATCH_DEBOUNCE_MS`      | `2000`    | 100–60000    | File-change debounce window before a re-index triggers           |
-| `CODEGRAPH_NO_WATCH`               | —         | —            | Disable the live file watcher (equivalent to `serve --no-watch`) |
-| `CODEGRAPH_FORCE_WATCH`            | —         | —            | Override WSL2 `/mnt/` auto-disable; does not override `NO_WATCH` |
-| `CODEGRAPH_MCP_REGISTRY_DIR`       | —         | —            | Override the stdio MCP registry directory read by `mcp list`     |
+| Variable                           | Default   | Clamp range         | Meaning                                                                                                |
+| ---------------------------------- | --------- | ------------------- | ------------------------------------------------------------------------------------------------------ |
+| `CODEGRAPH_NO_DAEMON`              | —         | —                   | Force foreground Direct mode; never spawn or proxy a daemon                                            |
+| `CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS` | `300000`  | 1000–3600000        | Exit after this long with no connected clients                                                         |
+| `CODEGRAPH_DAEMON_MAX_IDLE_MS`     | `1800000` | 1000–3600000        | Hard cap on total daemon lifetime when idle                                                            |
+| `CODEGRAPH_DAEMON_CLIENT_SWEEP_MS` | `30000`   | 50–600000           | How often the daemon sweeps for dead clients                                                           |
+| `CODEGRAPH_WATCH_DEBOUNCE_MS`      | `2000`    | 100–60000           | File-change debounce window before a re-index triggers                                                 |
+| `CODEGRAPH_NO_WATCH`               | —         | —                   | Disable the live file watcher (equivalent to `serve --no-watch`)                                       |
+| `CODEGRAPH_FORCE_WATCH`            | —         | —                   | Override WSL2 `/mnt/` auto-disable; does not override `NO_WATCH`                                       |
+| `CODEGRAPH_NO_WAL_DEFER`           | —         | `1` enables opt-out | Keep SQLite's default WAL autocheckpoint interval during bulk indexing                                 |
+| `CODEGRAPH_WAL_VALVE_MB`           | `256`     | >0; invalid→default | Shared MB threshold for the active WAL valve, resetting `journal_size_limit`, and `status` WAL warning |
+| `CODEGRAPH_MCP_REGISTRY_DIR`       | —         | —                   | Override the stdio MCP registry directory read by `mcp list`                                           |
 
-Values outside the clamp range are silently clamped to the nearest bound.
+Timeout/debounce values outside their clamp range are silently clamped to the
+nearest bound. `CODEGRAPH_WAL_VALVE_MB` instead falls back to `256` when it is
+empty, non-numeric, zero, or too large to convert safely to bytes.
 
 ### Custom extension mapping (`.codegraph-v2/codegraph.json`)
 
