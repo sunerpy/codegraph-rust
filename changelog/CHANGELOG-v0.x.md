@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.42.3](https://github.com/sunerpy/codegraph-rust/compare/v0.42.2...v0.42.3) (2026-08-01)
+
+
+### Bug Fixes
+
+* **store:** bound the WAL a killed session leaves behind ([#184](https://github.com/sunerpy/codegraph-rust/issues/184)) ([09a4b4e](https://github.com/sunerpy/codegraph-rust/commit/09a4b4e9d183dabc22ae32c39c4bec9fdba5b696))
+
 ## [0.42.2](https://github.com/sunerpy/codegraph-rust/compare/v0.42.1...v0.42.2) (2026-08-01)
 
 
