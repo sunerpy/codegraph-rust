@@ -468,12 +468,19 @@ tool that emits source first checks the file it is about to read.
 
 ### What counts as drift
 
-A referenced file is compared against its stored record before its text is used:
+A referenced file is compared against its stored record before its text is used.
+Freshness is fail-closed: **proven fresh** is an earned state, not the default:
 
-1. **Size + millisecond mtime match** → fresh, no hashing. This is the same fast
-   path `codegraph sync` uses.
+1. **The file record loads and size + millisecond mtime match** → proven fresh,
+   no hashing. This is the same fast path `codegraph sync` uses.
 2. **Stat mismatch** → the file's sha256 content hash is computed and compared.
-   Only a hash mismatch is drift.
+   A matching indexed hash also proves freshness; a hash mismatch is possibly
+   drifted.
+
+Every outcome that cannot prove either condition is **possibly drifted**: the
+file record is absent or unreadable, the source read fails, or an oversized file
+has a stat mismatch. Oversized files are never read or hashed, so only their
+size + millisecond mtime fast path can prove freshness.
 
 So a `touch`, or a rewrite that produces identical bytes, is not drift — the
 hash check absorbs it. The probe is memoized per tool call, so one `explore` never
@@ -507,8 +514,11 @@ A response is prefixed with:
 For accurate content of those specific files, Read them directly. The rest of this response is fresh.
 ```
 
-only when that response actually references a drifted file. A response with no
-drifted file gets **no** banner, which is what makes "trust everything not listed"
-a real guarantee rather than an assumption — the agent instructions had described
-this banner before anything produced it. Re-run `codegraph index`, or wait for the
+only when that response actually serves or cites current bytes from a
+possibly-drifted file. An unreadable or oversized file whose content is omitted
+is still not treated as fresh, but it does **not** fabricate a banner entry for
+bytes the response never exposed. A response with no cited possibly-drifted bytes
+gets **no** banner, which is what makes "trust everything not listed" a real
+guarantee rather than an assumption — the agent instructions had described this
+banner before anything produced it. Re-run `codegraph index`, or wait for the
 watcher, if you see it on a hot codebase.
