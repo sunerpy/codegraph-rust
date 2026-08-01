@@ -11,7 +11,8 @@
   applicable DEFER items landed across codegraph-rs `v0.28.3`–`v0.39.0`; see the
   2026-07-17 CLOSEOUT entry below for the full release table)
 - **This project version:** see `Cargo.toml` (`codegraph-rs`, independent line)
-- **Last sync:** `2026-07-17`
+- **Last sync:** `2026-08-02` (batches 1–2 of the `1.5.0` round landed; parity
+  still `1.4.1` — batches 3–4 open)
 - **Upstream repo:** https://github.com/colbymchenry/codegraph
 
 > **1.2.0 → 1.4.1 sync: COMPLETE.** Every portable, in-scope behavior in that
@@ -41,7 +42,7 @@
 
 ## Sync log
 
-### 2026-08-02 — AUDIT `1.4.1 → 1.5.0` + post-1.5.0 triage; batch 1 LANDED (tracked parity STAYS `1.4.1`)
+### 2026-08-02 — AUDIT `1.4.1 → 1.5.0` + post-1.5.0 triage; batches 1–2 LANDED (tracked parity STAYS `1.4.1`)
 
 A full audit of the `1.4.1 → 1.5.0` range plus the 6 unreleased commits above
 `v1.5.0`, and a triage of colby's open issues. **Tracked parity deliberately does
@@ -75,8 +76,8 @@ language extractors.
 | sha | disposition | rationale |
 | - | - | - |
 | `572d22b` TOML block finder preserves trailing `[[...]]` | **PORTED** — this batch, `88e7773` | Our `find_next_table_header` was the pre-fix logic verbatim, and reproduced with the shipped 0.42.0 binary: `uninstall --target codex` silently deleted a user's `[[mcp_servers.other.env]]` block |
-| `f2a5df3` never serve a mis-sliced body from a drifted file | **PORT — batch 2** | Our exposure is WORSE than upstream's was: `read_project_source` slices current bytes at indexed lines with no freshness check, and the staleness banner promised at `instructions.rs:63` has **no implementation anywhere** |
-| `f6ac7b3` blast radius follows caller chains | **PORT — batch 2** | `CALL_DEPTH = 1` plus an unconditional `"; ⚠️ no covering tests found"`; `codegraph affected` already BFSes correctly, the MCP renderer does not |
+| `f2a5df3` never serve a mis-sliced body from a drifted file | **PORTED** — batch 2, `v0.42.2` | Our exposure was WORSE than upstream's: `read_project_source` sliced current bytes at indexed lines with no freshness check, and the staleness banner promised at `instructions.rs:63` had **no implementation anywhere** |
+| `f6ac7b3` blast radius follows caller chains | **PORTED** — batch 2, `v0.42.2` | `CALL_DEPTH = 1` plus an unconditional `"; ⚠️ no covering tests found"`; `codegraph affected` already BFSed correctly, the MCP renderer did not |
 | `02c0e2c` bound the WAL after a killed session | **PORT (partial) — batch 3** | No `journal_size_limit` on any connection and no heal-at-open; our #1231 valve is bulk-index-only and documents itself as "sole connection" safe. Part (c) (watchdog `progressPaths`) is N/A — no SIGKILL watchdog exists here |
 | `38580e0` Python bare class refs → `references` edges | **PORT — batch 4, ISOLATED** | All three gates are pre-fix. The ONLY item in this round that moves `reference/golden/`; land it alone so a golden diff has exactly one possible cause |
 | `0682137` Claude prompt hook as `codegraph.cmd` | **N/A (packaging-rooted)** | We ship a native `codegraph.exe` (`install.ps1:34,144-150`), never a `.cmd` shim; Git Bash resolves the bare name to `.exe` natively, so writing `codegraph.cmd` would name a nonexistent file |
@@ -87,7 +88,7 @@ language extractors.
   **reproduced on CLI AND MCP**. `exact_or_top_matches` falls back to
   `matches.first()` with no note, and `--strict` only fires on an EMPTY result, so
   a substituted non-empty answer passes it. Highest-value: fails toward confident
-  wrongness, and it is the default. → batch 2.
+  wrongness, and it is the default. → batch 2, **LANDED in `v0.42.2`**.
 - **#1482 / #1482b** TS rename-through-alias loses caller/impact edges
   (`export const a = fn`, `export { fn as a }`, `export default fn` all produce a
   false zero), and `.js` specifiers never resolve to `.ts` because
@@ -121,6 +122,62 @@ by the first fix:
 `make ci` 128 suites / 3097 passed / 0 failed (+26 tests), `reference/` untouched,
 scope confined to `crates/codegraph-cli/`. Four Final-Wave gates APPROVED; F3 ran
 a ~60-fixture matrix over three rounds and is what found both extra defects.
+
+#### Batch 2 — LANDED (`v0.42.2`: `4e18f94`, `20e07e1`, `fea40a2`; PR #181)
+
+Ports `f2a5df3` and `f6ac7b3` from the `1.5.0` range plus issue #1473 from the
+triage above. Each was an **honesty** defect — the graph asserting something it
+had not established:
+
+- **#1473 silent symbol substitution.** A lookup matching no exact symbol fell
+  through to the top-ranked fuzzy result, so `callers ad` answered with rows
+  belonging to `add`. CLI lookup commands now exit non-zero pointing at
+  `codegraph query`; MCP returns `isError: true` pointing at `codegraph_search`.
+  Exact matching was widened to `qualified_name` and Godot resource paths so the
+  supported dotted-name and `.tscn` lookups survive. Decision A1 chose REFUSE over
+  annotate; A2 froze `--strict` (its 5 consumers are byte-unchanged).
+- **`f2a5df3` drifted source served at stored line numbers**, returning a different
+  symbol's body. A request-memoized probe compares size + millisecond mtime first
+  and hashes only on a stat mismatch (decision B1). A drifted file is emitted
+  whole up to `FILE_MODE_MAX_LINES = 2000` or omitted with a notice — never
+  sliced (B2). `docs/mcp.md` had documented a staleness banner that nothing
+  produced; B3 made it real. Case 3 of the issue was deliberately NOT implemented.
+- **`f6ac7b3` unmeasured coverage denial.** Blast radius claimed "no covering tests"
+  after inspecting direct callers only. It now walks callers through hop 3 under a
+  64-lookup budget with an uncapped frontier and a 2-file display cap (C1), and
+  reports what it actually searched.
+
+**Five review-found defects in the fixes themselves**, all in `codegraph-mcp`:
+freshness defaulted to fresh when the `FileRecord` was missing / the query failed
+/ the read failed (reachable — `sync` deletes the file record before upserting
+nodes and re-inserts it last, so a concurrent reader sees nodes whose file has no
+record); the oversized branch compared `size` alone, so a same-size rewrite read
+as fresh; a swallowed `get_callers` error still produced the strong three-hop
+claim; a duplicated whole-file-fits predicate diverged from the rendering decision
+at the trailing-newline boundary, banner-listing a 2000-line file whose source was
+omitted; and the first liveness gate inferred section survival by matching
+`#### {path} —` in the response text — source bytes as a control channel,
+spoofable by a marker literal in a retained file (this repo's own test source
+contains one). Freshness is now fail-closed via
+`SourceFreshness::{ProvenFresh, PossiblyDrifted}`, and banner liveness comes from
+`cut_at_section_boundary`'s surviving-prefix length plus per-section offsets.
+
+`make ci` 128 suites / 3110 passed / 0 failed. Each fix RED-proven by isolated
+revert. `cut_at_section_boundary`'s new `(String, usize)` signature is
+byte-identical to the old output (200k randomized inputs, 0 mismatches); the
+section-offset formula and its `<=` predicate likewise (200k combinations, 0
+errors). **One audited golden movement**:
+`reference/golden/mcp/codegraph_explore.json`, 4 blast-radius lines re-worded
+(`⚠️ no covering tests found` → `no tests found within 3 caller hops`), the rest
+byte-identical. `instructions.rs`, `initialize.json`, `codegraph-store/`, and
+`codegraph-core/` untouched. Four Final-Wave gates APPROVED — F2 took three rounds
+and is what found all five extra defects; F3 hands-on QA covered CLI and real MCP
+stdio across six drift scenarios (and established that MCP drift cases need
+`--no-watch`, since a background re-index legitimately clears the drift).
+
+**Parity still does NOT advance.** Batch 3 (`02c0e2c` WAL `journal_size_limit` +
+heal-at-open) and batch 4 (`38580e0` Python bare class refs — the only
+golden-moving item, to land isolated) remain open.
 
 ### 2026-07-17 — CLOSEOUT: 1.2.0 → 1.4.1 sync COMPLETE (tracked parity advanced to 1.4.1)
 
