@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.42.2](https://github.com/sunerpy/codegraph-rust/compare/v0.42.1...v0.42.2) (2026-08-01)
+
+
+### Bug Fixes
+
+* **mcp:** earn the freshness and coverage claims instead of defaulting to them ([#181](https://github.com/sunerpy/codegraph-rust/issues/181)) ([0a2506c](https://github.com/sunerpy/codegraph-rust/commit/0a2506c58604ee2d9747c184e4036f3e84e0595c))
+
 ## [0.42.1](https://github.com/sunerpy/codegraph-rust/compare/v0.42.0...v0.42.1) (2026-08-01)
 
 
