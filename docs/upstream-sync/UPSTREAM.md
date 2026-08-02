@@ -7,13 +7,40 @@
 
 ## Current alignment
 
-- **Tracked colby version:** `1.4.1` (the chosen `1.2.0 → 1.4.1` PORT subset + all
-  applicable DEFER items landed across codegraph-rs `v0.28.3`–`v0.39.0`; see the
-  2026-07-17 CLOSEOUT entry below for the full release table)
+- **Tracked colby version:** `1.5.0` (the `1.4.1 → 1.5.0` PORT subset + the
+  post-`v1.5.0` portable commits landed across codegraph-rs `v0.42.1`–`v0.42.4`;
+  see the 2026-08-02 CLOSEOUT entry below for the batch table. The preceding
+  `1.2.0 → 1.4.1` subset landed across `v0.28.3`–`v0.39.0`; see the 2026-07-17
+  CLOSEOUT entry)
 - **This project version:** see `Cargo.toml` (`codegraph-rs`, independent line)
-- **Last sync:** `2026-08-02` (batches 1–2 of the `1.5.0` round landed; parity
-  still `1.4.1` — batches 3–4 open)
+- **Last sync:** `2026-08-02` — the `1.4.1 → 1.5.0` round is **COMPLETE**; all
+  four batches shipped and parity advanced from `1.4.1` to `1.5.0`
 - **Upstream repo:** https://github.com/colbymchenry/codegraph
+
+> **1.4.1 → 1.5.0 sync: COMPLETE** (codegraph-rs `v0.42.1` → `v0.42.4`). Every
+> portable, in-scope behavior in that range has landed (see the 2026-08-02
+> CLOSEOUT entry below). Tracked parity is `1.5.0` with the following recorded
+> caveats — this is "faithful to 1.5.0 for all portable in-scope behavior, with
+> these explicit exceptions," not byte-for-byte everything:
+>
+> - **26 DEFER items remain deferred** — 19 resolution/store/synthesis perf
+>   strategies plus 7 sync/WAL scheduling strategies, all tuned to upstream's Node
+>   / `node:sqlite` runtime (pool sizing, cgroup cache credit, macOS `vm_stat`
+>   budgets). They are byte-identical to graph output, so not parity blockers;
+>   re-derive each from a Rust profile before porting rather than transcribing
+>   upstream's constants. **`2adc7f6`** (WAL truncate only at parked barriers)
+>   flips from a perf item to a CORRECTNESS item the moment timer-triggered
+>   truncation is adopted here.
+> - **`0682137` is N/A (packaging-rooted)** — we ship a native `codegraph.exe`,
+>   never a `.cmd` shim, so writing `codegraph.cmd` would name a nonexistent file.
+> - **Two triaged issues stay OPEN for a later batch** — **#1482 / #1482b**: TS
+>   rename-through-alias loses caller/impact edges (`export const a = fn`,
+>   `export { fn as a }`, and `export default fn` each produce a false zero), and
+>   `.js` specifiers never resolve to `.ts` because `extension_resolution` only
+>   APPENDS. Golden-affecting. **#1495**: Kotlin signatures are always absent; the
+>   fix pattern already exists ten lines away in the same file, and no Kotlin
+>   golden exists yet.
+> - The `1.2.0 → 1.4.1` caveats below all still hold and carry forward unchanged.
 
 > **1.2.0 → 1.4.1 sync: COMPLETE.** Every portable, in-scope behavior in that
 > range has landed (see the 2026-07-17 CLOSEOUT entry below). Tracked parity is
@@ -42,7 +69,108 @@
 
 ## Sync log
 
-### 2026-08-02 — AUDIT `1.4.1 → 1.5.0` + post-1.5.0 triage; batches 1–2 LANDED (tracked parity STAYS `1.4.1`)
+### 2026-08-02 — CLOSEOUT: `1.4.1 → 1.5.0` sync COMPLETE (tracked parity advanced to `1.5.0`)
+
+All four batches of the `1.4.1 → 1.5.0` round have shipped, across codegraph-rs
+`v0.42.1` → `v0.42.4`. Batch 4 was the last portable in-scope item, so by this
+ledger's own rule — parity advances only when every portable, in-scope behavior in
+the range has landed — tracked colby parity advances from `1.4.1` to `1.5.0`. The
+bucket tables, the post-`v1.5.0` triage, and the open-issue triage live in the
+AUDIT entry directly below; this entry is the batch index plus the exceptions that
+a future sync actually needs.
+
+Every release tag is `v<version>`, each published with `isDraft=false` and 7
+assets (6 platform binaries + `SHA256SUMS`). Final workspace test count after
+batch 4: **128 suites / 3127 passed / 0 failed**.
+
+| batch | release | upstream | our commits | what it actually fixed |
+| - | - | - | - | - |
+| 1 | `v0.42.1` | `572d22b` | `88e7773` (PR #178), `148090b`, `c167412`, `374d4ff` | The Codex TOML block finder deleted trailing `[[...]]` blocks. Our `find_next_table_header` was the pre-fix logic verbatim, reproduced with the shipped 0.42.0 binary: `uninstall --target codex` silently destroyed a user's `[[mcp_servers.other.env]]` block. The fix also handled a column-0 decoy inside a `"""` string and an indented-header duplicate |
+| 2 | `v0.42.2` | `f2a5df3`, `f6ac7b3`, issue #1473 | `4e18f94`, `20e07e1`, `fea40a2` (PR #181) | Three honesty defects — see below |
+| 3 | `v0.42.3` | `02c0e2c` | `3fe9b55` (PR #184) | A killed session left an uncheckpointed `-wal` that SQLite kept at its high-water mark forever |
+| 4 | `v0.42.4` | `38580e0` | `3860880` (PR #186) | Python class-as-value idioms produced no edges, so `callers` on a DRF serializer showed nothing |
+
+**Batch 2 — three honesty defects.** Lookups silently substituted a different
+symbol (`callers ad` answered with `add`'s rows); drifted files were sliced at
+stored line numbers; blast radius claimed "no covering tests" after checking only
+direct callers. Now: a non-exact lookup REFUSES (CLI non-zero pointing at
+`codegraph query`; MCP `isError: true` pointing at `codegraph_search`); freshness
+is fail-closed via `SourceFreshness::{ProvenFresh, PossiblyDrifted}`, comparing
+size + millisecond mtime and hashing only on a stat mismatch, then emitting a
+drifted file whole up to 2000 lines or omitting it entirely; coverage walks 3
+caller hops under a 64-lookup budget and reports what it searched. The staleness
+banner `docs/mcp.md` had promised now exists. **One audited golden movement**:
+`reference/golden/mcp/codegraph_explore.json`, 4 blast-radius lines re-worded, the
+rest byte-identical.
+
+**Batch 3 — WAL residue, measured not assumed.** On `0.42.1` a 9 204 112-byte
+residue stayed at exactly that size through a sync touching one line, and six
+interrupted rounds ratcheted 5 702 112 → 6 439 592 → 6 760 952 bytes.
+`journal_size_limit` is now set on both write-connection configuration points from
+the same `wal_valve_threshold_bytes()` the valve uses — one concept, one env var
+(`CODEGRAPH_WAL_VALVE_MB`) driving pragma, valve, and status warning. `sync` and
+`index` fold a leftover WAL before their writer opens the DB, requiring proof the
+previous daemon owner is dead AND a bounded exclusive lease, and reporting a heal
+only when the fold actually completed. `status` degrades to a read-only diagnostic
+on the typed `CurrentWithDatabaseSidecar` refusal, showing DB and WAL sizes without
+counts and never checkpointing. Golden-neutral. Parts (c) and (e) are N/A: the only
+watchdog here watches the parent pid and holds no `Store`, and every tracing sink
+already emits RFC3339 via `local_timer()`.
+
+**Batch 4 — Python class-as-value, four gates moved together.** The capture spec
+did not dispatch `return_statement`; the extraction gate admitted only same-file
+functions/methods; and resolution accepted only function targets at both the name
+matcher and the import fast path. Python now accepts class targets at both
+resolution sites through ONE shared predicate; methods stay excluded everywhere;
+every other language's kind filter is untouched. `EXTRACTION_VERSION` 2 → 3. The
+new `reference/golden/python/` fixture guards six positives (return, assignment
+RHS, registry pair, call argument, list literal, imported class as value) and two
+negatives (tuple return, bare method name).
+
+**Batch 4 export-semantics finding — record this, it will save a future sync a
+day.** The plan initially assumed the imported case resolves through the import
+fast path. **It cannot.** `find_exported_symbol` requires `is_exported`
+(`crates/codegraph-resolve/src/import_resolver.rs:1476`, `:1489`, `:1496`) and the
+Python spec has no override, inheriting the unconditional `false` at
+`crates/codegraph-extract/src/spec.rs:106` — measured zero `is_exported` Python
+nodes in both the `mini` and `python` goldens. **Upstream is identical**:
+`python.ts` implements no `isExported`, and `import-resolver.ts:94` does
+`if (!n.isExported) continue`, so upstream's own DRF assertion also comes from the
+name matcher's unique-name path. The import-side kind gate still mirrors upstream
+but is DEAD for Python; its test states plainly that it hand-builds a state real
+indexing cannot produce.
+
+#### Exceptions carried out of this round
+
+The full text is in `## Current alignment` above. In short: **26 DEFER items**
+remain (19 resolution/store/synthesis perf strategies + 7 sync/WAL scheduling
+strategies, all Node-runtime-tuned, byte-identical to graph output — re-derive from
+a Rust profile, and treat `2adc7f6` as a correctness item if timer-triggered
+truncation is ever adopted); **`0682137` is N/A** (native `.exe`, no `.cmd` shim);
+and **#1482 / #1482b** (TS rename-through-alias false zeros + `.js`→`.ts` specifier
+resolution, golden-affecting) and **#1495** (Kotlin signatures always absent) stay
+open for a later batch.
+
+#### Process note — one root cause, four batches
+
+Every single review rejection across all four batches reduced to the same thing in
+different clothing: **an assertion whose premise does not hold.** Batch 2 needed
+three F2 rounds — code claiming freshness it had not proven, a completeness claim
+keyed only on a budget while errors were swallowed, and a liveness gate inferring
+section survival by string-matching its own response text. Batch 3's plan took four
+momus rounds plus an F2 round — a test asserting SQLite clips at
+`wal_checkpoint(RESTART)` when the clip actually lands on the next resetting write,
+an acceptance criterion the fix deliberately eliminates, observability that does not
+exist outside the process, and a SAFETY comment claiming a mutex established a
+precondition it did not once `Store::open` began reading the env var. Batch 4's plan
+carried three false premises about resolver reachability, caught only because the
+golden audit refused to bend the artifacts to fit the plan, then three F2 rounds on
+stale comments and citations. Two mechanical rules fell out of it, both invisible to
+the compiler and to every test: **widening a filter makes the comment above it
+false**, and **inserting a doc section makes every line-range citation below it
+false**.
+
+### 2026-08-02 — AUDIT `1.4.1 → 1.5.0` + post-1.5.0 triage; batches 1–2 LANDED (parity stayed `1.4.1` at the time of writing — superseded by the CLOSEOUT entry above)
 
 A full audit of the `1.4.1 → 1.5.0` range plus the 6 unreleased commits above
 `v1.5.0`, and a triage of colby's open issues. **Tracked parity deliberately does
@@ -78,8 +206,8 @@ language extractors.
 | `572d22b` TOML block finder preserves trailing `[[...]]` | **PORTED** — this batch, `88e7773` | Our `find_next_table_header` was the pre-fix logic verbatim, and reproduced with the shipped 0.42.0 binary: `uninstall --target codex` silently deleted a user's `[[mcp_servers.other.env]]` block |
 | `f2a5df3` never serve a mis-sliced body from a drifted file | **PORTED** — batch 2, `v0.42.2` | Our exposure was WORSE than upstream's: `read_project_source` sliced current bytes at indexed lines with no freshness check, and the staleness banner promised at `instructions.rs:63` had **no implementation anywhere** |
 | `f6ac7b3` blast radius follows caller chains | **PORTED** — batch 2, `v0.42.2` | `CALL_DEPTH = 1` plus an unconditional `"; ⚠️ no covering tests found"`; `codegraph affected` already BFSed correctly, the MCP renderer did not |
-| `02c0e2c` bound the WAL after a killed session | **PORT (partial) — batch 3** | No `journal_size_limit` on any connection and no heal-at-open; our #1231 valve is bulk-index-only and documents itself as "sole connection" safe. Part (c) (watchdog `progressPaths`) is N/A — no SIGKILL watchdog exists here |
-| `38580e0` Python bare class refs → `references` edges | **PORT — batch 4, ISOLATED** | All three gates are pre-fix. The ONLY item in this round that moves `reference/golden/`; land it alone so a golden diff has exactly one possible cause |
+| `02c0e2c` bound the WAL after a killed session | **PORTED** — batch 3, `v0.42.3` | No `journal_size_limit` on any write connection, and no heal-at-open at the CLI mutation entry points. The audit's belief that the #1231 valve was bulk-index-only was WRONG and batch 3 corrected it: the valve already fired from three write paths — full index (`crates/codegraph-cli/src/main.rs:4765,4776`), the resolution tail (`crates/codegraph-resolve/src/resolver.rs:1527`), and migration (`crates/codegraph-watch/src/migrate.rs:156,161`) — so it did bound WAL growth across long write phases. What it never covered is the residue a KILLED session leaves behind: no path folded a WAL orphaned by a process that died mid-write, and nothing reclaimed its high-water mark. Part (c) (watchdog `progressPaths`) is N/A because the only watchdog here is the proxy's parent-pid watcher, which just sets a shutdown flag and holds no `Store` (`crates/codegraph-daemon/src/proxy.rs:575-599`), so there is no `progressPaths` to extend. Part (e) (daemon.log ISO timestamps) is N/A because `local_timer()` already emits RFC3339 with a UTC fallback on every tracing sink (`crates/codegraph-core/src/logger.rs:93-118`) |
+| `38580e0` Python bare class refs → `references` edges | **PORTED** — batch 4, `v0.42.4` (isolated) | All four gates were pre-fix. The ONLY item in this round that moves `reference/golden/`; land it alone so a golden diff has exactly one possible cause |
 | `0682137` Claude prompt hook as `codegraph.cmd` | **N/A (packaging-rooted)** | We ship a native `codegraph.exe` (`install.ps1:34,144-150`), never a `.cmd` shim; Git Bash resolves the bare name to `.exe` natively, so writing `codegraph.cmd` would name a nonexistent file |
 
 #### colby open-issue triage — 4 actionable, verified against our code
@@ -175,9 +303,10 @@ and is what found all five extra defects; F3 hands-on QA covered CLI and real MC
 stdio across six drift scenarios (and established that MCP drift cases need
 `--no-watch`, since a background re-index legitimately clears the drift).
 
-**Parity still does NOT advance.** Batch 3 (`02c0e2c` WAL `journal_size_limit` +
-heal-at-open) and batch 4 (`38580e0` Python bare class refs — the only
-golden-moving item, to land isolated) remain open.
+**Parity did not advance at this point.** Batch 3 (`02c0e2c` WAL
+`journal_size_limit` + heal-at-open) and batch 4 (`38580e0` Python bare class refs
+— the only golden-moving item, to land isolated) were still open; both have since
+shipped, and the CLOSEOUT entry above advances parity to `1.5.0`.
 
 ### 2026-07-17 — CLOSEOUT: 1.2.0 → 1.4.1 sync COMPLETE (tracked parity advanced to 1.4.1)
 
