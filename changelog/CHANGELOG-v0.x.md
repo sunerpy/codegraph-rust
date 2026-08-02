@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.42.4](https://github.com/sunerpy/codegraph-rust/compare/v0.42.3...v0.42.4) (2026-08-02)
+
+
+### Bug Fixes
+
+* **python:** resolve bare class references to their classes ([#186](https://github.com/sunerpy/codegraph-rust/issues/186)) ([3b33028](https://github.com/sunerpy/codegraph-rust/commit/3b330281f84ed6079f4ce6c0e5344323cc5f20b7))
+
 ## [0.42.3](https://github.com/sunerpy/codegraph-rust/compare/v0.42.2...v0.42.3) (2026-08-01)
 
 
