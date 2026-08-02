@@ -2020,11 +2020,15 @@ pub fn match_reference(
     match_fuzzy(reference, context)
 }
 
+pub(crate) fn is_python_class_function_ref_target(language: Language, kind: NodeKind) -> bool {
+    language == Language::Python && kind == NodeKind::Class
+}
+
 /// Resolve a `function_ref` (callback-as-value) reference: exact name,
-/// function/method targets only, same language family, same-file first,
-/// cross-file only when unique. No fuzzy fallback. `this.<member>` refs are
-/// resolved elsewhere (resolve_this_member_fn_ref). Ports `matchFunctionRef`
-/// (name-matcher.ts:179-310).
+/// function/method targets plus Python class targets (Python bare methods remain
+/// excluded), same language family, same-file first, cross-file only when unique.
+/// No fuzzy fallback. `this.<member>` refs are resolved elsewhere
+/// (resolve_this_member_fn_ref). Ports `matchFunctionRef` (name-matcher.ts:179-310).
 pub fn match_function_ref(
     reference: &RefView,
     context: &dyn ResolutionContext,
@@ -2033,8 +2037,9 @@ pub fn match_function_ref(
         return None;
     }
 
-    // A bare identifier can never be a method value in JS/TS/C++/Python/PHP
-    // (methods need a receiver), so those match FUNCTIONS only.
+    // A bare identifier cannot be a method value in JS/TS/C++/Python/PHP
+    // (methods need a receiver). Those match FUNCTIONS; Python additionally
+    // accepts CLASS targets through the shared predicate, but still not METHODS.
     let bare_fn_only = matches!(
         reference.language,
         Language::TypeScript
@@ -2093,7 +2098,9 @@ pub fn match_function_ref(
         .get_nodes_by_name(&reference.reference_name)
         .into_iter()
         .filter(|n| {
-            (n.kind == NodeKind::Function || (!bare_fn_only && n.kind == NodeKind::Method))
+            (n.kind == NodeKind::Function
+                || (!bare_fn_only && n.kind == NodeKind::Method)
+                || is_python_class_function_ref_target(reference.language, n.kind))
                 && same_language_family(n.language, reference.language)
                 && n.id != reference.from_node_id
         })
@@ -3798,6 +3805,47 @@ mod tests {
             1,
         );
         assert!(match_function_ref(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn function_ref_bare_class_target_matrix() {
+        let cases = [
+            (Language::TypeScript, NodeKind::Class, false),
+            (Language::Tsx, NodeKind::Class, false),
+            (Language::JavaScript, NodeKind::Class, false),
+            (Language::Jsx, NodeKind::Class, false),
+            (Language::Cpp, NodeKind::Class, false),
+            (Language::Php, NodeKind::Class, false),
+            (Language::Python, NodeKind::Method, false),
+            (Language::Python, NodeKind::Class, true),
+        ];
+
+        for (language, kind, should_resolve) in cases {
+            let target = mk(
+                "target:id",
+                kind,
+                "Target",
+                "Target",
+                "src/target",
+                language,
+            );
+            let ctx = Ctx::default().name("Target", vec![target]);
+            let r = refv("Target", EdgeKind::References, "src/consumer", language, 1);
+            let resolved = match_function_ref(&r, &ctx);
+
+            if should_resolve {
+                let resolved = resolved.unwrap_or_else(|| {
+                    panic!("{language:?} {kind:?} must be a function-ref target")
+                });
+                assert_eq!(resolved.target_node_id, "target:id");
+                assert_eq!(resolved.resolved_by, ResolvedBy::FunctionRef);
+            } else {
+                assert!(
+                    resolved.is_none(),
+                    "{language:?} {kind:?} must not be a function-ref target"
+                );
+            }
+        }
     }
 
     #[test]

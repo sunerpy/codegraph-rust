@@ -26,7 +26,7 @@
 //!
 //! This classifier boundary is narrower than the commit series containing it:
 //! existing CLI indexing still writes `project_metadata`, but now takes that
-//! metadata key and extraction version (`2`) from this store-owned module. That
+//! metadata key and extraction version (`3`) from this store-owned module. That
 //! pre-existing DB stamping is not state-slot publication and is not performed by
 //! this classifier.
 //!
@@ -44,7 +44,7 @@
 //! {
 //!   "sequence": 7,
 //!   "storageProtocol": 2,
-//!   "extractionVersion": 2,
+//!   "extractionVersion": 3,
 //!   "phase": "current",
 //!   "projectIdentity": "<64 lowercase hex>",
 //!   "checksum": "<64 lowercase hex>"
@@ -115,7 +115,7 @@ pub const CURRENT_STORAGE_PROTOCOL: u64 = 2;
 
 /// The extraction-pipeline version this binary produces. This is the single
 /// source of truth: no other crate may define its own copy.
-pub const CURRENT_EXTRACTION_VERSION: u64 = 2;
+pub const CURRENT_EXTRACTION_VERSION: u64 = 3;
 
 /// The `project_metadata` key under which a built index records the extraction
 /// version it was produced with. Single source of truth for the key spelling.

@@ -111,6 +111,22 @@ fn cpp_db_is_self_equivalent_to_cpp_golden() {
 }
 
 #[test]
+fn generated_golden_matches_committed_python_fixture() {
+    let tempdir = TestDir::new("generated-golden-python");
+    write_golden(&python_db(), tempdir.path()).unwrap();
+
+    let expected = load_golden(&python_golden_dir()).unwrap();
+    let actual = load_golden(tempdir.path()).unwrap();
+
+    diff_canonical(&expected, &actual, None).unwrap();
+}
+
+#[test]
+fn python_db_is_self_equivalent_to_python_golden() {
+    assert_equivalent(&python_db(), &python_golden_dir()).unwrap();
+}
+
+#[test]
 fn generated_golden_matches_committed_metal_fixture() {
     // Guards Metal (#1121): `.metal`→cpp mapping + the `[[attribute]]` blank that
     // prevents the spurious `VertexIn extends float4` inheritance edge.
@@ -362,6 +378,14 @@ fn cpp_db() -> PathBuf {
 
 fn cpp_golden_dir() -> PathBuf {
     workspace_root().join("reference/golden/cpp")
+}
+
+fn python_db() -> PathBuf {
+    workspace_root().join("reference/golden/python/colby.db")
+}
+
+fn python_golden_dir() -> PathBuf {
+    workspace_root().join("reference/golden/python")
 }
 
 fn metal_db() -> PathBuf {

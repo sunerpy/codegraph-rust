@@ -10,9 +10,9 @@
 use crate::framework::FrameworkResolver;
 use crate::import_resolver::{is_php_include_path_ref, resolve_jvm_import, resolve_via_import};
 use crate::name_matcher::{
-    crosses_known_family, is_php_property_receiver_shape, match_dotted_call_chain,
-    match_function_ref, match_method_call, match_reference, match_scoped_call_chain,
-    same_language_family,
+    crosses_known_family, is_php_property_receiver_shape, is_python_class_function_ref_target,
+    match_dotted_call_chain, match_function_ref, match_method_call, match_reference,
+    match_scoped_call_chain, same_language_family,
 };
 use crate::snapshot_context::{SnapshotResolutionContext, build_edge_adjacency};
 use crate::types::{
@@ -980,7 +980,9 @@ impl ReferenceResolver {
                 self.gate_language(resolve_via_import(reference, context), reference, context)
             {
                 if let Some(target) = context.get_node_by_id(&via_import.target_node_id) {
-                    if matches!(target.kind, NodeKind::Function | NodeKind::Method) {
+                    if matches!(target.kind, NodeKind::Function | NodeKind::Method)
+                        || is_python_class_function_ref_target(reference.language, target.kind)
+                    {
                         return (Some(via_import), None);
                     }
                 }
@@ -3085,6 +3087,85 @@ mod tests {
         };
         let resolved = resolver.resolve_one(&reference, &ctx).expect("resolves");
         assert_eq!(resolved.target_node_id, onblur.id);
+    }
+
+    // Synthetic kind-gate coverage only: this test hand-sets `is_exported = true`
+    // on Python class nodes, a state the extractor never produces because Python
+    // inherits `LanguageSpec::is_exported`'s `false` (`spec.rs:106`). Real Python
+    // indexing cannot reach this import path: `find_exported_symbol` requires
+    // `is_exported` at `import_resolver.rs:1476`, `:1489`, and `:1496`. This proves
+    // only that the upstream kind gate and shared B1 helper are wired; it must not
+    // be cited as golden, hands-on QA, or `ResolvedBy::Import` acceptance evidence
+    // for a real Python import.
+    #[test]
+    fn resolve_one_function_ref_imported_python_class_synthetic_kind_gate_accepts_python_class() {
+        let root = temp_db("fnref-imported-python-class").with_extension("project");
+        std::fs::create_dir_all(&root).expect("create project");
+        std::fs::write(root.join("models.py"), "class ImportedClass:\n    pass\n")
+            .expect("write imported class");
+        std::fs::write(root.join("decoy.py"), "class ImportedClass:\n    pass\n")
+            .expect("write decoy class");
+        std::fs::write(
+            root.join("consumer.py"),
+            "from models import ImportedClass\n\ndef choose():\n    return ImportedClass\n",
+        )
+        .expect("write consumer");
+
+        let mut store = Store::open(&root.join("codegraph.db")).expect("open");
+        let mut imported = mk_node2(
+            "class:imported",
+            NodeKind::Class,
+            "ImportedClass",
+            "models.py",
+            Language::Python,
+        );
+        imported.is_exported = true;
+        let mut decoy = mk_node2(
+            "class:decoy",
+            NodeKind::Class,
+            "ImportedClass",
+            "decoy.py",
+            Language::Python,
+        );
+        decoy.is_exported = true;
+        let caller = mk_node2(
+            "function:choose",
+            NodeKind::Function,
+            "choose",
+            "consumer.py",
+            Language::Python,
+        );
+        store
+            .upsert_nodes(&[imported.clone(), decoy, caller.clone()])
+            .expect("nodes");
+
+        let project_root = root.to_string_lossy().into_owned();
+        let mut resolver = ReferenceResolver::new(project_root.clone());
+        resolver.warm_caches(&crate::context::StoreResolutionContext::new(
+            &store,
+            project_root.clone(),
+        ));
+        let ctx = crate::context::StoreResolutionContext::new(&store, project_root);
+        let reference = RefView {
+            row_id: None,
+            from_node_id: caller.id,
+            reference_name: "ImportedClass".to_string(),
+            reference_kind: EdgeKind::References,
+            line: 4,
+            column: 11,
+            file_path: "consumer.py".to_string(),
+            language: Language::Python,
+            is_function_ref: true,
+            reference_subkind: None,
+        };
+        let resolved = resolver.resolve_one(&reference, &ctx);
+        drop(ctx);
+        drop(store);
+        std::fs::remove_dir_all(&root).expect("remove project");
+
+        let resolved = resolved.expect("imported Python class resolves");
+        assert_eq!(resolved.target_node_id, imported.id);
+        assert_eq!(resolved.resolved_by, ResolvedBy::Import);
     }
 
     #[test]

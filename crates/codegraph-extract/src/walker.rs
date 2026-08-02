@@ -3738,10 +3738,13 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     }
 
     /// Gate captured function-value candidates and push survivors as
-    /// `function_ref` references. A bare-name candidate survives only if its
-    /// name is a function/method DEFINED in this file or an imported name;
-    /// `this.<member>` candidates always flush (class-scoped at resolution).
-    /// Ports `flushFnRefCandidates` (tree-sitter.ts:429-521), TS/JS gate.
+    /// `function_ref` references. `this.<member>` and `::` candidates always
+    /// flush. C-family file-scope candidates in an ungated mode bypass the name
+    /// gate, as do `skip_gate` candidates (PHP HOF strings). Every other bare
+    /// name must be a function/method defined in this file, a Python class
+    /// defined in this file, or an imported name.
+    /// Ports `flushFnRefCandidates` (tree-sitter.ts:429-521) from the upstream
+    /// TS/JS gate, adapted here across languages.
     fn flush_fn_ref_candidates(&mut self) {
         if self.fn_ref_candidates.is_empty() {
             return;
@@ -3754,7 +3757,9 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
 
         let mut defined_here: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for n in &self.nodes {
-            if matches!(n.kind, NodeKind::Function | NodeKind::Method) {
+            if matches!(n.kind, NodeKind::Function | NodeKind::Method)
+                || (self.spec.language() == Language::Python && n.kind == NodeKind::Class)
+            {
                 defined_here.insert(n.name.as_str());
             }
         }
@@ -3800,8 +3805,8 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             }
             // Gate by candidate shape: `this.`/`::` always flush; C-family
             // file-scope initializers (ungated_modes) skip; PHP HOF strings
-            // (skip_gate) skip; everything else must be a same-file fn/method
-            // or an import (tree-sitter.ts:493-512).
+            // (skip_gate) skip; everything else must be a same-file fn/method,
+            // a same-file Python class, or an import (tree-sitter.ts:493-512).
             if !cand.name.starts_with("this.") && !cand.name.contains("::") {
                 let skip_gate = (at_file_scope
                     && crate::function_ref::mode_is_ungated(spec, cand.mode))

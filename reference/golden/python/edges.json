@@ -1,0 +1,275 @@
+[
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:consumers.py",
+    "target": "import:3e3fb8b0ff507a934daf33d767cfbcbe"
+  },
+  {
+    "col": 11,
+    "kind": "references",
+    "line": 35,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "function:7fe38b2a101736abde38fef885862694",
+    "target": "class:4c9c90936185ce0ba79fff80c167872e"
+  },
+  {
+    "col": 11,
+    "kind": "references",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.8,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "function:230b5585efc925330d3cbf214e8be03b",
+    "target": "class:099ebd3f5c7b1a6ac5522e9fbfb00912"
+  },
+  {
+    "col": 12,
+    "kind": "references",
+    "line": 39,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "function:f216f97a7c79cba22f0cf1bcb01d4ff4",
+    "target": "class:2ba663f8546d3fb02b843c54dd4ab265"
+  },
+  {
+    "col": 13,
+    "kind": "references",
+    "line": 47,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "function:8ab91cb55b890abcf7c58c5a8c532661",
+    "target": "class:73d50236f18650b7d0a250d4ae90cf3c"
+  },
+  {
+    "col": 14,
+    "kind": "references",
+    "line": 51,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "function:5e720163b2a45565e1d981792fd7ecb7",
+    "target": "class:02ea0f42e300fcc1605594c67cde3536"
+  },
+  {
+    "col": 27,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:consumers.py",
+    "target": "class:099ebd3f5c7b1a6ac5522e9fbfb00912"
+  },
+  {
+    "col": 28,
+    "kind": "references",
+    "line": 43,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "function:1198b6fc92ac818287e950fa1a067eda",
+    "target": "class:f6b91632a5d8b5435b08ac99b12f0570"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:980443e74cab7da71208d2a972b5a8d9",
+    "target": "method:8ac33b9d670a290f5c7fc3d5e77b79be"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:consumers.py",
+    "target": "function:230b5585efc925330d3cbf214e8be03b"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:consumers.py",
+    "target": "import:3e3fb8b0ff507a934daf33d767cfbcbe"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:imported_types.py",
+    "target": "class:099ebd3f5c7b1a6ac5522e9fbfb00912"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:same_file.py",
+    "target": "class:02ea0f42e300fcc1605594c67cde3536"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:same_file.py",
+    "target": "class:2ba663f8546d3fb02b843c54dd4ab265"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:same_file.py",
+    "target": "class:4c9c90936185ce0ba79fff80c167872e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:same_file.py",
+    "target": "class:60298d4e866b278c8cf73fc2a2ebceae"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:same_file.py",
+    "target": "class:73d50236f18650b7d0a250d4ae90cf3c"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:same_file.py",
+    "target": "class:980443e74cab7da71208d2a972b5a8d9"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:same_file.py",
+    "target": "class:ae598df922bbcd74e32d3bf7d7fa0828"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:same_file.py",
+    "target": "class:f6b91632a5d8b5435b08ac99b12f0570"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:same_file.py",
+    "target": "function:1198b6fc92ac818287e950fa1a067eda"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:same_file.py",
+    "target": "function:5e720163b2a45565e1d981792fd7ecb7"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:same_file.py",
+    "target": "function:7fe38b2a101736abde38fef885862694"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:same_file.py",
+    "target": "function:8ab91cb55b890abcf7c58c5a8c532661"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:same_file.py",
+    "target": "function:9b5e951f339c7fb15ae8717e06f1178e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:same_file.py",
+    "target": "function:ed31b0a0b2aa330bfbd8d25cc2f04164"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:same_file.py",
+    "target": "function:f216f97a7c79cba22f0cf1bcb01d4ff4"
+  }
+]

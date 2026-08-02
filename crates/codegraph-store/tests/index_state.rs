@@ -118,16 +118,16 @@ fn assert_corrupt(
 #[test]
 fn index_state_constants_and_canonical_payload_are_exact() {
     assert_eq!(CURRENT_STORAGE_PROTOCOL, 2);
-    assert_eq!(CURRENT_EXTRACTION_VERSION, 2);
+    assert_eq!(CURRENT_EXTRACTION_VERSION, 3);
     assert_eq!(EXTRACTION_VERSION_KEY, "indexed_with_extraction_version");
     assert_eq!(
-        canonical_checksum_payload(7, 2, 2, "future-phase", OWNER),
+        canonical_checksum_payload(7, 2, 3, "future-phase", OWNER),
         format!(
             "codegraph-index-state-v1\nsequence=7\nstorageProtocol=2\n\
-             extractionVersion=2\nphase=future-phase\nprojectIdentity={OWNER}\n"
+             extractionVersion=3\nphase=future-phase\nprojectIdentity={OWNER}\n"
         )
     );
-    let digest = checksum_hex(7, 2, 2, "future-phase", OWNER);
+    let digest = checksum_hex(7, 2, 3, "future-phase", OWNER);
     assert_eq!(digest.len(), 64);
     assert!(
         digest
@@ -176,6 +176,7 @@ fn index_state_current_protocol_maps_each_phase() {
 
 #[test]
 fn index_state_extraction_version_maps_outdated_and_future_for_every_phase() {
+    let future_extraction = CURRENT_EXTRACTION_VERSION + 1;
     for phase in ["building", "current", "uninitialized"] {
         let old = TempTree::new("outdated");
         write_wire(
@@ -191,18 +192,34 @@ fn index_state_extraction_version_maps_outdated_and_future_for_every_phase() {
             &ExtractionStatus::Outdated { built: 1 }
         );
 
+        let previous = TempTree::new("previous-extraction");
+        write_wire(
+            &previous.slots()[0],
+            1,
+            CURRENT_STORAGE_PROTOCOL,
+            2,
+            phase,
+            OWNER,
+        );
+        assert_eq!(
+            classify_slots(&previous.slots(), OWNER).status(),
+            &ExtractionStatus::Outdated { built: 2 }
+        );
+
         let future = TempTree::new("future-extraction");
         write_wire(
             &future.slots()[0],
             1,
             CURRENT_STORAGE_PROTOCOL,
-            3,
+            future_extraction,
             phase,
             OWNER,
         );
         assert_eq!(
             classify_slots(&future.slots(), OWNER).status(),
-            &ExtractionStatus::Future { built: 3 },
+            &ExtractionStatus::Future {
+                built: future_extraction
+            },
             "future extraction must dominate phase {phase}"
         );
     }
@@ -211,12 +228,18 @@ fn index_state_extraction_version_maps_outdated_and_future_for_every_phase() {
 #[test]
 fn index_state_unknown_fields_key_order_and_whitespace_are_ignored() {
     let tree = TempTree::new("formatting");
-    let checksum = checksum_hex(9, 2, 2, "current", OWNER);
+    let checksum = checksum_hex(
+        9,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION,
+        "current",
+        OWNER,
+    );
     let formatted = format!(
         "{{\n  \"unknownFutureField\": {{\"nested\": true}},\n  \
          \"checksum\": \"{checksum}\", \"projectIdentity\": \"{OWNER}\",\n  \
-         \"phase\": \"current\", \"extractionVersion\": 2,\n  \
-         \"storageProtocol\": 2, \"sequence\": 9\n}}\n"
+         \"phase\": \"current\", \"extractionVersion\": {CURRENT_EXTRACTION_VERSION},\n  \
+         \"storageProtocol\": {CURRENT_STORAGE_PROTOCOL}, \"sequence\": 9\n}}\n"
     );
     write_bytes(&tree.slots()[1], formatted.as_bytes());
     let result = classify_slots(&tree.slots(), OWNER);
@@ -228,16 +251,16 @@ fn index_state_unknown_fields_key_order_and_whitespace_are_ignored() {
 fn index_state_missing_and_wrong_typed_required_fields_are_malformed() {
     for value in [
         json!({
-            "storageProtocol": 2,
-            "extractionVersion": 2,
+            "storageProtocol": CURRENT_STORAGE_PROTOCOL,
+            "extractionVersion": CURRENT_EXTRACTION_VERSION,
             "phase": "current",
             "projectIdentity": OWNER,
             "checksum": "0".repeat(64),
         }),
         json!({
             "sequence": "1",
-            "storageProtocol": 2,
-            "extractionVersion": 2,
+            "storageProtocol": CURRENT_STORAGE_PROTOCOL,
+            "extractionVersion": CURRENT_EXTRACTION_VERSION,
             "phase": "current",
             "projectIdentity": OWNER,
             "checksum": "0".repeat(64),
@@ -261,7 +284,14 @@ fn index_state_bad_owner_and_checksum_shapes_are_typed_corruption() {
     ];
     for owner in bad_owners {
         let tree = TempTree::new("bad-owner-shape");
-        write_wire(&tree.slots()[0], 1, 3, 2, "future-phase", owner);
+        write_wire(
+            &tree.slots()[0],
+            1,
+            3,
+            CURRENT_EXTRACTION_VERSION,
+            "future-phase",
+            owner,
+        );
         let result = classify_unchanged(tree.path(), || classify_slots(&tree.slots(), OWNER));
         assert_corrupt(&result, |reason| {
             matches!(reason, CorruptReason::InvalidOwnerEncoding { .. })
@@ -270,7 +300,7 @@ fn index_state_bad_owner_and_checksum_shapes_are_typed_corruption() {
 
     for checksum in ["abc".to_string(), "A".repeat(64), "g".repeat(64)] {
         let tree = TempTree::new("bad-checksum-shape");
-        let mut value = wire_value(1, 3, 2, "future-phase", OWNER);
+        let mut value = wire_value(1, 3, CURRENT_EXTRACTION_VERSION, "future-phase", OWNER);
         value["checksum"] = Value::String(checksum);
         write_bytes(&tree.slots()[0], &serde_json::to_vec(&value).unwrap());
         let result = classify_slots(&tree.slots(), OWNER);
@@ -283,7 +313,7 @@ fn index_state_bad_owner_and_checksum_shapes_are_typed_corruption() {
 #[test]
 fn index_state_checksum_and_owner_mismatch_are_corrupt_even_for_future_protocol() {
     let checksum_tree = TempTree::new("checksum-mismatch");
-    let mut value = wire_value(1, 3, 2, "future-phase", OWNER);
+    let mut value = wire_value(1, 3, CURRENT_EXTRACTION_VERSION, "future-phase", OWNER);
     value["checksum"] = Value::String("0".repeat(64));
     write_bytes(
         &checksum_tree.slots()[0],
@@ -297,7 +327,14 @@ fn index_state_checksum_and_owner_mismatch_are_corrupt_even_for_future_protocol(
     });
 
     let owner_tree = TempTree::new("owner-mismatch");
-    write_wire(&owner_tree.slots()[0], 1, 3, 2, "future-phase", OTHER_OWNER);
+    write_wire(
+        &owner_tree.slots()[0],
+        1,
+        3,
+        CURRENT_EXTRACTION_VERSION,
+        "future-phase",
+        OTHER_OWNER,
+    );
     let result = classify_unchanged(owner_tree.path(), || {
         classify_slots(&owner_tree.slots(), OWNER)
     });
@@ -309,7 +346,14 @@ fn index_state_checksum_and_owner_mismatch_are_corrupt_even_for_future_protocol(
 #[test]
 fn index_state_current_unknown_phase_is_corrupt_but_future_unknown_phase_is_valid() {
     let current = TempTree::new("unknown-current-phase");
-    write_wire(&current.slots()[0], 1, 2, 2, "future-phase", OWNER);
+    write_wire(
+        &current.slots()[0],
+        1,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION,
+        "future-phase",
+        OWNER,
+    );
     let result = classify_slots(&current.slots(), OWNER);
     assert_corrupt(
         &result,
@@ -330,7 +374,14 @@ fn index_state_current_unknown_phase_is_corrupt_but_future_unknown_phase_is_vali
 fn index_state_lower_and_zero_storage_protocol_are_corrupt() {
     for protocol in [0, 1] {
         let tree = TempTree::new("lower-protocol");
-        write_wire(&tree.slots()[0], 1, protocol, 2, "current", OWNER);
+        write_wire(
+            &tree.slots()[0],
+            1,
+            protocol,
+            CURRENT_EXTRACTION_VERSION,
+            "current",
+            OWNER,
+        );
         let result = classify_slots(&tree.slots(), OWNER);
         assert_corrupt(
             &result,
@@ -343,7 +394,14 @@ fn index_state_lower_and_zero_storage_protocol_are_corrupt() {
 fn index_state_any_malformed_present_slot_dominates_a_valid_companion() {
     let tree = TempTree::new("invalid-dominance");
     write_bytes(&tree.slots()[0], b"not json");
-    write_wire(&tree.slots()[1], 99, 2, 2, "current", OWNER);
+    write_wire(
+        &tree.slots()[1],
+        99,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION,
+        "current",
+        OWNER,
+    );
     let result = classify_unchanged(tree.path(), || classify_slots(&tree.slots(), OWNER));
     assert_corrupt(&result, |reason| {
         matches!(reason, CorruptReason::MalformedJson { slot: 0, .. })
@@ -373,7 +431,14 @@ fn index_state_non_regular_and_unreadable_slots_are_corrupt() {
         use std::os::unix::fs::symlink;
         let link = TempTree::new("slot-symlink");
         let target = link.path().join("target.json");
-        write_wire(&target, 1, 2, 2, "current", OWNER);
+        write_wire(
+            &target,
+            1,
+            CURRENT_STORAGE_PROTOCOL,
+            CURRENT_EXTRACTION_VERSION,
+            "current",
+            OWNER,
+        );
         symlink(&target, &link.slots()[0]).unwrap();
         let result = classify_unchanged(link.path(), || classify_slots(&link.slots(), OWNER));
         assert_corrupt(&result, |reason| {
@@ -399,7 +464,14 @@ fn index_state_non_regular_and_unreadable_slots_are_corrupt() {
 fn index_state_future_protocol_dominates_current_in_both_sequence_directions() {
     for (future_sequence, current_sequence) in [(1, 100), (100, 1)] {
         let tree = TempTree::new("future-dominance");
-        write_wire(&tree.slots()[0], current_sequence, 2, 2, "current", OWNER);
+        write_wire(
+            &tree.slots()[0],
+            current_sequence,
+            CURRENT_STORAGE_PROTOCOL,
+            CURRENT_EXTRACTION_VERSION,
+            "current",
+            OWNER,
+        );
         write_wire(
             &tree.slots()[1],
             future_sequence,
@@ -417,7 +489,13 @@ fn index_state_future_protocol_dominates_current_in_both_sequence_directions() {
 #[test]
 fn index_state_equal_current_sequences_are_corrupt_for_identical_and_reformatted_json() {
     let identical = TempTree::new("equal-identical");
-    let bytes = wire_bytes(7, 2, 2, "current", OWNER);
+    let bytes = wire_bytes(
+        7,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION,
+        "current",
+        OWNER,
+    );
     write_bytes(&identical.slots()[0], &bytes);
     write_bytes(&identical.slots()[1], &bytes);
     let result = classify_unchanged(identical.path(), || {
@@ -435,11 +513,18 @@ fn index_state_equal_current_sequences_are_corrupt_for_identical_and_reformatted
 
     let reformatted = TempTree::new("equal-reformatted");
     write_bytes(&reformatted.slots()[0], &bytes);
-    let checksum = checksum_hex(7, 2, 2, "current", OWNER);
+    let checksum = checksum_hex(
+        7,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION,
+        "current",
+        OWNER,
+    );
     let other = format!(
         "{{ \"checksum\":\"{checksum}\", \"phase\":\"current\", \
-         \"projectIdentity\":\"{OWNER}\", \"extractionVersion\":2, \
-         \"storageProtocol\":2, \"sequence\":7 }}"
+         \"projectIdentity\":\"{OWNER}\", \
+         \"extractionVersion\":{CURRENT_EXTRACTION_VERSION}, \
+         \"storageProtocol\":{CURRENT_STORAGE_PROTOCOL}, \"sequence\":7 }}"
     );
     write_bytes(&reformatted.slots()[1], other.as_bytes());
     let result = classify_unchanged(reformatted.path(), || {
@@ -467,7 +552,14 @@ fn index_state_equal_future_and_mixed_sequences_are_corrupt_before_future_domina
     });
 
     let mixed = TempTree::new("equal-mixed");
-    write_wire(&mixed.slots()[0], 8, 2, 2, "current", OWNER);
+    write_wire(
+        &mixed.slots()[0],
+        8,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION,
+        "current",
+        OWNER,
+    );
     write_wire(&mixed.slots()[1], 8, 3, 10, "future-phase", OWNER);
     let result = classify_unchanged(mixed.path(), || classify_slots(&mixed.slots(), OWNER));
     assert_corrupt(&result, |reason| {
@@ -477,7 +569,14 @@ fn index_state_equal_future_and_mixed_sequences_are_corrupt_before_future_domina
 
 #[test]
 fn index_state_selected_max_sequence_is_corrupt_before_status_mapping() {
-    for (protocol, extraction, phase) in [(2, 2, "current"), (3, 99, "future-phase")] {
+    for (protocol, extraction, phase) in [
+        (
+            CURRENT_STORAGE_PROTOCOL,
+            CURRENT_EXTRACTION_VERSION,
+            "current",
+        ),
+        (3, 99, "future-phase"),
+    ] {
         let tree = TempTree::new("max-sequence");
         write_wire(
             &tree.slots()[0],
@@ -506,8 +605,22 @@ fn index_state_selected_max_sequence_is_corrupt_before_status_mapping() {
 #[test]
 fn index_state_highest_ordinary_current_slot_is_authoritative_with_full_metadata() {
     let tree = TempTree::new("authority");
-    write_wire(&tree.slots()[0], 4, 2, 1, "building", OWNER);
-    write_wire(&tree.slots()[1], 5, 2, 2, "current", OWNER);
+    write_wire(
+        &tree.slots()[0],
+        4,
+        CURRENT_STORAGE_PROTOCOL,
+        1,
+        "building",
+        OWNER,
+    );
+    write_wire(
+        &tree.slots()[1],
+        5,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION,
+        "current",
+        OWNER,
+    );
     let result = classify_unchanged(tree.path(), || classify_slots(&tree.slots(), OWNER));
     assert_eq!(result.status(), &ExtractionStatus::Current);
     let authority = result.authoritative().expect("authority");
@@ -515,13 +628,22 @@ fn index_state_highest_ordinary_current_slot_is_authoritative_with_full_metadata
     assert_eq!(authority.path, tree.slots()[1]);
     assert_eq!(authority.record.sequence, 5);
     assert_eq!(authority.record.storage_protocol, 2);
-    assert_eq!(authority.record.extraction_version, 2);
+    assert_eq!(
+        authority.record.extraction_version,
+        CURRENT_EXTRACTION_VERSION
+    );
     assert_eq!(authority.record.phase, Some(StatePhase::Current));
     assert_eq!(authority.record.phase_raw, "current");
     assert_eq!(authority.record.project_identity, OWNER);
     assert_eq!(
         authority.record.checksum,
-        checksum_hex(5, 2, 2, "current", OWNER)
+        checksum_hex(
+            5,
+            CURRENT_STORAGE_PROTOCOL,
+            CURRENT_EXTRACTION_VERSION,
+            "current",
+            OWNER
+        )
     );
 }
 

@@ -258,6 +258,56 @@ Like the Godot fixture, both the index and the dump are byte-stable, and the
 `upstream_db_is_self_equivalent_to_ruby_golden` tests in
 `crates/codegraph-bench/tests/equivalence.rs` enforce it.
 
+### Python fixture
+
+The dedicated `reference/golden/python/` fixture guards Python bare
+class-as-value function references without changing the shared `mini` corpus.
+Its three-file source corpus lives at `crates/codegraph-bench/fixtures/python/`
+and pins six positive `References` edges:
+
+- same-file class values in a direct return, assignment RHS, registry-pair
+  value, call argument, and list literal;
+- one cross-file `ImportedClass` value. The import syntax is present, but real
+  Python nodes are not marked exported, so import Gate 3b is unreachable. This
+  edge is intentionally resolved by Gate 3a's unique cross-file name match at
+  confidence 0.8.
+
+It also pins two negative boundaries: a tuple return does not recurse into
+`TupleA`/`TupleB`, and a bare `handler` parameter remains an unresolved
+`function_ref` rather than resolving to a same-named method. The undefined
+`register(...)` calls used by the argument and method shapes legitimately remain
+as two unresolved `calls` rows.
+
+Regenerate the committed database and canonical artifacts from a clean corpus:
+
+```bash
+# 1. Copy the corpus to a clean directory (keeps the workspace index out of it).
+rm -rf /tmp/cg-fixture-python
+cp -r crates/codegraph-bench/fixtures/python /tmp/cg-fixture-python
+
+# 2. Index it with OUR release binary (never hand-write the golden).
+cargo build --release -p codegraph-rs
+CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
+  ./target/release/codegraph init /tmp/cg-fixture-python
+
+# 3. Commit the produced database as the fixture's colby.db.
+mkdir -p reference/golden/python
+cp /tmp/cg-fixture-python/.codegraph-v2/codegraph.db reference/golden/python/colby.db
+
+# 4. Dump canonical JSON + schema from that exact database.
+cargo run -p codegraph-bench --bin bench -- \
+  --gen-golden reference/golden/python/colby.db reference/golden/python
+```
+
+As with every fixture, compare only `nodes.json`, `edges.json`, `refs.json`,
+`files.json`, and `schema.sql` byte-for-byte. `colby.db` itself is not a
+byte-reproducibility contract because SQLite updates its header change counter.
+Regenerate `schema.sql` from the database being committed; statement ordering
+may differ between binary versions, but its normalized statement set must not.
+The tests `generated_golden_matches_committed_python_fixture` and
+`python_db_is_self_equivalent_to_python_golden` enforce database/artifact
+self-equivalence.
+
 ### C++ fixture
 
 A fourth golden fixture, `reference/golden/cpp/`, guards C++ `base_class_clause`
