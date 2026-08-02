@@ -1,0 +1,2 @@
+class ImportedClass:
+    pass

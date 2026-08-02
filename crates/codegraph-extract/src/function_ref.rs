@@ -161,6 +161,7 @@ const PYTHON_SPEC: FnRefSpec = FnRefSpec {
         ("keyword_argument", CaptureMode::Value, Some("value")),
         ("pair", CaptureMode::Value, Some("value")),
         ("list", CaptureMode::List, None),
+        ("return_statement", CaptureMode::List, None),
     ],
     layers: &[],
     unwrap: &[],
@@ -1219,6 +1220,75 @@ class W:
         let refs = fn_refs("src/w.py", src, Language::Python);
         assert!(has_fn_ref(&refs, "on_click"), "names={:?}", names(&refs));
         assert!(has_fn_ref(&refs, "handler"), "names={:?}", names(&refs));
+    }
+
+    #[test]
+    fn python_captures_single_return_value_but_not_tuple_members() {
+        let src = r#"
+def handler():
+    return 1
+
+def first():
+    return 2
+
+def second():
+    return 3
+
+def choose_single():
+    return handler
+
+def choose_tuple():
+    return first, second
+"#;
+        let refs = fn_refs("src/returns.py", src, Language::Python);
+        assert!(has_fn_ref(&refs, "handler"), "names={:?}", names(&refs));
+        assert!(
+            !has_fn_ref(&refs, "first"),
+            "tuple members must not be captured: names={:?}",
+            names(&refs)
+        );
+        assert!(
+            !has_fn_ref(&refs, "second"),
+            "tuple members must not be captured: names={:?}",
+            names(&refs)
+        );
+    }
+
+    #[test]
+    fn python_captures_same_file_classes_in_value_containers() {
+        let src = r#"
+class AliasClass:
+    pass
+
+class RegistryClass:
+    pass
+
+class ArgumentClass:
+    pass
+
+class ListClass:
+    pass
+
+def choose_alias():
+    alias = AliasClass
+
+def choose_registry():
+    registry = {"registry": RegistryClass}
+
+def choose_argument():
+    register(ArgumentClass)
+
+def choose_list():
+    values = [ListClass]
+"#;
+        let refs = fn_refs("src/classes.py", src, Language::Python);
+        for name in ["AliasClass", "RegistryClass", "ArgumentClass", "ListClass"] {
+            assert!(
+                has_fn_ref(&refs, name),
+                "missing {name}: names={:?}",
+                names(&refs)
+            );
+        }
     }
 
     // --- Go ----------------------------------------------------------------

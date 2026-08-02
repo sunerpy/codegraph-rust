@@ -1,0 +1,26 @@
+[
+  {
+    "content_hash": "ffcdab43044b451a4dd403d4d74460128523d9fcba30dfe75e9a595a0f2c46db",
+    "errors": null,
+    "language": "python",
+    "node_count": 3,
+    "path": "consumers.py",
+    "size": 91
+  },
+  {
+    "content_hash": "6cebb328503cb6d3a66c76ade1e6da7f16dbd066c1689c41765ea55255d9d030",
+    "errors": null,
+    "language": "python",
+    "node_count": 2,
+    "path": "imported_types.py",
+    "size": 30
+  },
+  {
+    "content_hash": "dcee64febdb07e86597a805d2ca48d93a6c69a4c547247399c39e316c21827d2",
+    "errors": null,
+    "language": "python",
+    "node_count": 17,
+    "path": "same_file.py",
+    "size": 613
+  }
+]
