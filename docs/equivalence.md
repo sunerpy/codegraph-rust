@@ -308,6 +308,37 @@ The tests `generated_golden_matches_committed_python_fixture` and
 `python_db_is_self_equivalent_to_python_golden` enforce database/artifact
 self-equivalence.
 
+### Kotlin fixture
+
+The dedicated `reference/golden/kotlin/` fixture guards Kotlin callable
+signatures (#1495) without changing a shared corpus. Its single source file,
+`crates/codegraph-bench/fixtures/kotlin/signatures.kt`, pins five positive
+shapes: an explicit return, an inferred return, a generic return, a multiline
+class method with a nullable generic return, and an extension function. The
+`Processor` primary constructor is the negative boundary: the class signature
+stays null and no constructor method is synthesized.
+
+Regenerate the committed database and canonical artifacts from a clean corpus:
+
+```bash
+rm -rf /tmp/cg-fixture-kotlin
+cp -r crates/codegraph-bench/fixtures/kotlin /tmp/cg-fixture-kotlin
+cargo build --release -p codegraph-rs
+CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
+  ./target/release/codegraph init /tmp/cg-fixture-kotlin
+mkdir -p reference/golden/kotlin
+cp /tmp/cg-fixture-kotlin/.codegraph/codegraph.db reference/golden/kotlin/colby.db
+cargo run -p codegraph-bench --bin bench -- \
+  --gen-golden reference/golden/kotlin/colby.db reference/golden/kotlin
+```
+
+As with every fixture, only the five text artifacts are byte-compared;
+`colby.db` is not byte-reproducible. Compare `schema.sql` by normalized statement
+set when an older binary changes statement ordering. The tests
+`generated_golden_matches_committed_kotlin_fixture` and
+`kotlin_db_is_self_equivalent_to_kotlin_golden` enforce database/artifact
+self-equivalence.
+
 ### C++ fixture
 
 A fourth golden fixture, `reference/golden/cpp/`, guards C++ `base_class_clause`

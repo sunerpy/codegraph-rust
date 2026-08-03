@@ -152,11 +152,39 @@ impl LanguageSpec for KotlinSpec {
         None
     }
 
-    fn get_signature(&self, _node: Node<'_>, _source: &str) -> Option<String> {
-        // Upstream kotlin.ts:232-242 calls getChildByField(node,
-        // 'function_value_parameters'); the kotlin grammar exposes no such
-        // FIELD, so the upstream hook always returns undefined. Mirror with None.
-        None
+    fn get_signature(&self, node: Node<'_>, source: &str) -> Option<String> {
+        // Upstream kotlin.ts:232-242 intends to emit parameters plus an optional
+        // return type, but looks up function_value_parameters through a missing
+        // grammar field. Diverge by locating that direct child by KIND, matching
+        // the traversal already used for Kotlin declared return types below.
+        let mut signature = None;
+        for child in node.named_children(&mut node.walk()) {
+            if signature.is_none() {
+                if child.kind() == "function_value_parameters" {
+                    signature = Some(node_text(child, source));
+                }
+                continue;
+            }
+
+            if matches!(child.kind(), "function_body" | "type_constraints") {
+                break;
+            }
+            if matches!(
+                child.kind(),
+                "dynamic"
+                    | "function_type"
+                    | "non_nullable_type"
+                    | "nullable_type"
+                    | "parenthesized_type"
+                    | "user_type"
+            ) {
+                let mut signature = signature.expect("parameters found above");
+                signature.push_str(": ");
+                signature.push_str(&node_text(child, source));
+                return Some(signature);
+            }
+        }
+        signature
     }
 
     fn get_return_type(&self, node: Node<'_>, source: &str) -> Option<String> {
@@ -356,6 +384,95 @@ mod tests {
             Some("Widget")
         );
         assert!(KOTLIN_SPEC.get_return_type(fns[1], src).is_none());
+    }
+
+    #[test]
+    fn direct_kotlin_signatures_are_exact() {
+        let cases = [
+            (
+                "fun greet(name: String, times: Int = 1): String = name",
+                "(name: String, times: Int = 1): String",
+            ),
+            ("fun inferred(flag: Boolean) = flag", "(flag: Boolean)"),
+            ("fun <T> identity(value: T): T = value", "(value: T): T"),
+            (
+                "fun factory(): (Int) -> String = TODO()",
+                "(): (Int) -> String",
+            ),
+            (
+                "fun String.decorate(prefix: String): String = prefix + this",
+                "(prefix: String): String",
+            ),
+        ];
+
+        for (src, expected) in cases {
+            let tree = parse(src);
+            let function = first_of_kind(tree.root_node(), "function_declaration").unwrap();
+            assert_eq!(
+                KOTLIN_SPEC.get_signature(function, src).as_deref(),
+                Some(expected),
+                "source: {src}"
+            );
+        }
+    }
+
+    #[test]
+    fn extracted_kotlin_signatures_preserve_scope_and_shape() {
+        let src = r#"fun greet(name: String, times: Int = 1): String = name
+fun inferred(flag: Boolean) = flag
+fun <T> identity(value: T): T = value
+
+class Processor(val id: Int) {
+    fun factory(): (Int) -> String = TODO()
+    val mapper = { value: Int -> value.toString() }
+}
+
+val topLevelMapper = { value: Int -> value + 1 }
+fun String.decorate(prefix: String): String = prefix + this
+"#;
+
+        let result = crate::extract_source("signatures.kt", src, Some(Language::Kotlin));
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+
+        let processor = result
+            .nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::Class && node.name == "Processor")
+            .expect("Processor class");
+        assert_eq!(processor.signature, None);
+
+        let callables = result
+            .nodes
+            .iter()
+            .filter(|node| matches!(node.kind, NodeKind::Function | NodeKind::Method))
+            .collect::<Vec<_>>();
+        assert_eq!(callables.len(), 5);
+        assert!(callables.iter().all(|node| node.name != "mapper"));
+        assert!(callables.iter().all(|node| node.name != "topLevelMapper"));
+
+        let expected = [
+            (
+                "greet",
+                NodeKind::Function,
+                "(name: String, times: Int = 1): String",
+            ),
+            ("inferred", NodeKind::Function, "(flag: Boolean)"),
+            ("identity", NodeKind::Function, "(value: T): T"),
+            ("factory", NodeKind::Method, "(): (Int) -> String"),
+            ("decorate", NodeKind::Method, "(prefix: String): String"),
+        ];
+        for (name, kind, signature) in expected {
+            let node = callables
+                .iter()
+                .find(|node| node.name == name)
+                .unwrap_or_else(|| panic!("missing callable {name}"));
+            assert_eq!(node.kind, kind, "callable {name}");
+            assert_eq!(
+                node.signature.as_deref(),
+                Some(signature),
+                "callable {name}"
+            );
+        }
     }
 
     #[test]
