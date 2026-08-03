@@ -1,0 +1,56 @@
+[
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:6f584ac05d2d2c7faa41bae215f2b3fc",
+    "target": "method:b8173e3daeeefd9fa0ae5b727e67a8aa"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:signatures.kt",
+    "target": "class:6f584ac05d2d2c7faa41bae215f2b3fc"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:signatures.kt",
+    "target": "function:0b0f08a29514e44304e9aa9f38ff7ed4"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:signatures.kt",
+    "target": "function:2f46eb5b34c29e3d3d7af8f3a7af5859"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:signatures.kt",
+    "target": "function:bd4f6629b0fa20f11bfebda87027ba4c"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:signatures.kt",
+    "target": "method:8d87b9ca6e343e3bb82623dbca5775ad"
+  }
+]

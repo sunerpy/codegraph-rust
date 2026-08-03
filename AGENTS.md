@@ -19,14 +19,18 @@ Protocol) stdio server. No AI / vector / LLM anywhere in the binary — output i
   `crates/codegraph-bench/fixtures/python/`; guards six bare class-as-value
   `References` edges — return, assignment RHS, registry pair, call argument,
   list literal, and one cross-file unique match — plus tuple-return and bare-method
-  negatives, byte-for-byte), and `reference/golden/cpp/`
+  negatives, byte-for-byte), `reference/golden/kotlin/` (corpus
+  `crates/codegraph-bench/fixtures/kotlin/`; guards #1495 Kotlin callable
+  signatures for explicit, inferred, generic, multiline nullable, and extension
+  returns, plus a primary-constructor negative — byte-for-byte), and `reference/golden/cpp/`
   (corpus `crates/codegraph-bench/fixtures/cpp/`; guards #1043 C++ class/struct
   inheritance incl. templated-base stripping byte-for-byte, and retroactively
   the earlier C++ extraction work).
   The Python cross-file edge is resolved by Gate 3a's unique-name fallback;
   import Gate 3b is deliberately unreachable for real Python nodes because the
   extractor does not mark them exported. Regen recipe: `docs/equivalence.md`
-  "Godot fixture" / "Ruby fixture" / "Python fixture" / "C++ fixture" sections.
+  "Godot fixture" / "Ruby fixture" / "Python fixture" / "Kotlin fixture" /
+  "C++ fixture" sections.
 - **node-id formula**: `{kind}:{sha256("{filePath}:{kind}:{name}:{line}").hex[:32]}`; file nodes are the
   literal `file:{relpath}`; lines are 1-based; paths relative with `/`.
 - **No AI / vector / LLM crates** — enforced by `scripts/guardrail.sh` (CI gate):

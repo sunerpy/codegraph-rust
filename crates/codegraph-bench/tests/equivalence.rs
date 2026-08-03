@@ -127,6 +127,22 @@ fn python_db_is_self_equivalent_to_python_golden() {
 }
 
 #[test]
+fn generated_golden_matches_committed_kotlin_fixture() {
+    let tempdir = TestDir::new("generated-golden-kotlin");
+    write_golden(&kotlin_db(), tempdir.path()).unwrap();
+
+    let expected = load_golden(&kotlin_golden_dir()).unwrap();
+    let actual = load_golden(tempdir.path()).unwrap();
+
+    diff_canonical(&expected, &actual, None).unwrap();
+}
+
+#[test]
+fn kotlin_db_is_self_equivalent_to_kotlin_golden() {
+    assert_equivalent(&kotlin_db(), &kotlin_golden_dir()).unwrap();
+}
+
+#[test]
 fn generated_golden_matches_committed_metal_fixture() {
     // Guards Metal (#1121): `.metal`→cpp mapping + the `[[attribute]]` blank that
     // prevents the spurious `VertexIn extends float4` inheritance edge.
@@ -386,6 +402,14 @@ fn python_db() -> PathBuf {
 
 fn python_golden_dir() -> PathBuf {
     workspace_root().join("reference/golden/python")
+}
+
+fn kotlin_db() -> PathBuf {
+    workspace_root().join("reference/golden/kotlin/colby.db")
+}
+
+fn kotlin_golden_dir() -> PathBuf {
+    workspace_root().join("reference/golden/kotlin")
 }
 
 fn metal_db() -> PathBuf {

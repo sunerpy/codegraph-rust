@@ -118,16 +118,16 @@ fn assert_corrupt(
 #[test]
 fn index_state_constants_and_canonical_payload_are_exact() {
     assert_eq!(CURRENT_STORAGE_PROTOCOL, 2);
-    assert_eq!(CURRENT_EXTRACTION_VERSION, 3);
+    assert_eq!(CURRENT_EXTRACTION_VERSION, 4);
     assert_eq!(EXTRACTION_VERSION_KEY, "indexed_with_extraction_version");
     assert_eq!(
-        canonical_checksum_payload(7, 2, 3, "future-phase", OWNER),
+        canonical_checksum_payload(7, 2, 4, "future-phase", OWNER),
         format!(
             "codegraph-index-state-v1\nsequence=7\nstorageProtocol=2\n\
-             extractionVersion=3\nphase=future-phase\nprojectIdentity={OWNER}\n"
+             extractionVersion=4\nphase=future-phase\nprojectIdentity={OWNER}\n"
         )
     );
-    let digest = checksum_hex(7, 2, 3, "future-phase", OWNER);
+    let digest = checksum_hex(7, 2, 4, "future-phase", OWNER);
     assert_eq!(digest.len(), 64);
     assert!(
         digest
@@ -197,13 +197,13 @@ fn index_state_extraction_version_maps_outdated_and_future_for_every_phase() {
             &previous.slots()[0],
             1,
             CURRENT_STORAGE_PROTOCOL,
-            2,
+            3,
             phase,
             OWNER,
         );
         assert_eq!(
             classify_slots(&previous.slots(), OWNER).status(),
-            &ExtractionStatus::Outdated { built: 2 }
+            &ExtractionStatus::Outdated { built: 3 }
         );
 
         let future = TempTree::new("future-extraction");

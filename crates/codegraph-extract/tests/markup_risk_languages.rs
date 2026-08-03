@@ -198,9 +198,9 @@ fn lang_markup_risk_kotlin_extracts_upstream_symbol_set() {
     let run = assert_node(&result, NodeKind::Method, "run");
     assert_eq!(run.visibility.as_deref(), Some("public"));
     assert_eq!(run.return_type.as_deref(), Some("Entity"));
-    // kotlin.ts:232-242 getSignature uses a field lookup the kotlin grammar
-    // does not expose, so the upstream emits NO kotlin signatures.
-    assert_eq!(run.signature, None);
+    // Unlike upstream's missing-field lookup, the Rust extractor finds Kotlin
+    // parameters by direct-child KIND and emits the intended callable signature.
+    assert_eq!(run.signature.as_deref(), Some("(): Entity"));
 
     let level = assert_node(&result, NodeKind::Enum, "Level");
     assert_eq!(level.visibility.as_deref(), Some("public"));
@@ -225,7 +225,7 @@ fn lang_markup_risk_kotlin_extracts_upstream_symbol_set() {
     let fetch = assert_node(&result, NodeKind::Method, "fetch");
     assert_eq!(fetch.visibility.as_deref(), Some("public"));
     assert!(fetch.is_async, "suspend → isAsync (kotlin.ts:261-270)");
-    assert_eq!(fetch.signature, None);
+    assert_eq!(fetch.signature.as_deref(), Some("(id: String): Entity?"));
     // nullable return `Entity?` normalizes to bare class name (kotlin.ts:17-43).
     assert_eq!(fetch.return_type.as_deref(), Some("Entity"));
 
@@ -236,11 +236,14 @@ fn lang_markup_risk_kotlin_extracts_upstream_symbol_set() {
     assert_eq!(inner.qualified_name, "com.example.demo::Outer::Inner");
     assert_contains(&result, &outer.id, &inner.id);
     assert_node(&result, NodeKind::EnumMember, "A");
+    let touch = assert_node(&result, NodeKind::Method, "touch");
+    assert_eq!(touch.signature.as_deref(), Some("()"));
 
     // object_declaration → extraClassNodeTypes → class (kotlin.ts:84).
     let registry = assert_node(&result, NodeKind::Class, "Registry");
     let lookup = assert_node(&result, NodeKind::Method, "lookup");
     assert_eq!(lookup.return_type.as_deref(), Some("Repo"));
+    assert_eq!(lookup.signature.as_deref(), Some("(): Repo"));
     assert_contains(&result, &registry.id, &lookup.id);
 
     let alias = assert_node(&result, NodeKind::TypeAlias, "EntityId");
@@ -251,12 +254,14 @@ fn lang_markup_risk_kotlin_extracts_upstream_symbol_set() {
     let shout = assert_node(&result, NodeKind::Method, "shout");
     assert_eq!(shout.qualified_name, "String::shout");
     assert_eq!(shout.return_type.as_deref(), Some("String"));
+    assert_eq!(shout.signature.as_deref(), Some("(): String"));
 
     // expect marker lands in decorators (kotlin.ts:271-293 extractModifiers,
     // merged by tree-sitter.ts:626-634).
     let platform = assert_node(&result, NodeKind::Function, "platform");
     assert_eq!(platform.decorators, vec!["expect".to_string()]);
     assert_eq!(platform.return_type.as_deref(), Some("String"));
+    assert_eq!(platform.signature.as_deref(), Some("(): String"));
 
     // Golden unresolved references from the upstream run on this fixture.
     assert_ref_at(&result, EdgeKind::Imports, "com.example.db.Db", 3);
