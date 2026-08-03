@@ -378,11 +378,22 @@ fn configured_relative_root_uses_project_local_join_via_cli() {
         &[("CODEGRAPH_DIR", "cache")],
     );
     assert!(status.ok, "status must succeed: {}", status.stderr);
-    assert!(
-        status
-            .stdout
-            .contains(&project.join("cache/codegraph.db").display().to_string()),
-        "status indexPath must name the configured project-local DB: {}",
+    let status_json: Value = serde_json::from_str(status.stdout.trim()).expect("valid status JSON");
+    let status_db = Path::new(
+        status_json["dbPath"]
+            .as_str()
+            .expect("status dbPath must be a string"),
+    );
+    assert_eq!(
+        (
+            status_db
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str()),
+            status_db.file_name().and_then(|name| name.to_str()),
+        ),
+        (Some("cache"), Some("codegraph.db")),
+        "status dbPath must end in the configured project-local cache/codegraph.db: {}",
         status.stdout
     );
 }
