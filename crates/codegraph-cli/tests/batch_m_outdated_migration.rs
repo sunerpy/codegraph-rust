@@ -2,7 +2,7 @@
 //! frozen plan `upstream-v1.5-portable-fixes.md` lines 557-565 and 750-751).
 //!
 //! `codegraph sync` must classify the namespace BEFORE mutating a single row.
-//! An `Outdated` v2 namespace (built by an older extraction version) therefore
+//! An `Outdated` namespace (built by an older extraction version) therefore
 //! cannot be updated file-by-file: the sync escalates, under the SAME retained
 //! exclusive lease, to a deterministic full from-source migration that bypasses
 //! every mtime/content-hash skip, processes every current candidate in sorted

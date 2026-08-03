@@ -193,7 +193,9 @@ pub enum StoreError {
         purpose: StoreWritePurpose,
         status: ExtractionStatus,
     },
-    #[error("state is missing but a database artifact already exists at {path}")]
+    #[error(
+        "state is missing but a database artifact already exists at {path}; run `codegraph init` for the project to replace it"
+    )]
     MissingStateWithDatabase { path: PathBuf },
     #[error("index state {status} exists without its permanent lock at {path}")]
     StateWithoutPermanentLock {
@@ -433,7 +435,14 @@ impl Store {
         paths: &IndexPaths,
         lease: IndexLease,
     ) -> Result<StoreWriteOpen> {
-        Self::open_for_write_with_options(paths, lease, StoreWritePurpose::FullRebuild, true, || {})
+        Self::open_for_write_with_options(
+            paths,
+            lease,
+            StoreWritePurpose::FullRebuild,
+            true,
+            true,
+            || {},
+        )
     }
 
     fn open_for_write_with(
@@ -442,7 +451,7 @@ impl Store {
         purpose: StoreWritePurpose,
         before_write_open: impl FnOnce(),
     ) -> Result<StoreWriteOpen> {
-        Self::open_for_write_with_options(paths, lease, purpose, false, before_write_open)
+        Self::open_for_write_with_options(paths, lease, purpose, false, false, before_write_open)
     }
 
     fn open_for_write_with_options(
@@ -450,6 +459,7 @@ impl Store {
         lease: IndexLease,
         purpose: StoreWritePurpose,
         allow_current_tombstone: bool,
+        allow_missing_database_artifacts: bool,
         before_write_open: impl FnOnce(),
     ) -> Result<StoreWriteOpen> {
         lease.validate_exclusive(paths)?;
@@ -462,6 +472,7 @@ impl Store {
             return Err(StoreError::StateRejected { status });
         }
         if status == ExtractionStatus::Missing
+            && !allow_missing_database_artifacts
             && let Some(path) = first_existing_database_artifact(paths)?
         {
             return Err(StoreError::MissingStateWithDatabase { path });
@@ -1014,7 +1025,7 @@ fn validate_extraction_stamp(db_path: &Path, stamp: Option<String>) -> Result<()
     Ok(())
 }
 
-fn first_existing_database_artifact(paths: &IndexPaths) -> Result<Option<PathBuf>> {
+pub(crate) fn first_existing_database_artifact(paths: &IndexPaths) -> Result<Option<PathBuf>> {
     let db = paths.current_db();
     let mut artifacts = vec![db.clone()];
     artifacts.push(database_sidecar_path(&db, "-wal"));
@@ -1068,7 +1079,7 @@ fn remove_checkpointed_sidecars(paths: &IndexPaths, lease: &IndexLease) -> Resul
 /// would see a sidecar-free namespace while a committed `-wal` sat undetected
 /// beside the database, and the strict `Current` read would then serve an index
 /// missing every row that lives only in that log.
-fn database_sidecar_path(db: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn database_sidecar_path(db: &Path, suffix: &str) -> PathBuf {
     let mut native = db.as_os_str().to_os_string();
     native.push(suffix);
     PathBuf::from(native)

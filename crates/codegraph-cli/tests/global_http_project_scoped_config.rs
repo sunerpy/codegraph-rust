@@ -1,20 +1,19 @@
-//! Batch M item 19 — PROJECT-SCOPED v2 configuration, end to end.
+//! Batch M item 19 — project-scoped configuration, end to end.
 //!
 //! One process must never let one project's configuration reach another, and must
-//! never adopt a legacy `.codegraph/config.toml` / `.codegraph/codegraph.json`.
-//! These targets drive the REAL `codegraph` binary:
+//! never confuse two projects that use the same project-local `CODEGRAPH_DIR`
+//! name. These targets drive the REAL `codegraph` binary:
 //!
-//! 1. [`global_http_uses_project_scoped_v2_configs`] — the named acceptance
+//! 1. [`global_http_uses_project_scoped_configs`] — the named acceptance
 //!    target. ONE global `serve --http` process (no `--path`, `APP_CONFIG`
 //!    unset) answers requests for two projects whose current-root `config.toml`
-//!    files carry OPPOSING `include`/`exclude`/`max_file_size` settings, plus
-//!    hostile LEGACY configs that must be ignored. It proves per-request scoping
-//!    in both orders, then proves the same for `sync` and for the live watcher.
-//! 2. [`app_config_overrides_both_projects_including_codegraph_dir_collision`] —
+//!    files carry OPPOSING `include`/`exclude`/`max_file_size` settings. It proves
+//!    per-request scoping in both orders, then proves the same for `sync` and for
+//!    the live watcher.
+//! 2. [`app_config_overrides_both_projects_with_same_local_index_name`] —
 //!    the control: `APP_CONFIG` is INTENTIONALLY process-wide, so it supersedes
-//!    both projects' own configs; and with both projects pointed at the SAME
-//!    absolute `CODEGRAPH_DIR`, their identity-suffixed current roots stay
-//!    distinct, so neither project's index or config collides with the other's.
+//!    both projects' own configs; both projects use the same project-local
+//!    `CODEGRAPH_DIR` name without sharing storage.
 #![cfg(unix)]
 
 use std::fs;
@@ -86,30 +85,13 @@ fn copy_tree(src: &Path, dst: &Path) {
     }
 }
 
-/// A `mini`-fixture project plus a `.gitignore`d `Tools/` dir, and HOSTILE legacy
-/// configs (`.codegraph/config.toml` + `.codegraph/codegraph.json`) that no
-/// production path may read. The legacy TOML asks for the OPPOSITE of every
-/// project-scoped expectation, so adopting it fails the assertions below.
-fn project_with_hostile_legacy_config(root: &Path, legacy_include: &str) -> PathBuf {
+fn project_fixture(root: &Path) -> PathBuf {
     copy_tree(&mini_fixture(), root);
     fs::write(root.join(".gitignore"), "Tools/\n").unwrap();
     fs::create_dir_all(root.join("Tools")).unwrap();
     fs::write(
         root.join("Tools/helper.ts"),
         "export function toolsHelper() { return 1; }\n",
-    )
-    .unwrap();
-    fs::create_dir_all(root.join(".codegraph")).unwrap();
-    fs::write(
-        root.join(".codegraph/config.toml"),
-        format!(
-            "[app]\nname = \"legacy\"\n\n[indexing]\nmax_file_size = 7\ninclude = [{legacy_include}]\n"
-        ),
-    )
-    .unwrap();
-    fs::write(
-        root.join(".codegraph/codegraph.json"),
-        "{\"extensions\":{\".zz\":\"lua\"}}\n",
     )
     .unwrap();
     root.to_path_buf()
@@ -146,10 +128,10 @@ fn cli(args: &[&str], envs: &[(&str, &str)]) -> (String, String, bool) {
     )
 }
 
-/// The indexed root-relative file paths recorded in the project's v2 database.
+/// The indexed root-relative file paths recorded in the project's database.
 fn indexed_files(project: &Path, codegraph_dir: Option<&str>) -> Vec<String> {
     let paths = IndexPaths::resolve(project, codegraph_dir).expect("resolve index paths");
-    let store = Store::open(&paths.current_db()).expect("open v2 store");
+    let store = Store::open(&paths.current_db()).expect("open store");
     let mut files = store
         .all_files()
         .expect("read files")
@@ -313,17 +295,15 @@ const BETA_CONFIG: &str = "[app]\nname = \"beta\"\n\n[indexing]\nexclude = [\"sr
 /// Item 19. ONE global HTTP process, `APP_CONFIG` unset, two projects with
 /// opposing current-root configs — plus `sync` and the live watcher.
 #[test]
-fn global_http_uses_project_scoped_v2_configs() {
+fn global_http_uses_project_scoped_configs() {
     let home = TestDir::new("global-http");
-    let alpha = project_with_hostile_legacy_config(&home.path().join("alpha"), "\"tools/\"");
-    let beta = project_with_hostile_legacy_config(&home.path().join("beta"), "\"Tools/\"");
+    let alpha = project_fixture(&home.path().join("alpha"));
+    let beta = project_fixture(&home.path().join("beta"));
 
     // -------------------------------------------------- index and sync ---
-    // `init` publishes each project's v2 namespace; the per-project config then
-    // lands in that namespace. `index --force` must scope each project's SCAN by
-    // its own config, and a subsequent `sync` must scope the same way. The hostile
-    // legacy `.codegraph/config.toml` in each project asks for the other's
-    // `include` and a 7-byte size cap, so adopting it would flip the assertions.
+    // `init` publishes each project's namespace; the per-project config then
+    // lands in that namespace. `index --force` and `sync` must scope each scan by
+    // its own config.
     let (out, err, ok) = cli(&["init", alpha.to_str().unwrap()], &[]);
     assert!(ok, "alpha init failed: stdout={out} stderr={err}");
     let (out, err, ok) = cli(&["init", beta.to_str().unwrap()], &[]);
@@ -364,7 +344,7 @@ fn global_http_uses_project_scoped_v2_configs() {
 
     // The SYNC path is scoped the same way: an identical new file under the
     // gitignored `Tools/` is picked up by alpha (whose config includes it) and
-    // ignored by beta (whose config does not, its legacy config notwithstanding).
+    // ignored by beta (whose own config does not include it).
     for project in [&alpha, &beta] {
         fs::write(
             project.join("Tools/synced.ts"),
@@ -382,7 +362,7 @@ fn global_http_uses_project_scoped_v2_configs() {
     );
     assert!(
         !indexed_files(&beta, None).contains(&"Tools/synced.ts".to_string()),
-        "beta's sync must not adopt alpha's (or its legacy config's) include"
+        "beta's sync must not adopt alpha's include"
     );
 
     // --------------------------------------------------- one HTTP process ---
@@ -480,8 +460,7 @@ fn global_http_uses_project_scoped_v2_configs() {
     // ------------------------------------------------------------- watcher ---
     // The live watcher scopes by the ADDRESSED project's config: a new file under
     // the gitignored `Tools/` is auto-synced for alpha (which includes it) and
-    // never for beta (which does not) — even though beta's hostile LEGACY config
-    // names `Tools/`.
+    // never for beta (which does not).
     let mut alpha_serve = ServeProcess::spawn(&alpha);
     alpha_serve.handshake();
     fs::write(
@@ -504,23 +483,19 @@ fn global_http_uses_project_scoped_v2_configs() {
     .unwrap();
     assert!(
         !beta_serve.search_finds_within("betaWatchedMarker", Duration::from_secs(6)),
-        "beta's watcher must not adopt alpha's (or its legacy config's) include"
+        "beta's watcher must not adopt alpha's include"
     );
     drop(beta_serve);
 }
 
-/// The control: `APP_CONFIG` is INTENTIONALLY a process-wide override, so it
-/// supersedes both projects' own current-root configs. The same run also points
-/// both projects at ONE absolute `CODEGRAPH_DIR`: their identity-suffixed current
-/// roots must stay distinct, so the collision attempt cannot merge two projects'
-/// storage or configuration.
+/// The control: `APP_CONFIG` is INTENTIONALLY a process-wide override, while an
+/// identical project-local `CODEGRAPH_DIR` name still produces separate roots.
 #[test]
-fn app_config_overrides_both_projects_including_codegraph_dir_collision() {
+fn app_config_overrides_both_projects_with_same_local_index_name() {
     let home = TestDir::new("app-config");
-    let shared_dir = home.path().join("shared-index");
-    let shared = shared_dir.to_string_lossy().into_owned();
-    let alpha = project_with_hostile_legacy_config(&home.path().join("alpha"), "\"tools/\"");
-    let beta = project_with_hostile_legacy_config(&home.path().join("beta"), "\"Tools/\"");
+    let configured_dir = "shared-index";
+    let alpha = project_fixture(&home.path().join("alpha"));
+    let beta = project_fixture(&home.path().join("beta"));
 
     let override_path = home.path().join("process-wide.toml");
     fs::write(
@@ -530,14 +505,12 @@ fn app_config_overrides_both_projects_including_codegraph_dir_collision() {
     .unwrap();
     let override_arg = override_path.to_string_lossy().into_owned();
 
-    // The identity-suffixed sibling roots must differ even though CODEGRAPH_DIR is
-    // literally the same absolute path for both projects.
-    let alpha_paths = IndexPaths::resolve(&alpha, Some(&shared)).expect("alpha paths");
-    let beta_paths = IndexPaths::resolve(&beta, Some(&shared)).expect("beta paths");
+    let alpha_paths = IndexPaths::resolve(&alpha, Some(configured_dir)).expect("alpha paths");
+    let beta_paths = IndexPaths::resolve(&beta, Some(configured_dir)).expect("beta paths");
     assert_ne!(
         alpha_paths.current_root(),
         beta_paths.current_root(),
-        "a shared absolute CODEGRAPH_DIR must still yield per-project current roots"
+        "the same project-local CODEGRAPH_DIR name must yield per-project roots"
     );
     assert_ne!(alpha_paths.current_db(), beta_paths.current_db());
     assert_ne!(alpha_paths.config_toml(), beta_paths.config_toml());
@@ -548,7 +521,7 @@ fn app_config_overrides_both_projects_including_codegraph_dir_collision() {
     for project in [&alpha, &beta] {
         let (out, err, ok) = cli(
             &["init", project.to_str().unwrap()],
-            &[("CODEGRAPH_DIR", shared.as_str())],
+            &[("CODEGRAPH_DIR", configured_dir)],
         );
         assert!(
             ok,
@@ -556,13 +529,13 @@ fn app_config_overrides_both_projects_including_codegraph_dir_collision() {
             project.display()
         );
     }
-    write_current_config(&alpha, ALPHA_CONFIG, Some(&shared));
-    write_current_config(&beta, BETA_CONFIG, Some(&shared));
+    write_current_config(&alpha, ALPHA_CONFIG, Some(configured_dir));
+    write_current_config(&beta, BETA_CONFIG, Some(configured_dir));
     for project in [&alpha, &beta] {
         let (out, err, ok) = cli(
             &["index", "--force", project.to_str().unwrap()],
             &[
-                ("CODEGRAPH_DIR", shared.as_str()),
+                ("CODEGRAPH_DIR", configured_dir),
                 ("APP_CONFIG", override_arg.as_str()),
             ],
         );
@@ -576,7 +549,7 @@ fn app_config_overrides_both_projects_including_codegraph_dir_collision() {
     // APP_CONFIG won for BOTH: each index carries `Tools/helper.ts`, which
     // alpha's own config allows but beta's forbids.
     for (label, project) in [("alpha", &alpha), ("beta", &beta)] {
-        let files = indexed_files(project, Some(&shared));
+        let files = indexed_files(project, Some(configured_dir));
         assert!(
             files.contains(&"Tools/helper.ts".to_string()),
             "APP_CONFIG must override {label}'s own config: {files:?}"
@@ -589,17 +562,17 @@ fn app_config_overrides_both_projects_including_codegraph_dir_collision() {
     }
     assert!(
         alpha_paths.current_root().is_dir() && beta_paths.current_root().is_dir(),
-        "both identity-suffixed roots must exist side by side under the shared CODEGRAPH_DIR"
+        "both project-local configured roots must exist"
     );
 
     // And with APP_CONFIG UNSET the same two projects fall back to their own
     // configs again — the override is process-wide, not sticky state on disk.
     let (out, err, ok) = cli(
         &["index", "--force", beta.to_str().unwrap()],
-        &[("CODEGRAPH_DIR", shared.as_str())],
+        &[("CODEGRAPH_DIR", configured_dir)],
     );
     assert!(ok, "beta reindex failed: stdout={out} stderr={err}");
-    let beta_files = indexed_files(&beta, Some(&shared));
+    let beta_files = indexed_files(&beta, Some(configured_dir));
     assert!(
         !beta_files.contains(&"Tools/helper.ts".to_string()),
         "without APP_CONFIG beta must use its own config again: {beta_files:?}"

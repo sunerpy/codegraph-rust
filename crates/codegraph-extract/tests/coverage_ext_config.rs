@@ -111,11 +111,9 @@ fn absent_config_leaves_custom_extension_unknown() {
     fs::remove_dir_all(&project).ok();
 }
 
-/// A LEGACY `.codegraph/codegraph.json` is never consulted: only the project's
-/// current-root config can supply an override.
 #[test]
-fn legacy_codegraph_json_is_never_read() {
-    let project = unique_project("legacy");
+fn project_codegraph_json_is_read() {
+    let project = unique_project("project_config");
     fs::create_dir_all(project.join(".codegraph")).unwrap();
     fs::write(
         project.join(".codegraph/codegraph.json"),
@@ -125,10 +123,9 @@ fn legacy_codegraph_json_is_never_read() {
     let paths = IndexPaths::resolve(&project, None).expect("resolve index paths");
 
     let overrides = ExtensionOverrides::load_for_paths(&paths);
-    assert!(overrides.is_empty(), "a legacy config must not be adopted");
     assert_eq!(
         detect_language_with("plugin.legacyext", &overrides),
-        Language::Unknown
+        Language::Lua
     );
 
     fs::remove_dir_all(&project).ok();

@@ -112,7 +112,7 @@ impl TestProject {
     }
 
     fn paths(&self) -> IndexPaths {
-        IndexPaths::resolve(&self.0, None).expect("resolve v2 index paths")
+        IndexPaths::resolve(&self.0, None).expect("resolve index paths")
     }
 }
 
@@ -124,23 +124,16 @@ impl Drop for TestProject {
     }
 }
 
-/// Every rendezvous artifact path a daemon could publish: the authoritative v2
-/// identities plus the LEGACY `.codegraph` spellings, so "published nothing"
-/// cannot pass merely because the daemon wrote somewhere else.
-fn rendezvous_candidates(project: &Path, paths: &IndexPaths) -> Vec<PathBuf> {
-    let legacy = project.join(".codegraph");
+fn rendezvous_candidates(paths: &IndexPaths) -> Vec<PathBuf> {
     vec![
         paths.daemon_pid(),
         paths.daemon_socket(),
         paths.daemon_log(),
-        legacy.join("daemon.pid"),
-        legacy.join("daemon.sock"),
-        legacy.join("daemon.log"),
     ]
 }
 
-fn assert_no_rendezvous(project: &Path, paths: &IndexPaths, when: &str) {
-    for candidate in rendezvous_candidates(project, paths) {
+fn assert_no_rendezvous(paths: &IndexPaths, when: &str) {
+    for candidate in rendezvous_candidates(paths) {
         assert!(
             fs::symlink_metadata(&candidate).is_err(),
             "{when}: no daemon rendezvous artifact may exist at {}",
@@ -379,7 +372,7 @@ fn wait_for_owner_record(paths: &IndexPaths) -> u32 {
         thread::sleep(Duration::from_millis(25));
     }
     panic!(
-        "the daemon never published its v2 rendezvous at {}",
+        "the daemon never published its rendezvous at {}",
         paths.daemon_pid().display()
     );
 }
@@ -389,7 +382,7 @@ fn daemon_start_during_uninit_observes_uninitialized_and_tombstone_before_publis
     let project = TestProject::indexed("concurrent-start");
     let paths = project.paths();
     assert_eq!(Store::extraction_status(&paths), ExtractionStatus::Current);
-    assert_no_rendezvous(project.path(), &paths, "before any daemon start");
+    assert_no_rendezvous(&paths, "before any daemon start");
 
     let barrier = LeaseBarrier::start();
 
@@ -413,11 +406,7 @@ fn daemon_start_during_uninit_observes_uninitialized_and_tombstone_before_publis
         ExtractionStatus::Uninitialized
     );
     fs::write(paths.tombstone(), TOMBSTONE_BYTES).expect("publish the tombstone");
-    assert_no_rendezvous(
-        project.path(),
-        &paths,
-        "while uninit still holds the exclusive lease",
-    );
+    assert_no_rendezvous(&paths, "while uninit still holds the exclusive lease");
 
     drop(uninit_lease);
 
@@ -425,7 +414,6 @@ fn daemon_start_during_uninit_observes_uninitialized_and_tombstone_before_publis
     // SHARED lease. Nothing may have been published at or before this point.
     let released = barrier.wait(b'S');
     assert_no_rendezvous(
-        project.path(),
         &paths,
         "at the daemon's own startup shared-lease checkpoint",
     );
@@ -445,11 +433,7 @@ fn daemon_start_during_uninit_observes_uninitialized_and_tombstone_before_publis
         stderr.contains("tombstone"),
         "the refusal must name the observed tombstone: {stderr}"
     );
-    assert_no_rendezvous(
-        project.path(),
-        &paths,
-        "after the refused daemon start exited",
-    );
+    assert_no_rendezvous(&paths, "after the refused daemon start exited");
     assert_recoverable_uninitialized(&paths, "after the refused daemon start");
 }
 
@@ -505,7 +489,7 @@ fn uninit_shutdown_control_drains_without_pid_kill() {
     );
     assert!(
         !paths.current_db().is_file(),
-        "uninit removes the v2 database after the ACK, under the same lease"
+        "uninit removes the database after the ACK, under the same lease"
     );
     assert_recoverable_uninitialized(&paths, "after a drained uninit");
 }

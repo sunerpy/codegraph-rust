@@ -166,7 +166,7 @@ fn shipped_init(project: &Path) {
 }
 
 /// A command with the ambient index-location override cleared, so both the
-/// staging build and the served project resolve their own default v2 namespace.
+/// staging build and the served project resolve their own default namespace.
 /// The daemon opt-out keeps ONE direct long-lived process (never a proxy to a
 /// shared daemon), and the watch opt-out keeps the live watcher off.
 fn base_command() -> Command {
@@ -179,7 +179,7 @@ fn base_command() -> Command {
 }
 
 fn index_paths(project: &Path) -> IndexPaths {
-    IndexPaths::resolve(project, None).expect("resolve v2 IndexPaths")
+    IndexPaths::resolve(project, None).expect("resolve IndexPaths")
 }
 
 /// One long-lived shipped MCP stdio server plus the reader thread that turns its
@@ -483,8 +483,6 @@ fn long_lived_v2_mcp_releases_handles_per_request() {
         "request 1 must not observe the replacement graph: {first}"
     );
 
-    // ... the parent takes the exclusive lease (handles released) and atomically
-    // replaces the v2 database. No compatibility seam participates.
     replace_database(&project, &replacement_db);
 
     // THEN the CONTINUE frame (request 2) serves ONLY the replacement graph.

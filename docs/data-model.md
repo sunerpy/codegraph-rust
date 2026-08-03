@@ -13,14 +13,14 @@ Golden artifacts captured from that run, committed under `reference/golden/`:
 - Schema dump: `reference/golden/colby.schema.sql`
 - Raw database: `reference/golden/mini/colby.db`
 - Nodes table JSON: `reference/golden/mini/colby.nodes.json`
-- Database location: `/tmp/cg-fixture-mini/.codegraph-v2/codegraph.db`
+- Database location: `/tmp/cg-fixture-mini/.codegraph/codegraph.db`
 
 ## Real `.schema` Dump Contract
 
 `reference/golden/colby.schema.sql` was generated with:
 
 ```bash
-sqlite3 /tmp/cg-fixture-mini/.codegraph-v2/codegraph.db .schema > reference/golden/colby.schema.sql
+sqlite3 /tmp/cg-fixture-mini/.codegraph/codegraph.db .schema > reference/golden/colby.schema.sql
 ```
 
 The dump is post-initialization/post-migration truth. It includes the six application tables (`schema_versions`, `nodes`, `edges`, `files`, `unresolved_refs`, `project_metadata`), `nodes_fts` plus its FTS5 shadow tables, the three FTS triggers, the post-migration indexes, `sqlite_sequence`, and `sqlite_stat1` created by the maintenance/ANALYZE path.

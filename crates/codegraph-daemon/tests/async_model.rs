@@ -361,10 +361,8 @@ fn temp_indexed_project(name: &str) -> PathBuf {
         "codegraph-daemon-{name}-{}-{nanos}-{seq}",
         std::process::id()
     ));
-    // Batch M: the served index DB moved to the isolated v2 namespace
-    // (`.codegraph-v2`); the daemon rendezvous still lives under `.codegraph`.
-    let cg = path.join(".codegraph-v2");
-    fs::create_dir_all(&cg).expect("create project .codegraph-v2");
+    let cg = path.join(".codegraph");
+    fs::create_dir_all(&cg).expect("create project .codegraph");
     let root = workspace_root();
     fs::copy(
         root.join("reference/golden/mini/colby.db"),

@@ -109,8 +109,8 @@ fn cli_cwd(cwd: &Path, args: &[&str]) -> (String, String, bool) {
 
 fn db_path(project: &Path) -> PathBuf {
     // Batch M: both the index DB and the opt-in DSL config live in the isolated
-    // v2 namespace.
-    project.join(".codegraph-v2").join("codegraph.db")
+    // index namespace.
+    project.join(".codegraph").join("codegraph.db")
 }
 
 /// (i) `sync` after an edit to the `.tres` must equal a full `index --force`

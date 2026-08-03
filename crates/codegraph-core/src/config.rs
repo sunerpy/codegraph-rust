@@ -276,8 +276,8 @@ impl Config {
     ///
     /// A missing current-root config returns defaults. An explicitly selected
     /// CLI or environment path must exist and parse successfully. This API never
-    /// consults a legacy `.codegraph/config.toml`, the process working directory,
-    /// or another project's paths, and it does not cache across calls.
+    /// consults the process working directory or another project's paths, and it
+    /// does not cache across calls.
     pub fn load_for_paths(cli_path: Option<&Path>, paths: &IndexPaths) -> Result<Arc<Self>> {
         if let Some(path) = cli_path {
             return Self::from_path(path).map(Arc::new);
@@ -302,8 +302,8 @@ impl Config {
     ///
     /// Precedence is exactly the project-independent prefix of
     /// [`Config::load_for_paths`]: an explicit `cli_path`, then the process-wide
-    /// `APP_CONFIG` override, then all defaults. It never reads a project root,
-    /// a legacy `.codegraph/config.toml`, or the process working directory.
+    /// `APP_CONFIG` override, then all defaults. It never infers a project root
+    /// from the process working directory or reads project-local configuration.
     ///
     /// The result may ONLY configure process-wide bootstrap concerns (the logger
     /// level). It is never the configuration source for a project operation — a
@@ -541,11 +541,8 @@ max_file_size = 2097152
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Bootstrap must never adopt a project or CWD legacy `.codegraph/config.toml`:
-    /// with `APP_CONFIG` unset it is defaults-only, so it can never become the
-    /// configuration source for a later per-project operation.
     #[test]
-    fn load_env_or_default_ignores_legacy_project_and_cwd_configs() {
+    fn load_env_or_default_does_not_infer_project_config_from_cwd() {
         const CHILD_MARKER: &str = "CODEGRAPH_CONFIG_BOOTSTRAP_CHILD";
 
         if std::env::var_os(CHILD_MARKER).is_some() {
@@ -555,17 +552,17 @@ max_file_size = 2097152
             return;
         }
 
-        let outer = temp_dir("bootstrap-no-legacy");
+        let outer = temp_dir("bootstrap-no-cwd-project");
         std::fs::create_dir_all(outer.join(".codegraph")).unwrap();
         std::fs::write(
             outer.join(".codegraph/config.toml"),
-            "[app]\nname = \"legacy-cwd\"\nlog_level = \"error\"\n",
+            "[app]\nname = \"cwd-project\"\nlog_level = \"error\"\n",
         )
         .unwrap();
 
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
-            .arg("config::tests::load_env_or_default_ignores_legacy_project_and_cwd_configs")
+            .arg("config::tests::load_env_or_default_does_not_infer_project_config_from_cwd")
             .arg("--nocapture")
             .current_dir(&outer)
             .env(CHILD_MARKER, "1")
@@ -718,13 +715,13 @@ max_file_size = 2097152
     }
 
     #[test]
-    fn load_for_paths_ignores_legacy_project_and_cwd_configs() {
+    fn load_for_paths_reads_project_config_and_ignores_cwd_config() {
         const CHILD_PROJECT: &str = "CODEGRAPH_CONFIG_CWD_CHILD_PROJECT";
 
         if let Some(project) = std::env::var_os(CHILD_PROJECT) {
             let paths = IndexPaths::resolve(Path::new(&project), None).unwrap();
             let config = Config::load_for_paths(None, &paths).unwrap();
-            assert_eq!(config.app.name, "codegraph");
+            assert_eq!(config.app.name, "project");
             return;
         }
 
@@ -733,19 +730,19 @@ max_file_size = 2097152
         std::fs::create_dir_all(project.join(".codegraph")).unwrap();
         std::fs::write(
             project.join(".codegraph/config.toml"),
-            "[app]\nname = \"legacy-project\"\n",
+            "[app]\nname = \"project\"\n",
         )
         .unwrap();
         std::fs::create_dir_all(outer.join(".codegraph")).unwrap();
         std::fs::write(
             outer.join(".codegraph/config.toml"),
-            "[app]\nname = \"legacy-cwd\"\n",
+            "[app]\nname = \"unrelated-cwd\"\n",
         )
         .unwrap();
 
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
-            .arg("config::tests::load_for_paths_ignores_legacy_project_and_cwd_configs")
+            .arg("config::tests::load_for_paths_reads_project_config_and_ignores_cwd_config")
             .arg("--nocapture")
             .current_dir(&outer)
             .env(CHILD_PROJECT, &project)

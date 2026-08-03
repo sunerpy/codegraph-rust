@@ -78,7 +78,7 @@ fn copy_tree(src: &Path, dst: &Path) {
     }
 }
 
-/// Copy the mini fixture to `<dir>/<name>` and give it a v2 index namespace.
+/// Copy the mini fixture to `<dir>/<name>` and give it an index namespace.
 fn indexed_project(dir: &TestDir, name: &str) -> PathBuf {
     let project = dir.path().join(name);
     copy_tree(&mini_fixture(), &project);

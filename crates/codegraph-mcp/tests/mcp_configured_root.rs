@@ -5,8 +5,8 @@
 //! racing that binary's env-sensitive default-surface readers. The tests drive a
 //! REAL server front-end — most over an in-memory stdio pipe against `McpServer`,
 //! and one against the SHIPPED rmcp handler over a duplex transport — and prove
-//! the MCP request path opens the SAME identity-suffixed DB the CLI `init`
-//! writes, and fails closed identically on an invalid configured root.
+//! the MCP request path opens the SAME project-local DB the CLI `init` writes,
+//! and fails closed identically on an invalid configured root.
 
 use std::fs;
 use std::io::Cursor;
@@ -116,12 +116,8 @@ fn tool_call_search(project: &Path, project_path_arg: &str) -> Value {
     serde_json::from_str(line).expect("response json")
 }
 
-/// A relative `CODEGRAPH_DIR` is honored through `resolve`'s identity-suffixed
-/// sibling: staging the golden DB at `<parent>/<name>-v2-<identity>/codegraph.db`
-/// (NOT the simple-join `<project>/<name>`) makes a real `tools/call` resolve and
-/// return results — proving the MCP path opens the DB the CLI init would write.
 #[test]
-fn configured_relative_root_mcp_opens_identity_sibling_db() {
+fn configured_relative_root_mcp_opens_project_local_db() {
     let dir = unique_dir("rel");
     let base = &dir.path;
 
@@ -130,8 +126,8 @@ fn configured_relative_root_mcp_opens_identity_sibling_db() {
     let paths = codegraph_core::IndexPaths::resolve(base, Some("cache")).expect("resolve");
     stage_mini_db_at(&paths, base);
     assert!(
-        !base.join("cache").join("codegraph.db").is_file(),
-        "configured root must resolve to the identity sibling, not the simple-join"
+        base.join("cache").join("codegraph.db").is_file(),
+        "configured root must resolve to the direct project-local join"
     );
 
     let resp = tool_call_search(base, base.to_str().unwrap());
@@ -146,16 +142,12 @@ fn configured_relative_root_mcp_opens_identity_sibling_db() {
     );
     assert!(
         text.contains("add"),
-        "search against the identity-sibling DB must return results: {text}"
+        "search against the configured project-local DB must return results: {text}"
     );
 }
 
-/// Two DISTINCT projects sharing ONE absolute `CODEGRAPH_DIR` cannot cross-read:
-/// each resolves to its OWN identity-suffixed sibling, so staging only project
-/// A's DB leaves project B unindexed — B can never open A's graph through the
-/// shared absolute root.
 #[test]
-fn two_projects_sharing_absolute_root_cannot_cross_read_via_mcp() {
+fn absolute_configured_root_fails_closed_via_mcp() {
     let dir = unique_dir("abs");
     let holder = &dir.path;
     let project_a = holder.join("a");
@@ -165,37 +157,31 @@ fn two_projects_sharing_absolute_root_cannot_cross_read_via_mcp() {
     fs::create_dir_all(&project_b).unwrap();
     fs::create_dir_all(holder.join("shared")).unwrap();
 
+    let default_paths = codegraph_core::IndexPaths::resolve(&project_a, None).expect("default");
+    stage_mini_db_at(&default_paths, &project_a);
+
     let shared_str = shared.to_string_lossy().into_owned();
     let _env = EnvGuard::set(&shared_str);
 
-    let paths_a = codegraph_core::IndexPaths::resolve(&project_a, Some(&shared_str)).expect("a");
-    stage_mini_db_at(&paths_a, &project_a);
-
-    let paths_b = codegraph_core::IndexPaths::resolve(&project_b, Some(&shared_str)).expect("b");
-    assert_ne!(
-        paths_a.current_root(),
-        paths_b.current_root(),
-        "two projects sharing an absolute root must get distinct identity siblings"
-    );
     assert!(
-        !paths_b.current_db().is_file(),
-        "project B must NOT resolve to project A's staged DB"
+        codegraph_core::IndexPaths::resolve(&project_a, Some(&shared_str)).is_err(),
+        "absolute CODEGRAPH_DIR must be rejected"
     );
 
     let resp_a = tool_call_search(&project_a, project_a.to_str().unwrap());
     let resp_b = tool_call_search(&project_b, project_b.to_str().unwrap());
-
-    let text_a = resp_a["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap_or("");
+    for response in [resp_a, resp_b] {
+        let whole = serde_json::to_string(&response).unwrap();
+        assert_eq!(response["result"]["isError"], json!(true), "{whole}");
+        assert!(whole.contains("CODEGRAPH_DIR"), "{whole}");
+        assert!(
+            !whole.contains("Counter") && !whole.contains("Greeter"),
+            "{whole}"
+        );
+    }
     assert!(
-        resp_a["result"]["isError"] != json!(true) && text_a.contains("add"),
-        "project A must read its own graph: {text_a}"
-    );
-    let text_b = serde_json::to_string(&resp_b).unwrap();
-    assert!(
-        !text_b.contains("Greeter") && !text_b.contains("Counter"),
-        "project B must NOT surface project A's indexed symbols: {text_b}"
+        !shared.exists(),
+        "invalid external root must not be created"
     );
 }
 
@@ -361,9 +347,9 @@ fn assert_tree_unchanged(before: &[TreeEntry], after: &[TreeEntry], context: &st
 }
 
 /// An INVALID `CODEGRAPH_DIR` must fail closed on the REAL MCP public surface —
-/// it must not silently fall back to the default `.codegraph-v2` namespace.
+/// it must not silently fall back to the default `.codegraph` namespace.
 ///
-/// A TRAP database is staged at the default location `<project>/.codegraph-v2/
+/// A TRAP database is staged at the default location `<project>/.codegraph/
 /// codegraph.db` (the very path a `.`-alias fallback would open) and
 /// `CODEGRAPH_DIR=.` is set, which `IndexPaths::resolve` refuses because it
 /// aliases the project root. A real `tools/call codegraph_search` must then:
@@ -410,9 +396,8 @@ fn invalid_configured_root_mcp_fails_closed_and_never_serves_trap_default_db() {
         "the error must name the offending configuration: {text}"
     );
     assert!(
-        text.contains("project root itself"),
-        "the error must carry the STABLE `IndexPaths` reason (the `.` alias \
-         resolves to the project root itself), not a generic message: {text}"
+        text.contains("must be one non-empty project-local directory name"),
+        "the error must carry the stable `IndexPaths` reason, not a generic message: {text}"
     );
     assert!(
         !text.contains("No indexed project"),
@@ -456,7 +441,8 @@ fn invalid_configured_root_rmcp_fails_closed_and_never_serves_trap_default_db() 
     );
     let text = resp["content"][0]["text"].as_str().unwrap_or_default();
     assert!(
-        text.contains("CODEGRAPH_DIR") && text.contains("project root itself"),
+        text.contains("CODEGRAPH_DIR")
+            && text.contains("must be one non-empty project-local directory name"),
         "rmcp must surface the actionable IndexPaths diagnostic: {text}"
     );
     assert!(

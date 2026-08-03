@@ -72,8 +72,8 @@ fn cli(args: &[&str]) -> (String, String, bool) {
 }
 
 fn db_path(project: &Path) -> PathBuf {
-    // Batch M: `init`/`index`/`sync` now write the isolated v2 namespace.
-    project.join(".codegraph-v2").join("codegraph.db")
+    // `init`/`index`/`sync` write the selected index namespace.
+    project.join(".codegraph").join("codegraph.db")
 }
 
 #[test]

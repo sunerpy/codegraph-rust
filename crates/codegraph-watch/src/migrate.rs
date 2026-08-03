@@ -1,4 +1,4 @@
-//! Forced full migration of a v2 namespace that cannot be updated incrementally.
+//! Forced full migration of an index namespace that cannot be updated incrementally.
 //!
 //! Frozen plan `upstream-v1.5-portable-fixes.md` lines 557-565: an incremental
 //! sync classifies BEFORE mutating a row. `Missing`, `Outdated`, and a
@@ -17,7 +17,7 @@
 //! - reruns framework extraction, resolution, and maintenance, and
 //! - publishes `phase=current` LAST through the rebuild finalizer.
 //!
-//! Its five canonical surfaces therefore equal a fresh v2 `index --force`: the
+//! Its five canonical surfaces therefore equal a fresh `index --force`: the
 //! persist order below reproduces the CLI full-index pipeline exactly — file row
 //! then nodes per file in sorted order, ALL nodes before ANY edge, then edges,
 //! then unresolved refs, then framework extraction, batched resolution, and
@@ -76,7 +76,7 @@ pub(crate) fn migrate_project(
     let total = candidates.len();
 
     // Publishes `phase=building` BEFORE deleting a database byte, removes only
-    // the v2 database files, and opens the single fresh writer — all under the
+    // the database files, and opens the single fresh writer — all under the
     // lease the authorization retains.
     let rebuild = codegraph_store::resume_full_rebuild(paths, authorization)?;
     let mut rebuild = rebuild.open_store()?;

@@ -106,7 +106,7 @@ codegraph init --target=zed     # writes .zed/settings.json with an absolute --p
 ## Remote development (SSH)
 
 If you use Zed's remote SSH feature (Zed UI on your local machine, code and
-`.codegraph-v2/` index on a remote Linux host), codegraph MCP tools will silently
+`.codegraph/` index on a remote Linux host), codegraph MCP tools will silently
 return empty results. The cause: Zed runs `context_servers` on the **local**
 machine even for remote SSH projects, so the extension's downloaded binary cannot
 reach the remote index. Native remote MCP execution is not yet implemented in Zed

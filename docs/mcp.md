@@ -138,13 +138,13 @@ Run `codegraph install --target=zed` to write the bare global entry, or
 ### Zed over SSH (remote development)
 
 **Symptom.** You open a remote SSH project in Zed (Zed UI on your local machine,
-code and `.codegraph-v2/` index on a remote Linux host). All codegraph MCP tools
+code and `.codegraph/` index on a remote Linux host). All codegraph MCP tools
 return empty — "No relevant code found" — even after the index built successfully.
 
 **Root cause.** Zed currently executes `context_servers` entries on the **local
 machine**, not on the remote host. This is true even when a remote SSH project is
 open: the `command: "codegraph"` runs locally, cannot reach the remote
-`.codegraph-v2/` index, and returns nothing. Native remote MCP execution — running
+`.codegraph/` index, and returns nothing. Native remote MCP execution — running
 the server on the remote host — is not yet implemented in Zed (tracked in Zed's
 GitHub issues; status as of mid-2026).
 
@@ -334,7 +334,7 @@ Two distinct error channels:
 
 ## Daemon & live watch
 
-When the project is indexed (`.codegraph-v2/` exists), `serve --mcp` does not run
+When the project is indexed (`.codegraph/` exists), `serve --mcp` does not run
 inline. Instead it spawns — or proxies to — a single shared detached daemon
 process per project. Multiple agent clients (e.g. Claude Code + Cursor open
 simultaneously) all attach to the same daemon, so the index is loaded and
@@ -383,7 +383,7 @@ The server resolves a default project by walking three sources in order:
 
 1. **`--path` flag** — explicit pin; always wins.
 2. **find-up from cwd** — ascends from the working directory to the nearest
-   `.codegraph-v2/` index root. A cwd at or inside an indexed project resolves it
+   `.codegraph/` index root. A cwd at or inside an indexed project resolves it
    here, and `projectPath` is optional.
 3. **MCP `initialize` handshake** — if find-up yields nothing, the server reads
    the `initialize` message sent by the client and adopts the workspace it
@@ -406,7 +406,7 @@ them by passing an explicit `projectPath`; for single-project setups, pinning
 > resolved via find-up and gets the full daemon and watcher.
 
 The daemon exits automatically after all clients disconnect and an idle timeout
-elapses. Logs are appended to `.codegraph-v2/daemon.log`. A stale lock (e.g. after
+elapses. Logs are appended to `.codegraph/daemon.log`. A stale lock (e.g. after
 a crash) can be cleared with `codegraph unlock`.
 
 On Unix, the detached daemon calls `setsid` to become a session leader, so when

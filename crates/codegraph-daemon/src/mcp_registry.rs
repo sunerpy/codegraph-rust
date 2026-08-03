@@ -2,7 +2,7 @@
 //!
 //! `serve --mcp` speaks MCP over stdio in the FOREGROUND — the process a user
 //! actually sees in their process list. Unlike the per-project daemon (keyed by
-//! `.codegraph-v2/daemon.pid` under the project root) and unlike an HTTP MCP
+//! `.codegraph/daemon.pid` under the project root) and unlike an HTTP MCP
 //! server (keyed by bind addr, see [`crate::http_registry`]), a stdio process
 //! has no natural rendezvous of its own: several may serve the same project at
 //! once, and one may serve no resolvable project at all. So it is keyed by PID,

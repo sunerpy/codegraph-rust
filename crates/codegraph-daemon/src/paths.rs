@@ -144,9 +144,7 @@ mod tests {
         assert_eq!(daemon_log_path(&project).unwrap(), paths.daemon_log());
         assert_eq!(rendezvous_dir(&project).unwrap(), paths.current_root());
         assert!(
-            paths
-                .current_root()
-                .starts_with(project.join(".codegraph-v2")),
+            paths.current_root().starts_with(project.join(".codegraph")),
             "the default rendezvous dir is the v2 current root: {}",
             paths.current_root().display()
         );

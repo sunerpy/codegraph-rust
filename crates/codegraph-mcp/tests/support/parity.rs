@@ -83,11 +83,10 @@ pub fn setup_mini_project() -> TestProject {
         "cg-mcp-parity-{}-{nanos}-{seq}",
         std::process::id()
     ));
-    // Batch M: the MCP engine now opens the isolated v2 namespace.
-    fs::create_dir_all(base.join(".codegraph-v2")).unwrap();
+    fs::create_dir_all(base.join(".codegraph")).unwrap();
     copy_with_retry(
         &root.join("reference/golden/mini/colby.db"),
-        &base.join(".codegraph-v2").join("codegraph.db"),
+        &base.join(".codegraph").join("codegraph.db"),
     );
     let paths = codegraph_core::IndexPaths::resolve(&base, None).unwrap();
     codegraph_store::test_support::finalize_current_test_fixture(&paths).unwrap();

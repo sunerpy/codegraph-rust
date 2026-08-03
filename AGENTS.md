@@ -156,7 +156,7 @@ byte-stable — see "Hard invariants" above.)
 
 ## HTTP MCP server: background mode + addr-keyed registry
 
-`serve --mcp` (stdio) uses the PER-PROJECT daemon (`.codegraph-v2/daemon.pid` + socket; the whole
+`serve --mcp` (stdio) uses the PER-PROJECT daemon (`.codegraph/daemon.pid` + socket; the whole
 rendezvous is derived from `IndexPaths::current_root`). `serve --http`
 (streamable-HTTP) is different: HTTP servers are keyed by BIND ADDR — a global server (no `--path`)
 spans many projects — so they use a GLOBAL, addr-keyed registry, NOT the per-project root. The registry
@@ -183,7 +183,7 @@ the wire) under the same GLOBAL state chain as the HTTP one but with an `mcp` le
 Windows; `CODEGRAPH_MCP_REGISTRY_DIR` overrides). PID keying is forced by the transport: a stdio process
 has no addr and no per-project rendezvous, several may serve one project, and one may serve none.
 Registration fires from all THREE foreground exits in `cmd_serve` (`Direct`, `SpawnOrProxy`, and the
-too-broad-root home guard) and NEVER from `BeDaemon`, which already owns `.codegraph-v2/daemon.pid`.
+too-broad-root home guard) and NEVER from `BeDaemon`, which already owns `.codegraph/daemon.pid`.
 Reads go through `RegistryRead::{Available, Unavailable}` so a MISSING directory ("nobody registered
 yet", normal) is distinguishable from an unreadable one (an outage); `read_dir`'s `NotFound` only means
 MISSING when `fs::symlink_metadata` also fails, so a dangling symlink at the registry path reads as an
@@ -199,8 +199,8 @@ to open any indexed project's database. `codegraph mcp list [--json]` renders it
 BOTH holder diagnostics — `index`'s pre-warning and the `RemoveDatabase` FAILURE path — therefore report
 ALL live entries with no narrowing: filtering by `project` would drop the holder in the very case they
 exist for (a server launched elsewhere that a client has since pointed at this project), and the failure
-path additionally has only a DB path, which with `CODEGRAPH_DIR` set is a `<name>-v2-<projectIdentity>`
-sibling of the legacy root that can sit outside the project tree entirely. This
+path additionally has only a DB path. `CODEGRAPH_DIR` selects one validated
+project-local directory name, so the database remains inside the project tree. This
 registry is PURE OBSERVABILITY — there is no `mcp stop` and no `terminate_pid` import, because a stale
 entry's PID may have been reused and this workspace has no portable instance-identity primitive
 (`try_acquire_daemon_lock` is a `create_new` placeholder plus a recorded PID, not an OS advisory lock);

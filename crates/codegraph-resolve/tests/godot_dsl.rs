@@ -9,11 +9,11 @@
 //! `ExtResource("id")` handle → the resolved repo-relative path, via the same
 //! id-table T5 uses for `script`/property bindings).
 //!
-//! These tests write the config into the project's resolved v2 root, load it
+//! These tests write the config into the project's resolved index root, load it
 //! EXPLICITLY through [`GodotDslConfig::load_for_paths`], and drive the public
 //! [`FrameworkResolver::extract`] entry point with that config in the extraction
-//! context — exactly as the pipeline does. No legacy `.codegraph/codegraph.json`
-//! is written, because it is no longer consulted.
+//! context — exactly as the pipeline does. No process-CWD or cross-project config
+//! lookup participates in extraction.
 
 use std::path::{Path, PathBuf};
 

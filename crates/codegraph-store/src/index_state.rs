@@ -468,7 +468,7 @@ impl fmt::Display for CorruptReason {
     }
 }
 
-/// The typed classification of a v2 namespace, derived from the two fixed slots
+/// The typed classification of an index namespace, derived from the two fixed slots
 /// alone. Equivalent to the frozen plan's `ExtractionStatus`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExtractionStatus {

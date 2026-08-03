@@ -219,7 +219,7 @@ fn sync_project_once_with_scope(
 /// Loaded from the addressed project's resolved [`IndexPaths`] — its current-root
 /// `config.toml` (scan/extract options) and current-root `codegraph.json`
 /// (extension overrides + Godot DSL fields). Nothing here reads a process-global
-/// value, a legacy `.codegraph` root, or the process working directory, so a
+/// value, another project's index root, or the process working directory, so a
 /// watcher, a direct sync, and a startup catch-up on different projects inside one
 /// process each operate under their own settings.
 pub(crate) struct ProjectScope {
@@ -314,12 +314,12 @@ pub fn sync_changed_paths_with_patterns(
     let project_root = project_root.as_ref();
     let db_path = db_path.as_ref();
     let paths = index_paths(project_root)?;
-    // The caller-supplied database must BE this project's resolved v2 database.
+    // The caller-supplied database must BE this project's resolved database.
     // Accepting any other path would let a watcher mutate a namespace the state
     // gate never classified, so a mismatch fails closed.
     if db_path != paths.current_db() {
         bail!(
-            "incremental sync target {} is not the resolved v2 database {}",
+            "incremental sync target {} is not the resolved database {}",
             db_path.display(),
             paths.current_db().display()
         );
@@ -760,7 +760,7 @@ pub(crate) mod tests {
             // expectation below therefore starts from an EMPTY, published
             // `Current` namespace, built through the shipped rebuild finalizer
             // rather than by conjuring a raw database file.
-            let paths = index_paths(&path).expect("resolve the fixture v2 namespace");
+            let paths = index_paths(&path).expect("resolve the fixture index namespace");
             let deadline = Instant::now() + Duration::from_secs(30);
             codegraph_store::begin_full_rebuild(
                 &paths,
@@ -1277,34 +1277,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// A LEGACY `.codegraph/config.toml` must never influence a sync: with the
-    /// same `include` written only there, the gitignored dir stays unindexed.
-    #[test]
-    fn sync_project_once_ignores_a_legacy_project_config() {
-        let dir = TestDir::new("watch-once-legacy-config");
-        fs::write(dir.path().join(".gitignore"), "Tools/\n").unwrap();
-        fs::create_dir_all(dir.path().join(".codegraph")).unwrap();
-        fs::write(
-            dir.path().join(".codegraph/config.toml"),
-            "[app]\nname = \"legacy\"\n\n[indexing]\ninclude = [\"Tools/\"]\n",
-        )
-        .unwrap();
-        fs::create_dir_all(dir.path().join("Tools")).unwrap();
-        fs::write(
-            dir.path().join("Tools/helper.ts"),
-            "export function help() { return 2; }\n",
-        )
-        .unwrap();
-
-        let outcome = sync_project_once(dir.path()).unwrap();
-        assert!(
-            !outcome
-                .changed_paths
-                .contains(&"Tools/helper.ts".to_string()),
-            "a legacy .codegraph/config.toml must not re-include a gitignored dir: {outcome:?}"
-        );
-    }
-
     /// Two projects synced by ONE process use their OWN current-root configs:
     /// only the project whose config names `Tools/` indexes its gitignored dir.
     #[test]
@@ -1523,7 +1495,7 @@ pub(crate) mod tests {
     #[test]
     fn incremental_sync_rejects_a_database_outside_the_resolved_namespace() {
         // Given: an initialized project and a database path that is NOT its
-        // resolved v2 database.
+        // resolved database.
         let dir = TestDir::new("watch-foreign-db");
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::write(
@@ -1536,9 +1508,7 @@ pub(crate) mod tests {
         // When/Then: the sync refuses rather than mutating an unclassified file.
         let error = sync_changed_paths(dir.path(), &foreign, ["src/app.ts"]).unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("is not the resolved v2 database"),
+            error.to_string().contains("is not the resolved database"),
             "unexpected error: {error}"
         );
         assert!(

@@ -58,8 +58,7 @@ fn pipeline_project(files: &[(&str, &str)]) -> TestProject {
         fs::write(&dst, src).unwrap();
     }
 
-    // Batch M: the MCP engine reads the isolated v2 namespace (`.codegraph-v2`).
-    let mut store = Store::open(&base.join(".codegraph-v2").join("codegraph.db")).unwrap();
+    let mut store = Store::open(&base.join(".codegraph").join("codegraph.db")).unwrap();
     for (rel, src) in files {
         let metadata = fs::metadata(base.join(rel)).unwrap();
         let modified_at = metadata

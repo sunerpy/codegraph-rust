@@ -1,54 +1,38 @@
 //! Single source of truth for CodeGraph's on-disk index paths.
 //!
-//! Frozen plan `upstream-v1.5-portable-fixes.md`, Batch M ("Product boundary and
-//! selected storage layout", plan lines 236-338): `IndexPaths` is the ONE path
-//! authority shared by CLI, store, daemon, watch, and MCP. Production code must
-//! NOT reconstruct `.codegraph*` paths independently.
-//!
-//! This module implements the PATH LAYER ONLY (the first Batch M slice). It
-//! computes, for a given project and optional `CODEGRAPH_DIR` override:
+//! `IndexPaths` is the ONE path authority shared by CLI, store, daemon, watch,
+//! and MCP. Production code must NOT reconstruct `.codegraph*` paths
+//! independently. For a given project and optional `CODEGRAPH_DIR` override it
+//! computes:
 //!
 //! - the physical [`project_identity`](IndexPaths::project_identity) (full
 //!   lowercase SHA-256 of a versioned binary payload of the OS filesystem
 //!   identifiers — `st_dev`/`st_ino` on Unix, volume serial + 128-bit file id on
 //!   Windows). Unsupported filesystems fail closed; there is NO lexical-spelling
 //!   fallback;
-//! - the normalized [`legacy_roots`](IndexPaths::legacy_roots) set: the fixed
-//!   `<project>/.codegraph` root plus, when `CODEGRAPH_DIR` is set, the old CLI
-//!   root (relative-or-absolute), modeling v0.40.4's inconsistent env handling;
-//! - the isolated [`current_root`](IndexPaths::current_root) — `<project>/.codegraph-v2`
-//!   by default, or a `<name>-v2-<projectIdentity>` SIBLING of the normalized
-//!   legacy root when `CODEGRAPH_DIR` is set;
+//! - the [`current_root`](IndexPaths::current_root) — `<project>/.codegraph` by
+//!   default, or `<project>/<CODEGRAPH_DIR>` when the override is a safe single
+//!   directory name;
 //! - every current-root-owned artifact path (DB, permanent lock, the two fixed
 //!   state slots, the `uninitialized` tombstone, `config.toml`, `codegraph.json`,
 //!   and the daemon pid/log/socket identities).
 //!
-//! Path identity is PHYSICAL, not lexical: the project and each existing legacy
-//! root are canonicalized; a not-yet-created root canonicalizes its nearest
+//! Path identity is PHYSICAL, not lexical: the project and existing index root
+//! are canonicalized; a not-yet-created root canonicalizes its nearest
 //! existing ancestor and appends the normalized remainder. Empty/root/dot/parent
 //! aliases, symlink (or Windows reparse-point) components below the canonical
-//! ancestor, equality with any legacy identity, and any ancestor/descendant
-//! overlap with a legacy identity all fail closed with typed, stable diagnostics.
-//!
-//! This slice provides the path VALUES only; the state-slot / lease / Store open
-//! protocol that CONSUMES the state-slot, tombstone, and lock paths lands in a
-//! later Batch M task.
+//! ancestor, absolute overrides, and overrides containing path separators all
+//! fail closed with typed, stable diagnostics.
 
 use std::path::{Component, Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-/// Default current-root directory name (no `CODEGRAPH_DIR`): a sibling of the
-/// fixed legacy `.codegraph` root. This is the ONE place the `.codegraph-v2`
-/// literal is defined; every production consumer derives its default root from
-/// [`IndexPaths::resolve`].
-pub const DEFAULT_CURRENT_DIR: &str = ".codegraph-v2";
-/// Fixed legacy root directory name used by old daemon/watch/MCP paths.
-pub const LEGACY_DIR: &str = ".codegraph";
-/// Infix inserted into a configured legacy root's final component to form the
-/// sibling current root (`<name>-v2-<projectIdentity>`).
-const CONFIGURED_SUFFIX_INFIX: &str = "-v2-";
+/// Default per-project index-root directory name. This is the ONE place the
+/// `.codegraph` literal is defined; every production consumer derives its root
+/// from [`IndexPaths::resolve`].
+pub const DEFAULT_CURRENT_DIR: &str = ".codegraph";
 
 /// Version byte of the binary payload hashed into the project identity. Bump
 /// only with a deliberate, reviewed identity-format change.
@@ -100,41 +84,28 @@ pub enum IndexPathsError {
          reparse point below its canonical ancestor"
     )]
     SymlinkComponent { path: PathBuf },
-
-    /// The derived current root equals, contains, or is contained by a legacy
-    /// root. The current namespace must be fully disjoint from every legacy one.
-    #[error(
-        "refusing current index root {current}: it overlaps the legacy root \
-         {legacy} ({reason})"
-    )]
-    LegacyOverlap {
-        current: PathBuf,
-        legacy: PathBuf,
-        reason: String,
-    },
 }
 
 /// The resolved, physical, fail-closed set of index paths for one project.
 ///
 /// Construct via [`IndexPaths::resolve`]. Every artifact path is derived from a
 /// single validated [`current_root`](IndexPaths::current_root); callers consume
-/// these accessors instead of rebuilding `.codegraph-v2` strings.
+/// these accessors instead of rebuilding `.codegraph` strings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexPaths {
     project: PathBuf,
     project_identity: String,
-    legacy_roots: Vec<PathBuf>,
     current_root: PathBuf,
 }
 
 impl IndexPaths {
     /// Resolve the physical index paths for `project`, honoring an optional
-    /// `CODEGRAPH_DIR` override (relative or absolute). Production callers pass
+    /// `CODEGRAPH_DIR` override (one project-local directory name). Production callers pass
     /// `std::env::var("CODEGRAPH_DIR").ok().as_deref()`.
     ///
     /// `project` MUST exist (it is canonicalized to derive the physical
-    /// identity). Fails closed on unsafe roots, symlink aliases, overlap with a
-    /// legacy root, and unsupported filesystems.
+    /// identity). Fails closed on unsafe names, symlink aliases, and unsupported
+    /// filesystems.
     pub fn resolve(project: &Path, codegraph_dir: Option<&str>) -> Result<Self, IndexPathsError> {
         let project =
             project
@@ -146,82 +117,32 @@ impl IndexPaths {
 
         let project_identity = physical_identity(&project)?;
 
-        // Legacy root #1: the fixed `<project>/.codegraph` (old daemon/watch/MCP).
-        let legacy_fixed = physical_normalize(&project, &project.join(LEGACY_DIR))?;
-        let mut legacy_roots = vec![legacy_fixed];
-
-        // Legacy root #2 + configured current root: only when CODEGRAPH_DIR is set.
-        let configured = codegraph_dir.filter(|value| !value.is_empty());
-        let current_root = if let Some(value) = configured {
-            let raw = Path::new(value);
-            let cli_root = if raw.is_absolute() {
-                raw.to_path_buf()
-            } else {
-                project.join(raw)
-            };
-            let cli_root = lexical_normalize(&cli_root);
-            reject_project_alias(&project, &cli_root, value)?;
-            let cli_root = physical_normalize(&project, &cli_root)?;
-
-            // Sibling `<name>-v2-<projectIdentity>`, never a child.
-            let parent = cli_root
-                .parent()
-                .ok_or_else(|| IndexPathsError::RootAlias {
-                    path: cli_root.clone(),
-                    reason: "configured legacy root has no parent directory".to_string(),
-                })?;
-            let name = cli_root
-                .file_name()
-                .ok_or_else(|| IndexPathsError::RootAlias {
-                    path: cli_root.clone(),
-                    reason: "configured legacy root has no final component".to_string(),
-                })?
-                .to_string_lossy()
-                .into_owned();
-            let sibling_name = format!("{name}{CONFIGURED_SUFFIX_INFIX}{project_identity}");
-            let current = parent.join(sibling_name);
-
-            if !legacy_roots.contains(&cli_root) {
-                legacy_roots.push(cli_root);
-            }
-            physical_normalize(&project, &current)?
-        } else {
-            physical_normalize(&project, &project.join(DEFAULT_CURRENT_DIR))?
-        };
-
-        // Fail closed on any equality or ancestor/descendant overlap with a
-        // legacy identity: the current namespace must be fully disjoint.
-        for legacy in &legacy_roots {
-            if let Some(reason) = overlap_reason(&current_root, legacy) {
-                return Err(IndexPathsError::LegacyOverlap {
-                    current: current_root.clone(),
-                    legacy: legacy.clone(),
-                    reason: reason.to_string(),
-                });
-            }
-        }
+        let directory_name = configured_directory_name(codegraph_dir)?;
+        let candidate = lexical_normalize(&project.join(directory_name));
+        reject_project_alias(&project, &candidate, directory_name)?;
+        let current_root = physical_normalize(&project, &candidate)?;
 
         Ok(Self {
             project,
             project_identity,
-            legacy_roots,
             current_root,
         })
     }
 
     /// The EXACT resolved physical index-root PATHS the scanner/watcher must
-    /// exclude before descending: every fixed/configured legacy root plus the
-    /// current root, as full normalized paths (not basenames). The scanner
+    /// exclude before descending: the default root plus the resolved current
+    /// root, as full normalized paths (not basenames). The scanner
     /// compares each candidate directory path against this set, so a nested
     /// configured root such as `<project>/cache/index` is excluded at its true
     /// depth while an unrelated directory that merely shares a basename is not.
     ///
     /// In-project roots are re-anchored onto the caller's `project` spelling
     /// (`resolve` canonicalizes) so scanner candidates compare directly; roots
-    /// outside the project keep their absolute form. Always includes the fixed
-    /// `<project>/.codegraph`. On a `resolve` failure it degrades to just the two
-    /// safe default paths (fixed `.codegraph` and the default `.codegraph-v2`)
-    /// rather than reconstructing a configured-root path; the fail-closed DB
+    /// outside the project keep their absolute form. Always includes
+    /// `<project>/.codegraph`, even when an override is active, so an index from
+    /// another environment is never scanned as source. On a `resolve` failure it
+    /// degrades to that safe default path rather than reconstructing an invalid
+    /// configured-root path; the fail-closed DB
     /// contract is enforced separately at the CLI/MCP/watch boundary by
     /// [`IndexPaths::resolve`].
     pub fn reserved_index_roots(
@@ -238,14 +159,10 @@ impl IndexPaths {
                         Err(_) => root.to_path_buf(),
                     }
                 };
-                roots.insert(project.join(LEGACY_DIR));
-                for legacy in paths.legacy_roots() {
-                    roots.insert(reanchor(legacy));
-                }
+                roots.insert(project.join(DEFAULT_CURRENT_DIR));
                 roots.insert(reanchor(paths.current_root()));
             }
             Err(_) => {
-                roots.insert(project.join(LEGACY_DIR));
                 roots.insert(project.join(DEFAULT_CURRENT_DIR));
             }
         }
@@ -258,21 +175,13 @@ impl IndexPaths {
     }
 
     /// Full lowercase SHA-256 (64 hex chars) of the versioned physical-identity
-    /// payload. Same value seeds state ownership and configured-root suffixes.
+    /// payload. The value seeds state ownership.
     pub fn project_identity(&self) -> &str {
         &self.project_identity
     }
 
-    /// The normalized legacy-root set: the fixed `<project>/.codegraph` plus,
-    /// when `CODEGRAPH_DIR` is set, the old CLI root. New binaries never open,
-    /// migrate, or write these.
-    pub fn legacy_roots(&self) -> &[PathBuf] {
-        &self.legacy_roots
-    }
-
-    /// The isolated current index root (`.codegraph-v2` by default; a
-    /// `<name>-v2-<projectIdentity>` sibling of the configured legacy root when
-    /// `CODEGRAPH_DIR` is set).
+    /// The current index root (`<project>/.codegraph` by default, or the safe
+    /// project-local `CODEGRAPH_DIR` override).
     pub fn current_root(&self) -> &Path {
         &self.current_root
     }
@@ -323,9 +232,8 @@ impl IndexPaths {
     }
 
     /// `<current_root>/daemon.sock` — the in-root daemon socket identity. (The
-    /// POSIX tmp-socket fallback and Windows namespaced-pipe forms, which carry
-    /// the v2 protocol discriminator, are owned by the daemon lifecycle layer in
-    /// a later slice.)
+    /// POSIX tmp-socket fallback and Windows namespaced-pipe forms are owned by
+    /// the daemon lifecycle layer.)
     pub fn daemon_socket(&self) -> PathBuf {
         self.current_root.join("daemon.sock")
     }
@@ -351,8 +259,34 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     out
 }
 
-/// Reject a configured legacy root that aliases the project itself, an ancestor
-/// of the project, or the filesystem root — the `.`/`..`/root alias cases.
+fn configured_directory_name(codegraph_dir: Option<&str>) -> Result<&str, IndexPathsError> {
+    let Some(raw_value) = codegraph_dir else {
+        return Ok(DEFAULT_CURRENT_DIR);
+    };
+    let value = raw_value.trim();
+    let invalid = value.is_empty()
+        || value == "."
+        || value.contains("..")
+        || value.contains('/')
+        || value.contains('\\')
+        || Path::new(value).is_absolute()
+        || !matches!(
+            Path::new(value).components().collect::<Vec<_>>().as_slice(),
+            [Component::Normal(_)]
+        );
+    if invalid {
+        return Err(IndexPathsError::RootAlias {
+            path: PathBuf::from(raw_value),
+            reason: format!(
+                "CODEGRAPH_DIR={raw_value:?} must be one non-empty project-local directory name"
+            ),
+        });
+    }
+    Ok(value)
+}
+
+/// Reject a configured root that aliases the project itself, an ancestor of the
+/// project, or the filesystem root — the `.`/`..`/root alias cases.
 fn reject_project_alias(
     project: &Path,
     cli_root: &Path,
@@ -472,20 +406,6 @@ fn physical_normalize(project: &Path, target: &Path) -> Result<PathBuf, IndexPat
         .strip_prefix(&existing)
         .expect("existing is an ancestor of target");
     Ok(base.join(remainder))
-}
-
-/// If `current` and `legacy` overlap (equal, or one contains the other), return
-/// a stable reason string; otherwise `None`.
-fn overlap_reason(current: &Path, legacy: &Path) -> Option<&'static str> {
-    if current == legacy {
-        Some("equal paths")
-    } else if current.starts_with(legacy) {
-        Some("current root is inside the legacy root")
-    } else if legacy.starts_with(current) {
-        Some("legacy root is inside the current root")
-    } else {
-        None
-    }
 }
 
 /// Compute the full lowercase SHA-256 of the versioned physical-identity payload
@@ -682,18 +602,15 @@ mod tests {
     }
 
     #[test]
-    fn default_current_root_is_sibling_codegraph_v2() {
+    fn default_current_root_is_codegraph() {
         let project = temp_dir("default");
         let paths = IndexPaths::resolve(&project, None).expect("resolve default");
 
-        assert_eq!(paths.current_root(), project.join(".codegraph-v2"));
-        assert_eq!(paths.legacy_roots(), [project.join(".codegraph")]);
+        assert_eq!(paths.current_root(), project.join(".codegraph"));
         assert_eq!(
             paths.current_db(),
-            project.join(".codegraph-v2").join("codegraph.db")
+            project.join(".codegraph").join("codegraph.db")
         );
-        // The default current root is a SIBLING of the legacy root, never a child.
-        assert!(!paths.current_root().starts_with(project.join(".codegraph")));
 
         let _ = std::fs::remove_dir_all(&project);
     }
@@ -702,7 +619,7 @@ mod tests {
     fn every_derived_artifact_lives_under_current_root() {
         let project = temp_dir("artifacts");
         let paths = IndexPaths::resolve(&project, None).expect("resolve");
-        let root = project.join(".codegraph-v2");
+        let root = project.join(".codegraph");
 
         assert_eq!(paths.current_root(), root);
         assert_eq!(paths.current_db(), root.join("codegraph.db"));
@@ -745,92 +662,63 @@ mod tests {
     }
 
     #[test]
-    fn relative_codegraph_dir_current_root_is_sibling_with_identity_suffix() {
+    fn codegraph_dir_is_plain_project_local_root() {
         let project = temp_dir("rel-dir");
-        let paths = IndexPaths::resolve(&project, Some("cache")).expect("resolve relative");
+        let paths =
+            IndexPaths::resolve(&project, Some(".codegraph-win")).expect("resolve override");
 
-        // Legacy roots: the fixed `.codegraph` plus the configured relative root.
+        assert_eq!(paths.current_root(), project.join(".codegraph-win"));
         assert_eq!(
-            paths.legacy_roots(),
-            [project.join(".codegraph"), project.join("cache")]
+            paths.current_db(),
+            project.join(".codegraph-win").join("codegraph.db")
         );
-        // Current root is the SIBLING `cache-v2-<identity>`, not a child.
-        let expected = project.join(format!("cache-v2-{}", paths.project_identity()));
-        assert_eq!(paths.current_root(), expected);
-        assert!(!paths.current_root().starts_with(project.join("cache")));
 
         let _ = std::fs::remove_dir_all(&project);
     }
 
     #[test]
-    fn absolute_codegraph_dir_current_root_is_sibling_of_configured_root() {
+    fn absolute_codegraph_dir_is_rejected() {
         let project = temp_dir("abs-proj");
         let cache = temp_dir("abs-cache");
         let configured = cache.join("cg");
-        let paths = IndexPaths::resolve(&project, Some(configured.to_str().unwrap()))
-            .expect("resolve absolute");
-
+        let error = IndexPaths::resolve(&project, Some(configured.to_str().unwrap()))
+            .expect_err("absolute override must fail closed");
         assert!(
-            paths.legacy_roots().contains(&configured),
-            "configured absolute root is a legacy root: {:?}",
-            paths.legacy_roots()
+            matches!(error, IndexPathsError::RootAlias { .. }),
+            "{error:?}"
         );
-        // Sibling `<name>-v2-<identity>` next to the configured root.
-        let expected = cache.join(format!("cg-v2-{}", paths.project_identity()));
-        assert_eq!(paths.current_root(), expected);
-        assert!(!paths.current_root().starts_with(&configured));
 
         let _ = std::fs::remove_dir_all(&project);
         let _ = std::fs::remove_dir_all(&cache);
     }
 
     #[test]
-    fn two_projects_do_not_collide_on_a_shared_configured_root() {
-        // Two DISTINCT physical projects given the SAME configured root must
-        // receive DISTINCT current roots (identity-suffixed), so one cannot open
-        // the other's state.
+    fn configured_directory_name_stays_local_to_each_project() {
         let project_a = temp_dir("collide-a");
         let project_b = temp_dir("collide-b");
-        let shared = temp_dir("collide-shared");
-        let configured = shared.join("cg");
 
-        let a = IndexPaths::resolve(&project_a, Some(configured.to_str().unwrap())).expect("a");
-        let b = IndexPaths::resolve(&project_b, Some(configured.to_str().unwrap())).expect("b");
+        let a = IndexPaths::resolve(&project_a, Some("cache")).expect("a");
+        let b = IndexPaths::resolve(&project_b, Some("cache")).expect("b");
 
-        assert_ne!(
-            a.project_identity(),
-            b.project_identity(),
-            "distinct physical projects have distinct identities"
-        );
-        assert_ne!(
-            a.current_root(),
-            b.current_root(),
-            "shared configured root must not collapse two projects onto one current root"
-        );
+        assert_eq!(a.current_root(), project_a.join("cache"));
+        assert_eq!(b.current_root(), project_b.join("cache"));
+        assert_ne!(a.current_root(), b.current_root());
 
         let _ = std::fs::remove_dir_all(&project_a);
         let _ = std::fs::remove_dir_all(&project_b);
-        let _ = std::fs::remove_dir_all(&shared);
     }
 
     #[test]
-    fn two_projects_do_not_collide_on_an_escaping_relative_root() {
-        // A relative CODEGRAPH_DIR that escapes to a shared external directory
-        // must still yield distinct, identity-suffixed current roots.
+    fn path_separators_and_parent_traversal_are_rejected() {
         let base = temp_dir("escape-base");
-        let project_a = base.join("a");
-        let project_b = base.join("b");
-        std::fs::create_dir_all(&project_a).unwrap();
-        std::fs::create_dir_all(&project_b).unwrap();
-        std::fs::create_dir_all(base.join("shared")).unwrap();
-
-        let a = IndexPaths::resolve(&project_a, Some("../shared/cg")).expect("a");
-        let b = IndexPaths::resolve(&project_b, Some("../shared/cg")).expect("b");
-
-        // Both configured roots normalize to the SAME external path…
-        assert_eq!(a.legacy_roots()[1], b.legacy_roots()[1]);
-        // …yet the current roots differ by physical identity.
-        assert_ne!(a.current_root(), b.current_root());
+        for invalid in ["../shared", "cache/index", "cache\\index", "name..other"] {
+            let error = IndexPaths::resolve(&base, Some(invalid))
+                .expect_err("non-plain override must fail closed");
+            assert!(
+                matches!(error, IndexPathsError::RootAlias { .. }),
+                "{invalid}: {error:?}"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -868,12 +756,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_codegraph_dir_is_treated_as_unset_default() {
+    fn empty_codegraph_dir_is_rejected() {
         let project = temp_dir("empty-dir");
-        // An empty override string is ignored (treated as unset), matching the
-        // shell semantics where an empty env value is a no-op override.
-        let paths = IndexPaths::resolve(&project, Some("")).expect("empty resolves to default");
-        assert_eq!(paths.current_root(), project.join(".codegraph-v2"));
+        let error = IndexPaths::resolve(&project, Some(""))
+            .expect_err("an explicitly empty override must fail closed");
+        assert!(
+            matches!(error, IndexPathsError::RootAlias { .. }),
+            "{error:?}"
+        );
         let _ = std::fs::remove_dir_all(&project);
     }
 
@@ -888,9 +778,7 @@ mod tests {
         let link = project.join("link");
         symlink(&real, &link).unwrap();
 
-        // A configured root that descends THROUGH a symlink component below the
-        // project must fail closed rather than follow the link.
-        let err = IndexPaths::resolve(&project, Some("link/cg"))
+        let err = IndexPaths::resolve(&project, Some("link"))
             .expect_err("symlink component must fail closed");
         assert!(
             matches!(err, IndexPathsError::SymlinkComponent { .. }),
@@ -902,22 +790,17 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn rejects_in_project_root_reached_through_intermediate_symlink() {
+    fn rejects_configured_root_symlink_with_hidden_name() {
         use std::os::unix::fs::symlink;
 
-        // In-project spelling of the intermediate-alias case: `<project>/link`
-        // is a symlink to `<project>/real`, so `<project>/link/child` EXISTS as
-        // an ordinary directory reached THROUGH the alias. A relative
-        // `CODEGRAPH_DIR=link/child/cg` must fail closed on the `link` component
-        // even though the nearest existing ancestor (`.../child`) is ordinary.
         let project = temp_dir("symlink-inproj-mid");
         let real = project.join("real");
-        std::fs::create_dir_all(real.join("child")).unwrap();
-        let link = project.join("link");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = project.join(".codegraph-win");
         symlink(&real, &link).unwrap();
 
-        let err = IndexPaths::resolve(&project, Some("link/child/cg"))
-            .expect_err("in-project intermediate symlink must fail closed");
+        let err = IndexPaths::resolve(&project, Some(".codegraph-win"))
+            .expect_err("configured symlink must fail closed");
         assert!(
             matches!(err, IndexPathsError::SymlinkComponent { .. }),
             "{err:?}"
@@ -928,83 +811,22 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn rejects_symlinked_absolute_configured_root() {
+    fn rejects_symlinked_default_root() {
         use std::os::unix::fs::symlink;
 
         let project = temp_dir("symlink-abs-proj");
-        let cache = temp_dir("symlink-abs-cache");
-        let real = cache.join("real");
+        let real = project.join("real");
         std::fs::create_dir_all(&real).unwrap();
-        let link = cache.join("link");
+        let link = project.join(DEFAULT_CURRENT_DIR);
         symlink(&real, &link).unwrap();
 
-        // An absolute configured root that IS a symlink must fail closed.
-        let err = IndexPaths::resolve(&project, Some(link.to_str().unwrap()))
-            .expect_err("symlinked absolute root must fail closed");
+        let err = IndexPaths::resolve(&project, None)
+            .expect_err("symlinked default root must fail closed");
         assert!(
             matches!(err, IndexPathsError::SymlinkComponent { .. }),
             "{err:?}"
         );
 
-        let _ = std::fs::remove_dir_all(&project);
-        let _ = std::fs::remove_dir_all(&cache);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn rejects_external_configured_root_reached_through_intermediate_symlink() {
-        use std::os::unix::fs::symlink;
-
-        // `<cache>/link` is a symlink to `<cache>/real`; `<cache>/link/child`
-        // therefore EXISTS as an ordinary directory reached through the alias.
-        // An absolute CODEGRAPH_DIR of `<cache>/link/child/cg` must fail closed
-        // even though its nearest existing ancestor (`.../child`) is itself an
-        // ordinary directory — the intermediate `link` component is the alias.
-        let project = temp_dir("symlink-mid-proj");
-        let cache = temp_dir("symlink-mid-cache");
-        let real = cache.join("real");
-        std::fs::create_dir_all(real.join("child")).unwrap();
-        let link = cache.join("link");
-        symlink(&real, &link).unwrap();
-
-        let configured = link.join("child").join("cg");
-        let err = IndexPaths::resolve(&project, Some(configured.to_str().unwrap()))
-            .expect_err("intermediate symlink component must fail closed");
-        assert!(
-            matches!(err, IndexPathsError::SymlinkComponent { .. }),
-            "{err:?}"
-        );
-
-        let _ = std::fs::remove_dir_all(&project);
-        let _ = std::fs::remove_dir_all(&cache);
-    }
-
-    #[test]
-    fn rejects_current_root_overlapping_legacy_root() {
-        // A configured root whose derived sibling would nest under the fixed
-        // legacy `.codegraph` root must fail closed. Point CODEGRAPH_DIR at a
-        // child of `.codegraph`; the sibling `<name>-v2-<id>` then still lives
-        // inside `.codegraph`, overlapping the fixed legacy root.
-        let project = temp_dir("overlap");
-        std::fs::create_dir_all(project.join(".codegraph")).unwrap();
-        let err = IndexPaths::resolve(&project, Some(".codegraph/inner"))
-            .expect_err("overlap with legacy root must fail closed");
-        assert!(
-            matches!(err, IndexPathsError::LegacyOverlap { .. }),
-            "{err:?}"
-        );
-        let _ = std::fs::remove_dir_all(&project);
-    }
-
-    #[test]
-    fn current_root_never_equals_a_legacy_root() {
-        let project = temp_dir("disjoint");
-        let paths = IndexPaths::resolve(&project, Some("cache")).expect("resolve");
-        for legacy in paths.legacy_roots() {
-            assert_ne!(paths.current_root(), legacy);
-            assert!(!paths.current_root().starts_with(legacy));
-            assert!(!legacy.starts_with(paths.current_root()));
-        }
         let _ = std::fs::remove_dir_all(&project);
     }
 
@@ -1018,11 +840,10 @@ mod tests {
     }
 
     #[test]
-    fn reserved_roots_default_are_exactly_legacy_and_v2_paths() {
+    fn reserved_roots_default_contains_only_codegraph_path() {
         let project = temp_dir("reserved-default");
         let roots = IndexPaths::reserved_index_roots(&project, None);
-        assert!(roots.contains(&project.join(".codegraph")));
-        assert!(roots.contains(&project.join(".codegraph-v2")));
+        assert_eq!(roots, [project.join(".codegraph")].into_iter().collect());
         // A user source directory sharing the `.codegraph-` prefix is NOT a
         // reserved root and must remain scannable.
         assert!(!roots.contains(&project.join(".codegraph-sources")));
@@ -1030,46 +851,23 @@ mod tests {
     }
 
     #[test]
-    fn reserved_roots_include_relative_configured_sibling_as_full_path() {
+    fn reserved_roots_include_default_and_configured_paths() {
         let project = temp_dir("reserved-configured");
         let roots = IndexPaths::reserved_index_roots(&project, Some("cache"));
-        let identity = IndexPaths::resolve(&project, Some("cache"))
-            .unwrap()
-            .project_identity()
-            .to_string();
         assert!(roots.contains(&project.join(".codegraph")), "{roots:?}");
         assert!(
             roots.contains(&project.join("cache")),
-            "configured legacy root: {roots:?}"
+            "configured current root: {roots:?}"
         );
-        assert!(
-            roots.contains(&project.join(format!("cache-v2-{identity}"))),
-            "configured current sibling: {roots:?}"
-        );
+        assert_eq!(roots.len(), 2);
         let _ = std::fs::remove_dir_all(&project);
     }
 
     #[test]
-    fn reserved_roots_include_nested_configured_roots_at_true_depth() {
-        // A nested `CODEGRAPH_DIR=cache/index` puts the legacy root at
-        // `<project>/cache/index` and the current root at
-        // `<project>/cache/index-v2-<identity>`; both must be reserved as their
-        // full nested paths, so the scanner prunes them at depth rather than
-        // descending into and indexing the index's own storage.
+    fn reserved_roots_degrade_to_default_on_nested_configured_root() {
         let project = temp_dir("reserved-nested");
         let roots = IndexPaths::reserved_index_roots(&project, Some("cache/index"));
-        let identity = IndexPaths::resolve(&project, Some("cache/index"))
-            .unwrap()
-            .project_identity()
-            .to_string();
-        assert!(
-            roots.contains(&project.join("cache").join("index")),
-            "nested configured legacy root: {roots:?}"
-        );
-        assert!(
-            roots.contains(&project.join("cache").join(format!("index-v2-{identity}"))),
-            "nested configured current sibling: {roots:?}"
-        );
+        assert_eq!(roots, [project.join(".codegraph")].into_iter().collect());
         let _ = std::fs::remove_dir_all(&project);
     }
 
@@ -1079,8 +877,7 @@ mod tests {
         // `.` resolves to the project root itself — an invalid alias. Root
         // derivation degrades to the safe default paths, never errors.
         let roots = IndexPaths::reserved_index_roots(&project, Some("."));
-        assert!(roots.contains(&project.join(".codegraph")));
-        assert!(roots.contains(&project.join(".codegraph-v2")));
+        assert_eq!(roots, [project.join(".codegraph")].into_iter().collect());
         let _ = std::fs::remove_dir_all(&project);
     }
 }

@@ -204,7 +204,7 @@ fn status_json_flags_partial_only_when_marker_set() {
     let (out, err, ok) = cli(&["init", p]);
     assert!(ok, "init failed: stdout={out} stderr={err}");
 
-    let db = project.join(".codegraph-v2").join("codegraph.db");
+    let db = project.join(".codegraph").join("codegraph.db");
     {
         let store = Store::open(&db).unwrap();
         store.set_resolution_incomplete().unwrap();

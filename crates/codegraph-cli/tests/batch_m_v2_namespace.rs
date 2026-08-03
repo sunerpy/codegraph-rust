@@ -1,28 +1,15 @@
-//! Batch M — initial black-box Red for the isolated v2 index namespace.
-//!
-//! Frozen plan `upstream-v1.5-portable-fixes.md` (Batch M, "Product boundary and
-//! selected storage layout", plan line ~262) makes an explicit product-level
-//! compatibility break: the default *current* index root is
-//! `project/.codegraph-v2`, a **sibling** of the fixed legacy `project/.codegraph`
-//! root, and new binaries never open, migrate, or write the legacy namespace
-//! (plan lines 288-291). Acceptance for the Red boundary (plan lines 805-817)
-//! requires black-box evidence that current v0.40.4 behavior "opens/writes the
-//! fixed legacy `.codegraph` namespace instead of an isolated `.codegraph-v2`
-//! namespace".
-//!
-//! This is the INITIAL black-box Red described at plan lines 805-809: it uses
-//! ONLY the shipped public CLI surface (`codegraph init`) and filesystem
-//! artifacts. It imports no proposed Green type (`IndexPaths`, `IndexLease`,
-//! `open_for_*`) — those are Green design, not compile-time Red prerequisites.
-//! It is NOT the later API-level refinement of the store/lease/path modes.
-//!
 //! Isolation mirrors `cli_commands.rs`: a private temp project plus an isolated
 //! `CODEGRAPH_HTTP_REGISTRY_DIR`, and `CODEGRAPH_NO_DAEMON=1` so no daemon
 //! rendezvous state leaks. The default `init` target is `none`, so no agent
 //! config is written.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use codegraph_core::IndexPaths;
+use codegraph_store::{ExtractionStatus, Store};
+use serde_json::Value;
 
 fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_codegraph"))
@@ -109,31 +96,35 @@ fn run_in_env(registry_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Run 
     }
 }
 
-fn indexed_names(project: &Path) -> Vec<String> {
-    std::fs::read_dir(project)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect()
+fn stage_foreign_database(paths: &IndexPaths) {
+    let foreign = Store::open(&paths.current_db()).expect("create a real foreign SQLite index");
+    foreign
+        .set_project_metadata("foreign_fixture", "must be replaced")
+        .expect("write a foreign-only marker");
+    foreign
+        .restore_default_pragmas()
+        .expect("checkpoint foreign DB");
+    drop(foreign);
+
+    assert_eq!(
+        Store::extraction_status(paths),
+        ExtractionStatus::Missing,
+        "a real pre-state-slot database must classify Missing"
+    );
+    assert!(paths.current_db().is_file(), "foreign SQLite DB exists");
+    assert!(
+        paths.state_slots().iter().all(|slot| !slot.exists()),
+        "foreign fixture must have no state slots"
+    );
 }
 
-/// Initial Batch M black-box Red: `init` must build the index in the isolated
-/// sibling `.codegraph-v2` namespace, never the fixed legacy `.codegraph` one.
-///
-/// Expected Red on the v0.40.4 base: `init` writes `.codegraph/codegraph.db`
-/// (the fixed legacy root) and never creates `.codegraph-v2`, so the named
-/// v2-namespace assertion fails behaviorally. The setup (`init` succeeds) and
-/// the byte snapshot below both reach the assertion, so this is a behavioral —
-/// not a compile/setup/panic — failure. The snapshot preserves the built DB
-/// bytes that later Green will assert remain a byte-usable legacy graph.
 #[test]
-fn init_writes_isolated_v2_namespace_not_legacy_codegraph() {
-    let dir = TestDir::new("v2-namespace");
+fn init_writes_default_project_local_codegraph_root() {
+    let dir = TestDir::new("default-root");
     let project = dir.path().join("mini");
     copy_tree(&mini_fixture(), &project);
     let p = project.to_str().unwrap();
 
-    // Public shipped surface only.
     let run = run_in(dir.path(), &["init", p]);
     assert!(
         run.ok,
@@ -142,59 +133,231 @@ fn init_writes_isolated_v2_namespace_not_legacy_codegraph() {
         run.stdout, run.stderr
     );
 
-    let legacy_root = project.join(".codegraph");
-    let legacy_db = legacy_root.join("codegraph.db");
-    let v2_root = project.join(".codegraph-v2");
-    let v2_db = v2_root.join("codegraph.db");
-
-    // Byte snapshot of the DB the build actually produced (whichever namespace
-    // it landed in). Later Green preserves this as the byte-usable legacy graph;
-    // recording it here proves the build produced a non-empty DB and that the
-    // failure below is a namespace-placement failure, not an empty/failed build.
-    let built_db = if v2_db.is_file() {
-        v2_db.clone()
-    } else {
-        legacy_db.clone()
-    };
-    let built_bytes = std::fs::read(&built_db).unwrap_or_default();
+    let selected_db = project.join(".codegraph/codegraph.db");
+    let retired_db = project.join(".codegraph-v2/codegraph.db");
+    let built_bytes = std::fs::read(&selected_db).unwrap_or_default();
     assert!(
         !built_bytes.is_empty(),
-        "setup: `init` must produce a non-empty index DB (checked {}); \
-         got legacy_db.is_file()={}, v2_db.is_file()={}",
-        built_db.display(),
-        legacy_db.is_file(),
-        v2_db.is_file()
+        "`init` must produce a non-empty index DB at {}",
+        selected_db.display()
     );
-
-    // PRIMARY behavioral Red assertion (plan line 262 + lines 805-817): the DB
-    // must live in the isolated sibling v2 namespace, not the legacy root.
     assert!(
-        v2_db.is_file(),
-        "Batch M: `init` must create the isolated v2 namespace at {} \
-         (a sibling of the legacy root, per plan line 262), but no v2 DB exists; \
-         current v0.40.4 behavior wrote the legacy namespace instead \
-         (.codegraph/codegraph.db present={})",
-        v2_db.display(),
-        legacy_db.is_file()
-    );
-
-    // Secondary behavioral Red assertion (plan lines 288-291): new binaries must
-    // never write the fixed legacy namespace. Reached only once the v2 assertion
-    // passes at Green; both are Green-stable (legacy root absent post-Green).
-    assert!(
-        !legacy_db.is_file(),
-        "Batch M: a new binary must not write the legacy namespace at {}; \
-         the fixed legacy `.codegraph` root is read-only to new binaries",
-        legacy_db.display()
+        !retired_db.exists(),
+        "`init` must not recreate the retired namespace at {}",
+        retired_db.display()
     );
 }
 
-/// The v2 current root for a relative `CODEGRAPH_DIR` must be the fail-closed
-/// `IndexPaths::resolve` identity-suffixed SIBLING `<name>-v2-<projectIdentity>`
-/// through the REAL CLI, never the old `<project>/<value>` simple-join. Proven
-/// by `status --json`'s `indexPath` and the on-disk DB placement after `init`.
+/// A real pre-state-slot SQLite index in the selected root is a rebuildable
+/// foreign cache, not an unrecoverable contradiction. `init` must acquire its
+/// one rebuild lease, replace that database automatically, and explain the
+/// one-time replacement at INFO level.
 #[test]
-fn configured_relative_root_uses_identity_suffixed_sibling_via_cli() {
+fn init_takes_over_real_sqlite_database_without_state_slots() {
+    let dir = TestDir::new("foreign-db-takeover");
+    let project = dir.path().join("mini");
+    copy_tree(&mini_fixture(), &project);
+    let paths = IndexPaths::resolve(&project, None).expect("resolve selected index root");
+
+    stage_foreign_database(&paths);
+
+    let run = run_in(dir.path(), &["init", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "init must automatically replace a Missing-state SQLite index: stdout={} stderr={}",
+        run.stdout, run.stderr
+    );
+    assert!(
+        run.stderr.contains("replaced stale foreign index database")
+            && run
+                .stderr
+                .contains(&paths.current_db().display().to_string())
+            && run.stderr.contains("missing state slots"),
+        "INFO log must name the replaced DB and the Missing-state reason: stderr={}",
+        run.stderr
+    );
+
+    assert_eq!(Store::extraction_status(&paths), ExtractionStatus::Current);
+    let rebuilt = Store::open_for_read(
+        &paths,
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+        || false,
+    )
+    .expect("taken-over index is readable");
+    assert_eq!(
+        rebuilt
+            .get_project_metadata("foreign_fixture")
+            .expect("query foreign-only marker"),
+        None,
+        "takeover must rebuild instead of adopting foreign rows"
+    );
+}
+
+#[test]
+fn status_json_reports_foreign_database_without_opening_or_mutating_it() {
+    let dir = TestDir::new("foreign-db-status-json");
+    let project = dir.path().join("mini");
+    copy_tree(&mini_fixture(), &project);
+    let paths = IndexPaths::resolve(&project, None).expect("resolve selected index root");
+    stage_foreign_database(&paths);
+    let before = tree_snapshot(&project);
+
+    let run = run_in(dir.path(), &["status", "--json", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "status --json must degrade instead of failing: stdout={} stderr={}",
+        run.stdout, run.stderr
+    );
+    let status: Value = serde_json::from_str(run.stdout.trim()).expect("valid status JSON");
+    let actual_keys = status
+        .as_object()
+        .expect("status JSON object")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let expected_keys = [
+        "daemonLogPath",
+        "daemonPidPath",
+        "daemonRunning",
+        "daemonSocketPath",
+        "dbExists",
+        "dbPath",
+        "dbSizeBytes",
+        "extractionStatus",
+        "extractionStatusDetail",
+        "indexPath",
+        "initialized",
+        "lastIndexed",
+        "legacyIndexPaths",
+        "legacyIndexPresent",
+        "projectPath",
+        "version",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    assert_eq!(actual_keys, expected_keys, "degraded status key set");
+    assert_eq!(status["initialized"], Value::Bool(false));
+    assert_eq!(status["dbExists"], Value::Bool(true));
+    assert_eq!(status["extractionStatus"], Value::String("missing".into()));
+    assert_eq!(status["lastIndexed"], Value::Null);
+    assert!(status["dbSizeBytes"].as_u64().is_some_and(|size| size > 0));
+    assert!(
+        status["extractionStatusDetail"]
+            .as_str()
+            .is_some_and(
+                |detail| detail.contains("no state slots") && detail.contains("codegraph init")
+            ),
+        "diagnostic must explain the state and remedy: {status}"
+    );
+    assert_tree_bytes_unchanged(&before, &tree_snapshot(&project), "degraded JSON status");
+}
+
+#[test]
+fn status_human_reports_foreign_database_and_init_remedy_without_mutation() {
+    let dir = TestDir::new("foreign-db-status-human");
+    let project = dir.path().join("mini");
+    copy_tree(&mini_fixture(), &project);
+    let paths = IndexPaths::resolve(&project, None).expect("resolve selected index root");
+    stage_foreign_database(&paths);
+    let before = tree_snapshot(&project);
+
+    let run = run_in(dir.path(), &["status", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "human status must degrade instead of failing: stdout={} stderr={}",
+        run.stdout, run.stderr
+    );
+    assert!(
+        run.stdout.contains("index database has no state slots")
+            && run.stdout.contains("older version or another tool")
+            && run.stdout.contains("codegraph init")
+            && run.stdout.contains("replace"),
+        "human status must name the situation and remedy: stdout={} stderr={}",
+        run.stdout,
+        run.stderr
+    );
+    assert_tree_bytes_unchanged(&before, &tree_snapshot(&project), "degraded human status");
+}
+
+#[test]
+fn foreign_database_command_errors_name_explicit_init_without_mutation() {
+    let dir = TestDir::new("foreign-db-command-remedy");
+    let project = dir.path().join("mini");
+    copy_tree(&mini_fixture(), &project);
+    let paths = IndexPaths::resolve(&project, None).expect("resolve selected index root");
+    stage_foreign_database(&paths);
+    let before = tree_snapshot(&project);
+    let p = project.to_str().unwrap();
+
+    for (command, run) in [
+        ("query", run_in(dir.path(), &["query", "a", "--path", p])),
+        ("sync", run_in(dir.path(), &["sync", p])),
+    ] {
+        assert!(
+            !run.ok,
+            "{command} must reject a database without state slots: stdout={} stderr={}",
+            run.stdout, run.stderr
+        );
+        let output = format!("{}{}", run.stdout, run.stderr);
+        assert!(
+            output.contains("codegraph init") && output.contains(p),
+            "{command} must name the explicit recovery command and project: {output}"
+        );
+    }
+
+    assert_tree_bytes_unchanged(
+        &before,
+        &tree_snapshot(&project),
+        "foreign database command rejection",
+    );
+}
+
+/// A healthy state-slot-backed index is already authoritative. Re-running
+/// `init` must take the read-only early return and leave both database and state
+/// bytes untouched, proving the foreign-index takeover cannot fire on Current.
+#[test]
+fn init_does_not_rebuild_a_current_index() {
+    let dir = TestDir::new("current-not-rebuilt");
+    let project = dir.path().join("mini");
+    copy_tree(&mini_fixture(), &project);
+    let p = project.to_str().unwrap();
+
+    let first = run_in(dir.path(), &["init", p]);
+    assert!(
+        first.ok,
+        "initial init must succeed: {} {}",
+        first.stdout, first.stderr
+    );
+    let paths = IndexPaths::resolve(&project, None).expect("resolve current index");
+    assert_eq!(Store::extraction_status(&paths), ExtractionStatus::Current);
+    let before_db = std::fs::read(paths.current_db()).expect("snapshot current DB");
+    let before_slots = paths
+        .state_slots()
+        .map(|slot| std::fs::read(slot).expect("snapshot current state slot"));
+
+    let second = run_in(dir.path(), &["init", p]);
+    assert!(
+        second.ok && second.stdout.contains("Already initialized"),
+        "second init must take the Current early return: {} {}",
+        second.stdout,
+        second.stderr
+    );
+    assert_eq!(
+        std::fs::read(paths.current_db()).expect("read current DB after second init"),
+        before_db,
+        "Current database bytes must not be rebuilt"
+    );
+    assert_eq!(
+        paths
+            .state_slots()
+            .map(|slot| std::fs::read(slot).expect("read current slot after second init")),
+        before_slots,
+        "Current state-slot bytes must not be republished"
+    );
+}
+
+#[test]
+fn configured_relative_root_uses_project_local_join_via_cli() {
     let dir = TestDir::new("cfg-rel");
     let project = dir.path().join("mini");
     copy_tree(&mini_fixture(), &project);
@@ -203,26 +366,11 @@ fn configured_relative_root_uses_identity_suffixed_sibling_via_cli() {
     let run = run_in_env(dir.path(), &["init", p], &[("CODEGRAPH_DIR", "cache")]);
     assert!(run.ok, "init must succeed: {} {}", run.stdout, run.stderr);
 
-    let names = indexed_names(&project);
-    // The simple-join `<project>/cache/codegraph.db` MUST NOT exist.
     assert!(
-        !project.join("cache").join("codegraph.db").is_file(),
-        "configured root must NOT use the old simple-join `cache/`: dir={names:?}"
+        project.join("cache/codegraph.db").is_file(),
+        "configured root must be the direct project-local join"
     );
-    // Exactly one identity-suffixed sibling `cache-v2-<64hex>` holds the DB.
-    let sibling = names
-        .iter()
-        .find(|n| n.starts_with("cache-v2-"))
-        .unwrap_or_else(|| panic!("expected a `cache-v2-<identity>` sibling, got {names:?}"));
-    assert_eq!(
-        sibling.len(),
-        "cache-v2-".len() + 64,
-        "sibling must carry a full 64-hex projectIdentity: {sibling}"
-    );
-    assert!(
-        project.join(sibling).join("codegraph.db").is_file(),
-        "the identity-suffixed sibling must hold the DB: {names:?}"
-    );
+    assert!(!project.join(".codegraph/codegraph.db").exists());
 
     let status = run_in_env(
         dir.path(),
@@ -231,65 +379,49 @@ fn configured_relative_root_uses_identity_suffixed_sibling_via_cli() {
     );
     assert!(status.ok, "status must succeed: {}", status.stderr);
     assert!(
-        status.stdout.contains(sibling.as_str()),
-        "status indexPath must name the identity sibling {sibling}: {}",
+        status
+            .stdout
+            .contains(&project.join("cache/codegraph.db").display().to_string()),
+        "status indexPath must name the configured project-local DB: {}",
         status.stdout
     );
 }
 
-/// Two DISTINCT physical projects given the SAME absolute `CODEGRAPH_DIR` must
-/// receive DISTINCT identity-suffixed current roots through the REAL CLI, so one
-/// project can never open the other's index.
 #[test]
-fn two_projects_sharing_absolute_configured_root_get_distinct_roots_via_cli() {
+fn absolute_configured_root_fails_closed_without_mutation_via_cli() {
     let dir = TestDir::new("cfg-abs");
-    let project_a = dir.path().join("a/mini");
-    let project_b = dir.path().join("b/mini");
-    copy_tree(&mini_fixture(), &project_a);
-    copy_tree(&mini_fixture(), &project_b);
+    let project = dir.path().join("mini");
+    copy_tree(&mini_fixture(), &project);
     let shared = dir.path().join("shared/cg");
     std::fs::create_dir_all(dir.path().join("shared")).unwrap();
     let shared_str = shared.to_str().unwrap();
+    let before = tree_snapshot(&project);
 
-    let ra = run_in_env(
+    let run = run_in_env(
         dir.path(),
-        &["init", project_a.to_str().unwrap()],
+        &["init", project.to_str().unwrap()],
         &[("CODEGRAPH_DIR", shared_str)],
     );
-    assert!(ra.ok, "init a must succeed: {} {}", ra.stdout, ra.stderr);
-    let rb = run_in_env(
-        dir.path(),
-        &["init", project_b.to_str().unwrap()],
-        &[("CODEGRAPH_DIR", shared_str)],
-    );
-    assert!(rb.ok, "init b must succeed: {} {}", rb.stdout, rb.stderr);
-
-    let parent = dir.path().join("shared");
-    let siblings: Vec<String> = std::fs::read_dir(&parent)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with("cg-v2-"))
-        .collect();
-    assert_eq!(
-        siblings.len(),
-        2,
-        "two projects must produce two distinct identity siblings, got {siblings:?}"
-    );
-    assert_ne!(
-        siblings[0], siblings[1],
-        "the two current roots must differ"
-    );
-    // The shared simple-join `shared/cg/codegraph.db` must never exist.
     assert!(
-        !shared.join("codegraph.db").is_file(),
-        "configured absolute root must NOT collapse two projects onto one simple-join DB"
+        !run.ok,
+        "absolute CODEGRAPH_DIR must fail closed: {} {}",
+        run.stdout, run.stderr
     );
+    assert!(
+        format!("{}{}", run.stdout, run.stderr)
+            .contains("must be one non-empty project-local directory name"),
+        "absolute-root failure must be actionable: {} {}",
+        run.stdout,
+        run.stderr
+    );
+    assert!(
+        !shared.exists(),
+        "external configured root must not be created"
+    );
+    let after = tree_snapshot(&project);
+    assert_tree_bytes_unchanged(&before, &after, "an absolute-root rejection");
 }
 
-/// A `CODEGRAPH_DIR` that aliases the project root (`.`) must fail closed
-/// through the REAL CLI, creating NO `<project>/codegraph.db` and NO legacy
-/// mutation — the fail-closed `resolve` contract, not the old simple-join.
 #[test]
 fn configured_dot_alias_fails_closed_without_mutation_via_cli() {
     let dir = TestDir::new("cfg-dot");
@@ -309,7 +441,7 @@ fn configured_dot_alias_fails_closed_without_mutation_via_cli() {
     );
     assert!(
         !project.join(".codegraph").join("codegraph.db").is_file(),
-        "a `.` alias must not mutate the legacy namespace"
+        "a `.` alias must not create the default index"
     );
 }
 
@@ -491,7 +623,7 @@ fn assert_tree_bytes_unchanged(before: &[TreeEntry], after: &[TreeEntry], contex
 
 /// `status` under an invalid/aliasing `CODEGRAPH_DIR` must FAIL CLOSED through
 /// the REAL CLI — surfacing the stable diagnostic instead of masking the bad
-/// configuration behind a default `.codegraph-v2` "not initialized" report — and
+/// configuration behind a default `.codegraph` "not initialized" report — and
 /// must leave the project tree byte-for-byte unchanged (a read command never
 /// mutates). This is the CLI-side proof of the status fail-closed correction.
 #[test]
@@ -517,19 +649,17 @@ fn status_fails_closed_on_invalid_configured_root_without_mutation_via_cli() {
             run.stdout, run.stderr
         );
         assert!(
-            !run.stdout.contains(".codegraph-v2"),
-            "status must NOT mask an invalid configured root as a `.codegraph-v2` \
-             default: stdout={}",
+            !run.stdout.contains("Not initialized"),
+            "status must NOT mask an invalid configured root as the default layout: stdout={}",
             run.stdout
         );
         // The actionable `IndexPaths` diagnostic must reach the user (on stderr,
-        // where the CLI prints `Error: …`). Assert the STABLE reason phrasing —
-        // `.` aliases the project root — not merely "some error".
+        // where the CLI prints `Error: …`).
         let combined = format!("{}{}", run.stdout, run.stderr);
         assert!(
-            combined.contains("project root itself"),
+            combined.contains("must be one non-empty project-local directory name"),
             "status (json={json}) must surface the stable unsafe-root diagnostic \
-             (the `.` alias resolves to the project root itself): stdout={} stderr={}",
+             for `.`: stdout={} stderr={}",
             run.stdout,
             run.stderr
         );
@@ -702,55 +832,33 @@ fn tree_snapshot_fails_loudly_on_unsupported_entry_kind() {
     );
 }
 
-/// An escaping relative `CODEGRAPH_DIR` (`../shared/cg`) is a VALID configured
-/// root that escapes the project; two sibling projects given the same escaping
-/// value must each `init` into their own identity-suffixed sibling under the
-/// shared external parent, never a single shared simple-join DB — the REAL-CLI
-/// counterpart of the absolute-root isolation case.
 #[test]
-fn two_projects_sharing_escaping_relative_root_get_distinct_roots_via_cli() {
+fn escaping_relative_root_fails_closed_without_mutation_via_cli() {
     let dir = TestDir::new("cfg-escape");
     let base = dir.path();
-    let project_a = base.join("a");
-    let project_b = base.join("b");
-    copy_tree(&mini_fixture(), &project_a);
-    copy_tree(&mini_fixture(), &project_b);
+    let project = base.join("project");
+    copy_tree(&mini_fixture(), &project);
     std::fs::create_dir_all(base.join("shared")).unwrap();
+    let before = tree_snapshot(&project);
 
-    for project in [&project_a, &project_b] {
-        let run = run_in_env(
-            base,
-            &["init", project.to_str().unwrap()],
-            &[("CODEGRAPH_DIR", "../shared/cg")],
-        );
-        assert!(
-            run.ok,
-            "init with escaping CODEGRAPH_DIR must succeed for {}: {} {}",
-            project.display(),
-            run.stdout,
-            run.stderr
-        );
-    }
-
-    let shared_parent = base.join("shared");
-    let siblings: Vec<String> = std::fs::read_dir(&shared_parent)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with("cg-v2-"))
-        .collect();
-    assert_eq!(
-        siblings.len(),
-        2,
-        "two projects sharing an escaping relative root must produce two distinct \
-         identity siblings, got {siblings:?}"
-    );
-    assert_ne!(
-        siblings[0], siblings[1],
-        "the two current roots must differ"
+    let run = run_in_env(
+        base,
+        &["init", project.to_str().unwrap()],
+        &[("CODEGRAPH_DIR", "../shared/cg")],
     );
     assert!(
-        !shared_parent.join("cg").join("codegraph.db").is_file(),
-        "the escaping simple-join `shared/cg/codegraph.db` must never exist"
+        !run.ok,
+        "escaping CODEGRAPH_DIR must fail closed: {} {}",
+        run.stdout, run.stderr
     );
+    assert!(
+        format!("{}{}", run.stdout, run.stderr)
+            .contains("must be one non-empty project-local directory name"),
+        "escaping-root failure must be actionable: {} {}",
+        run.stdout,
+        run.stderr
+    );
+    assert!(!base.join("shared/cg").exists());
+    let after = tree_snapshot(&project);
+    assert_tree_bytes_unchanged(&before, &after, "an escaping-root rejection");
 }

@@ -7,8 +7,8 @@
 //! read from the addressed project's own index root — so the process CWD cannot
 //! influence which config is used. This test drives the binary from a DIFFERENT
 //! temp dir and asserts the `godot:id:*` (idFields) and `resourceFields` literal
-//! sentinels land in `unresolved_refs`; a companion target asserts a LEGACY
-//! `.codegraph/codegraph.json` is never adopted.
+//! sentinels land in `unresolved_refs`; a companion target verifies a config
+//! already present before `init` remains authoritative.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -102,8 +102,8 @@ fn cli_from(cwd: &Path, args: &[&str]) -> (String, String, bool) {
 
 fn unresolved_ref_names(project: &Path) -> Vec<String> {
     // Batch M: both the index DB and the opt-in DSL config live in the isolated
-    // v2 namespace.
-    let db = project.join(".codegraph-v2").join("codegraph.db");
+    // index namespace.
+    let db = project.join(".codegraph").join("codegraph.db");
     let store = Store::open(&db).expect("open store");
     store
         .all_unresolved_refs()
@@ -171,12 +171,10 @@ fn no_config_emits_zero_id_sentinels_from_foreign_cwd() {
     );
 }
 
-/// A LEGACY `.codegraph/codegraph.json` must NEVER supply the DSL config: with the
-/// same block written only there, the run emits zero sentinels.
 #[test]
-fn legacy_dsl_config_is_never_adopted() {
-    // Given a Godot project whose ONLY DSL config is the legacy one,
-    let project_dir = TestDir::new("legacy");
+fn project_dsl_config_present_before_init_is_used() {
+    // Given a Godot project whose DSL config exists before init,
+    let project_dir = TestDir::new("pre-init-config");
     let project = project_dir.path().join("game");
     write_godot_project(&project);
     fs::create_dir_all(project.join(".codegraph")).unwrap();
@@ -185,7 +183,7 @@ fn legacy_dsl_config_is_never_adopted() {
         DSL_CONFIG,
     )
     .unwrap();
-    let foreign = TestDir::new("legacy-cwd");
+    let foreign = TestDir::new("pre-init-config-cwd");
 
     // When indexed,
     let project_str = project.to_string_lossy().into_owned();
@@ -194,14 +192,14 @@ fn legacy_dsl_config_is_never_adopted() {
     let (out, err, ok) = cli_from(foreign.path(), &["index", "--force", &project_str]);
     assert!(ok, "index --force failed: stdout={out} stderr={err}");
 
-    // Then nothing fired: neither the id sentinel nor the resourceFields literal.
+    // Then both configured DSL extractors fired.
     let names = unresolved_ref_names(&project);
     assert!(
-        !names.iter().any(|n| n.starts_with("godot:id:")),
-        "a legacy DSL config must not emit id sentinels: {names:?}"
+        names.iter().any(|n| n == "godot:id:buff:7005"),
+        "pre-init project config did not emit the id sentinel: {names:?}"
     );
     assert!(
-        !names.iter().any(|n| n == "Fireball"),
-        "a legacy DSL config must not emit resourceFields literals: {names:?}"
+        names.iter().any(|n| n == "Fireball"),
+        "pre-init project config did not emit the resourceFields literal: {names:?}"
     );
 }
