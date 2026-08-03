@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.42.6](https://github.com/sunerpy/codegraph-rust/compare/v0.42.5...v0.42.6) (2026-08-03)
+
+
+### Bug Fixes
+
+* **kotlin:** emit callable signatures ([#192](https://github.com/sunerpy/codegraph-rust/issues/192)) ([81628f2](https://github.com/sunerpy/codegraph-rust/commit/81628f265c8f757905f9638b71e4a7fd51665bc5))
+
 ## [0.42.5](https://github.com/sunerpy/codegraph-rust/compare/v0.42.4...v0.42.5) (2026-08-03)
 
 
