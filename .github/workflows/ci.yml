@@ -39,14 +39,6 @@ jobs:
       - name: Clippy lint
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # Materializes the frozen v0.40.4 legacy CLI for the Batch M legacy
-      # compatibility tests, using THIS host's NATIVE asset (linux x86_64). The
-      # script verifies the archive digest, the extracted executable digest, and
-      # the real `--version` before exporting the path. A network or digest
-      # failure fails the job here — legacy tests are never skipped.
-      - name: Prepare legacy v0.40.4 fixture (native linux asset)
-        run: echo "CODEGRAPH_LEGACY_BIN=$(bash scripts/setup-legacy-fixture.sh)" >> "$GITHUB_ENV"
-
       - name: Run tests (incl. golden oracle + sync equivalence)
         run: cargo test --workspace
 
@@ -95,18 +87,11 @@ jobs:
         # codegraph-bench is a Unix-only dev harness (publish=false); excluded from the Windows job.
         run: cargo clippy --workspace --exclude codegraph-bench --all-targets -- -D warnings
 
-      # Same fixture step, but the script selects THIS host's NATIVE asset
-      # (windows x86_64 .zip). There is no cross-execution and no emulation:
-      # the Windows legacy proof runs only here, on a real Windows runner.
-      - name: Prepare legacy v0.40.4 fixture (native windows asset)
-        shell: bash
-        run: echo "CODEGRAPH_LEGACY_BIN=$(bash scripts/setup-legacy-fixture.sh)" >> "$GITHUB_ENV"
-
       - name: Run tests
         run: cargo test --workspace --exclude codegraph-bench
 
       # Batch M item 16 acceptance: ONE long-lived shipped `serve --mcp` process
-      # releases every SQLite handle when a request completes, so the v2 main
+      # releases every SQLite handle when a request completes, so the main
       # database can be REPLACED (MoveFileEx + REPLACE_EXISTING) without the
       # compatibility close seam, and the next request serves only the
       # replacement graph. The replacement rename is the Windows-specific handle

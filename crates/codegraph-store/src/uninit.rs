@@ -21,7 +21,7 @@ const TOMBSTONE_BYTES: &[u8] = b"uninitialized\n";
 /// Result of one complete new-uninit or cleanup-continuation pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UninitOutcome {
-    /// Whether any configured/fixed legacy namespace remains untouched.
+    /// Retained for API compatibility; legacy namespaces are no longer tracked.
     pub legacy_index_present: bool,
 }
 
@@ -223,7 +223,7 @@ fn uninit_index_with(
     drop(authorization);
     drop(lease);
     Ok(UninitOutcome {
-        legacy_index_present: paths.legacy_roots().iter().any(|path| path.exists()),
+        legacy_index_present: false,
     })
 }
 
@@ -483,11 +483,11 @@ mod tests {
             let project = TempProject::new("fault-matrix");
             let paths = project.paths();
             stage_building_with_all_residue(&paths);
-            let legacy = project.0.join(".codegraph");
-            std::fs::create_dir(&legacy).expect("create legacy namespace");
-            std::fs::write(legacy.join("legacy.bin"), b"legacy bytes")
-                .expect("write legacy proof bytes");
-            let legacy_before = snapshot(&legacy);
+            let unrelated = project.0.join("unrelated-cache");
+            std::fs::create_dir(&unrelated).expect("create unrelated project directory");
+            std::fs::write(unrelated.join("keep.bin"), b"unrelated bytes")
+                .expect("write unrelated proof bytes");
+            let unrelated_before = snapshot(&unrelated);
 
             let error = uninit_index_with(
                 &paths,
@@ -535,7 +535,7 @@ mod tests {
                     artifact.display()
                 );
             }
-            assert_unchanged(&legacy_before, &snapshot(&legacy));
+            assert_unchanged(&unrelated_before, &snapshot(&unrelated));
         }
     }
 

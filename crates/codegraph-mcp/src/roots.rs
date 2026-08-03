@@ -32,7 +32,7 @@ pub fn format_tool_debug_line(
     )
 }
 
-/// The current (v2) index DB path under a project root, resolved fail-closed
+/// The selected index DB path under a project root, resolved fail-closed
 /// through the single `codegraph-core::IndexPaths` authority so it agrees with
 /// [`crate::CodeGraphEngine::open`]. Returns `None` when the configured root is
 /// unsafe/aliased/overlapping (a `resolve` failure): callers treat that as "not
@@ -50,7 +50,7 @@ pub fn db_path_for(project_path: &Path) -> Option<PathBuf> {
     .map(|paths| paths.current_db())
 }
 
-/// Whether `project_path` resolves to an existing current-namespace index DB.
+/// Whether `project_path` resolves to an existing selected index DB.
 /// `false` for both an unresolvable configured root and a resolvable-but-absent
 /// index — the shared adoption / `tools/list`-schema predicate. Adoption and the
 /// schema selector only ask "is there a usable index here?", so collapsing the
@@ -81,7 +81,7 @@ pub enum RootStatus {
 
 /// Classify `project_path` via the single `IndexPaths` authority. NEVER
 /// reconstructs a default path on a resolve failure — an invalid configured root
-/// yields [`RootStatus::Invalid`], not a fabricated `.codegraph-v2` fallback that
+/// yields [`RootStatus::Invalid`], not a fabricated `.codegraph` fallback that
 /// could open an unrelated project's database.
 pub fn probe_root(project_path: &Path) -> RootStatus {
     classify_resolve(codegraph_core::IndexPaths::resolve(
@@ -215,9 +215,9 @@ fn resolve_project_arg_with(
 pub fn invalid_config_message(detail: &str) -> String {
     format!(
         "Invalid CODEGRAPH_DIR configuration: {detail}. The configured index root is \
-         unsafe — fix or unset CODEGRAPH_DIR (it must not alias the project root, an \
-         ancestor, a symlink/reparse component, or overlap the legacy `.codegraph` \
-         root), then re-run `codegraph init`."
+         unsafe — fix or unset CODEGRAPH_DIR (it must be one project-local directory \
+         name and must not alias the project root or a symlink/reparse component), \
+         then re-run `codegraph init`."
     )
 }
 
@@ -796,7 +796,7 @@ mod tests {
     #[test]
     fn db_path_for_honors_codegraph_dir_default() {
         // A real dir so `resolve` (which canonicalizes) succeeds; the default
-        // current DB is `<project>/.codegraph-v2/codegraph.db`.
+        // current DB is `<project>/.codegraph/codegraph.db`.
         let dir = std::env::temp_dir().join(format!(
             "cg-roots-dbpath-{}-{}",
             std::process::id(),
@@ -805,15 +805,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let db = db_path_for(&dir).expect("resolve default");
         assert!(
-            db.ends_with(".codegraph-v2/codegraph.db"),
-            "default db is under .codegraph-v2: {}",
+            db.ends_with(".codegraph/codegraph.db"),
+            "default db is under .codegraph: {}",
             db.display()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A `resolve` failure (here a nonexistent project) must yield `None`, not a
-    /// reconstructed `.codegraph-v2` default that could shadow another project.
+    /// reconstructed `.codegraph` default that could shadow another project.
     /// Race-free: it never mutates the process-global `CODEGRAPH_DIR`, unlike an
     /// env-set test. The invalid-`CODEGRAPH_DIR` path is covered end-to-end by
     /// the real CLI/MCP black-box regressions.
@@ -874,9 +874,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `classify_resolve` on an UNSAFE configured root (`.` aliases the project
-    /// root) → [`RootStatus::Invalid`] carrying the stable diagnostic. Race-free:
-    /// the bad value is passed as an argument, not via the global env.
     #[test]
     fn classify_resolve_invalid_config_is_invalid_with_diagnostic() {
         let dir = std::env::temp_dir().join(format!(
@@ -887,8 +884,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         match classify_resolve(codegraph_core::IndexPaths::resolve(&dir, Some("."))) {
             RootStatus::Invalid(detail) => assert!(
-                detail.contains("project root"),
-                "invalid diagnostic must name the aliasing reason: {detail}"
+                detail.contains("must be one non-empty project-local directory name"),
+                "invalid diagnostic must name the directory-name constraint: {detail}"
             ),
             other => panic!("`.` alias must classify Invalid, got {other:?}"),
         }

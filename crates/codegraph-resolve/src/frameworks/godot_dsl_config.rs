@@ -31,9 +31,9 @@
 //! The config is loaded ONCE per operation from the addressed project's resolved
 //! current root and threaded into extraction as an immutable
 //! [`GodotDslConfig`]. Nothing here walks up the directory tree, consults the
-//! process working directory, reads a legacy `.codegraph/codegraph.json`, or
-//! caches across calls — so two projects handled by one process can never see
-//! each other's DSL fields and no mtime cache can go stale.
+//! process working directory, reads another project's `codegraph.json`, or caches
+//! across calls — so two projects handled by one process can never see each
+//! other's DSL fields and no mtime cache can go stale.
 //!
 //! Parsing stays tolerant (`#[serde(default)]` at every level, a malformed file
 //! yielding the empty config), preserving the documented opt-in contract.
@@ -198,10 +198,8 @@ mod tests {
         assert!(GodotDslConfig::default().is_empty());
     }
 
-    /// The reader consults ONLY the current-root config path; a legacy
-    /// `.codegraph/codegraph.json` beside it is never adopted.
     #[test]
-    fn load_for_paths_reads_only_the_current_root_config() {
+    fn load_for_paths_reads_only_the_resolved_root_config() {
         let project = std::env::temp_dir().join(format!(
             "codegraph-godot-dsl-scoped-{}-{}",
             std::process::id(),
@@ -213,10 +211,11 @@ mod tests {
         std::fs::create_dir_all(project.join(".codegraph")).unwrap();
         std::fs::write(
             project.join(".codegraph/codegraph.json"),
-            r#"{"godot":{"dsl":{"resourceFields":["legacy_field"]}}}"#,
+            r#"{"godot":{"dsl":{"resourceFields":["default_field"]}}}"#,
         )
         .unwrap();
-        let paths = IndexPaths::resolve(&project, None).expect("resolve paths");
+        let paths = IndexPaths::resolve(&project, Some(".custom-codegraph"))
+            .expect("resolve overridden paths");
         std::fs::create_dir_all(paths.current_root()).unwrap();
         std::fs::write(
             paths.extension_config(),

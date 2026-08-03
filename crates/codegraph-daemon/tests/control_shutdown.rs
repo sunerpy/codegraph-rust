@@ -55,7 +55,7 @@ fn temp_project(label: &str) -> PathBuf {
 }
 
 fn paths_of(project: &Path) -> IndexPaths {
-    IndexPaths::resolve(project, None).expect("resolve v2 index paths")
+    IndexPaths::resolve(project, None).expect("resolve index paths")
 }
 
 fn options(drain_budget: Duration) -> DaemonOptions {

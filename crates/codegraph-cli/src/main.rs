@@ -1468,6 +1468,14 @@ fn cmd_sync(path: Option<PathBuf>, quiet: bool) -> Result<()> {
     // authorized to sync or recreate residue.
     let project = resolve_required_rebuild_project(path)?;
     let paths = index_paths(&project)?;
+    if Store::extraction_status(&paths) == codegraph_store::ExtractionStatus::Missing
+        && paths.current_db().is_file()
+    {
+        bail!(
+            "index database has no state slots; run `codegraph init {}` to replace it",
+            project.display()
+        );
+    }
     recover_dead_owner_sidecars(&paths, &project);
     // True single-file incremental sync (P0, docs/optimization-analysis.md §1).
     // sync_project_once self-discovers candidate files via scan_project, so it works
@@ -1502,19 +1510,11 @@ fn cmd_sync(path: Option<PathBuf>, quiet: bool) -> Result<()> {
 }
 
 fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
-    let explicit = path.is_some();
     let start = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
-    let project = if configured_root_is_absolute() {
-        if !explicit && !is_initialized(&start) {
-            bail!("CODEGRAPH_DIR is absolute; pass the project root explicitly");
-        }
-        start
-    } else {
-        resolve_project_path_optional(&start)
-    };
+    let project = resolve_project_path_optional(&start);
     // Fail closed on an unsafe/aliased/overlapping configured root: status must
     // surface the stable diagnostic, NOT mask an invalid `CODEGRAPH_DIR` as a
-    // default `.codegraph-v2` layout (which would report a bogus "not
+    // default `.codegraph` layout (which would report a bogus "not
     // initialized"). A genuinely absent index still resolves fine and reports
     // uninitialized below.
     let resolved = index_paths(&project)?;
@@ -1528,13 +1528,8 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
         }
     };
     let wal_size = Store::wal_size_bytes_for_path(&db)?;
-    let legacy_index_paths = resolved
-        .legacy_roots()
-        .iter()
-        .filter(|path| path.exists())
-        .cloned()
-        .collect::<Vec<_>>();
-    let legacy_index_present = !legacy_index_paths.is_empty();
+    let legacy_index_paths: Vec<PathBuf> = Vec::new();
+    let legacy_index_present = false;
     let daemon_running = daemon_already_running(&project);
     let daemon_pid_path = codegraph_daemon::daemon_pid_path(&project)?;
     let daemon_socket_path = codegraph_daemon::recorded_socket_path(&project)?;
@@ -1545,6 +1540,50 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
         || false,
     ) {
         Ok(status_open) => status_open,
+        Err(codegraph_store::StoreError::MissingStateWithDatabase { .. }) => {
+            let detail = format!(
+                "index database has no state slots and may have been created by an older version or another tool; run `codegraph init {}` to replace it",
+                project.display()
+            );
+            if json_output {
+                let mut status = json!({
+                    "initialized": false,
+                    "version": VERSION,
+                    "projectPath": project,
+                    "indexPath": index_root,
+                    "lastIndexed": null,
+                    "dbPath": db,
+                    "dbExists": db_exists,
+                    "dbSizeBytes": db_size,
+                    "extractionStatus": "missing",
+                    "extractionStatusDetail": detail,
+                    "legacyIndexPresent": legacy_index_present,
+                    "legacyIndexPaths": legacy_index_paths,
+                    "daemonRunning": daemon_running,
+                    "daemonPidPath": daemon_pid_path,
+                    "daemonSocketPath": daemon_socket_path,
+                    "daemonLogPath": daemon_log_path,
+                });
+                if wal_size > 0 {
+                    status["walSizeBytes"] = json!(wal_size);
+                }
+                print_json(&status)?;
+            } else {
+                println!("\nCodeGraph Status\n");
+                println!("Project: {}\n", project.display());
+                println!("State:   missing (index database has no state slots)");
+                println!("Index Statistics:");
+                println!("  DB Size:   {:.2} MB", db_size as f64 / 1024.0 / 1024.0);
+                print_wal_status(wal_size, db_size);
+                println!("\n  DB Path:   {}", db.display());
+                println!(
+                    "  Daemon:    {}",
+                    if daemon_running { "running" } else { "stopped" }
+                );
+                println!("\n{detail}");
+            }
+            return Ok(());
+        }
         Err(error @ codegraph_store::StoreError::CurrentWithDatabaseSidecar { .. }) => {
             if json_output {
                 let mut status = json!({
@@ -2672,19 +2711,17 @@ fn warn_if_stdio_mcp_may_hold_index(project: &Path) {
 /// Append holder guidance to the CLI's presentation of a `RemoveDatabase`
 /// failure — the exact Windows failure point, where `std::fs::remove_file` on an
 /// open `codegraph.db` cannot succeed. The store-layer message
-/// (`cannot remove v2 database artifact {path}: {source}`) is a statement of fact
+/// (`cannot remove database artifact {path}: {source}`) is a statement of fact
 /// and is left untouched; this only adds "who may be holding it, and how to stop
 /// it" AFTER it, and the original error chain is neither wrapped nor swallowed.
 ///
 /// Reports EVERY live registered server, exactly like the PRE-WARNING path — a
 /// server's recorded project is only its launch default, so neither path may
 /// filter on it (see [`mcp_live_entries`]). Two independent reasons converge here:
-/// all this error hands us is a database path, and a database path is not even a
-/// project root (with `CODEGRAPH_DIR` set the current index root is a
-/// `<name>-v2-<projectIdentity>` SIBLING of the normalized legacy root, so the
-/// artifact can live outside the project tree entirely). An over-inclusive list is
-/// strictly better than hiding the actual holder, and each row names its own
-/// launch project so a reader can still tell which is which.
+/// all this error hands us is a database path rather than the server instance
+/// that owns an open handle. An over-inclusive list is strictly better than
+/// hiding the actual holder, and each row names its own launch project so a
+/// reader can still tell which is which.
 ///
 /// Deliberately NOT integration-tested (decision B of the rev55 plan): the
 /// private `RebuildFault` hook cannot inject a DB removal failure, and a
@@ -2838,13 +2875,10 @@ mod index_holder_guidance_tests {
         assert!(text.ends_with('\n'), "must end with a newline: {text:?}");
     }
 
-    /// The FAILURE path must not narrow by the failing artifact's path. With
-    /// `CODEGRAPH_DIR` set, the current index root is a `<name>-v2-<identity>`
-    /// SIBLING of the normalized legacy root, so the database can live entirely
-    /// OUTSIDE the project tree; narrowing by it would then match no pinned entry
-    /// and wrongly report that no registered server matches. An over-inclusive
-    /// diagnostic beats hiding the actual holder — each row names its own project,
-    /// so a reader can still tell which is which.
+    /// The FAILURE path must not narrow by the failing artifact's path because a
+    /// server's launch project is informational and does not limit which project
+    /// a later MCP request can open. An over-inclusive diagnostic beats hiding the
+    /// actual holder.
     #[test]
     fn removal_guidance_reports_a_holder_pinned_outside_the_failing_artifact_path() {
         let dir =
@@ -2859,7 +2893,7 @@ mod index_holder_guidance_tests {
         let holder = entry(std::process::id(), Some("/unrelated/elsewhere"));
         codegraph_daemon::mcp_registry::write_entry(&holder).unwrap();
         let err = anyhow::Error::new(codegraph_store::RebuildError::RemoveDatabase {
-            path: PathBuf::from("/state/codegraph-v2-0f1e2d/codegraph.db"),
+            path: PathBuf::from("/work/project/.codegraph/codegraph.db"),
             source: std::io::Error::other("the process cannot access the file"),
         });
 
@@ -3563,8 +3597,7 @@ mod serve_mode_tests {
         let indexed =
             std::env::temp_dir().join(format!("cg-serve-gate-idx-{}-{seq}", std::process::id()));
         std::fs::create_dir_all(&unindexed).unwrap();
-        // Batch M: the serve-services gate keys on the v2 current root.
-        std::fs::create_dir_all(indexed.join(".codegraph-v2")).unwrap();
+        std::fs::create_dir_all(indexed.join(".codegraph")).unwrap();
 
         assert!(
             should_run_serve_services(true, &unindexed),
@@ -4396,7 +4429,7 @@ fn index_project(project: &Path, kind: codegraph_store::RebuildKind) -> Result<I
 /// Owns one destructive v2 rebuild for the whole full-index body.
 ///
 /// `begin` acquires the single outer exclusive `IndexLease`, classifies under it,
-/// publishes `phase=building`, removes the previous v2 database files, and opens
+/// publishes `phase=building`, removes the previous database files, and opens
 /// the fresh write-capable target. [`Self::finish`] is the EXPLICIT FALLIBLE
 /// completion path required by the frozen plan (lines 548-556): under the same
 /// retained lease it restores the shared `synchronous=NORMAL` durability, runs the
@@ -4482,8 +4515,8 @@ fn index_project_inner(
     let paths = index_paths(project)?;
     let index_root = paths.current_root().to_path_buf();
     // THIS project's own immutable config + extension overrides, read from its
-    // resolved current index root. Nothing consults a process-global value, a
-    // legacy `.codegraph` root, or the process working directory.
+    // resolved current index root. Nothing consults a process-global value,
+    // another project's root, or the process working directory.
     let config = Config::load_for_paths(None, &paths)?;
     let extensions = codegraph_extract::ExtensionOverrides::load_for_paths(&paths);
     let options = ExtractOptions::for_project(&config, extensions);
@@ -4497,7 +4530,7 @@ fn index_project_inner(
     let files = codegraph_extract::engine::scan_project(project, &options)?;
 
     // One destructive rebuild under ONE outer exclusive lease: classify, publish
-    // `phase=building`, remove the previous v2 DB files, then open the fresh
+    // `phase=building`, remove the previous DB files, then open the fresh
     // write-capable target. The index root and DB are created by the rebuild
     // layer, so nothing below reconstructs a path or reopens the namespace.
     //
@@ -5325,40 +5358,25 @@ fn has_lifecycle_namespace(project: &Path) -> bool {
     Store::extraction_status(&paths) != codegraph_store::ExtractionStatus::Missing
 }
 
-fn configured_root_is_absolute() -> bool {
-    std::env::var_os("CODEGRAPH_DIR")
-        .filter(|value| !value.is_empty())
-        .is_some_and(|value| Path::new(&value).is_absolute())
-}
-
 fn resolve_required_project(path: Option<PathBuf>) -> Result<PathBuf> {
-    let explicit = path.is_some();
     let start = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
-    let project = if configured_root_is_absolute() {
-        if !explicit && !is_initialized(&start) {
-            bail!("CODEGRAPH_DIR is absolute; pass the project root explicitly");
-        }
-        start
-    } else {
-        resolve_project_path_optional(&start)
-    };
+    index_paths(&start)?;
+    let project = resolve_project_path_optional(&start);
     if !is_initialized(&project) {
-        bail!("CodeGraph not initialized in {}", project.display());
+        bail!(
+            "CodeGraph not initialized in {}; run `codegraph init {}` to create or replace the index",
+            project.display(),
+            project.display()
+        );
     }
     Ok(project)
 }
 
 fn resolve_required_rebuild_project(path: Option<PathBuf>) -> Result<PathBuf> {
-    let explicit = path.is_some();
     let start = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
+    index_paths(&start)?;
     if has_rebuild_namespace(&start) {
         return Ok(start);
-    }
-    if configured_root_is_absolute() {
-        if !explicit {
-            bail!("CODEGRAPH_DIR is absolute; pass the project root explicitly");
-        }
-        bail!("CodeGraph not initialized in {}", start.display());
     }
     let mut current = start.as_path();
     while let Some(parent) = current.parent() {
@@ -5374,7 +5392,7 @@ fn resolve_required_rebuild_project(path: Option<PathBuf>) -> Result<PathBuf> {
 }
 
 fn resolve_project_path_optional(start: &Path) -> PathBuf {
-    if configured_root_is_absolute() || has_lifecycle_namespace(start) {
+    if has_lifecycle_namespace(start) {
         return start.to_path_buf();
     }
     let mut current = start;
@@ -5438,14 +5456,13 @@ fn index_paths(project: &Path) -> Result<codegraph_core::IndexPaths> {
         .map_err(Into::into)
 }
 
-/// The current (v2) index root for `project` (`.codegraph-v2` by default; a
-/// `<name>-v2-<projectIdentity>` sibling for a configured `CODEGRAPH_DIR`).
-/// Fail-closed via [`index_paths`].
+/// The selected project-local index root for `project`. Fail-closed via
+/// [`index_paths`].
 fn codegraph_dir(project: &Path) -> Result<PathBuf> {
     Ok(index_paths(project)?.current_root().to_path_buf())
 }
 
-/// The current (v2) index DB path for `project`. Fail-closed via [`index_paths`].
+/// The selected index DB path for `project`. Fail-closed via [`index_paths`].
 fn db_path(project: &Path) -> Result<PathBuf> {
     Ok(index_paths(project)?.current_db())
 }
@@ -6296,12 +6313,9 @@ mod pure_helper_tests {
             let canonical = dir.canonicalize().unwrap();
             assert_eq!(
                 db_path(&dir).unwrap(),
-                canonical.join(".codegraph-v2/codegraph.db")
+                canonical.join(".codegraph/codegraph.db")
             );
-            assert_eq!(
-                codegraph_dir(&dir).unwrap(),
-                canonical.join(".codegraph-v2")
-            );
+            assert_eq!(codegraph_dir(&dir).unwrap(), canonical.join(".codegraph"));
             let _ = fs::remove_dir_all(&dir);
         }
     }
@@ -6469,13 +6483,10 @@ mod formatter_and_env_tests {
         env.remove("CODEGRAPH_DIR");
         let proj = tmp("default-layout");
         let canonical = proj.canonicalize().unwrap();
-        assert_eq!(
-            codegraph_dir(&proj).unwrap(),
-            canonical.join(".codegraph-v2")
-        );
+        assert_eq!(codegraph_dir(&proj).unwrap(), canonical.join(".codegraph"));
         assert_eq!(
             db_path(&proj).unwrap(),
-            canonical.join(".codegraph-v2/codegraph.db")
+            canonical.join(".codegraph/codegraph.db")
         );
         env.assert_intact();
         let _ = fs::remove_dir_all(&proj);

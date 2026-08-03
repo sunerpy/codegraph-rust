@@ -1,4 +1,4 @@
-//! Process-level acceptance for the production v2 full-writer lifecycle.
+//! Process-level acceptance for the production full-writer lifecycle.
 
 #![cfg(unix)]
 
@@ -398,13 +398,16 @@ fn assert_namespace_unchanged(
     );
 }
 
-fn stage_legacy_namespace(project: &Path) -> PathBuf {
-    let legacy = project.join(".codegraph");
-    fs::create_dir(&legacy).expect("create independent legacy namespace");
-    fs::write(legacy.join("codegraph.db"), b"legacy-db-sentinel\0\xff")
-        .expect("write legacy DB sentinel");
-    fs::create_dir(legacy.join("empty-directory")).expect("create legacy empty directory");
-    legacy
+fn stage_unrelated_namespace(project: &Path) -> PathBuf {
+    let unrelated = project.join(".codegraph-unrelated");
+    fs::create_dir(&unrelated).expect("create unrelated namespace");
+    fs::write(
+        unrelated.join("codegraph.db"),
+        b"unrelated-db-sentinel\0\xff",
+    )
+    .expect("write unrelated DB sentinel");
+    fs::create_dir(unrelated.join("empty-directory")).expect("create unrelated empty directory");
+    unrelated
 }
 
 fn finish_rebuild(project: &Path) {
@@ -802,11 +805,11 @@ fn namespace_oracle_detects_nested_directory_replaced_by_external_symlink() {
 }
 
 #[test]
-fn concurrent_v2_writers_serialize_and_loser_is_nonmutating() {
+fn concurrent_writers_serialize_and_loser_is_nonmutating() {
     let project = TempProject::new("concurrent-writers");
     let paths = project.paths();
-    let legacy = stage_legacy_namespace(project.path());
-    let legacy_before = snapshot_namespace(&legacy);
+    let unrelated = stage_unrelated_namespace(project.path());
+    let unrelated_before = snapshot_namespace(&unrelated);
 
     let holder = Holder::spawn(project.path());
     assert!(matches!(
@@ -829,18 +832,18 @@ fn concurrent_v2_writers_serialize_and_loser_is_nonmutating() {
     assert_namespace_unchanged(
         &current_before_loser,
         &snapshot_namespace(paths.current_root()),
-        "v2 namespace while winner retains the production lease",
+        "index namespace while winner retains the production lease",
     );
     assert_namespace_unchanged(
-        &legacy_before,
-        &snapshot_namespace(&legacy),
-        "legacy namespace during writer contention",
+        &unrelated_before,
+        &snapshot_namespace(&unrelated),
+        "unrelated namespace during writer contention",
     );
     holder.release();
     assert_namespace_unchanged(
-        &legacy_before,
-        &snapshot_namespace(&legacy),
-        "legacy namespace after winner release",
+        &unrelated_before,
+        &snapshot_namespace(&unrelated),
+        "unrelated namespace after winner release",
     );
 }
 
@@ -848,8 +851,8 @@ fn concurrent_v2_writers_serialize_and_loser_is_nonmutating() {
 fn crashed_writer_releases_permanent_kernel_lease() {
     let project = TempProject::new("crashed-writer");
     let paths = project.paths();
-    let legacy = stage_legacy_namespace(project.path());
-    let legacy_before = snapshot_namespace(&legacy);
+    let unrelated = stage_unrelated_namespace(project.path());
+    let unrelated_before = snapshot_namespace(&unrelated);
 
     let holder = Holder::spawn(project.path());
     assert!(matches!(
@@ -863,9 +866,9 @@ fn crashed_writer_releases_permanent_kernel_lease() {
         "holder must terminate abnormally by SIGKILL, bypassing Rust cleanup: {crash_status:?}"
     );
     assert_namespace_unchanged(
-        &legacy_before,
-        &snapshot_namespace(&legacy),
-        "legacy namespace immediately after holder crash",
+        &unrelated_before,
+        &snapshot_namespace(&unrelated),
+        "unrelated namespace immediately after holder crash",
     );
 
     let (status, stdout, stderr) = run_child(project.path(), "recover");
@@ -882,8 +885,8 @@ fn crashed_writer_releases_permanent_kernel_lease() {
         .expect("public read gate corroborates recovered Current");
     drop(readable);
     assert_namespace_unchanged(
-        &legacy_before,
-        &snapshot_namespace(&legacy),
-        "legacy namespace across crash recovery",
+        &unrelated_before,
+        &snapshot_namespace(&unrelated),
+        "unrelated namespace across crash recovery",
     );
 }

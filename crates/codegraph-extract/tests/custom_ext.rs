@@ -221,11 +221,9 @@ fn custom_ext_malformed_config_is_ignored() {
     fs::remove_dir_all(&project2).ok();
 }
 
-/// A LEGACY `.codegraph/codegraph.json` never supplies an override, and neither
-/// does another project's config.
 #[test]
-fn custom_ext_ignores_legacy_and_other_projects() {
-    let project = unique_project("legacy");
+fn custom_ext_reads_project_config_and_isolates_other_projects() {
+    let project = unique_project("project");
     let other = unique_project("other");
     fs::create_dir_all(project.join(".codegraph")).unwrap();
     fs::write(
@@ -239,8 +237,8 @@ fn custom_ext_ignores_legacy_and_other_projects() {
 
     assert_eq!(
         detect_language_with(&file, &overrides_for(&project)),
-        Language::Unknown,
-        "neither the legacy config nor another project's may apply"
+        Language::Lua,
+        "the addressed project's current-root config applies"
     );
     assert_eq!(
         detect_language_with(&file, &overrides_for(&other)),

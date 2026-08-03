@@ -180,7 +180,7 @@ CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
   ./target/release/codegraph init /tmp/cg-fixture-godot
 
 # 3. Commit the produced database as the fixture's colby.db.
-cp /tmp/cg-fixture-godot/.codegraph-v2/codegraph.db reference/golden/godot/colby.db
+cp /tmp/cg-fixture-godot/.codegraph/codegraph.db reference/golden/godot/colby.db
 
 # 4. Dump the canonical golden JSON + schema from that database.
 cargo run -p codegraph-bench --bin bench -- \
@@ -246,7 +246,7 @@ CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
   ./target/release/codegraph init /tmp/cg-fixture-ruby
 
 # 3. Commit the produced database as the fixture's colby.db.
-cp /tmp/cg-fixture-ruby/.codegraph-v2/codegraph.db reference/golden/ruby/colby.db
+cp /tmp/cg-fixture-ruby/.codegraph/codegraph.db reference/golden/ruby/colby.db
 
 # 4. Dump the canonical golden JSON + schema from that database.
 cargo run -p codegraph-bench --bin bench -- \
@@ -292,7 +292,7 @@ CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
 
 # 3. Commit the produced database as the fixture's colby.db.
 mkdir -p reference/golden/python
-cp /tmp/cg-fixture-python/.codegraph-v2/codegraph.db reference/golden/python/colby.db
+cp /tmp/cg-fixture-python/.codegraph/codegraph.db reference/golden/python/colby.db
 
 # 4. Dump canonical JSON + schema from that exact database.
 cargo run -p codegraph-bench --bin bench -- \
@@ -413,7 +413,7 @@ CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
   ./target/release/codegraph init /tmp/cg-fixture-cpp
 
 # 3. Commit the produced database as the fixture's colby.db.
-cp /tmp/cg-fixture-cpp/.codegraph-v2/codegraph.db reference/golden/cpp/colby.db
+cp /tmp/cg-fixture-cpp/.codegraph/codegraph.db reference/golden/cpp/colby.db
 
 # 4. Dump the canonical golden JSON + schema from that database.
 cargo run -p codegraph-bench --bin bench -- \
@@ -478,7 +478,7 @@ substituting `metal`/`cuda`):
 rm -rf /tmp/cg-fixture-metal && cp -r crates/codegraph-bench/fixtures/metal /tmp/cg-fixture-metal
 cargo build --release -p codegraph-rs
 CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-metal
-cp /tmp/cg-fixture-metal/.codegraph-v2/codegraph.db reference/golden/metal/colby.db
+cp /tmp/cg-fixture-metal/.codegraph/codegraph.db reference/golden/metal/colby.db
 cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/metal/colby.db reference/golden/metal
 # …and the same for cuda.
 ```
@@ -519,7 +519,7 @@ Regenerate reproducibly (identical recipe to the C++ fixture, substituting
 rm -rf /tmp/cg-fixture-arkts && cp -r crates/codegraph-bench/fixtures/arkts /tmp/cg-fixture-arkts
 cargo build --release -p codegraph-rs
 CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-arkts
-cp /tmp/cg-fixture-arkts/.codegraph-v2/codegraph.db reference/golden/arkts/colby.db
+cp /tmp/cg-fixture-arkts/.codegraph/codegraph.db reference/golden/arkts/colby.db
 cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/arkts/colby.db reference/golden/arkts
 ```
 
@@ -569,7 +569,7 @@ Regenerate reproducibly (identical recipe to the ArkTS fixture, substituting
 rm -rf /tmp/cg-fixture-solidity && cp -r crates/codegraph-bench/fixtures/solidity /tmp/cg-fixture-solidity
 cargo build --release -p codegraph-rs
 CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-solidity
-cp /tmp/cg-fixture-solidity/.codegraph-v2/codegraph.db reference/golden/solidity/colby.db
+cp /tmp/cg-fixture-solidity/.codegraph/codegraph.db reference/golden/solidity/colby.db
 cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/solidity/colby.db reference/golden/solidity
 ```
 
@@ -617,7 +617,7 @@ Regenerate reproducibly (identical recipe to the Solidity fixture, substituting
 rm -rf /tmp/cg-fixture-nix && cp -r crates/codegraph-bench/fixtures/nix /tmp/cg-fixture-nix
 cargo build --release -p codegraph-rs
 CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-nix
-cp /tmp/cg-fixture-nix/.codegraph-v2/codegraph.db reference/golden/nix/colby.db
+cp /tmp/cg-fixture-nix/.codegraph/codegraph.db reference/golden/nix/colby.db
 cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/nix/colby.db reference/golden/nix
 ```
 
@@ -670,7 +670,7 @@ Regenerate reproducibly (identical recipe to the Nix fixture, substituting
 rm -rf /tmp/cg-fixture-terraform && cp -r crates/codegraph-bench/fixtures/terraform /tmp/cg-fixture-terraform
 cargo build --release -p codegraph-rs
 CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-terraform
-cp /tmp/cg-fixture-terraform/.codegraph-v2/codegraph.db reference/golden/terraform/colby.db
+cp /tmp/cg-fixture-terraform/.codegraph/codegraph.db reference/golden/terraform/colby.db
 cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/terraform/colby.db reference/golden/terraform
 ```
 
@@ -729,7 +729,7 @@ Regenerate reproducibly (identical recipe to the Terraform fixture, substituting
 rm -rf /tmp/cg-fixture-erlang && cp -r crates/codegraph-bench/fixtures/erlang /tmp/cg-fixture-erlang
 cargo build --release -p codegraph-rs
 CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-erlang
-cp /tmp/cg-fixture-erlang/.codegraph-v2/codegraph.db reference/golden/erlang/colby.db
+cp /tmp/cg-fixture-erlang/.codegraph/codegraph.db reference/golden/erlang/colby.db
 cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/erlang/colby.db reference/golden/erlang
 ```
 
@@ -776,7 +776,7 @@ Regenerate reproducibly (identical recipe, substituting `cfml`):
 rm -rf /tmp/cg-fixture-cfml && cp -r crates/codegraph-bench/fixtures/cfml /tmp/cg-fixture-cfml
 cargo build --release -p codegraph-rs
 CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 ./target/release/codegraph init /tmp/cg-fixture-cfml
-cp /tmp/cg-fixture-cfml/.codegraph-v2/codegraph.db reference/golden/cfml/colby.db
+cp /tmp/cg-fixture-cfml/.codegraph/codegraph.db reference/golden/cfml/colby.db
 cargo run -p codegraph-bench --bin bench -- --gen-golden reference/golden/cfml/colby.db reference/golden/cfml
 ```
 

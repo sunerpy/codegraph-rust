@@ -57,7 +57,7 @@ irm https://raw.githubusercontent.com/sunerpy/codegraph-rust/main/scripts/instal
 **Index a project and query it:**
 
 ```bash
-codegraph init  /path/to/project                 # create .codegraph-v2/ and run the first index
+codegraph init  /path/to/project                 # create .codegraph/ and run the first index
 codegraph query "<symbol>" -p /path/to/project   # full-text search
 codegraph serve --mcp --path /path/to/project    # MCP server (--path optional, defaults to cwd)
 ```
@@ -66,25 +66,17 @@ codegraph serve --mcp --path /path/to/project    # MCP server (--path optional, 
 
 ## Upgrading from v0.40.4
 
-The per-project index moved out of `<project>/.codegraph/` into an isolated
-`<project>/.codegraph-v2/`. A `v0.40.4` index is **not migrated and not read** —
-this binary never opens, migrates, or writes the old root, so an existing
-`.codegraph/` is simply ignored. Two consequences:
+The per-project index remains at `<project>/.codegraph/`. A v0.40.4 database has
+no authenticated index-state slots, so current releases do not read it as a
+current index. Run `codegraph init` once: while holding the exclusive index
+lease, CodeGraph replaces only the stale `codegraph.db`, `codegraph.db-wal`, and
+`codegraph.db-shm` artifacts and publishes a fresh current index.
 
-- **Run `codegraph init` again in each project.** Until you do, the project counts
-  as not indexed: `serve --mcp` falls back to direct mode with nothing to serve,
-  and the query commands report `CodeGraph not initialized`.
-- **Old configuration does not carry over.** `.codegraph/config.toml` and
-  `.codegraph/codegraph.json` are ignored. Copy them to
-  `.codegraph-v2/config.toml` and `.codegraph-v2/codegraph.json` if you still
-  want them.
-
-The daemon rendezvous (`daemon.pid`, `daemon.sock`, `daemon.log`) moved with the
-index, so it now also lives under `.codegraph-v2/`.
-
-`codegraph status` reports both roots: `indexPath` is the current one, and
-`legacyIndexPaths` lists any old root still on disk. The old directory is left
-untouched — delete it by hand once you no longer want it.
+Project configuration remains in `.codegraph/config.toml` and
+`.codegraph/codegraph.json`; daemon rendezvous files (`daemon.pid`,
+`daemon.sock`, `daemon.log`) also live under `.codegraph/`. The compatibility
+fields `legacyIndexPresent` and `legacyIndexPaths` remain in `status --json`, but
+always report `false` and `[]` respectively.
 
 ---
 
@@ -116,7 +108,7 @@ irm https://raw.githubusercontent.com/sunerpy/codegraph-rust/main/scripts/instal
 # Fallback — build from source (only if you have a Rust toolchain)
 cargo install --git https://github.com/sunerpy/codegraph-rust codegraph-rs   # binary: `codegraph`
 
-codegraph init  /path/to/project     # create the index DB (.codegraph-v2/)
+codegraph init  /path/to/project     # create the index DB (.codegraph/)
 codegraph index /path/to/project     # parse + build the graph
 ```
 
@@ -243,7 +235,7 @@ Beyond wiring the MCP server, CodeGraph can install a `SKILL.md` directly into
 each agent's skill directory. The skill teaches your agent to use CodeGraph for
 code research and project onboarding — reach for `codegraph_explore` before
 grep/read, use `codegraph_node` instead of a plain file read on indexed source,
-and run `codegraph init` when no `.codegraph-v2/` index is present yet.
+and run `codegraph init` when no `.codegraph/` index is present yet.
 
 ```bash
 codegraph skill install --yes              # install into all detected agents (global)
@@ -409,7 +401,7 @@ LLM library _inside_ the codegraph binary itself.
 
 CodeGraph spawns a shared background daemon for each indexed project when you run
 `codegraph serve --mcp`. Multiple MCP clients (terminal tabs, agents) share that
-one daemon via a Unix socket (`.codegraph-v2/daemon.sock`). It exits once all
+one daemon via a Unix socket (`.codegraph/daemon.sock`). It exits once all
 clients disconnect and the idle timeout elapses.
 
 Key operations:
@@ -423,8 +415,8 @@ codegraph http stop <addr>     # terminate one HTTP server by address
 
 Set `CODEGRAPH_NO_DAEMON=1` to force foreground mode (useful in CI). The daemon
 watches files with a 2 s debounce; pass `--no-watch` or set `CODEGRAPH_NO_WATCH=1`
-to disable. Custom extension mapping goes in `.codegraph-v2/codegraph.json`;
-exclude patterns in `.codegraph-v2/config.toml` under `[indexing] exclude`.
+to disable. Custom extension mapping goes in `.codegraph/codegraph.json`;
+exclude patterns in `.codegraph/config.toml` under `[indexing] exclude`.
 
 Full env-var table, HTTP server details, filesystem fallback behavior, and the
 Claude prompt-hook: [`docs/mcp.md`](docs/mcp.md) and

@@ -5,7 +5,7 @@
 //! The file read is ALWAYS the caller-supplied current-root
 //! [`IndexPaths::extension_config`](codegraph_core::IndexPaths::extension_config)
 //! path: nothing here walks the directory tree, consults the process working
-//! directory, or reads a legacy `.codegraph/codegraph.json`. The parsed result is
+//! directory, or reads another project's `codegraph.json`. The parsed result is
 //! an immutable [`ExtensionOverrides`] value that the caller threads through
 //! [`crate::ExtractOptions`], so two projects served by ONE process cannot see
 //! each other's overrides and no cache can go stale.
@@ -169,8 +169,7 @@ mod tests {
         assert!(ExtensionOverrides::load_from_file(&missing).is_empty());
     }
 
-    /// The reader consults the caller's current-root path only: a legacy
-    /// `.codegraph/codegraph.json` next to it is never adopted.
+    /// The reader consults the caller's current-root path only.
     #[test]
     fn load_for_paths_reads_only_the_current_root_config() {
         let project = std::env::temp_dir().join(format!(

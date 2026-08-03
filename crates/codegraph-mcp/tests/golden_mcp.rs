@@ -87,12 +87,10 @@ fn setup_mini_project() -> TestProject {
     let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let base =
         std::env::temp_dir().join(format!("cg-mcp-test-{}-{nanos}-{seq}", std::process::id()));
-    // Batch M: the MCP engine now opens the isolated v2 namespace
-    // (`.codegraph-v2`), so stage the golden DB there.
-    fs::create_dir_all(base.join(".codegraph-v2")).unwrap();
+    fs::create_dir_all(base.join(".codegraph")).unwrap();
     copy_with_retry(
         &root.join("reference/golden/mini/colby.db"),
-        &base.join(".codegraph-v2").join("codegraph.db"),
+        &base.join(".codegraph").join("codegraph.db"),
     );
     let paths = codegraph_core::IndexPaths::resolve(&base, None).unwrap();
     codegraph_store::test_support::finalize_current_test_fixture(&paths).unwrap();
@@ -753,8 +751,7 @@ fn index_fixture(files: &[(&str, &str)]) -> TestProject {
         fs::create_dir_all(dst.parent().unwrap()).unwrap();
         fs::write(&dst, src).unwrap();
     }
-    // Batch M: the MCP engine reads the isolated v2 namespace (`.codegraph-v2`).
-    let mut store = Store::open(&base.join(".codegraph-v2").join("codegraph.db")).unwrap();
+    let mut store = Store::open(&base.join(".codegraph").join("codegraph.db")).unwrap();
     let mut all_edges = Vec::new();
     for (rel, src) in files {
         let metadata = fs::metadata(base.join(rel)).unwrap();

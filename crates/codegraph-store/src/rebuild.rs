@@ -25,7 +25,10 @@ use std::time::Instant;
 use codegraph_core::IndexPaths;
 use thiserror::Error;
 
-use crate::connection::{Store, StoreError, StoreWriteOpen, StoreWritePurpose};
+use crate::connection::{
+    Store, StoreError, StoreWriteOpen, StoreWritePurpose, database_sidecar_path,
+    first_existing_database_artifact,
+};
 use crate::{
     IndexLease, IndexLeaseError, IndexLeaseValidationError, StatePhase, StatePublishError,
     publish_index_state,
@@ -73,8 +76,8 @@ impl RebuildCheckpoint {
         match self {
             Self::BeforeWriteAuthorization => "classify for full-rebuild authorization",
             Self::BuildingPublished => "publish phase=building",
-            Self::BeforeDatabaseRemoval => "prepare v2 database artifact removal",
-            Self::DatabaseRemoved => "remove v2 database files",
+            Self::BeforeDatabaseRemoval => "prepare database artifact removal",
+            Self::DatabaseRemoved => "remove database files",
             Self::BeforePragmasRestored => "prepare default pragma restoration",
             Self::PragmasRestored => "restore default pragmas",
             Self::BeforeCompaction => "prepare database checkpoint and compaction",
@@ -132,8 +135,8 @@ pub enum RebuildError {
         /// Operating-system error.
         source: io::Error,
     },
-    /// A v2 database artifact could not be removed under the lease.
-    #[error("cannot remove v2 database artifact {path}: {source}")]
+    /// A database artifact could not be removed under the lease.
+    #[error("cannot remove database artifact {path}: {source}")]
     RemoveDatabase {
         /// Exact artifact path.
         path: PathBuf,
@@ -210,7 +213,7 @@ pub struct ActiveFullRebuild {
 }
 
 /// Acquire the single outer exclusive lease, classify under it, publish
-/// `phase=building`, and remove the previous v2 database files.
+/// `phase=building`, and remove the previous database files.
 pub fn begin_full_rebuild(
     paths: &IndexPaths,
     kind: RebuildKind,
@@ -303,7 +306,7 @@ fn resume_full_rebuild_with(
 }
 
 /// Shared destructive prologue: publish `phase=building` BEFORE deleting any
-/// database byte, then remove only the v2 database files — all under the one
+/// database byte, then remove only the database files — all under the one
 /// already-held exclusive lease carried by `authorization`.
 fn begin_from_authorization(
     paths: &IndexPaths,
@@ -312,6 +315,12 @@ fn begin_from_authorization(
     authorization: crate::connection::StoreWriteAuthorization,
     fault: &mut impl RebuildFault,
 ) -> Result<FullRebuild, RebuildError> {
+    let replaced_artifact = if authorization.status() == &crate::ExtractionStatus::Missing {
+        lease.validate_exclusive(paths)?;
+        first_existing_database_artifact(paths)?
+    } else {
+        None
+    };
     // `phase=building` is durable BEFORE any destructive database work, so an
     // interruption leaves an explicit, owner-bound marker instead of a bare DB.
     publish_index_state(paths, &lease, StatePhase::Building)?;
@@ -319,6 +328,13 @@ fn begin_from_authorization(
     checkpoint(fault, RebuildCheckpoint::BeforeDatabaseRemoval)?;
     remove_database_files(paths, &lease)?;
     checkpoint(fault, RebuildCheckpoint::DatabaseRemoved)?;
+    if let Some(path) = replaced_artifact {
+        tracing::info!(
+            path = %path.display(),
+            reason = "missing state slots",
+            "replaced stale foreign index database"
+        );
+    }
 
     Ok(FullRebuild {
         paths: paths.clone(),
@@ -648,23 +664,40 @@ fn acquire_outer_exclusive(
     deadline: Instant,
     cancelled: impl FnMut() -> bool,
 ) -> Result<IndexLease, RebuildError> {
-    // An existing namespace is never repaired: its permanent lock must already
-    // exist, otherwise acquisition fails closed. The existing-vs-initial
-    // decision itself lives in `IndexLease` so every lifecycle owner (rebuild,
-    // forced sync migration) takes the SAME one outer capability.
-    Ok(IndexLease::acquire_or_create_exclusive(
-        paths, deadline, cancelled,
-    )?)
+    let mut cancelled = cancelled;
+    match IndexLease::acquire_or_create_exclusive(paths, deadline, &mut cancelled) {
+        Ok(lease) => Ok(lease),
+        Err(IndexLeaseError::LockNotFound { .. })
+            if Store::extraction_status(paths) == crate::ExtractionStatus::Missing
+                && (first_existing_database_artifact(paths)?.is_some()
+                    || first_existing_project_config(paths)?.is_some()) =>
+        {
+            Ok(IndexLease::create_exclusive_in_existing_root(
+                paths, deadline, cancelled,
+            )?)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
-/// Remove only the v2 `codegraph.db`, `-wal`, and `-shm`. The legacy sibling is
-/// never a target, and no other namespace child is touched.
+fn first_existing_project_config(paths: &IndexPaths) -> Result<Option<PathBuf>, RebuildError> {
+    for path in [paths.config_toml(), paths.extension_config()] {
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => return Ok(Some(path)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => return Err(RebuildError::InspectRoot { path, source }),
+        }
+    }
+    Ok(None)
+}
+
 fn remove_database_files(paths: &IndexPaths, lease: &IndexLease) -> Result<(), RebuildError> {
     let db = paths.current_db();
-    for suffix in ["", "-wal", "-shm"] {
-        let mut native = db.as_os_str().to_os_string();
-        native.push(suffix);
-        let path = PathBuf::from(native);
+    for path in [
+        db.clone(),
+        database_sidecar_path(&db, "-wal"),
+        database_sidecar_path(&db, "-shm"),
+    ] {
         lease.validate_exclusive(paths)?;
         match std::fs::remove_file(&path) {
             Ok(()) => {}
@@ -1526,6 +1559,129 @@ mod tests {
         // Only after the rebuild handle is gone may another writer acquire.
         IndexLease::acquire_exclusive_existing(&paths, deadline(), || false)
             .expect("the lease is released once the finished rebuild is dropped");
+    }
+
+    #[test]
+    fn explicit_init_accepts_an_existing_config_only_root() {
+        let project = TempProject::new("config-only-root");
+        let paths = project.paths();
+        std::fs::create_dir(paths.current_root()).expect("create config-only root");
+        let config = br#"{"extensions":{".myext":"lua"}}"#;
+        std::fs::write(paths.extension_config(), config).expect("write project config");
+
+        let rebuild = begin_full_rebuild(&paths, RebuildKind::ExplicitInit, deadline(), || false)
+            .expect("config-only root must admit its first lifecycle lock")
+            .open_store()
+            .expect("open initial database");
+        build_graph(&rebuild);
+        rebuild.finish().expect("finish initial rebuild");
+
+        assert_eq!(Store::extraction_status(&paths), ExtractionStatus::Current);
+        assert!(paths.permanent_lock().is_file());
+        assert_eq!(
+            std::fs::read(paths.extension_config()).expect("read preserved project config"),
+            config
+        );
+    }
+
+    #[test]
+    fn concurrent_building_future_and_corrupt_are_never_taken_over() {
+        let building = TempProject::new("no-takeover-building");
+        let building_paths = building.paths();
+        let active = begin_full_rebuild(
+            &building_paths,
+            RebuildKind::ExplicitInit,
+            deadline(),
+            || false,
+        )
+        .expect("start the live builder")
+        .open_store()
+        .expect("open the live builder database");
+        build_graph(&active);
+        let building_slot_before = std::fs::read(building_paths.state_slots()[0].clone())
+            .expect("snapshot Building state");
+        let competing = begin_full_rebuild(
+            &building_paths,
+            RebuildKind::ExplicitInit,
+            Instant::now() + Duration::from_millis(50),
+            || false,
+        )
+        .expect_err("a concurrent builder must retain exclusive authority");
+        assert!(
+            matches!(
+                competing,
+                RebuildError::Lease(IndexLeaseError::TimedOut { .. })
+            ),
+            "unexpected concurrent-Building result: {competing}"
+        );
+        assert_eq!(
+            Store::extraction_status(&building_paths),
+            ExtractionStatus::Building {
+                built: CURRENT_EXTRACTION_VERSION,
+            }
+        );
+        assert_eq!(
+            std::fs::read(building_paths.state_slots()[0].clone()).expect("re-read Building state"),
+            building_slot_before,
+            "the competing command must not republish or delete Building state"
+        );
+        assert!(
+            building_paths.current_db().is_file(),
+            "the competing command must not delete the live builder's database"
+        );
+        drop(active);
+
+        for label in ["future", "corrupt"] {
+            let project = TempProject::new(&format!("no-takeover-{label}"));
+            let paths = project.paths();
+            run_successful_rebuild(&paths, RebuildKind::ExplicitInit);
+            let [slot0, slot1] = paths.state_slots();
+            if label == "future" {
+                let future = CURRENT_EXTRACTION_VERSION + 1;
+                let record = serde_json::json!({
+                    "sequence": 100,
+                    "storageProtocol": crate::CURRENT_STORAGE_PROTOCOL,
+                    "extractionVersion": future,
+                    "phase": "current",
+                    "projectIdentity": paths.project_identity(),
+                    "checksum": crate::checksum_hex(
+                        100,
+                        crate::CURRENT_STORAGE_PROTOCOL,
+                        future,
+                        "current",
+                        paths.project_identity(),
+                    ),
+                });
+                std::fs::write(&slot0, serde_json::to_vec(&record).unwrap()).unwrap();
+            } else {
+                std::fs::write(&slot0, b"{ not valid state").unwrap();
+            }
+            let _ = std::fs::remove_file(&slot1);
+            let db_before = std::fs::read(paths.current_db()).expect("snapshot guarded DB");
+            let slot_before = std::fs::read(&slot0).expect("snapshot guarded state");
+
+            let error = begin_full_rebuild(&paths, RebuildKind::ExplicitInit, deadline(), || false)
+                .expect_err("Future and Corrupt must fail closed");
+            assert!(
+                matches!(
+                    error,
+                    RebuildError::Store(StoreError::StateRejected {
+                        status: ExtractionStatus::Future { .. } | ExtractionStatus::Corrupt { .. },
+                    })
+                ),
+                "unexpected {label} result: {error}"
+            );
+            assert_eq!(
+                std::fs::read(paths.current_db()).expect("re-read guarded DB"),
+                db_before,
+                "{label} database bytes must not be replaced"
+            );
+            assert_eq!(
+                std::fs::read(&slot0).expect("re-read guarded state"),
+                slot_before,
+                "{label} state bytes must not be replaced"
+            );
+        }
     }
 
     #[test]

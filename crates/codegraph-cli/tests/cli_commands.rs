@@ -301,7 +301,7 @@ fn unlock_removes_existing_lock_file() {
     let dir = TestDir::new("unlock-lock");
     let project = indexed_project(&dir);
     let p = project.to_str().unwrap();
-    let lock = project.join(".codegraph-v2/codegraph.lock");
+    let lock = project.join(".codegraph/codegraph.lock");
     std::fs::write(&lock, b"stale").unwrap();
     let run = run_in(dir.path(), &["unlock", p]);
     assert!(run.ok, "unlock must succeed: {}", run.stderr);
@@ -328,7 +328,7 @@ fn uninit_requires_force_then_preserves_recovery_state() {
         refused.stderr
     );
     assert!(
-        project.join(".codegraph-v2").exists(),
+        project.join(".codegraph").exists(),
         "uninit without --force must not delete the index"
     );
 

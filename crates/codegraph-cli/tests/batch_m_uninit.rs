@@ -193,11 +193,11 @@ fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(10)
 }
 
-fn assert_legacy_bytes(legacy_file: &Path, expected: &[u8]) {
+fn assert_unrelated_bytes(unrelated_file: &Path, expected: &[u8]) {
     assert_eq!(
-        std::fs::read(legacy_file).expect("read untouched legacy proof"),
+        std::fs::read(unrelated_file).expect("read untouched unrelated proof"),
         expected,
-        "v2 lifecycle operations must not mutate the legacy namespace"
+        "index lifecycle operations must not mutate unrelated project data"
     );
 }
 
@@ -216,12 +216,12 @@ fn interrupted_uninit_state_slot_is_recoverable_not_corrupt() {
         "setup: init must succeed before the lifecycle assertion: stdout={}, stderr={}",
         init.stdout, init.stderr
     );
-    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
-    let legacy = project.join(".codegraph");
-    std::fs::create_dir(&legacy).expect("create independent legacy namespace");
-    let legacy_file = legacy.join("legacy.bin");
-    let legacy_bytes = b"legacy bytes must remain unchanged";
-    std::fs::write(&legacy_file, legacy_bytes).expect("write legacy proof bytes");
+    let paths = IndexPaths::resolve(&project, None).expect("resolve index paths");
+    let unrelated = project.join("unrelated-cache");
+    std::fs::create_dir(&unrelated).expect("create unrelated project directory");
+    let unrelated_file = unrelated.join("keep.bin");
+    let unrelated_bytes = b"unrelated bytes must remain unchanged";
+    std::fs::write(&unrelated_file, unrelated_bytes).expect("write unrelated proof bytes");
 
     for (path, bytes) in [
         (
@@ -251,7 +251,7 @@ fn interrupted_uninit_state_slot_is_recoverable_not_corrupt() {
     assert_eq!(
         Store::extraction_status(&paths),
         ExtractionStatus::Uninitialized,
-        "uninit --force must durably publish phase=uninitialized before cleanup; deleting the whole v2 root loses the authenticated recovery state"
+        "uninit --force must durably publish phase=uninitialized before cleanup; deleting the whole index root loses the authenticated recovery state"
     );
     assert!(
         paths.permanent_lock().is_file(),
@@ -267,7 +267,7 @@ fn interrupted_uninit_state_slot_is_recoverable_not_corrupt() {
     );
     assert!(
         !paths.current_db().exists(),
-        "successful uninit cleanup must remove the v2 database"
+        "successful uninit cleanup must remove the database"
     );
     for path in [
         db_sidecar(&paths.current_db(), "-wal"),
@@ -284,7 +284,7 @@ fn interrupted_uninit_state_slot_is_recoverable_not_corrupt() {
             path.display()
         );
     }
-    assert_legacy_bytes(&legacy_file, legacy_bytes);
+    assert_unrelated_bytes(&unrelated_file, unrelated_bytes);
 
     let status = run_in(dir.path(), &["status", "--json", project_arg]);
     assert!(
@@ -296,7 +296,8 @@ fn interrupted_uninit_state_slot_is_recoverable_not_corrupt() {
         serde_json::from_str(status.stdout.trim()).expect("status emits JSON");
     assert_eq!(status_json["initialized"], false);
     assert_eq!(status_json["extractionStatus"], "uninitialized");
-    assert_eq!(status_json["legacyIndexPresent"], true);
+    assert_eq!(status_json["legacyIndexPresent"], false);
+    assert_eq!(status_json["legacyIndexPaths"], serde_json::json!([]));
 
     for args in [
         vec!["sync", project_arg],
@@ -316,7 +317,7 @@ fn interrupted_uninit_state_slot_is_recoverable_not_corrupt() {
             &namespace_snapshot(paths.current_root()),
             &format!("rejected command {args:?}"),
         );
-        assert_legacy_bytes(&legacy_file, legacy_bytes);
+        assert_unrelated_bytes(&unrelated_file, unrelated_bytes);
     }
 
     let first_sequence = classify(&paths)
@@ -341,7 +342,7 @@ fn interrupted_uninit_state_slot_is_recoverable_not_corrupt() {
         first_sequence + 1,
         "continued uninit must publish a monotonic Uninitialized sequence"
     );
-    assert_legacy_bytes(&legacy_file, legacy_bytes);
+    assert_unrelated_bytes(&unrelated_file, unrelated_bytes);
 
     let recovery = run_in(dir.path(), &["init", project_arg]);
     assert!(
@@ -358,7 +359,7 @@ fn interrupted_uninit_state_slot_is_recoverable_not_corrupt() {
         !paths.tombstone().exists(),
         "only successful explicit init recovery removes the tombstone"
     );
-    assert_legacy_bytes(&legacy_file, legacy_bytes);
+    assert_unrelated_bytes(&unrelated_file, unrelated_bytes);
 }
 
 #[test]
@@ -381,52 +382,30 @@ fn namespace_snapshot_detects_equal_length_byte_mutation() {
 }
 
 #[test]
-fn absolute_configured_root_requires_explicit_project_for_nested_uninit() {
+fn absolute_configured_root_is_rejected_without_creating_an_index() {
     let dir = TestDir::new("absolute-configured-root");
     let project = dir.path().join("mini");
     copy_tree(&mini_fixture(), &project);
-    let nested = project.join("src/nested");
-    std::fs::create_dir_all(&nested).expect("create nested invocation directory");
     let configured = dir.path().join("shared-index");
     let project_arg = project.to_str().expect("UTF-8 project path");
 
     let init = run_in_with_config(dir.path(), &["init", project_arg], Some(&configured));
     assert!(
-        init.ok,
-        "configured init failed: {} {}",
+        !init.ok,
+        "absolute configured root must be rejected: {} {}",
         init.stdout, init.stderr
     );
-    let paths =
-        IndexPaths::resolve(&project, configured.to_str()).expect("resolve configured root");
-    let before = namespace_snapshot(paths.current_root());
-
-    let implicit = run_in_with_config(&nested, &["uninit", "--force"], Some(&configured));
-    assert!(!implicit.ok, "nested implicit uninit must fail");
     assert!(
-        implicit.stderr.contains("pass the project root explicitly"),
-        "stable remedy missing: {}",
-        implicit.stderr
-    );
-    assert_namespace_unchanged(
-        &before,
-        &namespace_snapshot(paths.current_root()),
-        "nested implicit absolute-root uninit refusal",
-    );
-
-    let explicit = run_in_with_config(
-        &nested,
-        &["uninit", "--force", project_arg],
-        Some(&configured),
+        init.stderr
+            .contains("must be one non-empty project-local directory name"),
+        "stable rejection missing: {}",
+        init.stderr
     );
     assert!(
-        explicit.ok,
-        "explicit project-root uninit must succeed: {} {}",
-        explicit.stdout, explicit.stderr
+        !configured.exists(),
+        "a rejected absolute root must not be created"
     );
-    assert_eq!(
-        Store::extraction_status(&paths),
-        ExtractionStatus::Uninitialized
-    );
+    assert!(!project.join(".codegraph").exists());
 }
 
 fn stage_lifecycle_state(paths: &IndexPaths, status: &str) {
@@ -513,7 +492,7 @@ fn nested_status_discovers_interrupted_uninit_with_relative_configured_root() {
     copy_tree(&mini_fixture(), &project);
     let nested = project.join("src/nested");
     std::fs::create_dir_all(&nested).expect("create nested invocation directory");
-    let configured = Path::new("cache/index");
+    let configured = Path::new("cache");
     let project_arg = project.to_str().expect("UTF-8 project path");
     let init = run_in_with_config(dir.path(), &["init", project_arg], Some(configured));
     assert!(init.ok, "relative configured init failed: {}", init.stderr);

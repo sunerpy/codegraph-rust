@@ -71,8 +71,8 @@ pub struct CodeGraphEngine {
     project_root: PathBuf,
     /// The ADDRESSED project's own immutable config, loaded per request from its
     /// resolved current index root. A server that answers for many projects (a
-    /// global HTTP process) therefore honors each project's own settings, and
-    /// nothing here reads a process-global value or a legacy `.codegraph` config.
+    /// global HTTP process) therefore honors each project's own settings without
+    /// reading a process-global value or another project's config.
     config: Arc<Config>,
     /// Request-local source/freshness memo. `execute` clears it before every tool
     /// call so repeated render passes stat and read each referenced file once.
@@ -84,10 +84,10 @@ pub struct CodeGraphEngine {
 impl CodeGraphEngine {
     const READ_LEASE_TIMEOUT: Duration = Duration::from_secs(30);
 
-    /// Open the store at the project's current (v2) index DB, resolved
+    /// Open the store at the project's current index DB, resolved
     /// fail-closed through the single `codegraph-core::IndexPaths` authority
-    /// (`.codegraph-v2/codegraph.db` by default; a `<name>-v2-<projectIdentity>`
-    /// sibling for a configured `CODEGRAPH_DIR`). An unsafe/aliased/overlapping
+    /// (`.codegraph/codegraph.db` by default, or a configured project-local
+    /// directory). An unsafe or aliased
     /// configured root errors here rather than opening a reconstructed path.
     pub fn open(project_root: &Path) -> anyhow::Result<Self> {
         let paths = codegraph_core::IndexPaths::resolve(
@@ -4884,10 +4884,9 @@ mod tests {
             std::process::id(),
             TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
-        // Batch M: `CodeGraphEngine::open` reads the isolated v2 namespace.
-        std::fs::create_dir_all(base.join(".codegraph-v2")).unwrap();
+        std::fs::create_dir_all(base.join(".codegraph")).unwrap();
         {
-            let db = base.join(".codegraph-v2").join("codegraph.db");
+            let db = base.join(".codegraph").join("codegraph.db");
             Store::open(&db).unwrap();
         }
         let paths = codegraph_core::IndexPaths::resolve(&base, None).unwrap();

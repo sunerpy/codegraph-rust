@@ -194,12 +194,12 @@ fn full_rebuild_publishes_readable_current_last_via_cli() {
          (stdout={}, stderr={})",
         run.stdout, run.stderr
     );
-    let paths = IndexPaths::resolve(&project, None).expect("resolve default v2 paths");
+    let paths = IndexPaths::resolve(&project, None).expect("resolve default index paths");
     assert!(
         std::fs::metadata(paths.current_db())
             .map(|m| m.len() > 0)
             .unwrap_or(false),
-        "setup: `init` must produce a non-empty v2 DB at {}",
+        "setup: `init` must produce a non-empty DB at {}",
         paths.current_db().display()
     );
 
@@ -226,7 +226,7 @@ fn explicit_init_recovers_interrupted_building_with_db_present_or_absent() {
         });
         let project = dir.path().join("mini");
         copy_tree(&mini_fixture(), &project);
-        let paths = IndexPaths::resolve(&project, None).expect("resolve default v2 paths");
+        let paths = IndexPaths::resolve(&project, None).expect("resolve default index paths");
         stage_interrupted_building(&paths, db_present);
 
         let run = run_in(dir.path(), &["init", project.to_str().unwrap()]);
@@ -256,7 +256,7 @@ fn index_recovers_interrupted_building_with_db_present_or_absent() {
         });
         let project = dir.path().join("mini");
         copy_tree(&mini_fixture(), &project);
-        let paths = IndexPaths::resolve(&project, None).expect("resolve default v2 paths");
+        let paths = IndexPaths::resolve(&project, None).expect("resolve default index paths");
         stage_interrupted_building(&paths, db_present);
 
         let run = run_in(dir.path(), &["index", "--force", project.to_str().unwrap()]);
@@ -285,7 +285,7 @@ fn explicit_init_recovers_current_with_tombstone_residue() {
         "initial init must succeed: {} {}",
         initial.stdout, initial.stderr
     );
-    let paths = IndexPaths::resolve(&project, None).expect("resolve default v2 paths");
+    let paths = IndexPaths::resolve(&project, None).expect("resolve default index paths");
     std::fs::write(paths.tombstone(), b"remove failed")
         .expect("stage Current+tombstone finalizer residue");
     assert!(

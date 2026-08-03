@@ -1,4 +1,4 @@
-//! Public behavioral contract for the reusable v2 index lease capability.
+//! Public behavioral contract for the reusable index lease capability.
 
 use std::cell::Cell;
 use std::fs::OpenOptions;

@@ -7,7 +7,7 @@ description: >
   defined", tracing a call flow, onboarding/surveying an area, or
   whole-project analysis: "analyze the project", "explain the architecture",
   "what does this project do". Also trigger when asked to index/initialize a
-  codebase, or when .codegraph-v2/ is present. Prefer codegraph_* tools over
+codebase, or when .codegraph/ is present. Prefer codegraph_* tools over
   grep, find, or Read on source files — one call returns verbatim source plus
   the structural graph, replacing dozens of grep+read round-trips. Chinese
   triggers: "分析项目代码", "分析这个仓库", "代码分析", "这个项目是做什么的".
@@ -17,7 +17,7 @@ description: >
 
 CodeGraph is a **deterministic** code knowledge graph built on tree-sitter and
 SQLite/FTS5. It parses a codebase, extracts symbols and their relationships, and
-persists everything to a per-project `.codegraph-v2/` database. There is no AI, no
+persists everything to a per-project `.codegraph/` database. There is no AI, no
 LLM, no vector store, and no embeddings anywhere inside the binary — output is
 byte-stable and fully reproducible.
 
@@ -31,11 +31,11 @@ reads. You get more accurate context in far fewer tokens and round-trips.
 
 ### Detect a live index
 
-A project is indexed when a `.codegraph-v2/` directory exists at its root. Check
+A project is indexed when a `.codegraph/` directory exists at its root. Check
 for it before reaching for grep or Read on source files:
 
 ```
-.codegraph-v2/   ← present = indexed; absent = not yet indexed
+.codegraph/   ← present = indexed; absent = not yet indexed
 ```
 
 A `.codegraph/` directory is an index left by `v0.40.4` or earlier. It is never
@@ -56,7 +56,7 @@ irm https://raw.githubusercontent.com/sunerpy/codegraph-rust/main/scripts/instal
 cargo install --git https://github.com/sunerpy/codegraph-rust codegraph-rs
 
 # Index the project
-codegraph init  /path/to/project   # create .codegraph-v2/ and run first index
+codegraph init  /path/to/project   # create .codegraph/ and run first index
 codegraph index /path/to/project   # re-index after large changes
 ```
 
@@ -185,7 +185,7 @@ CodeGraph indexes source code. Fall back to the Read tool or grep for:
 
 - Config files, TOML, YAML, JSON, Markdown, lock files, data files
 - Files flagged in the stale-index banner
-- Anything outside the indexed source tree (the `.codegraph-v2/` dir itself,
+- Anything outside the indexed source tree (the `.codegraph/` dir itself,
   build artifacts, vendored binaries)
 
 For everything else in an indexed project, prefer the codegraph tools. The

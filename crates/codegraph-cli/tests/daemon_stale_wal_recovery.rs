@@ -103,7 +103,7 @@ fn indexed_project(label: &str) -> (TestDir, PathBuf) {
 }
 
 fn index_paths(project: &Path) -> codegraph_core::IndexPaths {
-    codegraph_core::IndexPaths::resolve(project, None).expect("resolve v2 index paths")
+    codegraph_core::IndexPaths::resolve(project, None).expect("resolve index paths")
 }
 
 fn sidecar(db: &Path, suffix: &str) -> PathBuf {

@@ -2,14 +2,14 @@
 //! `failed_engine_open_is_not_cached_and_next_request_recovers`.
 //!
 //! ONE long-lived SHIPPED MCP process (`codegraph serve --mcp --path <project>`)
-//! receives a request whose engine/`Store` open FAILS for a real v2
+//! receives a request whose engine/`Store` open FAILS for a real index
 //! state/artifact reason. The process must stay healthy, must retain NOTHING
 //! from that failed open — no cached error, no partial engine, no `Store`, no
 //! SQLite handle, no lease, no stale project result — and the NEXT request in the
 //! SAME process, after the namespace is repaired without a restart, must succeed
 //! and serve ONLY the repaired graph.
 //!
-//! # The staged failure is a real v2 inconsistency, not a stub
+//! # The staged failure is a real index inconsistency, not a stub
 //!
 //! The served project is really indexed by the shipped `codegraph init`, then
 //! BOTH fixed state slots are removed and nothing else. The namespace therefore
@@ -73,11 +73,11 @@
 //!   both graphs, so a catch-up that somehow ran after the repair is a proven
 //!   no-op rather than a source of the assertions.
 //!
-//! # A legacy namespace is not a recovery source
+//! # An unrelated sibling namespace is not a recovery source
 //!
-//! The project also carries a legacy `.codegraph/codegraph.db` holding a TRAP
-//! symbol that exists in no other graph. Request 2 must not surface it, so a
-//! silent legacy fallback cannot masquerade as recovery.
+//! The project also carries an unrelated sibling database holding a TRAP symbol
+//! that exists in no other graph. Request 2 must not surface it, so an accidental
+//! fallback cannot masquerade as recovery.
 //!
 //! # Scope
 //!
@@ -95,7 +95,10 @@ use std::time::{Duration, Instant};
 
 use codegraph_core::IndexPaths;
 use codegraph_extract::ExtractOptions;
-use codegraph_store::{ExtractionStatus, IndexLease, Store};
+use codegraph_store::{
+    CURRENT_EXTRACTION_VERSION, CURRENT_STORAGE_PROTOCOL, ExtractionStatus, IndexLease, Store,
+    checksum_hex,
+};
 use serde_json::{Value, json};
 
 /// Finite deadlock guard for every blocking wait. Never ordering evidence.
@@ -115,14 +118,14 @@ const ORIGINAL_FILE: &str = "supplied/zrqmfoss.ts";
 const REPAIRED_SYMBOL: &str = "vtwkhelm";
 /// The repo-relative file that exists ONLY in the repaired graph.
 const REPAIRED_FILE: &str = "supplied/vtwkhelm.ts";
-/// The symbol that exists ONLY in the LEGACY `.codegraph` database.
-const LEGACY_TRAP_SYMBOL: &str = "jbxdlurn";
-/// The repo-relative file that exists ONLY in the legacy database.
-const LEGACY_TRAP_FILE: &str = "supplied/jbxdlurn.ts";
+/// The symbol that exists ONLY in the unrelated sibling database.
+const UNRELATED_TRAP_SYMBOL: &str = "jbxdlurn";
+/// The repo-relative file that exists ONLY in the unrelated sibling database.
+const UNRELATED_TRAP_FILE: &str = "supplied/jbxdlurn.ts";
 
-/// The exact fail-closed diagnostic the v2 read gate produces for a `Missing`
+/// The exact fail-closed diagnostic the read gate produces for a `Missing`
 /// state whose database artifact still exists.
-const MISSING_WITH_DB: &str = "state is missing but a database artifact already exists";
+const FUTURE_STATE: &str = "future";
 
 /// The compatibility close seam this recovery flow must never touch, spelled in
 /// two halves so this file's own bytes are not a match for it.
@@ -187,7 +190,7 @@ fn base_command() -> Command {
     command
 }
 
-/// Run the SHIPPED `codegraph init` over `project`, producing a real v2
+/// Run the SHIPPED `codegraph init` over `project`, producing a real
 /// namespace (permanent lock + published `Current` state slots + stamped,
 /// checkpointed database). Never a hand-authored fixture.
 fn shipped_init(project: &Path) {
@@ -206,7 +209,7 @@ fn shipped_init(project: &Path) {
 }
 
 fn index_paths(project: &Path) -> IndexPaths {
-    IndexPaths::resolve(project, None).expect("resolve v2 IndexPaths")
+    IndexPaths::resolve(project, None).expect("resolve IndexPaths")
 }
 
 /// Build a project containing the neutral source plus `supplied_rel`, index it
@@ -234,10 +237,10 @@ fn build_graph_database(
 }
 
 /// Materialize a really indexed served project, freeze the supplied sources out
-/// of every future scan, plant the legacy trap graph, and then break the v2
+/// of every future scan, plant the unrelated trap graph, and then break the
 /// namespace into the REAL `Missing`-state-with-existing-database inconsistency
 /// by removing ONLY the two fixed state slots.
-fn stage_missing_state_with_database(project: &Path, staging: &TestDir, label: &str) -> IndexPaths {
+fn stage_future_state_with_database(project: &Path, staging: &TestDir, label: &str) -> IndexPaths {
     fs::create_dir_all(project).expect("create served project");
     write_source(project, NEUTRAL_FILE, &neutral_source());
     write_source(project, ORIGINAL_FILE, &source_for(ORIGINAL_SYMBOL));
@@ -246,9 +249,13 @@ fn stage_missing_state_with_database(project: &Path, staging: &TestDir, label: &
     // Both distinguishing sources exist on disk from here on, so no sync can
     // classify either as removed.
     write_source(project, REPAIRED_FILE, &source_for(REPAIRED_SYMBOL));
-    write_source(project, LEGACY_TRAP_FILE, &source_for(LEGACY_TRAP_SYMBOL));
+    write_source(
+        project,
+        UNRELATED_TRAP_FILE,
+        &source_for(UNRELATED_TRAP_SYMBOL),
+    );
     freeze_supplied_sources_out_of_scans(project);
-    plant_legacy_trap_graph(project, staging, label);
+    plant_unrelated_trap_graph(project, staging, label);
 
     let paths = index_paths(project);
     assert_eq!(
@@ -257,18 +264,40 @@ fn stage_missing_state_with_database(project: &Path, staging: &TestDir, label: &
         "the shipped init must leave a readable Current namespace before it is broken"
     );
 
-    for slot in paths.state_slots() {
-        if slot.exists() {
-            fs::remove_file(&slot).expect("remove one fixed state slot");
-        }
+    let [future_slot, inactive_slot] = paths.state_slots();
+    let sequence = 100;
+    let extraction_version = CURRENT_EXTRACTION_VERSION + 1;
+    let phase = "current";
+    let checksum = checksum_hex(
+        sequence,
+        CURRENT_STORAGE_PROTOCOL,
+        extraction_version,
+        phase,
+        paths.project_identity(),
+    );
+    fs::write(
+        &future_slot,
+        serde_json::to_vec(&json!({
+            "sequence": sequence,
+            "storageProtocol": CURRENT_STORAGE_PROTOCOL,
+            "extractionVersion": extraction_version,
+            "phase": phase,
+            "projectIdentity": paths.project_identity(),
+            "checksum": checksum,
+        }))
+        .expect("serialize Future state"),
+    )
+    .expect("write Future state");
+    if inactive_slot.exists() {
+        fs::remove_file(&inactive_slot).expect("remove inactive state slot");
     }
 
-    // The namespace is now genuinely inconsistent: no state, but the database
-    // and the permanent lock are still there.
     assert_eq!(
         Store::extraction_status(&paths),
-        ExtractionStatus::Missing,
-        "removing both fixed state slots must classify the namespace Missing"
+        ExtractionStatus::Future {
+            built: extraction_version
+        },
+        "the staged namespace must classify Future"
     );
     assert!(
         paths.current_db().is_file(),
@@ -282,18 +311,18 @@ fn stage_missing_state_with_database(project: &Path, staging: &TestDir, label: &
     );
     assert!(
         !paths.tombstone().exists(),
-        "the staged failure is a missing-state inconsistency, not an uninit tombstone"
+        "the staged failure is a Future state, not an uninit tombstone"
     );
 
     // The read gate must reject it for exactly the staged reason, checked before
     // any server is involved so the acceptance cannot mistake another failure
     // for this one.
     let rejection = Store::open_for_read(&paths, Instant::now() + WAIT, || false)
-        .expect_err("a Missing state with an existing database must fail closed")
+        .expect_err("a Future state with an existing database must fail closed")
         .to_string();
     assert!(
-        rejection.contains(MISSING_WITH_DB),
-        "the staged condition must be the missing-state-with-database refusal: {rejection}"
+        rejection.contains(FUTURE_STATE),
+        "the staged condition must be the Future-state refusal: {rejection}"
     );
 
     paths
@@ -311,7 +340,7 @@ fn freeze_supplied_sources_out_of_scans(project: &Path) {
         scanned.contains(&NEUTRAL_FILE.to_string()),
         "the neutral source must stay scannable so startup catch-up is a real no-op: {scanned:?}"
     );
-    for rel in [ORIGINAL_FILE, REPAIRED_FILE, LEGACY_TRAP_FILE] {
+    for rel in [ORIGINAL_FILE, REPAIRED_FILE, UNRELATED_TRAP_FILE] {
         assert!(
             !scanned.contains(&rel.to_string()),
             "no sync may be able to index {rel}, or the recovery request could pass by reindexing \
@@ -324,18 +353,18 @@ fn freeze_supplied_sources_out_of_scans(project: &Path) {
     }
 }
 
-/// Plant a LEGACY `.codegraph/codegraph.db` holding a graph that exists nowhere
-/// else, so a silent legacy fallback cannot masquerade as recovery.
-fn plant_legacy_trap_graph(project: &Path, staging: &TestDir, label: &str) {
+/// Plant an unrelated sibling database holding a graph that exists nowhere else.
+fn plant_unrelated_trap_graph(project: &Path, staging: &TestDir, label: &str) {
     let trap_db = build_graph_database(
         staging,
-        &format!("{label}-legacy-trap"),
-        LEGACY_TRAP_FILE,
-        LEGACY_TRAP_SYMBOL,
+        &format!("{label}-unrelated-trap"),
+        UNRELATED_TRAP_FILE,
+        UNRELATED_TRAP_SYMBOL,
     );
-    let legacy_root = project.join(".codegraph");
-    fs::create_dir_all(&legacy_root).expect("create the legacy root");
-    fs::copy(&trap_db, legacy_root.join("codegraph.db")).expect("plant the legacy trap database");
+    let unrelated_root = project.join(".codegraph-unrelated");
+    fs::create_dir_all(&unrelated_root).expect("create unrelated sibling root");
+    fs::copy(&trap_db, unrelated_root.join("codegraph.db"))
+        .expect("plant the unrelated trap database");
 }
 
 /// Repair the staged namespace WITHOUT restarting the server.
@@ -363,10 +392,15 @@ fn repair_without_restart(paths: &IndexPaths, repaired_db: &Path) {
             target.display()
         )
     });
+    for slot in paths.state_slots() {
+        if slot.exists() {
+            fs::remove_file(slot).expect("remove Future state before repair publication");
+        }
+    }
     drop(lease);
 
     codegraph_store::test_support::finalize_current_test_fixture(paths)
-        .expect("republish Missing -> Building -> Current over the repaired database");
+        .expect("publish Building -> Current over the repaired database");
 
     // Repair COMPLETION is observed from published state and artifact shape, not
     // from elapsed time.
@@ -569,14 +603,14 @@ fn tool_error_text(response: &Value, context: &str) -> String {
 
 #[test]
 fn failed_engine_open_is_not_cached_and_next_request_recovers() {
-    // GIVEN a really indexed v2 project broken into the REAL
+    // GIVEN a really indexed project broken into the REAL
     // `Missing`-state-with-existing-database inconsistency, its distinguishing
-    // sources frozen out of every scan, a legacy trap graph planted beside it,
+    // sources frozen out of every scan, an unrelated trap graph planted beside it,
     // and a separately built repaired database.
     let home = TestDir::new("served");
     let project = home.path().join("project");
     let staging = TestDir::new("staging");
-    let paths = stage_missing_state_with_database(&project, &staging, "served");
+    let paths = stage_future_state_with_database(&project, &staging, "served");
     let repaired_db = build_graph_database(&staging, "repaired", REPAIRED_FILE, REPAIRED_SYMBOL);
 
     // ONE long-lived shipped MCP process serves the whole session.
@@ -592,7 +626,7 @@ fn failed_engine_open_is_not_cached_and_next_request_recovers() {
     server.send(&initialized);
 
     // WHEN request 1 resolves the project but FAILS opening the engine/Store on
-    // the staged v2 inconsistency (its framed response IS the READY barrier) ...
+    // the staged inconsistency (its framed response IS the READY barrier) ...
     server.send(&search_frame(2, &project, REPAIRED_SYMBOL));
     let failure = tool_error_text(&server.await_response(2), "request 1");
     assert!(
@@ -600,8 +634,8 @@ fn failed_engine_open_is_not_cached_and_next_request_recovers() {
         "request 1 must fail in the ENGINE OPEN, after project resolution: {failure}"
     );
     assert!(
-        failure.contains(MISSING_WITH_DB),
-        "request 1 must fail for the staged v2 state/artifact reason: {failure}"
+        failure.contains(FUTURE_STATE),
+        "request 1 must fail for the staged state/artifact reason: {failure}"
     );
     assert!(
         !failure.contains("No indexed project"),
@@ -632,8 +666,8 @@ fn failed_engine_open_is_not_cached_and_next_request_recovers() {
         "request 2 must not leak the pre-repair graph: {recovered}"
     );
     assert!(
-        !recovered.contains(LEGACY_TRAP_FILE),
-        "request 2 must not read the legacy namespace: {recovered}"
+        !recovered.contains(UNRELATED_TRAP_FILE),
+        "request 2 must not read the unrelated sibling namespace: {recovered}"
     );
 
     // The pre-repair symbol is GONE from the same long-lived session, observed
@@ -646,12 +680,12 @@ fn failed_engine_open_is_not_cached_and_next_request_recovers() {
         "the pre-repair symbol must be absent from the repaired graph: {original}"
     );
 
-    // And the legacy trap graph is unreachable through the recovered session.
-    server.send(&search_frame(5, &project, LEGACY_TRAP_SYMBOL));
+    // And the unrelated trap graph is unreachable through the recovered session.
+    server.send(&search_frame(5, &project, UNRELATED_TRAP_SYMBOL));
     let trap = tool_text(&server.await_response(5), "request 4");
     assert!(
         trap.contains("No results found"),
-        "the legacy trap symbol must never be reachable: {trap}"
+        "the unrelated trap symbol must never be reachable: {trap}"
     );
 
     server.shutdown();
@@ -666,7 +700,7 @@ fn in_process_engine_open_failure_leaves_no_cached_state_and_reopens_repaired() 
     let home = TestDir::new("inproc");
     let project = home.path().join("project");
     let staging = TestDir::new("inproc-staging");
-    let paths = stage_missing_state_with_database(&project, &staging, "inproc");
+    let paths = stage_future_state_with_database(&project, &staging, "inproc");
     let repaired_db =
         build_graph_database(&staging, "inproc-repaired", REPAIRED_FILE, REPAIRED_SYMBOL);
 
@@ -677,7 +711,7 @@ fn in_process_engine_open_failure_leaves_no_cached_state_and_reopens_repaired() 
         Err(error) => error.to_string(),
     };
     assert!(
-        first.contains(MISSING_WITH_DB),
+        first.contains(FUTURE_STATE),
         "the in-process failure must be the staged state/artifact refusal: {first}"
     );
 
@@ -703,8 +737,8 @@ fn in_process_engine_open_failure_leaves_no_cached_state_and_reopens_repaired() 
         "the reopened engine must observe the repaired file: {text}"
     );
     assert!(
-        !text.contains(ORIGINAL_FILE) && !text.contains(LEGACY_TRAP_FILE),
-        "the reopened engine must not surface the pre-repair or legacy graph: {text}"
+        !text.contains(ORIGINAL_FILE) && !text.contains(UNRELATED_TRAP_FILE),
+        "the reopened engine must not surface the pre-repair or unrelated graph: {text}"
     );
 }
 
@@ -714,19 +748,19 @@ fn in_process_engine_open_failure_leaves_no_cached_state_and_reopens_repaired() 
 /// `Missing`-with-database namespace with the same diagnostic and leaves the
 /// database bytes and the (absent) state slots exactly as they were.
 #[test]
-fn catch_up_sync_refuses_missing_state_with_database_without_mutating_bytes() {
+fn catch_up_sync_refuses_future_state_without_mutating_bytes() {
     let home = TestDir::new("catchup");
     let project = home.path().join("project");
     let staging = TestDir::new("catchup-staging");
-    let paths = stage_missing_state_with_database(&project, &staging, "catchup");
+    let paths = stage_future_state_with_database(&project, &staging, "catchup");
 
     let before = fs::read(paths.current_db()).expect("read the staged database bytes");
 
     let error = codegraph_watch::sync_project_once(&project)
-        .expect_err("a catch-up sync must refuse the staged Missing-with-database namespace")
+        .expect_err("a catch-up sync must refuse the staged Future namespace")
         .to_string();
     assert!(
-        error.contains(MISSING_WITH_DB),
+        error.contains(FUTURE_STATE),
         "the catch-up refusal must be the staged state/artifact gate: {error}"
     );
 
@@ -735,13 +769,10 @@ fn catch_up_sync_refuses_missing_state_with_database_without_mutating_bytes() {
         before, after,
         "the refused catch-up must leave the database bytes byte-identical"
     );
-    for slot in paths.state_slots() {
-        assert!(
-            !slot.exists(),
-            "the refused catch-up must not publish a state slot at {}",
-            slot.display()
-        );
-    }
+    assert!(matches!(
+        Store::extraction_status(&paths),
+        ExtractionStatus::Future { .. }
+    ));
     assert!(
         !paths.tombstone().exists(),
         "the refused catch-up must not create a tombstone"

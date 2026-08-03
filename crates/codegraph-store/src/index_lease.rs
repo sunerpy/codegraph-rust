@@ -1,4 +1,4 @@
-//! Cooperative kernel-lock capability for one resolved v2 index namespace.
+//! Cooperative kernel-lock capability for one resolved index namespace.
 //!
 //! A lease owns one locked file description behind an [`Arc`]. Cloning a lease
 //! clones only that `Arc`; the file is unlocked and closed when the final owner
@@ -63,7 +63,7 @@ impl Drop for LeaseInner {
     }
 }
 
-/// A cloneable capability tied to one resolved v2 database parent.
+/// A cloneable capability tied to one resolved database parent.
 #[derive(Debug, Clone)]
 pub struct IndexLease {
     inner: Arc<LeaseInner>,
@@ -123,8 +123,8 @@ pub enum IndexLeaseValidationError {
     /// A shared reader lease cannot authorize a writer.
     #[error("a shared index lease cannot authorize a writer")]
     SharedLease,
-    /// The capability belongs to another resolved v2 database parent.
-    #[error("index lease belongs to a different v2 database parent")]
+    /// The capability belongs to another resolved database parent.
+    #[error("index lease belongs to a different database parent")]
     WrongDbParent,
     /// The permanent fixed path no longer names the exact locked handle.
     #[error("permanent index lock changed, disappeared, or became an alias: {path}")]
@@ -186,6 +186,58 @@ impl IndexLease {
         cancelled: impl FnMut() -> bool,
     ) -> Result<Self, IndexLeaseError> {
         Self::create_exclusive_with(paths, deadline, cancelled, |_| {})
+    }
+
+    /// Create and acquire the permanent lock inside an existing, state-less
+    /// namespace selected for stale-cache replacement. Callers must classify the
+    /// namespace again under the returned lease before changing any other byte.
+    pub(crate) fn create_exclusive_in_existing_root(
+        paths: &IndexPaths,
+        deadline: Instant,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<Self, IndexLeaseError> {
+        let root = paths.current_root();
+        let lock_path = paths.permanent_lock();
+        if cancelled() {
+            return Err(IndexLeaseError::Cancelled { path: lock_path });
+        }
+        if Instant::now() >= deadline {
+            return Err(IndexLeaseError::TimedOut { path: lock_path });
+        }
+        let metadata =
+            std::fs::symlink_metadata(root).map_err(|source| IndexLeaseError::CreateRoot {
+                path: root.to_path_buf(),
+                source,
+            })?;
+        if !metadata.file_type().is_dir() {
+            return Err(IndexLeaseError::CreateRoot {
+                path: root.to_path_buf(),
+                source: io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    "existing index root is not a directory",
+                ),
+            });
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|source| classify_create_error(&lock_path, source))?;
+        let opened_identity = opened_identity(&file, &lock_path, None)?;
+        Self::acquire_file(
+            file,
+            PendingAcquisition {
+                lock_path,
+                mode: LeaseMode::Exclusive,
+                db_parent: db_parent(paths),
+                deadline,
+                opened_identity,
+            },
+            cancelled,
+            |_| {},
+        )
     }
 
     fn create_exclusive_with(
@@ -271,8 +323,8 @@ impl IndexLease {
         self.inner.mode == LeaseMode::Exclusive
     }
 
-    /// Whether this capability belongs to the normalized v2 DB parent in
-    /// `paths`. The identity itself remains private.
+    /// Whether this capability belongs to the normalized DB parent in `paths`.
+    /// The identity itself remains private.
     #[must_use]
     pub fn matches_db_parent(&self, paths: &IndexPaths) -> bool {
         self.inner.db_parent == db_parent(paths)

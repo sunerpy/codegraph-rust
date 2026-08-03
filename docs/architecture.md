@@ -230,7 +230,7 @@ FTS5 候选（`search_nodes_fts_filtered`）→（空且文本≥2）LIKE 阶梯
 
 - 索引编排只用各 crate 公共 API：`extract::engine::{scan_project, extract_file}` →
   `store::Store` upsert/insert → `resolve::ReferenceResolver::resolve_and_persist`。
-  全量索引写 `.codegraph-v2/codegraph.db`、文件记录、结构边、未解析引用、已解析边及
+  全量索引写 `.codegraph/codegraph.db`、文件记录、结构边、未解析引用、已解析边及
   索引元数据。
 - `serve --mcp` 调用 `codegraph_mcp::McpServer` 公共入口（stdin/stdout）。
 - **`sync` 为真正的单文件增量路径**：`codegraph_watch::sync_project_once_with_progress`
@@ -278,9 +278,9 @@ serverInfo:{name:"codegraph",version}, instructions}`；`tools/list` 返回 8 �
   所有客户端断开且空闲超时后自动退出（`CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS`，
   默认 5 分钟）。另有 `run_foreground`/`attach_to_daemon`/`unlock_project`/
   `daemon_pid_path`/`daemon_socket_path`。
-- 会合文件位于当前索引根 `<project>/.codegraph-v2/`：`daemon.pid`、`daemon.sock`
+- 会合文件位于当前索引根 `<project>/.codegraph/`：`daemon.pid`、`daemon.sock`
   与 `daemon.log`，全部经 `IndexPaths` 派生（socket 路径过长时回落到哈希后的
-  tmpdir socket，其名称带 v2 判别前缀）。
+  tmpdir socket）。
 - 加锁逻辑（`daemon.ts:393-412`）：完整 JSON 锁信息先写私有临时文件，再原子
   hard-link 就位，避免空/半写 pidfile 竞争。
 - 陈旧解锁镜像 `daemon.ts:453-481`：删除前重读、已知 pid 时比对、**绝不**清除存活
