@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.42.5](https://github.com/sunerpy/codegraph-rust/compare/v0.42.4...v0.42.5) (2026-08-03)
+
+
+### Bug Fixes
+
+* **index:** put the index back in .codegraph ([#190](https://github.com/sunerpy/codegraph-rust/issues/190)) ([5aff695](https://github.com/sunerpy/codegraph-rust/commit/5aff695fecd5a8d0a336ebbd49ad949fa91279dd))
+
 ## [0.42.4](https://github.com/sunerpy/codegraph-rust/compare/v0.42.3...v0.42.4) (2026-08-02)
 
 
