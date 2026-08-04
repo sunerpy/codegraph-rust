@@ -25,8 +25,8 @@ use codegraph_graph::graph::{GodotReach, GraphTraverser};
 use codegraph_graph::query::{SearchOptions, search_nodes};
 use codegraph_mcp::{McpServer, RunUntilAdoption};
 use codegraph_resolve::ReferenceResolver;
-use codegraph_store::Store;
 use codegraph_store::queries::SearchResult;
+use codegraph_store::{ExtractionStatus, IndexLease, Store};
 use indicatif::{ParallelProgressIterator, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
 use serde::Serialize;
@@ -1541,10 +1541,7 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
     ) {
         Ok(status_open) => status_open,
         Err(codegraph_store::StoreError::MissingStateWithDatabase { .. }) => {
-            let detail = format!(
-                "index database has no state slots and may have been created by an older version or another tool; run `codegraph init {}` to replace it",
-                project.display()
-            );
+            let detail = missing_state_with_database_detail(&project);
             if json_output {
                 let mut status = json!({
                     "initialized": false,
@@ -1662,7 +1659,7 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
     let store = status_open.into_store();
     if store.is_none() {
         if json_output {
-            print_json(&json!({
+            let mut status = json!({
                 "initialized": false,
                 "version": VERSION,
                 "projectPath": project,
@@ -1678,7 +1675,12 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
                 "daemonPidPath": daemon_pid_path,
                 "daemonSocketPath": daemon_socket_path,
                 "daemonLogPath": daemon_log_path,
-            }))?;
+            });
+            if matches!(&extraction_status, ExtractionStatus::Building { .. }) {
+                status["recoveryCommand"] =
+                    json!(format!("codegraph index --force {}", project.display()));
+            }
+            print_json(&status)?;
         } else {
             println!("\nCodeGraph Status\n");
             println!("Project: {}", project.display());
@@ -1694,8 +1696,17 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
                 "Daemon:  {}",
                 if daemon_running { "running" } else { "stopped" }
             );
-            println!("Not initialized");
-            println!("Run \"codegraph init\" to initialize");
+            if matches!(&extraction_status, ExtractionStatus::Building { .. }) {
+                println!("Index is not readable while the build is incomplete.");
+                println!(
+                    "Recovery: run `codegraph index --force {}` to rebuild the interrupted index; `codegraph init {}` is also supported.",
+                    project.display(),
+                    project.display()
+                );
+            } else {
+                println!("Not initialized");
+                println!("Run \"codegraph init\" to initialize");
+            }
         }
         return Ok(());
     }
@@ -3687,18 +3698,51 @@ mod serve_mode_tests {
 }
 
 fn cmd_unlock(path: Option<PathBuf>) -> Result<()> {
-    let project = resolve_required_project(path)?;
+    let start = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
+    index_paths(&start)?;
+    let project = resolve_project_path_optional(&start);
+    let paths = index_paths(&project)?;
     let daemon_lock = codegraph_daemon::daemon_pid_path(&project)?;
     let daemon_removed = daemon_lock.exists() && codegraph_daemon::unlock_project(&project);
-    let lock = codegraph_dir(&project)?.join("codegraph.lock");
-    if !lock.exists() && !daemon_removed {
-        println!("No lock file found - nothing to do");
-        return Ok(());
-    }
+    let lock = paths.current_root().join("codegraph.lock");
+    let mut lock_removed = false;
     if lock.exists() {
         fs::remove_file(&lock).with_context(|| format!("removing {}", lock.display()))?;
+        lock_removed = true;
     }
-    println!("Removed lock file. You can now run indexing again.");
+    if lock_removed || daemon_removed {
+        println!("Removed lock file. You can now run indexing again.");
+    } else {
+        println!("No lock file found - nothing to do");
+    }
+
+    if matches!(
+        Store::extraction_status(&paths),
+        ExtractionStatus::Building { .. }
+    ) {
+        match IndexLease::acquire_shared_existing(
+            &paths,
+            std::time::Instant::now() + STATUS_LEASE_TIMEOUT,
+            || false,
+        ) {
+            Ok(_lease) => {
+                if matches!(
+                    Store::extraction_status(&paths),
+                    ExtractionStatus::Building { .. }
+                ) {
+                    println!(
+                        "Index state remains building; no rollback was performed. Run `codegraph index --force {}` to rebuild it (or `codegraph init {}`).",
+                        project.display(),
+                        project.display()
+                    );
+                }
+            }
+            Err(codegraph_store::IndexLeaseError::TimedOut { .. }) => {
+                println!("Index build is still running; no recovery command was issued.");
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
     Ok(())
 }
 
@@ -5307,6 +5351,8 @@ fn open_store(project: &Path) -> Result<Store> {
 /// `CODEGRAPH_DIR` (a `resolve` failure) counts as NOT initialized here so
 /// project discovery keeps walking; the mutating command paths independently
 /// re-resolve fail-closed via [`db_path`]/[`codegraph_dir`] before touching disk.
+/// Read-command diagnostics classify the resolved namespace separately rather
+/// than interpreting every `false` result as a missing index.
 fn is_initialized(project: &Path) -> bool {
     let Ok(paths) = index_paths(project) else {
         return false;
@@ -5362,14 +5408,79 @@ fn resolve_required_project(path: Option<PathBuf>) -> Result<PathBuf> {
     let start = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
     index_paths(&start)?;
     let project = resolve_project_path_optional(&start);
-    if !is_initialized(&project) {
-        bail!(
-            "CodeGraph not initialized in {}; run `codegraph init {}` to create or replace the index",
+    let paths = index_paths(&project)?;
+    match Store::extraction_status(&paths) {
+        ExtractionStatus::Current if paths.current_db().is_file() => Ok(project),
+        ExtractionStatus::Current => bail!(
+            "CodeGraph index state is current in {}, but {} is missing; no CodeGraph CLI command can recover this externally damaged namespace. After confirming no CodeGraph process is using it, run `rm -rf -- \"{}\" && codegraph init \"{}\"`.",
+            project.display(),
+            paths.current_db().display(),
+            paths.current_root().display(),
+            project.display()
+        ),
+        ExtractionStatus::Building { built: _ } => bail!(
+            "CodeGraph index build was interrupted in {}; reads remain blocked to avoid false empty results. Run `codegraph index --force {}` to rebuild it (or `codegraph init {}`).",
+            project.display(),
             project.display(),
             project.display()
-        );
+        ),
+        ExtractionStatus::Uninitialized => bail!(
+            "CodeGraph index removal was interrupted in {}; run `codegraph init {}` to rebuild it",
+            project.display(),
+            project.display()
+        ),
+        ExtractionStatus::Missing => {
+            if first_existing_database_artifact(&paths)?.is_some() {
+                bail!("{}", missing_state_with_database_detail(&project));
+            }
+            bail!(
+                "CodeGraph not initialized in {}; run `codegraph init {}` to create or replace the index",
+                project.display(),
+                project.display()
+            )
+        }
+        ExtractionStatus::Outdated { built } => bail!(
+            "CodeGraph index in {} is outdated (built with extraction version {built}); run `codegraph index --force {}` to rebuild it",
+            project.display(),
+            project.display()
+        ),
+        ExtractionStatus::Future { built } => bail!(
+            "CodeGraph index in {} was built by a newer CodeGraph version (extraction version {built}); upgrade CodeGraph before reading it",
+            project.display()
+        ),
+        ExtractionStatus::Corrupt { reason } => bail!(
+            "CodeGraph index state in {} is corrupt: {reason}; run `codegraph status {}` for details; manual recovery is required",
+            project.display(),
+            project.display()
+        ),
     }
-    Ok(project)
+}
+
+fn first_existing_database_artifact(paths: &codegraph_core::IndexPaths) -> Result<Option<PathBuf>> {
+    let db = paths.current_db();
+    let mut artifacts = vec![db.clone()];
+    for suffix in ["-wal", "-shm"] {
+        let mut native = db.as_os_str().to_os_string();
+        native.push(suffix);
+        artifacts.push(PathBuf::from(native));
+    }
+    for path in artifacts {
+        match fs::symlink_metadata(&path) {
+            Ok(_) => return Ok(Some(path)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn missing_state_with_database_detail(project: &Path) -> String {
+    format!(
+        "index database has no state slots and may have been created by an older version or another tool; run `codegraph init {}` to replace it",
+        project.display()
+    )
 }
 
 fn resolve_required_rebuild_project(path: Option<PathBuf>) -> Result<PathBuf> {
@@ -6331,7 +6442,14 @@ mod pure_helper_tests {
     fn resolve_required_project_errors_when_uninitialized() {
         let dir = tmp("required");
         let err = resolve_required_project(Some(dir.clone())).unwrap_err();
-        assert!(err.to_string().contains("not initialized"));
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "CodeGraph not initialized in {}; run `codegraph init {}` to create or replace the index",
+                dir.display(),
+                dir.display()
+            )
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

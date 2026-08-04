@@ -93,6 +93,42 @@ struct Run {
     ok: bool,
 }
 
+fn normalize(stream: &str) -> String {
+    stream
+        .lines()
+        .filter(|line| !line.contains("logger initialized"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn final_error_body(stderr: &str) -> String {
+    let normalized = normalize(stderr);
+    let non_empty = normalized
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    let error_lines = non_empty
+        .iter()
+        .filter(|line| line.starts_with("Error: "))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        error_lines.len(),
+        1,
+        "stderr must contain exactly one Error-prefixed line: {normalized:?}"
+    );
+    let final_line = non_empty
+        .last()
+        .expect("stderr must contain a final non-empty error line");
+    assert_eq!(
+        *final_line, *error_lines[0],
+        "the unique Error-prefixed line must be final: {normalized:?}"
+    );
+    final_line
+        .strip_prefix("Error: ")
+        .expect("the final line was proven to have the Error prefix")
+        .to_string()
+}
+
 fn run_in(registry_dir: &Path, args: &[&str]) -> Run {
     let output = Command::new(bin())
         .args(args)
@@ -157,7 +193,7 @@ fn assert_readable_current(paths: &IndexPaths, context: &str) {
 /// permanent lock and `phase=building` slot are authentic; the final SQLite DB
 /// is independently present or absent to cover both user-reachable crash
 /// windows (before or after the fresh writer opens).
-fn stage_interrupted_building(paths: &IndexPaths, db_present: bool) {
+fn stage_building_with_lease(paths: &IndexPaths, db_present: bool) -> IndexLease {
     let lease = IndexLease::create_exclusive(paths, deadline(), || false)
         .expect("create the interrupted-rebuild namespace");
     publish_index_state(paths, &lease, StatePhase::Building).expect("publish phase=building");
@@ -168,13 +204,199 @@ fn stage_interrupted_building(paths: &IndexPaths, db_present: bool) {
             .expect("write partial rebuild evidence");
         drop(store);
     }
-    drop(lease);
     assert_eq!(
         Store::extraction_status(paths),
         ExtractionStatus::Building {
             built: codegraph_store::CURRENT_EXTRACTION_VERSION,
         }
     );
+    lease
+}
+
+fn stage_interrupted_building(paths: &IndexPaths, db_present: bool) {
+    drop(stage_building_with_lease(paths, db_present));
+}
+
+fn building_error(project: &Path) -> String {
+    format!(
+        "CodeGraph index build was interrupted in {}; reads remain blocked to avoid false empty results. Run `codegraph index --force {}` to rebuild it (or `codegraph init {}`).",
+        project.display(),
+        project.display(),
+        project.display()
+    )
+}
+
+fn slot_bytes(paths: &IndexPaths) -> [Option<Vec<u8>>; 2] {
+    paths.state_slots().map(|slot| match std::fs::read(&slot) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("read state slot {}: {error}", slot.display()),
+    })
+}
+
+#[test]
+fn building_state_recovery_status_guides_only_stale_building() {
+    let dir = TestDir::new("status-stale-building");
+    let project = dir.path().join("mini");
+    copy_tree(&mini_fixture(), &project);
+    let paths = IndexPaths::resolve(&project, None).expect("resolve default index paths");
+    stage_interrupted_building(&paths, false);
+    let project_arg = project.to_str().expect("UTF-8 project path");
+
+    let human = run_in(dir.path(), &["status", project_arg]);
+    assert!(human.ok, "human status must succeed: {}", human.stderr);
+    assert_eq!(normalize(&human.stderr), "");
+    assert_eq!(
+        human.stdout,
+        format!(
+            "\nCodeGraph Status\n\nProject: {}\nDB Path: {}\nState:   building (extraction version {})\nDaemon:  stopped\nIndex is not readable while the build is incomplete.\nRecovery: run `codegraph index --force {}` to rebuild the interrupted index; `codegraph init {}` is also supported.\n",
+            project.display(),
+            paths.current_db().display(),
+            codegraph_store::CURRENT_EXTRACTION_VERSION,
+            project.display(),
+            project.display()
+        )
+    );
+
+    let json_run = run_in(dir.path(), &["status", "--json", project_arg]);
+    assert!(json_run.ok, "JSON status must succeed: {}", json_run.stderr);
+    assert_eq!(normalize(&json_run.stderr), "");
+    let value: serde_json::Value =
+        serde_json::from_str(json_run.stdout.trim()).expect("status emits JSON");
+    assert_eq!(value["initialized"], false);
+    assert_eq!(value["extractionStatus"], "building");
+    assert_eq!(
+        value["recoveryCommand"],
+        format!("codegraph index --force {}", project.display())
+    );
+}
+
+#[test]
+fn building_state_recovery_status_never_guides_a_live_builder() {
+    let dir = TestDir::new("status-live-building");
+    let project = dir.path().join("mini");
+    copy_tree(&mini_fixture(), &project);
+    let paths = IndexPaths::resolve(&project, None).expect("resolve default index paths");
+    let lease = stage_building_with_lease(&paths, false);
+
+    let status = run_in(
+        dir.path(),
+        &[
+            "status",
+            "--json",
+            project.to_str().expect("UTF-8 project path"),
+        ],
+    );
+    assert!(
+        status.ok,
+        "live-building status must succeed: {}",
+        status.stderr
+    );
+    assert_eq!(normalize(&status.stderr), "");
+    let value: serde_json::Value =
+        serde_json::from_str(status.stdout.trim()).expect("status emits JSON");
+    assert_eq!(value["initialized"], false);
+    assert_eq!(value["rebuilding"], true);
+    assert_eq!(value["extractionStatus"], serde_json::Value::Null);
+    assert!(value.get("recoveryCommand").is_none());
+    drop(lease);
+}
+
+#[test]
+fn building_state_recovery_unlock_clears_only_stale_locks_and_keeps_reads_blocked() {
+    let dir = TestDir::new("unlock-stale-locks");
+    let project = dir.path().join("mini");
+    copy_tree(&mini_fixture(), &project);
+    let paths = IndexPaths::resolve(&project, None).expect("resolve default index paths");
+    stage_interrupted_building(&paths, false);
+    let states_before = slot_bytes(&paths);
+    std::fs::write(paths.daemon_pid(), b"stale pid record").expect("write stale daemon pid");
+    let transient_lock = paths.current_root().join("codegraph.lock");
+    std::fs::write(&transient_lock, b"stale lock").expect("write stale transient lock");
+    let project_arg = project.to_str().expect("UTF-8 project path");
+
+    let unlock = run_in(dir.path(), &["unlock", project_arg]);
+    assert!(unlock.ok, "unlock must succeed: {}", unlock.stderr);
+    assert_eq!(normalize(&unlock.stderr), "");
+    assert_eq!(
+        unlock.stdout,
+        format!(
+            "Removed lock file. You can now run indexing again.\nIndex state remains building; no rollback was performed. Run `codegraph index --force {}` to rebuild it (or `codegraph init {}`).\n",
+            project.display(),
+            project.display()
+        )
+    );
+    assert!(!paths.daemon_pid().exists());
+    assert!(!transient_lock.exists());
+    assert!(paths.permanent_lock().is_file());
+    assert!(!paths.current_db().exists());
+    assert_eq!(slot_bytes(&paths), states_before);
+    assert_eq!(
+        Store::extraction_status(&paths),
+        ExtractionStatus::Building {
+            built: codegraph_store::CURRENT_EXTRACTION_VERSION,
+        }
+    );
+
+    let query = run_in(
+        dir.path(),
+        &["query", "Counter", "-p", project_arg, "--strict"],
+    );
+    assert!(!query.ok, "unlock must not make Building readable");
+    assert_eq!(final_error_body(&query.stderr), building_error(&project));
+}
+
+#[test]
+fn building_state_recovery_unlock_without_stale_locks_still_guides_recovery() {
+    let dir = TestDir::new("unlock-no-locks");
+    let project = dir.path().join("mini");
+    copy_tree(&mini_fixture(), &project);
+    let paths = IndexPaths::resolve(&project, None).expect("resolve default index paths");
+    stage_interrupted_building(&paths, false);
+    let states_before = slot_bytes(&paths);
+
+    let unlock = run_in(
+        dir.path(),
+        &["unlock", project.to_str().expect("UTF-8 project path")],
+    );
+    assert!(unlock.ok, "unlock must succeed: {}", unlock.stderr);
+    assert_eq!(normalize(&unlock.stderr), "");
+    assert_eq!(
+        unlock.stdout,
+        format!(
+            "No lock file found - nothing to do\nIndex state remains building; no rollback was performed. Run `codegraph index --force {}` to rebuild it (or `codegraph init {}`).\n",
+            project.display(),
+            project.display()
+        )
+    );
+    assert!(paths.permanent_lock().is_file());
+    assert!(!paths.current_db().exists());
+    assert_eq!(slot_bytes(&paths), states_before);
+}
+
+#[test]
+fn building_state_recovery_unlock_never_competes_with_a_live_builder() {
+    let dir = TestDir::new("unlock-live-building");
+    let project = dir.path().join("mini");
+    copy_tree(&mini_fixture(), &project);
+    let paths = IndexPaths::resolve(&project, None).expect("resolve default index paths");
+    let lease = stage_building_with_lease(&paths, false);
+    let states_before = slot_bytes(&paths);
+
+    let unlock = run_in(
+        dir.path(),
+        &["unlock", project.to_str().expect("UTF-8 project path")],
+    );
+    assert!(unlock.ok, "unlock must succeed: {}", unlock.stderr);
+    assert_eq!(normalize(&unlock.stderr), "");
+    assert_eq!(
+        unlock.stdout,
+        "No lock file found - nothing to do\nIndex build is still running; no recovery command was issued.\n"
+    );
+    assert!(paths.permanent_lock().is_file());
+    assert!(!paths.current_db().exists());
+    assert_eq!(slot_bytes(&paths), states_before);
+    drop(lease);
 }
 
 /// Plan test 8 (line 746) public boundary: only a completely successful rebuild
