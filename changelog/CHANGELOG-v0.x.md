@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.42.8](https://github.com/sunerpy/codegraph-rust/compare/v0.42.7...v0.42.8) (2026-08-04)
+
+
+### Bug Fixes
+
+* **typescript:** follow export aliases and .js specifiers to their source ([#196](https://github.com/sunerpy/codegraph-rust/issues/196)) ([4a17919](https://github.com/sunerpy/codegraph-rust/commit/4a1791926cc55bca8f7a1f2b2030b130d7ed52ef))
+
 ## [0.42.7](https://github.com/sunerpy/codegraph-rust/compare/v0.42.6...v0.42.7) (2026-08-04)
 
 
