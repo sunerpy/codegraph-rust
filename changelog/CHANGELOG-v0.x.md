@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.42.7](https://github.com/sunerpy/codegraph-rust/compare/v0.42.6...v0.42.7) (2026-08-04)
+
+
+### Bug Fixes
+
+* **cli:** name the real state when an index is unreadable ([#194](https://github.com/sunerpy/codegraph-rust/issues/194)) ([20e3f9d](https://github.com/sunerpy/codegraph-rust/commit/20e3f9dac1ee1859076c37faa385c9c2189f7cba))
+
 ## [0.42.6](https://github.com/sunerpy/codegraph-rust/compare/v0.42.5...v0.42.6) (2026-08-03)
 
 
