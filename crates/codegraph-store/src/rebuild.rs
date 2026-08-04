@@ -3,11 +3,13 @@
 //! Frozen plan `upstream-v1.5-portable-fixes.md` lines 548-556: under ONE
 //! retained exclusive [`IndexLease`], a destructive rebuild
 //!
-//! 1. classifies the namespace and takes its write authorization,
-//! 2. publishes `phase=building` BEFORE deleting or mutating the database,
-//! 3. removes only the v2 `codegraph.db`, `-wal`, and `-shm`,
-//! 4. rebuilds into a fresh state-gated writer database, and
-//! 5. finalizes: restore default pragmas -> final checkpoint + compaction ->
+//! 1. for explicit init only, normalizes an all-`OwnerMismatch` copied namespace
+//!    to `Missing` by removing those unusable slots under the retained lease,
+//! 2. classifies the namespace and takes its write authorization,
+//! 3. publishes `phase=building` BEFORE deleting or mutating the database,
+//! 4. removes only the v2 `codegraph.db`, `-wal`, and `-shm`,
+//! 5. rebuilds into a fresh state-gated writer database, and
+//! 6. finalizes: restore default pragmas -> final checkpoint + compaction ->
 //!    stamp extraction version -> checkpoint that stamp into the main database ->
 //!    close the final SQLite connection.
 //!
@@ -30,8 +32,8 @@ use crate::connection::{
     first_existing_database_artifact,
 };
 use crate::{
-    IndexLease, IndexLeaseError, IndexLeaseValidationError, StatePhase, StatePublishError,
-    publish_index_state,
+    CorruptReason, IndexLease, IndexLeaseError, IndexLeaseValidationError, SlotOutcome, StatePhase,
+    StatePublishError, classify, publish_index_state,
 };
 
 /// Which lifecycle command is performing the destructive rebuild.
@@ -143,6 +145,14 @@ pub enum RebuildError {
         /// Operating-system error.
         source: io::Error,
     },
+    /// An identity-mismatched state slot could not be removed under the lease.
+    #[error("cannot remove identity-mismatched index state slot {path}: {source}")]
+    RemoveStateSlot {
+        /// Exact fixed-slot path.
+        path: PathBuf,
+        /// Operating-system error.
+        source: io::Error,
+    },
     /// An interrupted-uninit namespace was reached by an ordinary reindex.
     #[error(
         "index namespace {path} was left uninitialized; only an explicit `init` may rebuild it"
@@ -212,8 +222,9 @@ pub struct ActiveFullRebuild {
     store: Option<Store>,
 }
 
-/// Acquire the single outer exclusive lease, classify under it, publish
-/// `phase=building`, and remove the previous database files.
+/// Acquire the single outer exclusive lease, optionally normalize an explicit
+/// init's all-`OwnerMismatch` slots to `Missing`, classify under that same lease,
+/// publish `phase=building`, and remove the previous database files.
 pub fn begin_full_rebuild(
     paths: &IndexPaths,
     kind: RebuildKind,
@@ -232,9 +243,12 @@ fn begin_full_rebuild_with(
 ) -> Result<FullRebuild, RebuildError> {
     let lease = acquire_outer_exclusive(paths, deadline, cancelled)?;
     checkpoint(fault, RebuildCheckpoint::BeforeWriteAuthorization)?;
+    if kind == RebuildKind::ExplicitInit {
+        remove_owner_mismatched_state_slots(paths, &lease)?;
+    }
     // Classification happens through the state gate under the already-held
-    // exclusive capability; a Future/Corrupt namespace is refused before any
-    // byte changes.
+    // exclusive capability. Future and every Corrupt shape except the explicit
+    // init normalization above are refused before any byte changes.
     let authorized = if kind == RebuildKind::ExplicitInit {
         Store::open_for_explicit_init_rebuild(paths, lease.clone())?
     } else {
@@ -258,6 +272,66 @@ fn begin_full_rebuild_with(
     }
 
     begin_from_authorization(paths, lease, kind, authorization, fault)
+}
+
+/// Normalize only the copied/moved-project shape: every PRESENT fixed slot must
+/// independently be an [`CorruptReason::OwnerMismatch`]. A mixed namespace is
+/// genuine damage and remains untouched for the ordinary state gate to refuse.
+fn remove_owner_mismatched_state_slots(
+    paths: &IndexPaths,
+    lease: &IndexLease,
+) -> Result<(), RebuildError> {
+    let classification = classify(paths);
+    if !matches!(
+        classification.status(),
+        crate::ExtractionStatus::Corrupt {
+            reason: CorruptReason::OwnerMismatch { .. }
+        }
+    ) {
+        return Ok(());
+    }
+
+    let mut mismatched_slots = Vec::new();
+    for index in 0..2 {
+        match classification.slot(index) {
+            SlotOutcome::Absent => {}
+            SlotOutcome::Invalid(CorruptReason::OwnerMismatch { path, .. }) => {
+                mismatched_slots.push(path.clone());
+            }
+            SlotOutcome::Valid(_) | SlotOutcome::FutureProtocol(_) | SlotOutcome::Invalid(_) => {
+                return Ok(());
+            }
+        }
+    }
+    if mismatched_slots.is_empty() {
+        return Ok(());
+    }
+
+    lease.validate_exclusive(paths)?;
+    for path in &mismatched_slots {
+        lease.validate_exclusive(paths)?;
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(RebuildError::RemoveStateSlot {
+                    path: path.clone(),
+                    source,
+                });
+            }
+        }
+    }
+    let removed = mismatched_slots
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    tracing::info!(
+        slots = %removed,
+        reason = "project identity mismatch after move or copy",
+        "replaced stale foreign index state slots"
+    );
+    Ok(())
 }
 
 /// Escalate an ALREADY-AUTHORIZED namespace to a destructive full rebuild using
@@ -307,7 +381,9 @@ fn resume_full_rebuild_with(
 
 /// Shared destructive prologue: publish `phase=building` BEFORE deleting any
 /// database byte, then remove only the database files — all under the one
-/// already-held exclusive lease carried by `authorization`.
+/// already-held exclusive lease carried by `authorization`. Any explicit-init
+/// OwnerMismatch slot normalization is already complete before this authorized
+/// prologue and did not touch a database byte.
 fn begin_from_authorization(
     paths: &IndexPaths,
     lease: IndexLease,

@@ -26,7 +26,7 @@ use codegraph_graph::query::{SearchOptions, search_nodes};
 use codegraph_mcp::{McpServer, RunUntilAdoption};
 use codegraph_resolve::ReferenceResolver;
 use codegraph_store::queries::SearchResult;
-use codegraph_store::{ExtractionStatus, IndexLease, Store};
+use codegraph_store::{CorruptReason, ExtractionStatus, IndexLease, SlotOutcome, Store};
 use indicatif::{ParallelProgressIterator, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
 use serde::Serialize;
@@ -1468,6 +1468,9 @@ fn cmd_sync(path: Option<PathBuf>, quiet: bool) -> Result<()> {
     // authorized to sync or recreate residue.
     let project = resolve_required_rebuild_project(path)?;
     let paths = index_paths(&project)?;
+    if let Some(reason) = owner_mismatch_only_reason(&paths) {
+        bail!("{}", owner_mismatch_recovery_error(&project, &reason));
+    }
     if Store::extraction_status(&paths) == codegraph_store::ExtractionStatus::Missing
         && paths.current_db().is_file()
     {
@@ -1656,6 +1659,9 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
         .status
         .clone()
         .expect("a non-busy status probe always classifies the namespace");
+    let owner_mismatch_recoverable = owner_mismatch_only_reason(&resolved).is_some();
+    let extraction_status_detail =
+        status_extraction_detail(&extraction_status, owner_mismatch_recoverable, &project);
     let store = status_open.into_store();
     if store.is_none() {
         if json_output {
@@ -1668,7 +1674,7 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
                 "dbPath": db,
                 "dbExists": db_exists,
                 "extractionStatus": extraction_status_name(&extraction_status),
-                "extractionStatusDetail": extraction_status.to_string(),
+                "extractionStatusDetail": extraction_status_detail,
                 "legacyIndexPresent": legacy_index_present,
                 "legacyIndexPaths": legacy_index_paths,
                 "daemonRunning": daemon_running,
@@ -1679,6 +1685,8 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
             if matches!(&extraction_status, ExtractionStatus::Building { .. }) {
                 status["recoveryCommand"] =
                     json!(format!("codegraph index --force {}", project.display()));
+            } else if owner_mismatch_recoverable {
+                status["recoveryCommand"] = json!(format!("codegraph init {}", project.display()));
             }
             print_json(&status)?;
         } else {
@@ -1696,16 +1704,31 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
                 "Daemon:  {}",
                 if daemon_running { "running" } else { "stopped" }
             );
-            if matches!(&extraction_status, ExtractionStatus::Building { .. }) {
-                println!("Index is not readable while the build is incomplete.");
-                println!(
-                    "Recovery: run `codegraph index --force {}` to rebuild the interrupted index; `codegraph init {}` is also supported.",
-                    project.display(),
-                    project.display()
-                );
-            } else {
-                println!("Not initialized");
-                println!("Run \"codegraph init\" to initialize");
+            match &extraction_status {
+                ExtractionStatus::Building { .. } => {
+                    println!("Index is not readable while the build is incomplete.");
+                    println!(
+                        "Recovery: run `codegraph index --force {}` to rebuild the interrupted index; `codegraph init {}` is also supported.",
+                        project.display(),
+                        project.display()
+                    );
+                }
+                ExtractionStatus::Corrupt { .. } if owner_mismatch_recoverable => {
+                    println!(
+                        "Index belongs to a different filesystem location because the project was moved or copied."
+                    );
+                    println!(
+                        "Recovery: run `codegraph init {}` to replace it.",
+                        project.display()
+                    );
+                }
+                ExtractionStatus::Corrupt { .. } => {
+                    println!("Manual recovery is required.");
+                }
+                _ => {
+                    println!("Not initialized");
+                    println!("Run \"codegraph init\" to initialize");
+                }
             }
         }
         return Ok(());
@@ -1825,6 +1848,54 @@ fn extraction_status_name(status: &codegraph_store::ExtractionStatus) -> &'stati
         codegraph_store::ExtractionStatus::Outdated { .. } => "outdated",
         codegraph_store::ExtractionStatus::Future { .. } => "future",
         codegraph_store::ExtractionStatus::Corrupt { .. } => "corrupt",
+    }
+}
+
+fn owner_mismatch_only_reason(
+    paths: &codegraph_core::IndexPaths,
+) -> Option<codegraph_store::CorruptReason> {
+    let classification = codegraph_store::classify(paths);
+    let reason = match classification.status() {
+        ExtractionStatus::Corrupt {
+            reason: reason @ CorruptReason::OwnerMismatch { .. },
+        } => reason.clone(),
+        _ => return None,
+    };
+    let mut present = false;
+    for index in 0..2 {
+        match classification.slot(index) {
+            SlotOutcome::Absent => {}
+            SlotOutcome::Invalid(CorruptReason::OwnerMismatch { .. }) => present = true,
+            SlotOutcome::Valid(_) | SlotOutcome::FutureProtocol(_) | SlotOutcome::Invalid(_) => {
+                return None;
+            }
+        }
+    }
+    present.then_some(reason)
+}
+
+fn owner_mismatch_recovery_error(project: &Path, reason: &CorruptReason) -> String {
+    format!(
+        "CodeGraph index state in {} is corrupt: {reason}; the index belongs to a different filesystem location because the project was moved or copied; run `codegraph init {}` to replace it",
+        project.display(),
+        project.display()
+    )
+}
+
+fn status_extraction_detail(
+    status: &ExtractionStatus,
+    owner_mismatch_recoverable: bool,
+    project: &Path,
+) -> String {
+    match status {
+        ExtractionStatus::Corrupt { reason } if owner_mismatch_recoverable => format!(
+            "{reason}; the index belongs to a different filesystem location because the project was moved or copied; run `codegraph init {}` to replace it",
+            project.display()
+        ),
+        ExtractionStatus::Corrupt { reason } => {
+            format!("{reason}; manual recovery is required")
+        }
+        _ => status.to_string(),
     }
 }
 
@@ -5404,6 +5475,9 @@ fn has_lifecycle_namespace(project: &Path) -> bool {
     Store::extraction_status(&paths) != codegraph_store::ExtractionStatus::Missing
 }
 
+/// Resolve a readable project and report lifecycle-specific recovery without
+/// authorizing mutation. Only an all-present-slot OwnerMismatch names explicit
+/// init; mixed or other corruption continues to require manual recovery.
 fn resolve_required_project(path: Option<PathBuf>) -> Result<PathBuf> {
     let start = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
     index_paths(&start)?;
@@ -5448,11 +5522,16 @@ fn resolve_required_project(path: Option<PathBuf>) -> Result<PathBuf> {
             "CodeGraph index in {} was built by a newer CodeGraph version (extraction version {built}); upgrade CodeGraph before reading it",
             project.display()
         ),
-        ExtractionStatus::Corrupt { reason } => bail!(
-            "CodeGraph index state in {} is corrupt: {reason}; run `codegraph status {}` for details; manual recovery is required",
-            project.display(),
-            project.display()
-        ),
+        ExtractionStatus::Corrupt { reason } => {
+            if owner_mismatch_only_reason(&paths).is_some() {
+                bail!("{}", owner_mismatch_recovery_error(&project, &reason));
+            }
+            bail!(
+                "CodeGraph index state in {} is corrupt: {reason}; run `codegraph status {}` for details; manual recovery is required",
+                project.display(),
+                project.display()
+            )
+        }
     }
 }
 

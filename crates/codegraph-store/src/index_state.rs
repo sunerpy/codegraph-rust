@@ -349,6 +349,9 @@ pub enum CorruptReason {
         supported: u64,
     },
     /// `projectIdentity` does not match the owner identity of the namespace.
+    /// This is the deterministic moved/copied-project signal: explicit init may
+    /// replace the namespace only when every present slot has this reason;
+    /// mixed slot damage remains unrecoverable automatically.
     OwnerMismatch {
         /// Slot index (0 or 1).
         slot: u8,

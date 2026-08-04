@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use codegraph_core::IndexPaths;
 use codegraph_store::{
-    CURRENT_EXTRACTION_VERSION, CURRENT_STORAGE_PROTOCOL, ExtractionStatus, IndexLease, StatePhase,
-    Store, checksum_hex, classify, publish_index_state,
+    CURRENT_EXTRACTION_VERSION, CURRENT_STORAGE_PROTOCOL, CorruptReason, ExtractionStatus,
+    IndexLease, SlotOutcome, StatePhase, Store, checksum_hex, classify, publish_index_state,
 };
 
 fn bin() -> PathBuf {
@@ -547,6 +547,63 @@ fn stage_lifecycle_state(paths: &IndexPaths, status: &str) {
     drop(lease);
 }
 
+fn slot_bytes(paths: &IndexPaths) -> [Option<Vec<u8>>; 2] {
+    paths.state_slots().map(|slot| match std::fs::read(&slot) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("read state slot {}: {error}", slot.display()),
+    })
+}
+
+fn stage_owner_mismatch(dir: &TestDir, label: &str) -> (PathBuf, IndexPaths) {
+    let source = dir.path().join(format!("{label}-source"));
+    copy_tree(&mini_fixture(), &source);
+    let source_arg = source.to_str().expect("UTF-8 source project path");
+    let init = run_in(dir.path(), &["init", source_arg]);
+    assert!(
+        init.ok,
+        "setup: source init must succeed: stdout={}, stderr={}",
+        init.stdout, init.stderr
+    );
+
+    let moved = dir.path().join(format!("{label}-moved"));
+    copy_tree(&source, &moved);
+    let source_paths = IndexPaths::resolve(&source, None).expect("resolve source index paths");
+    let moved_paths = IndexPaths::resolve(&moved, None).expect("resolve moved index paths");
+    assert_ne!(
+        source_paths.project_identity(),
+        moved_paths.project_identity(),
+        "copying a project directory must produce a distinct filesystem identity"
+    );
+    assert!(
+        matches!(
+            Store::extraction_status(&moved_paths),
+            ExtractionStatus::Corrupt {
+                reason: CorruptReason::OwnerMismatch { .. }
+            }
+        ),
+        "a copied initialized project must classify as OwnerMismatch"
+    );
+    (moved, moved_paths)
+}
+
+fn owner_mismatch_reason(paths: &IndexPaths) -> CorruptReason {
+    match Store::extraction_status(paths) {
+        ExtractionStatus::Corrupt {
+            reason: reason @ CorruptReason::OwnerMismatch { .. },
+        } => reason,
+        other => panic!("expected OwnerMismatch, got {other:?}"),
+    }
+}
+
+fn owner_mismatch_cli_error(project: &Path, reason: &CorruptReason) -> String {
+    format!(
+        "CodeGraph index state in {} is corrupt: {reason}; the index belongs to a different filesystem location because the project was moved or copied; run `codegraph init {}` to replace it",
+        project.display(),
+        project.display()
+    )
+}
+
 fn assert_query_error(dir: &TestDir, project: &Path, expected: &str) {
     let project_arg = project.to_str().expect("UTF-8 test project path");
     let run = run_in(
@@ -559,6 +616,220 @@ fn assert_query_error(dir: &TestDir, project: &Path, expected: &str) {
         run.stdout, run.stderr
     );
     assert_eq!(final_error_body(&run.stderr), expected);
+}
+
+#[test]
+fn owner_mismatch_read_and_status_diagnostics_name_explicit_init_recovery() {
+    let dir = TestDir::new("owner-mismatch-diagnostics");
+    let (project, paths) = stage_owner_mismatch(&dir, "diagnostics");
+    let reason = owner_mismatch_reason(&paths);
+    let expected_error = owner_mismatch_cli_error(&project, &reason);
+    assert_query_error(&dir, &project, &expected_error);
+
+    let project_arg = project.to_str().expect("UTF-8 moved project path");
+    let human = run_in(dir.path(), &["status", project_arg]);
+    assert!(
+        human.ok,
+        "human status must describe OwnerMismatch: stdout={}, stderr={}",
+        human.stdout, human.stderr
+    );
+    assert_eq!(normalize(&human.stderr), "");
+    assert_eq!(
+        human.stdout,
+        format!(
+            "\nCodeGraph Status\n\nProject: {}\nDB Path: {}\nState:   corrupt: {reason}\nDaemon:  stopped\nIndex belongs to a different filesystem location because the project was moved or copied.\nRecovery: run `codegraph init {}` to replace it.\n",
+            project.display(),
+            paths.current_db().display(),
+            project.display()
+        )
+    );
+
+    let json_run = run_in(dir.path(), &["status", "--json", project_arg]);
+    assert!(
+        json_run.ok,
+        "JSON status must describe OwnerMismatch: stdout={}, stderr={}",
+        json_run.stdout, json_run.stderr
+    );
+    assert_eq!(normalize(&json_run.stderr), "");
+    let value: serde_json::Value =
+        serde_json::from_str(json_run.stdout.trim()).expect("status emits JSON");
+    assert_eq!(value["initialized"], false);
+    assert_eq!(value["extractionStatus"], "corrupt");
+    assert_eq!(
+        value["extractionStatusDetail"],
+        format!(
+            "{reason}; the index belongs to a different filesystem location because the project was moved or copied; run `codegraph init {}` to replace it",
+            project.display()
+        )
+    );
+    assert_eq!(
+        value["recoveryCommand"],
+        format!("codegraph init {}", project.display())
+    );
+}
+
+#[test]
+fn explicit_init_recovers_an_owner_mismatched_namespace() {
+    let dir = TestDir::new("owner-mismatch-init");
+    let (project, paths) = stage_owner_mismatch(&dir, "init");
+
+    let init = run_in(
+        dir.path(),
+        &["init", project.to_str().expect("UTF-8 moved project path")],
+    );
+    assert!(
+        init.ok,
+        "explicit init must recover OwnerMismatch: stdout={}, stderr={}",
+        init.stdout, init.stderr
+    );
+    assert_eq!(Store::extraction_status(&paths), ExtractionStatus::Current);
+    let store = Store::open_for_read(&paths, deadline(), || false)
+        .expect("recovered OwnerMismatch namespace must be readable");
+    assert!(
+        store.counts().expect("read recovered counts").node_count > 0,
+        "recovered namespace must contain the rebuilt graph"
+    );
+}
+
+#[test]
+fn mixed_owner_mismatch_and_checksum_damage_refuses_init_without_changing_slots() {
+    let dir = TestDir::new("owner-mismatch-mixed");
+    let (project, paths) = stage_owner_mismatch(&dir, "mixed");
+    let [slot0, slot1] = paths.state_slots();
+    let mut second: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&slot1).expect("read copied second state slot"))
+            .expect("parse copied second state slot");
+    second["checksum"] = serde_json::Value::String("0".repeat(64));
+    std::fs::write(
+        &slot1,
+        serde_json::to_vec(&second).expect("serialize checksum-damaged slot"),
+    )
+    .expect("write checksum-damaged slot");
+
+    let classification = classify(&paths);
+    assert!(matches!(
+        classification.slot(0),
+        SlotOutcome::Invalid(CorruptReason::OwnerMismatch { .. })
+    ));
+    assert!(matches!(
+        classification.slot(1),
+        SlotOutcome::Invalid(CorruptReason::ChecksumMismatch { .. })
+    ));
+    let reason = match classification.status() {
+        ExtractionStatus::Corrupt { reason } => reason.clone(),
+        other => panic!("mixed slot damage must classify Corrupt, got {other:?}"),
+    };
+    let before = slot_bytes(&paths);
+    let project_arg = project.to_str().expect("UTF-8 moved project path");
+
+    let status = run_in(dir.path(), &["status", project_arg]);
+    assert!(status.ok, "status must report mixed corruption");
+    assert_eq!(normalize(&status.stderr), "");
+    assert_eq!(
+        status.stdout,
+        format!(
+            "\nCodeGraph Status\n\nProject: {}\nDB Path: {}\nState:   corrupt: {reason}\nDaemon:  stopped\nManual recovery is required.\n",
+            project.display(),
+            paths.current_db().display()
+        ),
+        "a mixed namespace must not recommend init merely because slot 0 supplies the aggregate OwnerMismatch reason"
+    );
+    let json_status = run_in(dir.path(), &["status", "--json", project_arg]);
+    assert!(json_status.ok, "JSON status must report mixed corruption");
+    assert_eq!(normalize(&json_status.stderr), "");
+    let value: serde_json::Value =
+        serde_json::from_str(json_status.stdout.trim()).expect("status emits JSON");
+    assert_eq!(
+        value["extractionStatusDetail"],
+        format!("{reason}; manual recovery is required")
+    );
+    assert!(value.get("recoveryCommand").is_none());
+
+    let init = run_in(dir.path(), &["init", project_arg]);
+    assert!(!init.ok, "mixed corruption must refuse explicit init");
+    assert_eq!(
+        final_error_body(&init.stderr),
+        format!("state-gated Store open rejected index state corrupt: {reason}")
+    );
+    assert_eq!(
+        slot_bytes(&paths),
+        before,
+        "a refused mixed-damage init must preserve both state slots byte-for-byte"
+    );
+    assert!(slot0.is_file());
+}
+
+#[test]
+fn another_corrupt_reason_keeps_manual_recovery_and_refuses_init() {
+    let dir = TestDir::new("other-corrupt");
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(&project).expect("create corrupt project");
+    let paths = IndexPaths::resolve(&project, None).expect("resolve corrupt index paths");
+    stage_lifecycle_state(&paths, "corrupt");
+    let reason = match Store::extraction_status(&paths) {
+        ExtractionStatus::Corrupt { reason } => reason,
+        other => panic!("expected staged Corrupt state, got {other:?}"),
+    };
+    assert!(matches!(reason, CorruptReason::EqualSequence { .. }));
+    let before = slot_bytes(&paths);
+    let project_arg = project.to_str().expect("UTF-8 corrupt project path");
+
+    let human = run_in(dir.path(), &["status", project_arg]);
+    assert!(human.ok, "status must report corruption: {}", human.stderr);
+    assert_eq!(normalize(&human.stderr), "");
+    assert_eq!(
+        human.stdout,
+        format!(
+            "\nCodeGraph Status\n\nProject: {}\nDB Path: {}\nState:   corrupt: {reason}\nDaemon:  stopped\nManual recovery is required.\n",
+            project.display(),
+            paths.current_db().display()
+        )
+    );
+    let json_status = run_in(dir.path(), &["status", "--json", project_arg]);
+    assert!(json_status.ok, "JSON status must report corruption");
+    assert_eq!(normalize(&json_status.stderr), "");
+    let value: serde_json::Value =
+        serde_json::from_str(json_status.stdout.trim()).expect("status emits JSON");
+    assert_eq!(
+        value["extractionStatusDetail"],
+        format!("{reason}; manual recovery is required")
+    );
+    assert!(value.get("recoveryCommand").is_none());
+
+    let init = run_in(dir.path(), &["init", project_arg]);
+    assert!(!init.ok, "non-OwnerMismatch corruption must refuse init");
+    assert_eq!(
+        final_error_body(&init.stderr),
+        format!("state-gated Store open rejected index state corrupt: {reason}")
+    );
+    assert_eq!(
+        slot_bytes(&paths),
+        before,
+        "a refused corrupt init must preserve both state slots byte-for-byte"
+    );
+}
+
+#[test]
+fn sync_never_deletes_owner_mismatched_state_slots() {
+    let dir = TestDir::new("owner-mismatch-sync");
+    let (project, paths) = stage_owner_mismatch(&dir, "sync");
+    let reason = owner_mismatch_reason(&paths);
+    let before = slot_bytes(&paths);
+
+    let sync = run_in(
+        dir.path(),
+        &["sync", project.to_str().expect("UTF-8 moved project path")],
+    );
+    assert!(!sync.ok, "sync must fail closed on OwnerMismatch");
+    assert_eq!(
+        final_error_body(&sync.stderr),
+        owner_mismatch_cli_error(&project, &reason)
+    );
+    assert_eq!(
+        slot_bytes(&paths),
+        before,
+        "sync must preserve OwnerMismatch state slots byte-for-byte"
+    );
 }
 
 #[test]

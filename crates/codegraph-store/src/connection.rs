@@ -431,6 +431,9 @@ impl Store {
     /// fully corroborated `Current` database whose tombstone remains after the
     /// prior finalizer published Current but failed to remove that tombstone.
     /// The namespace is still not readable until the explicit retry completes.
+    /// A copied project's all-`OwnerMismatch` slots are normalized to `Missing`
+    /// by `crate::rebuild` under the same lease before this gate; this function
+    /// itself never accepts a `Corrupt` classification.
     pub(crate) fn open_for_explicit_init_rebuild(
         paths: &IndexPaths,
         lease: IndexLease,
@@ -465,6 +468,10 @@ impl Store {
         lease.validate_exclusive(paths)?;
         let status = Self::extraction_status(paths);
 
+        // Every Corrupt classification that reaches this gate is refused. The
+        // explicit-init OwnerMismatch-only normalization, when applicable, has
+        // already removed every mismatched present slot under this same lease,
+        // so it reaches this gate as Missing rather than weakening this rule.
         if matches!(
             status,
             ExtractionStatus::Future { .. } | ExtractionStatus::Corrupt { .. }
