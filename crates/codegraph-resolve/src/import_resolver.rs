@@ -79,6 +79,54 @@ fn extension_resolution(language: Language) -> &'static [&'static str] {
     }
 }
 
+fn resolve_source_candidate(
+    base_path: &str,
+    language: Language,
+    context: &dyn ResolutionContext,
+) -> Option<String> {
+    let substitution = if matches!(language, Language::TypeScript | Language::Tsx) {
+        if let Some(stem) = base_path.strip_suffix(".mjs") {
+            Some((stem, &[".mts", ".d.mts"][..]))
+        } else if let Some(stem) = base_path.strip_suffix(".cjs") {
+            Some((stem, &[".cts", ".d.cts"][..]))
+        } else if let Some(stem) = base_path
+            .strip_suffix(".jsx")
+            .or_else(|| base_path.strip_suffix(".js"))
+        {
+            let extensions = if language == Language::Tsx {
+                &[".tsx", ".ts", ".d.ts"][..]
+            } else {
+                &[".ts", ".tsx", ".d.ts"][..]
+            };
+            Some((stem, extensions))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some((stem, extensions)) = substitution {
+        for extension in extensions {
+            let candidate = format!("{stem}{extension}");
+            if context.file_exists(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+
+    for extension in extension_resolution(language) {
+        let candidate = format!("{base_path}{extension}");
+        if context.file_exists(&candidate) {
+            return Some(candidate);
+        }
+    }
+
+    context
+        .file_exists(base_path)
+        .then(|| base_path.to_string())
+}
+
 /// Resolve an import path to an actual file (`resolveImportPath`,
 /// `import-resolver.ts:42-76`).
 pub fn resolve_import_path(
@@ -375,10 +423,9 @@ fn resolve_relative_import(
     language: Language,
     context: &dyn ResolutionContext,
 ) -> Option<String> {
-    let extensions = extension_resolution(language);
-
     // Python dotted-relative imports (import-resolver.ts:221-232).
     if language == Language::Python && import_path.starts_with('.') {
+        let extensions = extension_resolution(language);
         let dots = import_path.len() - import_path.trim_start_matches('.').len();
         let up = "../".repeat(dots.saturating_sub(1));
         let rest = import_path[dots..].replace('.', "/");
@@ -398,19 +445,7 @@ fn resolve_relative_import(
 
     let base_path = pathutil::resolve(from_dir, import_path);
     let relative_path = pathutil::relative(project_root, &base_path);
-
-    for ext in extensions {
-        let candidate = format!("{relative_path}{ext}");
-        if context.file_exists(&candidate) {
-            return Some(candidate);
-        }
-    }
-
-    if context.file_exists(&relative_path) {
-        return Some(relative_path);
-    }
-
-    None
+    resolve_source_candidate(&relative_path, language, context)
 }
 
 /// Resolve an aliased/absolute import (`resolveAliasedImport`,
@@ -421,19 +456,7 @@ fn resolve_aliased_import(
     language: Language,
     context: &dyn ResolutionContext,
 ) -> Option<String> {
-    let extensions = extension_resolution(language);
-    let try_with_ext = |base_path: &str| -> Option<String> {
-        for ext in extensions {
-            let candidate = format!("{base_path}{ext}");
-            if context.file_exists(&candidate) {
-                return Some(candidate);
-            }
-        }
-        if context.file_exists(base_path) {
-            return Some(base_path.to_string());
-        }
-        None
-    };
+    let try_with_ext = |base_path: &str| resolve_source_candidate(base_path, language, context);
 
     // 1. Project tsconfig/jsconfig paths (import-resolver.ts:282-289).
     if let Some(alias_map) = context.get_project_aliases() {
@@ -919,8 +942,8 @@ fn strip_js_comments(content: &str) -> String {
     out
 }
 
-/// Extract JS/TS re-export declarations (`extractReExports`,
-/// `import-resolver.ts:989-1042`).
+/// Extract JS/TS cross-file re-exports and explicit local export aliases
+/// (`extractReExports`, `import-resolver.ts:989-1042`).
 pub fn extract_re_exports(content: &str, language: Language) -> Vec<ReExport> {
     if !matches!(
         language,
@@ -933,12 +956,27 @@ pub fn extract_re_exports(content: &str, language: Language) -> Vec<ReExport> {
 
     static WILDCARD_RE: OnceLock<Regex> = OnceLock::new();
     static NAMED_RE: OnceLock<Regex> = OnceLock::new();
+    static LOCAL_CONST_RE: OnceLock<Regex> = OnceLock::new();
+    static LOCAL_NAMED_RE: OnceLock<Regex> = OnceLock::new();
+    static LOCAL_DEFAULT_RE: OnceLock<Regex> = OnceLock::new();
     let wildcard_re = WILDCARD_RE.get_or_init(|| {
         Regex::new(r#"export\s*\*(?:\s+as\s+\w+)?\s*from\s*['"]([^'"]+)['"]"#)
             .expect("reexport wildcard")
     });
     let named_re = NAMED_RE.get_or_init(|| {
         Regex::new(r#"export\s*\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]"#).expect("reexport named")
+    });
+    let local_const_re = LOCAL_CONST_RE.get_or_init(|| {
+        Regex::new(r"(?m)\bexport[ \t]+const[ \t]+(\w+)[ \t]*=[ \t]*(\w+)[ \t]*(?:;[ \t]*)?$")
+            .expect("local const export alias")
+    });
+    let local_named_re = LOCAL_NAMED_RE.get_or_init(|| {
+        Regex::new(r"(?m)\bexport[ \t]*\{([^}]+)\}[ \t]*;?[ \t]*$")
+            .expect("local named export alias")
+    });
+    let local_default_re = LOCAL_DEFAULT_RE.get_or_init(|| {
+        Regex::new(r"(?m)\bexport[ \t]+default[ \t]+(\w+)[ \t]*;?[ \t]*$")
+            .expect("local default export alias")
     });
 
     for caps in wildcard_re.captures_iter(&cleaned) {
@@ -969,6 +1007,37 @@ pub fn extract_re_exports(content: &str, language: Language) -> Vec<ReExport> {
                 });
             }
         }
+    }
+
+    for caps in local_const_re.captures_iter(&cleaned) {
+        out.push(ReExport::LocalAlias {
+            exported_name: caps[1].to_string(),
+            original_name: caps[2].to_string(),
+        });
+    }
+
+    for caps in local_named_re.captures_iter(&cleaned) {
+        for raw in caps[1].split(',') {
+            let item = raw.trim();
+            if let Some((original_name, exported_name)) = parse_as_alias(item) {
+                out.push(ReExport::LocalAlias {
+                    exported_name,
+                    original_name,
+                });
+            } else if is_word(item) {
+                out.push(ReExport::LocalAlias {
+                    exported_name: item.to_string(),
+                    original_name: item.to_string(),
+                });
+            }
+        }
+    }
+
+    for caps in local_default_re.captures_iter(&cleaned) {
+        out.push(ReExport::LocalAlias {
+            exported_name: "default".to_string(),
+            original_name: caps[1].to_string(),
+        });
     }
 
     out
@@ -1450,8 +1519,8 @@ struct Want {
     member_name: Option<String>,
 }
 
-/// Find an exported symbol, following re-export chains (`findExportedSymbol`,
-/// `import-resolver.ts:1810-1896`).
+/// Find an exported symbol through explicit local aliases and re-export chains
+/// (`findExportedSymbol`, `import-resolver.ts:1810-1896`).
 fn find_exported_symbol(
     file_path: &str,
     want: &Want,
@@ -1469,8 +1538,35 @@ fn find_exported_symbol(
     visited.insert(file_path.to_string());
 
     let nodes_in_file = context.get_nodes_in_file(file_path);
+    let re_exports = context.get_re_exports(file_path, language);
 
-    // 1. Direct hit (import-resolver.ts:1829-1853).
+    let requested_name = if want.is_default {
+        Some("default")
+    } else if want.is_namespace {
+        want.member_name.as_deref()
+    } else {
+        Some(want.exported_name.as_str())
+    };
+    if let Some(requested_name) = requested_name {
+        for rex in &re_exports {
+            if let ReExport::LocalAlias {
+                exported_name,
+                original_name,
+            } = rex
+            {
+                if exported_name == requested_name {
+                    if let Some(target) = nodes_in_file
+                        .iter()
+                        .find(|node| node.name == *original_name && node.kind == NodeKind::Function)
+                    {
+                        return Some(target.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // Direct hit (import-resolver.ts:1829-1853).
     if want.is_default {
         if let Some(direct) = nodes_in_file
             .iter()
@@ -1499,8 +1595,7 @@ fn find_exported_symbol(
         return Some(direct.clone());
     }
 
-    // 2 + 3. Re-export hits (import-resolver.ts:1855-1893).
-    let re_exports = context.get_re_exports(file_path, language);
+    // Cross-file re-export hits (import-resolver.ts:1855-1893).
     if re_exports.is_empty() {
         return None;
     }
@@ -1511,44 +1606,49 @@ fn find_exported_symbol(
         &want.exported_name
     };
     for rex in &re_exports {
-        if let ReExport::Named {
-            exported_name,
-            original_name,
-            source,
-        } = rex
-        {
-            if exported_name == target_name {
+        match rex {
+            ReExport::Named {
+                exported_name,
+                original_name,
+                source,
+            } => {
+                if exported_name == target_name {
+                    if let Some(next) = resolve_import_path(source, file_path, language, context) {
+                        let chained = find_exported_symbol(
+                            &next,
+                            &Want {
+                                is_default: original_name == "default",
+                                is_namespace: false,
+                                exported_name: original_name.clone(),
+                                member_name: None,
+                            },
+                            language,
+                            context,
+                            visited,
+                            depth + 1,
+                        );
+                        if chained.is_some() {
+                            return chained;
+                        }
+                    }
+                }
+            }
+            ReExport::Wildcard { .. } | ReExport::LocalAlias { .. } => {}
+        }
+    }
+
+    for rex in &re_exports {
+        match rex {
+            ReExport::Wildcard { source } => {
                 if let Some(next) = resolve_import_path(source, file_path, language, context) {
-                    let chained = find_exported_symbol(
-                        &next,
-                        &Want {
-                            is_default: original_name == "default",
-                            is_namespace: false,
-                            exported_name: original_name.clone(),
-                            member_name: None,
-                        },
-                        language,
-                        context,
-                        visited,
-                        depth + 1,
-                    );
+                    let chained =
+                        find_exported_symbol(&next, want, language, context, visited, depth + 1);
                     if chained.is_some() {
                         return chained;
                     }
                 }
             }
-        }
-    }
-
-    for rex in &re_exports {
-        if let ReExport::Wildcard { source } = rex {
-            if let Some(next) = resolve_import_path(source, file_path, language, context) {
-                let chained =
-                    find_exported_symbol(&next, want, language, context, visited, depth + 1);
-                if chained.is_some() {
-                    return chained;
-                }
-            }
+            ReExport::Named { .. } | ReExport::LocalAlias { .. } => {}
         }
     }
 
@@ -2469,6 +2569,80 @@ export { } from './empty';
     }
 
     #[test]
+    fn extract_re_exports_captures_local_function_alias_forms() {
+        let content = r#"
+function constTarget() {}
+export const constAlias = constTarget;
+function namedTarget() {}
+export { namedTarget as namedAlias };
+function defaultTarget() {}
+export default defaultTarget;
+export { Remote as RenamedRemote } from './remote';
+export let mutableLetAlias = constTarget;
+export var mutableVarAlias = constTarget;
+export const callAlias = factory();
+export const memberAlias = namespace.target;
+"#;
+
+        let out = extract_re_exports(content, Language::TypeScript);
+
+        assert!(out.iter().any(|r| matches!(
+            r,
+            ReExport::LocalAlias { exported_name, original_name }
+                if exported_name == "constAlias" && original_name == "constTarget"
+        )));
+        assert!(out.iter().any(|r| matches!(
+            r,
+            ReExport::LocalAlias { exported_name, original_name }
+                if exported_name == "namedAlias" && original_name == "namedTarget"
+        )));
+        assert!(out.iter().any(|r| matches!(
+            r,
+            ReExport::LocalAlias { exported_name, original_name }
+                if exported_name == "default" && original_name == "defaultTarget"
+        )));
+        assert!(out.iter().any(|r| matches!(
+            r,
+            ReExport::Named { exported_name, original_name, source }
+                if exported_name == "RenamedRemote"
+                    && original_name == "Remote"
+                    && source == "./remote"
+        )));
+        assert!(!out.iter().any(|r| matches!(
+            r,
+            ReExport::LocalAlias { exported_name, .. }
+                if ["mutableLetAlias", "mutableVarAlias", "callAlias", "memberAlias"]
+                    .contains(&exported_name.as_str())
+        )));
+    }
+
+    #[test]
+    fn extract_re_exports_stays_empty_for_non_ecmascript_languages() {
+        let content = r#"
+function constTarget() {}
+export const constAlias = constTarget;
+function namedTarget() {}
+export { namedTarget as namedAlias };
+function defaultTarget() {}
+export default defaultTarget;
+"#;
+
+        for language in Language::ALL {
+            if matches!(
+                language,
+                Language::TypeScript | Language::JavaScript | Language::Tsx | Language::Jsx
+            ) {
+                continue;
+            }
+            assert_eq!(
+                extract_re_exports(content, language),
+                Vec::new(),
+                "local aliases leaked into {language:?}"
+            );
+        }
+    }
+
+    #[test]
     fn is_external_import_relative_is_local() {
         let ctx = TestContext::default();
         assert!(!is_external_import("./foo", Language::TypeScript, &ctx));
@@ -2633,6 +2807,173 @@ export { } from './empty';
             ..Default::default()
         };
         assert!(resolve_import_path("./missing", "src/a.ts", Language::TypeScript, &ctx).is_none());
+    }
+
+    #[test]
+    fn resolve_import_path_typescript_js_specifier_substitution() {
+        for (language, specifier, existing, expected) in [
+            (Language::TypeScript, "./foo.js", "src/foo.ts", "src/foo.ts"),
+            (Language::Tsx, "./foo.js", "src/foo.tsx", "src/foo.tsx"),
+            (
+                Language::TypeScript,
+                "./foo.jsx",
+                "src/foo.ts",
+                "src/foo.ts",
+            ),
+            (
+                Language::TypeScript,
+                "./foo.mjs",
+                "src/foo.mts",
+                "src/foo.mts",
+            ),
+            (
+                Language::TypeScript,
+                "./foo.cjs",
+                "src/foo.cts",
+                "src/foo.cts",
+            ),
+        ] {
+            let ctx = TestContext {
+                project_root: "/proj".to_string(),
+                existing_files: BTreeSet::from([existing.to_string()]),
+                ..Default::default()
+            };
+            assert_eq!(
+                resolve_import_path(specifier, "src/a.ts", language, &ctx),
+                Some(expected.to_string()),
+                "specifier {specifier} for {language:?}"
+            );
+        }
+
+        let controls = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: BTreeSet::from([
+                "src/extensionless.ts".to_string(),
+                "src/data.json".to_string(),
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_import_path(
+                "./extensionless",
+                "src/a.ts",
+                Language::TypeScript,
+                &controls,
+            ),
+            Some("src/extensionless.ts".to_string())
+        );
+        assert_eq!(
+            resolve_import_path("./data.json", "src/a.ts", Language::TypeScript, &controls),
+            Some("src/data.json".to_string())
+        );
+        assert!(
+            resolve_import_path("./missing.js", "src/a.ts", Language::TypeScript, &controls,)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_import_path_typescript_js_specifier_prefers_typescript_source() {
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: BTreeSet::from(["src/foo.ts".to_string(), "src/foo.js".to_string()]),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_import_path("./foo.js", "src/a.ts", Language::TypeScript, &ctx),
+            Some("src/foo.ts".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_import_path_alias_js_specifier_substitution() {
+        for language in [Language::TypeScript, Language::Tsx] {
+            let ctx = TestContext {
+                project_root: "/proj".to_string(),
+                existing_files: BTreeSet::from(["src/foo.ts".to_string()]),
+                project_aliases: Some(AliasMap {
+                    base_url: "/proj".to_string(),
+                    patterns: vec![AliasPattern {
+                        prefix: "@/".to_string(),
+                        suffix: String::new(),
+                        has_wildcard: true,
+                        replacements: vec!["src/*".to_string()],
+                    }],
+                }),
+                ..Default::default()
+            };
+
+            assert_eq!(
+                resolve_import_path("@/foo.js", "src/a.ts", language, &ctx),
+                Some("src/foo.ts".to_string()),
+                "alias substitution for {language:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_import_path_js_specifier_substitution_stays_scoped_by_language() {
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: BTreeSet::from(["src/foo.ts".to_string()]),
+            ..Default::default()
+        };
+        let non_target_languages_with_extensions = [
+            Language::JavaScript,
+            Language::Jsx,
+            Language::Svelte,
+            Language::Vue,
+            Language::Python,
+            Language::Go,
+            Language::Rust,
+            Language::Java,
+            Language::C,
+            Language::Cpp,
+            Language::CSharp,
+            Language::Php,
+            Language::Ruby,
+            Language::ObjC,
+        ];
+
+        // A leading `.` is always local, so every non-Python relative row reaches
+        // the shared candidate helper; Python stays on its dedicated dotted path.
+        for language in non_target_languages_with_extensions {
+            if language != Language::Python {
+                assert_eq!(
+                    resolve_import_path("./foo.js", "src/a.ts", language, &ctx),
+                    None,
+                    "relative TS substitution leaked into {language:?}"
+                );
+            }
+            // Without a go.mod, Go is rejected as external before the alias helper;
+            // the remaining rows exercise the shared aliased candidate path.
+            assert_eq!(
+                resolve_import_path("@/foo.js", "src/a.ts", language, &ctx),
+                None,
+                "alias TS substitution leaked into {language:?}"
+            );
+        }
+
+        for language in Language::ALL {
+            if !matches!(
+                language,
+                Language::TypeScript | Language::Tsx | Language::Python
+            ) {
+                assert_eq!(
+                    resolve_import_path("./foo.js", "src/a.ts", language, &ctx),
+                    None,
+                    "relative TS substitution leaked into {language:?}"
+                );
+            }
+            if !matches!(language, Language::TypeScript | Language::Tsx) {
+                assert_eq!(
+                    resolve_import_path("@/foo.js", "src/a.ts", language, &ctx),
+                    None,
+                    "alias TS substitution leaked into {language:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3410,6 +3751,188 @@ export { } from './empty';
         let r = reference("Utils.doIt", EdgeKind::Calls, "Caller.java", Language::Java);
         let resolved = resolve_via_import(&r, &ctx).expect("resolves");
         assert_eq!(resolved.target_node_id, "method:doIt");
+    }
+
+    #[test]
+    fn find_exported_symbol_local_alias_const_form_prefers_original_function() {
+        let target = node(
+            "function:fn",
+            "fn",
+            NodeKind::Function,
+            "src/mod.ts",
+            Language::TypeScript,
+        );
+        let alias = exported(node(
+            "constant:a",
+            "a",
+            NodeKind::Constant,
+            "src/mod.ts",
+            Language::TypeScript,
+        ));
+        let mut re_exports = BTreeMap::new();
+        re_exports.insert(
+            "src/mod.ts".to_string(),
+            vec![ReExport::LocalAlias {
+                exported_name: "a".to_string(),
+                original_name: "fn".to_string(),
+            }],
+        );
+        let ctx = TestContext {
+            nodes: vec![alias, target],
+            re_exports,
+            ..Default::default()
+        };
+        let want = Want {
+            is_default: false,
+            is_namespace: false,
+            exported_name: "a".to_string(),
+            member_name: None,
+        };
+
+        let found = find_exported_symbol(
+            "src/mod.ts",
+            &want,
+            Language::TypeScript,
+            &ctx,
+            &mut BTreeSet::new(),
+            0,
+        )
+        .expect("local const alias resolves");
+
+        assert_eq!(found.id, "function:fn");
+    }
+
+    #[test]
+    fn find_exported_symbol_local_alias_named_form_targets_unexported_function() {
+        let target = node(
+            "function:fn",
+            "fn",
+            NodeKind::Function,
+            "src/mod.ts",
+            Language::TypeScript,
+        );
+        let mut re_exports = BTreeMap::new();
+        re_exports.insert(
+            "src/mod.ts".to_string(),
+            vec![ReExport::LocalAlias {
+                exported_name: "a".to_string(),
+                original_name: "fn".to_string(),
+            }],
+        );
+        let ctx = TestContext {
+            nodes: vec![target],
+            re_exports,
+            ..Default::default()
+        };
+        let want = Want {
+            is_default: false,
+            is_namespace: false,
+            exported_name: "a".to_string(),
+            member_name: None,
+        };
+
+        let found = find_exported_symbol(
+            "src/mod.ts",
+            &want,
+            Language::TypeScript,
+            &ctx,
+            &mut BTreeSet::new(),
+            0,
+        )
+        .expect("local named alias resolves");
+
+        assert_eq!(found.id, "function:fn");
+    }
+
+    #[test]
+    fn find_exported_symbol_local_alias_default_form_targets_unexported_function() {
+        let target = node(
+            "function:fn",
+            "fn",
+            NodeKind::Function,
+            "src/mod.ts",
+            Language::TypeScript,
+        );
+        let mut re_exports = BTreeMap::new();
+        re_exports.insert(
+            "src/mod.ts".to_string(),
+            vec![ReExport::LocalAlias {
+                exported_name: "default".to_string(),
+                original_name: "fn".to_string(),
+            }],
+        );
+        let ctx = TestContext {
+            nodes: vec![target],
+            re_exports,
+            ..Default::default()
+        };
+        let want = Want {
+            is_default: true,
+            is_namespace: false,
+            exported_name: "default".to_string(),
+            member_name: None,
+        };
+
+        let found = find_exported_symbol(
+            "src/mod.ts",
+            &want,
+            Language::TypeScript,
+            &ctx,
+            &mut BTreeSet::new(),
+            0,
+        )
+        .expect("local default alias resolves");
+
+        assert_eq!(found.id, "function:fn");
+    }
+
+    #[test]
+    fn find_exported_symbol_local_alias_default_form_ignores_unrelated_exported_function() {
+        let target = node(
+            "function:fn",
+            "fn",
+            NodeKind::Function,
+            "src/mod.ts",
+            Language::TypeScript,
+        );
+        let unrelated = exported(node(
+            "function:other",
+            "other",
+            NodeKind::Function,
+            "src/mod.ts",
+            Language::TypeScript,
+        ));
+        let mut re_exports = BTreeMap::new();
+        re_exports.insert(
+            "src/mod.ts".to_string(),
+            vec![ReExport::LocalAlias {
+                exported_name: "default".to_string(),
+                original_name: "fn".to_string(),
+            }],
+        );
+        let ctx = TestContext {
+            nodes: vec![unrelated, target],
+            re_exports,
+            ..Default::default()
+        };
+        let want = Want {
+            is_default: true,
+            is_namespace: false,
+            exported_name: "default".to_string(),
+            member_name: None,
+        };
+
+        let found = find_exported_symbol(
+            "src/mod.ts",
+            &want,
+            Language::TypeScript,
+            &ctx,
+            &mut BTreeSet::new(),
+            0,
+        )
+        .expect("local default alias resolves");
+
+        assert_eq!(found.id, "function:fn");
     }
 
     #[test]

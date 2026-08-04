@@ -1,0 +1,387 @@
+[
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "file:consumer.ts",
+    "target": "import:d34cfc18269336a2e853eed952aa430d"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 2,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "file:consumer.ts",
+    "target": "import:d34cfc18269336a2e853eed952aa430d"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "file:consumer.ts",
+    "target": "import:d34cfc18269336a2e853eed952aa430d"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "file:consumer.ts",
+    "target": "import:0b22b7f0be00f007f49feeb7c90a0878"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "file-path"
+    },
+    "provenance": null,
+    "source": "file:consumer.ts",
+    "target": "file:collision.js"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "file:consumer.ts",
+    "target": "import:249a167e6db6cb653a2b598f05964d03"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 7,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "file:consumer.ts",
+    "target": "import:58ba30c67d247ca76af614a60b572c1c"
+  },
+  {
+    "col": 2,
+    "kind": "calls",
+    "line": 10,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "function:f457dd2d5f87f1af2a87ff0989542423",
+    "target": "function:cdbcd95113ddd7cd4aff8ebf7e494ed2"
+  },
+  {
+    "col": 2,
+    "kind": "calls",
+    "line": 11,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "function:f457dd2d5f87f1af2a87ff0989542423",
+    "target": "function:d9eba2bae70ed18576ba5ed96bc2b644"
+  },
+  {
+    "col": 2,
+    "kind": "calls",
+    "line": 12,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "function:f457dd2d5f87f1af2a87ff0989542423",
+    "target": "function:d55a5266b864011bc34d8d3e40a60d5b"
+  },
+  {
+    "col": 2,
+    "kind": "calls",
+    "line": 13,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "function:f457dd2d5f87f1af2a87ff0989542423",
+    "target": "function:b8fad7e972c96125f3204297e4b630e0"
+  },
+  {
+    "col": 2,
+    "kind": "calls",
+    "line": 14,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "function:f457dd2d5f87f1af2a87ff0989542423",
+    "target": "function:a6d594ffd5d5f1daf20b2b6a38aa9d8a"
+  },
+  {
+    "col": 2,
+    "kind": "calls",
+    "line": 15,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "function:f457dd2d5f87f1af2a87ff0989542423",
+    "target": "function:82178a7ebdc9958e76b3d6014789f799"
+  },
+  {
+    "col": 21,
+    "kind": "imports",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:consumer.ts",
+    "target": "function:b8fad7e972c96125f3204297e4b630e0"
+  },
+  {
+    "col": 23,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:consumer.ts",
+    "target": "function:cdbcd95113ddd7cd4aff8ebf7e494ed2"
+  },
+  {
+    "col": 23,
+    "kind": "imports",
+    "line": 2,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:consumer.ts",
+    "target": "function:d9eba2bae70ed18576ba5ed96bc2b644"
+  },
+  {
+    "col": 26,
+    "kind": "references",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "file:exports.ts",
+    "target": "function:cdbcd95113ddd7cd4aff8ebf7e494ed2"
+  },
+  {
+    "col": 28,
+    "kind": "imports",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:consumer.ts",
+    "target": "function:a6d594ffd5d5f1daf20b2b6a38aa9d8a"
+  },
+  {
+    "col": 32,
+    "kind": "imports",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:consumer.ts",
+    "target": "function:82178a7ebdc9958e76b3d6014789f799"
+  },
+  {
+    "col": 7,
+    "kind": "imports",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:consumer.ts",
+    "target": "file:exports.ts"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:collision.js",
+    "target": "function:3a28a361b6c9074981b560e0f11901f5"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:collision.ts",
+    "target": "function:a6d594ffd5d5f1daf20b2b6a38aa9d8a"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:consumer.ts",
+    "target": "function:f457dd2d5f87f1af2a87ff0989542423"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:consumer.ts",
+    "target": "import:0b22b7f0be00f007f49feeb7c90a0878"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:consumer.ts",
+    "target": "import:249a167e6db6cb653a2b598f05964d03"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:consumer.ts",
+    "target": "import:58ba30c67d247ca76af614a60b572c1c"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:consumer.ts",
+    "target": "import:5eac6b1bb0ffbfd4f932dda317095565"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:consumer.ts",
+    "target": "import:6206d159d10d5c530bf6118d7a59dfa6"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:consumer.ts",
+    "target": "import:c5ca993266657ad192c6a7d55643f8e4"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:consumer.ts",
+    "target": "import:d34cfc18269336a2e853eed952aa430d"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:exports.ts",
+    "target": "constant:bc1551c21485869a4af357b17a0ba32a"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:exports.ts",
+    "target": "function:cdbcd95113ddd7cd4aff8ebf7e494ed2"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:exports.ts",
+    "target": "function:d55a5266b864011bc34d8d3e40a60d5b"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:exports.ts",
+    "target": "function:d9eba2bae70ed18576ba5ed96bc2b644"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:extensionless.ts",
+    "target": "function:82178a7ebdc9958e76b3d6014789f799"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:js_target.ts",
+    "target": "function:b8fad7e972c96125f3204297e4b630e0"
+  }
+]
