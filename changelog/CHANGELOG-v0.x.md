@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.42.9](https://github.com/sunerpy/codegraph-rust/compare/v0.42.8...v0.42.9) (2026-08-04)
+
+
+### Bug Fixes
+
+* **index:** recover an index whose project was moved or copied ([#199](https://github.com/sunerpy/codegraph-rust/issues/199)) ([8935fba](https://github.com/sunerpy/codegraph-rust/commit/8935fba9800c002f68fca535e71e27e45ece413c))
+
 ## [0.42.8](https://github.com/sunerpy/codegraph-rust/compare/v0.42.7...v0.42.8) (2026-08-04)
 
 
