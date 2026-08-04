@@ -13,8 +13,10 @@
   `1.2.0 → 1.4.1` subset landed across `v0.28.3`–`v0.39.0`; see the 2026-07-17
   CLOSEOUT entry)
 - **This project version:** see `Cargo.toml` (`codegraph-rs`, independent line)
-- **Last sync:** `2026-08-02` — the `1.4.1 → 1.5.0` round is **COMPLETE**; all
-  four batches shipped and parity advanced from `1.4.1` to `1.5.0`
+- **Last sync:** `2026-08-04` — the two triaged issues left open by the
+  `1.4.1 → 1.5.0` round (**#1495**, **#1482 / #1482b**) have shipped, alongside two
+  project-local fixes; see the 2026-08-04 entry. Tracked parity stays `1.5.0` —
+  none of the four releases is an upstream-range port
 - **Upstream repo:** https://github.com/colbymchenry/codegraph
 
 > **1.4.1 → 1.5.0 sync: COMPLETE** (codegraph-rs `v0.42.1` → `v0.42.4`). Every
@@ -33,13 +35,11 @@
 >   truncation is adopted here.
 > - **`0682137` is N/A (packaging-rooted)** — we ship a native `codegraph.exe`,
 >   never a `.cmd` shim, so writing `codegraph.cmd` would name a nonexistent file.
-> - **Two triaged issues stay OPEN for a later batch** — **#1482 / #1482b**: TS
->   rename-through-alias loses caller/impact edges (`export const a = fn`,
->   `export { fn as a }`, and `export default fn` each produce a false zero), and
->   `.js` specifiers never resolve to `.ts` because `extension_resolution` only
->   APPENDS. Golden-affecting. **#1495**: Kotlin signatures are always absent; the
->   fix pattern already exists ten lines away in the same file, and no Kotlin
->   golden exists yet.
+> - **Both formerly-open triaged issues have SHIPPED** — **#1495** Kotlin callable
+>   signatures in `v0.42.6` (a documented DIVERGENCE from upstream, not a port), and
+>   **#1482 / #1482b** TS export-alias resolution plus `.js`→`.ts` specifier
+>   substitution in `v0.42.8`. Both are golden-affecting and carry new fixtures; see
+>   the 2026-08-04 entry.
 > - The `1.2.0 → 1.4.1` caveats below all still hold and carry forward unchanged.
 
 > **1.2.0 → 1.4.1 sync: COMPLETE.** Every portable, in-scope behavior in that
@@ -68,6 +68,109 @@
 > that records colby parity — do not infer it from `Cargo.toml`.
 
 ## Sync log
+
+### 2026-08-04 — the two open triaged issues SHIPPED, plus two project-local fixes (`v0.42.5` → `v0.42.8`; tracked parity stays `1.5.0`)
+
+Four releases. Two of them close the issues the 2026-08-02 CLOSEOUT left open
+(**#1495**, **#1482 / #1482b**); the other two are project-local — a reverted
+invention and the Godot-team liaison doc's only P1. **Tracked parity stays
+`1.5.0`**: none of the four is an upstream-range port. #1495 is a documented
+divergence FROM upstream; #1482/#1482b close upstream-triaged ISSUES rather than
+upstream commits; and `v0.42.5`/`v0.42.7` have no upstream counterpart at all. A
+future sync must not read these four releases as parity movement.
+
+Every release published with `isDraft=false` and 7 assets (6 platform binaries +
+`SHA256SUMS`). Final workspace test count after `v0.42.8`: **127 suites / 3134
+passed / 0 failed**.
+
+| release | our commit | what it fixed |
+| - | - | - |
+| `v0.42.5` | `5aff695` (PR #190) | index root restored from `.codegraph-v2` to `.codegraph`, with takeover of a pre-existing legacy database |
+| `v0.42.6` | `81628f2` (PR #192) | **#1495** Kotlin callable signatures — a DIVERGENCE from upstream |
+| `v0.42.7` | `20e3f9d` (PR #194) | per-state CLI diagnostics when an index is unreadable (liaison-doc P1) |
+| `v0.42.8` | `4a17919` (PR #196) | **#1482 / #1482b** TS export-alias resolution + `.js`→`.ts` specifier substitution |
+
+**`v0.42.5` — a project-local invention reverted.** `.codegraph-v2` was never an
+upstream port: upstream's `src/directory.ts:12` has always used `.codegraph`. Two
+blockers had to fall together. `IndexPaths::resolve` rejected any current root
+overlapping a legacy root, and the fixed `.codegraph` was always in that set, so
+naming it made _every_ resolve fail. And a `.codegraph` written by v0.40.4 or by
+the upstream tool has no state slots, so it classifies `Missing` while its database
+exists — a state the write gate refused. An explicit `init` now takes such a
+database over under the one exclusive lease it already holds, logging what it
+replaced. **Only `Missing` qualifies**: `Building`, `Corrupt`, and `Future` still
+fail closed, so a running builder never loses its work. `CODEGRAPH_DIR` also
+returned to upstream's meaning — a plain project-local join, not a
+`<name>-v2-<64 hex>` sibling.
+
+**`v0.42.6` — #1495, and why it is a DIVERGENCE, not a port.**
+`KotlinSpec::get_signature` returned `None` unconditionally because upstream's
+`kotlin.ts:232-242` looks the parameter list up through a grammar FIELD the Kotlin
+grammar does not expose, so upstream's own hook always returns `undefined` and this
+port mirrored it faithfully. The fix reuses a pattern already in the same file:
+`declared_return_type_node` walks `named_children` and matches on KIND, sidestepping
+the missing field. It emits raw parameter text plus the declared return type when
+written. Primary constructors stay class details; lambdas, accessors, and anonymous
+functions stay outside the node set. `EXTRACTION_VERSION` 3 → 4. The new
+`reference/golden/kotlin/` fixture guards five shapes (explicit, inferred, generic,
+multiline nullable, extension) plus a primary-constructor negative.
+
+**`v0.42.7` — the message was the bug, not the permission.** The liaison doc's only
+P1: an interrupted `index --force` leaves the namespace in `building`, and every
+read then refused with "CodeGraph not initialized" pointing at `init`. Twelve
+commands shared that one message because `resolve_required_project` collapsed six of
+the seven lifecycle states into a single bool. Each state now names its own remedy;
+reads still fail closed everywhere. `status` adds recovery guidance for `building`
+but **only when a shared lease is free** — a real build holds the namespace
+exclusively, and telling someone to rebuild mid-build would destroy work in
+progress. `unlock` works in `building`, clearing a stale daemon pid record and the
+transient lock, then reporting that the state is still building.
+
+**The doc's own suggestion was REFUSED, with measurements.** It proposed rolling the
+newest `building` slot back to the previous `current`. But `begin_from_authorization`
+publishes `phase=building` durably _before_ any destructive database work
+(`crates/codegraph-store/src/rebuild.rs:324-330`), so the older slot describes a
+database that no longer exists. Measured aftermath: db 4096 bytes / `nodes=0`
+versus 1098/1221 intact. Presenting that as `Current` would turn every query into a
+silent empty answer.
+
+**`v0.42.8` — #1482 / #1482b, two independent misses.** `export const a = fn`,
+`export { fn as a }`, and `export default fn` each publish a local declaration
+under a different name, and an importer using that name resolved to nothing — so
+the original looked uncalled. Re-export extraction now records local aliases
+alongside the cross-file forms, and the export lookup follows them back.
+Separately, `.js` specifiers never reached their TypeScript source: NodeNext
+requires `import './foo.js'` even when the file is `foo.ts`, but the candidate
+builder only APPENDED extensions. A specifier ending in a JS-family extension now
+tries the matching TypeScript extension first (`.js`/`.jsx` → `.ts`/`.tsx`/`.d.ts`,
+`.mjs` → `.mts`, `.cjs` → `.cts`), falling back to the append behaviour. When both
+`foo.js` and `foo.ts` exist, TypeScript wins. Scoping is pinned by tests walking
+`Language::ALL`: only TypeScript and Tsx substitute, and only the four ECMAScript
+languages extract a local alias. `EXTRACTION_VERSION` 4 → 5. The new
+`reference/golden/typescript/` fixture carries four positives and three negatives.
+
+#### Exceptions carried forward unchanged
+
+The **26 DEFER items** remain deferred — 19 resolution/store/synthesis perf
+strategies plus 7 sync/WAL scheduling strategies, all tuned to upstream's Node /
+`node:sqlite` runtime, byte-identical to graph output, to be re-derived from a Rust
+profile rather than transcribed. **`2adc7f6` becomes a CORRECTNESS item** if
+timer-triggered truncation is ever adopted here. **`0682137` stays N/A**
+(packaging-rooted — we ship a native `codegraph.exe`, never a `.cmd` shim). Full
+text in `## Current alignment` above.
+
+#### Two findings worth carrying to the next sync
+
+Both cost real investigation and would otherwise be re-derived.
+
+1. **Python has no export semantics** — already recorded in the 2026-08-02 batch-4
+   export-semantics finding above, and it stayed load-bearing here: it is what makes
+   #1482's alias work TypeScript-scoped rather than generic. `find_exported_symbol`
+   requires `is_exported`, and the Python spec never sets it — upstream included.
+2. **The double-buffered state slots carry STATE, not DATA.** This is exactly what
+   made the liaison doc's rollback suggestion unsafe, and it generalizes: any future
+   "just roll back to the previous slot" idea faces the same problem, because the
+   slot is a phase record, not a snapshot of the database it describes.
 
 ### 2026-08-02 — CLOSEOUT: `1.4.1 → 1.5.0` sync COMPLETE (tracked parity advanced to `1.5.0`)
 
@@ -148,8 +251,9 @@ strategies, all Node-runtime-tuned, byte-identical to graph output — re-derive
 a Rust profile, and treat `2adc7f6` as a correctness item if timer-triggered
 truncation is ever adopted); **`0682137` is N/A** (native `.exe`, no `.cmd` shim);
 and **#1482 / #1482b** (TS rename-through-alias false zeros + `.js`→`.ts` specifier
-resolution, golden-affecting) and **#1495** (Kotlin signatures always absent) stay
-open for a later batch.
+resolution) and **#1495** (Kotlin signatures always absent) were left open at the
+time of writing — **both have since shipped**, in `v0.42.8` and `v0.42.6`
+respectively (see the 2026-08-04 entry).
 
 #### Process note — one root cause, four batches
 
@@ -220,10 +324,12 @@ language extractors.
 - **#1482 / #1482b** TS rename-through-alias loses caller/impact edges
   (`export const a = fn`, `export { fn as a }`, `export default fn` all produce a
   false zero), and `.js` specifiers never resolve to `.ts` because
-  `extension_resolution` only APPENDS. Golden-affecting. → later batch.
+  `extension_resolution` only APPENDS. Golden-affecting. → **LANDED in `v0.42.8`**
+  (`4a17919`, PR #196).
 - **#1495** Kotlin signatures always absent — our `get_signature` deliberately
   mirrors upstream's `undefined` with `None`; the fix pattern already exists ten
-  lines away in the same file. Cheap, no Kotlin golden exists yet.
+  lines away in the same file. Cheap, no Kotlin golden exists yet. → **LANDED in
+  `v0.42.6`** (`81628f2`, PR #192), as a documented divergence from upstream.
 - **ALREADY-HAVE, verified**: #1455 (exact-name ranking shipped in `v0.42.0` — but
   it changed `search` RANKING, so it does NOT close #1473's separate resolution
   path), #1451 (our sync gate is content-hash, no atime anywhere), #1447/#1445
