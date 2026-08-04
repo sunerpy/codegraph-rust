@@ -80,6 +80,42 @@ struct Run {
     ok: bool,
 }
 
+fn normalize(stream: &str) -> String {
+    stream
+        .lines()
+        .filter(|line| !line.contains("logger initialized"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn final_error_body(stderr: &str) -> String {
+    let normalized = normalize(stderr);
+    let non_empty = normalized
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    let error_lines = non_empty
+        .iter()
+        .filter(|line| line.starts_with("Error: "))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        error_lines.len(),
+        1,
+        "stderr must contain exactly one Error-prefixed line: {normalized:?}"
+    );
+    let final_line = non_empty
+        .last()
+        .expect("stderr must contain a final non-empty error line");
+    assert_eq!(
+        *final_line, *error_lines[0],
+        "the unique Error-prefixed line must be final: {normalized:?}"
+    );
+    final_line
+        .strip_prefix("Error: ")
+        .expect("the final line was proven to have the Error prefix")
+        .to_string()
+}
+
 fn run_in(registry_dir: &Path, args: &[&str]) -> Run {
     run_in_with_config(registry_dir, args, None)
 }
@@ -415,6 +451,34 @@ fn stage_lifecycle_state(paths: &IndexPaths, status: &str) {
         "building" => {
             publish_index_state(paths, &lease, StatePhase::Building).expect("publish Building");
         }
+        "uninitialized" => {
+            let phase = StatePhase::Uninitialized.as_wire();
+            let checksum = checksum_hex(
+                0,
+                CURRENT_STORAGE_PROTOCOL,
+                CURRENT_EXTRACTION_VERSION,
+                phase,
+                paths.project_identity(),
+            );
+            let body = serde_json::json!({
+                "sequence": 0,
+                "storageProtocol": CURRENT_STORAGE_PROTOCOL,
+                "extractionVersion": CURRENT_EXTRACTION_VERSION,
+                "phase": phase,
+                "projectIdentity": paths.project_identity(),
+                "checksum": checksum,
+            });
+            std::fs::write(
+                &paths.state_slots()[0],
+                serde_json::to_vec(&body).expect("serialize Uninitialized slot"),
+            )
+            .expect("write Uninitialized slot");
+        }
+        "current-no-db" => {
+            publish_index_state(paths, &lease, StatePhase::Building)
+                .expect("publish Building before Current");
+            publish_index_state(paths, &lease, StatePhase::Current).expect("publish Current");
+        }
         "outdated" | "future" | "corrupt" => {
             let (storage_protocol, extraction_version, phase) = match status {
                 "outdated" => (
@@ -428,8 +492,30 @@ fn stage_lifecycle_state(paths: &IndexPaths, status: &str) {
                     "current",
                 ),
                 "corrupt" => {
-                    std::fs::write(&paths.state_slots()[0], b"not-json")
-                        .expect("write corrupt slot");
+                    for (slot, phase) in
+                        paths.state_slots().into_iter().zip(["current", "building"])
+                    {
+                        let checksum = checksum_hex(
+                            7,
+                            CURRENT_STORAGE_PROTOCOL,
+                            CURRENT_EXTRACTION_VERSION,
+                            phase,
+                            paths.project_identity(),
+                        );
+                        let body = serde_json::json!({
+                            "sequence": 7,
+                            "storageProtocol": CURRENT_STORAGE_PROTOCOL,
+                            "extractionVersion": CURRENT_EXTRACTION_VERSION,
+                            "phase": phase,
+                            "projectIdentity": paths.project_identity(),
+                            "checksum": checksum,
+                        });
+                        std::fs::write(
+                            slot,
+                            serde_json::to_vec(&body).expect("serialize equal-sequence slot"),
+                        )
+                        .expect("write equal-sequence slot");
+                    }
                     drop(lease);
                     return;
                 }
@@ -459,6 +545,138 @@ fn stage_lifecycle_state(paths: &IndexPaths, status: &str) {
         _ => unreachable!(),
     }
     drop(lease);
+}
+
+fn assert_query_error(dir: &TestDir, project: &Path, expected: &str) {
+    let project_arg = project.to_str().expect("UTF-8 test project path");
+    let run = run_in(
+        dir.path(),
+        &["query", "Counter", "-p", project_arg, "--strict"],
+    );
+    assert!(
+        !run.ok,
+        "query must fail closed: stdout={}, stderr={}",
+        run.stdout, run.stderr
+    );
+    assert_eq!(final_error_body(&run.stderr), expected);
+}
+
+#[test]
+fn building_state_recovery_reports_exact_per_state_query_diagnostics() {
+    for status in ["building", "uninitialized", "outdated", "future", "corrupt"] {
+        let dir = TestDir::new(status);
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).expect("create lifecycle project");
+        let paths = IndexPaths::resolve(&project, None).expect("resolve lifecycle paths");
+        stage_lifecycle_state(&paths, status);
+        let project_display = project.display();
+        let expected = match status {
+            "building" => format!(
+                "CodeGraph index build was interrupted in {project_display}; reads remain blocked to avoid false empty results. Run `codegraph index --force {project_display}` to rebuild it (or `codegraph init {project_display}`)."
+            ),
+            "uninitialized" => format!(
+                "CodeGraph index removal was interrupted in {project_display}; run `codegraph init {project_display}` to rebuild it"
+            ),
+            "outdated" => format!(
+                "CodeGraph index in {project_display} is outdated (built with extraction version {}); run `codegraph index --force {project_display}` to rebuild it",
+                CURRENT_EXTRACTION_VERSION - 1
+            ),
+            "future" => format!(
+                "CodeGraph index in {project_display} was built by a newer CodeGraph version (extraction version {}); upgrade CodeGraph before reading it",
+                CURRENT_EXTRACTION_VERSION + 1
+            ),
+            "corrupt" => format!(
+                "CodeGraph index state in {project_display} is corrupt: both index state slots are valid at sequence 7 with differing payloads; run `codegraph status {project_display}` for details; manual recovery is required"
+            ),
+            _ => unreachable!(),
+        };
+        assert_query_error(&dir, &project, &expected);
+    }
+
+    let dir = TestDir::new("fresh-missing");
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(&project).expect("create fresh project");
+    let expected = format!(
+        "CodeGraph not initialized in {}; run `codegraph init {}` to create or replace the index",
+        project.display(),
+        project.display()
+    );
+    assert_query_error(&dir, &project, &expected);
+}
+
+#[test]
+fn building_state_recovery_reports_missing_state_for_every_database_artifact() {
+    for suffix in [None, Some("-wal"), Some("-shm")] {
+        let label = suffix.unwrap_or("database").trim_start_matches('-');
+        let dir = TestDir::new(&format!("missing-state-{label}"));
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).expect("create project");
+        let paths = IndexPaths::resolve(&project, None).expect("resolve index paths");
+        std::fs::create_dir_all(paths.current_root()).expect("create index root");
+        let artifact = suffix.map_or_else(
+            || paths.current_db(),
+            |value| db_sidecar(&paths.current_db(), value),
+        );
+        std::fs::write(&artifact, b"stale database artifact").expect("write database artifact");
+        let expected = format!(
+            "index database has no state slots and may have been created by an older version or another tool; run `codegraph init {}` to replace it",
+            project.display()
+        );
+        assert_query_error(&dir, &project, &expected);
+    }
+}
+
+#[test]
+fn building_state_recovery_current_without_database_names_the_working_manual_remedy() {
+    let dir = TestDir::new("current-no-db");
+    let project = dir.path().join("mini");
+    copy_tree(&mini_fixture(), &project);
+    let paths = IndexPaths::resolve(&project, None).expect("resolve index paths");
+    stage_lifecycle_state(&paths, "current-no-db");
+    let diagnostic_paths =
+        IndexPaths::resolve(&project, None).expect("re-resolve published index root");
+    let expected = format!(
+        "CodeGraph index state is current in {}, but {} is missing; no CodeGraph CLI command can recover this externally damaged namespace. After confirming no CodeGraph process is using it, run `rm -rf -- \"{}\" && codegraph init \"{}\"`.",
+        project.display(),
+        diagnostic_paths.current_db().display(),
+        diagnostic_paths.current_root().display(),
+        project.display()
+    );
+    assert_query_error(&dir, &project, &expected);
+
+    std::fs::remove_dir_all(diagnostic_paths.current_root())
+        .expect("remove externally damaged index root");
+    let recovery = run_in(
+        dir.path(),
+        &["init", project.to_str().expect("UTF-8 test project path")],
+    );
+    assert!(
+        recovery.ok,
+        "the exact manual remedy named by the diagnostic must recover: stdout={}, stderr={}",
+        recovery.stdout, recovery.stderr
+    );
+    assert_eq!(Store::extraction_status(&paths), ExtractionStatus::Current);
+    assert!(paths.current_db().is_file());
+}
+
+#[test]
+fn building_state_recovery_current_database_remains_readable() {
+    let dir = TestDir::new("current-readable");
+    let project = dir.path().join("mini");
+    copy_tree(&mini_fixture(), &project);
+    let project_arg = project.to_str().expect("UTF-8 test project path");
+    let init = run_in(dir.path(), &["init", project_arg]);
+    assert!(init.ok, "init must establish Current: {}", init.stderr);
+
+    let query = run_in(
+        dir.path(),
+        &["query", "Counter", "-p", project_arg, "--strict"],
+    );
+    assert!(
+        query.ok,
+        "Current plus database must remain readable: stdout={}, stderr={}",
+        query.stdout, query.stderr
+    );
 }
 
 #[test]
