@@ -1,0 +1,50 @@
+[
+  {
+    "content_hash": "5d91d0b374e6bbe30c01d7932f5554fbf02f1a3d1eea2f0aee046ae6a891c182",
+    "errors": null,
+    "language": "javascript",
+    "node_count": 2,
+    "path": "collision.js",
+    "size": 37
+  },
+  {
+    "content_hash": "5d91d0b374e6bbe30c01d7932f5554fbf02f1a3d1eea2f0aee046ae6a891c182",
+    "errors": null,
+    "language": "typescript",
+    "node_count": 2,
+    "path": "collision.ts",
+    "size": 37
+  },
+  {
+    "content_hash": "417ddd5bafc0993f53e32c05d91eef694f7ef6b3d99fda239ae893be0fcc7c9b",
+    "errors": null,
+    "language": "typescript",
+    "node_count": 9,
+    "path": "consumer.ts",
+    "size": 588
+  },
+  {
+    "content_hash": "1a81c274140423b2a2f7ce75e1f010817827acf00fdab3a5bfe87a1c0b3aacde",
+    "errors": null,
+    "language": "typescript",
+    "node_count": 5,
+    "path": "exports.ts",
+    "size": 192
+  },
+  {
+    "content_hash": "82f12c230dbce8f54af95b6050c1cb9286d876373a38ceccb7c5cb00add8df80",
+    "errors": null,
+    "language": "typescript",
+    "node_count": 2,
+    "path": "extensionless.ts",
+    "size": 41
+  },
+  {
+    "content_hash": "04c00befb179da7e0748d6338704f7953a0f419fc1b566168f68567d1cc5e52c",
+    "errors": null,
+    "language": "typescript",
+    "node_count": 2,
+    "path": "js_target.ts",
+    "size": 30
+  }
+]

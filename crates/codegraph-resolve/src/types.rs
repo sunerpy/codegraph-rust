@@ -139,8 +139,8 @@ pub struct ImportMapping {
 /// A re-export declared by a file.
 ///
 /// Ports the upstream `ReExport` union (`types.ts:222-235`):
-/// `export { x } from './other'` (named) or `export * from './other'`
-/// (wildcard).
+/// Cross-file re-exports (`export { x } from './other'` / `export * from
+/// './other'`) and explicit local export aliases.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReExport {
     /// `export { originalName as exportedName } from 'source'`.
@@ -156,6 +156,13 @@ pub enum ReExport {
     Wildcard {
         /// Module specifier of the upstream module.
         source: String,
+    },
+    /// An explicit local export alias such as `export { original as alias }`.
+    LocalAlias {
+        /// Name as exported by THIS file.
+        exported_name: String,
+        /// Name of the local declaration.
+        original_name: String,
     },
 }
 

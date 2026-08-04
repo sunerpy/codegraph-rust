@@ -117,8 +117,12 @@ fn assert_corrupt(
 
 #[test]
 fn index_state_constants_and_canonical_payload_are_exact() {
+    /// The extraction version the immediately preceding release wrote. Read from
+    /// `index_state.rs` at implementation time; see plan decision C1 step 0.
+    const PREVIOUS_EXTRACTION_VERSION: u64 = 4;
+
     assert_eq!(CURRENT_STORAGE_PROTOCOL, 2);
-    assert_eq!(CURRENT_EXTRACTION_VERSION, 4);
+    assert_eq!(CURRENT_EXTRACTION_VERSION, PREVIOUS_EXTRACTION_VERSION + 1);
     assert_eq!(EXTRACTION_VERSION_KEY, "indexed_with_extraction_version");
     assert_eq!(
         canonical_checksum_payload(7, 2, 4, "future-phase", OWNER),
@@ -176,6 +180,7 @@ fn index_state_current_protocol_maps_each_phase() {
 
 #[test]
 fn index_state_extraction_version_maps_outdated_and_future_for_every_phase() {
+    let previous_extraction = CURRENT_EXTRACTION_VERSION - 1;
     let future_extraction = CURRENT_EXTRACTION_VERSION + 1;
     for phase in ["building", "current", "uninitialized"] {
         let old = TempTree::new("outdated");
@@ -197,13 +202,15 @@ fn index_state_extraction_version_maps_outdated_and_future_for_every_phase() {
             &previous.slots()[0],
             1,
             CURRENT_STORAGE_PROTOCOL,
-            3,
+            previous_extraction,
             phase,
             OWNER,
         );
         assert_eq!(
             classify_slots(&previous.slots(), OWNER).status(),
-            &ExtractionStatus::Outdated { built: 3 }
+            &ExtractionStatus::Outdated {
+                built: previous_extraction
+            }
         );
 
         let future = TempTree::new("future-extraction");

@@ -815,6 +815,54 @@ The `generated_golden_matches_committed_cfml_fixture` and
 `cfml_db_is_self_equivalent_to_cfml_golden` tests in
 `crates/codegraph-bench/tests/equivalence.rs` enforce byte-stability.
 
+### TypeScript resolution fixture
+
+The dedicated `reference/golden/typescript/` fixture guards TypeScript export
+alias and explicit JavaScript-specifier resolution (#1482 / #1482b) without
+changing the shared `mini` corpus. Its six-file source corpus lives at
+`crates/codegraph-bench/fixtures/typescript/`; source lines are contractual
+because node IDs include the declaration line.
+
+The `runAll` function pins six positive `Calls` edges, in source order:
+
+- `viaConstAlias()` → the local `constTarget` function behind
+  `export const constAlias = constTarget`;
+- `viaNamedAlias()` → the local `namedTarget` function behind
+  `export { namedTarget as namedAlias }`;
+- `defaultExportAlias()` → the local `defaultTarget` function behind
+  `export default defaultTarget`;
+- `viaJsSpecifier()` from `./js_target.js` → `jsTarget` in `js_target.ts`;
+- `viaCollision()` from `./collision.js` → `collisionTarget` in
+  `collision.ts`, ahead of the real `collision.js` file;
+- `viaExtensionless()` → `extensionlessTarget` in `extensionless.ts`, preserving
+  the existing extensionless behavior.
+
+Two negative rules make false positives visible: `viaMissing` remains the only
+unresolved call and import pair in `refs.json`, with no `Calls` edge; and no
+`Calls` edge may target either the exported `Constant` `constAlias` or the
+JavaScript `collisionTarget` in `collision.js`.
+
+Regenerate the committed database and canonical artifacts from a clean corpus:
+
+```bash
+rm -rf /tmp/cg-fixture-typescript
+cp -r crates/codegraph-bench/fixtures/typescript /tmp/cg-fixture-typescript
+cargo build --release -p codegraph-rs
+CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
+  ./target/release/codegraph init /tmp/cg-fixture-typescript
+mkdir -p reference/golden/typescript
+cp /tmp/cg-fixture-typescript/.codegraph/codegraph.db reference/golden/typescript/colby.db
+cargo run -p codegraph-bench --bin bench -- \
+  --gen-golden reference/golden/typescript/colby.db reference/golden/typescript
+```
+
+The `generated_golden_matches_committed_typescript_fixture` and
+`typescript_db_is_self_equivalent_to_typescript_golden` tests in
+`crates/codegraph-bench/tests/equivalence.rs` enforce artifact/database
+self-equivalence. As for every fixture below the Godot caveats, do not compare
+`colby.db` bytes; compare the four JSON artifacts byte-for-byte and compare
+`schema.sql` as a normalized statement set when statement order differs.
+
 ### KNOWN_DIFFS.md format
 
 Tier-3 differences are allowlisted by grep-able lines in

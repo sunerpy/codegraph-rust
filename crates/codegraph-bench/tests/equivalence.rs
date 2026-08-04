@@ -143,6 +143,22 @@ fn kotlin_db_is_self_equivalent_to_kotlin_golden() {
 }
 
 #[test]
+fn generated_golden_matches_committed_typescript_fixture() {
+    let tempdir = TestDir::new("generated-golden-typescript");
+    write_golden(&typescript_db(), tempdir.path()).unwrap();
+
+    let expected = load_golden(&typescript_golden_dir()).unwrap();
+    let actual = load_golden(tempdir.path()).unwrap();
+
+    diff_canonical(&expected, &actual, None).unwrap();
+}
+
+#[test]
+fn typescript_db_is_self_equivalent_to_typescript_golden() {
+    assert_equivalent(&typescript_db(), &typescript_golden_dir()).unwrap();
+}
+
+#[test]
 fn generated_golden_matches_committed_metal_fixture() {
     // Guards Metal (#1121): `.metal`→cpp mapping + the `[[attribute]]` blank that
     // prevents the spurious `VertexIn extends float4` inheritance edge.
@@ -410,6 +426,14 @@ fn kotlin_db() -> PathBuf {
 
 fn kotlin_golden_dir() -> PathBuf {
     workspace_root().join("reference/golden/kotlin")
+}
+
+fn typescript_db() -> PathBuf {
+    workspace_root().join("reference/golden/typescript/colby.db")
+}
+
+fn typescript_golden_dir() -> PathBuf {
+    workspace_root().join("reference/golden/typescript")
 }
 
 fn metal_db() -> PathBuf {

@@ -1,0 +1,22 @@
+[
+  {
+    "candidates": null,
+    "col": 2,
+    "file_path": "consumer.ts",
+    "from_node_id": "function:f457dd2d5f87f1af2a87ff0989542423",
+    "language": "typescript",
+    "line": 16,
+    "reference_kind": "calls",
+    "reference_name": "viaMissing"
+  },
+  {
+    "candidates": null,
+    "col": 26,
+    "file_path": "consumer.ts",
+    "from_node_id": "file:consumer.ts",
+    "language": "typescript",
+    "line": 7,
+    "reference_kind": "imports",
+    "reference_name": "viaMissing"
+  }
+]

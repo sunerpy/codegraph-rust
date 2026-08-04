@@ -22,7 +22,11 @@ Protocol) stdio server. No AI / vector / LLM anywhere in the binary — output i
   negatives, byte-for-byte), `reference/golden/kotlin/` (corpus
   `crates/codegraph-bench/fixtures/kotlin/`; guards #1495 Kotlin callable
   signatures for explicit, inferred, generic, multiline nullable, and extension
-  returns, plus a primary-constructor negative — byte-for-byte), and `reference/golden/cpp/`
+  returns, plus a primary-constructor negative — byte-for-byte),
+  `reference/golden/typescript/` (corpus `crates/codegraph-bench/fixtures/typescript/`;
+  guards #1482 local export aliases and #1482b TypeScript `.js`-specifier
+  substitution, including TS-over-JS collision precedence — byte-for-byte), and
+  `reference/golden/cpp/`
   (corpus `crates/codegraph-bench/fixtures/cpp/`; guards #1043 C++ class/struct
   inheritance incl. templated-base stripping byte-for-byte, and retroactively
   the earlier C++ extraction work).
@@ -30,7 +34,7 @@ Protocol) stdio server. No AI / vector / LLM anywhere in the binary — output i
   import Gate 3b is deliberately unreachable for real Python nodes because the
   extractor does not mark them exported. Regen recipe: `docs/equivalence.md`
   "Godot fixture" / "Ruby fixture" / "Python fixture" / "Kotlin fixture" /
-  "C++ fixture" sections.
+  "TypeScript resolution fixture" / "C++ fixture" sections.
 - **node-id formula**: `{kind}:{sha256("{filePath}:{kind}:{name}:{line}").hex[:32]}`; file nodes are the
   literal `file:{relpath}`; lines are 1-based; paths relative with `/`.
 - **No AI / vector / LLM crates** — enforced by `scripts/guardrail.sh` (CI gate):
