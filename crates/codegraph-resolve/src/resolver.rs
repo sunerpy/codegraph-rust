@@ -20,8 +20,9 @@ use crate::types::{
 };
 use codegraph_core::types::{Edge, EdgeKind, Language, Node, NodeKind, UnresolvedRef};
 use codegraph_store::Store;
+use codegraph_store::queries::ReferenceSite;
 use rayon::prelude::*;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, OnceLock};
 
 /// Read-only deferred-pass intent returned by [`ReferenceResolver::resolve_one_pure`]
@@ -110,6 +111,15 @@ pub(crate) struct BatchedRunTelemetry {
     pub batches: usize,
     pub streaming: bool,
     pub wal_checkpoints: usize,
+}
+
+/// Read-only aggregate from the detected framework resolvers' per-file extract
+/// passes. Callers may select its refs before persistence; the normal full-file
+/// path persists `nodes` first and then `unresolved_references`.
+#[derive(Debug, Default)]
+pub struct FrameworkExtractionCollection {
+    pub nodes: Vec<Node>,
+    pub unresolved_references: Vec<UnresolvedRef>,
 }
 
 /// JS/TS built-in identifiers (`JS_BUILT_INS`, `index.ts:67-73`).
@@ -820,11 +830,27 @@ impl ReferenceResolver {
         context: &crate::framework::FrameworkExtractionContext,
         extensions: &codegraph_extract::ext_config::ExtensionOverrides,
     ) -> anyhow::Result<()> {
-        if self.framework_resolver_extensions.is_empty() {
-            return Ok(());
+        let collection =
+            self.collect_framework_extraction_with(relative_files, context, extensions);
+        if !collection.nodes.is_empty() {
+            store.upsert_nodes(&collection.nodes)?;
         }
-        let mut nodes: Vec<Node> = Vec::new();
-        let mut refs: Vec<UnresolvedRef> = Vec::new();
+        if !collection.unresolved_references.is_empty() {
+            store.insert_unresolved_refs(&collection.unresolved_references)?;
+        }
+        Ok(())
+    }
+
+    /// Collect detected framework nodes and refs without mutating the Store. This
+    /// is the selective-sync seam for unchanged dependents: base and framework
+    /// refs can be merged and filtered by complete source-site groups first.
+    pub fn collect_framework_extraction_with(
+        &self,
+        relative_files: &[String],
+        context: &crate::framework::FrameworkExtractionContext,
+        extensions: &codegraph_extract::ext_config::ExtensionOverrides,
+    ) -> FrameworkExtractionCollection {
+        let mut collection = FrameworkExtractionCollection::default();
         for relative in relative_files {
             let language = codegraph_extract::detect_language_with(relative, extensions);
             let Some(content) =
@@ -838,20 +864,16 @@ impl ReferenceResolver {
                     continue;
                 }
                 if let Some(result) = resolver.extract(relative, &content, context) {
-                    nodes.extend(result.nodes);
+                    collection.nodes.extend(result.nodes);
                     for reference in result.references {
-                        refs.push(ref_view_to_unresolved(&reference));
+                        collection
+                            .unresolved_references
+                            .push(ref_view_to_unresolved(&reference));
                     }
                 }
             }
         }
-        if !nodes.is_empty() {
-            store.upsert_nodes(&nodes)?;
-        }
-        if !refs.is_empty() {
-            store.insert_unresolved_refs(&refs)?;
-        }
-        Ok(())
+        collection
     }
 
     /// Project root the resolver was built for.
@@ -1616,51 +1638,27 @@ impl ReferenceResolver {
 
     /// Incremental form of [`Self::resolve_and_persist`] for `sync`.
     ///
-    /// Resolves only the unresolved references that could change state after a
-    /// scoped re-extraction, instead of the whole `unresolved_refs` table:
-    ///   * `scope_files` — files whose outgoing resolved (non-`contains`) edges
-    ///     were all dropped before this call: the changed/removed files (their
-    ///     nodes were deleted, cascading every edge) plus every affected file
-    ///     refreshed by the watch layer (one-hop dependents and files whose refs
-    ///     resolve to a changed name). Because those files hold NO resolved edges
-    ///     now, re-resolving their refs and persisting all resulting edges rebuilds
-    ///     exactly that source set with no duplication.
-    ///   * `changed_names` — names of symbols added or removed by the change.
-    ///     Covers the danger case where a ref in a file NOT in `scope_files` was
-    ///     previously unresolved but should now resolve to a newly-added symbol.
-    ///     Such a ref is still in `unresolved_refs` with no surviving edge, so
-    ///     persisting its edge cannot duplicate one.
-    ///
-    /// `known_names`/name caches are warmed against the CURRENT full node set, so
-    /// resolution sees the post-change symbol table. Refs whose source file is in
-    /// `scope_files` are resolved from the file query; name-set refs are added
-    /// only when their source file is NOT in `scope_files` (otherwise the file
-    /// query already covers them). Resolved rows are deleted exactly as the full
-    /// pass does, so the resulting DB is structurally equal to `index --force`.
+    /// Resolves the row-id union of three correctness lanes: all refs from truly
+    /// reindexed or whole-file-fallback files, complete groups from refreshed
+    /// source sites, and refs selected by changed target names. A physical row
+    /// reached through several lanes resolves once; semantically identical rows
+    /// with different ids retain their multiplicity. Every queried row must carry
+    /// its persisted id or the operation fails before resolution.
     pub fn resolve_incremental_and_persist(
         &mut self,
         store: &mut Store,
         scope_files: &std::collections::HashSet<String>,
+        scope_sites: &BTreeSet<ReferenceSite>,
         changed_names: &std::collections::HashSet<String>,
     ) -> anyhow::Result<ResolutionResult> {
         let files: Vec<String> = scope_files.iter().cloned().collect();
+        let sites: Vec<ReferenceSite> = scope_sites.iter().cloned().collect();
         let names: Vec<String> = changed_names.iter().cloned().collect();
 
         let by_files = store.unresolved_refs_by_files(&files)?;
+        let by_sites = store.unresolved_refs_by_sites(&sites)?;
         let by_names = store.unresolved_refs_by_names(&names)?;
-
-        // The file query already returns every row whose source file is in
-        // `scope_files`, including genuine duplicate rows (the same source
-        // resolving to the same target more than once), which must all be kept to
-        // reproduce the full pass's edge multiplicity. The name query only adds
-        // rows whose source file is OUTSIDE `scope_files`, so the two sets are
-        // disjoint and need no cross-query de-duplication.
-        let mut scoped: Vec<UnresolvedRef> = by_files;
-        for reference in by_names {
-            if !scope_files.contains(&reference.file_path) {
-                scoped.push(reference);
-            }
-        }
+        let scoped = union_persisted_refs([by_files, by_sites, by_names])?;
 
         let result = {
             let context = crate::context::StoreResolutionContext::new(store, &self.project_root);
@@ -2074,6 +2072,23 @@ fn delete_resolved_rows(store: &mut Store, resolved: &[ResolvedRef]) -> anyhow::
     let row_ids: Vec<i64> = resolved.iter().filter_map(|r| r.original.row_id).collect();
     store.delete_resolved_unresolved_refs(&row_ids)?;
     Ok(())
+}
+
+fn union_persisted_refs(
+    lanes: impl IntoIterator<Item = Vec<UnresolvedRef>>,
+) -> anyhow::Result<Vec<UnresolvedRef>> {
+    let mut by_id = BTreeMap::new();
+    for lane in lanes {
+        for reference in lane {
+            let row_id = reference.id.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "incremental resolution query returned a persisted reference without an id"
+                )
+            })?;
+            by_id.entry(row_id).or_insert(reference);
+        }
+    }
+    Ok(by_id.into_values().collect())
 }
 
 fn capitalize(s: &str) -> String {
@@ -2848,10 +2863,128 @@ mod tests {
         let mut scope = std::collections::HashSet::new();
         scope.insert("app.ts".to_string());
         let names = std::collections::HashSet::new();
+        let sites = BTreeSet::new();
         let result = resolver
-            .resolve_incremental_and_persist(&mut store, &scope, &names)
+            .resolve_incremental_and_persist(&mut store, &scope, &sites, &names)
             .expect("incremental");
         assert_eq!(result.stats.resolved, 1);
+    }
+
+    #[test]
+    fn dependent_ref_narrowing_three_lane_union_uses_only_persisted_row_ids() {
+        let mut store = Store::open(&temp_db("dependent-ref-three-lanes")).expect("open");
+        let add = mk_node("function:add", NodeKind::Function, "add", "math.ts");
+        let caller = mk_node("function:run", NodeKind::Function, "run", "app.ts");
+        store.upsert_file(&file_rec("math.ts")).expect("file");
+        store.upsert_file(&file_rec("app.ts")).expect("file");
+        store.upsert_nodes(&[add, caller.clone()]).expect("nodes");
+        let duplicate = UnresolvedRef {
+            id: None,
+            from_node_id: caller.id.clone(),
+            reference_name: "add".to_string(),
+            reference_kind: EdgeKind::Calls,
+            line: 1,
+            col: 0,
+            candidates: None,
+            file_path: "app.ts".to_string(),
+            language: Language::TypeScript,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+        store
+            .insert_unresolved_refs(&[duplicate.clone(), duplicate])
+            .expect("refs");
+        let row_ids = store
+            .all_unresolved_refs()
+            .expect("persisted refs")
+            .into_iter()
+            .map(|reference| reference.id.expect("persisted id"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(row_ids.len(), 2, "fixture requires genuine duplicate rows");
+
+        let mut files = std::collections::HashSet::new();
+        files.insert("app.ts".to_string());
+        let sites = BTreeSet::from([ReferenceSite {
+            from_node_id: caller.id,
+            line: 1,
+            col: 0,
+        }]);
+        let mut names = std::collections::HashSet::new();
+        names.insert("add".to_string());
+        let mut resolver = ReferenceResolver::new("/root");
+        let result = resolver
+            .resolve_incremental_and_persist(&mut store, &files, &sites, &names)
+            .expect("incremental");
+        assert_eq!(
+            result.stats.total, 2,
+            "three overlapping lanes must resolve each physical row once while retaining different ids"
+        );
+        assert_eq!(result.stats.resolved, 2);
+        assert_eq!(store.unresolved_refs_count().expect("remaining refs"), 0);
+    }
+
+    #[test]
+    fn dependent_ref_narrowing_three_lane_union_rejects_a_missing_row_id() {
+        let reference = UnresolvedRef {
+            id: None,
+            from_node_id: "function:run".to_string(),
+            reference_name: "add".to_string(),
+            reference_kind: EdgeKind::Calls,
+            line: 1,
+            col: 0,
+            candidates: None,
+            file_path: "app.ts".to_string(),
+            language: Language::TypeScript,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+        let error = union_persisted_refs([vec![reference]]).unwrap_err();
+        assert!(
+            error.to_string().contains("without an id"),
+            "unexpected typed error: {error}"
+        );
+    }
+
+    #[test]
+    fn dependent_ref_narrowing_godot_collector_is_read_only_and_complete() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root")
+            .join("crates/codegraph-bench/fixtures/godot");
+        let project_file = std::fs::read_to_string(root.join("project.godot")).expect("fixture");
+        let context = MinimalCtx {
+            files: HashMap::from([("project.godot".to_string(), project_file)]),
+        };
+        let mut resolver = ReferenceResolver::new(root.to_string_lossy());
+        resolver.initialize(&context);
+        assert!(resolver.has_framework_resolvers());
+
+        let store = Store::open(&temp_db("dependent-ref-godot-collector")).expect("open");
+        let collection = resolver.collect_framework_extraction_with(
+            &["stage_manager.gd".to_string()],
+            &crate::framework::FrameworkExtractionContext::without_config(root.to_string_lossy()),
+            &codegraph_extract::ext_config::ExtensionOverrides::default(),
+        );
+        let mut relevant_sites = collection
+            .unresolved_references
+            .iter()
+            .filter(|reference| matches!(reference.line, 5 | 6 | 9 | 10))
+            .map(|reference| (reference.line, reference.col))
+            .collect::<Vec<_>>();
+        relevant_sites.sort_unstable();
+        assert_eq!(
+            relevant_sites,
+            vec![(5, 0), (6, 0), (9, 0), (9, 0), (10, 0), (10, 0)],
+            "collector must return both F2 handler refs and both F1 sibling pairs"
+        );
+        assert!(collection.nodes.is_empty());
+        assert_eq!(
+            store.unresolved_refs_count().expect("unresolved count"),
+            0,
+            "read-only collection must not persist framework refs"
+        );
+        assert!(store.all_nodes().expect("nodes").is_empty());
     }
 
     #[test]

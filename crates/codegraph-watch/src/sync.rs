@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,6 +15,7 @@ use codegraph_extract::{
 use codegraph_resolve::ReferenceResolver;
 use codegraph_resolve::framework::FrameworkExtractionContext;
 use codegraph_resolve::frameworks::godot_dsl_config::GodotDslConfig;
+use codegraph_store::queries::{FileReferenceSite, ReferenceSite};
 use codegraph_store::{IndexLease, Store, StoreWriteOpen, StoreWritePurpose};
 
 use crate::policy::WatchPolicy;
@@ -386,7 +387,8 @@ fn sync_paths_with_store(
     let mut changed = false;
     let mut seen = HashSet::new();
 
-    let mut dependents = HashSet::new();
+    let mut dependent_sites = BTreeMap::new();
+    let mut dependent_fallbacks = BTreeSet::new();
     let mut reindexed = HashSet::new();
     let mut changed_names = HashSet::new();
 
@@ -414,7 +416,8 @@ fn sync_paths_with_store(
             &relative,
             scope,
             &mut outcome,
-            &mut dependents,
+            &mut dependent_sites,
+            &mut dependent_fallbacks,
             &mut changed_names,
         )? {
             changed = true;
@@ -425,23 +428,9 @@ fn sync_paths_with_store(
 
     if changed {
         let name_list: Vec<String> = changed_names.iter().cloned().collect();
-        for affected in store.source_files_of_edges_to_named_targets(&name_list)? {
-            if !reindexed.contains(&affected) {
-                dependents.insert(affected);
-            }
-        }
-        refresh_dependent_refs(
-            project_root,
-            store,
-            scope,
-            &dependents,
-            &reindexed,
-            &mut changed_names,
-        )?;
-        let mut scope_files = reindexed.clone();
-        for dependent in &dependents {
-            if !reindexed.contains(dependent) {
-                scope_files.insert(dependent.clone());
+        for affected in store.reference_sites_of_edges_to_named_targets(&name_list)? {
+            if !reindexed.contains(&affected.file_path) {
+                merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, affected);
             }
         }
         let mut resolver = ReferenceResolver::new(project_root.to_string_lossy());
@@ -463,7 +452,23 @@ fn sync_paths_with_store(
                 &scope.options.extensions,
             )?;
         }
-        resolver.resolve_incremental_and_persist(store, &scope_files, &changed_names)?;
+        let (scope_sites, fallback_files) = refresh_dependent_refs(
+            project_root,
+            store,
+            scope,
+            &resolver,
+            &dependent_sites,
+            &dependent_fallbacks,
+            &reindexed,
+        )?;
+        let mut scope_files = reindexed.clone();
+        scope_files.extend(fallback_files);
+        resolver.resolve_incremental_and_persist(
+            store,
+            &scope_files,
+            &scope_sites,
+            &changed_names,
+        )?;
         // Cross-file framework finalization on every sync (upstream index.ts:464).
         resolver.run_post_extract(store)?;
     }
@@ -488,7 +493,7 @@ fn sync_paths_with_store(
     Ok(outcome)
 }
 
-/// Rebuild the outgoing resolved references of files affected by the change
+/// Rebuild only the affected source-site groups of unchanged dependent files,
 /// WITHOUT deleting their nodes.
 ///
 /// An affected file F is either a one-hop dependent of a changed file (it had a
@@ -499,44 +504,123 @@ fn sync_paths_with_store(
 /// edges are already identical to a full index and must NOT be touched — deleting
 /// F's nodes would cascade away the edges INTO F and force the same recovery for
 /// F's own dependents (an unbounded closure on hub symbols). So F is extracted in
-/// memory only: all its outgoing resolved (non-`contains`) edges are dropped, its
-/// `unresolved_refs` rows are refreshed, and the incremental pass re-resolves them
-/// against the final graph — rebuilding exactly the edges a full `index --force`
-/// would, with no duplication, no stale confidence, and no second-hop cascade.
+/// memory only. Base and framework refs are merged, then every captured site is
+/// refreshed as one indivisible sibling group; unrelated edges and unresolved row
+/// ids stay untouched. A NULL historical edge coordinate or a captured site with
+/// no fresh ref upgrades that file to the correctness-first whole-file fallback,
+/// which still preserves nodes, `contains` edges, and incoming edges. The returned
+/// site lane plus fallback-file lane are resolved against the final graph.
 fn refresh_dependent_refs(
     project_root: &Path,
     store: &mut Store,
     scope: &ProjectScope,
-    dependents: &HashSet<String>,
+    resolver: &ReferenceResolver,
+    dependent_sites: &BTreeMap<String, BTreeSet<ReferenceSite>>,
+    fallback_files: &BTreeSet<String>,
     already_reindexed: &HashSet<String>,
-    changed_names: &mut HashSet<String>,
-) -> Result<()> {
+) -> Result<(BTreeSet<ReferenceSite>, HashSet<String>)> {
+    let dependents = dependent_sites
+        .keys()
+        .chain(fallback_files)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut refreshed_sites = BTreeSet::new();
+    let mut refreshed_files = HashSet::new();
     for relative in dependents {
-        if already_reindexed.contains(relative) {
+        if already_reindexed.contains(&relative) {
             continue;
         }
-        if !project_root.join(relative).exists() {
+        if !project_root.join(&relative).exists() {
             continue;
         }
-        let result = extract_file_with_options(project_root, relative, &scope.options)?;
-        let node_ids = result
-            .nodes
-            .iter()
-            .map(|node| node.id.as_str())
-            .collect::<HashSet<_>>();
-        let refs = result
-            .unresolved_references
+        let refs = extract_dependent_refs(project_root, &relative, scope, resolver)?;
+        let sites = dependent_sites.get(&relative);
+        let needs_fallback = fallback_files.contains(&relative)
+            || sites.is_some_and(|sites| {
+                sites.iter().any(|site| {
+                    !refs
+                        .iter()
+                        .any(|reference| reference_matches_site(reference, site))
+                })
+            });
+        if needs_fallback {
+            store.delete_resolved_edges_from_file(&relative)?;
+            delete_unresolved_refs_by_file(store, &relative)?;
+            store.insert_unresolved_refs(&refs)?;
+            refreshed_files.insert(relative);
+            continue;
+        }
+        let Some(sites) = sites else {
+            continue;
+        };
+        let selected = refs
             .into_iter()
-            .filter(|reference| node_ids.contains(reference.from_node_id.as_str()))
+            .filter(|reference| {
+                sites
+                    .iter()
+                    .any(|site| reference_matches_site(reference, site))
+            })
             .collect::<Vec<_>>();
-        for node in &result.nodes {
-            changed_names.insert(node.name.clone());
-        }
-        store.delete_resolved_edges_from_file(relative)?;
-        delete_unresolved_refs_by_file(store, relative)?;
-        store.insert_unresolved_refs(&refs)?;
+        let site_list = sites.iter().cloned().collect::<Vec<_>>();
+        store.delete_resolved_edges_at_sites(&site_list)?;
+        store.delete_unresolved_refs_at_sites(&site_list)?;
+        store.insert_unresolved_refs(&selected)?;
+        refreshed_sites.extend(sites.iter().cloned());
     }
-    Ok(())
+    Ok((refreshed_sites, refreshed_files))
+}
+
+fn extract_dependent_refs(
+    project_root: &Path,
+    relative: &str,
+    scope: &ProjectScope,
+    resolver: &ReferenceResolver,
+) -> Result<Vec<codegraph_core::types::UnresolvedRef>> {
+    let result = extract_file_with_options(project_root, relative, &scope.options)?;
+    let framework = resolver.collect_framework_extraction_with(
+        &[relative.to_string()],
+        &scope.framework,
+        &scope.options.extensions,
+    );
+    let node_ids = result
+        .nodes
+        .iter()
+        .chain(&framework.nodes)
+        .map(|node| node.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut refs = result.unresolved_references;
+    refs.extend(framework.unresolved_references);
+    refs.retain(|reference| node_ids.contains(reference.from_node_id.as_str()));
+    Ok(refs)
+}
+
+fn reference_matches_site(
+    reference: &codegraph_core::types::UnresolvedRef,
+    site: &ReferenceSite,
+) -> bool {
+    reference.from_node_id == site.from_node_id
+        && reference.line == site.line
+        && reference.col == site.col
+}
+
+fn merge_dependent_site(
+    dependent_sites: &mut BTreeMap<String, BTreeSet<ReferenceSite>>,
+    fallback_files: &mut BTreeSet<String>,
+    affected: FileReferenceSite,
+) {
+    match affected.site {
+        Some(site) if !fallback_files.contains(&affected.file_path) => {
+            dependent_sites
+                .entry(affected.file_path)
+                .or_default()
+                .insert(site);
+        }
+        Some(_) => {}
+        None => {
+            dependent_sites.remove(&affected.file_path);
+            fallback_files.insert(affected.file_path);
+        }
+    }
 }
 
 /// Grind the whole `unresolved_refs` table with the batched resolver to heal an
@@ -582,7 +666,8 @@ fn sync_one(
     relative: &str,
     scope: &ProjectScope,
     outcome: &mut SyncOutcome,
-    dependents: &mut HashSet<String>,
+    dependent_sites: &mut BTreeMap<String, BTreeSet<ReferenceSite>>,
+    dependent_fallbacks: &mut BTreeSet<String>,
     changed_names: &mut HashSet<String>,
 ) -> Result<bool> {
     let full = project_root.join(relative);
@@ -590,8 +675,8 @@ fn sync_one(
     let metadata = match fs::metadata(&full) {
         Ok(metadata) if metadata.is_file() => metadata,
         _ => {
-            for dependent in store.dependent_file_paths(relative)? {
-                dependents.insert(dependent);
+            for dependent in store.reference_sites_dependent_on_file(relative)? {
+                merge_dependent_site(dependent_sites, dependent_fallbacks, dependent);
             }
             for name in node_names_in_file(store, relative)? {
                 changed_names.insert(name);
@@ -629,8 +714,8 @@ fn sync_one(
         return Ok(false);
     }
 
-    for dependent in store.dependent_file_paths(relative)? {
-        dependents.insert(dependent);
+    for dependent in store.reference_sites_dependent_on_file(relative)? {
+        merge_dependent_site(dependent_sites, dependent_fallbacks, dependent);
     }
     reextract_into_store(project_root, store, relative, scope, changed_names)?;
     outcome.files_reindexed += 1;
@@ -736,6 +821,7 @@ pub(crate) fn now_millis() -> i64 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -944,6 +1030,191 @@ pub(crate) mod tests {
             store.file_by_path("src/app.ts").unwrap().is_none(),
             "deleted file must be dropped from the store"
         );
+    }
+
+    type RelevantEdgeRows = BTreeMap<String, (i64, String)>;
+
+    fn dependent_ref_narrowing_fixture(name: &str) -> (TestDir, PathBuf, String) {
+        let dir = TestDir::new(name);
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+
+        let hub_source = (0..20)
+            .map(|index| format!("export function hub_{index:02}(): void {{}}\n"))
+            .collect::<String>();
+        let mut consumer_source = String::from("export function consume(): void {\n");
+        for index in 0..19 {
+            consumer_source.push_str(&format!("  hub_{index:02}();\n"));
+        }
+        for index in 0..1_384 {
+            consumer_source.push_str(&format!("  missing_{index:04}();\n"));
+        }
+        consumer_source.push_str("}\n");
+
+        fs::write(dir.path().join("src/hub.ts"), &hub_source).unwrap();
+        fs::write(dir.path().join("src/consumer.ts"), consumer_source).unwrap();
+        let db = default_db_path(dir.path()).unwrap();
+        sync_changed_paths(dir.path(), &db, ["src/hub.ts", "src/consumer.ts"]).unwrap();
+
+        (dir, db, hub_source)
+    }
+
+    fn relevant_edge_rows(db: &Path) -> RelevantEdgeRows {
+        let store = Store::open(db).unwrap();
+        let mut stmt = store
+            .connection()
+            .prepare(
+                r#"SELECT tgt.name, e.id, e.target
+                FROM edges e
+                JOIN nodes src ON src.id = e.source
+                JOIN nodes tgt ON tgt.id = e.target
+                WHERE src.file_path = 'src/consumer.ts'
+                  AND tgt.file_path = 'src/hub.ts'
+                  AND e.kind = 'calls'
+                ORDER BY tgt.name"#,
+            )
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                (row.get::<_, i64>(1)?, row.get::<_, String>(2)?),
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    fn irrelevant_unresolved_rows(db: &Path) -> Vec<(String, i64)> {
+        let store = Store::open(db).unwrap();
+        let mut stmt = store
+            .connection()
+            .prepare(
+                r#"SELECT reference_name, id
+                FROM unresolved_refs
+                WHERE file_path = 'src/consumer.ts'
+                  AND reference_name LIKE 'missing_%'
+                ORDER BY reference_name, id"#,
+            )
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    fn assert_relevant_edges_were_rebuilt(before: &RelevantEdgeRows, after: &RelevantEdgeRows) {
+        assert_eq!(before.len(), 19, "fixture must resolve 19 hub calls");
+        assert_eq!(after.len(), 19, "sync must rebuild all 19 hub calls");
+        assert_eq!(
+            before.keys().collect::<Vec<_>>(),
+            after.keys().collect::<Vec<_>>(),
+            "sync must preserve the set of relevant call names"
+        );
+        for (name, (before_id, _)) in before {
+            let (after_id, _) = after.get(name).unwrap();
+            assert_ne!(
+                after_id, before_id,
+                "relevant edge {name} must be rebuilt after its target file changes"
+            );
+        }
+    }
+
+    fn assert_irrelevant_rows_are_identical(before: &[(String, i64)], after: &[(String, i64)]) {
+        assert_eq!(before.len(), 1_384, "fixture must park 1384 missing calls");
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "sync must retain every unrelated unresolved ref"
+        );
+        for ((before_name, before_id), (after_name, after_id)) in before.iter().zip(after) {
+            assert_eq!(
+                after_name, before_name,
+                "unrelated unresolved refs must retain their deterministic order"
+            );
+            assert_eq!(
+                after_id, before_id,
+                "unrelated unresolved row {before_name} must retain row identity"
+            );
+        }
+    }
+
+    #[test]
+    fn dependent_ref_narrowing_tail_edit_rebuilds_only_relevant_sites() {
+        let (dir, db, hub_source) = dependent_ref_narrowing_fixture("watch-ref-narrow-tail");
+        let edges_before = relevant_edge_rows(&db);
+        let irrelevant_before = irrelevant_unresolved_rows(&db);
+
+        fs::write(
+            dir.path().join("src/hub.ts"),
+            format!("{hub_source}// tail-only edit\n"),
+        )
+        .unwrap();
+        sync_changed_paths(dir.path(), &db, ["src/hub.ts"]).unwrap();
+
+        let edges_after = relevant_edge_rows(&db);
+        let irrelevant_after = irrelevant_unresolved_rows(&db);
+        assert_relevant_edges_were_rebuilt(&edges_before, &edges_after);
+        for (name, (_, target_before)) in &edges_before {
+            assert_eq!(
+                &edges_after.get(name).unwrap().1,
+                target_before,
+                "tail edit must not change target node identity for {name}"
+            );
+        }
+        assert_irrelevant_rows_are_identical(&irrelevant_before, &irrelevant_after);
+    }
+
+    #[test]
+    fn dependent_ref_narrowing_head_edit_retargets_shifted_nodes_only() {
+        let (dir, db, hub_source) = dependent_ref_narrowing_fixture("watch-ref-narrow-head");
+        let edges_before = relevant_edge_rows(&db);
+        let irrelevant_before = irrelevant_unresolved_rows(&db);
+
+        fs::write(
+            dir.path().join("src/hub.ts"),
+            format!("// head edit shifts every hub node id\n{hub_source}"),
+        )
+        .unwrap();
+        sync_changed_paths(dir.path(), &db, ["src/hub.ts"]).unwrap();
+
+        let edges_after = relevant_edge_rows(&db);
+        let irrelevant_after = irrelevant_unresolved_rows(&db);
+        assert_relevant_edges_were_rebuilt(&edges_before, &edges_after);
+
+        let store = Store::open(&db).unwrap();
+        let new_targets = store
+            .nodes_by_file_path("src/hub.ts")
+            .unwrap()
+            .into_iter()
+            .map(|node| (node.name, node.id))
+            .collect::<BTreeMap<_, _>>();
+        let old_targets = edges_before
+            .values()
+            .map(|(_, target)| target.clone())
+            .collect::<BTreeSet<_>>();
+        for (name, (_, target_after)) in &edges_after {
+            assert_eq!(
+                new_targets.get(name),
+                Some(target_after),
+                "head edit must retarget {name} to the shifted node id"
+            );
+            assert!(
+                !old_targets.contains(target_after),
+                "head edit must not leave {name} pointing at an old target id"
+            );
+        }
+        for old_target in old_targets {
+            let count = store
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM nodes WHERE id = ?1",
+                    [old_target],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "old shifted target nodes must be absent");
+        }
+        assert_irrelevant_rows_are_identical(&irrelevant_before, &irrelevant_after);
     }
 
     #[test]

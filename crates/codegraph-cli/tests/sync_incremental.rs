@@ -1,8 +1,11 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use codegraph_bench::oracle::{canonicalize_db, diff_canonical};
+use codegraph_core::types::EdgeKind;
+use codegraph_store::Store;
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -14,6 +17,10 @@ fn workspace_root() -> PathBuf {
 
 fn mini_fixture() -> PathBuf {
     workspace_root().join("crates/codegraph-bench/fixtures/mini")
+}
+
+fn godot_fixture() -> PathBuf {
+    workspace_root().join("crates/codegraph-bench/fixtures/godot")
 }
 
 fn copy_tree(src: &Path, dst: &Path) {
@@ -247,4 +254,121 @@ fn sync_after_file_removal_equals_index_force() {
 
     diff_canonical(&rebuilt, &synced, None)
         .expect("sync after file removal must equal a full index --force from scratch");
+}
+
+fn prepend_game_flow_comment(project: &Path) {
+    let path = project.join("game_flow.gd");
+    let original = fs::read_to_string(&path).unwrap();
+    fs::write(
+        path,
+        format!("# head edit shifts GameFlow target ids\n{original}"),
+    )
+    .unwrap();
+}
+
+fn return_to_map_id(project: &Path) -> String {
+    Store::open(&db_path(project))
+        .unwrap()
+        .nodes_by_file_path("game_flow.gd")
+        .unwrap()
+        .into_iter()
+        .find(|node| node.name == "return_to_map")
+        .expect("game_flow.gd must contain return_to_map")
+        .id
+}
+
+fn stage_manager_framework_state(project: &Path) -> (usize, usize, Vec<(i64, i64)>) {
+    let store = Store::open(&db_path(project)).unwrap();
+    let source_ids = store
+        .nodes_by_file_path("stage_manager.gd")
+        .unwrap()
+        .into_iter()
+        .map(|node| node.id)
+        .collect::<BTreeSet<_>>();
+    let mut sites = store
+        .all_edges()
+        .unwrap()
+        .into_iter()
+        .filter(|edge| source_ids.contains(&edge.source) && edge.kind != EdgeKind::Contains)
+        .map(|edge| {
+            (
+                edge.line.expect("framework edge line"),
+                edge.col.expect("framework edge column"),
+            )
+        })
+        .collect::<Vec<_>>();
+    sites.sort_unstable();
+    let unresolved = store
+        .unresolved_refs_by_file_path("stage_manager.gd")
+        .unwrap();
+    (sites.len(), unresolved.len(), sites)
+}
+
+#[test]
+fn dependent_ref_narrowing_godot_sync_equals_force() {
+    let fixture = godot_fixture();
+
+    let incremental = TestDir::new("godot-dependent-ref-narrowing");
+    let project = incremental.path().join("godot");
+    copy_tree(&fixture, &project);
+    let (out, err, ok) = cli(&["init", project.to_str().unwrap()]);
+    assert!(ok, "init failed: stdout={out} stderr={err}");
+    let old_return_to_map = return_to_map_id(&project);
+    prepend_game_flow_comment(&project);
+    let (out, err, ok) = cli(&["sync", project.to_str().unwrap()]);
+    assert!(ok, "sync failed: stdout={out} stderr={err}");
+
+    let scratch = TestDir::new("godot-dependent-ref-narrowing-scratch");
+    let scratch_project = scratch.path().join("godot");
+    copy_tree(&fixture, &scratch_project);
+    prepend_game_flow_comment(&scratch_project);
+    let (out, err, ok) = cli(&["init", scratch_project.to_str().unwrap()]);
+    assert!(ok, "scratch init failed: stdout={out} stderr={err}");
+    let (out, err, ok) = cli(&["index", "--force", scratch_project.to_str().unwrap()]);
+    assert!(ok, "index --force failed: stdout={out} stderr={err}");
+
+    let synced_state = stage_manager_framework_state(&project);
+    let rebuilt_state = stage_manager_framework_state(&scratch_project);
+    assert_eq!(
+        (rebuilt_state.0, rebuilt_state.1),
+        (6, 4),
+        "fresh Godot fixture must expose the expected 6 resolved / 4 unresolved refs"
+    );
+    assert_eq!(
+        (synced_state.0, synced_state.1),
+        (6, 4),
+        "incremental Godot state must retain 6 resolved / 4 unresolved refs; fresh force state was ({}, {})",
+        rebuilt_state.0,
+        rebuilt_state.1
+    );
+    assert_eq!(
+        synced_state.2,
+        vec![(5, 0), (6, 0), (9, 0), (9, 0), (10, 0), (10, 0)],
+        "stage_manager.gd must retain both F2 handlers and both F1 edge pairs"
+    );
+
+    let new_return_to_map = return_to_map_id(&project);
+    assert_ne!(
+        new_return_to_map, old_return_to_map,
+        "head insertion must shift the return_to_map node id"
+    );
+    let synced_store = Store::open(&db_path(&project)).unwrap();
+    assert!(
+        synced_store
+            .node_by_id(&old_return_to_map)
+            .unwrap()
+            .is_none(),
+        "the old shifted return_to_map node id must be absent"
+    );
+    assert!(
+        synced_store.all_edges().unwrap().into_iter().any(|edge| {
+            edge.kind == EdgeKind::Calls && edge.line == Some(9) && edge.target == new_return_to_map
+        }),
+        "GameFlow.return_to_map() must target the shifted function node"
+    );
+
+    let synced = canonicalize_db(&db_path(&project)).unwrap();
+    let rebuilt = canonicalize_db(&db_path(&scratch_project)).unwrap();
+    diff_canonical(&rebuilt, &synced, None)
+        .expect("Godot incremental sync must equal a full index --force from scratch");
 }
