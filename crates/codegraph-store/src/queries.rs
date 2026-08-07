@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use codegraph_core::types::{
     Edge, EdgeKind, FileRecord, Language, Node, NodeKind, ReferenceSubkind, UnresolvedRef,
@@ -86,6 +86,25 @@ pub struct StoreCounts {
 pub struct SearchResult {
     pub node: Node,
     pub score: f64,
+}
+
+/// One complete source-site group for reference refresh. A site can own several
+/// sibling refs and edges, so these coordinates are a correlation key for the
+/// whole group rather than an identity for one reference.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ReferenceSite {
+    pub from_node_id: String,
+    pub line: i64,
+    pub col: i64,
+}
+
+/// A source file and either one precise reference site or a whole-file fallback.
+/// `site = None` means at least one historical non-`contains` edge had a NULL
+/// line or column, so a caller cannot safely select a narrower group.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FileReferenceSite {
+    pub file_path: String,
+    pub site: Option<ReferenceSite>,
 }
 
 impl Store {
@@ -881,6 +900,57 @@ impl Store {
         Ok(out)
     }
 
+    /// Read every persisted unresolved row in the selected source-site groups.
+    /// Sites are sorted and deduplicated first; rows within each group are ordered
+    /// by physical row id so sibling multiplicity is preserved deterministically.
+    pub fn unresolved_refs_by_sites(
+        &self,
+        sites: &[ReferenceSite],
+    ) -> rusqlite::Result<Vec<UnresolvedRef>> {
+        let unique = sites.iter().cloned().collect::<BTreeSet<_>>();
+        let mut out = Vec::new();
+        let mut stmt = self.conn.prepare_cached(
+            r#"SELECT * FROM unresolved_refs
+            WHERE from_node_id = ?1 AND line = ?2 AND col = ?3
+            ORDER BY id"#,
+        )?;
+        for site in unique {
+            let rows = stmt.query_map(
+                params![site.from_node_id, site.line, site.col],
+                row_to_unresolved_ref,
+            )?;
+            for reference in rows {
+                out.push(reference?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Delete every persisted unresolved sibling in the selected source-site
+    /// groups. No target-name or edge-kind predicate may split a site group.
+    pub fn delete_unresolved_refs_at_sites(
+        &mut self,
+        sites: &[ReferenceSite],
+    ) -> rusqlite::Result<usize> {
+        let unique = sites.iter().cloned().collect::<BTreeSet<_>>();
+        if unique.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction()?;
+        let mut removed = 0;
+        {
+            let mut stmt = tx.prepare_cached(
+                r#"DELETE FROM unresolved_refs
+                WHERE from_node_id = ?1 AND line = ?2 AND col = ?3"#,
+            )?;
+            for site in unique {
+                removed += stmt.execute(params![site.from_node_id, site.line, site.col])?;
+            }
+        }
+        tx.commit()?;
+        Ok(removed)
+    }
+
     /// Fetch unresolved references whose `reference_name` is in `names`, chunked
     /// under SQLite's parameter limit (`reference_name IN (...)`, backed by
     /// `idx_unresolved_name`). Used by the incremental resolve path to cover the
@@ -1157,6 +1227,31 @@ impl Store {
         rows.collect()
     }
 
+    /// Source-site groups of every cross-file non-`contains` edge INTO a node in
+    /// `file_path`, captured before that target file's node cascade. A NULL edge
+    /// coordinate is returned as a whole-file fallback instead of being invented.
+    pub fn reference_sites_dependent_on_file(
+        &self,
+        file_path: &str,
+    ) -> rusqlite::Result<Vec<FileReferenceSite>> {
+        let mut stmt = self.conn.prepare(
+            r#"SELECT src.file_path, e.source, e.line, e.col
+            FROM edges e
+            JOIN nodes tgt ON tgt.id = e.target
+            JOIN nodes src ON src.id = e.source
+            WHERE tgt.file_path = ?1
+              AND e.kind != 'contains'
+              AND src.file_path != ?1
+            ORDER BY src.file_path, e.source, e.line, e.col"#,
+        )?;
+        let rows = stmt.query_map([file_path], row_to_file_reference_site)?;
+        let mut out = BTreeSet::new();
+        for row in rows {
+            out.insert(row?);
+        }
+        Ok(out.into_iter().collect())
+    }
+
     /// Ports `getDependencyFilePaths` from
     /// `upstream db/queries.ts:1410-1420`: the OUTGOING twin of
     /// `dependent_file_paths` — every file containing a symbol that a symbol of
@@ -1290,13 +1385,10 @@ impl Store {
     /// Delete every resolution-produced edge whose SOURCE node lives in
     /// `file_path`. Every non-`contains` edge is produced by reference resolution
     /// (it carries `metadata.resolvedBy`); `contains` edges come only from
-    /// extraction. Used by the incremental sync path to drop a refreshed file's
-    /// outgoing resolved edges (intra-file AND cross-file) before its refreshed
-    /// references are re-resolved, so rebuilding them cannot duplicate a surviving
-    /// row (the `edges` table has no unique constraint) and stale resolutions
-    /// (e.g. a confidence that changed because a same-named node elsewhere was
-    /// added or removed) are recomputed. `contains` edges are left intact because
-    /// the file's nodes are not re-extracted.
+    /// extraction. Used only by incremental sync's correctness-first whole-file
+    /// fallback; normal unchanged dependents use
+    /// [`Self::delete_resolved_edges_at_sites`]. `contains` edges are left intact
+    /// because the file's nodes are not re-extracted.
     pub fn delete_resolved_edges_from_file(&self, file_path: &str) -> rusqlite::Result<usize> {
         self.conn.execute(
             r#"DELETE FROM edges
@@ -1311,14 +1403,43 @@ impl Store {
         )
     }
 
+    /// Delete every non-`contains` edge in the selected source-site groups while
+    /// preserving extraction edges, other sites, and edges from other sources.
+    /// The predicate deliberately excludes target, kind, and metadata because
+    /// resolution can promote edge kinds and every sibling at a site is rebuilt.
+    pub fn delete_resolved_edges_at_sites(
+        &mut self,
+        sites: &[ReferenceSite],
+    ) -> rusqlite::Result<usize> {
+        let unique = sites.iter().cloned().collect::<BTreeSet<_>>();
+        if unique.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction()?;
+        let mut removed = 0;
+        {
+            let mut stmt = tx.prepare_cached(
+                r#"DELETE FROM edges
+                WHERE source = ?1 AND line = ?2 AND col = ?3
+                  AND kind != 'contains'"#,
+            )?;
+            for site in unique {
+                removed += stmt.execute(params![site.from_node_id, site.line, site.col])?;
+            }
+        }
+        tx.commit()?;
+        Ok(removed)
+    }
+
     /// Distinct source files of every resolution-produced edge whose TARGET node
     /// is named one of `names`. When a synced file changes the set of nodes
     /// sharing a name, the exact-name resolution of refs that already resolved to
     /// that name (in any file, including the referencing file itself) can change
     /// confidence or pick a different target, but those edges survive untouched.
-    /// This finds the files holding such refs so their outgoing resolved edges can
-    /// be recomputed. `contains` edges are excluded; results are in SQLite scan
-    /// order per chunk.
+    /// This path-level graph query remains available to existing callers; selective
+    /// sync uses [`Self::reference_sites_of_edges_to_named_targets`] so unrelated
+    /// refs in the same file retain row identity. `contains` edges are excluded;
+    /// results are in SQLite scan order per chunk.
     pub fn source_files_of_edges_to_named_targets(
         &self,
         names: &[String],
@@ -1351,6 +1472,65 @@ impl Store {
         }
         Ok(out)
     }
+
+    /// Precise source-site counterpart of
+    /// [`Self::source_files_of_edges_to_named_targets`]. Returns surviving
+    /// cross-file non-`contains` edges whose target name is selected. Multiple
+    /// matching sibling edges collapse to one site group; NULL coordinates expose
+    /// a whole-file fallback rather than silently skipping that source file.
+    pub fn reference_sites_of_edges_to_named_targets(
+        &self,
+        names: &[String],
+    ) -> rusqlite::Result<Vec<FileReferenceSite>> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut unique_names = names.to_vec();
+        unique_names.sort_unstable();
+        unique_names.dedup();
+        let mut out = BTreeSet::new();
+        for chunk in unique_names.chunks(SQLITE_PARAM_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"SELECT src.file_path, e.source, e.line, e.col
+                FROM edges e
+                JOIN nodes tgt ON tgt.id = e.target
+                JOIN nodes src ON src.id = e.source
+                WHERE tgt.name IN ({placeholders})
+                  AND e.kind != 'contains'
+                  AND src.file_path != tgt.file_path
+                ORDER BY src.file_path, e.source, e.line, e.col"#
+            );
+            let params = chunk
+                .iter()
+                .map(|name| name as &dyn ToSql)
+                .collect::<Vec<_>>();
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params.as_slice(), row_to_file_reference_site)?;
+            for row in rows {
+                out.insert(row?);
+            }
+        }
+        Ok(out.into_iter().collect())
+    }
+}
+
+fn row_to_file_reference_site(row: &Row<'_>) -> rusqlite::Result<FileReferenceSite> {
+    let file_path = row.get(0)?;
+    let from_node_id = row.get(1)?;
+    let line = row.get::<_, Option<i64>>(2)?;
+    let col = row.get::<_, Option<i64>>(3)?;
+    let site = match (line, col) {
+        (Some(line), Some(col)) => Some(ReferenceSite {
+            from_node_id,
+            line,
+            col,
+        }),
+        _ => None,
+    };
+    Ok(FileReferenceSite { file_path, site })
 }
 
 fn query_nodes<P>(conn: &Connection, sql: &str, params: P) -> rusqlite::Result<Vec<Node>>
@@ -2918,6 +3098,201 @@ mod tests {
         assert_eq!(removed, 1);
         assert_eq!(store.all_edges().unwrap().len(), 1);
         assert_eq!(store.all_edges().unwrap()[0].kind, EdgeKind::Contains);
+    }
+
+    #[test]
+    fn dependent_ref_narrowing_site_groups_are_read_and_deleted_atomically() {
+        let mut store = store("dependent-ref-narrowing-sites");
+        store
+            .upsert_nodes(&[
+                node("function:caller", "caller", "a.rs"),
+                node("function:other", "other", "other.rs"),
+                node("function:fallback", "fallback", "fallback.rs"),
+                node("function:self", "self_call", "b.rs"),
+                node("function:callee", "callee", "b.rs"),
+                node("function:sibling", "sibling", "b.rs"),
+            ])
+            .unwrap();
+
+        let at =
+            |source: &str, target: &str, kind: EdgeKind, line: Option<i64>, col: Option<i64>| {
+                let mut edge = edge(source, target, kind);
+                edge.line = line;
+                edge.col = col;
+                edge
+            };
+        store
+            .insert_edges(&[
+                at(
+                    "function:caller",
+                    "function:callee",
+                    EdgeKind::Calls,
+                    Some(10),
+                    Some(2),
+                ),
+                at(
+                    "function:caller",
+                    "function:sibling",
+                    EdgeKind::References,
+                    Some(10),
+                    Some(2),
+                ),
+                at(
+                    "function:caller",
+                    "function:callee",
+                    EdgeKind::Calls,
+                    Some(11),
+                    Some(2),
+                ),
+                at(
+                    "function:other",
+                    "function:callee",
+                    EdgeKind::Calls,
+                    Some(10),
+                    Some(2),
+                ),
+                at(
+                    "function:caller",
+                    "function:callee",
+                    EdgeKind::Contains,
+                    Some(10),
+                    Some(2),
+                ),
+                at(
+                    "function:fallback",
+                    "function:callee",
+                    EdgeKind::Calls,
+                    None,
+                    None,
+                ),
+                at(
+                    "function:self",
+                    "function:callee",
+                    EdgeKind::Calls,
+                    Some(10),
+                    Some(2),
+                ),
+            ])
+            .unwrap();
+
+        let caller_site = ReferenceSite {
+            from_node_id: "function:caller".to_string(),
+            line: 10,
+            col: 2,
+        };
+        let incoming = store.reference_sites_dependent_on_file("b.rs").unwrap();
+        assert!(incoming.contains(&FileReferenceSite {
+            file_path: "a.rs".to_string(),
+            site: Some(caller_site.clone()),
+        }));
+        assert!(incoming.contains(&FileReferenceSite {
+            file_path: "fallback.rs".to_string(),
+            site: None,
+        }));
+        assert!(
+            incoming.iter().all(|entry| entry.file_path != "b.rs"),
+            "same-file edges are not dependent refresh sites"
+        );
+        assert_eq!(
+            incoming
+                .iter()
+                .filter(
+                    |entry| entry.file_path == "a.rs" && entry.site.as_ref() == Some(&caller_site)
+                )
+                .count(),
+            1,
+            "two sibling edges at one source site must deduplicate to one group"
+        );
+
+        let named = store
+            .reference_sites_of_edges_to_named_targets(&[
+                "callee".to_string(),
+                "sibling".to_string(),
+                "callee".to_string(),
+            ])
+            .unwrap();
+        assert!(named.contains(&FileReferenceSite {
+            file_path: "a.rs".to_string(),
+            site: Some(caller_site.clone()),
+        }));
+        assert!(named.contains(&FileReferenceSite {
+            file_path: "fallback.rs".to_string(),
+            site: None,
+        }));
+
+        let unresolved = |name: &str, line: i64| UnresolvedRef {
+            id: None,
+            from_node_id: "function:caller".to_string(),
+            reference_name: name.to_string(),
+            reference_kind: EdgeKind::Calls,
+            line,
+            col: 2,
+            candidates: None,
+            file_path: "a.rs".to_string(),
+            language: Language::Rust,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+        store
+            .insert_unresolved_refs(&[
+                unresolved("resolved-sibling", 10),
+                unresolved("no-edge-sibling", 10),
+                unresolved("unrelated", 12),
+            ])
+            .unwrap();
+        let unrelated_before = store
+            .unresolved_refs_by_names(&["unrelated".to_string()])
+            .unwrap()[0]
+            .id;
+        let selected = store
+            .unresolved_refs_by_sites(&[caller_site.clone(), caller_site.clone()])
+            .unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|reference| reference.reference_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["resolved-sibling", "no-edge-sibling"],
+            "resolved and no-edge sibling refs at one site must be selected together"
+        );
+
+        assert_eq!(
+            store
+                .delete_resolved_edges_at_sites(&[caller_site.clone(), caller_site.clone()])
+                .unwrap(),
+            2,
+            "both non-contains sibling edges at the site must be deleted"
+        );
+        let remaining_edges = store.all_edges().unwrap();
+        assert!(remaining_edges.iter().any(|edge| {
+            edge.source == "function:caller"
+                && edge.line == Some(10)
+                && edge.kind == EdgeKind::Contains
+        }));
+        assert!(remaining_edges.iter().any(|edge| {
+            edge.source == "function:caller"
+                && edge.line == Some(11)
+                && edge.kind == EdgeKind::Calls
+        }));
+        assert!(remaining_edges.iter().any(|edge| {
+            edge.source == "function:other" && edge.line == Some(10) && edge.kind == EdgeKind::Calls
+        }));
+
+        assert_eq!(
+            store
+                .delete_unresolved_refs_at_sites(&[caller_site.clone(), caller_site])
+                .unwrap(),
+            2,
+            "both persisted sibling refs at the site must be deleted"
+        );
+        let unrelated_after = store
+            .unresolved_refs_by_names(&["unrelated".to_string()])
+            .unwrap();
+        assert_eq!(unrelated_after.len(), 1);
+        assert_eq!(
+            unrelated_after[0].id, unrelated_before,
+            "an unrelated unresolved row must retain physical identity"
+        );
     }
 
     #[test]
