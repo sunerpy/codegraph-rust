@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.42.10](https://github.com/sunerpy/codegraph-rust/compare/v0.42.9...v0.42.10) (2026-08-07)
+
+
+### Bug Fixes
+
+* **sync:** refresh only the reference sites a change can reach ([#201](https://github.com/sunerpy/codegraph-rust/issues/201)) ([5e34385](https://github.com/sunerpy/codegraph-rust/commit/5e34385e3cc21a47b8c6bc6360b889d82c42b025))
+
 ## [0.42.9](https://github.com/sunerpy/codegraph-rust/compare/v0.42.8...v0.42.9) (2026-08-04)
 
 
