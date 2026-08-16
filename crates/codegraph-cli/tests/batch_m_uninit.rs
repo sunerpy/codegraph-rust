@@ -7,8 +7,11 @@
 //! matrix for every private mutation boundary lives in `codegraph-store`.
 
 use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use codegraph_core::IndexPaths;
@@ -84,6 +87,13 @@ fn normalize(stream: &str) -> String {
     stream
         .lines()
         .filter(|line| !line.contains("logger initialized"))
+        .map(|line| {
+            let is_summary = line.contains(" nodes, ") && line.contains(" edges in ");
+            match line.rfind(" in ") {
+                Some(at) if is_summary => line[..at].to_string(),
+                _ => line.to_string(),
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -227,6 +237,104 @@ fn assert_namespace_unchanged(
 
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(10)
+}
+
+fn lock_not_found_error(paths: &IndexPaths) -> String {
+    format!(
+        "existing index namespace has no permanent lock file at {}; a failed background daemon start can leave this stale shape. Run `codegraph status` from the project root to classify it; only `State: missing` is safe to recover with `codegraph init`.",
+        paths.permanent_lock().display()
+    )
+}
+
+fn lockless_missing_detail(project: &Path, paths: &IndexPaths) -> String {
+    format!(
+        "CodeGraph index directory exists at {}, but its permanent lock is missing at {}; a failed background daemon start can leave this stale namespace. Run `codegraph init \"{}\"` to create the lock and rebuild the index.",
+        paths.current_root().display(),
+        paths.permanent_lock().display(),
+        project.display()
+    )
+}
+
+struct LeaseCheckpointBarrier {
+    address: SocketAddr,
+    arrived: Receiver<(u8, TcpStream)>,
+}
+
+impl LeaseCheckpointBarrier {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind lease checkpoint barrier");
+        let address = listener.local_addr().expect("lease checkpoint address");
+        let (tx, arrived) = mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut marker = [0_u8; 1];
+                if stream.read_exact(&mut marker).is_err() || marker[0] == b'C' {
+                    return;
+                }
+                if tx.send((marker[0], stream)).is_err() {
+                    return;
+                }
+            }
+        });
+        Self { address, arrived }
+    }
+
+    fn configure(&self, command: &mut Command) {
+        command
+            .env(
+                "CODEGRAPH_TEST_LEASE_BARRIER_ADDR",
+                self.address.to_string(),
+            )
+            .env("CODEGRAPH_TEST_LEASE_BARRIER_CHECKPOINT", "handle-opened");
+    }
+
+    fn wait_for_handle_opened(&self) -> TcpStream {
+        match self.arrived.recv_timeout(Duration::from_secs(10)) {
+            Ok((marker, stream)) => {
+                assert_eq!(
+                    marker, b'H',
+                    "existing-root creation must stop before locking"
+                );
+                stream
+            }
+            Err(error) => {
+                if let Ok(mut cancel) = TcpStream::connect(self.address) {
+                    let _ = cancel.write_all(b"C");
+                }
+                panic!("handle-opened barrier was not reached before its finite deadline: {error}");
+            }
+        }
+    }
+}
+
+impl Drop for LeaseCheckpointBarrier {
+    fn drop(&mut self) {
+        if let Ok(mut cancel) = TcpStream::connect(self.address) {
+            let _ = cancel.write_all(b"C");
+        }
+    }
+}
+
+struct ChildGuard(Option<Child>);
+
+impl ChildGuard {
+    fn finish(mut self) -> Output {
+        self.0
+            .take()
+            .expect("child still owned")
+            .wait_with_output()
+            .expect("collect child output")
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 fn assert_unrelated_bytes(unrelated_file: &Path, expected: &[u8]) {
@@ -948,6 +1056,215 @@ fn building_state_recovery_current_database_remains_readable() {
         "Current plus database must remain readable: stdout={}, stderr={}",
         query.stdout, query.stderr
     );
+}
+
+#[test]
+fn lockless_root_recovery_init_preserves_sentinel_and_builds_current() {
+    let dir = TestDir::new("lockless-only-log-init");
+    let project = dir.path().join("mini");
+    copy_tree(&mini_fixture(), &project);
+    let paths = IndexPaths::resolve(&project, None).expect("resolve lockless paths");
+    std::fs::create_dir(paths.current_root()).expect("create existing index root");
+    let sentinel = b"sentinel daemon diagnostic\n";
+    std::fs::write(paths.daemon_log(), sentinel).expect("write sentinel daemon log");
+
+    let init = run_in(
+        dir.path(),
+        &["init", project.to_str().expect("UTF-8 project path")],
+    );
+    assert!(
+        init.ok,
+        "lockless Missing root must be recoverable: stdout={}, stderr={}",
+        init.stdout, init.stderr
+    );
+    assert_eq!(
+        normalize(&init.stdout),
+        format!(
+            "Initialized in {}\nIndexed 3 files\n13 nodes, 21 edges",
+            project.display()
+        )
+    );
+    assert_eq!(normalize(&init.stderr), "Scanning files…");
+    assert_eq!(Store::extraction_status(&paths), ExtractionStatus::Current);
+    assert!(paths.permanent_lock().is_file());
+    assert!(paths.current_db().is_file());
+    assert_eq!(
+        std::fs::read(paths.daemon_log()).expect("read preserved daemon log"),
+        sentinel
+    );
+}
+
+#[test]
+fn lockless_root_recovery_missing_query_and_status_are_actionable() {
+    let dir = TestDir::new("lockless-missing-diagnostics");
+    let project = dir.path().join("project");
+    std::fs::create_dir(&project).expect("create project");
+    let paths = IndexPaths::resolve(&project, None).expect("resolve lockless paths");
+    std::fs::create_dir(paths.current_root()).expect("create existing index root");
+    std::fs::write(paths.daemon_log(), b"sentinel\n").expect("write sentinel daemon log");
+    let detail = lockless_missing_detail(&project, &paths);
+    let project_arg = project.to_str().expect("UTF-8 project path");
+
+    assert_query_error(&dir, &project, &detail);
+
+    let human = run_in(dir.path(), &["status", project_arg]);
+    assert!(human.ok, "human status must succeed: {}", human.stderr);
+    assert_eq!(normalize(&human.stderr), "");
+    assert_eq!(
+        human.stdout,
+        format!(
+            "\nCodeGraph Status\n\nProject: {}\nDB Path: {}\nState:   missing\nDaemon:  stopped\n{detail}\n",
+            project.display(),
+            paths.current_db().display()
+        )
+    );
+
+    let json_run = run_in(dir.path(), &["status", "--json", project_arg]);
+    assert!(json_run.ok, "JSON status must succeed: {}", json_run.stderr);
+    assert_eq!(normalize(&json_run.stderr), "");
+    let value: serde_json::Value =
+        serde_json::from_str(json_run.stdout.trim()).expect("status emits JSON");
+    assert_eq!(value["initialized"], false);
+    assert_eq!(value["extractionStatus"], "missing");
+    assert_eq!(value["extractionStatusDetail"], detail);
+    assert_eq!(
+        value["recoveryCommand"],
+        format!("codegraph init \"{}\"", project.display())
+    );
+    assert!(!paths.permanent_lock().exists());
+}
+
+#[test]
+fn lockless_root_recovery_fresh_missing_keeps_original_diagnostics_and_creates_nothing() {
+    let dir = TestDir::new("lockless-fresh-missing");
+    let project = dir.path().join("project");
+    std::fs::create_dir(&project).expect("create fresh project");
+    let paths = IndexPaths::resolve(&project, None).expect("resolve fresh paths");
+    let project_arg = project.to_str().expect("UTF-8 project path");
+    let query_error = format!(
+        "CodeGraph not initialized in {}; run `codegraph init {}` to create or replace the index",
+        project.display(),
+        project.display()
+    );
+
+    assert_query_error(&dir, &project, &query_error);
+    assert!(!paths.current_root().exists());
+
+    let human = run_in(dir.path(), &["status", project_arg]);
+    assert!(
+        human.ok,
+        "fresh human status must succeed: {}",
+        human.stderr
+    );
+    assert_eq!(normalize(&human.stderr), "");
+    assert_eq!(
+        human.stdout,
+        format!(
+            "\nCodeGraph Status\n\nProject: {}\nDB Path: {}\nState:   missing\nDaemon:  stopped\nNot initialized\nRun \"codegraph init\" to initialize\n",
+            project.display(),
+            paths.current_db().display()
+        )
+    );
+    assert!(!paths.current_root().exists());
+
+    let json_run = run_in(dir.path(), &["status", "--json", project_arg]);
+    assert!(
+        json_run.ok,
+        "fresh JSON status must succeed: {}",
+        json_run.stderr
+    );
+    assert_eq!(normalize(&json_run.stderr), "");
+    let value: serde_json::Value =
+        serde_json::from_str(json_run.stdout.trim()).expect("status emits JSON");
+    assert_eq!(value["initialized"], false);
+    assert_eq!(value["extractionStatus"], "missing");
+    assert!(value.get("recoveryCommand").is_none());
+    assert!(!paths.current_root().exists());
+}
+
+#[test]
+fn lockless_root_recovery_refuses_present_future_corrupt_and_current_state() {
+    for status in ["future", "corrupt", "current-no-db"] {
+        let dir = TestDir::new(&format!("lockless-refuse-{status}"));
+        let project = dir.path().join("project");
+        std::fs::create_dir(&project).expect("create lifecycle project");
+        let paths = IndexPaths::resolve(&project, None).expect("resolve lifecycle paths");
+        stage_lifecycle_state(&paths, status);
+        let expected_status = Store::extraction_status(&paths);
+        let before = slot_bytes(&paths);
+        std::fs::remove_file(paths.permanent_lock()).expect("remove permanent lock");
+
+        let init = run_in(
+            dir.path(),
+            &["init", project.to_str().expect("UTF-8 project path")],
+        );
+        assert!(!init.ok, "{status} without a lock must refuse init");
+        assert_eq!(normalize(&init.stdout), "");
+        assert_eq!(final_error_body(&init.stderr), lock_not_found_error(&paths));
+        assert_eq!(Store::extraction_status(&paths), expected_status);
+        assert_eq!(slot_bytes(&paths), before);
+        assert!(!paths.permanent_lock().exists());
+        assert!(!paths.current_db().exists());
+    }
+}
+
+#[test]
+fn lockless_root_recovery_race_refuses_state_published_before_kernel_lock() {
+    let dir = TestDir::new("lockless-handle-opened-race");
+    let project = dir.path().join("mini");
+    copy_tree(&mini_fixture(), &project);
+    let paths = IndexPaths::resolve(&project, None).expect("resolve race paths");
+    std::fs::create_dir(paths.current_root()).expect("create existing index root");
+    let sentinel = b"sentinel daemon diagnostic\n";
+    std::fs::write(paths.daemon_log(), sentinel).expect("write sentinel daemon log");
+    std::fs::write(paths.config_toml(), b"[app]\nname = \"codegraph\"\n")
+        .expect("write parseable stale config residue");
+
+    let barrier = LeaseCheckpointBarrier::start();
+    let mut command = Command::new(bin());
+    command
+        .current_dir(dir.path())
+        .args(["init", project.to_str().expect("UTF-8 project path")])
+        .env("CODEGRAPH_HTTP_REGISTRY_DIR", dir.path())
+        .env("CODEGRAPH_NO_DAEMON", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    barrier.configure(&mut command);
+    let child = ChildGuard(Some(command.spawn().expect("spawn barriered init")));
+
+    let mut opened = barrier.wait_for_handle_opened();
+    let competitor = IndexLease::acquire_exclusive_existing(&paths, deadline(), || false)
+        .expect("competitor acquires the still-unlocked permanent lock");
+    publish_index_state(&paths, &competitor, StatePhase::Building)
+        .expect("competitor publishes Building");
+    let competitor_status = Store::extraction_status(&paths);
+    let before = slot_bytes(&paths);
+    drop(competitor);
+    opened.write_all(b"R").expect("release barriered init");
+
+    let output = child.finish();
+    assert!(
+        !output.status.success(),
+        "takeover must reject state published before it acquired the kernel lock: stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(normalize(&String::from_utf8_lossy(&output.stdout)), "");
+    assert_eq!(
+        final_error_body(&String::from_utf8_lossy(&output.stderr)),
+        format!(
+            "lockless index takeover at {} no longer classifies missing after acquiring the permanent lock; found {competitor_status}",
+            paths.current_root().display()
+        )
+    );
+    assert_eq!(Store::extraction_status(&paths), competitor_status);
+    assert_eq!(slot_bytes(&paths), before);
+    assert!(!paths.current_db().exists());
+    assert_eq!(
+        std::fs::read(paths.daemon_log()).expect("read preserved sentinel"),
+        sentinel
+    );
+    assert!(paths.permanent_lock().is_file());
 }
 
 #[test]

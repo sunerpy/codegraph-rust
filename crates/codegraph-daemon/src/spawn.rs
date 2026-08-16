@@ -23,11 +23,12 @@ const DETACHED_PROCESS: u32 = 0x0000_0008;
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 
 /// Spawn a detached background daemon by re-invoking `exe serve --mcp --path
-/// <root>` with `CODEGRAPH_DAEMON_INTERNAL=1`, redirecting stdout+stderr to an
-/// appended `.codegraph/daemon.log`, detaching it from this process group, and
-/// keeping a tiny reaper thread to wait on the child when it exits. The
-/// executable path is a parameter so the daemon crate stays testable; the CLI
-/// passes `std::env::current_exe()?`.
+/// <root>` with `CODEGRAPH_DAEMON_INTERNAL=1`. When the index root already exists,
+/// stdout+stderr append to `.codegraph/daemon.log`; otherwise they use the null
+/// sink rather than creating an index namespace solely for logging. The child is
+/// detached from this process group and a tiny reaper thread waits for its exit.
+/// The executable path is a parameter so the daemon crate stays testable; the
+/// CLI passes `std::env::current_exe()?`.
 ///
 /// `no_watch` forwards the `--no-watch` intent to the detached child EXPLICITLY
 /// via `Command.env` instead of mutating this process's global environment.
@@ -63,13 +64,12 @@ pub fn spawn_detached_daemon(exe: &Path, root: &Path, no_watch: bool) -> Result<
     Ok(())
 }
 
-/// The rendezvous dir is created by the daemon's lock layer in the CHILD, but
-/// this log redirect is set up in the PARENT before spawn, so the parent creates
-/// the log's parent directory here — otherwise the redirect silently falls back
-/// to a null sink and the child's stderr is lost.
+/// Open a project-local append target only when its parent is already a directory.
+/// Falling back to the null sink keeps a failed background start from creating a
+/// lockless index root merely to hold diagnostics.
 fn log_target(path: &Path) -> Stdio {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    if !path.parent().is_some_and(Path::is_dir) {
+        return Stdio::null();
     }
     OpenOptions::new()
         .create(true)
@@ -227,6 +227,46 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lockless_root_recovery_spawn_does_not_create_absent_index_root() {
+        let exe = Path::new("/bin/true");
+        assert!(exe.exists(), "/bin/true is required for this Unix test");
+        let project = temp_root("lockless-absent-root");
+        let log = crate::paths::daemon_log_path(&project).expect("resolve daemon log");
+        let index_root = log.parent().expect("daemon log has an index root");
+        assert!(!index_root.exists());
+
+        spawn_detached_daemon(exe, &project, false).expect("spawn short-lived daemon command");
+
+        assert!(project.is_dir());
+        assert!(!index_root.exists());
+        assert!(!log.exists());
+        assert!(
+            eventually_no_zombie_children(Duration::from_secs(1)),
+            "spawn_detached_daemon must reap the absent-root control child"
+        );
+        let _ = fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn lockless_root_recovery_spawn_keeps_existing_index_root_log() {
+        let exe = Path::new("/bin/true");
+        assert!(exe.exists(), "/bin/true is required for this Unix test");
+        let project = temp_root("lockless-existing-root");
+        let log = crate::paths::daemon_log_path(&project).expect("resolve daemon log");
+        let index_root = log.parent().expect("daemon log has an index root");
+        fs::create_dir(index_root).expect("create existing index root");
+
+        spawn_detached_daemon(exe, &project, false).expect("spawn short-lived daemon command");
+
+        assert!(fs::metadata(&log).is_ok_and(|metadata| metadata.is_file()));
+        assert!(
+            eventually_no_zombie_children(Duration::from_secs(1)),
+            "spawn_detached_daemon must reap the existing-root control child"
+        );
+        let _ = fs::remove_dir_all(project);
     }
 
     #[test]

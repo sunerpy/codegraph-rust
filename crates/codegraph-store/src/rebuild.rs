@@ -137,6 +137,16 @@ pub enum RebuildError {
         /// Operating-system error.
         source: io::Error,
     },
+    /// A lockless namespace stopped classifying Missing before takeover held its lock.
+    #[error(
+        "lockless index takeover at {path} no longer classifies missing after acquiring the permanent lock; found {status}"
+    )]
+    LocklessTakeoverStateChanged {
+        /// Resolved current root.
+        path: PathBuf,
+        /// Classification observed while holding the newly created permanent lock.
+        status: crate::ExtractionStatus,
+    },
     /// A database artifact could not be removed under the lease.
     #[error("cannot remove database artifact {path}: {source}")]
     RemoveDatabase {
@@ -735,6 +745,11 @@ fn checkpoint(
         })
 }
 
+/// Acquire the one outer exclusive lease for a rebuild. A lockless existing
+/// root is eligible for permanent-lock creation only after a Missing precheck;
+/// because creating the file does not yet possess its kernel lock, the recovery
+/// arm re-asserts Missing while holding the returned lease before authorizing
+/// any state publication or database mutation.
 fn acquire_outer_exclusive(
     paths: &IndexPaths,
     deadline: Instant,
@@ -744,27 +759,24 @@ fn acquire_outer_exclusive(
     match IndexLease::acquire_or_create_exclusive(paths, deadline, &mut cancelled) {
         Ok(lease) => Ok(lease),
         Err(IndexLeaseError::LockNotFound { .. })
-            if Store::extraction_status(paths) == crate::ExtractionStatus::Missing
-                && (first_existing_database_artifact(paths)?.is_some()
-                    || first_existing_project_config(paths)?.is_some()) =>
+            if Store::extraction_status(paths) == crate::ExtractionStatus::Missing =>
         {
-            Ok(IndexLease::create_exclusive_in_existing_root(
-                paths, deadline, cancelled,
-            )?)
+            let lease = IndexLease::create_exclusive_in_existing_root(paths, deadline, cancelled)?;
+            let status = Store::extraction_status(paths);
+            if status != crate::ExtractionStatus::Missing {
+                return Err(RebuildError::LocklessTakeoverStateChanged {
+                    path: paths
+                        .permanent_lock()
+                        .parent()
+                        .expect("the permanent lock always belongs to the current index root")
+                        .to_path_buf(),
+                    status,
+                });
+            }
+            Ok(lease)
         }
         Err(error) => Err(error.into()),
     }
-}
-
-fn first_existing_project_config(paths: &IndexPaths) -> Result<Option<PathBuf>, RebuildError> {
-    for path in [paths.config_toml(), paths.extension_config()] {
-        match std::fs::symlink_metadata(&path) {
-            Ok(_) => return Ok(Some(path)),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => return Err(RebuildError::InspectRoot { path, source }),
-        }
-    }
-    Ok(None)
 }
 
 fn remove_database_files(paths: &IndexPaths, lease: &IndexLease) -> Result<(), RebuildError> {
@@ -1761,25 +1773,28 @@ mod tests {
     }
 
     #[test]
-    fn existing_root_without_a_permanent_lock_fails_closed() {
+    fn missing_existing_root_without_a_permanent_lock_begins_rebuild_safely() {
         let project = TempProject::new("lockless");
         let paths = project.paths();
         std::fs::create_dir_all(paths.current_root()).expect("stage a lockless root");
 
-        let error = begin_full_rebuild(&paths, RebuildKind::ExplicitInit, deadline(), || false)
-            .expect_err("a lockless existing namespace must never be repaired");
+        let rebuild = begin_full_rebuild(&paths, RebuildKind::ExplicitInit, deadline(), || false)
+            .expect("a Missing lockless namespace may begin explicit init");
         assert!(
-            matches!(
-                error,
-                RebuildError::Lease(IndexLeaseError::LockNotFound { .. })
-            ),
-            "unexpected error: {error}"
+            paths.permanent_lock().is_file(),
+            "takeover must create the permanent lock without replacing the root"
         );
-        assert_eq!(Store::extraction_status(&paths), ExtractionStatus::Missing);
+        assert_eq!(
+            Store::extraction_status(&paths),
+            ExtractionStatus::Building {
+                built: crate::CURRENT_EXTRACTION_VERSION,
+            }
+        );
         assert!(
             !paths.current_db().exists(),
-            "a refused rebuild must not create a database"
+            "the authorized prologue must not open SQLite before open_store"
         );
+        drop(rebuild);
     }
 
     /// Take the incremental-sync authorization the way a real sync does: ONE

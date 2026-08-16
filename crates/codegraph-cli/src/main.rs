@@ -1384,6 +1384,8 @@ fn recover_dead_owner_sidecars(paths: &codegraph_core::IndexPaths, project_root:
 /// The returned `Store` OWNS that same lease, so retaining it across pid/socket
 /// publication requires no second acquisition: there is no nested lock and no
 /// window between validation and publication for another writer to reclassify.
+/// A refusal therefore proves only that this daemon published no pid or socket;
+/// the detached parent may already have opened the project-local log redirect.
 fn authorize_daemon_startup(project_root: &Path) -> Result<codegraph_daemon::StartupAuthorization> {
     let paths = index_paths(project_root)?;
     recover_dead_owner_sidecars(&paths, project_root);
@@ -1404,8 +1406,11 @@ fn authorize_daemon_startup(project_root: &Path) -> Result<codegraph_daemon::Sta
             };
             bail!(
                 "refusing to start a daemon for {}: {error}; index state is {status} and its \
-                 uninitialized tombstone is {tombstone}. No daemon pid, socket, or log was \
-                 published. Run `codegraph init` to rebuild.",
+                 uninitialized tombstone is {tombstone}. This daemon did not publish a pid or \
+                 socket; a detached parent may already have opened {}. Run `codegraph status \
+                 \"{}\"` for state-specific recovery guidance.",
+                project_root.display(),
+                paths.daemon_log().display(),
                 project_root.display()
             )
         }
@@ -1660,8 +1665,13 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
         .clone()
         .expect("a non-busy status probe always classifies the namespace");
     let owner_mismatch_recoverable = owner_mismatch_only_reason(&resolved).is_some();
-    let extraction_status_detail =
-        status_extraction_detail(&extraction_status, owner_mismatch_recoverable, &project);
+    let lockless_missing =
+        extraction_status == ExtractionStatus::Missing && is_lockless_missing_root(&resolved)?;
+    let extraction_status_detail = if lockless_missing {
+        lockless_missing_detail(&project, &resolved)
+    } else {
+        status_extraction_detail(&extraction_status, owner_mismatch_recoverable, &project)
+    };
     let store = status_open.into_store();
     if store.is_none() {
         if json_output {
@@ -1687,6 +1697,9 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
                     json!(format!("codegraph index --force {}", project.display()));
             } else if owner_mismatch_recoverable {
                 status["recoveryCommand"] = json!(format!("codegraph init {}", project.display()));
+            } else if lockless_missing {
+                status["recoveryCommand"] =
+                    json!(format!("codegraph init \"{}\"", project.display()));
             }
             print_json(&status)?;
         } else {
@@ -1724,6 +1737,9 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
                 }
                 ExtractionStatus::Corrupt { .. } => {
                     println!("Manual recovery is required.");
+                }
+                ExtractionStatus::Missing if lockless_missing => {
+                    println!("{extraction_status_detail}");
                 }
                 _ => {
                     println!("Not initialized");
@@ -5447,7 +5463,10 @@ fn explicit_init_observes_readable_current(project: &Path) -> Result<bool> {
             drop(store);
             Ok(true)
         }
-        Err(codegraph_store::StoreError::CurrentTombstoned { .. }) => Ok(false),
+        Err(
+            codegraph_store::StoreError::CurrentTombstoned { .. }
+            | codegraph_store::StoreError::StateWithoutPermanentLock { .. },
+        ) => Ok(false),
         Err(error) => Err(error.into()),
     }
 }
@@ -5476,8 +5495,9 @@ fn has_lifecycle_namespace(project: &Path) -> bool {
 }
 
 /// Resolve a readable project and report lifecycle-specific recovery without
-/// authorizing mutation. Only an all-present-slot OwnerMismatch names explicit
-/// init; mixed or other corruption continues to require manual recovery.
+/// authorizing mutation. Only an all-present-slot OwnerMismatch or a Missing
+/// existing root with no permanent lock names explicit init; mixed or other
+/// corruption continues to require manual recovery.
 fn resolve_required_project(path: Option<PathBuf>) -> Result<PathBuf> {
     let start = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
     index_paths(&start)?;
@@ -5506,6 +5526,9 @@ fn resolve_required_project(path: Option<PathBuf>) -> Result<PathBuf> {
         ExtractionStatus::Missing => {
             if first_existing_database_artifact(&paths)?.is_some() {
                 bail!("{}", missing_state_with_database_detail(&project));
+            }
+            if is_lockless_missing_root(&paths)? {
+                bail!("{}", lockless_missing_detail(&project, &paths));
             }
             bail!(
                 "CodeGraph not initialized in {}; run `codegraph init {}` to create or replace the index",
@@ -5558,6 +5581,43 @@ fn first_existing_database_artifact(paths: &codegraph_core::IndexPaths) -> Resul
 fn missing_state_with_database_detail(project: &Path) -> String {
     format!(
         "index database has no state slots and may have been created by an older version or another tool; run `codegraph init {}` to replace it",
+        project.display()
+    )
+}
+
+/// Detect the recoverable filesystem shape after the caller has classified the
+/// namespace Missing. Both path probes are non-following and inspection errors
+/// propagate, so aliases and inaccessible entries cannot masquerade as recovery.
+fn is_lockless_missing_root(paths: &codegraph_core::IndexPaths) -> Result<bool> {
+    let root = paths.current_root();
+    let root_metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", root.display()));
+        }
+    };
+    if !root_metadata.file_type().is_dir() {
+        return Ok(false);
+    }
+
+    let lock = paths.permanent_lock();
+    match fs::symlink_metadata(&lock) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", lock.display())),
+    }
+}
+
+fn lockless_missing_detail(project: &Path, paths: &codegraph_core::IndexPaths) -> String {
+    let lock = paths.permanent_lock();
+    let root = lock
+        .parent()
+        .expect("the permanent lock always belongs to the current index root");
+    format!(
+        "CodeGraph index directory exists at {}, but its permanent lock is missing at {}; a failed background daemon start can leave this stale namespace. Run `codegraph init \"{}\"` to create the lock and rebuild the index.",
+        root.display(),
+        lock.display(),
         project.display()
     )
 }
