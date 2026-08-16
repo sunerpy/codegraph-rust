@@ -234,6 +234,94 @@ fn slot_bytes(paths: &IndexPaths) -> [Option<Vec<u8>>; 2] {
     })
 }
 
+fn lock_not_found_error(paths: &IndexPaths) -> String {
+    format!(
+        "existing index namespace has no permanent lock file at {}; a failed background daemon start can leave this stale shape. Run `codegraph status` from the project root to classify it; only `State: missing` is safe to recover with `codegraph init`.",
+        paths.permanent_lock().display()
+    )
+}
+
+fn wait_for_daemon_error(log: &Path) -> String {
+    let until = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < until {
+        if let Ok(contents) = std::fs::read_to_string(log) {
+            let normalized = normalize(&contents);
+            if contents.ends_with('\n')
+                && normalized.lines().any(|line| {
+                    line.strip_prefix("Error: ")
+                        .is_some_and(|body| !body.is_empty())
+                })
+            {
+                return final_error_body(&contents);
+            }
+        }
+        std::thread::yield_now();
+    }
+    panic!(
+        "detached daemon did not publish its final error to {}",
+        log.display()
+    );
+}
+
+#[test]
+fn lockless_root_recovery_building_without_lock_refuses_init_unchanged() {
+    let dir = TestDir::new("lockless-building-init");
+    let project = dir.path().join("mini");
+    copy_tree(&mini_fixture(), &project);
+    let paths = IndexPaths::resolve(&project, None).expect("resolve default index paths");
+    stage_interrupted_building(&paths, false);
+    let before = slot_bytes(&paths);
+    std::fs::remove_file(paths.permanent_lock()).expect("remove permanent lock");
+
+    let init = run_in(
+        dir.path(),
+        &["init", project.to_str().expect("UTF-8 project path")],
+    );
+    assert!(!init.ok, "lockless Building must refuse init");
+    assert_eq!(normalize(&init.stdout), "");
+    assert_eq!(final_error_body(&init.stderr), lock_not_found_error(&paths));
+    assert_eq!(slot_bytes(&paths), before);
+    assert!(!paths.permanent_lock().exists());
+    assert!(!paths.current_db().exists());
+    assert_eq!(
+        Store::extraction_status(&paths),
+        ExtractionStatus::Building {
+            built: codegraph_store::CURRENT_EXTRACTION_VERSION,
+        }
+    );
+}
+
+#[test]
+fn lockless_root_recovery_daemon_refusal_reports_only_pid_socket_guarantee() {
+    let dir = TestDir::new("lockless-daemon-refusal");
+    let project = dir.path().join("mini");
+    copy_tree(&mini_fixture(), &project);
+    let paths = IndexPaths::resolve(&project, None).expect("resolve default index paths");
+    stage_interrupted_building(&paths, false);
+    let before = slot_bytes(&paths);
+    let status = Store::extraction_status(&paths);
+    let store_error = Store::open_for_read(&paths, deadline(), || false)
+        .expect_err("Building must refuse a read open")
+        .to_string();
+
+    codegraph_daemon::spawn_detached_daemon(&bin(), &project, false)
+        .expect("spawn detached daemon against Building namespace");
+    let body = wait_for_daemon_error(&paths.daemon_log());
+    assert_eq!(
+        body,
+        format!(
+            "running as detached MCP daemon: refusing to start a daemon for {}: {store_error}; index state is {status} and its uninitialized tombstone is absent. This daemon did not publish a pid or socket; a detached parent may already have opened {}. Run `codegraph status \"{}\"` for state-specific recovery guidance.",
+            project.display(),
+            paths.daemon_log().display(),
+            project.display()
+        )
+    );
+    assert!(!paths.daemon_pid().exists());
+    assert!(!paths.daemon_socket().exists());
+    assert_eq!(slot_bytes(&paths), before);
+    assert_eq!(Store::extraction_status(&paths), status);
+}
+
 #[test]
 fn building_state_recovery_status_guides_only_stale_building() {
     let dir = TestDir::new("status-stale-building");

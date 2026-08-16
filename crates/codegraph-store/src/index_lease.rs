@@ -72,8 +72,11 @@ pub struct IndexLease {
 /// Typed failures while opening or acquiring a permanent index lock.
 #[derive(Debug, Error)]
 pub enum IndexLeaseError {
-    /// An existing namespace has no permanent lock.
-    #[error("permanent index lock does not exist: {path}")]
+    /// An existing namespace has no permanent lock; state must be classified
+    /// before deciding whether explicit init is safe.
+    #[error(
+        "existing index namespace has no permanent lock file at {path}; a failed background daemon start can leave this stale shape. Run `codegraph status` from the project root to classify it; only `State: missing` is safe to recover with `codegraph init`."
+    )]
     LockNotFound { path: PathBuf },
     /// The fixed permanent-lock path is a symlink or Windows reparse point.
     #[error("permanent index lock is an alias and cannot be lock authority: {path}")]
@@ -189,8 +192,10 @@ impl IndexLease {
     }
 
     /// Create and acquire the permanent lock inside an existing, state-less
-    /// namespace selected for stale-cache replacement. Callers must classify the
-    /// namespace again under the returned lease before changing any other byte.
+    /// namespace selected for stale-cache replacement. Callers must classify
+    /// before attempting creation, then re-classify under the genuinely held
+    /// returned lease before authorizing or changing any other byte: creating the
+    /// lock file is not itself possession of its kernel lock.
     pub(crate) fn create_exclusive_in_existing_root(
         paths: &IndexPaths,
         deadline: Instant,
@@ -226,6 +231,8 @@ impl IndexLease {
             .open(&lock_path)
             .map_err(|source| classify_create_error(&lock_path, source))?;
         let opened_identity = opened_identity(&file, &lock_path, None)?;
+        #[cfg(feature = "test-hooks")]
+        lease_test_checkpoint(AcquireCheckpoint::HandleOpened);
         Self::acquire_file(
             file,
             PendingAcquisition {
@@ -481,18 +488,17 @@ impl IndexLease {
     }
 }
 
-/// Deterministic cross-process checkpoint used only by integration-test builds.
+/// Deterministic cross-process barriers used only by integration-test builds.
 ///
-/// A test child opts in by supplying a loopback listener address and the lease
-/// mode it wants to stop. The hook writes one acknowledged mode byte only after
-/// the kernel lock and final path corroboration both succeeded, then waits for a
-/// release byte with bounded socket timeouts. No corresponding strings or I/O
-/// path are compiled into normal/release builds.
+/// The existing mode selector writes `S` or `X` only after the kernel lock and
+/// final-path corroboration both succeed. The checkpoint selector can separately
+/// stop existing-root lock creation at `HandleOpened`, writing `H` before the
+/// first kernel-lock attempt. Both protocols wait for one `R` release byte with
+/// bounded socket timeouts. No corresponding strings or I/O path are compiled
+/// into normal/release builds.
 #[cfg(feature = "test-hooks")]
 fn lease_test_barrier(mode: LeaseMode) {
-    const ADDR_ENV: &str = "CODEGRAPH_TEST_LEASE_BARRIER_ADDR";
     const MODE_ENV: &str = "CODEGRAPH_TEST_LEASE_BARRIER_MODE";
-    const WAIT: Duration = Duration::from_secs(10);
 
     let expected = match std::env::var(MODE_ENV) {
         Ok(value) => value,
@@ -505,8 +511,28 @@ fn lease_test_barrier(mode: LeaseMode) {
     if expected != mode_name {
         return;
     }
+    lease_test_wait(marker, MODE_ENV);
+}
+
+#[cfg(feature = "test-hooks")]
+fn lease_test_checkpoint(checkpoint: AcquireCheckpoint) {
+    const CHECKPOINT_ENV: &str = "CODEGRAPH_TEST_LEASE_BARRIER_CHECKPOINT";
+
+    if checkpoint != AcquireCheckpoint::HandleOpened
+        || !matches!(std::env::var(CHECKPOINT_ENV), Ok(value) if value == "handle-opened")
+    {
+        return;
+    }
+    lease_test_wait(b'H', CHECKPOINT_ENV);
+}
+
+#[cfg(feature = "test-hooks")]
+fn lease_test_wait(marker: u8, selector_env: &str) {
+    const ADDR_ENV: &str = "CODEGRAPH_TEST_LEASE_BARRIER_ADDR";
+    const WAIT: Duration = Duration::from_secs(10);
+
     let address = std::env::var(ADDR_ENV)
-        .unwrap_or_else(|_| panic!("{MODE_ENV} requires {ADDR_ENV}"))
+        .unwrap_or_else(|_| panic!("{selector_env} requires {ADDR_ENV}"))
         .parse()
         .unwrap_or_else(|error| panic!("invalid {ADDR_ENV}: {error}"));
     let mut stream = std::net::TcpStream::connect_timeout(&address, WAIT)
@@ -830,5 +856,18 @@ mod tests {
             .try_lock()
             .expect("failed creation never locks the competing entry");
         competing_handle.unlock().expect("unlock competing entry");
+    }
+
+    #[test]
+    fn lockless_root_recovery_lock_not_found_is_actionable() {
+        let path = PathBuf::from("/tmp/project/.codegraph/index.lock");
+        let error = IndexLeaseError::LockNotFound { path: path.clone() };
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "existing index namespace has no permanent lock file at {}; a failed background daemon start can leave this stale shape. Run `codegraph status` from the project root to classify it; only `State: missing` is safe to recover with `codegraph init`.",
+                path.display()
+            )
+        );
     }
 }
