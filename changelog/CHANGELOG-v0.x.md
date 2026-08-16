@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.43.0](https://github.com/sunerpy/codegraph-rust/compare/v0.42.10...v0.43.0) (2026-08-16)
+
+
+### Features
+
+* **zed:** rename the extension id and reap superseded binaries ([#203](https://github.com/sunerpy/codegraph-rust/issues/203)) ([188b8b6](https://github.com/sunerpy/codegraph-rust/commit/188b8b68304ba801f4d4c26e113f00c2941f0048))
+
+
+### Bug Fixes
+
+* **init:** recover a lockless index root instead of dead-ending ([#204](https://github.com/sunerpy/codegraph-rust/issues/204)) ([5175f2a](https://github.com/sunerpy/codegraph-rust/commit/5175f2a12f3c855fb1e3f61bff5c988bd7565e74))
+
 ## [0.42.10](https://github.com/sunerpy/codegraph-rust/compare/v0.42.9...v0.42.10) (2026-08-07)
 
 
