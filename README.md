@@ -298,7 +298,7 @@ needed.
 
 Search for **"CodeGraph"** in Zed's extension registry (`zed: extensions` from the
 command palette) and click Install. It is listed as **CodeGraph MCP Server**
-(extension ID `mcp-server-codegraph`). The extension auto-downloads the CodeGraph
+(extension ID `codegraph-mcp`). The extension auto-downloads the CodeGraph
 binary for your platform on first launch.
 
 **Dev install (for local development):**
@@ -324,14 +324,14 @@ codegraph-<version>/codegraph.exe    # Windows
 
 This path is **relative to the extension's working directory** that Zed manages,
 which is keyed on the extension ID: typically
-`~/.local/share/zed/extensions/work/mcp-server-codegraph/` on Linux,
-`~/Library/Application Support/Zed/extensions/work/mcp-server-codegraph/` on
-macOS, or `%LOCALAPPDATA%\Zed\extensions\work\mcp-server-codegraph\` on Windows.
+`~/.local/share/zed/extensions/work/codegraph-mcp/` on Linux,
+`~/Library/Application Support/Zed/extensions/work/codegraph-mcp/` on
+macOS, or `%LOCALAPPDATA%\Zed\extensions\work\codegraph-mcp\` on Windows.
 
 For example, after downloading version `v0.25.0` on Linux the binary lives at:
 
 ```
-~/.local/share/zed/extensions/work/mcp-server-codegraph/codegraph-v0.25.0/codegraph
+~/.local/share/zed/extensions/work/codegraph-mcp/codegraph-v0.25.0/codegraph
 ```
 
 When the CodeGraph CLI ships a new release the extension picks up the new binary
