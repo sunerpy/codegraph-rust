@@ -11,18 +11,14 @@ AI/LLM inside it — pure pre-computed structure for your agent to consume.
 
 ## Install
 
-### Preferred — official registry (once published)
+### Preferred — official registry
 
 Search for **"CodeGraph"** in Zed's extension registry (`zed: extensions` from
-the command palette) and click Install. The extension auto-downloads the
-CodeGraph binary for your platform on first launch.
+the command palette) and click Install. It is listed as **CodeGraph MCP Server**
+(extension ID `mcp-server-codegraph`). The extension auto-downloads the CodeGraph
+binary for your platform on first launch.
 
-> The extension is being submitted to the
-> [`zed-industries/extensions`](https://github.com/zed-industries/extensions)
-> registry. Once accepted it will be searchable there. Until then, use the
-> dev-install path below.
-
-### Dev install (before publication / for local development)
+### Dev install (for local development)
 
 1. Clone this repository.
 2. In Zed, run **`zed: install dev extension`** from the command palette.
@@ -48,26 +44,44 @@ codegraph-<version>/codegraph        # Linux / macOS
 codegraph-<version>/codegraph.exe    # Windows
 ```
 
-This path is **relative to the extension's working directory** that Zed manages
-(inside Zed's extensions data directory). The full on-disk location is:
+This path is **relative to the extension's working directory** that Zed manages —
+`<zed-data-dir>/extensions/work/mcp-server-codegraph/`, keyed on the extension
+ID. The full on-disk location is:
 
-| Platform | Full path                                                                                        |
-| -------- | ------------------------------------------------------------------------------------------------ |
-| Linux    | `~/.local/share/zed/extensions/installed/codegraph/codegraph-<version>/codegraph`                |
-| macOS    | `~/Library/Application Support/Zed/extensions/installed/codegraph/codegraph-<version>/codegraph` |
-| Windows  | `%APPDATA%\Zed\extensions\installed\codegraph\codegraph-<version>\codegraph.exe`                 |
+| Platform | Full path                                                                                              |
+| -------- | ------------------------------------------------------------------------------------------------------ |
+| Linux    | `~/.local/share/zed/extensions/work/mcp-server-codegraph/codegraph-<version>/codegraph`                |
+| macOS    | `~/Library/Application Support/Zed/extensions/work/mcp-server-codegraph/codegraph-<version>/codegraph` |
+| Windows  | `%LOCALAPPDATA%\Zed\extensions\work\mcp-server-codegraph\codegraph-<version>\codegraph.exe`            |
 
 For example, after downloading version `v0.25.0` on Linux the binary lives at:
 
 ```
-~/.local/share/zed/extensions/installed/codegraph/codegraph-v0.25.0/codegraph
+~/.local/share/zed/extensions/work/mcp-server-codegraph/codegraph-v0.25.0/codegraph
 ```
 
 Because the cache is keyed on the release version, when the CodeGraph CLI ships
 a new release the extension picks up the new binary automatically on the next
 launch — **no extension re-publish or manual update required**. If the GitHub
-API is unreachable (offline), the extension falls back to the newest binary it
-has already cached.
+API is unreachable (offline), the extension falls back to the binary it has
+already cached.
+
+### Cleanup of superseded binaries
+
+Immediately after a successful download the extension deletes every other
+`codegraph-*/` directory in its working directory, so the cache holds exactly one
+CodeGraph binary rather than accumulating one per release. Details:
+
+- It runs **only after a download**. A launch that finds the wanted version
+  already cached does no filesystem cleanup at all.
+- Only entries whose name starts with `codegraph-` are considered, and the
+  version currently in use is always kept.
+- Deletion is best-effort. A directory that cannot be removed (for example an
+  in-use `codegraph.exe` on Windows) is left in place and never fails the
+  server launch; the next update retries it.
+
+To reclaim the space by hand instead, delete the `codegraph-*` directories under
+the working-directory path in the table above.
 
 ## Use your own CodeGraph binary or pin a project path
 
@@ -158,35 +172,36 @@ To submit this extension to the official
 [`zed-industries/extensions`](https://github.com/zed-industries/extensions)
 registry so users can install it via `zed: extensions`, follow these steps:
 
-1. **Bump the version** in `editors/zed/extension.toml` to match the current
-   CodeGraph release (e.g. `version = "0.2.0"`).
+1. **Bump the version** in `editors/zed/extension.toml` (and `Cargo.toml`, in
+   lockstep) whenever the extension's WASM logic changes.
 
 2. **Fork** [`zed-industries/extensions`](https://github.com/zed-industries/extensions).
 
-3. **Add this repo as a git submodule** under `extensions/codegraph/`:
+3. **Add this repo as a git submodule** under `extensions/mcp-server-codegraph/`:
 
    ```bash
-   git submodule add https://github.com/sunerpy/codegraph-rust extensions/codegraph
+   git submodule add https://github.com/sunerpy/codegraph-rust extensions/mcp-server-codegraph
    ```
 
    The registry expects the extension root (containing `extension.toml`) at
-   `extensions/codegraph/editors/zed/`, so point the submodule at the repo root
-   and Zed's tooling walks for the manifest.
-
-   > Alternatively, if the registry requires the extension root at the submodule
-   > root, extract just `editors/zed/` into a dedicated repo first and submodule
-   > that instead.
+   `extensions/mcp-server-codegraph/editors/zed/`, so point the submodule at the
+   repo root and declare that subdirectory as the extension `path`.
 
 4. **Add an entry** to the top-level `extensions.toml` in the
    `zed-industries/extensions` repo:
 
    ```toml
-   [codegraph]
-   submodule = "extensions/codegraph"
+   [mcp-server-codegraph]
+   submodule = "extensions/mcp-server-codegraph"
+   path = "editors/zed"
    version = "0.2.0"
    ```
 
-   The `id` field (`codegraph`) must match the `id` in `extension.toml`.
+   The table key (`mcp-server-codegraph`) must match the `id` in
+   `extension.toml`. Registry policy requires MCP-server extensions to carry an
+   `mcp-server` prefix or suffix in that ID; the ID **cannot be changed after
+   publication**, so discoverability by the plain word "codegraph" comes from the
+   `name` field (`CodeGraph MCP Server`), which Zed also searches.
 
 5. **Open a pull request** against `zed-industries/extensions`. The Zed team
    reviews and merges it; once merged the extension becomes searchable in Zed's

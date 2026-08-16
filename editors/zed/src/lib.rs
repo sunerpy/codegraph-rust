@@ -63,11 +63,11 @@ impl CodeGraphExtension {
         format!("{}/{}", Self::version_dir(version), Self::binary_name())
     }
 
-    /// Newest existing `./codegraph-*/codegraph[.exe]` on disk, if any. Used as
-    /// an offline fallback when `latest_github_release` fails. "Newest" is by
-    /// lexicographically-greatest directory name, which matches semantic order
-    /// for the zero-padded-free `vX.Y.Z` tags this project uses well enough as
-    /// a best-effort offline fallback.
+    /// The cached `./codegraph-*/codegraph[.exe]` on disk, if any. Used as an
+    /// offline fallback when `latest_github_release` fails. `resolve_binary`
+    /// reaps superseded version dirs after each download, so in practice at most
+    /// one candidate survives; the sort is a vestigial tie-break for a cache
+    /// left behind by an older extension build.
     fn newest_cached_binary() -> Option<String> {
         let name = Self::binary_name();
         let mut candidates: Vec<String> = std::fs::read_dir(".")
@@ -132,6 +132,23 @@ impl CodeGraphExtension {
         let version_dir = Self::version_dir(&release.version);
         zed::download_file(&asset.download_url, &version_dir, file_type)?;
         zed::make_file_executable(&binary_path)?;
+
+        // Reap superseded version dirs so the cache does not grow without bound.
+        // Placement is load-bearing: only a successful download reaches here, so
+        // a cache hit never reaps. The `codegraph-` gate spares unrelated state
+        // Zed may keep here, and removal is `.ok()` rather than `?` because an
+        // undeletable dir (an in-use `.exe` on Windows) must not fail a launch.
+        let entries = std::fs::read_dir(".")
+            .map_err(|err| format!("failed to list the extension working directory: {err}"))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|err| format!("failed to read a working directory entry: {err}"))?;
+            if let Some(name) = entry.file_name().to_str() {
+                if name.starts_with("codegraph-") && name != version_dir {
+                    std::fs::remove_dir_all(entry.path()).ok();
+                }
+            }
+        }
 
         self.cached_binary_path = Some(binary_path.clone());
         Ok(binary_path)

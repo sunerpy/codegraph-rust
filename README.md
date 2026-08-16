@@ -294,18 +294,14 @@ needed.
 
 ### Install
 
-**Preferred — official registry (once published):**
+**Preferred — official registry:**
 
 Search for **"CodeGraph"** in Zed's extension registry (`zed: extensions` from the
-command palette) and click Install. The extension auto-downloads the CodeGraph
+command palette) and click Install. It is listed as **CodeGraph MCP Server**
+(extension ID `mcp-server-codegraph`). The extension auto-downloads the CodeGraph
 binary for your platform on first launch.
 
-> The extension is being submitted to the
-> [`zed-industries/extensions`](https://github.com/zed-industries/extensions)
-> registry. Once accepted it will be searchable there. Until then, use the
-> dev-install path below.
-
-**Dev install (before publication / for local development):**
+**Dev install (for local development):**
 
 1. Clone this repository.
 2. In Zed, open the command palette and run **`zed: install dev extension`**.
@@ -326,22 +322,29 @@ codegraph-<version>/codegraph        # Linux / macOS
 codegraph-<version>/codegraph.exe    # Windows
 ```
 
-This path is **relative to the extension's working directory** that Zed manages
-(inside Zed's extensions data directory, typically
-`~/.local/share/zed/extensions/installed/codegraph/` on Linux,
-`~/Library/Application Support/Zed/extensions/installed/codegraph/` on macOS, or
-`%APPDATA%\Zed\extensions\installed\codegraph\` on Windows).
+This path is **relative to the extension's working directory** that Zed manages,
+which is keyed on the extension ID: typically
+`~/.local/share/zed/extensions/work/mcp-server-codegraph/` on Linux,
+`~/Library/Application Support/Zed/extensions/work/mcp-server-codegraph/` on
+macOS, or `%LOCALAPPDATA%\Zed\extensions\work\mcp-server-codegraph\` on Windows.
 
 For example, after downloading version `v0.25.0` on Linux the binary lives at:
 
 ```
-~/.local/share/zed/extensions/installed/codegraph/codegraph-v0.25.0/codegraph
+~/.local/share/zed/extensions/work/mcp-server-codegraph/codegraph-v0.25.0/codegraph
 ```
 
 When the CodeGraph CLI ships a new release the extension picks up the new binary
 automatically on the next launch — **no extension re-publish or manual update
 required**. If the GitHub API is unreachable, the extension falls back to the
-newest cached binary it finds.
+binary it has already cached.
+
+Right after each successful download the extension removes the other
+`codegraph-*/` directories in that working directory, so the cache keeps exactly
+one binary instead of one per release. A launch that hits the cache does no
+cleanup, the in-use version is always kept, and a directory that cannot be
+deleted (an in-use `codegraph.exe` on Windows) never fails the launch. See
+[`editors/zed/README.md`](editors/zed/README.md) for the full cleanup contract.
 
 ### Override with your own binary
 
