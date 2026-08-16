@@ -15,7 +15,7 @@ AI/LLM inside it — pure pre-computed structure for your agent to consume.
 
 Search for **"CodeGraph"** in Zed's extension registry (`zed: extensions` from
 the command palette) and click Install. It is listed as **CodeGraph MCP Server**
-(extension ID `mcp-server-codegraph`). The extension auto-downloads the CodeGraph
+(extension ID `codegraph-mcp`). The extension auto-downloads the CodeGraph
 binary for your platform on first launch.
 
 ### Dev install (for local development)
@@ -45,19 +45,19 @@ codegraph-<version>/codegraph.exe    # Windows
 ```
 
 This path is **relative to the extension's working directory** that Zed manages —
-`<zed-data-dir>/extensions/work/mcp-server-codegraph/`, keyed on the extension
+`<zed-data-dir>/extensions/work/codegraph-mcp/`, keyed on the extension
 ID. The full on-disk location is:
 
-| Platform | Full path                                                                                              |
-| -------- | ------------------------------------------------------------------------------------------------------ |
-| Linux    | `~/.local/share/zed/extensions/work/mcp-server-codegraph/codegraph-<version>/codegraph`                |
-| macOS    | `~/Library/Application Support/Zed/extensions/work/mcp-server-codegraph/codegraph-<version>/codegraph` |
-| Windows  | `%LOCALAPPDATA%\Zed\extensions\work\mcp-server-codegraph\codegraph-<version>\codegraph.exe`            |
+| Platform | Full path                                                                                       |
+| -------- | ----------------------------------------------------------------------------------------------- |
+| Linux    | `~/.local/share/zed/extensions/work/codegraph-mcp/codegraph-<version>/codegraph`                |
+| macOS    | `~/Library/Application Support/Zed/extensions/work/codegraph-mcp/codegraph-<version>/codegraph` |
+| Windows  | `%LOCALAPPDATA%\Zed\extensions\work\codegraph-mcp\codegraph-<version>\codegraph.exe`            |
 
 For example, after downloading version `v0.25.0` on Linux the binary lives at:
 
 ```
-~/.local/share/zed/extensions/work/mcp-server-codegraph/codegraph-v0.25.0/codegraph
+~/.local/share/zed/extensions/work/codegraph-mcp/codegraph-v0.25.0/codegraph
 ```
 
 Because the cache is keyed on the release version, when the CodeGraph CLI ships
@@ -177,31 +177,33 @@ registry so users can install it via `zed: extensions`, follow these steps:
 
 2. **Fork** [`zed-industries/extensions`](https://github.com/zed-industries/extensions).
 
-3. **Add this repo as a git submodule** under `extensions/mcp-server-codegraph/`:
+3. **Add this repo as a git submodule** under `extensions/codegraph-mcp/`:
 
    ```bash
-   git submodule add https://github.com/sunerpy/codegraph-rust extensions/mcp-server-codegraph
+   git submodule add https://github.com/sunerpy/codegraph-rust extensions/codegraph-mcp
    ```
 
    The registry expects the extension root (containing `extension.toml`) at
-   `extensions/mcp-server-codegraph/editors/zed/`, so point the submodule at the
+   `extensions/codegraph-mcp/editors/zed/`, so point the submodule at the
    repo root and declare that subdirectory as the extension `path`.
 
 4. **Add an entry** to the top-level `extensions.toml` in the
    `zed-industries/extensions` repo:
 
    ```toml
-   [mcp-server-codegraph]
-   submodule = "extensions/mcp-server-codegraph"
+   [codegraph-mcp]
+   submodule = "extensions/codegraph-mcp"
    path = "editors/zed"
-   version = "0.2.0"
+   version = "0.2.1"
    ```
 
-   The table key (`mcp-server-codegraph`) must match the `id` in
-   `extension.toml`. Registry policy requires MCP-server extensions to carry an
-   `mcp-server` prefix or suffix in that ID; the ID **cannot be changed after
-   publication**, so discoverability by the plain word "codegraph" comes from the
-   `name` field (`CodeGraph MCP Server`), which Zed also searches.
+   The table key (`codegraph-mcp`) must match the `id` in `extension.toml`, as
+   must the submodule directory name. Registry policy requires the ID to convey
+   what the extension does, which the `-mcp` suffix carries (the registry already
+   hosts 14 such entries, including `azure-mcp` and `chrome-devtools-mcp`); the ID
+   **cannot be changed after publication**. The `name` field
+   (`CodeGraph MCP Server`) is what Zed displays for the extension in the list,
+   so the product word "CodeGraph" stays visible to anyone browsing it.
 
 5. **Open a pull request** against `zed-industries/extensions`. The Zed team
    reviews and merges it; once merged the extension becomes searchable in Zed's
