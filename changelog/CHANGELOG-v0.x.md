@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.43.1](https://github.com/sunerpy/codegraph-rust/compare/v0.43.0...v0.43.1) (2026-08-16)
+
+
+### Bug Fixes
+
+* **zed:** use the codegraph-mcp extension id ([#206](https://github.com/sunerpy/codegraph-rust/issues/206)) ([49a9635](https://github.com/sunerpy/codegraph-rust/commit/49a963560add8c5b138a7230323ae072ce36c0d7))
+
 ## [0.43.0](https://github.com/sunerpy/codegraph-rust/compare/v0.42.10...v0.43.0) (2026-08-16)
 
 
