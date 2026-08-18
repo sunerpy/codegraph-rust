@@ -5831,17 +5831,13 @@ fn glob_match_bytes(pattern: &[u8], value: &[u8]) -> bool {
     }
 }
 
+/// An explicit `--filter` glob fully REPLACES the heuristic — a user who names
+/// their test files takes precedence over any pattern table.
 fn is_test_file(file: &str, filter: Option<&str>) -> bool {
     if let Some(filter) = filter {
         return glob_matches(filter, file);
     }
-    file.contains(".spec.")
-        || file.contains(".test.")
-        || file.contains("/__tests__/")
-        || file.contains("/test/")
-        || file.contains("/tests/")
-        || file.contains("/e2e/")
-        || file.contains("/spec/")
+    codegraph_core::file_class::is_test_file(file)
 }
 
 fn print_json(value: &serde_json::Value) -> Result<()> {
@@ -6495,6 +6491,15 @@ mod pure_helper_tests {
         assert!(is_test_file("app/tests/mod.rs", None));
         assert!(is_test_file("e2e/flow.spec.ts", None));
         assert!(!is_test_file("src/main.rs", None));
+        // Go's test convention is a `_test.` stem, not a `.test.` one (#1507).
+        assert!(is_test_file("pkg/math_test.go", None));
+        assert!(is_test_file("math_test.go", None));
+        // Directory patterns are path-SEGMENT anchored, so a repo-root test
+        // directory (no leading slash) classifies like a nested one.
+        assert!(is_test_file("e2e/flow.go", None));
+        assert!(is_test_file("tests/mod.rs", None));
+        assert!(!is_test_file("internal/latest.go", None));
+        assert!(!is_test_file("src/route2e2e.ts", None));
     }
 
     #[test]

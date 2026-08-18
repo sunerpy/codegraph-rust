@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod errors;
+pub mod file_class;
 pub mod index_paths;
 pub mod logger;
 pub mod node_id;
