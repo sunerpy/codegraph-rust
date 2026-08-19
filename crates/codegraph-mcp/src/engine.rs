@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use codegraph_core::config::Config;
+use codegraph_core::file_class::{is_generated_file, is_test_file};
 use codegraph_core::node_id::hash_content;
 use codegraph_core::types::{EdgeKind, FileRecord, Node, NodeKind};
 use codegraph_graph::graph::{GodotReach, GraphTraverser, NodeEdge};
@@ -2304,7 +2305,7 @@ impl ExploreSubgraph {
                 neighbor_files.insert(n.file_path.as_str());
             }
         }
-        let scores: HashMap<String, (u8, usize)> = self
+        let scores: HashMap<String, (u8, u8, usize)> = self
             .file_order
             .iter()
             .map(|fp| {
@@ -2321,12 +2322,20 @@ impl ExploreSubgraph {
                 } else {
                     0
                 };
+                // Generated-path demotion sits INSIDE the tier, so it only ever
+                // reorders files of equal query relevance: a protobuf stub loses
+                // to the implementation it shadows, never falls behind an
+                // unrelated incidental file, and still ranks first in its tier
+                // when it is the only match. The sort is descending, so real
+                // code must carry the HIGHER value. `find_symbol_matches` and
+                // `find_all_symbols` apply the same signal.
+                let not_generated = u8::from(!is_generated_file(fp));
                 let sym_count = self
                     .nodes
                     .iter()
                     .filter(|n| &n.file_path == fp && n.kind != NodeKind::File)
                     .count();
-                (fp.clone(), (tier, sym_count))
+                (fp.clone(), (tier, not_generated, sym_count))
             })
             .collect();
         self.file_order
@@ -2836,26 +2845,6 @@ fn is_handler_method_name(name: &str) -> bool {
             | "run"
             | "__invoke"
     )
-}
-
-fn is_generated_file(path: &str) -> bool {
-    let p = path;
-    p.ends_with(".pb.go")
-        || p.ends_with(".pulsar.go")
-        || p.ends_with("_grpc.pb.go")
-        || p.ends_with(".g.dart")
-        || p.ends_with(".freezed.dart")
-}
-
-fn is_test_file(path: &str) -> bool {
-    let p = path;
-    p.contains("/test/")
-        || p.contains("/tests/")
-        || p.contains("/__tests__/")
-        || p.contains("/spec/")
-        || p.contains(".test.")
-        || p.contains(".spec.")
-        || p.contains("_test.")
 }
 
 fn is_container(kind: NodeKind) -> bool {
@@ -4751,6 +4740,339 @@ mod tests {
         assert!(is_low_value_file("src/foo.spec.ts"));
         assert!(is_low_value_file("assets/icon.svg"));
         assert!(!is_low_value_file("src/lib.rs"));
+    }
+
+    /// Tier 1 item 1 (upstream #1507) — the MCP-side half of the bidirectional
+    /// disagreement: the CLI's `is_test_file` had `/e2e/` and this one did not,
+    /// so a Playwright/Cypress `e2e/` tree read as production code on every MCP
+    /// path (blast radius, `excludeLowValueFiles`, the indirect-test note).
+    /// After convergence both predicates are the UNION of the two pattern sets.
+    #[test]
+    fn ext_is_test_file_recognizes_an_e2e_directory() {
+        // The MCP-side gap: an `/e2e/` segment, with no `.test.`/`.spec.` help.
+        assert!(
+            is_test_file("e2e/checkout.ts"),
+            "a top-level e2e/ tree is a test tree"
+        );
+        assert!(
+            is_test_file("apps/web/e2e/login.ts"),
+            "a nested e2e/ tree is a test tree"
+        );
+        // And it flows through to `excludeLowValueFiles`, which is what keeps an
+        // e2e tree from crowding out implementations in explore output.
+        assert!(is_low_value_file("e2e/checkout.ts"));
+        // Negative: `e2e` must be a whole path SEGMENT, never a substring.
+        assert!(
+            !is_test_file("src/route2e2e.ts"),
+            "an `e2e` substring inside a filename is not a test tree"
+        );
+    }
+
+    /// Tier 1 item 1, CLI-side half kept in force here too: Go's `_test.go`
+    /// convention (already recognized by this predicate) plus the union's other
+    /// members all classify, so the two predicates agree in BOTH directions.
+    #[test]
+    fn ext_is_test_file_covers_the_full_union() {
+        for path in [
+            "pkg/math_test.go",
+            "src/foo.test.ts",
+            "src/foo.spec.ts",
+            "pkg/__tests__/a.js",
+            "app/test/mod.rs",
+            "app/tests/mod.rs",
+            "app/spec/mod.rb",
+            "e2e/flow.ts",
+        ] {
+            assert!(is_test_file(path), "union member must classify: {path}");
+        }
+        for path in ["src/lib.rs", "src/main.rs", "internal/latest.go"] {
+            assert!(
+                !is_test_file(path),
+                "production file must not classify: {path}"
+            );
+        }
+    }
+
+    /// Tier 1 item 1 through a real MCP-path CONSUMER, not just the predicate:
+    /// `codegraph_explore`'s blast radius splits a symbol's caller files into
+    /// "used by" (production) and "tested via callers" (tests). Pre-fix an
+    /// `e2e/` caller landed in the production list, so the MCP surface claimed
+    /// the symbol had no test coverage.
+    #[test]
+    fn ext_blast_radius_lists_an_e2e_caller_as_a_test() {
+        let mut engine = test_engine();
+        let target = node_lang(
+            "checkout",
+            "checkout",
+            "src/checkout.ts",
+            1,
+            3,
+            NodeKind::Function,
+            Language::TypeScript,
+        );
+        let e2e_caller = node_lang(
+            "checkoutFlow",
+            "checkoutFlow",
+            "e2e/checkout.ts",
+            1,
+            5,
+            NodeKind::Function,
+            Language::TypeScript,
+        );
+        put_indexed_source(
+            &engine,
+            "src/checkout.ts",
+            "export function checkout() {\n  return 1;\n}\n",
+            Language::TypeScript,
+            1,
+        );
+        put_indexed_source(
+            &engine,
+            "e2e/checkout.ts",
+            "import { checkout } from '../src/checkout';\nexport function checkoutFlow() {\n  checkout();\n}\n",
+            Language::TypeScript,
+            1,
+        );
+        put_nodes(&mut engine, &[target.clone(), e2e_caller.clone()]);
+        put_edges(
+            &mut engine,
+            &[mk_edge(
+                &e2e_caller.id,
+                &target.id,
+                codegraph_core::types::EdgeKind::Calls,
+            )],
+        );
+
+        let text = text_of(&engine.execute(
+            "codegraph_explore",
+            &serde_json::json!({"query": "checkout"}),
+        ));
+        let radius = text
+            .lines()
+            .find(|l| l.contains("checkout") && l.contains("e2e/checkout.ts"))
+            .unwrap_or_else(|| panic!("blast radius must mention the e2e caller: {text}"));
+        assert!(
+            radius.contains("tests: `e2e/checkout.ts`"),
+            "an e2e/ caller must be credited as test coverage; got: {radius}"
+        );
+        assert!(
+            !radius.contains("no tests found"),
+            "an e2e/ caller must not leave a no-coverage claim standing; got: {radius}"
+        );
+        assert!(
+            !radius.contains("in `e2e/checkout.ts`"),
+            "an e2e/ caller must not also be listed as a production user; got: {radius}"
+        );
+    }
+
+    /// Tier 1 item 3 (upstream `generated-detection.ts` `GENERATED_PATTERNS`) —
+    /// one assertion group per language family in the ported table. Pre-fix only
+    /// the five Go/Dart protobuf suffixes were recognized, so mockgen output,
+    /// every TS/JS codegen convention, vendored minified bundles, Python
+    /// `_pb2*`, C++/C#/Java protobuf, Swift and in-tree Rust codegen all read as
+    /// hand-written implementations and outranked the real code.
+    #[test]
+    fn ext_is_generated_file_covers_upstream_language_families() {
+        // Go — protobuf / gRPC / pulsar (pre-existing).
+        for p in ["api.pb.go", "api.pulsar.go", "api_grpc.pb.go"] {
+            assert!(is_generated_file(p), "go protobuf: {p}");
+        }
+        // Go — mockgen. Upstream accepts BOTH suffix spellings because projects
+        // rename mockgen output (cosmos-sdk uses `expected_*_mocks.go`).
+        for p in ["store_mock.go", "expected_keepers_mocks.go"] {
+            assert!(is_generated_file(p), "go mockgen: {p}");
+        }
+        // TypeScript / JavaScript codegen (Apollo/GraphQL, Prisma, ts-proto,
+        // gRPC-web, swagger-codegen) — all four `[jt]sx?` spellings.
+        for p in [
+            "schema.generated.ts",
+            "schema.generated.tsx",
+            "schema.generated.js",
+            "schema.generated.jsx",
+            "api.gen.ts",
+            "api.gen.tsx",
+            "api.gen.js",
+            "api.gen.jsx",
+            "svc.pb.ts",
+            "svc.pb.js",
+            "svc_pb.ts",
+            "svc_pb.js",
+            "svc_grpc_pb.ts",
+            "svc_grpc_pb.js",
+        ] {
+            assert!(is_generated_file(p), "ts/js codegen: {p}");
+        }
+        // Vendored minified bundles — single-letter symbols make name edges noise.
+        for p in ["vendor/chart.min.js", "vendor/chart.min.mjs"] {
+            assert!(is_generated_file(p), "minified bundle: {p}");
+        }
+        // Python — protobuf / gRPC.
+        for p in ["svc_pb2.py", "svc_pb2_grpc.py", "svc_pb2.pyi"] {
+            assert!(is_generated_file(p), "python protobuf: {p}");
+        }
+        // C++ — protobuf.
+        for p in ["svc.pb.cc", "svc.pb.h"] {
+            assert!(is_generated_file(p), "c++ protobuf: {p}");
+        }
+        // C# — protobuf / gRPC.
+        for p in ["Model.g.cs", "GreeterGrpc.cs"] {
+            assert!(is_generated_file(p), "c# protobuf: {p}");
+        }
+        // Java — protoc-gen-java / protoc-gen-grpc-java.
+        for p in ["GreeterOuterClass.java", "GreeterGrpc.java"] {
+            assert!(is_generated_file(p), "java protobuf: {p}");
+        }
+        // Swift — protobuf.
+        assert!(is_generated_file("Model.pb.swift"), "swift protobuf");
+        // Dart — build_runner / freezed / protobuf / chopper.
+        for p in [
+            "model.g.dart",
+            "model.freezed.dart",
+            "model.pb.dart",
+            "model.pbgrpc.dart",
+            "api.chopper.dart",
+        ] {
+            assert!(is_generated_file(p), "dart codegen: {p}");
+        }
+        // Rust — in-tree codegen convention.
+        assert!(is_generated_file("src/proto.generated.rs"), "rust codegen");
+
+        // Negatives: hand-written files that merely share a stem.
+        for p in [
+            "main.rs",
+            "src/generator.ts",
+            "src/mocks.go",
+            "src/genesis.go",
+            "src/pb.go",
+            "src/table.js",
+            "docs/min.css",
+        ] {
+            assert!(
+                !is_generated_file(p),
+                "hand-written file must not match: {p}"
+            );
+        }
+    }
+
+    /// Tier 1 item 3, shape detail: upstream anchors mockgen's DEFAULT output as
+    /// `/^mock_[^/]+\.go$/` — a BASENAME rule. A naive `starts_with` on the full
+    /// path would miss every nested occurrence, which is where mocks actually
+    /// live, so the final path segment is what must be tested.
+    #[test]
+    fn ext_is_generated_file_mock_prefix_is_basename_anchored() {
+        assert!(
+            is_generated_file("src/mock_helpers.go"),
+            "nested mockgen default output must match on its basename"
+        );
+        assert!(
+            is_generated_file("mock_store.go"),
+            "repo-root mockgen default output must match"
+        );
+        assert!(
+            !is_generated_file("src/mockery_notgen.go"),
+            "`mock` without the underscore separator is a hand-written file"
+        );
+        assert!(
+            !is_generated_file("mock_store/registry.go"),
+            "a `mock_` DIRECTORY is not a generated file"
+        );
+    }
+
+    /// Tier 1 item 2 — generated-file demotion on the `explore` path. Two
+    /// same-named `ComputePay` definitions, one in a `.pb.go` stub and one in a
+    /// real file whose path sorts LAST alphabetically. `codegraph_node` already
+    /// demoted the stub (`find_symbol_matches`); `explore` did not consult the
+    /// signal at all, so within the same relevance tier the alphabetical
+    /// tie-break put the generated stub's section first.
+    #[test]
+    fn ext_explore_ranks_a_real_implementation_above_a_generated_stub() {
+        let mut engine = test_engine();
+        let generated = node_lang(
+            "ComputePay",
+            "ComputePay",
+            "payroll/a_gen.pb.go",
+            1,
+            3,
+            NodeKind::Function,
+            Language::Go,
+        );
+        let real = node_lang(
+            "ComputePay",
+            "ComputePay",
+            "payroll/zz_real.go",
+            1,
+            3,
+            NodeKind::Function,
+            Language::Go,
+        );
+        put_indexed_source(
+            &engine,
+            "payroll/a_gen.pb.go",
+            "func ComputePay() int {\n\treturn 0\n}\n",
+            Language::Go,
+            1,
+        );
+        put_indexed_source(
+            &engine,
+            "payroll/zz_real.go",
+            "func ComputePay() int {\n\treturn 42\n}\n",
+            Language::Go,
+            1,
+        );
+        put_nodes(&mut engine, &[generated.clone(), real.clone()]);
+
+        let text = text_of(&engine.execute(
+            "codegraph_explore",
+            &serde_json::json!({"query": "ComputePay"}),
+        ));
+        let order: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("#### "))
+            .filter_map(|l| {
+                ["payroll/zz_real.go", "payroll/a_gen.pb.go"]
+                    .into_iter()
+                    .find(|f| l.contains(f))
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec!["payroll/zz_real.go", "payroll/a_gen.pb.go"],
+            "the real implementation's section must precede the generated stub's; got {order:?} in:\n{text}"
+        );
+    }
+
+    /// Tier 1 item 2 NEGATIVE — the demotion is a RANKING hint, never a filter:
+    /// a generated file must stay reachable, and when it is the ONLY definition
+    /// site it still renders.
+    #[test]
+    fn ext_explore_still_renders_a_generated_file_when_it_is_the_only_match() {
+        let mut engine = test_engine();
+        let only = node_lang(
+            "MarshalOnly",
+            "MarshalOnly",
+            "payroll/only_gen.pb.go",
+            1,
+            3,
+            NodeKind::Function,
+            Language::Go,
+        );
+        put_indexed_source(
+            &engine,
+            "payroll/only_gen.pb.go",
+            "func MarshalOnly() int {\n\treturn 0\n}\n",
+            Language::Go,
+            1,
+        );
+        put_nodes(&mut engine, std::slice::from_ref(&only));
+
+        let text = text_of(&engine.execute(
+            "codegraph_explore",
+            &serde_json::json!({"query": "MarshalOnly"}),
+        ));
+        assert!(
+            text.contains("payroll/only_gen.pb.go"),
+            "a generated file must remain reachable when it is the only match: {text}"
+        );
     }
 
     #[test]

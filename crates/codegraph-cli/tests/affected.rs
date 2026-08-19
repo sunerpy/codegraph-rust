@@ -19,6 +19,10 @@ fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/godot_audit")
 }
 
+fn go_fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go_test_convention")
+}
+
 fn copy_tree(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).unwrap();
     for entry in fs::read_dir(src).unwrap() {
@@ -75,9 +79,13 @@ fn cli(args: &[&str]) -> (String, String, bool) {
 }
 
 fn indexed_project(label: &str) -> (TestDir, PathBuf) {
+    indexed_fixture(label, "godot_audit", &fixture())
+}
+
+fn indexed_fixture(label: &str, name: &str, src: &Path) -> (TestDir, PathBuf) {
     let dir = TestDir::new(label);
-    let project = dir.path().join("godot_audit");
-    copy_tree(&fixture(), &project);
+    let project = dir.path().join(name);
+    copy_tree(src, &project);
     let p = project.to_str().unwrap();
     let (out, err, ok) = cli(&["init", p]);
     assert!(ok, "init failed: stdout={out} stderr={err}");
@@ -209,5 +217,74 @@ fn affected_files_superset_of_tests() {
     assert!(
         affected_files.contains(&"main.tscn".to_string()),
         "affectedFiles must also list the non-test dependent main.tscn, got: {affected_files:?}"
+    );
+}
+
+/// Tier 1 item 1 (upstream #1507), end-to-end: Go names its tests `*_test.go`,
+/// so a predicate keyed on `.test.` never classifies one. The dependent WAS
+/// reachable — `affectedFiles` listed `math_test.go` — while `affectedTests`
+/// came back `[]`, i.e. `affected` reported Go's entire test convention as "no
+/// coverage". The same run also pins the repo-root `e2e/` directory, which the
+/// original `contains("/e2e/")` shape missed for want of a leading slash.
+#[test]
+fn affected_classifies_go_test_convention_and_root_e2e_dir() {
+    // Given an indexed Go module where math_test.go calls Add/Double from
+    // math.go, and a repo-root e2e/flow.go calls Double as well.
+    let (_dir, project) = indexed_fixture("go-test-conv", "go_test_convention", &go_fixture());
+    let p = project.to_str().unwrap();
+
+    // When affected runs on the implementation file,
+    let value = affected_json(p, "math.go", &["--depth", "5"]);
+
+    // Then both dependents are reachable (this held before the fix too — the
+    // defect was classification, not traversal),
+    let affected_files = string_array(&value, "affectedFiles");
+    for expected in ["math_test.go", "e2e/flow.go"] {
+        assert!(
+            affected_files.contains(&expected.to_string()),
+            "affectedFiles must list {expected}, got: {affected_files:?}"
+        );
+    }
+
+    // and both are reported as TESTS rather than as production dependents.
+    let affected_tests = string_array(&value, "affectedTests");
+    assert!(
+        affected_tests.contains(&"math_test.go".to_string()),
+        "Go's `_test.go` convention must count as test coverage, got: {affected_tests:?}"
+    );
+    assert!(
+        affected_tests.contains(&"e2e/flow.go".to_string()),
+        "a repo-root e2e/ directory must count as test coverage, got: {affected_tests:?}"
+    );
+
+    // and affectedFiles stays a superset of affectedTests.
+    for test_file in &affected_tests {
+        assert!(
+            affected_files.contains(test_file),
+            "affectedFiles must be a superset of affectedTests; missing {test_file:?} in {affected_files:?}"
+        );
+    }
+}
+
+/// The explicit `--filter` glob keeps overriding the heuristic: under a filter
+/// that matches nothing in the project, `math_test.go` must NOT be classified
+/// as a test even though the widened heuristic would now claim it.
+#[test]
+fn affected_filter_glob_still_overrides_the_heuristic() {
+    let (_dir, project) = indexed_fixture("go-filter", "go_test_convention", &go_fixture());
+    let p = project.to_str().unwrap();
+
+    let value = affected_json(p, "math.go", &["--depth", "5", "--filter", "*_never.go"]);
+
+    let affected_tests = string_array(&value, "affectedTests");
+    assert!(
+        affected_tests.is_empty(),
+        "an explicit --filter that matches nothing must suppress the heuristic, got: {affected_tests:?}"
+    );
+    // Traversal is unaffected: the dependents are still listed.
+    let affected_files = string_array(&value, "affectedFiles");
+    assert!(
+        affected_files.contains(&"math_test.go".to_string()),
+        "a filtered-out test file must remain reachable, got: {affected_files:?}"
     );
 }
