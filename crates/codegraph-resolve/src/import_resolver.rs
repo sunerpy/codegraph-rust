@@ -311,6 +311,37 @@ fn c_cpp_stdlib_headers() -> &'static BTreeSet<&'static str> {
     })
 }
 
+/// Languages using the JS module-specifier grammar, where a bare specifier names
+/// an npm package rather than a project path.
+///
+/// Wider than [`crate::types::ESM_LANGUAGES`] on purpose: that set is about
+/// VISIBILITY (which needs an import-mapping channel), this one is about
+/// SPECIFIER SHAPE, which Astro and ArkTS share even though they have no mapping
+/// channel yet.
+fn is_js_specifier_language(language: Language) -> bool {
+    matches!(
+        language,
+        Language::TypeScript
+            | Language::JavaScript
+            | Language::Tsx
+            | Language::Jsx
+            | Language::Svelte
+            | Language::Vue
+            | Language::Astro
+            | Language::ArkTs
+    )
+}
+
+/// Module-path roots that always name a crate OUTSIDE the repository for a Rust
+/// `use` (#1536).
+///
+/// Keyed on stdlib roots rather than on "the path does not resolve to a file",
+/// because a workspace crate can re-export another crate's modules
+/// (`pub use pupil_core::ports;`), so `crate::ports::X` has no local file and is
+/// nonetheless entirely in-repo. Upstream measured the broader rule deleting 13
+/// real trait implementations.
+const RUST_OUT_OF_REPO_ROOTS: [&str; 4] = ["std", "core", "alloc", "proc_macro"];
+
 /// Check if an import is external (`isExternalImport`, `import-resolver.ts:123-202`).
 fn is_external_import(
     import_path: &str,
@@ -328,10 +359,14 @@ fn is_external_import(
         }
     }
 
-    if matches!(
-        language,
-        Language::TypeScript | Language::JavaScript | Language::Tsx | Language::Jsx
-    ) {
+    // The whole JS specifier family, not just the four bare-TS/JS languages
+    // (#1537/#1536). `extract_import_mappings` already routes Svelte and Vue
+    // through `extract_js_imports`, so an npm specifier in an SFC reached here and
+    // was answered "not external" — which let an out-of-repo supertype bind an
+    // in-repo class. Astro and ArkTS carry the same specifier grammar; they have
+    // no import-mapping channel yet, so for them only import PATH resolution
+    // changes, in the same correct direction.
+    if is_js_specifier_language(language) {
         const NODE_BUILTINS: [&str; 12] = [
             "fs",
             "path",
@@ -940,6 +975,193 @@ fn strip_js_comments(content: &str) -> String {
         i += 1;
     }
     out
+}
+
+/// Bindings a Rust file's `use` declarations introduce, as `(local_name, path)`.
+///
+/// `extract_import_mappings` has no Rust arm, so Rust has no import-mapping
+/// channel at all; this is the narrow one the locality gate needs. Handles nested
+/// groups (`use a::{b, c::d}`), `as` aliases, and `self`; a glob (`use a::*`)
+/// binds no nameable symbol and is skipped rather than guessed at.
+///
+/// Paths are returned verbatim so the caller decides locality — this function has
+/// no notion of in-repo.
+pub fn extract_rust_use_bindings(content: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for raw in content.lines() {
+        let line = raw.trim();
+        let Some(rest) = line
+            .strip_prefix("pub use ")
+            .or_else(|| line.strip_prefix("use "))
+        else {
+            continue;
+        };
+        let body = rest.trim().trim_end_matches(';').trim();
+        if body.is_empty() {
+            continue;
+        }
+        expand_rust_use_tree("", body, &mut out);
+    }
+    out
+}
+
+/// Expand one `use` tree body under `prefix`, appending each `(local_name, path)`.
+fn expand_rust_use_tree(prefix: &str, body: &str, out: &mut Vec<(String, String)>) {
+    let body = body.trim();
+    if body.is_empty() {
+        return;
+    }
+    // A brace group splits into its members, each re-expanded under the prefix
+    // that precedes the brace.
+    if let Some(open) = body.find('{') {
+        let head = body[..open].trim().trim_end_matches("::").trim();
+        let Some(close) = body.rfind('}') else {
+            return;
+        };
+        let inner = &body[open + 1..close];
+        let nested_prefix = join_rust_path(prefix, head);
+        for member in split_top_level_commas(inner) {
+            expand_rust_use_tree(&nested_prefix, &member, out);
+        }
+        return;
+    }
+    if body.ends_with('*') {
+        return;
+    }
+    let (path_part, alias) = match body.split_once(" as ") {
+        Some((path, alias)) => (path.trim(), Some(alias.trim())),
+        None => (body, None),
+    };
+    let full = join_rust_path(prefix, path_part);
+    let last = full.rsplit("::").next().unwrap_or(&full);
+    let local = match alias {
+        Some(alias) => alias.to_string(),
+        None if last == "self" => full
+            .trim_end_matches("::self")
+            .rsplit("::")
+            .next()
+            .unwrap_or("")
+            .to_string(),
+        None => last.to_string(),
+    };
+    if local.is_empty() || local == "self" {
+        return;
+    }
+    out.push((local, full));
+}
+
+fn join_rust_path(prefix: &str, segment: &str) -> String {
+    match (prefix.is_empty(), segment.is_empty()) {
+        (true, _) => segment.to_string(),
+        (false, true) => prefix.to_string(),
+        (false, false) => format!("{prefix}::{segment}"),
+    }
+}
+
+/// Split a `use` group's members on commas that are not inside a nested brace.
+fn split_top_level_commas(inner: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut current = String::new();
+    for ch in inner.chars() {
+        match ch {
+            '{' => {
+                depth += 1;
+                current.push(ch);
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                parts.push(std::mem::take(&mut current));
+            }
+            _ => current.push(ch),
+        }
+    }
+    parts.push(current);
+    parts
+        .into_iter()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+/// Is `reference`'s name bound by an import whose module lives OUTSIDE the
+/// repository? (#1537/#1536)
+///
+/// Such a reference has no in-repo referent, so resolving it to a same-named
+/// project symbol fabricates an edge — and a kind filter cannot catch it, because
+/// the fabricated target is often a legal kind (a `function` for an `imports`
+/// ref, a `type_alias` for a supertype).
+///
+/// Two oracles only, each one its language cannot be wrong about:
+/// - the JS specifier family, via the existing [`is_external_import`], which
+///   already understands tsconfig path aliases and workspace packages; and
+/// - Rust `use`, restricted to [`RUST_OUT_OF_REPO_ROOTS`], with the escape that a
+///   path walking to a real file is local.
+///
+/// Every other language returns `false` and resolves exactly as before: JVM and
+/// Python use dedicated FQN/module matchers rather than `resolve_import_path`, so
+/// there is no oracle here that could be trusted.
+pub fn is_bound_to_out_of_repo_module(
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> bool {
+    let head = reference
+        .reference_name
+        .split(['.', ':'])
+        .next()
+        .unwrap_or(&reference.reference_name);
+    if head.is_empty() {
+        return false;
+    }
+
+    if is_js_specifier_language(reference.language) {
+        return context
+            .get_import_mappings(&reference.file_path, reference.language)
+            .into_iter()
+            .filter(|m| m.local_name == head)
+            .any(|m| is_external_import(&m.source, reference.language, context));
+    }
+
+    if reference.language == Language::Rust {
+        let Some(content) = context.read_file(&reference.file_path) else {
+            return false;
+        };
+        return extract_rust_use_bindings(&content)
+            .into_iter()
+            .filter(|(local, _)| local == head)
+            .any(|(_, path)| rust_use_path_is_out_of_repo(&path, reference, context));
+    }
+
+    false
+}
+
+/// Does a Rust `use` path name a crate outside the repository?
+///
+/// True only for a [`RUST_OUT_OF_REPO_ROOTS`] root, and even then not when the
+/// path walks to a real project file — a project module legitimately named `core`
+/// must keep resolving.
+fn rust_use_path_is_out_of_repo(
+    path: &str,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> bool {
+    let segments: Vec<&str> = path.split("::").filter(|s| !s.is_empty()).collect();
+    let Some(root) = segments.first() else {
+        return false;
+    };
+    if !RUST_OUT_OF_REPO_ROOTS.contains(root) {
+        return false;
+    }
+    if segments.len() >= 2 {
+        let module_segments = &segments[..segments.len() - 1];
+        if resolve_rust_module_file(module_segments, &reference.file_path, context).is_some() {
+            return false;
+        }
+    }
+    true
 }
 
 /// Extract JS/TS cross-file re-exports and explicit local export aliases
@@ -2330,6 +2552,213 @@ mod tests {
             source: source.to_string(),
             is_default: false,
             is_namespace: false,
+        }
+    }
+
+    // ---- Tier 2 item 6: import locality (#1537/#1536) ----------------------
+
+    #[test]
+    fn rust_use_bindings_cover_groups_aliases_and_globs() {
+        let bindings = extract_rust_use_bindings(concat!(
+            "use std::error::Error;\n",
+            "use crate::ports::Sha256Port;\n",
+            "use std::collections::{BTreeMap, HashMap};\n",
+            "use core::fmt::{self, Display as Disp};\n",
+            "pub use crate::api::Public;\n",
+            "use std::io::*;\n",
+        ));
+        let by_local = |local: &str| -> Option<String> {
+            bindings
+                .iter()
+                .find(|(l, _)| l == local)
+                .map(|(_, path)| path.clone())
+        };
+        assert_eq!(by_local("Error").as_deref(), Some("std::error::Error"));
+        assert_eq!(
+            by_local("Sha256Port").as_deref(),
+            Some("crate::ports::Sha256Port")
+        );
+        assert_eq!(
+            by_local("BTreeMap").as_deref(),
+            Some("std::collections::BTreeMap")
+        );
+        assert_eq!(
+            by_local("HashMap").as_deref(),
+            Some("std::collections::HashMap")
+        );
+        // `self` in a group binds the module name; `as` binds the alias.
+        assert_eq!(by_local("fmt").as_deref(), Some("core::fmt::self"));
+        assert_eq!(by_local("Disp").as_deref(), Some("core::fmt::Display"));
+        assert_eq!(by_local("Public").as_deref(), Some("crate::api::Public"));
+        // A glob binds no nameable symbol.
+        assert!(
+            !bindings.iter().any(|(l, _)| l == "*"),
+            "a glob must not produce a binding: {bindings:?}"
+        );
+    }
+
+    #[test]
+    fn stdlib_rooted_use_is_out_of_repo_but_crate_rooted_is_not() {
+        let mut ctx = TestContext {
+            project_root: "/proj".to_string(),
+            ..Default::default()
+        };
+        ctx.file_contents.insert(
+            "src/lib.rs".to_string(),
+            "use std::error::Error;\nuse crate::ports::Sha256Port;\n".to_string(),
+        );
+        ctx.existing_files.insert("src/ports.rs".to_string());
+
+        let out_of_repo = reference("Error", EdgeKind::Implements, "src/lib.rs", Language::Rust);
+        assert!(
+            is_bound_to_out_of_repo_module(&out_of_repo, &ctx),
+            "`use std::error::Error` is out-of-repo"
+        );
+
+        // The C3 falsifier: locality keys on the STDLIB ROOT, not on whether the
+        // module path resolves to a file. A workspace crate can re-export another
+        // crate's modules, so `crate::…` has no local file yet is entirely in-repo
+        // — the broader rule was measured deleting 13 real trait implementations.
+        let in_repo = reference(
+            "Sha256Port",
+            EdgeKind::Implements,
+            "src/lib.rs",
+            Language::Rust,
+        );
+        assert!(
+            !is_bound_to_out_of_repo_module(&in_repo, &ctx),
+            "a crate-rooted `use` must stay local"
+        );
+    }
+
+    #[test]
+    fn reexported_sibling_crate_module_still_resolves() {
+        // The C3 rejection, stated as its own case: `pub use pupil_core::ports;`
+        // means `crate::ports::CacheStore` walks to NO local file, and it must
+        // still count as in-repo.
+        let mut ctx = TestContext {
+            project_root: "/proj".to_string(),
+            ..Default::default()
+        };
+        ctx.file_contents.insert(
+            "src/cache.rs".to_string(),
+            "use crate::ports::CacheStore;\n".to_string(),
+        );
+        let r = reference(
+            "CacheStore",
+            EdgeKind::Implements,
+            "src/cache.rs",
+            Language::Rust,
+        );
+        assert!(
+            !is_bound_to_out_of_repo_module(&r, &ctx),
+            "an unresolvable but crate-rooted module path must not be judged out-of-repo"
+        );
+    }
+
+    #[test]
+    fn project_module_named_core_escapes_the_stdlib_root_rule() {
+        // The escape hatch: a stdlib-named project module that WALKS to a real
+        // file is local, so a repo with its own `core/` keeps resolving.
+        let mut ctx = TestContext {
+            project_root: "/proj".to_string(),
+            ..Default::default()
+        };
+        ctx.file_contents.insert(
+            "src/lib.rs".to_string(),
+            "use core::engine::Engine;\n".to_string(),
+        );
+        // A real module layout: `src/lib.rs` anchors the crate root, and `core`
+        // is a declared module directory, not a bare directory on disk.
+        ctx.existing_files.insert("src/lib.rs".to_string());
+        ctx.existing_files.insert("src/core/mod.rs".to_string());
+        ctx.existing_files.insert("src/core/engine.rs".to_string());
+        let r = reference("Engine", EdgeKind::Implements, "src/lib.rs", Language::Rust);
+        assert!(
+            !is_bound_to_out_of_repo_module(&r, &ctx),
+            "a stdlib-named project module that resolves to a file is local"
+        );
+    }
+
+    #[test]
+    fn npm_specifier_binding_is_out_of_repo_in_every_sfc_language() {
+        for language in [
+            Language::TypeScript,
+            Language::Svelte,
+            Language::Vue,
+            Language::Astro,
+            Language::ArkTs,
+        ] {
+            let mut ctx = TestContext {
+                project_root: "/proj".to_string(),
+                ..Default::default()
+            };
+            ctx.import_mappings.insert(
+                "src/Box.svelte".to_string(),
+                vec![mapping("Serializable", "Serializable", "some-npm-pkg")],
+            );
+            let r = reference(
+                "Serializable",
+                EdgeKind::Implements,
+                "src/Box.svelte",
+                language,
+            );
+            assert!(
+                is_bound_to_out_of_repo_module(&r, &ctx),
+                "an npm specifier must read as out-of-repo in {language:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn relative_specifier_binding_stays_local() {
+        let mut ctx = TestContext {
+            project_root: "/proj".to_string(),
+            ..Default::default()
+        };
+        ctx.import_mappings.insert(
+            "src/box.ts".to_string(),
+            vec![mapping("Shape", "Shape", "./shape")],
+        );
+        let r = reference(
+            "Shape",
+            EdgeKind::Implements,
+            "src/box.ts",
+            Language::TypeScript,
+        );
+        assert!(
+            !is_bound_to_out_of_repo_module(&r, &ctx),
+            "a relative specifier is never out-of-repo"
+        );
+    }
+
+    #[test]
+    fn languages_without_an_oracle_abstain() {
+        // JVM and Python use dedicated FQN/module matchers rather than
+        // `resolve_import_path`, so the locality gate must not claim to know.
+        for language in [
+            Language::Java,
+            Language::Kotlin,
+            Language::Python,
+            Language::Go,
+        ] {
+            let mut ctx = TestContext {
+                project_root: "/proj".to_string(),
+                ..Default::default()
+            };
+            ctx.import_mappings.insert(
+                "src/A.java".to_string(),
+                vec![mapping(
+                    "Serializable",
+                    "Serializable",
+                    "java.io.Serializable",
+                )],
+            );
+            let r = reference("Serializable", EdgeKind::Implements, "src/A.java", language);
+            assert!(
+                !is_bound_to_out_of_repo_module(&r, &ctx),
+                "{language:?} has no trustworthy oracle and must abstain"
+            );
         }
     }
 

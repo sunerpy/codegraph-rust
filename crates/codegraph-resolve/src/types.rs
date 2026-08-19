@@ -6,7 +6,111 @@
 //! [`codegraph_core::types::UnresolvedRef`] row read from the store. We model it
 //! here as [`RefView`] so the two never get confused.
 
-use codegraph_core::types::{EdgeKind, Language, Node, ReferenceSubkind};
+use codegraph_core::types::{EdgeKind, Language, Node, NodeKind, ReferenceSubkind};
+
+/// The ES-module family: the languages where a symbol declared in another file is
+/// visible ONLY through an explicit `import`, and the set
+/// [`crate::import_resolver::extract_import_mappings`] serves through
+/// `extract_js_imports`.
+///
+/// That equivalence is what makes "declared in this file, or imported into it" a
+/// sound visibility oracle here and nowhere else: a package- or namespace-scoped
+/// language (Go, Java, Kotlin, C#, Rust, Scala, Dart) makes a sibling-file type
+/// visible with no import at all, so the same predicate would delete real edges
+/// there.
+pub const ESM_LANGUAGES: [Language; 6] = [
+    Language::TypeScript,
+    Language::Tsx,
+    Language::JavaScript,
+    Language::Jsx,
+    Language::Svelte,
+    Language::Vue,
+];
+
+/// Is `language` in the [`ESM_LANGUAGES`] family?
+pub fn is_esm_language(language: Language) -> bool {
+    ESM_LANGUAGES.contains(&language)
+}
+
+/// Node kinds that DECLARE a name usable as a type.
+///
+/// Two readings, deliberately one list:
+/// - the only legal targets of an `extends`/`implements` reference — a
+///   `property`, `enum_member` or `method` sharing a supertype's name is not a
+///   supertype (#1537/#1536); and
+/// - the same-file declarations that BIND a type name at a call site, which is
+///   what the receiver-type visibility gate reads (#1566). A TS
+///   `namespace Foo {}` binds `Foo` as much as a `class Foo` does, which is why
+///   `Module`/`Namespace` belong here too.
+///
+/// Upstream's set carries 11 kinds including `union`; we have no
+/// `NodeKind::Union` yet, so this is the other 10 and `Union` must join it when
+/// the kind exists.
+pub const TYPE_DECLARING_KINDS: [NodeKind; 10] = [
+    NodeKind::Class,
+    NodeKind::Struct,
+    NodeKind::Interface,
+    NodeKind::Trait,
+    NodeKind::Protocol,
+    NodeKind::Enum,
+    NodeKind::TypeAlias,
+    NodeKind::Component,
+    NodeKind::Module,
+    NodeKind::Namespace,
+];
+
+/// Does `kind` declare a name usable as a type ([`TYPE_DECLARING_KINDS`])?
+pub fn declares_type_name(kind: NodeKind) -> bool {
+    TYPE_DECLARING_KINDS.contains(&kind)
+}
+
+/// Node kinds an `imports` reference may NEVER target.
+///
+/// A member of a type is not importable on its own, so an `imports` reference
+/// landing on one is fabricated: `import * as path from 'node:path'` binding to
+/// some class's `path` property (#1537). Stated as a DENY list rather than an
+/// allow list because the importable set is open-ended — a file, class, function,
+/// constant, variable, type alias and enum are all legitimately importable — while
+/// the members that are not form a small, closed set.
+pub const NON_IMPORTABLE_KINDS: [NodeKind; 5] = [
+    NodeKind::Property,
+    NodeKind::Field,
+    NodeKind::Method,
+    NodeKind::EnumMember,
+    NodeKind::Parameter,
+];
+
+/// Is `kind` a legal target for an `imports` reference?
+pub fn is_importable_kind(kind: NodeKind) -> bool {
+    !NON_IMPORTABLE_KINDS.contains(&kind)
+}
+
+/// Is `kind` an inheritance reference, i.e. one whose target must be a type
+/// ([`TYPE_DECLARING_KINDS`])?
+///
+/// Judged on the reference kind as EXTRACTED. `create_edges` later promotes
+/// `Extends` → `Implements` when the target is an interface/protocol, so an
+/// `Extends` reference must be tested against the supertype set BEFORE that
+/// promotion, not after.
+pub fn is_inheritance_ref(kind: EdgeKind) -> bool {
+    matches!(kind, EdgeKind::Extends | EdgeKind::Implements)
+}
+
+/// May a reference of kind `reference_kind` resolve to a node of kind
+/// `target_kind`? (#1537/#1536)
+///
+/// The two gates of item 6's kind eligibility, in one predicate so the candidate
+/// filter and the resolution seam cannot drift apart. Every other reference kind
+/// is unconstrained here and resolves exactly as before.
+pub fn kind_is_eligible_target(reference_kind: EdgeKind, target_kind: NodeKind) -> bool {
+    if is_inheritance_ref(reference_kind) {
+        return declares_type_name(target_kind);
+    }
+    if reference_kind == EdgeKind::Imports {
+        return is_importable_kind(target_kind);
+    }
+    true
+}
 
 /// An unresolved reference in resolution-ready form.
 ///
@@ -282,6 +386,105 @@ pub struct GoModule {
 mod tests {
     use super::*;
     use codegraph_core::types::{Language, Node, NodeKind};
+
+    #[test]
+    fn all_node_kinds_classified_against_supertype_and_import_sets() {
+        // Every one of the 22 kinds is classified explicitly, so a kind added
+        // later cannot be silently omitted from either gate: the two expected
+        // lists below are exhaustive and the assertion compares whole sets.
+        let type_declaring: Vec<NodeKind> = NodeKind::ALL
+            .into_iter()
+            .filter(|k| declares_type_name(*k))
+            .collect();
+        assert_eq!(
+            type_declaring,
+            vec![
+                NodeKind::Module,
+                NodeKind::Class,
+                NodeKind::Struct,
+                NodeKind::Interface,
+                NodeKind::Trait,
+                NodeKind::Protocol,
+                NodeKind::Enum,
+                NodeKind::TypeAlias,
+                NodeKind::Namespace,
+                NodeKind::Component,
+            ],
+            "10 supertype-eligible kinds — no `Union` yet, which Tier 3 must add"
+        );
+
+        let non_importable: Vec<NodeKind> = NodeKind::ALL
+            .into_iter()
+            .filter(|k| !is_importable_kind(*k))
+            .collect();
+        assert_eq!(
+            non_importable,
+            vec![
+                NodeKind::Method,
+                NodeKind::Property,
+                NodeKind::Field,
+                NodeKind::EnumMember,
+                NodeKind::Parameter,
+            ]
+        );
+
+        assert_eq!(
+            NodeKind::ALL.len(),
+            22,
+            "kind count changed — revisit both sets"
+        );
+    }
+
+    #[test]
+    fn kind_eligibility_gates_only_inheritance_and_imports() {
+        // Inheritance refs demand a type-declaring target.
+        for kind in [EdgeKind::Extends, EdgeKind::Implements] {
+            assert!(is_inheritance_ref(kind));
+            assert!(kind_is_eligible_target(kind, NodeKind::Trait));
+            assert!(kind_is_eligible_target(kind, NodeKind::TypeAlias));
+            assert!(!kind_is_eligible_target(kind, NodeKind::EnumMember));
+            assert!(!kind_is_eligible_target(kind, NodeKind::Function));
+        }
+        // Imports refs deny type members.
+        assert!(kind_is_eligible_target(
+            EdgeKind::Imports,
+            NodeKind::Function
+        ));
+        assert!(kind_is_eligible_target(EdgeKind::Imports, NodeKind::Import));
+        assert!(!kind_is_eligible_target(
+            EdgeKind::Imports,
+            NodeKind::Property
+        ));
+        // Every other reference kind is unconstrained.
+        assert!(!is_inheritance_ref(EdgeKind::Calls));
+        for target in NodeKind::ALL {
+            assert!(kind_is_eligible_target(EdgeKind::Calls, target));
+            assert!(kind_is_eligible_target(EdgeKind::References, target));
+        }
+    }
+
+    #[test]
+    fn esm_language_set_is_the_import_required_family() {
+        for language in ESM_LANGUAGES {
+            assert!(is_esm_language(language), "{language:?}");
+        }
+        // Package/namespace-scoped languages must stay out: a sibling-file type
+        // is visible there with no import, so the visibility oracle would delete
+        // real edges.
+        for language in [
+            Language::Go,
+            Language::Java,
+            Language::Kotlin,
+            Language::CSharp,
+            Language::Rust,
+            Language::Scala,
+            Language::Dart,
+            Language::Python,
+            Language::Cpp,
+        ] {
+            assert!(!is_esm_language(language), "{language:?}");
+        }
+    }
 
     #[test]
     fn resolved_by_as_str_all_variants() {

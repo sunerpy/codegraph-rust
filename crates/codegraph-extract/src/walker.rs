@@ -94,6 +94,57 @@ fn is_literal_receiver(node: SyntaxNode<'_>) -> bool {
     LITERAL_RECEIVER_KINDS.contains(&node.kind())
 }
 
+/// Call-node kinds whose `function` child names a member on a receiver — the
+/// `obj.method` family across the grammars (`member_expression` for TS/JS/ArkTS,
+/// `attribute` for Python, `field_expression` for Go/Rust/C/C++,
+/// `navigation_expression` for Swift/Kotlin, plus C++ `qualified_identifier`).
+const MEMBER_SHAPED_CALLEE_KINDS: [&str; 6] = [
+    "member_expression",
+    "attribute",
+    "selector_expression",
+    "navigation_expression",
+    "field_expression",
+    "qualified_identifier",
+];
+
+fn is_member_shaped_callee(node: SyntaxNode<'_>) -> bool {
+    MEMBER_SHAPED_CALLEE_KINDS.contains(&node.kind())
+}
+
+/// The member segment of a member-shaped node: `property` (TS/JS), `field`
+/// (Go/Rust/C/C++), else the second named child (Python `attribute`, Swift
+/// `navigation_expression`, C++ `qualified_identifier`).
+///
+/// Swift wraps the segment in a `navigation_suffix` whose text carries the
+/// leading `.`, so its `simple_identifier` is unwrapped here (kotlin-ng exposes
+/// identifiers directly, Swift does not — `tree-sitter.ts:2503-2506`).
+fn member_name_of(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
+    let segment = child_by_field(node, "property")
+        .or_else(|| child_by_field(node, "field"))
+        .or_else(|| node.named_child(1))?;
+    if segment.kind() == "navigation_suffix" {
+        return Some(
+            segment
+                .named_children(&mut segment.walk())
+                .find(|c| c.kind() == "simple_identifier")
+                .unwrap_or(segment),
+        );
+    }
+    Some(segment)
+}
+
+/// A receiver segment usable as an `obj.method` receiver: a single bare
+/// identifier that is not a self-reference. Anything else (an index expression,
+/// a call, a whitespace-bearing span) keeps the bare method name, so no new
+/// receiver grammar reaches the name matcher.
+fn is_plain_receiver_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && !matches!(segment, "self" | "this" | "cls" | "super")
+        && segment
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+}
+
 pub struct TreeSitterWalker<'a, 'tree> {
     file_path: &'a str,
     source: &'a str,
@@ -2972,32 +3023,8 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         let mut callee_name = String::new();
         let func = child_by_field(node, "function").or_else(|| node.named_child(0));
         if let Some(func) = func {
-            if matches!(
-                func.kind(),
-                "member_expression"
-                    | "attribute"
-                    | "selector_expression"
-                    | "navigation_expression"
-                    | "field_expression"
-                    | "qualified_identifier"
-            ) {
-                let property = child_by_field(func, "property")
-                    .or_else(|| child_by_field(func, "field"))
-                    .or_else(|| func.named_child(1))
-                    .map(|prop| {
-                        // tree-sitter.ts:2503-2506 — Swift wraps the method
-                        // name in navigation_suffix; unwrap its
-                        // simple_identifier (kotlin-ng exposes identifiers
-                        // directly, Swift does not).
-                        if prop.kind() == "navigation_suffix" {
-                            prop.named_children(&mut prop.walk())
-                                .find(|c| c.kind() == "simple_identifier")
-                                .unwrap_or(prop)
-                        } else {
-                            prop
-                        }
-                    });
-                if let Some(property) = property {
+            if is_member_shaped_callee(func) {
+                if let Some(property) = member_name_of(func) {
                     let method_name = node_text(property, self.source);
                     let receiver = child_by_field(func, "object")
                         .or_else(|| child_by_field(func, "operand"))
@@ -3057,6 +3084,26 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                                 format!("{inner}().{method_name}")
                             } else {
                                 method_name
+                            };
+                        } else if is_member_shaped_callee(receiver) {
+                            // #1496 — a receiver that is itself member-shaped
+                            // (`this.mailer`, `holder.values`, `a.b.c`) keeps its
+                            // LAST segment, so the ref arrives as `obj.method`.
+                            // Dropping it would leave resolution unable to
+                            // separate `this.run()` (self-target correct) from
+                            // `this.mailer.send()` (self-target wrong), and a bare
+                            // `send` then binds to whichever same-named method is
+                            // nearest the call line. One segment, not the full
+                            // chain: that is the receiver grammar the name matcher
+                            // already understands, and the same unwrap
+                            // `extract_object_name_call` performs for
+                            // Java/Kotlin/PHP (`tree-sitter.ts:2641-2651`).
+                            let segment = member_name_of(receiver)
+                                .map(|seg| node_text(seg, self.source))
+                                .filter(|seg| is_plain_receiver_segment(seg));
+                            callee_name = match segment {
+                                Some(segment) => format!("{segment}.{method_name}"),
+                                None => method_name,
                             };
                         } else {
                             callee_name = method_name;
@@ -7325,6 +7372,114 @@ g() ->\n\
         assert!(
             calls.is_empty(),
             "a literal PHP receiver must emit NO call ref, got: {calls:?}"
+        );
+    }
+
+    // ---- Member-expression receiver preservation (#1496) --------------------
+
+    #[test]
+    fn member_receiver_chain_keeps_last_segment() {
+        // `this.mailer.send(m)` must record `mailer.send`, not the bare `send`:
+        // the receiver's LAST segment is what lets resolution reach `Mailer::send`
+        // instead of proximity-picking the enclosing `Outbox::send`.
+        let ts = call_refs(
+            "src/mail.ts",
+            "export class Outbox { send(m: string): void { this.mailer.send(m); } }\n",
+            Language::TypeScript,
+        );
+        assert!(
+            ts.iter().any(|c| c == "mailer.send"),
+            "TS `this.mailer.send(m)` must record `mailer.send`, got: {ts:?}"
+        );
+
+        // A deeper chain keeps only the last receiver segment (`obj.method` is the
+        // shape the name matcher implements; no new receiver grammar is added).
+        let deep = call_refs(
+            "src/deep.ts",
+            "export class C { go(): void { this.a.b.zzDeepMethod(); } }\n",
+            Language::TypeScript,
+        );
+        assert!(
+            deep.iter().any(|c| c == "b.zzDeepMethod"),
+            "a deeper chain must record `b.zzDeepMethod`, got: {deep:?}"
+        );
+
+        // Python `attribute` receiver.
+        let py = call_refs(
+            "src/cache.py",
+            "class C:\n    def get(self, k):\n        return self.store.get(k)\n",
+            Language::Python,
+        );
+        assert!(
+            py.iter().any(|c| c == "store.get"),
+            "Python `self.store.get(k)` must record `store.get`, got: {py:?}"
+        );
+
+        // Go `selector_expression` receiver.
+        let go = call_refs(
+            "src/a.go",
+            "package a\n\nfunc (c *C) Get() { c.inner.Fetch() }\n",
+            Language::Go,
+        );
+        assert!(
+            go.iter().any(|c| c == "inner.Fetch"),
+            "Go `c.inner.Fetch()` must record `inner.Fetch`, got: {go:?}"
+        );
+
+        // Rust `field_expression` receiver.
+        let rs = call_refs(
+            "src/a.rs",
+            "impl C {\n    fn get(&self) { self.inner.fetch(); }\n}\n",
+            Language::Rust,
+        );
+        assert!(
+            rs.iter().any(|c| c == "inner.fetch"),
+            "Rust `self.inner.fetch()` must record `inner.fetch`, got: {rs:?}"
+        );
+
+        // Swift `navigation_expression` receiver.
+        let swift = call_refs(
+            "src/a.swift",
+            "class C {\n    func get() { self.inner.fetch() }\n}\n",
+            Language::Swift,
+        );
+        assert!(
+            swift.iter().any(|c| c == "inner.fetch"),
+            "Swift `self.inner.fetch()` must record `inner.fetch`, got: {swift:?}"
+        );
+    }
+
+    #[test]
+    fn bare_this_receiver_still_skips() {
+        // A `this`/`self` receiver that is the WHOLE receiver keeps the existing
+        // skip semantics — the recursion self-call must stay a bare name, which is
+        // what keeps a legitimate recursion self-edge resolvable.
+        let ts = call_refs(
+            "src/rec.ts",
+            "export class Walker { run(n: number): void { if (n > 0) { this.run(n - 1); } } }\n",
+            Language::TypeScript,
+        );
+        assert!(
+            ts.iter().any(|c| c == "run"),
+            "TS `this.run(n)` must stay the bare `run`, got: {ts:?}"
+        );
+        assert!(
+            !ts.iter().any(|c| c == "this.run"),
+            "TS `this.run(n)` must not keep the `this` receiver, got: {ts:?}"
+        );
+
+        let py = call_refs(
+            "src/rec.py",
+            "class C:\n    def run(self):\n        self.helper()\n",
+            Language::Python,
+        );
+        assert!(
+            py.iter().any(|c| c == "helper"),
+            "Python `self.helper()` must stay the bare `helper`, got: {py:?}"
+        );
+        assert!(
+            !py.iter().any(|c| c == "self.helper"),
+            "Python `self.helper()` must not keep the `self` receiver, got: {py:?}"
         );
     }
 
