@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.43.3](https://github.com/sunerpy/codegraph-rust/compare/v0.43.2...v0.43.3) (2026-08-19)
+
+
+### Bug Fixes
+
+* **resolve:** stop binding calls, imports and supertypes to coincidences ([#211](https://github.com/sunerpy/codegraph-rust/issues/211)) ([b9daa8d](https://github.com/sunerpy/codegraph-rust/commit/b9daa8dc56e56dce453001cd4715743f60cae271))
+
 ## [0.43.2](https://github.com/sunerpy/codegraph-rust/compare/v0.43.1...v0.43.2) (2026-08-19)
 
 
