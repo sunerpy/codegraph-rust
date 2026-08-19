@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.43.2](https://github.com/sunerpy/codegraph-rust/compare/v0.43.1...v0.43.2) (2026-08-19)
+
+
+### Bug Fixes
+
+* **rank:** share one file-classification signal across every surface ([#209](https://github.com/sunerpy/codegraph-rust/issues/209)) ([87dc548](https://github.com/sunerpy/codegraph-rust/commit/87dc548417b0d71512a08405acfd4d0a3a119f8b))
+
 ## [0.43.1](https://github.com/sunerpy/codegraph-rust/compare/v0.43.0...v0.43.1) (2026-08-16)
 
 
