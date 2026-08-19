@@ -5,7 +5,10 @@
 //! cross-language family gate — mirror the upstream exactly. Every strategy cites its
 //! upstream source range.
 
-use crate::types::{RefView, ResolutionContext, ResolvedBy, ResolvedRef};
+use crate::types::{
+    RefView, ResolutionContext, ResolvedBy, ResolvedRef, declares_type_name, is_esm_language,
+    kind_is_eligible_target,
+};
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use regex::Regex;
 use std::sync::OnceLock;
@@ -255,7 +258,7 @@ pub fn match_by_exact_name(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> Option<ResolvedRef> {
-    let candidates: Vec<Node> = apply_language_gate(
+    let reachable: Vec<Node> = apply_language_gate(
         context.get_nodes_by_name(&reference.reference_name),
         reference,
     )
@@ -264,11 +267,29 @@ pub fn match_by_exact_name(
     .filter(|n| is_lexically_reachable(n, reference, context))
     .collect();
 
+    // A same-named non-type is not a supertype, and a type member is not
+    // importable (#1537/#1536). Filtering BEFORE ranking — not just refusing the
+    // winner afterwards — is what lets a legitimate supertype OUTRANK a
+    // same-named enum member instead of the whole reference being dropped.
+    let candidates: Vec<Node> = reachable
+        .iter()
+        .filter(|n| kind_is_eligible_target(reference.reference_kind, n.kind))
+        .cloned()
+        .collect();
+
     if candidates.is_empty() {
         return None;
     }
 
-    if candidates.len() == 1 {
+    // Branch on the PRE-FILTER count. The single-candidate shortcut skips
+    // `find_best_match`, and with it the cross-language penalty that makes a
+    // genuinely ambiguous reference decline — so letting the kind filter collapse
+    // a multi-candidate set into that shortcut would CREATE an edge the scored
+    // path refused (a GDScript `extends Node` binding a Rust `struct Node` once
+    // its same-named enum-member rival was filtered out). These gates only ever
+    // remove an edge, so the ranking branch is chosen by how ambiguous the
+    // reference actually was, and only the CANDIDATES are narrowed.
+    if reachable.len() == 1 {
         let is_cross_language = candidates[0].language != reference.language;
         return Some(ResolvedRef {
             original: reference.clone(),
@@ -976,6 +997,135 @@ fn infer_local_receiver_type(
     None
 }
 
+/// Span end of `node`, falling back to its start when `end_line` was not
+/// recorded — the same convention [`enclosing_scope_start_line`] applies.
+fn span_end_line(node: &Node) -> i64 {
+    if node.end_line != 0 {
+        node.end_line
+    } else {
+        node.start_line
+    }
+}
+
+/// Second chance for a receiver that is a CLASS FIELD rather than a local
+/// (#1566, ESM only).
+///
+/// [`enclosing_scope_start_line`] bounds the backward scan to the enclosing
+/// FUNCTION or METHOD, so a field declared above a method is structurally
+/// unreachable from a call inside it. This reads the field's OWN declaration
+/// line instead: the tightest enclosing class-like node spanning the call, then
+/// its `Property`/`Field` member of the receiver's name, then the existing
+/// [`local_receiver_type_patterns`] applied to that single line.
+///
+/// Deliberately a bounded NODE lookup, not a widened scan window. The window
+/// scan takes the nearest match ABOVE the call, so a class-wide window would
+/// prefer a sibling method's `const conn = new Wrong()` over the field —
+/// precisely the cross-method leak [`enclosing_scope_start_line`] exists to
+/// prevent. Reading one line that lies outside every method body cannot leak.
+///
+/// Only ever turns inference `None` into `Some`: the caller reaches this after
+/// the function-scope scan already declined, so no currently-succeeding
+/// inference can change. The recovered type is still subject to
+/// [`is_receiver_type_bound_at_call_site`], so an unbound one (a built-in
+/// `Map`) is refused rather than resolved.
+fn infer_class_field_receiver_type(
+    receiver_name: &str,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<String> {
+    if !is_esm_language(reference.language) {
+        return None;
+    }
+    let escaped = regex_escape(receiver_name);
+    let patterns = local_receiver_type_patterns_tagged(reference.language, &escaped);
+    if patterns.is_empty() {
+        return None;
+    }
+
+    let in_file = context.get_nodes_in_file(&reference.file_path);
+    let enclosing = in_file
+        .iter()
+        .filter(|n| {
+            matches!(
+                n.kind,
+                NodeKind::Class | NodeKind::Struct | NodeKind::Interface
+            ) && n.language == reference.language
+                && n.start_line <= reference.line
+                && span_end_line(n) >= reference.line
+        })
+        .max_by_key(|n| n.start_line)?;
+
+    let want = format!("{}::{}", enclosing.qualified_name, receiver_name);
+    let field = in_file.iter().find(|n| {
+        matches!(n.kind, NodeKind::Property | NodeKind::Field)
+            && n.name == receiver_name
+            && n.qualified_name == want
+            && n.language == reference.language
+    })?;
+
+    let source = context.read_file(&reference.file_path)?;
+    let line = source
+        .split('\n')
+        .nth((field.start_line - 1).max(0) as usize)?
+        .trim_end_matches('\r');
+    if line.len() > 10_000 {
+        return None;
+    }
+    for (re, is_lua_annotation) in &patterns {
+        if let Some(caps) = re.captures(line) {
+            if let Some(m) = caps.get(1) {
+                if *is_lua_annotation && lua_annotation_is_method_call(line, m.end()) {
+                    continue;
+                }
+                if let Some(ty) = normalize_inferred_type_name(m.as_str()) {
+                    return Some(ty);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Is the inferred receiver type `type_name` BOUND at the call site (#1566)?
+///
+/// A built-in receiver (`new Map<string, string>()`) normalizes to a bare type
+/// name that some unrelated project file may also declare. Resolving a method on
+/// it then fabricates an edge — and does so through a SUCCESSFUL typed path when
+/// that file happens to declare a same-named method, so refusing only after
+/// typed resolution FAILS would miss the worst case.
+///
+/// Two indexed reads answer the question for the [`ESM_LANGUAGES`] family, where
+/// cross-file visibility requires an explicit import:
+/// 1. a same-file declaration that binds the name ([`declares_type_name`]), or
+/// 2. an import mapping whose `local_name` is that name.
+///
+/// Reading the IMPORTING file's `local_name` means a barrel `export *` chain
+/// needs no specifier resolution. Existence is deliberately NOT the test: a
+/// project `class Map` in an unimported file exists and must still not hijack.
+///
+/// Known limit: a type made global by an ambient `.d.ts` declaration and used
+/// without an import reads as unbound and is refused. That yields a MISSING
+/// edge, not a false one.
+///
+/// [`ESM_LANGUAGES`]: crate::types::ESM_LANGUAGES
+fn is_receiver_type_bound_at_call_site(
+    type_name: &str,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> bool {
+    if context
+        .get_nodes_in_file(&reference.file_path)
+        .iter()
+        .any(|n| n.name == type_name && declares_type_name(n.kind))
+    {
+        return true;
+    }
+    context
+        .get_import_mappings(&reference.file_path, reference.language)
+        .iter()
+        .any(|m| m.local_name == type_name)
+}
+
 /// True when a Lua/Luau `receiver:Capitalized` annotation match is really a
 /// method call (`lg:Log()`, `lg:Log"s"`, `lg:Log{t}`, or a longer `lg:Log.More`
 /// token the annotation regex stopped short of), which must NOT be read as a type
@@ -1215,9 +1365,22 @@ pub fn match_method_call(
         let inferred = if reference.language == Language::Cpp {
             infer_cpp_receiver_type(&object_or_class, reference, context, 0)
         } else {
+            // The field lookup runs ONLY where the function-scope scan declined,
+            // so it can add an inference but never change one (#1566, ESM only).
             infer_local_receiver_type(&object_or_class, reference, context)
+                .or_else(|| infer_class_field_receiver_type(&object_or_class, reference, context))
         };
         if let Some(inferred) = inferred {
+            // #1566 — an inferred type the call site cannot SEE is not this
+            // project's type: a built-in `Map` must never resolve onto a
+            // same-named project class. Refuse before typed resolution runs, and
+            // before Strategies 1/2/3 below, because the hijack arrives via a
+            // typed-resolution SUCCESS as readily as via its failure.
+            if is_esm_language(reference.language)
+                && !is_receiver_type_bound_at_call_site(&inferred, reference, context)
+            {
+                return None;
+            }
             // Java/Kotlin: the file's import pins WHICH same-named class (#314);
             // other languages disambiguate by call-site file in resolve_method_on_type.
             let imported_fqn = if matches!(reference.language, Language::Java | Language::Kotlin) {
@@ -2374,6 +2537,24 @@ mod tests {
         }
         fn import(mut self, path: &str, mappings: Vec<ImportMapping>) -> Self {
             self.imports.insert(path.to_string(), mappings);
+            self
+        }
+        /// Declare `type_name` imported into `path`, ADDING to any mappings the
+        /// file already has. A real ESM file that names a type from another file
+        /// carries this import statement; the mock reports none unless a test
+        /// wires one, so a receiver-type fixture needs it to be BOUND at its call
+        /// site (#1566).
+        fn imports_type(mut self, path: &str, type_name: &str) -> Self {
+            self.imports
+                .entry(path.to_string())
+                .or_default()
+                .push(ImportMapping {
+                    local_name: type_name.to_string(),
+                    exported_name: type_name.to_string(),
+                    source: "./dep".to_string(),
+                    is_default: false,
+                    is_namespace: false,
+                });
             self
         }
     }
@@ -4923,6 +5104,11 @@ mod tests {
 
     /// Build a ctx whose file `path` has `source`, plus an enclosing function
     /// spanning the whole file (so the scope bound includes the call line).
+    ///
+    /// `method`'s qualified name names the type the receiver is expected to infer
+    /// to (`Logger::log` → `Logger`), so that type is also declared imported into
+    /// `path` — the binding a real ESM call site carries and the mock otherwise
+    /// lacks (#1566).
     fn ctx_with_scope(
         path: &str,
         source: &str,
@@ -4940,10 +5126,18 @@ mod tests {
         );
         fn_node.start_line = 1;
         fn_node.end_line = source.split('\n').count() as i64 + 1;
-        Ctx::default()
+        let owner = method
+            .qualified_name
+            .rsplit_once("::")
+            .map(|(owner, _)| owner.to_string());
+        let ctx = Ctx::default()
             .file(path, source)
             .nodes_in_file(path, vec![fn_node])
-            .name(method_name, vec![method])
+            .name(method_name, vec![method]);
+        match owner {
+            Some(owner) => ctx.imports_type(path, &owner),
+            None => ctx,
+        }
     }
 
     #[test]
@@ -6418,5 +6612,706 @@ mod tests {
                 .target_node_id,
             "function:emit"
         );
+    }
+
+    // ---- Tier 2 item 4: dotted receiver refs vs the file-path strategy ------
+
+    #[test]
+    fn dotted_receiver_ref_is_not_treated_as_a_file_path() {
+        // `has_short_extension("mailer.send")` is TRUE (a 4-char alphanumeric
+        // tail), so item 4's rewritten refs now reach `match_by_file_path` first.
+        // It must still decline: the lookup key is the WHOLE dotted name, which
+        // no file node carries — a decoy `send` file node must not be adopted.
+        let decoy = mk(
+            "file:send",
+            NodeKind::File,
+            "send",
+            "src/send.ts",
+            "src/send.ts",
+            Language::TypeScript,
+        );
+        let ctx = Ctx::default()
+            .name("send", vec![decoy.clone()])
+            .name("mailer.send", vec![]);
+        let r = refv(
+            "mailer.send",
+            EdgeKind::Calls,
+            "src/mail.ts",
+            Language::TypeScript,
+            4,
+        );
+        assert!(
+            match_by_file_path(&r, &ctx).is_none(),
+            "a dotted receiver ref must not resolve as a file path"
+        );
+
+        // End to end through `match_reference`: the same ref resolves by the
+        // method strategies, never with `ResolvedBy::FilePath`.
+        let mailer = mk(
+            "class:mailer",
+            NodeKind::Class,
+            "Mailer",
+            "Mailer",
+            "src/mail.ts",
+            Language::TypeScript,
+        );
+        let send = mk(
+            "method:send",
+            NodeKind::Method,
+            "send",
+            "Mailer::send",
+            "src/mail.ts",
+            Language::TypeScript,
+        );
+        let full = Ctx::default()
+            .name("send", vec![decoy, send.clone()])
+            .name("Mailer", vec![mailer])
+            .nodes_in_file("src/mail.ts", vec![send]);
+        let resolved = match_reference(&r, &full).expect("dotted receiver still resolves");
+        assert_ne!(
+            resolved.resolved_by,
+            ResolvedBy::FilePath,
+            "a dotted receiver ref must not be resolved by the file-path strategy"
+        );
+        assert_eq!(resolved.target_node_id, "method:send");
+    }
+
+    // ---- Tier 2 item 5: inferred-type visibility at the call site (#1566) ---
+
+    /// A file declaring `class Map { <method> }` plus a lone project method of
+    /// that name, and a local `const m = new Map(); m.<method>()` in
+    /// `main.ts`. `bind_in_main` controls whether `Map` is visible at the call
+    /// site (same-file declaration), which is exactly what the gate reads.
+    fn builtin_hijack_ctx(method: &str, owner: &str, bind_in_main: bool) -> Ctx {
+        let map_class = mk(
+            "class:map",
+            NodeKind::Class,
+            "Map",
+            "Map",
+            "src/other.ts",
+            Language::TypeScript,
+        );
+        let target = mk(
+            "method:target",
+            NodeKind::Method,
+            method,
+            &format!("{owner}::{method}"),
+            "src/other.ts",
+            Language::TypeScript,
+        );
+        let mut caller = mk(
+            "function:useBuiltin",
+            NodeKind::Function,
+            "useBuiltin",
+            "useBuiltin",
+            "src/main.ts",
+            Language::TypeScript,
+        );
+        caller.start_line = 1;
+        caller.end_line = 4;
+        let mut in_main = vec![caller];
+        if bind_in_main {
+            let mut shadow = map_class.clone();
+            shadow.id = "class:map-main".to_string();
+            shadow.file_path = "src/main.ts".to_string();
+            in_main.push(shadow);
+        }
+        Ctx::default()
+            .file(
+                "src/main.ts",
+                "function useBuiltin() {\n  const m = new Map<string, string>();\n  m.MEMBER();\n}\n",
+            )
+            .nodes_in_file("src/main.ts", in_main)
+            .name("Map", vec![map_class])
+            .name(method, vec![target])
+    }
+
+    fn builtin_hijack_ref(method: &str) -> RefView {
+        refv(
+            &format!("m.{method}"),
+            EdgeKind::Calls,
+            "src/main.ts",
+            Language::TypeScript,
+            3,
+        )
+    }
+
+    #[test]
+    fn unimported_project_class_does_not_hijack_builtin() {
+        // Given a built-in `Map` in main.ts and an UNIMPORTED project
+        // `class Map { get() }` in other.ts,
+        // When the call `m.get("a")` resolves,
+        // Then nothing binds — today the TYPED path SUCCEEDS at 0.9 on a flatly
+        // wrong edge, which is why the gate must sit before typed resolution.
+        let ctx = builtin_hijack_ctx("get", "Map", false);
+        let landed = match_method_call(&builtin_hijack_ref("get"), &ctx);
+        assert!(
+            landed.is_none(),
+            "an unbound inferred type must not resolve its method, got: {:?}",
+            landed.map(|r| (r.target_node_id, r.resolved_by, r.confidence))
+        );
+    }
+
+    #[test]
+    fn unimported_project_class_without_the_method_does_not_fall_through() {
+        // The mirror: the unimported project `Map` has no `get`, so typed
+        // resolution FAILS and Strategy 3 would adopt a unique `Decoy::get`
+        // at 0.7. The gate refuses before either runs.
+        let ctx = builtin_hijack_ctx("get", "Decoy", false);
+        let landed = match_method_call(&builtin_hijack_ref("get"), &ctx);
+        assert!(
+            landed.is_none(),
+            "an unbound inferred type must not fall through to Strategy 3, got: {:?}",
+            landed.map(|r| (r.target_node_id, r.resolved_by, r.confidence))
+        );
+    }
+
+    #[test]
+    fn same_file_project_map_still_resolves() {
+        // V5 — a project `class Map` declared in the CALLING file shadows the
+        // built-in, so the receiver type IS bound and the edge must be kept.
+        let ctx = builtin_hijack_ctx("get", "Map", true);
+        let res =
+            match_method_call(&builtin_hijack_ref("get"), &ctx).expect("same-file Map is bound");
+        assert_eq!(res.target_node_id, "method:target");
+        assert_eq!(res.resolved_by, ResolvedBy::InstanceMethod);
+        assert!((res.confidence - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn imported_project_map_still_resolves() {
+        // V1 — a named import binds `Map` at the call site.
+        let ctx = builtin_hijack_ctx("get", "Map", false).import(
+            "src/main.ts",
+            vec![ImportMapping {
+                local_name: "Map".to_string(),
+                exported_name: "Map".to_string(),
+                source: "./other".to_string(),
+                is_default: false,
+                is_namespace: false,
+            }],
+        );
+        let res =
+            match_method_call(&builtin_hijack_ref("get"), &ctx).expect("imported Map is bound");
+        assert_eq!(res.target_node_id, "method:target");
+        assert!((res.confidence - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn barrel_imported_project_map_still_resolves() {
+        // V4 — a barrel re-export. The predicate reads the IMPORTING file's
+        // `local_name`, so it never has to resolve the specifier.
+        let ctx = builtin_hijack_ctx("get", "Map", false).import(
+            "src/main.ts",
+            vec![ImportMapping {
+                local_name: "Map".to_string(),
+                exported_name: "Map".to_string(),
+                source: "./barrel".to_string(),
+                is_default: false,
+                is_namespace: false,
+            }],
+        );
+        let res = match_method_call(&builtin_hijack_ref("get"), &ctx).expect("barrel Map is bound");
+        assert_eq!(res.target_node_id, "method:target");
+        assert!((res.confidence - 0.9).abs() < 1e-9);
+    }
+
+    /// C1/C2 — a receiver typed to a same-file PROJECT class `Real`.
+    /// `Real::poke` exists; `absentOnReal` does not, but a unique `Decoy` has it.
+    fn project_typed_receiver_ctx() -> Ctx {
+        let real = mk(
+            "class:real",
+            NodeKind::Class,
+            "Real",
+            "Real",
+            "src/main.ts",
+            Language::TypeScript,
+        );
+        let poke = mk(
+            "method:poke",
+            NodeKind::Method,
+            "poke",
+            "Real::poke",
+            "src/main.ts",
+            Language::TypeScript,
+        );
+        let absent = mk(
+            "method:absent",
+            NodeKind::Method,
+            "absentOnReal",
+            "Decoy::absentOnReal",
+            "src/decoy.ts",
+            Language::TypeScript,
+        );
+        let mut caller = mk(
+            "function:use",
+            NodeKind::Function,
+            "use",
+            "use",
+            "src/main.ts",
+            Language::TypeScript,
+        );
+        caller.start_line = 1;
+        caller.end_line = 4;
+        Ctx::default()
+            .file(
+                "src/main.ts",
+                "function use() {\n  const r = new Real();\n  r.poke();\n}\n",
+            )
+            .nodes_in_file("src/main.ts", vec![real.clone(), poke.clone(), caller])
+            .name("Real", vec![real])
+            .name("poke", vec![poke])
+            .name("absentOnReal", vec![absent])
+    }
+
+    #[test]
+    fn project_typed_receiver_still_resolves() {
+        // C1 — the inferred `Real` is declared in this file, so it is bound and
+        // typed resolution proceeds exactly as today.
+        let ctx = project_typed_receiver_ctx();
+        let r = refv(
+            "r.poke",
+            EdgeKind::Calls,
+            "src/main.ts",
+            Language::TypeScript,
+            3,
+        );
+        let res = match_method_call(&r, &ctx).expect("project-typed receiver resolves");
+        assert_eq!(res.target_node_id, "method:poke");
+        assert!((res.confidence - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn absent_method_on_project_type_still_falls_through() {
+        // C2 — the type is BOUND but lacks the method, so Strategy 3's guess is
+        // reached unchanged. The gate keys on binding, not on method existence.
+        let ctx = project_typed_receiver_ctx();
+        let r = refv(
+            "r.absentOnReal",
+            EdgeKind::Calls,
+            "src/main.ts",
+            Language::TypeScript,
+            3,
+        );
+        let res = match_method_call(&r, &ctx).expect("bound type still falls through");
+        assert_eq!(res.target_node_id, "method:absent");
+        assert!((res.confidence - 0.7).abs() < 1e-9);
+    }
+
+    #[test]
+    fn go_same_package_receiver_still_resolves() {
+        // V3 — Go makes a same-package type in ANOTHER file visible with no
+        // import statement at all, so "bound = same-file or imported"
+        // under-approximates there. The ESM-only scope is what keeps this edge.
+        let thing = mk(
+            "struct:thing",
+            NodeKind::Struct,
+            "Thing",
+            "Thing",
+            "b.go",
+            Language::Go,
+        );
+        let ping = mk(
+            "method:ping",
+            NodeKind::Method,
+            "Ping",
+            "Thing::Ping",
+            "b.go",
+            Language::Go,
+        );
+        let mut caller = mk(
+            "function:run",
+            NodeKind::Function,
+            "run",
+            "run",
+            "a.go",
+            Language::Go,
+        );
+        caller.start_line = 1;
+        caller.end_line = 4;
+        let ctx = Ctx::default()
+            .file("a.go", "func run() {\n\tvar t Thing\n\tt.Ping()\n}\n")
+            .nodes_in_file("a.go", vec![caller])
+            .name("Thing", vec![thing])
+            .name("Ping", vec![ping]);
+        let r = refv("t.Ping", EdgeKind::Calls, "a.go", Language::Go, 3);
+        let res = match_method_call(&r, &ctx).expect("go same-package receiver resolves");
+        assert_eq!(res.target_node_id, "method:ping");
+        assert!((res.confidence - 0.9).abs() < 1e-9);
+    }
+
+    // ---- Tier 2 item 5: class-field receiver inference (§2.2b) --------------
+
+    /// A class whose FIELD is initialized to a project class, with the call in a
+    /// later method — the shape item 4's rewrite produces and that the
+    /// function-scope backward scan structurally cannot reach. `with_wrong` adds a
+    /// competing `Wrong::doThing`; without it the name is unique project-wide and
+    /// Strategy 3 takes its single-candidate shortcut instead of overlap scoring.
+    fn class_field_receiver_ctx(
+        source: &str,
+        field_line: i64,
+        sibling: Option<Node>,
+        with_wrong: bool,
+    ) -> Ctx {
+        let mut holder = mk(
+            "class:c",
+            NodeKind::Class,
+            "C",
+            "C",
+            "src/main.ts",
+            Language::TypeScript,
+        );
+        holder.start_line = 1;
+        holder.end_line = source.split('\n').count() as i64;
+        let mut field = mk(
+            "property:conn",
+            NodeKind::Property,
+            "conn",
+            "C::conn",
+            "src/main.ts",
+            Language::TypeScript,
+        );
+        field.start_line = field_line;
+        field.end_line = field_line;
+        let right = mk(
+            "class:right",
+            NodeKind::Class,
+            "Right",
+            "Right",
+            "src/dep.ts",
+            Language::TypeScript,
+        );
+        let do_thing = mk(
+            "method:right-doThing",
+            NodeKind::Method,
+            "doThing",
+            "Right::doThing",
+            "src/dep.ts",
+            Language::TypeScript,
+        );
+        let mut members = vec![holder, field];
+        if let Some(sibling) = sibling {
+            members.push(sibling);
+        }
+        let wrong = mk(
+            "class:wrong",
+            NodeKind::Class,
+            "Wrong",
+            "Wrong",
+            "src/dep.ts",
+            Language::TypeScript,
+        );
+        let mut do_thing_targets = vec![do_thing.clone()];
+        if with_wrong {
+            do_thing_targets.push(mk(
+                "method:wrong-doThing",
+                NodeKind::Method,
+                "doThing",
+                "Wrong::doThing",
+                "src/dep.ts",
+                Language::TypeScript,
+            ));
+        }
+        // BOTH types are bound at the call site. Binding `Wrong` too is what makes
+        // the no-leak control meaningful: were inference to reach a sibling
+        // method's `new Wrong()`, the visibility gate would PERMIT it, so the
+        // assertion — not the gate — is what catches the leak.
+        Ctx::default()
+            .file("src/main.ts", source)
+            .nodes_in_file("src/main.ts", members)
+            .nodes_in_file("src/dep.ts", vec![do_thing, right.clone()])
+            .name("Right", vec![right])
+            .name("Wrong", vec![wrong])
+            .name("doThing", do_thing_targets)
+            .imports_type("src/main.ts", "Right")
+            .imports_type("src/main.ts", "Wrong")
+    }
+
+    #[test]
+    fn class_field_project_receiver_resolves_by_type() {
+        // Given `private conn = new Right()` as a class FIELD and
+        // `conn.doThing()` inside a method,
+        // When resolution runs,
+        // Then the edge comes from TYPED resolution at 0.9, not a Strategy 3
+        // guess at 0.7 — asserting the confidence is what proves inference ran.
+        let source = concat!(
+            "export class C {\n",
+            "  private conn = new Right();\n",
+            "\n",
+            "  second(): void {\n",
+            "    this.conn.doThing();\n",
+            "  }\n",
+            "}\n",
+        );
+        let mut second = mk(
+            "method:second",
+            NodeKind::Method,
+            "second",
+            "C::second",
+            "src/main.ts",
+            Language::TypeScript,
+        );
+        second.start_line = 4;
+        second.end_line = 6;
+        let ctx = class_field_receiver_ctx(source, 2, Some(second), false);
+        let r = refv(
+            "conn.doThing",
+            EdgeKind::Calls,
+            "src/main.ts",
+            Language::TypeScript,
+            5,
+        );
+        let res = match_method_call(&r, &ctx).expect("class-field receiver resolves");
+        assert_eq!(res.target_node_id, "method:right-doThing");
+        assert_eq!(res.resolved_by, ResolvedBy::InstanceMethod);
+        assert!(
+            (res.confidence - 0.9).abs() < 1e-9,
+            "must be typed resolution (0.9), not a Strategy 3 guess: {}",
+            res.confidence
+        );
+    }
+
+    #[test]
+    fn class_field_inference_does_not_leak_sibling_method_local() {
+        // The falsifier for the rejected widened-window design: the backward
+        // scan takes the NEAREST match ABOVE the call, so a class-wide window
+        // scanned back from line 12 would hit the sibling method's
+        // `const conn = new Wrong()` at line 7 and infer `Wrong`. Reading only
+        // the field node's OWN line cannot leak, because it never looks at a
+        // line inside any method body.
+        let source = concat!(
+            "export class C {\n",
+            "  private conn = new Right();\n",
+            "\n",
+            "  first(): void {\n",
+            "    const conn = new Wrong();\n",
+            "    conn.doThing();\n",
+            "  }\n",
+            "\n",
+            "  second(): void {\n",
+            "    this.conn.doThing();\n",
+            "  }\n",
+            "}\n",
+        );
+        let mut second = mk(
+            "method:second",
+            NodeKind::Method,
+            "second",
+            "C::second",
+            "src/main.ts",
+            Language::TypeScript,
+        );
+        second.start_line = 9;
+        second.end_line = 11;
+        let ctx = class_field_receiver_ctx(source, 2, Some(second), true);
+        let r = refv(
+            "conn.doThing",
+            EdgeKind::Calls,
+            "src/main.ts",
+            Language::TypeScript,
+            10,
+        );
+        // Asserted as a pure NEGATIVE so it holds both before the fix (where the
+        // ref resolves to nothing) and after (where it reaches `Right::doThing`).
+        let landed = match_method_call(&r, &ctx).map(|res| res.target_node_id);
+        assert_ne!(
+            landed.as_deref(),
+            Some("method:wrong-doThing"),
+            "field inference must not read a sibling method's local declaration"
+        );
+    }
+
+    // ---- Tier 2 item 6: kind eligibility (#1537/#1536) ---------------------
+
+    #[test]
+    fn import_does_not_bind_a_type_member() {
+        // `import * as path from 'node:path'` must not bind to some class's
+        // `path` PROPERTY — a type member is not importable on its own.
+        let prop = mk(
+            "property:path",
+            NodeKind::Property,
+            "path",
+            "Request::path",
+            "src/types.ts",
+            Language::TypeScript,
+        );
+        let ctx = Ctx::default().name("path", vec![prop]);
+        let r = refv(
+            "path",
+            EdgeKind::Imports,
+            "src/run.ts",
+            Language::TypeScript,
+            1,
+        );
+        let landed = match_by_exact_name(&r, &ctx);
+        assert!(
+            landed.is_none(),
+            "an imports ref must not bind a property, got: {:?}",
+            landed.map(|res| res.target_node_id)
+        );
+    }
+
+    #[test]
+    fn import_does_not_bind_a_same_named_function() {
+        // 6f — a `function` IS an importable kind, so the kind gate permits it
+        // and only import LOCALITY can refuse: `node:path` lives outside the
+        // repository, so no in-repo `path` is its referent. Both halves are
+        // asserted here so neither gate alone satisfies the test.
+        let helper = mk(
+            "function:path",
+            NodeKind::Function,
+            "path",
+            "path",
+            "src/helpers.ts",
+            Language::TypeScript,
+        );
+        assert!(
+            crate::types::is_importable_kind(NodeKind::Function),
+            "a function is importable — this case needs the locality gate, not the kind gate"
+        );
+        let ctx = Ctx::default().name("path", vec![helper]);
+        let r = refv(
+            "path",
+            EdgeKind::Imports,
+            "src/run.ts",
+            Language::TypeScript,
+            1,
+        );
+        // Locality is decided in the resolver over the file's import mappings, so
+        // the end-to-end refusal is asserted by the `esm_import` fixture test.
+        // Here the kind gate must at least NOT be what refuses it.
+        assert!(
+            match_by_exact_name(&r, &ctx).is_some(),
+            "the kind gate must permit an importable kind; locality owns this refusal"
+        );
+    }
+
+    #[test]
+    fn out_of_repo_supertype_does_not_bind_enum_member() {
+        // 6b — `impl Error for MapperError` where `std::error::Error` is
+        // out-of-repo must not bind the enum's own `Error` VARIANT.
+        let member = mk(
+            "enum_member:Error",
+            NodeKind::EnumMember,
+            "Error",
+            "MapperError::Error",
+            "src/lib.rs",
+            Language::Rust,
+        );
+        let ctx = Ctx::default().name("Error", vec![member]);
+        let r = refv(
+            "Error",
+            EdgeKind::Implements,
+            "src/lib.rs",
+            Language::Rust,
+            8,
+        );
+        let landed = match_by_exact_name(&r, &ctx);
+        assert!(
+            landed.is_none(),
+            "an implements ref must not bind an enum member, got: {:?}",
+            landed.map(|res| res.target_node_id)
+        );
+    }
+
+    #[test]
+    fn in_repo_trait_still_implements() {
+        // 6d control — a real in-repo trait target must keep its edge, and the
+        // pre-ranking filter is what lets it OUTRANK a same-named enum member
+        // rather than merely surviving.
+        let member = mk(
+            "enum_member:Error",
+            NodeKind::EnumMember,
+            "Error",
+            "MapperError::Error",
+            "src/lib.rs",
+            Language::Rust,
+        );
+        let trait_node = mk(
+            "trait:Error",
+            NodeKind::Trait,
+            "Error",
+            "Error",
+            "src/ports.rs",
+            Language::Rust,
+        );
+        let ctx = Ctx::default().name("Error", vec![member, trait_node]);
+        let r = refv(
+            "Error",
+            EdgeKind::Implements,
+            "src/lib.rs",
+            Language::Rust,
+            8,
+        );
+        let res = match_by_exact_name(&r, &ctx).expect("in-repo trait still resolves");
+        assert_eq!(
+            res.target_node_id, "trait:Error",
+            "the legal supertype must outrank the same-named enum member"
+        );
+    }
+
+    #[test]
+    fn kind_filter_does_not_reach_the_single_candidate_shortcut() {
+        // Measured on this repo: a GDScript `extends Node` had two same-named
+        // rivals — an `enum_member Node` and a cross-language Rust `struct Node` —
+        // and `find_best_match` correctly declined both (the −80 cross-language
+        // penalty sinks every score below the −1.0 floor). Filtering the enum
+        // member out must NOT hand the survivor to the single-candidate shortcut,
+        // which skips that penalty and would fabricate the edge the scored path
+        // refused. These gates only ever remove an edge.
+        let member = mk(
+            "enum_member:Node",
+            NodeKind::EnumMember,
+            "Node",
+            "Command::Node",
+            "src/main.rs",
+            Language::Rust,
+        );
+        let strukt = mk(
+            "struct:Node",
+            NodeKind::Struct,
+            "Node",
+            "Node",
+            "src/types.rs",
+            Language::Rust,
+        );
+        let ctx = Ctx::default().name("Node", vec![member, strukt]);
+        let r = refv(
+            "Node",
+            EdgeKind::Extends,
+            "fixtures/godot/effect_manager.gd",
+            Language::Gdscript,
+            1,
+        );
+        let landed = match_by_exact_name(&r, &ctx);
+        assert!(
+            landed.is_none(),
+            "a cross-language ambiguous supertype must stay unresolved, got: {:?}",
+            landed.map(|res| (res.target_node_id, res.confidence))
+        );
+    }
+
+    #[test]
+    fn class_implements_object_type_alias() {
+        // Gate 1's `TypeAlias` allowance is pinned as KEPT, not merely permitted:
+        // a TS class implementing an object type alias is a real edge.
+        let alias = mk(
+            "type_alias:Shape",
+            NodeKind::TypeAlias,
+            "Shape",
+            "Shape",
+            "src/shape.ts",
+            Language::TypeScript,
+        );
+        let ctx = Ctx::default().name("Shape", vec![alias]);
+        let r = refv(
+            "Shape",
+            EdgeKind::Implements,
+            "src/box.ts",
+            Language::TypeScript,
+            2,
+        );
+        let res = match_by_exact_name(&r, &ctx).expect("type alias is a legal supertype");
+        assert_eq!(res.target_node_id, "type_alias:Shape");
     }
 }

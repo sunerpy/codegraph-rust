@@ -19,9 +19,12 @@ docs/upstream-sync/V1_5_COMMIT_MANIFEST.md
 reference/
 
 # Test input fixtures are parsed by the extractors; reformatting changes the
-# extraction output and breaks golden parity.
+# extraction output and breaks golden parity. The tier2 fixtures additionally
+# assert on exact LINE NUMBERS (a self-edge is only distinguishable from a
+# correct edge by start_line), so reflowing them breaks those assertions.
 crates/codegraph-bench/fixtures/
 crates/codegraph-extract/tests/fixtures/
+crates/codegraph-resolve/tests/fixtures/
 
 # Embedded verbatim into the MCP tools/list response and byte-compared against
 # golden; reformatting breaks the MCP golden test.

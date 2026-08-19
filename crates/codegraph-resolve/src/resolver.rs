@@ -8,7 +8,9 @@
 //! follow-ups — see `KNOWN_DIFFS.md`. Resolution is synchronous (rusqlite).
 
 use crate::framework::FrameworkResolver;
-use crate::import_resolver::{is_php_include_path_ref, resolve_jvm_import, resolve_via_import};
+use crate::import_resolver::{
+    is_bound_to_out_of_repo_module, is_php_include_path_ref, resolve_jvm_import, resolve_via_import,
+};
 use crate::name_matcher::{
     crosses_known_family, is_php_property_receiver_shape, is_python_class_function_ref_target,
     match_dotted_call_chain, match_function_ref, match_method_call, match_reference,
@@ -970,6 +972,82 @@ impl ReferenceResolver {
     /// `known_names` is set once in `warm_caches` and only read, and the
     /// `framework_resolver_extensions` are read-only.
     pub(crate) fn resolve_one_pure(
+        &self,
+        reference: &RefView,
+        context: &dyn ResolutionContext,
+    ) -> (Option<ResolvedRef>, Option<DeferredIntent>) {
+        let (resolved, deferred) = self.resolve_one_pure_inner(reference, context);
+        let resolved = self.gate_target_kind(resolved, reference, context);
+        let resolved = self.gate_import_locality(resolved, reference, context);
+        (resolved, deferred)
+    }
+
+    /// Drop a result whose reference name is bound by an import from OUTSIDE the
+    /// repository (#1537/#1536).
+    ///
+    /// Kind eligibility and locality are two independent gates and both are
+    /// needed: a kind filter alone RELOCATES the false edge onto a same-named node
+    /// of a legal kind (an out-of-repo supertype moving from an `enum_member` to a
+    /// sibling `type_alias`), and an out-of-repo `imports` ref binds a `function`,
+    /// which is importable.
+    ///
+    /// Scoped to the three reference kinds item 6 owns. A `calls` or `references`
+    /// ref through an external import is a wider claim with its own measurement,
+    /// not made here.
+    fn gate_import_locality(
+        &self,
+        result: Option<ResolvedRef>,
+        reference: &RefView,
+        context: &dyn ResolutionContext,
+    ) -> Option<ResolvedRef> {
+        let result = result?;
+        if !crate::types::is_inheritance_ref(reference.reference_kind)
+            && reference.reference_kind != EdgeKind::Imports
+        {
+            return Some(result);
+        }
+        if is_bound_to_out_of_repo_module(reference, context) {
+            return None;
+        }
+        Some(result)
+    }
+
+    /// Drop a result whose target kind the reference kind forbids (#1537/#1536):
+    /// an `extends`/`implements` target that declares no type, or an `imports`
+    /// target that is a type member.
+    ///
+    /// Applied at the single seam every strategy returns through — framework,
+    /// import, name-match, fuzzy and chain alike — so no strategy can produce such
+    /// an edge by a route the candidate filter in `match_by_exact_name` does not
+    /// see. Judged on the reference kind as extracted, BEFORE `create_edges`
+    /// promotes `Extends` → `Implements`.
+    ///
+    /// One-way: it only ever removes an edge, and the dropped reference stays in
+    /// `unresolved_refs` as failed — the honest record for a supertype the
+    /// repository does not contain.
+    fn gate_target_kind(
+        &self,
+        result: Option<ResolvedRef>,
+        reference: &RefView,
+        context: &dyn ResolutionContext,
+    ) -> Option<ResolvedRef> {
+        let result = result?;
+        if !crate::types::is_inheritance_ref(reference.reference_kind)
+            && reference.reference_kind != EdgeKind::Imports
+        {
+            return Some(result);
+        }
+        let Some(target) = context.get_node_by_id(&result.target_node_id) else {
+            return Some(result);
+        };
+        if crate::types::kind_is_eligible_target(reference.reference_kind, target.kind) {
+            Some(result)
+        } else {
+            None
+        }
+    }
+
+    fn resolve_one_pure_inner(
         &self,
         reference: &RefView,
         context: &dyn ResolutionContext,
@@ -2197,6 +2275,27 @@ mod tests {
     }
 
     #[test]
+    fn esm_chained_call_is_never_deferred_as_chain_ref() {
+        // The receiver-type visibility gate (#1566) installs at ONE site,
+        // `match_reference` → `match_method_call`. The #750 conformance pass
+        // reaches `match_method_call` on its PHP branch only, and a ref can only
+        // reach that pass by being deferred as a `ChainRef` — which requires
+        // `is_chain_language`. No ESM language is in it, so gating that pass would
+        // be dead code. Pinned here so adding a language cannot silently
+        // invalidate the premise.
+        for language in crate::types::ESM_LANGUAGES {
+            assert!(
+                !is_chain_language(language),
+                "{language:?} must not defer as a ChainRef, or item 5 needs a second gate site"
+            );
+        }
+        // The languages that DO defer, so this is a discriminating assertion
+        // rather than a vacuous one.
+        assert!(is_chain_language(Language::Java));
+        assert!(is_chain_language(Language::Rust));
+    }
+
+    #[test]
     fn to_ref_view_and_back_roundtrip() {
         let stored = UnresolvedRef {
             id: Some(7),
@@ -2447,6 +2546,67 @@ mod tests {
         assert_eq!(edges.len(), 2);
         assert!(edges.iter().any(|e| e.kind == EdgeKind::Implements));
         assert!(edges.iter().any(|e| e.kind == EdgeKind::Instantiates));
+    }
+
+    #[test]
+    fn extends_ref_judged_before_implements_promotion() {
+        // `create_edges` promotes `Extends` → `Implements` when the target is an
+        // interface, so the kind gate must judge the reference kind as EXTRACTED.
+        // Reading the post-promotion kind would test the wrong thing entirely.
+        let mut store = Store::open(&temp_db("promote-order")).expect("open");
+        let iface = mk_node("interface:I", NodeKind::Interface, "I", "a.ts");
+        let member = mk_node("enum_member:I", NodeKind::EnumMember, "I", "a.ts");
+        let cls = mk_node("class:C", NodeKind::Class, "C", "a.ts");
+        store
+            .upsert_nodes(&[iface.clone(), member.clone(), cls.clone()])
+            .expect("upsert");
+        let resolver = ReferenceResolver::new("/root");
+        let context = crate::context::StoreResolutionContext::new(&store, "/root");
+
+        let extends_ref = RefView {
+            row_id: None,
+            from_node_id: cls.id.clone(),
+            reference_name: "I".to_string(),
+            reference_kind: EdgeKind::Extends,
+            line: 1,
+            column: 0,
+            file_path: "a.ts".to_string(),
+            language: Language::TypeScript,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+        let to_member = ResolvedRef {
+            original: extends_ref.clone(),
+            target_node_id: member.id.clone(),
+            confidence: 0.9,
+            resolved_by: ResolvedBy::ExactMatch,
+        };
+        let to_iface = ResolvedRef {
+            original: extends_ref,
+            target_node_id: iface.id.clone(),
+            confidence: 0.9,
+            resolved_by: ResolvedBy::ExactMatch,
+        };
+
+        assert!(
+            resolver
+                .gate_target_kind(Some(to_member.clone()), &to_member.original, &context)
+                .is_none(),
+            "an Extends ref must be judged against the supertype set, and an enum member fails it"
+        );
+        assert!(
+            resolver
+                .gate_target_kind(Some(to_iface.clone()), &to_iface.original, &context)
+                .is_some(),
+            "an interface target passes the supertype set and only THEN promotes"
+        );
+        let edges = resolver.create_edges(&[to_iface], &store);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(
+            edges[0].kind,
+            EdgeKind::Implements,
+            "promotion still happens after the gate"
+        );
     }
 
     #[test]
