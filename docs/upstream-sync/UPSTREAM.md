@@ -14,8 +14,8 @@
   CLOSEOUT entry)
 - **This project version:** see `Cargo.toml` (`codegraph-rs`, independent line)
 - **Last sync:** `2026-08-20` — the post-`v1.5.0` **unreleased** range (104 commits
-  on upstream `main` past the `v1.5.0` tag) was triaged and four tiers shipped
-  across `v0.43.2` → `v0.45.0`; see the 2026-08-20 entry. Tracked parity stays
+  on upstream `main` past the `v1.5.0` tag) was triaged and five tiers shipped
+  across `v0.43.2` → `v0.46.0`; see the 2026-08-20 entry. Tracked parity stays
   `1.5.0` — none of these releases is a port of an upstream *release* range, and
   upstream's newest tag is still `v1.5.0`
 - **Next sync starts here:** `git ls-remote --tags` alone is not enough. Diff
@@ -73,7 +73,7 @@
 
 ## Sync log
 
-### 2026-08-20 — post-`v1.5.0` unreleased range TRIAGED, four tiers SHIPPED (`v0.43.2` → `v0.45.0`; tracked parity stays `1.5.0`)
+### 2026-08-20 — post-`v1.5.0` unreleased range TRIAGED, five tiers SHIPPED (`v0.43.2` → `v0.46.0`; tracked parity stays `1.5.0`)
 
 `git ls-remote --tags` still reports `v1.5.0` as upstream's newest tag, so a
 version-delta sync had nothing to pull. But `main` had accumulated **104
@@ -95,6 +95,7 @@ port of an upstream *release* range.
 | `v0.44.0` | #213 | unions, unit structs and COM `interface` as containers | PR #1516, #1513/PR #1514, #1519 |
 | `v0.44.1` | #215 | imported members, cross-module Go calls, declaration initializers | #1518, #1521, #1510/PR #1511, #1524, #1512, #1504, #671 |
 | `v0.45.0` | #217 | Tauri commands bound to their `invoke` call sites | #1543 |
+| `v0.46.0` | #220 | generated files detected by their content banner | #1500, `57e0854` |
 
 `v0.43.2` also carried `h2` 0.4.16 for **RUSTSEC-2026-0258** — unrelated to the
 sync, but it is why that release exists at that moment: the advisory published
@@ -156,10 +157,17 @@ unification) and a byte-stable golden corpus.
 
 #### Still open from this range
 
-The `explore` budget/selection epic (CG-38/36/30/28/26/31) and content-header
-generated detection (#1500's `files.generated` column) are planned and reviewed
-but not yet shipped. The 26 DEFER items and the permanently-N/A `0682137`
-recorded in earlier entries are unchanged.
+The `explore` budget/selection epic (CG-38/36/30/28/26/31) is planned and under
+review but not yet shipped. Its review surfaced a defect worth recording ahead of
+the port: `engine.rs`'s whole-file rule returns a complete section before any
+budget or focus logic exists, and its line and character thresholds are
+independent — so a 63-line file over the character cap falls through to
+clustering and can be rejected whole, which makes an explicitly named symbol
+render as **615 bytes with zero sections**. That is the same empty answer CG-38
+exists to prevent, reached by a path a clustering-only fix would not cover.
+
+The 26 DEFER items and the permanently-N/A `0682137` recorded in earlier entries
+are unchanged.
 
 ### 2026-08-04 — the two open triaged issues SHIPPED, plus two project-local fixes (`v0.42.5` → `v0.42.8`; tracked parity stays `1.5.0`)
 
