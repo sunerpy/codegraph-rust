@@ -112,6 +112,52 @@ behaviors are active:
 Full Godot static-analysis scope, static-vs-runtime boundary, and honesty signals:
 [`docs/godot.md`](docs/godot.md).
 
+## Tauri IPC resolver (`codegraph-resolve`)
+
+The `TauriResolver` is the second concrete `FrameworkResolver` impl. It bridges the
+IPC boundary a `#[tauri::command]` opens: `extract()` emits one
+`tauri:invoke:<wire-name>` `Calls` reference per literal-argument `invoke('name')`
+call site in a JS-family file, and `resolve()` binds it to the command function.
+Registered **LAST** in `detect_frameworks` so the existing four resolvers' Strategy-1
+iteration order is unchanged. `confidence` is 0.9 at its single return site, so it
+short-circuits before the name matcher. File:
+`crates/codegraph-resolve/src/frameworks/tauri.rs`.
+
+- **Determinism rule.** An edge is built only when EXACTLY ONE command claims the
+  wire name. The roster is a `BTreeMap<String, Option<Node>>` keyed by both the
+  snake name and its `tauri-specta` camelCase spelling, and a key claimed by a
+  second, DIFFERENT target is permanently poisoned (`None`) — 0 or ≥2 candidates
+  produce no edge. The "different target id" clause is what keeps a single-word
+  command, whose camel spelling equals its wire name, from poisoning itself. This
+  rule is the ONLY protection that exists: `Language::Rust` has no language family,
+  so the cross-family gates are inert for a Rust target, and `Calls` bypasses them
+  regardless.
+- **Both text scans are lexically masked, and dropping either one is a defect.**
+  `rust_code_mask` gates the roster — BOTH the `#[tauri::command]` token and the
+  `fn <name>` that follows it, skipping masked bytes and further attributes in
+  between (a whole-span gate fails closed on the legal attribute / doc-comment /
+  attribute / `fn` interleaving) — plus a token boundary after `command`, because
+  `#[tauri::commandant]` is entirely ordinary code and the mask cannot reject it.
+  Without those, a commented-out or raw-string copy of the attribute promotes the
+  real UNATTRIBUTED same-named function: measured on the adversarial fixture, six
+  fabricated edges where the correct answer is one, since every masked copy mints
+  no node and the same-file/same-name join therefore has exactly one candidate and
+  it is the wrong one. `js_code_mask` plus a no-receiver guard gates the call side;
+  without its regex state, `/invoke('save_config')/` — a legal regex literal the
+  base extractor records nothing for — becomes a fabricated edge to a real command.
+  The same Rust mask also gates detection probe 4, without which THIS repository
+  self-detects as a Tauri project off the literal in its own source.
+- **Known limitations, deliberate.** References are FILE-granular
+  (`from_node_id = file:<relpath>`), so `codegraph callers get_mcp_port` answers
+  with `src/app.ts` rather than the enclosing function; reconstructing that id is
+  unsafe here because TypeScript has many declaration forms and an object-literal
+  call site has no enclosing function node at all. `invoke(cmdName)`,
+  ``invoke(`cmd_${id}`)`` and `client.invoke('x')` emit nothing, with no dynamic
+  sentinel — Tauri has no `codegraph audit`-style consumer that would read one.
+  `generate_handler![…]` is NOT parsed, so an attributed-but-unregistered command
+  still gets an edge (asserted deliberately). Events (`listen`/`once`) and the typed
+  `commands.getMcpPort()` binding path are out of scope.
+
 ## MCP protocol surface (`codegraph-mcp`, rmcp 3.0.1)
 
 `codegraph-mcp` builds on **rmcp 3.0.1** (`crates/codegraph-mcp/Cargo.toml`, dep and dev-dep;
