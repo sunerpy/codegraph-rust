@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.44.1](https://github.com/sunerpy/codegraph-rust/compare/v0.44.0...v0.44.1) (2026-08-20)
+
+
+### Bug Fixes
+
+* **resolve:** bind imported members, cross-module Go calls and initializers ([#215](https://github.com/sunerpy/codegraph-rust/issues/215)) ([ffb97d1](https://github.com/sunerpy/codegraph-rust/commit/ffb97d188db749fd7f6f2c85335b7530de6f4071))
+
 ## [0.44.0](https://github.com/sunerpy/codegraph-rust/compare/v0.43.3...v0.44.0) (2026-08-20)
 
 
