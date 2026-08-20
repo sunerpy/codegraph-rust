@@ -1947,6 +1947,7 @@ fn is_static_member_container(kind: NodeKind) -> bool {
         kind,
         NodeKind::Class
             | NodeKind::Struct
+            | NodeKind::Union
             | NodeKind::Interface
             | NodeKind::Enum
             | NodeKind::Trait
@@ -2213,6 +2214,7 @@ fn resolve_rust_path_reference(
                 n.kind,
                 NodeKind::Function
                     | NodeKind::Struct
+                    | NodeKind::Union
                     | NodeKind::Enum
                     | NodeKind::Trait
                     | NodeKind::TypeAlias

@@ -35,6 +35,15 @@ pub trait LanguageSpec: Sync {
     fn interface_types(&self) -> &'static [&'static str];
     fn struct_types(&self) -> &'static [&'static str];
     fn enum_types(&self) -> &'static [&'static str];
+
+    /// Node types extracted as [`NodeKind::Union`] through the shared aggregate
+    /// path. Empty by default: only C, C++, ObjC (`union_specifier`) and Rust
+    /// (`union_item`) have a union declaration. TypeScript's `A | B` is
+    /// deliberately NOT here — it stays a `type_alias`, as upstream PR #1516
+    /// decided.
+    fn union_types(&self) -> &'static [&'static str] {
+        &[]
+    }
     fn enum_member_types(&self) -> &'static [&'static str];
     fn type_alias_types(&self) -> &'static [&'static str];
     fn import_types(&self) -> &'static [&'static str];
@@ -88,6 +97,16 @@ pub trait LanguageSpec: Sync {
     }
 
     fn methods_are_top_level(&self) -> bool {
+        false
+    }
+
+    /// A bodiless `struct NAME;` is a COMPLETE definition, not a forward
+    /// declaration. Opt-in, because the default is the C-shaped rule: in
+    /// C/C++/ObjC `struct Foo;` really is a forward declaration and must stay
+    /// unindexed (`c_bodiless_forward_struct_is_skipped`). Rust has no forward
+    /// declarations, so the unit form is always a definition
+    /// (upstream #1513/PR #1514).
+    fn allow_bodiless_struct(&self) -> bool {
         false
     }
 

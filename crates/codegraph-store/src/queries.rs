@@ -1706,6 +1706,7 @@ fn parse_node_kind(value: String) -> rusqlite::Result<NodeKind> {
         "export" => NodeKind::Export,
         "route" => NodeKind::Route,
         "component" => NodeKind::Component,
+        "union" => NodeKind::Union,
         _ => return Err(enum_error(value, "node kind")),
     };
     Ok(kind)
@@ -1980,6 +1981,24 @@ mod tests {
             store.file_by_path("src/lib.rs").unwrap(),
             Some(file("src/lib.rs"))
         );
+    }
+
+    #[test]
+    fn union_node_round_trips_kind_through_sqlite() {
+        // `parse_node_kind` is a string match with a rejecting `_` arm, so a new
+        // NodeKind that extraction can WRITE but this cannot READ fails only at
+        // runtime, with `unknown node kind: union`. The extractor never round-trips
+        // through SQLite, so no extraction test can catch that.
+        let mut store = store("union-round-trip");
+        store.upsert_file(&file("src/bits.rs")).unwrap();
+        let mut inserted = node("union:bits", "Bits", "src/bits.rs");
+        inserted.kind = NodeKind::Union;
+
+        store.upsert_nodes(std::slice::from_ref(&inserted)).unwrap();
+
+        let read_back = store.node_by_id("union:bits").unwrap();
+        assert_eq!(read_back, Some(inserted.clone()));
+        assert_eq!(read_back.unwrap().kind, NodeKind::Union);
     }
 
     #[test]

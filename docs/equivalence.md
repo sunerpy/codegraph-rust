@@ -422,10 +422,74 @@ A further file exercises the Batch B explicit-operator gain (upstream #1268):
   `instance-method` at confidence 0.9 (`Vec2::operator+` twice,
   `Vec2::operator[]`, `Vec2::get`).
 
+Seven further files exercise the Tier 3 aggregate work — MSVC COM `interface`
+(upstream #1519) and first-class `union` nodes (upstream PR #1516). **This corpus
+is the C-FAMILY corpus, not a strictly-C++ one**: it already held a `.c` file, and
+Tier 3 adds a `.mm` file whose extension maps to the ObjC spec, so `cpp/` names the
+family rather than the dialect.
+
+- **MSVC COM `interface` positives** — `com_interface.hpp` carries `struct SControl`
+  as the control plus three `interface` shapes (`IWidget : IBase` with a base clause,
+  `IPlain` without one, and `INewlineBrace` with the brace on the next line). The
+  keyword is not C++, so tree-sitter reads each as a `function_definition`: the
+  container became a `function`, its member `Run` a free `function` instead of a
+  `method`, and the base clause vanished. The offset-preserving pre-parse rewrites
+  the line-leading keyword to `struct` + 3 spaces (9 bytes → 9 bytes, so every line
+  and column is unchanged), and the golden now pins all three as `struct` with
+  `IWidget::Run` a `method` and TWO `extends IBase` refs. `int interface_count = 0;`
+  is the mid-line negative in the same file.
+- **MSVC COM `interface` negatives** — `neg_interface.hpp` holds the five shapes the
+  guard must DECLINE, and pins them by extraction-INVARIANCE rather than by "the
+  substitution did not fire": a block comment containing `interface INegComment;`, a
+  C++/CLI `interface class`, an `interface struct`, a raw string containing a full
+  `interface INegGhost {…};` declaration, and a `#define` continuation line carrying
+  `interface INegMacro`. The golden pins exactly THREE nodes, the sharpest value
+  being `INegCli`'s `docstring` — the verbatim `interface INegComment;`. A
+  comment-blind substitution rewrites that string to `struct    INegComment;`, which
+  is how a leaking guard is caught. `INegCli`/`INegStructKw` staying `function` is
+  pre-existing garbage from the C++/CLI misparse and is deliberately preserved.
+- **C union** — `union_agg.c` (the second `.c` file, so the C walker is under test)
+  covers `union Named` plus both `typedef union` RE-KINDS (`AnonU` and `NamedU` were
+  `type_alias` before and are `union` now — node ids change), with `struct Ctl` /
+  `AnonS` as controls and three negatives: `union Fwd;` (bodiless forward
+  declaration, stays unindexed, `struct FwdS;` as its control) and
+  `union { int q; } anon_var;` (anonymous, mints nothing, as the anonymous struct
+  already did). `typedef union NamedTag { … } NamedU;` mints exactly ONE node named
+  `NamedU`; the tag never becomes a node.
+- **C++ union member method** — `union_agg.cpp` gives `union WithMethod` and
+  `struct SWithMethod` a SAME-NAMED `read_field`, plus one call on each receiver.
+  Before the fix the union's member leaked to file scope as a free `function`, so
+  `w.read_field()` bound `SWithMethod::read_field` — a FALSE edge to the wrong type,
+  not merely a missing one. The golden pins each call on its own receiver's member,
+  so receiver type has to decide.
+- **ObjC union** — `union_agg.mm` is the repo's ONLY Objective-C fixture (`.mm` maps
+  to the ObjC spec). It pins `union ObjcU` beside `struct ObjcS`.
+- **`Calls` → `Instantiates` promotion** — `instantiate_agg.cpp` has `Reg r = Reg();`
+  where the union is the only node of that name (measured pre-fix: a DANGLING `calls
+Reg` ref, because no union node existed to bind), with `Ctl c = Ctl();` as the
+  control. The golden pins `instantiates mk_union -> union:Reg` and NO surviving
+  `calls` edge.
+- **`Instantiates` candidate ranking** — `instantiate_rank.cpp` has `Value v{1};`
+  competing against a same-named `void Value()`. Measured pre-fix it bound
+  `function:Value`, the WRONG target; the golden pins the union winning, with
+  `Packet p{2};` as the control. Kept in a SEPARATE file from the promotion case on
+  purpose: one file mixing both mechanisms would make either revert-proof ambiguous.
+
+**Why the union/struct members are named `read_field` and not `get`.** `get` is the
+only duplicated symbol name in this corpus already (`operators.cpp:5` `Vec2::get`
+and `template_method.cpp:12` `Box::get`), and one of those carries a live
+2-candidate `calls` edge. Naming the new members `get` would take that candidate set
+to four and put an existing, unrelated golden edge at risk of re-pointing — drift in
+files this change has no business touching. `read_field` keeps the property that
+matters (two same-named members inside the new file, so receiver type must
+disambiguate) and drops the one that only adds risk.
+
 The minimal source corpus lives at `crates/codegraph-bench/fixtures/cpp/`
-(`attr_macro.c`, `base.hpp`, `derived.cpp`, `namespaced.cpp`,
-`namespaced_member.cpp`, `namespaced_member.hpp`, `operators.cpp`,
-`template_method.cpp`, `templated_call.cpp`, `ue_actor.h`). The inheritance base
+(`attr_macro.c`, `base.hpp`, `com_interface.hpp`, `derived.cpp`,
+`instantiate_agg.cpp`, `instantiate_rank.cpp`, `namespaced.cpp`,
+`namespaced_member.cpp`, `namespaced_member.hpp`, `neg_interface.hpp`,
+`operators.cpp`, `template_method.cpp`, `templated_call.cpp`, `ue_actor.h`,
+`union_agg.c`, `union_agg.cpp`, `union_agg.mm` — 17 files). The inheritance base
 classes live in a `.hpp` file (not `.h`,
 which maps to `Language::C` by extension); `ue_actor.h` deliberately uses `.h` to
 guard the content-based C++ reclassification, and `attr_macro.c` uses `.c` so the
@@ -455,6 +519,54 @@ Like the Ruby fixture, both the index and the dump are byte-stable, and the
 `generated_golden_matches_committed_cpp_fixture` and
 `cpp_db_is_self_equivalent_to_cpp_golden` tests in
 `crates/codegraph-bench/tests/equivalence.rs` enforce it.
+
+### Rust fixture
+
+`reference/golden/rust/` guards the two Tier 3 items that need Rust source, which
+no other corpus could reach — before it there was no `.rs` file anywhere under
+`crates/codegraph-bench/fixtures/`:
+
+- **unit structs are indexed** (upstream #1513 / PR #1514) — `lib.rs` declares
+  `struct UnitStruct;` beside `BraceStruct { … }` and `TupleStruct(u8)`, and gives
+  all three an `impl Greet for`. A bodiless `struct NAME;` is a COMPLETE definition
+  in Rust, not a forward declaration, so before the fix the unit struct produced no
+  node at all — and its `implements` edge went with it, leaving `UnitStruct::greet`
+  an orphan naming a type the graph did not contain. The golden pins exactly three
+  `struct` nodes and **four** `implements` edges (three structs + the union).
+- **`union` is a first-class kind** (upstream PR #1516) — `union Bits` carries an
+  inherent `impl` (`raw`) and a trait `impl` (`greet`). The golden pins `union:Bits`
+  with `contains union:Bits -> method:raw`, `contains union:Bits -> method:greet` and
+  `implements union:Bits -> trait:Greet`.
+- **cross-file resolution** — `consumer.rs` calls `u.greet()` / `b.greet()` on a
+  `&UnitStruct` and a `&Bits`, so `implements` and method resolution have to work
+  across files rather than only within one.
+
+**The Rust corpus deliberately makes NO instantiation claim.** An `instantiates` edge
+fires only for the CALL-EXPRESSION construction form: `TupleStruct(2)` yes, a bare
+path `UnitStruct` no, a struct literal `Bits { i: 0 }` no. A Rust union is
+constructible only as `Bits { … }`, so no Rust union can ever emit that edge —
+`make_unit` / `make_bits` are return-type references, not instantiation assertions,
+and the golden carries zero `instantiates` edges. Instantiation is pinned in C++
+instead (`instantiate_agg.cpp` / `instantiate_rank.cpp`), which is upstream's own
+shape. The corpus carries **no `Cargo.toml`**: it is indexed, not compiled, and a
+manifest inside the workspace tree could confuse `cargo`.
+
+Regenerate reproducibly (identical recipe to the C++ fixture, substituting `rust`):
+
+```bash
+mkdir -p reference/golden/rust
+rm -rf /tmp/cg-fixture-rust
+cp -r crates/codegraph-bench/fixtures/rust /tmp/cg-fixture-rust
+cargo build --release -p codegraph-rs
+CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
+  ./target/release/codegraph init /tmp/cg-fixture-rust
+cp /tmp/cg-fixture-rust/.codegraph/codegraph.db reference/golden/rust/colby.db
+cargo run -p codegraph-bench --bin bench -- \
+  --gen-golden reference/golden/rust/colby.db reference/golden/rust
+```
+
+`generated_golden_matches_committed_rust_fixture` and
+`rust_db_is_self_equivalent_to_rust_golden` enforce byte-stability.
 
 ### Metal fixture
 

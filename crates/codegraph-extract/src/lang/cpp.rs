@@ -36,6 +36,9 @@ impl LanguageSpec for CppSpec {
     fn struct_types(&self) -> &'static [&'static str] {
         &["struct_specifier"]
     }
+    fn union_types(&self) -> &'static [&'static str] {
+        &["union_specifier"]
+    }
     fn enum_types(&self) -> &'static [&'static str] {
         &["enum_specifier"]
     }
@@ -117,6 +120,9 @@ impl LanguageSpec for CppSpec {
             if child.kind() == "struct_specifier" && child_by_field(child, "body").is_some() {
                 return Some(NodeKind::Struct);
             }
+            if child.kind() == "union_specifier" && child_by_field(child, "body").is_some() {
+                return Some(NodeKind::Union);
+            }
         }
         None
     }
@@ -143,8 +149,8 @@ impl LanguageSpec for CppSpec {
 /// on char boundaries, so byte length (and thus line/column) is preserved. Each
 /// pass is `contains`-gated, so macro-free C++ is returned byte-identical.
 fn pre_parse_cpp_source(source: &str, file_path: &str) -> String {
-    let bytes = blank_cpp_annotation_macro_calls(blank_cpp_inline_annotation_macros(
-        blank_cpp_api_prefix_macros(source.as_bytes().to_vec()),
+    let bytes = blank_msvc_com_interface_keyword(blank_cpp_annotation_macro_calls(
+        blank_cpp_inline_annotation_macros(blank_cpp_api_prefix_macros(source.as_bytes().to_vec())),
     ));
     let lower = file_path.to_ascii_lowercase();
     let bytes = if lower.ends_with(".metal") {
@@ -436,6 +442,239 @@ fn blank_cpp_annotation_macro_calls(bytes: Vec<u8>) -> Vec<u8> {
         blank_span(&mut bytes, start, end);
     }
     bytes
+}
+
+/// Rewrite a line-leading MSVC COM `interface` keyword to `struct` + 3 spaces
+/// (#1519). `interface` is 9 bytes and `struct` is 6, so the 3 trailing spaces
+/// keep the byte length — and therefore every node's line and column — exactly
+/// as it was, the same contract every other pass in this file honours.
+///
+/// `interface` is not a C++ keyword, so tree-sitter-cpp reads
+/// `interface IFoo : IBase { … };` as a `function_definition`: the container
+/// becomes a `function`, its members become free `function`s instead of
+/// `method`s, and the base clause is lost entirely. A COM `interface` IS
+/// `#define`d to `struct`, so rewriting the token recovers all three at once.
+///
+/// Declined unless EVERY byte of the token is ordinary code per
+/// [`cpp_code_mask`], and declined when the next token is `class`, `struct`,
+/// `union` or `enum` — C++/CLI `interface class IFoo` is valid input today and
+/// the naive rewrite would emit the INVALID `struct    class IFoo`.
+/// `contains`-gated, so C++ without the token is returned byte-identical.
+fn blank_msvc_com_interface_keyword(bytes: Vec<u8>) -> Vec<u8> {
+    const KEYWORD: &[u8] = b"interface";
+    let source = match std::str::from_utf8(&bytes) {
+        Ok(source) => source,
+        Err(_) => return bytes,
+    };
+    if !source.contains("interface") {
+        return bytes;
+    }
+    let mask = cpp_code_mask(source);
+    let src = source.as_bytes();
+    let mut starts: Vec<usize> = Vec::new();
+    let mut pos = 0usize;
+    loop {
+        let line_end = src[pos..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(src.len(), |offset| pos + offset);
+        let mut i = pos;
+        while i < line_end && matches!(src[i], b' ' | b'\t') {
+            i += 1;
+        }
+        if i + KEYWORD.len() <= line_end && &src[i..i + KEYWORD.len()] == KEYWORD {
+            let all_code = (i..i + KEYWORD.len()).all(|k| mask[k]);
+            let mut j = i + KEYWORD.len();
+            let mut saw_space = false;
+            while j < line_end && matches!(src[j], b' ' | b'\t') {
+                saw_space = true;
+                j += 1;
+            }
+            let ident_start = src
+                .get(j)
+                .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_');
+            let mut k = j;
+            while k < line_end && (src[k].is_ascii_alphanumeric() || src[k] == b'_') {
+                k += 1;
+            }
+            let excluded = matches!(&src[j..k], b"class" | b"struct" | b"union" | b"enum");
+            if all_code && saw_space && ident_start && !excluded {
+                starts.push(i);
+            }
+        }
+        if line_end >= src.len() {
+            break;
+        }
+        pos = line_end + 1;
+    }
+    let mut bytes = bytes;
+    for start in starts {
+        bytes[start..start + 6].copy_from_slice(b"struct");
+        for b in bytes[start + 6..start + KEYWORD.len()].iter_mut() {
+            *b = b' ';
+        }
+    }
+    bytes
+}
+
+/// Byte mask over `src`: `true` where the byte is ordinary code. One forward
+/// scan tracking the five lexical states a textual match could hide in — line
+/// comments, block comments, char and string literals, C++ raw strings
+/// (`R"delim( … )delim"`, delimiter captured so a custom delimiter still closes
+/// correctly), and whole LOGICAL preprocessor lines including backslash
+/// continuations. Lexical state is not optional for #1519: a comment can hold a
+/// COMPLETE declaration (`/* interface IFoo; */`) that becomes the FOLLOWING
+/// node's docstring, so a purely textual match corrupts extraction output even
+/// though it never mints a node.
+fn cpp_code_mask(src: &str) -> Vec<bool> {
+    let bytes = src.as_bytes();
+    let mut mask = vec![true; bytes.len()];
+    let mut i = 0usize;
+    let mut at_line_start = true;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\n' {
+            at_line_start = true;
+            i += 1;
+            continue;
+        }
+        if at_line_start {
+            if matches!(b, b' ' | b'\t' | b'\r') {
+                i += 1;
+                continue;
+            }
+            at_line_start = false;
+            if b == b'#' {
+                i = mask_preprocessor_line(bytes, &mut mask, i);
+                at_line_start = true;
+                continue;
+            }
+        }
+        if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                mask[i] = false;
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            mask[i] = false;
+            mask[i + 1] = false;
+            i += 2;
+            while i < bytes.len() {
+                let closing = bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/');
+                mask[i] = false;
+                i += 1;
+                if closing {
+                    mask[i] = false;
+                    i += 1;
+                    break;
+                }
+            }
+            continue;
+        }
+        // A raw string is recognised by the `R` immediately before the quote,
+        // which also covers every encoding prefix (`LR"`, `u8R"`, `uR"`, `UR"`).
+        if b == b'"' && i > 0 && bytes[i - 1] == b'R' {
+            i = mask_raw_string(bytes, &mut mask, i);
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            i = mask_quoted_literal(bytes, &mut mask, i, b);
+            continue;
+        }
+        i += 1;
+    }
+    mask
+}
+
+/// Mask a whole LOGICAL preprocessor line starting at `start` (the `#`),
+/// following every backslash-newline continuation. Returns the index just past
+/// the logical line. The continuation matters: `#define D \` + a following
+/// `  interface IFoo` line is one directive, and its second physical line is
+/// not code.
+fn mask_preprocessor_line(bytes: &[u8], mask: &mut [bool], start: usize) -> usize {
+    let mut i = start;
+    loop {
+        while i < bytes.len() && bytes[i] != b'\n' {
+            mask[i] = false;
+            i += 1;
+        }
+        let mut back = i;
+        if back > start && bytes[back - 1] == b'\r' {
+            back -= 1;
+        }
+        let continued = back > start && bytes[back - 1] == b'\\';
+        if i < bytes.len() {
+            mask[i] = false;
+            i += 1;
+        }
+        if !continued || i >= bytes.len() {
+            return i;
+        }
+    }
+}
+
+/// Mask `R"delim( … )delim"` from its opening quote. The delimiter is captured
+/// so a custom one (`R"xy( … )xy"`) closes on its own terminator instead of the
+/// first `)"`. A malformed opener falls back to ordinary string rules.
+fn mask_raw_string(bytes: &[u8], mask: &mut [bool], quote: usize) -> usize {
+    let mut delim_end = quote + 1;
+    while delim_end < bytes.len()
+        && bytes[delim_end] != b'('
+        && delim_end - (quote + 1) < 16
+        && !bytes[delim_end].is_ascii_whitespace()
+    {
+        delim_end += 1;
+    }
+    if delim_end >= bytes.len() || bytes[delim_end] != b'(' {
+        return mask_quoted_literal(bytes, mask, quote, b'"');
+    }
+    let mut closer = Vec::with_capacity(delim_end - quote + 1);
+    closer.push(b')');
+    closer.extend_from_slice(&bytes[quote + 1..delim_end]);
+    closer.push(b'"');
+    let mut k = delim_end + 1;
+    let end = loop {
+        if k + closer.len() > bytes.len() {
+            break bytes.len();
+        }
+        if bytes[k..k + closer.len()] == closer[..] {
+            break k + closer.len();
+        }
+        k += 1;
+    };
+    for m in mask.iter_mut().take(end).skip(quote) {
+        *m = false;
+    }
+    end
+}
+
+/// Mask a `"…"` or `'…'` literal from its opening quote, honouring backslash
+/// escapes. An unterminated literal stops at the newline rather than swallowing
+/// the rest of the file.
+fn mask_quoted_literal(bytes: &[u8], mask: &mut [bool], start: usize, quote: u8) -> usize {
+    mask[start] = false;
+    let mut i = start + 1;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\n' {
+            break;
+        }
+        mask[i] = false;
+        i += 1;
+        if c == b'\\' {
+            if i < bytes.len() && bytes[i] != b'\n' {
+                mask[i] = false;
+                i += 1;
+            }
+            continue;
+        }
+        if c == quote {
+            break;
+        }
+    }
+    i
 }
 
 /// Recover the real function name from the macro-definition idiom
@@ -821,6 +1060,113 @@ mod tests {
         let src = "FOO(x);";
         let out = pre_parse_cpp_source(src, "t.cpp");
         assert_eq!(out, src);
+    }
+
+    #[test]
+    fn msvc_com_interface_rewrite_preserves_byte_offsets() {
+        // `interface` (9 bytes) -> `struct` (6) + 3 spaces, so every subsequent
+        // byte offset — and therefore every node's line and column — is exactly
+        // where it was. A shorter or longer replacement would silently shift the
+        // whole file's positions.
+        let src = "interface IWidget : IBase {\n    void Run() { }\n};\n";
+        let out = pre_parse_cpp_source(src, "com.hpp");
+        assert_eq!(
+            out.len(),
+            src.len(),
+            "the rewrite must preserve byte length"
+        );
+        assert_eq!(out, "struct    IWidget : IBase {\n    void Run() { }\n};\n");
+        // The rewritten declaration must land on the same line and column as the
+        // equivalent struct written by hand.
+        let control = "struct    SControl : IBase {\n    void Run() { }\n};\n";
+        let control_out = pre_parse_cpp_source(control, "ctl.hpp");
+        assert_eq!(
+            control_out, control,
+            "the control must be returned unchanged"
+        );
+        assert_eq!(
+            out.find("IWidget").expect("name present"),
+            control.find("SControl").expect("control name present"),
+            "the rewritten name must start at the control's column"
+        );
+    }
+
+    /// Every §3.3.3 shape, as a direct unit test of the pass: 11 that must NOT
+    /// fire and 4 that must, each also asserting byte length is preserved. This
+    /// is the ONLY isolated proof of the `class`/`struct`/`union`/`enum`
+    /// exclusion — the end-to-end `neg_interface.hpp` invariance test cannot see
+    /// it, because dropping the exclusion emits `struct    class INegCli`, which
+    /// tree-sitter's error recovery happens to extract identically for that
+    /// file's text (measured). The exclusion is still required: it stops the pass
+    /// emitting invalid C++ from input that parses correctly today.
+    #[test]
+    fn cpp_code_mask_covers_comments_strings_and_preproc() {
+        let must_not_fire: &[(&str, &str)] = &[
+            (
+                "block comment",
+                "/*\ninterface IFoo;\n*/\nstruct R { int x; };\n",
+            ),
+            (
+                "block cmt full decl",
+                "/*\ninterface IGhost { virtual void B() = 0; };\n*/\nstruct R { int x; };\n",
+            ),
+            ("line comment", "// interface IFoo;\nstruct R { int x; };\n"),
+            (
+                "cpp/cli class",
+                "interface class IFoo { public: virtual void B()=0; };\n",
+            ),
+            ("interface struct", "interface struct IBar { int x; };\n"),
+            ("__interface", "__interface IFoo { virtual void B()=0; };\n"),
+            ("raw string", "const char* s = R\"(\ninterface IFoo\n)\";\n"),
+            (
+                "raw string full decl",
+                "const char* s = R\"(\ninterface IGhost { virtual void B() = 0; };\n)\";\n",
+            ),
+            (
+                "raw delim",
+                "const char* s = R\"xy(\ninterface IFoo )\" still inside\n)xy\";\n",
+            ),
+            (
+                "macro continuation",
+                "#define DECL \\\n  interface IMacro\nstruct R { int x; };\n",
+            ),
+            ("interface_ptr", "int interface_ptr = 0;\n"),
+        ];
+        for (label, src) in must_not_fire {
+            let out = pre_parse_cpp_source(src, "n.hpp");
+            assert_eq!(out.len(), src.len(), "{label}: byte length moved");
+            assert_eq!(out, *src, "{label}: the substitution must NOT fire");
+        }
+
+        let must_fire: &[(&str, &str, &str)] = &[
+            (
+                "plain",
+                "interface IWidget : IBase {\n};\n",
+                "struct    IWidget : IBase {\n};\n",
+            ),
+            (
+                "newline brace",
+                "interface INewline\n{\n};\n",
+                "struct    INewline\n{\n};\n",
+            ),
+            (
+                "indented",
+                "  interface IIndent {\n};\n",
+                "  struct    IIndent {\n};\n",
+            ),
+            (
+                // The discriminating case: the masked `#define` directive is left
+                // alone while the real declaration beneath it IS rewritten.
+                "define interface",
+                "#define interface struct\ninterface IDefined {\n};\n",
+                "#define interface struct\nstruct    IDefined {\n};\n",
+            ),
+        ];
+        for (label, src, want) in must_fire {
+            let out = pre_parse_cpp_source(src, "p.hpp");
+            assert_eq!(out.len(), src.len(), "{label}: byte length moved");
+            assert_eq!(out, *want, "{label}: the substitution must fire");
+        }
     }
 
     #[test]

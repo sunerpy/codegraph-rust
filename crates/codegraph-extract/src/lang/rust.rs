@@ -30,6 +30,9 @@ impl LanguageSpec for RustSpec {
     fn struct_types(&self) -> &'static [&'static str] {
         &["struct_item"]
     }
+    fn union_types(&self) -> &'static [&'static str] {
+        &["union_item"]
+    }
     fn enum_types(&self) -> &'static [&'static str] {
         &["enum_item"]
     }
@@ -50,6 +53,9 @@ impl LanguageSpec for RustSpec {
     }
     fn interface_kind(&self) -> NodeKind {
         NodeKind::Trait
+    }
+    fn allow_bodiless_struct(&self) -> bool {
+        true
     }
     fn name_field(&self) -> &'static str {
         "name"

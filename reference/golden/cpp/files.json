@@ -16,12 +16,36 @@
     "size": 270
   },
   {
+    "content_hash": "6b55a06389ed10d1d23bcab95a9ae02421e1cf0aa566526df2f367e29270e7c2",
+    "errors": null,
+    "language": "cpp",
+    "node_count": 7,
+    "path": "com_interface.hpp",
+    "size": 294
+  },
+  {
     "content_hash": "7866bdbba877acfa0b4b8e7e4be58875893da925ac91aa333a4c3658bea64e69",
     "errors": null,
     "language": "cpp",
     "node_count": 12,
     "path": "derived.cpp",
     "size": 363
+  },
+  {
+    "content_hash": "e3331a39e14456236ae24d3d0cc31562b65008bf1027a065d8f403066d74a46e",
+    "errors": null,
+    "language": "cpp",
+    "node_count": 5,
+    "path": "instantiate_agg.cpp",
+    "size": 151
+  },
+  {
+    "content_hash": "5d9bf2ad4d29787d69c168a79c0efb471614f5996f9b065b206da7170bc0fe70",
+    "errors": null,
+    "language": "cpp",
+    "node_count": 6,
+    "path": "instantiate_rank.cpp",
+    "size": 167
   },
   {
     "content_hash": "bfd6da256b748444e2bfdff365e7d56daa640afa638e50b294db94cca1f2a7f8",
@@ -46,6 +70,14 @@
     "node_count": 2,
     "path": "namespaced_member.hpp",
     "size": 106
+  },
+  {
+    "content_hash": "e934b42dfe376e8b29355a6ed84d713d44ba9b6f898df4d774f6bda378562bb3",
+    "errors": null,
+    "language": "cpp",
+    "node_count": 4,
+    "path": "neg_interface.hpp",
+    "size": 270
   },
   {
     "content_hash": "61ac8b93b7094d0633203791513f3394c7f76e2993a50d75b9f8e32454dcccf6",
@@ -78,5 +110,29 @@
     "node_count": 2,
     "path": "ue_actor.h",
     "size": 191
+  },
+  {
+    "content_hash": "fd0d7579d620457505815a1d6829820f5512859858153568086bdebddcd0ead2",
+    "errors": null,
+    "language": "c",
+    "node_count": 7,
+    "path": "union_agg.c",
+    "size": 278
+  },
+  {
+    "content_hash": "d0f696b07337c1d1fcda49b0222d9b43a5c45a3932ff58cee2cd87b8d68caf53",
+    "errors": null,
+    "language": "cpp",
+    "node_count": 7,
+    "path": "union_agg.cpp",
+    "size": 257
+  },
+  {
+    "content_hash": "96f43a0f8244169fcc8281ef0f62de430a43436f39853e254ec27a840ccbe7c7",
+    "errors": null,
+    "language": "objc",
+    "node_count": 3,
+    "path": "union_agg.mm",
+    "size": 58
   }
 ]

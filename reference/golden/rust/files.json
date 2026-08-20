@@ -1,0 +1,18 @@
+[
+  {
+    "content_hash": "8121cdd4bac4cf4e031fa69ca8b2ceea14f7f61e2357a339025afdcb51ea6585",
+    "errors": null,
+    "language": "rust",
+    "node_count": 4,
+    "path": "consumer.rs",
+    "size": 164
+  },
+  {
+    "content_hash": "32fd3f5a2c8b2054c3197394a04d39f75f8ad52de6afe38e76ec0e4ee7358960",
+    "errors": null,
+    "language": "rust",
+    "node_count": 14,
+    "path": "lib.rs",
+    "size": 767
+  }
+]

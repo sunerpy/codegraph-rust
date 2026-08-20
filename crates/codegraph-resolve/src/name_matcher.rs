@@ -495,12 +495,13 @@ fn cpp_last_segment(name: &str) -> &str {
         .unwrap_or(name)
 }
 
-/// Does the graph hold a class/struct named `name`'s last segment?
+/// Does the graph hold a class/struct/union named `name`'s last segment?
 /// (`cppClassExists`, `name-matcher.ts:621-626`).
 fn cpp_class_exists(name: &str, reference: &RefView, context: &dyn ResolutionContext) -> bool {
     let last = cpp_last_segment(name);
     context.get_nodes_by_name(last).iter().any(|n| {
-        matches!(n.kind, NodeKind::Class | NodeKind::Struct) && n.language == reference.language
+        matches!(n.kind, NodeKind::Class | NodeKind::Struct | NodeKind::Union)
+            && n.language == reference.language
     })
 }
 
@@ -1436,7 +1437,7 @@ pub fn match_method_call(
     ) {
         if matches!(
             class_node.kind,
-            NodeKind::Class | NodeKind::Struct | NodeKind::Interface
+            NodeKind::Class | NodeKind::Struct | NodeKind::Union | NodeKind::Interface
         ) {
             if class_node.language != reference.language {
                 continue;
@@ -1462,7 +1463,7 @@ pub fn match_method_call(
         ) {
             if matches!(
                 class_node.kind,
-                NodeKind::Class | NodeKind::Struct | NodeKind::Interface
+                NodeKind::Class | NodeKind::Struct | NodeKind::Union | NodeKind::Interface
             ) {
                 if class_node.language != reference.language {
                     continue;
@@ -1867,7 +1868,7 @@ fn find_best_match<'a>(reference: &RefView, candidates: &'a [Node]) -> Option<&'
             EdgeKind::Instantiates => {
                 if matches!(
                     candidate.kind,
-                    NodeKind::Class | NodeKind::Struct | NodeKind::Interface
+                    NodeKind::Class | NodeKind::Struct | NodeKind::Union | NodeKind::Interface
                 ) {
                     score += 25.0;
                 }

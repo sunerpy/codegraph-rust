@@ -115,7 +115,7 @@ pub const CURRENT_STORAGE_PROTOCOL: u64 = 2;
 
 /// The extraction-pipeline version this binary produces. This is the single
 /// source of truth: no other crate may define its own copy.
-pub const CURRENT_EXTRACTION_VERSION: u64 = 6;
+pub const CURRENT_EXTRACTION_VERSION: u64 = 7;
 
 /// The `project_metadata` key under which a built index records the extraction
 /// version it was produced with. Single source of truth for the key spelling.

@@ -1,6 +1,26 @@
 [
   {
     "candidates": null,
+    "col": 18,
+    "file_path": "com_interface.hpp",
+    "from_node_id": "struct:f8ed8b93742d867912fe2dd218c2819e",
+    "language": "cpp",
+    "line": 1,
+    "reference_kind": "extends",
+    "reference_name": "IBase"
+  },
+  {
+    "candidates": null,
+    "col": 20,
+    "file_path": "com_interface.hpp",
+    "from_node_id": "struct:5009f722baa64c277a025aa26625b3dd",
+    "language": "cpp",
+    "line": 6,
+    "reference_kind": "extends",
+    "reference_name": "IBase"
+  },
+  {
+    "candidates": null,
     "col": 31,
     "file_path": "ue_actor.h",
     "from_node_id": "class:ade92bd69bacb920c05c0d123d2a5130",

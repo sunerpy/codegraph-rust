@@ -1,0 +1,32 @@
+[
+  {
+    "candidates": null,
+    "col": 12,
+    "file_path": "consumer.rs",
+    "from_node_id": "file:consumer.rs",
+    "language": "rust",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "crate::Bits"
+  },
+  {
+    "candidates": null,
+    "col": 18,
+    "file_path": "consumer.rs",
+    "from_node_id": "file:consumer.rs",
+    "language": "rust",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "crate::Greet"
+  },
+  {
+    "candidates": null,
+    "col": 25,
+    "file_path": "consumer.rs",
+    "from_node_id": "file:consumer.rs",
+    "language": "rust",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "crate::UnitStruct"
+  }
+]

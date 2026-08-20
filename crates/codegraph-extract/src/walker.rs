@@ -268,6 +268,9 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         } else if has_type(self.spec.struct_types(), node_type) {
             self.extract_struct(node);
             skip_children = true;
+        } else if has_type(self.spec.union_types(), node_type) {
+            self.extract_union(node);
+            skip_children = true;
         } else if has_type(self.spec.enum_types(), node_type) {
             self.extract_enum(node);
             skip_children = true;
@@ -2159,12 +2162,31 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     }
 
     fn extract_struct(&mut self, node: SyntaxNode<'tree>) {
-        let Some(body) = self.resolve_body(node) else {
+        self.extract_aggregate(node, NodeKind::Struct);
+    }
+
+    fn extract_union(&mut self, node: SyntaxNode<'tree>) {
+        self.extract_aggregate(node, NodeKind::Union);
+    }
+
+    /// Shared struct/union extractor (upstream `6978acc`'s `extractAggregate`).
+    /// One body, so a union's members, methods, containment and inheritance
+    /// behave like a struct's BY CONSTRUCTION rather than by parallel
+    /// maintenance — which is what every downstream `Union`-in-a-kind-set port
+    /// assumes.
+    fn extract_aggregate(&mut self, node: SyntaxNode<'tree>, kind: NodeKind) {
+        // #1093 / #1513 — a bodiless aggregate is a C/C++/ObjC forward
+        // declaration and stays unindexed, but a Rust `struct Unit;` is a
+        // complete definition, so the spec decides. The node is minted BEFORE
+        // the body walk (PR #1514) and the walk is conditional, which is the
+        // shape `extract_interface` already has.
+        let body = self.resolve_body(node);
+        if body.is_none() && !self.spec.allow_bodiless_struct() {
             return;
-        };
+        }
         let name = self.extract_name(node);
-        let struct_node = self.create_node(
-            NodeKind::Struct,
+        let aggregate_node = self.create_node(
+            kind,
             &name,
             node,
             NodeExtra {
@@ -2174,13 +2196,15 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 ..NodeExtra::default()
             },
         );
-        let Some(struct_node) = struct_node else {
+        let Some(aggregate_node) = aggregate_node else {
             return;
         };
-        self.extract_inheritance(node, &struct_node.id);
-        self.node_stack.push(struct_node.id);
-        self.visit_named_children(body);
-        self.node_stack.pop();
+        self.extract_inheritance(node, &aggregate_node.id);
+        if let Some(body) = body {
+            self.node_stack.push(aggregate_node.id);
+            self.visit_named_children(body);
+            self.node_stack.pop();
+        }
     }
 
     fn extract_method(&mut self, node: SyntaxNode<'tree>) {
@@ -2239,6 +2263,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                             && matches!(
                                 n.kind,
                                 NodeKind::Struct
+                                    | NodeKind::Union
                                     | NodeKind::Class
                                     | NodeKind::Enum
                                     | NodeKind::Trait
@@ -2404,6 +2429,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 alias_kind,
                 NodeKind::Class
                     | NodeKind::Struct
+                    | NodeKind::Union
                     | NodeKind::Interface
                     | NodeKind::Trait
                     | NodeKind::Enum
@@ -3732,6 +3758,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                     node.kind,
                     NodeKind::Class
                         | NodeKind::Struct
+                        | NodeKind::Union
                         | NodeKind::Interface
                         | NodeKind::Trait
                         | NodeKind::Enum
@@ -7503,5 +7530,358 @@ g() ->\n\
             java.iter().any(|c| c == "s.trim"),
             "an identifier receiver must still emit `s.trim`, got: {java:?}"
         );
+    }
+
+    // ---- Tier 3 / item 7 — Rust unit structs (upstream #1513, PR #1514) ----
+
+    #[test]
+    fn rust_unit_struct_is_indexed_with_its_impl_edge() {
+        // A bodiless `struct NAME;` is a COMPLETE definition in Rust, not a
+        // forward declaration, so it must mint a node and its `impl Trait for`
+        // must produce an Implements ref exactly as the bodied controls do.
+        let src = r#"
+pub trait Greet { fn greet(&self) -> String; }
+
+pub struct UnitStruct;
+pub struct BraceStruct { pub x: u32 }
+pub struct TupleStruct(pub u8);
+
+impl Greet for UnitStruct  { fn greet(&self) -> String { "unit".to_string()  } }
+impl Greet for BraceStruct { fn greet(&self) -> String { "brace".to_string() } }
+impl Greet for TupleStruct { fn greet(&self) -> String { "tuple".to_string() } }
+"#;
+        let (nodes, refs) = run("lib.rs", src, Language::Rust);
+        assert!(
+            has_node(&nodes, NodeKind::Struct, "UnitStruct"),
+            "the unit struct must be indexed"
+        );
+        // Controls: both bodied forms are indexed today and must stay indexed.
+        assert!(has_node(&nodes, NodeKind::Struct, "BraceStruct"));
+        assert!(has_node(&nodes, NodeKind::Struct, "TupleStruct"));
+        let implements = refs
+            .iter()
+            .filter(|r| r.reference_kind == EdgeKind::Implements)
+            .count();
+        assert_eq!(
+            implements, 3,
+            "each of the three structs must carry an Implements ref, got {implements}"
+        );
+    }
+
+    // ---- Tier 3 / item 8 — MSVC COM `interface` (upstream #1519) ----
+
+    /// The §7.2 `com_interface.hpp` fixture text, shared by the extraction test
+    /// and the byte-offset test so both speak about the same bytes.
+    const COM_INTERFACE_SRC: &str = "\
+struct SControl : IBase {
+    virtual void Ping() = 0;
+    void Run() { }
+};
+
+interface IWidget : IBase {
+    virtual void Ping() = 0;
+    void Run() { }
+};
+
+interface IPlain {
+    virtual void Ping() = 0;
+};
+
+interface INewlineBrace
+{
+    virtual void Ping() = 0;
+};
+
+int interface_count = 0;
+";
+
+    /// The §7.2 `neg_interface.hpp` fixture text: the five shapes the guard must
+    /// decline. Written as an escaped literal because a raw string cannot nest
+    /// the `R"( … )"` it needs to contain.
+    const NEG_INTERFACE_SRC: &str = concat!(
+        "/*\n interface INegComment;\n*/\n",
+        "interface class INegCli { public: virtual void B()=0; };\n",
+        "interface struct INegStructKw { int x; };\n",
+        "const char* idl = R\"(\ninterface INegGhost { virtual void B() = 0; };\n)\";\n",
+        "#define NEG_DECL \\\n  interface INegMacro\n",
+        "struct NegReal { int x; };\n",
+    );
+
+    #[test]
+    fn cpp_msvc_com_interface_extracts_as_struct() {
+        let (nodes, refs) = run("com_interface.hpp", COM_INTERFACE_SRC, Language::Cpp);
+        // Loss 1 — the COM interface must be a container, not a function.
+        for name in ["IWidget", "IPlain", "INewlineBrace"] {
+            assert!(
+                has_node(&nodes, NodeKind::Struct, name),
+                "`interface {name}` must extract as a struct"
+            );
+        }
+        assert!(has_node(&nodes, NodeKind::Struct, "SControl"));
+        assert!(
+            !nodes
+                .iter()
+                .any(|n| n.kind == NodeKind::Function && n.file_path == "com_interface.hpp"),
+            "no node in this file may stay a function: {:?}",
+            nodes
+                .iter()
+                .filter(|n| n.kind == NodeKind::Function)
+                .map(|n| (n.name.as_str(), n.start_line))
+                .collect::<Vec<_>>()
+        );
+        // Loss 2 — the member is a method of the interface, not a free function.
+        let mut runs = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Method && n.name == "Run")
+            .map(|n| n.qualified_name.as_str())
+            .collect::<Vec<_>>();
+        runs.sort_unstable();
+        assert_eq!(
+            runs,
+            ["IWidget::Run", "SControl::Run"],
+            "both members must be methods of their own container"
+        );
+        // Loss 3 — the base type is visible. The control emits one today; the
+        // rewritten interface must emit the second.
+        let extends_ibase = refs
+            .iter()
+            .filter(|r| r.reference_kind == EdgeKind::Extends && r.reference_name == "IBase")
+            .count();
+        assert_eq!(
+            extends_ibase, 2,
+            "SControl and IWidget must each emit `extends IBase`, got {extends_ibase}"
+        );
+    }
+
+    // ---- Tier 3 / item 9 — first-class `union` nodes (upstream PR #1516) ----
+
+    #[test]
+    fn rust_union_is_indexed_with_its_impl_edge() {
+        let src = r#"
+pub trait Greet { fn greet(&self) -> String; }
+pub union Bits { pub i: u32, pub f: f32 }
+impl Bits { pub fn raw(&self) -> u32 { unsafe { self.i } } }
+impl Greet for Bits { fn greet(&self) -> String { "bits".to_string() } }
+"#;
+        let (nodes, refs) = run("lib.rs", src, Language::Rust);
+        assert!(
+            has_node(&nodes, NodeKind::Union, "Bits"),
+            "a Rust union must be a first-class union node"
+        );
+        assert!(
+            !has_node(&nodes, NodeKind::Struct, "Bits"),
+            "a union must not be re-kinded to a struct"
+        );
+        assert!(
+            has_ref(&refs, EdgeKind::Implements, "Greet"),
+            "the union's `impl Greet for` must produce an Implements ref"
+        );
+    }
+
+    #[test]
+    fn c_cpp_objc_union_is_indexed_not_a_struct() {
+        for (file, src, lang) in [
+            (
+                "m.c",
+                "union Named { int i; float f; };\nstruct Ctl { int x; };\n",
+                Language::C,
+            ),
+            (
+                "m.cpp",
+                "union Named { int i; float f; };\nstruct Ctl { int x; };\n",
+                Language::Cpp,
+            ),
+            (
+                "m.mm",
+                "union Named { int i; float f; };\nstruct Ctl { int x; };\n",
+                Language::ObjC,
+            ),
+        ] {
+            let (nodes, _) = run(file, src, lang);
+            assert!(
+                has_node(&nodes, NodeKind::Union, "Named"),
+                "{file}: `union Named` must be a union node"
+            );
+            assert!(
+                !has_node(&nodes, NodeKind::Struct, "Named"),
+                "{file}: the union must not be kinded as a struct"
+            );
+            // Control: the struct beside it is unchanged.
+            assert!(
+                has_node(&nodes, NodeKind::Struct, "Ctl"),
+                "{file}: the struct control must stay a struct"
+            );
+        }
+    }
+
+    #[test]
+    fn cpp_union_member_method_belongs_to_the_union() {
+        // Pre-fix this member leaked to FILE scope as `function:read_field` with
+        // no container, which is what let a call on the union bind the SAME-NAMED
+        // struct method instead (the false edge in upstream #1515).
+        let src = concat!(
+            "union WithMethod {\n",
+            "    int i; float f;\n",
+            "    int read_field() { return i; }\n",
+            "};\n",
+            "struct SWithMethod {\n",
+            "    int i;\n",
+            "    int read_field() { return i; }\n",
+            "};\n",
+        );
+        let (nodes, _) = run("union_agg.cpp", src, Language::Cpp);
+        let union_node = node(&nodes, NodeKind::Union, "WithMethod");
+        let mut members = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Method && n.name == "read_field")
+            .map(|n| n.qualified_name.as_str())
+            .collect::<Vec<_>>();
+        members.sort_unstable();
+        assert_eq!(
+            members,
+            ["SWithMethod::read_field", "WithMethod::read_field"],
+            "the union's member must be a method qualified by the union"
+        );
+        assert!(
+            !nodes
+                .iter()
+                .any(|n| n.kind == NodeKind::Function && n.name == "read_field"),
+            "no `read_field` may remain a free function at file scope"
+        );
+        assert!(
+            union_node.start_line == 1 && union_node.end_line >= 4,
+            "the union must span its whole body: {union_node:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_out_of_line_union_method_gets_its_contains_edge() {
+        // The receiver-owner lookup is the widening that fails SILENTLY: an
+        // out-of-line `Union::method` still becomes a method with the right
+        // qualified name, so only the missing `contains union -> method` edge
+        // reveals the omission.
+        let src = concat!(
+            "union WithMethod {\n",
+            "    int i;\n",
+            "    int read_field();\n",
+            "};\n",
+            "int WithMethod::read_field() { return i; }\n",
+        );
+        let result = extract_source("u.cpp", src, Some(Language::Cpp));
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let union_id = &node(&result.nodes, NodeKind::Union, "WithMethod").id;
+        let method_id = &node(&result.nodes, NodeKind::Method, "read_field").id;
+        assert!(
+            result.edges.iter().any(|e| e.kind == EdgeKind::Contains
+                && &e.source == union_id
+                && &e.target == method_id),
+            "the out-of-line method must be contained by its union"
+        );
+    }
+
+    #[test]
+    fn c_typedef_union_is_one_union_node_named_by_the_typedef() {
+        let src = concat!(
+            "typedef union { int a; float b; } AnonU;\n",
+            "typedef struct { int a; int b; } AnonS;\n",
+            "typedef union NamedTag { int c; } NamedU;\n",
+        );
+        let (nodes, _) = run("m.c", src, Language::C);
+        let named = nodes
+            .iter()
+            .filter(|n| n.name == "NamedU")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            named.len(),
+            1,
+            "`typedef union NamedTag {{…}} NamedU;` must mint exactly ONE node, got {named:?}"
+        );
+        assert_eq!(named[0].kind, NodeKind::Union);
+        // The inner tag is not a separate node: extract_type_alias consumes the
+        // union_specifier, so it is never re-dispatched.
+        assert!(
+            !nodes.iter().any(|n| n.name == "NamedTag"),
+            "the union's tag must not become its own node"
+        );
+        assert!(has_node(&nodes, NodeKind::Union, "AnonU"));
+        // Control: the struct typedef beside it keeps its kind.
+        assert!(has_node(&nodes, NodeKind::Struct, "AnonS"));
+    }
+
+    #[test]
+    fn bodiless_and_anonymous_unions_are_not_indexed() {
+        let src = concat!(
+            "union Fwd;\n",
+            "struct FwdS;\n",
+            "union { int q; } anon_var;\n",
+            "struct { int r; } anon_struct_var;\n",
+            "union Named { int i; };\n",
+        );
+        let (nodes, _) = run("m.c", src, Language::C);
+        // A bodiless C union is a forward declaration: the shared aggregate guard
+        // drops it, the same rule that keeps `struct Foo;` out.
+        assert!(!nodes.iter().any(|n| n.name == "Fwd"));
+        assert!(!nodes.iter().any(|n| n.name == "FwdS"));
+        // An anonymous union mints nothing, because the anonymous struct beside it
+        // mints nothing — both are consumed by the `declaration` arm.
+        assert!(
+            !nodes.iter().any(|n| n.name == "<anonymous>"),
+            "an anonymous aggregate must mint no node: {:?}",
+            nodes.iter().map(|n| &n.name).collect::<Vec<_>>()
+        );
+        // Positive control, so the negatives cannot pass by the file failing to parse.
+        assert!(has_node(&nodes, NodeKind::Union, "Named"));
+    }
+
+    #[test]
+    fn cpp_interface_guard_negatives_are_extraction_invariant() {
+        // GREEN BEFORE THE FIX: this encodes today's measured output, so it is an
+        // invariance guard rather than a regression test written afterwards. Each
+        // row is a value a leaking mask would change — `INegCli`'s docstring is
+        // the sharpest, because a comment-blind substitution rewrites the comment
+        // text itself.
+        let (nodes, _) = run("neg_interface.hpp", NEG_INTERFACE_SRC, Language::Cpp);
+        let mut got = nodes
+            .iter()
+            .filter(|n| n.kind != NodeKind::File)
+            .map(|n| {
+                (
+                    n.kind,
+                    n.name.as_str(),
+                    n.start_line,
+                    n.docstring.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        got.sort_by_key(|row| row.2);
+        assert_eq!(
+            got,
+            vec![
+                (
+                    NodeKind::Function,
+                    "INegCli",
+                    4,
+                    Some("interface INegComment;")
+                ),
+                (NodeKind::Function, "INegStructKw", 5, None),
+                (NodeKind::Struct, "NegReal", 11, None),
+            ],
+            "the guard leaked: extraction output moved"
+        );
+        // A count catches a PHANTOM node that a name list would miss.
+        assert_eq!(got.len(), 3, "expected exactly 3 nodes, got {got:?}");
+        // Survives tree-sitter error-recovery differences in the garbage names.
+        assert!(
+            !nodes
+                .iter()
+                .any(|n| n.kind == NodeKind::Struct && n.name.starts_with("INeg")),
+            "an INeg* name became a struct: the interface class/struct exclusion failed"
+        );
+        for phantom in ["INegGhost", "INegMacro"] {
+            assert!(
+                !nodes.iter().any(|n| n.name == phantom),
+                "{phantom} must mint no node of any kind"
+            );
+        }
     }
 }

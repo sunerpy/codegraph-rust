@@ -652,6 +652,7 @@ pub fn kind_bonus(kind: NodeKind) -> f64 {
         NodeKind::Interface => 9.0,
         NodeKind::TypeAlias => 6.0,
         NodeKind::Struct => 6.0,
+        NodeKind::Union => 6.0,
         NodeKind::Trait => 9.0,
         NodeKind::Enum => 5.0,
         NodeKind::Component => 8.0,
