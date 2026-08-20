@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.46.1](https://github.com/sunerpy/codegraph-rust/compare/v0.46.0...v0.46.1) (2026-08-20)
+
+
+### Bug Fixes
+
+* **explore:** render the symbol you asked for, and charge what you spend ([#223](https://github.com/sunerpy/codegraph-rust/issues/223)) ([31326cb](https://github.com/sunerpy/codegraph-rust/commit/31326cb4915c09549f8ec0cb4e37359cb7ea652d))
+
 ## [0.46.0](https://github.com/sunerpy/codegraph-rust/compare/v0.45.0...v0.46.0) (2026-08-20)
 
 
