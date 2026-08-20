@@ -2,6 +2,7 @@
   {
     "content_hash": "ae235688285955ff53f65aa9468ee11fc2691fac2cbd99b76f36b6d72f363a98",
     "errors": null,
+    "generated": 0,
     "language": "c",
     "node_count": 6,
     "path": "attr_macro.c",
@@ -10,6 +11,7 @@
   {
     "content_hash": "918ff675ba5d4bc2916b5f0b01a6efe803acec492ab71f0bf83c593be612a202",
     "errors": null,
+    "generated": 0,
     "language": "cpp",
     "node_count": 9,
     "path": "base.hpp",
@@ -18,6 +20,7 @@
   {
     "content_hash": "6b55a06389ed10d1d23bcab95a9ae02421e1cf0aa566526df2f367e29270e7c2",
     "errors": null,
+    "generated": 0,
     "language": "cpp",
     "node_count": 7,
     "path": "com_interface.hpp",
@@ -26,6 +29,7 @@
   {
     "content_hash": "7866bdbba877acfa0b4b8e7e4be58875893da925ac91aa333a4c3658bea64e69",
     "errors": null,
+    "generated": 0,
     "language": "cpp",
     "node_count": 12,
     "path": "derived.cpp",
@@ -34,6 +38,7 @@
   {
     "content_hash": "e3331a39e14456236ae24d3d0cc31562b65008bf1027a065d8f403066d74a46e",
     "errors": null,
+    "generated": 0,
     "language": "cpp",
     "node_count": 5,
     "path": "instantiate_agg.cpp",
@@ -42,6 +47,7 @@
   {
     "content_hash": "5d9bf2ad4d29787d69c168a79c0efb471614f5996f9b065b206da7170bc0fe70",
     "errors": null,
+    "generated": 0,
     "language": "cpp",
     "node_count": 6,
     "path": "instantiate_rank.cpp",
@@ -50,6 +56,7 @@
   {
     "content_hash": "bfd6da256b748444e2bfdff365e7d56daa640afa638e50b294db94cca1f2a7f8",
     "errors": null,
+    "generated": 0,
     "language": "cpp",
     "node_count": 4,
     "path": "namespaced.cpp",
@@ -58,6 +65,7 @@
   {
     "content_hash": "e4419194da0741856b7b23dbc977893cdfda9a926201018b685dce64efbd1f30",
     "errors": null,
+    "generated": 0,
     "language": "cpp",
     "node_count": 4,
     "path": "namespaced_member.cpp",
@@ -66,6 +74,7 @@
   {
     "content_hash": "3d4b5ad9e00d6934eea58bd6707b171b7a335458df91499966798385a5d09ad7",
     "errors": null,
+    "generated": 0,
     "language": "cpp",
     "node_count": 2,
     "path": "namespaced_member.hpp",
@@ -74,6 +83,7 @@
   {
     "content_hash": "e934b42dfe376e8b29355a6ed84d713d44ba9b6f898df4d774f6bda378562bb3",
     "errors": null,
+    "generated": 0,
     "language": "cpp",
     "node_count": 4,
     "path": "neg_interface.hpp",
@@ -82,6 +92,7 @@
   {
     "content_hash": "61ac8b93b7094d0633203791513f3394c7f76e2993a50d75b9f8e32454dcccf6",
     "errors": null,
+    "generated": 0,
     "language": "cpp",
     "node_count": 9,
     "path": "operators.cpp",
@@ -90,6 +101,7 @@
   {
     "content_hash": "0527736aa5807318919d35bb62e2c3f8dc4be0e333cf2e27553b89dc59006b74",
     "errors": null,
+    "generated": 0,
     "language": "cpp",
     "node_count": 4,
     "path": "template_method.cpp",
@@ -98,6 +110,7 @@
   {
     "content_hash": "e72bc5982add705d170ebd03d4a3db5286237e5b8ab662fc9ed35cd51da438c9",
     "errors": null,
+    "generated": 0,
     "language": "cpp",
     "node_count": 3,
     "path": "templated_call.cpp",
@@ -106,6 +119,7 @@
   {
     "content_hash": "5afecb82e36830d924845a28b9069f2fb7cc3d9b15d74f6bf6623fd737b3d265",
     "errors": null,
+    "generated": 0,
     "language": "c",
     "node_count": 2,
     "path": "ue_actor.h",
@@ -114,6 +128,7 @@
   {
     "content_hash": "fd0d7579d620457505815a1d6829820f5512859858153568086bdebddcd0ead2",
     "errors": null,
+    "generated": 0,
     "language": "c",
     "node_count": 7,
     "path": "union_agg.c",
@@ -122,6 +137,7 @@
   {
     "content_hash": "d0f696b07337c1d1fcda49b0222d9b43a5c45a3932ff58cee2cd87b8d68caf53",
     "errors": null,
+    "generated": 0,
     "language": "cpp",
     "node_count": 7,
     "path": "union_agg.cpp",
@@ -130,6 +146,7 @@
   {
     "content_hash": "96f43a0f8244169fcc8281ef0f62de430a43436f39853e254ec27a840ccbe7c7",
     "errors": null,
+    "generated": 0,
     "language": "objc",
     "node_count": 3,
     "path": "union_agg.mm",

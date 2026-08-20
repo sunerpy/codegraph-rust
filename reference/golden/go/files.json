@@ -1,0 +1,56 @@
+[
+  {
+    "content_hash": "6266aa1b37584903c4bdb31325c4ad9d6baae30b2ab5282d38d2428afbe73374",
+    "errors": null,
+    "generated": 1,
+    "language": "go",
+    "node_count": 4,
+    "path": "api.pb.go",
+    "size": 203
+  },
+  {
+    "content_hash": "176b35b02d0f4e9aff372868b7b318d5e83a3a98702146b226647b203bba7a0b",
+    "errors": null,
+    "generated": 0,
+    "language": "go",
+    "node_count": 3,
+    "path": "generator.go",
+    "size": 459
+  },
+  {
+    "content_hash": "545c46190c505988dfa6b0a0029ab7eb9e9583d4b66c262e429c92354e5412d5",
+    "errors": null,
+    "generated": 0,
+    "language": "go",
+    "node_count": 2,
+    "path": "nightly.go",
+    "size": 282
+  },
+  {
+    "content_hash": "6df8e62ce5e6b7eb09837c1c0cb4e1236d78f451b5fba7a980577b948c5ba5fc",
+    "errors": null,
+    "generated": 1,
+    "language": "go",
+    "node_count": 3,
+    "path": "payroll.go",
+    "size": 172
+  },
+  {
+    "content_hash": "66291f001463b1dc06b4c145dbe74d30e8bcb1d82ca83f6d7453022ffc473d27",
+    "errors": null,
+    "generated": 0,
+    "language": "go",
+    "node_count": 2,
+    "path": "payroll_usecase.go",
+    "size": 158
+  },
+  {
+    "content_hash": "afd9d67706ef83f20e2e5c4832b28f3b18cfe3c972e047b1ec8a55d6361905ab",
+    "errors": null,
+    "generated": 1,
+    "language": "go",
+    "node_count": 3,
+    "path": "worker_types.go",
+    "size": 247
+  }
+]

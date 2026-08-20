@@ -526,6 +526,11 @@ pub struct FileRecord {
     pub indexed_at: i64,
     pub node_count: i64,
     pub errors: Vec<String>,
+    /// Whether this file looks machine-generated, from
+    /// [`crate::generated_header::detect_generated_file`] — the union of the
+    /// path convention and a content banner. A relevance hint for ranking, never
+    /// a filter.
+    pub generated: bool,
 }
 
 /// Structural label for HOW a reference was extracted, orthogonal to the typed
@@ -700,6 +705,7 @@ mod tests {
             indexed_at: 1_700_000_001_000,
             node_count: 3,
             errors: vec!["warning".to_string()],
+            generated: false,
         };
         let file_value = serde_json::to_value(file).expect("file record serializes");
         assert_eq!(file_value["contentHash"], json!("sha256"));

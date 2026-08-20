@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use codegraph_store::Store;
+use codegraph_store::migrations::CURRENT_SCHEMA_VERSION;
 
 const GOLDEN_SCHEMA: &str = include_str!("../../../reference/golden/colby.schema.sql");
 
@@ -42,7 +43,7 @@ fn reopening_database_does_not_rerun_migrations() {
 
     assert_eq!(first_count, 2);
     assert_eq!(first_count, second_count);
-    assert_eq!(first_max, 7);
+    assert_eq!(first_max, CURRENT_SCHEMA_VERSION);
     assert_eq!(first_max, second_max);
 }
 
@@ -86,8 +87,10 @@ fn old_v5_database_migrates_to_current_without_data_loss() {
              CREATE TABLE nodes (id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL, qualified_name TEXT NOT NULL, file_path TEXT NOT NULL, language TEXT NOT NULL, start_line INTEGER NOT NULL, end_line INTEGER NOT NULL, start_column INTEGER NOT NULL, end_column INTEGER NOT NULL, docstring TEXT, signature TEXT, visibility TEXT, is_exported INTEGER DEFAULT 0, is_async INTEGER DEFAULT 0, is_static INTEGER DEFAULT 0, is_abstract INTEGER DEFAULT 0, decorators TEXT, type_parameters TEXT, return_type TEXT, updated_at INTEGER NOT NULL);
              CREATE TABLE edges (id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, target TEXT NOT NULL, kind TEXT NOT NULL, metadata TEXT, line INTEGER, col INTEGER, provenance TEXT DEFAULT NULL);
              CREATE TABLE unresolved_refs (id INTEGER PRIMARY KEY AUTOINCREMENT, from_node_id TEXT NOT NULL, reference_name TEXT NOT NULL, reference_kind TEXT NOT NULL, line INTEGER NOT NULL, col INTEGER NOT NULL, candidates TEXT, file_path TEXT NOT NULL DEFAULT '', language TEXT NOT NULL DEFAULT 'unknown', FOREIGN KEY (from_node_id) REFERENCES nodes(id) ON DELETE CASCADE);
+             CREATE TABLE files (path TEXT PRIMARY KEY, content_hash TEXT NOT NULL, language TEXT NOT NULL, size INTEGER NOT NULL, modified_at INTEGER NOT NULL, indexed_at INTEGER NOT NULL, node_count INTEGER DEFAULT 0, errors TEXT);
              INSERT INTO schema_versions (version, applied_at, description) VALUES (1, 0, 'Initial schema'), (5, 0, 'Initial schema includes all migrations');
              INSERT INTO nodes (id, kind, name, qualified_name, file_path, language, start_line, end_line, start_column, end_column, updated_at) VALUES ('file:a.gd', 'file', 'a.gd', 'a.gd', 'a.gd', 'gdscript', 1, 1, 0, 0, 0);
+             INSERT INTO files (path, content_hash, language, size, modified_at, indexed_at, node_count, errors) VALUES ('a.gd', 'deadbeef', 'gdscript', 12, 0, 0, 1, NULL);
              INSERT INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, file_path, language) VALUES ('file:a.gd', 'player.gd', 'references', 3, 0, 'a.gd', 'godot_scene');",
         )
         .unwrap();
@@ -98,7 +101,7 @@ fn old_v5_database_migrates_to_current_without_data_loss() {
 
     // Then it migrates to the current version, gains the reference_subkind column
     // (NULL for the pre-existing row), and the row's data is preserved.
-    assert_eq!(store.schema_version().unwrap(), 7);
+    assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
     let (name, subkind): (String, Option<String>) = store
         .connection()
         .query_row(

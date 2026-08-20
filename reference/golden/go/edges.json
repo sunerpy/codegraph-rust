@@ -1,0 +1,128 @@
+[
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:api.pb.go",
+    "target": "method:6212aa78f83979803561e5a35e2204ca"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:api.pb.go",
+    "target": "method:96ccb238e207922617dad91a1a3bd096"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:api.pb.go",
+    "target": "struct:69ce2dc78af1c72c5e705b2eff7d50b3"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:generator.go",
+    "target": "method:ef967dad7607276a0b2b0ab216d3512c"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:generator.go",
+    "target": "struct:f491ce4d77b17ba0283270af44baa3cb"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:nightly.go",
+    "target": "function:97cc2d07cb9dbe40a71cf1fcc47017c0"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:payroll.go",
+    "target": "function:0244d391763c9267d93aa0f3daec14c3"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:payroll.go",
+    "target": "struct:beab0d96e183bbfa38be5a5dae58f885"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:payroll_usecase.go",
+    "target": "function:8182c7b348a8f99ca98471df85b680d0"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:worker_types.go",
+    "target": "function:9ca48aa8a0359c83c2de731082d72870"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:worker_types.go",
+    "target": "struct:6e0211f4791dd90203584f4897508e01"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:69ce2dc78af1c72c5e705b2eff7d50b3",
+    "target": "method:6212aa78f83979803561e5a35e2204ca"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:69ce2dc78af1c72c5e705b2eff7d50b3",
+    "target": "method:96ccb238e207922617dad91a1a3bd096"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:f491ce4d77b17ba0283270af44baa3cb",
+    "target": "method:ef967dad7607276a0b2b0ab216d3512c"
+  }
+]

@@ -129,6 +129,26 @@ fn rust_db_is_self_equivalent_to_rust_golden() {
 }
 
 #[test]
+fn generated_golden_matches_committed_go_fixture() {
+    // Guards #1500 content-header detection: `files.generated` is byte-pinned at
+    // BOTH values — 1 for the Go banner, the Wrangler double-`by` banner, and the
+    // path-only `.pb.go`; 0 for the hand-written sibling, the single-`by` prose
+    // negative, and the generator whose banner is a `const` in its body.
+    let tempdir = TestDir::new("generated-golden-go");
+    write_golden(&go_db(), tempdir.path()).unwrap();
+
+    let expected = load_golden(&go_golden_dir()).unwrap();
+    let actual = load_golden(tempdir.path()).unwrap();
+
+    diff_canonical(&expected, &actual, None).unwrap();
+}
+
+#[test]
+fn go_db_is_self_equivalent_to_go_golden() {
+    assert_equivalent(&go_db(), &go_golden_dir()).unwrap();
+}
+
+#[test]
 fn generated_golden_matches_committed_python_fixture() {
     let tempdir = TestDir::new("generated-golden-python");
     write_golden(&python_db(), tempdir.path()).unwrap();
@@ -436,6 +456,14 @@ fn rust_db() -> PathBuf {
 
 fn rust_golden_dir() -> PathBuf {
     workspace_root().join("reference/golden/rust")
+}
+
+fn go_db() -> PathBuf {
+    workspace_root().join("reference/golden/go/colby.db")
+}
+
+fn go_golden_dir() -> PathBuf {
+    workspace_root().join("reference/golden/go")
 }
 
 fn python_db() -> PathBuf {

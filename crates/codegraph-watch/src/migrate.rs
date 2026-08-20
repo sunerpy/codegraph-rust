@@ -34,6 +34,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use codegraph_core::IndexPaths;
+use codegraph_core::generated_header::detect_generated_file;
 use codegraph_core::node_id::hash_content;
 use codegraph_core::types::{Edge, FileRecord, Node, UnresolvedRef};
 use codegraph_extract::{detect_language_with, extract_source_with};
@@ -126,6 +127,7 @@ pub(crate) fn migrate_project(
                 .filter(|node| node.file_path == *relative)
                 .count() as i64,
             errors: result.errors.clone(),
+            generated: detect_generated_file(relative, &source),
         };
 
         rebuild.store().upsert_file(&file)?;

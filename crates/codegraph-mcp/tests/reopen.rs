@@ -95,6 +95,7 @@ fn index_into(base: &Path, files: &[(&str, &str)]) {
                 indexed_at: 0,
                 node_count: result.nodes.len() as i64,
                 errors: Vec::new(),
+                generated: false,
             })
             .unwrap();
     }

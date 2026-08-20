@@ -1578,6 +1578,28 @@ impl CodeGraphEngine {
 
     // === Symbol resolution ==============================================
 
+    /// Sort `nodes` so machine-generated files rank LAST, by the D1 union of the
+    /// path convention and the stored `files.generated` flag.
+    ///
+    /// The union is what makes this safe on an index written before #1500: those
+    /// rows all read 0, so reading the column ALONE would drop the path demotion
+    /// they already had. One batch query over the sorted+deduped candidate paths,
+    /// so no `HashSet` iteration order reaches output.
+    fn sort_generated_last(&self, nodes: &mut [Node]) -> anyhow::Result<()> {
+        let mut paths = nodes
+            .iter()
+            .map(|n| n.file_path.clone())
+            .collect::<Vec<_>>();
+        paths.sort_unstable();
+        paths.dedup();
+        let stored = self.store.generated_paths_among(&paths)?;
+        // ASCENDING on "is generated", so `false` (0) comes first.
+        nodes.sort_by_key(|n| {
+            u8::from(is_generated_file(&n.file_path) || stored.contains(&n.file_path))
+        });
+        Ok(())
+    }
+
     /// `findSymbolMatches` (`tools.ts:3220-3265`): exact-name enumeration for a
     /// bare name, falling back to the top fuzzy result.
     fn find_symbol_matches(&self, symbol: &str) -> anyhow::Result<Vec<Node>> {
@@ -1586,7 +1608,7 @@ impl CodeGraphEngine {
             let exact = self.store.nodes_by_name(symbol)?;
             if !exact.is_empty() {
                 let mut sorted = exact;
-                sorted.sort_by_key(|n| is_generated_file(&n.file_path) as u8);
+                self.sort_generated_last(&mut sorted)?;
                 return Ok(sorted);
             }
             let fuzzy = search_nodes(
@@ -1617,7 +1639,7 @@ impl CodeGraphEngine {
             return Ok(Vec::new());
         }
         let mut sorted = exact;
-        sorted.sort_by_key(|n| is_generated_file(&n.file_path) as u8);
+        self.sort_generated_last(&mut sorted)?;
         Ok(sorted)
     }
 
@@ -1643,7 +1665,7 @@ impl CodeGraphEngine {
             });
         }
         let mut ranked = exact;
-        ranked.sort_by_key(|n| is_generated_file(&n.file_path) as u8);
+        self.sort_generated_last(&mut ranked)?;
         let locations = ranked
             .iter()
             .map(|n| format!("{} at {}:{}", n.kind.as_str(), n.file_path, n.start_line))
@@ -1746,6 +1768,18 @@ impl CodeGraphEngine {
         }
 
         self.rescue_change_surface(&mut sub, &seed_ids, query, &traverser)?;
+
+        // The stored half of the generated signal, in ONE batch query. Sorted and
+        // deduped first, so no `HashSet` iteration order can reach output — the
+        // same discipline `rescue_change_surface` applies to its candidates.
+        let mut candidate_paths = sub
+            .nodes
+            .iter()
+            .map(|n| n.file_path.clone())
+            .collect::<Vec<_>>();
+        candidate_paths.sort_unstable();
+        candidate_paths.dedup();
+        sub.generated_files = self.store.generated_paths_among(&candidate_paths)?;
 
         sub.finalize();
         Ok(sub)
@@ -2253,6 +2287,12 @@ struct ExploreSubgraph {
     /// lexically-dissimilar answer file (grpc's `dialoptions.go`) is not buried
     /// under incidental roots that merely share query words.
     rescued_files: HashSet<String>,
+    /// Paths whose `files.generated` row is 1, fetched in ONE batch query before
+    /// `finalize` runs. `finalize` has no store handle, so the stored half of the
+    /// generated signal has to arrive as a field — exactly how `rescued_files`
+    /// reaches it. Empty leaves behavior on the path check alone, which is what
+    /// keeps a pre-#1500 index ranking as it always did.
+    generated_files: HashSet<String>,
 }
 
 impl ExploreSubgraph {
@@ -2336,7 +2376,8 @@ impl ExploreSubgraph {
                 // when it is the only match. The sort is descending, so real
                 // code must carry the HIGHER value. `find_symbol_matches` and
                 // `find_all_symbols` apply the same signal.
-                let not_generated = u8::from(!is_generated_file(fp));
+                let not_generated =
+                    u8::from(!(is_generated_file(fp) || self.generated_files.contains(fp)));
                 let sym_count = self
                     .nodes
                     .iter()
@@ -3313,6 +3354,7 @@ mod tests {
             indexed_at: 0,
             node_count,
             errors: Vec::new(),
+            generated: false,
         }
     }
 
@@ -3355,6 +3397,33 @@ mod tests {
         file.content_hash = codegraph_core::node_id::hash_content(content);
         file.size = metadata.len() as i64;
         file.modified_at = modified_at;
+        put_file(engine, &file);
+    }
+
+    /// `put_indexed_source` plus the stored `files.generated` verdict, so a test
+    /// can model a banner-marked file (flag 1 on an ORDINARY path) and a
+    /// pre-#1500 index (flag 0 on a path the suffix check still catches).
+    fn put_indexed_source_generated(
+        engine: &CodeGraphEngine,
+        rel: &str,
+        content: &str,
+        language: Language,
+        node_count: i64,
+        generated: bool,
+    ) {
+        write_src(engine, rel, content);
+        let metadata = std::fs::metadata(engine.project_root.join(rel)).unwrap();
+        let modified_at = metadata
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let mut file = file_rec(rel, language, node_count);
+        file.content_hash = codegraph_core::node_id::hash_content(content);
+        file.size = metadata.len() as i64;
+        file.modified_at = modified_at;
+        file.generated = generated;
         put_file(engine, &file);
     }
 
@@ -5100,6 +5169,254 @@ mod tests {
             order,
             vec!["payroll/zz_real.go", "payroll/a_gen.pb.go"],
             "the real implementation's section must precede the generated stub's; got {order:?} in:\n{text}"
+        );
+    }
+
+    /// #1500 — the same ranking property as the `.pb.go` test above, but the
+    /// generated file carries an ORDINARY Go filename and is known only by its
+    /// stored `files.generated` flag. The path check cannot see it, so this fails
+    /// unless `finalize` consults the batch-fetched set.
+    #[test]
+    fn explore_ranks_a_real_impl_above_a_banner_marked_generated_file() {
+        let mut engine = test_engine();
+        // Both names are ordinary: `a_banner.go` sorts FIRST alphabetically and
+        // would win on the tie-break, so a pass cannot come from name ordering.
+        let generated = node_lang(
+            "ComputePay",
+            "ComputePay",
+            "payroll/a_banner.go",
+            1,
+            3,
+            NodeKind::Function,
+            Language::Go,
+        );
+        let real = node_lang(
+            "ComputePay",
+            "ComputePay",
+            "payroll/zz_real.go",
+            1,
+            3,
+            NodeKind::Function,
+            Language::Go,
+        );
+        put_indexed_source_generated(
+            &engine,
+            "payroll/a_banner.go",
+            "// Code generated by fkit-crud. DO NOT EDIT.\nfunc ComputePay() int {\n\treturn 0\n}\n",
+            Language::Go,
+            1,
+            true,
+        );
+        put_indexed_source_generated(
+            &engine,
+            "payroll/zz_real.go",
+            "func ComputePay() int {\n\treturn 42\n}\n",
+            Language::Go,
+            1,
+            false,
+        );
+        // Neither path matches the suffix check, so the stored flag is the ONLY
+        // signal available — that is what makes this test the #1500 regression.
+        assert!(!is_generated_file("payroll/a_banner.go"));
+        put_nodes(&mut engine, &[generated.clone(), real.clone()]);
+
+        let text = text_of(&engine.execute(
+            "codegraph_explore",
+            &serde_json::json!({"query": "ComputePay"}),
+        ));
+        let order: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("#### "))
+            .filter_map(|l| {
+                ["payroll/zz_real.go", "payroll/a_banner.go"]
+                    .into_iter()
+                    .find(|f| l.contains(f))
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec!["payroll/zz_real.go", "payroll/a_banner.go"],
+            "the real implementation must precede the banner-marked file; got {order:?} in:\n{text}"
+        );
+    }
+
+    /// #1500 — the same signal in `find_symbol_matches`, whose sort is ASCENDING
+    /// (so `false` sorts first). A flipped polarity would still compile, so this
+    /// pins the direction as well as the presence of the union.
+    #[test]
+    fn find_symbol_matches_demotes_a_banner_marked_definition() {
+        let mut engine = test_engine();
+        let generated = node_lang(
+            "ComputePay",
+            "ComputePay",
+            "payroll/a_banner.go",
+            1,
+            3,
+            NodeKind::Function,
+            Language::Go,
+        );
+        let real = node_lang(
+            "ComputePay",
+            "ComputePay",
+            "payroll/zz_real.go",
+            1,
+            3,
+            NodeKind::Function,
+            Language::Go,
+        );
+        put_indexed_source_generated(
+            &engine,
+            "payroll/a_banner.go",
+            "// Code generated by fkit-crud. DO NOT EDIT.\nfunc ComputePay() int {\n\treturn 0\n}\n",
+            Language::Go,
+            1,
+            true,
+        );
+        put_indexed_source_generated(
+            &engine,
+            "payroll/zz_real.go",
+            "func ComputePay() int {\n\treturn 42\n}\n",
+            Language::Go,
+            1,
+            false,
+        );
+        put_nodes(&mut engine, &[generated, real]);
+
+        let matches = engine.find_symbol_matches("ComputePay").unwrap();
+        let files: Vec<&str> = matches.iter().map(|n| n.file_path.as_str()).collect();
+        assert_eq!(
+            files,
+            vec!["payroll/zz_real.go", "payroll/a_banner.go"],
+            "find_symbol_matches must rank the banner-marked definition LAST"
+        );
+    }
+
+    /// D1 GUARD — the stored flag only ever ADDS. A database written before
+    /// #1500 has `generated = 0` on every row, so a `.pb.go` file must STILL be
+    /// demoted by the path check alone. Drop the `is_generated_file(...) ||` half
+    /// and this fails, which is what stops the change from silently re-ranking
+    /// every existing index in the wrong direction.
+    #[test]
+    fn a_pre_change_index_keeps_the_path_demotion_when_generated_is_zero() {
+        let mut engine = test_engine();
+        let generated = node_lang(
+            "Marshal",
+            "Marshal",
+            "payroll/a_stub.pb.go",
+            1,
+            3,
+            NodeKind::Function,
+            Language::Go,
+        );
+        let real = node_lang(
+            "Marshal",
+            "Marshal",
+            "payroll/zz_real.go",
+            1,
+            3,
+            NodeKind::Function,
+            Language::Go,
+        );
+        // `generated = 0` on BOTH rows, exactly as a pre-#1500 database reads.
+        put_indexed_source_generated(
+            &engine,
+            "payroll/a_stub.pb.go",
+            "func Marshal() int {\n\treturn 0\n}\n",
+            Language::Go,
+            1,
+            false,
+        );
+        put_indexed_source_generated(
+            &engine,
+            "payroll/zz_real.go",
+            "func Marshal() int {\n\treturn 42\n}\n",
+            Language::Go,
+            1,
+            false,
+        );
+        put_nodes(&mut engine, &[generated, real]);
+
+        // find_symbol_matches (ASCENDING) still demotes it.
+        let matches = engine.find_symbol_matches("Marshal").unwrap();
+        let files: Vec<&str> = matches.iter().map(|n| n.file_path.as_str()).collect();
+        assert_eq!(
+            files,
+            vec!["payroll/zz_real.go", "payroll/a_stub.pb.go"],
+            "a stored 0 must not remove the PATH demotion in find_symbol_matches"
+        );
+
+        // ... and so does finalize, through the explore surface.
+        let text = text_of(&engine.execute(
+            "codegraph_explore",
+            &serde_json::json!({"query": "Marshal"}),
+        ));
+        let order: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("#### "))
+            .filter_map(|l| {
+                ["payroll/zz_real.go", "payroll/a_stub.pb.go"]
+                    .into_iter()
+                    .find(|f| l.contains(f))
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec!["payroll/zz_real.go", "payroll/a_stub.pb.go"],
+            "a stored 0 must not remove the PATH demotion in finalize; got {order:?} in:\n{text}"
+        );
+    }
+
+    /// Pins the TODO-28 wiring on its own, so a refactor that stops populating
+    /// the field fails a NAMED test instead of only shifting a ranking.
+    #[test]
+    fn explore_generated_files_set_is_populated_before_finalize() {
+        let mut engine = test_engine();
+        let generated = node_lang(
+            "ComputePay",
+            "ComputePay",
+            "payroll/a_banner.go",
+            1,
+            3,
+            NodeKind::Function,
+            Language::Go,
+        );
+        put_indexed_source_generated(
+            &engine,
+            "payroll/a_banner.go",
+            "// Code generated by fkit-crud. DO NOT EDIT.\nfunc ComputePay() int {\n\treturn 0\n}\n",
+            Language::Go,
+            1,
+            true,
+        );
+        put_indexed_source_generated(
+            &engine,
+            "payroll/zz_real.go",
+            "func ComputePay() int {\n\treturn 42\n}\n",
+            Language::Go,
+            1,
+            false,
+        );
+        let real = node_lang(
+            "ComputePay",
+            "ComputePay",
+            "payroll/zz_real.go",
+            1,
+            3,
+            NodeKind::Function,
+            Language::Go,
+        );
+        put_nodes(&mut engine, &[generated, real]);
+
+        let sub = engine.find_relevant_context("ComputePay").unwrap();
+        assert!(
+            sub.generated_files.contains("payroll/a_banner.go"),
+            "the flagged path must reach the subgraph before finalize; got {:?}",
+            sub.generated_files
+        );
+        assert!(
+            !sub.generated_files.contains("payroll/zz_real.go"),
+            "an unflagged path must NOT appear; got {:?}",
+            sub.generated_files
         );
     }
 

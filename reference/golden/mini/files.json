@@ -2,6 +2,7 @@
   {
     "content_hash": "10857ef49b4fb2f611c10181f9fa4c955e86b1ec1a54b2a272b17ffb848598cd",
     "errors": null,
+    "generated": 0,
     "language": "typescript",
     "node_count": 3,
     "path": "src/app.ts",
@@ -10,6 +11,7 @@
   {
     "content_hash": "caebbaef45cf4da7e66dd1479300307d465c03a7a9be5c9e358877bcbc81efc8",
     "errors": null,
+    "generated": 0,
     "language": "typescript",
     "node_count": 5,
     "path": "src/math.ts",
@@ -18,6 +20,7 @@
   {
     "content_hash": "256033248f73c030955a522a62420fc54a5bdc1fc1c7aff58e55403e7b27cc3b",
     "errors": null,
+    "generated": 0,
     "language": "python",
     "node_count": 5,
     "path": "tools/greeter.py",

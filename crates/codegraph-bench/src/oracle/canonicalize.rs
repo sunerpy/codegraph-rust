@@ -146,8 +146,9 @@ fn canonical_refs(conn: &Connection) -> Result<Vec<CanonicalRow>> {
 }
 
 fn canonical_files(conn: &Connection) -> Result<Vec<CanonicalRow>> {
-    let mut stmt =
-        conn.prepare("SELECT path, content_hash, language, size, node_count, errors FROM files")?;
+    let mut stmt = conn.prepare(
+        "SELECT path, content_hash, language, size, node_count, errors, generated FROM files",
+    )?;
     let rows = stmt.query_map([], |row| {
         Ok(RawFile {
             path: row.get(0)?,
@@ -156,6 +157,7 @@ fn canonical_files(conn: &Connection) -> Result<Vec<CanonicalRow>> {
             size: row.get(3)?,
             node_count: row.get(4)?,
             errors: row.get(5)?,
+            generated: row.get(6)?,
         })
     })?;
 
@@ -387,6 +389,7 @@ struct RawFile {
     size: i64,
     node_count: i64,
     errors: Option<String>,
+    generated: i64,
 }
 
 impl RawFile {
@@ -399,6 +402,7 @@ impl RawFile {
         row.insert("size".to_string(), json!(self.size));
         row.insert("node_count".to_string(), json!(self.node_count));
         row.insert("errors".to_string(), json_column(self.errors, "errors")?);
+        row.insert("generated".to_string(), json!(self.generated));
         Ok(row)
     }
 }

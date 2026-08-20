@@ -47,7 +47,8 @@ size INTEGER NOT NULL,
 modified_at INTEGER NOT NULL,
 indexed_at INTEGER NOT NULL,
 node_count INTEGER DEFAULT 0,
-errors TEXT -- JSON array
+errors TEXT, -- JSON array
+generated INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE unresolved_refs (
 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -104,6 +105,7 @@ CREATE UNIQUE INDEX idx_edges_identity
 ON edges(source, target, kind, IFNULL(line, -1), IFNULL(col, -1));
 CREATE INDEX idx_files_language ON files(language);
 CREATE INDEX idx_files_modified_at ON files(modified_at);
+CREATE INDEX idx_files_generated ON files(path) WHERE generated = 1;
 CREATE INDEX idx_unresolved_from_node ON unresolved_refs(from_node_id);
 CREATE INDEX idx_unresolved_name ON unresolved_refs(reference_name);
 CREATE INDEX idx_unresolved_file_path ON unresolved_refs(file_path);

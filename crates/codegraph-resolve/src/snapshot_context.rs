@@ -422,6 +422,7 @@ mod tests {
             indexed_at: 0,
             node_count: count,
             errors: Vec::new(),
+            generated: false,
         }
     }
 

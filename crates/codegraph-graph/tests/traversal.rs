@@ -498,6 +498,7 @@ fn file_record(path: &str) -> codegraph_core::types::FileRecord {
         indexed_at: 1,
         node_count: 1,
         errors: Vec::new(),
+        generated: false,
     }
 }
 

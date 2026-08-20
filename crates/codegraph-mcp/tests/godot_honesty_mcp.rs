@@ -78,6 +78,7 @@ fn pipeline_project(files: &[(&str, &str)]) -> TestProject {
                 indexed_at: 0,
                 node_count: result.nodes.len() as i64,
                 errors: Vec::new(),
+                generated: false,
             })
             .unwrap();
         store.upsert_nodes(&result.nodes).unwrap();
