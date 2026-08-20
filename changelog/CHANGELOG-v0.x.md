@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.45.0](https://github.com/sunerpy/codegraph-rust/compare/v0.44.1...v0.45.0) (2026-08-20)
+
+
+### Features
+
+* **resolve:** bind Tauri commands to their invoke call sites ([#217](https://github.com/sunerpy/codegraph-rust/issues/217)) ([4ef013b](https://github.com/sunerpy/codegraph-rust/commit/4ef013baf224fbe99ced3977af36e822ff6dafa2))
+
 ## [0.44.1](https://github.com/sunerpy/codegraph-rust/compare/v0.44.0...v0.44.1) (2026-08-20)
 
 
