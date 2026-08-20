@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.44.0](https://github.com/sunerpy/codegraph-rust/compare/v0.43.3...v0.44.0) (2026-08-20)
+
+
+### Features
+
+* **extract:** model unions, unit structs and COM interfaces as containers ([#213](https://github.com/sunerpy/codegraph-rust/issues/213)) ([0b365ed](https://github.com/sunerpy/codegraph-rust/commit/0b365ed0e304fbd37665a4c09bc797720c904fd5))
+
 ## [0.43.3](https://github.com/sunerpy/codegraph-rust/compare/v0.43.2...v0.43.3) (2026-08-19)
 
 
