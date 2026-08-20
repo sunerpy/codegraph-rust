@@ -37,6 +37,33 @@ const TRAIL_CAP: usize = 8;
 /// `Read`-tool cap mirrored by file-mode `codegraph_node` (`tools.ts:489`).
 const FILE_MODE_MAX_LINES: usize = 2000;
 
+/// Upstream's per-file protected-focus cap (`.slice(0, 6)`), so a 40-token query
+/// cannot pin a whole file.
+const FOCUS_CAP: usize = 6;
+
+/// Upstream's `POINTER_SYMBOLS` — `name:line` pairs shown per "Not shown above"
+/// pointer line before a `+N more` tail.
+const POINTER_SYMBOLS: usize = 6;
+
+/// Upstream's `POINTER_MAX_FILES` — files listed in the "Not shown above" block.
+const POINTER_MAX_FILES: usize = 10;
+
+/// Upstream's `MIN_WINDOW_LINES` — the never-empty floor for a windowed cluster.
+/// A file always emits at least this many whole lines around its
+/// highest-importance member, even when that exceeds the room it was given; the
+/// caller then drops the file whole rather than emitting a stub.
+const MIN_WINDOW_LINES: usize = 12;
+
+/// Fixed cost of `render_explore_file`'s section template around the header, the
+/// language tag and the cluster body: `"\n\n"` + ``"```"`` + `"\n"` + `"\n"` +
+/// ``"```"`` + `"\n"`.
+const SECTION_FENCE_CHARS: usize = 11;
+
+/// The trailing `"\n\n... (gap) ..."` a section carries when any cluster was
+/// dropped or windowed. Reserved unconditionally in `section_frame`, since
+/// whether it is emitted is only known after cluster selection.
+const SECTION_GAP_TAIL_CHARS: usize = 17;
+
 /// Callable node kinds whose signature (parameter/return) types the #1064
 /// change-surface pass follows. Mirrors upstream `CALLABLE_KINDS`
 /// (`tools.ts:2620`); `constructor` has no Rust NodeKind (ctors are `method`).
@@ -985,6 +1012,16 @@ impl CodeGraphEngine {
         let mut any_file_trimmed = false;
         let mut excluded_files: Vec<&String> = Vec::new();
         let mut rendered_sources: Vec<(String, usize)> = Vec::new();
+        let precise_tokens = precise_query_tokens(&query);
+        let indexed_file_count = self.store.counts().ok().map(|c| c.file_count);
+        let effective_budget = budget
+            .max_output_chars
+            .saturating_sub(fixed_epilogue_reserve(
+                &budget,
+                file_order.len(),
+                max_files,
+                indexed_file_count,
+            ));
 
         for file_path in &file_order {
             if files_included >= max_files {
@@ -1000,17 +1037,25 @@ impl CodeGraphEngine {
             let file_lines: Vec<&str> = content.split('\n').collect();
             let lang = subgraph.file_language(file_path);
 
-            let rendered = self.render_explore_file(
-                &subgraph,
-                file_path,
-                &file_lines,
-                &lang,
-                &budget,
-                possibly_drifted,
-            );
+            let focuses = subgraph.file_focus_lines(file_path, &precise_tokens);
+            let ctx = RenderCtx {
+                budget: &budget,
+                funded_headroom: effective_budget
+                    .saturating_sub(total_chars)
+                    .saturating_sub(1),
+                focuses: &focuses,
+                drifted: possibly_drifted,
+            };
+            let rendered = self.render_explore_file(&subgraph, file_path, &file_lines, &lang, &ctx);
             // Past the total cap an incidental file is skipped whole — the source
             // section never slices through a method body (`tools.ts:2888-2894`).
-            if total_chars + rendered.section.len() + 200 > budget.max_output_chars {
+            //
+            // A section costs `section.len() + 1`: its own length — which already
+            // covers the `#### ` header and the fence — plus the one
+            // `lines.join("\n")` separator it is pushed behind. The same
+            // expression appears at the accumulator below, so the admission test
+            // and the running total cannot disagree.
+            if total_chars + rendered.section.len() + 1 > effective_budget {
                 any_file_trimmed = true;
                 excluded_files.push(file_path);
                 continue;
@@ -1025,59 +1070,53 @@ impl CodeGraphEngine {
                 rendered_sources.push(((*file_path).clone(), lines.len()));
             }
             lines.push(rendered.section);
-            total_chars += section_len + 200;
+            total_chars += section_len + 1;
             files_included += 1;
         }
 
         // "Additional relevant files (not shown)" — the excluded set, so the
         // agent can request specifics. Gated by the budget (`tools.ts:2910-2927`).
         if budget.include_additional_files && !excluded_files.is_empty() {
-            lines.push("### Not shown above — explore these names for their source".to_string());
+            lines.push(POINTER_BLOCK_HEADER.to_string());
             lines.push(String::new());
-            for file_path in excluded_files.iter().take(10) {
-                let names = subgraph.file_node_locations(file_path);
-                lines.push(format!("- {file_path}: {names}"));
-            }
-            if excluded_files.len() > 10 {
-                lines.push(format!(
-                    "- ... and {} more files",
-                    excluded_files.len() - 10
-                ));
+            // The block is ELASTIC: it is fitted to the headroom the sections did
+            // not use, so however long the pointer list is it cannot push the
+            // response past its budget. The frame and the tail are already paid
+            // for by the reserve and so are not charged here.
+            let candidates: Vec<String> = excluded_files
+                .iter()
+                .map(|file_path| {
+                    format!("- {file_path}: {}", subgraph.file_node_locations(file_path))
+                })
+                .collect();
+            let (pointer_lines, unlisted) =
+                fit_pointer_lines(&candidates, effective_budget.saturating_sub(total_chars));
+            lines.extend(pointer_lines);
+            // The TRUE unlisted count — those dropped by elasticity plus those
+            // dropped by the file cap — so a file the response did not render is
+            // never silently absent.
+            if unlisted > 0 {
+                lines.push(pointer_unlisted_tail(unlisted));
             }
             lines.push(String::new());
         }
 
-        // Completeness signal / trim note, gated by the budget
-        // (`tools.ts:2933-2940`).
-        if budget.include_completeness_signal {
-            lines.push("---".to_string());
-            lines.push(format!(
-                "> **Complete source for {files_included} files is included above — do NOT re-read them.** If your question also needs files/symbols listed under \"Not shown above\" (or any area this call didn't cover), make ANOTHER codegraph_explore targeting those names — it returns the same source with line numbers and is cheaper and more complete than reading. Reserve Read for a single specific line range explore can't surface."
-            ));
-            lines.push(String::new());
-        } else if any_file_trimmed {
-            lines.push("> Some file sections were trimmed for size. For a specific symbol you still need, run another `codegraph_explore` (or `codegraph_node`) with its exact name — line-numbered source, cheaper and more complete than Read.".to_string());
-            lines.push(String::new());
-        }
-
-        // Follow-up-call note, gated (`tools.ts:2943-2952`).
+        // Completeness signal / trim note (`tools.ts:2933-2940`), then the
+        // follow-up-call note (`tools.ts:2943-2952`), both gated by the budget and
+        // both built by the SAME function the pre-loop reserve is computed from.
         //
-        // Upstream's wording announced a per-project call BUDGET ("N calls for
-        // this project … Synthesize once you've used N"), but nothing anywhere
-        // enforces it, so its only effect was agents stopping while their
-        // question was still uncovered (#1504). The useful half — one more
-        // explore beats falling back to Read — is kept, the phantom cap is
-        // dropped, and the absence of a limit is now stated outright rather than
-        // left to inference.
-        if budget.include_budget_note
-            && let Ok(c) = self.store.counts()
-        {
-            lines.push(format!(
-                    "> **{} files indexed.** Each call covers ~6 files; if your question spans more, make ANOTHER `codegraph_explore` targeting the uncovered area BEFORE falling back to Read — another explore is cheaper and more complete than reading those files. There is no call limit.",
-                    c.file_count
-                ));
-            lines.push(String::new());
-        }
+        // Upstream's follow-up wording announced a per-project call BUDGET ("N
+        // calls for this project … Synthesize once you've used N"), but nothing
+        // anywhere enforces it, so its only effect was agents stopping while their
+        // question was still uncovered (#1504). The useful half — one more explore
+        // beats falling back to Read — is kept, the phantom cap is dropped, and
+        // the absence of a limit is stated outright rather than left to inference.
+        lines.extend(epilogue_note_lines(
+            &budget,
+            files_included,
+            any_file_trimmed,
+            indexed_file_count,
+        ));
 
         // Final ABSOLUTE inline ceiling — cut at a `#### ` file-section boundary
         // so trailing whole sections drop rather than slicing a method body
@@ -1099,9 +1138,10 @@ impl CodeGraphEngine {
         file_path: &str,
         file_lines: &[&str],
         lang: &str,
-        budget: &ExploreOutputBudget,
-        drifted: bool,
+        ctx: &RenderCtx<'_>,
     ) -> ExploreFileRender {
+        let budget = ctx.budget;
+        let drifted = ctx.drifted;
         let total_lines = file_lines.len();
         let content = file_lines.join("\n");
         let body = content.trim_end_matches('\n');
@@ -1137,10 +1177,33 @@ impl CodeGraphEngine {
             let numbered = number_source_lines_at(&body.split('\n').collect::<Vec<_>>(), 1);
             let names =
                 subgraph.file_header_names_capped(file_path, budget.max_symbols_in_file_header);
-            return ExploreFileRender {
-                section: format!("#### {file_path} — {names}\n\n```{lang}\n{numbered}\n```\n"),
-                source_emitted: true,
-            };
+            let section = format!("#### {file_path} — {names}\n\n```{lang}\n{numbered}\n```\n");
+            // The two conditions are ordered AFFORDABILITY FIRST, and that order
+            // is normative rather than stylistic.
+            //
+            // (1) Affordable ⇒ byte-for-byte today's behaviour, with no focus
+            //     logic consulted at all, so every input that is not the defect —
+            //     including every existing golden — is untouched by EVALUATION
+            //     rather than by unreachability.
+            let section_cost = section.len() + 1;
+            if section_cost <= ctx.funded_headroom {
+                return ExploreFileRender {
+                    section,
+                    source_emitted: true,
+                };
+            }
+            // (2) Unaffordable but owning NO focus ⇒ also today's behaviour:
+            //     return whole and let the caller drop it whole, so "an incidental
+            //     file that doesn't fit is DROPPED whole" stays literally true.
+            if ctx.focuses.is_empty() {
+                return ExploreFileRender {
+                    section,
+                    source_emitted: true,
+                };
+            }
+            // (3) Unaffordable AND owning a focus ⇒ fall through to the clustering
+            //     path, which windows against `funded_headroom` and guarantees a
+            //     window per focus. The ONLY new behaviour.
         }
 
         // Cluster nearby symbol ranges; merge ranges within `gapThreshold`
@@ -1164,7 +1227,14 @@ impl CodeGraphEngine {
                     && (n.end_line - n.start_line + 1) as usize > total_lines / 2)
             })
             .map(|n| {
-                let importance = if subgraph.roots.iter().any(|r| r == &n.id) {
+                // A protected focus outranks an ordinary root, so a cluster that
+                // owns one sorts ahead of equally-important siblings. It is
+                // matched on the STORED definition line: a focus whose line the
+                // clamp below moves is one the range filters would drop anyway,
+                // and §3.1.1 conditions the guarantee on surviving them.
+                let importance = if ctx.focuses.contains(&(n.start_line as usize)) {
+                    11
+                } else if subgraph.roots.iter().any(|r| r == &n.id) {
                     10
                 } else {
                     1
@@ -1212,17 +1282,133 @@ impl CodeGraphEngine {
 
         const CONTEXT_PADDING: usize = 3;
         const GAP_MARKER: &str = "\n\n... (gap) ...\n\n";
-        let build_section = |c: &Cluster| -> String {
+        // A cluster's padded slice bounds, 0-based with an EXCLUSIVE end — the
+        // exact bounds `build_section` has always used, so a cluster that fits
+        // its room still renders byte-identically.
+        //
+        // `.min(end_idx)` guards the slice start: even if a cluster's start
+        // slipped past EOF, `start_idx <= end_idx` keeps the range valid.
+        let span_of = |c: &Cluster| -> (usize, usize) {
             let end_idx = (c.end + CONTEXT_PADDING).min(total_lines);
-            // `.min(end_idx)` guards the slice start: even if a cluster's start
-            // slipped past EOF, `start_idx <= end_idx` keeps the range valid.
             let start_idx = c
                 .start
                 .saturating_sub(1)
                 .saturating_sub(CONTEXT_PADDING)
                 .min(end_idx);
-            let slice = &file_lines[start_idx..end_idx];
-            number_source_lines_at(slice, start_idx + 1)
+            (start_idx, end_idx)
+        };
+        let render_range = |start_idx: usize, end_idx: usize| -> String {
+            number_source_lines_at(&file_lines[start_idx..end_idx], start_idx + 1)
+        };
+
+        // `number_source_lines_at` renders each line as `"{n}\t{line}"` and joins
+        // with "\n", so a range costs the per-line widths plus one separator
+        // between neighbours. Summed rather than rendered, so growing a window
+        // one line at a time stays linear instead of re-formatting the slice.
+        let range_cost = |start_idx: usize, end_idx: usize| -> usize {
+            if end_idx <= start_idx {
+                return 0;
+            }
+            (start_idx..end_idx)
+                .map(|i| decimal_width(i + 1) + 1 + file_lines[i].len())
+                .sum::<usize>()
+                + (end_idx - start_idx - 1)
+        };
+        let grow_head = |start_idx: usize, end_idx: usize, room: usize| -> (usize, usize) {
+            let floor = (start_idx + MIN_WINDOW_LINES).min(end_idx);
+            let mut end = (start_idx + 1).min(end_idx);
+            while end < end_idx && range_cost(start_idx, end + 1) <= room {
+                end += 1;
+            }
+            (start_idx, end.max(floor))
+        };
+        // Grow one line up, then one line down, alternating, so the emitted window
+        // is centred on the focus rather than biased to whichever side was tried
+        // first. Bounded by the span's own line count, so it always terminates.
+        let grow_around =
+            |focus_idx: usize, start_idx: usize, end_idx: usize, room: usize| -> (usize, usize) {
+                let focus_idx = focus_idx.clamp(start_idx, end_idx - 1);
+                let (mut lo, mut hi) = (focus_idx, focus_idx + 1);
+                let mut up = true;
+                for _ in 0..(end_idx - start_idx) * 2 {
+                    let can_up = lo > start_idx && range_cost(lo - 1, hi) <= room;
+                    let can_down = hi < end_idx && range_cost(lo, hi + 1) <= room;
+                    if !can_up && !can_down {
+                        break;
+                    }
+                    if (up && can_up) || !can_down {
+                        lo -= 1;
+                    } else {
+                        hi += 1;
+                    }
+                    up = !up;
+                }
+                let want = MIN_WINDOW_LINES.min(end_idx - start_idx);
+                if hi - lo < want {
+                    let lo2 = focus_idx
+                        .saturating_sub(want / 2)
+                        .max(start_idx)
+                        .min(end_idx - want);
+                    return (lo2, lo2 + want);
+                }
+                (lo, hi)
+            };
+        // Only the focuses inside THIS cluster's span may claim its reserve;
+        // clamping an out-of-span focus in would spend the reserve re-emitting
+        // lines the head window already covers.
+        let focuses_in = |c: &Cluster| -> Vec<usize> {
+            let (start_idx, end_idx) = span_of(c);
+            ctx.focuses
+                .iter()
+                .copied()
+                .filter(|&line| line > start_idx && line <= end_idx)
+                .collect()
+        };
+        // CG-30: a cluster too big for its room is emitted as WHOLE-LINE windows
+        // instead of being taken whole (which then costs the entire file) or
+        // skipped whole. Returns the rendered body and whether it was windowed,
+        // so the caller can add the `... (gap) ...` honesty marker.
+        let window_cluster = |c: &Cluster, room: usize, focuses: &[usize]| -> (String, bool) {
+            let (start_idx, end_idx) = span_of(c);
+            if range_cost(start_idx, end_idx) <= room {
+                return (render_range(start_idx, end_idx), false);
+            }
+            let head_room = if focuses.is_empty() {
+                room
+            } else {
+                room * 60 / 100
+            };
+            let mut windows: Vec<(usize, usize)> = vec![grow_head(start_idx, end_idx, head_room)];
+            if !focuses.is_empty() {
+                // Even shares with carry-forward, never greedy: upstream measured
+                // that a greedy split let an early focus eat the whole reserve and
+                // re-lose the target. One integer division, so the same input
+                // cannot drift by a char across platforms.
+                let reserve = room - head_room;
+                let base = reserve / focuses.len();
+                let mut carry = reserve - base * focuses.len();
+                for &line in focuses {
+                    let allot = base + carry;
+                    let w = grow_around(line.saturating_sub(1), start_idx, end_idx, allot);
+                    carry = allot.saturating_sub(range_cost(w.0, w.1));
+                    windows.push(w);
+                }
+            }
+            windows.sort_unstable();
+            let mut merged: Vec<(usize, usize)> = Vec::new();
+            for w in windows {
+                match merged.last_mut() {
+                    Some(last) if w.0 <= last.1 => last.1 = last.1.max(w.1),
+                    _ => merged.push(w),
+                }
+            }
+            let covers_all = merged.len() == 1 && merged[0] == (start_idx, end_idx);
+            let body = merged
+                .iter()
+                .map(|&(lo, hi)| render_range(lo, hi))
+                .collect::<Vec<_>>()
+                .join(GAP_MARKER);
+            (body, !covers_all)
         };
 
         // Rank clusters: entry-point importance first, then density, then span
@@ -1240,43 +1426,76 @@ impl CodeGraphEngine {
                 .then((span_a as usize).cmp(&(span_b as usize)))
         });
 
-        let file_budget = budget.max_chars_per_file;
-        let mut chosen: HashSet<usize> = HashSet::new();
+        // CG-30: the first cluster is still always taken, but WINDOWED to a
+        // ceiling rather than accepted at any size. `ceiling` bounds cluster
+        // BODIES while the caller's admission test and the 1.5x per-file bound
+        // both compare the finished SECTION, so `section_frame` — the header, the
+        // language tag, the fence and the gap tail — is subtracted OUTSIDE the
+        // `min`. Inside it, the section would clear admission yet overshoot
+        // `round(max_chars_per_file * 1.5)` by the frame.
+        let section_frame = subgraph
+            .file_header_len_upper_bound(file_path, budget.max_symbols_in_file_header)
+            + lang.len()
+            + SECTION_FENCE_CHARS
+            + SECTION_GAP_TAIL_CHARS;
+        let ceiling = ((budget.max_chars_per_file as f64 * 1.5).round() as usize)
+            .min(ctx.funded_headroom)
+            .saturating_sub(section_frame);
+        // Per-cluster render state lives in a Vec indexed parallel to `clusters`,
+        // never in a HashSet that is then iterated: emission order must come from
+        // the index, not from hash order, or the output stops being byte-stable.
+        let mut rendered_clusters: Vec<Option<String>> = vec![None; clusters.len()];
         let mut projected = 0usize;
+        let mut chosen_count = 0usize;
+        let mut any_cluster_windowed = false;
         for &idx in &ranked {
-            let section_len = build_section(&clusters[idx]).len()
-                + if chosen.is_empty() {
-                    0
-                } else {
-                    GAP_MARKER.len()
-                };
-            // Always take the top-ranked cluster even if oversize, so the file
-            // section is never empty (`tools.ts:2828-2835`).
-            if chosen.is_empty() {
-                chosen.insert(idx);
-                projected += section_len;
+            if chosen_count == 0 {
+                let (body, windowed) =
+                    window_cluster(&clusters[idx], ceiling, &focuses_in(&clusters[idx]));
+                projected += body.len();
+                any_cluster_windowed |= windowed;
+                rendered_clusters[idx] = Some(body);
+                chosen_count += 1;
                 continue;
             }
-            if projected + section_len > file_budget {
+            // CG-36: a later cluster that does not fit is SHRUNK into the
+            // remainder rather than skipped whole. The bound is `ceiling`, not
+            // `file_budget`, so the whole file obeys ONE stated bound — and
+            // `saturating_sub` is required rather than stylistic: half A lets the
+            // first cluster's body legitimately exceed `file_budget`, so a plain
+            // subtraction wraps to a huge `room` and hands this cluster unlimited
+            // budget, the exact opposite of the intent.
+            let room = ceiling.saturating_sub(projected + GAP_MARKER.len());
+            // The floor's own cost IS `MIN_CHARS` — the smallest useful window —
+            // rather than a new magic number. When even that cannot be paid for
+            // the cluster is still skipped, so shrinking can never overspend into
+            // the next file's share.
+            let (start_idx, end_idx) = span_of(&clusters[idx]);
+            let floor_end = (start_idx + MIN_WINDOW_LINES).min(end_idx);
+            if room < range_cost(start_idx, floor_end) {
                 continue;
             }
-            chosen.insert(idx);
-            projected += section_len;
+            let (body, windowed) =
+                window_cluster(&clusters[idx], room, &focuses_in(&clusters[idx]));
+            any_cluster_windowed |= windowed;
+            projected += body.len() + GAP_MARKER.len();
+            rendered_clusters[idx] = Some(body);
+            chosen_count += 1;
         }
 
         let mut file_section = String::new();
         let mut symbols: Vec<String> = Vec::new();
         for (i, cluster) in clusters.iter().enumerate() {
-            if !chosen.contains(&i) {
+            let Some(body) = rendered_clusters[i].as_ref() else {
                 continue;
-            }
+            };
             if !file_section.is_empty() {
                 file_section.push_str(GAP_MARKER);
             }
-            file_section.push_str(&build_section(cluster));
+            file_section.push_str(body);
             symbols.extend(cluster.symbols.iter().cloned());
         }
-        if chosen.len() < clusters.len() {
+        if chosen_count < clusters.len() || any_cluster_windowed {
             file_section.push_str("\n\n... (gap) ...");
         }
 
@@ -1780,9 +1999,81 @@ impl CodeGraphEngine {
         candidate_paths.sort_unstable();
         candidate_paths.dedup();
         sub.generated_files = self.store.generated_paths_among(&candidate_paths)?;
+        sub.ambient_files = self.ambient_declaration_files(&candidate_paths, query)?;
 
         sub.finalize();
         Ok(sub)
+    }
+
+    /// The ambient declaration files among `candidate_paths`, minus any this query
+    /// exempts by naming one of their types (ports upstream `9efae0f`'s
+    /// `ambientDeclarationPredicateFor`).
+    ///
+    /// All four conditions are evaluated INDEX-WIDE, never over the subgraph. The
+    /// distinction is the whole point of condition 4: the subgraph is seeded from
+    /// the top 8 search hits and expanded one hop from the ROOTS, so a file that
+    /// depends on a non-root declaration in the shim is normally absent from it
+    /// entirely — and a subgraph-scoped predicate would then read "nothing depends
+    /// on this" and damp a type module the repo genuinely imports.
+    ///
+    /// Conditions 1 and 2 run first as a cheap pre-filter, so the two edge queries
+    /// execute only for the handful of declaration-only files.
+    fn ambient_declaration_files(
+        &self,
+        candidate_paths: &[String],
+        query: &str,
+    ) -> anyhow::Result<HashSet<String>> {
+        let precise = precise_query_tokens(query);
+        let mut ambient = HashSet::new();
+        for path in candidate_paths {
+            let nodes = self.store.nodes_by_file_path(path)?;
+            let declared: Vec<&Node> = nodes
+                .iter()
+                .filter(|n| !is_ambient_bookkeeping_kind(n.kind))
+                .collect();
+            // (1) at least one declaration, and (2) every one of them is a type
+            // declaration — a file holding an implementation is never ambient.
+            if declared.is_empty() || !declared.iter().all(|n| is_type_declaration_kind(n.kind)) {
+                continue;
+            }
+            // A query naming one of this file's declarations is asking for it, so
+            // it keeps its rank. Applied while BUILDING the set because `finalize`
+            // never sees the query.
+            if declared
+                .iter()
+                .any(|n| precise.iter().any(|t| t.eq_ignore_ascii_case(&n.name)))
+            {
+                continue;
+            }
+            // (3) nothing in the file runs: no node is the source of a Calls or
+            // Instantiates edge.
+            let mut runs = false;
+            for n in &declared {
+                for kind in [EdgeKind::Calls, EdgeKind::Instantiates] {
+                    if !self
+                        .store
+                        .edges_by_source_kind(&n.id, Some(kind))?
+                        .is_empty()
+                    {
+                        runs = true;
+                        break;
+                    }
+                }
+                if runs {
+                    break;
+                }
+            }
+            if runs {
+                continue;
+            }
+            // (4) nothing anywhere in the index depends on it. Consumed only
+            // through `is_empty`, so the query's SQLite scan order can never reach
+            // the output.
+            if self.store.dependent_file_paths(path)?.is_empty() {
+                ambient.insert(path.clone());
+            }
+        }
+        Ok(ambient)
     }
 
     /// #1064 change-surface rescue (ports `2b256b9` `tools.ts:2585-2860`, adapted
@@ -2293,6 +2584,16 @@ struct ExploreSubgraph {
     /// reaches it. Empty leaves behavior on the path check alone, which is what
     /// keeps a pre-#1500 index ranking as it always did.
     generated_files: HashSet<String>,
+    /// Paths that are ambient DECLARATION files — every symbol is a type
+    /// declaration, nothing in them runs, and nothing anywhere in the index
+    /// depends on them — and that this query does not name a type in.
+    ///
+    /// Computed index-wide in `find_relevant_context` before `finalize`, exactly
+    /// as `generated_files` and `rescued_files` are: the predicate needs the store
+    /// and the query, and `finalize` has neither. Membership therefore already
+    /// accounts for the exemption, which is why the same file can be damped for a
+    /// prose query and undamped for one naming its type.
+    ambient_files: HashSet<String>,
 }
 
 impl ExploreSubgraph {
@@ -2369,21 +2670,39 @@ impl ExploreSubgraph {
                 } else {
                     0
                 };
-                // Generated-path demotion sits INSIDE the tier, so it only ever
-                // reorders files of equal query relevance: a protobuf stub loses
-                // to the implementation it shadows, never falls behind an
-                // unrelated incidental file, and still ranks first in its tier
-                // when it is the only match. The sort is descending, so real
-                // code must carry the HIGHER value. `find_symbol_matches` and
-                // `find_all_symbols` apply the same signal.
-                let not_generated =
-                    u8::from(!(is_generated_file(fp) || self.generated_files.contains(fp)));
+                // Generated-path and ambient-declaration demotion sit INSIDE the
+                // tier, so they only ever reorder files of equal query relevance: a
+                // protobuf stub or a shim nothing depends on loses to the
+                // implementation it shadows, never falls behind an unrelated
+                // incidental file, and still ranks first in its tier when it is the
+                // only match. The sort is descending, so real code must carry the
+                // HIGHER value. `find_symbol_matches` and `find_all_symbols` apply
+                // the same generated signal.
+                //
+                // The two signals combine by `min`, upstream's rule, so a file that
+                // is BOTH is damped exactly as much as a generated-only one and no
+                // more. That is why this is one 3-valued integer and not a second
+                // boolean key: appending `not_damped_ambient` to the tuple would
+                // rank generated+ambient strictly BELOW generated-only, which is
+                // the double penalty `min` exists to prevent. For any non-ambient
+                // file the values are order-isomorphic to the old
+                // `not_generated` boolean (10 > 3 exactly where 1 > 0), so no
+                // ranking can move unless the ambient predicate actually fires.
+                let generated = is_generated_file(fp) || self.generated_files.contains(fp);
+                let weight = u8::min(
+                    if generated { 3 } else { 10 },
+                    if self.ambient_files.contains(fp) {
+                        5
+                    } else {
+                        10
+                    },
+                );
                 let sym_count = self
                     .nodes
                     .iter()
                     .filter(|n| &n.file_path == fp && n.kind != NodeKind::File)
                     .count();
-                (fp.clone(), (tier, not_generated, sym_count))
+                (fp.clone(), (tier, weight, sym_count))
             })
             .collect();
         self.file_order
@@ -2419,7 +2738,65 @@ impl ExploreSubgraph {
         cap_header_names(&names, cap)
     }
 
-    /// `name:line` locations for the "Not shown above" list (`tools.ts:2920`).
+    /// Definition lines of this file's PROTECTED FOCUSES: nodes that are query
+    /// roots AND whose name a shape-precise query token names,
+    /// case-insensitively.
+    ///
+    /// Selection among more than [`FOCUS_CAP`] candidates is by
+    /// `(start_line, name)`, never by hash order, so the emitted windows are
+    /// byte-stable across runs.
+    fn file_focus_lines(&self, file_path: &str, precise: &[String]) -> Vec<usize> {
+        let mut picked: Vec<(usize, &str)> = self
+            .nodes
+            .iter()
+            .filter(|n| {
+                n.file_path == file_path
+                    && n.start_line > 0
+                    && self.roots.iter().any(|r| r == &n.id)
+                    && precise.iter().any(|t| t.eq_ignore_ascii_case(&n.name))
+            })
+            .map(|n| (n.start_line as usize, n.name.as_str()))
+            .collect();
+        picked.sort_unstable();
+        picked.dedup();
+        picked.truncate(FOCUS_CAP);
+        picked.into_iter().map(|(line, _)| line).collect()
+    }
+
+    /// The longest `#### path — names` header any subset of this file's clusters
+    /// can produce: the `cap` LONGEST candidate labels plus the maximal `+N more`
+    /// tail. A max over a set, so it is order-independent, and an over-estimate
+    /// only ever LOWERS the render ceiling — it can never break the bound.
+    ///
+    /// Built from the file's SUBGRAPH nodes, the set `explore_file_header` draws
+    /// from. Computing it over the store's nodes for the same path would
+    /// over-estimate whenever the subgraph holds fewer of them.
+    fn file_header_len_upper_bound(&self, file_path: &str, cap: usize) -> usize {
+        let mut labels: Vec<String> = Vec::new();
+        for n in self.nodes.iter().filter(|n| {
+            n.file_path == file_path && n.kind != NodeKind::Import && n.kind != NodeKind::Export
+        }) {
+            let label = format!("{}({})", n.name, n.kind.as_str());
+            if !labels.contains(&label) {
+                labels.push(label);
+            }
+        }
+        let total = labels.len();
+        labels.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        let shown = labels.into_iter().take(cap).collect::<Vec<_>>().join(", ");
+        let mut header = format!("#### {file_path} — {shown}");
+        if total > cap {
+            header.push_str(&format!(", +{} more", total - cap));
+        }
+        header.len()
+    }
+
+    /// `name:line` locations for the "Not shown above" list (`tools.ts:2920`),
+    /// capped at upstream's `POINTER_SYMBOLS` with a `+N more` tail.
+    ///
+    /// The cap is what turns each pointer LINE from unbounded into bounded: a
+    /// 120-method class contributed ~120 pairs on one line, so a single file's
+    /// pointer could exhaust the whole epilogue budget.
     fn file_node_locations(&self, file_path: &str) -> String {
         let mut in_file: Vec<&Node> = self
             .nodes
@@ -2427,12 +2804,42 @@ impl ExploreSubgraph {
             .filter(|n| n.file_path == file_path)
             .collect();
         in_file.sort_by_key(|n| n.start_line);
-        in_file
+        let pairs: Vec<String> = in_file
             .iter()
             .map(|n| format!("{}:{}", n.name, n.start_line))
-            .collect::<Vec<_>>()
-            .join(", ")
+            .collect();
+        cap_header_names(&pairs, POINTER_SYMBOLS)
     }
+}
+
+/// Per-file render state for one iteration of `handle_explore`'s file loop.
+///
+/// These cannot live in [`ExploreOutputBudget`]: that struct is `Copy` and built
+/// ONCE per response from the project's file count, so putting loop state in it
+/// would conflate a static tier constant with a per-file quantity.
+struct RenderCtx<'a> {
+    budget: &'a ExploreOutputBudget,
+    /// What the total-output budget can still pay for this file, less the
+    /// `lines.join("\n")` separator the section will be charged. The ceiling and
+    /// the caller's admission test are computed from the SAME quantity, so they
+    /// cannot disagree.
+    funded_headroom: usize,
+    /// Definition lines of this file's protected focuses (§3.1): roots whose name
+    /// a shape-precise query token names. Every focus line is guaranteed to land
+    /// inside some emitted window.
+    focuses: &'a [usize],
+    drifted: bool,
+}
+
+/// Decimal digit count, for costing a numbered source line without rendering it.
+fn decimal_width(n: usize) -> usize {
+    let mut width = 1;
+    let mut rest = n;
+    while rest >= 10 {
+        rest /= 10;
+        width += 1;
+    }
+    width
 }
 
 /// Cluster source range used when sizing a god-file (`tools.ts:2708-2718`).
@@ -3081,6 +3488,51 @@ fn query_terms(query: &str) -> Vec<String> {
     out
 }
 
+/// Whether a query token is SHAPE-PRECISE enough to name a symbol rather than
+/// describe one (upstream `89c53dd`'s `isPreciseToken`): at least 3 chars, and
+/// either carrying a separator, or a lower→UPPER transition, or an initial
+/// capital.
+///
+/// This is what keeps a prose query from minting protected focuses:
+/// `hugeHandler` and `Foo::Bar` qualify, `upload` and `work` do not.
+fn is_precise_query_token(token: &str) -> bool {
+    if token.chars().count() < 3 {
+        return false;
+    }
+    if token.contains(['.', '_', '$', '/']) || token.contains("::") {
+        return true;
+    }
+    let chars: Vec<char> = token.chars().collect();
+    if chars[0].is_uppercase() {
+        return true;
+    }
+    chars
+        .windows(2)
+        .any(|w| w[0].is_lowercase() && w[1].is_uppercase())
+}
+
+/// The query's shape-precise tokens, in query order and deduped.
+///
+/// Split on WHITESPACE, unlike `query_terms`: that helper lowercases and strips
+/// every separator, which would erase the very shape `is_precise_query_token`
+/// tests. Only punctuation that cannot belong to an identifier is trimmed, so
+/// `work?` reduces to prose while `Foo::Bar,` keeps its separator.
+fn precise_query_tokens(query: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for tok in query.split_whitespace() {
+        let t = tok.trim_matches(|c: char| {
+            c.is_ascii_punctuation() && !matches!(c, '.' | '_' | '$' | '/' | ':')
+        });
+        if !is_precise_query_token(t) {
+            continue;
+        }
+        if !out.iter().any(|e| e == t) {
+            out.push(t.to_string());
+        }
+    }
+    out
+}
+
 /// Whether the query itself is about tests — keeps the legitimate "explore the
 /// tests" case (`tools.ts:2228`).
 fn query_mentions_tests(query: &str) -> bool {
@@ -3091,6 +3543,140 @@ fn query_mentions_tests(query: &str) -> bool {
             "test" | "tests" | "testing" | "spec" | "verify" | "verifies"
         )
     })
+}
+
+/// Kinds the ambient-declaration predicate ignores: they describe a file's
+/// plumbing rather than what it declares (upstream `9efae0f`).
+fn is_ambient_bookkeeping_kind(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::File | NodeKind::Import | NodeKind::Export | NodeKind::Parameter
+    )
+}
+
+/// Type-declaration kinds — upstream's exact set. A file whose every
+/// non-bookkeeping node is one of these declares types and nothing else.
+fn is_type_declaration_kind(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Interface
+            | NodeKind::TypeAlias
+            | NodeKind::Enum
+            | NodeKind::EnumMember
+            | NodeKind::Namespace
+    )
+}
+
+/// Header of the "Not shown above" pointer block (`tools.ts:2910-2927`).
+const POINTER_BLOCK_HEADER: &str = "### Not shown above — explore these names for their source";
+
+/// Horizontal rule opening the completeness block (`tools.ts:2933-2940`).
+const COMPLETENESS_RULE: &str = "---";
+
+/// The trim note emitted at tiers that gate the completeness signal OFF. It is
+/// only reached when a file was actually trimmed, but `any_file_trimmed` is
+/// loop-determined, so the pre-loop reserve has to assume it.
+const TRIMMED_NOTE: &str = "> Some file sections were trimmed for size. For a specific symbol you still need, run another `codegraph_explore` (or `codegraph_node`) with its exact name — line-numbered source, cheaper and more complete than Read.";
+
+fn completeness_signal(files_included: usize) -> String {
+    format!(
+        "> **Complete source for {files_included} files is included above — do NOT re-read them.** If your question also needs files/symbols listed under \"Not shown above\" (or any area this call didn't cover), make ANOTHER codegraph_explore targeting those names — it returns the same source with line numbers and is cheaper and more complete than reading. Reserve Read for a single specific line range explore can't surface."
+    )
+}
+
+fn explore_budget_note(file_count: i64) -> String {
+    format!(
+        "> **{file_count} files indexed.** Each call covers ~6 files; if your question spans more, make ANOTHER `codegraph_explore` targeting the uncovered area BEFORE falling back to Read — another explore is cheaper and more complete than reading those files. There is no call limit."
+    )
+}
+
+fn pointer_unlisted_tail(unlisted: usize) -> String {
+    format!("- ... and {unlisted} more files")
+}
+
+/// The epilogue's note lines — everything after the pointer block.
+///
+/// The pre-loop reserve and the post-loop emitter both call THIS function, so the
+/// reserve is derived from the very strings that get emitted and cannot drift from
+/// them. The reserve passes the arguments that maximise the result, which is why
+/// it is an upper bound rather than an estimate.
+fn epilogue_note_lines(
+    budget: &ExploreOutputBudget,
+    files_included: usize,
+    any_file_trimmed: bool,
+    file_count: Option<i64>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if budget.include_completeness_signal {
+        lines.push(COMPLETENESS_RULE.to_string());
+        lines.push(completeness_signal(files_included));
+        lines.push(String::new());
+    } else if any_file_trimmed {
+        lines.push(TRIMMED_NOTE.to_string());
+        lines.push(String::new());
+    }
+    if budget.include_budget_note
+        && let Some(count) = file_count
+    {
+        lines.push(explore_budget_note(count));
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// What a set of pushed lines costs `lines.join("\n")`: its own length plus the
+/// one separator each is pushed behind.
+fn joined_line_cost(lines: &[String]) -> usize {
+    lines.iter().map(|l| 1 + l.len()).sum()
+}
+
+/// The epilogue's FIXED reserve, subtracted from `max_output_chars` before any
+/// file is admitted so the sections cannot spend what the epilogue will need.
+///
+/// Every term is the length of a string the epilogue actually emits, evaluated at
+/// its worst case: `max_files` maximises the completeness signal's digit width,
+/// `any_file_trimmed = true` selects the larger of the two mutually exclusive
+/// notes, and the unlisted tail is reserved at `file_order` length, which is
+/// >= any achievable count because every unlisted file came from `file_order`.
+fn fixed_epilogue_reserve(
+    budget: &ExploreOutputBudget,
+    file_order_len: usize,
+    max_files: usize,
+    file_count: Option<i64>,
+) -> usize {
+    let mut reserve = 0usize;
+    if budget.include_additional_files {
+        reserve += joined_line_cost(&[
+            POINTER_BLOCK_HEADER.to_string(),
+            String::new(),
+            pointer_unlisted_tail(file_order_len),
+            String::new(),
+        ]);
+    }
+    reserve += joined_line_cost(&epilogue_note_lines(budget, max_files, true, file_count));
+    reserve
+}
+
+/// Fit the pointer lines into the headroom the source sections did not use,
+/// stopping at the first that does not fit, and report how many files went
+/// unlisted — by `POINTER_MAX_FILES` and by elasticity together.
+///
+/// The iteration order IS part of the output contract: `excluded_files` arrives in
+/// `file_order` rank order and the loop stops at the first line that does not fit,
+/// so the ORDER selects the SET. A best-fit variant would use the budget better
+/// and is deliberately rejected — it would make the emitted set depend on
+/// arithmetic rather than on rank, which no caller could predict from the ranking.
+fn fit_pointer_lines(candidates: &[String], pointer_budget: usize) -> (Vec<String>, usize) {
+    let mut emitted = Vec::new();
+    let mut spent = 0usize;
+    for line in candidates.iter().take(POINTER_MAX_FILES) {
+        if spent + 1 + line.len() > pointer_budget {
+            break;
+        }
+        spent += 1 + line.len();
+        emitted.push(line.clone());
+    }
+    (emitted.clone(), candidates.len() - emitted.len())
 }
 
 /// Cut `output` at the last `#### ` file-section boundary before `ceiling` so
@@ -3173,6 +3759,17 @@ mod tests {
         }
     }
 
+    /// A direct-call render context with nothing already spent, mirroring what
+    /// `handle_explore` builds for the FIRST file of a response.
+    fn render_ctx<'a>(budget: &'a ExploreOutputBudget, focuses: &'a [usize]) -> RenderCtx<'a> {
+        RenderCtx {
+            budget,
+            funded_headroom: budget.max_output_chars.saturating_sub(1),
+            focuses,
+            drifted: false,
+        }
+    }
+
     fn subgraph_with(nodes: Vec<Node>, roots: Vec<String>) -> ExploreSubgraph {
         let mut sg = ExploreSubgraph::default();
         for n in nodes {
@@ -3203,7 +3800,7 @@ mod tests {
         let budget = crate::explore_budget::get_explore_output_budget(200);
 
         let out = engine
-            .render_explore_file(&sg, file, &file_lines, "rust", &budget, false)
+            .render_explore_file(&sg, file, &file_lines, "rust", &render_ctx(&budget, &[]))
             .section;
         assert!(
             out.contains(file),
@@ -3224,7 +3821,7 @@ mod tests {
         let budget = crate::explore_budget::get_explore_output_budget(200);
 
         let out = engine
-            .render_explore_file(&sg, file, &file_lines, "rust", &budget, false)
+            .render_explore_file(&sg, file, &file_lines, "rust", &render_ctx(&budget, &[]))
             .section;
         assert!(out.contains(file), "should render a header, got: {out:?}");
     }
@@ -3243,7 +3840,7 @@ mod tests {
         let budget = crate::explore_budget::get_explore_output_budget(200);
 
         let out = engine
-            .render_explore_file(&sg, file, &file_lines, "rust", &budget, false)
+            .render_explore_file(&sg, file, &file_lines, "rust", &render_ctx(&budget, &[]))
             .section;
         assert!(out.contains("line 10"), "cluster source missing: {out:?}");
         assert!(out.contains("line 30"), "cluster source missing: {out:?}");
@@ -3262,13 +3859,230 @@ mod tests {
         let budget = crate::explore_budget::get_explore_output_budget(200);
 
         let out = engine
-            .render_explore_file(&sg, file, &file_lines, "rust", &budget, false)
+            .render_explore_file(&sg, file, &file_lines, "rust", &render_ctx(&budget, &[]))
             .section;
         let expected = {
             let numbered = number_source_lines_at(&file_lines, 1);
             format!("#### {file} — Small(struct)\n\n```rust\n{numbered}\n```\n")
         };
         assert_eq!(out, expected);
+    }
+
+    /// Tier 5 item 12 (CG-38). Given the shape-precise token test, When each of a
+    /// symbol-like and a prose-like token is checked, Then only the symbol-like
+    /// ones qualify — so ordinary prose can never mint a protected focus.
+    #[test]
+    fn precise_query_token_shape() {
+        for t in ["hugeHandler", "processPayroll", "Foo::Bar", "a_b"] {
+            assert!(is_precise_query_token(t), "{t} must be precise");
+        }
+        for t in ["upload", "work", "id"] {
+            assert!(!is_precise_query_token(t), "{t} must NOT be precise");
+        }
+    }
+
+    /// Tier 5 item 12's affordability gate, INERT paths. Given a small whole-file
+    /// eligible file, When the funded headroom can pay for it, Then the complete
+    /// section is returned even though a focus exists; and When the headroom
+    /// cannot pay for it but the file owns NO focus, Then the complete section is
+    /// still returned so the caller drops it whole.
+    ///
+    /// Case (a) is the guard on gate (1) itself: measured, deleting that gate
+    /// windows an affordable focus-owning file, fails this test, AND drifts
+    /// `explore_matches_golden_structural`, whose mini fixture takes this very
+    /// branch. Merely SWAPPING the two conditions stays green — also measured —
+    /// because gate (1) still catches the affordable case; what the swap costs is
+    /// the golden-neutrality ARGUMENT, which then rests on the fixture holding no
+    /// precise token rather than on the code. That is why the order is asserted
+    /// structurally rather than here.
+    #[test]
+    fn whole_file_section_is_returned_whole_when_it_fits() {
+        let engine = test_engine();
+        let file = "small.ts";
+        let owned: Vec<String> = (1..=20)
+            .map(|i| format!("export function tinyFocus{i}(): number {{ return {i}; }}"))
+            .collect();
+        let file_lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let n = node("tinyFocus1", file, 1, 1, NodeKind::Function);
+        let sg = subgraph_with(vec![n.clone()], vec![n.id.clone()]);
+        let budget = crate::explore_budget::get_explore_output_budget(3);
+        let whole = {
+            let numbered = number_source_lines_at(&file_lines, 1);
+            format!("#### {file} — tinyFocus1(function)\n\n```typescript\n{numbered}\n```\n")
+        };
+
+        let affordable_with_focus = engine
+            .render_explore_file(
+                &sg,
+                file,
+                &file_lines,
+                "typescript",
+                &render_ctx(&budget, &[1]),
+            )
+            .section;
+        assert_eq!(
+            affordable_with_focus, whole,
+            "an AFFORDABLE focus-owning file must come back whole"
+        );
+        assert!(!affordable_with_focus.contains("... (gap) ..."));
+
+        let starved = RenderCtx {
+            budget: &budget,
+            funded_headroom: whole.len() - 1,
+            focuses: &[],
+            drifted: false,
+        };
+        let unaffordable_no_focus = engine
+            .render_explore_file(&sg, file, &file_lines, "typescript", &starved)
+            .section;
+        assert_eq!(
+            unaffordable_no_focus, whole,
+            "an unaffordable file owning NO focus must still be returned whole, \
+             so the caller drops it whole"
+        );
+    }
+
+    /// Tier 5 item 12 (CG-38). Given NINE qualifying focuses in one file, When the
+    /// focus list is selected, Then exactly the six LOWEST `start_line`s are
+    /// protected — and the same twice in one process, so a hash-ordered
+    /// implementation cannot pass.
+    #[test]
+    fn focus_cap_is_six_and_selection_is_line_ordered() {
+        let file = "many.ts";
+        let nodes: Vec<Node> = (0..9)
+            .map(|i| {
+                node(
+                    &format!("focusTarget{i}"),
+                    file,
+                    10 + i * 10,
+                    12 + i * 10,
+                    NodeKind::Function,
+                )
+            })
+            .collect();
+        let roots: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
+        let sg = subgraph_with(nodes, roots);
+        let precise: Vec<String> = (0..9).map(|i| format!("focusTarget{i}")).collect();
+
+        let first = sg.file_focus_lines(file, &precise);
+        let second = sg.file_focus_lines(file, &precise);
+        assert_eq!(first, vec![10, 20, 30, 40, 50, 60], "cap or order wrong");
+        assert_eq!(
+            first, second,
+            "focus selection is not stable within a process"
+        );
+    }
+
+    /// Tier 5 item 13 half A (CG-30). Given a 600-line file whose single symbol
+    /// spans all of it, so its only cluster renders ~13x the per-file cap, When
+    /// `render_explore_file` runs at the tiny budget, Then the returned SECTION —
+    /// frame included, the same quantity the caller's admission test compares —
+    /// obeys `round(max_chars_per_file * 1.5)` while still emitting whole source
+    /// lines.
+    ///
+    /// The unit is the SECTION and not the cluster body on purpose: `ceiling`
+    /// bounds bodies, so a ceiling that does not subtract the header/fence frame
+    /// satisfies the admission test yet overshoots this bound by the frame.
+    #[test]
+    fn render_explore_file_windows_an_oversize_first_cluster() {
+        let engine = test_engine();
+        let file = "god.ts";
+        let owned: Vec<String> = (1..=600)
+            .map(|i| format!("  // padding line {i} inside hugeHandler keeping the body enormous"))
+            .collect();
+        let file_lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let huge = node("hugeHandler", file, 1, 600, NodeKind::Function);
+        let sg = subgraph_with(vec![huge.clone()], vec![huge.id.clone()]);
+        let budget = crate::explore_budget::get_explore_output_budget(3);
+
+        let section = engine
+            .render_explore_file(
+                &sg,
+                file,
+                &file_lines,
+                "typescript",
+                &render_ctx(&budget, &[]),
+            )
+            .section;
+
+        let bound = (budget.max_chars_per_file as f64 * 1.5).round() as usize;
+        assert!(
+            section.contains('\t'),
+            "an oversize first cluster must still emit numbered source: {section:?}"
+        );
+        assert!(
+            section.len() <= bound,
+            "the returned section must obey the {bound}-char 1.5x per-file bound, got {}",
+            section.len()
+        );
+        for line in section.lines() {
+            let Some((num, body)) = line.split_once('\t') else {
+                continue;
+            };
+            let Ok(n) = num.parse::<usize>() else {
+                continue;
+            };
+            assert_eq!(
+                file_lines[n - 1],
+                body,
+                "line {n} was sliced mid-line: {section}"
+            );
+        }
+    }
+
+    /// Tier 5 item 13 half B's guard. Given an OVER-CEILING first cluster — so
+    /// `projected` legitimately exceeds the room a later cluster could draw on —
+    /// When a later cluster is considered, Then it is still DROPPED rather than
+    /// emitted, and nothing panics.
+    ///
+    /// This is the input that underflows a plain `ceiling - projected`: in debug
+    /// it panics, in release it wraps to a huge `room` and hands the later cluster
+    /// unlimited budget. A merely tight-but-positive `room` does not exercise it.
+    #[test]
+    fn render_explore_file_skips_a_later_cluster_with_no_usable_room() {
+        let engine = test_engine();
+        let file = "twin.ts";
+        // Lines long enough that the first cluster's 12-line never-empty FLOOR
+        // alone costs more than the whole ceiling. That is the only way
+        // `projected` can exceed `ceiling`: half A otherwise bounds the first
+        // cluster's body by the ceiling, so a fixture with ordinary-length lines
+        // never reaches the subtraction at all.
+        let owned: Vec<String> = (1..=900)
+            .map(|i| format!("  // padding line {i} {}", "-".repeat(600)))
+            .collect();
+        let file_lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let head = node("headSymbol", file, 1, 400, NodeKind::Function);
+        let tail = node("tailSymbol", file, 600, 890, NodeKind::Function);
+        let sg = subgraph_with(vec![head.clone(), tail], vec![head.id.clone()]);
+        let budget = crate::explore_budget::get_explore_output_budget(3);
+
+        let section = engine
+            .render_explore_file(
+                &sg,
+                file,
+                &file_lines,
+                "typescript",
+                &render_ctx(&budget, &[]),
+            )
+            .section;
+
+        let emitted: Vec<usize> = section
+            .lines()
+            .filter_map(|l| l.split_once('\t'))
+            .filter_map(|(n, _)| n.parse::<usize>().ok())
+            .collect();
+        assert!(
+            !emitted.is_empty(),
+            "the first cluster must still emit: {section}"
+        );
+        assert!(
+            emitted.iter().all(|&n| n < 600),
+            "the later cluster had no usable room and must be dropped, got lines {emitted:?}"
+        );
+        assert!(
+            section.contains("... (gap) ..."),
+            "a dropped later cluster must still be signalled: {section}"
+        );
     }
 
     /// Given a stale index whose node `end_line` (10) is BELOW its `start_line`
@@ -4124,6 +4938,43 @@ mod tests {
         );
     }
 
+    /// Given retained source that itself contains a line mimicking a `#### <path>`
+    /// section header for a DIFFERENT file, When that other file is dropped for the
+    /// budget, Then the spoofed marker must not make the response cite the dropped
+    /// file as a drifted source.
+    ///
+    /// The drop MECHANISM this exercises moved. It used to be the hard-ceiling cut,
+    /// and that is now unreachable by construction: `hard_ceiling` is
+    /// `min(max_output_chars * 1.5, 25_000)`, which is strictly GREATER than
+    /// `max_output_chars` at every tier (19,500 > 13,000; 25,000 > 18,000;
+    /// 25,000 > 24,000), while the accounting keeps the response inside
+    /// `max_output_chars`. So a file is dropped by the ADMISSION test instead, and
+    /// the assertions below pin that. Do not "restore" this test by widening the
+    /// ceiling.
+    ///
+    /// **Exactly what this test is and is not sensitive to, all measured by
+    /// reverting and re-running rather than reasoned about.** It fails only when the
+    /// pointer LINE cap and the elastic pointer BLOCK are BOTH absent — which is the
+    /// genuine pre-fix state, not a contrived mutant, and is why upstream needs both
+    /// (the cap bounds a line, elasticity bounds the block):
+    ///
+    /// | reverted | verdict | len | cut | ptr lines | completeness |
+    /// | --- | --- | --- | --- | --- | --- |
+    /// | nothing | pass | 22,266 | no | 10 | present |
+    /// | 6-symbol cap only | pass | 24,201 | no | 4 | present |
+    /// | elastic block only | pass | 22,266 | no | 10 | present |
+    /// | **cap + elastic block** | **FAIL** | 23,710 | **yes** | 4 | **destroyed** |
+    ///
+    /// It is NOT sensitive to the `+ 200` → `+ 1` real-cost charge, nor to the
+    /// pre-loop epilogue reserve: reverting either leaves this output byte-identical,
+    /// because with the cap in place all ten pointer lines fit the headroom anyway.
+    /// Those two are pinned elsewhere and deliberately not here —
+    /// `explore_output_respects_its_stated_budget` (the reserve, and the section
+    /// count when the real-cost charge is reverted),
+    /// `file_node_locations_caps_symbols_at_six` (the cap directly), and
+    /// `epilogue_pointer_block_fits_the_remaining_budget` (the elastic block's four
+    /// branches). This test is a whole-item regression check on the marker-collision
+    /// invariant, not per-change budget coverage.
     #[test]
     fn ext_explore_banner_ignores_marker_collision_from_retained_source() {
         let mut engine = test_engine();
@@ -4148,8 +4999,12 @@ mod tests {
 
         let dropped_indexed = "fn marker_collision_target_dropped() { indexed(); }\n";
         put_indexed_source(&engine, dropped_file, dropped_indexed, Language::Rust, 1);
+        // Wide enough that its section cannot fit the headroom the retained file
+        // leaves, so it is rejected by the ADMISSION test by ~13 KB rather than by
+        // a knife-edge. Still inside the whole-file gates (<=220 lines,
+        // <=3 * 7000 chars) so it renders as one section when it does fit.
         let dropped_padding = (0..180)
-            .map(|i| format!("// dropped {i:04} yyyyy\n"))
+            .map(|i| format!("// dropped {i:04} {}\n", "y".repeat(90)))
             .collect::<String>();
         write_src(
             &engine,
@@ -4177,35 +5032,65 @@ mod tests {
         );
         put_nodes(&mut engine, &[retained.clone(), dropped.clone()]);
 
-        let long_component = "x".repeat(220);
+        // The caller files must be REAL pointer candidates, and that needs three
+        // things at once — each of which the fixture previously lacked:
+        //
+        //  * source on disk. A file `project_source` cannot read is `continue`d
+        //    BEFORE `excluded_files.push`, so it never reaches the pointer block at
+        //    all. With DB rows alone the epilogue had exactly ONE candidate, which
+        //    always fits, leaving the cap, the reserve and the elastic block inert.
+        //  * a path component under the filesystem's 255-byte limit, so the source
+        //    can actually be written.
+        //  * many SUBGRAPH nodes each, since `file_node_locations` lists the
+        //    subgraph's nodes for the file and only nodes with an edge to a root are
+        //    reached. Uncapped, that is what makes one pointer line ~2 KB.
+        //
+        // Their sources are also wide enough to fail admission themselves, so they
+        // stay pointer candidates instead of becoming a second rendered section.
+        const CALLER_FILES: usize = 10;
+        const CALLER_SYMS: usize = 60;
+        let long_component = "x".repeat(200);
         let mut callers = Vec::new();
         let mut edges = Vec::new();
-        for i in 0..10 {
+        for i in 0..CALLER_FILES {
             let path = format!("callers/{i:02}_{long_component}.rs");
-            put_file(&engine, &file_rec(&path, Language::Rust, 1));
-            let caller = node_lang(
-                &format!("marker_collision_caller_{i}"),
-                &format!("marker_collision_caller_{i}"),
-                &path,
-                1,
-                1,
-                NodeKind::Function,
-                Language::Rust,
-            );
+            let body = (0..CALLER_SYMS)
+                .map(|j| {
+                    format!(
+                        "fn bulk_pointer_sym_{i}_{j}() {{ /* {} */ }}\n",
+                        "z".repeat(90)
+                    )
+                })
+                .collect::<String>();
+            put_indexed_source(&engine, &path, &body, Language::Rust, CALLER_SYMS as i64);
             let target = if i < 5 { &retained } else { &dropped };
-            edges.push(mk_edge(
-                &caller.id,
-                &target.id,
-                codegraph_core::types::EdgeKind::Calls,
-            ));
-            callers.push(caller);
+            for j in 0..CALLER_SYMS {
+                // Named without the query's own terms, so 600 extra nodes cannot
+                // crowd the two real targets out of the top-8 FTS roots.
+                let sym = node_lang(
+                    &format!("bulk_pointer_sym_{i}_{j}"),
+                    &format!("bulk_pointer_sym_{i}_{j}"),
+                    &path,
+                    (j + 1) as i64,
+                    (j + 1) as i64,
+                    NodeKind::Function,
+                    Language::Rust,
+                );
+                edges.push(mk_edge(
+                    &sym.id,
+                    &target.id,
+                    codegraph_core::types::EdgeKind::Calls,
+                ));
+                callers.push(sym);
+            }
         }
         put_nodes(&mut engine, &callers);
         put_edges(&mut engine, &edges);
 
-        // Cross into the large-project budget tier so excluded caller files and
-        // completeness metadata push the accepted source sections past the final
-        // 25K hard ceiling.
+        // Cross into the large-project budget tier, which turns the epilogue meta
+        // ON — the "Not shown above" pointer block and the completeness signal.
+        // That block is what names an admission-dropped file, and it is what the
+        // hard-ceiling cut used to destroy.
         for i in 0..5001 {
             put_file(
                 &engine,
@@ -4222,13 +5107,39 @@ mod tests {
             text.contains(&format!("// #### {dropped_file} — spoofed source marker")),
             "the retained source must contain the colliding marker: {text}"
         );
+        // The file left by ADMISSION, not by the cut and not by the file cap.
+        // `maxFiles` is 2, so a cap-drop would still have rendered two sections;
+        // exactly one section means the budget rejected the second.
+        let headers: Vec<&str> = text.lines().filter(|l| l.starts_with("#### ")).collect();
+        assert_eq!(
+            headers.len(),
+            1,
+            "maxFiles permits 2, so one section means admission rejected the other: {text}"
+        );
         assert!(
-            text.contains("output truncated to budget"),
-            "the final hard-ceiling cut must run: {text}"
+            headers[0].contains(retained_file),
+            "the surviving section must be the retained file: {headers:?}"
+        );
+        assert!(
+            !text.contains("output truncated to budget"),
+            "the response fits the inline ceiling, so the cut must NOT run: {text}"
+        );
+        // ...and the epilogue survives INTACT, naming the dropped file and carrying
+        // a true count. Uncapped AND non-elastic — the pre-fix state — the cut
+        // deletes this block along with the section, so the response neither shows
+        // the file nor says it exists: measured, the completeness signal is gone and
+        // only 4 of the 10 pointer lines survive.
+        assert!(
+            text.contains(&format!("- {dropped_file}:")),
+            "an admission-dropped file must be named in the pointer block: {text}"
+        );
+        assert!(
+            text.contains(&format!("Complete source for {} files", headers.len())),
+            "the epilogue must survive with a count matching the rendered sections: {text}"
         );
         assert!(
             !text.contains("marker_collision_target_dropped() { current(); }"),
-            "the dropped file's source section must not survive the cut: {text}"
+            "the dropped file's source section must not survive: {text}"
         );
         assert!(
             text.starts_with("⚠️ Some files referenced below"),
@@ -5491,6 +6402,383 @@ mod tests {
         ];
         let h = explore_file_header("f.rs", &syms, 5);
         assert!(h.starts_with("#### f.rs — "), "got: {h}");
+    }
+
+    /// Tier 5 item 14 (CG-28). Given four files — a pure declaration shim, a shim
+    /// with an outgoing `Calls`, a shim another file imports, and one of mixed
+    /// kinds — When the explore subgraph is built, Then only the PURE shim is
+    /// marked ambient.
+    ///
+    /// The four conditions are each necessary: a file that runs code, a file
+    /// something depends on, and a file holding real implementations are all
+    /// legitimate top-ranked answers.
+    #[test]
+    fn ambient_declaration_predicate_four_conditions() {
+        let mut engine = test_engine();
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+
+        for (stem, decl) in [
+            ("pure", "AmbientPureAlpha"),
+            ("caller", "AmbientCallerAlpha"),
+        ] {
+            let path = format!("src/types/{stem}.d.ts");
+            put_indexed_source(
+                &engine,
+                &path,
+                &format!("export interface {decl} {{\n  ambientId: string;\n}}\n"),
+                Language::TypeScript,
+                1,
+            );
+            nodes.push(node_lang(
+                decl,
+                decl,
+                &path,
+                1,
+                3,
+                NodeKind::Interface,
+                Language::TypeScript,
+            ));
+        }
+        // The `caller` shim additionally has a node that CALLS out, so condition 3
+        // rejects it: it does not merely declare.
+        let runner = node_lang(
+            "ambientRunner",
+            "ambientRunner",
+            "src/types/caller.d.ts",
+            5,
+            7,
+            NodeKind::Function,
+            Language::TypeScript,
+        );
+        let sink = node_lang(
+            "ambientSink",
+            "ambientSink",
+            "src/impl/sink.ts",
+            1,
+            3,
+            NodeKind::Function,
+            Language::TypeScript,
+        );
+        put_indexed_source(
+            &engine,
+            "src/impl/sink.ts",
+            "export function ambientSink(): number {\n  return 1;\n}\n",
+            Language::TypeScript,
+            1,
+        );
+        edges.push(mk_edge(&runner.id, &sink.id, EdgeKind::Calls));
+        nodes.push(runner);
+        nodes.push(sink);
+
+        // The `imported` shim is pure, but a DIFFERENT file references it, so
+        // condition 4 rejects it: something depends on it.
+        put_indexed_source(
+            &engine,
+            "src/types/imported.d.ts",
+            "export interface AmbientImportedAlpha {\n  ambientId: string;\n}\n",
+            Language::TypeScript,
+            1,
+        );
+        let imported = node_lang(
+            "AmbientImportedAlpha",
+            "AmbientImportedAlpha",
+            "src/types/imported.d.ts",
+            1,
+            3,
+            NodeKind::Interface,
+            Language::TypeScript,
+        );
+        let consumer = node_lang(
+            "ambientConsumer",
+            "ambientConsumer",
+            "src/impl/consumer.ts",
+            1,
+            3,
+            NodeKind::Function,
+            Language::TypeScript,
+        );
+        put_indexed_source(
+            &engine,
+            "src/impl/consumer.ts",
+            "export function ambientConsumer(): number {\n  return 2;\n}\n",
+            Language::TypeScript,
+            1,
+        );
+        edges.push(mk_edge(&consumer.id, &imported.id, EdgeKind::References));
+        nodes.push(imported);
+        nodes.push(consumer);
+
+        // The `mixed` file declares a type AND implements a function, so condition
+        // 2 rejects it.
+        put_indexed_source(
+            &engine,
+            "src/types/mixed.ts",
+            "export interface AmbientMixedAlpha {\n  ambientId: string;\n}\nexport function ambientMixedRun(): number {\n  return 3;\n}\n",
+            Language::TypeScript,
+            2,
+        );
+        nodes.push(node_lang(
+            "AmbientMixedAlpha",
+            "AmbientMixedAlpha",
+            "src/types/mixed.ts",
+            1,
+            3,
+            NodeKind::Interface,
+            Language::TypeScript,
+        ));
+        nodes.push(node_lang(
+            "ambientMixedRun",
+            "ambientMixedRun",
+            "src/types/mixed.ts",
+            4,
+            6,
+            NodeKind::Function,
+            Language::TypeScript,
+        ));
+
+        put_nodes(&mut engine, &nodes);
+        put_edges(&mut engine, &edges);
+
+        let sub = engine.find_relevant_context("Ambient").unwrap();
+        assert!(
+            sub.ambient_files.contains("src/types/pure.d.ts"),
+            "the pure shim must be ambient; got {:?}",
+            sub.ambient_files
+        );
+        for rejected in [
+            "src/types/caller.d.ts",
+            "src/types/imported.d.ts",
+            "src/types/mixed.ts",
+        ] {
+            assert!(
+                !sub.ambient_files.contains(rejected),
+                "{rejected} must NOT be ambient; got {:?}",
+                sub.ambient_files
+            );
+        }
+    }
+
+    /// Tier 5 item 14 (CG-28), the combination rule. Given four files equal in
+    /// `tier` AND in `sym_count`, differing only in the generated and ambient
+    /// signals, When `finalize` ranks them, Then generated-only and
+    /// generated+ambient produce the SAME key, so their order falls through to the
+    /// path tie-break.
+    ///
+    /// Holding both other components fixed is the whole point: a four-boolean key
+    /// would rank generated+ambient strictly below generated-only and still satisfy
+    /// any assertion that let `tier` or `sym_count` vary. No weight may be 0
+    /// either, or damping would cross a tier.
+    #[test]
+    fn ambient_and_generated_weight_ties_with_generated_only() {
+        // The two generated paths are named so that PATH order puts the
+        // generated+ambient one FIRST. That breaks a coincidence: with
+        // `c_generated` before `d_both`, a four-boolean key produces the same
+        // order as `min` and the assertion would discriminate nothing. Here the
+        // two disagree — `min` ties and the path tie-break wins (`c_both` first),
+        // while a fourth boolean ranks `d_generated` strictly higher.
+        let mut sg = ExploreSubgraph::default();
+        let mut roots = Vec::new();
+        // Distinct symbol names, because `node`'s synthetic id is derived from
+        // kind+name+line and four identical ones would collide into a single
+        // inserted node. Each file still contributes exactly one, so `sym_count`
+        // stays equal across all four.
+        for (i, stem) in ["a_plain", "b_ambient", "c_both", "d_generated"]
+            .into_iter()
+            .enumerate()
+        {
+            let path = format!("src/{stem}.ts");
+            let n = node(&format!("SharedName{i}"), &path, 1, 3, NodeKind::Interface);
+            roots.push(n.id.clone());
+            sg.insert(n);
+        }
+        sg.roots = roots;
+        sg.generated_files.insert("src/c_both.ts".to_string());
+        sg.generated_files.insert("src/d_generated.ts".to_string());
+        sg.ambient_files.insert("src/b_ambient.ts".to_string());
+        sg.ambient_files.insert("src/c_both.ts".to_string());
+        sg.finalize();
+
+        assert_eq!(
+            sg.file_order,
+            vec![
+                "src/a_plain.ts",
+                "src/b_ambient.ts",
+                "src/c_both.ts",
+                "src/d_generated.ts",
+            ],
+            "plain > ambient > {{generated, generated+ambient TIED, ordered by path}}"
+        );
+    }
+
+    /// Tier 5 item 14 (CG-28), SCOPE. Given a shim whose only dependent references
+    /// a declaration the query does not match — so that dependent is genuinely
+    /// absent from the subgraph — When the ambient set is computed, Then the shim
+    /// is NOT damped, because condition 4 is evaluated index-wide.
+    ///
+    /// A subgraph-scoped predicate passes assertion 1 and fails assertion 2: it
+    /// sees zero inbound cross-file edges and damps a hand-written type module
+    /// other files genuinely import. `get_callers` walks inbound edges from the
+    /// ROOTS only, so a consumer pointing at a non-root declaration is unreachable
+    /// at any depth — which is what makes this a scope test and not a duplicate.
+    #[test]
+    fn ambient_predicate_sees_a_dependent_outside_the_subgraph() {
+        let build = |with_consumer: bool| {
+            let mut engine = test_engine();
+            let shim = "src/types/env.d.ts";
+            put_indexed_source(
+                &engine,
+                shim,
+                "export interface UploadAlpha {\n  id: string;\n}\nexport interface UploadBeta {\n  id: string;\n}\nexport interface UploadGamma {\n  id: string;\n}\nexport interface LegacyChunkMeta {\n  id: string;\n}\n",
+                Language::TypeScript,
+                4,
+            );
+            let mut nodes: Vec<Node> = ["UploadAlpha", "UploadBeta", "UploadGamma"]
+                .iter()
+                .enumerate()
+                .map(|(i, n)| {
+                    node_lang(
+                        n,
+                        n,
+                        shim,
+                        1 + (i as i64) * 3,
+                        3 + (i as i64) * 3,
+                        NodeKind::Interface,
+                        Language::TypeScript,
+                    )
+                })
+                .collect();
+            let legacy = node_lang(
+                "LegacyChunkMeta",
+                "LegacyChunkMeta",
+                shim,
+                10,
+                12,
+                NodeKind::Interface,
+                Language::TypeScript,
+            );
+            nodes.push(legacy.clone());
+            let mut edges = Vec::new();
+            if with_consumer {
+                let consumer_path = "src/unrelated/consumer.ts";
+                put_indexed_source(
+                    &engine,
+                    consumer_path,
+                    "export function unrelatedConsumer(): number {\n  return 1;\n}\n",
+                    Language::TypeScript,
+                    1,
+                );
+                let consumer = node_lang(
+                    "unrelatedConsumer",
+                    "unrelatedConsumer",
+                    consumer_path,
+                    1,
+                    3,
+                    NodeKind::Function,
+                    Language::TypeScript,
+                );
+                edges.push(mk_edge(&consumer.id, &legacy.id, EdgeKind::References));
+                nodes.push(consumer);
+            }
+            put_nodes(&mut engine, &nodes);
+            put_edges(&mut engine, &edges);
+            engine.find_relevant_context("Upload").unwrap()
+        };
+
+        let sub = build(true);
+        assert!(
+            !sub.nodes
+                .iter()
+                .any(|n| n.file_path == "src/unrelated/consumer.ts"),
+            "the depending file must be genuinely OUTSIDE the subgraph, or this \
+             proves nothing about scope; got {:?}",
+            sub.nodes.iter().map(|n| &n.file_path).collect::<Vec<_>>()
+        );
+        assert!(
+            !sub.ambient_files.contains("src/types/env.d.ts"),
+            "condition 4 must be evaluated index-wide; got {:?}",
+            sub.ambient_files
+        );
+
+        let twin = build(false);
+        assert!(
+            twin.ambient_files.contains("src/types/env.d.ts"),
+            "with no dependent anywhere the same shim IS ambient, so the \
+             difference is attributable to condition 4 alone; got {:?}",
+            twin.ambient_files
+        );
+    }
+
+    /// Tier 5 item 15 (CG-26/31), the elastic pointer block. Given a set of
+    /// candidate pointer lines and the headroom the source sections left, When the
+    /// block is fitted, Then it never spends more than that headroom and the
+    /// unlisted count is TRUE — covering both files dropped by elasticity and
+    /// files dropped by the ten-file cap.
+    ///
+    /// A fixed pointer floor and an incremental per-file charge both fail these
+    /// cases, which is why they were rejected: the floor over-reserves and sheds a
+    /// source section, while the incremental charge discovers the cost only after
+    /// the admission it should have blocked.
+    #[test]
+    fn epilogue_pointer_block_fits_the_remaining_budget() {
+        let three: Vec<String> = (0..3).map(|i| format!("- src/f{i}.ts: sym:1")).collect();
+        let one_cost = 1 + three[0].len();
+
+        let (all, unlisted) = fit_pointer_lines(&three, one_cost * 3);
+        assert_eq!((all.len(), unlisted), (3, 0), "every line fits");
+
+        let (some, unlisted) = fit_pointer_lines(&three, one_cost * 2);
+        assert_eq!((some.len(), unlisted), (2, 1), "prefix emitted, 1 unlisted");
+        assert!(some.iter().map(|l| 1 + l.len()).sum::<usize>() <= one_cost * 2);
+
+        let (none, unlisted) = fit_pointer_lines(&three, one_cost - 1);
+        assert_eq!(
+            (none.len(), unlisted),
+            (0, 3),
+            "nothing fits ⇒ the tail must account for ALL candidates"
+        );
+
+        // Both drop mechanisms at once: 14 candidates, so the ten-file cap hides
+        // four, and a budget for two hides six more.
+        let many: Vec<String> = (0..14)
+            .map(|i| format!("- src/g{i:02}.ts: sym:1"))
+            .collect();
+        let two_cost = (1 + many[0].len()) * 2;
+        let (fitted, unlisted) = fit_pointer_lines(&many, two_cost);
+        assert_eq!(
+            (fitted.len(), unlisted),
+            (2, 12),
+            "N must count BOTH the cap's four and elasticity's eight"
+        );
+        assert!(fitted.iter().map(|l| 1 + l.len()).sum::<usize>() <= two_cost);
+    }
+
+    /// Tier 5 item 15 (CG-26/31). Given a file with 120 subgraph nodes, When its
+    /// "Not shown above" pointer line is built, Then it carries at most six
+    /// `name:line` pairs plus a `+114 more` tail.
+    ///
+    /// Uncapped, one such line reaches ~1,700 bytes and a single file's pointer
+    /// exhausts any plausible epilogue budget. The cap is asserted HERE rather
+    /// than on explore's output because the hard-ceiling cut deletes exactly the
+    /// long lines that would prove it: measured, the longest surviving `- src/…`
+    /// line in the defective output is 33 bytes.
+    #[test]
+    fn file_node_locations_caps_symbols_at_six() {
+        let nodes: Vec<Node> = (1..=120)
+            .map(|i| node(&format!("entry{i}"), "wide.ts", i, i, NodeKind::Method))
+            .collect();
+        let sg = subgraph_with(nodes, Vec::new());
+
+        let line = sg.file_node_locations("wide.ts");
+        assert_eq!(
+            line.matches(':').count(),
+            6,
+            "expected exactly 6 name:line pairs, got: {line}"
+        );
+        assert!(
+            line.ends_with(", +114 more"),
+            "expected a +114 more tail, got: {line}"
+        );
     }
 
     #[test]
