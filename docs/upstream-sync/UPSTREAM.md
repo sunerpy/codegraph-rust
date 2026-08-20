@@ -13,10 +13,14 @@
   `1.2.0 → 1.4.1` subset landed across `v0.28.3`–`v0.39.0`; see the 2026-07-17
   CLOSEOUT entry)
 - **This project version:** see `Cargo.toml` (`codegraph-rs`, independent line)
-- **Last sync:** `2026-08-04` — the two triaged issues left open by the
-  `1.4.1 → 1.5.0` round (**#1495**, **#1482 / #1482b**) have shipped, alongside two
-  project-local fixes; see the 2026-08-04 entry. Tracked parity stays `1.5.0` —
-  none of the four releases is an upstream-range port
+- **Last sync:** `2026-08-20` — the post-`v1.5.0` **unreleased** range (104 commits
+  on upstream `main` past the `v1.5.0` tag) was triaged and four tiers shipped
+  across `v0.43.2` → `v0.45.0`; see the 2026-08-20 entry. Tracked parity stays
+  `1.5.0` — none of these releases is a port of an upstream *release* range, and
+  upstream's newest tag is still `v1.5.0`
+- **Next sync starts here:** `git ls-remote --tags` alone is not enough. Diff
+  `v1.5.0..origin/main` too — this round found 104 unreleased commits behind an
+  unchanged tag
 - **Upstream repo:** https://github.com/colbymchenry/codegraph
 
 > **1.4.1 → 1.5.0 sync: COMPLETE** (codegraph-rs `v0.42.1` → `v0.42.4`). Every
@@ -68,6 +72,94 @@
 > that records colby parity — do not infer it from `Cargo.toml`.
 
 ## Sync log
+
+### 2026-08-20 — post-`v1.5.0` unreleased range TRIAGED, four tiers SHIPPED (`v0.43.2` → `v0.45.0`; tracked parity stays `1.5.0`)
+
+`git ls-remote --tags` still reports `v1.5.0` as upstream's newest tag, so a
+version-delta sync had nothing to pull. But `main` had accumulated **104
+unreleased commits** past that tag (43 source files, +5737/−368), and issues
+#1496–#1566 / PRs #1402–#1564 had never been triaged. "No new version" is not
+"no new content" — that is the lesson worth carrying into the next sync.
+
+Three parallel triages ran (extraction/kernel, `explore`/MCP, issues/PRs), and
+every disposition below marked MEASURED was reproduced against a built binary
+before being acted on. Tracked parity stays `1.5.0`: none of these releases is a
+port of an upstream *release* range.
+
+#### Shipped
+
+| release | PR | what landed | upstream refs |
+| --- | --- | --- | --- |
+| `v0.43.2` | #209 | one shared file-classification signal across every surface | #1507 + the path table behind #1500 |
+| `v0.43.3` | #211 | stop binding calls, imports and supertypes to coincidences | #1496, #1566, #1537/#1536 (PR #1538) |
+| `v0.44.0` | #213 | unions, unit structs and COM `interface` as containers | PR #1516, #1513/PR #1514, #1519 |
+| `v0.44.1` | #215 | imported members, cross-module Go calls, declaration initializers | #1518, #1521, #1510/PR #1511, #1524, #1512, #1504, #671 |
+| `v0.45.0` | #217 | Tauri commands bound to their `invoke` call sites | #1543 |
+
+`v0.43.2` also carried `h2` 0.4.16 for **RUSTSEC-2026-0258** — unrelated to the
+sync, but it is why that release exists at that moment: the advisory published
+mid-round and turned CI red on a lockfile nobody had touched.
+
+#### Two agent findings REFUTED by measurement — recorded so the next sync skips them
+
+| claim | verdict |
+| --- | --- |
+| `Store::nodes_by_name` lacks `ORDER BY`, so sync and rebuild can bind different same-name targets (upstream CG-33) | **ALREADY-HAVE.** Both production resolution contexts sort candidates themselves — `context.rs:111,125` and `snapshot_context.rs:118-124` call `order_candidates` / `order_candidates_pub`, keyed `(file_path, start_line, start_column, id)`: upstream's key plus an extra total-order `id` tie-break. MEASURED twice — sync and `index --force` both bind `caller.run → pct@alpha.ts` even when sync's rowid order puts `zeta` first. |
+| the `explore` staleness banner can be truncated away by our own budget logic | **ALREADY-HAVE.** The banner is *prepended after* truncation: `cut_at_section_boundary` → `mark_surviving_explore_citations(kept_prefix_len)` → `with_staleness_banner`. A cut section's citation is dropped first, so the banner correctly omits it. Pinned by the pre-existing `staleness_banner_omits_a_citation_removed_from_the_final_response`. The agent had conflated the in-section inline warning with the top-level banner. |
+
+#### One upstream premise upstream itself REJECTED — never port it
+
+**CG-27** — treating `function`/`method` as >50% envelope containers so inner
+closures rank independently. Upstream measured and rejected it
+(`91cb5b4:docs/benchmarks/explore-factory-closure-cg27.md`): delivered chars
+7,539 → 397, inner closures 7/11 → 0/11, ~5,200 of a 5,601 reservation unused.
+The cautious variant moved nine queries by 68 → 69 definitions total. Our
+envelope drop stays limited to `is_container`. The real defect it exposed —
+a trivial cluster winning on density while the answer cluster is dropped whole —
+is tracked separately as the Tier 5 `explore` work.
+
+#### Divergences to record, not port
+
+- **Self-hosted telemetry** (`49c11fc`, Cloudflare D1 + a password-gated
+  dashboard replacing PostHog) and **#1509's request for a Qdrant/vector-RAG
+  integration**. Both are permanent divergences: `scripts/guardrail.sh` is a CI
+  gate rejecting qdrant/lancedb/candle/onnx/ort, byte-stable output is
+  incompatible with a nondeterministic retrieval stage, and our indexing path
+  makes no network call. Nothing vector-related is merged upstream yet — the
+  stance is recorded now so it is a decision rather than a surprise. `package.json`
+  in this range adds no AI dependency.
+
+#### N/A — TypeScript/Node-only, no Rust analogue
+
+#1532 (FTS5 absent from official Node builds — we compile it into `rusqlite`),
+#1558 (V8 spread-arg limit), #1559 (V8 RegExp code space — the `regex` crate has
+no such budget), #1544/#1547/#1564 (Vapor regex catastrophic backtracking —
+`regex` is linear-time by construction), #1553 (V8 4 GB heap), #1549
+(`git ls-files --recurse-submodules` on git <2.34 — we never call it),
+#1476/#1477 (npm CVEs), #1550 (npm platform bundle).
+
+#### NOT REPRODUCED here — closed questions, with the measurement
+
+#1555 (C/C++ hex-blob header stall — a 360 KB header with 60,000 `0x..`
+initializers indexed in **326 ms**), #1522 (16-char raw-string delimiter — both
+functions extracted), #1505 (400-function anonymous namespace — all 402
+extracted), #1565 (init/sync symbol-count divergence — our byte-equality is a
+gated invariant). #1560 (JSX synthesis fabricating edges in a pure C/C++ index)
+**cannot occur**: we have no synthesis pass at all. The flip side is that we lack
+`jsx-render` edges entirely — a separate known gap.
+
+#### Where we are AHEAD of upstream
+
+Upstream is only now adding GDScript (#1499), which we shipped with a full
+framework resolver (F1 autoload calls, F2 signal handlers, F3 impact/affected
+unification) and a byte-stable golden corpus.
+
+#### Still open from this range
+
+The `explore` budget/selection epic (CG-38/36/30/28/26/31) and content-header
+generated detection (#1500's `files.generated` column) are planned and reviewed
+but not yet shipped. The 26 DEFER items and the permanently-N/A `0682137`
+recorded in earlier entries are unchanged.
 
 ### 2026-08-04 — the two open triaged issues SHIPPED, plus two project-local fixes (`v0.42.5` → `v0.42.8`; tracked parity stays `1.5.0`)
 
