@@ -319,6 +319,10 @@ enum Command {
         /// Exit non-zero when no callers are found (default exits 0).
         #[arg(long)]
         strict: bool,
+        /// Disambiguate same-named definitions: keep only the one defined in this
+        /// file (exact project-relative path or a trailing path suffix).
+        #[arg(long, value_name = "FILE")]
+        file: Option<String>,
     },
     // Upstream flags/output shape: upstream bin/codegraph.ts:1280-1284, 1298-1345.
     Callees {
@@ -332,6 +336,10 @@ enum Command {
         /// Exit non-zero when no callees are found (default exits 0).
         #[arg(long)]
         strict: bool,
+        /// Disambiguate same-named definitions: keep only the one defined in this
+        /// file (exact project-relative path or a trailing path suffix).
+        #[arg(long, value_name = "FILE")]
+        file: Option<String>,
     },
     // Upstream flags/output shape: upstream bin/codegraph.ts:1358-1362, 1374-1439.
     Impact {
@@ -345,6 +353,10 @@ enum Command {
         /// Exit non-zero when the symbol is not found (default exits 0).
         #[arg(long)]
         strict: bool,
+        /// Disambiguate same-named definitions: keep only the one defined in this
+        /// file (exact project-relative path or a trailing path suffix).
+        #[arg(long, value_name = "FILE")]
+        file: Option<String>,
     },
     // Upstream flags/output shape: upstream bin/codegraph.ts:1462-1469, 1479-1582.
     Affected {
@@ -650,21 +662,24 @@ fn run(cli: Cli) -> Result<()> {
             limit,
             json,
             strict,
-        } => cmd_callers(symbol, path, limit, json, strict),
+            file,
+        } => cmd_callers(symbol, path, limit, json, strict, file),
         Command::Callees {
             symbol,
             path,
             limit,
             json,
             strict,
-        } => cmd_callees(symbol, path, limit, json, strict),
+            file,
+        } => cmd_callees(symbol, path, limit, json, strict, file),
         Command::Impact {
             symbol,
             path,
             depth,
             json,
             strict,
-        } => cmd_impact(symbol, path, depth, json, strict),
+            file,
+        } => cmd_impact(symbol, path, depth, json, strict, file),
         Command::Affected {
             files,
             path,
@@ -3788,6 +3803,7 @@ fn cmd_unlock(path: Option<PathBuf>) -> Result<()> {
     let start = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
     index_paths(&start)?;
     let project = resolve_project_path_optional(&start);
+    warn_ancestor_index_retarget(&start, &project);
     let paths = index_paths(&project)?;
     let daemon_lock = codegraph_daemon::daemon_pid_path(&project)?;
     let daemon_removed = daemon_lock.exists() && codegraph_daemon::unlock_project(&project);
@@ -3839,19 +3855,32 @@ fn cmd_callers(
     limit: usize,
     json_output: bool,
     strict: bool,
+    file: Option<String>,
 ) -> Result<()> {
     let project = resolve_required_project(path)?;
     let store = open_store(&project)?;
-    let nodes = related_nodes_for_symbol(&store, &project, &symbol, limit, Related::Callers)?;
+    let nodes = related_nodes_for_symbol(
+        &store,
+        &project,
+        &symbol,
+        limit,
+        Related::Callers,
+        file.as_deref(),
+    )?;
     let godot = godot_honesty_for_symbol(&store, &project, &symbol)?;
     if json_output {
         print_json_pretty(&json!({
             "symbol": symbol,
+            "file": file,
             "callers": nodes,
             "godotDynamic": godot.as_json(),
         }))?;
     } else {
-        print_related("Callers", &symbol, &nodes);
+        print_related(
+            "Callers",
+            &describe_symbol(&symbol, file.as_deref()),
+            &nodes,
+        );
         godot.print_cli(nodes.is_empty());
     }
     if strict && nodes.is_empty() {
@@ -3866,14 +3895,26 @@ fn cmd_callees(
     limit: usize,
     json_output: bool,
     strict: bool,
+    file: Option<String>,
 ) -> Result<()> {
     let project = resolve_required_project(path)?;
     let store = open_store(&project)?;
-    let nodes = related_nodes_for_symbol(&store, &project, &symbol, limit, Related::Callees)?;
+    let nodes = related_nodes_for_symbol(
+        &store,
+        &project,
+        &symbol,
+        limit,
+        Related::Callees,
+        file.as_deref(),
+    )?;
     if json_output {
-        print_json_pretty(&json!({ "symbol": symbol, "callees": nodes }))?;
+        print_json_pretty(&json!({ "symbol": symbol, "file": file, "callees": nodes }))?;
     } else {
-        print_related("Callees", &symbol, &nodes);
+        print_related(
+            "Callees",
+            &describe_symbol(&symbol, file.as_deref()),
+            &nodes,
+        );
     }
     if strict && nodes.is_empty() {
         bail!("codegraph callees: no callees found for \"{symbol}\"");
@@ -3902,6 +3943,7 @@ fn cmd_impact(
     depth: usize,
     json_output: bool,
     strict: bool,
+    file: Option<String>,
 ) -> Result<()> {
     let project = resolve_required_project(path)?;
     let store = open_store(&project)?;
@@ -3919,6 +3961,7 @@ fn cmd_impact(
     if exact_matches.is_empty() {
         bail!(lookup_symbol_not_found_message(&symbol));
     }
+    let exact_matches = filter_matches_by_file(exact_matches, &symbol, file.as_deref())?;
     let traverser = GraphTraverser::new(&store);
     let mut nodes = HashMap::new();
     let mut edge_keys = HashSet::new();
@@ -3963,6 +4006,7 @@ fn cmd_impact(
     if json_output {
         print_json_pretty(&json!({
             "symbol": symbol,
+            "file": file,
             "depth": depth,
             "nodeCount": affected.len(),
             "edgeCount": edge_keys.len() + resource_edge_count,
@@ -3973,7 +4017,7 @@ fn cmd_impact(
     } else {
         println!(
             "\nImpact of changing \"{}\" - {} affected symbols:\n",
-            symbol,
+            describe_symbol(&symbol, file.as_deref()),
             affected.len()
         );
         print_by_file(&affected);
@@ -5196,12 +5240,14 @@ fn related_nodes_for_symbol(
     symbol: &str,
     limit: usize,
     related: Related,
+    file: Option<&str>,
 ) -> Result<Vec<NodeSummary>> {
     let matches = symbol_matches(store, project, symbol)?;
     let exact_matches = exact_or_top_matches(&matches, symbol);
     if exact_matches.is_empty() {
         bail!(lookup_symbol_not_found_message(symbol));
     }
+    let exact_matches = filter_matches_by_file(exact_matches, symbol, file)?;
     let traverser = GraphTraverser::new(store);
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -5416,6 +5462,60 @@ fn exact_or_top_matches<'a>(matches: &'a [Node], symbol: &str) -> Vec<&'a Node> 
                 || node.name.ends_with(&format!("::{symbol}"))
         })
         .collect()
+}
+
+/// Narrow same-named definitions to the one declared in `file` (#1512).
+///
+/// `None` passes every match through, so the unfiltered output of `callers` /
+/// `callees` / `impact` is byte-unchanged. A filter is matched against the whole
+/// project-relative path OR any trailing path segment boundary, so both
+/// `src/deep/mod.ts` and `deep/mod.ts` select the same definition.
+///
+/// An unmatched filter is an ERROR listing the files that DO define the symbol.
+/// Returning an empty relative-set instead would render as "no callers", which
+/// reads as "this symbol is dead" — the exact false negative the flag exists to
+/// prevent.
+fn filter_matches_by_file<'a>(
+    matches: Vec<&'a Node>,
+    symbol: &str,
+    file: Option<&str>,
+) -> Result<Vec<&'a Node>> {
+    let Some(want) = file else {
+        return Ok(matches);
+    };
+    let want = want.replace('\\', "/");
+    let want = want.trim_start_matches("./");
+    let kept: Vec<&'a Node> = matches
+        .iter()
+        .copied()
+        .filter(|node| path_matches_file_filter(&node.file_path, want))
+        .collect();
+    if kept.is_empty() {
+        let mut defined_in: Vec<&str> = matches.iter().map(|n| n.file_path.as_str()).collect();
+        defined_in.sort_unstable();
+        defined_in.dedup();
+        bail!(
+            "no definition of \"{symbol}\" in \"{want}\"; it is defined in: {}",
+            defined_in.join(", ")
+        );
+    }
+    Ok(kept)
+}
+
+/// A file filter matches the whole path or a trailing SEGMENT-aligned suffix, so
+/// `other.ts` never selects `my_other.ts`.
+fn path_matches_file_filter(file_path: &str, want: &str) -> bool {
+    let normalized = file_path.replace('\\', "/");
+    normalized == want || normalized.ends_with(&format!("/{want}"))
+}
+
+/// Render the queried symbol for human output, naming the applied `--file`
+/// filter so a narrowed list is never mistaken for the symbol's full set.
+fn describe_symbol(symbol: &str, file: Option<&str>) -> String {
+    match file {
+        Some(file) => format!("{symbol}\" in \"{file}"),
+        None => symbol.to_string(),
+    }
 }
 
 fn lookup_symbol_not_found_message(symbol: &str) -> String {
@@ -5634,11 +5734,42 @@ fn resolve_required_rebuild_project(path: Option<PathBuf>) -> Result<PathBuf> {
             break;
         }
         if has_rebuild_namespace(parent) {
+            warn_ancestor_index_retarget(&start, parent);
             return Ok(parent.to_path_buf());
         }
         current = parent;
     }
     bail!("CodeGraph not initialized in {}", start.display())
+}
+
+/// Announce that a MUTATING command is about to operate on an ANCESTOR's index
+/// rather than the directory the user named (#1524).
+///
+/// `index .` inside an unindexed `parent/child` rebuilt the PARENT and printed
+/// only `Indexed N files` — a count including the parent's own files — while
+/// creating no child index. The retarget is intended behaviour (it is how one
+/// index serves a whole tree), but performing it silently is what made the
+/// outcome unreadable, and for `uninit --force` it deletes an index the user
+/// never named.
+///
+/// STDERR only: these commands' stdout is machine-readable and pinned by
+/// `stdout_purity.rs`. Callers that already resolved the project themselves —
+/// [`cmd_unlock`] — call this directly.
+fn warn_ancestor_index_retarget(requested: &Path, resolved: &Path) {
+    if requested == resolved {
+        return;
+    }
+    eprintln!(
+        "Warning: {} has no CodeGraph index, so this command resolved to an ancestor index at {} \
+         and will operate on THAT project, not on {}.",
+        requested.display(),
+        resolved.display(),
+        requested.display()
+    );
+    eprintln!(
+        "         Run `codegraph init {}` first if you meant to give it its own index.",
+        requested.display()
+    );
 }
 
 fn resolve_project_path_optional(start: &Path) -> PathBuf {
@@ -6436,6 +6567,85 @@ mod pure_helper_tests {
         assert_eq!(picked.len(), 2);
     }
 
+    fn node_in(name: &str, file: &str) -> Node {
+        let mut n = node(name);
+        n.file_path = file.to_string();
+        n
+    }
+
+    #[test]
+    fn file_filter_matches_whole_path_and_segment_aligned_suffix() {
+        assert!(path_matches_file_filter(
+            "src/deep/mod.ts",
+            "src/deep/mod.ts"
+        ));
+        assert!(path_matches_file_filter("src/deep/mod.ts", "deep/mod.ts"));
+        assert!(path_matches_file_filter("src/deep/mod.ts", "mod.ts"));
+    }
+
+    #[test]
+    fn file_filter_rejects_a_suffix_that_splits_a_segment() {
+        // `other.ts` must not select `my_other.ts` — a plain `ends_with` would.
+        assert!(!path_matches_file_filter("src/my_other.ts", "other.ts"));
+        assert!(!path_matches_file_filter("src/deep/mod.ts", "eep/mod.ts"));
+    }
+
+    #[test]
+    fn filter_matches_by_file_none_passes_everything_through() {
+        let alpha = node_in("target", "alpha.ts");
+        let beta = node_in("target", "beta.ts");
+        let matches = vec![&alpha, &beta];
+        let kept = filter_matches_by_file(matches, "target", None).expect("no filter");
+        assert_eq!(kept.len(), 2, "unfiltered behaviour must be unchanged");
+    }
+
+    #[test]
+    fn filter_matches_by_file_selects_one_definition() {
+        let alpha = node_in("target", "alpha.ts");
+        let beta = node_in("target", "beta.ts");
+        let kept =
+            filter_matches_by_file(vec![&alpha, &beta], "target", Some("beta.ts")).expect("filter");
+        assert_eq!(
+            kept.iter()
+                .map(|n| n.file_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["beta.ts"]
+        );
+    }
+
+    #[test]
+    fn filter_matches_by_file_unmatched_errors_and_lists_the_real_files() {
+        let alpha = node_in("target", "alpha.ts");
+        let beta = node_in("target", "beta.ts");
+        let err = filter_matches_by_file(vec![&alpha, &beta], "target", Some("nope.ts"))
+            .expect_err("an unmatched filter must error, not return empty");
+        let text = err.to_string();
+        assert!(text.contains("nope.ts"), "must name the filter: {text}");
+        assert!(
+            text.contains("alpha.ts") && text.contains("beta.ts"),
+            "must list the defining files: {text}"
+        );
+    }
+
+    #[test]
+    fn filter_matches_by_file_normalizes_windows_separators_and_dot_slash() {
+        let deep = node_in("target", "src/deep/mod.ts");
+        for want in ["src\\deep\\mod.ts", "./src/deep/mod.ts"] {
+            let kept =
+                filter_matches_by_file(vec![&deep], "target", Some(want)).expect("normalized");
+            assert_eq!(kept.len(), 1, "{want} must select the definition");
+        }
+    }
+
+    #[test]
+    fn describe_symbol_names_the_applied_filter() {
+        assert_eq!(describe_symbol("target", None), "target");
+        assert_eq!(
+            describe_symbol("target", Some("alpha.ts")),
+            "target\" in \"alpha.ts"
+        );
+    }
+
     #[test]
     fn exact_or_top_matches_refuses_fuzzy_only_matches() {
         let matches = vec![node("alpha"), node("beta")];
@@ -6602,6 +6812,17 @@ mod pure_helper_tests {
         let dir = tmp("resolve");
         assert_eq!(resolve_project_path_optional(&dir), dir);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ancestor_retarget_warning_is_a_no_op_when_nothing_was_retargeted() {
+        // The common case is `requested == resolved`; warning there would print
+        // on every ordinary run. Exercised for its no-panic/no-emit contract —
+        // the emitting branch is covered end-to-end by
+        // `tests/ancestor_retarget_warning.rs`, which can actually capture
+        // stderr.
+        let same = PathBuf::from("/proj");
+        warn_ancestor_index_retarget(&same, &same);
     }
 
     #[test]

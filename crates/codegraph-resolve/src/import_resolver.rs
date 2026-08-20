@@ -12,7 +12,9 @@ use crate::name_matcher::{
 };
 use crate::path_aliases::apply_aliases;
 use crate::pathutil;
-use crate::types::{ImportMapping, ReExport, RefView, ResolutionContext, ResolvedBy, ResolvedRef};
+use crate::types::{
+    GoModule, ImportMapping, ReExport, RefView, ResolutionContext, ResolvedBy, ResolvedRef,
+};
 use crate::workspace_packages::resolve_workspace_import;
 use codegraph_core::types::{Language, Node, NodeKind};
 use regex::Regex;
@@ -424,7 +426,7 @@ fn is_external_import(
         if import_path.starts_with('.') {
             return false;
         }
-        if let Some(module) = context.get_go_module() {
+        for module in context.get_go_modules() {
             if import_path == module.module_path
                 || import_path.starts_with(&format!("{}/", module.module_path))
             {
@@ -1457,6 +1459,9 @@ pub fn resolve_via_import(
         if let Some(py_result) = resolve_python_module_member(reference, &imports, context) {
             return Some(py_result);
         }
+        if let Some(py_member) = resolve_python_from_import_member(reference, &imports, context) {
+            return Some(py_member);
+        }
         if let Some(py_mod) = resolve_python_absolute_module(reference, context) {
             return Some(py_mod);
         }
@@ -1996,6 +2001,30 @@ fn resolve_static_member(
     Some(candidates.swap_remove(0))
 }
 
+/// The module whose `module_path` covers `import_path`, longest match first.
+fn owning_go_module<'m>(import_path: &str, modules: &'m [GoModule]) -> Option<&'m GoModule> {
+    modules
+        .iter()
+        .filter(|m| {
+            import_path == m.module_path || import_path.starts_with(&format!("{}/", m.module_path))
+        })
+        .max_by_key(|m| m.module_path.len())
+}
+
+/// The project-relative directory an in-project Go import resolves to: the
+/// owning module's own directory, plus the import's path below `module_path`.
+fn go_package_dir(import_path: &str, module: &GoModule) -> String {
+    let below = import_path
+        .strip_prefix(&module.module_path)
+        .unwrap_or_default()
+        .trim_start_matches('/');
+    match (module.dir.as_str(), below) {
+        ("", rest) => rest.to_string(),
+        (dir, "") => dir.to_string(),
+        (dir, rest) => format!("{dir}/{rest}"),
+    }
+}
+
 /// Go cross-package call `pkga.FuncX` → the exported member in the package
 /// directory the import maps to. Ports `resolveGoCrossPackageReference`
 /// (import-resolver.ts, issue #388).
@@ -2004,7 +2033,10 @@ fn resolve_go_cross_package_reference(
     imports: &[ImportMapping],
     context: &dyn ResolutionContext,
 ) -> Option<ResolvedRef> {
-    let module = context.get_go_module()?;
+    let modules = context.get_go_modules();
+    if modules.is_empty() {
+        return None;
+    }
     let dot_idx = reference.reference_name.find('.')?;
     if dot_idx == 0 {
         return None;
@@ -2019,17 +2051,13 @@ fn resolve_go_cross_package_reference(
         if imp.local_name != receiver {
             continue;
         }
-        // Only in-module imports map to a known directory.
-        if imp.source != module.module_path
-            && !imp.source.starts_with(&format!("{}/", module.module_path))
-        {
+        // Only in-project imports map to a known directory. With several modules
+        // the LONGEST matching module path wins, so a module nested inside
+        // another's path resolves to its own directory rather than its parent's.
+        let Some(module) = owning_go_module(&imp.source, &modules) else {
             continue;
-        }
-        let pkg_dir = if imp.source == module.module_path {
-            ""
-        } else {
-            &imp.source[module.module_path.len() + 1..]
         };
+        let pkg_dir = go_package_dir(&imp.source, module);
 
         for node in context.get_nodes_by_name(member) {
             if node.language != Language::Go || !node.is_exported {
@@ -2115,6 +2143,97 @@ fn resolve_python_module_member(
                 original: reference.clone(),
                 target_node_id: target.id,
                 confidence: 0.85,
+                resolved_by: ResolvedBy::Import,
+            });
+        }
+    }
+    None
+}
+
+/// Python `from pkg.mod import member [as alias]` → `member` in the file
+/// `pkg.mod` names (#1518 / #1453).
+///
+/// The generic import loop cannot reach this: it only ever resolves an import's
+/// `source` through [`resolve_import_path`], which maps RELATIVE dotted Python
+/// paths but not ABSOLUTE ones, and it then requires
+/// [`find_exported_symbol`] — which gates on `is_exported`, a flag the Python
+/// extractor never sets. Both halves fail, so the reference falls through to the
+/// name matcher: with two same-named definitions it picks the proximity-nearest
+/// (a DECOY module), and with an `as` alias it finds no node named `alias` at all
+/// and emits NO edge. Upstream frames this as a line-wrapped parenthesized
+/// import-list parsing bug; the single-line form fails identically, so the fix is
+/// module-scoped member resolution rather than a list parser.
+///
+/// Deliberately narrow, so it repairs the reported defect without displacing an
+/// already-correct resolution chain:
+///   * `Imports` references keep their own module/file resolution.
+///   * FUNCTION-REF (function-as-value) references keep the strictly-gated #756
+///     path — `reference/golden/python/` pins those as `resolvedBy:function-ref`.
+///   * Only the BARE reference form (`member()`) is handled; a `Member.attr()`
+///     tail stays with `resolve_python_module_member` and the method matcher.
+fn resolve_python_from_import_member(
+    reference: &RefView,
+    imports: &[ImportMapping],
+    context: &dyn ResolutionContext,
+) -> Option<ResolvedRef> {
+    if reference.reference_kind == codegraph_core::types::EdgeKind::Imports
+        || reference.is_function_ref
+        || reference.reference_name.contains('.')
+        || reference.reference_name.is_empty()
+    {
+        return None;
+    }
+
+    for imp in imports {
+        if imp.local_name != reference.reference_name {
+            continue;
+        }
+        // A namespace/default import binds a MODULE, not a member.
+        if imp.is_namespace || imp.is_default || imp.exported_name.is_empty() {
+            continue;
+        }
+        // `import mod` yields `local_name == exported_name == source`; that is a
+        // module binding, handled by `resolve_python_module_member` /
+        // `resolve_module_import_to_file`.
+        if imp.source.is_empty() || imp.source == imp.local_name {
+            continue;
+        }
+
+        // Relative dotted sources resolve lexically; absolute ones need the
+        // dotted-module file lookup (`pkg.mod` → `pkg/mod.py`).
+        let Some(module_file) = resolve_import_path(
+            &imp.source,
+            &reference.file_path,
+            reference.language,
+            context,
+        )
+        .or_else(|| find_python_module_file(&imp.source, context, &reference.file_path)) else {
+            continue;
+        };
+        if module_file == reference.file_path {
+            continue;
+        }
+
+        // `get_nodes_in_file` is ordered by `start_line`, so a file declaring the
+        // name twice resolves deterministically to the first declaration.
+        if let Some(target) = context
+            .get_nodes_in_file(&module_file)
+            .into_iter()
+            .find(|n| {
+                n.name == imp.exported_name
+                    && matches!(
+                        n.kind,
+                        NodeKind::Function
+                            | NodeKind::Class
+                            | NodeKind::Variable
+                            | NodeKind::Constant
+                    )
+            })
+        {
+            return Some(ResolvedRef {
+                original: reference.clone(),
+                target_node_id: target.id,
+                confidence: 0.9,
                 resolved_by: ResolvedBy::Import,
             });
         }
@@ -2395,7 +2514,7 @@ fn resolve_lua_require(
 mod tests {
     use super::*;
     use crate::path_aliases::{AliasMap, AliasPattern};
-    use crate::types::{GoModule, ImportMapping, ReExport, RefView, ResolutionContext};
+    use crate::types::{ImportMapping, ReExport, RefView, ResolutionContext};
     use crate::workspace_packages::WorkspacePackages;
     use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
     use std::collections::{BTreeMap, BTreeSet};
@@ -3145,6 +3264,7 @@ export default defaultTarget;
         let ctx = TestContext {
             go_module: Some(GoModule {
                 module_path: "example.com/proj".to_string(),
+                dir: String::new(),
             }),
             ..Default::default()
         };
@@ -4010,12 +4130,56 @@ export default defaultTarget;
             nodes: vec![target],
             go_module: Some(GoModule {
                 module_path: "example.com/proj".to_string(),
+                dir: String::new(),
             }),
             ..Default::default()
         };
         let r = reference("pkga.FuncX", EdgeKind::Calls, "main.go", Language::Go);
         let resolved = resolve_via_import(&r, &ctx).expect("resolves");
         assert_eq!(resolved.target_node_id, "function:FuncX");
+    }
+
+    fn go_mod(module_path: &str, dir: &str) -> crate::types::GoModule {
+        crate::types::GoModule {
+            module_path: module_path.to_string(),
+            dir: dir.to_string(),
+        }
+    }
+
+    #[test]
+    fn owning_go_module_prefers_the_longest_matching_module_path() {
+        let modules = vec![go_mod("ex/a", "a"), go_mod("ex/a/sub", "a/sub")];
+        assert_eq!(
+            owning_go_module("ex/a/sub/pkg", &modules).map(|m| m.dir.as_str()),
+            Some("a/sub"),
+            "the nested module must win over its prefix"
+        );
+        assert_eq!(
+            owning_go_module("ex/a/other", &modules).map(|m| m.dir.as_str()),
+            Some("a")
+        );
+        assert!(owning_go_module("github.com/x/y", &modules).is_none());
+    }
+
+    #[test]
+    fn owning_go_module_rejects_a_shared_path_prefix_that_is_not_a_segment() {
+        let modules = vec![go_mod("ex/a", "a")];
+        assert!(
+            owning_go_module("ex/abc", &modules).is_none(),
+            "`ex/abc` is a different module, not a package inside `ex/a`"
+        );
+    }
+
+    #[test]
+    fn go_package_dir_joins_module_dir_with_the_path_below_it() {
+        assert_eq!(go_package_dir("ex/a", &go_mod("ex/a", "a")), "a");
+        assert_eq!(go_package_dir("ex/a/pkg", &go_mod("ex/a", "a")), "a/pkg");
+        assert_eq!(go_package_dir("ex/m/pkg", &go_mod("ex/m", "")), "pkg");
+        assert_eq!(
+            go_package_dir("ex/m", &go_mod("ex/m", "")),
+            "",
+            "a root module's own package lives in the project root"
+        );
     }
 
     #[test]

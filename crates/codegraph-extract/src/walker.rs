@@ -2560,22 +2560,32 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                     .collect::<String>();
                 format!("= {}{}", init, if init.len() >= 100 { "..." } else { "" })
             });
-            if let Some(var_node) = self.create_node(
-                kind,
-                &name,
-                child,
-                NodeExtra {
-                    docstring: docstring.clone(),
-                    signature,
-                    is_exported,
-                    ..NodeExtra::default()
-                },
-            ) {
-                self.extract_variable_type_annotation(child, &var_node.id);
-            }
+            let declared_id = self
+                .create_node(
+                    kind,
+                    &name,
+                    child,
+                    NodeExtra {
+                        docstring: docstring.clone(),
+                        signature,
+                        is_exported,
+                        ..NodeExtra::default()
+                    },
+                )
+                .map(|var_node| {
+                    self.extract_variable_type_annotation(child, &var_node.id);
+                    var_node.id
+                });
             if let Some(value) = value_node {
                 if value.kind() != "object" && value.kind() != "object_expression" {
-                    self.visit_function_body(value);
+                    match declared_id {
+                        Some(id) => {
+                            self.node_stack.push(id);
+                            self.visit_function_body(value);
+                            self.node_stack.pop();
+                        }
+                        None => self.visit_function_body(value),
+                    }
                 }
             }
         }
@@ -5135,6 +5145,83 @@ func main() { _ = counter }
         let (nodes, _) = run("v.go", src, Language::Go);
         assert!(has_node(&nodes, NodeKind::Constant, "MaxSize"));
         assert!(has_node(&nodes, NodeKind::Variable, "counter"));
+    }
+
+    /// #1510 / PR #1511 — a file-scope declaration's initializer call must
+    /// attribute to the DECLARED symbol. It landed on the file node before, so
+    /// `callers target` answered with a filename.
+    #[test]
+    fn declaration_initializer_call_attributes_to_the_declaration() {
+        let src = r#"
+export function target(): number { return 1; }
+export const value = target();
+"#;
+        let (nodes, refs) = run("d.ts", src, Language::TypeScript);
+        let value_id = node(&nodes, NodeKind::Constant, "value").id.clone();
+        let sources: Vec<&str> = refs
+            .iter()
+            .filter(|r| r.reference_name == "target" && r.reference_kind == EdgeKind::Calls)
+            .map(|r| r.from_node_id.as_str())
+            .collect();
+        assert_eq!(
+            sources,
+            vec![value_id.as_str()],
+            "the initializer call must come from `value`, not the file node"
+        );
+    }
+
+    /// The control for the test above: a declaration initializer INSIDE a
+    /// function still attributes to that function, so the fix cannot leak past
+    /// file scope and re-point every local call at its local binding.
+    #[test]
+    fn function_local_declaration_initializer_still_attributes_to_the_function() {
+        let src = r#"
+export function target(): number { return 1; }
+export function wrapper(): number {
+  const inner = target();
+  return inner;
+}
+"#;
+        let (nodes, refs) = run("d.ts", src, Language::TypeScript);
+        let wrapper_id = node(&nodes, NodeKind::Function, "wrapper").id.clone();
+        let sources: Vec<&str> = refs
+            .iter()
+            .filter(|r| r.reference_name == "target" && r.reference_kind == EdgeKind::Calls)
+            .map(|r| r.from_node_id.as_str())
+            .collect();
+        assert_eq!(
+            sources,
+            vec![wrapper_id.as_str()],
+            "a function-local initializer call must stay attributed to the function"
+        );
+    }
+
+    /// Multi-declarator statements attribute each initializer to ITS OWN
+    /// declarator, so `const a = f(), b = g()` does not collapse both calls onto
+    /// whichever node happened to be created last.
+    #[test]
+    fn multi_declarator_initializers_attribute_per_declarator() {
+        let src = r#"
+export function f(): number { return 1; }
+export function g(): number { return 2; }
+const a = f(), b = g();
+"#;
+        let (nodes, refs) = run("m.ts", src, Language::TypeScript);
+        let a_id = node(&nodes, NodeKind::Constant, "a").id.clone();
+        let b_id = node(&nodes, NodeKind::Constant, "b").id.clone();
+        let pairs: Vec<(&str, &str)> = refs
+            .iter()
+            .filter(|r| r.reference_kind == EdgeKind::Calls)
+            .map(|r| (r.from_node_id.as_str(), r.reference_name.as_str()))
+            .collect();
+        assert!(
+            pairs.contains(&(a_id.as_str(), "f")),
+            "`a = f()` must attribute to `a`: {pairs:?}"
+        );
+        assert!(
+            pairs.contains(&(b_id.as_str(), "g")),
+            "`b = g()` must attribute to `b`: {pairs:?}"
+        );
     }
 
     #[test]

@@ -399,3 +399,148 @@ fn unknown_target_fails() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("Unknown --target"));
 }
+
+// ===================== Copilot targets (#23) =================================
+//
+// The three Copilot surfaces are additive registry entries, so the end-to-end
+// contract is "the id resolves and writes the documented file with the documented
+// wrapper key". Before this change all three failed with
+// `Unknown target "vscode". Known: claude, cursor, …`.
+
+#[test]
+fn vscode_local_install_writes_servers_wrapper_then_uninstalls() {
+    let fx = Fixture::new("vscode-local");
+    let mcp = fx.project.join(".vscode/mcp.json");
+
+    fx.run(&["install", "--target=vscode", "--local", "--yes"]);
+    let config = read_json(&mcp);
+    assert!(
+        config.get("servers").is_some(),
+        "VS Code uses the `servers` wrapper, got {config}"
+    );
+    assert!(
+        config.get("mcpServers").is_none(),
+        "must NOT write `mcpServers`: {config}"
+    );
+    let args = config["servers"]["codegraph"]["args"].clone();
+    let args = args.as_array().unwrap();
+    assert!(
+        args.contains(&Value::String("--path".into())),
+        "the LOCAL entry pins a project path: {args:?}"
+    );
+
+    // A sibling server the user owns must survive.
+    let mut edited = read_json(&mcp);
+    edited["servers"]["other"] = serde_json::json!({ "command": "foo" });
+    fs::write(&mcp, serde_json::to_string_pretty(&edited).unwrap()).unwrap();
+
+    fx.run(&["uninstall", "--target=vscode", "--local"]);
+    let after = read_json(&mcp);
+    assert!(after["servers"].get("codegraph").is_none());
+    assert!(after["servers"].get("other").is_some());
+}
+
+/// Every `Code/User/mcp.json` written anywhere under `root`. The user-level base
+/// is per-OS (`.config` / `AppData/Roaming` / `Library/Application Support`), and
+/// the fixture pins HOME + XDG under `root`, so searching the fixture root keeps
+/// the assertion OS-agnostic instead of hardcoding one platform's layout.
+fn find_written(root: &Path, needle: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.ends_with(needle) {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+#[test]
+fn vscode_global_install_never_writes_workspace_folder() {
+    // VS Code expands ${workspaceFolder} only in a WORKSPACE mcp.json; in the
+    // user-level file it stays literal and would point the server at a directory
+    // named "${workspaceFolder}". Asserted against the WRITTEN FILE — reading
+    // `--print-config` instead would miss a wrong entry in `install`.
+    let fx = Fixture::new("vscode-global");
+    let out = fx.run(&["install", "--target=vscode", "--global", "--yes"]);
+    assert!(
+        !out.contains("Unknown target"),
+        "the vscode id must resolve: {out}"
+    );
+    let wanted = PathBuf::from("Code").join("User").join("mcp.json");
+    let written = find_written(&fx.root, &wanted);
+    assert_eq!(
+        written.len(),
+        1,
+        "exactly one user-level Code/User/mcp.json must be written, got {written:?}"
+    );
+    let config = read_json(&written[0]);
+    assert_eq!(
+        config["servers"]["codegraph"]["args"],
+        serde_json::json!(["serve", "--mcp"]),
+        "the global entry must be BARE — no --path, no ${{workspaceFolder}}: {config}"
+    );
+    let raw = fs::read_to_string(&written[0]).unwrap();
+    assert!(
+        !raw.contains("${workspaceFolder}"),
+        "the global config must not contain ${{workspaceFolder}}: {raw}"
+    );
+}
+
+#[test]
+fn copilot_cli_global_install_declares_all_tools() {
+    let fx = Fixture::new("copilot-cli");
+    fx.run(&["install", "--target=copilot-cli", "--global", "--yes"]);
+    let config = read_json(&fx.home.join(".copilot/mcp-config.json"));
+    assert_eq!(
+        config["mcpServers"]["codegraph"]["tools"],
+        serde_json::json!(["*"]),
+        "without tools:[\"*\"] the CLI exposes no tools: {config}"
+    );
+
+    fx.run(&["uninstall", "--target=copilot-cli", "--global"]);
+    let after = read_json(&fx.home.join(".copilot/mcp-config.json"));
+    assert!(after.get("mcpServers").is_none() || after["mcpServers"].get("codegraph").is_none());
+}
+
+#[test]
+fn jetbrains_global_install_writes_github_copilot_intellij() {
+    let fx = Fixture::new("jetbrains");
+    fx.run(&["install", "--target=jetbrains", "--global", "--yes"]);
+    // The fixture pins XDG_CONFIG_HOME, which is where this target resolves on
+    // every OS.
+    let file = fx.root.join("xdg/github-copilot/intellij/mcp.json");
+    assert!(file.is_file(), "missing {}", file.display());
+    let config = read_json(&file);
+    assert!(
+        config.get("servers").is_some(),
+        "JetBrains uses the `servers` wrapper: {config}"
+    );
+    assert_eq!(
+        config["servers"]["codegraph"]["args"],
+        serde_json::json!(["serve", "--mcp"]),
+        "global-only target writes a bare entry"
+    );
+}
+
+#[test]
+fn all_three_copilot_ids_resolve_in_print_config() {
+    let fx = Fixture::new("copilot-ids");
+    for id in ["vscode", "copilot-cli", "jetbrains"] {
+        let out = fx.run(&["install", "--print-config", id]);
+        assert!(!out.contains("Unknown target"), "{id} must resolve: {out}");
+        assert!(
+            out.contains("codegraph"),
+            "{id} must print a codegraph entry: {out}"
+        );
+    }
+}
