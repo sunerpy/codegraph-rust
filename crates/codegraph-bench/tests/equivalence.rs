@@ -111,6 +111,24 @@ fn cpp_db_is_self_equivalent_to_cpp_golden() {
 }
 
 #[test]
+fn generated_golden_matches_committed_rust_fixture() {
+    // Guards item 7 (Rust unit structs are indexed, so `impl Trait for Unit`
+    // forms) and item 9-Rust (`union` is a first-class kind) against byte-drift.
+    let tempdir = TestDir::new("generated-golden-rust");
+    write_golden(&rust_db(), tempdir.path()).unwrap();
+
+    let expected = load_golden(&rust_golden_dir()).unwrap();
+    let actual = load_golden(tempdir.path()).unwrap();
+
+    diff_canonical(&expected, &actual, None).unwrap();
+}
+
+#[test]
+fn rust_db_is_self_equivalent_to_rust_golden() {
+    assert_equivalent(&rust_db(), &rust_golden_dir()).unwrap();
+}
+
+#[test]
 fn generated_golden_matches_committed_python_fixture() {
     let tempdir = TestDir::new("generated-golden-python");
     write_golden(&python_db(), tempdir.path()).unwrap();
@@ -410,6 +428,14 @@ fn cpp_db() -> PathBuf {
 
 fn cpp_golden_dir() -> PathBuf {
     workspace_root().join("reference/golden/cpp")
+}
+
+fn rust_db() -> PathBuf {
+    workspace_root().join("reference/golden/rust/colby.db")
+}
+
+fn rust_golden_dir() -> PathBuf {
+    workspace_root().join("reference/golden/rust")
 }
 
 fn python_db() -> PathBuf {

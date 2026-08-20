@@ -268,9 +268,10 @@ impl ResolutionContext for SnapshotResolutionContext {
         // Union implements/extends targets of every same-named type node,
         // reading the per-chunk edge adjacency instead of the live store
         // (matches `StoreResolutionContext::get_supertypes`).
-        const SUPERTYPE_BEARING: [NodeKind; 6] = [
+        const SUPERTYPE_BEARING: [NodeKind; 7] = [
             NodeKind::Class,
             NodeKind::Struct,
+            NodeKind::Union,
             NodeKind::Interface,
             NodeKind::Trait,
             NodeKind::Protocol,

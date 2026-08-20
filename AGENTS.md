@@ -29,12 +29,22 @@ Protocol) stdio server. No AI / vector / LLM anywhere in the binary — output i
   `reference/golden/cpp/`
   (corpus `crates/codegraph-bench/fixtures/cpp/`; guards #1043 C++ class/struct
   inheritance incl. templated-base stripping byte-for-byte, and retroactively
-  the earlier C++ extraction work).
+  the earlier C++ extraction work; grown to 17 files by Tier 3 with the MSVC COM
+  `interface` positives + five guard negatives (#1519) and the C / C++ / ObjC
+  `union` fixtures incl. both `typedef union` re-kinds and both instantiation
+  paths (PR #1516) — it is the C-FAMILY corpus, not a strictly-C++ one, since it
+  holds `.c` and `.mm` files too), and `reference/golden/rust/`
+  (corpus `crates/codegraph-bench/fixtures/rust/`; the repo's only Rust corpus,
+  guards #1513/PR #1514 unit structs — 3 `struct` nodes and 4 `implements` edges,
+  where the unit struct produced NO node before — plus the Rust half of PR #1516's
+  first-class `union` kind, byte-for-byte; it deliberately claims NO `instantiates`
+  edge, because that edge fires only for the call-expression construction form and
+  a Rust union is constructible only as `U { … }`).
   The Python cross-file edge is resolved by Gate 3a's unique-name fallback;
   import Gate 3b is deliberately unreachable for real Python nodes because the
   extractor does not mark them exported. Regen recipe: `docs/equivalence.md`
   "Godot fixture" / "Ruby fixture" / "Python fixture" / "Kotlin fixture" /
-  "TypeScript resolution fixture" / "C++ fixture" sections.
+  "TypeScript resolution fixture" / "C++ fixture" / "Rust fixture" sections.
 - **node-id formula**: `{kind}:{sha256("{filePath}:{kind}:{name}:{line}").hex[:32]}`; file nodes are the
   literal `file:{relpath}`; lines are 1-based; paths relative with `/`.
 - **No AI / vector / LLM crates** — enforced by `scripts/guardrail.sh` (CI gate):
@@ -45,7 +55,11 @@ Protocol) stdio server. No AI / vector / LLM anywhere in the binary — output i
 
 `codegraph-core` (types/config/logger) · `codegraph-store` (SQLite+FTS5) · `codegraph-extract`
 (tree-sitter walker + embedded + custom extractors; incl. C++ `base_class_clause` → `Extends`
-inheritance extraction with templated-base stripping, #1043) · `codegraph-graph` (traversal + FTS search) ·
+inheritance extraction with templated-base stripping, #1043; a shared `extract_aggregate` behind
+`extract_struct`/`extract_union` so the `union` kind — C/C++/ObjC `union_specifier`, Rust
+`union_item`, PR #1516 — inherits struct behaviour by construction, plus the opt-in
+`allow_bodiless_struct()` that makes a Rust `struct Unit;` a definition rather than a forward
+declaration, #1513) · `codegraph-graph` (traversal + FTS search) ·
 `codegraph-resolve` (import + name matcher + FrameworkResolver; concrete `GodotResolver` impl — autoload-call + signal-handler resolution) · `codegraph-mcp`
 (stdio JSON-RPC; `codegraph_explore` runs a change-surface rescue, #1064, that surfaces a
 callable's buried parameter/return-type files into the explored subgraph; every source-emitting

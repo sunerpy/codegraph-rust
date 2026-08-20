@@ -43,12 +43,13 @@ pub fn is_esm_language(language: Language) -> bool {
 ///   `namespace Foo {}` binds `Foo` as much as a `class Foo` does, which is why
 ///   `Module`/`Namespace` belong here too.
 ///
-/// Upstream's set carries 11 kinds including `union`; we have no
-/// `NodeKind::Union` yet, so this is the other 10 and `Union` must join it when
-/// the kind exists.
-pub const TYPE_DECLARING_KINDS: [NodeKind; 10] = [
+/// Matches upstream's 11-kind set: `Union` joined it when `NodeKind::Union` was
+/// added (PR #1516), because a C/C++/ObjC/Rust `union` declares a type name
+/// exactly as a `struct` does.
+pub const TYPE_DECLARING_KINDS: [NodeKind; 11] = [
     NodeKind::Class,
     NodeKind::Struct,
+    NodeKind::Union,
     NodeKind::Interface,
     NodeKind::Trait,
     NodeKind::Protocol,
@@ -389,7 +390,7 @@ mod tests {
 
     #[test]
     fn all_node_kinds_classified_against_supertype_and_import_sets() {
-        // Every one of the 22 kinds is classified explicitly, so a kind added
+        // Every one of the 23 kinds is classified explicitly, so a kind added
         // later cannot be silently omitted from either gate: the two expected
         // lists below are exhaustive and the assertion compares whole sets.
         let type_declaring: Vec<NodeKind> = NodeKind::ALL
@@ -409,8 +410,9 @@ mod tests {
                 NodeKind::TypeAlias,
                 NodeKind::Namespace,
                 NodeKind::Component,
+                NodeKind::Union,
             ],
-            "10 supertype-eligible kinds — no `Union` yet, which Tier 3 must add"
+            "11 supertype-eligible kinds, `Union` among them since Tier 3"
         );
 
         let non_importable: Vec<NodeKind> = NodeKind::ALL
@@ -430,7 +432,7 @@ mod tests {
 
         assert_eq!(
             NodeKind::ALL.len(),
-            22,
+            23,
             "kind count changed — revisit both sets"
         );
     }

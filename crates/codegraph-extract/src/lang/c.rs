@@ -36,6 +36,9 @@ impl LanguageSpec for CSpec {
     fn struct_types(&self) -> &'static [&'static str] {
         &["struct_specifier"]
     }
+    fn union_types(&self) -> &'static [&'static str] {
+        &["union_specifier"]
+    }
     fn enum_types(&self) -> &'static [&'static str] {
         &["enum_specifier"]
     }
@@ -76,6 +79,9 @@ impl LanguageSpec for CSpec {
             }
             if child.kind() == "struct_specifier" && child_by_field(child, "body").is_some() {
                 return Some(NodeKind::Struct);
+            }
+            if child.kind() == "union_specifier" && child_by_field(child, "body").is_some() {
+                return Some(NodeKind::Union);
             }
         }
         None

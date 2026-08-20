@@ -49,9 +49,10 @@ const CALLABLE_KINDS: [NodeKind; 4] = [
 
 /// Type node kinds a signature edge may point at — the rescue only surfaces
 /// these. Mirrors upstream `TYPE_KINDS` (`tools.ts:2621`).
-const TYPE_KINDS: [NodeKind; 7] = [
+const TYPE_KINDS: [NodeKind; 8] = [
     NodeKind::Class,
     NodeKind::Struct,
+    NodeKind::Union,
     NodeKind::Interface,
     NodeKind::Trait,
     NodeKind::Protocol,
@@ -2853,6 +2854,7 @@ fn is_container(kind: NodeKind) -> bool {
         NodeKind::Class
             | NodeKind::Interface
             | NodeKind::Struct
+            | NodeKind::Union
             | NodeKind::Trait
             | NodeKind::Protocol
             | NodeKind::Enum
@@ -2867,6 +2869,7 @@ fn is_meaningful_kind(kind: NodeKind) -> bool {
             | NodeKind::Class
             | NodeKind::Interface
             | NodeKind::Struct
+            | NodeKind::Union
             | NodeKind::Trait
             | NodeKind::Protocol
             | NodeKind::Enum

@@ -1186,6 +1186,7 @@ impl ReferenceResolver {
             from_node.kind,
             NodeKind::Class
                 | NodeKind::Struct
+                | NodeKind::Union
                 | NodeKind::Interface
                 | NodeKind::Trait
                 | NodeKind::Protocol
@@ -1371,7 +1372,10 @@ impl ReferenceResolver {
                 // Promote calls → instantiates (index.ts:771-776).
                 if kind == EdgeKind::Calls {
                     if let Ok(Some(target_node)) = store.node_by_id(&reference.target_node_id) {
-                        if matches!(target_node.kind, NodeKind::Class | NodeKind::Struct) {
+                        if matches!(
+                            target_node.kind,
+                            NodeKind::Class | NodeKind::Struct | NodeKind::Union
+                        ) {
                             kind = EdgeKind::Instantiates;
                         }
                     }
@@ -2055,6 +2059,7 @@ fn is_supertype_bearing_or_module(kind: NodeKind) -> bool {
         kind,
         NodeKind::Class
             | NodeKind::Struct
+            | NodeKind::Union
             | NodeKind::Interface
             | NodeKind::Trait
             | NodeKind::Protocol

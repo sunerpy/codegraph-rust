@@ -6,10 +6,12 @@ use std::fmt;
 // protocol, function, method, property, field, variable, constant, enum,
 // enum_member, type_alias, namespace, parameter, import, export, route,
 // component.
+// `union` is APPENDED (upstream PR #1516): appending keeps every other
+// variant's discriminant, and therefore every existing node id, stable.
 // EdgeKind lines 48-60: contains, calls, imports, exports, extends,
 // implements, references, type_of, returns, instantiates, overrides,
 // decorates.
-pub const NODE_KIND_STRINGS: [&str; 22] = [
+pub const NODE_KIND_STRINGS: [&str; 23] = [
     "file",
     "module",
     "class",
@@ -32,6 +34,7 @@ pub const NODE_KIND_STRINGS: [&str; 22] = [
     "export",
     "route",
     "component",
+    "union",
 ];
 
 pub const EDGE_KIND_STRINGS: [&str; 12] = [
@@ -140,10 +143,12 @@ pub enum NodeKind {
     Route,
     #[serde(rename = "component")]
     Component,
+    #[serde(rename = "union")]
+    Union,
 }
 
 impl NodeKind {
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::File,
         Self::Module,
         Self::Class,
@@ -166,6 +171,7 @@ impl NodeKind {
         Self::Export,
         Self::Route,
         Self::Component,
+        Self::Union,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -192,6 +198,7 @@ impl NodeKind {
             Self::Export => "export",
             Self::Route => "route",
             Self::Component => "component",
+            Self::Union => "union",
         }
     }
 }

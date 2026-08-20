@@ -198,9 +198,10 @@ impl ResolutionContext for StoreResolutionContext<'_> {
     fn get_supertypes(&self, type_name: &str, language: Language) -> Vec<String> {
         // Union implements/extends targets of every same-named type node
         // (index.ts:425-442).
-        const SUPERTYPE_BEARING: [NodeKind; 6] = [
+        const SUPERTYPE_BEARING: [NodeKind; 7] = [
             NodeKind::Class,
             NodeKind::Struct,
+            NodeKind::Union,
             NodeKind::Interface,
             NodeKind::Trait,
             NodeKind::Protocol,

@@ -15,10 +15,11 @@ use serde::Serialize;
 
 // upstream graph/traversal.ts:506 — container kinds whose `contains`
 // children are pulled into the impact set at the same depth as the container.
-const CONTAINER_KINDS: [NodeKind; 7] = [
+const CONTAINER_KINDS: [NodeKind; 8] = [
     NodeKind::Class,
     NodeKind::Interface,
     NodeKind::Struct,
+    NodeKind::Union,
     NodeKind::Trait,
     NodeKind::Protocol,
     NodeKind::Module,
