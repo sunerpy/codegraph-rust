@@ -119,7 +119,7 @@ fn assert_corrupt(
 fn index_state_constants_and_canonical_payload_are_exact() {
     /// The extraction version the immediately preceding release wrote. Read from
     /// `index_state.rs` at implementation time; see plan decision C1 step 0.
-    const PREVIOUS_EXTRACTION_VERSION: u64 = 6;
+    const PREVIOUS_EXTRACTION_VERSION: u64 = 7;
 
     assert_eq!(CURRENT_STORAGE_PROTOCOL, 2);
     assert_eq!(CURRENT_EXTRACTION_VERSION, PREVIOUS_EXTRACTION_VERSION + 1);

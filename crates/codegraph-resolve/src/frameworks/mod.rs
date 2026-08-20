@@ -19,6 +19,7 @@ pub(crate) mod godot_scene;
 pub mod godot_script;
 pub mod nestjs;
 pub mod react;
+pub mod tauri;
 pub mod vue;
 
 use crate::framework::FrameworkResolver;
@@ -36,6 +37,11 @@ pub fn detect_frameworks(context: &dyn ResolutionContext) -> Vec<Box<dyn Framewo
         Box::new(react::ReactResolver),
         Box::new(vue::VueResolver),
         Box::new(godot::GodotResolver),
+        // APPENDED LAST on purpose: Strategy 1 iterates this `Vec` in order
+        // (`resolver.rs:1103`), so the first resolver to return `>= 0.9` for any
+        // PRE-EXISTING reference must not change. A new candidate at the front
+        // could pre-empt one of the four above.
+        Box::new(tauri::TauriResolver::default()),
     ];
     candidates
         .into_iter()
