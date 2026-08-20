@@ -52,6 +52,10 @@ fn mini_fixture() -> PathBuf {
     workspace_root().join("crates/codegraph-bench/fixtures/mini")
 }
 
+fn go_fixture() -> PathBuf {
+    workspace_root().join("crates/codegraph-bench/fixtures/go")
+}
+
 fn copy_tree(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).unwrap();
     for entry in fs::read_dir(src).unwrap() {
@@ -255,6 +259,46 @@ fn oversized_file_size_skips_with_exact_file_record() {
         errors,
         vec![expected_error],
         "size-skip must record the exact engine error string through the parallel path"
+    );
+}
+
+/// WRITE PATH 1 (`index --force`, the rayon producer closure): the persisted
+/// `files.generated` must carry the real per-file verdict, not a hardcoded false.
+/// This is the CLI counterpart to the two `codegraph-watch` tests that cover the
+/// incremental-sync and Outdated-rebuild write paths — three independent sites
+/// build their own `FileRecord`, so each needs its own end-to-end assertion.
+#[test]
+fn index_force_writes_the_generated_flag_per_file() {
+    let dir = TestDir::new("generated-flag");
+    let project = dir.path().join("go");
+    copy_tree(&go_fixture(), &project);
+
+    init_and_force_index(&project);
+
+    let store = Store::open(&db_path(&project)).unwrap();
+    let mut rows: Vec<(String, i64)> = store
+        .connection()
+        .prepare("SELECT path, generated FROM files ORDER BY path")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    rows.sort();
+
+    assert_eq!(
+        rows,
+        vec![
+            ("api.pb.go".to_string(), 1),
+            ("generator.go".to_string(), 0),
+            ("nightly.go".to_string(), 0),
+            ("payroll.go".to_string(), 1),
+            ("payroll_usecase.go".to_string(), 0),
+            ("worker_types.go".to_string(), 1),
+        ],
+        "index --force must persist the real generated verdict for every file"
     );
 }
 

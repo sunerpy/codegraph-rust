@@ -17,6 +17,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use codegraph_core::config::Config;
+use codegraph_core::generated_header::detect_generated_file;
 use codegraph_core::logger::{LoggerConfig, init_logger};
 use codegraph_core::node_id::hash_content;
 use codegraph_core::types::{ExtractionResult, FileRecord, Language, Node, NodeKind};
@@ -4866,6 +4867,7 @@ fn index_project_inner(
                                 .filter(|n| n.file_path == *relative)
                                 .count() as i64,
                             errors: result.errors.clone(),
+                            generated: detect_generated_file(relative, &source),
                         };
                         tx.send((i, relative.clone(), file, result))
                             .map_err(|_| anyhow!("parse result channel disconnected"))?;
@@ -6957,6 +6959,7 @@ mod formatter_and_env_tests {
             indexed_at: 0,
             node_count,
             errors: Vec::new(),
+            generated: false,
         }
     }
 

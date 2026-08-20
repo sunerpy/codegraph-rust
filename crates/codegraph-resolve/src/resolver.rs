@@ -2767,6 +2767,7 @@ mod tests {
                     indexed_at: 0,
                     node_count: result.nodes.len() as i64,
                     errors: Vec::new(),
+                    generated: false,
                 })
                 .expect("upsert file");
             store.upsert_nodes(&result.nodes).expect("upsert nodes");
@@ -3820,6 +3821,7 @@ mod tests {
             indexed_at: 0,
             node_count: 0,
             errors: Vec::new(),
+            generated: false,
         }
     }
 
@@ -3869,6 +3871,7 @@ mod tests {
                 indexed_at: 0,
                 node_count: result.nodes.len() as i64,
                 errors: Vec::new(),
+                generated: false,
             })
             .expect("upsert file");
         store.upsert_nodes(&result.nodes).expect("upsert nodes");

@@ -78,6 +78,19 @@ Project configuration remains in `.codegraph/config.toml` and
 fields `legacyIndexPresent` and `legacyIndexPaths` remain in `status --json`, but
 always report `false` and `[]` respectively.
 
+### Re-index required for content-header generated-file detection
+
+Generated-file detection now also reads a file's **content banner**, not only its
+filename, so a machine-written `payroll.go` carrying
+`// Code generated … DO NOT EDIT.` is demoted in ranking like a `.pb.go` file
+already was. The verdict is computed at index time and stored on the file row.
+
+An index built by an earlier release therefore reports every file as
+non-generated for the content half until it is re-extracted. Nothing breaks in the
+meantime — the filename signal keeps working exactly as before — and the next
+`codegraph index` or `codegraph sync` picks the new detection up automatically,
+since the extraction-version bump classifies the old index as outdated.
+
 ---
 
 ## Installation

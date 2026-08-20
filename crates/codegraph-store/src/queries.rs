@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use codegraph_core::types::{
     Edge, EdgeKind, FileRecord, Language, Node, NodeKind, ReferenceSubkind, UnresolvedRef,
@@ -282,6 +282,37 @@ impl Store {
             for node in rows {
                 let node = node?;
                 out.insert(node.id.clone(), node);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The subset of `paths` whose file row has `generated = 1`. Batched and
+    /// chunked like [`Self::nodes_by_ids`]; a path with no row is simply absent
+    /// from the result.
+    ///
+    /// Reports ONLY what is stored: the union with the path convention
+    /// (`is_generated_file`) is the CALLER's job, so this stays a faithful view
+    /// of the column and the partial `idx_files_generated` index serves it.
+    pub fn generated_paths_among(&self, paths: &[String]) -> rusqlite::Result<HashSet<String>> {
+        let mut out = HashSet::new();
+        if paths.is_empty() {
+            return Ok(out);
+        }
+        let mut unique = paths.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        for chunk in unique.chunks(SQLITE_PARAM_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql =
+                format!("SELECT path FROM files WHERE generated = 1 AND path IN ({placeholders})");
+            let params = chunk.iter().map(|p| p as &dyn ToSql).collect::<Vec<_>>();
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
+            for path in rows {
+                out.insert(path?);
             }
         }
         Ok(out)
@@ -666,8 +697,8 @@ impl Store {
         let errors = json_array_or_null(&file.errors)?;
         self.conn.execute(
             r#"
-            INSERT INTO files (path, content_hash, language, size, modified_at, indexed_at, node_count, errors)
-            VALUES (@path, @contentHash, @language, @size, @modifiedAt, @indexedAt, @nodeCount, @errors)
+            INSERT INTO files (path, content_hash, language, size, modified_at, indexed_at, node_count, errors, generated)
+            VALUES (@path, @contentHash, @language, @size, @modifiedAt, @indexedAt, @nodeCount, @errors, @generated)
             ON CONFLICT(path) DO UPDATE SET
               content_hash = @contentHash,
               language = @language,
@@ -675,7 +706,8 @@ impl Store {
               modified_at = @modifiedAt,
               indexed_at = @indexedAt,
               node_count = @nodeCount,
-              errors = @errors
+              errors = @errors,
+              generated = @generated
             "#,
             named_params! {
                 "@path": file.path,
@@ -686,6 +718,7 @@ impl Store {
                 "@indexedAt": file.indexed_at,
                 "@nodeCount": file.node_count,
                 "@errors": errors,
+                "@generated": i64::from(file.generated),
             },
         )
     }
@@ -1600,6 +1633,7 @@ fn row_to_file(row: &Row<'_>) -> rusqlite::Result<FileRecord> {
         indexed_at: millis_column(row, "indexed_at")?,
         node_count: row.get("node_count")?,
         errors: parse_json_array(row.get("errors")?)?,
+        generated: row.get::<_, i64>("generated")? != 0,
     })
 }
 
@@ -1954,7 +1988,83 @@ mod tests {
             indexed_at: 2,
             node_count: 1,
             errors: vec!["warn".to_string()],
+            generated: false,
         }
+    }
+
+    #[test]
+    fn upsert_file_round_trips_the_generated_flag() {
+        let store = store("generated-round-trip");
+
+        let mut rec = file("payroll.go");
+        rec.generated = true;
+        store.upsert_file(&rec).unwrap();
+        assert!(store.file_by_path("payroll.go").unwrap().unwrap().generated);
+
+        // Re-upserting the SAME path with a false verdict must overwrite it. This
+        // half is what catches a missing `ON CONFLICT ... DO UPDATE SET generated`:
+        // without it the row keeps its stale `1` forever.
+        rec.generated = false;
+        store.upsert_file(&rec).unwrap();
+        assert!(!store.file_by_path("payroll.go").unwrap().unwrap().generated);
+
+        // And back again, so the update is not one-directional.
+        rec.generated = true;
+        store.upsert_file(&rec).unwrap();
+        assert!(store.file_by_path("payroll.go").unwrap().unwrap().generated);
+    }
+
+    #[test]
+    fn generated_paths_among_returns_only_flagged_paths() {
+        let store = store("generated-paths-among");
+
+        let mut flagged = file("api.pb.go");
+        flagged.generated = true;
+        store.upsert_file(&flagged).unwrap();
+        store.upsert_file(&file("handwritten.go")).unwrap();
+
+        let asked = vec![
+            "api.pb.go".to_string(),
+            "handwritten.go".to_string(),
+            // A path with NO row at all is simply absent, never an error.
+            "never_indexed.go".to_string(),
+        ];
+        let got = store.generated_paths_among(&asked).unwrap();
+        assert_eq!(got, HashSet::from(["api.pb.go".to_string()]));
+
+        // An EMPTY slice returns an empty set. MEASURED: `chunks()` on an empty
+        // slice yields ZERO chunks, so the loop body never runs and no `IN ()`
+        // syntax error is reachable — the early return saves an allocation and a
+        // sort, it is not what makes this correct. Asserted anyway: the contract
+        // is "no rows", and a future rewrite that builds SQL before chunking
+        // would break it.
+        assert!(store.generated_paths_among(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn generated_paths_among_crosses_the_parameter_chunk_boundary() {
+        let store = store("generated-paths-chunked");
+
+        // More paths than SQLITE_PARAM_CHUNK_SIZE, with flagged rows placed in the
+        // FIRST and LAST chunk, so a loop that only ever runs once still fails.
+        let total = SQLITE_PARAM_CHUNK_SIZE * 2 + 7;
+        let mut asked = Vec::with_capacity(total);
+        for i in 0..total {
+            let path = format!("gen/f{i:04}.go");
+            let mut rec = file(&path);
+            rec.generated = i == 0 || i == total - 1;
+            store.upsert_file(&rec).unwrap();
+            asked.push(path);
+        }
+
+        let got = store.generated_paths_among(&asked).unwrap();
+        assert_eq!(
+            got,
+            HashSet::from([
+                "gen/f0000.go".to_string(),
+                format!("gen/f{:04}.go", total - 1),
+            ])
+        );
     }
 
     #[test]

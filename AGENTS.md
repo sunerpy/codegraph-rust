@@ -39,12 +39,22 @@ Protocol) stdio server. No AI / vector / LLM anywhere in the binary — output i
   where the unit struct produced NO node before — plus the Rust half of PR #1516's
   first-class `union` kind, byte-for-byte; it deliberately claims NO `instantiates`
   edge, because that edge fires only for the call-expression construction form and
-  a Rust union is constructible only as `U { … }`).
+  a Rust union is constructible only as `U { … }`), and `reference/golden/go/`
+  (corpus `crates/codegraph-bench/fixtures/go/`; the repo's only Go corpus, and the
+  only corpus where `files.generated` is anything other than `0` — it byte-pins
+  #1500 content-header detection at BOTH values, three each way: `payroll.go`
+  (Go's codified `Code generated … DO NOT EDIT.`), `worker_types.go` (pattern 6 /
+  CG-25, Wrangler's TWO `by` clauses) and `api.pb.go` (the PATH signal, no banner)
+  at `1`; `payroll_usecase.go` (hand-written, and the must-not-demote side),
+  `nightly.go` (ONE `by` clause — ordinary prose) and `generator.go` (the banner is
+  a `const` in the function BODY, so the comment-line fence rejects it) at `0`).
   The Python cross-file edge is resolved by Gate 3a's unique-name fallback;
   import Gate 3b is deliberately unreachable for real Python nodes because the
   extractor does not mark them exported. Regen recipe: `docs/equivalence.md`
   "Godot fixture" / "Ruby fixture" / "Python fixture" / "Kotlin fixture" /
-  "TypeScript resolution fixture" / "C++ fixture" / "Rust fixture" sections.
+  "TypeScript resolution fixture" / "C++ fixture" / "Rust fixture" / "Go fixture"
+  sections. `mini` has no re-indexable provenance and a schema migration cannot
+  normalise it in place, so it has its own "Mini schema rebuild" recipe there.
 - **node-id formula**: `{kind}:{sha256("{filePath}:{kind}:{name}:{line}").hex[:32]}`; file nodes are the
   literal `file:{relpath}`; lines are 1-based; paths relative with `/`.
 - **No AI / vector / LLM crates** — enforced by `scripts/guardrail.sh` (CI gate):

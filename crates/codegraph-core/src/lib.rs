@@ -3,6 +3,7 @@
 pub mod config;
 pub mod errors;
 pub mod file_class;
+pub mod generated_header;
 pub mod index_paths;
 pub mod logger;
 pub mod node_id;

@@ -66,6 +66,7 @@ fn index_fixture(test_name: &str, root: &Path, relative_files: &[&str]) -> (Stor
                 indexed_at: 0,
                 node_count: result.nodes.len() as i64,
                 errors: Vec::new(),
+                generated: false,
             })
             .expect("upsert file");
         store.upsert_nodes(&result.nodes).expect("upsert nodes");

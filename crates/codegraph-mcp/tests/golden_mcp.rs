@@ -774,6 +774,7 @@ fn index_fixture(files: &[(&str, &str)]) -> TestProject {
                 indexed_at: 0,
                 node_count: result.nodes.len() as i64,
                 errors: Vec::new(),
+                generated: false,
             })
             .unwrap();
     }

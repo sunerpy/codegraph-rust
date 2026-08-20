@@ -2,7 +2,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::schema::BASE_SCHEMA;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 7;
+pub const CURRENT_SCHEMA_VERSION: i64 = 8;
 pub const FRESH_SCHEMA_DESCRIPTION: &str = "Initial schema includes all migrations";
 
 const MIGRATIONS: &[Migration] = &[
@@ -21,6 +21,7 @@ const MIGRATIONS: &[Migration] = &[
         CREATE INDEX IF NOT EXISTS idx_unresolved_file_path ON unresolved_refs(file_path);
         CREATE INDEX IF NOT EXISTS idx_edges_provenance ON edges(provenance);
       "#,
+        adds_column: Some(("unresolved_refs", "file_path")),
     },
     Migration {
         version: 3,
@@ -28,6 +29,7 @@ const MIGRATIONS: &[Migration] = &[
         sql: r#"
         CREATE INDEX IF NOT EXISTS idx_nodes_lower_name ON nodes(lower(name));
       "#,
+        adds_column: None,
     },
     Migration {
         version: 4,
@@ -36,6 +38,7 @@ const MIGRATIONS: &[Migration] = &[
         DROP INDEX IF EXISTS idx_edges_source;
         DROP INDEX IF EXISTS idx_edges_target;
       "#,
+        adds_column: None,
     },
     Migration {
         version: 5,
@@ -43,6 +46,7 @@ const MIGRATIONS: &[Migration] = &[
         sql: r#"
         ALTER TABLE nodes ADD COLUMN return_type TEXT;
       "#,
+        adds_column: Some(("nodes", "return_type")),
     },
     Migration {
         version: 6,
@@ -50,6 +54,7 @@ const MIGRATIONS: &[Migration] = &[
         sql: r#"
         ALTER TABLE unresolved_refs ADD COLUMN reference_subkind TEXT;
       "#,
+        adds_column: Some(("unresolved_refs", "reference_subkind")),
     },
     Migration {
         version: 7,
@@ -63,6 +68,22 @@ const MIGRATIONS: &[Migration] = &[
         CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_identity
           ON edges(source, target, kind, IFNULL(line, -1), IFNULL(col, -1));
       "#,
+        adds_column: None,
+    },
+    Migration {
+        version: 8,
+        description: "Add files.generated — content-header generated-file detection (#1500)",
+        // DDL ONLY, deliberately no backfill: the flag derives from file CONTENT
+        // and this table stores `content_hash`, not bytes. Backfilling would mean
+        // re-reading every file from disk inside a schema step, on paths that may
+        // no longer exist. Existing rows therefore stay 0 until re-extraction,
+        // and readers UNION the column with the path check so a pre-#1500 index
+        // keeps the demotion it already had.
+        sql: r#"
+        ALTER TABLE files ADD COLUMN generated INTEGER NOT NULL DEFAULT 0;
+        CREATE INDEX IF NOT EXISTS idx_files_generated ON files(path) WHERE generated = 1;
+      "#,
+        adds_column: Some(("files", "generated")),
     },
 ];
 
@@ -71,6 +92,15 @@ struct Migration {
     version: i64,
     description: &'static str,
     sql: &'static str,
+    /// A `(table, column)` this migration ADDS. When the column is already
+    /// present the `sql` is skipped and only the version row is recorded.
+    ///
+    /// Needed because `ALTER TABLE` has no `IF NOT EXISTS` and
+    /// `run_pending_migrations` can legitimately replay a migration over a
+    /// database created from a NEWER `BASE_SCHEMA` that already carries the
+    /// column. Measured: without this, replaying migration 8 over a
+    /// `BASE_SCHEMA` database fails with `duplicate column name: generated`.
+    adds_column: Option<(&'static str, &'static str)>,
 }
 
 pub fn ensure_schema_and_migrations(conn: &mut Connection) -> rusqlite::Result<()> {
@@ -174,12 +204,33 @@ fn run_pending_migrations(conn: &mut Connection) -> rusqlite::Result<()> {
 
     for migration in pending {
         let tx = conn.transaction()?;
-        tx.execute_batch(migration.sql)?;
+        let already_applied = match migration.adds_column {
+            Some((table, column)) => table_has_column(&tx, table, column)?,
+            None => false,
+        };
+        if !already_applied {
+            tx.execute_batch(migration.sql)?;
+        }
         record_migration(&tx, migration.version, migration.description)?;
         tx.commit()?;
     }
 
     Ok(())
+}
+
+/// Whether `table` already declares `column`, read from `PRAGMA table_info`.
+///
+/// A missing table reports `false`, so a guarded migration still runs its `sql`
+/// and fails loudly there rather than being silently skipped.
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, String>(1)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn record_migration(
@@ -258,6 +309,7 @@ mod tests {
              CREATE TABLE unresolved_refs (id INTEGER PRIMARY KEY AUTOINCREMENT, from_node_id TEXT, reference_name TEXT, reference_kind TEXT, line INTEGER, col INTEGER, candidates TEXT);
              CREATE TABLE edges (id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT, target TEXT, kind TEXT, metadata TEXT, line INTEGER, col INTEGER);
              CREATE TABLE nodes (id TEXT PRIMARY KEY, name TEXT);
+             CREATE TABLE files (path TEXT PRIMARY KEY, content_hash TEXT NOT NULL, language TEXT NOT NULL, size INTEGER NOT NULL, modified_at INTEGER NOT NULL, indexed_at INTEGER NOT NULL, node_count INTEGER DEFAULT 0, errors TEXT);
              CREATE INDEX idx_edges_source ON edges(source);
              CREATE INDEX idx_edges_target ON edges(target);
              INSERT INTO schema_versions (version, applied_at, description) VALUES (1, 0, 'base');",
@@ -302,6 +354,101 @@ mod tests {
             .unwrap()
             .filter_map(Result::ok)
             .collect()
+    }
+
+    // Builds a v7-shaped `files` table (the 8 pre-#1500 columns) with one row, so
+    // migration 8's effect on a PRE-EXISTING row is observable.
+    fn seed_v7_schema_with_one_file(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE schema_versions (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL, description TEXT);
+             CREATE TABLE files (path TEXT PRIMARY KEY, content_hash TEXT NOT NULL, language TEXT NOT NULL, size INTEGER NOT NULL, modified_at INTEGER NOT NULL, indexed_at INTEGER NOT NULL, node_count INTEGER DEFAULT 0, errors TEXT);
+             INSERT INTO schema_versions (version, applied_at, description) VALUES (7, 0, 'v7');
+             INSERT INTO files (path, content_hash, language, size, modified_at, indexed_at, node_count, errors)
+               VALUES ('payroll.go', 'cafebabe', 'go', 172, 0, 0, 3, NULL);",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn migration_v8_adds_generated_column_defaulting_to_zero() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        seed_v7_schema_with_one_file(&conn);
+        assert_eq!(get_current_version(&conn).unwrap(), 7);
+        assert!(!has_column(&conn, "files", "generated"));
+
+        run_pending_migrations(&mut conn).unwrap();
+
+        assert_eq!(get_current_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
+        assert!(has_column(&conn, "files", "generated"));
+        assert!(has_index(&conn, "idx_files_generated"));
+
+        // DDL only: the pre-existing row reads 0 rather than being backfilled,
+        // because the verdict derives from CONTENT this migration cannot see.
+        // Readers UNION the column with the path check, which is what keeps a
+        // pre-#1500 index ranking the way it already did.
+        let generated: i64 = conn
+            .query_row(
+                "SELECT generated FROM files WHERE path = 'payroll.go'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generated, 0);
+
+        // NOT NULL, so a row inserted without the column still reads 0.
+        conn.execute_batch(
+            "INSERT INTO files (path, content_hash, language, size, modified_at, indexed_at)
+               VALUES ('other.go', 'f00d', 'go', 1, 0, 0);",
+        )
+        .unwrap();
+        let nulls: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE generated IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(nulls, 0);
+    }
+
+    #[test]
+    fn migration_v8_is_idempotent_when_the_column_already_exists() {
+        // Settles S4's guard question by MEASUREMENT: `ALTER TABLE` has no
+        // `IF NOT EXISTS`, so replaying migration 8 over a database whose
+        // BASE_SCHEMA already carries `generated` would raise
+        // `duplicate column name: generated` — and if it does, the migration
+        // needs a `PRAGMA table_info` guard rather than a plain `&'static str`.
+        let mut conn = Connection::open_in_memory().unwrap();
+        ensure_schema_and_migrations(&mut conn).unwrap();
+        assert!(has_column(&conn, "files", "generated"));
+
+        // Rewind the recorded version to exactly 7 so ONLY migration 8 is
+        // pending, over a table that already has the column — the replay the
+        // guard must survive. `initialize_fresh_schema` records just two rows,
+        // 1 and CURRENT_SCHEMA_VERSION, so a row 7 has to be inserted rather
+        // than uncovered by deleting 8: dropping 8 alone would leave MAX = 1 and
+        // make migrations 2..8 pending, which tests a different thing.
+        conn.execute("DELETE FROM schema_versions WHERE version = 8", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO schema_versions (version, applied_at, description) VALUES (7, 0, 'v7')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(get_current_version(&conn).unwrap(), 7);
+
+        let replayed = run_pending_migrations(&mut conn);
+
+        // Whichever way this lands, the column and index must still be intact
+        // and the version restored, so the assertion is meaningful either way.
+        assert!(
+            replayed.is_ok(),
+            "replaying migration 8 over a BASE_SCHEMA database must not fail: {:?}",
+            replayed.err()
+        );
+        assert_eq!(get_current_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
+        assert!(has_column(&conn, "files", "generated"));
+        assert!(has_index(&conn, "idx_files_generated"));
     }
 
     #[test]
@@ -361,7 +508,7 @@ mod tests {
 
         run_pending_migrations(&mut conn).unwrap();
 
-        assert_eq!(get_current_version(&conn).unwrap(), 7);
+        assert_eq!(get_current_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
         assert!(has_index(&conn, "idx_edges_identity"));
 
         assert_eq!(
@@ -391,6 +538,7 @@ mod tests {
             "CREATE TABLE schema_versions (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL, description TEXT);
              CREATE TABLE nodes (id TEXT PRIMARY KEY, name TEXT);
              CREATE TABLE edges (id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, target TEXT NOT NULL, kind TEXT NOT NULL, metadata TEXT, line INTEGER, col INTEGER, provenance TEXT DEFAULT NULL);
+             CREATE TABLE files (path TEXT PRIMARY KEY, content_hash TEXT NOT NULL, language TEXT NOT NULL, size INTEGER NOT NULL, modified_at INTEGER NOT NULL, indexed_at INTEGER NOT NULL, node_count INTEGER DEFAULT 0, errors TEXT);
              INSERT INTO schema_versions (version, applied_at, description) VALUES (6, 0, 'v6');
              INSERT INTO edges (id, source, target, kind, line, col) VALUES
                (1,'a','b','calls',5,3),
