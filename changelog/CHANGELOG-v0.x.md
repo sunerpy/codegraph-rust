@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.46.0](https://github.com/sunerpy/codegraph-rust/compare/v0.45.0...v0.46.0) (2026-08-20)
+
+
+### Features
+
+* **extract:** detect generated files by their content banner ([#220](https://github.com/sunerpy/codegraph-rust/issues/220)) ([9e75fed](https://github.com/sunerpy/codegraph-rust/commit/9e75fed7e75042ae7e8887c42ad251c520b0df00))
+
 ## [0.45.0](https://github.com/sunerpy/codegraph-rust/compare/v0.44.1...v0.45.0) (2026-08-20)
 
 
