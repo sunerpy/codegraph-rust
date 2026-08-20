@@ -60,6 +60,7 @@ struct NodeSnapshot {
     project_aliases: Option<AliasMap>,
     workspace_packages: Option<WorkspacePackages>,
     go_module: Option<GoModule>,
+    go_modules: Vec<GoModule>,
 }
 
 /// A `Sync`, immutable [`ResolutionContext`] over a precomputed [`NodeSnapshot`]
@@ -152,6 +153,7 @@ impl SnapshotResolutionContext {
         let project_aliases = load_project_aliases(&project_root);
         let workspace_packages = load_workspace_packages(&project_root);
         let go_module = crate::context::load_go_module_pub(&project_root);
+        let go_modules = crate::context::load_go_modules_pub(&project_root, &all_file_paths);
 
         Ok(Self {
             snapshot: Arc::new(NodeSnapshot {
@@ -168,6 +170,7 @@ impl SnapshotResolutionContext {
                 project_aliases,
                 workspace_packages,
                 go_module,
+                go_modules,
             }),
             edges: Arc::new(HashMap::new()),
         })
@@ -321,6 +324,10 @@ impl ResolutionContext for SnapshotResolutionContext {
 
     fn get_go_module(&self) -> Option<GoModule> {
         self.snapshot.go_module.clone()
+    }
+
+    fn get_go_modules(&self) -> Vec<GoModule> {
+        self.snapshot.go_modules.clone()
     }
 
     fn get_re_exports(&self, file_path: &str, language: Language) -> Vec<ReExport> {

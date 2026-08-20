@@ -14,6 +14,7 @@ use crate::{import_resolver, pathutil};
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use codegraph_store::Store;
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::path::Path;
 
 /// `DEFAULT_CACHE_LIMIT` (`index.ts:54`). Override via env in the upstream; the v1 port
@@ -41,6 +42,7 @@ struct Caches {
     qualified_name_cache: LruCache<String, Vec<Node>>,
     project_aliases: Option<Option<AliasMap>>,
     go_module: Option<Option<GoModule>>,
+    go_modules: Option<Vec<GoModule>>,
     workspace_packages: Option<Option<WorkspacePackages>>,
 }
 
@@ -59,6 +61,7 @@ impl Caches {
             qualified_name_cache: LruCache::new(limit),
             project_aliases: None,
             go_module: None,
+            go_modules: None,
             workspace_packages: None,
         }
     }
@@ -278,6 +281,15 @@ impl ResolutionContext for StoreResolutionContext<'_> {
         c.go_module.clone().flatten()
     }
 
+    fn get_go_modules(&self) -> Vec<GoModule> {
+        if let Some(cached) = self.caches.borrow().go_modules.clone() {
+            return cached;
+        }
+        let modules = load_go_modules(&self.project_root, &self.get_all_files());
+        self.caches.borrow_mut().go_modules = Some(modules.clone());
+        modules
+    }
+
     fn get_re_exports(&self, file_path: &str, language: Language) -> Vec<ReExport> {
         let mut c = self.caches.borrow_mut();
         if let Some(cached) = c.re_export_cache.get(&file_path.to_string()) {
@@ -322,6 +334,11 @@ pub(crate) fn load_go_module_pub(project_root: &str) -> Option<GoModule> {
     load_go_module(project_root)
 }
 
+/// Shares [`load_go_modules`] with the snapshot context.
+pub(crate) fn load_go_modules_pub(project_root: &str, files: &[String]) -> Vec<GoModule> {
+    load_go_modules(project_root, files)
+}
+
 /// Order name-lookup candidates by `(file_path, start_line, start_column, id)`.
 ///
 /// A full index inserts nodes file-by-file in sorted-path order, each file's
@@ -364,7 +381,17 @@ fn is_js_family_path(file_path: &str) -> bool {
 /// Load `module` path from `go.mod` at the project root
 /// (mirrors `loadGoModule`, `upstream resolution/go-module.ts`).
 fn load_go_module(project_root: &str) -> Option<GoModule> {
-    let text = std::fs::read_to_string(pathutil::resolve(project_root, "go.mod")).ok()?;
+    load_go_module_in(project_root, "")
+}
+
+/// Read the `module` line of `<project_root>/<dir>/go.mod`.
+fn load_go_module_in(project_root: &str, dir: &str) -> Option<GoModule> {
+    let relative = if dir.is_empty() {
+        "go.mod".to_string()
+    } else {
+        format!("{dir}/go.mod")
+    };
+    let text = std::fs::read_to_string(pathutil::resolve(project_root, &relative)).ok()?;
     for line in text.lines() {
         let trimmed = line.trim_start();
         if let Some(rest) = trimmed.strip_prefix("module") {
@@ -372,11 +399,53 @@ fn load_go_module(project_root: &str) -> Option<GoModule> {
             if !module_path.is_empty() {
                 return Some(GoModule {
                     module_path: module_path.to_string(),
+                    dir: dir.to_string(),
                 });
             }
         }
     }
     None
+}
+
+/// Every Go module reachable from the indexed `.go` files, nearest-`go.mod`-first
+/// per file (#1521).
+///
+/// A multi-module layout (`a/go.mod` + `b/go.mod`, no root `go.mod`) produced NO
+/// module at all before, because only `<project_root>/go.mod` was ever read; with
+/// no module path, every cross-module import classified as EXTERNAL and the Go
+/// cross-package resolver bailed on its first line, so such a repo got zero
+/// `calls` edges across the module boundary.
+///
+/// Ordered by `dir` and deduplicated, so the result does not depend on the file
+/// iteration order.
+fn load_go_modules(project_root: &str, files: &[String]) -> Vec<GoModule> {
+    let mut dirs: BTreeSet<String> = BTreeSet::new();
+    for file in files {
+        if !file.ends_with(".go") {
+            continue;
+        }
+        let normalized = file.replace('\\', "/");
+        let mut dir = pathutil::dirname(&normalized);
+        loop {
+            dirs.insert(dir.clone());
+            if dir.is_empty() {
+                break;
+            }
+            dir = pathutil::dirname(&dir);
+        }
+    }
+    // A Go-less project keeps the previous behaviour: probe the root only.
+    if dirs.is_empty() {
+        return load_go_module(project_root).into_iter().collect();
+    }
+
+    let mut modules: Vec<GoModule> = dirs
+        .iter()
+        .filter_map(|dir| load_go_module_in(project_root, dir))
+        .collect();
+    modules.sort_by(|a, b| a.dir.cmp(&b.dir).then(a.module_path.cmp(&b.module_path)));
+    modules.dedup_by(|a, b| a.dir == b.dir);
+    modules
 }
 
 #[cfg(test)]
@@ -478,6 +547,82 @@ mod tests {
         assert!(load_go_module(root.to_str().unwrap()).is_none());
         std::fs::write(root.join("go.mod"), "module\n").unwrap();
         assert!(load_go_module(root.to_str().unwrap()).is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn load_go_modules_finds_every_nested_module_without_a_root_one() {
+        let root = temp_root("gomods");
+        for sub in ["a", "b"] {
+            std::fs::create_dir_all(root.join(sub)).unwrap();
+            std::fs::write(
+                root.join(sub).join("go.mod"),
+                format!("module ex/{sub}\n\ngo 1.21\n"),
+            )
+            .unwrap();
+        }
+        let files = vec!["b/main.go".to_string(), "a/helper.go".to_string()];
+        let modules = load_go_modules(root.to_str().unwrap(), &files);
+        assert_eq!(
+            modules
+                .iter()
+                .map(|m| (m.dir.as_str(), m.module_path.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("a", "ex/a"), ("b", "ex/b")],
+            "both nested modules must be discovered, ordered by dir"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn load_go_modules_reversed_file_order_is_identical() {
+        let root = temp_root("gomodsdet");
+        for sub in ["a", "b"] {
+            std::fs::create_dir_all(root.join(sub)).unwrap();
+            std::fs::write(
+                root.join(sub).join("go.mod"),
+                format!("module ex/{sub}\n\ngo 1.21\n"),
+            )
+            .unwrap();
+        }
+        let forward = load_go_modules(
+            root.to_str().unwrap(),
+            &["a/helper.go".to_string(), "b/main.go".to_string()],
+        );
+        let reverse = load_go_modules(
+            root.to_str().unwrap(),
+            &["b/main.go".to_string(), "a/helper.go".to_string()],
+        );
+        assert_eq!(forward, reverse, "discovery must not depend on file order");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn load_go_modules_root_module_keeps_empty_dir() {
+        let root = temp_root("gomodroot");
+        std::fs::write(root.join("go.mod"), "module ex/m\n").unwrap();
+        let modules = load_go_modules(root.to_str().unwrap(), &["cmd/main.go".to_string()]);
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].dir, "");
+        assert_eq!(modules[0].module_path, "ex/m");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn load_go_modules_without_go_files_probes_the_root_only() {
+        let root = temp_root("gomodnogo");
+        std::fs::write(root.join("go.mod"), "module ex/m\n").unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub").join("go.mod"), "module ex/sub\n").unwrap();
+        let modules = load_go_modules(root.to_str().unwrap(), &["src/a.ts".to_string()]);
+        assert_eq!(
+            modules
+                .iter()
+                .map(|m| m.module_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ex/m"],
+            "a project with no .go files must not scan for nested modules"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

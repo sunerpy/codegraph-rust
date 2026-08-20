@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use crate::engine::CodeGraphEngine;
-use crate::instructions::SERVER_INSTRUCTIONS;
+use crate::instructions::server_instructions;
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse, ToolResult, error_codes};
 use crate::roots::{
     ROOTS_LIST_REQUEST_ID, WorkspaceRoots, db_exists_for, db_path_for, format_tool_debug_line,
@@ -614,7 +614,7 @@ pub fn initialize_result() -> Value {
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": { "tools": {} },
         "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION },
-        "instructions": SERVER_INSTRUCTIONS,
+        "instructions": server_instructions(),
     })
 }
 

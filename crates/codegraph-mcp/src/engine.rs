@@ -23,7 +23,7 @@ use codegraph_store::Store;
 use serde_json::Value;
 
 use crate::dynamic_boundaries::scan_dynamic_dispatch;
-use crate::explore_budget::{ExploreOutputBudget, get_explore_budget, get_explore_output_budget};
+use crate::explore_budget::{ExploreOutputBudget, get_explore_output_budget};
 use crate::protocol::ToolResult;
 
 /// Default caller/callee recursion depth for callers/callees tools. The upstream
@@ -1060,14 +1060,20 @@ impl CodeGraphEngine {
             lines.push(String::new());
         }
 
-        // Explore budget note (call-count recommendation), gated
-        // (`tools.ts:2943-2952`).
+        // Follow-up-call note, gated (`tools.ts:2943-2952`).
+        //
+        // Upstream's wording announced a per-project call BUDGET ("N calls for
+        // this project … Synthesize once you've used N"), but nothing anywhere
+        // enforces it, so its only effect was agents stopping while their
+        // question was still uncovered (#1504). The useful half — one more
+        // explore beats falling back to Read — is kept, the phantom cap is
+        // dropped, and the absence of a limit is now stated outright rather than
+        // left to inference.
         if budget.include_budget_note
             && let Ok(c) = self.store.counts()
         {
-            let call_budget = get_explore_budget(c.file_count);
             lines.push(format!(
-                    "> **Explore budget: {call_budget} calls for this project ({} files indexed).** Each call covers ~6 files; if your question spans more, spend your remaining calls on the uncovered area BEFORE falling back to Read — another explore is cheaper and more complete than reading those files. Synthesize once you've used {call_budget}.",
+                    "> **{} files indexed.** Each call covers ~6 files; if your question spans more, make ANOTHER `codegraph_explore` targeting the uncovered area BEFORE falling back to Read — another explore is cheaper and more complete than reading those files. There is no call limit.",
                     c.file_count
                 ));
             lines.push(String::new());
@@ -4502,8 +4508,61 @@ mod tests {
         assert!(txt.contains("### Relationships"), "got: {txt}");
         assert!(txt.contains("line 5"));
         assert!(
-            txt.contains("Explore budget"),
-            "expected budget note, got: {txt}"
+            txt.contains("files indexed"),
+            "expected the follow-up-call note, got: {txt}"
+        );
+    }
+
+    /// #1504 — the note must not promise a call CAP. Nothing enforces one, so
+    /// the upstream "N calls for this project / Synthesize once you've used N"
+    /// wording only made agents stop exploring early.
+    #[test]
+    fn ext_explore_note_promises_no_unenforced_call_budget() {
+        let mut engine = test_engine();
+        put_indexed_source(
+            &engine,
+            "svc.rs",
+            "fn processOrder() {}\n",
+            Language::Rust,
+            1,
+        );
+        for i in 0..5001 {
+            put_file(
+                &engine,
+                &file_rec(&format!("pad/f{i}.rs"), Language::Rust, 0),
+            );
+        }
+        put_nodes(
+            &mut engine,
+            &[node_lang(
+                "processOrder",
+                "processOrder",
+                "svc.rs",
+                1,
+                1,
+                NodeKind::Function,
+                Language::Rust,
+            )],
+        );
+        let txt = text_of(&engine.execute(
+            "codegraph_explore",
+            &serde_json::json!({"query": "processOrder"}),
+        ));
+
+        for banned in [
+            "Explore budget:",
+            "Synthesize once",
+            "calls for this project",
+            "remaining calls",
+        ] {
+            assert!(
+                !txt.contains(banned),
+                "the explore note must not imply an unenforced call cap, found {banned:?} in: {txt}"
+            );
+        }
+        assert!(
+            txt.contains("no call limit"),
+            "the note must say so explicitly, got: {txt}"
         );
     }
 

@@ -1,14 +1,57 @@
 //! Server-level instructions emitted in the MCP `initialize` response.
 //!
-//! Verbatim copy of the upstream `SERVER_INSTRUCTIONS`
+//! Ported from the upstream `SERVER_INSTRUCTIONS`
 //! (`upstream mcp/server-instructions.ts:18-78`), captured from the
 //! LIVE built server (`upstream bin/codegraph.js serve --mcp`) so
-//! the byte content is exactly what `initialize` returned (6421 bytes, single
-//! trailing newline). The MCP client surfaces this in the agent's system
-//! prompt (see that file's doc comment).
+//! the byte content matches what `initialize` returned. The MCP client surfaces
+//! this in the agent's system prompt (see that file's doc comment).
+//!
+//! One section is NOT upstream text: "Supported languages" (#671) is GENERATED
+//! from this build's own [`Language`] registry by [`server_instructions`], so it
+//! can never drift from what the binary actually parses. Upstream hardcodes a
+//! "30+" prose count; a copied number would silently go stale the next time a
+//! grammar lands.
 
-/// The exact instructions string returned in `initialize.result.instructions`.
-pub const SERVER_INSTRUCTIONS: &str = r#"# Codegraph — code intelligence over an indexed knowledge graph
+use codegraph_core::types::Language;
+use std::sync::OnceLock;
+
+/// The instructions returned in `initialize.result.instructions`: the static
+/// body plus the generated supported-language section.
+pub fn server_instructions() -> &'static str {
+    static RENDERED: OnceLock<String> = OnceLock::new();
+    RENDERED
+        .get_or_init(|| format!("{SERVER_INSTRUCTIONS_BODY}{}", render_supported_languages()))
+        .as_str()
+}
+
+/// The languages this build extracts, in [`Language::ALL`] order.
+///
+/// Excludes `Unknown` (the not-a-language sentinel) and the three Godot
+/// non-script file kinds (`.tscn` / `.tres` / `project.godot`), which are Godot
+/// PROJECT artifacts parsed as part of GDScript support rather than languages a
+/// user would name.
+pub fn supported_language_names() -> Vec<&'static str> {
+    Language::ALL
+        .iter()
+        .copied()
+        .filter(|l| *l != Language::Unknown && !l.is_godot_non_script_file())
+        .map(Language::as_str)
+        .collect()
+}
+
+fn render_supported_languages() -> String {
+    let names = supported_language_names();
+    format!(
+        "\n## Supported languages\n\n\
+         Codegraph extracts these {} languages ({}). A file outside this set is \
+         not indexed, so no codegraph tool can see it — reach for Read there.\n",
+        names.len(),
+        names.join(", ")
+    )
+}
+
+/// The static, upstream-derived body of the instructions.
+const SERVER_INSTRUCTIONS_BODY: &str = r#"# Codegraph — code intelligence over an indexed knowledge graph
 
 Codegraph is a SQLite knowledge graph of every symbol, edge, and file in
 the workspace — pre-computed structure you would otherwise re-derive by
@@ -69,3 +112,87 @@ typically one to a few calls; a grep/read exploration is dozens.
 - Cross-file resolution is best-effort name matching; ambiguous calls may return multiple candidates.
 - No live correctness validation — that's still the TypeScript compiler / test suite / linter's job. Codegraph supplements those with structural context they don't have.
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supported_languages_excludes_unknown_and_godot_artifacts() {
+        let names = supported_language_names();
+        assert!(
+            !names.contains(&"unknown"),
+            "the sentinel is not a language"
+        );
+        for artifact in ["godot_scene", "godot_resource", "godot_project"] {
+            assert!(
+                !names.contains(&artifact),
+                "{artifact} is a Godot project artifact, not a language"
+            );
+        }
+        assert!(names.contains(&"gdscript"), "GDScript itself IS a language");
+        assert_eq!(
+            names.len(),
+            Language::ALL.len() - 4,
+            "exactly `unknown` + the three Godot artifact kinds are excluded"
+        );
+    }
+
+    #[test]
+    fn supported_language_names_are_unique_and_ordered_like_the_registry() {
+        let names = supported_language_names();
+        let mut deduped = names.clone();
+        deduped.dedup();
+        assert_eq!(names, deduped, "no duplicates");
+        let from_registry: Vec<&str> = Language::ALL
+            .iter()
+            .copied()
+            .filter(|l| *l != Language::Unknown && !l.is_godot_non_script_file())
+            .map(Language::as_str)
+            .collect();
+        assert_eq!(
+            names, from_registry,
+            "the list must be derived from the registry, not a hand-kept copy"
+        );
+    }
+
+    /// #671 — the instructions must NAME the supported languages, and the count
+    /// must come from this build's registry rather than upstream's "30+" prose.
+    #[test]
+    fn instructions_list_the_supported_languages_from_the_registry() {
+        let text = server_instructions();
+        assert!(
+            text.contains("## Supported languages"),
+            "instructions must carry a supported-language section"
+        );
+        let names = supported_language_names();
+        assert!(
+            text.contains(&format!("these {} languages", names.len())),
+            "the count must be the registry's, got: {text}"
+        );
+        for name in names {
+            assert!(text.contains(name), "language {name} must be named");
+        }
+        assert!(
+            !text.contains("30+"),
+            "upstream's hardcoded count must not be copied"
+        );
+    }
+
+    #[test]
+    fn instructions_keep_the_upstream_body_and_end_with_one_newline() {
+        let text = server_instructions();
+        assert!(
+            text.starts_with("# Codegraph — code intelligence over an indexed knowledge graph"),
+            "the upstream body must still lead"
+        );
+        assert!(
+            text.contains("## Tool selection by intent"),
+            "the upstream body must be preserved in full"
+        );
+        assert!(
+            text.ends_with('\n') && !text.ends_with("\n\n"),
+            "single trailing newline"
+        );
+    }
+}

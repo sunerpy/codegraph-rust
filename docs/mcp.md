@@ -85,7 +85,8 @@ regardless of cwd (e.g.
 `"args": ["serve", "--mcp", "-p", "/abs/path/to/project"]`).
 
 Supported agents: Claude Code, Cursor, Codex CLI, opencode, Hermes Agent,
-Gemini CLI, Antigravity IDE, Kiro, Trae, Qoder, Zed.
+Gemini CLI, Antigravity IDE, Kiro, Trae, Qoder, Zed, VS Code (GitHub Copilot),
+GitHub Copilot CLI, JetBrains IDEs (GitHub Copilot).
 
 ---
 

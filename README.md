@@ -123,7 +123,8 @@ codegraph serve --mcp --path /path/to/project  # optional: pin to a specific pro
 ```
 
 Auto-register it into your agent's config (Claude Code, Cursor, Codex CLI,
-opencode, Hermes, Gemini CLI, Antigravity, Kiro, Trae, Qoder, Zed):
+opencode, Hermes, Gemini CLI, Antigravity, Kiro, Trae, Qoder, Zed, VS Code,
+Copilot CLI, JetBrains):
 
 ```bash
 codegraph install --yes              # detects installed agents and wires them up
@@ -217,7 +218,8 @@ directory or `rootUri`/`workspaceFolders`/`roots`. When it can't resolve one,
 See [`docs/mcp.md`](docs/mcp.md#project-resolution) for the full three-case breakdown.
 
 Supported agents: Claude Code, Cursor, Codex CLI, opencode, Hermes Agent,
-Gemini CLI, Antigravity IDE, Kiro, Trae, Qoder, Zed.
+Gemini CLI, Antigravity IDE, Kiro, Trae, Qoder, Zed, VS Code (GitHub Copilot),
+GitHub Copilot CLI, JetBrains IDEs (GitHub Copilot).
 
 ```bash
 codegraph install --yes                          # auto-detect installed agents

@@ -2,7 +2,7 @@
 //! running ALONGSIDE the hand-rolled [`crate::McpServer`].
 //!
 //! Reuses the sync engine + rendering layer verbatim: [`CodeGraphEngine`],
-//! [`crate::schemas`], [`crate::instructions::SERVER_INSTRUCTIONS`], and the
+//! [`crate::schemas`], [`crate::instructions::server_instructions`], and the
 //! `roots` project resolution. Only the transport/session shell is rmcp.
 //!
 //! ## Sync engine bridge
@@ -34,7 +34,7 @@ use rmcp::service::{NotificationContext, RequestContext, RoleServer};
 use serde_json::{Value, json};
 
 use crate::engine::CodeGraphEngine;
-use crate::instructions::SERVER_INSTRUCTIONS;
+use crate::instructions::server_instructions;
 use crate::protocol::ToolResult;
 use crate::roots::{WorkspaceRoots, db_exists_for, db_path_for};
 use crate::schemas;
@@ -301,7 +301,7 @@ impl ServerHandler for CodeGraphHandler {
         InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_server_info(Implementation::new(SERVER_NAME, SERVER_VERSION))
-            .with_instructions(SERVER_INSTRUCTIONS)
+            .with_instructions(server_instructions())
     }
 
     async fn on_initialized(&self, context: NotificationContext<RoleServer>) {

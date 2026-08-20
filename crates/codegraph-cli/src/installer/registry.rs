@@ -4,14 +4,24 @@
 //! Order is load-bearing: it is the order in `--target=all`, in detection, and
 //! in `--print-config`'s help listing. Matches `ALL_TARGETS` (registry.ts:20):
 //! claude, cursor, codex, opencode, hermes, gemini, antigravity, kiro, trae,
-//! qoder.
+//! qoder, zed, plus the three Copilot surfaces appended by this port: vscode,
+//! copilot-cli, jetbrains.
 
 use anyhow::{Result, bail};
 
 use super::targets::{
-    antigravity::ANTIGRAVITY_TARGET, claude::CLAUDE_TARGET, codex::CODEX_TARGET,
-    cursor::CURSOR_TARGET, gemini::GEMINI_TARGET, hermes::HERMES_TARGET, kiro::KIRO_TARGET,
-    opencode::OPENCODE_TARGET, qoder::QODER_TARGET, trae::TRAE_TARGET, zed::ZED_TARGET,
+    antigravity::ANTIGRAVITY_TARGET,
+    claude::CLAUDE_TARGET,
+    codex::CODEX_TARGET,
+    copilot::{COPILOT_CLI_TARGET, JETBRAINS_TARGET, VSCODE_TARGET},
+    cursor::CURSOR_TARGET,
+    gemini::GEMINI_TARGET,
+    hermes::HERMES_TARGET,
+    kiro::KIRO_TARGET,
+    opencode::OPENCODE_TARGET,
+    qoder::QODER_TARGET,
+    trae::TRAE_TARGET,
+    zed::ZED_TARGET,
 };
 use super::types::{AgentTarget, DetectionResult, InstallContext, Location};
 
@@ -28,6 +38,9 @@ pub fn all_targets() -> Vec<&'static dyn AgentTarget> {
         &TRAE_TARGET,
         &QODER_TARGET,
         &ZED_TARGET,
+        &VSCODE_TARGET,
+        &COPILOT_CLI_TARGET,
+        &JETBRAINS_TARGET,
     ]
 }
 
@@ -130,6 +143,9 @@ mod tests {
         "trae",
         "qoder",
         "zed",
+        "vscode",
+        "copilot-cli",
+        "jetbrains",
     ];
 
     #[test]

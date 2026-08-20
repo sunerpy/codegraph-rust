@@ -40,6 +40,9 @@ pub enum TargetId {
     Trae,
     Qoder,
     Zed,
+    VsCode,
+    CopilotCli,
+    JetBrains,
 }
 
 impl TargetId {
@@ -56,6 +59,9 @@ impl TargetId {
             TargetId::Trae => "trae",
             TargetId::Qoder => "qoder",
             TargetId::Zed => "zed",
+            TargetId::VsCode => "vscode",
+            TargetId::CopilotCli => "copilot-cli",
+            TargetId::JetBrains => "jetbrains",
         }
     }
 }

@@ -360,6 +360,15 @@ pub trait ResolutionContext {
         None
     }
 
+    /// EVERY Go module in the project, for multi-`go.mod` layouts (#1521).
+    ///
+    /// The default lifts [`Self::get_go_module`], so a context that only knows the
+    /// root module keeps its exact previous behaviour and no implementor is forced
+    /// to change.
+    fn get_go_modules(&self) -> Vec<GoModule> {
+        self.get_go_module().into_iter().collect()
+    }
+
     /// Re-exports declared by a file (`getReExports?`, `types.ts:119-125`).
     /// Empty when the file has none.
     fn get_re_exports(&self, _file_path: &str, _language: Language) -> Vec<ReExport> {
@@ -376,11 +385,15 @@ pub trait ResolutionContext {
 /// Go module info parsed from `go.mod`.
 ///
 /// Mirrors the upstream `GoModule` (`upstream resolution/go-module.ts`),
-/// referenced by `ResolutionContext.getGoModule?` (`types.ts:104-111`). Only
-/// `module_path` is load-bearing for import classification.
+/// referenced by `ResolutionContext.getGoModule?` (`types.ts:104-111`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoModule {
     pub module_path: String,
+    /// Project-relative directory holding this module's `go.mod`, `/`-separated,
+    /// EMPTY for a module at the project root. An import path is rewritten to a
+    /// directory as `dir` + the part of the import after `module_path`, so a
+    /// nested module's packages resolve to their real on-disk location (#1521).
+    pub dir: String,
 }
 
 #[cfg(test)]
@@ -619,9 +632,11 @@ mod tests {
     fn go_module_constructs_and_derives() {
         let gm = GoModule {
             module_path: "example.com/mod".to_string(),
+            dir: "sub".to_string(),
         };
         assert_eq!(gm.clone(), gm);
         assert_eq!(gm.module_path, "example.com/mod");
+        assert_eq!(gm.dir, "sub");
         assert!(format!("{gm:?}").contains("GoModule"));
     }
 

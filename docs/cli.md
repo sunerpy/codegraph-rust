@@ -32,9 +32,9 @@
 | `files`           | List indexed files (tree/flat/grouped)                                                    | `-p`, `--filter <DIR>`, `--language <LANG>`, `--pattern`, `--format`, `--max-depth`, `-j`                                                  |
 | `serve`           | Start the server; `--mcp` enters MCP stdio mode                                           | `-p`, `--mcp`, `--no-watch`                                                                                                                |
 | `unlock`          | Clear a stale daemon lock (keeps live pids)                                               | `[path]`                                                                                                                                   |
-| `callers`         | Who calls a symbol (along calls/references/imports)                                       | `<symbol>`, `-p`, `-l`, `-j`, `--strict`                                                                                                   |
-| `callees`         | What a symbol calls                                                                       | `<symbol>`, `-p`, `-l`, `-j`, `--strict`                                                                                                   |
-| `impact`          | Blast radius of changing a symbol (incoming deps, transitive)                             | `<symbol>`, `-p`, `-d/--depth`, `-j`, `--strict`                                                                                           |
+| `callers`         | Who calls a symbol (along calls/references/imports)                                       | `<symbol>`, `-p`, `-l`, `-j`, `--strict`, `--file <FILE>`                                                                                  |
+| `callees`         | What a symbol calls                                                                       | `<symbol>`, `-p`, `-l`, `-j`, `--strict`, `--file <FILE>`                                                                                  |
+| `impact`          | Blast radius of changing a symbol (incoming deps, transitive)                             | `<symbol>`, `-p`, `-d/--depth`, `-j`, `--strict`, `--file <FILE>`                                                                          |
 | `affected`        | Given changed files, the affected symbol set                                              | `[files...]`, `-p`, `-d/--depth`, `--filter`                                                                                               |
 | `check`           | Detect circular dependencies (each cycle as `a.ts -> b.ts -> a.ts`)                       | `[path]`, `-j/--json`                                                                                                                      |
 | `audit`           | Read-only Godot resource audit: orphan resources, dangling references, impact             | `-p`, `--orphans`, `--dangling`, `--impact <path>` (≥1 required), `--verify-plan`, `--include <PREFIX>`, `--exclude <PREFIX>`, `-j/--json` |
@@ -71,7 +71,9 @@
 config file; `uninstall` reverses it. No hand-editing of JSON/TOML required.
 
 Supported agents (`ALL_TARGETS` order): **Claude Code, Cursor, Codex CLI,
-opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, Trae, Qoder, Zed.**
+opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, Trae, Qoder, Zed,
+VS Code (`vscode`), GitHub Copilot CLI (`copilot-cli`), JetBrains
+(`jetbrains`).**
 The written MCP command launches the Rust binary: `command: "codegraph"`, `args: ["serve",
 "--mcp"]` (Cursor injects `--path`; Kiro injects `--path` only on a project-local
 install).
@@ -85,6 +87,23 @@ install).
 > because Kiro CLI does not expand `${workspaceFolder}` in `mcp.json` args: a
 > global `--path ${workspaceFolder}` would resolve to a literal, non-existent
 > directory and break the watcher and catch-up sync.
+
+> **The three GitHub Copilot targets.** They share the Copilot MCP surface but
+> disagree on both the wrapper key and the available locations:
+>
+> | target        | file                                         | wrapper      | locations      |
+> | ------------- | -------------------------------------------- | ------------ | -------------- |
+> | `vscode`      | `.vscode/mcp.json` (local)                   | `servers`    | local + global |
+> |               | `<config_base>/Code/User/mcp.json` (global)  | `servers`    |                |
+> | `copilot-cli` | `~/.copilot/mcp-config.json`                 | `mcpServers` | global only    |
+> | `jetbrains`   | `~/.config/github-copilot/intellij/mcp.json` | `servers`    | global only    |
+>
+> The VS Code **global** entry is a bare `serve --mcp` and deliberately does NOT
+> use `${workspaceFolder}`: VS Code expands that variable only in a WORKSPACE
+> `mcp.json`, so in the user-level file it would stay literal and point the server
+> at a nonexistent directory. Run `codegraph init --target=vscode` per project for
+> live watch. The Copilot CLI entry additionally carries `"tools": ["*"]`, without
+> which the CLI registers the server but exposes none of its tools.
 
 ```bash
 codegraph install --yes                          # auto-detect installed agents, global
@@ -363,6 +382,44 @@ also exits non-zero.
 | No exact match (symbol absent) | Fails                                | Fails      |
 | Exact match with results       | Succeeds                             | Succeeds   |
 | Exact match with zero results  | Succeeds and prints the empty result | Fails      |
+
+### Ancestor-index retargeting on mutating commands
+
+`index`, `sync`, `uninit`, and `unlock` walk UP from the given path to find an
+index, so running one inside an unindexed subdirectory operates on the nearest
+indexed ANCESTOR. That is intentional — one index serves a whole tree — but it is
+now announced on **stderr** instead of happening silently:
+
+```
+Warning: /repo/child has no CodeGraph index, so this command resolved to an
+         ancestor index at /repo and will operate on THAT project, not on /repo/child.
+         Run `codegraph init /repo/child` first if you meant to give it its own index.
+```
+
+It matters most for `uninit --force`, which would otherwise delete an index the
+user never named. Stdout stays machine-readable and unchanged.
+
+---
+
+### `--file` — disambiguating same-named definitions
+
+When two files define the same symbol, `callers` / `callees` / `impact` merge
+both definitions' relatives into one list. `--file <FILE>` keeps only the
+definition declared in that file:
+
+```bash
+codegraph callers target --file src/alpha.ts      # only alpha.ts's callers
+codegraph callees target --file alpha.ts          # a trailing path suffix works
+codegraph impact  target --file src/alpha.ts --json
+```
+
+The filter matches the whole project-relative path or any **segment-aligned**
+trailing suffix, so `other.ts` never selects `my_other.ts`. Windows separators
+and a leading `./` are normalized.
+
+A filter that matches no definition is an **error** naming the files that do
+define the symbol — reporting an empty relative-set instead would read as "this
+symbol is dead". In `--json`, the applied filter is echoed as `"file"`.
 
 ---
 
