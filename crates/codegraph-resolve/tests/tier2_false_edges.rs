@@ -433,6 +433,78 @@ fn npm_specifier_in_sfc_is_external() {
     );
 }
 
+// ====== Built-in METHOD name hijack — the field-reported import cycle ========
+
+#[test]
+fn array_receiver_does_not_bind_same_named_project_method() {
+    // The field report: a TypeScript project got a two-file import cycle because
+    // `out.push(...)` / `names.push(...)` — both `Array.push` on a locally
+    // declared array — were read as calls to `DialectGate.push`, manufacturing a
+    // reverse `Calls` edge that closed a cycle absent from the source. The
+    // fixture's import is deliberately ONE-WAY (dialect-gate imports the parser,
+    // never the reverse), so any parser→gate edge is false by construction.
+    let g = resolve_fixture("builtin_method");
+    let from_parse = calls_from(&g, "parseToolCalls");
+    let from_collect = calls_from(&g, "collectNames");
+    assert!(
+        from_parse.is_empty(),
+        "`out.push(...)` is Array.push, not DialectGate::push, got: {from_parse:?}"
+    );
+    assert!(
+        from_collect.is_empty(),
+        "`names.push(...)` is Array.push, not DialectGate::push, got: {from_collect:?}"
+    );
+}
+
+#[test]
+fn builtin_push_creates_no_self_edge() {
+    // The THIRD false edge, which the report missed: `this.buf.push(chunk)` at
+    // `dialect-gate.ts:7` pushes onto a `string[]` FIELD, and the same shortcut
+    // bound it to the enclosing `DialectGate::push` — a fabricated recursive
+    // self-edge. Distinct from `same_name_recursion_self_edge_survives`, where
+    // the receiver really is `this` and the self-edge is correct.
+    let g = resolve_fixture("builtin_method");
+    let described = g.described(EdgeKind::Calls);
+    assert!(
+        g.self_edges(EdgeKind::Calls).is_empty(),
+        "a `string[]` field push must not bind its enclosing method: {described:?}"
+    );
+}
+
+#[test]
+fn builtin_method_fixture_has_no_reverse_file_edge() {
+    // The WHOLE-fixture criterion, in the style of
+    // `class_field_builtin_receiver_is_refused`: NO `Calls` edge may leave
+    // `src/tool-call-parser.ts` at all, because every call it makes is
+    // `Array.push` / `String.split`. A symbol-scoped assertion alone would pass
+    // while a residue survived, which is exactly how the Tier 2 residue hid.
+    let g = resolve_fixture("builtin_method");
+    let described = g.described(EdgeKind::Calls);
+    let out_of_parser = g
+        .of_kind(EdgeKind::Calls)
+        .into_iter()
+        .filter(|e| g.node(&e.source).file_path == "src/tool-call-parser.ts")
+        .count();
+    assert_eq!(
+        out_of_parser, 0,
+        "the parser calls only built-ins, so it may originate no reverse edge: {described:?}"
+    );
+    // And the legitimate FORWARD direction must survive, so this cannot be
+    // satisfied by dropping every edge in the fixture.
+    let forward = g
+        .of_kind(EdgeKind::Calls)
+        .into_iter()
+        .filter(|e| {
+            g.node(&e.source).file_path == "src/streaming/dialect-gate.ts"
+                && g.node(&e.target).file_path == "src/tool-call-parser.ts"
+        })
+        .count();
+    assert_eq!(
+        forward, 1,
+        "`DialectGate::flush` really does call `parseToolCalls`: {described:?}"
+    );
+}
+
 #[test]
 fn same_name_recursion_self_edge_survives() {
     // Given `Walker.run` recursing via `this.run(n - 1)` beside a same-named

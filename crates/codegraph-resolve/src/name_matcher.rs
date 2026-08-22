@@ -1504,7 +1504,23 @@ pub fn match_method_call(
         methods
     };
 
-    if target_methods.len() == 1 && target_methods[0].language == reference.language {
+    // A SINGLE same-named candidate is not on its own evidence that the receiver
+    // is that candidate's type. Without the overlap check this branch bound every
+    // built-in call — `Array.push`, `Vec::len`, `HashMap::get`, tree-sitter
+    // `Node::kind` — onto whichever lone project method happened to share the
+    // name, which is what manufactured a false reverse `Calls` edge (and with it
+    // a phantom import cycle) for a project whose class had a `push` method.
+    // The threshold is not a new policy: the multi-candidate block below scores
+    // `overlap + 1` for a same-language candidate and gates at `>= 2`, i.e.
+    // `overlap >= 1`. Same-language is already guaranteed here, so requiring one
+    // shared word makes the two branches say the same thing. Do NOT remove it as
+    // redundant, and do NOT drop the language guard — the block below only
+    // *bonuses* same language, it does not require it, and `Calls` edges get no
+    // cross-family protection from `gate_language`.
+    if target_methods.len() == 1
+        && target_methods[0].language == reference.language
+        && receiver_shares_word(&object_or_class, &target_methods[0].qualified_name)
+    {
         return Some(ResolvedRef {
             original: reference.clone(),
             target_node_id: target_methods[0].id.clone(),
@@ -1514,18 +1530,13 @@ pub fn match_method_call(
     }
 
     if target_methods.len() > 1 {
-        let receiver_words = split_camel_case(&object_or_class);
         // Same-file candidates first, so a score tie (`score > best_score` keeps
         // the first seen) resolves to the call site's own file (#1079).
         let ordered = prefer_call_site_file(target_methods, &reference.file_path);
         let mut best_match: Option<&Node> = None;
         let mut best_score = 0i64;
         for method in &ordered {
-            let class_words = split_camel_case(&method.qualified_name);
-            let mut score = receiver_words
-                .iter()
-                .filter(|w| class_words.iter().any(|cw| cw.eq_ignore_ascii_case(w)))
-                .count() as i64;
+            let mut score = receiver_word_overlap(&object_or_class, &method.qualified_name) as i64;
             if method.language == reference.language {
                 score += 1;
             }
@@ -1771,6 +1782,27 @@ fn capitalize(s: &str) -> String {
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
         None => String::new(),
     }
+}
+
+/// How many [`split_camel_case`] words a receiver shares, case-insensitively,
+/// with a candidate's qualified name. The SINGLE implementation of that
+/// comparison: Strategy 3's one-candidate branch and its multi-candidate scorer
+/// both route through here, so the two can no longer drift apart.
+fn receiver_word_overlap(receiver: &str, qualified_name: &str) -> usize {
+    let receiver_words = split_camel_case(receiver);
+    let class_words = split_camel_case(qualified_name);
+    receiver_words
+        .iter()
+        .filter(|w| class_words.iter().any(|cw| cw.eq_ignore_ascii_case(w)))
+        .count()
+}
+
+/// The bool face of [`receiver_word_overlap`] — is there ANY shared word?
+///
+/// Note that [`split_camel_case`] drops single-character words, so a receiver
+/// named `r` shares nothing with anything.
+fn receiver_shares_word(receiver: &str, qualified_name: &str) -> bool {
+    receiver_word_overlap(receiver, qualified_name) >= 1
 }
 
 /// Split a camelCase/PascalCase string into words (`splitCamelCase`,
@@ -3309,7 +3341,11 @@ mod tests {
 
     #[test]
     fn method_call_strategy3_single_method_by_name() {
-        // No class match; exactly one same-language method named `render`.
+        // No class match; exactly one same-language method named `render`. The
+        // receiver is `thing`, which shares a word with `Thing::render` — a
+        // receiver naming nothing about the candidate is refused instead, which
+        // `method_call_strategy3_single_candidate_refuses_unrelated_receiver`
+        // covers.
         let method = mk(
             "method:r",
             NodeKind::Method,
@@ -3320,7 +3356,7 @@ mod tests {
         );
         let ctx = Ctx::default().name("render", vec![method]);
         let r = refv(
-            "obj.render",
+            "thing.render",
             EdgeKind::Calls,
             "src/a.ts",
             Language::TypeScript,
@@ -3329,6 +3365,46 @@ mod tests {
         let res = match_method_call(&r, &ctx).expect("strategy3 single");
         assert_eq!(res.target_node_id, "method:r");
         assert!((res.confidence - 0.7).abs() < 1e-9);
+    }
+
+    #[test]
+    fn method_call_strategy3_single_candidate_refuses_unrelated_receiver() {
+        // The unit-level twin of the field report: `out.push(...)` is
+        // `Array.push`, and a lone project `DialectGate::push` is not evidence
+        // that `out` is a `DialectGate`. Refuse rather than guess.
+        let method = mk(
+            "method:push",
+            NodeKind::Method,
+            "push",
+            "DialectGate::push",
+            "src/streaming/dialect-gate.ts",
+            Language::TypeScript,
+        );
+        let ctx = Ctx::default().name("push", vec![method]);
+        let r = refv(
+            "out.push",
+            EdgeKind::Calls,
+            "src/tool-call-parser.ts",
+            Language::TypeScript,
+            6,
+        );
+        assert!(
+            match_method_call(&r, &ctx).is_none(),
+            "a receiver sharing no word with the candidate's owner is not evidence"
+        );
+    }
+
+    #[test]
+    fn receiver_shares_word_drops_single_char_words() {
+        // `split_camel_case` drops single-character words, so a one-letter
+        // receiver can never overlap anything. Pinned because two fixture
+        // retargets (`real`, `logger`) depend on it, and a future reader
+        // "simplifying" a receiver back to one letter would silently delete
+        // their coverage.
+        assert!(!receiver_shares_word("r", "R::x"));
+        assert!(!receiver_shares_word("r", "Real::poke"));
+        assert!(receiver_shares_word("real", "Real::poke"));
+        assert_eq!(receiver_word_overlap("r", "R::x"), 0);
     }
 
     #[test]
@@ -5295,7 +5371,12 @@ mod tests {
 
     #[test]
     fn local_var_rust_let_new() {
-        // Rust: `let lg = Logger::new(); lg.log()`.
+        // Rust: `let logger = Logger::new(); logger.log()`.
+        // The receiver must SHARE A WORD with `Logger::log`, because Rust's
+        // `let` pattern lacks a `\s*` before its `=` and so declines on
+        // `let logger = …`; resolution therefore lands on Strategy 3's
+        // single-candidate branch, which requires receiver-word overlap. A
+        // receiver spelled `lg` overlaps nothing and resolves to None.
         let m = mk(
             "method:log",
             NodeKind::Method,
@@ -5306,19 +5387,20 @@ mod tests {
         );
         let ctx = ctx_with_scope(
             "src/a.rs",
-            "fn run() {\n    let lg = Logger::new();\n    lg.log();\n}\n",
+            "fn run() {\n    let logger = Logger::new();\n    logger.log();\n}\n",
             Language::Rust,
             m,
             "log",
         );
-        let r = refv("lg.log", EdgeKind::Calls, "src/a.rs", Language::Rust, 3);
+        let r = refv("logger.log", EdgeKind::Calls, "src/a.rs", Language::Rust, 3);
         let res = match_method_call(&r, &ctx).expect("rust let new inference");
         assert_eq!(res.target_node_id, "method:log");
     }
 
     #[test]
     fn local_var_rust_let_struct_literal() {
-        // Rust: `let lg = Logger { .. }; lg.log()`.
+        // Rust: `let logger = Logger { .. }; logger.log()`. Receiver-word overlap
+        // is required for the same reason as `local_var_rust_let_new`.
         let m = mk(
             "method:log",
             NodeKind::Method,
@@ -5329,12 +5411,12 @@ mod tests {
         );
         let ctx = ctx_with_scope(
             "src/a.rs",
-            "fn run() {\n    let lg = Logger { level: 0 };\n    lg.log();\n}\n",
+            "fn run() {\n    let logger = Logger { level: 0 };\n    logger.log();\n}\n",
             Language::Rust,
             m,
             "log",
         );
-        let r = refv("lg.log", EdgeKind::Calls, "src/a.rs", Language::Rust, 3);
+        let r = refv("logger.log", EdgeKind::Calls, "src/a.rs", Language::Rust, 3);
         let res = match_method_call(&r, &ctx).expect("rust struct literal inference");
         assert_eq!(res.target_node_id, "method:log");
     }
@@ -6857,7 +6939,7 @@ mod tests {
         Ctx::default()
             .file(
                 "src/main.ts",
-                "function use() {\n  const r = new Real();\n  r.poke();\n}\n",
+                "function use() {\n  const real = new Real();\n  real.poke();\n}\n",
             )
             .nodes_in_file("src/main.ts", vec![real.clone(), poke.clone(), caller])
             .name("Real", vec![real])
@@ -6871,7 +6953,7 @@ mod tests {
         // typed resolution proceeds exactly as today.
         let ctx = project_typed_receiver_ctx();
         let r = refv(
-            "r.poke",
+            "real.poke",
             EdgeKind::Calls,
             "src/main.ts",
             Language::TypeScript,
@@ -6886,9 +6968,16 @@ mod tests {
     fn absent_method_on_project_type_still_falls_through() {
         // C2 — the type is BOUND but lacks the method, so Strategy 3's guess is
         // reached unchanged. The gate keys on binding, not on method existence.
+        // The receiver MUST stay `real`, not `r`: `split_camel_case` drops
+        // single-character words, so `r` overlaps nothing and Strategy 3's
+        // single-candidate branch would refuse — deleting this test's coverage
+        // rather than exercising it. `real` overlaps `Real` in
+        // `Decoy::absentOnReal`. The shared fixture declares the same spelling,
+        // so all three sites move together or inference declines for the other
+        // consumer.
         let ctx = project_typed_receiver_ctx();
         let r = refv(
-            "r.absentOnReal",
+            "real.absentOnReal",
             EdgeKind::Calls,
             "src/main.ts",
             Language::TypeScript,
