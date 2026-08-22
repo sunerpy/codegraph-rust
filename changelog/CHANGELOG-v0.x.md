@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.46.2](https://github.com/sunerpy/codegraph-rust/compare/v0.46.1...v0.46.2) (2026-08-22)
+
+
+### Bug Fixes
+
+* **resolve:** a lone same-named method is not evidence of the receiver's type ([#226](https://github.com/sunerpy/codegraph-rust/issues/226)) ([1c180a4](https://github.com/sunerpy/codegraph-rust/commit/1c180a40325b5ed59ea1e944c257e31cd5c6524e))
+
 ## [0.46.1](https://github.com/sunerpy/codegraph-rust/compare/v0.46.0...v0.46.1) (2026-08-20)
 
 
