@@ -879,7 +879,7 @@ fn local_receiver_type_patterns_tagged(language: Language, r: &str) -> Vec<(Rege
             format!(r"\b{r}\b\s*:\s*([A-Z][\w.]*)"),
         ],
         Language::Rust => vec![
-            format!(r"\blet\s+(?:mut\s+)?{r}\b(?:\s*:[^=]+)?=\s*&?(?:mut\s+)?([A-Z]\w*)"),
+            format!(r"\blet\s+(?:mut\s+)?{r}\b(?:\s*:[^=]+)?\s*=\s*&?(?:mut\s+)?([A-Z]\w*)"),
             format!(r"\b{r}\s*:\s*&?(?:mut\s+)?([A-Z]\w*)"),
         ],
         Language::Go => vec![
@@ -5372,11 +5372,14 @@ mod tests {
     #[test]
     fn local_var_rust_let_new() {
         // Rust: `let logger = Logger::new(); logger.log()`.
-        // The receiver must SHARE A WORD with `Logger::log`, because Rust's
-        // `let` pattern lacks a `\s*` before its `=` and so declines on
-        // `let logger = …`; resolution therefore lands on Strategy 3's
-        // single-candidate branch, which requires receiver-word overlap. A
-        // receiver spelled `lg` overlaps nothing and resolves to None.
+        //
+        // The confidence assertion is load-bearing (#228). Until the Rust `let`
+        // pattern gained its `\s*` before `=`, inference DECLINED on the spaced
+        // form and this test passed anyway through Strategy 3's single-candidate
+        // branch at 0.7 — green for years while the code path it is named for
+        // never ran. Asserting 0.9 + `InstanceMethod` pins the TYPED path, so a
+        // regression that pushes resolution back onto any fallback fails here
+        // instead of hiding.
         let m = mk(
             "method:log",
             NodeKind::Method,
@@ -5395,12 +5398,18 @@ mod tests {
         let r = refv("logger.log", EdgeKind::Calls, "src/a.rs", Language::Rust, 3);
         let res = match_method_call(&r, &ctx).expect("rust let new inference");
         assert_eq!(res.target_node_id, "method:log");
+        assert_eq!(res.resolved_by, ResolvedBy::InstanceMethod);
+        assert!(
+            (res.confidence - 0.9).abs() < 1e-9,
+            "must resolve through receiver-type inference (0.9), not a fallback; got {}",
+            res.confidence
+        );
     }
 
     #[test]
     fn local_var_rust_let_struct_literal() {
-        // Rust: `let logger = Logger { .. }; logger.log()`. Receiver-word overlap
-        // is required for the same reason as `local_var_rust_let_new`.
+        // Rust: `let logger = Logger { .. }; logger.log()`. The 0.9 assertion is
+        // load-bearing for the same reason as `local_var_rust_let_new` (#228).
         let m = mk(
             "method:log",
             NodeKind::Method,
@@ -5419,6 +5428,151 @@ mod tests {
         let r = refv("logger.log", EdgeKind::Calls, "src/a.rs", Language::Rust, 3);
         let res = match_method_call(&r, &ctx).expect("rust struct literal inference");
         assert_eq!(res.target_node_id, "method:log");
+        assert_eq!(res.resolved_by, ResolvedBy::InstanceMethod);
+        assert!(
+            (res.confidence - 0.9).abs() < 1e-9,
+            "must resolve through receiver-type inference (0.9), not a fallback; got {}",
+            res.confidence
+        );
+    }
+
+    #[test]
+    fn local_var_rust_let_spaced_resolves_without_word_overlap() {
+        // #228 end-to-end: `let lg = Logger::new(); lg.log()`.
+        //
+        // The receiver is spelled `lg` deliberately — it shares no
+        // `split_camel_case` word with `Logger::log`, so Strategy 3's
+        // single-candidate branch refuses it and NOTHING but receiver-type
+        // inference can produce this edge. Before the `\s*` fix the whole call
+        // resolved to `None`.
+        let m = mk(
+            "method:log",
+            NodeKind::Method,
+            "log",
+            "Logger::log",
+            "src/a.rs",
+            Language::Rust,
+        );
+        let ctx = ctx_with_scope(
+            "src/a.rs",
+            "fn run() {\n    let lg = Logger::new();\n    lg.log();\n}\n",
+            Language::Rust,
+            m,
+            "log",
+        );
+        let r = refv("lg.log", EdgeKind::Calls, "src/a.rs", Language::Rust, 3);
+        let res = match_method_call(&r, &ctx).expect("rust spaced let inference");
+        assert_eq!(res.target_node_id, "method:log");
+        assert_eq!(res.resolved_by, ResolvedBy::InstanceMethod);
+        assert!(
+            (res.confidence - 0.9).abs() < 1e-9,
+            "must be the typed inference path (0.9); got {}",
+            res.confidence
+        );
+    }
+
+    #[test]
+    fn infer_local_receiver_type_rust_let_spacing_matrix() {
+        // #228 — the Rust `let` pattern's optional annotation group
+        // `(?:\s*:[^=]+)?` absorbed the whitespace before `=` ONLY when an
+        // annotation was present, so the idiomatic spaced form never matched.
+        // 3,318 spaced occurrences in this repository against 0 unspaced ones:
+        // Rust local-variable inference was effectively dead.
+        //
+        // Receiver `lg` shares no word with `Logger`, and this calls the
+        // inferrer DIRECTLY, so no downstream fallback can mask a decline. The
+        // negatives are bundled into the same test on purpose: they must not
+        // become independently green, because a guard that passes with the fix
+        // reverted proves nothing about the fix.
+        let build = |decl: &str, receiver: &str| -> (String, Ctx) {
+            let source = format!("fn run() {{\n    {decl}\n    {receiver}.log();\n}}\n");
+            let mut fn_node = mk(
+                "function:scope",
+                NodeKind::Function,
+                "run",
+                "run",
+                "src/a.rs",
+                Language::Rust,
+            );
+            fn_node.start_line = 1;
+            fn_node.end_line = 4;
+            let ctx = Ctx::default()
+                .file("src/a.rs", &source)
+                .nodes_in_file("src/a.rs", vec![fn_node]);
+            (source, ctx)
+        };
+
+        for (label, decl) in [
+            ("spaced", "let lg = Logger::new();"),
+            ("unspaced", "let lg=Logger::new();"),
+            ("annotated", "let lg: Logger = Logger::new();"),
+            ("mut spaced", "let mut lg = Logger::new();"),
+            ("mut annotated", "let mut lg: Logger = Logger::new();"),
+            ("struct literal", "let lg = Logger { level: 0 };"),
+            ("borrowed", "let lg = &Logger::new();"),
+            ("borrowed mut", "let lg = &mut Logger::new();"),
+            ("wide gap", "let lg\t=   Logger::new();"),
+            ("generic type", "let lg = Logger::<u8>::new();"),
+            ("annotated generic", "let lg: Logger<u8> = Logger::new();"),
+        ] {
+            let (_, ctx) = build(decl, "lg");
+            let r = refv("lg.log", EdgeKind::Calls, "src/a.rs", Language::Rust, 3);
+            assert_eq!(
+                infer_local_receiver_type("lg", &r, &ctx).as_deref(),
+                Some("Logger"),
+                "{label}: `{decl}` must infer Logger"
+            );
+        }
+
+        // The added `\s*` must not widen the pattern. A destructuring binding
+        // does not declare `lg` as a whole value, a bare re-assignment is not a
+        // declaration at all, and a lowercase initializer is not a type.
+        for (label, decl, receiver) in [
+            (
+                "tuple destructure",
+                "let (lg, other) = Logger::pair();",
+                "lg",
+            ),
+            ("struct destructure", "let Wrapper { lg } = make();", "lg"),
+            ("bare reassignment", "lg = Logger::new();", "lg"),
+            ("lowercase initializer", "let lg = logger_new();", "lg"),
+            ("other variable", "let other = Logger::new();", "lg"),
+        ] {
+            let (_, ctx) = build(decl, receiver);
+            let r = refv("lg.log", EdgeKind::Calls, "src/a.rs", Language::Rust, 3);
+            assert_eq!(
+                infer_local_receiver_type(receiver, &r, &ctx),
+                None,
+                "{label}: `{decl}` must NOT infer a type"
+            );
+        }
+    }
+
+    #[test]
+    fn infer_local_receiver_type_rust_let_shadow_takes_nearest_decl() {
+        // #228 — with both bindings now matchable, the backward scan must report
+        // the one NEAREST the call. A shadowed earlier binding leaking its type
+        // downstream would be a false inference, which is strictly worse than
+        // the missing edge this fix removes.
+        let source = "fn run() {\n    let cfg = Logger::new();\n    let cfg = Writer::new();\n    cfg.log();\n}\n";
+        let mut fn_node = mk(
+            "function:scope",
+            NodeKind::Function,
+            "run",
+            "run",
+            "src/a.rs",
+            Language::Rust,
+        );
+        fn_node.start_line = 1;
+        fn_node.end_line = 5;
+        let ctx = Ctx::default()
+            .file("src/a.rs", source)
+            .nodes_in_file("src/a.rs", vec![fn_node]);
+        let r = refv("cfg.log", EdgeKind::Calls, "src/a.rs", Language::Rust, 4);
+        assert_eq!(
+            infer_local_receiver_type("cfg", &r, &ctx).as_deref(),
+            Some("Writer")
+        );
     }
 
     #[test]
