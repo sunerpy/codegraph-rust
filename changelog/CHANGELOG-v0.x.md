@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.46.3](https://github.com/sunerpy/codegraph-rust/compare/v0.46.2...v0.46.3) (2026-08-23)
+
+
+### Bug Fixes
+
+* **resolve:** infer a Rust local's type when its `let` is written with spaces ([#229](https://github.com/sunerpy/codegraph-rust/issues/229)) ([b0d07e9](https://github.com/sunerpy/codegraph-rust/commit/b0d07e907282299f4da0885956f3cd6aa21f3469))
+
 ## [0.46.2](https://github.com/sunerpy/codegraph-rust/compare/v0.46.1...v0.46.2) (2026-08-22)
 
 
