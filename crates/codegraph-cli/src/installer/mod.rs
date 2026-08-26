@@ -313,12 +313,15 @@ fn uninstall_targets(
 }
 
 /// Options for `codegraph skill <action>`. One arg struct serves all four
-/// actions; `yes` is consumed by install/uninstall, `force` by update.
+/// actions; `yes` is consumed by install/uninstall, while update consumes
+/// `force`, `show_diff`, and `dry_run`.
 pub struct SkillArgs {
     pub target: Option<String>,
     pub location: Option<String>,
     pub yes: bool,
     pub force: bool,
+    pub show_diff: bool,
+    pub dry_run: bool,
 }
 
 fn resolve_skill_targets(
@@ -377,10 +380,76 @@ pub fn run_skill_install(args: SkillArgs) -> Result<()> {
     Ok(())
 }
 
-/// `codegraph skill update`: identical to install, but `--force` (plumbed
-/// through [`SkillArgs::force`]) overwrites a locally modified skill.
+/// `codegraph skill update`: preview the version transition + line counts, then
+/// refresh safe/outdated content. `--diff` adds a unified diff, `--dry-run`
+/// suppresses writes, and `--force` overwrites locally modified content.
 pub fn run_skill_update(args: SkillArgs) -> Result<()> {
-    run_skill_install(args)
+    let ctx = context_from_env()?;
+    let (location, targets) = resolve_skill_targets(&ctx, &args)?;
+    if targets.is_empty() {
+        println!("No agent targets selected — nothing to do.");
+        return Ok(());
+    }
+
+    let mut changed_names: Vec<&str> = Vec::new();
+    for target in &targets {
+        let Some(skill_dir) = target.resolved_skill_dir(&ctx, location) else {
+            println!(
+                "{}: skills not supported for --location={}",
+                target.display_name(),
+                location.as_str()
+            );
+            continue;
+        };
+        let preview = skill::preview_update_for_dir(&skill_dir, args.force);
+        println!(
+            "{}",
+            skill_update_preview_line(target.display_name(), &preview, args.dry_run)
+        );
+        if args.show_diff
+            && let Some(diff) = preview.unified_diff.as_deref()
+        {
+            print!("{diff}");
+        }
+
+        if args.dry_run {
+            if preview.decision == skill::SkillUpdateDecision::Update {
+                changed_names.push(target.display_name());
+            }
+            continue;
+        }
+
+        let result = target.install_skill(&ctx, location, args.force);
+        if result
+            .files
+            .iter()
+            .any(|file| matches!(file.action, FileAction::Created | FileAction::Updated))
+        {
+            changed_names.push(target.display_name());
+        }
+        report_write_result(target.display_name(), &ctx, &result);
+    }
+
+    if args.dry_run {
+        if changed_names.is_empty() {
+            println!("\nDry run: no skill files would change.");
+        } else {
+            println!(
+                "\nDry run: would update the CodeGraph skill for {} agent{}: {}.",
+                changed_names.len(),
+                if changed_names.len() > 1 { "s" } else { "" },
+                changed_names.join(", ")
+            );
+        }
+    } else if !changed_names.is_empty() {
+        println!(
+            "\nUpdated the CodeGraph skill for {} agent{}: {}.",
+            changed_names.len(),
+            if changed_names.len() > 1 { "s" } else { "" },
+            changed_names.join(", ")
+        );
+    }
+    Ok(())
 }
 
 /// `codegraph skill uninstall`. Removes the installed skill from each resolved
@@ -443,7 +512,7 @@ pub fn run_skill_uninstall(args: SkillArgs) -> Result<()> {
 /// `codegraph skill status`. Prints one line per target: "up to date" /
 /// "locally modified" / "outdated" / "not installed" / "not supported".
 pub fn run_skill_status(args: SkillArgs) -> Result<()> {
-    let _ = (args.yes, args.force);
+    let _ = (args.yes, args.force, args.show_diff, args.dry_run);
     let ctx = context_from_env()?;
     let (location, targets) = resolve_skill_targets(&ctx, &args)?;
     if targets.is_empty() {
@@ -461,7 +530,67 @@ pub fn run_skill_status(args: SkillArgs) -> Result<()> {
 /// Map a [`SkillStatusReport`] to its single printed line. Extracted so the
 /// label mapping is unit-testable without filesystem state.
 fn skill_status_line(report: &SkillStatusReport) -> String {
-    format!("{}: {}", report.display_name, report.label())
+    let current = skill::EMBEDDED_VERSION;
+    match report.status {
+        None => format!("{}: not supported", report.display_name),
+        Some(skill::SkillStatus::NotInstalled) => {
+            format!(
+                "{}: not installed (embedded {current})",
+                report.display_name
+            )
+        }
+        Some(skill::SkillStatus::UpToDate) => {
+            format!("{}: up to date ({current})", report.display_name)
+        }
+        Some(skill::SkillStatus::Outdated) => format!(
+            "{}: outdated ({} -> {current})",
+            report.display_name,
+            report.installed_version.as_deref().unwrap_or("unknown")
+        ),
+        Some(skill::SkillStatus::LocallyModified) => format!(
+            "{}: locally modified (base {}; embedded {current})",
+            report.display_name,
+            report.installed_version.as_deref().unwrap_or("unknown")
+        ),
+    }
+}
+
+fn skill_update_preview_line(
+    display_name: &str,
+    preview: &skill::SkillUpdatePreview,
+    dry_run: bool,
+) -> String {
+    let current = skill::EMBEDDED_VERSION;
+    let change = format!("+{} -{}", preview.added_lines, preview.removed_lines);
+    let action = if dry_run { "would update" } else { "updating" };
+    match (preview.decision, preview.status) {
+        (skill::SkillUpdateDecision::Unchanged, _) => {
+            format!("{display_name}: up to date ({current})")
+        }
+        (skill::SkillUpdateDecision::LocallyModified, _) => format!(
+            "{display_name}: locally modified (base {}; embedded {current}; {change}) — skipped; use --force to overwrite",
+            preview.installed_version.as_deref().unwrap_or("unknown")
+        ),
+        (skill::SkillUpdateDecision::Update, skill::SkillStatus::NotInstalled) => {
+            let action = if dry_run {
+                "would install"
+            } else {
+                "installing"
+            };
+            format!("{display_name}: {action} embedded skill {current} ({change})")
+        }
+        (skill::SkillUpdateDecision::Update, skill::SkillStatus::LocallyModified) => format!(
+            "{display_name}: {action} locally modified skill (base {}; embedded {current}; {change})",
+            preview.installed_version.as_deref().unwrap_or("unknown")
+        ),
+        (skill::SkillUpdateDecision::Update, skill::SkillStatus::UpToDate) => {
+            format!("{display_name}: {action} {current} -> {current} ({change})")
+        }
+        (skill::SkillUpdateDecision::Update, skill::SkillStatus::Outdated) => format!(
+            "{display_name}: {action} {} -> {current} ({change})",
+            preview.installed_version.as_deref().unwrap_or("unknown")
+        ),
+    }
 }
 
 /// Render the per-file log lines for an install result. Ports the loop in
@@ -551,34 +680,48 @@ mod tests {
 
     #[test]
     fn skill_status_line_renders_each_state() {
-        // Given a supported target reporting each status, Then the line is
-        // "<name>: <label>"; an unsupported report yields "not supported".
-        let supported = |status| SkillStatusReport {
+        // Given a supported target reporting each status, Then the line carries
+        // the installed/embedded version context; unsupported stays concise.
+        let supported = |status, installed_version: Option<&str>| SkillStatusReport {
             display_name: "Claude Code",
             location: Location::Global,
             status: Some(status),
+            installed_version: installed_version.map(str::to_string),
         };
         assert_eq!(
-            skill_status_line(&supported(skill::SkillStatus::UpToDate)),
-            "Claude Code: up to date"
+            skill_status_line(&supported(skill::SkillStatus::UpToDate, None)),
+            format!("Claude Code: up to date ({})", skill::EMBEDDED_VERSION)
         );
         assert_eq!(
-            skill_status_line(&supported(skill::SkillStatus::LocallyModified)),
-            "Claude Code: locally modified"
+            skill_status_line(&supported(
+                skill::SkillStatus::LocallyModified,
+                Some("0.40.1")
+            )),
+            format!(
+                "Claude Code: locally modified (base 0.40.1; embedded {})",
+                skill::EMBEDDED_VERSION
+            )
         );
         assert_eq!(
-            skill_status_line(&supported(skill::SkillStatus::Outdated)),
-            "Claude Code: outdated"
+            skill_status_line(&supported(skill::SkillStatus::Outdated, Some("0.40.1"))),
+            format!(
+                "Claude Code: outdated (0.40.1 -> {})",
+                skill::EMBEDDED_VERSION
+            )
         );
         assert_eq!(
-            skill_status_line(&supported(skill::SkillStatus::NotInstalled)),
-            "Claude Code: not installed"
+            skill_status_line(&supported(skill::SkillStatus::NotInstalled, None)),
+            format!(
+                "Claude Code: not installed (embedded {})",
+                skill::EMBEDDED_VERSION
+            )
         );
         assert_eq!(
             skill_status_line(&SkillStatusReport {
                 display_name: "Hermes Agent",
                 location: Location::Local,
                 status: None,
+                installed_version: None,
             }),
             "Hermes Agent: not supported"
         );
@@ -796,6 +939,8 @@ mod tests {
             location: Some("global".to_string()),
             yes: true,
             force: false,
+            show_diff: false,
+            dry_run: false,
         })
         .unwrap();
         run_skill_status(SkillArgs {
@@ -803,6 +948,8 @@ mod tests {
             location: Some("global".to_string()),
             yes: false,
             force: false,
+            show_diff: false,
+            dry_run: false,
         })
         .unwrap();
         run_skill_uninstall(SkillArgs {
@@ -810,6 +957,8 @@ mod tests {
             location: Some("global".to_string()),
             yes: true,
             force: false,
+            show_diff: false,
+            dry_run: false,
         })
         .unwrap();
 

@@ -191,20 +191,25 @@ pub trait AgentTarget {
         }
     }
 
-    /// Report the installed-skill status. When unsupported, the report's
-    /// `unsupported` flag is set; otherwise delegates to
-    /// [`skill::status_for_dir`].
+    /// Report the installed-skill status. Unsupported targets return a report
+    /// whose status is `None`; supported targets delegate to
+    /// [`skill::status_details_for_dir`].
     fn skill_status(&self, ctx: &InstallContext, loc: Location) -> SkillStatusReport {
         match self.resolved_skill_dir(ctx, loc) {
-            Some(dir) => SkillStatusReport {
-                display_name: self.display_name(),
-                location: loc,
-                status: Some(skill::status_for_dir(&dir)),
-            },
+            Some(dir) => {
+                let details = skill::status_details_for_dir(&dir);
+                SkillStatusReport {
+                    display_name: self.display_name(),
+                    location: loc,
+                    status: Some(details.status),
+                    installed_version: details.installed_version,
+                }
+            }
             None => SkillStatusReport {
                 display_name: self.display_name(),
                 location: loc,
                 status: None,
+                installed_version: None,
             },
         }
     }
@@ -244,6 +249,8 @@ pub struct SkillStatusReport {
     #[allow(dead_code)]
     pub location: Location,
     pub status: Option<skill::SkillStatus>,
+    /// Sidecar-recorded version for outdated or locally modified content.
+    pub installed_version: Option<String>,
 }
 
 impl SkillStatusReport {
@@ -251,15 +258,6 @@ impl SkillStatusReport {
     #[allow(dead_code)]
     pub fn is_unsupported(&self) -> bool {
         self.status.is_none()
-    }
-
-    /// Human-readable label: the underlying [`skill::SkillStatus::label`] when
-    /// supported, else `"not supported"`.
-    pub fn label(&self) -> &'static str {
-        match self.status {
-            Some(status) => status.label(),
-            None => "not supported",
-        }
     }
 }
 
@@ -470,7 +468,7 @@ mod tests {
 
         let status = target.skill_status(&ctx, Location::Global);
         assert!(status.is_unsupported());
-        assert_eq!(status.label(), "not supported");
+        assert!(status.status.is_none());
 
         let _ = fs::remove_dir_all(base);
     }

@@ -99,8 +99,11 @@ irm https://raw.githubusercontent.com/sunerpy/codegraph-rust/main/scripts/instal
 # 回退方案 —— 从源码构建（仅当你已有 Rust 工具链时）
 cargo install --git https://github.com/sunerpy/codegraph-rust codegraph-rs   # 二进制：`codegraph`
 
-codegraph init  /path/to/project     # 建立索引库（.codegraph/）
-codegraph index /path/to/project     # 解析 + 构建图
+codegraph status /path/to/project --json # 先检查索引健康状态
+codegraph init /path/to/project          # 创建首个可用索引
+codegraph sync /path/to/project          # 普通新增、修改、删除文件
+codegraph index /path/to/project         # 有意执行完整重建
+codegraph index --force /path/to/project # 仅在诊断明确要求时使用
 ```
 
 **作为 MCP 服务器使用（推荐给代理）**，它通过 stdio 走 MCP：
@@ -215,13 +218,16 @@ codegraph install --target=auto --local          # 项目级配置
 除了写入 MCP 服务器配置，CodeGraph 还可以把一个 `SKILL.md` 直接安装到每个代理的
 技能目录中。该技能教会代理如何将 CodeGraph 用于代码研究与项目初始化：在 grep/read
 之前优先调用 `codegraph_explore`，对已索引的源码用 `codegraph_node` 代替直接读文件，
-以及在尚未建立 `.codegraph/` 索引时自动运行 `codegraph init`。
+先用 `codegraph status` 判断索引状态，在没有可用索引时运行 `codegraph init`，
+普通手动追赶则使用 `codegraph sync`。
 
 ```bash
 codegraph skill install --yes                         # 安装到所有已检测到的代理（全局）
 codegraph skill install --target=claude,cursor --yes  # 显式指定代理列表
 codegraph skill install --target=auto --local         # 写入项目级技能目录
-codegraph skill update                                # 若未被手动修改则刷新技能文件
+codegraph skill update                                # 显示版本/+/-摘要后刷新
+codegraph skill update --diff                         # 同时显示统一内容差异
+codegraph skill update --dry-run --diff               # 仅预览，不写文件
 codegraph skill update --force                        # 强制覆盖，即使已被本地修改
 codegraph skill uninstall --target=claude --yes       # 从单个代理中移除
 codegraph skill status                                # 查看所有已检测代理的安装状态
@@ -234,7 +240,10 @@ Hermes Agent、Gemini CLI、Antigravity IDE、Kiro、Trae、Qoder）。默认位
 **更新语义。** `skill update` 用 git blob SHA-1 对比已安装文件与内嵌版本的内容哈希。
 未被修改的文件会自动刷新；经过手动编辑的文件会被跳过并提示"locally modified"（可传
 `--force` 强制覆盖）。紧邻 `SKILL.md` 的附属文件 `.codegraph-skill.json` 记录了安装
-时的哈希值，更新检查据此区分"已过时"与"本地修改"两种状态。
+时的哈希值，更新检查据此区分"已过时"与"本地修改"两种状态。写入前，
+`skill update` 会显示已安装版本到内嵌版本的迁移，以及确定性的新增/删除行数；
+`--diff` 输出统一差异，`--dry-run` 输出相同预览但不修改文件。`skill status`
+也会显示版本来源，例如 `outdated (0.40.1 -> 0.47.0)`。
 
 完整参考（含各代理技能路径）：[`../cli.md`](../cli.md)。
 

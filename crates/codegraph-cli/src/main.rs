@@ -568,6 +568,12 @@ enum SkillAction {
         local: bool,
         #[arg(long)]
         force: bool,
+        /// Show a unified installed-versus-embedded diff before writing.
+        #[arg(long)]
+        diff: bool,
+        /// Preview version and content changes without writing files.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Remove the installed CodeGraph skill.
     Uninstall {
@@ -766,6 +772,8 @@ fn run(cli: Cli) -> Result<()> {
                 location: location_flag(location, global, local),
                 yes,
                 force: false,
+                show_diff: false,
+                dry_run: false,
             }),
             SkillAction::Update {
                 target,
@@ -773,11 +781,15 @@ fn run(cli: Cli) -> Result<()> {
                 global,
                 local,
                 force,
+                diff,
+                dry_run,
             } => installer::run_skill_update(installer::SkillArgs {
                 target,
                 location: location_flag(location, global, local),
                 yes: false,
                 force,
+                show_diff: diff,
+                dry_run,
             }),
             SkillAction::Uninstall {
                 target,
@@ -790,6 +802,8 @@ fn run(cli: Cli) -> Result<()> {
                 location: location_flag(location, global, local),
                 yes,
                 force: false,
+                show_diff: false,
+                dry_run: false,
             }),
             SkillAction::Status {
                 target,
@@ -801,6 +815,8 @@ fn run(cli: Cli) -> Result<()> {
                 location: location_flag(location, global, local),
                 yes: false,
                 force: false,
+                show_diff: false,
+                dry_run: false,
             }),
         },
         Command::Http { action } => match action {
