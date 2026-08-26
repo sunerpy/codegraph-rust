@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.47.0](https://github.com/sunerpy/codegraph-rust/compare/v0.46.3...v0.47.0) (2026-08-26)
+
+
+### Features
+
+* **cli:** preview agent skill updates ([#231](https://github.com/sunerpy/codegraph-rust/issues/231)) ([f40afdc](https://github.com/sunerpy/codegraph-rust/commit/f40afdcc7132675e30b5ae24ec46792381f7f72f))
+
 ## [0.46.3](https://github.com/sunerpy/codegraph-rust/compare/v0.46.2...v0.46.3) (2026-08-23)
 
 
