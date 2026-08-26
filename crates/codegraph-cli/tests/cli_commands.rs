@@ -112,6 +112,11 @@ fn version_prints_semver_line() {
         "version output must start with `codegraph `: {}",
         run.stdout
     );
+    assert!(
+        !run.stderr.contains("logger initialized"),
+        "ordinary CLI startup must not emit a logger banner: {}",
+        run.stderr
+    );
 }
 
 #[test]

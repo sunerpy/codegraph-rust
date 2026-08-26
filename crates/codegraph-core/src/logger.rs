@@ -211,7 +211,6 @@ pub fn init_logger(cfg: &LoggerConfig) -> Result<Option<WorkerGuard>, Box<dyn st
         .with(file_layer)
         .init();
 
-    tracing::info!(level = %base_level, "logger initialized");
     Ok(guard)
 }
 
