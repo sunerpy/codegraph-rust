@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.47.1](https://github.com/sunerpy/codegraph-rust/compare/v0.47.0...v0.47.1) (2026-08-26)
+
+
+### Bug Fixes
+
+* **cli:** suppress logger startup banner ([#233](https://github.com/sunerpy/codegraph-rust/issues/233)) ([0f4de74](https://github.com/sunerpy/codegraph-rust/commit/0f4de74c9c8ee0eed06586db81497bc8dfc0b3a1))
+
 ## [0.47.0](https://github.com/sunerpy/codegraph-rust/compare/v0.46.3...v0.47.0) (2026-08-26)
 
 
