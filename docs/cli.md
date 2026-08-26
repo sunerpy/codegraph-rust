@@ -20,7 +20,7 @@
 | `uninstall`       | Remove codegraph from agent configs (inverse of `install`)                                | `-t/--target`, `-l/--location`, `--global`, `--local`, `-y/--yes`                                                                          |
 | `skill`           | Install / update / uninstall / check the embedded agent skill                             | `<action>` (install, update, uninstall, status)                                                                                            |
 | `skill install`   | Write the embedded SKILL.md into each agent's skill directory                             | `-t/--target`, `--global`, `--local`, `-y/--yes`                                                                                           |
-| `skill update`    | Refresh the installed skill when unchanged by the user                                    | `-t/--target`, `--global`, `--local`, `--force`                                                                                            |
+| `skill update`    | Preview versions/line counts and refresh the installed skill                              | `-t/--target`, `--global`, `--local`, `--force`, `--diff`, `--dry-run`                                                                     |
 | `skill uninstall` | Remove the skill from agent skill directories                                             | `-t/--target`, `--global`, `--local`, `-y/--yes`                                                                                           |
 | `skill status`    | Report install state per agent (up to date / locally modified / outdated / not installed) | `-t/--target`, `--global`, `--local`                                                                                                       |
 | `init`            | Initialize `.codegraph/` and run the first full index                                     | `[path]`, `-t/--target` (also write project-level MCP config; default `none`)                                                              |
@@ -167,8 +167,9 @@ codegraph init /path/to/proj -t auto  # index that project + wire detected edito
 `codegraph skill` installs a bundled `SKILL.md` into each supported agent's skill
 directory. The skill teaches the agent to use CodeGraph for code research and
 project onboarding: reach for `codegraph_explore` before grep/read, use
-`codegraph_node` instead of a plain file read on indexed source, and run
-`codegraph init` when no `.codegraph/` index is present.
+`codegraph_node` instead of a plain file read on indexed source, inspect
+`codegraph status` before lifecycle changes, run `codegraph init` when no usable
+index exists, and use `codegraph sync` for ordinary manual catch-up.
 
 Four actions:
 
@@ -176,7 +177,9 @@ Four actions:
 codegraph skill install   --yes                         # install into all detected agents (global)
 codegraph skill install   --target=claude,cursor --yes  # explicit target list
 codegraph skill install   --target=auto --local         # project-local skill dirs
-codegraph skill update                                  # refresh if unchanged by user
+codegraph skill update                                  # version/+/- summary, then refresh
+codegraph skill update    --diff                        # also show unified content diff
+codegraph skill update    --dry-run --diff              # preview without writing files
 codegraph skill update    --force                       # overwrite even locally-modified files
 codegraph skill uninstall --target=claude --yes         # remove from one agent
 codegraph skill status                                  # report state for all detected agents
@@ -225,6 +228,17 @@ version using a git blob SHA-1:
 A small sidecar file (`.codegraph-skill.json`) next to `SKILL.md` records the
 installed hash, version, and timestamp. Deleting the sidecar causes the update
 check to treat the file as locally modified (conservative).
+
+Before any write, `skill update` prints the installed-to-embedded version
+transition and deterministic added/removed line counts. Add `--diff` for a
+three-context unified diff. Add `--dry-run` to print the identical preview while
+leaving both `SKILL.md` and its sidecar untouched. `skill status` includes the
+same provenance, for example:
+
+```text
+Codex CLI: outdated (0.40.1 -> 0.47.0)
+opencode: locally modified (base 0.40.1; embedded 0.47.0)
+```
 
 ---
 

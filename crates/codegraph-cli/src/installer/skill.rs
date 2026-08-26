@@ -27,6 +27,9 @@ use super::types::{FileAction, FileWrite, WriteResult};
 /// `installer` → `src` → `codegraph-cli` → `crates` → repo root.
 pub const SKILL_MD: &str = include_str!("../../../../skills/codegraph/SKILL.md");
 
+/// CLI version that owns the embedded skill.
+pub const EMBEDDED_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// The skill folder name (matches the SKILL.md frontmatter `name:`).
 pub const SKILL_DIR_NAME: &str = "codegraph";
 
@@ -70,7 +73,7 @@ impl SkillMarker {
     fn for_embedded() -> Self {
         Self {
             hash: git_blob_sha1(SKILL_MD.as_bytes()),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: EMBEDDED_VERSION.to_string(),
             installed_at: now_rfc3339(),
         }
     }
@@ -168,16 +171,23 @@ pub enum SkillStatus {
     Outdated,
 }
 
-impl SkillStatus {
-    /// Human-readable label.
-    pub fn label(self) -> &'static str {
-        match self {
-            SkillStatus::NotInstalled => "not installed",
-            SkillStatus::UpToDate => "up to date",
-            SkillStatus::LocallyModified => "locally modified",
-            SkillStatus::Outdated => "outdated",
-        }
-    }
+/// Status plus the version provenance needed by human-facing reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillStatusDetails {
+    pub status: SkillStatus,
+    /// Version recorded by the sidecar. `None` when absent or unknown.
+    pub installed_version: Option<String>,
+}
+
+/// Read-only plan for one `codegraph skill update` target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillUpdatePreview {
+    pub decision: SkillUpdateDecision,
+    pub status: SkillStatus,
+    pub installed_version: Option<String>,
+    pub added_lines: usize,
+    pub removed_lines: usize,
+    pub unified_diff: Option<String>,
 }
 
 /// The skill folder for a given parent dir: `<parent>/codegraph`.
@@ -330,20 +340,242 @@ pub fn uninstall_from_dir(skill_parent_dir: &Path) -> WriteResult {
     }
 }
 
-/// Report the installed-skill status for one directory.
-pub fn status_for_dir(skill_parent_dir: &Path) -> SkillStatus {
+/// Report installed-skill status with marker version provenance.
+pub fn status_details_for_dir(skill_parent_dir: &Path) -> SkillStatusDetails {
     let (installed, sidecar) = read_installed(skill_parent_dir);
+    status_details_from_parts(installed.as_deref(), sidecar.as_ref())
+}
+
+fn status_details_from_parts(
+    installed: Option<&str>,
+    sidecar: Option<&SkillMarker>,
+) -> SkillStatusDetails {
     let Some(installed) = installed else {
-        return SkillStatus::NotInstalled;
+        return SkillStatusDetails {
+            status: SkillStatus::NotInstalled,
+            installed_version: None,
+        };
     };
     let embedded_hash = git_blob_sha1(SKILL_MD.as_bytes());
     let installed_hash = git_blob_sha1(installed.as_bytes());
     if installed_hash == embedded_hash {
-        return SkillStatus::UpToDate;
+        return SkillStatusDetails {
+            status: SkillStatus::UpToDate,
+            installed_version: Some(EMBEDDED_VERSION.to_string()),
+        };
     }
-    match sidecar {
-        Some(marker) if marker.hash == installed_hash => SkillStatus::Outdated,
-        _ => SkillStatus::LocallyModified,
+    SkillStatusDetails {
+        status: match sidecar {
+            Some(marker) if marker.hash == installed_hash => SkillStatus::Outdated,
+            _ => SkillStatus::LocallyModified,
+        },
+        installed_version: sidecar.map(|marker| marker.version.clone()),
+    }
+}
+
+/// Build a read-only update preview for one skill directory.
+pub fn preview_update_for_dir(skill_parent_dir: &Path, force: bool) -> SkillUpdatePreview {
+    let (installed, sidecar) = read_installed(skill_parent_dir);
+    let decision = decide(installed.as_deref(), sidecar.as_ref(), force);
+    let details = status_details_from_parts(installed.as_deref(), sidecar.as_ref());
+    let (added_lines, removed_lines, unified_diff) = match installed.as_deref() {
+        Some(content) if content != SKILL_MD => {
+            let old_label = match details.installed_version.as_deref() {
+                Some(version) => format!("installed CodeGraph skill {version}"),
+                None => "installed CodeGraph skill (unknown version)".to_string(),
+            };
+            let new_label = format!("embedded CodeGraph skill {EMBEDDED_VERSION}");
+            let rendered = render_unified_diff(content, SKILL_MD, &old_label, &new_label);
+            (
+                rendered.added_lines,
+                rendered.removed_lines,
+                Some(rendered.text),
+            )
+        }
+        None => {
+            let new_label = format!("embedded CodeGraph skill {EMBEDDED_VERSION}");
+            let rendered = render_unified_diff("", SKILL_MD, "/dev/null", &new_label);
+            (
+                rendered.added_lines,
+                rendered.removed_lines,
+                Some(rendered.text),
+            )
+        }
+        Some(_) => (0, 0, None),
+    };
+
+    SkillUpdatePreview {
+        decision,
+        status: details.status,
+        installed_version: details.installed_version,
+        added_lines,
+        removed_lines,
+        unified_diff,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffKind {
+    Equal,
+    Remove,
+    Add,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiffLine<'a> {
+    kind: DiffKind,
+    text: &'a str,
+    old_line: usize,
+    new_line: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RenderedDiff {
+    text: String,
+    added_lines: usize,
+    removed_lines: usize,
+}
+
+/// Deterministic line-based unified diff. Skill files are small, so the
+/// quadratic LCS table is bounded and keeps the shipped binary independent of
+/// an external `diff` command on Windows and minimal containers.
+fn render_unified_diff(old: &str, new: &str, old_label: &str, new_label: &str) -> RenderedDiff {
+    let old_lines: Vec<&str> = if old.is_empty() {
+        Vec::new()
+    } else {
+        old.split_inclusive('\n').collect()
+    };
+    let new_lines: Vec<&str> = if new.is_empty() {
+        Vec::new()
+    } else {
+        new.split_inclusive('\n').collect()
+    };
+    let old_len = old_lines.len();
+    let new_len = new_lines.len();
+    let width = new_len + 1;
+    let mut lcs = vec![0_usize; (old_len + 1) * width];
+    let at = |i: usize, j: usize| i * width + j;
+
+    for i in (0..old_len).rev() {
+        for j in (0..new_len).rev() {
+            lcs[at(i, j)] = if old_lines[i] == new_lines[j] {
+                1 + lcs[at(i + 1, j + 1)]
+            } else {
+                lcs[at(i + 1, j)].max(lcs[at(i, j + 1)])
+            };
+        }
+    }
+
+    let mut ops = Vec::with_capacity(old_len + new_len);
+    let (mut i, mut j, mut old_line, mut new_line) = (0, 0, 1, 1);
+    while i < old_len || j < new_len {
+        let (kind, text) = if i < old_len && j < new_len && old_lines[i] == new_lines[j] {
+            (DiffKind::Equal, old_lines[i])
+        } else if i < old_len && (j == new_len || lcs[at(i + 1, j)] >= lcs[at(i, j + 1)]) {
+            (DiffKind::Remove, old_lines[i])
+        } else {
+            (DiffKind::Add, new_lines[j])
+        };
+        ops.push(DiffLine {
+            kind,
+            text,
+            old_line,
+            new_line,
+        });
+        match kind {
+            DiffKind::Equal => {
+                i += 1;
+                j += 1;
+                old_line += 1;
+                new_line += 1;
+            }
+            DiffKind::Remove => {
+                i += 1;
+                old_line += 1;
+            }
+            DiffKind::Add => {
+                j += 1;
+                new_line += 1;
+            }
+        }
+    }
+
+    let added_lines = ops.iter().filter(|line| line.kind == DiffKind::Add).count();
+    let removed_lines = ops
+        .iter()
+        .filter(|line| line.kind == DiffKind::Remove)
+        .count();
+    let mut text = format!("--- {old_label}\n+++ {new_label}\n");
+    if added_lines == 0 && removed_lines == 0 {
+        return RenderedDiff {
+            text,
+            added_lines,
+            removed_lines,
+        };
+    }
+
+    const CONTEXT: usize = 3;
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for index in ops
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| (line.kind != DiffKind::Equal).then_some(index))
+    {
+        let start = index.saturating_sub(CONTEXT);
+        let end = (index + CONTEXT + 1).min(ops.len());
+        match ranges.last_mut() {
+            Some((_, current_end)) if start <= *current_end => {
+                *current_end = (*current_end).max(end);
+            }
+            _ => ranges.push((start, end)),
+        }
+    }
+
+    for (start, end) in ranges {
+        let hunk = &ops[start..end];
+        let old_count = hunk
+            .iter()
+            .filter(|line| line.kind != DiffKind::Add)
+            .count();
+        let new_count = hunk
+            .iter()
+            .filter(|line| line.kind != DiffKind::Remove)
+            .count();
+        let old_start = if old_count == 0 {
+            hunk[0].old_line.saturating_sub(1)
+        } else {
+            hunk[0].old_line
+        };
+        let new_start = if new_count == 0 {
+            hunk[0].new_line.saturating_sub(1)
+        } else {
+            hunk[0].new_line
+        };
+        text.push_str(&format!(
+            "@@ -{old_start},{old_count} +{new_start},{new_count} @@\n"
+        ));
+        for line in hunk {
+            let prefix = match line.kind {
+                DiffKind::Equal => ' ',
+                DiffKind::Remove => '-',
+                DiffKind::Add => '+',
+            };
+            text.push(prefix);
+            let has_newline = line.text.ends_with('\n');
+            let visible = line.text.strip_suffix('\n').unwrap_or(line.text);
+            let visible = visible.strip_suffix('\r').unwrap_or(visible);
+            text.push_str(visible);
+            text.push('\n');
+            if !has_newline {
+                text.push_str("\\ No newline at end of file\n");
+            }
+        }
+    }
+
+    RenderedDiff {
+        text,
+        added_lines,
+        removed_lines,
     }
 }
 
@@ -390,10 +622,24 @@ mod tests {
     #[test]
     fn skill_md_is_embedded_and_well_formed() {
         assert!(SKILL_MD.starts_with("---\n"), "must start with YAML fence");
+        let front_matter = SKILL_MD[4..]
+            .split_once("\n---")
+            .map(|(front_matter, _)| front_matter)
+            .expect("must close the YAML front-matter fence");
         assert!(
-            SKILL_MD.contains("name: codegraph"),
+            front_matter.lines().any(|line| line == "name: codegraph"),
             "must declare the codegraph skill name"
         );
+        let description = front_matter
+            .lines()
+            .position(|line| line == "description: >")
+            .expect("must declare a folded description");
+        for line in front_matter.lines().skip(description + 1) {
+            assert!(
+                line.is_empty() || line.starts_with("  "),
+                "description continuation must stay indented YAML, got {line:?}"
+            );
+        }
     }
 
     // --- Codex MAX_DESCRIPTION_LEN guard --------------------------------------
@@ -663,6 +909,61 @@ mod tests {
         let _ = fs::remove_dir_all(&parent);
     }
 
+    // --- update preview + unified diff ---------------------------------------
+
+    #[test]
+    fn unified_diff_reports_stable_hunks_and_counts() {
+        let diff = render_unified_diff(
+            "alpha\nold\nomega\n",
+            "alpha\nnew\nomega\n",
+            "installed 1.0.0",
+            "embedded 2.0.0",
+        );
+        assert_eq!(diff.added_lines, 1);
+        assert_eq!(diff.removed_lines, 1);
+        assert!(
+            diff.text
+                .starts_with("--- installed 1.0.0\n+++ embedded 2.0.0\n@@ -1,3 +1,3 @@\n")
+        );
+        assert!(diff.text.contains("-old\n"));
+        assert!(diff.text.contains("+new\n"));
+    }
+
+    #[test]
+    fn unified_diff_reports_missing_final_newline() {
+        let diff = render_unified_diff("same", "same\n", "installed", "embedded");
+        assert_eq!(diff.added_lines, 1);
+        assert_eq!(diff.removed_lines, 1);
+        assert!(diff.text.contains("\\ No newline at end of file\n"));
+    }
+
+    #[test]
+    fn outdated_preview_carries_versions_and_never_writes() {
+        let parent = temp_parent("preview-outdated");
+        let drifted = "previously embedded skill\n";
+        fs::create_dir_all(skill_dir(&parent)).unwrap();
+        fs::write(skill_file(&parent), drifted).unwrap();
+        let marker = SkillMarker {
+            hash: git_blob_sha1(drifted.as_bytes()),
+            version: "0.40.1".into(),
+            installed_at: "t".into(),
+        };
+        fs::write(sidecar_file(&parent), marker.to_pretty_json()).unwrap();
+
+        let preview = preview_update_for_dir(&parent, false);
+        assert_eq!(preview.decision, SkillUpdateDecision::Update);
+        assert_eq!(preview.status, SkillStatus::Outdated);
+        assert_eq!(preview.installed_version.as_deref(), Some("0.40.1"));
+        assert!(preview.added_lines > 0);
+        assert_eq!(preview.removed_lines, 1);
+        let diff = preview.unified_diff.expect("outdated preview has a diff");
+        assert!(diff.contains("--- installed CodeGraph skill 0.40.1"));
+        assert!(diff.contains(&format!("+++ embedded CodeGraph skill {EMBEDDED_VERSION}")));
+        assert_eq!(fs::read_to_string(skill_file(&parent)).unwrap(), drifted);
+
+        let _ = fs::remove_dir_all(&parent);
+    }
+
     // --- uninstall_from_dir ---------------------------------------------------
 
     #[test]
@@ -697,14 +998,23 @@ mod tests {
     #[test]
     fn status_reports_lifecycle_states() {
         let parent = temp_parent("status");
-        assert_eq!(status_for_dir(&parent), SkillStatus::NotInstalled);
+        assert_eq!(
+            status_details_for_dir(&parent).status,
+            SkillStatus::NotInstalled
+        );
 
         write_skill_to_dir(&parent, false);
-        assert_eq!(status_for_dir(&parent), SkillStatus::UpToDate);
+        assert_eq!(
+            status_details_for_dir(&parent).status,
+            SkillStatus::UpToDate
+        );
 
         // User edit, no provenance match ⇒ LocallyModified.
         fs::write(skill_file(&parent), "edited\n").unwrap();
-        assert_eq!(status_for_dir(&parent), SkillStatus::LocallyModified);
+        assert_eq!(
+            status_details_for_dir(&parent).status,
+            SkillStatus::LocallyModified
+        );
 
         // Provenance match against drifted content ⇒ Outdated.
         let drifted = "old embedded\n";
@@ -715,7 +1025,9 @@ mod tests {
             installed_at: "t".into(),
         };
         fs::write(sidecar_file(&parent), marker.to_pretty_json()).unwrap();
-        assert_eq!(status_for_dir(&parent), SkillStatus::Outdated);
+        let details = status_details_for_dir(&parent);
+        assert_eq!(details.status, SkillStatus::Outdated);
+        assert_eq!(details.installed_version.as_deref(), Some("0.0.1"));
 
         let _ = fs::remove_dir_all(&parent);
     }

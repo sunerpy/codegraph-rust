@@ -79,6 +79,14 @@ fn now_nanos() -> u128 {
         .as_nanos()
 }
 
+fn git_blob_sha1(content: &[u8]) -> String {
+    let mut hasher = sha1_smol::Sha1::new();
+    let header = format!("blob {}\0", content.len());
+    hasher.update(header.as_bytes());
+    hasher.update(content);
+    hasher.digest().to_string()
+}
+
 // --- Scenario 1: claude global install -------------------------------------
 
 #[test]
@@ -182,6 +190,51 @@ fn skill_update_no_change_reports_unchanged() {
         out.contains("Unchanged"),
         "re-running update with no change should report Unchanged:\n{out}"
     );
+}
+
+#[test]
+fn skill_update_dry_run_diff_previews_versions_without_writing() {
+    let fx = Fixture::new("update-preview");
+    let dir = fx.home.join(".claude/skills/codegraph");
+    let skill_md = dir.join("SKILL.md");
+    let sidecar = dir.join(".codegraph-skill.json");
+    fx.run(&["skill", "install", "--target=claude", "--global", "-y"]);
+
+    let previous = "previously embedded skill\n";
+    fs::write(&skill_md, previous).unwrap();
+    fs::write(
+        &sidecar,
+        format!(
+            "{{\n  \"hash\": \"{}\",\n  \"version\": \"0.40.1\",\n  \"installed_at\": \"t\"\n}}\n",
+            git_blob_sha1(previous.as_bytes())
+        ),
+    )
+    .unwrap();
+
+    let preview = fx.run(&[
+        "skill",
+        "update",
+        "--target=claude",
+        "--global",
+        "--dry-run",
+        "--diff",
+    ]);
+    assert!(preview.contains(&format!(
+        "Claude Code: would update 0.40.1 -> {}",
+        env!("CARGO_PKG_VERSION")
+    )));
+    assert!(preview.contains("--- installed CodeGraph skill 0.40.1"));
+    assert!(preview.contains("+++ embedded CodeGraph skill"));
+    assert!(preview.contains("-previously embedded skill"));
+    assert!(preview.contains("Dry run: would update"));
+    assert_eq!(fs::read_to_string(&skill_md).unwrap(), previous);
+
+    let applied = fx.run(&["skill", "update", "--target=claude", "--global"]);
+    assert!(applied.contains(&format!(
+        "Claude Code: updating 0.40.1 -> {}",
+        env!("CARGO_PKG_VERSION")
+    )));
+    assert_ne!(fs::read_to_string(&skill_md).unwrap(), previous);
 }
 
 // --- Scenario 5: locally-modified protection + --force restore -------------

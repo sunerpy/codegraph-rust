@@ -521,5 +521,5 @@ is still not treated as fresh, but it does **not** fabricate a banner entry for
 bytes the response never exposed. A response with no cited possibly-drifted bytes
 gets **no** banner, which is what makes "trust everything not listed" a real
 guarantee rather than an assumption — the agent instructions had described this
-banner before anything produced it. Re-run `codegraph index`, or wait for the
-watcher, if you see it on a hot codebase.
+banner before anything produced it. Run `codegraph sync`, or wait for the watcher,
+if you see it on a hot codebase; ordinary drift does not require a full rebuild.

@@ -7,7 +7,7 @@ description: >
   defined", tracing a call flow, onboarding/surveying an area, or
   whole-project analysis: "analyze the project", "explain the architecture",
   "what does this project do". Also trigger when asked to index/initialize a
-codebase, or when .codegraph/ is present. Prefer codegraph_* tools over
+  codebase, or when .codegraph/ is present. Prefer codegraph_* tools over
   grep, find, or Read on source files — one call returns verbatim source plus
   the structural graph, replacing dozens of grep+read round-trips. Chinese
   triggers: "分析项目代码", "分析这个仓库", "代码分析", "这个项目是做什么的".
@@ -29,22 +29,20 @@ reads. You get more accurate context in far fewer tokens and round-trips.
 
 ## Part A — Onboarding / Initialization
 
-### Detect a live index
+### Check index health first
 
-A project is indexed when a `.codegraph/` directory exists at its root. Check
-for it before reaching for grep or Read on source files:
+Do not infer readiness from the presence of `.codegraph/` alone: the directory
+may contain a current index, an interrupted build, or legacy/corrupt state.
+Use `codegraph_status` (MCP) or the CLI before deciding what to run:
 
+```bash
+codegraph status /path/to/project --json
 ```
-.codegraph/   ← present = indexed; absent = not yet indexed
-```
 
-A `.codegraph/` directory is an index left by `v0.40.4` or earlier. It is never
-read or migrated — treat it as NOT indexed and run `codegraph init`.
+The status result is authoritative for initialization, extraction compatibility,
+pending changes, and any explicit recovery command.
 
-Call `codegraph_status` to confirm the index is ready and to see how many
-files, nodes, and edges are loaded.
-
-### Create or refresh an index
+### Initialize, sync, or rebuild
 
 ```bash
 # Preferred: one-line installer (downloads prebuilt binary, no Rust needed)
@@ -55,12 +53,17 @@ irm https://raw.githubusercontent.com/sunerpy/codegraph-rust/main/scripts/instal
 # Fallback: build from source (requires Rust toolchain)
 cargo install --git https://github.com/sunerpy/codegraph-rust codegraph-rs
 
-# Index the project
-codegraph init  /path/to/project   # create .codegraph/ and run first index
-codegraph index /path/to/project   # re-index after large changes
+# Choose from status + intent
+codegraph init /path/to/project          # no usable index exists
+codegraph sync /path/to/project          # ordinary added/changed/deleted files
+codegraph index /path/to/project         # intentional full rebuild
+codegraph index --force /path/to/project # only when status/CLI explicitly prescribes it
 ```
 
-`codegraph init` is idempotent — safe to rerun.
+Use `sync` for routine manual catch-up. Supported extraction-version upgrades may
+also escalate through `sync`; do not jump to a forced rebuild merely because the
+CLI version changed. Follow the exact recovery command printed by `status` or the
+failed command.
 
 ### Start the MCP server
 
@@ -70,9 +73,9 @@ codegraph serve --mcp -p /path   # pin to a specific project
 ```
 
 The server speaks newline-delimited JSON-RPC over stdio. It watches the project
-directory and auto-updates the index when files change, with roughly a 1-second
-debounce lag. One server config works for all your projects — each just needs
-its own `codegraph index` run.
+directory and incrementally syncs file changes after a debounce. When the watcher
+is healthy, do not run a manual sync after every edit. Each project still needs
+one usable index, normally created with `codegraph init`.
 
 Auto-register into all detected agents (Claude Code, Cursor, Codex, opencode,
 Hermes, Gemini CLI, Antigravity, Kiro):
@@ -175,7 +178,9 @@ for accurate content. Every file **not** listed in the banner is fresh and can
 be trusted from the index without re-reading.
 
 `codegraph_status` also lists any pending files if you want a proactive check
-before starting a large research session.
+before starting a large research session. If the watcher is expected, wait for
+its debounce and re-check status. If no watcher is running, use `codegraph sync`;
+do not default to a full `codegraph index` for ordinary source changes.
 
 ---
 

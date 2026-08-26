@@ -121,8 +121,11 @@ irm https://raw.githubusercontent.com/sunerpy/codegraph-rust/main/scripts/instal
 # Fallback — build from source (only if you have a Rust toolchain)
 cargo install --git https://github.com/sunerpy/codegraph-rust codegraph-rs   # binary: `codegraph`
 
-codegraph init  /path/to/project     # create the index DB (.codegraph/)
-codegraph index /path/to/project     # parse + build the graph
+codegraph status /path/to/project --json # inspect index health first
+codegraph init /path/to/project          # create the first usable index
+codegraph sync /path/to/project          # ordinary added/changed/deleted files
+codegraph index /path/to/project         # intentional full rebuild
+codegraph index --force /path/to/project # only when diagnostics prescribe it
 ```
 
 > 中文：优先用上面的一键安装脚本（直接下载预编译二进制，无需 Rust 工具链、无需编译等待）；
@@ -250,13 +253,16 @@ Beyond wiring the MCP server, CodeGraph can install a `SKILL.md` directly into
 each agent's skill directory. The skill teaches your agent to use CodeGraph for
 code research and project onboarding — reach for `codegraph_explore` before
 grep/read, use `codegraph_node` instead of a plain file read on indexed source,
-and run `codegraph init` when no `.codegraph/` index is present yet.
+inspect `codegraph status`, run `codegraph init` when no usable index exists,
+and use `codegraph sync` for ordinary manual catch-up.
 
 ```bash
 codegraph skill install --yes              # install into all detected agents (global)
 codegraph skill install --target=claude,cursor --yes  # explicit list
 codegraph skill install --target=auto --local         # project-local skill dirs
-codegraph skill update                     # refresh skill if unchanged by user
+codegraph skill update                     # show version/+/- summary, then refresh
+codegraph skill update --diff              # also print the unified content diff
+codegraph skill update --dry-run --diff    # preview without writing files
 codegraph skill update --force             # overwrite even locally-modified files
 codegraph skill uninstall --target=claude --yes       # remove from one agent
 codegraph skill status                     # show state for all detected agents
@@ -273,6 +279,10 @@ against the embedded version. An unmodified file is refreshed automatically; a
 hand-edited file is skipped with a "locally modified" note (pass `--force` to
 overwrite). A small sidecar file (`.codegraph-skill.json`) records the installed
 hash so the update check can distinguish "outdated" from "locally modified".
+Before writing, update prints the installed-to-embedded version transition and
+added/removed line counts. `--diff` adds a deterministic unified diff;
+`--dry-run` prints the same preview without changing files. `skill status` also
+shows version provenance, for example `outdated (0.40.1 -> 0.47.0)`.
 
 Full reference including per-agent skill paths: [`docs/cli.md`](docs/cli.md).
 
