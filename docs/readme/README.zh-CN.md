@@ -18,7 +18,6 @@ SQLite 数据库（含 FTS5 检索索引），并通过 CLI 与 MCP stdio 服务
 ## 目录
 
 - [快速上手](#快速上手)
-- [从 v0.40.4 升级](#从-v0404-升级)
 - [安装](#安装)
 - [MCP 快速注册](#mcp-快速注册)
 - [安装 Agent 技能](#安装-agent-技能codegraph-skill)
@@ -56,20 +55,6 @@ codegraph init  /path/to/project                   # 创建 .codegraph/ 并执�
 codegraph search "<symbol>" -p /path/to/project    # 全文符号检索（`query` 为兼容别名）
 codegraph serve --mcp --path /path/to/project      # 为 AI 代理启动 MCP 服务器（--path 可选，默认 cwd）
 ```
-
----
-
-## 从 v0.40.4 升级
-
-按项目的索引目录仍为 `<project>/.codegraph/`。v0.40.4 数据库没有经过认证的索引状态槽，
-因此当前版本不会把它当作可读的当前索引。每个项目执行一次 `codegraph init`：CodeGraph
-会在持有独占索引租约时，仅替换陈旧的 `codegraph.db`、`codegraph.db-wal` 与
-`codegraph.db-shm`，然后发布全新的当前索引。
-
-项目配置继续位于 `.codegraph/config.toml` 与 `.codegraph/codegraph.json`；daemon
-会合文件（`daemon.pid`、`daemon.sock`、`daemon.log`）也位于 `.codegraph/`。
-`status --json` 为兼容保留 `legacyIndexPresent` 与 `legacyIndexPaths` 字段，但其值始终为
-`false` 与 `[]`。
 
 ---
 
