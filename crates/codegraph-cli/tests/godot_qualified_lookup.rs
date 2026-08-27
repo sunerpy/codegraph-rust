@@ -249,7 +249,7 @@ fn dotted_nonexistent_member_is_rejected() {
         "a nonexistent member must be rejected: stdout={stdout} stderr={err}"
     );
     assert!(
-        err.contains("not found") && err.contains("codegraph query DamageCalculator.nonexistent"),
+        err.contains("not found") && err.contains("codegraph search DamageCalculator.nonexistent"),
         "the rejection must be actionable: {err}"
     );
 }
@@ -269,7 +269,7 @@ fn dotted_non_class_receiver_is_rejected() {
         "a non-class receiver must be rejected: stdout={stdout} stderr={err}"
     );
     assert!(
-        err.contains("not found") && err.contains("codegraph query notaclass.calc_skill_damage"),
+        err.contains("not found") && err.contains("codegraph search notaclass.calc_skill_damage"),
         "the rejection must be actionable: {err}"
     );
 }

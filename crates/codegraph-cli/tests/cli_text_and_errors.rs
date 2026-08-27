@@ -117,6 +117,43 @@ fn query_text_with_results_prints_header_and_signature() {
 }
 
 #[test]
+fn search_is_listed_with_query_alias_in_help() {
+    let dir = TestDir::new("search-help");
+    let run = run_in(dir.path(), &["--help"]);
+    assert!(run.ok, "top-level help must succeed: {}", run.stderr);
+    assert!(
+        run.stdout
+            .lines()
+            .any(|line| line.contains("search") && line.contains("query")),
+        "help must expose canonical `search` with the `query` alias: {}",
+        run.stdout
+    );
+}
+
+#[test]
+fn search_and_query_alias_are_byte_identical() {
+    let dir = TestDir::new("search-query-alias");
+    let project = indexed_project(&dir);
+    let p = project.to_str().unwrap();
+    let search = run_in(dir.path(), &["search", "add", "-p", p, "--json"]);
+    let query = run_in(dir.path(), &["query", "add", "-p", p, "--json"]);
+    assert!(search.ok, "search must succeed: {}", search.stderr);
+    assert!(
+        query.ok,
+        "query compatibility alias must succeed: {}",
+        query.stderr
+    );
+    assert_eq!(
+        query.stdout, search.stdout,
+        "alias stdout must be identical"
+    );
+    assert_eq!(
+        query.stderr, search.stderr,
+        "alias stderr must be identical"
+    );
+}
+
+#[test]
 fn query_text_with_kind_filter_and_limit() {
     let dir = TestDir::new("query-kind");
     let project = indexed_project(&dir);
@@ -189,7 +226,7 @@ fn lookup_commands_refuse_fuzzy_only_symbol_matches() {
             run.stdout
         );
         assert!(
-            run.stderr.contains("not found") && run.stderr.contains("codegraph query ad"),
+            run.stderr.contains("not found") && run.stderr.contains("codegraph search ad"),
             "{command} must provide actionable fuzzy-search guidance: {}",
             run.stderr
         );
@@ -218,7 +255,7 @@ fn impact_text_output_and_not_found_branch() {
     );
     assert!(
         miss.stderr.contains("not found")
-            && miss.stderr.contains("codegraph query no_such_symbol_zzz"),
+            && miss.stderr.contains("codegraph search no_such_symbol_zzz"),
         "missing symbol must print actionable guidance: {}",
         miss.stderr
     );
