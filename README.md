@@ -54,11 +54,11 @@ curl -fsSL https://raw.githubusercontent.com/sunerpy/codegraph-rust/main/scripts
 irm https://raw.githubusercontent.com/sunerpy/codegraph-rust/main/scripts/install.ps1 | iex
 ```
 
-**Index a project and query it:**
+**Index a project and search it:**
 
 ```bash
 codegraph init  /path/to/project                 # create .codegraph/ and run the first index
-codegraph query "<symbol>" -p /path/to/project   # full-text search
+codegraph search "<symbol>" -p /path/to/project  # full-text symbol search (`query` is a legacy alias)
 codegraph serve --mcp --path /path/to/project    # MCP server (--path optional, defaults to cwd)
 ```
 
@@ -454,14 +454,15 @@ Claude prompt-hook: [`docs/mcp.md`](docs/mcp.md) and
 
 ## CLI Subcommands
 
-Core commands: `init`, `index`, `sync`, `query`, `files`, `status`, `serve`,
+Core commands: `init`, `index`, `sync`, `search`, `files`, `status`, `serve`,
 `callers`, `callees`, `impact`, `affected`, `check`, `export`, `unlock`.
 
 Agent / install commands: `install`, `uninstall`, `skill`, `self-update`,
 `completions` (`--install` sets up tab completion for bash/zsh/fish/powershell/elvish).
 
 Path convention: most traversal commands accept the project path as a positional
-argument or `-p/--path`; `query`/`files`/`serve` use `-p/--path`.
+argument or `-p/--path`; `search`/`files`/`serve` use `-p/--path`.
+`query` remains a backward-compatible alias for `search`.
 
 > **Full reference with all flags:** [`docs/cli.md`](docs/cli.md)
 

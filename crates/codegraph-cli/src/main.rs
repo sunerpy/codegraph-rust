@@ -239,8 +239,11 @@ enum Command {
         #[arg(short = 'j', long = "json")]
         json: bool,
     },
-    // Upstream flags/output shape: upstream bin/codegraph.ts:831-837, 849-887.
-    Query {
+    // Upstream `query` flags/output shape: upstream bin/codegraph.ts:831-837,
+    // 849-887. `search` is the canonical CLI name; `query` stays compatible.
+    /// Search indexed symbols by name.
+    #[command(visible_alias = "query")]
+    Search {
         search: String,
         #[arg(short, long)]
         path: Option<PathBuf>,
@@ -637,14 +640,14 @@ fn run(cli: Cli) -> Result<()> {
         } => cmd_index(path, force, quiet, verbose),
         Command::Sync { path, quiet } => cmd_sync(path, quiet),
         Command::Status { path, json } => cmd_status(path, json),
-        Command::Query {
+        Command::Search {
             search,
             path,
             limit,
             kind,
             json,
             strict,
-        } => cmd_query(search, path, limit, kind, json, strict),
+        } => cmd_search(search, path, limit, kind, json, strict),
         Command::Files {
             path,
             filter,
@@ -1947,7 +1950,7 @@ fn status_extraction_detail(
     }
 }
 
-fn cmd_query(
+fn cmd_search(
     search: String,
     path: Option<PathBuf>,
     limit: i64,
@@ -1991,7 +1994,7 @@ fn cmd_query(
     } else {
         println!("\nSearch Results for \"{search}\":\n");
         for result in results {
-            println!("{}", format_query_result_line(&result));
+            println!("{}", format_search_result_line(&result));
             println!("  {}:{}", result.node.file_path, result.node.start_line);
             if let Some(signature) = &result.node.signature {
                 println!("  {signature}");
@@ -2000,7 +2003,7 @@ fn cmd_query(
         }
     }
     if strict && is_empty {
-        bail!("codegraph query: no results found for \"{search}\"");
+        bail!("codegraph search: no results found for \"{search}\"");
     }
     Ok(())
 }
@@ -2009,7 +2012,7 @@ fn cmd_query(
 /// best-match-first, so the raw FTS `score` (not a 0..1 fraction) is NOT shown —
 /// rendering `score * 100` produced nonsensical values like `12042%` (upstream
 /// #1045). The score stays in the `--json` output for sorting/thresholding.
-fn format_query_result_line(result: &SearchResult) -> String {
+fn format_search_result_line(result: &SearchResult) -> String {
     format!("{:<12}{}", result.node.kind, result.node.name)
 }
 
@@ -5538,7 +5541,7 @@ fn describe_symbol(symbol: &str, file: Option<&str>) -> String {
 
 fn lookup_symbol_not_found_message(symbol: &str) -> String {
     format!(
-        "Symbol \"{symbol}\" not found. Run `codegraph query {symbol}` to search for fuzzy matches."
+        "Symbol \"{symbol}\" not found. Run `codegraph search {symbol}` to search for fuzzy matches."
     )
 }
 
@@ -7042,7 +7045,7 @@ mod formatter_and_env_tests {
     }
 
     #[test]
-    fn query_human_result_line_has_no_percentage() {
+    fn search_human_result_line_has_no_percentage() {
         // #1045: the raw FTS score is not a percentage; multiplying by 100 emits
         // nonsensical values like "12042%". Results are already best-match-first,
         // so the human-readable line must NOT print any percentage at all.
@@ -7051,7 +7054,7 @@ mod formatter_and_env_tests {
             node: n,
             score: 120.42,
         };
-        let line = format_query_result_line(&sr);
+        let line = format_search_result_line(&sr);
         assert!(
             !line.contains('%'),
             "human query output must not contain a percentage: {line:?}"

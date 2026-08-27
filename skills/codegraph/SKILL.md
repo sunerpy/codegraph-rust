@@ -103,6 +103,11 @@ Pick your entry point based on what you're trying to answer:
 | "What files are under path P?"      | `codegraph_files`   |
 | "Is the index up to date?"          | `codegraph_status`  |
 
+These are MCP tool names. When MCP is unavailable and you are invoking the
+binary directly, use `codegraph search "<symbol>" -p /path/to/project` for
+symbol lookup. `codegraph query` remains a compatibility alias; prefer
+`codegraph search` in new commands and guidance.
+
 ### `codegraph_explore` — start here
 
 For a whole-project overview ("analyze the project", "explain the architecture",
@@ -126,6 +131,12 @@ suspect) a symbol's name but not where it lives. The results are FTS5-scored
 across multiple signals (name, kind, path). This is the closest thing to
 "semantic" lookup available, but it is **fully deterministic full-text scoring**
 — there are no embeddings, no vector index, no neural model of any kind.
+
+CLI equivalent:
+
+```bash
+codegraph search "<symbol>" -p /path/to/project
+```
 
 ### `codegraph_node` — read source + graph trail
 

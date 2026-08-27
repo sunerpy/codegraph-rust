@@ -53,7 +53,7 @@ irm https://raw.githubusercontent.com/sunerpy/codegraph-rust/main/scripts/instal
 
 ```bash
 codegraph init  /path/to/project                   # 创建 .codegraph/ 并执行首次索引
-codegraph query "<symbol>" -p /path/to/project     # 全文检索
+codegraph search "<symbol>" -p /path/to/project    # 全文符号检索（`query` 为兼容别名）
 codegraph serve --mcp --path /path/to/project      # 为 AI 代理启动 MCP 服务器（--path 可选，默认 cwd）
 ```
 
@@ -415,13 +415,13 @@ codegraph http list / stop       # 管理运行中的 HTTP 服务
 
 ## CLI 子命令
 
-核心命令：`init`、`index`、`sync`、`query`、`files`、`status`、`serve`、
+核心命令：`init`、`index`、`sync`、`search`、`files`、`status`、`serve`、
 `callers`、`callees`、`impact`、`affected`、`check`、`export`、`unlock`。
 
 代理 / 安装命令：`install`、`uninstall`、`skill`、`self-update`、`completions`。
 
-路径约定：大多数遍历命令把项目路径作位置参数或 `-p/--path`；`query`/`files`/
-`serve` 用 `-p/--path`。
+路径约定：大多数遍历命令把项目路径作位置参数或 `-p/--path`；`search`/`files`/
+`serve` 用 `-p/--path`。`query` 继续作为 `search` 的向后兼容别名。
 
 > **完整参考（含所有标志）：** [`../cli.md`](../cli.md)
 

@@ -6,7 +6,7 @@
 
 - **Positional or `-p/--path`:** `init`, `uninit`, `index`, `sync`, `status`,
   `callers`, `callees`, `impact`, `affected`, `unlock`, `check`, `export`.
-- **`-p/--path` only:** `query`, `files`, `serve`, `audit`.
+- **`-p/--path` only:** `search`, `files`, `serve`, `audit`.
 - **No project path:** `install`, `uninstall`, `skill`, `version`, `self-update`,
   `completions`.
 
@@ -28,7 +28,7 @@
 | `index`           | (Re-)index in full                                                                        | `[path]`, `-f/--force`, `-q/--quiet`, `-v/--verbose`                                                                                       |
 | `sync`            | Incremental sync: re-index only changed files, drop deleted ones, re-resolve              | `[path]`, `-q/--quiet`                                                                                                                     |
 | `status`          | Print index stats (files/nodes/edges/DB size/journal)                                     | `[path]`, `-j/--json`                                                                                                                      |
-| `query`           | FTS5 + multi-signal scored search                                                         | `<search>`, `-p`, `-l/--limit`, `-k/--kind`, `-j/--json`, `--strict`                                                                       |
+| `search`          | FTS5 + multi-signal scored symbol search                                                  | `<search>`, `-p`, `-l/--limit`, `-k/--kind`, `-j/--json`, `--strict`                                                                       |
 | `files`           | List indexed files (tree/flat/grouped)                                                    | `-p`, `--filter <DIR>`, `--language <LANG>`, `--pattern`, `--format`, `--max-depth`, `-j`                                                  |
 | `serve`           | Start the server; `--mcp` enters MCP stdio mode                                           | `-p`, `--mcp`, `--no-watch`                                                                                                                |
 | `unlock`          | Clear a stale daemon lock (keeps live pids)                                               | `[path]`                                                                                                                                   |
@@ -42,6 +42,9 @@
 | `version`         | Print the codegraph version (same as `--version`)                                         | —                                                                                                                                          |
 | `self-update`     | Update the binary in place from the latest GitHub release                                 | `--check`, `--force`, `--tag <vX.Y.Z>`                                                                                                     |
 | `completions`     | Print or install shell completions                                                        | `<shell>` (bash, zsh, fish, powershell, elvish), `--install`                                                                               |
+
+`query` remains a visible backward-compatible alias for `search`; new scripts,
+documentation, and diagnostics should use `search`.
 
 > **Note:** `serve --no-watch` and `CODEGRAPH_NO_WATCH=1` are fully equivalent —
 > both disable the live file watcher. See
@@ -288,7 +291,7 @@ codegraph files -p . --filter src --language go  # combine: Go files under src/
 
 **Symbol count semantics.** The per-file "symbols" count shown by `files` is the
 **live count of graph nodes for that file** (`COUNT(*)` over the `nodes` table),
-so it stays consistent with what `query`/`callers`/`callees` see. This matters
+so it stays consistent with what `search`/`callers`/`callees` see. This matters
 for Godot `.tscn`/`.tres` files: their scene/resource marker nodes are added by
 the framework resolver after the initial extractor, so the stored
 `files.node_count` column (which records only the initial extractor's count) can
@@ -386,7 +389,7 @@ is out of scope (that is Godot MCP Pro's job).
 ## Symbol lookup failures and `--strict`
 
 `callers`, `callees`, and `impact` require an exact symbol match. If the name
-does not exist, they exit non-zero and suggest `codegraph query <name>` for
+does not exist, they exit non-zero and suggest `codegraph search <name>` for
 fuzzy search instead of silently substituting the highest-ranked result.
 `--strict` retains its separate contract: after an exact match, an empty result
 also exits non-zero.
