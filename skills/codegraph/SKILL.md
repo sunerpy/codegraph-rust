@@ -65,6 +65,12 @@ also escalate through `sync`; do not jump to a forced rebuild merely because the
 CLI version changed. Follow the exact recovery command printed by `status` or the
 failed command.
 
+Missing index-state slots and an all-`OwnerMismatch` index after a project move
+or copy are supported `init` recovery cases. When `status`, `sync`, or another
+failed command explicitly prints `codegraph init ...`, run that exact command to
+replace the stale index; do not keep retrying `sync`. Do not generalize this to
+mixed or other corruption when the CLI does not prescribe `init`.
+
 ### Start the MCP server
 
 ```bash

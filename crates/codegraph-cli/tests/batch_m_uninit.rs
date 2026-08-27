@@ -136,7 +136,8 @@ fn run_in_with_config(registry_dir: &Path, args: &[&str], codegraph_dir: Option<
         .current_dir(registry_dir)
         .args(args)
         .env("CODEGRAPH_HTTP_REGISTRY_DIR", registry_dir)
-        .env("CODEGRAPH_NO_DAEMON", "1");
+        .env("CODEGRAPH_NO_DAEMON", "1")
+        .env("RUST_LOG", "info");
     if let Some(configured) = codegraph_dir {
         command.env("CODEGRAPH_DIR", configured);
     } else {
@@ -789,6 +790,18 @@ fn explicit_init_recovers_an_owner_mismatched_namespace() {
         init.ok,
         "explicit init must recover OwnerMismatch: stdout={}, stderr={}",
         init.stdout, init.stderr
+    );
+    assert!(
+        !init
+            .stderr
+            .contains("replaced stale foreign index state slots")
+            && !init
+                .stderr
+                .contains("replaced stale foreign index database")
+            && !init.stderr.contains("codegraph_store::rebuild")
+            && !init.stderr.contains(" INFO "),
+        "normal init progress must not be split by recovery logger output: stderr={}",
+        init.stderr
     );
     assert_eq!(Store::extraction_status(&paths), ExtractionStatus::Current);
     let store = Store::open_for_read(&paths, deadline(), || false)
