@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.47.4](https://github.com/sunerpy/codegraph-rust/compare/v0.47.3...v0.47.4) (2026-08-27)
+
+
+### Bug Fixes
+
+* **cli:** keep init recovery logs out of progress ([#240](https://github.com/sunerpy/codegraph-rust/issues/240)) ([9c3313b](https://github.com/sunerpy/codegraph-rust/commit/9c3313b3b863b672270e8f3be83791ea19e5436b))
+
 ## [0.47.3](https://github.com/sunerpy/codegraph-rust/compare/v0.47.2...v0.47.3) (2026-08-27)
 
 
