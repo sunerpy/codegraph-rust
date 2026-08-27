@@ -75,11 +75,11 @@ impl FrameworkResolver for NestjsResolver {
             if !suffix.is_match(&reference.reference_name) {
                 continue;
             }
-            let candidates: Vec<Node> = context
-                .get_nodes_by_name(&reference.reference_name)
+            let candidates = context
+                .get_nodes_by_name_shared(&reference.reference_name)
                 .into_iter()
                 .filter(|n| n.kind == NodeKind::Class)
-                .collect();
+                .collect::<Vec<_>>();
             if candidates.is_empty() {
                 return None;
             }
@@ -270,17 +270,17 @@ impl FrameworkResolver for NestjsResolver {
 
         let mut updates: Vec<Node> = Vec::new();
         for (controller_name, prefix) in &controller_to_prefix {
-            let classes: Vec<Node> = context
-                .get_nodes_by_name(controller_name)
+            let classes = context
+                .get_nodes_by_name_shared(controller_name)
                 .into_iter()
                 .filter(|n| n.kind == NodeKind::Class)
-                .collect();
+                .collect::<Vec<_>>();
             for cls in classes {
-                let routes: Vec<Node> = context
-                    .get_nodes_in_file(&cls.file_path)
+                let routes = context
+                    .get_nodes_in_file_shared(&cls.file_path)
                     .into_iter()
                     .filter(|n| n.kind == NodeKind::Route)
-                    .collect();
+                    .collect::<Vec<_>>();
                 for route in routes {
                     if route.start_line < cls.start_line || route.start_line > cls.end_line {
                         continue;

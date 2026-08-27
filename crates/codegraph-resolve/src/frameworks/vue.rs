@@ -261,7 +261,7 @@ fn resolve_alias(alias_path: &str, context: &dyn ResolutionContext) -> Option<St
     for ext in EXTS {
         let full_path = format!("{alias_path}{ext}");
         if context.file_exists(&full_path) {
-            let nodes = context.get_nodes_in_file(&full_path);
+            let nodes = context.get_nodes_in_file_shared(&full_path);
             if !nodes.is_empty() {
                 return Some(nodes[0].id.clone());
             }
@@ -299,10 +299,10 @@ fn resolve_component(
 
     let component_in = |file: &str| -> Option<String> {
         context
-            .get_nodes_in_file(file)
+            .get_nodes_in_file_shared(file)
             .into_iter()
             .find(|n| n.kind == NodeKind::Component && n.name == name)
-            .map(|n| n.id)
+            .map(|n| n.id.clone())
     };
 
     let from_dir = dir_of(from_file);

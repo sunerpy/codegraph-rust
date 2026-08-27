@@ -346,7 +346,7 @@ fn resolve_component(
     from_file: &str,
     context: &dyn ResolutionContext,
 ) -> Option<String> {
-    let candidates = context.get_nodes_by_name(name);
+    let candidates = context.get_nodes_by_name_shared(name);
     if candidates.is_empty() {
         return None;
     }
@@ -392,7 +392,7 @@ fn resolve_component(
 
 /// `resolveHook` (react.ts:328-343).
 fn resolve_hook(name: &str, context: &dyn ResolutionContext) -> Option<String> {
-    let candidates = context.get_nodes_by_name(name);
+    let candidates = context.get_nodes_by_name_shared(name);
     if candidates.is_empty() {
         return None;
     }
@@ -415,12 +415,12 @@ fn resolve_hook(name: &str, context: &dyn ResolutionContext) -> Option<String> {
 
 /// `resolveContext` (react.ts:348-368).
 fn resolve_context(name: &str, context: &dyn ResolutionContext) -> Option<String> {
-    let candidates = context.get_nodes_by_name(name);
+    let candidates = context.get_nodes_by_name_shared(name);
     if candidates.is_empty() {
         // Strip Context/Provider suffix fallback (react.ts:351-357).
         let base_name = strip_context_suffix(name);
         if base_name != name {
-            let base_candidates = context.get_nodes_by_name(base_name);
+            let base_candidates = context.get_nodes_by_name_shared(base_name);
             if !base_candidates.is_empty() {
                 return Some(base_candidates[0].id.clone());
             }

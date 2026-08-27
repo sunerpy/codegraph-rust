@@ -336,11 +336,12 @@ impl FrameworkResolver for GodotResolver {
 /// `[autoload]` entries that have a backing script path.
 fn autoload_singletons(context: &dyn ResolutionContext) -> Vec<Node> {
     context
-        .get_nodes_by_kind(NodeKind::Constant)
+        .get_nodes_by_kind_shared(NodeKind::Constant)
         .into_iter()
         .filter(|n| {
             n.language == Language::GodotProject && godot_project::is_project_godot(&n.file_path)
         })
+        .map(|node| node.as_ref().clone())
         .collect()
 }
 
@@ -360,10 +361,10 @@ fn resolve_class_member(
     member: &str,
 ) -> Option<Node> {
     let mut class_files: Vec<String> = context
-        .get_nodes_by_name(receiver)
+        .get_nodes_by_name_shared(receiver)
         .into_iter()
         .filter(|n| n.kind == NodeKind::Class && n.language == Language::Gdscript)
-        .map(|n| n.file_path)
+        .map(|n| n.file_path.clone())
         .collect();
     if class_files.is_empty() {
         return None;
@@ -373,7 +374,7 @@ fn resolve_class_member(
     let class_file = &class_files[0];
 
     let mut matches = context
-        .get_nodes_in_file(class_file)
+        .get_nodes_in_file_shared(class_file)
         .into_iter()
         .filter(|n| {
             n.kind == NodeKind::Function && n.language == Language::Gdscript && n.name == member
@@ -382,7 +383,7 @@ fn resolve_class_member(
     if matches.next().is_some() {
         return None;
     }
-    Some(first)
+    Some(first.as_ref().clone())
 }
 
 /// Resolve an autoload method call `access` (`Receiver.member`) to the UNIQUE
@@ -410,7 +411,7 @@ fn resolve_autoload_func(context: &dyn ResolutionContext, access: &str) -> Optio
     let script_path = bindings.get(receiver)?;
 
     let mut matches = context
-        .get_nodes_in_file(script_path)
+        .get_nodes_in_file_shared(script_path)
         .into_iter()
         .filter(|n| {
             n.kind == NodeKind::Function && n.language == Language::Gdscript && n.name == member
@@ -419,7 +420,7 @@ fn resolve_autoload_func(context: &dyn ResolutionContext, access: &str) -> Optio
     if matches.next().is_some() {
         return None;
     }
-    Some(first)
+    Some(first.as_ref().clone())
 }
 
 /// Find the autoload singleton node whose name EXACTLY equals `name`.
@@ -428,11 +429,15 @@ fn resolve_autoload_func(context: &dyn ResolutionContext, access: &str) -> Optio
 /// resolves when it names a real `[autoload]` singleton. Scans the `Constant`
 /// nodes restricted to `project.godot` so it cannot match an unrelated constant.
 fn find_autoload_singleton(context: &dyn ResolutionContext, name: &str) -> Option<Node> {
-    context.get_nodes_by_name(name).into_iter().find(|n| {
-        n.kind == NodeKind::Constant
-            && n.language == Language::GodotProject
-            && godot_project::is_project_godot(&n.file_path)
-    })
+    context
+        .get_nodes_by_name_shared(name)
+        .into_iter()
+        .find(|n| {
+            n.kind == NodeKind::Constant
+                && n.language == Language::GodotProject
+                && godot_project::is_project_godot(&n.file_path)
+        })
+        .map(|node| node.as_ref().clone())
 }
 
 /// Map of `autoload name -> repo-relative script path`, recovered by RE-READING
