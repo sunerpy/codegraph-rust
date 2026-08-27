@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.47.2](https://github.com/sunerpy/codegraph-rust/compare/v0.47.1...v0.47.2) (2026-08-27)
+
+
+### Bug Fixes
+
+* **cli:** expose search subcommand ([#235](https://github.com/sunerpy/codegraph-rust/issues/235)) ([d137412](https://github.com/sunerpy/codegraph-rust/commit/d137412285fd9f5d719195ff5bcb3c8305e088ee))
+
 ## [0.47.1](https://github.com/sunerpy/codegraph-rust/compare/v0.47.0...v0.47.1) (2026-08-26)
 
 
