@@ -23,10 +23,11 @@
 //!
 //! Each node-lookup `Vec` is built by copying the store's own query output
 //! verbatim (`nodes_by_file_path`, `nodes_by_kind`, `all_node_names`) or by
-//! applying the identical [`order_candidates`](crate::context) tie-break, so the
+//! applying the identical [`order_candidates`](crate::context::order_candidates)
+//! tie-break, so the
 //! candidate order matches the store context exactly.
 
-use crate::context::{DEFAULT_CACHE_LIMIT, order_candidates_pub};
+use crate::context::{DEFAULT_CACHE_LIMIT, order_candidates};
 use crate::import_resolver;
 use crate::path_aliases::{AliasMap, load_project_aliases};
 use crate::types::{GoModule, ImportMapping, ReExport, ResolutionContext};
@@ -193,12 +194,12 @@ impl SnapshotCaches {
 /// safe to share across `rayon` threads.
 struct NodeSnapshot {
     project_root: String,
-    by_name: HashMap<String, Vec<Node>>,
-    by_lower_name: HashMap<String, Vec<Node>>,
-    by_qualified_name: HashMap<String, Vec<Node>>,
-    by_kind: HashMap<NodeKind, Vec<Node>>,
-    by_file_path: HashMap<String, Vec<Node>>,
-    by_id: HashMap<String, Node>,
+    by_name: HashMap<String, Vec<Arc<Node>>>,
+    by_lower_name: HashMap<String, Vec<Arc<Node>>>,
+    by_qualified_name: HashMap<String, Vec<Arc<Node>>>,
+    by_kind: HashMap<NodeKind, Vec<Arc<Node>>>,
+    by_file_path: HashMap<String, Vec<Arc<Node>>>,
+    by_id: HashMap<String, Arc<Node>>,
     known_node_names: Vec<String>,
     known_file_paths: HashSet<String>,
     all_file_paths: Vec<String>,
@@ -238,50 +239,64 @@ impl SnapshotResolutionContext {
         let project_root = project_root.into();
         let nodes = store.all_nodes()?;
 
-        let mut by_name: HashMap<String, Vec<Node>> = HashMap::new();
-        let mut by_lower_name: HashMap<String, Vec<Node>> = HashMap::new();
-        let mut by_qualified_name: HashMap<String, Vec<Node>> = HashMap::new();
-        let mut by_id: HashMap<String, Node> = HashMap::with_capacity(nodes.len());
+        let mut by_name: HashMap<String, Vec<Arc<Node>>> = HashMap::new();
+        let mut by_lower_name: HashMap<String, Vec<Arc<Node>>> = HashMap::new();
+        let mut by_qualified_name: HashMap<String, Vec<Arc<Node>>> = HashMap::new();
+        let mut by_id: HashMap<String, Arc<Node>> = HashMap::with_capacity(nodes.len());
 
-        for node in &nodes {
+        for node in nodes {
+            let node = Arc::new(node);
             by_name
                 .entry(node.name.clone())
                 .or_default()
-                .push(node.clone());
+                .push(Arc::clone(&node));
             by_lower_name
                 .entry(node.name.to_lowercase())
                 .or_default()
-                .push(node.clone());
+                .push(Arc::clone(&node));
             by_qualified_name
                 .entry(node.qualified_name.clone())
                 .or_default()
-                .push(node.clone());
-            by_id.insert(node.id.clone(), node.clone());
+                .push(Arc::clone(&node));
+            by_id.insert(node.id.clone(), node);
         }
         for list in by_name.values_mut() {
-            order_candidates_pub(list);
+            order_candidates(list);
         }
         for list in by_lower_name.values_mut() {
-            order_candidates_pub(list);
+            order_candidates(list);
         }
         for list in by_qualified_name.values_mut() {
-            order_candidates_pub(list);
+            order_candidates(list);
         }
 
         // Per-file and per-kind lists copy the store's own query output verbatim
         // so the candidate order matches `nodes_by_file_path` (ORDER BY
         // start_line) and `nodes_by_kind` (SQLite scan order) exactly.
-        let mut file_paths: Vec<String> = nodes.iter().map(|n| n.file_path.clone()).collect();
+        let mut file_paths: Vec<String> = by_id.values().map(|n| n.file_path.clone()).collect();
         file_paths.sort_unstable();
         file_paths.dedup();
-        let mut by_file_path: HashMap<String, Vec<Node>> = HashMap::with_capacity(file_paths.len());
+        let mut by_file_path: HashMap<String, Vec<Arc<Node>>> =
+            HashMap::with_capacity(file_paths.len());
         for fp in &file_paths {
-            by_file_path.insert(fp.clone(), store.nodes_by_file_path(fp).unwrap_or_default());
+            let entries = store
+                .nodes_by_file_path(fp)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|node| by_id.get(&node.id).cloned())
+                .collect();
+            by_file_path.insert(fp.clone(), entries);
         }
 
-        let mut by_kind: HashMap<NodeKind, Vec<Node>> = HashMap::new();
+        let mut by_kind: HashMap<NodeKind, Vec<Arc<Node>>> = HashMap::new();
         for kind in NodeKind::ALL {
-            by_kind.insert(kind, store.nodes_by_kind(kind).unwrap_or_default());
+            let entries = store
+                .nodes_by_kind(kind)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|node| by_id.get(&node.id).cloned())
+                .collect();
+            by_kind.insert(kind, entries);
         }
 
         let known_node_names = store.all_node_names().unwrap_or_default();
@@ -366,6 +381,13 @@ impl SnapshotResolutionContext {
 
 impl ResolutionContext for SnapshotResolutionContext {
     fn get_nodes_in_file(&self, file_path: &str) -> Vec<Node> {
+        self.get_nodes_in_file_shared(file_path)
+            .into_iter()
+            .map(|node| node.as_ref().clone())
+            .collect()
+    }
+
+    fn get_nodes_in_file_shared(&self, file_path: &str) -> Vec<Arc<Node>> {
         self.snapshot
             .by_file_path
             .get(file_path)
@@ -374,10 +396,24 @@ impl ResolutionContext for SnapshotResolutionContext {
     }
 
     fn get_nodes_by_name(&self, name: &str) -> Vec<Node> {
+        self.get_nodes_by_name_shared(name)
+            .into_iter()
+            .map(|node| node.as_ref().clone())
+            .collect()
+    }
+
+    fn get_nodes_by_name_shared(&self, name: &str) -> Vec<Arc<Node>> {
         self.snapshot.by_name.get(name).cloned().unwrap_or_default()
     }
 
     fn get_nodes_by_qualified_name(&self, qualified_name: &str) -> Vec<Node> {
+        self.get_nodes_by_qualified_name_shared(qualified_name)
+            .into_iter()
+            .map(|node| node.as_ref().clone())
+            .collect()
+    }
+
+    fn get_nodes_by_qualified_name_shared(&self, qualified_name: &str) -> Vec<Arc<Node>> {
         self.snapshot
             .by_qualified_name
             .get(qualified_name)
@@ -386,6 +422,13 @@ impl ResolutionContext for SnapshotResolutionContext {
     }
 
     fn get_nodes_by_kind(&self, kind: NodeKind) -> Vec<Node> {
+        self.get_nodes_by_kind_shared(kind)
+            .into_iter()
+            .map(|node| node.as_ref().clone())
+            .collect()
+    }
+
+    fn get_nodes_by_kind_shared(&self, kind: NodeKind) -> Vec<Arc<Node>> {
         self.snapshot
             .by_kind
             .get(&kind)
@@ -431,6 +474,13 @@ impl ResolutionContext for SnapshotResolutionContext {
     }
 
     fn get_nodes_by_lower_name(&self, lower_name: &str) -> Vec<Node> {
+        self.get_nodes_by_lower_name_shared(lower_name)
+            .into_iter()
+            .map(|node| node.as_ref().clone())
+            .collect()
+    }
+
+    fn get_nodes_by_lower_name_shared(&self, lower_name: &str) -> Vec<Arc<Node>> {
         self.snapshot
             .by_lower_name
             .get(lower_name)
@@ -439,6 +489,11 @@ impl ResolutionContext for SnapshotResolutionContext {
     }
 
     fn get_node_by_id(&self, id: &str) -> Option<Node> {
+        self.get_node_by_id_shared(id)
+            .map(|node| node.as_ref().clone())
+    }
+
+    fn get_node_by_id_shared(&self, id: &str) -> Option<Arc<Node>> {
         self.snapshot.by_id.get(id).cloned()
     }
 
@@ -455,11 +510,11 @@ impl ResolutionContext for SnapshotResolutionContext {
             NodeKind::Protocol,
             NodeKind::Enum,
         ];
-        let type_nodes: Vec<Node> = self
-            .get_nodes_by_name(type_name)
+        let type_nodes = self
+            .get_nodes_by_name_shared(type_name)
             .into_iter()
             .filter(|n| SUPERTYPE_BEARING.contains(&n.kind) && n.language == language)
-            .collect();
+            .collect::<Vec<_>>();
         if type_nodes.is_empty() {
             return Vec::new();
         }
@@ -659,6 +714,13 @@ mod tests {
         assert_eq!(ctx.get_nodes_by_lower_name("child").len(), 1);
         assert!(ctx.get_node_by_id("child").is_some());
         assert!(ctx.get_node_by_id("missing").is_none());
+        let by_name = ctx.get_nodes_by_name_shared("Child");
+        let by_file = ctx.get_nodes_in_file_shared("a.ts");
+        let by_kind = ctx.get_nodes_by_kind_shared(NodeKind::Class);
+        let by_id = ctx.get_node_by_id_shared("child").expect("shared id");
+        assert!(Arc::ptr_eq(&by_name[0], &by_file[0]));
+        assert!(Arc::ptr_eq(&by_name[0], &by_kind[0]));
+        assert!(Arc::ptr_eq(&by_name[0], &by_id));
         assert!(ctx.known_node_names().contains(&"Child".to_string()));
         assert_eq!(ctx.get_project_root(), root.to_str().unwrap());
         assert!(ctx.get_nodes_in_file("nope.ts").is_empty());

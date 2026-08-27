@@ -7,6 +7,7 @@
 //! here as [`RefView`] so the two never get confused.
 
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind, ReferenceSubkind};
+use std::sync::Arc;
 
 /// The ES-module family: the languages where a symbol declared in another file is
 /// visible ONLY through an explicit `import`, and the set
@@ -295,12 +296,44 @@ pub struct FrameworkResolverExtractionResult {
 pub trait ResolutionContext {
     /// Get all nodes in a file (`getNodesInFile`, ordered by `start_line`).
     fn get_nodes_in_file(&self, file_path: &str) -> Vec<Node>;
+    /// Shared-node variant for hot resolution paths.
+    ///
+    /// The default preserves compatibility for lightweight/test contexts.
+    /// Production contexts override it so repeated lookups clone only `Arc`
+    /// handles instead of every `Node` string/vector field.
+    fn get_nodes_in_file_shared(&self, file_path: &str) -> Vec<Arc<Node>> {
+        self.get_nodes_in_file(file_path)
+            .into_iter()
+            .map(Arc::new)
+            .collect()
+    }
     /// Get all nodes by name (`getNodesByName`).
     fn get_nodes_by_name(&self, name: &str) -> Vec<Node>;
+    /// Shared-node variant of [`Self::get_nodes_by_name`].
+    fn get_nodes_by_name_shared(&self, name: &str) -> Vec<Arc<Node>> {
+        self.get_nodes_by_name(name)
+            .into_iter()
+            .map(Arc::new)
+            .collect()
+    }
     /// Get all nodes by exact qualified name (`getNodesByQualifiedName`).
     fn get_nodes_by_qualified_name(&self, qualified_name: &str) -> Vec<Node>;
+    /// Shared-node variant of [`Self::get_nodes_by_qualified_name`].
+    fn get_nodes_by_qualified_name_shared(&self, qualified_name: &str) -> Vec<Arc<Node>> {
+        self.get_nodes_by_qualified_name(qualified_name)
+            .into_iter()
+            .map(Arc::new)
+            .collect()
+    }
     /// Get all nodes of a kind (`getNodesByKind`).
     fn get_nodes_by_kind(&self, kind: codegraph_core::types::NodeKind) -> Vec<Node>;
+    /// Shared-node variant of [`Self::get_nodes_by_kind`].
+    fn get_nodes_by_kind_shared(&self, kind: codegraph_core::types::NodeKind) -> Vec<Arc<Node>> {
+        self.get_nodes_by_kind(kind)
+            .into_iter()
+            .map(Arc::new)
+            .collect()
+    }
 
     /// All node names for the `warmCaches` known-name set (`index.ts:298-308`).
     /// Default loops every kind (old behavior); store contexts override to pull
@@ -332,11 +365,22 @@ pub trait ResolutionContext {
     fn get_all_files(&self) -> Vec<String>;
     /// Get nodes by lowercase name (`getNodesByLowerName`, O(1) via index).
     fn get_nodes_by_lower_name(&self, lower_name: &str) -> Vec<Node>;
+    /// Shared-node variant of [`Self::get_nodes_by_lower_name`].
+    fn get_nodes_by_lower_name_shared(&self, lower_name: &str) -> Vec<Arc<Node>> {
+        self.get_nodes_by_lower_name(lower_name)
+            .into_iter()
+            .map(Arc::new)
+            .collect()
+    }
 
     /// Resolve a node by id (`queries.getNodeById`). The upstream context reaches
     /// `queries` directly for this (`index.ts:1087,1094`); the Rust port exposes
     /// it on the trait so the orchestrator's language gates stay pure.
     fn get_node_by_id(&self, id: &str) -> Option<Node>;
+    /// Shared-node variant of [`Self::get_node_by_id`].
+    fn get_node_by_id_shared(&self, id: &str) -> Option<Arc<Node>> {
+        self.get_node_by_id(id).map(Arc::new)
+    }
 
     /// Direct supertypes of `type_name` in `language` (`getSupertypes?`).
     ///

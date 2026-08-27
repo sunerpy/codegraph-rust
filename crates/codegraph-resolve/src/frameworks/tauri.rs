@@ -256,11 +256,11 @@ fn build_roster(context: &dyn ResolutionContext) -> Roster {
 /// cannot say which function the attribute belongs to, so the key is poisoned
 /// rather than guessed.
 fn admit_command(roster: &mut Roster, context: &dyn ResolutionContext, file: &str, name: &str) {
-    let mut candidates: Vec<Node> = context
-        .get_nodes_in_file(file)
+    let mut candidates = context
+        .get_nodes_in_file_shared(file)
         .into_iter()
         .filter(|n| n.name == name && matches!(n.kind, NodeKind::Function | NodeKind::Method))
-        .collect();
+        .collect::<Vec<_>>();
     let camel = snake_to_camel(name);
     match candidates.len() {
         1 => {

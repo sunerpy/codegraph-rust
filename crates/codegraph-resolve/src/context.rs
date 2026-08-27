@@ -13,9 +13,11 @@ use crate::workspace_packages::{WorkspacePackages, load_workspace_packages};
 use crate::{import_resolver, pathutil};
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use codegraph_store::Store;
+use std::borrow::Borrow;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::Arc;
 
 /// `DEFAULT_CACHE_LIMIT` (`index.ts:54`). Override via env in the upstream; the
 /// Rust port keeps the fixed default for one resolution run.
@@ -33,13 +35,13 @@ pub struct StoreResolutionContext<'a> {
 }
 
 struct Caches {
-    node_cache: LruCache<String, Vec<Node>>,
+    node_cache: LruCache<String, Vec<Arc<Node>>>,
     file_cache: LruCache<String, Option<String>>,
     import_mapping_cache: LruCache<String, Vec<ImportMapping>>,
     re_export_cache: LruCache<String, Vec<ReExport>>,
-    name_cache: LruCache<String, Vec<Node>>,
-    lower_name_cache: LruCache<String, Vec<Node>>,
-    qualified_name_cache: LruCache<String, Vec<Node>>,
+    name_cache: LruCache<String, Vec<Arc<Node>>>,
+    lower_name_cache: LruCache<String, Vec<Arc<Node>>>,
+    qualified_name_cache: LruCache<String, Vec<Arc<Node>>>,
     project_aliases: Option<Option<AliasMap>>,
     go_module: Option<Option<GoModule>>,
     go_modules: Option<Vec<GoModule>>,
@@ -93,27 +95,55 @@ impl<'a> StoreResolutionContext<'a> {
 
 impl ResolutionContext for StoreResolutionContext<'_> {
     fn get_nodes_in_file(&self, file_path: &str) -> Vec<Node> {
+        self.get_nodes_in_file_shared(file_path)
+            .into_iter()
+            .map(|node| node.as_ref().clone())
+            .collect()
+    }
+
+    fn get_nodes_in_file_shared(&self, file_path: &str) -> Vec<Arc<Node>> {
         let mut c = self.caches.borrow_mut();
         if let Some(cached) = c.node_cache.get(&file_path.to_string()) {
             return cached;
         }
-        let result = self.store.nodes_by_file_path(file_path).unwrap_or_default();
+        let result: Vec<Arc<Node>> = self
+            .store
+            .nodes_by_file_path(file_path)
+            .unwrap_or_default()
+            .into_iter()
+            .map(Arc::new)
+            .collect();
         c.node_cache.set(file_path.to_string(), result.clone());
         result
     }
 
     fn get_nodes_by_name(&self, name: &str) -> Vec<Node> {
+        self.get_nodes_by_name_shared(name)
+            .into_iter()
+            .map(|node| node.as_ref().clone())
+            .collect()
+    }
+
+    fn get_nodes_by_name_shared(&self, name: &str) -> Vec<Arc<Node>> {
         let mut c = self.caches.borrow_mut();
         if let Some(cached) = c.name_cache.get(&name.to_string()) {
             return cached;
         }
         let mut result = self.store.nodes_by_name(name).unwrap_or_default();
         order_candidates(&mut result);
+        let result: Vec<Arc<Node>> = result.into_iter().map(Arc::new).collect();
         c.name_cache.set(name.to_string(), result.clone());
         result
     }
 
     fn get_nodes_by_qualified_name(&self, qualified_name: &str) -> Vec<Node> {
+        self.get_nodes_by_qualified_name_shared(qualified_name)
+            .into_iter()
+            .map(|node| node.as_ref().clone())
+            .collect()
+    }
+
+    fn get_nodes_by_qualified_name_shared(&self, qualified_name: &str) -> Vec<Arc<Node>> {
         let mut c = self.caches.borrow_mut();
         if let Some(cached) = c.qualified_name_cache.get(&qualified_name.to_string()) {
             return cached;
@@ -123,6 +153,7 @@ impl ResolutionContext for StoreResolutionContext<'_> {
             .nodes_by_qualified_name(qualified_name)
             .unwrap_or_default();
         order_candidates(&mut result);
+        let result: Vec<Arc<Node>> = result.into_iter().map(Arc::new).collect();
         c.qualified_name_cache
             .set(qualified_name.to_string(), result.clone());
         result
@@ -130,6 +161,15 @@ impl ResolutionContext for StoreResolutionContext<'_> {
 
     fn get_nodes_by_kind(&self, kind: NodeKind) -> Vec<Node> {
         self.store.nodes_by_kind(kind).unwrap_or_default()
+    }
+
+    fn get_nodes_by_kind_shared(&self, kind: NodeKind) -> Vec<Arc<Node>> {
+        self.store
+            .nodes_by_kind(kind)
+            .unwrap_or_default()
+            .into_iter()
+            .map(Arc::new)
+            .collect()
     }
 
     fn known_node_names(&self) -> Vec<String> {
@@ -180,6 +220,13 @@ impl ResolutionContext for StoreResolutionContext<'_> {
     }
 
     fn get_nodes_by_lower_name(&self, lower_name: &str) -> Vec<Node> {
+        self.get_nodes_by_lower_name_shared(lower_name)
+            .into_iter()
+            .map(|node| node.as_ref().clone())
+            .collect()
+    }
+
+    fn get_nodes_by_lower_name_shared(&self, lower_name: &str) -> Vec<Arc<Node>> {
         let mut c = self.caches.borrow_mut();
         if let Some(cached) = c.lower_name_cache.get(&lower_name.to_string()) {
             return cached;
@@ -189,6 +236,7 @@ impl ResolutionContext for StoreResolutionContext<'_> {
             .nodes_by_lower_name(lower_name)
             .unwrap_or_default();
         order_candidates(&mut result);
+        let result: Vec<Arc<Node>> = result.into_iter().map(Arc::new).collect();
         c.lower_name_cache
             .set(lower_name.to_string(), result.clone());
         result
@@ -210,11 +258,11 @@ impl ResolutionContext for StoreResolutionContext<'_> {
             NodeKind::Protocol,
             NodeKind::Enum,
         ];
-        let type_nodes: Vec<Node> = self
-            .get_nodes_by_name(type_name)
+        let type_nodes = self
+            .get_nodes_by_name_shared(type_name)
             .into_iter()
             .filter(|n| SUPERTYPE_BEARING.contains(&n.kind) && n.language == language)
-            .collect();
+            .collect::<Vec<_>>();
         if type_nodes.is_empty() {
             return Vec::new();
         }
@@ -318,12 +366,6 @@ impl ResolutionContext for StoreResolutionContext<'_> {
     }
 }
 
-/// Shares the byte-equivalence-critical [`order_candidates`] tie-break with the
-/// [`SnapshotResolutionContext`](crate::snapshot_context::SnapshotResolutionContext).
-pub(crate) fn order_candidates_pub(nodes: &mut [Node]) {
-    order_candidates(nodes);
-}
-
 /// Shares [`is_js_family_path`] with the snapshot context.
 pub(crate) fn is_js_family_path_pub(file_path: &str) -> bool {
     is_js_family_path(file_path)
@@ -350,8 +392,10 @@ pub(crate) fn load_go_modules_pub(project_root: &str, files: &[String]) -> Vec<G
 /// such ties; sorting every candidate list by this stable key reproduces the
 /// full-index order regardless of when a node was inserted, keeping incremental
 /// resolution byte-equal to `index --force`.
-fn order_candidates(nodes: &mut [Node]) {
+pub(crate) fn order_candidates<T: Borrow<Node>>(nodes: &mut [T]) {
     nodes.sort_by(|a, b| {
+        let a = a.borrow();
+        let b = b.borrow();
         a.file_path
             .cmp(&b.file_path)
             .then(a.start_line.cmp(&b.start_line))
@@ -652,6 +696,12 @@ mod tests {
         assert_eq!(ctx.get_nodes_by_lower_name("foo").len(), 1);
         assert!(ctx.get_node_by_id("f1").is_some());
         assert!(ctx.get_node_by_id("missing").is_none());
+        let by_name = ctx.get_nodes_by_name_shared("foo");
+        let by_name_cached = ctx.get_nodes_by_name_shared("foo");
+        assert!(Arc::ptr_eq(&by_name[0], &by_name_cached[0]));
+        let by_file = ctx.get_nodes_in_file_shared("a.ts");
+        let by_file_cached = ctx.get_nodes_in_file_shared("a.ts");
+        assert!(Arc::ptr_eq(&by_file[0], &by_file_cached[0]));
         assert!(ctx.known_node_names().contains(&"foo".to_string()));
         assert_eq!(ctx.get_project_root(), root.to_str().unwrap());
         std::fs::remove_dir_all(&root).ok();
@@ -798,7 +848,7 @@ mod tests {
             node("b", "n", NodeKind::Function, "b.ts", 1, 0),
             node("a", "n", NodeKind::Function, "a.ts", 1, 0),
         ];
-        order_candidates_pub(&mut nodes);
+        order_candidates(&mut nodes);
         assert_eq!(nodes[0].id, "a");
         assert!(is_js_family_path_pub("x.ts"));
         assert!(!is_js_family_path_pub("x.py"));

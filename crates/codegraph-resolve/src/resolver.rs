@@ -1037,7 +1037,7 @@ impl ReferenceResolver {
         {
             return Some(result);
         }
-        let Some(target) = context.get_node_by_id(&result.target_node_id) else {
+        let Some(target) = context.get_node_by_id_shared(&result.target_node_id) else {
             return Some(result);
         };
         if crate::types::kind_is_eligible_target(reference.reference_kind, target.kind) {
@@ -1079,7 +1079,7 @@ impl ReferenceResolver {
             if let Some(via_import) =
                 self.gate_language(resolve_via_import(reference, context), reference, context)
             {
-                if let Some(target) = context.get_node_by_id(&via_import.target_node_id) {
+                if let Some(target) = context.get_node_by_id_shared(&via_import.target_node_id) {
                     if matches!(target.kind, NodeKind::Function | NodeKind::Method)
                         || is_python_class_function_ref_target(reference.language, target.kind)
                     {
@@ -1179,7 +1179,7 @@ impl ReferenceResolver {
         if member.is_empty() {
             return (None, None);
         }
-        let Some(from_node) = context.get_node_by_id(&reference.from_node_id) else {
+        let Some(from_node) = context.get_node_by_id_shared(&reference.from_node_id) else {
             return (None, None);
         };
         let class_prefix = if matches!(
@@ -1205,7 +1205,7 @@ impl ReferenceResolver {
         };
         let qualified = format!("{class_prefix}::{member}");
         let target = context
-            .get_nodes_by_qualified_name(&qualified)
+            .get_nodes_by_qualified_name_shared(&qualified)
             .into_iter()
             .filter(|n| {
                 matches!(n.kind, NodeKind::Function | NodeKind::Method)
@@ -1217,7 +1217,7 @@ impl ReferenceResolver {
             Some(target) => (
                 Some(ResolvedRef {
                     original: reference.clone(),
-                    target_node_id: target.id,
+                    target_node_id: target.id.clone(),
                     confidence: 0.95,
                     resolved_by: ResolvedBy::FunctionRef,
                 }),
@@ -1982,7 +1982,9 @@ impl ReferenceResolver {
         target_node_id: &str,
         context: &dyn ResolutionContext,
     ) -> Option<Language> {
-        context.get_node_by_id(target_node_id).map(|n| n.language)
+        context
+            .get_node_by_id_shared(target_node_id)
+            .map(|n| n.language)
     }
 }
 

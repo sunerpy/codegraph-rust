@@ -11,7 +11,8 @@ use crate::types::{
 };
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use regex::Regex;
-use std::sync::OnceLock;
+use std::borrow::Borrow;
+use std::sync::{Arc, OnceLock};
 
 /// Ceiling on same-name candidates a proximity-SCORED strategy will rank
 /// (`AMBIGUOUS_NAME_CEILING`, upstream name-matcher; override
@@ -50,8 +51,8 @@ pub fn match_by_file_path(
         return None;
     }
 
-    let candidates = context.get_nodes_by_name(file_name);
-    let file_nodes: Vec<Node> = candidates
+    let candidates = context.get_nodes_by_name_shared(file_name);
+    let file_nodes: Vec<Arc<Node>> = candidates
         .into_iter()
         .filter(|n| n.kind == NodeKind::File)
         .collect();
@@ -74,6 +75,7 @@ pub fn match_by_file_path(
     // Suffix match, picking the closest file node (name-matcher.ts:54-64).
     let suffix_matches: Vec<&Node> = file_nodes
         .iter()
+        .map(Arc::as_ref)
         .filter(|n| {
             n.qualified_name.ends_with(&reference.reference_name)
                 || n.file_path.ends_with(&reference.reference_name)
@@ -192,15 +194,15 @@ pub fn crosses_known_family(a: Language, b: Language) -> bool {
 
 /// Drop cross-language candidates from a name lookup (`applyLanguageGate`,
 /// `name-matcher.ts:160-168`).
-fn apply_language_gate(candidates: Vec<Node>, reference: &RefView) -> Vec<Node> {
+fn apply_language_gate<T: Borrow<Node>>(candidates: Vec<T>, reference: &RefView) -> Vec<T> {
     match reference.reference_kind {
         EdgeKind::References => candidates
             .into_iter()
-            .filter(|c| same_language_family(c.language, reference.language))
+            .filter(|c| same_language_family(c.borrow().language, reference.language))
             .collect(),
         EdgeKind::Imports => candidates
             .into_iter()
-            .filter(|c| !crosses_known_family(c.language, reference.language))
+            .filter(|c| !crosses_known_family(c.borrow().language, reference.language))
             .collect(),
         _ => candidates,
     }
@@ -233,8 +235,8 @@ fn is_lexically_reachable(
     if parent_qualified.is_empty() {
         return true;
     }
-    let containers: Vec<Node> = context
-        .get_nodes_by_qualified_name(parent_qualified)
+    let containers: Vec<Arc<Node>> = context
+        .get_nodes_by_qualified_name_shared(parent_qualified)
         .into_iter()
         .filter(|p| {
             p.file_path == candidate.file_path
@@ -258,8 +260,8 @@ pub fn match_by_exact_name(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> Option<ResolvedRef> {
-    let reachable: Vec<Node> = apply_language_gate(
-        context.get_nodes_by_name(&reference.reference_name),
+    let reachable: Vec<Arc<Node>> = apply_language_gate(
+        context.get_nodes_by_name_shared(&reference.reference_name),
         reference,
     )
     .into_iter()
@@ -271,7 +273,7 @@ pub fn match_by_exact_name(
     // importable (#1537/#1536). Filtering BEFORE ranking — not just refusing the
     // winner afterwards — is what lets a legitimate supertype OUTRANK a
     // same-named enum member instead of the whole reference being dropped.
-    let candidates: Vec<Node> = reachable
+    let candidates: Vec<Arc<Node>> = reachable
         .iter()
         .filter(|n| kind_is_eligible_target(reference.reference_kind, n.kind))
         .cloned()
@@ -328,7 +330,7 @@ pub fn match_by_qualified_name(
         return None;
     }
 
-    let candidates = context.get_nodes_by_qualified_name(&reference.reference_name);
+    let candidates = context.get_nodes_by_qualified_name_shared(&reference.reference_name);
     if candidates.len() == 1 {
         return Some(ResolvedRef {
             original: reference.clone(),
@@ -358,8 +360,8 @@ pub fn match_by_qualified_name(
     // with the reference (#1079).
     let parts: Vec<&str> = reference.reference_name.split([':', '.']).collect();
     if let Some(last_name) = parts.last().filter(|s| !s.is_empty()) {
-        let partial: Vec<Node> = context
-            .get_nodes_by_name(last_name)
+        let partial: Vec<Arc<Node>> = context
+            .get_nodes_by_name_shared(last_name)
             .into_iter()
             .filter(|c| c.qualified_name.ends_with(&reference.reference_name))
             .collect();
@@ -385,14 +387,14 @@ pub fn match_by_qualified_name(
 /// `a/svc`. No-op when there are <2 candidates or none share the call site's
 /// file. The partition is STABLE (preserves within-group order), so edge output
 /// stays deterministic.
-fn prefer_call_site_file(nodes: Vec<Node>, call_site_file: &str) -> Vec<Node> {
+fn prefer_call_site_file<T: Borrow<Node>>(nodes: Vec<T>, call_site_file: &str) -> Vec<T> {
     if nodes.len() < 2 {
         return nodes;
     }
-    let mut same: Vec<Node> = Vec::new();
-    let mut other: Vec<Node> = Vec::new();
+    let mut same: Vec<T> = Vec::new();
+    let mut other: Vec<T> = Vec::new();
     for n in nodes {
-        if n.file_path == call_site_file {
+        if n.borrow().file_path == call_site_file {
             same.push(n);
         } else {
             other.push(n);
@@ -419,9 +421,9 @@ pub(crate) fn resolve_method_on_type(
     preferred_fqn: Option<&str>,
     depth: u32,
 ) -> Option<ResolvedRef> {
-    let method_candidates = context.get_nodes_by_name(method_name);
+    let method_candidates = context.get_nodes_by_name_shared(method_name);
     let want = format!("{type_name}::{method_name}");
-    let matches: Vec<Node> = method_candidates
+    let matches: Vec<Arc<Node>> = method_candidates
         .into_iter()
         .filter(|m| {
             m.kind == NodeKind::Method
@@ -499,7 +501,7 @@ fn cpp_last_segment(name: &str) -> &str {
 /// (`cppClassExists`, `name-matcher.ts:621-626`).
 fn cpp_class_exists(name: &str, reference: &RefView, context: &dyn ResolutionContext) -> bool {
     let last = cpp_last_segment(name);
-    context.get_nodes_by_name(last).iter().any(|n| {
+    context.get_nodes_by_name_shared(last).iter().any(|n| {
         matches!(n.kind, NodeKind::Class | NodeKind::Struct | NodeKind::Union)
             && n.language == reference.language
     })
@@ -726,7 +728,7 @@ fn infer_java_field_receiver_type(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> Option<String> {
-    let in_file = context.get_nodes_in_file(&reference.file_path);
+    let in_file = context.get_nodes_in_file_shared(&reference.file_path);
     if in_file.is_empty() {
         return None;
     }
@@ -930,7 +932,7 @@ fn local_receiver_type_patterns_tagged(language: Language, r: &str) -> Vec<(Rege
 /// so a same-named variable in another function can't leak in.
 fn enclosing_scope_start_line(reference: &RefView, context: &dyn ResolutionContext) -> i64 {
     let mut start = 1i64;
-    for n in context.get_nodes_in_file(&reference.file_path) {
+    for n in context.get_nodes_in_file_shared(&reference.file_path) {
         if !matches!(n.kind, NodeKind::Function | NodeKind::Method)
             || n.language != reference.language
         {
@@ -1043,7 +1045,7 @@ fn infer_class_field_receiver_type(
         return None;
     }
 
-    let in_file = context.get_nodes_in_file(&reference.file_path);
+    let in_file = context.get_nodes_in_file_shared(&reference.file_path);
     let enclosing = in_file
         .iter()
         .filter(|n| {
@@ -1115,7 +1117,7 @@ fn is_receiver_type_bound_at_call_site(
     context: &dyn ResolutionContext,
 ) -> bool {
     if context
-        .get_nodes_in_file(&reference.file_path)
+        .get_nodes_in_file_shared(&reference.file_path)
         .iter()
         .any(|n| n.name == type_name && declares_type_name(n.kind))
     {
@@ -1432,7 +1434,7 @@ pub fn match_method_call(
     // receiver names a class in several files, try the call site's own file
     // first (#1079).
     for class_node in prefer_call_site_file(
-        context.get_nodes_by_name(&object_or_class),
+        context.get_nodes_by_name_shared(&object_or_class),
         &reference.file_path,
     ) {
         if matches!(
@@ -1458,7 +1460,7 @@ pub fn match_method_call(
     let capitalized = capitalize(&object_or_class);
     if capitalized != object_or_class {
         for class_node in prefer_call_site_file(
-            context.get_nodes_by_name(&capitalized),
+            context.get_nodes_by_name_shared(&capitalized),
             &reference.file_path,
         ) {
             if matches!(
@@ -1483,17 +1485,17 @@ pub fn match_method_call(
 
     // Strategy 3: methods-by-name, receiver-overlap scoring
     // (name-matcher.ts:882-933).
-    let method_candidates = context.get_nodes_by_name(&method_name);
+    let method_candidates = context.get_nodes_by_name_shared(&method_name);
     // Ubiquitous-method ceiling (#999): bail before the O(K) scoring work when a
     // method name is re-declared across a vendored theme/SDK.
     if method_candidates.len() > ambiguous_name_ceiling() {
         return None;
     }
-    let methods: Vec<Node> = method_candidates
+    let methods: Vec<Arc<Node>> = method_candidates
         .into_iter()
         .filter(|n| n.kind == NodeKind::Method && n.name == method_name)
         .collect();
-    let same_language: Vec<Node> = methods
+    let same_language: Vec<Arc<Node>> = methods
         .iter()
         .filter(|m| m.language == reference.language)
         .cloned()
@@ -1767,13 +1769,14 @@ fn find_method_in_class(
     context: &dyn ResolutionContext,
 ) -> Option<Node> {
     context
-        .get_nodes_in_file(&class_node.file_path)
+        .get_nodes_in_file_shared(&class_node.file_path)
         .into_iter()
         .find(|n| {
             n.kind == NodeKind::Method
                 && n.name == method_name
                 && n.qualified_name.contains(&class_node.name)
         })
+        .map(|node| node.as_ref().clone())
 }
 
 fn capitalize(s: &str) -> String {
@@ -1874,11 +1877,15 @@ fn drop_last(path: &str) -> Vec<&str> {
 
 /// Find the best matching node among multiple candidates (`findBestMatch`,
 /// `name-matcher.ts:973-1055`).
-fn find_best_match<'a>(reference: &RefView, candidates: &'a [Node]) -> Option<&'a Node> {
+fn find_best_match<'a, T: Borrow<Node>>(
+    reference: &RefView,
+    candidates: &'a [T],
+) -> Option<&'a Node> {
     let mut best_score = -1.0f64;
     let mut best_node: Option<&Node> = None;
 
     for candidate in candidates {
+        let candidate = candidate.borrow();
         let mut score = 0.0f64;
 
         if candidate.file_path == reference.file_path {
@@ -1938,7 +1945,7 @@ fn find_best_match<'a>(reference: &RefView, candidates: &'a [Node]) -> Option<&'
 /// `name-matcher.ts:1060-1088`).
 pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Option<ResolvedRef> {
     let lower_name = reference.reference_name.to_lowercase();
-    let candidates = context.get_nodes_by_lower_name(&lower_name);
+    let candidates = context.get_nodes_by_lower_name_shared(&lower_name);
     if candidates.len() > ambiguous_name_ceiling() {
         return None;
     }
@@ -1952,7 +1959,7 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
         reference,
     );
 
-    let same_language: Vec<Node> = callable_candidates
+    let same_language: Vec<Arc<Node>> = callable_candidates
         .iter()
         .filter(|n| n.language == reference.language)
         .cloned()
@@ -2135,8 +2142,8 @@ fn lookup_callee_return_type(
         method = parts.last().copied().unwrap_or(callee).to_string();
         cls = Some(parts[..parts.len() - 1].join("::"));
     }
-    let candidates: Vec<Node> = context
-        .get_nodes_by_name(&method)
+    let candidates: Vec<Arc<Node>> = context
+        .get_nodes_by_name_shared(&method)
         .into_iter()
         .filter(|n| {
             matches!(n.kind, NodeKind::Method | NodeKind::Function)
@@ -2251,8 +2258,8 @@ pub fn match_function_ref(
     // that scope, unique-or-drop. Exempt from bare_fn_only.
     if let Some(sep) = reference.reference_name.rfind("::") {
         let member_name = &reference.reference_name[sep + 2..];
-        let scoped: Vec<Node> = context
-            .get_nodes_by_name(member_name)
+        let scoped: Vec<Arc<Node>> = context
+            .get_nodes_by_name_shared(member_name)
             .into_iter()
             .filter(|n| {
                 matches!(n.kind, NodeKind::Function | NodeKind::Method)
@@ -2268,13 +2275,14 @@ pub fn match_function_ref(
         }
         let same_file: Vec<&Node> = scoped
             .iter()
+            .map(Arc::as_ref)
             .filter(|n| n.file_path == reference.file_path)
             .collect();
         if same_file.is_empty() && scoped.len() > 1 {
             return None;
         }
         let pool: Vec<&Node> = if same_file.is_empty() {
-            scoped.iter().collect()
+            scoped.iter().map(Arc::as_ref).collect()
         } else {
             same_file
         };
@@ -2290,8 +2298,8 @@ pub fn match_function_ref(
         });
     }
 
-    let mut candidates: Vec<Node> = context
-        .get_nodes_by_name(&reference.reference_name)
+    let mut candidates: Vec<Arc<Node>> = context
+        .get_nodes_by_name_shared(&reference.reference_name)
         .into_iter()
         .filter(|n| {
             (n.kind == NodeKind::Function
@@ -2312,7 +2320,7 @@ pub fn match_function_ref(
         && candidates.iter().any(|n| n.kind == NodeKind::Method)
     {
         let class_prefix = context
-            .get_node_by_id(&reference.from_node_id)
+            .get_node_by_id_shared(&reference.from_node_id)
             .and_then(|f| {
                 let sep = f.qualified_name.rfind("::")?;
                 if sep > 0 {
@@ -2346,6 +2354,7 @@ pub fn match_function_ref(
 
     let same_file: Vec<&Node> = candidates
         .iter()
+        .map(Arc::as_ref)
         .filter(|n| n.file_path == reference.file_path)
         .collect();
     if !same_file.is_empty() {

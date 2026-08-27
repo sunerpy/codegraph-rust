@@ -19,7 +19,7 @@ use crate::workspace_packages::resolve_workspace_import;
 use codegraph_core::types::{Language, Node, NodeKind};
 use regex::Regex;
 use std::collections::BTreeSet;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 /// Extension resolution order by language (`EXTENSION_RESOLUTION`,
 /// `import-resolver.ts:17-37`).
@@ -1295,13 +1295,13 @@ pub fn resolve_jvm_import(
         return None;
     }
 
-    let candidates = context.get_nodes_by_qualified_name(&format!("{pkg}::{sym}"));
+    let candidates = context.get_nodes_by_qualified_name_shared(&format!("{pkg}::{sym}"));
     if candidates.is_empty() {
         return None;
     }
 
     let best = if candidates.len() == 1 {
-        candidates[0].clone()
+        candidates[0].as_ref().clone()
     } else {
         pick_closest_jvm_candidate(&candidates, &reference.file_path)
     };
@@ -1314,7 +1314,7 @@ pub fn resolve_jvm_import(
 }
 
 /// `pickClosestJvmCandidate` (`import-resolver.ts:1096-1119`).
-fn pick_closest_jvm_candidate(candidates: &[Node], from_path: &str) -> Node {
+fn pick_closest_jvm_candidate(candidates: &[Arc<Node>], from_path: &str) -> Node {
     let from_dirs: Vec<&str> = drop_last_segment(from_path);
     let shared_prefix = |p: &str| -> usize {
         let d = drop_last_segment(p);
@@ -1330,16 +1330,16 @@ fn pick_closest_jvm_candidate(candidates: &[Node], from_path: &str) -> Node {
     };
     let is_expect = |n: &Node| -> bool { n.decorators.iter().any(|d| d == "expect") };
 
-    let mut best = candidates[0].clone();
+    let mut best = Arc::clone(&candidates[0]);
     let mut best_prox = shared_prefix(&best.file_path);
     for c in &candidates[1..] {
         let prox = shared_prefix(&c.file_path);
         if prox > best_prox || (prox == best_prox && is_expect(c) && !is_expect(&best)) {
-            best = c.clone();
+            best = Arc::clone(c);
             best_prox = prox;
         }
     }
-    best
+    best.as_ref().clone()
 }
 
 fn drop_last_segment(path: &str) -> Vec<&str> {
@@ -1376,13 +1376,13 @@ pub fn resolve_via_import(
         });
         let sibling_base = pathutil::basename(&sibling_path);
         if let Some(sibling) = context
-            .get_nodes_by_name(sibling_base)
+            .get_nodes_by_name_shared(sibling_base)
             .into_iter()
             .find(|n| n.kind == NodeKind::File && n.file_path == sibling_path)
         {
             return Some(ResolvedRef {
                 original: reference.clone(),
-                target_node_id: sibling.id,
+                target_node_id: sibling.id.clone(),
                 confidence: 0.92,
                 resolved_by: ResolvedBy::Import,
             });
@@ -1395,13 +1395,13 @@ pub fn resolve_via_import(
         )?;
         let basename = pathutil::basename(&resolved_path);
         if let Some(file_node) = context
-            .get_nodes_by_name(basename)
+            .get_nodes_by_name_shared(basename)
             .into_iter()
             .find(|n| n.kind == NodeKind::File && n.file_path == resolved_path)
         {
             return Some(ResolvedRef {
                 original: reference.clone(),
-                target_node_id: file_node.id,
+                target_node_id: file_node.id.clone(),
                 confidence: 0.9,
                 resolved_by: ResolvedBy::Import,
             });
@@ -1416,13 +1416,13 @@ pub fn resolve_via_import(
         {
             let basename = pathutil::basename(&resolved_path);
             if let Some(file_node) = context
-                .get_nodes_by_name(basename)
+                .get_nodes_by_name_shared(basename)
                 .into_iter()
                 .find(|n| n.kind == NodeKind::File && n.file_path == resolved_path)
             {
                 return Some(ResolvedRef {
                     original: reference.clone(),
-                    target_node_id: file_node.id,
+                    target_node_id: file_node.id.clone(),
                     confidence: 0.9,
                     resolved_by: ResolvedBy::Import,
                 });
@@ -1622,13 +1622,13 @@ fn resolve_module_import_to_file(
         ) {
             if resolved_path != reference.file_path {
                 if let Some(file_node) = context
-                    .get_nodes_in_file(&resolved_path)
+                    .get_nodes_in_file_shared(&resolved_path)
                     .into_iter()
                     .find(|n| n.kind == NodeKind::File)
                 {
                     return Some(ResolvedRef {
                         original: reference.clone(),
-                        target_node_id: file_node.id,
+                        target_node_id: file_node.id.clone(),
                         confidence: 0.9,
                         resolved_by: ResolvedBy::Import,
                     });
@@ -1644,13 +1644,13 @@ fn resolve_module_import_to_file(
                 find_python_module_file(&module_path, context, &reference.file_path)
             {
                 if let Some(file_node) = context
-                    .get_nodes_in_file(&mod_file)
+                    .get_nodes_in_file_shared(&mod_file)
                     .into_iter()
                     .find(|n| n.kind == NodeKind::File)
                 {
                     return Some(ResolvedRef {
                         original: reference.clone(),
-                        target_node_id: file_node.id,
+                        target_node_id: file_node.id.clone(),
                         confidence: 0.9,
                         resolved_by: ResolvedBy::Import,
                     });
@@ -1693,7 +1693,7 @@ fn resolve_java_imported_reference(
             reference.reference_name[imp.local_name.len() + 1..].to_string()
         };
 
-        let candidates = context.get_nodes_by_name(&member_name);
+        let candidates = context.get_nodes_by_name_shared(&member_name);
         for node in &candidates {
             if node.language != reference.language {
                 continue;
@@ -1764,7 +1764,7 @@ fn find_exported_symbol(
     }
     visited.insert(file_path.to_string());
 
-    let nodes_in_file = context.get_nodes_in_file(file_path);
+    let nodes_in_file = context.get_nodes_in_file_shared(file_path);
     let re_exports = context.get_re_exports(file_path, language);
 
     let requested_name = if want.is_default {
@@ -1786,7 +1786,7 @@ fn find_exported_symbol(
                         .iter()
                         .find(|node| node.name == *original_name && node.kind == NodeKind::Function)
                     {
-                        return Some(target.clone());
+                        return Some(target.as_ref().clone());
                     }
                 }
             }
@@ -1804,7 +1804,7 @@ fn find_exported_symbol(
                 })
             })
         {
-            return Some(direct.clone());
+            return Some(direct.as_ref().clone());
         }
     } else if want.is_namespace {
         if let Some(member) = &want.member_name {
@@ -1812,14 +1812,14 @@ fn find_exported_symbol(
                 .iter()
                 .find(|n| &n.name == member && n.is_exported)
             {
-                return Some(direct.clone());
+                return Some(direct.as_ref().clone());
             }
         }
     } else if let Some(direct) = nodes_in_file
         .iter()
         .find(|n| n.name == want.exported_name && n.is_exported)
     {
-        return Some(direct.clone());
+        return Some(direct.as_ref().clone());
     }
 
     // Cross-file re-export hits (import-resolver.ts:1855-1893).
@@ -1981,8 +1981,8 @@ fn resolve_static_member(
     let member = remainder.split('.').next().filter(|s| !s.is_empty())?;
 
     let qualified = format!("{}::{}", container.qualified_name, member);
-    let mut candidates: Vec<Node> = context
-        .get_nodes_by_qualified_name(&qualified)
+    let mut candidates: Vec<Arc<Node>> = context
+        .get_nodes_by_qualified_name_shared(&qualified)
         .into_iter()
         .filter(|n| n.file_path == container.file_path)
         .collect();
@@ -1995,10 +1995,10 @@ fn resolve_static_member(
             .iter()
             .find(|n| matches!(n.kind, NodeKind::Method | NodeKind::Function))
         {
-            return Some(callable.clone());
+            return Some(callable.as_ref().clone());
         }
     }
-    Some(candidates.swap_remove(0))
+    Some(candidates.swap_remove(0).as_ref().clone())
 }
 
 /// The module whose `module_path` covers `import_path`, longest match first.
@@ -2059,7 +2059,7 @@ fn resolve_go_cross_package_reference(
         };
         let pkg_dir = go_package_dir(&imp.source, module);
 
-        for node in context.get_nodes_by_name(member) {
+        for node in context.get_nodes_by_name_shared(member) {
             if node.language != Language::Go || !node.is_exported {
                 continue;
             }
@@ -2071,7 +2071,7 @@ fn resolve_go_cross_package_reference(
             if file_dir == pkg_dir {
                 return Some(ResolvedRef {
                     original: reference.clone(),
-                    target_node_id: node.id,
+                    target_node_id: node.id.clone(),
                     confidence: 0.9,
                     resolved_by: ResolvedBy::Import,
                 });
@@ -2126,7 +2126,7 @@ fn resolve_python_module_member(
         }
 
         if let Some(target) = context
-            .get_nodes_in_file(&resolved_path)
+            .get_nodes_in_file_shared(&resolved_path)
             .into_iter()
             .find(|n| {
                 n.name == member
@@ -2141,7 +2141,7 @@ fn resolve_python_module_member(
         {
             return Some(ResolvedRef {
                 original: reference.clone(),
-                target_node_id: target.id,
+                target_node_id: target.id.clone(),
                 confidence: 0.85,
                 resolved_by: ResolvedBy::Import,
             });
@@ -2217,7 +2217,7 @@ fn resolve_python_from_import_member(
         // `get_nodes_in_file` is ordered by `start_line`, so a file declaring the
         // name twice resolves deterministically to the first declaration.
         if let Some(target) = context
-            .get_nodes_in_file(&module_file)
+            .get_nodes_in_file_shared(&module_file)
             .into_iter()
             .find(|n| {
                 n.name == imp.exported_name
@@ -2232,7 +2232,7 @@ fn resolve_python_from_import_member(
         {
             return Some(ResolvedRef {
                 original: reference.clone(),
-                target_node_id: target.id,
+                target_node_id: target.id.clone(),
                 confidence: 0.9,
                 resolved_by: ResolvedBy::Import,
             });
@@ -2257,10 +2257,10 @@ fn resolve_python_absolute_module(
     let hit_id = find_python_module_file(&reference.reference_name, context, &reference.file_path)
         .and_then(|path| {
             context
-                .get_nodes_in_file(&path)
+                .get_nodes_in_file_shared(&path)
                 .into_iter()
                 .find(|n| n.kind == NodeKind::File)
-                .map(|n| n.id)
+                .map(|n| n.id.clone())
         })?;
     Some(ResolvedRef {
         original: reference.clone(),
@@ -2285,7 +2285,7 @@ fn find_python_module_file(
     let ends_with = |p: &str, want: &str| p == want || p.ends_with(&format!("/{want}"));
 
     let module_file = context
-        .get_nodes_by_name(&format!("{last_seg}.py"))
+        .get_nodes_by_name_shared(&format!("{last_seg}.py"))
         .into_iter()
         .find(|n| {
             n.kind == NodeKind::File
@@ -2293,17 +2293,17 @@ fn find_python_module_file(
                 && ends_with(&n.file_path, &format!("{rel}.py"))
         });
     if let Some(n) = module_file {
-        return Some(n.file_path);
+        return Some(n.file_path.clone());
     }
     context
-        .get_nodes_by_name("__init__.py")
+        .get_nodes_by_name_shared("__init__.py")
         .into_iter()
         .find(|n| {
             n.kind == NodeKind::File
                 && n.file_path != exclude_file_path
                 && ends_with(&n.file_path, &format!("{rel}/__init__.py"))
         })
-        .map(|n| n.file_path)
+        .map(|n| n.file_path.clone())
 }
 
 /// Rust qualified path `A::B::C` → leaf `C` in the file the module prefix
@@ -2327,25 +2327,28 @@ fn resolve_rust_path_reference(
     if file == reference.file_path {
         return None;
     }
-    let target = context.get_nodes_in_file(&file).into_iter().find(|n| {
-        n.name == leaf
-            && matches!(
-                n.kind,
-                NodeKind::Function
-                    | NodeKind::Struct
-                    | NodeKind::Union
-                    | NodeKind::Enum
-                    | NodeKind::Trait
-                    | NodeKind::TypeAlias
-                    | NodeKind::Constant
-                    | NodeKind::Method
-                    | NodeKind::Class
-                    | NodeKind::Interface
-            )
-    })?;
+    let target = context
+        .get_nodes_in_file_shared(&file)
+        .into_iter()
+        .find(|n| {
+            n.name == leaf
+                && matches!(
+                    n.kind,
+                    NodeKind::Function
+                        | NodeKind::Struct
+                        | NodeKind::Union
+                        | NodeKind::Enum
+                        | NodeKind::Trait
+                        | NodeKind::TypeAlias
+                        | NodeKind::Constant
+                        | NodeKind::Method
+                        | NodeKind::Class
+                        | NodeKind::Interface
+                )
+        })?;
     Some(ResolvedRef {
         original: reference.clone(),
-        target_node_id: target.id,
+        target_node_id: target.id.clone(),
         confidence: 0.9,
         resolved_by: ResolvedBy::Import,
     })
@@ -2495,13 +2498,13 @@ fn resolve_lua_require(
             continue;
         }
         if let Some(file_node) = context
-            .get_nodes_in_file(best)
+            .get_nodes_in_file_shared(best)
             .into_iter()
             .find(|n| n.kind == NodeKind::File)
         {
             return Some(ResolvedRef {
                 original: reference.clone(),
-                target_node_id: file_node.id,
+                target_node_id: file_node.id.clone(),
                 confidence: 0.9,
                 resolved_by: ResolvedBy::Import,
             });
