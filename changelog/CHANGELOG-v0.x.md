@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.47.3](https://github.com/sunerpy/codegraph-rust/compare/v0.47.2...v0.47.3) (2026-08-27)
+
+
+### Bug Fixes
+
+* **resolve:** cache parallel snapshot lookups ([#237](https://github.com/sunerpy/codegraph-rust/issues/237)) ([2b51d68](https://github.com/sunerpy/codegraph-rust/commit/2b51d687bdd1e0cf843bcc0e80afc6e20a1c505b))
+
 ## [0.47.2](https://github.com/sunerpy/codegraph-rust/compare/v0.47.1...v0.47.2) (2026-08-27)
 
 
