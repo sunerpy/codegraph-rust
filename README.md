@@ -20,7 +20,6 @@ No AI/LLM anywhere inside the binary — output is byte-stable and deterministic
 ## Table of Contents
 
 - [Quickstart](#quickstart)
-- [Upgrading from v0.40.4](#upgrading-from-v0404)
 - [Installation](#installation)
   - [One-liner install (scripts)](#one-liner-install-scripts)
   - [Prebuilt binaries](#prebuilt-binaries)
@@ -61,35 +60,6 @@ codegraph init  /path/to/project                 # create .codegraph/ and run th
 codegraph search "<symbol>" -p /path/to/project  # full-text symbol search (`query` is a legacy alias)
 codegraph serve --mcp --path /path/to/project    # MCP server (--path optional, defaults to cwd)
 ```
-
----
-
-## Upgrading from v0.40.4
-
-The per-project index remains at `<project>/.codegraph/`. A v0.40.4 database has
-no authenticated index-state slots, so current releases do not read it as a
-current index. Run `codegraph init` once: while holding the exclusive index
-lease, CodeGraph replaces only the stale `codegraph.db`, `codegraph.db-wal`, and
-`codegraph.db-shm` artifacts and publishes a fresh current index.
-
-Project configuration remains in `.codegraph/config.toml` and
-`.codegraph/codegraph.json`; daemon rendezvous files (`daemon.pid`,
-`daemon.sock`, `daemon.log`) also live under `.codegraph/`. The compatibility
-fields `legacyIndexPresent` and `legacyIndexPaths` remain in `status --json`, but
-always report `false` and `[]` respectively.
-
-### Re-index required for content-header generated-file detection
-
-Generated-file detection now also reads a file's **content banner**, not only its
-filename, so a machine-written `payroll.go` carrying
-`// Code generated … DO NOT EDIT.` is demoted in ranking like a `.pb.go` file
-already was. The verdict is computed at index time and stored on the file row.
-
-An index built by an earlier release therefore reports every file as
-non-generated for the content half until it is re-extracted. Nothing breaks in the
-meantime — the filename signal keeps working exactly as before — and the next
-`codegraph index` or `codegraph sync` picks the new detection up automatically,
-since the extraction-version bump classifies the old index as outdated.
 
 ---
 
