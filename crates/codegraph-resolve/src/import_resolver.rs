@@ -1432,7 +1432,7 @@ pub fn resolve_via_import(
     }
 
     let imports = context.get_import_mappings(&reference.file_path, reference.language);
-    if imports.is_empty() && context.read_file(&reference.file_path).is_none() {
+    if imports.is_empty() && !context.is_file_readable(&reference.file_path) {
         return None;
     }
 

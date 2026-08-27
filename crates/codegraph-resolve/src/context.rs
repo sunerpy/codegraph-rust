@@ -17,9 +17,9 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::path::Path;
 
-/// `DEFAULT_CACHE_LIMIT` (`index.ts:54`). Override via env in the upstream; the v1 port
-/// keeps the fixed default since resolution is a single batch.
-const DEFAULT_CACHE_LIMIT: usize = 5_000;
+/// `DEFAULT_CACHE_LIMIT` (`index.ts:54`). Override via env in the upstream; the
+/// Rust port keeps the fixed default for one resolution run.
+pub(crate) const DEFAULT_CACHE_LIMIT: usize = 5_000;
 
 /// A [`ResolutionContext`] over a [`Store`] plus the project root.
 ///
