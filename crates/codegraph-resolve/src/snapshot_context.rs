@@ -8,9 +8,10 @@
 //! [`StoreResolutionContext`](crate::context::StoreResolutionContext) holds a
 //! live `&Store` handle behind `RefCell<Caches>` (LRU memoisation), so it is
 //! NOT `Sync` and cannot back a `rayon` parallel resolve. This type captures the
-//! same read surface into immutable, precomputed `Arc` state so it can be shared
-//! across threads (`SnapshotResolutionContext: Sync`) while producing
-//! BYTE-IDENTICAL results to the store-backed context.
+//! same graph read surface into immutable node state plus bounded thread-safe
+//! caches, so it can be shared across threads
+//! (`SnapshotResolutionContext: Sync`) while producing BYTE-IDENTICAL results
+//! to the store-backed context.
 //!
 //! The snapshot is split in two:
 //!   * a WHOLE-RUN immutable part (nodes + project config), built once from the
@@ -25,21 +26,165 @@
 //! applying the identical [`order_candidates`](crate::context) tie-break, so the
 //! candidate order matches the store context exactly.
 
-use crate::context::order_candidates_pub;
+use crate::context::{DEFAULT_CACHE_LIMIT, order_candidates_pub};
 use crate::import_resolver;
 use crate::path_aliases::{AliasMap, load_project_aliases};
 use crate::types::{GoModule, ImportMapping, ReExport, ResolutionContext};
 use crate::workspace_packages::{WorkspacePackages, load_workspace_packages};
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use codegraph_store::Store;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
+
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 
 /// Edge-adjacency for [`SnapshotResolutionContext::get_supertypes`]: source
 /// node id → its `implements`/`extends` `(target_id, kind)` pairs, in the
-/// store's `edges_by_source_kind` order (Implements queried before Extends).
+/// store's row order within each kind (Implements queried before Extends).
 pub type EdgeAdjacency = Arc<HashMap<String, Vec<(String, EdgeKind)>>>;
+
+/// One single-flight value plus the access bit used by the bounded clock cache.
+struct MemoEntry<V> {
+    value: OnceLock<V>,
+    recently_used: AtomicBool,
+}
+
+impl<V> MemoEntry<V> {
+    fn new() -> Self {
+        Self {
+            value: OnceLock::new(),
+            recently_used: AtomicBool::new(true),
+        }
+    }
+}
+
+struct BoundedFileMemoState<V> {
+    entries: HashMap<Arc<str>, Arc<MemoEntry<V>>>,
+    order: VecDeque<Arc<str>>,
+}
+
+/// Bounded, read-concurrent file-keyed memoisation.
+///
+/// Hits take only a shared lock and an atomic access-bit update. Misses install
+/// a [`OnceLock`] before doing I/O or parsing, so concurrent callers for the
+/// same file share one initialization. The clock eviction policy approximates
+/// the upstream LRU without the existing `VecDeque::position` scan on every hit.
+struct BoundedFileMemo<V> {
+    max_entries: usize,
+    state: RwLock<BoundedFileMemoState<V>>,
+}
+
+impl<V> BoundedFileMemo<V>
+where
+    V: Clone,
+{
+    fn new(max_entries: usize) -> Self {
+        assert!(
+            max_entries > 0,
+            "BoundedFileMemo max_entries must be positive"
+        );
+        Self {
+            max_entries,
+            state: RwLock::new(BoundedFileMemoState {
+                entries: HashMap::new(),
+                order: VecDeque::new(),
+            }),
+        }
+    }
+
+    fn get_or_init(&self, file_path: &str, init: impl FnOnce() -> V) -> V {
+        let cached = {
+            let state = self
+                .state
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.entries.get(file_path).cloned()
+        };
+        let entry = match cached {
+            Some(entry) => {
+                entry.recently_used.store(true, Ordering::Relaxed);
+                entry
+            }
+            None => {
+                let mut state = self
+                    .state
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(entry) = state.entries.get(file_path).cloned() {
+                    entry.recently_used.store(true, Ordering::Relaxed);
+                    entry
+                } else {
+                    while state.entries.len() >= self.max_entries {
+                        let Some(oldest) = state.order.pop_front() else {
+                            state.entries.clear();
+                            break;
+                        };
+                        let Some(oldest_entry) = state.entries.get(oldest.as_ref()).cloned() else {
+                            continue;
+                        };
+                        if oldest_entry.recently_used.swap(false, Ordering::Relaxed) {
+                            state.order.push_back(oldest);
+                        } else {
+                            state.entries.remove(oldest.as_ref());
+                        }
+                    }
+
+                    let key: Arc<str> = Arc::from(file_path);
+                    let entry = Arc::new(MemoEntry::new());
+                    state.entries.insert(Arc::clone(&key), Arc::clone(&entry));
+                    state.order.push_back(key);
+                    entry
+                }
+            }
+        };
+
+        entry.value.get_or_init(init).clone()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entries
+            .len()
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct SnapshotCacheCounters {
+    file_loads: AtomicUsize,
+    import_parses: AtomicUsize,
+    re_export_parses: AtomicUsize,
+}
+
+/// Whole-run file-derived caches shared by every per-chunk context clone.
+struct SnapshotCaches {
+    file_contents: BoundedFileMemo<Option<Arc<str>>>,
+    import_mappings: BoundedFileMemo<Arc<Vec<ImportMapping>>>,
+    re_exports: BoundedFileMemo<Arc<Vec<ReExport>>>,
+    #[cfg(test)]
+    counters: SnapshotCacheCounters,
+}
+
+impl SnapshotCaches {
+    fn new() -> Self {
+        // Match the upstream/store budgets: full source text gets one fifth of
+        // the normal cache because it dominates retained memory.
+        let content_limit = std::cmp::max(64, DEFAULT_CACHE_LIMIT / 5);
+        Self {
+            file_contents: BoundedFileMemo::new(content_limit),
+            import_mappings: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
+            re_exports: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
+            #[cfg(test)]
+            counters: SnapshotCacheCounters::default(),
+        }
+    }
+}
 
 /// WHOLE-RUN immutable node + project-config snapshot, shared across chunks.
 ///
@@ -67,14 +212,13 @@ struct NodeSnapshot {
 /// plus a per-chunk [`EdgeAdjacency`] map.
 ///
 /// Mirrors the read surface of
-/// [`StoreResolutionContext`](crate::context::StoreResolutionContext) without
-/// any interior mutability or live store handle, so it is `Sync` and usable from
-/// a `rayon` parallel map. File-derived methods (`read_file`,
-/// `get_import_mappings`, `get_re_exports`) read the immutable filesystem
-/// directly (thread-safe `std::fs`), exactly as the store context does on a
-/// cache miss; the candidate ordering, parsing, and aliasing all match.
+/// [`StoreResolutionContext`](crate::context::StoreResolutionContext) without a
+/// live store handle, so it is `Sync` and usable from a `rayon` parallel map.
+/// File-derived methods share bounded, single-flight run caches; candidate
+/// ordering, parsing, and aliasing still match the store context.
 pub struct SnapshotResolutionContext {
     snapshot: Arc<NodeSnapshot>,
+    caches: Arc<SnapshotCaches>,
     /// Per-chunk `implements`/`extends` adjacency for [`Self::get_supertypes`].
     /// Empty until the resolver installs a chunk's map (T4); an empty map yields
     /// the same result the store context gives before any such edge exists.
@@ -172,7 +316,20 @@ impl SnapshotResolutionContext {
                 go_module,
                 go_modules,
             }),
+            caches: Arc::new(SnapshotCaches::new()),
             edges: Arc::new(HashMap::new()),
+        })
+    }
+
+    fn read_file_cached(&self, file_path: &str) -> Option<Arc<str>> {
+        self.caches.file_contents.get_or_init(file_path, || {
+            #[cfg(test)]
+            self.caches
+                .counters
+                .file_loads
+                .fetch_add(1, Ordering::Relaxed);
+            let full_path = Path::new(&self.snapshot.project_root).join(file_path);
+            std::fs::read_to_string(full_path).ok().map(Arc::from)
         })
     }
 
@@ -189,8 +346,21 @@ impl SnapshotResolutionContext {
     pub fn with_edge_adjacency(&self, edges: EdgeAdjacency) -> Self {
         Self {
             snapshot: Arc::clone(&self.snapshot),
+            caches: Arc::clone(&self.caches),
             edges,
         }
+    }
+
+    #[cfg(test)]
+    fn cache_counts(&self) -> (usize, usize, usize) {
+        (
+            self.caches.counters.file_loads.load(Ordering::Relaxed),
+            self.caches.counters.import_parses.load(Ordering::Relaxed),
+            self.caches
+                .counters
+                .re_export_parses
+                .load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -243,8 +413,13 @@ impl ResolutionContext for SnapshotResolutionContext {
     }
 
     fn read_file(&self, file_path: &str) -> Option<String> {
-        let full_path = Path::new(&self.snapshot.project_root).join(file_path);
-        std::fs::read_to_string(&full_path).ok()
+        self.read_file_cached(file_path)
+            .as_deref()
+            .map(str::to_owned)
+    }
+
+    fn is_file_readable(&self, file_path: &str) -> bool {
+        self.read_file_cached(file_path).is_some()
     }
 
     fn get_project_root(&self) -> &str {
@@ -308,10 +483,22 @@ impl ResolutionContext for SnapshotResolutionContext {
     }
 
     fn get_import_mappings(&self, file_path: &str, language: Language) -> Vec<ImportMapping> {
-        match self.read_file(file_path) {
-            Some(text) => import_resolver::extract_import_mappings(&text, language),
-            None => Vec::new(),
-        }
+        self.caches
+            .import_mappings
+            .get_or_init(file_path, || {
+                #[cfg(test)]
+                self.caches
+                    .counters
+                    .import_parses
+                    .fetch_add(1, Ordering::Relaxed);
+                Arc::new(
+                    self.read_file_cached(file_path)
+                        .map(|text| import_resolver::extract_import_mappings(&text, language))
+                        .unwrap_or_default(),
+                )
+            })
+            .as_ref()
+            .clone()
     }
 
     fn get_project_aliases(&self) -> Option<AliasMap> {
@@ -331,19 +518,30 @@ impl ResolutionContext for SnapshotResolutionContext {
     }
 
     fn get_re_exports(&self, file_path: &str, language: Language) -> Vec<ReExport> {
-        match self.read_file(file_path) {
-            Some(text) => {
-                // Re-key on the BARREL file's own extension (matches the store
-                // context: js-family files parse as TypeScript).
-                let lang = if crate::context::is_js_family_path_pub(file_path) {
-                    Language::TypeScript
-                } else {
-                    language
-                };
-                import_resolver::extract_re_exports(&text, lang)
-            }
-            None => Vec::new(),
-        }
+        self.caches
+            .re_exports
+            .get_or_init(file_path, || {
+                #[cfg(test)]
+                self.caches
+                    .counters
+                    .re_export_parses
+                    .fetch_add(1, Ordering::Relaxed);
+                Arc::new(match self.read_file_cached(file_path) {
+                    Some(text) => {
+                        // Re-key on the BARREL file's own extension (matches the
+                        // store context: js-family files parse as TypeScript).
+                        let lang = if crate::context::is_js_family_path_pub(file_path) {
+                            Language::TypeScript
+                        } else {
+                            language
+                        };
+                        import_resolver::extract_re_exports(&text, lang)
+                    }
+                    None => Vec::new(),
+                })
+            })
+            .as_ref()
+            .clone()
     }
 }
 
@@ -354,17 +552,14 @@ impl ResolutionContext for SnapshotResolutionContext {
 /// sees the same edges the store context would.
 pub fn build_edge_adjacency(store: &Store) -> anyhow::Result<EdgeAdjacency> {
     let mut adjacency: HashMap<String, Vec<(String, EdgeKind)>> = HashMap::new();
-    for node in store.all_nodes()? {
-        for edge_kind in [EdgeKind::Implements, EdgeKind::Extends] {
-            let edges = store
-                .edges_by_source_kind(&node.id, Some(edge_kind))
-                .unwrap_or_default();
-            for edge in edges {
-                adjacency
-                    .entry(node.id.clone())
-                    .or_default()
-                    .push((edge.target, edge.kind));
-            }
+    // Two graph-wide indexed queries replace two queries PER NODE. Query kinds
+    // in this order to preserve the old adjacency ordering exactly.
+    for edge_kind in [EdgeKind::Implements, EdgeKind::Extends] {
+        for edge in store.edges_by_kind(edge_kind)? {
+            adjacency
+                .entry(edge.source)
+                .or_default()
+                .push((edge.target, edge.kind));
         }
     }
     Ok(Arc::new(adjacency))
@@ -485,30 +680,138 @@ mod tests {
     }
 
     #[test]
-    fn read_file_and_import_and_re_exports() {
+    fn read_file_and_import_and_re_exports_are_cached() {
         let root = temp_root("read");
         let store = Store::open(&root.join("index.db")).unwrap();
+        let original =
+            "import { foo } from './c';\nexport { foo } from './c';\nexport * from './d';\n";
+        std::fs::write(root.join("b.ts"), original).unwrap();
+        let ctx = SnapshotResolutionContext::from_store(&store, root.to_str().unwrap()).unwrap();
+
+        assert_eq!(ctx.read_file("b.ts").as_deref(), Some(original));
+        let imports = ctx.get_import_mappings("b.ts", Language::TypeScript);
+        let re_exports = ctx.get_re_exports("b.ts", Language::TypeScript);
+        assert!(!imports.is_empty());
+        assert!(!re_exports.is_empty());
+
+        // All three caches retain the first immutable-run view, including across
+        // the per-chunk context clones used by the parallel resolver.
         std::fs::write(
             root.join("b.ts"),
-            "import { foo } from './c';\nexport { foo } from './c';\nexport * from './d';\n",
+            "import { changed } from './new';\nexport { changed } from './new';\n",
         )
         .unwrap();
-        let ctx = SnapshotResolutionContext::from_store(&store, root.to_str().unwrap()).unwrap();
-        assert!(ctx.read_file("b.ts").is_some());
-        assert!(ctx.read_file("missing.ts").is_none());
-        assert!(
-            !ctx.get_import_mappings("b.ts", Language::TypeScript)
-                .is_empty()
+        let cloned = ctx.with_edge_adjacency(Arc::new(HashMap::new()));
+        assert_eq!(cloned.read_file("b.ts").as_deref(), Some(original));
+        assert_eq!(
+            cloned.get_import_mappings("b.ts", Language::TypeScript),
+            imports
         );
+        assert_eq!(
+            cloned.get_re_exports("b.ts", Language::TypeScript),
+            re_exports
+        );
+
+        assert!(ctx.read_file("missing.ts").is_none());
+        assert!(!ctx.is_file_readable("missing.ts"));
         assert!(
             ctx.get_import_mappings("gone.ts", Language::TypeScript)
                 .is_empty()
         );
-        assert!(!ctx.get_re_exports("b.ts", Language::TypeScript).is_empty());
         assert!(
             ctx.get_re_exports("gone.ts", Language::TypeScript)
                 .is_empty()
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn bounded_file_memo_is_single_flight_and_bounded() {
+        let cache = Arc::new(BoundedFileMemo::new(2));
+        let starts = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let cache = Arc::clone(&cache);
+            let starts = Arc::clone(&starts);
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                cache.get_or_init("shared.ts", || {
+                    starts.fetch_add(1, Ordering::Relaxed);
+                    7
+                })
+            }));
+        }
+        for worker in workers {
+            assert_eq!(worker.join().unwrap(), 7);
+        }
+        assert_eq!(starts.load(Ordering::Relaxed), 1);
+
+        assert_eq!(cache.get_or_init("second.ts", || 2), 2);
+        assert_eq!(cache.get_or_init("third.ts", || 3), 3);
+        assert_eq!(cache.len(), 2);
+        assert_eq!(
+            cache.get_or_init("shared.ts", || {
+                starts.fetch_add(1, Ordering::Relaxed);
+                9
+            }),
+            9,
+            "the oldest entry is reloaded after bounded eviction"
+        );
+        assert_eq!(starts.load(Ordering::Relaxed), 2);
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn parallel_file_derived_lookups_initialize_once() {
+        let root = temp_root("parallel-cache");
+        let store = Store::open(&root.join("index.db")).unwrap();
+        std::fs::write(
+            root.join("b.ts"),
+            "import { foo } from './c';\nexport { foo } from './c';\n",
+        )
+        .unwrap();
+        let ctx = Arc::new(
+            SnapshotResolutionContext::from_store(&store, root.to_str().unwrap()).unwrap(),
+        );
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let mut workers = Vec::new();
+        for _ in 0..16 {
+            let ctx = Arc::clone(&ctx);
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                assert!(ctx.read_file("b.ts").is_some());
+                assert!(
+                    !ctx.get_import_mappings("b.ts", Language::TypeScript)
+                        .is_empty()
+                );
+                assert!(!ctx.get_re_exports("b.ts", Language::TypeScript).is_empty());
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        assert_eq!(
+            ctx.cache_counts(),
+            (1, 1, 1),
+            "file I/O and both parsers are single-flight across rayon-style callers"
+        );
+        let cloned = ctx.with_edge_adjacency(Arc::new(HashMap::new()));
+        assert!(cloned.read_file("b.ts").is_some());
+        assert!(
+            !cloned
+                .get_import_mappings("b.ts", Language::TypeScript)
+                .is_empty()
+        );
+        assert!(
+            !cloned
+                .get_re_exports("b.ts", Language::TypeScript)
+                .is_empty()
+        );
+        assert_eq!(cloned.cache_counts(), (1, 1, 1));
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -556,6 +859,61 @@ mod tests {
         let store = Store::open(&root.join("index.db")).unwrap();
         let adjacency = build_edge_adjacency(&store).expect("adjacency");
         assert!(adjacency.is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn build_edge_adjacency_bulk_query_keeps_kind_order() {
+        let root = temp_root("adj-order");
+        let mut store = Store::open(&root.join("index.db")).unwrap();
+        store.upsert_file(&file_record("a.ts", 3)).unwrap();
+        store
+            .upsert_nodes(&[
+                node("child", "Child", NodeKind::Class, "a.ts", 1, 0),
+                node(
+                    "implemented",
+                    "Implemented",
+                    NodeKind::Interface,
+                    "a.ts",
+                    2,
+                    0,
+                ),
+                node("extended", "Extended", NodeKind::Class, "a.ts", 3, 0),
+            ])
+            .unwrap();
+        store
+            .insert_edges(&[
+                Edge {
+                    id: None,
+                    source: "child".to_string(),
+                    target: "extended".to_string(),
+                    kind: EdgeKind::Extends,
+                    metadata: None,
+                    line: Some(1),
+                    col: Some(0),
+                    provenance: None,
+                },
+                Edge {
+                    id: None,
+                    source: "child".to_string(),
+                    target: "implemented".to_string(),
+                    kind: EdgeKind::Implements,
+                    metadata: None,
+                    line: Some(1),
+                    col: Some(0),
+                    provenance: None,
+                },
+            ])
+            .unwrap();
+
+        let adjacency = build_edge_adjacency(&store).unwrap();
+        assert_eq!(
+            adjacency.get("child").unwrap(),
+            &vec![
+                ("implemented".to_string(), EdgeKind::Implements),
+                ("extended".to_string(), EdgeKind::Extends),
+            ]
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

@@ -318,6 +318,14 @@ pub trait ResolutionContext {
     fn file_exists(&self, file_path: &str) -> bool;
     /// Read file content (`readFile`); `None` when unreadable.
     fn read_file(&self, file_path: &str) -> Option<String>;
+    /// Whether [`Self::read_file`] can produce source text.
+    ///
+    /// The default preserves the exact `read_file` semantics. Contexts with
+    /// shared source buffers may override this to avoid cloning the full file
+    /// when a caller only needs the readable/unreadable distinction.
+    fn is_file_readable(&self, file_path: &str) -> bool {
+        self.read_file(file_path).is_some()
+    }
     /// Get project root (`getProjectRoot`).
     fn get_project_root(&self) -> &str;
     /// Get all files (`getAllFiles`).
@@ -752,6 +760,7 @@ mod tests {
         assert_eq!(ctx.get_nodes_by_kind(NodeKind::Class).len(), 1);
         assert!(!ctx.file_exists("a.ts"));
         assert!(ctx.read_file("a.ts").is_none());
+        assert!(!ctx.is_file_readable("a.ts"));
         assert_eq!(ctx.get_project_root(), "/proj");
         assert!(ctx.get_all_files().is_empty());
         assert!(ctx.get_nodes_by_lower_name("foo").is_empty());

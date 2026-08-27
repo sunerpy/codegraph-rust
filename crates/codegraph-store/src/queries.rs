@@ -672,6 +672,19 @@ impl Store {
         }
     }
 
+    /// Every edge of `kind`, ordered by row id.
+    ///
+    /// This is the bulk counterpart to [`Self::edges_by_source_kind`]. Callers
+    /// that need one graph-wide edge class should issue one indexed query rather
+    /// than one query per source node.
+    pub fn edges_by_kind(&self, kind: EdgeKind) -> rusqlite::Result<Vec<Edge>> {
+        query_edges(
+            &self.conn,
+            "SELECT * FROM edges WHERE kind = ? ORDER BY id",
+            [kind.as_str()],
+        )
+    }
+
     /// Ports `getIncomingEdges` from `upstream db/queries.ts:1339-1354`.
     pub fn edges_by_target_kind(
         &self,
@@ -2251,6 +2264,62 @@ mod tests {
             .unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].target, "function:target");
+    }
+
+    #[test]
+    fn edges_by_kind_returns_only_requested_kind_in_row_order() {
+        let mut store = store("edges-by-kind");
+        let source = node("function:source", "source", "src/e.rs");
+        let first = node("function:first", "first", "src/e.rs");
+        let second = node("function:second", "second", "src/e.rs");
+        let third = node("function:third", "third", "src/e.rs");
+        store.upsert_nodes(&[source, first, second, third]).unwrap();
+        store
+            .insert_edges(&[
+                Edge {
+                    id: None,
+                    source: "function:source".to_string(),
+                    target: "function:first".to_string(),
+                    kind: EdgeKind::Extends,
+                    metadata: None,
+                    line: None,
+                    col: None,
+                    provenance: None,
+                },
+                Edge {
+                    id: None,
+                    source: "function:source".to_string(),
+                    target: "function:second".to_string(),
+                    kind: EdgeKind::Implements,
+                    metadata: None,
+                    line: None,
+                    col: None,
+                    provenance: None,
+                },
+                Edge {
+                    id: None,
+                    source: "function:source".to_string(),
+                    target: "function:third".to_string(),
+                    kind: EdgeKind::Extends,
+                    metadata: None,
+                    line: None,
+                    col: None,
+                    provenance: None,
+                },
+            ])
+            .unwrap();
+
+        let extends = store.edges_by_kind(EdgeKind::Extends).unwrap();
+        assert_eq!(
+            extends
+                .iter()
+                .map(|edge| edge.target.as_str())
+                .collect::<Vec<_>>(),
+            vec!["function:first", "function:third"]
+        );
+        let implements = store.edges_by_kind(EdgeKind::Implements).unwrap();
+        assert_eq!(implements.len(), 1);
+        assert_eq!(implements[0].target, "function:second");
     }
 
     #[test]
