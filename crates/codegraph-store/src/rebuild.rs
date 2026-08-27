@@ -336,7 +336,9 @@ fn remove_owner_mismatched_state_slots(
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    tracing::info!(
+    // Keep successful cache recovery available for opt-in diagnostics without
+    // splitting the foreground CLI's progress renderer at the default INFO level.
+    tracing::debug!(
         slots = %removed,
         reason = "project identity mismatch after move or copy",
         "replaced stale foreign index state slots"
@@ -415,7 +417,9 @@ fn begin_from_authorization(
     remove_database_files(paths, &lease)?;
     checkpoint(fault, RebuildCheckpoint::DatabaseRemoved)?;
     if let Some(path) = replaced_artifact {
-        tracing::info!(
+        // This is successful internal recovery, not a user-facing warning.
+        // DEBUG preserves observability without interleaving raw logs with init.
+        tracing::debug!(
             path = %path.display(),
             reason = "missing state slots",
             "replaced stale foreign index database"

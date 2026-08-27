@@ -84,7 +84,8 @@ fn run_in_env(registry_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Run 
     let mut cmd = Command::new(bin());
     cmd.args(args)
         .env("CODEGRAPH_HTTP_REGISTRY_DIR", registry_dir)
-        .env("CODEGRAPH_NO_DAEMON", "1");
+        .env("CODEGRAPH_NO_DAEMON", "1")
+        .env("RUST_LOG", "info");
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -150,8 +151,8 @@ fn init_writes_default_project_local_codegraph_root() {
 
 /// A real pre-state-slot SQLite index in the selected root is a rebuildable
 /// foreign cache, not an unrecoverable contradiction. `init` must acquire its
-/// one rebuild lease, replace that database automatically, and explain the
-/// one-time replacement at INFO level.
+/// one rebuild lease and replace that database automatically without injecting
+/// raw logger output into the normal progress UI.
 #[test]
 fn init_takes_over_real_sqlite_database_without_state_slots() {
     let dir = TestDir::new("foreign-db-takeover");
@@ -168,12 +169,10 @@ fn init_takes_over_real_sqlite_database_without_state_slots() {
         run.stdout, run.stderr
     );
     assert!(
-        run.stderr.contains("replaced stale foreign index database")
-            && run
-                .stderr
-                .contains(&paths.current_db().display().to_string())
-            && run.stderr.contains("missing state slots"),
-        "INFO log must name the replaced DB and the Missing-state reason: stderr={}",
+        !run.stderr.contains("replaced stale foreign index database")
+            && !run.stderr.contains("codegraph_store::rebuild")
+            && !run.stderr.contains(" INFO "),
+        "normal init progress must not be split by recovery logger output: stderr={}",
         run.stderr
     );
 
@@ -190,6 +189,36 @@ fn init_takes_over_real_sqlite_database_without_state_slots() {
             .expect("query foreign-only marker"),
         None,
         "takeover must rebuild instead of adopting foreign rows"
+    );
+}
+
+#[test]
+fn foreign_database_replacement_details_require_debug_logging() {
+    let dir = TestDir::new("foreign-db-debug-log");
+    let project = dir.path().join("mini");
+    copy_tree(&mini_fixture(), &project);
+    let paths = IndexPaths::resolve(&project, None).expect("resolve selected index root");
+    stage_foreign_database(&paths);
+
+    let run = run_in_env(
+        dir.path(),
+        &["init", project.to_str().unwrap()],
+        &[("RUST_LOG", "codegraph_store::rebuild=debug")],
+    );
+    assert!(
+        run.ok,
+        "debug init must still replace a Missing-state SQLite index: stdout={} stderr={}",
+        run.stdout, run.stderr
+    );
+    assert!(
+        run.stderr.contains("replaced stale foreign index database")
+            && run
+                .stderr
+                .contains(&paths.current_db().display().to_string())
+            && run.stderr.contains("missing state slots")
+            && run.stderr.contains("DEBUG"),
+        "explicit debug logging must retain replacement diagnostics: stderr={}",
+        run.stderr
     );
 }
 
