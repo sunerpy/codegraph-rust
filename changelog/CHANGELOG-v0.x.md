@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.47.5](https://github.com/sunerpy/codegraph-rust/compare/v0.47.4...v0.47.5) (2026-08-27)
+
+
+### Bug Fixes
+
+* **resolve:** avoid cloning snapshot nodes during resolution ([#242](https://github.com/sunerpy/codegraph-rust/issues/242)) ([fe9f0a7](https://github.com/sunerpy/codegraph-rust/commit/fe9f0a730d6d0253cbe692c49106a42c32af2109))
+
 ## [0.47.4](https://github.com/sunerpy/codegraph-rust/compare/v0.47.3...v0.47.4) (2026-08-27)
 
 
