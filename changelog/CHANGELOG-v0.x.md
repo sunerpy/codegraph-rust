@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.48.1](https://github.com/sunerpy/codegraph-rust/compare/v0.48.0...v0.48.1) (2026-08-28)
+
+
+### Bug Fixes
+
+* **store:** allow shared leases on read-only indexes ([#246](https://github.com/sunerpy/codegraph-rust/issues/246)) ([399c70b](https://github.com/sunerpy/codegraph-rust/commit/399c70bb5e6c85f68c0ee842fd877e30be2d9624))
+
 ## [0.48.0](https://github.com/sunerpy/codegraph-rust/compare/v0.47.5...v0.48.0) (2026-08-28)
 
 
