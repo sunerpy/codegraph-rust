@@ -381,8 +381,10 @@ pub fn run_skill_install(args: SkillArgs) -> Result<()> {
 }
 
 /// `codegraph skill update`: preview the version transition + line counts, then
-/// refresh safe/outdated content. `--diff` adds a unified diff, `--dry-run`
-/// suppresses writes, and `--force` overwrites locally modified content.
+/// refresh safe/outdated skill content and each target's marker-managed
+/// instructions block. `--diff` adds a unified skill diff, `--dry-run`
+/// suppresses every write, and `--force` overwrites locally modified skill
+/// content. User text outside the managed instructions markers is untouched.
 pub fn run_skill_update(args: SkillArgs) -> Result<()> {
     let ctx = context_from_env()?;
     let (location, targets) = resolve_skill_targets(&ctx, &args)?;
@@ -391,7 +393,8 @@ pub fn run_skill_update(args: SkillArgs) -> Result<()> {
         return Ok(());
     }
 
-    let mut changed_names: Vec<&str> = Vec::new();
+    let mut skill_changed_names: Vec<&str> = Vec::new();
+    let mut instructions_changed_names: Vec<&str> = Vec::new();
     for target in &targets {
         let Some(skill_dir) = target.resolved_skill_dir(&ctx, location) else {
             println!(
@@ -412,9 +415,22 @@ pub fn run_skill_update(args: SkillArgs) -> Result<()> {
             print!("{diff}");
         }
 
+        let instructions_preview = target.preview_managed_instructions(&ctx, location);
+        if let Some(file) = &instructions_preview {
+            println!(
+                "{}",
+                managed_instructions_preview_line(target.display_name(), &ctx, file, args.dry_run)
+            );
+        }
+
         if args.dry_run {
             if preview.decision == skill::SkillUpdateDecision::Update {
-                changed_names.push(target.display_name());
+                skill_changed_names.push(target.display_name());
+            }
+            if instructions_preview.as_ref().is_some_and(|file| {
+                matches!(file.action, FileAction::Created | FileAction::Updated)
+            }) {
+                instructions_changed_names.push(target.display_name());
             }
             continue;
         }
@@ -425,32 +441,118 @@ pub fn run_skill_update(args: SkillArgs) -> Result<()> {
             .iter()
             .any(|file| matches!(file.action, FileAction::Created | FileAction::Updated))
         {
-            changed_names.push(target.display_name());
+            skill_changed_names.push(target.display_name());
         }
         report_write_result(target.display_name(), &ctx, &result);
+
+        if let Some(file) = target.refresh_managed_instructions(&ctx, location) {
+            if matches!(file.action, FileAction::Created | FileAction::Updated) {
+                instructions_changed_names.push(target.display_name());
+            }
+            report_write_result(
+                target.display_name(),
+                &ctx,
+                &WriteResult {
+                    files: vec![file],
+                    notes: Vec::new(),
+                },
+            );
+        }
     }
 
     if args.dry_run {
-        if changed_names.is_empty() {
-            println!("\nDry run: no skill files would change.");
-        } else {
+        if skill_changed_names.is_empty() && instructions_changed_names.is_empty() {
+            println!("\nDry run: no CodeGraph skill assets would change.");
+        }
+        if !skill_changed_names.is_empty() {
             println!(
                 "\nDry run: would update the CodeGraph skill for {} agent{}: {}.",
-                changed_names.len(),
-                if changed_names.len() > 1 { "s" } else { "" },
-                changed_names.join(", ")
+                skill_changed_names.len(),
+                if skill_changed_names.len() > 1 {
+                    "s"
+                } else {
+                    ""
+                },
+                skill_changed_names.join(", ")
             );
         }
-    } else if !changed_names.is_empty() {
-        println!(
-            "\nUpdated the CodeGraph skill for {} agent{}: {}.",
-            changed_names.len(),
-            if changed_names.len() > 1 { "s" } else { "" },
-            changed_names.join(", ")
-        );
+        if !instructions_changed_names.is_empty() {
+            println!(
+                "\nDry run: would refresh managed CodeGraph instructions for {} agent{}: {}.",
+                instructions_changed_names.len(),
+                if instructions_changed_names.len() > 1 {
+                    "s"
+                } else {
+                    ""
+                },
+                instructions_changed_names.join(", ")
+            );
+        }
+    } else {
+        if !skill_changed_names.is_empty() {
+            println!(
+                "\nUpdated the CodeGraph skill for {} agent{}: {}.",
+                skill_changed_names.len(),
+                if skill_changed_names.len() > 1 {
+                    "s"
+                } else {
+                    ""
+                },
+                skill_changed_names.join(", ")
+            );
+        }
+        if !instructions_changed_names.is_empty() {
+            println!(
+                "\nRefreshed managed CodeGraph instructions for {} agent{}: {}.",
+                instructions_changed_names.len(),
+                if instructions_changed_names.len() > 1 {
+                    "s"
+                } else {
+                    ""
+                },
+                instructions_changed_names.join(", ")
+            );
+        }
     }
     Ok(())
 }
+
+fn managed_instructions_preview_line(
+    display_name: &str,
+    ctx: &InstallContext,
+    file: &types::FileWrite,
+    dry_run: bool,
+) -> String {
+    let path = tildify(ctx, &file.path);
+    match (file.action, dry_run) {
+        (FileAction::Created, true) => {
+            format!("{display_name}: would create managed instructions {path}")
+        }
+        (FileAction::Updated, true) => {
+            format!("{display_name}: would refresh managed instructions {path}")
+        }
+        (FileAction::Unchanged, true) => {
+            format!("{display_name}: managed instructions up to date {path}")
+        }
+        (FileAction::Created, false) => {
+            format!("{display_name}: creating managed instructions {path}")
+        }
+        (FileAction::Updated, false) => {
+            format!("{display_name}: refreshing managed instructions {path}")
+        }
+        (FileAction::Unchanged, false) => {
+            format!("{display_name}: managed instructions up to date {path}")
+        }
+        (action, _) => format!(
+            "{display_name}: {} managed instructions {path}",
+            action.verb()
+        ),
+    }
+}
+
+// Keep the summary logic separate for skills and instructions: a target may
+// have an up-to-date or locally modified SKILL.md while its marker-managed
+// AGENTS/CLAUDE/GEMINI block still needs a safe refresh.
 
 /// `codegraph skill uninstall`. Removes the installed skill from each resolved
 /// target; an absent skill is reported as "not configured" (success exit).

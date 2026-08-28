@@ -20,7 +20,7 @@
 | `uninstall`       | Remove codegraph from agent configs (inverse of `install`)                                | `-t/--target`, `-l/--location`, `--global`, `--local`, `-y/--yes`                                                                          |
 | `skill`           | Install / update / uninstall / check the embedded agent skill                             | `<action>` (install, update, uninstall, status)                                                                                            |
 | `skill install`   | Write the embedded SKILL.md into each agent's skill directory                             | `-t/--target`, `--global`, `--local`, `-y/--yes`                                                                                           |
-| `skill update`    | Preview versions/line counts and refresh the installed skill                              | `-t/--target`, `--global`, `--local`, `--force`, `--diff`, `--dry-run`                                                                     |
+| `skill update`    | Refresh the installed skill and marker-managed agent instructions                         | `-t/--target`, `--global`, `--local`, `--force`, `--diff`, `--dry-run`                                                                     |
 | `skill uninstall` | Remove the skill from agent skill directories                                             | `-t/--target`, `--global`, `--local`, `-y/--yes`                                                                                           |
 | `skill status`    | Report install state per agent (up to date / locally modified / outdated / not installed) | `-t/--target`, `--global`, `--local`                                                                                                       |
 | `init`            | Initialize `.codegraph/` and run the first full index                                     | `[path]`, `-t/--target` (also write project-level MCP config; default `none`)                                                              |
@@ -75,7 +75,7 @@ config file; `uninstall` reverses it. No hand-editing of JSON/TOML required.
 
 Supported agents (`ALL_TARGETS` order): **Claude Code, Cursor, Codex CLI,
 opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, Trae, Qoder, Zed,
-VS Code (`vscode`), GitHub Copilot CLI (`copilot-cli`), JetBrains
+Zuno, VS Code (`vscode`), GitHub Copilot CLI (`copilot-cli`), JetBrains
 (`jetbrains`).**
 The written MCP command launches the Rust binary: `command: "codegraph"`, `args: ["serve",
 "--mcp"]` (Cursor injects `--path`; Kiro injects `--path` only on a project-local
@@ -120,6 +120,15 @@ codegraph uninstall --target=claude --local      # remove one agent's local conf
 Behavior is idempotent (upsert by the `codegraph` key). `uninstall` removes only
 codegraph's own entry and leaves other MCP servers intact. Instruction files are
 delimited by `<!-- CODEGRAPH_START -->`/`<!-- CODEGRAPH_END -->` markers.
+
+**Zuno.** `--target=zuno` supports both locations. Global files are
+`$XDG_CONFIG_HOME/zuno/zuno.json[c]` and
+`$XDG_CONFIG_HOME/zuno/AGENTS.md` (normally under `~/.config/zuno/`);
+project files are `.zuno/zuno.json[c]` and the project-root `AGENTS.md`. The MCP
+entry uses Zuno's `mcp.<name>` wrapper with
+`"command": ["codegraph", "serve", "--mcp"]`. Install migrates the older
+`mcp.codegraph-mcp-server` key to `mcp.codegraph` while preserving JSONC
+comments and sibling entries.
 
 **`--prompt-hook` (opt-in, Claude Code only).** Passing `--prompt-hook` writes an
 additional `UserPromptSubmit` hook into Claude Code's config. Before each prompt
@@ -189,11 +198,12 @@ codegraph skill status                                  # report state for all d
 codegraph skill status    --target=all                  # report state for every agent
 ```
 
-Ten of the eleven install targets have a skill directory. `--target` accepts
-those ten agent ids (`claude`, `cursor`, `codex`, `opencode`, `hermes`,
-`gemini`, `antigravity`, `kiro`, `trae`, `qoder`) plus `auto`, `all`, and
-`none`. Note: `zed` is a valid install target but has **no skill directory**
-(MCP config only) — passing `--target=zed` to `codegraph skill` is a no-op.
+Eleven of the fifteen install targets have a skill directory. `--target`
+accepts those eleven agent ids (`claude`, `cursor`, `codex`, `opencode`,
+`hermes`, `gemini`, `antigravity`, `kiro`, `trae`, `qoder`, `zuno`) plus
+`auto`, `all`, and `none`. Zed and the three GitHub Copilot targets are valid
+install targets but have **no skill directory** (MCP config only), so passing
+them to `codegraph skill` is a no-op.
 Default location is `--global`; pass `--local` to write into the project tree.
 Hermes supports global only (no automatic project-scope for skills).
 
@@ -211,10 +221,14 @@ Hermes supports global only (no automatic project-scope for skills).
 | kiro        | `~/.kiro/skills/codegraph/`           | `.kiro/skills/codegraph/`    |
 | trae        | `Trae/User/skills/codegraph/`         | `.trae/skills/codegraph/`    |
 | qoder       | `~/.agents/skills/codegraph/`         | `.qoder/skills/codegraph/`   |
+| zuno        | `~/.agents/skills/codegraph/`         | `.agents/skills/codegraph/`  |
 
 Note: opencode uses the singular `skill/` directory name (not `skills/`).
-Codex and Antigravity share `.agents/skills/` for local installs — writing both
-targets locally is idempotent (same content and hash).
+Codex, Antigravity, and Zuno may share `.agents/skills/` — writing more than one
+of those targets to the same scope is idempotent (same content and hash). Zuno
+uses the standard path intentionally because it already discovers that path;
+installing a second copy under `zuno/skills` would make same-name lookup
+ambiguous.
 
 ### Update semantics
 
@@ -242,6 +256,22 @@ same provenance, for example:
 Codex CLI: outdated (0.40.1 -> 0.47.0)
 opencode: locally modified (base 0.40.1; embedded 0.47.0)
 ```
+
+The same `skill update` command also refreshes CodeGraph's marker-fenced
+instructions for targets that install them: Claude Code, Codex CLI, opencode,
+Gemini CLI, and Zuno. Only the bytes between `<!-- CODEGRAPH_START -->` and
+`<!-- CODEGRAPH_END -->` are replaced; surrounding user instructions are
+preserved. For example:
+
+```bash
+codegraph skill update --target=zuno --global
+# refreshes ~/.config/zuno/AGENTS.md by default
+```
+
+`--dry-run` previews this instructions action as well as the Skill change and
+writes neither file. `--force` applies only to locally modified `SKILL.md`
+content; the instructions block is already explicitly installer-managed by its
+markers.
 
 ---
 

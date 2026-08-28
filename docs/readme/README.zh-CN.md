@@ -99,7 +99,8 @@ codegraph serve --mcp --path /path/to/project  # 可选：固定到指定项目
 ```
 
 自动注册进你的代理配置（Claude Code / Cursor / Codex CLI / opencode / Hermes /
-Gemini CLI / Antigravity / Kiro / Trae / Qoder / Zed）：
+Gemini CLI / Antigravity / Kiro / Trae / Qoder / Zed / Zuno / VS Code /
+Copilot CLI / JetBrains）：
 
 ```bash
 codegraph install --yes              # 检测已安装的代理并接线
@@ -186,7 +187,8 @@ cargo install --git https://github.com/sunerpy/codegraph-rust codegraph-rs
 `"args": ["serve", "--mcp", "-p", "/abs/path/to/project"]`）。
 
 支持的代理：Claude Code、Cursor、Codex CLI、opencode、Hermes Agent、
-Gemini CLI、Antigravity IDE、Kiro、Trae、Qoder、Zed。
+Gemini CLI、Antigravity IDE、Kiro、Trae、Qoder、Zed、Zuno、VS Code、
+GitHub Copilot CLI、JetBrains IDE。
 
 ```bash
 codegraph install --yes                          # 自动检测已安装代理
@@ -218,9 +220,11 @@ codegraph skill uninstall --target=claude --yes       # 从单个代理中移除
 codegraph skill status                                # 查看所有已检测代理的安装状态
 ```
 
-全部 10 个支持的代理均有技能目录（Claude Code、Cursor、Codex CLI、opencode、
-Hermes Agent、Gemini CLI、Antigravity IDE、Kiro、Trae、Qoder）。默认位置为 `--global`；传入
-`--local` 可写入项目树。Hermes 仅支持全局安装。注意：`zed` 是有效的安装目标但**无技能目录**（仅 MCP 配置）。
+15 个安装目标中有 11 个具备技能目录（Claude Code、Cursor、Codex CLI、opencode、
+Hermes Agent、Gemini CLI、Antigravity IDE、Kiro、Trae、Qoder、Zuno）。Zuno 复用标准
+`~/.agents/skills` / `.agents/skills`，因此与 Codex 同时选择时仍然幂等。默认位置为
+`--global`；传入 `--local` 可写入项目树。Hermes 仅支持全局安装。Zed 与三个 GitHub
+Copilot 目标仅支持 MCP 配置，无技能目录。
 
 **更新语义。** `skill update` 用 git blob SHA-1 对比已安装文件与内嵌版本的内容哈希。
 未被修改的文件会自动刷新；经过手动编辑的文件会被跳过并提示"locally modified"（可传
@@ -229,6 +233,17 @@ Hermes Agent、Gemini CLI、Antigravity IDE、Kiro、Trae、Qoder）。默认位
 `skill update` 会显示已安装版本到内嵌版本的迁移，以及确定性的新增/删除行数；
 `--diff` 输出统一差异，`--dry-run` 输出相同预览但不修改文件。`skill status`
 也会显示版本来源，例如 `outdated (0.40.1 -> 0.47.0)`。
+
+对于由安装器维护指令块的代理，`skill update` 还会同步刷新 marker 之间的内容，
+并保留 marker 外的全部用户规则。Zuno 的全局路径是
+`$XDG_CONFIG_HOME/zuno/AGENTS.md`（通常为 `~/.config/zuno/AGENTS.md`），项目级路径
+是仓库根 `AGENTS.md`。例如：
+
+```bash
+codegraph skill update --target=zuno --global
+```
+
+`--dry-run` 同样只预览 AGENTS.md 的变化，不会写入。
 
 完整参考（含各代理技能路径）：[`../cli.md`](../cli.md)。
 
@@ -242,7 +257,8 @@ Hermes Agent、Gemini CLI、Antigravity IDE、Kiro、Trae、Qoder）。默认位
 - **Cursor / Trae** — 全局配置使用 `--path ${workspaceFolder}`，一份配置自动跟随每个项目窗口，保存即更新。
 - **Kiro / Qoder** — 全局条目写入裸 `serve --mcp`（无 `--path`），工具对现有索引只读访问。在各项目内运行 `codegraph init --target=kiro` 可获得实时监听。
 - **Zed** — 全局 `~/.config/zed/settings.json`（Linux/macOS）或 `%APPDATA%\Zed\settings.json`（Windows）写入裸条目。在项目内运行 `codegraph init --target=zed` 写入带绝对 `--path` 的 `.zed/settings.json`——这是 Zed 获得项目级实时索引的唯一方式。
-- **Claude Code、Cursor、Codex CLI、opencode、Hermes、Gemini CLI、Antigravity** — 标准 `mcpServers` 配置，均通过守护进程获得实时监听。
+- **Zuno** — 全局配置位于 `$XDG_CONFIG_HOME/zuno/zuno.json[c]`（通常是 `~/.config/zuno/`），项目配置位于 `.zuno/zuno.json[c]`。安装器写入 `mcp.codegraph`，并自动迁移旧的 `mcp.codegraph-mcp-server` 键，同时保留 JSONC 注释和其他 MCP 项。
+- **Claude Code、Cursor、Codex CLI、opencode、Hermes、Gemini CLI、Antigravity** — 使用各自原生的 MCP 配置结构，守护进程可到达项目时获得实时监听。
 
 **在 Kiro、Qoder 或 Zed 中获得实时自动更新。** 在每个项目中运行一次：
 

@@ -19,17 +19,30 @@ use super::types::{FileAction, FileWrite};
 pub const CODEGRAPH_SECTION_START: &str = "<!-- CODEGRAPH_START -->";
 pub const CODEGRAPH_SECTION_END: &str = "<!-- CODEGRAPH_END -->";
 
-/// The marker-fenced agent-instructions block, byte-identical to
-/// `instructions-template.ts:42-51` (`CODEGRAPH_INSTRUCTIONS_BLOCK`).
+/// The marker-fenced agent-instructions block.
+///
+/// Kept agent-neutral because the same body is written to Codex/OpenCode
+/// `AGENTS.md`, Claude `CLAUDE.md`, Gemini `GEMINI.md`, and Zuno `AGENTS.md`.
 pub const CODEGRAPH_INSTRUCTIONS_BLOCK: &str = "<!-- CODEGRAPH_START -->
 ## CodeGraph
 
-In repositories indexed by CodeGraph (a `.codegraph/` directory exists at the repo root), reach for it BEFORE grep/find or reading files when you need to understand or locate code:
+When a repository contains a `.codegraph/` directory, use CodeGraph before grep/find or reading source files when you need to understand or locate code.
 
-- **MCP tools** (when available): `codegraph_explore` answers most code questions in one call — the relevant symbols' verbatim source plus the call paths between them. `codegraph_node` returns one symbol's source + callers, or reads a whole file with line numbers. If the tools are listed but deferred, load them by name via tool search.
-- **Shell** (always works): `codegraph explore \"<symbol names or question>\"` and `codegraph node <symbol-or-file>` print the same output.
+Before the first query in a repository, verify that the index is usable:
 
-If there is no `.codegraph/` directory, skip CodeGraph entirely — indexing is the user's decision.
+- **MCP:** `codegraph_status`
+- **Shell:** `codegraph status . --json`
+
+Do not infer index readiness from the directory alone. Follow the recovery guidance reported by `status`; do not initialize or rebuild an index unless the user requests it or `status` explicitly requires it.
+
+For code research:
+
+- Start with `codegraph_explore` for an area, feature, or call flow.
+- Use `codegraph_search` to locate a known symbol.
+- Use `codegraph_node` for a symbol's source and caller/callee trail, or for a line-numbered whole file.
+- If MCP tools are unavailable, use `codegraph explore`, `codegraph search`, and `codegraph node`.
+
+If there is no `.codegraph/` directory, do not create one unless the user asks.
 <!-- CODEGRAPH_END -->";
 
 /// The MCP-server config block codegraph injects. Ports `getMcpServerConfig`
@@ -561,6 +574,24 @@ pub fn replace_or_append_marked_section(
     FileAction::Updated
 }
 
+/// Preview what [`upsert_instructions_entry`] would do without writing.
+pub fn instructions_entry_action(path: &Path) -> FileAction {
+    let Ok(content) = fs::read_to_string(path) else {
+        return FileAction::Created;
+    };
+    if let (Some(start_idx), Some(end_idx)) = (
+        content.find(CODEGRAPH_SECTION_START),
+        content.find(CODEGRAPH_SECTION_END),
+    ) && end_idx > start_idx
+    {
+        let block_end = end_idx + CODEGRAPH_SECTION_END.len();
+        if &content[start_idx..block_end] == CODEGRAPH_INSTRUCTIONS_BLOCK {
+            return FileAction::Unchanged;
+        }
+    }
+    FileAction::Updated
+}
+
 /// Upsert the CodeGraph instructions block. Ports `upsertInstructionsEntry`
 /// (shared.ts:185) — the `appended` action is folded into `Updated` there too.
 pub fn upsert_instructions_entry(path: &Path) -> FileWrite {
@@ -1035,6 +1066,37 @@ mod tests {
 
         let removed = remove_marked_section(&p, start, end);
         assert_eq!(removed, FileAction::Removed);
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn managed_instructions_are_status_first_and_agent_neutral() {
+        let text = CODEGRAPH_INSTRUCTIONS_BLOCK;
+        assert!(text.contains("`codegraph_status`"));
+        assert!(text.contains("`codegraph status . --json`"));
+        assert!(text.contains("`codegraph_search`"));
+        assert!(text.contains("caller/callee trail"));
+        assert!(text.contains("do not create one unless the user asks"));
+        assert!(!text.contains("deferred"));
+        assert!(!text.contains("tool search"));
+    }
+
+    #[test]
+    fn instructions_entry_action_previews_without_writing() {
+        let p = tmp_path("AGENTS-preview.md");
+        assert_eq!(instructions_entry_action(&p), FileAction::Created);
+        assert!(!p.exists());
+
+        fs::write(
+            &p,
+            format!("user content\n\n{CODEGRAPH_SECTION_START}\nold\n{CODEGRAPH_SECTION_END}\n"),
+        )
+        .unwrap();
+        assert_eq!(instructions_entry_action(&p), FileAction::Updated);
+        assert!(fs::read_to_string(&p).unwrap().contains("\nold\n"));
+
+        upsert_instructions_entry(&p);
+        assert_eq!(instructions_entry_action(&p), FileAction::Unchanged);
         let _ = fs::remove_dir_all(p.parent().unwrap());
     }
 

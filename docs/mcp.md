@@ -85,8 +85,38 @@ regardless of cwd (e.g.
 `"args": ["serve", "--mcp", "-p", "/abs/path/to/project"]`).
 
 Supported agents: Claude Code, Cursor, Codex CLI, opencode, Hermes Agent,
-Gemini CLI, Antigravity IDE, Kiro, Trae, Qoder, Zed, VS Code (GitHub Copilot),
-GitHub Copilot CLI, JetBrains IDEs (GitHub Copilot).
+Gemini CLI, Antigravity IDE, Kiro, Trae, Qoder, Zed, Zuno, VS Code
+(GitHub Copilot), GitHub Copilot CLI, JetBrains IDEs (GitHub Copilot).
+
+---
+
+## Zuno — `mcp` config
+
+Zuno uses an `mcp.<name>` wrapper and a string-array command:
+
+```jsonc
+{
+  "mcp": {
+    "codegraph": {
+      "type": "local",
+      "command": ["codegraph", "serve", "--mcp"],
+      "enabled": true,
+    },
+  },
+}
+```
+
+Run `codegraph install --target=zuno --global` for
+`$XDG_CONFIG_HOME/zuno/zuno.json[c]` (normally
+`~/.config/zuno/zuno.json[c]`), or `--local` for
+`.zuno/zuno.json[c]`. Existing JSONC comments and sibling MCP entries are
+preserved. A pre-existing `mcp.codegraph-mcp-server` entry is migrated to the
+canonical `mcp.codegraph` key.
+
+The installer also manages only the fenced CodeGraph block in Zuno's
+`AGENTS.md`: global `$XDG_CONFIG_HOME/zuno/AGENTS.md`, or the project-root
+`AGENTS.md` for a local install. `codegraph skill update --target=zuno` refreshes
+that block together with the shared `.agents/skills/codegraph/SKILL.md`.
 
 ---
 

@@ -178,6 +178,46 @@ fn skill_install_codex_local_writes_into_project() {
     assert!(body.contains("name: codegraph"));
 }
 
+#[test]
+fn skill_update_zuno_refreshes_managed_agents_without_touching_user_text() {
+    let fx = Fixture::new("zuno-update");
+    let skill_md = fx.home.join(".agents/skills/codegraph/SKILL.md");
+    let agents = fx.root.join("xdg/zuno/AGENTS.md");
+
+    fx.run(&["skill", "install", "--target=zuno", "--global", "-y"]);
+    assert!(
+        skill_md.exists(),
+        "Zuno reuses the standard global skill dir"
+    );
+
+    fs::create_dir_all(agents.parent().unwrap()).unwrap();
+    let stale = concat!(
+        "user before\n\n",
+        "<!-- CODEGRAPH_START -->\n",
+        "old managed instructions\n",
+        "<!-- CODEGRAPH_END -->\n\n",
+        "user after\n",
+    );
+    fs::write(&agents, stale).unwrap();
+
+    let dry_run = fx.run(&["skill", "update", "--target=zuno", "--global", "--dry-run"]);
+    assert!(dry_run.contains("would refresh managed instructions"));
+    assert_eq!(
+        fs::read_to_string(&agents).unwrap(),
+        stale,
+        "dry-run must not write AGENTS.md"
+    );
+
+    let applied = fx.run(&["skill", "update", "--target=zuno", "--global"]);
+    assert!(applied.contains("Refreshed managed CodeGraph instructions"));
+    let updated = fs::read_to_string(&agents).unwrap();
+    assert!(updated.contains("user before"));
+    assert!(updated.contains("user after"));
+    assert!(updated.contains("`codegraph_status`"));
+    assert!(updated.contains("`codegraph_search`"));
+    assert!(!updated.contains("old managed instructions"));
+}
+
 // --- Scenario 4: update with no change reports Unchanged -------------------
 
 #[test]
