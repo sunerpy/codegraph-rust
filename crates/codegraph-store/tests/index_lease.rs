@@ -24,6 +24,22 @@ static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 struct TempProject(PathBuf);
 
+struct PermissionsGuard {
+    path: PathBuf,
+    original: std::fs::Permissions,
+}
+
+impl Drop for PermissionsGuard {
+    fn drop(&mut self) {
+        std::fs::set_permissions(&self.path, self.original.clone()).unwrap_or_else(|error| {
+            panic!(
+                "restore permissions for read-only lock fixture {}: {error}",
+                self.path.display()
+            )
+        });
+    }
+}
+
 impl TempProject {
     fn new(label: &str) -> Self {
         let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
@@ -71,6 +87,20 @@ fn stage_existing_lock(paths: &IndexPaths, bytes: &[u8]) {
 
 fn lock_bytes(paths: &IndexPaths) -> Vec<u8> {
     std::fs::read(paths.permanent_lock()).expect("read permanent lock bytes")
+}
+
+fn make_read_only(path: &Path) -> PermissionsGuard {
+    let original = std::fs::metadata(path)
+        .unwrap_or_else(|error| panic!("inspect lock permissions {}: {error}", path.display()))
+        .permissions();
+    let mut read_only = original.clone();
+    read_only.set_readonly(true);
+    std::fs::set_permissions(path, read_only)
+        .unwrap_or_else(|error| panic!("make lock read-only {}: {error}", path.display()));
+    PermissionsGuard {
+        path: path.to_path_buf(),
+        original,
+    }
 }
 
 /// Windows `ERROR_LOCK_VIOLATION`.
@@ -274,6 +304,32 @@ fn explicit_initial_creation_is_separate_and_never_truncates_an_existing_lock() 
         IndexLease::acquire_exclusive_existing(&paths, deadline_after(CHILD_WAIT), || false)
             .expect("open existing lock without truncation");
     drop(exclusive);
+    assert_eq!(lock_bytes(&paths), LOCK_BYTES);
+}
+
+#[test]
+fn shared_existing_open_needs_only_read_access_to_the_permanent_lock() {
+    let project = TempProject::new("shared-read-only-lock");
+    let paths = project.paths();
+    stage_existing_lock(&paths, LOCK_BYTES);
+    let _permissions = make_read_only(&paths.permanent_lock());
+
+    let write_error = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(paths.permanent_lock())
+        .expect_err("fixture must reject a write-capable lock handle");
+    assert_eq!(
+        write_error.kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "fixture must fail specifically because write access is denied"
+    );
+
+    let shared = IndexLease::acquire_shared_existing(&paths, deadline_after(CHILD_WAIT), || false)
+        .expect("shared lease must need only read access to the permanent lock");
+    assert!(shared.is_shared());
+    assert_lock_bytes_preserved(&paths, LOCK_BYTES);
+    drop(shared);
     assert_eq!(lock_bytes(&paths), LOCK_BYTES);
 }
 
