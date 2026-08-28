@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use super::skill;
+use super::{shared, skill};
 
 /// Ports the `Location` union (types.ts:15).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +40,7 @@ pub enum TargetId {
     Trae,
     Qoder,
     Zed,
+    Zuno,
     VsCode,
     CopilotCli,
     JetBrains,
@@ -59,6 +60,7 @@ impl TargetId {
             TargetId::Trae => "trae",
             TargetId::Qoder => "qoder",
             TargetId::Zed => "zed",
+            TargetId::Zuno => "zuno",
             TargetId::VsCode => "vscode",
             TargetId::CopilotCli => "copilot-cli",
             TargetId::JetBrains => "jetbrains",
@@ -134,7 +136,7 @@ pub struct InstallContext {
     pub cwd: PathBuf,
     /// `%APPDATA%` equivalent, used only by the opencode legacy-Windows sweep.
     pub app_data: Option<PathBuf>,
-    /// `$XDG_CONFIG_HOME`, used only by the opencode global config dir.
+    /// `$XDG_CONFIG_HOME`, used by XDG-aware global config dirs.
     pub xdg_config_home: Option<PathBuf>,
     /// `$HERMES_HOME`, used only by the Hermes target.
     pub hermes_home: Option<PathBuf>,
@@ -149,6 +151,39 @@ pub trait AgentTarget {
     fn install(&self, ctx: &InstallContext, loc: Location, opts: InstallOptions) -> WriteResult;
     fn uninstall(&self, ctx: &InstallContext, loc: Location) -> WriteResult;
     fn print_config(&self, ctx: &InstallContext, loc: Location) -> String;
+
+    // --- Managed-instructions refresh surface ------------------------------
+
+    /// Marker-managed instructions file for this target/location, when one is
+    /// part of the target's install contract. Default: `None`.
+    fn managed_instructions_path(&self, _ctx: &InstallContext, _loc: Location) -> Option<PathBuf> {
+        None
+    }
+
+    /// Preview the marker-block refresh without writing. Used by
+    /// `codegraph skill update --dry-run`.
+    fn preview_managed_instructions(
+        &self,
+        ctx: &InstallContext,
+        loc: Location,
+    ) -> Option<FileWrite> {
+        self.managed_instructions_path(ctx, loc)
+            .map(|path| FileWrite {
+                action: shared::instructions_entry_action(&path),
+                path,
+            })
+    }
+
+    /// Refresh only CodeGraph's marker-fenced block, preserving all user-owned
+    /// text outside it. Used by `codegraph skill update`.
+    fn refresh_managed_instructions(
+        &self,
+        ctx: &InstallContext,
+        loc: Location,
+    ) -> Option<FileWrite> {
+        self.managed_instructions_path(ctx, loc)
+            .map(|path| shared::upsert_instructions_entry(&path))
+    }
 
     // --- Skill-capability surface (all default; targets opt in) --------------
     //
@@ -421,6 +456,10 @@ mod tests {
             (TargetId::Trae, "trae"),
             (TargetId::Qoder, "qoder"),
             (TargetId::Zed, "zed"),
+            (TargetId::Zuno, "zuno"),
+            (TargetId::VsCode, "vscode"),
+            (TargetId::CopilotCli, "copilot-cli"),
+            (TargetId::JetBrains, "jetbrains"),
         ];
         for (id, expected) in target_pairs {
             assert_eq!(id.as_str(), expected);
@@ -450,6 +489,21 @@ mod tests {
         // writing no files and never panicking.
         assert!(!target.supports_skills(Location::Global));
         assert!(target.skill_dir(&ctx, Location::Global).is_none());
+        assert!(
+            target
+                .managed_instructions_path(&ctx, Location::Global)
+                .is_none()
+        );
+        assert!(
+            target
+                .preview_managed_instructions(&ctx, Location::Global)
+                .is_none()
+        );
+        assert!(
+            target
+                .refresh_managed_instructions(&ctx, Location::Global)
+                .is_none()
+        );
 
         let install = target.install_skill(&ctx, Location::Global, false);
         assert!(install.files.is_empty());

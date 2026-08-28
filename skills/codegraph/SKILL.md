@@ -84,7 +84,8 @@ is healthy, do not run a manual sync after every edit. Each project still needs
 one usable index, normally created with `codegraph init`.
 
 Auto-register into all detected agents (Claude Code, Cursor, Codex, opencode,
-Hermes, Gemini CLI, Antigravity, Kiro):
+Hermes, Gemini CLI, Antigravity, Kiro, Trae, Qoder, Zed, Zuno, VS Code,
+Copilot CLI, JetBrains):
 
 ```bash
 codegraph install --yes

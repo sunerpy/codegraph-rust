@@ -155,6 +155,10 @@ impl AgentTarget for CodexTarget {
         )
     }
 
+    fn managed_instructions_path(&self, ctx: &InstallContext, loc: Location) -> Option<PathBuf> {
+        (loc == Location::Global).then(|| instructions_path(ctx))
+    }
+
     // Skill support is INTENTIONALLY decoupled from `supports_location`: Codex
     // MCP config is global-only, yet Codex DOES scan project-local skills, so
     // skills are gated on `supports_skills` (true for BOTH locations), never on

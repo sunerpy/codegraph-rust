@@ -109,8 +109,8 @@ codegraph serve --mcp --path /path/to/project  # optional: pin to a specific pro
 ```
 
 Auto-register it into your agent's config (Claude Code, Cursor, Codex CLI,
-opencode, Hermes, Gemini CLI, Antigravity, Kiro, Trae, Qoder, Zed, VS Code,
-Copilot CLI, JetBrains):
+opencode, Hermes, Gemini CLI, Antigravity, Kiro, Trae, Qoder, Zed, Zuno,
+VS Code, Copilot CLI, JetBrains):
 
 ```bash
 codegraph install --yes              # detects installed agents and wires them up
@@ -204,8 +204,8 @@ directory or `rootUri`/`workspaceFolders`/`roots`. When it can't resolve one,
 See [`docs/mcp.md`](docs/mcp.md#project-resolution) for the full three-case breakdown.
 
 Supported agents: Claude Code, Cursor, Codex CLI, opencode, Hermes Agent,
-Gemini CLI, Antigravity IDE, Kiro, Trae, Qoder, Zed, VS Code (GitHub Copilot),
-GitHub Copilot CLI, JetBrains IDEs (GitHub Copilot).
+Gemini CLI, Antigravity IDE, Kiro, Trae, Qoder, Zed, Zuno, VS Code
+(GitHub Copilot), GitHub Copilot CLI, JetBrains IDEs (GitHub Copilot).
 
 ```bash
 codegraph install --yes                          # auto-detect installed agents
@@ -238,9 +238,11 @@ codegraph skill uninstall --target=claude --yes       # remove from one agent
 codegraph skill status                     # show state for all detected agents
 ```
 
-Ten of the eleven install targets have a skill directory (Claude Code, Cursor,
-Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, Trae,
-Qoder; `zed` is MCP-only and has no skill directory).
+Eleven of the fifteen install targets have a skill directory (Claude Code,
+Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro,
+Trae, Qoder, and Zuno). Zuno reuses the standard `~/.agents/skills` /
+`.agents/skills` path, so selecting both Codex and Zuno is idempotent. Zed and
+the three GitHub Copilot surfaces are MCP-only and have no skill directory.
 Default location is `--global`; pass `--local` to write into the project tree.
 Hermes supports global only.
 
@@ -253,6 +255,13 @@ Before writing, update prints the installed-to-embedded version transition and
 added/removed line counts. `--diff` adds a deterministic unified diff;
 `--dry-run` prints the same preview without changing files. `skill status` also
 shows version provenance, for example `outdated (0.40.1 -> 0.47.0)`.
+
+For agents whose installer owns a marker-fenced instructions block, `skill
+update` also refreshes that block while preserving all user text outside
+`<!-- CODEGRAPH_START -->` / `<!-- CODEGRAPH_END -->`. This includes Zuno's
+global `$XDG_CONFIG_HOME/zuno/AGENTS.md` (normally
+`~/.config/zuno/AGENTS.md`) and project-root `AGENTS.md`. `--dry-run` previews
+the instructions change without writing it.
 
 Full reference including per-agent skill paths: [`docs/cli.md`](docs/cli.md).
 
@@ -267,7 +276,8 @@ stays live depends on whether the IDE expands `${workspaceFolder}`:
 - **Cursor / Trae** — global config uses `--path ${workspaceFolder}`, so one entry auto-follows every project window. Live watch enabled.
 - **Kiro / Qoder** — global entry without `--path`; tools work read-only off the existing index. Run `codegraph init --target=kiro` (or `--target=qoder`) inside each project for live watch.
 - **Zed** — global `settings.json` entry without `--path`. Run `codegraph init --target=zed` inside each project to write a `.zed/settings.json` with an absolute `--path` — the only way to give Zed a per-project path. The installer also writes `//`-commented HTTP and SSH alternatives for remote-development use.
-- **Other agents** (Claude Code, Codex CLI, opencode, Hermes, Gemini CLI, Antigravity) — standard `mcpServers` entry; live watch where the daemon can reach the project.
+- **Zuno** — global config is `$XDG_CONFIG_HOME/zuno/zuno.json[c]` (normally `~/.config/zuno/zuno.json[c]`); project config is `.zuno/zuno.json[c]`. The installer writes `mcp.codegraph` and migrates the older `mcp.codegraph-mcp-server` key without disturbing siblings or JSONC comments.
+- **Other agents** (Claude Code, Codex CLI, opencode, Hermes, Gemini CLI, Antigravity) — their native MCP entry shape; live watch where the daemon can reach the project.
 
 > **Zed Remote (SSH).** Zed runs MCP `context_servers` on the local client, not on
 > the remote host. If codegraph tools return empty in a remote SSH session, use the

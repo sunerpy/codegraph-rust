@@ -559,7 +559,10 @@ enum SkillAction {
         #[arg(short, long)]
         yes: bool,
     },
-    /// Refresh an installed skill to the embedded version (use --force to overwrite local edits).
+    /// Refresh the installed skill and marker-managed agent instructions.
+    ///
+    /// Use --force to overwrite local edits to SKILL.md; user text outside the
+    /// managed instructions markers is always preserved.
     Update {
         #[arg(short, long)]
         target: Option<String>,
@@ -574,7 +577,7 @@ enum SkillAction {
         /// Show a unified installed-versus-embedded diff before writing.
         #[arg(long)]
         diff: bool,
-        /// Preview version and content changes without writing files.
+        /// Preview skill and managed-instructions changes without writing files.
         #[arg(long)]
         dry_run: bool,
     },

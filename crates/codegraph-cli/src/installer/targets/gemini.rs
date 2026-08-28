@@ -107,6 +107,10 @@ impl AgentTarget for GeminiTarget {
         format!("# Add to {}\n\n{snippet}\n", target.display())
     }
 
+    fn managed_instructions_path(&self, ctx: &InstallContext, loc: Location) -> Option<PathBuf> {
+        Some(instructions_path(ctx, loc))
+    }
+
     fn supports_skills(&self, _loc: Location) -> bool {
         true
     }

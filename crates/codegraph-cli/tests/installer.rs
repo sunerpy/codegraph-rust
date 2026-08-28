@@ -273,6 +273,70 @@ fn opencode_local_uses_mcp_wrapper() {
 }
 
 #[test]
+fn zuno_global_migrates_legacy_entry_and_preserves_user_content() {
+    let fx = Fixture::new("zuno-global");
+    let config = fx.root.join("xdg/zuno/zuno.json");
+    let agents = fx.root.join("xdg/zuno/AGENTS.md");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(
+        &config,
+        concat!(
+            "{\n",
+            "  // user comment\n",
+            "  \"mcp\": {\n",
+            "    \"other\": { \"type\": \"local\", \"command\": [\"other\"] },\n",
+            "    \"codegraph-mcp-server\": { \"type\": \"local\", \"command\": [\"codegraph\", \"serve\", \"--mcp\"] }\n",
+            "  }\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &agents,
+        "user before\n\n<!-- CODEGRAPH_START -->\nold\n<!-- CODEGRAPH_END -->\n\nuser after\n",
+    )
+    .unwrap();
+
+    fx.run(&["install", "--target=zuno", "--global", "--yes"]);
+    let raw = fs::read_to_string(&config).unwrap();
+    assert!(raw.contains("// user comment"));
+    let parsed = crate_jsonc(&raw);
+    let mcp = parsed["mcp"].as_object().unwrap();
+    assert!(mcp.get("other").is_some());
+    assert!(mcp.get("codegraph-mcp-server").is_none());
+    assert_eq!(
+        mcp["codegraph"]["command"],
+        serde_json::json!(["codegraph", "serve", "--mcp"])
+    );
+    assert_eq!(mcp["codegraph"]["type"], "local");
+    assert_eq!(mcp["codegraph"]["enabled"], true);
+
+    let instructions = fs::read_to_string(&agents).unwrap();
+    assert!(instructions.contains("user before"));
+    assert!(instructions.contains("user after"));
+    assert!(instructions.contains("`codegraph_status`"));
+    assert!(!instructions.contains("\nold\n"));
+
+    fx.run(&["uninstall", "--target=zuno", "--global"]);
+    let parsed = crate_jsonc(&fs::read_to_string(&config).unwrap());
+    assert!(parsed["mcp"].get("codegraph").is_none());
+    assert!(parsed["mcp"].get("other").is_some());
+    assert_eq!(
+        fs::read_to_string(&agents).unwrap(),
+        "user before\n\nuser after\n"
+    );
+}
+
+fn crate_jsonc(text: &str) -> Value {
+    let without_comments = text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    serde_json::from_str(&without_comments).unwrap()
+}
+
+#[test]
 fn print_config_does_not_write() {
     let fx = Fixture::new("print");
     let out = fx.run(&["install", "--print-config", "codex"]);
