@@ -383,20 +383,24 @@ impl IndexLease {
         let initial_identity =
             identity_for_validated_path(&lock_path, &initial).map_err(|_| changed(&lock_path))?;
         checkpoint(AcquireCheckpoint::InitialMetadataValidated);
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .map_err(|source| {
-                if source.kind() == std::io::ErrorKind::NotFound {
-                    changed(&lock_path)
-                } else {
-                    IndexLeaseError::OpenLock {
-                        path: lock_path.clone(),
-                        source,
-                    }
+        // Shared readers only need a shared kernel lock. Keeping their handle
+        // read-only lets status/query commands work in read-only sandboxes and
+        // mounts; exclusive lifecycle operations retain write access.
+        let mut options = OpenOptions::new();
+        options.read(true);
+        if mode == LeaseMode::Exclusive {
+            options.write(true);
+        }
+        let file = options.open(&lock_path).map_err(|source| {
+            if source.kind() == std::io::ErrorKind::NotFound {
+                changed(&lock_path)
+            } else {
+                IndexLeaseError::OpenLock {
+                    path: lock_path.clone(),
+                    source,
                 }
-            })?;
+            }
+        })?;
         let opened_identity = opened_identity(&file, &lock_path, Some(&initial))?;
         if initial_identity != opened_identity {
             return Err(changed(&lock_path));
