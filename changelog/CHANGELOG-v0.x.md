@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.48.0](https://github.com/sunerpy/codegraph-rust/compare/v0.47.5...v0.48.0) (2026-08-28)
+
+
+### Features
+
+* **installer:** support Zuno and refresh instructions ([#244](https://github.com/sunerpy/codegraph-rust/issues/244)) ([24670e2](https://github.com/sunerpy/codegraph-rust/commit/24670e2c54f716f690397d57454eb5b5e8c139a3))
+
 ## [0.47.5](https://github.com/sunerpy/codegraph-rust/compare/v0.47.4...v0.47.5) (2026-08-27)
 
 
