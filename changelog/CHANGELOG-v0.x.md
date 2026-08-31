@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.48.3](https://github.com/sunerpy/codegraph-rust/compare/v0.48.2...v0.48.3) (2026-08-31)
+
+
+### Bug Fixes
+
+* normalize alias roots on Windows ([f9ee631](https://github.com/sunerpy/codegraph-rust/commit/f9ee631891e121cf8780679364b864e5ce6e9a6d))
+* normalize watcher roots on Windows ([4609c8f](https://github.com/sunerpy/codegraph-rust/commit/4609c8fa0eab29a319da5aa61e82b6c9dbfc48be))
+* port upstream graph correctness and watcher reloads ([d42368c](https://github.com/sunerpy/codegraph-rust/commit/d42368c628820cfc49805d0384261e18e1c8e900))
+* port upstream graph correctness and watcher reloads ([9d26c70](https://github.com/sunerpy/codegraph-rust/commit/9d26c70ab0c8999a327a54ae0f0d1de0abbe3e24))
+* resolve watcher control paths physically ([6b6e0b5](https://github.com/sunerpy/codegraph-rust/commit/6b6e0b504551e2d7fc5ed0d9458f6a9c599d4320))
+
 ## [0.48.2](https://github.com/sunerpy/codegraph-rust/compare/v0.48.1...v0.48.2) (2026-08-31)
 
 
