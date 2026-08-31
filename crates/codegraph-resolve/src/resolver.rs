@@ -9,7 +9,8 @@
 
 use crate::framework::FrameworkResolver;
 use crate::import_resolver::{
-    is_bound_to_out_of_repo_module, is_php_include_path_ref, resolve_jvm_import, resolve_via_import,
+    is_bound_to_out_of_repo_module, is_php_include_path_ref, python_module_member_is_claimed,
+    resolve_jvm_import, resolve_via_import,
 };
 use crate::name_matcher::{
     crosses_known_family, is_php_property_receiver_shape, is_python_class_function_ref_target,
@@ -1059,7 +1060,12 @@ impl ReferenceResolver {
         // Fast pre-filter (index.ts:664-670). The `FrameworkResolver`
         // claims-reference escape is a no-op while the extension-point list is
         // empty.
-        if !self.has_any_possible_match(&reference.reference_name)
+        let existence_name = if reference.language == Language::Erlang {
+            strip_erlang_arity(&reference.reference_name)
+        } else {
+            &reference.reference_name
+        };
+        if !self.has_any_possible_match_for(existence_name, reference.language)
             && !self.matches_any_import(reference, context)
             && !self
                 .framework_resolver_extensions
@@ -1127,6 +1133,13 @@ impl ReferenceResolver {
 
         // PHP include path: never fall through to name-matcher (index.ts:714-720).
         if is_php_include_path_ref(reference) {
+            return (candidates.into_iter().reduce(highest_confidence), None);
+        }
+
+        // A Python receiver bound to an imported module is authoritative. If
+        // that module/member is missing or ambiguous, retain the unresolved
+        // reference rather than guessing a same-named global callable.
+        if python_module_member_is_claimed(reference, context) {
             return (candidates.into_iter().reduce(highest_confidence), None);
         }
 
@@ -1914,6 +1927,38 @@ impl ReferenceResolver {
         false
     }
 
+    /// Language-aware extension of the generic fast pre-filter.
+    ///
+    /// Lua/Luau method calls use `receiver:method`, while R member calls use
+    /// `receiver$method`. Admit those forms when either side is a known project
+    /// symbol without interpreting their separators in unrelated languages.
+    fn has_any_possible_match_for(&self, name: &str, language: Language) -> bool {
+        if self.has_any_possible_match(name) {
+            return true;
+        }
+        let Some(known) = &self.known_names else {
+            return true;
+        };
+
+        let separator = match language {
+            Language::Lua | Language::Luau => ':',
+            Language::R => '$',
+            _ => return false,
+        };
+        let Some((receiver, member)) = name.split_once(separator) else {
+            return false;
+        };
+        if receiver.is_empty()
+            || member.is_empty()
+            || (separator == ':' && member.starts_with(':'))
+            || member.contains(separator)
+        {
+            return false;
+        }
+
+        known.contains(receiver) || known.contains(member)
+    }
+
     /// Does `reference.reference_name` match an import in its file?
     /// (`matchesAnyImport`, `index.ts:635-647`).
     fn matches_any_import(&self, reference: &RefView, context: &dyn ResolutionContext) -> bool {
@@ -2181,6 +2226,20 @@ fn capitalize(s: &str) -> String {
     match chars.next() {
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
         None => String::new(),
+    }
+}
+
+fn strip_erlang_arity(name: &str) -> &str {
+    let Some((base, arity)) = name.rsplit_once('/') else {
+        return name;
+    };
+    if !base.is_empty()
+        && (1..=3).contains(&arity.len())
+        && arity.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        base
+    } else {
+        name
     }
 }
 
@@ -2476,6 +2535,21 @@ mod tests {
         assert!(r.has_any_possible_match("path/to/Foo"));
         // nothing known.
         assert!(!r.has_any_possible_match("unrelated.symbol"));
+    }
+
+    #[test]
+    fn has_any_possible_match_language_separators() {
+        let mut r = ReferenceResolver::new("/root");
+        r.known_names = Some(BTreeSet::from([
+            "assignedFn".to_string(),
+            "log".to_string(),
+        ]));
+
+        assert!(r.has_any_possible_match_for("M:assignedFn", Language::Lua));
+        assert!(r.has_any_possible_match_for("M:assignedFn", Language::Luau));
+        assert!(r.has_any_possible_match_for("logger$log", Language::R));
+        assert!(!r.has_any_possible_match_for("M:assignedFn", Language::TypeScript));
+        assert!(!r.has_any_possible_match_for("M:a:b", Language::Lua));
     }
 
     // ---------------------------------------------------------------------
@@ -3388,6 +3462,52 @@ mod tests {
         };
         let resolved = resolver.resolve_one(&reference, &ctx).expect("resolves");
         assert_eq!(resolved.target_node_id, onblur.id);
+    }
+
+    #[test]
+    fn resolve_one_lua_colon_static_table_member_survives_fast_prefilter() {
+        let mut store = Store::open(&temp_db("lua-colon-table-member")).expect("open");
+        let mut member = mk_node2(
+            "method:assigned",
+            NodeKind::Method,
+            "assignedFn",
+            "a.lua",
+            Language::Lua,
+        );
+        member.qualified_name = "M::assignedFn".to_string();
+        let caller = mk_node2(
+            "function:caller",
+            NodeKind::Function,
+            "caller",
+            "a.lua",
+            Language::Lua,
+        );
+        store
+            .upsert_nodes(&[member.clone(), caller.clone()])
+            .expect("nodes");
+
+        let mut resolver = ReferenceResolver::new("/root");
+        resolver.warm_caches(&crate::context::StoreResolutionContext::new(
+            &store, "/root",
+        ));
+        let context = crate::context::StoreResolutionContext::new(&store, "/root");
+        let reference = RefView {
+            row_id: None,
+            from_node_id: caller.id,
+            reference_name: "M:assignedFn".to_string(),
+            reference_kind: EdgeKind::Calls,
+            line: 3,
+            column: 0,
+            file_path: "a.lua".to_string(),
+            language: Language::Lua,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+
+        let resolved = resolver
+            .resolve_one(&reference, &context)
+            .expect("resolves");
+        assert_eq!(resolved.target_node_id, member.id);
     }
 
     // Synthetic kind-gate coverage only: this test hand-sets `is_exported = true`

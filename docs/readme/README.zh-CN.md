@@ -408,6 +408,10 @@ codegraph http list / stop       # 管理运行中的 HTTP 服务
 
 自定义扩展名映射写在 `.codegraph/codegraph.json`；可选的 Claude prompt hook
 通过 `codegraph install --prompt-hook` 启用。
+运行中的 watcher 会热重载该文件、当前索引根的 `config.toml`，以及项目根
+`.gitignore`，并执行一次完整 reconcile：新排除的文件会被移出图谱，新纳入或新扩展名
+文件会被加入，无需重启 MCP 服务。TOML 损坏时保留最后一次有效 scope 并报告错误；
+JSON 继续沿用宽容的空 override 语义。
 
 完整参考——守护进程生命周期、所有环境变量、HTTP 注册表、扩展名映射、Claude hook：
 [`../cli.md`](../cli.md#daemon-watch--environment-variables)。
@@ -445,7 +449,7 @@ codegraph completions elvish --install      # Elvish
 
 ## CodeGraph 的能力范围
 
-**做什么：** 确定性代码结构提取，支持 32 种语言（TypeScript、Python、Go、Rust、
+**做什么：** 确定性代码结构提取，支持 38 种语言（TypeScript、Python、Go、Rust、
 Java、C/C++、C#、Vue、Svelte、GDScript 等——详见
 [`../languages.md`](../languages.md)），跨文件解析（含 Godot 项目图），图遍历，
 FTS5 检索，全图导出（含确定性 PageRank 中心性），MCP/CLI 表面，golden 字节稳定输出。
@@ -455,6 +459,12 @@ CodeGraph 会记录稳定的文件错误，不保留该文件的部分节点、�
 索引项目中的其他文件。后续增量 `sync` 会删除该文件原有图谱，并与
 `index --force` 收敛到相同结果。
 
+图谱正确性还覆盖：Erlang `module::function/arity` 身份、Rust 泛型/引用/qualified
+`impl` 归属与经字段类型验证的 `self.field.method()`、JS/TS 对象字面量 namespace
+成员、TypeScript/JavaScript 配置继承 alias、Python import alias、Lua function
+expression callable、无扩展名导入解析到 `.xsjs`/`.xsjslib`，以及 `.h` 中普通派生
+C++ class/struct。精确静态分析边界见 [`../languages.md`](../languages.md)。
+
 **不做什么：** 二进制内部无任何 AI/向量/嵌入/LLM（硬约束，`scripts/guardrail.sh`
 强制执行）；无语义检索；不新增固定 `LANGUAGES` 集以外的语言。
 
@@ -462,18 +472,19 @@ CodeGraph 会记录稳定的文件错误，不保留该文件的部分节点、�
 
 ## 支持的语言
 
-CodeGraph 支持 **32 种语言**，按提取深度分为三个层级：
+CodeGraph 支持 **38 种语言**，按提取深度分为三个层级：
 
-**Tier 1 — 完整符号提取（23 种）：** TypeScript、TSX、JavaScript、JSX、
+**Tier 1 — 完整符号提取（29 种）：** TypeScript、TSX、JavaScript、JSX、ArkTS、
 Python、Go、Rust、Java、C、C++、C#、PHP、Ruby、Swift、Kotlin、Dart、Scala、Lua、
-Luau、Objective-C、R、GDScript、Pascal。
+Luau、Objective-C、R、Solidity、Nix、Terraform、Erlang、CFML、GDScript、Pascal。
 
 **Tier 2 — 嵌入式 / 模板提取（6 种）：** Vue（`<script>` 委托给 TS/JS）、
 Svelte（脚本块委托）、Astro、Razor/`.cshtml`、Liquid（Shopify 模板与 sections）、
 XML/MyBatis mapper。
 
-**Tier 3 — 仅文件级索引（3 种）：** YAML、Twig、Properties——作为文件节点
-索引，不提取符号。
+**Tier 3 — 仅文件级索引（3 类、6 个内部语言变体）：** YAML、Twig、Properties
+以及 GodotScene、GodotResource、GodotProject——作为文件节点索引，具体 Godot
+语义边由 framework resolver 补充。
 
 完整列表（含各语言扩展名和说明）：[`../languages.md`](../languages.md)。
 

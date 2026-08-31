@@ -4,6 +4,54 @@
     "kind": "imports",
     "line": 1,
     "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:alias_consumer.ts",
+    "target": "import:09ce996766fd26d9e6998db066851b9d"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "file:consumer.ts",
+    "target": "import:d34cfc18269336a2e853eed952aa430d"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "file:legacy_consumer.xsjs",
+    "target": "import:7f3be166afba827b32e6c135dc5ede93"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "file:namespace_consumer.ts",
+    "target": "import:df8c726e7593234084d6bdbf4b14a9a7"
+  },
+  {
+    "col": 0,
+    "kind": "imports",
+    "line": 2,
+    "metadata": {
       "confidence": 0.95,
       "resolvedBy": "qualified-name"
     },
@@ -20,8 +68,8 @@
       "resolvedBy": "qualified-name"
     },
     "provenance": null,
-    "source": "file:consumer.ts",
-    "target": "import:d34cfc18269336a2e853eed952aa430d"
+    "source": "file:legacy_consumer.xsjs",
+    "target": "import:1b117353a47071c7ab8ab37b53737d63"
   },
   {
     "col": 0,
@@ -82,6 +130,18 @@
     "provenance": null,
     "source": "file:consumer.ts",
     "target": "import:58ba30c67d247ca76af614a60b572c1c"
+  },
+  {
+    "col": 14,
+    "kind": "calls",
+    "line": 7,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:6410c0f7a6b37bec85b224477043b832",
+    "target": "function:881216817d6d02e528335a807d20c174"
   },
   {
     "col": 2,
@@ -154,6 +214,90 @@
     "provenance": null,
     "source": "function:f457dd2d5f87f1af2a87ff0989542423",
     "target": "function:82178a7ebdc9958e76b3d6014789f799"
+  },
+  {
+    "col": 2,
+    "kind": "calls",
+    "line": 16,
+    "metadata": {
+      "confidence": 0.85,
+      "resolvedBy": "instance-method"
+    },
+    "provenance": null,
+    "source": "function:e82cf45010261a86b704ce5e5eae8cb0",
+    "target": "function:11b0f33a34cdbb367d1c2e84ed0677d2"
+  },
+  {
+    "col": 2,
+    "kind": "calls",
+    "line": 17,
+    "metadata": {
+      "confidence": 0.85,
+      "resolvedBy": "instance-method"
+    },
+    "provenance": null,
+    "source": "function:e82cf45010261a86b704ce5e5eae8cb0",
+    "target": "function:6410c0f7a6b37bec85b224477043b832"
+  },
+  {
+    "col": 2,
+    "kind": "calls",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "function:2db6d4e910084af85ba3a523213a1a19",
+    "target": "function:11f52a047f284a61ac9210724034a4d5"
+  },
+  {
+    "col": 2,
+    "kind": "calls",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "function:30d56685f42c695610703f36bc7f5de8",
+    "target": "function:11b0f33a34cdbb367d1c2e84ed0677d2"
+  },
+  {
+    "col": 2,
+    "kind": "calls",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "function:30d56685f42c695610703f36bc7f5de8",
+    "target": "function:6410c0f7a6b37bec85b224477043b832"
+  },
+  {
+    "col": 2,
+    "kind": "calls",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "function:bec301d43eb73165b2bd3a9f7ba1f7da",
+    "target": "function:0d03f340ee7c7e08624ce3e2b6d4d24e"
+  },
+  {
+    "col": 2,
+    "kind": "calls",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "function:bec301d43eb73165b2bd3a9f7ba1f7da",
+    "target": "function:80a62e168be79a592fe0e5bc10062a24"
   },
   {
     "col": 21,
@@ -229,6 +373,18 @@
     "target": "function:82178a7ebdc9958e76b3d6014789f799"
   },
   {
+    "col": 4,
+    "kind": "calls",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:11b0f33a34cdbb367d1c2e84ed0677d2",
+    "target": "function:881216817d6d02e528335a807d20c174"
+  },
+  {
     "col": 7,
     "kind": "imports",
     "line": 3,
@@ -239,6 +395,90 @@
     "provenance": null,
     "source": "file:consumer.ts",
     "target": "file:exports.ts"
+  },
+  {
+    "col": 9,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:alias_consumer.ts",
+    "target": "function:11f52a047f284a61ac9210724034a4d5"
+  },
+  {
+    "col": 9,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:legacy_consumer.xsjs",
+    "target": "function:0d03f340ee7c7e08624ce3e2b6d4d24e"
+  },
+  {
+    "col": 9,
+    "kind": "imports",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:namespace_consumer.ts",
+    "target": "constant:e0a6f76bcfc760dc48e6fc82a29d1b60"
+  },
+  {
+    "col": 9,
+    "kind": "imports",
+    "line": 2,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:legacy_consumer.xsjs",
+    "target": "function:80a62e168be79a592fe0e5bc10062a24"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "constant:e0a6f76bcfc760dc48e6fc82a29d1b60",
+    "target": "function:11b0f33a34cdbb367d1c2e84ed0677d2"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "constant:e0a6f76bcfc760dc48e6fc82a29d1b60",
+    "target": "function:6410c0f7a6b37bec85b224477043b832"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:alias_consumer.ts",
+    "target": "function:2db6d4e910084af85ba3a523213a1a19"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:alias_consumer.ts",
+    "target": "import:09ce996766fd26d9e6998db066851b9d"
   },
   {
     "col": null,
@@ -383,5 +623,122 @@
     "provenance": null,
     "source": "file:js_target.ts",
     "target": "function:b8fad7e972c96125f3204297e4b630e0"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:legacy_consumer.xsjs",
+    "target": "function:bec301d43eb73165b2bd3a9f7ba1f7da"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:legacy_consumer.xsjs",
+    "target": "import:1b117353a47071c7ab8ab37b53737d63"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:legacy_consumer.xsjs",
+    "target": "import:7f3be166afba827b32e6c135dc5ede93"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:legacy_helpers.xsjslib",
+    "target": "function:0d03f340ee7c7e08624ce3e2b6d4d24e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:legacy_priority.js",
+    "target": "function:80a62e168be79a592fe0e5bc10062a24"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:legacy_priority.xsjs",
+    "target": "function:894fc8caf8f4ec26cbcd542f919d19d9"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:namespace.ts",
+    "target": "constant:e0a6f76bcfc760dc48e6fc82a29d1b60"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:namespace.ts",
+    "target": "function:881216817d6d02e528335a807d20c174"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:namespace.ts",
+    "target": "function:9e59a0a98d3be117aa5be3de7760b3e5"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:namespace.ts",
+    "target": "function:e82cf45010261a86b704ce5e5eae8cb0"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:namespace_consumer.ts",
+    "target": "function:30d56685f42c695610703f36bc7f5de8"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:namespace_consumer.ts",
+    "target": "import:df8c726e7593234084d6bdbf4b14a9a7"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:src/aliased.ts",
+    "target": "function:11f52a047f284a61ac9210724034a4d5"
   }
 ]

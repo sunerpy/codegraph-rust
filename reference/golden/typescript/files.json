@@ -1,5 +1,14 @@
 [
   {
+    "content_hash": "8b474eefa2c16bcaeaf85c35a659896cd9f9ceebdfe11a6ba6da651dc33600e9",
+    "errors": null,
+    "generated": 0,
+    "language": "typescript",
+    "node_count": 3,
+    "path": "alias_consumer.ts",
+    "size": 101
+  },
+  {
     "content_hash": "5d91d0b374e6bbe30c01d7932f5554fbf02f1a3d1eea2f0aee046ae6a891c182",
     "errors": null,
     "generated": 0,
@@ -52,5 +61,68 @@
     "node_count": 2,
     "path": "js_target.ts",
     "size": 30
+  },
+  {
+    "content_hash": "4c8d590e99b38d3c6022af171a878a52328933bd72e9a68f9db50e4add20105d",
+    "errors": null,
+    "generated": 0,
+    "language": "javascript",
+    "node_count": 4,
+    "path": "legacy_consumer.xsjs",
+    "size": 174
+  },
+  {
+    "content_hash": "f0e255b95400ad8f88f90187b7bfc54da833f2163f92501a85dcdb2004f44d21",
+    "errors": null,
+    "generated": 0,
+    "language": "javascript",
+    "node_count": 2,
+    "path": "legacy_helpers.xsjslib",
+    "size": 34
+  },
+  {
+    "content_hash": "508c9ef16e6c076ff760be735d8eede02d84855c7399221a999ac70acb6997df",
+    "errors": null,
+    "generated": 0,
+    "language": "javascript",
+    "node_count": 2,
+    "path": "legacy_priority.js",
+    "size": 37
+  },
+  {
+    "content_hash": "508c9ef16e6c076ff760be735d8eede02d84855c7399221a999ac70acb6997df",
+    "errors": null,
+    "generated": 0,
+    "language": "javascript",
+    "node_count": 2,
+    "path": "legacy_priority.xsjs",
+    "size": 37
+  },
+  {
+    "content_hash": "98f4ba15e567df1bbbed5e375e267c2d417423f349000bf95ad0828431ff583c",
+    "errors": null,
+    "generated": 0,
+    "language": "typescript",
+    "node_count": 7,
+    "path": "namespace.ts",
+    "size": 259
+  },
+  {
+    "content_hash": "a425b4fa0f0d64cfc918b3940856b1623b3340b7144cfbf2d5590516bee274aa",
+    "errors": null,
+    "generated": 0,
+    "language": "typescript",
+    "node_count": 3,
+    "path": "namespace_consumer.ts",
+    "size": 120
+  },
+  {
+    "content_hash": "45e8301f79eada6ecba2b82c0a65060c7adfd9909b3857f8cdbae9552cf95b85",
+    "errors": null,
+    "generated": 0,
+    "language": "typescript",
+    "node_count": 2,
+    "path": "src/aliased.ts",
+    "size": 35
   }
 ]

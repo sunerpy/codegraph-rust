@@ -45,7 +45,7 @@ pub(crate) use cfml::{
 };
 pub use cpp::CPP_SPEC;
 pub(crate) use cpp::{
-    ExplicitOperatorCall, ExportMacroClass, detect_export_macro_class,
+    ExplicitOperatorCall, ExportMacroClass, cpp_code_mask, detect_export_macro_class,
     recover_explicit_operator_call,
 };
 pub use csharp::CSHARP_SPEC;
@@ -54,8 +54,8 @@ pub use erlang::ERLANG_SPEC;
 pub(crate) use erlang::{
     erlang_atom_text, erlang_call_ref_name, erlang_clause_header, erlang_clause_name,
     erlang_collapse_ws, erlang_fun_value_ref_name, erlang_function_clauses, erlang_macro_name,
-    erlang_module_exports, erlang_preceding_spec, erlang_record_field_name, erlang_record_ref_name,
-    erlang_type_alias_name,
+    erlang_module_exports, erlang_node_arity, erlang_preceding_spec, erlang_record_field_name,
+    erlang_record_ref_name, erlang_type_alias_name,
 };
 pub use gdscript::GDSCRIPT_SPEC;
 pub use go::GO_SPEC;
@@ -78,6 +78,7 @@ pub use python::PYTHON_SPEC;
 pub use r::R_SPEC;
 pub use ruby::RUBY_SPEC;
 pub use rust::RUST_SPEC;
+pub(crate) use rust::rust_impl_type_name;
 pub use scala::SCALA_SPEC;
 pub use solidity::SOLIDITY_SPEC;
 pub use swift::SWIFT_SPEC;

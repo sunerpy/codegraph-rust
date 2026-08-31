@@ -18,7 +18,7 @@ use std::time::Instant;
 use tree_sitter::Parser;
 
 use crate::ext_config::ExtensionOverrides;
-use crate::lang::spec_for_language;
+use crate::lang::{cpp_code_mask, spec_for_language};
 use crate::walker::TreeSitterWalker;
 
 #[derive(Debug, Clone)]
@@ -165,20 +165,36 @@ pub fn detect_language_with(
 }
 
 /// A `.h` file maps to `Language::C` by extension, but may hold C++ or
-/// Objective-C. Match the upstream 8 KB-prefix content sniff (`grammars.ts`
-/// `looksLikeCpp`). The `class MACRO Name : Base` alternative recognizes an
-/// export-macro-annotated class whose only C++ signal is the macro — the
-/// two-token `<KW> <MACRO> <Name>` shape never occurs in valid C, so genuine C
-/// headers stay C. Lookahead-free (the `regex` crate has none).
+/// Objective-C. The ordinary unique-C++ probes retain their bounded 8 KiB pass;
+/// a second full-source pass recognizes a plain class/struct base clause, whose
+/// shape is never valid C. Both passes run over a lexical code-only view so
+/// comments, quoted strings, character literals, raw strings, and preprocessor
+/// text cannot fabricate a C++ signal.
 fn looks_like_cpp(source: &str) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| {
+    static PREFIX_RE: OnceLock<Regex> = OnceLock::new();
+    static BASE_CLAUSE_RE: OnceLock<Regex> = OnceLock::new();
+    let prefix_re = PREFIX_RE.get_or_init(|| {
         Regex::new(
             r"\bnamespace\b|\bclass\s+\w+\s*[:{]|\b(?:class|struct)\s+[A-Z][A-Z0-9_]+\s+\w+\s*(?:final\s*)?[:{]|\btemplate\s*<|\b(?:public|private|protected)\s*:|\bvirtual\b|\busing\s+(?:namespace\b|\w+\s*=)",
         )
         .expect("looks-like-cpp regex")
     });
-    re.is_match(prefix_8k(source))
+    let base_clause_re = BASE_CLAUSE_RE.get_or_init(|| {
+        Regex::new(
+            r"\b(?:class|struct)\s+[A-Za-z_]\w*\s*(?:final\s*)?:\s*(?:(?:public|protected|private|virtual)\s+)*(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*(?:\s*<[^{};]*>)?\s*[{,]",
+        )
+        .expect("C++ base-clause regex")
+    });
+
+    let mask = cpp_code_mask(source);
+    let mut code = source.as_bytes().to_vec();
+    for (index, is_code) in mask.into_iter().enumerate() {
+        if !is_code && code[index] != b'\n' && code[index] != b'\r' {
+            code[index] = b' ';
+        }
+    }
+    let code = String::from_utf8(code).expect("mask preserves UTF-8");
+    prefix_re.is_match(prefix_8k(&code)) || base_clause_re.is_match(&code)
 }
 
 fn looks_like_objc(source: &str) -> bool {
@@ -1288,6 +1304,46 @@ mod tests {
     }
 
     #[test]
+    fn looks_like_cpp_plain_base_clause_forms() {
+        for source in [
+            "struct Base {};\nstruct Derived : Base {};\n",
+            "struct Derived : public Base {};\n",
+            "struct Derived : ns::Base {};\n",
+            "struct Derived : Base<int, Foo<T>> {};\n",
+            "struct Derived final : Base {};\n",
+            "class Derived : public A, private B\n{\n};\n",
+            "struct Derived : virtual protected Base {};\n",
+        ] {
+            assert!(looks_like_cpp(source), "expected C++: {source}");
+        }
+    }
+
+    #[test]
+    fn looks_like_cpp_base_clause_scans_past_prefix() {
+        let preamble =
+            "#ifndef BIG_H\n#define BIG_H\n".to_string() + &"#define VALUE_0 0\n".repeat(700);
+        assert!(preamble.len() > 8192);
+        assert!(looks_like_cpp(&format!(
+            "{preamble}struct Base {{}};\nstruct Derived : Base {{}};\n#endif\n"
+        )));
+    }
+
+    #[test]
+    fn looks_like_cpp_masks_c_false_positives() {
+        for source in [
+            "struct S { unsigned int a : 3; unsigned int b : 5; };\n",
+            "static inline int sz(int x) { return x ? sizeof(struct foo) : 0; }\n",
+            "static void g(void) {\nstruct_end:\n  return;\n}\n",
+            "/* struct Fake : Base { }; */\nstruct Real { int x; };\n",
+            "const char *s = \"struct Fake : Base {\";\nstruct Real { int x; };\n",
+            "const char c = ':';\nstruct Real { int x; };\n",
+            "#define FAKE struct Fake : Base {\nstruct Real { int x; };\n",
+        ] {
+            assert!(!looks_like_cpp(source), "expected C: {source}");
+        }
+    }
+
+    #[test]
     fn looks_like_objc_interface() {
         assert!(looks_like_objc("@interface Foo\n@end\n"));
     }
@@ -1308,6 +1364,25 @@ mod tests {
                 .map(|n| (n.kind, n.name.as_str()))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn dot_h_plain_derived_struct_is_cpp_without_phantom_function() {
+        let result = extract_source(
+            "min.h",
+            "struct Base {};\nstruct Derived : Base {};\n",
+            None,
+        );
+        let derived = result
+            .nodes
+            .iter()
+            .find(|node| node.name == "Derived")
+            .expect("Derived node");
+        assert_eq!(derived.kind, codegraph_core::types::NodeKind::Struct);
+        assert_eq!(derived.language, Language::Cpp);
+        assert!(!result.nodes.iter().any(|node| {
+            node.name == "Base" && node.kind == codegraph_core::types::NodeKind::Function
+        }));
     }
 
     #[test]

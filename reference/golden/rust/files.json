@@ -9,6 +9,15 @@
     "size": 164
   },
   {
+    "content_hash": "b33b4e6f0ac65b57a3dabd104bdd6b94c9cddbce97ab756e6119abdb0d06f2d4",
+    "errors": null,
+    "generated": 0,
+    "language": "rust",
+    "node_count": 22,
+    "path": "impl_ownership.rs",
+    "size": 1229
+  },
+  {
     "content_hash": "32fd3f5a2c8b2054c3197394a04d39f75f8ad52de6afe38e76ec0e4ee7358960",
     "errors": null,
     "generated": 0,
@@ -16,5 +25,14 @@
     "node_count": 14,
     "path": "lib.rs",
     "size": 767
+  },
+  {
+    "content_hash": "30f4bab3e50f2460cce057b7701539c5e102f261366e9267fc5077df7aebed41",
+    "errors": null,
+    "generated": 0,
+    "language": "rust",
+    "node_count": 20,
+    "path": "self_field.rs",
+    "size": 1222
   }
 ]

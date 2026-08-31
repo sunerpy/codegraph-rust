@@ -62,7 +62,7 @@ impl LanguageSpec for LuauSpec {
     }
 
     fn variable_types(&self) -> &'static [&'static str] {
-        &["variable_declaration"]
+        &["variable_declaration", "assignment_statement"]
     }
 
     fn name_field(&self) -> &'static str {

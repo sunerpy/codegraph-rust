@@ -99,6 +99,24 @@
     "size": 513
   },
   {
+    "content_hash": "21fbcda14c0c45acbdabcd19f24c8e00bdb7b05c0bf35bc28d5225794138f6c0",
+    "errors": null,
+    "generated": 0,
+    "language": "c",
+    "node_count": 5,
+    "path": "plain_derived.h",
+    "size": 201
+  },
+  {
+    "content_hash": "24001d69fbb5bbd8ad5ff4473ca64d7dec525871877f354c03f19f67a612034b",
+    "errors": null,
+    "generated": 0,
+    "language": "c",
+    "node_count": 3,
+    "path": "plain_header_negatives.h",
+    "size": 260
+  },
+  {
     "content_hash": "0527736aa5807318919d35bb62e2c3f8dc4be0e333cf2e27553b89dc59006b74",
     "errors": null,
     "generated": 0,

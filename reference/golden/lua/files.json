@@ -1,0 +1,11 @@
+[
+  {
+    "content_hash": "760b2e4889e5531884639796828eb345dc332af82120bdb5145707149856292c",
+    "errors": null,
+    "generated": 0,
+    "language": "lua",
+    "node_count": 8,
+    "path": "handlers.lua",
+    "size": 449
+  }
+]

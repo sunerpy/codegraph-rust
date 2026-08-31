@@ -863,6 +863,16 @@ This keeps the total watch count well inside the OS inotify limit on large trees
 and makes daemon startup fast. A newly-created non-ignored directory is picked up
 automatically on its create event — no restart required.
 
+Three project-control files are recognized before ordinary include/exclude
+filtering: the selected index root's `config.toml` and `codegraph.json`, plus the
+project-root `.gitignore`. Editing one reloads the effective Config, extension
+overrides, and watch policy, atomically replaces the live scope, reconciles
+per-directory OS watches, and schedules one full project reconcile. That full
+reconcile dominates queued path events, while every later incremental sync
+re-checks the current scope, so an old event cannot re-add a newly excluded
+file. Invalid TOML keeps the last valid runtime scope and reports the error;
+malformed JSON retains the existing tolerant empty-override behavior.
+
 The watcher is also auto-disabled when the resolved project root is the
 filesystem root (`/`) or the current user's home directory (`$HOME`). This
 commonly happens when an IDE or agent (e.g. Kiro) launches `codegraph serve
@@ -930,6 +940,24 @@ Rules:
   inheritance, so one project can never adopt another's overrides.
 - A malformed JSON file is ignored and the error is logged; it does not abort
   indexing.
+- A running watcher reloads this file on change and performs one full reconcile,
+  so adding or removing an extension override takes effect without restarting
+  the MCP server.
+
+### Extraction-version upgrades
+
+After upgrading the binary, let diagnostics choose the least destructive path:
+
+```bash
+codegraph status /path/to/project --json
+codegraph init /path/to/project          # no usable index
+codegraph sync /path/to/project          # ordinary changes or a supported upgrade
+codegraph index --force /path/to/project # only when the CLI explicitly requires recovery
+```
+
+Extraction version 11 → 12 is a supported `sync` upgrade: `status` reports the
+old index as outdated, and `sync` rebuilds it into the current namespace. Do not
+run `index --force` solely because the extraction version changed.
 
 ### `--prompt-hook` detail
 

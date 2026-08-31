@@ -425,6 +425,11 @@ Set `CODEGRAPH_NO_DAEMON=1` to force foreground mode (useful in CI). The daemon
 watches files with a 2 s debounce; pass `--no-watch` or set `CODEGRAPH_NO_WATCH=1`
 to disable. Custom extension mapping goes in `.codegraph/codegraph.json`;
 exclude patterns in `.codegraph/config.toml` under `[indexing] exclude`.
+Changes to those two files, or to the project-root `.gitignore`, hot-reload the
+running watcher and trigger one full reconcile. Newly excluded files are removed
+and newly included/custom-extension files are added without restarting the MCP
+server. Invalid TOML keeps the last valid watcher scope and reports the error;
+malformed JSON keeps the existing tolerant empty-override behavior.
 
 Full env-var table, HTTP server details, filesystem fallback behavior, and the
 Claude prompt-hook: [`docs/mcp.md`](docs/mcp.md) and
@@ -477,6 +482,15 @@ Extraction is fail-closed per file: a source tree deeper than the deterministic
 graph for that file, and does not stop other files from being indexed. Incremental
 `sync` removes any older graph for the failed file and converges with
 `index --force`.
+
+Graph correctness includes Erlang `module::function/arity` identity, Rust
+generic/reference/qualified `impl` ownership and validated
+`self.field.method()` calls, JavaScript-family object-literal namespace members,
+inherited TypeScript/JavaScript path aliases, Python import aliases, Lua
+function-expression callables, extensionless `.xsjs`/`.xsjslib` imports, and
+plain derived C++ classes/structs in `.h` files. See
+[`docs/languages.md`](docs/languages.md) for the exact static-analysis
+boundaries.
 
 **Doesn't:** no AI / vector / embedding / LLM anywhere inside the binary (hard
 constraint, `scripts/guardrail.sh`-enforced); no semantic search; no languages

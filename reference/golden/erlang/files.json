@@ -1,5 +1,23 @@
 [
   {
+    "content_hash": "3bdd2a94e932123320f5271c55781030e77112b09f88fb1fe6ab6efdb0ed17d0",
+    "errors": null,
+    "generated": 0,
+    "language": "erlang",
+    "node_count": 5,
+    "path": "client.erl",
+    "size": 204
+  },
+  {
+    "content_hash": "dfbc4b6ed11b266e26afce1008ccd2eda015bb932cdd889d0b1f9e2cfd98e228",
+    "errors": null,
+    "generated": 0,
+    "language": "erlang",
+    "node_count": 5,
+    "path": "deleg.erl",
+    "size": 346
+  },
+  {
     "content_hash": "56a7be5a3cae1e5ae0a456229c15af753d04217c4415d02eeee7ae7d1aa91c0b",
     "errors": null,
     "generated": 0,
@@ -7,5 +25,41 @@
     "node_count": 9,
     "path": "m.erl",
     "size": 241
+  },
+  {
+    "content_hash": "53f2e5b0c36e4bf257cdaac4c908b8f642dafd172d2452c1d2b6b7a4a5d012db",
+    "errors": null,
+    "generated": 0,
+    "language": "erlang",
+    "node_count": 4,
+    "path": "multi.erl",
+    "size": 107
+  },
+  {
+    "content_hash": "c6545f5916c0c63c3c36943b2edacd09b51db8d086e55774cc9d8464ab2e4392",
+    "errors": null,
+    "generated": 0,
+    "language": "erlang",
+    "node_count": 3,
+    "path": "single.erl",
+    "size": 63
+  },
+  {
+    "content_hash": "7d336e4fa0cd8f28e8bafceb9134270777da0292e1cefd464b42b1dc944e9d76",
+    "errors": null,
+    "generated": 0,
+    "language": "erlang",
+    "node_count": 3,
+    "path": "spawner.erl",
+    "size": 122
+  },
+  {
+    "content_hash": "5849bc4d5a99636a9f7a4dc91cd75ebace25ac9a3d426bd861d9694a5258b86a",
+    "errors": null,
+    "generated": 0,
+    "language": "erlang",
+    "node_count": 4,
+    "path": "store.erl",
+    "size": 121
   }
 ]

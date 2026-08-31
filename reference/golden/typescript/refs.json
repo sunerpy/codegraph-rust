@@ -11,6 +11,26 @@
   },
   {
     "candidates": null,
+    "col": 2,
+    "file_path": "namespace.ts",
+    "from_node_id": "function:e82cf45010261a86b704ce5e5eae8cb0",
+    "language": "typescript",
+    "line": 18,
+    "reference_kind": "calls",
+    "reference_name": "nested.run"
+  },
+  {
+    "candidates": null,
+    "col": 2,
+    "file_path": "namespace_consumer.ts",
+    "from_node_id": "function:30d56685f42c695610703f36bc7f5de8",
+    "language": "typescript",
+    "line": 6,
+    "reference_kind": "calls",
+    "reference_name": "nested.run"
+  },
+  {
+    "candidates": null,
     "col": 26,
     "file_path": "consumer.ts",
     "from_node_id": "file:consumer.ts",

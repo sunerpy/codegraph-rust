@@ -1,5 +1,14 @@
 [
   {
+    "content_hash": "224bb69e956dc4c0129cc65ee97c5adfb6407ae700512becb365391b3d946b51",
+    "errors": null,
+    "generated": 0,
+    "language": "python",
+    "node_count": 7,
+    "path": "aliases.py",
+    "size": 280
+  },
+  {
     "content_hash": "ffcdab43044b451a4dd403d4d74460128523d9fcba30dfe75e9a595a0f2c46db",
     "errors": null,
     "generated": 0,
@@ -18,6 +27,24 @@
     "size": 30
   },
   {
+    "content_hash": "108d699db24f39f8fed45f5baee6f67fe5dfa8331f48ac4127efa5b9d3db4e2c",
+    "errors": null,
+    "generated": 0,
+    "language": "python",
+    "node_count": 1,
+    "path": "pkg/__init__.py",
+    "size": 59
+  },
+  {
+    "content_hash": "a0cd66e0da83b2dfe8bf19849a2b434ba34f3ebb0445d10dcc6d601a743df055",
+    "errors": null,
+    "generated": 0,
+    "language": "python",
+    "node_count": 2,
+    "path": "pkg/module.py",
+    "size": 25
+  },
+  {
     "content_hash": "dcee64febdb07e86597a805d2ca48d93a6c69a4c547247399c39e316c21827d2",
     "errors": null,
     "generated": 0,
@@ -25,5 +52,14 @@
     "node_count": 17,
     "path": "same_file.py",
     "size": 613
+  },
+  {
+    "content_hash": "68fe527839c99e1ebefe78d0d72cea48c5e37d54ec206c37b1d2545eebc0fbbe",
+    "errors": null,
+    "generated": 0,
+    "language": "python",
+    "node_count": 2,
+    "path": "top_level.py",
+    "size": 29
   }
 ]

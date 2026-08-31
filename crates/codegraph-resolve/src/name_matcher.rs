@@ -355,6 +355,39 @@ pub fn match_by_qualified_name(
         }
     }
 
+    // Erlang qualified refs carry arity when statically known
+    // (`mod::function/2`). A missed exact lookup with an arity must never fall
+    // through to a sibling arity. An arity-less dynamic MFA ref resolves only
+    // when that module defines exactly one arity of the function.
+    if reference.language == Language::Erlang && reference.reference_name.contains("::") {
+        if split_erlang_arity(&reference.reference_name).is_some() {
+            return None;
+        }
+        let base = reference.reference_name.rsplit("::").next()?;
+        let prefix = format!("{}/", reference.reference_name);
+        let arity_candidates: Vec<Arc<Node>> = context
+            .get_nodes_by_name_shared(base)
+            .into_iter()
+            .filter(|candidate| {
+                candidate.language == Language::Erlang
+                    && candidate.kind == NodeKind::Function
+                    && candidate
+                        .qualified_name
+                        .strip_prefix(&prefix)
+                        .is_some_and(is_erlang_arity_digits)
+            })
+            .collect();
+        if arity_candidates.len() == 1 {
+            return Some(ResolvedRef {
+                original: reference.clone(),
+                target_node_id: arity_candidates[0].id.clone(),
+                confidence: 0.85,
+                resolved_by: ResolvedBy::QualifiedName,
+            });
+        }
+        return None;
+    }
+
     // Partial qualified name match (name-matcher.ts:234-249), again preferring
     // the call site's own file among the candidates whose qualified name ends
     // with the reference (#1079).
@@ -406,6 +439,117 @@ fn prefer_call_site_file<T: Borrow<Node>>(nodes: Vec<T>, call_site_file: &str) -
         same.extend(other);
         same
     }
+}
+
+fn is_object_literal_language(language: Language) -> bool {
+    matches!(
+        language,
+        Language::TypeScript
+            | Language::Tsx
+            | Language::JavaScript
+            | Language::Jsx
+            | Language::ArkTs
+    )
+}
+
+fn range_within(inner: &Node, outer: &Node) -> bool {
+    if inner.start_line < outer.start_line || inner.end_line > outer.end_line {
+        return false;
+    }
+    if inner.start_line == outer.start_line && inner.start_column < outer.start_column {
+        return false;
+    }
+    if inner.end_line == outer.end_line && inner.end_column > outer.end_column {
+        return false;
+    }
+    true
+}
+
+fn same_range(left: &Node, right: &Node) -> bool {
+    left.start_line == right.start_line
+        && left.start_column == right.start_column
+        && left.end_line == right.end_line
+        && left.end_column == right.end_column
+}
+
+/// Resolve a direct callable/value member contained by a JS-family
+/// object-literal constant or variable. Members nested inside another callable
+/// body, outside the holder range, or ambiguous across distinct direct ranges
+/// are deliberately rejected.
+pub(crate) fn resolve_object_literal_member(
+    container: &Node,
+    member: &str,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+    confidence: f64,
+    resolved_by: ResolvedBy,
+) -> Option<ResolvedRef> {
+    if !matches!(container.kind, NodeKind::Constant | NodeKind::Variable)
+        || !is_object_literal_language(container.language)
+        || !same_language_family(container.language, reference.language)
+        || member.is_empty()
+    {
+        return None;
+    }
+
+    let callable = |node: &Node| matches!(node.kind, NodeKind::Function | NodeKind::Method);
+    let accepts = |node: &Node| {
+        callable(node)
+            || (reference.reference_kind != EdgeKind::Calls
+                && matches!(
+                    node.kind,
+                    NodeKind::Property | NodeKind::Variable | NodeKind::Constant
+                ))
+    };
+    let inside = context
+        .get_nodes_in_file_shared(&container.file_path)
+        .into_iter()
+        .filter(|node| node.id != container.id && range_within(node, container))
+        .collect::<Vec<_>>();
+    let callable_bodies = inside
+        .iter()
+        .filter(|node| callable(node))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut candidates = inside
+        .into_iter()
+        .filter(|node| node.name == member && accepts(node))
+        .filter(|candidate| {
+            !callable_bodies.iter().any(|body| {
+                body.id != candidate.id
+                    && !same_range(body, candidate)
+                    && range_within(candidate, body)
+            })
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return None;
+    }
+
+    candidates.sort_by(|left, right| {
+        let left_callable = !callable(left);
+        let right_callable = !callable(right);
+        left_callable
+            .cmp(&right_callable)
+            .then(left.start_line.cmp(&right.start_line))
+            .then(left.start_column.cmp(&right.start_column))
+            .then(left.id.cmp(&right.id))
+    });
+    let first = candidates.first()?;
+    if candidates
+        .iter()
+        .skip(1)
+        .any(|candidate| !same_range(candidate, first))
+    {
+        return None;
+    }
+
+    Some(ResolvedRef {
+        original: reference.clone(),
+        target_node_id: first.id.clone(),
+        confidence,
+        resolved_by,
+    })
 }
 
 /// Resolve a method on a type, walking supertypes (`resolveMethodOnType`,
@@ -1360,6 +1504,53 @@ pub fn match_method_call(
     let parsed = parse_method_call(&reference.reference_name, reference.language)?;
     let (object_or_class, method_name) = parsed;
 
+    // Rust call through one field of the enclosing type — emitted as
+    // `self.<field>.<method>`. This branch is exclusive: a missing, external,
+    // generic, container, or ambiguous field type must stay unresolved rather
+    // than reaching the receiver-name heuristics below.
+    if reference.language == Language::Rust {
+        if let Some(field) = object_or_class.strip_prefix("self.") {
+            return match_rust_self_field_call(field, &method_name, reference, context);
+        }
+    }
+
+    // Lua table functions carry the stable qualified form `Table::method`,
+    // while calls may use either `Table.method()` or `Table:method()`. Resolve
+    // that exact table member before receiver-type heuristics; an ambiguous
+    // exact qualified name stays unresolved instead of falling through to a
+    // same-named global guess.
+    if matches!(reference.language, Language::Lua | Language::Luau) {
+        let want = format!("{object_or_class}::{method_name}");
+        let exact = context
+            .get_nodes_by_name_shared(&method_name)
+            .into_iter()
+            .filter(|candidate| {
+                candidate.language == reference.language
+                    && matches!(candidate.kind, NodeKind::Function | NodeKind::Method)
+                    && candidate.qualified_name == want
+            })
+            .collect::<Vec<_>>();
+        if !exact.is_empty() {
+            let same_file = exact
+                .iter()
+                .filter(|candidate| candidate.file_path == reference.file_path)
+                .collect::<Vec<_>>();
+            let target = if same_file.len() == 1 {
+                Some(same_file[0])
+            } else if same_file.is_empty() && exact.len() == 1 {
+                exact.first()
+            } else {
+                None
+            };
+            return target.map(|target| ResolvedRef {
+                original: reference.clone(),
+                target_node_id: target.id.clone(),
+                confidence: 0.95,
+                resolved_by: ResolvedBy::InstanceMethod,
+            });
+        }
+    }
+
     // Receiver-type inference (#1108/#1125): only for a simple `obj.method` /
     // `obj:method` (Lua) / `obj$method` (R) shape — a `Class::method` colon-call
     // is not an instance call. C++ uses its dedicated inferrer; every other
@@ -1426,6 +1617,31 @@ pub fn match_method_call(
                 0,
             ) {
                 return Some(typed);
+            }
+        }
+    }
+
+    // Same-file object-literal namespace: `const api = { call() {} }` followed
+    // by `api.call()`. The callable has a bare qualified name, so resolve it by
+    // direct source-range containment before class-shaped strategies.
+    if is_object_literal_language(reference.language) && !object_or_class.contains('.') {
+        let holders = prefer_call_site_file(
+            context.get_nodes_by_name_shared(&object_or_class),
+            &reference.file_path,
+        );
+        for holder in holders.into_iter().filter(|node| {
+            node.file_path == reference.file_path
+                && matches!(node.kind, NodeKind::Constant | NodeKind::Variable)
+        }) {
+            if let Some(member) = resolve_object_literal_member(
+                &holder,
+                &method_name,
+                reference,
+                context,
+                0.85,
+                ResolvedBy::InstanceMethod,
+            ) {
+                return Some(member);
             }
         }
     }
@@ -1559,6 +1775,189 @@ pub fn match_method_call(
         }
     }
 
+    None
+}
+
+const RUST_NON_PROJECT_FIELD_TYPES: &[&str] = &[
+    "bool", "char", "str", "String", "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16",
+    "u32", "u64", "u128", "usize", "f32", "f64", "Self", "self",
+];
+
+const RUST_NON_DEREF_CONTAINERS: &[&str] = &[
+    "Option",
+    "Vec",
+    "VecDeque",
+    "LinkedList",
+    "HashMap",
+    "BTreeMap",
+    "HashSet",
+    "BTreeSet",
+    "Mutex",
+    "RwLock",
+    "RefCell",
+    "Cell",
+    "OnceLock",
+    "Result",
+];
+
+/// Reduce a Rust field type to the project type reached by method-call
+/// auto-deref. Only references and `Box`/`Rc`/`Arc` are unwrapped.
+fn rust_field_type_name(raw: &str) -> Option<String> {
+    static REF_PREFIX: OnceLock<Regex> = OnceLock::new();
+    let ref_prefix = REF_PREFIX.get_or_init(|| {
+        Regex::new(r"^&\s*(?:'\w+\s+)?(?:mut\s+)?").expect("rust reference prefix")
+    });
+
+    let mut value = raw.trim();
+    loop {
+        let before = value;
+        if let Some(prefix) = ref_prefix.find(value) {
+            value = value[prefix.end()..].trim_start();
+        }
+        if let Some(open) = value.find('<') {
+            let wrapper = value[..open].trim().rsplit("::").next();
+            if wrapper.is_some_and(|wrapper| matches!(wrapper, "Box" | "Rc" | "Arc")) {
+                value = value[open + 1..].trim_start();
+            }
+        }
+        if let Some(rest) = value.strip_prefix("dyn ") {
+            value = rest.trim_start();
+        } else if let Some(rest) = value.strip_prefix("impl ") {
+            value = rest.trim_start();
+        }
+        if value == before {
+            break;
+        }
+    }
+
+    let end = value
+        .char_indices()
+        .find_map(|(index, ch)| matches!(ch, '<' | '>' | '+').then_some(index))
+        .unwrap_or(value.len());
+    let type_path = value[..end].trim();
+    if type_path.contains("::") {
+        let root = type_path.split("::").find(|part| !part.is_empty())?;
+        if !matches!(root, "crate" | "self" | "super") {
+            return None;
+        }
+    }
+    let segment = type_path.rsplit("::").find(|part| !part.is_empty())?;
+    if !is_word(segment)
+        || RUST_NON_PROJECT_FIELD_TYPES.contains(&segment)
+        || RUST_NON_DEREF_CONTAINERS.contains(&segment)
+        || (segment.len() == 1 && segment.as_bytes()[0].is_ascii_uppercase())
+    {
+        return None;
+    }
+    Some(segment.to_string())
+}
+
+fn strip_rust_field_line_comments(line: &str) -> String {
+    let line = line.split_once("//").map_or(line, |(head, _)| head);
+    let mut output = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(start) = rest.find("/*") {
+        output.push_str(&rest[..start]);
+        let after_start = &rest[start + 2..];
+        let Some(end) = after_start.find("*/") else {
+            return output;
+        };
+        rest = &after_start[end + 2..];
+    }
+    output.push_str(rest);
+    output
+}
+
+/// Resolve `self.field.method()` through the field type declared on the
+/// caller's own Rust struct/union. Any uncertainty is a deliberate miss.
+fn match_rust_self_field_call(
+    field: &str,
+    method_name: &str,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<ResolvedRef> {
+    if field.is_empty() || field.contains('.') || !is_word(field) {
+        return None;
+    }
+    let caller = context.get_node_by_id_shared(&reference.from_node_id)?;
+    let (owner_prefix, _) = caller.qualified_name.rsplit_once("::")?;
+    let owner_name = owner_prefix.rsplit("::").next()?;
+    if owner_name.is_empty() {
+        return None;
+    }
+
+    let owners = context
+        .get_nodes_by_name_shared(owner_name)
+        .into_iter()
+        .filter(|node| {
+            node.language == Language::Rust
+                && matches!(
+                    node.kind,
+                    NodeKind::Struct | NodeKind::Union | NodeKind::Class
+                )
+        })
+        .collect::<Vec<_>>();
+    let same_file = owners
+        .iter()
+        .filter(|node| node.file_path == reference.file_path)
+        .collect::<Vec<_>>();
+    let owner = if same_file.len() == 1 {
+        same_file[0]
+    } else if same_file.is_empty() && owners.len() == 1 {
+        &owners[0]
+    } else {
+        return None;
+    };
+
+    let source = context.read_file(&owner.file_path)?;
+    let lines = source.lines().collect::<Vec<_>>();
+    let start = owner.start_line.saturating_sub(1) as usize;
+    let end = (owner.end_line.max(owner.start_line) as usize).min(lines.len());
+    if start >= end {
+        return None;
+    }
+    let field_re = Regex::new(&format!(r"\b{}\s*:\s*([^,{{}}]+)", regex::escape(field))).ok()?;
+
+    for raw_line in &lines[start..end] {
+        let line = strip_rust_field_line_comments(raw_line);
+        let Some(captures) = field_re.captures(&line) else {
+            continue;
+        };
+        let raw_type = captures.get(1)?.as_str();
+        let field_type = rust_field_type_name(raw_type)?;
+
+        // A same-named type in multiple project locations is not enough
+        // evidence to choose one. External types have zero candidates.
+        let type_candidates = context
+            .get_nodes_by_name_shared(&field_type)
+            .into_iter()
+            .filter(|node| {
+                node.language == Language::Rust
+                    && matches!(
+                        node.kind,
+                        NodeKind::Struct
+                            | NodeKind::Union
+                            | NodeKind::Enum
+                            | NodeKind::Trait
+                            | NodeKind::Class
+                    )
+            })
+            .collect::<Vec<_>>();
+        if type_candidates.len() != 1 {
+            return None;
+        }
+
+        return resolve_method_on_type(
+            &field_type,
+            method_name,
+            reference,
+            context,
+            0.85,
+            ResolvedBy::InstanceMethod,
+            None,
+            0,
+        );
+    }
     None
 }
 
@@ -2185,6 +2584,59 @@ pub fn match_reference(
         return Some(result);
     }
 
+    // Erlang local call/fun refs (`f/1`) resolve only to the definition of the
+    // written arity. Language semantics make the call site's own module the
+    // strongest signal; a missing arity stays unresolved rather than linking a
+    // same-name sibling.
+    if reference.language == Language::Erlang
+        && !reference.reference_name.contains("::")
+        && matches!(
+            reference.reference_kind,
+            EdgeKind::Calls | EdgeKind::References
+        )
+        && let Some((name, arity)) = split_erlang_arity(&reference.reference_name)
+    {
+        let arity_tail = format!("/{arity}");
+        let candidates: Vec<Arc<Node>> = context
+            .get_nodes_by_name_shared(name)
+            .into_iter()
+            .filter(|candidate| {
+                candidate.language == Language::Erlang
+                    && candidate.kind == NodeKind::Function
+                    && candidate.qualified_name.ends_with(&arity_tail)
+            })
+            .collect();
+        if let Some(same_file) = candidates
+            .iter()
+            .find(|candidate| candidate.file_path == reference.file_path)
+        {
+            return Some(ResolvedRef {
+                original: reference.clone(),
+                target_node_id: same_file.id.clone(),
+                confidence: 0.95,
+                resolved_by: ResolvedBy::ExactMatch,
+            });
+        }
+        if candidates.len() == 1 {
+            return Some(ResolvedRef {
+                original: reference.clone(),
+                target_node_id: candidates[0].id.clone(),
+                confidence: 0.8,
+                resolved_by: ResolvedBy::ExactMatch,
+            });
+        }
+        if let Some(best) = find_best_match(reference, &candidates) {
+            let proximity = compute_path_proximity(&reference.file_path, &best.file_path);
+            return Some(ResolvedRef {
+                original: reference.clone(),
+                target_node_id: best.id.clone(),
+                confidence: if proximity >= 30.0 { 0.7 } else { 0.4 },
+                resolved_by: ResolvedBy::ExactMatch,
+            });
+        }
+        return None;
+    }
+
     // 1c. `::`-scoped factory chain (PHP / Rust) (name-matcher.ts:1116-1123).
     if matches!(reference.language, Language::Php | Language::Rust) {
         if let Some(result) = match_scoped_call_chain(reference, context) {
@@ -2221,6 +2673,18 @@ pub fn match_reference(
 
     // 4. Fuzzy match.
     match_fuzzy(reference, context)
+}
+
+fn split_erlang_arity(name: &str) -> Option<(&str, &str)> {
+    let (base, arity) = name.rsplit_once('/')?;
+    if base.is_empty() || !is_erlang_arity_digits(arity) {
+        return None;
+    }
+    Some((base, arity))
+}
+
+fn is_erlang_arity_digits(value: &str) -> bool {
+    (1..=3).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 pub(crate) fn is_python_class_function_ref_target(language: Language, kind: NodeKind) -> bool {
@@ -3171,6 +3635,102 @@ mod tests {
         assert!(match_by_qualified_name(&r, &ctx).is_none());
     }
 
+    #[test]
+    fn erlang_qualified_name_requires_exact_written_arity() {
+        let f1 = mk(
+            "function:f1",
+            NodeKind::Function,
+            "f",
+            "mod::f/1",
+            "src/mod.erl",
+            Language::Erlang,
+        );
+        let f2 = mk(
+            "function:f2",
+            NodeKind::Function,
+            "f",
+            "mod::f/2",
+            "src/mod.erl",
+            Language::Erlang,
+        );
+        let ctx = Ctx::default()
+            .qualified("mod::f/2", vec![f2.clone()])
+            .name("f", vec![f1, f2]);
+        let hit = refv(
+            "mod::f/2",
+            EdgeKind::Calls,
+            "src/client.erl",
+            Language::Erlang,
+            1,
+        );
+        assert_eq!(
+            match_by_qualified_name(&hit, &ctx)
+                .expect("exact arity")
+                .target_node_id,
+            "function:f2"
+        );
+        let miss = refv(
+            "mod::f/3",
+            EdgeKind::Calls,
+            "src/client.erl",
+            Language::Erlang,
+            1,
+        );
+        assert!(match_by_qualified_name(&miss, &ctx).is_none());
+    }
+
+    #[test]
+    fn erlang_arityless_qualified_name_requires_one_arity() {
+        let single = mk(
+            "function:work",
+            NodeKind::Function,
+            "work",
+            "single::work/1",
+            "src/single.erl",
+            Language::Erlang,
+        );
+        let unique = Ctx::default().name("work", vec![single]);
+        let reference = refv(
+            "single::work",
+            EdgeKind::Calls,
+            "src/spawner.erl",
+            Language::Erlang,
+            1,
+        );
+        assert_eq!(
+            match_by_qualified_name(&reference, &unique)
+                .expect("unique arity")
+                .target_node_id,
+            "function:work"
+        );
+
+        let job1 = mk(
+            "function:job1",
+            NodeKind::Function,
+            "job",
+            "multi::job/1",
+            "src/multi.erl",
+            Language::Erlang,
+        );
+        let job2 = mk(
+            "function:job2",
+            NodeKind::Function,
+            "job",
+            "multi::job/2",
+            "src/multi.erl",
+            Language::Erlang,
+        );
+        let ambiguous = Ctx::default().name("job", vec![job1, job2]);
+        let reference = refv(
+            "multi::job",
+            EdgeKind::Calls,
+            "src/spawner.erl",
+            Language::Erlang,
+            1,
+        );
+        assert!(match_by_qualified_name(&reference, &ambiguous).is_none());
+    }
+
     // ================= parse helpers ==========================================
 
     #[test]
@@ -3275,6 +3835,366 @@ mod tests {
             1,
         );
         assert!(match_method_call(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn rust_field_type_name_unwraps_only_auto_deref_layers() {
+        for (raw, expected) in [
+            ("Inner", Some("Inner")),
+            ("&Inner", Some("Inner")),
+            ("&'a mut Inner", Some("Inner")),
+            ("Box<Inner>", Some("Inner")),
+            ("Rc<Inner>", Some("Inner")),
+            ("std::sync::Arc<Box<crate::inner::Inner>>", Some("Inner")),
+            ("Box<dyn Source + Send>", Some("Source")),
+            ("crate::inner::Inner", Some("Inner")),
+            ("std::vec::IntoIter<u8>", None),
+            ("regex::Regex", None),
+            ("Option<Inner>", None),
+            ("Vec<Inner>", None),
+            ("Mutex<Inner>", None),
+            ("T", None),
+            ("u32", None),
+            ("(Inner, Other)", None),
+            ("*const Inner", None),
+            ("[Inner; 4]", None),
+        ] {
+            assert_eq!(rust_field_type_name(raw).as_deref(), expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn rust_self_field_call_resolves_on_the_declared_type() {
+        let source = "pub struct Outer {\n    pub(crate) inner: Box<Inner>,\n}\n";
+        let mut owner = mk(
+            "struct:outer",
+            NodeKind::Struct,
+            "Outer",
+            "Outer",
+            "src/outer.rs",
+            Language::Rust,
+        );
+        owner.start_line = 1;
+        owner.end_line = 3;
+        let caller = mk(
+            "method:outer-go",
+            NodeKind::Method,
+            "go",
+            "Outer::go",
+            "src/outer.rs",
+            Language::Rust,
+        );
+        let inner = mk(
+            "struct:inner",
+            NodeKind::Struct,
+            "Inner",
+            "Inner",
+            "src/inner.rs",
+            Language::Rust,
+        );
+        let target = mk(
+            "method:inner-run",
+            NodeKind::Method,
+            "run",
+            "Inner::run",
+            "src/inner.rs",
+            Language::Rust,
+        );
+        let ctx = Ctx::default()
+            .file("src/outer.rs", source)
+            .node_by_id(caller)
+            .name("Outer", vec![owner])
+            .name("Inner", vec![inner])
+            .name("run", vec![target]);
+        let mut reference = refv(
+            "self.inner.run",
+            EdgeKind::Calls,
+            "src/outer.rs",
+            Language::Rust,
+            6,
+        );
+        reference.from_node_id = "method:outer-go".to_string();
+
+        let resolved = match_method_call(&reference, &ctx).expect("typed field call");
+        assert_eq!(resolved.target_node_id, "method:inner-run");
+        assert_eq!(resolved.resolved_by, ResolvedBy::InstanceMethod);
+        assert!((resolved.confidence - 0.85).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rust_self_field_call_does_not_guess_external_or_container_types() {
+        for (field_decl, field_name, method_name, type_name) in [
+            ("its: std::vec::IntoIter<u8>,", "its", "next", "IntoIter"),
+            ("inner: Option<Inner>,", "inner", "take", "Inner"),
+            ("items: T,", "items", "run", "T"),
+        ] {
+            let source = format!("pub struct Outer<T> {{\n    {field_decl}\n}}\n");
+            let mut owner = mk(
+                "struct:outer",
+                NodeKind::Struct,
+                "Outer",
+                "Outer",
+                "src/outer.rs",
+                Language::Rust,
+            );
+            owner.start_line = 1;
+            owner.end_line = 3;
+            let caller = mk(
+                "method:outer-go",
+                NodeKind::Method,
+                "go",
+                "Outer::go",
+                "src/outer.rs",
+                Language::Rust,
+            );
+            let decoy_type = mk(
+                "struct:decoy",
+                NodeKind::Struct,
+                type_name,
+                type_name,
+                "src/decoy.rs",
+                Language::Rust,
+            );
+            let decoy_method = mk(
+                "method:decoy",
+                NodeKind::Method,
+                method_name,
+                &format!("{type_name}::{method_name}"),
+                "src/decoy.rs",
+                Language::Rust,
+            );
+            let ctx = Ctx::default()
+                .file("src/outer.rs", &source)
+                .node_by_id(caller)
+                .name("Outer", vec![owner])
+                .name(type_name, vec![decoy_type])
+                .name(method_name, vec![decoy_method]);
+            let mut reference = refv(
+                &format!("self.{field_name}.{method_name}"),
+                EdgeKind::Calls,
+                "src/outer.rs",
+                Language::Rust,
+                6,
+            );
+            reference.from_node_id = "method:outer-go".to_string();
+
+            assert!(
+                match_method_call(&reference, &ctx).is_none(),
+                "{field_decl} must stay unresolved"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_self_field_call_rejects_ambiguous_project_type() {
+        let source = "pub struct Outer {\n    inner: Inner,\n}\n";
+        let mut owner = mk(
+            "struct:outer",
+            NodeKind::Struct,
+            "Outer",
+            "Outer",
+            "src/outer.rs",
+            Language::Rust,
+        );
+        owner.start_line = 1;
+        owner.end_line = 3;
+        let caller = mk(
+            "method:outer-go",
+            NodeKind::Method,
+            "go",
+            "Outer::go",
+            "src/outer.rs",
+            Language::Rust,
+        );
+        let first = mk(
+            "struct:first",
+            NodeKind::Struct,
+            "Inner",
+            "Inner",
+            "src/a.rs",
+            Language::Rust,
+        );
+        let second = mk(
+            "struct:second",
+            NodeKind::Struct,
+            "Inner",
+            "Inner",
+            "src/b.rs",
+            Language::Rust,
+        );
+        let target = mk(
+            "method:inner-run",
+            NodeKind::Method,
+            "run",
+            "Inner::run",
+            "src/a.rs",
+            Language::Rust,
+        );
+        let ctx = Ctx::default()
+            .file("src/outer.rs", source)
+            .node_by_id(caller)
+            .name("Outer", vec![owner])
+            .name("Inner", vec![first, second])
+            .name("run", vec![target]);
+        let mut reference = refv(
+            "self.inner.run",
+            EdgeKind::Calls,
+            "src/outer.rs",
+            Language::Rust,
+            6,
+        );
+        reference.from_node_id = "method:outer-go".to_string();
+
+        assert!(match_method_call(&reference, &ctx).is_none());
+    }
+
+    #[test]
+    fn object_literal_member_resolves_by_direct_containment() {
+        let mut api = mk(
+            "constant:api",
+            NodeKind::Constant,
+            "api",
+            "api",
+            "src/api.ts",
+            Language::TypeScript,
+        );
+        api.start_line = 1;
+        api.end_line = 8;
+        let mut direct = mk(
+            "function:direct-call",
+            NodeKind::Function,
+            "call",
+            "call",
+            "src/api.ts",
+            Language::TypeScript,
+        );
+        direct.start_line = 2;
+        direct.end_line = 2;
+        let mut get = mk(
+            "function:get",
+            NodeKind::Function,
+            "get",
+            "get",
+            "src/api.ts",
+            Language::TypeScript,
+        );
+        get.start_line = 3;
+        get.end_line = 6;
+        let mut nested = mk(
+            "function:nested-call",
+            NodeKind::Function,
+            "call",
+            "call",
+            "src/api.ts",
+            Language::TypeScript,
+        );
+        nested.start_line = 4;
+        nested.end_line = 4;
+        let mut outside = mk(
+            "function:outside-call",
+            NodeKind::Function,
+            "call",
+            "call",
+            "src/api.ts",
+            Language::TypeScript,
+        );
+        outside.start_line = 10;
+        outside.end_line = 10;
+        let ctx = Ctx::default()
+            .name("api", vec![api.clone()])
+            .nodes_in_file("src/api.ts", vec![api, direct, get, nested, outside]);
+        let reference = refv(
+            "api.call",
+            EdgeKind::Calls,
+            "src/api.ts",
+            Language::TypeScript,
+            12,
+        );
+
+        let resolved = match_method_call(&reference, &ctx).expect("literal member");
+        assert_eq!(resolved.target_node_id, "function:direct-call");
+        assert_eq!(resolved.resolved_by, ResolvedBy::InstanceMethod);
+        assert!((resolved.confidence - 0.85).abs() < 1e-9);
+    }
+
+    #[test]
+    fn object_literal_member_rejects_nested_outside_and_ambiguous_candidates() {
+        let mut api = mk(
+            "constant:api",
+            NodeKind::Constant,
+            "api",
+            "api",
+            "src/api.ts",
+            Language::TypeScript,
+        );
+        api.start_line = 1;
+        api.end_line = 8;
+        let mut get = mk(
+            "function:get",
+            NodeKind::Function,
+            "get",
+            "get",
+            "src/api.ts",
+            Language::TypeScript,
+        );
+        get.start_line = 2;
+        get.end_line = 5;
+        let mut nested = mk(
+            "function:nested-call",
+            NodeKind::Function,
+            "call",
+            "call",
+            "src/api.ts",
+            Language::TypeScript,
+        );
+        nested.start_line = 3;
+        nested.end_line = 3;
+        let mut outside = mk(
+            "function:outside-call",
+            NodeKind::Function,
+            "call",
+            "call",
+            "src/api.ts",
+            Language::TypeScript,
+        );
+        outside.start_line = 10;
+        outside.end_line = 10;
+        let nested_ctx = Ctx::default()
+            .name("api", vec![api.clone()])
+            .nodes_in_file("src/api.ts", vec![api.clone(), get, nested, outside]);
+        let reference = refv(
+            "api.call",
+            EdgeKind::Calls,
+            "src/api.ts",
+            Language::TypeScript,
+            12,
+        );
+        assert!(match_method_call(&reference, &nested_ctx).is_none());
+
+        let mut first = mk(
+            "function:first",
+            NodeKind::Function,
+            "call",
+            "call",
+            "src/api.ts",
+            Language::TypeScript,
+        );
+        first.start_line = 2;
+        first.end_line = 2;
+        let mut second = mk(
+            "function:second",
+            NodeKind::Function,
+            "call",
+            "call",
+            "src/api.ts",
+            Language::TypeScript,
+        );
+        second.start_line = 6;
+        second.end_line = 6;
+        let ambiguous_ctx = Ctx::default()
+            .name("api", vec![api.clone()])
+            .nodes_in_file("src/api.ts", vec![api, first, second]);
+        assert!(match_method_call(&reference, &ambiguous_ctx).is_none());
     }
 
     #[test]
@@ -4331,6 +5251,56 @@ mod tests {
             1,
         );
         assert!(match_reference(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn erlang_local_reference_prefers_same_file_and_never_sibling_arity() {
+        let local = mk(
+            "function:local",
+            NodeKind::Function,
+            "header",
+            "deleg::header/3",
+            "src/deleg.erl",
+            Language::Erlang,
+        );
+        let other = mk(
+            "function:other",
+            NodeKind::Function,
+            "header",
+            "other::header/3",
+            "src/other.erl",
+            Language::Erlang,
+        );
+        let sibling = mk(
+            "function:sibling",
+            NodeKind::Function,
+            "header",
+            "deleg::header/2",
+            "src/deleg.erl",
+            Language::Erlang,
+        );
+        let ctx = Ctx::default().name("header", vec![other, sibling, local]);
+        let hit = refv(
+            "header/3",
+            EdgeKind::Calls,
+            "src/deleg.erl",
+            Language::Erlang,
+            10,
+        );
+        assert_eq!(
+            match_reference(&hit, &ctx)
+                .expect("same-file exact arity")
+                .target_node_id,
+            "function:local"
+        );
+        let miss = refv(
+            "header/4",
+            EdgeKind::Calls,
+            "src/deleg.erl",
+            Language::Erlang,
+            10,
+        );
+        assert!(match_reference(&miss, &ctx).is_none());
     }
 
     // ================= C++ receiver inference =================================
@@ -6204,6 +7174,24 @@ mod tests {
         let r = refv("lg:log", EdgeKind::Calls, "a.lua", Language::Lua, 3);
         let res = match_method_call(&r, &ctx).expect("lua colon separator");
         assert_eq!(res.target_node_id, "method:log");
+    }
+
+    #[test]
+    fn lua_static_table_member_resolves_for_dot_and_colon_calls() {
+        let member = mk(
+            "method:assigned",
+            NodeKind::Method,
+            "assignedFn",
+            "M::assignedFn",
+            "a.lua",
+            Language::Lua,
+        );
+        let ctx = Ctx::default().name("assignedFn", vec![member]);
+        for reference_name in ["M.assignedFn", "M:assignedFn"] {
+            let reference = refv(reference_name, EdgeKind::Calls, "a.lua", Language::Lua, 3);
+            let resolved = match_method_call(&reference, &ctx).expect("static table method");
+            assert_eq!(resolved.target_node_id, "method:assigned");
+        }
     }
 
     #[test]

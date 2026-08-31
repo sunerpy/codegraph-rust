@@ -261,9 +261,10 @@ Like the Godot fixture, both the index and the dump are byte-stable, and the
 ### Python fixture
 
 The dedicated `reference/golden/python/` fixture guards Python bare
-class-as-value function references without changing the shared `mini` corpus.
-Its three-file source corpus lives at `crates/codegraph-bench/fixtures/python/`
-and pins six positive `References` edges:
+class-as-value references plus aliased imports (#1626) without changing the
+shared `mini` corpus. Its seven indexed files live at
+`crates/codegraph-bench/fixtures/python/` and retain the original six positive
+`References` edges:
 
 - same-file class values in a direct return, assignment RHS, registry-pair
   value, call argument, and list literal;
@@ -277,6 +278,19 @@ It also pins two negative boundaries: a tuple return does not recurse into
 `function_ref` rather than resolving to a same-named method. The undefined
 `register(...)` calls used by the argument and method shapes legitimately remain
 as two unresolved `calls` rows.
+
+The added alias files pin three import-resolution contracts:
+
+- `import top_level as top_alias; top_alias.top_func()` binds the receiver to
+  module `top_level`, never to a global same-named callable;
+- `from pkg import module as mod_alias; mod_alias.func()` prefers the existing
+  module file `pkg/module.py`;
+- `from imported_types import ImportedClass as ImportedAlias; return
+ImportedAlias` preserves member-import semantics and resolves the aliased
+  class-as-value reference by import.
+
+Missing/duplicate/ambiguous module aliases remain unresolved, and a claimed
+module alias never falls through to global bare-name matching.
 
 Regenerate the committed database and canonical artifacts from a clean corpus:
 
@@ -359,6 +373,12 @@ general C++ inheritance shapes plus templated-base stripping:
   Since the C++ namespace-prefix work (Release D) stores `Tpl`'s qualified name as
   `ns::Tpl`, this ref now RESOLVES to a real `Extends` edge (`Q` → `ns::Tpl`) in
   `edges.json` instead of remaining an unresolved ref.
+- **plain derived declarations in `.h`** — `plain_derived.h` is promoted from
+  the extension-default C parser to C++ by a full-source, lexically masked
+  `class/struct Derived : Base` probe. It covers access modifiers, `virtual`,
+  qualified names, and templated bases. `plain_header_negatives.h` pins the
+  false-positive boundary: comments, strings, character literals,
+  preprocessor text, bitfields, labels, and ternaries do not promote C source.
 
 Three further files exercise the Release D C++ extraction gains:
 
@@ -488,8 +508,9 @@ The minimal source corpus lives at `crates/codegraph-bench/fixtures/cpp/`
 (`attr_macro.c`, `base.hpp`, `com_interface.hpp`, `derived.cpp`,
 `instantiate_agg.cpp`, `instantiate_rank.cpp`, `namespaced.cpp`,
 `namespaced_member.cpp`, `namespaced_member.hpp`, `neg_interface.hpp`,
-`operators.cpp`, `template_method.cpp`, `templated_call.cpp`, `ue_actor.h`,
-`union_agg.c`, `union_agg.cpp`, `union_agg.mm` — 17 files). The inheritance base
+`operators.cpp`, `plain_derived.h`, `plain_header_negatives.h`,
+`template_method.cpp`, `templated_call.cpp`, `ue_actor.h`, `union_agg.c`,
+`union_agg.cpp`, `union_agg.mm` — 19 files). The inheritance base
 classes live in a `.hpp` file (not `.h`,
 which maps to `Language::C` by extension); `ue_actor.h` deliberately uses `.h` to
 guard the content-based C++ reclassification, and `attr_macro.c` uses `.c` so the
@@ -522,9 +543,9 @@ Like the Ruby fixture, both the index and the dump are byte-stable, and the
 
 ### Rust fixture
 
-`reference/golden/rust/` guards the two Tier 3 items that need Rust source, which
-no other corpus could reach — before it there was no `.rs` file anywhere under
-`crates/codegraph-bench/fixtures/`:
+`reference/golden/rust/` is the repository's Rust corpus. It retains the
+original unit-struct/union contracts and now also pins generic `impl` ownership
+and `self.field.method()` resolution:
 
 - **unit structs are indexed** (upstream #1513 / PR #1514) — `lib.rs` declares
   `struct UnitStruct;` beside `BraceStruct { … }` and `TupleStruct(u8)`, and gives
@@ -540,6 +561,17 @@ no other corpus could reach — before it there was no `.rs` file anywhere under
 - **cross-file resolution** — `consumer.rs` calls `u.greet()` / `b.greet()` on a
   `&UnitStruct` and a `&Bits`, so `implements` and method resolution have to work
   across files rather than only within one.
+- **implementing-type ownership** — `impl_ownership.rs` covers generic,
+  lifetime, reference, qualified, inherent, and trait impls. Methods qualify
+  under the implementing type, not the trait; only trait impls emit
+  `Implements`. Tuple, `dyn`, raw-pointer, and primitive impls remain ordinary
+  functions because there is no single safe owner.
+- **validated self-field calls** — `self_field.rs` pins
+  `self.inner.run()`/reference/`Box` wrappers to the unique project field type.
+  `Option`, `Vec`, `Mutex`, generic, external, and ambiguous field types stay
+  unresolved, and genuine `self.run()` recursion keeps its self-edge. Once the
+  extractor recognizes the single-hop shape it never falls through to a global
+  same-name guess.
 
 **The Rust corpus deliberately makes NO instantiation claim.** An `instantiates` edge
 fires only for the CALL-EXPRESSION construction form: `TupleStruct(2)` yes, a bare
@@ -550,6 +582,9 @@ and the golden carries zero `instantiates` edges. Instantiation is pinned in C++
 instead (`instantiate_agg.cpp` / `instantiate_rank.cpp`), which is upstream's own
 shape. The corpus carries **no `Cargo.toml`**: it is indexed, not compiled, and a
 manifest inside the workspace tree could confuse `cargo`.
+
+The four source files are `lib.rs`, `consumer.rs`, `impl_ownership.rs`, and
+`self_field.rs`.
 
 Regenerate reproducibly (identical recipe to the C++ fixture, substituting `rust`):
 
@@ -567,6 +602,39 @@ cargo run -p codegraph-bench --bin bench -- \
 
 `generated_golden_matches_committed_rust_fixture` and
 `rust_db_is_self_equivalent_to_rust_golden` enforce byte-stability.
+
+### Lua fixture
+
+`reference/golden/lua/` guards #1616 function expressions in assignments and
+table fields. Its single `handlers.lua` source pins:
+
+- `local localFn = function ... end` as one `Function` and no duplicate
+  `Variable`;
+- `M.assignedFn = function` and `M["bracketFn"] = function` as methods qualified
+  `M::assignedFn` / `M::bracketFn`;
+- nested constructor fields as `M.callbacks::onStart` and
+  `M.callbacks::onStop`, while a computed key remains dynamic and emits no
+  callable;
+- every body `helper()` call attributed to its synthesized callable;
+- `localFn()`, `M.assignedFn()`, and `M:assignedFn()` resolving to the intended
+  target, with dot and colon calls sharing `M::assignedFn`.
+
+Regenerate reproducibly:
+
+```bash
+mkdir -p reference/golden/lua
+rm -rf /tmp/cg-fixture-lua
+cp -r crates/codegraph-bench/fixtures/lua /tmp/cg-fixture-lua
+cargo build --release -p codegraph-rs
+CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
+  ./target/release/codegraph init /tmp/cg-fixture-lua
+cp /tmp/cg-fixture-lua/.codegraph/codegraph.db reference/golden/lua/colby.db
+cargo run -p codegraph-bench --bin bench -- \
+  --gen-golden reference/golden/lua/colby.db reference/golden/lua
+```
+
+`generated_golden_matches_committed_lua_fixture` and
+`lua_db_is_self_equivalent_to_lua_golden` enforce byte-stability.
 
 ### Go fixture
 
@@ -944,47 +1012,39 @@ The `generated_golden_matches_committed_terraform_fixture` and
 
 ### Erlang fixture
 
-An eleventh golden fixture, `reference/golden/erlang/`, guards Erlang extraction
-(upstream #1165 / `6511722`, the extraction slice only). Erlang is a **new
-`Language::Erlang` variant** backed by a **dedicated `tree-sitter-erlang`
-grammar** (`.erl`/`.hrl` → `Language::Erlang`). Erlang is form-based — a
-function's name lives on its `function_clause`, the grammar emits one `fun_decl`
-per clause, `record_decl` carries fields as direct children, and
-`-spec`/`-callback`/type bodies parse as `call` nodes — so `ERLANG_SPEC` has
-all-empty C-family type-sets (only `package_types`/`import_types` are wired, as
-upstream) and extraction is driven by the `Language::Erlang`-guarded
-`visit_erlang_node` walker extension. The corpus
-(`crates/codegraph-bench/fixtures/erlang/m.erl`) is a single deterministic file
-with `-module(m)`, `-export([f/1, g/0])`, `-include("foo.hrl")`, `-define(X, 1)`,
-`-record(state, {a, b})`, a `-spec f(integer()) -> integer().`, a two-clause
-`f/1`, and a `g/0` that references `fun f/1`, constructs `#state{}`, calls the
-remote `other:h()`, and self-calls `g()`. What it guards:
+`reference/golden/erlang/` retains the original Erlang extraction contract
+(upstream #1165 / `6511722`) and now guards arity-qualified identity and
+resolution (upstream `41c1075`). Erlang is form-based — a function's name lives
+on its `function_clause`, the grammar emits one `fun_decl` per clause, and
+`-spec`/type bodies also contain `call` nodes — so extraction remains in the
+`Language::Erlang`-guarded walker extension rather than the C-family type sets.
 
-- the `.erl` file with `"language": "erlang"`;
-- `-module(m)` → `NodeKind::Namespace` (so every function's qualified name is
-  `m::f` — the shape the remote-call branch emits, so `mod:f(...)` resolves
-  through the standard qualified-name matcher);
-- clause-merge dedup: the two `f/1` clauses merge to exactly ONE
-  `NodeKind::Function` `f`;
-- `-record(state, {a, b})` → `NodeKind::Struct` `state` with `NodeKind::Field`
-  children `a` and `b`;
-- `-define(X, 1)` → `NodeKind::Constant` `X`;
-- `-include("foo.hrl")` → `NodeKind::Import` + an `Imports` file edge;
-- local `g()` → a `Calls` edge, remote `other:h()` → a `Calls` ref `other::h`;
-- `fun f/1` (function value) and `#state{}` (record usage) → `References`, NOT
-  `Calls`;
-- the `-spec f(integer()) -> integer().` and `-callback` / record-field
-  type-position `call` nodes mint NO bogus type call refs (no `integer` call).
+The seven-file corpus under `crates/codegraph-bench/fixtures/erlang/` pins:
 
-The local `g()` self-call and the `foo.hrl` include resolve; `other::h` (the
-`other` module is absent from the fixture) is the sole unresolved `refs.json`
-row. The non-Godot framework bridges — `-behaviour` callback contracts,
-`gen_server:call/cast(?MODULE|?SERVER)` → `handle_call`/`handle_cast`, the
-`spawn`/`apply`/`proc_lib`/`timer`/`rpc` MFA-argument callee lift, var-module
-dispatch, and `.app`/`.app.src` resource-tuple wiring — are all **DEFERRED**, so
-none of those edges is emitted. Adding the variant is byte-neutral for
-`colby.schema.sql` (language is a stored TEXT value, not DDL) and for the ten
-existing goldens (none holds a `.erl`/`.hrl` file).
+- display names remain bare (`get`, `job`, `header`), while qualified names are
+  `module::function/arity`, such as `store::get/1`, `store::get/2`,
+  `multi::job/1`, and `multi::job/2`;
+- adjacent clauses merge only when both name and arity match (`m::f/1` remains
+  one function), while same-name/different-arity definitions remain distinct;
+- exports and specs select the exact arity;
+- local and remote calls carry arity, so `store:get/2` resolves while the
+  deliberate `store:get/3` call stays unresolved instead of binding a sibling;
+- `fun store:get/1` resolves as a function-value `References` edge;
+- the statically safe `erlang:spawn(single, work, Args)` MFA form resolves
+  `single::work/1`; `multi::job` stays unresolved when the runtime argument
+  list does not prove whether `/1` or `/2` is intended;
+- commas inside `<<Name, Value>>` do not inflate `binary_arg/1` or its call
+  arity;
+- the original module, record, macro, include, recursive-call, and
+  type-position negatives in `m.erl` remain intact.
+
+The unresolved set intentionally includes `store::get/3`, external library
+calls such as `lists::map/2` and `maps::get/3`, `other::h/0`, the runtime
+`erlang::spawn/3` calls themselves, and ambiguous `multi::job`. Variable-module
+dispatch, dynamic MFA targets, behaviour callback contracts, and
+`.app`/`.app.src` resource wiring remain outside this corpus. The CLI and MCP
+node lookup normalize Erlang's source spelling `mod:fn/3` to the stored
+`mod::fn/3` form.
 
 Regenerate reproducibly (identical recipe to the Terraform fixture, substituting
 `erlang`):
@@ -1051,12 +1111,14 @@ The `generated_golden_matches_committed_cfml_fixture` and
 ### TypeScript resolution fixture
 
 The dedicated `reference/golden/typescript/` fixture guards TypeScript export
-alias and explicit JavaScript-specifier resolution (#1482 / #1482b) without
-changing the shared `mini` corpus. Its six-file source corpus lives at
-`crates/codegraph-bench/fixtures/typescript/`; source lines are contractual
-because node IDs include the declaration line.
+aliases, JavaScript-family import resolution, object-literal namespaces, and
+inherited path aliases without changing the shared `mini` corpus. It has 14
+indexed source files plus `tsconfig.json` and
+`config/tsconfig.base.json`; source lines are contractual because node IDs
+include the declaration line.
 
-The `runAll` function pins six positive `Calls` edges, in source order:
+The original `runAll` function retains six positive `Calls` edges, in source
+order:
 
 - `viaConstAlias()` → the local `constTarget` function behind
   `export const constAlias = constTarget`;
@@ -1071,9 +1133,24 @@ The `runAll` function pins six positive `Calls` edges, in source order:
   the existing extensionless behavior.
 
 Two negative rules make false positives visible: `viaMissing` remains the only
-unresolved call and import pair in `refs.json`, with no `Calls` edge; and no
+unresolved direct-import call and import pair in `refs.json`, with no `Calls`
+edge; and no
 `Calls` edge may target either the exported `Constant` `constAlias` or the
 JavaScript `collisionTarget` in `collision.js`.
+
+The expanded corpus also pins:
+
+- local `api.run()` / `api.stop()` and imported `api.run()` / `api.stop()` to
+  direct callable members of one exported object literal;
+- source-range containment prevents the unrelated top-level `run` function
+  from becoming the target, while nested `api.nested.run()` remains unresolved;
+- `tsconfig.json` extends the JSONC/trailing-comma
+  `config/tsconfig.base.json`; the declaring config's `baseUrl` resolves
+  `@fixture/aliased` to `src/aliased.ts`;
+- extensionless imports consider `.xsjs` and `.xsjslib` after ordinary
+  `.js`/`.jsx`/`.mjs`/`.cjs` candidates and before index candidates, so
+  `legacy_helpers.xsjslib` resolves while `legacy_priority.js` still wins over
+  the same-name `.xsjs` file.
 
 Regenerate the committed database and canonical artifacts from a clean corpus:
 

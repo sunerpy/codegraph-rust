@@ -376,6 +376,13 @@ files. Events are debounced (default ~2 s; tunable via
 `CODEGRAPH_WATCH_DEBOUNCE_MS`) so a burst of saves triggers one incremental
 rebuild rather than many. The watcher is auto-disabled on WSL2 `/mnt/` drives
 where recursive watch is too slow; set `CODEGRAPH_FORCE_WATCH=1` to override.
+The selected index root's `config.toml` and `codegraph.json`, plus the project
+root `.gitignore`, are live control files: their events bypass ordinary
+include/exclude filtering, reload the running scope, reconcile OS watch targets,
+and trigger one full scan that supersedes queued path deltas. Invalid TOML keeps
+the last valid scope and is reported; malformed JSON keeps the existing tolerant
+empty-override semantics. Every later incremental sync re-checks the current
+scope, preventing stale events from re-admitting excluded files.
 When the resolved root is exactly `$HOME` or the filesystem root (`/`), the
 server first disables the daemon, the file watcher, AND catch-up sync — not just
 the watcher. This happens when an IDE or agent (e.g. Kiro) launches

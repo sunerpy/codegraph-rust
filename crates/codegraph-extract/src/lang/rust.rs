@@ -8,6 +8,25 @@ pub struct RustSpec;
 
 pub static RUST_SPEC: RustSpec = RustSpec;
 
+/// Return the implementing type's simple name from an `impl_item` `type` field.
+///
+/// Generic, scoped, and reference wrappers are unwrapped recursively. Shapes
+/// that do not name one concrete type (tuples, `dyn`, raw pointers, primitive
+/// and function types) deliberately return `None`.
+pub(crate) fn rust_impl_type_name(type_node: Option<Node<'_>>, source: &str) -> Option<String> {
+    let type_node = type_node?;
+    match type_node.kind() {
+        "type_identifier" | "identifier" => Some(node_text(type_node, source)),
+        "generic_type" | "reference_type" => {
+            rust_impl_type_name(child_by_field(type_node, "type"), source)
+        }
+        "scoped_type_identifier" | "scoped_identifier" => {
+            rust_impl_type_name(child_by_field(type_node, "name"), source)
+        }
+        _ => None,
+    }
+}
+
 impl LanguageSpec for RustSpec {
     fn language(&self) -> Language {
         Language::Rust
@@ -149,27 +168,7 @@ impl LanguageSpec for RustSpec {
         let mut parent = node.parent();
         while let Some(current) = parent {
             if current.kind() == "impl_item" {
-                let children = current
-                    .named_children(&mut current.walk())
-                    .collect::<Vec<_>>();
-                if let Some(type_node) = children
-                    .iter()
-                    .rev()
-                    .find(|child| child.kind() == "type_identifier")
-                {
-                    return Some(node_text(*type_node, source));
-                }
-                if let Some(generic_type) =
-                    children.iter().find(|child| child.kind() == "generic_type")
-                {
-                    if let Some(inner) = generic_type
-                        .named_children(&mut generic_type.walk())
-                        .find(|child| child.kind() == "type_identifier")
-                    {
-                        return Some(node_text(inner, source));
-                    }
-                }
-                return None;
+                return rust_impl_type_name(child_by_field(current, "type"), source);
             }
             parent = current.parent();
         }
@@ -275,6 +274,67 @@ mod tests {
         let tree = parse(src);
         let func = first_of_kind(tree.root_node(), "function_item").unwrap();
         assert_eq!(RUST_SPEC.get_receiver_type(func, src).as_deref(), Some("S"));
+    }
+
+    #[test]
+    fn trait_impl_receivers_use_the_implementing_type_field() {
+        for (src, expected) in [
+            (
+                "trait Tr { fn m(&self); }\nstruct G<T>(T);\nimpl<T> Tr for G<T> { fn m(&self) {} }\n",
+                Some("G"),
+            ),
+            (
+                "trait Tr { fn m(&self); }\nstruct P<'a>(&'a u8);\nimpl<'a> Tr for P<'a> { fn m(&self) {} }\n",
+                Some("P"),
+            ),
+            (
+                "trait Tr { fn m(&self); }\nstruct S;\nimpl Tr for &S { fn m(&self) {} }\n",
+                Some("S"),
+            ),
+            (
+                "trait Tr { fn m(&self); }\nmod m { pub struct S; }\nimpl Tr for m::S { fn m(&self) {} }\n",
+                Some("S"),
+            ),
+            (
+                "trait Tr { fn m(&self); }\nimpl Tr for (u8, u8) { fn m(&self) {} }\n",
+                None,
+            ),
+            (
+                "trait Tr { fn m(&self); }\nimpl Tr for dyn Tr { fn m(&self) {} }\n",
+                None,
+            ),
+            (
+                "trait Tr { fn m(&self); }\nimpl Tr for *const u8 { fn m(&self) {} }\n",
+                None,
+            ),
+            (
+                "trait Tr { fn m(&self); }\nimpl Tr for u32 { fn m(&self) {} }\n",
+                None,
+            ),
+        ] {
+            let tree = parse(src);
+            let funcs = {
+                let mut out = Vec::new();
+                fn walk<'t>(node: Node<'t>, out: &mut Vec<Node<'t>>) {
+                    if node.kind() == "function_item" {
+                        out.push(node);
+                    }
+                    for index in 0..node.named_child_count() {
+                        if let Some(child) = node.named_child(index as u32) {
+                            walk(child, out);
+                        }
+                    }
+                }
+                walk(tree.root_node(), &mut out);
+                out
+            };
+            let implementation = *funcs.last().expect("impl method");
+            assert_eq!(
+                RUST_SPEC.get_receiver_type(implementation, src).as_deref(),
+                expected,
+                "{src}"
+            );
+        }
     }
 
     #[test]
