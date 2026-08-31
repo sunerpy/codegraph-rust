@@ -145,6 +145,57 @@ fn is_plain_receiver_segment(segment: &str) -> bool {
             .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
 }
 
+/// Deterministic logical recursion bound for the native AST walker.
+///
+/// Tree-sitter parses deeply nested input iteratively, but this walker descends
+/// recursively. Bounding named-node depth keeps one adversarial file from
+/// overflowing the process stack. The value is deliberately well above normal
+/// source nesting while remaining safe on a 1 MiB worker stack.
+const MAX_WALK_DEPTH: usize = 256;
+
+fn is_transparent_walk_wrapper(language: Language, node: SyntaxNode<'_>) -> bool {
+    language == Language::Rust
+        && node.kind() == "expression_statement"
+        && node.named_child_count() == 1
+}
+
+fn unwrap_transparent_walk_wrappers(
+    language: Language,
+    mut node: SyntaxNode<'_>,
+) -> SyntaxNode<'_> {
+    while is_transparent_walk_wrapper(language, node) {
+        let Some(child) = node.named_child(0) else {
+            break;
+        };
+        node = child;
+    }
+    node
+}
+
+fn ast_exceeds_safe_depth(root: SyntaxNode<'_>, language: Language) -> bool {
+    let mut pending = vec![(root, 1usize)];
+
+    while let Some((node, depth)) = pending.pop() {
+        if depth > MAX_WALK_DEPTH {
+            return true;
+        }
+
+        for index in 0..node.named_child_count() {
+            if let Some(child) = node.named_child(index as u32) {
+                // tree-sitter-rust inserts an inert `expression_statement`
+                // between every nested block. It carries no extraction
+                // semantics, so count the source-level block rather than
+                // double-charging this grammar wrapper.
+                let child_depth =
+                    depth + usize::from(!is_transparent_walk_wrapper(language, child));
+                pending.push((child, child_depth));
+            }
+        }
+    }
+
+    false
+}
+
 pub struct TreeSitterWalker<'a, 'tree> {
     file_path: &'a str,
     source: &'a str,
@@ -170,6 +221,11 @@ pub struct TreeSitterWalker<'a, 'tree> {
     /// component body) have already been consumed, so the top-level `program`
     /// walk skips them instead of re-visiting. 0 outside CFML tag files.
     cfml_consumed_until: usize,
+    /// Current named-node recursion depth. Root is depth 1.
+    walk_depth: usize,
+    /// Latched once a child would exceed [`MAX_WALK_DEPTH`]. All remaining
+    /// descent stops and `extract` discards the partial graph.
+    walk_aborted: bool,
 }
 
 impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
@@ -194,10 +250,16 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             erlang_last_fn_name: None,
             erlang_last_fn_id: None,
             cfml_consumed_until: 0,
+            walk_depth: 0,
+            walk_aborted: false,
         }
     }
 
     pub fn extract(mut self, duration_ms: i64) -> ExtractionResult {
+        if ast_exceeds_safe_depth(self.root, self.spec.language()) {
+            return self.depth_error_result(duration_ms);
+        }
+
         let file_node = self.create_file_node();
         let file_id = file_node.id.clone();
         self.nodes.push(file_node);
@@ -212,6 +274,10 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
         self.node_stack.pop();
 
+        if self.walk_aborted {
+            return self.depth_error_result(duration_ms);
+        }
+
         self.flush_fn_ref_candidates();
 
         ExtractionResult {
@@ -223,7 +289,35 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
     }
 
+    fn depth_error_result(&self, duration_ms: i64) -> ExtractionResult {
+        ExtractionResult {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            unresolved_references: Vec::new(),
+            errors: vec![format!(
+                "AST nesting exceeds safe traversal limit ({MAX_WALK_DEPTH}): {}",
+                self.file_path
+            )],
+            duration_ms,
+        }
+    }
+
     fn visit_node(&mut self, node: SyntaxNode<'tree>) {
+        let node = unwrap_transparent_walk_wrappers(self.spec.language(), node);
+        if self.walk_aborted {
+            return;
+        }
+        if self.walk_depth >= MAX_WALK_DEPTH {
+            self.walk_aborted = true;
+            return;
+        }
+
+        self.walk_depth += 1;
+        self.visit_node_inner(node);
+        self.walk_depth -= 1;
+    }
+
+    fn visit_node_inner(&mut self, node: SyntaxNode<'tree>) {
         let node_type = node.kind();
         let mut skip_children = false;
 
@@ -3322,6 +3416,21 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     }
 
     fn visit_body_node(&mut self, node: SyntaxNode<'tree>) {
+        let node = unwrap_transparent_walk_wrappers(self.spec.language(), node);
+        if self.walk_aborted {
+            return;
+        }
+        if self.walk_depth >= MAX_WALK_DEPTH {
+            self.walk_aborted = true;
+            return;
+        }
+
+        self.walk_depth += 1;
+        self.visit_body_node_inner(node);
+        self.walk_depth -= 1;
+    }
+
+    fn visit_body_node_inner(&mut self, node: SyntaxNode<'tree>) {
         let node_type = node.kind();
         self.maybe_capture_fn_refs(node, node_type);
         // Inside a function body, GDScript `preload(...)`/`load(...)` calls must

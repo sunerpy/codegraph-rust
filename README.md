@@ -472,6 +472,12 @@ Godot project graphs), graph traversal, FTS5 search, whole-graph export with
 deterministic PageRank centrality, MCP/CLI surfaces, and golden byte-stable
 output.
 
+Extraction is fail-closed per file: a source tree deeper than the deterministic
+256-level logical named-node limit records a stable file error, emits no partial
+graph for that file, and does not stop other files from being indexed. Incremental
+`sync` removes any older graph for the failed file and converges with
+`index --force`.
+
 **Doesn't:** no AI / vector / embedding / LLM anywhere inside the binary (hard
 constraint, `scripts/guardrail.sh`-enforced); no semantic search; no languages
 beyond the fixed `LANGUAGES` set.

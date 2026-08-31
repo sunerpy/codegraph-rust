@@ -77,6 +77,34 @@
 
 ## Sync log
 
+### 2026-08-31 — Wave 0 deep-AST guard IMPLEMENTED in PR #249; release pending
+
+Upstream `838006c947ebe69407e8f64ba756f97132f411f4` fixed the process-crash
+class caused by deeply recursive native walkers. Rust PR
+[#249](https://github.com/sunerpy/codegraph-rust/pull/249), commit `53360d9`,
+implements the portable behavior with a deterministic design rather than
+copying upstream's platform stack-pointer / wasm fallback:
+
+- an iterative preflight rejects logical named-node depth above 256 before any
+  recursive semantic traversal;
+- the main walker and function-body walker share a fail-closed runtime depth
+  latch, while Rust's inert single-child `expression_statement` grammar wrapper
+  is folded so 200 levels of ordinary source nesting remain valid;
+- an over-limit file contributes no partial nodes, edges, or unresolved
+  references, records one stable file error, and does not stop sibling files;
+- incremental `sync` removes the file's previous graph and is canonically
+  identical to a fresh `index --force` for the same final filesystem state.
+
+Coverage includes 30,000-level C, C++, Rust, TypeScript, and Python inputs on a
+1 MiB test thread, the exact inclusive 256/257 boundary, per-file isolation, and
+the incremental/full-rebuild equivalence oracle. Local `make ci` and the
+pre-push gate both passed. This change deliberately keeps extraction version 11
+and changes no golden artifact or node-id formula.
+
+This entry records implementation only. The item remains release-pending until
+the release-please PR, six-platform artifacts, checksums, and published Linux
+black-box smoke test complete; tracked colby parity therefore remains `1.5.0`.
+
 ### 2026-08-31 — implementation baseline refreshed at codegraph-rs `v0.48.1`
 
 Before implementation began, both repositories and the three load-bearing open
