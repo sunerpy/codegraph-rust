@@ -1804,6 +1804,13 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
                 ExtractionStatus::Missing if lockless_missing => {
                     println!("{extraction_status_detail}");
                 }
+                ExtractionStatus::Outdated { .. } => {
+                    println!("Index was built by an older extraction version.");
+                    println!(
+                        "Recovery: run `codegraph sync {}` to migrate it.",
+                        project.display()
+                    );
+                }
                 _ => {
                     println!("Not initialized");
                     println!("Run \"codegraph init\" to initialize");
