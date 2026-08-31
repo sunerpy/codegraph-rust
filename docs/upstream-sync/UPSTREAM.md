@@ -201,6 +201,21 @@ Final black-box acceptance used that downloaded `v0.50.1` static binary:
   print-config output stayed compatible, and shell completion succeeded on a
   1 MiB thread stack.
 
+While validating this closeout documentation, Windows CI exposed a test-only
+temporary-database collision: the two parallel `go_multi_module` Tier 6 tests
+could receive the same coarse wall-clock value and therefore open the same
+SQLite path, producing `UNIQUE constraint failed: schema_versions.version`.
+Rust PR [#263](https://github.com/sunerpy/codegraph-rust/pull/263), merged as
+`be0da2dffe65ffde6892e44c3d2e8d5366e1f07f` from commit
+`6ef62963f85fbeafdf6bd05c1d09f8f867c0b060`, adds a process-local atomic nonce
+and a deterministic same-clock regression test. It changes no product
+behavior, version, extraction, schema, node-id, graph row, golden, or Skill.
+Local `make ci`, the pre-push gate, PR CI run
+[`33436085651`](https://github.com/sunerpy/codegraph-rust/actions/runs/33436085651),
+and post-merge main CI run
+[`33437015489`](https://github.com/sunerpy/codegraph-rust/actions/runs/33437015489)
+all passed, including the complete native Windows job.
+
 A final live upstream refresh found release `v1.6.0`, `main` still exactly
 `6a056ec5db35172f9dc348f87b54ea415aa5169e`, and #1626, #1616, and #1617 still
 open upstream. The Rust port has shipped the first two issue fixes; #1617 and
