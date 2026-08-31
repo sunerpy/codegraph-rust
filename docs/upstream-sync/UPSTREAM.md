@@ -13,14 +13,18 @@
   `1.2.0 → 1.4.1` subset landed across `v0.28.3`–`v0.39.0`; see the 2026-07-17
   CLOSEOUT entry)
 - **This project version:** see `Cargo.toml` (`codegraph-rs`, independent line)
-- **Last sync:** `2026-08-20` — the post-`v1.5.0` **unreleased** range (104 commits
-  on upstream `main` past the `v1.5.0` tag) was triaged and six tiers shipped
-  across `v0.43.2` → `v0.46.1`; see the 2026-08-20 entry. Tracked parity stays
-  `1.5.0` — none of these releases is a port of an upstream *release* range, and
-  upstream's newest tag is still `v1.5.0`
-- **Next sync starts here:** `git ls-remote --tags` alone is not enough. Diff
-  `v1.5.0..origin/main` too — this round found 104 unreleased commits behind an
-  unchanged tag
+- **Last audit:** `2026-08-27` (refreshed `2026-08-31`) — upstream `v1.6.0`
+  plus its one following
+  docs-only commit was audited through
+  `6a056ec5db35172f9dc348f87b54ea415aa5169e`. The exact new range after the
+  previously closed 104-commit batch is 28 commits and leaves 15 PORT families;
+  see `V1_6_TRIAGE_2026-08-27.md`. Tracked parity therefore remains `1.5.0`
+  until that backlog lands
+- **Previous exact boundary:** `c6aaa20358cd6adcd04b87bdef8e5803ad146f3a`
+  (the 104th commit after `v1.5.0`; merge of upstream PR #1516)
+- **Next discovery starts here:** diff
+  `6a056ec5db35172f9dc348f87b54ea415aa5169e..origin/main`; do not re-triage
+  the v1.6 backlog — use `V1_6_TRIAGE_2026-08-27.md`
 - **Upstream repo:** https://github.com/colbymchenry/codegraph
 
 > **1.4.1 → 1.5.0 sync: COMPLETE** (codegraph-rs `v0.42.1` → `v0.42.4`). Every
@@ -72,6 +76,55 @@
 > that records colby parity — do not infer it from `Cargo.toml`.
 
 ## Sync log
+
+### 2026-08-31 — implementation baseline refreshed at codegraph-rs `v0.48.1`
+
+Before implementation began, both repositories and the three load-bearing open
+issues were refreshed against their live GitHub state:
+
+- codegraph-rs `main` and the latest published release are both `v0.48.1`
+  (`e5350b3c6eb6312cfae86f2353375e4bfb5e9a3f`);
+- upstream's latest release remains `v1.6.0`, and upstream `main` is still
+  exactly `6a056ec5db35172f9dc348f87b54ea415aa5169e`;
+- the diff after the audit boundary is empty, so the 15 PORT families below do
+  not need re-triage;
+- #1626 (Python aliases), #1616 (Lua function expressions), and #1617 (custom
+  Lua loaders) remain open. The first two stay in the implementation backlog;
+  #1617 stays explicitly deferred.
+
+This refresh changes only the Rust implementation/release baseline. It does not
+rewrite the 2026-08-27 audit evidence, and tracked upstream parity remains
+`1.5.0` until the portable `v1.6.0` backlog lands.
+
+### 2026-08-27 — `v1.6.0` release range AUDITED; 15 PORT families OPEN (tracked parity stays `1.5.0`)
+
+Upstream released `v1.6.0` on 2026-08-26. The earlier post-`v1.5.0` audit
+covered exactly 104 commits through `c6aaa20358cd6adcd04b87bdef8e5803ad146f3a`;
+that count was re-verified before this round. The fresh range through current
+upstream head `6a056ec5db35172f9dc348f87b54ea415aa5169e` is exactly 28 commits
+(27 through the release tag plus one docs-only follow-up), 100 files,
++6900/−575.
+
+The complete classification, local source evidence, open-issue triage, and
+recommended implementation waves are recorded in
+[`V1_6_TRIAGE_2026-08-27.md`](V1_6_TRIAGE_2026-08-27.md).
+
+The highest-priority item is native tree-walker depth protection: upstream
+demonstrated a process-level stack-overflow crash on deeply nested source, and
+the Rust walker still recurses without a guard. The graph-correctness wave then
+contains Erlang arity identity, two Rust method-resolution fixes, JS/TS
+object-literal namespaces, inherited TS aliases, C++ `.h` detection, Python
+import aliases, Lua function-expression callables, and live watcher-scope
+refresh. Retrieval/UX work follows.
+
+One measured performance regression is also now pinned: the Rust database
+already has `idx_nodes_lower_name`, but its case-insensitive exact-name query
+uses `COLLATE NOCASE` and scans `nodes`; `lower(name) = lower(?)` seeks the
+expression index. That upstream change is a real PORT item, not an
+already-present optimization.
+
+No source port was implemented in this audit. The next upstream discovery diff
+starts after `6a056ec5`; implementation work starts from the linked report.
 
 ### 2026-08-20 — post-`v1.5.0` unreleased range TRIAGED and CLOSED, six tiers SHIPPED (`v0.43.2` → `v0.46.1`; tracked parity stays `1.5.0`)
 
