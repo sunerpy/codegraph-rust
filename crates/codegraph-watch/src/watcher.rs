@@ -128,10 +128,32 @@ impl ControlFiles {
 }
 
 fn relative_path(project_root: &Path, path: &Path) -> String {
-    path.strip_prefix(project_root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
+    if let Ok(relative) = path.strip_prefix(project_root) {
+        return relative.to_string_lossy().replace('\\', "/");
+    }
+
+    // `IndexPaths` keeps canonical physical paths. On Windows canonicalization
+    // commonly adds the verbatim `\\?\` prefix, while a caller may still hold
+    // the equivalent ordinary `C:\...` spelling. Compare their slash-normalized
+    // forms after removing that prefix so project-control files remain relative.
+    let root = native_path_string(project_root);
+    let candidate = native_path_string(path);
+    let prefix = format!("{}/", root.trim_end_matches('/'));
+    candidate
+        .strip_prefix(&prefix)
+        .unwrap_or(&candidate)
+        .to_string()
+}
+
+fn native_path_string(path: &Path) -> String {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    if let Some(rest) = normalized.strip_prefix("//?/UNC/") {
+        format!("//{rest}")
+    } else if let Some(rest) = normalized.strip_prefix("//?/") {
+        rest.to_string()
+    } else {
+        normalized
+    }
 }
 
 fn reload_runtime_scope(
@@ -603,14 +625,19 @@ pub fn watch_options_for_project(project_root: impl AsRef<Path>) -> Result<Watch
 
 impl ProjectWatcher {
     pub fn start(project_root: impl AsRef<Path>, options: WatchOptions) -> Result<Option<Self>> {
-        let project_root = project_root.as_ref().to_path_buf();
-        if watch_disabled_reason(&project_root, options.no_watch).is_some() {
+        let requested_root = project_root.as_ref().to_path_buf();
+        if watch_disabled_reason(&requested_root, options.no_watch).is_some() {
             return Ok(None);
         }
         let index_paths = Arc::new(IndexPaths::resolve(
-            &project_root,
+            &requested_root,
             std::env::var("CODEGRAPH_DIR").ok().as_deref(),
         )?);
+        // Keep every watcher path in the same physical namespace as IndexPaths.
+        // This matters on Windows, where canonical paths carry a `\\?\` prefix:
+        // mixing that spelling with the requested root makes absolute control
+        // events fail `WatchPolicy::normalize_relative` before classification.
+        let project_root = index_paths.project().to_path_buf();
         let control_files = ControlFiles::new(&project_root, &index_paths);
         let runtime_scope = RuntimeWatchScope::from_options(&project_root, &options);
         let policy = runtime_scope.policy.clone();
@@ -1386,6 +1413,21 @@ mod tests {
         assert_eq!(
             outcome.trigger_paths,
             vec!["src/brand_new_symbol.ts".to_string()]
+        );
+    }
+
+    #[test]
+    fn relative_path_equates_windows_verbatim_and_regular_drive_paths() {
+        assert_eq!(
+            relative_path(
+                Path::new("C:/Users/test/project"),
+                Path::new("//?/C:/Users/test/project/.codegraph/config.toml"),
+            ),
+            ".codegraph/config.toml"
+        );
+        assert_eq!(
+            native_path_string(Path::new("//?/UNC/server/share/project")),
+            "//server/share/project"
         );
     }
 
