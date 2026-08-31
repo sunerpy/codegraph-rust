@@ -20,11 +20,14 @@
 //! file, so the worktree stays clean.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use codegraph_core::types::{Edge, EdgeKind, FileRecord, Node, NodeKind};
 use codegraph_extract::{detect_language, extract_file};
 use codegraph_resolve::ReferenceResolver;
 use codegraph_store::Store;
+
+static NEXT_TEMP_DB: AtomicU64 = AtomicU64::new(0);
 
 fn fixture_root(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -35,16 +38,32 @@ fn fixture_root(name: &str) -> PathBuf {
 }
 
 fn temp_db_path(test_name: &str) -> PathBuf {
-    let mut path = std::env::temp_dir();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock after epoch")
         .as_nanos();
+    temp_db_path_at(test_name, nanos)
+}
+
+fn temp_db_path_at(test_name: &str, nanos: u128) -> PathBuf {
+    let mut path = std::env::temp_dir();
+    // Windows may return the same wall-clock value to parallel tests. The
+    // process-local nonce keeps same-fixture stores collision-free regardless
+    // of clock resolution.
+    let nonce = NEXT_TEMP_DB.fetch_add(1, Ordering::Relaxed);
     path.push(format!(
-        "codegraph-tier6-{test_name}-{}-{nanos}.db",
+        "codegraph-tier6-{test_name}-{}-{nanos}-{nonce}.db",
         std::process::id()
     ));
     path
+}
+
+#[test]
+fn temp_db_paths_remain_unique_when_clock_does_not_advance() {
+    assert_ne!(
+        temp_db_path_at("same_fixture", 42),
+        temp_db_path_at("same_fixture", 42)
+    );
 }
 
 /// Every indexable file under `root`, as project-relative `/`-separated paths,
