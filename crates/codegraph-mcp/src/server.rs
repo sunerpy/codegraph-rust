@@ -19,8 +19,8 @@ use crate::engine::CodeGraphEngine;
 use crate::instructions::server_instructions;
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse, ToolResult, error_codes};
 use crate::roots::{
-    ROOTS_LIST_REQUEST_ID, WorkspaceRoots, db_exists_for, db_path_for, format_tool_debug_line,
-    roots_list_request,
+    ROOTS_LIST_REQUEST_ID, ServerRootDiscovery, WorkspaceRoots, db_exists_for, db_path_for,
+    format_subproject_candidates, format_tool_debug_line, not_indexed_message, roots_list_request,
 };
 use crate::schemas;
 
@@ -194,16 +194,60 @@ pub struct McpServer {
     cwd: Option<PathBuf>,
     observed_identities: HashMap<PathBuf, ObservedDbIdentity>,
     workspace_roots: WorkspaceRoots,
+    root_discovery: ServerRootDiscovery,
     no_roots: bool,
 }
 
 impl McpServer {
     pub fn new(default_project: Option<PathBuf>) -> Self {
+        Self::with_cwd(default_project, std::env::current_dir().ok(), false)
+    }
+
+    fn with_cwd(
+        default_project: Option<PathBuf>,
+        cwd: Option<PathBuf>,
+        use_cwd_for_discovery: bool,
+    ) -> Self {
+        let search_from = default_project
+            .clone()
+            .or_else(|| use_cwd_for_discovery.then(|| cwd.clone()).flatten());
+        let mut root_discovery = ServerRootDiscovery::new(search_from);
+        let mut resolved_default = default_project;
+        if let Some(resolution) = root_discovery.initial_resolution() {
+            if let Some(root) = resolution.root {
+                if resolution.via_subproject_scan {
+                    let relative = root
+                        .strip_prefix(&resolution.search_from)
+                        .unwrap_or(&root)
+                        .display();
+                    eprintln!(
+                        "[CodeGraph MCP] No index at or above {}; adopted the single indexed sub-project {relative} as the default project.",
+                        resolution.search_from.display()
+                    );
+                }
+                resolved_default = Some(root);
+            } else {
+                eprintln!(
+                    "[CodeGraph MCP] No index at or above {}: no default project, live sync disabled.",
+                    resolution.search_from.display()
+                );
+                if !resolution.candidates.is_empty() {
+                    eprintln!(
+                        "[CodeGraph MCP] Indexed sub-projects found: {}. Pass `projectPath` per call, or launch with --path.",
+                        format_subproject_candidates(
+                            Some(&resolution.search_from),
+                            &resolution.candidates
+                        )
+                    );
+                }
+            }
+        }
         Self {
-            default_project,
-            cwd: std::env::current_dir().ok(),
+            default_project: resolved_default,
+            cwd,
             observed_identities: HashMap::new(),
             workspace_roots: WorkspaceRoots::new(),
+            root_discovery,
             no_roots: false,
         }
     }
@@ -218,6 +262,24 @@ impl McpServer {
             return false;
         };
         db_exists_for(project)
+    }
+
+    fn retry_default_project(&mut self) -> Option<PathBuf> {
+        if self.has_default_codegraph() {
+            return None;
+        }
+        let resolution = self.root_discovery.retry_resolution()?;
+        let root = resolution.root?;
+        let relative = root
+            .strip_prefix(&resolution.search_from)
+            .unwrap_or(&root)
+            .display();
+        eprintln!(
+            "[CodeGraph MCP] Adopted newly indexed project {relative} from {} as the default project.",
+            resolution.search_from.display()
+        );
+        self.default_project = Some(root.clone());
+        Some(root)
     }
 
     /// Run the stdio loop until the broad-root daemon handoff adopts a project
@@ -333,6 +395,7 @@ impl McpServer {
                     cwd.as_deref(),
                     req.params.as_ref(),
                 ) {
+                    self.root_discovery.clear_candidates();
                     self.debug_roots_adopted(&adopted, old_default.as_deref());
                     return Dispatch::ReplyWithAdoption {
                         reply: initialize_result(),
@@ -355,20 +418,26 @@ impl McpServer {
             }
             "initialized" => Dispatch::Notification,
             "notifications/initialized" => Dispatch::Notification,
-            "tools/list" if is_request => Dispatch::Reply(json!({
-                // tools/list ALWAYS exposes the visible tool surface (#94 /
-                // colby #964, PR#966). When a default project is resolved,
-                // projectPath stays OPTIONAL (byte-identical to the golden).
-                // When none is resolved (roots-less client, unindexed cwd),
-                // the SAME tools are listed with projectPath marked required
-                // (#993, PR#1007) so the agent supplies it per call. This
-                // reverses the c450fd95 "empty list when unindexed" behavior.
-                "tools": if self.has_default_codegraph() {
-                    schemas::visible_tool_definitions()
-                } else {
-                    schemas::visible_tool_definitions_requiring_project_path()
-                }
-            })),
+            "tools/list" if is_request => {
+                let adopted = self.retry_default_project();
+                let reply = json!({
+                    // tools/list ALWAYS exposes the visible tool surface (#94 /
+                    // colby #964, PR#966). When a default project is resolved,
+                    // projectPath stays OPTIONAL (byte-identical to the golden).
+                    // When none is resolved (roots-less client, unindexed cwd),
+                    // the SAME tools are listed with projectPath marked required
+                    // (#993, PR#1007) so the agent supplies it per call. This
+                    // reverses the c450fd95 "empty list when unindexed" behavior.
+                    "tools": if self.has_default_codegraph() {
+                        schemas::visible_tool_definitions()
+                    } else {
+                        schemas::visible_tool_definitions_requiring_project_path()
+                    }
+                });
+                adopted.map_or(Dispatch::Reply(reply.clone()), |adopted| {
+                    Dispatch::ReplyWithAdoption { reply, adopted }
+                })
+            }
             "tools/call" if is_request => self.handle_tools_call(req),
             "ping" if is_request => Dispatch::Reply(json!({})),
             "resources/list" if is_request => Dispatch::Reply(json!({ "resources": [] })),
@@ -397,6 +466,7 @@ impl McpServer {
             cwd.as_deref(),
             response.get("result"),
         ) {
+            self.root_discovery.clear_candidates();
             self.debug_roots_adopted(&adopted, old_default.as_deref());
             return Some(adopted);
         }
@@ -434,6 +504,10 @@ impl McpServer {
             .unwrap_or_else(|| json!({}));
 
         let raw_project = args.get("projectPath").and_then(Value::as_str);
+        let adopted = raw_project
+            .is_none()
+            .then(|| self.retry_default_project())
+            .flatten();
         let resolved = self.resolve_project_arg(raw_project);
         tracing::debug!(
             "{}",
@@ -456,15 +530,18 @@ impl McpServer {
                 );
             }
             crate::roots::ProjectArg::NotIndexed => {
-                let message = match raw_project {
-                    Some(raw) => format!(
-                        "No indexed project found for projectPath {raw:?}. Pass an absolute path to an indexed project, or run `codegraph init` there."
-                    ),
-                    None => "No indexed project resolved. Pass a `projectPath` argument, run `codegraph init` in the project, or start the server with `--path <project>`.".to_string(),
+                let message = not_indexed_message(
+                    raw_project,
+                    self.root_discovery.search_from(),
+                    self.root_discovery.known_candidates(),
+                );
+                let result = if raw_project.is_some() {
+                    ToolResult::error(message)
+                } else {
+                    ToolResult::text(message)
                 };
                 return Dispatch::Reply(
-                    serde_json::to_value(ToolResult::error(message))
-                        .expect("ToolResult serializes"),
+                    serde_json::to_value(result).expect("ToolResult serializes"),
                 );
             }
         };
@@ -483,7 +560,10 @@ impl McpServer {
         };
 
         let result = engine.execute(&tool_name, &args);
-        Dispatch::Reply(serde_json::to_value(result).expect("ToolResult serializes"))
+        let reply = serde_json::to_value(result).expect("ToolResult serializes");
+        adopted.map_or(Dispatch::Reply(reply.clone()), |adopted| {
+            Dispatch::ReplyWithAdoption { reply, adopted }
+        })
     }
 
     /// Resolve a caller's `projectPath` argument to an INDEXED project dir (one
@@ -561,13 +641,7 @@ impl McpServer {
     /// mutating the process-global working directory.
     #[doc(hidden)]
     pub fn new_with_cwd(default_project: Option<PathBuf>, cwd: Option<PathBuf>) -> Self {
-        Self {
-            default_project,
-            cwd,
-            observed_identities: HashMap::new(),
-            workspace_roots: WorkspaceRoots::new(),
-            no_roots: false,
-        }
+        Self::with_cwd(default_project, cwd, true)
     }
 }
 
@@ -655,6 +729,25 @@ mod tests {
         TempProject { path }
     }
 
+    fn workspace(tag: &str) -> TempProject {
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "cg-mcp-workspace-{tag}-{}-{seq}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(path.join(".git")).unwrap();
+        TempProject { path }
+    }
+
+    fn indexed_child(workspace: &TempProject, name: &str) -> PathBuf {
+        let child = workspace.path().join(name);
+        std::fs::create_dir_all(&child).unwrap();
+        let db = db_path_for(&child).expect("child project resolves");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::fs::write(db, b"placeholder").unwrap();
+        child
+    }
+
     /// Drive one `initialize` frame through the retained `run_until_adoption`
     /// loop and capture every response line. `initialize` never adopts (adoption
     /// only fires on a roots/list RESPONSE), so the loop runs to EOF.
@@ -695,6 +788,46 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn handwritten_stdio_adopts_single_indexed_subproject() {
+        let workspace = workspace("single-child");
+        let child = indexed_child(&workspace, "service-a");
+
+        let server = McpServer::new_with_cwd(
+            Some(workspace.path().to_path_buf()),
+            Some(workspace.path().to_path_buf()),
+        );
+
+        assert_eq!(server.default_project(), Some(child.as_path()));
+    }
+
+    #[test]
+    fn handwritten_stdio_keeps_ambiguous_children_explicit() {
+        let workspace = workspace("ambiguous");
+        let a = indexed_child(&workspace, "service-a");
+        let b = indexed_child(&workspace, "service-b");
+        let server = McpServer::new_with_cwd(
+            Some(workspace.path().to_path_buf()),
+            Some(workspace.path().to_path_buf()),
+        );
+
+        assert_eq!(server.default_project(), Some(workspace.path()));
+        assert_eq!(
+            server
+                .resolve_project_arg(Some(a.to_str().unwrap()))
+                .resolved(),
+            Some(a.as_path())
+        );
+        assert_eq!(
+            format_subproject_candidates(
+                server.root_discovery.search_from(),
+                server.root_discovery.known_candidates()
+            ),
+            "service-a, service-b"
+        );
+        assert!(b.exists());
     }
 
     #[test]
@@ -1057,7 +1190,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_call_unresolved_project_returns_tool_error_result() {
+    fn tools_call_without_a_default_returns_success_text() {
         let mut server = McpServer::new(None);
         let out = one_line(
             &mut server,
@@ -1072,7 +1205,10 @@ mod tests {
             out[0]["error"].is_null(),
             "must be a Reply, not a JSON-RPC error"
         );
-        assert_eq!(out[0]["result"]["isError"], json!(true));
+        assert!(
+            out[0]["result"]["isError"].is_null(),
+            "an absent default is guidance, not a failed explicit project selection"
+        );
         let text = out[0]["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
             text.contains("No indexed project resolved"),

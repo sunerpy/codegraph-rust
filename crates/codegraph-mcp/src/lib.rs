@@ -24,4 +24,5 @@ pub mod server;
 
 pub use engine::CodeGraphEngine;
 pub use rmcp_handler::{serve_http, serve_stdio_rmcp};
+pub use roots::{ServerRootResolution, resolve_server_root};
 pub use server::{McpServer, RunUntilAdoption, initialize_result};

@@ -90,6 +90,16 @@ directory and incrementally syncs file changes after a debounce. When the watche
 is healthy, do not run a manual sync after every edit. Each project still needs
 one usable index, normally created with `codegraph init`.
 
+A bare stdio launch first walks upward for an index. If that misses and the
+launch directory is a workspace root (manifest or `.git`), CodeGraph performs a
+bounded scan (depth 4, at most 64 candidates). It adopts exactly one indexed
+child and starts that child's normal daemon/watcher/catch-up path. Zero or
+multiple children are never guessed: the tool response and stderr name the
+sorted candidates, and the caller must pass `projectPath` or restart with
+`--path`. HOME and filesystem roots are never scanned downward. A no-default
+server retries at most once every five seconds, so an index created later can be
+adopted.
+
 The watcher hot-reloads the selected index root's `config.toml` and
 `codegraph.json`, plus the project root `.gitignore`. A control-file change
 atomically replaces the live scope and triggers one full reconcile, so newly
@@ -118,7 +128,16 @@ Copilot CLI, JetBrains):
 
 ```bash
 codegraph install --yes
+codegraph install --yes --init                 # wire agents, then init cwd
+codegraph install --target=codex --local --yes # project-local Codex setup
 ```
+
+`install --init` is explicit: without it, install never creates an index.
+`--print-config` returns before initialization. `init -y/--yes` is accepted for
+unattended bootstrap compatibility. A local Codex install writes
+`.codex/config.toml`, project-root `AGENTS.md`, and
+`.agents/skills/codegraph`; Codex applies that project layer only after the
+repository is trusted.
 
 ---
 

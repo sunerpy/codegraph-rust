@@ -1,8 +1,9 @@
 //! OpenAI Codex CLI target. Ports `upstream installer/targets/codex.ts`.
 //!
-//! Writes the MCP entry to `~/.codex/config.toml` as the dotted-key table
-//! `[mcp_servers.codegraph]`, and the instructions block to `~/.codex/AGENTS.md`.
-//! Codex is global-only (no project-local config concept).
+//! Writes the MCP entry as the dotted-key table `[mcp_servers.codegraph]` and
+//! installs the managed instructions block:
+//! - global: `~/.codex/config.toml` + `~/.codex/AGENTS.md`
+//! - local: `<project>/.codex/config.toml` + `<project>/AGENTS.md`
 
 use std::fs;
 use std::path::PathBuf;
@@ -21,14 +22,27 @@ pub struct CodexTarget;
 
 const TOML_HEADER: &str = "mcp_servers.codegraph";
 
-fn config_dir(ctx: &InstallContext) -> PathBuf {
-    ctx.home.join(".codex")
+fn config_dir(ctx: &InstallContext, loc: Location) -> PathBuf {
+    match loc {
+        Location::Global => ctx.home.join(".codex"),
+        Location::Local => ctx.cwd.join(".codex"),
+    }
 }
-fn toml_config_path(ctx: &InstallContext) -> PathBuf {
-    config_dir(ctx).join("config.toml")
+fn toml_config_path(ctx: &InstallContext, loc: Location) -> PathBuf {
+    config_dir(ctx, loc).join("config.toml")
 }
-fn instructions_path(ctx: &InstallContext) -> PathBuf {
-    config_dir(ctx).join("AGENTS.md")
+fn instructions_path(ctx: &InstallContext, loc: Location) -> PathBuf {
+    match loc {
+        Location::Global => config_dir(ctx, loc).join("AGENTS.md"),
+        Location::Local => ctx.cwd.join("AGENTS.md"),
+    }
+}
+
+fn trust_note(ctx: &InstallContext) -> String {
+    format!(
+        "Codex applies {} only after this project is marked trusted. Trust the project in Codex to activate its local MCP configuration.",
+        toml_config_path(ctx, Location::Local).display()
+    )
 }
 
 // Ports buildCodegraphBlock (codex.ts:136). The MCP server config command/args
@@ -57,52 +71,40 @@ impl AgentTarget for CodexTarget {
     fn display_name(&self) -> &'static str {
         "Codex CLI"
     }
-    fn supports_location(&self, loc: Location) -> bool {
-        loc == Location::Global
+    fn supports_location(&self, _loc: Location) -> bool {
+        true
     }
 
     fn detect(&self, ctx: &InstallContext, loc: Location) -> DetectionResult {
-        if loc != Location::Global {
-            return DetectionResult::default();
-        }
-        let toml_path = toml_config_path(ctx);
+        let toml_path = toml_config_path(ctx, loc);
         let already_configured = fs::read_to_string(&toml_path)
             .map(|content| contains_toml_table(&content, TOML_HEADER))
             .unwrap_or(false);
         DetectionResult {
-            installed: config_dir(ctx).exists(),
+            installed: config_dir(ctx, loc).exists() || toml_path.exists(),
             already_configured,
         }
     }
 
     // Ports codexTarget.install (codex.ts:76).
     fn install(&self, ctx: &InstallContext, loc: Location, _opts: InstallOptions) -> WriteResult {
-        if loc != Location::Global {
-            return WriteResult {
-                files: Vec::new(),
-                notes: vec![
-                    "Codex CLI has no project-local config — re-run with --location=global to install."
-                        .to_string(),
-                ],
-            };
-        }
         let files = vec![
-            write_mcp_entry(ctx),
-            upsert_instructions_entry(&instructions_path(ctx)),
+            write_mcp_entry(ctx, loc),
+            upsert_instructions_entry(&instructions_path(ctx, loc)),
         ];
         WriteResult {
             files,
-            notes: Vec::new(),
+            notes: (loc == Location::Local)
+                .then(|| trust_note(ctx))
+                .into_iter()
+                .collect(),
         }
     }
 
     // Ports codexTarget.uninstall (codex.ts:95).
     fn uninstall(&self, ctx: &InstallContext, loc: Location) -> WriteResult {
-        if loc != Location::Global {
-            return WriteResult::default();
-        }
         let mut files = Vec::new();
-        let toml_path = toml_config_path(ctx);
+        let toml_path = toml_config_path(ctx, loc);
         if let Ok(content) = fs::read_to_string(&toml_path) {
             let line_ending = if content.contains("\r\n") {
                 "\r\n"
@@ -135,7 +137,7 @@ impl AgentTarget for CodexTarget {
                 action: FileAction::NotFound,
             });
         }
-        files.push(remove_instructions_entry(ctx));
+        files.push(remove_instructions_entry(ctx, loc));
         WriteResult {
             files,
             notes: Vec::new(),
@@ -144,26 +146,19 @@ impl AgentTarget for CodexTarget {
 
     // Ports codexTarget.printConfig (codex.ts:122).
     fn print_config(&self, ctx: &InstallContext, loc: Location) -> String {
-        if loc != Location::Global {
-            return "# Codex CLI has no project-local config — use --location=global.\n"
-                .to_string();
-        }
         format!(
             "# Add to {}\n\n{}\n",
-            toml_config_path(ctx).display(),
+            toml_config_path(ctx, loc).display(),
             build_codegraph_block()
         )
     }
 
     fn managed_instructions_path(&self, ctx: &InstallContext, loc: Location) -> Option<PathBuf> {
-        (loc == Location::Global).then(|| instructions_path(ctx))
+        Some(instructions_path(ctx, loc))
     }
 
-    // Skill support is INTENTIONALLY decoupled from `supports_location`: Codex
-    // MCP config is global-only, yet Codex DOES scan project-local skills, so
-    // skills are gated on `supports_skills` (true for BOTH locations), never on
-    // `supports_location`. Codex + Antigravity LOCAL both target `.agents/skills`
-    // — co-installing them is idempotent (same content, same hash).
+    // Codex + Antigravity LOCAL both target `.agents/skills`; co-installing them
+    // is idempotent (same content, same hash).
     fn supports_skills(&self, _loc: Location) -> bool {
         true
     }
@@ -177,8 +172,8 @@ impl AgentTarget for CodexTarget {
 }
 
 // Ports writeMcpEntry (codex.ts:144).
-fn write_mcp_entry(ctx: &InstallContext) -> FileWrite {
-    let file = toml_config_path(ctx);
+fn write_mcp_entry(ctx: &InstallContext, loc: Location) -> FileWrite {
+    let file = toml_config_path(ctx, loc);
     if let Some(dir) = file.parent() {
         let _ = fs::create_dir_all(dir);
     }
@@ -204,8 +199,8 @@ fn write_mcp_entry(ctx: &InstallContext) -> FileWrite {
 }
 
 // Ports removeInstructionsEntry (codex.ts:169).
-fn remove_instructions_entry(ctx: &InstallContext) -> FileWrite {
-    let file = instructions_path(ctx);
+fn remove_instructions_entry(ctx: &InstallContext, loc: Location) -> FileWrite {
+    let file = instructions_path(ctx, loc);
     let action =
         shared::remove_marked_section(&file, CODEGRAPH_SECTION_START, CODEGRAPH_SECTION_END);
     FileWrite { path: file, action }
@@ -246,7 +241,7 @@ mod tests {
         let t = CodexTarget;
         assert!(t.supports_skills(Location::Local));
         assert!(t.supports_skills(Location::Global));
-        assert!(!t.supports_location(Location::Local));
+        assert!(t.supports_location(Location::Local));
         assert!(t.supports_location(Location::Global));
     }
 
@@ -294,7 +289,7 @@ mod tests {
     fn install_creates_toml_table_and_instructions_then_uninstall() {
         let fx = TempCodex::new("lifecycle");
         let target = CodexTarget;
-        let toml = toml_config_path(&fx.ctx);
+        let toml = toml_config_path(&fx.ctx, Location::Global);
 
         let before = target.detect(&fx.ctx, Location::Global);
         assert!(!before.installed);
@@ -305,7 +300,7 @@ mod tests {
         assert!(content.contains("[mcp_servers.codegraph]"));
         assert!(content.contains("command = \"codegraph\""));
         assert!(content.contains("args = [\"serve\", \"--mcp\"]"));
-        assert!(instructions_path(&fx.ctx).exists());
+        assert!(instructions_path(&fx.ctx, Location::Global).exists());
 
         let after = target.detect(&fx.ctx, Location::Global);
         assert!(after.installed);
@@ -319,10 +314,10 @@ mod tests {
     fn install_is_idempotent() {
         let fx = TempCodex::new("idempotent");
         let target = CodexTarget;
-        let toml = toml_config_path(&fx.ctx);
+        let toml = toml_config_path(&fx.ctx, Location::Global);
         target.install(&fx.ctx, Location::Global, opts());
         let first = fs::read_to_string(&toml).unwrap();
-        let again = write_mcp_entry(&fx.ctx);
+        let again = write_mcp_entry(&fx.ctx, Location::Global);
         assert_eq!(again.action, FileAction::Unchanged);
         assert_eq!(fs::read_to_string(&toml).unwrap(), first);
     }
@@ -331,7 +326,7 @@ mod tests {
     fn detect_uses_toml_lexer_for_real_and_decoy_headers() {
         let fx = TempCodex::new("detect-toml-header");
         let target = CodexTarget;
-        let toml = toml_config_path(&fx.ctx);
+        let toml = toml_config_path(&fx.ctx, Location::Global);
         fs::create_dir_all(toml.parent().unwrap()).unwrap();
         fs::write(
             &toml,
@@ -355,21 +350,95 @@ mod tests {
     }
 
     #[test]
-    fn local_location_is_rejected() {
-        let fx = TempCodex::new("local-reject");
+    fn local_install_uses_project_layout_and_reports_trust_requirement() {
+        let fx = TempCodex::new("local-layout");
         let target = CodexTarget;
         let install = target.install(&fx.ctx, Location::Local, opts());
-        assert!(install.files.is_empty());
-        assert!(install.notes[0].contains("--location=global"));
+        assert_eq!(install.files.len(), 2);
+        assert!(install.notes.join(" ").contains("trusted"));
+        let toml = toml_config_path(&fx.ctx, Location::Local);
+        assert_eq!(toml, fx.ctx.cwd.join(".codex/config.toml"));
+        assert!(
+            fs::read_to_string(&toml)
+                .unwrap()
+                .contains("[mcp_servers.codegraph]")
+        );
+        assert_eq!(
+            instructions_path(&fx.ctx, Location::Local),
+            fx.ctx.cwd.join("AGENTS.md")
+        );
+        assert!(instructions_path(&fx.ctx, Location::Local).exists());
+        assert!(
+            !toml_config_path(&fx.ctx, Location::Global).exists(),
+            "local install must not touch the global config"
+        );
+        assert!(target.detect(&fx.ctx, Location::Local).already_configured);
+        assert!(
+            target
+                .print_config(&fx.ctx, Location::Local)
+                .contains(&toml.display().to_string())
+        );
+    }
 
-        let uninstall = target.uninstall(&fx.ctx, Location::Local);
-        assert!(uninstall.files.is_empty());
+    #[test]
+    fn local_uninstall_leaves_global_install_intact() {
+        let fx = TempCodex::new("local-uninstall");
+        let target = CodexTarget;
+        target.install(&fx.ctx, Location::Global, opts());
+        target.install(&fx.ctx, Location::Local, opts());
 
-        let detect = target.detect(&fx.ctx, Location::Local);
-        assert!(!detect.installed);
+        let removed = target.uninstall(&fx.ctx, Location::Local);
+        assert!(
+            removed
+                .files
+                .iter()
+                .any(|file| file.action == FileAction::Removed)
+        );
+        assert!(!target.detect(&fx.ctx, Location::Local).already_configured);
+        assert!(target.detect(&fx.ctx, Location::Global).already_configured);
+        assert!(
+            fs::read_to_string(toml_config_path(&fx.ctx, Location::Global))
+                .unwrap()
+                .contains("[mcp_servers.codegraph]")
+        );
+    }
 
-        let printed = target.print_config(&fx.ctx, Location::Local);
-        assert!(printed.contains("--location=global"));
+    #[test]
+    fn local_round_trip_preserves_user_toml_and_agents_text() {
+        let fx = TempCodex::new("local-preserve");
+        let target = CodexTarget;
+        let toml = toml_config_path(&fx.ctx, Location::Local);
+        let agents = instructions_path(&fx.ctx, Location::Local);
+        fs::create_dir_all(toml.parent().unwrap()).unwrap();
+        fs::create_dir_all(&fx.ctx.cwd).unwrap();
+        fs::write(
+            &toml,
+            "# user comment\n[features]\nexperimental = true\n\n[mcp_servers.other]\ncommand = \"other\"\n",
+        )
+        .unwrap();
+        fs::write(&agents, "# User rules\n\nKeep this text.\n").unwrap();
+
+        target.install(&fx.ctx, Location::Local, opts());
+        let installed_toml = fs::read_to_string(&toml).unwrap();
+        let installed_agents = fs::read_to_string(&agents).unwrap();
+        assert!(installed_toml.contains("# user comment"));
+        assert!(installed_toml.contains("[features]"));
+        assert!(installed_toml.contains("[mcp_servers.other]"));
+        assert!(installed_toml.contains("[mcp_servers.codegraph]"));
+        assert!(installed_agents.contains("# User rules"));
+        assert!(installed_agents.contains("Keep this text."));
+        assert!(installed_agents.contains(CODEGRAPH_SECTION_START));
+
+        target.uninstall(&fx.ctx, Location::Local);
+        let uninstalled_toml = fs::read_to_string(&toml).unwrap();
+        let uninstalled_agents = fs::read_to_string(&agents).unwrap();
+        assert!(uninstalled_toml.contains("# user comment"));
+        assert!(uninstalled_toml.contains("[features]"));
+        assert!(uninstalled_toml.contains("[mcp_servers.other]"));
+        assert!(!uninstalled_toml.contains("[mcp_servers.codegraph]"));
+        assert!(uninstalled_agents.contains("# User rules"));
+        assert!(uninstalled_agents.contains("Keep this text."));
+        assert!(!uninstalled_agents.contains(CODEGRAPH_SECTION_START));
     }
 
     #[test]
@@ -384,7 +453,7 @@ mod tests {
     fn uninstall_preserves_sibling_table() {
         let fx = TempCodex::new("uninstall-sibling");
         let target = CodexTarget;
-        let toml = toml_config_path(&fx.ctx);
+        let toml = toml_config_path(&fx.ctx, Location::Global);
         target.install(&fx.ctx, Location::Global, opts());
         let content = fs::read_to_string(&toml).unwrap();
         fs::write(
@@ -403,7 +472,7 @@ mod tests {
     fn uninstall_preserves_crlf_line_endings() {
         let fx = TempCodex::new("uninstall-crlf");
         let target = CodexTarget;
-        let toml = toml_config_path(&fx.ctx);
+        let toml = toml_config_path(&fx.ctx, Location::Global);
         fs::create_dir_all(toml.parent().unwrap()).unwrap();
         fs::write(
             &toml,

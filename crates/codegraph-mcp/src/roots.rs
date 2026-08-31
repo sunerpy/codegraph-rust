@@ -1,10 +1,64 @@
 //! Workspace-root discovery for clients that launch the MCP server globally.
 
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
 pub const ROOTS_LIST_REQUEST_ID: &str = "codegraph-roots-list-1";
+
+const SUBPROJECT_SCAN_MAX_DEPTH: usize = 4;
+const SUBPROJECT_SCAN_MAX_CANDIDATES: usize = 64;
+const SUBPROJECT_RESCAN_TTL: Duration = Duration::from_secs(5);
+
+const SUBPROJECT_SCAN_SKIP: &[&str] = &[
+    "node_modules",
+    ".git",
+    ".svn",
+    ".hg",
+    "dist",
+    "build",
+    "out",
+    "target",
+    "vendor",
+    "bin",
+    "obj",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    ".cache",
+    "coverage",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".turbo",
+    ".idea",
+    ".vscode",
+    "tmp",
+    "temp",
+];
+
+const WORKSPACE_ROOT_MANIFESTS: &[&str] = &[
+    "package.json",
+    "pnpm-workspace.yaml",
+    "lerna.json",
+    "nx.json",
+    "turbo.json",
+    "go.work",
+    "go.mod",
+    "Cargo.toml",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "settings.gradle",
+    "pyproject.toml",
+    "composer.json",
+    "Gemfile",
+    "rush.json",
+    "WORKSPACE",
+    "WORKSPACE.bazel",
+];
 
 /// Pure formatter for the per-tool `projectPath` resolution debug line
 /// (unit-tested without touching process state).
@@ -88,6 +142,245 @@ pub fn probe_root(project_path: &Path) -> RootStatus {
         project_path,
         std::env::var("CODEGRAPH_DIR").ok().as_deref(),
     ))
+}
+
+/// One stdio server-root resolution. The common path is the upward walk. When
+/// that misses and the launch directory is a plausible workspace root, the
+/// bounded downward scan may adopt exactly one indexed child project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerRootResolution {
+    pub search_from: PathBuf,
+    pub root: Option<PathBuf>,
+    pub via_subproject_scan: bool,
+    pub candidates: Vec<PathBuf>,
+}
+
+/// Resolve the default project for a stdio MCP server.
+///
+/// The downward scan is deliberately caller-controlled so long-running
+/// no-default sessions can run the cheap upward walk on every request while
+/// throttling the bounded workspace scan to once per five seconds.
+#[must_use]
+pub fn resolve_server_root(
+    search_from: impl AsRef<Path>,
+    scan_subprojects: bool,
+) -> ServerRootResolution {
+    let search_from = absolute_search_path(search_from.as_ref());
+    if let Some(root) = find_nearest_indexed_root(&search_from) {
+        return ServerRootResolution {
+            search_from,
+            root: Some(root),
+            via_subproject_scan: false,
+            candidates: Vec::new(),
+        };
+    }
+    if !scan_subprojects || !eligible_for_subproject_scan(&search_from) {
+        return ServerRootResolution {
+            search_from,
+            root: None,
+            via_subproject_scan: false,
+            candidates: Vec::new(),
+        };
+    }
+
+    let candidates = find_indexed_subproject_roots(
+        &search_from,
+        SUBPROJECT_SCAN_MAX_DEPTH,
+        SUBPROJECT_SCAN_MAX_CANDIDATES,
+    );
+    let root = (candidates.len() == 1).then(|| candidates[0].clone());
+    ServerRootResolution {
+        search_from,
+        root,
+        via_subproject_scan: candidates.len() == 1,
+        candidates,
+    }
+}
+
+/// Stateful wrapper shared by both stdio front-ends. Initial construction scans
+/// immediately; retries always perform the cheap upward walk and run the
+/// downward scan no more than once per five seconds.
+#[derive(Debug)]
+pub(crate) struct ServerRootDiscovery {
+    search_from: Option<PathBuf>,
+    known_candidates: Vec<PathBuf>,
+    last_subproject_scan: Option<Instant>,
+}
+
+impl ServerRootDiscovery {
+    pub(crate) fn new(search_from: Option<PathBuf>) -> Self {
+        Self {
+            search_from,
+            known_candidates: Vec::new(),
+            last_subproject_scan: None,
+        }
+    }
+
+    pub(crate) fn initial_resolution(&mut self) -> Option<ServerRootResolution> {
+        self.resolve_at(Instant::now(), true)
+    }
+
+    pub(crate) fn retry_resolution(&mut self) -> Option<ServerRootResolution> {
+        self.resolve_at(Instant::now(), false)
+    }
+
+    fn resolve_at(
+        &mut self,
+        now: Instant,
+        force_subproject_scan: bool,
+    ) -> Option<ServerRootResolution> {
+        let search_from = self.search_from.as_ref()?;
+        let scan_due = force_subproject_scan
+            || self.last_subproject_scan.is_none_or(|last| {
+                now.checked_duration_since(last)
+                    .is_some_and(|elapsed| elapsed >= SUBPROJECT_RESCAN_TTL)
+            });
+        let resolution = resolve_server_root(search_from, scan_due);
+        if scan_due {
+            self.last_subproject_scan = Some(now);
+        }
+        if resolution.root.is_some() {
+            self.known_candidates.clear();
+        } else if scan_due {
+            self.known_candidates.clone_from(&resolution.candidates);
+        }
+        Some(resolution)
+    }
+
+    pub(crate) fn search_from(&self) -> Option<&Path> {
+        self.search_from.as_deref()
+    }
+
+    pub(crate) fn known_candidates(&self) -> &[PathBuf] {
+        &self.known_candidates
+    }
+
+    pub(crate) fn clear_candidates(&mut self) {
+        self.known_candidates.clear();
+    }
+}
+
+fn absolute_search_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
+fn find_nearest_indexed_root(start: &Path) -> Option<PathBuf> {
+    let mut current = start.to_path_buf();
+    loop {
+        if db_exists_for(&current) {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+fn eligible_for_subproject_scan(base: &Path) -> bool {
+    if base.parent().is_none() {
+        return false;
+    }
+    if let Some(home) = home_dir()
+        && canonicalize_lenient(base) == canonicalize_lenient(&home)
+    {
+        return false;
+    }
+    WORKSPACE_ROOT_MANIFESTS
+        .iter()
+        .any(|manifest| base.join(manifest).exists())
+        || base.join(".git").exists()
+}
+
+fn find_indexed_subproject_roots(
+    root: &Path,
+    max_depth: usize,
+    max_candidates: usize,
+) -> Vec<PathBuf> {
+    fn walk(
+        dir: &Path,
+        depth: usize,
+        max_depth: usize,
+        max_candidates: usize,
+        out: &mut Vec<PathBuf>,
+    ) {
+        if out.len() >= max_candidates || depth > max_depth {
+            return;
+        }
+        let Ok(read_dir) = fs::read_dir(dir) else {
+            return;
+        };
+        let mut entries = read_dir.filter_map(Result::ok).collect::<Vec<_>>();
+        entries.sort_by_key(fs::DirEntry::file_name);
+        for entry in entries {
+            if out.len() >= max_candidates {
+                return;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || SUBPROJECT_SCAN_SKIP.contains(&name.as_ref()) {
+                continue;
+            }
+            let child = entry.path();
+            if db_exists_for(&child) {
+                out.push(child);
+                continue;
+            }
+            walk(&child, depth + 1, max_depth, max_candidates, out);
+        }
+    }
+
+    let mut out = Vec::new();
+    walk(root, 1, max_depth, max_candidates, &mut out);
+    out.sort();
+    out.dedup();
+    out
+}
+
+pub(crate) fn format_subproject_candidates(base: Option<&Path>, roots: &[PathBuf]) -> String {
+    let mut display = roots
+        .iter()
+        .map(|root| {
+            base.and_then(|base| root.strip_prefix(base).ok())
+                .filter(|relative| !relative.as_os_str().is_empty())
+                .unwrap_or(root)
+                .display()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    display.sort();
+    display.dedup();
+    display.join(", ")
+}
+
+pub(crate) fn not_indexed_message(
+    raw_project: Option<&str>,
+    search_from: Option<&Path>,
+    candidates: &[PathBuf],
+) -> String {
+    if let Some(raw) = raw_project {
+        return format!(
+            "No indexed project found for projectPath {raw:?}. Pass an absolute path to an indexed project, or run `codegraph init` there."
+        );
+    }
+    if candidates.is_empty() {
+        return "No indexed project resolved. Pass a `projectPath` argument, run `codegraph init` in the project, or start the server with `--path <project>`.".to_string();
+    }
+    let listed = format_subproject_candidates(search_from, candidates);
+    format!(
+        "No indexed project resolved. Indexed sub-projects were found below the server root: {listed}. Pass one as `projectPath`, or launch the server with `--path <project>`."
+    )
 }
 
 /// Pure classifier for an [`codegraph_core::IndexPaths::resolve`] outcome, split
@@ -1002,5 +1295,137 @@ mod tests {
         );
         assert!(msg.contains("CODEGRAPH_DIR"), "{msg}");
         assert!(msg.contains("unsafe"), "{msg}");
+    }
+
+    fn mark_indexed(path: &Path) {
+        std::fs::create_dir_all(path).unwrap();
+        let db = db_path_for(path).expect("indexed fixture path resolves");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::fs::write(db, b"placeholder").unwrap();
+    }
+
+    #[test]
+    fn server_root_adopts_exactly_one_indexed_child_of_git_workspace() {
+        let workspace = unindexed_dir("subscan-one");
+        std::fs::create_dir(workspace.path().join(".git")).unwrap();
+        let child = workspace.path().join("service-a");
+        mark_indexed(&child);
+
+        let resolved = resolve_server_root(workspace.path(), true);
+
+        assert_eq!(resolved.root.as_deref(), Some(child.as_path()));
+        assert!(resolved.via_subproject_scan);
+        assert_eq!(resolved.candidates, vec![child]);
+    }
+
+    #[test]
+    fn server_root_lists_multiple_children_in_deterministic_order_without_guessing() {
+        let workspace = unindexed_dir("subscan-many");
+        std::fs::write(workspace.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let b = workspace.path().join("service-b");
+        let a = workspace.path().join("service-a");
+        mark_indexed(&b);
+        mark_indexed(&a);
+
+        let resolved = resolve_server_root(workspace.path(), true);
+
+        assert_eq!(resolved.root, None);
+        assert_eq!(resolved.candidates, vec![a, b]);
+        assert_eq!(
+            format_subproject_candidates(Some(workspace.path()), resolved.candidates.as_slice()),
+            "service-a, service-b"
+        );
+    }
+
+    #[test]
+    fn server_root_does_not_scan_a_non_workspace_or_filesystem_root() {
+        let workspace = unindexed_dir("subscan-gate");
+        let child = workspace.path().join("service-a");
+        mark_indexed(&child);
+
+        let no_manifest = resolve_server_root(workspace.path(), true);
+        assert_eq!(no_manifest.root, None);
+        assert!(no_manifest.candidates.is_empty());
+
+        let filesystem_root = Path::new(if cfg!(windows) { r"C:\" } else { "/" });
+        assert!(!eligible_for_subproject_scan(filesystem_root));
+        if let Some(home) = home_dir() {
+            assert!(
+                !eligible_for_subproject_scan(&home),
+                "the home directory is never a downward-scan root"
+            );
+        }
+    }
+
+    #[test]
+    fn subproject_scan_honors_depth_skip_and_stop_descent_boundaries() {
+        let workspace = unindexed_dir("subscan-bounds");
+        std::fs::create_dir(workspace.path().join(".git")).unwrap();
+
+        let depth_four = workspace.path().join("a/b/c/d");
+        mark_indexed(&depth_four);
+        mark_indexed(&workspace.path().join("x/y/z/u/v"));
+        mark_indexed(&workspace.path().join("vendor/hidden"));
+        mark_indexed(&workspace.path().join(".hidden/child"));
+        mark_indexed(&depth_four.join("nested-index"));
+
+        let resolved = resolve_server_root(workspace.path(), true);
+
+        assert_eq!(resolved.root.as_deref(), Some(depth_four.as_path()));
+        assert_eq!(resolved.candidates, vec![depth_four]);
+    }
+
+    #[test]
+    fn subproject_scan_caps_candidates_at_sixty_four() {
+        let workspace = unindexed_dir("subscan-cap");
+        std::fs::create_dir(workspace.path().join(".git")).unwrap();
+        for index in 0..70 {
+            mark_indexed(&workspace.path().join(format!("service-{index:02}")));
+        }
+
+        let candidates =
+            find_indexed_subproject_roots(workspace.path(), 4, SUBPROJECT_SCAN_MAX_CANDIDATES);
+
+        assert_eq!(candidates.len(), SUBPROJECT_SCAN_MAX_CANDIDATES);
+        assert!(candidates[0].ends_with("service-00"));
+        assert!(candidates[63].ends_with("service-63"));
+    }
+
+    #[test]
+    fn discovery_retries_upward_immediately_but_throttles_child_scan_for_five_seconds() {
+        let workspace = unindexed_dir("subscan-retry");
+        std::fs::create_dir(workspace.path().join(".git")).unwrap();
+        let started = Instant::now();
+        let mut discovery = ServerRootDiscovery::new(Some(workspace.path().to_path_buf()));
+
+        let first = discovery
+            .resolve_at(started, true)
+            .expect("search path configured");
+        assert_eq!(first.root, None);
+
+        let child = workspace.path().join("later");
+        mark_indexed(&child);
+        let too_soon = discovery
+            .resolve_at(started + Duration::from_secs(4), false)
+            .expect("search path configured");
+        assert_eq!(too_soon.root, None);
+
+        let due = discovery
+            .resolve_at(started + Duration::from_secs(5), false)
+            .expect("search path configured");
+        assert_eq!(due.root.as_deref(), Some(child.as_path()));
+    }
+
+    #[test]
+    fn ambiguous_subprojects_are_named_in_the_existing_tool_error_shape() {
+        let base = Path::new("/workspace");
+        let message = not_indexed_message(
+            None,
+            Some(base),
+            &[base.join("service-b"), base.join("service-a")],
+        );
+        assert!(message.starts_with("No indexed project resolved."));
+        assert!(message.contains("service-a, service-b"));
+        assert!(message.contains("projectPath"));
     }
 }

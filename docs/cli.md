@@ -16,14 +16,14 @@
 
 | Subcommand        | Purpose                                                                                   | Key flags                                                                                                                                  |
 | ----------------- | ----------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `install`         | Write the codegraph MCP server into each AI agent's config                                | `-t/--target`, `-l/--location`, `--global`, `--local`, `-y/--yes`, `--no-permissions`, `--print-config <id>`, `--prompt-hook`              |
+| `install`         | Write the codegraph MCP server into each AI agent's config                                | `-t/--target`, `-l/--location`, `--global`, `--local`, `-y/--yes`, `-i/--init`, `--no-permissions`, `--print-config <id>`, `--prompt-hook` |
 | `uninstall`       | Remove codegraph from agent configs (inverse of `install`)                                | `-t/--target`, `-l/--location`, `--global`, `--local`, `-y/--yes`                                                                          |
 | `skill`           | Install / update / uninstall / check the embedded agent skill                             | `<action>` (install, update, uninstall, status)                                                                                            |
 | `skill install`   | Write the embedded SKILL.md into each agent's skill directory                             | `-t/--target`, `--global`, `--local`, `-y/--yes`                                                                                           |
 | `skill update`    | Refresh the installed skill and marker-managed agent instructions                         | `-t/--target`, `--global`, `--local`, `--force`, `--diff`, `--dry-run`                                                                     |
 | `skill uninstall` | Remove the skill from agent skill directories                                             | `-t/--target`, `--global`, `--local`, `-y/--yes`                                                                                           |
 | `skill status`    | Report install state per agent (up to date / locally modified / outdated / not installed) | `-t/--target`, `--global`, `--local`                                                                                                       |
-| `init`            | Initialize `.codegraph/` and run the first full index                                     | `[path]`, `-t/--target` (also write project-level MCP config; default `none`)                                                              |
+| `init`            | Initialize `.codegraph/` and run the first full index                                     | `[path]`, `-t/--target` (also write project-level MCP config; default `none`), `-y/--yes`                                                  |
 | `uninit`          | Delete the project's `.codegraph/` index                                                  | `[path]`, `-f/--force`                                                                                                                     |
 | `index`           | (Re-)index in full                                                                        | `[path]`, `-f/--force`, `-q/--quiet`, `-v/--verbose`                                                                                       |
 | `sync`            | Incremental sync: re-index only changed files, drop deleted ones, re-resolve              | `[path]`, `-q/--quiet`                                                                                                                     |
@@ -119,8 +119,10 @@ install).
 
 ```bash
 codegraph install --yes                          # auto-detect installed agents, global
+codegraph install --yes --init                   # install, then initialize cwd
 codegraph install --target=claude,cursor --yes   # explicit list
 codegraph install --target=auto --local          # detected agents, project-local
+codegraph install --target=codex --local --yes   # project .codex/config.toml + AGENTS.md + skill
 codegraph install --print-config cursor          # print the snippet only, no write
 codegraph install --prompt-hook                  # also add the Claude UserPromptSubmit hook (opt-in)
 codegraph uninstall --target=claude --local      # remove one agent's local config
@@ -129,6 +131,24 @@ codegraph uninstall --target=claude --local      # remove one agent's local conf
 Behavior is idempotent (upsert by the `codegraph` key). `uninstall` removes only
 codegraph's own entry and leaves other MCP servers intact. Instruction files are
 delimited by `<!-- CODEGRAPH_START -->`/`<!-- CODEGRAPH_END -->` markers.
+
+**One-shot bootstrap.** `install -i/--init` runs the normal `init` flow in the
+current directory only after the installer succeeds. It still runs when no
+target is selected (`--target=none`), but never runs for `--print-config`.
+Without `--init`, install never creates or changes an index. `init -y/--yes` is
+the non-interactive compatibility flag; the Rust init flow currently has no
+confirmation prompt, so it is behavior-neutral. Therefore
+`codegraph install --yes --init` is safe for unattended setup while retaining
+all ordinary broad-root and existing-index guards.
+
+**Codex CLI.** Global install remains `~/.codex/config.toml` plus
+`~/.codex/AGENTS.md`. Local install writes `<project>/.codex/config.toml`,
+the project-root `<project>/AGENTS.md`, and
+`<project>/.agents/skills/codegraph`. Detection, `--print-config`, install, and
+uninstall all honor the selected location. A local uninstall never edits the
+global files. Codex loads the project layer only after that repository is
+marked trusted; the installer prints this requirement instead of silently
+claiming the local entry is active.
 
 **Zuno.** `--target=zuno` supports both locations. Global files are
 `$XDG_CONFIG_HOME/zuno/zuno.json[c]` and
@@ -176,6 +196,7 @@ the `[path]` argument differs from the current directory. It is idempotent.
 
 ```bash
 codegraph init                       # index only — no MCP config written (default none)
+codegraph init --yes                 # same init flow, explicit non-interactive entry point
 codegraph init --target=kiro         # index, then write this project's .kiro/settings/mcp.json with --path
 codegraph init . --target=kiro,cursor  # index + wire both editors project-level
 codegraph init /path/to/proj -t auto  # index that project + wire detected editors there
@@ -817,6 +838,30 @@ exclusive lease succeeds. A live or contended owner is never folded underneath.
 ---
 
 ## Daemon, watch & environment variables
+
+### How stdio chooses the default project
+
+Before choosing Direct/daemon mode, `serve --mcp` resolves one default root:
+
+1. walk upward from `--path` (or cwd) to the nearest usable index;
+2. when that misses, scan downward only if the launch directory contains a
+   workspace manifest or `.git`;
+3. adopt the child only when exactly one indexed project is found.
+
+The downward scan is deterministic and bounded: depth 4, at most 64 candidates,
+sorted directory traversal, no descent below an indexed child, and no
+`node_modules`, VCS metadata, build output, vendor, virtualenv, cache, or temp
+directories. It never runs from `$HOME` or a filesystem root. An adopted child
+enters the ordinary daemon/watcher/catch-up path, so the daemon socket and watch
+scope are keyed to the child rather than the unindexed workspace container.
+
+Zero or multiple candidates remain unresolved. stderr reports the no-default
+state and lists sorted candidates when present; tool calls without
+`projectPath` return success-shaped guidance rather than guessing. An explicit
+`projectPath` always bypasses the ambiguity. While no default exists, the
+upward probe runs on each relevant request and the bounded child scan runs at
+most once every five seconds, allowing an index created after startup to be
+adopted.
 
 ### How `serve --mcp` chooses a run mode
 

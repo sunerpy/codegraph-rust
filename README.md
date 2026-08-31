@@ -59,6 +59,7 @@ irm https://raw.githubusercontent.com/sunerpy/codegraph-rust/main/scripts/instal
 codegraph init  /path/to/project                 # create .codegraph/ and run the first index
 codegraph search "<symbol>" -p /path/to/project  # full-text symbol search (`query` is a legacy alias)
 codegraph serve --mcp --path /path/to/project    # MCP server (--path optional, defaults to cwd)
+codegraph install --yes --init                   # wire detected agents + initialize cwd
 ```
 
 ---
@@ -114,6 +115,7 @@ VS Code, Copilot CLI, JetBrains):
 
 ```bash
 codegraph install --yes              # detects installed agents and wires them up
+codegraph install --yes --init       # one-shot unattended install + cwd index
 ```
 
 **MCP tools you can call** (prefer these over grep/read for indexed source):
@@ -197,9 +199,12 @@ automatically):
 ```
 
 **Default (no `-p`):** one config works for all your projects — each just needs
-`codegraph index` first. The server resolves the project from the client's working
-directory or `rootUri`/`workspaceFolders`/`roots`. When it can't resolve one,
-`projectPath` is marked required per tool call.
+an index first. The stdio server finds an indexed ancestor; from an unindexed
+workspace root (`.git` or a workspace manifest), it also adopts exactly one
+indexed child project. Multiple candidates are never guessed and are listed in
+stderr/tool guidance; pass `projectPath` per call or pin `--path`. Client
+`rootUri`/`workspaceFolders`/`roots` remain another adoption path. When no
+default resolves, `projectPath` is marked required per tool call.
 **Optional `-p <path>`:** pin to one fixed project
 (e.g. `"args": ["serve", "--mcp", "-p", "/abs/path/to/project"]`).
 
@@ -211,9 +216,15 @@ Gemini CLI, Antigravity IDE, Kiro, Trae, Qoder, Zed, Zuno, VS Code
 
 ```bash
 codegraph install --yes                          # auto-detect installed agents
+codegraph install --yes --init                   # wire agents, then initialize cwd
 codegraph install --target=claude,cursor --yes   # explicit list
 codegraph install --target=auto --local          # project-local config
+codegraph install --target=codex --local --yes   # .codex/config.toml + AGENTS.md + local skill
 ```
+
+Codex project-local configuration is applied only after the repository is
+trusted in Codex. `install` never indexes implicitly; only explicit `--init`
+does so, and `--print-config` always returns without writing or indexing.
 
 Full MCP tool reference: [`docs/mcp.md`](docs/mcp.md).
 
@@ -279,7 +290,8 @@ stays live depends on whether the IDE expands `${workspaceFolder}`:
 - **Kiro / Qoder** — global entry without `--path`; tools work read-only off the existing index. Run `codegraph init --target=kiro` (or `--target=qoder`) inside each project for live watch.
 - **Zed** — global `settings.json` entry without `--path`. Run `codegraph init --target=zed` inside each project to write a `.zed/settings.json` with an absolute `--path` — the only way to give Zed a per-project path. The installer also writes `//`-commented HTTP and SSH alternatives for remote-development use.
 - **Zuno** — global config is `$XDG_CONFIG_HOME/zuno/zuno.json[c]` (normally `~/.config/zuno/zuno.json[c]`); project config is `.zuno/zuno.json[c]`. The installer writes `mcp.codegraph` and migrates the older `mcp.codegraph-mcp-server` key without disturbing siblings or JSONC comments.
-- **Other agents** (Claude Code, Codex CLI, opencode, Hermes, Gemini CLI, Antigravity) — their native MCP entry shape; live watch where the daemon can reach the project.
+- **Codex CLI** — global install keeps `~/.codex/config.toml` + `~/.codex/AGENTS.md`; local install writes `.codex/config.toml`, project-root `AGENTS.md`, and `.agents/skills/codegraph`. Trust the project in Codex to activate its local layer.
+- **Other agents** (Claude Code, opencode, Hermes, Gemini CLI, Antigravity) — their native MCP entry shape; live watch where the daemon can reach the project.
 
 > **Zed Remote (SSH).** Zed runs MCP `context_servers` on the local client, not on
 > the remote host. If codegraph tools return empty in a remote SSH session, use the

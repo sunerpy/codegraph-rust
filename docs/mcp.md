@@ -73,12 +73,12 @@ it automatically:
 
 **Default (no `-p`):** `tools/list` always returns the full tool surface, even
 before a project is resolved. When the server resolves a default project — the
-working directory is at or inside an indexed project (find-up), or the client
-sends `rootUri`/`workspaceFolders`/`roots` — all tools work with `projectPath`
-optional. When it cannot resolve one (a roots-less client launched from a fixed
-directory that is not inside any project, e.g. a shared global config using the
-home directory as cwd), tools are still listed but `projectPath` is marked
-required in each tool's schema; the agent must then pass it per call. See
+working directory is at or inside an indexed project (find-up), an unindexed
+workspace root contains exactly one indexed child, or the client sends
+`rootUri`/`workspaceFolders`/`roots` — all tools work with `projectPath`
+optional. When it cannot resolve one, tools are still listed but `projectPath`
+is marked required in each tool's schema; the agent must then pass it per call.
+Multiple indexed children are listed and never guessed. See
 [Project resolution](#project-resolution) for the full three-case breakdown.
 **Optional `-p <path>` / `--path <path>`:** pin the server to one fixed project
 regardless of cwd (e.g.
@@ -87,6 +87,24 @@ regardless of cwd (e.g.
 Supported agents: Claude Code, Cursor, Codex CLI, opencode, Hermes Agent,
 Gemini CLI, Antigravity IDE, Kiro, Trae, Qoder, Zed, Zuno, VS Code
 (GitHub Copilot), GitHub Copilot CLI, JetBrains IDEs (GitHub Copilot).
+
+---
+
+## Codex CLI — global and project-local config
+
+Codex accepts the same TOML entry at two locations:
+
+- global: `~/.codex/config.toml`, with managed instructions in
+  `~/.codex/AGENTS.md`;
+- local: `<project>/.codex/config.toml`, with managed instructions in the
+  project-root `AGENTS.md` and the Skill in `.agents/skills/codegraph`.
+
+Run `codegraph install --target=codex --local --yes` from the project root for
+the local form. `--print-config=codex --local` prints the project snippet
+without writing. Local uninstall removes only local CodeGraph markers/files and
+does not touch the global entry. Codex disables project-layer configuration for
+untrusted repositories, so mark the project trusted in Codex before expecting
+the local MCP server to appear.
 
 ---
 
@@ -423,6 +441,16 @@ do not support roots, pin the root via `--path <project>` in the client's MCP
 config args (e.g. a workspace-level `.kiro/settings/mcp.json`), or open the
 project folder as the working directory.
 
+For a normal unindexed workspace container, stdio startup has one additional
+safe path before entering no-default mode: if the launch directory has a
+workspace manifest or `.git`, CodeGraph scans downward to depth 4, inspects at
+most 64 indexed candidates, skips dot/heavy/build/vendor/venv/cache/temp
+directories, and stops below an indexed child. Exactly one candidate is adopted
+and gets the full daemon/watcher/catch-up lifecycle. Zero or multiple candidates
+are never guessed. This scan is forbidden at `$HOME` and filesystem roots.
+Streamable HTTP global/no-path mode remains request-scoped and does not adopt a
+cwd child.
+
 ---
 
 ## Project resolution
@@ -438,26 +466,40 @@ whether a default project was resolved is which tool parameters are required:
   agent knows to supply it per call. You can also pin a single project with
   `-p`/`--path` instead.
 
-The server resolves a default project by walking three sources in order:
+The stdio server resolves a default project from these sources:
 
 1. **`--path` flag** — explicit pin; always wins.
 2. **find-up from cwd** — ascends from the working directory to the nearest
    `.codegraph/` index root. A cwd at or inside an indexed project resolves it
    here, and `projectPath` is optional.
-3. **MCP `initialize` handshake** — if find-up yields nothing, the server reads
+3. **bounded workspace child scan** — if find-up yields nothing and the launch
+   directory contains `.git` or a workspace manifest, scan at most four levels
+   and 64 candidates. Exactly one indexed child is adopted; multiple candidates
+   are sorted and reported, never selected. HOME and filesystem roots are not
+   scanned.
+4. **MCP `initialize` handshake** — if startup resolution yields nothing, the server reads
    the `initialize` message sent by the client and adopts the workspace it
    advertises (`rootUri`, `rootPath`, or `workspaceFolders[0].uri`) — provided
    that path is already indexed. If the client does not include those fields but
    advertises `capabilities.roots`, the server sends a `roots/list` request and
    adopts the first indexed root from the response.
 
-If all three sources yield nothing, the server serves the full tool list with
+If all sources yield nothing, the server serves the full tool list with
 `projectPath` marked required. This is the case for roots-less clients that use
 a fixed launch directory not inside any project — for example, 通义灵码/Lingma
 configured with a single global MCP entry whose working directory is the home
 directory. In that scenario the tools are listed and the agent can still call
 them by passing an explicit `projectPath`; for single-project setups, pinning
 `-p /path/to/project` in the MCP config args is the simpler alternative.
+
+With no default, a tool call that omits `projectPath` returns normal
+success-shaped text explaining the remedies. If the child scan found several
+indexes, that text and stderr list the sorted candidates. A caller-supplied
+absolute `projectPath` is authoritative and bypasses the ambiguity; an explicit
+path that does not resolve remains an `isError` tool result. The cheap upward
+probe runs again on relevant requests, while the downward scan is throttled to
+once per five seconds so a project initialized after server startup can be
+adopted without walking the workspace on every call.
 
 > **Note:** the home-directory / filesystem-root guard (see [Daemon & live watch]
 > above) also skips the normal watcher and catch-up sync for those paths. A real
