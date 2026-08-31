@@ -129,7 +129,11 @@ fn strip_trailing_commas(src: &str) -> String {
 }
 
 fn path_to_posix(path: &Path) -> String {
-    pathutil::normalize(&path.to_string_lossy().replace('\\', "/"))
+    string_path_to_posix(&path.to_string_lossy())
+}
+
+fn string_path_to_posix(path: &str) -> String {
+    pathutil::normalize(&path.replace('\\', "/"))
 }
 
 fn resolve_config_path(from_dir: &Path, spec: &str) -> PathBuf {
@@ -285,7 +289,7 @@ pub fn load_project_aliases(project_root: &str) -> Option<AliasMap> {
     let base_url = effective
         .base_url
         .or(effective.paths_dir)
-        .unwrap_or_else(|| pathutil::normalize(project_root));
+        .unwrap_or_else(|| string_path_to_posix(project_root));
     let paths = effective.paths?;
 
     let mut patterns: Vec<AliasPattern> = Vec::new();
@@ -339,6 +343,7 @@ pub fn load_project_aliases(project_root: &str) -> Option<AliasMap> {
 /// empty vec when no alias matches. Callers still apply the language's extension
 /// list to each candidate.
 pub fn apply_aliases(import_path: &str, aliases: &AliasMap, project_root: &str) -> Vec<String> {
+    let project_root = string_path_to_posix(project_root);
     for pat in &aliases.patterns {
         if !import_path.starts_with(&pat.prefix) {
             continue;
@@ -364,7 +369,7 @@ pub fn apply_aliases(import_path: &str, aliases: &AliasMap, project_root: &str) 
                 target.clone()
             };
             let absolute = pathutil::resolve(&aliases.base_url, &filled);
-            let rel = pathutil::relative(project_root, &absolute);
+            let rel = pathutil::relative(&project_root, &absolute);
             // Skip rewrites that escape the project root (path-aliases.ts:235-236).
             if rel == ".." || rel.starts_with("../") {
                 continue;
@@ -730,7 +735,7 @@ mod tests {
         )
         .unwrap();
         let map = load_project_aliases(root.to_str().unwrap()).expect("aliases");
-        assert_eq!(map.base_url, root.to_str().unwrap());
+        assert_eq!(map.base_url, path_to_posix(&root));
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -791,6 +796,23 @@ mod tests {
         };
         let out = apply_aliases("@up/x", &map, "/proj");
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn apply_aliases_normalizes_windows_project_root_separators() {
+        let map = AliasMap {
+            base_url: "C:/repo".to_string(),
+            patterns: vec![AliasPattern {
+                prefix: "@app/".to_string(),
+                suffix: String::new(),
+                has_wildcard: true,
+                replacements: vec!["src/*".to_string()],
+            }],
+        };
+        assert_eq!(
+            apply_aliases("@app/main", &map, r"C:\repo"),
+            vec!["src/main"]
+        );
     }
 
     #[test]
