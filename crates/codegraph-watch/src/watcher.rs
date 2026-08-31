@@ -131,6 +131,11 @@ fn relative_path(project_root: &Path, path: &Path) -> String {
     if let Ok(relative) = path.strip_prefix(project_root) {
         return relative.to_string_lossy().replace('\\', "/");
     }
+    if let Ok(canonical_root) = project_root.canonicalize()
+        && let Ok(relative) = path.strip_prefix(canonical_root)
+    {
+        return relative.to_string_lossy().replace('\\', "/");
+    }
 
     // `IndexPaths` keeps canonical physical paths. On Windows canonicalization
     // commonly adds the verbatim `\\?\` prefix, while a caller may still hold
@@ -1428,6 +1433,20 @@ mod tests {
         assert_eq!(
             native_path_string(Path::new("//?/UNC/server/share/project")),
             "//server/share/project"
+        );
+    }
+
+    #[test]
+    fn relative_path_uses_the_physical_root_for_lexical_aliases() {
+        let dir = crate::sync::tests::TestDir::new("watch-relative-physical");
+        fs::create_dir_all(dir.path().join("alias")).unwrap();
+        let physical = dir.path().canonicalize().unwrap();
+        assert_eq!(
+            relative_path(
+                &dir.path().join("alias/.."),
+                &physical.join(".codegraph/config.toml"),
+            ),
+            ".codegraph/config.toml"
         );
     }
 
