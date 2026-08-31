@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.49.0](https://github.com/sunerpy/codegraph-rust/compare/v0.48.3...v0.49.0) (2026-08-31)
+
+
+### Features
+
+* **search:** port upstream retrieval and ranking controls ([#255](https://github.com/sunerpy/codegraph-rust/issues/255)) ([036330c](https://github.com/sunerpy/codegraph-rust/commit/036330cfe26aae0e775d8847bc030414f9479013))
+
 ## [0.48.3](https://github.com/sunerpy/codegraph-rust/compare/v0.48.2...v0.48.3) (2026-08-31)
 
 
