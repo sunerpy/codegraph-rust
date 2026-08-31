@@ -7,27 +7,39 @@
 
 ## Current alignment
 
-- **Tracked colby version:** `1.5.0` (the `1.4.1 → 1.5.0` PORT subset + the
-  post-`v1.5.0` portable commits landed across codegraph-rs `v0.42.1`–`v0.42.4`;
-  see the 2026-08-02 CLOSEOUT entry below for the batch table. The preceding
-  `1.2.0 → 1.4.1` subset landed across `v0.28.3`–`v0.39.0`; see the 2026-07-17
-  CLOSEOUT entry)
+- **Tracked colby version:** `1.6.0` (all 15 audited `v1.6.0` PORT families,
+  plus the separately tracked Python #1626 and Lua #1616 fixes, shipped across
+  codegraph-rs `v0.48.2`–`v0.50.1`; see the 2026-08-31 CLOSEOUT entry below.
+  `codegraph context` and custom Lua loader #1617 remain explicit DEFER items)
 - **This project version:** see `Cargo.toml` (`codegraph-rs`, independent line)
 - **Last audit:** `2026-08-27` (refreshed `2026-08-31`) — upstream `v1.6.0`
   plus its one following docs-only commit was audited through
   `6a056ec5db35172f9dc348f87b54ea415aa5169e`. The exact new range after the
   previously closed 104-commit batch is 28 commits and identified 15 PORT
-  families; Waves 0–2 have now shipped twelve of those families in
-  `v0.48.2`/`v0.48.3`/`v0.49.0`, together with the separately tracked #1626
-  and #1616 fixes. Three upstream PORT families remain in Wave 3; see
-  `V1_6_TRIAGE_2026-08-27.md`. Tracked parity therefore remains `1.5.0` until
-  that final backlog lands
+  families. Waves 0–3 shipped the complete backlog in
+  `v0.48.2`/`v0.48.3`/`v0.49.0`/`v0.50.0`, together with the separately
+  tracked #1626 and #1616 fixes; `v0.50.1` closed two release-smoke defects
+  without changing extraction. Tracked parity is now `1.6.0`
 - **Previous exact boundary:** `c6aaa20358cd6adcd04b87bdef8e5803ad146f3a`
   (the 104th commit after `v1.5.0`; merge of upstream PR #1516)
 - **Next discovery starts here:** diff
   `6a056ec5db35172f9dc348f87b54ea415aa5169e..origin/main`; do not re-triage
   the v1.6 backlog — use `V1_6_TRIAGE_2026-08-27.md`
 - **Upstream repo:** https://github.com/colbymchenry/codegraph
+
+> **1.5.0 → 1.6.0 sync: COMPLETE** (codegraph-rs `v0.48.2` → `v0.50.1`).
+> Every audited portable, in-scope behavior landed across the four waves, and
+> the final official binary passed the release smoke described in the
+> 2026-08-31 CLOSEOUT entry below. The explicit exceptions are:
+>
+> - **`codegraph context` remains DEFERRED** — the deterministic context engine
+>   already exists as `explore`; no external compatibility requirement has
+>   justified a second public output contract.
+> - **#1617 custom Lua module loaders remain DEFERRED** — this is
+>   project-specific configurable synthesis and still lacks a real target
+>   project plus deterministic path/root contract.
+> - The older `1.4.1 → 1.5.0` and `1.2.0 → 1.4.1` caveats below carry forward
+>   unchanged.
 
 > **1.4.1 → 1.5.0 sync: COMPLETE** (codegraph-rs `v0.42.1` → `v0.42.4`). Every
 > portable, in-scope behavior in that range has landed (see the 2026-08-02
@@ -78,6 +90,124 @@
 > that records colby parity — do not infer it from `Cargo.toml`.
 
 ## Sync log
+
+### 2026-08-31 — Wave 3 LANDED in `v0.50.0`; release-smoke fixes LANDED in `v0.50.1`; `v1.6.0` sync COMPLETE
+
+Rust PR [#258](https://github.com/sunerpy/codegraph-rust/pull/258), merged as
+`4e0cbad8aa2225d133675235df290f6c262b8ba9` from implementation commit
+`3f723014955badc1fc00e195b9766e07e57c3a22`, shipped the three frozen Wave 3
+PORT families: upstream `bc89480`, `0d17dfd`, and `a5c2709`.
+
+The shipped behavior is:
+
+- Codex supports location-aware global and project-local install, detect,
+  print-config, and uninstall flows. A local install writes
+  `.codex/config.toml`, project-root `AGENTS.md`, and
+  `.agents/skills/codegraph`, preserves unrelated TOML/marker-external user
+  text, and explains Codex's project-trust requirement. Local uninstall does
+  not touch the global layer;
+- `init -y/--yes` is an intentionally behavior-neutral unattended-bootstrap
+  compatibility flag. `install -i/--init` initializes the current directory
+  only after installer success, remains effective when no agent target is
+  selected, returns before initialization under `--print-config`, and invokes
+  init with `target=none` so it cannot duplicate local agent configuration; and
+- a bare stdio MCP launch walks upward first, then performs the bounded
+  workspace-root scan only when the launch directory has a workspace manifest
+  or `.git`. It adopts exactly one indexed child, starts that project's normal
+  daemon/watcher/catch-up path, reports zero/multiple candidates without
+  guessing, preserves explicit `projectPath` authority, and keeps global
+  no-path HTTP behavior unchanged.
+
+Wave 3 deliberately keeps extraction version 12, the node-id formula, every
+graph row, and all extraction goldens unchanged. Local `make ci`, the pre-push
+gate, PR CI run
+[`33422822781`](https://github.com/sunerpy/codegraph-rust/actions/runs/33422822781),
+post-merge main CI run
+[`33423660004`](https://github.com/sunerpy/codegraph-rust/actions/runs/33423660004),
+and its release-please workflow
+[`33423660035`](https://github.com/sunerpy/codegraph-rust/actions/runs/33423660035)
+all passed.
+
+Release-please PR
+[#259](https://github.com/sunerpy/codegraph-rust/pull/259) merged as
+`1264493b42d7aaccd4498580685fddd074e7c356`, cut tag `v0.50.0` at that exact
+commit, and release/tag CI run
+[`33424831118`](https://github.com/sunerpy/codegraph-rust/actions/runs/33424831118)
+plus release workflow
+[`33424831111`](https://github.com/sunerpy/codegraph-rust/actions/runs/33424831111)
+passed all six platform builds, the CI gate, checksum generation, and publish.
+The official `codegraph-0.50.0-x86_64-unknown-linux-musl.tar.gz` digest was
+`081a6d51440a505dbb26ccaf0041022921d57e46bce1478d7ddf639562e2c547`.
+
+Black-box acceptance of that downloaded `v0.50.0` binary proved the Wave 3
+features, but also found two defects that prevented final closeout:
+
+- raw `codegraph export` JSON ordered otherwise-identical edges by SQLite
+  insertion order, so incremental `sync` and `index --force` differed
+  byte-for-byte even though their canonical graph content matched; and
+- text `status` correctly detected an extraction-version 11 index as outdated,
+  but incorrectly described it as uninitialized and recommended `init` even
+  though ordinary `sync` performed the supported migration.
+
+Patch PR [#260](https://github.com/sunerpy/codegraph-rust/pull/260), merged as
+`6108538b8c32efabaf975d70bbde58712037d84a` from commit
+`1bcf5856940178388bb217e62d4cb6dff8bb9ede`, adds a deterministic semantic edge
+sort to export and changes outdated text guidance to `codegraph sync`. The
+patch changes no extraction version, schema, node-id, golden, or Skill content.
+Focused tests, workspace tests, `make ci`, the pre-push hook, PR CI run
+[`33429410706`](https://github.com/sunerpy/codegraph-rust/actions/runs/33429410706),
+and post-merge main CI run
+[`33430264430`](https://github.com/sunerpy/codegraph-rust/actions/runs/33430264430)
+all passed, including native Windows. Release workflow
+[`33430264432`](https://github.com/sunerpy/codegraph-rust/actions/runs/33430264432)
+then created the patch release PR without prematurely building assets.
+
+Release-please PR
+[#261](https://github.com/sunerpy/codegraph-rust/pull/261) merged as
+`02c535999189b7d4517d8c6bbdf08d82575eb4c2`, cut tag `v0.50.1` at that exact
+commit, and final CI run
+[`33431047600`](https://github.com/sunerpy/codegraph-rust/actions/runs/33431047600)
+plus release workflow
+[`33431047589`](https://github.com/sunerpy/codegraph-rust/actions/runs/33431047589)
+passed. The Release is neither draft nor prerelease and contains all six
+platform archives plus `SHA256SUMS`. The official
+`codegraph-0.50.1-x86_64-unknown-linux-musl.tar.gz` digest is
+`dd8d2c0f7deb19752639c3f4e16127cf47c584577ae5b67b5464403de818ff25`,
+matching both `SHA256SUMS` and GitHub's asset digest.
+
+Final black-box acceptance used that downloaded `v0.50.1` static binary:
+
+- `codegraph --version` returned `codegraph 0.50.1` with no logger-init banner;
+  `status`, `init -y`, `sync`, `index --force`, `search`, `explore`, and `node`
+  all succeeded on extraction version 12;
+- a comment-only edit followed by `sync` and a fresh `index --force` produced
+  raw exports with identical SHA256
+  `379dbcfd439a9616c5d0c19f35d5f42b9173cb2bed5e805c76108aa7809e952c`;
+- a real extraction-version 11 index reported
+  `Recovery: run codegraph sync ...`, then migrated to version 12 through
+  ordinary `sync`;
+- MCP `initialize` negotiated `2026-07-28`, `tools/list` returned the expected
+  tool surface, and queries succeeded with a read-only permanent `index.lock`;
+- Codex global/local install, print-config, uninstall, trust guidance, user
+  config preservation, `install --yes --init`, no-init, print-only, and
+  no-target bootstrap branches all passed;
+- unique-child adoption started the daemon/watcher and automatically indexed a
+  new function; `alpha, beta` ambiguity was reported in sorted order, explicit
+  `projectPath` bypassed it, and an un-gated parent did not scan downward;
+- an isolated HOME upgraded the real Skill from `0.48.1` to `0.50.1`, previewed
+  the full `+70 -4` diff, reached `up to date`, and preserved a subsequent
+  local edit by refusing to overwrite it without `--force`;
+- Zuno install/uninstall preserved unrelated JSON, existing target
+  print-config output stayed compatible, and shell completion succeeded on a
+  1 MiB thread stack.
+
+A final live upstream refresh found release `v1.6.0`, `main` still exactly
+`6a056ec5db35172f9dc348f87b54ea415aa5169e`, and #1626, #1616, and #1617 still
+open upstream. The Rust port has shipped the first two issue fixes; #1617 and
+`codegraph context` remain DEFER. All 15 audited PORT families plus those two
+issue fixes are now shipped, so tracked colby parity advances from `1.5.0` to
+`1.6.0`. The next discovery boundary remains
+`6a056ec5db35172f9dc348f87b54ea415aa5169e`.
 
 ### 2026-08-31 — Wave 2 retrieval + ranking controls LANDED in `v0.49.0`
 
