@@ -43,6 +43,7 @@ impl Fixture {
             .args(args)
             .current_dir(cwd)
             .env("HOME", &self.home)
+            .env("USERPROFILE", &self.home)
             .env("XDG_CONFIG_HOME", self.root.join("xdg"))
             .env("HERMES_HOME", self.root.join("hermes"))
             .env_remove("APPDATA")
