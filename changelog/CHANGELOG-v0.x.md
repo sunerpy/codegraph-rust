@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.50.1](https://github.com/sunerpy/codegraph-rust/compare/v0.50.0...v0.50.1) (2026-08-31)
+
+
+### Bug Fixes
+
+* **cli:** stabilize export and outdated status guidance ([6108538](https://github.com/sunerpy/codegraph-rust/commit/6108538b8c32efabaf975d70bbde58712037d84a))
+
 ## [0.50.0](https://github.com/sunerpy/codegraph-rust/compare/v0.49.0...v0.50.0) (2026-08-31)
 
 
