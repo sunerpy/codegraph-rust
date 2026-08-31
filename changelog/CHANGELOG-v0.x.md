@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.50.0](https://github.com/sunerpy/codegraph-rust/compare/v0.49.0...v0.50.0) (2026-08-31)
+
+
+### Features
+
+* **cli:** complete wave 3 bootstrap and project discovery ([#258](https://github.com/sunerpy/codegraph-rust/issues/258)) ([4e0cbad](https://github.com/sunerpy/codegraph-rust/commit/4e0cbad8aa2225d133675235df290f6c262b8ba9))
+
 ## [0.49.0](https://github.com/sunerpy/codegraph-rust/compare/v0.48.3...v0.49.0) (2026-08-31)
 
 
