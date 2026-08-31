@@ -1,5 +1,7 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 
+use codegraph_core::deprioritize::DeprioritizeMatcher;
 use codegraph_core::types::{Language, Node, NodeKind};
 use codegraph_graph::query::{SearchOptions, parse_query, search_nodes};
 use codegraph_store::Store;
@@ -285,6 +287,8 @@ fn options_from_golden(opts: &GoldenOptions) -> SearchOptions {
         languages: Vec::new(),
         limit: opts.limit,
         offset: None,
+        seed_names: Vec::new(),
+        deprioritize: None,
     }
 }
 
@@ -622,5 +626,141 @@ fn search_multiple_exact_matches_preserve_score_order_deterministically() {
         limited_ids,
         ["function:strong-exact", "parameter:weak-exact"],
         "limit must retain exact rows in score order"
+    );
+}
+
+#[test]
+fn search_deprioritize_damps_ranking_without_hiding_results() {
+    let mut store = Store::open(&temp_db_path("deprioritize-ranking")).expect("open temp store");
+    store
+        .upsert_nodes(&[
+            node(
+                "function:product",
+                NodeKind::Function,
+                "usage",
+                "product::usage",
+                "src/product/usage.rs",
+                Language::Rust,
+                1,
+                2,
+                None,
+                None,
+                true,
+            ),
+            node(
+                "function:vendor",
+                NodeKind::Function,
+                "usage",
+                "vendor::usage",
+                "vendor/sdk/usage.rs",
+                Language::Rust,
+                1,
+                2,
+                None,
+                None,
+                true,
+            ),
+            node(
+                "function:prefix",
+                NodeKind::Function,
+                "usageHelper",
+                "product::usageHelper",
+                "src/product/usage_helper.rs",
+                Language::Rust,
+                1,
+                2,
+                None,
+                None,
+                true,
+            ),
+        ])
+        .expect("insert ranking corpus");
+    let opts = SearchOptions {
+        deprioritize: Some(Arc::new(DeprioritizeMatcher::from_patterns([
+            "vendor/**".to_string()
+        ]))),
+        ..SearchOptions::default()
+    };
+    let results = search_nodes(&store, "usage", &opts, &HashSet::new()).unwrap();
+    assert_eq!(results.len(), 3, "deprioritized source remains findable");
+    assert_eq!(results[0].node.id, "function:product");
+    assert_eq!(results[1].node.id, "function:vendor");
+    assert_eq!(results[2].node.id, "function:prefix");
+    assert!(
+        (results[0].score - results[1].score - 35.0).abs() < f64::EPSILON,
+        "-15 path penalty plus 0.75x exact-name bonus must produce a 35-point discount"
+    );
+    assert!(
+        results[1].score > results[2].score,
+        "discount must not erase an exact match behind a mere prefix"
+    );
+}
+
+#[test]
+fn search_accepts_variable_and_constant_seed_names() {
+    let mut store = Store::open(&temp_db_path("camel-variable-seed")).expect("open temp store");
+    let mut variable = node(
+        "variable:bottom",
+        NodeKind::Variable,
+        "feedAtBottom",
+        "feedAtBottom",
+        "src/feed.ts",
+        Language::TypeScript,
+        1,
+        1,
+        None,
+        None,
+        false,
+    );
+    variable.signature = Some("let feedAtBottom = false".to_string());
+    let constant = node(
+        "constant:pin",
+        NodeKind::Constant,
+        "PIN_FEED_IF_NEAR_BOTTOM",
+        "PIN_FEED_IF_NEAR_BOTTOM",
+        "src/feed.ts",
+        Language::TypeScript,
+        2,
+        2,
+        None,
+        None,
+        false,
+    );
+    store
+        .upsert_nodes(&[variable, constant])
+        .expect("insert camel corpus");
+
+    let results = search_nodes(
+        &store,
+        "atBottom",
+        &SearchOptions {
+            seed_names: vec!["feedAtBottom".to_string()],
+            ..SearchOptions::default()
+        },
+        &HashSet::new(),
+    )
+    .unwrap();
+    assert!(
+        results
+            .iter()
+            .any(|result| result.node.id == "variable:bottom"),
+        "multi-hump variable must be a seed candidate"
+    );
+
+    let results = search_nodes(
+        &store,
+        "pinFeedNearBottom",
+        &SearchOptions {
+            seed_names: vec!["PIN_FEED_IF_NEAR_BOTTOM".to_string()],
+            ..SearchOptions::default()
+        },
+        &HashSet::new(),
+    )
+    .unwrap();
+    assert!(
+        results
+            .iter()
+            .any(|result| result.node.id == "constant:pin"),
+        "multi-hump constant must be a seed candidate"
     );
 }

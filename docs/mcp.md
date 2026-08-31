@@ -318,6 +318,23 @@ returns the symbols relevant to a query, their verbatim source grouped by file,
 plus the call/impact graph around them. Prefer it over individual `callers`/
 `callees` chains when surveying an unfamiliar area.
 
+Explicit source paths in the query are resolved before fuzzy search and pinned
+to the front of the result. Quoted/backticked paths, `./`, Windows separators,
+`:123`, and `#L12` are normalized; exact matches precede segment-aligned suffix
+matches. Extensionless kebab basenames are accepted only when they resolve to at
+most three indexed files, so ordinary hyphenated prose remains prose. The
+resolver examines at most eight path spans, drops at most eight leading
+segments, pins at most eight files (also bounded by `maxFiles`), and reports at
+most four unresolved explicit paths. Resolved or clearly missing explicit paths
+are removed from the normal query, preventing route parameters and basenames
+from becoming noisy symbol seeds. Pinned files survive low-score filtering and
+receive a protected source budget.
+
+Explore also resolves prose and camelCase query segments against indexed symbol
+names, then merges the resulting callable, Variable, and Constant names as
+dampened exact seeds. This recovers names such as `feedAtBottom` from "feed
+bottom" while keeping ordinary `codegraph_search` on its fast SQL/FTS path.
+
 The blast-radius block that `explore` prints reports **measured** test coverage.
 When no test file calls a root directly, codegraph walks UP the caller graph
 before saying anything — up to 3 hops (direct callers are hop 1), bounded by 64
@@ -383,6 +400,10 @@ and trigger one full scan that supersedes queued path deltas. Invalid TOML keeps
 the last valid scope and is reported; malformed JSON keeps the existing tolerant
 empty-override semantics. Every later incremental sync re-checks the current
 scope, preventing stale events from re-admitting excluded files.
+Ranking-only `deprioritize` rules are loaded separately from watcher scope.
+Each request-scoped engine loads the addressed project's JSON rules followed by
+its authoritative TOML rules, so a long-lived stdio or HTTP process observes
+edits on its next search/explore request without changing the graph.
 When the resolved root is exactly `$HOME` or the filesystem root (`/`), the
 server first disables the daemon, the file watcher, AND catch-up sync — not just
 the watcher. This happens when an IDE or agent (e.g. Kiro) launches

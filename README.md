@@ -130,7 +130,9 @@ codegraph install --yes              # detects installed agents and wires them u
 **Rules of thumb:** reach for `codegraph_explore` _before_ reading files; trust
 its results (full AST parse — don't re-verify with grep); use `codegraph_impact`
 for refactor blast-radius rather than walking callers by hand. The index lags
-file writes by ~1s; tool responses flag any stale files.
+file writes by ~1s; tool responses flag any stale files. If the question names
+a source path, include it in the explore query: explicit paths are normalized
+and pinned ahead of fuzzy matches, while unresolved paths are reported.
 
 </details>
 
@@ -431,6 +433,19 @@ and newly included/custom-extension files are added without restarting the MCP
 server. Invalid TOML keeps the last valid watcher scope and reports the error;
 malformed JSON keeps the existing tolerant empty-override behavior.
 
+Keep third-party or generated source searchable while ranking it below
+first-party code with ranking-only rules:
+
+```toml
+[indexing]
+deprioritize = ["vendor/**", "generated/**"]
+```
+
+`.codegraph/codegraph.json` also accepts a top-level `deprioritize` array for
+compatibility. JSON rules run first, TOML rules run last, ordered `!pattern`
+exceptions make matching last-rule-wins, and no file/node/edge is removed.
+Search and explore reload the addressed project's policy on every request.
+
 Full env-var table, HTTP server details, filesystem fallback behavior, and the
 Claude prompt-hook: [`docs/mcp.md`](docs/mcp.md) and
 [`docs/cli.md`](docs/cli.md#daemon-watch--environment-variables).
@@ -439,8 +454,9 @@ Claude prompt-hook: [`docs/mcp.md`](docs/mcp.md) and
 
 ## CLI Subcommands
 
-Core commands: `init`, `index`, `sync`, `search`, `files`, `status`, `serve`,
-`callers`, `callees`, `impact`, `affected`, `check`, `export`, `unlock`.
+Core commands: `init`, `index`, `sync`, `search`, `explore`, `node`, `files`,
+`status`, `serve`, `callers`, `callees`, `impact`, `affected`, `check`, `audit`,
+`export`, `unlock`, `http`, `mcp`.
 
 Agent / install commands: `install`, `uninstall`, `skill`, `self-update`,
 `completions` (`--install` sets up tab completion for bash/zsh/fish/powershell/elvish).

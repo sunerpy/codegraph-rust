@@ -98,6 +98,20 @@ without restarting the MCP server. Invalid TOML keeps the last valid scope and
 reports an error; malformed JSON retains CodeGraph's tolerant empty-override
 behavior.
 
+To keep vendored or generated source indexed but rank it below first-party code,
+configure ranking-only rules:
+
+```toml
+[indexing]
+deprioritize = ["vendor/**", "generated/**"]
+```
+
+The compatibility form in `.codegraph/codegraph.json` is
+`{"deprioritize":["vendor/**"]}`. JSON rules run first, TOML rules run last,
+and ordered `!pattern` exceptions make matching last-rule-wins. This never
+removes files or changes nodes/edges. Search and explore reload the addressed
+project's policy on each request, so a long-running MCP process needs no restart.
+
 Auto-register into all detected agents (Claude Code, Cursor, Codex, opencode,
 Hermes, Gemini CLI, Antigravity, Kiro, Trae, Qoder, Zed, Zuno, VS Code,
 Copilot CLI, JetBrains):
@@ -125,10 +139,11 @@ Pick your entry point based on what you're trying to answer:
 | "What files are under path P?"      | `codegraph_files`   |
 | "Is the index up to date?"          | `codegraph_status`  |
 
-These are MCP tool names. When MCP is unavailable and you are invoking the
-binary directly, use `codegraph search "<symbol>" -p /path/to/project` for
-symbol lookup. `codegraph query` remains a compatibility alias; prefer
-`codegraph search` in new commands and guidance.
+These are MCP tool names. When MCP is unavailable, the binary exposes the same
+engine through `codegraph explore "<question>" -p /path/to/project`,
+`codegraph node "<symbol-or-file>" -p /path/to/project`, and
+`codegraph search "<symbol>" -p /path/to/project`. `codegraph query` remains a
+compatibility alias; prefer `codegraph search` in new commands and guidance.
 
 ### `codegraph_explore` — start here
 
@@ -143,6 +158,17 @@ relevant to your query, their verbatim source grouped by file, and the
 call/impact graph connecting them. It replaces the grep-then-read-then-grep loop
 that would otherwise take 10-20 round-trips.
 
+When the question names a source path, include that path in the explore query.
+CodeGraph normalizes quoted/backticked, `./`, Windows, `:line`, and `#Lline`
+forms, pins matching files ahead of fuzzy results, and removes path fragments
+from normal symbol search. An unresolved explicit path is reported instead of
+being dissolved into noisy query tokens. Path recognition is deliberately
+bounded; ordinary hyphenated prose is left alone.
+
+Explore also supplements FTS with camelCase/snake-case identifier segments, so
+prose such as "feed bottom" can seed callable, Variable, and Constant names such
+as `feedAtBottom` without slowing the ordinary `codegraph_search` path.
+
 Trust the results — they come from a full AST parse, not text matching. Don't
 re-verify with grep.
 
@@ -153,6 +179,7 @@ suspect) a symbol's name but not where it lives. The results are FTS5-scored
 across multiple signals (name, kind, path). This is the closest thing to
 "semantic" lookup available, but it is **fully deterministic full-text scoring**
 — there are no embeddings, no vector index, no neural model of any kind.
+Case-insensitive exact-name lookups use the dedicated lower-name SQLite index.
 
 CLI equivalent:
 

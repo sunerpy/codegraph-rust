@@ -2,7 +2,9 @@ pub mod parser;
 pub mod scoring;
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
+use codegraph_core::deprioritize::DeprioritizeMatcher;
 use codegraph_core::types::{Language, Node, NodeKind};
 use codegraph_store::Store;
 use codegraph_store::queries::SearchResult;
@@ -26,6 +28,13 @@ pub struct SearchOptions {
     pub languages: Vec<Language>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    /// Exact names supplied by a higher-level retrieval surface, such as
+    /// explore's identifier-segment vocabulary. Ordinary search leaves this
+    /// empty, avoiding an all-name vocabulary scan on its hot path.
+    pub seed_names: Vec<String>,
+    /// Ranking-only project path matcher. `None` preserves the pre-config
+    /// ordering byte-for-byte.
+    pub deprioritize: Option<Arc<DeprioritizeMatcher>>,
 }
 
 fn merge_unique<T: Clone + PartialEq>(base: &[T], extra: &[T]) -> Vec<T> {
@@ -103,21 +112,36 @@ pub fn search_nodes(
         }
     }
 
+    seed_named_nodes(store, &options.seed_names, &kinds, &languages, &mut results)?;
     seed_multi_segment_definers(store, query, &kinds, &mut results)?;
 
     if !results.is_empty() && (!text.is_empty() || !query.is_empty()) {
         let scoring_query = if !text.is_empty() { &text } else { query };
         for result in &mut results {
+            let deprioritized = options
+                .deprioritize
+                .as_ref()
+                .is_some_and(|matcher| matcher.is_match(&result.node.file_path));
+            let name_bonus = scoring::name_match_bonus(&result.node.name, scoring_query);
             result.score += scoring::kind_bonus(result.node.kind)
                 + scoring::score_path_relevance(
                     &result.node.file_path,
                     scoring_query,
                     project_name_tokens,
+                    deprioritized,
                 )
-                + scoring::name_match_bonus(&result.node.name, scoring_query);
+                + if deprioritized {
+                    (name_bonus * 0.75).round()
+                } else {
+                    name_bonus
+                };
         }
 
-        sort_by_exact_name_then_score_desc(&mut results, scoring_query);
+        sort_by_exact_name_then_score_desc(
+            &mut results,
+            scoring_query,
+            options.deprioritize.as_deref(),
+        );
         if results.len() > limit as usize {
             results.truncate(limit as usize);
         }
@@ -149,15 +173,48 @@ fn sort_by_score_desc(results: &mut [SearchResult]) {
     });
 }
 
-fn sort_by_exact_name_then_score_desc(results: &mut [SearchResult], query: &str) {
+fn sort_by_exact_name_then_score_desc(
+    results: &mut [SearchResult],
+    query: &str,
+    deprioritize: Option<&DeprioritizeMatcher>,
+) {
     // Both sorts are stable: establish score order first, then group exact whole-name
     // matches ahead of non-exact rows without mutating the externally visible scores.
     sort_by_score_desc(results);
     results.sort_by(|a, b| {
-        let a_is_exact = scoring::is_exact_name_match(&a.node.name, query);
-        let b_is_exact = scoring::is_exact_name_match(&b.node.name, query);
+        let a_is_exact = scoring::is_exact_name_match(&a.node.name, query)
+            && !deprioritize.is_some_and(|matcher| matcher.is_match(&a.node.file_path));
+        let b_is_exact = scoring::is_exact_name_match(&b.node.name, query)
+            && !deprioritize.is_some_and(|matcher| matcher.is_match(&b.node.file_path));
         b_is_exact.cmp(&a_is_exact)
     });
+}
+
+fn seed_named_nodes(
+    store: &Store,
+    seed_names: &[String],
+    kinds: &[NodeKind],
+    languages: &[Language],
+    results: &mut Vec<SearchResult>,
+) -> rusqlite::Result<()> {
+    if seed_names.is_empty() {
+        return Ok(());
+    }
+    let mut existing = results
+        .iter()
+        .map(|result| result.node.id.clone())
+        .collect::<HashSet<_>>();
+    for name in seed_names {
+        for node in store.nodes_by_exact_name_nocase(name, kinds, languages)? {
+            if existing.insert(node.id.clone()) {
+                results.push(SearchResult {
+                    node,
+                    score: INFIX_SEED_SCORE * 0.6,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Multi-hump field-name seeding (upstream `1de7e8f` #1319).
@@ -197,7 +254,7 @@ fn seed_multi_segment_definers(
             continue;
         }
         let mut seeded = 0usize;
-        for node in store.callable_nodes_by_name_infix(&needle, INFIX_CANDIDATE_CAP)? {
+        for node in store.seedable_nodes_by_name_infix(&needle, INFIX_CANDIDATE_CAP)? {
             if seeded >= INFIX_SEED_CAP {
                 break;
             }

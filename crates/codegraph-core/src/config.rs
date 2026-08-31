@@ -83,6 +83,13 @@ pub struct IndexingConfig {
     /// behavior byte-identical). #1063.
     #[serde(default)]
     pub include: Vec<String>,
+    /// Root-relative gitignore-style patterns for source that remains indexed
+    /// and directly retrievable, but should lose ranking ties to first-party
+    /// code. Rules are evaluated in order with last-match-wins semantics;
+    /// `!pattern` clears an earlier match. The project's `codegraph.json`
+    /// rules run first and these TOML rules run last, so TOML is authoritative.
+    #[serde(default)]
+    pub deprioritize: Vec<String>,
 }
 
 fn default_max_file_size() -> u64 {
@@ -206,6 +213,7 @@ impl Default for IndexingConfig {
             ignore_paths: default_ignore_paths(),
             exclude: Vec::new(),
             include: Vec::new(),
+            deprioritize: Vec::new(),
         }
     }
 }
@@ -404,6 +412,7 @@ name = "my-project"
         assert!(cfg.watch.enabled); // default
         assert_eq!(cfg.watch.debounce_ms, 2000); // default
         assert!(cfg.indexing.exclude.is_empty()); // off by default
+        assert!(cfg.indexing.deprioritize.is_empty()); // ranking-only, off by default
     }
 
     #[test]
@@ -427,6 +436,22 @@ max_file_size = 2097152
 "#;
         let cfg: Config = toml::from_str(without).expect("should parse");
         assert!(cfg.indexing.exclude.is_empty());
+    }
+
+    #[test]
+    fn test_deprioritize_parses_and_preserves_rule_order() {
+        let config = r#"
+[app]
+name = "p"
+
+[indexing]
+deprioritize = ["vendor/**", "!vendor/first-party/**", "generated/**"]
+"#;
+        let cfg: Config = toml::from_str(config).expect("should parse");
+        assert_eq!(
+            cfg.indexing.deprioritize,
+            vec!["vendor/**", "!vendor/first-party/**", "generated/**"]
+        );
     }
 
     #[test]

@@ -408,6 +408,7 @@ pub fn score_path_relevance(
     file_path: &str,
     query: &str,
     project_name_tokens: &HashSet<String>,
+    is_deprioritized: bool,
 ) -> f64 {
     let path_lower = file_path.to_lowercase();
     let file_name = basename(file_path).to_lowercase();
@@ -451,7 +452,9 @@ pub fn score_path_relevance(
 
     let query_lower = query.to_lowercase();
     let is_test_query = query_lower.contains("test") || query_lower.contains("spec");
-    if !is_test_query && is_test_file(file_path) {
+    // A configured peripheral path stays penalized even for a test-oriented
+    // query. A path that is both test-like and configured is docked once.
+    if (!is_test_query && is_test_file(file_path)) || is_deprioritized {
         score -= 15.0;
     }
 
@@ -855,9 +858,9 @@ mod tests {
     fn score_path_relevance_filename_beats_dir_beats_path() {
         let empty = HashSet::new();
         // token in filename → +10
-        let fname = score_path_relevance("src/auth/login.ts", "login", &empty);
+        let fname = score_path_relevance("src/auth/login.ts", "login", &empty, false);
         // token in dir → +5
-        let dir = score_path_relevance("src/login/handler.ts", "login", &empty);
+        let dir = score_path_relevance("src/login/handler.ts", "login", &empty, false);
         assert!(
             fname > dir,
             "filename hit outranks dir hit: {fname} vs {dir}"
@@ -869,33 +872,35 @@ mod tests {
     fn score_path_relevance_path_only_hit_scores_three() {
         let empty = HashSet::new();
         // "widget" appears only deep in the path segment, not filename/immediate dir.
-        let score = score_path_relevance("app/widget/nested/main.ts", "widget", &empty);
+        let score = score_path_relevance("app/widget/nested/main.ts", "widget", &empty, false);
         assert!(score >= 3.0);
     }
 
     #[test]
     fn score_path_relevance_empty_query_is_zero() {
         let empty = HashSet::new();
-        assert_eq!(score_path_relevance("src/a.ts", "", &empty), 0.0);
-        assert_eq!(score_path_relevance("src/a.ts", "   ", &empty), 0.0);
+        assert_eq!(score_path_relevance("src/a.ts", "", &empty, false), 0.0);
+        assert_eq!(score_path_relevance("src/a.ts", "   ", &empty, false), 0.0);
     }
 
     #[test]
     fn score_path_relevance_test_file_penalized_unless_test_query() {
         let empty = HashSet::new();
         // Non-test query on a test file → -15 penalty pushes it negative.
-        let penalized = score_path_relevance("src/tests/foo.rs", "foo", &empty);
+        let penalized = score_path_relevance("src/tests/foo.rs", "foo", &empty, false);
         assert!(penalized < 10.0, "test file penalized: {penalized}");
         // Test query on a test file → no penalty.
-        let ok = score_path_relevance("src/tests/foo.rs", "test foo", &empty);
+        let ok = score_path_relevance("src/tests/foo.rs", "test foo", &empty, false);
         assert!(ok >= penalized);
+        let configured = score_path_relevance("src/tests/foo.rs", "test foo", &empty, true);
+        assert_eq!(configured, ok - 15.0);
     }
 
     #[test]
     fn score_path_relevance_project_tokens_filtered_out() {
         // If every query word is a project token, fall back to all_words.
         let project = tokens(&["myproj"]);
-        let s = score_path_relevance("src/myproj/login.ts", "myproj login", &project);
+        let s = score_path_relevance("src/myproj/login.ts", "myproj login", &project, false);
         assert!(s > 0.0);
     }
 

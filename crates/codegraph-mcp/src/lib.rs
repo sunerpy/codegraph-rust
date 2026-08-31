@@ -15,6 +15,7 @@ pub mod engine;
 pub mod explore_budget;
 pub mod instructions;
 pub mod protocol;
+pub(crate) mod query_paths;
 pub mod rmcp_handler;
 pub mod rmcp_session;
 pub(crate) mod roots;

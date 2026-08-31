@@ -17,6 +17,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use codegraph_core::config::Config;
+use codegraph_core::deprioritize::DeprioritizeMatcher;
 use codegraph_core::generated_header::detect_generated_file;
 use codegraph_core::logger::{LoggerConfig, init_logger};
 use codegraph_core::node_id::hash_content;
@@ -24,6 +25,7 @@ use codegraph_core::types::{ExtractionResult, FileRecord, Language, Node, NodeKi
 use codegraph_extract::{ExtractOptions, detect_language_with, extract_source_with};
 use codegraph_graph::graph::{GodotReach, GraphTraverser};
 use codegraph_graph::query::{SearchOptions, search_nodes};
+use codegraph_graph::{segment_match, segments};
 use codegraph_mcp::{McpServer, RunUntilAdoption};
 use codegraph_resolve::ReferenceResolver;
 use codegraph_store::queries::SearchResult;
@@ -36,8 +38,6 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 mod installer;
-mod segment_match;
-mod segments;
 mod structural_gate;
 
 /// Test-only: the ONE process-wide environment lock for this binary.
@@ -1963,6 +1963,12 @@ fn cmd_search(
 ) -> Result<()> {
     let project = resolve_required_project(path)?;
     let store = open_store(&project)?;
+    let paths = codegraph_core::IndexPaths::resolve(
+        &project,
+        std::env::var("CODEGRAPH_DIR").ok().as_deref(),
+    )?;
+    let config = Config::load_for_paths(None, &paths)?;
+    let deprioritize = Arc::new(DeprioritizeMatcher::load_for_paths(&paths, &config));
     let kinds = kind
         .as_deref()
         .map(parse_node_kind)
@@ -1977,6 +1983,8 @@ fn cmd_search(
             languages: Vec::new(),
             limit: Some(limit),
             offset: Some(0),
+            seed_names: Vec::new(),
+            deprioritize: Some(deprioritize),
         },
         &project_name_tokens(&project),
     )?;

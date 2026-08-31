@@ -1,14 +1,14 @@
 # CLI Subcommand Reference
 
-`codegraph` ships 22 subcommands. All commands accept `--help` for usage details.
+`codegraph` ships 26 subcommands. All commands accept `--help` for usage details.
 
 ## Path Convention
 
 - **Positional or `-p/--path`:** `init`, `uninit`, `index`, `sync`, `status`,
   `callers`, `callees`, `impact`, `affected`, `unlock`, `check`, `export`.
-- **`-p/--path` only:** `search`, `files`, `serve`, `audit`.
+- **`-p/--path` only:** `search`, `files`, `serve`, `audit`, `explore`, `node`.
 - **No project path:** `install`, `uninstall`, `skill`, `version`, `self-update`,
-  `completions`.
+  `completions`, `http`, `mcp`.
 
 ---
 
@@ -39,12 +39,21 @@
 | `check`           | Detect circular dependencies (each cycle as `a.ts -> b.ts -> a.ts`)                       | `[path]`, `-j/--json`                                                                                                                      |
 | `audit`           | Read-only Godot resource audit: orphan resources, dangling references, impact             | `-p`, `--orphans`, `--dangling`, `--impact <path>` (≥1 required), `--verify-plan`, `--include <PREFIX>`, `--exclude <PREFIX>`, `-j/--json` |
 | `export`          | Export the whole code graph as NetworkX node-link JSON                                    | `[path]`, `-o/--out <file>`, `--no-centrality`                                                                                             |
+| `explore`         | Explore an area with the same deterministic engine/output as `codegraph_explore`          | `<query>`, `-p`, `--max-files <1..20>`, `-j/--json`                                                                                        |
+| `node`            | Read a symbol or indexed file with the same engine/output as `codegraph_node`             | `<target>`, `-p`, `-f/--file`, `--symbols-only`, `-j/--json`, `--strict`                                                                   |
+| `http`            | Inspect or stop detached HTTP MCP servers                                                 | `<action>` (`list`, `status`, `stop`)                                                                                                      |
+| `mcp`             | Inspect foreground stdio MCP processes                                                    | `list`, optional `--json`                                                                                                                  |
 | `version`         | Print the codegraph version (same as `--version`)                                         | —                                                                                                                                          |
 | `self-update`     | Update the binary in place from the latest GitHub release                                 | `--check`, `--force`, `--tag <vX.Y.Z>`                                                                                                     |
 | `completions`     | Print or install shell completions                                                        | `<shell>` (bash, zsh, fish, powershell, elvish), `--install`                                                                               |
 
 `query` remains a visible backward-compatible alias for `search`; new scripts,
 documentation, and diagnostics should use `search`.
+
+Case-insensitive exact-name search probes seek through `idx_nodes_lower_name`
+rather than scanning `nodes`. Explore separately supplements its context seeds
+with camelCase/snake-case segments, including Variable and Constant definitions.
+These are query-time changes only; they do not change the stored graph.
 
 > **Note:** `serve --no-watch` and `CODEGRAPH_NO_WATCH=1` are fully equivalent —
 > both disable the live file watcher. See
@@ -943,6 +952,44 @@ Rules:
 - A running watcher reloads this file on change and performs one full reconcile,
   so adding or removing an extension override takes effect without restarting
   the MCP server.
+
+### Ranking-only path de-prioritization
+
+Keep peripheral source indexed and directly retrievable while ranking it below
+first-party code:
+
+```toml
+[app]
+name = "my-project"
+
+[indexing]
+deprioritize = ["vendor/**", "generated/**"]
+```
+
+The compatibility JSON form shares `.codegraph/codegraph.json` with extension
+overrides:
+
+```jsonc
+{
+  "extensions": {
+    ".x": "lua",
+  },
+  "deprioritize": ["vendor/**"],
+}
+```
+
+Rules are project-root-relative, evaluated in order, and use last-match-wins;
+prefix a rule with `!` to clear an earlier match. JSON rules are evaluated
+first, then TOML rules, so TOML has final authority. Blank, invalid, or
+non-string JSON rules are ignored.
+
+This policy affects only `search`/`explore` ranking: path relevance loses 15
+points and the exact-name bonus is multiplied by `0.75`. A file that is both
+test-like and explicitly de-prioritized is docked once; a test-oriented query
+may waive only the inferred test penalty, never an explicit rule. Files, nodes,
+edges, exact path pins, and direct node/file reads are unchanged. MCP engines
+reload the addressed project's config for every request, so a long-running
+server observes edits on the next search/explore call.
 
 ### Extraction-version upgrades
 

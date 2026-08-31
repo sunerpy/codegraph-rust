@@ -119,7 +119,8 @@ codegraph install --yes              # 检测已安装的代理并接线
 
 **经验法则**：读文件**之前**先用 `codegraph_explore`；信任它的结果（完整 AST 解析，
 别用 grep 复核）；重构影响半径用 `codegraph_impact` 而非手工遍历调用者。索引比文件
-写入滞后约 1 秒；工具响应会标注过期文件。
+写入滞后约 1 秒；工具响应会标注过期文件。问题若明确提到源码路径，就把路径直接放进
+explore 查询：显式路径会被标准化并固定在模糊结果之前，无法解析的路径会明确报告。
 
 </details>
 
@@ -413,6 +414,18 @@ codegraph http list / stop       # 管理运行中的 HTTP 服务
 文件会被加入，无需重启 MCP 服务。TOML 损坏时保留最后一次有效 scope 并报告错误；
 JSON 继续沿用宽容的空 override 语义。
 
+若希望 vendor、生成代码等继续被索引和直接查询，但在排序中低于一方代码，可配置：
+
+```toml
+[indexing]
+deprioritize = ["vendor/**", "generated/**"]
+```
+
+兼容格式 `.codegraph/codegraph.json` 也接受顶层 `deprioritize` 数组。JSON 规则先执行，
+TOML 规则后执行并最终生效；有序 `!pattern` 例外采用 last-match-wins。该配置只影响
+search/explore 排名，不删除文件、节点或边；长驻 MCP 进程会在每次请求重新读取当前
+项目策略，无需重启。
+
 完整参考——守护进程生命周期、所有环境变量、HTTP 注册表、扩展名映射、Claude hook：
 [`../cli.md`](../cli.md#daemon-watch--environment-variables)。
 
@@ -420,8 +433,9 @@ JSON 继续沿用宽容的空 override 语义。
 
 ## CLI 子命令
 
-核心命令：`init`、`index`、`sync`、`search`、`files`、`status`、`serve`、
-`callers`、`callees`、`impact`、`affected`、`check`、`export`、`unlock`。
+核心命令：`init`、`index`、`sync`、`search`、`explore`、`node`、`files`、
+`status`、`serve`、`callers`、`callees`、`impact`、`affected`、`check`、
+`audit`、`export`、`unlock`、`http`、`mcp`。
 
 代理 / 安装命令：`install`、`uninstall`、`skill`、`self-update`、`completions`。
 
