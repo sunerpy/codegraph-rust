@@ -303,6 +303,40 @@ fn namespace_snapshot_detects_equal_length_byte_mutation() {
     );
 }
 
+#[test]
+fn status_on_outdated_namespace_recommends_sync() {
+    let dir = TestDir::new("outdated-status-sync");
+    let project = init_project("outdated-status-sync", &dir);
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+
+    let run = cli(&["status", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "status must report an outdated namespace: stdout={}, stderr={}",
+        run.stdout, run.stderr
+    );
+    assert!(
+        run.stdout.contains("State:   outdated")
+            && run
+                .stdout
+                .contains(&format!("codegraph sync {}", project.display())),
+        "outdated status must prescribe ordinary sync: {}",
+        run.stdout
+    );
+    assert!(
+        !run.stdout.contains("Not initialized") && !run.stdout.contains("codegraph init"),
+        "outdated status must not prescribe initialization: {}",
+        run.stdout
+    );
+}
+
 /// Plan test 9: an `Outdated` namespace forces EVERY file through migration —
 /// zero unchanged skips even though every source byte is identical to the
 /// outdated database — and the result equals a fresh v2 `index --force`.

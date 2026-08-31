@@ -4,12 +4,13 @@
 //! `agents_md_generator`) consume: `{nodes:[{id,label,file_type,source_file,
 //! kind,...}], links:[{source,target,relation,...}], edges:[...], directed,
 //! multigraph, graph}`. `links` is the canonical NetworkX `node_link_data` key;
-//! `edges` is a duplicate alias for readers that expect it. Deterministic
-//! (nodes/edges read in id order).
+//! `edges` is a duplicate alias for readers that expect it. Deterministic:
+//! nodes are read in stable id order and edges are sorted by their semantic
+//! fields rather than SQLite insertion rowid.
 
 use std::collections::HashMap;
 
-use codegraph_core::types::{Node, NodeKind};
+use codegraph_core::types::{Edge, Node, NodeKind};
 use codegraph_store::Store;
 use serde_json::{Map, Value, json};
 
@@ -25,7 +26,8 @@ pub fn node_link_graph(store: &Store) -> anyhow::Result<Value> {
 /// then carry no `god_score`/`pagerank`/`in_degree`/`out_degree`.
 pub fn node_link_graph_opts(store: &Store, with_centrality: bool) -> anyhow::Result<Value> {
     let nodes = store.all_nodes()?;
-    let edges = store.all_edges()?;
+    let mut edges = store.all_edges()?;
+    edges.sort_by_cached_key(edge_export_sort_key);
 
     let scores = if with_centrality {
         centrality::compute(&nodes, &edges)
@@ -63,6 +65,32 @@ pub fn node_link_graph_opts(store: &Store, with_centrality: bool) -> anyhow::Res
         "links": link_values,
         "edges": link_values,
     }))
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct EdgeExportSortKey {
+    source: String,
+    target: String,
+    kind: &'static str,
+    line: Option<i64>,
+    col: Option<i64>,
+    provenance: Option<String>,
+    metadata: Option<String>,
+}
+
+fn edge_export_sort_key(edge: &Edge) -> EdgeExportSortKey {
+    EdgeExportSortKey {
+        source: edge.source.clone(),
+        target: edge.target.clone(),
+        kind: edge.kind.as_str(),
+        line: edge.line,
+        col: edge.col,
+        provenance: edge.provenance.clone(),
+        metadata: edge
+            .metadata
+            .as_ref()
+            .map(|metadata| serde_json::to_string(metadata).expect("JSON values always serialize")),
+    }
 }
 
 fn node_to_link_node(node: &Node, centrality: Option<&Centrality>) -> Value {
@@ -252,5 +280,51 @@ mod tests {
         assert_eq!(doc["nodes"].as_array().expect("nodes").len(), 0);
         assert_eq!(doc["links"].as_array().expect("links").len(), 0);
         assert_eq!(doc["edges"].as_array().expect("edges").len(), 0);
+    }
+
+    #[test]
+    fn node_link_graph_is_byte_stable_across_edge_insertion_order() {
+        let nodes = [
+            node("file:src/a.ts", NodeKind::File, "a.ts", "src/a.ts"),
+            node("function:caller", NodeKind::Function, "caller", "src/a.ts"),
+            node("function:callee", NodeKind::Function, "callee", "src/a.ts"),
+        ];
+        let edges = [
+            edge("file:src/a.ts", "function:caller", EdgeKind::Contains),
+            edge("function:caller", "function:callee", EdgeKind::Calls),
+        ];
+
+        let mut forward = Store::open(&temp_db_path("stable-forward")).expect("open forward store");
+        forward.upsert_nodes(&nodes).expect("insert forward nodes");
+        forward.insert_edges(&edges).expect("insert forward edges");
+
+        let mut reverse = Store::open(&temp_db_path("stable-reverse")).expect("open reverse store");
+        reverse.upsert_nodes(&nodes).expect("insert reverse nodes");
+        reverse
+            .insert_edges(&[edges[1].clone(), edges[0].clone()])
+            .expect("insert reverse edges");
+
+        let forward_row_order = forward
+            .all_edges()
+            .expect("read forward edges")
+            .into_iter()
+            .map(|edge| (edge.source, edge.target))
+            .collect::<Vec<_>>();
+        let reverse_row_order = reverse
+            .all_edges()
+            .expect("read reverse edges")
+            .into_iter()
+            .map(|edge| (edge.source, edge.target))
+            .collect::<Vec<_>>();
+        assert_ne!(
+            forward_row_order, reverse_row_order,
+            "fixture must exercise different SQLite insertion rowids"
+        );
+
+        let forward_json =
+            serde_json::to_vec(&node_link_graph(&forward).expect("export forward")).unwrap();
+        let reverse_json =
+            serde_json::to_vec(&node_link_graph(&reverse).expect("export reverse")).unwrap();
+        assert_eq!(forward_json, reverse_json);
     }
 }

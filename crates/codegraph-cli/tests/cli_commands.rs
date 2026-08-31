@@ -288,6 +288,49 @@ fn export_to_stdout_and_file() {
 }
 
 #[test]
+fn export_is_byte_stable_after_sync_and_force_rebuild() {
+    let dir = TestDir::new("export-sync-force-stable");
+    let project = indexed_project(&dir);
+    let p = project.to_str().unwrap();
+    let app = project.join("src/app.ts");
+    let mut source = std::fs::read_to_string(&app).expect("read app fixture");
+    source.push_str("\n// Force an incremental reindex without changing the extracted graph.\n");
+    std::fs::write(&app, source).expect("edit app fixture");
+
+    let sync = run_in(dir.path(), &["sync", p]);
+    assert!(
+        sync.ok,
+        "sync must succeed: {} {}",
+        sync.stdout, sync.stderr
+    );
+    let incremental = run_in(dir.path(), &["export", "-p", p]);
+    assert!(
+        incremental.ok,
+        "incremental export must succeed: {}",
+        incremental.stderr
+    );
+
+    let rebuild = run_in(dir.path(), &["index", "--force", p]);
+    assert!(
+        rebuild.ok,
+        "index --force must succeed: {} {}",
+        rebuild.stdout, rebuild.stderr
+    );
+    let rebuilt = run_in(dir.path(), &["export", "-p", p]);
+    assert!(
+        rebuilt.ok,
+        "rebuilt export must succeed: {}",
+        rebuilt.stderr
+    );
+
+    assert_eq!(
+        incremental.stdout.as_bytes(),
+        rebuilt.stdout.as_bytes(),
+        "incremental sync and index --force must emit byte-identical graph JSON"
+    );
+}
+
+#[test]
 fn unlock_on_clean_project_reports_nothing_to_do() {
     let dir = TestDir::new("unlock-clean");
     let project = indexed_project(&dir);
