@@ -1822,7 +1822,7 @@ impl CodeGraphEngine {
     /// `findSymbolMatches` (`tools.ts:3220-3265`): exact-name enumeration for a
     /// bare name, falling back to the top fuzzy result.
     fn find_symbol_matches(&self, symbol: &str) -> anyhow::Result<Vec<Node>> {
-        let is_qualified = symbol.contains(['.', '/']) || symbol.contains("::");
+        let is_qualified = symbol.contains(['.', '/', ':']) || symbol.contains("::");
         if !is_qualified {
             let exact = self.store.nodes_by_name(symbol)?;
             if !exact.is_empty() {
@@ -3229,18 +3229,26 @@ fn file_path_matches_hint(file_path: &str, hint: &str) -> bool {
 
 /// `matchesSymbol` (`tools.ts:3175-3210`).
 fn matches_symbol(node: &Node, symbol: &str) -> bool {
+    let mut symbol = symbol;
+    if let Some((without_arity, requested_arity)) = split_erlang_arity(symbol)
+        && let Some((_, node_arity)) = split_erlang_arity(&node.qualified_name)
+    {
+        if requested_arity != node_arity {
+            return false;
+        }
+        symbol = without_arity;
+    }
     if node.name == symbol {
         return true;
     }
     if node.kind == NodeKind::File && strip_ext(&node.name) == symbol {
         return true;
     }
-    if !(symbol.contains(['.', '/']) || symbol.contains("::")) {
+    if !(symbol.contains(['.', '/', ':']) || symbol.contains("::")) {
         return false;
     }
     let parts: Vec<&str> = symbol
-        .split("::")
-        .flat_map(|p| p.split(['.', '/']))
+        .split(['.', '/', ':'])
         .filter(|p| !p.is_empty())
         .collect();
     if parts.len() < 2 {
@@ -3278,12 +3286,25 @@ fn strip_ext(s: &str) -> &str {
 }
 
 fn last_qualifier_part(symbol: &str) -> Option<&str> {
+    let symbol = split_erlang_arity(symbol)
+        .map(|(base, _)| base)
+        .unwrap_or(symbol);
     let parts: Vec<&str> = symbol
-        .split("::")
-        .flat_map(|p| p.split(['.', '/']))
+        .split(['.', '/', ':'])
         .filter(|p| !p.is_empty())
         .collect();
     parts.last().copied()
+}
+
+fn split_erlang_arity(symbol: &str) -> Option<(&str, &str)> {
+    let (base, arity) = symbol.rsplit_once('/')?;
+    if base.is_empty()
+        || !(1..=3).contains(&arity.len())
+        || !arity.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    Some((base, arity))
 }
 
 /// Ports the typed-bus `HANDLER_METHODS` regex (`tools.ts:1816`): the runtime
@@ -5741,6 +5762,25 @@ mod tests {
         m.qualified_name = "widget::render".to_string();
         assert!(matches_symbol(&m, "widget::render"));
         assert!(!matches_symbol(&m, "other::render"));
+
+        let erlang = node_lang(
+            "request_process",
+            "cowboy_stream_h::request_process/3",
+            "src/cowboy_stream_h.erl",
+            1,
+            1,
+            NodeKind::Function,
+            Language::Erlang,
+        );
+        assert!(matches_symbol(&erlang, "cowboy_stream_h:request_process/3"));
+        assert!(matches_symbol(
+            &erlang,
+            "cowboy_stream_h::request_process/3"
+        ));
+        assert!(!matches_symbol(
+            &erlang,
+            "cowboy_stream_h:request_process/2"
+        ));
     }
 
     #[test]
@@ -7721,6 +7761,10 @@ mod tests {
     fn ext_last_qualifier_part_and_glob_escapes() {
         assert_eq!(last_qualifier_part("a::b::c"), Some("c"));
         assert_eq!(last_qualifier_part("plain"), Some("plain"));
+        assert_eq!(
+            last_qualifier_part("cowboy_stream_h:request_process/3"),
+            Some("request_process")
+        );
         assert!(glob_match("a.b?.rs", "a.bx.rs"));
         assert!(!glob_match("a.b.rs", "axb.rs"));
     }

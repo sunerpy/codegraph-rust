@@ -129,6 +129,27 @@ fn rust_db_is_self_equivalent_to_rust_golden() {
 }
 
 #[test]
+fn generated_golden_matches_committed_lua_fixture() {
+    // Guards #1616 Lua function expressions: local assignment functions become
+    // Function nodes without duplicate Variables, table members become Methods
+    // with full qualified names, nested table members retain their namespace,
+    // body calls belong to the synthesized callable, and both dot/colon calls
+    // resolve to the same static table member.
+    let tempdir = TestDir::new("generated-golden-lua");
+    write_golden(&lua_db(), tempdir.path()).unwrap();
+
+    let expected = load_golden(&lua_golden_dir()).unwrap();
+    let actual = load_golden(tempdir.path()).unwrap();
+
+    diff_canonical(&expected, &actual, None).unwrap();
+}
+
+#[test]
+fn lua_db_is_self_equivalent_to_lua_golden() {
+    assert_equivalent(&lua_db(), &lua_golden_dir()).unwrap();
+}
+
+#[test]
 fn generated_golden_matches_committed_go_fixture() {
     // Guards #1500 content-header detection: `files.generated` is byte-pinned at
     // BOTH values — 1 for the Go banner, the Wrangler double-`by` banner, and the
@@ -456,6 +477,14 @@ fn rust_db() -> PathBuf {
 
 fn rust_golden_dir() -> PathBuf {
     workspace_root().join("reference/golden/rust")
+}
+
+fn lua_db() -> PathBuf {
+    workspace_root().join("reference/golden/lua/colby.db")
+}
+
+fn lua_golden_dir() -> PathBuf {
+    workspace_root().join("reference/golden/lua")
 }
 
 fn go_db() -> PathBuf {

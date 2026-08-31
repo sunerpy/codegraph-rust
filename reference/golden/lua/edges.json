@@ -1,0 +1,161 @@
+[
+  {
+    "col": 0,
+    "kind": "calls",
+    "line": 31,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "file:handlers.lua",
+    "target": "function:ff34e2f3ae7c208f111ac2cfd85f600d"
+  },
+  {
+    "col": 0,
+    "kind": "calls",
+    "line": 32,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "instance-method"
+    },
+    "provenance": null,
+    "source": "file:handlers.lua",
+    "target": "method:742ab6c0defa5b8f0772d5562b1f3263"
+  },
+  {
+    "col": 0,
+    "kind": "calls",
+    "line": 33,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "instance-method"
+    },
+    "provenance": null,
+    "source": "file:handlers.lua",
+    "target": "method:742ab6c0defa5b8f0772d5562b1f3263"
+  },
+  {
+    "col": 13,
+    "kind": "calls",
+    "line": 12,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:0bf0129e0980af36b718e68ea60ffa89",
+    "target": "function:5d761336fb13189219904449641a9826"
+  },
+  {
+    "col": 13,
+    "kind": "calls",
+    "line": 15,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:eec721544fdfd4a940c00dce1bb2a378",
+    "target": "function:5d761336fb13189219904449641a9826"
+  },
+  {
+    "col": 9,
+    "kind": "calls",
+    "line": 24,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:742ab6c0defa5b8f0772d5562b1f3263",
+    "target": "function:5d761336fb13189219904449641a9826"
+  },
+  {
+    "col": 9,
+    "kind": "calls",
+    "line": 28,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:d5de1b11670a9a514cb200eb64d003fb",
+    "target": "function:5d761336fb13189219904449641a9826"
+  },
+  {
+    "col": 9,
+    "kind": "calls",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:ff34e2f3ae7c208f111ac2cfd85f600d",
+    "target": "function:5d761336fb13189219904449641a9826"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:handlers.lua",
+    "target": "function:5d761336fb13189219904449641a9826"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:handlers.lua",
+    "target": "function:ff34e2f3ae7c208f111ac2cfd85f600d"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:handlers.lua",
+    "target": "method:0bf0129e0980af36b718e68ea60ffa89"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:handlers.lua",
+    "target": "method:742ab6c0defa5b8f0772d5562b1f3263"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:handlers.lua",
+    "target": "method:d5de1b11670a9a514cb200eb64d003fb"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:handlers.lua",
+    "target": "method:eec721544fdfd4a940c00dce1bb2a378"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:handlers.lua",
+    "target": "variable:4ae3f719c4487b878978b0e5478230ae"
+  }
+]

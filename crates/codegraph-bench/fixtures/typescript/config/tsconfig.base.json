@@ -1,0 +1,9 @@
+{
+  // baseUrl belongs to this config directory, not the extending file.
+  "compilerOptions": {
+    "baseUrl": "../src",
+    "paths": {
+      "@fixture/*": ["*"],
+    },
+  },
+}

@@ -302,9 +302,15 @@ serverInfo:{name:"codegraph",version}, instructions}`；`tools/list` 返回 8 �
 - 基于 `notify` v6 `RecommendedWatcher`（递归 + 测试用 inert seam）。事件循环按
   burst 合并：每事件重置单一去抖截止点（`watcher.ts:529-540`）。
 - 默认去抖 `CODEGRAPH_WATCH_DEBOUNCE_MS`，clamp 到 100ms..60s，回落 2000ms。
-- 过滤逻辑：默认忽略目录 + 根 `.gitignore` 合并（negation 在内建之后应用）。
+- 过滤逻辑：默认忽略目录 + 当前索引根 `config.toml` 的 include/exclude +
+  根 `.gitignore` 合并（negation 在内建之后应用）。当前索引根
+  `config.toml` / `codegraph.json` 与根 `.gitignore` 是控制文件，事件先于普通
+  scope 过滤识别；变更会重载 Config、扩展名映射和 WatchPolicy，原子替换运行时
+  scope、增减 per-directory watch，并触发一次覆盖所有已排队增量的完整 reconcile。
+  TOML 损坏时继续使用最后一次有效 scope；JSON 保持宽容的空 override 语义。
 - 增量同步：对候选变更文件读取并哈希，`files.content_hash` 命中则跳过；否则删除
   旧的 per-file 节点/文件行 → 写入新提取结果 → 持久化后跑 `ReferenceResolver`。
+  每次增量操作都会重新加载当前项目 scope，因此旧事件无法把新排除的文件重新加入。
   `codegraph-extract` 保持只读，watch 仅调用其公共 API。
 
 ---

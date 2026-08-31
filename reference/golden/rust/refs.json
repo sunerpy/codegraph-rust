@@ -28,5 +28,55 @@
     "line": 1,
     "reference_kind": "imports",
     "reference_name": "crate::UnitStruct"
+  },
+  {
+    "candidates": null,
+    "col": 5,
+    "file_path": "impl_ownership.rs",
+    "from_node_id": "struct:37445fd25f0ca6329d4d7075ab077d8c",
+    "language": "rust",
+    "line": 63,
+    "reference_kind": "implements",
+    "reference_name": "From<u32>"
+  },
+  {
+    "candidates": null,
+    "col": 8,
+    "file_path": "self_field.rs",
+    "from_node_id": "method:1664cb1c390283048a9ac640a8797063",
+    "language": "rust",
+    "line": 59,
+    "reference_kind": "calls",
+    "reference_name": "self.items.next"
+  },
+  {
+    "candidates": null,
+    "col": 8,
+    "file_path": "self_field.rs",
+    "from_node_id": "method:1dd02f37a64f7acaf7c8dc29c55017c9",
+    "language": "rust",
+    "line": 77,
+    "reference_kind": "calls",
+    "reference_name": "self.item.run"
+  },
+  {
+    "candidates": null,
+    "col": 8,
+    "file_path": "self_field.rs",
+    "from_node_id": "method:3b296c4a5cc83673fdc59a30ac709fbd",
+    "language": "rust",
+    "line": 49,
+    "reference_kind": "calls",
+    "reference_name": "self.inner.take"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "impl_ownership.rs",
+    "from_node_id": "struct:ecebb1c2db370c42a9704b4fb9ab844b",
+    "language": "rust",
+    "line": 29,
+    "reference_kind": "implements",
+    "reference_name": "Iterator"
   }
 ]

@@ -37,25 +37,20 @@
 //! # The replacement graph cannot come from a reindex
 //!
 //! `serve --mcp --path` runs a one-shot startup catch-up sync on a detached
-//! thread (`spawn_catch_up`), and `--no-watch` does not disable it. If the served
-//! project's SOURCES could produce the replacement graph, that background sync
-//! could satisfy the post-replacement assertions without the replaced bytes ever
-//! being read — and could equally delete the replacement rows again, making the
-//! test flaky in both directions.
+//! thread (`spawn_catch_up`), and `--no-watch` does not disable it. A catch-up
+//! that started only after the parent replaced the database could restore the
+//! original source graph and erase the supplied replacement rows.
 //!
-//! So the two distinguishing source files live under a directory the served
-//! project's own root `.gitignore` excludes:
+//! The test therefore gives the neutral source a unique OFFLINE edit after
+//! `init`, starts the server, and polls search over the same MCP connection until
+//! that marker is visible. Visibility proves the catch-up transaction committed;
+//! because `--no-watch` is active, no later source-driven writer exists. The
+//! served project never contains the replacement source at all, so no reindex can
+//! create its rows.
 //!
-//! - No sync can ever CREATE those rows: `scan_project` never yields the paths.
-//!   The test asserts this with the shipped scanner before the acceptance runs.
-//! - No sync can ever DELETE those rows: the cold sync's removal pass only
-//!   considers a tracked path that is absent from disk, both files stay present,
-//!   and the same ignore policy filters them out of `should_handle_file` anyway.
-//!
-//! What remains scannable is one neutral file that is byte-identical in both
-//! graphs, so the startup catch-up is a proven no-op instead of a race. The ONLY
-//! way request 2 can observe the replacement file is by reading the database
-//! bytes the parent supplied.
+//! The exclusive lease acquired after request 1 remains the handle-release proof.
+//! The ONLY way request 2 can observe the replacement file is by reading the
+//! database bytes the parent supplied.
 //!
 //! # Scope
 //!
@@ -73,19 +68,16 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use codegraph_core::IndexPaths;
-use codegraph_extract::ExtractOptions;
 use codegraph_store::IndexLease;
 use serde_json::{Value, json};
 
 /// Finite deadlock guard for every blocking wait. Never ordering evidence.
 const WAIT: Duration = Duration::from_secs(60);
 
-/// The scannable file both graphs share, byte-identical. Its only job is to keep
-/// the startup catch-up sync a proven no-op instead of a degenerate empty scan.
+/// The scannable file both graphs share. An offline-only marker added to this
+/// file proves startup catch-up committed before the database replacement.
 const NEUTRAL_FILE: &str = "src/pwqneutral.ts";
-/// The gitignored directory holding the two supplied-graph-only sources. Nothing
-/// under it is ever scanned in the SERVED project.
-const SUPPLIED_DIR: &str = "supplied";
+const CATCH_UP_SYMBOL: &str = "pwqcatchupdone";
 /// The symbol that exists ONLY in the original graph.
 const ORIGINAL_SYMBOL: &str = "qxwoolrig";
 /// The repo-relative file that exists ONLY in the original graph.
@@ -145,6 +137,10 @@ fn source_for(symbol: &str) -> String {
 /// The neutral scannable source, byte-identical in every project here.
 fn neutral_source() -> String {
     source_for("pwqneutral")
+}
+
+fn caught_up_neutral_source() -> String {
+    format!("{}{}", neutral_source(), source_for(CATCH_UP_SYMBOL))
 }
 
 /// Run the SHIPPED `codegraph init` over `project`, producing a real v2
@@ -332,47 +328,10 @@ fn tool_text(response: &Value, context: &str) -> String {
         .to_string()
 }
 
-/// Freeze the supplied-graph sources out of every future scan of the SERVED
-/// project, then PROVE it with the shipped scanner.
-///
-/// This is what makes the acceptance deterministic against the startup catch-up
-/// sync: the scanner is the same `scan_project` a sync feeds from, so an empty
-/// result for both supplied paths means no sync in this project can invent the
-/// replacement rows (or the original ones) from disk.
-fn freeze_supplied_sources_out_of_scans(project: &Path) {
-    fs::write(project.join(".gitignore"), format!("{SUPPLIED_DIR}/\n"))
-        .expect("write root .gitignore");
-
-    let scanned = codegraph_extract::engine::scan_project(project, &ExtractOptions::default())
-        .expect("scan the served project with the shipped scanner");
-    assert!(
-        scanned.contains(&NEUTRAL_FILE.to_string()),
-        "the neutral source must stay scannable so startup catch-up is a real no-op: {scanned:?}"
-    );
-    assert!(
-        !scanned.contains(&REPLACEMENT_FILE.to_string()),
-        "no sync may be able to index {REPLACEMENT_FILE}, or request 2 could pass by reindexing \
-         instead of by reading the replaced database: {scanned:?}"
-    );
-    assert!(
-        !scanned.contains(&ORIGINAL_FILE.to_string()),
-        "no sync may be able to re-index {ORIGINAL_FILE} back into the replacement graph: \
-         {scanned:?}"
-    );
-    // Both supplied sources stay PRESENT on disk, so the cold sync's removal
-    // pass (tracked-but-absent) can never delete their rows either.
-    for rel in [ORIGINAL_FILE, REPLACEMENT_FILE] {
-        assert!(
-            project.join(rel).is_file(),
-            "{rel} must remain on disk so no sync can classify it as removed"
-        );
-    }
-}
-
 /// Build the replacement database in a staging project and return its path. The
 /// staging project holds the neutral file plus ONLY the replacement supplied
-/// source and carries NO `.gitignore`, so its graph contains the replacement
-/// file and cannot contain the original one.
+/// source, so its graph contains the replacement file and cannot contain the
+/// original one.
 fn build_replacement_database(staging: &TestDir) -> PathBuf {
     let project = staging.path().join("replacement-build");
     fs::create_dir_all(&project).expect("create staging project");
@@ -443,9 +402,8 @@ fn replace_database(project: &Path, replacement_db: &Path) {
 #[test]
 fn long_lived_v2_mcp_releases_handles_per_request() {
     // GIVEN a really indexed v2 project whose graph contains the original
-    // supplied symbol, with both supplied sources frozen out of every future
-    // scan, and a separately built replacement database that contains ONLY the
-    // replacement supplied symbol.
+    // supplied symbol, plus a separately built replacement database that
+    // contains ONLY the replacement supplied symbol.
     let home = TestDir::new("served");
     let project = home.path().join("project");
     fs::create_dir_all(&project).expect("create served project");
@@ -453,8 +411,9 @@ fn long_lived_v2_mcp_releases_handles_per_request() {
     write_source(&project, ORIGINAL_FILE, &source_for(ORIGINAL_SYMBOL));
     shipped_init(&project);
 
-    write_source(&project, REPLACEMENT_FILE, &source_for(REPLACEMENT_SYMBOL));
-    freeze_supplied_sources_out_of_scans(&project);
+    // Offline edit: seeing this marker through MCP proves startup catch-up has
+    // committed before the parent replaces the database.
+    write_source(&project, NEUTRAL_FILE, &caught_up_neutral_source());
 
     let staging = TestDir::new("staging");
     let replacement_db = build_replacement_database(&staging);
@@ -471,9 +430,28 @@ fn long_lived_v2_mcp_releases_handles_per_request() {
     );
     server.send(&initialized);
 
+    // First wait for the one-shot catch-up to publish the offline marker. Search
+    // visibility, not elapsed time, is the completion proof.
+    let catch_up_deadline = Instant::now() + WAIT;
+    let mut request_id = 2_i64;
+    loop {
+        server.send(&search_frame(request_id, &project, CATCH_UP_SYMBOL));
+        let text = tool_text(&server.await_response(request_id), "catch-up barrier");
+        request_id += 1;
+        if text.contains(NEUTRAL_FILE) {
+            break;
+        }
+        assert!(
+            Instant::now() < catch_up_deadline,
+            "startup catch-up did not publish {CATCH_UP_SYMBOL} before the finite deadline: {text}"
+        );
+        std::thread::yield_now();
+    }
+
     // WHEN request 1 completes (its framed response IS the READY barrier) ...
-    server.send(&search_frame(2, &project, ORIGINAL_SYMBOL));
-    let first = tool_text(&server.await_response(2), "request 1");
+    server.send(&search_frame(request_id, &project, ORIGINAL_SYMBOL));
+    let first = tool_text(&server.await_response(request_id), "request 1");
+    request_id += 1;
     assert!(
         first.contains(ORIGINAL_FILE),
         "request 1 must observe the original graph: {first}"
@@ -486,8 +464,9 @@ fn long_lived_v2_mcp_releases_handles_per_request() {
     replace_database(&project, &replacement_db);
 
     // THEN the CONTINUE frame (request 2) serves ONLY the replacement graph.
-    server.send(&search_frame(3, &project, REPLACEMENT_SYMBOL));
-    let second = tool_text(&server.await_response(3), "request 2");
+    server.send(&search_frame(request_id, &project, REPLACEMENT_SYMBOL));
+    let second = tool_text(&server.await_response(request_id), "request 2");
+    request_id += 1;
     assert!(
         second.contains("## Search Results ("),
         "request 2 must render real search results, not an echo: {second}"
@@ -504,8 +483,8 @@ fn long_lived_v2_mcp_releases_handles_per_request() {
     // And the original symbol is GONE from the same long-lived session: the
     // absence is observed through a lookup that resolves nothing, not through a
     // response that merely omits it.
-    server.send(&search_frame(4, &project, ORIGINAL_SYMBOL));
-    let third = tool_text(&server.await_response(4), "request 3");
+    server.send(&search_frame(request_id, &project, ORIGINAL_SYMBOL));
+    let third = tool_text(&server.await_response(request_id), "request 3");
     assert!(
         third.contains("No results found"),
         "the original symbol must be absent from the replacement graph: {third}"

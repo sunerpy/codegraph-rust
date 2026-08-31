@@ -11,6 +11,16 @@
   },
   {
     "candidates": null,
+    "col": 26,
+    "file_path": "aliases.py",
+    "from_node_id": "file:aliases.py",
+    "language": "python",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "mod_alias"
+  },
+  {
+    "candidates": null,
     "col": 4,
     "file_path": "same_file.py",
     "from_node_id": "function:8ab91cb55b890abcf7c58c5a8c532661",
@@ -28,5 +38,15 @@
     "line": 59,
     "reference_kind": "calls",
     "reference_name": "register"
+  },
+  {
+    "candidates": null,
+    "col": 44,
+    "file_path": "aliases.py",
+    "from_node_id": "file:aliases.py",
+    "language": "python",
+    "line": 3,
+    "reference_kind": "imports",
+    "reference_name": "ImportedAlias"
   }
 ]

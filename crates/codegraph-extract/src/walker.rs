@@ -13,6 +13,7 @@ use regex::Regex;
 use std::path::Path;
 use tree_sitter::Node as SyntaxNode;
 
+use crate::lang::rust_impl_type_name;
 use crate::spec::{LanguageSpec, has_type};
 
 pub fn node_text(node: SyntaxNode<'_>, source: &str) -> String {
@@ -211,10 +212,12 @@ pub struct TreeSitterWalker<'a, 'tree> {
     /// symbols' `qualified_name`. Prefix-only (no namespace node) to avoid the
     /// #1093 crowd-out; empty outside C++.
     namespace_prefix: Vec<String>,
-    /// Erlang clause-merge state: the previously-emitted function's name and
-    /// node id. A `fun_decl` whose clause repeats that name is a continuation
-    /// clause and attaches to the existing node. Empty outside Erlang.
+    /// Erlang clause-merge state: the previously-emitted function's name,
+    /// arity, and node id. A `fun_decl` whose clause repeats the same
+    /// `(name, arity)` is a continuation clause and attaches to the existing
+    /// node. Empty outside Erlang.
     erlang_last_fn_name: Option<String>,
+    erlang_last_fn_arity: Option<usize>,
     erlang_last_fn_id: Option<String>,
     /// CFML tag-dialect state: the byte offset up to which a
     /// `cf_component_open_tag`'s following siblings (the implicit-end-tag
@@ -248,6 +251,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             fn_ref_candidates: Vec::new(),
             namespace_prefix: Vec::new(),
             erlang_last_fn_name: None,
+            erlang_last_fn_arity: None,
             erlang_last_fn_id: None,
             cfml_consumed_until: 0,
             walk_depth: 0,
@@ -476,13 +480,13 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     /// Form dispatch: `fun_decl` → merged Function (clause-merge dedup);
     /// `record_decl` → Struct + Field children; `type_alias`/`opaque` →
     /// TypeAlias; `pp_define` → Constant. Call/reference edges: a `call` →
-    /// `Calls` (remote qualified `mod::f`); `internal_fun`/`external_fun` and the
-    /// four record-expression forms → `References` (function VALUES / record
-    /// USAGES, not calls). `spec`/`callback`/`type_alias`/`opaque`/`record_decl`
-    /// are consumed WITHOUT descending into their type-position `call` children,
-    /// so `-spec f(integer()) -> integer().` mints no bogus `integer` call ref.
-    /// The `-behaviour`, gen_server, spawn/apply MFA, and `.app` resource-tuple
-    /// bridges are DEFERRED.
+    /// `Calls` (remote qualified `mod::f/arity`); `internal_fun`/`external_fun`
+    /// and the four record-expression forms → `References` (function VALUES /
+    /// record USAGES, not calls). `spec`/`callback`/`type_alias`/`opaque`/
+    /// `record_decl` are consumed WITHOUT descending into their type-position
+    /// `call` children, so `-spec f(integer()) -> integer().` mints no bogus
+    /// `integer` call ref. Static gen_server and spawn/apply MFA dispatch is
+    /// lifted here; behaviour and resource-tuple bridges remain deferred.
     /// CFML extraction (upstream `CfmlExtractor`, `cfml-extractor.ts`, #1153 —
     /// scope-B extraction slice). A first-token sniff (`is_bare_script_cfml`)
     /// selects the dialect. Bare-script: the cfscript type-set config drives the
@@ -740,11 +744,11 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     }
 
     /// `fun_decl` → merged Function with the clause-merge dedup rule: the grammar
-    /// emits one `fun_decl` per clause, so a `fun_decl` whose clause name equals
-    /// the previously-emitted function's name is a CONTINUATION — no new symbol;
-    /// its clause bodies' refs attribute to the existing function id. A clause
-    /// with no static name (macro-templated) is skipped. Ports `handleFunDecl`
-    /// (erlang.ts:99-143).
+    /// emits one `fun_decl` per clause, so a `fun_decl` whose clause name and
+    /// arity equal the previously-emitted function is a CONTINUATION — no new
+    /// symbol; its clause bodies' refs attribute to the existing function id.
+    /// A same-name different-arity declaration is a distinct function. A clause
+    /// with no static name (macro-templated) is skipped.
     fn visit_erlang_fun_decl(&mut self, node: SyntaxNode<'tree>) {
         let clauses = crate::lang::erlang_function_clauses(node);
         let Some(first) = clauses.first().copied() else {
@@ -753,10 +757,13 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         let Some(name) = crate::lang::erlang_clause_name(first, self.source) else {
             return;
         };
+        let arity = crate::lang::erlang_node_arity(first);
 
         // Continuation clause: extend the existing node's span and attribute
         // this clause's refs to it.
-        if self.erlang_last_fn_name.as_deref() == Some(name.as_str()) {
+        if self.erlang_last_fn_name.as_deref() == Some(name.as_str())
+            && self.erlang_last_fn_arity == Some(arity)
+        {
             if let Some(existing_id) = self.erlang_last_fn_id.clone() {
                 let end_line = node.end_position().row as i64 + 1;
                 if let Some(existing) = self.nodes.iter_mut().find(|n| n.id == existing_id) {
@@ -773,7 +780,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             }
         }
 
-        let spec = crate::lang::erlang_preceding_spec(node, &name, self.source);
+        let spec = crate::lang::erlang_preceding_spec(node, &name, arity, self.source);
         let signature = match spec {
             Some(spec_node) => Some(
                 crate::lang::erlang_collapse_ws(&node_text(spec_node, self.source))
@@ -785,7 +792,8 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         };
         let docstring = self.preceding_docstring(spec.unwrap_or(node));
         let exports = crate::lang::erlang_module_exports(self.root, self.source);
-        let is_exported = exports.contains(&name);
+        let is_exported = exports.contains(&name, arity);
+        let qualified_name = format!("{}/{}", self.build_qualified_name(&name), arity);
 
         let Some(func) = self.create_node(
             NodeKind::Function,
@@ -795,6 +803,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 docstring,
                 signature,
                 is_exported,
+                qualified_name: Some(qualified_name),
                 ..NodeExtra::default()
             },
         ) else {
@@ -808,6 +817,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
         self.node_stack.pop();
         self.erlang_last_fn_name = Some(name);
+        self.erlang_last_fn_arity = Some(arity);
         self.erlang_last_fn_id = Some(func.id);
     }
 
@@ -851,16 +861,134 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         self.node_stack.pop();
     }
 
-    /// A `call` node → a `Calls` edge to the (possibly remote-qualified) callee.
-    /// A dynamic (var/macro-module) target emits nothing. Ports the `call` arm
-    /// of the erlang `extractCall` branch (tree-sitter.ts:3684-3690), MINUS the
-    /// DEFERRED gen_server / MFA-argument lifts.
+    /// A `call` node → a `Calls` edge to the (possibly remote-qualified,
+    /// arity-bearing) callee. Static gen_server targets and static
+    /// `(Module, Function, Args)` pairs are lifted to their real callback.
+    /// Dynamic module/function targets emit nothing.
     fn visit_erlang_call(&mut self, node: SyntaxNode<'tree>) {
-        if let Some(name) = crate::lang::erlang_call_ref_name(node, self.source) {
-            if let Some(from) = self.node_stack.last().cloned() {
-                self.push_ref(&from, &name, EdgeKind::Calls, node);
-            }
+        let Some(name) = crate::lang::erlang_call_ref_name(node, self.source) else {
+            return;
+        };
+        let Some(from) = self.node_stack.last().cloned() else {
+            return;
+        };
+        self.push_ref(&from, &name, EdgeKind::Calls, node);
+
+        let base = strip_erlang_arity(&name);
+        let args = child_by_field(node, "args");
+
+        if matches!(
+            base,
+            "gen_server::call" | "gen_server::cast" | "gen_server::send_request"
+        ) && let Some(target) = args.and_then(|args| args.named_child(0))
+            && let Some(module) = self.resolve_erlang_gen_server_target(target)
+        {
+            let handler = if base == "gen_server::cast" {
+                "handle_cast/2"
+            } else {
+                "handle_call/3"
+            };
+            self.push_ref(
+                &from,
+                &format!("{module}::{handler}"),
+                EdgeKind::Calls,
+                node,
+            );
         }
+
+        if !is_erlang_mfa_call(base) {
+            return;
+        }
+        let Some(args) = args else {
+            return;
+        };
+        let expressions: Vec<SyntaxNode<'tree>> = args.named_children(&mut args.walk()).collect();
+        for pair_start in 0..expressions.len().saturating_sub(1) {
+            let module = expressions[pair_start];
+            let function = expressions[pair_start + 1];
+            if function.kind() != "atom" {
+                continue;
+            }
+            let is_local_module = module.kind() == "macro_call_expr"
+                && child_by_field(module, "name")
+                    .is_some_and(|name| node_text(name, self.source) == "MODULE");
+            if module.kind() != "atom" && !is_local_module {
+                continue;
+            }
+            let function_name = crate::lang::erlang_atom_text(function, self.source);
+            let mut target = if is_local_module {
+                function_name
+            } else {
+                format!(
+                    "{}::{function_name}",
+                    crate::lang::erlang_atom_text(module, self.source)
+                )
+            };
+            if expressions
+                .get(pair_start + 2)
+                .is_some_and(|list| list.kind() == "list")
+            {
+                let arity = expressions[pair_start + 2].named_child_count();
+                target.push('/');
+                target.push_str(&arity.to_string());
+            }
+            self.push_ref(&from, &target, EdgeKind::Calls, function);
+            break;
+        }
+    }
+
+    fn resolve_erlang_gen_server_target(&self, target: SyntaxNode<'tree>) -> Option<String> {
+        if target.kind() == "atom" {
+            let name = crate::lang::erlang_atom_text(target, self.source);
+            return (!name.is_empty()).then_some(name);
+        }
+        if target.kind() != "macro_call_expr" {
+            return None;
+        }
+        let macro_name = child_by_field(target, "name")
+            .map(|name| node_text(name, self.source))
+            .filter(|name| !name.is_empty())?;
+        let own_module = || {
+            self.nodes
+                .iter()
+                .find(|node| {
+                    node.kind == NodeKind::Namespace
+                        && node.language == Language::Erlang
+                        && node.file_path == self.file_path
+                })
+                .map(|node| node.name.clone())
+        };
+        if macro_name == "MODULE" {
+            return own_module();
+        }
+
+        for form in self.root.named_children(&mut self.root.walk()) {
+            if form.kind() != "pp_define" {
+                continue;
+            }
+            let Some(lhs) = child_by_field(form, "lhs") else {
+                continue;
+            };
+            let Some(name) = child_by_field(lhs, "name") else {
+                continue;
+            };
+            if node_text(name, self.source) != macro_name {
+                continue;
+            }
+            let replacement = child_by_field(form, "replacement")?;
+            if replacement.kind() == "atom" {
+                let name = crate::lang::erlang_atom_text(replacement, self.source);
+                return (!name.is_empty()).then_some(name);
+            }
+            if replacement.kind() == "macro_call_expr"
+                && child_by_field(replacement, "name")
+                    .is_some_and(|name| node_text(name, self.source) == "MODULE")
+            {
+                return own_module();
+            }
+            return None;
+        }
+        None
     }
 
     /// Terraform/HCL extraction (upstream `terraformExtractor.visitNode`,
@@ -1923,7 +2051,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 return true;
             }
         }
-        if node.kind() == "variable_declaration" {
+        if matches!(node.kind(), "variable_declaration" | "assignment_statement") {
             for call in descendants_of_kind(node, "function_call") {
                 self.emit_lua_require(call);
             }
@@ -2671,7 +2799,11 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                     var_node.id
                 });
             if let Some(value) = value_node {
-                if value.kind() != "object" && value.kind() != "object_expression" {
+                if matches!(value.kind(), "object" | "object_expression") {
+                    if let Some(owner_id) = declared_id.as_deref() {
+                        self.extract_js_object_literal_members(value, owner_id);
+                    }
+                } else {
                     match declared_id {
                         Some(id) => {
                             self.node_stack.push(id);
@@ -2683,6 +2815,48 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 }
             }
         }
+    }
+
+    /// Emit callable members directly declared in one JS-family object literal.
+    ///
+    /// The holder constant/variable remains the namespace anchor; each direct
+    /// method or function-valued property becomes a Function node whose source
+    /// range is inside that holder. Nested objects are deliberately not recursed
+    /// into, which lets resolution distinguish `api.run()` from
+    /// `api.nested.run()` by direct range containment.
+    fn extract_js_object_literal_members(&mut self, object: SyntaxNode<'tree>, owner_id: &str) {
+        self.node_stack.push(owner_id.to_string());
+        for member in object.named_children(&mut object.walk()) {
+            if member.kind() == "method_definition" {
+                let Some(name_node) = child_by_field(member, "name") else {
+                    continue;
+                };
+                let Some(name) = js_object_member_name(name_node, self.source) else {
+                    continue;
+                };
+                self.extract_function(member, Some(name));
+                continue;
+            }
+            if member.kind() != "pair" {
+                continue;
+            }
+            let Some(value) = child_by_field(member, "value") else {
+                continue;
+            };
+            if !matches!(value.kind(), "arrow_function" | "function_expression") {
+                continue;
+            }
+            let Some(key) =
+                child_by_field(member, "key").or_else(|| child_by_field(member, "name"))
+            else {
+                continue;
+            };
+            let Some(name) = js_object_member_name(key, self.source) else {
+                continue;
+            };
+            self.extract_function(value, Some(name));
+        }
+        self.node_stack.pop();
     }
 
     fn extract_python_assignment(&mut self, node: SyntaxNode<'tree>) {
@@ -2738,32 +2912,169 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     }
 
     fn extract_lua_variable(&mut self, node: SyntaxNode<'tree>) {
-        let is_local = node_text(node, self.source)
-            .trim_start()
-            .starts_with("local");
-        let _ = is_local;
-        let kind = NodeKind::Variable;
-        for name_node in descendants_of_kind(node, "identifier") {
-            let Some(parent) = name_node.parent() else {
+        let assignment = if node.kind() == "variable_declaration" {
+            node.named_children(&mut node.walk())
+                .find(|child| child.kind() == "assignment_statement")
+                .unwrap_or(node)
+        } else {
+            node
+        };
+        let variable_list = assignment
+            .named_children(&mut assignment.walk())
+            .find(|child| child.kind() == "variable_list");
+        let expression_list = assignment
+            .named_children(&mut assignment.walk())
+            .find(|child| child.kind() == "expression_list");
+        let targets: Vec<_> = variable_list
+            .map(|list| list.named_children(&mut list.walk()).collect())
+            .unwrap_or_default();
+        let values: Vec<_> = expression_list
+            .map(|list| list.named_children(&mut list.walk()).collect())
+            .unwrap_or_default();
+        let docstring = self.preceding_docstring(node);
+
+        for (index, target_node) in targets.into_iter().enumerate() {
+            let Some((name, receiver, full_name)) = self.lua_assignment_target(target_node) else {
                 continue;
             };
-            if !matches!(parent.kind(), "variable_list" | "variable_declarator") {
+            let value = values.get(index).copied();
+            if let Some(value) = value {
+                if value.kind() == "function_definition" {
+                    self.extract_lua_function_value(value, name, receiver, docstring.clone());
+                    continue;
+                }
+                if value.kind() == "table_constructor" {
+                    self.extract_lua_table_functions(value, full_name);
+                }
+            }
+
+            // Member assignments update a table rather than declaring a
+            // standalone variable. Function-valued members were handled above.
+            if receiver.is_some() || node.kind() == "assignment_statement" || name == "require" {
                 continue;
             }
-            let name = node_text(name_node, self.source);
-            if name == "require" {
-                continue;
-            }
+
+            let signature = value.map(|value| {
+                let init = node_text(value, self.source)
+                    .chars()
+                    .take(100)
+                    .collect::<String>();
+                format!("= {}{}", init, if init.len() >= 100 { "..." } else { "" })
+            });
             self.create_node(
-                kind,
+                NodeKind::Variable,
                 &name,
-                name_node,
+                target_node,
                 NodeExtra {
+                    docstring: docstring.clone(),
+                    signature,
                     is_exported: false,
                     ..NodeExtra::default()
                 },
             );
-            break;
+        }
+    }
+
+    fn lua_assignment_target(
+        &self,
+        node: SyntaxNode<'tree>,
+    ) -> Option<(String, Option<String>, String)> {
+        if node.kind() == "identifier" {
+            let name = node_text(node, self.source).trim().to_string();
+            return (!name.is_empty()).then(|| (name.clone(), None, name));
+        }
+        if !matches!(
+            node.kind(),
+            "dot_index_expression" | "method_index_expression" | "bracket_index_expression"
+        ) {
+            return None;
+        }
+        let table = child_by_field(node, "table")?;
+        let field = child_by_field(node, "field").or_else(|| child_by_field(node, "method"))?;
+        let receiver = node_text(table, self.source).trim().to_string();
+        let name = self.lua_static_field_name(field, node.kind() == "bracket_index_expression");
+        if receiver.is_empty() || name.is_empty() {
+            return None;
+        }
+        let full_name = format!("{receiver}.{name}");
+        Some((name, Some(receiver), full_name))
+    }
+
+    fn lua_static_field_name(&self, node: SyntaxNode<'tree>, bracketed: bool) -> String {
+        if node.kind() == "identifier" {
+            return if bracketed {
+                String::new()
+            } else {
+                node_text(node, self.source).trim().to_string()
+            };
+        }
+        if node.kind() == "string" {
+            if let Some(content) = node
+                .named_children(&mut node.walk())
+                .find(|child| child.kind() == "string_content")
+            {
+                return node_text(content, self.source).trim().to_string();
+            }
+        }
+        String::new()
+    }
+
+    fn extract_lua_function_value(
+        &mut self,
+        node: SyntaxNode<'tree>,
+        name: String,
+        receiver: Option<String>,
+        docstring: Option<String>,
+    ) {
+        let (kind, qualified_name) = match receiver {
+            Some(receiver) => (
+                NodeKind::Method,
+                Some(self.compose_receiver_qualified_name(&receiver, &name)),
+            ),
+            None => (NodeKind::Function, None),
+        };
+        let callable = self.create_node(
+            kind,
+            &name,
+            node,
+            NodeExtra {
+                docstring,
+                signature: self.spec.get_signature(node, self.source),
+                qualified_name,
+                is_exported: false,
+                ..NodeExtra::default()
+            },
+        );
+        let Some(callable) = callable else { return };
+        self.node_stack.push(callable.id);
+        if let Some(body) = child_by_field(node, self.spec.body_field()) {
+            self.visit_function_body(body);
+        }
+        self.node_stack.pop();
+    }
+
+    fn extract_lua_table_functions(&mut self, table: SyntaxNode<'tree>, receiver: String) {
+        let fields: Vec<_> = table.named_children(&mut table.walk()).collect();
+        for field in fields {
+            if field.kind() != "field" {
+                continue;
+            }
+            let Some(name_node) = child_by_field(field, "name") else {
+                continue;
+            };
+            let Some(value) = child_by_field(field, "value") else {
+                continue;
+            };
+            let bracketed = node_text(field, self.source).trim_start().starts_with('[');
+            let name = self.lua_static_field_name(name_node, bracketed);
+            if name.is_empty() {
+                continue;
+            }
+            if value.kind() == "function_definition" {
+                self.extract_lua_function_value(value, name, Some(receiver.clone()), None);
+            } else if value.kind() == "table_constructor" {
+                self.extract_lua_table_functions(value, format!("{receiver}.{name}"));
+            }
         }
     }
 
@@ -3214,6 +3525,28 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                                 format!("{inner}().{method_name}")
                             } else {
                                 method_name
+                            };
+                        } else if self.spec.language() == Language::Rust
+                            && receiver.kind() == "field_expression"
+                        {
+                            // Preserve exactly one Rust owner-field hop so the
+                            // resolver can recover the field's declared type:
+                            // `self.inner.run()` -> `self.inner.run`. Deeper
+                            // chains and non-self field receivers stay bare.
+                            let value = child_by_field(receiver, "value");
+                            let field = child_by_field(receiver, "field");
+                            callee_name = match (value, field) {
+                                (Some(value), Some(field))
+                                    if value.kind() == "self"
+                                        && field.kind() == "field_identifier" =>
+                                {
+                                    format!(
+                                        "self.{}.{}",
+                                        node_text(field, self.source),
+                                        method_name
+                                    )
+                                }
+                                _ => method_name,
                             };
                         } else if is_member_shaped_callee(receiver) {
                             // #1496 — a receiver that is itself member-shaped
@@ -3915,6 +4248,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 || matches!(
                     node_type,
                     "arrow_function"
+                        | "function_definition"
                         | "function_expression"
                         | "lambda_literal"
                         | "lambda_expression"
@@ -4096,25 +4430,25 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     }
 
     fn extract_rust_impl_item(&mut self, node: SyntaxNode<'tree>) {
-        let mut type_nodes = node
-            .named_children(&mut node.walk())
-            .filter(|child| child.kind() == "type_identifier")
-            .collect::<Vec<_>>();
-        if type_nodes.len() < 2 {
-            return;
-        }
-        let Some(target) = type_nodes.pop() else {
+        let Some(trait_node) = child_by_field(node, "trait") else {
             return;
         };
-        let Some(trait_node) = type_nodes.first().copied() else {
+        let Some(target_name) = rust_impl_type_name(child_by_field(node, "type"), self.source)
+        else {
             return;
         };
-        let target_name = node_text(target, self.source);
         let trait_name = node_text(trait_node, self.source);
         if let Some(owner_id) = self
             .nodes
             .iter()
-            .find(|n| n.file_path == self.file_path && n.name == target_name)
+            .find(|n| {
+                n.file_path == self.file_path
+                    && n.name == target_name
+                    && matches!(
+                        n.kind,
+                        NodeKind::Struct | NodeKind::Union | NodeKind::Enum | NodeKind::Class
+                    )
+            })
             .map(|n| n.id.clone())
         {
             self.push_ref(&owner_id, &trait_name, EdgeKind::Implements, trait_node);
@@ -4147,6 +4481,48 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     }
 }
 
+fn strip_erlang_arity(name: &str) -> &str {
+    let Some((base, tail)) = name.rsplit_once('/') else {
+        return name;
+    };
+    if !base.is_empty()
+        && (1..=3).contains(&tail.len())
+        && tail.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        base
+    } else {
+        name
+    }
+}
+
+fn is_erlang_mfa_call(name: &str) -> bool {
+    matches!(
+        name,
+        "spawn"
+            | "spawn_link"
+            | "spawn_monitor"
+            | "spawn_opt"
+            | "apply"
+            | "erlang::spawn"
+            | "erlang::spawn_link"
+            | "erlang::spawn_monitor"
+            | "erlang::spawn_opt"
+            | "erlang::apply"
+            | "proc_lib::spawn"
+            | "proc_lib::spawn_link"
+            | "proc_lib::spawn_opt"
+            | "proc_lib::start"
+            | "proc_lib::start_link"
+            | "timer::apply_after"
+            | "timer::apply_interval"
+            | "rpc::call"
+            | "rpc::cast"
+            | "rpc::async_call"
+            | "erpc::call"
+            | "erpc::cast"
+    )
+}
+
 #[derive(Default)]
 struct NodeExtra {
     docstring: Option<String>,
@@ -4160,6 +4536,24 @@ struct NodeExtra {
     type_parameters: Vec<String>,
     return_type: Option<String>,
     qualified_name: Option<String>,
+}
+
+fn js_object_member_name(node: SyntaxNode<'_>, source: &str) -> Option<String> {
+    let raw = match node.kind() {
+        "identifier" | "property_identifier" | "shorthand_property_identifier" => {
+            node_text(node, source)
+        }
+        "string" => node_text(node, source)
+            .trim_matches(['\'', '"'])
+            .to_string(),
+        _ => return None,
+    };
+    let name = raw.trim();
+    (!name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphanumeric()))
+    .then(|| name.to_string())
 }
 
 /// The call's callee name when it is a bare identifier or `pkg::fn` (yields
@@ -4912,6 +5306,74 @@ return mod
         assert!(has_node(&nodes, NodeKind::Import, "shared.util"));
     }
 
+    #[test]
+    fn lua_function_expression_bindings_are_callable_nodes() {
+        let src = r#"
+local function helper() return 1 end
+local localFn = function() return helper() end
+local M = {
+  callbacks = {
+    onStart = function() return helper() end,
+    ["onStop"] = function() return helper() end,
+    [DYNAMIC] = function() return helper() end,
+  },
+}
+M.assignedFn = function() return helper() end
+M["bracketFn"] = function() return helper() end
+localFn()
+M.assignedFn()
+M:assignedFn()
+"#;
+        let (nodes, refs) = run("handlers.lua", src, Language::Lua);
+
+        let local_fn = node(&nodes, NodeKind::Function, "localFn");
+        let assigned = nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::Method && node.qualified_name == "M::assignedFn")
+            .expect("M::assignedFn");
+        let on_start = nodes
+            .iter()
+            .find(|node| {
+                node.kind == NodeKind::Method && node.qualified_name == "M.callbacks::onStart"
+            })
+            .expect("M.callbacks::onStart");
+        let on_stop = nodes
+            .iter()
+            .find(|node| {
+                node.kind == NodeKind::Method && node.qualified_name == "M.callbacks::onStop"
+            })
+            .expect("M.callbacks::onStop");
+        let bracket = nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::Method && node.qualified_name == "M::bracketFn")
+            .expect("M::bracketFn");
+
+        assert!(!has_node(&nodes, NodeKind::Variable, "localFn"));
+        assert!(!nodes.iter().any(|node| node.name == "DYNAMIC"));
+        for callable in [local_fn, assigned, on_start, on_stop, bracket] {
+            assert!(
+                refs.iter().any(|reference| {
+                    reference.from_node_id == callable.id
+                        && reference.reference_kind == EdgeKind::Calls
+                        && reference.reference_name == "helper"
+                }),
+                "helper() should belong to {}",
+                callable.qualified_name
+            );
+        }
+        assert!(has_ref(&refs, EdgeKind::Calls, "localFn"));
+        assert!(has_ref(&refs, EdgeKind::Calls, "M.assignedFn"));
+    }
+
+    #[test]
+    fn luau_local_function_expression_is_not_a_variable() {
+        let src = "local helper = function(): number return 1 end\nhelper()\n";
+        let (nodes, refs) = run("handlers.luau", src, Language::Luau);
+        assert!(has_node(&nodes, NodeKind::Function, "helper"));
+        assert!(!has_node(&nodes, NodeKind::Variable, "helper"));
+        assert!(has_ref(&refs, EdgeKind::Calls, "helper"));
+    }
+
     // ---- Objective-C class_implementation ----
 
     #[test]
@@ -5166,6 +5628,142 @@ impl Draw for Button {
         assert!(has_ref(&refs, EdgeKind::Implements, "Draw"));
     }
 
+    #[test]
+    fn rust_impl_methods_are_owned_by_the_implementing_type() {
+        let src = r#"
+pub trait Source { fn read(&mut self) -> usize; }
+pub struct FileSource { pub n: usize }
+impl Source for FileSource { fn read(&mut self) -> usize { self.n } }
+pub struct BufSource<T> { pub inner: T }
+impl<T> Source for BufSource<T> { fn read(&mut self) -> usize { 0 } }
+pub struct Parents<'a> { cur: &'a u32 }
+impl<'a> Iterator for Parents<'a> {
+    type Item = u32;
+    fn next(&mut self) -> Option<u32> { None }
+}
+pub struct Wrapper { pub n: usize }
+impl Source for &Wrapper { fn read(&mut self) -> usize { 1 } }
+pub mod m { pub struct Scoped { pub n: usize } }
+impl Source for m::Scoped { fn read(&mut self) -> usize { 2 } }
+pub struct Own { pub n: usize }
+impl From<u32> for Own { fn from(n: u32) -> Self { Own { n: n as usize } } }
+"#;
+        let result = extract_source("src.rs", src, Some(Language::Rust));
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let mut method_qns = result
+            .nodes
+            .iter()
+            .filter(|node| node.kind == NodeKind::Method)
+            .map(|node| node.qualified_name.as_str())
+            .collect::<Vec<_>>();
+        method_qns.sort_unstable();
+        assert_eq!(
+            method_qns,
+            [
+                "BufSource::read",
+                "FileSource::read",
+                "Own::from",
+                "Parents::next",
+                "Scoped::read",
+                "Source::read",
+                "Wrapper::read",
+            ]
+        );
+        assert_eq!(
+            result
+                .nodes
+                .iter()
+                .filter(|node| node.qualified_name == "Source::read")
+                .count(),
+            1,
+            "only the trait declaration may keep Source::read"
+        );
+
+        for (owner, trait_name) in [
+            ("FileSource", "Source"),
+            ("BufSource", "Source"),
+            ("Parents", "Iterator"),
+            ("Wrapper", "Source"),
+            ("Scoped", "Source"),
+            ("Own", "From<u32>"),
+        ] {
+            let owner_id = result
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.name == owner
+                        && matches!(
+                            node.kind,
+                            NodeKind::Struct | NodeKind::Union | NodeKind::Enum | NodeKind::Class
+                        )
+                })
+                .unwrap_or_else(|| panic!("missing owner {owner}"))
+                .id
+                .as_str();
+            assert!(
+                result.unresolved_references.iter().any(|reference| {
+                    reference.from_node_id == owner_id
+                        && reference.reference_kind == EdgeKind::Implements
+                        && reference.reference_name == trait_name
+                }),
+                "missing {owner} implements {trait_name}: {:#?}",
+                result.unresolved_references
+            );
+        }
+
+        let buf = result
+            .nodes
+            .iter()
+            .find(|node| node.name == "BufSource" && node.kind == NodeKind::Struct)
+            .expect("BufSource");
+        let read = result
+            .nodes
+            .iter()
+            .find(|node| node.qualified_name == "BufSource::read")
+            .expect("BufSource::read");
+        assert!(result.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::Contains && edge.source == buf.id && edge.target == read.id
+        }));
+    }
+
+    #[test]
+    fn rust_impl_without_a_single_concrete_type_stays_unowned() {
+        let src = r#"
+pub trait Base { fn id(&self) -> u32; }
+impl Base for (u32, u32) { fn id(&self) -> u32 { 0 } }
+impl Base for dyn Base { fn id(&self) -> u32 { 1 } }
+impl Base for *const u8 { fn id(&self) -> u32 { 2 } }
+impl Base for u32 { fn id(&self) -> u32 { 3 } }
+"#;
+        let result = extract_source("src.rs", src, Some(Language::Rust));
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let ids = result
+            .nodes
+            .iter()
+            .filter(|node| node.name == "id")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids.iter()
+                .filter(|node| node.kind == NodeKind::Function)
+                .count(),
+            4
+        );
+        assert_eq!(
+            ids.iter()
+                .filter(|node| node.qualified_name == "Base::id")
+                .count(),
+            1
+        );
+        assert!(
+            result
+                .unresolved_references
+                .iter()
+                .all(|reference| reference.reference_kind != EdgeKind::Implements)
+        );
+    }
+
     // ---- helper unit checks ----
 
     #[test]
@@ -5355,6 +5953,44 @@ export const greet = (name: string) => name;
         let (nodes, _) = run("c.ts", src, Language::TypeScript);
         assert!(has_node(&nodes, NodeKind::Constant, "PI"));
         assert!(has_node(&nodes, NodeKind::Function, "greet"));
+    }
+
+    #[test]
+    fn typescript_object_literal_emits_only_direct_callable_members() {
+        let src = r#"
+function helper() {}
+export const api = {
+    run() { helper(); },
+    stop: () => helper(),
+    nested: {
+        hidden() { helper(); },
+    },
+};
+"#;
+        let (nodes, refs) = run("api.ts", src, Language::TypeScript);
+        let api = node(&nodes, NodeKind::Constant, "api");
+        let run = node(&nodes, NodeKind::Function, "run");
+        let stop = node(&nodes, NodeKind::Function, "stop");
+        assert!(!has_node(&nodes, NodeKind::Function, "hidden"));
+        for member in [run, stop] {
+            assert!(
+                refs.iter().any(|reference| {
+                    reference.from_node_id == member.id
+                        && reference.reference_kind == EdgeKind::Calls
+                        && reference.reference_name == "helper"
+                }),
+                "helper call must belong to {}",
+                member.name
+            );
+        }
+        assert!(
+            nodes
+                .iter()
+                .filter(|candidate| candidate.name == "run" || candidate.name == "stop")
+                .all(|candidate| {
+                    candidate.start_line >= api.start_line && candidate.end_line <= api.end_line
+                })
+        );
     }
 
     #[test]
@@ -7325,6 +7961,56 @@ g() ->\n\
             1,
             "two clauses of f/1 merge to one Function: {fs:?}"
         );
+        assert_eq!(fs[0].qualified_name, "m::f/1");
+    }
+
+    #[test]
+    fn erlang_same_name_different_arity_is_distinct_and_exported_per_arity() {
+        let src = "-module(m).\n\
+-export([f/1]).\n\
+f(X) -> X.\n\
+f(X, Y) -> {X, Y}.\n";
+        let (nodes, _refs) = run("m.erl", src, Language::Erlang);
+        let fs: Vec<_> = nodes
+            .iter()
+            .filter(|node| node.kind == NodeKind::Function && node.name == "f")
+            .collect();
+        assert_eq!(fs.len(), 2, "f/1 and f/2 must be distinct: {fs:?}");
+        let f1 = fs
+            .iter()
+            .find(|node| node.qualified_name == "m::f/1")
+            .expect("f/1");
+        let f2 = fs
+            .iter()
+            .find(|node| node.qualified_name == "m::f/2")
+            .expect("f/2");
+        assert!(f1.is_exported);
+        assert!(!f2.is_exported);
+    }
+
+    #[test]
+    fn erlang_spec_and_local_delegation_are_arity_specific() {
+        let src = "-module(deleg).\n\
+-export([header/2, header/3]).\n\
+header(Name, Req) -> header(Name, Req, undefined).\n\
+-spec header(binary(), map(), any()) -> any().\n\
+header(Name, Headers, Default) -> maps:get(Name, Headers, Default).\n";
+        let (nodes, refs) = run("deleg.erl", src, Language::Erlang);
+        let h2 = nodes
+            .iter()
+            .find(|node| node.qualified_name == "deleg::header/2")
+            .expect("header/2");
+        let h3 = nodes
+            .iter()
+            .find(|node| node.qualified_name == "deleg::header/3")
+            .expect("header/3");
+        assert_eq!(h2.signature.as_deref(), Some("header(Name, Req)"));
+        assert!(
+            h3.signature
+                .as_deref()
+                .is_some_and(|signature| signature.starts_with("-spec header("))
+        );
+        assert!(has_ref(&refs, EdgeKind::Calls, "header/3"));
     }
 
     #[test]
@@ -7350,8 +8036,8 @@ g() ->\n\
     fn erlang_remote_call_is_qualified_mod_fn() {
         let (_nodes, refs) = run("m.erl", ERLANG_SAMPLE, Language::Erlang);
         assert!(
-            has_ref(&refs, EdgeKind::Calls, "other::h"),
-            "remote other:h() → Calls other::h: {refs:?}"
+            has_ref(&refs, EdgeKind::Calls, "other::h/0"),
+            "remote other:h() → Calls other::h/0: {refs:?}"
         );
     }
 
@@ -7359,8 +8045,8 @@ g() ->\n\
     fn erlang_local_call_extracted() {
         let (_nodes, refs) = run("m.erl", ERLANG_SAMPLE, Language::Erlang);
         assert!(
-            has_ref(&refs, EdgeKind::Calls, "g"),
-            "local g() → Calls g: {refs:?}"
+            has_ref(&refs, EdgeKind::Calls, "g/0"),
+            "local g() → Calls g/0: {refs:?}"
         );
     }
 
@@ -7368,8 +8054,8 @@ g() ->\n\
     fn erlang_fun_value_and_record_usage_are_references() {
         let (_nodes, refs) = run("m.erl", ERLANG_SAMPLE, Language::Erlang);
         assert!(
-            has_ref(&refs, EdgeKind::References, "f"),
-            "fun f/1 → References f: {refs:?}"
+            has_ref(&refs, EdgeKind::References, "f/1"),
+            "fun f/1 → References f/1: {refs:?}"
         );
         assert!(
             has_ref(&refs, EdgeKind::References, "state"),
@@ -7401,6 +8087,31 @@ g() ->\n\
         let (nodes, _refs) = run("m.erl", ERLANG_SAMPLE, Language::Erlang);
         assert!(has_node(&nodes, NodeKind::Constant, "X"));
         assert!(has_node(&nodes, NodeKind::Namespace, "m"));
+    }
+
+    #[test]
+    fn erlang_static_gen_server_and_mfa_dispatch_carry_target_arity() {
+        let src = "-module(worker).\n\
+-define(SERVER, ?MODULE).\n\
+-export([go/0, work/2, handle_call/3]).\n\
+go() ->\n\
+    gen_server:call(?SERVER, ping),\n\
+    proc_lib:spawn_link(?MODULE, work, [a, b]).\n\
+work(A, B) -> {A, B}.\n\
+handle_call(Msg, From, State) -> {reply, {Msg, From}, State}.\n";
+        let (_nodes, refs) = run("worker.erl", src, Language::Erlang);
+        assert!(has_ref(&refs, EdgeKind::Calls, "worker::handle_call/3"));
+        assert!(has_ref(&refs, EdgeKind::Calls, "work/2"));
+    }
+
+    #[test]
+    fn erlang_call_arity_ignores_binary_literal_commas() {
+        let src = "-module(probe).\n\
+-export([go/0]).\n\
+go() -> codec:decode(<<1,2,3>>, []).\n";
+        let (_nodes, refs) = run("probe.erl", src, Language::Erlang);
+        assert!(has_ref(&refs, EdgeKind::Calls, "codec::decode/2"));
+        assert!(!has_ref(&refs, EdgeKind::Calls, "codec::decode/4"));
     }
 
     // ---- CFML (dual-grammar: cfscript for bare-script, cfml for tag) ----
@@ -7656,8 +8367,8 @@ g() ->\n\
             Language::Rust,
         );
         assert!(
-            rs.iter().any(|c| c == "inner.fetch"),
-            "Rust `self.inner.fetch()` must record `inner.fetch`, got: {rs:?}"
+            rs.iter().any(|c| c == "self.inner.fetch"),
+            "Rust `self.inner.fetch()` must record `self.inner.fetch`, got: {rs:?}"
         );
 
         // Swift `navigation_expression` receiver.
@@ -7670,6 +8381,40 @@ g() ->\n\
             swift.iter().any(|c| c == "inner.fetch"),
             "Swift `self.inner.fetch()` must record `inner.fetch`, got: {swift:?}"
         );
+    }
+
+    #[test]
+    fn rust_only_single_hop_self_field_receiver_keeps_its_owner_shape() {
+        let calls = call_refs(
+            "src/outer.rs",
+            r#"
+pub struct Outer { inner: Inner, deep: Deep }
+impl Outer {
+    pub fn run(&mut self) {
+        self.inner.run();
+        self.deep.inner.run();
+        self.make().run();
+        (self.inner).run();
+        self.run();
+        let local = Inner { n: 0 };
+        local.run();
+    }
+}
+"#,
+            Language::Rust,
+        );
+
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|name| name.starts_with("self."))
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["self.inner.run".to_string()]
+        );
+        assert!(calls.iter().any(|name| name == "local.run"));
+        assert_eq!(calls.iter().filter(|name| *name == "run").count(), 4);
+        assert!(calls.iter().any(|name| name == "make"));
     }
 
     #[test]

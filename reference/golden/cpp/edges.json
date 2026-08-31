@@ -36,6 +36,18 @@
     "target": "file:namespaced_member.hpp"
   },
   {
+    "col": 0,
+    "kind": "imports",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.92,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:plain_derived.h",
+    "target": "file:base.hpp"
+  },
+  {
     "col": 11,
     "kind": "calls",
     "line": 10,
@@ -204,6 +216,18 @@
     "target": "struct:56b403b06683b2fb3f6682df6301cba3"
   },
   {
+    "col": 29,
+    "kind": "extends",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "class:663f57ce46858cb3d9b9085a4dcead53",
+    "target": "class:8d69d653dc95cdd3c552158090518169"
+  },
+  {
     "col": 37,
     "kind": "calls",
     "line": 10,
@@ -226,6 +250,18 @@
     "provenance": null,
     "source": "function:2ae5d01268ba71490a736bc108e76245",
     "target": "method:715248b9cda9caac9e3841d433bd5ef2"
+  },
+  {
+    "col": 39,
+    "kind": "extends",
+    "line": 11,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "class:5300f6306a9364abb796c710c4d27a3e",
+    "target": "class:11306345dc1e400be056c1416040177a"
   },
   {
     "col": 4,
@@ -262,6 +298,18 @@
     "provenance": null,
     "source": "class:1f9695d61900e851f6609231a60ccd9a",
     "target": "class:a314922ccab0b69f3b0ef9ac4aa03899"
+  },
+  {
+    "col": 49,
+    "kind": "extends",
+    "line": 8,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "struct:ba394e66f523aafa20ecfd967cbf6f2e",
+    "target": "class:11306345dc1e400be056c1416040177a"
   },
   {
     "col": null,
@@ -739,6 +787,60 @@
     "provenance": null,
     "source": "file:operators.cpp",
     "target": "struct:a79c39917f9987d43250fce7bde68405"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:plain_derived.h",
+    "target": "class:5300f6306a9364abb796c710c4d27a3e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:plain_derived.h",
+    "target": "class:663f57ce46858cb3d9b9085a4dcead53"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:plain_derived.h",
+    "target": "import:41140ae1a2bc439305db929eea318afe"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:plain_derived.h",
+    "target": "struct:ba394e66f523aafa20ecfd967cbf6f2e"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:plain_header_negatives.h",
+    "target": "function:7d67c5231553d5bd8cebacf0f8bdbf72"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:plain_header_negatives.h",
+    "target": "struct:2bf8f85a163435816a0103679af5fa1d"
   },
   {
     "col": null,

@@ -526,7 +526,7 @@ fn blank_msvc_com_interface_keyword(bytes: Vec<u8>) -> Vec<u8> {
 /// COMPLETE declaration (`/* interface IFoo; */`) that becomes the FOLLOWING
 /// node's docstring, so a purely textual match corrupts extraction output even
 /// though it never mints a node.
-fn cpp_code_mask(src: &str) -> Vec<bool> {
+pub(crate) fn cpp_code_mask(src: &str) -> Vec<bool> {
     let bytes = src.as_bytes();
     let mut mask = vec![true; bytes.len()];
     let mut i = 0usize;

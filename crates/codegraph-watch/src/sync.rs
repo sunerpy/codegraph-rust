@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -118,28 +120,6 @@ pub fn sync_project_once_cancellable(
     sync_project_once_with_scope(project_root, &paths, &scope, Some(cancel), |_, _| {})
 }
 
-/// Whole-project sync using watcher-owned path patterns while preserving every
-/// other scan option from the normal sync path.
-///
-/// The watcher owns `include`/`exclude` because it derived them from the SAME
-/// project config when it started; every other option (size limit, ignore sets,
-/// extension overrides, framework config) is loaded here from the addressed
-/// project, so a watcher-triggered full sync scans exactly what a direct sync of
-/// that project scans.
-pub(crate) fn sync_project_once_with_patterns(
-    project_root: impl AsRef<Path>,
-    include: &[String],
-    exclude: &[String],
-    cancel: Option<&SyncCancellation>,
-) -> Result<SyncOutcome> {
-    let project_root = project_root.as_ref();
-    let paths = index_paths(project_root)?;
-    let mut scope = ProjectScope::load(project_root, &paths)?;
-    scope.options.include = include.to_vec();
-    scope.options.exclude = exclude.to_vec();
-    sync_project_once_with_scope(project_root, &paths, &scope, cancel, |_, _| {})
-}
-
 /// Like [`sync_project_once`] but invokes `on_progress(done, total)` after each
 /// candidate file is processed, letting a caller drive a progress bar. The
 /// callback is a pure side effect: it never gates or reorders work, so the
@@ -175,15 +155,15 @@ fn sync_project_once_with_scope(
     match open_sync_writer(paths, cancel)? {
         SyncWriter::Incremental(mut store) => {
             let mut candidates = codegraph_extract::engine::scan_project(project_root, options)?;
-            // Cold CLI sync has no watcher event list, so deletions are found by
-            // diffing tracked files against scan_project's on-disk set; absent
-            // paths flow through sync_one's delete branch (upstream removal pass,
-            // index.ts:1436-1441). The `exists()` guard keeps a still-present file
-            // that merely became ignored.
+            // Cold CLI sync has no watcher event list, so removals are found by
+            // diffing tracked files against scan_project's current in-scope set.
+            // This includes both physically absent files and still-present files
+            // that a newly loaded include/exclude/.gitignore rule moved out of
+            // scope. Both flow through sync_one's forced-absent branch.
             let on_disk = candidates.iter().cloned().collect::<HashSet<_>>();
             let mut absent = Vec::new();
             for tracked in store.all_files()? {
-                if !on_disk.contains(&tracked.path) && !project_root.join(&tracked.path).exists() {
+                if !on_disk.contains(&tracked.path) {
                     absent.push(tracked.path);
                 }
             }
@@ -297,19 +277,25 @@ pub fn sync_changed_paths(
     db_path: impl AsRef<Path>,
     paths: impl IntoIterator<Item = impl AsRef<Path>>,
 ) -> Result<SyncOutcome> {
-    sync_changed_paths_with_patterns(project_root, db_path, paths, &[], &[], None)
+    sync_changed_paths_current_scope(project_root, db_path, paths, None)
 }
 
-/// Like [`sync_changed_paths`] but threads the `codegraph.json`/`config.toml`
-/// `include`/`exclude` path patterns (#1063) so the watcher's incremental sync
-/// scopes files exactly as the full scan does — an included gitignored path is
-/// handled, a built-in skip is not, and an explicit `exclude` wins.
-pub fn sync_changed_paths_with_patterns(
+/// Scoped sync under the addressed project's config as it exists at the start
+/// of THIS operation. The watcher uses this path so queued events can never
+/// re-admit a file that a newer config has excluded.
+pub(crate) fn sync_changed_paths_cancellable(
+    project_root: impl AsRef<Path>,
+    db_path: impl AsRef<Path>,
+    paths: impl IntoIterator<Item = impl AsRef<Path>>,
+    cancel: &SyncCancellation,
+) -> Result<SyncOutcome> {
+    sync_changed_paths_current_scope(project_root, db_path, paths, Some(cancel))
+}
+
+fn sync_changed_paths_current_scope(
     project_root: impl AsRef<Path>,
     db_path: impl AsRef<Path>,
     changed: impl IntoIterator<Item = impl AsRef<Path>>,
-    include: &[String],
-    exclude: &[String],
     cancel: Option<&SyncCancellation>,
 ) -> Result<SyncOutcome> {
     let started = Instant::now();
@@ -327,13 +313,12 @@ pub fn sync_changed_paths_with_patterns(
         );
     }
 
-    // The addressed project's own immutable config drives extraction and any
-    // migration escalation; the caller-supplied `include`/`exclude` (the watcher's
-    // own patterns, derived from this same project config) override those two
-    // fields so watcher scope and scan scope stay identical.
-    let mut scope = ProjectScope::load(project_root, &paths)?;
-    scope.options.include = include.to_vec();
-    scope.options.exclude = exclude.to_vec();
+    // The addressed project's current config drives extraction and migration.
+    // Reloading it for every incremental operation prevents a queued event from
+    // re-admitting a file that a newer scope has excluded.
+    let scope = ProjectScope::load(project_root, &paths)?;
+    let include = scope.options.include.clone();
+    let exclude = scope.options.exclude.clone();
 
     // Same classify-before-mutate gate as the cold full sync: a Current namespace
     // stays incremental, while Missing/Outdated/recoverable Building escalate to a
@@ -346,8 +331,8 @@ pub fn sync_changed_paths_with_patterns(
                 project_root,
                 changed,
                 &scope,
-                include,
-                exclude,
+                &include,
+                &exclude,
                 started,
                 |_, _| {},
             )?;
@@ -406,7 +391,8 @@ fn sync_paths_with_store(
             continue;
         }
         outcome.files_checked += 1;
-        if !policy.should_handle_file(&relative) {
+        let in_scope = policy.should_handle_file(&relative);
+        if !in_scope && store.file_by_path(&relative)?.is_none() {
             outcome.files_ignored += 1;
             on_progress(done + 1, total);
             continue;
@@ -420,6 +406,7 @@ fn sync_paths_with_store(
             &mut dependent_sites,
             &mut dependent_fallbacks,
             &mut changed_names,
+            !in_scope,
         )? {
             changed = true;
             reindexed.insert(relative);
@@ -652,6 +639,7 @@ fn sweep_orphaned_refs(project_root: &Path, store: &mut Store) -> Result<()> {
 /// (`RESOLVE_BATCH_ROWS`) so a healed index is byte-equal to `index --force`.
 const ORPHAN_SWEEP_BATCH_ROWS: usize = 5_000;
 
+#[cfg(test)]
 pub(crate) fn default_db_path(project_root: &Path) -> Result<PathBuf> {
     Ok(codegraph_core::IndexPaths::resolve(
         project_root,
@@ -670,12 +658,18 @@ fn sync_one(
     dependent_sites: &mut BTreeMap<String, BTreeSet<ReferenceSite>>,
     dependent_fallbacks: &mut BTreeSet<String>,
     changed_names: &mut HashSet<String>,
+    force_absent: bool,
 ) -> Result<bool> {
     let full = project_root.join(relative);
     // One stat serves as both the existence check and the (mtime, size) source.
-    let metadata = match fs::metadata(&full) {
-        Ok(metadata) if metadata.is_file() => metadata,
+    let metadata = match (!force_absent).then(|| fs::metadata(&full)) {
+        Some(Ok(metadata)) if metadata.is_file() => metadata,
         _ => {
+            let was_tracked = store.file_by_path(relative)?.is_some();
+            if !was_tracked {
+                outcome.files_ignored += 1;
+                return Ok(false);
+            }
             for dependent in store.reference_sites_dependent_on_file(relative)? {
                 merge_dependent_site(dependent_sites, dependent_fallbacks, dependent);
             }
@@ -1622,10 +1616,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn sync_changed_paths_with_patterns_handles_included_gitignored_file() {
-        // #1063: the watcher's incremental path uses
-        // sync_changed_paths_with_patterns; a gitignored file named in include is
-        // reindexed rather than ignored by the WatchPolicy gate.
+    fn sync_changed_paths_reloads_include_for_gitignored_file() {
+        // #1063 plus hot reload: each incremental sync reloads the project's
+        // current config, so adding an include rule makes a previously ignored
+        // gitignored file eligible without restarting the watcher.
         let dir = TestDir::new("watch-incr-include");
         fs::write(dir.path().join(".gitignore"), "Tools/\n").unwrap();
         fs::create_dir_all(dir.path().join("Tools")).unwrap();
@@ -1641,21 +1635,59 @@ pub(crate) mod tests {
         assert_eq!(plain.files_reindexed, 0);
         assert!(plain.files_ignored >= 1);
 
-        // With include: the same file is now handled and reindexed.
-        let included = sync_changed_paths_with_patterns(
+        write_project_config(
             dir.path(),
-            &db,
-            ["Tools/helper.ts"],
-            &["Tools/".to_string()],
-            &[],
-            None,
-        )
-        .unwrap();
+            "[app]\nname = \"p\"\n\n[indexing]\ninclude = [\"Tools/\"]\n",
+        );
+        // With the newly loaded include: the same file is handled and reindexed.
+        let included = sync_changed_paths(dir.path(), &db, ["Tools/helper.ts"]).unwrap();
         assert_eq!(included.files_reindexed, 1);
         assert!(
             included
                 .changed_paths
                 .contains(&"Tools/helper.ts".to_string())
+        );
+    }
+
+    #[test]
+    fn incremental_sync_removes_newly_excluded_file_and_can_readmit_it() {
+        let dir = TestDir::new("watch-incr-scope-reload");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("src/app.ts"),
+            "export function before() { return 1; }\n",
+        )
+        .unwrap();
+        let db = default_db_path(dir.path()).unwrap();
+
+        let initial = sync_changed_paths(dir.path(), &db, ["src/app.ts"]).unwrap();
+        assert_eq!(initial.files_reindexed, 1);
+
+        write_project_config(
+            dir.path(),
+            "[app]\nname = \"p\"\n\n[indexing]\nexclude = [\"src/app.ts\"]\n",
+        );
+        let excluded = sync_changed_paths(dir.path(), &db, ["src/app.ts"]).unwrap();
+        assert_eq!(excluded.files_removed, 1);
+        assert!(
+            Store::open(&db)
+                .unwrap()
+                .file_by_path("src/app.ts")
+                .unwrap()
+                .is_none(),
+            "a queued event must not re-admit a file excluded by the current scope"
+        );
+
+        write_project_config(dir.path(), "[app]\nname = \"p\"\n");
+        let readmitted = sync_changed_paths(dir.path(), &db, ["src/app.ts"]).unwrap();
+        assert_eq!(readmitted.files_reindexed, 1);
+        assert!(
+            Store::open(&db)
+                .unwrap()
+                .file_by_path("src/app.ts")
+                .unwrap()
+                .is_some(),
+            "removing the exclusion must make the same on-disk file indexable again"
         );
     }
 

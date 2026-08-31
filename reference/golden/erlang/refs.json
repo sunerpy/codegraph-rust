@@ -2,11 +2,71 @@
   {
     "candidates": null,
     "col": 10,
+    "file_path": "client.erl",
+    "from_node_id": "function:786a4e513d0c6396a2bc2eecaf516820",
+    "language": "erlang",
+    "line": 8,
+    "reference_kind": "calls",
+    "reference_name": "store::get/3"
+  },
+  {
+    "candidates": null,
+    "col": 10,
+    "file_path": "client.erl",
+    "from_node_id": "function:96948ff67cc4766c109f13e2b0e79e26",
+    "language": "erlang",
+    "line": 11,
+    "reference_kind": "calls",
+    "reference_name": "lists::map/2"
+  },
+  {
+    "candidates": null,
+    "col": 10,
     "file_path": "m.erl",
     "from_node_id": "function:743aa71cb79a0e4ccf698e6157e258dd",
     "language": "erlang",
     "line": 17,
     "reference_kind": "calls",
-    "reference_name": "other::h"
+    "reference_name": "other::h/0"
+  },
+  {
+    "candidates": null,
+    "col": 11,
+    "file_path": "spawner.erl",
+    "from_node_id": "function:8d2d16f1262cec5991acc1c69c736551",
+    "language": "erlang",
+    "line": 5,
+    "reference_kind": "calls",
+    "reference_name": "erlang::spawn/3"
+  },
+  {
+    "candidates": null,
+    "col": 11,
+    "file_path": "spawner.erl",
+    "from_node_id": "function:8d2d16f1262cec5991acc1c69c736551",
+    "language": "erlang",
+    "line": 6,
+    "reference_kind": "calls",
+    "reference_name": "erlang::spawn/3"
+  },
+  {
+    "candidates": null,
+    "col": 24,
+    "file_path": "spawner.erl",
+    "from_node_id": "function:8d2d16f1262cec5991acc1c69c736551",
+    "language": "erlang",
+    "line": 6,
+    "reference_kind": "calls",
+    "reference_name": "multi::job"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "deleg.erl",
+    "from_node_id": "function:43136ca2bd6d7f964b0b4cd8586c73cd",
+    "language": "erlang",
+    "line": 10,
+    "reference_kind": "calls",
+    "reference_name": "maps::get/3"
   }
 ]

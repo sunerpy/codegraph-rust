@@ -19,27 +19,41 @@ Protocol) stdio server. No AI / vector / LLM anywhere in the binary — output i
   `crates/codegraph-bench/fixtures/python/`; guards six bare class-as-value
   `References` edges — return, assignment RHS, registry pair, call argument,
   list literal, and one cross-file unique match — plus tuple-return and bare-method
-  negatives, byte-for-byte), `reference/golden/kotlin/` (corpus
+  negatives, plus #1626 Python module/member import aliases and their no-global-fallback
+  boundaries, byte-for-byte), `reference/golden/kotlin/` (corpus
   `crates/codegraph-bench/fixtures/kotlin/`; guards #1495 Kotlin callable
   signatures for explicit, inferred, generic, multiline nullable, and extension
   returns, plus a primary-constructor negative — byte-for-byte),
   `reference/golden/typescript/` (corpus `crates/codegraph-bench/fixtures/typescript/`;
   guards #1482 local export aliases and #1482b TypeScript `.js`-specifier
-  substitution, including TS-over-JS collision precedence — byte-for-byte), and
+  substitution, object-literal callable members, inherited/config-relative TS
+  path aliases, and `.xsjs`/`.xsjslib` import candidates with ordinary-JS
+  precedence — byte-for-byte), and
   `reference/golden/cpp/`
   (corpus `crates/codegraph-bench/fixtures/cpp/`; guards #1043 C++ class/struct
   inheritance incl. templated-base stripping byte-for-byte, and retroactively
-  the earlier C++ extraction work; grown to 17 files by Tier 3 with the MSVC COM
+  the earlier C++ extraction work; grown to 19 files with full-source lexically
+  masked plain-derived `.h` detection and its text/bitfield/label/ternary
+  negatives, plus the Tier 3 MSVC COM
   `interface` positives + five guard negatives (#1519) and the C / C++ / ObjC
   `union` fixtures incl. both `typedef union` re-kinds and both instantiation
   paths (PR #1516) — it is the C-FAMILY corpus, not a strictly-C++ one, since it
   holds `.c` and `.mm` files too), and `reference/golden/rust/`
-  (corpus `crates/codegraph-bench/fixtures/rust/`; the repo's only Rust corpus,
+  (four-file corpus `crates/codegraph-bench/fixtures/rust/`; the repo's only Rust corpus,
   guards #1513/PR #1514 unit structs — 3 `struct` nodes and 4 `implements` edges,
   where the unit struct produced NO node before — plus the Rust half of PR #1516's
-  first-class `union` kind, byte-for-byte; it deliberately claims NO `instantiates`
-  edge, because that edge fires only for the call-expression construction form and
-  a Rust union is constructible only as `U { … }`), and `reference/golden/go/`
+  first-class `union` kind, generic/lifetime/reference/qualified impl ownership,
+  and the statically safe subset of `self.field.method()` resolution, byte-for-byte;
+  it deliberately claims NO `instantiates` edge, because that edge fires only for
+  the call-expression construction form and a Rust union is constructible only as
+  `U { … }`), `reference/golden/lua/` (single-file corpus
+  `crates/codegraph-bench/fixtures/lua/`; guards #1616 local/table-field function
+  expressions, nested qualified names, body-call ownership, dot/colon calls, and
+  dynamic-key negatives — byte-for-byte), `reference/golden/erlang/` (seven-file
+  corpus `crates/codegraph-bench/fixtures/erlang/`; guards bare display names plus
+  `module::function/arity` identity across clauses, exports, specs, local/remote
+  calls, fun values, safe MFA dispatch, and binary-literal comma counting —
+  byte-for-byte), and `reference/golden/go/`
   (corpus `crates/codegraph-bench/fixtures/go/`; the repo's only Go corpus, and the
   only corpus where `files.generated` is anything other than `0` — it byte-pins
   #1500 content-header detection at BOTH values, three each way: `payroll.go`
@@ -52,9 +66,10 @@ Protocol) stdio server. No AI / vector / LLM anywhere in the binary — output i
   import Gate 3b is deliberately unreachable for real Python nodes because the
   extractor does not mark them exported. Regen recipe: `docs/equivalence.md`
   "Godot fixture" / "Ruby fixture" / "Python fixture" / "Kotlin fixture" /
-  "TypeScript resolution fixture" / "C++ fixture" / "Rust fixture" / "Go fixture"
-  sections. `mini` has no re-indexable provenance and a schema migration cannot
-  normalise it in place, so it has its own "Mini schema rebuild" recipe there.
+  "TypeScript resolution fixture" / "C++ fixture" / "Rust fixture" / "Lua fixture" /
+  "Erlang fixture" / "Go fixture" sections. `mini` has no re-indexable provenance
+  and a schema migration cannot normalise it in place, so it has its own
+  "Mini schema rebuild" recipe there.
 - **node-id formula**: `{kind}:{sha256("{filePath}:{kind}:{name}:{line}").hex[:32]}`; file nodes are the
   literal `file:{relpath}`; lines are 1-based; paths relative with `/`.
 - **No AI / vector / LLM crates** — enforced by `scripts/guardrail.sh` (CI gate):

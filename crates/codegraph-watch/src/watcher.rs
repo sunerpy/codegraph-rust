@@ -18,14 +18,13 @@ use codegraph_extract::ExtensionOverrides;
 
 use crate::policy::{WatchPolicy, watch_disabled_reason};
 use crate::sync::{
-    SyncCancellation, SyncOutcome, default_db_path, sync_changed_paths_with_patterns,
-    sync_project_once_with_patterns,
+    SyncCancellation, SyncOutcome, sync_changed_paths_cancellable, sync_project_once_cancellable,
 };
 
 type SyncCallback = Arc<dyn Fn(SyncOutcome) + Send + Sync>;
 type SyncFn = Arc<dyn Fn(Vec<String>) -> Result<SyncOutcome> + Send + Sync>;
-/// Whole-project sync, used when an event cannot be expressed as a path list —
-/// currently only a removed DIRECTORY (see [`RemovalHint`]).
+/// Whole-project sync, used when an event changes the effective project scope
+/// or cannot be expressed as a path list (see [`RemovalHint`]).
 type FullSyncFn = Arc<dyn Fn() -> Result<SyncOutcome> + Send + Sync>;
 type NoticeCallback = Arc<dyn Fn(String) + Send + Sync>;
 
@@ -36,6 +35,171 @@ type NoticeCallback = Arc<dyn Fn(String) + Send + Sync>;
 /// otherwise hold no watch until a server restart; the loop adds one on its
 /// create event.
 type SharedWatcher = Arc<Mutex<Option<RecommendedWatcher>>>;
+
+#[derive(Debug, Clone)]
+struct RuntimeWatchScope {
+    policy: WatchPolicy,
+    ignore_dirs: Vec<String>,
+    ignore_paths: Vec<String>,
+    include: Vec<String>,
+    exclude: Vec<String>,
+    extensions: Arc<ExtensionOverrides>,
+    debounce: Duration,
+    enabled: bool,
+}
+
+impl RuntimeWatchScope {
+    fn from_options(project_root: &Path, options: &WatchOptions) -> Self {
+        let policy = WatchPolicy::with_config(
+            project_root,
+            &options.ignore_dirs,
+            &options.ignore_paths,
+            &options.include,
+            &options.exclude,
+        )
+        .with_extension_overrides(Arc::clone(&options.extensions));
+        Self {
+            policy,
+            ignore_dirs: options.ignore_dirs.clone(),
+            ignore_paths: options.ignore_paths.clone(),
+            include: options.include.clone(),
+            exclude: options.exclude.clone(),
+            extensions: Arc::clone(&options.extensions),
+            debounce: options.debounce,
+            enabled: !options.no_watch,
+        }
+    }
+
+    fn rebuild_policy(&mut self, project_root: &Path) {
+        self.policy = WatchPolicy::with_config(
+            project_root,
+            &self.ignore_dirs,
+            &self.ignore_paths,
+            &self.include,
+            &self.exclude,
+        )
+        .with_extension_overrides(Arc::clone(&self.extensions));
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ControlChanges {
+    config_toml: bool,
+    codegraph_json: bool,
+    root_gitignore: bool,
+}
+
+impl ControlChanges {
+    fn any(self) -> bool {
+        self.config_toml || self.codegraph_json || self.root_gitignore
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ControlFiles {
+    config_toml: String,
+    codegraph_json: String,
+    root_gitignore: String,
+}
+
+impl ControlFiles {
+    fn new(project_root: &Path, paths: &IndexPaths) -> Self {
+        Self {
+            config_toml: relative_path(project_root, &paths.config_toml()),
+            codegraph_json: relative_path(project_root, &paths.extension_config()),
+            root_gitignore: ".gitignore".to_string(),
+        }
+    }
+
+    fn classify(&self, relative: &str, changes: &mut ControlChanges) -> bool {
+        if relative == self.config_toml {
+            changes.config_toml = true;
+            true
+        } else if relative == self.codegraph_json {
+            changes.codegraph_json = true;
+            true
+        } else if relative == self.root_gitignore {
+            changes.root_gitignore = true;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn relative_path(project_root: &Path, path: &Path) -> String {
+    if let Ok(relative) = path.strip_prefix(project_root) {
+        return relative.to_string_lossy().replace('\\', "/");
+    }
+    if let Ok(canonical_root) = project_root.canonicalize()
+        && let Ok(relative) = path.strip_prefix(canonical_root)
+    {
+        return relative.to_string_lossy().replace('\\', "/");
+    }
+
+    // `IndexPaths` keeps canonical physical paths. On Windows canonicalization
+    // commonly adds the verbatim `\\?\` prefix, while a caller may still hold
+    // the equivalent ordinary `C:\...` spelling. Compare their slash-normalized
+    // forms after removing that prefix so project-control files remain relative.
+    let root = native_path_string(project_root);
+    let candidate = native_path_string(path);
+    let prefix = format!("{}/", root.trim_end_matches('/'));
+    candidate
+        .strip_prefix(&prefix)
+        .unwrap_or(&candidate)
+        .to_string()
+}
+
+fn native_path_string(path: &Path) -> String {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    if let Some(rest) = normalized.strip_prefix("//?/UNC/") {
+        format!("//{rest}")
+    } else if let Some(rest) = normalized.strip_prefix("//?/") {
+        rest.to_string()
+    } else {
+        normalized
+    }
+}
+
+fn reload_runtime_scope(
+    project_root: &Path,
+    paths: &IndexPaths,
+    previous: &RuntimeWatchScope,
+    changes: ControlChanges,
+) -> (RuntimeWatchScope, bool, Option<String>) {
+    let mut next = previous.clone();
+    let mut applied = changes.root_gitignore;
+    let mut error = None;
+
+    if changes.config_toml {
+        match Config::load_for_paths(None, paths) {
+            Ok(config) => {
+                next.ignore_dirs = config.indexing.ignore_dirs.clone();
+                next.ignore_paths = config.indexing.ignore_paths.clone();
+                next.include = config.indexing.include.clone();
+                next.exclude = config.indexing.exclude.clone();
+                next.debounce = debounce_from_env_or(config.watch.debounce_ms);
+                next.enabled = config.watch.enabled;
+                applied = true;
+            }
+            Err(err) => {
+                error = Some(format!(
+                    "watch config reload failed; keeping the last valid config: {err}"
+                ));
+            }
+        }
+    }
+    if changes.codegraph_json {
+        // JSON is deliberately tolerant: malformed content produces empty
+        // overrides plus its existing warning, matching every other loader.
+        next.extensions = ExtensionOverrides::load_for_paths(paths);
+        applied = true;
+    }
+    if applied {
+        next.rebuild_policy(project_root);
+    }
+    (next, applied, error)
+}
 
 // libc errnos used to classify a backend watch failure. Hard-coded (rather than
 // pulling in `libc`) because these three values are stable across every Unix the
@@ -250,6 +414,51 @@ fn register_new_dirs(watcher: &SharedWatcher, policy: &WatchPolicy, new_dir: &Pa
     });
 }
 
+fn reconcile_watch_dirs(
+    watcher: &SharedWatcher,
+    project_root: &Path,
+    policy: &WatchPolicy,
+    known_dirs: &mut BTreeSet<String>,
+    degraded: &Arc<DegradedState>,
+    on_degraded: &Option<NoticeCallback>,
+    on_sync_error: &Option<NoticeCallback>,
+) -> bool {
+    let desired = known_directory_paths(project_root, policy);
+    if watch_registration(platform_watch_backend()) == WatchRegistration::SingleRootRecursive {
+        *known_dirs = desired;
+        return true;
+    }
+
+    let Ok(mut guard) = watcher.lock() else {
+        if let Some(callback) = on_sync_error {
+            callback("watch scope reload could not lock the watcher".to_string());
+        }
+        return true;
+    };
+    let Some(watcher) = guard.as_mut() else {
+        *known_dirs = desired;
+        return true;
+    };
+
+    for relative in known_dirs.difference(&desired) {
+        // A removed directory often no longer exists by the time this runs;
+        // unwatch is best-effort in that case because the backend has already
+        // dropped the path. The desired set remains authoritative.
+        let _ = watcher.unwatch(&project_root.join(relative));
+    }
+    for relative in desired.difference(known_dirs) {
+        let path = project_root.join(relative);
+        if let Err(err) = watcher.watch(&path, RecursiveMode::NonRecursive) {
+            match handle_watch_error(&err, degraded, on_degraded, on_sync_error) {
+                WatchErrorClass::Degrade => return false,
+                WatchErrorClass::Warn | WatchErrorClass::Other => {}
+            }
+        }
+    }
+    *known_dirs = desired;
+    true
+}
+
 /// Double `prev` for the next backoff step, saturating at [`MAX_BACKOFF`].
 ///
 /// A zero/sub-ms `prev` seeds the schedule at 1ms so the doubling progresses; the
@@ -421,37 +630,33 @@ pub fn watch_options_for_project(project_root: impl AsRef<Path>) -> Result<Watch
 
 impl ProjectWatcher {
     pub fn start(project_root: impl AsRef<Path>, options: WatchOptions) -> Result<Option<Self>> {
-        let project_root = project_root.as_ref().to_path_buf();
-        if watch_disabled_reason(&project_root, options.no_watch).is_some() {
+        let requested_root = project_root.as_ref().to_path_buf();
+        if watch_disabled_reason(&requested_root, options.no_watch).is_some() {
             return Ok(None);
         }
-        let policy = WatchPolicy::with_config(
-            &project_root,
-            &options.ignore_dirs,
-            &options.ignore_paths,
-            &options.include,
-            &options.exclude,
-        )
-        .with_extension_overrides(Arc::clone(&options.extensions));
+        let index_paths = Arc::new(IndexPaths::resolve(
+            &requested_root,
+            std::env::var("CODEGRAPH_DIR").ok().as_deref(),
+        )?);
+        // Keep every watcher path in the same physical namespace as IndexPaths.
+        // This matters on Windows, where canonical paths carry a `\\?\` prefix:
+        // mixing that spelling with the requested root makes absolute control
+        // events fail `WatchPolicy::normalize_relative` before classification.
+        let project_root = index_paths.project().to_path_buf();
+        let control_files = ControlFiles::new(&project_root, &index_paths);
+        let runtime_scope = RuntimeWatchScope::from_options(&project_root, &options);
+        let policy = runtime_scope.policy.clone();
         let db_path = match options.db_path.clone() {
             Some(db) => db,
-            None => default_db_path(&project_root)?,
+            None => index_paths.current_db(),
         };
         let cancel = options.cancel.clone();
         let sync_fn = options.sync_fn.clone().unwrap_or_else(|| {
             let project_root = project_root.clone();
-            let include = options.include.clone();
-            let exclude = options.exclude.clone();
+            let db_path = db_path.clone();
             let cancel = cancel.clone();
             Arc::new(move |paths| {
-                sync_changed_paths_with_patterns(
-                    &project_root,
-                    &db_path,
-                    paths,
-                    &include,
-                    &exclude,
-                    Some(&cancel),
-                )
+                sync_changed_paths_cancellable(&project_root, &db_path, paths, &cancel)
             })
         });
         // A removed directory cannot be expressed as a path list (its tracked
@@ -459,12 +664,8 @@ impl ProjectWatcher {
         // disk), so it escalates to the SAME full sync `codegraph sync` runs.
         let full_sync_fn = options.full_sync_fn.clone().unwrap_or_else(|| {
             let project_root = project_root.clone();
-            let include = options.include.clone();
-            let exclude = options.exclude.clone();
             let cancel = cancel.clone();
-            Arc::new(move || {
-                sync_project_once_with_patterns(&project_root, &include, &exclude, Some(&cancel))
-            })
+            Arc::new(move || sync_project_once_cancellable(&project_root, &cancel))
         });
         let (tx, rx) = mpsc::channel();
         let degraded = Arc::new(DegradedState::default());
@@ -499,7 +700,22 @@ impl ProjectWatcher {
             // handles per registration in notify v6). Other targets retain the
             // pruned per-directory NonRecursive strategy that prevents Linux
             // inotify exhaustion.
-            let targets = initial_watch_targets(platform_watch_backend(), &project_root, &policy);
+            let backend = platform_watch_backend();
+            let mut targets = initial_watch_targets(backend, &project_root, &policy);
+            // The index root is structurally ignored source, but its two
+            // project-control files must still be observed. Per-directory
+            // backends therefore add one explicit non-recursive control watch.
+            if watch_registration(backend) == WatchRegistration::PerDirNonRecursive
+                && index_paths.current_root().is_dir()
+                && !targets
+                    .iter()
+                    .any(|(dir, _)| dir == index_paths.current_root())
+            {
+                targets.push((
+                    index_paths.current_root().to_path_buf(),
+                    RecursiveMode::NonRecursive,
+                ));
+            }
             let mut watch_err: Option<notify::Error> = None;
             for (dir, mode) in &targets {
                 if let Err(err) = watcher.watch(dir, *mode) {
@@ -543,11 +759,9 @@ impl ProjectWatcher {
             Arc::new(Mutex::new(Some(watcher)))
         };
 
-        let loop_policy = policy.clone();
         let on_sync_complete = options.on_sync_complete.clone();
         let on_degraded = options.on_degraded.clone();
         let on_sync_error = options.on_sync_error.clone();
-        let debounce = options.debounce;
         let loop_degraded = Arc::clone(&degraded);
         let loop_watcher = Arc::clone(&watcher);
         let finished = Arc::new(AtomicBool::new(false));
@@ -555,8 +769,10 @@ impl ProjectWatcher {
         let thread = thread::spawn(move || {
             event_loop(EventLoopCtx {
                 rx,
-                policy: loop_policy,
-                debounce,
+                project_root,
+                index_paths,
+                control_files,
+                runtime_scope,
                 sync_fn,
                 full_sync_fn,
                 on_sync_complete,
@@ -763,8 +979,10 @@ struct PendingInfo {
 
 struct EventLoopCtx {
     rx: mpsc::Receiver<LoopMessage>,
-    policy: WatchPolicy,
-    debounce: Duration,
+    project_root: PathBuf,
+    index_paths: Arc<IndexPaths>,
+    control_files: ControlFiles,
+    runtime_scope: RuntimeWatchScope,
     sync_fn: SyncFn,
     full_sync_fn: FullSyncFn,
     on_sync_complete: Option<SyncCallback>,
@@ -778,8 +996,10 @@ struct EventLoopCtx {
 fn event_loop(ctx: EventLoopCtx) {
     let EventLoopCtx {
         rx,
-        policy,
-        debounce,
+        project_root,
+        index_paths,
+        control_files,
+        mut runtime_scope,
         sync_fn,
         full_sync_fn,
         on_sync_complete,
@@ -812,41 +1032,74 @@ fn event_loop(ctx: EventLoopCtx) {
         match message {
             Some(LoopMessage::Event(batch)) => {
                 let WatchEventBatch { paths, removal } = batch;
+                let mut control_changes = ControlChanges::default();
+                let mut normalized = Vec::new();
                 for path in paths {
-                    if let Some(relative) = policy.normalize_relative(&path) {
-                        // A removed DIRECTORY bypasses extension filtering: it has
-                        // no source extension, so the file gate below would drop it
-                        // and every tracked descendant would linger in the index
-                        // forever. The watch policy still applies (an ignored dir is
-                        // still ignored), and the removal escalates the burst to one
-                        // full sync — the only pass that can find those descendants.
-                        if classify_removed_directory(removal, &relative, &mut known_dirs) {
-                            if policy.should_watch_dir(&relative) {
-                                full_sync_pending = true;
-                                let now = epoch_millis();
+                    if let Some(relative) = runtime_scope.policy.normalize_relative(&path) {
+                        let is_control = control_files.classify(&relative, &mut control_changes);
+                        normalized.push((path, relative, is_control));
+                    }
+                }
+
+                // Project control files are recognized BEFORE ordinary
+                // include/exclude filtering. A successful reload swaps the
+                // complete runtime scope at once, reconciles the OS watch set,
+                // and makes one full scan dominate every queued path delta.
+                if control_changes.any() {
+                    let (next, applied, reload_error) = reload_runtime_scope(
+                        &project_root,
+                        &index_paths,
+                        &runtime_scope,
+                        control_changes,
+                    );
+                    if let Some(reason) = reload_error
+                        && let Some(callback) = &on_sync_error
+                    {
+                        callback(reason);
+                    }
+                    if applied {
+                        if !reconcile_watch_dirs(
+                            &watcher,
+                            &project_root,
+                            &next.policy,
+                            &mut known_dirs,
+                            &degraded,
+                            &on_degraded,
+                            &on_sync_error,
+                        ) {
+                            break;
+                        }
+                        runtime_scope = next;
+                        full_sync_pending = true;
+                        let now = epoch_millis();
+                        for (_, relative, is_control) in &normalized {
+                            if *is_control {
                                 pending
-                                    .entry(relative)
+                                    .entry(relative.clone())
                                     .and_modify(|info| info.last_seen_ms = now)
                                     .or_insert(PendingInfo {
                                         first_seen_ms: now,
                                         last_seen_ms: now,
                                     });
                             }
-                            continue;
                         }
-                        // A brand-new non-ignored directory holds no inotify watch
-                        // yet (Linux watches are per-dir NonRecursive — see
-                        // `collect_watch_dirs`). Register it (and any non-ignored
-                        // descendants created in the same burst, e.g. `mkdir -p`) so
-                        // edits inside it are seen without a server restart.
-                        if path.is_dir() && policy.should_watch_dir(&relative) {
-                            register_new_dirs(&watcher, &policy, &path);
-                            known_dirs.extend(known_directory_paths(&path, &policy));
-                        }
-                        if policy.should_handle_file(&relative)
-                            || (policy.allows_file_path(&relative)
-                                && maybe_deleted_source(&relative))
-                        {
+                    }
+                }
+
+                for (path, relative, is_control) in normalized {
+                    if is_control || !runtime_scope.enabled {
+                        continue;
+                    }
+
+                    // A removed DIRECTORY bypasses extension filtering: it has
+                    // no source extension, so the file gate below would drop it
+                    // and every tracked descendant would linger in the index
+                    // forever. The watch policy still applies (an ignored dir is
+                    // still ignored), and the removal escalates the burst to one
+                    // full sync — the only pass that can find those descendants.
+                    if classify_removed_directory(removal, &relative, &mut known_dirs) {
+                        if runtime_scope.policy.should_watch_dir(&relative) {
+                            full_sync_pending = true;
                             let now = epoch_millis();
                             pending
                                 .entry(relative)
@@ -856,12 +1109,35 @@ fn event_loop(ctx: EventLoopCtx) {
                                     last_seen_ms: now,
                                 });
                         }
+                        continue;
+                    }
+                    // A brand-new non-ignored directory holds no inotify watch
+                    // yet (Linux watches are per-dir NonRecursive — see
+                    // `collect_watch_dirs`). Register it (and any non-ignored
+                    // descendants created in the same burst, e.g. `mkdir -p`) so
+                    // edits inside it are seen without a server restart.
+                    if path.is_dir() && runtime_scope.policy.should_watch_dir(&relative) {
+                        register_new_dirs(&watcher, &runtime_scope.policy, &path);
+                        known_dirs.extend(known_directory_paths(&path, &runtime_scope.policy));
+                    }
+                    if runtime_scope.policy.should_handle_file(&relative)
+                        || (runtime_scope.policy.allows_file_path(&relative)
+                            && maybe_deleted_source(&relative))
+                    {
+                        let now = epoch_millis();
+                        pending
+                            .entry(relative)
+                            .and_modify(|info| info.last_seen_ms = now)
+                            .or_insert(PendingInfo {
+                                first_seen_ms: now,
+                                last_seen_ms: now,
+                            });
                     }
                 }
                 if !pending.is_empty() {
                     // Resetting the timer on every event ports the upstream exactly-once
                     // burst semantics (`upstream sync/watcher.ts:529-540`).
-                    deadline = Some(Instant::now() + debounce);
+                    deadline = Some(Instant::now() + runtime_scope.debounce);
                 }
             }
             Some(LoopMessage::WatchError(err)) => {
@@ -1116,6 +1392,20 @@ mod tests {
     use std::fs;
     use std::sync::{Arc, Mutex};
 
+    fn write_current_config(project_root: &Path, contents: &str) -> IndexPaths {
+        let paths = IndexPaths::resolve(project_root, None).unwrap();
+        fs::create_dir_all(paths.current_root()).unwrap();
+        fs::write(paths.config_toml(), contents).unwrap();
+        paths
+    }
+
+    fn live_project_options(project_root: &Path) -> WatchOptions {
+        let paths = IndexPaths::resolve(project_root, None).unwrap();
+        let config = Config::load_for_paths(None, &paths).unwrap();
+        let extensions = ExtensionOverrides::load_for_paths(&paths);
+        WatchOptions::for_project(&config, extensions)
+    }
+
     #[test]
     fn noop_watcher_completion_preserves_trigger_paths() {
         let outcome = with_trigger_paths(
@@ -1128,6 +1418,35 @@ mod tests {
         assert_eq!(
             outcome.trigger_paths,
             vec!["src/brand_new_symbol.ts".to_string()]
+        );
+    }
+
+    #[test]
+    fn relative_path_equates_windows_verbatim_and_regular_drive_paths() {
+        assert_eq!(
+            relative_path(
+                Path::new("C:/Users/test/project"),
+                Path::new("//?/C:/Users/test/project/.codegraph/config.toml"),
+            ),
+            ".codegraph/config.toml"
+        );
+        assert_eq!(
+            native_path_string(Path::new("//?/UNC/server/share/project")),
+            "//server/share/project"
+        );
+    }
+
+    #[test]
+    fn relative_path_uses_the_physical_root_for_lexical_aliases() {
+        let dir = crate::sync::tests::TestDir::new("watch-relative-physical");
+        fs::create_dir_all(dir.path().join("alias")).unwrap();
+        let physical = dir.path().canonicalize().unwrap();
+        assert_eq!(
+            relative_path(
+                &dir.path().join("alias/.."),
+                &physical.join(".codegraph/config.toml"),
+            ),
+            ".codegraph/config.toml"
         );
     }
 
@@ -1191,6 +1510,12 @@ mod tests {
         // descendant — instead of an incremental path-scoped sync.
         let dir = crate::sync::tests::TestDir::new("watch-deleted-dir");
         fs::write(dir.path().join(".gitignore"), "Tools/\n").unwrap();
+        let index_paths = IndexPaths::resolve(dir.path(), None).unwrap();
+        fs::write(
+            index_paths.config_toml(),
+            "[app]\nname = \"watch-deleted-dir\"\n\n[indexing]\ninclude = [\"Tools/\"]\n",
+        )
+        .unwrap();
         fs::create_dir_all(dir.path().join("Tools/feature")).unwrap();
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::write(
@@ -1214,7 +1539,7 @@ mod tests {
         )
         .unwrap();
         let db = crate::sync::default_db_path(dir.path()).unwrap();
-        let indexed = crate::sync::sync_changed_paths_with_patterns(
+        let indexed = crate::sync::sync_changed_paths(
             dir.path(),
             &db,
             [
@@ -1223,9 +1548,6 @@ mod tests {
                 "Tools/keep.ts",
                 "src/excluded.ts",
             ],
-            &["Tools/".to_string()],
-            &[],
-            None,
         )
         .unwrap();
         assert_eq!(
@@ -1233,10 +1555,9 @@ mod tests {
             "all fixture files indexed first"
         );
 
-        // The watcher-local patterns deliberately oppose the process-global/default
-        // full-sync scope: include the gitignored Tools tree, but exclude one normal
-        // source file. Both surviving files change before the directory removal so
-        // the resulting stored symbols prove which patterns the full sync used.
+        // Both surviving files change before the directory removal so the
+        // resulting stored symbols prove the full sync reloaded the project's
+        // authoritative current config rather than a frozen startup snapshot.
         fs::write(
             dir.path().join("Tools/keep.ts"),
             "export function includedAfter() { return 30; }\n",
@@ -1265,7 +1586,6 @@ mod tests {
                 db_path: Some(db.clone()),
                 sync_fn: Some(sync_fn),
                 include: vec!["Tools/".to_string()],
-                exclude: vec!["src/excluded.ts".to_string()],
                 on_sync_complete: Some(Arc::new(move |outcome| {
                     outcome_tx.send(outcome).unwrap();
                 })),
@@ -1324,10 +1644,238 @@ mod tests {
             .map(|node| node.name)
             .collect::<Vec<_>>();
         assert!(
-            excluded_names.iter().any(|name| name == "excludedBefore")
-                && !excluded_names.iter().any(|name| name == "excludedAfter"),
-            "watcher-local exclude must keep src/excluded.ts untouched: {excluded_names:?}"
+            excluded_names.iter().any(|name| name == "excludedAfter"),
+            "the current config must let full sync refresh src/excluded.ts: {excluded_names:?}"
         );
+    }
+
+    #[test]
+    fn config_reload_reconciles_scope_and_dominates_queued_paths() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-config-reload");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::create_dir_all(dir.path().join("generated")).unwrap();
+        fs::write(
+            dir.path().join("src/keep.ts"),
+            "export function keep() { return 1; }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("generated/drop.ts"),
+            "export function drop() { return 2; }\n",
+        )
+        .unwrap();
+        let paths = write_current_config(dir.path(), "[app]\nname = \"watch-config\"\n");
+        let initial = crate::sync::sync_project_once(dir.path()).unwrap();
+        assert_eq!(initial.files_reindexed, 2);
+
+        let (outcome_tx, outcome_rx) = mpsc::channel();
+        let mut options = live_project_options(dir.path());
+        options.debounce = Duration::from_secs(30);
+        options.inert_for_tests = true;
+        options.on_sync_complete = Some(Arc::new(move |outcome| {
+            outcome_tx.send(outcome).unwrap();
+        }));
+        let watcher = ProjectWatcher::start(dir.path(), options).unwrap().unwrap();
+        let control = relative_path(dir.path(), &paths.config_toml());
+
+        fs::write(
+            paths.config_toml(),
+            "[app]\nname = \"watch-config\"\n\n[indexing]\nexclude = [\"generated/\"]\n",
+        )
+        .unwrap();
+        watcher.ingest_event_for_tests(&control);
+        watcher.ingest_event_for_tests("generated/drop.ts");
+        watcher.flush_for_tests();
+        let excluded = outcome_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("scope-removal full sync");
+        assert_eq!(excluded.files_removed, 1);
+        assert_eq!(excluded.trigger_paths, vec![control.clone()]);
+        assert!(
+            codegraph_store::Store::open(&paths.current_db())
+                .unwrap()
+                .file_by_path("generated/drop.ts")
+                .unwrap()
+                .is_none(),
+            "the full reconcile must remove a file excluded by the new scope"
+        );
+
+        fs::write(paths.config_toml(), "[app]\nname = \"watch-config\"\n").unwrap();
+        watcher.ingest_event_for_tests(&control);
+        watcher.flush_for_tests();
+        let readmitted = outcome_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("scope-readmission full sync");
+        assert_eq!(readmitted.files_reindexed, 1);
+        assert!(
+            codegraph_store::Store::open(&paths.current_db())
+                .unwrap()
+                .file_by_path("generated/drop.ts")
+                .unwrap()
+                .is_some(),
+            "removing the exclusion must readmit the existing source file"
+        );
+        watcher.stop();
+    }
+
+    #[test]
+    fn malformed_toml_keeps_last_valid_scope_and_reports_error() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-config-invalid");
+        fs::create_dir_all(dir.path().join("generated")).unwrap();
+        fs::write(
+            dir.path().join("generated/drop.ts"),
+            "export function drop() { return 1; }\n",
+        )
+        .unwrap();
+        let paths = write_current_config(
+            dir.path(),
+            "[app]\nname = \"watch-config\"\n\n[indexing]\nexclude = [\"generated/\"]\n",
+        );
+        let control = relative_path(dir.path(), &paths.config_toml());
+        let incremental_calls = Arc::new(AtomicUsize::new(0));
+        let incremental_counter = Arc::clone(&incremental_calls);
+        let full_calls = Arc::new(AtomicUsize::new(0));
+        let full_counter = Arc::clone(&full_calls);
+        let (error_tx, error_rx) = mpsc::channel();
+        let mut options = live_project_options(dir.path());
+        options.debounce = Duration::from_secs(30);
+        options.inert_for_tests = true;
+        options.sync_fn = Some(Arc::new(move |_| {
+            incremental_counter.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(SyncOutcome::default())
+        }));
+        options.full_sync_fn = Some(Arc::new(move || {
+            full_counter.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(SyncOutcome::default())
+        }));
+        options.on_sync_error = Some(Arc::new(move |error| {
+            error_tx.send(error).unwrap();
+        }));
+        let watcher = ProjectWatcher::start(dir.path(), options).unwrap().unwrap();
+
+        fs::write(paths.config_toml(), "[app\nthis is not toml").unwrap();
+        watcher.ingest_event_for_tests(&control);
+        watcher.flush_for_tests();
+        let error = error_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("malformed config warning");
+        assert!(error.contains("keeping the last valid config"), "{error}");
+
+        watcher.ingest_event_for_tests("generated/drop.ts");
+        watcher.flush_for_tests();
+        assert!(watcher.pending_files().is_empty());
+        watcher.stop();
+        assert_eq!(incremental_calls.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(full_calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn extension_config_reload_handles_and_then_drops_custom_source() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-extension-reload");
+        fs::write(
+            dir.path().join("plugin.zz"),
+            "local function plugin()\n  return 1\nend\n",
+        )
+        .unwrap();
+        let paths = IndexPaths::resolve(dir.path(), None).unwrap();
+        let control = relative_path(dir.path(), &paths.extension_config());
+        let (outcome_tx, outcome_rx) = mpsc::channel();
+        let mut options = live_project_options(dir.path());
+        options.debounce = Duration::from_secs(30);
+        options.inert_for_tests = true;
+        options.on_sync_complete = Some(Arc::new(move |outcome| {
+            outcome_tx.send(outcome).unwrap();
+        }));
+        let watcher = ProjectWatcher::start(dir.path(), options).unwrap().unwrap();
+
+        fs::write(paths.extension_config(), r#"{"extensions":{".zz":"lua"}}"#).unwrap();
+        watcher.ingest_event_for_tests(&control);
+        watcher.ingest_event_for_tests("plugin.zz");
+        watcher.flush_for_tests();
+        let added = outcome_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("extension-add full sync");
+        assert_eq!(added.files_reindexed, 1);
+        assert_eq!(
+            added.trigger_paths,
+            vec![control.clone(), "plugin.zz".to_string()]
+        );
+        assert!(
+            codegraph_store::Store::open(&paths.current_db())
+                .unwrap()
+                .file_by_path("plugin.zz")
+                .unwrap()
+                .is_some()
+        );
+
+        fs::write(paths.extension_config(), "{ malformed").unwrap();
+        watcher.ingest_event_for_tests(&control);
+        watcher.flush_for_tests();
+        let removed = outcome_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("tolerant extension reset full sync");
+        assert_eq!(removed.files_removed, 1);
+        assert!(
+            codegraph_store::Store::open(&paths.current_db())
+                .unwrap()
+                .file_by_path("plugin.zz")
+                .unwrap()
+                .is_none(),
+            "malformed JSON keeps the existing tolerant empty-override semantics"
+        );
+        watcher.stop();
+    }
+
+    #[test]
+    fn root_gitignore_reload_reconciles_and_readmits_sources() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-gitignore-reload");
+        fs::create_dir_all(dir.path().join("generated")).unwrap();
+        fs::write(
+            dir.path().join("generated/drop.ts"),
+            "export function drop() { return 1; }\n",
+        )
+        .unwrap();
+        let paths = IndexPaths::resolve(dir.path(), None).unwrap();
+        let initial = crate::sync::sync_project_once(dir.path()).unwrap();
+        assert_eq!(initial.files_reindexed, 1);
+        let (outcome_tx, outcome_rx) = mpsc::channel();
+        let mut options = live_project_options(dir.path());
+        options.debounce = Duration::from_secs(30);
+        options.inert_for_tests = true;
+        options.on_sync_complete = Some(Arc::new(move |outcome| {
+            outcome_tx.send(outcome).unwrap();
+        }));
+        let watcher = ProjectWatcher::start(dir.path(), options).unwrap().unwrap();
+
+        fs::write(dir.path().join(".gitignore"), "generated/\n").unwrap();
+        watcher.ingest_event_for_tests(".gitignore");
+        watcher.ingest_event_for_tests("generated/drop.ts");
+        watcher.flush_for_tests();
+        let removed = outcome_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("gitignore-removal full sync");
+        assert_eq!(removed.files_removed, 1);
+        assert_eq!(removed.trigger_paths, vec![".gitignore".to_string()]);
+
+        fs::write(dir.path().join(".gitignore"), "").unwrap();
+        watcher.ingest_event_for_tests(".gitignore");
+        watcher.flush_for_tests();
+        let readmitted = outcome_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("gitignore-readmission full sync");
+        assert_eq!(readmitted.files_reindexed, 1);
+        assert!(
+            codegraph_store::Store::open(&paths.current_db())
+                .unwrap()
+                .file_by_path("generated/drop.ts")
+                .unwrap()
+                .is_some()
+        );
+        watcher.stop();
     }
 
     #[test]

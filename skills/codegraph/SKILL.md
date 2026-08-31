@@ -90,6 +90,14 @@ directory and incrementally syncs file changes after a debounce. When the watche
 is healthy, do not run a manual sync after every edit. Each project still needs
 one usable index, normally created with `codegraph init`.
 
+The watcher hot-reloads the selected index root's `config.toml` and
+`codegraph.json`, plus the project root `.gitignore`. A control-file change
+atomically replaces the live scope and triggers one full reconcile, so newly
+excluded files are removed and newly included/custom-extension files are added
+without restarting the MCP server. Invalid TOML keeps the last valid scope and
+reports an error; malformed JSON retains CodeGraph's tolerant empty-override
+behavior.
+
 Auto-register into all detected agents (Claude Code, Cursor, Codex, opencode,
 Hermes, Gemini CLI, Antigravity, Kiro, Trae, Qoder, Zed, Zuno, VS Code,
 Copilot CLI, JetBrains):
@@ -159,6 +167,11 @@ the symbol's verbatim source plus its direct callers and callees. A file path
 returns the file's line-numbered source — use this instead of the Read tool for
 any indexed source file. It's faster, and the output is pre-annotated with
 structural context.
+
+Erlang functions are arity-qualified internally. Written queries such as
+`cowboy_stream_h:request_process/3` and
+`cowboy_stream_h::request_process/3` both select that exact function; keep the
+arity when different definitions share the same bare name.
 
 Supports `offset` and `limit` for large files, matching Read's pagination
 interface.

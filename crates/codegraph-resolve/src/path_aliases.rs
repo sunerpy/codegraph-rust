@@ -3,13 +3,15 @@
 //! Ports `upstream resolution/path-aliases.ts`. Reads
 //! `compilerOptions.paths` from `tsconfig.json` / `jsconfig.json` at the project
 //! root and converts the patterns into a form the import resolver can consult
-//! (`path-aliases.ts:1-24`). Scope mirrors the upstream v1: reads tsconfig then
-//! jsconfig, honors `baseUrl` + `paths`, supports the single `*` wildcard, does
-//! NOT follow `extends` chains or read Vite/webpack configs (`path-aliases.ts:14-20`).
+//! (`path-aliases.ts:1-24`). Reads `tsconfig.json`, then `jsconfig.json`, then
+//! `tsconfig.base.json`; follows bounded `extends` chains; honors config-relative
+//! `baseUrl` + `paths`; and supports the single `*` wildcard. Vite/webpack
+//! configs remain out of scope.
 
 use crate::pathutil;
 use serde_json::Value;
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 /// A single alias pattern from `compilerOptions.paths`
 /// (`AliasPattern`, `path-aliases.ts:31-45`).
@@ -34,6 +36,21 @@ pub struct AliasMap {
     /// wildcard).
     pub patterns: Vec<AliasPattern>,
 }
+
+#[derive(Debug, Clone, Default)]
+struct EffectiveOptions {
+    /// Already resolved against the config file that declared it.
+    base_url: Option<String>,
+    /// `paths` replaces its inherited value wholesale, matching TypeScript.
+    paths: Option<serde_json::Map<String, Value>>,
+    /// Directory of the config that declared `paths`; used when no `baseUrl`
+    /// exists anywhere in the effective chain.
+    paths_dir: Option<String>,
+}
+
+/// Real-world chains are normally one to three files deep. Keep malformed or
+/// adversarial projects bounded and deterministic.
+const MAX_EXTENDS_DEPTH: usize = 32;
 
 /// Strip JSONC comments + trailing commas (`stripJsonc`, `path-aliases.ts:65-104`).
 ///
@@ -111,6 +128,127 @@ fn strip_trailing_commas(src: &str) -> String {
     out
 }
 
+fn path_to_posix(path: &Path) -> String {
+    string_path_to_posix(&path.to_string_lossy())
+}
+
+fn string_path_to_posix(path: &str) -> String {
+    pathutil::normalize(&path.replace('\\', "/"))
+}
+
+fn resolve_config_path(from_dir: &Path, spec: &str) -> PathBuf {
+    let path = Path::new(spec);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        from_dir.join(path)
+    }
+}
+
+fn append_json_extension(path: &Path) -> PathBuf {
+    let mut raw = path.as_os_str().to_os_string();
+    raw.push(".json");
+    PathBuf::from(raw)
+}
+
+fn is_file(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
+/// Locate a TypeScript `extends` target. Relative and absolute values are
+/// resolved from the referencing config; package specifiers are searched under
+/// `node_modules` while walking toward the filesystem root. Every form accepts
+/// an explicit file, an implied `.json`, or a directory `tsconfig.json`.
+fn resolve_extends_target(spec: &str, from_dir: &Path) -> Option<PathBuf> {
+    let candidates_for = |base: PathBuf| {
+        [
+            base.clone(),
+            append_json_extension(&base),
+            base.join("tsconfig.json"),
+        ]
+    };
+
+    if spec.starts_with("./") || spec.starts_with("../") || Path::new(spec).is_absolute() {
+        return candidates_for(resolve_config_path(from_dir, spec))
+            .into_iter()
+            .find(|candidate| is_file(candidate));
+    }
+
+    for dir in from_dir.ancestors() {
+        let base = dir.join("node_modules").join(spec);
+        if let Some(candidate) = candidates_for(base)
+            .into_iter()
+            .find(|candidate| is_file(candidate))
+        {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn read_tsconfig_like(path: &Path) -> Option<Value> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let parsed = serde_json::from_str::<Value>(&strip_jsonc(&text)).ok()?;
+    parsed.is_object().then_some(parsed)
+}
+
+/// Fold one config's parents first, then apply the nearest config. A cycle or
+/// overlong chain stops that parent branch while preserving options already
+/// reached through the rest of the chain.
+fn load_effective_options(
+    file_path: &Path,
+    stack: &mut HashSet<String>,
+    depth: usize,
+) -> Option<EffectiveOptions> {
+    let key = path_to_posix(file_path);
+    if depth > MAX_EXTENDS_DEPTH || stack.contains(&key) {
+        return None;
+    }
+    let raw = read_tsconfig_like(file_path)?;
+    stack.insert(key.clone());
+
+    let dir = file_path.parent().unwrap_or_else(|| Path::new(""));
+    let mut effective = EffectiveOptions::default();
+    let parents: Vec<&str> = match raw.get("extends") {
+        Some(Value::String(parent)) => vec![parent.as_str()],
+        Some(Value::Array(parents)) => parents.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    };
+    for parent in parents {
+        let Some(target) = resolve_extends_target(parent, dir) else {
+            continue;
+        };
+        let Some(inherited) = load_effective_options(&target, stack, depth + 1) else {
+            continue;
+        };
+        if inherited.base_url.is_some() {
+            effective.base_url = inherited.base_url;
+        }
+        if inherited.paths.is_some() {
+            effective.paths = inherited.paths;
+            effective.paths_dir = inherited.paths_dir;
+        }
+    }
+    stack.remove(&key);
+
+    let compiler_options = raw.get("compilerOptions").and_then(Value::as_object);
+    if let Some(base_url) = compiler_options
+        .and_then(|options| options.get("baseUrl"))
+        .and_then(Value::as_str)
+    {
+        effective.base_url = Some(path_to_posix(&resolve_config_path(dir, base_url)));
+    }
+    if let Some(paths) = compiler_options
+        .and_then(|options| options.get("paths"))
+        .and_then(Value::as_object)
+    {
+        effective.paths = Some(paths.clone());
+        effective.paths_dir = Some(path_to_posix(dir));
+    }
+
+    Some(effective)
+}
+
 /// Split a pattern around its `*` wildcard (`splitWildcard`, `path-aliases.ts:124-136`).
 fn split_wildcard(pattern: &str) -> (String, String, bool) {
     match pattern.find('*') {
@@ -125,37 +263,37 @@ fn split_wildcard(pattern: &str) -> (String, String, bool) {
 
 /// Load aliases for `project_root` (`loadProjectAliases`, `path-aliases.ts:145-200`).
 ///
-/// Returns `None` when no tsconfig/jsconfig with usable `paths` is present.
+/// Returns `None` when no candidate config or inherited parent has usable
+/// `paths`. A nearer config replaces inherited `paths`; `baseUrl` is resolved
+/// relative to the file that declared it.
 pub fn load_project_aliases(project_root: &str) -> Option<AliasMap> {
-    let candidates = ["tsconfig.json", "jsconfig.json"];
-    let mut raw: Option<Value> = None;
+    let candidates = ["tsconfig.json", "jsconfig.json", "tsconfig.base.json"];
+    let mut effective: Option<EffectiveOptions> = None;
     for name in candidates {
         let p = Path::new(project_root).join(name);
-        if p.exists() {
-            if let Ok(text) = std::fs::read_to_string(&p) {
-                if let Ok(parsed) = serde_json::from_str::<Value>(&strip_jsonc(&text)) {
-                    if parsed.is_object() {
-                        raw = Some(parsed);
-                        break;
-                    }
-                }
-            }
+        if !is_file(&p) {
+            continue;
+        }
+        let Some(options) = load_effective_options(&p, &mut HashSet::new(), 0) else {
+            continue;
+        };
+        if effective.is_none() {
+            effective = Some(options.clone());
+        }
+        if options.paths.is_some() {
+            effective = Some(options);
+            break;
         }
     }
-    let raw = raw?;
-
-    let compiler_options = raw.get("compilerOptions").and_then(Value::as_object);
-    let base_url_rel = compiler_options
-        .and_then(|co| co.get("baseUrl"))
-        .and_then(Value::as_str)
-        .unwrap_or(".");
-    let base_url = pathutil::resolve(project_root, base_url_rel);
-
-    let paths = compiler_options.and_then(|co| co.get("paths"))?;
-    let paths = paths.as_object()?;
+    let effective = effective?;
+    let base_url = effective
+        .base_url
+        .or(effective.paths_dir)
+        .unwrap_or_else(|| string_path_to_posix(project_root));
+    let paths = effective.paths?;
 
     let mut patterns: Vec<AliasPattern> = Vec::new();
-    for (pattern, targets) in paths {
+    for (pattern, targets) in &paths {
         let Some(targets) = targets.as_array() else {
             continue;
         };
@@ -205,6 +343,7 @@ pub fn load_project_aliases(project_root: &str) -> Option<AliasMap> {
 /// empty vec when no alias matches. Callers still apply the language's extension
 /// list to each candidate.
 pub fn apply_aliases(import_path: &str, aliases: &AliasMap, project_root: &str) -> Vec<String> {
+    let project_root = string_path_to_posix(project_root);
     for pat in &aliases.patterns {
         if !import_path.starts_with(&pat.prefix) {
             continue;
@@ -230,9 +369,9 @@ pub fn apply_aliases(import_path: &str, aliases: &AliasMap, project_root: &str) 
                 target.clone()
             };
             let absolute = pathutil::resolve(&aliases.base_url, &filled);
-            let rel = pathutil::relative(project_root, &absolute);
+            let rel = pathutil::relative(&project_root, &absolute);
             // Skip rewrites that escape the project root (path-aliases.ts:235-236).
-            if rel.starts_with("..") {
+            if rel == ".." || rel.starts_with("../") {
                 continue;
             }
             out.push(rel);
@@ -256,6 +395,12 @@ mod tests {
         p.push(format!("cg-aliases-{tag}-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&p).expect("mkdir temp");
         p
+    }
+
+    fn write_json(path: impl AsRef<Path>, value: Value) {
+        let path = path.as_ref();
+        std::fs::create_dir_all(path.parent().expect("config parent")).unwrap();
+        std::fs::write(path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
     }
 
     #[test]
@@ -339,6 +484,216 @@ mod tests {
     }
 
     #[test]
+    fn load_project_aliases_follows_relative_multi_hop_extends() {
+        let root = temp_dir("extends-relative");
+        write_json(
+            root.join("tsconfig.root.json"),
+            serde_json::json!({
+                "compilerOptions": {
+                    "baseUrl": ".",
+                    "paths": { "@app/*": ["packages/*/src"] }
+                }
+            }),
+        );
+        write_json(
+            root.join("tsconfig.mid.json"),
+            serde_json::json!({ "extends": "./tsconfig.root" }),
+        );
+        write_json(
+            root.join("tsconfig.json"),
+            serde_json::json!({ "extends": "./tsconfig.mid.json" }),
+        );
+
+        let map = load_project_aliases(root.to_str().unwrap()).expect("aliases");
+        assert_eq!(
+            apply_aliases("@app/ui", &map, root.to_str().unwrap()),
+            vec!["packages/ui/src"]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn load_project_aliases_accepts_absolute_extends_target() {
+        let root = temp_dir("extends-absolute");
+        let base = root.join("config/aliases.json");
+        write_json(
+            &base,
+            serde_json::json!({
+                "compilerOptions": { "paths": { "~/*": ["src/*"] } }
+            }),
+        );
+        write_json(
+            root.join("tsconfig.json"),
+            serde_json::json!({ "extends": base.to_string_lossy() }),
+        );
+
+        let map = load_project_aliases(root.to_str().unwrap()).expect("aliases");
+        assert_eq!(
+            apply_aliases("~/thing", &map, root.to_str().unwrap()),
+            vec!["config/src/thing"]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn load_project_aliases_resolves_node_modules_package_extends() {
+        let root = temp_dir("extends-package");
+        write_json(
+            root.join("node_modules/@acme/tsconfig/tsconfig.json"),
+            serde_json::json!({
+                "compilerOptions": { "paths": { "@acme/*": ["../../../src/*"] } }
+            }),
+        );
+        write_json(
+            root.join("tsconfig.json"),
+            serde_json::json!({ "extends": "@acme/tsconfig" }),
+        );
+
+        let map = load_project_aliases(root.to_str().unwrap()).expect("aliases");
+        assert_eq!(
+            apply_aliases("@acme/thing", &map, root.to_str().unwrap()),
+            vec!["src/thing"]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn inherited_paths_and_baseurl_are_anchored_at_declaring_config() {
+        let root = temp_dir("extends-anchor");
+        write_json(
+            root.join("config/tsconfig.base.json"),
+            serde_json::json!({
+                "compilerOptions": {
+                    "baseUrl": "..",
+                    "paths": { "~/*": ["src/*"] }
+                }
+            }),
+        );
+        write_json(
+            root.join("tsconfig.json"),
+            serde_json::json!({ "extends": "./config/tsconfig.base.json" }),
+        );
+
+        let map = load_project_aliases(root.to_str().unwrap()).expect("aliases");
+        assert_eq!(
+            apply_aliases("~/foo", &map, root.to_str().unwrap()),
+            vec!["src/foo"]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn child_paths_replace_parent_paths_and_nearest_baseurl_wins() {
+        let root = temp_dir("extends-override");
+        write_json(
+            root.join("tsconfig.base.json"),
+            serde_json::json!({
+                "compilerOptions": {
+                    "baseUrl": "base-dir",
+                    "paths": {
+                        "@x/*": ["from-base/*"],
+                        "@parent/*": ["parent/*"]
+                    }
+                }
+            }),
+        );
+        write_json(
+            root.join("tsconfig.json"),
+            serde_json::json!({
+                "extends": "./tsconfig.base.json",
+                "compilerOptions": {
+                    "baseUrl": "own-dir",
+                    "paths": { "@x/*": ["from-child/*"] }
+                }
+            }),
+        );
+
+        let map = load_project_aliases(root.to_str().unwrap()).expect("aliases");
+        assert_eq!(
+            apply_aliases("@x/y", &map, root.to_str().unwrap()),
+            vec!["own-dir/from-child/y"]
+        );
+        assert!(apply_aliases("@parent/y", &map, root.to_str().unwrap()).is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cyclic_extends_terminates_and_keeps_reached_options() {
+        let root = temp_dir("extends-cycle");
+        write_json(
+            root.join("tsconfig.json"),
+            serde_json::json!({ "extends": "./a.json" }),
+        );
+        write_json(
+            root.join("a.json"),
+            serde_json::json!({
+                "extends": "./b.json",
+                "compilerOptions": { "paths": { "@cycle/*": ["from-a/*"] } }
+            }),
+        );
+        write_json(
+            root.join("b.json"),
+            serde_json::json!({ "extends": "./a.json" }),
+        );
+
+        let map = load_project_aliases(root.to_str().unwrap()).expect("aliases");
+        assert_eq!(
+            apply_aliases("@cycle/x", &map, root.to_str().unwrap()),
+            vec!["from-a/x"]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn extends_depth_is_bounded() {
+        let root = temp_dir("extends-depth");
+        write_json(
+            root.join("tsconfig.json"),
+            serde_json::json!({ "extends": "./c0.json" }),
+        );
+        for index in 0..32 {
+            write_json(
+                root.join(format!("c{index}.json")),
+                serde_json::json!({ "extends": format!("./c{}.json", index + 1) }),
+            );
+        }
+        write_json(
+            root.join("c32.json"),
+            serde_json::json!({
+                "compilerOptions": { "paths": { "@too-deep/*": ["src/*"] } }
+            }),
+        );
+
+        assert!(load_project_aliases(root.to_str().unwrap()).is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn solution_root_falls_back_to_tsconfig_base() {
+        let root = temp_dir("base-fallback");
+        write_json(
+            root.join("tsconfig.json"),
+            serde_json::json!({ "files": [], "references": [] }),
+        );
+        write_json(
+            root.join("tsconfig.base.json"),
+            serde_json::json!({
+                "compilerOptions": {
+                    "baseUrl": ".",
+                    "paths": { "@scope/*": ["libs/*/src/index.ts"] }
+                }
+            }),
+        );
+
+        let map = load_project_aliases(root.to_str().unwrap()).expect("aliases");
+        assert_eq!(
+            apply_aliases("@scope/lib", &map, root.to_str().unwrap()),
+            vec!["libs/lib/src/index.ts"]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn load_project_aliases_none_when_no_config() {
         let root = temp_dir("none");
         assert!(load_project_aliases(root.to_str().unwrap()).is_none());
@@ -380,7 +735,7 @@ mod tests {
         )
         .unwrap();
         let map = load_project_aliases(root.to_str().unwrap()).expect("aliases");
-        assert_eq!(map.base_url, root.to_str().unwrap());
+        assert_eq!(map.base_url, path_to_posix(&root));
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -441,6 +796,23 @@ mod tests {
         };
         let out = apply_aliases("@up/x", &map, "/proj");
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn apply_aliases_normalizes_windows_project_root_separators() {
+        let map = AliasMap {
+            base_url: "C:/repo".to_string(),
+            patterns: vec![AliasPattern {
+                prefix: "@app/".to_string(),
+                suffix: String::new(),
+                has_wildcard: true,
+                replacements: vec!["src/*".to_string()],
+            }],
+        };
+        assert_eq!(
+            apply_aliases("@app/main", &map, r"C:\repo"),
+            vec!["src/main"]
+        );
     }
 
     #[test]

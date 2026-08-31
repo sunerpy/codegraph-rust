@@ -13,18 +13,17 @@
 //!
 //! Two config hooks ARE used through the generic machinery, exactly as
 //! upstream: `package_types` (`module_attribute` → a file namespace, so every
-//! function's qualified name is `m::f` — the same shape the remote-call branch
-//! emits, so `mod:f(...)` resolves through the standard qualified-name matcher
-//! with ZERO resolver changes) and `import_types`
+//! function's qualified name is `m::f/arity` — the same shape the remote-call
+//! branch emits, so `mod:f(...)` resolves through the qualified-name matcher)
+//! and `import_types`
 //! (`import_attribute`/`pp_include`/`pp_include_lib` → an `Import` node + an
 //! `Imports` file/module edge).
 //!
 //! The non-Godot framework RESOLVER bridges — `-behaviour(x)` callback
-//! contracts, `gen_server:call/cast(?MODULE|?SERVER)` → `handle_call`/
-//! `handle_cast`, the `spawn`/`apply`/`proc_lib`/`timer`/`rpc` MFA-argument
-//! callee lift, var-module dispatch, and `.app`/`.app.src` resource-tuple wiring
-//! — are DEFERRED, consistent with ArkTS/Nix/Terraform (the port has exactly one
-//! concrete `FrameworkResolver`, `GodotResolver`).
+//! contracts, var-module dispatch, and `.app`/`.app.src` resource-tuple wiring
+//! — are DEFERRED. Static `gen_server` targets and the
+//! `spawn`/`apply`/`proc_lib`/`timer`/`rpc` MFA-argument callee lift are handled
+//! directly by the walker because they are deterministic AST facts.
 //!
 //! The pure AST helper fns below are `pub(crate)` and re-exported through
 //! [`crate::lang`] so the walker can reach them as `crate::lang::<fn>`.
@@ -176,20 +175,42 @@ pub(crate) fn erlang_collapse_ws(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Exported function names for a module, or [`ErlangExports::All`] for
-/// `-compile(export_all)`. Ports `moduleExports` (erlang.ts:53-79). The result
-/// is used only for the `is_exported` membership check — it never iterates into
-/// output — so a `HashSet` is deterministic here.
+/// Argument count of an Erlang clause, type signature, or call. The grammar's
+/// `args` field is an `expr_args`; its direct named-child count is the language
+/// arity, so commas nested inside `<<binary, literals>>` never inflate it.
+pub(crate) fn erlang_node_arity(node: Node<'_>) -> usize {
+    child_by_field(node, "args")
+        .map(|args| args.named_child_count())
+        .unwrap_or(0)
+}
+
+fn erlang_written_arity(node: Node<'_>, source: &str) -> Option<String> {
+    let arity = child_by_field(node, "arity")?;
+    let value = child_by_field(arity, "value")?;
+    let text = node_text(value, source);
+    if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) {
+        Some(text)
+    } else {
+        None
+    }
+}
+
+/// Exported function `name/arity` keys for a module, or
+/// [`ErlangExports::All`] for `-compile(export_all)`. A malformed export lacking
+/// an arity falls back to a bare-name key. The result is used only for
+/// membership checks, so a `HashSet` is deterministic here.
 pub(crate) enum ErlangExports {
     All,
     Names(HashSet<String>),
 }
 
 impl ErlangExports {
-    pub(crate) fn contains(&self, name: &str) -> bool {
+    pub(crate) fn contains(&self, name: &str, arity: usize) -> bool {
         match self {
             ErlangExports::All => true,
-            ErlangExports::Names(set) => set.contains(name),
+            ErlangExports::Names(set) => {
+                set.contains(&format!("{name}/{arity}")) || set.contains(name)
+            }
         }
     }
 }
@@ -212,7 +233,10 @@ pub(crate) fn erlang_module_exports(root: Node<'_>, source: &str) -> ErlangExpor
                 if let Some(fun) = child_by_field(fa, "fun") {
                     let n = erlang_atom_text(fun, source);
                     if !n.is_empty() {
-                        names.insert(n);
+                        let key = erlang_written_arity(fa, source)
+                            .map(|arity| format!("{n}/{arity}"))
+                            .unwrap_or(n);
+                        names.insert(key);
                     }
                 }
             }
@@ -226,6 +250,7 @@ pub(crate) fn erlang_module_exports(root: Node<'_>, source: &str) -> ErlangExpor
 pub(crate) fn erlang_preceding_spec<'t>(
     fun_decl: Node<'t>,
     name: &str,
+    arity: usize,
     source: &str,
 ) -> Option<Node<'t>> {
     let mut prev = fun_decl.prev_named_sibling();
@@ -240,7 +265,19 @@ pub(crate) fn erlang_preceding_spec<'t>(
     if p.kind() == "spec" {
         let spec_fun = child_by_field(p, "fun")?;
         if erlang_atom_text(spec_fun, source) == name {
-            return Some(p);
+            let mut saw_signature = false;
+            for signature in p.named_children(&mut p.walk()) {
+                if signature.kind() != "type_sig" {
+                    continue;
+                }
+                saw_signature = true;
+                if erlang_node_arity(signature) == arity {
+                    return Some(p);
+                }
+            }
+            if !saw_signature {
+                return Some(p);
+            }
         }
     }
     None
@@ -310,11 +347,11 @@ pub(crate) fn erlang_macro_name(node: Node<'_>, source: &str) -> Option<String> 
 
 /// The qualified callee name of a `call` node, or `None` for a dynamic
 /// (var/macro-module) target that has no static callee. A remote call
-/// (`mod:f(...)`) yields `mod::f`; a local call (`f(...)`) yields `f`;
-/// `?MODULE:f(...)` yields the bare `f` (same-file preference resolves it).
+/// (`mod:f(A, B)`) yields `mod::f/2`; a local call (`f(A)`) yields `f/1`;
+/// `?MODULE:f(...)` yields the bare name plus arity (same-file preference
+/// resolves it).
 /// Ports the `node.type === 'call'` arm of the erlang branch in
-/// `extractCall` (tree-sitter.ts:3684-3722), MINUS the DEFERRED gen_server and
-/// MFA-argument lifts.
+/// `extractCall` (tree-sitter.ts:3684-3722).
 pub(crate) fn erlang_call_ref_name(call: Node<'_>, source: &str) -> Option<String> {
     let mut callee = child_by_field(call, "expr")?;
     let mut module_node: Option<Node<'_>> = None;
@@ -333,35 +370,36 @@ pub(crate) fn erlang_call_ref_name(call: Node<'_>, source: &str) -> Option<Strin
         return None;
     }
     let fn_bare = erlang_atom_text(callee, source);
-    let Some(module_node) = module_node else {
-        return Some(fn_bare);
-    };
-    // `remote_module` wraps the module expression in a `module` field.
-    let module_expr = child_by_field(module_node, "module");
-    match module_expr {
-        Some(m) if m.kind() == "atom" => {
-            Some(format!("{}::{}", erlang_atom_text(m, source), fn_bare))
-        }
-        Some(m) => {
-            // Non-atom module. `?MODULE:f(X)` targets THIS module — keep the
-            // bare name so same-file preference resolves it. Anything else
-            // (`Mod:f(X)`) is dynamic dispatch with no static target: stay
-            // silent rather than link an arbitrary same-named function.
-            if m.kind() == "macro_call_expr" {
-                if let Some(mname) = child_by_field(m, "name") {
-                    if node_text(mname, source) == "MODULE" {
-                        return Some(fn_bare);
-                    }
+    let base = if let Some(module_node) = module_node {
+        // `remote_module` wraps the module expression in a `module` field.
+        let module_expr = child_by_field(module_node, "module");
+        match module_expr {
+            Some(m) if m.kind() == "atom" => {
+                format!("{}::{}", erlang_atom_text(m, source), fn_bare)
+            }
+            Some(m) => {
+                // Non-atom module. `?MODULE:f(X)` targets THIS module — keep
+                // the bare name so same-file preference resolves it. Anything
+                // else (`Mod:f(X)`) is dynamic dispatch with no static target.
+                if m.kind() == "macro_call_expr"
+                    && child_by_field(m, "name")
+                        .is_some_and(|mname| node_text(mname, source) == "MODULE")
+                {
+                    fn_bare
+                } else {
+                    return None;
                 }
             }
-            None
+            None => fn_bare,
         }
-        None => Some(fn_bare),
-    }
+    } else {
+        fn_bare
+    };
+    Some(format!("{base}/{}", erlang_node_arity(call)))
 }
 
-/// The referenced fun name of an `internal_fun` (`fun f/1` → `f`) or
-/// `external_fun` (`fun mod:f/1` → `mod::f`), or `None` for a var-part
+/// The referenced fun name of an `internal_fun` (`fun f/1` → `f/1`) or
+/// `external_fun` (`fun mod:f/1` → `mod::f/1`), or `None` for a var-part
 /// (`fun Mod:F/A`) that is dynamic. These are function VALUES —
 /// `EdgeKind::References`, not calls. Ports the `internal_fun`/`external_fun`
 /// arm (tree-sitter.ts:3785-3803).
@@ -378,6 +416,10 @@ pub(crate) fn erlang_fun_value_ref_name(node: Node<'_>, source: &str) -> Option<
             return None;
         }
         name = format!("{}::{}", erlang_atom_text(module_atom, source), name);
+    }
+    if let Some(arity) = erlang_written_arity(node, source) {
+        name.push('/');
+        name.push_str(&arity);
     }
     Some(name)
 }

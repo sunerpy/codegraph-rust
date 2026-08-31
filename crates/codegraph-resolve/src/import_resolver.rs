@@ -8,7 +8,7 @@
 
 use crate::name_matcher::{
     local_receiver_type_patterns, normalize_inferred_type_name, regex_escape,
-    resolve_method_on_type,
+    resolve_method_on_type, resolve_object_literal_member,
 };
 use crate::path_aliases::apply_aliases;
 use crate::pathutil;
@@ -35,7 +35,16 @@ fn extension_resolution(language: Language) -> &'static [&'static str] {
             "/index.tsx",
             "/index.js",
         ],
-        Language::JavaScript => &[".js", ".jsx", ".mjs", ".cjs", "/index.js", "/index.jsx"],
+        Language::JavaScript => &[
+            ".js",
+            ".jsx",
+            ".mjs",
+            ".cjs",
+            ".xsjs",
+            ".xsjslib",
+            "/index.js",
+            "/index.jsx",
+        ],
         Language::Tsx => &[
             ".tsx",
             ".ts",
@@ -1456,8 +1465,12 @@ pub fn resolve_via_import(
     // `from . import certs`), and absolute dotted module import
     // (`import pkg.mod`) (import-resolver.ts:1226-1238).
     if reference.language == Language::Python {
-        if let Some(py_result) = resolve_python_module_member(reference, &imports, context) {
+        let py_module = lookup_python_module_member(reference, &imports, context);
+        if let Some(py_result) = py_module.resolved {
             return Some(py_result);
+        }
+        if py_module.claimed {
+            return None;
         }
         if let Some(py_member) = resolve_python_from_import_member(reference, &imports, context) {
             return Some(py_member);
@@ -1547,6 +1560,26 @@ pub fn resolve_via_import(
                     // (which `create_edges` would then mis-promote to `instantiates`).
                     // Ports import-resolver.ts:1298-1316 (upstream f7441f21 / #825).
                     if !imp.is_namespace {
+                        if matches!(target_node.kind, NodeKind::Constant | NodeKind::Variable) {
+                            let prefix = format!("{}.", imp.local_name);
+                            if let Some(member) = reference
+                                .reference_name
+                                .strip_prefix(&prefix)
+                                .and_then(|tail| tail.split('.').next())
+                                .filter(|member| !member.is_empty())
+                            {
+                                if let Some(literal_member) = resolve_object_literal_member(
+                                    &target_node,
+                                    member,
+                                    reference,
+                                    context,
+                                    0.9,
+                                    ResolvedBy::Import,
+                                ) {
+                                    return Some(literal_member);
+                                }
+                            }
+                        }
                         // An imported VALUE called through a member —
                         // `reproStore.notifyJoinGuildStatus()` after
                         // `import { reproStore } from './store'`. Linking the
@@ -2081,34 +2114,60 @@ fn resolve_go_cross_package_reference(
     None
 }
 
-/// Python `mod.func()` where `mod` is an imported MODULE (submodule of a
-/// package or a bare `import mod`). Ports `resolvePythonModuleMember`
-/// (import-resolver.ts, issue #578).
-fn resolve_python_module_member(
+#[derive(Default)]
+struct PythonModuleMemberLookup {
+    claimed: bool,
+    resolved: Option<ResolvedRef>,
+}
+
+/// Classify and, when possible, resolve Python `mod.func()` where `mod` is an
+/// imported MODULE (a submodule of a package or a bare `import mod`).
+///
+/// The `claimed` bit is as important as the successful result: once a receiver
+/// is known to be a module alias, an absent or ambiguous member must stay
+/// unresolved instead of falling through to a same-named global guess.
+fn lookup_python_module_member(
     reference: &RefView,
     imports: &[ImportMapping],
     context: &dyn ResolutionContext,
-) -> Option<ResolvedRef> {
-    let dot_idx = reference.reference_name.find('.')?;
+) -> PythonModuleMemberLookup {
+    let Some(dot_idx) = reference.reference_name.find('.') else {
+        return PythonModuleMemberLookup::default();
+    };
     if dot_idx == 0 {
-        return None;
+        return PythonModuleMemberLookup::default();
     }
     let receiver = &reference.reference_name[..dot_idx];
-    let member = reference.reference_name[dot_idx + 1..].split('.').next()?;
+    let Some(member) = reference.reference_name[dot_idx + 1..].split('.').next() else {
+        return PythonModuleMemberLookup::default();
+    };
     if member.is_empty() {
-        return None;
+        return PythonModuleMemberLookup::default();
     }
 
-    for imp in imports {
-        if imp.local_name != receiver {
-            continue;
-        }
+    let matching: Vec<&ImportMapping> = imports
+        .iter()
+        .filter(|imp| imp.local_name == receiver)
+        .collect();
+    if matching.is_empty() {
+        return PythonModuleMemberLookup::default();
+    }
+
+    let mut module_bindings = Vec::new();
+    let mut namespace_claimed = false;
+    for imp in &matching {
+        let module_name = if imp.exported_name == "*" {
+            imp.local_name.as_str()
+        } else {
+            imp.exported_name.as_str()
+        };
         let module_path = if imp.is_namespace {
+            namespace_claimed = true;
             imp.source.clone()
         } else if imp.source.ends_with('.') {
-            format!("{}{}", imp.source, imp.local_name)
+            format!("{}{}", imp.source, module_name)
         } else {
-            format!("{}.{}", imp.source, imp.local_name)
+            format!("{}.{}", imp.source, module_name)
         };
 
         let resolved_path = resolve_import_path(
@@ -2118,36 +2177,86 @@ fn resolve_python_module_member(
             context,
         )
         .or_else(|| find_python_module_file(&module_path, context, &reference.file_path));
-        let Some(resolved_path) = resolved_path else {
-            continue;
-        };
-        if resolved_path == reference.file_path {
-            continue;
-        }
-
-        if let Some(target) = context
-            .get_nodes_in_file_shared(&resolved_path)
-            .into_iter()
-            .find(|n| {
-                n.name == member
-                    && matches!(
-                        n.kind,
-                        NodeKind::Function
-                            | NodeKind::Class
-                            | NodeKind::Variable
-                            | NodeKind::Constant
-                    )
-            })
-        {
-            return Some(ResolvedRef {
-                original: reference.clone(),
-                target_node_id: target.id.clone(),
-                confidence: 0.85,
-                resolved_by: ResolvedBy::Import,
-            });
+        if let Some(resolved_path) = resolved_path {
+            module_bindings.push(resolved_path);
         }
     }
-    None
+
+    // `from pkg import Thing as Alias` is still a member import when
+    // `pkg/Thing.py` does not exist. Preserve that existing path. Namespace
+    // imports (`import pkg as alias`) always claim their receiver, even when the
+    // module is missing, because they cannot denote a package member.
+    if module_bindings.is_empty() {
+        return PythonModuleMemberLookup {
+            claimed: namespace_claimed,
+            resolved: None,
+        };
+    }
+
+    // Rebinding the same local alias is ambiguous by construction. Never select
+    // whichever import happened to be visited first.
+    if matching.len() != 1 || module_bindings.len() != 1 {
+        return PythonModuleMemberLookup {
+            claimed: true,
+            resolved: None,
+        };
+    }
+
+    let resolved_path = &module_bindings[0];
+    if resolved_path == &reference.file_path {
+        return PythonModuleMemberLookup {
+            claimed: true,
+            resolved: None,
+        };
+    }
+
+    let mut targets = context
+        .get_nodes_in_file_shared(resolved_path)
+        .into_iter()
+        .filter(|n| {
+            n.name == member
+                && matches!(
+                    n.kind,
+                    NodeKind::Function | NodeKind::Class | NodeKind::Variable | NodeKind::Constant
+                )
+        });
+    let Some(target) = targets.next() else {
+        return PythonModuleMemberLookup {
+            claimed: true,
+            resolved: None,
+        };
+    };
+    if targets.next().is_some() {
+        return PythonModuleMemberLookup {
+            claimed: true,
+            resolved: None,
+        };
+    }
+
+    PythonModuleMemberLookup {
+        claimed: true,
+        resolved: Some(ResolvedRef {
+            original: reference.clone(),
+            target_node_id: target.id.clone(),
+            confidence: 0.85,
+            resolved_by: ResolvedBy::Import,
+        }),
+    }
+}
+
+/// Whether a Python qualified reference is bound to an imported module alias.
+///
+/// Used by the strategy orchestrator to prevent a claimed-but-unresolved module
+/// member from falling through to global name matching.
+pub(crate) fn python_module_member_is_claimed(
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> bool {
+    if reference.language != Language::Python {
+        return false;
+    }
+    let imports = context.get_import_mappings(&reference.file_path, reference.language);
+    lookup_python_module_member(reference, &imports, context).claimed
 }
 
 /// Python `from pkg.mod import member [as alias]` → `member` in the file
@@ -2167,8 +2276,9 @@ fn resolve_python_module_member(
 /// Deliberately narrow, so it repairs the reported defect without displacing an
 /// already-correct resolution chain:
 ///   * `Imports` references keep their own module/file resolution.
-///   * FUNCTION-REF (function-as-value) references keep the strictly-gated #756
-///     path — `reference/golden/python/` pins those as `resolvedBy:function-ref`.
+///   * Unaliased FUNCTION-REF references keep the strictly-gated #756 path;
+///     aliased member values need this import binding because no target node is
+///     named after the local alias.
 ///   * Only the BARE reference form (`member()`) is handled; a `Member.attr()`
 ///     tail stays with `resolve_python_module_member` and the method matcher.
 fn resolve_python_from_import_member(
@@ -2177,68 +2287,62 @@ fn resolve_python_from_import_member(
     context: &dyn ResolutionContext,
 ) -> Option<ResolvedRef> {
     if reference.reference_kind == codegraph_core::types::EdgeKind::Imports
-        || reference.is_function_ref
         || reference.reference_name.contains('.')
         || reference.reference_name.is_empty()
     {
         return None;
     }
 
-    for imp in imports {
-        if imp.local_name != reference.reference_name {
-            continue;
-        }
-        // A namespace/default import binds a MODULE, not a member.
-        if imp.is_namespace || imp.is_default || imp.exported_name.is_empty() {
-            continue;
-        }
-        // `import mod` yields `local_name == exported_name == source`; that is a
-        // module binding, handled by `resolve_python_module_member` /
-        // `resolve_module_import_to_file`.
-        if imp.source.is_empty() || imp.source == imp.local_name {
-            continue;
-        }
-
-        // Relative dotted sources resolve lexically; absolute ones need the
-        // dotted-module file lookup (`pkg.mod` → `pkg/mod.py`).
-        let Some(module_file) = resolve_import_path(
-            &imp.source,
-            &reference.file_path,
-            reference.language,
-            context,
-        )
-        .or_else(|| find_python_module_file(&imp.source, context, &reference.file_path)) else {
-            continue;
-        };
-        if module_file == reference.file_path {
-            continue;
-        }
-
-        // `get_nodes_in_file` is ordered by `start_line`, so a file declaring the
-        // name twice resolves deterministically to the first declaration.
-        if let Some(target) = context
-            .get_nodes_in_file_shared(&module_file)
-            .into_iter()
-            .find(|n| {
-                n.name == imp.exported_name
-                    && matches!(
-                        n.kind,
-                        NodeKind::Function
-                            | NodeKind::Class
-                            | NodeKind::Variable
-                            | NodeKind::Constant
-                    )
-            })
-        {
-            return Some(ResolvedRef {
-                original: reference.clone(),
-                target_node_id: target.id.clone(),
-                confidence: 0.9,
-                resolved_by: ResolvedBy::Import,
-            });
-        }
+    let matching = imports
+        .iter()
+        .filter(|imp| imp.local_name == reference.reference_name)
+        .filter(|imp| {
+            !imp.is_namespace
+                && !imp.is_default
+                && !imp.exported_name.is_empty()
+                && !imp.source.is_empty()
+                && imp.source != imp.local_name
+                && (!reference.is_function_ref || imp.local_name != imp.exported_name)
+        })
+        .collect::<Vec<_>>();
+    if matching.len() != 1 {
+        return None;
     }
-    None
+    let imp = matching[0];
+
+    // Relative dotted sources resolve lexically; absolute ones need the
+    // dotted-module file lookup (`pkg.mod` → `pkg/mod.py`).
+    let module_file = resolve_import_path(
+        &imp.source,
+        &reference.file_path,
+        reference.language,
+        context,
+    )
+    .or_else(|| find_python_module_file(&imp.source, context, &reference.file_path))?;
+    if module_file == reference.file_path {
+        return None;
+    }
+
+    let targets = context
+        .get_nodes_in_file_shared(&module_file)
+        .into_iter()
+        .filter(|node| {
+            node.name == imp.exported_name
+                && matches!(
+                    node.kind,
+                    NodeKind::Function | NodeKind::Class | NodeKind::Variable | NodeKind::Constant
+                )
+        })
+        .collect::<Vec<_>>();
+    if targets.len() != 1 {
+        return None;
+    }
+    Some(ResolvedRef {
+        original: reference.clone(),
+        target_node_id: targets[0].id.clone(),
+        confidence: 0.9,
+        resolved_by: ResolvedBy::Import,
+    })
 }
 
 /// Python absolute dotted module import `import a.b.c` → its file (the Django
@@ -3325,6 +3429,36 @@ export default defaultTarget;
     }
 
     #[test]
+    fn resolve_import_path_javascript_supports_xsjslib() {
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: BTreeSet::from(["src/helpers.xsjslib".to_string()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_import_path("./helpers", "src/service.xsjs", Language::JavaScript, &ctx),
+            Some("src/helpers.xsjslib".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_import_path_javascript_keeps_js_precedence_over_xsjs() {
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: BTreeSet::from([
+                "src/helpers.js".to_string(),
+                "src/helpers.xsjs".to_string(),
+                "src/helpers.xsjslib".to_string(),
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_import_path("./helpers", "src/service.xsjs", Language::JavaScript, &ctx),
+            Some("src/helpers.js".to_string())
+        );
+    }
+
+    #[test]
     fn resolve_import_path_relative_index_file() {
         let mut existing = BTreeSet::new();
         existing.insert("src/dir/index.ts".to_string());
@@ -3947,6 +4081,62 @@ export default defaultTarget;
     }
 
     #[test]
+    fn resolve_via_import_object_literal_member_by_containment() {
+        let mut existing = BTreeSet::new();
+        existing.insert("src/api.ts".to_string());
+        let mut import_mappings = BTreeMap::new();
+        import_mappings.insert(
+            "src/use.ts".to_string(),
+            vec![mapping("api", "api", "./api")],
+        );
+        let mut api = exported(node(
+            "constant:api",
+            "api",
+            NodeKind::Constant,
+            "src/api.ts",
+            Language::TypeScript,
+        ));
+        api.start_line = 1;
+        api.end_line = 6;
+        let mut member = node(
+            "function:call-member",
+            "call",
+            NodeKind::Function,
+            "src/api.ts",
+            Language::TypeScript,
+        );
+        member.start_line = 2;
+        member.end_line = 2;
+        let mut decoy = node(
+            "function:call-decoy",
+            "call",
+            NodeKind::Function,
+            "src/api.ts",
+            Language::TypeScript,
+        );
+        decoy.start_line = 10;
+        decoy.end_line = 10;
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            import_mappings,
+            nodes: vec![api, member, decoy],
+            ..Default::default()
+        };
+        let reference = reference(
+            "api.call",
+            EdgeKind::Calls,
+            "src/use.ts",
+            Language::TypeScript,
+        );
+
+        let resolved = resolve_via_import(&reference, &ctx).expect("literal member");
+        assert_eq!(resolved.target_node_id, "function:call-member");
+        assert_eq!(resolved.resolved_by, ResolvedBy::Import);
+        assert_eq!(resolved.confidence, 0.9);
+    }
+
+    #[test]
     fn resolve_via_import_generic_default_import() {
         let mut existing = BTreeSet::new();
         existing.insert("src/foo.ts".to_string());
@@ -4228,6 +4418,236 @@ export default defaultTarget;
         let resolved = resolve_via_import(&r, &ctx).expect("resolves");
         assert_eq!(resolved.target_node_id, "function:helper");
         assert_eq!(resolved.confidence, 0.85);
+    }
+
+    #[test]
+    fn resolve_python_module_member_uses_exported_name_for_from_import_alias() {
+        let mut existing = BTreeSet::new();
+        existing.insert("pkg/module.py".to_string());
+        let mut import_mappings = BTreeMap::new();
+        import_mappings.insert(
+            "app.py".to_string(),
+            vec![ImportMapping {
+                local_name: "mod_alias".to_string(),
+                exported_name: "module".to_string(),
+                source: "pkg".to_string(),
+                is_default: false,
+                is_namespace: false,
+            }],
+        );
+        let target = node(
+            "function:func",
+            "func",
+            NodeKind::Function,
+            "pkg/module.py",
+            Language::Python,
+        );
+        let module_file = file_node("pkg/module.py", Language::Python);
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            import_mappings,
+            nodes: vec![target, module_file],
+            ..Default::default()
+        };
+        let r = reference(
+            "mod_alias.func",
+            EdgeKind::Calls,
+            "app.py",
+            Language::Python,
+        );
+
+        let resolved = resolve_via_import(&r, &ctx).expect("aliased submodule resolves");
+        assert_eq!(resolved.target_node_id, "function:func");
+        assert!(python_module_member_is_claimed(&r, &ctx));
+    }
+
+    #[test]
+    fn resolve_python_plain_module_alias_remains_supported() {
+        let mut existing = BTreeSet::new();
+        existing.insert("top_level.py".to_string());
+        let mut import_mappings = BTreeMap::new();
+        import_mappings.insert(
+            "app.py".to_string(),
+            vec![ImportMapping {
+                local_name: "tl".to_string(),
+                exported_name: "*".to_string(),
+                source: "top_level".to_string(),
+                is_default: false,
+                is_namespace: true,
+            }],
+        );
+        let target = node(
+            "function:top_func",
+            "top_func",
+            NodeKind::Function,
+            "top_level.py",
+            Language::Python,
+        );
+        let module_file = file_node("top_level.py", Language::Python);
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            import_mappings,
+            nodes: vec![target, module_file],
+            ..Default::default()
+        };
+        let r = reference("tl.top_func", EdgeKind::Calls, "app.py", Language::Python);
+
+        let resolved = resolve_via_import(&r, &ctx).expect("plain module alias resolves");
+        assert_eq!(resolved.target_node_id, "function:top_func");
+        assert!(python_module_member_is_claimed(&r, &ctx));
+    }
+
+    #[test]
+    fn python_from_import_without_submodule_keeps_member_semantics() {
+        let mut import_mappings = BTreeMap::new();
+        import_mappings.insert(
+            "app.py".to_string(),
+            vec![ImportMapping {
+                local_name: "Alias".to_string(),
+                exported_name: "Thing".to_string(),
+                source: "pkg".to_string(),
+                is_default: false,
+                is_namespace: false,
+            }],
+        );
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            import_mappings,
+            ..Default::default()
+        };
+        let r = reference("Alias.run", EdgeKind::Calls, "app.py", Language::Python);
+
+        assert!(!python_module_member_is_claimed(&r, &ctx));
+        assert!(resolve_via_import(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn python_aliased_member_function_ref_resolves_in_its_module() {
+        let mut existing = BTreeSet::new();
+        existing.insert("pkg/types.py".to_string());
+        let mut import_mappings = BTreeMap::new();
+        import_mappings.insert(
+            "app.py".to_string(),
+            vec![ImportMapping {
+                local_name: "Alias".to_string(),
+                exported_name: "Thing".to_string(),
+                source: "pkg.types".to_string(),
+                is_default: false,
+                is_namespace: false,
+            }],
+        );
+        let target = node(
+            "class:thing",
+            "Thing",
+            NodeKind::Class,
+            "pkg/types.py",
+            Language::Python,
+        );
+        let module_file = file_node("pkg/types.py", Language::Python);
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            import_mappings,
+            nodes: vec![target, module_file],
+            ..Default::default()
+        };
+        let mut reference = reference("Alias", EdgeKind::References, "app.py", Language::Python);
+        reference.is_function_ref = true;
+
+        let resolved = resolve_via_import(&reference, &ctx).expect("aliased member value");
+        assert_eq!(resolved.target_node_id, "class:thing");
+    }
+
+    #[test]
+    fn python_duplicate_module_alias_is_claimed_but_unresolved() {
+        let mut existing = BTreeSet::new();
+        existing.insert("a.py".to_string());
+        existing.insert("b.py".to_string());
+        let mut import_mappings = BTreeMap::new();
+        import_mappings.insert(
+            "app.py".to_string(),
+            vec![
+                ImportMapping {
+                    local_name: "dup".to_string(),
+                    exported_name: "*".to_string(),
+                    source: "a".to_string(),
+                    is_default: false,
+                    is_namespace: true,
+                },
+                ImportMapping {
+                    local_name: "dup".to_string(),
+                    exported_name: "*".to_string(),
+                    source: "b".to_string(),
+                    is_default: false,
+                    is_namespace: true,
+                },
+            ],
+        );
+        let target = node(
+            "function:run",
+            "run",
+            NodeKind::Function,
+            "a.py",
+            Language::Python,
+        );
+        let a_file = file_node("a.py", Language::Python);
+        let b_file = file_node("b.py", Language::Python);
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            import_mappings,
+            nodes: vec![target, a_file, b_file],
+            ..Default::default()
+        };
+        let r = reference("dup.run", EdgeKind::Calls, "app.py", Language::Python);
+
+        assert!(python_module_member_is_claimed(&r, &ctx));
+        assert!(resolve_via_import(&r, &ctx).is_none());
+    }
+
+    #[test]
+    fn python_duplicate_member_in_module_is_claimed_but_unresolved() {
+        let mut existing = BTreeSet::new();
+        existing.insert("pkg/mod.py".to_string());
+        let mut import_mappings = BTreeMap::new();
+        import_mappings.insert(
+            "app.py".to_string(),
+            vec![ImportMapping {
+                local_name: "mod".to_string(),
+                exported_name: "*".to_string(),
+                source: "pkg.mod".to_string(),
+                is_default: false,
+                is_namespace: true,
+            }],
+        );
+        let first = node(
+            "function:first",
+            "run",
+            NodeKind::Function,
+            "pkg/mod.py",
+            Language::Python,
+        );
+        let second = node(
+            "function:second",
+            "run",
+            NodeKind::Function,
+            "pkg/mod.py",
+            Language::Python,
+        );
+        let module_file = file_node("pkg/mod.py", Language::Python);
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            import_mappings,
+            nodes: vec![first, second, module_file],
+            ..Default::default()
+        };
+        let r = reference("mod.run", EdgeKind::Calls, "app.py", Language::Python);
+
+        assert!(python_module_member_is_claimed(&r, &ctx));
+        assert!(resolve_via_import(&r, &ctx).is_none());
     }
 
     #[test]
