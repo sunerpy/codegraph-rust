@@ -884,11 +884,21 @@ fn location_flag(location: Option<String>, global: bool, local: bool) -> Option<
     None
 }
 
-fn generate_completion_bytes(shell: Shell) -> Vec<u8> {
-    let mut cmd = Cli::command();
-    let mut buf = Vec::new();
-    generate(shell, &mut cmd, "codegraph", &mut buf);
-    buf
+fn generate_completion_bytes(shell: Shell) -> Result<Vec<u8>> {
+    const COMPLETION_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+    std::thread::Builder::new()
+        .name("codegraph-completions".to_string())
+        .stack_size(COMPLETION_STACK_BYTES)
+        .spawn(move || {
+            let mut cmd = Cli::command();
+            let mut buf = Vec::new();
+            generate(shell, &mut cmd, "codegraph", &mut buf);
+            buf
+        })
+        .context("failed to start completion generator")?
+        .join()
+        .map_err(|_| anyhow!("completion generator thread panicked"))
 }
 
 fn env_path(key: &str) -> Option<PathBuf> {
@@ -967,7 +977,7 @@ fn append_dot_source_once(profile: &Path, script: &Path) -> Result<bool> {
 
 fn install_completions(shell: Shell) -> Result<()> {
     let target = completion_target(shell)?;
-    let bytes = generate_completion_bytes(shell);
+    let bytes = generate_completion_bytes(shell)?;
     write_completion_file(&target, &bytes)?;
     println!("Installed {shell} completions to {}", target.display());
 
@@ -6963,7 +6973,7 @@ mod pure_helper_tests {
 
     #[test]
     fn generate_completion_bytes_are_non_empty_for_bash() {
-        let bytes = generate_completion_bytes(clap_complete::Shell::Bash);
+        let bytes = generate_completion_bytes(clap_complete::Shell::Bash).unwrap();
         assert!(!bytes.is_empty());
         assert!(String::from_utf8_lossy(&bytes).contains("codegraph"));
     }
@@ -7419,7 +7429,7 @@ mod formatter_and_env_tests {
             Shell::PowerShell,
             Shell::Elvish,
         ] {
-            let bytes = generate_completion_bytes(shell);
+            let bytes = generate_completion_bytes(shell).unwrap();
             assert!(bytes.len() > 100);
             assert!(String::from_utf8_lossy(&bytes).contains("codegraph"));
         }
