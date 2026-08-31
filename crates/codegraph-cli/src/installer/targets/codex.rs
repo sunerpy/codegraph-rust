@@ -376,7 +376,7 @@ mod tests {
         assert!(
             target
                 .print_config(&fx.ctx, Location::Local)
-                .contains(".codex/config.toml")
+                .contains(&toml.display().to_string())
         );
     }
 
