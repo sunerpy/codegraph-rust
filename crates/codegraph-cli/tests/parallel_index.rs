@@ -27,6 +27,10 @@
 //!     `max_file_size` yields the exact size-skip `FileRecord` through the
 //!     parallel parse path (T2): size set to the real byte length, node_count 0,
 //!     and the exact `"File exceeds max size (N > M): path"` error string.
+//!   * `deep_file_sync_discards_stale_graph_and_matches_force_index` — replacing
+//!     a previously valid file with a 30,000-level AST removes its old graph,
+//!     records one stable file error, leaves sibling files intact, and converges
+//!     to the same canonical DB as a fresh `index --force`.
 //!   * `full_index_leaves_synchronous_at_normal` — after a full `index --force`
 //!     (which runs under `synchronous=OFF` per T5), a FRESH `Store::open` reports
 //!     `PRAGMA synchronous != 0` (NORMAL), proving the bulk-index pragma never
@@ -260,6 +264,93 @@ fn oversized_file_size_skips_with_exact_file_record() {
         vec![expected_error],
         "size-skip must record the exact engine error string through the parallel path"
     );
+}
+
+/// DEPTH-ABORT PARITY: a file that crosses the deterministic AST traversal
+/// limit contributes no partial graph. Incremental sync must first remove the
+/// file's previous graph, persist the stable error, and converge to the same DB
+/// as a clean full rebuild of the final filesystem state.
+#[test]
+fn deep_file_sync_discards_stale_graph_and_matches_force_index() {
+    const DEPTH: usize = 30_000;
+    const REL_PATH: &str = "deep.c";
+    const EXPECTED_ERROR: &str = "AST nesting exceeds safe traversal limit (256): deep.c";
+
+    let deep_source = format!(
+        "void before(void) {{}}\nvoid deep(void) {{{}{}}}\nvoid after(void) {{}}\n",
+        "{".repeat(DEPTH),
+        "}".repeat(DEPTH)
+    );
+    let normal_source = "int healthy_target(void) { return 7; }\n";
+
+    let synced = TestDir::new("deep-sync");
+    let synced_project = synced.path().join("project");
+    fs::create_dir_all(&synced_project).unwrap();
+    fs::write(
+        synced_project.join(REL_PATH),
+        "int stale_target(void) { return 1; }\n",
+    )
+    .unwrap();
+    fs::write(synced_project.join("ok.c"), normal_source).unwrap();
+    init_and_force_index(&synced_project);
+
+    fs::write(synced_project.join(REL_PATH), &deep_source).unwrap();
+    let (out, err, ok) = cli(&["sync", synced_project.to_str().unwrap()]);
+    assert!(ok, "sync failed: stdout={out} stderr={err}");
+
+    let synced_store = Store::open(&db_path(&synced_project)).unwrap();
+    let deep_node_count: i64 = synced_store
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM nodes WHERE file_path = ?1",
+            [REL_PATH],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        deep_node_count, 0,
+        "the failed file's previous and partial nodes must be removed"
+    );
+
+    let healthy_count: i64 = synced_store
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM nodes WHERE file_path = 'ok.c' AND name = 'healthy_target'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        healthy_count, 1,
+        "one invalid file must not remove a healthy sibling's graph"
+    );
+
+    let (node_count, errors_json): (i64, Option<String>) = synced_store
+        .connection()
+        .query_row(
+            "SELECT node_count, errors FROM files WHERE path = ?1",
+            [REL_PATH],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("the failed file must retain a files row");
+    assert_eq!(node_count, 0);
+    let errors: Vec<String> =
+        serde_json::from_str(&errors_json.expect("the failed file must persist its depth error"))
+            .unwrap();
+    assert_eq!(errors, vec![EXPECTED_ERROR]);
+    drop(synced_store);
+
+    let rebuilt = TestDir::new("deep-force");
+    let rebuilt_project = rebuilt.path().join("project");
+    fs::create_dir_all(&rebuilt_project).unwrap();
+    fs::write(rebuilt_project.join(REL_PATH), &deep_source).unwrap();
+    fs::write(rebuilt_project.join("ok.c"), normal_source).unwrap();
+    init_and_force_index(&rebuilt_project);
+
+    let after_sync = canonicalize_db(&db_path(&synced_project)).unwrap();
+    let after_force = canonicalize_db(&db_path(&rebuilt_project)).unwrap();
+    diff_canonical(&after_sync, &after_force, None)
+        .expect("sync and index --force must converge after a depth-aborted file");
 }
 
 /// WRITE PATH 1 (`index --force`, the rayon producer closure): the persisted

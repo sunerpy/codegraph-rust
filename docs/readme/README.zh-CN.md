@@ -450,6 +450,11 @@ Java、C/C++、C#、Vue、Svelte、GDScript 等——详见
 [`../languages.md`](../languages.md)），跨文件解析（含 Godot 项目图），图遍历，
 FTS5 检索，全图导出（含确定性 PageRank 中心性），MCP/CLI 表面，golden 字节稳定输出。
 
+提取按文件 fail-closed：若源码树超过确定性的 256 层逻辑 named-node 深度限制，
+CodeGraph 会记录稳定的文件错误，不保留该文件的部分节点、边或未解析引用，并继续
+索引项目中的其他文件。后续增量 `sync` 会删除该文件原有图谱，并与
+`index --force` 收敛到相同结果。
+
 **不做什么：** 二进制内部无任何 AI/向量/嵌入/LLM（硬约束，`scripts/guardrail.sh`
 强制执行）；无语义检索；不新增固定 `LANGUAGES` 集以外的语言。
 

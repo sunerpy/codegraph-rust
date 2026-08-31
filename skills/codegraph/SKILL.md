@@ -71,6 +71,13 @@ failed command explicitly prints `codegraph init ...`, run that exact command to
 replace the stale index; do not keep retrying `sync`. Do not generalize this to
 mixed or other corruption when the CLI does not prescribe `init`.
 
+Extraction is fail-closed per file at a deterministic logical named-node depth
+of 256. If an adversarial or generated file exceeds that limit, CodeGraph records
+one file error, contributes no partial nodes/edges/references for that file, and
+continues indexing the rest of the project. A later `sync` also removes any graph
+previously produced by that file. Do not retry with `index --force`: a full
+rebuild intentionally produces the same file-level result.
+
 ### Start the MCP server
 
 ```bash

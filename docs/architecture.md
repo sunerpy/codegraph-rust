@@ -128,6 +128,12 @@ graph LR
 - `create_node`：生成节点 ID（非文件节点走
   `generate_node_id(file, kind, name, start_line)`，1-based 行号），从语义栈
   （排除文件节点）构造 `qualified_name`，并即时发出 `contains` 边。
+- **深度安全边界**：正式语义遍历前先用显式 `Vec` 迭代检查逻辑 named-node
+  深度，固定上限 256；主 walker 与函数体 walker 共享运行时深度闩锁。超限时整份
+  文件结果 fail-closed（节点、边、未解析引用全部丢弃，只保留稳定文件错误），其他
+  文件继续处理。Rust grammar 在嵌套 block 之间插入的单子
+  `expression_statement` 是无语义包装层，预检与 walker 都将其折叠，因此 200 层
+  正常源码嵌套仍在安全预算内。`sync` 会先替换该文件旧结果，所以不会遗留陈旧图谱。
 
 **关键边界：** 提取层把**结构性边**（`contains`）与**未解析引用**
 （calls/imports/instantiates/decorates）分离——`contains` 立即发出，其余作为
