@@ -77,13 +77,14 @@
 
 ## Sync log
 
-### 2026-08-31 — Wave 0 deep-AST guard IMPLEMENTED in PR #249; release pending
+### 2026-08-31 — Wave 0 deep-AST guard LANDED in `v0.48.2`
 
 Upstream `838006c947ebe69407e8f64ba756f97132f411f4` fixed the process-crash
 class caused by deeply recursive native walkers. Rust PR
-[#249](https://github.com/sunerpy/codegraph-rust/pull/249), commit `53360d9`,
-implements the portable behavior with a deterministic design rather than
-copying upstream's platform stack-pointer / wasm fallback:
+[#249](https://github.com/sunerpy/codegraph-rust/pull/249), merged as
+`22f9753049d91ccad11ffb30184ee4799182b519` (implementation commit `53360d9`),
+implements the portable behavior with a deterministic design rather than copying
+upstream's platform stack-pointer / wasm fallback:
 
 - an iterative preflight rejects logical named-node depth above 256 before any
   recursive semantic traversal;
@@ -97,13 +98,38 @@ copying upstream's platform stack-pointer / wasm fallback:
 
 Coverage includes 30,000-level C, C++, Rust, TypeScript, and Python inputs on a
 1 MiB test thread, the exact inclusive 256/257 boundary, per-file isolation, and
-the incremental/full-rebuild equivalence oracle. Local `make ci` and the
-pre-push gate both passed. This change deliberately keeps extraction version 11
-and changes no golden artifact or node-id formula.
+the incremental/full-rebuild equivalence oracle. Local `make ci`, the pre-push
+gate, PR CI, and post-merge main CI all passed. This change deliberately keeps
+extraction version 11 and changes no golden artifact or node-id formula.
 
-This entry records implementation only. The item remains release-pending until
-the release-please PR, six-platform artifacts, checksums, and published Linux
-black-box smoke test complete; tracked colby parity therefore remains `1.5.0`.
+Release-please PR
+[#250](https://github.com/sunerpy/codegraph-rust/pull/250) merged as
+`b53d0e64f4334cba38ec018c9277051aa645951a`, cut tag `v0.48.2` at that exact
+commit, and published the Release only after CI Success plus all six platform
+builds, asset upload, and checksum generation passed. The published Release has
+the expected six archives plus `SHA256SUMS`. The official
+`codegraph-0.48.2-x86_64-unknown-linux-musl.tar.gz` digest is
+`b37af51df668121a635c6a04decd87dcc90a1067230125b56bb6d94690a423ef`, matching
+both the uploaded checksum file and GitHub's asset digest.
+
+Black-box acceptance used that downloaded static binary, not a local build:
+
+- `codegraph --version` returned exactly `codegraph 0.48.2` with no logger-init
+  banner;
+- `status` → `init` → `search` succeeded on a clean project;
+- replacing an indexed C file with 30,000 nested compounds and running `sync`
+  removed its stale symbol, preserved the healthy sibling, and recorded exactly
+  `AST nesting exceeds safe traversal limit (256): deep.c`;
+- the stable files/nodes/edges/unresolved-ref projection then matched a fresh
+  `index --force` byte-for-byte;
+- a query still succeeded with a clean index's permanent `index.lock` made
+  read-only;
+- MCP `initialize` and `tools/list` returned protocol/tool results; and
+- `skill update --global --dry-run --diff` reported `0.48.1 -> 0.48.2 (+7 -0)`
+  for every installed supported agent without writing files.
+
+Wave 0 is therefore shipped, not merely implemented. Tracked colby parity still
+remains `1.5.0` until the remaining Wave 1–3 `v1.6.0` PORT families land.
 
 ### 2026-08-31 — implementation baseline refreshed at codegraph-rs `v0.48.1`
 
