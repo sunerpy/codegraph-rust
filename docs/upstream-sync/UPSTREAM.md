@@ -17,11 +17,11 @@
   plus its one following docs-only commit was audited through
   `6a056ec5db35172f9dc348f87b54ea415aa5169e`. The exact new range after the
   previously closed 104-commit batch is 28 commits and identified 15 PORT
-  families; Wave 0 and Wave 1 have now shipped nine of those families in
-  `v0.48.2`/`v0.48.3`, together with the separately tracked #1626 and #1616
-  fixes. Six upstream PORT families remain in Waves 2–3; see
+  families; Waves 0–2 have now shipped twelve of those families in
+  `v0.48.2`/`v0.48.3`/`v0.49.0`, together with the separately tracked #1626
+  and #1616 fixes. Three upstream PORT families remain in Wave 3; see
   `V1_6_TRIAGE_2026-08-27.md`. Tracked parity therefore remains `1.5.0` until
-  that backlog lands
+  that final backlog lands
 - **Previous exact boundary:** `c6aaa20358cd6adcd04b87bdef8e5803ad146f3a`
   (the 104th commit after `v1.5.0`; merge of upstream PR #1516)
 - **Next discovery starts here:** diff
@@ -78,6 +78,79 @@
 > that records colby parity — do not infer it from `Cargo.toml`.
 
 ## Sync log
+
+### 2026-08-31 — Wave 2 retrieval + ranking controls LANDED in `v0.49.0`
+
+Rust PR [#255](https://github.com/sunerpy/codegraph-rust/pull/255), merged as
+`036330cfe26aae0e775d8847bc030414f9479013` from implementation commit
+`1e114cdfa7263837b9e90930cae568b5787c80f1`, shipped all three frozen Wave 2
+PORT families: upstream `238dbc5` + `ccb0295`, `9219967`, and `1d9de88`.
+
+The shipped behavior is:
+
+- Explore recognizes bounded explicit source paths, normalizes quoted,
+  backticked, `./`, Windows, `:line`, and `#Lline` forms, pins exact/suffix
+  matches ahead of fuzzy results, reports unmatched explicit paths, and adds
+  extensionless kebab basenames plus camelCase Variable/Constant seeds;
+- case-insensitive exact-name supplements use
+  `lower(name) = lower(?)`, with planner regressions proving
+  `idx_nodes_lower_name` is used for hits, misses, and filtered queries; and
+- ordered ranking-only `deprioritize` rules load from
+  `.codegraph/codegraph.json` first and `[indexing].deprioritize` last, use
+  last-match-wins `!pattern` exceptions, apply only the documented path and
+  exact-name penalties, and refresh for every long-running MCP search/explore
+  request.
+
+This wave deliberately keeps extraction version 12, the node-id formula, graph
+rows, and every golden artifact unchanged. Direct node/file lookup and explicit
+path pinning bypass ranking penalties. Local `make ci`, the pre-push gate, PR
+CI run
+[`33408838909`](https://github.com/sunerpy/codegraph-rust/actions/runs/33408838909),
+post-merge main CI run
+[`33409994677`](https://github.com/sunerpy/codegraph-rust/actions/runs/33409994677),
+release-please PR CI run
+[`33410032708`](https://github.com/sunerpy/codegraph-rust/actions/runs/33410032708),
+and release/tag main CI run
+[`33412026542`](https://github.com/sunerpy/codegraph-rust/actions/runs/33412026542)
+all passed, including native Windows.
+
+Release-please PR
+[#256](https://github.com/sunerpy/codegraph-rust/pull/256) merged as
+`1e938d0d975eb6f01fd82e3ab416a6722a468159`, cut tag `v0.49.0` at that exact
+commit, and release workflow
+[`33412026472`](https://github.com/sunerpy/codegraph-rust/actions/runs/33412026472)
+published only after CI Success, all six platform builds, asset upload,
+checksum generation, and the publish gate passed. The official
+`codegraph-0.49.0-x86_64-unknown-linux-musl.tar.gz` digest is
+`8aa3b5219054c772e2e8b86f9552a49e4a05eeb93e5e2d404e295aa05180fb27`,
+matching both `SHA256SUMS` and GitHub's asset digest.
+
+Black-box acceptance used that downloaded static binary:
+
+- `codegraph --version` returned exactly `codegraph 0.49.0` with no
+  logger-init banner; `status`, `init`, `sync`, `index --force`, `search`,
+  `explore`, and `node` all succeeded on an extraction-version 12 project;
+- a pinned `src/services/user-service.ts` survived a tight Explore budget,
+  while `missing/path.ts` was reported as unresolved instead of becoming fuzzy
+  query noise; Variable/Constant lookup also found `httpClient`;
+- JSON-only `archive/**` ranking reduced an exact-name result from
+  `92.50074874522146` to `57.50074874522145`, and a later TOML
+  `!archive/**` rule restored it, proving JSON-then-TOML authority without
+  reindexing;
+- one live MCP process completed `initialize`, `tools/list`, search, and
+  Explore; after the TOML exception was removed, its next search immediately
+  moved `archive/buildProfile.ts` behind first-party source, proving
+  request-scoped config refresh;
+- CLI queries still succeeded with the permanent `index.lock` read-only;
+- an isolated HOME previewed the real `0.48.3 -> 0.49.0 (+31 -4)` Skill diff,
+  updated it, and then reported `up to date (0.49.0)`; and
+- isolated Zuno install/uninstall preserved unrelated JSON keys and another MCP
+  entry, while its generated CodeGraph entry stayed unchanged.
+
+Wave 2 is therefore shipped, not merely implemented. The remaining upstream
+`v1.6.0` backlog is the three Wave 3 PORT families. Tracked colby parity remains
+`1.5.0` until those ship; `codegraph context` and #1617 remain explicitly
+deferred.
 
 ### 2026-08-31 — Wave 1 graph correctness + watcher reload LANDED in `v0.48.3`
 
