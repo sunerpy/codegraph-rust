@@ -239,12 +239,14 @@ impl Store {
     }
 
     /// Ports `getNodesByLowerName` from `upstream db/queries.ts:754-765`.
-    /// Callers pass `lowercase`; the SQL shape stays `lower(name) = ?` for `idx_nodes_lower_name`.
-    pub fn nodes_by_lower_name(&self, lower_name: &str) -> rusqlite::Result<Vec<Node>> {
+    /// The SQL expression mirrors `idx_nodes_lower_name`, so SQLite performs an
+    /// index seek. `lower(?)` keeps parameter folding on SQLite's ASCII rules
+    /// and does not require callers to lowercase first.
+    pub fn nodes_by_lower_name(&self, name: &str) -> rusqlite::Result<Vec<Node>> {
         query_nodes(
             &self.conn,
-            "SELECT * FROM nodes WHERE lower(name) = ?",
-            [lower_name],
+            "SELECT * FROM nodes WHERE lower(name) = lower(?)",
+            [name],
         )
     }
 
@@ -496,14 +498,16 @@ impl Store {
     }
 
     /// Ports the exact-name supplement query from `upstream db/queries.ts:834-845`.
-    /// `name = ? COLLATE NOCASE` plus optional kind/language `IN (...)`; `LIMIT 20`.
+    /// `lower(name) = lower(?)` plus optional kind/language `IN (...)`;
+    /// `LIMIT 20`. The matching expression pins the planner to
+    /// `idx_nodes_lower_name`, including misses.
     pub fn nodes_by_exact_name_nocase(
         &self,
         name: &str,
         kinds: &[NodeKind],
         languages: &[Language],
     ) -> rusqlite::Result<Vec<Node>> {
-        let mut sql = String::from("SELECT * FROM nodes WHERE name = ? COLLATE NOCASE");
+        let mut sql = String::from("SELECT * FROM nodes WHERE lower(name) = lower(?)");
         let mut params: Vec<Box<dyn ToSql>> = vec![Box::new(name.to_string())];
         append_kind_language_filters(&mut sql, &mut params, "kind", "language", kinds, languages);
         // upstream db/queries.ts:844 — LIMIT 20.
@@ -533,10 +537,9 @@ impl Store {
         rows.collect()
     }
 
-    /// Callable definitions whose name CONTAINS `needle` as a substring, fetched
-    /// as a SEPARATE batch from the FTS/LIKE ladder (upstream `1de7e8f` #1319
-    /// "kind whitelist" — hot single-word terms must not crowd definers out of
-    /// the length-ordered batch).
+    /// Callable/variable/constant definitions whose name CONTAINS `needle` as a
+    /// substring, fetched as a SEPARATE batch from the FTS/LIKE ladder
+    /// (upstream `1de7e8f` #1319 plus v1.6.0 variable seeding).
     ///
     /// `needle` is matched lowercase against both `lower(name)` and its
     /// separator-stripped form, so a `user_profile_id` query reaches a
@@ -546,7 +549,7 @@ impl Store {
     /// an incidental namesake never becomes a match. `ORDER BY` is fully
     /// specified — shortest name first, then name/path/line — so the candidate
     /// order never depends on SQLite's incidental row order.
-    pub fn callable_nodes_by_name_infix(
+    pub fn seedable_nodes_by_name_infix(
         &self,
         needle: &str,
         limit: i64,
@@ -555,7 +558,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT * FROM nodes
-            WHERE kind IN ('function', 'method', 'component')
+            WHERE kind IN ('function', 'method', 'component', 'variable', 'constant')
               AND (
                 lower(name) LIKE ?
                 OR replace(replace(replace(lower(name), '_', ''), '-', ''), '.', '') LIKE ?
@@ -2573,12 +2576,14 @@ mod tests {
     }
 
     #[test]
-    fn callable_infix_returns_callables_only_shortest_first_and_folds_separators() {
+    fn seedable_infix_includes_variables_constants_and_folds_separators() {
         let mut store = store("callable-infix");
         let mut cls = node("class:holder", "UserProfileIdHolder", "src/holder.rs");
         cls.kind = NodeKind::Class;
         let mut var = node("variable:v", "userProfileId", "src/var.rs");
         var.kind = NodeKind::Variable;
+        let mut constant = node("constant:c", "USER_PROFILE_ID", "src/constant.rs");
+        constant.kind = NodeKind::Constant;
         store
             .upsert_nodes(&[
                 node("function:long", "updateUserProfileIdMapping", "src/b.rs"),
@@ -2587,26 +2592,29 @@ mod tests {
                 node("function:other", "unrelated", "src/d.rs"),
                 cls,
                 var,
+                constant,
             ])
             .unwrap();
 
         let hits = store
-            .callable_nodes_by_name_infix("userprofileid", 50)
+            .seedable_nodes_by_name_infix("userprofileid", 50)
             .unwrap();
         let names: Vec<&str> = hits.iter().map(|n| n.name.as_str()).collect();
         assert_eq!(
             names,
             vec![
+                "userProfileId",
                 "userProfileId2",
+                "USER_PROFILE_ID",
                 "read_user_profile_id",
                 "updateUserProfileIdMapping"
             ],
-            "callables only, shortest name first; the separator-stripped form matches snake_case"
+            "seedable kinds only, shortest name first; the separator-stripped form matches snake_case"
         );
 
         assert!(
             store
-                .callable_nodes_by_name_infix("userprofileid", 1)
+                .seedable_nodes_by_name_infix("userprofileid", 1)
                 .unwrap()
                 .len()
                 == 1,
@@ -2614,7 +2622,7 @@ mod tests {
         );
         assert!(
             store
-                .callable_nodes_by_name_infix("nosuchneedle", 50)
+                .seedable_nodes_by_name_infix("nosuchneedle", 50)
                 .unwrap()
                 .is_empty()
         );
@@ -2703,6 +2711,57 @@ mod tests {
                 .nodes_by_exact_name_filtered("missing", &[], &[])
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn exact_name_queries_seek_lower_name_index_for_hits_misses_and_filters() {
+        let mut store = store("exact-name-plan");
+        store
+            .upsert_nodes(&[
+                node("function:x", "HandleRequest", "src/x.rs"),
+                node("function:y", "handlerequest", "src/y.rs"),
+            ])
+            .unwrap();
+
+        let ids = store
+            .nodes_by_lower_name("HANDLEREQUEST")
+            .unwrap()
+            .into_iter()
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 2, "caller casing must not affect lookup");
+
+        fn plan(store: &Store, sql: &str, params: &[&dyn ToSql]) -> String {
+            let explained = format!("EXPLAIN QUERY PLAN {sql}");
+            let mut stmt = store.conn.prepare(&explained).unwrap();
+            let details = stmt
+                .query_map(params, |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            details.join(" | ")
+        }
+
+        let miss = plan(
+            &store,
+            "SELECT * FROM nodes WHERE lower(name) = lower(?) LIMIT 20",
+            &[&"not-a-symbol"],
+        );
+        assert!(
+            miss.contains("SEARCH nodes") && miss.contains("idx_nodes_lower_name"),
+            "miss regressed to a scan: {miss}"
+        );
+
+        let filtered = plan(
+            &store,
+            "SELECT * FROM nodes WHERE lower(name) = lower(?) \
+             AND kind IN (?) AND language IN (?) LIMIT 20",
+            &[&"HandleRequest", &"function", &"rust"],
+        );
+        assert!(
+            filtered.contains("SEARCH nodes") && filtered.contains("idx_nodes_lower_name"),
+            "filtered lookup regressed to a scan: {filtered}"
         );
     }
 

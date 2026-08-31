@@ -1,4 +1,5 @@
-//! Identifier-segment utilities for the prompt hook's graph-derived MEDIUM tier.
+//! Identifier-segment utilities shared by graph search and the prompt hook's
+//! graph-derived MEDIUM tier.
 //!
 //! Rust port of the PURE functions from upstream `src/search/identifier-segments.ts`
 //! (#1136 `e699ee9` + #1145 plural-folding correctness from `35611b9`). NO
@@ -375,6 +376,35 @@ pub fn extract_prose_candidates(prompt: &str) -> Vec<String> {
     out
 }
 
+/// Search-query words for the segment matcher: prose candidates plus the
+/// constituent words of camelCase/PascalCase tokens. FTS stores a camelCase
+/// identifier as one token, so `atBottom` must also seed `bottom`.
+pub fn extract_segment_search_words(query: &str) -> Vec<String> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let mut out = extract_prose_candidates(query);
+    let mut seen = out.iter().cloned().collect::<BTreeSet<_>>();
+    let mut segments = Vec::new();
+    for run_match in WORD_RUN_RE.find_iter(query) {
+        let run = run_match.as_str();
+        let chars = run.chars().collect::<Vec<_>>();
+        if !chars
+            .windows(2)
+            .any(|pair| (pair[0].is_lowercase() || pair[0].is_numeric()) && pair[1].is_uppercase())
+        {
+            continue;
+        }
+        segments.extend(split_identifier_segments(run));
+    }
+    for word in extract_prose_candidates(&segments.join(" ")) {
+        if seen.insert(word.clone()) {
+            out.push(word);
+        }
+    }
+    out
+}
+
 /// Lookup variants for a prose word: the word itself plus light English-plural
 /// folding, so common plurals still hit their singular segment. Keyed on
 /// English plural spelling (#1145), in three classes:
@@ -480,5 +510,12 @@ mod tests {
         assert!(cands.contains(&"checkout".to_string()));
         assert!(cands.contains(&"state".to_string()));
         assert!(cands.contains(&"machine".to_string()));
+    }
+
+    #[test]
+    fn search_words_add_camel_segments() {
+        let words = extract_segment_search_words("where is atBottom reset");
+        assert!(words.contains(&"bottom".to_string()));
+        assert!(words.contains(&"reset".to_string()));
     }
 }

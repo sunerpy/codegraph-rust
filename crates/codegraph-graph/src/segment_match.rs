@@ -1,4 +1,5 @@
-//! Query-time graph-derived segment matching for the prompt-hook MEDIUM tier.
+//! Query-time graph-derived segment matching for explore retrieval and the
+//! prompt-hook MEDIUM tier.
 //!
 //! Rust port of upstream `CodeGraph.getSegmentMatches` (`src/index.ts:908-1030`,
 //! #1136 `e699ee9` + #1144/#1145/#1146 hardening from `35611b9`). Instead of

@@ -14,17 +14,21 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use codegraph_core::config::Config;
+use codegraph_core::deprioritize::DeprioritizeMatcher;
 use codegraph_core::file_class::{is_generated_file, is_test_file};
 use codegraph_core::node_id::hash_content;
 use codegraph_core::types::{EdgeKind, FileRecord, Node, NodeKind};
 use codegraph_graph::graph::{GodotReach, GraphTraverser, NodeEdge};
 use codegraph_graph::query::{SearchOptions, search_nodes};
+use codegraph_graph::segment_match::get_segment_matches;
+use codegraph_graph::segments::extract_segment_search_words;
 use codegraph_store::Store;
 use serde_json::Value;
 
 use crate::dynamic_boundaries::scan_dynamic_dispatch;
 use crate::explore_budget::{ExploreOutputBudget, get_explore_output_budget};
 use crate::protocol::ToolResult;
+use crate::query_paths::{extract_query_paths, query_might_contain_paths};
 
 /// Default caller/callee recursion depth for callers/callees tools. The upstream
 /// `getCallers`/`getCallees` default to `maxDepth: 1` (`traversal.ts` callers
@@ -53,6 +57,16 @@ const POINTER_MAX_FILES: usize = 10;
 /// highest-importance member, even when that exceeds the room it was given; the
 /// caller then drops the file whole rather than emitting a stub.
 const MIN_WINDOW_LINES: usize = 12;
+
+/// Minimum source budget protected for every path explicitly named in an
+/// explore query. Pinned files are ordered first and reserve this much for one
+/// another before incidental files can spend the remaining envelope.
+const PINNED_MIN_SOURCE_CHARS: usize = 1024;
+
+/// Bounded symbol admission for one explicitly pinned file. The file itself
+/// remains pinned and source-renderable beyond this cap; only the auxiliary
+/// graph-node gather is bounded.
+const PINNED_FILE_NODE_CAP: usize = 300;
 
 /// Fixed cost of `render_explore_file`'s section template around the header, the
 /// language tag and the cluster body: `"\n\n"` + ``"```"`` + `"\n"` + `"\n"` +
@@ -103,6 +117,10 @@ pub struct CodeGraphEngine {
     /// global HTTP process) therefore honors each project's own settings without
     /// reading a process-global value or another project's config.
     config: Arc<Config>,
+    /// Ranking-only project path policy. It is reloaded whenever the
+    /// request-scoped engine opens, so long-lived MCP processes observe
+    /// config mtime/size changes on the next search/explore call.
+    deprioritize: Arc<DeprioritizeMatcher>,
     /// Request-local source/freshness memo. `execute` clears it before every tool
     /// call so repeated render passes stat and read each referenced file once.
     source_probes: RefCell<HashMap<String, SourceProbe>>,
@@ -124,12 +142,14 @@ impl CodeGraphEngine {
             std::env::var("CODEGRAPH_DIR").ok().as_deref(),
         )?;
         let config = Config::load_for_paths(None, &paths)?;
+        let deprioritize = Arc::new(DeprioritizeMatcher::load_for_paths(&paths, &config));
         let store =
             Store::open_for_read(&paths, Instant::now() + Self::READ_LEASE_TIMEOUT, || false)?;
         Ok(Self {
             store,
             project_root: project_root.to_path_buf(),
             config,
+            deprioritize,
             source_probes: RefCell::new(HashMap::new()),
             source_citations: RefCell::new(HashSet::new()),
         })
@@ -380,6 +400,8 @@ impl CodeGraphEngine {
             languages: Vec::new(),
             limit: Some(limit),
             offset: None,
+            seed_names: Vec::new(),
+            deprioritize: Some(Arc::clone(&self.deprioritize)),
         };
         let results = search_nodes(&self.store, &query, &options, &self.project_name_tokens())?;
         if results.is_empty() {
@@ -922,13 +944,6 @@ impl CodeGraphEngine {
             Err(msg) => return Ok(ToolResult::error(msg)),
         };
 
-        let subgraph = self.find_relevant_context(&query)?;
-        if subgraph.nodes.is_empty() {
-            return Ok(ToolResult::text(format!(
-                "No relevant code found for \"{query}\""
-            )));
-        }
-
         // Resolve the adaptive output budget from the project's indexed file
         // count (`tools.ts:2024-2029`), falling back to the largest tier if
         // stats are unavailable.
@@ -946,12 +961,39 @@ impl CodeGraphEngine {
             .unwrap_or(budget.default_max_files)
             .clamp(1, 20);
 
-        let file_count = subgraph
-            .nodes
-            .iter()
-            .map(|n| n.file_path.as_str())
-            .collect::<HashSet<_>>()
-            .len();
+        let path_extraction = if query_might_contain_paths(&query) {
+            let indexed_paths = self
+                .store
+                .all_files()?
+                .into_iter()
+                .map(|file| file.path)
+                .collect::<Vec<_>>();
+            extract_query_paths(&query, &indexed_paths, max_files.min(8))
+        } else {
+            extract_query_paths(&query, &[], max_files.min(8))
+        };
+        let match_query = path_extraction.stripped_query.trim().to_string();
+        let subgraph =
+            self.find_relevant_context_with_pins(&match_query, &path_extraction.pinned_files)?;
+        let unresolved_note = (!path_extraction.unresolved_path_spans.is_empty()).then(|| {
+            path_extraction
+                .unresolved_path_spans
+                .iter()
+                .map(|span| format!("`{span}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        });
+        if subgraph.nodes.is_empty() && subgraph.file_order.is_empty() {
+            let miss_note = unresolved_note
+                .as_ref()
+                .map(|spans| format!(" (no indexed file uniquely matches {spans})"))
+                .unwrap_or_default();
+            return Ok(ToolResult::text(format!(
+                "No relevant code found for \"{query}\"{miss_note}"
+            )));
+        }
+
+        let file_count = subgraph.file_order.len();
 
         let mut lines = vec![
             format!("## Exploration: {query}"),
@@ -960,8 +1002,22 @@ impl CodeGraphEngine {
                 "Found {} symbols across {file_count} files.",
                 subgraph.nodes.len()
             ),
-            String::new(),
         ];
+        if !path_extraction.pinned_files.is_empty() {
+            lines.push(format!(
+                "{} file{} pinned from the query.",
+                path_extraction.pinned_files.len(),
+                if path_extraction.pinned_files.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ));
+        }
+        if let Some(spans) = &unresolved_note {
+            lines.push(format!("No indexed file uniquely matches {spans}."));
+        }
+        lines.push(String::new());
 
         if let Some(blast) = self.build_blast_radius(&subgraph)? {
             lines.push(blast);
@@ -991,10 +1047,10 @@ impl CodeGraphEngine {
         // icon/i18n files unless the query mentions tests, and only when >=2
         // non-low-value files remain (else tests are the only signal here).
         let mut file_order: Vec<&String> = subgraph.file_order.iter().collect();
-        if budget.exclude_low_value_files && !query_mentions_tests(&query) {
+        if budget.exclude_low_value_files && !query_mentions_tests(&match_query) {
             let non_low: Vec<&String> = file_order
                 .iter()
-                .filter(|f| !is_low_value_file(f))
+                .filter(|f| !is_low_value_file(f) || subgraph.is_pinned(f))
                 .copied()
                 .collect();
             if non_low.len() >= 2 {
@@ -1012,7 +1068,7 @@ impl CodeGraphEngine {
         let mut any_file_trimmed = false;
         let mut excluded_files: Vec<&String> = Vec::new();
         let mut rendered_sources: Vec<(String, usize)> = Vec::new();
-        let precise_tokens = precise_query_tokens(&query);
+        let precise_tokens = precise_query_tokens(&match_query);
         let indexed_file_count = self.store.counts().ok().map(|c| c.file_count);
         let effective_budget = budget
             .max_output_chars
@@ -1023,7 +1079,7 @@ impl CodeGraphEngine {
                 indexed_file_count,
             ));
 
-        for file_path in &file_order {
+        for (file_index, file_path) in file_order.iter().enumerate() {
             if files_included >= max_files {
                 excluded_files.push(file_path);
                 continue;
@@ -1038,11 +1094,21 @@ impl CodeGraphEngine {
             let lang = subgraph.file_language(file_path);
 
             let focuses = subgraph.file_focus_lines(file_path, &precise_tokens);
+            let available = effective_budget
+                .saturating_sub(total_chars)
+                .saturating_sub(1);
+            let pending_pins = file_order[file_index + 1..]
+                .iter()
+                .filter(|path| subgraph.is_pinned(path))
+                .count();
+            let reserved_for_pins = pending_pins.saturating_mul(PINNED_MIN_SOURCE_CHARS);
+            let mut funded_headroom = available.saturating_sub(reserved_for_pins);
+            if subgraph.is_pinned(file_path) {
+                funded_headroom = funded_headroom.max(PINNED_MIN_SOURCE_CHARS.min(available));
+            }
             let ctx = RenderCtx {
                 budget: &budget,
-                funded_headroom: effective_budget
-                    .saturating_sub(total_chars)
-                    .saturating_sub(1),
+                funded_headroom,
                 focuses: &focuses,
                 drifted: possibly_drifted,
             };
@@ -1951,24 +2017,62 @@ impl CodeGraphEngine {
     /// callers/callees + `contains` children into the subgraph so the blast
     /// radius, relationship map, and source section have content. The RWR
     /// relevance re-ranking / file gating is NOT ported (see KNOWN_DIFFS.md).
+    #[cfg(test)]
     fn find_relevant_context(&self, query: &str) -> anyhow::Result<ExploreSubgraph> {
+        self.find_relevant_context_with_pins(query, &[])
+    }
+
+    fn find_relevant_context_with_pins(
+        &self,
+        query: &str,
+        pinned_files: &[String],
+    ) -> anyhow::Result<ExploreSubgraph> {
         let mut sub = ExploreSubgraph::default();
         let traverser = GraphTraverser::new(&self.store);
 
         let mut seed_ids: Vec<String> = Vec::new();
-        let results = search_nodes(
-            &self.store,
-            query,
-            &SearchOptions {
-                limit: Some(8),
-                ..Default::default()
-            },
-            &self.project_name_tokens(),
-        )?;
+        let results = if query.trim().is_empty() {
+            Vec::new()
+        } else {
+            let seed_names =
+                get_segment_matches(&self.store, &extract_segment_search_words(query), 8)
+                    .into_iter()
+                    .map(|matched| matched.name)
+                    .collect();
+            search_nodes(
+                &self.store,
+                query,
+                &SearchOptions {
+                    limit: Some(8),
+                    seed_names,
+                    deprioritize: Some(Arc::clone(&self.deprioritize)),
+                    ..Default::default()
+                },
+                &self.project_name_tokens(),
+            )?
+        };
         for r in results {
             if sub.insert(r.node.clone()) {
                 seed_ids.push(r.node.id.clone());
                 sub.roots.push(r.node.id.clone());
+            }
+        }
+        for file_path in pinned_files {
+            sub.pin_file(file_path);
+            let mut file_nodes = self.store.nodes_by_file_path(file_path)?;
+            file_nodes.sort_by(|a, b| {
+                (a.start_line, a.start_column, a.id.as_str()).cmp(&(
+                    b.start_line,
+                    b.start_column,
+                    b.id.as_str(),
+                ))
+            });
+            for node in file_nodes
+                .into_iter()
+                .filter(|node| !matches!(node.kind, NodeKind::File | NodeKind::Import))
+                .take(PINNED_FILE_NODE_CAP)
+            {
+                sub.insert(node);
             }
         }
 
@@ -1996,10 +2100,16 @@ impl CodeGraphEngine {
             .iter()
             .map(|n| n.file_path.clone())
             .collect::<Vec<_>>();
+        candidate_paths.extend(pinned_files.iter().cloned());
         candidate_paths.sort_unstable();
         candidate_paths.dedup();
         sub.generated_files = self.store.generated_paths_among(&candidate_paths)?;
         sub.ambient_files = self.ambient_declaration_files(&candidate_paths, query)?;
+        sub.deprioritized_files = candidate_paths
+            .iter()
+            .filter(|path| self.deprioritize.is_match(path))
+            .cloned()
+            .collect();
 
         sub.finalize();
         Ok(sub)
@@ -2573,6 +2683,9 @@ struct ExploreSubgraph {
     edge_seen: HashSet<(String, String, String)>,
     roots: Vec<String>,
     file_order: Vec<String>,
+    /// Query-named paths in appearance order. They remain ahead of every
+    /// inferred file and are exempt from low-value filtering.
+    pinned_files: Vec<String>,
     /// Files rescued by the #1064 change-surface pass: a tiered callable seed's
     /// buried signature-type file. `finalize` floats these to the TOP tier so a
     /// lexically-dissimilar answer file (grpc's `dialoptions.go`) is not buried
@@ -2594,9 +2707,25 @@ struct ExploreSubgraph {
     /// accounts for the exemption, which is why the same file can be damped for a
     /// prose query and undamped for one naming its type.
     ambient_files: HashSet<String>,
+    /// Project-configured ranking-only paths. They stay in the subgraph and
+    /// source output, but lose same-tier ordering ties to first-party files.
+    deprioritized_files: HashSet<String>,
 }
 
 impl ExploreSubgraph {
+    fn pin_file(&mut self, file_path: &str) {
+        if !self.pinned_files.iter().any(|path| path == file_path) {
+            self.pinned_files.push(file_path.to_string());
+        }
+        if !self.file_order.iter().any(|path| path == file_path) {
+            self.file_order.push(file_path.to_string());
+        }
+    }
+
+    fn is_pinned(&self, file_path: &str) -> bool {
+        self.pinned_files.iter().any(|path| path == file_path)
+    }
+
     fn insert(&mut self, node: Node) -> bool {
         if self.index.contains_key(&node.id) {
             return false;
@@ -2653,7 +2782,7 @@ impl ExploreSubgraph {
                 neighbor_files.insert(n.file_path.as_str());
             }
         }
-        let scores: HashMap<String, (u8, u8, usize)> = self
+        let scores: HashMap<String, (u8, u8, u8, usize)> = self
             .file_order
             .iter()
             .map(|fp| {
@@ -2702,11 +2831,24 @@ impl ExploreSubgraph {
                     .iter()
                     .filter(|n| &n.file_path == fp && n.kind != NodeKind::File)
                     .count();
-                (fp.clone(), (tier, weight, sym_count))
+                let first_party = u8::from(!self.deprioritized_files.contains(fp));
+                (fp.clone(), (tier, first_party, weight, sym_count))
             })
             .collect();
-        self.file_order
-            .sort_by(|a, b| scores[b].cmp(&scores[a]).then_with(|| a.cmp(b)));
+        let pin_order = self
+            .pinned_files
+            .iter()
+            .enumerate()
+            .map(|(index, path)| (path.as_str(), index))
+            .collect::<HashMap<_, _>>();
+        self.file_order.sort_by(|a, b| {
+            match (pin_order.get(a.as_str()), pin_order.get(b.as_str())) {
+                (Some(a_index), Some(b_index)) => a_index.cmp(b_index),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => scores[b].cmp(&scores[a]).then_with(|| a.cmp(b)),
+            }
+        });
     }
 
     fn file_language(&self, file_path: &str) -> String {
@@ -3749,6 +3891,7 @@ mod tests {
             store,
             project_root: base,
             config: Arc::new(Config::default()),
+            deprioritize: Arc::new(DeprioritizeMatcher::default()),
             source_probes: RefCell::new(HashMap::new()),
             source_citations: RefCell::new(HashSet::new()),
         }
@@ -5445,6 +5588,166 @@ mod tests {
     }
 
     #[test]
+    fn ext_explore_pins_explicit_path_and_strips_path_shrapnel() {
+        let mut engine = test_engine();
+        let target = "src/routes/m/projects/[id]/runs/[runId]/+page.ts";
+        put_indexed_source(
+            &engine,
+            target,
+            "const feedAtBottom = true;\nfunction pinFeedIfNearBottom() {}\n",
+            Language::TypeScript,
+            2,
+        );
+        put_indexed_source(
+            &engine,
+            "src/lib/runs-store.ts",
+            "function runId() {}\n",
+            Language::TypeScript,
+            1,
+        );
+        put_nodes(
+            &mut engine,
+            &[
+                node_lang(
+                    "feedAtBottom",
+                    "feedAtBottom",
+                    target,
+                    1,
+                    1,
+                    NodeKind::Variable,
+                    Language::TypeScript,
+                ),
+                node_lang(
+                    "runId",
+                    "runId",
+                    "src/lib/runs-store.ts",
+                    1,
+                    1,
+                    NodeKind::Function,
+                    Language::TypeScript,
+                ),
+            ],
+        );
+
+        let text = text_of(&engine.execute(
+            "codegraph_explore",
+            &serde_json::json!({"query": target, "maxFiles": 1}),
+        ));
+        assert!(
+            text.contains("1 file pinned from the query."),
+            "got: {text}"
+        );
+        assert!(text.contains(target), "got: {text}");
+        assert!(text.contains("feedAtBottom"), "got: {text}");
+        assert!(
+            !text.contains("src/lib/runs-store.ts"),
+            "path fragments must not seed the decoy: {text}"
+        );
+    }
+
+    #[test]
+    fn ext_explore_camel_segment_seeds_variables_and_constants() {
+        let mut engine = test_engine();
+        put_indexed_source(
+            &engine,
+            "src/feed.ts",
+            "let feedAtBottom = false;\nconst PIN_FEED_IF_NEAR_BOTTOM = true;\n",
+            Language::TypeScript,
+            2,
+        );
+        put_nodes(
+            &mut engine,
+            &[
+                node_lang(
+                    "feedAtBottom",
+                    "feedAtBottom",
+                    "src/feed.ts",
+                    1,
+                    1,
+                    NodeKind::Variable,
+                    Language::TypeScript,
+                ),
+                node_lang(
+                    "PIN_FEED_IF_NEAR_BOTTOM",
+                    "PIN_FEED_IF_NEAR_BOTTOM",
+                    "src/feed.ts",
+                    2,
+                    2,
+                    NodeKind::Constant,
+                    Language::TypeScript,
+                ),
+            ],
+        );
+
+        let text = text_of(&engine.execute(
+            "codegraph_explore",
+            &serde_json::json!({"query": "feed bottom behavior"}),
+        ));
+        assert!(text.contains("feedAtBottom"), "got: {text}");
+        assert!(text.contains("PIN_FEED_IF_NEAR_BOTTOM"), "got: {text}");
+    }
+
+    #[test]
+    fn ext_explore_pinned_low_value_file_wins_max_files_and_reports_misses() {
+        let mut engine = test_engine();
+        put_indexed_source(
+            &engine,
+            "tests/target.rs",
+            "fn only_in_target() {}\n",
+            Language::Rust,
+            1,
+        );
+        put_indexed_source(
+            &engine,
+            "src/scroll.rs",
+            "fn scroll() {}\n",
+            Language::Rust,
+            1,
+        );
+        put_nodes(
+            &mut engine,
+            &[
+                node_lang(
+                    "target",
+                    "only_in_target",
+                    "tests/target.rs",
+                    1,
+                    1,
+                    NodeKind::Function,
+                    Language::Rust,
+                ),
+                node_lang(
+                    "scroll",
+                    "scroll",
+                    "src/scroll.rs",
+                    1,
+                    1,
+                    NodeKind::Function,
+                    Language::Rust,
+                ),
+            ],
+        );
+        let pinned = text_of(&engine.execute(
+            "codegraph_explore",
+            &serde_json::json!({"query": "scroll tests/target.rs", "maxFiles": 1}),
+        ));
+        assert!(pinned.contains("tests/target.rs"), "got: {pinned}");
+        assert!(
+            !pinned.contains("#### `src/scroll.rs`"),
+            "pinned file must own the sole source slot: {pinned}"
+        );
+
+        let missing = text_of(&engine.execute(
+            "codegraph_explore",
+            &serde_json::json!({"query": "crash in src/gone/missing.rs"}),
+        ));
+        assert!(
+            missing.contains("No indexed file uniquely matches `src/gone/missing.rs`"),
+            "got: {missing}"
+        );
+    }
+
+    #[test]
     fn ext_explore_full_render_with_blast_relationships_and_source() {
         let mut engine = test_engine();
         put_indexed_source(
@@ -6923,6 +7226,77 @@ mod tests {
         let engine = CodeGraphEngine::open(&base).unwrap();
         let tr = engine.execute("codegraph_status", &serde_json::json!({}));
         assert!(text_of(&tr).contains("## CodeGraph Status"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ext_request_scoped_open_reloads_deprioritize_config() {
+        let base = std::env::temp_dir().join(format!(
+            "cg-mcp-ranking-reload-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let paths = codegraph_core::IndexPaths::resolve(&base, None).unwrap();
+        std::fs::create_dir_all(paths.current_root()).unwrap();
+        {
+            let mut store = Store::open(&paths.current_db()).unwrap();
+            store
+                .upsert_nodes(&[
+                    node_lang(
+                        "usage",
+                        "product::usage",
+                        "src/product.rs",
+                        1,
+                        2,
+                        NodeKind::Function,
+                        Language::Rust,
+                    ),
+                    node_lang(
+                        "usage",
+                        "vendor::usage",
+                        "vendor/sdk.rs",
+                        1,
+                        2,
+                        NodeKind::Function,
+                        Language::Rust,
+                    ),
+                ])
+                .unwrap();
+        }
+        codegraph_store::test_support::finalize_current_test_fixture(&paths).unwrap();
+
+        std::fs::write(
+            paths.config_toml(),
+            "[app]\nname = \"ranking-reload\"\n\n[indexing]\ndeprioritize = [\"vendor/**\"]\n",
+        )
+        .unwrap();
+        let first = CodeGraphEngine::open(&base)
+            .unwrap()
+            .execute("codegraph_search", &serde_json::json!({"query": "usage"}));
+        let first = text_of(&first);
+        assert!(
+            first.find("src/product.rs").unwrap() < first.find("vendor/sdk.rs").unwrap(),
+            "vendor rule should rank product first: {first}"
+        );
+
+        // A long-lived server opens a request-scoped engine for every tool
+        // call. Rewriting the project config must therefore affect the next
+        // request in the same process without restarting or rebuilding.
+        std::fs::write(
+            paths.config_toml(),
+            "[app]\nname = \"ranking-reload\"\n\n[indexing]\ndeprioritize = [\"src/**\"]\n",
+        )
+        .unwrap();
+        let second = CodeGraphEngine::open(&base)
+            .unwrap()
+            .execute("codegraph_search", &serde_json::json!({"query": "usage"}));
+        let second = text_of(&second);
+        assert!(
+            second.find("vendor/sdk.rs").unwrap() < second.find("src/product.rs").unwrap(),
+            "reloaded src rule should rank vendor first: {second}"
+        );
+
         let _ = std::fs::remove_dir_all(&base);
     }
 

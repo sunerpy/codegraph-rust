@@ -456,6 +456,7 @@ name = "codegraph-core"
 version = "0.48.3"
 dependencies = [
  "anyhow",
+ "globset",
  "serde",
  "serde_json",
  "sha2",
@@ -544,9 +545,11 @@ dependencies = [
  "codegraph-extract",
  "codegraph-resolve",
  "codegraph-store",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
+ "unicode-normalization",
 ]
 
 [[package]]

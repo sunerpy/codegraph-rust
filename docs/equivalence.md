@@ -1173,6 +1173,22 @@ self-equivalence. As for every fixture below the Godot caveats, do not compare
 `colby.db` bytes; compare the four JSON artifacts byte-for-byte and compare
 `schema.sql` as a normalized statement set when statement order differs.
 
+### Retrieval and ranking wave (golden-neutral)
+
+Explicit-path pinning in `codegraph_explore`, camel/segment explore seeding,
+case-insensitive exact-name index seeks, and `[indexing].deprioritize` are
+query/render-time behavior only. They do not modify extraction, resolution,
+node IDs, files, nodes, edges, unresolved references, FTS schema, or any
+committed golden artifact. This wave therefore keeps extraction version `12`
+and has no golden regeneration recipe: a changed file under
+`reference/golden/` is a regression, not expected output.
+
+Planner tests lock exact-name hit, miss, and filtered probes to
+`idx_nodes_lower_name`; search/MCP tests cover Variable/Constant seeds,
+last-match-wins ranking rules, explicit-path bounds, pinned-file budgeting, and
+same-process config reload. The normal equivalence suite remains the authority
+that every extraction golden is byte-stable.
+
 ### KNOWN_DIFFS.md format
 
 Tier-3 differences are allowlisted by grep-able lines in

@@ -1,6 +1,7 @@
 //! codegraph-core crate
 
 pub mod config;
+pub mod deprioritize;
 pub mod errors;
 pub mod file_class;
 pub mod generated_header;
