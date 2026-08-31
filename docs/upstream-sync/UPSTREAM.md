@@ -14,12 +14,14 @@
   CLOSEOUT entry)
 - **This project version:** see `Cargo.toml` (`codegraph-rs`, independent line)
 - **Last audit:** `2026-08-27` (refreshed `2026-08-31`) — upstream `v1.6.0`
-  plus its one following
-  docs-only commit was audited through
+  plus its one following docs-only commit was audited through
   `6a056ec5db35172f9dc348f87b54ea415aa5169e`. The exact new range after the
-  previously closed 104-commit batch is 28 commits and leaves 15 PORT families;
-  see `V1_6_TRIAGE_2026-08-27.md`. Tracked parity therefore remains `1.5.0`
-  until that backlog lands
+  previously closed 104-commit batch is 28 commits and identified 15 PORT
+  families; Wave 0 and Wave 1 have now shipped nine of those families in
+  `v0.48.2`/`v0.48.3`, together with the separately tracked #1626 and #1616
+  fixes. Six upstream PORT families remain in Waves 2–3; see
+  `V1_6_TRIAGE_2026-08-27.md`. Tracked parity therefore remains `1.5.0` until
+  that backlog lands
 - **Previous exact boundary:** `c6aaa20358cd6adcd04b87bdef8e5803ad146f3a`
   (the 104th commit after `v1.5.0`; merge of upstream PR #1516)
 - **Next discovery starts here:** diff
@@ -76,6 +78,89 @@
 > that records colby parity — do not infer it from `Cargo.toml`.
 
 ## Sync log
+
+### 2026-08-31 — Wave 1 graph correctness + watcher reload LANDED in `v0.48.3`
+
+Rust PR [#252](https://github.com/sunerpy/codegraph-rust/pull/252), merged as
+`d42368c628820cfc49805d0384261e18e1c8e900`, shipped all ten frozen Wave 1
+items: upstream `41c1075`, `12f7a59`, `7963672`, `278a8ed`, `474f051`,
+`d618d94`, `a740291`, and `cf1b0e3`, plus open-issue fixes #1626 and #1616.
+The implementation commit is `9d26c70`; follow-up commits `f9ee631`,
+`4609c8f`, and `6b6e0b5` lock the alias and watcher path semantics on native
+Windows.
+
+The shipped behavior is:
+
+- Erlang function identity and resolution are arity-aware, including exports,
+  specs, local/remote calls, `fun`, spawn/apply, binary-literal argument
+  counting, and CLI/MCP `module:function/arity` lookup;
+- Rust methods are assigned only to statically safe `impl` owners, and exact
+  single-hop `self.field.method()` calls resolve through declared field types
+  without falling back to unsafe global same-name guesses;
+- JS/TS object-literal callable members resolve within their source ranges,
+  inherited `tsconfig`/`jsconfig` aliases honor config-relative origins and
+  bounded/cycle-safe `extends`, and `.xsjs`/`.xsjslib` participate in the
+  documented JS import ordering;
+- full-source masked C-family header detection recognizes plain derived
+  `class`/`struct` declarations without promoting comments, literals,
+  bitfields, labels, or ternaries;
+- Python module aliases and Lua function expressions/table members gain their
+  scoped callable/module bindings; and
+- the watcher treats the selected index root's `config.toml` and
+  `codegraph.json`, plus the project-root `.gitignore`, as control files,
+  atomically reloads scope/watch targets, and performs one dominating full
+  reconcile while stale queued events are re-checked against the new scope.
+
+Extraction version moved exactly once, from 11 to 12. The node-id formula is
+unchanged. Expected golden growth is isolated to the C-family, Erlang, Python,
+Rust, and TypeScript corpora, plus a new Lua corpus; `docs/equivalence.md`
+records every regeneration recipe. Existing unaffected corpora remain
+byte-stable. Local `make ci`, the pre-push gate, PR CI run
+[`33399374332`](https://github.com/sunerpy/codegraph-rust/actions/runs/33399374332),
+post-merge main CI run
+[`33400228015`](https://github.com/sunerpy/codegraph-rust/actions/runs/33400228015),
+and the release/tag CI run
+[`33401044034`](https://github.com/sunerpy/codegraph-rust/actions/runs/33401044034)
+all passed, including native Windows.
+
+Release-please PR
+[#253](https://github.com/sunerpy/codegraph-rust/pull/253) merged as
+`14c8f7bf636b0d6b857a8fdeba618448eca028d8`, cut tag `v0.48.3` at that exact
+commit, and release workflow
+[`33401043968`](https://github.com/sunerpy/codegraph-rust/actions/runs/33401043968)
+published only after CI Success, all six platform builds, asset upload, and
+checksum generation passed. The official
+`codegraph-0.48.3-x86_64-unknown-linux-musl.tar.gz` digest is
+`f8d84244df59974734535d5c45d1ea9c63af5c4019e3f161dd9859a21c4cc287`,
+matching both `SHA256SUMS` and GitHub's asset digest.
+
+Black-box acceptance used that downloaded static binary:
+
+- a project initialized by the official `v0.48.2` binary reported extraction
+  version 11 as `outdated`, then ordinary `codegraph sync .` upgraded it to
+  version 12 without requiring `index --force`;
+- `status`, `sync`, `index --force`, `search`, `explore`, and `node` succeeded;
+  the incremental upgrade and full rebuild both produced 3 files, 11 nodes,
+  and 13 edges for the smoke corpus;
+- TS inherited aliases/object members and Lua `local f = function` /
+  `M.f = function` were queryable with their expected call trails;
+- MCP `initialize` and `tools/list` returned protocol/tool results, and a query
+  succeeded while another process held the permanent `index.lock` shared;
+- an invalid runtime `config.toml` kept the previous watcher scope, while a
+  valid exclusion removed the Lua file and clearing it re-indexed that file
+  without restarting the server;
+- an isolated HOME installed Skill `0.48.2`, reported
+  `outdated (0.48.2 -> 0.48.3)`, showed the complete
+  `--dry-run --diff` with `+13 -0`, updated successfully, and then reported
+  `up to date (0.48.3)`;
+- the Zuno `--print-config` contract remained unchanged; and
+- normal CLI startup did not reintroduce the former `logger initialized`
+  banner.
+
+Wave 1 is therefore shipped, not merely implemented. The remaining upstream
+`v1.6.0` backlog is the six Wave 2–3 PORT families. Tracked colby parity remains
+`1.5.0` until those ship; `codegraph context` and #1617 remain explicitly
+deferred.
 
 ### 2026-08-31 — Wave 0 deep-AST guard LANDED in `v0.48.2`
 
