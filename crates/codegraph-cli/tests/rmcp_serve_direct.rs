@@ -13,7 +13,7 @@
 //! stdin EOF removes it.
 #![cfg(unix)]
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -333,6 +333,20 @@ fn search(
     id: i64,
     arguments: Value,
 ) -> String {
+    let resp = search_response(stdin, stdout, deadline, id, arguments);
+    resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("")
+        .to_string()
+}
+
+fn search_response(
+    stdin: &mut impl Write,
+    stdout: &mut impl BufRead,
+    deadline: Instant,
+    id: i64,
+    arguments: Value,
+) -> Value {
     let call = json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -341,11 +355,7 @@ fn search(
     });
     writeln!(stdin, "{call}").unwrap();
     stdin.flush().unwrap();
-    let resp = read_json_line_with_id(stdout, id, deadline).expect("tools/call response");
-    resp["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap_or("")
-        .to_string()
+    read_json_line_with_id(stdout, id, deadline).expect("tools/call response")
 }
 
 /// A `--path`-pinned server WILL open a DIFFERENT project's index when a client
@@ -489,6 +499,263 @@ fn serve_mcp_without_an_explicit_path_registers_without_a_project() {
     assert!(
         wait_with_timeout(&mut child, Duration::from_secs(10)),
         "serve --mcp must exit after stdin EOF"
+    );
+}
+
+#[test]
+fn bare_serve_adopts_the_only_indexed_workspace_child() {
+    // GIVEN an unindexed workspace root with exactly one indexed child.
+    let workspace = TestDir::new("single-subproject");
+    std::fs::create_dir(workspace.path().join(".git")).unwrap();
+    let indexed = indexed_project_with(
+        &workspace,
+        "service-a",
+        Some((
+            "src/unique.ts",
+            "export function uniquechildmarker(): number {\n  return 11;\n}\n",
+        )),
+    );
+    let registry_dir = workspace.path().join("mcp-registry");
+
+    let mut process = Command::new(bin())
+        .args(["serve", "--mcp"])
+        .current_dir(workspace.path())
+        .env("CODEGRAPH_NO_DAEMON", "1")
+        .env("CODEGRAPH_NO_WATCH", "1")
+        .env("CODEGRAPH_MCP_REGISTRY_DIR", &registry_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bare serve --mcp from workspace root");
+
+    let mut stdin = process.stdin.take().expect("child stdin");
+    let mut stdout = BufReader::new(process.stdout.take().expect("child stdout"));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    handshake(
+        &mut stdin,
+        &mut stdout,
+        deadline,
+        "rmcp-single-subproject-test",
+    );
+
+    // WHEN the client omits projectPath, THEN the unique child is the default.
+    let hit = search(
+        &mut stdin,
+        &mut stdout,
+        deadline,
+        2,
+        json!({ "query": "uniquechildmarker" }),
+    );
+    assert!(
+        hit.contains("unique.ts") && hit.contains("uniquechildmarker"),
+        "the only indexed child must be adopted as the default project: {hit}"
+    );
+
+    drop(stdin);
+    assert!(
+        wait_with_timeout(&mut process, Duration::from_secs(10)),
+        "serve --mcp must exit after stdin EOF"
+    );
+    let mut diagnostics = String::new();
+    process
+        .stderr
+        .take()
+        .expect("child stderr")
+        .read_to_string(&mut diagnostics)
+        .unwrap();
+    assert!(
+        diagnostics.contains("adopted the single indexed sub-project service-a"),
+        "startup must explain the deterministic adoption: {diagnostics}"
+    );
+    assert!(indexed.join(".codegraph/codegraph.db").is_file());
+}
+
+#[test]
+fn bare_serve_reports_ambiguous_children_and_explicit_project_path_wins() {
+    // GIVEN an unindexed workspace root with two indexed children.
+    let workspace = TestDir::new("ambiguous-subprojects");
+    std::fs::create_dir(workspace.path().join(".git")).unwrap();
+    let service_a = indexed_project_with(
+        &workspace,
+        "service-a",
+        Some((
+            "src/alpha.ts",
+            "export function alphachildmarker(): number {\n  return 1;\n}\n",
+        )),
+    );
+    let service_b = indexed_project_with(
+        &workspace,
+        "service-b",
+        Some((
+            "src/beta.ts",
+            "export function betachildmarker(): number {\n  return 2;\n}\n",
+        )),
+    );
+    let registry_dir = workspace.path().join("mcp-registry");
+
+    let mut process = Command::new(bin())
+        .args(["serve", "--mcp"])
+        .current_dir(workspace.path())
+        .env("CODEGRAPH_NO_DAEMON", "1")
+        .env("CODEGRAPH_NO_WATCH", "1")
+        .env("CODEGRAPH_MCP_REGISTRY_DIR", &registry_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ambiguous bare serve --mcp");
+
+    let mut stdin = process.stdin.take().expect("child stdin");
+    let mut stdout = BufReader::new(process.stdout.take().expect("child stdout"));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    handshake(
+        &mut stdin,
+        &mut stdout,
+        deadline,
+        "rmcp-ambiguous-subproject-test",
+    );
+
+    // No projectPath means no guessing; the existing tool-result error shape
+    // lists candidates in deterministic order.
+    let ambiguous_response = search_response(
+        &mut stdin,
+        &mut stdout,
+        deadline,
+        2,
+        json!({ "query": "add" }),
+    );
+    assert!(
+        ambiguous_response["result"]["isError"] != json!(true),
+        "ambiguous defaults must use the existing success-shaped guidance result: {ambiguous_response}"
+    );
+    let ambiguous = ambiguous_response["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        ambiguous.contains("service-a, service-b") && ambiguous.contains("projectPath"),
+        "ambiguous children must be reported rather than guessed: {ambiguous}"
+    );
+
+    // An explicit absolute projectPath bypasses the default-root ambiguity.
+    let explicit = search(
+        &mut stdin,
+        &mut stdout,
+        deadline,
+        3,
+        json!({
+            "query": "betachildmarker",
+            "projectPath": service_b.to_str().unwrap()
+        }),
+    );
+    assert!(
+        explicit.contains("beta.ts") && explicit.contains("betachildmarker"),
+        "explicit projectPath must win over ambiguous defaults: {explicit}"
+    );
+    assert!(service_a.join(".codegraph/codegraph.db").is_file());
+
+    drop(stdin);
+    assert!(
+        wait_with_timeout(&mut process, Duration::from_secs(10)),
+        "serve --mcp must exit after stdin EOF"
+    );
+    let mut diagnostics = String::new();
+    process
+        .stderr
+        .take()
+        .expect("child stderr")
+        .read_to_string(&mut diagnostics)
+        .unwrap();
+    assert!(
+        diagnostics.contains("Indexed sub-projects found: service-a, service-b"),
+        "stderr must explain the ambiguity and sorted choices: {diagnostics}"
+    );
+}
+
+#[test]
+fn bare_serve_does_not_scan_children_without_a_workspace_gate() {
+    // GIVEN an ordinary unindexed directory with one indexed child but no
+    // workspace manifest and no .git entry.
+    let directory = TestDir::new("ungated-subproject");
+    let indexed = indexed_project_with(
+        &directory,
+        "hidden-child",
+        Some((
+            "src/hidden.ts",
+            "export function ungatedchildmarker(): number {\n  return 3;\n}\n",
+        )),
+    );
+    let registry_dir = directory.path().join("mcp-registry");
+
+    let mut process = Command::new(bin())
+        .args(["serve", "--mcp"])
+        .current_dir(directory.path())
+        .env("CODEGRAPH_NO_DAEMON", "1")
+        .env("CODEGRAPH_NO_WATCH", "1")
+        .env("CODEGRAPH_MCP_REGISTRY_DIR", &registry_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ungated bare serve --mcp");
+
+    let mut stdin = process.stdin.take().expect("child stdin");
+    let mut stdout = BufReader::new(process.stdout.take().expect("child stdout"));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    handshake(
+        &mut stdin,
+        &mut stdout,
+        deadline,
+        "rmcp-ungated-subproject-test",
+    );
+
+    let no_default = search_response(
+        &mut stdin,
+        &mut stdout,
+        deadline,
+        2,
+        json!({ "query": "ungatedchildmarker" }),
+    );
+    assert_ne!(no_default["result"]["isError"], json!(true), "{no_default}");
+    let guidance = no_default["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        guidance.contains("No indexed project resolved") && !guidance.contains("hidden-child"),
+        "an ungated directory must not down-scan its child: {guidance}"
+    );
+
+    let explicit = search(
+        &mut stdin,
+        &mut stdout,
+        deadline,
+        3,
+        json!({
+            "query": "ungatedchildmarker",
+            "projectPath": indexed.to_str().unwrap()
+        }),
+    );
+    assert!(
+        explicit.contains("hidden.ts") && explicit.contains("ungatedchildmarker"),
+        "the same child remains reachable when explicitly selected: {explicit}"
+    );
+
+    drop(stdin);
+    assert!(
+        wait_with_timeout(&mut process, Duration::from_secs(10)),
+        "serve --mcp must exit after stdin EOF"
+    );
+    let mut diagnostics = String::new();
+    process
+        .stderr
+        .take()
+        .expect("child stderr")
+        .read_to_string(&mut diagnostics)
+        .unwrap();
+    assert!(
+        diagnostics.contains("no default project, live sync disabled")
+            && !diagnostics.contains("Indexed sub-projects found"),
+        "stderr must report the no-default state without claiming an ungated scan: {diagnostics}"
     );
 }
 

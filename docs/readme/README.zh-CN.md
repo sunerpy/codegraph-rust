@@ -54,6 +54,7 @@ irm https://raw.githubusercontent.com/sunerpy/codegraph-rust/main/scripts/instal
 codegraph init  /path/to/project                   # 创建 .codegraph/ 并执行首次索引
 codegraph search "<symbol>" -p /path/to/project    # 全文符号检索（`query` 为兼容别名）
 codegraph serve --mcp --path /path/to/project      # 为 AI 代理启动 MCP 服务器（--path 可选，默认 cwd）
+codegraph install --yes --init                     # 接线已检测代理并初始化 cwd
 ```
 
 ---
@@ -104,6 +105,7 @@ Copilot CLI / JetBrains）：
 
 ```bash
 codegraph install --yes              # 检测已安装的代理并接线
+codegraph install --yes --init       # 无人值守的一次性安装 + cwd 建索引
 ```
 
 **可调用的 MCP 工具**（对已索引源码优先用这些而非 grep/read）：
@@ -181,9 +183,12 @@ cargo install --git https://github.com/sunerpy/codegraph-rust codegraph-rs
 }
 ```
 
-**默认（不带 `-p`）：** 一份配置即可覆盖所有项目——每个项目只需提前用
-`codegraph index` 建立索引。当服务器无法从 cwd 或 MCP 握手中解析项目时，每次
-工具调用需显式传入 `projectPath`。**可选 `-p <path>` / `--path <path>`：**
+**默认（不带 `-p`）：** 一份配置即可覆盖所有项目。stdio 服务先向上查找索引；
+若启动目录本身是 workspace 根（含 `.git` 或 workspace manifest），还会在确定性
+边界内自动采用唯一一个已索引子项目。多个候选绝不猜测，而会在 stderr/工具提示中
+按序列出；此时每次调用传 `projectPath`，或用 `--path` 固定项目。MCP 握手中的
+`rootUri`/`workspaceFolders`/`roots` 仍可用于采用项目。**可选 `-p <path>` /
+`--path <path>`：**
 固定指向单个项目（例如
 `"args": ["serve", "--mcp", "-p", "/abs/path/to/project"]`）。
 
@@ -193,9 +198,15 @@ GitHub Copilot CLI、JetBrains IDE。
 
 ```bash
 codegraph install --yes                          # 自动检测已安装代理
+codegraph install --yes --init                   # 接线代理后初始化 cwd
 codegraph install --target=claude,cursor --yes   # 显式指定
 codegraph install --target=auto --local          # 项目级配置
+codegraph install --target=codex --local --yes   # .codex/config.toml + AGENTS.md + 本地 Skill
 ```
+
+Codex 的项目级配置只有在仓库被 Codex 标记为可信后才会启用。`install` 默认绝不
+创建索引；只有显式 `--init` 才会在安装成功后初始化，`--print-config` 始终提前返回，
+既不写配置也不建索引。
 
 完整 MCP 工具参考：[`../mcp.md`](../mcp.md)。
 
@@ -259,7 +270,8 @@ codegraph skill update --target=zuno --global
 - **Kiro / Qoder** — 全局条目写入裸 `serve --mcp`（无 `--path`），工具对现有索引只读访问。在各项目内运行 `codegraph init --target=kiro` 可获得实时监听。
 - **Zed** — 全局 `~/.config/zed/settings.json`（Linux/macOS）或 `%APPDATA%\Zed\settings.json`（Windows）写入裸条目。在项目内运行 `codegraph init --target=zed` 写入带绝对 `--path` 的 `.zed/settings.json`——这是 Zed 获得项目级实时索引的唯一方式。
 - **Zuno** — 全局配置位于 `$XDG_CONFIG_HOME/zuno/zuno.json[c]`（通常是 `~/.config/zuno/`），项目配置位于 `.zuno/zuno.json[c]`。安装器写入 `mcp.codegraph`，并自动迁移旧的 `mcp.codegraph-mcp-server` 键，同时保留 JSONC 注释和其他 MCP 项。
-- **Claude Code、Cursor、Codex CLI、opencode、Hermes、Gemini CLI、Antigravity** — 使用各自原生的 MCP 配置结构，守护进程可到达项目时获得实时监听。
+- **Codex CLI** — 全局安装保持 `~/.codex/config.toml` 与 `~/.codex/AGENTS.md`；项目级安装写入 `.codex/config.toml`、仓库根 `AGENTS.md` 和 `.agents/skills/codegraph`。需在 Codex 中信任该仓库才会启用本地层。
+- **Claude Code、Cursor、opencode、Hermes、Gemini CLI、Antigravity** — 使用各自原生的 MCP 配置结构，守护进程可到达项目时获得实时监听。
 
 **在 Kiro、Qoder 或 Zed 中获得实时自动更新。** 在每个项目中运行一次：
 

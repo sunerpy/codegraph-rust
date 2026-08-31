@@ -161,9 +161,8 @@ fn skill_install_all_global_writes_every_supporting_agent() {
 
 #[test]
 fn skill_install_codex_local_writes_into_project() {
-    // codex's MCP config is global-only (supports_location(Local)==false), but it
-    // DOES support local skills (gated on supports_skills). So a local skill
-    // install must WRITE under the project dir, NOT be skipped like local MCP.
+    // Codex supports both project-local MCP config and project-local skills.
+    // The skill belongs under the shared `.agents/skills` project directory.
     let fx = Fixture::new("codex-local");
     let skill_md = fx.project.join(".agents/skills/codegraph/SKILL.md");
 

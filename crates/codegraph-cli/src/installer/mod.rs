@@ -337,8 +337,8 @@ fn resolve_skill_targets(
 
 /// `codegraph skill install`. Writes the embedded skill into each resolved
 /// target's skill directory, gating on `supports_skills` (NOT
-/// `supports_location` — codex/antigravity support local skills even though
-/// their MCP config is global-only).
+/// `supports_location` — a target may expose skill locations independently
+/// from its MCP config locations).
 pub fn run_skill_install(args: SkillArgs) -> Result<()> {
     let _ = args.yes;
     let ctx = context_from_env()?;
@@ -913,10 +913,13 @@ mod tests {
     }
 
     #[test]
-    fn run_install_with_ctx_skips_unsupported_location() {
-        let (ctx, base) = temp_ctx("run-skip");
+    fn run_install_with_ctx_installs_codex_locally() {
+        let (ctx, base) = temp_ctx("run-codex-local");
+        let cwd = ctx.cwd.clone();
         run_install_with_ctx(ctx.clone(), install_args("codex", "local")).unwrap();
         assert!(!ctx.home.join(".codex").exists());
+        assert!(cwd.join(".codex/config.toml").exists());
+        assert!(cwd.join("AGENTS.md").exists());
         let _ = fs::remove_dir_all(base);
     }
 
@@ -978,8 +981,7 @@ mod tests {
         let reports = uninstall_targets(&ctx, &[gemini, codex], Location::Local);
         assert!(matches!(reports[0].status, UninstallStatus::Removed));
         assert!(!reports[0].removed_paths.is_empty());
-        assert!(matches!(reports[1].status, UninstallStatus::Unsupported));
-        assert!(!reports[1].notes.is_empty());
+        assert!(matches!(reports[1].status, UninstallStatus::NotConfigured));
 
         let again = uninstall_targets(&ctx, &[gemini], Location::Local);
         assert!(matches!(again[0].status, UninstallStatus::NotConfigured));

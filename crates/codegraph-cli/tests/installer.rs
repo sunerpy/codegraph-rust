@@ -345,11 +345,31 @@ fn print_config_does_not_write() {
 }
 
 #[test]
-fn codex_local_is_skipped_global_only() {
-    let fx = Fixture::new("codex-skip");
+fn codex_local_install_and_uninstall_are_project_scoped() {
+    let fx = Fixture::new("codex-local");
     let out = fx.run(&["install", "--target=codex", "--local", "--yes"]);
-    assert!(out.contains("skipped"));
+    assert!(out.contains("trusted"));
+    let local_toml = fx.project.join(".codex/config.toml");
+    let local_agents = fx.project.join("AGENTS.md");
+    let local_skill = fx.project.join(".agents/skills/codegraph/SKILL.md");
+    assert!(
+        fs::read_to_string(&local_toml)
+            .unwrap()
+            .contains("[mcp_servers.codegraph]")
+    );
+    assert!(
+        fs::read_to_string(&local_agents)
+            .unwrap()
+            .contains("codegraph explore")
+    );
+    assert!(local_skill.exists());
     assert!(!fx.home.join(".codex/config.toml").exists());
+
+    fx.run(&["install", "--target=codex", "--global", "--yes"]);
+    fx.run(&["uninstall", "--target=codex", "--local", "--yes"]);
+    assert!(!local_toml.exists());
+    assert!(!local_skill.exists());
+    assert!(fx.home.join(".codex/config.toml").exists());
 }
 
 fn user_prompt_groups(settings: &Value) -> Vec<Value> {

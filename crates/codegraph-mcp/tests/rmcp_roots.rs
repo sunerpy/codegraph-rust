@@ -231,11 +231,16 @@ fn rmcp_does_not_adopt_unindexed_client_root() {
             .and_then(|c| c.as_text().map(|t| t.text.clone()))
             .unwrap_or_default();
 
-        // No adoption ⇒ the unindexed default resolves nothing ⇒ the no-project
-        // error message (isError result), NOT a wrong project's results.
+        // No adoption ⇒ the unindexed default resolves nothing ⇒ the
+        // success-shaped no-project guidance, NOT a wrong project's results.
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "an absent default is guidance rather than an explicit-path error"
+        );
         assert!(
             text.contains("No indexed project"),
-            "unindexed client root must NOT be adopted; expected no-project error, got: {text}"
+            "unindexed client root must NOT be adopted; expected no-project guidance, got: {text}"
         );
 
         let _ = client.cancel().await;
@@ -245,7 +250,8 @@ fn rmcp_does_not_adopt_unindexed_client_root() {
 
 /// GUARD: an HTTP/`no_roots` handler never requests roots. Even a roots-capable
 /// client that reports an INDEXED root leaves the unindexed HTTP pin unadopted,
-/// so a tool call with NO projectPath errors (parity with the pinned no_roots path).
+/// so a tool call with NO projectPath returns no-project guidance (parity with
+/// the pinned no_roots path).
 #[test]
 fn rmcp_http_no_roots_never_adopts() {
     rt().block_on(async {
@@ -284,6 +290,11 @@ fn rmcp_http_no_roots_never_adopts() {
             .and_then(|c| c.as_text().map(|t| t.text.clone()))
             .unwrap_or_default();
 
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "an absent default is guidance, not an explicit-path failure"
+        );
         assert!(
             text.contains("No indexed project"),
             "http no_roots mode must NOT adopt the client's indexed root: {text}"

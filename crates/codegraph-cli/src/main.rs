@@ -210,6 +210,10 @@ enum Command {
         /// get the project's absolute `--path`.
         #[arg(short, long, default_value = "none")]
         target: String,
+        /// Accepted for non-interactive bootstrap compatibility. `init` has no
+        /// confirmation prompt today, so this is intentionally behavior-neutral.
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
     // Upstream flags/output: upstream bin/codegraph.ts:482-485, 489-527.
     Uninit {
@@ -468,6 +472,9 @@ enum Command {
         local: bool,
         #[arg(short, long)]
         yes: bool,
+        /// After a successful agent install, initialize the current project.
+        #[arg(short = 'i', long = "init")]
+        init: bool,
         #[arg(long = "no-permissions")]
         no_permissions: bool,
         #[arg(long = "prompt-hook")]
@@ -633,7 +640,7 @@ enum McpAction {
 
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Init { path, target } => cmd_init(path, &target),
+        Command::Init { path, target, yes } => cmd_init(path, &target, yes),
         Command::Uninit { path, force } => cmd_uninit(path, force),
         Command::Index {
             path,
@@ -744,17 +751,25 @@ fn run(cli: Cli) -> Result<()> {
             global,
             local,
             yes,
+            init,
             no_permissions,
             prompt_hook,
             print_config,
-        } => installer::run_install(installer::InstallArgs {
-            target,
-            location: location_flag(location, global, local),
-            yes,
-            permissions: if no_permissions { Some(false) } else { None },
-            front_load_hook: prompt_hook,
-            print_config,
-        }),
+        } => {
+            let print_only = print_config.is_some();
+            installer::run_install(installer::InstallArgs {
+                target,
+                location: location_flag(location, global, local),
+                yes,
+                permissions: if no_permissions { Some(false) } else { None },
+                front_load_hook: prompt_hook,
+                print_config,
+            })?;
+            if init && !print_only {
+                cmd_init(None, "none", yes)?;
+            }
+            Ok(())
+        }
         Command::Uninstall {
             target,
             location,
@@ -1291,7 +1306,7 @@ fn cmd_prompt_hook(path: Option<PathBuf>, query: Option<String>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_init(path: Option<PathBuf>, target: &str) -> Result<()> {
+fn cmd_init(path: Option<PathBuf>, target: &str, _yes: bool) -> Result<()> {
     let project = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
     if explicit_init_observes_readable_current(&project)? {
         println!("Already initialized in {}", project.display());
@@ -2169,14 +2184,26 @@ fn cmd_serve(
     if http {
         return cmd_serve_http(path, &http_addr, detach);
     }
-    // Default the MCP project to cwd so `serve --mcp` (no --path, as the
-    // installer injects) finds the index of the agent's project root.
     let explicit_path = path.is_some();
-    let project = Some(resolve_project_path_optional(&absolute_path(
-        path.unwrap_or_else(|| PathBuf::from(".")),
-    )));
+    let search_from = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
+    // Preserve the existing lifecycle-root fallback for interrupted/outdated
+    // indexes, but prefer the shared stdio resolver when it finds a usable
+    // ancestor or exactly one indexed child workspace project.
+    let lifecycle_root = resolve_project_path_optional(&search_from);
+    let resolution = codegraph_mcp::resolve_server_root(&search_from, true);
+    let project_root = resolution.root.clone().unwrap_or(lifecycle_root);
+    if resolution.via_subproject_scan {
+        let relative = project_root
+            .strip_prefix(&resolution.search_from)
+            .unwrap_or(&project_root)
+            .display();
+        eprintln!(
+            "[CodeGraph MCP] No index at or above {}; adopted the single indexed sub-project {relative} as the default project.",
+            resolution.search_from.display()
+        );
+    }
+    let project = Some(project_root.clone());
     if mcp {
-        let project_root = project.clone().unwrap_or_else(|| PathBuf::from("."));
         // Stop-the-bleed home guard: an IDE (e.g. Kiro) launches `serve --mcp`
         // with CWD=$HOME, which would otherwise spawn a daemon and run a
         // home-wide catch-up sync that pegs a CPU indexing the entire home

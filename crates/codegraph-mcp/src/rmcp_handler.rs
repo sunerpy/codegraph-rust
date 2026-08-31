@@ -36,7 +36,10 @@ use serde_json::{Value, json};
 use crate::engine::CodeGraphEngine;
 use crate::instructions::server_instructions;
 use crate::protocol::ToolResult;
-use crate::roots::{WorkspaceRoots, db_exists_for, db_path_for};
+use crate::roots::{
+    ServerRootDiscovery, WorkspaceRoots, db_exists_for, db_path_for, format_subproject_candidates,
+    not_indexed_message,
+};
 use crate::schemas;
 
 const SERVER_NAME: &str = "codegraph";
@@ -102,6 +105,7 @@ fn tool_timeout() -> Option<Duration> {
 /// handler, so it lives behind a `Mutex` for interior mutability. In pinned /
 /// `no_roots` mode it never changes after construction.
 type DefaultProject = Arc<Mutex<Option<PathBuf>>>;
+type RootDiscovery = Arc<Mutex<ServerRootDiscovery>>;
 
 /// rmcp handler state: the default project / cwd used to resolve a per-call
 /// `projectPath`. `no_roots` mirrors the
@@ -111,6 +115,7 @@ pub struct CodeGraphHandler {
     default_project: DefaultProject,
     cwd: Option<PathBuf>,
     no_roots: bool,
+    root_discovery: Option<RootDiscovery>,
 }
 
 impl CodeGraphHandler {
@@ -119,6 +124,7 @@ impl CodeGraphHandler {
             default_project: Arc::new(Mutex::new(default_project)),
             cwd: std::env::current_dir().ok(),
             no_roots: true,
+            root_discovery: None,
         }
     }
 
@@ -137,11 +143,7 @@ impl CodeGraphHandler {
     /// is the bare-`serve --mcp` / Zed-local case where `default_project` is a
     /// cwd-derived, possibly unindexed dir.
     pub fn serve_with_roots(default_project: Option<PathBuf>, cwd: Option<PathBuf>) -> Self {
-        Self {
-            default_project: Arc::new(Mutex::new(default_project)),
-            cwd,
-            no_roots: false,
-        }
+        Self::stdio(default_project, cwd, false)
     }
 
     /// Test-only constructor with an explicit cwd (mirrors
@@ -149,10 +151,47 @@ impl CodeGraphHandler {
     /// exercised deterministically.
     #[doc(hidden)]
     pub fn new_with_cwd(default_project: Option<PathBuf>, cwd: Option<PathBuf>) -> Self {
+        Self::stdio(default_project, cwd, true)
+    }
+
+    fn stdio(default_project: Option<PathBuf>, cwd: Option<PathBuf>, no_roots: bool) -> Self {
+        let search_from = default_project.clone().or_else(|| cwd.clone());
+        let mut discovery = ServerRootDiscovery::new(search_from);
+        let mut resolved_default = default_project;
+        if let Some(resolution) = discovery.initial_resolution() {
+            if let Some(root) = resolution.root {
+                if resolution.via_subproject_scan {
+                    let relative = root
+                        .strip_prefix(&resolution.search_from)
+                        .unwrap_or(&root)
+                        .display();
+                    eprintln!(
+                        "[CodeGraph MCP] No index at or above {}; adopted the single indexed sub-project {relative} as the default project.",
+                        resolution.search_from.display()
+                    );
+                }
+                resolved_default = Some(root);
+            } else {
+                eprintln!(
+                    "[CodeGraph MCP] No index at or above {}: no default project, live sync disabled.",
+                    resolution.search_from.display()
+                );
+                if !resolution.candidates.is_empty() {
+                    eprintln!(
+                        "[CodeGraph MCP] Indexed sub-projects found: {}. Pass `projectPath` per call, or launch with --path.",
+                        format_subproject_candidates(
+                            Some(&resolution.search_from),
+                            &resolution.candidates
+                        )
+                    );
+                }
+            }
+        }
         Self {
-            default_project: Arc::new(Mutex::new(default_project)),
+            default_project: Arc::new(Mutex::new(resolved_default)),
             cwd,
-            no_roots: true,
+            no_roots,
+            root_discovery: Some(Arc::new(Mutex::new(discovery))),
         }
     }
 
@@ -169,6 +208,54 @@ impl CodeGraphHandler {
         self.default_project_snapshot()
             .as_ref()
             .is_some_and(|p| db_exists_for(p))
+    }
+
+    fn retry_default_project(&self) {
+        if self.has_default_codegraph() {
+            return;
+        }
+        let Some(discovery) = &self.root_discovery else {
+            return;
+        };
+        let resolution = discovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retry_resolution();
+        let Some(resolution) = resolution else {
+            return;
+        };
+        let Some(root) = resolution.root else {
+            return;
+        };
+        let mut default = self
+            .default_project
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if default.as_ref().is_some_and(|path| db_exists_for(path)) {
+            return;
+        }
+        let relative = root
+            .strip_prefix(&resolution.search_from)
+            .unwrap_or(&root)
+            .display();
+        eprintln!(
+            "[CodeGraph MCP] Adopted newly indexed project {relative} from {} as the default project.",
+            resolution.search_from.display()
+        );
+        *default = Some(root);
+    }
+
+    fn discovery_snapshot(&self) -> (Option<PathBuf>, Vec<PathBuf>) {
+        let Some(discovery) = &self.root_discovery else {
+            return (None, Vec::new());
+        };
+        let discovery = discovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            discovery.search_from().map(Path::to_path_buf),
+            discovery.known_candidates().to_vec(),
+        )
     }
 
     /// Resolve a caller's `projectPath` through the shared
@@ -202,6 +289,12 @@ impl CodeGraphHandler {
             Some(roots_result),
         );
         if let Some(adopted) = &adopted {
+            if let Some(discovery) = &self.root_discovery {
+                discovery
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clear_candidates();
+            }
             let was = old_default
                 .as_deref()
                 .map_or_else(|| "none".to_string(), |p| p.display().to_string());
@@ -347,6 +440,7 @@ impl ServerHandler for CodeGraphHandler {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
+        self.retry_default_project();
         let defs = if self.has_default_codegraph() {
             schemas::visible_tool_definitions()
         } else {
@@ -380,6 +474,9 @@ impl ServerHandler for CodeGraphHandler {
             .unwrap_or_else(|| json!({}));
 
         let raw_project = args.get("projectPath").and_then(Value::as_str);
+        if raw_project.is_none() {
+            self.retry_default_project();
+        }
         let project_path = match self.resolve_project_arg(raw_project) {
             crate::roots::ProjectArg::Resolved(p) => p,
             crate::roots::ProjectArg::InvalidConfig(detail) => {
@@ -389,13 +486,14 @@ impl ServerHandler for CodeGraphHandler {
                 .into());
             }
             crate::roots::ProjectArg::NotIndexed => {
-                let message = match raw_project {
-                    Some(raw) => format!(
-                        "No indexed project found for projectPath {raw:?}. Pass an absolute path to an indexed project, or run `codegraph init` there."
-                    ),
-                    None => "No indexed project resolved. Pass a `projectPath` argument, run `codegraph init` in the project, or start the server with `--path <project>`.".to_string(),
+                let (search_from, candidates) = self.discovery_snapshot();
+                let message = not_indexed_message(raw_project, search_from.as_deref(), &candidates);
+                let result = if raw_project.is_some() {
+                    ToolResult::error(message)
+                } else {
+                    ToolResult::text(message)
                 };
-                return Ok(tool_result_to_call_result(&ToolResult::error(message)).into());
+                return Ok(tool_result_to_call_result(&result).into());
             }
         };
 
@@ -835,6 +933,15 @@ mod handler_tests {
         dir
     }
 
+    fn placeholder_indexed_child(workspace: &TempDir, name: &str) -> PathBuf {
+        let child = workspace.path.join(name);
+        std::fs::create_dir_all(&child).unwrap();
+        let db = db_path_for(&child).expect("child project resolves");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::fs::write(&db, b"not a real sqlite db").unwrap();
+        child
+    }
+
     #[test]
     fn host_guard_from_env_open_when_unset_or_blank() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -1005,6 +1112,10 @@ mod handler_tests {
         let project = placeholder_indexed("http-ctor");
         let handler = CodeGraphHandler::http(project.path.clone());
         assert!(handler.no_roots);
+        assert!(
+            handler.root_discovery.is_none(),
+            "HTTP sessions never run stdio launch-root discovery"
+        );
         assert_eq!(
             handler.default_project_snapshot().as_deref(),
             Some(project.path.as_path())
@@ -1015,6 +1126,54 @@ mod handler_tests {
     fn serve_with_roots_clears_no_roots() {
         let handler = CodeGraphHandler::serve_with_roots(None, Some(PathBuf::from("/tmp")));
         assert!(!handler.no_roots, "serve_with_roots enables adoption");
+    }
+
+    #[test]
+    fn rmcp_stdio_adopts_single_indexed_subproject() {
+        let workspace = unique_dir("stdio-single-child");
+        std::fs::create_dir(workspace.path.join(".git")).unwrap();
+        let child = placeholder_indexed_child(&workspace, "service-a");
+
+        let handler = CodeGraphHandler::serve_with_roots(
+            Some(workspace.path.clone()),
+            Some(workspace.path.clone()),
+        );
+
+        assert_eq!(
+            handler.default_project_snapshot().as_deref(),
+            Some(child.as_path())
+        );
+        assert!(handler.has_default_codegraph());
+    }
+
+    #[test]
+    fn rmcp_stdio_preserves_ambiguous_candidates_and_explicit_path_wins() {
+        let workspace = unique_dir("stdio-ambiguous");
+        std::fs::create_dir(workspace.path.join(".git")).unwrap();
+        let a = placeholder_indexed_child(&workspace, "service-a");
+        let b = placeholder_indexed_child(&workspace, "service-b");
+
+        let handler = CodeGraphHandler::serve_with_roots(
+            Some(workspace.path.clone()),
+            Some(workspace.path.clone()),
+        );
+        let (base, candidates) = handler.discovery_snapshot();
+
+        assert_eq!(
+            handler.default_project_snapshot().as_deref(),
+            Some(workspace.path.as_path())
+        );
+        assert_eq!(
+            format_subproject_candidates(base.as_deref(), &candidates),
+            "service-a, service-b"
+        );
+        assert_eq!(
+            handler
+                .resolve_project_arg(Some(a.to_str().unwrap()))
+                .resolved(),
+            Some(a.as_path())
+        );
+        assert!(b.exists());
     }
 
     #[test]
