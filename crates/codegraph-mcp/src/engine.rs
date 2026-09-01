@@ -566,25 +566,48 @@ impl CodeGraphEngine {
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
-        let matches = self.find_symbol_matches(symbol)?;
+        // Exact node IDs are authoritative. This makes the public
+        // `codegraph search --json` -> `codegraph node <id>` flow round-trip
+        // without routing the opaque ID through fuzzy/qualified-name search.
+        let matches = match self.store.node_by_id(symbol)? {
+            Some(node) => vec![node],
+            None => self.find_symbol_matches(symbol)?,
+        };
         if matches.is_empty() {
             return Ok(ToolResult::not_found_text(format!(
                 "Symbol \"{symbol}\" not found in the codebase"
             )));
         }
-        // `symbol` + `file` (#1314): the schema promises `file` PINS an
-        // overloaded name to the definition in that file. A pin that matches
-        // nothing reports not-found rather than falling back to an arbitrary
-        // overload — a silent miss beats a wrong answer.
-        if let Some(file_hint) = file_hint {
+        let line_hint = args.get("line").and_then(Value::as_i64);
+        // `symbol` + `file`/`line` (#1314): the schema promises these fields
+        // PIN an overloaded name to one definition. A pin that matches nothing
+        // reports not-found rather than falling back to an arbitrary overload
+        // — a silent miss beats a wrong answer.
+        if file_hint.is_some() || line_hint.is_some() {
             let pinned: Vec<Node> = matches
                 .iter()
-                .filter(|n| file_path_matches_hint(&n.file_path, file_hint))
+                .filter(|node| {
+                    let file_matches = file_hint
+                        .map(|file| file_path_matches_hint(&node.file_path, file))
+                        .unwrap_or(true);
+                    let line_matches = line_hint
+                        .map(|line| {
+                            node.start_line <= line && line <= node.end_line.max(node.start_line)
+                        })
+                        .unwrap_or(true);
+                    file_matches && line_matches
+                })
                 .cloned()
                 .collect();
             if pinned.is_empty() {
+                let scope = match (file_hint, line_hint) {
+                    (Some(file), Some(line)) => format!(" in \"{file}\" at line {line}"),
+                    (Some(file), None) => format!(" in \"{file}\""),
+                    (None, Some(line)) => format!(" at line {line}"),
+                    (None, None) => String::new(),
+                };
                 return Ok(ToolResult::not_found_text(format!(
-                    "Symbol \"{symbol}\" not found in \"{file_hint}\""
+                    "Symbol \"{symbol}\" not found{scope}"
                 )));
             }
             if pinned.len() == 1 {
@@ -4719,8 +4742,8 @@ mod tests {
             "setState",
             "setState",
             "src/beta.ts",
-            1,
-            4,
+            10,
+            13,
             NodeKind::Function,
             Language::TypeScript,
         );
@@ -4741,6 +4764,32 @@ mod tests {
             "a resolved pin renders one definition, not the ambiguity list: {txt}"
         );
 
+        let line_pinned = engine.execute(
+            "codegraph_node",
+            &serde_json::json!({"symbol": "setState", "line": 10}),
+        );
+        let txt = text_of(&line_pinned);
+        assert!(txt.contains("src/beta.ts"), "got: {txt}");
+        assert!(
+            !txt.contains("src/alpha.ts"),
+            "the line pin must exclude the other overload: {txt}"
+        );
+
+        let file_and_line_pinned = engine.execute(
+            "codegraph_node",
+            &serde_json::json!({
+                "symbol": "setState",
+                "file": "src/beta.ts",
+                "line": 11
+            }),
+        );
+        let txt = text_of(&file_and_line_pinned);
+        assert!(txt.contains("src/beta.ts"), "got: {txt}");
+        assert!(
+            !txt.contains("src/alpha.ts"),
+            "the combined pin must exclude the other overload: {txt}"
+        );
+
         let bad = engine.execute(
             "codegraph_node",
             &serde_json::json!({"symbol": "setState", "file": "src/nowhere.ts"}),
@@ -4750,6 +4799,17 @@ mod tests {
             text_of(&bad).contains("not found in \"src/nowhere.ts\""),
             "got: {}",
             text_of(&bad)
+        );
+
+        let bad_line = engine.execute(
+            "codegraph_node",
+            &serde_json::json!({"symbol": "setState", "line": 99}),
+        );
+        assert_eq!(bad_line.not_found, Some(true));
+        assert!(
+            text_of(&bad_line).contains("at line 99"),
+            "got: {}",
+            text_of(&bad_line)
         );
     }
 
@@ -4766,6 +4826,37 @@ mod tests {
         let engine = test_engine();
         let tr = engine.execute("codegraph_node", &serde_json::json!({"symbol": "ghost"}));
         assert!(text_of(&tr).contains("not found in the codebase"));
+    }
+
+    #[test]
+    fn ext_node_exact_id_round_trips_without_name_search() {
+        let mut engine = test_engine();
+        put_indexed_source(
+            &engine,
+            "svc.rs",
+            &(1..=20).map(|i| format!("line {i}\n")).collect::<String>(),
+            Language::Rust,
+            1,
+        );
+        let target = node_lang(
+            "doThing",
+            "doThing",
+            "svc.rs",
+            10,
+            12,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        let id = target.id.clone();
+        put_nodes(&mut engine, &[target]);
+
+        let tr = engine.execute(
+            "codegraph_node",
+            &serde_json::json!({"symbol": id, "includeCode": true}),
+        );
+        let txt = text_of(&tr);
+        assert!(txt.contains("## doThing (function)"), "got: {txt}");
+        assert!(txt.contains("line 10"), "got: {txt}");
     }
 
     #[test]

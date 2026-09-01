@@ -62,6 +62,12 @@ codegraph serve --mcp --path /path/to/project    # MCP server (--path optional, 
 codegraph install --yes --init                   # wire detected agents + initialize cwd
 ```
 
+Project paths are intentionally parsed differently by command family:
+lifecycle commands use an optional positional path (`codegraph status .`),
+while research commands use `-p/--path`
+(`codegraph search "<symbol>" -p .`). If a command rejects an argument, check
+`codegraph <command> --help` before falling back to text search.
+
 ---
 
 ## Installation

@@ -5,6 +5,24 @@ extracts symbols and their relationships, persists them to a per-project SQLite 
 (with an FTS5 search index), and exposes the result through a CLI and an MCP (Model Context
 Protocol) stdio server. No AI / vector / LLM anywhere in the binary — output is byte-stable.
 
+## CodeGraph command contract
+
+Before code research, run `codegraph status . --json`. Lifecycle commands
+(`status`, `init`, `sync`, `index`) accept an optional positional project path.
+Research commands take one positional query/target and select the project with
+`-p/--path`:
+
+```bash
+codegraph explore "<question>" -p .
+codegraph search "<symbol>" -p .
+codegraph node "<symbol-name-or-id>" -p .
+```
+
+Do not append `.` as a second positional argument to a research command. If an
+argument is rejected, run `codegraph <command> --help` and correct the syntax
+before falling back to grep. `node` accepts a symbol name, qualified name, exact
+`node.id` from `search --json`, or an indexed file path.
+
 ## Hard invariants (never break)
 
 - **Golden `.schema` byte-stability** — verified by `crates/codegraph-bench/tests/equivalence.rs`

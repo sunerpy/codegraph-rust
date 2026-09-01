@@ -36,11 +36,11 @@
 | `callees`         | What a symbol calls                                                                       | `<symbol>`, `-p`, `-l`, `-j`, `--strict`, `--file <FILE>`                                                                                  |
 | `impact`          | Blast radius of changing a symbol (incoming deps, transitive)                             | `<symbol>`, `-p`, `-d/--depth`, `-j`, `--strict`, `--file <FILE>`                                                                          |
 | `affected`        | Given changed files, the affected symbol set                                              | `[files...]`, `-p`, `-d/--depth`, `--filter`                                                                                               |
-| `check`           | Detect circular dependencies (each cycle as `a.ts -> b.ts -> a.ts`)                       | `[path]`, `-j/--json`                                                                                                                      |
+| `check`           | Detect circular dependencies (each cycle as `a.ts -> b.ts -> a.ts`)                       | `-p/--path`, `-j/--json`                                                                                                                   |
 | `audit`           | Read-only Godot resource audit: orphan resources, dangling references, impact             | `-p`, `--orphans`, `--dangling`, `--impact <path>` (≥1 required), `--verify-plan`, `--include <PREFIX>`, `--exclude <PREFIX>`, `-j/--json` |
-| `export`          | Export the whole code graph as NetworkX node-link JSON                                    | `[path]`, `-o/--out <file>`, `--no-centrality`                                                                                             |
+| `export`          | Export the whole code graph as NetworkX node-link JSON                                    | `-p/--path`, `-o/--out <file>`, `--no-centrality`                                                                                          |
 | `explore`         | Explore an area with the same deterministic engine/output as `codegraph_explore`          | `<query>`, `-p`, `--max-files <1..20>`, `-j/--json`                                                                                        |
-| `node`            | Read a symbol or indexed file with the same engine/output as `codegraph_node`             | `<target>`, `-p`, `-f/--file`, `--symbols-only`, `-j/--json`, `--strict`                                                                   |
+| `node`            | Read a symbol name, exact node ID, or indexed file with the `codegraph_node` engine       | `<target>`, `-p`, `-f/--file`, `--symbols-only`, `-j/--json`, `--strict`                                                                   |
 | `http`            | Inspect or stop detached HTTP MCP servers                                                 | `<action>` (`list`, `status`, `stop`)                                                                                                      |
 | `mcp`             | Inspect foreground stdio MCP processes                                                    | `list`, optional `--json`                                                                                                                  |
 | `version`         | Print the codegraph version (same as `--version`)                                         | —                                                                                                                                          |
@@ -49,6 +49,33 @@
 
 `query` remains a visible backward-compatible alias for `search`; new scripts,
 documentation, and diagnostics should use `search`.
+
+### Project-path argument contract
+
+Lifecycle commands (`init`, `uninit`, `index`, `sync`, `status`, `unlock`)
+accept the project as an optional positional `[path]`. Query and analysis
+commands accept their query/target as the positional argument and require
+`-p/--path` for the project:
+
+```bash
+codegraph status . --json
+codegraph sync .
+
+codegraph search "handle_node" -p . --json
+codegraph explore "node lookup flow" -p .
+codegraph node "handle_node" -p .
+```
+
+Do not append `.` as a second positional argument to `search`, `explore`, or
+`node`. On an argument error, use `codegraph <command> --help`; a CLI-shape
+mismatch is not a reason to abandon the index for grep.
+
+`search --json` includes each result's stable internal `node.id`. That ID can be
+passed directly to `node`, avoiding name ambiguity:
+
+```bash
+codegraph node "function:b8b1c4a981a1841066418516bc8ebf86" -p .
+```
 
 Case-insensitive exact-name search probes seek through `idx_nodes_lower_name`
 rather than scanning `nodes`. Explore separately supplements its context seeds

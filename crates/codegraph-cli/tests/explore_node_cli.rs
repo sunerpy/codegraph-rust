@@ -126,6 +126,31 @@ fn help_lists_explore_and_node_subcommands() {
         "node must be a real subcommand: {}",
         nh.stderr
     );
+    assert!(
+        nh.stdout.contains("exact node ID"),
+        "node help must advertise search-result IDs: {}",
+        nh.stdout
+    );
+
+    let sh = run_in(dir.path(), &["search", "--help"]);
+    assert!(sh.ok, "search --help must succeed: {}", sh.stderr);
+    assert!(
+        sh.stdout.contains("-p/--path") && sh.stdout.contains("positional"),
+        "query help must distinguish the project path option: {}",
+        sh.stdout
+    );
+
+    let status_help = run_in(dir.path(), &["status", "--help"]);
+    assert!(
+        status_help.ok,
+        "status --help must succeed: {}",
+        status_help.stderr
+    );
+    assert!(
+        status_help.stdout.contains("optional positional"),
+        "lifecycle help must identify its positional path: {}",
+        status_help.stdout
+    );
 }
 
 #[test]
@@ -183,6 +208,41 @@ fn node_symbol_returns_source_and_trail() {
         run.stdout.contains("Location:"),
         "node symbol output must carry the location line: {}",
         run.stdout
+    );
+}
+
+#[test]
+fn search_json_node_id_round_trips_through_node() {
+    let dir = TestDir::new("node-id");
+    let project = indexed_project(&dir);
+    let p = project.to_str().unwrap();
+
+    let search = run_in(
+        dir.path(),
+        &["search", "Counter", "-p", p, "--json", "--strict"],
+    );
+    assert!(search.ok, "search --json must succeed: {}", search.stderr);
+    let results: serde_json::Value =
+        serde_json::from_str(&search.stdout).expect("search emits JSON");
+    let id = results[0]["node"]["id"]
+        .as_str()
+        .expect("search result carries node.id");
+
+    let node = run_in(dir.path(), &["node", id, "-p", p, "--strict"]);
+    assert!(
+        node.ok,
+        "node <search-result-id> must succeed: {}",
+        node.stderr
+    );
+    assert!(
+        node.stdout.contains("## Counter (class)"),
+        "node ID must render the named target, not the opaque ID: {}",
+        node.stdout
+    );
+    assert!(
+        node.stdout.contains("src/math.ts"),
+        "node ID must preserve the target location: {}",
+        node.stdout
     );
 }
 

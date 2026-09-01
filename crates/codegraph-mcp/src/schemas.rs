@@ -171,6 +171,17 @@ mod tests {
             !DEFAULT_MCP_TOOLS.contains(&"check"),
             "codegraph_check is additive, not part of the default surface"
         );
+        let node = arr
+            .iter()
+            .find(|tool| tool["name"] == "codegraph_node")
+            .expect("node tool exists");
+        assert!(
+            node["inputSchema"]["properties"]["symbol"]["description"]
+                .as_str()
+                .expect("node symbol description")
+                .contains("exact node ID"),
+            "the public schema must advertise exact-ID lookup"
+        );
     }
 
     #[test]

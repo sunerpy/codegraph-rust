@@ -203,6 +203,8 @@ struct Cli {
 enum Command {
     // Upstream flags/output: upstream bin/codegraph.ts:420-424, 431-470.
     Init {
+        /// Project root. Lifecycle commands accept this as an optional
+        /// positional path.
         path: Option<PathBuf>,
         /// Also write project-level MCP config for these agents (csv ids,
         /// `auto`, `all`, `none`). Defaults to `none` (index only). Editors that
@@ -217,12 +219,16 @@ enum Command {
     },
     // Upstream flags/output: upstream bin/codegraph.ts:482-485, 489-527.
     Uninit {
+        /// Project root. Lifecycle commands accept this as an optional
+        /// positional path.
         path: Option<PathBuf>,
         #[arg(short, long)]
         force: bool,
     },
     // Upstream flags/output: upstream bin/codegraph.ts:536-540, 545-596.
     Index {
+        /// Project root. Lifecycle commands accept this as an optional
+        /// positional path.
         path: Option<PathBuf>,
         #[arg(short, long)]
         force: bool,
@@ -233,12 +239,16 @@ enum Command {
     },
     // Upstream flags/output: upstream bin/codegraph.ts:605-608, 612-657.
     Sync {
+        /// Project root. Lifecycle commands accept this as an optional
+        /// positional path.
         path: Option<PathBuf>,
         #[arg(short, long)]
         quiet: bool,
     },
     // Upstream flags/output shape: upstream bin/codegraph.ts:667-670, 679-738, 743-820.
     Status {
+        /// Project root. Lifecycle commands accept this as an optional
+        /// positional path.
         path: Option<PathBuf>,
         #[arg(short = 'j', long = "json")]
         json: bool,
@@ -249,6 +259,8 @@ enum Command {
     #[command(visible_alias = "query")]
     Search {
         search: String,
+        /// Project root. Query commands require `-p/--path`; do not append the
+        /// project as another positional argument.
         #[arg(short, long)]
         path: Option<PathBuf>,
         #[arg(short, long, default_value_t = 10)]
@@ -263,6 +275,8 @@ enum Command {
     },
     // Upstream flags/output shape: upstream bin/codegraph.ts:903-911, 939-1013.
     Files {
+        /// Project root. Query commands require `-p/--path`; do not append the
+        /// project as another positional argument.
         #[arg(short, long)]
         path: Option<PathBuf>,
         /// Filter to files under this directory (path prefix).
@@ -282,6 +296,8 @@ enum Command {
     },
     // Upstream flags/output: upstream bin/codegraph.ts:1110-1115, 1124-1156.
     Serve {
+        /// Project root to pin. Use `-p/--path`; this command does not accept a
+        /// positional project path.
         #[arg(short, long)]
         path: Option<PathBuf>,
         #[arg(long)]
@@ -313,11 +329,15 @@ enum Command {
     },
     // Upstream flags/output: upstream bin/codegraph.ts:1167-1169, 1173-1186.
     Unlock {
+        /// Project root. Lifecycle commands accept this as an optional
+        /// positional path.
         path: Option<PathBuf>,
     },
     // Upstream flags/output shape: upstream bin/codegraph.ts:1201-1205, 1219-1267.
     Callers {
         symbol: String,
+        /// Project root. Query commands require `-p/--path`; do not append the
+        /// project as another positional argument.
         #[arg(short, long)]
         path: Option<PathBuf>,
         #[arg(short, long, default_value_t = 20)]
@@ -335,6 +355,8 @@ enum Command {
     // Upstream flags/output shape: upstream bin/codegraph.ts:1280-1284, 1298-1345.
     Callees {
         symbol: String,
+        /// Project root. Query commands require `-p/--path`; do not append the
+        /// project as another positional argument.
         #[arg(short, long)]
         path: Option<PathBuf>,
         #[arg(short, long, default_value_t = 20)]
@@ -352,6 +374,8 @@ enum Command {
     // Upstream flags/output shape: upstream bin/codegraph.ts:1358-1362, 1374-1439.
     Impact {
         symbol: String,
+        /// Project root. Query commands require `-p/--path`; do not append the
+        /// project as another positional argument.
         #[arg(short, long)]
         path: Option<PathBuf>,
         #[arg(short, long, default_value_t = 2)]
@@ -369,6 +393,8 @@ enum Command {
     // Upstream flags/output shape: upstream bin/codegraph.ts:1462-1469, 1479-1582.
     Affected {
         files: Vec<String>,
+        /// Project root. Query commands require `-p/--path`; do not append the
+        /// project as another positional argument.
         #[arg(short, long)]
         path: Option<PathBuf>,
         #[arg(short, long, default_value_t = 5)]
@@ -381,6 +407,8 @@ enum Command {
     // cycle detection. Ports `findCircularDependencies`
     // (upstream graph/queries.ts:225-263).
     Check {
+        /// Project root. Query commands require `-p/--path`; do not append the
+        /// project as another positional argument.
         #[arg(short, long)]
         path: Option<PathBuf>,
         #[arg(short = 'j', long = "json")]
@@ -390,7 +418,8 @@ enum Command {
     /// and reverse-dependency impact. Computed from the existing graph + disk
     /// checks; adds no extraction and is separate from `check`.
     Audit {
-        /// Project root (NOT a result filter; use --include/--exclude to narrow).
+        /// Project root (use `-p/--path`; NOT a result filter — use
+        /// `--include`/`--exclude` to narrow).
         #[arg(short, long)]
         path: Option<PathBuf>,
         /// Report `.tres`/`.tscn` resources nothing references.
@@ -415,6 +444,8 @@ enum Command {
         json: bool,
     },
     Export {
+        /// Project root. Query commands require `-p/--path`; do not append the
+        /// project as another positional argument.
         #[arg(short, long)]
         path: Option<PathBuf>,
         #[arg(short = 'o', long = "out")]
@@ -429,6 +460,8 @@ enum Command {
     Explore {
         /// Symbol names or a natural-language question to explore.
         query: String,
+        /// Project root. Query commands require `-p/--path`; do not append the
+        /// project as another positional argument.
         #[arg(short, long)]
         path: Option<PathBuf>,
         /// Max number of files to include source from (clamped 1..=20).
@@ -442,8 +475,11 @@ enum Command {
     /// caller/callee trail; for a file it prints the line-numbered source plus
     /// which files depend on it. NO LLM.
     Node {
-        /// A symbol name, or a file path/basename to read.
+        /// A symbol name, exact node ID (for example from `search --json`), or
+        /// a file path/basename to read.
         target: String,
+        /// Project root. Query commands require `-p/--path`; do not append the
+        /// project as another positional argument.
         #[arg(short, long)]
         path: Option<PathBuf>,
         /// Pin an overloaded SYMBOL to the definition in this file (path or

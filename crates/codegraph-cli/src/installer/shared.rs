@@ -35,6 +35,13 @@ Before the first query in a repository, verify that the index is usable:
 
 Do not infer index readiness from the directory alone. Follow the recovery guidance reported by `status`; do not initialize or rebuild an index unless the user requests it or `status` explicitly requires it.
 
+Shell project-path syntax differs by command family:
+
+- Lifecycle commands accept an optional positional path: `codegraph status . --json`, `codegraph init .`, `codegraph sync .`, `codegraph index .`.
+- Research commands take exactly one positional query/target and use `-p/--path` for the project: `codegraph explore \"<question>\" -p .`, `codegraph search \"<symbol>\" -p .`, `codegraph node \"<symbol-name-or-id>\" -p .`.
+
+Do not append the project as a second positional argument to a research command. If the shell rejects an argument, run `codegraph <command> --help` and correct the syntax before falling back to grep/find.
+
 For code research:
 
 - Start with `codegraph_explore` for an area, feature, or call flow.
@@ -1075,6 +1082,8 @@ mod tests {
         assert!(text.contains("`codegraph_status`"));
         assert!(text.contains("`codegraph status . --json`"));
         assert!(text.contains("`codegraph_search`"));
+        assert!(text.contains("`codegraph search \"<symbol>\" -p .`"));
+        assert!(text.contains("`codegraph <command> --help`"));
         assert!(text.contains("caller/callee trail"));
         assert!(text.contains("do not create one unless the user asks"));
         assert!(!text.contains("deferred"));

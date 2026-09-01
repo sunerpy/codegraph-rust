@@ -85,7 +85,7 @@ typically one to a few calls; a grep/read exploration is dozens.
 - **"What is the symbol named X?" (just its location)** → `codegraph_search`
 - **"What calls this?" / "What does this call?" / "What would changing this break?"** → `codegraph_callers` / `codegraph_callees` / `codegraph_impact`
 - **Reading a source FILE (any time you'd use the `Read` tool)** → `codegraph_node` with a `file` path and no `symbol`. It returns the file's **current source with line numbers — the same `<n>\t<line>` shape `Read` gives you, safe to `Edit` from** — narrowable with `offset`/`limit` exactly like `Read`, PLUS a one-line note of which files depend on it. Same bytes as `Read`, faster (served from the index), with the blast radius attached. Use it **instead of `Read`** for indexed source files; fall back to `Read` only for what codegraph doesn't index (configs, docs). Pass `symbolsOnly: true` for just the file's structure.
-- **About to read or edit a symbol you can name** → `codegraph_node` with that `symbol` (SECONDARY — the after-explore depth tool): the verbatim source (`includeCode: true`) PLUS its caller/callee trail, so before changing it you see what calls it and what your edit would break. For an OVERLOADED name it returns EVERY matching definition's body in one call, so you never Read a file to find the right overload
+- **About to read or edit a symbol you can name (or whose exact node ID you have)** → `codegraph_node` with that `symbol` (SECONDARY — the after-explore depth tool): the verbatim source (`includeCode: true`) PLUS its caller/callee trail, so before changing it you see what calls it and what your edit would break. For an OVERLOADED name it returns EVERY matching definition's body in one call, so you never Read a file to find the right overload
 - **"What's in directory X?"** → `codegraph_files`
 - **"Is the index ready / what's its size?"** → `codegraph_status`
 
@@ -107,7 +107,7 @@ typically one to a few calls; a grep/read exploration is dozens.
 
 ## Limitations
 
-- If a tool reports the project isn't initialized, `.codegraph/` doesn't exist yet — offer to run `codegraph init -i` to build the index.
+- If a tool reports the project isn't initialized, `.codegraph/` doesn't exist yet — offer to run `codegraph init .` to build the index.
 - Index lags file writes by ~1 second.
 - Cross-file resolution is best-effort name matching; ambiguous calls may return multiple candidates.
 - No live correctness validation — that's still the TypeScript compiler / test suite / linter's job. Codegraph supplements those with structural context they don't have.
