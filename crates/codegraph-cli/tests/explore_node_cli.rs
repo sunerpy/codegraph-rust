@@ -153,6 +153,32 @@ fn help_lists_explore_and_node_subcommands() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn init_survives_a_one_mib_launcher_stack() {
+    let dir = TestDir::new("small-launcher-stack");
+    let project = dir.path().join("mini");
+    copy_tree(&mini_fixture(), &project);
+
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg("ulimit -s 1024; exec \"$1\" init \"$2\"")
+        .arg("codegraph-small-stack")
+        .arg(bin())
+        .arg(&project)
+        .current_dir(dir.path())
+        .env("CODEGRAPH_NO_DAEMON", "1")
+        .output()
+        .expect("run codegraph with a one MiB launcher stack");
+
+    assert!(
+        output.status.success(),
+        "init must not depend on the platform main-thread stack size: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn explore_returns_nonempty_structured_output() {
     let dir = TestDir::new("explore");

@@ -145,8 +145,29 @@ pub(crate) mod test_env {
 }
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+// MSVC executables start with a 1 MiB main-thread stack. Keep CLI growth and
+// indexing work independent of that platform default.
+const CLI_MAIN_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 fn main() {
+    let main_thread = match std::thread::Builder::new()
+        .name("codegraph-main".to_string())
+        .stack_size(CLI_MAIN_STACK_BYTES)
+        .spawn(cli_main)
+    {
+        Ok(handle) => handle,
+        Err(err) => {
+            eprintln!("CodeGraph startup error: failed to create the CLI thread: {err}");
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(payload) = main_thread.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+fn cli_main() {
     let cli = Cli::parse();
     // Process bootstrap has no addressed project yet, so this config is
     // `APP_CONFIG`-or-defaults ONLY and may configure NOTHING but the logger
