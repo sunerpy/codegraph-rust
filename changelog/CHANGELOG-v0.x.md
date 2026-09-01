@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.50.2](https://github.com/sunerpy/codegraph-rust/compare/v0.50.1...v0.50.2) (2026-09-01)
+
+
+### Bug Fixes
+
+* **cli:** align node lookup and command guidance ([#265](https://github.com/sunerpy/codegraph-rust/issues/265)) ([1258f3a](https://github.com/sunerpy/codegraph-rust/commit/1258f3af4720277a423e29487e83bb9da10d2a74))
+
 ## [0.50.1](https://github.com/sunerpy/codegraph-rust/compare/v0.50.0...v0.50.1) (2026-08-31)
 
 
