@@ -158,10 +158,18 @@ Pick your entry point based on what you're trying to answer:
 | "What files are under path P?"      | `codegraph_files`   |
 | "Is the index up to date?"          | `codegraph_status`  |
 
-These are MCP tool names. When MCP is unavailable, the binary exposes the same
-engine through `codegraph explore "<question>" -p /path/to/project`,
-`codegraph node "<symbol-or-file>" -p /path/to/project`, and
-`codegraph search "<symbol>" -p /path/to/project`. `codegraph query` remains a
+These are MCP tool names. Shell project-path syntax is intentionally split:
+
+- Lifecycle commands accept an optional positional path: `codegraph status .`,
+  `codegraph init .`, `codegraph sync .`, and `codegraph index .`.
+- Research commands take exactly one positional query/target and select the
+  project with `-p/--path`: `codegraph explore "<question>" -p .`,
+  `codegraph search "<symbol>" -p .`, and
+  `codegraph node "<symbol-name-or-id>" -p .`.
+
+Do not append the project as a second positional argument to a research command.
+If the shell rejects an argument, run `codegraph <command> --help` and correct
+the syntax before falling back to grep/Read. `codegraph query` remains a
 compatibility alias; prefer `codegraph search` in new commands and guidance.
 
 ### `codegraph_explore` — start here
@@ -208,7 +216,8 @@ codegraph search "<symbol>" -p /path/to/project
 
 ### `codegraph_node` — read source + graph trail
 
-Pass a symbol ID (from a `search` result) or a file path. A symbol ID returns
+Pass a symbol name, qualified name, exact node ID (for example, the `node.id`
+from CLI `codegraph search --json`), or a file path. A symbol selector returns
 the symbol's verbatim source plus its direct callers and callees. A file path
 returns the file's line-numbered source — use this instead of the Read tool for
 any indexed source file. It's faster, and the output is pre-annotated with
@@ -219,8 +228,9 @@ Erlang functions are arity-qualified internally. Written queries such as
 `cowboy_stream_h::request_process/3` both select that exact function; keep the
 arity when different definitions share the same bare name.
 
-Supports `offset` and `limit` for large files, matching Read's pagination
-interface.
+MCP file mode supports `offset` and `limit` for large files, matching Read's
+pagination interface. The shell `codegraph node` command currently reads the
+whole file (or `--symbols-only`) and does not expose those pagination flags.
 
 ### `codegraph_callers` / `codegraph_callees` — directed edges
 

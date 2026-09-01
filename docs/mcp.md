@@ -370,9 +370,11 @@ Neither not-found form carries a warning glyph any more: the note states what wa
 searched instead of implying the symbol is untested, which for anything reached
 through a helper it usually was not.
 
-**`codegraph_node`** accepts either a symbol ID (from a `search` result) or a
-file path. When given a file path it returns the file's source with line numbers,
-which is a more accurate alternative to a plain `Read` tool call.
+**`codegraph_node`** accepts a symbol name, qualified name, exact node ID (for
+example, `node.id` from CLI `codegraph search --json`), or a file path. `file`
+and `line` can pin an overloaded symbol to one definition. When given a file
+path without a symbol it returns the file's source with line numbers, which is a
+more accurate alternative to a plain `Read` tool call.
 
 **`codegraph_impact`** returns the transitive incoming dependency set — every
 symbol that would break if the queried symbol changed. Use it before a refactor

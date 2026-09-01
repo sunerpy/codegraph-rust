@@ -57,6 +57,11 @@ codegraph serve --mcp --path /path/to/project      # 为 AI 代理启动 MCP 服
 codegraph install --yes --init                     # 接线已检测代理并初始化 cwd
 ```
 
+项目路径的参数形式按命令类别区分：生命周期命令使用可选位置路径
+（如 `codegraph status .`），代码查询命令则使用 `-p/--path`
+（如 `codegraph search "<symbol>" -p .`）。如果参数被拒绝，应先运行
+`codegraph <command> --help`，不要直接退回全文检索。
+
 ---
 
 ## 安装

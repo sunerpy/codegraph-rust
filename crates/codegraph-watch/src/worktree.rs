@@ -42,7 +42,7 @@ pub fn detect_worktree_index_mismatch(
 
 pub fn worktree_mismatch_warning(mismatch: &WorktreeIndexMismatch) -> String {
     format!(
-        "This CodeGraph index belongs to a different git working tree.\n  Running in: {}\n  Index from: {}\nResults reflect that tree's code (often a different branch), not this worktree - symbols changed only here are missing. Run \"codegraph init -i\" in this worktree for a worktree-local index.",
+        "This CodeGraph index belongs to a different git working tree.\n  Running in: {}\n  Index from: {}\nResults reflect that tree's code (often a different branch), not this worktree - symbols changed only here are missing. Run \"codegraph init .\" in this worktree for a worktree-local index.",
         mismatch.worktree_root.display(),
         mismatch.index_root.display()
     )
@@ -50,7 +50,7 @@ pub fn worktree_mismatch_warning(mismatch: &WorktreeIndexMismatch) -> String {
 
 pub fn worktree_mismatch_notice(mismatch: &WorktreeIndexMismatch) -> String {
     format!(
-        "CodeGraph results below come from a different git worktree ({}), not where you're working ({}) - they may reflect another branch, and symbols changed only here are missing. Run \"codegraph init -i\" here for a worktree-local index.",
+        "CodeGraph results below come from a different git worktree ({}), not where you're working ({}) - they may reflect another branch, and symbols changed only here are missing. Run \"codegraph init .\" here for a worktree-local index.",
         mismatch.index_root.display(),
         mismatch.worktree_root.display()
     )
@@ -185,11 +185,13 @@ mod tests {
         let warning = worktree_mismatch_warning(&mismatch);
         assert!(warning.contains("/work/tree"));
         assert!(warning.contains("/index/tree"));
-        assert!(warning.contains("codegraph init"));
+        assert!(warning.contains("codegraph init ."));
+        assert!(!warning.contains("codegraph init -i"));
 
         let notice = worktree_mismatch_notice(&mismatch);
         assert!(notice.contains("/work/tree"));
         assert!(notice.contains("/index/tree"));
-        assert!(notice.contains("codegraph init"));
+        assert!(notice.contains("codegraph init ."));
+        assert!(!notice.contains("codegraph init -i"));
     }
 }
