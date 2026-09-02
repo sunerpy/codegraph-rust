@@ -531,6 +531,7 @@ XML/MyBatis mapper。
 - [`../grammar-manifest.md`](../grammar-manifest.md) / [`../embedded-extraction.md`](../embedded-extraction.md) — 语言支持与提取层级（工程 ABI 细节）。
 - [`../cli.md`](../cli.md) — 完整 CLI 子命令参考（22 个子命令，所有标志）、守护进程/监听环境变量、HTTP MCP 服务、自定义扩展名映射、Claude hook。
 - [`../mcp.md`](../mcp.md) — MCP 服务器协议、全部 10 个工具、JSON-RPC 详情、各 IDE 配置、Zed 远程 SSH。
+- [`../troubleshooting.md`](../troubleshooting.md) — `init` / `index` / `sync` 卡顿时的 JSONL 调试日志、隐私边界与反馈清单。
 - [`../../examples/`](../../examples/) — codegraph + LLM 编排示例。
 
 ---

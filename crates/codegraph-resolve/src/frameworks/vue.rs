@@ -77,7 +77,10 @@ impl FrameworkResolver for VueResolver {
                 }
             }
         }
-        context.get_all_files().iter().any(|f| f.ends_with(".vue"))
+        context
+            .get_all_files_shared()
+            .iter()
+            .any(|f| f.ends_with(".vue"))
     }
 
     // Ports vueResolver.resolve (vue.ts:103-188).
@@ -283,16 +286,8 @@ fn resolve_component(
     from_file: &str,
     context: &dyn ResolutionContext,
 ) -> Option<String> {
-    let mut matches: Vec<String> = Vec::new();
-    for file in context.get_all_files() {
-        if !file.ends_with(".vue") {
-            continue;
-        }
-        let file_name = file.rsplit(['/', '\\']).next().unwrap_or(&file);
-        if file_name.strip_suffix(".vue").unwrap_or(file_name) == name {
-            matches.push(file);
-        }
-    }
+    let basename = format!("{name}.vue");
+    let matches = context.get_files_by_basename_shared(&basename);
     if matches.is_empty() {
         return None;
     }

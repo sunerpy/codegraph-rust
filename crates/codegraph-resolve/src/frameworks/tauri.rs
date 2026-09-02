@@ -140,7 +140,7 @@ impl FrameworkResolver for TauriResolver {
                 return true;
             }
         }
-        context.get_all_files().iter().any(|f| {
+        context.get_all_files_shared().iter().any(|f| {
             is_rust_source(f)
                 && context
                     .read_file(f)

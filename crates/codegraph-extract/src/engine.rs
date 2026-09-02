@@ -37,6 +37,33 @@ pub struct ExtractOptions {
     pub extensions: Arc<ExtensionOverrides>,
 }
 
+/// Coarse, read-only extraction stages for diagnostics.
+///
+/// Observers are notified only when execution enters a stage. They cannot
+/// cancel parsing or alter extraction output, so enabling diagnostics remains
+/// behavior-neutral and deterministic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtractionStage {
+    DetectLanguage,
+    Prepare,
+    Embedded,
+    TreeSitterParse,
+    Walk,
+}
+
+impl ExtractionStage {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DetectLanguage => "detect_language",
+            Self::Prepare => "prepare",
+            Self::Embedded => "embedded",
+            Self::TreeSitterParse => "tree_sitter_parse",
+            Self::Walk => "walk",
+        }
+    }
+}
+
 impl Default for ExtractOptions {
     fn default() -> Self {
         let indexing = IndexingConfig::default();
@@ -232,8 +259,25 @@ pub fn extract_source_with(
     language: Option<Language>,
     overrides: &ExtensionOverrides,
 ) -> ExtractionResult {
+    extract_source_with_observer(file_path, source, language, overrides, |_| {})
+}
+
+/// Like [`extract_source_with`], with a read-only stage observer.
+///
+/// The observer is deliberately notification-only: there is no cancellation
+/// return value and no wall-clock timeout. A successful index therefore still
+/// parses every admitted file exactly as the ordinary path does.
+pub fn extract_source_with_observer(
+    file_path: &str,
+    source: &str,
+    language: Option<Language>,
+    overrides: &ExtensionOverrides,
+    mut observer: impl FnMut(ExtractionStage),
+) -> ExtractionResult {
     let start = Instant::now();
+    observer(ExtractionStage::DetectLanguage);
     let mut language = language.unwrap_or_else(|| detect_language_with(file_path, overrides));
+    observer(ExtractionStage::Prepare);
     if language == Language::C
         && Path::new(file_path)
             .extension()
@@ -246,6 +290,7 @@ pub fn extract_source_with(
             language = Language::ObjC;
         }
     }
+    observer(ExtractionStage::Embedded);
     if let Some(result) = crate::embedded::extract_embedded(file_path, source, language) {
         return result;
     }
@@ -282,6 +327,7 @@ pub fn extract_source_with(
     // behavior-neutral reorder (their `pre_parse` is the identity default, and
     // the two that override it — C++/embedded — don't override the grammar
     // hook, so their parse path is byte-identical).
+    observer(ExtractionStage::Prepare);
     let parsed_source = spec.pre_parse(source, file_path);
     let ts_language = spec.tree_sitter_language_for_source(&parsed_source);
     if let Err(error) = parser.set_language(&ts_language) {
@@ -293,6 +339,7 @@ pub fn extract_source_with(
             duration_ms: start.elapsed().as_millis() as i64,
         };
     }
+    observer(ExtractionStage::TreeSitterParse);
     let Some(tree) = parser.parse(&parsed_source, None) else {
         return ExtractionResult {
             nodes: Vec::new(),
@@ -302,6 +349,7 @@ pub fn extract_source_with(
             duration_ms: start.elapsed().as_millis() as i64,
         };
     };
+    observer(ExtractionStage::Walk);
     TreeSitterWalker::new(file_path, &parsed_source, spec, tree.root_node())
         .extract(start.elapsed().as_millis() as i64)
 }
@@ -325,6 +373,17 @@ pub fn extract_file_with_options(
     relative_path: impl AsRef<Path>,
     options: &ExtractOptions,
 ) -> Result<ExtractionResult> {
+    extract_file_with_options_observer(root, relative_path, options, |_| {})
+}
+
+/// Like [`extract_file_with_options`], with a read-only extraction-stage
+/// observer. File metadata and source reads remain caller-visible errors.
+pub fn extract_file_with_options_observer(
+    root: impl AsRef<Path>,
+    relative_path: impl AsRef<Path>,
+    options: &ExtractOptions,
+    observer: impl FnMut(ExtractionStage),
+) -> Result<ExtractionResult> {
     let root = root.as_ref();
     let relative_path = normalize_path(relative_path.as_ref());
     let full_path = root.join(&relative_path);
@@ -340,11 +399,12 @@ pub fn extract_file_with_options(
     let source = fs::read_to_string(&full_path)
         .with_context(|| format!("read source file {}", full_path.display()))?;
     let _content_hash = hash_content(&source);
-    Ok(extract_source_with(
+    Ok(extract_source_with_observer(
         &relative_path,
         &source,
         None,
         &options.extensions,
+        observer,
     ))
 }
 
@@ -1389,5 +1449,38 @@ mod tests {
     fn dot_h_plain_c_stays_c() {
         let result = extract_source("plain.h", "int add(int a, int b);\n", None);
         assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn observed_extraction_reports_stages_without_changing_output() {
+        let source = "export function answer(): number { return 42; }\n";
+        let mut ordinary = extract_source_with(
+            "src/answer.ts",
+            source,
+            None,
+            &ExtensionOverrides::default(),
+        );
+        let mut stages = Vec::new();
+        let mut observed = extract_source_with_observer(
+            "src/answer.ts",
+            source,
+            None,
+            &ExtensionOverrides::default(),
+            |stage| stages.push(stage),
+        );
+        ordinary.duration_ms = 0;
+        observed.duration_ms = 0;
+        assert_eq!(observed, ordinary);
+        assert_eq!(
+            stages,
+            vec![
+                ExtractionStage::DetectLanguage,
+                ExtractionStage::Prepare,
+                ExtractionStage::Embedded,
+                ExtractionStage::Prepare,
+                ExtractionStage::TreeSitterParse,
+                ExtractionStage::Walk,
+            ]
+        );
     }
 }

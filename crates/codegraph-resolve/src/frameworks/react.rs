@@ -36,7 +36,7 @@ impl FrameworkResolver for ReactResolver {
             }
         }
         context
-            .get_all_files()
+            .get_all_files_shared()
             .iter()
             .any(|f| f.ends_with(".jsx") || f.ends_with(".tsx"))
     }

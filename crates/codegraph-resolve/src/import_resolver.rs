@@ -2583,7 +2583,7 @@ fn resolve_lua_require(
         format!("{base}/init.lua"),
         format!("{base}/init.luau"),
     ];
-    let files = context.get_all_files();
+    let files = context.get_all_files_shared();
     let shared = |a: &str, b: &str| -> usize {
         a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count()
     };

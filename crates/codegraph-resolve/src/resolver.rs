@@ -116,6 +116,23 @@ pub(crate) struct BatchedRunTelemetry {
     pub wal_checkpoints: usize,
 }
 
+/// Read-only lifecycle events from the batched resolver. Observers cannot alter
+/// the selected mode, batch size, ordering, or resolution result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolutionObservation {
+    Setup {
+        node_count: u64,
+        reference_count: u64,
+        streaming: bool,
+        batch_size: usize,
+    },
+    BatchComplete {
+        batch: usize,
+        processed: u64,
+        total: u64,
+    },
+}
+
 /// Read-only aggregate from the detected framework resolvers' per-file extract
 /// passes. Callers may select its refs before persistence; the normal full-file
 /// path persists `nodes` first and then `unresolved_references`.
@@ -853,13 +870,35 @@ impl ReferenceResolver {
         context: &crate::framework::FrameworkExtractionContext,
         extensions: &codegraph_extract::ext_config::ExtensionOverrides,
     ) -> FrameworkExtractionCollection {
+        self.collect_framework_extraction_with_reader(
+            relative_files,
+            context,
+            extensions,
+            |relative| {
+                std::fs::read_to_string(std::path::Path::new(&self.project_root).join(relative))
+                    .ok()
+            },
+        )
+    }
+
+    fn collect_framework_extraction_with_reader(
+        &self,
+        relative_files: &[String],
+        context: &crate::framework::FrameworkExtractionContext,
+        extensions: &codegraph_extract::ext_config::ExtensionOverrides,
+        mut read_file: impl FnMut(&str) -> Option<String>,
+    ) -> FrameworkExtractionCollection {
         let mut collection = FrameworkExtractionCollection::default();
         for relative in relative_files {
             let language = codegraph_extract::detect_language_with(relative, extensions);
-            let Some(content) =
-                std::fs::read_to_string(std::path::Path::new(&self.project_root).join(relative))
-                    .ok()
-            else {
+            let has_applicable = self
+                .framework_resolver_extensions
+                .iter()
+                .any(|resolver| applies_to_language(resolver.as_ref(), language));
+            if !has_applicable {
+                continue;
+            }
+            let Some(content) = read_file(relative) else {
                 continue;
             };
             for resolver in &self.framework_resolver_extensions {
@@ -1484,6 +1523,28 @@ impl ReferenceResolver {
             resolve_streaming_threshold(),
             codegraph_store::wal_valve_threshold_bytes(),
             on_progress,
+            |_| {},
+        )?;
+        Ok(result)
+    }
+
+    /// Like [`Self::resolve_and_persist_batched_with_progress`], with additive
+    /// setup/mode/batch observations for diagnostics. The observer is
+    /// notification-only and cannot cancel or influence resolution.
+    pub fn resolve_and_persist_batched_with_observer(
+        &mut self,
+        store: &mut Store,
+        batch_size: usize,
+        on_progress: impl FnMut(u64, u64),
+        on_observation: impl FnMut(ResolutionObservation),
+    ) -> anyhow::Result<ResolutionResult> {
+        let (result, _telemetry) = self.resolve_and_persist_batched_inner(
+            store,
+            batch_size,
+            resolve_streaming_threshold(),
+            codegraph_store::wal_valve_threshold_bytes(),
+            on_progress,
+            on_observation,
         )?;
         Ok(result)
     }
@@ -1518,6 +1579,7 @@ impl ReferenceResolver {
         streaming_threshold: usize,
         wal_valve_bytes: u64,
         mut on_progress: impl FnMut(u64, u64),
+        mut on_observation: impl FnMut(ResolutionObservation),
     ) -> anyhow::Result<(ResolutionResult, BatchedRunTelemetry)> {
         // Incomplete-resolution marker (#1187): armed BEFORE the first batch and
         // cleared only after the deferred passes complete below. An interrupted
@@ -1542,6 +1604,12 @@ impl ReferenceResolver {
             streaming,
             wal_checkpoints: 0,
         };
+        on_observation(ResolutionObservation::Setup {
+            node_count: node_count as u64,
+            reference_count: total_refs,
+            streaming,
+            batch_size,
+        });
 
         // Built lazily on first-chunk entry, AFTER framework extraction injected
         // its nodes — never in `new`/`initialize` (would miss framework nodes).
@@ -1654,6 +1722,11 @@ impl ReferenceResolver {
 
             telemetry.batches += 1;
             processed += batch.len() as u64;
+            on_observation(ResolutionObservation::BatchComplete {
+                batch: telemetry.batches,
+                processed,
+                total: total_refs,
+            });
             on_progress(processed, total_refs);
         }
 
@@ -2896,13 +2969,20 @@ mod tests {
         let (mut snap_store, snap_db) = index_java_fixture("dualpath-snap", &dir, &files);
         let mut snap_resolver = ReferenceResolver::new(root.clone());
         let (_snap_result, snap_tel) = snap_resolver
-            .resolve_and_persist_batched_inner(&mut snap_store, 1, usize::MAX, u64::MAX, |_, _| {})
+            .resolve_and_persist_batched_inner(
+                &mut snap_store,
+                1,
+                usize::MAX,
+                u64::MAX,
+                |_, _| {},
+                |_| {},
+            )
             .expect("snapshot path");
 
         let (mut stream_store, stream_db) = index_java_fixture("dualpath-stream", &dir, &files);
         let mut stream_resolver = ReferenceResolver::new(root.clone());
         let (_stream_result, stream_tel) = stream_resolver
-            .resolve_and_persist_batched_inner(&mut stream_store, 1, 0, u64::MAX, |_, _| {})
+            .resolve_and_persist_batched_inner(&mut stream_store, 1, 0, u64::MAX, |_, _| {}, |_| {})
             .expect("streaming path");
 
         assert!(
@@ -2976,7 +3056,7 @@ mod tests {
         let (mut on_store, on_db) = index_java_fixture("walvalve-on", &dir, &files);
         let mut on_resolver = ReferenceResolver::new(root.clone());
         let (_on_result, on_tel) = on_resolver
-            .resolve_and_persist_batched_inner(&mut on_store, 1, usize::MAX, 0, |_, _| {})
+            .resolve_and_persist_batched_inner(&mut on_store, 1, usize::MAX, 0, |_, _| {}, |_| {})
             .expect("valve on");
         assert!(
             on_tel.batches >= 2,
@@ -2992,7 +3072,14 @@ mod tests {
         let (mut off_store, off_db) = index_java_fixture("walvalve-off", &dir, &files);
         let mut off_resolver = ReferenceResolver::new(root.clone());
         let (_off_result, off_tel) = off_resolver
-            .resolve_and_persist_batched_inner(&mut off_store, 1, usize::MAX, u64::MAX, |_, _| {})
+            .resolve_and_persist_batched_inner(
+                &mut off_store,
+                1,
+                usize::MAX,
+                u64::MAX,
+                |_, _| {},
+                |_| {},
+            )
             .expect("valve off");
         assert_eq!(
             off_tel.wal_checkpoints, 0,
@@ -3070,12 +3157,34 @@ mod tests {
             .expect("refs");
         let mut resolver = ReferenceResolver::new("/root");
         let mut last_total = 0u64;
+        let mut observations = Vec::new();
         resolver
-            .resolve_and_persist_batched_with_progress(&mut store, 10, |_processed, total| {
-                last_total = total;
-            })
+            .resolve_and_persist_batched_with_observer(
+                &mut store,
+                10,
+                |_processed, total| {
+                    last_total = total;
+                },
+                |observation| observations.push(observation),
+            )
             .expect("batched");
         assert_eq!(last_total, 1);
+        assert_eq!(
+            observations,
+            vec![
+                ResolutionObservation::Setup {
+                    node_count: 2,
+                    reference_count: 1,
+                    streaming: false,
+                    batch_size: 10,
+                },
+                ResolutionObservation::BatchComplete {
+                    batch: 1,
+                    processed: 1,
+                    total: 1,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -3626,6 +3735,35 @@ mod tests {
         assert!(
             ctx.get_import_mappings("f.ts", Language::TypeScript)
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn framework_extraction_does_not_read_files_with_no_applicable_resolver() {
+        let mut resolver = ReferenceResolver::new("/root");
+        resolver.framework_resolver_extensions = vec![Box::new(ReactLike)];
+        let files = vec![
+            "module/src/App.java".to_string(),
+            "pages/about.ts".to_string(),
+        ];
+        let mut reads = Vec::new();
+
+        let collection = resolver.collect_framework_extraction_with_reader(
+            &files,
+            &crate::framework::FrameworkExtractionContext::without_config("/root"),
+            &codegraph_extract::ext_config::ExtensionOverrides::default(),
+            |relative| {
+                reads.push(relative.to_string());
+                Some(String::new())
+            },
+        );
+
+        assert!(collection.nodes.is_empty());
+        assert!(collection.unresolved_references.is_empty());
+        assert_eq!(
+            reads,
+            vec!["pages/about.ts".to_string()],
+            "the Java file must be rejected by language gating before any read"
         );
     }
 

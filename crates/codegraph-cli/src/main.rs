@@ -8,9 +8,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -22,7 +22,7 @@ use codegraph_core::generated_header::detect_generated_file;
 use codegraph_core::logger::{LoggerConfig, init_logger};
 use codegraph_core::node_id::hash_content;
 use codegraph_core::types::{ExtractionResult, FileRecord, Language, Node, NodeKind};
-use codegraph_extract::{ExtractOptions, detect_language_with, extract_source_with};
+use codegraph_extract::{ExtractOptions, detect_language_with, extract_source_with_observer};
 use codegraph_graph::graph::{GodotReach, GraphTraverser};
 use codegraph_graph::query::{SearchOptions, search_nodes};
 use codegraph_graph::{segment_match, segments};
@@ -30,13 +30,14 @@ use codegraph_mcp::{McpServer, RunUntilAdoption};
 use codegraph_resolve::ReferenceResolver;
 use codegraph_store::queries::SearchResult;
 use codegraph_store::{CorruptReason, ExtractionStatus, IndexLease, SlotOutcome, Store};
-use indicatif::{ParallelProgressIterator, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use rayon::prelude::*;
+use diagnostics::{DiagnosticArgs, DiagnosticRun, IndexTracker};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use serde::Serialize;
 use serde_json::json;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+mod diagnostics;
 mod installer;
 mod structural_gate;
 
@@ -145,6 +146,7 @@ pub(crate) mod test_env {
 }
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const PARSE_REORDER_WINDOW: usize = 512;
 // MSVC executables start with a 1 MiB main-thread stack. Keep CLI growth and
 // indexing work independent of that platform default.
 const CLI_MAIN_STACK_BYTES: usize = 8 * 1024 * 1024;
@@ -237,6 +239,8 @@ enum Command {
         /// confirmation prompt today, so this is intentionally behavior-neutral.
         #[arg(short = 'y', long)]
         yes: bool,
+        #[command(flatten)]
+        diagnostics: DiagnosticArgs,
     },
     // Upstream flags/output: upstream bin/codegraph.ts:482-485, 489-527.
     Uninit {
@@ -257,6 +261,8 @@ enum Command {
         quiet: bool,
         #[arg(short, long)]
         verbose: bool,
+        #[command(flatten)]
+        diagnostics: DiagnosticArgs,
     },
     // Upstream flags/output: upstream bin/codegraph.ts:605-608, 612-657.
     Sync {
@@ -265,6 +271,8 @@ enum Command {
         path: Option<PathBuf>,
         #[arg(short, long)]
         quiet: bool,
+        #[command(flatten)]
+        diagnostics: DiagnosticArgs,
     },
     // Upstream flags/output shape: upstream bin/codegraph.ts:667-670, 679-738, 743-820.
     Status {
@@ -697,15 +705,25 @@ enum McpAction {
 
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Init { path, target, yes } => cmd_init(path, &target, yes),
+        Command::Init {
+            path,
+            target,
+            yes,
+            diagnostics,
+        } => cmd_init(path, &target, yes, diagnostics),
         Command::Uninit { path, force } => cmd_uninit(path, force),
         Command::Index {
             path,
             force,
             quiet,
             verbose,
-        } => cmd_index(path, force, quiet, verbose),
-        Command::Sync { path, quiet } => cmd_sync(path, quiet),
+            diagnostics,
+        } => cmd_index(path, force, quiet, verbose, diagnostics),
+        Command::Sync {
+            path,
+            quiet,
+            diagnostics,
+        } => cmd_sync(path, quiet, diagnostics),
         Command::Status { path, json } => cmd_status(path, json),
         Command::Search {
             search,
@@ -823,7 +841,7 @@ fn run(cli: Cli) -> Result<()> {
                 print_config,
             })?;
             if init && !print_only {
-                cmd_init(None, "none", yes)?;
+                cmd_init(None, "none", yes, DiagnosticArgs::default())?;
             }
             Ok(())
         }
@@ -1373,7 +1391,12 @@ fn cmd_prompt_hook(path: Option<PathBuf>, query: Option<String>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_init(path: Option<PathBuf>, target: &str, _yes: bool) -> Result<()> {
+fn cmd_init(
+    path: Option<PathBuf>,
+    target: &str,
+    _yes: bool,
+    diagnostics: DiagnosticArgs,
+) -> Result<()> {
     let project = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
     if explicit_init_observes_readable_current(&project)? {
         println!("Already initialized in {}", project.display());
@@ -1384,7 +1407,12 @@ fn cmd_init(path: Option<PathBuf>, target: &str, _yes: bool) -> Result<()> {
     // The rebuild layer creates the current root and its permanent lock under the
     // one outer exclusive lease; pre-creating it here would produce a lockless
     // namespace that acquisition then refuses.
-    let result = index_project(&project, codegraph_store::RebuildKind::ExplicitInit)?;
+    let result = index_project(
+        &project,
+        codegraph_store::RebuildKind::ExplicitInit,
+        &diagnostics,
+        "init",
+    )?;
     println!("Initialized in {}", project.display());
     print_index_result(&result);
     installer::run_install_local_targets(project, target)
@@ -1554,7 +1582,13 @@ fn drain_project_daemon(project: &Path, project_identity: &str) -> Result<(), St
     }
 }
 
-fn cmd_index(path: Option<PathBuf>, force: bool, quiet: bool, verbose: bool) -> Result<()> {
+fn cmd_index(
+    path: Option<PathBuf>,
+    force: bool,
+    quiet: bool,
+    verbose: bool,
+    diagnostics: DiagnosticArgs,
+) -> Result<()> {
     // Index is the one ordinary CLI surface allowed to retry an authenticated
     // interrupted Building rebuild. Resolve state slots as well as a DB artifact
     // so the crash window after deletion but before final writer creation remains
@@ -1576,6 +1610,8 @@ fn cmd_index(path: Option<PathBuf>, force: bool, quiet: bool, verbose: bool) -> 
         codegraph_store::RebuildKind::Reindex,
         verbose,
         quiet,
+        &diagnostics,
+        "index",
     )?;
     if !quiet {
         print_index_result(&result);
@@ -1586,7 +1622,7 @@ fn cmd_index(path: Option<PathBuf>, force: bool, quiet: bool, verbose: bool) -> 
     Ok(())
 }
 
-fn cmd_sync(path: Option<PathBuf>, quiet: bool) -> Result<()> {
+fn cmd_sync(path: Option<PathBuf>, quiet: bool, diagnostics: DiagnosticArgs) -> Result<()> {
     // Sync must discover authenticated Outdated/Building state so its Store gate
     // can migrate it under one retained exclusive lease. Uninitialized remains
     // discoverable only to reach the typed under-lease rejection; it is never
@@ -1605,6 +1641,27 @@ fn cmd_sync(path: Option<PathBuf>, quiet: bool) -> Result<()> {
         );
     }
     recover_dead_owner_sidecars(&paths, &project);
+    let mut diagnostic_run = DiagnosticRun::start(
+        &project,
+        paths.current_root(),
+        "sync",
+        &diagnostics,
+        json!({
+            "version": VERSION,
+            "platform": std::env::consts::OS,
+            "architecture": std::env::consts::ARCH,
+            "rayonThreads": rayon::current_num_threads(),
+            "command": "sync",
+            "fileTotal": serde_json::Value::Null,
+            "windowSize": 1,
+        }),
+    )?;
+    if let Some(path) = diagnostic_run.path() {
+        eprintln!("Debug log: {}", path.display());
+    }
+    diagnostic_run.phase_start("sync");
+    let sync_started = std::time::Instant::now();
+    let diagnostic_sink = diagnostic_run.sink();
     // True single-file incremental sync (P0, docs/optimization-analysis.md §1).
     // sync_project_once self-discovers candidate files via scan_project, so it works
     // for a cold CLI invocation with no daemon. Hash-gated skip + per-file delete/reinsert
@@ -1623,8 +1680,52 @@ fn cmd_sync(path: Option<PathBuf>, quiet: bool) -> Result<()> {
             bar_len_set = true;
         }
         bar.set_position(done as u64);
+        if let Some(sink) = &diagnostic_sink {
+            sink.emit(
+                "heartbeat",
+                json!({
+                    "scheduled": total,
+                    "active": usize::from(done < total),
+                    "parsed": done,
+                    "buffered": 0,
+                    "persisted": done,
+                    "nextExpected": done,
+                }),
+            );
+        }
     })?;
     finish_phase(&bar, "Synced files");
+    diagnostic_run.relocate_to_index_root(paths.current_root());
+    if let Some(sink) = &diagnostic_sink
+        && let Ok(store) = open_store(&project)
+    {
+        for relative in &outcome.changed_paths {
+            let record = store.file_by_path(relative).ok().flatten();
+            sink.emit(
+                "file_complete",
+                json!({
+                    "file": relative,
+                    "status": if record.is_some() { "reindexed" } else { "removed" },
+                    "language": record.as_ref().map(|file| file.language.to_string()),
+                    "sizeBytes": record.as_ref().map(|file| file.size),
+                    "nodes": record.as_ref().map(|file| file.node_count),
+                    "edges": serde_json::Value::Null,
+                    "references": serde_json::Value::Null,
+                    "errors": record.as_ref().map(|file| file.errors.len()),
+                }),
+            );
+        }
+    }
+    diagnostic_run.phase_end(
+        "sync",
+        sync_started.elapsed(),
+        json!({
+            "filesChecked": outcome.files_checked,
+            "filesReindexed": outcome.files_reindexed,
+            "filesSkipped": outcome.files_skipped_unchanged,
+            "filesRemoved": outcome.files_removed,
+        }),
+    );
     if !quiet {
         println!(
             "Synced: {} reindexed, {} skipped (unchanged), {} removed in {}",
@@ -1634,6 +1735,13 @@ fn cmd_sync(path: Option<PathBuf>, quiet: bool) -> Result<()> {
             format_duration(outcome.duration_ms as i64)
         );
     }
+    diagnostic_run.finish_success(json!({
+        "durationMs": outcome.duration_ms,
+        "filesChecked": outcome.files_checked,
+        "filesReindexed": outcome.files_reindexed,
+        "filesSkipped": outcome.files_skipped_unchanged,
+        "filesRemoved": outcome.files_removed,
+    }));
     Ok(())
 }
 
@@ -4729,8 +4837,13 @@ fn finish_phase(bar: &ProgressBar, label: &str) {
     bar.abandon_with_message(format!("✓ {label} ({elapsed})"));
 }
 
-fn index_project(project: &Path, kind: codegraph_store::RebuildKind) -> Result<IndexSummary> {
-    index_project_inner(project, kind, false, false)
+fn index_project(
+    project: &Path,
+    kind: codegraph_store::RebuildKind,
+    diagnostics: &DiagnosticArgs,
+    command: &'static str,
+) -> Result<IndexSummary> {
+    index_project_inner(project, kind, false, false, diagnostics, command)
 }
 
 /// Owns one destructive v2 rebuild for the whole full-index body.
@@ -4817,6 +4930,8 @@ fn index_project_inner(
     kind: codegraph_store::RebuildKind,
     verbose: bool,
     quiet: bool,
+    diagnostics: &DiagnosticArgs,
+    command: &'static str,
 ) -> Result<IndexSummary> {
     let started = std::time::Instant::now();
     let paths = index_paths(project)?;
@@ -4834,7 +4949,38 @@ fn index_project_inner(
     if !quiet {
         eprintln!("Scanning files…");
     }
+    let scan_started = std::time::Instant::now();
     let files = codegraph_extract::engine::scan_project(project, &options)?;
+    let scan_duration = scan_started.elapsed();
+    let mut diagnostic_run = DiagnosticRun::start(
+        project,
+        &index_root,
+        command,
+        diagnostics,
+        json!({
+            "version": VERSION,
+            "platform": std::env::consts::OS,
+            "architecture": std::env::consts::ARCH,
+            "rayonThreads": rayon::current_num_threads(),
+            "command": command,
+            "fileTotal": files.len(),
+            "windowSize": PARSE_REORDER_WINDOW,
+            "configLimits": {
+                "maxFileSizeBytes": options.max_file_size,
+                "includeRuleCount": options.include.len(),
+                "excludeRuleCount": options.exclude.len(),
+                "ignoreDirCount": options.ignore_dirs.len(),
+                "ignorePathCount": options.ignore_paths.len(),
+            },
+        }),
+    )?;
+    if let Some(path) = diagnostic_run.path() {
+        // This one line is intentionally independent of --quiet so a feedback
+        // bundle remains discoverable when all ordinary progress is suppressed.
+        eprintln!("Debug log: {}", path.display());
+    }
+    diagnostic_run.phase_start("scan");
+    diagnostic_run.phase_end("scan", scan_duration, json!({ "fileTotal": files.len() }));
 
     // One destructive rebuild under ONE outer exclusive lease: classify, publish
     // `phase=building`, remove the previous DB files, then open the fresh
@@ -4847,13 +4993,14 @@ fn index_project_inner(
     // If the body bails out early, the guard's Drop only attempts state-gated
     // pragma repair/compaction/close and publishes nothing: the namespace stays
     // `phase=building` and unreadable.
-    let store = BulkIndexPragmaGuard::begin(&paths, kind)?;
+    let mut store = BulkIndexPragmaGuard::begin(&paths, kind)?;
+    diagnostic_run.relocate_to_index_root(&index_root);
     store.set_bulk_index_pragmas()?;
 
     let before = store.counts()?;
-    let files_indexed = 0;
-    let files_skipped = 0;
-    let files_errored = 0;
+    let mut files_indexed = 0;
+    let mut files_skipped = 0;
+    let mut files_errored = 0;
 
     // Stream the graph to the store in capped batches instead of holding the whole
     // project in memory. Equivalence with the all-at-once path is byte-for-byte and
@@ -4872,8 +5019,8 @@ fn index_project_inner(
     const REF_FLUSH_ROWS: usize = 20_000;
     const RESOLVE_BATCH_ROWS: usize = 5_000;
 
-    let spill = SpillWriter::new(index_root.clone())?;
-    let pending_nodes: Vec<Node> = Vec::with_capacity(NODE_FLUSH_ROWS);
+    let mut spill = SpillWriter::new(index_root.clone())?;
+    let mut pending_nodes: Vec<Node> = Vec::with_capacity(NODE_FLUSH_ROWS);
 
     let bar = progress_bar(
         files.len() as u64,
@@ -4887,218 +5034,163 @@ fn index_project_inner(
         ));
     }
 
-    // Overlap parse (rayon producers) with persist (one ordered consumer) while
-    // persisting in EXACT sorted `scan_project` order — byte-identical to the
-    // serial drain. The handoff channel is UNBOUNDED so a producer's `send` never
-    // parks a rayon worker; memory is bounded by a reorder WINDOW instead: a
-    // producer for index `i` waits until `i < next_expected + WINDOW`, capping the
-    // buffer to ≤ WINDOW entries. The head index (`i == next_expected`) is never
-    // gated, so the consumer can always advance — deadlock-free by construction.
-    // Producers only parse; the consumer alone touches the Store.
-    const PARSE_REORDER_WINDOW: usize = 512;
+    // The scheduler, not workers, owns the reorder window. It submits at most
+    // 512 files initially and replenishes one slot only after one sorted result
+    // has been persisted. Workers only read + parse and therefore never block on
+    // window backpressure; the single consumer remains the only Store writer.
+    let base_message = if verbose {
+        format!("parsing ({} threads)", rayon::current_num_threads())
+    } else {
+        "parsing".to_string()
+    };
+    bar.set_message(base_message.clone());
+    bar.enable_steady_tick(std::time::Duration::from_millis(250));
+    let (tracker, monitor) = IndexTracker::start(bar.clone(), diagnostic_run.sink(), base_message);
+    diagnostic_run.phase_start("parse_write");
+    let parse_started = std::time::Instant::now();
 
-    type ParsePayload = (usize, String, FileRecord, ExtractionResult);
-    let (tx, rx) = mpsc::channel::<ParsePayload>();
-    let gate = Arc::new((Mutex::new(0usize), Condvar::new()));
-    // Set on a consumer store-write error so gated producers wake and abort.
-    let abort = Arc::new(AtomicBool::new(false));
+    type ParsePayload = (String, FileRecord, ExtractionResult);
+    let schedule_tracker = tracker.clone();
+    let parse_tracker = tracker.clone();
+    let buffer_tracker = tracker.clone();
+    let persist_tracker = tracker.clone();
+    let parse_result = run_ordered_parallel_window(
+        files.len(),
+        PARSE_REORDER_WINDOW,
+        |index| schedule_tracker.scheduled(index, &files[index]),
+        |index| -> Result<ParsePayload> {
+            let relative = &files[index];
+            let full = project.join(relative);
 
-    let producer_err: Arc<Mutex<Option<anyhow::Error>>> = Arc::new(Mutex::new(None));
-    let bar_for_finish = bar.clone();
-
-    // The scope closure is `move` so it owns `rx` (a `Receiver` is `Send` but not
-    // `Sync`, so it cannot be captured by reference into the `Send` closure). The
-    // consumer-side owned state (store/spill/pending_nodes/counters) moves in too
-    // and is returned out so the rest of the function can continue using it.
-    let (
-        consumer_err,
-        mut store,
-        spill,
-        pending_nodes,
-        files_indexed,
-        files_skipped,
-        files_errored,
-    ) = {
-        let gate = Arc::clone(&gate);
-        let abort = Arc::clone(&abort);
-        let producer_err = Arc::clone(&producer_err);
-        let bar = bar.clone();
-        // Borrow `files`/`options` from the function scope (outlives the rayon
-        // scope); only these references — not the owned Vecs — enter the `move`
-        // closure, so the borrowed data stays alive past the scope.
-        let files_ref: &[String] = &files;
-        let options_ref = &options;
-        rayon::scope(move |s| {
-            let mut store = store;
-            let mut spill = spill;
-            let mut pending_nodes = pending_nodes;
-            let mut files_indexed = files_indexed;
-            let mut files_skipped = files_skipped;
-            let mut files_errored = files_errored;
-            let mut consumer_err: Option<anyhow::Error> = None;
-
-            // The sole `tx` moves into the producer closure so it drops when
-            // parsing ends → the consumer's `rx.recv()` disconnects and exits.
-            let producer_gate = Arc::clone(&gate);
-            let producer_abort = Arc::clone(&abort);
-            let producer_err = Arc::clone(&producer_err);
-            s.spawn(move |_| {
-                let tx = tx;
-                let result = files_ref
-                    .par_iter()
-                    .enumerate()
-                    .progress_with(bar)
-                    .try_for_each(|(i, relative)| -> Result<()> {
-                        {
-                            let (lock, cvar) = &*producer_gate;
-                            let mut next_expected = lock.lock().unwrap();
-                            while should_block(i, *next_expected, PARSE_REORDER_WINDOW)
-                                && !producer_abort.load(Ordering::Relaxed)
-                            {
-                                next_expected = cvar.wait(next_expected).unwrap();
-                            }
-                        }
-                        if producer_abort.load(Ordering::Relaxed) {
-                            return Err(anyhow!("indexing aborted by consumer write error"));
-                        }
-
-                        // One metadata + one source read per file (no double read, no
-                        // TOCTOU straddle); the size gate mirrors `extract_file`
-                        // (engine.rs:152) exactly so oversized files still size-skip.
-                        let full = project.join(relative);
-                        let metadata = fs::metadata(&full)
-                            .with_context(|| format!("reading metadata for {}", full.display()))?;
-                        let source = fs::read_to_string(&full)
-                            .with_context(|| format!("reading source file {}", full.display()))?;
-                        let result = if metadata.len() > options_ref.max_file_size {
-                            ExtractionResult {
-                                nodes: Vec::new(),
-                                edges: Vec::new(),
-                                unresolved_references: Vec::new(),
-                                errors: vec![format!(
-                                    "File exceeds max size ({} > {}): {relative}",
-                                    metadata.len(),
-                                    options_ref.max_file_size
-                                )],
-                                duration_ms: 0,
-                            }
-                        } else {
-                            extract_source_with(relative, &source, None, &options_ref.extensions)
-                        };
-                        let file = FileRecord {
-                            path: relative.clone(),
-                            content_hash: hash_content(&source),
-                            language: detect_language_with(relative, &options_ref.extensions),
-                            size: metadata.len() as i64,
-                            modified_at: modified_millis(&metadata),
-                            indexed_at: now_millis(),
-                            node_count: result
-                                .nodes
-                                .iter()
-                                .filter(|n| n.file_path == *relative)
-                                .count() as i64,
-                            errors: result.errors.clone(),
-                            generated: detect_generated_file(relative, &source),
-                        };
-                        tx.send((i, relative.clone(), file, result))
-                            .map_err(|_| anyhow!("parse result channel disconnected"))?;
-                        Ok(())
-                    });
-                if let Err(err) = result {
-                    *producer_err.lock().unwrap() = Some(err);
+            parse_tracker.stage(index, "metadata");
+            let metadata = match fs::metadata(&full)
+                .with_context(|| format!("reading metadata for {}", full.display()))
+            {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    parse_tracker.failed(index, &error);
+                    return Err(error);
                 }
-            });
+            };
 
-            // Drain strictly in cursor order via an index-keyed reorder buffer,
-            // reproducing the exact sorted-scan persist order. A store-write Err sets
-            // `abort`, wakes gated producers, and stops. When `tx` drops, `rx.recv()`
-            // disconnects and the loop exits — a missing index (its producer errored)
-            // never arrives, so we drain the buffered in-order prefix and stop.
-            let mut buffer: ReorderBuffer<ParsePayload> = ReorderBuffer::new();
-            let mut next_expected = 0usize;
-            'consume: while let Ok(payload) = rx.recv() {
-                buffer.insert(payload.0, payload);
-                while let Some((_i, _relative, file, mut result)) = buffer.take(next_expected) {
-                    if file.errors.is_empty() {
-                        files_indexed += 1;
-                    } else if result.nodes.is_empty() {
-                        files_skipped += 1;
-                    } else {
-                        files_errored += 1;
-                    }
-
-                    let drain = (|| -> Result<()> {
-                        store.upsert_file(&file)?;
-                        pending_nodes.append(&mut result.nodes);
-                        if pending_nodes.len() >= NODE_FLUSH_ROWS {
-                            store.upsert_nodes(&pending_nodes)?;
-                            pending_nodes.clear();
-                        }
-                        spill.write_edges(&result.edges)?;
-                        spill.write_refs(&result.unresolved_references)?;
-                        Ok(())
-                    })();
-                    if let Err(err) = drain {
-                        abort.store(true, Ordering::Relaxed);
-                        let (lock, cvar) = &*gate;
-                        let _guard = lock.lock().unwrap();
-                        cvar.notify_all();
-                        consumer_err = Some(err);
-                        break 'consume;
-                    }
-
-                    next_expected += 1;
-                    let (lock, cvar) = &*gate;
-                    {
-                        let mut ne = lock.lock().unwrap();
-                        *ne = next_expected;
-                    }
-                    cvar.notify_all();
+            parse_tracker.stage(index, "read");
+            let source = match fs::read_to_string(&full)
+                .with_context(|| format!("reading source file {}", full.display()))
+            {
+                Ok(source) => source,
+                Err(error) => {
+                    parse_tracker.failed(index, &error);
+                    return Err(error);
                 }
+            };
+            parse_tracker.stage(index, "prepare");
+            let language = detect_language_with(relative, &options.extensions);
+            parse_tracker.file_info(index, metadata.len(), language);
+
+            let result = if metadata.len() > options.max_file_size {
+                ExtractionResult {
+                    nodes: Vec::new(),
+                    edges: Vec::new(),
+                    unresolved_references: Vec::new(),
+                    errors: vec![format!(
+                        "File exceeds max size ({} > {}): {relative}",
+                        metadata.len(),
+                        options.max_file_size
+                    )],
+                    duration_ms: 0,
+                }
+            } else {
+                extract_source_with_observer(
+                    relative,
+                    &source,
+                    None,
+                    &options.extensions,
+                    |stage| parse_tracker.extraction_stage(index, stage),
+                )
+            };
+            let file = FileRecord {
+                path: relative.clone(),
+                content_hash: hash_content(&source),
+                language,
+                size: metadata.len() as i64,
+                modified_at: modified_millis(&metadata),
+                indexed_at: now_millis(),
+                node_count: result
+                    .nodes
+                    .iter()
+                    .filter(|node| node.file_path == *relative)
+                    .count() as i64,
+                errors: result.errors.clone(),
+                generated: detect_generated_file(relative, &source),
+            };
+            parse_tracker.parsed(index, &result);
+            Ok((relative.clone(), file, result))
+        },
+        |buffered| buffer_tracker.buffered(buffered),
+        |index, (_relative, file, mut result)| {
+            if file.errors.is_empty() {
+                files_indexed += 1;
+            } else if result.nodes.is_empty() {
+                files_skipped += 1;
+            } else {
+                files_errored += 1;
             }
 
-            (
-                consumer_err,
-                store,
-                spill,
-                pending_nodes,
-                files_indexed,
-                files_skipped,
-                files_errored,
-            )
-        })
-    };
+            let persist = (|| -> Result<()> {
+                store.upsert_file(&file)?;
+                pending_nodes.append(&mut result.nodes);
+                if pending_nodes.len() >= NODE_FLUSH_ROWS {
+                    store.upsert_nodes(&pending_nodes)?;
+                    pending_nodes.clear();
+                }
+                spill.write_edges(&result.edges)?;
+                spill.write_refs(&result.unresolved_references)?;
+                Ok(())
+            })();
+            if let Err(error) = persist {
+                persist_tracker.failed(index, &error);
+                return Err(error);
+            }
+            persist_tracker.persisted(index);
+            Ok(())
+        },
+    );
+    monitor.stop();
+    parse_result?;
+    diagnostic_run.phase_end(
+        "parse_write",
+        parse_started.elapsed(),
+        json!({
+            "persisted": bar.position(),
+            "filesIndexed": files_indexed,
+            "filesSkipped": files_skipped,
+            "filesErrored": files_errored,
+        }),
+    );
 
-    // Net behavior MUST equal today's `collect::<Result<Vec>>()?` short-circuit:
-    // a consumer write error or any producer parse error returns Err, no hang.
-    if let Some(err) = consumer_err {
-        return Err(err);
-    }
-    if let Some(err) = Arc::into_inner(producer_err)
-        .expect("producer scope joined; no other Arc holders remain")
-        .into_inner()
-        .unwrap()
-    {
-        return Err(err);
-    }
-    let scan_files = bar_for_finish.position();
+    let scan_files = bar.position();
     finish_phase(
-        &bar_for_finish,
+        &bar,
         &format!("Indexed {} files", format_number(scan_files as i64)),
     );
 
+    diagnostic_run.phase_start("node_write");
+    let node_write_started = std::time::Instant::now();
     let pb = phase_spinner("Persisting nodes", quiet);
     if !pending_nodes.is_empty() {
         store.upsert_nodes(&pending_nodes)?;
     }
     drop(pending_nodes);
     finish_phase(&pb, "Persisted nodes");
+    diagnostic_run.phase_end("node_write", node_write_started.elapsed(), json!({}));
 
     // WAL-valve fold threshold (#1231): with bulk autocheckpoint deferred
     // (set_bulk_index_pragmas), fold the WAL back whenever it grows past this
     // size so it never balloons unbounded across the edge/ref replay passes.
     let wal_valve_bytes = codegraph_store::wal_valve_threshold_bytes();
     let mut spill = spill.into_reader()?;
+    diagnostic_run.phase_start("edge_write");
+    let edge_write_started = std::time::Instant::now();
     let pb = phase_spinner("Persisting edges", quiet);
     spill.replay_edges(EDGE_FLUSH_ROWS, |batch| {
         store.insert_edges(batch).map_err(anyhow::Error::from)?;
@@ -5108,6 +5200,9 @@ fn index_project_inner(
         Ok(())
     })?;
     finish_phase(&pb, "Persisted edges");
+    diagnostic_run.phase_end("edge_write", edge_write_started.elapsed(), json!({}));
+    diagnostic_run.phase_start("reference_write");
+    let reference_write_started = std::time::Instant::now();
     let pb = phase_spinner("Persisting references", quiet);
     spill.replay_refs(REF_FLUSH_ROWS, |batch| {
         store
@@ -5119,8 +5214,15 @@ fn index_project_inner(
         Ok(())
     })?;
     finish_phase(&pb, "Persisted references");
+    diagnostic_run.phase_end(
+        "reference_write",
+        reference_write_started.elapsed(),
+        json!({}),
+    );
     spill.cleanup();
 
+    diagnostic_run.phase_start("framework_extract");
+    let framework_started = std::time::Instant::now();
     let pb = phase_spinner("Detecting frameworks", quiet);
     let mut resolver = ReferenceResolver::new(project.to_string_lossy());
     // Detect frameworks then run their per-file extract (route/component/handler
@@ -5145,6 +5247,11 @@ fn index_project_inner(
         )?;
     }
     finish_phase(&pb, "Detected frameworks");
+    diagnostic_run.phase_end(
+        "framework_extract",
+        framework_started.elapsed(),
+        json!({ "enabled": resolver.has_framework_resolvers() }),
+    );
     // Finished from INSIDE the callback on the final chunk so the retained line
     // lands before the resolver's deferred passes (which resolve refs this bar
     // does not count). The trailing finish covers the no-chunk case where the
@@ -5156,7 +5263,10 @@ fn index_project_inner(
     );
     let mut bar_sized = false;
     let mut done_in_callback = false;
-    resolver.resolve_and_persist_batched_with_progress(
+    diagnostic_run.phase_start("reference_resolution");
+    let resolution_started = std::time::Instant::now();
+    let resolution_sink = diagnostic_run.sink();
+    resolver.resolve_and_persist_batched_with_observer(
         &mut store,
         RESOLVE_BATCH_ROWS,
         |processed, total| {
@@ -5170,15 +5280,60 @@ fn index_project_inner(
                 done_in_callback = true;
             }
         },
+        |observation| {
+            let Some(sink) = &resolution_sink else {
+                return;
+            };
+            match observation {
+                codegraph_resolve::ResolutionObservation::Setup {
+                    node_count,
+                    reference_count,
+                    streaming,
+                    batch_size,
+                } => sink.emit(
+                    "resolution_setup",
+                    json!({
+                        "nodes": node_count,
+                        "references": reference_count,
+                        "mode": if streaming { "streaming" } else { "snapshot" },
+                        "batchSize": batch_size,
+                    }),
+                ),
+                codegraph_resolve::ResolutionObservation::BatchComplete {
+                    batch,
+                    processed,
+                    total,
+                } => sink.emit(
+                    "resolution_batch",
+                    json!({
+                        "batch": batch,
+                        "processed": processed,
+                        "total": total,
+                    }),
+                ),
+            }
+        },
     )?;
     if !done_in_callback {
         finish_phase(&resolve_bar, "Resolved references");
     }
+    diagnostic_run.phase_end(
+        "reference_resolution",
+        resolution_started.elapsed(),
+        json!({ "processed": resolve_bar.position(), "total": resolve_bar.length() }),
+    );
+    diagnostic_run.phase_start("framework_finalize");
+    let framework_finalize_started = std::time::Instant::now();
     let pb = phase_spinner("Finalizing frameworks", quiet);
     // Cross-file framework finalization (NestJS RouterModule prefixing) after
     // resolution, mirroring the upstream index.ts:358 runPostExtract.
     resolver.run_post_extract(&mut store)?;
     finish_phase(&pb, "Finalized frameworks");
+    diagnostic_run.phase_end(
+        "framework_finalize",
+        framework_finalize_started.elapsed(),
+        json!({}),
+    );
     store.set_project_metadata("indexed_with_version", VERSION)?;
     let after = store.counts()?;
     // Explicit fallible finalization: pragma restore -> checkpoint + compaction ->
@@ -5186,17 +5341,29 @@ fn index_project_inner(
     // publish `phase=current` (and remove a tombstone only for a successful
     // explicit init). The namespace becomes readable at the LAST step, or not at
     // all. Counts are read BEFORE the connection closes.
+    diagnostic_run.phase_start("publish");
+    let publish_started = std::time::Instant::now();
     let pb = phase_spinner("Publishing index", quiet);
     store.finish()?;
     finish_phase(&pb, "Published index");
-    Ok(IndexSummary {
+    diagnostic_run.phase_end("publish", publish_started.elapsed(), json!({}));
+    let summary = IndexSummary {
         files_indexed,
         files_skipped,
         files_errored,
         nodes_created: after.node_count - before.node_count,
         edges_created: after.edge_count - before.edge_count,
         duration_ms: started.elapsed().as_millis() as i64,
-    })
+    };
+    diagnostic_run.finish_success(json!({
+        "durationMs": summary.duration_ms,
+        "filesIndexed": summary.files_indexed,
+        "filesSkipped": summary.files_skipped,
+        "filesErrored": summary.files_errored,
+        "nodesCreated": summary.nodes_created,
+        "edgesCreated": summary.edges_created,
+    }));
+    Ok(summary)
 }
 
 /// Index-keyed reorder buffer for the streaming index consumer: parsed payloads
@@ -5227,12 +5394,156 @@ impl<T> ReorderBuffer<T> {
     }
 }
 
-/// Window-gate predicate: a producer at `index` must wait while it would run
-/// more than `window` indices ahead of the consumer's `next_expected` cursor.
-/// The head index (`index == next_expected`) is never blocked for `window >= 1`,
-/// which is what makes the design deadlock-free.
-fn should_block(index: usize, next_expected: usize, window: usize) -> bool {
-    index >= next_expected + window
+/// Run `parse` in Rayon while consuming results in strict ascending index order.
+///
+/// Only the caller schedules work: it submits the first `window` tasks, then
+/// submits exactly one replacement after one result has been consumed
+/// successfully. Workers never wait on the reorder window, so a slow head task
+/// cannot strand every Rayon worker behind a condition variable. At all times,
+/// running plus completed-but-not-consumed tasks are bounded by `window`.
+fn run_ordered_parallel_window<T>(
+    count: usize,
+    window: usize,
+    mut on_schedule: impl FnMut(usize),
+    parse: impl Fn(usize) -> Result<T> + Sync,
+    mut on_buffered: impl FnMut(usize),
+    mut consume: impl FnMut(usize, T) -> Result<()>,
+) -> Result<()>
+where
+    T: Send,
+{
+    if window == 0 {
+        bail!("parallel parse window must be at least one");
+    }
+    if count == 0 {
+        return Ok(());
+    }
+
+    // Keep the scheduler/consumer on the CLI thread. Only spawned parse jobs
+    // enter the Rayon pool, so even a two-thread pool retains both workers for
+    // parsing while the caller waits for ordered results.
+    rayon::in_place_scope(|scope| {
+        run_ordered_parallel_window_scoped(
+            scope,
+            count,
+            window,
+            &mut on_schedule,
+            &parse,
+            &mut on_buffered,
+            &mut consume,
+        )
+    })
+}
+
+fn run_ordered_parallel_window_scoped<'scope, T>(
+    scope: &rayon::Scope<'scope>,
+    count: usize,
+    window: usize,
+    on_schedule: &mut impl FnMut(usize),
+    parse: &'scope (impl Fn(usize) -> Result<T> + Sync),
+    on_buffered: &mut impl FnMut(usize),
+    consume: &mut impl FnMut(usize, T) -> Result<()>,
+) -> Result<()>
+where
+    T: Send + 'scope,
+{
+    let (tx, rx) = mpsc::channel::<(usize, Result<T>)>();
+    let mut next_to_schedule = 0usize;
+    let mut next_expected = 0usize;
+    let mut awaiting_receive = 0usize;
+    let mut buffer = ReorderBuffer::new();
+    let mut scheduling_stopped = false;
+    let mut terminal_error: Option<anyhow::Error> = None;
+
+    let mut schedule = |index: usize| {
+        on_schedule(index);
+        let tx = tx.clone();
+        scope.spawn(move |_| {
+            // The receiver lives until every scheduled task has naturally
+            // completed, including the error path, so this send cannot block
+            // and should only fail if the scheduler itself panics. Convert an
+            // extractor panic into an ordered error payload; otherwise the
+            // scheduler would wait forever for this task's missing result.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parse(index)))
+                .unwrap_or_else(|_| {
+                    Err(anyhow!(
+                        "parallel parse worker panicked at file index {index}"
+                    ))
+                });
+            let _ = tx.send((index, result));
+        });
+    };
+
+    while next_to_schedule < count && awaiting_receive < window {
+        schedule(next_to_schedule);
+        next_to_schedule += 1;
+        awaiting_receive += 1;
+    }
+
+    while awaiting_receive > 0 {
+        let (index, result) = rx
+            .recv()
+            .map_err(|_| anyhow!("parallel parse result channel disconnected"))?;
+        awaiting_receive -= 1;
+        if result.is_err() {
+            // Stop growing the work set as soon as ANY worker reports an error.
+            // The error itself is still propagated only when its sorted index
+            // reaches `next_expected`.
+            scheduling_stopped = true;
+        }
+        buffer.insert(index, result);
+        on_buffered(buffer.pending.len());
+        debug_assert!(awaiting_receive + buffer.pending.len() <= window);
+
+        while terminal_error.is_none() {
+            let Some(result) = buffer.take(next_expected) else {
+                break;
+            };
+            on_buffered(buffer.pending.len());
+            match result {
+                Ok(payload) => {
+                    if let Err(error) = consume(next_expected, payload) {
+                        scheduling_stopped = true;
+                        terminal_error = Some(error);
+                        break;
+                    }
+                    next_expected += 1;
+                    if !scheduling_stopped && next_to_schedule < count {
+                        schedule(next_to_schedule);
+                        next_to_schedule += 1;
+                        awaiting_receive += 1;
+                    }
+                }
+                Err(error) => {
+                    scheduling_stopped = true;
+                    terminal_error = Some(error);
+                }
+            }
+            debug_assert!(awaiting_receive + buffer.pending.len() <= window);
+        }
+
+        if terminal_error.is_some() {
+            // Do not cancel or skip already-started parses. Drain one result
+            // from each remaining worker so the scoped tasks can finish
+            // naturally, then return the deterministic ordered error.
+            while awaiting_receive > 0 {
+                let (_, result) = rx
+                    .recv()
+                    .map_err(|_| anyhow!("parallel parse result channel disconnected"))?;
+                drop(result);
+                awaiting_receive -= 1;
+            }
+            break;
+        }
+    }
+
+    if let Some(error) = terminal_error {
+        return Err(error);
+    }
+    if next_expected != count {
+        bail!("parallel parse stopped at file {next_expected} of {count} without an ordered error");
+    }
+    Ok(())
 }
 
 /// On-disk spill for extracted edges and unresolved refs during a full index.
@@ -6329,8 +6640,7 @@ mod self_update_tests {
 
 #[cfg(test)]
 mod reorder_tests {
-    use super::{ReorderBuffer, should_block};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use super::{ReorderBuffer, run_ordered_parallel_window_scoped};
     use std::sync::mpsc;
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::Duration;
@@ -6377,71 +6687,186 @@ mod reorder_tests {
     }
 
     #[test]
-    fn window_gate_blocks_far_index_and_releases_on_advance() {
-        let window = 4usize;
-        assert!(!should_block(0, 0, window), "head index never blocks");
-        assert!(
-            !should_block(3, 0, window),
-            "last in-window index does not block"
-        );
-        assert!(should_block(4, 0, window), "index at cursor+window blocks");
-
-        let gate = Arc::new((Mutex::new(0usize), Condvar::new()));
-        let abort = Arc::new(AtomicBool::new(false));
-        let producer_gate = Arc::clone(&gate);
-        let producer_abort = Arc::clone(&abort);
-        let index = 4usize;
+    fn two_workers_blocked_head_never_schedule_beyond_window() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let runner_release = Arc::clone(&release);
+        let scheduled = Arc::new(Mutex::new(Vec::new()));
+        let runner_scheduled = Arc::clone(&scheduled);
+        let consumed = Arc::new(Mutex::new(Vec::new()));
+        let runner_consumed = Arc::clone(&consumed);
+        let (started_tx, started_rx) = mpsc::channel();
 
         let handle = std::thread::spawn(move || {
-            let (lock, cvar) = &*producer_gate;
-            let mut ne = lock.lock().unwrap();
-            while should_block(index, *ne, window) && !producer_abort.load(Ordering::Relaxed) {
-                ne = cvar.wait(ne).unwrap();
-            }
-            *ne
+            let parse_release = Arc::clone(&runner_release);
+            let parse = move |index: usize| -> anyhow::Result<usize> {
+                started_tx.send(index).unwrap();
+                if index == 0 {
+                    let (lock, wake) = &*parse_release;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = wake.wait(released).unwrap();
+                    }
+                }
+                Ok(index)
+            };
+            let mut on_schedule = |index| runner_scheduled.lock().unwrap().push(index);
+            let mut on_buffered = |_| {};
+            let mut consume = |index, value| {
+                assert_eq!(index, value);
+                runner_consumed.lock().unwrap().push(index);
+                Ok(())
+            };
+            pool.in_place_scope(|scope| {
+                run_ordered_parallel_window_scoped(
+                    scope,
+                    8,
+                    4,
+                    &mut on_schedule,
+                    &parse,
+                    &mut on_buffered,
+                    &mut consume,
+                )
+            })
+            .unwrap();
         });
 
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(
-            !handle.is_finished(),
-            "producer at cursor+window stays blocked"
+        let mut started = Vec::new();
+        for _ in 0..4 {
+            started.push(started_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        }
+        started.sort_unstable();
+        assert_eq!(started, vec![0, 1, 2, 3]);
+        assert_eq!(
+            *scheduled.lock().unwrap(),
+            vec![0, 1, 2, 3],
+            "no fifth task is submitted while the ordered head is blocked"
         );
 
-        let (lock, cvar) = &*gate;
+        let (lock, wake) = &*release;
         {
-            let mut ne = lock.lock().unwrap();
-            *ne = 1;
+            let mut released = lock.lock().unwrap();
+            *released = true;
         }
-        cvar.notify_all();
+        wake.notify_all();
 
-        let observed = handle.join().unwrap();
+        handle.join().unwrap();
+        assert_eq!(*consumed.lock().unwrap(), (0usize..8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn consumer_error_stops_replenishment_and_joins_started_tasks() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let scheduled = Arc::new(Mutex::new(Vec::new()));
+        let scheduled_for_callback = Arc::clone(&scheduled);
+        let parse = |index| Ok(index);
+        let mut on_schedule = |index| scheduled_for_callback.lock().unwrap().push(index);
+        let mut on_buffered = |_| {};
+        let mut consume = |_index, _value| anyhow::bail!("injected database write failure");
+        let error = pool
+            .in_place_scope(|scope| {
+                run_ordered_parallel_window_scoped(
+                    scope,
+                    8,
+                    4,
+                    &mut on_schedule,
+                    &parse,
+                    &mut on_buffered,
+                    &mut consume,
+                )
+            })
+            .unwrap_err();
         assert!(
-            observed >= 1,
-            "producer unblocked after the cursor advanced"
+            error
+                .to_string()
+                .contains("injected database write failure")
+        );
+        assert_eq!(
+            *scheduled.lock().unwrap(),
+            vec![0, 1, 2, 3],
+            "a consumer failure stops all replenishment"
         );
     }
 
     #[test]
-    fn producer_disconnect_with_gap_terminates_consumer() {
-        let (tx, rx) = mpsc::channel::<(usize, usize)>();
-        tx.send((0, 0)).unwrap();
-        tx.send((1, 1)).unwrap();
-        tx.send((3, 3)).unwrap();
-        drop(tx);
+    fn parse_error_is_propagated_in_index_order_and_stops_replenishment() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let runner_release = Arc::clone(&release);
+        let scheduled = Arc::new(Mutex::new(Vec::new()));
+        let runner_scheduled = Arc::clone(&scheduled);
+        let consumed = Arc::new(Mutex::new(Vec::new()));
+        let runner_consumed = Arc::clone(&consumed);
+        let (buffered_tx, buffered_rx) = mpsc::channel();
 
-        let mut buffer = ReorderBuffer::new();
-        let mut next_expected = 0usize;
-        let mut out = Vec::new();
-        while let Ok((i, payload)) = rx.recv() {
-            buffer.insert(i, payload);
-            while let Some(p) = buffer.take(next_expected) {
-                out.push(p);
-                next_expected += 1;
-            }
-        }
-        assert_eq!(out, vec![0, 1], "drains buffered prefix, stops at the gap");
-        assert_eq!(next_expected, 2);
-        assert_eq!(buffer.len(), 1, "index 3 stays buffered, never drained");
+        let handle = std::thread::spawn(move || {
+            let parse_release = Arc::clone(&runner_release);
+            let parse = move |index: usize| -> anyhow::Result<usize> {
+                if index == 2 {
+                    anyhow::bail!("injected read failure at index 2");
+                }
+                if matches!(index, 0 | 3) {
+                    let (lock, wake) = &*parse_release;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = wake.wait(released).unwrap();
+                    }
+                }
+                Ok(index)
+            };
+            let mut on_schedule = |index| runner_scheduled.lock().unwrap().push(index);
+            let mut buffered_results = 0usize;
+            let mut on_buffered = |_buffered| {
+                buffered_results += 1;
+                if buffered_results == 2 {
+                    buffered_tx.send(()).unwrap();
+                }
+            };
+            let mut consume = |index, _value| {
+                runner_consumed.lock().unwrap().push(index);
+                Ok(())
+            };
+            pool.in_place_scope(|scope| {
+                run_ordered_parallel_window_scoped(
+                    scope,
+                    8,
+                    4,
+                    &mut on_schedule,
+                    &parse,
+                    &mut on_buffered,
+                    &mut consume,
+                )
+            })
+            .unwrap_err()
+        });
+
+        buffered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(*scheduled.lock().unwrap(), vec![0, 1, 2, 3]);
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+
+        let error = handle.join().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("injected read failure at index 2")
+        );
+        assert_eq!(*consumed.lock().unwrap(), vec![0, 1]);
+        assert_eq!(
+            *scheduled.lock().unwrap(),
+            vec![0, 1, 2, 3],
+            "the observed parse failure must prevent replenishment"
+        );
     }
 }
 

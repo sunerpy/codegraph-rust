@@ -15,7 +15,7 @@ use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use codegraph_store::Store;
 use std::borrow::Borrow;
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -46,6 +46,8 @@ struct Caches {
     go_module: Option<Option<GoModule>>,
     go_modules: Option<Vec<GoModule>>,
     workspace_packages: Option<Option<WorkspacePackages>>,
+    all_files: Option<Arc<Vec<String>>>,
+    files_by_basename: Option<HashMap<String, Arc<Vec<String>>>>,
 }
 
 impl Caches {
@@ -65,6 +67,8 @@ impl Caches {
             go_module: None,
             go_modules: None,
             workspace_packages: None,
+            all_files: None,
+            files_by_basename: None,
         }
     }
 }
@@ -90,6 +94,51 @@ impl<'a> StoreResolutionContext<'a> {
         c.name_cache.clear();
         c.lower_name_cache.clear();
         c.qualified_name_cache.clear();
+        c.all_files = None;
+        c.files_by_basename = None;
+    }
+
+    fn cached_all_files(&self) -> Arc<Vec<String>> {
+        if let Some(files) = self.caches.borrow().all_files.clone() {
+            return files;
+        }
+        let files = Arc::new(
+            self.store
+                .all_files()
+                .map(|files| files.into_iter().map(|file| file.path).collect())
+                .unwrap_or_default(),
+        );
+        self.caches.borrow_mut().all_files = Some(Arc::clone(&files));
+        files
+    }
+
+    fn cached_files_by_basename(&self, basename: &str) -> Arc<Vec<String>> {
+        if let Some(index) = self.caches.borrow().files_by_basename.as_ref() {
+            return index
+                .get(basename)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(Vec::new()));
+        }
+
+        let mut index: HashMap<String, Vec<String>> = HashMap::new();
+        for file in self.cached_all_files().iter() {
+            let name = file
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(file.as_str())
+                .to_string();
+            index.entry(name).or_default().push(file.clone());
+        }
+        let index: HashMap<String, Arc<Vec<String>>> = index
+            .into_iter()
+            .map(|(name, files)| (name, Arc::new(files)))
+            .collect();
+        let result = index
+            .get(basename)
+            .cloned()
+            .unwrap_or_else(|| Arc::new(Vec::new()));
+        self.caches.borrow_mut().files_by_basename = Some(index);
+        result
     }
 }
 
@@ -213,10 +262,15 @@ impl ResolutionContext for StoreResolutionContext<'_> {
     }
 
     fn get_all_files(&self) -> Vec<String> {
-        self.store
-            .all_files()
-            .map(|files| files.into_iter().map(|f| f.path).collect())
-            .unwrap_or_default()
+        self.cached_all_files().as_ref().clone()
+    }
+
+    fn get_all_files_shared(&self) -> Arc<Vec<String>> {
+        self.cached_all_files()
+    }
+
+    fn get_files_by_basename_shared(&self, basename: &str) -> Arc<Vec<String>> {
+        self.cached_files_by_basename(basename)
     }
 
     fn get_nodes_by_lower_name(&self, lower_name: &str) -> Vec<Node> {
@@ -727,6 +781,36 @@ mod tests {
         assert!(ctx.read_file("missing.ts").is_none());
 
         assert!(ctx.get_all_files().contains(&"known.ts".to_string()));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn store_context_reuses_file_list_and_basename_index() {
+        let root = temp_root("file-index");
+        let store = open_store(&root);
+        for path in [
+            "frontend/src/Button.vue",
+            "mobile/components/Button.vue",
+            "backend/src/App.java",
+        ] {
+            store.upsert_file(&file_record(path, 0)).unwrap();
+        }
+
+        let ctx = StoreResolutionContext::new(&store, root.to_str().unwrap());
+        let files = ctx.get_all_files_shared();
+        let files_again = ctx.get_all_files_shared();
+        assert!(Arc::ptr_eq(&files, &files_again));
+
+        let buttons = ctx.get_files_by_basename_shared("Button.vue");
+        let buttons_again = ctx.get_files_by_basename_shared("Button.vue");
+        assert!(Arc::ptr_eq(&buttons, &buttons_again));
+        assert_eq!(
+            buttons.as_ref(),
+            &vec![
+                "frontend/src/Button.vue".to_string(),
+                "mobile/components/Button.vue".to_string(),
+            ]
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

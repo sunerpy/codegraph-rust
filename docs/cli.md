@@ -1078,6 +1078,15 @@ Extraction version 11 → 12 is a supported `sync` upgrade: `status` reports the
 old index as outdated, and `sync` rebuilds it into the current namespace. Do not
 run `index --force` solely because the extraction version changed.
 
+### Index diagnostics
+
+`init`, `index`, and `sync` share `--debug` and `--debug-log <FILE>`.
+`--debug-log` implies `--debug`; otherwise the log is written under
+`.codegraph/diagnostics/`. These JSONL diagnostics are opt-in and do not change
+parse, resolution, or persistence decisions. See
+[`troubleshooting.md`](troubleshooting.md) for the event schema, privacy
+boundary, slow-file watchdog behavior, and the files to attach to a report.
+
 ### `--prompt-hook` detail
 
 `codegraph prompt-hook` is a hidden subcommand (not shown in `--help`). It accepts
