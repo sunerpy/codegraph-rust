@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.50.3](https://github.com/sunerpy/codegraph-rust/compare/v0.50.2...v0.50.3) (2026-09-02)
+
+
+### Bug Fixes
+
+* **index:** unblock large multi-module indexing ([#267](https://github.com/sunerpy/codegraph-rust/issues/267)) ([540f742](https://github.com/sunerpy/codegraph-rust/commit/540f742cbd204e4b3c614ac690708790d579ed8b))
+
 ## [0.50.2](https://github.com/sunerpy/codegraph-rust/compare/v0.50.1...v0.50.2) (2026-09-01)
 
 
