@@ -202,7 +202,8 @@ struct NodeSnapshot {
     by_id: HashMap<String, Arc<Node>>,
     known_node_names: Vec<String>,
     known_file_paths: HashSet<String>,
-    all_file_paths: Vec<String>,
+    all_file_paths: Arc<Vec<String>>,
+    files_by_basename: HashMap<String, Arc<Vec<String>>>,
     project_aliases: Option<AliasMap>,
     workspace_packages: Option<WorkspacePackages>,
     go_module: Option<GoModule>,
@@ -308,6 +309,23 @@ impl SnapshotResolutionContext {
         let mut all_file_paths: Vec<String> = known_file_paths.iter().cloned().collect();
         // `all_files` returns `ORDER BY path`; mirror it for `get_all_files`.
         all_file_paths.sort();
+        let mut files_by_basename: HashMap<String, Vec<String>> = HashMap::new();
+        for file in &all_file_paths {
+            let basename = file
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(file.as_str())
+                .to_string();
+            files_by_basename
+                .entry(basename)
+                .or_default()
+                .push(file.clone());
+        }
+        let files_by_basename = files_by_basename
+            .into_iter()
+            .map(|(name, files)| (name, Arc::new(files)))
+            .collect();
+        let all_file_paths = Arc::new(all_file_paths);
 
         let project_aliases = load_project_aliases(&project_root);
         let workspace_packages = load_workspace_packages(&project_root);
@@ -326,6 +344,7 @@ impl SnapshotResolutionContext {
                 known_node_names,
                 known_file_paths,
                 all_file_paths,
+                files_by_basename,
                 project_aliases,
                 workspace_packages,
                 go_module,
@@ -470,7 +489,19 @@ impl ResolutionContext for SnapshotResolutionContext {
     }
 
     fn get_all_files(&self) -> Vec<String> {
-        self.snapshot.all_file_paths.clone()
+        self.snapshot.all_file_paths.as_ref().clone()
+    }
+
+    fn get_all_files_shared(&self) -> Arc<Vec<String>> {
+        Arc::clone(&self.snapshot.all_file_paths)
+    }
+
+    fn get_files_by_basename_shared(&self, basename: &str) -> Arc<Vec<String>> {
+        self.snapshot
+            .files_by_basename
+            .get(basename)
+            .cloned()
+            .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
     fn get_nodes_by_lower_name(&self, lower_name: &str) -> Vec<Node> {

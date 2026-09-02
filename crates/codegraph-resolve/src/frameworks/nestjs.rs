@@ -47,14 +47,14 @@ impl FrameworkResolver for NestjsResolver {
             }
         }
 
-        for file in context.get_all_files() {
+        for file in context.get_all_files_shared().iter() {
             if file.ends_with(".controller.ts")
                 || file.ends_with(".controller.js")
                 || file.ends_with(".module.ts")
                 || file.ends_with(".resolver.ts")
                 || file.ends_with(".gateway.ts")
             {
-                if let Some(content) = context.read_file(&file) {
+                if let Some(content) = context.read_file(file) {
                     if content.contains("@nestjs/")
                         || content.contains("@Controller")
                         || content.contains("@Module(")

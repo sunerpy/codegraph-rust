@@ -104,10 +104,16 @@ impl Drop for TestDir {
 }
 
 fn cli(args: &[&str]) -> (String, String, bool) {
-    let output = Command::new(env!("CARGO_BIN_EXE_codegraph"))
-        .args(args)
-        .output()
-        .expect("run codegraph binary");
+    cli_with_threads(args, None)
+}
+
+fn cli_with_threads(args: &[&str], threads: Option<&str>) -> (String, String, bool) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_codegraph"));
+    command.args(args);
+    if let Some(threads) = threads {
+        command.env("RAYON_NUM_THREADS", threads);
+    }
+    let output = command.output().expect("run codegraph binary");
     (
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -168,6 +174,41 @@ fn repeated_force_index_same_dir_is_canonically_identical() {
 
     diff_canonical(&first, &second, None)
         .expect("re-running index --force in place must be canonically identical");
+}
+
+#[test]
+fn debug_mode_is_canonically_identical_at_one_two_and_four_threads() {
+    let mut cross_thread_baseline = None;
+    for threads in ["1", "2", "4"] {
+        let dir = TestDir::new(&format!("debug-equivalence-{threads}"));
+        let project = dir.path().join("mini");
+        copy_tree(&mini_fixture(), &project);
+        let project_arg = project.to_str().unwrap();
+
+        let (out, err, ok) = cli_with_threads(&["init", project_arg], Some(threads));
+        assert!(ok, "init ({threads} threads) failed: {out} {err}");
+        let (out, err, ok) = cli_with_threads(&["index", "--force", project_arg], Some(threads));
+        assert!(ok, "ordinary index ({threads} threads) failed: {out} {err}");
+        let ordinary = canonicalize_db(&db_path(&project)).unwrap();
+
+        let (out, err, ok) = cli_with_threads(
+            &["index", "--force", "--quiet", "--debug", project_arg],
+            Some(threads),
+        );
+        assert!(ok, "debug index ({threads} threads) failed: {out} {err}");
+        let debug = canonicalize_db(&db_path(&project)).unwrap();
+        diff_canonical(&ordinary, &debug, None).unwrap_or_else(|error| {
+            panic!("debug changed index output with {threads} threads: {error}")
+        });
+
+        if let Some(baseline) = &cross_thread_baseline {
+            diff_canonical(baseline, &debug, None).unwrap_or_else(|error| {
+                panic!("thread count changed index output at {threads} threads: {error}")
+            });
+        } else {
+            cross_thread_baseline = Some(debug);
+        }
+    }
 }
 
 /// BASELINE→PARALLEL EQUIVALENCE (the form a self-contained test can control):

@@ -566,6 +566,8 @@ Full list with extensions and per-language notes: [`docs/languages.md`](docs/lan
   all flags).
 - [`docs/mcp.md`](docs/mcp.md) — MCP server protocol, all 10 tools, JSON-RPC
   details, IDE per-agent config matrix, HTTP server, env-var reference.
+- [`docs/troubleshooting.md`](docs/troubleshooting.md) — opt-in JSONL diagnostics
+  for slow `init` / `index` / `sync` runs and the feedback checklist.
 - [`examples/`](examples/) — codegraph + LLM orchestration example.
 - [`editors/zed/README.md`](editors/zed/README.md) — Zed extension reference.
 - [`docs/readme/README.zh-CN.md`](docs/readme/README.zh-CN.md) — 中文说明.

@@ -363,6 +363,29 @@ pub trait ResolutionContext {
     fn get_project_root(&self) -> &str;
     /// Get all files (`getAllFiles`).
     fn get_all_files(&self) -> Vec<String>;
+    /// Shared-file-list variant of [`Self::get_all_files`].
+    ///
+    /// The default preserves compatibility for lightweight and external
+    /// contexts. Production contexts override it so repeated framework
+    /// detection borrows one immutable list instead of querying and cloning the
+    /// complete file table for every resolver.
+    fn get_all_files_shared(&self) -> Arc<Vec<String>> {
+        Arc::new(self.get_all_files())
+    }
+    /// Files whose final path component exactly equals `basename`.
+    ///
+    /// The returned paths retain [`Self::get_all_files`] ordering. Production
+    /// contexts override this with a precomputed basename index; the default
+    /// keeps existing implementors source-compatible.
+    fn get_files_by_basename_shared(&self, basename: &str) -> Arc<Vec<String>> {
+        Arc::new(
+            self.get_all_files_shared()
+                .iter()
+                .filter(|file| file.rsplit(['/', '\\']).next().unwrap_or(file.as_str()) == basename)
+                .cloned()
+                .collect(),
+        )
+    }
     /// Get nodes by lowercase name (`getNodesByLowerName`, O(1) via index).
     fn get_nodes_by_lower_name(&self, lower_name: &str) -> Vec<Node>;
     /// Shared-node variant of [`Self::get_nodes_by_lower_name`].
