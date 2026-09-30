@@ -57,6 +57,9 @@ impl LanguageSpec for CSpec {
     fn variable_types(&self) -> &'static [&'static str] {
         &["declaration"]
     }
+    fn resolve_name(&self, node: Node<'_>, source: &str) -> Option<String> {
+        crate::lang::cpp::recover_single_arg_macro_defined_name(node, source)
+    }
     fn name_field(&self) -> &'static str {
         "declarator"
     }

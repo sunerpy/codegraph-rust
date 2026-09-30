@@ -70,7 +70,9 @@ impl LanguageSpec for CppSpec {
         "type"
     }
     fn resolve_name(&self, node: Node<'_>, source: &str) -> Option<String> {
-        if let Some(name) = recover_cpp_macro_defined_name(node, source) {
+        if let Some(name) = recover_single_arg_macro_defined_name(node, source)
+            .or_else(|| recover_cpp_macro_defined_name(node, source))
+        {
             return Some(name);
         }
         let qid = declarator_qualified_id(child_by_field(node, "declarator")?)?;
@@ -919,6 +921,108 @@ fn mask_quoted_literal(bytes: &[u8], mask: &mut [bool], start: usize, quote: u8)
         }
     }
     i
+}
+
+/// Recover the function a single-argument macro defines —
+/// `#define NATIVE_FN(name) int name(void)` then `NATIVE_FN(get_version) { … }`
+/// (upstream #1373). Without its definition the shape is ambiguous, so a
+/// preceding local `#define` whose replacement uses its sole parameter as the
+/// function declarator is required; registration, token-pasting and `typedef`
+/// replacements, an `#undef` or redefinition in between, and any conditional
+/// block leave the name alone. C parses the macro as the return type with a
+/// `(name)` declarator; C++ as an implicit-return-type function.
+pub(crate) fn recover_single_arg_macro_defined_name(
+    node: Node<'_>,
+    source: &str,
+) -> Option<String> {
+    if node.kind() != "function_definition" {
+        return None;
+    }
+    let declarator = child_by_field(node, "declarator")?;
+    let (macro_node, argument) = match declarator.kind() {
+        "parenthesized_declarator" if declarator.named_child_count() == 1 => {
+            let macro_node = child_by_field(node, "type")?;
+            let argument = declarator.named_child(0)?;
+            if macro_node.kind() != "type_identifier" || argument.kind() != "identifier" {
+                return None;
+            }
+            (macro_node, argument)
+        }
+        "function_declarator" if child_by_field(node, "type").is_none() => {
+            let macro_node = child_by_field(declarator, "declarator")?;
+            let params = child_by_field(declarator, "parameters")?;
+            let param = params.named_child(0)?;
+            if macro_node.kind() != "identifier"
+                || params.named_child_count() != 1
+                || param.kind() != "parameter_declaration"
+                || param.named_child_count() != 1
+            {
+                return None;
+            }
+            let argument = param.named_child(0)?;
+            if argument.kind() != "type_identifier" {
+                return None;
+            }
+            (macro_node, argument)
+        }
+        _ => return None,
+    };
+    let macro_name = node_text(macro_node, source);
+    static REPLACEMENT: OnceLock<Regex> = OnceLock::new();
+    let replacement_pattern = REPLACEMENT.get_or_init(|| {
+        Regex::new(
+            r"^(?:[A-Za-z_][A-Za-z0-9_:]*\s+)+[*&\s]*([A-Za-z_][A-Za-z0-9_]*)\s*\([^(){};#]*\)\s*$",
+        )
+        .expect("single-argument macro replacement pattern")
+    });
+    static TYPEDEF: OnceLock<Regex> = OnceLock::new();
+    let typedef = TYPEDEF.get_or_init(|| Regex::new(r"(?-u:\b)typedef(?-u:\b)").expect("typedef"));
+    let mut scope = Some(node);
+    while let Some(current) = scope {
+        if current.kind() == "preproc_else" || current.kind().starts_with("preproc_elif") {
+            return None;
+        }
+        let mut previous = current.prev_named_sibling();
+        while let Some(prev) = previous {
+            previous = prev.prev_named_sibling();
+            if prev.kind().starts_with("preproc_if") {
+                return None;
+            }
+            if prev.kind() == "preproc_call"
+                && child_by_field(prev, "directive")
+                    .is_some_and(|directive| node_text(directive, source) == "#undef")
+                && child_by_field(prev, "argument")
+                    .is_some_and(|argument| node_text(argument, source).trim() == macro_name)
+            {
+                return None;
+            }
+            if !matches!(prev.kind(), "preproc_function_def" | "preproc_def")
+                || child_by_field(prev, "name").map(|name| node_text(name, source))
+                    != Some(macro_name.clone())
+            {
+                continue;
+            }
+            let params = child_by_field(prev, "parameters")?;
+            let param = params.named_child(0)?;
+            let value = child_by_field(prev, "value")?;
+            if params.named_child_count() != 1 || param.kind() != "identifier" {
+                return None;
+            }
+            let replacement = node_text(value, source)
+                .replace("\\\r\n", " ")
+                .replace("\\\n", " ");
+            let replacement = replacement.trim();
+            let declared = replacement_pattern
+                .captures(replacement)
+                .and_then(|captures| captures.get(1))?;
+            if typedef.is_match(replacement) || declared.as_str() != node_text(param, source) {
+                return None;
+            }
+            return Some(node_text(argument, source));
+        }
+        scope = current.parent();
+    }
+    None
 }
 
 /// Recover the real function name from the macro-definition idiom

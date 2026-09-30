@@ -478,3 +478,40 @@ fn kotlin_private_and_rust_module_visibility_are_enforced() {
         BTreeSet::from([("src/net.rs", "exported"), ("src/net.rs", "shared")])
     );
 }
+
+#[test]
+fn single_argument_function_macros_connect_callers_and_callees() {
+    // Upstream #1373: `NATIVE_FN(get_version) { ... }` defines `get_version`
+    // once the local `#define` establishes the name.
+    for file in ["main.c", "main.cpp"] {
+        let graph = resolve_project(
+            "single-arg-macro",
+            &[(
+                file,
+                "#define NATIVE_FN(name) int name(void)\n\
+                 int helper(void) { return 1; }\n\
+                 NATIVE_FN(get_version) { return helper(); }\n\
+                 int use_it(void) { return get_version(); }\n\
+                 int plain_func(void) { return 42; }\n",
+            )],
+        );
+        let recovered = graph.node(NodeKind::Function, "get_version", file);
+        let helper = graph.node(NodeKind::Function, "helper", file);
+        let caller = graph.node(NodeKind::Function, "use_it", file);
+        graph.node(NodeKind::Function, "plain_func", file);
+        assert!(
+            graph
+                .outgoing(caller, EdgeKind::Calls)
+                .iter()
+                .any(|target| target.id == recovered.id),
+            "{file}"
+        );
+        assert!(
+            graph
+                .outgoing(recovered, EdgeKind::Calls)
+                .iter()
+                .any(|target| target.id == helper.id),
+            "{file}"
+        );
+    }
+}

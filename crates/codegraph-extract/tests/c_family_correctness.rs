@@ -152,3 +152,104 @@ fn cpp_pure_virtual_declarations_become_abstract_methods_only() {
             && matches!(reference.reference_name.as_str(), "read" | "store.read")
     }));
 }
+
+// ---- single-argument function macros (#1373) --------------------------------
+
+fn functions(file: &str, source: &str, language: Language) -> Vec<codegraph_core::types::Node> {
+    let mut functions = extract_source(file, source, Some(language))
+        .nodes
+        .into_iter()
+        .filter(|node| node.kind == NodeKind::Function)
+        .collect::<Vec<_>>();
+    functions.sort_by_key(|node| (node.start_line, node.start_column));
+    functions
+}
+
+#[test]
+fn single_argument_function_macros_recover_their_function_name() {
+    let source = "#define NATIVE_FN(name) int name(void)\n\
+                  NATIVE_FN(get_version) { return helper(); }\n\
+                  int use_it(void) { return get_version(); }\n";
+    for (file, language) in [("main.c", Language::C), ("main.cpp", Language::Cpp)] {
+        let result = extract_source(file, source, Some(language));
+        let found = functions(file, source, language);
+        assert_eq!(
+            found
+                .iter()
+                .map(|node| node.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["get_version", "use_it"],
+            "{file}"
+        );
+        let recovered = &found[0];
+        assert_eq!(
+            (
+                recovered.qualified_name.as_str(),
+                recovered.start_line,
+                recovered.end_line,
+                recovered.start_column
+            ),
+            ("get_version", 2, 2, 0),
+            "{file}"
+        );
+        let calls = |from: &str, name: &str| {
+            result.unresolved_references.iter().any(|reference| {
+                reference.from_node_id == from
+                    && reference.reference_name == name
+                    && reference.reference_kind == EdgeKind::Calls
+            })
+        };
+        assert!(calls(&found[0].id, "helper"), "{file}");
+        assert!(calls(&found[1].id, "get_version"), "{file}");
+    }
+}
+
+#[test]
+fn single_argument_function_macros_are_never_guessed() {
+    let prefixes = [
+        "",
+        "// #define NATIVE_FN(name) int name(void)\n",
+        "#define NATIVE_FN(name) int fixed(name)\n",
+        "#define NATIVE_FN(name) int test_ ## name(void)\n",
+        "#define NATIVE_FN(name) register_test(name)\n",
+        "#define NATIVE_FN(name) typedef int name(void)\n",
+        "#define NATIVE_FN(name) int name(void)\n#define NATIVE_FN int\n",
+        "#define NATIVE_FN(name) int name(void)\n#ifdef OTHER\n#undef NATIVE_FN\n#endif\n",
+        "#define NATIVE_FN(name) int name(void)\n#undef NATIVE_FN\n",
+        "#define NATIVE_FN(name) int name(void)\n#define NATIVE_FN(name) int fixed(name)\n",
+    ];
+    for (file, language) in [("main.c", Language::C), ("main.cpp", Language::Cpp)] {
+        for prefix in prefixes {
+            let source = format!("{prefix}NATIVE_FN(candidate) {{ return 1; }}\n");
+            assert!(
+                !functions(file, &source, language)
+                    .iter()
+                    .any(|node| node.name == "candidate"),
+                "{file}: {prefix:?}"
+            );
+        }
+        let alternate = "#ifdef OTHER\n#define NATIVE_FN(name) int name(void)\n#else\n\
+                         NATIVE_FN(candidate) { return 1; }\n#endif\n";
+        assert!(
+            !functions(file, alternate, language)
+                .iter()
+                .any(|node| node.name == "candidate"),
+            "{file}: #else branch"
+        );
+        let ordinary = functions(file, "int (parenthesized)(void) { return 1; }\n", language);
+        assert_eq!(
+            ordinary.first().map(|node| node.name.as_str()),
+            Some("(parenthesized)"),
+            "{file}"
+        );
+    }
+    let knr = functions(
+        "knr.c",
+        "int old_style(arg) int arg; { return arg; }\n",
+        Language::C,
+    );
+    assert_eq!(
+        knr.first().map(|node| node.name.as_str()),
+        Some("old_style")
+    );
+}
