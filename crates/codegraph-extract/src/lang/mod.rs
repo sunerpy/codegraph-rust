@@ -43,10 +43,13 @@ pub use cfml::CFML_SPEC;
 pub(crate) use cfml::{
     cfml_component_name_from_path, cfml_string_attr_value, cfml_tag_attr, is_bare_script_cfml,
 };
-pub use cpp::CPP_SPEC;
+pub use cpp::{
+    CPP_CONSTRUCTOR_REFERENCE_PREFIX, CPP_SPEC, cpp_constructor_arity_range,
+    cpp_constructor_reference_name, parse_cpp_constructor_reference_name,
+};
 pub(crate) use cpp::{
     ExplicitOperatorCall, ExportMacroClass, cpp_code_mask, detect_export_macro_class,
-    recover_explicit_operator_call,
+    is_cpp_pure_virtual_method_decl, recover_explicit_operator_call,
 };
 pub use csharp::CSHARP_SPEC;
 pub use dart::DART_SPEC;
@@ -80,6 +83,7 @@ pub use ruby::RUBY_SPEC;
 pub use rust::RUST_SPEC;
 pub(crate) use rust::rust_impl_type_name;
 pub use scala::SCALA_SPEC;
+pub(crate) use scala::scala_base_type_name;
 pub use solidity::SOLIDITY_SPEC;
 pub use swift::SWIFT_SPEC;
 pub use terraform::TERRAFORM_SPEC;

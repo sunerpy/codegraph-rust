@@ -205,9 +205,9 @@ fn file_filter_accepts_a_path_suffix() {
 }
 
 #[test]
-fn file_filter_matching_nothing_is_an_explicit_error() {
-    // Silently returning "no callers" would read as "this symbol is dead" —
-    // the same false-negative the filter exists to prevent.
+fn file_filter_matching_nothing_falls_back_to_all_definitions_visibly() {
+    // An empty result would read as "this symbol is dead". Keep the real
+    // definitions and disclose that the requested narrowing missed.
     let dir = TestDir::new("nomatch");
     let project = two_definition_project(&dir);
     let p = project.to_str().unwrap();
@@ -220,19 +220,13 @@ fn file_filter_matching_nothing_is_an_explicit_error() {
         "nosuch.ts",
         "--json",
     ]);
-    assert!(
-        !ok,
-        "an unmatched --file must fail, not report an empty result: {stdout}"
-    );
-    let combined = format!("{stdout}{stderr}");
-    assert!(
-        combined.contains("nosuch.ts"),
-        "the error must name the rejected filter: {combined}"
-    );
-    assert!(
-        combined.contains("alpha.ts") && combined.contains("beta.ts"),
-        "the error must list the files that DO define the symbol: {combined}"
-    );
+    assert!(ok, "fallback must succeed: stdout={stdout} stderr={stderr}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("JSON output");
+    assert_eq!(value["filteredOut"], true);
+    assert_eq!(value["ambiguous"], true);
+    assert!(value["note"].as_str().unwrap().contains("nosuch.ts"));
+    assert_eq!(names(&value, "callers").len(), 2);
+    assert_eq!(value["definitions"].as_array().unwrap().len(), 2);
 }
 
 #[test]

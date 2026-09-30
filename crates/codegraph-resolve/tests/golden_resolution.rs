@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use codegraph_core::types::{Edge, FileRecord, Language};
+use codegraph_core::types::{Edge, EdgeKind, FileRecord, Language, NodeKind};
 use codegraph_extract::extract_file;
 use codegraph_resolve::ReferenceResolver;
 use codegraph_store::Store;
@@ -124,6 +124,7 @@ fn resolve_fixture(test_name: &str, root: &Path, relative_files: &[&str]) -> Vec
             Some("java") => Language::Java,
             Some("cpp") => Language::Cpp,
             Some("php") => Language::Php,
+            Some("rs") => Language::Rust,
             Some("xml") => Language::Xml,
             other => panic!("unexpected fixture extension {other:?}"),
         };
@@ -403,10 +404,9 @@ fn callback_function_ref_emits_references_edges_with_fn_ref_metadata() {
 
 #[test]
 fn callback_function_ref_python_bare_function_value() {
-    // Multi-language function_ref (upstream #756): Python `register(worker)` bare
-    // function value yields a `references` edge tagged fnRef:true / resolvedBy
-    // function-ref. Edge count + target captured byte-identical from the upstream 1.0.1
-    // on this exact source (the upstream emits exactly one fnRef edge here).
+    // Multi-language function_ref (upstream #756 plus #1820): Python
+    // `register(worker)` and class-scoped `self.on_click` method values each
+    // yield a `references` edge tagged fnRef:true / resolvedBy function-ref.
     let dir = std::env::temp_dir().join(format!(
         "codegraph-fn-ref-py-{}-{}",
         std::process::id(),
@@ -438,14 +438,100 @@ fn callback_function_ref_python_bare_function_value() {
         .collect();
     assert_eq!(
         fn_refs.len(),
-        1,
-        "expected 1 Python fnRef edge (setup->worker), got: {resolved:#?}"
+        2,
+        "expected Python fnRef edges setup->worker and wire->on_click, got: {resolved:#?}"
     );
-    let edge = fn_refs[0];
-    assert!(edge.target.starts_with("function:"));
+    assert!(
+        fn_refs
+            .iter()
+            .any(|edge| edge.target.starts_with("function:")),
+        "bare worker must reach a function target"
+    );
+    assert!(
+        fn_refs
+            .iter()
+            .any(|edge| edge.target.starts_with("method:")),
+        "self.on_click must reach the enclosing class method"
+    );
+    for edge in fn_refs {
+        assert_eq!(
+            edge.metadata.as_ref().expect("metadata")["resolvedBy"].as_str(),
+            Some("function-ref")
+        );
+    }
+}
+
+#[test]
+fn callback_function_ref_python_receiver_method_value() {
+    // #1820: a receiver-qualified method used as a VALUE must reuse the same
+    // conservative target selection as a direct method call, but create a
+    // `references` edge rather than fabricating an immediate `calls` edge.
+    let dir = fresh_fixture_dir("fn-ref-py-receiver");
+    std::fs::write(
+        dir.join("src/store.py"),
+        "class Base:\n    pass\n\nclass Store(Base):\n    def fetch(self, ids):\n        return ids\n\nclass Decoy:\n    def fetch(self, ids):\n        return []\n",
+    )
+    .expect("write store.py");
+    std::fs::write(
+        dir.join("src/consumer.py"),
+        "from concurrent.futures import ThreadPoolExecutor\nfrom store import Base\n\nclass Consumer:\n    def __init__(self, store: Base):\n        self.store = store\n\n    def direct(self, ids):\n        return self.store.fetch(ids)\n\n    def via_callback(self, ids, pool: ThreadPoolExecutor):\n        return pool.submit(self.store.fetch, ids)\n\n    def ambiguous_receiver(self, ids, pool: ThreadPoolExecutor):\n        return pool.submit(self.client.fetch, ids)\n",
+    )
+    .expect("write consumer.py");
+
+    let resolved = resolve_fixture(
+        "fn-ref-py-receiver",
+        &dir,
+        &["src/store.py", "src/consumer.py"],
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let fetch_targets = resolved
+        .iter()
+        .filter(|edge| {
+            edge.target.starts_with("method:")
+                && edge.kind != codegraph_core::types::EdgeKind::Contains
+        })
+        .collect::<Vec<_>>();
+    let direct = fetch_targets
+        .iter()
+        .find(|edge| edge.kind == codegraph_core::types::EdgeKind::Calls)
+        .expect("direct call must continue to resolve");
+    let callback = fetch_targets
+        .iter()
+        .find(|edge| {
+            edge.kind == codegraph_core::types::EdgeKind::References
+                && edge
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("fnRef"))
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+        })
+        .expect("receiver-qualified callback must resolve as a function reference");
+
     assert_eq!(
-        edge.metadata.as_ref().expect("metadata")["resolvedBy"].as_str(),
+        callback.target, direct.target,
+        "callback and direct-call resolution must select the same concrete method"
+    );
+    assert_eq!(
+        callback.metadata.as_ref().expect("metadata")["resolvedBy"].as_str(),
         Some("function-ref")
+    );
+    assert!(
+        !resolved.iter().any(|edge| {
+            edge.source == callback.source
+                && edge.target == callback.target
+                && edge.kind == codegraph_core::types::EdgeKind::Calls
+        }),
+        "passing a method value must not claim it was immediately called"
+    );
+    assert_eq!(
+        fetch_targets
+            .iter()
+            .filter(|edge| edge.kind == codegraph_core::types::EdgeKind::References)
+            .count(),
+        1,
+        "the unrelated `client.fetch` receiver is ambiguous and must remain unlinked"
     );
 }
 
@@ -769,4 +855,316 @@ fn mybatis_qualified_refid_resolves_across_namespaces_and_rejects_the_decoy() {
         None,
         "a refid naming a namespace that does not exist must emit NO edge rather than binding an arbitrary same-named fragment; edges={resolved:#?}"
     );
+}
+
+#[test]
+fn python_quoted_annotation_resolves_receiver_type() {
+    // #1684: a quoted forward-reference annotation is the same receiver type as
+    // its unquoted form. Keep both quote styles, an unquoted control, and a
+    // missing-type negative beside same-named method/function decoys.
+    let dir = fresh_fixture_dir("python-quoted-annotation");
+    std::fs::write(
+        dir.join("src/types.py"),
+        concat!(
+            "def render(value):\n    return value\n\n",
+            "class Alpha:\n    def render(self):\n        return 'alpha'\n\n",
+            "class Beta:\n    def render(self):\n        return 'beta'\n",
+        ),
+    )
+    .expect("write Python types");
+    std::fs::write(
+        dir.join("src/app.py"),
+        concat!(
+            "from __future__ import annotations\n",
+            "from src.types import Alpha, Beta\n\n",
+            "def quoted(value: \"Alpha\"):\n    return value.render()\n\n",
+            "def single_quoted(value: 'Beta'):\n    return value.render()\n\n",
+            "def unquoted(value: Alpha):\n    return value.render()\n\n",
+            "def missing(value: \"Missing\"):\n    return value.render()\n",
+        ),
+    )
+    .expect("write Python callers");
+
+    let types = codegraph_extract::extract_file(&dir, "src/types.py").expect("extract types");
+    let callers = codegraph_extract::extract_file(&dir, "src/app.py").expect("extract callers");
+    let id = |result: &codegraph_core::types::ExtractionResult, kind: NodeKind, qualified: &str| {
+        result
+            .nodes
+            .iter()
+            .find(|node| node.kind == kind && node.qualified_name == qualified)
+            .unwrap_or_else(|| panic!("missing {kind:?} {qualified}; nodes={:#?}", result.nodes))
+            .id
+            .clone()
+    };
+    let alpha_render = id(&types, NodeKind::Method, "Alpha::render");
+    let beta_render = id(&types, NodeKind::Method, "Beta::render");
+    let quoted = id(&callers, NodeKind::Function, "quoted");
+    let single_quoted = id(&callers, NodeKind::Function, "single_quoted");
+    let unquoted = id(&callers, NodeKind::Function, "unquoted");
+    let missing = id(&callers, NodeKind::Function, "missing");
+
+    let resolved = resolve_fixture(
+        "python-quoted-annotation",
+        &dir,
+        &["src/types.py", "src/app.py"],
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let call_target = |source: &str| {
+        resolved
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::Calls && edge.source == source)
+            .map(|edge| edge.target.as_str())
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(call_target(&quoted), vec![alpha_render.as_str()]);
+    assert_eq!(call_target(&single_quoted), vec![beta_render.as_str()]);
+    assert_eq!(call_target(&unquoted), vec![alpha_render.as_str()]);
+    assert!(
+        call_target(&missing).is_empty(),
+        "an unavailable quoted type must not donate a same-named method/function; edges={resolved:#?}"
+    );
+}
+
+#[test]
+fn php_import_alias_owns_static_call_without_stealing_variable_receiver() {
+    // #1545: the namespace named by `use ... as Alias` owns a static call,
+    // including a missing member. A `$Alias->method()` on the same source line
+    // remains a variable receiver and must continue through local type inference.
+    let dir = fresh_fixture_dir("php-import-alias-static");
+    std::fs::write(
+        dir.join("src/Services.php"),
+        r#"<?php
+namespace App\Services;
+class SettleService {
+    public static function getSettlesToExcel() {}
+}
+
+class OtherService {
+    public function getSettlesToExcel() {}
+}
+"#,
+    )
+    .expect("write PHP services");
+    std::fs::write(
+        dir.join("src/Repository.php"),
+        r#"<?php
+namespace App\Repositories;
+class SettleRepository {
+    public static function getSettlesToExcel() {}
+    public static function missing() {}
+}
+"#,
+    )
+    .expect("write PHP decoy");
+    std::fs::write(
+        dir.join("src/Controller.php"),
+        r#"<?php
+namespace App\Http;
+use App\Services\SettleService as Settle;
+use App\Services\OtherService;
+class Controller {
+    public function excel() {
+        $Settle = new OtherService();
+        $Settle->getSettlesToExcel();
+        Settle::getSettlesToExcel();
+    }
+    public function unavailable() {
+        Settle::missing();
+    }
+}
+"#,
+    )
+    .expect("write PHP controller");
+
+    let services =
+        codegraph_extract::extract_file(&dir, "src/Services.php").expect("extract PHP services");
+    let repository = codegraph_extract::extract_file(&dir, "src/Repository.php")
+        .expect("extract PHP repository");
+    let controller = codegraph_extract::extract_file(&dir, "src/Controller.php")
+        .expect("extract PHP controller");
+    let id = |result: &codegraph_core::types::ExtractionResult, kind: NodeKind, qualified: &str| {
+        result
+            .nodes
+            .iter()
+            .find(|node| node.kind == kind && node.qualified_name == qualified)
+            .unwrap_or_else(|| panic!("missing {kind:?} {qualified}; nodes={:#?}", result.nodes))
+            .id
+            .clone()
+    };
+    let service_method = id(
+        &services,
+        NodeKind::Method,
+        "App\\Services::SettleService::getSettlesToExcel",
+    );
+    let variable_method = id(
+        &services,
+        NodeKind::Method,
+        "App\\Services::OtherService::getSettlesToExcel",
+    );
+    let repository_method = id(
+        &repository,
+        NodeKind::Method,
+        "App\\Repositories::SettleRepository::getSettlesToExcel",
+    );
+    let repository_missing = id(
+        &repository,
+        NodeKind::Method,
+        "App\\Repositories::SettleRepository::missing",
+    );
+    let excel = id(
+        &controller,
+        NodeKind::Method,
+        "App\\Http::Controller::excel",
+    );
+    let unavailable = id(
+        &controller,
+        NodeKind::Method,
+        "App\\Http::Controller::unavailable",
+    );
+
+    let resolved = resolve_fixture(
+        "php-import-alias-static",
+        &dir,
+        &[
+            "src/Services.php",
+            "src/Repository.php",
+            "src/Controller.php",
+        ],
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let targets = |source: &str| {
+        resolved
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::Calls && edge.source == source)
+            .map(|edge| edge.target.as_str())
+            .collect::<BTreeSet<_>>()
+    };
+
+    assert_eq!(
+        targets(&excel),
+        BTreeSet::from([service_method.as_str(), variable_method.as_str()]),
+        "the static alias and same-spelled variable must resolve in separate namespaces; edges={resolved:#?}"
+    );
+    assert!(!targets(&excel).contains(repository_method.as_str()));
+    assert!(
+        targets(&unavailable).is_empty(),
+        "a missing member on the imported class must not fall back to the decoy; edges={resolved:#?}"
+    );
+    assert!(!targets(&unavailable).contains(repository_missing.as_str()));
+}
+#[test]
+fn rust_self_call_resolves_across_split_and_trait_impls_without_global_fallback() {
+    // #1861/PR #1866: `self.method()` carries an exact receiver. The owner is
+    // the enclosing method's qualified-name prefix, not the nearest or unique
+    // same-named method elsewhere in the project. Split inherent impls and
+    // trait impls are both ordinary Rust ownership shapes.
+    let dir = fresh_fixture_dir("rust-self-call-owner");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        r#"pub struct Target;
+impl Target {
+    pub fn reset(&mut self) {}
+}
+
+pub struct Decoy;
+impl Decoy {
+    pub fn reset(&mut self) {}
+    pub fn missing(&mut self) {}
+}
+
+impl Target {
+    pub fn run(&mut self) {
+        self.reset();
+        self.missing();
+    }
+}
+
+pub trait Run {
+    fn go(&mut self);
+}
+
+pub struct StepDecoy;
+impl StepDecoy {
+    pub fn step(&mut self) {}
+}
+
+pub struct Doer;
+impl Doer {
+    pub fn step(&mut self) {}
+}
+
+impl Run for Doer {
+    fn go(&mut self) {
+        self.step();
+    }
+}
+"#,
+    )
+    .expect("write Rust self-call fixture");
+
+    let extracted = extract_file(&dir, "src/lib.rs").expect("extract Rust fixture");
+    let id = |qualified: &str| {
+        extracted
+            .nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::Method && node.qualified_name == qualified)
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing Rust method {qualified}; nodes={:#?}",
+                    extracted.nodes
+                )
+            })
+            .id
+            .clone()
+    };
+    let target_reset = id("Target::reset");
+    let target_run = id("Target::run");
+    let decoy_missing = id("Decoy::missing");
+    let doer_step = id("Doer::step");
+    let doer_go = id("Doer::go");
+
+    let refs = extracted
+        .unresolved_references
+        .iter()
+        .filter(|reference| reference.reference_kind == EdgeKind::Calls)
+        .map(|reference| {
+            (
+                reference.from_node_id.as_str(),
+                reference.reference_name.as_str(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    assert!(
+        refs.contains(&(target_run.as_str(), "self.reset")),
+        "refs={refs:#?}"
+    );
+    assert!(
+        refs.contains(&(target_run.as_str(), "self.missing")),
+        "refs={refs:#?}"
+    );
+    assert!(
+        refs.contains(&(doer_go.as_str(), "self.step")),
+        "refs={refs:#?}"
+    );
+
+    let resolved = resolve_fixture("rust-self-call-owner", &dir, &["src/lib.rs"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let targets = |source: &str| {
+        resolved
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::Calls && edge.source == source)
+            .map(|edge| edge.target.as_str())
+            .collect::<BTreeSet<_>>()
+    };
+
+    assert_eq!(
+        targets(&target_run),
+        BTreeSet::from([target_reset.as_str()])
+    );
+    assert!(
+        !targets(&target_run).contains(decoy_missing.as_str()),
+        "an absent owner method must never fall back to another type; edges={resolved:#?}"
+    );
+    assert_eq!(targets(&doer_go), BTreeSet::from([doer_step.as_str()]));
 }

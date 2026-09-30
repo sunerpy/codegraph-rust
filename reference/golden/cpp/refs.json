@@ -28,5 +28,15 @@
     "line": 3,
     "reference_kind": "extends",
     "reference_name": "UObject"
+  },
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "designated_macro.c",
+    "from_node_id": "function:e5656cf0c49caffad1139fecf1e2a293",
+    "language": "c",
+    "line": 3,
+    "reference_kind": "calls",
+    "reference_name": "RESET_CONFIG"
   }
 ]

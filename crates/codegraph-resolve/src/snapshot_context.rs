@@ -30,6 +30,8 @@
 use crate::context::{DEFAULT_CACHE_LIMIT, order_candidates};
 use crate::import_resolver;
 use crate::path_aliases::{AliasMap, load_project_aliases};
+use crate::pathutil;
+use crate::source_facts::SourceFacts;
 use crate::types::{GoModule, ImportMapping, ReExport, ResolutionContext};
 use crate::workspace_packages::{WorkspacePackages, load_workspace_packages};
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
@@ -159,6 +161,7 @@ where
 #[derive(Default)]
 struct SnapshotCacheCounters {
     file_loads: AtomicUsize,
+    source_facts_builds: AtomicUsize,
     import_parses: AtomicUsize,
     re_export_parses: AtomicUsize,
 }
@@ -166,6 +169,9 @@ struct SnapshotCacheCounters {
 /// Whole-run file-derived caches shared by every per-chunk context clone.
 struct SnapshotCaches {
     file_contents: BoundedFileMemo<Option<Arc<str>>>,
+    /// Derived source views and memoised per-file gate decisions. Shares the
+    /// content budget: a fact set retains its file's text.
+    source_facts: BoundedFileMemo<Option<Arc<SourceFacts>>>,
     import_mappings: BoundedFileMemo<Arc<Vec<ImportMapping>>>,
     re_exports: BoundedFileMemo<Arc<Vec<ReExport>>>,
     #[cfg(test)]
@@ -179,6 +185,7 @@ impl SnapshotCaches {
         let content_limit = std::cmp::max(64, DEFAULT_CACHE_LIMIT / 5);
         Self {
             file_contents: BoundedFileMemo::new(content_limit),
+            source_facts: BoundedFileMemo::new(content_limit),
             import_mappings: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
             re_exports: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
             #[cfg(test)]
@@ -200,6 +207,8 @@ struct NodeSnapshot {
     by_kind: HashMap<NodeKind, Vec<Arc<Node>>>,
     by_file_path: HashMap<String, Vec<Arc<Node>>>,
     by_id: HashMap<String, Arc<Node>>,
+    /// Files holding at least one exported node (`fileHasExportedNode`).
+    files_with_exported_nodes: HashSet<String>,
     known_node_names: Vec<String>,
     known_file_paths: HashSet<String>,
     all_file_paths: Arc<Vec<String>>,
@@ -300,6 +309,12 @@ impl SnapshotResolutionContext {
             by_kind.insert(kind, entries);
         }
 
+        let files_with_exported_nodes: HashSet<String> = by_id
+            .values()
+            .filter(|node| node.is_exported)
+            .map(|node| node.file_path.clone())
+            .collect();
+
         let known_node_names = store.all_node_names().unwrap_or_default();
 
         let known_file_paths: HashSet<String> = store
@@ -341,6 +356,7 @@ impl SnapshotResolutionContext {
                 by_kind,
                 by_file_path,
                 by_id,
+                files_with_exported_nodes,
                 known_node_names,
                 known_file_paths,
                 all_file_paths,
@@ -469,9 +485,8 @@ impl ResolutionContext for SnapshotResolutionContext {
         if normalized != file_path && self.snapshot.known_file_paths.contains(&normalized) {
             return true;
         }
-        Path::new(&self.snapshot.project_root)
-            .join(file_path)
-            .exists()
+        pathutil::lexical_path_within_root(&self.snapshot.project_root, file_path)
+            .is_some_and(|full_path| full_path.exists())
     }
 
     fn read_file(&self, file_path: &str) -> Option<String> {
@@ -482,6 +497,26 @@ impl ResolutionContext for SnapshotResolutionContext {
 
     fn is_file_readable(&self, file_path: &str) -> bool {
         self.read_file_cached(file_path).is_some()
+    }
+
+    fn read_file_shared(&self, file_path: &str) -> Option<Arc<str>> {
+        self.read_file_cached(file_path)
+    }
+
+    fn source_facts(&self, file_path: &str) -> Option<Arc<SourceFacts>> {
+        self.caches.source_facts.get_or_init(file_path, || {
+            #[cfg(test)]
+            self.caches
+                .counters
+                .source_facts_builds
+                .fetch_add(1, Ordering::Relaxed);
+            self.read_file_cached(file_path)
+                .map(|source| Arc::new(SourceFacts::new(source)))
+        })
+    }
+
+    fn file_has_exported_node(&self, file_path: &str) -> bool {
+        self.snapshot.files_with_exported_nodes.contains(file_path)
     }
 
     fn get_project_root(&self) -> &str {
@@ -544,7 +579,11 @@ impl ResolutionContext for SnapshotResolutionContext {
         let type_nodes = self
             .get_nodes_by_name_shared(type_name)
             .into_iter()
-            .filter(|n| SUPERTYPE_BEARING.contains(&n.kind) && n.language == language)
+            .filter(|n| {
+                n.language == language
+                    // A Scala singleton inherits members though it can never be a parent.
+                    && (SUPERTYPE_BEARING.contains(&n.kind) || crate::types::is_scala_singleton(n))
+            })
             .collect::<Vec<_>>();
         if type_nodes.is_empty() {
             return Vec::new();
@@ -762,14 +801,28 @@ mod tests {
     #[test]
     fn file_exists_uses_known_set_and_fs() {
         let root = temp_root("exists");
+        let outside = root.parent().unwrap().join(format!(
+            "outside-{}",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.ts"), "x").unwrap();
         let store = populated_store(&root);
         std::fs::write(root.join("ondisk.ts"), "x").unwrap();
         let ctx = SnapshotResolutionContext::from_store(&store, root.to_str().unwrap()).unwrap();
         assert!(ctx.file_exists("a.ts"));
         assert!(ctx.file_exists("ondisk.ts"));
         assert!(!ctx.file_exists("nowhere.ts"));
+        assert!(
+            !ctx.file_exists(&format!(
+                "../{}/secret.ts",
+                outside.file_name().unwrap().to_string_lossy()
+            )),
+            "an existing file outside the project must not become an existence oracle"
+        );
         assert!(ctx.get_all_files().contains(&"a.ts".to_string()));
         std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
     }
 
     #[test]
@@ -815,6 +868,35 @@ mod tests {
             ctx.get_re_exports("gone.ts", Language::TypeScript)
                 .is_empty()
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn source_facts_are_shared_once_per_file_across_chunk_clones() {
+        let root = temp_root("facts");
+        let store = Store::open(&root.join("index.db")).unwrap();
+        let source = "const a = 1;\nexport function b() {}\n";
+        std::fs::write(root.join("f.ts"), source).unwrap();
+        let ctx = SnapshotResolutionContext::from_store(&store, root.to_str().unwrap()).unwrap();
+        let cloned = ctx.with_edge_adjacency(Arc::new(HashMap::new()));
+
+        let first = ctx.source_facts("f.ts").expect("readable file has facts");
+        let second = cloned.source_facts("f.ts").expect("shared cache");
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.source(), source);
+        assert_eq!(
+            ctx.caches
+                .counters
+                .source_facts_builds
+                .load(Ordering::Relaxed),
+            1
+        );
+        // The shared buffer is the cached content, not a copy.
+        let shared = ctx.read_file_shared("f.ts").unwrap();
+        assert!(Arc::ptr_eq(&shared, &ctx.read_file_shared("f.ts").unwrap()));
+        assert!(ctx.source_facts("missing.ts").is_none());
+        // No indexed nodes here, so no file reports an exported node.
+        assert!(!ctx.file_has_exported_node("f.ts"));
         std::fs::remove_dir_all(&root).ok();
     }
 

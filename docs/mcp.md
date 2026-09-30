@@ -325,7 +325,13 @@ CODEGRAPH_MCP_TOOLS=explore,node,search,callers,impact,check codegraph serve --m
 Every tool is query-only, so each carries MCP tool **annotations** in
 `tools/list` — `readOnlyHint: true`, `destructiveHint: false`,
 `idempotentHint: true`, `openWorldHint: false`. Hosts that respect these hints
-can call codegraph tools freely without write-confirmation prompts.
+can call codegraph tools freely without write-confirmation prompts. The hint
+describes the caller's environment: a tool never writes a source file or any
+path outside the project's index directory. The first call with an explicit
+`projectPath` may start that project's shared daemon and bring its
+**existing** derived index up to date (see the explicit-project lifecycle
+below); that is cache maintenance inside `.codegraph/`, never the creation of
+an index or a change to user files, so the hint stays `true`.
 
 ---
 
@@ -376,6 +382,25 @@ and `line` can pin an overloaded symbol to one definition. When given a file
 path without a symbol it returns the file's source with line numbers, which is a
 more accurate alternative to a plain `Read` tool call.
 
+File mode also accepts pasted editor/GitHub locations: `src/app.ts:42`,
+`src/app.ts:42-80`, `src/app.ts#L42`, and `src/app.ts#L42-L80` (the final `L` is
+optional). Resolution tries the literal indexed filename first; only a literal
+miss may strip a valid positive selector. A single line supplies the default
+`offset`; a closed range supplies the default inclusive `limit`. Explicit MCP
+`offset` and `limit` fields override the suffix independently, so
+`{"file":"src/app.ts:42-80","offset":5,"limit":2}` reads lines 5–6. Invalid,
+zero, reversed, overflowing, and ambiguous Windows-drive spellings stay literal.
+
+**`codegraph_callers`**, **`codegraph_callees`**, and **`codegraph_impact`** do
+not silently merge unrelated same-named definitions. Results are grouped by
+`(filePath, qualifiedName)`; same-definition overloads stay together, while two
+apps that each define `handle` get separate sections/blast radii. Pass `file`
+with an exact project-relative path or suffix to select one definition. A
+non-matching filter is disclosed and falls back to all definitions instead of
+returning a misleading empty result. Caller/callee limits apply per definition;
+when a cap hides rows, the response reports `Showing N of M` and tells the host
+to widen `limit` (up to 100).
+
 **`codegraph_impact`** returns the transitive incoming dependency set — every
 symbol that would break if the queried symbol changed. Use it before a refactor
 to understand the blast radius instead of walking callers manually.
@@ -383,6 +408,12 @@ to understand the blast radius instead of walking callers manually.
 **`codegraph_check`** returns cycles as ordered lists of file paths. It's
 additive: most projects have zero cycles; run it after a large dependency
 restructuring to confirm no new cycles were introduced.
+
+**`codegraph_status`** appends a `Pending sync` section when the current source
+scope differs from the persisted file inventory. It sees committed-but-unindexed
+work as well as working-tree and non-Git changes, applies the same project scope
+and content-hash gates as whole-tree sync, and lists each added/modified/removed
+path. The check is read-only and holds the engine's existing shared index lease.
 
 **`codegraph_export`** dumps the complete graph as NetworkX node-link JSON.
 Useful for external visualization tools, custom analysis scripts, or feeding an
@@ -424,6 +455,16 @@ Ranking-only `deprioritize` rules are loaded separately from watcher scope.
 Each request-scoped engine loads the addressed project's JSON rules followed by
 its authoritative TOML rules, so a long-lived stdio or HTTP process observes
 edits on its next search/explore request without changing the graph.
+
+Exactly one process owns background writes for each indexed project. Besides the
+short-lived `index.lock` leases taken by individual mutations, the daemon holds an
+OS kernel exclusive lock on `.codegraph/writer.pid` for its whole watcher/catch-up
+lifetime. The file's JSON is diagnostic; process death releases the kernel lock
+without trusting PID reuse or deleting/recreating the authority path. On a cold
+daemon start, the foreground stdio process answers the first handshake directly
+but starts no second watcher. When `CODEGRAPH_NO_DAEMON=1` is used, the foreground
+process owns this writer lock; a second direct server for the same project exits
+with actionable guidance. Read-only/no-default sessions take no writer lock.
 When the resolved root is exactly `$HOME` or the filesystem root (`/`), the
 server first disables the daemon, the file watcher, AND catch-up sync — not just
 the watcher. This happens when an IDE or agent (e.g. Kiro) launches
@@ -450,8 +491,25 @@ most 64 indexed candidates, skips dot/heavy/build/vendor/venv/cache/temp
 directories, and stops below an indexed child. Exactly one candidate is adopted
 and gets the full daemon/watcher/catch-up lifecycle. Zero or multiple candidates
 are never guessed. This scan is forbidden at `$HOME` and filesystem roots.
-Streamable HTTP global/no-path mode remains request-scoped and does not adopt a
-cwd child.
+
+Multiple indexed children do not need duplicate MCP registrations. On the first
+tool call that supplies an explicit `projectPath`, CodeGraph starts or attaches
+that **existing** project's shared daemon, retains one connection for the MCP
+session, and waits for a whole-project catch-up before executing the tool. Later
+saves are handled by that daemon's single watcher. A second MCP session reuses
+the same daemon; closing either session drops only its retained connection, so
+the other keeps live sync active. Each session retains at most 32 explicit
+projects. A retained service is re-checked on every call: if its daemon has
+exited, or the project's index was removed or re-created since the service
+attached, the stale connection is released and the next call attaches and
+catches up again instead of answering without live synchronization. This never
+creates an index, selects a default, or eagerly watches all discovered
+children. `CODEGRAPH_NO_DAEMON=1` explicitly opts out of this lazy daemon-backed
+lifecycle; `--no-watch` still permits the first catch-up but disables later
+file watching. Streamable HTTP global/no-path mode does not adopt a cwd child;
+because HTTP requests carry no session, one explicit-project service broker is
+shared by the whole server process, so the 32-project bound and the retained
+connections last until the server exits.
 
 ---
 
@@ -503,10 +561,17 @@ probe runs again on relevant requests, while the downward scan is throttled to
 once per five seconds so a project initialized after server startup can be
 adopted without walking the workspace on every call.
 
+For an explicit path that **does** resolve to an existing index, the first call
+is also the live-service boundary: it waits for catch-up and retains that
+project's shared daemon/watcher as described above. Query routing therefore does
+not imply default selection, while synchronization no longer depends on having a
+default project.
+
 > **Note:** the home-directory / filesystem-root guard (see [Daemon & live watch]
-> above) also skips the normal watcher and catch-up sync for those paths. A real
-> project nested under `$HOME` (e.g. `~/projects/myapp`) is unaffected — it is
-> resolved via find-up and gets the full daemon and watcher.
+> above) also skips the normal watcher and catch-up sync **against those broad
+> roots**. A real indexed project nested under `$HOME` (e.g.
+> `~/projects/myapp`) is unaffected: find-up/default adoption or an explicit
+> `projectPath` gives that project its own daemon and watcher.
 
 The daemon exits automatically after all clients disconnect and an idle timeout
 elapses. Logs are appended to `.codegraph/daemon.log`. A stale lock (e.g. after
@@ -521,8 +586,10 @@ for this check because a deliberately daemonized process legitimately reparents
 to `init`.
 
 To disable the daemon entirely and run the MCP server in the foreground, set
-`CODEGRAPH_NO_DAEMON=1`. For the full set of env-var knobs — timeouts, sweep
-intervals, watch settings — see [`docs/cli.md`](cli.md).
+`CODEGRAPH_NO_DAEMON=1`. Run only one such writer per indexed project; additional
+clients should leave daemon mode enabled and proxy to the shared process. For the
+full set of env-var knobs — timeouts, sweep intervals, watch settings — see
+[`docs/cli.md`](cli.md).
 
 ---
 
@@ -543,7 +610,8 @@ inject context but _how much_:
   Latin, Cyrillic, Greek, CJK, Hangul, Arabic, Hebrew, Thai, and Devanagari
   scripts), OR a code-shaped token (`getUserId`, `get_user`, `Counter()`,
   `user.login`) that is verified as a real symbol in the index, runs
-  `codegraph_explore` and injects its full output (capped at 16000 bytes).
+  `codegraph_explore` and injects its full output (capped at 9,000 UTF-8 bytes,
+  leaving wrapper headroom under Claude Code's 10,000-byte inline limit).
 - **Plain words matching indexed symbols → short hint.** When the prompt has no
   structural keyword or verified token but its prose words match indexed
   symbol-name segments (e.g. `checkout state machine` → `CheckoutStateMachine`),
@@ -560,6 +628,9 @@ telemetry or tracking of any kind**. Set `CODEGRAPH_NO_PROMPT_HOOK=1` (or
 `CODEGRAPH_PROMPT_HOOK=0`) to disable the hook without editing the config. Every
 failure path — kill-switch, non-matching prompt, no index, engine error — exits 0
 with no output; the hook is degradable by contract and never breaks the prompt.
+Host-generated task completions are also discarded before classification when
+their first non-whitespace content is `<task-notification>`; the same text later
+inside a real user discussion does not match that anchored gate.
 
 ---
 

@@ -2,7 +2,8 @@
 //!
 //! Writes the MCP entry as the dotted-key table `[mcp_servers.codegraph]` and
 //! installs the managed instructions block:
-//! - global: `~/.codex/config.toml` + `~/.codex/AGENTS.md`
+//! - global: `$CODEX_HOME/config.toml` + `$CODEX_HOME/AGENTS.md`, falling back
+//!   to `~/.codex` when the override is absent
 //! - local: `<project>/.codex/config.toml` + `<project>/AGENTS.md`
 
 use std::fs;
@@ -24,7 +25,17 @@ const TOML_HEADER: &str = "mcp_servers.codegraph";
 
 fn config_dir(ctx: &InstallContext, loc: Location) -> PathBuf {
     match loc {
-        Location::Global => ctx.home.join(".codex"),
+        Location::Global => ctx
+            .codex_home
+            .as_ref()
+            .map(|path| {
+                if path.is_absolute() {
+                    path.clone()
+                } else {
+                    ctx.cwd.join(path)
+                }
+            })
+            .unwrap_or_else(|| ctx.home.join(".codex")),
         Location::Local => ctx.cwd.join(".codex"),
     }
 }
@@ -219,6 +230,8 @@ mod tests {
             app_data: None,
             xdg_config_home: None,
             hermes_home: None,
+            claude_config_dir: None,
+            codex_home: None,
         }
     }
 
@@ -267,6 +280,8 @@ mod tests {
                 app_data: None,
                 xdg_config_home: None,
                 hermes_home: None,
+                claude_config_dir: None,
+                codex_home: None,
             };
             Self { base, ctx }
         }
@@ -506,5 +521,46 @@ mod tests {
         let out = target.print_config(&fx.ctx, Location::Global);
         assert!(out.contains("[mcp_servers.codegraph]"));
         assert!(out.contains("config.toml"));
+    }
+
+    #[test]
+    fn global_codex_home_override_moves_user_layer_and_round_trips() {
+        let fx = TempCodex::new("profile-override");
+        let mut ctx = fx.ctx.clone();
+        ctx.codex_home = Some(PathBuf::from("profiles/codex custom"));
+        let profile = ctx.cwd.join("profiles/codex custom");
+        let target = CodexTarget;
+
+        target.install(&ctx, Location::Global, opts());
+        assert!(profile.join("config.toml").is_file());
+        assert!(profile.join("AGENTS.md").is_file());
+        assert!(target.detect(&ctx, Location::Global).already_configured);
+        assert!(
+            target
+                .print_config(&ctx, Location::Global)
+                .contains(&profile.join("config.toml").display().to_string())
+        );
+        assert!(!ctx.home.join(".codex").exists());
+
+        target.uninstall(&ctx, Location::Global);
+        assert!(!target.detect(&ctx, Location::Global).already_configured);
+    }
+
+    #[test]
+    fn codex_home_override_never_moves_the_project_layer() {
+        let fx = TempCodex::new("profile-local");
+        let mut ctx = fx.ctx.clone();
+        ctx.codex_home = Some(fx.base.join("custom-profile"));
+        let target = CodexTarget;
+        target.install(&ctx, Location::Local, opts());
+        assert_eq!(
+            toml_config_path(&ctx, Location::Local),
+            ctx.cwd.join(".codex/config.toml")
+        );
+        assert_eq!(
+            instructions_path(&ctx, Location::Local),
+            ctx.cwd.join("AGENTS.md")
+        );
+        assert!(!fx.base.join("custom-profile").exists());
     }
 }

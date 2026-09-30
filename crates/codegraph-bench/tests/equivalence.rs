@@ -202,6 +202,43 @@ fn kotlin_db_is_self_equivalent_to_kotlin_golden() {
 }
 
 #[test]
+fn generated_golden_matches_committed_scala_fixture() {
+    // Guards Scala grammar 0.26.2's multi-parameter-list inheritance shape,
+    // every `extends`/`with` parent, companion object -> Module classification,
+    // inheritance preference for the real type, and eta-expansion method values.
+    let tempdir = TestDir::new("generated-golden-scala");
+    write_golden(&scala_db(), tempdir.path()).unwrap();
+
+    let expected = load_golden(&scala_golden_dir()).unwrap();
+    let actual = load_golden(tempdir.path()).unwrap();
+
+    diff_canonical(&expected, &actual, None).unwrap();
+}
+
+#[test]
+fn scala_db_is_self_equivalent_to_scala_golden() {
+    assert_equivalent(&scala_db(), &scala_golden_dir()).unwrap();
+}
+
+#[test]
+fn generated_golden_matches_committed_dart_fixture() {
+    // Guards Dart 3 `extension type`: the type is class-like and owns getter /
+    // method nodes rather than leaving top-level functions or dropping members.
+    let tempdir = TestDir::new("generated-golden-dart");
+    write_golden(&dart_db(), tempdir.path()).unwrap();
+
+    let expected = load_golden(&dart_golden_dir()).unwrap();
+    let actual = load_golden(tempdir.path()).unwrap();
+
+    diff_canonical(&expected, &actual, None).unwrap();
+}
+
+#[test]
+fn dart_db_is_self_equivalent_to_dart_golden() {
+    assert_equivalent(&dart_db(), &dart_golden_dir()).unwrap();
+}
+
+#[test]
 fn generated_golden_matches_committed_typescript_fixture() {
     let tempdir = TestDir::new("generated-golden-typescript");
     write_golden(&typescript_db(), tempdir.path()).unwrap();
@@ -509,6 +546,22 @@ fn kotlin_db() -> PathBuf {
 
 fn kotlin_golden_dir() -> PathBuf {
     workspace_root().join("reference/golden/kotlin")
+}
+
+fn scala_db() -> PathBuf {
+    workspace_root().join("reference/golden/scala/colby.db")
+}
+
+fn scala_golden_dir() -> PathBuf {
+    workspace_root().join("reference/golden/scala")
+}
+
+fn dart_db() -> PathBuf {
+    workspace_root().join("reference/golden/dart/colby.db")
+}
+
+fn dart_golden_dir() -> PathBuf {
+    workspace_root().join("reference/golden/dart")
 }
 
 fn typescript_db() -> PathBuf {

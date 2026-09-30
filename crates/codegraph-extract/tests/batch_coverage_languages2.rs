@@ -403,7 +403,7 @@ object Helper {
 "#;
     let result = extract_source("src/helper.scala", source, Some(Language::Scala));
     assert!(result.errors.is_empty(), "{:?}", result.errors);
-    assert_node(&result.nodes, NodeKind::Class, "Helper");
+    assert_node(&result.nodes, NodeKind::Module, "Helper");
 
     // qualified return pkg.sub.Widget -> last segment "Widget".
     let make = assert_node(&result.nodes, NodeKind::Method, "make");

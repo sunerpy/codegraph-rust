@@ -1,9 +1,9 @@
 //! A mutating command must not silently retarget an ANCESTOR index (#1524).
 //!
-//! `index .` inside `parent/child`, with only `parent/` indexed, walks up and
-//! rebuilds the PARENT — reporting a file count that includes the parent's own
-//! files while creating no child index, and printing nothing about it. Upstream's
-//! thread widens the diagnostic to `sync` / `uninit` / `unlock`.
+//! An explicit `index .` inside `parent/child`, with only `parent/` indexed,
+//! must refuse to rebuild the parent. A bare `index` retains upward discovery,
+//! while `sync` / `uninit` / `unlock` also retain their documented ancestor
+//! behavior; those accepted retargets must name both paths on stderr.
 //!
 //! Each test drives the REAL binary, because the defect is in the CLI's project
 //! resolution, and asserts on STDERR: a mutating command's stdout is parsed by
@@ -98,13 +98,54 @@ fn assert_retarget_warning(stderr: &str, parent: &Path, child: &Path) {
 }
 
 #[test]
-fn index_in_an_unindexed_child_warns_that_the_parent_is_the_target() {
+fn index_with_an_explicit_unindexed_child_refuses_to_retarget_the_parent() {
     let dir = TestDir::new("index");
     let (parent, child) = parent_indexed_child_not(&dir);
+    let parent_db = parent.join(".codegraph/codegraph.db");
+    let parent_mtime_before = fs::metadata(&parent_db).unwrap().modified().unwrap();
     let (stdout, stderr, ok) = cli_in(&child, &["index", "."]);
     assert!(
+        !ok,
+        "explicit index must refuse ancestor retargeting: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("not initialized in {}", child.display())),
+        "the error must name the requested directory: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "nearest initialized project is {}",
+            parent.display()
+        )),
+        "the error must name the ancestor without operating on it: {stderr}"
+    );
+    assert!(
+        stderr.contains("codegraph init"),
+        "the error must explain how to create a child-local index: {stderr}"
+    );
+    assert!(
+        parent_db.is_file(),
+        "the refused command must leave the parent index intact"
+    );
+    assert_eq!(
+        fs::metadata(&parent_db).unwrap().modified().unwrap(),
+        parent_mtime_before,
+        "the refused command must not rewrite the parent database"
+    );
+    assert!(
+        !child.join(".codegraph").exists(),
+        "the refused command must not initialize the child implicitly"
+    );
+}
+
+#[test]
+fn bare_index_in_an_unindexed_child_still_resolves_to_the_parent() {
+    let dir = TestDir::new("index-bare");
+    let (parent, child) = parent_indexed_child_not(&dir);
+    let (stdout, stderr, ok) = cli_in(&child, &["index"]);
+    assert!(
         ok,
-        "index must still succeed: stdout={stdout} stderr={stderr}"
+        "bare index must still succeed: stdout={stdout} stderr={stderr}"
     );
     assert_retarget_warning(&stderr, &parent, &child);
 }
@@ -170,7 +211,7 @@ fn the_retarget_warning_never_reaches_stdout() {
     // warning printed there would corrupt any script parsing the output.
     let dir = TestDir::new("purity");
     let (_parent, child) = parent_indexed_child_not(&dir);
-    let (stdout, stderr, ok) = cli_in(&child, &["index", "."]);
+    let (stdout, stderr, ok) = cli_in(&child, &["index"]);
     assert!(ok, "index failed: stderr={stderr}");
     assert!(
         !stdout.contains("resolved to an ancestor"),

@@ -291,3 +291,48 @@ fn node_file_returns_numbered_source() {
         run.stdout
     );
 }
+
+#[test]
+fn node_file_accepts_pasted_line_and_range_selectors() {
+    let dir = TestDir::new("node-file-ranges");
+    let project = indexed_project(&dir);
+    let p = project.to_str().unwrap();
+
+    // Full paths exercise file mode directly; basenames also prove the CLI does
+    // not misroute a line-suffixed indexed file to symbol lookup.
+    for target in [
+        "src/math.ts:5-6",
+        "math.ts:5-6",
+        "src/math.ts#L5-L6",
+        "math.ts#L5-6",
+    ] {
+        let run = run_in(dir.path(), &["node", target, "-p", p]);
+        assert!(run.ok, "node {target} must succeed: {}", run.stderr);
+        assert!(
+            run.stdout.contains("5\texport class Counter {")
+                && run.stdout.contains("6\t  private value = 0;"),
+            "node {target} must render the inclusive requested range: {}",
+            run.stdout
+        );
+        assert!(
+            !run.stdout.contains("4\t") && !run.stdout.contains("7\t"),
+            "node {target} must not leak adjacent lines: {}",
+            run.stdout
+        );
+    }
+
+    let pointer = run_in(dir.path(), &["node", "math.ts:8", "-p", p]);
+    assert!(
+        pointer.ok,
+        "single-line pointer must succeed: {}",
+        pointer.stderr
+    );
+    assert!(
+        pointer
+            .stdout
+            .contains("8\t  increment(step: number = 1): number {")
+            && !pointer.stdout.contains("7\t"),
+        "a single-line suffix must start the read at that line: {}",
+        pointer.stdout
+    );
+}

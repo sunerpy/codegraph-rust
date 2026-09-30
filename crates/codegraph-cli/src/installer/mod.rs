@@ -34,12 +34,19 @@ fn context_from_env() -> Result<InstallContext> {
         .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("could not resolve home directory (HOME/USERPROFILE)"))?;
     let cwd = std::env::current_dir()?;
+    let non_blank_path = |name: &str| {
+        std::env::var_os(name)
+            .filter(|value| !value.to_string_lossy().trim().is_empty())
+            .map(PathBuf::from)
+    };
     Ok(InstallContext {
         home,
         cwd,
         app_data: std::env::var_os("APPDATA").map(PathBuf::from),
         xdg_config_home: std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
         hermes_home: std::env::var_os("HERMES_HOME").map(PathBuf::from),
+        claude_config_dir: non_blank_path("CLAUDE_CONFIG_DIR"),
+        codex_home: non_blank_path("CODEX_HOME"),
     })
 }
 
@@ -747,6 +754,8 @@ mod tests {
             app_data: None,
             xdg_config_home: Some(base.join("xdg")),
             hermes_home: Some(base.join("hermes")),
+            claude_config_dir: None,
+            codex_home: None,
         };
         (ctx, base)
     }

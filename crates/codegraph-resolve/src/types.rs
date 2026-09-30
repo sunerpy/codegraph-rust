@@ -6,6 +6,7 @@
 //! [`codegraph_core::types::UnresolvedRef`] row read from the store. We model it
 //! here as [`RefView`] so the two never get confused.
 
+use crate::source_facts::SourceFacts;
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind, ReferenceSubkind};
 use std::sync::Arc;
 
@@ -104,6 +105,22 @@ pub fn is_inheritance_ref(kind: EdgeKind) -> bool {
 /// The two gates of item 6's kind eligibility, in one predicate so the candidate
 /// filter and the resolution seam cannot drift apart. Every other reference kind
 /// is unconstrained here and resolves exactly as before.
+/// Whether `target` may be the target of a `reference_kind` reference:
+/// [`kind_is_eligible_target`] plus the one language exception upstream
+/// makes (`isSupertypeTarget`, #1824) — a Scala `object` is a singleton
+/// value, never a parent type, even though Ruby modules are inheritable.
+pub fn node_is_eligible_target(reference_kind: EdgeKind, target: &Node) -> bool {
+    if is_inheritance_ref(reference_kind) && is_scala_singleton(target) {
+        return false;
+    }
+    kind_is_eligible_target(reference_kind, target.kind)
+}
+
+/// A Scala `object` (extracted as a `Module`).
+pub fn is_scala_singleton(node: &Node) -> bool {
+    node.language == Language::Scala && node.kind == NodeKind::Module
+}
+
 pub fn kind_is_eligible_target(reference_kind: EdgeKind, target_kind: NodeKind) -> bool {
     if is_inheritance_ref(reference_kind) {
         return declares_type_name(target_kind);
@@ -358,6 +375,27 @@ pub trait ResolutionContext {
     /// when a caller only needs the readable/unreadable distinction.
     fn is_file_readable(&self, file_path: &str) -> bool {
         self.read_file(file_path).is_some()
+    }
+    /// Shared-buffer variant of [`Self::read_file`]. Contexts with a file
+    /// content cache return the cached buffer without copying the file.
+    fn read_file_shared(&self, file_path: &str) -> Option<Arc<str>> {
+        self.read_file(file_path).map(Arc::from)
+    }
+    /// Lazily derived facts about `file_path`'s source text, shared by the
+    /// resolver's text-scanning gates. Contexts that live for one resolution
+    /// pass cache one [`SourceFacts`] per file so every view — and every
+    /// memoised gate decision — is computed at most once; the default derives
+    /// fresh facts on each call, which is correct but uncached.
+    fn source_facts(&self, file_path: &str) -> Option<Arc<SourceFacts>> {
+        self.read_file_shared(file_path)
+            .map(|source| Arc::new(SourceFacts::new(source)))
+    }
+    /// Whether any node in `file_path` is exported (`fileHasExportedNode`).
+    /// Production contexts answer from a precomputed set.
+    fn file_has_exported_node(&self, file_path: &str) -> bool {
+        self.get_nodes_in_file_shared(file_path)
+            .iter()
+            .any(|node| node.is_exported)
     }
     /// Get project root (`getProjectRoot`).
     fn get_project_root(&self) -> &str;

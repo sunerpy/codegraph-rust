@@ -454,3 +454,26 @@ fn prompt_hook_kill_switch_silences() {
         "kill-switch must silence output, got:\n{out}"
     );
 }
+
+#[test]
+fn host_task_notification_is_silent_only_when_it_is_the_first_content() {
+    let (_dir, project) = index_mini("task-notification");
+    let wrapped = format!(
+        "{{\"prompt\":\"\\n  <task-notification>what calls Counter()</task-notification>\",\"cwd\":{}}}",
+        serde_json::to_string(project.to_str().unwrap()).unwrap()
+    );
+    let (out, err, ok) = cli_stdin(&["prompt-hook"], &wrapped);
+    assert!(ok, "wrapper run failed: stdout={out} stderr={err}");
+    assert!(out.trim().is_empty(), "host wrapper must be silent: {out}");
+
+    let discussed = format!(
+        "{{\"prompt\":\"Please explain <task-notification> and what calls Counter()\",\"cwd\":{}}}",
+        serde_json::to_string(project.to_str().unwrap()).unwrap()
+    );
+    let (out, err, ok) = cli_stdin(&["prompt-hook"], &discussed);
+    assert!(ok, "discussion run failed: stdout={out} stderr={err}");
+    assert!(
+        out.contains("<codegraph_context") && out.contains("Counter"),
+        "a user discussion mentioning the tag later must not be suppressed: {out}"
+    );
+}

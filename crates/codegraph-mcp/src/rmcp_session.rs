@@ -25,6 +25,7 @@ use std::path::PathBuf;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::project_services::ProjectServiceBroker;
 use crate::rmcp_handler::CodeGraphHandler;
 
 /// Buffer size for the in-process duplex pipe bridging blocking socket halves to
@@ -51,9 +52,20 @@ pub async fn serve_session_rmcp_async<T>(transport: T, project_root: PathBuf) ->
 where
     T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
+    serve_session_rmcp_async_with_project_services(transport, project_root, None).await
+}
+
+pub async fn serve_session_rmcp_async_with_project_services<T>(
+    transport: T,
+    project_root: PathBuf,
+    project_services: Option<ProjectServiceBroker>,
+) -> anyhow::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
     use rmcp::ServiceExt;
 
-    let handler = CodeGraphHandler::new(Some(project_root));
+    let handler = CodeGraphHandler::new_with_project_services(Some(project_root), project_services);
     let running = handler
         .serve(transport)
         .await
@@ -75,6 +87,19 @@ where
 /// threads and a `tokio::io::duplex`, so rmcp still drives a genuinely-async
 /// transport (the blocking `poll_read` deadlock is impossible on the rmcp side).
 pub fn serve_session_rmcp<R, W>(reader: R, writer: W, project_root: PathBuf) -> anyhow::Result<()>
+where
+    R: BufRead + Send + 'static,
+    W: Write + Send + 'static,
+{
+    serve_session_rmcp_with_project_services(reader, writer, project_root, None)
+}
+
+pub fn serve_session_rmcp_with_project_services<R, W>(
+    reader: R,
+    writer: W,
+    project_root: PathBuf,
+    project_services: Option<ProjectServiceBroker>,
+) -> anyhow::Result<()>
 where
     R: BufRead + Send + 'static,
     W: Write + Send + 'static,
@@ -135,7 +160,12 @@ where
             }
         });
 
-        let serve_result = serve_session_rmcp_async(rmcp_side, project_root).await;
+        let serve_result = serve_session_rmcp_async_with_project_services(
+            rmcp_side,
+            project_root,
+            project_services,
+        )
+        .await;
 
         // Teardown ORDER guarantees rmcp's final response reaches the writer
         // before we return: drain the pipe to EOF (only after rmcp closed its

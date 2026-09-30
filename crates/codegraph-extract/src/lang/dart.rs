@@ -70,7 +70,11 @@ impl LanguageSpec for DartSpec {
     }
 
     fn extra_class_node_types(&self) -> &'static [&'static str] {
-        &["mixin_declaration", "extension_declaration"]
+        &[
+            "mixin_declaration",
+            "extension_declaration",
+            "extension_type_declaration",
+        ]
     }
 
     fn name_field(&self) -> &'static str {
@@ -315,6 +319,7 @@ fn dart_enclosing_type_name(node: Node<'_>, source: &str) -> Option<String> {
                 | "class_declaration"
                 | "mixin_declaration"
                 | "extension_declaration"
+                | "extension_type_declaration"
                 | "enum_declaration"
         ) {
             return child_by_field(current, "name").map(|name| node_text(name, source));

@@ -97,6 +97,13 @@ persisted via the literal `unresolved_refs.reference_kind` string `function_ref`
 (no `.schema` change — the column has no CHECK constraint), read back as
 `references` + `is_function_ref`, and resolved to a `references` edge.
 
+Upstream #1820 extends that same model to statically receiver-qualified method
+values in TypeScript/JavaScript and Python. `obj.method` and proven
+`this.field.method` callbacks reuse the ordinary conservative method target
+selection, but the persisted edge remains `References` with `fnRef:true`; no
+immediate `Calls` edge is fabricated. Call-result, index, literal, missing-type,
+and ambiguous receiver shapes remain unresolved.
+
 15 of the 17 supported languages produce edge sets BYTE-IDENTICAL to colby 1.0.1
 for the function_ref feature (TS/JS/TSX/JSX, Python, Go, Rust, C, C++, Java,
 Kotlin, Ruby, PHP, C#, Swift, Scala, Lua/Luau). The following two carry minor,
@@ -124,9 +131,10 @@ TS/Python with no callbacks); they are recorded here as scoped follow-ups.
 
 ## Task 22 — MCP tool output (Tier-2 text-formatting differences)
 
-The MCP server (`crates/codegraph-mcp`) renders 8 tools byte-identical to colby
-on the mini golden EXCEPT the following text-formatting / relevance-ordering
-differences. Six of the eight tools (`codegraph_search`, `codegraph_callers`,
+The Task 22 parity corpus compares the 8 upstream tools; the Rust server also
+exposes the additive `codegraph_check` and `codegraph_export` tools. Those 8
+shared tools render byte-identically on the mini golden EXCEPT the following
+text-formatting / relevance-ordering differences. Six of the eight shared tools (`codegraph_search`, `codegraph_callers`,
 `codegraph_callees`, `codegraph_impact`, `codegraph_node` symbol+file modes,
 `codegraph_files` tree/flat/grouped) are byte-identical; the diffs below are
 confined to `codegraph_explore` and `codegraph_status`.

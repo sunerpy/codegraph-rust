@@ -49,6 +49,8 @@ impl Fixture {
             // never reads the developer's real ~/.config or $HERMES_HOME.
             .env("XDG_CONFIG_HOME", self.root.join("xdg"))
             .env("HERMES_HOME", self.root.join("hermes"))
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .env_remove("CODEX_HOME")
             .env_remove("APPDATA")
             .output()
             .expect("run codegraph");
@@ -91,6 +93,7 @@ fn claude_local_install_idempotent_then_uninstall() {
     assert_eq!(entry["command"], "codegraph");
     assert_eq!(entry["args"], serde_json::json!(["serve", "--mcp"]));
     assert_eq!(entry["type"], "stdio");
+    assert_eq!(entry["alwaysLoad"], true);
     assert!(settings.exists());
     let allow = read_json(&settings)["permissions"]["allow"].clone();
     assert!(
@@ -253,23 +256,97 @@ fn codex_replaces_indented_table_then_uninstalls_it() {
 }
 
 #[test]
-fn opencode_local_uses_mcp_wrapper() {
+fn opencode_local_uses_native_v2_mcp_wrapper() {
     let fx = Fixture::new("opencode");
     let cfg = fx.project.join("opencode.jsonc");
     fx.run(&["install", "--target=opencode", "--local", "--yes"]);
     let json = read_json(&cfg);
     assert_eq!(json["$schema"], "https://opencode.ai/config.json");
-    let entry = &json["mcp"]["codegraph"];
+    let entry = &json["mcp"]["servers"]["codegraph"];
     assert_eq!(entry["type"], "local");
     assert_eq!(
         entry["command"],
         serde_json::json!(["codegraph", "serve", "--mcp"])
     );
-    assert_eq!(entry["enabled"], true);
+    assert_eq!(entry["disabled"], false);
+    assert_eq!(entry["codemode"], false);
+    assert!(json["mcp"].get("codegraph").is_none());
 
     fx.run(&["install", "--target=opencode", "--local", "--yes"]);
     fx.run(&["uninstall", "--target=opencode", "--local"]);
-    assert!(read_json(&cfg)["mcp"].get("codegraph").is_none());
+    assert!(
+        read_json(&cfg)
+            .get("mcp")
+            .is_none_or(|mcp| mcp.get("servers").is_none())
+    );
+}
+
+#[test]
+fn claude_global_honors_custom_profile_through_cli_round_trip() {
+    let fx = Fixture::new("claude-profile");
+    let profile = fx.root.join("profiles/claude");
+    let run = |args: &[&str]| {
+        let output = Command::new(bin())
+            .args(args)
+            .current_dir(&fx.project)
+            .env("HOME", &fx.home)
+            .env("CLAUDE_CONFIG_DIR", &profile)
+            .env_remove("CODEX_HOME")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    run(&["install", "--target=claude", "--global", "--yes"]);
+    assert!(profile.join(".claude.json").is_file());
+    assert!(profile.join("settings.json").is_file());
+    assert!(profile.join("CLAUDE.md").is_file());
+    assert!(!fx.home.join(".claude").exists());
+    assert!(!fx.home.join(".claude.json").exists());
+    let printed = run(&["install", "--print-config", "claude"]);
+    assert!(printed.contains(&profile.join(".claude.json").display().to_string()));
+    run(&["uninstall", "--target=claude", "--global"]);
+    assert!(
+        read_json(&profile.join(".claude.json"))["mcpServers"]
+            .get("codegraph")
+            .is_none()
+    );
+}
+
+#[test]
+fn codex_global_honors_custom_profile_through_cli_round_trip() {
+    let fx = Fixture::new("codex-profile");
+    let profile = fx.root.join("profiles/codex");
+    let run = |args: &[&str]| {
+        let output = Command::new(bin())
+            .args(args)
+            .current_dir(&fx.project)
+            .env("HOME", &fx.home)
+            .env("CODEX_HOME", &profile)
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    run(&["install", "--target=codex", "--global", "--yes"]);
+    assert!(profile.join("config.toml").is_file());
+    assert!(profile.join("AGENTS.md").is_file());
+    assert!(!fx.home.join(".codex").exists());
+    let printed = run(&["install", "--print-config", "codex"]);
+    assert!(printed.contains(&profile.join("config.toml").display().to_string()));
+    run(&["uninstall", "--target=codex", "--global"]);
+    assert!(!profile.join("config.toml").exists());
 }
 
 #[test]
@@ -589,6 +666,10 @@ fn copilot_cli_global_install_declares_all_tools() {
         config["mcpServers"]["codegraph"]["tools"],
         serde_json::json!(["*"]),
         "without tools:[\"*\"] the CLI exposes no tools: {config}"
+    );
+    assert_eq!(
+        config["mcpServers"]["codegraph"]["deferTools"], "never",
+        "Explore must not be deferred behind Copilot CLI tool search: {config}"
     );
 
     fx.run(&["uninstall", "--target=copilot-cli", "--global"]);

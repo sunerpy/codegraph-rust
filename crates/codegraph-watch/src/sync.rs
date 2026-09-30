@@ -103,6 +103,81 @@ pub struct SyncOutcome {
     pub trigger_paths: Vec<String>,
 }
 
+/// Read-only difference between the current project scope and the persisted
+/// file inventory. Paths are root-relative, sorted, and mutually exclusive.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PendingChanges {
+    pub added: Vec<String>,
+    pub modified: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+impl PendingChanges {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.modified.is_empty() && self.removed.is_empty()
+    }
+
+    #[must_use]
+    pub fn total(&self) -> usize {
+        self.added.len() + self.modified.len() + self.removed.len()
+    }
+}
+
+/// Compute the same whole-project candidate delta an ordinary full `sync` would
+/// inspect, without acquiring a writer lease or mutating any index byte (#1829).
+///
+/// This intentionally uses the correctness-first full scan instead of Git's
+/// working-tree status: a committed change is absent from `git status`, history
+/// can be rebased/shallow, and CodeGraph also supports non-Git projects. The
+/// scan reuses the addressed project's include/exclude/custom-extension policy.
+/// Existing files use sync's `(size, mtime) -> content hash` decision, so the
+/// reported counts match the work the next whole-tree sync will perform.
+pub fn pending_project_changes(
+    project_root: impl AsRef<Path>,
+    store: &Store,
+) -> Result<PendingChanges> {
+    let project_root = project_root.as_ref();
+    let paths = index_paths(project_root)?;
+    let scope = ProjectScope::load(project_root, &paths)?;
+    let on_disk = codegraph_extract::engine::scan_project(project_root, &scope.options)?;
+    let tracked = store
+        .all_files()?
+        .into_iter()
+        .map(|file| (file.path.clone(), file))
+        .collect::<BTreeMap<_, _>>();
+    let on_disk_set = on_disk.iter().cloned().collect::<BTreeSet<_>>();
+
+    let mut pending = PendingChanges::default();
+    for relative in on_disk {
+        let Some(stored) = tracked.get(&relative) else {
+            pending.added.push(relative);
+            continue;
+        };
+        let full = project_root.join(&relative);
+        let metadata = fs::metadata(&full).with_context(|| format!("stat {}", full.display()))?;
+        if stored.size == metadata.len() as i64 && stored.modified_at == modified_millis(&metadata)
+        {
+            continue;
+        }
+        let source = fs::read_to_string(&full)
+            .with_context(|| format!("read pending source {}", full.display()))?;
+        if stored.content_hash != hash_content(&source) {
+            pending.modified.push(relative);
+        }
+    }
+    for relative in tracked.keys() {
+        if !on_disk_set.contains(relative) {
+            pending.removed.push(relative.clone());
+        }
+    }
+
+    pending.added.sort();
+    pending.modified.sort();
+    pending.removed.sort();
+    Ok(pending)
+}
+
 pub fn sync_project_once(project_root: impl AsRef<Path>) -> Result<SyncOutcome> {
     sync_project_once_with_progress(project_root, |_, _| {})
 }
@@ -532,9 +607,7 @@ fn refresh_dependent_refs(
                 })
             });
         if needs_fallback {
-            store.delete_resolved_edges_from_file(&relative)?;
-            delete_unresolved_refs_by_file(store, &relative)?;
-            store.insert_unresolved_refs(&refs)?;
+            store.replace_resolution_state_from_file(&relative, &refs)?;
             refreshed_files.insert(relative);
             continue;
         }
@@ -550,9 +623,7 @@ fn refresh_dependent_refs(
             })
             .collect::<Vec<_>>();
         let site_list = sites.iter().cloned().collect::<Vec<_>>();
-        store.delete_resolved_edges_at_sites(&site_list)?;
-        store.delete_unresolved_refs_at_sites(&site_list)?;
-        store.insert_unresolved_refs(&selected)?;
+        store.replace_resolution_state_at_sites(&site_list, &selected)?;
         refreshed_sites.extend(sites.iter().cloned());
     }
     Ok((refreshed_sites, refreshed_files))

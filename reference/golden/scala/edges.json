@@ -1,0 +1,101 @@
+[
+  {
+    "col": 10,
+    "kind": "extends",
+    "line": 2,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "class:627a216b0cc8c0c9e5e61a855c967dd4",
+    "target": "class:29d4ea01650c7344733d923a81d0516b"
+  },
+  {
+    "col": 51,
+    "kind": "extends",
+    "line": 2,
+    "metadata": {
+      "confidence": 0.4,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "class:627a216b0cc8c0c9e5e61a855c967dd4",
+    "target": "trait:82c543978cf8541c3f7a0c088d5521f3"
+  },
+  {
+    "col": 69,
+    "kind": "extends",
+    "line": 2,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "class:627a216b0cc8c0c9e5e61a855c967dd4",
+    "target": "trait:5fe9b04e2c5042b6b532f8a4d92e1bc5"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:627a216b0cc8c0c9e5e61a855c967dd4",
+    "target": "method:9fd814c66467ec06ba0f3dc046d0a650"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:agreements.scala",
+    "target": "class:29d4ea01650c7344733d923a81d0516b"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:agreements.scala",
+    "target": "module:bd1ee126d046e3b49d2f34ed9d713fc7"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:agreements.scala",
+    "target": "trait:5fe9b04e2c5042b6b532f8a4d92e1bc5"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:agreements.scala",
+    "target": "trait:82c543978cf8541c3f7a0c088d5521f3"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:m_ext_agreement.scala",
+    "target": "class:627a216b0cc8c0c9e5e61a855c967dd4"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "trait:82c543978cf8541c3f7a0c088d5521f3",
+    "target": "method:71607374878addf68c9584ca659d0dd5"
+  }
+]

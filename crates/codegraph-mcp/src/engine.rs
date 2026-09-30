@@ -18,7 +18,7 @@ use codegraph_core::deprioritize::DeprioritizeMatcher;
 use codegraph_core::file_class::{is_generated_file, is_test_file};
 use codegraph_core::node_id::hash_content;
 use codegraph_core::types::{EdgeKind, FileRecord, Node, NodeKind};
-use codegraph_graph::graph::{GodotReach, GraphTraverser, NodeEdge};
+use codegraph_graph::graph::{GodotReach, GraphTraverser, NodeEdge, group_definitions};
 use codegraph_graph::query::{SearchOptions, search_nodes};
 use codegraph_graph::segment_match::get_segment_matches;
 use codegraph_graph::segments::extract_segment_search_words;
@@ -28,7 +28,7 @@ use serde_json::Value;
 use crate::dynamic_boundaries::scan_dynamic_dispatch;
 use crate::explore_budget::{ExploreOutputBudget, get_explore_output_budget};
 use crate::protocol::ToolResult;
-use crate::query_paths::{extract_query_paths, query_might_contain_paths};
+use crate::query_paths::{extract_query_paths_with_file_probe, query_might_contain_paths};
 
 /// Default caller/callee recursion depth for callers/callees tools. The upstream
 /// `getCallers`/`getCallees` default to `maxDepth: 1` (`traversal.ts` callers
@@ -306,6 +306,17 @@ impl CodeGraphEngine {
             .collect())
     }
 
+    /// Whether a CLI `node` positional resolves to an indexed file, including a
+    /// pasted line/range suffix such as `lib.rs:42-80` or `lib.rs#L42-L80`.
+    /// The MCP file-view handler uses the same resolver, so the CLI cannot drift
+    /// into symbol mode for a spelling the MCP tool accepts.
+    pub fn node_target_is_indexed_file(&self, target: &str) -> anyhow::Result<bool> {
+        let files = self.store.all_files()?;
+        Ok(!resolve_file_view_target(&files, target)
+            .candidates
+            .is_empty())
+    }
+
     /// Read-only access to the underlying store, for the CLI prompt-hook gate's
     /// query-time segment matching (`get_segment_matches`).
     pub fn store(&self) -> &Store {
@@ -433,7 +444,12 @@ impl CodeGraphEngine {
             Ok(s) => s,
             Err(msg) => return Ok(ToolResult::error(msg)),
         };
-        let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(20) as usize;
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_i64)
+            .unwrap_or(20)
+            .clamp(1, 100) as usize;
+        let file_filter = args.get("file").and_then(Value::as_str);
 
         let all_matches = self.find_all_symbols(&symbol)?;
         if all_matches.nodes.is_empty() {
@@ -441,49 +457,135 @@ impl CodeGraphEngine {
                 "Symbol \"{symbol}\" not found in the codebase. Use codegraph_search with query \"{symbol}\" to find fuzzy matches."
             )));
         }
-
+        let grouped = group_definitions(&all_matches.nodes, file_filter);
+        let filter_note = if grouped.filtered_out {
+            format!(
+                "\n\n> **Note:** no definition of \"{symbol}\" matches file \"{}\" — showing all definitions instead.",
+                file_filter.unwrap_or_default()
+            )
+        } else {
+            String::new()
+        };
         let traverser = GraphTraverser::new(&self.store);
-        let mut aggregated: Vec<Node> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        for node in &all_matches.nodes {
-            let edges: Vec<NodeEdge> = match dir {
-                CallDir::Callers => traverser.get_callers(&node.id, CALL_DEPTH)?,
-                CallDir::Callees => traverser.get_callees(&node.id, CALL_DEPTH)?,
-            };
-            for ne in edges {
-                if seen.insert(ne.node.id.clone()) {
-                    aggregated.push(ne.node);
+        let collect = |roots: &[Node]| -> anyhow::Result<Vec<Node>> {
+            let mut related = Vec::new();
+            let mut seen = HashSet::new();
+            for node in roots {
+                let edges: Vec<NodeEdge> = match dir {
+                    CallDir::Callers => traverser.get_callers(&node.id, CALL_DEPTH)?,
+                    CallDir::Callees => traverser.get_callees(&node.id, CALL_DEPTH)?,
+                };
+                for entry in edges {
+                    if seen.insert(entry.node.id.clone()) {
+                        related.push(entry.node);
+                    }
                 }
             }
-        }
-
+            Ok(related)
+        };
+        let selected = grouped.groups.iter().flatten().cloned().collect::<Vec<_>>();
         let godot = match dir {
-            CallDir::Callers => self.godot_honesty(&all_matches.nodes)?,
+            CallDir::Callers => self.godot_honesty(&selected)?,
             CallDir::Callees => GodotHonesty::default(),
         };
+        let label = match dir {
+            CallDir::Callers => "callers",
+            CallDir::Callees => "callees",
+        };
+        let title = match dir {
+            CallDir::Callers => "Callers",
+            CallDir::Callees => "Callees",
+        };
 
-        if aggregated.is_empty() {
-            let label = match dir {
-                CallDir::Callers => "callers",
-                CallDir::Callees => "callees",
+        if grouped.groups.len() == 1 {
+            let related = collect(&grouped.groups[0])?;
+            if related.is_empty() {
+                return Ok(ToolResult::not_found_text(format!(
+                    "No {label} found for \"{symbol}\"{}{}{}",
+                    if file_filter.is_some() && !grouped.filtered_out {
+                        ""
+                    } else {
+                        &all_matches.note
+                    },
+                    filter_note,
+                    godot.annotation(true)
+                )));
+            }
+            let shown = related.len().min(limit);
+            let cut = (related.len() > limit).then(|| {
+                format!(
+                    "\n\n> Showing {shown} of {} {label}; pass `limit` (up to 100) to widen.",
+                    related.len()
+                )
+            });
+            let note = if file_filter.is_some() && !grouped.filtered_out {
+                ""
+            } else {
+                &all_matches.note
             };
-            return Ok(ToolResult::not_found_text(format!(
-                "No {label} found for \"{symbol}\"{}{}",
-                all_matches.note,
-                godot.annotation(true)
-            )));
+            let formatted = format!(
+                "{}{}{}{}{}",
+                format_node_list(&format!("{title} of {symbol}"), &related[..shown]),
+                cut.as_deref().unwrap_or_default(),
+                note,
+                filter_note,
+                godot.annotation(false)
+            );
+            return Ok(ToolResult::text(truncate_output(&formatted)));
         }
 
-        aggregated.truncate(limit);
-        let title = match dir {
-            CallDir::Callers => format!("Callers of {symbol}"),
-            CallDir::Callees => format!("Callees of {symbol}"),
-        };
+        let mut lines = vec![format!(
+            "**{title} of {symbol} — {} distinct definitions (narrow with `file`)**",
+            grouped.groups.len()
+        )];
+        let mut any = false;
+        for group in &grouped.groups {
+            let head = &group[0];
+            let location = if head.start_line == 0 {
+                String::new()
+            } else {
+                format!(":{}", head.start_line)
+            };
+            lines.push(String::new());
+            lines.push(format!(
+                "### {} ({}) — {}{}",
+                head.qualified_name,
+                head.kind.as_str(),
+                head.file_path,
+                location
+            ));
+            let related = collect(group)?;
+            if related.is_empty() {
+                lines.push(format!("- (no {label})"));
+                continue;
+            }
+            any = true;
+            for node in related.iter().take(limit) {
+                let location = if node.start_line == 0 {
+                    String::new()
+                } else {
+                    format!(":{}", node.start_line)
+                };
+                lines.push(format!(
+                    "- {} ({}) - {}{}",
+                    node.name,
+                    node.kind.as_str(),
+                    node.file_path,
+                    location
+                ));
+            }
+            if related.len() > limit {
+                lines.push(format!(
+                    "- … +{} more (pass `limit` to widen)",
+                    related.len() - limit
+                ));
+            }
+        }
         let formatted = format!(
             "{}{}{}",
-            format_node_list(&title, &aggregated),
-            all_matches.note,
-            godot.annotation(false)
+            lines.join("\n"),
+            filter_note,
+            godot.annotation(!any)
         );
         Ok(ToolResult::text(truncate_output(&formatted)))
     }
@@ -497,7 +599,12 @@ impl CodeGraphEngine {
             Ok(s) => s,
             Err(msg) => return Ok(ToolResult::error(msg)),
         };
-        let depth = args.get("depth").and_then(Value::as_i64).unwrap_or(2) as usize;
+        let depth = args
+            .get("depth")
+            .and_then(Value::as_i64)
+            .unwrap_or(2)
+            .clamp(1, 10) as usize;
+        let file_filter = args.get("file").and_then(Value::as_str);
 
         let all_matches = self.find_all_symbols(&symbol)?;
         if all_matches.nodes.is_empty() {
@@ -505,34 +612,96 @@ impl CodeGraphEngine {
                 "Symbol \"{symbol}\" not found in the codebase. Use codegraph_search with query \"{symbol}\" to find fuzzy matches."
             )));
         }
-
+        let grouped = group_definitions(&all_matches.nodes, file_filter);
+        let filter_note = if grouped.filtered_out {
+            format!(
+                "\n\n> **Note:** no definition of \"{symbol}\" matches file \"{}\" — showing all definitions instead.",
+                file_filter.unwrap_or_default()
+            )
+        } else {
+            String::new()
+        };
         let traverser = GraphTraverser::new(&self.store);
-        let mut merged_order: Vec<String> = Vec::new();
-        let mut merged: HashMap<String, Node> = HashMap::new();
-        for node in &all_matches.nodes {
-            let sub = traverser.get_impact_radius(&node.id, depth)?;
-            for id in &sub.node_order {
-                if let Some(n) = sub.nodes.get(id) {
-                    if !merged.contains_key(id) {
-                        merged_order.push(id.clone());
+        let impact_of = |roots: &[Node]| -> anyhow::Result<(Vec<String>, HashMap<String, Node>)> {
+            let mut order = Vec::new();
+            let mut nodes = HashMap::new();
+            for root in roots {
+                let sub = traverser.get_impact_radius(&root.id, depth)?;
+                for id in &sub.node_order {
+                    if let Some(node) = sub.nodes.get(id) {
+                        if !nodes.contains_key(id) {
+                            order.push(id.clone());
+                        }
+                        nodes.insert(id.clone(), node.clone());
                     }
-                    merged.insert(id.clone(), n.clone());
                 }
             }
+            Ok((order, nodes))
+        };
+        let selected = grouped.groups.iter().flatten().cloned().collect::<Vec<_>>();
+        let godot = self.godot_honesty(&selected)?;
+
+        if grouped.groups.len() == 1 {
+            let (order, nodes) = impact_of(&grouped.groups[0])?;
+            let ordered = order
+                .iter()
+                .filter_map(|id| nodes.get(id))
+                .collect::<Vec<_>>();
+            let root_ids = grouped.groups[0]
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<HashSet<_>>();
+            let no_static_dependents = ordered
+                .iter()
+                .all(|node| root_ids.contains(node.id.as_str()));
+            let note = if file_filter.is_some() && !grouped.filtered_out {
+                ""
+            } else {
+                &all_matches.note
+            };
+            let formatted = format!(
+                "{}{}{}{}",
+                format_impact(&symbol, &ordered),
+                note,
+                filter_note,
+                godot.annotation(no_static_dependents)
+            );
+            return Ok(ToolResult::text(truncate_output(&formatted)));
         }
 
-        let ordered: Vec<&Node> = merged_order
-            .iter()
-            .filter_map(|id| merged.get(id))
-            .collect();
-        let godot = self.godot_honesty(&all_matches.nodes)?;
-        let match_ids: HashSet<&str> = all_matches.nodes.iter().map(|n| n.id.as_str()).collect();
-        let no_static_dependents = ordered.iter().all(|n| match_ids.contains(n.id.as_str()));
+        let mut sections = vec![format!(
+            "**Impact of {symbol} — {} distinct definitions (each with its own blast radius; narrow with `file`)**",
+            grouped.groups.len()
+        )];
+        let mut any_dependents = false;
+        for group in &grouped.groups {
+            let head = &group[0];
+            let line = if head.start_line == 0 {
+                String::new()
+            } else {
+                format!(":{}", head.start_line)
+            };
+            let (order, nodes) = impact_of(group)?;
+            let ordered = order
+                .iter()
+                .filter_map(|id| nodes.get(id))
+                .collect::<Vec<_>>();
+            let roots = group
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<HashSet<_>>();
+            any_dependents |= ordered.iter().any(|node| !roots.contains(node.id.as_str()));
+            sections.push(String::new());
+            sections.push(format_impact(
+                &format!("{} ({}{line})", head.qualified_name, head.file_path),
+                &ordered,
+            ));
+        }
         let formatted = format!(
             "{}{}{}",
-            format_impact(&symbol, &ordered),
-            all_matches.note,
-            godot.annotation(no_static_dependents)
+            sections.join("\n"),
+            filter_note,
+            godot.annotation(!any_dependents)
         );
         Ok(ToolResult::text(truncate_output(&formatted)))
     }
@@ -823,12 +992,8 @@ impl CodeGraphEngine {
     /// `handleFileView` (`tools.ts:2659-2799`): read an indexed file with line
     /// numbers + a dependents note (Read-equivalent).
     fn handle_file_view(&self, args: &Value, file_arg: &str) -> anyhow::Result<ToolResult> {
-        let offset = args
-            .get("offset")
-            .and_then(Value::as_i64)
-            .unwrap_or(1)
-            .max(1) as usize;
-        let limit = args.get("limit").and_then(Value::as_i64);
+        let explicit_offset = args.get("offset").and_then(Value::as_i64);
+        let explicit_limit = args.get("limit").and_then(Value::as_i64);
         let symbols_only = args
             .get("symbolsOnly")
             .and_then(Value::as_bool)
@@ -841,7 +1006,11 @@ impl CodeGraphEngine {
             ));
         }
 
-        let candidates = resolve_file_candidates(&files, file_arg);
+        // Resolve the literal spelling first: an indexed file genuinely named
+        // `foo.rs:42` must win over interpreting `:42` as a line pointer. Only a
+        // literal miss may retry after stripping a supported line suffix.
+        let resolved_target = resolve_file_view_target(&files, file_arg);
+        let candidates = &resolved_target.candidates;
         let file_path = match candidates.as_slice() {
             [one] => one.clone(),
             [] => {
@@ -852,7 +1021,8 @@ impl CodeGraphEngine {
             many => {
                 let mut out = vec![
                     format!(
-                        "\"{file_arg}\" matches {} indexed files — pass a longer path:",
+                        "\"{}\" matches {} indexed files — pass a longer path:",
+                        resolved_target.shown_arg,
                         many.len()
                     ),
                     String::new(),
@@ -863,6 +1033,21 @@ impl CodeGraphEngine {
                 return Ok(ToolResult::text(out.join("\n")));
             }
         };
+
+        // Explicit MCP pagination fields independently win over the suffix.
+        // A single-line pointer supplies only the offset; a closed range also
+        // supplies its inclusive length.
+        let offset = explicit_offset
+            .map(|value| value.max(1) as usize)
+            .or_else(|| resolved_target.selector.map(|selector| selector.start))
+            .unwrap_or(1);
+        let limit = explicit_limit.or_else(|| {
+            resolved_target.selector.and_then(|selector| {
+                selector.end.and_then(|end| {
+                    i64::try_from(end.saturating_sub(selector.start).saturating_add(1)).ok()
+                })
+            })
+        });
 
         let mut nodes = self.store.nodes_by_file_path(&file_path)?;
         nodes.retain(|n| n.kind != NodeKind::File);
@@ -991,9 +1176,16 @@ impl CodeGraphEngine {
                 .into_iter()
                 .map(|file| file.path)
                 .collect::<Vec<_>>();
-            extract_query_paths(&query, &indexed_paths, max_files.min(8))
+            extract_query_paths_with_file_probe(
+                &query,
+                &indexed_paths,
+                max_files.min(8),
+                &|relative| project_regular_file_exists(&self.project_root, relative),
+            )
         } else {
-            extract_query_paths(&query, &[], max_files.min(8))
+            extract_query_paths_with_file_probe(&query, &[], max_files.min(8), &|relative| {
+                project_regular_file_exists(&self.project_root, relative)
+            })
         };
         let match_query = path_extraction.stripped_query.trim().to_string();
         let subgraph =
@@ -1805,6 +1997,7 @@ impl CodeGraphEngine {
     /// daemon-only (see KNOWN_DIFFS.md), so a static index omits them.
     fn handle_status(&self, _args: &Value) -> anyhow::Result<ToolResult> {
         let counts = self.store.counts()?;
+        let pending = codegraph_watch::pending_project_changes(&self.project_root, &self.store)?;
         let db_size = fs::metadata(self.store.path())
             .map(|m| m.len())
             .unwrap_or(0);
@@ -1833,6 +2026,24 @@ impl CodeGraphEngine {
             lines.push("### Languages:".to_string());
             for (lang, count) in by_lang {
                 lines.push(format!("- {lang}: {count}"));
+            }
+        }
+        if !pending.is_empty() {
+            lines.push(String::new());
+            lines.push(format!(
+                "### Pending sync: {} added, {} modified, {} removed",
+                pending.added.len(),
+                pending.modified.len(),
+                pending.removed.len()
+            ));
+            for (label, paths) in [
+                ("added", &pending.added),
+                ("modified", &pending.modified),
+                ("removed", &pending.removed),
+            ] {
+                for path in paths {
+                    lines.push(format!("- {label}: {path}"));
+                }
             }
         }
         // #1187: only appended when the interrupted-resolution marker is set, so a
@@ -2160,9 +2371,21 @@ impl CodeGraphEngine {
         let mut ambient = HashSet::new();
         for path in candidate_paths {
             let nodes = self.store.nodes_by_file_path(path)?;
+            let interface_owners = nodes
+                .iter()
+                .filter(|node| node.kind == NodeKind::Interface)
+                .map(|node| node.qualified_name.as_str())
+                .collect::<HashSet<_>>();
+            let is_interface_member = |node: &Node| {
+                matches!(node.kind, NodeKind::Method | NodeKind::Property)
+                    && node
+                        .qualified_name
+                        .rsplit_once("::")
+                        .is_some_and(|(owner, _)| interface_owners.contains(owner))
+            };
             let declared: Vec<&Node> = nodes
                 .iter()
-                .filter(|n| !is_ambient_bookkeeping_kind(n.kind))
+                .filter(|n| !is_ambient_bookkeeping_kind(n.kind) && !is_interface_member(n))
                 .collect();
             // (1) at least one declaration, and (2) every one of them is a type
             // declaration — a file holding an implementation is never ambient.
@@ -2202,7 +2425,23 @@ impl CodeGraphEngine {
             // (4) nothing anywhere in the index depends on it. Consumed only
             // through `is_empty`, so the query's SQLite scan order can never reach
             // the output.
-            if self.store.dependent_file_paths(path)?.is_empty() {
+            let mut depended_on = false;
+            for target in nodes.iter().filter(|node| !is_interface_member(node)) {
+                for edge in self.store.edges_by_target_kind(&target.id, None)? {
+                    if self
+                        .store
+                        .node_by_id(&edge.source)?
+                        .is_some_and(|source| source.file_path != *path)
+                    {
+                        depended_on = true;
+                        break;
+                    }
+                }
+                if depended_on {
+                    break;
+                }
+            }
+            if !depended_on {
                 ambient.insert(path.clone());
             }
         }
@@ -3364,6 +3603,155 @@ fn resolve_file_candidates(files: &[FileRecord], file_arg: &str) -> Vec<String> 
         })
         .map(|f| f.path.clone())
         .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileLineSelector {
+    start: usize,
+    end: Option<usize>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ResolvedFileViewTarget<'a> {
+    candidates: Vec<String>,
+    shown_arg: &'a str,
+    selector: Option<FileLineSelector>,
+}
+
+/// Resolve a file-view argument while preserving literal-path precedence.
+///
+/// Agents routinely paste editor locations (`a.rs:12`, `a.rs:12-40`,
+/// `a.rs#L12-L40`). These are pagination hints only when the literal spelling
+/// matches no indexed path and the stripped base does. This also prevents a
+/// real filename ending in `:12` from being silently reinterpreted.
+fn resolve_file_view_target<'a>(
+    files: &[FileRecord],
+    file_arg: &'a str,
+) -> ResolvedFileViewTarget<'a> {
+    let literal = resolve_file_candidates(files, file_arg);
+    if !literal.is_empty() {
+        return ResolvedFileViewTarget {
+            candidates: literal,
+            shown_arg: file_arg,
+            selector: None,
+        };
+    }
+
+    if let Some((base, selector)) = split_file_line_selector(file_arg) {
+        let stripped = resolve_file_candidates(files, base);
+        if !stripped.is_empty() {
+            return ResolvedFileViewTarget {
+                candidates: stripped,
+                shown_arg: base,
+                selector: Some(selector),
+            };
+        }
+    }
+
+    ResolvedFileViewTarget {
+        candidates: Vec::new(),
+        shown_arg: file_arg,
+        selector: None,
+    }
+}
+
+/// Split a supported trailing line selector from a path.
+///
+/// A bare `C:42` stays literal because it is a valid Windows drive-relative
+/// spelling; the final colon in `C:\\repo\\lib.rs:42` is unambiguous and is
+/// accepted. Invalid, zero, reversed, or overflowing ranges stay literal.
+fn split_file_line_selector(input: &str) -> Option<(&str, FileLineSelector)> {
+    if let Some((base, suffix)) = input.rsplit_once("#L")
+        && !base.is_empty()
+        && !is_bare_windows_drive(base)
+        && let Some(selector) = parse_line_selector(suffix, true)
+    {
+        return Some((base, selector));
+    }
+
+    if let Some((base, suffix)) = input.rsplit_once(':')
+        && !base.is_empty()
+        && !is_bare_windows_drive(base)
+        && let Some(selector) = parse_line_selector(suffix, false)
+    {
+        return Some((base, selector));
+    }
+
+    None
+}
+
+fn parse_line_selector(suffix: &str, allow_end_l: bool) -> Option<FileLineSelector> {
+    let (start_raw, end_raw) = match suffix.split_once('-') {
+        Some((start, end)) => (start, Some(end)),
+        None => (suffix, None),
+    };
+    let start = parse_positive_line(start_raw)?;
+    let end = match end_raw {
+        Some(raw) => {
+            let raw = if allow_end_l {
+                raw.strip_prefix('L').unwrap_or(raw)
+            } else {
+                raw
+            };
+            let end = parse_positive_line(raw)?;
+            (end >= start).then_some(end)?
+        }
+        None => return Some(FileLineSelector { start, end: None }),
+    };
+    Some(FileLineSelector {
+        start,
+        end: Some(end),
+    })
+}
+
+fn parse_positive_line(raw: &str) -> Option<usize> {
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let line = raw.parse::<usize>().ok()?;
+    (line > 0).then_some(line)
+}
+
+fn is_bare_windows_drive(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    (bytes.len() == 1 && bytes[0].is_ascii_alphabetic())
+        || (bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+}
+
+/// Does a query-named relative path identify a regular project file that the
+/// index does not contain? Lexical escapes and platform prefixes are rejected
+/// before any metadata call; symlink components are rejected rather than
+/// followed, so this honesty probe cannot leave the project tree.
+fn project_regular_file_exists(project_root: &Path, relative: &str) -> bool {
+    let normalized = relative.replace('\\', "/");
+    let bytes = normalized.as_bytes();
+    if normalized.starts_with('/') || bytes.get(1) == Some(&b':') && bytes[0].is_ascii_alphabetic()
+    {
+        return false;
+    }
+    let segments = normalized
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .collect::<Vec<_>>();
+    if segments.is_empty() || segments.contains(&"..") {
+        return false;
+    }
+
+    let mut candidate = match project_root.canonicalize() {
+        Ok(root) => root,
+        Err(_) => return false,
+    };
+    for segment in segments {
+        candidate.push(segment);
+        let metadata = match fs::symlink_metadata(&candidate) {
+            Ok(metadata) => metadata,
+            Err(_) => return false,
+        };
+        if metadata.file_type().is_symlink() {
+            return false;
+        }
+    }
+    fs::metadata(candidate).is_ok_and(|metadata| metadata.is_file())
 }
 
 fn basename(path: &str) -> &str {
@@ -4563,6 +4951,38 @@ mod tests {
     }
 
     #[test]
+    fn ext_callers_reports_when_limit_hides_rows() {
+        let mut engine = test_engine();
+        let target = node_lang(
+            "save",
+            "save",
+            "svc.rs",
+            1,
+            5,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        let a = node_lang("a", "a", "a.rs", 1, 2, NodeKind::Function, Language::Rust);
+        let b = node_lang("b", "b", "b.rs", 1, 2, NodeKind::Function, Language::Rust);
+        put_nodes(&mut engine, &[target.clone(), a.clone(), b.clone()]);
+        put_edges(
+            &mut engine,
+            &[
+                mk_edge(&a.id, &target.id, EdgeKind::Calls),
+                mk_edge(&b.id, &target.id, EdgeKind::Calls),
+            ],
+        );
+
+        let result = engine.execute(
+            "codegraph_callers",
+            &serde_json::json!({"symbol": "save", "limit": 1}),
+        );
+        let text = text_of(&result);
+        assert!(text.contains("Showing 1 of 2 callers"), "got: {text}");
+        assert!(text.contains("pass `limit` (up to 100)"), "got: {text}");
+    }
+
+    #[test]
     fn ext_lookup_handlers_refuse_fuzzy_only_symbol_matches() {
         let mut engine = test_engine();
         let target = node_lang(
@@ -5606,6 +6026,100 @@ mod tests {
     }
 
     #[test]
+    fn ext_file_view_accepts_pasted_line_and_range_selectors() {
+        let engine = test_engine();
+        put_indexed_source(
+            &engine,
+            "src/big.rs",
+            &(1..=80)
+                .map(|line| format!("value {line}\n"))
+                .collect::<String>(),
+            Language::Rust,
+            0,
+        );
+
+        for target in [
+            "src/big.rs:40-42",
+            "big.rs:40-42",
+            "src/big.rs#L40-L42",
+            "big.rs#L40-42",
+        ] {
+            let text =
+                text_of(&engine.execute("codegraph_node", &serde_json::json!({"file": target})));
+            assert!(text.contains("40\tvalue 40"), "target={target}: {text}");
+            assert!(text.contains("42\tvalue 42"), "target={target}: {text}");
+            assert!(!text.contains("39\tvalue 39"), "target={target}: {text}");
+            assert!(!text.contains("43\tvalue 43"), "target={target}: {text}");
+        }
+
+        let pointer =
+            text_of(&engine.execute("codegraph_node", &serde_json::json!({"file": "big.rs:40"})));
+        assert!(pointer.contains("40\tvalue 40"), "got: {pointer}");
+        assert!(!pointer.contains("39\tvalue 39"), "got: {pointer}");
+    }
+
+    #[test]
+    fn ext_file_view_explicit_pagination_wins_over_selector() {
+        let engine = test_engine();
+        put_indexed_source(
+            &engine,
+            "big.rs",
+            &(1..=80)
+                .map(|line| format!("value {line}\n"))
+                .collect::<String>(),
+            Language::Rust,
+            0,
+        );
+        let text = text_of(&engine.execute(
+            "codegraph_node",
+            &serde_json::json!({
+                "file": "big.rs:40-42",
+                "offset": 5,
+                "limit": 2,
+            }),
+        ));
+        assert!(text.contains("5\tvalue 5"), "got: {text}");
+        assert!(text.contains("6\tvalue 6"), "got: {text}");
+        assert!(!text.contains("40\tvalue 40"), "got: {text}");
+    }
+
+    #[test]
+    fn file_view_selector_parsing_preserves_literal_and_windows_ambiguities() {
+        let literal = file_rec("src/lib.rs:42", Language::Rust, 0);
+        let base = file_rec("src/lib.rs", Language::Rust, 0);
+        let resolved = resolve_file_view_target(&[literal, base.clone()], "src/lib.rs:42");
+        assert_eq!(resolved.candidates, vec!["src/lib.rs:42"]);
+        assert_eq!(resolved.selector, None, "literal path must win");
+
+        let ranged = resolve_file_view_target(&[base], "src/lib.rs#L42-L80");
+        assert_eq!(ranged.candidates, vec!["src/lib.rs"]);
+        assert_eq!(
+            ranged.selector,
+            Some(FileLineSelector {
+                start: 42,
+                end: Some(80),
+            })
+        );
+
+        assert_eq!(split_file_line_selector("C:42"), None);
+        assert_eq!(split_file_line_selector("C:#L42"), None);
+        assert_eq!(split_file_line_selector(r"C:\repo\lib.rs"), None);
+        assert_eq!(
+            split_file_line_selector(r"C:\repo\lib.rs:42"),
+            Some((
+                r"C:\repo\lib.rs",
+                FileLineSelector {
+                    start: 42,
+                    end: None,
+                },
+            ))
+        );
+        for invalid in ["lib.rs:0", "lib.rs:80-42", "lib.rs#Lx", "lib.rs:42-"] {
+            assert_eq!(split_file_line_selector(invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
     fn ext_file_view_offset_past_end() {
         let mut engine = test_engine();
         put_indexed_source(&engine, "svc.rs", "one\ntwo\nthree\n", Language::Rust, 1);
@@ -5734,6 +6248,50 @@ mod tests {
             !text.contains("src/lib/runs-store.ts"),
             "path fragments must not seed the decoy: {text}"
         );
+    }
+
+    #[test]
+    fn ext_explore_reports_an_existing_unindexed_extensionless_file() {
+        let engine = test_engine();
+        std::fs::create_dir_all(engine.project_root.join("scripts")).unwrap();
+        std::fs::write(engine.project_root.join("scripts/deploy"), "#!/bin/sh\n").unwrap();
+
+        let text = text_of(&engine.execute(
+            "codegraph_explore",
+            &serde_json::json!({"query": "scripts/deploy"}),
+        ));
+        assert!(text.contains("No relevant code found"), "got: {text}");
+        assert!(
+            text.contains("no indexed file uniquely matches `scripts/deploy`"),
+            "got: {text}"
+        );
+    }
+
+    #[test]
+    fn project_file_probe_rejects_escapes_prefixes_and_directories() {
+        let engine = test_engine();
+        std::fs::create_dir_all(engine.project_root.join("scripts")).unwrap();
+        std::fs::write(engine.project_root.join("scripts/deploy"), "#!/bin/sh\n").unwrap();
+        assert!(project_regular_file_exists(
+            &engine.project_root,
+            "scripts/deploy"
+        ));
+        assert!(!project_regular_file_exists(
+            &engine.project_root,
+            "scripts"
+        ));
+        assert!(!project_regular_file_exists(
+            &engine.project_root,
+            "../outside"
+        ));
+        assert!(!project_regular_file_exists(
+            &engine.project_root,
+            "/etc/passwd"
+        ));
+        assert!(!project_regular_file_exists(
+            &engine.project_root,
+            r"C:\outside\file"
+        ));
     }
 
     #[test]
@@ -7596,7 +8154,7 @@ mod tests {
     }
 
     #[test]
-    fn ext_callers_multi_match_aggregated_note() {
+    fn ext_callers_group_distinct_definitions_and_support_file_narrowing() {
         let mut engine = test_engine();
         let a = node_lang(
             "api",
@@ -7616,34 +8174,65 @@ mod tests {
             NodeKind::Function,
             Language::Rust,
         );
-        let caller = node_lang(
-            "boot",
-            "boot",
-            "main.rs",
+        let caller_a = node_lang(
+            "boot_a",
+            "boot_a",
+            "a_main.rs",
             1,
             5,
             NodeKind::Function,
             Language::Rust,
         );
-        put_nodes(&mut engine, &[a.clone(), b.clone(), caller.clone()]);
+        let caller_b = node_lang(
+            "boot_b",
+            "boot_b",
+            "b_main.rs",
+            1,
+            5,
+            NodeKind::Function,
+            Language::Rust,
+        );
+        put_nodes(
+            &mut engine,
+            &[a.clone(), b.clone(), caller_a.clone(), caller_b.clone()],
+        );
         put_edges(
             &mut engine,
-            &[mk_edge(
-                &caller.id,
-                &a.id,
-                codegraph_core::types::EdgeKind::Calls,
-            )],
+            &[
+                mk_edge(&caller_a.id, &a.id, codegraph_core::types::EdgeKind::Calls),
+                mk_edge(&caller_b.id, &b.id, codegraph_core::types::EdgeKind::Calls),
+            ],
         );
         let tr = engine.execute("codegraph_callers", &serde_json::json!({"symbol": "api"}));
         let txt = text_of(&tr);
         assert!(
-            txt.contains("Aggregated results across 2 symbols"),
+            txt.contains("2 distinct definitions")
+                && txt.contains("svc::api")
+                && txt.contains("core::api")
+                && txt.contains("boot_a")
+                && txt.contains("boot_b"),
             "got: {txt}"
         );
+
+        let narrowed = engine.execute(
+            "codegraph_callers",
+            &serde_json::json!({"symbol": "api", "file": "svc/a.rs"}),
+        );
+        let narrowed = text_of(&narrowed);
+        assert!(narrowed.contains("boot_a"), "got: {narrowed}");
+        assert!(!narrowed.contains("boot_b"), "got: {narrowed}");
+
+        let fallback = engine.execute(
+            "codegraph_callers",
+            &serde_json::json!({"symbol": "api", "file": "missing.rs"}),
+        );
+        let fallback = text_of(&fallback);
+        assert!(fallback.contains("showing all definitions instead"));
+        assert!(fallback.contains("boot_a") && fallback.contains("boot_b"));
     }
 
     #[test]
-    fn ext_impact_multi_match_aggregated_note() {
+    fn ext_impact_groups_distinct_definitions() {
         let mut engine = test_engine();
         let a = node_lang(
             "core",
@@ -7666,9 +8255,9 @@ mod tests {
         put_nodes(&mut engine, &[a, b]);
         let tr = engine.execute("codegraph_impact", &serde_json::json!({"symbol": "core"}));
         let txt = text_of(&tr);
-        assert!(txt.contains("## Impact: \"core\""), "got: {txt}");
+        assert!(txt.contains("2 distinct definitions"), "got: {txt}");
         assert!(
-            txt.contains("Aggregated results across 2 symbols"),
+            txt.contains("a::core") && txt.contains("b::core"),
             "got: {txt}"
         );
     }

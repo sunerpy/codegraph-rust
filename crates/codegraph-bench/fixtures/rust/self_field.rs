@@ -90,3 +90,46 @@ impl Countdown {
         }
     }
 }
+
+pub struct SplitTarget;
+
+impl SplitTarget {
+    pub fn reset(&mut self) {}
+}
+
+pub struct SplitDecoy;
+
+impl SplitDecoy {
+    pub fn reset(&mut self) {}
+
+    pub fn missing(&mut self) {}
+}
+
+impl SplitTarget {
+    pub fn drive(&mut self) {
+        self.reset();
+        self.missing();
+    }
+}
+
+pub trait Drive {
+    fn go(&mut self);
+}
+
+pub struct StepDecoy;
+
+impl StepDecoy {
+    pub fn step(&mut self) {}
+}
+
+pub struct Doer;
+
+impl Doer {
+    pub fn step(&mut self) {}
+}
+
+impl Drive for Doer {
+    fn go(&mut self) {
+        self.step();
+    }
+}

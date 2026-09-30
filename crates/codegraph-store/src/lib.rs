@@ -15,6 +15,7 @@ pub use connection::{
     ExtractionStampIssue, Store, StoreError, StoreStatusOpen, StoreWriteAuthorization,
     StoreWriteOpen, StoreWritePurpose,
 };
+pub use file_identity::{PathIdentity, path_still_names_file};
 pub use index_lease::{IndexLease, IndexLeaseError, IndexLeaseValidationError};
 pub use index_state::{
     AuthoritativeSlot, CURRENT_EXTRACTION_VERSION, CURRENT_STORAGE_PROTOCOL, CorruptReason,

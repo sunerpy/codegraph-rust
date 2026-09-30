@@ -90,13 +90,83 @@ impl LanguageSpec for CSpec {
         include_import(node, source)
     }
     fn pre_parse(&self, source: &str, _file_path: &str) -> String {
-        let blanked = blank_c_leading_attr_macros(source);
+        let blanked = blank_c_designated_macro_args(source);
+        let blanked = blank_c_leading_attr_macros(&blanked);
         if crate::lang::cpp::looks_like_cuda_source(&blanked) {
             crate::lang::cpp::blank_cuda_constructs_str(&blanked)
         } else {
             blanked
         }
     }
+}
+
+/// Blank only the argument bytes of a statement-level, macro-cased call that
+/// contains a C designated initializer (`.field = value` or `[index] = value`).
+/// tree-sitter-c otherwise recovers a trailing-comma call by extending the
+/// enclosing function to EOF, swallowing later declarations (#1729). The
+/// C/C++ lexical mask keeps comments, ordinary strings, and raw strings out of
+/// both the candidate and designator tests; newlines and byte offsets survive.
+fn blank_c_designated_macro_args(source: &str) -> String {
+    if !source.contains('=') || !source.contains('(') {
+        return source.to_string();
+    }
+    static HEAD_RE: OnceLock<Regex> = OnceLock::new();
+    let head_re = HEAD_RE.get_or_init(|| {
+        Regex::new(r"(?m)^[ \t]*([A-Z_][A-Z0-9_]*)\s*\(").expect("C designated macro head regex")
+    });
+    static DESIGNATOR_RE: OnceLock<Regex> = OnceLock::new();
+    let designator_re = DESIGNATOR_RE.get_or_init(|| {
+        Regex::new(r"(?:^|[,{(\s])(?:\.[A-Za-z_]\w*|\[[^\]]+\])\s*=[^=]")
+            .expect("C designated initializer regex")
+    });
+
+    let bytes = source.as_bytes();
+    let mask = crate::lang::cpp::cpp_code_mask(source);
+    let mut spans = Vec::new();
+    for captures in head_re.captures_iter(source) {
+        let whole = captures.get(0).expect("C macro match");
+        let name = captures.get(1).expect("C macro name");
+        if !(name.start()..whole.end()).all(|index| mask[index]) {
+            continue;
+        }
+        let open = whole.end() - 1;
+        let Some(end) = crate::lang::cpp::balanced_paren_end(bytes, &mask, open) else {
+            continue;
+        };
+        let close = end - 1;
+        let mut after = end;
+        while bytes.get(after).is_some_and(u8::is_ascii_whitespace) {
+            after += 1;
+        }
+        if bytes.get(after) != Some(&b';') {
+            continue;
+        }
+
+        let mut visible_args = bytes[open + 1..close].to_vec();
+        for (offset, byte) in visible_args.iter_mut().enumerate() {
+            if !mask[open + 1 + offset] && !matches!(*byte, b'\n' | b'\r') {
+                *byte = b' ';
+            }
+        }
+        let Ok(visible_args) = std::str::from_utf8(&visible_args) else {
+            continue;
+        };
+        if designator_re.is_match(visible_args) {
+            spans.push((open + 1, close));
+        }
+    }
+    if spans.is_empty() {
+        return source.to_string();
+    }
+    let mut output = bytes.to_vec();
+    for (start, end) in spans {
+        for byte in &mut output[start..end] {
+            if !matches!(*byte, b'\n' | b'\r') {
+                *byte = b' ';
+            }
+        }
+    }
+    String::from_utf8(output).unwrap_or_else(|_| source.to_string())
 }
 
 /// Blank an attribute macro sitting in front of a C function definition's return
@@ -162,9 +232,11 @@ fn blank_c_leading_attr_macros(source: &str) -> String {
         Regex::new(r"(?m)^[ \t]*([A-Za-z_]\w*)\s+[A-Za-z_]\w*[\s*]+[A-Za-z_]\w*\s*\(")
             .expect("c-leading-attr-macro regex")
     });
+    let mask = crate::lang::cpp::cpp_code_mask(source);
     let spans: Vec<(usize, usize)> = re
         .captures_iter(source)
         .filter_map(|caps| caps.get(1))
+        .filter(|matched| (matched.start()..matched.end()).all(|index| mask[index]))
         .filter(|m| attr_macros.contains(m.as_str()))
         .map(|m| (m.start(), m.end()))
         .collect();

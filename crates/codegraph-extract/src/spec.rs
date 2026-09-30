@@ -134,6 +134,13 @@ pub trait LanguageSpec: Sync {
         false
     }
 
+    /// Whether a callable declaration is abstract. C++ uses this for pure
+    /// virtual methods (`virtual int read() = 0;`); other languages inherit the
+    /// concrete default.
+    fn is_abstract(&self, _node: Node<'_>, _source: &str) -> bool {
+        false
+    }
+
     fn is_const(&self, _node: Node<'_>) -> bool {
         false
     }

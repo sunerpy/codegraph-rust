@@ -20,8 +20,9 @@
 //!   named `${workspaceFolder}`. The global entry is therefore BARE (read-only
 //!   off any existing index, like the Kiro/Qoder global entries) and the LOCAL
 //!   entry pins an absolute `--path`.
-//! * The Copilot CLI entry carries `"tools": ["*"]`. Without it the CLI
-//!   registers the server but exposes none of its tools.
+//! * The Copilot CLI entry carries `"tools": ["*"]` plus
+//!   `"deferTools": "never"`. Without the first it exposes no tools; without
+//!   the second a large connected tool set defers Explore behind tool search.
 //!
 //! CLI-only and additive: no extraction, resolution, or golden surface is
 //! touched. The upsert is JSONC-surgical and only ever writes the `codegraph`
@@ -102,6 +103,7 @@ fn copilot_cli_entry() -> Value {
     let mut base = mcp_server_config();
     if let Value::Object(map) = &mut base {
         map.insert("tools".to_string(), json!(["*"]));
+        map.insert("deferTools".to_string(), json!("never"));
     }
     base
 }
@@ -427,6 +429,8 @@ mod tests {
             app_data: Some(home.join("AppData").join("Roaming")),
             xdg_config_home: Some(home.join(".config")),
             hermes_home: None,
+            claude_config_dir: None,
+            codex_home: None,
         };
         (ctx, base)
     }
@@ -626,8 +630,8 @@ mod tests {
 
     #[test]
     fn copilot_cli_entry_declares_all_tools() {
-        // Without `"tools": ["*"]` the CLI registers the server but exposes none
-        // of its tools.
+        // Without `tools` the CLI exposes nothing; without `deferTools: never`
+        // it can hide Explore behind tool search on large tool sets (#1696).
         let (ctx, base) = temp_ctx("cli-tools");
         CopilotCliTarget.install(&ctx, Location::Global, opts());
         let config = read_json_file(&copilot_cli_mcp_json(&ctx));
@@ -635,6 +639,11 @@ mod tests {
             config["mcpServers"]["codegraph"]["tools"],
             json!(["*"]),
             "the CLI entry must declare tools: [\"*\"]"
+        );
+        assert_eq!(
+            config["mcpServers"]["codegraph"]["deferTools"],
+            json!("never"),
+            "Explore must remain on Copilot CLI's native tool list"
         );
         let _ = fs::remove_dir_all(base);
     }

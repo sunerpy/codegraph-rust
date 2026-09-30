@@ -27,12 +27,12 @@
     "size": 767
   },
   {
-    "content_hash": "30f4bab3e50f2460cce057b7701539c5e102f261366e9267fc5077df7aebed41",
+    "content_hash": "278055c1c308236d4e3c8f32a6f2e3ff33f5fff3b193c8a36b3029f7691f8207",
     "errors": null,
     "generated": 0,
     "language": "rust",
-    "node_count": 20,
+    "node_count": 33,
     "path": "self_field.rs",
-    "size": 1222
+    "size": 1768
   }
 ]

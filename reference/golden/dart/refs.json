@@ -1,0 +1,12 @@
+[
+  {
+    "candidates": null,
+    "col": 4,
+    "file_path": "extension_type.dart",
+    "from_node_id": "method:92e64d057dc21e59be0578ff025bbc66",
+    "language": "dart",
+    "line": 5,
+    "reference_kind": "calls",
+    "reference_name": "print"
+  }
+]

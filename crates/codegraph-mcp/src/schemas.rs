@@ -273,6 +273,27 @@ mod tests {
     }
 
     #[test]
+    fn explore_always_load_metadata_survives_every_schema_surface() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        for surface in [
+            tool_definitions(),
+            visible_tool_definitions(),
+            visible_tool_definitions_requiring_project_path(),
+        ] {
+            let explore = surface
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == "codegraph_explore")
+                .expect("explore remains visible");
+            assert_eq!(
+                explore["_meta"]["anthropic/alwaysLoad"],
+                serde_json::json!(true)
+            );
+        }
+    }
+
+    #[test]
     fn is_known_tool_rejects_unknown_and_accepts_known() {
         assert!(is_known_tool("codegraph_search"));
         assert!(is_known_tool("codegraph_export"));

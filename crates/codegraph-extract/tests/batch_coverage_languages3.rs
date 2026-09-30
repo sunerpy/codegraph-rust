@@ -128,9 +128,10 @@ class Widget:
     assert!(result.errors.is_empty(), "{:?}", result.errors);
     let refs = &result.unresolved_references;
     assert!(has_fn_ref(refs, "on_click"), "arg fn-ref; refs={refs:#?}");
-    // `self.handle` (attribute special form) captures the attribute name only.
+    // `self.handle` preserves the class-scoped owner marker so resolution can
+    // distinguish it from unrelated same-named methods.
     assert!(
-        has_fn_ref(refs, "handle"),
+        has_fn_ref(refs, "this.handle"),
         "self.attr fn-ref; refs={refs:#?}"
     );
     assert!(

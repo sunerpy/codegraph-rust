@@ -9,6 +9,8 @@
 //!
 //! [`ResolutionContext`]: crate::types::ResolutionContext
 
+use std::path::{Path, PathBuf};
+
 /// Lexically normalize a POSIX path, collapsing `.` and `..` segments.
 ///
 /// Equivalent to `path.posix.normalize` for the inputs the resolver produces.
@@ -74,6 +76,37 @@ pub fn resolve(base: &str, relative: &str) -> String {
         format!("{}/{}", base.trim_end_matches('/'), relative)
     };
     normalize(&joined)
+}
+
+/// Resolve a project-relative candidate without allowing it to escape the
+/// project root lexically.
+///
+/// Resolution's filesystem fallback receives paths containing `..` from
+/// relative-import candidates. A plain [`Path::join`] would let repository
+/// content probe arbitrary paths outside the project. This intentionally does
+/// not canonicalize or reject symlinks: indexing permits an in-project symlink
+/// whose target is outside the root, so this guard covers lexical traversal
+/// only (#1631).
+pub(crate) fn lexical_path_within_root(project_root: &str, file_path: &str) -> Option<PathBuf> {
+    let normalized_separators = file_path.replace('\\', "/");
+    let bytes = normalized_separators.as_bytes();
+    let has_windows_prefix = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    // After separators are normalized, a leading `/` covers POSIX absolute
+    // paths plus Windows root-relative, UNC, and device forms. Check it directly
+    // rather than using `Path::is_absolute`: on Windows `/outside` is rooted but
+    // not "absolute" (it has no drive prefix), yet joining it to `C:\repo`
+    // still escapes to `C:\outside`. The prefix check covers both `C:/outside`
+    // and drive-relative `C:outside` forms on every host.
+    if normalized_separators.starts_with('/') || has_windows_prefix {
+        return None;
+    }
+
+    let relative = normalize(&normalized_separators);
+    if relative == ".." || relative.starts_with("../") {
+        return None;
+    }
+
+    Some(Path::new(project_root).join(relative))
 }
 
 /// Compute a relative path from `from` to `to`, both treated as POSIX
@@ -172,6 +205,59 @@ mod tests {
     fn resolve_empty_base_uses_relative() {
         assert_eq!(resolve("", "a/b"), "a/b");
         assert_eq!(resolve("", "./a"), "a");
+    }
+
+    #[test]
+    fn lexical_path_within_root_rejects_relative_and_absolute_escapes() {
+        let root = if cfg!(windows) { r"C:\repo" } else { "/repo" };
+        assert_eq!(
+            lexical_path_within_root(root, "src/../lib/a.ts"),
+            Some(Path::new(root).join("lib/a.ts"))
+        );
+        assert!(lexical_path_within_root(root, "../outside/a.ts").is_none());
+        assert!(lexical_path_within_root(root, "a/../../outside.ts").is_none());
+        assert!(lexical_path_within_root(root, "/outside/a.ts").is_none());
+        assert!(lexical_path_within_root(root, r"\outside\a.ts").is_none());
+        assert!(lexical_path_within_root(root, r"C:\outside\a.ts").is_none());
+        assert!(lexical_path_within_root(root, r"C:outside\a.ts").is_none());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn lexical_path_within_root_preserves_in_root_symlink_targets() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sandbox = std::env::temp_dir().join(format!(
+            "cg-pathutil-symlink-{}-{nanos}",
+            std::process::id()
+        ));
+        let root = sandbox.join("repo");
+        let outside = sandbox.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.ts"), "export const secret = 42;\n").unwrap();
+
+        #[cfg(unix)]
+        let link_result = std::os::unix::fs::symlink(&outside, root.join("vendor"));
+        #[cfg(windows)]
+        let link_result = std::os::windows::fs::symlink_dir(&outside, root.join("vendor"));
+
+        if link_result.is_ok() {
+            let candidate = lexical_path_within_root(
+                root.to_str().expect("UTF-8 temp path"),
+                "vendor/secret.ts",
+            )
+            .expect("the symlink path is lexically inside the project");
+            assert_eq!(candidate, root.join("vendor/secret.ts"));
+            assert!(
+                candidate.exists(),
+                "the filesystem probe still follows symlinks"
+            );
+        }
+
+        std::fs::remove_dir_all(&sandbox).unwrap();
     }
 
     #[test]

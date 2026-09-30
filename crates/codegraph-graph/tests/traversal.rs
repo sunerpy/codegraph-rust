@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
 
 use codegraph_core::types::{Edge, EdgeKind, Language, Node, NodeKind};
-use codegraph_graph::graph::{Direction, GraphTraverser, TraversalOptions, find_all_definitions};
+use codegraph_graph::graph::{
+    Direction, GraphTraverser, TraversalOptions, find_all_definitions, group_definitions,
+};
 use codegraph_store::Store;
 
 fn temp_db_path(test_name: &str) -> std::path::PathBuf {
@@ -334,6 +336,72 @@ fn node_name_ambiguity_returns_all_overloads() {
     let got = id_set(found.iter().map(|n| n.id.clone()));
     let want = id_set(["method:execute_a", "method:execute_b"].map(str::to_string));
     assert_eq!(got, want, "ambiguous name must return all overloads");
+}
+
+#[test]
+fn definition_groups_keep_overloads_together_and_disclose_filter_fallback() {
+    let nodes = vec![
+        node(
+            "method:a1",
+            NodeKind::Method,
+            "run",
+            "Service::run",
+            "src/a.ts",
+            Language::TypeScript,
+            10,
+            12,
+        ),
+        node(
+            "method:a2",
+            NodeKind::Method,
+            "run",
+            "Service::run",
+            "src/a.ts",
+            Language::TypeScript,
+            20,
+            22,
+        ),
+        node(
+            "method:b",
+            NodeKind::Method,
+            "run",
+            "Other::run",
+            "vendor/b.ts",
+            Language::TypeScript,
+            30,
+            32,
+        ),
+    ];
+
+    let all = group_definitions(&nodes, None);
+    assert!(!all.filtered_out);
+    assert_eq!(all.groups.len(), 2);
+    assert_eq!(all.groups[0].len(), 2, "same-definition overloads group");
+    assert_eq!(all.groups[1].len(), 1);
+
+    let narrowed = group_definitions(&nodes, Some("a.ts"));
+    assert!(!narrowed.filtered_out);
+    assert_eq!(narrowed.groups.len(), 1);
+    assert_eq!(narrowed.groups[0].len(), 2);
+
+    let windows = group_definitions(&nodes, Some(".\\vendor\\b.ts"));
+    assert!(!windows.filtered_out);
+    assert_eq!(windows.groups.len(), 1);
+    assert_eq!(windows.groups[0][0].id, "method:b");
+
+    let fallback = group_definitions(&nodes, Some("missing.ts"));
+    assert!(fallback.filtered_out);
+    assert_eq!(
+        fallback.groups.len(),
+        2,
+        "no-match filter keeps all definitions"
+    );
+
+    let unaligned = group_definitions(&nodes, Some("b.ts"));
+    assert!(!unaligned.filtered_out);
+    assert_eq!(unaligned.groups[0][0].id, "method:b");
+    let unaligned_miss = group_definitions(&nodes, Some("my_b.ts"));
+    assert!(unaligned_miss.filtered_out);
 }
 
 #[test]

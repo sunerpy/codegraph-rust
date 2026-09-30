@@ -214,6 +214,8 @@ mod tests {
             app_data: Some(home.join("AppData").join("Roaming")),
             xdg_config_home: Some(home.join(".config")),
             hermes_home: None,
+            claude_config_dir: None,
+            codex_home: None,
         };
         (ctx, base)
     }

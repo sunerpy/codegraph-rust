@@ -1,0 +1,60 @@
+[
+  {
+    "col": 10,
+    "kind": "references",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.95,
+      "fnRef": true,
+      "resolvedBy": "function-ref"
+    },
+    "provenance": null,
+    "source": "method:92e64d057dc21e59be0578ff025bbc66",
+    "target": "method:05192e5077270147247cb766102ea8f1"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:8e751eea10d61643a8aa244715e82664",
+    "target": "method:05192e5077270147247cb766102ea8f1"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:8e751eea10d61643a8aa244715e82664",
+    "target": "method:92e64d057dc21e59be0578ff025bbc66"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "class:db1c1649eba5ed312e7fe91d279f2695",
+    "target": "method:c8de892aa59dcfa863960de73ca95d53"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:extension_type.dart",
+    "target": "class:8e751eea10d61643a8aa244715e82664"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:extension_type.dart",
+    "target": "class:db1c1649eba5ed312e7fe91d279f2695"
+  }
+]

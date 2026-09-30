@@ -53,6 +53,16 @@
     "candidates": null,
     "col": 8,
     "file_path": "self_field.rs",
+    "from_node_id": "method:1c949c796cae4f133f48ba2603ba82b7",
+    "language": "rust",
+    "line": 111,
+    "reference_kind": "calls",
+    "reference_name": "self.missing"
+  },
+  {
+    "candidates": null,
+    "col": 8,
+    "file_path": "self_field.rs",
     "from_node_id": "method:1dd02f37a64f7acaf7c8dc29c55017c9",
     "language": "rust",
     "line": 77,

@@ -22,9 +22,18 @@
     "errors": null,
     "generated": 0,
     "language": "cpp",
-    "node_count": 7,
+    "node_count": 11,
     "path": "com_interface.hpp",
     "size": 294
+  },
+  {
+    "content_hash": "d15e2f0f74ca060f2739db7aba1fa9799bbab59eaef3eb336d27949ae18b1a3f",
+    "errors": null,
+    "generated": 0,
+    "language": "cpp",
+    "node_count": 19,
+    "path": "constructor_resolution.cpp",
+    "size": 760
   },
   {
     "content_hash": "7866bdbba877acfa0b4b8e7e4be58875893da925ac91aa333a4c3658bea64e69",
@@ -34,6 +43,15 @@
     "node_count": 12,
     "path": "derived.cpp",
     "size": 363
+  },
+  {
+    "content_hash": "23ecaace76f5fc36b4126a4e37c0ea5d099d2098c530c5520ffbdc8aa4f980c5",
+    "errors": null,
+    "generated": 0,
+    "language": "c",
+    "node_count": 4,
+    "path": "designated_macro.c",
+    "size": 211
   },
   {
     "content_hash": "e3331a39e14456236ae24d3d0cc31562b65008bf1027a065d8f403066d74a46e",
@@ -115,6 +133,24 @@
     "node_count": 3,
     "path": "plain_header_negatives.h",
     "size": 260
+  },
+  {
+    "content_hash": "d68692863901bd7bd192db10fc580becc6d1533c734f74abf8596eaaf8c0e5f5",
+    "errors": null,
+    "generated": 0,
+    "language": "cpp",
+    "node_count": 10,
+    "path": "pure_virtual.cpp",
+    "size": 524
+  },
+  {
+    "content_hash": "f95f1fbfc5b7cf252c5baac6791d675054eb8e99cc2c6a787f95ee9594f71806",
+    "errors": null,
+    "generated": 0,
+    "language": "cpp",
+    "node_count": 3,
+    "path": "raw_string.cpp",
+    "size": 365
   },
   {
     "content_hash": "0527736aa5807318919d35bb62e2c3f8dc4be0e333cf2e27553b89dc59006b74",

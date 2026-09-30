@@ -9,6 +9,15 @@
     "size": 101
   },
   {
+    "content_hash": "94c7c95e28d1f77ebf4addcd681e8ed5445938facba2b853db54a2ec0aa6cead",
+    "errors": null,
+    "generated": 0,
+    "language": "typescript",
+    "node_count": 12,
+    "path": "callable_semantics.ts",
+    "size": 924
+  },
+  {
     "content_hash": "5d91d0b374e6bbe30c01d7932f5554fbf02f1a3d1eea2f0aee046ae6a891c182",
     "errors": null,
     "generated": 0,
@@ -25,6 +34,15 @@
     "node_count": 2,
     "path": "collision.ts",
     "size": 37
+  },
+  {
+    "content_hash": "1d69b93cbb14ab8e0323ae07ca1b8997d40381621d6a0e14d23cc89c67a4ced2",
+    "errors": null,
+    "generated": 0,
+    "language": "javascript",
+    "node_count": 6,
+    "path": "commonjs_handlers.js",
+    "size": 275
   },
   {
     "content_hash": "417ddd5bafc0993f53e32c05d91eef694f7ef6b3d99fda239ae893be0fcc7c9b",

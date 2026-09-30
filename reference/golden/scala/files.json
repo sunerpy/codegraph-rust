@@ -1,0 +1,20 @@
+[
+  {
+    "content_hash": "7324352515604b9d2fac88358395643dfa87fee0bb726ba0437f617f74c0c84d",
+    "errors": null,
+    "generated": 0,
+    "language": "scala",
+    "node_count": 6,
+    "path": "agreements.scala",
+    "size": 160
+  },
+  {
+    "content_hash": "c7b2a4154d23f77fbd135bc5d0bf84b90f53626fb5ff2c80c978816cb31a22e7",
+    "errors": null,
+    "generated": 0,
+    "language": "scala",
+    "node_count": 3,
+    "path": "m_ext_agreement.scala",
+    "size": 199
+  }
+]

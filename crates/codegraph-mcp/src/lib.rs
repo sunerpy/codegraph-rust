@@ -14,6 +14,7 @@ pub mod dynamic_boundaries;
 pub mod engine;
 pub mod explore_budget;
 pub mod instructions;
+pub mod project_services;
 pub mod protocol;
 pub(crate) mod query_paths;
 pub mod rmcp_handler;
@@ -23,6 +24,13 @@ pub mod schemas;
 pub mod server;
 
 pub use engine::CodeGraphEngine;
-pub use rmcp_handler::{serve_http, serve_stdio_rmcp};
+pub use project_services::{
+    MAX_SESSION_PROJECT_SERVICES, ProjectService, ProjectServiceBroker, ProjectServiceHandle,
+    ProjectServiceStarter,
+};
+pub use rmcp_handler::{
+    serve_http, serve_http_with_project_services, serve_stdio_rmcp,
+    serve_stdio_rmcp_with_project_services,
+};
 pub use roots::{ServerRootResolution, resolve_server_root};
 pub use server::{McpServer, RunUntilAdoption, initialize_result};

@@ -1,6 +1,6 @@
 # CLI Subcommand Reference
 
-`codegraph` ships 26 subcommands. All commands accept `--help` for usage details.
+`codegraph --help` is the authoritative command inventory. Every command accepts `--help` for usage details; the table below documents the current public surface without maintaining a separate unchecked count.
 
 ## Path Convention
 
@@ -50,6 +50,16 @@
 `query` remains a visible backward-compatible alias for `search`; new scripts,
 documentation, and diagnostics should use `search`.
 
+`status` performs a read-only, scope-aware source inventory against the current
+index. It reports pending added, modified, and removed paths even after those
+changes were committed (a clean `git status` is not treated as an up-to-date
+CodeGraph index), after history rewrites, and in non-Git projects. The detector
+reuses full-sync include/exclude/custom-extension rules and the same
+`(size,mtime) → sha256` decision. JSON always includes counts plus
+`addedPaths`/`modifiedPaths`/`removedPaths`; text lists the same paths only when
+non-empty. Running status acquires only the normal read lease and does not mutate
+the database.
+
 ### Project-path argument contract
 
 Lifecycle commands (`init`, `uninit`, `index`, `sync`, `status`, `unlock`)
@@ -77,10 +87,33 @@ passed directly to `node`, avoiding name ambiguity:
 codegraph node "function:b8b1c4a981a1841066418516bc8ebf86" -p .
 ```
 
+File mode accepts editor-style line selectors and uses them as an inclusive read
+window:
+
+```bash
+codegraph node "src/main.rs:42" -p .        # start at line 42
+codegraph node "src/main.rs:42-80" -p .     # lines 42 through 80
+codegraph node "src/main.rs#L42-L80" -p .   # GitHub/editor spelling
+```
+
+The literal indexed path is resolved first, so a real filename ending in `:42`
+is never reinterpreted. Only after a literal miss does `node` strip `:<line>`,
+`:<start>-<end>`, `#L<line>`, or `#L<start>-L<end>`. Invalid, zero, reversed, and
+overflowing selectors remain literal. Windows drive-relative `C:42` and `C:#L42`
+also remain literal, while `C:\repo\src\main.rs:42` is unambiguous. CLI file mode
+uses the selector directly; MCP callers can override its offset and limit as
+described in [`mcp.md`](mcp.md).
+
 Case-insensitive exact-name search probes seek through `idx_nodes_lower_name`
 rather than scanning `nodes`. Explore separately supplements its context seeds
 with camelCase/snake-case segments, including Variable and Constant definitions.
 These are query-time changes only; they do not change the stored graph.
+
+Explore treats a slashed, extensionless path that exists as a regular file
+inside the project (for example `scripts/deploy`) as an explicit but unindexed
+path. It removes the path fragments from FTS and reports the path caveat instead
+of returning unrelated matches. Slashed prose such as `input/output` stays in
+the query, and absolute, `..`, or symlink-escaping paths are never followed.
 
 > **Note:** `serve --no-watch` and `CODEGRAPH_NO_WATCH=1` are fully equivalent —
 > both disable the live file watcher. See
@@ -92,6 +125,11 @@ These are query-time changes only; they do not change the stored graph.
 > rejected with an error instead of building a home-wide index — that index
 > would be enormous and would make a home-launched `serve --mcp` peg a CPU. Run
 > these commands inside a specific project directory.
+
+> **Unsupported-only projects are explicit.** If discovery sees files but none
+> use a language CodeGraph indexes, `init`/`index` prints the total and the five
+> most common extensions, then states that CodeGraph is inactive for the
+> workspace. Empty projects keep the ordinary `No files found to index` output.
 
 > **`affected` output fields.** `codegraph affected` always emits JSON on stdout
 > (there is no `--json` flag). Its keys are `changedFiles` (the input files),
@@ -117,16 +155,25 @@ The written MCP command launches the Rust binary: `command: "codegraph"`, `args:
 "--mcp"]` (Cursor injects `--path`; Kiro injects `--path` only on a project-local
 install).
 
-> **Kiro must be installed project-level.** Kiro launches its stdio MCP
-> subprocess from `$HOME` and its `initialize` carries no workspace root and no
-> `roots` capability, so a bare `serve --mcp` would degrade to home safe mode.
-> Run `codegraph install --target=kiro --local` from each project root — that
-> pins the project's absolute `--path`. A **global** Kiro install intentionally
-> writes **no** MCP entry (and removes a stale one left by an older version),
-> because Kiro CLI does not expand `${workspaceFolder}` in `mcp.json` args: a
-> global `--path ${workspaceFolder}` would resolve to a literal, non-existent
-> directory and break the watcher and catch-up sync.
+> **Kiro global versus project-local.** A global Kiro install writes a bare
+> `serve --mcp` entry with no `--path`. It can list tools and query any existing
+> index when the agent supplies `projectPath` per call, but it does not own a
+> project's live watcher. Run `codegraph init --target=kiro <project>` (or a
+> local Kiro install from that project) to write a project-level entry with an
+> absolute `--path` and enable live catch-up/watch. Kiro does not expand
+> `${workspaceFolder}` in global `mcp.json`, so the installer never writes that
+> literal placeholder.
 
+> **Claude tool loading.** Claude entries carry `"alwaysLoad": true`, and the
+> Explore tool also advertises `_meta["anthropic/alwaysLoad"] = true`. Together
+> they keep the primary exploration tool available from the first prompt rather
+> than hiding it behind tool search.
+
+> **OpenCode 2.** The installer writes the native
+> `mcp.servers.codegraph` entry with `disabled: false` and `codemode: false`.
+> Reinstall migrates the older `mcp.codegraph` + `enabled` shape, and uninstall
+> removes either shape while preserving JSONC comments and sibling servers.
+>
 > **The three GitHub Copilot targets.** They share the Copilot MCP surface but
 > disagree on both the wrapper key and the available locations:
 >
@@ -142,7 +189,8 @@ install).
 > `mcp.json`, so in the user-level file it would stay literal and point the server
 > at a nonexistent directory. Run `codegraph init --target=vscode` per project for
 > live watch. The Copilot CLI entry additionally carries `"tools": ["*"]`, without
-> which the CLI registers the server but exposes none of its tools.
+> which the CLI registers the server but exposes none of its tools, plus
+> `"deferTools": "never"` so Explore is not hidden behind tool search.
 
 ```bash
 codegraph install --yes                          # auto-detect installed agents, global
@@ -168,8 +216,17 @@ confirmation prompt, so it is behavior-neutral. Therefore
 `codegraph install --yes --init` is safe for unattended setup while retaining
 all ordinary broad-root and existing-index guards.
 
-**Codex CLI.** Global install remains `~/.codex/config.toml` plus
-`~/.codex/AGENTS.md`. Local install writes `<project>/.codex/config.toml`,
+**Claude and Codex profile roots.** Global Claude install follows a non-blank
+`CLAUDE_CONFIG_DIR`: `.claude.json`, `settings.json`, `CLAUDE.md`, and the skill
+directory all live inside that profile; without it the established
+`~/.claude.json` plus `~/.claude/` layout remains. Global Codex MCP config and
+managed instructions follow a non-blank `CODEX_HOME`, falling back to
+`~/.codex/config.toml` plus `~/.codex/AGENTS.md`. Relative overrides resolve
+against the install command's working directory. Detection, print-config,
+reinstall, skill updates (Claude), and uninstall use the same resolved paths.
+Local installs ignore both overrides.
+
+**Codex CLI.** Local install writes `<project>/.codex/config.toml`,
 the project-root `<project>/AGENTS.md`, and
 `<project>/.agents/skills/codegraph`. Detection, `--print-config`, install, and
 uninstall all honor the selected location. A local uninstall never edits the
@@ -202,9 +259,9 @@ installer pins an explicit `--path`:
 
 - **Cursor** — `install` injects `--path` automatically (local install pins the
   project dir; global uses `${workspaceFolder}`, which Cursor expands).
-- **Kiro** — install **project-level** only: `--path` is the concrete project dir.
-  A global Kiro install writes no entry, because Kiro CLI does not expand
-  `${workspaceFolder}` (see the note above).
+- **Kiro** — global install writes a bare read-only entry; local install and
+  `init --target=kiro` pin the concrete project path for live watch. Kiro does
+  not expand `${workspaceFolder}` in global configuration.
 - **Zed** — Zed's global `context_servers` config cannot inject a per-project
   path (no `${workspaceFolder}` expansion). A global `codegraph install --target=zed`
   writes a bare entry (read-only off any existing index). To pin a specific project,
@@ -345,7 +402,7 @@ versions behind you are.
 codegraph self-update              # update to the latest release
 codegraph self-update --check      # only report whether a newer version exists
 codegraph self-update --force      # reinstall even if already current
-codegraph self-update --tag v0.3.0 # pin a specific release tag
+codegraph self-update --tag vX.Y.Z # pin a specific release tag
 ```
 
 If codegraph lives on a root-owned path (e.g. `/usr/local/bin`), run with
@@ -507,8 +564,10 @@ user never named. Stdout stays machine-readable and unchanged.
 
 ### `--file` — disambiguating same-named definitions
 
-When two files define the same symbol, `callers` / `callees` / `impact` merge
-both definitions' relatives into one list. `--file <FILE>` keeps only the
+When two files define the same symbol, `callers` / `callees` / `impact` render
+one section or blast radius per distinct `(filePath, qualifiedName)` definition;
+same-definition overloads stay together. The backward-compatible top-level JSON
+arrays remain an explicitly labelled union. `--file <FILE>` keeps only the
 definition declared in that file:
 
 ```bash
@@ -521,17 +580,23 @@ The filter matches the whole project-relative path or any **segment-aligned**
 trailing suffix, so `other.ts` never selects `my_other.ts`. Windows separators
 and a leading `./` are normalized.
 
-A filter that matches no definition is an **error** naming the files that do
-define the symbol — reporting an empty relative-set instead would read as "this
-symbol is dead". In `--json`, the applied filter is echoed as `"file"`.
+A filter that matches no definition does not fabricate an empty answer. It
+falls back to all definitions and sets `filteredOut: true` plus a human-readable
+`note`. JSON also exposes `targets`, `ambiguous`, `aggregation`, and
+`definitions[]`; caller/callee definitions carry their own `total`, `limit`,
+`truncated`, relation list, and contributing edges. The legacy top-level union
+has the same three truncation fields. Human output says `Showing N of M` whenever
+`--limit` hides rows.
 
 ---
 
 ## `codegraph impact` — edge counts in `--json`
 
-`impact --json` emits `symbol`, `depth`, `nodeCount`, `edgeCount`,
-`resourceEdgeCount`, `affected`, and `godotDynamic`. The two counts split like
-this:
+`impact --json` emits `symbol`, `depth`, `targets`, `ambiguous`, `aggregation`,
+`file`, `filteredOut`, `note`, `definitions`, `nodeCount`, `edgeCount`,
+`resourceEdgeCount`, `affected`, and `godotDynamic`. Each definition contains
+its own roots, affected set, edges, and counts; the top-level values remain their
+deduplicated union. The two edge counts split like this:
 
 - **`edgeCount`** — **all** impact edges: the graph-traversal edges reached from
   the matched symbols, **plus** the Godot static resource edges (a `.tscn` /
@@ -890,12 +955,25 @@ upward probe runs on each relevant request and the bounded child scan runs at
 most once every five seconds, allowing an index created after startup to be
 adopted.
 
+The first call for an explicit path to an **existing** index lazily starts or
+attaches that project's shared daemon, retains one connection for the MCP
+session, and waits for catch-up before returning the tool result. Subsequent
+edits use the daemon's watcher. Multiple MCP sessions share the same per-project
+daemon, and one session closing does not stop synchronization retained by
+another. The session cap is 32 explicit projects; no index is created and no
+candidate becomes an implicit default. `CODEGRAPH_NO_DAEMON=1` opts out of this
+lazy lifecycle, while `--no-watch` keeps first-access catch-up but disables later
+watch events.
+
 ### How `serve --mcp` chooses a run mode
 
 The launcher selects a mode in this exact order:
 
 1. `CODEGRAPH_NO_DAEMON=1` is set → **Direct** (foreground, no daemon ever spawned)
-2. No `.codegraph/` directory in the project → **Direct** (nothing to share yet)
+2. No `.codegraph/` directory in the project → **Direct read-only/no-services**
+   for that launch root (an explicit `--path` pins queries but never creates
+   index state; a later per-call path to a different existing index may still
+   acquire its own lazy shared-daemon services)
 3. Otherwise → **SpawnOrProxy**: spawn a new shared detached daemon, or proxy to one already running
 
 > `CODEGRAPH_DAEMON_INTERNAL=1` is **internal-only** — it is set automatically on
@@ -907,6 +985,19 @@ When the daemon starts, it detaches from the parent process group (Unix:
 `process_group(0)`; Windows: `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`).
 Its stdout and stderr are appended to `.codegraph/daemon.log`. The Unix socket
 is at `.codegraph/daemon.sock`; the pid/lock file lives alongside it.
+
+The daemon also takes an OS kernel exclusive lock on `.codegraph/writer.pid`
+before it publishes the rendezvous. That stable file is never unlink/recreated as
+part of ordinary ownership: the lock follows the open handle and is released by
+the OS on exit; the JSON payload is only diagnostic. The permanent `index.lock`
+still guards each individual read/write operation. Keeping these capabilities
+separate means many proxy clients can share one watcher while two long-lived
+direct writers cannot alternate syncs.
+
+Cold-start latency remains bounded: after a successful fire-and-forget daemon
+spawn, the first foreground stdio process answers MCP directly but starts no
+watcher/catch-up of its own. If the child cannot be spawned, that foreground
+process falls back to direct writer mode and takes `writer.pid` itself.
 
 On filesystems that reject binding an `AF_UNIX` socket inside the project
 directory (ExFAT/FAT, some network mounts, WSL DrvFs), the daemon falls back
@@ -927,6 +1018,10 @@ To suppress the daemon entirely in CI or scripted contexts:
 ```bash
 CODEGRAPH_NO_DAEMON=1 codegraph serve --mcp --path /path/to/project
 ```
+
+Only one such direct process may run background services for the same indexed
+project. A second exits immediately and names the current holder. Prefer default
+daemon mode when several agents or editor windows need the same live index.
 
 ### Live file watch
 
@@ -980,7 +1075,7 @@ Three escape hatches:
 
 | Variable                           | Default      | Clamp range         | Meaning                                                                                                            |
 | ---------------------------------- | ------------ | ------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `CODEGRAPH_NO_DAEMON`              | —            | —                   | Force foreground Direct mode; never spawn or proxy a daemon                                                        |
+| `CODEGRAPH_NO_DAEMON`              | —            | —                   | Force foreground Direct mode; one indexed-project writer only, enforced by `writer.pid`                            |
 | `CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS` | `300000`     | 1000–3600000        | Exit after this long with no connected clients                                                                     |
 | `CODEGRAPH_DAEMON_MAX_IDLE_MS`     | `1800000`    | 1000–3600000        | Hard cap on total daemon lifetime when idle                                                                        |
 | `CODEGRAPH_DAEMON_CLIENT_SWEEP_MS` | `30000`      | 50–600000           | How often the daemon sweeps for dead clients                                                                       |
@@ -1074,9 +1169,15 @@ codegraph sync /path/to/project          # ordinary changes or a supported upgra
 codegraph index --force /path/to/project # only when the CLI explicitly requires recovery
 ```
 
-Extraction version 11 → 12 is a supported `sync` upgrade: `status` reports the
-old index as outdated, and `sync` rebuilds it into the current namespace. Do not
-run `index --force` solely because the extraction version changed.
+Extraction versions 11 → 12 and 12 → 13 are supported `sync` upgrades: `status`
+reports the old index as outdated, and `sync` rebuilds it into the current
+namespace. Do not run `index --force` solely because the extraction version
+changed.
+
+If a supported grammar reports tree errors and extraction collapses to only the
+synthetic file node, `init`/`index`/`sync` still succeed but print and persist
+`parse produced no symbols (tree has errors)`. Files with useful surviving
+symbols stay quiet even when the grammar tree contains recoverable error nodes.
 
 ### Index diagnostics
 
@@ -1091,8 +1192,13 @@ boundary, slow-file watchdog behavior, and the files to attach to a report.
 
 `codegraph prompt-hook` is a hidden subcommand (not shown in `--help`). It accepts
 a query as an argument or reads one from stdin, runs `codegraph_explore` against
-the nearest index, and prints structured context. If no index is found it prints a
-graceful message and exits cleanly; same if no query is provided.
+the nearest index, and prints structured context. HIGH-tier Explore text is
+capped at 9,000 UTF-8 bytes so the complete wrapper stays below Claude Code's
+10,000-byte inline hook-output limit; truncation never splits a multi-byte
+character. If the first non-whitespace content is `<task-notification>`, the
+host-generated message is skipped before index work. A user mentioning that tag
+later in a real prompt is not suppressed. If no index is found or no query is
+provided, the hook exits cleanly and silently.
 
 `codegraph install --prompt-hook` writes a `UserPromptSubmit` hook into Claude
 Code's config that calls `codegraph prompt-hook` before each prompt. This is
@@ -1105,23 +1211,12 @@ entry. No other agent configs are touched.
 
 ## Supported languages
 
-The language set is the fixed `LANGUAGES` constant, in three extraction tiers.
-
-**tree-sitter grammars (regular symbol extraction):** TypeScript, TSX, JavaScript,
-JSX, Python, Go, Rust, Java, C, C++, C#, PHP, Ruby, Swift, Kotlin, Dart, Pascal,
-Scala, Lua, Luau, Objective-C, R.
-
-**embedded / custom extractors:** Vue, Svelte, Astro, Razor, Liquid, MyBatis XML,
-DFM/FMX.
-
-**file-level-only (0 symbols at the extract stage):** YAML, Twig, Properties.
-
-`html` / `css` / `json` / `sql` are not in the extraction model and are not
-extracted. See [`grammar-manifest.md`](grammar-manifest.md) and
-[`embedded-extraction.md`](embedded-extraction.md) for the full grammar manifest
-and embedded-language extraction detail.
-
----
+The complete source-derived taxonomy, extension map, extraction tiers, and
+static-analysis boundaries are maintained in [`languages.md`](languages.md).
+Grammar/custom ownership and ABI smoke coverage are in
+[`grammar-manifest.md`](grammar-manifest.md). Do not duplicate that inventory in
+the CLI reference: `Language::ALL`, `spec_for_language`, embedded detection, and
+`builtin_language_for_ext` are the runtime authorities.
 
 ## Scope and non-goals
 
@@ -1135,6 +1230,6 @@ golden byte-stable output.
   constraint, guardrail-enforced; LLM combination happens in the orchestration
   layer).
 - No semantic search; search is FTS5 + deterministic scoring only.
-- Concrete `FrameworkResolver`s exist for React / Vue / NestJS; other framework
-  resolution is deferred.
+- Concrete `FrameworkResolver`s exist for NestJS, React, Vue, Godot, and Tauri;
+  other framework resolution remains explicitly deferred.
 - No languages beyond the fixed `LANGUAGES` set.

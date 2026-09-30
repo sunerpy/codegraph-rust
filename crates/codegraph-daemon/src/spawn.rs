@@ -17,6 +17,12 @@ pub const CODEGRAPH_HTTP_DETACH_INTERNAL: &str = "CODEGRAPH_HTTP_DETACH_INTERNAL
 /// daemon crate does not need to depend on codegraph-watch just for a string.
 const CODEGRAPH_NO_WATCH: &str = "CODEGRAPH_NO_WATCH";
 
+/// Internal marker used only when a lazy explicit-project service starts a
+/// daemon. That caller performs the mandatory first catch-up synchronously, so
+/// the daemon must subscribe its watcher but skip its usual duplicate startup
+/// catch-up pass.
+pub const CODEGRAPH_SKIP_STARTUP_CATCHUP: &str = "CODEGRAPH_SKIP_STARTUP_CATCHUP";
+
 #[cfg(windows)]
 const DETACHED_PROCESS: u32 = 0x0000_0008;
 #[cfg(windows)]
@@ -36,6 +42,26 @@ const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 /// file watcher, exactly as if the flag had been inherited — but without any
 /// global-env mutation in the parent.
 pub fn spawn_detached_daemon(exe: &Path, root: &Path, no_watch: bool) -> Result<()> {
+    spawn_detached_daemon_inner(exe, root, no_watch, false)
+}
+
+/// Spawn a daemon for lazy explicit-`projectPath` services. The daemon owns the
+/// watcher immediately but skips its background catch-up because the caller
+/// waits for one synchronous catch-up before returning the first tool result.
+pub fn spawn_detached_daemon_for_project_service(
+    exe: &Path,
+    root: &Path,
+    no_watch: bool,
+) -> Result<()> {
+    spawn_detached_daemon_inner(exe, root, no_watch, true)
+}
+
+fn spawn_detached_daemon_inner(
+    exe: &Path,
+    root: &Path,
+    no_watch: bool,
+    skip_startup_catch_up: bool,
+) -> Result<()> {
     // Resolved once, fail-closed: the log target must be the project's own v2
     // rendezvous log, never a reconstructed path.
     let log_path = daemon_log_path(root)?;
@@ -51,6 +77,9 @@ pub fn spawn_detached_daemon(exe: &Path, root: &Path, no_watch: bool) -> Result<
         .stderr(log_target(&log_path));
     if no_watch {
         command.env(CODEGRAPH_NO_WATCH, "1");
+    }
+    if skip_startup_catch_up {
+        command.env(CODEGRAPH_SKIP_STARTUP_CATCHUP, "1");
     }
 
     detach(&mut command);

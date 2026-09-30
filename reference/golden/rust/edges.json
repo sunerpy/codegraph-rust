@@ -16,8 +16,8 @@
     "kind": "calls",
     "line": 89,
     "metadata": {
-      "confidence": 0.4,
-      "resolvedBy": "exact-match"
+      "confidence": 0.9,
+      "resolvedBy": "qualified-name"
     },
     "provenance": null,
     "source": "method:e3a6ddebdcc8fea332bc9fd28acd3c7b",
@@ -58,6 +58,18 @@
     "provenance": null,
     "source": "struct:280f7daaeca096946aa3484658c88063",
     "target": "trait:822b89fd17ee8e49a50fbe03e4fe72de"
+  },
+  {
+    "col": 5,
+    "kind": "implements",
+    "line": 131,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "struct:10ae8eba9644fb15110032de62f5074b",
+    "target": "trait:7885ef3f957141ad762ca16f1afc580a"
   },
   {
     "col": 5,
@@ -130,6 +142,30 @@
     "provenance": null,
     "source": "struct:00fb5a02fc6889409e039fb6dcf358a0",
     "target": "trait:d8605a7e20ab75ad54290c9e4502ad66"
+  },
+  {
+    "col": 8,
+    "kind": "calls",
+    "line": 110,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "method:1c949c796cae4f133f48ba2603ba82b7",
+    "target": "method:6e1e7eb1897ffb7d6281af7959155dde"
+  },
+  {
+    "col": 8,
+    "kind": "calls",
+    "line": 133,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "qualified-name"
+    },
+    "provenance": null,
+    "source": "method:0f4640288266b6d082378f92d5216de4",
+    "target": "method:90df49b6bc4206e7aaec991f720e1732"
   },
   {
     "col": 8,
@@ -510,6 +546,15 @@
     "metadata": null,
     "provenance": null,
     "source": "file:self_field.rs",
+    "target": "method:0f4640288266b6d082378f92d5216de4"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:self_field.rs",
     "target": "method:1664cb1c390283048a9ac640a8797063"
   },
   {
@@ -520,6 +565,15 @@
     "provenance": null,
     "source": "file:self_field.rs",
     "target": "method:1957267ebf94a1b5a3d96556ced4faca"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:self_field.rs",
+    "target": "method:1c949c796cae4f133f48ba2603ba82b7"
   },
   {
     "col": null,
@@ -555,7 +609,52 @@
     "metadata": null,
     "provenance": null,
     "source": "file:self_field.rs",
+    "target": "method:5f36c0113db17e9515d3bc25a8e6c05a"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:self_field.rs",
+    "target": "method:634b614d0e02aa92d10ee65727574f28"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:self_field.rs",
     "target": "method:6b1aec63e0cff57c30774c728e61e843"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:self_field.rs",
+    "target": "method:6e1e7eb1897ffb7d6281af7959155dde"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:self_field.rs",
+    "target": "method:90df49b6bc4206e7aaec991f720e1732"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:self_field.rs",
+    "target": "method:d4ac1e2a071762b4692a5826527d6d8c"
   },
   {
     "col": null,
@@ -582,6 +681,15 @@
     "metadata": null,
     "provenance": null,
     "source": "file:self_field.rs",
+    "target": "struct:10ae8eba9644fb15110032de62f5074b"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:self_field.rs",
     "target": "struct:19fcccf3e085823e5f2e65e3a41576ae"
   },
   {
@@ -591,7 +699,25 @@
     "metadata": null,
     "provenance": null,
     "source": "file:self_field.rs",
+    "target": "struct:25cc800d94ce63b910b6fd528599a25d"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:self_field.rs",
     "target": "struct:2e679781b98a6308aa8511ef6b4fae19"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:self_field.rs",
+    "target": "struct:3044babf327ea10cf62bed16c2f469c1"
   },
   {
     "col": null,
@@ -619,6 +745,15 @@
     "provenance": null,
     "source": "file:self_field.rs",
     "target": "struct:a2deb552393969ddffca8b8b8b3b6776"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:self_field.rs",
+    "target": "struct:a4f78f063a09975857997e494dd8553f"
   },
   {
     "col": null,
@@ -662,8 +797,35 @@
     "line": null,
     "metadata": null,
     "provenance": null,
+    "source": "file:self_field.rs",
+    "target": "trait:7885ef3f957141ad762ca16f1afc580a"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
     "source": "struct:00fb5a02fc6889409e039fb6dcf358a0",
     "target": "method:d2dfb67ceb37326f45f8cd1641fe3ba6"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:10ae8eba9644fb15110032de62f5074b",
+    "target": "method:0f4640288266b6d082378f92d5216de4"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:10ae8eba9644fb15110032de62f5074b",
+    "target": "method:90df49b6bc4206e7aaec991f720e1732"
   },
   {
     "col": null,
@@ -682,6 +844,24 @@
     "provenance": null,
     "source": "struct:1ef30d9d3f298b426fbbbd5910139ecc",
     "target": "method:15074a95e078da927a780dccd5ed2448"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:25cc800d94ce63b910b6fd528599a25d",
+    "target": "method:5f36c0113db17e9515d3bc25a8e6c05a"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:25cc800d94ce63b910b6fd528599a25d",
+    "target": "method:634b614d0e02aa92d10ee65727574f28"
   },
   {
     "col": null,
@@ -709,6 +889,24 @@
     "provenance": null,
     "source": "struct:2e679781b98a6308aa8511ef6b4fae19",
     "target": "method:fbf14162f990c64466ebf52588d5e3a6"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:3044babf327ea10cf62bed16c2f469c1",
+    "target": "method:1c949c796cae4f133f48ba2603ba82b7"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:3044babf327ea10cf62bed16c2f469c1",
+    "target": "method:6e1e7eb1897ffb7d6281af7959155dde"
   },
   {
     "col": null,
@@ -754,6 +952,15 @@
     "provenance": null,
     "source": "struct:a2deb552393969ddffca8b8b8b3b6776",
     "target": "method:1664cb1c390283048a9ac640a8797063"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "struct:a4f78f063a09975857997e494dd8553f",
+    "target": "method:d4ac1e2a071762b4692a5826527d6d8c"
   },
   {
     "col": null,
@@ -835,6 +1042,15 @@
     "provenance": null,
     "source": "trait:76fe46fe3128f1980f0bda9a06155993",
     "target": "method:9765edc3e460e1296020dc1ddf2531af"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "trait:7885ef3f957141ad762ca16f1afc580a",
+    "target": "method:d2274655d99f1b81b0b65055cdfbff4d"
   },
   {
     "col": null,

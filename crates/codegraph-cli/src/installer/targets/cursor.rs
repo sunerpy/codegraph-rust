@@ -237,6 +237,8 @@ mod tests {
             app_data: None,
             xdg_config_home: None,
             hermes_home: None,
+            claude_config_dir: None,
+            codex_home: None,
         }
     }
 
@@ -262,6 +264,8 @@ mod tests {
                 app_data: None,
                 xdg_config_home: None,
                 hermes_home: None,
+                claude_config_dir: None,
+                codex_home: None,
             };
             fs::create_dir_all(&ctx.cwd).unwrap();
             fs::create_dir_all(&ctx.home).unwrap();

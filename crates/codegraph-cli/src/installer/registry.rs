@@ -188,6 +188,8 @@ mod tests {
             app_data: None,
             xdg_config_home: None,
             hermes_home: None,
+            claude_config_dir: None,
+            codex_home: None,
         }
     }
 

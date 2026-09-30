@@ -182,10 +182,20 @@ codegraph install --yes --init
 codegraph install --target=codex,claude,kiro --yes
 ```
 
+Global profile overrides are honored: Claude Code follows
+`CLAUDE_CONFIG_DIR`, Codex follows `CODEX_HOME`, and OpenCode 2 receives its
+native `mcp.servers.codegraph` entry with `codemode: false`. Claude entries set
+`alwaysLoad: true`; Copilot CLI entries set `deferTools: "never"` so Explore is
+available from the first prompt.
+
 A server launched without `--path` can serve an existing index selected by an
 explicit per-call `projectPath`, client roots, or deterministic workspace
-adoption. Pin `--path` when a project should be the default rather than
-supplied per call.
+adoption. First explicit access to an existing index waits for catch-up and
+retains that project's shared daemon/watcher; multiple child projects remain
+separate and multiple MCP sessions share one writer per project. Pin `--path`
+when a project should be the default rather than supplied per call. Explicit
+direct mode (`CODEGRAPH_NO_DAEMON=1`) opts out of lazy cross-project daemon
+services, permits one direct writer, and rejects a second.
 
 The default visible MCP surface emphasizes exploration, file/symbol reads,
 search, and callers. Additional known tools can be enabled with

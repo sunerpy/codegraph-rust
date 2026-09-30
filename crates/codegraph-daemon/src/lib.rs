@@ -11,10 +11,12 @@ mod lock;
 pub mod mcp_registry;
 mod paths;
 mod process;
+mod project_service;
 pub mod proxy;
 mod session;
 pub mod spawn;
 mod transport;
+mod writer_lock;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -38,10 +40,19 @@ pub use process::{
     SupervisionState, current_ppid, is_process_alive, is_session_leader, supervision_lost_reason,
     terminate_pid,
 };
+pub use project_service::{ProjectDaemonLease, project_service_broker, retain_project_daemon};
 pub use proxy::{ProxyOutcome, run_proxy, verify_daemon_hello};
 pub use session::{SessionRegistry, read_daemon_hello, run_session_recv};
-pub use spawn::{CODEGRAPH_HTTP_DETACH_INTERNAL, spawn_detached_daemon, spawn_detached_http};
+pub use spawn::{
+    CODEGRAPH_HTTP_DETACH_INTERNAL, CODEGRAPH_SKIP_STARTUP_CATCHUP, spawn_detached_daemon,
+    spawn_detached_daemon_for_project_service, spawn_detached_http,
+};
 use tracing::{debug, info, warn};
+pub use writer_lock::{
+    WriterAcquireResult, WriterLockGuard, WriterLockInfo, clear_stale_writer_lock,
+    decode_writer_lock_info, read_writer_lock, try_acquire_writer_lock, writer_lock_held_message,
+    writer_pid_path,
+};
 
 use crate::lock::{cleanup_owned_rendezvous, rewrite_lock_socket_path};
 use crate::session::{ControlHandle, ShutdownRequest, serve_session_async};
@@ -373,6 +384,19 @@ fn start_with_lock(
     let rendezvous_dir = paths::rendezvous_dir(&project_root)?;
     fs::create_dir_all(&rendezvous_dir)
         .with_context(|| format!("creating {}", rendezvous_dir.display()))?;
+    let writer_guard = match try_acquire_writer_lock(&project_root, "daemon")? {
+        WriterAcquireResult::Acquired(guard) => guard,
+        WriterAcquireResult::Taken {
+            pid_path: writer_path,
+            existing,
+        } => {
+            cleanup_owned_rendezvous(&pid_path, &socket_path, std::process::id());
+            bail!(
+                "{}",
+                writer_lock_held_message(existing.as_ref(), &writer_path)
+            );
+        }
+    };
     let project_identity = paths::index_paths(&project_root)?
         .project_identity()
         .to_string();
@@ -413,6 +437,7 @@ fn start_with_lock(
             thread_registry,
             thread_shutdown,
             options,
+            writer_guard,
         ))
     });
 
@@ -491,6 +516,7 @@ async fn run_accept_loop_async(
     registry: SessionRegistry,
     shutdown: Arc<AtomicBool>,
     options: DaemonOptions,
+    _writer_guard: WriterLockGuard,
 ) -> Result<()> {
     use interprocess::local_socket::traits::tokio::Listener as _;
 
@@ -520,7 +546,8 @@ async fn run_accept_loop_async(
     // the session task: per-connection would spawn N watchers.
     let watcher = start_project_watcher(&project_root, &options, &lease_loops);
 
-    let _catch_up_done = spawn_catch_up(&project_root, &lease_loops);
+    let _catch_up_done = (std::env::var(CODEGRAPH_SKIP_STARTUP_CATCHUP).as_deref() != Ok("1"))
+        .then(|| spawn_catch_up(&project_root, &lease_loops));
 
     // The control channel is separate from the request path by construction: a
     // session that reads a control frame never builds an engine and never takes a
@@ -549,6 +576,9 @@ async fn run_accept_loop_async(
                     let session_socket = socket_display.clone();
                     let session_registry = registry.clone();
                     let run_mcp = options.run_mcp;
+                    let project_services = run_mcp.then(|| {
+                        project_service_broker(!options.watch)
+                    });
                     let session_control = control.clone();
                     tokio::spawn(async move {
                         if let Err(err) = serve_session_async(
@@ -557,6 +587,7 @@ async fn run_accept_loop_async(
                             session_socket,
                             session_registry,
                             run_mcp,
+                            project_services,
                             Some(session_control),
                         )
                         .await

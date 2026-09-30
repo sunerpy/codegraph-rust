@@ -547,6 +547,122 @@ pub fn remove_nested_key_jsonc(
     Ok(FileAction::Removed)
 }
 
+/// Surgically upsert `<root>.<middle>.<leaf> = value` in JSONC while preserving
+/// comments, sibling servers, key order, and formatting. This is the native
+/// OpenCode 2 `mcp.servers.codegraph` shape; keeping the primitive generic stops
+/// targets from replacing the whole `servers` object and dropping user comments.
+pub fn upsert_three_level_key_jsonc(
+    path: &Path,
+    root_key: &str,
+    middle_key: &str,
+    leaf_key: &str,
+    value: &Value,
+    schema_url: Option<&str>,
+) -> std::io::Result<FileAction> {
+    let text = fs::read_to_string(path)?;
+    let existed = !text.trim().is_empty();
+    let parsed = parse_json_object(&text);
+    if let Some(map) = &parsed {
+        let current = map
+            .get(root_key)
+            .and_then(|root| root.get(middle_key))
+            .and_then(|middle| middle.get(leaf_key));
+        if current == Some(value) && (schema_url.is_none() || map.contains_key("$schema")) {
+            return Ok(FileAction::Unchanged);
+        }
+    }
+
+    let root = CstRootNode::parse(&text, &ParseOptions::default())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+    let root_object = root.object_value_or_set();
+    let first = root_object
+        .object_value_or_create(root_key)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("`{root_key}` exists but is not an object"),
+            )
+        })?;
+    let second = first.object_value_or_create(middle_key).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("`{root_key}.{middle_key}` exists but is not an object"),
+        )
+    })?;
+    match second.get(leaf_key) {
+        Some(property) => property.set_value(to_cst_input(value)),
+        None => {
+            second.append(leaf_key, to_cst_input(value));
+        }
+    }
+    if let Some(schema) = schema_url
+        && root_object.get("$schema").is_none()
+    {
+        root_object.insert(0, "$schema", CstInputValue::String(schema.to_string()));
+    }
+    let mut output = root.to_string();
+    if text.ends_with('\n') && !output.ends_with('\n') {
+        output.push('\n');
+    }
+    atomic_write_file(path, &output)?;
+    Ok(if existed {
+        FileAction::Updated
+    } else {
+        FileAction::Created
+    })
+}
+
+/// Remove `<root>.<middle>.<leaf>` from JSONC, dropping only wrappers that become
+/// empty. Comments and unrelated entries at every level remain untouched.
+pub fn remove_three_level_key_jsonc(
+    path: &Path,
+    root_key: &str,
+    middle_key: &str,
+    leaf_key: &str,
+) -> std::io::Result<FileAction> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return Ok(FileAction::NotFound);
+    };
+    let present = parse_json_object(&text)
+        .and_then(|map| {
+            map.get(root_key)
+                .and_then(|root| root.get(middle_key))
+                .and_then(|middle| middle.get(leaf_key))
+                .cloned()
+        })
+        .is_some();
+    if !present {
+        return Ok(FileAction::NotFound);
+    }
+
+    let root = CstRootNode::parse(&text, &ParseOptions::default())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+    if let Some(root_object) = root.object_value()
+        && let Some(first) = root_object.object_value(root_key)
+        && let Some(second) = first.object_value(middle_key)
+    {
+        if let Some(property) = second.get(leaf_key) {
+            property.remove();
+        }
+        if second.properties().is_empty()
+            && let Some(property) = first.get(middle_key)
+        {
+            property.remove();
+        }
+        if first.properties().is_empty()
+            && let Some(property) = root_object.get(root_key)
+        {
+            property.remove();
+        }
+    }
+    let mut output = root.to_string();
+    if text.ends_with('\n') && !output.ends_with('\n') {
+        output.push('\n');
+    }
+    atomic_write_file(path, &output)?;
+    Ok(FileAction::Removed)
+}
+
 /// Replace or append a marker-delimited section. Ports
 /// `replaceOrAppendMarkedSection` (shared.ts:141).
 pub fn replace_or_append_marked_section(

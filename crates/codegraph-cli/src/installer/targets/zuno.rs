@@ -230,6 +230,8 @@ mod tests {
                 app_data: None,
                 xdg_config_home: Some(base.join("xdg")),
                 hermes_home: None,
+                claude_config_dir: None,
+                codex_home: None,
             };
             fs::create_dir_all(&ctx.home).unwrap();
             fs::create_dir_all(&ctx.cwd).unwrap();

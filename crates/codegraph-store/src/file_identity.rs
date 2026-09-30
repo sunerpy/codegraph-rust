@@ -1,4 +1,5 @@
-//! Private cross-platform filesystem-object identity helpers.
+//! Cross-platform filesystem-object identity helpers: crate-private, plus
+//! the opaque public [`PathIdentity`].
 
 #[cfg(windows)]
 use std::fs::OpenOptions;
@@ -21,6 +22,30 @@ pub(crate) enum FileIdentity {
         modified: Option<std::time::SystemTime>,
         created: Option<std::time::SystemTime>,
     },
+}
+
+/// Opaque identity of the filesystem object a path names right now. A file
+/// rewritten in place keeps it; a file deleted and re-created, or replaced by
+/// a rename, does not — which is how a long-lived holder notices that the
+/// index it attached to is no longer the one on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathIdentity(FileIdentity);
+
+impl PathIdentity {
+    /// Capture the identity of the regular file `path` names.
+    ///
+    /// # Errors
+    /// When the path is missing, unreadable, or not a regular file.
+    pub fn of(path: &Path) -> io::Result<Self> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !is_regular(&metadata) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path does not name a regular file",
+            ));
+        }
+        identity_for_validated_path(path, &metadata).map(Self)
+    }
 }
 
 pub(crate) fn is_alias(metadata: &Metadata) -> bool {
@@ -162,7 +187,11 @@ pub(crate) fn identity_for_validated_path(
     }
 }
 
-pub(crate) fn path_still_names_file(path: &Path, file: &File) -> io::Result<bool> {
+/// Whether `path` still names the exact physical object held by `file`.
+///
+/// Exported for other index-lifecycle crates that need the same Unix inode /
+/// Windows FileIdInfo corroboration as [`crate::IndexLease`].
+pub fn path_still_names_file(path: &Path, file: &File) -> io::Result<bool> {
     path_still_names_identity(path, identity_for_file(file)?)
 }
 

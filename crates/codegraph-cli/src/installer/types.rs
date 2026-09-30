@@ -140,6 +140,10 @@ pub struct InstallContext {
     pub xdg_config_home: Option<PathBuf>,
     /// `$HERMES_HOME`, used only by the Hermes target.
     pub hermes_home: Option<PathBuf>,
+    /// `$CLAUDE_CONFIG_DIR`, used only by global Claude Code profile paths.
+    pub claude_config_dir: Option<PathBuf>,
+    /// `$CODEX_HOME`, used only by global Codex user-layer paths.
+    pub codex_home: Option<PathBuf>,
 }
 
 /// Ports `AgentTarget` (types.ts:73). `&self` is the frozen registry singleton.
@@ -317,6 +321,8 @@ mod tests {
             app_data: None,
             xdg_config_home: None,
             hermes_home: None,
+            claude_config_dir: None,
+            codex_home: None,
         };
         (ctx, base)
     }

@@ -27,14 +27,15 @@ use std::time::Duration;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
-    Implementation, InitializeResult, JsonObject, ListToolsResult, PaginatedRequestParams,
-    ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
+    Implementation, InitializeResult, JsonObject, ListToolsResult, MetaObject,
+    PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleServer};
 use serde_json::{Value, json};
 
 use crate::engine::CodeGraphEngine;
 use crate::instructions::server_instructions;
+use crate::project_services::ProjectServiceBroker;
 use crate::protocol::ToolResult;
 use crate::roots::{
     ServerRootDiscovery, WorkspaceRoots, db_exists_for, db_path_for, format_subproject_candidates,
@@ -116,15 +117,27 @@ pub struct CodeGraphHandler {
     cwd: Option<PathBuf>,
     no_roots: bool,
     root_discovery: Option<RootDiscovery>,
+    project_services: Option<ProjectServiceBroker>,
 }
 
 impl CodeGraphHandler {
     pub fn new(default_project: Option<PathBuf>) -> Self {
+        Self::new_with_project_services(default_project, None)
+    }
+
+    /// Pinned/no-roots handler with an optional explicit-`projectPath` live
+    /// service broker. The daemon and CLI integration layers supply the broker;
+    /// library callers that only need request-scoped reads keep using [`Self::new`].
+    pub fn new_with_project_services(
+        default_project: Option<PathBuf>,
+        project_services: Option<ProjectServiceBroker>,
+    ) -> Self {
         Self {
             default_project: Arc::new(Mutex::new(default_project)),
             cwd: std::env::current_dir().ok(),
             no_roots: true,
             root_discovery: None,
+            project_services,
         }
     }
 
@@ -137,13 +150,28 @@ impl CodeGraphHandler {
         Self::new(Some(project))
     }
 
+    pub fn http_with_project_services(
+        project: PathBuf,
+        project_services: Option<ProjectServiceBroker>,
+    ) -> Self {
+        Self::new_with_project_services(Some(project), project_services)
+    }
+
     /// Non-pinned stdio constructor: `no_roots = false`, so
     /// `on_initialized` requests the client's roots and adopts an indexed one
     /// when the current default is displaceable (`roots::` adoption rules). This
     /// is the bare-`serve --mcp` / Zed-local case where `default_project` is a
     /// cwd-derived, possibly unindexed dir.
     pub fn serve_with_roots(default_project: Option<PathBuf>, cwd: Option<PathBuf>) -> Self {
-        Self::stdio(default_project, cwd, false)
+        Self::stdio(default_project, cwd, false, None)
+    }
+
+    pub fn serve_with_roots_and_project_services(
+        default_project: Option<PathBuf>,
+        cwd: Option<PathBuf>,
+        project_services: Option<ProjectServiceBroker>,
+    ) -> Self {
+        Self::stdio(default_project, cwd, false, project_services)
     }
 
     /// Test-only constructor with an explicit cwd (mirrors
@@ -151,10 +179,15 @@ impl CodeGraphHandler {
     /// exercised deterministically.
     #[doc(hidden)]
     pub fn new_with_cwd(default_project: Option<PathBuf>, cwd: Option<PathBuf>) -> Self {
-        Self::stdio(default_project, cwd, true)
+        Self::stdio(default_project, cwd, true, None)
     }
 
-    fn stdio(default_project: Option<PathBuf>, cwd: Option<PathBuf>, no_roots: bool) -> Self {
+    fn stdio(
+        default_project: Option<PathBuf>,
+        cwd: Option<PathBuf>,
+        no_roots: bool,
+        project_services: Option<ProjectServiceBroker>,
+    ) -> Self {
         let search_from = default_project.clone().or_else(|| cwd.clone());
         let mut discovery = ServerRootDiscovery::new(search_from);
         let mut resolved_default = default_project;
@@ -192,6 +225,7 @@ impl CodeGraphHandler {
             cwd,
             no_roots,
             root_discovery: Some(Arc::new(Mutex::new(discovery))),
+            project_services,
         }
     }
 
@@ -336,6 +370,9 @@ fn tools_from_schema(tools_json: Value) -> Vec<Tool> {
                 built = built.annotate(
                     serde_json::from_value(Value::Object(annotations)).unwrap_or_default(),
                 );
+            }
+            if let Some(Value::Object(meta)) = obj.remove("_meta") {
+                built.meta = Some(MetaObject(meta));
             }
             Some(built)
         })
@@ -496,7 +533,6 @@ impl ServerHandler for CodeGraphHandler {
                 return Ok(tool_result_to_call_result(&result).into());
             }
         };
-
         // Handler half of the debug split (paired with the `debug_log_requests`
         // middleware): logs the resolved tool + projectPath — values already in
         // hand here, so no request-body buffering is needed. Emitted at debug
@@ -525,8 +561,25 @@ impl ServerHandler for CodeGraphHandler {
         // unblocked fast with an isError result; the orphaned thread drains
         // on its own. `tool_timeout() == None` (env `0`) opts out entirely.
         let outcome_tool = tool_name.clone();
-        let join_future =
-            tokio::task::spawn_blocking(move || execute_owned(&project_path, &tool_name, &args));
+        let explicit_project = raw_project.is_some();
+        let project_services = self.project_services.clone();
+        let join_future = tokio::task::spawn_blocking(move || {
+            // Default-project reads keep the established startup lifecycle. An
+            // explicit path is unambiguous and may lazily attach its EXISTING
+            // index to a shared watcher owner. Keep the catch-up in this blocking
+            // closure: first access waits for it, the tokio executor stays free,
+            // and the existing per-tool timeout bounds the client's wait.
+            if explicit_project
+                && let Some(project_services) = &project_services
+                && let Err(error) = project_services.ensure(&project_path)
+            {
+                return ToolResult::error(format!(
+                    "Failed to prepare live synchronization for {}: {error:#}",
+                    project_path.display()
+                ));
+            }
+            execute_owned(&project_path, &tool_name, &args)
+        });
 
         let timed_out;
         let join = match tool_timeout() {
@@ -581,6 +634,13 @@ impl ServerHandler for CodeGraphHandler {
 /// adopts an indexed one when the cwd-derived default is displaceable — parity
 /// with the hand-rolled `McpServer::new` direct serve.
 pub fn serve_stdio_rmcp(project: Option<PathBuf>) -> anyhow::Result<()> {
+    serve_stdio_rmcp_with_project_services(project, None)
+}
+
+pub fn serve_stdio_rmcp_with_project_services(
+    project: Option<PathBuf>,
+    project_services: Option<ProjectServiceBroker>,
+) -> anyhow::Result<()> {
     use rmcp::ServiceExt;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -588,7 +648,8 @@ pub fn serve_stdio_rmcp(project: Option<PathBuf>) -> anyhow::Result<()> {
         .build()?;
     runtime.block_on(async move {
         let cwd = std::env::current_dir().ok();
-        let handler = CodeGraphHandler::serve_with_roots(project, cwd);
+        let handler =
+            CodeGraphHandler::serve_with_roots_and_project_services(project, cwd, project_services);
         let running = handler
             .serve(rmcp::transport::stdio())
             .await
@@ -681,6 +742,14 @@ pub fn serve_http(
     default_project: Option<PathBuf>,
     addr: std::net::SocketAddr,
 ) -> anyhow::Result<()> {
+    serve_http_with_project_services(default_project, addr, None)
+}
+
+pub fn serve_http_with_project_services(
+    default_project: Option<PathBuf>,
+    addr: std::net::SocketAddr,
+    project_services: Option<ProjectServiceBroker>,
+) -> anyhow::Result<()> {
     use rmcp::transport::streamable_http_server::StreamableHttpService;
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 
@@ -723,9 +792,15 @@ pub fn serve_http(
         }
 
         let handler_default = default_project.clone();
+        let handler_project_services = project_services.clone();
         let service: StreamableHttpService<CodeGraphHandler, LocalSessionManager> =
             StreamableHttpService::new(
-                move || Ok(CodeGraphHandler::new(handler_default.clone())),
+                move || {
+                    Ok(CodeGraphHandler::new_with_project_services(
+                        handler_default.clone(),
+                        handler_project_services.clone(),
+                    ))
+                },
                 Arc::new(LocalSessionManager::default()),
                 build_http_config(addr, guard),
             );
@@ -1063,13 +1138,21 @@ mod handler_tests {
                 "name": "t1",
                 "description": "d1",
                 "inputSchema": { "type": "object" },
-                "annotations": { "title": "T1", "readOnlyHint": true }
+                "annotations": { "title": "T1", "readOnlyHint": true },
+                "_meta": { "anthropic/alwaysLoad": true }
             },
             { "name": "t2" }
         ]));
         assert_eq!(tools.len(), 2);
         assert_eq!(&*tools[0].name, "t1");
         assert_eq!(tools[0].description.as_deref(), Some("d1"));
+        assert_eq!(
+            tools[0]
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.0.get("anthropic/alwaysLoad")),
+            Some(&json!(true))
+        );
         assert_eq!(&*tools[1].name, "t2");
     }
 

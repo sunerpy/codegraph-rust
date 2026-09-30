@@ -851,6 +851,7 @@ fn reader_lease_spans_stamp_check_through_last_row() {
             .arg("--http-addr")
             .arg(address.to_string())
             .env("CODEGRAPH_HTTP_REGISTRY_DIR", &registry_dir)
+            .env("CODEGRAPH_NO_DAEMON", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

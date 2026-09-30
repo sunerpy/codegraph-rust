@@ -169,7 +169,7 @@ type Name = String
     let result = extract_source("src/shapes.scala", source, Some(Language::Scala));
     assert!(result.errors.is_empty(), "{:?}", result.errors);
     assert_node(&result.nodes, NodeKind::Trait, "Shape");
-    assert_node(&result.nodes, NodeKind::Class, "Registry");
+    assert_node(&result.nodes, NodeKind::Module, "Registry");
     assert_node(&result.nodes, NodeKind::Class, "Circle");
     // tree-sitter-scala does not emit a `modifiers`/`access_modifier` child
     // holding a `private`/`protected` node for `private def`, so

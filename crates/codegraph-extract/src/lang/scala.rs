@@ -93,10 +93,13 @@ impl LanguageSpec for ScalaSpec {
     }
 
     fn classify_class_node(&self, node: Node<'_>) -> NodeKind {
-        if node.kind() == "trait_definition" {
-            NodeKind::Trait
-        } else {
-            NodeKind::Class
+        match node.kind() {
+            "trait_definition" => NodeKind::Trait,
+            // A Scala `object` is a singleton value, not a type. Keeping it
+            // distinct from a same-named companion trait/class lets inheritance
+            // resolution prefer the real type deterministically (#1824).
+            "object_definition" => NodeKind::Module,
+            _ => NodeKind::Class,
         }
     }
 
@@ -169,6 +172,38 @@ impl LanguageSpec for ScalaSpec {
         }
         None
     }
+}
+
+/// Resolve a Scala type subtree to the bare name used by inheritance matching.
+///
+/// `extends A[X] with pkg.B` packs every parent into one `extends_clause`.
+/// Unwrap generic bases and keep only the final segment of stable qualified
+/// identifiers, matching the language's ordinary type-name resolution.
+pub(crate) fn scala_base_type_name(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "type_identifier" | "identifier" => Some(node_text(node, source)),
+        "generic_type" => node
+            .named_child(0)
+            .and_then(|child| scala_base_type_name(child, source)),
+        "stable_type_identifier" | "stable_identifier" => node
+            .named_children(&mut node.walk())
+            .filter(|child| matches!(child.kind(), "type_identifier" | "identifier"))
+            .last()
+            .map(|child| node_text(child, source)),
+        _ => first_descendant_type_identifier(node).map(|identifier| node_text(identifier, source)),
+    }
+}
+
+fn first_descendant_type_identifier(node: Node<'_>) -> Option<Node<'_>> {
+    for child in node.named_children(&mut node.walk()) {
+        if child.kind() == "type_identifier" {
+            return Some(child);
+        }
+        if let Some(found) = first_descendant_type_identifier(child) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 fn strip_bracket_generics(raw: &str) -> String {

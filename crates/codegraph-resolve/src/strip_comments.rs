@@ -497,9 +497,153 @@ fn starts_with(chars: &[char], at: usize, needle: &str) -> bool {
     chars[at..at + nch.len()] == nch[..]
 }
 
+/// Blank the contents of `'…'`, `"…"` and `` `…` `` literals with spaces,
+/// keeping the quotes and every newline (`blankStringContents`,
+/// `strip-comments.ts`, upstream v1.6.1).
+///
+/// A quote inside a JS regex literal is data, not the start of a string: a
+/// `/` that follows expression-start punctuation or keyword skips to that
+/// regex's closing `/` on the same line. Single- and double-quoted literals
+/// stop at an unterminated line end; templates span lines. Run it after
+/// [`strip_comments_for_regex`], so a quote inside a comment cannot open a
+/// literal. Like that stripper it replaces character for character, so the
+/// composed view keeps every line's character offsets.
+pub fn blank_string_contents(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = chars.clone();
+    let n = chars.len();
+    // Byte offset of each char, for the regex-start look-behind window.
+    let offsets: Vec<usize> = text.char_indices().map(|(offset, _)| offset).collect();
+    let mut i = 0;
+    while i < n {
+        let c = chars[i];
+        if c == '/' && regex_literal_may_start(&text[..offsets[i]]) {
+            let mut end = i + 1;
+            let mut in_class = false;
+            while end < n && chars[end] != '\n' {
+                match chars[end] {
+                    '\\' => {
+                        end += 2;
+                        continue;
+                    }
+                    '[' => in_class = true,
+                    ']' => in_class = false,
+                    '/' if !in_class => break,
+                    _ => {}
+                }
+                end += 1;
+            }
+            if end < n && chars[end] == '/' {
+                i = end + 1;
+                continue;
+            }
+        }
+        if c == '"' || c == '\'' || c == '`' {
+            let quote = c;
+            i += 1;
+            while i < n && chars[i] != quote {
+                if chars[i] == '\\' && i + 1 < n {
+                    out[i] = ' ';
+                    out[i + 1] = ' ';
+                    i += 2;
+                    continue;
+                }
+                if quote != '`' && chars[i] == '\n' {
+                    break;
+                }
+                if chars[i] != '\n' {
+                    out[i] = ' ';
+                }
+                i += 1;
+            }
+            if i < n && chars[i] == quote {
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    out.into_iter().collect()
+}
+
+/// Whether a `/` whose preceding text is `before` opens a regex literal:
+/// upstream tests `(?:^|[=(:,)!&|?;{}\[\]+*%~^<>-]|\b(?:return|…))\s*$`
+/// against the 32 characters before it, where `^` is the start of that window.
+fn regex_literal_may_start(before: &str) -> bool {
+    const KEYWORDS: [&str; 14] = [
+        "return",
+        "throw",
+        "case",
+        "yield",
+        "await",
+        "else",
+        "do",
+        "typeof",
+        "void",
+        "delete",
+        "new",
+        "in",
+        "of",
+        "instanceof",
+    ];
+    let window_start = before
+        .char_indices()
+        .rev()
+        .nth(31)
+        .map_or(0, |(offset, _)| offset);
+    let window = &before[window_start..];
+    let trimmed = window.trim_end_matches(char::is_whitespace);
+    let Some(last) = trimmed.chars().next_back() else {
+        return true;
+    };
+    if "=(:,)!&|?;{}[]+*%~^<>-".contains(last) {
+        return true;
+    }
+    KEYWORDS.iter().any(|keyword| {
+        trimmed.strip_suffix(keyword).is_some_and(|head| {
+            !head
+                .chars()
+                .next_back()
+                .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blank_string_contents_keeps_quotes_newlines_and_code() {
+        let input = "import a from \"./a\";\nconst t = `x\nimport fake from \"fake\";\n`;\nf('b');";
+        assert_eq!(
+            blank_string_contents(input),
+            "import a from \"   \";\nconst t = ` \n                        \n`;\nf(' ');"
+        );
+    }
+
+    #[test]
+    fn blank_string_contents_skips_quotes_inside_regex_literals() {
+        // The `'` inside the regex is data; the literal after it is blanked.
+        let input = "const r = /it's/; const s = 'x';";
+        assert_eq!(
+            blank_string_contents(input),
+            "const r = /it's/; const s = ' ';"
+        );
+        // Division is not a regex: `a / b` keeps scanning for literals.
+        assert_eq!(blank_string_contents("x = a / b + 'q'"), "x = a / b + ' '");
+        // A keyword opens an expression, so `return /'/` is a regex.
+        assert_eq!(
+            blank_string_contents("return /'/.test(s)"),
+            "return /'/.test(s)"
+        );
+    }
+
+    #[test]
+    fn blank_string_contents_stops_single_quotes_at_line_end() {
+        assert_eq!(blank_string_contents("'abc\nd'e'"), "'   \nd' '");
+        assert_eq!(blank_string_contents("\"é\\\"ü\" x"), "\"    \" x");
+    }
 
     #[test]
     fn python_blanks_comment_preserves_offsets() {

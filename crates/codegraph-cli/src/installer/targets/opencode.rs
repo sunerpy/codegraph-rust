@@ -2,9 +2,9 @@
 //!
 //! Writes the MCP entry to `$XDG_CONFIG_HOME/opencode/opencode.jsonc` (global,
 //! XDG on every platform) or `./opencode.jsonc` (local), falling back to an
-//! existing `.json`. Instructions go to `<dir>/AGENTS.md`. opencode uses the
-//! `mcp.<name>` wrapper with a string-array `command` and an `enabled` flag —
-//! not `mcpServers`.
+//! existing `.json`. Instructions go to `<dir>/AGENTS.md`. OpenCode 2 uses the
+//! native `mcp.servers.<name>` wrapper with a string-array `command`,
+//! `disabled`, and `codemode` flags — not `mcpServers` (#1698).
 //!
 //! Existing configs are edited surgically via `jsonc-parser` (see
 //! `shared::upsert_nested_key_jsonc`), preserving the user's comments, key
@@ -18,8 +18,8 @@ use serde_json::{Map, Value, json};
 
 use super::super::shared::{
     self, CODEGRAPH_SECTION_END, CODEGRAPH_SECTION_START, ConfigRead, parse_json_object,
-    read_config_file, remove_nested_key_jsonc, to_upstream_json, upsert_instructions_entry,
-    upsert_nested_key_jsonc, write_json_file,
+    read_config_file, remove_nested_key_jsonc, remove_three_level_key_jsonc, to_upstream_json,
+    upsert_instructions_entry, upsert_three_level_key_jsonc, write_json_file,
 };
 use super::super::types::{
     AgentTarget, DetectionResult, FileAction, FileWrite, InstallContext, InstallOptions, Location,
@@ -85,7 +85,8 @@ fn opencode_server_entry() -> Value {
     json!({
         "type": "local",
         "command": ["codegraph", "serve", "--mcp"],
-        "enabled": true,
+        "disabled": false,
+        "codemode": false,
     })
 }
 
@@ -107,7 +108,9 @@ impl AgentTarget for OpencodeTarget {
     fn detect(&self, ctx: &InstallContext, loc: Location) -> DetectionResult {
         let file = config_path(ctx, loc);
         let config = parse_config(&fs::read_to_string(&file).unwrap_or_default());
-        let already_configured = config.get("mcp").and_then(|m| m.get("codegraph")).is_some();
+        let already_configured = config.get("mcp").is_some_and(|mcp| {
+            mcp.get("codegraph").is_some() || mcp["servers"].get("codegraph").is_some()
+        });
         let installed = match loc {
             Location::Global => {
                 let legacy = legacy_windows_config_dir(ctx);
@@ -153,7 +156,7 @@ impl AgentTarget for OpencodeTarget {
         let target = config_path(ctx, loc);
         let snippet = to_upstream_json(&json!({
             "$schema": SCHEMA_URL,
-            "mcp": { "codegraph": opencode_server_entry() },
+            "mcp": { "servers": { "codegraph": opencode_server_entry() } },
         }));
         format!("# Add to {}\n\n{snippet}\n", target.display())
     }
@@ -187,8 +190,10 @@ fn write_mcp_entry(ctx: &InstallContext, loc: Location) -> FileWrite {
         ConfigRead::Missing => {
             let mut config = Map::new();
             config.insert("$schema".to_string(), json!(SCHEMA_URL));
+            let mut servers = Map::new();
+            servers.insert("codegraph".to_string(), after);
             let mut mcp = Map::new();
-            mcp.insert("codegraph".to_string(), after);
+            mcp.insert("servers".to_string(), Value::Object(servers));
             config.insert("mcp".to_string(), Value::Object(mcp));
             let _ = write_json_file(&file, &config);
             FileWrite {
@@ -196,10 +201,33 @@ fn write_mcp_entry(ctx: &InstallContext, loc: Location) -> FileWrite {
                 action: FileAction::Created,
             }
         }
-        ConfigRead::Parsed(_) => {
-            let action =
-                upsert_nested_key_jsonc(&file, "mcp", "codegraph", &after, Some(SCHEMA_URL))
-                    .unwrap_or(FileAction::Skipped);
+        ConfigRead::Parsed(config) => {
+            let had_legacy = config
+                .get("mcp")
+                .and_then(|mcp| mcp.get("codegraph"))
+                .is_some();
+            if had_legacy && remove_nested_key_jsonc(&file, "mcp", "codegraph").is_err() {
+                return FileWrite {
+                    path: file,
+                    action: FileAction::Skipped,
+                };
+            }
+            let action = upsert_three_level_key_jsonc(
+                &file,
+                "mcp",
+                "servers",
+                "codegraph",
+                &after,
+                Some(SCHEMA_URL),
+            )
+            .map(|action| {
+                if had_legacy && action == FileAction::Unchanged {
+                    FileAction::Updated
+                } else {
+                    action
+                }
+            })
+            .unwrap_or(FileAction::Skipped);
             FileWrite { path: file, action }
         }
     }
@@ -207,7 +235,14 @@ fn write_mcp_entry(ctx: &InstallContext, loc: Location) -> FileWrite {
 
 // Ports removeMcpEntryAt (opencode.ts:233).
 fn remove_mcp_entry_at(file: &Path) -> FileWrite {
-    let action = remove_nested_key_jsonc(file, "mcp", "codegraph").unwrap_or(FileAction::NotFound);
+    let native = remove_three_level_key_jsonc(file, "mcp", "servers", "codegraph")
+        .unwrap_or(FileAction::NotFound);
+    let legacy = remove_nested_key_jsonc(file, "mcp", "codegraph").unwrap_or(FileAction::NotFound);
+    let action = if native == FileAction::Removed || legacy == FileAction::Removed {
+        FileAction::Removed
+    } else {
+        FileAction::NotFound
+    };
     FileWrite {
         path: file.to_path_buf(),
         action,
@@ -262,6 +297,8 @@ mod tests {
             app_data: None,
             xdg_config_home: None,
             hermes_home: None,
+            claude_config_dir: None,
+            codex_home: None,
         }
     }
 
@@ -287,6 +324,8 @@ mod tests {
                 app_data: None,
                 xdg_config_home: Some(base.join("xdg")),
                 hermes_home: None,
+                claude_config_dir: None,
+                codex_home: None,
             };
             fs::create_dir_all(&ctx.cwd).unwrap();
             Self { base, ctx }
@@ -323,13 +362,15 @@ mod tests {
         assert!(result.files.len() >= 2);
         let json = fx.read(&cfg);
         assert_eq!(json["$schema"], SCHEMA_URL);
-        let entry = &json["mcp"]["codegraph"];
+        let entry = &json["mcp"]["servers"]["codegraph"];
         assert_eq!(entry["type"], "local");
         assert_eq!(
             entry["command"],
             serde_json::json!(["codegraph", "serve", "--mcp"])
         );
-        assert_eq!(entry["enabled"], true);
+        assert_eq!(entry["disabled"], false);
+        assert_eq!(entry["codemode"], false);
+        assert!(json["mcp"].get("codegraph").is_none());
         assert!(instructions_path(&fx.ctx, Location::Local).exists());
 
         let detect = target.detect(&fx.ctx, Location::Local);
@@ -344,7 +385,10 @@ mod tests {
         target.install(&fx.ctx, Location::Global, opts());
         let cfg = config_path(&fx.ctx, Location::Global);
         assert!(cfg.starts_with(fx.ctx.xdg_config_home.as_ref().unwrap()));
-        assert!(fx.read(&cfg)["mcp"]["codegraph"].is_object());
+        let entry = &fx.read(&cfg)["mcp"]["servers"]["codegraph"];
+        assert!(entry.is_object());
+        assert_eq!(entry["disabled"], false);
+        assert_eq!(entry["codemode"], false);
     }
 
     #[test]
@@ -368,6 +412,49 @@ mod tests {
     }
 
     #[test]
+    fn reinstall_migrates_v1_shape_and_preserves_jsonc_siblings() {
+        let fx = TempOc::new("migrate-v1");
+        let target = OpencodeTarget;
+        let cfg = fx.ctx.cwd.join("opencode.jsonc");
+        fs::write(
+            &cfg,
+            concat!(
+                "{\n",
+                "  // keep this comment\n",
+                "  \"mcp\": {\n",
+                "    \"codegraph\": { \"type\": \"local\", \"command\": [\"old\"], \"enabled\": true },\n",
+                "    \"other\": { \"type\": \"local\", \"command\": [\"other\"] }\n",
+                "  }\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+
+        assert!(target.detect(&fx.ctx, Location::Local).already_configured);
+        let first = target.install(&fx.ctx, Location::Local, opts());
+        assert_eq!(first.files[0].action, FileAction::Updated);
+        let text = fs::read_to_string(&cfg).unwrap();
+        assert!(text.contains("// keep this comment"));
+        let parsed = fx.read(&cfg);
+        assert!(parsed["mcp"].get("codegraph").is_none());
+        assert!(parsed["mcp"]["other"].is_object());
+        assert_eq!(parsed["mcp"]["servers"]["codegraph"]["disabled"], false);
+        assert_eq!(parsed["mcp"]["servers"]["codegraph"]["codemode"], false);
+
+        let before = fs::read_to_string(&cfg).unwrap();
+        let second = target.install(&fx.ctx, Location::Local, opts());
+        assert_eq!(second.files[0].action, FileAction::Unchanged);
+        assert_eq!(fs::read_to_string(&cfg).unwrap(), before);
+
+        target.uninstall(&fx.ctx, Location::Local);
+        let text = fs::read_to_string(&cfg).unwrap();
+        assert!(text.contains("// keep this comment"));
+        let parsed = fx.read(&cfg);
+        assert!(parsed["mcp"].get("servers").is_none());
+        assert!(parsed["mcp"]["other"].is_object());
+    }
+
+    #[test]
     fn config_path_prefers_existing_json_over_default_jsonc() {
         let fx = TempOc::new("prefer-json");
         let json_file = fx.ctx.cwd.join("opencode.json");
@@ -384,7 +471,11 @@ mod tests {
         let result = target.uninstall(&fx.ctx, Location::Local);
         assert_eq!(result.files[0].action, FileAction::Removed);
         let json = fx.read(&cfg);
-        assert!(json.get("mcp").is_none() || json["mcp"].get("codegraph").is_none());
+        assert!(
+            json.get("mcp").is_none()
+                || json["mcp"].get("servers").is_none()
+                || json["mcp"]["servers"].get("codegraph").is_none()
+        );
     }
 
     #[test]
@@ -420,6 +511,8 @@ mod tests {
             app_data: Some(base.join("appdata")),
             xdg_config_home: Some(base.join("xdg")),
             hermes_home: None,
+            claude_config_dir: None,
+            codex_home: None,
         };
         let legacy = legacy_windows_config_dir(&ctx).expect("distinct app_data yields legacy dir");
         assert!(legacy.ends_with("opencode"));
@@ -446,6 +539,8 @@ mod tests {
             app_data: Some(base.join("appdata")),
             xdg_config_home: Some(base.join("xdg")),
             hermes_home: None,
+            claude_config_dir: None,
+            codex_home: None,
         };
         let legacy = legacy_windows_config_dir(&ctx).unwrap();
         fs::create_dir_all(&legacy).unwrap();

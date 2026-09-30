@@ -24,8 +24,10 @@ impl LanguageSpec for JavaScriptSpec {
     fn function_types(&self) -> &'static [&'static str] {
         &[
             "function_declaration",
+            "generator_function_declaration",
             "arrow_function",
             "function_expression",
+            "generator_function",
         ]
     }
 
@@ -139,14 +141,20 @@ pub(crate) fn resolve_class_field_body<'tree>(
 ) -> Option<Node<'tree>> {
     for i in 0..node.named_child_count() {
         let child = node.named_child(i as u32)?;
-        if child.kind() == "arrow_function" || child.kind() == "function_expression" {
+        if matches!(
+            child.kind(),
+            "arrow_function" | "function_expression" | "generator_function"
+        ) {
             return child_by_field(child, body_field);
         }
         if child.kind() == "call_expression" {
             if let Some(args) = child_by_field(child, "arguments") {
                 for j in 0..args.named_child_count() {
                     if let Some(arg) = args.named_child(j as u32) {
-                        if arg.kind() == "arrow_function" || arg.kind() == "function_expression" {
+                        if matches!(
+                            arg.kind(),
+                            "arrow_function" | "function_expression" | "generator_function"
+                        ) {
                             return child_by_field(arg, body_field);
                         }
                     }

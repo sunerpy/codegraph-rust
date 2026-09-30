@@ -21,6 +21,17 @@ use regex::Regex;
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
+/// Result of checking whether a PHP call is owned by a class import.
+///
+/// `Claimed(None)` is intentionally distinct from `NotApplicable`: once a
+/// `use ... as Alias` mapping owns `Alias::method()`, a missing or ambiguous
+/// target must stay unresolved instead of falling through to a same-named
+/// class or method in another namespace (#1545).
+pub(crate) enum PhpImportedStaticCallResolution {
+    NotApplicable,
+    Claimed(Option<ResolvedRef>),
+}
+
 /// Extension resolution order by language (`EXTENSION_RESOLUTION`,
 /// `import-resolver.ts:17-37`).
 fn extension_resolution(language: Language) -> &'static [&'static str] {
@@ -1358,6 +1369,94 @@ fn drop_last_segment(path: &str) -> Vec<&str> {
     } else {
         segs[..segs.len() - 1].to_vec()
     }
+}
+
+/// Resolve a PHP scoped call through the exact class namespace named by its
+/// local `use` binding.
+///
+/// The extractor encodes both `Alias::method()` and `$Alias->method()` as
+/// `Alias.method`. The source-position check keeps PHP's class and variable
+/// namespaces separate: a leading `$` is an instance receiver and remains
+/// eligible for local type inference. Otherwise an import mapping claims the
+/// call even when its class or member is unavailable, preventing unrelated
+/// name-matching fallbacks from manufacturing an edge (#1545).
+pub(crate) fn resolve_php_imported_static_call(
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> PhpImportedStaticCallResolution {
+    if reference.language != Language::Php
+        || reference.reference_kind != codegraph_core::types::EdgeKind::Calls
+    {
+        return PhpImportedStaticCallResolution::NotApplicable;
+    }
+
+    let Some((receiver, member)) = reference.reference_name.split_once('.') else {
+        return PhpImportedStaticCallResolution::NotApplicable;
+    };
+    if receiver.is_empty()
+        || member.is_empty()
+        || member.contains('.')
+        || !receiver.chars().all(|c| c == '_' || c.is_alphanumeric())
+        || !member.chars().all(|c| c == '_' || c.is_alphanumeric())
+    {
+        return PhpImportedStaticCallResolution::NotApplicable;
+    }
+
+    let Some(import) = context
+        .get_import_mappings(&reference.file_path, reference.language)
+        .into_iter()
+        .find(|import| import.local_name == receiver)
+    else {
+        return PhpImportedStaticCallResolution::NotApplicable;
+    };
+
+    // Tree-sitter columns are byte offsets. Checking the byte directly avoids
+    // slicing a UTF-8 line at a potentially non-character boundary.
+    let is_variable_receiver = context.read_file(&reference.file_path).and_then(|source| {
+        source
+            .lines()
+            .nth((reference.line.max(1) - 1) as usize)
+            .and_then(|line| line.as_bytes().get(reference.column.max(0) as usize))
+            .copied()
+    }) == Some(b'$');
+    if is_variable_receiver {
+        return PhpImportedStaticCallResolution::NotApplicable;
+    }
+
+    let imported_fqn = import.source.trim_start_matches('\\');
+    let owner_qualified = imported_fqn.rsplit_once('\\').map_or_else(
+        || imported_fqn.to_string(),
+        |(namespace, name)| format!("{namespace}::{name}"),
+    );
+    let owners: Vec<Arc<Node>> = context
+        .get_nodes_by_qualified_name_shared(&owner_qualified)
+        .into_iter()
+        .filter(|node| node.language == Language::Php && is_static_member_container(node.kind))
+        .collect();
+    let [owner] = owners.as_slice() else {
+        return PhpImportedStaticCallResolution::Claimed(None);
+    };
+
+    let member_qualified = format!("{}::{member}", owner.qualified_name);
+    let methods: Vec<Arc<Node>> = context
+        .get_nodes_by_qualified_name_shared(&member_qualified)
+        .into_iter()
+        .filter(|node| {
+            node.language == Language::Php
+                && node.kind == NodeKind::Method
+                && node.file_path == owner.file_path
+        })
+        .collect();
+    let [method] = methods.as_slice() else {
+        return PhpImportedStaticCallResolution::Claimed(None);
+    };
+
+    PhpImportedStaticCallResolution::Claimed(Some(ResolvedRef {
+        original: reference.clone(),
+        target_node_id: method.id.clone(),
+        confidence: 0.95,
+        resolved_by: ResolvedBy::Import,
+    }))
 }
 
 /// Resolve a reference using import mappings (`resolveViaImport`,

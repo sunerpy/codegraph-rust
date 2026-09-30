@@ -2,7 +2,9 @@
 //!
 //! Writes the MCP entry to `~/.claude.json` (global) or `./.mcp.json` (local),
 //! permissions to `<dir>/.claude/settings.json` (gated on `auto_allow`), and the
-//! marker-fenced instructions block to `<dir>/.claude/CLAUDE.md`.
+//! marker-fenced instructions block to `<dir>/.claude/CLAUDE.md`. A global
+//! `$CLAUDE_CONFIG_DIR` moves all three profile files (and the skill directory)
+//! into that directory; local installs remain project-scoped (#1627).
 
 use std::fs;
 use std::path::PathBuf;
@@ -21,15 +23,39 @@ use super::super::types::{
 
 pub struct ClaudeCodeTarget;
 
+fn claude_mcp_server_config() -> Value {
+    let mut config = mcp_server_config();
+    if let Value::Object(map) = &mut config {
+        map.insert("alwaysLoad".to_string(), Value::Bool(true));
+    }
+    config
+}
+
+fn resolved_profile_path(ctx: &InstallContext, path: &PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path.clone()
+    } else {
+        ctx.cwd.join(path)
+    }
+}
+
 fn config_dir(ctx: &InstallContext, loc: Location) -> PathBuf {
     match loc {
-        Location::Global => ctx.home.join(".claude"),
+        Location::Global => ctx
+            .claude_config_dir
+            .as_ref()
+            .map(|path| resolved_profile_path(ctx, path))
+            .unwrap_or_else(|| ctx.home.join(".claude")),
         Location::Local => ctx.cwd.join(".claude"),
     }
 }
 fn mcp_json_path(ctx: &InstallContext, loc: Location) -> PathBuf {
-    // global → ~/.claude.json; local → ./.mcp.json (claude.ts:49-56).
+    // Default global → ~/.claude.json; custom profile →
+    // $CLAUDE_CONFIG_DIR/.claude.json; local → ./.mcp.json.
     match loc {
+        Location::Global if ctx.claude_config_dir.is_some() => {
+            config_dir(ctx, loc).join(".claude.json")
+        }
         Location::Global => ctx.home.join(".claude.json"),
         Location::Local => ctx.cwd.join(".mcp.json"),
     }
@@ -129,7 +155,7 @@ impl AgentTarget for ClaudeCodeTarget {
     fn print_config(&self, ctx: &InstallContext, loc: Location) -> String {
         let target = mcp_json_path(ctx, loc);
         let snippet =
-            to_upstream_json(&json!({ "mcpServers": { "codegraph": mcp_server_config() } }));
+            to_upstream_json(&json!({ "mcpServers": { "codegraph": claude_mcp_server_config() } }));
         format!("# Add to {}\n\n{snippet}\n", target.display())
     }
 
@@ -149,7 +175,7 @@ impl AgentTarget for ClaudeCodeTarget {
 // Ports writeMcpEntry (claude.ts:214).
 fn write_mcp_entry(ctx: &InstallContext, loc: Location) -> FileWrite {
     let file = mcp_json_path(ctx, loc);
-    let after = mcp_server_config();
+    let after = claude_mcp_server_config();
     match read_config_file(&file) {
         ConfigRead::Unparseable => FileWrite {
             path: file,
@@ -431,6 +457,8 @@ mod tests {
             app_data: None,
             xdg_config_home: None,
             hermes_home: None,
+            claude_config_dir: None,
+            codex_home: None,
         }
     }
 
@@ -479,6 +507,8 @@ mod tests {
                 app_data: None,
                 xdg_config_home: None,
                 hermes_home: None,
+                claude_config_dir: None,
+                codex_home: None,
             };
             fs::create_dir_all(&ctx.home).unwrap();
             fs::create_dir_all(&ctx.cwd).unwrap();
@@ -601,6 +631,7 @@ mod tests {
         assert!(out.contains("mcpServers"));
         assert!(out.contains("codegraph"));
         assert!(out.contains(".claude.json"));
+        assert!(out.contains("\"alwaysLoad\": true"));
     }
 
     #[test]
@@ -618,5 +649,63 @@ mod tests {
         if settings.exists() {
             assert!(fx.read(&settings).get("permissions").is_none());
         }
+    }
+
+    #[test]
+    fn global_profile_override_moves_every_claude_surface_and_round_trips() {
+        let fx = TempClaude::new("profile-override");
+        let mut ctx = fx.ctx.clone();
+        ctx.claude_config_dir = Some(PathBuf::from("profiles/claude custom"));
+        let profile = ctx.cwd.join("profiles/claude custom");
+        let target = ClaudeCodeTarget;
+
+        let installed = target.install(&ctx, Location::Global, opts(true));
+        let expected = [
+            profile.join(".claude.json"),
+            profile.join("settings.json"),
+            profile.join("CLAUDE.md"),
+        ];
+        assert_eq!(
+            installed
+                .files
+                .iter()
+                .map(|file| file.path.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(target.detect(&ctx, Location::Global).already_configured);
+        assert_eq!(
+            target.skill_dir(&ctx, Location::Global).unwrap(),
+            profile.join("skills")
+        );
+        assert!(
+            target
+                .print_config(&ctx, Location::Global)
+                .contains(&profile.join(".claude.json").display().to_string())
+        );
+        assert!(!ctx.home.join(".claude").exists());
+        assert!(!ctx.home.join(".claude.json").exists());
+
+        target.uninstall(&ctx, Location::Global);
+        assert!(!target.detect(&ctx, Location::Global).already_configured);
+        assert!(!profile.join("CLAUDE.md").exists());
+    }
+
+    #[test]
+    fn claude_profile_override_never_moves_local_project_files() {
+        let fx = TempClaude::new("profile-local");
+        let mut ctx = fx.ctx.clone();
+        ctx.claude_config_dir = Some(fx.base.join("custom-profile"));
+        let target = ClaudeCodeTarget;
+        target.install(&ctx, Location::Local, opts(false));
+        assert_eq!(
+            mcp_json_path(&ctx, Location::Local),
+            ctx.cwd.join(".mcp.json")
+        );
+        assert_eq!(
+            instructions_path(&ctx, Location::Local),
+            ctx.cwd.join(".claude/CLAUDE.md")
+        );
+        assert!(!fx.base.join("custom-profile").exists());
     }
 }

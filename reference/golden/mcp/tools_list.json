@@ -70,6 +70,10 @@
                 "description": "Maximum number of callers to return (default: 20)",
                 "default": 20
               },
+              "file": {
+                "type": "string",
+                "description": "Narrow same-named definitions by exact project-relative path or path suffix. A miss is disclosed and falls back to all definitions."
+              },
               "projectPath": {
                 "type": "string",
                 "description": "Path to a different project with .codegraph/ initialized. If omitted, uses current project. Use this to query other codebases."

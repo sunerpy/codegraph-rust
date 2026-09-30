@@ -46,6 +46,8 @@ impl Fixture {
             .env("USERPROFILE", &self.home)
             .env("XDG_CONFIG_HOME", self.root.join("xdg"))
             .env("HERMES_HOME", self.root.join("hermes"))
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .env_remove("CODEX_HOME")
             .env_remove("APPDATA")
             .output()
             .expect("run codegraph")

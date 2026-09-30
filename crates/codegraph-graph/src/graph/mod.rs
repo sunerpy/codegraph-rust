@@ -1297,6 +1297,57 @@ pub fn find_all_definitions(store: &Store, name: &str) -> rusqlite::Result<Vec<N
     store.nodes_by_name(name)
 }
 
+/// One group per distinct definition (`file_path`, `qualified_name`).
+///
+/// Same-file overload nodes stay together while unrelated definitions with the
+/// same bare name retain separate graph answers. A non-matching file filter is
+/// fail-visible rather than destructive: all groups are returned and
+/// `filtered_out` tells the presentation layer to disclose the fallback.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DefinitionGroups {
+    pub groups: Vec<Vec<Node>>,
+    pub filtered_out: bool,
+}
+
+pub fn group_definitions(nodes: &[Node], file_filter: Option<&str>) -> DefinitionGroups {
+    let wanted = file_filter.map(|value| {
+        value
+            .replace('\\', "/")
+            .trim_start_matches("./")
+            .to_string()
+    });
+    let narrowed = wanted.as_deref().map(|wanted| {
+        nodes
+            .iter()
+            .filter(|node| {
+                node.file_path == wanted || node.file_path.ends_with(&format!("/{wanted}"))
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    });
+    let filtered_out = narrowed.as_ref().is_some_and(Vec::is_empty);
+    let pool = narrowed
+        .filter(|matches| !matches.is_empty())
+        .unwrap_or_else(|| nodes.to_vec());
+
+    let mut groups: Vec<Vec<Node>> = Vec::new();
+    for node in pool {
+        if let Some(group) = groups.iter_mut().find(|group| {
+            group.first().is_some_and(|head| {
+                head.file_path == node.file_path && head.qualified_name == node.qualified_name
+            })
+        }) {
+            group.push(node);
+        } else {
+            groups.push(vec![node]);
+        }
+    }
+    DefinitionGroups {
+        groups,
+        filtered_out,
+    }
+}
+
 /// upstream graph/traversal.ts:88-91 — frontier ordering priority
 /// `contains` < `calls` < everything else.
 fn structural_priority(edge: &Edge) -> u8 {

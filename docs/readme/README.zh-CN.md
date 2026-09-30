@@ -175,7 +175,10 @@ codegraph install --target=codex,claude,kiro --yes
 ```
 
 不带 `--path` 启动的服务器可通过每次调用显式传入的 `projectPath`、客户端 roots，
-或确定性的 workspace adoption 选择已有索引。需要把某项目设为默认值时再固定 `--path`。
+或确定性的 workspace adoption 选择已有索引。首次显式访问已有索引时会先等待
+catch-up，并保留该项目的共享 daemon/watcher；多个子项目仍使用各自独立索引，多个
+MCP 会话则复用每个项目唯一的 writer。需要把某项目设为默认值时再固定 `--path`。
+`CODEGRAPH_NO_DAEMON=1` 会显式关闭这种跨项目的懒加载 daemon 服务。
 
 默认可见 MCP surface 聚焦 explore、文件/符号读取、search 与 callers；其他已知
 工具可通过 `CODEGRAPH_MCP_TOOLS` 启用。工具 schema、项目解析、stdio/HTTP 行为与

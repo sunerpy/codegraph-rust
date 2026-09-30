@@ -10,7 +10,7 @@ use codegraph_core::node_id::hash_content;
 use codegraph_core::types::{ExtractionResult, Language};
 use rayon::prelude::*;
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -20,6 +20,16 @@ use tree_sitter::Parser;
 use crate::ext_config::ExtensionOverrides;
 use crate::lang::{cpp_code_mask, spec_for_language};
 use crate::walker::TreeSitterWalker;
+
+/// Stable diagnostic fragment used when a supported grammar reports parse
+/// errors and extraction collapses to only the synthetic file node.
+pub const PARSE_COLLAPSE_WARNING: &str = "parse produced no symbols (tree has errors)";
+
+/// Parse-collapse diagnostics are warning-only: the file stays indexed and the
+/// index command succeeds, but callers must surface the message honestly.
+pub fn is_extraction_warning(message: &str) -> bool {
+    message.contains(PARSE_COLLAPSE_WARNING)
+}
 
 #[derive(Debug, Clone)]
 pub struct ExtractOptions {
@@ -350,8 +360,20 @@ pub fn extract_source_with_observer(
         };
     };
     observer(ExtractionStage::Walk);
-    TreeSitterWalker::new(file_path, &parsed_source, spec, tree.root_node())
-        .extract(start.elapsed().as_millis() as i64)
+    let parse_has_error = tree.root_node().has_error();
+    let mut result = TreeSitterWalker::new(file_path, &parsed_source, spec, tree.root_node())
+        .extract(start.elapsed().as_millis() as i64);
+    if parse_has_error
+        && result
+            .nodes
+            .iter()
+            .all(|node| node.kind == codegraph_core::types::NodeKind::File)
+    {
+        result.errors.push(format!(
+            "{file_path}: {PARSE_COLLAPSE_WARNING} - the file is indexed but contributes nothing to the graph"
+        ));
+    }
+    result
 }
 
 /// Extract one file under the DEFAULT options (no project config). Kept for
@@ -444,8 +466,22 @@ pub fn extract_project(
     merge_results(&mut results)
 }
 
+/// Result of one source discovery walk. Unsupported extensions are collected
+/// during the same traversal so an unsupported-only project can be reported
+/// honestly without a second filesystem scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanProjectResult {
+    pub files: Vec<String>,
+    pub unsupported_by_extension: BTreeMap<String, usize>,
+}
+
 pub fn scan_project(root: &Path, options: &ExtractOptions) -> Result<Vec<String>> {
+    Ok(scan_project_with_stats(root, options)?.files)
+}
+
+pub fn scan_project_with_stats(root: &Path, options: &ExtractOptions) -> Result<ScanProjectResult> {
     let mut files = Vec::new();
+    let mut unsupported_by_extension = BTreeMap::new();
     let ignored_dirs = options
         .ignore_dirs
         .iter()
@@ -473,9 +509,13 @@ pub fn scan_project(root: &Path, options: &ExtractOptions) -> Result<Vec<String>
         &include,
         &options.extensions,
         &mut files,
+        &mut unsupported_by_extension,
     )?;
     files.sort();
-    Ok(files)
+    Ok(ScanProjectResult {
+        files,
+        unsupported_by_extension,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -488,6 +528,7 @@ fn scan_dir(
     include: &IncludeSet,
     overrides: &ExtensionOverrides,
     files: &mut Vec<String>,
+    unsupported_by_extension: &mut BTreeMap<String, usize>,
 ) -> Result<()> {
     let entries = fs::read_dir(dir).with_context(|| format!("read dir {}", dir.display()))?;
     for entry in entries {
@@ -524,19 +565,29 @@ fn scan_dir(
                 include,
                 overrides,
                 files,
+                unsupported_by_extension,
             )?;
-        } else if file_type.is_file() && is_extractable_source_path(&relative, overrides) {
+        } else if file_type.is_file() {
             // Post-model include decision: a model-ignored file is force-included
             // iff it matches `include` and is NOT overridden by an explicit
             // `exclude` (checked inside `IncludeSet::forces`). Built-in dir skips
             // are already handled structurally above, so include can never
             // resurface node_modules/dist/.git/etc.
             if !ignored || include.forces(&relative) {
-                files.push(relative);
+                if is_extractable_source_path(&relative, overrides) {
+                    files.push(relative);
+                } else if let Some(extension) = unsupported_extension(&relative) {
+                    *unsupported_by_extension.entry(extension).or_default() += 1;
+                }
             }
         }
     }
     Ok(())
+}
+
+fn unsupported_extension(relative: &str) -> Option<String> {
+    let extension = Path::new(relative).extension()?.to_str()?;
+    (!extension.is_empty()).then(|| format!(".{}", extension.to_ascii_lowercase()))
 }
 
 fn merge_results(results: &mut [ExtractionResult]) -> Result<ExtractionResult> {
@@ -1333,6 +1384,25 @@ mod tests {
     }
 
     #[test]
+    fn scan_project_reports_visible_unsupported_extensions_in_the_same_walk() {
+        let project = unique_project("unsupported-extensions");
+        touch(&project, ".gitignore", "ignored.move\n");
+        touch(&project, "a.move", "module a {}\n");
+        touch(&project, "nested/b.MOVE", "module b {}\n");
+        touch(&project, "tool.pl", "print 1;\n");
+        touch(&project, "ignored.move", "module ignored {}\n");
+        touch(&project, "README", "no extension\n");
+
+        let report = scan_project_with_stats(&project, &ExtractOptions::default()).expect("scan");
+        assert!(report.files.is_empty());
+        assert_eq!(
+            report.unsupported_by_extension,
+            BTreeMap::from([(".move".to_string(), 2), (".pl".to_string(), 1)])
+        );
+        fs::remove_dir_all(&project).ok();
+    }
+
+    #[test]
     fn extract_project_parallel_path_merges_results() {
         let project = unique_project("extract_project_par");
         touch(&project, "a.rs", "pub fn a() {}\n");
@@ -1449,6 +1519,53 @@ mod tests {
     fn dot_h_plain_c_stays_c() {
         let result = extract_source("plain.h", "int add(int a, int b);\n", None);
         assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+    }
+
+    fn cpp_raw_string(delimiter: &str) -> String {
+        format!(
+            "const char* kTemplate = R\"{delimiter}(\nstruct Ignored {{ int v; }};\n){delimiter}\";\n\nint after_the_raw_string(int x) {{\n  return x + 1;\n}}\n"
+        )
+    }
+
+    #[test]
+    fn parse_collapse_warning_is_honest_and_narrow() {
+        let collapsed = extract_source("min.cpp", &cpp_raw_string("FILE_TEMPLATE_V1"), None);
+        assert_eq!(
+            collapsed
+                .nodes
+                .iter()
+                .filter(|node| node.kind != codegraph_core::types::NodeKind::File)
+                .count(),
+            0
+        );
+        assert_eq!(collapsed.errors.len(), 1);
+        assert!(is_extraction_warning(&collapsed.errors[0]));
+        assert!(collapsed.errors[0].contains(PARSE_COLLAPSE_WARNING));
+
+        let healthy = extract_source("min.cpp", &cpp_raw_string("FILE_TEMPLATE_V"), None);
+        assert!(
+            healthy
+                .nodes
+                .iter()
+                .any(|node| node.name == "after_the_raw_string")
+        );
+        assert!(healthy.errors.is_empty(), "errors={:?}", healthy.errors);
+
+        for (path, source) in [
+            ("empty.cpp", ""),
+            ("includes.cpp", "#include <stdio.h>\n#include <stdlib.h>\n"),
+            (
+                "survivor.cpp",
+                "int before() { return 0; }\nconst char* x = R\"FILE_TEMPLATE_V1(\nstruct Ignored {};\n)FILE_TEMPLATE_V1\";\n",
+            ),
+        ] {
+            let result = extract_source(path, source, None);
+            assert!(
+                result.errors.is_empty(),
+                "a healthy/partially surviving file must not be called a collapse: {path}: {:?}",
+                result.errors
+            );
+        }
     }
 
     #[test]

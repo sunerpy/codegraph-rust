@@ -43,17 +43,36 @@ pub(crate) fn query_might_contain_paths(query: &str) -> bool {
     })
 }
 
+#[cfg(test)]
 pub(crate) fn extract_query_paths(
     query: &str,
     indexed_paths: &[String],
     max_pins: usize,
+) -> QueryPathExtraction {
+    extract_query_paths_inner(query, indexed_paths, max_pins, None)
+}
+
+pub(crate) fn extract_query_paths_with_file_probe(
+    query: &str,
+    indexed_paths: &[String],
+    max_pins: usize,
+    exists_on_disk: &dyn Fn(&str) -> bool,
+) -> QueryPathExtraction {
+    extract_query_paths_inner(query, indexed_paths, max_pins, Some(exists_on_disk))
+}
+
+fn extract_query_paths_inner(
+    query: &str,
+    indexed_paths: &[String],
+    max_pins: usize,
+    exists_on_disk: Option<&dyn Fn(&str) -> bool>,
 ) -> QueryPathExtraction {
     let passthrough = || QueryPathExtraction {
         stripped_query: query.to_string(),
         pinned_files: Vec::new(),
         unresolved_path_spans: Vec::new(),
     };
-    if query.trim().is_empty() || indexed_paths.is_empty() {
+    if query.trim().is_empty() || (indexed_paths.is_empty() && exists_on_disk.is_none()) {
         return passthrough();
     }
     let max_pins = max_pins.clamp(1, MAX_PINS);
@@ -99,7 +118,10 @@ pub(crate) fn extract_query_paths(
                     pinned.push(path);
                 }
             }
-        } else if resolved.ambiguous || is_clearly_path_shaped(&normalized) {
+        } else if resolved.ambiguous
+            || is_clearly_path_shaped(&normalized)
+            || (normalized.contains('/') && exists_on_disk.is_some_and(|probe| probe(&normalized)))
+        {
             consumed.insert(index);
             if unresolved.len() < MAX_UNRESOLVED {
                 unresolved.push(normalized);
@@ -387,5 +409,50 @@ mod tests {
         );
         assert_eq!(capped.pinned_files, vec!["src/lib/chat-manager.ts"]);
         assert_eq!(capped.stripped_query, "background-image-table then");
+    }
+
+    #[test]
+    fn dotless_unindexed_file_is_reported_only_when_the_safe_probe_confirms_it() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let exists = |path: &str| {
+            seen.borrow_mut().push(path.to_string());
+            path == "scripts/deploy"
+        };
+        let out = extract_query_paths_with_file_probe(
+            "why does scripts/deploy fail on release",
+            &index(),
+            8,
+            &exists,
+        );
+        assert!(out.pinned_files.is_empty());
+        assert_eq!(out.unresolved_path_spans, vec!["scripts/deploy"]);
+        assert_eq!(out.stripped_query, "why does fail on release");
+        assert!(seen.borrow().iter().any(|path| path == "scripts/deploy"));
+
+        let prose = extract_query_paths_with_file_probe(
+            "does gen_server:call/2 block and/or timeout",
+            &index(),
+            8,
+            &exists,
+        );
+        assert!(prose.unresolved_path_spans.is_empty());
+        assert_eq!(
+            prose.stripped_query,
+            "does gen_server:call/2 block and/or timeout"
+        );
+        assert!(seen.borrow().iter().any(|path| path == "and/or"));
+    }
+
+    #[test]
+    fn indexed_dotless_path_wins_without_consulting_the_file_probe() {
+        let exists = |_path: &str| panic!("indexed path must not reach filesystem probe");
+        let out = extract_query_paths_with_file_probe(
+            "what does scripts/pre-commit run",
+            &index(),
+            8,
+            &exists,
+        );
+        assert_eq!(out.pinned_files, vec!["scripts/pre-commit"]);
+        assert!(out.unresolved_path_spans.is_empty());
     }
 }

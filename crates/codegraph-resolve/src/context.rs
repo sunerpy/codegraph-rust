@@ -8,6 +8,7 @@
 
 use crate::lru_cache::LruCache;
 use crate::path_aliases::{AliasMap, load_project_aliases};
+use crate::source_facts::SourceFacts;
 use crate::types::{GoModule, ImportMapping, ReExport, ResolutionContext};
 use crate::workspace_packages::{WorkspacePackages, load_workspace_packages};
 use crate::{import_resolver, pathutil};
@@ -36,7 +37,8 @@ pub struct StoreResolutionContext<'a> {
 
 struct Caches {
     node_cache: LruCache<String, Vec<Arc<Node>>>,
-    file_cache: LruCache<String, Option<String>>,
+    file_cache: LruCache<String, Option<Arc<str>>>,
+    source_facts_cache: LruCache<String, Option<Arc<SourceFacts>>>,
     import_mapping_cache: LruCache<String, Vec<ImportMapping>>,
     re_export_cache: LruCache<String, Vec<ReExport>>,
     name_cache: LruCache<String, Vec<Arc<Node>>>,
@@ -58,6 +60,7 @@ impl Caches {
         Self {
             node_cache: LruCache::new(limit),
             file_cache: LruCache::new(content_limit),
+            source_facts_cache: LruCache::new(content_limit),
             import_mapping_cache: LruCache::new(limit),
             re_export_cache: LruCache::new(limit),
             name_cache: LruCache::new(limit),
@@ -89,6 +92,7 @@ impl<'a> StoreResolutionContext<'a> {
         let mut c = self.caches.borrow_mut();
         c.node_cache.clear();
         c.file_cache.clear();
+        c.source_facts_cache.clear();
         c.import_mapping_cache.clear();
         c.re_export_cache.clear();
         c.name_cache.clear();
@@ -242,19 +246,41 @@ impl ResolutionContext for StoreResolutionContext<'_> {
         {
             return true;
         }
-        let full_path = Path::new(&self.project_root).join(file_path);
-        full_path.exists()
+        pathutil::lexical_path_within_root(&self.project_root, file_path)
+            .is_some_and(|full_path| full_path.exists())
     }
 
     fn read_file(&self, file_path: &str) -> Option<String> {
+        self.read_file_shared(file_path)
+            .map(|content| content.to_string())
+    }
+
+    fn read_file_shared(&self, file_path: &str) -> Option<Arc<str>> {
         let mut c = self.caches.borrow_mut();
         if c.file_cache.has(&file_path.to_string()) {
             return c.file_cache.get(&file_path.to_string()).flatten();
         }
         let full_path = Path::new(&self.project_root).join(file_path);
-        let content = std::fs::read_to_string(&full_path).ok();
+        let content: Option<Arc<str>> = std::fs::read_to_string(&full_path).ok().map(Arc::from);
         c.file_cache.set(file_path.to_string(), content.clone());
         content
+    }
+
+    fn source_facts(&self, file_path: &str) -> Option<Arc<SourceFacts>> {
+        {
+            let mut c = self.caches.borrow_mut();
+            if c.source_facts_cache.has(&file_path.to_string()) {
+                return c.source_facts_cache.get(&file_path.to_string()).flatten();
+            }
+        }
+        let facts = self
+            .read_file_shared(file_path)
+            .map(|source| Arc::new(SourceFacts::new(source)));
+        self.caches
+            .borrow_mut()
+            .source_facts_cache
+            .set(file_path.to_string(), facts.clone());
+        facts
     }
 
     fn get_project_root(&self) -> &str {
@@ -315,7 +341,11 @@ impl ResolutionContext for StoreResolutionContext<'_> {
         let type_nodes = self
             .get_nodes_by_name_shared(type_name)
             .into_iter()
-            .filter(|n| SUPERTYPE_BEARING.contains(&n.kind) && n.language == language)
+            .filter(|n| {
+                n.language == language
+                    // A Scala singleton inherits members though it can never be a parent.
+                    && (SUPERTYPE_BEARING.contains(&n.kind) || crate::types::is_scala_singleton(n))
+            })
             .collect::<Vec<_>>();
         if type_nodes.is_empty() {
             return Vec::new();
@@ -764,6 +794,12 @@ mod tests {
     #[test]
     fn store_context_file_exists_and_read_file() {
         let root = temp_root("files");
+        let outside = root.parent().unwrap().join(format!(
+            "outside-{}",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.ts"), "export const secret = 42;\n").unwrap();
         let store = open_store(&root);
         store.upsert_file(&file_record("known.ts", 0)).unwrap();
         std::fs::write(root.join("ondisk.ts"), "export const x = 1;\n").unwrap();
@@ -772,6 +808,13 @@ mod tests {
         assert!(ctx.file_exists("known.ts"));
         assert!(ctx.file_exists("ondisk.ts"));
         assert!(!ctx.file_exists("nowhere.ts"));
+        assert!(
+            !ctx.file_exists(&format!(
+                "../{}/secret.ts",
+                outside.file_name().unwrap().to_string_lossy()
+            )),
+            "an existing file outside the project must not become an existence oracle"
+        );
 
         let content = ctx.read_file("ondisk.ts").expect("read");
         assert!(content.contains("export const x"));
@@ -782,6 +825,7 @@ mod tests {
 
         assert!(ctx.get_all_files().contains(&"known.ts".to_string()));
         std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
     }
 
     #[test]

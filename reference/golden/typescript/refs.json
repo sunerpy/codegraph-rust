@@ -31,6 +31,76 @@
   },
   {
     "candidates": null,
+    "col": 20,
+    "file_path": "callable_semantics.ts",
+    "from_node_id": "function:4b0317e2a093194d05c58f73d1e5b715",
+    "language": "typescript",
+    "line": 25,
+    "reference_kind": "calls",
+    "reference_name": "useMemo"
+  },
+  {
+    "candidates": null,
+    "col": 23,
+    "file_path": "callable_semantics.ts",
+    "from_node_id": "function:4b0317e2a093194d05c58f73d1e5b715",
+    "language": "typescript",
+    "line": 19,
+    "reference_kind": "calls",
+    "reference_name": "useEffectEvent"
+  },
+  {
+    "candidates": null,
+    "col": 25,
+    "file_path": "callable_semantics.ts",
+    "from_node_id": "function:4b0317e2a093194d05c58f73d1e5b715",
+    "language": "typescript",
+    "line": 22,
+    "reference_kind": "calls",
+    "reference_name": "Effect.fn"
+  },
+  {
+    "candidates": null,
+    "col": 25,
+    "file_path": "callable_semantics.ts",
+    "from_node_id": "function:4b0317e2a093194d05c58f73d1e5b715",
+    "language": "typescript",
+    "line": 22,
+    "reference_kind": "calls",
+    "reference_name": "Effect.fn(\"Screen.wrapped\")"
+  },
+  {
+    "candidates": null,
+    "col": 25,
+    "file_path": "callable_semantics.ts",
+    "from_node_id": "method:39f6bda50dc637243a66e8c89d24fac7",
+    "language": "typescript",
+    "line": 2,
+    "reference_kind": "references",
+    "reference_name": "Promise"
+  },
+  {
+    "candidates": null,
+    "col": 25,
+    "file_path": "callable_semantics.ts",
+    "from_node_id": "method:39f6bda50dc637243a66e8c89d24fac7",
+    "language": "typescript",
+    "line": 2,
+    "reference_kind": "references",
+    "reference_name": "Promise"
+  },
+  {
+    "candidates": null,
+    "col": 26,
+    "file_path": "callable_semantics.ts",
+    "from_node_id": "function:4b0317e2a093194d05c58f73d1e5b715",
+    "language": "typescript",
+    "line": 18,
+    "reference_kind": "calls",
+    "reference_name": "useCallback"
+  },
+  {
+    "candidates": null,
     "col": 26,
     "file_path": "consumer.ts",
     "from_node_id": "file:consumer.ts",
