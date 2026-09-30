@@ -368,5 +368,35 @@ if ! grep -q 'MISSING-OR-UNREADABLE' "$WORK/H.err"; then
 fi
 [ "$h_ok" -eq 1 ] && ok "H_trap_deletion (exit=$h_rc, missing lock → 90)"
 
+# ---------------------------------------------------------------------------
+# Scenario I — CRLF tool output. Windows builds of jq end every output line with
+# `\r\n`; the gate must normalise that rather than report every package as a
+# name/version mismatch. A shim first on PATH rewrites the real jq's output to
+# CRLF; the valid fixture must still pass.
+# ---------------------------------------------------------------------------
+REAL_JQ="$(command -v jq)"
+DIR_I="$WORK/crlf_jq"
+make_base_workspace "$DIR_I" "$V"
+SHIM_I="$WORK/shim_i"
+mkdir -p "$SHIM_I"
+cat > "$SHIM_I/jq" <<EOF
+#!/usr/bin/env bash
+set -o pipefail
+"$REAL_JQ" "\$@" | sed 's/\$/\r/'
+EOF
+chmod +x "$SHIM_I/jq"
+i_ok=1
+set +e
+PATH="$SHIM_I:$PATH" "$GATE" "$DIR_I" >"$WORK/I.out" 2>"$WORK/I.err"
+i_rc=$?
+set -e
+if [ "$i_rc" -ne 0 ]; then
+    bad "I_crlf_tool_output: expected exit 0, got $i_rc"; note "stderr: $(tr '\n' '|' < "$WORK/I.err")"; i_ok=0
+fi
+if ! grep -q 'check-workspace-versions: OK' "$WORK/I.out"; then
+    bad "I_crlf_tool_output: missing OK summary"; i_ok=0
+fi
+[ "$i_ok" -eq 1 ] && ok "I_crlf_tool_output (exit=$i_rc, CRLF jq output normalised)"
+
 printf '=== harness result: %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -233,9 +233,7 @@ jobs:
         run: npm install --global oxfmt@0.64.0
 
       - name: Install pinned actionlint
-        uses: taiki-e/install-action@a2a5f6e99e1a31540baa0468acfa302cff0f359f # v2.86.4
-        with:
-          tool: actionlint@1.7.12
+        run: bash .github/scripts/install-actionlint.sh
 
       - name: Require fixture parsers and shell linter
         run: |

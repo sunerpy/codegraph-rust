@@ -107,9 +107,9 @@ fi
 rm -f "/tmp/cwv_meta_err.$$"
 
 # Authoritative workspace package names + versions (workspace members only).
-META_NAMES="$(printf '%s' "$META_JSON" | jq -r '.packages[].name' | sort)"
+META_NAMES="$(printf '%s' "$META_JSON" | jq -r '.packages[].name' | tr -d '\r' | sort)"
 META_VERSIONS="$(printf '%s' "$META_JSON" \
-    | jq -r '.packages[] | "\(.name)=\(.version)"' | sort)"
+    | jq -r '.packages[] | "\(.name)=\(.version)"' | tr -d '\r' | sort)"
 
 # ---------------------------------------------------------------------------
 # Parse surface 1: root [workspace.package] version from Cargo.toml.
@@ -146,10 +146,10 @@ LOCK_NAMES="$(printf '%s\n' "$LOCK_ENTRIES" | sed 's/=.*//' | sort)"
 # ---------------------------------------------------------------------------
 # Parse surfaces 3/4: release manifest and rendered-scaffold metadata.
 # ---------------------------------------------------------------------------
-RELEASE_MANIFEST_VALUE="$(jq -r '."."' "$RELEASE_MANIFEST")"
+RELEASE_MANIFEST_VALUE="$(jq -r '."."' "$RELEASE_MANIFEST" | tr -d '\r')"
 [ -n "$RELEASE_MANIFEST_VALUE" ] && [ "$RELEASE_MANIFEST_VALUE" != "null" ] \
     || fail "no root \".\" entry in .release-please-manifest.json"
-SCAFFOLD_VERSION="$(jq -r '.placeholders.CURRENT_VERSION // empty' "$SCAFFOLD_CONFIG")"
+SCAFFOLD_VERSION="$(jq -r '.placeholders.CURRENT_VERSION // empty' "$SCAFFOLD_CONFIG" | tr -d '\r')"
 [ -n "$SCAFFOLD_VERSION" ] || fail "no placeholders.CURRENT_VERSION in .github/scaffold.json"
 
 # This repository has a virtual workspace root (`[workspace]` without
