@@ -1,0 +1,9 @@
+# cargo-audit reads this file directly from the repository root context.
+#
+# RUSTSEC-2026-0194 / RUSTSEC-2026-0195 are denial-of-service advisories in
+# quick-xml. quick-xml is transitive only through self_update's GitHub backend
+# (`self_update -> quick-xml`) and parses trusted GitHub release metadata fetched
+# over TLS, not user-controlled XML. self_update 0.44 still constrains quick-xml
+# to ^0.38; remove these exceptions as soon as it accepts quick-xml >=0.41.
+[advisories]
+ignore = ["RUSTSEC-2026-0194", "RUSTSEC-2026-0195"]

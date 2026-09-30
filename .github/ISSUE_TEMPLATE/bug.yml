@@ -1,0 +1,59 @@
+name: Bug report
+description: Report incorrect indexing, querying, CLI, MCP, installer, or runtime behavior
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report vulnerabilities here. Use the private channel in SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: CodeGraph version
+      description: Output of `codegraph --version` and installation method.
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: OS, architecture, filesystem, shell
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include the smallest source tree and exact commands. Remove secrets.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+      description: Include complete error text and whether the result is deterministic.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: Index status and diagnostics
+      description: Paste `codegraph status <project> --json`; attach opt-in diagnostics when relevant.
+      render: json
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues and the upstream ledger.
+          required: true
+        - label: This report contains no secrets or confidential vulnerability details.
+          required: true

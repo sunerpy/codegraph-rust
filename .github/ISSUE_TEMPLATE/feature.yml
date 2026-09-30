@@ -1,0 +1,53 @@
+name: Feature request
+description: Propose a new query, workflow, integration, or product behavior
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user task cannot be completed reliably today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe inputs, outputs, failure cases, and static/runtime boundary.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Primary surface
+      options:
+        - Extraction or resolution
+        - Graph or search
+        - CLI
+        - MCP
+        - Installer or agent integration
+        - Daemon or watcher
+        - Documentation or tooling
+        - Other
+    validations:
+      required: true
+  - type: checkboxes
+    id: compatibility
+    attributes:
+      label: Compatibility considerations
+      options:
+        - label: This may change graph output or require golden updates.
+        - label: This may change a public CLI, JSON, MCP, or installer contract.
+        - label: This may require a schema or extraction-version migration.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues and the upstream ledger.
+          required: true

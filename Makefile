@@ -1,250 +1,201 @@
+SHELL := /bin/sh
+.DEFAULT_GOAL := help
+
+PROJECT_NAME := codegraph-rs
+BINARY_NAME := codegraph
+CLI_CRATE := codegraph-rs
+CARGO ?= cargo
+TARGET_DIR := target
+DIST_DIR := dist
+TARGET ?=
+OXFMT_VERSION := 0.64.0
+ACTIONLINT_VERSION := 1.7.12
+OXFMT_ARGS := --no-error-on-unmatched-pattern --ignore-path .oxfmtignore .
+
 .PHONY: all build build-dev build-prod release release-target install uninstall \
         fmt fmt-rust fmt-oxfmt fmt-check fmt-rust-check fmt-oxfmt-check \
-        lint check test guardrail ci hooks setup-hooks clean size-compare help \
+        tools-check workflow-lint docs-check workspace-version typecheck lint test guardrail script-tests archive-smoke \
+        check ci pre-ci hooks setup-hooks clean size-compare help \
         coverage coverage-html coverage-lcov coverage-open coverage-clean
 
-# Project configuration
-PROJECT_NAME := codegraph-rs
-BINARY_NAME  := codegraph
-CLI_CRATE    := codegraph-rs
-CARGO        := cargo
-
-# Directories
-TARGET_DIR := target
-DIST_DIR   := dist
-
-# Cross-compilation target (set via environment variable or command line)
-# Example: make release-target TARGET=x86_64-unknown-linux-musl
-TARGET ?=
-
-# Default target
 all: build
 
-# Build the CLI in debug mode and copy the binary into dist/
 build: build-dev
 
 build-dev:
-	@echo "🔨 Building $(PROJECT_NAME) (debug)..."
-	$(CARGO) build -p $(CLI_CRATE)
+	@echo "Building $(PROJECT_NAME) (debug)..."
+	$(CARGO) build --locked -p $(CLI_CRATE)
 	@mkdir -p $(DIST_DIR)
-	@cp $(TARGET_DIR)/debug/$(BINARY_NAME) $(DIST_DIR)/$(BINARY_NAME) 2>/dev/null || \
-		echo "⚠️  Binary not found, check Cargo.toml [[bin]] configuration"
-	@echo "✅ Debug build complete: $(DIST_DIR)/$(BINARY_NAME)"
+	@if [ -f "$(TARGET_DIR)/debug/$(BINARY_NAME)" ]; then \
+		cp "$(TARGET_DIR)/debug/$(BINARY_NAME)" "$(DIST_DIR)/$(BINARY_NAME)"; \
+	elif [ -f "$(TARGET_DIR)/debug/$(BINARY_NAME).exe" ]; then \
+		cp "$(TARGET_DIR)/debug/$(BINARY_NAME).exe" "$(DIST_DIR)/$(BINARY_NAME).exe"; \
+	else echo "binary not found"; exit 1; fi
 
 build-prod: release
 
-# Build the optimized release binary and copy it into dist/
 release:
-	@echo "🚀 Building $(PROJECT_NAME) (release)..."
-	$(CARGO) build --release -p $(CLI_CRATE)
+	@echo "Building $(PROJECT_NAME) (release)..."
+	$(CARGO) build --locked --release -p $(CLI_CRATE)
 	@mkdir -p $(DIST_DIR)
-	@cp $(TARGET_DIR)/release/$(BINARY_NAME) $(DIST_DIR)/$(BINARY_NAME) 2>/dev/null || \
-		echo "⚠️  Binary not found, check Cargo.toml [[bin]] configuration"
-	@echo "✅ Release build complete: $(DIST_DIR)/$(BINARY_NAME)"
-	@ls -lh $(DIST_DIR)/$(BINARY_NAME) 2>/dev/null || true
+	@if [ -f "$(TARGET_DIR)/release/$(BINARY_NAME)" ]; then \
+		cp "$(TARGET_DIR)/release/$(BINARY_NAME)" "$(DIST_DIR)/$(BINARY_NAME)"; \
+	elif [ -f "$(TARGET_DIR)/release/$(BINARY_NAME).exe" ]; then \
+		cp "$(TARGET_DIR)/release/$(BINARY_NAME).exe" "$(DIST_DIR)/$(BINARY_NAME).exe"; \
+	else echo "binary not found"; exit 1; fi
 
-# Build the release binary for a specific target (cross-compilation).
-# Usage: make release-target TARGET=x86_64-unknown-linux-musl
 release-target:
 ifndef TARGET
 	$(error TARGET is not set. Usage: make release-target TARGET=x86_64-unknown-linux-musl)
 endif
-	@echo "🚀 Building $(PROJECT_NAME) for target $(TARGET)..."
-	$(CARGO) build --release -p $(CLI_CRATE) --target $(TARGET)
+	$(CARGO) build --locked --release -p $(CLI_CRATE) --target "$(TARGET)"
 	@mkdir -p $(DIST_DIR)
 	@if [ -f "$(TARGET_DIR)/$(TARGET)/release/$(BINARY_NAME)" ]; then \
-		cp $(TARGET_DIR)/$(TARGET)/release/$(BINARY_NAME) $(DIST_DIR)/$(BINARY_NAME)-$(TARGET); \
+		cp "$(TARGET_DIR)/$(TARGET)/release/$(BINARY_NAME)" "$(DIST_DIR)/$(BINARY_NAME)-$(TARGET)"; \
 	elif [ -f "$(TARGET_DIR)/$(TARGET)/release/$(BINARY_NAME).exe" ]; then \
-		cp $(TARGET_DIR)/$(TARGET)/release/$(BINARY_NAME).exe $(DIST_DIR)/$(BINARY_NAME)-$(TARGET).exe; \
-	else \
-		echo "⚠️  Binary not found for target $(TARGET)"; \
-		exit 1; \
-	fi
-	@echo "✅ Release build complete for $(TARGET)"
-	@ls -lh $(DIST_DIR)/$(BINARY_NAME)-$(TARGET)* 2>/dev/null || true
+		cp "$(TARGET_DIR)/$(TARGET)/release/$(BINARY_NAME).exe" "$(DIST_DIR)/$(BINARY_NAME)-$(TARGET).exe"; \
+	else echo "binary not found for $(TARGET)"; exit 1; fi
 
-# Install the binary to ~/.cargo/bin
 install: release
-	@echo "📦 Installing $(BINARY_NAME) to ~/.cargo/bin..."
-	$(CARGO) install --path crates/codegraph-cli
-	@echo "✅ Installation complete"
+	$(CARGO) install --locked --path crates/codegraph-cli
 
 uninstall:
-	@echo "🗑️  Uninstalling $(CLI_CRATE)..."
 	$(CARGO) uninstall $(CLI_CRATE) || true
 
-# oxfmt: formats Markdown / JSON / YAML etc. (Rust is owned by `cargo fmt`).
-# Auto-generated files (CHANGELOG.md, release-please manifests) + golden
-# fixtures are excluded via .oxfmtignore.
-OXFMT := oxfmt
-OXFMT_ARGS := --no-error-on-unmatched-pattern --ignore-path .oxfmtignore .
+# Every formatter/linter target fails closed when its tool is absent. CI installs
+# the exact pinned versions before invoking the same make check entry point.
+tools-check:
+	@command -v jq >/dev/null 2>&1 || { echo "jq is required"; exit 1; }
+	@command -v python3 >/dev/null 2>&1 || { echo "python3 is required"; exit 1; }
+	@python3 -c 'import yaml' >/dev/null 2>&1 || { echo "PyYAML is required"; exit 1; }
+	@command -v oxfmt >/dev/null 2>&1 || { echo "oxfmt $(OXFMT_VERSION) is required: npm install --global oxfmt@$(OXFMT_VERSION)"; exit 1; }
+	@test "$$(oxfmt --version | awk '{print $$NF}')" = "$(OXFMT_VERSION)" \
+		|| { echo "oxfmt $(OXFMT_VERSION) is required: npm install --global oxfmt@$(OXFMT_VERSION)"; exit 1; }
+	@command -v actionlint >/dev/null 2>&1 || { echo "actionlint $(ACTIONLINT_VERSION) is required"; exit 1; }
+	@test "$$(actionlint -version | head -1 | sed 's/^v//')" = "$(ACTIONLINT_VERSION)" \
+		|| { echo "actionlint $(ACTIONLINT_VERSION) is required"; exit 1; }
+	@command -v shellcheck >/dev/null 2>&1 || { echo "shellcheck is required"; exit 1; }
 
-# Format code (Rust via cargo fmt + docs/markdown via oxfmt)
-fmt: fmt-rust fmt-oxfmt
-	@echo "✨ Formatting complete."
+fmt: tools-check fmt-rust fmt-oxfmt
+	@echo "Formatting complete."
 
 fmt-rust:
-	@echo "✨ Formatting Rust (cargo fmt)..."
 	$(CARGO) fmt --all
 
 fmt-oxfmt:
-	@echo "✨ Formatting docs (oxfmt)..."
-	@if command -v $(OXFMT) >/dev/null 2>&1; then \
-		$(OXFMT) $(OXFMT_ARGS); \
-	else \
-		echo "⚠️  oxfmt not found — skipping doc formatting. Install: npm i -g oxfmt"; \
-	fi
+	oxfmt --write $(OXFMT_ARGS)
 
-# Check code formatting (CI: Rust + docs)
-fmt-check: fmt-rust-check fmt-oxfmt-check
-	@echo "✨ Format check complete."
+fmt-check: tools-check fmt-rust-check fmt-oxfmt-check
+	@echo "Format check complete."
 
 fmt-rust-check:
-	@echo "✨ Checking Rust formatting..."
 	$(CARGO) fmt --all --check
 
 fmt-oxfmt-check:
-	@echo "✨ Checking doc formatting..."
-	@if command -v $(OXFMT) >/dev/null 2>&1; then \
-		$(OXFMT) --check $(OXFMT_ARGS); \
-	else \
-		echo "⚠️  oxfmt not found — skipping doc format check. Install: npm i -g oxfmt"; \
-	fi
+	oxfmt --check $(OXFMT_ARGS)
 
-# Run linter (clippy, warnings denied)
+workspace-version:
+	@bash scripts/check-workspace-versions.sh
+
+typecheck:
+	$(CARGO) check --workspace --locked
+
 lint:
-	@echo "🔍 Running clippy..."
-	$(CARGO) clippy --workspace --all-targets -- -D warnings
+	$(CARGO) clippy --workspace --all-targets --locked -- -D warnings
 
-# Type-check the workspace without producing artifacts
-check:
-	@echo "✅ Checking workspace..."
-	$(CARGO) check --workspace
-
-# Run the full test suite (incl. golden oracle + equivalence)
 test:
-	@echo "🧪 Running tests..."
-	$(CARGO) test --workspace
+	$(CARGO) test --workspace --locked
 
-# Scope guardrail: no AI / vector / LLM crates in the workspace, and no drift
-# between the release workflow's asset names and what the installers download.
+workflow-lint: tools-check
+	actionlint .github/workflows/*.yml
+	shellcheck .github/scripts/*.sh .githooks/pre-push scripts/*.sh scripts/tests/*.sh
+
+docs-check: tools-check
+	python3 scripts/docs-check.py
+
+# Guardrail includes deterministic workflow/installer contract checks.
 guardrail:
-	@echo "🛡️  Running scope guardrail..."
-	bash scripts/guardrail.sh
+	@bash scripts/guardrail.sh
 
-# Run every gate that CI enforces
-ci: fmt-check lint test guardrail
-	@echo "✅ All CI checks passed!"
+script-tests:
+	@for test_script in scripts/tests/*.test.sh; do \
+		echo "Running $$test_script"; bash "$$test_script"; \
+	done
 
-# ─── Test coverage (cargo-llvm-cov + Codecov) ───────────────────────────────
-# Coverage is a tracked-but-informational metric: the target is 95%+ but the CI
-# gate never turns red (baseline ~72%). See codecov.yml + AGENTS.md.
-# Every recipe first checks that cargo-llvm-cov is installed.
-LLVM_COV_INSTALL := Install with: cargo install cargo-llvm-cov --locked
-LLVM_COV_HTML    := $(TARGET_DIR)/llvm-cov/html/index.html
+# Keep all supported local/CI entry points byte-for-byte equivalent in ordering.
+# The version check is the first Cargo subprocess and every later Cargo command
+# is locked. Recursive invocations make the ordering explicit even under make -j.
+check:
+	@$(MAKE) --no-print-directory workspace-version
+	@$(MAKE) --no-print-directory tools-check
+	@$(MAKE) --no-print-directory fmt-check
+	@$(MAKE) --no-print-directory docs-check
+	@$(MAKE) --no-print-directory workflow-lint
+	@$(MAKE) --no-print-directory lint
+	@$(MAKE) --no-print-directory test
+	@$(MAKE) --no-print-directory release
+	@$(MAKE) --no-print-directory guardrail
+	@$(MAKE) --no-print-directory script-tests
+	@echo "All checks passed."
+
+ci: check
+pre-ci: check archive-smoke
+
+archive-smoke:
+	bash scripts/smoke-release-archive.sh
+
+LLVM_COV_INSTALL := Install with: cargo install cargo-llvm-cov --version 0.8.7 --locked
+LLVM_COV_HTML := $(TARGET_DIR)/llvm-cov/html/index.html
 
 define REQUIRE_LLVM_COV
-	@command -v cargo-llvm-cov >/dev/null 2>&1 || { \
-		echo "❌ cargo-llvm-cov not found. $(LLVM_COV_INSTALL)"; exit 1; }
+	@command -v cargo-llvm-cov >/dev/null 2>&1 || { echo "cargo-llvm-cov not found. $(LLVM_COV_INSTALL)"; exit 1; }
 endef
 
-# Print a workspace coverage summary (line/region/function %) to stdout.
 coverage:
 	$(REQUIRE_LLVM_COV)
-	@echo "📈 Measuring workspace coverage (summary)..."
 	$(CARGO) llvm-cov --workspace --summary-only --ignore-filename-regex 'codegraph-bench'
 
-# Generate the browsable HTML report under target/llvm-cov/html/.
 coverage-html:
 	$(REQUIRE_LLVM_COV)
-	@echo "📈 Generating HTML coverage report..."
 	$(CARGO) llvm-cov --workspace --html --ignore-filename-regex 'codegraph-bench'
-	@echo "✅ HTML report: $(LLVM_COV_HTML)"
+	@echo "HTML report: $(LLVM_COV_HTML)"
 
-# Produce lcov.info (the artifact CI uploads to Codecov).
 coverage-lcov:
 	$(REQUIRE_LLVM_COV)
-	@echo "📈 Generating lcov.info..."
 	$(CARGO) llvm-cov --workspace --lcov --output-path lcov.info --ignore-filename-regex 'codegraph-bench'
-	@echo "✅ Wrote lcov.info"
 
-# Build the HTML report and open it (best-effort; never fails if no opener).
 coverage-open: coverage-html
-	@if command -v xdg-open >/dev/null 2>&1; then \
-		xdg-open "$(LLVM_COV_HTML)" >/dev/null 2>&1 || true; \
-	elif command -v open >/dev/null 2>&1; then \
-		open "$(LLVM_COV_HTML)" >/dev/null 2>&1 || true; \
-	else \
-		echo "ℹ️  No opener found; open manually: $(LLVM_COV_HTML)"; \
-	fi
+	@if command -v xdg-open >/dev/null 2>&1; then xdg-open "$(LLVM_COV_HTML)" >/dev/null 2>&1 || true; \
+	elif command -v open >/dev/null 2>&1; then open "$(LLVM_COV_HTML)" >/dev/null 2>&1 || true; \
+	else echo "Open $(LLVM_COV_HTML) manually"; fi
 
-# Clear coverage instrumentation/profraw data.
 coverage-clean:
 	$(REQUIRE_LLVM_COV)
-	@echo "🧹 Cleaning coverage data..."
 	$(CARGO) llvm-cov clean --workspace
 
-# Enable the version-controlled pre-push hook (run once per clone).
-# Points core.hooksPath at .githooks so `git push` runs the local quality gate
-# (fmt + clippy + test + guardrail) before anything reaches GitHub.
 hooks setup-hooks:
-	@echo "🪝  Enabling version-controlled git hooks (core.hooksPath -> .githooks)..."
 	git config core.hooksPath .githooks
-	@echo "✅ Done. The pre-push gate is now active (fmt + clippy + test + guardrail on push)."
+	@echo "Enabled .githooks (pre-push runs make pre-ci)."
 
-# Clean build artifacts
 clean:
-	@echo "🧹 Cleaning build artifacts..."
 	$(CARGO) clean
 	@rm -rf $(DIST_DIR)
-	@echo "✅ Clean complete"
 
-# Show debug vs release binary size
 size-compare: build-dev
-	@echo ""
-	@echo "📊 Binary size comparison:"
-	@echo "Debug:"
-	@ls -lh $(TARGET_DIR)/debug/$(BINARY_NAME) 2>/dev/null || echo "  Not found"
-	@if [ -f "$(TARGET_DIR)/release/$(BINARY_NAME)" ]; then \
-		echo "Release:"; \
-		ls -lh $(TARGET_DIR)/release/$(BINARY_NAME); \
-	fi
+	@ls -lh "$(TARGET_DIR)/debug/$(BINARY_NAME)"
+	@if [ -f "$(TARGET_DIR)/release/$(BINARY_NAME)" ]; then ls -lh "$(TARGET_DIR)/release/$(BINARY_NAME)"; fi
 
 help:
-	@echo "Available targets:"
-	@echo ""
-	@echo "  Build:"
-	@echo "    build        - Build the CLI (debug) into dist/"
-	@echo "    release      - Build the optimized CLI (release) into dist/"
-	@echo "    build-prod   - Alias for release"
-	@echo "    release-target TARGET=<triple> - Cross-compile for a target"
-	@echo "                   e.g. make release-target TARGET=x86_64-unknown-linux-musl"
-	@echo ""
-	@echo "  Install:"
-	@echo "    install      - cargo install the CLI to ~/.cargo/bin"
-	@echo "    uninstall    - cargo uninstall the CLI"
-	@echo ""
-	@echo "  Development:"
-	@echo "    fmt          - Format code (cargo fmt --all)"
-	@echo "    fmt-check    - Check formatting (CI)"
-	@echo "    lint         - Run clippy with -D warnings"
-	@echo "    check        - cargo check the workspace"
-	@echo "    test         - Run the full test suite"
-	@echo "    guardrail    - Run the scope guardrail (no AI/vector/LLM crates)"
-	@echo "    ci           - fmt-check + lint + test + guardrail"
-	@echo "    hooks        - Enable the pre-push git hook (run once after clone)"
-	@echo ""
-	@echo "  Coverage (cargo-llvm-cov + Codecov; target 95%, informational gate):"
-	@echo "    coverage       - Workspace coverage summary to stdout"
-	@echo "    coverage-html  - HTML report -> target/llvm-cov/html/index.html"
-	@echo "    coverage-lcov  - Write lcov.info (uploaded to Codecov in CI)"
-	@echo "    coverage-open  - Build HTML report and open it (best-effort)"
-	@echo "    coverage-clean - Clear coverage instrumentation data"
-	@echo ""
-	@echo "  Utilities:"
-	@echo "    clean        - Remove build artifacts and dist/"
-	@echo "    size-compare - Show debug vs release binary size"
-	@echo "    help         - Show this help"
-	@echo ""
-	@echo "  Release profile (configured in Cargo.toml [profile.release]):"
-	@echo "    opt-level = 3, lto = \"fat\", codegen-units = 1, strip = true"
+	@printf '%s\n' \
+		'Targets:' \
+		'  check / ci           complete quality gate (ci is an alias)' \
+		'  pre-ci               complete gate plus local archive smoke' \
+		'  fmt / fmt-check       Rust plus repository text formatting' \
+		'  typecheck              locked cargo check for the workspace' \
+		'  lint / test / release locked Rust gates and shipped build' \
+		'  workflow-lint         actionlint plus shellcheck' \
+		'  docs-check             local Markdown links, mirrors, and source contracts' \
+		'  workspace-version     version/Cargo.lock consistency gate' \
+		'  coverage[-html|-lcov] informational coverage reports' \
+		'  archive-smoke          package, unpack, and execute local release bytes' \
+		'  hooks                  enable the versioned pre-push hook'

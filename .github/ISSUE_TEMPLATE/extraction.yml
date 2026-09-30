@@ -1,0 +1,67 @@
+name: Language or extraction gap
+description: Report a missing, wrong, or fabricated symbol/edge for a minimal source fixture
+title: "fix(extraction): "
+labels: ["bug", "extraction"]
+body:
+  - type: input
+    id: language
+    attributes:
+      label: Language and extension
+      placeholder: TypeScript (.ts)
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: CodeGraph version
+      description: Output of `codegraph --version`.
+    validations:
+      required: true
+  - type: textarea
+    id: fixture
+    attributes:
+      label: Minimal source fixture
+      description: Include every file needed to reproduce and no private code.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: commands
+    attributes:
+      label: Commands and observed graph
+      description: Show init/sync plus search, callers, export, or MCP calls that demonstrate the gap.
+      render: shell
+    validations:
+      required: true
+  - type: dropdown
+    id: problem_kind
+    attributes:
+      label: Problem kind
+      options:
+        - Missing symbol or edge
+        - Fabricated symbol or edge
+        - Wrong owner or target
+        - Wrong location or signature
+        - Import/path resolution
+        - Parser error or unsupported syntax
+        - Incremental/full-index mismatch
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected static-analysis result
+      description: Explain ambiguity and any dynamic behavior that should remain unresolved.
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I reduced this to a non-confidential fixture.
+          required: true
+        - label: I checked docs/languages.md for the documented boundary.
+          required: true
+        - label: I searched existing issues and the upstream ledger.
+          required: true

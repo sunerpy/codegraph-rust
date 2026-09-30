@@ -4,8 +4,10 @@ CodeGraph extracts code structure deterministically using tree-sitter grammars a
 embedded extractors. No AI, vectors, or embeddings are involved. The output is byte-stable
 across runs.
 
-**38 concrete languages** are supported, grouped into three extraction tiers based on what
-the extractor produces.
+**38 code and template language IDs** are supported, grouped into three extraction tiers.
+Three additional Godot project/resource format IDs are tracked for file/framework
+analysis. Internally this is 41 concrete IDs plus the `unknown` fallback (42 entries in
+`LANGUAGE_STRINGS`).
 
 > **Note on TypeScript/JavaScript variants:** `typescript` and `tsx`, and `javascript` and
 > `jsx`, are distinct grammar variants internally (separate `Language` enum entries). They

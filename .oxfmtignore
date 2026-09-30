@@ -1,10 +1,7 @@
 # oxfmt ignore — files oxfmt must NOT touch.
 #
-# Auto-generated changelog / release-please manifests are produced and formatted
-# by the release workflow (update-changelog job); the dev/CI fmt flow must not
-# touch them, otherwise git-cliff regeneration conflicts with oxfmt's expected
-# format and fmt-check would falsely fail on every PR between releases.
-CHANGELOG.md
+# Release-please owns changelog and manifest bytes; the general repository
+# formatter must not rewrite them between release PR updates.
 changelog/
 .release-please-manifest.json
 release-please-config.json

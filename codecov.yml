@@ -1,13 +1,15 @@
+# Coverage remains informational: 95% is the ratchet target, not a merge gate.
+# Measured 2026-09-15: 94.73% lines, 94.44% regions, 93.73% functions.
 coverage:
   status:
     project:
       default:
         target: 95%
-        informational: true # report-only: never fails CI (baseline ~72%, iron rule: local green => CI green)
+        informational: true
     patch:
       default:
         target: 95%
-        informational: true # new code encouraged to 95%, still non-blocking
+        informational: true
 
 comment:
   layout: "reach, diff, flags, files"

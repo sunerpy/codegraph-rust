@@ -228,7 +228,7 @@ FTS5 候选（`search_nodes_fts_filtered`）→（空且文本≥2）LIKE 阶梯
 ## 7. CLI 表面 / CLI Surface（`codegraph-cli`）
 
 `codegraph` 单一二进制，clap 26 个子命令（见
-[README §CLI 子命令](../README.md#cli-subcommands)）。CLI bootstrap：
+[CLI 参考](cli.md)）。CLI bootstrap：
 `Config::load_env_or_default` fail-fast（人类可读错误，只配置 logger，不代表任何项目）
 → `init_logger`（在 `main` 中持有 guard；日志只走 stderr，`serve --mcp` 独占 stdout
 以免污染 JSON-RPC 流）。每个针对项目的操作再各自从该项目解析出的索引根加载其

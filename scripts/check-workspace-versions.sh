@@ -8,10 +8,10 @@
 #   keeps the tag, binary, archive, and every in-repo version string in lockstep.
 #
 #   The four version surfaces:
-#     1. root  Cargo.toml  [workspace.package] version
-#     2. every source-less package version in  Cargo.lock  (the workspace members)
-#     3. version.txt
-#     4. the root ("."") entry in  .release-please-manifest.json
+#     1. root Cargo.toml [workspace.package] version
+#     2. every source-less package version in Cargo.lock (workspace members)
+#     3. the root (".") entry in .release-please-manifest.json
+#     4. .github/scaffold.json placeholders.CURRENT_VERSION
 #
 # Cargo ordering contract (see the frozen v1.5 plan, E2)
 #   * The FIRST operation snapshots the Cargo.lock bytes/hash.
@@ -41,15 +41,16 @@ WORKSPACE_ROOT="${1:-"$(cd -- "$SCRIPT_DIR/.." && pwd -P)"}"
 
 CARGO_TOML="$WORKSPACE_ROOT/Cargo.toml"
 CARGO_LOCK="$WORKSPACE_ROOT/Cargo.lock"
-VERSION_TXT="$WORKSPACE_ROOT/version.txt"
 RELEASE_MANIFEST="$WORKSPACE_ROOT/.release-please-manifest.json"
+RELEASE_CONFIG="$WORKSPACE_ROOT/release-please-config.json"
+SCAFFOLD_CONFIG="$WORKSPACE_ROOT/.github/scaffold.json"
 
 fail() {
     printf 'check-workspace-versions: ERROR: %s\n' "$1" >&2
     exit 1
 }
 
-for f in "$CARGO_TOML" "$CARGO_LOCK" "$VERSION_TXT" "$RELEASE_MANIFEST"; do
+for f in "$CARGO_TOML" "$CARGO_LOCK" "$RELEASE_MANIFEST" "$RELEASE_CONFIG" "$SCAFFOLD_CONFIG"; do
     [ -f "$f" ] || fail "required file not found: $f"
 done
 
@@ -143,17 +144,42 @@ LOCK_ENTRIES="$(awk '
 LOCK_NAMES="$(printf '%s\n' "$LOCK_ENTRIES" | sed 's/=.*//' | sort)"
 
 # ---------------------------------------------------------------------------
-# Parse surface 3: version.txt (trim all surrounding whitespace).
-# ---------------------------------------------------------------------------
-VERSION_TXT_VALUE="$(tr -d '[:space:]' < "$VERSION_TXT")"
-[ -n "$VERSION_TXT_VALUE" ] || fail "version.txt is empty"
-
-# ---------------------------------------------------------------------------
-# Parse surface 4: root "." entry in .release-please-manifest.json.
+# Parse surfaces 3/4: release manifest and rendered-scaffold metadata.
 # ---------------------------------------------------------------------------
 RELEASE_MANIFEST_VALUE="$(jq -r '."."' "$RELEASE_MANIFEST")"
 [ -n "$RELEASE_MANIFEST_VALUE" ] && [ "$RELEASE_MANIFEST_VALUE" != "null" ] \
     || fail "no root \".\" entry in .release-please-manifest.json"
+SCAFFOLD_VERSION="$(jq -r '.placeholders.CURRENT_VERSION // empty' "$SCAFFOLD_CONFIG")"
+[ -n "$SCAFFOLD_VERSION" ] || fail "no placeholders.CURRENT_VERSION in .github/scaffold.json"
+
+# This repository has a virtual workspace root (`[workspace]` without
+# `[package]`) and every member inherits `version.workspace = true`.
+# release-please 17.6.0's Rust/CargoWorkspace updaters require literal
+# `[package].version` strings, so the supported contract is the proven
+# `simple` strategy plus explicit extra-file updates for every version surface.
+jq -e '.packages["."]."release-type" == "simple"' "$RELEASE_CONFIG" >/dev/null \
+    || fail "release-please root package must use the simple strategy for this virtual Cargo workspace"
+jq -e '
+  .packages["."]."extra-files"
+  | any(.type == "toml"
+      and .path == "Cargo.toml"
+      and .jsonpath == "$.workspace.package.version")
+' "$RELEASE_CONFIG" >/dev/null \
+    || fail "release-please must update Cargo.toml workspace.package.version"
+jq -e '
+  .packages["."]."extra-files"
+  | any(.type == "toml"
+      and .path == "Cargo.lock"
+      and .jsonpath == "$.package[?(!@.source)].version")
+' "$RELEASE_CONFIG" >/dev/null \
+    || fail "release-please must update every source-less Cargo.lock package version"
+jq -e '
+  .packages["."]."extra-files"
+  | any(.type == "json"
+      and .path == ".github/scaffold.json"
+      and .jsonpath == "$.placeholders.CURRENT_VERSION")
+' "$RELEASE_CONFIG" >/dev/null \
+    || fail "release-please must update .github/scaffold.json CURRENT_VERSION"
 
 # ---------------------------------------------------------------------------
 # Assertions. Collect every discrepancy for a precise, deterministic report.
@@ -170,13 +196,12 @@ if [ "$META_NAMES" != "$LOCK_NAMES" ]; then
     comm -13 <(printf '%s\n' "$META_NAMES") <(printf '%s\n' "$LOCK_NAMES") | sed 's/^/    /' >&2
 fi
 
-# Surface 1 is the reference version; assert 2/3/4 (and metadata versions) match.
-if [ "$VERSION_TXT_VALUE" != "$WORKSPACE_VERSION" ]; then
-    report "version.txt = '$VERSION_TXT_VALUE' != [workspace.package] version = '$WORKSPACE_VERSION'"
-fi
-
+# Surface 1 is the reference version; assert surfaces 2/3/4 and metadata match.
 if [ "$RELEASE_MANIFEST_VALUE" != "$WORKSPACE_VERSION" ]; then
     report ".release-please-manifest.json \".\" = '$RELEASE_MANIFEST_VALUE' != [workspace.package] version = '$WORKSPACE_VERSION'"
+fi
+if [ "$SCAFFOLD_VERSION" != "$WORKSPACE_VERSION" ]; then
+    report ".github/scaffold.json CURRENT_VERSION = '$SCAFFOLD_VERSION' != [workspace.package] version = '$WORKSPACE_VERSION'"
 fi
 
 while IFS= read -r entry; do
@@ -213,8 +238,8 @@ PKG_COUNT="$(printf '%s\n' "$LOCK_NAMES" | grep -c .)"
 printf 'check-workspace-versions: OK\n'
 printf '  first cargo subprocess : cargo metadata --locked --no-deps --format-version 1\n'
 printf '  workspace version      : %s\n' "$WORKSPACE_VERSION"
-printf '  version.txt            : %s\n' "$VERSION_TXT_VALUE"
 printf '  release manifest "."   : %s\n' "$RELEASE_MANIFEST_VALUE"
+printf '  scaffold version       : %s\n' "$SCAFFOLD_VERSION"
 printf '  source-less packages   : %s (all at %s)\n' "$PKG_COUNT" "$WORKSPACE_VERSION"
 printf '%s\n' "$LOCK_NAMES" | sed 's/^/    /'
 # EXIT trap now proves Cargo.lock is byte-for-byte unchanged.

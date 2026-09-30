@@ -1,0 +1,25 @@
+{
+  "profile": "rust",
+  "addons": ["codecov"],
+  "placeholders": {
+    "BINARY": "codegraph",
+    "CRATE": "codegraph-rs",
+    "CURRENT_VERSION": "0.50.3",
+    "DEFAULT_BRANCH": "main",
+    "OWNER": "sunerpy",
+    "PACKAGE_NAME": "codegraph-rs",
+    "REPO": "codegraph-rust",
+    "RUST_TOOLCHAIN": "1.96.0"
+  },
+  "drift_allow": [
+    ".github/workflows/ci.yml",
+    ".github/workflows/release.yml",
+    "release-please-config.json",
+    "Makefile",
+    "scripts/install.sh",
+    "scripts/install.ps1",
+    ".oxfmtignore",
+    "codecov.yml",
+    ".github/dependabot.yml"
+  ]
+}

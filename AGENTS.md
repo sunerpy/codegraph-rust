@@ -1,398 +1,188 @@
-# AGENTS.md — codegraph-rs
+# AGENTS.md — codegraph-rs contributor contract
 
-A deterministic tree-sitter + SQLite/FTS5 **code knowledge graph**: it parses a codebase,
-extracts symbols and their relationships, persists them to a per-project SQLite database
-(with an FTS5 search index), and exposes the result through a CLI and an MCP (Model Context
-Protocol) stdio server. No AI / vector / LLM anywhere in the binary — output is byte-stable.
+CodeGraph is a deterministic tree-sitter + SQLite/FTS5 code knowledge graph. The
+single `codegraph` binary indexes source, resolves relationships, answers graph
+queries through the CLI and MCP, and can keep an index current through a local
+daemon. It contains no AI, vector database, embedding model, or LLM runtime.
 
-## CodeGraph command contract
+This file is the canonical instruction source for coding agents. `CLAUDE.md`
+imports it; do not create a second agent guide. Detailed, changeable behavior
+belongs in [`docs/`](docs/README.md), not here.
 
-Before code research, run `codegraph status . --json`. Lifecycle commands
-(`status`, `init`, `sync`, `index`) accept an optional positional project path.
-Research commands take one positional query/target and select the project with
-`-p/--path`:
+## Navigate with CodeGraph first
+
+Before researching source in an indexed checkout, verify the index:
 
 ```bash
-codegraph explore "<question>" -p .
-codegraph search "<symbol>" -p .
-codegraph node "<symbol-name-or-id>" -p .
+codegraph status . --json
 ```
 
-Do not append `.` as a second positional argument to a research command. If an
-argument is rejected, run `codegraph <command> --help` and correct the syntax
-before falling back to grep. `node` accepts a symbol name, qualified name, exact
-`node.id` from `search --json`, or an indexed file path.
+Lifecycle commands take an optional positional project path. Research commands
+take one query/target plus `-p/--path`:
 
-## Hard invariants (never break)
-
-- **Golden `.schema` byte-stability** — verified by `crates/codegraph-bench/tests/equivalence.rs`
-  against the fixed golden artifacts under `reference/golden/`. Fixtures: the existing upstream
-  corpus plus `reference/golden/godot/` (corpus `crates/codegraph-bench/fixtures/godot/`;
-  guards F1 autoload-call edges + F2 signal-handler edges + UID-form autoloads
-  — a sidecar-UID script autoload (`*.gd.uid`) and a header-UID scene autoload
-  (`.tscn` `uid=`) — byte-for-byte) and
-  `reference/golden/ruby/` (corpus `crates/codegraph-bench/fixtures/ruby/`; guards #1110
-  Ruby `receiver.method` extraction — instance/class-method Calls, `Const.new` Instantiates,
-  bare `include` Implements — byte-for-byte), `reference/golden/python/` (corpus
-  `crates/codegraph-bench/fixtures/python/`; guards six bare class-as-value
-  `References` edges — return, assignment RHS, registry pair, call argument,
-  list literal, and one cross-file unique match — plus tuple-return and bare-method
-  negatives, plus #1626 Python module/member import aliases and their no-global-fallback
-  boundaries, byte-for-byte), `reference/golden/kotlin/` (corpus
-  `crates/codegraph-bench/fixtures/kotlin/`; guards #1495 Kotlin callable
-  signatures for explicit, inferred, generic, multiline nullable, and extension
-  returns, plus a primary-constructor negative — byte-for-byte),
-  `reference/golden/typescript/` (corpus `crates/codegraph-bench/fixtures/typescript/`;
-  guards #1482 local export aliases and #1482b TypeScript `.js`-specifier
-  substitution, object-literal callable members, inherited/config-relative TS
-  path aliases, and `.xsjs`/`.xsjslib` import candidates with ordinary-JS
-  precedence — byte-for-byte), and
-  `reference/golden/cpp/`
-  (corpus `crates/codegraph-bench/fixtures/cpp/`; guards #1043 C++ class/struct
-  inheritance incl. templated-base stripping byte-for-byte, and retroactively
-  the earlier C++ extraction work; grown to 19 files with full-source lexically
-  masked plain-derived `.h` detection and its text/bitfield/label/ternary
-  negatives, plus the Tier 3 MSVC COM
-  `interface` positives + five guard negatives (#1519) and the C / C++ / ObjC
-  `union` fixtures incl. both `typedef union` re-kinds and both instantiation
-  paths (PR #1516) — it is the C-FAMILY corpus, not a strictly-C++ one, since it
-  holds `.c` and `.mm` files too), and `reference/golden/rust/`
-  (four-file corpus `crates/codegraph-bench/fixtures/rust/`; the repo's only Rust corpus,
-  guards #1513/PR #1514 unit structs — 3 `struct` nodes and 4 `implements` edges,
-  where the unit struct produced NO node before — plus the Rust half of PR #1516's
-  first-class `union` kind, generic/lifetime/reference/qualified impl ownership,
-  and the statically safe subset of `self.field.method()` resolution, byte-for-byte;
-  it deliberately claims NO `instantiates` edge, because that edge fires only for
-  the call-expression construction form and a Rust union is constructible only as
-  `U { … }`), `reference/golden/lua/` (single-file corpus
-  `crates/codegraph-bench/fixtures/lua/`; guards #1616 local/table-field function
-  expressions, nested qualified names, body-call ownership, dot/colon calls, and
-  dynamic-key negatives — byte-for-byte), `reference/golden/erlang/` (seven-file
-  corpus `crates/codegraph-bench/fixtures/erlang/`; guards bare display names plus
-  `module::function/arity` identity across clauses, exports, specs, local/remote
-  calls, fun values, safe MFA dispatch, and binary-literal comma counting —
-  byte-for-byte), and `reference/golden/go/`
-  (corpus `crates/codegraph-bench/fixtures/go/`; the repo's only Go corpus, and the
-  only corpus where `files.generated` is anything other than `0` — it byte-pins
-  #1500 content-header detection at BOTH values, three each way: `payroll.go`
-  (Go's codified `Code generated … DO NOT EDIT.`), `worker_types.go` (pattern 6 /
-  CG-25, Wrangler's TWO `by` clauses) and `api.pb.go` (the PATH signal, no banner)
-  at `1`; `payroll_usecase.go` (hand-written, and the must-not-demote side),
-  `nightly.go` (ONE `by` clause — ordinary prose) and `generator.go` (the banner is
-  a `const` in the function BODY, so the comment-line fence rejects it) at `0`).
-  The Python cross-file edge is resolved by Gate 3a's unique-name fallback;
-  import Gate 3b is deliberately unreachable for real Python nodes because the
-  extractor does not mark them exported. Regen recipe: `docs/equivalence.md`
-  "Godot fixture" / "Ruby fixture" / "Python fixture" / "Kotlin fixture" /
-  "TypeScript resolution fixture" / "C++ fixture" / "Rust fixture" / "Lua fixture" /
-  "Erlang fixture" / "Go fixture" sections. `mini` has no re-indexable provenance
-  and a schema migration cannot normalise it in place, so it has its own
-  "Mini schema rebuild" recipe there.
-- **node-id formula**: `{kind}:{sha256("{filePath}:{kind}:{name}:{line}").hex[:32]}`; file nodes are the
-  literal `file:{relpath}`; lines are 1-based; paths relative with `/`.
-- **No AI / vector / LLM crates** — enforced by `scripts/guardrail.sh` (CI gate):
-  no surrealdb / rig / qdrant / lancedb / candle / onnx / ort.
-- **Deterministic** extraction + resolution; sync output must equal `index --force` byte-for-byte.
-
-## Workspace layout (10 crates)
-
-`codegraph-core` (types/config/logger) · `codegraph-store` (SQLite+FTS5) · `codegraph-extract`
-(tree-sitter walker + embedded + custom extractors; incl. C++ `base_class_clause` → `Extends`
-inheritance extraction with templated-base stripping, #1043; a shared `extract_aggregate` behind
-`extract_struct`/`extract_union` so the `union` kind — C/C++/ObjC `union_specifier`, Rust
-`union_item`, PR #1516 — inherits struct behaviour by construction, plus the opt-in
-`allow_bodiless_struct()` that makes a Rust `struct Unit;` a definition rather than a forward
-declaration, #1513) · `codegraph-graph` (traversal + FTS search) ·
-`codegraph-resolve` (import + name matcher + FrameworkResolver; concrete `GodotResolver` impl — autoload-call + signal-handler resolution) · `codegraph-mcp`
-(stdio JSON-RPC; `codegraph_explore` runs a change-surface rescue, #1064, that surfaces a
-callable's buried parameter/return-type files into the explored subgraph; every source-emitting
-path goes through a request-memoized freshness probe — size + ms-mtime, then sha256 on stat
-mismatch — so a drifted file is served whole under `FILE_MODE_MAX_LINES` or omitted, never sliced
-at stored line numbers, and the response carries the staleness banner only when it actually cites
-one) · `codegraph-cli` (single binary, owns logger; also hosts the `install`/`uninstall`
-agent-config installer in `src/installer/`) · `codegraph-daemon` ·
-`codegraph-watch` · `codegraph-bench` (benchmark harness + golden oracle).
-
-The published crate is `codegraph-rs` (the `codegraph-cli` package); the installed binary is
-`codegraph`. The library crates publish as `codegraph-{core,store,extract,graph,resolve,mcp,daemon,watch}`.
-`codegraph-bench` is `publish = false`.
-
-## Godot framework resolver (`codegraph-resolve`)
-
-The `GodotResolver` is the first concrete `FrameworkResolver` impl. It fires on
-GDScript files and synthesizes edges that tree-sitter alone cannot produce. Three
-behaviors are active:
-
-- **F1 — autoload-call→func edges**: a call `Autoload.method()` in a `.gd` file
-  emits a `Calls` edge to the UNIQUE same-named `func` in the autoload's bound
-  target script (binding read from `project.godot` `[autoload]` section,
-  `Name="*res://path.gd"` form only). Determinism rule: edge built ONLY when
-  exactly one matching `func` exists in that script; 0 or ≥2 matches → no edge.
-  Files: `crates/codegraph-resolve/src/frameworks/godot.rs`,
-  `crates/codegraph-resolve/src/frameworks/godot_script.rs`.
-
-- **F2 — signal handler extraction**: `connect_handler` now extracts handlers
-  from `.connect(_h.bind(x))` (head segment before `.bind(`) and
-  `Callable(self,"h")`/`Callable(this,"h")` forms, in addition to bare
-  `.connect(_h)`. Other receivers, variable handlers, or non-literal method
-  names stay dynamic sentinels (unresolved). File:
-  `crates/codegraph-resolve/src/frameworks/godot_script.rs`.
-
-- **F3 — impact/affected↔audit unification**: `codegraph impact` (file-node
-  targets) and `codegraph affected` now also consume path-keyed `unresolved_refs`
-  restricted to Godot `ReferenceSubkind`s (`script_attach`, `ext_resource`,
-  `scene_instance`, `group_member`, `signal_method`, `autoload`), so their
-  output agrees with `codegraph audit --impact`. Query-side only; zero extraction
-  change. New function: `dependent_file_paths_unresolved` in
-  `crates/codegraph-store/src/queries.rs`; CLI wired in
-  `crates/codegraph-cli/src/main.rs`. `codegraph affected` additionally emits an
-  `affectedFiles` key — the sorted+deduped union of every traversed dependent
-  plus the test-file set (`affectedFiles ⊇ affectedTests`) — so it LISTS the
-  complete affected set instead of only counting it via
-  `totalDependentsTraversed`. Additive: `changedFiles`, `affectedTests`,
-  `totalDependentsTraversed` are byte-for-byte unchanged.
-
-Full Godot static-analysis scope, static-vs-runtime boundary, and honesty signals:
-[`docs/godot.md`](docs/godot.md).
-
-## Tauri IPC resolver (`codegraph-resolve`)
-
-The `TauriResolver` is the second concrete `FrameworkResolver` impl. It bridges the
-IPC boundary a `#[tauri::command]` opens: `extract()` emits one
-`tauri:invoke:<wire-name>` `Calls` reference per literal-argument `invoke('name')`
-call site in a JS-family file, and `resolve()` binds it to the command function.
-Registered **LAST** in `detect_frameworks` so the existing four resolvers' Strategy-1
-iteration order is unchanged. `confidence` is 0.9 at its single return site, so it
-short-circuits before the name matcher. File:
-`crates/codegraph-resolve/src/frameworks/tauri.rs`.
-
-- **Determinism rule.** An edge is built only when EXACTLY ONE command claims the
-  wire name. The roster is a `BTreeMap<String, Option<Node>>` keyed by both the
-  snake name and its `tauri-specta` camelCase spelling, and a key claimed by a
-  second, DIFFERENT target is permanently poisoned (`None`) — 0 or ≥2 candidates
-  produce no edge. The "different target id" clause is what keeps a single-word
-  command, whose camel spelling equals its wire name, from poisoning itself. This
-  rule is the ONLY protection that exists: `Language::Rust` has no language family,
-  so the cross-family gates are inert for a Rust target, and `Calls` bypasses them
-  regardless.
-- **Both text scans are lexically masked, and dropping either one is a defect.**
-  `rust_code_mask` gates the roster — BOTH the `#[tauri::command]` token and the
-  `fn <name>` that follows it, skipping masked bytes and further attributes in
-  between (a whole-span gate fails closed on the legal attribute / doc-comment /
-  attribute / `fn` interleaving) — plus a token boundary after `command`, because
-  `#[tauri::commandant]` is entirely ordinary code and the mask cannot reject it.
-  Without those, a commented-out or raw-string copy of the attribute promotes the
-  real UNATTRIBUTED same-named function: measured on the adversarial fixture, six
-  fabricated edges where the correct answer is one, since every masked copy mints
-  no node and the same-file/same-name join therefore has exactly one candidate and
-  it is the wrong one. `js_code_mask` plus a no-receiver guard gates the call side;
-  without its regex state, `/invoke('save_config')/` — a legal regex literal the
-  base extractor records nothing for — becomes a fabricated edge to a real command.
-  The same Rust mask also gates detection probe 4, without which THIS repository
-  self-detects as a Tauri project off the literal in its own source.
-- **Known limitations, deliberate.** References are FILE-granular
-  (`from_node_id = file:<relpath>`), so `codegraph callers get_mcp_port` answers
-  with `src/app.ts` rather than the enclosing function; reconstructing that id is
-  unsafe here because TypeScript has many declaration forms and an object-literal
-  call site has no enclosing function node at all. `invoke(cmdName)`,
-  ``invoke(`cmd_${id}`)`` and `client.invoke('x')` emit nothing, with no dynamic
-  sentinel — Tauri has no `codegraph audit`-style consumer that would read one.
-  `generate_handler![…]` is NOT parsed, so an attributed-but-unregistered command
-  still gets an edge (asserted deliberately). Events (`listen`/`once`) and the typed
-  `commands.getMcpPort()` binding path are out of scope.
-
-## MCP protocol surface (`codegraph-mcp`, rmcp 3.0.1)
-
-`codegraph-mcp` builds on **rmcp 3.0.1** (`crates/codegraph-mcp/Cargo.toml`, dep and dev-dep;
-features `server`, `client`, `transport-io`, `transport-streamable-http-server`). The 2.1 → 3.0.1
-upgrade cost three lines in `rmcp_handler.rs`: `call_tool` returns the `#[non_exhaustive]`
-`CallToolResponse` enum instead of `CallToolResult` (we only ever build `Complete`, via `.into()`),
-`with_stateful_mode` became `with_legacy_session_mode`, and a stale `get_info()` comment was
-corrected. The 3.x breaking changes that bit third-party code were all CLIENT-side
-(`InitializeResult` → `ServerPeerInfo`, optional `server_info`, OAuth `resolve_metadata()`), none of
-which touch a server `ServerHandler`. `Peer::list_roots` is still `#[deprecated]` (SEP-2577) with
-still no replacement, so the `#[allow(deprecated)]` at `rmcp_handler.rs:334` stays.
-
-**We serve five protocol revisions, and that is the SDK default rather than a choice.**
-`ProtocolVersion` is `struct ProtocolVersion(Cow<'static, str>)` plus associated constants (NOT an
-enum); rmcp's `negotiate_protocol_version` echoes back any client-requested version present in
-`KNOWN_VERSIONS`. So `get_info()`'s `.with_protocol_version(V_2024_11_05)` is only the FALLBACK for
-an unknown client version — it is not a ceiling, and we do not pin or force 2024-11-05:
-
-| client requests | negotiated | `resultType` in results | HTTP session           |
-| --------------- | ---------- | ----------------------- | ---------------------- |
-| 2024-11-05      | 2024-11-05 | absent                  | no header (our config) |
-| 2025-03-26      | 2025-03-26 | absent                  | no header (our config) |
-| 2025-06-18      | 2025-06-18 | absent                  | no header (our config) |
-| 2025-11-25      | 2025-11-25 | absent                  | no header (our config) |
-| 2026-07-28      | 2026-07-28 | `"complete"`            | no header (per spec)   |
-
-`resultType` (SEP-2322) is absent for pre-2026 peers because upstream
-[#1038](https://github.com/modelcontextprotocol/rust-sdk/pull/1038) strips it for legacy peers, and
-2026-07-28 is stateless per SEP-2567 — no `Mcp-Session-Id` — unconditionally, regardless of
-`with_legacy_session_mode`, which now governs legacy versions only. We pass
-`with_legacy_session_mode(false)` (`rmcp_handler.rs:737`), so the legacy versions issue no
-`Mcp-Session-Id` either: THIS server never sends one at any revision. The two absences differ in
-cause, though — legacy is our configuration and would come back if that flag flipped to `true`,
-while 2026-07-28 is mandated and cannot be turned back on. SEP-2243 standard headers are
-validated in both directions: matching `MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name` reach the
-tool, while a missing protocol header or a mismatched `Mcp-Method` / `Mcp-Name` is rejected with
-HTTP 400 + JSON-RPC code `-32020`. Coverage lives in `tests/rmcp_l3.rs` (version echo, `resultType`
-presence/absence) and `tests/rmcp_http.rs` (no session header, SEP-2243 both branches).
-
-**Not implemented, deliberately:** Tasks (SEP-2663), MRTR / elicitation-in-tool, and subscriptions.
-We advertise only the tools capability and always return `CallToolResponse::Complete`; we never
-construct `Task` or `InputRequired`. `accepted_subscription_filter` keeps its `None` default, while
-legacy `subscribe` / `unsubscribe` return method-not-found. The request surface is not literally
-tools-only, however. Beyond the mandatory `initialize` handshake — itself an inherited default
-(`handler/server.rs:314-326`), which is why negotiation runs automatically over our `get_info()` and
-why the `V_2024_11_05` there is only a fallback — these inherited defaults also answer `Ok`.
-`discover` returns real content
-(`supported_protocol_versions()` plus `get_info()`); `complete` returns an empty `CompleteResult`;
-`list_prompts` / `list_resources` / `list_resource_templates` (`handler/server.rs:362-383`) return
-EMPTY results, so `prompts/list`, `resources/list`, and `resources/templates/list` answer with
-nothing rather than method-not-found; and `ping` succeeds on the legacy revisions only
-(method-not-found at 2026-07-28, `handler/server.rs:112-118`). The `set_level`, `get_prompt`,
-`read_resource`, and task-lifecycle defaults return method-not-found. These are SDK defaults, not
-our implementations, and they add no advertised capabilities.
-
-**MCP golden fixtures are STRUCTURAL, not byte-stable.** `tests/support/parity.rs:244-300` and
-`tests/golden_mcp.rs` compare only NAMED fields — initialize: `protocolVersion`, `capabilities`,
-`serverInfo.name`, `serverInfo.version`, `instructions`; tools/list: names + order + `inputSchema` +
-annotations; tool result: `content[0].type`, `isError`, and the sorted set of non-empty text lines;
-error: `code` + `message` — never whole-object equality. That is why an added top-level `resultType`
-could not drift the 15 existing fixtures, and equally why it needed its own explicit test. (The
-EXTRACTION goldens under `reference/golden/` are a different contract and genuinely ARE
-byte-stable — see "Hard invariants" above.)
-
-## HTTP MCP server: background mode + addr-keyed registry
-
-`serve --mcp` (stdio) uses the PER-PROJECT daemon (`.codegraph/daemon.pid` + socket; the whole
-rendezvous is derived from `IndexPaths::current_root`). `serve --http`
-(streamable-HTTP) is different: HTTP servers are keyed by BIND ADDR — a global server (no `--path`)
-spans many projects — so they use a GLOBAL, addr-keyed registry, NOT the per-project root. The registry
-lives in `codegraph-daemon/src/http_registry.rs`: one `<addr-sanitized>.json` file per running server
-(`HttpServerInfo { pid, addr, mode, project, started_at, version, log_file }`) under
-`$XDG_STATE_HOME/codegraph/http` (else `~/.local/state/codegraph/http`; `%LOCALAPPDATA%\codegraph\http`
-on Windows; `CODEGRAPH_HTTP_REGISTRY_DIR` overrides). Entries are pruned when their pid is dead
-(self-heal, gated on `is_process_alive`).
-
-`serve --http` stays FOREGROUND by default; `serve --http --detach` runs in the BACKGROUND via
-`spawn::spawn_detached_http` (generalized from `spawn_detached_daemon` over the shared `detach()`
-primitive; the child carries `CODEGRAPH_HTTP_DETACH_INTERNAL=1` so it runs the foreground serve path
-and does NOT re-detach). On startup `serve --http` prunes dead entries, ERRORS on a live same-addr
-conflict (listing the running instance), and notes any other live servers when the addr is free. The
-`codegraph http {list, status, stop}` subcommand group inspects and terminates registered servers
-(`stop` uses `process::terminate_pid` — SIGTERM on unix / `TerminateProcess` on Windows). None of this
-touches extraction/golden equivalence.
-
-Foreground stdio `serve --mcp` gets a THIRD, PID-keyed registry
-(`codegraph-daemon/src/mcp_registry.rs`): one `<pid>.json`
-(`McpServerInfo { pid, project: Option<String>, transport: "stdio", started_at, version }`, camelCase on
-the wire) under the same GLOBAL state chain as the HTTP one but with an `mcp` leaf
-(`$XDG_STATE_HOME/codegraph/mcp`, else `~/.local/state/codegraph/mcp`, `%LOCALAPPDATA%\codegraph\mcp` on
-Windows; `CODEGRAPH_MCP_REGISTRY_DIR` overrides). PID keying is forced by the transport: a stdio process
-has no addr and no per-project rendezvous, several may serve one project, and one may serve none.
-Registration fires from all THREE foreground exits in `cmd_serve` (`Direct`, `SpawnOrProxy`, and the
-too-broad-root home guard) and NEVER from `BeDaemon`, which already owns `.codegraph/daemon.pid`.
-Reads go through `RegistryRead::{Available, Unavailable}` so a MISSING directory ("nobody registered
-yet", normal) is distinguishable from an unreadable one (an outage); `read_dir`'s `NotFound` only means
-MISSING when `fs::symlink_metadata` also fails, so a dangling symlink at the registry path reads as an
-outage instead of an empty registry. `list_entries` is the RAW on-disk view (stale entries included);
-`live_entries` filters its RETURN VALUE by `is_process_alive` rather than trusting `prune_dead`'s
-deletions to have landed, so a dead entry on an undeletable (read-only) registry is still never reported
-as running — dead-PID and unparseable files are pruned on read as best-effort disk self-heal only.
-`project` records the launch `--path` and ONLY that: it is `Some` only when the user actually passed
-`--path` (a bare `serve --mcp` stores `None`, not its cwd), and it is purely INFORMATIONAL — never a
-capability boundary, because `roots::resolve_project_arg` probes an absolute per-call `projectPath` on its
-own merits and consults the launch default only when no path was passed, so any live server can be asked
-to open any indexed project's database. `codegraph mcp list [--json]` renders it as `LAUNCH PROJECT`, and
-BOTH holder diagnostics — `index`'s pre-warning and the `RemoveDatabase` FAILURE path — therefore report
-ALL live entries with no narrowing: filtering by `project` would drop the holder in the very case they
-exist for (a server launched elsewhere that a client has since pointed at this project), and the failure
-path additionally has only a DB path. `CODEGRAPH_DIR` selects one validated
-project-local directory name, so the database remains inside the project tree. This
-registry is PURE OBSERVABILITY — there is no `mcp stop` and no `terminate_pid` import, because a stale
-entry's PID may have been reused and this workspace has no portable instance-identity primitive
-(`try_acquire_daemon_lock` is a `create_new` placeholder plus a recorded PID, not an OS advisory lock);
-`list` asks a human to confirm the PID with `ps -p <pid> -o command=` / `tasklist /FI "PID eq <pid>"`
-before offering `kill <pid>` / `taskkill /PID <pid> /F`. CLI/daemon only; extraction and golden
-equivalence untouched.
-
-## Agent installer (`codegraph install` / `uninstall`)
-
-`codegraph install` writes the codegraph MCP-server entry into each supported agent's config
-(Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, Trae, Qoder, Zed);
-`uninstall` reverses it. The written command launches the binary (`command: "codegraph"`,
-`args: ["serve", "--mcp"]`). Cursor and Trae use `--path ${workspaceFolder}` in their global config so
-one entry auto-follows each project window; Kiro and Qoder write a bare global entry (no `--path`) that
-serves tools read-only off any existing index, with the agent passing the project path per call — run
-`codegraph init --target=<ide>` inside each project to write a project-local config with an absolute
-`--path` for live watch. Kiro's `mcp.json` also carries a `//`-commented HTTP alternative alongside the
-active stdio entry (JSONC, idempotent, injected best-effort without corrupting existing files); it uses
-`http://localhost:8111/mcp` because Kiro allows `http` only for localhost (remote servers must be `https`).
-Zed's `settings.json` likewise carries `//`-commented remote-development alternatives after the active
-`context_servers.codegraph` stdio entry (both `install` global and `init` project-local): an SSH-stdio
-bridge and an HTTP server (`http://localhost:8111/mcp`, marked RECOMMENDED for remote); the shared
-JSONC-safe injector is `inject_commented_alternative(path, parent_key, entry_key, sentinel, block)` in
-`shared.rs`, used by both Kiro (`mcpServers`) and Zed (`context_servers`).
-Non-interactive, flag-driven (`--target`, `--global`/`--local`/`--location`,
-`--yes`, `--no-permissions`, `--print-config`); the config-writing logic (paths/keys/marker sections,
-idempotent upsert, uninstall removal) is CLI-only and additive — it does NOT touch
-extraction/golden equivalence.
-
-## Verification gates (run before every commit)
-
+```bash
+codegraph status . --json
+codegraph sync .
+codegraph explore "index and resolve flow" -p .
+codegraph search "ReferenceResolver" -p .
+codegraph node "ReferenceResolver" -p .
 ```
-make ci          # fmt-check + clippy + test + guardrail
-# or individually:
-cargo test --workspace          # incl. golden oracle + sync equivalence
-cargo clippy --workspace --all-targets -- -D warnings
+
+Use `explore` for an area or call flow, `search` for a known name, `node` for one
+symbol/file plus its trail, and `impact` before a refactor. Do not append `.` as
+a second positional argument to a research command. If the index is unavailable,
+follow `status` recovery guidance; do not initialize or rebuild unless requested
+or required by that guidance.
+
+## Hard invariants
+
+1. **Deterministic graph output.** Identical source and configuration must produce
+   identical canonical nodes, edges, references, files, and query ordering.
+   Incremental `sync` must converge with a clean full index.
+2. **Golden compatibility.** Extraction goldens under `reference/golden/` are
+   byte-stable canonical artifacts. Update them only for an intentional graph
+   behavior change, with the matching corpus and regeneration evidence documented
+   in [`docs/equivalence.md`](docs/equivalence.md).
+3. **Stable node IDs.** Symbol IDs are
+   `{kind}:{sha256("{filePath}:{kind}:{name}:{line}").hex[..32]}`; file nodes are
+   `file:{relative/path}`. Paths use `/`; lines are 1-based. Never change this
+   formula incidentally.
+4. **No AI/vector runtime.** Do not add AI, LLM, embedding, vector-database, or
+   inference dependencies. `scripts/guardrail.sh` enforces the dependency boundary.
+5. **Project containment.** Managed state stays under the selected project index
+   root. Filesystem fallbacks must prove lexical containment before probing or
+   reading a path. Do not broaden project authority through ancestor discovery,
+   symlink guessing, environment-global state, or another project's configuration.
+6. **Fail closed.** Ambiguous resolution stays unresolved. Unsafe stale source is
+   served whole or omitted, never sliced using stale line ranges. Lock, checksum,
+   migration, and release validation failures must stop rather than silently skip.
+7. **Protocol and stdout purity.** MCP/JSON-RPC output owns stdout. Logs and
+   diagnostics go to stderr. Additive fields are preferred; existing JSON, text,
+   installer, and protocol contracts require explicit compatibility tests.
+8. **No manual releases or version edits.** Release Please owns versions and tags.
+   Distribution is GitHub Releases plus `cargo install --git`; no crate is
+   published to crates.io.
+
+## Workspace ownership
+
+The workspace members are declared in root `Cargo.toml`; that manifest is the
+authority when the list changes.
+
+| Crate                            | Owns                                                               |
+| -------------------------------- | ------------------------------------------------------------------ |
+| `codegraph-core`                 | shared types, config, IDs, file classification, logging            |
+| `codegraph-extract`              | language detection, tree-sitter/custom extraction, scan policy     |
+| `codegraph-store`                | SQLite schema/migrations, FTS5, persistence and queries            |
+| `codegraph-resolve`              | import/name resolution and framework resolvers                     |
+| `codegraph-graph`                | traversal, impact, search scoring and query parsing                |
+| `codegraph-mcp`                  | MCP schemas, rmcp transports, project resolution, tool rendering   |
+| `codegraph-watch`                | incremental synchronization and filesystem watching                |
+| `codegraph-daemon`               | shared process lifecycle, IPC, registries and detach behavior      |
+| `codegraph-cli` (`codegraph-rs`) | CLI, installer, orchestration and shipped binary                   |
+| `codegraph-bench`                | equivalence oracle and reproducible benchmark harness; not shipped |
+
+Keep dependency direction acyclic and lower layers independent of presentation.
+Extraction must not depend on store/graph. Query rendering must not leak into core
+semantics. See [`docs/architecture.md`](docs/architecture.md) for the current graph.
+
+## Change-to-proof matrix
+
+Run the narrowest relevant tests while iterating, then the complete gate before
+handoff. Do not use a narrow test to claim a workspace-wide property.
+
+| Change                     | Minimum focused proof                                                  | Required documentation                                                       |
+| -------------------------- | ---------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| extraction/language rules  | extractor tests; affected golden corpus; incremental/full equivalence  | `languages.md`, `grammar-manifest.md`, and golden recipe when behavior moves |
+| resolution/framework rules | resolver unit/integration tests; ambiguity negatives; affected golden  | `equivalence.md` or framework reference when public behavior moves           |
+| schema/migrations/store    | schema parity; migration replay; state/lease tests; golden equivalence | `data-model.md`                                                              |
+| graph/search               | graph/query tests; deterministic ordering and limit cases              | CLI/MCP docs for public output changes                                       |
+| MCP/protocol               | engine tests; structural MCP goldens; rmcp stdio/HTTP/version tests    | `mcp.md`                                                                     |
+| CLI/installer              | command tests; installer round trips; script contract fixtures         | `cli.md`, README only for landing-page behavior                              |
+| daemon/watch/concurrency   | lifecycle, lock, recovery, watcher and platform-focused tests          | architecture/CLI/MCP lifecycle sections                                      |
+| release/install/checksum   | shell/PowerShell fixtures, asset-name checks, archive smoke            | README install section and release workflow contract                         |
+| docs/community files       | `python3 scripts/docs-check.py`; formatter; link/anchor checks         | update the canonical page, not a duplicate summary                           |
+
+If a change alters nodes, edges, reference resolution, file classification, or
+stored graph meaning, decide explicitly whether the extraction version must move.
+Group related graph-semantic changes so users do not rebuild repeatedly. Schema
+version and extraction version are independent.
+
+## Documentation rules
+
+- Public technical docs are canonical in English. The Chinese README is a
+  maintained landing-page mirror, not a promise to translate every deep reference.
+- Docs describe **AS-BUILT** behavior. Update the relevant page in the same change
+  as code. Avoid fixed counts and point-in-time versions unless a source-contract
+  test derives and checks them.
+- Keep the English and Chinese README structure, commands, security claims, and
+  links in sync. Move volatile CLI/IDE/protocol details into canonical docs.
+- Historical entries in `docs/upstream-sync/UPSTREAM.md` and dated audit files are
+  evidence: append a new entry; never rewrite an old observation to look current.
+- Do not publish unmeasured performance claims. Benchmark method and results must
+  identify the commit, corpus, environment, command, run count, and dispersion.
+- `CLAUDE.md` must remain a regular file containing exactly `@AGENTS.md` plus a
+  trailing newline.
+
+Directory-specific rules live in [`docs/AGENTS.md`](docs/AGENTS.md).
+
+## Validation
+
+The authoritative local/CI entry point is:
+
+```bash
+make check
+```
+
+`make ci` is a compatibility alias for the same complete gate. `make pre-ci` adds a package/unpack/execute smoke over the built release bytes.
+It validates workspace-version consistency before any Cargo subprocess, required
+tool versions, Rust and repository-text formatting, workflow/shell linting,
+Clippy with warnings denied, locked tests, a locked release build, guardrails,
+and script fixtures. The version-controlled pre-push hook calls this same path.
+
+Useful focused commands:
+
+```bash
+cargo test -p <crate> --locked <test-filter>
+cargo test -p codegraph-bench --test equivalence --locked
+cargo test -p codegraph-mcp --locked
 cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+python3 scripts/docs-check.py
+actionlint .github/workflows/*.yml
 bash scripts/guardrail.sh
-make coverage    # workspace coverage summary (informational; `make coverage-html` for the full report)
 ```
 
-## Test coverage (tracked, informational)
+Coverage is tracked against an aspirational 95% target but remains informational
+until it is sustainably above that target. Do not weaken tests to raise coverage,
+and do not quote a cached percentage as current without re-measuring it.
 
-- Unit-test coverage is a tracked metric via `cargo llvm-cov` + Codecov.
-  Run `make coverage` for a summary; `make coverage-html` for the browsable
-  report; `make coverage-lcov` writes the `lcov.info` CI uploads.
-- **Target is 95%+** (aspirational). The CI gate is **informational /
-  non-blocking** — the `coverage` job is kept out of the `CI Success` gate and
-  the Codecov status is `informational: true` (`codecov.yml`), so a below-target
-  % never turns CI red. This honors the iron rule "local green ⇒ CI green".
-- **Measured 94.42% line / 94.12% region / 93.41% function** — close to the 95%
-  target but not yet there. Figure measured at `4fabc0b` (rmcp 3.0.1 round) via
-  `make coverage`; re-measure before quoting it, since it moves with every round.
-  The remaining gap is now concentrated in the **per-language extractors** rather
-  than the resolver or watch internals: 7 of the 10 lowest-covered files are
-  `codegraph-extract/src/lang/*` — `r.rs` 70.59%, `dart.rs` 72.75%,
-  `erlang.rs` 75.77%, `arkts.rs` 81.01%, `nix.rs` 82.21%, `jsx.rs` 82.61%,
-  `lua.rs` 85.94% — alongside `codegraph-watch/src/migrate.rs` 74.77%,
-  `codegraph-store/src/index_state.rs` 80.45%, and
-  `codegraph-store/src/connection.rs` 82.57%.
-- **Enabling Codecov:** enable the repo at codecov.io. This repo is public, so
-  tokenless upload works (no `CODECOV_TOKEN` needed); a private repo would need
-  `CODECOV_TOKEN` in GitHub repo Secrets.
+## Upstream synchronization
 
-## CI, hooks & release
+The TypeScript reference is `colbymchenry/codegraph`; the Rust product remains
+independent. Read [`docs/upstream-sync/UPSTREAM.md`](docs/upstream-sync/UPSTREAM.md)
+first. Port behavior and intent, not TypeScript mechanisms. For each upstream
+family record one of `PORT`, `ALREADY-HAVE`, `N/A`, or `DEFER`, with source proof,
+Rust target, graph/schema/API impact, and acceptance tests. Update the ledger only
+after current source and runtime evidence agree.
 
-- **Pre-push hook** (`.githooks/pre-push`): runs fmt + clippy + test + guardrail
-  on `git push` (never on commit). Enable once per clone with `make hooks`
-  (sets `core.hooksPath`). Local green ⇒ CI green.
-- **CI** (`.github/workflows/ci.yml`): `Test` (fmt/clippy/test/guardrail) +
-  `Security Audit` (cargo-audit) + `CI Success` gate, on push/PR to `main`.
-- **Release** (`.github/workflows/release-please.yml`): release-please opens a
-  release PR; merging it cuts a `v<version>` tag and triggers the pipeline —
-  6-platform binaries (linux musl x86_64/aarch64 via cargo-zigbuild, macOS
-  x86_64/aarch64, and Windows MSVC `x86_64-pc-windows-msvc` on `windows-latest`
-  plus `aarch64-pc-windows-msvc` on `windows-11-arm`), git-cliff release notes,
-  and a GitHub Release with the binaries attached. The project is distributed via GitHub Releases +
-  `cargo install --git`; it is NOT published to crates.io. Version bumps are
-  owned by release-please via `.release-please-manifest.json` — never bump by
-  hand.
-- **Commits are English Conventional Commits.** `feat`→minor, `fix`→patch.
-  The end-to-end release runbook lives in the `codegraph-release` skill.
-- **Docs** are formatted with `oxfmt` (`make fmt`); `.oxfmtignore` excludes
-  golden fixtures, embedded JSON, and auto-generated files.
+## Git, PR, and release discipline
+
+- Preserve dirty work and owner-uncertain worktrees. Use an isolated worktree for
+  implementation; never reset, clean, overwrite, apply/drop stashes, or delete
+  another worker's state.
+- Commits and PR titles use English Conventional Commits. `feat` is a minor bump,
+  `fix` is a patch bump, and `feat!`/`BREAKING CHANGE` is major. Never add AI or
+  co-author trailers.
+- Stage specific files. Do not commit, push, merge, or mutate GitHub settings
+  unless explicitly requested.
+- The required check is `CI Success`. Coverage is separately informational.
+- Release runs are same-run, draft-until-verified: the exact tag SHA, six platform
+  archives, archive smoke, checksums, attestations, asset inventory, and source CI
+  gate must pass before publication. Never describe a draft or partial run as a
+  release.
+- A release claim binds implementation PR head → merge → tag SHA → workflow run →
+  downloaded public bytes. “Latest” is not evidence.
+
+Canonical details: [`CONTRIBUTING.md`](CONTRIBUTING.md),
+[`docs/equivalence.md`](docs/equivalence.md),
+[`docs/mcp.md`](docs/mcp.md), and [`docs/upstream-sync/`](docs/upstream-sync/).

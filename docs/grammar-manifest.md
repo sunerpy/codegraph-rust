@@ -1,125 +1,128 @@
-# Tree-sitter grammar ABI manifest
+# Tree-sitter and custom extractor manifest
 
-Task 5 smoke target: `tree-sitter = "0.26"` from the workspace. The authoritative language set is the `LANGUAGES` table plus the grammar manifest (WASM_GRAMMAR_FILES, extension delegation, custom/file-level branches). `unknown` is intentionally excluded from dependency planning.
+This is the contributor-facing ABI/ownership map for language extraction. Exact
+crate versions are pinned in `crates/codegraph-extract/Cargo.toml` and
+`Cargo.lock`; this document deliberately names crates without copying version
+numbers that can drift independently.
 
-The current `LANGUAGES` set has 30 entries including `unknown`; this manifest accounts for the 29 concrete entries, `dfm` as the Pascal custom extension path, and the user-requested future/static-resource grammars `sql`, `html`, `css`, and `json`. In this language set, `sql`, `html`, `css`, and general `json` are not `Language` enum entries; Shopify `templates/*.json` and `sections/*.json` delegate to Liquid.
+The public taxonomy is:
 
-## Tier policy
+- 38 code/template language IDs: 29 grammar-backed, 6 embedded/custom, and 3
+  ordinary file-level formats;
+- 3 additional Godot project/resource format IDs handled at file/framework level;
+- `unknown`, which is an internal fallback and not supported-language coverage.
 
-| Tier   | Meaning                                                                                                         |
-| ------ | --------------------------------------------------------------------------------------------------------------- |
-| a      | crates.io grammar crate links directly with workspace `tree-sitter = "0.26"` and passes `abi_smoke`             |
-| b      | git dependency pinned by rev and passes `abi_smoke`                                                             |
-| c      | vendored grammar plan required; task 17 should add generated C/CPP sources via `cc`                             |
-| custom | no native grammar dependency selected because the language uses custom/file-level extraction or host delegation |
+That yields 42 entries in `LANGUAGE_STRINGS`: 41 concrete IDs plus `unknown`.
+`scripts/docs-check.py` derives and checks those counts from
+`codegraph-core/src/types.rs`.
 
-## Manifest
+## Grammar-backed `LanguageSpec` implementations
 
-| Language   | Upstream source status                                                              | Chosen strategy                                            | Tier   | ABI status | Notes                                                                                                                         |
-| ---------- | ----------------------------------------------------------------------------------- | ---------------------------------------------------------- | ------ | ---------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| typescript | WASM `tree-sitter-typescript.wasm`                                                  | `tree-sitter-typescript = "0.23.2"`, `LANGUAGE_TYPESCRIPT` | a      | PASS       | Crate exposes both TypeScript and TSX grammars.                                                                               |
-| javascript | WASM `tree-sitter-javascript.wasm`                                                  | `tree-sitter-javascript = "0.25.0"`, `LANGUAGE`            | a      | PASS       | Used for `.js`, `.mjs`, `.cjs`, `.xsjs`, `.xsjslib`.                                                                          |
-| tsx        | WASM `tree-sitter-tsx.wasm`                                                         | `tree-sitter-typescript = "0.23.2"`, `LANGUAGE_TSX`        | a      | PASS       | Same crate as TypeScript.                                                                                                     |
-| jsx        | WASM reuses `tree-sitter-javascript.wasm`                                           | `tree-sitter-javascript = "0.25.0"`, `LANGUAGE`            | a      | PASS       | JSX is parsed by the JavaScript grammar.                                                                                      |
-| python     | WASM `tree-sitter-python.wasm`                                                      | `tree-sitter-python = "0.25.0"`, `LANGUAGE`                | a      | PASS       | Direct crates.io grammar.                                                                                                     |
-| go         | WASM `tree-sitter-go.wasm`                                                          | `tree-sitter-go = "0.25.0"`, `LANGUAGE`                    | a      | PASS       | Direct crates.io grammar.                                                                                                     |
-| rust       | WASM `tree-sitter-rust.wasm`                                                        | `tree-sitter-rust = "0.24.2"`, `LANGUAGE`                  | a      | PASS       | Direct crates.io grammar.                                                                                                     |
-| java       | WASM `tree-sitter-java.wasm`                                                        | `tree-sitter-java = "0.23.5"`, `LANGUAGE`                  | a      | PASS       | Direct crates.io grammar.                                                                                                     |
-| c          | WASM `tree-sitter-c.wasm`                                                           | `tree-sitter-c = "0.24.2"`, `LANGUAGE`                     | a      | PASS       | `.h` may be promoted to C++/ObjC by source heuristics.                                                                        |
-| cpp        | WASM `tree-sitter-cpp.wasm`                                                         | `tree-sitter-cpp = "0.23.4"`, `LANGUAGE`                   | a      | PASS       | Direct crates.io grammar.                                                                                                     |
-| csharp     | WASM `tree-sitter-c_sharp.wasm` (WASM grammar)                                      | `tree-sitter-c-sharp = "0.23.5"`, `LANGUAGE`               | a      | PASS       | Crates.io release parses primary-constructor smoke under TS 0.26 ABI.                                                         |
-| razor      | custom Razor extractor                                                              | CUSTOM                                                     | custom | CUSTOM     | `.cshtml` / `.razor`; markup is not parsed via tree-sitter. C# snippets can reuse `tree-sitter-c-sharp` later.                |
-| php        | WASM `tree-sitter-php.wasm`                                                         | `tree-sitter-php = "0.24.2"`, `LANGUAGE_PHP`               | a      | PASS       | Use PHP grammar, not `LANGUAGE_PHP_ONLY`, for regular files.                                                                  |
-| ruby       | WASM `tree-sitter-ruby.wasm`                                                        | `tree-sitter-ruby = "0.23.1"`, `LANGUAGE`                  | a      | PASS       | Direct crates.io grammar.                                                                                                     |
-| swift      | WASM `tree-sitter-swift.wasm`                                                       | `tree-sitter-swift = "0.7.3"`, `LANGUAGE`                  | a      | PASS       | Verified against 0.26 despite historical old-core risk; crate uses `tree-sitter-language` and only dev-depends on older core. |
-| kotlin     | WASM `tree-sitter-kotlin.wasm`                                                      | `tree-sitter-kotlin-ng = "1.1.0"`, `LANGUAGE`              | a      | PASS       | Use `kotlin-ng`; avoid legacy `tree-sitter-kotlin = 0.3.8` for this workspace.                                                |
-| dart       | WASM `tree-sitter-dart.wasm`                                                        | `tree-sitter-dart = "0.2.0"`, `LANGUAGE`                   | a      | PASS       | Crate is old but exposes `LanguageFn`, so it links with workspace TS 0.26.                                                    |
-| gdscript   | non-upstream Rust-side addition                                                     | `tree-sitter-gdscript = "6.1.0"`, `LANGUAGE`               | a      | PASS       | `.gd`; Godot scripting; functions/classes/enums/vars/signals(as Property)/extends/preload-load                                |
-| svelte     | custom extractor                                                                    | CUSTOM                                                     | custom | CUSTOM     | Delegates script blocks to TypeScript/JavaScript grammars.                                                                    |
-| vue        | custom extractor                                                                    | CUSTOM                                                     | custom | CUSTOM     | Delegates `<script>` / `<script setup>` to TypeScript/JavaScript grammars.                                                    |
-| liquid     | custom regex extractor                                                              | CUSTOM                                                     | custom | CUSTOM     | Shopify `templates/*.json` and `sections/*.json` delegate to Liquid.                                                          |
-| pascal     | WASM `tree-sitter-pascal.wasm` (WASM grammar)                                       | `tree-sitter-pascal = "0.10.2"`, `LANGUAGE`                | a      | PASS       | Handles `.pas`, `.dpr`, `.dpk`, `.lpr`; DFM/FMX uses custom row below.                                                        |
-| scala      | WASM `tree-sitter-scala.wasm` (WASM grammar)                                        | `tree-sitter-scala = "0.26.0"`, `LANGUAGE`                 | a      | PASS       | Direct ABI match version.                                                                                                     |
-| lua        | WASM `tree-sitter-lua.wasm` (WASM grammar)                                          | `tree-sitter-lua = "0.5.0"`, `LANGUAGE`                    | a      | PASS       | Crates.io release avoids the old WASM heap issue.                                                                             |
-| luau       | WASM `tree-sitter-luau.wasm` (WASM grammar)                                         | `tree-sitter-luau = "1.2.0"`, `LANGUAGE`                   | a      | PASS       | Direct crates.io grammar.                                                                                                     |
-| objc       | WASM `tree-sitter-objc.wasm`                                                        | `tree-sitter-objc = "3.0.2"`, `LANGUAGE`                   | a      | PASS       | Used for `.m`, `.mm`, and `.h` heuristic promotion.                                                                           |
-| yaml       | file-level only                                                                     | `tree-sitter-yaml = "0.7.2"`, `LANGUAGE`                   | a      | PASS       | Native grammar is available for future extraction; no tree-sitter symbols are emitted for YAML today.                         |
-| twig       | file-level only                                                                     | CUSTOM                                                     | custom | CUSTOM     | No selected Rust crate; keep file-level/custom behavior.                                                                      |
-| xml        | custom MyBatis extractor                                                            | `tree-sitter-xml = "0.7.0"`, `LANGUAGE_XML`                | a      | PASS       | Native grammar is available; uses MyBatis custom extraction and non-mapper XML file nodes.                                    |
-| properties | file-level/custom Spring config keys                                                | `tree-sitter-properties = "0.3.0"`, `LANGUAGE`             | a      | PASS       | Native grammar is available; properties are treated as file-level for core extraction.                                        |
-| dfm        | `.dfm` / `.fmx` extension maps to `pascal`, then custom DFM extractor               | CUSTOM                                                     | custom | CUSTOM     | Do not parse DFM as Pascal source; port the DFM/FMX extractor later.                                                          |
-| sql        | not in the current `LANGUAGES` set; MyBatis emits SQL statement nodes from XML text | `tree-sitter-sequel = "0.3.11"`, `LANGUAGE`                | a      | PASS       | Use `tree-sitter-sequel`, not stale `tree-sitter-sql = 0.0.2`.                                                                |
-| html       | not in the current `LANGUAGES` set                                                  | `tree-sitter-html = "0.23.2"`, `LANGUAGE`                  | a      | PASS       | Added for future embedded/markup reuse.                                                                                       |
-| css        | not in the current `LANGUAGES` set                                                  | `tree-sitter-css = "0.25.0"`, `LANGUAGE`                   | a      | PASS       | Added for future embedded/style reuse.                                                                                        |
-| json       | not a general `Language`; Shopify JSON templates delegate to Liquid                 | `tree-sitter-json = "0.24.8"`, `LANGUAGE`                  | a      | PASS       | Added for future JSON-resource extraction; current Shopify route remains Liquid custom.                                       |
+`spec_for_language` in `crates/codegraph-extract/src/lang/mod.rs` is the runtime
+authority. TSX and JSX are separate IDs that share their TypeScript/JavaScript
+grammar crates.
 
-## Ready-to-copy dependency block
+| Language ID         | Grammar crate / entry    | Notes                                                                  |
+| ------------------- | ------------------------ | ---------------------------------------------------------------------- |
+| `typescript`, `tsx` | `tree-sitter-typescript` | TypeScript and TSX entry points                                        |
+| `javascript`, `jsx` | `tree-sitter-javascript` | JS grammar includes JSX; separate specs preserve ID/extension behavior |
+| `arkts`             | `tree-sitter-arkts`      | `.ets`; ArkUI syntax                                                   |
+| `python`            | `tree-sitter-python`     | `.py`, `.pyw`                                                          |
+| `go`                | `tree-sitter-go`         | `.go`                                                                  |
+| `rust`              | `tree-sitter-rust`       | `.rs`                                                                  |
+| `java`              | `tree-sitter-java`       | `.java`                                                                |
+| `c`                 | `tree-sitter-c`          | `.c`, ambiguous `.h` before source classification                      |
+| `cpp`               | `tree-sitter-cpp`        | C++, Metal, and CUDA source families                                   |
+| `csharp`            | `tree-sitter-c-sharp`    | `.cs`                                                                  |
+| `php`               | `tree-sitter-php`        | PHP plus Drupal-style PHP extensions                                   |
+| `ruby`              | `tree-sitter-ruby`       | `.rb`, `.rake`                                                         |
+| `swift`             | `tree-sitter-swift`      | `.swift`                                                               |
+| `kotlin`            | `tree-sitter-kotlin-ng`  | `.kt`, `.kts`; do not substitute the legacy grammar                    |
+| `dart`              | `tree-sitter-dart`       | `.dart`                                                                |
+| `pascal`            | `tree-sitter-pascal`     | Pascal source; DFM/FMX takes the custom path first                     |
+| `scala`             | `tree-sitter-scala`      | `.scala`, `.sc`                                                        |
+| `lua`               | `tree-sitter-lua`        | `.lua`                                                                 |
+| `luau`              | `tree-sitter-luau`       | `.luau`                                                                |
+| `objc`              | `tree-sitter-objc`       | `.m`, `.mm`, and classified headers                                    |
+| `r`                 | `tree-sitter-r`          | `.r`                                                                   |
+| `solidity`          | `tree-sitter-solidity`   | `.sol`                                                                 |
+| `nix`               | `tree-sitter-nix`        | `.nix`                                                                 |
+| `terraform`         | `tree-sitter-hcl`        | `.tf`, `.tfvars`, `.tofu`                                              |
+| `erlang`            | `tree-sitter-erlang`     | `.erl`, `.hrl`                                                         |
+| `cfml`              | `tree-sitter-cfml`       | dual script/tag entry selected from source                             |
+| `gdscript`          | `tree-sitter-gdscript`   | `.gd`; framework resolution adds Godot relationships                   |
 
-```toml
-tree-sitter = { workspace = true }
-tree-sitter-c = "0.24.2"
-tree-sitter-c-sharp = "0.23.5"
-tree-sitter-cpp = "0.23.4"
-tree-sitter-css = "0.25.0"
-tree-sitter-dart = "0.2.0"
-tree-sitter-gdscript = "6.1.0"
-tree-sitter-go = "0.25.0"
-tree-sitter-html = "0.23.2"
-tree-sitter-java = "0.23.5"
-tree-sitter-javascript = "0.25.0"
-tree-sitter-json = "0.24.8"
-tree-sitter-kotlin-ng = "1.1.0"
-tree-sitter-lua = "0.5.0"
-tree-sitter-luau = "1.2.0"
-tree-sitter-objc = "3.0.2"
-tree-sitter-pascal = "0.10.2"
-tree-sitter-php = "0.24.2"
-tree-sitter-properties = "0.3.0"
-tree-sitter-python = "0.25.0"
-tree-sitter-ruby = "0.23.1"
-tree-sitter-rust = "0.24.2"
-tree-sitter-scala = "0.26.0"
-tree-sitter-sequel = "0.3.11"
-tree-sitter-swift = "0.7.3"
-tree-sitter-typescript = "0.23.2"
-tree-sitter-xml = "0.7.0"
-tree-sitter-yaml = "0.7.2"
+`LanguageSpec` maps grammar node types to symbols and unresolved references, and
+owns language-specific name/body/signature/visibility/import behavior. Changing a
+grammar or spec is a graph change unless proven otherwise by affected goldens.
+
+## Embedded and custom paths
+
+These run before ordinary grammar dispatch:
+
+| Language ID    | Implementation        | Delegation / output                                                   |
+| -------------- | --------------------- | --------------------------------------------------------------------- |
+| `vue`          | `embedded/vue.rs`     | script regions to TypeScript/JavaScript plus component/file ownership |
+| `svelte`       | `embedded/svelte.rs`  | script regions to TypeScript/JavaScript plus component/file ownership |
+| `astro`        | `embedded/astro.rs`   | frontmatter/scripts/templates with source-line remapping              |
+| `razor`        | `embedded/razor.rs`   | Razor/C#-like regions through custom extraction                       |
+| `liquid`       | `embedded/liquid.rs`  | Liquid and Shopify template JSON custom scan                          |
+| `xml`          | `embedded/mybatis.rs` | MyBatis mapper statements; generic XML remains file-level             |
+| Pascal DFM/FMX | `embedded/dfm.rs`     | `.dfm`/`.fmx` detect as Pascal but bypass Pascal grammar              |
+
+See [`embedded-extraction.md`](embedded-extraction.md) for region remapping and
+merge invariants.
+
+## File/framework-level IDs
+
+| Language ID      | Runtime behavior                                                     |
+| ---------------- | -------------------------------------------------------------------- |
+| `yaml`           | file-level only; no language symbols                                 |
+| `twig`           | file-level only; no language symbols                                 |
+| `properties`     | file-level only; no language symbols                                 |
+| `godot_scene`    | `.tscn`; file-level language ID plus Godot scene resolver extraction |
+| `godot_resource` | `.tres`; file-level language ID plus Godot resource relationships    |
+| `godot_project`  | `project.godot`; autoload/input/plugin/framework extraction          |
+
+The first three are part of the 38 public code/template language count. The three
+Godot resource-format IDs are reported separately so “38 languages” does not
+silently become “41” in another page.
+
+## ABI-smoke-only grammar dependencies
+
+`tree-sitter-yaml`, `tree-sitter-properties`, and `tree-sitter-xml` are linked and
+smoke-tested even though their current production paths are file/custom level.
+`tree-sitter-html`, `tree-sitter-css`, and `tree-sitter-json` are also ABI-smoke
+helpers; HTML/CSS/general JSON are not standalone `Language` IDs. Shopify JSON is
+claimed only by the Liquid embedded detector.
+
+SQL is not a standalone language ID or extension mapping. MyBatis extraction can
+emit SQL-related mapper symbols from XML without adding `.sql` source support.
+
+## Extension and dialect classification
+
+`builtin_language_for_ext` and embedded detection are authoritative. Notable
+classifications:
+
+- `.h` begins as C, then masked source heuristics may promote it to C++ or
+  Objective-C;
+- `.metal`, `.cu`, and `.cuh` use the C++ grammar with dialect-specific preparse;
+- `.xsjs` and `.xsjslib` use JavaScript;
+- `.dfm` and `.fmx` use the Pascal language ID but custom extraction;
+- `project.godot` is detected by filename because it has no extension;
+- project extension overrides can claim only extensions left unclaimed by built-in
+  and embedded detection.
+
+## Contributor checks
+
+Run the ABI smoke and relevant extraction/golden tests after any grammar change:
+
+```bash
+cargo run --locked -p codegraph-extract --example abi_smoke
+cargo test --locked -p codegraph-extract
+cargo test --locked -p codegraph-bench --test equivalence
 ```
 
-## Smoke command
-
-```sh
-cargo run -p codegraph-extract --example abi_smoke
-```
-
-All tier-a rows must print `PASS`. Custom rows print `CUSTOM (...)` and do not exercise tree-sitter.
-
-## Task 17 outcome (risk-grammar wiring)
-
-The plan's tier-c warnings for swift/kotlin/sql resolved as follows once wired:
-
-- **swift** — `tree-sitter-swift = "0.7.3"` from crates.io (alex-pinkus grammar,
-  repo `https://github.com/alex-pinkus/tree-sitter-swift`, crate release tag
-  `v0.7.3`) links and parses against workspace tree-sitter 0.26 directly. The
-  crate uses `tree-sitter-language` `LanguageFn` so no vendored `cc` build.rs
-  was needed; the "pins an older core" risk applied only to dev-dependencies.
-  Spec: `crates/codegraph-extract/src/lang/swift.rs` (ports the upstream
-  `swift.ts:43-138` rules).
-- **kotlin** — `tree-sitter-kotlin-ng = "1.1.0"` (NOT legacy
-  `tree-sitter-kotlin = 0.3.8`). Node names differ from the fwcd WASM
-  build (`import`/`qualified_identifier` vs `import_header`, `identifier` vs
-  `simple_identifier`); `crates/codegraph-extract/src/lang/kotlin.rs` maps
-  the kotlin.ts rules onto the -ng shapes.
-- **sql** — intentionally NOT wired as a language. The `LANGUAGES` set
-  has no `sql` entry and EXTENSION_MAP
-  has no `.sql`; adding it would violate golden parity. SQL statement nodes
-  only come from the MyBatis XML extractor. `tree-sitter-sequel = "0.3.11"`
-  remains the documented choice if a future upstream pin adds the language.
-- **dfm** — custom extractor `crates/codegraph-extract/src/embedded/dfm.rs`
-  (port of `dfm-extractor.ts`); `.dfm`/`.fmx` detect as pascal and route
-  through the embedded dispatch before grammar parsing.
-- **yaml / twig / properties** — file-level-only (extract stage returns an
-  empty result, mirroring `isFileLevelOnlyLanguage`); their grammar rows above
-  stay unused by the extractor.
-- **html / css / json** — not in the language set; no specs were wired (rows above
-  are reserved for future use only).
+Review `cargo tree -p codegraph-extract` for duplicate/incompatible tree-sitter
+cores. Do not vendor a grammar or change a pin merely to match upstream's WASM
+packaging; the Rust crate ABI and actual fixtures decide compatibility.

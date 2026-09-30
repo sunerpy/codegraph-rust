@@ -2,247 +2,306 @@ name: CI
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   pull_request:
-    branches:
-      - main
+    branches: [main]
+  merge_group:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: "1"
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: sccache
 
 jobs:
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+  workspace-version:
+    name: Workspace Version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-21
         with:
+          toolchain: 1.96.0
+
+      - name: Require the version gate's parser
+        run: command -v jq >/dev/null 2>&1 || { echo "jq is required"; exit 1; }
+
+      # This is deliberately the workflow's first Cargo subprocess. Every
+      # Cargo-running job below depends on this job.
+      - name: Verify workspace version surfaces
+        run: bash scripts/check-workspace-versions.sh
+
+  linux:
+    name: Linux
+    needs: workspace-version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-21
+        with:
+          toolchain: 1.96.0
           components: rustfmt,clippy
 
-      - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@v2
+      - name: Verify workspace version surfaces before Cargo/cache
+        run: bash scripts/check-workspace-versions.sh
 
-      - name: Format check (rustfmt)
-        run: cargo fmt --all --check
+      - name: Cache Rust inputs
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: cargo-home-${{ runner.os }}-${{ runner.arch }}
+          cache-targets: false
 
-      - name: Clippy lint
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Configure compiler cache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: "v0.16.0"
 
-      - name: Run tests (incl. golden oracle + sync equivalence)
-        run: cargo test --workspace
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
 
-      # Windows cross-check is intentionally omitted on Ubuntu: target C deps
-      # (tree-sitter/libsqlite3-sys/ring) require MSVC tooling. Runtime
-      # correctness is gated by the native windows-latest job below.
+      - name: Install pinned repository tools
+        run: npm install --global oxfmt@0.64.0
 
-      # The guardrail's asset-name drift gate parses release-please.yml with
-      # yaml.safe_load, so PyYAML must be importable. Idempotent: installs only
-      # when the runner image does not already ship it. A missing PyYAML must
-      # never degrade the gate into a silent skip — the gate itself exits nonzero
-      # in that case, and this step fails loudly first.
-      - name: Ensure PyYAML (asset-name drift gate)
+      - name: Install pinned actionlint
+        uses: taiki-e/install-action@a2a5f6e99e1a31540baa0468acfa302cff0f359f # v2.86.4
+        with:
+          tool: actionlint@1.7.12
+
+      - name: Require fixture parsers and shell linter
         run: |
+          set -euo pipefail
+          command -v shellcheck >/dev/null 2>&1 || { echo "shellcheck is required"; exit 1; }
           python3 -c 'import yaml' \
-            || python3 -m pip install --break-system-packages PyYAML \
-            || python3 -m pip install PyYAML
+            || python3 -m pip install --break-system-packages PyYAML==6.0.3 \
+            || python3 -m pip install PyYAML==6.0.3
 
-      # The CI-gate integrity block of the guardrail runs the shipped `ci-success`
-      # step body over a synthetic needs context, which needs jq. Present on
-      # ubuntu-latest; asserted here so a missing jq fails loudly rather than
-      # letting the gate degrade.
-      - name: Ensure jq (CI gate-integrity check)
-        run: jq --version
+      - name: Run the complete local gate
+        run: make check
 
-      - name: Scope guardrail (no AI/vector/LLM crates + release asset-name drift + CI gate integrity)
-        run: bash scripts/guardrail.sh
-
-  windows:
-    name: Windows
-    runs-on: windows-latest
-    timeout-minutes: 30
+  windows-clippy:
+    name: Windows Clippy
+    needs: workspace-version
+    runs-on: windows-2025
+    timeout-minutes: 35
+    env:
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: off
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-21
         with:
-          components: rustfmt,clippy
+          toolchain: 1.96.0
+          components: clippy
 
-      - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@v2
+      - name: Verify workspace version surfaces before Cargo/cache
+        shell: bash
+        run: bash scripts/check-workspace-versions.sh
 
-      - name: Clippy lint
-        # codegraph-bench is a Unix-only dev harness (publish=false); excluded from the Windows job.
-        run: cargo clippy --workspace --exclude codegraph-bench --all-targets -- -D warnings
+      - name: Cache Rust inputs
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: cargo-home-${{ runner.os }}-${{ runner.arch }}
+          cache-targets: false
 
-      - name: Run tests
-        run: cargo test --workspace --exclude codegraph-bench
+      - name: Configure compiler cache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: "v0.16.0"
 
-      # Batch M item 16 acceptance: ONE long-lived shipped `serve --mcp` process
-      # releases every SQLite handle when a request completes, so the main
-      # database can be REPLACED (MoveFileEx + REPLACE_EXISTING) without the
-      # compatibility close seam, and the next request serves only the
-      # replacement graph. The replacement rename is the Windows-specific handle
-      # proof (a retained handle makes it fail with a sharing violation), so this
-      # target is selected EXPLICITLY here — never compile-only, never skipped —
-      # even though the workspace run above already covers it.
-      - name: Run Batch M item 16 native Windows replacement acceptance
-        run: cargo test -p codegraph-rs --test batch_m_long_lived_mcp
+      - name: Clippy
+        run: cargo clippy --workspace --exclude codegraph-bench --all-targets --locked -- -D warnings
+
+  windows-test:
+    name: Windows Tests
+    needs: workspace-version
+    runs-on: windows-2025
+    timeout-minutes: 40
+    env:
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: off
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-21
+        with:
+          toolchain: 1.96.0
+
+      - name: Verify workspace version surfaces before Cargo/cache
+        shell: bash
+        run: bash scripts/check-workspace-versions.sh
+
+      - name: Parse the PowerShell installer
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            "scripts/install.ps1", [ref]$tokens, [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -ne 0) {
+            $errors | ForEach-Object { Write-Error $_.ToString() }
+            exit 1
+          }
+
+      - name: Cache Rust inputs
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: cargo-home-${{ runner.os }}-${{ runner.arch }}
+          cache-targets: false
+
+      - name: Configure compiler cache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: "v0.16.0"
+
+      - name: Run native Windows tests
+        run: cargo test --workspace --exclude codegraph-bench --locked
+
+      # A retained SQLite handle makes the replacement rename fail with a
+      # sharing violation, so this remains an explicit native acceptance gate.
+      - name: Run long-lived MCP database replacement acceptance
+        run: cargo test -p codegraph-rs --locked --test batch_m_long_lived_mcp
 
   audit:
     name: Security Audit
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    needs: workspace-version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
-
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          tool: cargo-audit
-
-      - name: Run cargo-audit
-        # --ignore rationale documented in audit.toml. quick-xml (RUSTSEC-2026-0194/0195)
-        # is transitive via self_update and only parses trusted GitHub release metadata —
-        # not reachable; no self_update release pins quick-xml >= 0.41 yet. number_prefix
-        # (RUSTSEC-2025-0119) is an unmaintained-crate warning.
-        run: cargo audit --ignore RUSTSEC-2025-0119 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
-
-  # Coverage is INFORMATIONAL: it measures unit-test coverage and uploads to
-  # Codecov, but it is deliberately kept OUT of the `ci-success` gate's `needs:`
-  # so it can never block a merge. The Codecov status itself is also
-  # `informational: true` (see codecov.yml), so a below-target % (baseline
-  # ~72%, aspirational target 95%) never turns a PR red. This honors the iron
-  # rule "local green ⇒ CI green".
-  coverage:
-    name: Coverage
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-21
         with:
+          toolchain: 1.96.0
+
+      - name: Verify workspace version surfaces before Cargo
+        run: bash scripts/check-workspace-versions.sh
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@a2a5f6e99e1a31540baa0468acfa302cff0f359f # v2.86.4
+        with:
+          tool: cargo-audit@0.22.2
+
+      - name: Audit dependencies
+        run: cargo audit
+
+  # Informational by policy: omitted from CI Success and informational in
+  # codecov.yml. A reporting outage or a below-target percentage cannot block.
+  coverage:
+    name: Coverage
+    needs: workspace-version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-21
+        with:
+          toolchain: 1.96.0
           components: llvm-tools-preview
 
-      - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@v2
+      - name: Verify workspace version surfaces before Cargo/cache
+        run: bash scripts/check-workspace-versions.sh
+
+      - name: Cache Rust inputs
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: cargo-home-${{ runner.os }}-${{ runner.arch }}
+          cache-targets: false
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@a2a5f6e99e1a31540baa0468acfa302cff0f359f # v2.86.4
         with:
-          tool: cargo-llvm-cov
+          tool: cargo-llvm-cov@0.8.7
 
-      - name: Generate coverage (lcov)
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info --ignore-filename-regex 'codegraph-bench'
+      - name: Generate coverage
+        run: make coverage-lcov
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           files: lcov.info
-          # Report-only: never fail CI on a Codecov upload/processing error.
           fail_ci_if_error: false
-          # Public repo: tokenless upload works. A token is optional here (kept
-          # for reliability) and REQUIRED for private repos. Add CODECOV_TOKEN
-          # to repo Secrets to use it; harmless/ignored if unset on a public repo.
           token: ${{ secrets.CODECOV_TOKEN }}
 
-  # ci-success is the SINGLE required status check for branch protection AND the
-  # job the release workflow's `verify-ci` waits on before a release may leave
-  # draft. It must therefore be a STRICT gate: it passes only when every required
-  # job's result is exactly `success`.
-  #
-  # WHY strict (the bug this shape fixes): `needs.<job>.result` can be `success`,
-  # `failure`, `cancelled`, or `skipped`. The previous check rejected only
-  # `failure`, so `cancelled` and `skipped` both PASSED. Combined with
-  # `cancel-in-progress: true` above, a run cancelled by a newer push could still
-  # conclude `CI Success` — and release-please.yml's `verify-ci` gates the release
-  # on exactly that job. A release could then be cut on a run whose tests never
-  # finished. Anything other than `success` now fails, including any result value
-  # GitHub may add in the future (unknown values are not silently tolerated).
-  #
-  # WHY the results are read from `toJSON(needs)` rather than named one by one:
-  # the step body hardcodes no job name, so adding a job to `needs:` below
-  # automatically makes it required with no change to the script. GitHub Actions
-  # cannot make this fully automatic — the `needs` context contains ONLY the jobs
-  # listed in `needs:`, so a new job that is never added there is invisible to
-  # this gate no matter how the expression is written. That gap is closed OUTSIDE
-  # the workflow, loudly: `scripts/check-ci-gate.sh` (run by scripts/guardrail.sh
-  # in `make ci`, the pre-push hook, and the CI `test` job) asserts that
-  # `ci-success.needs` equals every job in this file minus an explicit
-  # informational allow-list, so forgetting to list a new job turns CI red
-  # instead of silently narrowing the gate.
   ci-success:
     name: CI Success
-    runs-on: ubuntu-latest
+    needs: [workspace-version, linux, windows-clippy, windows-test, audit]
     if: always()
-    # NOTE: `coverage` is intentionally NOT listed here — coverage is
-    # informational (codecov.yml sets `informational: true`, baseline ~72% vs an
-    # aspirational 95% target) and must never gate a merge or a release. It is
-    # the ONLY allowed exclusion; scripts/check-ci-gate.sh enforces that, and
-    # also enforces that codecov.yml still marks coverage informational, so the
-    # exclusion can never outlive its justification.
-    needs: [test, audit, windows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - name: Check job status
+      - name: Require every CI job to succeed
         env:
-          # The whole needs context as JSON: {"test":{"result":"success",...},...}
           NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
           set -euo pipefail
-
           if [ -z "${NEEDS_JSON:-}" ]; then
-            echo "::error title=CI gate::the needs context was empty; cannot prove any required job succeeded — failing closed."
+            echo "::error title=CI gate::the needs context was empty; failing closed"
             exit 1
           fi
-          if ! printf '%s' "$NEEDS_JSON" | jq -e 'type == "object" and length > 0' > /dev/null 2>&1; then
-            echo "::error title=CI gate::the needs context did not parse as a non-empty JSON object — failing closed."
-            printf 'needs context was: %s\n' "$NEEDS_JSON"
+          if ! printf '%s' "$NEEDS_JSON" | jq -e 'type == "object" and length > 0' >/dev/null 2>&1; then
+            echo "::error title=CI gate::the needs context was not a non-empty object; failing closed"
             exit 1
           fi
-
-          # One row per required job: "<job>\t<result>". A job whose `result` key
-          # is absent renders as <missing> and fails, never passes.
           mapfile -t rows < <(
             printf '%s' "$NEEDS_JSON" \
               | jq -r 'to_entries | sort_by(.key)[] | "\(.key)\t\(.value.result // "<missing>")"'
           )
-          if [ "${#rows[@]}" -eq 0 ]; then
-            echo "::error title=CI gate::no required jobs were found in the needs context — failing closed."
-            exit 1
-          fi
-
-          echo "Required job results (only 'success' passes):"
+          ((${#rows[@]} > 0)) || { echo "::error title=CI gate::no required jobs found"; exit 1; }
           offenders=0
           for row in "${rows[@]}"; do
             job="${row%%$'\t'*}"
             result="${row#*$'\t'}"
-            if [ "$result" = "success" ]; then
-              printf '  ✅ %-12s %s\n' "$job" "$result"
+            if [ "$result" = success ]; then
+              printf '  OK   %-20s %s\n' "$job" "$result"
             else
-              printf '  ❌ %-12s %s\n' "$job" "$result"
-              echo "::error title=CI gate::required job '${job}' concluded '${result}', not 'success'."
+              printf '  FAIL %-20s %s\n' "$job" "$result"
+              echo "::error title=CI gate::required job '${job}' concluded '${result}', not 'success'"
               offenders=$((offenders + 1))
             fi
           done
-
           if [ "$offenders" -ne 0 ]; then
-            echo "❌ CI failed: ${offenders} of ${#rows[@]} required job(s) did not conclude 'success' (see the ❌ rows above)."
+            echo "CI failed: ${offenders} of ${#rows[@]} required job(s) did not conclude 'success'."
             exit 1
           fi
-          echo "✅ CI passed: all ${#rows[@]} required job(s) concluded 'success'."
+          echo "CI passed: all ${#rows[@]} required job(s) concluded 'success'."

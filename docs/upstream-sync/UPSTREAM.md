@@ -7,25 +7,29 @@
 
 ## Current alignment
 
-- **Tracked colby version:** `1.6.0` (all 15 audited `v1.6.0` PORT families,
-  plus the separately tracked Python #1626 and Lua #1616 fixes, shipped across
-  codegraph-rs `v0.48.2`–`v0.50.1`; see the 2026-08-31 CLOSEOUT entry below.
-  `codegraph context` and custom Lua loader #1617 remain explicit DEFER items)
-- **This project version:** see `Cargo.toml` (`codegraph-rs`, independent line)
-- **Last audit:** `2026-08-27` (refreshed `2026-08-31`) — upstream `v1.6.0`
-  plus its one following docs-only commit was audited through
-  `6a056ec5db35172f9dc348f87b54ea415aa5169e`. The exact new range after the
-  previously closed 104-commit batch is 28 commits and identified 15 PORT
-  families. Waves 0–3 shipped the complete backlog in
-  `v0.48.2`/`v0.48.3`/`v0.49.0`/`v0.50.0`, together with the separately
-  tracked #1626 and #1616 fixes; `v0.50.1` closed two release-smoke defects
-  without changing extraction. Tracked parity is now `1.6.0`
-- **Previous exact boundary:** `c6aaa20358cd6adcd04b87bdef8e5803ad146f3a`
-  (the 104th commit after `v1.5.0`; merge of upstream PR #1516)
-- **Next discovery starts here:** diff
-  `6a056ec5db35172f9dc348f87b54ea415aa5169e..origin/main`; do not re-triage
-  the v1.6 backlog — use `V1_6_TRIAGE_2026-08-27.md`
-- **Upstream repo:** https://github.com/colbymchenry/codegraph
+- **Tracked colby release:** `v1.6.0`. All portable in-scope behavior audited
+  through that release remains closed as recorded below. A newer upstream release
+  did not exist at the 2026-09-15 refresh, so main-branch discoveries do not
+  advance release parity.
+- **Last discovery audit:** upstream main
+  `3ed73bc127323e63153bf6ec8354afa82ce36aaf` on 2026-09-15. The exact range from
+  the previous boundary contains 119 unreleased commits; dispositions and Rust
+  acceptance targets are in
+  [`POST_V1_6_MAIN_2026-09-15.md`](POST_V1_6_MAIN_2026-09-15.md).
+- **Previous discovery boundary:**
+  `6a056ec5db35172f9dc348f87b54ea415aa5169e` (the `v1.6.0` release plus its
+  docs-only follow-up, closed in the 2026-08-31 entry).
+- **Next discovery starts here:**
+  `3ed73bc127323e63153bf6ec8354afa82ce36aaf..origin/main`. Do not re-triage the
+  audited 119-commit range.
+- **Upstream repository:** <https://github.com/colbymchenry/codegraph>.
+- **Approved but deferred UI epic:** upstream's unreleased viewer/Screens/Steps
+  work is not a current parity blocker. Rust UI code begins only after the owner
+  selects a Penpot design and a stable upstream baseline is re-audited.
+
+The Rust product and upstream release versions are independent. This Current
+alignment block is the only place that states release parity; dated log entries
+below remain immutable historical evidence.
 
 > **1.5.0 → 1.6.0 sync: COMPLETE** (codegraph-rs `v0.48.2` → `v0.50.1`).
 > Every audited portable, in-scope behavior landed across the four waves, and
@@ -90,6 +94,25 @@
 > that records colby parity — do not infer it from `Cargo.toml`.
 
 ## Sync log
+
+### 2026-09-15 — post-v1.6.0 main AUDITED through `3ed73bc`; tracked release stays `v1.6.0`
+
+A fresh upstream clone confirmed that the newest formal release is still
+`v1.6.0`, while main advanced from
+`6a056ec5db35172f9dc348f87b54ea415aa5169e` to
+`3ed73bc127323e63153bf6ec8354afa82ce36aaf`. The exact unreleased range is 119
+commits across 373 changed files (+86,127/-1,745).
+
+The dated report
+[`POST_V1_6_MAIN_2026-09-15.md`](POST_V1_6_MAIN_2026-09-15.md) partitions every
+commit family and records `PORT`, `ALREADY-HAVE`, `N/A`, and `DEFER` decisions.
+It identifies real Rust correctness/safety and CLI/MCP/installer gaps, but none is
+marked LANDED by this audit. The large browser viewer/Screens/Steps family is
+explicitly deferred to an owner-selected Penpot design and a stable upstream
+baseline; it is not mixed into core parity work.
+
+Because upstream has no post-1.6 tag, tracked release parity remains `v1.6.0`.
+Only the discovery boundary advances to `3ed73bc`.
 
 ### 2026-08-31 — Wave 3 LANDED in `v0.50.0`; release-smoke fixes LANDED in `v0.50.1`; `v1.6.0` sync COMPLETE
 

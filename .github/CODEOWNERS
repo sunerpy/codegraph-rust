@@ -1,0 +1,7 @@
+# Routing only while the repository has one maintainer. The ruleset must not
+# require code-owner approval until a second maintainer can review changes.
+* @sunerpy
+/.github/workflows/ @sunerpy
+/.github/scripts/ @sunerpy
+/scripts/ @sunerpy
+/reference/golden/ @sunerpy
