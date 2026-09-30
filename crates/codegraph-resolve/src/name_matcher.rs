@@ -393,7 +393,7 @@ pub(crate) fn is_lexically_reachable(
             .any(|p| reference.line >= p.start_line && reference.line <= p.end_line)
 }
 
-fn is_js_family(language: Language) -> bool {
+pub(crate) fn is_js_family(language: Language) -> bool {
     matches!(
         language,
         Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx
@@ -687,7 +687,7 @@ fn is_receiver_less_call(reference: &RefView, context: &dyn ResolutionContext) -
 }
 
 /// A receiver-less JS/TS call can never bind to a method (#1714).
-fn is_bare_js_call(reference: &RefView, context: &dyn ResolutionContext) -> bool {
+pub(crate) fn is_bare_js_call(reference: &RefView, context: &dyn ResolutionContext) -> bool {
     is_js_family(reference.language) && is_receiver_less_call(reference, context)
 }
 
@@ -928,6 +928,14 @@ pub fn match_by_exact_name(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> Option<ResolvedRef> {
+    let bare_js = is_bare_js_call(reference, context);
+    // A bare call bound to a store action (#1862) resolves inside that store,
+    // ahead of any same-named function.
+    if bare_js
+        && let Some(action) = crate::js_store::match_js_store_binding_call(reference, context)
+    {
+        return Some(action);
+    }
     let reachable: Vec<Arc<Node>> = apply_language_gate(
         context.get_nodes_by_name_shared(&reference.reference_name),
         reference,
@@ -941,7 +949,6 @@ pub fn match_by_exact_name(
     // importable (#1537/#1536). Filtering BEFORE ranking — not just refusing the
     // winner afterwards — is what lets a legitimate supertype OUTRANK a
     // same-named enum member instead of the whole reference being dropped.
-    let bare_js = is_bare_js_call(reference, context);
     let bare_go = is_bare_go_call(reference, context);
     let candidates: Vec<Arc<Node>> = reachable
         .iter()
@@ -1135,7 +1142,7 @@ fn is_object_literal_language(language: Language) -> bool {
     )
 }
 
-fn range_within(inner: &Node, outer: &Node) -> bool {
+pub(crate) fn range_within(inner: &Node, outer: &Node) -> bool {
     if inner.start_line < outer.start_line || inner.end_line > outer.end_line {
         return false;
     }
@@ -1765,7 +1772,10 @@ fn local_receiver_type_patterns_tagged(language: Language, r: &str) -> Vec<(Rege
 /// 1-based start line of the tightest function/method enclosing the call
 /// (`enclosingScopeStartLine`, name-matcher.ts:#1108). Bounds the backward scan
 /// so a same-named variable in another function can't leak in.
-fn enclosing_scope_start_line(reference: &RefView, context: &dyn ResolutionContext) -> i64 {
+pub(crate) fn enclosing_scope_start_line(
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> i64 {
     let mut start = 1i64;
     for n in context.get_nodes_in_file_shared(&reference.file_path) {
         if !matches!(n.kind, NodeKind::Function | NodeKind::Method)
@@ -3759,12 +3769,13 @@ pub fn match_reference(
     // A JS/TS/Python call-result receiver carries no proven result type. It
     // stays unresolved instead of degrading to a global same-named callable:
     // the fuzzy strategy would split `make().run` on `.` and hand it to any
-    // `run` (#1683).
+    // `run` (#1683). The one exception is a store accessor, whose store is
+    // identified (`useStore.getState().reset`, #1862).
     if reference.reference_kind == EdgeKind::Calls
         && (is_js_family(reference.language) || reference.language == Language::Python)
         && reference.reference_name.contains("().")
     {
-        return None;
+        return crate::js_store::match_store_accessor_chain(reference, context);
     }
 
     // 2. Method call pattern.

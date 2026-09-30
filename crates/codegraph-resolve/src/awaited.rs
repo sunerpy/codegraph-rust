@@ -264,7 +264,7 @@ pub(crate) fn has_parameter_binding(code: &str, name: &str) -> bool {
 }
 
 /// `\b(?:const|let|var|function|class)\s+(?:NAME\b|\{[^}]*\bNAME\b)` starts.
-fn declaration_offsets(code: &str, name: &str) -> Vec<usize> {
+pub(crate) fn declaration_offsets(code: &str, name: &str) -> Vec<usize> {
     static KEYWORD: OnceLock<Regex> = OnceLock::new();
     let keyword = KEYWORD.get_or_init(|| {
         Regex::new(r"(?-u:\b)(?:const|let|var|function|class)\s+").expect("declaration keyword")
@@ -296,7 +296,11 @@ fn is_reassigned(code: &str, name: &str) -> bool {
 
 /// `importShadowedAt`: a parameter of the enclosing function, or a declaration
 /// in a scope enclosing the position, rebinds the imported `name`.
-fn import_shadowed_at(name: &str, reference: &RefView, context: &dyn ResolutionContext) -> bool {
+pub(crate) fn import_shadowed_at(
+    name: &str,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> bool {
     let enclosing_parameter = context
         .get_nodes_in_file_shared(&reference.file_path)
         .iter()

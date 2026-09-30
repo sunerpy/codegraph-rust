@@ -22,6 +22,7 @@ pub mod context;
 pub mod framework; // the FrameworkResolver extension point
 pub mod frameworks; // concrete react/vue/nestjs FrameworkResolvers
 pub mod import_resolver;
+mod js_store;
 pub mod lru_cache;
 pub mod name_matcher;
 pub mod path_aliases;

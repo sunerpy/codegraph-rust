@@ -1782,7 +1782,16 @@ impl ReferenceResolver {
                 .any(|f| f.claims_reference(&reference.reference_name))
             && !call_result_chain
         {
-            return (None, None);
+            // A store-bound bare call need not share its action's name
+            // (#1862), so it gets one chance past the existence check.
+            return (
+                self.gate_language(
+                    crate::js_store::match_js_store_binding_call(reference, context),
+                    reference,
+                    context,
+                ),
+                None,
+            );
         }
 
         // Function-as-value refs (#756) get a dedicated, strictly-gated path,
@@ -1850,7 +1859,19 @@ impl ReferenceResolver {
         // unique-name heuristics guess the result type (#1683). A retained
         // untyped member chain is the same kind of evidence: importing its
         // root does not make the root its call target (#1862).
-        if call_result_chain || is_unresolved_js_member_call(reference) {
+        if call_result_chain {
+            // The one call-result receiver with an identified target is a store
+            // accessor (`useStore.getState().reset`, #1862).
+            if let Some(action) = self.gate_language(
+                crate::js_store::match_store_accessor_chain(reference, context),
+                reference,
+                context,
+            ) {
+                candidates.push(action);
+            }
+            return (candidates.into_iter().reduce(highest_confidence), None);
+        }
+        if is_unresolved_js_member_call(reference) {
             return (candidates.into_iter().reduce(highest_confidence), None);
         }
 

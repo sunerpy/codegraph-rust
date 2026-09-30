@@ -3074,6 +3074,21 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                     if let Some(owner_id) = declared_id.as_deref() {
                         self.extract_js_object_literal_members(value, owner_id);
                     }
+                } else if let (Some(owner_id), Some(actions)) = (
+                    declared_id.as_deref(),
+                    (value.kind() == "call_expression")
+                        .then(|| initializer_returned_object(value, 0))
+                        .flatten()
+                        .filter(|actions| object_has_inline_functions(*actions))
+                        .filter(|_| is_exported || self.is_exported_later(&name)),
+                ) {
+                    // An exported store — `create((set, get) => ({ reset: () =>
+                    // set({}) }))`, middleware wrappers included — owns the
+                    // inline actions of the object its initializer returns
+                    // (upstream #647/#1862). The initializer is not walked as a
+                    // whole: that would re-attribute every action's calls to
+                    // the store itself.
+                    self.extract_js_object_literal_members(actions, owner_id);
                 } else {
                     match declared_id {
                         Some(id) => {
@@ -3086,6 +3101,20 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 }
             }
         }
+    }
+
+    /// A top-level binding exported by a LATER statement rather than at its
+    /// declaration: `export default NAME` or `export { NAME }` (upstream
+    /// `isExportedLater`).
+    fn is_exported_later(&self, name: &str) -> bool {
+        if !is_js_identifier(name) {
+            return false;
+        }
+        let name = regex::escape(name);
+        Regex::new(&format!(
+            r"(?m)^[ \t]*export\s+(?:default\s+{name}\s*;?[ \t\r]*$|\{{[^}}]*\b{name}\b[^}}]*\}})"
+        ))
+        .is_ok_and(|pattern| pattern.is_match(self.source))
     }
 
     /// Emit callable members directly declared in one JS-family object literal.
@@ -5007,6 +5036,76 @@ fn js_object_member_name(node: SyntaxNode<'_>, source: &str) -> Option<String> {
             .chars()
             .all(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphanumeric()))
     .then(|| name.to_string())
+}
+
+/// The object literal a store-initializer call returns through one of its
+/// function arguments — `create((set, get) => ({ … }))` — descending through
+/// nested call arguments so middleware wrappers are unwrapped
+/// (`create(persist((set, get) => ({ … }), { … }))`). Keyed purely on AST
+/// shape, never on library names (upstream `findInitializerReturnedObject`).
+fn initializer_returned_object(call: SyntaxNode<'_>, depth: usize) -> Option<SyntaxNode<'_>> {
+    if depth > 4 {
+        return None;
+    }
+    let arguments = child_by_field(call, "arguments")?;
+    let arguments = arguments
+        .named_children(&mut arguments.walk())
+        .collect::<Vec<_>>();
+    arguments
+        .into_iter()
+        .find_map(|argument| match argument.kind() {
+            "arrow_function" | "function_expression" => function_returned_object(argument),
+            "call_expression" => initializer_returned_object(argument, depth + 1),
+            _ => None,
+        })
+}
+
+/// The object literal a function returns: the `=> ({ … })` arrow form or a
+/// top-level `return { … }` of a block body.
+fn function_returned_object(function: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
+    fn as_object(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
+        match node.kind() {
+            "object" | "object_expression" => Some(node),
+            "parenthesized_expression" => node
+                .named_children(&mut node.walk())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .find_map(as_object),
+            _ => None,
+        }
+    }
+    let body = child_by_field(function, "body")?;
+    if let Some(object) = as_object(body) {
+        return Some(object);
+    }
+    if body.kind() != "statement_block" {
+        return None;
+    }
+    let statements = body.named_children(&mut body.walk()).collect::<Vec<_>>();
+    statements
+        .into_iter()
+        .filter(|statement| statement.kind() == "return_statement")
+        .find_map(|statement| {
+            statement
+                .named_children(&mut statement.walk())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .find_map(as_object)
+        })
+}
+
+/// Whether an object literal declares an inline function member — an action
+/// map, unlike a setup store's all-shorthand `return { foo, bar }`.
+fn object_has_inline_functions(object: SyntaxNode<'_>) -> bool {
+    object
+        .named_children(&mut object.walk())
+        .any(|member| match member.kind() {
+            "method_definition" => true,
+            "pair" => child_by_field(member, "value").is_some_and(|value| {
+                matches!(value.kind(), "arrow_function" | "function_expression")
+            }),
+            _ => false,
+        })
 }
 
 /// The call's callee name when it is a bare identifier or `pkg::fn` (yields

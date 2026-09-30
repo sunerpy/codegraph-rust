@@ -833,3 +833,230 @@ fn call_result_receivers_never_fabricate_an_edge() {
     assert_eq!(project.callers("run", js), Vec::<String>::new());
     assert_eq!(project.callees("bucket", js), vec!["make"]);
 }
+
+// ---- store actions (#647, #1862) --------------------------------------------
+
+fn store_project() -> Project {
+    resolve_project(&files(&[
+        (
+            "store.ts",
+            "import { create } from 'zustand';
+interface S { fetchUser(): Promise<void>; reset(): void }
+export const useStore = create<S>((set, get, api) => ({
+  fetchUser: async () => { get().reset(); },
+  reset: () => set({}),
+}));
+export const anotherStore = create((set, get) => ({
+  reset: () => set({}),
+}));
+",
+        ),
+        (
+            "consumer.ts",
+            "import { useStore as current, anotherStore } from './store';
+function fetchUser() { return 'local'; }
+export async function loginFlow() {
+  const { fetchUser } = current.getState();
+  await fetchUser();
+}
+export function hardReset() { current.getState().reset(); }
+export function multipleBindings() {
+  const { fetchUser, reset } = current.getState();
+  fetchUser(); reset();
+}
+export function otherReset() { anotherStore.getState().reset(); }
+export function shadowed() {
+  const { fetchUser } = current.getState();
+  { const fetchUser = () => 'shadow'; fetchUser(); }
+}
+export function siblingScope(flag: boolean) {
+  if (flag) { const { fetchUser } = current.getState(); }
+  return fetchUser();
+}
+export function unknownStore(unknown: any) { unknown.getState().reset(); }
+export function unknownFactory(db: any) { db.prepare().reset(); }
+",
+        ),
+        (
+            "not-a-store.ts",
+            "export const fake = otherFactory(() => ({ reset() { return 1; } }));\n",
+        ),
+        (
+            "barrel.ts",
+            "export { useStore as routedStore } from './store';\n",
+        ),
+        (
+            "barrel-consumer.ts",
+            "import { routedStore as current } from './barrel';
+export function barrelReset() { current.getState().reset(); }
+export function barrelSelected() { const selected = current(s => s.reset); selected(); }
+",
+        ),
+        (
+            "selectors.ts",
+            "import { useStore as current, anotherStore } from './store';
+import { fake } from './not-a-store';
+export function rootShadow(current: any) { const selected = current(s => s.reset); selected(); }
+export function rootBlockShadow() { const current = fake; const selected = current(s => s.reset); selected(); }
+export function fakeSelector() { const selected = fake(s => s.reset); selected(); }
+export function Screen() {
+  const selected = current((s) => s.reset);
+  const otherSelected = anotherStore(s => s.reset);
+  function captured() { selected(); }
+  function otherCaptured() { otherSelected(); }
+  function parameterShadow(selected: () => void) { selected(); }
+  const arrowShadow = (selected: () => void) => { selected(); };
+  function localShadow() { const selected = () => 1; selected(); }
+  return { captured, otherCaptured, parameterShadow, arrowShadow, localShadow };
+}
+export function sibling() { const selected = current(s => s.reset); }
+export function outside() { selected(); }
+export function wrongSelector(other: any) {
+  const selected = current(s => other.reset);
+  selected();
+}
+export function unknownSelector(unknown: any) {
+  const selected = unknown(s => s.reset);
+  selected();
+}
+",
+        ),
+    ]))
+}
+
+const USE_STORE_RESET: &str = "useStore::reset";
+const OTHER_STORE_RESET: &str = "anotherStore::reset";
+
+#[test]
+fn store_initializers_own_their_inline_actions() {
+    let project = store_project();
+    let store_actions = |file: &str| {
+        let mut names = project
+            .store()
+            .nodes_by_kind(NodeKind::Function)
+            .expect("functions")
+            .into_iter()
+            .filter(|node| node.file_path == file)
+            .map(|node| (node.qualified_name, node.start_line))
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    assert_eq!(
+        store_actions("store.ts"),
+        vec![
+            ("anotherStore::reset".to_string(), 8),
+            ("useStore::fetchUser".to_string(), 4),
+            ("useStore::reset".to_string(), 5),
+        ]
+    );
+    assert_eq!(
+        store_actions("not-a-store.ts"),
+        vec![("fake::reset".to_string(), 1)]
+    );
+}
+
+#[test]
+fn store_accessors_resolve_inside_the_identified_store() {
+    let project = store_project();
+    assert!(
+        project
+            .callees("useStore::fetchUser", None)
+            .contains(&USE_STORE_RESET.to_string())
+    );
+    let hard = project.callees("hardReset", None);
+    assert!(hard.contains(&USE_STORE_RESET.to_string()), "{hard:?}");
+    assert!(!hard.contains(&OTHER_STORE_RESET.to_string()), "{hard:?}");
+    let other = project.callees("otherReset", None);
+    assert!(other.contains(&OTHER_STORE_RESET.to_string()), "{other:?}");
+    assert!(!other.contains(&USE_STORE_RESET.to_string()), "{other:?}");
+    for name in ["unknownStore", "unknownFactory"] {
+        let callees = project.callees(name, None);
+        assert!(
+            !callees
+                .iter()
+                .any(|callee| callee.starts_with("useStore::")
+                    || callee.starts_with("anotherStore::")),
+            "{name}: {callees:?}"
+        );
+    }
+}
+
+#[test]
+fn destructured_store_actions_resolve_ahead_of_same_named_locals() {
+    let project = store_project();
+    let login = project.callees("loginFlow", None);
+    assert!(
+        login.contains(&"useStore::fetchUser".to_string()),
+        "{login:?}"
+    );
+    assert!(!login.contains(&"fetchUser".to_string()), "{login:?}");
+    let multiple = project.callees("multipleBindings", None);
+    assert!(
+        multiple.contains(&"useStore::fetchUser".to_string()),
+        "{multiple:?}"
+    );
+    assert!(
+        multiple.contains(&USE_STORE_RESET.to_string()),
+        "{multiple:?}"
+    );
+    for name in ["shadowed", "siblingScope"] {
+        let callees = project.callees(name, None);
+        assert!(
+            !callees.contains(&"useStore::fetchUser".to_string()),
+            "{name}: {callees:?}"
+        );
+    }
+}
+
+#[test]
+fn selectors_follow_their_own_store_through_closures_and_barrels() {
+    let project = store_project();
+    assert_eq!(
+        project.callees("Screen::captured", None),
+        vec![USE_STORE_RESET]
+    );
+    assert_eq!(
+        project.callees("Screen::otherCaptured", None),
+        vec![OTHER_STORE_RESET]
+    );
+    for name in ["barrelReset", "barrelSelected"] {
+        let callees = project.callees(name, Some("barrel-consumer.ts"));
+        assert!(
+            callees.contains(&USE_STORE_RESET.to_string()),
+            "{name}: {callees:?}"
+        );
+        // The imported store itself may also be referenced by the accessor or
+        // hook call; the other store's same-named action must not leak in.
+        assert!(
+            callees
+                .iter()
+                .all(|callee| callee == USE_STORE_RESET || callee == "useStore"),
+            "{name}: {callees:?}"
+        );
+    }
+}
+
+#[test]
+fn selectors_are_not_guessed_through_shadows_or_foreign_factories() {
+    let project = store_project();
+    for name in [
+        "Screen::parameterShadow",
+        "Screen::arrowShadow",
+        "Screen::localShadow",
+        "outside",
+        "wrongSelector",
+        "unknownSelector",
+        "rootShadow",
+        "rootBlockShadow",
+    ] {
+        let callees = project.callees(name, Some("selectors.ts"));
+        assert!(
+            !callees.contains(&USE_STORE_RESET.to_string())
+                && !callees.contains(&OTHER_STORE_RESET.to_string()),
+            "{name}: {callees:?}"
+        );
+    }
+    let fake = project.callees("fakeSelector", Some("selectors.ts"));
+    assert!(!fake.contains(&"fake::reset".to_string()), "{fake:?}");
+}

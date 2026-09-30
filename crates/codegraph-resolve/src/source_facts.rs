@@ -127,6 +127,8 @@ pub struct SourceFacts {
     js_local_bindings: Mutex<HashMap<String, bool>>,
     node_decisions: Mutex<HashMap<(&'static str, String), bool>>,
     ts_field_declarations: Mutex<HashMap<(String, String), Option<TsFieldDeclaration>>>,
+    js_get_state_file: OnceLock<bool>,
+    js_selector_names: OnceLock<HashSet<String>>,
     awaited_raw_names: OnceLock<HashSet<String>>,
     awaited_index: OnceLock<Arc<AwaitedIndex>>,
 }
@@ -144,6 +146,8 @@ impl SourceFacts {
             js_local_bindings: Mutex::new(HashMap::new()),
             node_decisions: Mutex::new(HashMap::new()),
             ts_field_declarations: Mutex::new(HashMap::new()),
+            js_get_state_file: OnceLock::new(),
+            js_selector_names: OnceLock::new(),
             awaited_raw_names: OnceLock::new(),
             awaited_index: OnceLock::new(),
         }
@@ -233,6 +237,20 @@ impl SourceFacts {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(name.to_string(), bound);
         bound
+    }
+
+    /// Whether the raw source can destructure a store's `getState()`;
+    /// `scan` runs once.
+    pub(crate) fn js_get_state_file(&self, scan: impl FnOnce(&str) -> bool) -> bool {
+        *self.js_get_state_file.get_or_init(|| scan(&self.source))
+    }
+
+    /// Names the raw source binds to a selector call; `scan` runs once.
+    pub(crate) fn js_selector_names(
+        &self,
+        scan: impl FnOnce(&str) -> HashSet<String>,
+    ) -> &HashSet<String> {
+        self.js_selector_names.get_or_init(|| scan(&self.source))
     }
 
     /// Names the raw source binds as `const x = await f(`; `scan` runs once.
