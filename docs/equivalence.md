@@ -293,8 +293,11 @@ The added alias files pin three import-resolution contracts:
 - `from pkg import module as mod_alias; mod_alias.func()` prefers the existing
   module file `pkg/module.py`;
 - `from imported_types import ImportedClass as ImportedAlias; return
-ImportedAlias` preserves member-import semantics and resolves the aliased
-  class-as-value reference by import.
+ImportedAlias` preserves member-import semantics: both the import statement and
+  the aliased class-as-value reference resolve to the class through the import
+  (named Python imports use the absolute-module and top-level-definition
+  fallback of upstream #1820, because Python symbols are never marked
+  exported).
 
 Missing/duplicate/ambiguous module aliases remain unresolved, and a claimed
 module alias never falls through to global bare-name matching.

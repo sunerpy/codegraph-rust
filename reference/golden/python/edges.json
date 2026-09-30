@@ -90,9 +90,9 @@
     "kind": "references",
     "line": 5,
     "metadata": {
-      "confidence": 0.8,
+      "confidence": 0.9,
       "fnRef": true,
-      "resolvedBy": "function-ref"
+      "resolvedBy": "import"
     },
     "provenance": null,
     "source": "function:230b5585efc925330d3cbf214e8be03b",
@@ -143,7 +143,7 @@
     "line": 1,
     "metadata": {
       "confidence": 0.9,
-      "resolvedBy": "exact-match"
+      "resolvedBy": "import"
     },
     "provenance": null,
     "source": "file:consumers.py",
@@ -161,6 +161,18 @@
     "provenance": null,
     "source": "function:1198b6fc92ac818287e950fa1a067eda",
     "target": "class:f6b91632a5d8b5435b08ac99b12f0570"
+  },
+  {
+    "col": 44,
+    "kind": "imports",
+    "line": 3,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "file:aliases.py",
+    "target": "class:099ebd3f5c7b1a6ac5522e9fbfb00912"
   },
   {
     "col": 7,

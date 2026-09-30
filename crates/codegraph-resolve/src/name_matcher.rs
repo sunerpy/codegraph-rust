@@ -162,19 +162,27 @@ fn dir_of(path: &str) -> &str {
 }
 
 /// Language families that share a type system / runtime (`LANGUAGE_FAMILY`,
-/// `name-matcher.ts:113-121`).
+/// upstream v1.6.1): C, C++, Objective-C and Swift interoperate natively; ArkTS
+/// and the single-file-component languages are web.
 fn language_family(lang: Language) -> Option<&'static str> {
     match lang {
         Language::Java | Language::Kotlin | Language::Scala => Some("jvm"),
-        Language::Swift | Language::ObjC => Some("apple"),
-        Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx => Some("web"),
-        Language::C | Language::Cpp => Some("c"),
+        Language::Swift | Language::ObjC | Language::C | Language::Cpp => Some("native"),
+        Language::TypeScript
+        | Language::Tsx
+        | Language::JavaScript
+        | Language::Jsx
+        | Language::ArkTs
+        | Language::Svelte
+        | Language::Vue
+        | Language::Astro => Some("web"),
         Language::CSharp | Language::Razor => Some("dotnet"),
+        Language::Cfml => Some("cfml"),
         _ => None,
     }
 }
 
-/// `sameLanguageFamily` (`name-matcher.ts:122-126`).
+/// `sameLanguageFamily`.
 pub fn same_language_family(a: Language, b: Language) -> bool {
     if a == b {
         return true;
@@ -185,27 +193,148 @@ pub fn same_language_family(a: Language, b: Language) -> bool {
     }
 }
 
-/// `isKnownLanguageFamily` (`name-matcher.ts:134-136`).
-pub fn is_known_language_family(lang: Language) -> bool {
-    language_family(lang).is_some()
+/// The code family of `lang` (`CODE_FAMILY`): a multi-language family, or a
+/// singleton for every other programming language. Config and markup formats
+/// have none, so their transitions stay open.
+fn code_family(lang: Language) -> Option<&'static str> {
+    language_family(lang).or(match lang {
+        Language::Python => Some("python"),
+        Language::Go => Some("go"),
+        Language::Rust => Some("rust"),
+        Language::Php => Some("php"),
+        Language::Ruby => Some("ruby"),
+        Language::Dart => Some("dart"),
+        Language::Lua | Language::Luau => Some("lua"),
+        Language::R => Some("r"),
+        Language::Erlang => Some("erlang"),
+        Language::Pascal => Some("pascal"),
+        Language::Solidity => Some("solidity"),
+        Language::Nix => Some("nix"),
+        _ => None,
+    })
 }
 
-/// `crossesKnownFamily` (`name-matcher.ts:147-149`).
-pub fn crosses_known_family(a: Language, b: Language) -> bool {
-    is_known_language_family(a) && is_known_language_family(b) && !same_language_family(a, b)
+/// Whether a reference from `a` to `b` crosses between two code families
+/// (`crossesCodeBoundary`).
+pub fn crosses_code_boundary(a: Language, b: Language) -> bool {
+    matches!((code_family(a), code_family(b)), (Some(fa), Some(fb)) if fa != fb)
 }
 
-/// Drop cross-language candidates from a name lookup (`applyLanguageGate`,
-/// `name-matcher.ts:160-168`).
+/// Cross-family name matches need an actual ABI boundary (`hasBridgeEvidence`):
+/// a native caller reaching a cgo `//export` or a Rust `pub extern "C" fn`, or
+/// a Go `C.name` / Rust `extern "C" { fn name(…) }` caller reaching a C or C++
+/// function. The evidence is scoped to the named free function.
+fn has_bridge_evidence(
+    candidate: &Node,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> bool {
+    if reference.reference_kind != EdgeKind::Calls || candidate.kind != NodeKind::Function {
+        return false;
+    }
+    let name = regex::escape(&candidate.name);
+    static CGO_IMPORT: OnceLock<Regex> = OnceLock::new();
+    let cgo_import = || {
+        CGO_IMPORT
+            .get_or_init(|| Regex::new(r#"(?-u:\b)import\s+(?:\(\s*)?"C""#).expect("cgo import"))
+    };
+    if code_family(reference.language) == Some("native") {
+        let Some(facts) = context.source_facts(&candidate.file_path) else {
+            return false;
+        };
+        if candidate.language == Language::Go {
+            let start = (candidate.start_line.max(2) - 2) as usize;
+            let end =
+                (candidate.end_line.max(candidate.start_line) as usize).min(facts.line_count());
+            let declaration = if start < end {
+                facts.join_lines(start, end, "\n")
+            } else {
+                String::new()
+            };
+            return cgo_import()
+                .is_match(&strip_comments_for_regex(facts.source(), CommentLang::Go))
+                && Regex::new(&format!(r"(?m)^//export {name}\r?\nfunc {name}\s*\("))
+                    .is_ok_and(|export| export.is_match(&declaration));
+        }
+        if candidate.language == Language::Rust {
+            let start = (candidate.start_line.max(1) - 1) as usize;
+            let end =
+                (candidate.end_line.max(candidate.start_line) as usize).min(facts.line_count());
+            let declaration = if start < end {
+                facts.join_lines(start, end, "\n")
+            } else {
+                String::new()
+            };
+            return Regex::new(&format!(
+                r#"(?-u:\b)pub\s+extern\s+"C"\s+fn\s+{name}(?-u:\b)"#
+            ))
+            .is_ok_and(|export| {
+                export.is_match(&strip_comments_for_regex(&declaration, CommentLang::Rust))
+            });
+        }
+    }
+    if matches!(candidate.language, Language::C | Language::Cpp) {
+        let Some(facts) = context.source_facts(&reference.file_path) else {
+            return false;
+        };
+        if reference.language == Language::Go {
+            return cgo_import()
+                .is_match(&strip_comments_for_regex(facts.source(), CommentLang::Go))
+                && reference.reference_name == format!("C.{}", candidate.name);
+        }
+        if reference.language == Language::Rust {
+            return Regex::new(&format!(
+                r#"extern\s+"C"\s*\{{[^}}]*(?-u:\b)fn\s+{name}\s*\("#
+            ))
+            .is_ok_and(|block| {
+                block.is_match(&strip_comments_for_regex(facts.source(), CommentLang::Rust))
+            });
+        }
+    }
+    false
+}
+
+/// Reject a chosen result that crosses a code-family boundary without bridge
+/// evidence (`gateLanguageMatch`). It never shrinks a candidate pool or tries
+/// a replacement, so no lone survivor is manufactured.
+pub(crate) fn gate_language_match(
+    result: Option<ResolvedRef>,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<ResolvedRef> {
+    let result = result?;
+    let Some(target) = context.get_node_by_id_shared(&result.target_node_id) else {
+        return Some(result);
+    };
+    if crosses_code_boundary(reference.language, target.language)
+        && !has_bridge_evidence(&target, reference, context)
+    {
+        return None;
+    }
+    // Rust-only (upstream has no Godot support): a scene, resource, or
+    // project file's path references into scripts stay unresolved rows, which
+    // impact/affected/audit consume path-keyed (F3). Name matching must not
+    // turn them into edges through the open config→code transition.
+    if reference.reference_kind == EdgeKind::References
+        && matches!(
+            reference.language,
+            Language::GodotScene | Language::GodotResource | Language::GodotProject
+        )
+        && target.language != reference.language
+    {
+        return None;
+    }
+    Some(result)
+}
+
+/// Type/value references keep same-family eligibility in the candidate pool:
+/// a native namesake must not hide the actual web type. Calls, imports and
+/// inheritance are gated on the chosen result instead.
 fn apply_language_gate<T: Borrow<Node>>(candidates: Vec<T>, reference: &RefView) -> Vec<T> {
     match reference.reference_kind {
         EdgeKind::References => candidates
             .into_iter()
             .filter(|c| same_language_family(c.borrow().language, reference.language))
-            .collect(),
-        EdgeKind::Imports => candidates
-            .into_iter()
-            .filter(|c| !crosses_known_family(c.borrow().language, reference.language))
             .collect(),
         _ => candidates,
     }
@@ -3923,6 +4052,10 @@ mod tests {
         assert!(same_language_family(Language::TypeScript, Language::Jsx));
         assert!(same_language_family(Language::JavaScript, Language::Tsx));
         assert!(same_language_family(Language::C, Language::Cpp));
+        // C, C++, Objective-C and Swift interoperate natively (v1.6.1).
+        assert!(same_language_family(Language::Swift, Language::Cpp));
+        assert!(same_language_family(Language::ArkTs, Language::TypeScript));
+        assert!(same_language_family(Language::Vue, Language::TypeScript));
         assert!(same_language_family(Language::CSharp, Language::Razor));
         // Identity always matches even for a language with no family.
         assert!(same_language_family(Language::Rust, Language::Rust));
@@ -3933,19 +4066,75 @@ mod tests {
     }
 
     #[test]
-    fn known_family_and_cross_family_predicates() {
-        assert!(is_known_language_family(Language::Java));
-        assert!(is_known_language_family(Language::Cpp));
-        assert!(!is_known_language_family(Language::Rust));
-        assert!(!is_known_language_family(Language::Go));
+    fn code_boundary_covers_singleton_families_and_leaves_config_open() {
+        // Two different code families cross.
+        assert!(crosses_code_boundary(Language::Java, Language::Swift));
+        assert!(crosses_code_boundary(Language::Rust, Language::TypeScript));
+        assert!(crosses_code_boundary(Language::Python, Language::Go));
+        // One family (or one language) does not.
+        assert!(!crosses_code_boundary(Language::Java, Language::Kotlin));
+        assert!(!crosses_code_boundary(Language::Lua, Language::Luau));
+        assert!(!crosses_code_boundary(Language::Rust, Language::Rust));
+        // Config and markup transitions stay open.
+        assert!(!crosses_code_boundary(Language::Yaml, Language::Php));
+        assert!(!crosses_code_boundary(
+            Language::TypeScript,
+            Language::Liquid
+        ));
+    }
 
-        // crosses_known_family: both known + different family.
-        assert!(crosses_known_family(Language::Java, Language::Swift));
-        // same family => does not cross.
-        assert!(!crosses_known_family(Language::Java, Language::Kotlin));
-        // one unknown => does not cross.
-        assert!(!crosses_known_family(Language::Rust, Language::Java));
-        assert!(!crosses_known_family(Language::Java, Language::Rust));
+    #[test]
+    fn cross_family_results_need_bridge_evidence() {
+        let ts_method = mk(
+            "method:Adapter::map",
+            NodeKind::Method,
+            "map",
+            "Adapter::map",
+            "ui/adapter.ts",
+            Language::TypeScript,
+        );
+        let rust_call = refv("map", EdgeKind::Calls, "src/lib.rs", Language::Rust, 1);
+        let ctx = Ctx::default().node_by_id(ts_method.clone());
+        let chosen = || {
+            Some(ResolvedRef {
+                original: rust_call.clone(),
+                target_node_id: ts_method.id.clone(),
+                confidence: 0.5,
+                resolved_by: ResolvedBy::ExactMatch,
+            })
+        };
+        assert!(
+            gate_language_match(chosen(), &rust_call, &ctx).is_none(),
+            "`v.iter().map()` never reaches TS"
+        );
+
+        let exported = {
+            let mut node = mk(
+                "function:add",
+                NodeKind::Function,
+                "add",
+                "add",
+                "go/lib.go",
+                Language::Go,
+            );
+            node.start_line = 4;
+            node.end_line = 4;
+            node
+        };
+        let c_call = refv("add", EdgeKind::Calls, "native/main.c", Language::C, 1);
+        let cgo = Ctx::default()
+            .node_by_id(exported.clone())
+            .file("go/lib.go", "package main\nimport \"C\"\n//export add\nfunc add(a, b C.int) C.int { return a + b }\n");
+        let via_cgo = Some(ResolvedRef {
+            original: c_call.clone(),
+            target_node_id: exported.id.clone(),
+            confidence: 0.5,
+            resolved_by: ResolvedBy::ExactMatch,
+        });
+        assert!(
+            gate_language_match(via_cgo, &c_call, &cgo).is_some(),
+            "a cgo //export is a C ABI bridge"
+        );
     }
 
     #[test]
@@ -3977,43 +4166,6 @@ mod tests {
         let out = apply_language_gate(vec![same.clone(), cross], &r);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, "function:a");
-    }
-
-    #[test]
-    fn language_gate_imports_drops_only_cross_known_family() {
-        // Imports edge: only candidates that CROSS a known family are dropped;
-        // an unknown-family candidate (Rust vs TS) is KEPT.
-        let same = mk(
-            "function:a",
-            NodeKind::Function,
-            "f",
-            "f",
-            "src/a.ts",
-            Language::TypeScript,
-        );
-        let cross = mk(
-            "function:b",
-            NodeKind::Function,
-            "f",
-            "f",
-            "src/b.java",
-            Language::Java,
-        );
-        let unknown = mk(
-            "function:c",
-            NodeKind::Function,
-            "f",
-            "f",
-            "src/c.rs",
-            Language::Rust,
-        );
-        let r = refv("f", EdgeKind::Imports, "src/x.ts", Language::TypeScript, 1);
-        let out = apply_language_gate(vec![same, cross, unknown], &r);
-        // TS kept (same family), Java dropped (crosses web↔jvm), Rust kept (unknown family).
-        let ids: Vec<&str> = out.iter().map(|n| n.id.as_str()).collect();
-        assert!(ids.contains(&"function:a"));
-        assert!(ids.contains(&"function:c"));
-        assert!(!ids.contains(&"function:b"));
     }
 
     #[test]

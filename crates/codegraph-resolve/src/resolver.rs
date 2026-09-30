@@ -15,9 +15,10 @@ use crate::import_resolver::{
     resolve_php_imported_static_call, resolve_via_import,
 };
 use crate::name_matcher::{
-    crosses_known_family, is_js_name_target_visible, is_php_property_receiver_shape,
-    is_python_class_function_ref_target, match_dotted_call_chain, match_function_ref,
-    match_method_call, match_reference, match_scoped_call_chain, same_language_family,
+    crosses_code_boundary, gate_language_match, is_js_name_target_visible,
+    is_php_property_receiver_shape, is_python_class_function_ref_target, match_dotted_call_chain,
+    match_function_ref, match_method_call, match_reference, match_scoped_call_chain,
+    same_language_family,
 };
 use crate::snapshot_context::{SnapshotResolutionContext, build_edge_adjacency};
 use crate::source_facts::SourceFacts;
@@ -1545,6 +1546,15 @@ impl ReferenceResolver {
         let resolved = self.gate_import_locality(resolved, reference, context);
         let resolved = self.gate_c_macro_calls(resolved, reference);
         let resolved = self.forward_alias_binding(resolved, reference, context);
+        // Every chosen result — including an alias-forwarded one — obeys the
+        // code-family boundary (upstream v1.6.1 `resolveOne`); framework
+        // bridges keep their calls.
+        let resolved = match &resolved {
+            Some(result) if result.resolved_by == ResolvedBy::Framework => {
+                self.gate_framework_resolver_extension_language(resolved, reference, context)
+            }
+            _ => self.gate_language(resolved, reference, context),
+        };
         let resolved = self.gate_language_visibility(resolved, reference, context);
         let resolved = self.gate_js_visibility(resolved, reference, context);
         (resolved, deferred)
@@ -2765,26 +2775,13 @@ impl ReferenceResolver {
         reference: &RefView,
         context: &dyn ResolutionContext,
     ) -> Option<ResolvedRef> {
-        let result = result?;
-        let Some(target_language) = self.language_of_target(&result.target_node_id, context) else {
-            return Some(result);
-        };
-        if reference.reference_kind == EdgeKind::References
-            && !same_language_family(target_language, reference.language)
-        {
-            return None;
-        }
-        if reference.reference_kind == EdgeKind::Imports
-            && crosses_known_family(target_language, reference.language)
-        {
-            return None;
-        }
-        Some(result)
+        gate_language_match(result, reference, context)
     }
 
-    /// Drop a `FrameworkResolver`-strategy result that crosses two known families
-    /// (`gateFrameworkResolverLanguage`, `index.ts:1182-1188`). Never fires in v1 (the
-    /// `FrameworkResolver` extension-point list is empty).
+    /// Framework calls carry their own bridge evidence (a Tauri IPC command, a
+    /// Godot autoload); every other framework result obeys the code-family
+    /// boundary, while config/markup transitions stay open
+    /// (`gateFrameworkLanguage`, upstream v1.6.1).
     fn gate_framework_resolver_extension_language(
         &self,
         result: Option<ResolvedRef>,
@@ -2792,16 +2789,13 @@ impl ReferenceResolver {
         context: &dyn ResolutionContext,
     ) -> Option<ResolvedRef> {
         let result = result?;
-        if !matches!(
-            reference.reference_kind,
-            EdgeKind::References | EdgeKind::Imports
-        ) {
+        if reference.reference_kind == EdgeKind::Calls {
             return Some(result);
         }
-        if let Some(target_language) = self.language_of_target(&result.target_node_id, context) {
-            if crosses_known_family(target_language, reference.language) {
-                return None;
-            }
+        if let Some(target_language) = self.language_of_target(&result.target_node_id, context)
+            && crosses_code_boundary(target_language, reference.language)
+        {
+            return None;
         }
         Some(result)
     }

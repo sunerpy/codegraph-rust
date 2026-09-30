@@ -38,15 +38,5 @@
     "line": 59,
     "reference_kind": "calls",
     "reference_name": "register"
-  },
-  {
-    "candidates": null,
-    "col": 44,
-    "file_path": "aliases.py",
-    "from_node_id": "file:aliases.py",
-    "language": "python",
-    "line": 3,
-    "reference_kind": "imports",
-    "reference_name": "ImportedAlias"
   }
 ]
