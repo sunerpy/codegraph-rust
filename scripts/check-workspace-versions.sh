@@ -147,8 +147,9 @@ LOCK_NAMES="$(printf '%s\n' "$LOCK_ENTRIES" | sed 's/=.*//' | sort)"
 # Parse surfaces 3/4: release manifest and rendered-scaffold metadata.
 # ---------------------------------------------------------------------------
 RELEASE_MANIFEST_VALUE="$(jq -r '."."' "$RELEASE_MANIFEST" | tr -d '\r')"
-[ -n "$RELEASE_MANIFEST_VALUE" ] && [ "$RELEASE_MANIFEST_VALUE" != "null" ] \
-    || fail "no root \".\" entry in .release-please-manifest.json"
+if [ -z "$RELEASE_MANIFEST_VALUE" ] || [ "$RELEASE_MANIFEST_VALUE" = "null" ]; then
+    fail "no root \".\" entry in .release-please-manifest.json"
+fi
 SCAFFOLD_VERSION="$(jq -r '.placeholders.CURRENT_VERSION // empty' "$SCAFFOLD_CONFIG" | tr -d '\r')"
 [ -n "$SCAFFOLD_VERSION" ] || fail "no placeholders.CURRENT_VERSION in .github/scaffold.json"
 
