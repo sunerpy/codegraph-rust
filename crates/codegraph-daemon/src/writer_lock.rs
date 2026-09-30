@@ -4,11 +4,15 @@
 //! two long-lived direct MCP processes from alternating watcher syncs forever.
 //! `writer.pid` closes that lifecycle gap: one shared daemon, or one explicit
 //! direct process, holds an OS-level exclusive lock for the lifetime of its
-//! background writes. The JSON stored in the same file is diagnostic only; the
-//! kernel lock, not PID liveness, is authority.
+//! background writes. The kernel lock, not PID liveness, is authority.
+//!
+//! Diagnostics (holder pid, mode, start time) live in the sibling
+//! `writer.json`, never in the locked file: Windows `LockFileEx` locks are
+//! mandatory, so no other handle — not even one in the same process — could
+//! read a record kept inside the locked file while its owner is alive.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -44,6 +48,7 @@ pub enum WriterAcquireResult {
 pub struct WriterLockGuard {
     file: File,
     pid_path: PathBuf,
+    record_path: PathBuf,
     info: WriterLockInfo,
 }
 
@@ -61,10 +66,11 @@ impl WriterLockGuard {
 
 impl Drop for WriterLockGuard {
     fn drop(&mut self) {
-        // Clear diagnostics before releasing authority. Failure is best-effort:
-        // closing the file still releases the kernel lock, and the next owner
-        // overwrites the whole record after acquiring it.
-        let _ = clear_file(&mut self.file);
+        // Remove diagnostics before releasing authority. Failure is
+        // best-effort: closing the file still releases the kernel lock, a
+        // reader only trusts the record while the lock is held, and the next
+        // owner replaces the record after acquiring it.
+        let _ = fs::remove_file(&self.record_path);
         let _ = self.file.unlock();
     }
 }
@@ -72,6 +78,11 @@ impl Drop for WriterLockGuard {
 pub fn writer_pid_path(project_root: &Path) -> Result<PathBuf> {
     let paths = IndexPaths::resolve(project_root, std::env::var("CODEGRAPH_DIR").ok().as_deref())?;
     Ok(paths.current_root().join("writer.pid"))
+}
+
+/// The diagnostic record beside [`writer_pid_path`].
+fn writer_record_path(pid_path: &Path) -> PathBuf {
+    pid_path.with_file_name("writer.json")
 }
 
 pub fn decode_writer_lock_info(raw: &str) -> Option<WriterLockInfo> {
@@ -84,13 +95,13 @@ pub fn decode_writer_lock_info(raw: &str) -> Option<WriterLockInfo> {
 /// survived an unclean shutdown.
 pub fn read_writer_lock(project_root: &Path) -> Option<WriterLockInfo> {
     let path = writer_pid_path(project_root).ok()?;
-    let mut file = OpenOptions::new().read(true).write(true).open(path).ok()?;
+    let file = OpenOptions::new().read(true).write(true).open(&path).ok()?;
     match file.try_lock() {
         Ok(()) => {
             let _ = file.unlock();
             None
         }
-        Err(std::fs::TryLockError::WouldBlock) => read_info_from(&mut file),
+        Err(std::fs::TryLockError::WouldBlock) => read_record(&writer_record_path(&path)),
         Err(std::fs::TryLockError::Error(_)) => None,
     }
 }
@@ -125,7 +136,7 @@ pub fn try_acquire_writer_lock(
         );
     }
 
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
@@ -159,16 +170,20 @@ pub fn try_acquire_writer_lock(
                 mode: mode.into(),
                 started_at: now_millis(),
             };
-            write_info(&mut file, &info)
-                .with_context(|| format!("publishing {}", pid_path.display()))?;
+            let record_path = writer_record_path(&pid_path);
+            if let Err(error) = write_record(&record_path, &info) {
+                let _ = file.unlock();
+                return Err(error).with_context(|| format!("publishing {}", record_path.display()));
+            }
             Ok(WriterAcquireResult::Acquired(WriterLockGuard {
                 file,
                 pid_path,
+                record_path,
                 info,
             }))
         }
         Err(std::fs::TryLockError::WouldBlock) => Ok(WriterAcquireResult::Taken {
-            existing: read_info_from(&mut file),
+            existing: read_record(&writer_record_path(&pid_path)),
             pid_path,
         }),
         Err(std::fs::TryLockError::Error(source)) => {
@@ -195,32 +210,53 @@ pub fn clear_stale_writer_lock(project_root: &Path) -> bool {
     let Ok(path) = writer_pid_path(project_root) else {
         return false;
     };
-    let Ok(mut file) = OpenOptions::new().read(true).write(true).open(path) else {
+    let Ok(mut file) = OpenOptions::new().read(true).write(true).open(&path) else {
         return false;
     };
     if file.try_lock().is_err() {
         return false;
     }
+    let record_path = writer_record_path(&path);
+    let had_record = fs::symlink_metadata(&record_path).is_ok();
+    let removed = had_record && fs::remove_file(&record_path).is_ok();
+    // An older build kept the record inside the lock file itself.
     let had_bytes = file.metadata().is_ok_and(|metadata| metadata.len() > 0);
-    let cleared = clear_file(&mut file).is_ok();
+    let cleared = had_bytes && clear_file(&mut file).is_ok();
     let _ = file.unlock();
-    had_bytes && cleared
+    removed || cleared
 }
 
-fn read_info_from(file: &mut File) -> Option<WriterLockInfo> {
-    file.seek(SeekFrom::Start(0)).ok()?;
-    let mut raw = String::new();
-    file.read_to_string(&mut raw).ok()?;
-    decode_writer_lock_info(&raw)
+fn read_record(path: &Path) -> Option<WriterLockInfo> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    decode_writer_lock_info(&fs::read_to_string(path).ok()?)
 }
 
-fn write_info(file: &mut File, info: &WriterLockInfo) -> std::io::Result<()> {
-    file.set_len(0)?;
-    file.seek(SeekFrom::Start(0))?;
-    serde_json::to_writer_pretty(&mut *file, info).map_err(std::io::Error::other)?;
-    file.write_all(b"\n")?;
-    file.flush()?;
-    file.sync_data()
+/// Publish the record atomically: write a fresh sibling, then rename it over
+/// `writer.json` (a rename replaces a planted symlink rather than following it).
+fn write_record(path: &Path, info: &WriterLockInfo) -> std::io::Result<()> {
+    let staging = path.with_file_name(format!(
+        "writer.json.{}.{}.tmp",
+        process::id(),
+        now_millis()
+    ));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)?;
+        serde_json::to_writer_pretty(&mut file, info).map_err(std::io::Error::other)?;
+        file.write_all(b"\n")?;
+        file.sync_data()?;
+        drop(file);
+        fs::rename(&staging, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&staging);
+    }
+    result
 }
 
 fn clear_file(file: &mut File) -> std::io::Result<()> {
@@ -269,7 +305,15 @@ mod tests {
             path.is_file(),
             "authority path remains stable between owners"
         );
-        assert_eq!(fs::metadata(path).unwrap().len(), 0);
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            0,
+            "the lock file never holds the record"
+        );
+        assert!(
+            !writer_record_path(&path).exists(),
+            "drop removes the record"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -295,7 +339,16 @@ mod tests {
         let root = project("stale");
         let path = writer_pid_path(&root).unwrap();
         fs::write(&path, r#"{"pid":4294967294,"mode":"direct","startedAt":1}"#).unwrap();
+        fs::write(
+            writer_record_path(&path),
+            r#"{"pid":4294967294,"mode":"direct","startedAt":1}"#,
+        )
+        .unwrap();
+        // A record is trusted only while the kernel lock is held.
         assert!(read_writer_lock(&root).is_none());
+        assert!(clear_stale_writer_lock(&root));
+        assert!(!writer_record_path(&path).exists());
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
         let guard = match try_acquire_writer_lock(&root, "daemon").unwrap() {
             WriterAcquireResult::Acquired(guard) => guard,
             other => panic!("free kernel lock should be acquired: {other:?}"),
