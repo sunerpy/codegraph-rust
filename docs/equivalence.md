@@ -1234,6 +1234,8 @@ The expanded corpus also pins:
   direct callable members of one exported object literal;
 - source-range containment prevents the unrelated top-level `run` function
   from becoming the target, while nested `api.nested.run()` remains unresolved;
+  since extraction version 14 it is retained as the qualified call site
+  `api.nested.run` (upstream #1862), which only a framework resolver may bind;
 - `tsconfig.json` extends the JSONC/trailing-comma
   `config/tsconfig.base.json`; the declaring config's `baseUrl` resolves
   `@fixture/aliased` to `src/aliased.ts`;
