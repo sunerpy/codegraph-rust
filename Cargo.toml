@@ -29,12 +29,12 @@ categories = ["development-tools", "command-line-utilities", "parsing"]
 # Config (rust-base-convention)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "1.1"
 anyhow = "1"
-thiserror = "1"
+thiserror = "2"
 
 # Utilities
-sha2 = "0.10"
+sha2 = "0.11"
 sha1_smol = "1"
 rayon = "1.8"
 globset = "0.4"
@@ -46,19 +46,19 @@ tracing-appender = "0.2"
 time = { version = "0.3", features = ["macros", "local-offset", "formatting"] }
 
 # Database
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Tree-sitter
-tree-sitter = "0.26"
+tree-sitter = "0.27"
 streaming-iterator = "0.1"
 
 # File watching
-notify = "6"
+notify = "8"
 
 # Cross-platform IPC (daemon local socket / named pipe). The `tokio` feature
 # enables the async local-socket Listener/Stream used by the daemon accept loop.
 interprocess = { version = "2.4", features = ["tokio"] }
-rustix = { version = "0.38", features = ["process"] }
+rustix = { version = "1.1", features = ["process"] }
 
 # CLI
 clap = { version = "4.5", features = ["derive"] }
@@ -68,7 +68,7 @@ clap_complete = "4.5"
 indicatif = { version = "0.18", features = ["rayon"] }
 
 # JSONC config editing (preserve comments + key order on agent config writes)
-jsonc-parser = { version = "0.26", features = ["cst", "serde"] }
+jsonc-parser = { version = "0.33", features = ["cst", "serde"] }
 
 # Self-update from GitHub Releases (mise-style `codegraph self-update`)
 # self_update 0.43+ moved to quick-xml ^0.38 (fixes RUSTSEC-2026-0194/0195) and
@@ -79,10 +79,10 @@ jsonc-parser = { version = "0.26", features = ["cst", "serde"] }
 self_update = { version = "0.44", default-features = false, features = ["reqwest", "rustls", "archive-tar", "archive-zip", "compression-flate2", "compression-zip-deflate"] }
 
 # Benchmarking
-criterion = "0.7"
+criterion = "0.8"
 
 # Testing (dev-dependencies; not shipped in the binary)
-rstest = "0.23"
+rstest = "0.27"
 assert_fs = "1"
 assert_cmd = "2"
 predicates = "3"
