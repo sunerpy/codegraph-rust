@@ -5,6 +5,9 @@
 //! cross-language family gate — mirror the upstream exactly. Every strategy cites its
 //! upstream source range.
 
+use crate::object_literal::{
+    LiteralLookup, object_literal_property, property_contains, resolve_object_literal_binding,
+};
 use crate::source_facts::{SourceFacts, TsFieldDeclaration};
 use crate::strip_comments::{CommentLang, strip_comments_for_regex};
 use crate::types::{
@@ -1131,7 +1134,7 @@ fn prefer_call_site_file<T: Borrow<Node>>(nodes: Vec<T>, call_site_file: &str) -
     }
 }
 
-fn is_object_literal_language(language: Language) -> bool {
+pub(crate) fn is_object_literal_language(language: Language) -> bool {
     matches!(
         language,
         Language::TypeScript
@@ -1191,6 +1194,15 @@ pub(crate) fn resolve_object_literal_member(
                     NodeKind::Property | NodeKind::Variable | NodeKind::Constant
                 ))
     };
+    // Only the literal's own property that defines the member counts — the
+    // last one wins — and an identifier-valued member is followed by
+    // `resolve_object_literal_binding` instead (#1932).
+    let property = match object_literal_property(container, member, context) {
+        LiteralLookup::Absent => return None,
+        LiteralLookup::Property(property) if property.binding.is_some() => return None,
+        LiteralLookup::Property(property) => Some(property),
+        LiteralLookup::Unknown => None,
+    };
     let inside = context
         .get_nodes_in_file_shared(&container.file_path)
         .into_iter()
@@ -1204,6 +1216,11 @@ pub(crate) fn resolve_object_literal_member(
     let mut candidates = inside
         .into_iter()
         .filter(|node| node.name == member && accepts(node))
+        .filter(|node| {
+            property
+                .as_ref()
+                .is_none_or(|property| property_contains(property, container, node, context))
+        })
         .filter(|candidate| {
             !callable_bodies.iter().any(|body| {
                 body.id != candidate.id
@@ -2624,7 +2641,9 @@ pub fn match_method_call(
                 context,
                 0.85,
                 ResolvedBy::InstanceMethod,
-            ) {
+            )
+            .or_else(|| resolve_object_literal_binding(&holder, &method_name, reference, context))
+            {
                 return Some(member);
             }
         }

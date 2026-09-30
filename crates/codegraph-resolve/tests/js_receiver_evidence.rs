@@ -1060,3 +1060,302 @@ fn selectors_are_not_guessed_through_shadows_or_foreign_factories() {
     let fake = project.callees("fakeSelector", Some("selectors.ts"));
     assert!(!fake.contains(&"fake::reset".to_string()), "{fake:?}");
 }
+
+// ---- object-literal members that alias a function (#1932) ------------------
+
+#[test]
+fn literal_members_follow_shorthand_and_identifier_bindings() {
+    let project = resolve_project(&files(&[
+        (
+            "a.ts",
+            "import { imported } from './d';
+const viaArrow = async () => 1;
+function viaDecl() { return 2; }
+const longForm = async () => 3;
+function renamed() { return 4; }
+
+export const api = {
+  inline() { return 0; },
+  viaArrow,
+  viaDecl,
+  longForm: longForm,
+  alias: renamed,
+  imported,
+};
+
+export function sameFileCaller() {
+  return [api.inline(), api.viaArrow(), api.viaDecl(), api.longForm(), api.alias(), api.imported()];
+}
+",
+        ),
+        (
+            "b.ts",
+            "import { api } from './a';
+export function crossFileCaller() {
+  return [api.viaArrow(), api.viaDecl(), api.longForm(), api.alias()];
+}
+",
+        ),
+        ("d.ts", "export function imported() { return 5; }\n"),
+        (
+            "e.ts",
+            "function frozenFn() { return 6; }\nexport const frozen = Object.freeze({ frozenFn });\n",
+        ),
+        (
+            "f.ts",
+            "import { frozen } from './e';\nexport function frozenCaller() { return frozen.frozenFn(); }\n",
+        ),
+    ]));
+    // A literal handed straight to a wrapper still names its members.
+    assert_eq!(
+        project.callers("frozenFn", Some("e.ts")),
+        vec!["frozenCaller"]
+    );
+    assert_eq!(
+        project.callers("api::inline", Some("a.ts")),
+        vec!["sameFileCaller"]
+    );
+    for function in ["viaArrow", "viaDecl", "longForm", "renamed"] {
+        assert_eq!(
+            project.callers(function, Some("a.ts")),
+            vec!["crossFileCaller", "sameFileCaller"],
+            "{function}"
+        );
+    }
+    assert_eq!(
+        project.callers("imported", Some("d.ts")),
+        vec!["sameFileCaller"]
+    );
+}
+
+#[test]
+fn literal_members_never_follow_keys_nested_objects_or_shadows() {
+    let project = resolve_project(&files(&[(
+        "c.ts",
+        "function keyOnly() { return 1; }
+function nested() { return 2; }
+function shadowed() { return 3; }
+
+export const other = { keyOnly: 1, box: { nested } };
+
+export function useOther() {
+  return [other.keyOnly(), other.nested()];
+}
+
+export function makeApi(shadowed: () => number) {
+  const local = { shadowed };
+  return local.shadowed();
+}
+",
+    )]));
+    for function in ["keyOnly", "nested", "shadowed"] {
+        assert_eq!(
+            project.callers(function, Some("c.ts")),
+            Vec::<String>::new(),
+            "{function}"
+        );
+    }
+}
+
+#[test]
+fn literal_member_boundaries_pick_the_last_own_property() {
+    let cases: [(&str, &str, &str, bool); 14] = [
+        (
+            "sibling literals",
+            "const first = { wrong }; export const api = { run: right };",
+            "run",
+            true,
+        ),
+        (
+            "unicode before literal",
+            "const label = 'é🙂'; export const api = { run: right };",
+            "run",
+            true,
+        ),
+        (
+            "absent sibling member",
+            "const first = { wrong }; export const api = { right };",
+            "wrong",
+            false,
+        ),
+        (
+            "duplicate key",
+            "export const api = { run: wrong, run: right };",
+            "run",
+            true,
+        ),
+        (
+            "non-callable overwrite",
+            "export const api = { wrong, wrong: 0 };",
+            "wrong",
+            false,
+        ),
+        (
+            "nested member",
+            "export const api = { box: { wrong }, method() { return { wrong }; } };",
+            "wrong",
+            false,
+        ),
+        (
+            "unknown spread",
+            "export const api = { wrong, ...unknown };",
+            "wrong",
+            false,
+        ),
+        (
+            "explicit after spread",
+            "export const api = { ...unknown, run: right };",
+            "run",
+            true,
+        ),
+        (
+            "quoted overwrite",
+            "export const api = { wrong, 'wrong': 0 };",
+            "wrong",
+            false,
+        ),
+        (
+            "computed overwrite",
+            "export const api = { wrong, [unknown]: 0 };",
+            "wrong",
+            false,
+        ),
+        (
+            "frozen literal",
+            "export const api = Object.freeze({ run: right });",
+            "run",
+            true,
+        ),
+        (
+            "parenthesized literal",
+            "export const api = ({ run: right });",
+            "run",
+            true,
+        ),
+        (
+            "inline overwrite",
+            "export const api = { run() { return 0; }, run: right };",
+            "run",
+            true,
+        ),
+        (
+            "nested inline",
+            "export const api = { box: { wrong() { return 0; } } };",
+            "wrong",
+            false,
+        ),
+    ];
+    for ext in ["ts", "js"] {
+        for (name, declaration, member, resolves) in cases {
+            let project = resolve_project(&files(&[
+                (
+                    &format!("impl.{ext}"),
+                    &format!(
+                        "function wrong() {{ return 1; }}
+function right() {{ return 2; }}
+{declaration}
+export function sameCaller() {{ return api.{member}(); }}
+"
+                    ),
+                ),
+                (
+                    &format!("consumer.{ext}"),
+                    &format!(
+                        "import {{ api }} from './impl';
+export function crossCaller() {{ return api.{member}(); }}
+"
+                    ),
+                ),
+            ]));
+            let label = format!("{ext}: {name}");
+            let impl_file = format!("impl.{ext}");
+            let wrong = project.callers("wrong", Some(&impl_file));
+            let right = project.callers("right", Some(&impl_file));
+            for caller in ["sameCaller", "crossCaller"] {
+                assert!(!wrong.contains(&caller.to_string()), "{label}: {wrong:?}");
+                assert_eq!(
+                    right.contains(&caller.to_string()),
+                    resolves,
+                    "{label}: {caller} in {right:?}"
+                );
+            }
+            for inline in project
+                .store()
+                .nodes_by_kind(NodeKind::Function)
+                .expect("functions")
+                .into_iter()
+                .filter(|node| {
+                    node.name == member
+                        && !matches!(node.qualified_name.as_str(), "right" | "wrong")
+                })
+            {
+                let callers = project.callers(&inline.qualified_name, Some(&inline.file_path));
+                assert!(
+                    !callers
+                        .iter()
+                        .any(|caller| caller == "sameCaller" || caller == "crossCaller"),
+                    "{label}: {} called by {callers:?}",
+                    inline.qualified_name
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn literal_bindings_do_not_cross_parameter_or_value_shadows() {
+    let project = resolve_project(&files(&[(
+        "impl.ts",
+        "function target() { return 0; }
+export function parameter(target: () => number) {
+  const api = { target };
+  return api.target();
+}
+export function value() {
+  const target = 0;
+  const api = { target };
+  return api.target();
+}
+export function later() {
+  const api = { target };
+  const target = 0;
+  return api.target();
+}
+",
+    )]));
+    let callers = project.callers("target", Some("impl.ts"));
+    for name in ["parameter", "value", "later"] {
+        assert!(!callers.contains(&name.to_string()), "{name}: {callers:?}");
+    }
+}
+
+#[test]
+fn literal_bindings_follow_renamed_imports_and_ignore_nested_namesakes() {
+    let project = resolve_project(&files(&[
+        ("target.ts", "export function actual() { return 1; }\n"),
+        (
+            "impl.ts",
+            "import { actual as renamed } from './target';
+function unrelated() { function renamed() { return 0; } return renamed(); }
+export const api = { run: renamed };
+export function sameCaller() { return api.run(); }
+",
+        ),
+        (
+            "consumer.ts",
+            "import { api as facade } from './impl';
+export function crossCaller() { return facade.run(); }
+",
+        ),
+    ]));
+    let actual = project.callers("actual", Some("target.ts"));
+    assert!(actual.contains(&"sameCaller".to_string()), "{actual:?}");
+    assert!(actual.contains(&"crossCaller".to_string()), "{actual:?}");
+    let nested = project.callers("unrelated::renamed", Some("impl.ts"));
+    assert!(
+        !nested
+            .iter()
+            .any(|caller| caller == "sameCaller" || caller == "crossCaller"),
+        "{nested:?}"
+    );
+}

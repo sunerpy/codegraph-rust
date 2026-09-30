@@ -1,10 +1,11 @@
 //! Resolution for a binding whose initializer is only another callable.
 
-use codegraph_core::types::{Node, NodeKind};
+use codegraph_core::types::{EdgeKind, Node, NodeKind};
 use regex::Regex;
 
-use crate::name_matcher::same_language_family;
-use crate::types::ResolutionContext;
+use crate::name_matcher::{is_object_literal_language, same_language_family};
+use crate::object_literal::resolve_object_literal_binding;
+use crate::types::{RefView, ResolutionContext};
 
 fn is_alias_binding_kind(kind: NodeKind) -> bool {
     matches!(
@@ -68,6 +69,29 @@ pub(crate) fn resolve_alias_binding(
 ) -> Option<Node> {
     if !is_alias_binding_kind(alias.kind) {
         return None;
+    }
+    // A JS-family object member is read off the literal's own properties and
+    // followed lexically from where the literal is written (#1932), not
+    // pattern-matched in the (truncated) signature.
+    if let Some(member) = member_name
+        && is_object_literal_language(alias.language)
+    {
+        let reference = RefView {
+            row_id: None,
+            from_node_id: alias.id.clone(),
+            reference_name: member.to_string(),
+            reference_kind: EdgeKind::Calls,
+            line: alias.start_line,
+            column: alias.start_column,
+            file_path: alias.file_path.clone(),
+            language: alias.language,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+        let resolved = resolve_object_literal_binding(alias, member, &reference, context)?;
+        return context
+            .get_node_by_id_shared(&resolved.target_node_id)
+            .map(|node| node.as_ref().clone());
     }
     let target_name = alias_target_name(alias.signature.as_deref(), member_name)?;
     if target_name == alias.name {

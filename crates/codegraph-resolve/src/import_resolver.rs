@@ -1712,6 +1712,23 @@ pub fn resolve_via_import(
                                 ) {
                                     return Some(literal_member);
                                 }
+                                // `{ getUser }` / `{ getUser: fetchUser }`: the
+                                // member names a binding of the literal's file
+                                // (#1932).
+                                if let Some(bound) =
+                                    crate::object_literal::resolve_object_literal_binding(
+                                        &target_node,
+                                        member,
+                                        reference,
+                                        context,
+                                    )
+                                {
+                                    return Some(ResolvedRef {
+                                        confidence: 0.9,
+                                        resolved_by: ResolvedBy::Import,
+                                        ..bound
+                                    });
+                                }
                             }
                         }
                         // An imported VALUE called through a member —

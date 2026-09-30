@@ -12,6 +12,7 @@
 //! snapshot of the pass — so a cached answer is identical to recomputing it.
 
 use crate::awaited::AwaitedIndex;
+use crate::object_literal::LiteralLookup;
 use crate::strip_comments::{CommentLang, blank_string_contents, strip_comments_for_regex};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -129,6 +130,8 @@ pub struct SourceFacts {
     ts_field_declarations: Mutex<HashMap<(String, String), Option<TsFieldDeclaration>>>,
     js_get_state_file: OnceLock<bool>,
     js_selector_names: OnceLock<HashSet<String>>,
+    literal_properties: Mutex<HashMap<(String, String), LiteralLookup>>,
+    literal_binding_targets: Mutex<HashMap<(String, String), Option<String>>>,
     awaited_raw_names: OnceLock<HashSet<String>>,
     awaited_index: OnceLock<Arc<AwaitedIndex>>,
 }
@@ -148,6 +151,8 @@ impl SourceFacts {
             ts_field_declarations: Mutex::new(HashMap::new()),
             js_get_state_file: OnceLock::new(),
             js_selector_names: OnceLock::new(),
+            literal_properties: Mutex::new(HashMap::new()),
+            literal_binding_targets: Mutex::new(HashMap::new()),
             awaited_raw_names: OnceLock::new(),
             awaited_index: OnceLock::new(),
         }
@@ -251,6 +256,56 @@ impl SourceFacts {
         scan: impl FnOnce(&str) -> HashSet<String>,
     ) -> &HashSet<String> {
         self.js_selector_names.get_or_init(|| scan(&self.source))
+    }
+
+    /// Memoised own property of the object literal `container_id` (defined in
+    /// this file) for `member`; `compute` runs at most once per key.
+    pub(crate) fn literal_property(
+        &self,
+        container_id: &str,
+        member: &str,
+        compute: impl FnOnce(&Self) -> LiteralLookup,
+    ) -> LiteralLookup {
+        let key = (container_id.to_string(), member.to_string());
+        if let Some(known) = self
+            .literal_properties
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+        {
+            return known.clone();
+        }
+        let lookup = compute(self);
+        self.literal_properties
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key, lookup.clone());
+        lookup
+    }
+
+    /// Memoised target node id of an object-literal member's binding;
+    /// `compute` runs at most once per `(container, key)`.
+    pub(crate) fn literal_binding_target(
+        &self,
+        container_id: &str,
+        key: &str,
+        compute: impl FnOnce(&Self) -> Option<String>,
+    ) -> Option<String> {
+        let key = (container_id.to_string(), key.to_string());
+        if let Some(known) = self
+            .literal_binding_targets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+        {
+            return known.clone();
+        }
+        let target = compute(self);
+        self.literal_binding_targets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key, target.clone());
+        target
     }
 
     /// Names the raw source binds as `const x = await f(`; `scan` runs once.

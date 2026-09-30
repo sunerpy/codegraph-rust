@@ -25,6 +25,7 @@ pub mod import_resolver;
 mod js_store;
 pub mod lru_cache;
 pub mod name_matcher;
+mod object_literal;
 pub mod path_aliases;
 pub mod pathutil;
 pub mod resolver;
