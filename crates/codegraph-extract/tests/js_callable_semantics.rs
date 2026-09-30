@@ -231,3 +231,59 @@ export class Vault {
         assert_eq!(shape(file, language), expected, "{file}");
     }
 }
+
+#[test]
+fn curried_wrapper_object_members_are_named_by_their_key() {
+    // Upstream #1747 follow-up: an Effect service is usually an object a
+    // factory returns, so the wrapper's result lands in a `pair`.
+    let result = extract(
+        "src/m.ts",
+        r#"
+declare const Effect: { fn: (n: string) => (b: unknown) => unknown };
+declare function wrap(n: string): (c: unknown) => unknown;
+declare function useMemo<T>(f: () => T, d: unknown[]): T;
+
+function helper() { return 1; }
+
+function make() {
+  return {
+    getMode: Effect.fn("ACP.Session.getMode")(function* (id: string) { return helper(); }),
+    'quotedKey': wrap("n")(() => { return helper(); }),
+    computed: useMemo(() => 1 + 1, []),
+    mapped: [1, 2].map((x) => x + 1),
+  };
+}
+
+const service = {
+  run: Effect.fn("Service.run")(function* () { return helper(); }),
+  plain: () => helper(),
+};
+
+export const mixed = {
+  direct: () => helper(),
+  wrapped: Effect.fn("Mixed.wrapped")(function* () { return helper(); }),
+};
+"#,
+        Language::TypeScript,
+    );
+    let names = function_names(&result);
+    for expected in ["getMode", "quotedKey", "run", "wrapped"] {
+        assert!(names.contains(&expected), "missing {expected}; {names:?}");
+    }
+    assert!(
+        !names.contains(&"computed") && !names.contains(&"mapped"),
+        "{names:?}"
+    );
+    // Neither path may mint a member twice.
+    for once in ["run", "wrapped", "plain"] {
+        assert_eq!(
+            names.iter().filter(|name| **name == once).count(),
+            1,
+            "{once}: {names:?}"
+        );
+    }
+    let get_mode = node(&result, NodeKind::Function, "getMode");
+    assert!(calls_from(&result, &get_mode.id).contains(&"helper"));
+    let make = node(&result, NodeKind::Function, "make");
+    assert!(!calls_from(&result, &make.id).contains(&"helper"));
+}

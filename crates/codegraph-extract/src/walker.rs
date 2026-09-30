@@ -2572,9 +2572,11 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     }
 
     /// The declarator name for a function passed to the second application of
-    /// a curried wrapper (`const NAME = factory(...)(function () { ... })`).
-    /// Requiring the callee itself to be a call keeps single-call computations
-    /// such as `useMemo` and `array.map` anonymous.
+    /// a curried wrapper (`const NAME = factory(...)(function () { ... })`), or
+    /// the property key when the call is an object member (`{ NAME:
+    /// factory(...)(fn) }`, #1747). Requiring the callee itself to be a call
+    /// keeps single-call computations such as `useMemo` and `array.map`
+    /// anonymous.
     fn curried_wrapper_bound_name(&self, node: SyntaxNode<'tree>) -> Option<String> {
         if !matches!(
             self.spec.language(),
@@ -2599,11 +2601,22 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         {
             return None;
         }
-        let declarator = call.parent()?;
-        if declarator.kind() != "variable_declarator" {
+        let binder = call.parent()?;
+        if binder.kind() == "pair" {
+            // A service is often an object a factory returns, so the wrapper's
+            // result lands in a `pair`; its key names the member, as it does
+            // for `key: () => {}`.
+            let value = child_by_field(binder, "value")?;
+            if value.start_byte() != call.start_byte() || value.end_byte() != call.end_byte() {
+                return None;
+            }
+            let key = child_by_field(binder, "key")?;
+            return js_object_member_name(key, self.source);
+        }
+        if binder.kind() != "variable_declarator" {
             return None;
         }
-        let name = child_by_field(declarator, "name")?;
+        let name = child_by_field(binder, "name")?;
         (name.kind() == "identifier").then(|| node_text(name, self.source))
     }
 
@@ -3143,6 +3156,17 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             let Some(value) = child_by_field(member, "value") else {
                 continue;
             };
+            if value.kind() == "call_expression" {
+                // `key: Effect.fn("…")(function* () {…})` — see
+                // `curried_wrapper_bound_name` (#1747).
+                if let Some(function) = child_by_field(value, "arguments")
+                    .and_then(|arguments| arguments.named_child(0))
+                    && let Some(bound) = self.curried_wrapper_bound_name(function)
+                {
+                    self.extract_function(function, Some(bound));
+                }
+                continue;
+            }
             if !matches!(
                 value.kind(),
                 "arrow_function" | "function_expression" | "generator_function"
