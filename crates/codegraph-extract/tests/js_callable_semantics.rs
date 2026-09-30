@@ -190,3 +190,44 @@ handlers.onSave = () => { findItems(); };
     assert!(calls_from(&result, &delete.id).contains(&"removeItem"));
     assert!(!function_names(&result).contains(&"onSave"));
 }
+
+#[test]
+fn tsx_and_jsx_class_fields_are_modelled_like_their_base_language() {
+    // TSX and JSX run the TypeScript/JavaScript extractors (upstream
+    // `languages/index.ts`); a plain field is a property there, only a
+    // function-valued field is a method.
+    let source = r#"
+class Cart {}
+export class Vault {
+  items = new Cart();
+  #secret = 1;
+  handle = () => { run(); };
+  run() {}
+}
+"#;
+    let shape = |file: &str, language: Language| {
+        let mut members = extract(file, source, language)
+            .nodes
+            .into_iter()
+            .filter(|node| node.qualified_name.starts_with("Vault::"))
+            .map(|node| (node.name, node.kind))
+            .collect::<Vec<_>>();
+        members.sort_by(|a, b| a.0.cmp(&b.0));
+        members
+    };
+    // JS names a field by its `property` child (upstream #808).
+    let expected = vec![
+        ("#secret".to_string(), NodeKind::Property),
+        ("handle".to_string(), NodeKind::Method),
+        ("items".to_string(), NodeKind::Property),
+        ("run".to_string(), NodeKind::Method),
+    ];
+    for (file, language) in [
+        ("vault.ts", Language::TypeScript),
+        ("vault.tsx", Language::Tsx),
+        ("vault.js", Language::JavaScript),
+        ("vault.jsx", Language::Jsx),
+    ] {
+        assert_eq!(shape(file, language), expected, "{file}");
+    }
+}

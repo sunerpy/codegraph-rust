@@ -33,6 +33,9 @@ impl LanguageSpec for JsxSpec {
     fn method_types(&self) -> &'static [&'static str] {
         JAVASCRIPT_SPEC.method_types()
     }
+    fn class_member_is_method(&self, node: Node<'_>, source: &str) -> bool {
+        JAVASCRIPT_SPEC.class_member_is_method(node, source)
+    }
     fn interface_types(&self) -> &'static [&'static str] {
         &[]
     }
@@ -59,6 +62,9 @@ impl LanguageSpec for JsxSpec {
     }
     fn name_field(&self) -> &'static str {
         JAVASCRIPT_SPEC.name_field()
+    }
+    fn resolve_name(&self, node: Node<'_>, source: &str) -> Option<String> {
+        JAVASCRIPT_SPEC.resolve_name(node, source)
     }
     fn body_field(&self) -> &'static str {
         JAVASCRIPT_SPEC.body_field()

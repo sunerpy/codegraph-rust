@@ -106,6 +106,15 @@ pub struct LocalBindingSites {
     pub arrows: Vec<usize>,
 }
 
+/// The declared type of a TS/JS class field, read off the class's own lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TsFieldDeclaration {
+    /// `field: typeof Value` — the type OF a value (an object-literal namespace).
+    pub value_type: bool,
+    /// The declared or constructed type as spelled (`ns.Mailer`, `Mailer`).
+    pub type_name: String,
+}
+
 /// Lazily derived, memoised facts about one file's source text.
 #[derive(Debug)]
 pub struct SourceFacts {
@@ -117,6 +126,7 @@ pub struct SourceFacts {
     js_binding_sites: OnceLock<LocalBindingSites>,
     js_local_bindings: Mutex<HashMap<String, bool>>,
     node_decisions: Mutex<HashMap<(&'static str, String), bool>>,
+    ts_field_declarations: Mutex<HashMap<(String, String), Option<TsFieldDeclaration>>>,
     awaited_raw_names: OnceLock<HashSet<String>>,
     awaited_index: OnceLock<Arc<AwaitedIndex>>,
 }
@@ -133,6 +143,7 @@ impl SourceFacts {
             js_binding_sites: OnceLock::new(),
             js_local_bindings: Mutex::new(HashMap::new()),
             node_decisions: Mutex::new(HashMap::new()),
+            ts_field_declarations: Mutex::new(HashMap::new()),
             awaited_raw_names: OnceLock::new(),
             awaited_index: OnceLock::new(),
         }
@@ -264,6 +275,31 @@ impl SourceFacts {
             .insert(key, decision);
         decision
     }
+
+    /// Memoised declaration of `field` on the class `owner_id` defined in this
+    /// file; `compute` runs at most once per `(owner, field)`.
+    pub fn ts_field_declaration(
+        &self,
+        owner_id: &str,
+        field: &str,
+        compute: impl FnOnce(&Self) -> Option<TsFieldDeclaration>,
+    ) -> Option<TsFieldDeclaration> {
+        let key = (owner_id.to_string(), field.to_string());
+        if let Some(known) = self
+            .ts_field_declarations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+        {
+            return known.clone();
+        }
+        let declaration = compute(self);
+        self.ts_field_declarations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key, declaration.clone());
+        declaration
+    }
 }
 
 /// Offsets of `\b(?:kw1|kw2|…)\s` matches: a keyword preceded by a non-word
@@ -391,6 +427,34 @@ mod tests {
         assert!(facts.node_decision("c_static", "function:1", |_| true));
         assert!(facts.node_decision("c_static", "function:1", |_| unreachable!("memoised")));
         assert!(!facts.node_decision("rust_trait", "function:1", |_| false));
+    }
+
+    #[test]
+    fn ts_field_declarations_are_computed_once_per_owner_and_field() {
+        let facts = SourceFacts::new(Arc::from("class A { #m = new M(); }\n"));
+        let declared = TsFieldDeclaration {
+            value_type: false,
+            type_name: "M".to_string(),
+        };
+        let mut runs = 0;
+        let mut compute = |_: &SourceFacts| {
+            runs += 1;
+            Some(declared.clone())
+        };
+        assert_eq!(
+            facts.ts_field_declaration("class:1", "#m", &mut compute),
+            Some(declared.clone())
+        );
+        assert_eq!(
+            facts.ts_field_declaration("class:1", "#m", |_| unreachable!("memoised")),
+            Some(declared)
+        );
+        assert_eq!(facts.ts_field_declaration("class:1", "m", |_| None), None);
+        assert_eq!(
+            facts.ts_field_declaration("class:1", "m", |_| unreachable!("memoised")),
+            None
+        );
+        assert_eq!(runs, 1);
     }
 
     #[test]

@@ -71,13 +71,43 @@ fn is_scoped_chain_language(language: Language) -> bool {
     language == Language::Rust
 }
 
-fn is_js_call_result_chain(reference: &RefView) -> bool {
+/// A TS/JS/Python call whose receiver is itself a call, encoded
+/// `<inner>().<method>` (#1683): nothing proves what the inner call returns.
+fn is_call_result_chain(reference: &RefView) -> bool {
+    reference.reference_kind == EdgeKind::Calls
+        && matches!(
+            reference.language,
+            Language::TypeScript
+                | Language::Tsx
+                | Language::JavaScript
+                | Language::Jsx
+                | Language::Python
+        )
+        && reference.reference_name.contains("().")
+}
+
+/// A retained untyped TS/JS member chain — `holder.values.get`, three or more
+/// plain segments not rooted at `this`/`window` (upstream v1.6.1
+/// `isUnresolvedJsMemberCall`, #1862). It is call-site evidence, not
+/// permission to infer a property type: only a framework resolver may bind it.
+fn is_unresolved_js_member_call(reference: &RefView) -> bool {
+    fn is_segment(segment: &str) -> bool {
+        let mut chars = segment.chars();
+        chars
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic() || matches!(ch, '_' | '$'))
+            && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$'))
+    }
+    let name = reference.reference_name.as_str();
     reference.reference_kind == EdgeKind::Calls
         && matches!(
             reference.language,
             Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx
         )
-        && reference.reference_name.contains("().")
+        && !name.starts_with("this.")
+        && !name.starts_with("window.")
+        && name.split('.').count() >= 3
+        && name.split('.').all(is_segment)
 }
 
 /// The extractor's chained-receiver encoding `<inner>().<method>`
@@ -1743,14 +1773,14 @@ impl ReferenceResolver {
         } else {
             &reference.reference_name
         };
-        let js_call_result_chain = is_js_call_result_chain(reference);
+        let call_result_chain = is_call_result_chain(reference);
         if !self.has_any_possible_match_for(existence_name, reference.language)
             && !self.matches_any_import(reference, context)
             && !self
                 .framework_resolver_extensions
                 .iter()
                 .any(|f| f.claims_reference(&reference.reference_name))
-            && !js_call_result_chain
+            && !call_result_chain
         {
             return (None, None);
         }
@@ -1817,8 +1847,10 @@ impl ReferenceResolver {
 
         // An imported root in `make().run()` does not prove what `make`
         // returns. Preserve any framework result, but never let import or
-        // unique-name heuristics guess the result type (#1683).
-        if js_call_result_chain {
+        // unique-name heuristics guess the result type (#1683). A retained
+        // untyped member chain is the same kind of evidence: importing its
+        // root does not make the root its call target (#1862).
+        if call_result_chain || is_unresolved_js_member_call(reference) {
             return (candidates.into_iter().reduce(highest_confidence), None);
         }
 

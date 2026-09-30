@@ -31,6 +31,12 @@ impl LanguageSpec for TsxSpec {
     fn method_types(&self) -> &'static [&'static str] {
         TYPESCRIPT_SPEC.method_types()
     }
+    fn property_types(&self) -> &'static [&'static str] {
+        TYPESCRIPT_SPEC.property_types()
+    }
+    fn class_member_is_method(&self, node: Node<'_>, source: &str) -> bool {
+        TYPESCRIPT_SPEC.class_member_is_method(node, source)
+    }
     fn interface_types(&self) -> &'static [&'static str] {
         TYPESCRIPT_SPEC.interface_types()
     }

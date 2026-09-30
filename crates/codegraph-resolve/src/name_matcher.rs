@@ -5,7 +5,7 @@
 //! cross-language family gate — mirror the upstream exactly. Every strategy cites its
 //! upstream source range.
 
-use crate::source_facts::SourceFacts;
+use crate::source_facts::{SourceFacts, TsFieldDeclaration};
 use crate::strip_comments::{CommentLang, strip_comments_for_regex};
 use crate::types::{
     RefView, ResolutionContext, ResolvedBy, ResolvedRef, declares_type_name, is_esm_language,
@@ -398,6 +398,120 @@ fn is_js_family(language: Language) -> bool {
         language,
         Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx
     )
+}
+
+/// Method names that require receiver evidence before a JS/TS call links to
+/// project code (`JS_BUILTIN_METHODS`, upstream v1.6.1 #1987): Array / typed
+/// array and collection, String, Promise, Function, EventTarget /
+/// EventEmitter and iterator methods. Sorted for binary search.
+const JS_BUILTIN_METHODS: [&str; 103] = [
+    "add",
+    "addEventListener",
+    "addListener",
+    "apply",
+    "at",
+    "bind",
+    "call",
+    "catch",
+    "charAt",
+    "charCodeAt",
+    "clear",
+    "codePointAt",
+    "concat",
+    "copyWithin",
+    "delete",
+    "dispatchEvent",
+    "drop",
+    "emit",
+    "endsWith",
+    "entries",
+    "eventNames",
+    "every",
+    "fill",
+    "filter",
+    "finally",
+    "find",
+    "findIndex",
+    "findLast",
+    "findLastIndex",
+    "flat",
+    "flatMap",
+    "forEach",
+    "get",
+    "getMaxListeners",
+    "has",
+    "includes",
+    "indexOf",
+    "join",
+    "keys",
+    "lastIndexOf",
+    "listenerCount",
+    "listeners",
+    "localeCompare",
+    "map",
+    "match",
+    "matchAll",
+    "next",
+    "normalize",
+    "off",
+    "on",
+    "once",
+    "padEnd",
+    "padStart",
+    "pop",
+    "prependListener",
+    "prependOnceListener",
+    "push",
+    "rawListeners",
+    "reduce",
+    "reduceRight",
+    "removeAllListeners",
+    "removeEventListener",
+    "removeListener",
+    "repeat",
+    "replace",
+    "replaceAll",
+    "return",
+    "reverse",
+    "search",
+    "set",
+    "setMaxListeners",
+    "shift",
+    "slice",
+    "some",
+    "sort",
+    "splice",
+    "split",
+    "startsWith",
+    "subarray",
+    "substr",
+    "substring",
+    "take",
+    "then",
+    "throw",
+    "toArray",
+    "toLocaleLowerCase",
+    "toLocaleString",
+    "toLocaleUpperCase",
+    "toLowerCase",
+    "toReversed",
+    "toSorted",
+    "toSpliced",
+    "toString",
+    "toUpperCase",
+    "trim",
+    "trimEnd",
+    "trimLeft",
+    "trimRight",
+    "trimStart",
+    "unshift",
+    "valueOf",
+    "values",
+    "with",
+];
+
+fn is_js_builtin_method(name: &str) -> bool {
+    JS_BUILTIN_METHODS.binary_search(&name).is_ok()
 }
 
 /// Languages whose file boundary follows ESM-style import/export semantics.
@@ -1812,14 +1926,16 @@ fn infer_class_field_receiver_type(
 
 /// Resolve a JS/TS `this.<field>.<method>()` exclusively through the field's
 /// declaration on the enclosing class. Unproven/builtin/ambiguous types remain
-/// unresolved rather than falling through to receiver-name heuristics.
+/// unresolved rather than falling through to receiver-name heuristics. An ES
+/// private field (`#items`) is a name of its own: it never reads a public
+/// `items` declaration, nor the reverse (#1987).
 fn match_ts_this_field_call(
     field: &str,
     method_name: &str,
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> Option<ResolvedRef> {
-    if field.is_empty() || field.contains('.') || !is_word(field) {
+    if !is_ts_field_name(field) {
         return None;
     }
     let caller = context.get_node_by_id_shared(&reference.from_node_id)?;
@@ -1839,109 +1955,203 @@ fn match_ts_this_field_call(
         return None;
     }
     let owner = &owners[0];
-    let source = context.read_file(&owner.file_path)?;
-    let code = strip_comments_for_regex(&source, CommentLang::TypeScript);
-    let lines: Vec<&str> = code.lines().collect();
-    let start = owner.start_line.saturating_sub(1) as usize;
-    let end = (owner.end_line.max(owner.start_line) as usize).min(lines.len());
-    if start >= end {
+    let facts = context.source_facts(&owner.file_path)?;
+    let declaration = facts.ts_field_declaration(&owner.id, field, |facts| {
+        scan_ts_field_declaration(facts, owner, field, context)
+    })?;
+
+    if declaration.value_type {
+        let value_name = declaration.type_name.rsplit('.').next().unwrap_or_default();
+        let holders = prefer_call_site_file(
+            context.get_nodes_by_name_shared(value_name),
+            &reference.file_path,
+        );
+        for holder in holders.into_iter().filter(|node| {
+            matches!(node.kind, NodeKind::Constant | NodeKind::Variable)
+                && same_language_family(node.language, reference.language)
+        }) {
+            if let Some(resolved) = resolve_object_literal_member(
+                &holder,
+                method_name,
+                reference,
+                context,
+                0.85,
+                ResolvedBy::InstanceMethod,
+            ) {
+                return Some(resolved);
+            }
+        }
         return None;
     }
-    let escaped = regex_escape(field);
-    let typeof_pattern = Regex::new(&format!(
-        r"\b{escaped}\b\s*[?!]?\s*:\s*(?:readonly\s+)?typeof\s+([A-Za-z_$][\w.$]*)"
-    ))
-    .ok()?;
-    let declared_pattern = Regex::new(&format!(
-        r"\b{escaped}\b\s*[?!]?\s*:\s*(?:readonly\s+)?([A-Za-z_$][\w.$]*)"
-    ))
-    .ok()?;
-    let initialized_pattern =
-        Regex::new(&format!(r"\b{escaped}\b\s*=\s*new\s+([A-Za-z_$][\w.$]*)")).ok()?;
-    let parameter_property = Regex::new(&format!(
-        r"\b(?:public|protected|private|readonly)(?:\s+(?:public|protected|private|readonly))*\s+{escaped}\b"
-    ))
-    .ok()?;
+
+    let type_name = declaration.type_name.rsplit('.').next().unwrap_or_default();
+    if !type_name
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_uppercase())
+    {
+        return None;
+    }
+    resolve_method_on_type(
+        type_name,
+        method_name,
+        reference,
+        context,
+        0.85,
+        ResolvedBy::InstanceMethod,
+        None,
+        0,
+    )
+}
+
+/// A public (`mailer`) or ES private (`#mailer`) class field name.
+fn is_ts_field_name(field: &str) -> bool {
+    match field.strip_prefix('#') {
+        Some(private) => {
+            !private.is_empty()
+                && private
+                    .chars()
+                    .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '$'))
+        }
+        None => is_word(field),
+    }
+}
+
+/// `this.#field.method` → (`#field`, `method`): upstream's
+/// `/^this\.(#[\w$]+)\.(\w+)$/` (#1987).
+fn split_private_this_field_call(name: &str) -> Option<(&str, &str)> {
+    let (field, method) = name.strip_prefix("this.")?.split_once('.')?;
+    (field.starts_with('#') && is_ts_field_name(field) && is_word(method))
+        .then_some((field, method))
+}
+
+/// The first declaration of `field` on the enclosing class's own lines of the
+/// comment-free source. Inside a method body only a `this.<field>` assignment
+/// counts (`this.mailer = new Mailer()` in a constructor) — a method-local
+/// parameter or variable of the same name is not the field — while a
+/// constructor's parameter properties (`constructor(private mailer: Mailer)`)
+/// read like class-level declarations.
+fn scan_ts_field_declaration(
+    facts: &SourceFacts,
+    owner: &Node,
+    field: &str,
+    context: &dyn ResolutionContext,
+) -> Option<TsFieldDeclaration> {
+    let member_prefix = format!("{}::", owner.qualified_name);
     let owner_members = context
         .get_nodes_in_file_shared(&owner.file_path)
         .into_iter()
         .filter(|node| {
             matches!(node.kind, NodeKind::Method | NodeKind::Function)
-                && node
-                    .qualified_name
-                    .starts_with(&format!("{owner_qualified}::"))
+                && node.qualified_name.starts_with(&member_prefix)
         })
         .collect::<Vec<_>>();
-
-    for (offset, line) in lines[start..end].iter().enumerate() {
-        if line.len() > 10_000 {
+    let (code, lines) = facts.ts_comment_free();
+    let start = owner.start_line.saturating_sub(1) as usize;
+    let end = (owner.end_line.max(owner.start_line) as usize).min(lines.line_count());
+    for index in start..end {
+        let line = lines.line(code, index);
+        // Every declaration pattern spells the field literally.
+        if line.len() > 10_000 || !line.contains(field) {
             continue;
         }
-        let source_line = (start + offset + 1) as i64;
-        if let Some(member) = owner_members.iter().find(|member| {
-            source_line >= member.start_line
-                && source_line <= member.end_line.max(member.start_line)
-        }) && !(member.name == "constructor" && parameter_property.is_match(line))
-        {
-            // A method-local parameter or variable is not a `this` field.
-            continue;
-        }
-        if let Some(value_name) = typeof_pattern
-            .captures(line)
-            .and_then(|captures| captures.get(1))
-            .map(|capture| capture.as_str().rsplit('.').next().unwrap_or_default())
-        {
-            let holders = prefer_call_site_file(
-                context.get_nodes_by_name_shared(value_name),
-                &reference.file_path,
-            );
-            for holder in holders.into_iter().filter(|node| {
-                matches!(node.kind, NodeKind::Constant | NodeKind::Variable)
-                    && same_language_family(node.language, reference.language)
-            }) {
-                if let Some(resolved) = resolve_object_literal_member(
-                    &holder,
-                    method_name,
-                    reference,
-                    context,
-                    0.85,
-                    ResolvedBy::InstanceMethod,
-                ) {
-                    return Some(resolved);
-                }
-            }
-            return None;
-        }
-
-        let type_name = declared_pattern
-            .captures(line)
-            .and_then(|captures| captures.get(1))
-            .or_else(|| {
-                initialized_pattern
-                    .captures(line)
-                    .and_then(|captures| captures.get(1))
+        let source_line = (index + 1) as i64;
+        let this_only = owner_members
+            .iter()
+            .find(|member| {
+                source_line >= member.start_line
+                    && source_line <= member.end_line.max(member.start_line)
             })
-            .map(|capture| capture.as_str().rsplit('.').next().unwrap_or_default());
-        let Some(type_name) = type_name else { continue };
-        if !type_name
-            .chars()
-            .next()
-            .is_some_and(|first| first.is_ascii_uppercase())
-        {
-            return None;
+            .is_some_and(|member| {
+                !(member.name == "constructor" && declares_parameter_property(line, field))
+            });
+        if let Some(declaration) = ts_field_on_line(line, field, this_only) {
+            return Some(declaration);
         }
-        return resolve_method_on_type(
-            type_name,
-            method_name,
-            reference,
-            context,
-            0.85,
-            ResolvedBy::InstanceMethod,
-            None,
-            0,
-        );
     }
     None
+}
+
+/// The declaration patterns, tried in order after a whole-token occurrence of
+/// the field: `field: typeof Value` (the type OF a value — tried first, or the
+/// declared-type pattern would capture the word `typeof`), a declared type
+/// `field?: Mailer` (the capture stops at `<`, `[` or `|`, so a generic or
+/// union yields its head), and an initializer `field = new Mailer()`.
+fn ts_field_patterns() -> &'static [(Regex, bool); 3] {
+    static PATTERNS: OnceLock<[(Regex, bool); 3]> = OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        [
+            (
+                Regex::new(r"^\s*[?!]?\s*:\s*(?:readonly\s+)?typeof\s+([A-Za-z_$][\w.$]*)")
+                    .expect("typeof field pattern"),
+                true,
+            ),
+            (
+                Regex::new(r"^\s*[?!]?\s*:\s*(?:readonly\s+)?([A-Za-z_$][\w.$]*)")
+                    .expect("declared field pattern"),
+                false,
+            ),
+            (
+                Regex::new(r"^\s*=\s*new\s+([A-Za-z_$][\w.$]*)")
+                    .expect("initialized field pattern"),
+                false,
+            ),
+        ]
+    })
+}
+
+/// The first declaration of `field` on one line, pattern by pattern as the
+/// upstream field regexes would find it. The field must be a whole `[\w$#]`
+/// token — the `(?<![\w$#])` lookbehind of upstream v1.6.1 — so a public
+/// `items` never matches `#items` (#1987); with `this_only`, it must also be
+/// written `this.<field>`. KEEP-RUST: a field ending in `$` (`users$`) is a
+/// whole token too, where upstream's trailing `\b` rejects it.
+fn ts_field_on_line(line: &str, field: &str, this_only: bool) -> Option<TsFieldDeclaration> {
+    let is_token = |ch: char| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '#');
+    let ends = line
+        .match_indices(field)
+        .filter(|(at, _)| {
+            let before = &line[..*at];
+            !before.chars().next_back().is_some_and(is_token)
+                && !line[at + field.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(is_token)
+                && (!this_only
+                    || before
+                        .strip_suffix("this.")
+                        .is_some_and(|rest| !rest.chars().next_back().is_some_and(is_token)))
+        })
+        .map(|(at, _)| at + field.len())
+        .collect::<Vec<_>>();
+    ts_field_patterns()
+        .iter()
+        .find_map(|(pattern, value_type)| {
+            ends.iter().find_map(|&end| {
+                pattern
+                    .captures(&line[end..])
+                    .and_then(|captures| captures.get(1))
+                    .map(|capture| TsFieldDeclaration {
+                        value_type: *value_type,
+                        type_name: capture.as_str().to_string(),
+                    })
+            })
+        })
+}
+
+/// Whether a constructor line declares `field` as a parameter property
+/// (`private readonly mailer: Mailer`). A private name is never one.
+fn declares_parameter_property(line: &str, field: &str) -> bool {
+    static PARAMETER_PROPERTY: OnceLock<Regex> = OnceLock::new();
+    PARAMETER_PROPERTY
+        .get_or_init(|| {
+            Regex::new(
+                r"\b(?:public|protected|private|readonly)(?:\s+(?:public|protected|private|readonly))*\s+([\w$]+)",
+            )
+            .expect("parameter property pattern")
+        })
+        .captures_iter(line)
+        .any(|captures| captures.get(1).is_some_and(|name| name.as_str() == field))
 }
 
 /// Is the inferred receiver type `type_name` BOUND at the call site (#1566)?
@@ -2212,6 +2422,16 @@ pub fn match_method_call(
         }
     }
 
+    // A TS/JS call through an ES private field of the enclosing class —
+    // `this.#items.add()`, emitted as `this.#items.add` (#1987) — resolves
+    // exactly like `this.<field>` below (#1496). `#` is outside the dotted
+    // receiver grammar, so the shape is matched here.
+    if is_js_family(reference.language)
+        && let Some((field, method)) = split_private_this_field_call(&reference.reference_name)
+    {
+        return match_ts_this_field_call(field, method, reference, context);
+    }
+
     let parsed = parse_method_call(&reference.reference_name, reference.language)?;
     let (object_or_class, method_name) = parsed;
 
@@ -2425,6 +2645,18 @@ pub fn match_method_call(
                 });
             }
         }
+    }
+
+    // Built-in method names need a validated receiver (#1987). Typed, imported,
+    // object-literal and direct class receivers have had their chance above;
+    // capitalization, word overlap or a unique method name are not evidence
+    // that `list.map()` / `cache.get()` calls a project class.
+    if reference.reference_kind == EdgeKind::Calls
+        && is_js_family(reference.language)
+        && !matches!(object_or_class.as_str(), "this" | "super")
+        && is_js_builtin_method(&method_name)
+    {
+        return None;
     }
 
     // Strategy 2: instance-variable receiver → capitalized class
@@ -3524,10 +3756,12 @@ pub fn match_reference(
         }
     }
 
-    // A JS/TS call-result receiver carries no proven result type. It stays
-    // unresolved instead of degrading to a global same-named callable (#1683).
+    // A JS/TS/Python call-result receiver carries no proven result type. It
+    // stays unresolved instead of degrading to a global same-named callable:
+    // the fuzzy strategy would split `make().run` on `.` and hand it to any
+    // `run` (#1683).
     if reference.reference_kind == EdgeKind::Calls
-        && is_js_family(reference.language)
+        && (is_js_family(reference.language) || reference.language == Language::Python)
         && reference.reference_name.contains("().")
     {
         return None;
@@ -4686,6 +4920,93 @@ mod tests {
         assert!(is_word("abc_1"));
         assert!(!is_word(""));
         assert!(!is_word("a b"));
+    }
+
+    #[test]
+    fn js_builtin_methods_are_sorted_for_binary_search() {
+        assert!(JS_BUILTIN_METHODS.windows(2).all(|pair| pair[0] < pair[1]));
+        for name in ["map", "get", "then", "addEventListener", "return", "with"] {
+            assert!(is_js_builtin_method(name), "{name}");
+        }
+        for name in ["send", "run", "Map", "mapAll"] {
+            assert!(!is_js_builtin_method(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn private_this_field_calls_split_only_the_exact_shape() {
+        assert_eq!(
+            split_private_this_field_call("this.#items.add"),
+            Some(("#items", "add"))
+        );
+        assert_eq!(
+            split_private_this_field_call("this.#$store.get"),
+            Some(("#$store", "get"))
+        );
+        for name in [
+            "this.items.add",
+            "this.#.add",
+            "this.#items",
+            "this.#a.b.c",
+            "that.#items.add",
+            "this.#items.a-b",
+        ] {
+            assert_eq!(split_private_this_field_call(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn ts_field_declarations_keep_public_and_private_names_apart() {
+        let declared = |line: &str, field: &str, this_only: bool| {
+            ts_field_on_line(line, field, this_only)
+                .map(|found| (found.value_type, found.type_name))
+        };
+        assert_eq!(
+            declared("  #items = new Set<string>();", "#items", false),
+            Some((false, "Set".to_string()))
+        );
+        assert_eq!(declared("  #items = new Set();", "items", false), None);
+        assert_eq!(declared("  items = new Cart();", "#items", false), None);
+        assert_eq!(
+            declared("  private readonly mailer?: ns.Mailer;", "mailer", false),
+            Some((false, "ns.Mailer".to_string()))
+        );
+        assert_eq!(
+            declared("  storage: typeof DraftHubStorage;", "storage", false),
+            Some((true, "DraftHubStorage".to_string()))
+        );
+        assert_eq!(declared("  mailerX: Decoy;", "mailer", false), None);
+        assert_eq!(
+            declared("  users$: Observable<User>;", "users$", false),
+            Some((false, "Observable".to_string()))
+        );
+        // Inside a method body only a `this.<field>` assignment counts.
+        assert_eq!(
+            declared(
+                "  constructor() { this.mailer = new Mailer(); }",
+                "mailer",
+                true
+            ),
+            Some((false, "Mailer".to_string()))
+        );
+        assert_eq!(
+            declared("  run() { const mailer = new Decoy(); }", "mailer", true),
+            None
+        );
+        assert_eq!(
+            declared("  run() { xthis.mailer = new Decoy(); }", "mailer", true),
+            None
+        );
+    }
+
+    #[test]
+    fn parameter_properties_need_a_modifier_before_the_exact_name() {
+        let line = "  constructor(private readonly mailer: Mailer, other: X, public items: Y) {}";
+        assert!(declares_parameter_property(line, "mailer"));
+        assert!(declares_parameter_property(line, "items"));
+        assert!(!declares_parameter_property(line, "other"));
+        assert!(!declares_parameter_property(line, "mail"));
+        assert!(!declares_parameter_property(line, "#mailer"));
     }
 
     #[test]

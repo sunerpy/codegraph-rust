@@ -641,14 +641,13 @@ class Panel {
     assert_node(&result.nodes, NodeKind::Class, "Panel");
     let load = assert_node(&result.nodes, NodeKind::Function, "load");
     assert!(load.is_async, "load should be async");
-    // An arrow assigned to a class field is a method whose name is anonymous
-    // in this grammar (the identifier lives outside the arrow_function node).
+    // An arrow assigned to a class field is a method named by the field's
+    // `property` key; a plain field is a property (upstream #808).
+    assert_node(&result.nodes, NodeKind::Method, "handler");
+    assert_node(&result.nodes, NodeKind::Property, "value");
     assert!(
-        result
-            .nodes
-            .iter()
-            .any(|n| n.kind == NodeKind::Method && n.name == "<anonymous>"),
-        "arrow field should yield an anonymous method; nodes={:#?}",
+        !result.nodes.iter().any(|n| n.name == "<anonymous>"),
+        "no class field may stay anonymous; nodes={:#?}",
         result.nodes
     );
     assert_ref(&result.unresolved_references, EdgeKind::Calls, "fetchData");

@@ -154,6 +154,111 @@ fn is_js_identifier(segment: &str) -> bool {
         && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$'))
 }
 
+/// Languages whose member calls go through the TS/JS grammars
+/// (`TS_JS_CHAIN_LANGUAGES`, upstream v1.6.1).
+fn is_ts_js_chain_language(language: Language) -> bool {
+    matches!(
+        language,
+        Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx
+    )
+}
+
+/// Receiver kinds (TS/JS grammars) that continue a member chain downward.
+fn is_ts_js_chain_receiver(node: SyntaxNode<'_>) -> bool {
+    matches!(node.kind(), "member_expression" | "subscript_expression")
+}
+
+/// TS/JS wrappers that leave a member call's receiver the same object:
+/// `(x).m()`, `x!.m()`, `(x as T).m()`, `(x satisfies T).m()`, `(<T>x).m()`
+/// and `(await x).m()` all call `m` on what `x` holds.
+const TS_JS_TRANSPARENT_RECEIVER_KINDS: [&str; 6] = [
+    "parenthesized_expression",
+    "non_null_expression",
+    "as_expression",
+    "satisfies_expression",
+    "type_assertion",
+    "await_expression",
+];
+
+/// Strip [`TS_JS_TRANSPARENT_RECEIVER_KINDS`] wrappers off a receiver.
+/// tree-sitter-typescript parses `a && b!.c()` as `(a && b)!.c()`; the `!`
+/// belongs to the right operand, so a non-null over a binary expression peels
+/// to that operand.
+fn peel_ts_js_receiver(node: SyntaxNode<'_>) -> SyntaxNode<'_> {
+    let mut current = node;
+    while TS_JS_TRANSPARENT_RECEIVER_KINDS.contains(&current.kind()) {
+        let mut inner = if current.kind() == "type_assertion" {
+            u32::try_from(current.named_child_count())
+                .ok()
+                .and_then(|count| count.checked_sub(1))
+                .and_then(|last| current.named_child(last))
+        } else {
+            current.named_child(0)
+        };
+        if current.kind() == "non_null_expression" {
+            while let Some(binary) = inner.filter(|inner| inner.kind() == "binary_expression") {
+                inner = child_by_field(binary, "right");
+            }
+        }
+        let Some(inner) = inner else {
+            break;
+        };
+        current = inner;
+    }
+    current
+}
+
+/// Identifier-rooted TS/JS member chains have no inferred property type
+/// (upstream #1566), host API chains included (#1707). The `window.MyNs`
+/// project-global escape stays outside; call-result and `this` receivers have
+/// their own paths.
+fn is_unresolved_ts_js_chain(node: SyntaxNode<'_>, source: &str) -> bool {
+    let mut current = Some(node);
+    while let Some(link) = current.filter(|link| is_ts_js_chain_receiver(*link)) {
+        current = child_by_field(link, "object");
+    }
+    current.is_some_and(|root| root.kind() == "identifier" && node_text(root, source) != "window")
+}
+
+/// The root of a TS/JS receiver chain, looking through
+/// [`peel_ts_js_receiver`] wrappers at every hop.
+fn ts_js_chain_root(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
+    let mut current = Some(node);
+    while let Some(link) = current.filter(|link| is_ts_js_chain_receiver(*link)) {
+        current = child_by_field(link, "object").map(peel_ts_js_receiver);
+    }
+    current
+}
+
+/// Whether a TS/JS receiver still collapses to the bare method name: `this` /
+/// `super` (resolution reads the owner off the enclosing class), a member
+/// chain rooted at either or at `window` (the project-global escape of
+/// [`is_unresolved_ts_js_chain`]), and `new C()` (its class is written at the
+/// call).
+fn keeps_bare_ts_js_receiver(node: SyntaxNode<'_>, source: &str) -> bool {
+    let Some(root) = ts_js_chain_root(node) else {
+        return false;
+    };
+    match root.kind() {
+        "this" | "super" => true,
+        "identifier" => node_text(root, source) == "window",
+        kind => root.id() == node.id() && kind == "new_expression",
+    }
+}
+
+/// A retained untyped TS/JS chain (`holder.values.get`): at least three plain
+/// identifier segments, whitespace removed and `?.` read as `.`.
+fn plain_ts_js_chain(text: &str) -> Option<String> {
+    let chain = text
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>()
+        .replace("?.", ".");
+    let segments = chain.split('.').collect::<Vec<_>>();
+    (segments.len() >= 3 && segments.iter().all(|segment| is_js_identifier(segment)))
+        .then_some(chain)
+}
+
 /// Deterministic logical recursion bound for the native AST walker.
 ///
 /// Tree-sitter parses deeply nested input iteratively, but this walker descends
@@ -3636,10 +3741,22 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             if is_member_shaped_callee(func) {
                 if let Some(property) = member_name_of(func) {
                     let method_name = node_text(property, self.source);
+                    let ts_js = is_ts_js_chain_language(self.spec.language());
+                    // TS/JS: look through wrappers that keep the receiver the
+                    // same object (`(x).m()`, `x!.m()`, `(x as T).m()`,
+                    // `(await f()).m()`), so the branches below see the
+                    // identifier / call / chain the call is really made on.
                     let receiver = child_by_field(func, "object")
                         .or_else(|| child_by_field(func, "operand"))
                         .or_else(|| child_by_field(func, "argument"))
-                        .or_else(|| func.named_child(0));
+                        .or_else(|| func.named_child(0))
+                        .map(|receiver| {
+                            if ts_js {
+                                peel_ts_js_receiver(receiver)
+                            } else {
+                                receiver
+                            }
+                        });
                     if let Some(receiver) = receiver {
                         if is_literal_receiver(receiver) {
                             return;
@@ -3695,18 +3812,16 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                             } else {
                                 method_name
                             };
-                        } else if receiver.kind() == "call_expression"
-                            && matches!(
-                                self.spec.language(),
-                                Language::TypeScript
-                                    | Language::Tsx
-                                    | Language::JavaScript
-                                    | Language::Jsx
-                            )
+                        } else if (ts_js && receiver.kind() == "call_expression")
+                            || (self.spec.language() == Language::Python
+                                && receiver.kind() == "call")
                         {
                             // Keep a simple inner callee so resolution can
                             // reject an untyped call-result receiver instead of
-                            // degrading it to a bare same-named callable.
+                            // degrading it to a bare same-named callable —
+                            // `make().run()`, `d.setdefault(k, []).append(v)`
+                            // (#1683). An inner callee that is not a plain name
+                            // or member chain has no static receiver at all.
                             let Some(inner) = self.plain_js_inner_callee(receiver) else {
                                 return;
                             };
@@ -3741,25 +3856,64 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                                 }
                                 _ => method_name,
                             };
-                        } else if matches!(
-                            self.spec.language(),
-                            Language::TypeScript
-                                | Language::Tsx
-                                | Language::JavaScript
-                                | Language::Jsx
-                        ) && let Some(field) = self.js_this_field_of(receiver)
-                        {
+                        } else if ts_js && let Some(field) = self.js_this_field_of(receiver) {
                             // `this.field.method()` is an exclusive typed-field
                             // path; keeping `this` prevents name heuristics from
-                            // guessing an unrelated method.
+                            // guessing an unrelated method. An ES private field
+                            // (`this.#items.add()`) is the same shape and keeps
+                            // its `#` (#1987).
                             callee_name = format!("this.{field}.{method_name}");
+                        } else if ts_js
+                            && is_ts_js_chain_receiver(receiver)
+                            && is_unresolved_ts_js_chain(receiver, self.source)
+                        {
+                            // Keep the source call for effect reporting, but never
+                            // collapse it to a guessed method: resolution lets
+                            // only frameworks with receiver evidence handle these
+                            // qualified chains (upstream #1862).
+                            let Some(chain) = plain_ts_js_chain(&node_text(func, self.source))
+                            else {
+                                return;
+                            };
+                            callee_name = chain;
+                        } else if ts_js && !keeps_bare_ts_js_receiver(receiver, self.source) {
+                            // Any other TS/JS receiver is an expression with no
+                            // static type here — `(a ?? b).map()`,
+                            // `f().list.map()`, `arr[0].run()`,
+                            // `(() => {}).call()`. The bare method name would
+                            // exact-match whichever project method shares it.
+                            // Emit nothing: a silent miss, never a wrong edge
+                            // (upstream #1986).
+                            return;
+                        } else if ts_js {
+                            // `super.m()`, `window.Ns.m()` and `new C().m()`:
+                            // the owner is read off the enclosing class, the
+                            // project global, or the call itself. KEEP-RUST: a
+                            // member chain rooted at `this`/`super` through more
+                            // than one field (`this.a.b.m()`) keeps its last
+                            // segment (#1496) instead of upstream v1.6.1's bare
+                            // name, which would let the name matcher bind the
+                            // enclosing class's same-named method — the very
+                            // self-edge #1496 removed.
+                            let owner_segment = (receiver.kind() == "member_expression"
+                                && ts_js_chain_root(receiver)
+                                    .is_some_and(|root| matches!(root.kind(), "this" | "super")))
+                            .then(|| member_name_of(receiver))
+                            .flatten()
+                            .map(|segment| node_text(segment, self.source))
+                            .filter(|segment| is_plain_receiver_segment(segment));
+                            callee_name = match owner_segment {
+                                Some(segment) => format!("{segment}.{method_name}"),
+                                None => method_name,
+                            };
                         } else if is_member_shaped_callee(receiver) {
-                            // #1496 — a receiver that is itself member-shaped
-                            // (`this.mailer`, `holder.values`, `a.b.c`) keeps its
-                            // LAST segment, so the ref arrives as `obj.method`.
+                            // #1496 — outside TS/JS (handled above), a receiver
+                            // that is itself member-shaped (`self.mailer`,
+                            // `holder.values`, `a.b.c`) keeps its LAST segment,
+                            // so the ref arrives as `obj.method`.
                             // Dropping it would leave resolution unable to
-                            // separate `this.run()` (self-target correct) from
-                            // `this.mailer.send()` (self-target wrong), and a bare
+                            // separate `self.run()` (self-target correct) from
+                            // `self.mailer.send()` (self-target wrong), and a bare
                             // `send` then binds to whichever same-named method is
                             // nearest the call line. One segment, not the full
                             // chain: that is the receiver grammar the name matcher
@@ -3812,7 +3966,12 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
         let object = child_by_field(receiver, "object")?;
         let property = child_by_field(receiver, "property")?;
-        if object.kind() != "this" || property.kind() != "property_identifier" {
+        if object.kind() != "this"
+            || !matches!(
+                property.kind(),
+                "property_identifier" | "private_property_identifier"
+            )
+        {
             return None;
         }
         Some(node_text(property, self.source))

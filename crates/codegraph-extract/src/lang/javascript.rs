@@ -43,6 +43,16 @@ impl LanguageSpec for JavaScriptSpec {
         crate::lang::typescript::class_field_is_callable(node, "field_definition")
     }
 
+    fn resolve_name(&self, node: Node<'_>, source: &str) -> Option<String> {
+        // JS `field_definition` names its key the `property` field (TS's
+        // `public_field_definition` uses `name`); without this every JS class
+        // field, handler fields included, is `<anonymous>` (upstream #808).
+        if node.kind() == "field_definition" {
+            return child_by_field(node, "property").map(|property| node_text(property, source));
+        }
+        None
+    }
+
     fn interface_types(&self) -> &'static [&'static str] {
         &[]
     }
