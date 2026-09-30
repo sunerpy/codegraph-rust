@@ -1619,12 +1619,21 @@ pub fn resolve_via_import(
                 .reference_name
                 .starts_with(&format!("{}.", imp.local_name))
         {
-            if let Some(resolved_path) = resolve_import_path(
+            // Named Python imports need the same absolute-module lookup as
+            // namespace imports, including aliases used as receiver types
+            // (upstream #1820).
+            let resolved_path = resolve_import_path(
                 &imp.source,
                 &reference.file_path,
                 reference.language,
                 context,
-            ) {
+            )
+            .or_else(|| {
+                (reference.language == Language::Python)
+                    .then(|| find_python_module_file(&imp.source, context, &reference.file_path))
+                    .flatten()
+            });
+            if let Some(resolved_path) = resolved_path {
                 let exported_name = if imp.is_default {
                     "default".to_string()
                 } else {
@@ -1640,6 +1649,27 @@ pub fn resolve_via_import(
                     None
                 };
 
+                let python_symbol = |name: &str| {
+                    // Python symbols are never marked exported; a named import
+                    // names the module's own top-level definition (#1820).
+                    context
+                        .get_nodes_in_file_shared(&resolved_path)
+                        .into_iter()
+                        .find(|node| {
+                            node.name == name
+                                && !node.qualified_name.contains("::")
+                                && matches!(
+                                    node.kind,
+                                    NodeKind::Class
+                                        | NodeKind::Function
+                                        | NodeKind::Variable
+                                        | NodeKind::Constant
+                                )
+                        })
+                        .map(|node| node.as_ref().clone())
+                };
+                let wanted_python_name =
+                    member_name.clone().unwrap_or_else(|| exported_name.clone());
                 if let Some(target_node) = find_exported_symbol(
                     &resolved_path,
                     &Want {
@@ -1652,7 +1682,12 @@ pub fn resolve_via_import(
                     context,
                     &mut BTreeSet::new(),
                     0,
-                ) {
+                )
+                .or_else(|| {
+                    (reference.language == Language::Python)
+                        .then(|| python_symbol(&wanted_python_name))
+                        .flatten()
+                }) {
                     // `Foo.bar()` on a NAMED class import resolves the receiver to the
                     // class container; descend to the static member so the edge stays a
                     // `calls`/etc. to `method:bar` rather than mislinking to the class
@@ -1694,9 +1729,27 @@ pub fn resolve_via_import(
                             return Some(instance_member);
                         }
                     }
+                    let member_access = !imp.is_namespace
+                        && reference
+                            .reference_name
+                            .starts_with(&format!("{}.", imp.local_name));
                     let resolved_target = if !imp.is_namespace {
-                        resolve_static_member(&target_node, reference, &imp.local_name, context)
-                            .unwrap_or(target_node)
+                        match resolve_static_member(
+                            &target_node,
+                            reference,
+                            &imp.local_name,
+                            context,
+                        ) {
+                            Some(member) => member,
+                            // Finding a named Python import proves the receiver
+                            // exists, not its requested attribute: `task.delay()`
+                            // enqueues work, it does not call the task function.
+                            // Keep unknown members unresolved (upstream #2040).
+                            None if member_access && reference.language == Language::Python => {
+                                return None;
+                            }
+                            None => target_node,
+                        }
                     } else {
                         target_node
                     };
