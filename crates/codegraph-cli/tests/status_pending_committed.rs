@@ -61,8 +61,33 @@ impl Drop for Project {
     }
 }
 
+/// Repository-locating variables (`git rev-parse --local-env-vars`). Git
+/// exports them to hooks, so a test run from `pre-push` would otherwise commit
+/// its throwaway fixture into the repository being pushed.
+const GIT_LOCAL_ENV: &[&str] = &[
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+];
+
 fn git(root: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    for name in GIT_LOCAL_ENV {
+        command.env_remove(name);
+    }
+    let output = command
         .args(args)
         .current_dir(root)
         .output()

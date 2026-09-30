@@ -4,5 +4,11 @@
 set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
+# Git hands hooks the repository-locating environment (GIT_DIR, GIT_INDEX_FILE,
+# ...). Tests create throwaway repositories; inheriting these variables would
+# point their commits at THIS repository, so clear them before the gate.
+for name in $(git rev-parse --local-env-vars); do
+    unset "$name"
+done
 echo "==> [pre-push] make pre-ci"
 exec make pre-ci
