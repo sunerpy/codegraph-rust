@@ -265,7 +265,7 @@
   },
   {
     "decorators": null,
-    "docstring": null,
+    "docstring": "Package marker for module-alias resolution fixtures.",
     "end_column": 0,
     "end_line": 2,
     "file_path": "pkg/__init__.py",

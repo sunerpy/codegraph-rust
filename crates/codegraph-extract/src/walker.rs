@@ -907,7 +907,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             ),
             None => crate::lang::erlang_clause_header(first, self.source),
         };
-        let docstring = self.preceding_docstring(spec.unwrap_or(node));
+        let docstring = self.docstring_for(spec.unwrap_or(node));
         let exports = crate::lang::erlang_module_exports(self.root, self.source);
         let is_exported = exports.contains(&name, arity);
         let qualified_name = format!("{}/{}", self.build_qualified_name(&name), arity);
@@ -953,7 +953,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             .chars()
             .take(300)
             .collect();
-        let docstring = self.preceding_docstring(node);
+        let docstring = self.docstring_for(node);
         let Some(rec) = self.create_node(
             NodeKind::Struct,
             &name,
@@ -2257,7 +2257,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             end_line: self.source.split('\n').count() as i64,
             start_column: 0,
             end_column: 0,
-            docstring: None,
+            docstring: self.spec.body_docstring(self.root, self.source),
             signature: None,
             visibility: None,
             is_exported: false,
@@ -2451,7 +2451,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             &name,
             node,
             NodeExtra {
-                docstring: self.preceding_docstring(node),
+                docstring: self.docstring_for(node),
                 signature: self.spec.get_signature(node, self.source),
                 visibility: self.spec.get_visibility(node),
                 is_exported: common_js_export || self.spec.is_exported(node, self.source),
@@ -2648,7 +2648,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             &name,
             node,
             NodeExtra {
-                docstring: self.preceding_docstring(node),
+                docstring: self.docstring_for(node),
                 visibility: self.spec.get_visibility(node),
                 is_exported: self.spec.is_exported(node, self.source),
                 ..NodeExtra::default()
@@ -2692,7 +2692,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             &name,
             node,
             NodeExtra {
-                docstring: self.preceding_docstring(node),
+                docstring: self.docstring_for(node),
                 visibility: self.spec.get_visibility(node),
                 is_exported: self.spec.is_exported(node, self.source),
                 ..NodeExtra::default()
@@ -2740,7 +2740,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             &name,
             node,
             NodeExtra {
-                docstring: self.preceding_docstring(node),
+                docstring: self.docstring_for(node),
                 signature: self.spec.get_signature(node, self.source),
                 visibility: self.spec.get_visibility(node),
                 is_async: self.spec.is_async(node),
@@ -2803,7 +2803,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             &name,
             node,
             NodeExtra {
-                docstring: self.preceding_docstring(node),
+                docstring: self.docstring_for(node),
                 is_exported: self.spec.is_exported(node, self.source),
                 ..NodeExtra::default()
             },
@@ -2828,7 +2828,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             &name,
             node,
             NodeExtra {
-                docstring: self.preceding_docstring(node),
+                docstring: self.docstring_for(node),
                 visibility: self.spec.get_visibility(node),
                 is_exported: self.spec.is_exported(node, self.source),
                 ..NodeExtra::default()
@@ -2922,7 +2922,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             &name,
             node,
             NodeExtra {
-                docstring: self.preceding_docstring(node),
+                docstring: self.docstring_for(node),
                 is_exported: self.spec.is_exported(node, self.source),
                 ..NodeExtra::default()
             },
@@ -3014,7 +3014,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                     &node_text(name_node, self.source),
                     node,
                     NodeExtra {
-                        docstring: self.preceding_docstring(node),
+                        docstring: self.docstring_for(node),
                         ..NodeExtra::default()
                     },
                 );
@@ -3032,7 +3032,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         } else {
             NodeKind::Variable
         };
-        let docstring = self.preceding_docstring(node);
+        let docstring = self.docstring_for(node);
         let is_exported = self.spec.is_exported(node, self.source);
 
         for i in 0..node.named_child_count() {
@@ -3258,7 +3258,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         let values: Vec<_> = expression_list
             .map(|list| list.named_children(&mut list.walk()).collect())
             .unwrap_or_default();
-        let docstring = self.preceding_docstring(node);
+        let docstring = self.docstring_for(node);
 
         for (index, target_node) in targets.into_iter().enumerate() {
             let Some((name, receiver, full_name)) = self.lua_assignment_target(target_node) else {
@@ -4899,6 +4899,21 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             is_function_ref: false,
             reference_subkind: None,
         });
+    }
+
+    /// The node's prose from both places it can live — a preceding comment and
+    /// a docstring inside the body — joined when both are present: they are
+    /// two things the author wrote about the same symbol (upstream
+    /// `docstringFor`, #1905).
+    fn docstring_for(&self, node: SyntaxNode<'tree>) -> Option<String> {
+        let preceding = self
+            .preceding_docstring(node)
+            .filter(|text| !text.is_empty());
+        let body = self.spec.body_docstring(node, self.source);
+        match (preceding, body) {
+            (Some(preceding), Some(body)) => Some(format!("{preceding}\n\n{body}")),
+            (preceding, body) => body.or(preceding),
+        }
     }
 
     fn preceding_docstring(&self, node: SyntaxNode<'tree>) -> Option<String> {

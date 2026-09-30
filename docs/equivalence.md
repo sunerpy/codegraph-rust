@@ -302,6 +302,10 @@ ImportedAlias` preserves member-import semantics: both the import statement and
 Missing/duplicate/ambiguous module aliases remain unresolved, and a claimed
 module alias never falls through to global bare-name matching.
 
+Since extraction version 14 the `pkg/__init__.py` file node carries its module
+docstring (upstream #1905): a bare string literal first in a module, class or
+function body is that node's docstring, joined after any preceding comment.
+
 Regenerate the committed database and canonical artifacts from a clean corpus:
 
 ```bash
