@@ -555,3 +555,68 @@ export class Consumer {
         "an undeclared receiver must remain unresolved"
     );
 }
+
+/// `(target kind, target name)` of every `implements` edge out of class `name`.
+fn implements_targets(project: &Project, name: &str) -> Vec<(NodeKind, String)> {
+    let store = project.store.as_ref().expect("store");
+    let source = node_id(project, NodeKind::Class, name);
+    store
+        .edges_by_source_kind(&source, Some(EdgeKind::Implements))
+        .expect("implements")
+        .into_iter()
+        .filter_map(|edge| store.node_by_id(&edge.target).expect("target query"))
+        .map(|node| (node.kind, node.name))
+        .collect()
+}
+
+#[test]
+fn implements_binds_the_interface_of_a_value_and_interface_pair() {
+    // VS Code declares every service twice under one name: the DI identifier
+    // value and the interface (upstream #2055).
+    let value = "export const IFooService = createDecorator<IFooService>('fooService');\n";
+    let interface = "export interface IFooService {\n  run(): void;\n}\n";
+    for first_is_value in [true, false] {
+        let foo = format!(
+            "import {{ createDecorator }} from './instantiation';\n\n{}",
+            if first_is_value {
+                format!("{value}{interface}")
+            } else {
+                format!("{interface}{value}")
+            }
+        );
+        let project = resolve_project(
+            "value-interface-pair",
+            &[
+                (
+                    "src/instantiation.ts",
+                    "export function createDecorator<T>(id: string): { id: string } { return { id }; }\n",
+                ),
+                ("src/foo.ts", &foo),
+                (
+                    "src/fooService.ts",
+                    "import { IFooService } from './foo';\n\nexport class FooService implements IFooService {\n  run(): void {}\n}\n",
+                ),
+            ],
+        );
+        assert_eq!(
+            implements_targets(&project, "FooService"),
+            vec![(NodeKind::Interface, "IFooService".to_string())],
+            "value first: {first_is_value}"
+        );
+    }
+}
+
+#[test]
+fn implements_whose_only_same_named_target_is_a_value_is_dropped() {
+    let project = resolve_project(
+        "value-only-implements",
+        &[
+            ("src/foo.ts", "export const IBarService = { id: 'bar' };\n"),
+            (
+                "src/barService.ts",
+                "import { IBarService } from './foo';\n\nexport class BarService implements IBarService {\n  id = 'bar';\n}\n",
+            ),
+        ],
+    );
+    assert!(implements_targets(&project, "BarService").is_empty());
+}

@@ -1097,6 +1097,28 @@ fn c_family_static_function_is_file_local(
     })
 }
 
+/// The one inheritance-eligible node a TypeScript value shares its name and
+/// file with (`sameNamedTypeOfValue`, upstream #2055).
+fn same_named_type_of_value(value: &Node, context: &dyn ResolutionContext) -> Option<Arc<Node>> {
+    if !matches!(value.kind, NodeKind::Constant | NodeKind::Variable)
+        || !matches!(value.language, Language::TypeScript | Language::Tsx)
+    {
+        return None;
+    }
+    let types: Vec<Arc<Node>> = context
+        .get_nodes_in_file_shared(&value.file_path)
+        .into_iter()
+        .filter(|node| {
+            node.name == value.name
+                && crate::types::node_is_eligible_target(EdgeKind::Implements, node)
+        })
+        .collect();
+    let [type_node] = types.as_slice() else {
+        return None;
+    };
+    Some(Arc::clone(type_node))
+}
+
 fn rust_module_dir(file_path: &str) -> String {
     let normalized = file_path.replace('\\', "/");
     let dir = crate::pathutil::dirname(&normalized);
@@ -1670,10 +1692,21 @@ impl ReferenceResolver {
             return Some(result);
         };
         if crate::types::node_is_eligible_target(reference.reference_kind, &target) {
-            Some(result)
-        } else {
-            None
+            return Some(result);
         }
+        // One exception: a TypeScript VALUE sharing its name with a type in the
+        // same file (`export const IFoo = createDecorator<IFoo>('foo')` beside
+        // `export interface IFoo`, VS Code's service idiom). The strategy found
+        // the right file and name; the type declared there is the supertype, so
+        // the edge moves to it instead of being dropped (upstream #2055).
+        if crate::types::is_inheritance_ref(reference.reference_kind)
+            && let Some(type_node) = same_named_type_of_value(&target, context)
+        {
+            let mut moved = result;
+            moved.target_node_id = type_node.id.clone();
+            return Some(moved);
+        }
+        None
     }
 
     fn resolve_one_pure_inner(
