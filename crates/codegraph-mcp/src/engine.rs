@@ -2037,27 +2037,35 @@ impl CodeGraphEngine {
                 if range_cost(start_idx, end_idx) <= room {
                     return (vec![(start_idx, end_idx)], false);
                 }
-                let head_room = if focuses.is_empty() {
-                    room
-                } else {
-                    room * 60 / 100
-                };
-                let mut windows: Vec<(usize, usize)> =
-                    vec![grow_head(start_idx, end_idx, head_room)];
-                if !focuses.is_empty() {
-                    // Even shares with carry-forward, never greedy: upstream measured
-                    // that a greedy split let an early focus eat the whole reserve and
-                    // re-lose the target. One integer division, so the same input
-                    // cannot drift by a char across platforms.
-                    let reserve = room - head_room;
-                    let base = reserve / focuses.len();
-                    let mut carry = reserve - base * focuses.len();
-                    for &line in focuses {
-                        let allot = base + carry;
-                        let w = grow_around(line.saturating_sub(1), start_idx, end_idx, allot);
-                        carry = allot.saturating_sub(range_cost(w.0, w.1));
-                        windows.push(w);
-                    }
+                // Upstream `windowToCeiling` (CG-38): the whole room goes to the
+                // head first, and 40% of it is held back for focus windows only
+                // when that head leaves a focus uncovered — then only the focuses
+                // the smaller head misses take a share of it.
+                let full = grow_head(start_idx, end_idx, room);
+                let covers = |w: (usize, usize), line: usize| line > w.0 && line <= w.1;
+                if focuses.iter().all(|&line| covers(full, line)) {
+                    return (vec![full], full != (start_idx, end_idx));
+                }
+                let head_room = room * 60 / 100;
+                let head = grow_head(start_idx, end_idx, head_room);
+                let pending: Vec<usize> = focuses
+                    .iter()
+                    .copied()
+                    .filter(|&line| !covers(head, line))
+                    .collect();
+                let mut windows: Vec<(usize, usize)> = vec![head];
+                // Even shares with carry-forward, never greedy: upstream measured
+                // that a greedy split let an early focus eat the whole reserve and
+                // re-lose the target. One integer division, so the same input
+                // cannot drift by a char across platforms.
+                let reserve = room - head_room;
+                let base = reserve / pending.len();
+                let mut carry = reserve - base * pending.len();
+                for &line in &pending {
+                    let allot = base + carry;
+                    let w = grow_around(line.saturating_sub(1), start_idx, end_idx, allot);
+                    carry = allot.saturating_sub(range_cost(w.0, w.1));
+                    windows.push(w);
                 }
                 windows.sort_unstable();
                 let mut merged: Vec<(usize, usize)> = Vec::new();
@@ -6107,6 +6115,35 @@ mod tests {
                 "named body line {line} missing: {emitted:?}"
             );
         }
+    }
+
+    /// CG-38, as upstream's `windowToCeiling` has it: the whole room goes to a
+    /// windowed cluster's head first, so a focus the head already covers costs
+    /// the head nothing — it used to hold 40% of the room back for a window on
+    /// a line the head showed anyway.
+    #[test]
+    fn a_focus_the_head_already_covers_costs_the_head_nothing() {
+        let engine = test_engine();
+        let file = "god.ts";
+        let owned: Vec<String> = (1..=600)
+            .map(|i| format!("  // padding line {i} inside hugeHandler keeping the body enormous"))
+            .collect();
+        let file_lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let huge = node("hugeHandler", file, 1, 600, NodeKind::Function);
+        let sg = subgraph_with(vec![huge.clone()], vec![huge.id.clone()]);
+        let budget = crate::explore_budget::get_explore_output_budget(200);
+        let render = |focuses: &[usize]| {
+            engine
+                .render_explore_file(
+                    &sg,
+                    file,
+                    &file_lines,
+                    "typescript",
+                    &render_ctx(&budget, focuses),
+                )
+                .section
+        };
+        assert_eq!(render(&[1]), render(&[]));
     }
 
     /// #2063: two exact targets in different clusters of one file. The one
