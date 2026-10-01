@@ -1732,6 +1732,7 @@ impl CodeGraphEngine {
                 current.end = current.end.max(r.end);
                 current.symbols.push(r.label.clone());
                 current.members.push(r.member.clone());
+                current.spans.push((r.start, r.end, r.importance));
                 current.score += r.importance;
                 current.max_importance = current.max_importance.max(r.importance);
             } else {
@@ -1907,6 +1908,94 @@ impl CodeGraphEngine {
         let ceiling = ((budget.max_chars_per_file as f64 * 1.5).round() as usize)
             .min(ctx.funded_headroom)
             .saturating_sub(section_frame);
+        // A member the query asked for — a root or a protected focus — rather
+        // than incidental context that merely sits within `gap_threshold` of one
+        // (#2062).
+        let is_protected = |importance: u32| importance >= 10;
+        // Member ranges re-merged in source order and padded into windows, so
+        // adjacent survivors read as one block.
+        let member_windows = |spans: &[(usize, usize)]| -> Vec<(usize, usize)> {
+            let mut sorted = spans.to_vec();
+            sorted.sort_unstable();
+            let mut merged: Vec<(usize, usize)> = Vec::new();
+            for (start, end) in sorted {
+                match merged.last_mut() {
+                    Some(last) if start <= last.1 + budget.gap_threshold => {
+                        last.1 = last.1.max(end);
+                    }
+                    _ => merged.push((start, end)),
+                }
+            }
+            let mut windows: Vec<(usize, usize)> = Vec::new();
+            for (start, end) in merged {
+                let hi = (end + CONTEXT_PADDING).min(total_lines);
+                let lo = start
+                    .saturating_sub(1)
+                    .saturating_sub(CONTEXT_PADDING)
+                    .min(hi);
+                match windows.last_mut() {
+                    Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
+                    _ => windows.push((lo, hi)),
+                }
+            }
+            windows
+        };
+        // What a cluster's protected members cost on their own — the room a
+        // cluster ranked ABOVE it must leave for them. 0 without any.
+        let protected_core_cost = |c: &Cluster| -> usize {
+            let core = c
+                .spans
+                .iter()
+                .filter(|s| is_protected(s.2))
+                .map(|s| (s.0, s.1))
+                .collect::<Vec<_>>();
+            if core.is_empty() {
+                0
+            } else {
+                bare_len(&member_windows(&core)) + GAP_MARKER.len()
+            }
+        };
+        // The cluster's protected members always, then its incidental members
+        // (most important, smallest, earliest first) while the windows still fit
+        // `cap`. `None` when every member fits, or when the protected core alone
+        // overruns `room` and the ordinary windowing has to cut it.
+        let shrink_to_members =
+            |c: &Cluster, room: usize, cap: usize| -> Option<Vec<(usize, usize)>> {
+                if c.spans.len() < 2 {
+                    return None;
+                }
+                let mut order = c.spans.clone();
+                order.sort_by(|a, b| {
+                    is_protected(b.2)
+                        .cmp(&is_protected(a.2))
+                        .then(b.2.cmp(&a.2))
+                        .then((a.1 - a.0).cmp(&(b.1 - b.0)))
+                        .then(a.0.cmp(&b.0))
+                });
+                let mut kept: Vec<(usize, usize)> = Vec::new();
+                for span in &order {
+                    let mut candidate = kept.clone();
+                    candidate.push((span.0, span.1));
+                    let cost = bare_len(&member_windows(&candidate));
+                    if kept.is_empty() || is_protected(span.2) {
+                        if cost > room {
+                            return None;
+                        }
+                        kept = candidate;
+                    } else if cost <= cap.min(room) {
+                        kept = candidate;
+                    }
+                }
+                (kept.len() < c.spans.len()).then(|| member_windows(&kept))
+            };
+        // What the protected members of every cluster ranked below position `p`
+        // cost. Rank orders clusters, not members, and density counts every
+        // member, so a named function packed with helpers can outrank a named
+        // function alone and spend the file's room on the helpers (#2062).
+        let mut owed_from = vec![0usize; ranked.len() + 1];
+        for p in (0..ranked.len()).rev() {
+            owed_from[p] = owed_from[p + 1] + protected_core_cost(&clusters[ranked[p]]);
+        }
         // Per-cluster render state lives in a Vec indexed parallel to `clusters`,
         // never in a HashSet that is then iterated: emission order must come from
         // the index, not from hash order, or the output stops being byte-stable.
@@ -1914,10 +2003,33 @@ impl CodeGraphEngine {
         let mut projected = 0usize;
         let mut chosen_count = 0usize;
         let mut any_cluster_windowed = false;
-        for &idx in &ranked {
+        // A cluster's incidental members may only use what is left once every
+        // lower-ranked cluster's protected members are paid for, and in a
+        // cluster holding a protected member they never take it past its room,
+        // so a window from the head no longer cuts a named body's tail. Its own
+        // protected members are never held back (#2062).
+        let guarded_render =
+            |c: &Cluster, room: usize, owed_below: usize| -> (Vec<(usize, usize)>, bool) {
+                let has_protected = c.spans.iter().any(|s| is_protected(s.2));
+                let cap = match (owed_below > 0, has_protected) {
+                    (true, _) => Some(room.saturating_sub(owed_below)),
+                    (false, true) => Some(room),
+                    (false, false) => None,
+                };
+                if let Some(cap) = cap {
+                    let (start_idx, end_idx) = span_of(c);
+                    if range_cost(start_idx, end_idx) > cap.min(room)
+                        && let Some(windows) = shrink_to_members(c, room, cap)
+                    {
+                        return (windows, true);
+                    }
+                }
+                window_cluster(c, room, &focuses_in(c))
+            };
+        for (rank, &idx) in ranked.iter().enumerate() {
+            let owed_below = owed_from[rank + 1];
             if chosen_count == 0 {
-                let (windows, windowed) =
-                    window_cluster(&clusters[idx], ceiling, &focuses_in(&clusters[idx]));
+                let (windows, windowed) = guarded_render(&clusters[idx], ceiling, owed_below);
                 projected += bare_len(&windows);
                 any_cluster_windowed |= windowed;
                 rendered_clusters[idx] = Some(windows);
@@ -1941,8 +2053,7 @@ impl CodeGraphEngine {
             if room < range_cost(start_idx, floor_end) {
                 continue;
             }
-            let (windows, windowed) =
-                window_cluster(&clusters[idx], room, &focuses_in(&clusters[idx]));
+            let (windows, windowed) = guarded_render(&clusters[idx], room, owed_below);
             any_cluster_windowed |= windowed;
             projected += bare_len(&windows) + GAP_MARKER.len();
             rendered_clusters[idx] = Some(windows);
@@ -3488,6 +3599,10 @@ struct Cluster {
     /// Every member's name, kind and definition line, so the header can name
     /// the ones a trim cut (#1711).
     members: Vec<ElidedSymbol>,
+    /// Every member's `(start, end, importance)` source range, 1-based, so a
+    /// cluster can render its protected members without its incidental ones
+    /// (#2062).
+    spans: Vec<(usize, usize, u32)>,
     score: u32,
     max_importance: u32,
 }
@@ -3499,6 +3614,7 @@ impl Cluster {
             end: r.end,
             symbols: vec![r.label.clone()],
             members: vec![r.member.clone()],
+            spans: vec![(r.start, r.end, r.importance)],
             score: r.importance,
             max_importance: r.importance,
         }
@@ -4982,6 +5098,55 @@ mod tests {
             explore_file_header("f.ts", &symbols, &elided_sorted, 3),
             "#### f.ts — beta(function), syncStateNow(method), alpha(function), +1 more"
         );
+    }
+
+    /// A named function packed with incidental helpers can outrank, by density,
+    /// a cluster holding a named function alone. Its helpers may then only use
+    /// what is left once the lower cluster's named body is paid for, so both
+    /// named bodies come back whole (upstream #2062).
+    #[test]
+    fn incidental_members_leave_room_for_a_lower_ranked_named_body() {
+        let engine = test_engine();
+        let file = "lib/response.ts";
+        let owned: Vec<String> = (1..=600)
+            .map(|i| format!("    const v{i} = step{i}(input); // line {i}"))
+            .collect();
+        let file_lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let send_file = node("sendFile", file, 10, 30, NodeKind::Function);
+        let send_body = node("sendBody", file, 300, 336, NodeKind::Function);
+        let mut nodes = vec![send_file.clone(), send_body.clone()];
+        for k in 0..40 {
+            let start = 32 + 3 * k;
+            nodes.push(node(
+                &format!("helper{k}"),
+                file,
+                start,
+                start + 1,
+                NodeKind::Function,
+            ));
+        }
+        let sg = subgraph_with(nodes, vec![send_file.id.clone(), send_body.id.clone()]);
+        let budget = crate::explore_budget::get_explore_output_budget(200);
+        let out = engine
+            .render_explore_file(
+                &sg,
+                file,
+                &file_lines,
+                "typescript",
+                &render_ctx(&budget, &[]),
+            )
+            .section;
+        let emitted = out
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .filter_map(|(n, _)| n.parse::<usize>().ok())
+            .collect::<std::collections::BTreeSet<_>>();
+        for line in (10..=30).chain(300..=336) {
+            assert!(
+                emitted.contains(&line),
+                "named body line {line} missing: {emitted:?}"
+            );
+        }
     }
 
     /// End to end: two rendered clusters with an index-only symbol between
