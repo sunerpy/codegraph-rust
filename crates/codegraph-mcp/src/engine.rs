@@ -1581,6 +1581,11 @@ impl CodeGraphEngine {
                     start,
                     end,
                     label: format!("{}({})", n.name, n.kind.as_str()),
+                    member: ElidedSymbol {
+                        name: n.name.clone(),
+                        kind: n.kind.as_str(),
+                        start_line: start,
+                    },
                     importance,
                 }
             })
@@ -1602,6 +1607,7 @@ impl CodeGraphEngine {
             if r.start <= current.end + budget.gap_threshold {
                 current.end = current.end.max(r.end);
                 current.symbols.push(r.label.clone());
+                current.members.push(r.member.clone());
                 current.score += r.importance;
                 current.max_importance = current.max_importance.max(r.importance);
             } else {
@@ -1699,47 +1705,52 @@ impl CodeGraphEngine {
         // instead of being taken whole (which then costs the entire file) or
         // skipped whole. Returns the rendered body and whether it was windowed,
         // so the caller can add the `... (gap) ...` honesty marker.
-        let window_cluster = |c: &Cluster, room: usize, focuses: &[usize]| -> (String, bool) {
-            let (start_idx, end_idx) = span_of(c);
-            if range_cost(start_idx, end_idx) <= room {
-                return (render_range(start_idx, end_idx), false);
-            }
-            let head_room = if focuses.is_empty() {
-                room
-            } else {
-                room * 60 / 100
+        let window_cluster =
+            |c: &Cluster, room: usize, focuses: &[usize]| -> (Vec<(usize, usize)>, bool) {
+                let (start_idx, end_idx) = span_of(c);
+                if range_cost(start_idx, end_idx) <= room {
+                    return (vec![(start_idx, end_idx)], false);
+                }
+                let head_room = if focuses.is_empty() {
+                    room
+                } else {
+                    room * 60 / 100
+                };
+                let mut windows: Vec<(usize, usize)> =
+                    vec![grow_head(start_idx, end_idx, head_room)];
+                if !focuses.is_empty() {
+                    // Even shares with carry-forward, never greedy: upstream measured
+                    // that a greedy split let an early focus eat the whole reserve and
+                    // re-lose the target. One integer division, so the same input
+                    // cannot drift by a char across platforms.
+                    let reserve = room - head_room;
+                    let base = reserve / focuses.len();
+                    let mut carry = reserve - base * focuses.len();
+                    for &line in focuses {
+                        let allot = base + carry;
+                        let w = grow_around(line.saturating_sub(1), start_idx, end_idx, allot);
+                        carry = allot.saturating_sub(range_cost(w.0, w.1));
+                        windows.push(w);
+                    }
+                }
+                windows.sort_unstable();
+                let mut merged: Vec<(usize, usize)> = Vec::new();
+                for w in windows {
+                    match merged.last_mut() {
+                        Some(last) if w.0 <= last.1 => last.1 = last.1.max(w.1),
+                        _ => merged.push(w),
+                    }
+                }
+                let covers_all = merged.len() == 1 && merged[0] == (start_idx, end_idx);
+                (merged, !covers_all)
             };
-            let mut windows: Vec<(usize, usize)> = vec![grow_head(start_idx, end_idx, head_room)];
-            if !focuses.is_empty() {
-                // Even shares with carry-forward, never greedy: upstream measured
-                // that a greedy split let an early focus eat the whole reserve and
-                // re-lose the target. One integer division, so the same input
-                // cannot drift by a char across platforms.
-                let reserve = room - head_room;
-                let base = reserve / focuses.len();
-                let mut carry = reserve - base * focuses.len();
-                for &line in focuses {
-                    let allot = base + carry;
-                    let w = grow_around(line.saturating_sub(1), start_idx, end_idx, allot);
-                    carry = allot.saturating_sub(range_cost(w.0, w.1));
-                    windows.push(w);
-                }
-            }
-            windows.sort_unstable();
-            let mut merged: Vec<(usize, usize)> = Vec::new();
-            for w in windows {
-                match merged.last_mut() {
-                    Some(last) if w.0 <= last.1 => last.1 = last.1.max(w.1),
-                    _ => merged.push(w),
-                }
-            }
-            let covers_all = merged.len() == 1 && merged[0] == (start_idx, end_idx);
-            let body = merged
+        // What windows cost with bare gap markers, the price selection uses.
+        let bare_len = |windows: &[(usize, usize)]| -> usize {
+            windows
                 .iter()
-                .map(|&(lo, hi)| render_range(lo, hi))
-                .collect::<Vec<_>>()
-                .join(GAP_MARKER);
-            (body, !covers_all)
+                .map(|&(lo, hi)| range_cost(lo, hi))
+                .sum::<usize>()
+                + GAP_MARKER.len() * windows.len().saturating_sub(1)
         };
 
         // Rank clusters: entry-point importance first, then density, then span
@@ -1775,17 +1786,17 @@ impl CodeGraphEngine {
         // Per-cluster render state lives in a Vec indexed parallel to `clusters`,
         // never in a HashSet that is then iterated: emission order must come from
         // the index, not from hash order, or the output stops being byte-stable.
-        let mut rendered_clusters: Vec<Option<String>> = vec![None; clusters.len()];
+        let mut rendered_clusters: Vec<Option<Vec<(usize, usize)>>> = vec![None; clusters.len()];
         let mut projected = 0usize;
         let mut chosen_count = 0usize;
         let mut any_cluster_windowed = false;
         for &idx in &ranked {
             if chosen_count == 0 {
-                let (body, windowed) =
+                let (windows, windowed) =
                     window_cluster(&clusters[idx], ceiling, &focuses_in(&clusters[idx]));
-                projected += body.len();
+                projected += bare_len(&windows);
                 any_cluster_windowed |= windowed;
-                rendered_clusters[idx] = Some(body);
+                rendered_clusters[idx] = Some(windows);
                 chosen_count += 1;
                 continue;
             }
@@ -1806,31 +1817,59 @@ impl CodeGraphEngine {
             if room < range_cost(start_idx, floor_end) {
                 continue;
             }
-            let (body, windowed) =
+            let (windows, windowed) =
                 window_cluster(&clusters[idx], room, &focuses_in(&clusters[idx]));
             any_cluster_windowed |= windowed;
-            projected += body.len() + GAP_MARKER.len();
-            rendered_clusters[idx] = Some(body);
+            projected += bare_len(&windows) + GAP_MARKER.len();
+            rendered_clusters[idx] = Some(windows);
             chosen_count += 1;
         }
 
-        let mut file_section = String::new();
+        // Emit chosen clusters in source order, each window a part named by its
+        // 1-based line span.
+        let mut parts: Vec<(usize, usize, String)> = Vec::new();
         let mut symbols: Vec<String> = Vec::new();
         for (i, cluster) in clusters.iter().enumerate() {
-            let Some(body) = rendered_clusters[i].as_ref() else {
+            let Some(windows) = rendered_clusters[i].as_ref() else {
                 continue;
             };
-            if !file_section.is_empty() {
-                file_section.push_str(GAP_MARKER);
-            }
-            file_section.push_str(body);
+            parts.extend(
+                windows
+                    .iter()
+                    .map(|&(lo, hi)| (lo + 1, hi, render_range(lo, hi))),
+            );
             symbols.extend(cluster.symbols.iter().cloned());
         }
+        // Gap names (#1711) are paid from what selection left of this file's
+        // budget, never from source: selection measured every gap as bare.
+        let bare_text = parts.iter().map(|(_, _, text)| text.len()).sum::<usize>()
+            + GAP_MARKER.len() * parts.len().saturating_sub(1);
+        let spare = ceiling.max(projected).saturating_sub(bare_text);
+        let file_index_nodes = self.store.nodes_by_file_path(file_path).unwrap_or_default();
+        let mut file_section =
+            join_parts_with_named_gaps(file_path, &parts, &file_index_nodes, spare);
         if chosen_count < clusters.len() || any_cluster_windowed {
             file_section.push_str("\n\n... (gap) ...");
         }
 
-        let header = explore_file_header(file_path, &symbols, budget.max_symbols_in_file_header);
+        // Every member across ALL clusters is a candidate for the header bias,
+        // so a dropped cluster's symbols no longer vanish from it (#1711).
+        let mut elided: Vec<ElidedSymbol> = Vec::new();
+        for member in clusters.iter().flat_map(|c| &c.members) {
+            let covered = parts
+                .iter()
+                .any(|(first, last, _)| member.start_line >= *first && member.start_line <= *last);
+            if !covered && !elided.iter().any(|e| e.name == member.name) {
+                elided.push(member.clone());
+            }
+        }
+        elided.sort_by_key(|s| s.start_line);
+        let header = explore_file_header(
+            file_path,
+            &symbols,
+            &elided,
+            budget.max_symbols_in_file_header,
+        );
         ExploreFileRender {
             section: format!("{header}\n\n```{lang}\n{file_section}\n```\n"),
             source_emitted: true,
@@ -3313,6 +3352,7 @@ struct ClusterRange {
     start: usize,
     end: usize,
     label: String,
+    member: ElidedSymbol,
     importance: u32,
 }
 
@@ -3321,6 +3361,9 @@ struct Cluster {
     start: usize,
     end: usize,
     symbols: Vec<String>,
+    /// Every member's name, kind and definition line, so the header can name
+    /// the ones a trim cut (#1711).
+    members: Vec<ElidedSymbol>,
     score: u32,
     max_importance: u32,
 }
@@ -3331,10 +3374,105 @@ impl Cluster {
             start: r.start,
             end: r.end,
             symbols: vec![r.label.clone()],
+            members: vec![r.member.clone()],
             score: r.importance,
             max_importance: r.importance,
         }
     }
+}
+
+/// An indexed symbol a trim left out of a rendered file (#1711).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ElidedSymbol {
+    name: String,
+    kind: &'static str,
+    start_line: usize,
+}
+
+/// How many elided symbols a gap marker names (#1711): enough for a follow-up
+/// explore to have a target, few enough that the marker never rivals the
+/// source it points at.
+const ELIDED_SYMBOL_CAP: usize = 6;
+
+const BARE_GAP_MARKER: &str = "\n\n... (gap) ...\n\n";
+
+/// Indexed symbols whose definition starts strictly between two rendered spans
+/// (1-based lines): the hole a trim dropped (#1711).
+fn symbols_between_ranges(nodes: &[Node], from_end: usize, to_start: usize) -> Vec<ElidedSymbol> {
+    if to_start <= from_end + 1 {
+        return Vec::new();
+    }
+    let mut out: Vec<ElidedSymbol> = Vec::new();
+    for node in nodes {
+        if matches!(node.kind, NodeKind::Import | NodeKind::Export) {
+            continue;
+        }
+        let start = usize::try_from(node.start_line).unwrap_or(0);
+        if start <= from_end || start >= to_start || out.iter().any(|s| s.name == node.name) {
+            continue;
+        }
+        out.push(ElidedSymbol {
+            name: node.name.clone(),
+            kind: node.kind.as_str(),
+            start_line: start,
+        });
+    }
+    out.sort_by_key(|s| s.start_line);
+    out
+}
+
+/// The gap marker between two non-contiguous slices of one file. A bare
+/// `... (gap) ...` said something was missing but not WHAT, while the trim
+/// note asked for exact names it never gave (#1711); a hole holding indexed
+/// symbols names them as `name (file:line)`.
+fn format_gap_marker(file_path: &str, elided: &[ElidedSymbol]) -> String {
+    if elided.is_empty() {
+        return BARE_GAP_MARKER.to_string();
+    }
+    let shown = elided
+        .iter()
+        .take(ELIDED_SYMBOL_CAP)
+        .map(|s| format!("{} ({file_path}:{})", s.name, s.start_line))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = elided.len().saturating_sub(ELIDED_SYMBOL_CAP);
+    let more = if more > 0 {
+        format!(", +{more} more")
+    } else {
+        String::new()
+    };
+    format!("\n\n... (gap: {shown}{more}) ...\n\n")
+}
+
+/// Join rendered parts — `(first_line, last_line, text)`, 1-based — with gap
+/// markers that name what the trim skipped. `spare` is what naming may cost
+/// beyond bare markers: selection priced every join as bare, so a gap the
+/// spare cannot cover stays bare rather than pushing source out (#2057).
+fn join_parts_with_named_gaps(
+    file_path: &str,
+    parts: &[(usize, usize, String)],
+    nodes: &[Node],
+    mut spare: usize,
+) -> String {
+    let Some((_, _, first)) = parts.first() else {
+        return String::new();
+    };
+    let mut out = first.clone();
+    for pair in parts.windows(2) {
+        let named = format_gap_marker(
+            file_path,
+            &symbols_between_ranges(nodes, pair[0].1, pair[1].0),
+        );
+        let extra = named.len() - BARE_GAP_MARKER.len();
+        if extra <= spare {
+            out.push_str(&named);
+            spare -= extra;
+        } else {
+            out.push_str(BARE_GAP_MARKER);
+        }
+        out.push_str(&pair[1].2);
+    }
+    out
 }
 
 // === Free-function renderers (1:1 with upstream helpers) ====================
@@ -4119,9 +4257,15 @@ fn cap_header_names(names: &[String], cap: usize) -> String {
     format!("{shown}, +{} more", names.len() - cap)
 }
 
-/// Build a clustered file's `#### path — symbols` header, ranking symbols by
-/// frequency and capping at `cap` (`tools.ts:2859-2876`).
-fn explore_file_header(file_path: &str, symbols: &[String], cap: usize) -> String {
+/// A clustered file's header, preferring the symbols the trim elided so
+/// `+N more` is less likely to hide the answer (#1711): elided first (in
+/// source order), then frequency, then name.
+fn explore_file_header(
+    file_path: &str,
+    symbols: &[String],
+    elided: &[ElidedSymbol],
+    cap: usize,
+) -> String {
     let mut counts: Vec<(String, usize)> = Vec::new();
     for s in symbols {
         if let Some(slot) = counts.iter_mut().find(|(name, _)| name == s) {
@@ -4130,7 +4274,35 @@ fn explore_file_header(file_path: &str, symbols: &[String], cap: usize) -> Strin
             counts.push((s.clone(), 1));
         }
     }
-    counts.sort_by_key(|b| std::cmp::Reverse(b.1));
+    let elided_labels = elided
+        .iter()
+        .map(|s| format!("{}({})", s.name, s.kind))
+        .collect::<Vec<_>>();
+    for label in &elided_labels {
+        if !counts.iter().any(|(name, _)| name == label) {
+            counts.push((label.clone(), 1));
+        }
+    }
+    let rank_of = |label: &str| -> Option<usize> {
+        let name = label.split_once('(').map_or(label, |(name, _)| name);
+        elided_labels
+            .iter()
+            .position(|l| l == label)
+            .or_else(|| elided.iter().position(|s| s.name == name))
+    };
+    counts.sort_by(|(a, count_a), (b, count_b)| {
+        let (rank_a, rank_b) = (rank_of(a), rank_of(b));
+        rank_b
+            .is_some()
+            .cmp(&rank_a.is_some())
+            .then(count_b.cmp(count_a))
+            .then(
+                rank_a
+                    .unwrap_or(usize::MAX)
+                    .cmp(&rank_b.unwrap_or(usize::MAX)),
+            )
+            .then(a.cmp(b))
+    });
     let ranked: Vec<String> = counts.into_iter().map(|(name, _)| name).collect();
     format!("#### {file_path} — {}", cap_header_names(&ranked, cap))
 }
@@ -4243,7 +4415,7 @@ const COMPLETENESS_RULE: &str = "---";
 /// The trim note emitted at tiers that gate the completeness signal OFF. It is
 /// only reached when a file was actually trimmed, but `any_file_trimmed` is
 /// loop-determined, so the pre-loop reserve has to assume it.
-const TRIMMED_NOTE: &str = "> Some file sections were trimmed for size. For a specific symbol you still need, run another `codegraph_explore` (or `codegraph_node`) with its exact name — line-numbered source, cheaper and more complete than Read.";
+const TRIMMED_NOTE: &str = "> Some file sections were trimmed for size. Elided symbols are named inside gap markers as `name (file:line)` and preferred in the file header — run another `codegraph_explore` (or `codegraph_node`) with those exact names for their source.";
 
 fn completeness_signal(files_included: usize) -> String {
     format!(
@@ -4513,6 +4685,108 @@ mod tests {
             .section;
         assert!(out.contains("line 10"), "cluster source missing: {out:?}");
         assert!(out.contains("line 30"), "cluster source missing: {out:?}");
+    }
+
+    /// A gap between two rendered spans names the indexed symbols that start
+    /// inside it, from the full file index (#1711), and only while the spare
+    /// budget pays for the names; otherwise it stays bare (#2057).
+    #[test]
+    fn gap_markers_name_the_symbols_a_trim_skipped_within_the_spare_budget() {
+        let nodes = vec![
+            node("alpha", "a.ts", 10, 30, NodeKind::Function),
+            node("helperMid", "a.ts", 100, 120, NodeKind::Function),
+            node("helperMid", "a.ts", 130, 140, NodeKind::Function),
+            node("loader", "a.ts", 150, 150, NodeKind::Import),
+            node("beta", "a.ts", 200, 220, NodeKind::Function),
+        ];
+        assert_eq!(
+            symbols_between_ranges(&nodes, 33, 197)
+                .iter()
+                .map(|s| (s.name.as_str(), s.start_line))
+                .collect::<Vec<_>>(),
+            vec![("helperMid", 100)]
+        );
+        let parts = vec![(7, 33, "head".to_string()), (197, 223, "tail".to_string())];
+        assert_eq!(
+            join_parts_with_named_gaps("a.ts", &parts, &nodes, usize::MAX),
+            "head\n\n... (gap: helperMid (a.ts:100)) ...\n\ntail"
+        );
+        assert_eq!(
+            join_parts_with_named_gaps("a.ts", &parts, &nodes, 3),
+            "head\n\n... (gap) ...\n\ntail",
+            "names the spare cannot pay for stay out"
+        );
+
+        let many: Vec<ElidedSymbol> = (0..8)
+            .map(|i| ElidedSymbol {
+                name: format!("s{i}"),
+                kind: "function",
+                start_line: 40 + i,
+            })
+            .collect();
+        assert!(format_gap_marker("a.ts", &many).contains("s5 (a.ts:45), +2 more"));
+    }
+
+    /// The header prefers the symbols the trim cut, in source order, so
+    /// `+N more` stops hiding the answer (#1711).
+    #[test]
+    fn clustered_file_header_prefers_elided_symbols() {
+        let symbols = vec![
+            "alpha(function)".to_string(),
+            "alpha(function)".to_string(),
+            "zed(function)".to_string(),
+        ];
+        let elided = vec![
+            ElidedSymbol {
+                name: "syncStateNow".to_string(),
+                kind: "method",
+                start_line: 300,
+            },
+            ElidedSymbol {
+                name: "beta".to_string(),
+                kind: "function",
+                start_line: 120,
+            },
+        ];
+        let mut elided_sorted = elided.clone();
+        elided_sorted.sort_by_key(|s| s.start_line);
+        assert_eq!(
+            explore_file_header("f.ts", &symbols, &elided_sorted, 3),
+            "#### f.ts — beta(function), syncStateNow(method), alpha(function), +1 more"
+        );
+    }
+
+    /// End to end: two rendered clusters with an index-only symbol between
+    /// them get a named gap.
+    #[test]
+    fn render_explore_file_names_an_index_only_symbol_in_a_gap() {
+        let mut engine = test_engine();
+        let file = "big.ts";
+        let owned: Vec<String> = (1..=400).map(|i| format!("line {i}")).collect();
+        let file_lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let alpha = node("alpha", file, 10, 30, NodeKind::Function);
+        let beta = node("beta", file, 200, 220, NodeKind::Function);
+        let mid = node("helperMid", file, 100, 110, NodeKind::Function);
+        put_nodes(&mut engine, &[alpha.clone(), mid, beta.clone()]);
+        let sg = subgraph_with(
+            vec![alpha.clone(), beta.clone()],
+            vec![alpha.id.clone(), beta.id.clone()],
+        );
+        let budget = crate::explore_budget::get_explore_output_budget(200);
+        let out = engine
+            .render_explore_file(
+                &sg,
+                file,
+                &file_lines,
+                "typescript",
+                &render_ctx(&budget, &[]),
+            )
+            .section;
+        assert!(out.contains("line 10") && out.contains("line 200"), "{out}");
+        assert!(
+            out.contains("... (gap: helperMid (big.ts:100)) ..."),
+            "{out}"
+        );
     }
 
     /// Regression: a small HEALTHY file returns WHOLE, byte-for-byte, exactly as
@@ -7592,7 +7866,7 @@ mod tests {
             "a(function)".to_string(),
             "b(function)".to_string(),
         ];
-        let h = explore_file_header("f.rs", &syms, 5);
+        let h = explore_file_header("f.rs", &syms, &[], 5);
         assert!(h.starts_with("#### f.rs — "), "got: {h}");
     }
 
