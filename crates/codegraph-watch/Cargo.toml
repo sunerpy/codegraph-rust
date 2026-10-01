@@ -13,6 +13,11 @@ rust-version.workspace = true
 description = "Debounced file watcher and incremental sync for CodeGraph-rs."
 readme = "../../README.md"
 
+[features]
+# Test seams for dependents' test builds (e.g. publishing a watcher health
+# without a running watcher). NEVER enabled in the shipped binary.
+test-hooks = []
+
 [dependencies]
 serde = { workspace = true }
 anyhow = { workspace = true }

@@ -7,7 +7,7 @@
 //! file:line for its API call + output template.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -126,6 +126,10 @@ pub struct CodeGraphEngine {
     source_probes: RefCell<HashMap<String, SourceProbe>>,
     /// Request-local set of files whose current bytes actually reached the result.
     source_citations: RefCell<HashSet<String>>,
+    /// Request-local set of indexed files a graph answer (search, callers,
+    /// callees, impact) names as locations. Checked for drift before the answer
+    /// is served while auto-sync is not healthy (upstream #1959).
+    answer_files: RefCell<BTreeSet<String>>,
 }
 
 impl CodeGraphEngine {
@@ -152,6 +156,7 @@ impl CodeGraphEngine {
             deprioritize,
             source_probes: RefCell::new(HashMap::new()),
             source_citations: RefCell::new(HashSet::new()),
+            answer_files: RefCell::new(BTreeSet::new()),
         })
     }
 
@@ -336,6 +341,8 @@ impl CodeGraphEngine {
     pub fn execute(&self, tool_name: &str, args: &Value) -> ToolResult {
         self.source_probes.borrow_mut().clear();
         self.source_citations.borrow_mut().clear();
+        self.answer_files.borrow_mut().clear();
+        let health = codegraph_watch::watch_health(&self.project_root);
         let result = match tool_name {
             "codegraph_search" => self.handle_search(args),
             "codegraph_callers" => self.handle_callers(args),
@@ -350,9 +357,49 @@ impl CodeGraphEngine {
             other => return ToolResult::error(format!("Unknown tool: {other}")),
         };
         match result {
-            Ok(tr) => self.with_staleness_banner(tr),
+            Ok(tr) => {
+                let tr = match &health {
+                    Some(health) if *health != codegraph_watch::WatchHealth::Healthy => {
+                        self.refuse_drifted_answer(tr)
+                    }
+                    _ => tr,
+                };
+                with_health_banner(self.with_staleness_banner(tr), health.as_ref())
+            }
             Err(e) => ToolResult::error(format!("Tool execution failed: {e}")),
         }
+    }
+
+    fn mark_answer_files<'a>(&self, nodes: impl IntoIterator<Item = &'a Node>) {
+        self.answer_files
+            .borrow_mut()
+            .extend(nodes.into_iter().map(|node| node.file_path.clone()));
+    }
+
+    /// While auto-sync is paused or stopped the graph is frozen: a graph answer
+    /// that names a file changed (or gone) since its last sync would present
+    /// stale edges as current, so the drifted files are named instead of the
+    /// answer (upstream #1959). `codegraph_node` and explore keep their own
+    /// per-file drift gates, which serve or omit current bytes.
+    fn refuse_drifted_answer(&self, result: ToolResult) -> ToolResult {
+        if result.is_error == Some(true) {
+            return result;
+        }
+        let files = std::mem::take(&mut *self.answer_files.borrow_mut());
+        let stale = files
+            .into_iter()
+            .filter(|file| self.project_source(file).is_possibly_drifted())
+            .collect::<Vec<_>>();
+        if stale.is_empty() {
+            return result;
+        }
+        let mut lines = vec![
+            "⚠️ CodeGraph cannot answer from this index:".to_string(),
+            "These files changed or became unavailable after their last sync:".to_string(),
+        ];
+        lines.extend(stale.iter().map(|file| format!("- {file}")));
+        lines.push("Retry after a successful codegraph sync, or narrow the query.".to_string());
+        ToolResult::text(lines.join("\n"))
     }
 
     /// `codegraph_check` — additive cycle-detection tool (not in the upstream pin).
@@ -419,6 +466,7 @@ impl CodeGraphEngine {
             )));
         }
         let nodes: Vec<Node> = results.into_iter().map(|r| r.node).collect();
+        self.mark_answer_files(&nodes);
         Ok(ToolResult::text(truncate_output(&format_search_results(
             &nodes,
         ))))
@@ -479,9 +527,11 @@ impl CodeGraphEngine {
                     }
                 }
             }
+            self.mark_answer_files(&related);
             Ok(related)
         };
         let selected = grouped.groups.iter().flatten().cloned().collect::<Vec<_>>();
+        self.mark_answer_files(&selected);
         let godot = match dir {
             CallDir::Callers => self.godot_honesty(&selected)?,
             CallDir::Callees => GodotHonesty::default(),
@@ -634,9 +684,11 @@ impl CodeGraphEngine {
                     }
                 }
             }
+            self.mark_answer_files(nodes.values());
             Ok((order, nodes))
         };
         let selected = grouped.groups.iter().flatten().cloned().collect::<Vec<_>>();
+        self.mark_answer_files(&selected);
         let godot = self.godot_honesty(&selected)?;
 
         if grouped.groups.len() == 1 {
@@ -2009,6 +2061,18 @@ impl CodeGraphEngine {
         ));
         lines.push("**Backend:** node:sqlite (Node built-in) — full WAL + FTS5".to_string());
         lines.push("**Journal mode:** wal (concurrent reads safe)".to_string());
+        match codegraph_watch::watch_health(&self.project_root) {
+            Some(codegraph_watch::WatchHealth::Healthy) => {
+                lines.push("**Auto-sync:** watching".to_string());
+            }
+            Some(codegraph_watch::WatchHealth::Recovering { reason }) => lines.push(format!(
+                "**Auto-sync:** RECOVERING — a full catch-up has not committed yet ({reason})"
+            )),
+            Some(codegraph_watch::WatchHealth::Disabled { reason }) => {
+                lines.push(format!("**Auto-sync:** DISABLED ({reason})"));
+            }
+            None => {}
+        }
 
         let by_kind = self.store.node_counts_by_kind()?;
         if !by_kind.is_empty() {
@@ -3276,6 +3340,37 @@ impl Cluster {
 // === Free-function renderers (1:1 with upstream helpers) ====================
 
 /// `formatSearchResults` (`tools.ts:3324-3338`).
+/// Prepend the whole-index notice a paused or stopped watcher owes every
+/// answer (upstream #876, #1959): the per-file drift banner cannot cover edits
+/// the index never heard about while auto-sync was off.
+fn with_health_banner(
+    mut result: ToolResult,
+    health: Option<&codegraph_watch::WatchHealth>,
+) -> ToolResult {
+    if result.is_error == Some(true) {
+        return result;
+    }
+    let banner = match health {
+        Some(codegraph_watch::WatchHealth::Recovering { .. }) => {
+            "⚠️ CodeGraph auto-sync is RECOVERING — another process held the index lock, so \
+             syncing paused; changes are still being collected, but the full index catch-up \
+             has not completed. Read files directly to confirm current content before relying \
+             on these results."
+                .to_string()
+        }
+        Some(codegraph_watch::WatchHealth::Disabled { reason }) => format!(
+            "⚠️ CodeGraph auto-sync is DISABLED — live file watching stopped, so the index is \
+             frozen and any file edited since then is stale here. Read files directly to confirm \
+             current content before relying on it.\n  Reason: {reason}"
+        ),
+        Some(codegraph_watch::WatchHealth::Healthy) | None => return result,
+    };
+    if let Some(first) = result.content.first_mut() {
+        first.text = format!("{banner}\n\n{}", first.text);
+    }
+    result
+}
+
 fn format_search_results(nodes: &[Node]) -> String {
     let mut lines = vec![
         format!("## Search Results ({} found)", nodes.len()),
@@ -4303,6 +4398,7 @@ mod tests {
             deprioritize: Arc::new(DeprioritizeMatcher::default()),
             source_probes: RefCell::new(HashMap::new()),
             source_citations: RefCell::new(HashSet::new()),
+            answer_files: RefCell::new(BTreeSet::new()),
         }
     }
 
@@ -5457,6 +5553,85 @@ mod tests {
             "a possibly-drifted file whose bytes were omitted must not fabricate a banner: {}",
             text_of(&tr)
         );
+    }
+
+    /// While auto-sync is paused or stopped the graph is frozen, so a graph
+    /// answer that names a drifted file is refused, the file is named instead,
+    /// and every answer carries the whole-index notice (upstream #876, #1959).
+    #[test]
+    fn graph_answers_naming_a_drifted_file_are_refused_while_auto_sync_is_off() {
+        let mut engine = test_engine();
+        put_indexed_source(&engine, "src/a.rs", "fn alpha() {}\n", Language::Rust, 1);
+        put_indexed_source(&engine, "src/b.rs", "fn beta() {}\n", Language::Rust, 1);
+        put_nodes(
+            &mut engine,
+            &[
+                node_lang(
+                    "alpha",
+                    "alpha",
+                    "src/a.rs",
+                    1,
+                    1,
+                    NodeKind::Function,
+                    Language::Rust,
+                ),
+                node_lang(
+                    "beta",
+                    "beta",
+                    "src/b.rs",
+                    1,
+                    1,
+                    NodeKind::Function,
+                    Language::Rust,
+                ),
+            ],
+        );
+        write_src(&engine, "src/a.rs", "fn alpha() { changed(); }\n");
+        let search = |engine: &CodeGraphEngine, query: &str| {
+            text_of(&engine.execute("codegraph_search", &serde_json::json!({ "query": query })))
+        };
+
+        // No watcher in this process: per-file gates only, answers as usual.
+        assert!(search(&engine, "alpha").contains("alpha"));
+
+        let guard = codegraph_watch::register_watch_health_for_tests(
+            &engine.project_root,
+            codegraph_watch::WatchHealth::Recovering {
+                reason: "lock held".to_string(),
+            },
+        );
+        let refused = search(&engine, "alpha");
+        assert!(
+            refused.starts_with("⚠️ CodeGraph auto-sync is RECOVERING"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("cannot answer from this index"),
+            "{refused}"
+        );
+        assert!(refused.contains("- src/a.rs"), "{refused}");
+        let fresh = search(&engine, "beta");
+        assert!(
+            fresh.starts_with("⚠️ CodeGraph auto-sync is RECOVERING"),
+            "{fresh}"
+        );
+        assert!(!fresh.contains("cannot answer"), "{fresh}");
+        assert!(fresh.contains("beta"), "{fresh}");
+        drop(guard);
+
+        let _guard = codegraph_watch::register_watch_health_for_tests(
+            &engine.project_root,
+            codegraph_watch::WatchHealth::Disabled {
+                reason: "inotify exhausted".to_string(),
+            },
+        );
+        let disabled = search(&engine, "alpha");
+        assert!(
+            disabled.starts_with("⚠️ CodeGraph auto-sync is DISABLED"),
+            "{disabled}"
+        );
+        assert!(disabled.contains("Reason: inotify exhausted"), "{disabled}");
+        assert!(disabled.contains("- src/a.rs"), "{disabled}");
     }
 
     /// Indexing records a file over the limit by its size stamp, so the probe

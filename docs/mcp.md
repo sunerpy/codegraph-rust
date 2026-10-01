@@ -696,3 +696,23 @@ gets **no** banner, which is what makes "trust everything not listed" a real
 guarantee rather than an assumption — the agent instructions had described this
 banner before anything produced it. Run `codegraph sync`, or wait for the watcher,
 if you see it on a hot codebase; ordinary drift does not require a full rebuild.
+
+### Auto-sync health
+
+When the server runs the project's live watcher in-process, every answer also
+reports its health, since edits the index never heard about cannot reach the
+per-file banner above:
+
+- **RECOVERING** — another process held the index past the sync's contention
+  budget (a long foreground `index`). Watching continues and changes are still
+  collected; a full reconcile is retried every 30 s, and until one commits each
+  response starts with `⚠️ CodeGraph auto-sync is RECOVERING …`.
+- **DISABLED** — watching stopped (watch resources exhausted, or syncs failing
+  persistently). Responses start with `⚠️ CodeGraph auto-sync is DISABLED …` and
+  the reason; run `codegraph sync` and restart the server.
+
+In either state `codegraph_search`, `codegraph_callers`, `codegraph_callees`
+and `codegraph_impact` check every indexed file they would name against disk,
+and when one changed or disappeared since its last sync they name those files
+instead of answering from the frozen graph. `codegraph_status` reports the
+state as `Auto-sync:`.

@@ -1,10 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -477,23 +477,147 @@ pub fn next_backoff(prev: Duration) -> Duration {
 #[derive(Default)]
 struct DegradedState {
     degraded: AtomicBool,
+    /// Set while lock contention paused auto-sync: the watcher still collects
+    /// changes and retries a full reconcile, which clears the whole state.
+    recovering: AtomicBool,
     reason: Mutex<Option<String>>,
 }
 
 impl DegradedState {
+    /// Auto-sync stopped for good (until a restart).
     fn mark(&self, reason: String) {
         if let Ok(mut guard) = self.reason.lock() {
             *guard = Some(reason);
         }
+        self.recovering.store(false, Ordering::SeqCst);
         self.degraded.store(true, Ordering::SeqCst);
+    }
+
+    /// Auto-sync paused by lock contention, recovering on its own.
+    fn mark_recovering(&self, reason: String) {
+        if let Ok(mut guard) = self.reason.lock() {
+            *guard = Some(reason);
+        }
+        self.recovering.store(true, Ordering::SeqCst);
+        self.degraded.store(true, Ordering::SeqCst);
+    }
+
+    /// A committed full reconcile ends a recovery; a stopped watcher stays stopped.
+    fn recover(&self) {
+        if self.recovering.swap(false, Ordering::SeqCst) {
+            if let Ok(mut guard) = self.reason.lock() {
+                *guard = None;
+            }
+            self.degraded.store(false, Ordering::SeqCst);
+        }
     }
 
     fn is_degraded(&self) -> bool {
         self.degraded.load(Ordering::SeqCst)
     }
 
+    fn is_recovering(&self) -> bool {
+        self.recovering.load(Ordering::SeqCst)
+    }
+
     fn reason(&self) -> Option<String> {
         self.reason.lock().ok().and_then(|guard| guard.clone())
+    }
+
+    fn health(&self) -> WatchHealth {
+        let reason = self.reason().unwrap_or_default();
+        if !self.is_degraded() {
+            WatchHealth::Healthy
+        } else if self.is_recovering() {
+            WatchHealth::Recovering { reason }
+        } else {
+            WatchHealth::Disabled { reason }
+        }
+    }
+}
+
+/// Auto-sync health of a project's live watcher in this process, for the hosts
+/// that answer from its index (upstream #876, #1959).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchHealth {
+    /// Watching, and every change is synced or queued for a retry.
+    Healthy,
+    /// Another writer held the index past the contention budget. Changes are
+    /// still collected and a full reconcile is retried, but until one commits
+    /// the index may be stale.
+    Recovering { reason: String },
+    /// Watching stopped (watch resources exhausted, or sync failing
+    /// persistently): the index is frozen until `codegraph sync` and a restart.
+    Disabled { reason: String },
+}
+
+type HealthRegistry = Mutex<HashMap<PathBuf, std::sync::Weak<DegradedState>>>;
+
+fn health_registry() -> &'static HealthRegistry {
+    static REGISTRY: OnceLock<HealthRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The auto-sync health of the live watcher this process runs for
+/// `project_root`, or `None` when it runs none.
+pub fn watch_health(project_root: &Path) -> Option<WatchHealth> {
+    let key = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let registry = health_registry().lock().ok()?;
+    registry
+        .get(&key)
+        .and_then(std::sync::Weak::upgrade)
+        .map(|state| state.health())
+}
+
+/// Test seam: publish `health` for `project_root` as a watcher there would,
+/// for as long as the returned guard lives.
+#[cfg(feature = "test-hooks")]
+pub fn register_watch_health_for_tests(
+    project_root: &Path,
+    health: WatchHealth,
+) -> WatchHealthGuard {
+    let key = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let state = Arc::new(DegradedState::default());
+    match health {
+        WatchHealth::Healthy => {}
+        WatchHealth::Recovering { reason } => state.mark_recovering(reason),
+        WatchHealth::Disabled { reason } => state.mark(reason),
+    }
+    register_health(&key, &state);
+    WatchHealthGuard { key, state }
+}
+
+/// Keeps a [`register_watch_health_for_tests`] registration alive.
+#[cfg(feature = "test-hooks")]
+pub struct WatchHealthGuard {
+    key: PathBuf,
+    state: Arc<DegradedState>,
+}
+
+#[cfg(feature = "test-hooks")]
+impl Drop for WatchHealthGuard {
+    fn drop(&mut self) {
+        unregister_health(&self.key, &self.state);
+    }
+}
+
+fn register_health(project_root: &Path, state: &Arc<DegradedState>) {
+    if let Ok(mut registry) = health_registry().lock() {
+        registry.insert(project_root.to_path_buf(), Arc::downgrade(state));
+    }
+}
+
+fn unregister_health(project_root: &Path, state: &Arc<DegradedState>) {
+    if let Ok(mut registry) = health_registry().lock()
+        && registry
+            .get(project_root)
+            .is_some_and(|registered| std::ptr::eq(registered.as_ptr(), Arc::as_ptr(state)))
+    {
+        registry.remove(project_root);
     }
 }
 
@@ -528,7 +652,18 @@ pub struct WatchOptions {
     /// shutdown can refuse queued lease loops and interrupt a running one
     /// (frozen plan lines 598-601).
     cancel: SyncCancellation,
+    /// Cumulative backoff a sync spends waiting out another writer before
+    /// auto-sync pauses as RECOVERING. Defaults to [`MAX_BACKOFF`].
+    pub lock_contention_budget: Duration,
+    /// How often a RECOVERING watcher retries its full reconcile. Defaults to
+    /// [`LOCK_RECOVERY_INTERVAL`].
+    pub lock_recovery_interval: Duration,
 }
+
+/// How often a watcher paused by lock contention retries its full reconcile,
+/// so a long-lived writer is not polled in a loop (upstream #1959's re-arm
+/// cooldown).
+pub const LOCK_RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
 
 impl Default for WatchOptions {
     fn default() -> Self {
@@ -551,6 +686,8 @@ impl Default for WatchOptions {
             sync_fn: None,
             full_sync_fn: None,
             cancel: SyncCancellation::new(),
+            lock_contention_budget: MAX_BACKOFF,
+            lock_recovery_interval: LOCK_RECOVERY_INTERVAL,
         }
     }
 }
@@ -597,6 +734,8 @@ pub struct ProjectWatcher {
     thread: Option<JoinHandle<()>>,
     watcher: SharedWatcher,
     degraded: Arc<DegradedState>,
+    /// The canonical project root its health is registered under.
+    health_key: PathBuf,
     cancel: SyncCancellation,
     /// Set by the event-loop thread as its LAST action. Lets a caller observe
     /// completion without joining, so a bounded shutdown never blocks on a
@@ -669,6 +808,9 @@ impl ProjectWatcher {
         });
         let (tx, rx) = mpsc::channel();
         let degraded = Arc::new(DegradedState::default());
+        let health_key = project_root.clone();
+        let lock_contention_budget = options.lock_contention_budget;
+        let lock_recovery_interval = options.lock_recovery_interval;
         // Capture directory identity before registering the backend. Windows emits
         // `RemoveKind::Any` after deletion, so this pre-event snapshot is the only
         // deterministic way to distinguish a known directory from an extensionless
@@ -781,15 +923,19 @@ impl ProjectWatcher {
                 degraded: loop_degraded,
                 watcher: loop_watcher,
                 known_dirs,
+                lock_contention_budget,
+                lock_recovery_interval,
             });
             loop_finished.store(true, Ordering::SeqCst);
         });
 
+        register_health(&health_key, &degraded);
         Ok(Some(Self {
             tx,
             thread: Some(thread),
             watcher,
             degraded,
+            health_key,
             cancel,
             finished,
         }))
@@ -847,6 +993,12 @@ impl ProjectWatcher {
         self.degraded.reason()
     }
 
+    /// Auto-sync health; [`WatchHealth::Recovering`] while lock contention
+    /// paused it and a full reconcile has not committed yet.
+    pub fn health(&self) -> WatchHealth {
+        self.degraded.health()
+    }
+
     pub fn ingest_event_for_tests(&self, relative: impl Into<PathBuf>) {
         let _ = self.tx.send(LoopMessage::Event(WatchEventBatch::paths(vec![
             relative.into(),
@@ -893,6 +1045,7 @@ impl ProjectWatcher {
         // Signal first (never join without cancelling: the event-loop thread may be
         // inside a bounded lease acquisition), then join.
         self.begin_shutdown();
+        unregister_health(&self.health_key, &self.degraded);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -991,6 +1144,8 @@ struct EventLoopCtx {
     degraded: Arc<DegradedState>,
     watcher: SharedWatcher,
     known_dirs: BTreeSet<String>,
+    lock_contention_budget: Duration,
+    lock_recovery_interval: Duration,
 }
 
 fn event_loop(ctx: EventLoopCtx) {
@@ -1008,6 +1163,8 @@ fn event_loop(ctx: EventLoopCtx) {
         degraded,
         watcher,
         mut known_dirs,
+        lock_contention_budget,
+        lock_recovery_interval,
     } = ctx;
     let mut pending = BTreeMap::<String, PendingInfo>::new();
     let mut deadline = None::<Instant>;
@@ -1134,7 +1291,9 @@ fn event_loop(ctx: EventLoopCtx) {
                             });
                     }
                 }
-                if !pending.is_empty() {
+                // While lock contention paused auto-sync, the recovery retry keeps
+                // its own cadence; a burst of edits must not poll the other writer.
+                if !pending.is_empty() && !degraded.is_recovering() {
                     // Resetting the timer on every event ports the upstream exactly-once
                     // burst semantics (`upstream sync/watcher.ts:529-540`).
                     deadline = Some(Instant::now() + runtime_scope.debounce);
@@ -1158,18 +1317,27 @@ fn event_loop(ctx: EventLoopCtx) {
             }
             Some(LoopMessage::Stop) => break,
             None => {
-                let batch = std::mem::take(&mut pending);
-                let paths = batch.keys().cloned().collect::<Vec<_>>();
+                // Taken for the attempt; a failed or paused sync puts it back.
+                let mut batch = Some(std::mem::take(&mut pending));
+                let paths = batch
+                    .as_ref()
+                    .map(|batch| batch.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
                 deadline = None;
                 let full_sync = std::mem::take(&mut full_sync_pending);
                 let attempt = if full_sync {
-                    run_full_sync_with_backoff(&full_sync_fn)
+                    run_full_sync_with_backoff(&full_sync_fn, lock_contention_budget)
                 } else {
-                    run_sync_with_backoff(&sync_fn, paths.clone())
+                    run_sync_with_backoff(&sync_fn, paths.clone(), lock_contention_budget)
                 };
                 let decision = classify_persistent_failure(&attempt, &mut consecutive_sync_errors);
                 match attempt {
                     SyncAttempt::Done(outcome) => {
+                        // A committed full reconcile is what ends a recovery: the
+                        // edits missed while another writer held the index are in.
+                        if full_sync {
+                            degraded.recover();
+                        }
                         // Preserve the event batch independently of actual DB
                         // mutations. Startup catch-up can win the writer lease and
                         // index the same file first; the watcher still handled this
@@ -1187,7 +1355,7 @@ fn event_loop(ctx: EventLoopCtx) {
                         // and any full reconcile it owed (a directory removal
                         // adds no pending file), and retry after a backoff
                         // rather than drop them (upstream #1964).
-                        pending = batch;
+                        pending = batch.take().unwrap_or_default();
                         full_sync_pending |= full_sync;
                         deadline = Some(
                             Instant::now()
@@ -1196,10 +1364,28 @@ fn event_loop(ctx: EventLoopCtx) {
                     }
                     SyncAttempt::Degraded(_) => {}
                 }
-                if let PersistentFailure::Degrade(reason) | PersistentFailure::Disable(reason) =
-                    decision
-                {
-                    if !degraded.is_degraded() {
+                if let PersistentFailure::Degrade(reason) = decision {
+                    // Another writer held the index past the contention budget.
+                    // Keep watching and collecting changes, report RECOVERING, and
+                    // retry a FULL reconcile on a slow cadence until one commits
+                    // (upstream #1959).
+                    if !degraded.is_recovering()
+                        && let Some(cb) = &on_sync_error
+                    {
+                        cb(format!(
+                            "auto-sync paused: {reason}; retrying a full reconcile every {}s",
+                            lock_recovery_interval.as_secs()
+                        ));
+                    }
+                    degraded.mark_recovering(reason);
+                    pending = batch.take().unwrap_or_default();
+                    full_sync_pending = true;
+                    deadline = Some(Instant::now() + lock_recovery_interval);
+                    continue;
+                }
+                if let PersistentFailure::Disable(reason) = decision {
+                    // A recovery that keeps failing is a stop like any other.
+                    if !degraded.is_degraded() || degraded.is_recovering() {
                         degraded.mark(reason.clone());
                         if let Some(cb) = &on_degraded {
                             cb(reason);
@@ -1297,14 +1483,14 @@ fn classify_persistent_failure(
 /// Run `sync_fn`, retrying on write-lock contention with bounded exponential
 /// backoff capped at [`MAX_BACKOFF`]. Once the cumulative sleep budget is spent
 /// the watcher degrades; any non-contention error is surfaced as a sync error.
-fn run_sync_with_backoff(sync_fn: &SyncFn, paths: Vec<String>) -> SyncAttempt {
-    run_sync_with_backoff_inner(sync_fn, paths, MAX_BACKOFF, thread::sleep)
+fn run_sync_with_backoff(sync_fn: &SyncFn, paths: Vec<String>, budget: Duration) -> SyncAttempt {
+    run_sync_with_backoff_inner(sync_fn, paths, budget, thread::sleep)
 }
 
 /// Same bounded-backoff contract as [`run_sync_with_backoff`], for the
 /// whole-project sync a removed directory escalates to.
-fn run_full_sync_with_backoff(full_sync_fn: &FullSyncFn) -> SyncAttempt {
-    run_with_backoff(MAX_BACKOFF, thread::sleep, || full_sync_fn())
+fn run_full_sync_with_backoff(full_sync_fn: &FullSyncFn, budget: Duration) -> SyncAttempt {
+    run_with_backoff(budget, thread::sleep, || full_sync_fn())
 }
 
 /// Inner retry loop with an injectable budget and sleeper so the cap can be
@@ -2688,6 +2874,111 @@ mod tests {
         );
         assert!(watcher.pending_files().is_empty());
         watcher.stop();
+    }
+
+    /// Lock contention past the budget pauses auto-sync as RECOVERING rather
+    /// than stopping it: changes are still collected, a FULL reconcile is
+    /// retried on a slow cadence, and the one that commits restores health
+    /// (upstream #1959).
+    #[test]
+    fn lock_contention_pauses_auto_sync_until_a_full_reconcile_commits() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-recover-lock");
+        let held = Arc::new(AtomicBool::new(true));
+        let full_calls = Arc::new(AtomicUsize::new(0));
+        let full_held = Arc::clone(&held);
+        let full_counter = Arc::clone(&full_calls);
+        let full_sync_fn: FullSyncFn = Arc::new(move || {
+            full_counter.fetch_add(1, AtomicOrdering::SeqCst);
+            if full_held.load(AtomicOrdering::SeqCst) {
+                return Err(anyhow::anyhow!("database is locked"));
+            }
+            Ok(SyncOutcome {
+                files_reindexed: 2,
+                ..Default::default()
+            })
+        });
+        let held_for_sync = Arc::clone(&held);
+        let sync_fn: SyncFn = Arc::new(move |_paths| {
+            if held_for_sync.load(AtomicOrdering::SeqCst) {
+                return Err(anyhow::anyhow!("database is locked"));
+            }
+            Ok(SyncOutcome::default())
+        });
+        let notices = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorded = Arc::clone(&notices);
+        let stops = Arc::new(AtomicUsize::new(0));
+        let stop_counter = Arc::clone(&stops);
+        let (outcome_tx, outcome_rx) = mpsc::channel();
+        let watcher = ProjectWatcher::start(
+            dir.path(),
+            WatchOptions {
+                debounce: Duration::from_millis(20),
+                inert_for_tests: true,
+                sync_fn: Some(sync_fn),
+                full_sync_fn: Some(full_sync_fn),
+                lock_contention_budget: Duration::from_millis(1),
+                lock_recovery_interval: Duration::from_millis(50),
+                on_sync_error: Some(Arc::new(move |msg| recorded.lock().unwrap().push(msg))),
+                on_degraded: Some(Arc::new(move |_| {
+                    stop_counter.fetch_add(1, AtomicOrdering::SeqCst);
+                })),
+                on_sync_complete: Some(Arc::new(move |outcome| {
+                    outcome_tx.send(outcome).unwrap();
+                })),
+                ..WatchOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(watch_health(dir.path()), Some(WatchHealth::Healthy));
+
+        watcher.ingest_event_for_tests("src/app.ts");
+        watcher.flush_for_tests();
+        let mut recovering = false;
+        for _ in 0..80 {
+            if matches!(watcher.health(), WatchHealth::Recovering { .. }) {
+                recovering = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(recovering, "contention must pause auto-sync as recovering");
+        assert!(matches!(
+            watch_health(dir.path()),
+            Some(WatchHealth::Recovering { .. })
+        ));
+        assert!(watcher.is_degraded());
+        assert_eq!(
+            stops.load(AtomicOrdering::SeqCst),
+            0,
+            "recovering is not a stop"
+        );
+        assert!(
+            notices.lock().unwrap()[0].contains("auto-sync paused"),
+            "{:?}",
+            notices.lock().unwrap()
+        );
+        watcher.ingest_event_for_tests("src/other.ts");
+
+        held.store(false, AtomicOrdering::SeqCst);
+        let outcome = outcome_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the full reconcile commits once the writer is gone");
+        assert_eq!(outcome.files_reindexed, 2);
+        assert_eq!(watcher.health(), WatchHealth::Healthy);
+        assert_eq!(watch_health(dir.path()), Some(WatchHealth::Healthy));
+        assert!(
+            full_calls.load(AtomicOrdering::SeqCst) >= 1,
+            "the recovery ran the full reconcile"
+        );
+        assert!(watcher.pending_files().is_empty());
+        watcher.stop();
+        assert_eq!(
+            watch_health(dir.path()),
+            None,
+            "a stopped watcher is unregistered"
+        );
     }
 
     /// A long foreground `index` holds the permanent index lock past a sync's

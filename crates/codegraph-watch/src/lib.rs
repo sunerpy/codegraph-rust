@@ -17,8 +17,11 @@ pub use sync::{
     sync_project_once, sync_project_once_cancellable, sync_project_once_with_progress,
 };
 pub use watcher::{
-    PendingFile, ProjectWatcher, WatchOptions, start_serve_watcher, watch_options_for_project,
+    LOCK_RECOVERY_INTERVAL, PendingFile, ProjectWatcher, WatchHealth, WatchOptions,
+    start_serve_watcher, watch_health, watch_options_for_project,
 };
+#[cfg(feature = "test-hooks")]
+pub use watcher::{WatchHealthGuard, register_watch_health_for_tests};
 pub use worktree::{
     WorktreeIndexMismatch, detect_worktree_index_mismatch, git_worktree_root,
     worktree_mismatch_notice, worktree_mismatch_warning,
