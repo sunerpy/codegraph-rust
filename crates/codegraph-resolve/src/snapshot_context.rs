@@ -174,6 +174,10 @@ struct SnapshotCaches {
     source_facts: BoundedFileMemo<Option<Arc<SourceFacts>>>,
     import_mappings: BoundedFileMemo<Arc<Vec<ImportMapping>>>,
     re_exports: BoundedFileMemo<Arc<Vec<ReExport>>>,
+    /// Filesystem existence probes for paths the snapshot does not know: the
+    /// same candidates are probed from every importing file, and the tree does
+    /// not change within a pass (upstream `fileExistsMemo`).
+    fs_exists: BoundedFileMemo<bool>,
     #[cfg(test)]
     counters: SnapshotCacheCounters,
 }
@@ -188,6 +192,7 @@ impl SnapshotCaches {
             source_facts: BoundedFileMemo::new(content_limit),
             import_mappings: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
             re_exports: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
+            fs_exists: BoundedFileMemo::new(crate::context::FILE_EXISTS_MEMO_LIMIT),
             #[cfg(test)]
             counters: SnapshotCacheCounters::default(),
         }
@@ -499,8 +504,10 @@ impl ResolutionContext for SnapshotResolutionContext {
         if normalized != file_path && self.snapshot.known_file_paths.contains(&normalized) {
             return true;
         }
-        pathutil::lexical_path_within_root(&self.snapshot.project_root, file_path)
-            .is_some_and(|full_path| full_path.exists())
+        self.caches.fs_exists.get_or_init(file_path, || {
+            pathutil::lexical_path_within_root(&self.snapshot.project_root, file_path)
+                .is_some_and(|full_path| full_path.exists())
+        })
     }
 
     fn read_file(&self, file_path: &str) -> Option<String> {

@@ -253,3 +253,31 @@ fn framework_extraction_skips_a_file_too_large_to_extract() {
         .collect::<Vec<_>>();
     assert_eq!(sources, vec!["src/app.ts"]);
 }
+
+/// Import resolution probes the same candidate paths (every extension of a
+/// specifier) from every file that imports it, and the tree does not change
+/// within a pass, so a pass answers each existence probe once (upstream
+/// v1.6.1's `fileExistsMemo`); the next pass probes afresh.
+#[test]
+fn existence_probes_are_answered_once_per_pass() {
+    let project = Project::new("exists-memo");
+    project.write("present.ts", "export const a = 1;\n");
+    let (store_context, snapshot) = contexts(&project);
+    for context in [&store_context as &dyn ResolutionContext, &snapshot] {
+        assert!(context.file_exists("present.ts"));
+        assert!(!context.file_exists("later.ts"));
+    }
+
+    project.write("later.ts", "export const b = 2;\n");
+    std::fs::remove_file(project.root.join("present.ts")).expect("remove");
+    for context in [&store_context as &dyn ResolutionContext, &snapshot] {
+        assert!(context.file_exists("present.ts"), "memoized for the pass");
+        assert!(!context.file_exists("later.ts"), "memoized for the pass");
+    }
+
+    let (store_context, snapshot) = contexts(&project);
+    for context in [&store_context as &dyn ResolutionContext, &snapshot] {
+        assert!(!context.file_exists("present.ts"));
+        assert!(context.file_exists("later.ts"));
+    }
+}

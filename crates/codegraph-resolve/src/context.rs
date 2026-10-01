@@ -51,7 +51,14 @@ struct Caches {
     workspace_packages: Option<Option<WorkspacePackages>>,
     all_files: Option<Arc<Vec<String>>>,
     files_by_basename: Option<HashMap<String, Arc<Vec<String>>>>,
+    /// Existence answers for the pass: import resolution probes every extension
+    /// of a specifier from every importing file, and neither the borrowed store
+    /// nor the tree changes within a pass (upstream `fileExistsMemo`).
+    file_exists: HashMap<String, bool>,
 }
+
+/// Bound on memoized existence answers; the memo restarts past it, as upstream.
+pub(crate) const FILE_EXISTS_MEMO_LIMIT: usize = 200_000;
 
 impl Caches {
     fn new() -> Self {
@@ -73,6 +80,7 @@ impl Caches {
             workspace_packages: None,
             all_files: None,
             files_by_basename: None,
+            file_exists: HashMap::new(),
         }
     }
 }
@@ -110,6 +118,7 @@ impl<'a> StoreResolutionContext<'a> {
         c.qualified_name_cache.clear();
         c.all_files = None;
         c.files_by_basename = None;
+        c.file_exists.clear();
     }
 
     fn cached_all_files(&self) -> Arc<Vec<String>> {
@@ -240,24 +249,28 @@ impl ResolutionContext for StoreResolutionContext<'_> {
     }
 
     fn file_exists(&self, file_path: &str) -> bool {
+        if let Some(&exists) = self.caches.borrow().file_exists.get(file_path) {
+            return exists;
+        }
         // Known-file fast path then filesystem fallback (index.ts:358-374).
         // The store is the index of known files.
-        if self.store.file_by_path(file_path).ok().flatten().is_some() {
-            return true;
-        }
         let normalized = file_path.replace('\\', "/");
-        if normalized != file_path
-            && self
-                .store
-                .file_by_path(&normalized)
-                .ok()
-                .flatten()
-                .is_some()
-        {
-            return true;
+        let exists = self.store.file_by_path(file_path).ok().flatten().is_some()
+            || (normalized != file_path
+                && self
+                    .store
+                    .file_by_path(&normalized)
+                    .ok()
+                    .flatten()
+                    .is_some())
+            || pathutil::lexical_path_within_root(&self.project_root, file_path)
+                .is_some_and(|full_path| full_path.exists());
+        let mut c = self.caches.borrow_mut();
+        if c.file_exists.len() >= FILE_EXISTS_MEMO_LIMIT {
+            c.file_exists.clear();
         }
-        pathutil::lexical_path_within_root(&self.project_root, file_path)
-            .is_some_and(|full_path| full_path.exists())
+        c.file_exists.insert(file_path.to_string(), exists);
+        exists
     }
 
     fn read_file(&self, file_path: &str) -> Option<String> {
