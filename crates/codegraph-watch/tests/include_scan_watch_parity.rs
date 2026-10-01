@@ -531,3 +531,65 @@ fn config_set_order_decides_which_negation_wins() {
          watcher either"
     );
 }
+
+/// The root `.gitignore` is read by ONE git-rules matcher on both sides, so the
+/// watcher handles exactly the files the scan indexes and watches every
+/// directory above them: anchored and any-depth rules, globs, `**`, no
+/// re-inclusion below an ignored directory, and JVM packages named `build`
+/// under bare, Android and Spring Initializr rules (#1642).
+#[test]
+fn scan_and_watch_agree_on_root_gitignore_rules() {
+    let files = [
+        "src/app.ts",
+        "artifacts/a.ts",
+        "src/artifacts/b.ts",
+        "src/types.gen.ts",
+        "docs/guide/draft/c.ts",
+        "docs/guide/final/d.ts",
+        "src/scratch/e.ts",
+        "logs/keep.ts",
+        "src/main/java/com/acme/build/Hidden.java",
+        "src/main/java/build/nested/build/Example.java",
+        "app/build/generated/Out.java",
+    ];
+    for gitignore in [
+        "/artifacts/\n*.gen.ts\ndocs/**/draft/\nscratch/\nlogs/\n!logs/keep.ts\n",
+        "build/\n",
+        "/build\n",
+        "build/\n!**/src/main/**/build/\n!**/src/test/**/build/\n",
+    ] {
+        let project = unique_project("gitignore_rules");
+        touch(&project, ".gitignore", gitignore);
+        for file in files {
+            touch(&project, file, "x");
+        }
+        let options = ExtractOptions::default();
+        let scanned = scan_project(&project, &options).expect("scan");
+        let policy = WatchPolicy::with_config(
+            &project,
+            &options.ignore_dirs,
+            &options.ignore_paths,
+            &[],
+            &[],
+        );
+        for file in files {
+            let in_scan = scanned.iter().any(|f| f == file);
+            assert_eq!(
+                in_scan,
+                policy.should_handle_file(file),
+                "scan⇔watch parity broken for .gitignore={gitignore:?} file={file}"
+            );
+            if in_scan {
+                let segments = file.split('/').collect::<Vec<_>>();
+                for depth in 1..segments.len() {
+                    let dir = segments[..depth].join("/");
+                    assert!(
+                        policy.should_watch_dir(&dir),
+                        ".gitignore={gitignore:?}: {dir} holds indexed {file} but is not watched"
+                    );
+                }
+            }
+        }
+        fs::remove_dir_all(&project).ok();
+    }
+}

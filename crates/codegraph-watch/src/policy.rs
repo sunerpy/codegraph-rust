@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use codegraph_extract::{ExtensionOverrides, detect_language_with};
+use codegraph_extract::{ExtensionOverrides, RootGitignore, detect_language_with};
 
 pub const CODEGRAPH_NO_WATCH: &str = "CODEGRAPH_NO_WATCH";
 
@@ -20,12 +20,6 @@ const WATCH_ONLY_DEFAULT_IGNORE_DIRS: &[&str] = &[
 ];
 
 #[derive(Debug, Clone)]
-struct IgnoreRule {
-    pattern: String,
-    negated: bool,
-}
-
-#[derive(Debug, Clone)]
 pub struct WatchPolicy {
     root: PathBuf,
     /// STRUCTURAL skips, mirroring the scan's pre-include prune in `scan_dir`:
@@ -41,11 +35,12 @@ pub struct WatchPolicy {
     /// uses, never [`rule_matches`] — whose `*` form compares BASENAMES, so it
     /// could never match a `res/values*` prefix against `res/values/strings.xml`.
     ignore_paths: Vec<String>,
-    /// The root `.gitignore` rules in file order — the NEGOTIABLE tail of the
-    /// last-match-wins stream (`ignore_paths` and `exclude` first, these last,
-    /// mirroring the scan's `pattern_sets`), so a `!pattern` line here re-includes
-    /// what an `ignore_paths`, `exclude`, or earlier `.gitignore` line dropped.
-    gitignore_rules: Vec<IgnoreRule>,
+    /// The root `.gitignore` — the NEGOTIABLE tail of the last-match-wins stream
+    /// (`ignore_paths` and `exclude` first, it last, mirroring the scan), so a
+    /// `!pattern` line here re-includes what an `ignore_paths`, `exclude`, or
+    /// earlier `.gitignore` line dropped. It is the scan's own git-rules
+    /// matcher, so the two read every `.gitignore` line identically.
+    gitignore: RootGitignore,
     include: Vec<String>,
     exclude: Vec<String>,
     /// The addressed project's custom extension→language overrides, so a file the
@@ -95,12 +90,12 @@ impl WatchPolicy {
                     .map(str::to_string),
             )
             .collect::<Vec<_>>();
-        let gitignore_rules = read_gitignore_rules(&root);
+        let gitignore = RootGitignore::load(&root);
         Self {
             root,
             structural_ignores,
             ignore_paths: ignore_paths.to_vec(),
-            gitignore_rules,
+            gitignore,
             include: include.to_vec(),
             exclude: exclude.to_vec(),
             extensions: ExtensionOverrides::empty(),
@@ -208,20 +203,16 @@ impl WatchPolicy {
     /// `gen/helper.ts` — and the set order is observable, so a `!` in `exclude`
     /// re-includes an `ignore_paths` match but not the reverse.
     ///
-    /// The ONLY deviation from the scan is which matcher each set uses, and it
-    /// is LOAD-BEARING — do not "simplify" this into a single matcher:
-    /// the two CONFIG sets use the SHARED whole-path
-    /// [`codegraph_extract::include_exclude_pattern_matches`] the scan itself
-    /// uses (its trailing-`*` form is a whole-path prefix, so `res/values*`
-    /// matches `res/values/strings.xml`), while `.gitignore` keeps the
-    /// watcher's basename-glob [`rule_matches`]. A `!` in a config set is
-    /// stripped and then re-matched with that set's OWN matcher, mirroring how
-    /// the scan strips then calls `pattern_matches`. The config sets are also
-    /// matched WITHOUT `is_dir`, exactly as the scan feeds a bare `relative` to
-    /// `is_path_ignored`; only the `.gitignore` fold is `is_dir`-aware. The
-    /// `.gitignore` rules arrive pre-parsed into [`IgnoreRule`] by
-    /// [`read_gitignore_rules`], so their `!` is already split off, whereas the
-    /// config sets are raw patterns with the `!` still inline.
+    /// Each set uses the scan's own matcher: the two CONFIG sets the SHARED
+    /// whole-path [`codegraph_extract::include_exclude_pattern_matches`] (its
+    /// trailing-`*` form is a whole-path prefix, so `res/values*` matches
+    /// `res/values/strings.xml`), and `.gitignore` the SHARED git-rules
+    /// [`RootGitignore`]. A `!` in a config set is stripped and then re-matched
+    /// with that set's OWN matcher, mirroring how the scan strips then calls
+    /// `pattern_matches`. The config sets are also matched WITHOUT `is_dir`,
+    /// exactly as the scan feeds a bare `relative` to `is_path_ignored`; only
+    /// the `.gitignore` verdict is `is_dir`-aware, and it walks the directories
+    /// above `relative` the way the scan carries them down its walk.
     fn matches_negotiable(&self, relative: &str, is_dir: bool) -> bool {
         let mut ignored = false;
         for set in [&self.ignore_paths, &self.exclude] {
@@ -235,12 +226,7 @@ impl WatchPolicy {
                 }
             }
         }
-        for rule in &self.gitignore_rules {
-            if rule_matches(&rule.pattern, relative, is_dir) {
-                ignored = !rule.negated;
-            }
-        }
-        ignored
+        self.gitignore.verdict(relative, is_dir).unwrap_or(ignored)
     }
 
     /// The scan's `IncludeSet::forces`/`wants_descend` knockout check, which is a
@@ -430,26 +416,6 @@ pub fn normalize_path(path: impl AsRef<Path>) -> String {
         .collect::<PathBuf>()
         .to_string_lossy()
         .replace('\\', "/")
-}
-
-fn read_gitignore_rules(root: &Path) -> Vec<IgnoreRule> {
-    fs::read_to_string(root.join(".gitignore"))
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                return None;
-            }
-            let (negated, pattern) = trimmed
-                .strip_prefix('!')
-                .map_or((false, trimmed), |pattern| (true, pattern));
-            Some(IgnoreRule {
-                pattern: pattern.trim_start_matches('/').to_string(),
-                negated,
-            })
-        })
-        .collect()
 }
 
 /// The `build/` structural rule, segment by segment: a `build` directory on the
@@ -690,7 +656,8 @@ mod tests {
         fs::write(dir.path().join(".gitignore"), "a/b/\n").unwrap();
         let policy = WatchPolicy::new(dir.path());
         assert!(!policy.should_watch_dir("a/b"));
-        assert!(!policy.should_watch_dir("x/a/b"));
+        // An inner `/` anchors the rule to the root, in git and in the scan.
+        assert!(policy.should_watch_dir("x/a/b"));
         assert!(!policy.should_watch_dir("a/b/c"));
         assert!(policy.should_watch_dir("a/bb"));
         assert!(policy.should_watch_dir("za/b"));

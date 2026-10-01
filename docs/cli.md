@@ -1032,9 +1032,14 @@ those paths; the reason is surfaced in the log.
 
 The watcher registers per-directory watches only on non-ignored directories,
 pruning `node_modules`, `.venv`, `__pycache__`, `target`, `dist`, `.godot`,
-`.cache`, `.git`, `.codegraph`, and everything else in the
-default ignore set, plus any paths matched by the root `.gitignore`. This pruning applies at any
-nesting depth, so an `node_modules` buried several levels deep is never walked.
+`.cache`, `.git`, `.codegraph`, and everything else in the default ignore set at
+any nesting depth, so a `node_modules` buried several levels deep is never walked.
+A `build` directory that is a Java, Kotlin or Scala package under a source root
+(`src/<sourceSet>/{java,kotlin,scala}/…/build`) is source rather than build
+output, so it stays indexed and watched. The root `.gitignore` prunes the index
+and the watcher alike, with git's own rules: a slash-less rule applies at any
+depth, a leading or inner `/` anchors it to the project root, `*` and `**` glob,
+and `!` re-includes a path unless a directory above it is ignored.
 This keeps the total watch count well inside the OS inotify limit on large trees
 and makes daemon startup fast. A newly-created non-ignored directory is picked up
 automatically on its create event — no restart required.

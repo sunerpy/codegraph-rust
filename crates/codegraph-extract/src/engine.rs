@@ -487,10 +487,10 @@ pub fn scan_project_with_stats(root: &Path, options: &ExtractOptions) -> Result<
         .iter()
         .map(String::as_str)
         .collect::<HashSet<_>>();
-    let gitignore = read_root_gitignore(root);
+    let gitignore = RootGitignore::load(root);
     // Evaluated in order (default paths → config exclude → .gitignore), so a
     // later `!pattern` negation re-includes a path an earlier set excluded.
-    let pattern_sets: Vec<&[String]> = vec![&options.ignore_paths, &options.exclude, &gitignore];
+    let pattern_sets: Vec<&[String]> = vec![&options.ignore_paths, &options.exclude];
     let include = IncludeSet::new(&options.include, &options.exclude);
     // The EXACT resolved reserved index-root PATH for THIS project, resolved
     // once. scan_dir prunes a directory iff its FULL path equals this root,
@@ -506,6 +506,7 @@ pub fn scan_project_with_stats(root: &Path, options: &ExtractOptions) -> Result<
         &ignored_dirs,
         &reserved_roots,
         &pattern_sets,
+        (&gitignore, GitignoreAncestry::default()),
         &include,
         &options.extensions,
         &mut files,
@@ -525,6 +526,7 @@ fn scan_dir(
     ignored_dirs: &HashSet<&str>,
     reserved_roots: &std::collections::BTreeSet<PathBuf>,
     pattern_sets: &[&[String]],
+    (gitignore, above): (&RootGitignore, GitignoreAncestry),
     include: &IncludeSet,
     overrides: &ExtensionOverrides,
     files: &mut Vec<String>,
@@ -551,8 +553,9 @@ fn scan_dir(
         if is_reserved_root_here || (ignored_dirs.contains(name.as_ref()) && !jvm_package) {
             continue;
         }
-        let ignored = is_path_ignored(&relative, pattern_sets);
         let file_type = entry.file_type()?;
+        let own = gitignore.matched(&relative, file_type.is_dir());
+        let ignored = is_path_ignored(&relative, pattern_sets, above.decide(own));
         if file_type.is_dir() {
             // A model-ignored dir is normally pruned before descent, so a FILE
             // include under a gitignored ancestor would never be reached.
@@ -567,6 +570,7 @@ fn scan_dir(
                 ignored_dirs,
                 reserved_roots,
                 pattern_sets,
+                (gitignore, above.child(own)),
                 include,
                 overrides,
                 files,
@@ -627,22 +631,96 @@ fn size_skip_result(file_path: &str, size: u64, max: u64) -> ExtractionResult {
     }
 }
 
-fn read_root_gitignore(root: &Path) -> Vec<String> {
-    fs::read_to_string(root.join(".gitignore"))
-        .unwrap_or_default()
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(ToOwned::to_owned)
-        .collect()
+/// The project-root `.gitignore`, read with git's own rules through the
+/// `ignore` crate, as upstream reads it with the `ignore` package: a leading or
+/// inner `/` anchors a rule to the root, a slash-less rule applies at any
+/// depth, `*` and `**` glob, a trailing `/` matches directories only, and `!`
+/// re-includes. Shared with `codegraph-watch`, so the watcher's `.gitignore`
+/// verdict is the scan's by construction. An unreadable, non-UTF-8 or NUL-laden
+/// file is treated as absent and an unparseable line is skipped, never fatal.
+#[derive(Debug, Clone, Default)]
+pub struct RootGitignore {
+    matcher: Option<ignore::gitignore::Gitignore>,
 }
 
-/// Evaluate ordered `.gitignore`-style pattern sets with last-match-wins
-/// negation: a `!pattern` line un-ignores a path an earlier pattern excluded.
-/// Sets are scanned in order, patterns within a set in order, and the final
-/// matching pattern decides — so a later `!res/values/` re-includes what a
-/// default `res/values*` excluded.
-fn is_path_ignored(relative: &str, pattern_sets: &[&[String]]) -> bool {
+impl RootGitignore {
+    pub fn load(root: &Path) -> Self {
+        let Ok(text) = fs::read_to_string(root.join(".gitignore")) else {
+            return Self::default();
+        };
+        if text.contains('\0') {
+            return Self::default();
+        }
+        // Rooted at `.` so a root-relative candidate is never prefix-stripped.
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(".");
+        for line in text.lines() {
+            // An invalid glob drops only its own line; the rest still apply.
+            let _ = builder.add_line(None, line);
+        }
+        let matcher = builder.build().ok().filter(|matcher| !matcher.is_empty());
+        Self { matcher }
+    }
+
+    /// The root `.gitignore` verdict for `relative` (root-relative,
+    /// `/`-separated): `Some(true)` ignored, `Some(false)` re-included, `None`
+    /// undecided. Walks the directories above it; the scan instead carries
+    /// that state down its walk in a [`GitignoreAncestry`].
+    pub fn verdict(&self, relative: &str, is_dir: bool) -> Option<bool> {
+        self.matcher.as_ref()?;
+        let above = relative
+            .match_indices('/')
+            .fold(GitignoreAncestry::default(), |above, (end, _)| {
+                above.child(self.matched(&relative[..end], true))
+            });
+        above.decide(self.matched(relative, is_dir))
+    }
+
+    /// The last rule matching `relative` itself, ignoring its ancestors.
+    fn matched(&self, relative: &str, is_dir: bool) -> Option<bool> {
+        match self.matcher.as_ref()?.matched(relative, is_dir) {
+            ignore::Match::None => None,
+            ignore::Match::Ignore(_) => Some(true),
+            ignore::Match::Whitelist(_) => Some(false),
+        }
+    }
+}
+
+/// What the root `.gitignore` decided for the directories above a path.
+#[derive(Debug, Clone, Copy, Default)]
+struct GitignoreAncestry {
+    ignored: bool,
+    reincluded: bool,
+}
+
+impl GitignoreAncestry {
+    /// The ancestry of an entry below a directory whose own verdict was `own`.
+    fn child(self, own: Option<bool>) -> Self {
+        Self {
+            ignored: self.ignored || own == Some(true),
+            reincluded: self.reincluded || own == Some(false),
+        }
+    }
+
+    /// An ignored ancestor hides the path, since git never re-includes below an
+    /// excluded directory; otherwise the path's own last matching rule decides,
+    /// and failing that a re-included ancestor re-includes it, so `!res/values/`
+    /// still overrides a default path set that matched the files inside.
+    fn decide(self, own: Option<bool>) -> Option<bool> {
+        if self.ignored {
+            Some(true)
+        } else {
+            own.or(self.reincluded.then_some(false))
+        }
+    }
+}
+
+/// Evaluate the ordered `.gitignore`-style config pattern sets with last-match
+/// wins negation, then let the root `.gitignore` verdict, when it has one,
+/// decide last: a `!pattern` line un-ignores a path an earlier pattern
+/// excluded. Sets are scanned in order, patterns within a set in order, and the
+/// final matching pattern decides — so a later `!res/values/` re-includes what
+/// a default `res/values*` excluded.
+fn is_path_ignored(relative: &str, pattern_sets: &[&[String]], gitignore: Option<bool>) -> bool {
     let mut ignored = false;
     for set in pattern_sets {
         for pattern in set.iter() {
@@ -655,7 +733,7 @@ fn is_path_ignored(relative: &str, pattern_sets: &[&[String]]) -> bool {
             }
         }
     }
-    ignored
+    gitignore.unwrap_or(ignored)
 }
 
 fn pattern_matches(relative: &str, pattern: &str) -> bool {
@@ -1406,14 +1484,20 @@ mod tests {
     fn is_path_ignored_negation_is_last_match_wins() {
         let defaults = vec!["res/values*".to_string()];
         let user = vec!["!res/values/".to_string()];
-        assert!(is_path_ignored("res/values/strings.xml", &[&defaults]));
+        assert!(is_path_ignored(
+            "res/values/strings.xml",
+            &[&defaults],
+            None
+        ));
         assert!(!is_path_ignored(
             "res/values/strings.xml",
-            &[&defaults, &user]
+            &[&defaults, &user],
+            None
         ));
         assert!(is_path_ignored(
             "res/values-es/strings.xml",
-            &[&defaults, &user]
+            &[&defaults, &user],
+            None
         ));
     }
 
@@ -1430,6 +1514,71 @@ mod tests {
             ".gitignore vendor/ must be skipped: {files:?}"
         );
         fs::remove_dir_all(&project).ok();
+    }
+
+    /// The root `.gitignore` is read with git's own rules, as upstream's `ignore`
+    /// matcher reads it: a leading or inner `/` anchors a rule to the root, a
+    /// slash-less rule applies at any depth, `*` and `**` glob, and nothing below
+    /// an ignored directory can be re-included.
+    #[test]
+    fn scan_project_reads_the_root_gitignore_with_git_rules() {
+        let project = unique_project("gitignore_git_rules");
+        touch(
+            &project,
+            ".gitignore",
+            "/artifacts/\n*.gen.ts\ndocs/**/draft/\nscratch/\nlogs/\n!logs/keep.ts\n",
+        );
+        for file in [
+            "src/app.ts",
+            "artifacts/a.ts",
+            "src/artifacts/b.ts",
+            "src/types.gen.ts",
+            "docs/guide/draft/c.ts",
+            "docs/guide/final/d.ts",
+            "src/scratch/e.ts",
+            "logs/keep.ts",
+        ] {
+            touch(&project, file, "export const x = 1;\n");
+        }
+        let files = scan_project(&project, &ExtractOptions::default()).expect("scan");
+        assert_eq!(
+            files,
+            vec!["docs/guide/final/d.ts", "src/app.ts", "src/artifacts/b.ts"]
+        );
+        fs::remove_dir_all(&project).ok();
+    }
+
+    /// An explicit root `.gitignore` still decides a JVM package named `build`
+    /// (upstream #1642): a bare `build/` hides it as git does, while Android's
+    /// anchored `/build` and Spring Initializr's `build/` plus
+    /// `!**/src/main/**/build/` keep it. Module build output stays pruned.
+    #[test]
+    fn root_gitignore_still_decides_jvm_packages_named_build() {
+        for (gitignore, kept) in [
+            ("build/\n", false),
+            ("/build\n", true),
+            (
+                "build/\n!**/src/main/**/build/\n!**/src/test/**/build/\n",
+                true,
+            ),
+        ] {
+            let project = unique_project("jvm_build_gitignore");
+            touch(&project, ".gitignore", gitignore);
+            touch(&project, "src/main/java/App.java", "class App {}");
+            touch(
+                &project,
+                "src/main/java/com/acme/build/Hidden.java",
+                "class Hidden {}",
+            );
+            touch(&project, "app/build/generated/Out.java", "class Out {}");
+            let files = scan_project(&project, &ExtractOptions::default()).expect("scan");
+            let mut expected = vec!["src/main/java/App.java".to_string()];
+            if kept {
+                expected.push("src/main/java/com/acme/build/Hidden.java".to_string());
+            }
+            assert_eq!(files, expected, "{gitignore:?}");
+            fs::remove_dir_all(&project).ok();
+        }
     }
 
     #[test]
