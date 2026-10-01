@@ -577,6 +577,54 @@ struct FormSpec {
     re: Regex,
     key_from: Option<fn(&str) -> Option<DerivedKey>>,
     key_window: Option<usize>,
+    /// Final say on a match, for forms whose argument decides it.
+    accept: Option<AcceptMatch>,
+}
+
+/// Given the stripped and original bytes and the offset just past a match,
+/// `false` drops the match.
+type AcceptMatch = fn(&[u8], &[u8], usize) -> bool;
+
+/// Whether the call argument starting at `start` is anything but ONE complete
+/// string literal (upstream #1967): `import('./a')` or a backtick string with
+/// no substitution is an ordinary import, while a template with a `${}`
+/// substitution, a concatenation or a bare expression picks the module at
+/// runtime. String contents are blank in `stripped` (quotes kept), so the
+/// substitution check reads `original` at the same offsets.
+fn is_runtime_import_argument(stripped: &[u8], original: &[u8], start: usize) -> bool {
+    let skip_space = |mut at: usize| {
+        while stripped.get(at).is_some_and(u8::is_ascii_whitespace) {
+            at += 1;
+        }
+        at
+    };
+    let open = skip_space(start);
+    let quote = match stripped.get(open) {
+        Some(b')') => return false, // `import()` — nothing to resolve
+        Some(&quote @ (b'"' | b'\'' | b'`')) => quote,
+        _ => return true,
+    };
+    let Some(close) = stripped[open + 1..]
+        .iter()
+        .position(|&byte| byte == quote)
+        .map(|offset| open + 1 + offset)
+    else {
+        return false;
+    };
+    if quote == b'`' {
+        let mut at = open + 1;
+        while at < close {
+            match original.get(at) {
+                // An escape pair: `\${` is literal text, but `\\${` interpolates.
+                Some(b'\\') => at += 2,
+                Some(b'$') if original.get(at + 1) == Some(&b'{') => return true,
+                _ => at += 1,
+            }
+        }
+    }
+    // `)` ends the call and `,` starts import()'s options argument; anything
+    // else (`+`, `.concat(`, …) builds the specifier at runtime.
+    !matches!(stripped.get(skip_space(close + 1)), Some(b')' | b','))
 }
 
 fn key_computed_call(orig: &str) -> Option<DerivedKey> {
@@ -638,15 +686,16 @@ fn forms() -> &'static [FormSpec] {
                 re: Regex::new(r"[\w$)\]]\s*\[([^\[\]\n]{1,80})\]\s*\(").expect("computed-call"),
                 key_from: Some(key_computed_call),
                 key_window: None,
+                accept: None,
             },
             FormSpec {
                 form: "dynamic-import",
                 label: "dynamic import",
                 langs: Some(JS_FAMILY),
-                re: Regex::new(r#"\b(?:import|require)\s*\(\s*(?:[^\s'"`)])"#)
-                    .expect("dynamic-import-js"),
+                re: Regex::new(r"\b(?:import|require)\s*\(").expect("dynamic-import-js"),
                 key_from: None,
                 key_window: None,
+                accept: Some(is_runtime_import_argument),
             },
             FormSpec {
                 form: "dynamic-import",
@@ -656,6 +705,7 @@ fn forms() -> &'static [FormSpec] {
                     .expect("dynamic-import-py"),
                 key_from: None,
                 key_window: None,
+                accept: None,
             },
             FormSpec {
                 form: "ruby-send",
@@ -665,6 +715,7 @@ fn forms() -> &'static [FormSpec] {
                     .expect("ruby-send"),
                 key_from: Some(key_ruby_send),
                 key_window: None,
+                accept: None,
             },
             FormSpec {
                 form: "php-dynamic",
@@ -676,6 +727,7 @@ fn forms() -> &'static [FormSpec] {
                 .expect("php-dynamic"),
                 key_from: Some(key_single_literal),
                 key_window: Some(80),
+                accept: None,
             },
             FormSpec {
                 form: "reflection",
@@ -687,6 +739,7 @@ fn forms() -> &'static [FormSpec] {
                 .expect("reflection"),
                 key_from: Some(key_single_literal),
                 key_window: Some(80),
+                accept: None,
             },
             FormSpec {
                 form: "proxy-reflect",
@@ -696,6 +749,7 @@ fn forms() -> &'static [FormSpec] {
                     .expect("proxy-reflect"),
                 key_from: None,
                 key_window: None,
+                accept: None,
             },
             FormSpec {
                 form: "typed-bus",
@@ -707,6 +761,7 @@ fn forms() -> &'static [FormSpec] {
                 .expect("typed-bus"),
                 key_from: Some(key_typed_bus),
                 key_window: None,
+                accept: None,
             },
             FormSpec {
                 form: "var-key-dispatch",
@@ -718,6 +773,7 @@ fn forms() -> &'static [FormSpec] {
                 .expect("var-key-dispatch"),
                 key_from: None,
                 key_window: None,
+                accept: None,
             },
             FormSpec {
                 form: "selector",
@@ -727,6 +783,7 @@ fn forms() -> &'static [FormSpec] {
                     .expect("selector"),
                 key_from: Some(key_selector),
                 key_window: None,
+                accept: None,
             },
         ]
     })
@@ -1008,6 +1065,11 @@ pub fn scan_dynamic_dispatch(
             continue;
         }
         for m in spec.re.find_iter(&stripped_str) {
+            if let Some(accept) = spec.accept
+                && !accept(&stripped, original, m.end())
+            {
+                continue;
+            }
             let m_index = m.start();
             let mut slice_end = m.end();
             if let Some(window) = spec.key_window {
@@ -1056,6 +1118,39 @@ pub fn scan_dynamic_dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A JS dynamic import is a runtime boundary unless its argument is exactly
+    /// one complete string literal (upstream #1967).
+    #[test]
+    fn js_dynamic_import_flags_templates_concatenations_and_expressions() {
+        let flagged = |body: &str| {
+            scan_dynamic_dispatch(body, "typescript", 1)
+                .iter()
+                .any(|m| m.form == "dynamic-import")
+        };
+        for runtime in [
+            "const m = await import(`./locales/${lang}.js`);",
+            "const m = await import('./x/' + y);",
+            "const m = await import(\"./a\".concat(b));",
+            "const m = await import(name);",
+            "const m = require('./plugins/' + id);",
+            "const m = await import(`\\\\${dir}/a.js`);",
+        ] {
+            assert!(flagged(runtime), "{runtime}");
+        }
+        for literal in [
+            "const m = await import('./a');",
+            "const m = await import(\"./a\");",
+            "const m = await import(`./a.js`);",
+            "const m = await import('./data.json', { with: { type: 'json' } });",
+            "const m = await import(`\\${literal}.js`);",
+            "const m = await import( './spaced' );",
+            "const m = require('./a');",
+            "import();",
+        ] {
+            assert!(!flagged(literal), "{literal}");
+        }
+    }
 
     fn one(body: &str, lang: &str, start: i64) -> BoundaryMatch {
         let mut m = scan_dynamic_dispatch(body, lang, start);
