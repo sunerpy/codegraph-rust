@@ -14,6 +14,13 @@ use crate::process::is_process_alive;
 
 const EMPTY_RETRY_DELAY: Duration = Duration::from_millis(20);
 
+/// Waits between retries of a pid-file replace on Windows, doubling to a cap:
+/// eight attempts wait about 1.6s in all, well inside a launcher's connect
+/// window (upstream #2053, #1773). Windows refuses to replace a file another
+/// process holds open without sharing deletion — an antivirus scan, an indexer
+/// — for a moment, and for longer on a loaded machine.
+const LOCK_REPLACE_RETRY_DELAYS_MS: [u64; 7] = [25, 50, 100, 200, 400, 400, 400];
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DaemonLockInfo {
@@ -85,9 +92,17 @@ pub fn try_acquire_daemon_lock(project_root: &Path) -> Result<AcquireResult> {
         .create_new(true)
         .open(&pid_path)
     {
-        Ok(_placeholder) => {
-            fs::rename(&tmp, &pid_path)
-                .with_context(|| format!("publishing daemon lock {}", pid_path.display()))?;
+        Ok(placeholder) => {
+            drop(placeholder);
+            replace_owned_lock(
+                &pid_path,
+                &tmp,
+                "",
+                is_transient_sharing_violation,
+                |from, to| fs::rename(from, to),
+                thread::sleep,
+            )
+            .with_context(|| format!("publishing daemon lock {}", pid_path.display()))?;
             true
         }
         Err(err) if err.kind() == ErrorKind::AlreadyExists => {
@@ -118,9 +133,61 @@ pub fn rewrite_lock_socket_path(pid_path: &Path, socket_path: &Path) -> Result<(
     let mut info = decode_lock_info(&raw)
         .with_context(|| format!("decoding daemon lock {}", pid_path.display()))?;
     info.socket_path = socket_path.to_path_buf();
-    fs::write(pid_path, encode_lock_info(&info)?)
-        .with_context(|| format!("rewriting daemon lock {}", pid_path.display()))?;
-    Ok(())
+    // A complete temp record renamed over the lock, so a reader never sees a
+    // truncated one, and only while the lock still holds the record read above.
+    let tmp = pid_path.with_extension(format!("pid.{}.bound", process::id()));
+    fs::write(&tmp, encode_lock_info(&info)?)
+        .with_context(|| format!("writing temp daemon lock {}", tmp.display()))?;
+    replace_owned_lock(
+        pid_path,
+        &tmp,
+        &raw,
+        is_transient_sharing_violation,
+        |from, to| fs::rename(from, to),
+        thread::sleep,
+    )
+    .with_context(|| format!("rewriting daemon lock {}", pid_path.display()))
+}
+
+/// Replace `pid_path` with the fully written `tmp` while `pid_path` still holds
+/// `expected`. A transient failure (`is_transient`) is retried per
+/// [`LOCK_REPLACE_RETRY_DELAYS_MS`], re-checking ownership before every
+/// attempt, so a retry never replaces a record whose owner changed meanwhile;
+/// any other failure aborts at once. `tmp` is removed unless it was renamed.
+fn replace_owned_lock(
+    pid_path: &Path,
+    tmp: &Path,
+    expected: &str,
+    is_transient: impl Fn(&std::io::Error) -> bool,
+    mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+    mut wait: impl FnMut(Duration),
+) -> Result<()> {
+    let outcome = (|| {
+        let mut delays = LOCK_REPLACE_RETRY_DELAYS_MS.iter();
+        loop {
+            let current = fs::read_to_string(pid_path).unwrap_or_default();
+            if current != expected {
+                anyhow::bail!("lost daemon lock ownership of {}", pid_path.display());
+            }
+            match rename(tmp, pid_path) {
+                Ok(()) => return Ok(()),
+                Err(error) if is_transient(&error) => match delays.next() {
+                    Some(delay) => wait(Duration::from_millis(*delay)),
+                    None => return Err(error.into()),
+                },
+                Err(error) => return Err(error.into()),
+            }
+        }
+    })();
+    let _ = fs::remove_file(tmp);
+    outcome
+}
+
+/// A Windows sharing failure another process's open handle causes:
+/// `ERROR_ACCESS_DENIED`, `ERROR_SHARING_VIOLATION` or `ERROR_LOCK_VIOLATION`.
+/// Never transient elsewhere.
+fn is_transient_sharing_violation(error: &std::io::Error) -> bool {
+    cfg!(windows) && matches!(error.raw_os_error(), Some(5 | 32 | 33))
 }
 
 pub fn clear_stale_daemon_lock(pid_path: &Path, expected_dead_pid: Option<u32>) -> bool {
@@ -411,6 +478,123 @@ fn now_millis() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sharing_violation() -> std::io::Error {
+        std::io::Error::from_raw_os_error(32)
+    }
+
+    /// The replace a lock publish ends with retries a transient sharing
+    /// violation, re-checking ownership first, and never touches a record
+    /// whose owner changed (upstream #2053, #1773).
+    #[test]
+    fn lock_replace_retries_transient_failures_while_the_record_is_ours() {
+        let base = temp_base("replace-retry");
+        let pid_path = base.join("daemon.pid");
+        let tmp = base.join("daemon.pid.tmp");
+        fs::create_dir_all(&base).unwrap();
+        fs::write(&pid_path, "ours").unwrap();
+        fs::write(&tmp, "next").unwrap();
+
+        let mut failures = 3;
+        let mut waits = Vec::new();
+        replace_owned_lock(
+            &pid_path,
+            &tmp,
+            "ours",
+            |_| true,
+            |from, to| {
+                if failures > 0 {
+                    failures -= 1;
+                    return Err(sharing_violation());
+                }
+                fs::rename(from, to)
+            },
+            |delay| waits.push(delay.as_millis()),
+        )
+        .expect("transient failures are retried");
+        assert_eq!(fs::read_to_string(&pid_path).unwrap(), "next");
+        assert!(!tmp.exists());
+        assert_eq!(waits, vec![25, 50, 100]);
+
+        // A failure that never clears gives up after the whole budget.
+        fs::write(&tmp, "later").unwrap();
+        let mut attempts = 0;
+        let mut waits = Vec::new();
+        let result = replace_owned_lock(
+            &pid_path,
+            &tmp,
+            "next",
+            |_| true,
+            |_, _| {
+                attempts += 1;
+                Err(sharing_violation())
+            },
+            |delay| waits.push(delay.as_millis()),
+        );
+        assert!(result.is_err());
+        assert_eq!(attempts, 8);
+        assert_eq!(waits, vec![25, 50, 100, 200, 400, 400, 400]);
+        assert!(!tmp.exists(), "the temp record is cleaned up");
+        assert_eq!(fs::read_to_string(&pid_path).unwrap(), "next");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn lock_replace_stops_on_lost_ownership_and_on_non_transient_errors() {
+        let base = temp_base("replace-stop");
+        let pid_path = base.join("daemon.pid");
+        let tmp = base.join("daemon.pid.tmp");
+        fs::create_dir_all(&base).unwrap();
+        fs::write(&pid_path, "ours").unwrap();
+        fs::write(&tmp, "next").unwrap();
+
+        let mut attempts = 0;
+        let result = replace_owned_lock(
+            &pid_path,
+            &tmp,
+            "ours",
+            |_| true,
+            |_, to| {
+                attempts += 1;
+                // Another daemon takes the lock while this one waits.
+                fs::write(to, "theirs").unwrap();
+                Err(sharing_violation())
+            },
+            |_| {},
+        );
+        assert!(result.is_err());
+        assert_eq!(attempts, 1, "a changed owner stops the retry");
+        assert_eq!(fs::read_to_string(&pid_path).unwrap(), "theirs");
+
+        fs::write(&tmp, "next").unwrap();
+        let mut attempts = 0;
+        let result = replace_owned_lock(
+            &pid_path,
+            &tmp,
+            "theirs",
+            |_| false,
+            |_, _| {
+                attempts += 1;
+                Err(std::io::Error::other("disk full"))
+            },
+            |_| {},
+        );
+        assert!(result.is_err());
+        assert_eq!(attempts, 1, "a non-transient error is not retried");
+        assert!(!tmp.exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn only_windows_sharing_errors_are_transient() {
+        assert_eq!(
+            is_transient_sharing_violation(&sharing_violation()),
+            cfg!(windows)
+        );
+        assert!(!is_transient_sharing_violation(&std::io::Error::other(
+            "disk full"
+        )));
+    }
 
     #[test]
     fn legacy_plain_pid_decodes() {
