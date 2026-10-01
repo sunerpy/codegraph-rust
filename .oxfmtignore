@@ -1,10 +1,13 @@
 # oxfmt ignore — files oxfmt must NOT touch.
 #
 # Release-please owns changelog and manifest bytes; the general repository
-# formatter must not rewrite them between release PR updates.
+# formatter must not rewrite them between release PR updates. Its JSON
+# extra-file updater rewrites the whole of `.github/scaffold.json` (an inline
+# array comes back expanded), so oxfmt must leave that file to it as well.
 changelog/
 .release-please-manifest.json
 release-please-config.json
+.github/scaffold.json
 
 # Frozen/hash-addressed upstream-sync provenance. These bytes are reviewed and
 # verified by SHA rather than rewritten by the general Markdown formatter.

@@ -1,6 +1,8 @@
 {
   "profile": "rust",
-  "addons": ["codecov"],
+  "addons": [
+    "codecov"
+  ],
   "placeholders": {
     "BINARY": "codegraph",
     "CRATE": "codegraph-rs",
