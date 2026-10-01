@@ -22,6 +22,7 @@ use codegraph_resolve::frameworks::godot_dsl_config::GodotDslConfig;
 use codegraph_store::queries::{FileReferenceSite, ReferenceSite};
 use codegraph_store::{IndexLease, Store, StoreWriteOpen, StoreWritePurpose};
 
+use crate::link_state::{RehashUnder, record_followed_links};
 use crate::policy::WatchPolicy;
 
 /// Bounded wall-clock budget for acquiring the ONE outer exclusive lease a sync
@@ -147,7 +148,11 @@ pub fn pending_project_changes(
     let project_root = project_root.as_ref();
     let paths = index_paths(project_root)?;
     let scope = ProjectScope::load(project_root, &paths)?;
-    let on_disk = codegraph_extract::engine::scan_project(project_root, &scope.options)?;
+    let scan = codegraph_extract::engine::scan_project_with_stats(project_root, &scope.options)?;
+    // A path reached through a new, retargeted or unrecorded link is re-read:
+    // its stored stat may describe a different file (#935).
+    let rehash = RehashUnder::for_scan(store, &scan.links)?;
+    let on_disk = scan.files;
     let tracked = store
         .all_files()?
         .into_iter()
@@ -169,7 +174,9 @@ pub fn pending_project_changes(
             continue;
         };
         let metadata = fs::metadata(&full).with_context(|| format!("stat {}", full.display()))?;
-        if stored.size == metadata.len() as i64 && stored.modified_at == modified_millis(&metadata)
+        if stored.size == metadata.len() as i64
+            && stored.modified_at == modified_millis(&metadata)
+            && !rehash.covers(&relative)
         {
             continue;
         }
@@ -247,7 +254,11 @@ fn sync_project_once_with_scope(
     let _active = cancel.map(SyncCancellation::enter);
     match open_sync_writer(paths, cancel)? {
         SyncWriter::Incremental(mut store) => {
-            let mut candidates = codegraph_extract::engine::scan_project(project_root, options)?;
+            let scan = codegraph_extract::engine::scan_project_with_stats(project_root, options)?;
+            // Re-read whatever a new, retargeted or unrecorded link reaches, so a
+            // same-stat file behind a moved link cannot keep its old graph (#935).
+            let rehash = RehashUnder::for_scan(&store, &scan.links)?;
+            let mut candidates = scan.files;
             // Cold CLI sync has no watcher event list, so removals are found by
             // diffing tracked files against scan_project's current in-scope set.
             // This includes both physically absent files and still-present files
@@ -270,12 +281,14 @@ fn sync_project_once_with_scope(
                 project_root,
                 candidates,
                 Some(&on_disk),
+                &rehash,
                 scope,
                 &include,
                 &exclude,
                 started,
                 on_progress,
             )?;
+            record_followed_links(&store, &scan.links)?;
             store.finish_current_mutation()?;
             Ok(outcome)
         }
@@ -425,6 +438,7 @@ fn sync_changed_paths_current_scope(
                 project_root,
                 changed,
                 None,
+                &RehashUnder::default(),
                 &scope,
                 &include,
                 &exclude,
@@ -451,6 +465,7 @@ fn sync_paths_with_store(
     project_root: &Path,
     paths: impl IntoIterator<Item = impl AsRef<Path>>,
     scanned: Option<&HashSet<String>>,
+    rehash: &RehashUnder,
     scope: &ProjectScope,
     include: &[String],
     exclude: &[String],
@@ -506,6 +521,7 @@ fn sync_paths_with_store(
             store,
             &relative,
             scope,
+            rehash,
             &mut outcome,
             &mut dependent_sites,
             &mut dependent_fallbacks,
@@ -759,6 +775,7 @@ fn sync_one(
     store: &mut Store,
     relative: &str,
     scope: &ProjectScope,
+    rehash: &RehashUnder,
     outcome: &mut SyncOutcome,
     dependent_sites: &mut BTreeMap<String, BTreeSet<ReferenceSite>>,
     dependent_fallbacks: &mut BTreeSet<String>,
@@ -793,6 +810,7 @@ fn sync_one(
     if let Some(file) = &stored
         && file.size == metadata.len() as i64
         && file.modified_at == modified_millis(&metadata)
+        && !rehash.covers(relative)
     {
         outcome.files_skipped_unchanged += 1;
         return Ok(false);

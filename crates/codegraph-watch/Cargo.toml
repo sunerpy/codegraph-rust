@@ -23,6 +23,7 @@ serde = { workspace = true }
 anyhow = { workspace = true }
 notify = { workspace = true }
 rusqlite = { workspace = true }
+serde_json = { workspace = true }
 codegraph-core = { path = "../codegraph-core" }
 codegraph-extract = { path = "../codegraph-extract" }
 codegraph-resolve = { path = "../codegraph-resolve" }

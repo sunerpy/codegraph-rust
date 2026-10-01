@@ -5289,6 +5289,8 @@ fn index_project_inner(
     });
     top_unsupported_extensions.truncate(5);
     let files = scan.files;
+    // Recorded with the index so a later sync can tell a retargeted link (#935).
+    let followed_links = scan.links;
     let scan_duration = scan_started.elapsed();
     let mut diagnostic_run = DiagnosticRun::start(
         project,
@@ -5671,6 +5673,7 @@ fn index_project_inner(
         json!({}),
     );
     store.set_project_metadata("indexed_with_version", VERSION)?;
+    codegraph_watch::record_followed_links(&store, &followed_links)?;
     let after = store.counts()?;
     // Explicit fallible finalization: pragma restore -> checkpoint + compaction ->
     // extraction stamp -> stamp checkpoint -> close the final connection ->

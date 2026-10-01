@@ -1,4 +1,5 @@
 mod git;
+mod link_state;
 mod migrate;
 mod policy;
 mod sync;
@@ -9,6 +10,7 @@ pub use git::{
     DEFAULT_SYNC_HOOKS, GitHookName, GitHookResult, install_git_sync_hooks, is_git_repo,
     is_sync_hook_installed, remove_git_sync_hooks,
 };
+pub use link_state::{FOLLOWED_LINKS_KEY, record_followed_links};
 pub use policy::{
     CODEGRAPH_NO_WATCH, TooBroadRoot, WatchPolicy, too_broad_root_reason, watch_disabled_reason,
 };

@@ -17,8 +17,8 @@ use std::time::Instant;
 use tree_sitter::Parser;
 
 use crate::ext_config::ExtensionOverrides;
-use crate::links::LinkWalk;
 use crate::lang::{cpp_code_mask, spec_for_language};
+use crate::links::LinkWalk;
 use crate::walker::TreeSitterWalker;
 use codegraph_core::source_file::{SourceText, read_source_file};
 
@@ -630,8 +630,7 @@ impl ScanWalk<'_> {
                     continue;
                 }
                 if is_link {
-                    self.links
-                        .queue(hops + 1, relative, path, above.child(own));
+                    self.links.queue(hops + 1, relative, path, above.child(own));
                     continue;
                 }
                 let canonical = canonical_dir.join(&file_name);

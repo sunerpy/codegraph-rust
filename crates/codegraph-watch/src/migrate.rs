@@ -73,7 +73,8 @@ pub(crate) fn migrate_project(
     let options = &scope.options;
     // `scan_project` returns a SORTED list, and every downstream pass keeps that
     // order, so no HashSet iteration order can reach the database or the outcome.
-    let candidates = codegraph_extract::engine::scan_project(project_root, options)?;
+    let scan = codegraph_extract::engine::scan_project_with_stats(project_root, options)?;
+    let candidates = scan.files;
     let total = candidates.len();
 
     // Publishes `phase=building` BEFORE deleting a database byte, removes only
@@ -180,6 +181,7 @@ pub(crate) fn migrate_project(
     rebuild
         .store()
         .set_project_metadata(INDEXED_WITH_VERSION_KEY, env!("CARGO_PKG_VERSION"))?;
+    crate::link_state::record_followed_links(rebuild.store(), &scan.links)?;
 
     // Explicit fallible finalization: pragma restore, checkpoint + compaction,
     // extraction stamp, stamp checkpoint, connection close, and only then the

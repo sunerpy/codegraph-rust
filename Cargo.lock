@@ -617,6 +617,7 @@ dependencies = [
  "rayon",
  "regex",
  "rstest",
+ "rusqlite",
  "self_update",
  "serde",
  "serde_json",
@@ -653,6 +654,7 @@ dependencies = [
  "notify",
  "rusqlite",
  "serde",
+ "serde_json",
  "windows-sys 0.52.0",
 ]
 

@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::SystemTime;
 
-use codegraph_extract::engine::{LinkKind, ScanProjectResult, scan_project_with_stats};
 use codegraph_extract::ExtractOptions;
+use codegraph_extract::engine::{LinkKind, ScanProjectResult, scan_project_with_stats};
 
 fn sandbox(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -91,8 +91,10 @@ fn file_links_and_out_of_root_directory_links_index_at_their_logical_paths() {
     touch(&project, "src/real/a.ts", "export const a = 1;");
     touch(&outside, "lib/out.ts", "export const out = 2;");
     touch(&outside, "lib/deep/inner.ts", "export const inner = 3;");
-    if !link_file(&project.join("src/real/a.ts"), &project.join("src/afile.ts"))
-        || !link_dir(&outside.join("lib"), &project.join("src/extlink"))
+    if !link_file(
+        &project.join("src/real/a.ts"),
+        &project.join("src/afile.ts"),
+    ) || !link_dir(&outside.join("lib"), &project.join("src/extlink"))
     {
         return;
     }
@@ -119,7 +121,10 @@ fn file_links_and_out_of_root_directory_links_index_at_their_logical_paths() {
         .iter()
         .find(|link| link.relative == "src/extlink")
         .unwrap();
-    assert_eq!(extlink.canonical, outside.join("lib").canonicalize().unwrap());
+    assert_eq!(
+        extlink.canonical,
+        outside.join("lib").canonicalize().unwrap()
+    );
     assert_eq!(
         result.linked_dirs,
         strings(&["src/extlink", "src/extlink/deep"])
@@ -197,7 +202,10 @@ fn roots_ancestors_git_index_roots_and_broken_links_are_not_followed() {
         || !link_dir(&project.join(".codegraph"), &project.join("cg"))
         || !link_dir(&project.join(".git"), &project.join("gitdir"))
         || !link_dir(&project.join(".git/hooks"), &project.join("hooks"))
-        || !link_file(&project.join(".git/hooks/hook.ts"), &project.join("hook.ts"))
+        || !link_file(
+            &project.join(".git/hooks/hook.ts"),
+            &project.join("hook.ts"),
+        )
         || !link_dir(&root.join("missing"), &project.join("broken"))
     {
         return;
@@ -274,8 +282,10 @@ fn file_aliases_map_an_indexed_target_to_its_link_paths() {
     touch(&project, "src/real/a.ts", "export const a = 1;");
     touch(&outside, "lib/b.ts", "export const b = 1;");
     touch(&root, "lonely/c.ts", "export const c = 1;");
-    if !link_file(&project.join("src/real/a.ts"), &project.join("src/afile.ts"))
-        || !link_file(&project.join("src/real/a.ts"), &project.join("other/a2.ts"))
+    if !link_file(
+        &project.join("src/real/a.ts"),
+        &project.join("src/afile.ts"),
+    ) || !link_file(&project.join("src/real/a.ts"), &project.join("other/a2.ts"))
         || !link_dir(&outside.join("lib"), &project.join("ext"))
         || !link_file(&outside.join("lib/b.ts"), &project.join("bfile.ts"))
         || !link_file(&root.join("lonely/c.ts"), &project.join("cfile.ts"))
