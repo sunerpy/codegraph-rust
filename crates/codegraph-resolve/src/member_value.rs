@@ -175,14 +175,11 @@ pub(crate) fn match_member_function_ref(
             return unique_callable(descendants, reference, context, 0.8);
         }
     }
-    // An unknown receiver keeps the unique-or-drop discipline across ALL
-    // files; test doubles and abstract bases are candidates too.
-    unique_callable(
-        context.get_nodes_by_name_shared(member),
-        reference,
-        context,
-        0.8,
-    )
+    // An unknowable receiver stays unresolved, even when exactly one project
+    // method bears the member's name: `self.store.fetch` may be a library
+    // object's method. Upstream keeps "the old unique-or-drop discipline"
+    // across ALL files here; the port does not (KEEP-RUST).
+    None
 }
 
 /// The single same-family candidate when it is a callable other than the

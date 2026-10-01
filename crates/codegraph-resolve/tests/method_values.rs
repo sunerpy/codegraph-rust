@@ -453,3 +453,47 @@ fn go_receiver_types_disambiguate_method_values_and_reject_external_fields() {
             .all(|edge| project.target(edge).qualified_name == "Store::Fetch")
     );
 }
+
+#[test]
+fn unknown_receivers_never_bind_to_a_project_unique_method() {
+    // Exactly ONE project method of each name, so the old unique-name
+    // fallback would have bound every value below. Nothing proves what these
+    // receivers are: `store` is assigned from an unannotated parameter, `obj`
+    // is an unannotated parameter, and the Go `obj` has a type from outside
+    // the project.
+    let python = resolve_project(&[
+        (
+            "store.py",
+            "class Store:\n    def fetch(self, ids):\n        return ids\n",
+        ),
+        (
+            "consumer.py",
+            "class Consumer:\n\
+             \x20   def __init__(self, store):\n\
+             \x20       self.store = store\n\
+             \x20   def via_field(self, pool, ids):\n\
+             \x20       return pool.submit(self.store.fetch, ids)\n\
+             def via_param(obj, pool):\n\
+             \x20   return pool.submit(obj.fetch)\n",
+        ),
+    ]);
+    let go = resolve_project(&[
+        (
+            "store.go",
+            "package demo\n\ntype Store struct{}\n\nfunc (s *Store) Fetch(ids []string) []string { return ids }\n",
+        ),
+        (
+            "consumer.go",
+            "package demo\n\n\
+             import \"example.com/remote\"\n\n\
+             func Submit(fn func([]string) []string, ids []string) []string { return fn(ids) }\n\n\
+             func ViaParam(obj remote.Client, ids []string) []string { return Submit(obj.Fetch, ids) }\n",
+        ),
+    ]);
+    let bound =
+        |project: &Project, name: &str| project.source_names(&project.fn_ref_edges_into(name));
+    assert_eq!(
+        (bound(&python, "fetch"), bound(&go, "Fetch")),
+        (Vec::<String>::new(), Vec::<String>::new())
+    );
+}
