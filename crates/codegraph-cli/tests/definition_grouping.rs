@@ -189,3 +189,44 @@ fn limits_and_impact_metadata_tell_the_truth() {
         assert!(definition["affected"][0]["id"].is_string());
     }
 }
+
+#[test]
+fn callers_report_each_callers_relationship_kinds() {
+    // Upstream #1839 (CLI): a caller that constructs the symbol is marked, in
+    // JSON and in text, so it is not read as a plain call.
+    let dir = TestDir::new();
+    fs::write(
+        dir.0.join("widget.ts"),
+        "export class Widget {}\n\
+         export function make() { return new Widget(); }\n\
+         export function use() { return make(); }\n",
+    )
+    .unwrap();
+    let path = dir.0.to_str().unwrap();
+    let (stdout, stderr, ok) = run(&dir.0, &["init", path]);
+    assert!(ok, "init failed: stdout={stdout} stderr={stderr}");
+
+    let widget = json(&dir.0, &["callers", "Widget", "--path", path, "--json"]);
+    assert_eq!(widget["callers"][0]["name"], "make");
+    assert_eq!(
+        widget["callers"][0]["relationships"],
+        serde_json::json!(["instantiates"])
+    );
+    assert_eq!(
+        widget["definitions"][0]["callers"][0]["relationships"],
+        serde_json::json!(["instantiates"])
+    );
+    let make = json(&dir.0, &["callers", "make", "--path", path, "--json"]);
+    assert_eq!(
+        make["callers"][0]["relationships"],
+        serde_json::json!(["calls"])
+    );
+
+    let (text, stderr, ok) = run(&dir.0, &["callers", "Widget", "--path", path]);
+    assert!(ok, "callers failed: {stderr}");
+    assert!(text.contains("make [instantiates]"), "{text}");
+    let (text, stderr, ok) = run(&dir.0, &["callers", "make", "--path", path]);
+    assert!(ok, "callers failed: {stderr}");
+    assert!(text.contains("use\n"), "{text}");
+    assert!(!text.contains("[calls]"), "{text}");
+}

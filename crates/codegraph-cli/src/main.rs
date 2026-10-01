@@ -4289,11 +4289,6 @@ fn cmd_callers(
         Related::Callers,
         file.as_deref(),
     )?;
-    let summaries = report
-        .union
-        .iter()
-        .map(NodeSummary::from)
-        .collect::<Vec<_>>();
     let godot = godot_honesty_for_symbol(&store, &project, &symbol)?;
     if json_output {
         let targets = report
@@ -4311,14 +4306,14 @@ fn cmd_callers(
             "filteredOut": report.filtered_out,
             "note": report.note,
             "definitions": related_definitions_json(&report, Related::Callers),
-            "callers": summaries,
+            "callers": related_union_json(&report, Related::Callers),
             "total": report.total,
             "limit": report.limit,
             "truncated": report.total > report.limit,
             "godotDynamic": godot.as_json(),
         }))?;
     } else {
-        print_related_report("Callers", "callers", &symbol, &report);
+        print_related_report("Callers", "callers", &symbol, &report, Related::Callers);
         godot.print_cli(report.union.is_empty());
     }
     if strict && report.union.is_empty() {
@@ -4345,11 +4340,6 @@ fn cmd_callees(
         Related::Callees,
         file.as_deref(),
     )?;
-    let summaries = report
-        .union
-        .iter()
-        .map(NodeSummary::from)
-        .collect::<Vec<_>>();
     if json_output {
         let targets = report
             .definitions
@@ -4366,13 +4356,13 @@ fn cmd_callees(
             "filteredOut": report.filtered_out,
             "note": report.note,
             "definitions": related_definitions_json(&report, Related::Callees),
-            "callees": summaries,
+            "callees": related_union_json(&report, Related::Callees),
             "total": report.total,
             "limit": report.limit,
             "truncated": report.total > report.limit,
         }))?;
     } else {
-        print_related_report("Callees", "callees", &symbol, &report);
+        print_related_report("Callees", "callees", &symbol, &report, Related::Callees);
     }
     if strict && report.union.is_empty() {
         bail!("codegraph callees: no callees found for \"{symbol}\"");
@@ -6239,10 +6229,12 @@ fn related_definitions_json(report: &RelatedReport, related: Related) -> Vec<ser
                         .map(|node| {
                             let mut value = serde_json::to_value(NodeSummary::from(node))
                                 .expect("node summary serializes");
-                            value
-                                .as_object_mut()
-                                .expect("node summary is object")
-                                .insert("id".to_string(), json!(node.id));
+                            let object = value.as_object_mut().expect("node summary is object");
+                            object.insert("id".to_string(), json!(node.id));
+                            object.insert(
+                                "relationships".to_string(),
+                                json!(relationships(node, &definition.edges, related)),
+                            );
                             value
                         })
                         .collect(),
@@ -6267,6 +6259,49 @@ fn related_definitions_json(report: &RelatedReport, related: Related) -> Vec<ser
 enum Related {
     Callers,
     Callees,
+}
+
+/// The distinct edge kinds that link `node` to the queried symbol, in edge
+/// order — `["calls", "instantiates"]` for a caller that both calls and
+/// constructs it (upstream #1839).
+fn relationships(node: &Node, edges: &[Edge], related: Related) -> Vec<&'static str> {
+    let mut kinds = Vec::new();
+    for edge in edges {
+        let end = match related {
+            Related::Callers => &edge.source,
+            Related::Callees => &edge.target,
+        };
+        if end == &node.id && !kinds.contains(&edge.kind.as_str()) {
+            kinds.push(edge.kind.as_str());
+        }
+    }
+    kinds
+}
+
+/// The legacy union list with each node's relationships across every
+/// definition.
+fn related_union_json(report: &RelatedReport, related: Related) -> Vec<serde_json::Value> {
+    let edges = report
+        .definitions
+        .iter()
+        .flat_map(|definition| definition.edges.iter().cloned())
+        .collect::<Vec<_>>();
+    report
+        .union
+        .iter()
+        .map(|node| {
+            let mut value =
+                serde_json::to_value(NodeSummary::from(node)).expect("node summary serializes");
+            value
+                .as_object_mut()
+                .expect("node summary is object")
+                .insert(
+                    "relationships".to_string(),
+                    json!(relationships(node, &edges, related)),
+                );
+            value
+        })
+        .collect()
 }
 
 /// Collected Godot honesty signals for the matched symbols of one query: the
@@ -7018,7 +7053,13 @@ fn print_related(label: &str, symbol: &str, nodes: &[NodeSummary]) {
     }
 }
 
-fn print_related_report(title: &str, label: &str, symbol: &str, report: &RelatedReport) {
+fn print_related_report(
+    title: &str,
+    label: &str,
+    symbol: &str,
+    report: &RelatedReport,
+    related: Related,
+) {
     if let Some(note) = &report.note {
         println!("Note: {note}");
     }
@@ -7057,7 +7098,17 @@ fn print_related_report(title: &str, label: &str, symbol: &str, report: &Related
             continue;
         }
         for node in definition.nodes.iter().take(report.limit) {
-            println!("{:<12}{}", node.kind, node.name);
+            // Kinds other than a plain call — `[instantiates]`, `[references]`.
+            let kinds = relationships(node, &definition.edges, related)
+                .into_iter()
+                .filter(|kind| *kind != "calls")
+                .collect::<Vec<_>>();
+            let relation = if kinds.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", kinds.join(", "))
+            };
+            println!("{:<12}{}{relation}", node.kind, node.name);
             println!("  {}:{}\n", node.file_path, node.start_line);
         }
         if definition.nodes.len() > report.limit {

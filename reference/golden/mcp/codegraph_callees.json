@@ -18,7 +18,7 @@
       "content": [
         {
           "type": "text",
-          "text": "## Callees of runDemo (2 found)\n\n- increment (method) - src/math.ts:8\n- add (function) - src/math.ts:1"
+          "text": "## Callees of runDemo (3 found)\n\n- increment (method) - src/math.ts:8\n- add (function) - src/math.ts:1\n- Counter (class) - src/math.ts:5"
         }
       ]
     }

@@ -270,9 +270,9 @@ fn callees_returns_outgoing_call_reference_import_targets() {
     let callees = traverser.get_callees(RUN_DEMO, 1).expect("callees");
     let got = id_set(callees.iter().map(|c| c.node.id.clone()));
 
-    // runDemo calls increment (x2, deduped) and add; instantiates Counter is
-    // excluded (not in the calls/references/imports callee kinds).
-    let want = id_set([INCREMENT, ADD].map(str::to_string));
+    // runDemo calls increment (x2, deduped) and add, and instantiates Counter:
+    // class instantiation is a caller/callee edge (upstream #774/#804).
+    let want = id_set([INCREMENT, ADD, COUNTER].map(str::to_string));
     assert_eq!(got, want, "callees(runDemo) mismatch");
 }
 

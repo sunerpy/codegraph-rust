@@ -371,8 +371,8 @@ impl<'store> GraphTraverser<'store> {
     }
 
     /// Ports `getCallers` from `upstream graph/traversal.ts:230-266`.
-    /// Incoming `calls`/`references`/`imports` edges, recursive to `max_depth`,
-    /// cycle-safe via `visited`.
+    /// Incoming `calls`/`references`/`imports`/`instantiates` edges, recursive
+    /// to `max_depth`, cycle-safe via `visited`.
     pub fn get_callers(&self, node_id: &str, max_depth: usize) -> rusqlite::Result<Vec<NodeEdge>> {
         let mut result = Vec::new();
         let mut visited = HashMap::new();
@@ -403,7 +403,12 @@ impl<'store> GraphTraverser<'store> {
 
         let incoming = self.incoming_edges_kinds(
             node_id,
-            &[EdgeKind::Calls, EdgeKind::References, EdgeKind::Imports],
+            &[
+                EdgeKind::Calls,
+                EdgeKind::References,
+                EdgeKind::Imports,
+                EdgeKind::Instantiates,
+            ],
         )?;
         if incoming.is_empty() {
             return Ok(());
@@ -501,8 +506,8 @@ impl<'store> GraphTraverser<'store> {
     }
 
     /// Ports `getCallees` from `upstream graph/traversal.ts:275-310`.
-    /// Outgoing `calls`/`references`/`imports` edges, recursive to `max_depth`,
-    /// cycle-safe via `visited`.
+    /// Outgoing `calls`/`references`/`imports`/`instantiates` edges, recursive
+    /// to `max_depth`, cycle-safe via `visited`.
     pub fn get_callees(&self, node_id: &str, max_depth: usize) -> rusqlite::Result<Vec<NodeEdge>> {
         let mut result = Vec::new();
         let mut visited = HashMap::new();
@@ -533,7 +538,12 @@ impl<'store> GraphTraverser<'store> {
 
         let outgoing = self.outgoing_edges_kinds(
             node_id,
-            &[EdgeKind::Calls, EdgeKind::References, EdgeKind::Imports],
+            &[
+                EdgeKind::Calls,
+                EdgeKind::References,
+                EdgeKind::Imports,
+                EdgeKind::Instantiates,
+            ],
         )?;
         if outgoing.is_empty() {
             return Ok(());
