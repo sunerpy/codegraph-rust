@@ -2,7 +2,7 @@
 //! a regular file no larger than the extraction size limit, checked before any
 //! byte is read, with the rejection cached for the pass like any other read.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use codegraph_core::config::DEFAULT_MAX_FILE_SIZE;
@@ -203,7 +203,7 @@ fn a_fifo_is_rejected_without_blocking() {
     let db = project.root.join("index.db");
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let store = Store::open(Path::new(&db)).expect("open store");
+        let store = Store::open(&db).expect("open store");
         let store_read = StoreResolutionContext::new(&store, root.clone()).read_file("pipe.ts");
         let snapshot_read = SnapshotResolutionContext::from_store(&store, root)
             .expect("snapshot")
