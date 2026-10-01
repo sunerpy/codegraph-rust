@@ -1158,8 +1158,8 @@ fn event_loop(ctx: EventLoopCtx) {
             }
             Some(LoopMessage::Stop) => break,
             None => {
-                let paths = pending.keys().cloned().collect::<Vec<_>>();
-                pending.clear();
+                let batch = std::mem::take(&mut pending);
+                let paths = batch.keys().cloned().collect::<Vec<_>>();
                 deadline = None;
                 let full_sync = std::mem::take(&mut full_sync_pending);
                 let attempt = if full_sync {
@@ -1183,6 +1183,16 @@ fn event_loop(ctx: EventLoopCtx) {
                         if let Some(cb) = &on_sync_error {
                             cb(reason);
                         }
+                        // The failed batch is still unindexed: keep its paths
+                        // and any full reconcile it owed (a directory removal
+                        // adds no pending file), and retry after a backoff
+                        // rather than drop them (upstream #1964).
+                        pending = batch;
+                        full_sync_pending |= full_sync;
+                        deadline = Some(
+                            Instant::now()
+                                + sync_retry_delay(runtime_scope.debounce, consecutive_sync_errors),
+                        );
                     }
                     SyncAttempt::Degraded(_) => {}
                 }
@@ -1339,11 +1349,32 @@ fn run_with_backoff(
     }
 }
 
-/// A sync error is "lock contention" iff its chain mentions a busy/locked DB,
-/// which is the only error worth retrying with backoff.
+/// A sync error is "lock contention" iff another writer holds the index: its
+/// chain mentions a busy/locked DB, or the bounded permanent-index-lock
+/// acquisition timed out behind a long foreground `index`. Only contention is
+/// retried in place with backoff; a timed-out lease counted as a sync failure
+/// would drop the batch and push auto-sync toward being disabled.
 fn is_lock_contention(err: &anyhow::Error) -> bool {
+    use codegraph_store::{IndexLeaseError, StoreError};
+    let lease_timed_out = err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<IndexLeaseError>(),
+            Some(IndexLeaseError::TimedOut { .. })
+        ) || matches!(
+            cause.downcast_ref::<StoreError>(),
+            Some(StoreError::Lease(IndexLeaseError::TimedOut { .. }))
+        )
+    });
     let text = format!("{err:#}").to_ascii_lowercase();
-    text.contains("locked") || text.contains("busy")
+    lease_timed_out || text.contains("locked") || text.contains("busy")
+}
+
+/// How long the event loop waits before retrying a batch whose sync failed:
+/// the debounce doubled per consecutive failure, capped at [`MAX_BACKOFF`]
+/// (upstream `debounceMs * 2 ** (n - 1)`).
+fn sync_retry_delay(debounce: Duration, consecutive_errors: u32) -> Duration {
+    let doublings = consecutive_errors.saturating_sub(1).min(16);
+    debounce.saturating_mul(1_u32 << doublings).min(MAX_BACKOFF)
 }
 
 fn snapshot(pending: &BTreeMap<String, PendingInfo>) -> Vec<PendingFile> {
@@ -2585,6 +2616,100 @@ mod tests {
             sync_errors.lock().unwrap()[0].contains("parse error"),
             "the surfaced message must carry the underlying error"
         );
+    }
+
+    /// A failed sync leaves its batch unindexed. A directory removal owes a
+    /// full reconcile and adds no pending file, so dropping the batch on the
+    /// failure lost the reconcile and the removed files kept their nodes
+    /// (upstream #1964): both the paths and the owed full sync are kept and
+    /// retried after a backoff.
+    #[test]
+    fn a_failed_sync_keeps_its_batch_and_owed_full_reconcile_and_retries() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-retry-owed-full");
+        let full_calls = Arc::new(AtomicUsize::new(0));
+        let full_counter = Arc::clone(&full_calls);
+        let full_sync_fn: FullSyncFn = Arc::new(move || {
+            if full_counter.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                return Err(anyhow::anyhow!("disk full while removing nodes"));
+            }
+            Ok(SyncOutcome {
+                files_removed: 2,
+                ..Default::default()
+            })
+        });
+        let incremental_paths = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let recorded = Arc::clone(&incremental_paths);
+        let sync_fn: SyncFn = Arc::new(move |paths| {
+            let mut calls = recorded.lock().unwrap();
+            calls.push(paths);
+            if calls.len() == 1 {
+                return Err(anyhow::anyhow!("parse error while re-extracting"));
+            }
+            Ok(SyncOutcome::default())
+        });
+        let (outcome_tx, outcome_rx) = mpsc::channel();
+        let watcher = ProjectWatcher::start(
+            dir.path(),
+            WatchOptions {
+                debounce: Duration::from_millis(20),
+                inert_for_tests: true,
+                sync_fn: Some(sync_fn),
+                full_sync_fn: Some(full_sync_fn),
+                on_sync_complete: Some(Arc::new(move |outcome| {
+                    outcome_tx.send(outcome).unwrap();
+                })),
+                ..WatchOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        watcher.ingest_removed_dir_for_tests("src/feature");
+        watcher.flush_for_tests();
+        let outcome = outcome_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the owed full reconcile is retried");
+        assert_eq!(outcome.files_removed, 2);
+        assert_eq!(full_calls.load(AtomicOrdering::SeqCst), 2);
+        assert!(incremental_paths.lock().unwrap().is_empty());
+
+        watcher.ingest_event_for_tests("src/app.ts");
+        watcher.flush_for_tests();
+        outcome_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the failed batch is retried");
+        assert_eq!(
+            *incremental_paths.lock().unwrap(),
+            vec![
+                vec!["src/app.ts".to_string()],
+                vec!["src/app.ts".to_string()]
+            ]
+        );
+        assert!(watcher.pending_files().is_empty());
+        watcher.stop();
+    }
+
+    /// A long foreground `index` holds the permanent index lock past a sync's
+    /// bounded acquisition: that is contention to back off from, not a sync
+    /// failure counted toward disabling auto-sync.
+    #[test]
+    fn an_index_lease_timeout_is_lock_contention() {
+        let timed_out = codegraph_store::IndexLeaseError::TimedOut {
+            path: std::path::PathBuf::from("/p/.codegraph/codegraph.lock"),
+        };
+        assert!(is_lock_contention(&anyhow::Error::new(
+            codegraph_store::StoreError::Lease(timed_out)
+        )));
+        assert!(is_lock_contention(
+            &anyhow::Error::new(codegraph_store::IndexLeaseError::TimedOut {
+                path: std::path::PathBuf::from("/p/.codegraph/codegraph.lock"),
+            })
+            .context("opening the sync writer")
+        ));
+        assert!(!is_lock_contention(&anyhow::anyhow!(
+            "schema version mismatch"
+        )));
     }
 
     #[test]
