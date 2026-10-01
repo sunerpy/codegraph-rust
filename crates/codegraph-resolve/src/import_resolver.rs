@@ -1999,11 +1999,15 @@ fn find_exported_symbol(
 
     // Direct hit (import-resolver.ts:1829-1853).
     if want.is_default {
-        // A component file IS its default export; otherwise the binding an
-        // `export default NAME` statement names — a function, class, component,
-        // or a namespace object such as `const Api = { upload }` that is not
-        // exported at its declaration — beats the first-exported-function
-        // guess (upstream F13 / `defaultExportBindingNode`).
+        // The binding an `export default NAME` statement names — a function,
+        // class, component, or a namespace object such as `const Api = { upload
+        // }` that is not exported at its declaration — is the default export
+        // (upstream F13 / `defaultExportBindingNode`). Without one, a component
+        // file IS its default export, and otherwise the first exported function
+        // or class is the guess. Upstream tries the component first, but the
+        // React resolver mints component nodes inside ordinary modules too, and
+        // one of those is not the module's default export when a statement says
+        // which binding is.
         let bound_name = re_exports.iter().find_map(|rex| match rex {
             ReExport::LocalAlias {
                 exported_name,
@@ -2028,10 +2032,12 @@ fn find_exported_symbol(
                 })
                 .min_by_key(|n| (n.start_line, n.start_column))
         };
-        if let Some(direct) = nodes_in_file
-            .iter()
-            .find(|n| n.is_exported && n.kind == NodeKind::Component)
-            .or_else(bound)
+        if let Some(direct) = bound()
+            .or_else(|| {
+                nodes_in_file
+                    .iter()
+                    .find(|n| n.is_exported && n.kind == NodeKind::Component)
+            })
             .or_else(|| {
                 nodes_in_file.iter().find(|n| {
                     n.is_exported && matches!(n.kind, NodeKind::Function | NodeKind::Class)
