@@ -29,7 +29,7 @@ use crate::dynamic_boundaries::scan_dynamic_dispatch;
 use crate::explore_budget::{ExploreOutputBudget, get_explore_output_budget};
 use crate::protocol::ToolResult;
 use crate::query_paths::{
-    QueryLineAnchor, extract_query_paths_with_file_probe, query_might_contain_paths,
+    QueryLineAnchor, extract_query_paths_with_probes, query_might_contain_paths,
 };
 
 /// Default caller/callee recursion depth for callers/callees tools. The upstream
@@ -1244,16 +1244,21 @@ impl CodeGraphEngine {
                 .into_iter()
                 .map(|file| file.path)
                 .collect::<Vec<_>>();
-            extract_query_paths_with_file_probe(
+            extract_query_paths_with_probes(
                 &query,
                 &indexed_paths,
                 max_files.min(8),
-                &|relative| project_regular_file_exists(&self.project_root, relative),
+                Some(&|relative| project_regular_file_exists(&self.project_root, relative)),
+                Some(&|symbol| self.files_defining_symbol(symbol)),
             )
         } else {
-            extract_query_paths_with_file_probe(&query, &[], max_files.min(8), &|relative| {
-                project_regular_file_exists(&self.project_root, relative)
-            })
+            extract_query_paths_with_probes(
+                &query,
+                &[],
+                max_files.min(8),
+                Some(&|relative| project_regular_file_exists(&self.project_root, relative)),
+                None,
+            )
         };
         let match_query = path_extraction.stripped_query.trim().to_string();
         let exact = self.exact_targets(&match_query, &path_extraction.line_anchors);
@@ -1304,6 +1309,34 @@ impl CodeGraphEngine {
         }
         if let Some(spans) = &unresolved_note {
             lines.push(format!("No indexed file uniquely matches {spans}."));
+        }
+        // A same-named file a span did not pin is named, so an agent that did
+        // mean it sees where it went instead of a silent drop (#2071).
+        let set_aside_note = path_extraction
+            .set_aside_matches
+            .iter()
+            .map(|entry| {
+                let which = if entry.files.len() <= 2 {
+                    entry
+                        .files
+                        .iter()
+                        .map(|file| format!("`{file}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                } else {
+                    format!("{} other `{}` files", entry.files.len(), entry.span)
+                };
+                let verb = if entry.files.len() == 1 {
+                    "defines"
+                } else {
+                    "define"
+                };
+                format!("Not pinned: {which}, which {verb} none of the named symbols.")
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !set_aside_note.is_empty() {
+            lines.push(set_aside_note);
         }
         lines.push(String::new());
 
@@ -2876,6 +2909,35 @@ impl CodeGraphEngine {
             results = search_nodes(&self.store, tail, &opts, &self.project_name_tokens())?;
         }
         Ok(results.into_iter().map(|r| r.node).collect())
+    }
+
+    /// Which indexed files define a symbol spelled like this query token
+    /// (upstream `filesDefiningSymbol`, #2071): exact names only, and the shared
+    /// matcher for a qualified token, so it agrees with how explore resolves
+    /// named symbols. A node that names a thing without defining it in its file
+    /// (a file, import, export or parameter) does not count. A lookup error
+    /// answers "none", which leaves the span's pins as they were.
+    fn files_defining_symbol(&self, symbol: &str) -> Vec<String> {
+        let qualified = symbol.contains(['.', '/']) || symbol.contains("::");
+        let name = if qualified {
+            last_qualifier_part(symbol).unwrap_or(symbol)
+        } else {
+            symbol
+        };
+        let Ok(nodes) = self.store.nodes_by_name(name) else {
+            return Vec::new();
+        };
+        nodes
+            .into_iter()
+            .filter(|n| !qualified || matches_symbol(n, symbol))
+            .filter(|n| {
+                !matches!(
+                    n.kind,
+                    NodeKind::File | NodeKind::Import | NodeKind::Export | NodeKind::Parameter
+                )
+            })
+            .map(|n| n.file_path)
+            .collect()
     }
 
     /// The query's EXACT targets (upstream #2063). A multi-line anchor names a

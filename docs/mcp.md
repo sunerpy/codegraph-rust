@@ -346,7 +346,12 @@ Explicit source paths in the query are resolved before fuzzy search and pinned
 to the front of the result. Quoted/backticked paths, `./`, and Windows
 separators are normalized; exact matches precede segment-aligned suffix
 matches. Extensionless kebab basenames are accepted only when they resolve to at
-most three indexed files, so ordinary hyphenated prose remains prose. The
+most three indexed files, so ordinary hyphenated prose remains prose. When a
+path or basename matches several files and the query also names symbols in a
+code shape (camelCase, PascalCase, snake_case, `$` or qualified), only the
+matches defining one of them are pinned, and the summary names the files set
+aside; a basename shared by more than three files resolves the same way when
+the named symbols narrow it to three or fewer. The
 resolver examines at most eight path spans, drops at most eight leading
 segments, pins at most eight files (also bounded by `maxFiles`), and reports at
 most four unresolved explicit paths. Resolved or clearly missing explicit paths

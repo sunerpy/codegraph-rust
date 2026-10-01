@@ -42,6 +42,17 @@ static RANGE_CONNECTIVE: LazyLock<Regex> = LazyLock::new(|| {
 });
 /// Nothing real is this long; a larger number is a port, an id or a typo.
 const MAX_LINE_NUMBER: u64 = 1_000_000;
+/// A query token that names a symbol, in the shape explore's named-symbol
+/// seeder reads: `clampedInt`, `SQLCompiler.as_sql`, `Engine::ServeHTTP`.
+/// ASCII only, as JavaScript's `\w`.
+static SYMBOL_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[A-Za-z_$][A-Za-z0-9_$]*(?:(?:::|\.)[A-Za-z0-9_$]+)*$")
+        .expect("symbol-token regex is valid")
+});
+/// Symbol tokens consulted per query — the seeder's cap.
+const MAX_SYMBOL_TOKENS: usize = 16;
+/// Files one span may pin before it is ambiguous.
+const MAX_MATCHES_PER_SPAN: usize = 3;
 static LAST_EXTENSION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\.[A-Za-z][A-Za-z0-9]{0,7}$").expect("last-extension regex is valid")
 });
@@ -58,6 +69,22 @@ pub(crate) struct QueryPathExtraction {
     /// Only a span whose path resolved to exactly one file is kept: a line
     /// number means nothing across two candidate files (upstream #2063).
     pub line_anchors: Vec<QueryLineAnchor>,
+    /// Files a span matched but did NOT pin: the span named several files, some
+    /// of which define a symbol the query also names, and these define none
+    /// (upstream #2071). Surfaced so a set-aside file is visible, not silently
+    /// dropped.
+    pub set_aside_matches: Vec<QuerySetAsideMatch>,
+}
+
+/// The index lookup path extraction is given: which indexed files define a
+/// symbol spelled like this query token.
+pub(crate) type SymbolFiles<'a> = &'a dyn Fn(&str) -> Vec<String>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QuerySetAsideMatch {
+    /// The span as the query wrote it, normalized (`editorOptions.ts`).
+    pub span: String,
+    pub files: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,34 +109,61 @@ pub(crate) fn extract_query_paths(
     indexed_paths: &[String],
     max_pins: usize,
 ) -> QueryPathExtraction {
-    extract_query_paths_inner(query, indexed_paths, max_pins, None)
+    extract_query_paths_with_probes(query, indexed_paths, max_pins, None, None)
 }
 
+#[cfg(test)]
 pub(crate) fn extract_query_paths_with_file_probe(
     query: &str,
     indexed_paths: &[String],
     max_pins: usize,
     exists_on_disk: &dyn Fn(&str) -> bool,
 ) -> QueryPathExtraction {
-    extract_query_paths_inner(query, indexed_paths, max_pins, Some(exists_on_disk))
+    extract_query_paths_with_probes(query, indexed_paths, max_pins, Some(exists_on_disk), None)
 }
 
-fn extract_query_paths_inner(
+/// Resolve the query's paths. Both probes are injected so this module stays
+/// free of the filesystem and the index, and neither may fail:
+///
+/// - `exists_on_disk` tells a dotless path the index does not hold
+///   (`scripts/deploy`) from slashed prose (`and/or`).
+/// - `symbol_files` answers which indexed files define a symbol spelled like a
+///   query token (`clampedInt`, `SQLCompiler.as_sql`). It is consulted only when
+///   a span matches several files: the matches defining a symbol the query also
+///   names are pinned and the rest set aside (upstream #2071).
+pub(crate) fn extract_query_paths_with_probes(
     query: &str,
     indexed_paths: &[String],
     max_pins: usize,
     exists_on_disk: Option<&dyn Fn(&str) -> bool>,
+    symbol_files: Option<SymbolFiles<'_>>,
 ) -> QueryPathExtraction {
     let passthrough = || QueryPathExtraction {
         stripped_query: query.to_string(),
         pinned_files: Vec::new(),
         unresolved_path_spans: Vec::new(),
         line_anchors: Vec::new(),
+        set_aside_matches: Vec::new(),
     };
     if query.trim().is_empty() || (indexed_paths.is_empty() && exists_on_disk.is_none()) {
         return passthrough();
     }
     let max_pins = max_pins.clamp(1, MAX_PINS);
+    let mut narrowing = SymbolNarrowing {
+        symbol_files,
+        query,
+        indexed_paths,
+        tokens: None,
+        definers_of: BTreeMap::new(),
+    };
+    let mut set_aside: Vec<QuerySetAsideMatch> = Vec::new();
+    // A span is collected past the ambiguity budget only while narrowing is
+    // possible, and still reports as ambiguous if it does not narrow into it.
+    let collect_limit = if symbol_files.is_some() {
+        usize::MAX
+    } else {
+        MAX_MATCHES_PER_SPAN
+    };
     let lower_to_original = indexed_paths
         .iter()
         .map(|path| (path.to_lowercase(), path.clone()))
@@ -145,10 +199,21 @@ fn extract_query_paths_inner(
             continue;
         }
         candidates_examined += 1;
-        let resolved = resolve_span(&normalized.to_lowercase(), &lower_to_original, 3);
-        if !resolved.matches.is_empty() {
+        let resolved = resolve_span(
+            &normalized.to_lowercase(),
+            &lower_to_original,
+            collect_limit,
+        );
+        let collected = !resolved.matches.is_empty();
+        let pinnable = if collected {
+            narrowing.pinnable(&normalized, resolved.matches, &mut set_aside)
+        } else {
+            None
+        };
+        let ambiguous = resolved.ambiguous || (collected && pinnable.is_none());
+        if let Some(matches) = pinnable {
             consumed.insert(index);
-            for path in &resolved.matches {
+            for path in &matches {
                 if pinned.len() >= max_pins {
                     break;
                 }
@@ -158,13 +223,13 @@ fn extract_query_paths_inner(
             }
             record_single_file(
                 index,
-                &resolved.matches,
+                &matches,
                 lines,
                 &pinned_seen,
                 &mut single_file_at,
                 &mut anchors,
             );
-        } else if resolved.ambiguous
+        } else if ambiguous
             || is_clearly_path_shaped(&normalized)
             || (normalized.contains('/') && exists_on_disk.is_some_and(|probe| probe(&normalized)))
         {
@@ -190,14 +255,14 @@ fn extract_query_paths_inner(
             continue;
         }
         candidates_examined += 1;
-        let Some(matches) = stems.get(&stripped.to_lowercase()) else {
+        let Some(matches) = stems
+            .get(&stripped.to_lowercase())
+            .and_then(|matches| narrowing.pinnable(&stripped, matches.clone(), &mut set_aside))
+        else {
             continue;
         };
-        if matches.len() > 3 {
-            continue;
-        }
         consumed.insert(index);
-        for path in matches {
+        for path in &matches {
             if pinned.len() >= max_pins {
                 break;
             }
@@ -207,7 +272,7 @@ fn extract_query_paths_inner(
         }
         record_single_file(
             index,
-            matches,
+            &matches,
             lines,
             &pinned_seen,
             &mut single_file_at,
@@ -290,7 +355,153 @@ fn extract_query_paths_inner(
         pinned_files: pinned,
         unresolved_path_spans: unresolved,
         line_anchors: anchors,
+        // A file another span pinned outright (the agent also wrote its full
+        // path) was not set aside after all.
+        set_aside_matches: set_aside
+            .into_iter()
+            .map(|entry| QuerySetAsideMatch {
+                span: entry.span,
+                files: entry
+                    .files
+                    .into_iter()
+                    .filter(|file| !pinned_seen.contains(file))
+                    .collect(),
+            })
+            .filter(|entry| !entry.files.is_empty())
+            .collect(),
     }
+}
+
+/// Narrowing a span's matches by the symbols the query names (upstream #2071).
+///
+/// A bare basename two directories share (`editorOptions.ts`) used to pin every
+/// match, and the matches split the pinned reservation. When the query names
+/// symbols, the file it means is the one defining them: the matches defining at
+/// least one are kept and the rest set aside. When no match defines one, or
+/// every match does, the symbols pick nothing out and the span resolves as
+/// before. The same test lets a basename shared past the ambiguity budget
+/// (django's `models.py`) resolve after all, to the one defining the named
+/// class.
+struct SymbolNarrowing<'a> {
+    symbol_files: Option<SymbolFiles<'a>>,
+    query: &'a str,
+    indexed_paths: &'a [String],
+    /// The query's precise symbol tokens, computed on first use.
+    tokens: Option<Vec<String>>,
+    definers_of: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl SymbolNarrowing<'_> {
+    /// The matches defining a named symbol, or `None` when narrowing picks
+    /// nothing out.
+    fn narrow(&mut self, matches: &[String]) -> Option<Vec<String>> {
+        let symbol_files = self.symbol_files?;
+        if matches.len() < 2 {
+            return None;
+        }
+        let tokens = self.tokens.get_or_insert_with(|| {
+            let basenames: BTreeSet<String> = self
+                .indexed_paths
+                .iter()
+                .map(|path| {
+                    path.rsplit(['/', '\\'])
+                        .next()
+                        .unwrap_or(path)
+                        .to_lowercase()
+                })
+                .collect();
+            query_symbol_tokens(self.query, &basenames)
+        });
+        let candidates: BTreeSet<&String> = matches.iter().collect();
+        let mut definers: BTreeSet<String> = BTreeSet::new();
+        for token in tokens.iter() {
+            let files = self
+                .definers_of
+                .entry(token.clone())
+                .or_insert_with(|| symbol_files(token).into_iter().collect());
+            definers.extend(
+                files
+                    .iter()
+                    .filter(|file| candidates.contains(file))
+                    .cloned(),
+            );
+        }
+        if definers.is_empty() || definers.len() == candidates.len() {
+            return None;
+        }
+        Some(
+            matches
+                .iter()
+                .filter(|file| definers.contains(*file))
+                .cloned()
+                .collect(),
+        )
+    }
+
+    /// The matches a span may pin, recording what it set aside; `None` when
+    /// they stay over the ambiguity budget.
+    fn pinnable(
+        &mut self,
+        span: &str,
+        matches: Vec<String>,
+        set_aside: &mut Vec<QuerySetAsideMatch>,
+    ) -> Option<Vec<String>> {
+        if let Some(narrowed) = self.narrow(&matches)
+            && narrowed.len() <= MAX_MATCHES_PER_SPAN
+        {
+            set_aside.push(QuerySetAsideMatch {
+                span: span.to_string(),
+                files: matches
+                    .into_iter()
+                    .filter(|file| !narrowed.contains(file))
+                    .collect(),
+            });
+            return Some(narrowed);
+        }
+        (matches.len() <= MAX_MATCHES_PER_SPAN).then_some(matches)
+    }
+}
+
+/// The seeder's NL-stopword test: camelCase, PascalCase, snake_case, `$` and
+/// qualified tokens are unmistakably code. A bare lowercase word (`options`,
+/// `render`) is also English, and a file defining one proves nothing about
+/// which same-named file the agent meant.
+fn is_precise_symbol_token(token: &str) -> bool {
+    token.contains(['.', '_', '$'])
+        || token.contains("::")
+        || token.starts_with(|c: char| c.is_ascii_uppercase())
+        || token
+            .as_bytes()
+            .windows(2)
+            .any(|w| w[0].is_ascii_lowercase() && w[1].is_ascii_uppercase())
+}
+
+/// The precise symbol tokens a query names, excluding the files it names
+/// (`editorOptions.ts` is identifier-shaped too). Split on the same brackets
+/// the seeder splits on, so `clampedInt()` still counts.
+fn query_symbol_tokens(query: &str, indexed_basenames: &BTreeSet<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in query.split_whitespace() {
+        for part in raw.split([',', '(', ')', '[', ']', '{', '}']) {
+            let token = part
+                .trim_start_matches(['\'', '"', '`', '<'])
+                .trim_end_matches(['\'', '"', '`', '>', '.', ',', ';', ':', '!', '?']);
+            if token.len() < 3
+                || !SYMBOL_TOKEN.is_match(token)
+                || !is_precise_symbol_token(token)
+                || indexed_basenames.contains(&token.to_lowercase())
+            {
+                continue;
+            }
+            if !out.iter().any(|seen| seen == token) {
+                out.push(token.to_string());
+            }
+            if out.len() >= MAX_SYMBOL_TOKENS {
+                return out;
+            }
+        }
+    }
+    out
 }
 
 /// Remember a token that resolved to exactly one pinned file, and the line
@@ -738,5 +949,206 @@ mod tests {
             anchors(&format!("{CHAT}:7 and {CHAT} line 7")),
             vec![anchor(CHAT, 7, 7)]
         );
+    }
+
+    const REGISTRY: &str = "src/editor/config/editorOptions.ts";
+    const HELPER: &str = "src/workbench/editor/editorOptions.ts";
+
+    fn shared_index() -> Vec<String> {
+        let mut paths = index();
+        paths.extend([REGISTRY.to_string(), HELPER.to_string()]);
+        paths
+    }
+
+    /// Path extraction with a `symbol_files` lookup over `defs`, recording every
+    /// symbol it is asked about.
+    fn narrowed(query: &str, defs: &[(&str, &[&str])]) -> (QueryPathExtraction, Vec<String>) {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let lookup = |symbol: &str| -> Vec<String> {
+            asked.borrow_mut().push(symbol.to_string());
+            defs.iter()
+                .find(|(name, _)| *name == symbol)
+                .map(|(_, files)| files.iter().map(|f| f.to_string()).collect())
+                .unwrap_or_default()
+        };
+        let out = extract_query_paths_with_probes(query, &shared_index(), 8, None, Some(&lookup));
+        (out, asked.into_inner())
+    }
+
+    fn set_aside(span: &str, files: &[&str]) -> QuerySetAsideMatch {
+        QuerySetAsideMatch {
+            span: span.to_string(),
+            files: files.iter().map(|f| f.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn pins_only_the_match_defining_a_named_symbol_and_reports_the_rest() {
+        let (out, asked) = narrowed(
+            "editorOptions.ts clampedInt cursorStyleToString",
+            &[
+                ("clampedInt", &[REGISTRY]),
+                ("cursorStyleToString", &[REGISTRY]),
+            ],
+        );
+        assert_eq!(out.pinned_files, vec![REGISTRY]);
+        assert_eq!(
+            out.set_aside_matches,
+            vec![set_aside("editorOptions.ts", &[HELPER])]
+        );
+        assert_eq!(out.stripped_query, "clampedInt cursorStyleToString");
+        // The span itself is a file name, not a symbol to look up.
+        assert_eq!(asked, vec!["clampedInt", "cursorStyleToString"]);
+    }
+
+    #[test]
+    fn narrows_a_shared_kebab_stem_the_same_way() {
+        let (out, _) = narrowed(
+            "generic-modal GenericModalFooter",
+            &[("GenericModalFooter", &["src/y/generic-modal.tsx"])],
+        );
+        assert_eq!(out.pinned_files, vec!["src/y/generic-modal.tsx"]);
+        assert_eq!(
+            out.set_aside_matches,
+            vec![set_aside("generic-modal", &["src/x/generic-modal.tsx"])]
+        );
+    }
+
+    #[test]
+    fn pins_every_match_when_no_match_or_every_match_defines_a_named_symbol() {
+        let (none, asked) = narrowed(
+            "editorOptions.ts clampedInt",
+            &[("clampedInt", &["src/lib/chat-manager.ts"])],
+        );
+        assert_eq!(none.pinned_files, vec![REGISTRY, HELPER]);
+        assert!(none.set_aside_matches.is_empty());
+        // Consulted and found nothing — not skipped.
+        assert_eq!(asked, vec!["clampedInt"]);
+
+        let (both, _) = narrowed(
+            "editorOptions.ts EditorOptions",
+            &[("EditorOptions", &[HELPER, REGISTRY])],
+        );
+        assert_eq!(both.pinned_files, vec![REGISTRY, HELPER]);
+        assert!(both.set_aside_matches.is_empty());
+    }
+
+    #[test]
+    fn a_bare_english_word_does_not_pick_a_file() {
+        // `options` and `close` are words as much as names: a file defining one
+        // says nothing about which same-named file the agent meant.
+        let defs: &[(&str, &[&str])] = &[
+            ("options", &[HELPER]),
+            ("close", &["src/x/generic-modal.tsx"]),
+        ];
+        let (words, asked) = narrowed("editorOptions.ts options", defs);
+        assert_eq!(words.pinned_files, vec![REGISTRY, HELPER]);
+        assert!(asked.is_empty());
+        let (kebab, asked) = narrowed("generic-modal close behavior", defs);
+        assert_eq!(
+            kebab.pinned_files,
+            vec!["src/x/generic-modal.tsx", "src/y/generic-modal.tsx"]
+        );
+        assert!(asked.is_empty());
+    }
+
+    #[test]
+    fn looks_a_qualified_token_up_as_written_and_reads_a_call_as_its_name() {
+        let (out, asked) = narrowed(
+            "editorOptions.ts EditorIntOption.clampedInt `cursorStyleFromString()`",
+            &[
+                ("EditorIntOption.clampedInt", &[REGISTRY]),
+                ("cursorStyleFromString", &[REGISTRY]),
+            ],
+        );
+        assert_eq!(out.pinned_files, vec![REGISTRY]);
+        assert_eq!(
+            asked,
+            vec!["EditorIntOption.clampedInt", "cursorStyleFromString"]
+        );
+    }
+
+    #[test]
+    fn resolves_a_basename_shared_past_the_ambiguity_budget_when_it_narrows() {
+        let (out, _) = narrowed(
+            "user-profile UserProfileCard",
+            &[("UserProfileCard", &["src/c/user-profile.tsx"])],
+        );
+        assert_eq!(out.pinned_files, vec!["src/c/user-profile.tsx"]);
+        assert_eq!(
+            out.set_aside_matches,
+            vec![set_aside(
+                "user-profile",
+                &[
+                    "src/a/user-profile.tsx",
+                    "src/b/user-profile.tsx",
+                    "src/d/user-profile.tsx"
+                ]
+            )]
+        );
+
+        let (dotted, _) = narrowed(
+            "+page.svelte ChatScroller",
+            &[(
+                "ChatScroller",
+                &["src/routes/(protected)/chat-window/+page.svelte"],
+            )],
+        );
+        assert_eq!(
+            dotted.pinned_files,
+            vec!["src/routes/(protected)/chat-window/+page.svelte"]
+        );
+        assert!(dotted.unresolved_path_spans.is_empty());
+    }
+
+    #[test]
+    fn keeps_an_over_budget_span_ambiguous_when_the_symbols_do_not_narrow_it() {
+        let defs: &[(&str, &[&str])] = &[(
+            "PageHeader",
+            &[
+                "src/routes/m/projects/[id]/runs/[runId]/+page.svelte",
+                "src/routes/m/projects/[id]/chat/[scope]/+page.svelte",
+                "src/routes/m/projects/[id]/+page.svelte",
+                "src/routes/(protected)/chat-window/+page.svelte",
+            ],
+        )];
+        let (out, _) = narrowed("why do all +page.svelte PageHeader files flash", defs);
+        assert!(out.pinned_files.is_empty());
+        assert_eq!(out.unresolved_path_spans, vec!["+page.svelte"]);
+        assert!(out.set_aside_matches.is_empty());
+
+        let (kebab, _) = narrowed("refactor the user-profile rendering", defs);
+        assert!(kebab.pinned_files.is_empty());
+        assert_eq!(kebab.stripped_query, "refactor the user-profile rendering");
+    }
+
+    #[test]
+    fn binds_a_line_anchor_once_the_span_narrows_to_one_file() {
+        let (out, _) = narrowed(
+            "editorOptions.ts:1291 clampedInt",
+            &[("clampedInt", &[REGISTRY])],
+        );
+        assert_eq!(out.pinned_files, vec![REGISTRY]);
+        assert_eq!(out.line_anchors, vec![anchor(REGISTRY, 1291, 1291)]);
+    }
+
+    #[test]
+    fn does_not_report_a_file_the_query_also_names_by_its_full_path() {
+        let (out, _) = narrowed(
+            &format!("editorOptions.ts clampedInt {HELPER}"),
+            &[("clampedInt", &[REGISTRY])],
+        );
+        assert_eq!(out.pinned_files, vec![REGISTRY, HELPER]);
+        assert!(out.set_aside_matches.is_empty());
+    }
+
+    #[test]
+    fn never_looks_anything_up_for_a_span_that_matches_one_file() {
+        let (out, asked) = narrowed(
+            "chat-manager.ts ChatManager",
+            &[("ChatManager", &["src/lib/chat-manager.ts"])],
+        );
+        assert_eq!(out.pinned_files, vec!["src/lib/chat-manager.ts"]);
+        assert!(asked.is_empty());
     }
 }
