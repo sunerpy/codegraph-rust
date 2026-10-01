@@ -199,6 +199,7 @@ impl MacroVisibility {
         }
         let source = context.read_file(file).unwrap_or_default();
         let lines = directive_lines(&source);
+        let code = code_line_flags(&source);
         let mut events = Vec::new();
         let mut continued_until = 0;
         for (index, text) in lines.iter().enumerate() {
@@ -222,7 +223,7 @@ impl MacroVisibility {
                 } else {
                     branch[2].to_string()
                 };
-                let guard = guards_itself(&lines, index, op, &expression);
+                let guard = guards_itself(&lines, &code, index, op, &expression);
                 events.push(FileEvent::Branch {
                     op,
                     expression,
@@ -941,13 +942,27 @@ fn arithmetic(op: &str, a: i64, b: i64) -> Option<i64> {
     })
 }
 
-/// The include-guard idiom: `#ifndef X_H` (or `#if !defined(X_H)`) whose next
-/// directive is `#define X_H`. Nothing defines the guard before the test, so
-/// this is the first inclusion and the guarded body is active. A fallback
-/// function-like macro (`#ifndef MIN` / `#define MIN(a, b) …`) reads the same
-/// way. A default VALUE (`#ifndef ENABLE_X` / `#define ENABLE_X 0`) does not:
-/// that is the flag a build overrides on the command line.
-fn guards_itself(lines: &[String], index: usize, op: BranchOp, expression: &str) -> bool {
+/// A whole-file include guard: `#ifndef X_H` (or `#if !defined(X_H)`) is
+/// the file's first code line, its next directive is an empty `#define X_H`,
+/// and its matching `#endif` — with no `#else`/`#elif` at its depth — is the
+/// file's last code line. Nothing defines the guard before the test, so this
+/// is the first inclusion and the guarded body is active.
+///
+/// Upstream reads any `#ifndef X` / `#define X` pair, and a fallback
+/// function-like macro (`#ifndef MIN` / `#define MIN(a, b) …`), the same way.
+/// The port does not (KEEP-RUST): a feature-flag default
+/// (`#ifndef FEATURE` / `#define FEATURE` among other code) is skipped by a
+/// build with `-DFEATURE`, and a prior `MIN` from an unseen header or `-D` may
+/// be a wrapper that calls the function. A valued default
+/// (`#ifndef ENABLE_X` / `#define ENABLE_X 0`) is the flag a build overrides,
+/// never a guard.
+fn guards_itself(
+    lines: &[String],
+    code: &[bool],
+    index: usize,
+    op: BranchOp,
+    expression: &str,
+) -> bool {
     let name = match op {
         BranchOp::Ifndef => expression.trim().to_string(),
         BranchOp::If => NOT_DEFINED_GUARD
@@ -956,7 +971,7 @@ fn guards_itself(lines: &[String], index: usize, op: BranchOp, expression: &str)
             .map_or(String::new(), |m| m.as_str().to_string()),
         _ => return false,
     };
-    if !is_word(&name) {
+    if !is_word(&name) || code.iter().take(index).any(|has_code| *has_code) {
         return false;
     }
     let Some(next) = lines[index + 1..]
@@ -971,8 +986,79 @@ fn guards_itself(lines: &[String], index: usize, op: BranchOp, expression: &str)
     if &captures[1] != "define" || captures[2] != *name {
         return false;
     }
-    let rest = &next[captures.get(2).map_or(0, |m| m.end())..];
-    rest.starts_with('(') || rest.trim().is_empty()
+    if !next[captures.get(2).map_or(0, |m| m.end())..]
+        .trim()
+        .is_empty()
+    {
+        return false;
+    }
+    let mut depth = 0usize;
+    for (at, text) in lines.iter().enumerate().skip(index + 1) {
+        let Some(branch) = BRANCH.captures(text) else {
+            continue;
+        };
+        match (&branch[1], depth) {
+            ("if" | "ifdef" | "ifndef", _) => depth += 1,
+            ("else" | "elif", 0) => return false,
+            ("endif", 0) => return !code.iter().skip(at + 1).any(|has_code| *has_code),
+            ("endif", _) => depth -= 1,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Per line: whether anything but comments and whitespace is on it, with raw
+/// string bodies masked first, as [`directive_lines`] does.
+fn code_line_flags(source: &str) -> Vec<bool> {
+    let masked = mask_cpp_raw_strings(source);
+    let mut in_block = false;
+    masked
+        .split('\n')
+        .map(|raw| {
+            let line = raw.strip_suffix('\r').unwrap_or(raw);
+            let bytes = line.as_bytes();
+            let mut has_code = false;
+            let mut quote: Option<u8> = None;
+            let mut i = 0;
+            while i < bytes.len() {
+                if in_block {
+                    let Some(end) = line[i..].find("*/") else {
+                        break;
+                    };
+                    i += end + 2;
+                    in_block = false;
+                    continue;
+                }
+                let byte = bytes[i];
+                if let Some(q) = quote {
+                    if byte == b'\\' {
+                        i += 1;
+                    } else if byte == q {
+                        quote = None;
+                    }
+                    i += 1;
+                    continue;
+                }
+                match byte {
+                    b'/' if bytes.get(i + 1) == Some(&b'/') => break,
+                    b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                        in_block = true;
+                        i += 2;
+                        continue;
+                    }
+                    b'"' | b'\'' => {
+                        quote = Some(byte);
+                        has_code = true;
+                    }
+                    _ if !byte.is_ascii_whitespace() => has_code = true,
+                    _ => {}
+                }
+                i += 1;
+            }
+            has_code
+        })
+        .collect()
 }
 
 /// Does the body of the `#define NAME(` at `index` (continuation lines
@@ -1316,16 +1402,82 @@ mod tests {
     }
 
     #[test]
-    fn guards_are_the_ifndef_define_idiom_and_not_a_default_value() {
-        let guard = ["#ifndef X_H", "#define X_H"].map(str::to_string).to_vec();
-        assert!(guards_itself(&guard, 0, BranchOp::Ifndef, " X_H"));
-        let fallback = ["#if !defined(MIN)", "#define MIN(a, b) a"]
-            .map(str::to_string)
-            .to_vec();
-        assert!(guards_itself(&fallback, 0, BranchOp::If, " !defined(MIN)"));
-        let default = ["#ifndef ENABLE_X", "#define ENABLE_X 0"]
-            .map(str::to_string)
-            .to_vec();
-        assert!(!guards_itself(&default, 0, BranchOp::Ifndef, " ENABLE_X"));
+    fn guards_are_whole_file_ifndef_define_idioms_only() {
+        // `(file, line of the test, op, expression, guard?)`.
+        let cases = [
+            (
+                "/* License */\n#ifndef X_H\n#define X_H\nint x;\n#endif // X_H\n",
+                1,
+                BranchOp::Ifndef,
+                " X_H",
+                true,
+            ),
+            (
+                "#if !defined(X_H)\n#define X_H\n#if A\n#else\n#endif\n#endif\n",
+                0,
+                BranchOp::If,
+                " !defined(X_H)",
+                true,
+            ),
+            // A fallback function-like macro is no guard (KEEP-RUST).
+            (
+                "#if !defined(MIN)\n#define MIN(a, b) a\n#endif\n",
+                0,
+                BranchOp::If,
+                " !defined(MIN)",
+                false,
+            ),
+            // A default VALUE is the flag a build overrides.
+            (
+                "#ifndef ENABLE_X\n#define ENABLE_X 0\n#endif\n",
+                0,
+                BranchOp::Ifndef,
+                " ENABLE_X",
+                false,
+            ),
+            // Code before the test or after the `#endif`, or an `#else` at
+            // the guard's depth: not the whole file.
+            (
+                "int before;\n#ifndef X_H\n#define X_H\n#endif\n",
+                1,
+                BranchOp::Ifndef,
+                " X_H",
+                false,
+            ),
+            (
+                "#ifndef X_H\n#define X_H\n#endif\nint after;\n",
+                0,
+                BranchOp::Ifndef,
+                " X_H",
+                false,
+            ),
+            (
+                "#ifndef X_H\n#define X_H\n#else\n#endif\n",
+                0,
+                BranchOp::Ifndef,
+                " X_H",
+                false,
+            ),
+        ];
+        for (source, index, op, expression, expected) in cases {
+            let lines = directive_lines(source);
+            let code = code_line_flags(source);
+            assert_eq!(
+                guards_itself(&lines, &code, index, op, expression),
+                expected,
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn code_lines_ignore_comments_and_whitespace() {
+        let flags = code_line_flags(
+            "/* a\n * b */\n// c\n  \nint x; // d\n/* e */ y\nchar *s = \"/* f\";\n",
+        );
+        assert_eq!(
+            flags,
+            vec![false, false, false, false, true, true, true, false]
+        );
     }
 }

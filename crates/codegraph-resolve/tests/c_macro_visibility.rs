@@ -668,3 +668,83 @@ fn compound_conditions_decide_macro_visibility() {
         );
     }
 }
+
+#[test]
+fn only_a_whole_file_ifndef_is_an_include_guard() {
+    for language in ["c", "cpp"] {
+        let graph = resolve_project(
+            "whole-file-guard",
+            &[
+                (
+                    "licensed.h".to_string(),
+                    "/* License\n * text */\n// more\n#ifndef LICENSED_H\n#define LICENSED_H\n#define LIC(x) ((void)(x))\n#endif // LICENSED_H\n\n"
+                        .to_string(),
+                ),
+                (
+                    "code_before.h".to_string(),
+                    "int before;\n#ifndef BEFORE_H\n#define BEFORE_H\n#define BEFORE(x) ((void)(x))\n#endif\n"
+                        .to_string(),
+                ),
+                (
+                    "code_after.h".to_string(),
+                    "#ifndef AFTER_H\n#define AFTER_H\n#define AFTER(x) ((void)(x))\n#endif\nint after;\n"
+                        .to_string(),
+                ),
+                (
+                    "has_else.h".to_string(),
+                    "#ifndef ELSE_H\n#define ELSE_H\n#define ELSE(x) ((void)(x))\n#else\n#endif\n"
+                        .to_string(),
+                ),
+                (
+                    format!("unit.{language}"),
+                    [
+                        "#include \"licensed.h\"",
+                        "#include \"code_before.h\"",
+                        "#include \"code_after.h\"",
+                        "#include \"has_else.h\"",
+                        // A feature-flag default, not a guard: a build with
+                        // -DFEATURE never defines HOOK.
+                        "#ifndef FEATURE",
+                        "#define FEATURE",
+                        "#define HOOK(x) ((void)(x))",
+                        "#endif",
+                        // A fallback macro: a prior MIN from an unseen header or
+                        // -D may call the function, so nothing is definite.
+                        "#ifndef MIN",
+                        "#define MIN(a, b) ((a) < (b) ? (a) : (b))",
+                        "#endif",
+                        "void use_lic(void) { LIC(1); }",
+                        "void use_before(void) { BEFORE(1); }",
+                        "void use_after(void) { AFTER(1); }",
+                        "void use_else(void) { ELSE(1); }",
+                        "void use_hook(void) { HOOK(1); }",
+                        "int use_min(void) { return MIN(1, 2); }",
+                        "",
+                    ]
+                    .join("\n"),
+                ),
+                (
+                    format!("decoy.{language}"),
+                    "void LIC(int x) {}\nvoid BEFORE(int x) {}\nvoid AFTER(int x) {}\nvoid ELSE(int x) {}\nvoid HOOK(int x) {}\nint MIN(int a, int b) { return a; }\n"
+                        .to_string(),
+                ),
+            ],
+        );
+        let calls = ["lic", "before", "after", "else", "hook", "min"]
+            .map(|user| (user, graph.calls(&format!("use_{user}"))))
+            .to_vec();
+        let real = |name: &str| vec![format!("function {name} (decoy.{language})")];
+        assert_eq!(
+            calls,
+            vec![
+                ("lic", Vec::<String>::new()),
+                ("before", real("BEFORE")),
+                ("after", real("AFTER")),
+                ("else", real("ELSE")),
+                ("hook", real("HOOK")),
+                ("min", real("MIN")),
+            ],
+            "{language}"
+        );
+    }
+}
