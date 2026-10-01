@@ -11,7 +11,7 @@
     "OWNER": "sunerpy",
     "PACKAGE_NAME": "codegraph-rs",
     "REPO": "codegraph-rust",
-    "RUST_TOOLCHAIN": "1.96.0"
+    "RUST_TOOLCHAIN": "1.98.0"
   },
   "drift_allow": [
     ".github/workflows/ci.yml",
