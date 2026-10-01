@@ -23,6 +23,13 @@
   `f4ddf508516332419ea3c95702810765936cf679..origin/main`. Do not re-triage the
   audited `v1.6.1` range.
 - **Upstream repository:** <https://github.com/colbymchenry/codegraph>.
+- **Landed after `v0.51.0`, not yet released:**
+  - #286, which makes a full `sync` keep what `index` keeps;
+  - #288, symlink following (#935, #770);
+  - #289, the #1878 git fast path for pending status.
+
+  All three have dated entries below and ship in the next release. The two
+  `v0.51.0` exceptions #770 and #1829/#1878 are closed on main.
 - **Deferred UI family:** the browser viewer and the graph-semantic families
   F1–F12 that shipped beside it in `v1.6.1` (framework navigation edges and
   routers, the synthesis layer and its schema, cross-tier channels, server route

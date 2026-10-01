@@ -1,5 +1,5 @@
 mod git;
-mod git_pending;
+pub mod git_pending;
 mod link_state;
 mod migrate;
 mod policy;

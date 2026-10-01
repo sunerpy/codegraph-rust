@@ -406,6 +406,7 @@ pub(crate) fn extend_for_incremental(
         }
         _ => forget(store)?,
     }
+    test_hooks::after_incremental_extend(root);
     Ok(())
 }
 
@@ -505,9 +506,11 @@ pub(crate) fn git_fast_pending(
     Ok(Some(pending))
 }
 
-/// Seams for tests that race the writers: a hook that runs right after
-/// [`GitIndexCapture::begin`] captures git (before the build scans), and one
-/// right before [`GitIndexCapture::record`] (after every file was read).
+/// Seams for tests that race or break the writers: hooks right after
+/// [`GitIndexCapture::begin`] captures git (before the build scans), right
+/// before [`GitIndexCapture::record`] (after every file was read), and right
+/// after an incremental sync updated the record (before any row moves). A
+/// panicking hook must not poison the next test, so locks tolerate poison.
 pub mod test_hooks {
     use std::path::Path;
 
@@ -518,15 +521,42 @@ pub mod test_hooks {
     static AFTER_GIT_BEGIN: std::sync::Mutex<Option<Hook>> = std::sync::Mutex::new(None);
     #[cfg(feature = "test-hooks")]
     static BEFORE_GIT_RECORD: std::sync::Mutex<Option<Hook>> = std::sync::Mutex::new(None);
+    #[cfg(feature = "test-hooks")]
+    static AFTER_INCREMENTAL_EXTEND: std::sync::Mutex<Option<Hook>> = std::sync::Mutex::new(None);
+
+    /// Runs once an incremental sync has extended (or forgotten) the record,
+    /// before it writes a row.
+    #[cfg(feature = "test-hooks")]
+    pub fn set_after_incremental_extend(hook: Option<Hook>) {
+        *AFTER_INCREMENTAL_EXTEND
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
+    }
+
+    pub(super) fn after_incremental_extend(root: &Path) {
+        #[cfg(feature = "test-hooks")]
+        if let Some(hook) = AFTER_INCREMENTAL_EXTEND
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            hook(root);
+        }
+        let _ = root;
+    }
 
     #[cfg(feature = "test-hooks")]
     pub fn set_after_git_begin(hook: Option<Hook>) {
-        *AFTER_GIT_BEGIN.lock().unwrap() = hook;
+        *AFTER_GIT_BEGIN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
     }
 
     #[cfg(feature = "test-hooks")]
     pub fn set_before_git_record(hook: Option<Hook>) {
-        *BEFORE_GIT_RECORD.lock().unwrap() = hook;
+        *BEFORE_GIT_RECORD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
     }
 
     #[cfg(feature = "test-hooks")]
@@ -537,18 +567,26 @@ pub mod test_hooks {
     /// Run this program instead of `git` (a stand-in that hangs, say).
     #[cfg(feature = "test-hooks")]
     pub fn set_git_program(program: Option<std::path::PathBuf>) {
-        *GIT_PROGRAM.lock().unwrap() = program;
+        *GIT_PROGRAM
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = program;
     }
 
     /// Give up on git after this long instead of the default.
     #[cfg(feature = "test-hooks")]
     pub fn set_git_timeout(timeout: Option<std::time::Duration>) {
-        *GIT_TIMEOUT.lock().unwrap() = timeout;
+        *GIT_TIMEOUT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = timeout;
     }
 
     pub(super) fn git_program() -> std::ffi::OsString {
         #[cfg(feature = "test-hooks")]
-        if let Some(program) = GIT_PROGRAM.lock().unwrap().as_ref() {
+        if let Some(program) = GIT_PROGRAM
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
             return program.clone().into_os_string();
         }
         "git".into()
@@ -556,7 +594,10 @@ pub mod test_hooks {
 
     pub(super) fn git_timeout(default: std::time::Duration) -> std::time::Duration {
         #[cfg(feature = "test-hooks")]
-        if let Some(timeout) = *GIT_TIMEOUT.lock().unwrap() {
+        if let Some(timeout) = *GIT_TIMEOUT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
             return timeout;
         }
         default
@@ -564,7 +605,11 @@ pub mod test_hooks {
 
     pub(super) fn after_git_begin(root: &Path) {
         #[cfg(feature = "test-hooks")]
-        if let Some(hook) = AFTER_GIT_BEGIN.lock().unwrap().as_ref() {
+        if let Some(hook) = AFTER_GIT_BEGIN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
             hook(root);
         }
         let _ = root;
@@ -572,7 +617,11 @@ pub mod test_hooks {
 
     pub(super) fn before_git_record(root: &Path) {
         #[cfg(feature = "test-hooks")]
-        if let Some(hook) = BEFORE_GIT_RECORD.lock().unwrap().as_ref() {
+        if let Some(hook) = BEFORE_GIT_RECORD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
             hook(root);
         }
         let _ = root;

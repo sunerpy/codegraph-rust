@@ -42,6 +42,53 @@ fn hooks_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+fn codegraph_dir() -> Option<String> {
+    std::env::var("CODEGRAPH_DIR").ok()
+}
+
+/// Sets `CODEGRAPH_DIR` for one test (every test here holds [`hooks_guard`],
+/// so none runs alongside) and restores it on drop.
+struct IndexDirGuard(Option<std::ffi::OsString>);
+
+impl IndexDirGuard {
+    fn set(name: &str) -> Self {
+        let previous = std::env::var_os("CODEGRAPH_DIR");
+        // SAFETY: tests in this binary are serialized by `hooks_guard`.
+        unsafe { std::env::set_var("CODEGRAPH_DIR", name) };
+        Self(previous)
+    }
+}
+
+impl Drop for IndexDirGuard {
+    fn drop(&mut self) {
+        // SAFETY: as in `set`.
+        unsafe {
+            match self.0.take() {
+                Some(value) => std::env::set_var("CODEGRAPH_DIR", value),
+                None => std::env::remove_var("CODEGRAPH_DIR"),
+            }
+        }
+    }
+}
+
+/// The record straight from the database file, readable even when an
+/// interrupted writer left the namespace unreadable through the state gate.
+fn raw_record(root: &Path) -> Option<serde_json::Value> {
+    let db = IndexPaths::resolve(root, codegraph_dir().as_deref())
+        .unwrap()
+        .current_db();
+    let conn =
+        rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    conn.query_row(
+        "SELECT value FROM project_metadata WHERE key = ?1",
+        [GIT_PENDING_KEY],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .map(|value| serde_json::from_str(&value).unwrap())
+}
+
 fn git_available() -> bool {
     Command::new("git")
         .arg("--version")
@@ -138,7 +185,9 @@ impl Repo {
     }
 
     fn sync_paths(&self, paths: &[&str]) {
-        let db = IndexPaths::resolve(&self.root, None).unwrap().current_db();
+        let db = IndexPaths::resolve(&self.root, codegraph_dir().as_deref())
+            .unwrap()
+            .current_db();
         sync_changed_paths(
             &self.root,
             db,
@@ -148,7 +197,7 @@ impl Repo {
     }
 
     fn store(&self) -> Store {
-        let paths = IndexPaths::resolve(&self.root, None).unwrap();
+        let paths = IndexPaths::resolve(&self.root, codegraph_dir().as_deref()).unwrap();
         Store::open_for_read(&paths, Instant::now() + Duration::from_secs(30), || false)
             .expect("open the index")
     }
@@ -406,7 +455,9 @@ fn no_git_an_empty_repo_or_no_record_declines() {
     let Some(repo) = indexed("no-record") else {
         return;
     };
-    let db = IndexPaths::resolve(&repo.root, None).unwrap().current_db();
+    let db = IndexPaths::resolve(&repo.root, codegraph_dir().as_deref())
+        .unwrap()
+        .current_db();
     rusqlite::Connection::open(db)
         .unwrap()
         .execute(
@@ -669,7 +720,9 @@ fn a_full_sync_forgets_the_record_before_it_scans() {
         return;
     };
     assert!(repo.record().is_some());
-    let db = IndexPaths::resolve(&repo.root, None).unwrap().current_db();
+    let db = IndexPaths::resolve(&repo.root, codegraph_dir().as_deref())
+        .unwrap()
+        .current_db();
     let absent = Arc::new(AtomicBool::new(false));
     let seen = Arc::clone(&absent);
     git_pending_hooks::set_after_git_begin(Some(Box::new(move |_| {
@@ -692,4 +745,115 @@ fn a_full_sync_forgets_the_record_before_it_scans() {
         "the record was gone during the sync"
     );
     assert!(repo.record().is_some(), "and written again at its end");
+}
+
+/// `CODEGRAPH_DIR` names a single project-local index root. The watcher's
+/// policy only knows `.codegraph*`, but the scan prunes the exact root, so
+/// the index's own files never become candidates.
+#[test]
+fn a_custom_index_root_is_excluded_by_the_scan_rules() {
+    let _hooks = hooks_guard();
+    if !git_available() {
+        return;
+    }
+    let _dir = IndexDirGuard::set("cgidx");
+    let repo = Repo::new("custom-root");
+    fs::write(repo.top.join(".git/info/exclude"), "").unwrap();
+    repo.write("src/a.ts", "export const a = 1;\n");
+    repo.commit("init");
+    repo.sync();
+    assert!(
+        repo.root.join("cgidx").is_dir(),
+        "the index lives in the custom root"
+    );
+    assert!(repo.assert_fast("custom root, clean").is_empty());
+    repo.write("src/a.ts", "export const a = 2;\n");
+    assert_eq!(
+        repo.assert_fast("custom root, an edit").modified,
+        paths(&["src/a.ts"])
+    );
+}
+
+#[test]
+fn a_submodule_below_a_subdirectory_project_declines() {
+    let _hooks = hooks_guard();
+    if !git_available() {
+        return;
+    }
+    let source = Repo::new("subdir-submodule-source");
+    source.write("lib.ts", "export const lib = 1;\n");
+    source.commit("lib");
+    let repo = Repo::in_subdir("subdir-submodule");
+    repo.write("src/a.ts", "export const a = 1;\n");
+    repo.commit("init");
+    repo.git(&[
+        "submodule",
+        "add",
+        "-q",
+        source.top.to_str().unwrap(),
+        "packages/app/vendor",
+    ]);
+    repo.commit("submodule");
+    repo.sync();
+    assert_eq!(
+        repo.record().expect("a record")["submodules"],
+        serde_json::json!(true),
+        "the --full-name gitlink check sees a submodule below the project"
+    );
+    repo.assert_declines("a submodule below a subdirectory project");
+}
+
+/// A full sync that dies after forgetting the record and before writing the
+/// new one leaves no record, never a stale one.
+#[test]
+fn an_interrupted_full_sync_leaves_no_record() {
+    let _hooks = hooks_guard();
+    let Some(repo) = indexed("interrupted-full") else {
+        return;
+    };
+    assert!(raw_record(&repo.root).is_some());
+    repo.write("src/a.ts", "export const a = 8;\n");
+    git_pending_hooks::set_before_git_record(Some(Box::new(|_| {
+        panic!("injected failure before the record is written")
+    })));
+    let root = repo.root.clone();
+    let outcome =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sync_project_once(&root)));
+    git_pending_hooks::set_before_git_record(None);
+    assert!(
+        outcome.is_err(),
+        "the injected failure interrupted the sync"
+    );
+    assert!(raw_record(&repo.root).is_none(), "no stale record survives");
+}
+
+/// An incremental sync records its paths before any row moves, so one that
+/// dies right after still leaves them in `dirty`.
+#[test]
+fn an_interrupted_incremental_sync_keeps_its_paths_recorded() {
+    let _hooks = hooks_guard();
+    let Some(repo) = indexed("interrupted-incremental") else {
+        return;
+    };
+    repo.write("src/a.ts", "export const a = 9;\n");
+    git_pending_hooks::set_after_incremental_extend(Some(Box::new(|_| {
+        panic!("injected failure before any row moves")
+    })));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        repo.sync_paths(&["src/a.ts"])
+    }));
+    git_pending_hooks::set_after_incremental_extend(None);
+    assert!(
+        outcome.is_err(),
+        "the injected failure interrupted the sync"
+    );
+    let record = raw_record(&repo.root).expect("the record survives");
+    assert!(
+        record["dirty"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path == "src/a.ts"),
+        "{record}"
+    );
 }
