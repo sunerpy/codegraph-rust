@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.52.0](https://github.com/sunerpy/codegraph-rust/compare/v0.51.0...v0.52.0) (2026-10-01)
+
+
+### Features
+
+* **scan:** follow symlinked files and directories ([#935](https://github.com/sunerpy/codegraph-rust/issues/935)) ([a10ede3](https://github.com/sunerpy/codegraph-rust/commit/a10ede33df7e6e7169f2d64a7dc1d97289085264))
+* **status:** answer pending changes from git's candidates when git sees every change ([#1878](https://github.com/sunerpy/codegraph-rust/issues/1878)) ([a572fb5](https://github.com/sunerpy/codegraph-rust/commit/a572fb55b405af98d1dac9d7931797792a8d5def))
+* **watch:** follow the scan's symlinks with live watches ([#770](https://github.com/sunerpy/codegraph-rust/issues/770)) ([a10ede3](https://github.com/sunerpy/codegraph-rust/commit/a10ede33df7e6e7169f2d64a7dc1d97289085264))
+
+
+### Bug Fixes
+
+* **sync:** keep the files a full sync's own scan indexes ([#286](https://github.com/sunerpy/codegraph-rust/issues/286)) ([f23b0bd](https://github.com/sunerpy/codegraph-rust/commit/f23b0bdc74fd652e700f0c09351c142c0c30249e))
+* **sync:** re-read files behind new, retargeted or unrecorded symlinks ([a10ede3](https://github.com/sunerpy/codegraph-rust/commit/a10ede33df7e6e7169f2d64a7dc1d97289085264))
+
 ## [0.51.0](https://github.com/sunerpy/codegraph-rust/compare/v0.50.3...v0.51.0) (2026-10-01)
 
 
