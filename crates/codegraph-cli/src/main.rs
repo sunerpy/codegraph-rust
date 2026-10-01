@@ -22,7 +22,7 @@ use codegraph_core::generated_header::detect_generated_file;
 use codegraph_core::logger::{LoggerConfig, init_logger};
 use codegraph_core::node_id::hash_content;
 use codegraph_core::types::{Edge, ExtractionResult, FileRecord, Language, Node, NodeKind};
-use codegraph_extract::{ExtractOptions, detect_language_with, extract_source_with_observer};
+use codegraph_extract::{ExtractOptions, detect_language_with};
 use codegraph_graph::graph::{GodotReach, GraphTraverser, group_definitions};
 use codegraph_graph::query::{SearchOptions, search_nodes};
 use codegraph_graph::{segment_match, segments};
@@ -5301,6 +5301,7 @@ fn index_project_inner(
     let mut files_indexed = 0;
     let mut files_skipped = 0;
     let mut files_errored = 0;
+    let mut files_not_source = 0_u64;
     let mut warnings = Vec::new();
 
     // Stream the graph to the store in capped batches instead of holding the whole
@@ -5350,7 +5351,8 @@ fn index_project_inner(
     diagnostic_run.phase_start("parse_write");
     let parse_started = std::time::Instant::now();
 
-    type ParsePayload = (String, FileRecord, ExtractionResult);
+    // `None` for an MPEG transport stream named `.ts`: video, not source (#1910).
+    type ParsePayload = Option<(String, FileRecord, ExtractionResult)>;
     let schedule_tracker = tracker.clone();
     let parse_tracker = tracker.clone();
     let buffer_tracker = tracker.clone();
@@ -5363,55 +5365,34 @@ fn index_project_inner(
             let relative = &files[index];
             let full = project.join(relative);
 
-            parse_tracker.stage(index, "metadata");
-            let metadata = match fs::metadata(&full)
-                .with_context(|| format!("reading metadata for {}", full.display()))
-            {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    parse_tracker.failed(index, &error);
-                    return Err(error);
-                }
-            };
-
             parse_tracker.stage(index, "read");
-            let source = match fs::read_to_string(&full)
-                .with_context(|| format!("reading source file {}", full.display()))
-            {
-                Ok(source) => source,
-                Err(error) => {
-                    parse_tracker.failed(index, &error);
-                    return Err(error);
-                }
+            let (metadata, source) =
+                match codegraph_extract::read_source_file(&full, relative, options.max_file_size)
+                    .with_context(|| format!("reading source file {}", full.display()))
+                {
+                    Ok(read) => read,
+                    Err(error) => {
+                        parse_tracker.failed(index, &error);
+                        return Err(error);
+                    }
+                };
+            // A file over the limit was never read: its size stamp stands in for
+            // its content, in the hash and in the generated-file check. A video
+            // clip named `.ts` is not source at all, so it is not recorded.
+            let Some(hash_input) = source.hash_input() else {
+                return Ok(None);
             };
             parse_tracker.stage(index, "prepare");
             let language = detect_language_with(relative, &options.extensions);
             parse_tracker.file_info(index, metadata.len(), language);
 
-            let result = if metadata.len() > options.max_file_size {
-                ExtractionResult {
-                    nodes: Vec::new(),
-                    edges: Vec::new(),
-                    unresolved_references: Vec::new(),
-                    errors: vec![format!(
-                        "File exceeds max size ({} > {}): {relative}",
-                        metadata.len(),
-                        options.max_file_size
-                    )],
-                    duration_ms: 0,
-                }
-            } else {
-                extract_source_with_observer(
-                    relative,
-                    &source,
-                    None,
-                    &options.extensions,
-                    |stage| parse_tracker.extraction_stage(index, stage),
-                )
-            };
+            let result =
+                codegraph_extract::engine::extraction_of(relative, &source, &options, |stage| {
+                    parse_tracker.extraction_stage(index, stage)
+                });
             let file = FileRecord {
                 path: relative.clone(),
-                content_hash: hash_content(&source),
+                content_hash: hash_content(&hash_input),
                 language,
                 size: metadata.len() as i64,
                 modified_at: modified_millis(&metadata),
@@ -5422,13 +5403,18 @@ fn index_project_inner(
                     .filter(|node| node.file_path == *relative)
                     .count() as i64,
                 errors: result.errors.clone(),
-                generated: detect_generated_file(relative, &source),
+                generated: detect_generated_file(relative, &hash_input),
             };
             parse_tracker.parsed(index, &result);
-            Ok((relative.clone(), file, result))
+            Ok(Some((relative.clone(), file, result)))
         },
         |buffered| buffer_tracker.buffered(buffered),
-        |index, (_relative, file, mut result)| {
+        |index, payload| {
+            let Some((_relative, file, mut result)) = payload else {
+                files_not_source += 1;
+                persist_tracker.persisted(index);
+                return Ok(());
+            };
             let fatal_errors = file
                 .errors
                 .iter()
@@ -5480,7 +5466,7 @@ fn index_project_inner(
         }),
     );
 
-    let scan_files = bar.position();
+    let scan_files = bar.position() - files_not_source;
     finish_phase(
         &bar,
         &format!("Indexed {} files", format_number(scan_files as i64)),

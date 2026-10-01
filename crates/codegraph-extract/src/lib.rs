@@ -16,6 +16,9 @@ pub mod lang;
 pub mod spec;
 pub mod walker;
 
+pub use codegraph_core::source_file::{
+    SourceText, is_source_file, oversize_stamp, read_source_file,
+};
 pub use engine::{
     ExtractOptions, ExtractionStage, PARSE_COLLAPSE_WARNING, RootGitignore, detect_language,
     detect_language_with, extract_file, extract_file_with_options,

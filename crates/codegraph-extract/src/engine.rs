@@ -6,7 +6,6 @@
 
 use anyhow::{Context, Result};
 use codegraph_core::config::{Config, IndexingConfig};
-use codegraph_core::node_id::hash_content;
 use codegraph_core::types::{ExtractionResult, Language};
 use rayon::prelude::*;
 use regex::Regex;
@@ -20,6 +19,7 @@ use tree_sitter::Parser;
 use crate::ext_config::ExtensionOverrides;
 use crate::lang::{cpp_code_mask, spec_for_language};
 use crate::walker::TreeSitterWalker;
+use codegraph_core::source_file::{SourceText, read_source_file};
 
 /// Stable diagnostic fragment used when a supported grammar reports parse
 /// errors and extraction collapses to only the synthetic file node.
@@ -409,25 +409,33 @@ pub fn extract_file_with_options_observer(
     let root = root.as_ref();
     let relative_path = normalize_path(relative_path.as_ref());
     let full_path = root.join(&relative_path);
-    let metadata = fs::metadata(&full_path)
-        .with_context(|| format!("stat source file {}", full_path.display()))?;
-    if metadata.len() > options.max_file_size {
-        return Ok(size_skip_result(
-            &relative_path,
-            metadata.len(),
-            options.max_file_size,
-        ));
-    }
-    let source = fs::read_to_string(&full_path)
+    let (_, source) = read_source_file(&full_path, &relative_path, options.max_file_size)
         .with_context(|| format!("read source file {}", full_path.display()))?;
-    let _content_hash = hash_content(&source);
-    Ok(extract_source_with_observer(
-        &relative_path,
-        &source,
-        None,
-        &options.extensions,
-        observer,
-    ))
+    Ok(extraction_of(&relative_path, &source, options, observer))
+}
+
+/// The extraction result for one file as [`read_source_file`] saw it: a parse
+/// of its text, the size-skip result over the limit, and nothing at all for an
+/// MPEG transport stream, which is not source.
+pub fn extraction_of(
+    relative_path: &str,
+    source: &SourceText,
+    options: &ExtractOptions,
+    observer: impl FnMut(ExtractionStage),
+) -> ExtractionResult {
+    match source {
+        SourceText::Text(text) => {
+            extract_source_with_observer(relative_path, text, None, &options.extensions, observer)
+        }
+        SourceText::Oversize(size) => size_skip_result(relative_path, *size, options.max_file_size),
+        SourceText::MpegTransportStream => ExtractionResult {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            unresolved_references: Vec::new(),
+            errors: Vec::new(),
+            duration_ms: 0,
+        },
+    }
 }
 
 pub fn extract_project(
@@ -438,24 +446,9 @@ pub fn extract_project(
     let files = scan_project(root, options)?;
     let parse = |relative: &String| -> Result<ExtractionResult> {
         let full = root.join(relative);
-        let metadata =
-            fs::metadata(&full).with_context(|| format!("stat source file {}", full.display()))?;
-        if metadata.len() > options.max_file_size {
-            return Ok(size_skip_result(
-                relative,
-                metadata.len(),
-                options.max_file_size,
-            ));
-        }
-        let source = fs::read_to_string(&full)
+        let (_, source) = read_source_file(&full, relative, options.max_file_size)
             .with_context(|| format!("read source file {}", full.display()))?;
-        let _content_hash = hash_content(&source);
-        Ok(extract_source_with(
-            relative,
-            &source,
-            None,
-            &options.extensions,
-        ))
+        Ok(extraction_of(relative, &source, options, |_| {}))
     };
 
     let mut results = if options.parallel {
@@ -619,7 +612,9 @@ fn merge_results(results: &mut [ExtractionResult]) -> Result<ExtractionResult> {
     Ok(merged)
 }
 
-fn size_skip_result(file_path: &str, size: u64, max: u64) -> ExtractionResult {
+/// The result recorded for a file over the size limit: no symbols, and the
+/// error every indexing path reports for it.
+pub fn size_skip_result(file_path: &str, size: u64, max: u64) -> ExtractionResult {
     ExtractionResult {
         nodes: Vec::new(),
         edges: Vec::new(),

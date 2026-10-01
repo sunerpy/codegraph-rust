@@ -8,6 +8,7 @@ pub mod generated_header;
 pub mod index_paths;
 pub mod logger;
 pub mod node_id;
+pub mod source_file;
 pub mod traits;
 pub mod types;
 

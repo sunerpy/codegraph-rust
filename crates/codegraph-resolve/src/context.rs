@@ -272,7 +272,7 @@ impl ResolutionContext for StoreResolutionContext<'_> {
         }
         let full_path = Path::new(&self.project_root).join(file_path);
         let content: Option<Arc<str>> =
-            read_source_file(&full_path, self.max_file_size).map(Arc::from);
+            read_source_file(&full_path, file_path, self.max_file_size).map(Arc::from);
         c.file_cache.set(file_path.to_string(), content.clone());
         content
     }
@@ -523,24 +523,20 @@ fn load_go_module(project_root: &str) -> Option<GoModule> {
     load_go_module_in(project_root, "")
 }
 
-/// Read `path` for resolution only if extraction would accept it: a regular
-/// file no larger than `max_bytes` (upstream #1553). The `stat` comes first, so
-/// a dependency archive an import resolves to is never decoded and a FIFO is
-/// never opened; the read is bounded as well, in case the file grows meanwhile.
-pub(crate) fn read_source_file(path: &Path, max_bytes: u64) -> Option<String> {
-    use std::io::Read;
-
-    let metadata = std::fs::metadata(path).ok()?;
-    if !metadata.is_file() || metadata.len() > max_bytes {
-        return None;
-    }
-    let mut content = String::new();
-    std::fs::File::open(path)
+/// Read `path` (`relative` in the project) for resolution only if extraction
+/// would index it: a regular file no larger than `max_bytes` that is not a video
+/// clip named `.ts` (upstream #1553, #1910). The shared bounded reader stats it
+/// first, so a dependency archive an import resolves to is never decoded and a
+/// FIFO is never opened, and it decodes the text exactly as extraction does.
+pub(crate) fn read_source_file(path: &Path, relative: &str, max_bytes: u64) -> Option<String> {
+    match codegraph_core::source_file::read_source_file(path, relative, max_bytes)
         .ok()?
-        .take(max_bytes.saturating_add(1))
-        .read_to_string(&mut content)
-        .ok()?;
-    (content.len() as u64 <= max_bytes).then_some(content)
+        .1
+    {
+        codegraph_core::source_file::SourceText::Text(text) => Some(text),
+        codegraph_core::source_file::SourceText::Oversize(_)
+        | codegraph_core::source_file::SourceText::MpegTransportStream => None,
+    }
 }
 
 /// Read the `module` line of `<project_root>/<dir>/go.mod`.

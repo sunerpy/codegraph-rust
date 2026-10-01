@@ -1439,6 +1439,7 @@ impl ReferenceResolver {
             |relative| {
                 crate::context::read_source_file(
                     &std::path::Path::new(&self.project_root).join(relative),
+                    relative,
                     self.max_file_size,
                 )
             },

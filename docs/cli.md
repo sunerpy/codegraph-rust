@@ -1184,6 +1184,15 @@ synthetic file node, `init`/`index`/`sync` still succeed but print and persist
 `parse produced no symbols (tree has errors)`. Files with useful surviving
 symbols stay quiet even when the grammar tree contains recoverable error nodes.
 
+A file over `indexing.max_file_size` (1 MiB by default) is recorded without
+being read: no symbols, a `File exceeds max size` error, and a size stamp in
+place of its content hash, so a same-size rewrite is not a change while crossing
+the limit in either direction is. A `.ts` file whose head is an MPEG transport
+stream is video rather than TypeScript: it is neither indexed nor counted, and a
+tracked file that turns into one leaves the index. Bytes that are not valid
+UTF-8 are decoded with U+FFFD replacements, so a Latin-1 or binary source file
+is indexed like any other instead of failing the run.
+
 ### Index diagnostics
 
 `init`, `index`, and `sync` share `--debug` and `--debug-log <FILE>`.

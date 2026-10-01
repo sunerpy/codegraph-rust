@@ -173,9 +173,10 @@ impl CodeGraphEngine {
     /// Freshness is fail-closed: it is proven only after successfully loading the
     /// file record and matching either size + millisecond mtime (the sync fast
     /// path, with no hash) or, after a stat mismatch, the indexed sha256 content
-    /// hash. A missing/unreadable record, read failure, or unhashable oversized
-    /// stat mismatch remains possibly drifted. The full probe is memoized for the
-    /// current handler.
+    /// hash — of the file's text, or of its size stamp for a file over the limit,
+    /// which is compared without being read, exactly as indexing hashed it. A
+    /// missing/unreadable record or a read failure remains possibly drifted. The
+    /// full probe is memoized for the current handler.
     fn project_source(&self, file_path: &str) -> SourceProbe {
         if let Some(cached) = self.source_probes.borrow().get(file_path).cloned() {
             return cached;
@@ -193,34 +194,31 @@ impl CodeGraphEngine {
                         && metadata_modified_millis(&metadata)
                             .is_some_and(|mtime| file.modified_at == mtime)
                 });
-                if metadata.len() > self.config.indexing.max_file_size {
-                    SourceProbe {
-                        content: None,
-                        freshness: if stat_matches {
+                match codegraph_core::source_file::read_source_file(
+                    &abs,
+                    file_path,
+                    self.config.indexing.max_file_size,
+                ) {
+                    Ok((_, source)) => {
+                        let freshness = if stat_matches
+                            || source.hash_input().is_some_and(|input| {
+                                stored
+                                    .as_ref()
+                                    .is_some_and(|file| file.content_hash == hash_content(&input))
+                            }) {
                             SourceFreshness::ProvenFresh
                         } else {
                             SourceFreshness::PossiblyDrifted
-                        },
-                    }
-                } else {
-                    match fs::read_to_string(&abs) {
-                        Ok(content) => {
-                            let freshness = if stat_matches
-                                || stored
-                                    .as_ref()
-                                    .is_some_and(|file| file.content_hash == hash_content(&content))
-                            {
-                                SourceFreshness::ProvenFresh
-                            } else {
-                                SourceFreshness::PossiblyDrifted
-                            };
-                            SourceProbe {
-                                content: Some(Arc::<str>::from(content)),
-                                freshness,
+                        };
+                        let content = match source {
+                            codegraph_core::source_file::SourceText::Text(text) => {
+                                Some(Arc::<str>::from(text))
                             }
-                        }
-                        Err(_) => SourceProbe::default(),
+                            _ => None,
+                        };
+                        SourceProbe { content, freshness }
                     }
+                    Err(_) => SourceProbe::default(),
                 }
             }
             _ => SourceProbe::default(),
@@ -5458,6 +5456,33 @@ mod tests {
             !text_of(&tr).starts_with("⚠️ Some files referenced below"),
             "a possibly-drifted file whose bytes were omitted must not fabricate a banner: {}",
             text_of(&tr)
+        );
+    }
+
+    /// Indexing records a file over the limit by its size stamp, so the probe
+    /// compares it by that stamp, unread: a same-size rewrite is no drift
+    /// (upstream #1910), as it is no change to sync.
+    #[test]
+    fn project_source_compares_an_oversized_file_by_its_size_stamp() {
+        let mut engine = test_engine();
+        let file = "src/oversized.rs";
+        put_indexed_source(&engine, file, "fn oversized() {}\n", Language::Rust, 1);
+        let metadata = std::fs::metadata(engine.project_root.join(file)).unwrap();
+        let mut stored = engine.store.file_by_path(file).unwrap().unwrap();
+        stored.modified_at += 1;
+        stored.content_hash =
+            hash_content(&codegraph_core::source_file::oversize_stamp(metadata.len()));
+        put_file(&engine, &stored);
+        Arc::get_mut(&mut engine.config)
+            .unwrap()
+            .indexing
+            .max_file_size = metadata.len() - 1;
+
+        let probe = engine.project_source(file);
+        assert_eq!(probe.freshness, SourceFreshness::ProvenFresh);
+        assert!(
+            probe.content.is_none(),
+            "oversized source bytes stay unread"
         );
     }
 

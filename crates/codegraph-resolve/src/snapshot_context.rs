@@ -382,7 +382,8 @@ impl SnapshotResolutionContext {
                 .file_loads
                 .fetch_add(1, Ordering::Relaxed);
             let full_path = Path::new(&self.snapshot.project_root).join(file_path);
-            crate::context::read_source_file(&full_path, self.max_file_size).map(Arc::from)
+            crate::context::read_source_file(&full_path, file_path, self.max_file_size)
+                .map(Arc::from)
         })
     }
 

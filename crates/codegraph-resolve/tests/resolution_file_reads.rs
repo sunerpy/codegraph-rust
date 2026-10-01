@@ -50,7 +50,7 @@ impl Project {
         self.root.to_string_lossy().to_string()
     }
 
-    fn write(&self, relative: &str, content: &str) {
+    fn write(&self, relative: &str, content: impl AsRef<[u8]>) {
         let path = self.root.join(relative);
         std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
         std::fs::write(path, content).expect("write fixture");
@@ -86,7 +86,7 @@ fn reads_stop_at_the_extraction_size_limit_in_both_contexts() {
     let at_limit = "a".repeat(LIMIT);
     project.write("small.ts", "export const answer = 42;\n");
     project.write("boundary.ts", &at_limit);
-    project.write("bundle.js", &"a".repeat(LIMIT + 1));
+    project.write("bundle.js", "a".repeat(LIMIT + 1));
     std::fs::create_dir_all(project.root.join("directory")).expect("mkdir");
     let archive = project.sparse_archive();
 
@@ -105,6 +105,29 @@ fn reads_stop_at_the_extraction_size_limit_in_both_contexts() {
             );
             assert!(!context.is_file_readable(rejected), "{rejected}");
         }
+    }
+}
+
+/// Resolution decodes a file exactly as extraction does (upstream #1910): bytes
+/// that are not UTF-8 become U+FFFD, and a video clip named `.ts` is not
+/// source, so neither context reads it.
+#[test]
+fn reads_decode_like_extraction_and_skip_video_clips() {
+    let project = Project::new("decode");
+    project.write("legacy.c", b"/* caf\xe9 */\n");
+    let mut clip = Vec::new();
+    for packet in 0..64_u32 {
+        clip.push(0x47);
+        clip.extend((0..187_u32).map(|byte| ((packet * 31 + byte * 7) % 32) as u8));
+    }
+    project.write("clip.ts", &clip);
+    let (store_context, snapshot) = contexts(&project);
+    for context in [&store_context as &dyn ResolutionContext, &snapshot] {
+        assert_eq!(
+            context.read_file("legacy.c").as_deref(),
+            Some("/* caf\u{fffd} */\n")
+        );
+        assert_eq!(context.read_file("clip.ts"), None);
     }
 }
 
@@ -208,7 +231,7 @@ fn framework_extraction_skips_a_file_too_large_to_extract() {
     );
     let call = "import { invoke } from '@tauri-apps/api/core';\ninvoke('save_config');\n";
     project.write("src/app.ts", call);
-    project.write("src/bundle.ts", &format!("{call}{}", " ".repeat(LIMIT)));
+    project.write("src/bundle.ts", format!("{call}{}", " ".repeat(LIMIT)));
 
     let mut resolver = ReferenceResolver::new(project.root_str());
     {
