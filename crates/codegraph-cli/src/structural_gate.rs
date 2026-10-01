@@ -34,8 +34,10 @@ use regex::Regex;
 /// Structural keywords matched as EXACT words (boundary on both sides): short
 /// or ambiguous tokens where prefix matching would false-positive ("flow" in
 /// "flower", "path" in "pathological"). Grouped by language; a term appears once
-/// even when several languages share it ("como" is Portuguese for how AND
-/// unaccented-typed Spanish "cómo"). Verbatim from `directory.ts:255-310`.
+/// even when several languages share it. Ambiguous everyday words like PT/ES
+/// "como" and DE "wie" are excluded: the hook instead requires another strong
+/// keyword, a verified code token, or indexed prose segments (upstream #1654).
+/// Verbatim from `directory.ts:255-310`.
 const STRUCTURAL_WORDS: &[&str] = &[
     // English — the pre-#1126 list minus what moved to STRUCTURAL_STEMS: the
     // bare-stem entries never matched their own derived forms (`\barchitect\b`
@@ -55,7 +57,7 @@ const STRUCTURAL_WORDS: &[&str] = &[
     "flux",
     "chemins?",
     "casse",
-    // Spanish (cómo/como=how, dónde/donde=where, flujo=flow, ruta/camino=path,
+    // Spanish (cómo=how, dónde/donde=where, flujo=flow, ruta/camino=path,
     // rompe=breaks, llaman / quién llama = call(s) — bare "llama" is excluded:
     // it's also the animal/model name in English prompts)
     "cómo",
@@ -68,16 +70,13 @@ const STRUCTURAL_WORDS: &[&str] = &[
     "llaman",
     "quién llama",
     "quien llama",
-    // Portuguese (como=how — also covers unaccented Spanish; onde=where,
-    // fluxo=flow, caminho=path)
-    "como",
+    // Portuguese (onde=where, fluxo=flow, caminho=path)
     "onde",
     "fluxos?",
     "caminhos?",
-    // German (wie=how, wo/woher/wohin=where, Pfad=path, Fluss/Ablauf=flow,
+    // German (wo/woher/wohin=where, Pfad=path, Fluss/Ablauf=flow,
     // bricht/kaputt=breaks, ruft=calls, hängt=depends — "hängt … von X ab"
     // splits the separable verb "abhängen", so the "abhäng" stem can't catch it)
-    "wie",
     "wo",
     "woher",
     "wohin",
