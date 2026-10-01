@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.52.2](https://github.com/sunerpy/codegraph-rust/compare/v0.52.1...v0.52.2) (2026-10-01)
+
+
+### Bug Fixes
+
+* **resolve:** bind store actions only inside stores a Zustand factory built ([ff52e5c](https://github.com/sunerpy/codegraph-rust/commit/ff52e5ceb7a73c13ca30c530b0b4447bebf8aea2))
+* **resolve:** construct from a literal past initializer_list overloads ([ff52e5c](https://github.com/sunerpy/codegraph-rust/commit/ff52e5ceb7a73c13ca30c530b0b4447bebf8aea2))
+* **resolve:** evaluate whole #if expressions three-valued ([ff52e5c](https://github.com/sunerpy/codegraph-rust/commit/ff52e5ceb7a73c13ca30c530b0b4447bebf8aea2))
+* **resolve:** leave a method value with an unknowable receiver unresolved ([ff52e5c](https://github.com/sunerpy/codegraph-rust/commit/ff52e5ceb7a73c13ca30c530b0b4447bebf8aea2))
+* **resolve:** treat only a whole-file #ifndef as an include guard ([ff52e5c](https://github.com/sunerpy/codegraph-rust/commit/ff52e5ceb7a73c13ca30c530b0b4447bebf8aea2))
+
 ## [0.52.1](https://github.com/sunerpy/codegraph-rust/compare/v0.52.0...v0.52.1) (2026-10-01)
 
 
