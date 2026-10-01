@@ -936,3 +936,30 @@ fn a_global_attributes_file_declines() {
     fs::remove_file(&attributes).unwrap();
     assert_eq!(declined, PendingSource::FullInventory);
 }
+
+/// Only the value git uses counts: a global `core.autocrlf=true` that the
+/// repository overrides with `false` converts nothing (Git for Windows ships
+/// `true` in its system config).
+#[test]
+fn an_overridden_conversion_setting_keeps_the_fast_path() {
+    let _hooks = hooks_guard();
+    let Some(repo) = indexed("overridden") else {
+        return;
+    };
+    let global = isolated_config_home().join("gitconfig-autocrlf");
+    fs::write(&global, "[core]\n\tautocrlf = true\n\tignorecase = true\n").unwrap();
+    let previous = std::env::var_os("GIT_CONFIG_GLOBAL");
+    // SAFETY: tests in this binary are serialized by `hooks_guard`.
+    unsafe { std::env::set_var("GIT_CONFIG_GLOBAL", &global) };
+    let (pending, source) = repo.pending();
+    // SAFETY: as above.
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("GIT_CONFIG_GLOBAL", value),
+            None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+        }
+    }
+    fs::remove_file(&global).ok();
+    assert_eq!(source, PendingSource::GitFastPath, "the local false wins");
+    assert!(pending.is_empty());
+}

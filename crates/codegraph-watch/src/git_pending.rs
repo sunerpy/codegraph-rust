@@ -259,12 +259,17 @@ fn committed_paths(root: &Path, repo: &Repo, commit: &str) -> Option<BTreeSet<St
 /// case-insensitive or Unicode-precomposing name match. `None` when git fails.
 fn conversion_risk(root: &Path, repo: &Repo) -> Option<bool> {
     let config = git(root, &["config", "--list", "-z"])?;
+    // `--list` prints every scope in precedence order (system, global, local,
+    // worktree), so the last value of a key is the one git uses.
+    let mut effective = std::collections::BTreeMap::new();
     for entry in nul_fields(&config) {
         let (key, value) = entry.split_once('\n').unwrap_or((entry.as_str(), ""));
-        let value = value.trim().to_ascii_lowercase();
+        effective.insert(key.to_ascii_lowercase(), value.trim().to_ascii_lowercase());
+    }
+    for (key, value) in &effective {
         let truthy = value.is_empty() || matches!(value.as_str(), "true" | "yes" | "on" | "1");
         let falsy = matches!(value.as_str(), "false" | "no" | "off" | "0");
-        let risky = match key.to_ascii_lowercase().as_str() {
+        let risky = match key.as_str() {
             "core.autocrlf" => !falsy,
             "core.ignorecase" | "core.precomposeunicode" => truthy,
             "core.attributesfile" => !value.is_empty(),
