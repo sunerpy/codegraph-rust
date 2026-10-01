@@ -963,3 +963,28 @@ fn an_overridden_conversion_setting_keeps_the_fast_path() {
     assert_eq!(source, PendingSource::GitFastPath, "the local false wins");
     assert!(pending.is_empty());
 }
+
+/// A `.gitattributes` above a project rooted below its work tree still
+/// applies to the project's files.
+#[test]
+fn an_ancestor_gitattributes_above_a_subdirectory_project_declines() {
+    let _hooks = hooks_guard();
+    if !git_available() {
+        return;
+    }
+    let repo = Repo::in_subdir("ancestor-attributes");
+    repo.write("src/a.ts", "export const a = 1;\n");
+    repo.commit("init");
+    repo.sync();
+    assert!(repo.assert_fast("no attributes yet").is_empty());
+    for (dir, label) in [
+        (repo.top.clone(), "the work-tree root"),
+        (repo.top.join("packages"), "an intermediate directory"),
+    ] {
+        let attributes = dir.join(".gitattributes");
+        fs::write(&attributes, "* text=auto\n").unwrap();
+        repo.assert_declines(label);
+        fs::remove_file(&attributes).unwrap();
+    }
+    assert!(repo.assert_fast("attributes removed again").is_empty());
+}

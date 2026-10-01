@@ -289,6 +289,7 @@ fn conversion_risk(root: &Path, repo: &Repo) -> Option<bool> {
     }
     if attributes_file_applies(root, "GIT_ATTR_GLOBAL")
         || repo.common_dir.join("info").join("attributes").exists()
+        || ancestor_attributes_exist(repo)
     {
         return Some(true);
     }
@@ -306,6 +307,26 @@ fn conversion_risk(root: &Path, repo: &Repo) -> Option<bool> {
         ],
     )?;
     Some(nul_fields(&attributes).next().is_some())
+}
+
+/// Whether a `.gitattributes` sits in a directory between the work-tree root
+/// and the project root: git applies it to the project's files, but a pathspec
+/// rooted at the project cannot list it. The project root itself and
+/// everything below are covered by the `ls-files` query.
+fn ancestor_attributes_exist(repo: &Repo) -> bool {
+    let top = Path::new(&repo.toplevel);
+    let segments = repo
+        .prefix
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    (0..segments.len()).any(|depth| {
+        segments[..depth]
+            .iter()
+            .fold(top.to_path_buf(), |dir, segment| dir.join(segment))
+            .join(".gitattributes")
+            .exists()
+    })
 }
 
 /// Whether the attributes file git names for `var` (`GIT_ATTR_SYSTEM`,
