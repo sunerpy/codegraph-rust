@@ -164,12 +164,10 @@ pub(crate) fn migrate_project(
     }
     drop(refs);
 
-    let mut resolver = ReferenceResolver::new(project_root.to_string_lossy());
+    let mut resolver = ReferenceResolver::new(project_root.to_string_lossy())
+        .with_max_file_size(options.max_file_size);
     {
-        let context = codegraph_resolve::StoreResolutionContext::new(
-            rebuild.store(),
-            project_root.to_string_lossy(),
-        );
+        let context = resolver.store_context(rebuild.store());
         resolver.initialize(&context);
     }
     if resolver.has_framework_resolvers() {

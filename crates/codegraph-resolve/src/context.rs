@@ -32,6 +32,7 @@ pub(crate) const DEFAULT_CACHE_LIMIT: usize = 5_000;
 pub struct StoreResolutionContext<'a> {
     store: &'a Store,
     project_root: String,
+    max_file_size: u64,
     caches: RefCell<Caches>,
 }
 
@@ -82,8 +83,17 @@ impl<'a> StoreResolutionContext<'a> {
         Self {
             store,
             project_root: project_root.into(),
+            max_file_size: codegraph_core::config::DEFAULT_MAX_FILE_SIZE,
             caches: RefCell::new(Caches::new()),
         }
+    }
+
+    /// Read files up to the addressed project's extraction limit
+    /// (`indexing.max_file_size`) instead of the default one.
+    #[must_use]
+    pub fn with_max_file_size(mut self, max_file_size: u64) -> Self {
+        self.max_file_size = max_file_size;
+        self
     }
 
     /// Drop all caches (`clearCaches`, `index.ts:313-324`). Called between
@@ -261,7 +271,8 @@ impl ResolutionContext for StoreResolutionContext<'_> {
             return c.file_cache.get(&file_path.to_string()).flatten();
         }
         let full_path = Path::new(&self.project_root).join(file_path);
-        let content: Option<Arc<str>> = std::fs::read_to_string(&full_path).ok().map(Arc::from);
+        let content: Option<Arc<str>> =
+            read_source_file(&full_path, self.max_file_size).map(Arc::from);
         c.file_cache.set(file_path.to_string(), content.clone());
         content
     }
@@ -510,6 +521,26 @@ fn is_js_family_path(file_path: &str) -> bool {
 /// (mirrors `loadGoModule`, `upstream resolution/go-module.ts`).
 fn load_go_module(project_root: &str) -> Option<GoModule> {
     load_go_module_in(project_root, "")
+}
+
+/// Read `path` for resolution only if extraction would accept it: a regular
+/// file no larger than `max_bytes` (upstream #1553). The `stat` comes first, so
+/// a dependency archive an import resolves to is never decoded and a FIFO is
+/// never opened; the read is bounded as well, in case the file grows meanwhile.
+pub(crate) fn read_source_file(path: &Path, max_bytes: u64) -> Option<String> {
+    use std::io::Read;
+
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return None;
+    }
+    let mut content = String::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(max_bytes.saturating_add(1))
+        .read_to_string(&mut content)
+        .ok()?;
+    (content.len() as u64 <= max_bytes).then_some(content)
 }
 
 /// Read the `module` line of `<project_root>/<dir>/go.mod`.

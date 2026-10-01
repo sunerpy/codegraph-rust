@@ -1284,6 +1284,9 @@ fn target_is_visible_across_files(
 /// `FrameworkResolver`s).
 pub struct ReferenceResolver {
     project_root: String,
+    /// Largest file resolution reads, the project's extraction limit
+    /// (`indexing.max_file_size`), handed to every context the resolver builds.
+    max_file_size: u64,
     /// Detected `FrameworkResolver` implementations (`frameworks` field,
     /// `index.ts:264`). Empty until [`Self::initialize`] detects react/vue/nestjs.
     framework_resolver_extensions: Vec<Box<dyn FrameworkResolver>>,
@@ -1318,6 +1321,7 @@ impl ReferenceResolver {
     pub fn new(project_root: impl Into<String>) -> Self {
         Self {
             project_root: project_root.into(),
+            max_file_size: codegraph_core::config::DEFAULT_MAX_FILE_SIZE,
             framework_resolver_extensions: Vec::new(),
             known_names: None,
             c_family_visible_macros: BTreeMap::new(),
@@ -1325,6 +1329,25 @@ impl ReferenceResolver {
             deferred_this_member_refs: std::sync::Mutex::new(Vec::new()),
             deferred_chain_refs: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Read files up to the addressed project's extraction limit
+    /// (`indexing.max_file_size`) instead of the default one, so resolution
+    /// never reads a file extraction would skip and never skips one it indexed.
+    #[must_use]
+    pub fn with_max_file_size(mut self, max_file_size: u64) -> Self {
+        self.max_file_size = max_file_size;
+        self
+    }
+
+    /// A store-backed resolution context for this resolver's project and file
+    /// size limit.
+    pub fn store_context<'a>(
+        &self,
+        store: &'a Store,
+    ) -> crate::context::StoreResolutionContext<'a> {
+        crate::context::StoreResolutionContext::new(store, &self.project_root)
+            .with_max_file_size(self.max_file_size)
     }
 
     /// Detect the project's frameworks and populate the resolver's
@@ -1346,7 +1369,7 @@ impl ReferenceResolver {
     pub fn run_post_extract(&self, store: &mut Store) -> anyhow::Result<usize> {
         let mut all_updates: Vec<Node> = Vec::new();
         {
-            let context = crate::context::StoreResolutionContext::new(store, &self.project_root);
+            let context = self.store_context(store);
             for resolver in &self.framework_resolver_extensions {
                 if let Some(nodes) = resolver.post_extract(&context) {
                     all_updates.extend(nodes);
@@ -1414,8 +1437,10 @@ impl ReferenceResolver {
             context,
             extensions,
             |relative| {
-                std::fs::read_to_string(std::path::Path::new(&self.project_root).join(relative))
-                    .ok()
+                crate::context::read_source_file(
+                    &std::path::Path::new(&self.project_root).join(relative),
+                    self.max_file_size,
+                )
             },
         )
     }
@@ -2139,7 +2164,7 @@ impl ReferenceResolver {
         }
 
         let resolved: Vec<ResolvedRef> = {
-            let context = crate::context::StoreResolutionContext::new(store, &self.project_root);
+            let context = self.store_context(store);
             deferred
                 .iter()
                 .filter_map(|reference| {
@@ -2231,7 +2256,7 @@ impl ReferenceResolver {
     pub fn resolve_and_persist(&mut self, store: &mut Store) -> anyhow::Result<ResolutionResult> {
         let unresolved_refs = store.all_unresolved_refs()?;
         let result = {
-            let context = crate::context::StoreResolutionContext::new(store, &self.project_root);
+            let context = self.store_context(store);
             self.resolve_all(&unresolved_refs, &context)
         };
 
@@ -2365,7 +2390,7 @@ impl ReferenceResolver {
         store.set_resolution_incomplete()?;
 
         {
-            let context = crate::context::StoreResolutionContext::new(store, &self.project_root);
+            let context = self.store_context(store);
             self.warm_caches(&context);
         }
 
@@ -2428,18 +2453,17 @@ impl ReferenceResolver {
                 // context. Prior batches' inheritance edges are already committed
                 // (persisted at the bottom of this loop), so `get_supertypes`
                 // reads them straight from the store — no snapshot, no adjacency.
-                let context =
-                    crate::context::StoreResolutionContext::new(store, &self.project_root);
+                let context = self.store_context(store);
                 self.resolve_all(&batch, &context)
             } else {
                 let base = match &node_snapshot {
                     Some(snapshot) => snapshot,
                     None => {
                         base_adjacency = (*build_edge_adjacency(store)?).clone();
-                        node_snapshot.insert(SnapshotResolutionContext::from_store(
-                            store,
-                            &self.project_root,
-                        )?)
+                        node_snapshot.insert(
+                            SnapshotResolutionContext::from_store(store, &self.project_root)?
+                                .with_max_file_size(self.max_file_size),
+                        )
                     }
                 };
                 // Install the adjacency from chunks 0..N-1 BEFORE resolving chunk N
@@ -2614,7 +2638,7 @@ impl ReferenceResolver {
         let scoped = union_persisted_refs([by_files, by_sites, by_names])?;
 
         let result = {
-            let context = crate::context::StoreResolutionContext::new(store, &self.project_root);
+            let context = self.store_context(store);
             self.resolve_all(&scoped, &context)
         };
 

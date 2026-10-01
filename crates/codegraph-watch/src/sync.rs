@@ -496,12 +496,10 @@ fn sync_paths_with_store(
                 merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, affected);
             }
         }
-        let mut resolver = ReferenceResolver::new(project_root.to_string_lossy());
+        let mut resolver = ReferenceResolver::new(project_root.to_string_lossy())
+            .with_max_file_size(scope.options.max_file_size);
         {
-            let context = codegraph_resolve::StoreResolutionContext::new(
-                store,
-                project_root.to_string_lossy(),
-            );
+            let context = resolver.store_context(store);
             resolver.initialize(&context);
         }
         // Re-run framework per-file extract for reindexed files whose framework
@@ -546,7 +544,7 @@ fn sync_paths_with_store(
     // healthy index (marker absent) skips this entirely, so an ordinary sync is
     // byte-for-byte unchanged.
     if store.is_resolution_incomplete()? {
-        sweep_orphaned_refs(project_root, store)?;
+        sweep_orphaned_refs(project_root, store, scope.options.max_file_size)?;
     }
 
     outcome.duration_ms = started.elapsed().as_millis();
@@ -687,11 +685,11 @@ fn merge_dependent_site(
 /// batched pass re-arms and clears the marker itself, so on success the index is
 /// no longer flagged partial. Framework per-file extract is re-run first so any
 /// framework refs an interrupted run never re-injected are present for the sweep.
-fn sweep_orphaned_refs(project_root: &Path, store: &mut Store) -> Result<()> {
-    let mut resolver = ReferenceResolver::new(project_root.to_string_lossy());
+fn sweep_orphaned_refs(project_root: &Path, store: &mut Store, max_file_size: u64) -> Result<()> {
+    let mut resolver =
+        ReferenceResolver::new(project_root.to_string_lossy()).with_max_file_size(max_file_size);
     {
-        let context =
-            codegraph_resolve::StoreResolutionContext::new(store, project_root.to_string_lossy());
+        let context = resolver.store_context(store);
         resolver.initialize(&context);
     }
     // Framework extraction must not run in the sweep. The marker is set only

@@ -5536,13 +5536,13 @@ fn index_project_inner(
     diagnostic_run.phase_start("framework_extract");
     let framework_started = std::time::Instant::now();
     let pb = phase_spinner("Detecting frameworks", quiet);
-    let mut resolver = ReferenceResolver::new(project.to_string_lossy());
+    let mut resolver =
+        ReferenceResolver::new(project.to_string_lossy()).with_max_file_size(options.max_file_size);
     // Detect frameworks then run their per-file extract (route/component/handler
     // nodes + refs) BEFORE resolution, mirroring the upstream tree-sitter.ts:4796-4819
     // framework-extraction pass feeding the resolution pipeline.
     {
-        let context =
-            codegraph_resolve::StoreResolutionContext::new(&store, project.to_string_lossy());
+        let context = resolver.store_context(&store);
         resolver.initialize(&context);
     }
     if resolver.has_framework_resolvers() {

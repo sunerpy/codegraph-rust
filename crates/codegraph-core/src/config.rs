@@ -92,11 +92,15 @@ pub struct IndexingConfig {
     pub deprioritize: Vec<String>,
 }
 
+/// The largest source file extraction parses unless a project raises
+/// `indexing.max_file_size`; resolution reads no file extraction would skip.
+// upstream extraction/index.ts:101, src/file-limits.ts (`MAX_SOURCE_FILE_SIZE_BYTES`)
+// Skip files larger than this (bytes). Generated bundles, minified JS, and
+// vendored blobs blow the WASM heap. 1 MB covers essentially all hand-written source.
+pub const DEFAULT_MAX_FILE_SIZE: u64 = 1024 * 1024;
+
 fn default_max_file_size() -> u64 {
-    // upstream extraction/index.ts:101
-    // Skip files larger than this (bytes). Generated bundles, minified JS, and
-    // vendored blobs blow the WASM heap. 1 MB covers essentially all hand-written source.
-    1024 * 1024
+    DEFAULT_MAX_FILE_SIZE
 }
 
 /// Whether `relative_dir` — a project-relative, `/`-separated directory path —
