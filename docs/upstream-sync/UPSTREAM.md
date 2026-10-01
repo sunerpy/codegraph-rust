@@ -46,8 +46,9 @@ below remain immutable historical evidence.
 >   did not follow symlinks, so a watcher that did would have watched what was
 >   never indexed. It landed afterwards in #288, together with the #935 scan
 >   port; see the 2026-10-01 symlink entry below.
-> - **#1829 / #1878 git-stamped pending status stays KEEP-RUST** (a full
->   inventory); its fast path is deferred pending a measurement.
+> - **#1829 / #1878 git-stamped pending status was a full inventory at
+>   `v0.51.0`**, with the fast path deferred pending a measurement. The fast
+>   path landed afterwards in #289; see the 2026-10-01 pending-status entry below.
 > - **KEEP-RUST divergences** are recorded row by row in the audit — among them
 >   a parameter-pack constructor declines its overload set (upstream admits it
 >   unbounded), a self-closing `<sqlMap/>` is never a statement-map root, and a
@@ -117,6 +118,49 @@ below remain immutable historical evidence.
 > that records colby parity — do not infer it from `Cargo.toml`.
 
 ## Sync log
+
+### 2026-10-01 — #1878 git-stamped pending status LANDED (#289)
+
+Owner decision, 2026-10-01: port #1878's fast path. The design passed the
+kirocodex plan-convergence review in round 4.
+
+#289 keeps the full inventory as the reference answer. A full build or full sync
+records, under `project_metadata` key `git_pending_state`:
+
+- the commit it started at;
+- every path that may differ from that commit: paths git reported dirty, rows
+  whose stat moved during the build, and paths a fresh scan and the database
+  disagree on.
+
+Incremental syncs add the paths they handle. `status` then classifies only git's
+candidates plus the recorded paths, by the full inventory's own rules.
+
+KEEP-RUST:
+
+- **One record, not two keys.** Upstream keeps a commit key and a dirty-path key.
+- **Race guards:** the stat-moved and fresh-scan comparisons.
+- **Declines to the full inventory**, beyond upstream's missing- or
+  unknown-stamp checks:
+  - a changed scope;
+  - an index built through symlinks;
+  - submodules;
+  - an untracked nested repository;
+  - `assume-unchanged` or `skip-worktree` entries;
+  - an ignored path the scan keeps (the scan honors only the root
+    `.gitignore`);
+  - a git timeout.
+
+Measured on the code at `ea0d069`, release build, warm cache, five runs after
+a warm-up, `codegraph status . --json`. The corpus was a generated repository of
+40,000 TypeScript files on ext4, on a 32-CPU Linux host. Medians, with
+min–max:
+
+| Scenario            | Fast path         | Full inventory    |
+| ------------------- | ----------------- | ----------------- |
+| Clean               | 183 ms (175–183)  | 262 ms (259–263)  |
+| 18 committed edits  | 171 ms (167–181)  | 260 ms (255–260)  |
+
+Both columns reported the same pending changes in every run.
 
 ### 2026-10-01 — #935 row CORRECTED; #935 and #770 symlink following LANDED on main (#288)
 
