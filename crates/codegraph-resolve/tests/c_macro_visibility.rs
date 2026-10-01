@@ -597,3 +597,74 @@ fn a_cpp_type_whose_name_is_no_macro_is_still_constructed() {
         vec!["instantiates struct Widget (widget.hpp)"]
     );
 }
+
+#[test]
+fn compound_conditions_decide_macro_visibility() {
+    for language in ["c", "cpp"] {
+        let graph = resolve_project(
+            "compound",
+            &[
+                (
+                    format!("unit.{language}"),
+                    [
+                        "#if 1 || FLAG",
+                        "#define HOOK_A(x) ((void)(x))",
+                        "#endif",
+                        "#if 0 && FLAG",
+                        "#define HOOK_B(x) ((void)(x))",
+                        "#endif",
+                        "#define A",
+                        "#if defined(A) || defined(B)",
+                        "#define HOOK_C(x) ((void)(x))",
+                        "#endif",
+                        "#if FLAG == 0",
+                        "#define HOOK_D(x) ((void)(x))",
+                        "#endif",
+                        "#if 1 || \\",
+                        "    FLAG /* continued */",
+                        "#define HOOK_E(x) ((void)(x))",
+                        "#endif",
+                        "#if 0",
+                        "#elif 1 || \\",
+                        "      FLAG",
+                        "#define HOOK_F(x) ((void)(x))",
+                        "#endif",
+                        "void use_a(void) { HOOK_A(1); }",
+                        "void use_b(void) { HOOK_B(1); }",
+                        "void use_c(void) { HOOK_C(1); }",
+                        "void use_d(void) { HOOK_D(1); }",
+                        "void use_e(void) { HOOK_E(1); }",
+                        "void use_f(void) { HOOK_F(1); }",
+                        "",
+                    ]
+                    .join("\n"),
+                ),
+                (
+                    format!("decoy.{language}"),
+                    ["A", "B", "C", "D", "E", "F"]
+                        .map(|hook| format!("void HOOK_{hook}(int x) {{}}\n"))
+                        .concat(),
+                ),
+            ],
+        );
+        let calls = ["a", "b", "c", "d", "e", "f"]
+            .map(|user| (user, graph.calls(&format!("use_{user}"))))
+            .to_vec();
+        let real = |hook: &str| vec![format!("function HOOK_{hook} (decoy.{language})")];
+        // Definitely true, through `||`, `defined` or a continued line: the
+        // macro expands. Definitely false: the function is called. Unknown: the
+        // call keeps its function.
+        assert_eq!(
+            calls,
+            vec![
+                ("a", Vec::<String>::new()),
+                ("b", real("B")),
+                ("c", Vec::new()),
+                ("d", real("D")),
+                ("e", Vec::new()),
+                ("f", Vec::new()),
+            ],
+            "{language}"
+        );
+    }
+}

@@ -200,7 +200,12 @@ impl MacroVisibility {
         let source = context.read_file(file).unwrap_or_default();
         let lines = directive_lines(&source);
         let mut events = Vec::new();
+        let mut continued_until = 0;
         for (index, text) in lines.iter().enumerate() {
+            // A continuation line belongs to the directive above it.
+            if index < continued_until {
+                continue;
+            }
             if let Some(branch) = BRANCH.captures(text) {
                 let op = match &branch[1] {
                     "ifdef" => BranchOp::Ifdef,
@@ -210,7 +215,13 @@ impl MacroVisibility {
                     "else" => BranchOp::Else,
                     _ => BranchOp::Endif,
                 };
-                let expression = branch[2].to_string();
+                let expression = if matches!(op, BranchOp::If | BranchOp::Elif) {
+                    let (logical, taken) = spliced(&lines, index, &branch[2]);
+                    continued_until = index + 1 + taken;
+                    logical
+                } else {
+                    branch[2].to_string()
+                };
                 let guard = guards_itself(&lines, index, op, &expression);
                 events.push(FileEvent::Branch {
                     op,
@@ -225,9 +236,18 @@ impl MacroVisibility {
                 if &directive[1] == "define" {
                     let function_like = !directive[3].is_empty();
                     let matched = directive.get(0).map_or(0, |m| m.end());
+                    // An object-like value is read as `#if` reads it, so it
+                    // gets its continuation lines too.
+                    let value = if function_like {
+                        text[matched..].to_string()
+                    } else {
+                        let (logical, taken) = spliced(&lines, index, &text[matched..]);
+                        continued_until = index + 1 + taken;
+                        logical
+                    };
                     events.push(FileEvent::Define {
                         wraps_itself: function_like && calls_itself(&lines, index, &name),
-                        value: text[matched..].to_string(),
+                        value,
                         name,
                         line,
                         function_like,
@@ -469,31 +489,17 @@ impl Walk {
         })
     }
 
-    /// What an `#if` expression says, as far as the source decides it:
-    /// integer literals, `defined(NAME)` / `!defined NAME`, and a bare name's
-    /// known value. Anything else depends on the build.
+    /// What an `#if` expression says, as far as the source decides it: the
+    /// whole expression, three-valued (see [`evaluate`]). Upstream reads a
+    /// literal, one `defined` test or a bare name only (KEEP-RUST).
     fn condition(&self, expression: &str) -> Truth {
-        let text = expression.trim();
-        if let Some(literal) = INTEGER_LITERAL.captures(text) {
-            let digits = literal.get(1).map_or(&literal[2], |hex| hex.as_str());
-            return Some(digits.bytes().any(|digit| digit != b'0'));
-        }
-        if let Some(defined) = DEFINED_TEST.captures(text) {
-            let name = defined
-                .get(2)
-                .or_else(|| defined.get(3))
-                .map_or("", |m| m.as_str());
-            let known = self.definitions.get(name).and_then(|d| d.defined);
-            return if defined.get(1).is_some() {
-                not(known)
-            } else {
-                known
-            };
-        }
-        if is_word(text) {
-            return self.definitions.get(text).and_then(|d| d.value);
-        }
-        None
+        evaluate(expression, &|name| {
+            let known = self.definitions.get(name);
+            NameState {
+                defined: known.and_then(|d| d.defined),
+                value: known.and_then(|d| d.value),
+            }
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -557,17 +563,383 @@ static INCLUDE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static PRAGMA_ONCE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*#\s*pragma\s+once\b").expect("pragma once regex is valid"));
-static INTEGER_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^(?:0x([0-9a-f]+)|([0-9]+))[ul]*$").expect("integer literal regex is valid")
-});
-static DEFINED_TEST: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(!)?\s*defined\s*(?:\(\s*([A-Za-z0-9_]+)\s*\)|([A-Za-z0-9_]+))$")
-        .expect("defined test regex is valid")
-});
 static NOT_DEFINED_GUARD: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\s*!\s*defined\s*(?:\(\s*([A-Za-z0-9_]+)\s*\)|([A-Za-z0-9_]+))\s*$")
         .expect("guard test regex is valid")
 });
+
+/// A directive's text with its backslash-continued lines spliced on, as the
+/// preprocessor reads one logical line, and how many continuation lines that
+/// took. A continuation line loses its comments and its trailing backslash.
+fn spliced(lines: &[String], index: usize, first: &str) -> (String, usize) {
+    let mut text = first.trim_end().to_string();
+    let mut taken = 0;
+    while let Some(head) = text.strip_suffix('\\') {
+        let head = head.trim_end().to_string();
+        let Some(next) = lines.get(index + 1 + taken) else {
+            text = head;
+            break;
+        };
+        taken += 1;
+        text = format!("{head} {}", strip_line_comments(next).trim())
+            .trim_end()
+            .to_string();
+    }
+    (text, taken)
+}
+
+/// One line without its `//` and `/* … */` comments; an unclosed `/*` drops
+/// the rest of the line. Quoted text is kept as is.
+fn strip_line_comments(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    let mut quote: Option<u8> = None;
+    let mut kept_from = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if let Some(q) = quote {
+            if byte == b'\\' {
+                i += 1;
+            } else if byte == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match byte {
+            b'"' | b'\'' => quote = Some(byte),
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                out.push_str(&line[kept_from..i]);
+                return out;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                out.push_str(&line[kept_from..i]);
+                match line[i + 2..].find("*/") {
+                    Some(end) => {
+                        out.push(' ');
+                        i += 2 + end + 2;
+                        kept_from = i;
+                        continue;
+                    }
+                    None => return out,
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push_str(&line[kept_from.min(line.len())..]);
+    out
+}
+
+/// What the walk knows about a name an `#if` mentions.
+struct NameState {
+    defined: Truth,
+    /// The truth of its value, when a definitely active definition gave one.
+    value: Truth,
+}
+
+/// An `#if` operand: a known integer, or a truth that may depend on the build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Value {
+    Int(i64),
+    Truth(Truth),
+}
+
+impl Value {
+    fn truth(self) -> Truth {
+        match self {
+            Value::Int(number) => Some(number != 0),
+            Value::Truth(truth) => truth,
+        }
+    }
+
+    fn int(self) -> Option<i64> {
+        match self {
+            Value::Int(number) => Some(number),
+            Value::Truth(truth) => truth.map(i64::from),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Token<'a> {
+    /// `None` for a number the evaluator cannot read (a float, an overflow).
+    Number(Option<i64>),
+    Word(&'a str),
+    Punct(&'static str),
+    /// A character or string literal, or a byte no operator uses.
+    Opaque,
+}
+
+const PUNCTUATORS: [&str; 25] = [
+    "<<", ">>", "<=", ">=", "==", "!=", "&&", "||", "+", "-", "*", "/", "%", "<", ">", "&", "^",
+    "|", "!", "~", "?", ":", "(", ")", ",",
+];
+
+fn tokens(expression: &str) -> Vec<Token<'_>> {
+    let bytes = expression.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if byte.is_ascii_whitespace() {
+            i += 1;
+        } else if byte.is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && (is_word_byte(bytes[i]) || matches!(bytes[i], b'\'' | b'.')) {
+                i += 1;
+            }
+            out.push(Token::Number(integer_literal(&expression[start..i])));
+        } else if is_word_byte(byte) {
+            let start = i;
+            while i < bytes.len() && is_word_byte(bytes[i]) {
+                i += 1;
+            }
+            out.push(Token::Word(&expression[start..i]));
+        } else if byte == b'"' || byte == b'\'' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != byte {
+                i += if bytes[i] == b'\\' { 2 } else { 1 };
+            }
+            i += 1;
+            out.push(Token::Opaque);
+        } else if let Some(punct) = PUNCTUATORS
+            .iter()
+            .find(|punct| expression[i..].starts_with(**punct))
+        {
+            i += punct.len();
+            out.push(Token::Punct(punct));
+        } else {
+            i += expression[i..].chars().next().map_or(1, char::len_utf8);
+            out.push(Token::Opaque);
+        }
+    }
+    out
+}
+
+/// A C integer literal — decimal, `0x`, `0b` or octal, with digit separators
+/// and `u`/`l`/`z` suffixes — or `None`.
+fn integer_literal(text: &str) -> Option<i64> {
+    let digits: String = text
+        .trim_end_matches(['u', 'U', 'l', 'L', 'z', 'Z'])
+        .chars()
+        .filter(|c| *c != '\'')
+        .collect();
+    let (radix, body) = if let Some(hex) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        (16, hex)
+    } else if let Some(binary) = digits
+        .strip_prefix("0b")
+        .or_else(|| digits.strip_prefix("0B"))
+    {
+        (2, binary)
+    } else if digits.len() > 1 && digits.starts_with('0') {
+        (8, &digits[1..])
+    } else {
+        (10, digits.as_str())
+    };
+    i64::from_str_radix(body, radix).ok()
+}
+
+/// Evaluate an `#if` expression three-valued. `&&` and `||` decide whenever
+/// one side does (`1 || FLAG` is true, `0 && FLAG` false); `?:` with an
+/// unknown condition is known only when both branches agree; every other
+/// operator needs known operands. An unseen name, a definitely undefined
+/// name's `0` aside, is unknown; so are a call-like `__has_include(…)`, a
+/// character literal, overflow, division by zero, and anything malformed.
+fn evaluate(expression: &str, name: &dyn Fn(&str) -> NameState) -> Truth {
+    let tokens = tokens(expression);
+    let mut parser = ConditionParser {
+        tokens: &tokens,
+        at: 0,
+        name,
+    };
+    let value = parser.ternary()?;
+    (parser.at == tokens.len()).then_some(())?;
+    value.truth()
+}
+
+struct ConditionParser<'t, 'n> {
+    tokens: &'t [Token<'t>],
+    at: usize,
+    name: &'n dyn Fn(&str) -> NameState,
+}
+
+impl<'t> ConditionParser<'t, '_> {
+    fn peek(&self) -> Option<Token<'t>> {
+        self.tokens.get(self.at).copied()
+    }
+
+    fn next(&mut self) -> Option<Token<'t>> {
+        let token = self.tokens.get(self.at).copied();
+        self.at += 1;
+        token
+    }
+
+    fn eat(&mut self, punct: &str) -> bool {
+        let found = matches!(self.peek(), Some(Token::Punct(p)) if p == punct);
+        if found {
+            self.at += 1;
+        }
+        found
+    }
+
+    fn ternary(&mut self) -> Option<Value> {
+        let condition = self.binary(1)?;
+        if !self.eat("?") {
+            return Some(condition);
+        }
+        let yes = self.ternary()?;
+        if !self.eat(":") {
+            return None;
+        }
+        let no = self.ternary()?;
+        Some(match condition.truth() {
+            Some(true) => yes,
+            Some(false) => no,
+            None => match (yes.int(), no.int()) {
+                (Some(a), Some(b)) if a == b => Value::Int(a),
+                _ => Value::Truth(None),
+            },
+        })
+    }
+
+    fn binary(&mut self, minimum: u8) -> Option<Value> {
+        let mut left = self.unary()?;
+        while let Some(Token::Punct(op)) = self.peek() {
+            let Some(precedence) = binary_precedence(op).filter(|p| *p >= minimum) else {
+                break;
+            };
+            self.at += 1;
+            let right = self.binary(precedence + 1)?;
+            left = combine(op, left, right);
+        }
+        Some(left)
+    }
+
+    fn unary(&mut self) -> Option<Value> {
+        let Some(Token::Punct(op @ ("!" | "~" | "-" | "+"))) = self.peek() else {
+            return self.primary();
+        };
+        self.at += 1;
+        let value = self.unary()?;
+        Some(match op {
+            "!" => Value::Truth(not(value.truth())),
+            "~" => value.int().map_or(Value::Truth(None), |n| Value::Int(!n)),
+            "-" => value
+                .int()
+                .and_then(i64::checked_neg)
+                .map_or(Value::Truth(None), Value::Int),
+            _ => value.int().map_or(Value::Truth(None), Value::Int),
+        })
+    }
+
+    fn primary(&mut self) -> Option<Value> {
+        match self.next()? {
+            Token::Number(number) => Some(number.map_or(Value::Truth(None), Value::Int)),
+            Token::Punct("(") => {
+                let value = self.ternary()?;
+                self.eat(")").then_some(value)
+            }
+            Token::Word("defined") => {
+                let parenthesized = self.eat("(");
+                let Some(Token::Word(word)) = self.next() else {
+                    return None;
+                };
+                if parenthesized && !self.eat(")") {
+                    return None;
+                }
+                Some(Value::Truth((self.name)(word).defined))
+            }
+            Token::Word(word) => {
+                if matches!(self.peek(), Some(Token::Punct("("))) {
+                    // `__has_include(<x>)`, a function-like macro: the build decides.
+                    self.skip_group()?;
+                    return Some(Value::Truth(None));
+                }
+                let state = (self.name)(word);
+                Some(if state.defined == Some(false) {
+                    Value::Int(0)
+                } else {
+                    Value::Truth(state.value)
+                })
+            }
+            Token::Opaque => Some(Value::Truth(None)),
+            Token::Punct(_) => None,
+        }
+    }
+
+    /// Skip one balanced `( … )` group, whatever it holds.
+    fn skip_group(&mut self) -> Option<()> {
+        let mut depth = 0usize;
+        loop {
+            match self.next()? {
+                Token::Punct("(") => depth += 1,
+                Token::Punct(")") => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn binary_precedence(op: &str) -> Option<u8> {
+    Some(match op {
+        "||" => 1,
+        "&&" => 2,
+        "|" => 3,
+        "^" => 4,
+        "&" => 5,
+        "==" | "!=" => 6,
+        "<" | "<=" | ">" | ">=" => 7,
+        "<<" | ">>" => 8,
+        "+" | "-" => 9,
+        "*" | "/" | "%" => 10,
+        _ => return None,
+    })
+}
+
+fn combine(op: &str, left: Value, right: Value) -> Value {
+    match op {
+        "||" => Value::Truth(or(left.truth(), right.truth())),
+        "&&" => Value::Truth(and(left.truth(), right.truth())),
+        _ => left
+            .int()
+            .zip(right.int())
+            .and_then(|(a, b)| arithmetic(op, a, b))
+            .map_or(Value::Truth(None), Value::Int),
+    }
+}
+
+fn arithmetic(op: &str, a: i64, b: i64) -> Option<i64> {
+    Some(match op {
+        "*" => a.checked_mul(b)?,
+        "/" => a.checked_div(b)?,
+        "%" => a.checked_rem(b)?,
+        "+" => a.checked_add(b)?,
+        "-" => a.checked_sub(b)?,
+        "<<" => a.checked_shl(u32::try_from(b).ok()?)?,
+        ">>" => a.checked_shr(u32::try_from(b).ok()?)?,
+        "<" => i64::from(a < b),
+        "<=" => i64::from(a <= b),
+        ">" => i64::from(a > b),
+        ">=" => i64::from(a >= b),
+        "==" => i64::from(a == b),
+        "!=" => i64::from(a != b),
+        "&" => a & b,
+        "^" => a ^ b,
+        "|" => a | b,
+        _ => return None,
+    })
+}
 
 /// The include-guard idiom: `#ifndef X_H` (or `#if !defined(X_H)`) whose next
 /// directive is `#define X_H`. Nothing defines the guard before the test, so
@@ -845,6 +1217,102 @@ mod tests {
         assert!(!calls_itself(&plain, 0, "helper"));
         let parenthesized = vec!["#define wrap(x) (wrap)(x)".to_string()];
         assert!(calls_itself(&parenthesized, 0, "wrap"));
+    }
+
+    /// Evaluate with `A` definitely defined as 1, `Z` definitely undefined,
+    /// and every other name unseen.
+    fn eval(expression: &str) -> Truth {
+        evaluate(expression, &|name| match name {
+            "A" => NameState {
+                defined: Some(true),
+                value: Some(true),
+            },
+            "Z" => NameState {
+                defined: Some(false),
+                value: None,
+            },
+            _ => NameState {
+                defined: None,
+                value: None,
+            },
+        })
+    }
+
+    #[test]
+    fn conditions_are_whole_expressions_decided_three_valued() {
+        for (expression, expected) in [
+            // The forms upstream reads.
+            ("1", Some(true)),
+            ("0x0", Some(false)),
+            ("10UL", Some(true)),
+            ("defined(A)", Some(true)),
+            ("!defined A", Some(false)),
+            ("defined FLAG", None),
+            ("A", Some(true)),
+            ("FLAG", None),
+            // `||` and `&&` decide whenever one side does.
+            ("1 || FLAG", Some(true)),
+            ("FLAG || 1", Some(true)),
+            ("0 && FLAG", Some(false)),
+            ("FLAG && 1", None),
+            ("defined(A) || defined(B)", Some(true)),
+            ("defined A && !defined(Z)", Some(true)),
+            // C precedence and arithmetic on known operands.
+            ("1 + 2 * 3 == 7", Some(true)),
+            ("(1 + 2) * 3 == 9", Some(true)),
+            ("1 << 4 == 0x10 && 07 == 7 && 0b101 == 5", Some(true)),
+            ("1'000 > 999", Some(true)),
+            ("-1 < 0 && ~0 == -1", Some(true)),
+            ("!0 == 1", Some(true)),
+            // A definitely undefined name is 0; an unseen one is unknown.
+            ("Z == 0", Some(true)),
+            ("FLAG == 0", None),
+            // `?:` with an unknown condition needs agreeing branches.
+            ("1 ? FLAG : 0", None),
+            ("FLAG ? 1 : 1", Some(true)),
+            ("0 ? FLAG : A", Some(true)),
+            // The build decides: calls, characters, overflow, division by zero.
+            ("__has_include(<stdio.h>)", None),
+            ("__has_include(<stdio.h>) || 1", Some(true)),
+            ("'a' == 97", None),
+            ("9223372036854775807 + 1", None),
+            ("1 / 0", None),
+            ("1.5", None),
+            // Malformed text decides nothing.
+            ("", None),
+            ("1 +", None),
+            ("1 2", None),
+            ("(1", None),
+            ("1 ? 2", None),
+            ("defined", None),
+        ] {
+            assert_eq!(eval(expression), expected, "{expression:?}");
+        }
+    }
+
+    #[test]
+    fn continued_directives_are_one_logical_line() {
+        let lines: Vec<String> = [
+            "#if 1 || \\",
+            "    FLAG // trailing",
+            "#elif A && \\",
+            "  /* note */ B \\",
+            "  && C",
+            "#if DONE",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        assert_eq!(
+            spliced(&lines, 0, " 1 || \\"),
+            (" 1 || FLAG".to_string(), 1)
+        );
+        assert_eq!(
+            spliced(&lines, 2, " A && \\"),
+            (" A && B && C".to_string(), 2)
+        );
+        assert_eq!(spliced(&lines, 5, " DONE"), (" DONE".to_string(), 0));
+        // A last line that still ends in a backslash just stops.
+        assert_eq!(spliced(&lines[..1], 0, " 1 \\"), (" 1".to_string(), 0));
     }
 
     #[test]
