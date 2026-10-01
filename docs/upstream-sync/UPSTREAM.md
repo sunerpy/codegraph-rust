@@ -23,13 +23,13 @@
   `f4ddf508516332419ea3c95702810765936cf679..origin/main`. Do not re-triage the
   audited `v1.6.1` range.
 - **Upstream repository:** <https://github.com/colbymchenry/codegraph>.
-- **Landed after `v0.51.0`, not yet released:**
+- **Shipped in codegraph-rs `v0.52.0`, 2026-10-01:**
   - #286, which makes a full `sync` keep what `index` keeps;
   - #288, symlink following (#935, #770);
   - #289, the #1878 git fast path for pending status.
 
-  All three have dated entries below and ship in the next release. The two
-  `v0.51.0` exceptions #770 and #1829/#1878 are closed on main.
+  This closes the two `v0.51.0` exceptions, #770 and #1829/#1878. See the
+  dated entries below, including the `v0.52.0` release record.
 - **Deferred UI family:** the browser viewer and the graph-semantic families
   F1–F12 that shipped beside it in `v1.6.1` (framework navigation edges and
   routers, the synthesis layer and its schema, cross-tier channels, server route
@@ -125,6 +125,41 @@ below remain immutable historical evidence.
 > that records colby parity — do not infer it from `Cargo.toml`.
 
 ## Sync log
+
+### 2026-10-01 — `v0.52.0` RELEASED: #286, #288 and #289 shipped
+
+Release-please PR [#287](https://github.com/sunerpy/codegraph-rust/pull/287)
+merged as `4986722e08feca1b39c0aa885eb608d608244e4d` and cut tag `v0.52.0` at
+that exact commit.
+
+Release workflow run
+[`36854318561`](https://github.com/sunerpy/codegraph-rust/actions/runs/36854318561)
+passed all twelve jobs:
+
+- release-please, the source gate, and the tag check;
+- the exact-SHA CI gate, over main CI run
+  [`36854318393`](https://github.com/sunerpy/codegraph-rust/actions/runs/36854318393);
+- six platform builds;
+- asset attachment and publish.
+
+The release was published at 2026-10-01T11:28:53Z. The official
+`codegraph-0.52.0-x86_64-unknown-linux-musl.tar.gz` digest is
+`91668069f916e15330bd819a63d4d898ad7129657dbf18a78072f6b730732d09`.
+
+Black-box acceptance of the downloaded release:
+
+- `SHA256SUMS` and `gh attestation verify` passed for all six archives, and the
+  binary reports `codegraph 0.52.0`.
+- **#935:** on the probe layout
+  `{src/real/a.ts, src/afile.ts -> real/a.ts, src/linkdir -> real, src/extlink -> ../../outside/lib}`,
+  `init` indexes `src/afile.ts`, `src/extlink/out.ts` and `src/real/a.ts`, where
+  `v0.51.0` indexed only `src/real/a.ts`.
+- **#286:** after `init` and `sync`, `.cache/a.ts` is still indexed.
+- **#1878:** in a git repository, an edit committed after `init` is reported
+  by `status` as modified, and the git record is present.
+- **Upgrade:** an index written by the official `v0.51.0` binary reads as
+  `current` under `v0.52.0`, with nothing pending, and `sync` reindexes nothing.
+  The extraction version is unchanged.
 
 ### 2026-10-01 — #1878 git-stamped pending status LANDED (#289)
 
