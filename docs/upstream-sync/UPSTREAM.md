@@ -69,7 +69,12 @@ below remain immutable historical evidence.
 >   retroactive review, in #291: a store initializer's own calls stay with the
 >   store, an explicit `export default NAME` binding beats an exported
 >   component, and a trim note never claims that gap markers name every elided
->   symbol. See the 2026-10-01 retroactive-review entry below.
+>   symbol. See the 2026-10-01 retroactive-review entry below. Five more, in
+>   #295, fix the findings that review had kept at upstream behavior: Zustand
+>   provenance for every store-action form, no unique-name guess for an
+>   unknowable receiver, three-valued whole `#if` expressions, whole-file
+>   include guards only, and literal paren constructions past
+>   `initializer_list` overloads. See the 2026-10-02 entry.
 > - The `1.5.0 → 1.6.0` and older caveats below carry forward unchanged.
 
 > **1.5.0 → 1.6.0 sync: COMPLETE** (codegraph-rs `v0.48.2` → `v0.50.1`).
@@ -135,6 +140,25 @@ below remain immutable historical evidence.
 > that records colby parity — do not infer it from `Cargo.toml`.
 
 ## Sync log
+
+### 2026-10-02 — five more KEEP-RUST divergences: the declined retroactive-review findings FIXED (#295)
+
+The 2026-10-01 retroactive-review entry below kept five review findings at
+upstream behavior. On 2026-10-02 the owner asked for all five to be fixed
+beyond upstream `v1.6.1` (`f4ddf50`). Their design passed the kirocodex plan
+review in round 3, with blocking items 6 → 1 → 0. Each item below is a
+KEEP-RUST divergence: stricter than upstream, or more exact. The extraction
+version moves to 19, so an index built at 18 is rebuilt.
+
+| Finding | Upstream `f4ddf50` | Port |
+| ------- | ------------------ | ---- |
+| #277: store actions | `matchStoreAccessorChain` checks Zustand provenance for selectors only, so `otherFactory(() => ({ reset() {} })).getState().reset()` binds | Every store-action form needs a Zustand factory on the initializer's call path to the action function. That path is read by the parser, following the same search that finds the actions. The factories are `create`, `createStore` and `createWithEqualityFn` from `zustand`, `zustand/vanilla` or `zustand/traditional`, the default import, or a namespace member. A selector also needs a hook factory. A wrapped hook such as `createSelectors(create(...))` now binds its selectors. |
+| #278: method values | "Unknown receivers retain the old unique-or-drop discipline" | An unknowable Python or Go receiver leaves the value unresolved, even when one project method bears the name |
+| #282: `#if` | `condition` reads a literal, one `defined` test or a bare name | The whole expression is evaluated three-valued, with C precedence. `&&`/`||` decide whenever one side does, and a definitely undefined name reads 0. Unseen names, `__has_include(...)`, character literals, overflow and malformed text stay unknown. Backslash continuations are spliced first. |
+| #282: guards | `guardsItself` reads any `#ifndef X` followed by `#define X` (empty) or `#define X(` as a guard and forces the branch active | Only a whole-file include guard counts: the test is the first code line, the next directive is an empty `#define X`, and the matching `#endif`, with no `#else`/`#elif` at its depth, is the last code line. A feature-flag default and a fallback `#ifndef MIN` / `#define MIN(a, b)` stay undecided and keep the call. |
+| #282: constructors | any constructor mentioning `initializer_list` declines the set | `T x(<literal>, ...)`, with no `{` in the arguments, drops the constructors whose first parameter is the list; a literal never converts to one. The rest compete by arity. Every other form still declines. |
+
+Each fix was red first; the logs are in `/tmp/evidence-p10/red-*.log`.
 
 ### 2026-10-01 — `v0.52.1` RELEASED: #291 and #292 shipped
 
