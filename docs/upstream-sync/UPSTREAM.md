@@ -62,8 +62,8 @@ below remain immutable historical evidence.
 >   `this.a.b.m()` chain keeps its last segment. Three more came out of the
 >   retroactive review, in #291: a store initializer's own calls stay with the
 >   store, an explicit `export default NAME` binding beats an exported
->   component, and a trim note never claims a name a gap withheld. See the
->   2026-10-01 retroactive-review entry below.
+>   component, and a trim note never claims that gap markers name every elided
+>   symbol. See the 2026-10-01 retroactive-review entry below.
 > - The `1.5.0 → 1.6.0` and older caveats below carry forward unchanged.
 
 > **1.5.0 → 1.6.0 sync: COMPLETE** (codegraph-rs `v0.48.2` → `v0.50.1`).
@@ -171,12 +171,12 @@ Then every blocking item was checked against `main` (`c00aa2b`) and upstream
   component. In a module exporting `function Screen() { return <div /> }`
   beside `const Api = { upload }; export default Api`, `Api.upload()` became a
   call to `Screen`, and the `upload` edge was lost.
-- **KEEP-RUST: the trim note never claims a name a gap withheld.** A gap marker
-  names what it hides only from the budget its file has spare. Both tiers'
-  notes still said the markers named what was elided, and upstream's wording
-  (`tools.ts:1302`, `:7272`) is the same. When a name was withheld, the note now
-  says the markers name only what room allowed. The epilogue reserve holds the
-  longer of the two wordings.
+- **KEEP-RUST: the trim note never claims that gap markers name every elided
+  symbol.** A gap marker names what it hides only from the budget its file has
+  spare. The tail marker after a dropped or windowed cluster names nothing, and
+  a dropped file appears only in the pointer list. Both tiers' notes, like
+  upstream's (`tools.ts:1302`, `:7272`), still said the markers named what was
+  elided. They now say the markers name what room allowed.
 
 **Kept at upstream behavior.** Each of these review findings describes
 upstream's own design, and in each case the upstream source says why:
