@@ -4413,10 +4413,10 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
 
         if has_type(self.spec.function_types(), node_type)
-            && !self
+            && self
                 .store_walk
                 .as_ref()
-                .is_some_and(|walk| walk.factory == Some(node.id()))
+                .is_none_or(|walk| walk.factory != Some(node.id()))
         {
             let nested_name = self.extract_name(node);
             if !nested_name.is_empty() && nested_name != "<anonymous>" {
