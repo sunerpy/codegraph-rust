@@ -215,9 +215,9 @@ def main() -> int:
                 fail(f"{path.relative_to(ROOT)} references retired {retired}")
 
     upstream = read("docs/upstream-sync/UPSTREAM.md")
-    if "3ed73bc127323e63153bf6ec8354afa82ce36aaf..origin/main" not in upstream:
+    if "f4ddf508516332419ea3c95702810765936cf679..origin/main" not in upstream:
         fail("upstream ledger does not carry the audited next-discovery boundary")
-    if "Tracked colby release:** `v1.6.0`" not in upstream:
+    if "Tracked colby release:** `v1.6.1`" not in upstream:
         fail("upstream ledger tracked release changed without a new formal tag")
 
     paths = markdown_files()
