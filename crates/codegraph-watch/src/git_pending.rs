@@ -20,7 +20,9 @@
 //! - the recorded commit is no longer in the repository;
 //! - an untracked nested repository, a directory or symlink candidate, an
 //!   `assume-unchanged` or `skip-worktree` entry, or an ignored path the scan
-//!   would keep.
+//!   would keep;
+//! - git may call changed bytes clean: `core.autocrlf`, any gitattributes
+//!   source, or a case-insensitive or Unicode-precomposing name match.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -148,23 +150,34 @@ struct Repo {
     /// empty at the top level.
     prefix: String,
     toplevel: String,
+    /// The repository's common git directory (holding `info/attributes`).
+    common_dir: std::path::PathBuf,
 }
 
 impl Repo {
     fn read(root: &Path) -> Option<Self> {
         let out = git(
             root,
-            &["rev-parse", "HEAD", "--show-prefix", "--show-toplevel"],
+            &[
+                "rev-parse",
+                "HEAD",
+                "--show-prefix",
+                "--show-toplevel",
+                "--git-common-dir",
+            ],
         )?;
         let text = String::from_utf8(out).ok()?;
         let mut lines = text.lines();
         let head = lines.next()?.trim().to_string();
         let prefix = lines.next()?.to_string();
         let toplevel = lines.next()?.to_string();
+        // Printed relative to the working directory unless it lies elsewhere.
+        let common_dir = root.join(lines.next()?);
         (!head.is_empty()).then_some(Self {
             head,
             prefix,
             toplevel,
+            common_dir,
         })
     }
 
@@ -239,6 +252,55 @@ fn committed_paths(root: &Path, repo: &Repo, commit: &str) -> Option<BTreeSet<St
     Some(paths)
 }
 
+/// Whether git compares content after a conversion, or matches names in a
+/// way, that can make it call a path clean although its bytes (or its exact
+/// name) differ from what was indexed: `core.autocrlf`, any gitattributes
+/// source (`text`, `eol`, `filter` such as LFS, `ident`, encodings), a
+/// case-insensitive or Unicode-precomposing name match. `None` when git fails.
+fn conversion_risk(root: &Path, repo: &Repo) -> Option<bool> {
+    let config = git(root, &["config", "--list", "-z"])?;
+    for entry in nul_fields(&config) {
+        let (key, value) = entry.split_once('\n').unwrap_or((entry.as_str(), ""));
+        let value = value.trim().to_ascii_lowercase();
+        let truthy = value.is_empty() || matches!(value.as_str(), "true" | "yes" | "on" | "1");
+        let falsy = matches!(value.as_str(), "false" | "no" | "off" | "0");
+        let risky = match key.to_ascii_lowercase().as_str() {
+            "core.autocrlf" => !falsy,
+            "core.ignorecase" | "core.precomposeunicode" => truthy,
+            "core.attributesfile" => !value.is_empty(),
+            _ => false,
+        };
+        if risky {
+            return Some(true);
+        }
+    }
+    // Git's default global attributes file applies without any config.
+    let global_attributes = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|dir| !dir.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".config")))
+        .map(|config| config.join("git").join("attributes"));
+    if global_attributes.is_some_and(|path| path.exists())
+        || repo.common_dir.join("info").join("attributes").exists()
+    {
+        return Some(true);
+    }
+    let attributes = git(
+        root,
+        &[
+            "ls-files",
+            "--full-name",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            ":(glob)**/.gitattributes",
+        ],
+    )?;
+    Some(nul_fields(&attributes).next().is_some())
+}
+
 /// What the index file says that `git status` cannot: a gitlink (submodule),
 /// or an entry marked `assume-unchanged` or `skip-worktree`, whose working-tree
 /// changes git hides.
@@ -289,6 +351,10 @@ fn ignores_scanned_path(root: &Path, repo: &Repo, options: &ExtractOptions) -> O
         let Some(relative) = repo.rebase(&entry) else {
             continue;
         };
+        // An attributes file applies whether or not git ignores it.
+        if Path::new(&relative).file_name() == Some(std::ffi::OsStr::new(".gitattributes")) {
+            return Some(true);
+        }
         let membership = match relative.strip_suffix('/') {
             Some(dir) => scan_membership(root, options, dir, true),
             None => scan_membership(root, options, &relative, false),
@@ -441,6 +507,9 @@ pub(crate) fn git_fast_pending(
         return Ok(None);
     };
     if flags.submodules || flags.hidden_changes {
+        return Ok(None);
+    }
+    if conversion_risk(root, &repo) != Some(false) {
         return Ok(None);
     }
     let (Some(status), Some(committed)) = (

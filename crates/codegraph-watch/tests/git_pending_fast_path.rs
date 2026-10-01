@@ -89,6 +89,14 @@ fn raw_record(root: &Path) -> Option<serde_json::Value> {
     .map(|value| serde_json::from_str(&value).unwrap())
 }
 
+/// A path git accepts as a clone source on every platform: no Windows
+/// verbatim prefix, forward slashes.
+fn git_path(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    text.strip_prefix("//?/")
+        .map_or(text.clone(), str::to_string)
+}
+
 fn git_available() -> bool {
     Command::new("git")
         .arg("--version")
@@ -133,6 +141,16 @@ impl Repo {
         repo.git_at(&repo.top, &["init", "-q", "."]);
         // Keep the index itself out of every commit, as a project does.
         fs::write(repo.top.join(".git/info/exclude"), ".codegraph/\n").unwrap();
+        // The same byte- and case-exact git on every runner (Windows defaults
+        // to `core.autocrlf=true`, macOS and Windows to `core.ignorecase`);
+        // the decline tests set them back on purpose.
+        for (key, value) in [
+            ("core.autocrlf", "false"),
+            ("core.ignorecase", "false"),
+            ("core.precomposeunicode", "false"),
+        ] {
+            repo.git_at(&repo.top, &["config", key, value]);
+        }
         repo
     }
 
@@ -516,13 +534,7 @@ fn nested_repositories_submodules_and_hidden_changes_decline() {
     source.commit("lib");
     let host = Repo::new("submodule-host");
     host.write("src/a.ts", "export const a = 1;\n");
-    host.git(&[
-        "submodule",
-        "add",
-        "-q",
-        source.top.to_str().unwrap(),
-        "sub",
-    ]);
+    host.git(&["submodule", "add", "-q", &git_path(&source.top), "sub"]);
     host.git(&["config", "-f", ".gitmodules", "submodule.sub.ignore", "all"]);
     host.commit("submodule");
     host.sync();
@@ -790,7 +802,7 @@ fn a_submodule_below_a_subdirectory_project_declines() {
         "submodule",
         "add",
         "-q",
-        source.top.to_str().unwrap(),
+        &git_path(&source.top),
         "packages/app/vendor",
     ]);
     repo.commit("submodule");
@@ -856,4 +868,36 @@ fn an_interrupted_incremental_sync_keeps_its_paths_recorded() {
             .any(|path| path == "src/a.ts"),
         "{record}"
     );
+}
+
+/// Git compares content after line-ending conversion, so a revert can rewrite
+/// a file's bytes (LF to CRLF) while `git status` calls it clean. The fast path
+/// must decline, and the full inventory reports the changed bytes.
+#[test]
+fn line_ending_conversion_declines() {
+    let _hooks = hooks_guard();
+    let Some(repo) = indexed("autocrlf") else {
+        return;
+    };
+    repo.git(&["config", "core.autocrlf", "true"]);
+    repo.write("src/a.ts", "export const a = 2;\n");
+    repo.commit("edit a");
+    repo.git(&["revert", "--no-edit", "HEAD"]);
+    repo.assert_declines("core.autocrlf");
+}
+
+#[test]
+fn gitattributes_and_case_insensitive_names_decline() {
+    let _hooks = hooks_guard();
+    let Some(repo) = indexed("attributes") else {
+        return;
+    };
+    repo.write(".gitattributes", "* text=auto\n");
+    repo.assert_declines("a .gitattributes file");
+
+    let Some(repo) = indexed("ignorecase") else {
+        return;
+    };
+    repo.git(&["config", "core.ignorecase", "true"]);
+    repo.assert_declines("core.ignorecase");
 }
