@@ -443,6 +443,10 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
 
         self.maybe_capture_fn_refs(node, node_type);
 
+        if self.extract_c_function_macro(node) {
+            return;
+        }
+
         if self.visit_language_specific(node) {
             return;
         }
@@ -1503,7 +1507,9 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     }
 
     fn visit_cpp_node(&mut self, node: SyntaxNode<'tree>) -> bool {
-        if crate::lang::is_cpp_pure_virtual_method_decl(node, self.source) {
+        if crate::lang::is_cpp_pure_virtual_method_decl(node, self.source)
+            || crate::lang::is_cpp_constructor_declaration(node, self.source)
+        {
             self.extract_method(node);
             return true;
         }
@@ -4162,10 +4168,49 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
     }
 
-    // #1035 — C/C++ stack/brace construction (`Calc c(0)`, `W w{1, 2}`) records
-    // an Instantiates edge, matching the existing heap `new_expression` path.
-    // Gated to a user `type_identifier` (not a `primitive_type`) so `int y(5)`
-    // never fires; the init_declarator must carry a call- or brace-initializer.
+    /// A C/C++ function-like macro (`#define TRACE(x) ...`) becomes a `constant`
+    /// carrying the directive as its signature (upstream #1838). A macro is a
+    /// value, never an executable callee: the resolver reads these to recognize
+    /// a call whose name is a macro visible in the translation unit and refuses
+    /// to bind it to a same-named function elsewhere. An object-like `#define`
+    /// mints nothing. Returns whether `node` was such a directive.
+    fn extract_c_function_macro(&mut self, node: SyntaxNode<'tree>) -> bool {
+        if node.kind() != "preproc_function_def"
+            || !matches!(self.spec.language(), Language::C | Language::Cpp)
+        {
+            return false;
+        }
+        if let Some(name) = child_by_field(node, "name") {
+            let signature = node_text(node, self.source).trim().to_string();
+            self.create_node(
+                NodeKind::Constant,
+                &node_text(name, self.source),
+                node,
+                NodeExtra {
+                    signature: Some(signature),
+                    ..NodeExtra::default()
+                },
+            );
+        }
+        true
+    }
+
+    /// C++ stack construction (`Calc c(0)`, `W w{1, 2}`, `W w;`) carries no call
+    /// node, so each constructed object gets a constructor reference named for
+    /// its argument count (#1839), and an initialized declaration keeps the
+    /// #1035 `instantiates` reference to the type.
+    ///
+    /// Gated to a named class-like type (not a `primitive_type`, so `int y(5)`
+    /// never fires). `extern T x;` declares and constructs nothing. Per
+    /// declarator (upstream `cppStackConstructions`):
+    /// - a bare identifier is default construction, arity 0, and so is a bare
+    ///   array of objects;
+    /// - an `init_declarator` whose value is `(args)` or `{args}` constructs
+    ///   with that many arguments, comments aside — except that an array's
+    ///   braces hold ELEMENTS, each constructed by its own arity, with one more
+    ///   default construction when the literal size leaves elements over;
+    /// - pointer, reference and function declarators construct nothing:
+    ///   `T* p{}` is a null pointer, `T& r{x}` binds, `T c();` is a prototype.
     fn maybe_cpp_construction(&mut self, node: SyntaxNode<'tree>) {
         if !matches!(self.spec.language(), Language::C | Language::Cpp) {
             return;
@@ -4186,38 +4231,60 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         if class_name.is_empty() {
             return;
         }
+        if node.named_children(&mut node.walk()).any(|child| {
+            child.kind() == "storage_class_specifier" && node_text(child, self.source) == "extern"
+        }) {
+            return;
+        }
 
         let caller_is_callable = self.nodes.iter().any(|candidate| {
             candidate.id == from_id
                 && matches!(candidate.kind, NodeKind::Function | NodeKind::Method)
         });
         let mut has_explicit_construction = false;
+        let mut constructions: Vec<(usize, SyntaxNode<'tree>)> = Vec::new();
         for declarator in node.named_children(&mut node.walk()) {
-            let (arity, anchor, explicit) = match declarator.kind() {
-                // `Type object;` default-initializes an object. A pointer,
-                // reference, array, or most-vexing `Type object();` has a
-                // different direct declarator kind and is intentionally skipped.
-                "identifier" | "field_identifier" => (Some(0), declarator, false),
+            match declarator.kind() {
+                "identifier" | "field_identifier" => constructions.push((0, declarator)),
+                "array_declarator" if cpp_object_array(declarator) => {
+                    constructions.push((0, declarator));
+                }
                 "init_declarator" => {
-                    let Some(value) = child_by_field(declarator, "value") else {
+                    let (Some(inner), Some(value)) = (
+                        child_by_field(declarator, "declarator"),
+                        child_by_field(declarator, "value"),
+                    ) else {
                         continue;
                     };
-                    if matches!(value.kind(), "argument_list" | "initializer_list") {
-                        (Some(value.named_child_count()), value, true)
-                    } else {
-                        // Copy-initialization and nested temporary expressions
-                        // require conversion/type analysis; their own call/new
-                        // expression remains handled by the ordinary walker.
-                        (None, value, false)
+                    if !matches!(inner.kind(), "identifier" | "array_declarator")
+                        || !matches!(value.kind(), "argument_list" | "initializer_list")
+                    {
+                        // Copy-initialization and nested temporaries keep their
+                        // own call/new expression in the ordinary walk.
+                        continue;
+                    }
+                    has_explicit_construction = true;
+                    if inner.kind() == "identifier" {
+                        constructions.push((non_comment_children(value).len(), value));
+                    } else if cpp_object_array(inner) {
+                        let mut dimensions = Vec::new();
+                        let mut array = Some(inner);
+                        while let Some(current) = array.filter(|a| a.kind() == "array_declarator") {
+                            let size = child_by_field(current, "size")
+                                .map(|size| node_text(size, self.source))
+                                .unwrap_or_default();
+                            dimensions.insert(0, size.parse::<usize>().ok());
+                            array = child_by_field(current, "declarator");
+                        }
+                        cpp_array_element_constructions(value, 0, &dimensions, &mut constructions);
                     }
                 }
-                _ => (None, declarator, false),
-            };
-            has_explicit_construction |= explicit;
-            if self.spec.language() == Language::Cpp
-                && caller_is_callable
-                && let Some(arity) = arity
-            {
+                _ => {}
+            }
+        }
+
+        if self.spec.language() == Language::Cpp && caller_is_callable {
+            for (arity, anchor) in constructions {
                 let reference_name =
                     crate::lang::cpp_constructor_reference_name(&class_name, arity);
                 self.push_ref(&from_id, &reference_name, EdgeKind::Calls, anchor);
@@ -4255,6 +4322,10 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     fn visit_body_node_inner(&mut self, node: SyntaxNode<'tree>) {
         let node_type = node.kind();
         self.maybe_capture_fn_refs(node, node_type);
+        // A function-like macro defined inside a body is still a macro (#1838).
+        if self.extract_c_function_macro(node) {
+            return;
+        }
         // Inside a function body, GDScript `preload(...)`/`load(...)` calls must
         // become Imports, not Calls. The body walker never dispatches the
         // language hook, so route GDScript nodes through it first; a `true`
@@ -5051,6 +5122,58 @@ fn is_erlang_mfa_call(name: &str) -> bool {
             | "erpc::call"
             | "erpc::cast"
     )
+}
+
+/// Whether an array declarator declares objects rather than pointers or
+/// references: its innermost declarator is a plain identifier.
+fn cpp_object_array(node: SyntaxNode<'_>) -> bool {
+    let mut element = child_by_field(node, "declarator");
+    while let Some(current) = element.filter(|e| e.kind() == "array_declarator") {
+        element = child_by_field(current, "declarator");
+    }
+    element.is_some_and(|e| e.kind() == "identifier")
+}
+
+fn non_comment_children(node: SyntaxNode<'_>) -> Vec<SyntaxNode<'_>> {
+    node.named_children(&mut node.walk())
+        .filter(|child| child.kind() != "comment")
+        .collect()
+}
+
+/// The constructions an array initializer list implies: each innermost
+/// element by its own arity (a braced element by its entry count, a scalar by
+/// one), nested lists level by level, and one default construction where the
+/// literal size leaves elements over. Unbraced multidimensional layouts need
+/// type information and claim no remainder.
+fn cpp_array_element_constructions<'tree>(
+    list: SyntaxNode<'tree>,
+    depth: usize,
+    dimensions: &[Option<usize>],
+    out: &mut Vec<(usize, SyntaxNode<'tree>)>,
+) {
+    let entries = non_comment_children(list);
+    let mut elided = false;
+    for entry in &entries {
+        if depth + 1 < dimensions.len() {
+            if entry.kind() == "initializer_list" {
+                cpp_array_element_constructions(*entry, depth + 1, dimensions, out);
+            } else {
+                elided = true;
+            }
+        } else if entry.kind() == "initializer_list" {
+            out.push((non_comment_children(*entry).len(), *entry));
+        } else {
+            out.push((1, *entry));
+        }
+    }
+    let left_over = dimensions
+        .get(depth)
+        .copied()
+        .flatten()
+        .is_some_and(|size| size > entries.len());
+    if !elided && (entries.is_empty() || left_over) {
+        out.push((0, list));
+    }
 }
 
 #[derive(Default)]

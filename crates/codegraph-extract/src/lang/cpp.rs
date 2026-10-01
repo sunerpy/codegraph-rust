@@ -338,12 +338,48 @@ fn cpp_constructor_signature(node: Node<'_>, source: &str) -> Option<String> {
         return None;
     }
     let parameters = child_by_field(function, "parameters")?;
-    Some(node_text(parameters, source))
+    // A prototype keeps its terminating `;`, so resolution can tell the
+    // declaration from the definition it merges with (#1839).
+    let terminator = if node.kind() == "declaration" {
+        ";"
+    } else {
+        ""
+    };
+    Some(format!("{}{terminator}", node_text(parameters, source)))
+}
+
+/// An in-class constructor prototype (upstream `isCppConstructorDeclaration`,
+/// #1839): a `declaration` with no return type, directly in a class, struct or
+/// union body, whose declarator is a function declarator named like the type.
+/// It becomes a method node so a default argument declared on it reaches the
+/// out-of-line definition's overload.
+pub fn is_cpp_constructor_declaration(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != "declaration" || child_by_field(node, "type").is_some() {
+        return false;
+    }
+    let Some(owner) = node.parent().and_then(|body| body.parent()) else {
+        return false;
+    };
+    if !matches!(
+        owner.kind(),
+        "class_specifier" | "struct_specifier" | "union_specifier"
+    ) {
+        return false;
+    }
+    let Some(declarator) = child_by_field(node, "declarator") else {
+        return false;
+    };
+    declarator.kind() == "function_declarator"
+        && child_by_field(declarator, "declarator").map(|name| node_text(name, source))
+            == child_by_field(owner, "name").map(|name| node_text(name, source))
 }
 
 fn nearest_cpp_class_name(mut node: Node<'_>, source: &str) -> Option<String> {
     while let Some(parent) = node.parent() {
-        if matches!(parent.kind(), "class_specifier" | "struct_specifier") {
+        if matches!(
+            parent.kind(),
+            "class_specifier" | "struct_specifier" | "union_specifier"
+        ) {
             return child_by_field(parent, "name").map(|name| node_text(name, source));
         }
         node = parent;

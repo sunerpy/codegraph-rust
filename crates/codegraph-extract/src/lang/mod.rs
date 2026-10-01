@@ -49,7 +49,8 @@ pub use cpp::{
 };
 pub(crate) use cpp::{
     ExplicitOperatorCall, ExportMacroClass, cpp_code_mask, detect_export_macro_class,
-    is_cpp_pure_virtual_method_decl, recover_explicit_operator_call,
+    is_cpp_constructor_declaration, is_cpp_pure_virtual_method_decl,
+    recover_explicit_operator_call,
 };
 pub use csharp::CSHARP_SPEC;
 pub use dart::DART_SPEC;
