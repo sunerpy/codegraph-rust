@@ -127,3 +127,37 @@ fn repeated_same_line_liquid_and_cfml_declarations_survive() {
     assert_eq!(methods.len(), 2, "{:#?}", cfml.nodes);
     assert_ne!(methods[0].id, methods[1].id);
 }
+
+#[test]
+fn same_line_vue_script_functions_survive() {
+    // The Vue extractor mints its own script-block functions; ids use the
+    // block-relative line and column, as upstream's delegated extractor does.
+    let source =
+        "<template><div/></template>\n<script>\nfunction f() {} function f() {}\n</script>\n";
+    let result = extract("Widget.vue", source, Language::Vue);
+    let functions = named(&result, "f", NodeKind::Function);
+    assert_eq!(functions.len(), 2, "{:#?}", result.nodes);
+    let legacy = generate_node_id("Widget.vue", NodeKind::Function, "f", 2);
+    let block_line = "function f() {} function f() {}";
+    let second = utf16_column(block_line, block_line.rfind("function").unwrap());
+    let mut ids = functions
+        .iter()
+        .map(|node| node.id.clone())
+        .collect::<Vec<_>>();
+    ids.sort();
+    assert_eq!(ids, vec![legacy.clone(), format!("{legacy}:{second}")]);
+    for node in functions {
+        assert!(
+            result
+                .edges
+                .iter()
+                .any(|edge| edge.kind == EdgeKind::Contains && edge.target == node.id),
+            "{} has no contains edge",
+            node.id
+        );
+    }
+    assert_eq!(
+        extract("Widget.vue", source, Language::Vue).nodes,
+        result.nodes
+    );
+}
