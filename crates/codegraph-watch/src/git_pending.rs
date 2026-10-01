@@ -274,13 +274,15 @@ fn conversion_risk(root: &Path, repo: &Repo) -> Option<bool> {
             return Some(true);
         }
     }
-    // Git's default global attributes file applies without any config.
-    let global_attributes = std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|dir| !dir.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".config")))
-        .map(|config| config.join("git").join("attributes"));
-    if global_attributes.is_some_and(|path| path.exists())
+    // The system (`$(prefix)/etc/gitattributes`) and global (`core.attributesFile`,
+    // else the XDG default) attributes files, exactly as git resolves them.
+    // `GIT_ATTR_NOSYSTEM` switches the system file off, as it does for git.
+    let system_disabled = std::env::var_os("GIT_ATTR_NOSYSTEM")
+        .is_some_and(|value| !matches!(value.to_str(), Some("" | "0" | "false" | "no" | "off")));
+    if !system_disabled && attributes_file_applies(root, "GIT_ATTR_SYSTEM") {
+        return Some(true);
+    }
+    if attributes_file_applies(root, "GIT_ATTR_GLOBAL")
         || repo.common_dir.join("info").join("attributes").exists()
     {
         return Some(true);
@@ -299,6 +301,18 @@ fn conversion_risk(root: &Path, repo: &Repo) -> Option<bool> {
         ],
     )?;
     Some(nul_fields(&attributes).next().is_some())
+}
+
+/// Whether the attributes file git names for `var` (`GIT_ATTR_SYSTEM`,
+/// `GIT_ATTR_GLOBAL`, git 2.42+) exists. A git that cannot say counts as one
+/// that applies it.
+fn attributes_file_applies(root: &Path, var: &str) -> bool {
+    let Some(out) = git(root, &["var", var]) else {
+        return true;
+    };
+    let text = String::from_utf8_lossy(&out);
+    let path = text.trim_end_matches(['\r', '\n']);
+    !path.is_empty() && Path::new(path).exists()
 }
 
 /// What the index file says that `git status` cannot: a gitlink (submodule),
@@ -694,5 +708,53 @@ pub mod test_hooks {
             hook(root);
         }
         let _ = root;
+    }
+}
+
+#[cfg(all(test, unix, feature = "test-hooks"))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    /// A stand-in git that answers only what `conversion_risk` asks.
+    fn fake_git(dir: &Path, system_attributes: &Path) -> std::path::PathBuf {
+        let script = dir.join("git");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do\n  case \"$a\" in\n    GIT_ATTR_SYSTEM) echo '{}'; exit 0;;\n    GIT_ATTR_GLOBAL) echo '{}'; exit 0;;\n  esac\ndone\nexit 0\n",
+                system_attributes.display(),
+                dir.join("no-global-attributes").display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    #[test]
+    fn a_system_attributes_file_is_a_conversion_risk() {
+        let dir = std::env::temp_dir().join(format!("cg_fake_git_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let system = dir.join("etc-gitattributes");
+        let repo = Repo {
+            head: "0".repeat(40),
+            prefix: String::new(),
+            toplevel: dir.to_string_lossy().into_owned(),
+            common_dir: dir.join("dot-git"),
+        };
+        test_hooks::set_git_program(Some(fake_git(&dir, &system)));
+        let without = conversion_risk(&dir, &repo);
+        fs::write(&system, "* text=auto\n").unwrap();
+        let with = conversion_risk(&dir, &repo);
+        test_hooks::set_git_program(None);
+        fs::remove_dir_all(&dir).ok();
+        assert_eq!(without, Some(false), "no attributes anywhere");
+        assert_eq!(
+            with,
+            Some(true),
+            "git reads $(prefix)/etc/gitattributes too"
+        );
     }
 }

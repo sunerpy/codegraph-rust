@@ -36,10 +36,28 @@ const GIT_ENV: &[&str] = &[
 /// them being unset, run one at a time.
 static HOOKS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// An empty `XDG_CONFIG_HOME`: no global git attributes or config leak in.
+fn isolated_config_home() -> PathBuf {
+    std::env::temp_dir().join(format!("cg_git_pending_xdg_{}", std::process::id()))
+}
+
 fn hooks_guard() -> std::sync::MutexGuard<'static, ()> {
-    HOOKS
+    static ISOLATE: std::sync::Once = std::sync::Once::new();
+    let guard = HOOKS
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ISOLATE.call_once(|| {
+        let home = isolated_config_home();
+        fs::create_dir_all(&home).unwrap();
+        // SAFETY: every test here holds `HOOKS`, so none runs alongside.
+        unsafe {
+            // A system attributes file (Git for Windows ships one) or a global
+            // one would make every case decline; the decline tests add their own.
+            std::env::set_var("GIT_ATTR_NOSYSTEM", "1");
+            std::env::set_var("XDG_CONFIG_HOME", &home);
+        }
+    });
+    guard
 }
 
 fn codegraph_dir() -> Option<String> {
@@ -900,4 +918,21 @@ fn gitattributes_and_case_insensitive_names_decline() {
     };
     repo.git(&["config", "core.ignorecase", "true"]);
     repo.assert_declines("core.ignorecase");
+}
+
+/// A global attributes file (the XDG default, as `git var GIT_ATTR_GLOBAL`
+/// resolves it) converts content as much as a `.gitattributes` does.
+#[test]
+fn a_global_attributes_file_declines() {
+    let _hooks = hooks_guard();
+    let Some(repo) = indexed("global-attributes") else {
+        return;
+    };
+    assert!(repo.assert_fast("no attributes anywhere").is_empty());
+    let attributes = isolated_config_home().join("git").join("attributes");
+    fs::create_dir_all(attributes.parent().unwrap()).unwrap();
+    fs::write(&attributes, "* text=auto\n").unwrap();
+    let declined = repo.pending().1;
+    fs::remove_file(&attributes).unwrap();
+    assert_eq!(declined, PendingSource::FullInventory);
 }
