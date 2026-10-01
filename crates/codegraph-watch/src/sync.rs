@@ -269,6 +269,7 @@ fn sync_project_once_with_scope(
                 &mut store,
                 project_root,
                 candidates,
+                Some(&on_disk),
                 scope,
                 &include,
                 &exclude,
@@ -423,6 +424,7 @@ fn sync_changed_paths_current_scope(
                 &mut store,
                 project_root,
                 changed,
+                None,
                 &scope,
                 &include,
                 &exclude,
@@ -448,6 +450,7 @@ fn sync_paths_with_store(
     store: &mut Store,
     project_root: &Path,
     paths: impl IntoIterator<Item = impl AsRef<Path>>,
+    scanned: Option<&HashSet<String>>,
     scope: &ProjectScope,
     include: &[String],
     exclude: &[String],
@@ -484,7 +487,15 @@ fn sync_paths_with_store(
             continue;
         }
         outcome.files_checked += 1;
-        let in_scope = policy.should_handle_file(&relative);
+        // A full sync reconciles against the scan it just ran, so the scan alone
+        // decides scope, exactly as for `index --force`. The watch policy is
+        // stricter on purpose (it never watches `.cache`, a top-level
+        // `.codegraph-*` directory, and the other watch-only defaults), so it may
+        // only judge the paths an incremental sync was handed.
+        let in_scope = match scanned {
+            Some(scanned) => scanned.contains(&relative),
+            None => policy.should_handle_file(&relative),
+        };
         if !in_scope && store.file_by_path(&relative)?.is_none() {
             outcome.files_ignored += 1;
             on_progress(done + 1, total);
