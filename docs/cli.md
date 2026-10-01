@@ -77,6 +77,11 @@ inventory still answers whenever git might not see a change:
   is present;
 - git ignores a path the scan keeps, such as one under a nested `.gitignore` or an
   `include` override;
+- git might call changed bytes or names clean: `core.autocrlf`, any gitattributes
+  source (`.gitattributes`, `info/attributes`, `core.attributesFile`), or a
+  case-insensitive or Unicode-precomposing name match (`core.ignorecase`, the
+  macOS and Windows default; `core.precomposeunicode`). On those systems the full
+  inventory answers;
 - git is missing or does not answer within 10 seconds.
 
 Git runs without optional locks, so `status` never rewrites `.git/index`.

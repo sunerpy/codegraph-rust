@@ -155,17 +155,21 @@ KEEP-RUST:
   - `assume-unchanged` or `skip-worktree` entries;
   - an ignored path the scan keeps (the scan honors only the root
     `.gitignore`);
+  - content or name conversions that let git call changed bytes clean:
+    `core.autocrlf`, any gitattributes source, `core.ignorecase`,
+    `core.precomposeunicode`. Windows CI caught this: a revert rewrote LF as
+    CRLF while `git status` stayed clean;
   - a git timeout.
 
-Measured on the code at `ea0d069`, release build, warm cache, five runs after
+Measured on the code at `f750335`, release build, warm cache, five runs after
 a warm-up, `codegraph status . --json`. The corpus was a generated repository of
 40,000 TypeScript files on ext4, on a 32-CPU Linux host. Medians, with
 min–max:
 
 | Scenario            | Fast path         | Full inventory    |
 | ------------------- | ----------------- | ----------------- |
-| Clean               | 183 ms (175–183)  | 262 ms (259–263)  |
-| 18 committed edits  | 171 ms (167–181)  | 260 ms (255–260)  |
+| Clean               | 198 ms (197–208)  | 259 ms (257–263)  |
+| 18 committed edits  | 196 ms (194–209)  | 261 ms (255–266)  |
 
 Both columns reported the same pending changes in every run.
 
