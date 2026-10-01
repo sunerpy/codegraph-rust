@@ -191,9 +191,13 @@ impl WatchPolicy {
     }
 
     fn matches_structural(&self, relative: &str, is_dir: bool) -> bool {
-        self.structural_ignores
-            .iter()
-            .any(|pattern| rule_matches(pattern, relative, is_dir))
+        self.structural_ignores.iter().any(|pattern| {
+            if pattern == "build/" {
+                build_segment_is_output(relative, is_dir)
+            } else {
+                rule_matches(pattern, relative, is_dir)
+            }
+        })
     }
 
     /// The watcher's port of the scan's `is_path_ignored` fold over its ordered
@@ -446,6 +450,25 @@ fn read_gitignore_rules(root: &Path) -> Vec<IgnoreRule> {
             })
         })
         .collect()
+}
+
+/// The `build/` structural rule, segment by segment: a `build` directory on the
+/// path prunes it unless it is a JVM package under a conventional source root
+/// (#1642, mirroring `scan_dir`).
+fn build_segment_is_output(relative: &str, is_dir: bool) -> bool {
+    let segments = relative
+        .trim_end_matches('/')
+        .split('/')
+        .collect::<Vec<_>>();
+    let directories = if is_dir {
+        segments.len()
+    } else {
+        segments.len().saturating_sub(1)
+    };
+    (0..directories).any(|index| {
+        segments[index] == "build"
+            && !codegraph_core::config::is_jvm_source_build_dir(&segments[..=index].join("/"))
+    })
 }
 
 fn rule_matches(pattern: &str, relative: &str, is_dir: bool) -> bool {
@@ -894,6 +917,20 @@ mod tests {
         assert!(!policy.should_watch_dir("node_modules"));
         assert!(policy.should_watch_dir("src"));
         assert!(policy.should_handle_file("src/app.ts"));
+    }
+
+    #[test]
+    fn jvm_packages_named_build_are_watched_like_the_scan_indexes_them() {
+        let dir = crate::sync::tests::TestDir::new("watch-policy-jvm-build");
+        let policy = WatchPolicy::new(dir.path());
+        assert!(policy.should_watch_dir("src/main/java/com/acme/build"));
+        assert!(policy.should_handle_file("src/main/java/com/acme/build/Builder.java"));
+        assert!(policy.should_handle_file("app/src/test/kotlin/build/BuildTest.kt"));
+        assert!(!policy.should_watch_dir("build"));
+        assert!(!policy.should_watch_dir("app/build"));
+        assert!(!policy.should_handle_file("app/build/classes/Out.java"));
+        assert!(!policy.should_handle_file("src/main/resources/build/Res.java"));
+        assert!(!policy.should_handle_file("src/main/java/build/node_modules/dep.js"));
     }
 
     #[test]

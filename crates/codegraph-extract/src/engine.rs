@@ -542,10 +542,15 @@ fn scan_dir(
         // while a same-basename user directory elsewhere is not.
         let is_reserved_root_here =
             (dir == root && name == ".git") || reserved_roots.contains(&path);
-        if is_reserved_root_here || ignored_dirs.contains(name.as_ref()) {
+        let relative = normalize_path(path.strip_prefix(root).unwrap_or(&path));
+        // `build` is also a legal JVM package segment: keep it under a
+        // conventional source root while still pruning build output (#1642).
+        let jvm_package = name == "build"
+            && codegraph_core::config::is_jvm_source_build_dir(&relative)
+            && entry.file_type().is_ok_and(|kind| kind.is_dir());
+        if is_reserved_root_here || (ignored_dirs.contains(name.as_ref()) && !jvm_package) {
             continue;
         }
-        let relative = normalize_path(path.strip_prefix(root).unwrap_or(&path));
         let ignored = is_path_ignored(&relative, pattern_sets);
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
@@ -921,6 +926,50 @@ mod tests {
         assert!(
             !files.iter().any(|f| f.starts_with("addons/")),
             "addons/ vendored plugins must be skipped: {files:?}"
+        );
+
+        fs::remove_dir_all(&project).ok();
+    }
+
+    /// `build` is a legal JVM package segment: a Java/Kotlin/Scala package
+    /// directory named `build` under a conventional source root stays indexed,
+    /// while module build output and the other defaults inside it stay pruned
+    /// (upstream #1642).
+    #[test]
+    fn scan_keeps_jvm_packages_named_build_but_prunes_build_output() {
+        let project = unique_project("jvm_build_package");
+        touch(
+            &project,
+            "src/main/java/com/acme/build/Builder.java",
+            "class Builder {}",
+        );
+        touch(
+            &project,
+            "app/src/test/kotlin/build/BuildTest.kt",
+            "class BuildTest",
+        );
+        touch(&project, "src/main/scala/build/Tool.scala", "object Tool");
+        touch(&project, "build/generated/Gen.java", "class Gen {}");
+        touch(&project, "app/build/classes/Out.java", "class Out {}");
+        touch(
+            &project,
+            "src/main/resources/build/Res.java",
+            "class Res {}",
+        );
+        touch(
+            &project,
+            "src/main/java/build/node_modules/dep.js",
+            "export {}",
+        );
+
+        let files = scan_project(&project, &ExtractOptions::default()).expect("scan project");
+        assert_eq!(
+            files,
+            vec![
+                "app/src/test/kotlin/build/BuildTest.kt".to_string(),
+                "src/main/java/com/acme/build/Builder.java".to_string(),
+                "src/main/scala/build/Tool.scala".to_string(),
+            ]
         );
 
         fs::remove_dir_all(&project).ok();
