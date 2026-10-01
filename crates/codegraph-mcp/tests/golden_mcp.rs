@@ -1390,12 +1390,26 @@ fn explore_output_respects_its_stated_budget() {
         text.contains("Complete source for 3 files"),
         "the completeness signal must be present with a TRUE count:\n{text}"
     );
-    // The exclusion must still be STATED even when no pointer line fits: five
-    // candidates are excluded here and the remaining budget cannot hold a
-    // 166-byte line, so the tail is the only honest way to say so.
-    assert!(
-        text.lines().any(|l| l == "- ... and 5 more files"),
-        "the unlisted count must be stated:\n{text}"
+    // The exclusion must still be STATED however few pointer lines fit: five
+    // candidates are excluded here, so the lines listed and the tail's count add
+    // up to five. The leftover held no 166-byte line until #2077 shortened the
+    // completeness note, and holds one since; the count is what must not drift.
+    let listed = text
+        .lines()
+        .filter(|l| l.starts_with("- src/ledger"))
+        .count();
+    let counted = text
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("- ... and ")
+                .and_then(|rest| rest.strip_suffix(" more files"))
+                .and_then(|n| n.parse::<usize>().ok())
+        })
+        .unwrap_or(0);
+    assert_eq!(
+        listed + counted,
+        5,
+        "every excluded file must be listed or counted:\n{text}"
     );
 }
 
