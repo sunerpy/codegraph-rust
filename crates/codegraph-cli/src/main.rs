@@ -209,6 +209,9 @@ fn cli_main() {
         if let Some(guidance) = index_removal_holder_guidance(&err) {
             eprint!("{guidance}");
         }
+        if let Some(guidance) = codegraph_store::wsl_shared_index_guidance(err.as_ref()) {
+            eprint!("{guidance}");
+        }
         std::process::exit(1);
     }
 }
@@ -1438,6 +1441,22 @@ fn cmd_init(
         "init",
     )?;
     println!("Initialized in {}", project.display());
+    // A fresh index on a Windows drive under WSL gets its own directory (#995);
+    // it is not the documented name, so say where it went and why.
+    if std::env::var_os("CODEGRAPH_DIR").is_none()
+        && let Ok(paths) = index_paths(&project)
+        && paths
+            .current_root()
+            .file_name()
+            .is_some_and(|name| name != codegraph_core::index_paths::DEFAULT_CURRENT_DIR)
+    {
+        println!(
+            "The index is in {}/: this project is on a Windows drive, so WSL keeps its own index \
+             rather than share {}/ with CodeGraph on Windows. Set CODEGRAPH_DIR to choose the name yourself.",
+            codegraph_core::index_paths::WSL_CURRENT_DIR,
+            codegraph_core::index_paths::DEFAULT_CURRENT_DIR
+        );
+    }
     print_index_result(&result);
     installer::run_install_local_targets(project, target)
 }

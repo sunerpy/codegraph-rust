@@ -34,6 +34,10 @@ use thiserror::Error;
 /// from [`IndexPaths::resolve`].
 pub const DEFAULT_CURRENT_DIR: &str = ".codegraph";
 
+/// The index-root name WSL gives a fresh project on a Windows drive, so it
+/// never shares one index with CodeGraph on Windows (upstream #995).
+pub const WSL_CURRENT_DIR: &str = ".codegraph-wsl";
+
 /// Version byte of the binary payload hashed into the project identity. Bump
 /// only with a deliberate, reviewed identity-format change.
 const IDENTITY_PAYLOAD_VERSION: u8 = 1;
@@ -117,7 +121,10 @@ impl IndexPaths {
 
         let project_identity = physical_identity(&project)?;
 
-        let directory_name = configured_directory_name(codegraph_dir)?;
+        let directory_name = match codegraph_dir {
+            None => default_directory_name(&project, crate::wsl::is_wsl_windows_drive(&project)),
+            Some(_) => configured_directory_name(codegraph_dir)?,
+        };
         let candidate = lexical_normalize(&project.join(directory_name));
         reject_project_alias(&project, &candidate, directory_name)?;
         let current_root = physical_normalize(&project, &candidate)?;
@@ -257,6 +264,32 @@ fn lexical_normalize(path: &Path) -> PathBuf {
         }
     }
     out
+}
+
+/// The index-root name for `project` with no `CODEGRAPH_DIR` set. Off a WSL
+/// Windows drive it is always [`DEFAULT_CURRENT_DIR`]. On one, Windows-native
+/// CodeGraph opens `.codegraph` in the same tree and SQLite's locking does not
+/// hold across the 9p/DrvFs bridge, so sharing one index fails with "disk I/O
+/// error" (upstream #995):
+///   1. `.codegraph-wsl/` exists: it, even once Windows builds a `.codegraph`;
+///   2. `.codegraph/codegraph.db` exists: `.codegraph`, so an index built before
+///      this default is kept rather than silently rebuilt elsewhere;
+///   3. neither: `.codegraph-wsl`, so a fresh WSL index never shares.
+fn default_directory_name(project: &Path, wsl_windows_drive: bool) -> &'static str {
+    if !wsl_windows_drive {
+        return DEFAULT_CURRENT_DIR;
+    }
+    if project.join(WSL_CURRENT_DIR).is_dir() {
+        return WSL_CURRENT_DIR;
+    }
+    if project
+        .join(DEFAULT_CURRENT_DIR)
+        .join("codegraph.db")
+        .exists()
+    {
+        return DEFAULT_CURRENT_DIR;
+    }
+    WSL_CURRENT_DIR
 }
 
 fn configured_directory_name(codegraph_dir: Option<&str>) -> Result<&str, IndexPathsError> {
@@ -690,6 +723,30 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&project);
         let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    #[test]
+    fn wsl_windows_drive_projects_default_to_their_own_index_root() {
+        let fresh = temp_dir("wsl-fresh");
+        assert_eq!(default_directory_name(&fresh, false), DEFAULT_CURRENT_DIR);
+        assert_eq!(default_directory_name(&fresh, true), WSL_CURRENT_DIR);
+
+        let legacy = temp_dir("wsl-legacy");
+        std::fs::create_dir_all(legacy.join(DEFAULT_CURRENT_DIR)).unwrap();
+        assert_eq!(
+            default_directory_name(&legacy, true),
+            WSL_CURRENT_DIR,
+            "an index root without a database is not an index to keep"
+        );
+        std::fs::write(legacy.join(DEFAULT_CURRENT_DIR).join("codegraph.db"), b"").unwrap();
+        assert_eq!(default_directory_name(&legacy, true), DEFAULT_CURRENT_DIR);
+
+        std::fs::create_dir_all(legacy.join(WSL_CURRENT_DIR)).unwrap();
+        assert_eq!(
+            default_directory_name(&legacy, true),
+            WSL_CURRENT_DIR,
+            "WSL keeps its own index once it has one"
+        );
     }
 
     #[test]

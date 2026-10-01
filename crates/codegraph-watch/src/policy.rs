@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -301,7 +300,7 @@ pub fn watch_disabled_reason(project_root: impl AsRef<Path>, no_watch: bool) -> 
     if std::env::var("CODEGRAPH_FORCE_WATCH").as_deref() == Ok("1") {
         return None;
     }
-    if detect_wsl() && is_windows_drive_mount(project_root.as_ref()) {
+    if codegraph_core::wsl::is_wsl_windows_drive(project_root.as_ref()) {
         return Some(
             "project is on a WSL2 /mnt/ drive, where recursive fs.watch is too slow to be reliable"
                 .to_string(),
@@ -463,34 +462,12 @@ fn rule_matches(pattern: &str, relative: &str, is_dir: bool) -> bool {
     relative == pattern || relative.ends_with(&format!("/{pattern}"))
 }
 
-fn detect_wsl() -> bool {
-    if !cfg!(target_os = "linux") {
-        return false;
-    }
-    if std::env::var_os("WSL_DISTRO_NAME").is_some() || std::env::var_os("WSL_INTEROP").is_some() {
-        return true;
-    }
-    fs::read_to_string("/proc/version")
-        .map(|version| {
-            let version = version.to_ascii_lowercase();
-            version.contains("microsoft") || version.contains("wsl")
-        })
-        .unwrap_or(false)
-}
-
-fn is_windows_drive_mount(path: &Path) -> bool {
-    let normalized = normalize_path(path);
-    let mut parts = normalized.split('/');
-    matches!(
-        (parts.next(), parts.next(), parts.next()),
-        (Some(""), Some("mnt"), Some(drive)) if drive.len() == 1 && drive.as_bytes()[0].is_ascii_alphabetic()
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_env::{EnvGuard, env_guard};
+    use codegraph_core::wsl::is_windows_drive_mount;
+    use std::fs;
 
     #[test]
     fn watch_disabled_when_root_is_home() {

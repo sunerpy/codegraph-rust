@@ -579,8 +579,10 @@ impl McpServer {
             Err(e) => {
                 return Dispatch::Reply(
                     serde_json::to_value(ToolResult::error(format!(
-                        "Failed to open project at {}: {e}",
-                        project_path.display()
+                        "Failed to open project at {}: {e}{}",
+                        project_path.display(),
+                        codegraph_store::wsl_shared_index_guidance(e.as_ref())
+                            .map_or(String::new(), |guidance| format!("\n{guidance}"))
                     )))
                     .expect("ToolResult serializes"),
                 );

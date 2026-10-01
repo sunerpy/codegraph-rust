@@ -1028,7 +1028,12 @@ daemon mode when several agents or editor windows need the same live index.
 The daemon watches the project for file changes and re-indexes automatically.
 Changes are debounced before the re-index triggers. On WSL2, watching files under
 `/mnt/` is automatically disabled because recursive `fs.watch` is too slow on
-those paths; the reason is surfaced in the log.
+those paths; the reason is surfaced in the log. On such a Windows drive WSL also
+keeps its own index: SQLite's locking does not hold across the Windows/WSL
+bridge, so with `CODEGRAPH_DIR` unset an existing `.codegraph-wsl/` is used, then
+an existing `.codegraph/codegraph.db` is kept, and otherwise a fresh index goes
+in `.codegraph-wsl/` (`init` says so). A disk I/O error on a shared
+`.codegraph/` index explains how to give WSL its own.
 
 The watcher registers per-directory watches only on non-ignored directories,
 pruning `node_modules`, `.venv`, `__pycache__`, `target`, `dist`, `.godot`,
@@ -1078,19 +1083,19 @@ Three escape hatches:
 
 ### Environment variable reference
 
-| Variable                           | Default      | Clamp range         | Meaning                                                                                                            |
-| ---------------------------------- | ------------ | ------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `CODEGRAPH_NO_DAEMON`              | —            | —                   | Force foreground Direct mode; one indexed-project writer only, enforced by `writer.pid`                            |
-| `CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS` | `300000`     | 1000–3600000        | Exit after this long with no connected clients                                                                     |
-| `CODEGRAPH_DAEMON_MAX_IDLE_MS`     | `1800000`    | 1000–3600000        | Hard cap on total daemon lifetime when idle                                                                        |
-| `CODEGRAPH_DAEMON_CLIENT_SWEEP_MS` | `30000`      | 50–600000           | How often the daemon sweeps for dead clients                                                                       |
-| `CODEGRAPH_WATCH_DEBOUNCE_MS`      | `2000`       | 100–60000           | File-change debounce window before a re-index triggers                                                             |
-| `CODEGRAPH_NO_WATCH`               | —            | —                   | Disable the live file watcher (equivalent to `serve --no-watch`)                                                   |
-| `CODEGRAPH_FORCE_WATCH`            | —            | —                   | Override WSL2 `/mnt/` auto-disable; does not override `NO_WATCH`                                                   |
-| `CODEGRAPH_NO_WAL_DEFER`           | —            | `1` enables opt-out | Keep SQLite's default WAL autocheckpoint interval during bulk indexing                                             |
-| `CODEGRAPH_WAL_VALVE_MB`           | `256`        | >0; invalid→default | Shared MB threshold for the active WAL valve, resetting `journal_size_limit`, and `status` WAL warning             |
-| `CODEGRAPH_MCP_REGISTRY_DIR`       | —            | —                   | Override the stdio MCP registry directory read by `mcp list`                                                       |
-| `CODEGRAPH_DIR`                    | `.codegraph` | —                   | Select one non-empty project-local directory name; absolute paths, separators, `.`, `..`, and aliases are rejected |
+| Variable                           | Default      | Clamp range         | Meaning                                                                                                                                                                                                                                                                                            |
+| ---------------------------------- | ------------ | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CODEGRAPH_NO_DAEMON`              | —            | —                   | Force foreground Direct mode; one indexed-project writer only, enforced by `writer.pid`                                                                                                                                                                                                            |
+| `CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS` | `300000`     | 1000–3600000        | Exit after this long with no connected clients                                                                                                                                                                                                                                                     |
+| `CODEGRAPH_DAEMON_MAX_IDLE_MS`     | `1800000`    | 1000–3600000        | Hard cap on total daemon lifetime when idle                                                                                                                                                                                                                                                        |
+| `CODEGRAPH_DAEMON_CLIENT_SWEEP_MS` | `30000`      | 50–600000           | How often the daemon sweeps for dead clients                                                                                                                                                                                                                                                       |
+| `CODEGRAPH_WATCH_DEBOUNCE_MS`      | `2000`       | 100–60000           | File-change debounce window before a re-index triggers                                                                                                                                                                                                                                             |
+| `CODEGRAPH_NO_WATCH`               | —            | —                   | Disable the live file watcher (equivalent to `serve --no-watch`)                                                                                                                                                                                                                                   |
+| `CODEGRAPH_FORCE_WATCH`            | —            | —                   | Override WSL2 `/mnt/` auto-disable; does not override `NO_WATCH`                                                                                                                                                                                                                                   |
+| `CODEGRAPH_NO_WAL_DEFER`           | —            | `1` enables opt-out | Keep SQLite's default WAL autocheckpoint interval during bulk indexing                                                                                                                                                                                                                             |
+| `CODEGRAPH_WAL_VALVE_MB`           | `256`        | >0; invalid→default | Shared MB threshold for the active WAL valve, resetting `journal_size_limit`, and `status` WAL warning                                                                                                                                                                                             |
+| `CODEGRAPH_MCP_REGISTRY_DIR`       | —            | —                   | Override the stdio MCP registry directory read by `mcp list`                                                                                                                                                                                                                                       |
+| `CODEGRAPH_DIR`                    | `.codegraph` | —                   | Select one non-empty project-local directory name; absolute paths, separators, `.`, `..`, and aliases are rejected. Unset on a WSL Windows drive (`/mnt/<drive>/`), the default is `.codegraph-wsl` unless `.codegraph/codegraph.db` already exists, so WSL never shares Windows CodeGraph's index |
 
 Timeout/debounce values outside their clamp range are silently clamped to the
 nearest bound. `CODEGRAPH_WAL_VALVE_MB` instead falls back to `256` when it is
