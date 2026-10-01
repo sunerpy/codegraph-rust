@@ -748,3 +748,57 @@ fn only_a_whole_file_ifndef_is_an_include_guard() {
         );
     }
 }
+
+#[test]
+fn continuations_splice_before_comments_and_macro_values_keep_their_number() {
+    for language in ["c", "cpp"] {
+        let graph = resolve_project(
+            "splice-first",
+            &[
+                (
+                    format!("unit.{language}"),
+                    [
+                        // `N` is 2: whether it equals 1 is not its truth.
+                        "#define N 2",
+                        "#if N == 1",
+                        "#define HOOK_G(x) ((void)(x))",
+                        "#endif",
+                        // Lines splice before comments go: the backslash inside
+                        // the comment still continues the directive.
+                        "#if 1 || /* comment \\",
+                        "*/ FLAG",
+                        "#define HOOK_H(x) ((void)(x))",
+                        "#endif",
+                        "#define LEVEL /* level \\",
+                        "*/ 1",
+                        "#if LEVEL",
+                        "#define HOOK_I(x) ((void)(x))",
+                        "#endif",
+                        "void use_g(void) { HOOK_G(1); }",
+                        "void use_h(void) { HOOK_H(1); }",
+                        "void use_i(void) { HOOK_I(1); }",
+                        "",
+                    ]
+                    .join("\n"),
+                ),
+                (
+                    format!("decoy.{language}"),
+                    "void HOOK_G(int x) {}\nvoid HOOK_H(int x) {}\nvoid HOOK_I(int x) {}\n"
+                        .to_string(),
+                ),
+            ],
+        );
+        let calls = ["g", "h", "i"]
+            .map(|user| (user, graph.calls(&format!("use_{user}"))))
+            .to_vec();
+        assert_eq!(
+            calls,
+            vec![
+                ("g", vec![format!("function HOOK_G (decoy.{language})")]),
+                ("h", Vec::<String>::new()),
+                ("i", Vec::new()),
+            ],
+            "{language}"
+        );
+    }
+}

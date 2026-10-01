@@ -201,12 +201,7 @@ impl MacroVisibility {
         let lines = directive_lines(&source);
         let code = code_line_flags(&source);
         let mut events = Vec::new();
-        let mut continued_until = 0;
         for (index, text) in lines.iter().enumerate() {
-            // A continuation line belongs to the directive above it.
-            if index < continued_until {
-                continue;
-            }
             if let Some(branch) = BRANCH.captures(text) {
                 let op = match &branch[1] {
                     "ifdef" => BranchOp::Ifdef,
@@ -216,13 +211,7 @@ impl MacroVisibility {
                     "else" => BranchOp::Else,
                     _ => BranchOp::Endif,
                 };
-                let expression = if matches!(op, BranchOp::If | BranchOp::Elif) {
-                    let (logical, taken) = spliced(&lines, index, &branch[2]);
-                    continued_until = index + 1 + taken;
-                    logical
-                } else {
-                    branch[2].to_string()
-                };
+                let expression = branch[2].to_string();
                 let guard = guards_itself(&lines, &code, index, op, &expression);
                 events.push(FileEvent::Branch {
                     op,
@@ -237,18 +226,9 @@ impl MacroVisibility {
                 if &directive[1] == "define" {
                     let function_like = !directive[3].is_empty();
                     let matched = directive.get(0).map_or(0, |m| m.end());
-                    // An object-like value is read as `#if` reads it, so it
-                    // gets its continuation lines too.
-                    let value = if function_like {
-                        text[matched..].to_string()
-                    } else {
-                        let (logical, taken) = spliced(&lines, index, &text[matched..]);
-                        continued_until = index + 1 + taken;
-                        logical
-                    };
                     events.push(FileEvent::Define {
                         wraps_itself: function_like && calls_itself(&lines, index, &name),
-                        value,
+                        value: text[matched..].to_string(),
                         name,
                         line,
                         function_like,
@@ -569,69 +549,33 @@ static NOT_DEFINED_GUARD: LazyLock<Regex> = LazyLock::new(|| {
         .expect("guard test regex is valid")
 });
 
-/// A directive's text with its backslash-continued lines spliced on, as the
-/// preprocessor reads one logical line, and how many continuation lines that
-/// took. A continuation line loses its comments and its trailing backslash.
-fn spliced(lines: &[String], index: usize, first: &str) -> (String, usize) {
-    let mut text = first.trim_end().to_string();
-    let mut taken = 0;
-    while let Some(head) = text.strip_suffix('\\') {
-        let head = head.trim_end().to_string();
-        let Some(next) = lines.get(index + 1 + taken) else {
-            text = head;
-            break;
+/// Translation phase 2: every backslash-newline joins its line to the next,
+/// before comments are removed, so a backslash inside a `/* … */` still
+/// continues a directive. A joined line's text moves to the line that
+/// started it and leaves an empty line behind, so line numbers stay put.
+fn splice_continuations(source: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut joined: Option<usize> = None;
+    for raw in source.split('\n') {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        let (text, continues) = match line.strip_suffix('\\') {
+            Some(head) => (head, true),
+            None => (line, false),
         };
-        taken += 1;
-        text = format!("{head} {}", strip_line_comments(next).trim())
-            .trim_end()
-            .to_string();
-    }
-    (text, taken)
-}
-
-/// One line without its `//` and `/* … */` comments; an unclosed `/*` drops
-/// the rest of the line. Quoted text is kept as is.
-fn strip_line_comments(line: &str) -> String {
-    let bytes = line.as_bytes();
-    let mut out = String::with_capacity(line.len());
-    let mut i = 0;
-    let mut quote: Option<u8> = None;
-    let mut kept_from = 0;
-    while i < bytes.len() {
-        let byte = bytes[i];
-        if let Some(q) = quote {
-            if byte == b'\\' {
-                i += 1;
-            } else if byte == q {
-                quote = None;
+        match joined {
+            Some(at) => {
+                lines[at].push_str(text);
+                lines.push(String::new());
             }
-            i += 1;
-            continue;
+            None => lines.push(text.to_string()),
         }
-        match byte {
-            b'"' | b'\'' => quote = Some(byte),
-            b'/' if bytes.get(i + 1) == Some(&b'/') => {
-                out.push_str(&line[kept_from..i]);
-                return out;
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                out.push_str(&line[kept_from..i]);
-                match line[i + 2..].find("*/") {
-                    Some(end) => {
-                        out.push(' ');
-                        i += 2 + end + 2;
-                        kept_from = i;
-                        continue;
-                    }
-                    None => return out,
-                }
-            }
-            _ => {}
-        }
-        i += 1;
+        joined = if continues {
+            joined.or(Some(lines.len() - 1))
+        } else {
+            None
+        };
     }
-    out.push_str(&line[kept_from.min(line.len())..]);
-    out
+    lines.join("\n")
 }
 
 /// What the walk knows about a name an `#if` mentions.
@@ -641,11 +585,18 @@ struct NameState {
     value: Truth,
 }
 
-/// An `#if` operand: a known integer, or a truth that may depend on the build.
+/// An `#if` operand: a known integer — a literal, or a logical result's 0 or
+/// 1 — or a truth with no known number: a macro's value, recorded only as a
+/// truth (`#define N 2` is true, not 1), or anything the build decides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Value {
     Int(i64),
     Truth(Truth),
+}
+
+/// A decided truth as C's 0 or 1, an undecided one as unknown.
+fn logical(truth: Truth) -> Value {
+    truth.map_or(Value::Truth(None), |known| Value::Int(i64::from(known)))
 }
 
 impl Value {
@@ -659,7 +610,7 @@ impl Value {
     fn int(self) -> Option<i64> {
         match self {
             Value::Int(number) => Some(number),
-            Value::Truth(truth) => truth.map(i64::from),
+            Value::Truth(_) => None,
         }
     }
 }
@@ -749,8 +700,9 @@ fn integer_literal(text: &str) -> Option<i64> {
 /// Evaluate an `#if` expression three-valued. `&&` and `||` decide whenever
 /// one side does (`1 || FLAG` is true, `0 && FLAG` false); `?:` with an
 /// unknown condition is known only when both branches agree; every other
-/// operator needs known operands. An unseen name, a definitely undefined
-/// name's `0` aside, is unknown; so are a call-like `__has_include(…)`, a
+/// operator needs known operands, and a macro's value is known only as a truth
+/// (`#if N == 1` with `#define N 2` stays unknown). An unseen name, a
+/// definitely undefined name's `0` aside, is unknown; so are a call-like `__has_include(…)`, a
 /// character literal, overflow, division by zero, and anything malformed.
 fn evaluate(expression: &str, name: &dyn Fn(&str) -> NameState) -> Truth {
     let tokens = tokens(expression);
@@ -829,7 +781,7 @@ impl<'t> ConditionParser<'t, '_> {
         self.at += 1;
         let value = self.unary()?;
         Some(match op {
-            "!" => Value::Truth(not(value.truth())),
+            "!" => logical(not(value.truth())),
             "~" => value.int().map_or(Value::Truth(None), |n| Value::Int(!n)),
             "-" => value
                 .int()
@@ -854,7 +806,7 @@ impl<'t> ConditionParser<'t, '_> {
                 if parenthesized && !self.eat(")") {
                     return None;
                 }
-                Some(Value::Truth((self.name)(word).defined))
+                Some(logical((self.name)(word).defined))
             }
             Token::Word(word) => {
                 if matches!(self.peek(), Some(Token::Punct("("))) {
@@ -910,8 +862,8 @@ fn binary_precedence(op: &str) -> Option<u8> {
 
 fn combine(op: &str, left: Value, right: Value) -> Value {
     match op {
-        "||" => Value::Truth(or(left.truth(), right.truth())),
-        "&&" => Value::Truth(and(left.truth(), right.truth())),
+        "||" => logical(or(left.truth(), right.truth())),
+        "&&" => logical(and(left.truth(), right.truth())),
         _ => left
             .int()
             .zip(right.int())
@@ -1011,7 +963,7 @@ fn guards_itself(
 /// Per line: whether anything but comments and whitespace is on it, with raw
 /// string bodies masked first, as [`directive_lines`] does.
 fn code_line_flags(source: &str) -> Vec<bool> {
-    let masked = mask_cpp_raw_strings(source);
+    let masked = splice_continuations(&mask_cpp_raw_strings(source));
     let mut in_block = false;
     masked
         .split('\n')
@@ -1110,7 +1062,7 @@ fn calls_itself(lines: &[String], index: usize, name: &str) -> bool {
 /// string bodies are masked first, so a `#define` inside one is not a
 /// directive.
 fn directive_lines(source: &str) -> Vec<String> {
-    let masked = mask_cpp_raw_strings(source);
+    let masked = splice_continuations(&mask_cpp_raw_strings(source));
     let mut out = Vec::new();
     let mut in_block = false;
     for raw in masked.split('\n') {
@@ -1353,6 +1305,12 @@ mod tests {
             // A definitely undefined name is 0; an unseen one is unknown.
             ("Z == 0", Some(true)),
             ("FLAG == 0", None),
+            // A name's value is known only as a truth, never as a number: `A`
+            // may be defined as 2. A logical result is a real 0 or 1.
+            ("A == 1", None),
+            ("A + 0", None),
+            ("defined(A) + defined(A) == 2", Some(true)),
+            ("(1 || FLAG) == 1", Some(true)),
             // `?:` with an unknown condition needs agreeing branches.
             ("1 ? FLAG : 0", None),
             ("FLAG ? 1 : 1", Some(true)),
@@ -1378,27 +1336,23 @@ mod tests {
 
     #[test]
     fn continued_directives_are_one_logical_line() {
-        let lines: Vec<String> = [
-            "#if 1 || \\",
-            "    FLAG // trailing",
-            "#elif A && \\",
-            "  /* note */ B \\",
-            "  && C",
-            "#if DONE",
-        ]
-        .map(str::to_string)
-        .to_vec();
+        // Phase 2 joins lines before comments go: a backslash inside a block
+        // comment still continues the directive. Joined lines stay as empty
+        // lines, so every line keeps its number.
+        let source = "#if 1 || \\\n    FLAG // trailing\n#if A || /* c \\\n*/ B\n#define V /* v \\\n*/ 1\n#if DONE\n";
         assert_eq!(
-            spliced(&lines, 0, " 1 || \\"),
-            (" 1 || FLAG".to_string(), 1)
+            splice_continuations(source),
+            "#if 1 ||     FLAG // trailing\n\n#if A || /* c */ B\n\n#define V /* v */ 1\n\n#if DONE\n"
         );
-        assert_eq!(
-            spliced(&lines, 2, " A && \\"),
-            (" A && B && C".to_string(), 2)
-        );
-        assert_eq!(spliced(&lines, 5, " DONE"), (" DONE".to_string(), 0));
-        // A last line that still ends in a backslash just stops.
-        assert_eq!(spliced(&lines[..1], 0, " 1 \\"), (" 1".to_string(), 0));
+        let lines = directive_lines(source);
+        assert_eq!(lines.len(), 8);
+        assert_eq!(lines[0], "#if 1 ||     FLAG ");
+        assert_eq!(lines[2], "#if A ||   B");
+        assert_eq!(lines[4], "#define V   1");
+        assert_eq!(lines[6], "#if DONE");
+        assert!([1, 3, 5, 7].iter().all(|at| lines[*at].is_empty()));
+        // A trailing backslash on the last line joins nothing.
+        assert_eq!(splice_continuations("#if 1 \\"), "#if 1 ");
     }
 
     #[test]
