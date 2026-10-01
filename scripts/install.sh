@@ -35,6 +35,13 @@ fi
 case "$(uname -s)" in
 Linux) os_part="unknown-linux-musl" ;;
 Darwin) os_part="apple-darwin" ;;
+MINGW* | MSYS* | CYGWIN*)
+	# A Windows POSIX shell (Git Bash, MSYS2, Cygwin): the Windows build is
+	# installed by the PowerShell installer.
+	info "codegraph: on Windows, open PowerShell and run:"
+	info "  irm https://raw.githubusercontent.com/${REPO}/main/scripts/install.ps1 | iex"
+	exit 1
+	;;
 *) err "unsupported OS: $(uname -s) (supported: Linux, Darwin)" ;;
 esac
 case "$(uname -m)" in
