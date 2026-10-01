@@ -73,6 +73,8 @@ pub(crate) fn migrate_project(
     let options = &scope.options;
     // `scan_project` returns a SORTED list, and every downstream pass keeps that
     // order, so no HashSet iteration order can reach the database or the outcome.
+    // Capture git before the scan, so the record this build writes is race-safe.
+    let git_capture = crate::git_pending::GitIndexCapture::begin(project_root, options);
     let scan = codegraph_extract::engine::scan_project_with_stats(project_root, options)?;
     let candidates = scan.files;
     let total = candidates.len();
@@ -182,6 +184,14 @@ pub(crate) fn migrate_project(
         .store()
         .set_project_metadata(INDEXED_WITH_VERSION_KEY, env!("CARGO_PKG_VERSION"))?;
     crate::link_state::record_followed_links(rebuild.store(), &scan.links)?;
+    if let Some(capture) = git_capture {
+        capture.record(
+            rebuild.store(),
+            project_root,
+            options,
+            !scan.links.is_empty(),
+        )?;
+    }
 
     // Explicit fallible finalization: pragma restore, checkpoint + compaction,
     // extraction stamp, stamp checkpoint, connection close, and only then the

@@ -441,6 +441,8 @@ scope differs from the persisted file inventory. It sees committed-but-unindexed
 work as well as working-tree and non-Git changes, applies the same project scope
 and content-hash gates as whole-tree sync, and lists each added/modified/removed
 path. The check is read-only and holds the engine's existing shared index lease.
+In a git work tree it takes the same git fast path as `codegraph status`, and it
+falls back to the full inventory under the same conditions.
 
 **`codegraph_export`** dumps the complete graph as NetworkX node-link JSON.
 Useful for external visualization tools, custom analysis scripts, or feeding an

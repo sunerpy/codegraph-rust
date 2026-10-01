@@ -44,6 +44,14 @@ impl ExtensionOverrides {
         Arc::new(Self::default())
     }
 
+    /// Every override, in extension order: a stable identity for the scope a
+    /// scan ran under.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, Language)> + '_ {
+        self.map
+            .iter()
+            .map(|(extension, language)| (extension.as_str(), *language))
+    }
+
     /// Load the overrides declared by ONE project's current index root.
     ///
     /// Reads exactly `paths.extension_config()`. A missing file yields empty

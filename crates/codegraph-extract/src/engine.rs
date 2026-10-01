@@ -492,6 +492,96 @@ pub enum LinkKind {
     Dir,
 }
 
+/// How the project scan treats one root-relative path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Membership {
+    /// [`scan_project`] yields the file, or descends into the directory.
+    Admitted,
+    /// The scan never yields it — including a path that does not exist.
+    Rejected,
+    /// The path runs through a symlink, which only a full scan can resolve,
+    /// or a component could not be inspected.
+    Unknown,
+}
+
+/// Whether [`scan_project`] would yield `relative` as a source file or, with
+/// `dir`, descend into it as a directory, judged component by component by the
+/// same per-entry rules the walk applies.
+pub fn scan_membership(
+    root: &Path,
+    options: &ExtractOptions,
+    relative: &str,
+    dir: bool,
+) -> Membership {
+    let components = relative
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>();
+    if components.is_empty() || components.iter().any(|c| *c == "." || *c == "..") {
+        return Membership::Rejected;
+    }
+    let ignored_dirs = options
+        .ignore_dirs
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let gitignore = RootGitignore::load(root);
+    let pattern_sets: Vec<&[String]> = vec![&options.ignore_paths, &options.exclude];
+    let include = IncludeSet::new(&options.include, &options.exclude);
+    let reserved_roots = codegraph_core::IndexPaths::reserved_index_roots(
+        root,
+        std::env::var("CODEGRAPH_DIR").ok().as_deref(),
+    );
+    let rules = ScanRules {
+        root,
+        ignored_dirs: &ignored_dirs,
+        reserved_roots: &reserved_roots,
+        pattern_sets: &pattern_sets,
+        gitignore: &gitignore,
+        include: &include,
+        overrides: &options.extensions,
+    };
+    let mut parent = root.to_path_buf();
+    let mut above = GitignoreAncestry::default();
+    for (index, name) in components.iter().enumerate() {
+        let path = parent.join(name);
+        let partial = components[..=index].join("/");
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Membership::Rejected;
+            }
+            Err(_) => return Membership::Unknown,
+        };
+        if metadata.file_type().is_symlink() {
+            return Membership::Unknown;
+        }
+        let is_dir = metadata.is_dir();
+        if rules.prunes_by_name(&parent, &path, name, &partial, || is_dir) {
+            return Membership::Rejected;
+        }
+        let last = index + 1 == components.len();
+        if last && !dir {
+            if !metadata.is_file() {
+                return Membership::Rejected;
+            }
+            return match rules.decide(&partial, false, above) {
+                EntryDecision::File { extractable: true } => Membership::Admitted,
+                _ => Membership::Rejected,
+            };
+        }
+        if !is_dir {
+            return Membership::Rejected;
+        }
+        match rules.decide(&partial, true, above) {
+            EntryDecision::Descend(next) => above = next,
+            _ => return Membership::Rejected,
+        }
+        parent = path;
+    }
+    Membership::Admitted
+}
+
 pub fn scan_project(root: &Path, options: &ExtractOptions) -> Result<Vec<String>> {
     Ok(scan_project_with_stats(root, options)?.files)
 }
@@ -518,13 +608,15 @@ pub fn scan_project_with_stats(root: &Path, options: &ExtractOptions) -> Result<
     // No symlink may lead into the project's `.git` or a reserved index root.
     let blocked = std::iter::once(root.join(".git")).chain(reserved_roots.iter().cloned());
     let mut walk = ScanWalk {
-        root,
-        ignored_dirs: &ignored_dirs,
-        reserved_roots: &reserved_roots,
-        pattern_sets: &pattern_sets,
-        gitignore: &gitignore,
-        include: &include,
-        overrides: &options.extensions,
+        rules: ScanRules {
+            root,
+            ignored_dirs: &ignored_dirs,
+            reserved_roots: &reserved_roots,
+            pattern_sets: &pattern_sets,
+            gitignore: &gitignore,
+            include: &include,
+            overrides: &options.extensions,
+        },
         links: LinkWalk::new(root, blocked),
         files: Vec::new(),
         unsupported_by_extension: BTreeMap::new(),
@@ -551,8 +643,9 @@ pub fn scan_project_with_stats(root: &Path, options: &ExtractOptions) -> Result<
     Ok(walk.finish())
 }
 
-/// One scan's fixed inputs and accumulated output.
-struct ScanWalk<'a> {
+/// The scan's per-entry rules, shared by the walk and [`scan_membership`] so
+/// that single-path membership cannot drift from what the walk yields.
+struct ScanRules<'a> {
     root: &'a Path,
     ignored_dirs: &'a HashSet<&'a str>,
     reserved_roots: &'a std::collections::BTreeSet<PathBuf>,
@@ -560,6 +653,78 @@ struct ScanWalk<'a> {
     gitignore: &'a RootGitignore,
     include: &'a IncludeSet<'a>,
     overrides: &'a ExtensionOverrides,
+}
+
+/// The scan's verdict on one entry whose kind is known.
+enum EntryDecision {
+    Skip,
+    /// Descend into the directory with this ancestry.
+    Descend(GitignoreAncestry),
+    /// A file the ignore model admits; it is indexed iff `extractable`, and
+    /// otherwise counted as an unsupported extension.
+    File {
+        extractable: bool,
+    },
+}
+
+impl ScanRules<'_> {
+    /// Whether the entry `name` at `path` inside `dir` is pruned before its
+    /// kind is read: `.git` directly under the root, an exact reserved index
+    /// root at any depth, or an `ignore_dirs` name — except a `build` that is a
+    /// JVM package segment under a conventional source root (#1642).
+    fn prunes_by_name(
+        &self,
+        dir: &Path,
+        path: &Path,
+        name: &str,
+        relative: &str,
+        resolves_to_dir: impl FnOnce() -> bool,
+    ) -> bool {
+        // Skip `.git` (a direct child of the scan root) and any directory whose
+        // FULL path is a resolved reserved index root — matched at any depth, so
+        // a nested configured root like `<root>/cache/index` is pruned exactly,
+        // while a same-basename user directory elsewhere is not.
+        let is_reserved_root_here =
+            (dir == self.root && name == ".git") || self.reserved_roots.contains(path);
+        // `build` is also a legal JVM package segment: keep it under a
+        // conventional source root while still pruning build output (#1642).
+        let jvm_package = name == "build"
+            && codegraph_core::config::is_jvm_source_build_dir(relative)
+            && resolves_to_dir();
+        is_reserved_root_here || (self.ignored_dirs.contains(name) && !jvm_package)
+    }
+
+    fn decide(&self, relative: &str, is_dir: bool, above: GitignoreAncestry) -> EntryDecision {
+        let own = self.gitignore.matched(relative, is_dir);
+        let ignored = is_path_ignored(relative, self.pattern_sets, above.decide(own));
+        if is_dir {
+            // A model-ignored dir is normally pruned before descent, so a FILE
+            // include under a gitignored ancestor would never be reached.
+            // Descend anyway when this dir is an ancestor of (or matches) an
+            // include pattern; files inside are still pruned unless force-included.
+            if ignored && !self.include.wants_descend(relative) {
+                EntryDecision::Skip
+            } else {
+                EntryDecision::Descend(above.child(own))
+            }
+        } else if !ignored || self.include.forces(relative) {
+            // Post-model include decision: a model-ignored file is force-included
+            // iff it matches `include` and is NOT overridden by an explicit
+            // `exclude` (checked inside `IncludeSet::forces`). Built-in dir skips
+            // are already handled structurally above, so include can never
+            // resurface node_modules/dist/.git/etc.
+            EntryDecision::File {
+                extractable: is_extractable_source_path(relative, self.overrides),
+            }
+        } else {
+            EntryDecision::Skip
+        }
+    }
+}
+
+/// One scan's fixed inputs and accumulated output.
+struct ScanWalk<'a> {
+    rules: ScanRules<'a>,
     links: LinkWalk<GitignoreAncestry>,
     files: Vec<String>,
     unsupported_by_extension: BTreeMap<String, usize>,
@@ -586,20 +751,10 @@ impl ScanWalk<'_> {
             let path = entry.path();
             let file_name = entry.file_name();
             let name = file_name.to_string_lossy();
-            // Skip `.git` (a direct child of the scan root) and any directory whose
-            // FULL path is a resolved reserved index root — matched at any depth, so
-            // a nested configured root like `<root>/cache/index` is pruned exactly,
-            // while a same-basename user directory elsewhere is not.
-            let is_reserved_root_here =
-                (dir == self.root && name == ".git") || self.reserved_roots.contains(&path);
-            let relative = normalize_path(path.strip_prefix(self.root).unwrap_or(&path));
-            // `build` is also a legal JVM package segment: keep it under a
-            // conventional source root while still pruning build output (#1642).
-            let jvm_package = name == "build"
-                && codegraph_core::config::is_jvm_source_build_dir(&relative)
-                && resolves_to_dir(&entry, &path);
-            if is_reserved_root_here || (self.ignored_dirs.contains(name.as_ref()) && !jvm_package)
-            {
+            let relative = normalize_path(path.strip_prefix(self.rules.root).unwrap_or(&path));
+            if self.rules.prunes_by_name(dir, &path, &name, &relative, || {
+                resolves_to_dir(&entry, &path)
+            }) {
                 continue;
             }
             let file_type = entry.file_type()?;
@@ -619,54 +774,44 @@ impl ScanWalk<'_> {
             } else {
                 continue;
             };
-            let own = self.gitignore.matched(&relative, is_dir);
-            let ignored = is_path_ignored(&relative, self.pattern_sets, above.decide(own));
-            if is_dir {
-                // A model-ignored dir is normally pruned before descent, so a FILE
-                // include under a gitignored ancestor would never be reached.
-                // Descend anyway when this dir is an ancestor of (or matches) an
-                // include pattern; files inside are still pruned unless force-included.
-                if ignored && !self.include.wants_descend(&relative) {
-                    continue;
-                }
-                if is_link {
-                    self.links.queue(hops + 1, relative, path, above.child(own));
-                    continue;
-                }
-                let canonical = canonical_dir.join(&file_name);
-                if !self.links.enter(canonical.clone(), &relative) {
-                    continue;
-                }
-                if hops > 0 {
-                    self.linked_dirs.push(relative);
-                }
-                self.scan_dir(&path, &canonical, above.child(own), hops)?;
-            } else if !ignored || self.include.forces(&relative) {
-                // Post-model include decision: a model-ignored file is force-included
-                // iff it matches `include` and is NOT overridden by an explicit
-                // `exclude` (checked inside `IncludeSet::forces`). Built-in dir skips
-                // are already handled structurally above, so include can never
-                // resurface node_modules/dist/.git/etc.
-                let target = if is_link {
-                    match self.links.file_target(&path) {
-                        Some(target) => Some(target),
-                        None => continue,
+            match self.rules.decide(&relative, is_dir, above) {
+                EntryDecision::Skip => {}
+                EntryDecision::Descend(next) => {
+                    if is_link {
+                        self.links.queue(hops + 1, relative, path, next);
+                        continue;
                     }
-                } else {
-                    None
-                };
-                if is_extractable_source_path(&relative, self.overrides) {
-                    if let Some(target) = target {
-                        self.followed.push(FollowedLink {
-                            relative: relative.clone(),
-                            canonical: target.clone(),
-                            kind: LinkKind::File,
-                        });
-                        self.file_links.push((relative.clone(), target));
+                    let canonical = canonical_dir.join(&file_name);
+                    if !self.links.enter(canonical.clone(), &relative) {
+                        continue;
                     }
-                    self.files.push(relative);
-                } else if let Some(extension) = unsupported_extension(&relative) {
-                    *self.unsupported_by_extension.entry(extension).or_default() += 1;
+                    if hops > 0 {
+                        self.linked_dirs.push(relative);
+                    }
+                    self.scan_dir(&path, &canonical, next, hops)?;
+                }
+                EntryDecision::File { extractable } => {
+                    let target = if is_link {
+                        match self.links.file_target(&path) {
+                            Some(target) => Some(target),
+                            None => continue,
+                        }
+                    } else {
+                        None
+                    };
+                    if extractable {
+                        if let Some(target) = target {
+                            self.followed.push(FollowedLink {
+                                relative: relative.clone(),
+                                canonical: target.clone(),
+                                kind: LinkKind::File,
+                            });
+                            self.file_links.push((relative.clone(), target));
+                        }
+                        self.files.push(relative);
+                    } else if let Some(extension) = unsupported_extension(&relative) {
+                        *self.unsupported_by_extension.entry(extension).or_default() += 1;
+                    }
                 }
             }
         }

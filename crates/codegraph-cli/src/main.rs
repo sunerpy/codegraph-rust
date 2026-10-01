@@ -5272,6 +5272,9 @@ fn index_project_inner(
         eprintln!("Scanning files…");
     }
     let scan_started = std::time::Instant::now();
+    // Capture git before the scan, so the pending-status record this build
+    // writes is race-safe (#1878).
+    let git_capture = codegraph_watch::GitIndexCapture::begin(project, &options);
     let scan = codegraph_extract::engine::scan_project_with_stats(project, &options)?;
     let files_skipped_unsupported = scan
         .unsupported_by_extension
@@ -5674,6 +5677,9 @@ fn index_project_inner(
     );
     store.set_project_metadata("indexed_with_version", VERSION)?;
     codegraph_watch::record_followed_links(&store, &followed_links)?;
+    if let Some(capture) = git_capture {
+        capture.record(&store, project, &options, !followed_links.is_empty())?;
+    }
     let after = store.counts()?;
     // Explicit fallible finalization: pragma restore -> checkpoint + compaction ->
     // extraction stamp -> stamp checkpoint -> close the final connection ->

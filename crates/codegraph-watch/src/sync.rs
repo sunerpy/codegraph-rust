@@ -22,6 +22,7 @@ use codegraph_resolve::frameworks::godot_dsl_config::GodotDslConfig;
 use codegraph_store::queries::{FileReferenceSite, ReferenceSite};
 use codegraph_store::{IndexLease, Store, StoreWriteOpen, StoreWritePurpose};
 
+use crate::git_pending::{GitIndexCapture, PendingSource};
 use crate::link_state::{RehashUnder, record_followed_links};
 use crate::policy::WatchPolicy;
 
@@ -145,9 +146,45 @@ pub fn pending_project_changes(
     project_root: impl AsRef<Path>,
     store: &Store,
 ) -> Result<PendingChanges> {
+    Ok(pending_project_changes_detailed(project_root, store)?.0)
+}
+
+/// [`pending_project_changes`], and which computation answered: the git fast
+/// path when git can see every change since the index was built (#1878),
+/// otherwise the full inventory.
+pub fn pending_project_changes_detailed(
+    project_root: impl AsRef<Path>,
+    store: &Store,
+) -> Result<(PendingChanges, PendingSource)> {
     let project_root = project_root.as_ref();
     let paths = index_paths(project_root)?;
     let scope = ProjectScope::load(project_root, &paths)?;
+    if let Some(fast) = crate::git_pending::git_fast_pending(project_root, store, &scope.options)? {
+        return Ok((fast, PendingSource::GitFastPath));
+    }
+    Ok((
+        full_inventory(project_root, store, &scope)?,
+        PendingSource::FullInventory,
+    ))
+}
+
+/// The reference answer: a full scan against the persisted inventory, never
+/// consulting git.
+pub fn pending_full_inventory(
+    project_root: impl AsRef<Path>,
+    store: &Store,
+) -> Result<PendingChanges> {
+    let project_root = project_root.as_ref();
+    let paths = index_paths(project_root)?;
+    let scope = ProjectScope::load(project_root, &paths)?;
+    full_inventory(project_root, store, &scope)
+}
+
+fn full_inventory(
+    project_root: &Path,
+    store: &Store,
+    scope: &ProjectScope,
+) -> Result<PendingChanges> {
     let scan = codegraph_extract::engine::scan_project_with_stats(project_root, &scope.options)?;
     // A path reached through a new, retargeted or unrecorded link is re-read:
     // its stored stat may describe a different file (#935).
@@ -254,6 +291,10 @@ fn sync_project_once_with_scope(
     let _active = cancel.map(SyncCancellation::enter);
     match open_sync_writer(paths, cancel)? {
         SyncWriter::Incremental(mut store) => {
+            // Forget the git record before any row moves, and capture git
+            // before the scan, so the record this sync writes is race-safe.
+            crate::git_pending::forget(&store)?;
+            let git_capture = GitIndexCapture::begin(project_root, options);
             let scan = codegraph_extract::engine::scan_project_with_stats(project_root, options)?;
             // Re-read whatever a new, retargeted or unrecorded link reaches, so a
             // same-stat file behind a moved link cannot keep its old graph (#935).
@@ -289,6 +330,9 @@ fn sync_project_once_with_scope(
                 on_progress,
             )?;
             record_followed_links(&store, &scan.links)?;
+            if let Some(capture) = git_capture {
+                capture.record(&store, project_root, options, !scan.links.is_empty())?;
+            }
             store.finish_current_mutation()?;
             Ok(outcome)
         }
@@ -433,6 +477,24 @@ fn sync_changed_paths_current_scope(
     let _active = cancel.map(SyncCancellation::enter);
     match open_sync_writer(&paths, cancel)? {
         SyncWriter::Incremental(mut store) => {
+            // Rows change only for these paths, so the git record stays valid
+            // once they are in its always-reclassified set (#1878). That is
+            // written before the first row moves.
+            let changed = changed
+                .into_iter()
+                .map(|path| path.as_ref().to_path_buf())
+                .collect::<Vec<_>>();
+            let normalizer = WatchPolicy::new(project_root);
+            let requested = changed
+                .iter()
+                .filter_map(|path| normalizer.normalize_relative(path))
+                .collect::<BTreeSet<_>>();
+            crate::git_pending::extend_for_incremental(
+                &store,
+                project_root,
+                &scope.options,
+                &requested,
+            )?;
             let outcome = sync_paths_with_store(
                 &mut store,
                 project_root,

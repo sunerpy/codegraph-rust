@@ -60,6 +60,27 @@ reuses full-sync include/exclude/custom-extension rules and the same
 non-empty. Running status acquires only the normal read lease and does not mutate
 the database.
 
+In a git work tree, a full `index` or `sync` also records the commit it started at.
+It records every path that may differ from that commit as well: paths git reported
+dirty during the build, files whose size or mtime moved while it ran, and paths a
+fresh scan and the database disagree on. Incremental syncs add the paths they
+handle. `status` then classifies only git's candidates and those recorded paths,
+by the same rules: what changed between the recorded commit and `HEAD`, plus what
+`git status` reports now. The answer is the same as the full inventory's. The full
+inventory still answers whenever git might not see a change:
+
+- there is no record, the commit no longer exists, or the repository has no commit;
+- the scope changed: config, root `.gitignore`, extension overrides, index root,
+  or binary version;
+- the index was built through symlinks, or the repository has submodules;
+- an untracked nested repository or an `assume-unchanged` or `skip-worktree` entry
+  is present;
+- git ignores a path the scan keeps, such as one under a nested `.gitignore` or an
+  `include` override;
+- git is missing or does not answer within 10 seconds.
+
+Git runs without optional locks, so `status` never rewrites `.git/index`.
+
 ### Project-path argument contract
 
 Lifecycle commands (`init`, `uninit`, `index`, `sync`, `status`, `unlock`)

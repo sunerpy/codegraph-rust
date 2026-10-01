@@ -651,6 +651,7 @@ dependencies = [
  "codegraph-extract",
  "codegraph-resolve",
  "codegraph-store",
+ "codegraph-watch",
  "notify",
  "rusqlite",
  "serde",

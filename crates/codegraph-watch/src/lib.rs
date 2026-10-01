@@ -1,4 +1,5 @@
 mod git;
+mod git_pending;
 mod link_state;
 mod migrate;
 mod policy;
@@ -10,13 +11,17 @@ pub use git::{
     DEFAULT_SYNC_HOOKS, GitHookName, GitHookResult, install_git_sync_hooks, is_git_repo,
     is_sync_hook_installed, remove_git_sync_hooks,
 };
+#[cfg(feature = "test-hooks")]
+pub use git_pending::test_hooks as git_pending_hooks;
+pub use git_pending::{GIT_PENDING_KEY, GitIndexCapture, PendingSource, scope_fingerprint};
 pub use link_state::{FOLLOWED_LINKS_KEY, record_followed_links};
 pub use policy::{
     CODEGRAPH_NO_WATCH, TooBroadRoot, WatchPolicy, too_broad_root_reason, watch_disabled_reason,
 };
 pub use sync::{
-    PendingChanges, SyncCancellation, SyncOutcome, pending_project_changes, sync_changed_paths,
-    sync_project_once, sync_project_once_cancellable, sync_project_once_with_progress,
+    PendingChanges, SyncCancellation, SyncOutcome, pending_full_inventory, pending_project_changes,
+    pending_project_changes_detailed, sync_changed_paths, sync_project_once,
+    sync_project_once_cancellable, sync_project_once_with_progress,
 };
 pub use watcher::{
     LOCK_RECOVERY_INTERVAL, PendingFile, ProjectWatcher, WatchHealth, WatchOptions,
