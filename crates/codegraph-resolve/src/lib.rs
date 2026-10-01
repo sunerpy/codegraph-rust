@@ -24,6 +24,7 @@ pub mod frameworks; // concrete react/vue/nestjs FrameworkResolvers
 pub mod import_resolver;
 mod js_store;
 pub mod lru_cache;
+mod member_value;
 pub mod name_matcher;
 mod object_literal;
 pub mod path_aliases;

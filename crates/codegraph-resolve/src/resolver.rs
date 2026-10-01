@@ -1805,6 +1805,16 @@ impl ReferenceResolver {
                 let (resolved, deferred) = self.resolve_this_member_fn_ref_pure(reference, context);
                 return (self.gate_language(resolved, reference, context), deferred);
             }
+            // Python/Go member values are scoped by their receiver; import
+            // lookups happen inside that scoping (#1820).
+            if matches!(reference.language, Language::Python | Language::Go)
+                && reference.reference_name.contains('.')
+            {
+                return (
+                    self.gate_language(match_function_ref(reference, context), reference, context),
+                    None,
+                );
+            }
             if let Some(via_import) =
                 self.gate_language(resolve_via_import(reference, context), reference, context)
             {

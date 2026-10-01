@@ -128,10 +128,11 @@ class Widget:
     assert!(result.errors.is_empty(), "{:?}", result.errors);
     let refs = &result.unresolved_references;
     assert!(has_fn_ref(refs, "on_click"), "arg fn-ref; refs={refs:#?}");
-    // `self.handle` preserves the class-scoped owner marker so resolution can
-    // distinguish it from unrelated same-named methods.
+    // `self.handle` keeps its receiver as written (upstream v1.6.1 #1820);
+    // resolution scopes `self` to the enclosing class, so an unrelated
+    // same-named method cannot win.
     assert!(
-        has_fn_ref(refs, "this.handle"),
+        has_fn_ref(refs, "self.handle"),
         "self.attr fn-ref; refs={refs:#?}"
     );
     assert!(

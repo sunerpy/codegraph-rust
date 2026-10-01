@@ -1113,7 +1113,10 @@ pub fn match_by_qualified_name(
 /// `a/svc`. No-op when there are <2 candidates or none share the call site's
 /// file. The partition is STABLE (preserves within-group order), so edge output
 /// stays deterministic.
-fn prefer_call_site_file<T: Borrow<Node>>(nodes: Vec<T>, call_site_file: &str) -> Vec<T> {
+pub(crate) fn prefer_call_site_file<T: Borrow<Node>>(
+    nodes: Vec<T>,
+    call_site_file: &str,
+) -> Vec<T> {
     if nodes.len() < 2 {
         return nodes;
     }
@@ -1818,7 +1821,7 @@ pub(crate) fn enclosing_scope_start_line(
 /// languages without patterns or when no declaration is found. Bounded to the
 /// enclosing scope. The caller validates the method via `resolve_method_on_type`,
 /// so a mis-inference produces no edge.
-fn infer_local_receiver_type(
+pub(crate) fn infer_local_receiver_type(
     receiver_name: &str,
     reference: &RefView,
     context: &dyn ResolutionContext,
@@ -3844,6 +3847,14 @@ pub fn match_function_ref(
         .is_some_and(|member| !member.contains('.'))
     {
         return None;
+    }
+
+    // Python and Go member values retain their receiver path and resolve
+    // through the receiver's scope before a unique name (upstream #1820).
+    if matches!(reference.language, Language::Python | Language::Go)
+        && reference.reference_name.contains('.')
+    {
+        return crate::member_value::match_member_function_ref(reference, context);
     }
 
     // Receiver-qualified first-class method value (#1820): reuse the exact

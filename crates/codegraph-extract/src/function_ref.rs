@@ -183,7 +183,7 @@ const GO_SPEC: FnRefSpec = FnRefSpec {
     ],
     layers: &[("literal_element", None), ("expression_list", None)],
     unwrap: &[],
-    special: &[],
+    special: &["selector_expression"],
     ungated_modes: &[],
     address_of_only: false,
 };
@@ -573,6 +573,33 @@ impl<'tree> NormalizedRef<'tree> {
             skip_gate: false,
         }
     }
+
+    /// A Python/Go member value: it retains its receiver for scoped
+    /// resolution, so the same-file/import name gate does not apply.
+    fn ungated(name: String, node: SyntaxNode<'tree>) -> Self {
+        Self {
+            name,
+            node,
+            skip_gate: true,
+        }
+    }
+}
+
+/// `^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+$` — a statically named member path.
+fn is_dotted_member_value(value: &str) -> bool {
+    let mut segments = value.split('.');
+    let Some(first) = segments.next() else {
+        return false;
+    };
+    let segment_ok = |segment: &str| {
+        let mut chars = segment.chars();
+        chars
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+            && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    };
+    let rest = segments.collect::<Vec<_>>();
+    segment_ok(first) && !rest.is_empty() && rest.into_iter().all(segment_ok)
 }
 
 /// Normalize one value expression to zero or more function names + source node.
@@ -766,6 +793,26 @@ fn normalize_special<'tree>(
         // Swift `#selector(fire)` / ObjC `@selector(storeImage:)`
         // (function-ref.ts:685-696).
         "selector_expression" => {
+            // Go `c.store.Fetch` (a `field` child) keeps its receiver path, so
+            // resolution can use the receiver's type before a unique name
+            // (#1820); Swift `#selector(...)` / ObjC `@selector(...)` have no
+            // `field`.
+            if let Some(field) = child_by_field(node, "field") {
+                let value = child_by_field(node, "operand")
+                    .map(|operand| {
+                        format!(
+                            "{}.{}",
+                            node_text(operand, source),
+                            node_text(field, source)
+                        )
+                    })
+                    .unwrap_or_default();
+                return if is_dotted_member_value(&value) {
+                    vec![NormalizedRef::ungated(value, field)]
+                } else {
+                    Vec::new()
+                };
+            }
             let Some(inner) = node.named_child(0) else {
                 return Vec::new();
             };
@@ -835,28 +882,21 @@ fn normalize_special<'tree>(
             Vec::new()
         }
 
-        // Python method values. A direct `self.handle_click` is class-scoped;
-        // `store.fetch` and `self.store.fetch` retain `store.fetch`, matching
-        // the representation used by direct calls so both paths choose the
-        // same target. Dynamic receivers remain unlinked (#1820).
+        // Python method values keep their whole receiver path —
+        // `self.handle_click`, `self.store.fetch`, `Actual.fetch` — so
+        // resolution can scope the member through the class, a field's type,
+        // a local's type or an import (#1820). A call or subscript receiver is
+        // not statically named and must not collapse to a bare method.
         "attribute" => {
-            let obj = child_by_field(node, "object");
-            let attr = child_by_field(node, "attribute");
-            if let (Some(obj), Some(attr)) = (obj, attr) {
-                if obj.kind() == "identifier" && node_text(obj, source) == "self" {
-                    return vec![NormalizedRef::new(
-                        format!("this.{}", node_text(attr, source)),
-                        attr,
-                    )];
-                }
-                if let Some(receiver) = method_value_receiver_segment(obj, source) {
-                    return vec![NormalizedRef::new(
-                        format!("{receiver}.{}", node_text(attr, source)),
-                        attr,
-                    )];
-                }
+            let Some(attr) = child_by_field(node, "attribute") else {
+                return Vec::new();
+            };
+            let value = node_text(node, source);
+            if is_dotted_member_value(&value) {
+                vec![NormalizedRef::ungated(value, attr)]
+            } else {
+                Vec::new()
             }
-            Vec::new()
         }
 
         // `this.Run0` (C#) (function-ref.ts:738-746).
@@ -1316,8 +1356,10 @@ class W:
         register("blur", handler)
 "#;
         let refs = fn_refs("src/w.py", src, Language::Python);
+        // Upstream v1.6.1 #1820: the receiver path is kept as written and the
+        // resolver scopes `self` to the enclosing class.
         assert!(
-            has_fn_ref(&refs, "this.on_click"),
+            has_fn_ref(&refs, "self.on_click"),
             "names={:?}",
             names(&refs)
         );
@@ -1349,9 +1391,11 @@ class Consumer:
         register(factory().fetch)
 "#;
         let refs = fn_refs("src/receiver_values.py", src, Language::Python);
+        // Upstream v1.6.1 #1820: every member value keeps its whole receiver
+        // path, so resolution can scope `self`, a field or a local.
         assert!(
-            has_fn_ref(&refs, "this.own_handler"),
-            "self method must retain class scope: names={:?}",
+            has_fn_ref(&refs, "self.own_handler"),
+            "self method must retain its receiver: names={:?}",
             names(&refs)
         );
         assert!(
@@ -1361,15 +1405,16 @@ class Consumer:
         );
         assert_eq!(
             refs.iter()
-                .filter(|reference| reference.reference_name == "store.fetch")
+                .filter(|reference| reference.reference_name == "self.store.fetch")
                 .count(),
-            3,
-            "argument, assignment, and list forms must retain their distinct source owners"
+            2,
+            "assignment and list forms must retain the field receiver and their owners"
         );
         assert!(
             !refs
                 .iter()
-                .any(|reference| reference.reference_name == "factory.fetch"),
+                .any(|reference| reference.reference_name.ends_with("fetch")
+                    && reference.reference_name.contains("factory")),
             "dynamic call-result receivers must remain unresolved"
         );
     }
@@ -2238,7 +2283,7 @@ object M {
         let lang = tree_sitter_python::LANGUAGE.into();
         let names = special_names(lang, "reg(self.handler)", "attribute");
         assert!(
-            names.contains(&"this.handler".to_string()),
+            names.contains(&"self.handler".to_string()),
             "self.attr; names={names:?}"
         );
     }

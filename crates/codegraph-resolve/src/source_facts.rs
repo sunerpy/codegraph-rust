@@ -122,6 +122,7 @@ pub struct SourceFacts {
     source: Arc<str>,
     lines: OnceLock<LineIndex>,
     ts_comment_free: OnceLock<(String, LineIndex)>,
+    python_comment_free: OnceLock<(String, LineIndex)>,
     ts_blanked: OnceLock<String>,
     js_sealed_module: OnceLock<bool>,
     js_binding_sites: OnceLock<LocalBindingSites>,
@@ -143,6 +144,7 @@ impl SourceFacts {
             source,
             lines: OnceLock::new(),
             ts_comment_free: OnceLock::new(),
+            python_comment_free: OnceLock::new(),
             ts_blanked: OnceLock::new(),
             js_sealed_module: OnceLock::new(),
             js_binding_sites: OnceLock::new(),
@@ -194,6 +196,17 @@ impl SourceFacts {
     pub fn ts_comment_free(&self) -> (&str, &LineIndex) {
         let (code, lines) = self.ts_comment_free.get_or_init(|| {
             let code = strip_comments_for_regex(&self.source, CommentLang::TypeScript);
+            let lines = LineIndex::new(&code);
+            (code, lines)
+        });
+        (code, lines)
+    }
+
+    /// The whole file through [`strip_comments_for_regex`] with the Python
+    /// rules, plus its line index.
+    pub fn python_comment_free(&self) -> (&str, &LineIndex) {
+        let (code, lines) = self.python_comment_free.get_or_init(|| {
+            let code = strip_comments_for_regex(&self.source, CommentLang::Python);
             let lines = LineIndex::new(&code);
             (code, lines)
         });
