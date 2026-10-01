@@ -1061,6 +1061,105 @@ fn selectors_are_not_guessed_through_shadows_or_foreign_factories() {
     assert!(!fake.contains(&"fake::reset".to_string()), "{fake:?}");
 }
 
+#[test]
+fn store_actions_bind_only_inside_zustand_built_stores() {
+    let project = resolve_project(&files(&[
+        (
+            "fake.ts",
+            "import { create } from 'zustand';
+export const fake = otherFactory(() => ({ reset() { return 1; } }));
+export const fakeGet = otherFactory((set, get) => ({ reset() { return 1; }, again() { get().reset(); } }));
+export const commented = otherFactory(/* create( */ () => ({ reset() { return 1; } }));
+export const quoted = otherFactory(\"create(\", () => ({ reset() { return 1; } }));
+export const offPath = otherFactory(create(1), () => ({ reset() { return 1; } }));
+export const typed = otherFactory<ReturnType<typeof create>>(() => ({ reset() { return 1; } }));
+",
+        ),
+        (
+            "real.ts",
+            "import { create } from 'zustand';
+import { createStore } from 'zustand/vanilla';
+import createDefault from 'zustand';
+import * as zs from 'zustand';
+import { createSelectors } from './selectors-util';
+export const vanilla = createStore(() => ({ reset() { return 1; } }));
+export const wrapped = createSelectors(create<{ reset(): number }>()(() => ({ reset() { return 1; } })));
+export const viaNamespace = zs.create(() => ({ reset() { return 1; } }));
+export const viaDefault = createDefault(() => ({ reset() { return 1; } }));
+",
+        ),
+        (
+            "use.ts",
+            "import { fake, commented, quoted, offPath, typed } from './fake';
+import { vanilla, wrapped, viaNamespace, viaDefault } from './real';
+export function useFake() { fake.getState().reset(); }
+export function useFakeDestructured() { const { reset } = fake.getState(); reset(); }
+export function useCommented() { commented.getState().reset(); }
+export function useQuoted() { quoted.getState().reset(); }
+export function useOffPath() { offPath.getState().reset(); }
+export function useTyped() { typed.getState().reset(); }
+export function useVanilla() { vanilla.getState().reset(); }
+export function useWrapped() { wrapped.getState().reset(); }
+export function useWrappedSelector() { const selected = wrapped((s) => s.reset); selected(); }
+export function useNamespace() { viaNamespace.getState().reset(); }
+export function useDefault() { viaDefault.getState().reset(); }
+",
+        ),
+    ]));
+    // A store action needs a Zustand factory on the initializer's call path
+    // to the action function: a comment, a string, an argument off that path
+    // or a type argument naming `create` proves nothing.
+    let bound = |caller: &str, file: &str| {
+        project
+            .callees(caller, Some(file))
+            .into_iter()
+            .filter(|callee| callee.ends_with("::reset"))
+            .collect::<Vec<_>>()
+    };
+    let mut actual = Vec::new();
+    for caller in [
+        "useFake",
+        "useFakeDestructured",
+        "useCommented",
+        "useQuoted",
+        "useOffPath",
+        "useTyped",
+        "useVanilla",
+        "useWrapped",
+        "useWrappedSelector",
+        "useNamespace",
+        "useDefault",
+    ] {
+        actual.push((caller.to_string(), bound(caller, "use.ts")));
+    }
+    actual.push((
+        "fakeGet::again".to_string(),
+        bound("fakeGet::again", "fake.ts"),
+    ));
+    let expected = [
+        ("useFake", vec![]),
+        ("useFakeDestructured", vec![]),
+        ("useCommented", vec![]),
+        ("useQuoted", vec![]),
+        ("useOffPath", vec![]),
+        ("useTyped", vec![]),
+        ("useVanilla", vec!["vanilla::reset"]),
+        ("useWrapped", vec!["wrapped::reset"]),
+        ("useWrappedSelector", vec!["wrapped::reset"]),
+        ("useNamespace", vec!["viaNamespace::reset"]),
+        ("useDefault", vec!["viaDefault::reset"]),
+        ("fakeGet::again", vec![]),
+    ]
+    .map(|(caller, callees)| {
+        (
+            caller.to_string(),
+            callees.into_iter().map(str::to_string).collect::<Vec<_>>(),
+        )
+    })
+    .to_vec();
+    assert_eq!(actual, expected);
+}
+
 // ---- object-literal members that alias a function (#1932) ------------------
 
 #[test]

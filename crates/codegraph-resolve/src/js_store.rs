@@ -13,7 +13,10 @@
 //!
 //! Each form identifies exactly one store and resolves the member inside that
 //! store's own object literal — never a same-named function elsewhere, and
-//! never an interface signature. Anything less certain stays unresolved.
+//! never an interface signature. The store must be built by a Zustand factory
+//! on its initializer's call path; upstream checks that for selectors only, so
+//! `otherFactory(() => ({ reset() {} })).getState().reset()` bound there
+//! (KEEP-RUST). Anything less certain stays unresolved.
 
 use std::collections::HashSet;
 use std::sync::OnceLock;
@@ -29,7 +32,7 @@ use crate::name_matcher::{
 };
 use crate::source_facts::SourceFacts;
 use crate::strip_comments::{CommentLang, blank_string_contents, strip_comments_for_regex};
-use crate::types::{RefView, ResolutionContext, ResolvedBy, ResolvedRef};
+use crate::types::{ImportMapping, RefView, ResolutionContext, ResolvedBy, ResolvedRef};
 
 /// `get().m` / `getState().m` / `store.getState().m` for a TS/JS/Python call
 /// whose receiver is itself a call — the one fallback such a chain keeps
@@ -152,7 +155,9 @@ fn resolve_store_action(
     let [holder] = holders.as_slice() else {
         return None;
     };
-    if selector && !is_zustand_hook(holder, context) {
+    if !built_by_zustand(holder, context, false)
+        || (selector && !built_by_zustand(holder, context, true))
+    {
         return None;
     }
     resolve_object_literal_member(
@@ -192,39 +197,76 @@ fn factory_takes_accessor(
     start < end && pattern.is_match(&facts.join_lines(start, end, "\n"))
 }
 
-/// Only a Zustand hook promises to return a selector's result:
-/// `const useStore = create(...)` with `create` imported from `zustand`.
-fn is_zustand_hook(holder: &Node, context: &dyn ResolutionContext) -> bool {
+/// Modules whose factories build a Zustand store, and those factories.
+const STORE_SOURCES: [&str; 3] = ["zustand", "zustand/vanilla", "zustand/traditional"];
+const STORE_FACTORIES: [&str; 3] = ["create", "createStore", "createWithEqualityFn"];
+/// The subset whose result is a hook, the only kind a selector can call:
+/// a vanilla `createStore` store is no hook.
+const HOOK_SOURCES: [&str; 2] = ["zustand", "zustand/traditional"];
+const HOOK_FACTORIES: [&str; 2] = ["create", "createWithEqualityFn"];
+
+/// Whether `holder` was built by a Zustand factory (a hook factory when
+/// `hook`): some callee on its initializer's path to the action function is
+/// imported from Zustand. The path comes from the parser, so a comment, a
+/// string, a type argument or an argument off the path never proves it.
+fn built_by_zustand(holder: &Node, context: &dyn ResolutionContext, hook: bool) -> bool {
     let Some(facts) = context.source_facts(&holder.file_path) else {
         return false;
     };
-    let start = holder.start_line.saturating_sub(1).max(0) as usize;
-    let end = (holder.end_line.max(holder.start_line).max(0) as usize).min(facts.line_count());
-    if start >= end {
-        return false;
+    let gate = if hook {
+        "zustand-hook"
+    } else {
+        "zustand-store"
+    };
+    facts.node_decision(gate, &holder.id, |facts| {
+        let start = holder.start_line.saturating_sub(1).max(0) as usize;
+        let end = (holder.end_line.max(holder.start_line).max(0) as usize).min(facts.line_count());
+        if start >= end {
+            return false;
+        }
+        let Some(callees) = codegraph_extract::walker::js_store_initializer_callees(
+            &facts.join_lines(start, end, "\n"),
+            holder.language,
+            &holder.name,
+        ) else {
+            return false;
+        };
+        let imports = context.get_import_mappings(&holder.file_path, holder.language);
+        callees
+            .iter()
+            .any(|callee| is_zustand_factory(callee, &imports, hook))
+    })
+}
+
+/// Whether `callee` (`create`, `zs.create`) names a Zustand factory through
+/// the file's `imports`.
+fn is_zustand_factory(callee: &str, imports: &[ImportMapping], hook: bool) -> bool {
+    let (sources, factories): (&[&str], &[&str]) = if hook {
+        (&HOOK_SOURCES, &HOOK_FACTORIES)
+    } else {
+        (&STORE_SOURCES, &STORE_FACTORIES)
+    };
+    match callee.split_once('.') {
+        None => imports.iter().any(|mapping| {
+            mapping.local_name == callee
+                && !mapping.is_namespace
+                && sources.contains(&mapping.source.as_str())
+                && if mapping.is_default {
+                    // Zustand v3's `import create from 'zustand'`.
+                    mapping.source == "zustand"
+                } else {
+                    factories.contains(&mapping.exported_name.as_str())
+                }
+        }),
+        Some((namespace, member)) => {
+            factories.contains(&member)
+                && imports.iter().any(|mapping| {
+                    mapping.local_name == namespace
+                        && mapping.is_namespace
+                        && sources.contains(&mapping.source.as_str())
+                })
+        }
     }
-    let text = facts.join_lines(start, end, "\n");
-    let Ok(pattern) = Regex::new(&format!(
-        r"(?-u:\b)(?:const|let)\s+{}\s*=\s*([A-Za-z0-9_$]+)\s*[<(]",
-        regex::escape(&holder.name)
-    )) else {
-        return false;
-    };
-    let Some(factory) = pattern
-        .captures(&text)
-        .and_then(|captures| captures.get(1))
-        .map(|factory| factory.as_str())
-    else {
-        return false;
-    };
-    context
-        .get_import_mappings(&holder.file_path, holder.language)
-        .iter()
-        .any(|mapping| {
-            mapping.local_name == factory
-                && mapping.source == "zustand"
-                && (mapping.exported_name == "create" || mapping.is_default)
-        })
 }
 
 /// A bare call to a name destructured from `store.getState()` in an

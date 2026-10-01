@@ -5281,6 +5281,83 @@ fn initializer_returned_object(call: SyntaxNode<'_>, depth: usize) -> Option<Syn
         })
 }
 
+/// The callees on the path from the store initializer `source` declares as
+/// `name` to the function whose returned object holds its inline actions —
+/// the path [`initializer_returned_object`] takes — or `None` when `source`
+/// declares no such store. The parser decides what is a call, so a comment, a
+/// string or a type argument naming a factory is never a callee:
+/// `createSelectors(create<S>()(persist((set) => ({ … }))))` yields
+/// `["createSelectors", "create", "persist"]`.
+pub fn js_store_initializer_callees(
+    source: &str,
+    language: Language,
+    name: &str,
+) -> Option<Vec<String>> {
+    let grammar: tree_sitter::Language = match language {
+        Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        Language::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        Language::JavaScript | Language::Jsx => tree_sitter_javascript::LANGUAGE.into(),
+        _ => return None,
+    };
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&grammar).ok()?;
+    let tree = parser.parse(source, None)?;
+    let mut pending = vec![tree.root_node()];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "variable_declarator"
+            && child_by_field(node, "name").is_some_and(|n| node_text(n, source) == name)
+        {
+            let value = child_by_field(node, "value").filter(|v| v.kind() == "call_expression")?;
+            let mut path = Vec::new();
+            return initializer_callee_path(value, 0, source, &mut path).then_some(path);
+        }
+        pending.extend(node.named_children(&mut node.walk()));
+    }
+    None
+}
+
+/// [`initializer_returned_object`]'s search, recording each call's callee
+/// while it descends; `true` once a function argument returns an object.
+fn initializer_callee_path(
+    call: SyntaxNode<'_>,
+    depth: usize,
+    source: &str,
+    path: &mut Vec<String>,
+) -> bool {
+    if depth > 4 {
+        return false;
+    }
+    let mark = path.len();
+    path.push(callee_text(call, source));
+    if let Some(arguments) = child_by_field(call, "arguments") {
+        for argument in arguments.named_children(&mut arguments.walk()) {
+            let found = match argument.kind() {
+                "arrow_function" | "function_expression" => {
+                    function_returned_object(argument).is_some()
+                }
+                "call_expression" => initializer_callee_path(argument, depth + 1, source, path),
+                _ => false,
+            };
+            if found {
+                return true;
+            }
+        }
+    }
+    path.truncate(mark);
+    false
+}
+
+/// A call's callee as written, `create` or `zs.create`; a curried
+/// `create<S>()(…)` is named by its innermost callee. Type arguments are a
+/// separate field and never part of it.
+fn callee_text(call: SyntaxNode<'_>, source: &str) -> String {
+    let mut callee = child_by_field(call, "function");
+    while let Some(inner) = callee.filter(|c| c.kind() == "call_expression") {
+        callee = child_by_field(inner, "function");
+    }
+    callee.map(|c| node_text(c, source)).unwrap_or_default()
+}
+
 /// The closest function enclosing `node`: a store's factory closure.
 fn nearest_function_ancestor(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     let mut current = node.parent();
