@@ -60,15 +60,20 @@ fn epilogue_of(text: &str) -> &str {
     text.rfind("```").map_or(text, |i| &text[i + 3..])
 }
 
-/// `src/big.ts`: `alphaEntry` at the top, an index-only helper whose name is
-/// longer than any per-file budget, then `betaEntry`, whose body runs `beta_lines`
-/// lines. `padding` small files lift the project into the large tiers.
-fn project(label: &str, beta_lines: usize, padding: usize) -> (TestDir, PathBuf) {
+/// `src/big.ts`: `alphaEntry` at the top, then (when `helper_x` is given) an
+/// index-only helper named `helper` plus that many X's, then `betaEntry`, whose
+/// body runs `beta_lines` lines. `padding` small files lift the project into
+/// the large tiers.
+fn project(
+    label: &str,
+    helper_x: Option<usize>,
+    beta_lines: usize,
+    padding: usize,
+) -> (TestDir, PathBuf) {
     let dir = TestDir::new(label);
     let root = dir.path.join("app");
     let src = root.join("src");
     std::fs::create_dir_all(&src).unwrap();
-    let helper = format!("helper{}", "X".repeat(8000));
     let mut body: Vec<String> = (1..10).map(|i| format!("// header {i}")).collect();
     body.push("export function alphaEntry(): number {".to_string());
     body.extend((0..19).map(|i| format!("  const a{i} = {i};")));
@@ -77,7 +82,10 @@ fn project(label: &str, beta_lines: usize, padding: usize) -> (TestDir, PathBuf)
     while body.len() < 99 {
         body.push(format!("// filler {}", body.len() + 1));
     }
-    body.push(format!("function {helper}(): number {{ return 1; }}"));
+    if let Some(x) = helper_x {
+        let helper = format!("helper{}", "X".repeat(x));
+        body.push(format!("function {helper}(): number {{ return 1; }}"));
+    }
     while body.len() < 199 {
         body.push(format!("// filler {}", body.len() + 1));
     }
@@ -106,7 +114,8 @@ fn project(label: &str, beta_lines: usize, padding: usize) -> (TestDir, PathBuf)
 
 #[test]
 fn small_tier_note_does_not_claim_an_unaffordable_gap_name() {
-    let (_dir, root) = project("small", 19, 0);
+    // No per-file budget affords an 8000-character name.
+    let (_dir, root) = project("small", Some(8000), 19, 0);
     let text = run_in(&root, &["explore", "alphaEntry betaEntry"]);
     // The fixture does what it is for: both windows render around a bare gap.
     assert!(text.contains("export function alphaEntry"), "{text}");
@@ -127,7 +136,7 @@ fn small_tier_note_does_not_claim_an_unaffordable_gap_name() {
 
 #[test]
 fn large_tier_note_does_not_claim_an_unaffordable_gap_name() {
-    let (_dir, root) = project("large", 900, 520);
+    let (_dir, root) = project("large", Some(8000), 900, 520);
     let text = run_in(&root, &["explore", "alphaEntry betaEntry"]);
     assert!(text.contains("export function alphaEntry"), "{text}");
     assert!(text.contains("... (gap) ..."), "{text}");
@@ -137,4 +146,39 @@ fn large_tier_note_does_not_claim_an_unaffordable_gap_name() {
     assert!(epilogue.contains("Verbatim source for"), "{epilogue}");
     assert!(!epilogue.contains("name what was elided"), "{epilogue}");
     assert!(epilogue.contains("name what room allowed"), "{epilogue}");
+}
+
+/// The section a windowed `betaEntry` leaves ends in a bare tail marker: what
+/// it cut is never named in a gap marker, whatever the budget. Nothing indexed
+/// sits between the two functions, so no inner gap had a name to withhold.
+fn assert_trailing_bare_gap(text: &str) {
+    assert!(text.contains("export function betaEntry"), "{text}");
+    assert!(text.contains("... (gap) ...\n```"), "{text}");
+    assert!(!text.contains("(gap: "), "{text}");
+}
+
+#[test]
+fn small_tier_note_does_not_claim_names_for_a_trailing_gap() {
+    let (_dir, root) = project("small-tail", None, 900, 0);
+    let text = run_in(&root, &["explore", "alphaEntry betaEntry"]);
+    assert_trailing_bare_gap(&text);
+    let epilogue = epilogue_of(&text);
+    assert!(
+        epilogue.contains("Some file sections were trimmed for size"),
+        "{epilogue}"
+    );
+    assert!(
+        !epilogue.contains("Elided symbols are named inside gap markers"),
+        "{epilogue}"
+    );
+}
+
+#[test]
+fn large_tier_note_does_not_claim_names_for_a_trailing_gap() {
+    let (_dir, root) = project("large-tail", None, 900, 520);
+    let text = run_in(&root, &["explore", "alphaEntry betaEntry"]);
+    assert_trailing_bare_gap(&text);
+    let epilogue = epilogue_of(&text);
+    assert!(epilogue.contains("Verbatim source for"), "{epilogue}");
+    assert!(!epilogue.contains("name what was elided"), "{epilogue}");
 }
