@@ -391,8 +391,16 @@ fn classify_resolve(
 ) -> RootStatus {
     use codegraph_core::IndexPathsError;
     match resolved {
+        // An index is a published namespace, not merely a file: a stray, empty or
+        // schema-less `codegraph.db` with no state record (an interrupted copy, a
+        // stray touch) must not capture the upward walk for every project below
+        // it (upstream #1895). The CLI's ancestor walk uses the same authority,
+        // which reads only the state slots and never opens SQLite.
         Ok(paths) => {
-            if paths.current_db().is_file() {
+            if paths.current_db().is_file()
+                && codegraph_store::Store::extraction_status(&paths)
+                    != codegraph_store::ExtractionStatus::Missing
+            {
                 RootStatus::Indexed
             } else {
                 RootStatus::Absent
@@ -696,6 +704,34 @@ fn percent_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Test fixture: an index in the eyes of root discovery under `paths` — the
+/// namespace created and published as Current, which is what makes a directory
+/// an index (#1895), around a database file holding `db_bytes`.
+#[cfg(test)]
+pub(crate) fn write_index_fixture_at(paths: &codegraph_core::IndexPaths, db_bytes: &[u8]) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let lease = codegraph_store::IndexLease::create_exclusive(paths, deadline, || false)
+        .expect("fixture namespace lease");
+    codegraph_store::publish_index_state(paths, &lease, codegraph_store::StatePhase::Building)
+        .expect("publish fixture building state");
+    std::fs::create_dir_all(paths.current_db().parent().unwrap()).unwrap();
+    std::fs::write(paths.current_db(), db_bytes).unwrap();
+    codegraph_store::publish_index_state(paths, &lease, codegraph_store::StatePhase::Current)
+        .expect("publish fixture current state");
+}
+
+/// [`write_index_fixture_at`] for `project` under the current `CODEGRAPH_DIR`.
+#[cfg(test)]
+pub(crate) fn write_index_fixture(project: &Path, db_bytes: &[u8]) {
+    std::fs::create_dir_all(project).unwrap();
+    let paths = codegraph_core::IndexPaths::resolve(
+        project,
+        std::env::var("CODEGRAPH_DIR").ok().as_deref(),
+    )
+    .expect("fixture project resolves");
+    write_index_fixture_at(&paths, db_bytes);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -723,12 +759,7 @@ mod tests {
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let path =
             std::env::temp_dir().join(format!("cg-mcp-roots-{tag}-{}-{seq}", std::process::id()));
-        // The project dir must exist before `db_path_for` (which resolves the
-        // physical identity) can succeed.
-        std::fs::create_dir_all(&path).unwrap();
-        let db = db_path_for(&path).expect("default project resolves");
-        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
-        std::fs::write(&db, b"placeholder").unwrap();
+        write_index_fixture(&path, b"placeholder");
         TempProject { path }
     }
 
@@ -1140,12 +1171,30 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let paths = codegraph_core::IndexPaths::resolve(&dir, None).expect("resolve default");
+        write_index_fixture_at(&paths, b"placeholder");
+        assert!(matches!(
+            classify_resolve(codegraph_core::IndexPaths::resolve(&dir, None)),
+            RootStatus::Indexed
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A database file with no published namespace is not an index (#1895).
+    #[test]
+    fn classify_resolve_unpublished_database_file_is_absent() {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-roots-classify-unpublished-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = codegraph_core::IndexPaths::resolve(&dir, None).expect("resolve default");
         let db = paths.current_db();
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         std::fs::write(&db, b"placeholder").unwrap();
         assert!(matches!(
             classify_resolve(codegraph_core::IndexPaths::resolve(&dir, None)),
-            RootStatus::Indexed
+            RootStatus::Absent
         ));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1298,10 +1347,37 @@ mod tests {
     }
 
     fn mark_indexed(path: &Path) {
-        std::fs::create_dir_all(path).unwrap();
-        let db = db_path_for(path).expect("indexed fixture path resolves");
-        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
-        std::fs::write(db, b"placeholder").unwrap();
+        write_index_fixture(path, b"placeholder");
+    }
+
+    /// A stray `codegraph.db` with no published namespace — an interrupted
+    /// copy, a stray touch — at a workspace root must not capture discovery:
+    /// the sub-project scan still finds the real index below it (#1895).
+    #[test]
+    fn a_stray_database_file_does_not_capture_root_discovery() {
+        let workspace = unindexed_dir("stray-db");
+        std::fs::create_dir(workspace.path().join(".git")).unwrap();
+        let stray = db_path_for(workspace.path()).expect("workspace resolves");
+        std::fs::create_dir_all(stray.parent().unwrap()).unwrap();
+        std::fs::write(&stray, b"").unwrap();
+        let child = workspace.path().join("service-a");
+        mark_indexed(&child);
+
+        assert!(!db_exists_for(workspace.path()));
+        let resolved = resolve_server_root(workspace.path(), true);
+        assert_eq!(resolved.root.as_deref(), Some(child.as_path()));
+        assert!(resolved.via_subproject_scan);
+
+        let nested = child.join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(
+            resolve_server_root(&nested, false).root.as_deref(),
+            Some(child.as_path())
+        );
+        assert!(matches!(
+            resolve_project_arg(workspace.path().to_str(), None, None),
+            ProjectArg::NotIndexed
+        ));
     }
 
     #[test]
