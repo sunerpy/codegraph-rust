@@ -45,8 +45,11 @@ or required by that guidance.
    in [`docs/equivalence.md`](docs/equivalence.md).
 3. **Stable node IDs.** Symbol IDs are
    `{kind}:{sha256("{filePath}:{kind}:{name}:{line}").hex[..32]}`; file nodes are
-   `file:{relative/path}`. Paths use `/`; lines are 1-based. Never change this
-   formula incidentally.
+   `file:{relative/path}`. Paths use `/`; lines are 1-based. Within one file's
+   extraction, a later declaration that collides with an earlier one at a
+   different column appends `:{column}` (zero-based UTF-16 code units, upstream
+   #1349), so it no longer overwrites the first. Never change this formula
+   incidentally.
 4. **No AI/vector runtime.** Do not add AI, LLM, embedding, vector-database, or
    inference dependencies. `scripts/guardrail.sh` enforces the dependency boundary.
 5. **Project containment.** Managed state stays under the selected project index

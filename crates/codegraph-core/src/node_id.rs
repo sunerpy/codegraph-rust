@@ -1,5 +1,7 @@
 //! Upstream-compatible node and content identifiers.
 
+use std::collections::HashMap;
+
 use sha2::{Digest, Sha256};
 
 use crate::types::NodeKind;
@@ -17,6 +19,50 @@ pub fn generate_node_id(file_path: &str, kind: NodeKind, name: &str, line: u32) 
     let hex = hex_lower(&digest);
 
     format!("{}:{}", kind, &hex[..32])
+}
+
+/// Per-extraction node identities (upstream `NodeIdAllocator`, #1349).
+///
+/// A declaration keeps its [`generate_node_id`] identity unless an EARLIER
+/// declaration of the same extraction already holds that identity at a
+/// different source position — a same-kind, same-name declaration on the same
+/// line, such as a getter/setter pair. The later one then appends
+/// `:{column}`, its zero-based UTF-16 column, instead of overwriting the first
+/// in the store. Revisiting a declaration yields the identity it had.
+#[derive(Debug, Default)]
+pub struct NodeIdAllocator {
+    first_columns: HashMap<String, u32>,
+}
+
+impl NodeIdAllocator {
+    /// The identity of the declaration of `kind`/`name` at `line` (1-based)
+    /// and `utf16_column` (0-based UTF-16 code units).
+    pub fn generate(
+        &mut self,
+        file_path: &str,
+        kind: NodeKind,
+        name: &str,
+        line: u32,
+        utf16_column: u32,
+    ) -> String {
+        let id = generate_node_id(file_path, kind, name, line);
+        let first = *self.first_columns.entry(id.clone()).or_insert(utf16_column);
+        if first == utf16_column {
+            id
+        } else {
+            format!("{id}:{utf16_column}")
+        }
+    }
+}
+
+/// Zero-based UTF-16 column of byte offset `byte` in `source` — the column
+/// unit upstream's identities use, never tree-sitter's byte column.
+pub fn utf16_column(source: &str, byte: usize) -> u32 {
+    let byte = byte.min(source.len());
+    let line_start = source[..byte].rfind('\n').map_or(0, |newline| newline + 1);
+    source
+        .get(line_start..byte)
+        .map_or(0, |prefix| prefix.encode_utf16().count() as u32)
 }
 
 /// Generate the literal file-node ID used by the upstream tree-sitter extractor.
@@ -48,6 +94,39 @@ mod tests {
     use serde::Deserialize;
 
     use super::*;
+
+    #[test]
+    fn collisions_only_suffix_later_distinct_columns() {
+        // Upstream kernel `collision_only_identity_vectors`.
+        let mut ids = NodeIdAllocator::default();
+        let base = generate_node_id("src/a.ts", NodeKind::Function, "foo", 3);
+        for (column, expected) in [
+            (2, base.clone()),
+            (24, format!("{base}:24")),
+            (48, format!("{base}:48")),
+            (24, format!("{base}:24")),
+            (2, base.clone()),
+        ] {
+            assert_eq!(
+                ids.generate("src/a.ts", NodeKind::Function, "foo", 3, column),
+                expected
+            );
+        }
+        assert_eq!(
+            ids.generate("src/a.ts", NodeKind::Function, "bar", 3, 24),
+            generate_node_id("src/a.ts", NodeKind::Function, "bar", 3)
+        );
+    }
+
+    #[test]
+    fn utf16_columns_count_code_units_from_the_line_start() {
+        let source = "x\n/* é😀 */ set";
+        let byte = source.find("set").unwrap();
+        // `/* ` 3, `é` 1, `😀` 2, ` */ ` 4.
+        assert_eq!(utf16_column(source, byte), 10);
+        assert_eq!(utf16_column(source, 0), 0);
+        assert_eq!(utf16_column("ab", 99), 2);
+    }
 
     #[derive(Debug, Deserialize)]
     struct GoldenNode {

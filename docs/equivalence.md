@@ -41,6 +41,14 @@ Inputs are part of the compatibility contract:
 - `line`: 1-based start line. The tree-sitter call site passes
   `node.startPosition.row + 1`.
 
+Same-kind, same-name declarations on one line (a getter/setter pair) hash to
+the same id. Since extraction version 15 the first one, in extraction order,
+keeps it, and every later declaration at a different column appends
+`:{column}`, its zero-based UTF-16 column — the column unit upstream uses, not
+tree-sitter's byte column (`NodeIdAllocator`, upstream #1349). Revisiting the
+same declaration yields the same id, so a declaration that collides with
+nothing keeps exactly the id above.
+
 ## File Node Special Case
 
 Tree-sitter file nodes do not call `generateNodeId()`. The tree-sitter file-node special case uses the literal ID:

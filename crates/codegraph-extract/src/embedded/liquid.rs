@@ -1,4 +1,7 @@
-use codegraph_core::types::{EdgeKind, ExtractionResult, Language, NodeKind};
+use std::cell::RefCell;
+
+use codegraph_core::node_id::{NodeIdAllocator, utf16_column};
+use codegraph_core::types::{EdgeKind, ExtractionResult, Language, Node, NodeKind};
 use regex::Regex;
 
 use crate::embedded::shared::{
@@ -10,6 +13,7 @@ pub struct LiquidExtractor<'a> {
     file_path: &'a str,
     source: &'a str,
     line_starts: Vec<usize>,
+    node_ids: RefCell<NodeIdAllocator>,
 }
 
 impl<'a> LiquidExtractor<'a> {
@@ -18,7 +22,22 @@ impl<'a> LiquidExtractor<'a> {
             file_path,
             source,
             line_starts: line_starts(source),
+            node_ids: RefCell::new(NodeIdAllocator::default()),
         }
+    }
+
+    /// Identify `node`, created at byte `offset`, through the per-file
+    /// allocator: a later same-kind, same-name node on the same line gains a
+    /// column suffix instead of overwriting the first (#1349).
+    fn identify(&self, mut node: Node, offset: usize) -> Node {
+        node.id = self.node_ids.borrow_mut().generate(
+            self.file_path,
+            node.kind,
+            &node.name,
+            node.start_line.max(1) as u32,
+            utf16_column(self.source, offset),
+        );
+        node
     }
 
     pub fn extract(self) -> ExtractionResult {
@@ -73,17 +92,20 @@ impl<'a> LiquidExtractor<'a> {
             let name = cap.get(2).unwrap().as_str();
             let line = line_number_for_offset(&self.line_starts, full.start());
             let col = full.start() as i64 - line_start_for(&self.line_starts, line) as i64;
-            self.push_import_node(result, file_id, name, full.as_str(), line, col);
-            let node = default_node(
-                self.file_path,
-                Language::Liquid,
-                NodeKind::Component,
-                name.to_string(),
-                format!("{}::{}:{}", self.file_path, tag_type, name),
-                line,
-                line,
-                col,
-                col + full.as_str().len() as i64,
+            self.push_import_node(result, file_id, name, full.as_str(), full.start());
+            let node = self.identify(
+                default_node(
+                    self.file_path,
+                    Language::Liquid,
+                    NodeKind::Component,
+                    name.to_string(),
+                    format!("{}::{}:{}", self.file_path, tag_type, name),
+                    line,
+                    line,
+                    col,
+                    col + full.as_str().len() as i64,
+                ),
+                full.start(),
             );
             let node_id = node.id.clone();
             result.nodes.push(node);
@@ -107,17 +129,20 @@ impl<'a> LiquidExtractor<'a> {
             let name = cap.get(1).unwrap().as_str();
             let line = line_number_for_offset(&self.line_starts, full.start());
             let col = full.start() as i64 - line_start_for(&self.line_starts, line) as i64;
-            self.push_import_node(result, file_id, name, full.as_str(), line, col);
-            let node = default_node(
-                self.file_path,
-                Language::Liquid,
-                NodeKind::Component,
-                name.to_string(),
-                format!("{}::section:{}", self.file_path, name),
-                line,
-                line,
-                col,
-                col + full.as_str().len() as i64,
+            self.push_import_node(result, file_id, name, full.as_str(), full.start());
+            let node = self.identify(
+                default_node(
+                    self.file_path,
+                    Language::Liquid,
+                    NodeKind::Component,
+                    name.to_string(),
+                    format!("{}::section:{}", self.file_path, name),
+                    line,
+                    line,
+                    col,
+                    col + full.as_str().len() as i64,
+                ),
+                full.start(),
             );
             let node_id = node.id.clone();
             result.nodes.push(node);
@@ -143,16 +168,19 @@ impl<'a> LiquidExtractor<'a> {
             let start_line = line_number_for_offset(&self.line_starts, full.start());
             let end_line = line_number_for_offset(&self.line_starts, full.end());
             let schema_name = schema_name(content);
-            let mut node = default_node(
-                self.file_path,
-                Language::Liquid,
-                NodeKind::Constant,
-                schema_name.clone(),
-                format!("{}::schema:{}", self.file_path, schema_name),
-                start_line,
-                end_line,
-                full.start() as i64 - line_start_for(&self.line_starts, start_line) as i64,
-                0,
+            let mut node = self.identify(
+                default_node(
+                    self.file_path,
+                    Language::Liquid,
+                    NodeKind::Constant,
+                    schema_name.clone(),
+                    format!("{}::schema:{}", self.file_path, schema_name),
+                    start_line,
+                    end_line,
+                    full.start() as i64 - line_start_for(&self.line_starts, start_line) as i64,
+                    0,
+                ),
+                full.start(),
             );
             node.docstring = None;
             let node_id = node.id.clone();
@@ -168,16 +196,19 @@ impl<'a> LiquidExtractor<'a> {
             let name = cap.get(1).unwrap().as_str();
             let line = line_number_for_offset(&self.line_starts, full.start());
             let col = full.start() as i64 - line_start_for(&self.line_starts, line) as i64;
-            let node = default_node(
-                self.file_path,
-                Language::Liquid,
-                NodeKind::Variable,
-                name.to_string(),
-                format!("{}::{}", self.file_path, name),
-                line,
-                line,
-                col,
-                col + full.as_str().len() as i64,
+            let node = self.identify(
+                default_node(
+                    self.file_path,
+                    Language::Liquid,
+                    NodeKind::Variable,
+                    name.to_string(),
+                    format!("{}::{}", self.file_path, name),
+                    line,
+                    line,
+                    col,
+                    col + full.as_str().len() as i64,
+                ),
+                full.start(),
             );
             let node_id = node.id.clone();
             result.nodes.push(node);
@@ -191,19 +222,23 @@ impl<'a> LiquidExtractor<'a> {
         file_id: &str,
         name: &str,
         signature: &str,
-        line: i64,
-        col: i64,
+        offset: usize,
     ) {
-        let mut node = default_node(
-            self.file_path,
-            Language::Liquid,
-            NodeKind::Import,
-            name.to_string(),
-            format!("{}::import:{}", self.file_path, name),
-            line,
-            line,
-            col,
-            col + signature.len() as i64,
+        let line = line_number_for_offset(&self.line_starts, offset);
+        let col = offset as i64 - line_start_for(&self.line_starts, line) as i64;
+        let mut node = self.identify(
+            default_node(
+                self.file_path,
+                Language::Liquid,
+                NodeKind::Import,
+                name.to_string(),
+                format!("{}::import:{}", self.file_path, name),
+                line,
+                line,
+                col,
+                col + signature.len() as i64,
+            ),
+            offset,
         );
         node.signature = Some(signature.to_string());
         let node_id = node.id.clone();

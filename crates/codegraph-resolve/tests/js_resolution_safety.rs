@@ -620,3 +620,60 @@ fn implements_whose_only_same_named_target_is_a_value_is_dropped() {
     );
     assert!(implements_targets(&project, "BarService").is_empty());
 }
+
+#[test]
+fn same_line_accessors_persist_with_their_own_call_edges() {
+    // Upstream #1349: the getter and setter share kind, name and line; before
+    // the column suffix the setter overwrote the getter in the store.
+    let project = resolve_project(
+        "same-line-accessors",
+        &[(
+            "point.ts",
+            "function read() { return 1; } function write(v: number) {}\n\
+             export class Point { /* é😀 */ get x() { return read(); } set x(v: number) { write(v); }\n\
+             \x20 get y() { return read(); }\n\
+             \x20 set y(v: number) { write(v); }\n\
+             }\n",
+        )],
+    );
+    let store = project.store.as_ref().expect("store");
+    let nodes = store.nodes_by_file_path("point.ts").expect("nodes");
+    let mut x = nodes
+        .iter()
+        .filter(|node| node.name == "x")
+        .collect::<Vec<_>>();
+    x.sort_by_key(|node| node.start_column);
+    assert_eq!(x.len(), 2, "{nodes:#?}");
+    let ids = nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(ids.len(), nodes.len());
+    assert_eq!(nodes.iter().filter(|node| node.name == "y").count(), 2);
+    let class = nodes
+        .iter()
+        .find(|node| node.name == "Point")
+        .expect("class");
+    for accessor in &x {
+        assert!(
+            store
+                .edges_by_target_kind(&accessor.id, Some(EdgeKind::Contains))
+                .expect("contains")
+                .iter()
+                .any(|edge| edge.source == class.id),
+            "{}",
+            accessor.id
+        );
+    }
+    let callee_names = |id: &str| {
+        store
+            .edges_by_source_kind(id, Some(EdgeKind::Calls))
+            .expect("calls")
+            .into_iter()
+            .filter_map(|edge| store.node_by_id(&edge.target).expect("target"))
+            .map(|node| node.name)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(callee_names(&x[0].id), vec!["read"]);
+    assert_eq!(callee_names(&x[1].id), vec!["write"]);
+}

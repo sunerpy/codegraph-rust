@@ -5,7 +5,7 @@
 //! `:580-650` becomes [`TreeSitterWalker::create_node`], `:748-983` maps to
 //! symbol extractors, and `:1872-2632` maps to import/call reference extraction.
 
-use codegraph_core::node_id::{file_node_id, generate_node_id};
+use codegraph_core::node_id::{NodeIdAllocator, file_node_id, utf16_column};
 use codegraph_core::types::{
     Edge, EdgeKind, ExtractionResult, Language, Node, NodeKind, ReferenceSubkind, UnresolvedRef,
 };
@@ -320,6 +320,8 @@ pub struct TreeSitterWalker<'a, 'tree> {
     unresolved_references: Vec<UnresolvedRef>,
     errors: Vec<String>,
     node_stack: Vec<String>,
+    /// Same-line, same-name declarations keep distinct identities (#1349).
+    node_ids: NodeIdAllocator,
     fn_ref_candidates: Vec<(crate::function_ref::FnRefCandidate, String)>,
     /// C++ enclosing `namespace ns { … }` names, prefixed onto contained
     /// symbols' `qualified_name`. Prefix-only (no namespace node) to avoid the
@@ -361,6 +363,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             unresolved_references: Vec::new(),
             errors: Vec::new(),
             node_stack: Vec::new(),
+            node_ids: NodeIdAllocator::default(),
             fn_ref_candidates: Vec::new(),
             namespace_prefix: Vec::new(),
             erlang_last_fn_name: None,
@@ -2305,7 +2308,13 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
 
         let start_line = node.start_position().row as u32 + 1;
-        let id = generate_node_id(self.file_path, kind, name, start_line);
+        let id = self.node_ids.generate(
+            self.file_path,
+            kind,
+            name,
+            start_line,
+            utf16_column(self.source, node.start_byte()),
+        );
         let mut new_node = Node {
             id: id.clone(),
             kind,
