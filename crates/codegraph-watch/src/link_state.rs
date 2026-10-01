@@ -29,9 +29,13 @@ fn kind_name(kind: LinkKind) -> &'static str {
     }
 }
 
+/// The canonical record: one row per link, sorted by logical path.
 fn encode(links: &[FollowedLink]) -> String {
+    let mut links = links.iter().collect::<Vec<_>>();
+    links.sort_by(|left, right| left.relative.cmp(&right.relative));
+    links.dedup_by(|left, right| left.relative == right.relative);
     let rows = links
-        .iter()
+        .into_iter()
         .map(|link| {
             serde_json::json!([
                 link.relative,
@@ -43,16 +47,26 @@ fn encode(links: &[FollowedLink]) -> String {
     serde_json::Value::Array(rows).to_string()
 }
 
-/// `None` for anything that is not exactly the format [`encode`] writes.
+/// `None` for anything that is not exactly the format [`encode`] writes,
+/// including rows out of order or a logical path recorded twice: an ambiguous
+/// record proves no link identity, so it counts as missing.
 fn decode(value: &str) -> Option<BTreeMap<String, (PathBuf, LinkKind)>> {
     let rows: Vec<(String, String, String)> = serde_json::from_str(value).ok()?;
     let mut links = BTreeMap::new();
+    let mut previous: Option<String> = None;
     for (relative, canonical, kind) in rows {
+        if previous
+            .as_ref()
+            .is_some_and(|previous| *previous >= relative)
+        {
+            return None;
+        }
         let kind = match kind.as_str() {
             "file" => LinkKind::File,
             "dir" => LinkKind::Dir,
             _ => return None,
         };
+        previous = Some(relative.clone());
         links.insert(relative, (PathBuf::from(canonical), kind));
     }
     Some(links)
@@ -141,6 +155,21 @@ mod tests {
         for malformed in ["", "{}", "[[\"a\",\"/x\"]]", "[[\"a\",\"/x\",\"socket\"]]"] {
             assert_eq!(decode(malformed), None, "{malformed:?}");
         }
+        // A duplicated or reordered path is ambiguous, so it proves nothing.
+        let duplicated = r#"[["lib","/old","dir"],["lib","/new","dir"]]"#;
+        let reordered = r#"[["z","/z","dir"],["a","/a","dir"]]"#;
+        assert_eq!(decode(duplicated), None);
+        assert_eq!(decode(reordered), None);
+    }
+
+    #[test]
+    fn an_ambiguous_record_rehashes_every_current_link() {
+        // The last duplicate matches the current target; a decoder that kept it
+        // would skip the rehash the earlier, different identity demands.
+        let duplicated = r#"[["lib","/old","dir"],["lib","/new","dir"]]"#;
+        let current = [link("lib", "/new", LinkKind::Dir)];
+        let rehash = RehashUnder::compare(decode(duplicated).as_ref(), &current);
+        assert!(rehash.covers("lib/a.ts"));
     }
 
     #[test]

@@ -439,6 +439,9 @@ impl LinkState {
         fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
             || self.link_paths.contains(relative)
             || (self.watched_dirs.contains(relative) && !path.is_dir())
+            // A file link's target turned into a directory: the link now
+            // reaches a tree the scan must follow.
+            || (self.aliases.contains_key(relative) && path.is_dir())
     }
 }
 
@@ -446,6 +449,19 @@ impl LinkState {
 /// directory, so each watched directory link gets its own recursive watch, up
 /// to this many.
 const MAX_SUPPLEMENTAL_WATCHES: usize = 256;
+
+/// The single warning a watcher gives when its supplemental watches were
+/// capped, however often its link set is re-read.
+fn supplemental_cap_warning(truncated: bool, warned: &mut bool) -> Option<String> {
+    if !truncated || *warned {
+        return None;
+    }
+    *warned = true;
+    Some(format!(
+        "watching only the first {MAX_SUPPLEMENTAL_WATCHES} symlinked directories; \
+         changes below the rest are picked up by the next full sync"
+    ))
+}
 
 /// The supplemental recursive watches for `dir_links`: the first
 /// [`MAX_SUPPLEMENTAL_WATCHES`] in logical order, and whether the cap cut any.
@@ -1038,11 +1054,12 @@ impl ProjectWatcher {
         } else {
             (Vec::new(), false)
         };
-        if supplemental_truncated && let Some(callback) = &options.on_sync_error {
-            callback(format!(
-                "watching only the first {MAX_SUPPLEMENTAL_WATCHES} symlinked directories; \
-                 changes below the rest are picked up by the next full sync"
-            ));
+        let mut supplemental_cap_warned = false;
+        if let Some(warning) =
+            supplemental_cap_warning(supplemental_truncated, &mut supplemental_cap_warned)
+            && let Some(callback) = &options.on_sync_error
+        {
+            callback(warning);
         }
 
         // Build the OS watcher and register the pruned watch set BEFORE spawning
@@ -1169,6 +1186,7 @@ impl ProjectWatcher {
                 known_dirs,
                 link_state,
                 supplemental,
+                supplemental_cap_warned,
                 lock_contention_budget,
                 lock_recovery_interval,
             });
@@ -1392,6 +1410,7 @@ struct EventLoopCtx {
     known_dirs: BTreeSet<String>,
     link_state: LinkState,
     supplemental: Vec<(String, PathBuf)>,
+    supplemental_cap_warned: bool,
     lock_contention_budget: Duration,
     lock_recovery_interval: Duration,
 }
@@ -1413,6 +1432,7 @@ fn event_loop(ctx: EventLoopCtx) {
         mut known_dirs,
         mut link_state,
         mut supplemental,
+        mut supplemental_cap_warned,
         lock_contention_budget,
         lock_recovery_interval,
     } = ctx;
@@ -1423,7 +1443,6 @@ fn event_loop(ctx: EventLoopCtx) {
     // per-path list (one full sync instead of N incremental ones) yet still
     // flushes exactly once, on the same debounce deadline.
     let mut full_sync_pending = false;
-    let mut supplemental_cap_warned = false;
     loop {
         let message = match deadline {
             Some(when) => match rx.recv_timeout(when.saturating_duration_since(Instant::now())) {
@@ -1556,7 +1575,19 @@ fn event_loop(ctx: EventLoopCtx) {
                                     .iter()
                                     .filter_map(|dir| runtime_scope.policy.normalize_relative(dir)),
                             );
-                            link_topology_changed |= saw_link;
+                            if saw_link {
+                                // The directory may add no pending file, yet the
+                                // full sync it owes must still run on the deadline.
+                                link_topology_changed = true;
+                                let now = epoch_millis();
+                                pending
+                                    .entry(relative.clone())
+                                    .and_modify(|info| info.last_seen_ms = now)
+                                    .or_insert(PendingInfo {
+                                        first_seen_ms: now,
+                                        last_seen_ms: now,
+                                    });
+                            }
                         }
                     }
                     if runtime_scope.policy.should_handle_file(&relative)
@@ -1601,16 +1632,11 @@ fn event_loop(ctx: EventLoopCtx) {
                     ) else {
                         break;
                     };
-                    if truncated
-                        && !supplemental_cap_warned
+                    if let Some(warning) =
+                        supplemental_cap_warning(truncated, &mut supplemental_cap_warned)
                         && let Some(callback) = &on_sync_error
                     {
-                        supplemental_cap_warned = true;
-                        callback(format!(
-                            "watching only the first {MAX_SUPPLEMENTAL_WATCHES} symlinked \
-                             directories; changes below the rest are picked up by the next \
-                             full sync"
-                        ));
+                        callback(warning);
                     }
                     known_dirs.retain(|dir| !link_state.watched_dirs.contains(dir));
                     known_dirs.extend(next_links.watched_dirs.iter().cloned());
@@ -4056,5 +4082,69 @@ mod tests {
             "the retargeted link resolves to its new target"
         );
         assert!(removed, "removing a link schedules a full sync");
+    }
+
+    #[test]
+    fn symlink_cap_warning_is_given_once_per_watcher() {
+        let mut warned = false;
+        assert!(supplemental_cap_warning(false, &mut warned).is_none());
+        assert!(supplemental_cap_warning(true, &mut warned).is_some());
+        assert!(supplemental_cap_warning(true, &mut warned).is_none());
+        // A watcher that warned at startup never warns again in its loop.
+        let mut warned_at_startup = true;
+        assert!(supplemental_cap_warning(true, &mut warned_at_startup).is_none());
+    }
+
+    /// A real directory moved in with a link (and sources) inside adds no
+    /// pending file of its own; the full sync it owes must still run.
+    #[test]
+    fn symlink_moved_in_directory_holding_a_link_schedules_a_full_sync() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-symlink-moved-in");
+        let staging = LinkTarget::new("moved-in-staging");
+        let target = LinkTarget::new("moved-in-target");
+        fs::write(target.0.join("t.ts"), "export const t = 1;\n").unwrap();
+        fs::create_dir_all(staging.0.join("pkg")).unwrap();
+        fs::write(staging.0.join("pkg/a.ts"), "export const a = 1;\n").unwrap();
+        if !symlink_at(&target.0, &staging.0.join("pkg/linked"), true) {
+            return;
+        }
+        let (watcher, _, full) = recording_watcher(dir.path());
+        fs::rename(staging.0.join("pkg"), dir.path().join("pkg")).unwrap();
+        let scheduled = wait_until(|| full.load(AtomicOrdering::SeqCst) >= 1);
+        watcher.stop();
+        assert!(
+            scheduled,
+            "a moved-in directory holding a link schedules a full sync"
+        );
+    }
+
+    #[test]
+    fn symlink_file_target_turning_into_a_directory_schedules_a_full_sync() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-symlink-retype");
+        fs::create_dir_all(dir.path().join("src/real")).unwrap();
+        fs::write(dir.path().join("src/real/a.ts"), "export const a = 1;\n").unwrap();
+        if !symlink_at(
+            &dir.path().join("src/real/a.ts"),
+            &dir.path().join("src/afile.ts"),
+            false,
+        ) {
+            return;
+        }
+        let (watcher, _, full) = recording_watcher(dir.path());
+        fs::remove_file(dir.path().join("src/real/a.ts")).unwrap();
+        fs::create_dir_all(dir.path().join("src/real/a.ts")).unwrap();
+        fs::write(
+            dir.path().join("src/real/a.ts/inner.ts"),
+            "export const i = 1;\n",
+        )
+        .unwrap();
+        let scheduled = wait_until(|| full.load(AtomicOrdering::SeqCst) >= 1);
+        watcher.stop();
+        assert!(
+            scheduled,
+            "a file link whose target became a directory now reaches a tree the scan follows"
+        );
     }
 }
