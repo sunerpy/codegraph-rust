@@ -571,6 +571,49 @@ impl Store {
         rows.collect()
     }
 
+    /// Whether any node's name, qualified name, signature or docstring holds an
+    /// FTS token starting with `word` — the posting-list half of upstream's
+    /// `getExploreMissDiagnostics` (#1904). `word` must be letters/digits only.
+    pub fn fts_any_column_has_prefix(&self, word: &str) -> rusqlite::Result<bool> {
+        self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM nodes_fts WHERE nodes_fts MATCH ?1)",
+            params![format!(
+                "{{name qualified_name signature docstring}} : \"{word}\"*"
+            )],
+            |row| row.get::<_, bool>(0),
+        )
+    }
+
+    /// Up to `limit` names of non-file, non-import nodes whose NAME holds an FTS
+    /// token starting with one of `words` (letters/digits only), in index order
+    /// (#1904's retry candidates).
+    pub fn fts_name_prefix_names(
+        &self,
+        words: &[String],
+        limit: usize,
+    ) -> rusqlite::Result<Vec<String>> {
+        if words.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pattern = format!(
+            "name : ({})",
+            words
+                .iter()
+                .map(|word| format!("\"{word}\"*"))
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        );
+        let mut stmt = self.conn.prepare(
+            "SELECT n.name FROM nodes_fts JOIN nodes n ON n.rowid = nodes_fts.rowid \
+             WHERE nodes_fts MATCH ?1 AND n.kind NOT IN ('file', 'import') \
+             ORDER BY nodes_fts.rowid LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![pattern, limit as i64], |row| {
+            row.get::<_, String>(0)
+        })?;
+        rows.collect()
+    }
+
     /// Ports `getAllNodeNames` from `upstream db/queries.ts:1655-1661`.
     /// `SELECT DISTINCT name FROM nodes` — the candidate name set for fuzzy fallback.
     pub fn all_node_names(&self) -> rusqlite::Result<Vec<String>> {

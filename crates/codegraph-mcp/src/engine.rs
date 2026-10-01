@@ -10,7 +10,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use codegraph_core::config::Config;
@@ -1253,8 +1253,9 @@ impl CodeGraphEngine {
                 .as_ref()
                 .map(|spans| format!(" (no indexed file uniquely matches {spans})"))
                 .unwrap_or_default();
+            let explanation = self.explore_miss_explanation(&match_query);
             return Ok(ToolResult::text(format!(
-                "No relevant code found for \"{query}\"{miss_note}"
+                "No relevant code found for \"{query}\"{miss_note}{explanation}"
             )));
         }
 
@@ -1457,6 +1458,129 @@ impl CodeGraphEngine {
         let (output, kept_prefix_len) = cut_at_section_boundary(&output, hard_ceiling);
         self.mark_surviving_explore_citations(&lines, &rendered_sources, kept_prefix_len);
         Ok(ToolResult::text(output))
+    }
+
+    /// Why an explore came back empty (upstream #1904). Explore matches names
+    /// and indexed code words lexically, not by meaning, so the answer names
+    /// the checked words that matched nothing, those that matched but scored
+    /// out, and indexed names sharing a word to retry with — from two bounded
+    /// FTS queries and the query-time name segments (the golden-neutral
+    /// substitute for upstream's `name_segment_vocab`).
+    fn explore_miss_explanation(&self, match_query: &str) -> String {
+        let mut explanation = "\n\nExplore matches symbol/file names and indexed code words lexically, not by meaning.".to_string();
+        if self
+            .store
+            .counts()
+            .is_ok_and(|counts| counts.node_count == 0)
+        {
+            explanation.push_str("\nThis project has nothing indexed.");
+            return explanation;
+        }
+        let miss = self.explore_miss_diagnostics(match_query);
+        explanation.push_str("\nChecked indexed names, signatures, docstrings (FTS prefixes) and live name segments; not all source text.");
+        if miss.limited {
+            explanation.push_str("\nWord check limited to 16 words of at most 64 characters.");
+        }
+        let unmatched = capped_word_list(&miss.unmatched, 250);
+        explanation.push_str(&format!(
+            "\nNo lexical matches for checked words: {}.",
+            if unmatched.is_empty() {
+                "(none)"
+            } else {
+                &unmatched
+            }
+        ));
+        if !miss.matched.is_empty() {
+            explanation.push_str(&format!(
+                "\nMatched indexed words: {}; these did not yield a relevant result after filtering/scoring.",
+                capped_word_list(&miss.matched, 200)
+            ));
+        }
+        if miss.candidates.is_empty() {
+            explanation.push_str("\nNo shared-word symbol candidates found; retry codegraph_explore with literal symbol/file names or code terms.");
+        } else {
+            explanation.push_str(&format!(
+                "\nCandidates to retry with codegraph_explore (shared words, not confirmed answers): {}",
+                capped_word_list(&miss.candidates, 350)
+            ));
+        }
+        explanation
+    }
+
+    /// The lexical evidence behind [`Self::explore_miss_explanation`]: at most
+    /// 16 query words of at most 64 characters are checked against FTS
+    /// prefixes and live name segments; up to 12 retry candidates.
+    fn explore_miss_diagnostics(&self, query: &str) -> ExploreMissDiagnostics {
+        static WORD: OnceLock<regex::Regex> = OnceLock::new();
+        let word_re =
+            WORD.get_or_init(|| regex::Regex::new(r"[\p{L}\p{N}]+").expect("explore miss word"));
+        let mut words: Vec<String> = Vec::new();
+        for word in word_re.find_iter(query) {
+            let word = word.as_str().to_lowercase();
+            if !words.contains(&word) {
+                words.push(word);
+            }
+        }
+        let checked = words
+            .iter()
+            .filter(|word| word.chars().count() <= 64)
+            .take(16)
+            .cloned()
+            .collect::<Vec<_>>();
+        let limited = checked.len() != words.len();
+        let mut diagnostics = ExploreMissDiagnostics {
+            limited,
+            ..ExploreMissDiagnostics::default()
+        };
+        if checked.is_empty() {
+            return diagnostics;
+        }
+        let names = self
+            .store
+            .distinct_non_file_node_names()
+            .unwrap_or_default();
+        let mut segment_hits: BTreeSet<String> = BTreeSet::new();
+        let mut candidates: Vec<String> = Vec::new();
+        for (name, _) in &names {
+            let segments = codegraph_graph::segments::split_identifier_segments(name);
+            let mut shares = false;
+            for segment in segments {
+                if checked.contains(&segment) {
+                    segment_hits.insert(segment);
+                    shares = true;
+                }
+            }
+            if shares && candidates.len() < 12 {
+                candidates.push(name.clone());
+            }
+        }
+        for word in checked {
+            let matched = segment_hits.contains(&word)
+                || self.store.fts_any_column_has_prefix(&word).unwrap_or(false);
+            if matched {
+                diagnostics.matched.push(word);
+            } else {
+                diagnostics.unmatched.push(word);
+            }
+        }
+        let checked_words = diagnostics
+            .matched
+            .iter()
+            .chain(&diagnostics.unmatched)
+            .cloned()
+            .collect::<Vec<_>>();
+        for name in self
+            .store
+            .fts_name_prefix_names(&checked_words, 12)
+            .unwrap_or_default()
+        {
+            if !candidates.contains(&name) {
+                candidates.push(name);
+            }
+        }
+        candidates.truncate(12);
+        diagnostics.candidates = candidates;
+        diagnostics
     }
 
     /// Render one file's source section under the per-file budget. Small files
@@ -3381,6 +3505,36 @@ impl Cluster {
     }
 }
 
+/// What an empty explore's diagnostics found (upstream #1904).
+#[derive(Debug, Default)]
+struct ExploreMissDiagnostics {
+    matched: Vec<String>,
+    unmatched: Vec<String>,
+    candidates: Vec<String>,
+    limited: bool,
+}
+
+/// Backticked words joined by `, `, keeping whole words up to `cap` (UTF-16
+/// units, as upstream measures) and marking a cut with ` …`.
+fn capped_word_list(words: &[String], cap: usize) -> String {
+    let list = |words: &[String]| {
+        words
+            .iter()
+            .map(|word| format!("`{word}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut kept = 0;
+    while kept < words.len() && list(&words[..=kept]).encode_utf16().count() <= cap {
+        kept += 1;
+    }
+    let mut out = list(&words[..kept]);
+    if kept < words.len() {
+        out.push_str(" …");
+    }
+    out
+}
+
 /// An indexed symbol a trim left out of a rendered file (#1711).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ElidedSymbol {
@@ -4725,6 +4879,80 @@ mod tests {
             })
             .collect();
         assert!(format_gap_marker("a.ts", &many).contains("s5 (a.ts:45), +2 more"));
+    }
+
+    /// An empty explore explains itself lexically (upstream #1904): which
+    /// checked words matched nothing, which matched but scored out, and the
+    /// indexed names sharing a word to retry with.
+    #[test]
+    fn empty_explore_explains_lexical_misses_and_offers_shared_word_candidates() {
+        let mut engine = test_engine();
+        put_indexed_source(
+            &engine,
+            "src/a.ts",
+            "function explainHowThingsWork() {\n  return 1;\n}\n",
+            Language::TypeScript,
+            1,
+        );
+        put_nodes(
+            &mut engine,
+            &[node_lang(
+                "explainHowThingsWork",
+                "explainHowThingsWork",
+                "src/a.ts",
+                1,
+                3,
+                NodeKind::Function,
+                Language::TypeScript,
+            )],
+        );
+        let explore = |query: &str| {
+            text_of(&engine.execute("codegraph_explore", &serde_json::json!({ "query": query })))
+        };
+
+        let text = explore("how do we stop users signing up too fast");
+        assert!(text.contains("No relevant code found"), "{text}");
+        assert!(text.contains("lexically, not by meaning"), "{text}");
+        let line = |prefix: &str| {
+            text.lines()
+                .find(|line| line.starts_with(prefix))
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert!(line("No lexical matches").contains("`signing`"), "{text}");
+        assert!(line("Matched indexed words").contains("`how`"), "{text}");
+        assert!(
+            line("Candidates to retry with codegraph_explore").contains("`explainHowThingsWork`"),
+            "{text}"
+        );
+
+        let text = explore("zebra quantum");
+        assert!(
+            text.contains("No lexical matches for checked words: `zebra`, `quantum`."),
+            "{text}"
+        );
+        assert!(
+            text.contains("No shared-word symbol candidates found"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn empty_explore_on_an_empty_index_says_so() {
+        let engine = test_engine();
+        let text = text_of(&engine.execute(
+            "codegraph_explore",
+            &serde_json::json!({ "query": "signup throttle" }),
+        ));
+        assert!(text.contains("This project has nothing indexed"), "{text}");
+    }
+
+    #[test]
+    fn capped_word_lists_keep_whole_words_and_mark_the_cut() {
+        let words = ["alpha", "beta", "gamma"].map(String::from);
+        assert_eq!(capped_word_list(&words, 100), "`alpha`, `beta`, `gamma`");
+        assert_eq!(capped_word_list(&words, 15), "`alpha`, `beta` …");
+        assert_eq!(capped_word_list(&words, 3), " …");
     }
 
     /// The header prefers the symbols the trim cut, in source order, so
