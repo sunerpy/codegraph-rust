@@ -370,6 +370,12 @@ plus windows on the anchored line and on its calls into the other symbols the
 query names. A named neighbour that no longer fits beside it is listed in the
 file header instead.
 
+Each file's source is held to a per-file ceiling of 1.5 × the tier's per-file
+budget. A file the query names (by path, by an exact target, or by a symbol it
+defines) that this ceiling clipped is rendered again into whatever budget the
+rest of the response left unspent, so a question about one file can use the
+whole response while every other file keeps exactly the section it was given.
+
 Explore also resolves prose and camelCase query segments against indexed symbol
 names, then merges the resulting callable, Variable, and Constant names as
 dampened exact seeds. This recovers names such as `feedAtBottom` from "feed

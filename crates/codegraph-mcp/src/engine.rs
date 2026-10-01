@@ -1353,9 +1353,13 @@ impl CodeGraphEngine {
         // list (`tools.ts:2483-2905`).
         let mut total_chars: usize = lines.join("\n").len();
         let mut files_included = 0usize;
-        let mut any_file_trimmed = false;
+        let mut budget_dropped = false;
         let mut excluded_files: Vec<&String> = Vec::new();
         let mut rendered_sources: Vec<(String, usize)> = Vec::new();
+        let mut section_lines: Vec<usize> = Vec::new();
+        // Named files whose per-file ceiling clipped them, with what a second
+        // render needs: `(line index, path, focuses, exact focus)`.
+        let mut named_clipped: Vec<(usize, &String, Vec<usize>, Vec<BodyFocus>)> = Vec::new();
         let precise_tokens = precise_query_tokens(&match_query);
         let question_ids = subgraph.question_ids(&precise_tokens);
         let indexed_file_count = self.store.counts().ok().map(|c| c.file_count);
@@ -1406,6 +1410,7 @@ impl CodeGraphEngine {
                 funded_headroom,
                 focuses: &focuses,
                 exact_focus: &exact_focus,
+                lift_file_cap: false,
                 drifted: possibly_drifted,
             };
             let rendered = self.render_explore_file(&subgraph, file_path, &file_lines, &lang, &ctx);
@@ -1418,23 +1423,87 @@ impl CodeGraphEngine {
             // expression appears at the accumulator below, so the admission test
             // and the running total cannot disagree.
             if total_chars + rendered.section.len() + 1 > effective_budget {
-                any_file_trimmed = true;
+                budget_dropped = true;
                 excluded_files.push(file_path);
                 continue;
-            }
-            if rendered.section.contains("... (gap) ...")
-                || rendered.section.contains("more (signatures elided)")
-            {
-                any_file_trimmed = true;
             }
             let section_len = rendered.section.len();
             if rendered.source_emitted {
                 rendered_sources.push(((*file_path).clone(), lines.len()));
             }
+            let named = subgraph.is_pinned(file_path)
+                || subgraph.holds_exact(file_path)
+                || !focuses.is_empty();
+            if rendered.clipped && named {
+                named_clipped.push((lines.len(), file_path, focuses, exact_focus));
+            }
+            section_lines.push(lines.len());
             lines.push(rendered.section);
             total_chars += section_len + 1;
             files_included += 1;
         }
+
+        // A file the query NAMED — by path, or by a symbol it defines — that its
+        // per-file ceiling clipped is rendered again into what the response left
+        // unspent (upstream #2068), in file order. Only that: every other file
+        // keeps exactly the section it was given, and the pointer list below
+        // keeps the room it would have had. Where nothing is spare a named file
+        // renders exactly as before.
+        let pointer_candidates: Vec<String> =
+            if budget.include_additional_files && !excluded_files.is_empty() {
+                excluded_files
+                    .iter()
+                    .map(|file_path| {
+                        format!("- {file_path}: {}", subgraph.file_node_locations(file_path))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        let pointer_reserve: usize = fit_pointer_lines(
+            &pointer_candidates,
+            effective_budget.saturating_sub(total_chars),
+        )
+        .0
+        .iter()
+        .map(|line| line.len() + 1)
+        .sum();
+        let mut spare = effective_budget
+            .saturating_sub(total_chars)
+            .saturating_sub(pointer_reserve);
+        for (line_index, file_path, focuses, exact_focus) in &named_clipped {
+            if spare == 0 {
+                break;
+            }
+            let source = self.project_source(file_path);
+            let Some(content) = source.content.clone() else {
+                continue;
+            };
+            let file_lines: Vec<&str> = content.split('\n').collect();
+            let lang = subgraph.file_language(file_path);
+            let given = lines[*line_index].len();
+            let ctx = RenderCtx {
+                budget: &budget,
+                funded_headroom: given + spare,
+                focuses,
+                exact_focus,
+                lift_file_cap: true,
+                drifted: source.is_possibly_drifted(),
+            };
+            let grown = self.render_explore_file(&subgraph, file_path, &file_lines, &lang, &ctx);
+            let len = grown.section.len();
+            if !grown.source_emitted || len <= given || len > given + spare {
+                continue;
+            }
+            spare -= len - given;
+            total_chars += len - given;
+            lines[*line_index] = grown.section;
+        }
+        let any_file_trimmed = budget_dropped
+            || section_lines.iter().any(|&index| {
+                lines[index].contains("... (gap) ...")
+                    || lines[index].contains("more (signatures elided)")
+            });
 
         // "Additional relevant files (not shown)" — the excluded set, so the
         // agent can request specifics. Gated by the budget (`tools.ts:2910-2927`).
@@ -1445,14 +1514,10 @@ impl CodeGraphEngine {
             // not use, so however long the pointer list is it cannot push the
             // response past its budget. The frame and the tail are already paid
             // for by the reserve and so are not charged here.
-            let candidates: Vec<String> = excluded_files
-                .iter()
-                .map(|file_path| {
-                    format!("- {file_path}: {}", subgraph.file_node_locations(file_path))
-                })
-                .collect();
-            let (pointer_lines, unlisted) =
-                fit_pointer_lines(&candidates, effective_budget.saturating_sub(total_chars));
+            let (pointer_lines, unlisted) = fit_pointer_lines(
+                &pointer_candidates,
+                effective_budget.saturating_sub(total_chars),
+            );
             lines.extend(pointer_lines);
             // The TRUE unlisted count — those dropped by elasticity plus those
             // dropped by the file cap — so a file the response did not render is
@@ -1644,6 +1709,7 @@ impl CodeGraphEngine {
                         "#### {file_path} — {names} · ⚠ changed since last index sync; source below is the full current file\n\n```{lang}\n{numbered}\n```\n"
                     ),
                     source_emitted: true,
+                    clipped: false,
                 };
             }
             return ExploreFileRender {
@@ -1651,6 +1717,7 @@ impl CodeGraphEngine {
                     "#### {file_path} — ⚠ changed on disk after the last index sync — source omitted because indexed line ranges are unsafe and the current file exceeds the {FILE_MODE_MAX_LINES}-line whole-file cap. Read this file directly.\n"
                 ),
                 source_emitted: false,
+                clipped: false,
             };
         }
 
@@ -1675,6 +1742,7 @@ impl CodeGraphEngine {
                 return ExploreFileRender {
                     section,
                     source_emitted: true,
+                    clipped: false,
                 };
             }
             // (2) Unaffordable but owning NO focus and no exact target ⇒ also
@@ -1685,6 +1753,7 @@ impl CodeGraphEngine {
                 return ExploreFileRender {
                     section,
                     source_emitted: true,
+                    clipped: false,
                 };
             }
             // (3) Unaffordable AND owning a focus or an exact target ⇒ fall
@@ -1777,6 +1846,7 @@ impl CodeGraphEngine {
             return ExploreFileRender {
                 section: String::new(),
                 source_emitted: false,
+                clipped: false,
             };
         }
 
@@ -1960,9 +2030,12 @@ impl CodeGraphEngine {
             + lang.len()
             + SECTION_FENCE_CHARS
             + SECTION_GAP_TAIL_CHARS;
-        let ceiling = ((budget.max_chars_per_file as f64 * 1.5).round() as usize)
-            .min(ctx.funded_headroom)
-            .saturating_sub(section_frame);
+        let file_cap = if ctx.lift_file_cap {
+            ctx.funded_headroom
+        } else {
+            ((budget.max_chars_per_file as f64 * 1.5).round() as usize).min(ctx.funded_headroom)
+        };
+        let ceiling = file_cap.saturating_sub(section_frame);
         // A member the query asked for — a root or a protected focus — rather
         // than incidental context that merely sits within `gap_threshold` of one
         // (#2062).
@@ -2298,7 +2371,8 @@ impl CodeGraphEngine {
         let file_index_nodes = self.store.nodes_by_file_path(file_path).unwrap_or_default();
         let mut file_section =
             join_parts_with_named_gaps(file_path, &parts, &file_index_nodes, spare);
-        if chosen_count < clusters.len() || any_cluster_windowed {
+        let clipped = chosen_count < clusters.len() || any_cluster_windowed;
+        if clipped {
             file_section.push_str("\n\n... (gap) ...");
         }
 
@@ -2323,6 +2397,7 @@ impl CodeGraphEngine {
         ExploreFileRender {
             section: format!("{header}\n\n```{lang}\n{file_section}\n```\n"),
             source_emitted: true,
+            clipped,
         }
     }
 
@@ -2884,7 +2959,7 @@ impl CodeGraphEngine {
         file_path: &str,
         anchors: &[QueryLineAnchor],
         question_ids: &HashSet<String>,
-    ) -> Vec<(usize, usize, Vec<usize>)> {
+    ) -> Vec<BodyFocus> {
         let mut out = Vec::new();
         for id in &subgraph.exact_ids {
             let Some(n) = subgraph.node(id) else {
@@ -3540,6 +3615,10 @@ struct SourceProbe {
 struct ExploreFileRender {
     section: String,
     source_emitted: bool,
+    /// The per-file ceiling cut something cluster selection wanted: a cluster
+    /// was dropped or windowed. Only such a render can grow when a named file
+    /// is given the response's unspent budget (#2068).
+    clipped: bool,
 }
 
 impl SourceProbe {
@@ -3944,6 +4023,10 @@ impl ExploreSubgraph {
     }
 }
 
+/// An exact target's `(start, end, focus lines)`: where its body sits and the
+/// lines a window of it must still reach (#2063).
+type BodyFocus = (usize, usize, Vec<usize>);
+
 /// Per-file render state for one iteration of `handle_explore`'s file loop.
 ///
 /// These cannot live in [`ExploreOutputBudget`]: that struct is `Copy` and built
@@ -3965,7 +4048,11 @@ struct RenderCtx<'a> {
     focuses: &'a [usize],
     /// This file's exact targets as `(start, end, body focus lines)`, from
     /// [`CodeGraphEngine::exact_body_focus`].
-    exact_focus: &'a [(usize, usize, Vec<usize>)],
+    exact_focus: &'a [BodyFocus],
+    /// Bound the section by `funded_headroom` alone, not also by the per-file
+    /// ceiling: set only when a named file is re-rendered into the budget the
+    /// rest of the response left unspent (#2068).
+    lift_file_cap: bool,
     drifted: bool,
 }
 
@@ -5353,6 +5440,7 @@ mod tests {
             funded_headroom: budget.max_output_chars.saturating_sub(1),
             focuses,
             exact_focus: &[],
+            lift_file_cap: false,
             drifted: false,
         }
     }
@@ -5925,6 +6013,7 @@ mod tests {
             funded_headroom: whole.len() - 1,
             focuses: &[],
             exact_focus: &[],
+            lift_file_cap: false,
             drifted: false,
         };
         let unaffordable_no_focus = engine
