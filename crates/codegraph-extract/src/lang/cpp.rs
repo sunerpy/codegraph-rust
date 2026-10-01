@@ -211,105 +211,132 @@ pub fn parse_cpp_constructor_reference_name(name: &str) -> Option<(&str, usize)>
     Some((type_name, arity.parse().ok()?))
 }
 
-/// Return the accepted positional-argument range for a constructor signature.
-///
-/// Constructor nodes store only their raw `parameter_list` as `signature`, so
-/// resolution can distinguish overloads without reparsing source files for
-/// every call. Nested delimiters and lexically-masked literals/comments do not
-/// split parameters; defaults lower the minimum accepted arity. Parameter packs
-/// deliberately return `None`: proving their overload semantics requires more
-/// type information than the graph carries, so resolution must fail closed.
-pub fn cpp_constructor_arity_range(signature: &str) -> Option<(usize, usize)> {
-    let signature = signature.trim();
-    let inner = signature.strip_prefix('(')?.strip_suffix(')')?.trim();
-    if inner.is_empty() || inner == "void" {
-        return Some((0, 0));
-    }
-    if inner.contains("...") {
-        return None;
-    }
-
-    let mask = cpp_code_mask(inner);
-    let bytes = inner.as_bytes();
-    let mut round = 0usize;
-    let mut square = 0usize;
-    let mut brace = 0usize;
-    let mut angle = 0usize;
-    let mut start = 0usize;
-    let mut spans = Vec::new();
-    for (index, byte) in bytes.iter().copied().enumerate() {
-        if !mask[index] {
-            continue;
-        }
-        match byte {
-            b'(' => round += 1,
-            b')' => round = round.checked_sub(1)?,
-            b'[' => square += 1,
-            b']' => square = square.checked_sub(1)?,
-            b'{' => brace += 1,
-            b'}' => brace = brace.checked_sub(1)?,
-            // In a parameter list, angle brackets overwhelmingly delimit a
-            // template type. If a default expression uses comparison operators
-            // and leaves this unbalanced, the final balance check rejects the
-            // signature rather than guessing an overload.
-            b'<' => angle += 1,
-            b'>' if angle > 0 => angle -= 1,
-            b',' if round == 0 && square == 0 && brace == 0 && angle == 0 => {
-                spans.push((start, index));
-                start = index + 1;
-            }
-            _ => {}
-        }
-    }
-    if round != 0 || square != 0 || brace != 0 || angle != 0 {
-        return None;
-    }
-    spans.push((start, bytes.len()));
-
-    let mut required = 0usize;
-    for (start, end) in &spans {
-        let parameter = inner.get(*start..*end)?.trim();
-        if parameter.is_empty() {
-            return None;
-        }
-        if !has_top_level_default(parameter) {
-            required += 1;
-        }
-    }
-    Some((required, spans.len()))
+/// A constructor's overload shape (upstream `constructorShape`, #1839): its
+/// parameter types with names and defaults stripped — the key a prototype and
+/// its out-of-line definition share — and the argument counts it admits
+/// (defaults lower the minimum).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CppConstructorShape {
+    pub key: String,
+    pub min: usize,
+    pub max: usize,
 }
 
-fn has_top_level_default(parameter: &str) -> bool {
-    let mask = cpp_code_mask(parameter);
-    let bytes = parameter.as_bytes();
-    let mut round = 0usize;
-    let mut square = 0usize;
-    let mut brace = 0usize;
-    let mut angle = 0usize;
-    for (index, byte) in bytes.iter().copied().enumerate() {
-        if !mask[index] {
+/// The overload shape of a constructor signature (`(int value = 7)`, or a
+/// prototype's `(int value = 7);`), or `None` when it cannot be read: brackets
+/// that do not balance, or a comparison in a default argument, which would be
+/// taken for a default or a template bracket. A parameter pack is unreadable
+/// too: its overload semantics need more type information than the graph
+/// carries. Upstream admits a pack unbounded; this port declines the overload
+/// set instead, so a pack never lets a lone non-pack overload look unique.
+pub fn cpp_constructor_shape(signature: &str) -> Option<CppConstructorShape> {
+    let signature = signature.trim();
+    let signature = signature.strip_suffix(';').unwrap_or(signature).trim_end();
+    let text = signature.strip_prefix('(')?.strip_suffix(')')?.trim();
+    if text.is_empty() || text == "void" {
+        return Some(CppConstructorShape {
+            key: String::new(),
+            min: 0,
+            max: 0,
+        });
+    }
+    // Top-level commas only: `std::map<K, V>`, `int (*cb)(int, int)` and
+    // `T x = f(a, b)` all nest theirs.
+    let bytes = text.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0i64;
+    let mut quote: Option<u8> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if let Some(open) = quote {
+            if byte == b'\\' {
+                i += 1;
+            } else if byte == open {
+                quote = None;
+            }
+            i += 1;
             continue;
         }
         match byte {
-            b'(' => round += 1,
-            b')' => round = round.saturating_sub(1),
-            b'[' => square += 1,
-            b']' => square = square.saturating_sub(1),
-            b'{' => brace += 1,
-            b'}' => brace = brace.saturating_sub(1),
-            b'<' => angle += 1,
-            b'>' if angle > 0 => angle -= 1,
-            b'=' if round == 0 && square == 0 && brace == 0 && angle == 0 => {
-                let previous = bytes.get(index.wrapping_sub(1)).copied();
-                let next = bytes.get(index + 1).copied();
-                if previous != Some(b'=') && next != Some(b'=') {
-                    return true;
-                }
+            b'"' | b'\'' => quote = Some(byte),
+            b'(' | b'<' | b'[' | b'{' => depth += 1,
+            b')' | b'>' | b']' | b'}' => depth -= 1,
+            b',' if depth == 0 => {
+                parts.push(&text[start..i]);
+                start = i + 1;
             }
             _ => {}
         }
+        i += 1;
     }
-    false
+    if depth != 0 || quote.is_some() {
+        return None;
+    }
+    parts.push(&text[start..]);
+    if parts.iter().any(|part| {
+        part.contains(">=") || part.contains("<=") || part.contains("==") || part.contains("!=")
+    }) || parts.iter().any(|part| part.contains("..."))
+    {
+        return None;
+    }
+    let key = parts
+        .iter()
+        .map(|part| {
+            let declared = part.split('=').next().unwrap_or(part).trim();
+            strip_cpp_parameter_name(declared)
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(CppConstructorShape {
+        key,
+        min: parts.iter().filter(|part| !part.contains('=')).count(),
+        max: parts.len(),
+    })
+}
+
+/// Strip an optional parameter name, keeping unnamed built-in types
+/// (`unsigned int`, `long long`) and qualified ones (`const T`, `struct S`).
+/// Complex declarators stay distinct unless their spelling matches: an
+/// uncertain merge must not join two overloads.
+fn strip_cpp_parameter_name(declared: &str) -> &str {
+    static NAMED: OnceLock<Regex> = OnceLock::new();
+    let named = NAMED.get_or_init(|| {
+        Regex::new(r"^(.*[\s*&>])([A-Za-z_][A-Za-z0-9_]*)$").expect("parameter name regex is valid")
+    });
+    let Some(captures) = named.captures(declared) else {
+        return declared;
+    };
+    let prefix = captures.get(1).map_or("", |m| m.as_str());
+    let name = captures.get(2).map_or("", |m| m.as_str());
+    let builtin = matches!(
+        name,
+        "void"
+            | "bool"
+            | "char"
+            | "short"
+            | "int"
+            | "long"
+            | "float"
+            | "double"
+            | "signed"
+            | "unsigned"
+            | "const"
+            | "volatile"
+    );
+    let qualifier = matches!(
+        prefix.trim_end(),
+        "const" | "volatile" | "struct" | "class" | "enum"
+    );
+    if builtin || qualifier {
+        declared
+    } else {
+        prefix
+    }
 }
 
 /// Store signatures only for actual constructors. Broadly adding C++ callable

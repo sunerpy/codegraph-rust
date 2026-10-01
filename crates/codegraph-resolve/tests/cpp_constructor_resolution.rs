@@ -232,3 +232,217 @@ fn lexical_namespace_prefers_nested_or_root_owner_without_path_guessing() {
     assert_eq!(root_targets.len(), 1);
     assert_eq!(root_targets[0].qualified_name, "Widget::Widget");
 }
+
+impl ResolvedGraph {
+    fn function(&self, name: &str) -> &Node {
+        self.nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::Function && node.name == name)
+            .unwrap_or_else(|| panic!("missing function {name}"))
+    }
+
+    /// `kind qualified_name (file)` of a function's `calls` targets, sorted.
+    fn calls(&self, caller: &str) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .call_targets(self.function(caller))
+            .into_iter()
+            .map(|node| {
+                format!(
+                    "{} {} ({})",
+                    node.kind.as_str(),
+                    node.qualified_name,
+                    node.file_path
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The signatures (or names) of a function's `calls` targets, sorted.
+    fn callee_signatures(&self, caller: &str) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .call_targets(self.function(caller))
+            .into_iter()
+            .map(|node| node.signature.clone().unwrap_or_else(|| node.name.clone()))
+            .collect();
+        out.sort();
+        out
+    }
+}
+
+#[test]
+fn a_constructor_is_chosen_in_the_sites_namespace_then_an_enclosing_or_global_one() {
+    let graph = resolve_project(
+        "namespaces",
+        &[(
+            "ns.cpp",
+            concat!(
+                "struct Global { Global() {} };\n",
+                "union Value { Value() {} int x; };\n",
+                "void union_use() { Value v; }\n",
+                "namespace first { struct Widget { Widget() {} }; }\n",
+                "namespace second {\n",
+                "  struct Widget { Widget() {} };\n",
+                "  void local_use() { Widget w; }\n",
+                "  void global_use() { Global g; }\n",
+                "}\n",
+                "void explicit_use() { first::Widget w; }\n",
+            ),
+        )],
+    );
+    assert_eq!(
+        graph.calls("union_use"),
+        vec!["method Value::Value (ns.cpp)"]
+    );
+    assert_eq!(
+        graph.calls("local_use"),
+        vec!["method second::Widget::Widget (ns.cpp)"]
+    );
+    assert_eq!(
+        graph.calls("global_use"),
+        vec!["method Global::Global (ns.cpp)"]
+    );
+    assert_eq!(
+        graph.calls("explicit_use"),
+        vec!["method first::Widget::Widget (ns.cpp)"]
+    );
+}
+
+#[test]
+fn an_overload_is_chosen_by_arity_only_when_exactly_one_admits_the_count() {
+    let graph = resolve_project(
+        "overloads",
+        &[(
+            "overloads.cpp",
+            concat!(
+                "struct Widget {\n",
+                "  Widget() {}\n",
+                "  Widget(int value) {}\n",
+                "  Widget(int a, int b = 2) {}\n",
+                "};\n",
+                "struct Ambiguous {\n",
+                "  Ambiguous(int) {}\n",
+                "  Ambiguous(double) {}\n",
+                "};\n",
+                "void default_use() { Widget w; }\n",
+                "void two_use() { Widget w(1, 2); }\n",
+                "void one_use() { Widget w(1); }\n",
+                "void ambiguous_use(int value) { Ambiguous w(value); }\n",
+            ),
+        )],
+    );
+    assert_eq!(graph.callee_signatures("default_use"), vec!["()"]);
+    assert_eq!(
+        graph.callee_signatures("two_use"),
+        vec!["(int a, int b = 2)"]
+    );
+    // `Widget(int)` and `Widget(int, int = 2)` both admit one argument.
+    assert_eq!(graph.callee_signatures("one_use"), Vec::<String>::new());
+    assert_eq!(
+        graph.callee_signatures("ambiguous_use"),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_default_declared_on_a_prototype_reaches_the_definitions_overload() {
+    let graph = resolve_project(
+        "prototype-defaults",
+        &[
+            (
+                "widget.hpp",
+                "namespace app {\nstruct Widget {\n  Widget(int value = 7);\n  Widget(double value);\n};\nstruct Pair { Pair(int first, int second = 2); };\n}\n",
+            ),
+            (
+                "widget.cpp",
+                "#include \"widget.hpp\"\napp::Widget::Widget(int renamed) {}\napp::Widget::Widget(double renamed) {}\napp::Pair::Pair(int a, int b) {}\n",
+            ),
+            (
+                "use.cpp",
+                "#include \"widget.hpp\"\nint argument(int value) { return value; }\nvoid defaults() { app::Widget item; }\nvoid nested() { app::Pair item(argument(1)); }\nvoid ambiguous() { app::Widget item(1); }\n",
+            ),
+        ],
+    );
+    assert_eq!(
+        graph.calls("defaults"),
+        vec!["method app::Widget::Widget (widget.cpp)"]
+    );
+    assert_eq!(graph.callee_signatures("defaults"), vec!["(int renamed)"]);
+    assert_eq!(
+        graph.calls("nested"),
+        vec![
+            "function argument (use.cpp)",
+            "method app::Pair::Pair (widget.cpp)"
+        ]
+    );
+    assert_eq!(graph.calls("ambiguous"), Vec::<String>::new());
+}
+
+#[test]
+fn an_initializer_list_overload_or_a_parameter_pack_declines() {
+    let graph = resolve_project(
+        "declines",
+        &[(
+            "declines.cpp",
+            concat!(
+                "namespace std { template <class T> class initializer_list {}; }\n",
+                "struct Listed {\n",
+                "  Listed(std::initializer_list<int> values) {}\n",
+                "  Listed(int one) {}\n",
+                "};\n",
+                "struct Forwarding {\n",
+                "  template <class... A> Forwarding(A&&... args) {}\n",
+                "  Forwarding(int one) {}\n",
+                "};\n",
+                "void braced() { Listed l{1}; }\n",
+                "void forwarded() { Forwarding f(1); }\n",
+            ),
+        )],
+    );
+    // Brace-init prefers the initializer_list overload, which needs the
+    // argument types; a pack admits any count, so `Forwarding(int)` is not
+    // the only overload that could take one argument.
+    assert_eq!(graph.calls("braced"), Vec::<String>::new());
+    assert_eq!(graph.calls("forwarded"), Vec::<String>::new());
+}
+
+#[test]
+fn array_elements_reach_their_constructors_and_keep_nested_calls() {
+    let graph = resolve_project(
+        "arrays",
+        &[(
+            "arrays.cpp",
+            concat!(
+                "struct Widget {\n",
+                " Widget() {}\n",
+                " Widget(int value) {}\n",
+                "};\n",
+                "int argument() { return 1; }\n",
+                "void plain() { Widget items[2]; }\n",
+                "void empty() { Widget items[2]{}; }\n",
+                "void elements() { Widget items[3]{{argument()}, {2}}; }\n",
+                "void grid() { Widget items[2][2]{{{1}, {2}}, {{3}}}; }\n",
+                "void scalar_elements() { Widget items[2]{1, 2}; }\n",
+                "void pointers() { Widget *p{}; Widget *q(nullptr); Widget *arr[2]{}; }\n",
+                "void prototype() { Widget most_vexing(); extern Widget external; }\n",
+            ),
+        )],
+    );
+    assert_eq!(graph.callee_signatures("plain"), vec!["()"]);
+    assert_eq!(graph.callee_signatures("empty"), vec!["()"]);
+    assert_eq!(
+        graph.callee_signatures("grid"),
+        vec!["()", "(int value)", "(int value)", "(int value)"]
+    );
+    assert_eq!(
+        graph.callee_signatures("scalar_elements"),
+        vec!["(int value)", "(int value)"]
+    );
+    assert_eq!(
+        graph.callee_signatures("elements"),
+        vec!["()", "(int value)", "(int value)", "argument"]
+    );
+    assert_eq!(graph.calls("pointers"), Vec::<String>::new());
+    assert_eq!(graph.calls("prototype"), Vec::<String>::new());
+}

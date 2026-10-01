@@ -7628,20 +7628,38 @@ void build() {
     }
 
     #[test]
-    fn cpp_constructor_arity_range_handles_defaults_and_nested_types() {
-        use crate::lang::cpp_constructor_arity_range;
+    fn cpp_constructor_shape_handles_defaults_nested_types_and_names() {
+        use crate::lang::cpp_constructor_shape;
+        let shape = |signature: &str| {
+            cpp_constructor_shape(signature).map(|shape| (shape.key, shape.min, shape.max))
+        };
 
-        assert_eq!(cpp_constructor_arity_range("()"), Some((0, 0)));
-        assert_eq!(cpp_constructor_arity_range("(void)"), Some((0, 0)));
+        assert_eq!(shape("()"), Some((String::new(), 0, 0)));
+        assert_eq!(shape("(void)"), Some((String::new(), 0, 0)));
         assert_eq!(
-            cpp_constructor_arity_range("(std::pair<int, int> value, int flags = 0)"),
-            Some((1, 2))
+            shape("(std::pair<int, int> value, int flags = 0)"),
+            Some(("std::pair<int,int>,int".to_string(), 1, 2))
         );
         assert_eq!(
-            cpp_constructor_arity_range("(void (*callback)(int, int), const char *text = \"a,b\")"),
-            Some((1, 2))
+            shape("(void (*callback)(int, int), const char *text = \"a,b\")"),
+            Some(("void(*callback)(int,int),constchar*".to_string(), 1, 2))
         );
-        assert_eq!(cpp_constructor_arity_range("(Args&&... args)"), None);
+        // A prototype and its definition share the key, whatever the names.
+        assert_eq!(
+            shape("(int value = 7);").map(|(key, ..)| key),
+            shape("(int renamed)").map(|(key, ..)| key)
+        );
+        assert_eq!(
+            shape("(unsigned int)"),
+            Some(("unsignedint".to_string(), 1, 1))
+        );
+        assert_eq!(
+            shape("(const Widget)"),
+            Some(("constWidget".to_string(), 1, 1))
+        );
+        // A parameter pack and a comparison in a default are unreadable.
+        assert_eq!(shape("(Args&&... args)"), None);
+        assert_eq!(shape("(int x = a >= b)"), None);
     }
 
     #[test]

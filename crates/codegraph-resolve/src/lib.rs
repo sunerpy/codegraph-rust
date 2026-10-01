@@ -18,6 +18,7 @@
 
 mod alias_binding;
 mod awaited;
+mod c_macro_visibility;
 pub mod context;
 pub mod framework; // the FrameworkResolver extension point
 pub mod frameworks; // concrete react/vue/nestjs FrameworkResolvers

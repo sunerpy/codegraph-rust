@@ -939,14 +939,24 @@ pub fn match_by_exact_name(
     {
         return Some(action);
     }
-    let reachable: Vec<Arc<Node>> = apply_language_gate(
-        context.get_nodes_by_name_shared(&reference.reference_name),
-        reference,
-    )
-    .into_iter()
-    // Nested locals are only reachable from inside their container (#1230).
-    .filter(|n| is_lexically_reachable(n, reference, context))
-    .collect();
+    let same_name = context.get_nodes_by_name_shared(&reference.reference_name);
+    // `NAME(...)` where NAME is a function-like macro somewhere in the project
+    // is an expansion or a call to a same-named function — never the macro
+    // itself (#1839), and never a type that happens to share the name (#2070:
+    // expat's `PREFIX(scanRef)(…)` bound an unrelated `struct PREFIX`). Neither
+    // is a candidate at all, so neither makes the reference look ambiguous or
+    // counts toward the same-name ceiling.
+    let macro_call = reference.reference_kind == EdgeKind::Calls
+        && matches!(reference.language, Language::C | Language::Cpp)
+        && same_name
+            .iter()
+            .any(|n| crate::c_macro_visibility::is_define_constant(n));
+    let reachable: Vec<Arc<Node>> = apply_language_gate(same_name, reference)
+        .into_iter()
+        .filter(|n| !macro_call || matches!(n.kind, NodeKind::Function | NodeKind::Method))
+        // Nested locals are only reachable from inside their container (#1230).
+        .filter(|n| is_lexically_reachable(n, reference, context))
+        .collect();
 
     // A same-named non-type is not a supertype, and a type member is not
     // importable (#1537/#1536). Filtering BEFORE ranking — not just refusing the

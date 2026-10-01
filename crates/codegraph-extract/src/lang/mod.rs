@@ -44,8 +44,8 @@ pub(crate) use cfml::{
     cfml_component_name_from_path, cfml_string_attr_value, cfml_tag_attr, is_bare_script_cfml,
 };
 pub use cpp::{
-    CPP_CONSTRUCTOR_REFERENCE_PREFIX, CPP_SPEC, cpp_constructor_arity_range,
-    cpp_constructor_reference_name, parse_cpp_constructor_reference_name,
+    CPP_CONSTRUCTOR_REFERENCE_PREFIX, CPP_SPEC, CppConstructorShape,
+    cpp_constructor_reference_name, cpp_constructor_shape, parse_cpp_constructor_reference_name,
 };
 pub(crate) use cpp::{
     ExplicitOperatorCall, ExportMacroClass, cpp_code_mask, detect_export_macro_class,

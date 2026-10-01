@@ -11,8 +11,8 @@ use crate::alias_binding::resolve_alias_binding;
 use crate::framework::FrameworkResolver;
 use crate::import_resolver::{
     PhpImportedStaticCallResolution, is_bound_to_out_of_repo_module, is_php_include_path_ref,
-    python_module_member_is_claimed, resolve_import_path, resolve_jvm_import,
-    resolve_php_imported_static_call, resolve_via_import,
+    python_module_member_is_claimed, resolve_jvm_import, resolve_php_imported_static_call,
+    resolve_via_import,
 };
 use crate::name_matcher::{
     crosses_code_boundary, gate_language_match, is_js_name_target_visible,
@@ -27,12 +27,12 @@ use crate::types::{
     RefView, ResolutionContext, ResolutionResult, ResolutionStats, ResolvedBy, ResolvedRef,
 };
 use codegraph_core::types::{Edge, EdgeKind, Language, Node, NodeKind, UnresolvedRef};
-use codegraph_extract::lang::{cpp_constructor_arity_range, parse_cpp_constructor_reference_name};
+use codegraph_extract::lang::{cpp_constructor_shape, parse_cpp_constructor_reference_name};
 use codegraph_store::Store;
 use codegraph_store::queries::ReferenceSite;
 use rayon::prelude::*;
 use regex::Regex;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, OnceLock};
 
 /// Read-only deferred-pass intent returned by [`ReferenceResolver::resolve_one_pure`]
@@ -121,6 +121,20 @@ fn has_chain_shape(name: &str) -> bool {
     !inner.is_empty()
         && !method.is_empty()
         && method.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// Whether a constructor signature names `initializer_list` as a whole word.
+fn mentions_initializer_list(signature: &str) -> bool {
+    let bytes = signature.as_bytes();
+    signature
+        .match_indices("initializer_list")
+        .any(|(start, word)| {
+            let end = start + word.len();
+            (start == 0 || !(bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_'))
+                && bytes
+                    .get(end)
+                    .is_none_or(|byte| !(byte.is_ascii_alphanumeric() || *byte == b'_'))
+        })
 }
 
 fn cpp_type_spelling_matches(spelled: &str, qualified: &str) -> bool {
@@ -846,245 +860,6 @@ fn cpp_built_ins() -> &'static BTreeSet<&'static str> {
     })
 }
 
-fn c_family_language_for_path(path: &str) -> Option<Language> {
-    let lower = path.to_ascii_lowercase();
-    if lower.ends_with(".c") {
-        Some(Language::C)
-    } else if [
-        ".h", ".hh", ".hpp", ".hxx", ".inc", ".inl", ".ipp", ".cc", ".cpp", ".cxx", ".c++", ".m",
-        ".mm",
-    ]
-    .iter()
-    .any(|extension| lower.ends_with(extension))
-    {
-        Some(Language::Cpp)
-    } else {
-        None
-    }
-}
-
-/// Build `file -> function-like macro names visible from that file` through
-/// project-local include edges. Macro names propagate backwards from a header
-/// to every transitive includer; unrelated headers never suppress a real call.
-fn build_c_family_visible_macros(
-    context: &dyn ResolutionContext,
-) -> BTreeMap<String, BTreeSet<String>> {
-    let mut files = context.get_all_files();
-    files.sort();
-    let mut visible = BTreeMap::<String, BTreeSet<String>>::new();
-    let mut reverse_includes = BTreeMap::<String, BTreeSet<String>>::new();
-
-    for file in files {
-        let Some(language) = c_family_language_for_path(&file) else {
-            continue;
-        };
-        let Some(source) = context.read_file(&file) else {
-            continue;
-        };
-        visible.insert(file.clone(), function_like_macro_names(&source));
-
-        for import in context.get_import_mappings(&file, language) {
-            let from_dir = crate::pathutil::dirname(&file);
-            let sibling = crate::pathutil::normalize(&if from_dir.is_empty() {
-                import.source.clone()
-            } else {
-                format!("{from_dir}/{}", import.source)
-            });
-            let included = if context.file_exists(&sibling) {
-                Some(sibling)
-            } else {
-                resolve_import_path(&import.source, &file, language, context)
-            };
-            if let Some(included) = included {
-                reverse_includes
-                    .entry(included)
-                    .or_default()
-                    .insert(file.clone());
-            }
-        }
-    }
-
-    // Monotone work queue: when a file learns a macro, propagate the complete
-    // set to its includers. Cycles terminate because every set only grows.
-    let mut queue: VecDeque<String> = visible
-        .iter()
-        .filter(|(_, names)| !names.is_empty())
-        .map(|(file, _)| file.clone())
-        .collect();
-    while let Some(included) = queue.pop_front() {
-        let inherited = visible.get(&included).cloned().unwrap_or_default();
-        let parents = reverse_includes.get(&included).cloned().unwrap_or_default();
-        for parent in parents {
-            let names = visible.entry(parent.clone()).or_default();
-            let before = names.len();
-            names.extend(inherited.iter().cloned());
-            if names.len() != before {
-                queue.push_back(parent);
-            }
-        }
-    }
-    visible
-}
-
-/// Collect real preprocessor function macros (`#define NAME(`) while ignoring
-/// comments, quoted literals, C++ raw strings, and continuation lines. The C
-/// standard requires `(` to immediately follow the name for a function-like
-/// macro, so `#define NAME (value)` is correctly not admitted.
-fn function_like_macro_names(source: &str) -> BTreeSet<String> {
-    let bytes = source.as_bytes();
-    let mut names = BTreeSet::new();
-    let mut i = 0usize;
-    let mut directive_allowed = true;
-
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\n' => {
-                directive_allowed = true;
-                i += 1;
-            }
-            b' ' | b'\t' | b'\r' if directive_allowed => i += 1,
-            b'/' if bytes.get(i + 1) == Some(&b'/') => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                i += 2;
-                while i < bytes.len() {
-                    if bytes[i] == b'\n' {
-                        directive_allowed = true;
-                    }
-                    if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
-                        i += 2;
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            b'#' if directive_allowed => {
-                if let Some(name) = function_macro_name_on_directive(&bytes[i..]) {
-                    names.insert(name.to_string());
-                }
-                i = c_logical_directive_end(bytes, i);
-                directive_allowed = true;
-            }
-            b'"' if i > 0 && bytes[i - 1] == b'R' => {
-                directive_allowed = false;
-                i = skip_cpp_raw_string(bytes, i);
-            }
-            quote @ (b'"' | b'\'') => {
-                directive_allowed = false;
-                i = skip_c_quoted_literal(bytes, i, quote);
-            }
-            _ => {
-                directive_allowed = false;
-                i += 1;
-            }
-        }
-    }
-    names
-}
-
-fn function_macro_name_on_directive(bytes: &[u8]) -> Option<&str> {
-    let line_end = bytes
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .unwrap_or(bytes.len());
-    let line = &bytes[..line_end];
-    let mut i = 1usize; // leading '#'
-    while matches!(line.get(i), Some(b' ' | b'\t')) {
-        i += 1;
-    }
-    let keyword = b"define";
-    if line.get(i..i + keyword.len())? != keyword {
-        return None;
-    }
-    i += keyword.len();
-    if !matches!(line.get(i), Some(b' ' | b'\t')) {
-        return None;
-    }
-    while matches!(line.get(i), Some(b' ' | b'\t')) {
-        i += 1;
-    }
-    let start = i;
-    if !line
-        .get(i)
-        .is_some_and(|byte| *byte == b'_' || byte.is_ascii_alphabetic())
-    {
-        return None;
-    }
-    i += 1;
-    while line
-        .get(i)
-        .is_some_and(|byte| *byte == b'_' || byte.is_ascii_alphanumeric())
-    {
-        i += 1;
-    }
-    if line.get(i) != Some(&b'(') {
-        return None;
-    }
-    std::str::from_utf8(&line[start..i]).ok()
-}
-
-fn c_logical_directive_end(bytes: &[u8], start: usize) -> usize {
-    let mut i = start;
-    loop {
-        while i < bytes.len() && bytes[i] != b'\n' {
-            i += 1;
-        }
-        let mut back = i;
-        if back > start && bytes[back - 1] == b'\r' {
-            back -= 1;
-        }
-        let continued = back > start && bytes[back - 1] == b'\\';
-        if i < bytes.len() {
-            i += 1;
-        }
-        if !continued || i >= bytes.len() {
-            return i;
-        }
-    }
-}
-
-fn skip_c_quoted_literal(bytes: &[u8], start: usize, quote: u8) -> usize {
-    let mut i = start + 1;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => i = (i + 2).min(bytes.len()),
-            b'\n' => return i,
-            byte if byte == quote => return i + 1,
-            _ => i += 1,
-        }
-    }
-    i
-}
-
-fn skip_cpp_raw_string(bytes: &[u8], quote: usize) -> usize {
-    let mut delimiter_end = quote + 1;
-    while delimiter_end < bytes.len()
-        && bytes[delimiter_end] != b'('
-        && delimiter_end - quote - 1 < 16
-        && !bytes[delimiter_end].is_ascii_whitespace()
-    {
-        delimiter_end += 1;
-    }
-    if delimiter_end >= bytes.len() || bytes[delimiter_end] != b'(' {
-        return skip_c_quoted_literal(bytes, quote, b'"');
-    }
-    let mut closer = Vec::with_capacity(delimiter_end - quote + 1);
-    closer.push(b')');
-    closer.extend_from_slice(&bytes[quote + 1..delimiter_end]);
-    closer.push(b'"');
-    let mut i = delimiter_end + 1;
-    while i + closer.len() <= bytes.len() {
-        if bytes[i..i + closer.len()] == closer {
-            return i + closer.len();
-        }
-        i += 1;
-    }
-    bytes.len()
-}
-
 fn c_family_static_function_is_file_local(
     target: &Node,
     reference: &RefView,
@@ -1293,13 +1068,12 @@ pub struct ReferenceResolver {
     /// Distinct symbol names known to the graph, for the fast pre-filter
     /// (`knownNames`, `index.ts:224`). Populated by `warm_caches`.
     known_names: Option<BTreeSet<String>>,
-    /// Function-like macro names visible from each C/C++ file through its
-    /// project-local include closure. Built once with the other read-only
-    /// resolution caches, then shared by the parallel resolver.
-    c_family_visible_macros: BTreeMap<String, BTreeSet<String>>,
-    /// Constructor node id -> accepted positional-argument range. Built once
-    /// from the narrow C++ constructor signatures stored by extraction.
-    cpp_constructor_arities: BTreeMap<String, (usize, usize)>,
+    /// Per-file directive summaries and per-root macro timelines for C/C++
+    /// translation-unit macro visibility (#1838), filled on demand by the
+    /// parallel resolver and cleared with the other resolution caches. Every
+    /// entry is a pure function of the files, so evaluation order cannot reach
+    /// the output.
+    macro_visibility: std::sync::Mutex<crate::c_macro_visibility::MacroVisibility>,
     /// `this.<member>` fn-refs whose member wasn't on the enclosing class
     /// itself — retried in the supertype pass once implements/extends edges
     /// exist (`deferredThisMemberRefs`, index.ts:214 / #808). A `Mutex` (not
@@ -1324,8 +1098,7 @@ impl ReferenceResolver {
             max_file_size: codegraph_core::config::DEFAULT_MAX_FILE_SIZE,
             framework_resolver_extensions: Vec::new(),
             known_names: None,
-            c_family_visible_macros: BTreeMap::new(),
-            cpp_constructor_arities: BTreeMap::new(),
+            macro_visibility: std::sync::Mutex::default(),
             deferred_this_member_refs: std::sync::Mutex::new(Vec::new()),
             deferred_chain_refs: std::sync::Mutex::new(Vec::new()),
         }
@@ -1494,16 +1267,10 @@ impl ReferenceResolver {
     pub fn warm_caches(&mut self, context: &dyn ResolutionContext) {
         let names: BTreeSet<String> = context.known_node_names().into_iter().collect();
         self.known_names = Some(names);
-        self.c_family_visible_macros = build_c_family_visible_macros(context);
-        self.cpp_constructor_arities = context
-            .get_nodes_by_kind_shared(NodeKind::Method)
-            .into_iter()
-            .filter(|node| node.language == Language::Cpp)
-            .filter_map(|node| {
-                let range = cpp_constructor_arity_range(node.signature.as_deref()?)?;
-                Some((node.id.clone(), range))
-            })
-            .collect();
+        *self
+            .macro_visibility
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Default::default();
     }
 
     /// Resolve all unresolved references (`resolveAll`, `index.ts:511-572`).
@@ -1600,7 +1367,7 @@ impl ReferenceResolver {
         let (resolved, deferred) = self.resolve_one_pure_inner(reference, context);
         let resolved = self.gate_target_kind(resolved, reference, context);
         let resolved = self.gate_import_locality(resolved, reference, context);
-        let resolved = self.gate_c_macro_calls(resolved, reference);
+        let resolved = self.gate_c_macro_calls(resolved, reference, context);
         let resolved = self.forward_alias_binding(resolved, reference, context);
         // Every chosen result — including an alias-forwarded one — obeys the
         // code-family boundary (upstream v1.6.1 `resolveOne`); framework
@@ -1616,27 +1383,30 @@ impl ReferenceResolver {
         (resolved, deferred)
     }
 
-    /// C/C++ preprocessor binding gate: a call spelled like a function-like
-    /// macro visible from the calling file is an expansion, not a call. (A
-    /// receiver-less Go call is kept off methods inside the name matchers,
-    /// #1857.)
+    /// C/C++ preprocessor binding gate (upstream #1838). A call spelled like
+    /// a function-like macro definitely visible at the call site, or a name
+    /// only macros bear, is an expansion, not a call; and a `#define` is a
+    /// value, never a callee, whichever strategy produced it. (A receiver-less
+    /// Go call is kept off methods inside the name matchers, #1857.)
     fn gate_c_macro_calls(
         &self,
         result: Option<ResolvedRef>,
         reference: &RefView,
+        context: &dyn ResolutionContext,
     ) -> Option<ResolvedRef> {
         let result = result?;
-
-        if matches!(reference.language, Language::C | Language::Cpp)
-            && reference.reference_kind == EdgeKind::Calls
-            && self
-                .c_family_visible_macros
-                .get(&reference.file_path)
-                .is_some_and(|names| names.contains(&reference.reference_name))
+        if reference.reference_kind != EdgeKind::Calls {
+            return Some(result);
+        }
+        if context
+            .get_node_by_id_shared(&result.target_node_id)
+            .is_some_and(|target| crate::c_macro_visibility::is_define_constant(&target))
         {
             return None;
         }
-
+        if crate::c_macro_visibility::is_visible_macro(&self.macro_visibility, reference, context) {
+            return None;
+        }
         Some(result)
     }
 
@@ -1995,24 +1765,65 @@ impl ReferenceResolver {
             .collect::<Vec<_>>();
         let owner = unique_cpp_type_owner(owners, reference, context)?;
         let constructor_name = format!("{}::{base_name}", owner.qualified_name);
-        let candidates = context
+        let constructors = context
             .get_nodes_by_name_shared(base_name)
             .into_iter()
             .filter(|candidate| {
                 candidate.language == Language::Cpp
                     && candidate.kind == NodeKind::Method
                     && candidate.qualified_name == constructor_name
-                    && self.cpp_constructor_arities.get(&candidate.id).is_some_and(
-                        |(minimum, maximum)| *minimum <= call_arity && call_arity <= *maximum,
-                    )
             })
             .collect::<Vec<_>>();
-        if candidates.len() != 1 {
+        // Brace-init prefers an initializer_list overload over arity, a choice
+        // that needs the argument types, so decline (upstream #1839).
+        if constructors.iter().any(|candidate| {
+            candidate
+                .signature
+                .as_deref()
+                .is_some_and(mentions_initializer_list)
+        }) {
             return None;
         }
+        // A prototype and its out-of-line definition describe one overload:
+        // merge their admissible counts, so a default declared on the
+        // prototype reaches the definition, then prefer the executable
+        // definition. A signature that cannot be read declines the whole set.
+        let mut overloads: BTreeMap<String, (Vec<Arc<Node>>, usize, usize)> = BTreeMap::new();
+        for candidate in constructors {
+            let shape = cpp_constructor_shape(candidate.signature.as_deref()?)?;
+            let entry = overloads
+                .entry(shape.key)
+                .or_insert_with(|| (Vec::new(), shape.min, shape.max));
+            entry.1 = entry.1.min(shape.min);
+            entry.0.push(candidate);
+        }
+        let admitting = overloads
+            .into_values()
+            .filter(|(_, minimum, maximum)| *minimum <= call_arity && call_arity <= *maximum)
+            .collect::<Vec<_>>();
+        let [(nodes, _, _)] = admitting.as_slice() else {
+            return None;
+        };
+        let definitions = nodes
+            .iter()
+            .filter(|node| {
+                !node
+                    .signature
+                    .as_deref()
+                    .is_some_and(|signature| signature.trim_end().ends_with(';'))
+            })
+            .collect::<Vec<_>>();
+        let targets = if definitions.is_empty() {
+            nodes.iter().collect()
+        } else {
+            definitions
+        };
+        let [target] = targets.as_slice() else {
+            return None;
+        };
         Some(ResolvedRef {
             original: reference.clone(),
-            target_node_id: candidates[0].id.clone(),
+            target_node_id: target.id.clone(),
             confidence: 0.98,
             resolved_by: ResolvedBy::QualifiedName,
         })
