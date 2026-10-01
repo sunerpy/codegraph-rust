@@ -343,8 +343,8 @@ plus the call/impact graph around them. Prefer it over individual `callers`/
 `callees` chains when surveying an unfamiliar area.
 
 Explicit source paths in the query are resolved before fuzzy search and pinned
-to the front of the result. Quoted/backticked paths, `./`, Windows separators,
-`:123`, and `#L12` are normalized; exact matches precede segment-aligned suffix
+to the front of the result. Quoted/backticked paths, `./`, and Windows
+separators are normalized; exact matches precede segment-aligned suffix
 matches. Extensionless kebab basenames are accepted only when they resolve to at
 most three indexed files, so ordinary hyphenated prose remains prose. The
 resolver examines at most eight path spans, drops at most eight leading
@@ -353,6 +353,22 @@ most four unresolved explicit paths. Resolved or clearly missing explicit paths
 are removed from the normal query, preventing route parameters and basenames
 from becoming noisy symbol seeds. Pinned files survive low-score filtering and
 receive a protected source budget.
+
+Line references on a path that resolved to exactly one file are kept as
+anchors: `compiler.py:776`, `foo.ts:12-40`, `foo.ts#L88-L120`, and prose ranges
+bound to the nearest such path (`compiler.py lines 900-1003`,
+`L900-L1003 in compiler.py`, `lines 900 to 1003`). A bare number counts only
+after `line`/`lines` or directly after the path, and numbers above 1,000,000
+are ignored. A single-line anchor selects the innermost method, function, or
+component enclosing it; a range, or a line no callable encloses (with 15 lines
+either side), renders as that span. Those, and a qualified name
+(`SQLCompiler.as_sql`, `Engine::ServeHTTP`) with at most three non-test
+definitions, are **exact targets**: they lead the blast radius, their files rank
+ahead of incidental files, and their clusters render first. An exact body is
+returned whole when it fits the file's budget, and otherwise from its own head
+plus windows on the anchored line and on its calls into the other symbols the
+query names. A named neighbour that no longer fits beside it is listed in the
+file header instead.
 
 Explore also resolves prose and camelCase query segments against indexed symbol
 names, then merges the resulting callable, Variable, and Constant names as

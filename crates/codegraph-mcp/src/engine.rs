@@ -10,7 +10,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use codegraph_core::config::Config;
@@ -28,7 +28,9 @@ use serde_json::Value;
 use crate::dynamic_boundaries::scan_dynamic_dispatch;
 use crate::explore_budget::{ExploreOutputBudget, get_explore_output_budget};
 use crate::protocol::ToolResult;
-use crate::query_paths::{extract_query_paths_with_file_probe, query_might_contain_paths};
+use crate::query_paths::{
+    QueryLineAnchor, extract_query_paths_with_file_probe, query_might_contain_paths,
+};
 
 /// Default caller/callee recursion depth for callers/callees tools. The upstream
 /// `getCallers`/`getCallees` default to `maxDepth: 1` (`traversal.ts` callers
@@ -57,6 +59,22 @@ const POINTER_MAX_FILES: usize = 10;
 /// highest-importance member, even when that exceeds the room it was given; the
 /// caller then drops the file whole rather than emitting a stub.
 const MIN_WINDOW_LINES: usize = 12;
+
+/// Importance of an EXACT target (upstream #2063): a callable the query
+/// singled out with no ambiguity left — a qualified name resolving to at most
+/// three callables, or the callable enclosing a single-line anchor — or a line
+/// span the query anchored. Above a protected focus (11) and a root (10).
+const EXACT_IMPORTANCE: u32 = 12;
+
+/// Lines either side of a single-line anchor that no callable encloses.
+const ANCHOR_LINE_CONTEXT: usize = 15;
+
+/// Most lines an oversize exact body is windowed on beyond its head: the
+/// anchored line inside it and its calls into the question's other symbols.
+const MAX_BODY_FOCUS_LINES: usize = 6;
+
+/// Query tokens consulted for qualified exact targets — upstream's seeder cap.
+const MAX_EXACT_SYMBOL_TOKENS: usize = 16;
 
 /// Minimum source budget protected for every path explicitly named in an
 /// explore query. Pinned files are ordered first and reserve this much for one
@@ -1238,8 +1256,12 @@ impl CodeGraphEngine {
             })
         };
         let match_query = path_extraction.stripped_query.trim().to_string();
-        let subgraph =
-            self.find_relevant_context_with_pins(&match_query, &path_extraction.pinned_files)?;
+        let exact = self.exact_targets(&match_query, &path_extraction.line_anchors);
+        let subgraph = self.find_relevant_context_with_pins(
+            &match_query,
+            &path_extraction.pinned_files,
+            &exact,
+        )?;
         let unresolved_note = (!path_extraction.unresolved_path_spans.is_empty()).then(|| {
             path_extraction
                 .unresolved_path_spans
@@ -1335,6 +1357,7 @@ impl CodeGraphEngine {
         let mut excluded_files: Vec<&String> = Vec::new();
         let mut rendered_sources: Vec<(String, usize)> = Vec::new();
         let precise_tokens = precise_query_tokens(&match_query);
+        let question_ids = subgraph.question_ids(&precise_tokens);
         let indexed_file_count = self.store.counts().ok().map(|c| c.file_count);
         let effective_budget = budget
             .max_output_chars
@@ -1360,6 +1383,12 @@ impl CodeGraphEngine {
             let lang = subgraph.file_language(file_path);
 
             let focuses = subgraph.file_focus_lines(file_path, &precise_tokens);
+            let exact_focus = self.exact_body_focus(
+                &subgraph,
+                file_path,
+                &path_extraction.line_anchors,
+                &question_ids,
+            );
             let available = effective_budget
                 .saturating_sub(total_chars)
                 .saturating_sub(1);
@@ -1376,6 +1405,7 @@ impl CodeGraphEngine {
                 budget: &budget,
                 funded_headroom,
                 focuses: &focuses,
+                exact_focus: &exact_focus,
                 drifted: possibly_drifted,
             };
             let rendered = self.render_explore_file(&subgraph, file_path, &file_lines, &lang, &ctx);
@@ -1647,18 +1677,20 @@ impl CodeGraphEngine {
                     source_emitted: true,
                 };
             }
-            // (2) Unaffordable but owning NO focus ⇒ also today's behaviour:
-            //     return whole and let the caller drop it whole, so "an incidental
-            //     file that doesn't fit is DROPPED whole" stays literally true.
-            if ctx.focuses.is_empty() {
+            // (2) Unaffordable but owning NO focus and no exact target ⇒ also
+            //     today's behaviour: return whole and let the caller drop it
+            //     whole, so "an incidental file that doesn't fit is DROPPED
+            //     whole" stays literally true.
+            if ctx.focuses.is_empty() && !subgraph.holds_exact(file_path) {
                 return ExploreFileRender {
                     section,
                     source_emitted: true,
                 };
             }
-            // (3) Unaffordable AND owning a focus ⇒ fall through to the clustering
-            //     path, which windows against `funded_headroom` and guarantees a
-            //     window per focus. The ONLY new behaviour.
+            // (3) Unaffordable AND owning a focus or an exact target ⇒ fall
+            //     through to the clustering path, which windows against
+            //     `funded_headroom` and pays the named members first. The ONLY
+            //     new behaviour.
         }
 
         // Cluster nearby symbol ranges; merge ranges within `gapThreshold`
@@ -1687,7 +1719,9 @@ impl CodeGraphEngine {
                 // matched on the STORED definition line: a focus whose line the
                 // clamp below moves is one the range filters would drop anyway,
                 // and §3.1.1 conditions the guarantee on surviving them.
-                let importance = if ctx.focuses.contains(&(n.start_line as usize)) {
+                let importance = if subgraph.is_exact(&n.id) {
+                    EXACT_IMPORTANCE
+                } else if ctx.focuses.contains(&(n.start_line as usize)) {
                     11
                 } else if subgraph.roots.iter().any(|r| r == &n.id) {
                     10
@@ -1716,6 +1750,27 @@ impl CodeGraphEngine {
             // Drop ranges whose start is past EOF (a fully-stale node).
             .filter(|r| r.start <= total_lines)
             .collect();
+        // Line spans the query anchored in this file (`lines 900-1003`) are
+        // exact targets too, rendered as exactly the span asked for rather than
+        // as the symbols around it (#2063).
+        for (start, end) in subgraph.anchor_spans_in(file_path) {
+            if start > total_lines {
+                continue;
+            }
+            let end = end.min(total_lines);
+            let name = format!("lines {start}-{end}");
+            ranges.push(ClusterRange {
+                start,
+                end,
+                label: format!("{name}(range)"),
+                member: ElidedSymbol {
+                    name,
+                    kind: "range",
+                    start_line: start,
+                },
+                importance: EXACT_IMPORTANCE,
+            });
+        }
         ranges.sort_by_key(|r| r.start);
 
         if ranges.is_empty() {
@@ -2003,13 +2058,150 @@ impl CodeGraphEngine {
         let mut projected = 0usize;
         let mut chosen_count = 0usize;
         let mut any_cluster_windowed = false;
+        // A cluster's exact members (#2063), re-merged and padded like any other.
+        let exact_spans = |c: &Cluster| -> Vec<(usize, usize)> {
+            c.spans
+                .iter()
+                .filter(|s| s.2 >= EXACT_IMPORTANCE)
+                .map(|s| (s.0, s.1))
+                .collect()
+        };
+        let exact_core_cost = |c: &Cluster| -> usize {
+            let exact = exact_spans(c);
+            if exact.is_empty() {
+                0
+            } else {
+                bare_len(&member_windows(&exact))
+            }
+        };
+        // Whether 1-based `line` falls inside one of the 0-based exclusive-end
+        // `windows`.
+        let covers = |windows: &[(usize, usize)], line: usize| -> bool {
+            windows.iter().any(|&(lo, hi)| line > lo && line <= hi)
+        };
+        // What a window of an exact cluster's exact bodies must still reach when
+        // they do not fit whole: each exact member's first line, its body focus
+        // lines, and any named focus inside an exact body. Only lines INSIDE the
+        // exact bodies, as upstream windows only the parts it kept: a named
+        // member beside an oversize exact body is dropped and named in the
+        // header rather than splitting the room the body's own calls need.
+        let exact_focuses_in = |c: &Cluster| -> Vec<usize> {
+            let exact = exact_spans(c);
+            let inside = |line: usize| exact.iter().any(|&(lo, hi)| line >= lo && line <= hi);
+            let mut lines: Vec<usize> = exact.iter().map(|&(lo, _)| lo).collect();
+            for (start, end, body) in ctx.exact_focus {
+                if *start >= c.start && (*end).min(total_lines) <= c.end {
+                    lines.extend(body.iter().copied());
+                }
+            }
+            lines.extend(focuses_in(c).into_iter().filter(|&line| inside(line)));
+            lines.retain(|&line| line >= 1 && line <= total_lines);
+            lines.sort_unstable();
+            lines.dedup();
+            lines
+        };
+        // Upstream's exact branch (#2063). The exact body is kept whole when it
+        // fits `room`, and every other member joins while the rendered windows
+        // still fit: a protected one within `room`, an incidental one within
+        // `cap`. Priced on the rendered windows, so nothing above the exact body
+        // in source order can be paid first and cut its tail. When the exact
+        // body alone overruns `room` it is windowed from its own first line:
+        // the whole room goes to that head unless it would leave a focus line
+        // uncovered, and then 60% of it. Focus lines still uncovered get a
+        // window each from an even share of what is left, carried forward, and
+        // only when one of `MIN_WINDOW_LINES` fits its share.
+        let exact_render = |c: &Cluster, room: usize, cap: usize| -> (Vec<(usize, usize)>, bool) {
+            let (start_idx, end_idx) = span_of(c);
+            if range_cost(start_idx, end_idx) <= cap.min(room) {
+                return (vec![(start_idx, end_idx)], false);
+            }
+            let exact = exact_spans(c);
+            let core = member_windows(&exact);
+            let focuses = exact_focuses_in(c);
+            let mut windows = if bare_len(&core) <= room {
+                let mut order: Vec<(usize, usize, u32)> = c
+                    .spans
+                    .iter()
+                    .filter(|s| s.2 < EXACT_IMPORTANCE)
+                    .copied()
+                    .collect();
+                order.sort_by(|a, b| {
+                    is_protected(b.2)
+                        .cmp(&is_protected(a.2))
+                        .then(b.2.cmp(&a.2))
+                        .then((a.1 - a.0).cmp(&(b.1 - b.0)))
+                        .then(a.0.cmp(&b.0))
+                });
+                let mut kept = exact;
+                for span in order {
+                    let mut candidate = kept.clone();
+                    candidate.push((span.0, span.1));
+                    let limit = if is_protected(span.2) {
+                        room
+                    } else {
+                        cap.min(room)
+                    };
+                    if bare_len(&member_windows(&candidate)) <= limit {
+                        kept = candidate;
+                    }
+                }
+                member_windows(&kept)
+            } else {
+                let head_start = core[0].0;
+                let full = grow_head(head_start, end_idx, room);
+                let head_room = if focuses.iter().all(|&line| covers(&[full], line)) {
+                    room
+                } else {
+                    room * 60 / 100
+                };
+                vec![grow_head(head_start, end_idx, head_room)]
+            };
+            let pending: Vec<usize> = focuses
+                .iter()
+                .copied()
+                .filter(|&line| !covers(&windows, line))
+                .collect();
+            let mut left = room.saturating_sub(bare_len(&windows));
+            for (i, &line) in pending.iter().enumerate() {
+                if covers(&windows, line) {
+                    continue;
+                }
+                let share = (left / (pending.len() - i)).saturating_sub(GAP_MARKER.len());
+                if share == 0 {
+                    continue;
+                }
+                let w = grow_around(line - 1, start_idx, end_idx, share);
+                if w.1 - w.0 < MIN_WINDOW_LINES.min(end_idx - start_idx)
+                    || range_cost(w.0, w.1) > share
+                {
+                    continue;
+                }
+                left = left.saturating_sub(range_cost(w.0, w.1) + GAP_MARKER.len());
+                windows.push(w);
+            }
+            windows.sort_unstable();
+            let mut merged: Vec<(usize, usize)> = Vec::new();
+            for w in windows {
+                match merged.last_mut() {
+                    Some(last) if w.0 <= last.1 => last.1 = last.1.max(w.1),
+                    _ => merged.push(w),
+                }
+            }
+            let whole = merged.len() == 1 && merged[0] == (start_idx, end_idx);
+            (merged, !whole)
+        };
         // A cluster's incidental members may only use what is left once every
         // lower-ranked cluster's protected members are paid for, and in a
         // cluster holding a protected member they never take it past its room,
         // so a window from the head no longer cuts a named body's tail. Its own
         // protected members are never held back (#2062).
+        // An exact cluster renders by `exact_render`, with the same hold-back.
         let guarded_render =
             |c: &Cluster, room: usize, owed_below: usize| -> (Vec<(usize, usize)>, bool) {
+                if c.max_importance >= EXACT_IMPORTANCE {
+                    let cap = room.saturating_sub(owed_below);
+                    return exact_render(c, room, cap);
+                }
                 let has_protected = c.spans.iter().any(|s| is_protected(s.2));
                 let cap = match (owed_below > 0, has_protected) {
                     (true, _) => Some(room.saturating_sub(owed_below)),
@@ -2026,10 +2218,29 @@ impl CodeGraphEngine {
                 }
                 window_cluster(c, room, &focuses_in(c))
             };
+        // What the exact members of every exact cluster ranked below position
+        // `p` cost. Several exact targets can land in different clusters of one
+        // big file, and the one ranked first would spend the whole room on its
+        // neighbours; so an exact cluster holds that back, never cutting into its
+        // own exact members (#2063).
+        let mut owed_exact_from = vec![0usize; ranked.len() + 1];
+        for p in (0..ranked.len()).rev() {
+            let cost = exact_core_cost(&clusters[ranked[p]]);
+            owed_exact_from[p] =
+                owed_exact_from[p + 1] + if cost > 0 { cost + GAP_MARKER.len() } else { 0 };
+        }
+        let hold_back = |c: &Cluster, rank: usize, room: usize| -> usize {
+            let owed = owed_exact_from[rank + 1];
+            if c.max_importance < EXACT_IMPORTANCE || owed == 0 {
+                return room;
+            }
+            room.min(exact_core_cost(c).max(room.saturating_sub(owed)))
+        };
         for (rank, &idx) in ranked.iter().enumerate() {
             let owed_below = owed_from[rank + 1];
             if chosen_count == 0 {
-                let (windows, windowed) = guarded_render(&clusters[idx], ceiling, owed_below);
+                let room = hold_back(&clusters[idx], rank, ceiling);
+                let (windows, windowed) = guarded_render(&clusters[idx], room, owed_below);
                 projected += bare_len(&windows);
                 any_cluster_windowed |= windowed;
                 rendered_clusters[idx] = Some(windows);
@@ -2043,7 +2254,11 @@ impl CodeGraphEngine {
             // first cluster's body legitimately exceed `file_budget`, so a plain
             // subtraction wraps to a huge `room` and hands this cluster unlimited
             // budget, the exact opposite of the intent.
-            let room = ceiling.saturating_sub(projected + GAP_MARKER.len());
+            let room = hold_back(
+                &clusters[idx],
+                rank,
+                ceiling.saturating_sub(projected + GAP_MARKER.len()),
+            );
             // The floor's own cost IS `MIN_CHARS` — the smallest useful window —
             // rather than a new magic number. When even that cannot be paid for
             // the cluster is still skipped, so shrinking can never overspend into
@@ -2116,9 +2331,17 @@ impl CodeGraphEngine {
         const ROOT_CAP: usize = 5;
         const DIRECT_CALLER_FILE_CAP: usize = 4;
         let traverser = GraphTraverser::new(&self.store);
-        let roots: Vec<&Node> = subgraph
-            .roots
-            .iter()
+        // Exact targets lead (upstream #2063): the roots are whatever search
+        // ranked first for the bare name, so without this a query for
+        // `SQLCompiler.as_sql` headlined a same-named override.
+        let mut ids: Vec<&String> = Vec::new();
+        for id in subgraph.exact_ids.iter().chain(&subgraph.roots) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        let roots: Vec<&Node> = ids
+            .into_iter()
             .filter_map(|id| subgraph.node(id))
             .filter(|n| is_meaningful_kind(n.kind))
             .take(ROOT_CAP)
@@ -2580,6 +2803,123 @@ impl CodeGraphEngine {
         Ok(results.into_iter().map(|r| r.node).collect())
     }
 
+    /// The query's EXACT targets (upstream #2063). A multi-line anchor names a
+    /// span, not a symbol — often the tail of a body a previous response
+    /// windowed — so it is kept as that span; a single-line anchor resolves to
+    /// the innermost callable containing it. A qualified token is exact when
+    /// its non-test definitions number at most three, and then only its
+    /// callables are. Lookups that fail are skipped: exact targets must never
+    /// fail an explore call.
+    ///
+    /// Test paths are judged by the shared `is_test_file`, which differs from
+    /// upstream's seeder regex only at its margins (it also counts `e2e/` and
+    /// `_test.`, but not `fixtures/` or `mocks/`).
+    fn exact_targets(&self, match_query: &str, anchors: &[QueryLineAnchor]) -> ExactTargets {
+        let mut exact = ExactTargets::default();
+        for anchor in anchors {
+            let Ok(file_nodes) = self.store.nodes_by_file_path(&anchor.file) else {
+                continue;
+            };
+            if anchor.start == anchor.end {
+                let line = anchor.start as i64;
+                let enclosing = file_nodes
+                    .into_iter()
+                    .filter(|n| {
+                        is_exact_target_kind(n.kind) && n.start_line <= line && n.end_line >= line
+                    })
+                    .min_by_key(|n| {
+                        (
+                            n.end_line - n.start_line,
+                            n.start_line,
+                            n.start_column,
+                            n.id.clone(),
+                        )
+                    });
+                if let Some(node) = enclosing {
+                    exact.push_node(node);
+                    continue;
+                }
+            }
+            let (start, end) = if anchor.start == anchor.end {
+                (
+                    anchor.start.saturating_sub(ANCHOR_LINE_CONTEXT).max(1),
+                    anchor.start + ANCHOR_LINE_CONTEXT,
+                )
+            } else {
+                (anchor.start, anchor.end)
+            };
+            exact.spans.push((anchor.file.clone(), start, end));
+        }
+        for token in exact_symbol_tokens(match_query) {
+            if !(token.contains('.') || token.contains("::")) {
+                continue;
+            }
+            let Ok(all) = self.find_all_symbols(&token) else {
+                continue;
+            };
+            let candidates: Vec<Node> = all
+                .nodes
+                .into_iter()
+                .filter(|n| is_seedable_kind(n.kind) && !is_test_file(&n.file_path))
+                .collect();
+            if candidates.len() > 3 {
+                continue;
+            }
+            for node in candidates {
+                if is_exact_target_kind(node.kind) {
+                    exact.push_node(node);
+                }
+            }
+        }
+        exact
+    }
+
+    /// Per exact target in `file_path`, `(start, end, focus lines)`: the lines a
+    /// window of its body must reach when it does not fit whole — an anchored
+    /// line inside it, then every line where it uses another symbol the
+    /// question is about (upstream `bodyFocusLines`), capped.
+    fn exact_body_focus(
+        &self,
+        subgraph: &ExploreSubgraph,
+        file_path: &str,
+        anchors: &[QueryLineAnchor],
+        question_ids: &HashSet<String>,
+    ) -> Vec<(usize, usize, Vec<usize>)> {
+        let mut out = Vec::new();
+        for id in &subgraph.exact_ids {
+            let Some(n) = subgraph.node(id) else {
+                continue;
+            };
+            if n.file_path != file_path || n.start_line < 1 || n.end_line < n.start_line {
+                continue;
+            }
+            let (start, end) = (n.start_line as usize, n.end_line as usize);
+            let mut lines: Vec<usize> = anchors
+                .iter()
+                .filter(|a| a.file == n.file_path && a.start > start && a.start <= end)
+                .map(|a| a.start)
+                .collect();
+            let mut uses: Vec<usize> = self
+                .store
+                .edges_by_source_kind(&n.id, None)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|e| e.target != n.id && question_ids.contains(&e.target))
+                .filter_map(|e| e.line)
+                .filter(|&line| line > start as i64 && line <= end as i64)
+                .map(|line| line as usize)
+                .collect();
+            uses.sort_unstable();
+            lines.extend(uses);
+            let mut seen = HashSet::new();
+            lines.retain(|line| seen.insert(*line));
+            lines.truncate(MAX_BODY_FOCUS_LINES);
+            out.push((start, end, lines));
+        }
+        out.sort_unstable();
+        out
+    }
+
     /// Build the explore subgraph. Ports the deterministic spine of
     /// `findRelevantContext` (`context/index.ts:900-940`): the entry points
     /// (`roots`) are the FTS search results for the query (`searchLimit: 8`,
@@ -2589,13 +2929,14 @@ impl CodeGraphEngine {
     /// relevance re-ranking / file gating is NOT ported (see KNOWN_DIFFS.md).
     #[cfg(test)]
     fn find_relevant_context(&self, query: &str) -> anyhow::Result<ExploreSubgraph> {
-        self.find_relevant_context_with_pins(query, &[])
+        self.find_relevant_context_with_pins(query, &[], &ExactTargets::default())
     }
 
     fn find_relevant_context_with_pins(
         &self,
         query: &str,
         pinned_files: &[String],
+        exact: &ExactTargets,
     ) -> anyhow::Result<ExploreSubgraph> {
         let mut sub = ExploreSubgraph::default();
         let traverser = GraphTraverser::new(&self.store);
@@ -2645,6 +2986,12 @@ impl CodeGraphEngine {
                 sub.insert(node);
             }
         }
+        for node in &exact.nodes {
+            sub.exact_ids.push(node.id.clone());
+            sub.exact_files.insert(node.file_path.clone());
+            sub.insert(node.clone());
+        }
+        sub.anchor_spans = exact.spans.clone();
 
         for root_id in seed_ids.clone() {
             for c in traverser.get_callers(&root_id, CALL_DEPTH)? {
@@ -3308,6 +3655,15 @@ struct ExploreSubgraph {
     /// Project-configured ranking-only paths. They stay in the subgraph and
     /// source output, but lose same-tier ordering ties to first-party files.
     deprioritized_files: HashSet<String>,
+    /// EXACT targets (upstream #2063), in discovery order: they lead the blast
+    /// radius and outrank every other member of their file's clusters.
+    exact_ids: Vec<String>,
+    /// Files holding an exact target. Ranked with the rescued files, the
+    /// port's named-file tier, so the answer the agent singled out is funded
+    /// before incidental files.
+    exact_files: HashSet<String>,
+    /// Anchored line spans to render as written, `(file, start, end)`.
+    anchor_spans: Vec<(String, usize, usize)>,
 }
 
 impl ExploreSubgraph {
@@ -3322,6 +3678,38 @@ impl ExploreSubgraph {
 
     fn is_pinned(&self, file_path: &str) -> bool {
         self.pinned_files.iter().any(|path| path == file_path)
+    }
+
+    fn is_exact(&self, id: &str) -> bool {
+        self.exact_ids.iter().any(|exact| exact == id)
+    }
+
+    /// Whether `file_path` holds an exact target or an anchored span.
+    fn holds_exact(&self, file_path: &str) -> bool {
+        self.exact_files.contains(file_path)
+            || self
+                .anchor_spans
+                .iter()
+                .any(|(file, _, _)| file == file_path)
+    }
+
+    fn anchor_spans_in(&self, file_path: &str) -> Vec<(usize, usize)> {
+        self.anchor_spans
+            .iter()
+            .filter(|(file, _, _)| file == file_path)
+            .map(|&(_, start, end)| (start, end))
+            .collect()
+    }
+
+    /// The symbols the question is about: its exact targets and the roots a
+    /// shape-precise query token names — the port's analog of upstream's
+    /// `questionIds` (exact ∪ named ∪ spine), since it has no flow spine.
+    fn question_ids(&self, precise: &[String]) -> HashSet<String> {
+        let named = self.roots.iter().filter(|id| {
+            self.node(id)
+                .is_some_and(|n| precise.iter().any(|t| t.eq_ignore_ascii_case(&n.name)))
+        });
+        self.exact_ids.iter().chain(named).cloned().collect()
     }
 
     fn insert(&mut self, node: Node) -> bool {
@@ -3387,8 +3775,12 @@ impl ExploreSubgraph {
                 // A rescued change-surface file (#1064) is the lexically-
                 // dissimilar answer — give it the TOP tier so it outranks
                 // incidental roots that merely share query words and survives
-                // the output file budget.
-                let tier = if self.rescued_files.contains(fp.as_str()) {
+                // the output file budget. A file holding an exact target
+                // (#2063) is the answer by the same argument, and upstream sorts
+                // the two into one named-file tier.
+                let tier = if self.rescued_files.contains(fp.as_str())
+                    || self.exact_files.contains(fp.as_str())
+                {
                     3
                 } else if root_files.contains(fp.as_str()) {
                     2
@@ -3566,8 +3958,14 @@ struct RenderCtx<'a> {
     funded_headroom: usize,
     /// Definition lines of this file's protected focuses (§3.1): roots whose name
     /// a shape-precise query token names. Every focus line is guaranteed to land
-    /// inside some emitted window.
+    /// inside some emitted window — except in a cluster holding an exact target
+    /// (#2063), which pays the exact body first: a focus outside it that no
+    /// longer fits whole is dropped and named in the file header instead, as
+    /// upstream ranks exact above named.
     focuses: &'a [usize],
+    /// This file's exact targets as `(start, end, body focus lines)`, from
+    /// [`CodeGraphEngine::exact_body_focus`].
+    exact_focus: &'a [(usize, usize, Vec<usize>)],
     drifted: bool,
 }
 
@@ -3580,6 +3978,28 @@ fn decimal_width(n: usize) -> usize {
         width += 1;
     }
     width
+}
+
+/// What an explore query singled out with no ambiguity left (upstream #2063):
+/// a qualified name that resolves to at most three callables
+/// (`SQLCompiler.as_sql`, not the other `as_sql`s), the callable enclosing a
+/// single-line anchor (`compiler.py:776`), or a line span the query anchored
+/// that no callable answers (`compiler.py lines 900-1003`).
+#[derive(Debug, Default)]
+struct ExactTargets {
+    /// Exact callables in discovery order: anchors first, then qualified names.
+    nodes: Vec<Node>,
+    /// Anchored spans, `(file, start, end)`, 1-based and inclusive. A
+    /// single-line anchor no callable encloses becomes the lines around it.
+    spans: Vec<(String, usize, usize)>,
+}
+
+impl ExactTargets {
+    fn push_node(&mut self, node: Node) {
+        if !self.nodes.iter().any(|known| known.id == node.id) {
+            self.nodes.push(node);
+        }
+    }
 }
 
 /// Cluster source range used when sizing a god-file (`tools.ts:2708-2718`).
@@ -4377,6 +4797,61 @@ fn is_handler_method_name(name: &str) -> bool {
     )
 }
 
+/// Kinds an exact target can be (upstream `ANCHOR_CALLABLE_KINDS` / the
+/// seeder's `CALLABLE`): the innermost one containing an anchored line is the
+/// symbol the agent points at. A class is deliberately not one — it spans most
+/// of its file, and "the whole class" is not what a line number asks for.
+/// `constructor` has no Rust NodeKind (ctors are `method`).
+fn is_exact_target_kind(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Method | NodeKind::Function | NodeKind::Component
+    )
+}
+
+/// Upstream's seeder `SEEDABLE`: what a named token resolves to, counted when
+/// deciding whether a qualified name is specific enough to be exact.
+fn is_seedable_kind(kind: NodeKind) -> bool {
+    is_exact_target_kind(kind) || matches!(kind, NodeKind::Variable | NodeKind::Constant)
+}
+
+/// File extensions the seeder strips from a token (upstream `FILE_EXT`), so
+/// `compiler.py` reads as `compiler`.
+static SEEDER_FILE_EXT: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?i)\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte|astro|erl|hrl)$",
+    )
+    .expect("seeder file-extension regex is valid")
+});
+
+/// A token shaped like a symbol name (upstream's seeder test), ASCII only as in
+/// JavaScript's `\w`: `get_select`, `SQLCompiler.as_sql`, `Engine::ServeHTTP`.
+static SEEDER_SYMBOL_TOKEN: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"^[A-Za-z_$][A-Za-z0-9_$]*(?:(?:::|\.)[A-Za-z0-9_$]+)*$")
+        .expect("seeder symbol-token regex is valid")
+});
+
+/// The query's symbol-shaped tokens, split as upstream's named-symbol seeder
+/// splits them, in order, deduped and capped.
+fn exact_symbol_tokens(query: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in query.split(|c: char| c.is_whitespace() || matches!(c, ',' | '(' | ')' | '[' | ']'))
+    {
+        let token = SEEDER_FILE_EXT.replace(raw, "");
+        let token = token.trim();
+        if token.len() < 3 || !SEEDER_SYMBOL_TOKEN.is_match(token) {
+            continue;
+        }
+        if !out.iter().any(|seen| seen == token) {
+            out.push(token.to_string());
+        }
+        if out.len() >= MAX_EXACT_SYMBOL_TOKENS {
+            break;
+        }
+    }
+    out
+}
+
 fn is_container(kind: NodeKind) -> bool {
     matches!(
         kind,
@@ -4877,6 +5352,7 @@ mod tests {
             budget,
             funded_headroom: budget.max_output_chars.saturating_sub(1),
             focuses,
+            exact_focus: &[],
             drifted: false,
         }
     }
@@ -5149,6 +5625,188 @@ mod tests {
         }
     }
 
+    /// #2063: two exact targets in different clusters of one file. The one
+    /// ranked first sits among named roots that would otherwise fill the whole
+    /// room, so it holds back what the lower-ranked exact target still owes, and
+    /// both render whole.
+    #[test]
+    fn an_exact_cluster_holds_back_what_a_lower_ranked_exact_target_owes() {
+        let engine = test_engine();
+        let file = "app/App.py";
+        let owned: Vec<String> = (1..=600)
+            .map(|i| format!("    v{i} = step{i}(state)  # line {i}"))
+            .collect();
+        let file_lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let trigger = node("triggerRender", file, 10, 40, NodeKind::Method);
+        let pointer = node("handlePointer", file, 500, 530, NodeKind::Method);
+        let mut nodes = vec![trigger.clone(), pointer.clone()];
+        let mut roots = Vec::new();
+        for k in 0..30 {
+            let start = 42 + 4 * k;
+            let root = node(
+                &format!("hook{k}"),
+                file,
+                start,
+                start + 1,
+                NodeKind::Method,
+            );
+            roots.push(root.id.clone());
+            nodes.push(root);
+        }
+        let mut sg = subgraph_with(nodes, roots);
+        sg.exact_ids = vec![trigger.id.clone(), pointer.id.clone()];
+        sg.exact_files.insert(file.to_string());
+        let budget = crate::explore_budget::get_explore_output_budget(200);
+        let out = engine
+            .render_explore_file(&sg, file, &file_lines, "python", &render_ctx(&budget, &[]))
+            .section;
+        let emitted = out
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .filter_map(|(n, _)| n.parse::<usize>().ok())
+            .collect::<std::collections::BTreeSet<_>>();
+        for line in (10..=40).chain(500..=530) {
+            assert!(
+                emitted.contains(&line),
+                "exact body line {line} missing: {emitted:?}"
+            );
+        }
+    }
+
+    /// #2063: an anchor resolves to the innermost callable enclosing its line;
+    /// a range, or a line no callable encloses, stays a span.
+    #[test]
+    fn line_anchors_resolve_to_the_innermost_callable_or_stay_spans() {
+        let mut engine = test_engine();
+        let file = "pkg/compiler.py";
+        let class = node("SQLCompiler", file, 1, 100, NodeKind::Class);
+        let method = node("as_sql", file, 10, 60, NodeKind::Method);
+        let inner = node("render_part", file, 20, 30, NodeKind::Function);
+        put_nodes(&mut engine, &[class, method.clone(), inner.clone()]);
+        let anchor = |start: usize, end: usize| QueryLineAnchor {
+            file: file.to_string(),
+            start,
+            end,
+        };
+        let exact = engine.exact_targets(
+            "",
+            &[
+                anchor(25, 25),
+                anchor(50, 50),
+                anchor(150, 150),
+                anchor(5, 5),
+                anchor(40, 60),
+            ],
+        );
+        let ids: Vec<&str> = exact.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, vec![inner.id.as_str(), method.id.as_str()]);
+        assert_eq!(
+            exact.spans,
+            vec![
+                (file.to_string(), 135, 165),
+                (file.to_string(), 1, 20),
+                (file.to_string(), 40, 60),
+            ]
+        );
+    }
+
+    /// #2063: a qualified name is exact only when its non-test definitions
+    /// number at most three, and then only its callables are.
+    #[test]
+    fn a_qualified_name_is_exact_only_when_it_names_at_most_three_definitions() {
+        let mut engine = test_engine();
+        let lang = Language::Python;
+        let plan = node_lang(
+            "plan",
+            "Planner::plan",
+            "planner.py",
+            2,
+            9,
+            NodeKind::Method,
+            lang,
+        );
+        let plan_test = node_lang(
+            "plan",
+            "Planner::plan",
+            "tests/test_planner.py",
+            2,
+            4,
+            NodeKind::Method,
+            lang,
+        );
+        let limit = node_lang(
+            "limit",
+            "Planner::limit",
+            "planner.py",
+            11,
+            11,
+            NodeKind::Variable,
+            lang,
+        );
+        let as_sql: Vec<Node> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|dir| {
+                node_lang(
+                    "as_sql",
+                    "Compiler::as_sql",
+                    &format!("{dir}/compiler.py"),
+                    3,
+                    8,
+                    NodeKind::Method,
+                    lang,
+                )
+            })
+            .collect();
+        let render: Vec<Node> = ["a", "b", "c"]
+            .iter()
+            .map(|dir| {
+                node_lang(
+                    "render",
+                    "Widget::render",
+                    &format!("{dir}/widget.py"),
+                    3,
+                    8,
+                    NodeKind::Method,
+                    lang,
+                )
+            })
+            .collect();
+        let mut all = vec![plan.clone(), plan_test, limit];
+        all.extend(as_sql);
+        all.extend(render.clone());
+        put_nodes(&mut engine, &all);
+        let exact = engine.exact_targets(
+            "Planner.plan Planner.limit Compiler.as_sql Widget.render plan",
+            &[],
+        );
+        let ids: Vec<&str> = exact.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids.first(), Some(&plan.id.as_str()), "{ids:?}");
+        let mut rest = ids[1..].to_vec();
+        rest.sort_unstable();
+        let mut want: Vec<&str> = render.iter().map(|n| n.id.as_str()).collect();
+        want.sort_unstable();
+        assert_eq!(
+            rest, want,
+            "three definitions are still exact; four are not"
+        );
+        assert!(exact.spans.is_empty());
+    }
+
+    #[test]
+    fn exact_symbol_tokens_split_like_the_seeder() {
+        assert_eq!(
+            exact_symbol_tokens(
+                "SQLCompiler.as_sql, get_select() compiler.py Engine::ServeHTTP of x é.a get_select"
+            ),
+            vec![
+                "SQLCompiler.as_sql",
+                "get_select",
+                "compiler",
+                "Engine::ServeHTTP",
+            ]
+        );
+    }
+
     /// End to end: two rendered clusters with an index-only symbol between
     /// them get a named gap.
     #[test]
@@ -5266,6 +5924,7 @@ mod tests {
             budget: &budget,
             funded_headroom: whole.len() - 1,
             focuses: &[],
+            exact_focus: &[],
             drifted: false,
         };
         let unaffordable_no_focus = engine
