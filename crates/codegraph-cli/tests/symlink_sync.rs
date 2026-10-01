@@ -110,17 +110,22 @@ fn store(project: &Path) -> Store {
         .expect("open the index for reading")
 }
 
-/// Files (path, hash) and nodes (file, kind, name, line), sorted.
-fn snapshot(project: &Path) -> (Vec<(String, String)>, Vec<(String, String, String, i64)>) {
+/// An indexed file: (path, content hash).
+type FileRow = (String, String);
+/// An indexed node: (file, kind, name, start line).
+type NodeRow = (String, String, String, i64);
+
+/// Files and nodes, sorted.
+fn snapshot(project: &Path) -> (Vec<FileRow>, Vec<NodeRow>) {
     let store = store(project);
-    let mut files: Vec<(String, String)> = store
+    let mut files: Vec<FileRow> = store
         .all_files()
         .unwrap()
         .into_iter()
         .map(|file| (file.path, file.content_hash))
         .collect();
     files.sort();
-    let mut nodes: Vec<(String, String, String, i64)> = store
+    let mut nodes: Vec<NodeRow> = store
         .all_nodes()
         .unwrap()
         .into_iter()

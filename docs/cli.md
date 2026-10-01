@@ -1045,6 +1045,25 @@ output, so it stays indexed and watched. The root `.gitignore` prunes the index
 and the watcher alike, with git's own rules: a slash-less rule applies at any
 depth, a leading or inner `/` anchors it to the project root, `*` and `**` glob,
 and `!` re-includes a path unless a directory above it is ignored.
+
+Indexing follows symlinked files and directories, including targets outside
+the project, and indexes their files under the link's own path. A directory is
+indexed once, under the path that reaches it through the fewest symlinks; a tie
+goes to the alphabetically first path. So a real directory always wins over a
+link to it, and of two links to one target the first path wins. A link is not
+followed to the project root or a directory above it, into the project's `.git`
+or index root, or to a target that is missing or unreadable. Ignore rules judge
+a link at its own path, so a link named `node_modules` is skipped like the
+directory. Each full index records the links it followed. A later `sync` re-reads
+every file behind a link that is new or now points elsewhere, even when the size
+and modification time look unchanged. An index built before that record
+existed is re-read once below every link. The watcher watches the directories
+indexing reached through a link. Creating, removing or retargeting a link
+schedules one full reconcile. An edit to a file that a file symlink points at
+also re-indexes the symlink. One exception is not watched: a file symlink whose
+target lies outside every indexed directory. Edits to that target are picked
+up by the next full `sync`.
+
 This keeps the total watch count well inside the OS inotify limit on large trees
 and makes daemon startup fast. A newly-created non-ignored directory is picked up
 automatically on its create event — no restart required.

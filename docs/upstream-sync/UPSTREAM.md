@@ -42,9 +42,10 @@ below remain immutable historical evidence.
 >
 > - **The UI family is DEFERRED** — the viewer and F1–F12, by owner decision
 >   (2026-10-01); see Current alignment above and the audit's re-triage table.
-> - **#770 symlinked-directory watching is DEFERRED** until the scan's symlink
->   policy is settled: the scan does not follow symlinked directories, so a
->   watcher that did would watch what is never indexed.
+> - **#770 symlinked-directory watching was DEFERRED at `v0.51.0`**: the scan
+>   did not follow symlinks, so a watcher that did would have watched what was
+>   never indexed. It landed afterwards in #288, together with the #935 scan
+>   port; see the 2026-10-01 symlink entry below.
 > - **#1829 / #1878 git-stamped pending status stays KEEP-RUST** (a full
 >   inventory); its fast path is deferred pending a measurement.
 > - **KEEP-RUST divergences** are recorded row by row in the audit — among them
@@ -116,6 +117,51 @@ below remain immutable historical evidence.
 > that records colby parity — do not infer it from `Cargo.toml`.
 
 ## Sync log
+
+### 2026-10-01 — #935 row CORRECTED; #935 and #770 symlink following LANDED on main (#288)
+
+The 2026-06-24 `v1.0.1 → v1.1.0` entry below records "In-root symlink indexing
+(#935)" as ALREADY-HAVE. That was wrong. The official `v0.51.0` binary indexed
+only `src/real/a.ts` from
+`{src/real/a.ts, src/afile.ts -> real/a.ts, src/linkdir -> real, src/extlink -> ../../outside/lib}`,
+because the scan skipped every symlink. That row stays as written; this entry
+supersedes it.
+
+The owner decided on 2026-10-01 to follow symlinks by default, as upstream does,
+including targets outside the project. Its design passed the kirocodex
+plan-convergence review in round 3. #288 ports both behaviors: the scan follows
+symlinked files and directories (#935), and the watcher watches what the scan
+reached (#770). A binary built from the PR indexes `src/afile.ts`,
+`src/extlink/out.ts` and `src/real/a.ts` from the same tree. `src/linkdir` adds
+nothing, because the real `src/real` wins.
+
+KEEP-RUST divergences:
+
+- **Precedence:** a directory is scanned once, under the logical path with the
+  fewest symlink hops, ties going to the smallest path. Upstream's winner
+  depends on `read_dir` order.
+- **Targets that are not followed:** a link to the project root or an ancestor
+  of it, a link into the canonical `.git` or a reserved index root, and a
+  missing or unreadable target. Upstream re-walks a parent tree under an
+  ancestor link, and skips `.git` and data directories by entry name only.
+- **Retargets keep `sync` equal to `index --force`:** a full build records its
+  links under `project_metadata` key `followed_links`. Full sync and `status`
+  re-read every path behind a new, retargeted or retyped link, and behind every
+  link when the record is missing.
+- **The watcher takes its links from the scan.** It narrows them by its stricter
+  policy, so it never watches a path the scan did not reach. Native-recursive
+  backends add up to 256 supplemental watches; that cap matches upstream. An
+  edit to a file link's target re-indexes the link.
+- **Known limitation, as upstream:** a file link whose target lies outside every
+  scanned directory is not watched; the next full sync picks it up.
+
+#286 (`f23b0bd`) fixed a pre-existing `v0.51.0` defect found along the way. A
+full sync judged scope with the watcher's stricter policy, so it deleted indexed
+files under `.cache`, `vcpkg_installed`, the other watch-only defaults, and
+top-level `.codegraph-*` directories.
+
+Goldens: all 19 re-indexable corpora are byte-identical; they contain no
+symlinks. The change ships in the next release.
 
 ### 2026-10-01 — CLOSEOUT: `v1.6.0 → v1.6.1` sync COMPLETE in codegraph-rs `v0.51.0` (tracked parity advanced to `v1.6.1`)
 

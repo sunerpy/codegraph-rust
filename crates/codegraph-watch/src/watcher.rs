@@ -411,7 +411,11 @@ impl LinkState {
             })
         };
         Self {
-            link_paths: scan.links.iter().map(|link| link.relative.clone()).collect(),
+            link_paths: scan
+                .links
+                .iter()
+                .map(|link| link.relative.clone())
+                .collect(),
             watched_dirs: scan
                 .linked_dirs
                 .iter()
@@ -625,8 +629,14 @@ fn relink(
             RecursiveMode::NonRecursive,
         ),
         WatchRegistration::SingleRootRecursive => (
-            old_supplemental.iter().map(|(dir, _)| dir.clone()).collect(),
-            new_supplemental.iter().map(|(dir, _)| dir.clone()).collect(),
+            old_supplemental
+                .iter()
+                .map(|(dir, _)| dir.clone())
+                .collect(),
+            new_supplemental
+                .iter()
+                .map(|(dir, _)| dir.clone())
+                .collect(),
             RecursiveMode::Recursive,
         ),
     };
@@ -1021,13 +1031,13 @@ impl ProjectWatcher {
             .filter_map(|dir| policy.normalize_relative(dir))
             .collect::<BTreeSet<_>>();
         known_dirs.extend(link_state.watched_dirs.iter().cloned());
-        let (supplemental, supplemental_truncated) =
-            if watch_registration(platform_watch_backend()) == WatchRegistration::SingleRootRecursive
-            {
-                supplemental_watches(&link_state.dir_links)
-            } else {
-                (Vec::new(), false)
-            };
+        let (supplemental, supplemental_truncated) = if watch_registration(platform_watch_backend())
+            == WatchRegistration::SingleRootRecursive
+        {
+            supplemental_watches(&link_state.dir_links)
+        } else {
+            (Vec::new(), false)
+        };
         if supplemental_truncated && let Some(callback) = &options.on_sync_error {
             callback(format!(
                 "watching only the first {MAX_SUPPLEMENTAL_WATCHES} symlinked directories; \
@@ -1512,8 +1522,7 @@ fn event_loop(ctx: EventLoopCtx) {
                                 last_seen_ms: now,
                             });
                     }
-                    let removal =
-                        effective_removal(removal, &relative, &known_dirs, path.is_dir());
+                    let removal = effective_removal(removal, &relative, &known_dirs, path.is_dir());
                     if classify_removed_directory(removal, &relative, &mut known_dirs) {
                         if runtime_scope.policy.should_watch_dir(&relative) {
                             full_sync_pending = true;
@@ -3978,7 +3987,10 @@ mod tests {
         fs::write(outside.0.join("x.ts"), "export const x = 2;\n").unwrap();
         let seen = wait_until(|| saw_path(&synced, "ext/x.ts"));
         watcher.stop();
-        assert!(seen, "an edit behind a followed link syncs its logical path");
+        assert!(
+            seen,
+            "an edit behind a followed link syncs its logical path"
+        );
     }
 
     #[test]
@@ -3996,7 +4008,8 @@ mod tests {
         }
         let (watcher, synced, _) = recording_watcher(dir.path());
         fs::write(dir.path().join("src/real/a.ts"), "export const a = 2;\n").unwrap();
-        let seen = wait_until(|| saw_path(&synced, "src/real/a.ts") && saw_path(&synced, "src/afile.ts"));
+        let seen =
+            wait_until(|| saw_path(&synced, "src/real/a.ts") && saw_path(&synced, "src/afile.ts"));
         watcher.stop();
         assert!(seen, "a file link is re-indexed with the file it aliases");
     }
@@ -4038,7 +4051,10 @@ mod tests {
         assert!(created, "creating a directory link schedules a full sync");
         assert!(watched_first, "the new link's target is watched");
         assert!(retargeted, "retargeting a link schedules a full sync");
-        assert!(watched_second, "the retargeted link resolves to its new target");
+        assert!(
+            watched_second,
+            "the retargeted link resolves to its new target"
+        );
         assert!(removed, "removing a link schedules a full sync");
     }
 }
