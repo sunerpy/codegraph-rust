@@ -59,7 +59,11 @@ below remain immutable historical evidence.
 > - **KEEP-RUST divergences** are recorded row by row in the audit — among them
 >   a parameter-pack constructor declines its overload set (upstream admits it
 >   unbounded), a self-closing `<sqlMap/>` is never a statement-map root, and a
->   `this.a.b.m()` chain keeps its last segment.
+>   `this.a.b.m()` chain keeps its last segment. Three more came out of the
+>   retroactive review, in #291: a store initializer's own calls stay with the
+>   store, an explicit `export default NAME` binding beats an exported
+>   component, and a trim note never claims that gap markers name every elided
+>   symbol. See the 2026-10-01 retroactive-review entry below.
 > - The `1.5.0 → 1.6.0` and older caveats below carry forward unchanged.
 
 > **1.5.0 → 1.6.0 sync: COMPLETE** (codegraph-rs `v0.48.2` → `v0.50.1`).
@@ -125,6 +129,74 @@ below remain immutable historical evidence.
 > that records colby parity — do not infer it from `Cargo.toml`.
 
 ## Sync log
+
+### 2026-10-01 — Retroactive review of the `v1.6.1` port PRs: four port defects FIXED (#291)
+
+The owner asked for a kirocodex review of the large PRs that merged before
+large changes needed one. The goal gate reviewed each merged commit against its
+parent at `high` effort, with the PR description as the claims under review.
+Then every blocking item was checked against `main` (`c00aa2b`) and upstream
+`v1.6.1` (`f4ddf50`).
+
+| PR   | Verdict | Blocking items | Outcome                                                                     |
+| ---- | ------- | -------------- | --------------------------------------------------------------------------- |
+| #271 | PASS    | 0              | —                                                                           |
+| #275 | PASS    | 0              | —                                                                           |
+| #277 | FAIL    | 2              | one fixed, one kept at upstream behavior                                    |
+| #278 | FAIL    | 4              | two fixed, one kept at upstream behavior, one about evidence only           |
+| #279 | PASS    | 0              | its one defect, the full-sync scope, was already fixed by #286              |
+| #281 | FAIL    | 1              | fixed                                                                       |
+| #282 | FAIL    | 3              | all three kept at upstream behavior                                         |
+
+**Fixed in #291, extraction version 18:**
+
+- **#1349 gap.** The Vue extractor mints its own script-block functions and
+  still called `generate_node_id` directly. Two same-name declarations on one
+  line therefore shared an id, and the store kept one row. Upstream reaches its
+  allocator by delegating Vue scripts to its tree-sitter extractor. The port now
+  uses `NodeIdAllocator` there, with the same block-relative line and UTF-16
+  column.
+- **KEEP-RUST: a store initializer's own calls stay with the store.** After
+  #277, an exported store's inline actions were function nodes, and the rest of
+  the initializer went unwalked. `create`, `persist` and their options' calls
+  were lost; the port had recorded them before #277. Upstream skips the
+  initializer the same way (`membersExtractedSeparately`). The walk now skips
+  only the extracted action values, and it treats the factory closure as the
+  store's body, so a curried `create<S>()(...)` mints no function named after
+  the store.
+- **KEEP-RUST: an explicit `export default NAME` binding beats an exported
+  component.** The React resolver mints component nodes inside `.js` and `.ts`
+  modules. Upstream's lookup (`defaultComponent ?? defaultExportBindingNode ??
+  defaultFnClass`) bound a default import to the module's first exported
+  component. In a module exporting `function Screen() { return <div /> }`
+  beside `const Api = { upload }; export default Api`, `Api.upload()` became a
+  call to `Screen`, and the `upload` edge was lost.
+- **KEEP-RUST: the trim note never claims that gap markers name every elided
+  symbol.** A gap marker names what it hides only from the budget its file has
+  spare. The tail marker after a dropped or windowed cluster names nothing, and
+  a dropped file appears only in the pointer list. Both tiers' notes, like
+  upstream's (`tools.ts:1302`, `:7272`), still said the markers named what was
+  elided. They now say the markers name what room allowed.
+
+**Kept at upstream behavior.** Each of these review findings describes
+upstream's own design, and in each case the upstream source says why:
+
+- **#277:** `.getState().member()` binds for a store built by any factory, not
+  only Zustand's `create`. Upstream's `matchStoreAccessorChain` checks Zustand
+  provenance only for selectors. The member must still sit in that holder's own
+  object literal. A provenance gate would also drop `zustand/vanilla`, wrapped
+  and locally re-exported stores.
+- **#278:** an unknown receiver falls back to a project-unique method name
+  ("Unknown receivers retain the old unique-or-drop discipline"). This
+  predates #278.
+- **#282:** `#if` reads a literal, one `defined()` or a bare name, so a compound
+  condition is unknown and keeps the call. `#ifndef X` followed by an empty
+  `#define X` reads as the guard idiom (`guardsItself`). Any `initializer_list`
+  constructor declines its overload set, because the reference carries arity,
+  not the brace or paren form.
+
+The fourth #278 item asked for an exact-head evidence artifact. #278 merged
+after CI run `36798356332` passed on a tree-identical head.
 
 ### 2026-10-01 — `v0.52.0` RELEASED: #286, #288 and #289 shipped
 

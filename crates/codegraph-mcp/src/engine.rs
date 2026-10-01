@@ -5411,7 +5411,12 @@ const COMPLETENESS_RULE: &str = "---";
 /// The trim note emitted at tiers that gate the completeness signal OFF. It is
 /// only reached when a file was actually trimmed, but `any_file_trimmed` is
 /// loop-determined, so the pre-loop reserve has to assume it.
-const TRIMMED_NOTE: &str = "> Some file sections were trimmed for size. Elided symbols are named inside gap markers as `name (file:line)` and preferred in the file header — run another `codegraph_explore` (or `codegraph_node`) with those exact names for their source.";
+///
+/// It never says every elided symbol is named: a gap marker names what it
+/// hides only from the budget its file has spare (#2057), the tail marker after
+/// a dropped or windowed cluster names nothing, and a dropped file appears only
+/// in the pointer list. Upstream's wording claims the markers name them all.
+const TRIMMED_NOTE: &str = "> Some file sections were trimmed for size. Gap markers name elided symbols as `name (file:line)` only where room allowed, and the file header prefers them — run another `codegraph_explore` (or `codegraph_node`) for their source.";
 
 /// One symbol a file section set out to deliver: a cluster member, or a node
 /// of a section that renders no source (#2077). Completeness is judged against
@@ -5529,7 +5534,8 @@ fn complete_source_note(files: &str) -> String {
     )
 }
 
-const TRIMMED_NOTE_WHAT: &str = "gap markers and file headers name what was elided";
+/// Never "name what was elided", as upstream says: see [`TRIMMED_NOTE`].
+const TRIMMED_NOTE_WHAT: &str = "gap markers and headers name what room allowed";
 const TRIMMED_NOTE_TAIL: &str = "For those, or anything under \"Not shown above\", make ANOTHER codegraph_explore with those exact names instead of reading the files — it returns their source with line numbers.";
 
 fn trimmed_note_head(files: &str) -> String {
@@ -6545,6 +6551,21 @@ mod tests {
         assert!(completeness_note_floor(8) >= notes[2].len());
         assert!(completeness_note_floor(8) >= completeness_notes(8, &[], &known)[0].len());
         assert!(completeness_note_floor(8) >= completeness_notes(0, &trimmed, &known)[2].len());
+    }
+
+    #[test]
+    fn trim_notes_never_claim_every_elided_symbol_is_named() {
+        let trimmed = vec![(
+            "src/a.ts".to_string(),
+            vec![wanted("f", 1, 9, 10, "function")],
+        )];
+        let mut notes = completeness_notes(1, &trimmed, &["src/a.ts".to_string()]);
+        notes.push(TRIMMED_NOTE.to_string());
+        for note in &notes {
+            assert!(!note.contains("name what was elided"), "{note}");
+            assert!(!note.contains("Elided symbols are named"), "{note}");
+            assert!(note.contains("room allowed"), "{note}");
+        }
     }
 
     #[test]

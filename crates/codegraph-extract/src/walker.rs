@@ -344,6 +344,19 @@ pub struct TreeSitterWalker<'a, 'tree> {
     /// Latched once a child would exceed [`MAX_WALK_DEPTH`]. All remaining
     /// descent stops and `extract` discards the partial graph.
     walk_aborted: bool,
+    /// Set while an exported store's initializer is walked for the store's
+    /// own calls; see [`StoreWalk`].
+    store_walk: Option<StoreWalk>,
+}
+
+/// The parts of a store initializer that its walk must not treat as the
+/// store's own code.
+struct StoreWalk {
+    /// The factory closure whose body returns the action object. It is walked
+    /// as the store's body, never bound as a function named after the store.
+    factory: Option<usize>,
+    /// The action values that became function nodes of their own.
+    actions: Vec<usize>,
 }
 
 impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
@@ -372,6 +385,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             cfml_consumed_until: 0,
             walk_depth: 0,
             walk_aborted: false,
+            store_walk: None,
         }
     }
 
@@ -3113,10 +3127,23 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                     // An exported store — `create((set, get) => ({ reset: () =>
                     // set({}) }))`, middleware wrappers included — owns the
                     // inline actions of the object its initializer returns
-                    // (upstream #647/#1862). The initializer is not walked as a
-                    // whole: that would re-attribute every action's calls to
-                    // the store itself.
-                    self.extract_js_object_literal_members(actions, owner_id);
+                    // (upstream #647/#1862).
+                    let actions_ids = self.extract_js_object_literal_members(actions, owner_id);
+                    // The rest of the initializer runs when the store is built:
+                    // the `create`/`persist` wrappers, their options, a block
+                    // factory's setup. Those calls stay the store's (#693), as
+                    // they were before the actions became nodes; upstream skips
+                    // the whole initializer here and drops them. Only the
+                    // extracted actions are skipped, so no action's calls are
+                    // counted for the store as well.
+                    let previous = self.store_walk.replace(StoreWalk {
+                        factory: nearest_function_ancestor(actions).map(|factory| factory.id()),
+                        actions: actions_ids,
+                    });
+                    self.node_stack.push(owner_id.to_string());
+                    self.visit_function_body(value);
+                    self.node_stack.pop();
+                    self.store_walk = previous;
                 } else {
                     match declared_id {
                         Some(id) => {
@@ -3152,7 +3179,14 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     /// range is inside that holder. Nested objects are deliberately not recursed
     /// into, which lets resolution distinguish `api.run()` from
     /// `api.nested.run()` by direct range containment.
-    fn extract_js_object_literal_members(&mut self, object: SyntaxNode<'tree>, owner_id: &str) {
+    ///
+    /// Returns the tree node ids of the extracted member values.
+    fn extract_js_object_literal_members(
+        &mut self,
+        object: SyntaxNode<'tree>,
+        owner_id: &str,
+    ) -> Vec<usize> {
+        let mut extracted = Vec::new();
         self.node_stack.push(owner_id.to_string());
         for member in object.named_children(&mut object.walk()) {
             if member.kind() == "method_definition" {
@@ -3163,6 +3197,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                     continue;
                 };
                 self.extract_function(member, Some(name));
+                extracted.push(member.id());
                 continue;
             }
             if member.kind() != "pair" {
@@ -3179,6 +3214,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                     && let Some(bound) = self.curried_wrapper_bound_name(function)
                 {
                     self.extract_function(function, Some(bound));
+                    extracted.push(function.id());
                 }
                 continue;
             }
@@ -3197,8 +3233,10 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 continue;
             };
             self.extract_function(value, Some(name));
+            extracted.push(value.id());
         }
         self.node_stack.pop();
+        extracted
     }
 
     fn extract_python_assignment(&mut self, node: SyntaxNode<'tree>) {
@@ -4309,6 +4347,13 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         if self.walk_aborted {
             return;
         }
+        if self
+            .store_walk
+            .as_ref()
+            .is_some_and(|walk| walk.actions.contains(&node.id()))
+        {
+            return;
+        }
         if self.walk_depth >= MAX_WALK_DEPTH {
             self.walk_aborted = true;
             return;
@@ -4367,7 +4412,12 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             self.maybe_cpp_construction(node);
         }
 
-        if has_type(self.spec.function_types(), node_type) {
+        if has_type(self.spec.function_types(), node_type)
+            && self
+                .store_walk
+                .as_ref()
+                .is_none_or(|walk| walk.factory != Some(node.id()))
+        {
             let nested_name = self.extract_name(node);
             if !nested_name.is_empty() && nested_name != "<anonymous>" {
                 self.extract_function(node, None);
@@ -5229,6 +5279,21 @@ fn initializer_returned_object(call: SyntaxNode<'_>, depth: usize) -> Option<Syn
             "call_expression" => initializer_returned_object(argument, depth + 1),
             _ => None,
         })
+}
+
+/// The closest function enclosing `node`: a store's factory closure.
+fn nearest_function_ancestor(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
+    let mut current = node.parent();
+    while let Some(candidate) = current {
+        if matches!(
+            candidate.kind(),
+            "arrow_function" | "function_expression" | "generator_function"
+        ) {
+            return Some(candidate);
+        }
+        current = candidate.parent();
+    }
+    None
 }
 
 /// The object literal a function returns: the `=> ({ … })` arrow form or a

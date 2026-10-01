@@ -1417,3 +1417,36 @@ fn a_default_import_of_a_later_exported_const_finds_that_const() {
     // first exported function (`unrelated`).
     assert_eq!(project.callees("consume", None), vec!["useStore::read"]);
 }
+
+#[test]
+fn an_explicit_default_binding_beats_an_exported_component() {
+    let project = resolve_project(&files(&[
+        (
+            "package.json",
+            "{\"name\":\"app\",\"dependencies\":{\"react\":\"18\"}}",
+        ),
+        (
+            "src/upload.js",
+            "export function upload(uri) {\n  return uri\n}\n",
+        ),
+        (
+            "src/screen.js",
+            "import { upload } from './upload'\n\
+             import { memo } from 'react'\n\
+             export function Screen() {\n  return <div />\n}\n\
+             export const Card = memo(() => <div />)\n\
+             const Api = {\n  upload,\n}\n\
+             export default Api\n",
+        ),
+        (
+            "src/use.js",
+            "import Api from './screen'\nexport function consume(uri) {\n  return Api.upload(uri)\n}\n",
+        ),
+    ]));
+    // The React resolver makes `Screen` and `Card` component nodes, but a
+    // module's exported component is not its default export: the `export
+    // default NAME` statement says which binding is. Upstream prefers the
+    // first exported component, which made `consume` call `Screen` and lose
+    // its `upload` edge.
+    assert_eq!(project.callees("consume", None), vec!["upload"]);
+}
