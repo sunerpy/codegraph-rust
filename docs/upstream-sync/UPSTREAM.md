@@ -36,6 +36,10 @@
   - #292, the Rust 1.98.0 toolchain and MSRV.
 
   See the dated entries below, including the `v0.52.1` release record.
+- **Shipped in codegraph-rs `v0.52.2`, 2026-10-02:** #295, five KEEP-RUST
+  resolution divergences that fix the findings the retroactive review had kept
+  at upstream behavior, with extraction version 19. See the dated entries
+  below, including the `v0.52.2` release record.
 - **Deferred UI family:** the browser viewer and the graph-semantic families
   F1–F12 that shipped beside it in `v1.6.1` (framework navigation edges and
   routers, the synthesis layer and its schema, cross-tier channels, server route
@@ -140,6 +144,45 @@ below remain immutable historical evidence.
 > that records colby parity — do not infer it from `Cargo.toml`.
 
 ## Sync log
+
+### 2026-10-02 — `v0.52.2` RELEASED: #295 shipped
+
+Release-please PR [#296](https://github.com/sunerpy/codegraph-rust/pull/296)
+merged as `36841bcd398ca0f9bd882a61075ef3a5708b957c` and cut tag `v0.52.2` at
+that exact commit. Its implementation PR #295 merged as `ff52e5c`, from the
+reviewed head `0d3a991` with an identical tree.
+
+Release workflow run
+[`36942112539`](https://github.com/sunerpy/codegraph-rust/actions/runs/36942112539)
+passed all twelve jobs on its first attempt, over main CI run
+[`36942112580`](https://github.com/sunerpy/codegraph-rust/actions/runs/36942112580).
+The release was published at 2026-10-01T23:54:19Z UTC. The official
+`codegraph-0.52.2-x86_64-unknown-linux-musl.tar.gz` digest is
+`fc066b91ad587abd65cb602ccfde4b1a97b4d0dc5d97eff2813581638d25d62e`.
+
+Black-box acceptance of the downloaded release, against the official
+`v0.52.1`, follows the table the plan for #295 fixed in advance:
+
+- `SHA256SUMS` and `gh attestation verify` passed for all six archives. The
+  binary reports `codegraph 0.52.2`, and its `.comment` section names rustc
+  1.98.0.
+- **Zustand provenance:** `run` calls `fake.getState().reset()` on an
+  `otherFactory` store and `useStore.getState().reset()` on a `create` store.
+  Its call targets go from `fake::reset,useStore::reset` to `useStore::reset`.
+- **Unknown receiver:** `pool.submit(self.store.fetch)` with an unannotated
+  `store` gives one reference edge into the only `Store::fetch` before and none
+  now.
+- **`#if 1 || FLAG`:** the `HOOK` call edge, which a definitely visible macro
+  now suppresses, is gone.
+- **Feature-flag default:** `#ifndef FEATURE` / `#define FEATURE` among other
+  code is no guard, so `use2` now calls the real `HOOK2`, where `v0.52.1` had
+  no edge.
+- **Literal paren construction:** `L value(1)` beside
+  `L(std::initializer_list<int>)` now calls `L::L`, the `L(int)` definition;
+  `v0.52.1` declined.
+- **Upgrade:** an index written by `v0.52.1` reads as `outdated`, because the
+  extraction version moved from 18 to 19. `sync` rebuilds it, and it then reads
+  `current`.
 
 ### 2026-10-02 — five more KEEP-RUST divergences: the declined retroactive-review findings FIXED (#295)
 
