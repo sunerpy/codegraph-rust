@@ -137,6 +137,147 @@ fn mentions_initializer_list(signature: &str) -> bool {
         })
 }
 
+/// Whether the FIRST parameter of a constructor signature (`(a, b)` or a
+/// prototype's `(a, b);`) names `initializer_list`.
+fn first_parameter_mentions_initializer_list(signature: &str) -> bool {
+    let Some(open) = signature.find('(') else {
+        return false;
+    };
+    let mut depth = 0usize;
+    for (offset, byte) in signature[open + 1..].bytes().enumerate() {
+        match byte {
+            b'(' | b'<' | b'[' | b'{' => depth += 1,
+            b')' if depth == 0 => {
+                return mentions_initializer_list(&signature[open + 1..open + 1 + offset]);
+            }
+            b',' if depth == 0 => {
+                return mentions_initializer_list(&signature[open + 1..open + 1 + offset]);
+            }
+            b')' | b'>' | b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether the C++ construction `reference` anchors is `T x(<literal>, …)`:
+/// the anchor is the `(` of the initializer, its balanced argument text holds
+/// no `{` (a braced list, or a lambda body, could be or build an
+/// initializer_list), and the first argument is a literal — numeric,
+/// character, string, `true`, `false` or `nullptr`. Such an argument can never
+/// be, or convert to, a `std::initializer_list`.
+fn paren_construction_from_a_literal(reference: &RefView, context: &dyn ResolutionContext) -> bool {
+    static LITERAL: OnceLock<Regex> = OnceLock::new();
+    let literal = LITERAL.get_or_init(|| {
+        Regex::new(concat!(
+            r"^(?:true|false|nullptr",
+            r"|[-+]?(?:0[xX][0-9a-fA-F']+|0[bB][01']+",
+            r"|[0-9][0-9']*(?:\.[0-9']*)?(?:[eE][-+]?[0-9']+)?",
+            r"|\.[0-9][0-9']*(?:[eE][-+]?[0-9']+)?)[uUlLfFzZ]*",
+            r#"|(?:u8|u|U|L)?'(?:\\.|[^'\\])+'"#,
+            r#"|(?:u8|u|U|L)?"(?:\\.|[^"\\])*")$"#,
+        ))
+        .expect("C++ literal pattern")
+    });
+    let Some(facts) = context.source_facts(&reference.file_path) else {
+        return false;
+    };
+    let (Some(line), Ok(column)) = (
+        usize::try_from(reference.line)
+            .ok()
+            .and_then(|line| line.checked_sub(1)),
+        usize::try_from(reference.column),
+    ) else {
+        return false;
+    };
+    let Some(start) = facts.lines().raw_line_start(line) else {
+        return false;
+    };
+    let source = facts.source();
+    let Some(text) = source.get(start + column..) else {
+        return false;
+    };
+    let Some(arguments) = cpp_paren_arguments(text) else {
+        return false;
+    };
+    literal.is_match(first_cpp_argument(arguments).trim())
+}
+
+/// The text inside the balanced `( … )` that `text` opens, or `None` when it
+/// does not open one, never closes, or holds a `{` outside quotes and
+/// comments.
+fn cpp_paren_arguments(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    if bytes.first() != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => i = skip_cpp_quoted(bytes, i, b'"'),
+            // A digit separator (`1'000`) follows a word character.
+            b'\'' if i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') => {
+                i = skip_cpp_quoted(bytes, i, b'\'');
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                i = text[i..].find('\n').map_or(bytes.len(), |end| i + end);
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i = text[i + 2..].find("*/").map(|end| i + 2 + end + 2)?;
+            }
+            b'{' => return None,
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return text.get(1..i);
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// The index just past the literal quoted by `quote` that opens at `start`.
+fn skip_cpp_quoted(bytes: &[u8], start: usize, quote: u8) -> usize {
+    let mut i = start + 1;
+    while i < bytes.len() && bytes[i] != quote {
+        i += if bytes[i] == b'\\' { 2 } else { 1 };
+    }
+    i + 1
+}
+
+/// The first comma-separated argument of an argument list's inner text.
+fn first_cpp_argument(arguments: &str) -> &str {
+    let bytes = arguments.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                i = skip_cpp_quoted(bytes, i, b'"');
+                continue;
+            }
+            b'\'' if i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') => {
+                i = skip_cpp_quoted(bytes, i, b'\'');
+                continue;
+            }
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => return &arguments[..i],
+            _ => {}
+        }
+        i += 1;
+    }
+    arguments
+}
+
 fn cpp_type_spelling_matches(spelled: &str, qualified: &str) -> bool {
     if spelled.contains("::") {
         qualified == spelled
@@ -1775,14 +1916,32 @@ impl ReferenceResolver {
             })
             .collect::<Vec<_>>();
         // Brace-init prefers an initializer_list overload over arity, a choice
-        // that needs the argument types, so decline (upstream #1839).
+        // that needs the argument types, so decline (upstream #1839). Upstream
+        // declines every form; the port keeps `T x(<literal>, …)`: a literal is
+        // never an initializer_list, so a constructor whose FIRST parameter is
+        // the list cannot take it, and the rest compete by arity (KEEP-RUST).
+        let mut constructors = constructors;
         if constructors.iter().any(|candidate| {
             candidate
                 .signature
                 .as_deref()
                 .is_some_and(mentions_initializer_list)
         }) {
-            return None;
+            let list_first_only = constructors.iter().all(|candidate| {
+                candidate.signature.as_deref().is_none_or(|signature| {
+                    !mentions_initializer_list(signature)
+                        || first_parameter_mentions_initializer_list(signature)
+                })
+            });
+            if !list_first_only || !paren_construction_from_a_literal(reference, context) {
+                return None;
+            }
+            constructors.retain(|candidate| {
+                !candidate
+                    .signature
+                    .as_deref()
+                    .is_some_and(first_parameter_mentions_initializer_list)
+            });
         }
         // A prototype and its out-of-line definition describe one overload:
         // merge their admissible counts, so a default declared on the
@@ -3122,6 +3281,37 @@ mod tests {
         r.original.reference_subkind = Some(codegraph_core::types::ReferenceSubkind::ScriptAttach);
         let meta = build_edge_metadata(&r);
         assert_eq!(meta["subkind"].as_str(), Some("script_attach"));
+    }
+
+    #[test]
+    fn constructor_argument_scans_see_only_real_syntax() {
+        assert!(first_parameter_mentions_initializer_list(
+            "(std::initializer_list<int> values)"
+        ));
+        assert!(first_parameter_mentions_initializer_list(
+            "(const std::initializer_list<std::pair<int, int>>& values);"
+        ));
+        assert!(!first_parameter_mentions_initializer_list(
+            "(int a, std::initializer_list<int> rest)"
+        ));
+        assert!(!first_parameter_mentions_initializer_list("(int one)"));
+
+        assert_eq!(
+            cpp_paren_arguments("(1, \"a{\", 'b') rest"),
+            Some("1, \"a{\", 'b'")
+        );
+        assert_eq!(cpp_paren_arguments("(1 /* { */ ) x"), Some("1 /* { */ "));
+        assert_eq!(cpp_paren_arguments("(1'000)"), Some("1'000"));
+        assert_eq!(cpp_paren_arguments("(\n    1); }"), Some("\n    1"));
+        // Any brace could be or build a list: a braced argument, a lambda.
+        assert_eq!(cpp_paren_arguments("({1})"), None);
+        assert_eq!(cpp_paren_arguments("(f([] { return 1; }))"), None);
+        assert_eq!(cpp_paren_arguments("(1"), None);
+        assert_eq!(cpp_paren_arguments("x(1)"), None);
+
+        assert_eq!(first_cpp_argument("f(a, b), 2"), "f(a, b)");
+        assert_eq!(first_cpp_argument("'a', 2"), "'a'");
+        assert_eq!(first_cpp_argument("\",\", 2"), "\",\"");
     }
 
     #[test]

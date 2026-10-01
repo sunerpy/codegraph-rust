@@ -446,3 +446,71 @@ fn array_elements_reach_their_constructors_and_keep_nested_calls() {
     assert_eq!(graph.calls("pointers"), Vec::<String>::new());
     assert_eq!(graph.calls("prototype"), Vec::<String>::new());
 }
+
+#[test]
+fn paren_construction_from_a_literal_skips_initializer_list_constructors() {
+    let graph = resolve_project(
+        "paren-literal",
+        &[(
+            "listed.cpp",
+            concat!(
+                "namespace std { template <class T> class initializer_list {}; }\n",
+                "struct Listed {\n",
+                "  Listed(std::initializer_list<int> values) {}\n",
+                "  Listed(int one) {}\n",
+                "};\n",
+                "struct Second {\n",
+                "  Second(int a, std::initializer_list<int> rest) {}\n",
+                "  Second(int a, int b) {}\n",
+                "};\n",
+                "void literal() { Listed l(1); }\n",
+                "void negative() { Listed l(-1); }\n",
+                "void character() { Listed l('a'); }\n",
+                "void multiline() { Listed l(\n",
+                "    1); }\n",
+                "void variable() { std::initializer_list<int> xs; Listed l(xs); }\n",
+                "void braced_argument() { Listed l({1}); }\n",
+                "void braced() { Listed l{1}; }\n",
+                "void second() { Second s(1, 2); }\n",
+            ),
+        )],
+    );
+    // A literal can never be, or convert to, an initializer_list, so under
+    // parentheses `Listed(int)` (line 4) is the only constructor that can take
+    // it. An identifier's type is unknown, braces prefer the list, and a list
+    // past the first parameter needs more than the first argument: decline.
+    let lines = [
+        "literal",
+        "negative",
+        "character",
+        "multiline",
+        "variable",
+        "braced_argument",
+        "braced",
+        "second",
+    ]
+    .map(|caller| {
+        let targets = graph.call_targets(graph.function(caller));
+        (
+            caller,
+            targets
+                .iter()
+                .map(|node| node.start_line)
+                .collect::<Vec<_>>(),
+        )
+    })
+    .to_vec();
+    assert_eq!(
+        lines,
+        vec![
+            ("literal", vec![4]),
+            ("negative", vec![4]),
+            ("character", vec![4]),
+            ("multiline", vec![4]),
+            ("variable", vec![]),
+            ("braced_argument", vec![]),
+            ("braced", vec![]),
+            ("second", vec![]),
+        ]
+    );
+}
