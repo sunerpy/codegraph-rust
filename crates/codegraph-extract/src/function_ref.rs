@@ -137,13 +137,23 @@ const OBJC_SPEC: FnRefSpec = c_family_spec(&["selector_expression"], false);
 
 /// Ports `TS_JS_SPEC` (function-ref.ts:177-187).
 const TS_JS_SPEC: FnRefSpec = FnRefSpec {
-    id_types: &["identifier"],
+    // `shorthand_property_identifier`: `{ handleSubmit }` — the object a hook
+    // returns its handlers in, and a namespace object's members.
+    id_types: &["identifier", "shorthand_property_identifier"],
     dispatch: &[
         ("arguments", CaptureMode::Args, None),
         ("assignment_expression", CaptureMode::Rhs, Some("right")),
         ("variable_declarator", CaptureMode::VarInit, Some("value")),
         ("pair", CaptureMode::Value, Some("value")),
         ("array", CaptureMode::List, None),
+        // A JSX attribute value or child — `onPress={handleSubmit}`,
+        // `renderItem={renderRow}`: React's handler-binding idiom. A spread or
+        // a call normalizes to nothing.
+        ("jsx_expression", CaptureMode::List, None),
+        // An object literal's shorthand members — `return { handleApprove }`
+        // from a hook, `const Api = { upload }`. Only a shorthand identifier
+        // normalizes; a `pair` is its own container above.
+        ("object", CaptureMode::List, None),
     ],
     layers: &[],
     unwrap: &[],

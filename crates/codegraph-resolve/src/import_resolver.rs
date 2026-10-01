@@ -1969,8 +1969,10 @@ fn find_exported_symbol(
     let nodes_in_file = context.get_nodes_in_file_shared(file_path);
     let re_exports = context.get_re_exports(file_path, language);
 
+    // A default request is answered below, where a component file and the
+    // `export default NAME` binding take precedence (upstream F13).
     let requested_name = if want.is_default {
-        Some("default")
+        None
     } else if want.is_namespace {
         want.member_name.as_deref()
     } else {
@@ -1997,9 +1999,39 @@ fn find_exported_symbol(
 
     // Direct hit (import-resolver.ts:1829-1853).
     if want.is_default {
+        // A component file IS its default export; otherwise the binding an
+        // `export default NAME` statement names — a function, class, component,
+        // or a namespace object such as `const Api = { upload }` that is not
+        // exported at its declaration — beats the first-exported-function
+        // guess (upstream F13 / `defaultExportBindingNode`).
+        let bound_name = re_exports.iter().find_map(|rex| match rex {
+            ReExport::LocalAlias {
+                exported_name,
+                original_name,
+            } if exported_name == "default" => Some(original_name.as_str()),
+            _ => None,
+        });
+        let bound = || {
+            let name = bound_name?;
+            nodes_in_file
+                .iter()
+                .filter(|n| {
+                    n.name == name
+                        && matches!(
+                            n.kind,
+                            NodeKind::Function
+                                | NodeKind::Class
+                                | NodeKind::Component
+                                | NodeKind::Constant
+                                | NodeKind::Variable
+                        )
+                })
+                .min_by_key(|n| (n.start_line, n.start_column))
+        };
         if let Some(direct) = nodes_in_file
             .iter()
             .find(|n| n.is_exported && n.kind == NodeKind::Component)
+            .or_else(bound)
             .or_else(|| {
                 nodes_in_file.iter().find(|n| {
                     n.is_exported && matches!(n.kind, NodeKind::Function | NodeKind::Class)

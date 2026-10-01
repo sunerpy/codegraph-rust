@@ -287,3 +287,57 @@ export const mixed = {
     let make = node(&result, NodeKind::Function, "make");
     assert!(!calls_from(&result, &make.id).contains(&"helper"));
 }
+
+#[test]
+fn jsx_attributes_and_returned_shorthands_are_function_values() {
+    // Upstream F13 (`873f133`): `onPress={handleApprove}` and a hook's
+    // `return { handleApprove, handleRetake, extra: helper }` hand handlers
+    // out as values; a shorthand naming a non-callable (`count`) does not.
+    let screen = extract(
+        "src/app/review.tsx",
+        r#"
+import { useCallback } from 'react'
+export default function ReviewScreen() {
+  const handleApprove = useCallback(() => {
+    finalize()
+  }, [])
+  return <Button onPress={handleApprove} />
+}
+"#,
+        Language::Tsx,
+    );
+    let component = node(&screen, NodeKind::Function, "ReviewScreen");
+    assert!(
+        screen.unresolved_references.iter().any(|reference| {
+            reference.from_node_id == component.id
+                && reference.is_function_ref
+                && reference.reference_name == "handleApprove"
+        }),
+        "{:#?}",
+        screen.unresolved_references
+    );
+
+    let hooks = extract(
+        "src/hooks.ts",
+        r#"
+import { useCallback } from 'react'
+export function useReviewHandlers() {
+  const handleApprove = useCallback(() => { finalize() }, [])
+  const handleRetake = useCallback(() => { retake() }, [])
+  const count = 1
+  return { handleApprove, handleRetake, count, extra: helper }
+}
+function helper() {}
+"#,
+        Language::TypeScript,
+    );
+    let hook = node(&hooks, NodeKind::Function, "useReviewHandlers");
+    let mut values = hooks
+        .unresolved_references
+        .iter()
+        .filter(|reference| reference.from_node_id == hook.id && reference.is_function_ref)
+        .map(|reference| reference.reference_name.as_str())
+        .collect::<Vec<_>>();
+    values.sort_unstable();
+    assert_eq!(values, vec!["handleApprove", "handleRetake", "helper"]);
+}

@@ -1359,3 +1359,61 @@ export function crossCaller() { return facade.run(); }
         "{nested:?}"
     );
 }
+
+// ---- default-export namespace objects (F13) --------------------------------
+
+#[test]
+fn a_default_exported_namespace_object_resolves_its_members() {
+    let project = resolve_project(&files(&[
+        ("package.json", "{\"name\":\"app\"}"),
+        (
+            "src/api/frames.ts",
+            "export async function uploadARCapture(uri: string) {\n  return uri\n}\n",
+        ),
+        (
+            "src/api/folders.ts",
+            "export function createFolder(name: string) {\n  return name\n}\n",
+        ),
+        (
+            "src/api/index.ts",
+            "import { uploadARCapture } from './frames'\n\
+             import { createFolder } from './folders'\n\
+             function localHelper() {\n  return 1\n}\n\
+             const UploadApi = {\n  uploadARCapture,\n  makeFolder: createFolder,\n  localHelper,\n}\n\
+             export default UploadApi\n",
+        ),
+        (
+            "src/hooks.ts",
+            "import UploadApi from './api'\n\
+             export function handleZipComplete(uri: string) {\n\
+             \x20 UploadApi.makeFolder(uri)\n\
+             \x20 UploadApi.localHelper()\n\
+             \x20 return UploadApi.uploadARCapture(uri)\n\
+             }\n",
+        ),
+    ]));
+    assert_eq!(
+        project.callees("handleZipComplete", None),
+        vec!["createFolder", "localHelper", "uploadARCapture"]
+    );
+}
+
+#[test]
+fn a_default_import_of_a_later_exported_const_finds_that_const() {
+    let project = resolve_project(&files(&[
+        ("package.json", "{\"name\":\"app\"}"),
+        (
+            "src/store.ts",
+            "const useStore = {\n  read() {\n    return 1\n  },\n}\n\
+             export function unrelated() {\n  return 2\n}\n\
+             export default useStore\n",
+        ),
+        (
+            "src/use.ts",
+            "import store from './store'\nexport function consume() {\n  return store.read()\n}\n",
+        ),
+    ]));
+    // Without the `export default NAME` binding the default import guessed the
+    // first exported function (`unrelated`).
+    assert_eq!(project.callees("consume", None), vec!["useStore::read"]);
+}
