@@ -356,33 +356,60 @@ pub fn parse_json_object(text: &str) -> Option<Map<String, Value>> {
     }
 }
 
-/// Read an agent config file, distinguishing missing / parsed / unparseable.
+/// Read an agent config file on a WRITE path, distinguishing missing / parsed /
+/// unparseable.
 ///
 /// Tolerates JSONC (comments + trailing commas). A present-but-unparseable file
 /// is backed up to `<path>.backup` and reported as [`ConfigRead::Unparseable`]
 /// WITHOUT being modified, so the caller can skip writing instead of clobbering
 /// the user's config.
 pub fn read_config_file(path: &Path) -> ConfigRead {
+    let read = read_config(path);
+    if matches!(read, ConfigRead::Unparseable) {
+        let _ = fs::copy(path, path.with_extension("backup"));
+    }
+    read
+}
+
+/// Read a JSON/JSONC file into a map, `{}` when missing or unparseable.
+///
+/// Read-only and silent: every target's `detect()` reads its agent's config
+/// on every run, including agents codegraph was never installed into, and
+/// `install --refresh` skips the unconfigured ones on that answer, so a
+/// `.backup` left by a read would touch a config codegraph has no business
+/// touching (upstream #1870). Callers on the WRITE path must NOT use this (it
+/// cannot signal the unparseable case); use [`read_config_file`] and abort on
+/// [`ConfigRead::Unparseable`] there.
+pub fn read_json_file(path: &Path) -> Map<String, Value> {
+    match read_config(path) {
+        ConfigRead::Parsed(map) => map,
+        ConfigRead::Missing | ConfigRead::Unparseable => Map::new(),
+    }
+}
+
+fn read_config(path: &Path) -> ConfigRead {
     let Ok(text) = fs::read_to_string(path) else {
         return ConfigRead::Missing;
     };
     match parse_json_object(&text) {
         Some(map) => ConfigRead::Parsed(map),
-        None => {
-            let _ = fs::copy(path, path.with_extension("backup"));
-            ConfigRead::Unparseable
-        }
+        None => ConfigRead::Unparseable,
     }
 }
 
-/// Read a JSON/JSONC file into a map. Backward-compatible helper that maps
-/// [`ConfigRead::Missing`] to `{}`. Callers on the WRITE path must NOT use this
-/// (it cannot signal the unparseable case); use [`read_config_file`] and abort
-/// on [`ConfigRead::Unparseable`] there.
-pub fn read_json_file(path: &Path) -> Map<String, Value> {
-    match read_config_file(path) {
-        ConfigRead::Parsed(map) => map,
-        ConfigRead::Missing | ConfigRead::Unparseable => Map::new(),
+/// Copy a config about to be replaced to `<path>.backup` when it does not
+/// parse: a read handed the caller `{}` for it, so the write is a replacement,
+/// not an edit. No-op when the file is absent or parses.
+fn backup_unparseable_config(path: &Path) {
+    let Ok(bytes) = fs::read(path) else {
+        return;
+    };
+    if std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(parse_json_object)
+        .is_none()
+    {
+        let _ = fs::copy(path, path.with_extension("backup"));
     }
 }
 
@@ -406,7 +433,11 @@ pub fn atomic_write_file(path: &Path, content: &str) -> std::io::Result<()> {
 
 /// Atomic JSON write with a trailing newline. Ports `writeJsonFile`
 /// (shared.ts:99) — `JSON.stringify(data, null, 2) + '\n'`.
+///
+/// The one place a target replaces a JSON config, so it is also where an
+/// unparseable one is preserved (upstream #1870).
 pub fn write_json_file(path: &Path, data: &Map<String, Value>) -> std::io::Result<()> {
+    backup_unparseable_config(path);
     let mut content = to_upstream_json(&Value::Object(data.clone()));
     content.push('\n');
     atomic_write_file(path, &content)
@@ -1755,6 +1786,36 @@ name = "important-user-tool"
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Reading a config is read-only (upstream #1870): every target's
+    /// `detect()` reads its agent's config on every run, and `install
+    /// --refresh` skips unconfigured agents on that answer, so a read must not
+    /// leave a `.backup` beside a config codegraph never touches. A backup is
+    /// made where a config is about to be replaced, or before a write path
+    /// skips one it cannot parse.
+    #[test]
+    fn reading_an_unparseable_config_leaves_no_backup() {
+        let config = tmp_path("mcp_config.json");
+        let backup = config.with_extension("backup");
+        fs::write(&config, "{ broken").unwrap();
+
+        assert!(read_json_file(&config).is_empty());
+        assert!(!backup.exists(), "a read is not a write");
+
+        assert!(matches!(read_config_file(&config), ConfigRead::Unparseable));
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "{ broken");
+        fs::remove_file(&backup).unwrap();
+
+        let mut data = Map::new();
+        data.insert("k".to_string(), Value::from(1));
+        write_json_file(&config, &data).unwrap();
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "{ broken");
+
+        fs::remove_file(&backup).unwrap();
+        write_json_file(&config, &data).unwrap();
+        assert!(!backup.exists(), "a parseable config needs no backup");
+        let _ = fs::remove_dir_all(config.parent().unwrap());
     }
 
     fn tmp_path(name: &str) -> std::path::PathBuf {
