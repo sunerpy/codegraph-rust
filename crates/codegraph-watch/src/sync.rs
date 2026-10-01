@@ -102,6 +102,12 @@ pub struct SyncOutcome {
     /// this remains populated when another writer (for example startup catch-up)
     /// indexed the same event first and this sync consequently skips it unchanged.
     pub trigger_paths: Vec<String>,
+    /// References the orphan sweep attempted, resolved and left unresolved
+    /// when it ran (upstream #1360), so a sync that healed an interrupted index
+    /// does not read as a no-op. Zero on a healthy index.
+    pub pending_refs_processed: usize,
+    pub pending_refs_resolved: usize,
+    pub pending_refs_unresolved: usize,
 }
 
 /// Read-only difference between the current project scope and the persisted
@@ -556,7 +562,10 @@ fn sync_paths_with_store(
     // healthy index (marker absent) skips this entirely, so an ordinary sync is
     // byte-for-byte unchanged.
     if store.is_resolution_incomplete()? {
-        sweep_orphaned_refs(project_root, store, scope.options.max_file_size)?;
+        let stats = sweep_orphaned_refs(project_root, store, scope.options.max_file_size)?;
+        outcome.pending_refs_processed = stats.total;
+        outcome.pending_refs_resolved = stats.resolved;
+        outcome.pending_refs_unresolved = stats.unresolved;
     }
 
     outcome.duration_ms = started.elapsed().as_millis();
@@ -697,7 +706,11 @@ fn merge_dependent_site(
 /// batched pass re-arms and clears the marker itself, so on success the index is
 /// no longer flagged partial. Framework per-file extract is re-run first so any
 /// framework refs an interrupted run never re-injected are present for the sweep.
-fn sweep_orphaned_refs(project_root: &Path, store: &mut Store, max_file_size: u64) -> Result<()> {
+fn sweep_orphaned_refs(
+    project_root: &Path,
+    store: &mut Store,
+    max_file_size: u64,
+) -> Result<codegraph_resolve::ResolutionStats> {
     let mut resolver =
         ReferenceResolver::new(project_root.to_string_lossy()).with_max_file_size(max_file_size);
     {
@@ -711,9 +724,9 @@ fn sweep_orphaned_refs(project_root: &Path, store: &mut Store, max_file_size: u6
     // duplicate rows (`unresolved_refs` has no UNIQUE constraint), which
     // accumulate across interrupt→heal cycles and diverge from `index --force`.
     // Re-resolving the existing rows alone heals the interrupted pass byte-equal.
-    resolver.resolve_and_persist_batched(store, ORPHAN_SWEEP_BATCH_ROWS)?;
+    let result = resolver.resolve_and_persist_batched(store, ORPHAN_SWEEP_BATCH_ROWS)?;
     resolver.run_post_extract(store)?;
-    Ok(())
+    Ok(result.stats)
 }
 
 /// Batch size for the #1187 orphan sweep, matching the CLI full-index batch
@@ -1564,6 +1577,16 @@ pub(crate) mod tests {
         // When: a bare no-change sync runs (no path is dirty on disk).
         let outcome = sync_changed_paths(dir.path(), &db, Vec::<String>::new()).unwrap();
         assert_eq!(outcome.files_reindexed, 0, "no file changed");
+        // The sweep's work is reported, so a recovering sync is not a no-op
+        // (upstream #1360).
+        assert_eq!(
+            (
+                outcome.pending_refs_processed,
+                outcome.pending_refs_resolved,
+                outcome.pending_refs_unresolved
+            ),
+            (1, 1, 0)
+        );
 
         // Then: the orphaned ref is swept into a Calls edge and the marker clears.
         let store = Store::open(&db).unwrap();
@@ -1607,6 +1630,7 @@ pub(crate) mod tests {
         // Then: no marker was set, nothing was swept, and the retained
         // unresolvable rows are untouched (#1240 retry state preserved).
         assert_eq!(outcome.files_reindexed, 0);
+        assert_eq!(outcome.pending_refs_processed, 0, "no sweep ran");
         assert!(!before.0, "a healthy index must not carry the marker");
         let store = Store::open(&db).unwrap();
         assert!(!store.is_resolution_incomplete().unwrap());

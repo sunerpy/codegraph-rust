@@ -1774,6 +1774,22 @@ fn cmd_sync(path: Option<PathBuf>, quiet: bool, diagnostics: DiagnosticArgs) -> 
             format_number(outcome.files_removed as i64),
             format_duration(outcome.duration_ms as i64)
         );
+        // A sync that healed an interrupted index reports the sweep's work, so
+        // recovering references on unchanged files is not a no-op (#1360).
+        if outcome.pending_refs_processed > 0 {
+            let unresolved = if outcome.pending_refs_unresolved > 0 {
+                format!(
+                    " ({} unresolved)",
+                    format_number(outcome.pending_refs_unresolved as i64)
+                )
+            } else {
+                String::new()
+            };
+            println!(
+                "Resolved {} pending references{unresolved}",
+                format_number(outcome.pending_refs_resolved as i64)
+            );
+        }
         for warning in &sync_warnings {
             eprintln!("warning: {warning}");
         }
@@ -1784,6 +1800,9 @@ fn cmd_sync(path: Option<PathBuf>, quiet: bool, diagnostics: DiagnosticArgs) -> 
         "filesReindexed": outcome.files_reindexed,
         "filesSkipped": outcome.files_skipped_unchanged,
         "filesRemoved": outcome.files_removed,
+        "pendingRefsProcessed": outcome.pending_refs_processed,
+        "pendingRefsResolved": outcome.pending_refs_resolved,
+        "pendingRefsUnresolved": outcome.pending_refs_unresolved,
         "warnings": sync_warnings,
     }));
     Ok(())
