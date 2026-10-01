@@ -1166,3 +1166,139 @@ fn callers_dedup_same_kind_multiple_sites_counted_once() {
         "same-kind repeated call site must dedup to one — #1088 (callers: {callers:?})"
     );
 }
+
+// ---- shallowest-depth expansion (#1974) -------------------------------------
+
+/// A store over function nodes `ids` and `calls` edges `(source, target)` in
+/// insertion order — the order the traversal reads them back.
+fn depth_store(test_name: &str, ids: &[&str], calls: &[(&str, &str)]) -> Store {
+    let mut store = Store::open(&temp_db_path(test_name)).expect("open store");
+    let nodes = ids
+        .iter()
+        .enumerate()
+        .map(|(line, id)| {
+            node(
+                &format!("function:{id}"),
+                NodeKind::Function,
+                id,
+                id,
+                "src/depth.ts",
+                Language::TypeScript,
+                line as i64 + 1,
+                line as i64 + 1,
+            )
+        })
+        .collect::<Vec<_>>();
+    store.upsert_nodes(&nodes).expect("insert nodes");
+    let edges = calls
+        .iter()
+        .enumerate()
+        .map(|(line, (source, target))| {
+            edge(
+                &format!("function:{source}"),
+                &format!("function:{target}"),
+                EdgeKind::Calls,
+                Some(line as i64 + 1),
+                Some(0),
+            )
+        })
+        .collect::<Vec<_>>();
+    store.insert_edges(&edges).expect("insert edges");
+    store
+}
+
+fn names(rows: &[codegraph_graph::graph::NodeEdge]) -> Vec<String> {
+    let mut names = rows
+        .iter()
+        .map(|row| row.node.name.clone())
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+#[test]
+fn impact_keeps_dependents_reached_first_through_a_longer_path() {
+    // The issue's graph: a→t, b→a, b→t, c→b. Edge order sends the walk to b
+    // through a first, before the direct b→t edge (upstream #1974).
+    let store = depth_store(
+        "impact-1974",
+        &["t", "a", "b", "c"],
+        &[("a", "t"), ("b", "a"), ("b", "t"), ("c", "b")],
+    );
+    let impact = GraphTraverser::new(&store)
+        .get_impact_radius("function:t", 2)
+        .expect("impact");
+    assert_eq!(
+        id_set(impact.nodes.keys().cloned()),
+        id_set(["a", "b", "c", "t"].map(|id| format!("function:{id}")))
+    );
+    assert!(
+        impact
+            .edges
+            .iter()
+            .any(|edge| edge.source == "function:c" && edge.target == "function:b")
+    );
+    let keys = impact
+        .edges
+        .iter()
+        .map(|edge| format!("{}>{}:{:?}", edge.source, edge.target, edge.line))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        keys.iter().collect::<BTreeSet<_>>().len(),
+        keys.len(),
+        "re-expansion must not record an edge twice: {keys:?}"
+    );
+}
+
+#[test]
+fn callers_and_callees_report_every_node_within_the_depth_once() {
+    let store = depth_store(
+        "callers-1974",
+        &["t", "a", "b", "c"],
+        &[("a", "t"), ("b", "a"), ("b", "t"), ("c", "b")],
+    );
+    let traverser = GraphTraverser::new(&store);
+    assert_eq!(
+        names(&traverser.get_callers("function:t", 2).expect("callers")),
+        vec!["a", "b", "c"]
+    );
+    // Mirror image: t→a, a→b, t→b, b→c.
+    let store = depth_store(
+        "callees-1974",
+        &["t", "a", "b", "c"],
+        &[("t", "a"), ("a", "b"), ("t", "b"), ("b", "c")],
+    );
+    assert_eq!(
+        names(
+            &GraphTraverser::new(&store)
+                .get_callees("function:t", 2)
+                .expect("callees")
+        ),
+        vec!["a", "b", "c"]
+    );
+}
+
+#[test]
+fn a_nearer_path_re_expands_a_node_first_expanded_deeper() {
+    // t ← a ← b ← x ← d, and t ← x directly; the a-path reaches x at depth 3
+    // first. With max depth 3, x is one hop from t, so its caller d (two hops)
+    // must be found — the loss the shallowest-depth rule exists to prevent.
+    let store = depth_store(
+        "nearer-1974",
+        &["t", "a", "b", "x", "d"],
+        &[("a", "t"), ("b", "a"), ("x", "b"), ("x", "t"), ("d", "x")],
+    );
+    let traverser = GraphTraverser::new(&store);
+    assert_eq!(
+        names(&traverser.get_callers("function:t", 3).expect("callers")),
+        vec!["a", "b", "d", "x"]
+    );
+    let impact = traverser
+        .get_impact_radius("function:t", 3)
+        .expect("impact");
+    assert!(
+        impact.nodes.contains_key("function:d"),
+        "{:?}",
+        impact.nodes.keys()
+    );
+}

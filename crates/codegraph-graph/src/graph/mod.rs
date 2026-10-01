@@ -375,8 +375,16 @@ impl<'store> GraphTraverser<'store> {
     /// cycle-safe via `visited`.
     pub fn get_callers(&self, node_id: &str, max_depth: usize) -> rusqlite::Result<Vec<NodeEdge>> {
         let mut result = Vec::new();
-        let mut visited = HashSet::new();
-        self.callers_recursive(node_id, max_depth, 0, &mut result, &mut visited)?;
+        let mut visited = HashMap::new();
+        let mut reported = HashSet::new();
+        self.callers_recursive(
+            node_id,
+            max_depth,
+            0,
+            &mut result,
+            &mut visited,
+            &mut reported,
+        )?;
         Ok(result)
     }
 
@@ -386,12 +394,12 @@ impl<'store> GraphTraverser<'store> {
         max_depth: usize,
         current_depth: usize,
         result: &mut Vec<NodeEdge>,
-        visited: &mut HashSet<String>,
+        visited: &mut HashMap<String, usize>,
+        reported: &mut HashSet<(String, EdgeKind)>,
     ) -> rusqlite::Result<()> {
-        if current_depth >= max_depth || visited.contains(node_id) {
+        if current_depth >= max_depth || !enter_at_depth(visited, node_id, current_depth) {
             return Ok(());
         }
-        visited.insert(node_id.to_string());
 
         let incoming = self.incoming_edges_kinds(
             node_id,
@@ -404,26 +412,27 @@ impl<'store> GraphTraverser<'store> {
         let source_ids: Vec<String> = incoming.iter().map(|e| e.source.clone()).collect();
         let caller_nodes = self.store.nodes_by_ids(&source_ids)?;
 
-        // #1087 vs #1088: emit one NodeEdge per DISTINCT (caller, edge-kind) so a
-        // caller linked by several kinds (Calls AND References) surfaces BOTH
+        // #1087 vs #1088: report one NodeEdge per DISTINCT (caller, edge-kind) so
+        // a caller linked by several kinds (Calls AND References) surfaces BOTH
         // (#1087), while repeated SAME-kind sites of one caller still collapse to
-        // a single row (#1088). `visited` gates only the RECURSION (cycle safety),
-        // never the emission — so the node is still walked at most once.
-        let mut emitted: HashSet<(String, EdgeKind)> = HashSet::new();
+        // a single row (#1088) — across the whole walk, not per parent. `visited`
+        // gates only the RECURSION: a caller is expanded again only when a
+        // nearer path reaches it (#1974).
         for edge in incoming {
             if let Some(caller) = caller_nodes.get(&edge.source) {
-                if !emitted.insert((caller.id.clone(), edge.kind)) {
-                    continue;
-                }
-                let recurse = !visited.contains(&caller.id);
                 let caller_id = caller.id.clone();
                 let next_depth = current_depth + 1;
-                result.push(NodeEdge {
-                    node: caller.clone(),
-                    edge,
-                });
+                let recurse = nearer_than_before(visited, &caller_id, next_depth);
+                if reported.insert((caller_id.clone(), edge.kind)) {
+                    result.push(NodeEdge {
+                        node: caller.clone(),
+                        edge,
+                    });
+                }
                 if recurse {
-                    self.callers_recursive(&caller_id, max_depth, next_depth, result, visited)?;
+                    self.callers_recursive(
+                        &caller_id, max_depth, next_depth, result, visited, reported,
+                    )?;
                 }
             }
         }
@@ -496,8 +505,16 @@ impl<'store> GraphTraverser<'store> {
     /// cycle-safe via `visited`.
     pub fn get_callees(&self, node_id: &str, max_depth: usize) -> rusqlite::Result<Vec<NodeEdge>> {
         let mut result = Vec::new();
-        let mut visited = HashSet::new();
-        self.callees_recursive(node_id, max_depth, 0, &mut result, &mut visited)?;
+        let mut visited = HashMap::new();
+        let mut reported = HashSet::new();
+        self.callees_recursive(
+            node_id,
+            max_depth,
+            0,
+            &mut result,
+            &mut visited,
+            &mut reported,
+        )?;
         Ok(result)
     }
 
@@ -507,12 +524,12 @@ impl<'store> GraphTraverser<'store> {
         max_depth: usize,
         current_depth: usize,
         result: &mut Vec<NodeEdge>,
-        visited: &mut HashSet<String>,
+        visited: &mut HashMap<String, usize>,
+        reported: &mut HashSet<(String, EdgeKind)>,
     ) -> rusqlite::Result<()> {
-        if current_depth >= max_depth || visited.contains(node_id) {
+        if current_depth >= max_depth || !enter_at_depth(visited, node_id, current_depth) {
             return Ok(());
         }
-        visited.insert(node_id.to_string());
 
         let outgoing = self.outgoing_edges_kinds(
             node_id,
@@ -526,23 +543,24 @@ impl<'store> GraphTraverser<'store> {
         let callee_nodes = self.store.nodes_by_ids(&target_ids)?;
 
         // #1087 vs #1088: mirror of `callers_recursive` — one NodeEdge per
-        // DISTINCT (callee, edge-kind) keeps multi-kind pairs while collapsing
-        // repeated same-kind sites; `visited` gates only recursion.
-        let mut emitted: HashSet<(String, EdgeKind)> = HashSet::new();
+        // DISTINCT (callee, edge-kind) across the walk keeps multi-kind pairs
+        // while collapsing repeated same-kind sites; `visited` gates only
+        // recursion, by shallowest expansion depth (#1974).
         for edge in outgoing {
             if let Some(callee) = callee_nodes.get(&edge.target) {
-                if !emitted.insert((callee.id.clone(), edge.kind)) {
-                    continue;
-                }
-                let recurse = !visited.contains(&callee.id);
                 let callee_id = callee.id.clone();
                 let next_depth = current_depth + 1;
-                result.push(NodeEdge {
-                    node: callee.clone(),
-                    edge,
-                });
+                let recurse = nearer_than_before(visited, &callee_id, next_depth);
+                if reported.insert((callee_id.clone(), edge.kind)) {
+                    result.push(NodeEdge {
+                        node: callee.clone(),
+                        edge,
+                    });
+                }
                 if recurse {
-                    self.callees_recursive(&callee_id, max_depth, next_depth, result, visited)?;
+                    self.callees_recursive(
+                        &callee_id, max_depth, next_depth, result, visited, reported,
+                    )?;
                 }
             }
         }
@@ -696,10 +714,18 @@ impl<'store> GraphTraverser<'store> {
         };
 
         let mut graph = Subgraph::empty();
-        let mut visited = HashSet::new();
+        let mut visited = HashMap::new();
+        let mut expanded = HashSet::new();
         graph.set_node(focal);
 
-        self.impact_recursive(node_id, max_depth, 0, &mut graph, &mut visited)?;
+        self.impact_recursive(
+            node_id,
+            max_depth,
+            0,
+            &mut graph,
+            &mut visited,
+            &mut expanded,
+        )?;
 
         graph.roots = vec![node_id.to_string()];
         Ok(graph)
@@ -711,12 +737,15 @@ impl<'store> GraphTraverser<'store> {
         max_depth: usize,
         current_depth: usize,
         graph: &mut Subgraph,
-        visited: &mut HashSet<String>,
+        visited: &mut HashMap<String, usize>,
+        expanded: &mut HashSet<String>,
     ) -> rusqlite::Result<()> {
-        if current_depth >= max_depth || visited.contains(node_id) {
+        if current_depth >= max_depth || !enter_at_depth(visited, node_id, current_depth) {
             return Ok(());
         }
-        visited.insert(node_id.to_string());
+        // A node re-expanded from a nearer depth re-reads the same edges;
+        // record them on its first expansion only (#1974).
+        let first_expansion = expanded.insert(node_id.to_string());
 
         if let Some(focal) = self.store.node_by_id(node_id)?
             && CONTAINER_KINDS.contains(&focal.kind)
@@ -731,13 +760,22 @@ impl<'store> GraphTraverser<'store> {
                 )?;
                 for edge in contains {
                     if let Some(child) = children.get(&edge.target)
-                        && !visited.contains(&child.id)
+                        && nearer_than_before(visited, &child.id, current_depth)
                     {
-                        let child = child.clone();
                         let child_id = child.id.clone();
-                        graph.set_node(child);
-                        graph.edges.push(edge);
-                        self.impact_recursive(&child_id, max_depth, current_depth, graph, visited)?;
+                        if !graph.nodes.contains_key(&child_id) {
+                            graph.set_node(child.clone());
+                            graph.edges.push(edge);
+                        }
+                        // Children are part of the same symbol: same depth.
+                        self.impact_recursive(
+                            &child_id,
+                            max_depth,
+                            current_depth,
+                            graph,
+                            visited,
+                            expanded,
+                        )?;
                     }
                 }
             }
@@ -760,20 +798,23 @@ impl<'store> GraphTraverser<'store> {
 
         for edge in incoming {
             if let Some(source) = sources.get(&edge.source) {
-                // #1086: the direct-dependency edge is recorded unconditionally —
-                // even when `source` is already in the subgraph via another path,
-                // the edge between the two endpoints is a real dependency and must
-                // survive. Only the NODE addition + recursion is guarded so we
-                // neither duplicate the node nor re-walk an already-visited source.
-                let already_present = graph.nodes.contains_key(&source.id);
+                // #1086: the direct-dependency edge is recorded even when
+                // `source` is already in the subgraph via another path — it is a
+                // real dependency — but only on this node's first expansion, so
+                // a re-expansion never repeats it. A source is walked again only
+                // when this path reaches it nearer than before (#1974).
                 let source_id = source.id.clone();
                 let next_depth = current_depth + 1;
-                if !already_present {
+                if !graph.nodes.contains_key(&source_id) {
                     graph.set_node(source.clone());
                 }
-                graph.edges.push(edge);
-                if !already_present {
-                    self.impact_recursive(&source_id, max_depth, next_depth, graph, visited)?;
+                if first_expansion {
+                    graph.edges.push(edge);
+                }
+                if nearer_than_before(visited, &source_id, next_depth) {
+                    self.impact_recursive(
+                        &source_id, max_depth, next_depth, graph, visited, expanded,
+                    )?;
                 }
             }
         }
@@ -1376,6 +1417,25 @@ fn unvisited_neighbor_ids(edges: &[Edge], node_id: &str, visited: &HashSet<Strin
         .map(|e| neighbor_id(e, node_id).to_string())
         .filter(|id| !visited.contains(id))
         .collect()
+}
+
+/// Whether `depth` is nearer than any depth `node_id` was expanded at.
+/// Depth-limited walks record the SHALLOWEST depth each node was expanded at,
+/// so a node first reached through a longer path is expanded again when a
+/// nearer path reaches it, and its own dependents within the limit are not lost
+/// to edge order (upstream #1974).
+fn nearer_than_before(visited: &HashMap<String, usize>, node_id: &str, depth: usize) -> bool {
+    visited.get(node_id).is_none_or(|&seen| depth < seen)
+}
+
+/// Record that `node_id` is expanded at `depth`; false when it already was at
+/// this depth or nearer.
+fn enter_at_depth(visited: &mut HashMap<String, usize>, node_id: &str, depth: usize) -> bool {
+    if !nearer_than_before(visited, node_id, depth) {
+        return false;
+    }
+    visited.insert(node_id.to_string(), depth);
+    true
 }
 
 #[cfg(test)]
