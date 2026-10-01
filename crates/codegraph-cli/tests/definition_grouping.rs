@@ -3,18 +3,25 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 struct TestDir(PathBuf);
+
+/// Parallel tests in this file share a name prefix, and Windows' clock can hand
+/// two of them the same nanosecond, so a sequence number keeps each directory
+/// apart (a shared one failed `init` with "namespace already exists").
+static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
 impl TestDir {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
-            "codegraph-cli-definition-groups-{}-{}",
+            "codegraph-cli-definition-groups-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock")
-                .as_nanos()
+                .as_nanos(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&path).expect("create temp project");
         Self(path)
