@@ -1389,8 +1389,9 @@ impl CodeGraphEngine {
         let mut budget_dropped = false;
         let mut excluded_files: Vec<&String> = Vec::new();
         let mut rendered_sources: Vec<(String, usize)> = Vec::new();
-        // Every admitted section: `(line index, path, what it elided)`.
-        let mut sections: Vec<(usize, &String, Vec<WantedSpan>)> = Vec::new();
+        // Every admitted section: `(line index, path, what it elided, whether a
+        // gap marker had no room for its names)`.
+        let mut sections: Vec<(usize, &String, Vec<WantedSpan>, bool)> = Vec::new();
         // Named files whose per-file ceiling clipped them, with what a second
         // render needs: `(line index, path, focuses, exact focus)`.
         let mut named_clipped: Vec<(usize, &String, Vec<usize>, Vec<BodyFocus>)> = Vec::new();
@@ -1471,7 +1472,12 @@ impl CodeGraphEngine {
             if rendered.clipped && named {
                 named_clipped.push((lines.len(), file_path, focuses, exact_focus));
             }
-            sections.push((lines.len(), file_path, rendered.elided));
+            sections.push((
+                lines.len(),
+                file_path,
+                rendered.elided,
+                rendered.names_withheld,
+            ));
             lines.push(rendered.section);
             total_chars += section_len + 1;
             files_included += 1;
@@ -1534,6 +1540,7 @@ impl CodeGraphEngine {
             lines[*line_index] = grown.section;
             if let Some(entry) = sections.iter_mut().find(|entry| entry.0 == *line_index) {
                 entry.2 = grown.elided;
+                entry.3 = grown.names_withheld;
             }
         }
         // Sections missing some of what they set out to deliver, in render
@@ -1541,12 +1548,13 @@ impl CodeGraphEngine {
         // claimed only for sections that are.
         let trimmed_shown: Vec<(String, Vec<WantedSpan>)> = sections
             .iter()
-            .filter(|(_, _, elided)| !elided.is_empty())
-            .map(|(_, path, elided)| ((*path).clone(), elided.clone()))
+            .filter(|(_, _, elided, _)| !elided.is_empty())
+            .map(|(_, path, elided, _)| ((*path).clone(), elided.clone()))
             .collect();
+        let names_withheld = sections.iter().any(|(_, _, _, withheld)| *withheld);
         let any_file_trimmed = budget_dropped
             || !trimmed_shown.is_empty()
-            || sections.iter().any(|(index, _, _)| {
+            || sections.iter().any(|(index, _, _, _)| {
                 lines[*index].contains("... (gap) ...")
                     || lines[*index].contains("more (signatures elided)")
             });
@@ -1589,8 +1597,12 @@ impl CodeGraphEngine {
         // files and symbols is paid only from what the sections and the pointer
         // list left, and never costs a pointer line (upstream #2077).
         let completeness_note = if budget.include_completeness_signal {
-            let candidates =
-                completeness_notes(files_included, &trimmed_shown, &subgraph.file_order);
+            let candidates = completeness_notes(
+                files_included,
+                &trimmed_shown,
+                &subgraph.file_order,
+                names_withheld,
+            );
             let room = completeness_note_floor(max_files) + epilogue_room;
             candidates
                 .iter()
@@ -1605,6 +1617,7 @@ impl CodeGraphEngine {
             &budget,
             &completeness_note,
             any_file_trimmed,
+            names_withheld,
             indexed_file_count,
         ));
 
@@ -1779,6 +1792,7 @@ impl CodeGraphEngine {
                     source_emitted: true,
                     clipped: false,
                     elided: Vec::new(),
+                    names_withheld: false,
                 };
             }
             return ExploreFileRender {
@@ -1789,6 +1803,7 @@ impl CodeGraphEngine {
                 clipped: false,
                 // Nothing it set out to deliver was sent (#2077).
                 elided: elided_wanted_spans(&subgraph.wanted_spans_in(file_path), &[]),
+                names_withheld: false,
             };
         }
 
@@ -1815,6 +1830,7 @@ impl CodeGraphEngine {
                     source_emitted: true,
                     clipped: false,
                     elided: Vec::new(),
+                    names_withheld: false,
                 };
             }
             // (2) Unaffordable but owning NO focus and no exact target ⇒ also
@@ -1827,6 +1843,7 @@ impl CodeGraphEngine {
                     source_emitted: true,
                     clipped: false,
                     elided: Vec::new(),
+                    names_withheld: false,
                 };
             }
             // (3) Unaffordable AND owning a focus or an exact target ⇒ fall
@@ -1923,6 +1940,7 @@ impl CodeGraphEngine {
                 source_emitted: false,
                 clipped: false,
                 elided: Vec::new(),
+                names_withheld: false,
             };
         }
 
@@ -2453,7 +2471,7 @@ impl CodeGraphEngine {
             + GAP_MARKER.len() * parts.len().saturating_sub(1);
         let spare = ceiling.max(projected).saturating_sub(bare_text);
         let file_index_nodes = self.store.nodes_by_file_path(file_path).unwrap_or_default();
-        let mut file_section =
+        let (mut file_section, names_withheld) =
             join_parts_with_named_gaps(file_path, &parts, &file_index_nodes, spare);
         let clipped = chosen_count < clusters.len() || any_cluster_windowed;
         if clipped {
@@ -2500,6 +2518,7 @@ impl CodeGraphEngine {
             source_emitted: true,
             clipped,
             elided: elided_wanted_spans(&wanted, &delivered),
+            names_withheld,
         }
     }
 
@@ -3753,6 +3772,9 @@ struct ExploreFileRender {
     /// The symbols this section set out to deliver and did not, measured from
     /// the ranges it sent (#2077). Empty for a complete section.
     elided: Vec<WantedSpan>,
+    /// Some gap marker stayed bare though it held indexed symbols to name: the
+    /// names cost more than the file had spare (#1711, #2057).
+    names_withheld: bool,
 }
 
 impl SourceProbe {
@@ -4389,31 +4411,38 @@ fn format_gap_marker(file_path: &str, elided: &[ElidedSymbol]) -> String {
 /// markers that name what the trim skipped. `spare` is what naming may cost
 /// beyond bare markers: selection priced every join as bare, so a gap the
 /// spare cannot cover stays bare rather than pushing source out (#2057).
+///
+/// Also reports whether such a gap was left bare, so the trim note does not
+/// claim the markers named everything.
 fn join_parts_with_named_gaps(
     file_path: &str,
     parts: &[(usize, usize, String)],
     nodes: &[Node],
     mut spare: usize,
-) -> String {
+) -> (String, bool) {
     let Some((_, _, first)) = parts.first() else {
-        return String::new();
+        return (String::new(), false);
     };
     let mut out = first.clone();
+    let mut withheld = false;
     for pair in parts.windows(2) {
         let named = format_gap_marker(
             file_path,
             &symbols_between_ranges(nodes, pair[0].1, pair[1].0),
         );
+        // A hole with nothing to name costs nothing extra, so only a gap
+        // that had names can land here.
         let extra = named.len() - BARE_GAP_MARKER.len();
         if extra <= spare {
             out.push_str(&named);
             spare -= extra;
         } else {
             out.push_str(BARE_GAP_MARKER);
+            withheld = true;
         }
         out.push_str(&pair[1].2);
     }
-    out
+    (out, withheld)
 }
 
 // === Free-function renderers (1:1 with upstream helpers) ====================
@@ -5413,6 +5442,10 @@ const COMPLETENESS_RULE: &str = "---";
 /// loop-determined, so the pre-loop reserve has to assume it.
 const TRIMMED_NOTE: &str = "> Some file sections were trimmed for size. Elided symbols are named inside gap markers as `name (file:line)` and preferred in the file header — run another `codegraph_explore` (or `codegraph_node`) with those exact names for their source.";
 
+/// [`TRIMMED_NOTE`] when some gap marker had no room for the names it hid: it
+/// must not say the markers name the elided symbols.
+const TRIMMED_NOTE_PARTIAL: &str = "> Some file sections were trimmed for size. Gap markers name elided symbols as `name (file:line)` only where room allowed, and the file header prefers them — run another `codegraph_explore` (or `codegraph_node`) for their source.";
+
 /// One symbol a file section set out to deliver: a cluster member, or a node
 /// of a section that renders no source (#2077). Completeness is judged against
 /// these, not against the file — explore never promises whole files, only the
@@ -5530,6 +5563,8 @@ fn complete_source_note(files: &str) -> String {
 }
 
 const TRIMMED_NOTE_WHAT: &str = "gap markers and file headers name what was elided";
+/// [`TRIMMED_NOTE_WHAT`] when some gap marker had no room for its names.
+const TRIMMED_NOTE_WHAT_PARTIAL: &str = "gap markers and headers name what room allowed";
 const TRIMMED_NOTE_TAIL: &str = "For those, or anything under \"Not shown above\", make ANOTHER codegraph_explore with those exact names instead of reading the files — it returns their source with line numbers.";
 
 fn trimmed_note_head(files: &str) -> String {
@@ -5538,9 +5573,9 @@ fn trimmed_note_head(files: &str) -> String {
 
 /// The least specific trimmed note: it names nothing, so it is the floor the
 /// epilogue reserve holds.
-fn generic_trimmed_note(files: &str) -> String {
+fn generic_trimmed_note(files: &str, what: &str) -> String {
     format!(
-        "{} Some sections were trimmed for size; {TRIMMED_NOTE_WHAT}. {TRIMMED_NOTE_TAIL}",
+        "{} Some sections were trimmed for size; {what}. {TRIMMED_NOTE_TAIL}",
         trimmed_note_head(files)
     )
 }
@@ -5551,11 +5586,13 @@ fn generic_trimmed_note(files: &str) -> String {
 /// note keeps the guarantee that is still true (every block shown is
 /// verbatim), names the trimmed files and the most relevant elided symbols as
 /// room allows, and sends the agent to another codegraph_explore for them. It
-/// never offers Read.
+/// never offers Read. Where a gap marker had no room for its names
+/// (`names_withheld`), it says the markers name only what room allowed.
 fn completeness_notes(
     files_included: usize,
     trimmed: &[(String, Vec<WantedSpan>)],
     known_paths: &[String],
+    names_withheld: bool,
 ) -> Vec<String> {
     let files = files_wording(files_included);
     if trimmed.is_empty() {
@@ -5603,8 +5640,13 @@ fn completeness_notes(
             }
         }
     }
+    let what = if names_withheld {
+        TRIMMED_NOTE_WHAT_PARTIAL
+    } else {
+        TRIMMED_NOTE_WHAT
+    };
     let head = trimmed_note_head(&files);
-    let with_files = format!("{head} Trimmed for size: {trimmed_list}; {TRIMMED_NOTE_WHAT}");
+    let with_files = format!("{head} Trimmed for size: {trimmed_list}; {what}");
     let mut candidates = Vec::new();
     if !names.is_empty() {
         let named = names
@@ -5615,7 +5657,7 @@ fn completeness_notes(
         candidates.push(format!("{with_files} (e.g. {named}). {TRIMMED_NOTE_TAIL}"));
     }
     candidates.push(format!("{with_files}. {TRIMMED_NOTE_TAIL}"));
-    candidates.push(generic_trimmed_note(&files));
+    candidates.push(generic_trimmed_note(&files, what));
     candidates
 }
 
@@ -5631,9 +5673,10 @@ fn completeness_note_floor(max_files: usize) -> usize {
     ]
     .iter()
     .map(|files| {
-        complete_source_note(files)
-            .len()
-            .max(generic_trimmed_note(files).len())
+        [TRIMMED_NOTE_WHAT, TRIMMED_NOTE_WHAT_PARTIAL]
+            .iter()
+            .map(|what| generic_trimmed_note(files, what).len())
+            .fold(complete_source_note(files).len(), usize::max)
     })
     .max()
     .unwrap_or(0)
@@ -5672,6 +5715,7 @@ fn epilogue_note_lines(
     budget: &ExploreOutputBudget,
     completeness_note: &str,
     any_file_trimmed: bool,
+    names_withheld: bool,
     file_count: Option<i64>,
 ) -> Vec<String> {
     let mut lines = Vec::new();
@@ -5680,7 +5724,12 @@ fn epilogue_note_lines(
         lines.push(completeness_note.to_string());
         lines.push(String::new());
     } else if any_file_trimmed {
-        lines.push(TRIMMED_NOTE.to_string());
+        let note = if names_withheld {
+            TRIMMED_NOTE_PARTIAL
+        } else {
+            TRIMMED_NOTE
+        };
+        lines.push(note.to_string());
         lines.push(String::new());
     }
     if budget.include_budget_note
@@ -5704,7 +5753,7 @@ fn joined_line_cost(lines: &[String]) -> usize {
 /// Every term is the length of a string the epilogue actually emits, evaluated at
 /// its worst case: the completeness note at the longest length it can fall back
 /// to, `any_file_trimmed = true` selects the larger of the two mutually exclusive
-/// notes, and the unlisted tail is reserved at `file_order` length, which is
+/// notes (in the longer of its two wordings), and the unlisted tail is reserved at `file_order` length, which is
 /// >= any achievable count because every unlisted file came from `file_order`.
 fn fixed_epilogue_reserve(
     budget: &ExploreOutputBudget,
@@ -5722,7 +5771,19 @@ fn fixed_epilogue_reserve(
         ]);
     }
     let floor_note = "x".repeat(completeness_note_floor(max_files));
-    reserve += joined_line_cost(&epilogue_note_lines(budget, &floor_note, true, file_count));
+    reserve += [false, true]
+        .map(|names_withheld| {
+            joined_line_cost(&epilogue_note_lines(
+                budget,
+                &floor_note,
+                true,
+                names_withheld,
+                file_count,
+            ))
+        })
+        .into_iter()
+        .max()
+        .unwrap_or(0);
     reserve
 }
 
@@ -5947,12 +6008,21 @@ mod tests {
         let parts = vec![(7, 33, "head".to_string()), (197, 223, "tail".to_string())];
         assert_eq!(
             join_parts_with_named_gaps("a.ts", &parts, &nodes, usize::MAX),
-            "head\n\n... (gap: helperMid (a.ts:100)) ...\n\ntail"
+            (
+                "head\n\n... (gap: helperMid (a.ts:100)) ...\n\ntail".to_string(),
+                false
+            )
         );
         assert_eq!(
             join_parts_with_named_gaps("a.ts", &parts, &nodes, 3),
-            "head\n\n... (gap) ...\n\ntail",
-            "names the spare cannot pay for stay out"
+            ("head\n\n... (gap) ...\n\ntail".to_string(), true),
+            "names the spare cannot pay for stay out, and that is reported"
+        );
+        // A hole with nothing indexed in it is bare at no cost: nothing withheld.
+        let quiet = vec![(7, 33, "head".to_string()), (34, 60, "tail".to_string())];
+        assert_eq!(
+            join_parts_with_named_gaps("a.ts", &quiet, &nodes, 0),
+            ("head\n\n... (gap) ...\n\ntail".to_string(), false)
         );
 
         let many: Vec<ElidedSymbol> = (0..8)
@@ -6412,7 +6482,7 @@ mod tests {
 
     #[test]
     fn completeness_is_claimed_only_when_nothing_was_trimmed() {
-        let notes = completeness_notes(4, &[], &["a.ts".to_string(), "b.ts".to_string()]);
+        let notes = completeness_notes(4, &[], &["a.ts".to_string(), "b.ts".to_string()], false);
         assert_eq!(notes.len(), 1);
         assert!(
             notes[0].contains("Complete source for 4 files"),
@@ -6432,7 +6502,7 @@ mod tests {
                 wanted("helperNobodyAskedFor", 10, 12, 1, "method"),
             ],
         )];
-        let notes = completeness_notes(3, &trimmed, &[file, "src/a.ts".to_string()]);
+        let notes = completeness_notes(3, &trimmed, &[file, "src/a.ts".to_string()], false);
         for note in &notes {
             assert!(!note.contains("Complete source"), "{note}");
             assert!(note.contains("Verbatim source for 3 files"), "{note}");
@@ -6455,14 +6525,14 @@ mod tests {
         let one = vec![("a.ts".to_string(), vec![wanted("f", 1, 9, 10, "function")])];
         let known = ["a.ts".to_string()];
         assert!(
-            completeness_notes(1, &[], &known)[0]
+            completeness_notes(1, &[], &known, false)[0]
                 .contains("Complete source for 1 file is included")
         );
         assert!(
-            completeness_notes(1, &one, &known)[0]
+            completeness_notes(1, &one, &known, false)[0]
                 .contains("Verbatim source for 1 file is included")
         );
-        for note in completeness_notes(0, &one, &known) {
+        for note in completeness_notes(0, &one, &known, false) {
             assert!(!note.contains(" 0 file"), "{note}");
             assert!(note.contains("Verbatim source for these files"), "{note}");
         }
@@ -6477,6 +6547,7 @@ mod tests {
                 "src/common/rpcProtocol.ts".to_string(),
                 "src/node/rpcProtocol.ts".to_string(),
             ],
+            false,
         );
         assert!(notes[0].contains("`common/rpcProtocol.ts`"), "{}", notes[0]);
     }
@@ -6508,6 +6579,7 @@ mod tests {
             1,
             &trimmed,
             &["django/db/models/sql/compiler.py".to_string()],
+            false,
         );
         assert!(
             notes[0]
@@ -6529,7 +6601,7 @@ mod tests {
             })
             .collect();
         let known: Vec<String> = trimmed.iter().map(|(path, _)| path.clone()).collect();
-        let notes = completeness_notes(8, &trimmed, &known);
+        let notes = completeness_notes(8, &trimmed, &known, false);
         assert_eq!(notes.len(), 3);
         for pair in notes.windows(2) {
             assert!(pair[1].len() < pair[0].len(), "{pair:?}");
@@ -6543,8 +6615,37 @@ mod tests {
         assert!(notes[2].len() < OLD_COMPLETENESS_NOTE.len());
         // The reserve covers the longest note the epilogue can fall back to.
         assert!(completeness_note_floor(8) >= notes[2].len());
-        assert!(completeness_note_floor(8) >= completeness_notes(8, &[], &known)[0].len());
-        assert!(completeness_note_floor(8) >= completeness_notes(0, &trimmed, &known)[2].len());
+        assert!(completeness_note_floor(8) >= completeness_notes(8, &[], &known, false)[0].len());
+        assert!(
+            completeness_note_floor(8) >= completeness_notes(0, &trimmed, &known, false)[2].len()
+        );
+        // The wording for a gap left unnamed is covered by the same reserve,
+        // and none of its candidates says the markers named what was elided.
+        let partial = completeness_notes(8, &trimmed, &known, true);
+        assert_eq!(partial.len(), 3);
+        assert!(completeness_note_floor(8) >= partial[2].len());
+        assert!(
+            completeness_note_floor(8) >= completeness_notes(0, &trimmed, &known, true)[2].len()
+        );
+        for note in &partial {
+            assert!(!note.contains("name what was elided"), "{note}");
+            assert!(note.contains("name what room allowed"), "{note}");
+        }
+    }
+
+    #[test]
+    fn the_small_tier_trim_note_claims_names_only_when_every_gap_had_them() {
+        let budget = crate::explore_budget::get_explore_output_budget(3);
+        assert!(!budget.include_completeness_signal);
+        let note = |names_withheld| epilogue_note_lines(&budget, "", true, names_withheld, None);
+        assert_eq!(note(false)[0], TRIMMED_NOTE);
+        assert_eq!(note(true)[0], TRIMMED_NOTE_PARTIAL);
+        assert!(!TRIMMED_NOTE_PARTIAL.contains("Elided symbols are named inside gap markers"));
+        // The reserve holds whichever wording is longer.
+        let reserve = fixed_epilogue_reserve(&budget, 0, 6, None);
+        for withheld in [false, true] {
+            assert!(reserve >= joined_line_cost(&note(withheld)), "{withheld}");
+        }
     }
 
     #[test]
