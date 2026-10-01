@@ -161,15 +161,15 @@ KEEP-RUST:
     CRLF while `git status` stayed clean;
   - a git timeout.
 
-Measured on the code at `f750335`, release build, warm cache, five runs after
+Measured on the code at `87d6804`, release build, warm cache, five runs after
 a warm-up, `codegraph status . --json`. The corpus was a generated repository of
 40,000 TypeScript files on ext4, on a 32-CPU Linux host. Medians, with
 min–max:
 
 | Scenario            | Fast path         | Full inventory    |
 | ------------------- | ----------------- | ----------------- |
-| Clean               | 198 ms (197–208)  | 259 ms (257–263)  |
-| 18 committed edits  | 196 ms (194–209)  | 261 ms (255–266)  |
+| Clean               | 215 ms (213–225)  | 265 ms (265–267)  |
+| 18 committed edits  | 217 ms (209–222)  | 263 ms (257–269)  |
 
 Both columns reported the same pending changes in every run.
 
