@@ -2046,6 +2046,9 @@ mod tests {
         watcher.stop();
     }
 
+    /// How long a test waits for a full reconcile to report.
+    const FULL_SYNC_WAIT: Duration = Duration::from_secs(10);
+
     #[test]
     fn root_gitignore_reload_reconciles_and_readmits_sources() {
         let _env = crate::test_env::env_guard();
@@ -2072,8 +2075,10 @@ mod tests {
         watcher.ingest_event_for_tests(".gitignore");
         watcher.ingest_event_for_tests("generated/drop.ts");
         watcher.flush_for_tests();
+        // A full reconcile rescans and rewrites the index; a loaded Windows
+        // runner has taken over two seconds for it.
         let removed = outcome_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(FULL_SYNC_WAIT)
             .expect("gitignore-removal full sync");
         assert_eq!(removed.files_removed, 1);
         assert_eq!(removed.trigger_paths, vec![".gitignore".to_string()]);
@@ -2082,7 +2087,7 @@ mod tests {
         watcher.ingest_event_for_tests(".gitignore");
         watcher.flush_for_tests();
         let readmitted = outcome_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(FULL_SYNC_WAIT)
             .expect("gitignore-readmission full sync");
         assert_eq!(readmitted.files_reindexed, 1);
         assert!(
