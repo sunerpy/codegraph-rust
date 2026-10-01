@@ -13,6 +13,7 @@ pub mod engine;
 pub mod ext_config;
 pub mod function_ref;
 pub mod lang;
+mod links;
 pub mod spec;
 pub mod walker;
 

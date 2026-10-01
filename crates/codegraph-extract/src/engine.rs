@@ -17,6 +17,7 @@ use std::time::Instant;
 use tree_sitter::Parser;
 
 use crate::ext_config::ExtensionOverrides;
+use crate::links::LinkWalk;
 use crate::lang::{cpp_code_mask, spec_for_language};
 use crate::walker::TreeSitterWalker;
 use codegraph_core::source_file::{SourceText, read_source_file};
@@ -466,6 +467,29 @@ pub fn extract_project(
 pub struct ScanProjectResult {
     pub files: Vec<String>,
     pub unsupported_by_extension: BTreeMap<String, usize>,
+    /// Every symlink the scan followed, sorted by logical path (#935).
+    pub links: Vec<FollowedLink>,
+    /// Logical path of every directory scanned through a symlink, the links
+    /// themselves included, sorted. The watcher watches only these below a link.
+    pub linked_dirs: Vec<String>,
+    /// For each file link whose target sits in a scanned directory: the
+    /// target's logical path → the link paths that alias it, sorted.
+    pub file_aliases: BTreeMap<String, Vec<String>>,
+}
+
+/// A symlink the scan followed: its logical path, the canonical path it
+/// resolved to, and whether it named a file or a directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FollowedLink {
+    pub relative: String,
+    pub canonical: PathBuf,
+    pub kind: LinkKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LinkKind {
+    File,
+    Dir,
 }
 
 pub fn scan_project(root: &Path, options: &ExtractOptions) -> Result<Vec<String>> {
@@ -473,8 +497,6 @@ pub fn scan_project(root: &Path, options: &ExtractOptions) -> Result<Vec<String>
 }
 
 pub fn scan_project_with_stats(root: &Path, options: &ExtractOptions) -> Result<ScanProjectResult> {
-    let mut files = Vec::new();
-    let mut unsupported_by_extension = BTreeMap::new();
     let ignored_dirs = options
         .ignore_dirs
         .iter()
@@ -493,98 +515,206 @@ pub fn scan_project_with_stats(root: &Path, options: &ExtractOptions) -> Result<
         root,
         std::env::var("CODEGRAPH_DIR").ok().as_deref(),
     );
-    scan_dir(
+    // No symlink may lead into the project's `.git` or a reserved index root.
+    let blocked = std::iter::once(root.join(".git")).chain(reserved_roots.iter().cloned());
+    let mut walk = ScanWalk {
         root,
-        root,
-        &ignored_dirs,
-        &reserved_roots,
-        &pattern_sets,
-        (&gitignore, GitignoreAncestry::default()),
-        &include,
-        &options.extensions,
-        &mut files,
-        &mut unsupported_by_extension,
-    )?;
-    files.sort();
-    Ok(ScanProjectResult {
-        files,
-        unsupported_by_extension,
-    })
+        ignored_dirs: &ignored_dirs,
+        reserved_roots: &reserved_roots,
+        pattern_sets: &pattern_sets,
+        gitignore: &gitignore,
+        include: &include,
+        overrides: &options.extensions,
+        links: LinkWalk::new(root, blocked),
+        files: Vec::new(),
+        unsupported_by_extension: BTreeMap::new(),
+        followed: Vec::new(),
+        linked_dirs: Vec::new(),
+        file_links: Vec::new(),
+    };
+    let canonical_root = walk
+        .links
+        .canonical_root()
+        .map_or_else(|| root.to_path_buf(), Path::to_path_buf);
+    walk.links.enter(canonical_root.clone(), "");
+    walk.scan_dir(root, &canonical_root, GitignoreAncestry::default(), 0)?;
+    // Symlinked directories, fewest hops first, then by logical path (#935).
+    while let Some(linked) = walk.links.next() {
+        walk.followed.push(FollowedLink {
+            relative: linked.relative.clone(),
+            canonical: linked.canonical.clone(),
+            kind: LinkKind::Dir,
+        });
+        walk.linked_dirs.push(linked.relative);
+        walk.scan_dir(&linked.path, &linked.canonical, linked.state, linked.hops)?;
+    }
+    Ok(walk.finish())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn scan_dir(
-    root: &Path,
-    dir: &Path,
-    ignored_dirs: &HashSet<&str>,
-    reserved_roots: &std::collections::BTreeSet<PathBuf>,
-    pattern_sets: &[&[String]],
-    (gitignore, above): (&RootGitignore, GitignoreAncestry),
-    include: &IncludeSet,
-    overrides: &ExtensionOverrides,
-    files: &mut Vec<String>,
-    unsupported_by_extension: &mut BTreeMap<String, usize>,
-) -> Result<()> {
-    let entries = fs::read_dir(dir).with_context(|| format!("read dir {}", dir.display()))?;
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        // Skip `.git` (a direct child of the scan root) and any directory whose
-        // FULL path is a resolved reserved index root — matched at any depth, so
-        // a nested configured root like `<root>/cache/index` is pruned exactly,
-        // while a same-basename user directory elsewhere is not.
-        let is_reserved_root_here =
-            (dir == root && name == ".git") || reserved_roots.contains(&path);
-        let relative = normalize_path(path.strip_prefix(root).unwrap_or(&path));
-        // `build` is also a legal JVM package segment: keep it under a
-        // conventional source root while still pruning build output (#1642).
-        let jvm_package = name == "build"
-            && codegraph_core::config::is_jvm_source_build_dir(&relative)
-            && entry.file_type().is_ok_and(|kind| kind.is_dir());
-        if is_reserved_root_here || (ignored_dirs.contains(name.as_ref()) && !jvm_package) {
-            continue;
-        }
-        let file_type = entry.file_type()?;
-        let own = gitignore.matched(&relative, file_type.is_dir());
-        let ignored = is_path_ignored(&relative, pattern_sets, above.decide(own));
-        if file_type.is_dir() {
-            // A model-ignored dir is normally pruned before descent, so a FILE
-            // include under a gitignored ancestor would never be reached.
-            // Descend anyway when this dir is an ancestor of (or matches) an
-            // include pattern; files inside are still pruned unless force-included.
-            if ignored && !include.wants_descend(&relative) {
+/// One scan's fixed inputs and accumulated output.
+struct ScanWalk<'a> {
+    root: &'a Path,
+    ignored_dirs: &'a HashSet<&'a str>,
+    reserved_roots: &'a std::collections::BTreeSet<PathBuf>,
+    pattern_sets: &'a [&'a [String]],
+    gitignore: &'a RootGitignore,
+    include: &'a IncludeSet<'a>,
+    overrides: &'a ExtensionOverrides,
+    links: LinkWalk<GitignoreAncestry>,
+    files: Vec<String>,
+    unsupported_by_extension: BTreeMap<String, usize>,
+    followed: Vec<FollowedLink>,
+    linked_dirs: Vec<String>,
+    /// Indexed file links: logical path → canonical target.
+    file_links: Vec<(String, PathBuf)>,
+}
+
+impl ScanWalk<'_> {
+    /// Scan `dir`, whose canonical path is `canonical_dir`, reached through
+    /// `hops` symlinks. Real subdirectories are scanned at once; a symlinked
+    /// one is queued for the next hop level.
+    fn scan_dir(
+        &mut self,
+        dir: &Path,
+        canonical_dir: &Path,
+        above: GitignoreAncestry,
+        hops: usize,
+    ) -> Result<()> {
+        let entries = fs::read_dir(dir).with_context(|| format!("read dir {}", dir.display()))?;
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let file_name = entry.file_name();
+            let name = file_name.to_string_lossy();
+            // Skip `.git` (a direct child of the scan root) and any directory whose
+            // FULL path is a resolved reserved index root — matched at any depth, so
+            // a nested configured root like `<root>/cache/index` is pruned exactly,
+            // while a same-basename user directory elsewhere is not.
+            let is_reserved_root_here =
+                (dir == self.root && name == ".git") || self.reserved_roots.contains(&path);
+            let relative = normalize_path(path.strip_prefix(self.root).unwrap_or(&path));
+            // `build` is also a legal JVM package segment: keep it under a
+            // conventional source root while still pruning build output (#1642).
+            let jvm_package = name == "build"
+                && codegraph_core::config::is_jvm_source_build_dir(&relative)
+                && resolves_to_dir(&entry, &path);
+            if is_reserved_root_here || (self.ignored_dirs.contains(name.as_ref()) && !jvm_package)
+            {
                 continue;
             }
-            scan_dir(
-                root,
-                &path,
-                ignored_dirs,
-                reserved_roots,
-                pattern_sets,
-                (gitignore, above.child(own)),
-                include,
-                overrides,
-                files,
-                unsupported_by_extension,
-            )?;
-        } else if file_type.is_file() {
-            // Post-model include decision: a model-ignored file is force-included
-            // iff it matches `include` and is NOT overridden by an explicit
-            // `exclude` (checked inside `IncludeSet::forces`). Built-in dir skips
-            // are already handled structurally above, so include can never
-            // resurface node_modules/dist/.git/etc.
-            if !ignored || include.forces(&relative) {
-                if is_extractable_source_path(&relative, overrides) {
-                    files.push(relative);
+            let file_type = entry.file_type()?;
+            // A symlink is judged at its logical path by what it resolves to
+            // (#935). A broken one, or one to anything but a file or a
+            // directory, is skipped.
+            let (is_dir, is_link) = if file_type.is_symlink() {
+                match fs::metadata(&path) {
+                    Ok(target) if target.is_dir() => (true, true),
+                    Ok(target) if target.is_file() => (false, true),
+                    _ => continue,
+                }
+            } else if file_type.is_dir() {
+                (true, false)
+            } else if file_type.is_file() {
+                (false, false)
+            } else {
+                continue;
+            };
+            let own = self.gitignore.matched(&relative, is_dir);
+            let ignored = is_path_ignored(&relative, self.pattern_sets, above.decide(own));
+            if is_dir {
+                // A model-ignored dir is normally pruned before descent, so a FILE
+                // include under a gitignored ancestor would never be reached.
+                // Descend anyway when this dir is an ancestor of (or matches) an
+                // include pattern; files inside are still pruned unless force-included.
+                if ignored && !self.include.wants_descend(&relative) {
+                    continue;
+                }
+                if is_link {
+                    self.links
+                        .queue(hops + 1, relative, path, above.child(own));
+                    continue;
+                }
+                let canonical = canonical_dir.join(&file_name);
+                if !self.links.enter(canonical.clone(), &relative) {
+                    continue;
+                }
+                if hops > 0 {
+                    self.linked_dirs.push(relative);
+                }
+                self.scan_dir(&path, &canonical, above.child(own), hops)?;
+            } else if !ignored || self.include.forces(&relative) {
+                // Post-model include decision: a model-ignored file is force-included
+                // iff it matches `include` and is NOT overridden by an explicit
+                // `exclude` (checked inside `IncludeSet::forces`). Built-in dir skips
+                // are already handled structurally above, so include can never
+                // resurface node_modules/dist/.git/etc.
+                let target = if is_link {
+                    match self.links.file_target(&path) {
+                        Some(target) => Some(target),
+                        None => continue,
+                    }
+                } else {
+                    None
+                };
+                if is_extractable_source_path(&relative, self.overrides) {
+                    if let Some(target) = target {
+                        self.followed.push(FollowedLink {
+                            relative: relative.clone(),
+                            canonical: target.clone(),
+                            kind: LinkKind::File,
+                        });
+                        self.file_links.push((relative.clone(), target));
+                    }
+                    self.files.push(relative);
                 } else if let Some(extension) = unsupported_extension(&relative) {
-                    *unsupported_by_extension.entry(extension).or_default() += 1;
+                    *self.unsupported_by_extension.entry(extension).or_default() += 1;
                 }
             }
         }
+        Ok(())
     }
-    Ok(())
+
+    fn finish(mut self) -> ScanProjectResult {
+        self.files.sort();
+        self.followed
+            .sort_by(|left, right| left.relative.cmp(&right.relative));
+        self.linked_dirs.sort();
+        // A file link aliases its target's logical path when the target sits
+        // in a scanned directory, so an edit there can re-index the link too.
+        let mut file_aliases = BTreeMap::<String, Vec<String>>::new();
+        for (alias, target) in self.file_links {
+            let (Some(parent), Some(name)) = (target.parent(), target.file_name()) else {
+                continue;
+            };
+            let Some(dir) = self.links.logical_dir(parent) else {
+                continue;
+            };
+            let name = name.to_string_lossy();
+            let primary = if dir.is_empty() {
+                name.into_owned()
+            } else {
+                format!("{dir}/{name}")
+            };
+            file_aliases.entry(primary).or_default().push(alias);
+        }
+        for aliases in file_aliases.values_mut() {
+            aliases.sort();
+        }
+        ScanProjectResult {
+            files: self.files,
+            unsupported_by_extension: self.unsupported_by_extension,
+            links: self.followed,
+            linked_dirs: self.linked_dirs,
+            file_aliases,
+        }
+    }
+}
+
+/// Whether a directory entry is a directory, or a symlink to one.
+fn resolves_to_dir(entry: &fs::DirEntry, path: &Path) -> bool {
+    entry.file_type().is_ok_and(|kind| {
+        kind.is_dir() || (kind.is_symlink() && fs::metadata(path).is_ok_and(|meta| meta.is_dir()))
+    })
 }
 
 fn unsupported_extension(relative: &str) -> Option<String> {
