@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.52.1](https://github.com/sunerpy/codegraph-rust/compare/v0.52.0...v0.52.1) (2026-10-01)
+
+
+### Bug Fixes
+
+* **extract:** give same-line Vue script functions distinct ids ([#1349](https://github.com/sunerpy/codegraph-rust/issues/1349)) ([436791b](https://github.com/sunerpy/codegraph-rust/commit/436791b7f52ddf4e14fac9398f284d162c9cd0b9))
+* **extract:** keep a store initializer's own calls on the store ([436791b](https://github.com/sunerpy/codegraph-rust/commit/436791b7f52ddf4e14fac9398f284d162c9cd0b9))
+* **mcp:** never claim that gap markers name every elided symbol ([436791b](https://github.com/sunerpy/codegraph-rust/commit/436791b7f52ddf4e14fac9398f284d162c9cd0b9))
+* **resolve:** prefer an explicit default binding over an exported component ([436791b](https://github.com/sunerpy/codegraph-rust/commit/436791b7f52ddf4e14fac9398f284d162c9cd0b9))
+
 ## [0.52.0](https://github.com/sunerpy/codegraph-rust/compare/v0.51.0...v0.52.0) (2026-10-01)
 
 
