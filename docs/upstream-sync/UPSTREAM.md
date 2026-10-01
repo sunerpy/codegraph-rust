@@ -30,6 +30,12 @@
 
   This closes the two `v0.51.0` exceptions, #770 and #1829/#1878. See the
   dated entries below, including the `v0.52.0` release record.
+- **Shipped in codegraph-rs `v0.52.1`, 2026-10-01:**
+  - #291, the four port defects found by the retroactive review of the
+    `v1.6.1` port PRs, with extraction version 18;
+  - #292, the Rust 1.98.0 toolchain and MSRV.
+
+  See the dated entries below, including the `v0.52.1` release record.
 - **Deferred UI family:** the browser viewer and the graph-semantic families
   F1–F12 that shipped beside it in `v1.6.1` (framework navigation edges and
   routers, the synthesis layer and its schema, cross-tier channels, server route
@@ -129,6 +135,47 @@ below remain immutable historical evidence.
 > that records colby parity — do not infer it from `Cargo.toml`.
 
 ## Sync log
+
+### 2026-10-01 — `v0.52.1` RELEASED: #291 and #292 shipped
+
+Release-please PR [#293](https://github.com/sunerpy/codegraph-rust/pull/293)
+merged as `9ca7f9716de38828562295cdc79a3b5a99b52738` and cut tag `v0.52.1` at
+that exact commit.
+
+Release workflow run
+[`36879201833`](https://github.com/sunerpy/codegraph-rust/actions/runs/36879201833)
+passed all twelve jobs on its second attempt.
+
+- **First attempt:** the exact-SHA CI gate failed. On main CI run
+  [`36879201821`](https://github.com/sunerpy/codegraph-rust/actions/runs/36879201821),
+  Windows Clippy could not start sccache, because the Actions cache backend
+  answered 503 (`Egress is over the account`). The release stayed a draft.
+- **Second attempt:** re-running that job passed, and the re-run gate then
+  admitted the release. The six platform builds are from the first attempt.
+
+The release was published at 2026-10-01T15:12:32Z. The official
+`codegraph-0.52.1-x86_64-unknown-linux-musl.tar.gz` digest is
+`73bd59d46588467507152e2783cb06fd001187bc73f5a095b85708991326863d`.
+
+Black-box acceptance of the downloaded release, against the official
+`v0.52.0`:
+
+- `SHA256SUMS` and `gh attestation verify` passed for all six archives. The
+  binary reports `codegraph 0.52.1`, and its `.comment` section names rustc
+  1.98.0, where `v0.52.0` names 1.96.0.
+- **Vue:** two same-name functions on one line of a script block index as two
+  rows; `v0.52.0` kept one.
+- **Store initializer:** `useStore = create(persist(..., { storage:
+  createJSONStorage(...) }))` calls `create`, `createJSONStorage` and
+  `persist`; `v0.52.0` recorded no call.
+- **Default binding:** in a React `.js` module, `consume` calls `upload`
+  through `export default Api`; `v0.52.0` made it call the component
+  `Screen`.
+- **Trim note:** a windowed explore says gap markers name elided symbols "only
+  where room allowed".
+- **Upgrade:** an index written by `v0.52.0` reads as `outdated`, because the
+  extraction version moved from 17 to 18. `sync` re-extracts it, and it then
+  reads `current`.
 
 ### 2026-10-01 — Retroactive review of the `v1.6.1` port PRs: four port defects FIXED (#291)
 
