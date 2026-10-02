@@ -12,6 +12,7 @@
   until it is pressed.
 -->
 <script lang="ts">
+  import Icon from './Icon.svelte';
   import { copyPngToClipboard, downloadSvg, svgToPng, PNG_SCALE } from '../lib/export-image';
   import { toast } from '../lib/toast.svelte';
 
@@ -57,10 +58,10 @@
 </script>
 
 <div class="exp">
-  <button type="button" onclick={copyImage} disabled={disabled || busy}>
-    {busy ? 'Rendering…' : 'Copy image'}
+  <button type="button" class="btn secondary" onclick={copyImage} disabled={disabled || busy}>
+    <Icon name="copy" />{busy ? 'Rendering…' : 'Copy image'}
   </button>
-  <button type="button" onclick={saveSvg} {disabled}>Download SVG</button>
+  <button type="button" class="btn secondary" onclick={saveSvg} {disabled}>Download SVG</button>
 </div>
 
 <style>
@@ -70,32 +71,5 @@
     /* Pushed to the trailing edge of a flex header; inert in a block panel. */
     margin-left: auto;
     gap: 6px;
-  }
-
-  .exp button {
-    padding: 3px 8px;
-    background: var(--paper-2);
-    border: 1px solid var(--rule-soft);
-    border-radius: 0;
-    color: var(--ink-2);
-    cursor: pointer;
-    font: 12.5px var(--sans);
-    white-space: nowrap;
-  }
-
-  .exp button:hover:not(:disabled) {
-    background: var(--press);
-    border-color: var(--ink-3);
-    color: var(--ink);
-  }
-
-  .exp button:disabled {
-    color: var(--ink-4);
-    cursor: default;
-  }
-
-  .exp button:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 1px;
   }
 </style>

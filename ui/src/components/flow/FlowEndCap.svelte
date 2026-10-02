@@ -93,19 +93,22 @@
 </div>
 
 <style>
+  /* Where the static graph stops: the "leaves the index" recipe of §9.1 — a
+     dashed `fg-4` box — around the dispatch sites and what might come next. */
   .endcap {
     box-sizing: border-box;
-    padding: 12px;
-    background: var(--paper);
-    border: 1px dashed var(--rule-soft);
-    color: var(--ink-2);
-    font-size: 12px;
+    padding: 12px 14px;
+    border: 1px dashed var(--fg-4);
+    border-radius: 12px;
+    background: color-mix(in srgb, var(--card) 70%, transparent);
+    color: var(--fg-2);
+    font: var(--t-small);
     line-height: 1.45;
     text-align: left;
   }
 
   .endcap.dim {
-    opacity: 0.4;
+    opacity: 0.45;
   }
 
   .lead {
@@ -113,13 +116,13 @@
   }
 
   .lead b {
-    color: var(--ink);
+    color: var(--fg);
     font-weight: 600;
   }
 
   .site,
   .block {
-    margin-top: 8px;
+    margin-top: 10px;
   }
 
   .endcap p {
@@ -127,11 +130,11 @@
   }
 
   .form {
-    color: var(--ink);
+    color: var(--fg);
   }
 
   .soft {
-    color: var(--ink-3);
+    color: var(--fg-3);
   }
 
   .key .mono,
@@ -142,20 +145,22 @@
   .row {
     display: flex;
     width: 100%;
-    align-items: baseline;
-    padding: 0;
-    background: none;
+    align-items: center;
+    margin-top: 4px;
+    padding: 4px 8px;
     border: 0;
-    color: var(--ink-2);
+    border-radius: 6px;
+    background: var(--raised);
+    color: var(--fg-2);
     cursor: pointer;
-    font: 11.5px / 18px var(--mono);
+    font: var(--t-mono-sm);
     gap: 8px;
     justify-content: space-between;
     text-align: left;
   }
 
   .row:hover .nm {
-    color: var(--accent);
+    color: var(--primary-ink);
   }
 
   .nm {
@@ -167,13 +172,12 @@
   /* A refused match reads as refused: the dotted rule under it is the same one
      the code block draws under an uncertain call site. */
   .unsure {
-    text-decoration: underline dotted var(--ink-4);
+    text-decoration: underline dotted var(--fg-4);
     text-underline-offset: 3px;
   }
 
   .at {
-    color: var(--ink-4);
-    font-size: 11px;
+    color: var(--fg-4);
     white-space: nowrap;
   }
 </style>

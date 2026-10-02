@@ -13,6 +13,7 @@
   look up.
 -->
 <script lang="ts">
+  import Icon from '../Icon.svelte';
   import KindGlyph from '../KindGlyph.svelte';
   import { fileHref } from '../../lib/navigation';
   import type { EntryRow, EntrySection } from '../../lib/entry-model';
@@ -38,6 +39,7 @@
   {#each section.groups as group (group.path)}
     <div class="filegroup">
       <div class="fpath">
+        <Icon name="folder" size={14} />
         {#if group.file}
           <a href={fileHref(group.file)} title={group.file}>{group.path}</a>
         {:else}
@@ -47,7 +49,7 @@
       </div>
       {#each group.rows as row (row.id)}
         <div class="row" class:armed={armed === row.id} class:stub={!row.target}>
-          <KindGlyph kind={row.kind} />
+          <KindGlyph kind={row.kind} size={22} />
           <div class="body">
             <div class="line">
               {#if row.target}
@@ -70,14 +72,14 @@
                   armed === null ? 'Flow ›' : armed === row.id ? 'Cancel' : '→ here'}
                 <button
                   type="button"
-                  class="chip"
+                  class="btn chip"
                   title={armed === null
                     ? `Start a flow from ${row.flowFrom}`
                     : armed === row.id
                       ? 'Stop drawing a flow from here'
                       : `Draw the path that ends at ${row.flowFrom}`}
                   data-entry-flow={row.id}
-                  onclick={() => onflow(row)}>{label}</button
+                  onclick={() => onflow(row)}>{#if armed === null}<Icon name="workflow" />{/if}{label}</button
                 >
               {/if}
             </div>
@@ -97,13 +99,13 @@
 </section>
 
 <style>
+  /* One entry-point list as a D card: title `label`, a caption under it,
+     rows as `card` + `line-faint` r 10 with a ghost Flow button (§8 D-01). */
   .sec {
-    padding: 0 0 18px;
-    border-bottom: 1px solid var(--rule-faint);
-  }
-
-  .sec:last-child {
-    border-bottom: 0;
+    padding: 4px 18px 16px;
+    border: 1px solid var(--line-faint);
+    border-radius: 12px;
+    background: var(--panel);
   }
 
   .sec-h {
@@ -111,73 +113,87 @@
     align-items: baseline;
     justify-content: space-between;
     gap: 12px;
-    padding: 14px 14px 2px;
+    padding: 14px 0 2px;
   }
 
   .sec-h h3 {
     margin: 0;
-    font-size: 15px;
-    font-weight: 600;
+    color: var(--fg);
+    font: var(--t-label);
   }
 
   .sec-h .meta {
-    color: var(--ink-3);
-    font-size: 11.5px;
+    color: var(--fg-3);
+    font: var(--t-caption);
   }
 
   .note {
     margin: 0;
-    padding: 2px 14px 4px;
-    color: var(--ink-3);
-    font-size: 11.5px;
-    line-height: 1.4;
+    padding: 2px 0 6px;
+    color: var(--fg-3);
+    font: var(--t-caption);
+    line-height: 1.45;
   }
 
   .note.dim {
-    color: var(--ink-4);
+    color: var(--fg-4);
   }
 
   .filegroup {
-    padding: 10px 14px 4px;
+    padding-top: 10px;
   }
 
   .fpath {
     display: flex;
-    justify-content: space-between;
+    align-items: center;
     gap: 8px;
-    margin-bottom: 4px;
-    color: var(--ink-3);
-    font: 11px var(--mono);
+    margin: 0 2px 8px;
+    color: var(--fg-3);
+    font: var(--t-mono-sm);
+  }
+
+  .fpath a,
+  .fpath span {
+    min-width: 0;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .fpath a:hover {
-    color: var(--ink);
+    color: var(--fg);
     text-decoration: underline;
   }
 
   .fpath b {
-    color: var(--ink-2);
+    flex: 0 0 auto;
+    color: var(--fg-2);
     font-weight: 500;
   }
 
   .row {
     position: relative;
     display: grid;
-    grid-template-columns: 16px 1fr;
-    gap: 8px;
-    align-items: start;
-    margin: 0 -6px;
-    padding: 5px 6px 5px 4px;
-    border: 1px solid transparent;
+    grid-template-columns: 22px minmax(0, 1fr);
+    gap: 12px;
+    align-items: center;
+    margin-bottom: 6px;
+    padding: 9px 12px;
+    border: 1px solid var(--line-faint);
+    border-radius: 10px;
+    background: var(--card);
   }
 
   .row:hover {
-    background: var(--press);
+    border-color: var(--line);
+    background: var(--raised);
   }
 
   .row.armed {
-    border-color: var(--accent-line);
-    background: var(--accent-soft);
+    border-color: var(--primary-line);
+    background: var(--primary-soft);
+    box-shadow: var(--glow-25);
   }
 
   .body {
@@ -186,15 +202,16 @@
 
   .line {
     display: flex;
-    align-items: baseline;
+    align-items: center;
     gap: 8px;
   }
 
   .nm {
-    overflow: hidden;
     min-width: 0;
-    color: var(--ink);
-    font: 12.5px var(--mono);
+    flex: 1;
+    overflow: hidden;
+    color: var(--fg);
+    font: var(--t-mono-500);
     text-align: left;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -204,36 +221,32 @@
     cursor: pointer;
   }
 
+  .nm:not(.plain):hover {
+    color: var(--primary-ink);
+  }
+
   .row.stub .nm {
-    color: var(--ink-2);
+    color: var(--fg-2);
   }
 
   .verb {
-    margin-right: 6px;
-    color: var(--ink-2);
-    font-weight: 500;
+    margin-right: 8px;
+    color: var(--amber);
+    font-weight: 600;
   }
 
   .meta {
-    margin-top: 1px;
+    margin-top: 2px;
     overflow: hidden;
-    color: var(--ink-3);
-    font-size: 11px;
+    color: var(--fg-3);
+    font: var(--t-mono-sm);
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
   .chip {
     flex: none;
-    padding: 0 4px;
-    border: 1px solid var(--rule-soft);
-    background: var(--paper);
-    color: var(--ink-2);
-    font: 11px var(--mono);
-  }
-
-  .chip:hover {
-    border-color: var(--ink);
-    color: var(--ink);
+    height: 28px;
+    padding: 0 10px;
   }
 </style>

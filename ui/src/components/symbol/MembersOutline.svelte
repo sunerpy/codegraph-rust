@@ -9,6 +9,7 @@
   the weight sits than twenty rows with their edge counts.
 -->
 <script lang="ts">
+  import Icon from '../Icon.svelte';
   import KindGlyph from '../KindGlyph.svelte';
   import type { WireNodeRef, WireOverride } from '../../lib/api';
   import type { OutlineRow } from '../../lib/symbol-model';
@@ -35,9 +36,11 @@
   }
 </script>
 
+<div class="mcard">
 <div class="subh">
+  <span class="lead"><Icon name="braces" /></span>
   <span>Members</span>
-  <span class="n">{total}</span>
+  <span class="n">{total} · ← in → out</span>
 </div>
 
 <div class="outline">
@@ -50,7 +53,7 @@
       onclick={() => onopen(row.member)}
       title={`${row.member.qualifiedName} — ${row.member.file}:${row.member.line}`}
     >
-      <KindGlyph kind={row.member.kind} />
+      <KindGlyph kind={row.member.kind} size={20} />
       <span class="nm">{row.member.name}</span>
       <span class="sig">
         {#if row.member.overrides}
@@ -59,10 +62,7 @@
             {row.member.overrides.baseTypeName}
           </span>
         {/if}{row.member.signature ?? ''}</span>
-      <span class="cnt">
-        {#if row.member.fanIn}← {row.member.fanIn}{/if}{#if row.member.fanIn && row.member.fanOut}&nbsp;
-        {/if}{#if row.member.fanOut}→ {row.member.fanOut}{/if}
-      </span>
+      <span class="cnt"><span class:zero={!row.member.fanIn}>← {row.member.fanIn}</span><span class:zero={!row.member.fanOut}>→ {row.member.fanOut}</span></span>
     </button>
   {/each}
 </div>
@@ -72,80 +72,101 @@
     Showing {rows.length} of {total} members — open the file to see the rest.
   </div>
 {/if}
+</div>
 
 <style>
+  /* §8 D-06 members card: tile 20, the name, the signature in `mono-sm`
+     `fg-4`, and the ← in / → out counts on the right. */
+  .mcard {
+    margin-top: 16px;
+    padding: 0 12px 10px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--card);
+  }
+
   .subh {
     display: flex;
-    align-items: baseline;
+    align-items: center;
     gap: 8px;
-    margin: 18px 0 4px;
-    font-weight: 600;
-    font-size: 13px;
+    height: 48px;
+    padding: 0 4px;
+    font: var(--t-label);
+  }
+
+  .subh .lead {
+    display: inline-flex;
+    color: var(--fg-3);
   }
 
   .subh .n {
-    color: var(--ink-3);
-    font-weight: 400;
-  }
-
-  .outline {
-    border-top: 1px solid var(--rule);
+    color: var(--fg-3);
+    font: var(--t-caption);
   }
 
   .orow {
     display: grid;
-    grid-template-columns: 16px minmax(160px, auto) 1fr auto;
+    grid-template-columns: 20px minmax(120px, auto) minmax(0, 1fr) auto;
     gap: 10px;
-    align-items: baseline;
+    align-items: center;
     width: 100%;
-    padding: 6px 4px;
-    border-bottom: 1px solid var(--rule-faint);
+    min-height: 34px;
+    padding: 0 6px;
+    border-radius: 8px;
     text-align: left;
   }
 
   .orow:hover {
-    background: var(--press);
+    background: var(--raised);
   }
 
   .orow.nested {
-    padding-left: 22px;
+    padding-left: 28px;
   }
 
   .nm {
-    font: 12.5px var(--mono);
+    color: var(--fg);
+    font: var(--t-mono);
   }
 
   .orow.dimmed .nm {
-    color: var(--ink-3);
+    color: var(--fg-3);
   }
 
   .ovr {
-    margin-right: 6px;
-    padding: 0 4px;
-    border: 1px solid var(--rule-soft);
-    color: var(--ink-2);
-    font: 10.5px var(--mono);
+    margin-right: 8px;
+    padding: 1px 7px;
+    border-radius: 9px;
+    background: var(--violet-soft);
+    color: var(--violet);
+    font: var(--t-mono-sm);
     white-space: nowrap;
   }
 
   .sig {
     overflow: hidden;
-    color: var(--ink-3);
-    font: 11.5px var(--mono);
+    color: var(--fg-4);
+    font: var(--t-mono-sm);
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
   .cnt {
-    color: var(--ink-3);
-    font: 11px var(--mono);
+    display: inline-flex;
+    gap: 12px;
+    color: var(--fg-2);
+    font: var(--t-mono-sm);
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
   }
 
+  .cnt .zero {
+    color: var(--fg-4);
+  }
+
   .note {
-    padding: 8px 0;
-    color: var(--ink-3);
-    font-size: 11.5px;
+    padding: 8px 6px 2px;
+    color: var(--fg-3);
+    font: var(--t-caption);
   }
 </style>

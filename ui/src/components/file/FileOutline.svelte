@@ -1,8 +1,8 @@
 <!--
   The file's symbols in source order (design spec §3.4).
 
-  Same row geometry as the Symbol view's members outline — `16px | name | 1fr |
-  counts` — because they answer the same question at two scales, and a reader
+  Same row geometry as the Symbol view's members outline — `tile | name |
+  signature | counts` — because they answer the same question at two scales, and a reader
   who has learned one should not have to learn the other. What differs is the
   right column: a file outline prints the LINE number as well as the edge
   counts, since source order is the only ordering here and the line is how a
@@ -16,6 +16,7 @@
   `OUTLINE_ROW_HEIGHT` constant) so the window's arithmetic stays exact.
 -->
 <script lang="ts">
+  import Icon from '../Icon.svelte';
   import KindGlyph from '../KindGlyph.svelte';
   import type { WireNodeRef } from '../../lib/api';
   import {
@@ -37,6 +38,9 @@
   }
 
   let { rows, total, truncated, scroller, selected = -1, onopen, onhover }: Props = $props();
+
+  /** The in-bar's scale: the most-referenced symbol in this file. */
+  let maxIn = $derived(rows.reduce((max, row) => Math.max(max, row.entry.fanIn ?? 0), 1));
 
   let listEl = $state<HTMLDivElement | null>(null);
   let scrollTop = $state(0);
@@ -99,10 +103,12 @@
   });
 </script>
 
+<div class="ocard">
 <div class="subh">
+  <span class="lead"><Icon name="list-tree" /></span>
   <span>Outline</span>
-  <span class="n">in source order</span>
-  <span class="n count">{total}</span>
+  <span class="n">source order · nested by owner · {total}</span>
+  <span class="cols" aria-hidden="true"><span>← in</span><span>→ out</span><span>line</span></span>
 </div>
 
 <div class="outline" bind:this={listEl}>
@@ -114,18 +120,20 @@
       class="orow"
       class:dimmed={row.dimmed}
       class:sel={index === selected}
-      style:padding-left={`${4 + row.indent * 22}px`}
+      style:padding-left={`${8 + row.indent * 28}px`}
       onclick={() => onopen(row.entry)}
       onmouseenter={() => onhover?.(index)}
       title={`${row.entry.qualifiedName} — line ${row.entry.line}`}
     >
-      <KindGlyph kind={row.entry.kind} />
+      <KindGlyph kind={row.entry.kind} size={20} />
       <span class="nm">{row.entry.name}</span>
       <span class="sig">{row.entry.signature ?? ''}</span>
-      <span class="cnt">
-        {row.entry.line}{#if row.entry.fanIn}&nbsp;· ← {row.entry.fanIn}{/if}{#if row.entry.fanOut}&nbsp;·
-          → {row.entry.fanOut}{/if}
+      <span class="in" class:zero={!row.entry.fanIn}>
+        <b>{row.entry.fanIn ?? 0}</b>
+        <span class="bar"><i style:width={`${Math.max(row.entry.fanIn ? 8 : 0, Math.round((100 * (row.entry.fanIn ?? 0)) / maxIn))}%`}></i></span>
       </span>
+      <span class="out" class:zero={!row.entry.fanOut}>{row.entry.fanOut ?? 0}</span>
+      <span class="ln">{row.entry.line}</span>
     </button>
   {/each}
   {#if window_.after > 0}<div style:height={`${window_.after}px`}></div>{/if}
@@ -144,81 +152,137 @@
     screen caps what it draws.
   </div>
 {/if}
+</div>
 
 <style>
+  /* §8 D-03 outline card: rows 28 high at a 30 pitch — name / signature
+     `mono-sm` `fg-4` / ← in with a 3px GRAD.data bar / → out / line. */
+  .ocard {
+    margin-top: 18px;
+    padding: 0 10px 8px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--card);
+  }
+
   .subh {
     display: flex;
-    align-items: baseline;
+    align-items: center;
     gap: 8px;
-    margin: 18px 0 4px;
-    font-weight: 600;
-    font-size: 13px;
+    height: 48px;
+    padding: 0 8px;
+    font: var(--t-label);
+  }
+
+  .subh .lead {
+    display: inline-flex;
+    color: var(--fg-3);
   }
 
   .subh .n {
-    color: var(--ink-3);
-    font-weight: 400;
+    color: var(--fg-3);
+    font: var(--t-caption);
   }
 
-  .subh .count {
+  .cols {
+    display: grid;
+    grid-template-columns: 80px 48px 44px;
     margin-left: auto;
-    font-variant-numeric: tabular-nums;
+    color: var(--fg-3);
+    font: var(--t-micro);
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
   }
 
-  .outline {
-    border-top: 1px solid var(--rule);
+  .cols span:last-child {
+    text-align: right;
   }
 
-  /* The height here is load-bearing: the windowing arithmetic above assumes
+  /* The pitch here is load-bearing: the windowing arithmetic above assumes
      every row is exactly OUTLINE_ROW_HEIGHT tall. Any change must move both. */
   .orow {
     display: grid;
-    height: 28px;
+    height: 30px;
     box-sizing: border-box;
-    grid-template-columns: 16px minmax(160px, auto) 1fr auto;
+    grid-template-columns: 20px minmax(140px, auto) minmax(0, 1fr) 80px 48px 44px;
     width: 100%;
     align-items: center;
     gap: 10px;
-    padding: 0 4px;
-    border-bottom: 1px solid var(--rule-faint);
+    padding: 1px 8px;
+    border-radius: 8px;
+    background-clip: content-box;
     text-align: left;
   }
 
-  .orow:hover,
+  .orow:hover {
+    background-color: var(--raised);
+  }
+
   .orow.sel {
-    background: var(--press);
+    background-color: var(--primary-soft);
+    box-shadow:
+      inset 0 0 0 1px var(--primary-line),
+      var(--glow-20);
+  }
+
+  .orow.sel .nm {
+    color: var(--primary-ink);
   }
 
   .nm {
     overflow: hidden;
-    font: 12.5px var(--mono);
+    color: var(--fg);
+    font: var(--t-mono);
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
   .orow.dimmed .nm {
-    color: var(--ink-3);
+    color: var(--fg-2);
   }
 
   .sig {
     overflow: hidden;
-    color: var(--ink-3);
-    font: 11.5px var(--mono);
+    color: var(--fg-4);
+    font: var(--t-mono-sm);
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
-  .cnt {
-    color: var(--ink-3);
-    font: 11px var(--mono);
+  .in {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .in b,
+  .out {
+    color: var(--fg);
+    font: var(--t-mono-sm);
     font-variant-numeric: tabular-nums;
-    white-space: nowrap;
+  }
+
+  .in .bar {
+    width: 36px;
+    height: 3px;
+  }
+
+  .zero b,
+  .out.zero {
+    color: var(--fg-4);
+  }
+
+  .ln {
+    color: var(--fg-4);
+    font: var(--t-mono-sm);
+    font-variant-numeric: tabular-nums;
+    text-align: right;
   }
 
   .note {
-    padding: 10px 0;
-    color: var(--ink-3);
-    font-size: 11.5px;
+    padding: 10px 8px 4px;
+    color: var(--fg-3);
+    font: var(--t-caption);
     line-height: 1.5;
   }
 </style>

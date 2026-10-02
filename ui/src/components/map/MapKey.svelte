@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Icon from '../Icon.svelte';
   /**
    * The Map's key (design spec §3.6), matching the Screens and Steps views'.
    *
@@ -24,8 +25,11 @@
 </script>
 
 <div class="legend" class:open>
-  <button class="legend-h" onclick={() => onToggle(!open)} aria-expanded={open}>
-    Key <span class="dim">{open ? '▾' : '▸'}</span>
+  <button class="legend-h" onclick={() => onToggle(!open)} aria-expanded={open} title={open ? 'Fold the key' : 'Open the full key'}>
+    <span class="kl"><svg width="20" height="8" aria-hidden="true"><path d="M1 4 H19" class="k-line" /></svg>calls · width = volume</span>
+    <span class="kl"><svg width="20" height="8" aria-hidden="true"><path d="M1 4 H19" class="k-line k-hot" /></svg>touches the selection</span>
+    {#if thinCount > 0}<span class="kl dim">{thinCount} link{thinCount === 1 ? '' : 's'} &lt; {minWeight} calls hidden</span>{/if}
+    <span class="chev"><Icon name={open ? 'chevron-down' : 'chevron-right'} size={14} /></span>
   </button>
   {#if open}
     <div class="legend-body">
@@ -93,97 +97,126 @@
 </div>
 
 <style>
+  /* §7 legend: 34 high at 16 from the bottom-left, `overlay` + `line` +
+     SH.pop, r 10 — the one-line key at rest, the full key when opened. */
   .legend {
     position: absolute;
-    left: 12px;
-    bottom: 12px;
+    bottom: 16px;
+    left: 16px;
     z-index: 4;
-    max-width: 400px;
-    border: 1px solid var(--rule);
-    background: var(--paper);
-    font-size: 11.5px;
-    color: var(--ink-2);
+    max-width: min(460px, calc(100% - 32px));
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--overlay);
+    box-shadow: var(--sh-pop);
+    color: var(--fg-2);
+    font: var(--t-caption);
   }
   .legend-h {
-    display: block;
+    display: flex;
     width: 100%;
+    min-height: 34px;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 6px 16px;
+    padding: 6px 12px;
     border: 0;
     background: transparent;
-    padding: 5px 10px;
-    text-align: left;
-    color: var(--ink);
-    font: 600 12px var(--sans);
+    color: var(--fg-2);
     cursor: pointer;
+    font: var(--t-caption);
+    text-align: left;
+  }
+  .kl {
+    display: inline-flex;
+    min-width: 0;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+  }
+
+  .kl.dim {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .chev {
+    display: inline-flex;
+    margin-left: auto;
+    color: var(--fg-3);
   }
   .legend-body {
-    padding: 2px 10px 8px;
-    border-top: 1px solid var(--rule-soft);
+    padding: 4px 12px 10px;
+    border-top: 1px solid var(--line-faint);
   }
   .lrow {
     display: flex;
     align-items: center;
     gap: 10px;
-    padding: 3px 0;
+    padding: 4px 0;
   }
   .lrow > :first-child {
-    flex: 0 0 52px;
     display: inline-flex;
+    flex: 0 0 56px;
     justify-content: center;
   }
   .k-line {
-    stroke: var(--ink);
-    stroke-opacity: 0.6;
-    stroke-width: 1.5;
     fill: none;
+    stroke: var(--line-strong);
+    stroke-width: 2;
+  }
+  .k-line.k-hot {
+    stroke: var(--cyan);
   }
   .k-line.k-back {
-    stroke: var(--accent);
-    stroke-opacity: 0.8;
+    stroke: var(--violet);
     stroke-dasharray: 4 3;
   }
   .k-label {
-    font-size: 10px;
-    color: var(--ink-3);
-    text-align: center;
+    color: var(--fg-3);
+    font: var(--t-caption);
     line-height: 1.2;
+    text-align: center;
   }
   .k-box {
     box-sizing: border-box;
-    padding: 1px 5px;
-    border: 1px solid var(--ink);
-    font-size: 10.5px;
-    color: var(--ink);
-    line-height: 14px;
+    padding: 1px 6px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--card);
+    color: var(--fg);
+    font: var(--t-mono-sm);
+    line-height: 16px;
   }
   /* The bar, drawn the way the canvas draws it: inside the bottom edge. */
   .k-box.k-weight {
     position: relative;
   }
   .k-box.k-weight::after {
-    content: '';
     position: absolute;
-    left: 0;
-    bottom: 0;
-    width: 68%;
-    height: 4px;
-    background: var(--ink);
-    opacity: 0.3;
+    bottom: 1px;
+    left: 4px;
+    width: 60%;
+    height: 2px;
+    border-radius: 1px;
+    background: var(--grad-data);
+    content: '';
   }
-  /* The same three treatments the canvas uses, at key size. */
+  /* The same treatments the canvas uses, at key size. */
   .k-box.k-sel {
-    border-width: 2px;
-    background: var(--press);
+    border-color: var(--primary-line);
+    background: var(--primary-soft);
+    color: var(--primary-ink);
   }
   .k-box.k-test {
     border-style: dashed;
-    border-color: var(--ink-3);
-    color: var(--ink-3);
+    border-color: var(--line-strong);
+    color: var(--fg-3);
   }
   .k-box.k-gen {
-    border-color: var(--ink-4);
-    color: var(--ink-4);
+    color: var(--fg-4);
   }
   .dim {
-    color: var(--ink-3);
+    color: var(--fg-4);
   }
 </style>

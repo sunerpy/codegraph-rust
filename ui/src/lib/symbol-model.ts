@@ -471,7 +471,67 @@ export function buildCallerRail(payload: WireSymbolPayload): CallerRailModel {
   };
 }
 
+/**
+ * The Called by rail narrowed to the rows a "Filter callers" query names
+ * (docs/design/viewer-d.md §8 D-02): a row stays when its name, qualified name
+ * or file contains the query, case-insensitively, and a file group with no row
+ * left goes. The headline `total` does not move — the filter narrows what is
+ * listed, not what the graph says calls this.
+ */
+export function filterCallerRail(model: CallerRailModel, query: string): CallerRailModel {
+  const needle = query.trim().toLowerCase();
+  if (needle === '') return model;
+  const keep = (row: CallerRow): boolean => {
+    const node = row.relation.node;
+    return (
+      node.name.toLowerCase().includes(needle) ||
+      node.qualifiedName.toLowerCase().includes(needle) ||
+      node.file.toLowerCase().includes(needle)
+    );
+  };
+  const testRows = model.tests.rows.filter(keep);
+  return {
+    ...model,
+    groups: model.groups
+      .map((group) => ({ ...group, rows: group.rows.filter(keep) }))
+      .filter((group) => group.rows.length > 0),
+    uncertain: model.uncertain.filter(keep),
+    tests: {
+      rows: testRows,
+      calls: testRows.reduce((sum, row) => sum + row.relation.edgeCount, 0),
+      files: [...new Set(testRows.map((row) => row.relation.node.file))].sort(),
+    },
+  };
+}
+
 /* ----------------------------------------------------------- connectors -- */
+
+/** §7 callee row: 44 high, and at least 8 between two rows pushed apart. */
+export const CALLEE_ROW_HEIGHT = 44;
+export const CALLEE_ROW_GAP = 8;
+
+/**
+ * Where each callee row sits: centred on its call-site line, never above the
+ * row before it — `y = max(lineY − 22, previous + 52)` (§8 D-02). A row with no
+ * line to point at (`null`) stacks under its predecessor. Order beats exactness:
+ * a rail whose rows jump around relative to the body stops being a reading of
+ * the code, and the connector still runs to the line.
+ *
+ * @param centres the call-site line's vertical centre per row, in rail space
+ * @param start where the first row may begin (under the rail header)
+ */
+export function calleeRowTops(centres: ReadonlyArray<number | null>, start: number): number[] {
+  const tops: number[] = [];
+  let y = start;
+  for (const centre of centres) {
+    const wanted = centre !== null ? centre - CALLEE_ROW_HEIGHT / 2 : y;
+    y = Math.max(wanted, y);
+    tops.push(y);
+    y += CALLEE_ROW_HEIGHT + CALLEE_ROW_GAP;
+  }
+  return tops;
+}
+
 
 /** One hairline from a gutter port to a callee row. Geometry comes from the view. */
 export interface Connector {

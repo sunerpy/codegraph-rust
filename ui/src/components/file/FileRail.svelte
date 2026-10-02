@@ -14,6 +14,7 @@
   read as broken.
 -->
 <script lang="ts">
+  import Icon from '../Icon.svelte';
   import { fileHref } from '../../lib/navigation';
   import { plural } from '../../lib/symbol-model';
   import type { FileRailModel, FileRailRow } from '../../lib/file-model';
@@ -55,7 +56,10 @@
 
 <div class="rail" class:right={side === 'right'} aria-label={title}>
   <div class="rail-h">
-    <span>{title} <span class="n">{model.total}</span></span>
+    <span class="title"
+      ><span class="lead"><Icon name={side === 'left' ? 'corner-down-right' : 'arrow-right'} /></span>{title}
+      <span class="count">{model.total}</span></span
+    >
   </div>
 
   {#if model.rows.length === 0}
@@ -71,6 +75,7 @@
       title={rowTitle(row)}
       onmouseenter={() => onhover?.(index)}
     >
+      <span class="fi"><Icon name="file-code-2" size={14} /></span>
       <span class="p"><span class="dir">{dirOf(row.path)}</span><span class="base"
           >{baseOf(row.path)}</span
         ></span>
@@ -87,33 +92,27 @@
   {/if}
 
   {#if model.outside.length > 0}
-    <div class="sub">
-      Outside the index <span class="n">{model.outside.length}</span>
+    <div class="sub micro">Outside the index · {model.outside.length}</div>
+    <div class="outside">
+      {#each model.outside as row (row.name)}
+        <span class="pill bordered mono" title={`imported at line ${row.lines.join(', ')}`}
+          >{row.name}{#if row.lines.length > 1}<span class="dim"> ×{row.lines.length}</span>{/if}</span
+        >
+      {/each}
     </div>
-    {#each model.outside as row (row.name)}
-      <div class="filerow outside" title={`imported at line ${row.lines.join(', ')}`}>
-        <span class="p"><span class="dir">{row.name}</span></span>
-        {#if row.lines.length > 1}<span class="n2">×{row.lines.length}</span>{/if}
-      </div>
-    {/each}
-    <div class="note dim">
-      Packages and runtime modules — nothing was indexed for them, so this
-      viewer cannot open them.
+    <div class="note">
+      Listed, not linked — packages and runtime modules the index does not contain.
     </div>
   {/if}
 </div>
 
 <style>
+  /* §8 D-03 rails: header 52, file rows 28 high at a 30 pitch with the
+     count right-aligned; what leaves the index as bordered pills. */
   .rail {
-    overflow: auto;
     height: 100%;
-    border-right: 1px solid var(--rule-soft);
-    background: var(--paper);
-  }
-
-  .rail.right {
-    border-right: none;
-    border-left: 1px solid var(--rule-soft);
+    overflow: auto;
+    padding-bottom: 12px;
   }
 
   .rail-h {
@@ -121,51 +120,64 @@
     top: 0;
     z-index: 2;
     display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    padding: 12px 14px 8px;
-    border-bottom: 1px solid var(--rule-soft);
-    background: var(--paper);
-    font-weight: 600;
-    font-size: 13px;
+    align-items: center;
+    height: 52px;
+    padding: 0 16px;
+    background: var(--panel);
   }
 
-  .rail-h .n,
-  .sub .n {
-    color: var(--ink-3);
-    font-weight: 400;
+  .title {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font: var(--t-label);
   }
 
-  .sub {
-    margin-top: 14px;
-    padding: 10px 14px 4px;
-    border-top: 1px solid var(--rule-soft);
-    color: var(--ink-2);
-    font-size: 12px;
+  .title .lead {
+    display: inline-flex;
+    color: var(--cyan);
+  }
+
+  .count {
+    display: inline-flex;
+    min-width: 22px;
+    height: 20px;
+    align-items: center;
+    justify-content: center;
+    padding: 0 7px;
+    border-radius: 10px;
+    background: var(--raised);
+    color: var(--fg-2);
+    font: var(--t-mono-sm);
   }
 
   .filerow {
     display: grid;
-    grid-template-columns: 1fr auto;
+    grid-template-columns: 14px minmax(0, 1fr) auto;
     gap: 8px;
-    align-items: baseline;
-    padding: 5px 14px;
-    border-bottom: 1px solid var(--rule-faint);
-    color: var(--ink-2);
-    font: 12px var(--mono);
+    align-items: center;
+    height: 28px;
+    margin: 0 10px 2px;
+    padding: 0 8px;
+    border-radius: 8px;
+    color: var(--fg-2);
+    font: var(--t-mono);
     text-decoration: none;
   }
 
   a.filerow:hover,
   a.filerow.sel {
-    background: var(--press);
-    color: var(--ink);
+    background: var(--raised);
+    color: var(--fg);
   }
 
-  /* Not a link, and drawn so — nothing was indexed to open. */
-  .filerow.outside {
-    color: var(--ink-3);
-    cursor: default;
+  a.filerow.sel {
+    box-shadow: inset 0 0 0 1px var(--fg-2);
+  }
+
+  .fi {
+    display: inline-flex;
+    color: var(--fg-4);
   }
 
   .p {
@@ -176,34 +188,51 @@
   .dir {
     overflow: hidden;
     flex: 0 1 auto;
-    color: var(--ink-3);
+    color: var(--fg-3);
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
   .base {
     flex: 0 0 auto;
+    color: var(--fg);
     white-space: nowrap;
   }
 
   .filerow.test .base {
-    color: var(--ink-3);
+    color: var(--fg-3);
   }
 
   .n2 {
-    color: var(--ink-3);
-    font-size: 11px;
+    min-width: 26px;
+    padding: 1px 7px;
+    border-radius: 9px;
+    background: var(--raised);
+    color: var(--fg-2);
+    font: var(--t-mono-sm);
     font-variant-numeric: tabular-nums;
+    text-align: center;
+  }
+
+  .sub {
+    margin: 18px 16px 10px;
+  }
+
+  .outside {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 0 16px;
   }
 
   .note {
-    padding: 8px 14px;
-    color: var(--ink-3);
-    font-size: 11.5px;
-    line-height: 1.4;
+    padding: 10px 16px;
+    color: var(--fg-3);
+    font: var(--t-caption);
+    line-height: 1.45;
   }
 
   .note.dim {
-    color: var(--ink-4);
+    color: var(--fg-4);
   }
 </style>

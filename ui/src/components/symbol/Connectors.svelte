@@ -21,6 +21,17 @@
   }
 
   let { connectors, width, height }: Props = $props();
+
+  // §7: the hot connector is drawn last, so it crosses over the resting ones.
+  let ordered = $derived.by(() => {
+    const resting: Array<{ connector: Connector; key: string }> = [];
+    const lit: Array<{ connector: Connector; key: string }> = [];
+    connectors.forEach((connector, i) => {
+      const entry = { connector, key: `${connector.targetId}:${i}` };
+      (hot.is(connector.targetId) ? lit : resting).push(entry);
+    });
+    return [...resting, ...lit];
+  });
 </script>
 
 <svg
@@ -31,7 +42,7 @@
   aria-hidden="true"
   focusable="false"
 >
-  {#each connectors as connector, i (`${connector.targetId}:${i}`)}
+  {#each ordered as { connector, key } (key)}
     <path
       d={connector.d}
       class:uncertain={connector.uncertain}
@@ -46,31 +57,37 @@
   .overlay {
     position: absolute;
     inset: 0;
+    z-index: 1;
     overflow: visible;
     pointer-events: none;
   }
 
+  /* §9.1 edges: code port → callee row `cyan-line` 1.5; the hot one `cyan`
+     2 with the 80 % glow; a name-only guess `fg-3` dashed 2 3; a synthesized
+     edge `fg-2` dashed 6 3. */
   path {
     fill: none;
-    stroke: var(--ink-4);
-    stroke-width: 1;
+    stroke: var(--cyan-line);
+    stroke-width: 1.5;
   }
 
   path.uncertain {
+    stroke: var(--fg-3);
     stroke-dasharray: 2 3;
   }
 
   path.heur {
-    stroke: var(--ink-3);
+    stroke: var(--fg-2);
     stroke-dasharray: 6 3;
   }
 
   path.origin {
-    stroke: var(--accent);
+    stroke: var(--primary);
   }
 
   path.hot {
-    stroke: var(--accent);
-    stroke-width: 1.5;
+    stroke: var(--cyan);
+    stroke-width: 2;
+    filter: var(--glow-cyan-80-f);
   }
 </style>

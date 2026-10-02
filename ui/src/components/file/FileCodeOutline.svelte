@@ -115,8 +115,7 @@
     display: grid;
     grid-template-rows: auto minmax(0, 1fr) auto;
     height: 100%;
-    border-right: 1px solid var(--rule-soft);
-    background: var(--paper);
+    background: var(--panel);
   }
 
   .navh {
@@ -136,6 +135,7 @@
 
   /* Fixed height — the windowing above assumes it (NAV_ROW_HEIGHT). */
   .nrow {
+    border-radius: 6px;
     display: grid;
     height: 24px;
     box-sizing: border-box;
@@ -148,16 +148,17 @@
   }
 
   .nrow:hover {
-    background: var(--press);
+    background: var(--raised);
   }
 
   .nrow.current {
-    background: var(--accent-soft);
+    background: var(--primary-soft);
+    color: var(--primary-ink);
   }
 
   .nm {
     overflow: hidden;
-    font: 12px var(--mono);
+    font: var(--t-mono);
     text-overflow: ellipsis;
     white-space: nowrap;
   }

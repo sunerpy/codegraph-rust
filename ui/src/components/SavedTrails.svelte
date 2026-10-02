@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Icon from './Icon.svelte';
   /**
    * The trails somebody kept — the fifth answer to "where do I start".
    *
@@ -94,9 +95,9 @@
 {#if !(hideWhenEmpty && list.length === 0 && trails.failure === null)}
   <section class="trails" aria-label={title}>
     <div class="head">
-      <h3>{title}</h3>
+      <h3><Icon name="bookmark" />{title}</h3>
       {#if trails.directory}
-        <span class="where">{trails.directory}</span>
+        <span class="where">newest first · stored in {trails.directory}</span>
       {/if}
     </div>
 
@@ -125,7 +126,7 @@
               disabled={!isOpenable(saved)}
               onclick={() => open(saved)}
             >
-              <KindGlyph kind={saved.hops[0]?.kind ?? null} />
+              <KindGlyph kind={saved.hops[0]?.kind ?? null} size={22} />
               <span class="mid">
                 <span class="nm">{saved.name}</span>
                 {#if saved.note}<span class="note">{saved.note}</span>{/if}
@@ -134,7 +135,7 @@
             </button>
 
             <div class="acts">
-              <button type="button" class="act" onclick={() => download(saved)}>Export</button>
+              <button type="button" class="act" title="Export this trail" onclick={() => download(saved)}><Icon name="external-link" size={14} />Export</button>
               {#if trails.canSave}
                 <button
                   type="button"
@@ -153,7 +154,7 @@
                  since moved; this is where the graph gets to say so. -->
             {#if decay || opens}
               <p class="decay" class:warn={decay?.tone === 'warn'}>
-                {[decay?.text, opens].filter(Boolean).join(' ')}
+                {#if decay?.tone === 'warn'}<Icon name="triangle-alert" size={14} />{/if}<span>{[decay?.text, opens].filter(Boolean).join(' ')}</span>
               </p>
             {/if}
           </div>
@@ -167,139 +168,182 @@
 {/if}
 
 <style>
+  /* §8 D-01 saved trails: rows 64 high as `card` + `line-faint` r 10; a hop
+     the index no longer has gets an `amber-soft` callout under its row. */
   .trails {
-    max-width: 720px;
+    max-width: 920px;
   }
 
   .head {
     display: flex;
+    flex-wrap: wrap;
     align-items: baseline;
     justify-content: space-between;
-    gap: 12px;
-    margin-bottom: 8px;
+    gap: 4px 12px;
+    margin-bottom: 10px;
   }
 
   .trails h3 {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
     margin: 0;
-    font-size: 14px;
-    font-weight: 600;
+    color: var(--fg);
+    font: var(--t-label);
+  }
+
+  .trails h3 :global(.icon) {
+    color: var(--fg-3);
   }
 
   .where {
-    color: var(--ink-4);
-    font-family: var(--mono);
-    font-size: 11px;
+    color: var(--fg-4);
+    font: var(--t-caption);
   }
 
   .msg {
     margin: 0;
-    padding: 8px 0 0;
-    color: var(--ink-3);
-    font-size: 12px;
+    padding: 4px 0 0;
+    color: var(--fg-3);
+    font: var(--t-small);
+    line-height: 1.5;
+  }
+
+  .msg strong {
+    color: var(--fg);
   }
 
   .msg.err {
-    color: var(--accent);
+    color: var(--red);
   }
 
   .rows {
-    border: 1px solid var(--rule-soft);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
   }
 
   .row {
     position: relative;
-    border-bottom: 1px solid var(--rule-faint);
+    border: 1px solid var(--line-faint);
+    border-radius: 10px;
+    background: var(--card);
   }
 
-  .row:last-child {
-    border-bottom: 0;
+  .row:hover {
+    border-color: var(--line);
   }
 
   .pick {
     display: grid;
     width: 100%;
-    align-items: baseline;
-    padding: 6px 10px;
-    color: var(--ink);
-    gap: 10px;
-    grid-template-columns: 18px 1fr auto;
+    min-height: 62px;
+    align-items: center;
+    padding: 10px 14px;
+    color: var(--fg);
+    gap: 12px;
+    grid-template-columns: 22px minmax(0, 1fr) auto;
     text-align: left;
   }
 
-  .pick:hover:not(:disabled) {
-    background: var(--press);
-  }
-
   .pick:disabled {
-    color: var(--ink-3);
+    color: var(--fg-3);
     cursor: default;
   }
 
   .mid {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+  }
+
+  .nm {
     overflow: hidden;
+    font: var(--t-body-500);
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
-  .nm {
-    font-family: var(--mono);
-    font-size: 12.5px;
+  .pick:hover:not(:disabled) .nm {
+    color: var(--primary-ink);
   }
 
   .note {
-    margin-left: 6px;
-    color: var(--ink-3);
-    font-size: 11.5px;
+    overflow: hidden;
+    color: var(--fg-3);
+    font: var(--t-caption);
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   /* Room for the actions, which overlay the row's right edge. */
   .meta {
-    padding-right: 96px;
-    color: var(--ink-3);
-    font-family: var(--mono);
-    font-size: 11px;
+    padding-right: 150px;
+    color: var(--fg-3);
+    font: var(--t-caption);
     white-space: nowrap;
   }
 
   /* Always drawn, never revealed on hover: a control that appears when the
-     pointer arrives is one a keyboard reader has to guess at. It recedes to
-     ink-3 instead, which is the same thing done with ink. */
+     pointer arrives is one a keyboard reader has to guess at. */
   .acts {
     position: absolute;
-    top: 4px;
-    right: 8px;
+    top: 16px;
+    right: 12px;
     display: flex;
-    gap: 4px;
+    gap: 6px;
   }
 
   .act {
-    padding: 2px 6px;
-    color: var(--ink-3);
-    background: var(--paper);
-    border: 1px solid var(--rule-soft);
-    font-family: var(--sans);
-    font-size: 11px;
+    display: inline-flex;
+    height: 28px;
+    align-items: center;
+    gap: 6px;
+    padding: 0 10px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--raised);
+    color: var(--fg-2);
+    font: var(--t-small-500);
   }
 
   .act:hover:not(:disabled) {
-    color: var(--ink);
-    border-color: var(--ink);
+    border-color: var(--line-strong);
+    color: var(--fg);
   }
 
   .act.armed {
-    color: var(--accent);
-    border-color: var(--accent-line);
-    background: var(--accent-soft);
+    border-color: color-mix(in srgb, var(--red) 40%, transparent);
+    background: var(--red-soft);
+    color: var(--red);
   }
 
   .decay {
-    margin: 0;
-    padding: 0 10px 6px 38px;
-    color: var(--ink-3);
-    font-size: 11.5px;
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    margin: 0 14px 12px 48px;
+    padding: 8px 12px;
+    border-radius: 8px;
+    background: var(--raised);
+    color: var(--fg-3);
+    font: var(--t-caption);
+    line-height: 1.45;
   }
 
   .decay.warn {
+    background: var(--amber-soft);
     color: var(--amber);
+  }
+
+  @media (max-width: 599px) {
+    .meta {
+      display: none;
+    }
+
+    .pick {
+      grid-template-columns: 22px minmax(0, 1fr);
+      padding-right: 150px;
+    }
   }
 </style>

@@ -17,6 +17,7 @@
    * at rest, the empty screen and this panel, so all three agree on the order.
    */
   import EntrySection from '../components/entry/EntrySection.svelte';
+  import Icon from '../components/Icon.svelte';
   import SavedTrails from '../components/SavedTrails.svelte';
   import { palette } from '../lib/palette.svelte';
   import { buildEntryPanel, flowPair, type EntryRow } from '../lib/entry-model';
@@ -85,11 +86,12 @@
 
 <div class="scroll">
   <div class="head">
-    <h2>Entry points</h2>
+    <span class="etile"><Icon name="bookmark" /></span>
+    <h2>Saved trails and entry points</h2>
     <p>
       Where a flow starts{project ? ` in ${project}` : ''} — every list below is read out of the
       graph, not guessed from a filename. Open a row to read the code, or use
-      <span class="chiplike">Flow ›</span> to draw the path from it to a second symbol.
+      <span class="chiplike">Flow</span> to draw the path from it to a second symbol.
     </p>
   </div>
 
@@ -112,11 +114,11 @@
       />
       <button
         type="button"
-        class="go"
+        class="btn primary"
         disabled={flowPair(armed.name, reaches) === null}
-        onclick={() => armed && draw(armed.name, reaches)}>Draw the flow</button
+        onclick={() => armed && draw(armed.name, reaches)}><Icon name="workflow" />Draw the flow</button
       >
-      <button type="button" class="cancel" onclick={() => (armed = null)}>Cancel</button>
+      <button type="button" class="btn" onclick={() => (armed = null)}>Cancel</button>
       <span class="hint">or pick the other end with <span class="chiplike">→ here</span></span>
     </div>
   {/if}
@@ -131,7 +133,7 @@
   {#if palette.entriesFailure}
     <p class="state">Could not read the entry points — {palette.entriesFailure}</p>
   {:else if !palette.entriesSettled}
-    <p class="state">Reading the graph…</p>
+    <p class="state"><span class="pill"><Icon name="refresh-cw" size={14} />Reading the graph…</span></p>
   {:else if panel.empty}
     <p class="state">{panel.empty}</p>
   {:else}
@@ -144,40 +146,58 @@
 </div>
 
 <style>
+  /* One island; the lists inside it are D cards, two columns when wide. */
   .scroll {
     height: 100%;
     overflow: auto;
+    border: 1px solid var(--line-faint);
+    border-radius: var(--island-r);
+    background: var(--bg);
   }
 
   .head {
-    max-width: 760px;
-    padding: 26px 40px 6px;
+    display: grid;
+    grid-template-columns: 40px minmax(0, 1fr);
+    gap: 4px 14px;
+    max-width: 920px;
+    padding: 22px 24px 4px;
   }
 
-  .saved {
-    max-width: 800px;
-    padding: 14px 40px 0;
+  .etile {
+    display: inline-flex;
+    width: 40px;
+    height: 40px;
+    grid-row: span 2;
+    align-items: center;
+    justify-content: center;
+    border-radius: 12px;
+    background: var(--primary-soft);
+    color: var(--primary-ink);
   }
 
   .head h2 {
-    margin: 0 0 6px;
-    font-size: 20px;
-    font-weight: 600;
-    letter-spacing: -0.01em;
+    margin: 0;
+    color: var(--fg);
+    font: var(--t-h1);
   }
 
   .head p {
     margin: 0;
-    color: var(--ink-2);
-    font-size: 13px;
-    line-height: 1.45;
+    color: var(--fg-2);
+    font: var(--t-body);
   }
 
   .chiplike {
-    padding: 0 4px;
-    border: 1px solid var(--rule-soft);
-    color: var(--ink-2);
-    font: 11px var(--mono);
+    padding: 1px 7px;
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    color: var(--fg-2);
+    font: var(--t-mono-sm);
+  }
+
+  .saved {
+    max-width: 920px;
+    padding: 14px 24px 0;
   }
 
   .arming {
@@ -188,71 +208,69 @@
     flex-wrap: wrap;
     align-items: center;
     gap: 8px;
-    margin: 12px 40px 0;
-    padding: 8px 12px;
-    border: 1px solid var(--accent-line);
-    background: var(--accent-soft);
+    margin: 14px 24px 0;
+    padding: 10px 14px;
+    border: 1px solid var(--primary-line);
+    border-radius: 12px;
+    background: var(--primary-soft);
+    box-shadow: var(--sh-pop);
   }
 
   .arming .from {
-    color: var(--ink);
-    font: 500 12.5px var(--mono);
+    color: var(--primary-ink);
+    font: var(--t-mono-500);
   }
 
   .arming .arrow {
-    color: var(--ink-3);
+    color: var(--fg-3);
   }
 
   .arming input {
-    width: 220px;
-    height: 26px;
-    padding: 0 8px;
-    border: 1px solid var(--rule-soft);
-    background: var(--paper);
-    color: var(--ink);
-    font: 12.5px var(--mono);
+    width: 240px;
+    height: 30px;
+    padding: 0 10px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--raised);
+    color: var(--fg);
+    font: var(--t-mono);
   }
 
   .arming input:focus {
-    border-color: var(--ink);
+    border-color: var(--primary-line);
     outline: none;
-  }
-
-  .arming button {
-    height: 26px;
-    padding: 0 10px;
-    border: 1px solid var(--rule-soft);
-    background: var(--paper);
-    color: var(--ink-2);
-    font-size: 12px;
-  }
-
-  .arming button:hover:not(:disabled) {
-    border-color: var(--ink);
-    color: var(--ink);
-  }
-
-  .arming button:disabled {
-    color: var(--ink-4);
-    cursor: default;
+    box-shadow: var(--glow-25);
   }
 
   .arming .hint {
-    color: var(--ink-3);
-    font-size: 11.5px;
+    color: var(--fg-3);
+    font: var(--t-caption);
   }
 
   .state {
     max-width: 760px;
-    padding: 16px 40px 40px;
-    color: var(--ink-3);
-    font-size: 12.5px;
-    line-height: 1.5;
+    padding: 16px 24px 40px;
+    color: var(--fg-2);
+    font: var(--t-body);
   }
 
   .sections {
-    max-width: 760px;
-    margin: 14px 40px 48px;
-    border: 1px solid var(--rule-soft);
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+    gap: var(--gap);
+    margin: 14px 24px 32px;
+  }
+
+  @media (max-width: 599px) {
+    .head,
+    .saved {
+      padding-right: 14px;
+      padding-left: 14px;
+    }
+
+    .sections {
+      grid-template-columns: minmax(0, 1fr);
+      margin: 12px 14px 24px;
+    }
   }
 </style>

@@ -87,6 +87,7 @@
 
 <style>
   .rrow {
+    border-radius: 10px;
     position: absolute;
     right: 12px;
     left: 14px;
@@ -98,21 +99,23 @@
     align-items: center;
     padding: 0 6px;
     border: 1px solid transparent;
-    background: var(--paper);
+    background: var(--card);
     cursor: pointer;
   }
 
   .rrow:hover {
-    background: var(--press);
+    border-color: var(--line);
+    background: var(--raised);
   }
 
   .rrow.focused {
-    border-color: var(--rule-soft);
+    border-color: var(--fg-2);
   }
 
   .rrow.hot {
-    border-color: var(--accent-line);
-    background: var(--accent-soft);
+    border-color: var(--primary-line);
+    background: var(--primary-soft);
+    box-shadow: var(--glow-30);
   }
 
   .body {
@@ -121,7 +124,7 @@
 
   .nm {
     overflow: hidden;
-    font: 12.5px var(--mono);
+    font: var(--t-mono-500);
     text-overflow: ellipsis;
     white-space: nowrap;
   }

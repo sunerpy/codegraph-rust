@@ -21,6 +21,8 @@
   import FileRail from '../components/file/FileRail.svelte';
   import FileModeTabs from '../components/file/FileModeTabs.svelte';
   import KindGlyph from '../components/KindGlyph.svelte';
+  import Icon from '../components/Icon.svelte';
+  import ErrorCard from '../components/ErrorCard.svelte';
   import DriftBanner from '../components/DriftBanner.svelte';
   import { ApiFailure, fetchFile, type WireFilePayload, type WireNodeRef } from '../lib/api';
   import {
@@ -28,6 +30,7 @@
     buildFileOutline,
     buildFileRail,
     fileMetaLine,
+    formatBytes,
   } from '../lib/file-model';
   import { fileHref, navigate } from '../lib/navigation';
   import { liveRefresh } from '../lib/live.svelte';
@@ -245,21 +248,25 @@
 <svelte:window {onkeydown} />
 
 {#if failure}
-  <div class="scroll">
-    <div class="emptystate">
-      <h2>{failure.code === 'not-found' ? 'Not in the index' : 'Could not load this file'}</h2>
-      <p class="mono">{path}</p>
-      <p>{failure.message}</p>
-      {#if failure.guidance}<p class="dim">{failure.guidance}</p>{/if}
-    </div>
+  <div class="scroll island">
+    <ErrorCard
+      title={failure.code === 'not-found' ? 'Not in the index' : 'Could not load this file'}
+      message={`${path} — ${failure.message}`}
+      guidance={failure.guidance}
+    />
   </div>
 {:else if loading || !payload || !imports || !importedBy}
-  <div class="scroll">
-    <div class="emptystate"><p class="dim">Loading…</p></div>
+  <div class="fileview" aria-busy="true">
+    <div class="pane island"><div class="sk-list">{#each [0, 1, 2, 3, 4, 5] as i (i)}<span class="skeleton" style:width={`${60 + ((i * 29) % 35)}%`}></span>{/each}</div></div>
+    <section class="center island">
+      <span class="pill"><Icon name="refresh-cw" size={14} />Reading the file from the index…</span>
+      <div class="sk-list">{#each [0, 1, 2, 3, 4, 5, 6, 7] as i (i)}<span class="skeleton" style:width={`${40 + ((i * 41) % 50)}%`}></span>{/each}</div>
+    </section>
+    <div class="pane island"><div class="sk-list">{#each [0, 1, 2] as i (i)}<span class="skeleton" style:width={`${50 + i * 15}%`}></span>{/each}</div></div>
   </div>
 {:else}
   <div class="fileview">
-    <div class="pane" data-pane="left">
+    <div class="pane island" data-pane="left">
       <FileRail
         title="Imported by"
         model={importedBy}
@@ -273,32 +280,36 @@
       />
     </div>
 
-    <section class="center" bind:this={centerEl}>
+    <section class="center island" bind:this={centerEl}>
       <div class="card-h">
-        <KindGlyph kind="file" />
-        <!-- Generated code recedes wherever it appears (design spec §2.6). -->
-        <h1 class:gen={payload.file.generated}>{basename(payload.file.path)}</h1>
-        <span class="kindword">{fileMetaLine(payload)}</span>
-        <span class="loc">{payload.file.path}</span>
+        <KindGlyph kind="file" size={26} />
+        <div class="titles">
+          <div class="tl">
+            <!-- Generated code recedes wherever it appears (design spec §2.6). -->
+            <h1 class:gen={payload.file.generated}>{basename(payload.file.path)}</h1>
+            <span class="pill amber">{payload.file.language}</span>
+          </div>
+          <div class="loc"><span>{payload.file.path}</span><span class="dim">{fileMetaLine(payload)}</span></div>
+        </div>
         <div class="spacer"></div>
         <FileModeTabs path={payload.file.path} {line} source={false} />
       </div>
 
       <div class="badges">
         {#if payload.topLevel.calls > 0}
-          <span class="badge">
-            Runs {plural(payload.topLevel.calls, 'call')} at the top level —
+          <span class="pill cyan">
+            <Icon name="activity" size={14} />Runs {plural(payload.topLevel.calls, 'call')} at the top level —
             <button type="button" class="linkish" onclick={openFileNode}>
               see what it calls
             </button>
           </span>
         {/if}
         {#if payload.file.generated}
-          <span class="badge">generated</span>
+          <span class="pill">generated</span>
         {/if}
         {#if payload.file.errors.length > 0}
-          <span class="badge warn">
-            {plural(payload.file.errors.length, 'extraction error')} — the outline may be
+          <span class="pill amber">
+            <Icon name="triangle-alert" size={14} />{plural(payload.file.errors.length, 'extraction error')} — the outline may be
             incomplete
           </span>
         {/if}
@@ -329,23 +340,36 @@
       />
     </section>
 
-    <div class="pane" data-pane="right">
-      <FileRail
-        title="Imports"
-        model={imports}
-        side="right"
-        selected={pane === 'right' ? index : -1}
-        onhover={(i) => {
-          pane = 'right';
-          index = i;
-        }}
-        emptyNote="This file reaches nothing else in the index — it depends on nothing the graph holds."
-      />
+    <div class="pane island right" data-pane="right">
+      <div class="rail-scroll">
+        <FileRail
+          title="Imports"
+          model={imports}
+          side="right"
+          selected={pane === 'right' ? index : -1}
+          onhover={(i) => {
+            pane = 'right';
+            index = i;
+          }}
+          emptyNote="This file reaches nothing else in the index — it depends on nothing the graph holds."
+        />
+      </div>
+      <!-- §8 D-03 "This file": the reach of the file as a whole. -->
+      <div class="thisfile">
+        <div class="micro">This file</div>
+        <div class="tiles">
+          <div class="stat"><span class="label">Depended on by</span><span class="value">{payload.dependents.length}<small>files</small></span></div>
+          <div class="stat"><span class="label">Depends on</span><span class="value">{payload.dependencies.length}<small>files</small></span></div>
+          <div class="stat"><span class="label">Symbols</span><span class="value">{payload.outline.total}</span></div>
+          <div class="stat"><span class="label">Size</span><span class="value">{formatBytes(payload.file.size)}</span></div>
+        </div>
+      </div>
     </div>
   </div>
 {/if}
 
 <style>
+  /* §8 D-03: three islands — depended on by 288 | the file | depends on 320. */
   .scroll {
     height: 100%;
     overflow: auto;
@@ -353,95 +377,151 @@
 
   .fileview {
     display: grid;
-    grid-template-columns: 300px minmax(480px, 1fr) 300px;
+    grid-template-columns: 288px minmax(0, 1fr) 320px;
+    gap: var(--gap);
     height: 100%;
     min-height: 0;
   }
 
   .pane {
     min-width: 0;
-    overflow: hidden;
+  }
+
+  .pane.right {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .rail-scroll {
+    min-height: 0;
+    flex: 1;
+    overflow: auto;
+  }
+
+  .thisfile {
+    flex: 0 0 auto;
+    padding: 14px 16px 16px;
+    border-top: 1px solid var(--line-faint);
+  }
+
+  .tiles {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    margin-top: 10px;
+  }
+
+  .tiles .value {
+    font-size: 20px;
   }
 
   .center {
     min-width: 0;
     overflow: auto;
-    padding: 18px 22px 40px;
+    padding: 20px 24px 32px;
   }
 
   .card-h {
     display: flex;
-    flex-wrap: wrap;
-    align-items: baseline;
-    gap: 6px 12px;
+    align-items: center;
+    gap: 14px;
+  }
+
+  .titles {
+    min-width: 0;
+  }
+
+  .tl {
+    display: flex;
+    align-items: center;
+    gap: 10px;
   }
 
   .card-h h1 {
     margin: 0;
-    font: 600 20px/1.2 var(--mono);
-    letter-spacing: -0.01em;
+    overflow: hidden;
+    color: var(--fg);
+    font: var(--t-title-mono);
+    font-variant-ligatures: none;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .card-h h1.gen {
-    color: var(--ink-4);
+    color: var(--fg-4);
   }
 
   .spacer {
     flex: 1 1 auto;
   }
 
-  .kindword {
-    color: var(--ink-3);
-    font-size: 12.5px;
-  }
-
   .loc {
-    color: var(--ink-2);
-    font: 11.5px var(--mono);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 12px;
+    margin-top: 4px;
+    color: var(--fg-2);
+    font: var(--t-mono-sm);
   }
 
   .badges {
     display: flex;
     flex-wrap: wrap;
-    gap: 6px;
+    gap: 8px;
   }
 
   .badges:not(:empty) {
-    margin-top: 10px;
-  }
-
-  .badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    padding: 2px 7px;
-    border: 1px solid var(--rule-soft);
-    background: var(--paper);
-    color: var(--ink-2);
-    font-size: 11.5px;
-  }
-
-  .badge.warn {
-    border-color: var(--amber);
-    background: var(--amber-soft);
-    color: var(--amber);
+    margin-top: 14px;
   }
 
   .linkish {
-    color: var(--accent);
+    color: inherit;
     font: inherit;
+    font-weight: 600;
     text-decoration: underline;
-    text-decoration-color: var(--accent-line);
     text-underline-offset: 3px;
   }
 
   .banner {
-    margin-top: 12px;
+    margin-top: 14px;
   }
 
-  @media (max-width: 1100px) {
+  .sk-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 20px;
+  }
+
+  @media (max-width: 1023px) {
     .fileview {
-      grid-template-columns: 220px minmax(360px, 1fr) 220px;
+      grid-template-columns: minmax(0, 1fr) 248px;
+    }
+
+    .pane[data-pane='left'] {
+      display: none;
+    }
+
+    .center {
+      padding: 18px 20px 28px;
+    }
+  }
+
+  @media (max-width: 599px) {
+    .fileview {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .pane.right {
+      display: none;
+    }
+
+    .card-h {
+      flex-wrap: wrap;
+    }
+
+    .center {
+      padding: 14px;
     }
   }
 </style>

@@ -16,7 +16,7 @@
 <script lang="ts">
   import { Handle, Position } from '@xyflow/svelte';
   import KindGlyph from '../KindGlyph.svelte';
-  import { tokenClass, tokensByLine, type Token } from '../../lib/highlight';
+  import { tokenClassFor, tokensByLine, type Token } from '../../lib/highlight';
   import { assignRefs, basename, type LineRef } from '../../lib/symbol-model';
   import type { FlowCardLayout } from '../../lib/flow-model';
 
@@ -76,7 +76,7 @@
         call: n === hop.callRef?.line || n === card.stopLine,
         parts: lineTokens.map((token, index): Part => {
           const ref = claimed.get(index) ?? null;
-          return { text: token.text, cls: ref ? null : tokenClass(token.cls), ref };
+          return { text: token.text, cls: ref ? null : tokenClassFor(token), ref };
         }),
       };
     });
@@ -93,7 +93,8 @@
   <Handle type="source" position={Position.Right} id="out" isConnectable={false} />
 
   <button type="button" class="head" onclick={() => data.onOpen(card)}>
-    <KindGlyph kind={hop.node.kind} />
+    {#if card.step >= 0}<span class="badge">{card.step + 1}</span>{/if}
+    <KindGlyph kind={hop.node.kind} size={20} />
     <span class="nm">{hop.node.name}</span>
     <span class="loc">{basename(hop.node.file)}:{hop.node.line}</span>
   </button>
@@ -125,127 +126,176 @@
 </div>
 
 <style>
+  /* §7 flow step card: `card` + `line` + SH.card, r 12; the step badge,
+     the kind tile, the name and its location; then the window opened at the
+     call, the call line lit as the Symbol view lights a hot line. */
   .card {
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    background: var(--paper);
-    border: 1px solid var(--rule-soft);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--card);
+    box-shadow: var(--sh-card);
     text-align: left;
+    transition:
+      border-color 120ms,
+      box-shadow 120ms;
   }
 
   .card:hover {
-    border-color: var(--ink);
+    border-color: var(--line-strong);
   }
 
+  /* Selected: 1.5px GRAD.brand stroke and the 40 % glow (§7, D-04). */
   .card.cur {
-    border-color: var(--accent);
+    border: 1.5px solid transparent;
+    background:
+      linear-gradient(var(--card), var(--card)) padding-box,
+      var(--grad-brand-d) border-box;
+    box-shadow: var(--glow-40);
   }
 
   .card.dim {
-    opacity: 0.4;
+    opacity: 0.45;
   }
 
   .head {
     display: grid;
-    align-items: baseline;
-    padding: 10px 12px 6px;
-    border-bottom: 1px solid var(--rule-faint);
+    align-items: center;
+    padding: 10px 12px 9px;
+    border-bottom: 1px solid var(--line-faint);
     background: none;
-    color: var(--ink);
+    color: var(--fg);
     gap: 8px;
-    grid-template-columns: 16px 1fr auto;
+    grid-template-columns: auto 20px minmax(0, 1fr) auto;
     text-align: left;
   }
 
   .head:hover .nm {
-    color: var(--accent);
+    color: var(--primary-ink);
+  }
+
+  .badge {
+    display: inline-flex;
+    width: 22px;
+    height: 22px;
+    align-items: center;
+    justify-content: center;
+    border-radius: 11px;
+    background: var(--raised);
+    color: var(--fg-2);
+    font: var(--t-mono-sm);
+    font-weight: 600;
+  }
+
+  .card.cur .badge {
+    background: var(--grad-button);
+    box-shadow: var(--glow-50);
+    color: var(--on-primary);
   }
 
   .nm {
     overflow: hidden;
-    font: 600 13px var(--mono);
+    font: var(--t-mono-500);
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
   .loc {
-    color: var(--ink-3);
-    font: 11px var(--mono);
+    color: var(--fg-3);
+    font: var(--t-mono-sm);
     white-space: nowrap;
   }
 
   .code {
     padding: 6px 0;
-    font: 12px / 19px var(--mono);
+    font: 400 12px / 19px var(--mono);
   }
 
   .ln {
+    position: relative;
     display: grid;
     align-items: stretch;
     grid-template-columns: 40px 1fr 6px;
   }
 
   .ln.call {
-    background: var(--accent-soft);
+    background: var(--primary-soft);
+  }
+
+  .ln.call::before {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: 2px;
+    background: var(--grad-brand-v);
+    content: '';
   }
 
   .no {
     padding-right: 10px;
-    color: var(--ink-4);
-    font-size: 11px;
+    color: var(--fg-4);
+    font: 400 11px / 19px var(--mono);
     text-align: right;
     user-select: none;
   }
 
   .tx {
     overflow: hidden;
+    color: var(--fg);
     text-overflow: ellipsis;
     white-space: pre;
   }
 
   .nosource {
     margin: 0;
-    padding: 6px 12px;
-    color: var(--ink-3);
-    font-size: 12px;
+    padding: 8px 12px;
+    color: var(--fg-3);
+    font: var(--t-small);
     line-height: 19px;
   }
 
-  /* Token classes — the same near-monochrome ramp the Symbol view paints
-     (design spec §2.2); the class names come from the server's classifier. */
+  /* §3 syntax — the same classes the Symbol view paints. */
   .t-c {
-    color: var(--code-comment);
+    color: var(--syn-com);
   }
   .t-s {
-    color: var(--ink-2);
+    color: var(--syn-str);
   }
   .t-k {
+    color: var(--syn-kw);
     font-weight: 500;
   }
   .t-n {
-    color: var(--ink-2);
+    color: var(--syn-num);
   }
-
-  /* A definition's own name, from the extractor's tables. */
+  .t-t {
+    color: var(--syn-type);
+  }
+  .t-p {
+    color: var(--syn-punct);
+  }
   .t-def {
+    color: var(--fg);
     font-weight: 600;
   }
 
-  /* The only colour in the window: the call this card is opened at. */
+  /* The call this card is opened at: a cyan capsule (§7). */
   .ref {
-    padding: 0;
-    background: none;
-    color: var(--accent);
+    margin: 0 -3px;
+    padding: 1px 3px;
     border: 0;
+    border-radius: 5px;
+    background: var(--cyan-soft);
+    box-shadow: inset 0 0 0 1px var(--cyan-line);
+    color: var(--cyan);
     cursor: pointer;
     font: inherit;
-    text-decoration: underline;
-    text-decoration-color: var(--accent-line);
-    text-underline-offset: 3px;
   }
 
   .ref:hover {
-    text-decoration-color: var(--accent);
+    background: color-mix(in srgb, var(--cyan) 22%, var(--cyan-soft));
   }
 </style>

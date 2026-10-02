@@ -42,8 +42,10 @@ export const LINK_WIDTH = 86;
 export const COLUMN_PITCH = CARD_WIDTH + LINK_WIDTH;
 
 /**
- * Advance of IBM Plex Mono at the 11px a connector label is set in, and the
- * clear space kept either side of the longest line.
+ * Advance of JetBrains Mono at the 11px a connector label is set in (`mono-sm`,
+ * 0.6 em: 6.60px, measured in Chrome with the bundled font on 2026-10-03;
+ * upstream's IBM Plex Mono measured 6.65), and the clear space kept either side
+ * of the longest line.
  *
  * A gap only ever GROWS past {@link LINK_WIDTH}: 86px holds `calls` and
  * `line 2029` comfortably, but a synthesized hop's `registered at App.tsx:3764`
@@ -52,7 +54,7 @@ export const COLUMN_PITCH = CARD_WIDTH + LINK_WIDTH;
  * the very card the label was explaining. The label is the evidence for a hop
  * nobody can see in the source, so the picture makes room for it.
  */
-const LABEL_CHAR_WIDTH = 6.65;
+const LABEL_CHAR_WIDTH = 6.6;
 const LABEL_PAD = 18;
 
 /** Card header: `10px 12px 6px` padding around one 18px row, plus a rule. */

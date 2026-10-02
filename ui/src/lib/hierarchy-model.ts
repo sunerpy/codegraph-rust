@@ -15,21 +15,27 @@
 
 import type { WireHierarchy, WireHierarchyNode, WireNodeDetail, WireNodeRef } from './wire';
 
-/** Row height, in px. Fixed, so connector geometry is arithmetic. */
-export const HIER_ROW_H = 24;
+/**
+ * Row height, in px. Fixed, so connector geometry is arithmetic. Direction D
+ * draws 26 (docs/design/viewer-d.md §8 D-06; upstream's spec drew 24).
+ */
+export const HIER_ROW_H = 26;
 
-/** Indent per descendant level, in px (design spec §3.10). */
-export const HIER_INDENT = 22;
+/** Indent per descendant level, in px — 28 in D (§8 D-06; upstream 22). */
+export const HIER_INDENT = 28;
 
-/** Left edge of a row's kind glyph, measured from the row's own indent. */
+/** Left edge of a row's kind tile, measured from the row's own indent. */
 export const HIER_GLYPH_X = 18;
 
+/** The kind tile's edge in the tree — 20 in D (upstream's glyph was 16). */
+export const HIER_TILE = 20;
+
 /**
- * Where a row's connector leaves it: the centre of its 16px kind glyph. Lines
- * hang off the glyph rather than off the row, so the trunk of a fan reads as
- * coming out of the type rather than out of the margin.
+ * Where a row's connector leaves it: the centre of its kind tile. Lines hang
+ * off the tile rather than off the row, so the trunk of a fan reads as coming
+ * out of the type rather than out of the margin.
  */
-export const HIER_PORT_X = HIER_GLYPH_X + 8;
+export const HIER_PORT_X = HIER_GLYPH_X + HIER_TILE / 2;
 
 /**
  * Subtypes drawn before the rest fold away.

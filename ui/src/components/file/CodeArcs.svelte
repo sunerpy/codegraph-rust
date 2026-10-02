@@ -95,7 +95,7 @@
 
   .arc {
     fill: none;
-    stroke: var(--ink-4);
+    stroke: var(--cyan-line);
     stroke-width: 1;
     pointer-events: none;
   }
@@ -107,12 +107,13 @@
   /* Synthesized rather than parsed — dynamic dispatch the parser cannot see.
      Same dash the Symbol view's connectors use for the same claim. */
   .arc.heur {
-    stroke: var(--ink-3);
+    stroke: var(--fg-2);
     stroke-dasharray: 6 3;
   }
 
   .arc.lit {
-    stroke: var(--accent);
+    stroke: var(--cyan);
+    filter: var(--glow-cyan-80-f);
     stroke-width: 1.5;
   }
 

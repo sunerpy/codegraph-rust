@@ -57,25 +57,30 @@
 </g>
 
 <style>
+  /* §8 D-04 links: `cyan` 1.5 with an 8px arrowhead and the 45 % cyan glow;
+     the line label in `mono-sm`. A dashed (uncertain or synthesized) link
+     keeps the dash the model gives it. */
   :global(.svelte-flow__edge-path.flink) {
-    stroke: var(--ink-3);
-    stroke-width: 1px;
+    stroke: var(--cyan);
+    stroke-width: 1.5px;
     fill: none;
+    filter: var(--glow-cyan-45-f);
   }
   :global(.svelte-flow__edge-path.flink.dimmed) {
-    stroke-opacity: 0.25;
+    stroke-opacity: 0.3;
+    filter: none;
   }
   .fhead {
-    fill: var(--ink-3);
+    fill: var(--cyan);
   }
   .fhead.dimmed {
-    fill-opacity: 0.25;
+    fill-opacity: 0.3;
   }
   .flabel text {
-    fill: var(--ink-3);
-    font: 11px var(--mono);
+    fill: var(--fg-3);
+    font: var(--t-mono-sm);
   }
   .flabel.dimmed text {
-    fill-opacity: 0.25;
+    fill-opacity: 0.3;
   }
 </style>

@@ -6,6 +6,7 @@
 import { describe, it, expect } from 'vitest';
 import { armWords, buildStepsModel, countWords, kindWord, kindWords, stepEdgeVisible, stepLabel, stepNeighbourhood, stepSub, stepViaText, triggerWords } from '../src/lib/steps-model';
 import { placeLabels } from '../src/lib/screens-model';
+import { NODE_HEIGHT } from '../src/lib/map-model';
 import type { WireNodeRef, WireStep, WireStepLink, WireStepSite, WireStepsPayload } from '../src/lib/wire';
 
 function ref(name: string, file = 'src/a.tsx', language: WireNodeRef['language'] = 'tsx'): WireNodeRef {
@@ -318,7 +319,9 @@ describe('a screen laid out by region', () => {
       payload([root, p1, p2, p3], [link(root, p1), link(p1, p2), link(p2, p3), link(p3, p1)])
     );
     const ys = [p1, p2, p3].map((s) => m.layout.nodes.find((n) => n.id === s.id)!.y);
-    const pitch = 40 + m.layerGap;
+    // One row of boxes is a node height plus the layer gap (the steps layout
+    // is the map's; upstream's node height was the literal 40 here).
+    const pitch = NODE_HEIGHT + m.layerGap;
     // Three boxes, so at most three lines of them — not one line per pass.
     expect((Math.max(...ys) - Math.min(...ys)) / pitch).toBeLessThanOrEqual(2);
   });

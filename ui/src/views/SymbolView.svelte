@@ -24,6 +24,9 @@
   import SourceBlock from '../components/symbol/SourceBlock.svelte';
   import SymbolHeader from '../components/symbol/SymbolHeader.svelte';
   import DriftBanner from '../components/DriftBanner.svelte';
+  import Icon from '../components/Icon.svelte';
+  import KindGlyph from '../components/KindGlyph.svelte';
+  import ErrorCard from '../components/ErrorCard.svelte';
   import {
     ApiFailure,
     fetchFile,
@@ -42,16 +45,21 @@
     buildCallerRail,
     buildCodeBlock,
     buildOutline,
+    calleeRowTops,
+    filterCallerRail,
     graphCallLines,
+    CALLEE_ROW_GAP,
+    CALLEE_ROW_HEIGHT,
     refsByLine,
     showsBody,
     synthesizedBy,
+    type CalleeRow,
     type Connector,
     type LineRef,
   } from '../lib/symbol-model';
   import { encodeTrail, trail } from '../lib/trail.svelte';
   import { liveRefresh } from '../lib/live.svelte';
-  import { fileHref, navigate, symbolHref } from '../lib/navigation';
+  import { fileHref, flowHref, navigate, symbolHref } from '../lib/navigation';
   import { arrivedFrom, walkTo } from '../lib/walk';
 
   interface Props {
@@ -63,11 +71,12 @@
 
   /* ------------------------------------------------------------ geometry -- */
 
-  /** Row height and the gap between two rows pushed apart — spec §3.2. */
-  const ROW_HEIGHT = 34;
-  const ROW_GAP = 6;
-  /** Fallback for the sticky rail header before it has been measured. */
-  const RAIL_HEADER_FALLBACK = 38;
+  /** Fallback for the rail's header block before it has been measured. */
+  const RAIL_HEADER_FALLBACK = 52;
+  /** The connector leaves the port's right edge: card width − 18 + 7 (§7). */
+  const PORT_RIGHT_INSET = 11;
+  /** The callee rows' left inset inside the Calls island (§7). */
+  const ROW_INSET = 12;
 
   /**
    * How much of a DRIFTED file this screen will show in place of the body.
@@ -87,6 +96,8 @@
   /* --------------------------------------------------------------- state -- */
 
   let payload = $state<WireSymbolPayload | null>(null);
+  /** The body is on its way (§9.2 loading: the code card in skeleton). */
+  let sourceLoading = $state(false);
   let source = $state<WireSource | null>(null);
   let failure = $state<ApiFailure | null>(null);
   let loading = $state(true);
@@ -110,6 +121,13 @@
    * PREVIOUS symbol's coordinates would be worse. It stays hidden instead.
    */
   let placed = $state(false);
+
+  /** The "Filter callers" box (§8 D-02). Cleared when the symbol changes. */
+  let callerQuery = $state('');
+  /** Tablet: the Called by island folds into a header button and opens over the page. */
+  let callersOpen = $state(false);
+  /** Phone: one pane at a time — Code, Called by or Calls (§10). */
+  let pane = $state<'code' | 'callers' | 'calls'>('code');
 
   /* ---------------------------------------------------------------- data -- */
 
@@ -145,9 +163,14 @@
       failure = null;
       payload = null;
       source = null;
+      sourceLoading = false;
       railFocus.reset();
       hot.set(null);
       placed = false;
+      callerQuery = '';
+      callersOpen = false;
+      pane = 'code';
+      lineSheet = null;
     }
     void project.ensure();
 
@@ -192,6 +215,7 @@
       // the one thing about it that is certainly wrong — and the answer comes
       // back flagged `showing: 'current'`, which is what switches every
       // line-anchored marking below off.
+      if (!quiet) sourceLoading = true;
       const slice = node.drift
         ? await fetchSource(node.node.file, 1, 0, signal, 'current')
         : await fetchSource(node.node.file, node.node.line, node.node.endLine, signal);
@@ -200,6 +224,8 @@
       // No slice: the header, the rails and the blast strip are all still
       // true, so the screen loses the body and says so rather than erroring.
       if (!signal.aborted) source = null;
+    } finally {
+      if (!signal.aborted) sourceLoading = false;
     }
   }
 
@@ -234,6 +260,7 @@
   /* -------------------------------------------------------------- models -- */
 
   let callers = $derived(payload ? buildCallerRail(payload) : null);
+  let callersShown = $derived(callers ? filterCallerRail(callers, callerQuery) : null);
   let callees = $derived(payload ? buildCalleeRail(payload) : null);
   let refs = $derived(payload ? refsByLine(payload) : new Map<number, LineRef[]>());
   let outline = $derived(payload ? buildOutline(payload) : []);
@@ -311,17 +338,32 @@
     walkTo(node, 'start');
   }
 
-  function followRef(ref: LineRef): void {
+  /**
+   * Follow a call site. On the phone (§10) a tap opens the bottom sheet of the
+   * calls on that line instead — the rail is a pane away there, and the sheet
+   * is where the line's callees, Open and Read as flow sit together.
+   */
+  function followRef(ref: LineRef, at: number): void {
     if (!ref.targetId) return;
+    if (globalThis.matchMedia?.('(max-width: 599px)').matches) {
+      const rows = (callees?.rows ?? []).filter((row) => row.lines.includes(at));
+      if (rows.length > 0) {
+        lineSheet = { line: at, rows };
+        return;
+      }
+    }
     const target = payload?.outgoing.items.find((r) => r.node.id === ref.targetId)?.node
       ?? payload?.typesUsed.find((r) => r.node.id === ref.targetId)?.node;
     if (target) walkTo(target, 'down');
   }
 
+  /** Phone: the calls on the tapped line (§10 bottom sheet). */
+  let lineSheet = $state<{ line: number; rows: CalleeRow[] } | null>(null);
+
   /* ------------------------------------------------------------ keyboard -- */
 
   function leftRows(): WireNodeRef[] {
-    return (callers?.groups ?? []).flatMap((group) => group.rows.map((row) => row.relation.node));
+    return (callersShown?.groups ?? []).flatMap((group) => group.rows.map((row) => row.relation.node));
   }
 
   function rightRows(): WireNodeRef[] {
@@ -422,17 +464,13 @@
       return el ? el.offsetTop + el.offsetHeight / 2 : null;
     };
 
-    let y = headerHeight + 14;
-    const nextTops: number[] = [];
-    const rowCentres: Array<number | null> = [];
-    for (const row of rows) {
-      const centre = row.anchor !== null ? lineCentre(row.anchor) : null;
-      const wanted = centre !== null ? centre - ROW_HEIGHT / 2 : y;
-      y = Math.max(wanted, y);
-      nextTops.push(y);
-      rowCentres.push(y + ROW_HEIGHT / 2);
-      y += ROW_HEIGHT + ROW_GAP;
-    }
+    const start = headerHeight + 12;
+    const nextTops = calleeRowTops(
+      rows.map((row) => (row.anchor !== null ? lineCentre(row.anchor) : null)),
+      start
+    );
+    const rowCentres = nextTops.map((top) => top + CALLEE_ROW_HEIGHT / 2);
+    let y = nextTops.length > 0 ? (nextTops[nextTops.length - 1] as number) + CALLEE_ROW_HEIGHT + CALLEE_ROW_GAP : start;
 
     const nextFoldTop = y + 8;
     if ((callees?.uncertain.length ?? 0) > 0) {
@@ -446,11 +484,14 @@
     noteTop = nextNoteTop;
     stageMinHeight = Math.max(center.offsetHeight, nextNoteTop + 60);
 
-    // Connectors: one per call site, from the centre column's right edge to the
-    // row's own centre. Both coordinate systems are the stage's, so the port
-    // and the row agree even when the stage is scrolled.
-    const x0 = center.offsetLeft + center.offsetWidth - 10;
-    const x1 = rail.offsetLeft + 14;
+    // Connectors: one per call site, from the port's right edge in the code
+    // card to the row's left edge. Both coordinate systems are the stage's, so
+    // the port and the row agree even when the stage is scrolled.
+    const card = center.querySelector<HTMLElement>('[data-code-card]');
+    const x0 = card
+      ? card.offsetLeft + card.offsetWidth - PORT_RIGHT_INSET
+      : center.offsetLeft + center.offsetWidth - PORT_RIGHT_INSET;
+    const x1 = rail.offsetLeft + ROW_INSET;
     const cx = (x0 + x1) / 2;
     const next: Connector[] = [];
     rows.forEach((row, index) => {
@@ -534,34 +575,90 @@
 <svelte:window {onkeydown} />
 
 {#if failure}
-  <div class="scroll">
-    <div class="emptystate">
-      <h2>{failure.code === 'not-found' ? 'No such symbol' : 'Could not load this symbol'}</h2>
-      <p>{failure.message}</p>
-      {#if failure.guidance}<p class="dim">{failure.guidance}</p>{/if}
+  <div class="scroll island">
+    <ErrorCard
+      title={failure.code === 'not-found' ? 'No such symbol' : 'Could not load this symbol'}
+      message={failure.message}
+      guidance={failure.guidance}
+      onretry={failure.code === 'not-found' ? null : () => {
+        const controller = new AbortController();
+        void load(id, controller.signal);
+      }}
+    />
+  </div>
+{:else if loading || !payload || !callers || !callees || !callersShown}
+  <!-- §9.2 loading: the three islands in skeleton, and what is being read. -->
+  <div class="focus loading" aria-busy="true">
+    <aside class="rail-left island">
+      <div class="sk-head"><span class="skeleton" style:width="96px"></span></div>
+      {#each [0, 1, 2, 3] as i (i)}
+        <div class="sk-row"><span class="skeleton tile"></span><span class="skeleton" style:width={`${120 + ((i * 37) % 60)}px`}></span></div>
+      {/each}
+    </aside>
+    <div class="stage">
+      <div class="stage-inner">
+        <section class="center">
+          <span class="pill"><Icon name="refresh-cw" size={14} />Reading the symbol from the index…</span>
+          <div class="sk-title"><span class="skeleton tile lg"></span><span class="skeleton" style:width="280px" style:height="18px"></span></div>
+          <div class="sk-code">
+            {#each [0, 1, 2, 3, 4, 5, 6, 7, 8, 9] as i (i)}
+              <span class="skeleton" style:width={`${30 + ((i * 53) % 55)}%`}></span>
+            {/each}
+          </div>
+        </section>
+        <aside class="rail-right">
+          <div class="sk-head"><span class="skeleton" style:width="64px"></span></div>
+          {#each [0, 1, 2] as i (i)}
+            <div class="sk-row"><span class="skeleton tile"></span><span class="skeleton" style:width={`${110 + i * 20}px`}></span></div>
+          {/each}
+        </aside>
+      </div>
     </div>
   </div>
-{:else if loading || !payload || !callers || !callees}
-  <div class="scroll">
-    <div class="emptystate"><p class="dim">Loading…</p></div>
-  </div>
 {:else}
-  <div class="focus">
-    <aside class="rail-left" bind:this={leftRailEl} aria-label="Called by">
-      <CallersRail
-        model={callers}
-        originId={originLeft}
-        exported={payload.node.exported === true}
-        onstepUp={stepUp}
-      />
+  <!-- Phone (§10): one pane at a time. -->
+  <div class="segmented" role="tablist" aria-label="Show">
+    <button type="button" role="tab" aria-selected={pane === 'code'} class:on={pane === 'code'} onclick={() => (pane = 'code')}>Code</button>
+    <button type="button" role="tab" aria-selected={pane === 'callers'} class:on={pane === 'callers'} onclick={() => (pane = 'callers')}>Called by {callers.total}</button>
+    <button type="button" role="tab" aria-selected={pane === 'calls'} class:on={pane === 'calls'} onclick={() => (pane = 'calls')}>Calls {callees.rows.length}</button>
+  </div>
+
+  <div class="focus pane-{pane}" class:callers-open={callersOpen}>
+    <aside class="rail-left island" bind:this={leftRailEl} aria-label="Called by">
+      <div class="callers-scroll">
+        <CallersRail
+          model={callersShown}
+          query={callerQuery}
+          onquery={(q) => (callerQuery = q)}
+          originId={originLeft}
+          exported={payload.node.exported === true}
+          onstepUp={stepUp}
+        />
+      </div>
+      {#if payload.blast}
+        <div class="blast-foot">
+          <BlastStrip
+            blast={payload.blast}
+            scale={project.stats?.blastScale ?? null}
+            testCalls={callers.tests.calls}
+            testFiles={callers.tests.files.length}
+          />
+        </div>
+      {/if}
     </aside>
+    {#if callersOpen}
+      <button type="button" class="drawer-scrim" aria-label="Close Called by" onclick={() => (callersOpen = false)}></button>
+    {/if}
 
     <div class="stage">
       <div class="stage-inner" bind:this={innerEl} style:min-height={`${stageMinHeight}px`}>
         <Connectors {connectors} width={overlay.width} height={overlay.height} />
 
         <section class="center" bind:this={centerEl}>
-          <SymbolHeader {payload} onopen={open} relationChips={!payload.hierarchy} />
+          <button type="button" class="btn secondary calledby" onclick={() => (callersOpen = !callersOpen)} aria-expanded={callersOpen}>
+            <Icon name="corner-down-right" />Called by {callers.total}
+          </button>
+          <SymbolHeader {payload} onopen={open} relationChips={!payload.hierarchy} signature={!codeBlock} />
 
           {#if payload.drift}
             <div class="banner">
@@ -592,7 +689,22 @@
               defName={showingCurrent ? '' : payload.node.name}
               highlight={showingCurrent ? null : line}
               onfollow={followRef}
+              file={payload.node.file}
             />
+            {#if !showingCurrent}
+              <div class="legend">
+                <span class="micro">Confidence</span>
+                <span class="key"><i class="solid"></i>resolved</span>
+                <span class="key"><i class="dotted"></i>name-only &lt; 0.6</span>
+                <span class="key"><i class="dashed"></i>synthesized</span>
+              </div>
+            {/if}
+          {:else if sourceLoading && wantsBody}
+            <div class="sk-code" aria-busy="true">
+              {#each [0, 1, 2, 3, 4, 5, 6, 7] as i (i)}
+                <span class="skeleton" style:width={`${30 + ((i * 53) % 55)}%`}></span>
+              {/each}
+            </div>
           {:else if payload.drift}
             <!-- The banner above is the whole answer for this file. -->
           {:else if !wantsBody}
@@ -609,15 +721,6 @@
               onopen={open}
             />
           {/if}
-
-          {#if payload.blast}
-            <BlastStrip
-              blast={payload.blast}
-              scale={project.stats?.blastScale ?? null}
-              testCalls={callers.tests.calls}
-              testFiles={callers.tests.files.length}
-            />
-          {/if}
         </section>
 
         <aside class="rail-right" bind:this={railEl} aria-label="Calls">
@@ -630,35 +733,77 @@
             focalFile={payload.node.file}
             originId={originRight}
             emptyReason={emptyCalleeReason}
+            outside={payload.outsideIndex}
             onstepDown={stepDown}
           />
         </aside>
       </div>
     </div>
   </div>
+  {#if lineSheet}
+    <button type="button" class="sheet-scrim" aria-label="Close" onclick={() => (lineSheet = null)}></button>
+    <div class="sheet" role="dialog" aria-modal="true" aria-label={`Calls on line ${lineSheet.line}`}>
+      <span class="grabber" aria-hidden="true"></span>
+      <h2>Calls on line {lineSheet.line}</h2>
+      {#each lineSheet.rows as row (row.relation.node.id)}
+        {@const node = row.relation.node}
+        <div class="sheetrow">
+          <KindGlyph kind={node.kind} size={22} />
+          <div>
+            <div class="sn">{node.name}</div>
+            <div class="sm">{node.file === payload.node.file ? 'same file' : node.file} · defined at line {node.line}</div>
+          </div>
+        </div>
+        <div class="sheetacts">
+          <button type="button" class="btn primary lg" onclick={() => { lineSheet = null; stepDown(node); }}><Icon name="external-link" />Open</button>
+          <button type="button" class="btn secondary lg" onclick={() => { lineSheet = null; navigate(flowHref({ from: payload?.node.name ?? '', to: node.name })); }}><Icon name="workflow" />Read as flow</button>
+        </div>
+      {/each}
+    </div>
+  {/if}
 {/if}
 
 <style>
+  /* §2 / §8 D-02: three islands 8px apart — Called by 288 | the symbol |
+     Calls 320. The symbol and the Calls island scroll TOGETHER (one stage),
+     because a callee row that drifts away from its line is worse than no rail
+     at all; Called by scrolls alone. */
   .scroll {
     height: 100%;
     overflow: auto;
   }
 
   .focus {
+    position: relative;
     display: grid;
-    grid-template-columns: 300px minmax(520px, 1fr);
+    grid-template-columns: 288px minmax(0, 1fr);
+    gap: var(--gap);
     height: 100%;
     min-height: 0;
   }
 
   .rail-left {
+    display: flex;
+    min-height: 0;
+    flex-direction: column;
+  }
+
+  .callers-scroll {
+    min-height: 0;
+    flex: 1;
     overflow: auto;
-    border-right: 1px solid var(--rule-soft);
-    background: var(--paper);
+  }
+
+  /* Blast radius pinned to the foot of the Called by island. */
+  .blast-foot {
+    flex: 0 0 auto;
+    padding: 14px 16px 16px;
+    border-top: 1px solid var(--line-faint);
   }
 
   .stage {
     position: relative;
+    min-width: 0;
     overflow: auto;
   }
 
@@ -667,18 +812,25 @@
   .stage-inner {
     position: relative;
     display: grid;
-    grid-template-columns: minmax(480px, 1fr) 320px;
+    grid-template-columns: minmax(0, 1fr) 320px;
+    gap: var(--gap);
     min-height: 100%;
   }
 
-  .center {
+  .center,
+  .rail-right {
     min-width: 0;
-    padding: 18px 22px 40px;
+    border: 1px solid var(--line-faint);
+    border-radius: var(--island-r);
+    background: var(--panel);
+  }
+
+  .center {
+    padding: 20px 24px 32px;
   }
 
   .rail-right {
     position: relative;
-    border-left: 1px solid var(--rule-faint);
   }
 
   .banner {
@@ -687,17 +839,294 @@
 
   .note {
     padding: 12px 0;
-    color: var(--ink-3);
-    font-size: 12px;
+    color: var(--fg-3);
+    font: var(--t-small);
   }
 
-  @media (max-width: 1100px) {
+  /* The confidence legend under the code card. */
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 18px;
+    margin-top: 14px;
+    color: var(--fg-2);
+    font: var(--t-small);
+  }
+
+  .key {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .key i {
+    width: 24px;
+    height: 0;
+    border-top: 2px solid var(--cyan);
+  }
+
+  .key i.dotted {
+    border-top: 2px dotted var(--fg-3);
+  }
+
+  .key i.dashed {
+    border-top: 2px dashed var(--fg-2);
+  }
+
+  .calledby,
+  .segmented,
+  .drawer-scrim {
+    display: none;
+  }
+
+  /* §10 phone bottom sheet: `overlay` + `line` + SH.pop, r 18, a 36x4
+     grabber; the line's calls, Open and Read as flow. */
+  .sheet-scrim {
+    position: fixed;
+    inset: 0 0 64px;
+    z-index: 60;
+    background: color-mix(in srgb, var(--bg) 50%, transparent);
+  }
+
+  .sheet {
+    position: fixed;
+    right: 0;
+    bottom: 64px;
+    left: 0;
+    z-index: 61;
+    display: flex;
+    max-height: 70vh;
+    flex-direction: column;
+    gap: 12px;
+    overflow: auto;
+    padding: 14px 16px 24px;
+    border: 1px solid var(--line);
+    border-bottom: 0;
+    border-radius: 18px 18px 0 0;
+    background: var(--overlay);
+    box-shadow: var(--sh-pop);
+  }
+
+  .sheet .grabber {
+    width: 36px;
+    height: 4px;
+    align-self: center;
+    border-radius: 2px;
+    background: var(--line-strong);
+  }
+
+  .sheet h2 {
+    margin: 0;
+    color: var(--fg);
+    font: var(--t-h2);
+  }
+
+  .sheetrow {
+    display: grid;
+    grid-template-columns: 22px minmax(0, 1fr);
+    align-items: center;
+    gap: 12px;
+    padding: 12px 14px;
+    border: 1px solid var(--primary-line);
+    border-radius: 12px;
+    background: var(--primary-soft);
+    box-shadow: var(--glow-25);
+  }
+
+  .sn {
+    color: var(--primary-ink);
+    font: var(--t-mono-500);
+  }
+
+  .sm {
+    margin-top: 2px;
+    color: var(--fg-3);
+    font: var(--t-caption);
+  }
+
+  .sheetacts {
+    display: flex;
+    gap: 8px;
+  }
+
+  /* ---- §9.2 loading skeletons ---- */
+  .sk-head {
+    display: flex;
+    height: 52px;
+    align-items: center;
+    padding: 0 16px;
+  }
+
+  .sk-row {
+    display: grid;
+    grid-template-columns: 22px 1fr;
+    gap: 10px;
+    align-items: center;
+    height: 46px;
+    margin: 0 10px 6px;
+    padding: 0 12px;
+    border: 1px solid var(--line-faint);
+    border-radius: 10px;
+    background: var(--card);
+  }
+
+  .skeleton.tile {
+    width: 22px;
+    height: 22px;
+    border-radius: 7px;
+  }
+
+  .skeleton.tile.lg {
+    width: 28px;
+    height: 28px;
+    border-radius: 8px;
+  }
+
+  .sk-title {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 18px;
+  }
+
+  .sk-code {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 24px;
+    padding: 20px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--card);
+  }
+
+  /* §10 tablet: Called by folds into a header button and opens as a drawer
+     over the page; the symbol and Calls islands share the width. */
+  @media (max-width: 1023px) {
     .focus {
-      grid-template-columns: 240px minmax(360px, 1fr);
+      grid-template-columns: minmax(0, 1fr);
     }
 
     .stage-inner {
-      grid-template-columns: minmax(360px, 1fr) 260px;
+      grid-template-columns: minmax(0, 1fr) 248px;
+    }
+
+    .center {
+      padding: 18px 20px 28px;
+    }
+
+    .focus:not(.loading) .rail-left {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      left: 0;
+      z-index: 20;
+      width: min(320px, 90%);
+      box-shadow: var(--sh-pop);
+      transform: translateX(calc(-100% - 16px));
+      transition: transform 160ms ease-out;
+    }
+
+    .focus.loading .rail-left {
+      display: none;
+    }
+
+    .focus.callers-open .rail-left {
+      transform: none;
+    }
+
+    .drawer-scrim {
+      position: absolute;
+      inset: 0;
+      z-index: 19;
+      display: block;
+      border-radius: var(--island-r);
+      background: color-mix(in srgb, var(--bg) 60%, transparent);
+    }
+
+    .calledby {
+      display: inline-flex;
+      float: right;
+      margin: 0 0 8px 12px;
+    }
+  }
+
+  /* §10 phone: a segmented control picks the pane — Code, Called by, Calls. */
+  @media (max-width: 599px) {
+    .segmented {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 4px;
+      margin-bottom: var(--gap);
+      padding: 4px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--card);
+    }
+
+    .segmented button {
+      height: 34px;
+      border: 1px solid transparent;
+      border-radius: 9px;
+      color: var(--fg-2);
+      font: var(--t-small-500);
+    }
+
+    .segmented button.on {
+      border-color: var(--primary-line);
+      background: var(--primary-soft);
+      color: var(--primary-ink);
+    }
+
+    .focus {
+      height: calc(100% - 50px);
+    }
+
+    .calledby {
+      display: none;
+    }
+
+    .focus:not(.loading) .rail-left {
+      position: static;
+      width: auto;
+      box-shadow: none;
+      transform: none;
+      transition: none;
+    }
+
+    .focus.pane-callers .rail-left {
+      display: flex;
+    }
+
+    .focus:not(.pane-callers) .rail-left {
+      display: none;
+    }
+
+    .focus.pane-callers .stage {
+      display: none;
+    }
+
+    .stage-inner {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .focus.pane-code .rail-right,
+    .focus.pane-calls .center {
+      display: none;
+    }
+
+    .focus.pane-calls .stage-inner {
+      min-height: 0 !important;
+    }
+
+    .center {
+      padding: 14px 14px 24px;
+    }
+
+    /* The rail is a pane away: no connector has a row to land on. */
+    .stage-inner :global(.overlay) {
+      display: none;
     }
   }
 </style>

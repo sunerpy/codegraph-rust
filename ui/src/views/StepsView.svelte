@@ -14,6 +14,7 @@
   or a Flow strip between two steps.
 -->
 <script lang="ts">
+  import Icon from '../components/Icon.svelte';
   import { SvelteFlow, Controls, type Node, type Edge, type Viewport } from '@xyflow/svelte';
   import '@xyflow/svelte/dist/style.css';
   import StepNode from '../components/steps/StepNode.svelte';
@@ -514,11 +515,13 @@
   <div class="stage" bind:this={stage} role="presentation" onmousemove={onStageMove} onmouseleave={() => (hovered = null)}>
     {#if !supported}
       <div class="state">
+        <span class="stile"><Icon name="footprints" size={20} /></span>
         <h2>This viewer cannot draw steps</h2>
         <p>The host it runs in has not wired the steps question. The Screens and Flow views still work.</p>
       </div>
     {:else if !asked}
       <div class="state chooser">
+        <span class="stile"><Icon name="footprints" size={20} /></span>
         <h2>What happens from where?</h2>
         {#if chooser === 'routes'}
           <p>
@@ -565,6 +568,7 @@
       </div>
     {:else if error !== null}
       <div class="state">
+        <span class="stile"><Icon name="footprints" size={20} /></span>
         <h2>The steps could not be read</h2>
         <p>{error}</p>
       </div>
@@ -572,6 +576,7 @@
       <div class="state"><p class="dim">Walking from the anchor…</p></div>
     {:else if model !== null && payload !== null && readAs === 'order' && !orderReadable}
       <div class="state">
+        <span class="stile"><Icon name="footprints" size={20} /></span>
         <h2>This has no body to read in order</h2>
         <p>
           Nothing the picture holds is written inside this symbol — a screen renders handlers that fire on
@@ -879,19 +884,27 @@
 </div>
 
 <style>
+  /* §8 D-08 / D-09: the canvas island | the inspector 320, 8 apart. */
   .steps {
     display: grid;
-    grid-template-columns: minmax(600px, 1fr) 340px;
+    grid-template-columns: minmax(0, 1fr) 320px;
+    gap: var(--gap);
     height: 100%;
     min-height: 0;
+  }
+  /* Nothing to inspect yet (the empty states): the canvas takes the width. */
+  .steps:not(:has(.side)) {
+    grid-template-columns: minmax(0, 1fr);
   }
   .stage {
     position: relative;
     overflow: hidden;
-    background: var(--paper);
+    border: 1px solid var(--line-faint);
+    border-radius: var(--island-r);
+    background: var(--canvas);
   }
   .stage :global(.svelte-flow) {
-    background: var(--paper);
+    background: transparent;
   }
   .stage :global(.svelte-flow__handle) {
     opacity: 0;
@@ -905,23 +918,47 @@
   .stage :global(.svelte-flow__edge-labels) {
     pointer-events: none;
   }
+  .stage :global(.svelte-flow__controls) {
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    box-shadow: var(--sh-pop);
+  }
   .stage :global(.svelte-flow__controls-button) {
-    background: var(--paper);
     border: 0;
-    border-bottom: 1px solid var(--rule-soft);
-    border-radius: 0;
-    color: var(--ink-2);
+    border-bottom: 1px solid var(--line);
+    background: var(--overlay);
+    color: var(--fg-2);
   }
   .stage :global(.svelte-flow__controls-button svg) {
-    fill: var(--ink-2);
+    fill: var(--fg-2);
   }
+  /* The empty and not-yet-drawn states: a D card on the canvas (§9). */
   .state {
-    padding: 48px 40px;
-    max-width: 560px;
+    max-width: 600px;
+    margin: 32px;
+    padding: 22px 24px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--card);
+    box-shadow: var(--sh-card);
+    color: var(--fg-2);
+    font: var(--t-body);
   }
   .state h2 {
-    font: 600 20px var(--sans);
-    margin: 0 0 8px;
+    margin: 12px 0 8px;
+    color: var(--fg);
+    font: var(--t-h2);
+  }
+  .stile {
+    display: inline-flex;
+    width: 40px;
+    height: 40px;
+    align-items: center;
+    justify-content: center;
+    border-radius: 12px;
+    background: var(--primary-soft);
+    color: var(--primary-ink);
   }
   .chooser {
     max-width: 720px;
@@ -988,10 +1025,13 @@
     border-top: 1px solid var(--rule-soft);
   }
   .side {
-    border-left: 1px solid var(--rule);
-    padding: 14px 16px;
+    padding: 16px;
     overflow: auto;
-    font-size: 12.5px;
+    border: 1px solid var(--line-faint);
+    border-radius: var(--island-r);
+    background: var(--panel);
+    color: var(--fg-2);
+    font: var(--t-small);
   }
   .head {
     display: flex;
@@ -1165,5 +1205,14 @@
   }
   .mark {
     color: var(--accent);
+  }
+  @media (max-width: 1023px) {
+    .steps {
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: minmax(0, 1fr) auto;
+    }
+    .side {
+      max-height: 40vh;
+    }
   }
 </style>

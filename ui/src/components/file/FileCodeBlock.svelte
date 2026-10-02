@@ -14,7 +14,7 @@
   text. Only the characters are missing, and they fill in behind the reader.
 -->
 <script lang="ts">
-  import { tokenClass, type Token } from '../../lib/highlight';
+  import { tokenClassFor, type Token } from '../../lib/highlight';
   import { assignRefs, type LineRef } from '../../lib/symbol-model';
   import { lineTop } from '../../lib/filecode-model';
   import { hot } from '../../lib/focus.svelte';
@@ -73,7 +73,7 @@
       const ref = claimed.get(index) ?? null;
       return {
         text: token.text,
-        cls: ref ? null : tokenClass(token.cls),
+        cls: ref ? null : tokenClassFor(token),
         ref,
         def:
           !ref &&
@@ -145,7 +145,7 @@
   .code {
     position: absolute;
     inset: 0;
-    font: var(--code-size) / var(--code-lh) var(--mono);
+    font: var(--t-code);
   }
 
   /* 44px gutter | source | 18px port cell — the Symbol view's grid.
@@ -166,23 +166,35 @@
   }
 
   .ln:hover {
-    background: var(--paper-2);
+    background: var(--raised);
   }
 
+  /* Hot: `primary-soft` with the 2px GRAD.brand bar (§7 hot line). */
   .ln.hot {
-    background: var(--accent-soft);
+    background: var(--primary-soft);
+  }
+
+  .ln.hot::before {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: 2px;
+    background: var(--grad-brand-v);
+    content: '';
   }
 
   .no {
     padding-right: 12px;
-    color: var(--ink-4);
-    font-size: 11px;
+    color: var(--fg-4);
+    font: var(--t-lineno);
     text-align: right;
     user-select: none;
   }
 
   .tx {
     overflow: hidden;
+    color: var(--fg);
     white-space: pre;
   }
 
@@ -192,7 +204,8 @@
     display: inline-block;
     width: 34%;
     height: 8px;
-    background: var(--rule-faint);
+    border-radius: 4px;
+    background: var(--raised);
     vertical-align: middle;
   }
 
@@ -200,74 +213,93 @@
     position: relative;
   }
 
+  /* §7 port: a 7px `cyan` dot; hollow for a line of guesses; glowing hot. */
   .port i {
     position: absolute;
-    top: 7px;
-    right: 4px;
-    width: 6px;
-    height: 6px;
-    border: 1px solid var(--ink-3);
-    background: var(--paper);
+    top: 6.5px;
+    right: 5px;
+    width: 7px;
+    height: 7px;
+    border: 1px solid var(--cyan-line);
+    border-radius: 50%;
+    background: transparent;
   }
 
   .port i.sure {
-    background: var(--ink-3);
+    border-color: var(--cyan);
+    background: var(--cyan);
   }
 
   .ln.hot .port i {
-    border-color: var(--accent);
-    background: var(--accent);
+    border-color: var(--cyan);
+    background: var(--cyan);
+    box-shadow: var(--glow-cyan-90);
   }
 
-  /* ---- token classes (near-monochrome by design, spec §2.2) ---- */
+  /* ---- §3 syntax ---- */
   .t-c {
-    color: var(--code-comment);
+    color: var(--syn-com);
   }
 
   .t-s {
-    color: var(--ink-2);
+    color: var(--syn-str);
   }
 
   .t-k {
+    color: var(--syn-kw);
     font-weight: 500;
   }
 
   .t-n {
-    color: var(--ink-2);
+    color: var(--syn-num);
+  }
+
+  .t-t {
+    color: var(--syn-type);
+  }
+
+  .t-p {
+    color: var(--syn-punct);
   }
 
   .t-def {
+    color: var(--fg);
     font-weight: 600;
   }
 
+  /* §7 call capsule behind each resolved call name. */
   .ref {
-    color: var(--accent);
+    margin: 0 -3px;
+    padding: 1px 3px;
+    border-radius: 5px;
+    background: color-mix(in srgb, var(--cyan-soft) 85%, transparent);
+    color: var(--cyan);
     cursor: pointer;
-    text-decoration: underline;
-    text-decoration-color: var(--accent-line);
-    text-underline-offset: 3px;
   }
 
   .ref:hover,
-  .ref.hot {
-    background: var(--accent-soft);
-    text-decoration-color: var(--accent);
+  .ref.hot,
+  .ln.hot .ref {
+    background: var(--cyan-soft);
+    box-shadow: inset 0 0 0 1px var(--cyan-line);
   }
 
   .ref.uncertain {
-    color: var(--ink-2);
-    text-decoration-style: dotted;
-    text-decoration-color: var(--ink-4);
+    background: transparent;
+    color: var(--fg-2);
+    text-decoration: underline dotted var(--fg-4);
+    text-underline-offset: 3px;
   }
 
   .ref.stub {
-    color: var(--ink-2);
+    background: transparent;
+    color: var(--fg-2);
     cursor: default;
-    text-decoration-color: var(--rule-soft);
+    text-decoration: underline dotted var(--line-strong);
+    text-underline-offset: 3px;
   }
 
   .ref.stub:hover {
-    background: none;
-    text-decoration-color: var(--rule-soft);
+    box-shadow: none;
   }
 </style>

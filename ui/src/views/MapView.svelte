@@ -13,7 +13,8 @@
   place you were.
 -->
 <script lang="ts">
-  import { SvelteFlow, Controls, ViewportPortal, type Node, type Edge } from '@xyflow/svelte';
+  import { effectiveTheme, theme } from '../lib/theme-choice.svelte';
+  import { SvelteFlow, Controls, ViewportPortal, type Node, type Edge, MiniMap } from '@xyflow/svelte';
   import '@xyflow/svelte/dist/style.css';
   import ModuleNode from '../components/map/ModuleNode.svelte';
   import ModuleEdge from '../components/map/ModuleEdge.svelte';
@@ -57,16 +58,17 @@
    */
   const FIT = { fitViewOptions: { padding: 0.12, maxZoom: 1, minZoom: 0.45 } };
 
-  // The key stays open until the reader closes it; the choice survives a reload
-  // but is per browser — a preference, not a fact about the project. Same
-  // storage shape as the Screens and Steps keys.
+  // The key rests as D-05's one-line legend and opens to the full key on
+  // request; the choice survives a reload but is per browser — a preference,
+  // not a fact about the project. Same storage shape as the Screens and Steps
+  // keys. (Upstream opened the full key by default, over the map.)
   const LEGEND_KEY = 'codegraph-ui:map-legend';
   let legendOpen = $state(readLegendOpen());
   function readLegendOpen(): boolean {
     try {
-      return localStorage.getItem(LEGEND_KEY) !== 'closed';
+      return localStorage.getItem(LEGEND_KEY) === 'open';
     } catch {
-      return true;
+      return false;
     }
   }
   $effect(() => {
@@ -213,6 +215,8 @@
     const root = payload?.root ?? '';
     return mapSvg(layout, {
       scale,
+      // The theme on screen, System resolved (§3.6).
+      theme: effectiveTheme(theme.choice),
       selected,
       caption: `${root || 'the project'} · ${layout.nodes.length} modules${selected ? ` · ${selected} selected` : ''}`,
     });
@@ -226,14 +230,14 @@
 </script>
 
 <div class="mapview">
-  <div class="mapstage" bind:this={stage}>
+  <div class="mapstage island" bind:this={stage}>
     {#if error !== null}
       <div class="state">
         <h2>The map could not be built</h2>
         <p>{error}</p>
       </div>
     {:else if loading && payload === null}
-      <div class="state"><p class="dim">Aggregating the graph by module…</p></div>
+      <div class="state"><span class="pill">Aggregating the graph by module…</span></div>
     {:else if layout !== null && layout.nodes.length === 0}
       <div class="state">
         <h2>Nothing to draw here</h2>
@@ -285,7 +289,10 @@
             {/if}
           {/each}
         </ViewportPortal>
-        <Controls position="bottom-right" showLock={false} />
+        <!-- §7: the floating toolbar at the top right, the minimap at the
+             bottom right, the key at the bottom left. -->
+        <Controls position="top-right" orientation="horizontal" showLock={false} />
+        <MiniMap position="bottom-right" width={176} height={116} pannable zoomable />
       </SvelteFlow>
 
       <!-- The key, on the picture it explains. -->
@@ -340,22 +347,20 @@
 </div>
 
 <style>
+  /* §8 D-05: the canvas island (dots and ambient glows) | the inspector 320. */
   .mapview {
     display: grid;
-    grid-template-columns: minmax(600px, 1fr) 320px;
+    grid-template-columns: minmax(0, 1fr) 320px;
+    gap: var(--gap);
     height: 100%;
     min-height: 0;
   }
   .mapstage {
     position: relative;
-    overflow: hidden;
-    background: var(--paper);
+    background: var(--canvas);
   }
-  /* Svelte Flow paints its own surface and its own controls; both are
-     re-tokenised so the canvas belongs to the paper/ink system rather than
-     arriving with the library's blue-grey defaults. */
   .mapstage :global(.svelte-flow) {
-    background: var(--paper);
+    background: transparent;
   }
   .mapstage :global(.svelte-flow__handle) {
     opacity: 0;
@@ -366,20 +371,42 @@
     border: 0;
     pointer-events: none;
   }
-  .mapstage :global(.svelte-flow__controls-button) {
-    background: var(--paper);
-    border: 0;
-    border-bottom: 1px solid var(--rule-soft);
-    border-radius: 0;
-    box-shadow: none;
-    fill: var(--ink-2);
-  }
   .mapstage :global(.svelte-flow__controls) {
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    box-shadow: var(--sh-pop);
+  }
+  .mapstage :global(.svelte-flow__controls-button) {
+    border: 0;
+    border-bottom: 1px solid var(--line);
+    background: var(--overlay);
     box-shadow: none;
-    border: 1px solid var(--rule-soft);
+    fill: var(--fg-2);
+  }
+  .mapstage :global(.svelte-flow__controls-button:hover) {
+    background: var(--raised);
+    fill: var(--fg);
   }
   .mapstage :global(.svelte-flow__node) {
     cursor: default;
+  }
+  .mapstage :global(.svelte-flow__controls.horizontal) {
+    margin: 14px 16px;
+  }
+  .mapstage :global(.svelte-flow__controls.horizontal .svelte-flow__controls-button) {
+    border-right: 1px solid var(--line);
+    border-bottom: 0;
+  }
+  .mapstage :global(.svelte-flow__minimap) {
+    overflow: hidden;
+    margin: 16px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    box-shadow: var(--sh-pop);
+  }
+  .mapstage :global(.svelte-flow__minimap-node) {
+    fill: var(--line-strong);
   }
 
   .layerline {
@@ -387,56 +414,62 @@
     top: 0;
     left: 0;
     height: 1px;
-    background: var(--rule-faint);
+    background: var(--line-faint);
     pointer-events: none;
   }
+  /* §8 D-05 bands: `ENTRY` and `FOUNDATIONS · DEPEND ON NOTHING BELOW` in
+     `fg-4` micro. */
   .layerlbl {
     position: absolute;
     top: 0;
     left: 0;
-    font: 12px var(--sans);
-    color: var(--ink-3);
+    color: var(--fg-4);
+    font: var(--t-micro);
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
     white-space: nowrap;
     pointer-events: none;
   }
 
   .state {
-    padding: 40px;
-    max-width: 46ch;
+    max-width: 52ch;
+    padding: 32px;
   }
   .state h2 {
     margin: 0 0 8px;
-    font-size: 15px;
-    font-weight: 600;
+    color: var(--fg);
+    font: var(--t-h2);
   }
   .state p {
     margin: 0;
-    color: var(--ink-2);
-    font-size: 12.5px;
-    line-height: 1.5;
+    color: var(--fg-2);
+    font: var(--t-body);
   }
   .dim {
-    color: var(--ink-3);
+    color: var(--fg-3);
   }
 
+  /* The link tooltip: `overlay` + `line-strong` + SH.pop (§7). */
   .tip {
     position: absolute;
     z-index: 6;
-    max-width: 320px;
-    background: var(--paper);
-    border: 1px solid var(--ink);
-    padding: 8px 10px;
-    font-size: 12px;
-    color: var(--ink-2);
+    max-width: 340px;
+    padding: 10px 12px;
+    border: 1px solid var(--line-strong);
+    border-radius: 10px;
+    background: var(--overlay);
+    box-shadow: var(--sh-pop);
+    color: var(--fg-2);
+    font: var(--t-small);
     pointer-events: none;
   }
   .tip .mono {
-    font: 12px var(--mono);
-    color: var(--ink-2);
-    margin-bottom: 4px;
+    margin-bottom: 6px;
+    color: var(--fg-2);
+    font: var(--t-mono);
   }
   .tip .mono b {
-    color: var(--ink);
+    color: var(--fg);
     font-weight: 600;
   }
   .tip .row2 {
@@ -446,15 +479,23 @@
     padding: 1px 0;
   }
   .tip .row2.mono {
-    font: 11.5px var(--mono);
+    margin: 0;
+    font: var(--t-mono-sm);
   }
   .tip .row2.dim {
-    color: var(--ink-3);
+    color: var(--fg-3);
   }
 
-  @media (max-width: 1100px) {
+  @media (max-width: 1023px) {
     .mapview {
-      grid-template-columns: 1fr 260px;
+      grid-template-columns: minmax(0, 1fr) 260px;
+    }
+  }
+
+  @media (max-width: 599px) {
+    .mapview {
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: minmax(0, 1fr) auto;
     }
   }
 </style>

@@ -1,17 +1,24 @@
 <!--
-  The focus card: what this symbol is, where it lives, and the three claims
-  worth making before the body (design spec §3.2).
+  The focus card: what this symbol is, where it lives, and the claims worth
+  making before the body (docs/design/viewer-d.md §8 D-02).
 
-  The badges are the honesty layer. "exported" and "hub · N callers" are facts
-  about reach; the test badge is the one that changes behaviour — an amber
-  "No test reaches this within 3 caller hops" is the difference between editing
-  freely and editing carefully, so it is stated in the header rather than left
-  to be inferred from an empty rail.
+  The crumb names the file's path and the symbol's owners; the title row is a
+  28px kind tile, the name in `title-mono`, the kind pills and the icon
+  actions. The metric pills are the honesty layer — hub, callees, the test
+  claim, the extent. "No test reaches this within 3 caller hops" is the one
+  that changes behaviour, so it is an amber pill rather than an inference
+  from an empty rail.
+
+  A name too long for the row is cut where it would run into its pills, and
+  the whole name appears in a tooltip under it (D-02s longname).
 -->
 <script lang="ts">
+  import Icon from '../Icon.svelte';
   import KindGlyph from '../KindGlyph.svelte';
   import { fileHref } from '../../lib/navigation';
-  import { kindPhrase, plural } from '../../lib/symbol-model';
+  import { kindWord } from '../../lib/kinds';
+  import { plural } from '../../lib/symbol-model';
+  import { toast } from '../../lib/toast.svelte';
   import type {
     WireNodeDetail,
     WireNodeRef,
@@ -31,12 +38,21 @@
      * column is how a reader ends up trusting neither.
      */
     relationChips?: boolean;
+    /** The signature line; off when the code card below already starts with it. */
+    signature?: boolean;
   }
 
-  let { payload, onopen, relationChips = true }: Props = $props();
+  let { payload, onopen, relationChips = true, signature = true }: Props = $props();
 
   let node = $derived<WireNodeDetail>(payload.node);
   let tests = $derived(payload.tests);
+
+  /** The crumb: the file's directories and name, then the owning symbols. */
+  let crumb = $derived.by(() => {
+    const parts = node.file.split('/');
+    const owners = payload.ancestors.filter((a) => a.kind !== 'file');
+    return { dirs: parts.slice(0, -1), file: parts[parts.length - 1] ?? node.file, owners };
+  });
 
   /** `extends`/`implements` this symbol declares, and the ones declared on it. */
   let supertypes = $derived(
@@ -61,17 +77,31 @@
     return relation.edgeKinds.includes('implements') ? 'implements' : 'extends';
   }
 
+  /** Kind pills: the kind, then each modifier the node carries. */
+  let kindPills = $derived.by(() => {
+    const pills = [node.kind === 'type_alias' ? 'type' : kindWord(node.kind)];
+    if (node.async) pills.push('async');
+    if (node.static) pills.push('static');
+    if (node.abstract) pills.push('abstract');
+    if (node.visibility && node.visibility !== 'public') pills.push(node.visibility);
+    // Rust says `pub`; the extractors record it as public visibility or export.
+    if (node.language === 'rust' ? node.exported || node.visibility === 'public' : node.exported) {
+      pills.push(node.language === 'rust' ? 'pub' : 'exported');
+    }
+    return pills;
+  });
+
   /**
    * The test claim, worded to exactly what was checked. An interrupted search
    * (`exhaustive: false`) only ever established that no test calls the symbol
-   * directly, so the badge must not widen that to three hops.
+   * directly, so the pill must not widen that to three hops.
    */
   let testBadge = $derived.by(() => {
     if (tests.reached) {
       return {
         warn: false,
-        text: `Reached by tests · ${plural(tests.fileCount, 'file')} within ${tests.hopsSearched} hop${tests.hopsSearched === 1 ? '' : 's'}`,
-        title: tests.files.join(', '),
+        text: `Tests reach · ${plural(tests.fileCount, 'file')}`,
+        title: `Reached by tests within ${tests.hopsSearched} hop${tests.hopsSearched === 1 ? '' : 's'}: ${tests.files.join(', ')}`,
       };
     }
     return {
@@ -84,39 +114,99 @@
         : 'The caller search ran out of budget — only direct callers were checked.',
     };
   });
+
+  /* ---- the long-name tooltip: only when the title was actually cut ---- */
+  let titleEl: HTMLElement | null = $state(null);
+  let cut = $state(false);
+  let tipOpen = $state(false);
+
+  $effect(() => {
+    const el = titleEl;
+    void node.name;
+    if (!el) return;
+    const measure = () => (cut = el.scrollWidth > el.clientWidth + 1);
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    void document.fonts?.ready.then(measure);
+    return () => observer.disconnect();
+  });
+
+  async function copyName(): Promise<void> {
+    const text = node.qualifiedName || node.name;
+    try {
+      await navigator.clipboard.writeText(text);
+      toast.show(`Copied · ${text}`);
+    } catch {
+      toast.show('Copy is not available in this browser');
+    }
+  }
 </script>
 
-<div class="card-h">
-  <KindGlyph kind={node.kind} titled />
-  <h1>{node.name}</h1>
-  <span class="kindword">{kindPhrase(node)}</span>
-  <span class="loc mono">
-    <a href={fileHref(node.file, { line: node.line })}>{node.file}</a>:{node.line}–{node.endLine}
-    · {plural(node.lines, 'line')}
+<nav class="crumb" aria-label="Where this lives">
+  {#each crumb.dirs as dir, i (i)}<span>{dir}</span><span class="sep"
+      ><Icon name="chevron-right" size={12} /></span
+    >{/each}<a href={fileHref(node.file, { line: node.line })}>{crumb.file}</a
+  >{#each crumb.owners as owner (owner.id)}<span class="sep"><Icon name="chevron-right" size={12} /></span
+    ><button type="button" onclick={() => onopen(owner)}>{owner.name}</button>{/each}
+</nav>
+
+<div class="titlerow">
+  <KindGlyph kind={node.kind} titled size={28} />
+  <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+  <h1
+    bind:this={titleEl}
+    tabindex={cut ? 0 : undefined}
+    aria-describedby={tipOpen ? 'symbol-fullname' : undefined}
+    onmouseenter={() => (tipOpen = cut)}
+    onmouseleave={() => (tipOpen = false)}
+    onfocus={() => (tipOpen = cut)}
+    onblur={() => (tipOpen = false)}
+  >
+    {node.name}
+  </h1>
+  <span class="kinds">
+    {#each kindPills as pill (pill)}<span class="pill">{pill}</span>{/each}
   </span>
+  <span class="actions">
+    <button type="button" class="iconbtn bordered" aria-label="Copy the qualified name" title="Copy the qualified name" onclick={copyName}>
+      <Icon name="copy" />
+    </button>
+    <a class="iconbtn bordered" href={fileHref(node.file, { line: node.line })} aria-label="Open the file" title="Open the file">
+      <Icon name="external-link" />
+    </a>
+  </span>
+  {#if tipOpen}
+    <div class="tip mono" role="tooltip" id="symbol-fullname">{node.qualifiedName || node.name}</div>
+  {/if}
 </div>
 
-{#if payload.ancestors.length > 0}
-  <div class="parents mono">
-    in {#each payload.ancestors as ancestor, i (ancestor.id)}{#if i > 0}<span class="sep"> › </span
-        >{/if}<button type="button" onclick={() => onopen(ancestor)}>{ancestor.name}</button
-      >{/each}
-  </div>
-{/if}
-
-<div class="badges">
-  {#if node.exported}<span class="badge">exported</span>{/if}
-  {#if payload.counts.hub}
-    <span class="badge hub" title="Changing this reaches a lot of the repo">
-      hub · {plural(payload.counts.callers, 'caller')}
+<div class="metrics">
+  {#if payload.hierarchy?.polymorphic}
+    <span class="pill violet" title="A call through this type has no single static target">
+      <Icon name="layers" size={14} />Polymorphic · {plural(payload.hierarchy.implementers, 'implementation')}
     </span>
   {/if}
-  <span class="badge" class:warn={testBadge.warn} title={testBadge.title}>
-    <span class="sw"></span>{testBadge.text}
+  {#if payload.members.total > 0}
+    <span class="pill"><Icon name="list-tree" size={14} />{plural(payload.members.total, 'member')}</span>
+  {/if}
+  {#if payload.counts.hub}
+    <span class="pill violet" title="Changing this reaches a lot of the repo">
+      <Icon name="zap" size={14} />Hub · {plural(payload.counts.callers, 'caller')}
+    </span>
+  {/if}
+  {#if payload.counts.callees > 0}
+    <span class="pill cyan"><Icon name="arrow-right" size={14} />{plural(payload.counts.callees, 'callee')}</span>
+  {/if}
+  <span class="pill" class:green={!testBadge.warn} class:amber={testBadge.warn} title={testBadge.title}>
+    <Icon name={testBadge.warn ? 'triangle-alert' : 'flask-conical'} size={14} />{testBadge.text}
+  </span>
+  <span class="pill">
+    <Icon name="file-code-2" size={14} />{plural(node.lines, 'line')} · {node.line}–{node.endLine}
   </span>
 </div>
 
-{#if node.signature}
+{#if signature && node.signature}
   <div class="sig">{node.name}{node.signature}</div>
 {/if}
 
@@ -163,136 +253,149 @@
 {/if}
 
 <style>
-  .card-h {
+  .crumb {
     display: flex;
     flex-wrap: wrap;
-    align-items: baseline;
-    gap: 6px 12px;
+    align-items: center;
+    gap: 2px;
+    color: var(--fg-3);
+    font: var(--t-small);
   }
 
-  .card-h h1 {
-    margin: 0;
-    font: 600 20px/1.2 var(--mono);
-    letter-spacing: -0.01em;
+  .crumb .sep {
+    display: inline-flex;
+    margin: 0 4px;
+    color: var(--fg-4);
   }
 
-  .kindword {
-    color: var(--ink-3);
-    font-size: 12.5px;
-  }
-
-  .loc {
-    color: var(--ink-2);
-    font-size: 11.5px;
-  }
-
-  .loc a:hover {
-    text-decoration: underline;
-  }
-
-  .parents {
-    margin-top: 6px;
-    color: var(--ink-3);
-    font-size: 11.5px;
-  }
-
-  .parents button {
-    color: inherit;
+  .crumb a,
+  .crumb button {
+    color: var(--fg-2);
     font: inherit;
   }
 
-  .parents button:hover {
-    color: var(--ink);
+  .crumb a:hover,
+  .crumb button:hover {
+    color: var(--fg);
     text-decoration: underline;
+    text-underline-offset: 2px;
   }
 
-  .parents .sep {
-    color: var(--ink-4);
+  /* Title row: tile 28, the name, its pills 12px after it, the actions 12px
+     after those — the name is the one thing that gives way. */
+  .titlerow {
+    position: relative;
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    gap: 12px;
+    margin-top: 12px;
   }
 
-  .badges {
+  h1 {
+    min-width: 0;
+    margin: 0;
+    overflow: hidden;
+    color: var(--fg);
+    font: var(--t-title-mono);
+    font-variant-ligatures: none;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  h1:focus-visible {
+    outline-offset: 2px;
+  }
+
+  .kinds {
+    display: inline-flex;
+    flex: 0 0 auto;
+    gap: 6px;
+  }
+
+  .actions {
+    display: inline-flex;
+    flex: 0 0 auto;
+    gap: 6px;
+    margin-left: auto;
+  }
+
+  .tip {
+    position: absolute;
+    top: calc(100% + 8px);
+    left: 40px;
+    z-index: 20;
+    max-width: calc(100% - 40px);
+    padding: 7px 12px;
+    overflow-wrap: anywhere;
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
+    background: var(--overlay);
+    box-shadow: var(--sh-pop);
+    color: var(--fg);
+    font: var(--t-mono);
+  }
+
+  .metrics {
     display: flex;
     flex-wrap: wrap;
-    gap: 6px;
-    margin-top: 10px;
-  }
-
-  .badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    padding: 2px 7px;
-    border: 1px solid var(--rule-soft);
-    background: var(--paper);
-    color: var(--ink-2);
-    font-size: 11.5px;
-  }
-
-  /* Amber is used here and nowhere else in the app. */
-  .badge.warn {
-    border-color: var(--amber);
-    background: var(--amber-soft);
-    color: var(--amber);
-  }
-
-  .badge.hub {
-    border-color: var(--ink);
-  }
-
-  .sw {
-    display: inline-block;
-    width: 8px;
-    height: 8px;
-    border: 1px solid currentColor;
-  }
-
-  .badge.warn .sw {
-    background: currentColor;
+    gap: 8px;
+    margin-top: 12px;
   }
 
   .sig {
-    margin-top: 10px;
-    color: var(--ink-2);
-    font: 12px var(--mono);
+    margin-top: 12px;
+    color: var(--fg-2);
+    font: 400 12px / 18px var(--mono);
+    font-variant-ligatures: none;
     white-space: pre-wrap;
     word-break: break-word;
   }
 
   .doc {
-    margin-top: 8px;
-    max-width: 70ch;
-    color: var(--ink-2);
-    font-size: 12.5px;
+    max-width: 78ch;
+    margin-top: 12px;
+    color: var(--fg-2);
+    font: var(--t-body);
     white-space: pre-wrap;
   }
 
   .rel {
     display: flex;
     flex-wrap: wrap;
-    align-items: baseline;
+    align-items: center;
     gap: 6px;
-    margin-top: 10px;
-    color: var(--ink-3);
-    font-size: 12px;
+    margin-top: 12px;
+    color: var(--fg-3);
+    font: var(--t-small);
   }
 
   .rel > span {
     display: inline-flex;
     flex-wrap: wrap;
-    align-items: baseline;
+    align-items: center;
     gap: 6px;
   }
 
   .chip {
-    padding: 1px 6px;
-    border: 1px solid var(--rule-soft);
-    background: var(--paper);
-    color: var(--ink-2);
-    font: 11.5px var(--mono);
+    height: 22px;
+    padding: 0 9px;
+    border: 1px solid var(--line);
+    border-radius: 11px;
+    background: var(--raised);
+    color: var(--fg-2);
+    font: var(--t-mono-sm);
   }
 
   .chip:hover {
-    border-color: var(--ink);
-    color: var(--ink);
+    border-color: var(--line-strong);
+    color: var(--fg);
+  }
+
+  @media (max-width: 599px) {
+    .actions,
+    .kinds {
+      display: none;
+    }
   }
 </style>

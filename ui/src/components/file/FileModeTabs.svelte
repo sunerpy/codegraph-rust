@@ -6,6 +6,7 @@
   the same mode, and `?src=1` is how it travels.
 -->
 <script lang="ts">
+  import Icon from '../Icon.svelte';
   import { fileHref } from '../../lib/navigation';
 
   interface Props {
@@ -23,36 +24,48 @@
     class="mode"
     class:on={!source}
     href={fileHref(path, line ? { line } : {})}
-    aria-current={!source ? 'page' : undefined}>Outline</a
+    aria-current={!source ? 'page' : undefined}><Icon name="list-tree" />Outline</a
   >
   <a
     class="mode"
     class:on={source}
     href={fileHref(path, { source: true, ...(line ? { line } : {}) })}
-    aria-current={source ? 'page' : undefined}>Source</a
+    aria-current={source ? 'page' : undefined}><Icon name="file-code-2" />Whole-file source</a
   >
 </nav>
 
 <style>
   .modes {
-    display: flex;
-    gap: 2px;
+    display: inline-flex;
+    gap: 4px;
+    padding: 3px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--card);
   }
 
   .mode {
-    padding: 3px 10px;
-    border: 1px solid var(--rule-soft);
-    color: var(--ink-2);
-    font-size: 12.5px;
+    display: inline-flex;
+    height: 28px;
+    align-items: center;
+    gap: 6px;
+    padding: 0 10px;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    color: var(--fg-2);
+    font: var(--t-small-500);
     text-decoration: none;
+    white-space: nowrap;
   }
 
   .mode:hover {
-    background: var(--press);
+    background: var(--raised);
+    color: var(--fg);
   }
 
   .mode.on {
-    border-color: var(--ink);
-    color: var(--ink);
+    border-color: var(--primary-line);
+    background: var(--primary-soft);
+    color: var(--primary-ink);
   }
 </style>

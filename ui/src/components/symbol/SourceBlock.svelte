@@ -16,7 +16,9 @@
     callee's own name whatever boundaries a grammar chose.
 -->
 <script lang="ts">
-  import { tokenClass, type Token } from '../../lib/highlight';
+  import Icon from '../Icon.svelte';
+  import { tokenClassFor, type Token } from '../../lib/highlight';
+  import { toast } from '../../lib/toast.svelte';
   import { assignRefs, type CodeBlock, type LineRef } from '../../lib/symbol-model';
   import { hot } from '../../lib/focus.svelte';
 
@@ -30,10 +32,41 @@
     defName: string;
     /** Line from `?hl=` — tinted and scrolled to. */
     highlight: number | null;
-    onfollow: (ref: LineRef) => void;
+    /** Follow a call site; `line` is the file line it sits on. */
+    onfollow: (ref: LineRef, line: number) => void;
+    /** The card header's file name; omitted, the card has no header. */
+    file?: string | null;
   }
 
-  let { block, tokens, refs, defLine, defName, highlight, onfollow }: Props = $props();
+  let { block, tokens, refs, defLine, defName, highlight, onfollow, file = null }: Props = $props();
+
+  /** `L109–130`: the first and last line the card draws. */
+  let range = $derived.by(() => {
+    const first = block.windows[0];
+    const last = block.windows[block.windows.length - 1];
+    if (!first || !last) return '';
+    const end = last.start + last.lines.length - 1;
+    return `L${first.start}–${end}`;
+  });
+
+  /** Distinct resolved targets called from the body, and how many are lit. */
+  let calls = $derived.by(() => {
+    const targets = new Set<string>();
+    for (const lineRefs of refs.values()) {
+      for (const ref of lineRefs) if (ref.targetId && !ref.outside && !ref.uncertain) targets.add(ref.targetId);
+    }
+    return targets.size;
+  });
+
+  async function copyBody(): Promise<void> {
+    const text = block.windows.map((w) => w.lines.join('\n')).join('\n…\n');
+    try {
+      await navigator.clipboard.writeText(text);
+      toast.show('Copied the source');
+    } catch {
+      toast.show('Copy is not available in this browser');
+    }
+  }
 
   interface Part {
     text: string;
@@ -80,7 +113,7 @@
       const ref = claimed.get(index) ?? null;
       return {
         text: token.text,
-        cls: ref ? null : tokenClass(token.cls),
+        cls: ref ? null : tokenClassFor(token),
         ref,
         def:
           !ref &&
@@ -105,9 +138,27 @@
   function isHot(line: RenderedLine): boolean {
     return line.n === highlight || line.targets.some((id) => hot.is(id));
   }
+
+  /** Lit lines, for the header's `N calls · 1 hot`. */
+  let hotLines = $derived(chunks.reduce((n, c) => n + c.lines.filter((l) => isHot(l)).length, 0));
 </script>
 
-<div class="code">
+<div class="code" data-code-card>
+  {#if file}
+    <div class="ch">
+      <span class="fi"><Icon name="file-code-2" /></span>
+      <span class="fname">{file.slice(file.lastIndexOf('/') + 1)}</span>
+      <span class="range">{range}</span>
+      <span class="sp"></span>
+      {#if calls > 0}
+        <span class="pill cyan">{calls} call{calls === 1 ? '' : 's'}{#if hotLines > 0} · {hotLines} hot{/if}</span>
+      {/if}
+      <button type="button" class="iconbtn" aria-label="Copy the source" title="Copy the source" onclick={copyBody}>
+        <Icon name="copy" />
+      </button>
+    </div>
+  {/if}
+  <div class="lines">
   {#each chunks as chunk (chunk.lines[0]?.n ?? -1)}
     {#if chunk.gapBefore > 0}
       <div class="gap">⋯ {chunk.gapBefore} lines without calls</div>
@@ -123,11 +174,11 @@
                 role="link"
                 tabindex="0"
                 title={ref.title}
-                onclick={() => onfollow(ref)}
+                onclick={() => onfollow(ref, line.n)}
                 onkeydown={(e) => {
                   if (e.key === 'Enter' || e.key === ' ') {
                     e.preventDefault();
-                    onfollow(ref);
+                    onfollow(ref, line.n);
                   }
                 }}
                 onmouseenter={() => hot.set(ref.targetId)}
@@ -147,37 +198,96 @@
   {#if block.tailGap > 0}
     <div class="gap">⋯ {block.tailGap} more lines</div>
   {/if}
+  </div>
 </div>
 
 <style>
+  /* §7 code card: `card` + `line` + SH.card, r 12; a 40px header over a
+     `line-faint` rule; 20px lines from y 47; gutter 48 with the numbers
+     right-aligned in 34; the port column at the right edge. */
   .code {
-    margin-top: 16px;
-    padding-top: 6px;
-    border-top: 1px solid var(--rule);
-    font: var(--code-size) / var(--code-lh) var(--mono);
+    margin-top: 20px;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--card);
+    box-shadow: var(--sh-card);
+    font: var(--t-code);
+    font-variant-ligatures: none;
   }
 
-  /* 44px gutter | source | 18px port cell. The port lives in its own column
+  .ch {
+    display: flex;
+    height: 40px;
+    align-items: center;
+    gap: 10px;
+    padding: 0 8px 0 16px;
+    border-bottom: 1px solid var(--line-faint);
+  }
+
+  .fi {
+    display: inline-flex;
+    color: var(--fg-3);
+  }
+
+  .fname {
+    color: var(--fg);
+    font: var(--t-mono-500);
+  }
+
+  .range {
+    color: var(--fg-3);
+    font: var(--t-mono-sm);
+    white-space: nowrap;
+  }
+
+  .fname {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .sp {
+    flex: 1;
+  }
+
+  .lines {
+    padding: 7px 0 14px;
+  }
+
+  /* 48px gutter | source | 26px port cell. The port lives in its own column
      so a long line scrolling sideways never slides under it. */
   .ln {
     position: relative;
     display: grid;
-    grid-template-columns: 44px 1fr 18px;
+    grid-template-columns: 48px minmax(0, 1fr) 26px;
     align-items: stretch;
+    height: 20px;
   }
 
   .ln:hover {
-    background: var(--paper-2);
+    background: var(--raised);
   }
 
+  /* Hot: `primary-soft` across the card with a 2px GRAD.brand bar at x 0. */
   .ln.hot {
-    background: var(--accent-soft);
+    background: var(--primary-soft);
+  }
+
+  .ln.hot::before {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: 2px;
+    background: var(--grad-brand-v);
+    content: '';
   }
 
   .no {
-    padding-right: 12px;
-    color: var(--ink-4);
-    font-size: 11px;
+    padding-right: 14px;
+    color: var(--fg-4);
+    font: var(--t-lineno);
     text-align: right;
     user-select: none;
   }
@@ -196,87 +306,105 @@
     position: relative;
   }
 
+  /* §7 port: a 7px dot at card width − 18, centred on the line — `cyan`,
+     hollow when the line only holds guesses, glowing when hot. */
   .port i {
     position: absolute;
-    top: 7px;
-    right: 4px;
-    width: 6px;
-    height: 6px;
-    border: 1px solid var(--ink-3);
-    background: var(--paper);
+    top: 6.5px;
+    left: 8px;
+    width: 7px;
+    height: 7px;
+    border: 1px solid var(--cyan-line);
+    border-radius: 50%;
+    background: transparent;
   }
 
   .port i.sure {
-    background: var(--ink-3);
+    border-color: var(--cyan);
+    background: var(--cyan);
   }
 
   .ln.hot .port i {
-    border-color: var(--accent);
-    background: var(--accent);
+    border-color: var(--cyan);
+    background: var(--cyan);
+    box-shadow: var(--glow-cyan-90);
   }
 
   .gap {
-    margin: 2px 0;
-    padding: 2px 0 2px 44px;
-    border-top: 1px dashed var(--rule-soft);
-    border-bottom: 1px dashed var(--rule-soft);
-    color: var(--ink-4);
-    font-size: 11px;
+    margin: 4px 0;
+    padding: 2px 0 2px 48px;
+    border-top: 1px dashed var(--line);
+    border-bottom: 1px dashed var(--line);
+    color: var(--fg-4);
+    font: var(--t-caption);
   }
 
-  /* ---- token classes (near-monochrome by design, spec §2.2) ----
-     Comments use --code-comment rather than --ink-3: the spec's colour reads
-     at 3.46:1 on paper, under AA for 12.5px text. See app.css. */
+  /* ---- §3 syntax: keywords 500, comments AA on every surface code sits on */
   .t-c {
-    color: var(--code-comment);
+    color: var(--syn-com);
   }
 
   .t-s {
-    color: var(--ink-2);
+    color: var(--syn-str);
   }
 
   .t-k {
+    color: var(--syn-kw);
     font-weight: 500;
   }
 
   .t-n {
-    color: var(--ink-2);
+    color: var(--syn-num);
+  }
+
+  .t-t {
+    color: var(--syn-type);
+  }
+
+  .t-p {
+    color: var(--syn-punct);
   }
 
   .t-def {
+    color: var(--fg);
     font-weight: 600;
   }
 
-  /* The only colour in the body: a call site the graph resolved. */
+  /* §7 call capsule: `cyan-soft` at 85 % behind the callee's name, which
+     is `cyan`; on the hot line 100 % with a 1px `cyan-line` border. */
   .ref {
-    color: var(--accent);
+    margin: 0 -3px;
+    padding: 1px 3px;
+    border-radius: 5px;
+    background: color-mix(in srgb, var(--cyan-soft) 85%, transparent);
+    color: var(--cyan);
     cursor: pointer;
-    text-decoration: underline;
-    text-decoration-color: var(--accent-line);
-    text-underline-offset: 3px;
   }
 
   .ref:hover,
-  .ref.hot {
-    background: var(--accent-soft);
-    text-decoration-color: var(--accent);
+  .ref.hot,
+  .ln.hot .ref {
+    background: var(--cyan-soft);
+    box-shadow: inset 0 0 0 1px var(--cyan-line);
   }
 
   .ref.uncertain {
-    color: var(--ink-2);
-    text-decoration-style: dotted;
-    text-decoration-color: var(--ink-4);
+    background: transparent;
+    color: var(--fg-2);
+    text-decoration: underline dotted var(--fg-4);
+    text-underline-offset: 3px;
   }
 
   /* Outside the index: there is nothing to open, so it does not offer to. */
   .ref.stub {
-    color: var(--ink-2);
+    background: transparent;
+    color: var(--fg-2);
     cursor: default;
-    text-decoration-color: var(--rule-soft);
+    text-decoration: underline dotted var(--line-strong);
+    text-underline-offset: 3px;
   }
 
   .ref.stub:hover {
-    background: none;
-    text-decoration-color: var(--rule-soft);
+    box-shadow: none;
   }
 </style>

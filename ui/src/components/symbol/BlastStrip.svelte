@@ -35,34 +35,43 @@
 
 <div class="blast">
   <div class="bh">
-    <b>Blast radius</b>
-    <span class="stat"><strong>{blast.direct}</strong> direct dependent{blast.direct === 1 ? '' : 's'}</span>
-    <span class="stat"><strong>{blast.withinHops}</strong> within {blast.hops} hops</span>
-    <span class="stat"><strong>{blast.files}</strong> file{blast.files === 1 ? '' : 's'}</span>
-    <span class="stat"><strong>{blast.testFiles}</strong> test file{blast.testFiles === 1 ? '' : 's'}</span>
-    {#if blast.routes > 0}
-      <span class="stat"><strong>{blast.routes}</strong> route{blast.routes === 1 ? '' : 's'}</span>
-    {/if}
+    <span class="micro">Blast radius</span>
+    <span
+      class="scale"
+      title={scale?.estimated
+        ? `Scaled to the widest radius in the index, measured across its ${scale.sampled} most-depended-on symbols.`
+        : 'Scaled to the widest radius in the index.'}>vs widest {maxWithin.toLocaleString()}</span
+    >
   </div>
 
-  <div
-    class="bar"
-    title={`Scaled to the widest radius in the index: ${maxWithin} symbols within ${blast.hops} hops.`}
-  >
-    <i style:width={`${share(blast.withinHops, maxWithin)}%`}></i>
-    <i class="direct" style:width={`${share(blast.direct, maxDirect)}%`}></i>
+  <div class="tiles">
+    <div class="stat" title="Symbols that depend on this one directly">
+      <span class="label">Direct</span>
+      <span class="value">{blast.direct.toLocaleString()}</span>
+      <span class="bar"><i style:width={`${share(blast.direct, maxDirect)}%`}></i></span>
+    </div>
+    <div class="stat" title={`Symbols within ${blast.hops} hops`}>
+      <span class="label">≤ {blast.hops} hops</span>
+      <span class="value">{blast.withinHops.toLocaleString()}</span>
+      <span class="bar"><i style:width={`${share(blast.withinHops, maxWithin)}%`}></i></span>
+    </div>
+    <div class="stat" title="Production files that would need re-checking">
+      <span class="label">Prod files</span>
+      <span class="value">{Math.max(0, blast.files - blast.testFiles).toLocaleString()}</span>
+    </div>
+    <div class="stat" title="Test files that would catch a regression">
+      <span class="label">Test files</span>
+      <span class="value">{blast.testFiles.toLocaleString()}</span>
+      <span class="bar green"><i style:width={`${share(blast.testFiles, Math.max(1, blast.files))}%`}></i></span>
+    </div>
   </div>
-
-  <div class="legend">
-    dark: direct dependents · light: within {blast.hops} hops — scaled to the widest radius in the
-    index{#if scale?.estimated}{' '}<span class="dim"
-        >(measured across its {scale.sampled} most-depended-on symbols)</span
-      >{/if}
-  </div>
+  {#if blast.routes > 0}
+    <div class="routes">{plural(blast.routes, 'route')} within reach</div>
+  {/if}
 
   {#if blast.topFiles.length > 0}
     <details>
-      <summary>What would need re-checking if this changed</summary>
+      <summary>What would need re-checking</summary>
       <div class="body">
         {#each blast.topFiles as entry (entry.file)}
           <div class="fp">
@@ -85,70 +94,42 @@
 </div>
 
 <style>
-  .blast {
-    margin-top: 22px;
-    padding-top: 10px;
-    border-top: 1px solid var(--rule);
-  }
-
   .bh {
     display: flex;
-    flex-wrap: wrap;
     align-items: baseline;
-    gap: 6px 14px;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 10px;
   }
 
-  .bh b {
-    font-weight: 600;
+  .scale {
+    color: var(--fg-3);
+    font: var(--t-caption);
   }
 
-  .stat {
-    color: var(--ink-2);
-    font-size: 12.5px;
+  .tiles {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
   }
 
-  .stat strong {
-    color: var(--ink);
-    font-weight: 600;
-    font-variant-numeric: tabular-nums;
-  }
-
-  .bar {
-    position: relative;
-    max-width: 420px;
-    height: 6px;
+  .routes {
     margin-top: 8px;
-    background: var(--press);
-  }
-
-  .bar i {
-    position: absolute;
-    top: 0;
-    bottom: 0;
-    left: 0;
-    background: var(--ink-2);
-  }
-
-  /* Drawn second so the shorter, darker "direct" share sits over the lighter
-     "within N hops" one rather than beside it — they are nested quantities. */
-  .bar i.direct {
-    background: var(--ink);
-  }
-
-  .legend {
-    margin-top: 4px;
-    color: var(--ink-3);
-    font-size: 11.5px;
+    color: var(--fg-3);
+    font: var(--t-caption);
   }
 
   details {
-    margin-top: 8px;
+    margin-top: 10px;
   }
 
   summary {
-    color: var(--ink-2);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--fg-2);
     cursor: pointer;
-    font-size: 12px;
+    font: var(--t-small);
     list-style: none;
   }
 
@@ -157,13 +138,14 @@
   }
 
   summary::before {
-    content: '+ ';
-    color: var(--ink-3);
+    width: 10px;
+    color: var(--fg-3);
+    content: '+';
     font-family: var(--mono);
   }
 
   details[open] summary::before {
-    content: '− ';
+    content: '−';
   }
 
   .body {
@@ -175,28 +157,34 @@
     justify-content: space-between;
     gap: 10px;
     padding: 2px 0;
-    color: var(--ink-2);
-    font: 11px var(--mono);
+    color: var(--fg-2);
+    font: var(--t-mono-sm);
+  }
+
+  .fp a {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .fp a:hover {
-    color: var(--ink);
+    color: var(--fg);
     text-decoration: underline;
   }
 
   .fp a.test {
-    color: var(--ink-3);
+    color: var(--fg-3);
   }
 
   .fp b {
-    color: var(--ink);
+    color: var(--fg);
     font-weight: 500;
     font-variant-numeric: tabular-nums;
   }
 
   .note {
     padding-top: 6px;
-    color: var(--ink-3);
-    font-size: 11.5px;
+    color: var(--fg-3);
+    font: var(--t-caption);
   }
 </style>

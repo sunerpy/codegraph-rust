@@ -17,6 +17,7 @@
   the pointer means the line NEAREST it, not the one drawn last under it.
 -->
 <script lang="ts">
+  import Icon from '../components/Icon.svelte';
   import { SvelteFlow, Controls, type Node, type Edge, type Viewport } from '@xyflow/svelte';
   import '@xyflow/svelte/dist/style.css';
   import ScreenNode from '../components/screens/ScreenNode.svelte';
@@ -292,6 +293,7 @@
   <div class="stage" bind:this={stage} role="presentation" onmousemove={onStageMove} onmouseleave={() => (hovered = null)}>
     {#if error !== null}
       <div class="state">
+        <span class="stile"><Icon name="monitor-smartphone" size={20} /></span>
         <h2>The screens could not be read</h2>
         <p>{error}</p>
       </div>
@@ -299,6 +301,7 @@
       <div class="state"><p class="dim">Reading screens and transitions…</p></div>
     {:else if payload !== null && !payload.routed}
       <div class="state">
+        <span class="stile"><Icon name="monitor-smartphone" size={20} /></span>
         <h2>No screen navigation in this graph</h2>
         <p>
           This view draws the routes a UI framework binds to components and the navigation calls
@@ -526,19 +529,27 @@
 </div>
 
 <style>
+  /* §8 D-08 / D-09: the canvas island | the inspector 320, 8 apart. */
   .screens {
     display: grid;
-    grid-template-columns: minmax(600px, 1fr) 340px;
+    grid-template-columns: minmax(0, 1fr) 320px;
+    gap: var(--gap);
     height: 100%;
     min-height: 0;
+  }
+  /* Nothing to inspect yet (the empty states): the canvas takes the width. */
+  .screens:not(:has(.side)) {
+    grid-template-columns: minmax(0, 1fr);
   }
   .stage {
     position: relative;
     overflow: hidden;
-    background: var(--paper);
+    border: 1px solid var(--line-faint);
+    border-radius: var(--island-r);
+    background: var(--canvas);
   }
   .stage :global(.svelte-flow) {
-    background: var(--paper);
+    background: transparent;
   }
   .stage :global(.svelte-flow__handle) {
     opacity: 0;
@@ -554,49 +565,76 @@
   .stage :global(.svelte-flow__edge-labels) {
     pointer-events: none;
   }
+  .stage :global(.svelte-flow__controls) {
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    box-shadow: var(--sh-pop);
+  }
   .stage :global(.svelte-flow__controls-button) {
-    background: var(--paper);
     border: 0;
-    border-bottom: 1px solid var(--rule-soft);
-    border-radius: 0;
-    color: var(--ink-2);
+    border-bottom: 1px solid var(--line);
+    background: var(--overlay);
+    color: var(--fg-2);
   }
   .stage :global(.svelte-flow__controls-button svg) {
-    fill: var(--ink-2);
+    fill: var(--fg-2);
   }
+  /* The empty and not-yet-drawn states: a D card on the canvas (§9). */
   .state {
-    padding: 48px 40px;
-    max-width: 560px;
+    max-width: 600px;
+    margin: 32px;
+    padding: 22px 24px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--card);
+    box-shadow: var(--sh-card);
+    color: var(--fg-2);
+    font: var(--t-body);
   }
   .state h2 {
-    font: 600 20px var(--sans);
-    margin: 0 0 8px;
+    margin: 12px 0 8px;
+    color: var(--fg);
+    font: var(--t-h2);
+  }
+  .stile {
+    display: inline-flex;
+    width: 40px;
+    height: 40px;
+    align-items: center;
+    justify-content: center;
+    border-radius: 12px;
+    background: var(--primary-soft);
+    color: var(--primary-ink);
   }
   .legend {
     position: absolute;
-    left: 12px;
-    bottom: 12px;
+    bottom: 16px;
+    left: 16px;
     z-index: 4;
     max-width: 380px;
-    border: 1px solid var(--rule);
-    background: var(--paper);
-    font-size: 11.5px;
-    color: var(--ink-2);
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--overlay);
+    box-shadow: var(--sh-pop);
+    color: var(--fg-2);
+    font: var(--t-caption);
   }
   .legend-h {
     display: block;
     width: 100%;
+    padding: 8px 12px;
     border: 0;
     background: transparent;
-    padding: 5px 10px;
-    text-align: left;
-    color: var(--ink);
-    font: 600 12px var(--sans);
+    color: var(--fg);
     cursor: pointer;
+    font: var(--t-small-500);
+    text-align: left;
   }
   .legend-body {
-    padding: 2px 10px 8px;
-    border-top: 1px solid var(--rule-soft);
+    padding: 4px 12px 10px;
+    border-top: 1px solid var(--line-faint);
   }
   .lrow {
     display: flex;
@@ -653,11 +691,13 @@
     position: absolute;
     z-index: 5;
     width: 340px;
-    padding: 8px 10px;
-    border: 1px solid var(--ink);
-    background: var(--paper);
-    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
-    font-size: 12px;
+    padding: 10px 12px;
+    border: 1px solid var(--line-strong);
+    border-radius: 10px;
+    background: var(--overlay);
+    box-shadow: var(--sh-pop);
+    color: var(--fg-2);
+    font: var(--t-small);
     pointer-events: none;
     /* A long via chain or condition wraps inside the box. */
     overflow-wrap: anywhere;
@@ -671,10 +711,13 @@
     border-top: 1px solid var(--rule-soft);
   }
   .side {
-    border-left: 1px solid var(--rule);
-    padding: 14px 16px;
+    padding: 16px;
     overflow: auto;
-    font-size: 12.5px;
+    border: 1px solid var(--line-faint);
+    border-radius: var(--island-r);
+    background: var(--panel);
+    color: var(--fg-2);
+    font: var(--t-small);
   }
   .head {
     display: flex;
@@ -786,5 +829,14 @@
   }
   .mark {
     color: var(--accent);
+  }
+  @media (max-width: 1023px) {
+    .screens {
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: minmax(0, 1fr) auto;
+    }
+    .side {
+      max-height: 40vh;
+    }
   }
 </style>

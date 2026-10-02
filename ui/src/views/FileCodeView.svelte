@@ -30,6 +30,8 @@
   import FileCodeRail from '../components/file/FileCodeRail.svelte';
   import FileModeTabs from '../components/file/FileModeTabs.svelte';
   import KindGlyph from '../components/KindGlyph.svelte';
+  import Icon from '../components/Icon.svelte';
+  import ErrorCard from '../components/ErrorCard.svelte';
   import DriftBanner from '../components/DriftBanner.svelte';
   import {
     ApiFailure,
@@ -425,22 +427,21 @@
 </script>
 
 {#if failure}
-  <div class="scroll">
-    <div class="emptystate">
-      <h2>{failure.code === 'not-found' ? 'Not in the index' : 'Could not load this file'}</h2>
-      <p class="mono">{path}</p>
-      <p>{failure.message}</p>
-      {#if failure.guidance}<p class="dim">{failure.guidance}</p>{/if}
-    </div>
+  <div class="scroll island">
+    <ErrorCard
+      title={failure.code === 'not-found' ? 'Not in the index' : 'Could not load this file'}
+      message={`${path} — ${failure.message}`}
+      guidance={failure.guidance}
+    />
   </div>
 {:else if loading || !payload}
-  <div class="scroll">
-    <div class="emptystate"><p class="dim">Loading…</p></div>
+  <div class="scroll island">
+    <div class="loadingrow"><span class="pill"><Icon name="refresh-cw" size={14} />Reading the file from the index…</span></div>
   </div>
 {:else}
   <div class="codeview" class:wide={outlineRows.length > 0}>
     {#if outlineRows.length > 0}
-      <aside class="nav">
+      <aside class="nav island">
         <FileCodeOutline
           rows={outlineRows}
           total={payload.outline.total}
@@ -454,10 +455,10 @@
       </aside>
     {/if}
 
-    <section class="main">
+    <section class="main island">
       <header class="band">
         <div class="card-h">
-          <KindGlyph kind="file" />
+          <KindGlyph kind="file" size={26} />
           <h1>{basename(payload.file.path)}</h1>
           <span class="kindword">
             {payload.file.language} · {formatBytes(payload.file.size)} ·
@@ -568,8 +569,13 @@
   .codeview {
     display: grid;
     grid-template-columns: minmax(0, 1fr);
+    gap: var(--gap);
     height: 100%;
     min-height: 0;
+  }
+
+  .loadingrow {
+    padding: 24px;
   }
 
   /* The navigation rail is a luxury, not the screen: below 1400px the code and
@@ -601,22 +607,22 @@
   /* Outside the scroller on purpose: a header inside it would put every line at
      `headerHeight + (n - 1) * 20`, and the header's height is a measurement. */
   .band {
-    padding: 14px 22px 8px;
-    border-bottom: 1px solid var(--rule);
-    background: var(--paper);
+    padding: 16px 22px 10px;
+    border-bottom: 1px solid var(--line-faint);
+    background: var(--panel);
   }
 
   .card-h {
     display: flex;
     flex-wrap: wrap;
-    align-items: baseline;
+    align-items: center;
     gap: 6px 12px;
   }
 
   .card-h h1 {
     margin: 0;
-    font: 600 20px/1.2 var(--mono);
-    letter-spacing: -0.01em;
+    color: var(--fg);
+    font: var(--t-title-mono);
   }
 
   .spacer {
@@ -624,26 +630,26 @@
   }
 
   .kindword {
-    color: var(--ink-3);
-    font-size: 12.5px;
+    color: var(--fg-3);
+    font: var(--t-small);
   }
 
   .loc {
-    color: var(--ink-2);
-    font: 11.5px var(--mono);
+    color: var(--fg-2);
+    font: var(--t-mono-sm);
   }
 
   .toolbar {
     display: flex;
     justify-content: space-between;
     gap: 16px;
-    margin-top: 8px;
-    color: var(--ink-2);
-    font-size: 11.5px;
+    margin-top: 10px;
+    color: var(--fg-2);
+    font: var(--t-caption);
   }
 
   .railnote .n {
-    color: var(--ink-3);
+    color: var(--fg-3);
   }
 
   .arcnote,
@@ -659,8 +665,8 @@
 
   .note {
     margin-top: 10px;
-    color: var(--ink-3);
-    font-size: 12.5px;
+    color: var(--fg-3);
+    font: var(--t-small);
     line-height: 1.5;
   }
 
@@ -685,7 +691,7 @@
 
   .arccol {
     position: relative;
-    border-right: 1px solid var(--rule-faint);
+    border-right: 1px solid var(--line-faint);
   }
 
   .codecol {
@@ -696,7 +702,7 @@
 
   .rail {
     position: relative;
-    border-left: 1px solid var(--rule-faint);
+    border-left: 1px solid var(--line-faint);
   }
 
   @media (max-width: 1100px) {

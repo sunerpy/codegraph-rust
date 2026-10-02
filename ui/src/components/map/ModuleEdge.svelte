@@ -49,20 +49,25 @@
 />
 
 <style>
+  /* §8 D-05 edges: `line-strong` at 70 % (35 % while a selection exists);
+     touching the selection `cyan` with the 55 % glow; pointing back up
+     `violet` dashed 4 3. Width comes from the model (volume). */
   :global(.svelte-flow__edge-path.medge) {
-    stroke: var(--ink);
-    stroke-opacity: 0.28;
+    stroke: var(--line-strong);
+    stroke-opacity: 0.7;
     fill: none;
   }
   :global(.svelte-flow__edge-path.medge.hot) {
-    stroke-opacity: 0.95;
+    stroke: var(--cyan);
+    stroke-opacity: 1;
+    filter: var(--glow-cyan-55-f);
   }
   :global(.svelte-flow__edge-path.medge.dimmed) {
-    stroke-opacity: 0.06;
+    stroke-opacity: 0.35;
   }
   :global(.svelte-flow__edge-path.medge.back) {
-    stroke: var(--accent);
-    stroke-opacity: 0.6;
+    stroke: var(--violet);
+    stroke-opacity: 0.8;
     stroke-dasharray: 4 3;
   }
   .hit {

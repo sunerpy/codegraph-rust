@@ -16,6 +16,7 @@
   synthesized hop.
 -->
 <script lang="ts">
+  import Icon from '../Icon.svelte';
   import KindGlyph from '../KindGlyph.svelte';
   import type { WireHierarchy, WireNodeDetail, WireNodeRef } from '../../lib/api';
   import {
@@ -23,6 +24,7 @@
     connectorPath,
     visibleHierarchy,
     HIER_ROW_H,
+    HIER_TILE,
   } from '../../lib/hierarchy-model';
 
   interface Props {
@@ -65,106 +67,125 @@
   }
 </script>
 
-<div class="subh">
-  <span>Type hierarchy</span>
-  <span class="n">{counts}</span>
-  <span class="hint">supertypes above · subtypes below</span>
-</div>
-
 {#if model.headline}
-  <p class="headline">{model.headline}</p>
+  <!-- §8 D-06: the one claim the rows cannot make for themselves. -->
+  <p class="callout violet headline"><span class="zap"><Icon name="zap" /></span>{model.headline}</p>
 {/if}
 
-<div class="tree">
- <div class="canvas" style:height={`${view.height}px`}>
-  <svg class="wires" width="100%" height={view.height} aria-hidden="true">
-    {#each view.connectors as c, i (i)}
-      <path
-        d={connectorPath(c)}
-        class:dashed={c.relation === 'implements'}
-        class:synth={c.synthesized}
-      />
+<div class="hcard">
+  <div class="subh">
+    <span class="lead"><Icon name="list-tree" /></span>
+    <span>Type hierarchy</span>
+    {#if counts}<span class="n">{counts}</span>{/if}
+    <span class="hint">supertypes above · subtypes below</span>
+  </div>
+
+  <div class="tree">
+   <div class="canvas" style:height={`${view.height}px`}>
+    <svg class="wires" width="100%" height={view.height} aria-hidden="true">
+      {#each view.connectors as c, i (i)}
+        <path
+          d={connectorPath(c)}
+          class:dashed={c.relation === 'implements'}
+          class:synth={c.synthesized}
+        />
+      {/each}
+    </svg>
+
+    {#each view.rows as row (row.node.id + row.side)}
+      {#if row.side === 'focus'}
+        <div
+          class="row focus"
+          style:top={`${row.index * HIER_ROW_H}px`}
+          style:padding-left={`${row.indent + 18}px`}
+        >
+          <span class="focustile"><KindGlyph kind={row.node.kind} size={HIER_TILE} /></span>
+          <span class="nm">{row.node.name}</span>
+        </div>
+      {:else}
+        <button
+          type="button"
+          class="row"
+          style:top={`${row.index * HIER_ROW_H}px`}
+          style:padding-left={`${row.indent + 18}px`}
+          onclick={() => onopen(row.node)}
+          title={title(row)}
+        >
+          <KindGlyph kind={row.node.kind} size={HIER_TILE} />
+          <span class="nm">{row.node.name}</span>
+          <span class="word">{row.word} · {row.node.file === focus.file ? 'same file' : row.node.file.slice(row.node.file.lastIndexOf('/') + 1)}</span>
+          {#if row.entry?.synthesized}
+            <span class="pill mono" title={row.entry.registeredAt ?? ''}>
+              via {row.entry.via ?? 'resolver'}
+            </span>
+          {/if}
+          {#if row.entry && row.entry.hiddenSubtypes > 0}
+            <span class="pill mono">+{row.entry.hiddenSubtypes} below</span>
+          {/if}
+        </button>
+      {/if}
     {/each}
-  </svg>
+   </div>
+  </div>
 
-  {#each view.rows as row (row.node.id + row.side)}
-    {#if row.side === 'focus'}
-      <div
-        class="row focus"
-        style:top={`${row.index * HIER_ROW_H}px`}
-        style:padding-left={`${row.indent + 18}px`}
-      >
-        <KindGlyph kind={row.node.kind} />
-        <span class="nm">{row.node.name}</span>
-      </div>
-    {:else}
-      <button
-        type="button"
-        class="row"
-        style:top={`${row.index * HIER_ROW_H}px`}
-        style:padding-left={`${row.indent + 18}px`}
-        onclick={() => onopen(row.node)}
-        title={title(row)}
-      >
-        <KindGlyph kind={row.node.kind} />
-        <span class="nm">{row.node.name}</span>
-        <span class="word">{row.word}</span>
-        {#if row.entry?.synthesized}
-          <span class="pill" title={row.entry.registeredAt ?? ''}>
-            via {row.entry.via ?? 'resolver'}
-          </span>
-        {/if}
-        {#if row.entry && row.entry.hiddenSubtypes > 0}
-          <span class="pill">+{row.entry.hiddenSubtypes} below</span>
-        {/if}
-        <span class="file">{row.node.file === focus.file ? 'same file' : row.node.file}</span>
-      </button>
-    {/if}
-  {/each}
- </div>
+  {#if model.foldFrom !== null}
+    <button type="button" class="btn secondary fold" onclick={() => (expanded = !expanded)}>
+      <Icon name={expanded ? 'minus' : 'plus'} />{expanded ? 'Fold' : `+${model.foldCount} more ${model.foldNoun}`}
+    </button>
+  {/if}
+
+  {#if model.note}
+    <div class="note">{model.note}</div>
+  {/if}
 </div>
-
-{#if model.foldFrom !== null}
-  <button type="button" class="fold" onclick={() => (expanded = !expanded)}>
-    {expanded ? 'Fold' : `+${model.foldCount} more ${model.foldNoun}`}
-  </button>
-{/if}
-
-{#if model.note}
-  <div class="note">{model.note}</div>
-{/if}
 
 <style>
+  .headline {
+    margin: 20px 0 0;
+    font: var(--t-body);
+  }
+
+  .zap {
+    display: inline-flex;
+    color: var(--violet);
+  }
+
+  /* §8 D-06 hierarchy card: rows 26 high, 28 per level, tiles 20; guides
+     `line-strong` 1.2 — solid for extends, dashed 4 3 for implements. */
+  .hcard {
+    margin-top: 16px;
+    padding: 0 16px 14px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--card);
+  }
+
   .subh {
     display: flex;
-    align-items: baseline;
+    align-items: center;
     gap: 8px;
-    margin: 18px 0 4px;
-    font-weight: 600;
-    font-size: 13px;
+    height: 48px;
+    font: var(--t-label);
+  }
+
+  .subh .lead {
+    display: inline-flex;
+    color: var(--fg-3);
   }
 
   .subh .n {
-    color: var(--ink-3);
-    font-weight: 400;
+    color: var(--fg-3);
+    font: var(--t-caption);
   }
 
   .subh .hint {
     margin-left: auto;
-    color: var(--ink-3);
-    font-size: 11.5px;
-    font-weight: 400;
-  }
-
-  .headline {
-    margin: 0 0 6px;
-    color: var(--ink-2);
-    font-size: 12px;
+    color: var(--fg-3);
+    font: var(--t-caption);
   }
 
   .tree {
-    border-top: 1px solid var(--rule);
-    padding-top: 6px;
+    padding-top: 2px;
   }
 
   /* The one positioned box: rows and wires share its origin, so a row's y and
@@ -183,8 +204,8 @@
 
   .wires path {
     fill: none;
-    stroke: var(--ink-4);
-    stroke-width: 1;
+    stroke: var(--line-strong);
+    stroke-width: 1.2;
   }
 
   .wires path.dashed {
@@ -192,7 +213,7 @@
   }
 
   .wires path.synth {
-    stroke: var(--ink-3);
+    stroke: var(--fg-3);
     stroke-dasharray: 6 3;
   }
 
@@ -203,69 +224,55 @@
     left: 0;
     display: flex;
     align-items: center;
-    gap: 8px;
-    height: 24px;
-    padding-right: 4px;
-    border: 1px solid transparent;
+    gap: 10px;
+    height: 26px;
+    padding-right: 6px;
+    border-radius: 6px;
     text-align: left;
   }
 
   button.row:hover {
-    background: var(--press);
+    background: var(--raised);
   }
 
   .nm {
-    font: 12.5px var(--mono);
+    color: var(--fg);
+    font: var(--t-mono);
     white-space: nowrap;
-  }
-
-  .row.focus {
-    color: var(--accent);
   }
 
   .row.focus .nm {
-    font-weight: 600;
+    color: var(--primary-ink);
+    font: var(--t-mono-500);
+  }
+
+  .focustile {
+    display: inline-flex;
+    border-radius: 6px;
+    box-shadow: var(--glow-50);
   }
 
   .word {
-    color: var(--ink-3);
-    font-size: 11px;
-    white-space: nowrap;
-  }
-
-  .pill {
-    padding: 0 4px;
-    border: 1px solid var(--rule-soft);
-    color: var(--ink-3);
-    font: 10.5px var(--mono);
-    white-space: nowrap;
-  }
-
-  .file {
     overflow: hidden;
-    margin-left: auto;
-    padding-left: 10px;
-    color: var(--ink-3);
-    font: 11px var(--mono);
+    color: var(--fg-3);
+    font: var(--t-caption);
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
-  .fold {
-    margin-top: 6px;
-    padding: 3px 8px;
-    border: 1px solid var(--rule-soft);
-    color: var(--ink-2);
-    font-size: 11.5px;
+  .row .pill {
+    height: 18px;
+    padding: 0 7px;
   }
 
-  .fold:hover {
-    background: var(--press);
+  .fold {
+    height: 28px;
+    margin: 10px 0 0 34px;
   }
 
   .note {
-    padding: 8px 0;
-    color: var(--ink-3);
-    font-size: 11.5px;
+    padding: 10px 0 0;
+    color: var(--fg-3);
+    font: var(--t-caption);
   }
 </style>

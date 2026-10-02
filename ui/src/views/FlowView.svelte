@@ -14,12 +14,15 @@
   path so far, so the strip hands the reader off to the view that goes deep.
 -->
 <script lang="ts">
+  import { effectiveTheme, theme } from '../lib/theme-choice.svelte';
   import { SvelteFlow, Controls, type Node, type Edge } from '@xyflow/svelte';
   import '@xyflow/svelte/dist/style.css';
   import FlowCard from '../components/flow/FlowCard.svelte';
   import FlowLink from '../components/flow/FlowLink.svelte';
   import FlowEndCap from '../components/flow/FlowEndCap.svelte';
   import ExportButtons from '../components/ExportButtons.svelte';
+  import Icon from '../components/Icon.svelte';
+  import KindGlyph from '../components/KindGlyph.svelte';
   import { exportFilename, flowSvg } from '../lib/export-svg';
   import { fetchFlow, type WireFlow, type WireFlowPayload } from '../lib/api';
   import { live } from '../lib/live.svelte';
@@ -239,11 +242,63 @@
       : (activeFlow?.label ?? 'flow')
   );
 
+  /**
+   * The "Every hop" table (§8 D-04): one row per call on the path — who calls
+   * whom, under what condition (phase 2 ports the conditions; until then the
+   * column reads "—"), at which line, and how sure the graph is.
+   */
+  const hopRows = $derived.by(() => {
+    const hops = activeFlow?.hops ?? [];
+    const rows: Array<{
+      step: number;
+      from: (typeof hops)[number];
+      to: (typeof hops)[number];
+      when: string | null;
+      site: string;
+      line: number | null;
+      confidence: number | null;
+      resolvedBy: string | null;
+      label: string;
+    }> = [];
+    for (let i = 1; i < hops.length; i++) {
+      const fromHop = hops[i - 1];
+      const toHop = hops[i];
+      if (!fromHop || !toHop) continue;
+      const edge = toHop.edge;
+      // An upward hop is read callee → caller: the call site is in the hop
+      // it arrives at, not the one it leaves.
+      const caller = edge?.upward ? toHop : fromHop;
+      const line = edge?.line ?? toHop.callRef?.line ?? fromHop.callRef?.line ?? null;
+      rows.push({
+        step: i,
+        from: fromHop,
+        to: toHop,
+        when: edge?.when ?? null,
+        site: `${basename(caller.node.file)}${line !== null ? `:${line}` : ''}`,
+        line,
+        confidence: edge?.confidence ?? null,
+        resolvedBy: edge?.resolvedBy ?? edge?.synthesizedBy ?? null,
+        label: edge?.label ?? 'calls',
+      });
+    }
+    return rows;
+  });
+
+  const callCount = $derived(hopRows.length);
+
+  function openSite(row: (typeof hopRows)[number]): void {
+    const caller = row.to.edge?.upward ? row.to : row.from;
+    trail.clear();
+    navigate(symbolHref(caller.node.id, row.line !== null ? { line: row.line } : {}));
+  }
+
   function buildSvg(scale: number): string {
     if (layout === null) throw new Error('There is no strip to export yet.');
     const hops = activeFlow?.hops.length ?? 0;
     return flowSvg(layout, {
       scale,
+      // The theme on screen, System resolved (§3.6).
+      theme: effectiveTheme(theme.choice),
       activeFlowId: picked,
       showAll,
       caption: showAll ? exportLabel : `${exportLabel}${hops > 1 ? ` · ${hops} hops` : ''}`,
@@ -252,44 +307,54 @@
 </script>
 
 <div class="flowview">
-  <header class="fhead">
-    <h1>Flow</h1>
+  <header class="fhead island">
+    <span class="ftile"><Icon name="workflow" /></span>
+    <div class="ftitle">
+      <h1>Flow</h1>
+      <span class="sub">how one symbol reaches another, opened at each call</span>
+    </div>
     {#if flows.length > 0}
-      <select
-        aria-label="Which path to draw"
-        value={showAll ? ALL : (picked ?? '')}
-        onchange={(event) => {
-          const value = (event.currentTarget as HTMLSelectElement).value;
-          showAll = value === ALL;
-          if (!showAll) picked = value;
-        }}
-      >
-        {#each flows as flow (flow.id)}
-          <option value={flow.id}
-            >{flow.label}{flow.hops.length > 1 ? ` · ${flow.hops.length} hops` : ''}</option
-          >
-        {/each}
-        {#if flows.length > 1}
-          <option value={ALL}>All {flows.length} paths</option>
-        {/if}
-      </select>
+      <label class="route">
+        <span class="sr">Which path to draw</span>
+        <select
+          aria-label="Which path to draw"
+          value={showAll ? ALL : (picked ?? '')}
+          onchange={(event) => {
+            const value = (event.currentTarget as HTMLSelectElement).value;
+            showAll = value === ALL;
+            if (!showAll) picked = value;
+          }}
+        >
+          {#each flows as flow (flow.id)}
+            <option value={flow.id}
+              >{flow.label}{flow.hops.length > 1 ? ` · ${flow.hops.length} hops` : ''}</option
+            >
+          {/each}
+          {#if flows.length > 1}
+            <option value={ALL}>All {flows.length} paths</option>
+          {/if}
+        </select>
+        <span class="chev"><Icon name="chevron-down" size={14} /></span>
+      </label>
     {/if}
-    {#if payload}
-      <p class="note">{note(payload)}</p>
+    {#if activeFlow && layout !== null}
+      <span class="pill">{activeFlow.hops.length} symbol{activeFlow.hops.length === 1 ? '' : 's'}</span>
+      {#if callCount > 0}<span class="pill cyan"><Icon name="arrow-right" size={14} />{callCount} call{callCount === 1 ? '' : 's'}</span>{/if}
     {/if}
+    <span class="sp"></span>
     {#if layout !== null}
       <ExportButtons build={buildSvg} filename={exportFilename('flow', exportLabel)} />
     {/if}
   </header>
 
-  <div class="fstage">
+  <div class="fstage island">
     {#if error !== null}
       <div class="state">
         <h2>The flow could not be built</h2>
         <p>{error}</p>
       </div>
     {:else if loading && payload === null}
-      <div class="state"><p class="dim">Following the calls…</p></div>
+      <div class="state"><span class="pill"><Icon name="refresh-cw" size={14} />Following the calls…</span></div>
     {:else if payload === null}
       <div class="state">
         <h2>Nothing to follow yet</h2>
@@ -327,80 +392,174 @@
       >
         <Controls position="bottom-right" showLock={false} />
       </SvelteFlow>
+      <p class="legend">{note(payload)}</p>
     {/if}
   </div>
 
-  {#if payload && (payload.reason !== null || payload.ambiguous.length > 0 || payload.unresolved.length > 0) && layout !== null}
-    <footer class="fnote">
-      {#if payload.reason !== null}
-        <p>{payload.reason}</p>
-      {/if}
-      {#each payload.ambiguous as amb (amb.token)}
-        <p>
-          <span class="mono">{amb.token}</span> names {amb.others.length + 1} definitions.
-          {#if amb.chosen}
-            This path runs through the one in
-            <span class="mono">{basename(amb.chosen.file)}:{amb.chosen.line}</span>.
-          {:else}
-            None of them are on this path.
+  {#if payload && layout !== null && (hopRows.length > 0 || payload.reason !== null || payload.ambiguous.length > 0 || payload.unresolved.length > 0)}
+    <section class="hops island" aria-label="Every hop">
+      <div class="hh">
+        <span class="title">Every hop</span>
+        <span class="dim">the calls on this path, in order · conditions arrive with the branch-guard port</span>
+      </div>
+      {#if payload.reason !== null || payload.ambiguous.length > 0 || payload.unresolved.length > 0}
+        <div class="fnote">
+          {#if payload.reason !== null}
+            <p class="callout"><Icon name="info" />{payload.reason}</p>
           {/if}
-        </p>
-      {/each}
-      {#each payload.unresolved as token (token)}
-        <p><span class="mono">{token}</span> names nothing in this index.</p>
-      {/each}
-    </footer>
+          {#each payload.ambiguous as amb (amb.token)}
+            <p class="callout">
+              <Icon name="circle-alert" /><span><span class="mono">{amb.token}</span> names {amb.others.length + 1} definitions.
+              {#if amb.chosen}
+                This path runs through the one in
+                <span class="mono">{basename(amb.chosen.file)}:{amb.chosen.line}</span>.
+              {:else}
+                None of them are on this path.
+              {/if}</span>
+            </p>
+          {/each}
+          {#each payload.unresolved as token (token)}
+            <p class="callout"><Icon name="circle-dashed" /><span><span class="mono">{token}</span> names nothing in this index.</span></p>
+          {/each}
+        </div>
+      {/if}
+      {#if hopRows.length > 0}
+        <div class="table" role="table">
+          <div class="tr th" role="row">
+            <span role="columnheader">#</span>
+            <span role="columnheader">Call</span>
+            <span class="when" role="columnheader">Runs when</span>
+            <span role="columnheader">Site</span>
+            <span class="conf" role="columnheader">Confidence</span>
+          </div>
+          {#each hopRows as row (row.step)}
+            <button type="button" class="tr" role="row" onclick={() => openSite(row)} title={`Open ${row.site}`}>
+              <span class="badge" role="cell">{row.step}</span>
+              <span class="call" role="cell">
+                <KindGlyph kind={row.from.node.kind} />
+                <span class="nm">{row.from.node.name}</span>
+                <span class="arrow"><Icon name={row.to.edge?.upward ? 'corner-left-up' : 'arrow-right'} size={14} /></span>
+                <KindGlyph kind={row.to.node.kind} />
+                <span class="nm">{row.to.node.name}</span>
+              </span>
+              <span class="when" role="cell">
+                {#if row.when}<span class="pill amber mono"><Icon name="route" size={14} />when {row.when}</span>{:else}<span class="dim">—</span>{/if}
+              </span>
+              <span class="site mono" role="cell">{row.site}</span>
+              <span class="conf" role="cell">
+                {#if row.confidence !== null}
+                  <span class="bar"><i style:width={`${Math.round(row.confidence * 100)}%`}></i></span>
+                  <span class="mono">{row.confidence.toFixed(2)}</span>
+                {:else}<span class="dim">—</span>{/if}
+                {#if row.resolvedBy}<span class="pill mono">{row.resolvedBy}</span>{/if}
+              </span>
+            </button>
+          {/each}
+        </div>
+      {/if}
+    </section>
   {/if}
 </div>
 
 <style>
+  /* §8 D-04: three islands stacked — the header 64, the canvas, Every hop. */
   .flowview {
     display: grid;
     height: 100%;
     min-height: 0;
+    gap: var(--gap);
     grid-template-rows: auto minmax(0, 1fr) auto;
   }
 
   .fhead {
     display: flex;
+    min-height: 64px;
+    flex-wrap: wrap;
     align-items: center;
-    padding: 12px 18px;
-    border-bottom: 1px solid var(--rule-soft);
-    gap: 12px;
+    gap: 10px 14px;
+    padding: 12px 16px;
+    overflow: visible;
   }
 
-  .fhead h1 {
+  .ftile {
+    display: inline-flex;
+    width: 32px;
+    height: 32px;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: center;
+    border-radius: 10px;
+    background: var(--primary-soft);
+    color: var(--primary-ink);
+  }
+
+  .ftitle {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+  }
+
+  .ftitle h1 {
     margin: 0;
-    font-size: 16px;
-    font-weight: 600;
+    color: var(--fg);
+    font: var(--t-h1);
   }
 
-  .fhead select {
-    padding: 3px 6px;
-    background: var(--paper-2);
-    color: var(--ink);
-    border: 1px solid var(--rule-soft);
-    border-radius: 0;
-    font: 12.5px var(--sans);
+  .sub {
+    color: var(--fg-3);
+    font: var(--t-caption);
   }
 
-  .note {
-    max-width: 78ch;
-    margin: 0;
-    color: var(--ink-3);
-    font-size: 12px;
+  .route {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
   }
 
+  .route select {
+    height: 36px;
+    max-width: 440px;
+    padding: 0 34px 0 12px;
+    appearance: none;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--raised);
+    color: var(--fg);
+    font: var(--t-mono);
+  }
+
+  .route select:focus-visible {
+    border-color: var(--primary-line);
+  }
+
+  .route .chev {
+    position: absolute;
+    right: 12px;
+    display: inline-flex;
+    color: var(--fg-3);
+    pointer-events: none;
+  }
+
+  .sr {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+  }
+
+  .sp {
+    flex: 1;
+  }
+
+  /* The canvas: dots and ambient glows (§4), the cards floating above. */
   .fstage {
     position: relative;
-    overflow: hidden;
-    background: var(--paper);
+    background: var(--canvas);
   }
 
-  /* Svelte Flow paints its own surface and controls; both are re-tokenised so
-     the canvas belongs to the paper/ink system. Same treatment as the Map. */
   .fstage :global(.svelte-flow) {
-    background: var(--paper);
+    background: transparent;
   }
   .fstage :global(.svelte-flow__handle) {
     width: 1px;
@@ -415,48 +574,216 @@
     cursor: default;
   }
   .fstage :global(.svelte-flow__controls) {
-    border: 1px solid var(--rule-soft);
-    box-shadow: none;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    box-shadow: var(--sh-pop);
   }
   .fstage :global(.svelte-flow__controls-button) {
-    background: var(--paper);
     border: 0;
-    border-bottom: 1px solid var(--rule-soft);
-    border-radius: 0;
+    border-bottom: 1px solid var(--line);
+    background: var(--overlay);
     box-shadow: none;
-    fill: var(--ink-2);
+    fill: var(--fg-2);
+  }
+  .fstage :global(.svelte-flow__controls-button:hover) {
+    background: var(--raised);
+    fill: var(--fg);
+  }
+
+  /* The note about what a card and a dashed link mean, as a legend. */
+  .legend {
+    position: absolute;
+    bottom: 16px;
+    left: 16px;
+    z-index: 5;
+    max-width: min(560px, calc(100% - 120px));
+    margin: 0;
+    padding: 9px 12px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--overlay);
+    box-shadow: var(--sh-pop);
+    color: var(--fg-2);
+    font: var(--t-caption);
+    line-height: 1.45;
   }
 
   .state {
-    max-width: 52ch;
-    padding: 40px;
+    max-width: 56ch;
+    padding: 32px;
   }
   .state h2 {
     margin: 0 0 8px;
-    font-size: 15px;
-    font-weight: 600;
+    color: var(--fg);
+    font: var(--t-h2);
   }
   .state p {
     margin: 0 0 8px;
-    color: var(--ink-2);
-    font-size: 12.5px;
-    line-height: 1.5;
+    color: var(--fg-2);
+    font: var(--t-body);
   }
   .dim {
-    color: var(--ink-3);
+    color: var(--fg-3);
   }
   .mono {
     font-family: var(--mono);
   }
 
-  .fnote {
-    padding: 8px 18px;
-    border-top: 1px solid var(--rule-soft);
-    background: var(--paper-2);
-    color: var(--ink-2);
-    font-size: 12px;
+  /* Every hop: columns # | call | runs when | site | confidence; rows 40. */
+  .hops {
+    max-height: 320px;
+    overflow: auto;
+    padding: 0 16px 12px;
   }
+
+  .hh {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    padding: 16px 4px 10px;
+    background: var(--panel);
+    font: var(--t-caption);
+  }
+
+  .hh .title {
+    color: var(--fg);
+    font: var(--t-label);
+  }
+
+  .fnote {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 10px;
+  }
+
   .fnote p {
-    margin: 0 0 2px;
+    margin: 0;
+  }
+
+  .tr {
+    display: grid;
+    width: 100%;
+    min-height: 40px;
+    align-items: center;
+    gap: 14px;
+    padding: 0 10px;
+    border: 1px solid transparent;
+    border-radius: 10px;
+    color: var(--fg);
+    grid-template-columns: 28px minmax(260px, 1.4fr) minmax(160px, 1.2fr) 220px 240px;
+    text-align: left;
+  }
+
+  button.tr:hover {
+    border-color: var(--primary-line);
+    background: color-mix(in srgb, var(--primary-soft) 85%, transparent);
+  }
+
+  .th {
+    min-height: 30px;
+    border-bottom: 1px solid var(--line-faint);
+    border-radius: 0;
+    color: var(--fg-3);
+    font: var(--t-micro);
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+  }
+
+  .badge {
+    display: inline-flex;
+    width: 22px;
+    height: 22px;
+    align-items: center;
+    justify-content: center;
+    border-radius: 11px;
+    background: var(--raised);
+    color: var(--fg-2);
+    font: var(--t-mono-sm);
+  }
+
+  .call {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .call .nm {
+    overflow: hidden;
+    font: var(--t-mono);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .arrow {
+    display: inline-flex;
+    color: var(--cyan);
+  }
+
+  .when {
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .site {
+    overflow: hidden;
+    color: var(--fg-2);
+    font: var(--t-mono-sm);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .conf {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .conf .bar {
+    width: 56px;
+  }
+
+  .conf .mono {
+    color: var(--fg);
+    font: var(--t-mono-sm);
+  }
+
+  @media (max-width: 1023px) {
+    .tr {
+      grid-template-columns: 28px minmax(200px, 1fr) 120px 200px;
+    }
+
+    .when {
+      display: none;
+    }
+  }
+
+  @media (max-width: 599px) {
+    .fhead .pill,
+    .fhead .ftitle .sub,
+    .legend {
+      display: none;
+    }
+
+    .route select {
+      max-width: calc(100vw - 120px);
+    }
+
+    .hops {
+      max-height: 40vh;
+    }
+
+    .tr {
+      grid-template-columns: 24px minmax(0, 1fr) 90px;
+    }
+
+    .conf {
+      display: none;
+    }
   }
 </style>

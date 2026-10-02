@@ -21,6 +21,7 @@
    * says so in its own count line. See `lib/map-model.ts`.
    */
   import KindGlyph from '../components/KindGlyph.svelte';
+  import Icon from '../components/Icon.svelte';
   import { fetchDeadCode, ApiFailure, type WireDeadCode, type WireDeadCodeRow } from '../lib/api';
   import { deadHref, fileHref, navigate, symbolHref } from '../lib/navigation';
   import { live } from '../lib/live.svelte';
@@ -70,46 +71,69 @@
   let scale = $derived(deadCodeScale(payload));
   let phrases = $derived(exclusionPhrases(payload));
 
+  /** Size bars (§8 D-07): each row against the largest one listed, 140px wide. */
+  let maxLines = $derived(
+    Math.max(1, ...(payload?.groups ?? []).flatMap((g) => g.rows.map((r) => r.lines)))
+  );
+  let maxExcluded = $derived(Math.max(1, ...(payload?.excluded ?? []).map((e) => e.count)));
+  let listedShare = $derived(
+    payload && payload.candidates > 0 ? (100 * payload.rows.total) / payload.candidates : 0
+  );
+
   function open(row: WireDeadCodeRow): void {
     navigate(symbolHref(row.id, { line: row.line }));
   }
 </script>
 
-<div class="scroll">
+<div class="deadview">
+<div class="scroll island">
   <div class="head">
-    <h2>Dead code</h2>
-    <p>
-      Symbols no import, call or reference in this index reaches, largest first. Everything below
-      is what the graph can see; the notes under the list are what it cannot.
-    </p>
+    <span class="dtile"><Icon name="ghost" /></span>
+    <div class="ht">
+      <h1>Dead code</h1>
+      <p>symbols nothing in the index reaches · largest first · grouped by file</p>
+    </div>
+    <!-- §8 D-07: Internal only / Including exported. -->
+    <div class="segmented" role="radiogroup" aria-label="Which symbols to list">
+      <a
+        role="radio"
+        aria-checked={!exported}
+        class:on={!exported}
+        href={deadHref({ exported: false })}
+        title="Symbols nothing outside this repository could import either"
+        onclick={(event) => {
+          event.preventDefault();
+          navigate(deadHref({ exported: false }));
+        }}>Internal only</a
+      >
+      <a
+        role="radio"
+        aria-checked={exported}
+        class:on={exported}
+        href={deadHref({ exported: true })}
+        title="Also list symbols something outside this repository could import — the index cannot check those"
+        onclick={(event) => {
+          event.preventDefault();
+          navigate(deadHref({ exported: true }));
+        }}>Including exported</a
+      >
+    </div>
   </div>
 
-  <div class="bar">
-    <p class="caveat">{DEAD_CODE_CAVEAT}</p>
-    <a
-      class="toggle"
-      class:on={exported}
-      href={deadHref({ exported: !exported })}
-      title={exported
-        ? 'Back to symbols nothing outside this repository could import either'
-        : 'Also list symbols something outside this repository could import — the index cannot check those'}
-      onclick={(event) => {
-        event.preventDefault();
-        navigate(deadHref({ exported: !exported }));
-      }}>{exported ? 'Including exported' : 'Internal only'}</a
-    >
-  </div>
+  <!-- The caveat is never dismissible and never collapsed: it is the
+       difference between "nothing references this" and "nobody uses this". -->
+  <p class="callout caveat"><Icon name="circle-alert" /><span>{DEAD_CODE_CAVEAT}</span><span class="why">macros, trait objects and reflection leave no edge</span></p>
 
   {#if failure}
     <p class="state">Could not read the list — {failure}</p>
   {:else if loading && payload === null}
-    <p class="state">Reading the graph…</p>
+    <div class="state"><span class="pill"><Icon name="refresh-cw" size={14} />Reading the graph…</span></div>
   {:else if payload}
     {#if exported}
-      <p class="warn">
-        Exported symbols are on this list. Nothing in this repository references them, but anything
+      <p class="callout amber">
+        <Icon name="triangle-alert" /><span>Exported symbols are on this list. Nothing in this repository references them, but anything
         outside it can — a published package, another service, a script. Read each one before you
-        believe it.
+        believe it.</span>
       </p>
     {/if}
 
@@ -121,12 +145,13 @@
         {#each payload.groups as group (group.file)}
           <div class="filegroup" class:gen={group.generated}>
             <div class="fpath">
+              <Icon name="folder" size={14} />
               <a href={fileHref(group.file)} title={group.file}>{group.file}</a>
               <b>{groupMeta(group)}</b>
             </div>
             {#each group.rows as row (row.id)}
               <div class="row">
-                <KindGlyph kind={row.kind} />
+                <KindGlyph kind={row.kind} size={22} />
                 <div class="body">
                   <div class="line">
                     <button
@@ -137,9 +162,9 @@
                       onclick={() => open(row)}>{row.name}</button
                     >
                     <a class="ln" href={fileHref(group.file, { source: true, line: row.line })}
-                      >{row.file}:{row.line}</a
+                      >{row.file.slice(row.file.lastIndexOf('/') + 1)}:{row.line}</a
                     >
-                    {#if row.exported}<span class="chip">exported</span>{/if}
+                    {#if row.exported}<span class="pill amber">exported</span>{/if}
                   </div>
                   <div class="meta">{deadCodeRowMeta(row)}</div>
                   {#if row.members.items.length > 0}
@@ -155,6 +180,7 @@
                     </div>
                   {/if}
                 </div>
+                <span class="size bar brand" title={`${row.lines} lines`}><i style:width={`${Math.max(3, Math.round((100 * row.lines) / maxLines))}%`}></i></span>
               </div>
             {/each}
           </div>
@@ -162,190 +188,233 @@
       </div>
     {/if}
 
-    <div class="notes">
-      <p>{scale}</p>
-      {#if phrases.length > 0}
-        <ul>
-          {#each phrases as phrase (phrase)}
-            <li>{phrase}</li>
-          {/each}
-        </ul>
-      {/if}
-      {#if !payload.corroborated}
-        <p>
-          The rows were not checked against the text of the files that can reach them, so a
-          reference the extractor did not record would not have been caught.
-        </p>
-      {/if}
-      {#if payload.bounded}
-        <p>
-          The scan stopped at its cap — this index holds more unreferenced symbols than were
-          considered.
-        </p>
-      {/if}
-      {#if payload.rows.truncated}
-        <p>
-          Showing {payload.rows.shown} of {payload.rows.total} — the rest are in the index, not on
-          this list.
-        </p>
-      {/if}
-    </div>
+    {#if payload.rows.truncated}
+      <p class="foot">
+        Showing {payload.rows.shown} of {payload.rows.total} — the rest are in the index, not on
+        this list.
+      </p>
+    {/if}
   {/if}
 </div>
 
+<!-- §8 D-07: what the list leaves out, and why. -->
+<aside class="leftoff island">
+  <div class="lh"><Icon name="eye-off" /><span>What the list leaves out</span></div>
+  {#if payload}
+    {#if payload.candidates > 0}
+      <div class="big">
+        <div class="bn"><b>{payload.candidates.toLocaleString()}</b><span>symbols carry no incoming reference at all</span></div>
+        <span class="bar brand"><i style:width={`${Math.max(1, listedShare)}%`}></i></span>
+        <div class="split">
+          <span><i class="sw on"></i>{payload.rows.total.toLocaleString()} listed</span>
+          <span><i class="sw"></i>{payload.excludedTotal.toLocaleString()} left off</span>
+        </div>
+      </div>
+    {:else}
+      <p class="dim">{scale || 'Every symbol in this index is referenced by something.'}</p>
+    {/if}
+
+    {#if payload.excluded.length > 0}
+      <div class="micro sec">Why they were left off</div>
+      {#each payload.excluded as entry (entry.reason)}
+        <div class="reason">
+          <span class="rl">{entry.label}</span>
+          <span class="rc mono">{entry.count.toLocaleString()}</span>
+          <span class="bar"><i style:width={`${Math.max(2, Math.round((100 * entry.count) / maxExcluded))}%`}></i></span>
+        </div>
+      {/each}
+    {/if}
+
+    {#if !payload.corroborated}
+      <p class="dim note">
+        The rows were not checked against the text of the files that can reach them, so a
+        reference the extractor did not record would not have been caught.
+      </p>
+    {/if}
+    {#if payload.bounded}
+      <p class="dim note">
+        The scan stopped at its cap — this index holds more unreferenced symbols than were
+        considered.
+      </p>
+    {/if}
+    <p class="dim note">
+      Every rule removes a symbol something could still reach. What remains has no static
+      reference — not proof that it is unused.
+    </p>
+    <!-- The same facts as one sentence each, for a reader of the text alone. -->
+    <div class="sr">
+      <p>{scale}</p>
+      {#if phrases.length > 0}<ul>{#each phrases as phrase (phrase)}<li>{phrase}</li>{/each}</ul>{/if}
+    </div>
+  {/if}
+</aside>
+</div>
+
 <style>
+  /* §8 D-07: the list island 924 | what it leaves out 428. */
+  .deadview {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 428px;
+    gap: var(--gap);
+    height: 100%;
+    min-height: 0;
+  }
+
   .scroll {
     height: 100%;
     overflow: auto;
+    padding: 20px 24px 28px;
   }
 
   .head {
-    max-width: 760px;
-    padding: 26px 40px 6px;
-  }
-
-  .head h2 {
-    margin: 0 0 6px;
-    font-size: 20px;
-    font-weight: 600;
-    letter-spacing: -0.01em;
-  }
-
-  .head p {
-    margin: 0;
-    color: var(--ink-2);
-    font-size: 13px;
-    line-height: 1.45;
-  }
-
-  .bar {
     display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 16px;
-    max-width: 760px;
-    margin: 14px 40px 0;
-    padding: 6px 0;
-    border-top: 1px solid var(--rule-soft);
-    border-bottom: 1px solid var(--rule-soft);
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px 14px;
   }
 
-  /* The caveat is never dismissible and never collapsed: it is the difference
-     between "nothing references this" and "nobody uses this". */
-  .caveat {
+  .dtile {
+    display: inline-flex;
+    width: 40px;
+    height: 40px;
+    align-items: center;
+    justify-content: center;
+    border-radius: 12px;
+    background: var(--raised);
+    color: var(--fg-2);
+  }
+
+  .ht {
+    min-width: 0;
+    flex: 1;
+  }
+
+  .ht h1 {
     margin: 0;
-    color: var(--ink-3);
-    font-size: 11.5px;
-    line-height: 1.4;
+    color: var(--fg);
+    font: var(--t-h1);
   }
 
-  .toggle {
-    flex: none;
-    padding: 1px 6px;
-    border: 1px solid var(--rule-soft);
-    color: var(--ink-2);
-    font: 11px var(--mono);
+  .ht p {
+    margin: 0;
+    color: var(--fg-3);
+    font: var(--t-small);
+  }
+
+  .segmented {
+    display: inline-flex;
+    gap: 4px;
+    padding: 4px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--card);
+  }
+
+  .segmented a {
+    display: inline-flex;
+    height: 32px;
+    align-items: center;
+    padding: 0 14px;
+    border: 1px solid transparent;
+    border-radius: 9px;
+    color: var(--fg-2);
+    font: var(--t-small-500);
     text-decoration: none;
+    white-space: nowrap;
   }
 
-  .toggle:hover {
-    border-color: var(--ink);
-    color: var(--ink);
+  .segmented a:hover {
+    color: var(--fg);
   }
 
-  .toggle.on {
-    border-color: var(--accent-line);
-    background: var(--accent-soft);
-    color: var(--accent);
+  .segmented a.on {
+    border-color: var(--primary-line);
+    background: var(--primary-soft);
+    color: var(--primary-ink);
   }
 
-  .warn {
-    max-width: 760px;
-    margin: 12px 40px 0;
-    padding: 8px 12px;
-    border: 1px solid var(--accent-line);
-    background: var(--accent-soft);
-    color: var(--ink-2);
-    font-size: 11.5px;
-    line-height: 1.45;
+  .caveat {
+    margin: 18px 0 0;
+    border: 1px solid var(--line-faint);
+    background: var(--card);
+    color: var(--fg);
+    font: var(--t-body);
   }
 
-  .headline {
-    max-width: 760px;
-    margin: 14px 40px 0;
-    color: var(--ink-2);
-    font-size: 12.5px;
+  .caveat .why {
+    margin-left: auto;
+    color: var(--fg-3);
+    font: var(--t-caption);
+  }
+
+  .callout.amber {
+    margin: 12px 0 0;
   }
 
   .state {
-    max-width: 760px;
-    padding: 16px 40px 40px;
-    color: var(--ink-3);
-    font-size: 12.5px;
-    line-height: 1.5;
+    padding: 20px 0;
+    color: var(--fg-2);
+    font: var(--t-body);
   }
 
-  .groups {
-    max-width: 760px;
-    margin: 8px 40px 0;
-    border: 1px solid var(--rule-soft);
+  .headline {
+    margin: 16px 0 6px;
+    color: var(--fg-3);
+    font: var(--t-caption);
   }
 
   .filegroup {
-    padding: 10px 14px 6px;
-    border-bottom: 1px solid var(--rule-faint);
+    margin-top: 14px;
   }
 
-  .filegroup:last-child {
-    border-bottom: 0;
+  .filegroup.gen {
+    opacity: 0.6;
   }
 
   .fpath {
     display: flex;
-    justify-content: space-between;
+    align-items: center;
     gap: 8px;
-    margin-bottom: 4px;
-    color: var(--ink-3);
-    font: 11px var(--mono);
+    margin: 0 2px 8px;
+    color: var(--fg-3);
+    font: var(--t-mono-sm);
   }
 
   .fpath a {
+    min-width: 0;
+    flex: 1;
     overflow: hidden;
+    color: var(--fg-2);
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
   .fpath a:hover {
-    color: var(--ink);
+    color: var(--fg);
     text-decoration: underline;
   }
 
   .fpath b {
-    flex: none;
-    color: var(--ink-2);
-    font-weight: 500;
+    color: var(--fg-3);
+    font: var(--t-caption);
   }
 
-  /* Generated code recedes wherever it appears (design spec §2.6). */
-  .filegroup.gen .fpath,
-  .filegroup.gen .fpath b,
-  .filegroup.gen .nm,
-  .filegroup.gen .meta {
-    color: var(--ink-4);
-  }
-
+  /* Rows: `card` + `line-faint`, r 10; the size bar GRAD.brand, 140 max. */
   .row {
     display: grid;
-    grid-template-columns: 16px 1fr;
-    gap: 8px;
-    align-items: start;
-    margin: 0 -6px;
-    padding: 5px 6px 5px 4px;
-    border: 1px solid transparent;
+    grid-template-columns: 22px minmax(0, 1fr) 140px;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 6px;
+    padding: 10px 14px;
+    border: 1px solid var(--line-faint);
+    border-radius: 10px;
+    background: var(--card);
   }
 
   .row:hover {
-    background: var(--press);
+    border-color: var(--line);
+    background: var(--raised);
   }
 
   .body {
@@ -354,87 +423,205 @@
 
   .line {
     display: flex;
+    min-width: 0;
+    flex-wrap: wrap;
     align-items: baseline;
-    gap: 8px;
+    gap: 4px 10px;
   }
 
   .nm {
-    overflow: hidden;
-    min-width: 0;
-    color: var(--ink);
-    font: 12.5px var(--mono);
+    color: var(--fg);
+    font: var(--t-mono-500);
     text-align: left;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    cursor: pointer;
+  }
+
+  .nm:hover {
+    color: var(--primary-ink);
   }
 
   .ln {
-    flex: none;
-    color: var(--ink-3);
-    font: 11px var(--mono);
-    text-decoration: none;
+    color: var(--fg-4);
+    font: var(--t-mono-sm);
   }
 
   .ln:hover {
-    color: var(--accent);
-    text-decoration: underline;
-  }
-
-  .chip {
-    flex: none;
-    padding: 0 4px;
-    border: 1px solid var(--accent-line);
-    background: var(--accent-soft);
-    color: var(--accent);
-    font: 11px var(--mono);
+    color: var(--fg-2);
   }
 
   .meta {
-    margin-top: 1px;
-    overflow: hidden;
-    color: var(--ink-3);
-    font-size: 11px;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    margin-top: 2px;
+    color: var(--fg-3);
+    font: var(--t-caption);
   }
 
   .members {
     display: flex;
     flex-wrap: wrap;
-    gap: 4px 8px;
-    margin-top: 3px;
+    gap: 4px 6px;
+    margin-top: 6px;
   }
 
   .member {
-    color: var(--ink-3);
-    font: 11px var(--mono);
-    text-decoration: none;
-  }
-
-  .member:hover {
-    color: var(--accent);
-    text-decoration: underline;
+    padding: 1px 7px;
+    border-radius: 9px;
+    background: var(--raised);
+    color: var(--fg-2);
+    font: var(--t-mono-sm);
   }
 
   .member.more {
-    color: var(--ink-4);
+    background: none;
+    color: var(--fg-4);
   }
 
-  .notes {
-    max-width: 760px;
-    margin: 14px 40px 48px;
-    color: var(--ink-3);
-    font-size: 11.5px;
+  .size {
+    height: 4px;
+  }
+
+  .foot {
+    margin: 16px 0 0;
+    color: var(--fg-2);
+    font: var(--t-body);
+  }
+
+  .leftoff {
+    overflow: auto;
+    padding: 0 20px 20px;
+  }
+
+  .lh {
+    display: flex;
+    height: 52px;
+    align-items: center;
+    gap: 10px;
+    color: var(--fg);
+    font: var(--t-label);
+  }
+
+  .lh :global(.icon) {
+    color: var(--fg-3);
+  }
+
+  .big {
+    padding: 16px 18px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--card);
+  }
+
+  .bn {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 6px 12px;
+    margin-bottom: 14px;
+    color: var(--fg-2);
+    font: var(--t-small);
+  }
+
+  .bn b {
+    color: var(--fg);
+    font: 600 28px / 34px var(--sans);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .big .bar {
+    height: 8px;
+    border-radius: 4px;
+  }
+
+  .split {
+    display: flex;
+    gap: 24px;
+    margin-top: 10px;
+    color: var(--fg-2);
+    font: var(--t-small);
+  }
+
+  .split span {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .sw {
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+    background: var(--line-strong);
+  }
+
+  .sw.on {
+    background: var(--primary);
+  }
+
+  .sec {
+    margin: 22px 0 10px;
+  }
+
+  .reason {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 6px 10px;
+    margin-bottom: 14px;
+    color: var(--fg);
+    font: var(--t-body);
+  }
+
+  .rc {
+    color: var(--fg-2);
+    font: var(--t-mono-sm);
+  }
+
+  .reason .bar {
+    grid-column: 1 / -1;
+    height: 4px;
+  }
+
+  .note {
+    margin: 12px 0 0;
+    font: var(--t-caption);
     line-height: 1.5;
   }
 
-  .notes p {
-    margin: 0 0 6px;
+  .dim {
+    color: var(--fg-3);
   }
 
-  .notes ul {
-    margin: 0;
-    padding-left: 16px;
+  .sr {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+  }
+
+  @media (max-width: 1023px) {
+    .deadview {
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: minmax(0, 1fr) auto;
+    }
+
+    .leftoff {
+      max-height: 40vh;
+    }
+  }
+
+  @media (max-width: 599px) {
+    .scroll {
+      padding: 14px;
+    }
+
+    .row {
+      grid-template-columns: 22px minmax(0, 1fr);
+    }
+
+    .size {
+      display: none;
+    }
+
+    .caveat .why {
+      display: none;
+    }
   }
 </style>

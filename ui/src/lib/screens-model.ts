@@ -57,7 +57,11 @@ const LEVEL_NEST = 0.26;
 /** Points a curve is sampled at for hit-testing; at 116px tall, under a pixel off. */
 const HIT_SAMPLES = 24;
 
-/** IBM Plex Mono at 10.5px advances ~6.3px per character; the pill adds 6px each side. */
+/**
+ * JetBrains Mono at 10.5px (`pill`) advances 6.30px per character — 0.6 em,
+ * measured in Chrome with the bundled font on 2026-10-03, the same as
+ * upstream's IBM Plex Mono figure. The pill adds 6px each side.
+ */
 export const PILL_CHAR_WIDTH = 6.3;
 export const PILL_PADDING = 12;
 export const PILL_HEIGHT = 17;

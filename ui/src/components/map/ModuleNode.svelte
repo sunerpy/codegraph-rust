@@ -1,4 +1,5 @@
 <script lang="ts">
+  import KindGlyph from '../KindGlyph.svelte';
   /**
    * One module box on the Map (design spec §3.6): a 40px rectangle carrying
    * the module's path and what is inside it.
@@ -60,6 +61,7 @@
     layout.generated ? '. Every file in it is tool-generated.' : ''
   }`}
 >
+  <span class="tile"><KindGlyph kind="module" size={22} /></span>
   <span class="name">{module.id}</span>
   <!-- The same string nodeWidth() sized the box for; they must not drift. -->
   <span class="count" class:island={layout.island}
@@ -84,93 +86,100 @@
 {/each}
 
 <style>
+  /* §7 map node: 52 high, r 12, `card` + `line` + SH.card; tile 22 at 12,15,
+     the label `mono-500` at 44,8, the meta `caption` at 44,27, and a 2px
+     GRAD.data weight bar along the bottom. Selected: `primary-soft`, a 1.5px
+     GRAD.brand stroke and the 45 % glow. Dimmed 45 %. */
   .mnode {
     position: relative;
     display: flex;
     flex-direction: column;
     justify-content: center;
-    gap: 1px;
+    gap: 2px;
     box-sizing: border-box;
-    padding: 0 9px;
-    border: 1px solid var(--ink);
-    border-radius: 0;
-    background: var(--paper);
-    text-align: left;
+    padding: 0 18px 0 44px;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--card);
+    box-shadow: var(--sh-card);
+    color: var(--fg);
     cursor: pointer;
     font: inherit;
-    color: var(--ink);
-    transition: background 90ms linear;
+    text-align: left;
+    transition:
+      border-color 120ms,
+      background-color 120ms,
+      opacity 120ms;
   }
-  .mnode:hover,
+  .mnode:hover {
+    border-color: var(--line-strong);
+  }
   .mnode.sel {
-    border-width: 2px;
-    padding: 0 8px;
-    background: var(--press);
+    border: 1.5px solid transparent;
+    background:
+      linear-gradient(var(--primary-soft), var(--primary-soft)) padding-box,
+      var(--grad-brand) border-box;
+    box-shadow: var(--glow-45);
+  }
+  .mnode.sel .name {
+    color: var(--primary-ink);
   }
   .mnode.dimmed {
-    border-color: var(--ink-4);
-    color: var(--ink-4);
+    opacity: 0.45;
   }
-  .mnode.dimmed .count {
-    color: var(--ink-4);
+  .tile {
+    position: absolute;
+    top: 14px;
+    left: 11px;
+    display: inline-flex;
   }
-  /* Nothing depends on it — the stroke stays normal (it is not a lesser module,
-     it is an unreached one); only the count line changes what it says. */
+  /* Nothing depends on it — the box is not a lesser module, it is an
+     unreached one; the meta line says so in amber (§9.1). */
   .count.island {
-    color: var(--ink-2);
+    color: var(--amber);
   }
   /* Generated code: nobody wrote it by hand and nobody deletes it by hand. */
   .mnode.gen {
-    color: var(--ink-4);
-    border-color: var(--rule-soft);
+    color: var(--fg-4);
   }
   .mnode.gen .count {
-    color: var(--ink-4);
+    color: var(--fg-4);
   }
   /* Test modules read as scaffolding, not as part of the program. */
   .mnode.test {
     border-style: dashed;
-    border-color: var(--ink-3);
+    border-color: var(--line-strong);
   }
   .mnode:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 1px;
+    outline-offset: 4px;
   }
-  /* A wash, not a rule: it is a quantity the eye should compare across boxes at
-     a glance, never a line competing with the box's own border. */
+  /* How much leans on the box, as a share of the heaviest one drawn. */
   .weight {
     position: absolute;
-    left: 0;
-    bottom: 0;
-    height: 4px;
-    background: var(--ink);
-    /* Dark enough to survive the fit: the map opens as far out as 0.45, where a
-       3px band at 0.18 was a rumour. Length is what carries the comparison, and
-       length cannot be read off a stroke the eye has to hunt for. */
-    opacity: 0.3;
+    bottom: 3px;
+    left: 12px;
+    max-width: calc(100% - 24px);
+    height: 2px;
+    border-radius: 1px;
+    background: var(--grad-data);
     pointer-events: none;
-  }
-  .mnode:hover .weight,
-  .mnode.sel .weight {
-    opacity: 0.55;
   }
   .mnode.dimmed .weight,
   .mnode.gen .weight {
-    opacity: 0.1;
+    opacity: 0.3;
   }
   .name {
-    font: 500 13px var(--mono);
-    line-height: 15px;
-    white-space: nowrap;
     overflow: hidden;
+    font: var(--t-mono-500);
     text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .count {
-    font: 400 11px var(--sans);
-    line-height: 13px;
-    color: var(--ink-3);
-    white-space: nowrap;
     overflow: hidden;
+    color: var(--fg-3);
+    font: var(--t-caption);
     text-overflow: ellipsis;
+    white-space: nowrap;
   }
 </style>

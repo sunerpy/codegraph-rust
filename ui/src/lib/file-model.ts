@@ -29,8 +29,11 @@ const QUIET_KINDS = new Set(['property', 'field', 'enum_member', 'variable', 'co
 /** Above this many rows the outline is windowed rather than fully rendered. */
 export const OUTLINE_VIRTUAL_THRESHOLD = 250;
 
-/** Fixed row height the windowed outline measures with — pinned in the CSS. */
-export const OUTLINE_ROW_HEIGHT = 28;
+/**
+ * Fixed row pitch the windowed outline measures with — pinned in the CSS.
+ * Direction D draws 28px rows at a 30px pitch (docs/design/viewer-d.md §8 D-03).
+ */
+export const OUTLINE_ROW_HEIGHT = 30;
 
 /* ----------------------------------------------------------------- rails -- */
 

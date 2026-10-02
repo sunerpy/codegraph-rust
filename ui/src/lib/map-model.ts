@@ -45,9 +45,10 @@
 import type { WireMapLink, WireMapModule, WireMapPayload } from './api';
 
 // Geometry, from the design spec. Changing these changes the picture.
-export const NODE_HEIGHT = 40;
-export const LAYER_GAP = 74;
-export const NODE_GAP = 34;
+/** Direction D map node: 52 high, rows 96 apart (52 + 44), 28 between boxes (§8 D-05). */
+export const NODE_HEIGHT = 52;
+export const LAYER_GAP = 44;
+export const NODE_GAP = 28;
 export const PADDING = 44;
 /** Least horizontal room a layer gets per module, so a sparse row still spreads. */
 const MIN_SLOT = 230;
@@ -59,16 +60,16 @@ const MIN_SLOT = 230;
 export const PORT_PITCH = 12;
 const MIN_NODE_WIDTH = 110;
 /**
- * IBM Plex Mono's real advance at 13px (0.6em), not the spec's 7.3 estimate.
+ * JetBrains Mono's real advance for the D label (`mono-500`, 12px): 0.6 em,
+ * measured in Chrome with the bundled variable font on 2026-10-03 — 7.20px
+ * a character. (Upstream measured IBM Plex Mono at 13px: 7.81.)
  *
- * The prototype drew labels as SVG text that spilled harmlessly past the
- * rectangle, so 7.3 was close enough there. An HTML box clips instead, and at
- * 7.3 a 27-character id like `src/resolution/(root files)` lost its last
- * characters to an ellipsis — measured in the browser: 211px of text in 205px
- * of box. Padding is the box's own 9px each side plus its 1px borders.
+ * The box clips, so an under-estimate costs a label its last characters to an
+ * ellipsis. Padding is the D-05 recipe: the label starts at 44 (tile 22 at 12,
+ * then 10), and the box ends 18 past the text.
  */
-const CHAR_WIDTH = 7.81;
-const LABEL_PADDING = 22;
+const CHAR_WIDTH = 7.2;
+const LABEL_PADDING = 62;
 
 /** Links below this weight stay hidden until a module they touch is selected. */
 export const MIN_WEIGHT = 4;
@@ -87,9 +88,14 @@ export const MIN_WEIGHT_WITH_TESTS = 6;
  */
 const DECLARED_BASIS_COVERAGE = 0.4;
 
-/** Approximate advance of the 11px sans meta line, measured against Archivo. */
-const META_CHAR_WIDTH = 5.9;
-const META_PADDING = 24;
+/**
+ * Advance of the 11px meta line in Inter (`caption`), measured in Chrome on
+ * 2026-10-03: 4.96–5.45px a character across this repository's meta strings,
+ * lower-case-heavy ones widest. 5.5 keeps every one inside its box. (Upstream
+ * measured Archivo: 5.9.) Same left inset as the label.
+ */
+const META_CHAR_WIDTH = 5.5;
+const META_PADDING = 62;
 
 /**
  * A box wide enough for BOTH of its lines.

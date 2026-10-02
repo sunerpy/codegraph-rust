@@ -5,7 +5,7 @@
   let { path }: Props = $props();
 </script>
 
-<div class="scroll">
+<div class="scroll island">
   <div class="emptystate">
     <h2>No such view</h2>
     <p>
@@ -22,9 +22,9 @@
   }
 
   .link {
-    color: var(--accent);
+    color: var(--primary-ink);
     text-decoration: underline;
-    text-decoration-color: var(--accent-line);
+    text-decoration-color: var(--primary-line);
     text-underline-offset: 3px;
   }
 </style>
