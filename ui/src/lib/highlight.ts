@@ -139,6 +139,25 @@ export function tokensByLine(
  * is free once the tree has been walked, and re-deriving it in a consumer would
  * not be.
  */
+/** Text that is nothing but punctuation and operators — `syn-punct` in D. */
+const PUNCTUATION = /^[\s(){}[\];,.:<>=+\-*/&|!?^%~@#$\\'"`]+$/;
+
+/**
+ * The class a rendered token takes in direction D (docs/design/viewer-d.md §3:
+ * `syn-kw`, `syn-str`, `syn-num`, `syn-com`, `syn-type`, `syn-punct`).
+ *
+ * {@link tokenClass} plus the two D colours it leaves out: a `type` token, and
+ * an `other` token that is only punctuation. An `other` token holding anything
+ * else — whitespace, or a whole unclassified line from a plain answer — stays
+ * unclassed, so an unhighlighted file reads in plain ink rather than in the
+ * punctuation colour.
+ */
+export function tokenClassFor(token: Pick<Token, 'cls' | 'text'>): string | null {
+  if (token.cls === 'type') return 't-t';
+  if (token.cls === 'other') return token.text.trim() !== '' && PUNCTUATION.test(token.text) ? 't-p' : null;
+  return tokenClass(token.cls);
+}
+
 export function tokenClass(cls: TokenClass): string | null {
   switch (cls) {
     case 'comment':

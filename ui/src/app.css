@@ -1,11 +1,11 @@
 /* =====================================================================
-   codegraph ui — the app's global primitives
+   codegraph ui — the app's global primitives (direction D)
 
-   The design tokens themselves live in `lib/theme.css`, which is also
-   what `@colbymchenry/codegraph-ui` exports for a host to import and
-   override. This file is everything ON TOP of them that only the
-   standalone viewer needs: the reset, the shell grid, and the handful of
-   primitives shared across views.
+   The tokens live in `lib/theme.css`, which is also what a host imports.
+   This file is everything ON TOP of them that the standalone viewer needs:
+   the reset, the shell grid of docs/design/viewer-d.md §2, and the handful of
+   primitives §7 shares across views (islands, pills, buttons, key caps, stat
+   tiles, bars, skeletons, callouts, the empty and error states).
 
    Component-specific rules live in each .svelte file's scoped <style>.
    ===================================================================== */
@@ -20,23 +20,19 @@ body {
 
 body {
   margin: 0;
-  /* body always paints --paper: the bars are transparent over it and a
-     short view must not reveal the browser's own canvas colour. */
-  background: var(--paper);
-  color: var(--ink);
-  font-family: var(--sans);
-  font-size: 13px;
-  line-height: 1.45;
+  /* body paints `bg`: the nav and the command bar sit on it with no fill of
+     their own, and the islands float above it with 8px between them. */
+  background: var(--bg);
+  color: var(--fg);
+  font: var(--t-body);
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 *,
 *::before,
 *::after {
   box-sizing: border-box;
-  /* Square corners are non-negotiable in this system, including on the
-     UA-styled controls (input, select, button) we do not restyle. */
-  border-radius: 0 !important;
 }
 
 a {
@@ -53,6 +49,13 @@ button {
   cursor: pointer;
 }
 
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
 h1,
 h2,
 h3 {
@@ -60,9 +63,58 @@ h3 {
   text-wrap: balance;
 }
 
+/* §13: source fidelity — code, names and line refs never render `->` as an
+   arrow. JetBrains Mono (and Inter) draw those through contextual alternates,
+   and every component sets its type with the `font` shorthand, which resets
+   `font-variant-ligatures` — so the switch is made once, here, and made to
+   stick. */
+*,
+*::before,
+*::after {
+  font-variant-ligatures: none !important;
+}
+
+/* §9.1 focus: a 2px primary ring outside the element, following its radius,
+   with the 45 % glow. Rows and buttons tune the offset in their own rules. */
 :focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
+  outline: 2px solid var(--primary);
+  outline-offset: 3px;
+  box-shadow: var(--glow-45);
+}
+
+::selection {
+  background: color-mix(in srgb, var(--primary) 30%, transparent);
+}
+
+/* Slim scrollbars on every scroll area; the thumb is GRAD.brand (§4). */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background: var(--line-strong) padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--grad-brand-v) padding-box;
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+@supports not selector(::-webkit-scrollbar) {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--line-strong) transparent;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -75,46 +127,488 @@ h3 {
   }
 }
 
-/* ---------- app shell ----------
-   Design spec §3.1: top bar 48px / trail bar 34px / main. The grid is on
-   index.html's mount host, which App.svelte fills directly (no wrapper — a
-   second #app would duplicate the id).
+/* ---------- app shell (§2) ----------
+   nav rail 64 | command bar 56 over the trail ribbon 40 over the islands,
+   8px apart. The grid is on index.html's mount host, which App.svelte fills
+   directly (a second #app would duplicate the id).
 
-   The trail row is `auto`, not `--trailbar-h`: the bar keeps that height on
-   its own (see TrailBar.svelte) and grows only while the save-trail form is
-   open. Pinning the row instead would clip the form. */
-#app {
-  height: 100vh;
-  display: grid;
-  grid-template-rows: var(--topbar-h) auto 1fr;
+   The trail row is `auto`: the ribbon is 40px on its own, grows while the
+   save form is open, and collapses to nothing when there is no trail — the
+   islands then start 8px under the command bar (§2: y 64 instead of 104). */
+:root {
+  --nav-w: 64px;
+  --topbar-h: 56px;
+  --trailbar-h: 40px;
+  --gap: 8px;
+  --island-r: 12px;
 }
 
-/* ---------- cross-view primitives ---------- */
+#app {
+  height: 100vh;
+  height: 100dvh;
+  display: grid;
+  grid-template-columns: var(--nav-w) minmax(0, 1fr);
+  grid-template-rows: var(--topbar-h) auto minmax(0, 1fr);
+  grid-template-areas:
+    'nav top'
+    'nav trail'
+    'nav main';
+  background: var(--bg);
+}
+
+/* §10 tablet: the rail narrows to 56. */
+@media (max-width: 1023px) {
+  :root {
+    --nav-w: 56px;
+    --topbar-h: 52px;
+    --trailbar-h: 36px;
+  }
+}
+
+/* §10 phone: no rail; a bottom tab bar instead, and a compact top bar. */
+@media (max-width: 599px) {
+  :root {
+    --nav-w: 0px;
+    --topbar-h: 56px;
+    --trailbar-h: 40px;
+  }
+
+  #app {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: var(--topbar-h) auto minmax(0, 1fr) auto;
+    grid-template-areas:
+      'top'
+      'trail'
+      'main'
+      'tabs';
+  }
+}
+
+/* ---------- nav buttons (§2): the rail's destinations and its foot ----------
+   40x40, r 8, icon 16 in `fg-3`; active is `primary-soft` + `primary-ink`. The
+   label shows to the right of the rail on hover and keyboard focus. */
+.navbtn {
+  position: relative;
+  display: inline-flex;
+  width: 40px;
+  height: 40px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  color: var(--fg-3);
+  transition:
+    background-color 120ms,
+    color 120ms;
+}
+
+.navbtn:hover {
+  background: var(--raised);
+  color: var(--fg);
+}
+
+.navbtn.active {
+  background: var(--primary-soft);
+  color: var(--primary-ink);
+}
+
+.navbtn[data-tip]::after {
+  position: absolute;
+  top: 50%;
+  left: calc(100% + 12px);
+  z-index: 50;
+  padding: 6px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--overlay);
+  box-shadow: var(--sh-pop);
+  color: var(--fg);
+  content: attr(data-tip);
+  font: var(--t-small-500);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-50%);
+  transition: opacity 120ms;
+  white-space: nowrap;
+}
+
+.navbtn[data-tip]:hover::after,
+.navbtn[data-tip]:focus-visible::after {
+  opacity: 1;
+}
+
+.navbtn[aria-expanded='true']::after {
+  opacity: 0;
+}
+
+@media (max-width: 1023px) {
+  .navbtn {
+    width: 36px;
+    height: 36px;
+  }
+}
+
+/* ---------- islands (§2) ---------- */
+.island {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid var(--line-faint);
+  border-radius: var(--island-r);
+  background: var(--panel);
+}
+
+/* A view's island row: the islands sit 8px apart and fill the main area. */
+.islands {
+  display: grid;
+  gap: var(--gap);
+  height: 100%;
+  min-height: 0;
+}
+
+.island-h {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 52px;
+  padding: 0 16px;
+  font: var(--t-label);
+}
+
+.island-h .count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 20px;
+  padding: 0 7px;
+  border-radius: 10px;
+  background: var(--raised);
+  color: var(--fg-2);
+  font: var(--t-mono-sm);
+}
+
+/* ---------- cross-view primitives (§7) ---------- */
 .mono {
   font-family: var(--mono);
 }
 
 .dim {
-  color: var(--ink-3);
+  color: var(--fg-3);
 }
 
 .tnum {
   font-variant-numeric: tabular-nums;
 }
 
+/* Section labels: upper case, tracked — §5 `micro`. */
+.micro {
+  color: var(--fg-3);
+  font: var(--t-micro);
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+}
+
+/* Pills: 22 high, r = h/2. Neutral is `raised` + `fg-2`; a tone is its soft
+   fill with the tone as text (primary uses `primary-ink`). */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 22px;
+  padding: 0 9px;
+  border-radius: 11px;
+  background: var(--raised);
+  color: var(--fg-2);
+  font: var(--t-small-500);
+  white-space: nowrap;
+}
+
+.pill.bordered {
+  border: 1px solid var(--line);
+}
+
+.pill.mono {
+  font: var(--t-mono-sm);
+}
+
+.pill.primary {
+  background: var(--primary-soft);
+  color: var(--primary-ink);
+}
+
+.pill.cyan {
+  background: var(--cyan-soft);
+  color: var(--cyan);
+}
+
+.pill.green {
+  background: var(--green-soft);
+  color: var(--green);
+}
+
+.pill.amber {
+  background: var(--amber-soft);
+  color: var(--amber);
+}
+
+.pill.red {
+  background: var(--red-soft);
+  color: var(--red);
+}
+
+.pill.violet {
+  background: var(--violet-soft);
+  color: var(--violet);
+}
+
+.pill .dot {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.pill.green .dot {
+  box-shadow: var(--glow-green-60);
+}
+
+/* Buttons: 30 high, r 8, width text + 24. Primary is GRAD.button with the 35 %
+   glow and `on-primary` text — the only place text sits on a gradient. */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: var(--fg-2);
+  font: var(--t-small-500);
+  white-space: nowrap;
+  transition:
+    background-color 120ms,
+    border-color 120ms,
+    box-shadow 120ms;
+}
+
+.btn:hover:not(:disabled) {
+  background: var(--raised);
+  color: var(--fg);
+}
+
+.btn:active:not(:disabled) {
+  background: var(--overlay);
+}
+
+.btn.primary {
+  background: var(--grad-button);
+  box-shadow: var(--glow-35);
+  color: var(--on-primary);
+}
+
+.btn.primary:hover:not(:disabled) {
+  background: var(--grad-button);
+  box-shadow: var(--glow-55);
+  color: var(--on-primary);
+}
+
+.btn.primary:active:not(:disabled) {
+  box-shadow: none;
+}
+
+.btn.secondary {
+  border-color: var(--line);
+  background: var(--raised);
+  color: var(--fg);
+}
+
+.btn.secondary:hover:not(:disabled) {
+  border-color: var(--line-strong);
+  background: var(--overlay);
+}
+
+.btn.secondary:active:not(:disabled) {
+  background: var(--card);
+}
+
+.btn:disabled {
+  cursor: default;
+  opacity: 0.4;
+  box-shadow: none;
+}
+
+.btn.lg {
+  height: 32px;
+}
+
+/* Icon buttons: square, r 8, icon 16 centred. */
+.iconbtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: var(--fg-3);
+  transition:
+    background-color 120ms,
+    color 120ms;
+}
+
+.iconbtn:hover {
+  background: var(--raised);
+  color: var(--fg);
+}
+
+.iconbtn.bordered {
+  border-color: var(--line);
+}
+
+.iconbtn.active {
+  background: var(--primary-soft);
+  color: var(--primary-ink);
+}
+
+/* Key caps: 18 high, r 5, `overlay` + `line-strong`. */
+.kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  background: var(--overlay);
+  color: var(--fg-2);
+  font: var(--t-kbd);
+}
+
+/* Stat tiles: `card` + `line`, r 10; label `micro`, value `big-num`, and a
+   4px track at the bottom with a GRAD.data fill (GRAD.green for tests). */
+.stat {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  min-height: 64px;
+  flex-direction: column;
+  gap: 2px;
+  padding: 12px 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--card);
+}
+
+.stat .label {
+  color: var(--fg-3);
+  font: var(--t-micro);
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+}
+
+.stat .value {
+  color: var(--fg);
+  font: var(--t-big-num);
+  font-variant-numeric: tabular-nums;
+}
+
+.stat .value small {
+  margin-left: 4px;
+  color: var(--fg-3);
+  font: var(--t-small);
+}
+
+.bar {
+  position: relative;
+  display: block;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: var(--raised);
+}
+
+.bar > i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: 2px;
+  background: var(--grad-data);
+}
+
+.bar.green > i {
+  background: var(--grad-green);
+}
+
+.bar.brand > i {
+  background: var(--grad-brand);
+}
+
+.stat .bar {
+  position: absolute;
+  right: 14px;
+  bottom: 10px;
+  left: 14px;
+}
+
+/* Loading skeletons: `raised` bars, radius h/2. */
+.skeleton {
+  display: block;
+  height: 12px;
+  border-radius: 6px;
+  background: var(--raised);
+  animation: skeleton-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes skeleton-pulse {
+  50% {
+    opacity: 0.55;
+  }
+}
+
+/* Callouts: drift and stale are amber; a sample note is neutral. */
+.callout {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 36px;
+  padding: 9px 14px;
+  border-radius: 10px;
+  background: var(--raised);
+  color: var(--fg-2);
+  font: var(--t-small);
+}
+
+.callout.amber {
+  background: var(--amber-soft);
+  color: var(--amber);
+}
+
+.callout.violet {
+  background: var(--violet-soft);
+  color: var(--fg);
+}
+
+.callout a {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 /* Empty / not-yet-loaded states. Sentence case, no exclamation marks —
    say what is missing and what to do about it. */
 .emptystate {
-  padding: 40px;
-  max-width: 60ch;
-  color: var(--ink-2);
-  line-height: 1.5;
+  max-width: 64ch;
+  padding: 32px;
+  color: var(--fg-2);
+  font: var(--t-body);
 }
 
 .emptystate h2 {
   margin: 0 0 8px;
-  font-size: 16px;
-  color: var(--ink);
+  color: var(--fg);
+  font: var(--t-h2);
 }
 
 .emptystate p {
@@ -122,8 +616,53 @@ h3 {
 }
 
 .emptystate code {
-  font-family: var(--mono);
-  font-size: 12px;
-  background: var(--press);
-  padding: 1px 4px;
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: var(--raised);
+  color: var(--fg);
+  font: var(--t-mono-sm);
+}
+
+/* The error card (§7 callouts, D-02s error): what went wrong, that nothing
+   changed, the command that fixes it, and Retry. */
+.errorcard {
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr);
+  gap: 14px;
+  max-width: 640px;
+  margin: 24px;
+  padding: 20px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--card);
+  box-shadow: var(--sh-card);
+  color: var(--fg-2);
+}
+
+.errorcard .tile {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 12px;
+  background: var(--red-soft);
+  color: var(--red);
+}
+
+.errorcard h2 {
+  margin: 0 0 6px;
+  color: var(--fg);
+  font: var(--t-h2);
+}
+
+.errorcard p {
+  margin: 0 0 8px;
+}
+
+.errorcard .actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
 }

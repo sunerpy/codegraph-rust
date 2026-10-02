@@ -1,8 +1,10 @@
 /**
- * Kind glyphs — design spec §2.3.
+ * Kind letters — the character a kind tile carries.
  *
- * A 16x16 hollow square with a mono letter. Container/type kinds get a
- * --press fill so a class reads as a box and a function as an outline.
+ * Direction D draws them as soft filled tiles coloured by kind family
+ * (docs/design/viewer-d.md §7; `KindGlyph.svelte`). `FILLED_KINDS` is
+ * upstream's container/type split, which the SVG export still draws with: a
+ * filled box for a type, an outline for a function.
  */
 
 /** NodeKind values the engine emits (src/types.ts). */

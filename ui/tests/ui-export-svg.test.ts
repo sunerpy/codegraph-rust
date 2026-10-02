@@ -277,7 +277,8 @@ describe('flowSvg', () => {
 
   it('keeps fonts as stacks and embeds nothing', () => {
     const svg = flowSvg(layout);
-    expect(svg).toContain("'IBM Plex Mono'");
+    // Direction D sets code in JetBrains Mono (docs/design/viewer-d.md §5).
+    expect(svg).toContain("'JetBrains Mono'");
     expect(svg).not.toContain('@font-face');
     expect(svg).not.toContain('base64');
   });

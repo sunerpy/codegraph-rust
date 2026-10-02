@@ -1,57 +1,110 @@
+<script lang="ts" module>
+  import type { IconName } from '../lib/icons';
+
+  /** §7 kind tile colour: one tone per family of kinds. */
+  const TONE: Record<string, string> = {
+    function: 'cyan',
+    component: 'cyan',
+    module: 'cyan',
+    method: 'primary',
+    struct: 'green',
+    class: 'green',
+    union: 'green',
+    type_alias: 'green',
+    enum: 'amber',
+    enum_member: 'amber',
+    route: 'amber',
+    trait: 'violet',
+    interface: 'violet',
+    protocol: 'violet',
+  };
+
+  /** Kinds that draw a 12px icon instead of a letter. */
+  const ICON: Record<string, IconName> = {
+    file: 'file-code-2',
+    module: 'package',
+  };
+</script>
+
 <script lang="ts">
-  import { kindLetter, kindWord, FILLED_KINDS } from '../lib/kinds';
+  import Icon from './Icon.svelte';
+  import { kindLetter, kindWord } from '../lib/kinds';
 
   interface Props {
     kind: string | null | undefined;
     /** Adds a tooltip; off by default so rails do not fight the browser. */
     titled?: boolean;
+    /** Tile edge in px — §7 uses 18, 20, 22, 26 and 28. */
+    size?: number;
   }
 
-  let { kind, titled = false }: Props = $props();
+  let { kind, titled = false, size = 18 }: Props = $props();
 
   // An unknown kind (a trail hop restored from a URL, before its node is
-  // fetched) draws an empty box. A '?' would read as a claim about the symbol.
+  // fetched) draws an empty neutral tile. A '?' would read as a claim about
+  // the symbol.
   let letter = $derived(kind ? kindLetter(kind) : '');
-  let filled = $derived(kind ? FILLED_KINDS.has(kind) : false);
-  let dashed = $derived(kind === 'file');
+  let tone = $derived((kind && TONE[kind]) || 'neutral');
+  let icon = $derived(kind ? ICON[kind] : undefined);
+  let radius = $derived(Math.round(size * 0.3));
+  let fontSize = $derived(size >= 26 ? 12 : size >= 22 ? 10.5 : 10);
 </script>
 
 <span
-  class="k"
-  class:filled
-  class:dashed
+  class="k {tone}"
   class:wide={letter.length > 1}
+  style:width={`${size}px`}
+  style:height={`${size}px`}
+  style:border-radius={`${radius}px`}
+  style:font-size={`${fontSize}px`}
   title={titled ? kindWord(kind) : undefined}
   aria-hidden={titled ? undefined : 'true'}
->{letter}</span>
+  >{#if icon}<Icon name={icon} size={12} />{:else}{letter}{/if}</span
+>
 
 <style>
   .k {
     display: inline-flex;
-    width: 16px;
-    height: 16px;
     flex: 0 0 auto;
     align-items: center;
     justify-content: center;
-    border: 1px solid var(--ink-3);
-    color: var(--ink-2);
-    font: 500 9.5px var(--mono);
+    background: var(--raised);
+    color: var(--fg-2);
+    font-family: var(--mono);
+    font-weight: 700;
+    font-variant-ligatures: none;
     line-height: 1;
     user-select: none;
   }
 
-  .k.filled {
-    background: var(--press);
+  .k.cyan {
+    background: var(--cyan-soft);
+    color: var(--cyan);
   }
 
-  .k.dashed {
-    border-style: dashed;
+  .k.primary {
+    background: var(--primary-soft);
+    color: var(--primary-ink);
   }
 
-  /* Two-character letters (Tr, im, ex) need to lose a little tracking to
-     sit inside the 16px box without touching the rule. */
+  .k.green {
+    background: var(--green-soft);
+    color: var(--green);
+  }
+
+  .k.amber {
+    background: var(--amber-soft);
+    color: var(--amber);
+  }
+
+  .k.violet {
+    background: var(--violet-soft);
+    color: var(--violet);
+  }
+
+  /* Two-character letters (Tr, im, ex) lose a little tracking to sit inside
+     the tile without touching its edge. */
   .k.wide {
-    font-size: 8.5px;
-    letter-spacing: -0.02em;
+    letter-spacing: -0.04em;
   }
 </style>

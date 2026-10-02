@@ -1,120 +1,195 @@
 /* =====================================================================
-   @colbymchenry/codegraph-ui — design tokens
+   codegraph ui — design tokens, direction D "Modern Tech"
 
-   The engine's paper/ink editorial system, as specified in
-   docs/design/codegraph-ui-design-spec.md §2.2: flat, hairline rules,
-   square corners everywhere, no shadows, no gradients, sentence case,
-   one oxblood accent, one amber (the "untested" badge).
+   The numbers are docs/design/viewer-d.md: §3 colour (`D · Nebula`, dark),
+   §3.6 the light set (`D · Daylight`), §4 effects, §5 type. Every component
+   paints from these names; nothing below a token picks its own hex.
 
-   This file is the package's whole theming surface. Import it once and
-   override any variable on a narrower selector — the components read
-   nothing else. What is NOT themable is geometry: 34px rail rows, the
-   300/320px rails, the 20px code line. Those are measured against each
-   other by the Symbol view's layout pass, and a host that moves one of
-   them moves a callee row away from the line it points at.
+   Two sets, one mechanism (upstream's): the bare :root carries Daylight,
+   `prefers-color-scheme: dark` swaps in Nebula unless the reader chose light,
+   and an explicit `data-theme` — on <html> for the viewer's own switch, on a
+   wrapper for a host that embeds a reader — wins over the OS either way.
 
-   Colour and type only. Every token is defined once on the bare :root
-   below and only REDEFINED in the two dark blocks, so a host that sets
-   `--accent` on its own container gets it in both schemes.
+   Derived values (effects, gradients, the 15 aliases, Svelte Flow's
+   variables) are declared on `:root, [data-theme]` rather than on :root
+   alone. A custom property resolves its var() references where it is
+   declared, so a derived value declared only on :root would carry :root's
+   palette into a subtree that asked for the other one.
+
+   Geometry is not themable: the 20px code line, the 64px nav rail, the rail
+   widths. The Symbol view measures those against each other.
    ===================================================================== */
 
-/* ---------- tokens: light / paper (the bare :root set) ---------- */
+/* ---------- D · Daylight (light) — the bare :root set ---------- */
 :root {
-  --paper: #f7f6f2;
-  --paper-2: #f1efe8;
-  --press: #e8e6dd;
-  --press-2: #dedbd0;
-  --ink: #16150f;
-  --ink-2: #56544a;
-  --ink-3: #87847a;
-  --ink-4: #b4b1a5;
-  --rule: #16150f;
-  --rule-soft: #d6d3c8;
-  --rule-faint: #e6e3d9;
-  --accent: #7a2230;
-  --accent-ink: #5e1a25;
-  --accent-soft: #f0e3e5;
-  --accent-line: #d9b3b9;
-  --amber: #8a5a0b;
-  --amber-soft: #f3e9d2;
+  --bg: #ebeef4;
+  --rail: #e4e8f0;
+  --panel: #ffffff;
+  --card: #f7f8fb;
+  --raised: #eef1f6;
+  --overlay: #ffffff;
+  --line: #d8dde7;
+  --line-strong: #bcc4d3;
+  --line-faint: #e6e9f0;
+  --fg: #1a2130;
+  --fg-2: #434d62;
+  --fg-3: #5f687c;
+  --fg-4: #98a1b3;
+  --primary: #4155ee;
+  --primary-2: #7640ed;
+  --primary-soft: #e9edff;
+  --primary-line: #b9c3f6;
+  --primary-ink: #3340aa;
+  --primary-deep: #4c5fe8;
+  --primary-2-deep: #7a4fe6;
+  --on-primary: #ffffff;
+  --cyan: #0b7280;
+  --cyan-soft: #dcf2f5;
+  --cyan-line: #8accd6;
+  --green: #187648;
+  --green-soft: #ddf3e7;
+  --green-deep: #1f9a5e;
+  --amber: #975a00;
+  --amber-soft: #fbeed6;
+  --red: #bf332b;
+  --red-soft: #fbe4e2;
+  --violet: #7747df;
+  --violet-soft: #efe8fd;
+  --syn-kw: #7444da;
+  --syn-str: #1b7943;
+  --syn-num: #a15717;
+  --syn-com: #626a7d;
+  --syn-type: #0d7487;
+  --syn-punct: #5f6a7e;
 
-  /* The one code colour that is not a plain re-use of the ink ramp.
-     The spec asks for comments at --ink-3; measured against --paper that
-     is 3.46:1 and against the hot-line tint --accent-soft it is 3.00:1,
-     both under the 4.5:1 an AA reading of 12.5px body text needs. This is
-     the smallest step DOWN the same warm-grey ramp that clears 4.5:1 on
-     all three backgrounds a code line can have (paper 5.23, paper-2 4.92,
-     accent-soft 4.53) while staying quieter than --ink-2, which strings
-     and numbers use — so the recession order the spec describes is
-     unchanged, only legible. Dark needed the mirror step UP (4.51 on
-     accent-soft, where --ink-3 was 4.10). */
-  --code-comment: #6a675d;
-
-  --sans: 'Archivo Variable', 'Archivo', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif;
-  --mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
-  --code-size: 12.5px;
-  --code-lh: 20px;
-
-  /* App-shell geometry, shared by the grid and by anything that has to
-     offset itself under the bars (sticky rail headers, SVG overlays). */
-  --topbar-h: 48px;
-  --trailbar-h: 34px;
+  /* §3.6 effects: softer shadows, glows at 0.6x (primary) and 0.5x (data). */
+  --sh-card: 0 4px 14px 0 rgb(16 24 40 / 8%);
+  --sh-pop: 0 12px 32px 0 rgb(16 24 40 / 16%);
+  --glow-blur: 14px;
+  --glow-k: 0.6;
+  --glow-data-blur: 6px;
+  --glow-data-k: 0.5;
+  --canvas-base: var(--card);
+  --dots: #d3d9e4;
+  --ambient-1: #c7d0ff;
+  --ambient-2: #e0d2ff;
 
   color-scheme: light dark;
 }
 
-/* ---------- tokens: dark / ink ----------
-   Every colour is defined on the bare :root above; these blocks only
-   redefine. `:not([data-theme="light"])` lets an explicit light choice
-   win over the OS preference. */
+/* ---------- D · Nebula (dark) ----------
+   The same names redefined. `:not([data-theme='light'])` lets an explicit
+   light choice win over the OS preference. */
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme='light']) {
-    --paper: #16150f;
-    --paper-2: #1c1a14;
-    --press: #23211a;
-    --press-2: #2c2a22;
-    --ink: #f3f1ea;
-    --ink-2: #b8b5a8;
-    --ink-3: #87847a;
-    --ink-4: #5d5b52;
-    --rule: #f3f1ea;
-    --rule-soft: #34322a;
-    --rule-faint: #26241d;
-    --accent: #d48b96;
-    --accent-ink: #e5a5ae;
-    --accent-soft: #33201f;
-    --accent-line: #6b3a42;
-    --amber: #d9a94a;
-    --amber-soft: #2e2716;
-    --code-comment: #8e8b81;
+    --bg: #0a0c10;
+    --rail: #0d1016;
+    --panel: #10141b;
+    --card: #151a23;
+    --raised: #1b2130;
+    --overlay: #1f2636;
+    --line: #232a38;
+    --line-strong: #303a4d;
+    --line-faint: #191f29;
+    --fg: #e8ecf4;
+    --fg-2: #a9b2c4;
+    --fg-3: #838da0;
+    --fg-4: #4a5468;
+    --primary: #7c93ff;
+    --primary-2: #a07cff;
+    --primary-soft: #1a2140;
+    --primary-line: #3b4a8c;
+    --primary-ink: #b9c6ff;
+    --primary-deep: #4465ff;
+    --primary-2-deep: #7f4eff;
+    --on-primary: #ffffff;
+    --cyan: #3dd6e8;
+    --cyan-soft: #0e2a31;
+    --cyan-line: #1f5966;
+    --green: #3fd68e;
+    --green-soft: #0e2a1f;
+    --green-deep: #2bb673;
+    --amber: #f5b544;
+    --amber-soft: #2e240e;
+    --red: #f2706b;
+    --red-soft: #2f1517;
+    --violet: #b48cff;
+    --violet-soft: #231a3d;
+    --syn-kw: #b79cff;
+    --syn-str: #8fd9a8;
+    --syn-num: #f5b57a;
+    --syn-com: #808aa2;
+    --syn-type: #7fcfe6;
+    --syn-punct: #8c96ab;
+    --sh-card: 0 6px 20px 0 rgb(0 0 0 / 32%);
+    --sh-pop: 0 16px 40px 0 rgb(0 0 0 / 50%);
+    --glow-blur: 18px;
+    --glow-k: 1;
+    --glow-data-blur: 8px;
+    --glow-data-k: 1;
+    --canvas-base: var(--panel);
+    --dots: #2c3445;
+    --ambient-1: #3a4ca8;
+    --ambient-2: #553f9e;
+    color-scheme: dark;
   }
 }
 
 /* An explicit choice, wherever it is made. `:root[data-theme]` is the viewer's
    own switch; the bare attribute selector is what `<CodegraphUi theme="dark">`
-   sets on its wrapper — custom properties inherit, so redefining them on a
-   container re-themes that subtree without touching :root. A host can therefore
-   put a light reader inside a dark application, and the reverse. */
+   sets on its wrapper, so a host can put a dark reader inside a light page and
+   the reverse. */
 :root[data-theme='dark'],
 [data-theme='dark'] {
-  --paper: #16150f;
-  --paper-2: #1c1a14;
-  --press: #23211a;
-  --press-2: #2c2a22;
-  --ink: #f3f1ea;
-  --ink-2: #b8b5a8;
-  --ink-3: #87847a;
-  --ink-4: #5d5b52;
-  --rule: #f3f1ea;
-  --rule-soft: #34322a;
-  --rule-faint: #26241d;
-  --accent: #d48b96;
-  --accent-ink: #e5a5ae;
-  --accent-soft: #33201f;
-  --accent-line: #6b3a42;
-  --amber: #d9a94a;
-  --amber-soft: #2e2716;
-  --code-comment: #8e8b81;
+  --bg: #0a0c10;
+  --rail: #0d1016;
+  --panel: #10141b;
+  --card: #151a23;
+  --raised: #1b2130;
+  --overlay: #1f2636;
+  --line: #232a38;
+  --line-strong: #303a4d;
+  --line-faint: #191f29;
+  --fg: #e8ecf4;
+  --fg-2: #a9b2c4;
+  --fg-3: #838da0;
+  --fg-4: #4a5468;
+  --primary: #7c93ff;
+  --primary-2: #a07cff;
+  --primary-soft: #1a2140;
+  --primary-line: #3b4a8c;
+  --primary-ink: #b9c6ff;
+  --primary-deep: #4465ff;
+  --primary-2-deep: #7f4eff;
+  --on-primary: #ffffff;
+  --cyan: #3dd6e8;
+  --cyan-soft: #0e2a31;
+  --cyan-line: #1f5966;
+  --green: #3fd68e;
+  --green-soft: #0e2a1f;
+  --green-deep: #2bb673;
+  --amber: #f5b544;
+  --amber-soft: #2e240e;
+  --red: #f2706b;
+  --red-soft: #2f1517;
+  --violet: #b48cff;
+  --violet-soft: #231a3d;
+  --syn-kw: #b79cff;
+  --syn-str: #8fd9a8;
+  --syn-num: #f5b57a;
+  --syn-com: #808aa2;
+  --syn-type: #7fcfe6;
+  --syn-punct: #8c96ab;
+  --sh-card: 0 6px 20px 0 rgb(0 0 0 / 32%);
+  --sh-pop: 0 16px 40px 0 rgb(0 0 0 / 50%);
+  --glow-blur: 18px;
+  --glow-k: 1;
+  --glow-data-blur: 8px;
+  --glow-data-k: 1;
+  --canvas-base: var(--panel);
+  --dots: #2c3445;
+  --ambient-1: #3a4ca8;
+  --ambient-2: #553f9e;
   color-scheme: dark;
 }
 
@@ -122,71 +197,184 @@
    the OS is painting dark. `:root[data-theme='light']` needs no block — the
    media query above already excludes it. */
 [data-theme='light'] {
-  --paper: #f7f6f2;
-  --paper-2: #f1efe8;
-  --press: #e8e6dd;
-  --press-2: #dedbd0;
-  --ink: #16150f;
-  --ink-2: #56544a;
-  --ink-3: #87847a;
-  --ink-4: #b4b1a5;
-  --rule: #16150f;
-  --rule-soft: #d6d3c8;
-  --rule-faint: #e6e3d9;
-  --accent: #7a2230;
-  --accent-ink: #5e1a25;
-  --accent-soft: #f0e3e5;
-  --accent-line: #d9b3b9;
-  --amber: #8a5a0b;
-  --amber-soft: #f3e9d2;
-  --code-comment: #6a675d;
+  --bg: #ebeef4;
+  --rail: #e4e8f0;
+  --panel: #ffffff;
+  --card: #f7f8fb;
+  --raised: #eef1f6;
+  --overlay: #ffffff;
+  --line: #d8dde7;
+  --line-strong: #bcc4d3;
+  --line-faint: #e6e9f0;
+  --fg: #1a2130;
+  --fg-2: #434d62;
+  --fg-3: #5f687c;
+  --fg-4: #98a1b3;
+  --primary: #4155ee;
+  --primary-2: #7640ed;
+  --primary-soft: #e9edff;
+  --primary-line: #b9c3f6;
+  --primary-ink: #3340aa;
+  --primary-deep: #4c5fe8;
+  --primary-2-deep: #7a4fe6;
+  --on-primary: #ffffff;
+  --cyan: #0b7280;
+  --cyan-soft: #dcf2f5;
+  --cyan-line: #8accd6;
+  --green: #187648;
+  --green-soft: #ddf3e7;
+  --green-deep: #1f9a5e;
+  --amber: #975a00;
+  --amber-soft: #fbeed6;
+  --red: #bf332b;
+  --red-soft: #fbe4e2;
+  --violet: #7747df;
+  --violet-soft: #efe8fd;
+  --syn-kw: #7444da;
+  --syn-str: #1b7943;
+  --syn-num: #a15717;
+  --syn-com: #626a7d;
+  --syn-type: #0d7487;
+  --syn-punct: #5f6a7e;
+  --sh-card: 0 4px 14px 0 rgb(16 24 40 / 8%);
+  --sh-pop: 0 12px 32px 0 rgb(16 24 40 / 16%);
+  --glow-blur: 14px;
+  --glow-k: 0.6;
+  --glow-data-blur: 6px;
+  --glow-data-k: 0.5;
+  --canvas-base: var(--card);
+  --dots: #d3d9e4;
+  --ambient-1: #c7d0ff;
+  --ambient-2: #e0d2ff;
   color-scheme: light;
 }
 
-/* ---------- Svelte Flow ----------
-   The Map and the Flow strip draw on @xyflow/svelte, which ships its own
-   blue-on-white palette in `--xy-*` variables. Mapping them onto the ink
-   ramp here — rather than in each canvas — is what stops a host from
-   seeing library defaults in the gaps our custom node and edge
-   components do not paint: the pane behind the cards, the controls, the
-   minimap, the selection ring, the attribution.
+/* ---------- derived: type, effects, gradients, aliases ---------- */
+:root,
+[data-theme] {
+  /* §5: Inter for the interface, JetBrains Mono for code, names and numbers. */
+  --sans: 'Inter Variable', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+    'Helvetica Neue', Arial, sans-serif;
+  --mono: 'JetBrains Mono Variable', 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas,
+    monospace;
+  --code-size: 12.5px;
+  --code-lh: 20px;
 
-   Set on :root so it reaches the portalled panes too. A host that wants
-   the library's own look overrides these after importing this file. */
-:root {
-  --xy-background-color: var(--paper);
-  --xy-background-pattern-color: var(--rule-faint);
+  /* §5 type roles, as `font` shorthands: `font: var(--t-label)`. */
+  --t-display: 600 24px / 31.92px var(--sans);
+  --t-h1: 600 20px / 28px var(--sans);
+  --t-h2: 600 15px / 22.05px var(--sans);
+  --t-label: 600 13px / 17.94px var(--sans);
+  --t-body: 400 13px / 20.02px var(--sans);
+  --t-body-500: 500 13px / 20.02px var(--sans);
+  --t-small: 400 12px / 15.96px var(--sans);
+  --t-small-500: 500 12px / 15.96px var(--sans);
+  --t-micro: 600 10.5px / 13.97px var(--sans);
+  --t-caption: 400 11px / 13.97px var(--sans);
+  --t-big-num: 600 22px / 27.94px var(--sans);
+  --t-title-mono: 600 20px / 28px var(--mono);
+  --t-code: 400 12.5px / 20px var(--mono);
+  --t-mono: 400 12px / 15.96px var(--mono);
+  --t-mono-500: 500 12px / 15.96px var(--mono);
+  --t-mono-sm: 400 11px / 13.97px var(--mono);
+  --t-kbd: 500 10.5px / 13.97px var(--mono);
+  --t-tile: 700 10px / 12px var(--mono);
+  --t-lineno: 400 11px / 20px var(--mono);
 
-  --xy-edge-stroke: var(--ink-3);
-  --xy-edge-stroke-selected: var(--accent);
+  /* §4 SH.glow(op) — 0 0 18 0 primary @ op (Daylight: blur 14, 0.6 x op). One
+     variable per opacity the spec uses, so a component names its glow. */
+  --glow-20: 0 0 var(--glow-blur) 0 color-mix(in srgb, var(--primary) calc(20% * var(--glow-k)), transparent);
+  --glow-22: 0 0 var(--glow-blur) 0 color-mix(in srgb, var(--primary) calc(22% * var(--glow-k)), transparent);
+  --glow-25: 0 0 var(--glow-blur) 0 color-mix(in srgb, var(--primary) calc(25% * var(--glow-k)), transparent);
+  --glow-30: 0 0 var(--glow-blur) 0 color-mix(in srgb, var(--primary) calc(30% * var(--glow-k)), transparent);
+  --glow-35: 0 0 var(--glow-blur) 0 color-mix(in srgb, var(--primary) calc(35% * var(--glow-k)), transparent);
+  --glow-40: 0 0 var(--glow-blur) 0 color-mix(in srgb, var(--primary) calc(40% * var(--glow-k)), transparent);
+  --glow-45: 0 0 var(--glow-blur) 0 color-mix(in srgb, var(--primary) calc(45% * var(--glow-k)), transparent);
+  --glow-50: 0 0 var(--glow-blur) 0 color-mix(in srgb, var(--primary) calc(50% * var(--glow-k)), transparent);
+  --glow-55: 0 0 var(--glow-blur) 0 color-mix(in srgb, var(--primary) calc(55% * var(--glow-k)), transparent);
+  /* SH.glowCyan(op) / SH.glowGreen(op) — 0 0 8 0 @ op (Daylight: blur 6, 0.5 x op). */
+  --glow-cyan-45: 0 0 var(--glow-data-blur) 0 color-mix(in srgb, var(--cyan) calc(45% * var(--glow-data-k)), transparent);
+  --glow-cyan-55: 0 0 var(--glow-data-blur) 0 color-mix(in srgb, var(--cyan) calc(55% * var(--glow-data-k)), transparent);
+  --glow-cyan-60: 0 0 var(--glow-data-blur) 0 color-mix(in srgb, var(--cyan) calc(60% * var(--glow-data-k)), transparent);
+  --glow-cyan-80: 0 0 var(--glow-data-blur) 0 color-mix(in srgb, var(--cyan) calc(80% * var(--glow-data-k)), transparent);
+  --glow-cyan-90: 0 0 var(--glow-data-blur) 0 color-mix(in srgb, var(--cyan) calc(90% * var(--glow-data-k)), transparent);
+  --glow-green-60: 0 0 var(--glow-data-blur) 0 color-mix(in srgb, var(--green) calc(60% * var(--glow-data-k)), transparent);
+  --glow-green-80: 0 0 var(--glow-data-blur) 0 color-mix(in srgb, var(--green) calc(80% * var(--glow-data-k)), transparent);
+  /* The same cyan glows for SVG strokes, which take no box-shadow: a
+     drop-shadow() deviation is half a box-shadow blur radius. */
+  --glow-cyan-45-f: drop-shadow(0 0 calc(var(--glow-data-blur) / 2) color-mix(in srgb, var(--cyan) calc(45% * var(--glow-data-k)), transparent));
+  --glow-cyan-55-f: drop-shadow(0 0 calc(var(--glow-data-blur) / 2) color-mix(in srgb, var(--cyan) calc(55% * var(--glow-data-k)), transparent));
+  --glow-cyan-60-f: drop-shadow(0 0 calc(var(--glow-data-blur) / 2) color-mix(in srgb, var(--cyan) calc(60% * var(--glow-data-k)), transparent));
+  --glow-cyan-80-f: drop-shadow(0 0 calc(var(--glow-data-blur) / 2) color-mix(in srgb, var(--cyan) calc(80% * var(--glow-data-k)), transparent));
+  --glow-cyan-90-f: drop-shadow(0 0 calc(var(--glow-data-blur) / 2) color-mix(in srgb, var(--cyan) calc(90% * var(--glow-data-k)), transparent));
+  --glow-50-f: drop-shadow(0 0 calc(var(--glow-blur) / 2) color-mix(in srgb, var(--primary) calc(50% * var(--glow-k)), transparent));
+
+  /* §4 gradients. GRAD.brand runs left to right on a horizontal bar and corner
+     to corner on anything else; GRAD.button is the only one text sits on. */
+  --grad-brand: linear-gradient(90deg, var(--primary), var(--primary-2));
+  --grad-brand-v: linear-gradient(180deg, var(--primary), var(--primary-2));
+  --grad-brand-d: linear-gradient(to bottom right, var(--primary), var(--primary-2));
+  --grad-button: linear-gradient(to bottom right, var(--primary-deep), var(--primary-2-deep));
+  --grad-data: linear-gradient(90deg, var(--cyan), var(--primary));
+  --grad-green: linear-gradient(90deg, var(--green-deep), var(--green));
+
+  /* The canvas behind Map, Flow, Screens and Steps: a dot grid at pitch 20 and
+     two ambient glows, top left and bottom right. */
+  --canvas: radial-gradient(ellipse 34% 60% at 10% 6%, color-mix(in srgb, var(--ambient-1) 35%, transparent), transparent),
+    radial-gradient(ellipse 28% 50% at 95% 98%, color-mix(in srgb, var(--ambient-2) 35%, transparent), transparent),
+    radial-gradient(circle, var(--dots) 1.05px, transparent 1.6px) 0 0 / 20px 20px,
+    var(--canvas-base);
+
+  /* §3.2 — the 15 aliases, so a rule written against upstream's names paints
+     with D's. New rules use the token names. `--accent-ink` is upstream's
+     sixteenth name; it maps the way §3.2 maps `--accent`. */
+  --paper: var(--panel);
+  --paper-2: var(--raised);
+  --press: var(--raised);
+  --press-2: var(--line);
+  --ink: var(--fg);
+  --ink-2: var(--fg-2);
+  --ink-3: var(--fg-3);
+  --ink-4: var(--fg-4);
+  --rule: var(--line-strong);
+  --rule-soft: var(--line);
+  --rule-faint: var(--line-faint);
+  --accent: var(--primary);
+  --accent-soft: var(--primary-soft);
+  --accent-line: var(--primary-line);
+  --accent-ink: var(--primary-ink);
+  --code-comment: var(--syn-com);
+
+  /* ---------- Svelte Flow ----------
+     @xyflow/svelte ships its own palette in `--xy-*`; mapping it here keeps
+     library defaults out of the gaps our node and edge components do not
+     paint: the pane, the controls, the minimap, the selection ring. */
+  --xy-background-color: transparent;
+  --xy-background-pattern-color: var(--dots);
+  --xy-edge-stroke: var(--line-strong);
+  --xy-edge-stroke-selected: var(--cyan);
   --xy-edge-stroke-width: 1;
-  --xy-connectionline-stroke: var(--ink-3);
-
-  --xy-node-color: var(--ink);
-  --xy-node-background-color: var(--paper);
-  --xy-node-border: 1px solid var(--rule-soft);
+  --xy-connectionline-stroke: var(--fg-3);
+  --xy-node-color: var(--fg);
+  --xy-node-background-color: var(--card);
+  --xy-node-border: 1px solid var(--line);
   --xy-node-boxshadow-hover: none;
   --xy-node-boxshadow-selected: none;
-  --xy-selection-background-color: var(--accent-soft);
-  --xy-selection-border: 1px solid var(--accent-line);
-
+  --xy-selection-background-color: color-mix(in srgb, var(--primary-soft) 60%, transparent);
+  --xy-selection-border: 1px solid var(--primary-line);
   --xy-handle-background-color: transparent;
   --xy-handle-border-color: transparent;
-
-  --xy-controls-button-background-color: var(--paper);
-  --xy-controls-button-background-color-hover: var(--press);
-  --xy-controls-button-color: var(--ink-2);
-  --xy-controls-button-color-hover: var(--ink);
-  --xy-controls-button-border-color: var(--rule-soft);
-  --xy-controls-box-shadow: none;
-
-  --xy-minimap-background-color: var(--paper-2);
-  --xy-minimap-mask-background-color: var(--paper);
-  --xy-minimap-node-background-color: var(--rule-soft);
-  --xy-minimap-node-stroke-color: var(--ink-3);
-
+  --xy-controls-button-background-color: var(--overlay);
+  --xy-controls-button-background-color-hover: var(--raised);
+  --xy-controls-button-color: var(--fg-2);
+  --xy-controls-button-color-hover: var(--fg);
+  --xy-controls-button-border-color: var(--line);
+  --xy-controls-box-shadow: var(--sh-pop);
+  --xy-minimap-background-color: var(--overlay);
+  --xy-minimap-mask-background-color: color-mix(in srgb, var(--bg) 60%, transparent);
+  --xy-minimap-node-background-color: var(--line-strong);
+  --xy-minimap-node-stroke-color: var(--fg-3);
   --xy-attribution-background-color: transparent;
-
-  --xy-resize-background-color: var(--accent);
-  --xy-error-color: var(--accent);
+  --xy-resize-background-color: var(--primary);
+  --xy-error-color: var(--red);
 }

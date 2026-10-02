@@ -34,6 +34,11 @@ export default defineConfig(({ command }) => {
       // double the bundle in every platform archive for no one's benefit.
       sourcemap: false,
       chunkSizeWarningLimit: 1024,
+      // Never inline an asset as a data: URI. The server's CSP allows fonts
+      // from 'self' only, and Vite would otherwise inline every font subset
+      // under 4 kB (JetBrains Mono's cyrillic-ext is 2 kB) — which the browser
+      // then refuses to load.
+      assetsInlineLimit: 0,
     },
     server: {
       host: '127.0.0.1',

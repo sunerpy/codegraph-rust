@@ -27,24 +27,27 @@
  * The measurements that actually place things — heights, widths, columns — are
  * NOT restated; they are imported from the layout models.
  *
- * ## Light, always
+ * ## In the theme on screen, as literal hex
  *
- * An image pasted into a PR is read by people whose editors are set both ways,
- * and a dark-mode screenshot on GitHub's white comment background reads as a
- * mistake. So the export inlines the light token set as literal hex regardless
- * of the viewer's theme — there is no `prefers-color-scheme` in a file someone
- * else opens.
+ * Direction D (docs/design/viewer-d.md §3, §3.6) has two token sets, and the
+ * export paints the one the reader is looking at: the caller passes `theme`
+ * (the viewer passes the effective theme, System resolved). Light is the
+ * default, upstream's reasoning for a file read on someone else's page. Either
+ * way the colours are inlined as literal hex — there is no
+ * `prefers-color-scheme` in a file someone else opens, and an export must not
+ * depend on a stylesheet having loaded. `ui/tests/theme-contrast.test.ts`
+ * checks both palettes against `lib/theme.css`, so the two cannot drift.
  *
  * ## Fonts are stacks, not bytes
  *
  * Per the spec: no embedding. The consequence is honest and worth stating —
- * an exported SVG opened on a machine without IBM Plex Mono falls back through
- * the stack to the platform's own monospace, and a PNG rasterised through an
- * `<img>` always does, because an SVG loaded as an image may not fetch a
- * webfont. Every fallback in the mono stack advances at ~0.6em like Plex Mono
- * does, so the monospace grid the code windows depend on survives the swap;
- * only the letterforms change. Embedding Plex Mono would add ~90 kB of base64
- * to every export and put us over the PNG budget for nothing.
+ * an exported SVG opened on a machine without JetBrains Mono falls back
+ * through the stack to the platform's own monospace, and a PNG rasterised
+ * through an `<img>` always does, because an SVG loaded as an image may not
+ * fetch a webfont. Every fallback in the mono stack advances at ~0.6em like
+ * JetBrains Mono does, so the monospace grid the code windows depend on
+ * survives the swap; only the letterforms change. Embedding the font would add
+ * tens of kB of base64 to every export for nothing.
  *
  * Tested in `__tests__/ui-export-svg.test.ts`.
  */
@@ -77,32 +80,89 @@ import { kindLetter, FILLED_KINDS } from './kinds';
 
 /* ---------------------------------------------------------------- tokens -- */
 
+/** The colours an export paints with, named as upstream's tokens were. */
+export interface ExportPalette {
+  paper: string;
+  paper2: string;
+  press: string;
+  ink: string;
+  ink2: string;
+  ink3: string;
+  ink4: string;
+  ruleSoft: string;
+  ruleFaint: string;
+  accent: string;
+  accentSoft: string;
+  accentLine: string;
+  codeComment: string;
+}
+
 /**
- * The light token set (`ui/src/app.css`, the bare `:root` block), as literal
- * hex. Copied deliberately rather than read from `getComputedStyle`: an export
- * must not depend on a stylesheet having loaded, and must not follow the
- * reader's theme into a dark image on a white page.
+ * Both D token sets (`lib/theme.css`), as literal hex under upstream's names —
+ * the §3.2 aliases: paper = panel, paper-2 = raised, press = raised, ink = fg,
+ * ink-2..4 = fg-2..4, rule-soft = line, rule-faint = line-faint, accent =
+ * primary, accent-soft = primary-soft, accent-line = primary-line,
+ * code-comment = syn-com.
  */
-export const EXPORT_COLORS = {
-  paper: '#f7f6f2',
-  paper2: '#f1efe8',
-  press: '#e8e6dd',
-  ink: '#16150f',
-  ink2: '#56544a',
-  ink3: '#87847a',
-  ink4: '#b4b1a5',
-  ruleSoft: '#d6d3c8',
-  ruleFaint: '#e6e3d9',
-  accent: '#7a2230',
-  accentSoft: '#f0e3e5',
-  accentLine: '#d9b3b9',
-  codeComment: '#6a675d',
-} as const;
+export const EXPORT_PALETTES: Record<'light' | 'dark', ExportPalette> = {
+  // D · Daylight (§3.6)
+  light: {
+    paper: '#ffffff',
+    paper2: '#eef1f6',
+    press: '#eef1f6',
+    ink: '#1a2130',
+    ink2: '#434d62',
+    ink3: '#5f687c',
+    ink4: '#98a1b3',
+    ruleSoft: '#d8dde7',
+    ruleFaint: '#e6e9f0',
+    accent: '#4155ee',
+    accentSoft: '#e9edff',
+    accentLine: '#b9c3f6',
+    codeComment: '#626a7d',
+  },
+  // D · Nebula (§3.1)
+  dark: {
+    paper: '#10141b',
+    paper2: '#1b2130',
+    press: '#1b2130',
+    ink: '#e8ecf4',
+    ink2: '#a9b2c4',
+    ink3: '#838da0',
+    ink4: '#4a5468',
+    ruleSoft: '#232a38',
+    ruleFaint: '#191f29',
+    accent: '#7c93ff',
+    accentSoft: '#1a2140',
+    accentLine: '#3b4a8c',
+    codeComment: '#808aa2',
+  },
+};
+
+/** The light palette — what an export paints when no theme is asked for. */
+export const EXPORT_COLORS: ExportPalette = EXPORT_PALETTES.light;
+
+/**
+ * The palette the drawing in progress paints with. Set by `flowSvg` and
+ * `mapSvg` for the length of one call (they are synchronous), so the drawing
+ * helpers below need no extra parameter.
+ */
+let C: ExportPalette = EXPORT_COLORS;
+
+function withPalette<T>(theme: 'light' | 'dark' | undefined, draw: () => T): T {
+  const previous = C;
+  C = EXPORT_PALETTES[theme ?? 'light'];
+  try {
+    return draw();
+  } finally {
+    C = previous;
+  }
+}
 
 export const MONO_STACK =
-  "'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace";
+  "'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace";
 export const SANS_STACK =
-  "'Archivo Variable', 'Archivo', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif";
+  "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif";
 
 /** Clear space between the drawing and the edge of the image (design spec §3.9). */
 export const EXPORT_PADDING = 24;
@@ -250,6 +310,8 @@ export interface ExportOptions {
   scale?: number;
   /** A line of context under the drawing, left of the mark. */
   caption?: string | null;
+  /** Which token set to paint with; light when omitted. */
+  theme?: 'light' | 'dark';
 }
 
 interface Frame {
@@ -281,7 +343,7 @@ function document_(frame: Frame, defs: string, body: string, options: ExportOpti
             x: EXPORT_PADDING,
             y: markY,
             size: MARK_SIZE,
-            fill: EXPORT_COLORS.ink3,
+            fill: C.ink3,
             family: MONO_STACK,
           },
           esc(
@@ -296,7 +358,7 @@ function document_(frame: Frame, defs: string, body: string, options: ExportOpti
   return [
     `<svg xmlns="http://www.w3.org/2000/svg" width="${Math.round(width * scale)}" height="${Math.round(height * scale)}" viewBox="0 0 ${width} ${height}" font-family="${SANS_STACK}">`,
     defs === '' ? '' : `<defs>${defs}</defs>`,
-    rect(0, 0, width, height, { fill: EXPORT_COLORS.paper }),
+    rect(0, 0, width, height, { fill: C.paper }),
     `<g transform="translate(${round(EXPORT_PADDING - frame.minX)},${round(EXPORT_PADDING - frame.minY)})">`,
     body,
     '</g>',
@@ -306,7 +368,7 @@ function document_(frame: Frame, defs: string, body: string, options: ExportOpti
         x: width - EXPORT_PADDING,
         y: markY,
         size: MARK_SIZE,
-        fill: EXPORT_COLORS.ink3,
+        fill: C.ink3,
         family: MONO_STACK,
         anchor: 'end',
       },
@@ -362,8 +424,8 @@ function flowCardSvg(card: FlowCardLayout, dimmed: boolean, current: boolean): s
 
   out.push(
     rect(card.x, card.y, card.width, card.height, {
-      fill: EXPORT_COLORS.paper,
-      stroke: current ? EXPORT_COLORS.accent : EXPORT_COLORS.ruleSoft,
+      fill: C.paper,
+      stroke: current ? C.accent : C.ruleSoft,
     })
   );
 
@@ -373,8 +435,8 @@ function flowCardSvg(card: FlowCardLayout, dimmed: boolean, current: boolean): s
   const gy = card.y + GLYPH_TOP;
   out.push(
     rect(gx, gy, GLYPH_SIZE, GLYPH_SIZE, {
-      fill: FILLED_KINDS.has(hop.node.kind) ? EXPORT_COLORS.press : 'none',
-      stroke: EXPORT_COLORS.ink3,
+      fill: FILLED_KINDS.has(hop.node.kind) ? C.press : 'none',
+      stroke: C.ink3,
       dash: hop.node.kind === 'file' ? '2 2' : undefined,
     })
   );
@@ -386,7 +448,7 @@ function flowCardSvg(card: FlowCardLayout, dimmed: boolean, current: boolean): s
           x: gx + GLYPH_SIZE / 2,
           y: gy + GLYPH_SIZE / 2 + glyphSize * 0.36,
           size: glyphSize,
-          fill: EXPORT_COLORS.ink2,
+          fill: C.ink2,
           family: MONO_STACK,
           weight: 500,
           anchor: 'middle',
@@ -406,7 +468,7 @@ function flowCardSvg(card: FlowCardLayout, dimmed: boolean, current: boolean): s
         x: nameX,
         y: card.y + HEAD_BASELINE,
         size: NAME_SIZE,
-        fill: EXPORT_COLORS.ink,
+        fill: C.ink,
         family: MONO_STACK,
         weight: 600,
       },
@@ -417,13 +479,13 @@ function flowCardSvg(card: FlowCardLayout, dimmed: boolean, current: boolean): s
         x: card.x + card.width - CARD_PAD_X,
         y: card.y + HEAD_BASELINE,
         size: LOC_SIZE,
-        fill: EXPORT_COLORS.ink3,
+        fill: C.ink3,
         family: MONO_STACK,
         anchor: 'end',
       },
       esc(loc)
     ),
-    `<line x1="${round(card.x)}" y1="${round(card.y + HEADER_HEIGHT)}" x2="${round(card.x + card.width)}" y2="${round(card.y + HEADER_HEIGHT)}" stroke="${EXPORT_COLORS.ruleFaint}" stroke-width="1" />`
+    `<line x1="${round(card.x)}" y1="${round(card.y + HEADER_HEIGHT)}" x2="${round(card.x + card.width)}" y2="${round(card.y + HEADER_HEIGHT)}" stroke="${C.ruleFaint}" stroke-width="1" />`
   );
 
   // --- source window -------------------------------------------------------
@@ -438,7 +500,7 @@ function flowCardSvg(card: FlowCardLayout, dimmed: boolean, current: boolean): s
           x: card.x + CARD_PAD_X,
           y: card.y + HEADER_HEIGHT + 6 + CODE_BASELINE,
           size: CODE_SIZE,
-          fill: EXPORT_COLORS.ink3,
+          fill: C.ink3,
         },
         esc(truncate(why, card.width - CARD_PAD_X * 2, CODE_SIZE, SANS_ADVANCE))
       )
@@ -473,7 +535,7 @@ function flowCardSvg(card: FlowCardLayout, dimmed: boolean, current: boolean): s
     const claimed = assignRefs(lineTokens, refs.get(n) ?? []);
     if (n === callRef?.line || n === card.stopLine) {
       body.push(
-        rect(card.x, top, card.width, CODE_LINE_HEIGHT, { fill: EXPORT_COLORS.accentSoft })
+        rect(card.x, top, card.width, CODE_LINE_HEIGHT, { fill: C.accentSoft })
       );
     }
     body.push(
@@ -482,7 +544,7 @@ function flowCardSvg(card: FlowCardLayout, dimmed: boolean, current: boolean): s
           x: card.x + GUTTER - 10,
           y: top + CODE_BASELINE,
           size: LINE_NO_SIZE,
-          fill: EXPORT_COLORS.ink4,
+          fill: C.ink4,
           family: MONO_STACK,
           anchor: 'end',
         },
@@ -512,7 +574,7 @@ function flowCardSvg(card: FlowCardLayout, dimmed: boolean, current: boolean): s
           x: textX,
           y: top + CODE_BASELINE,
           size: CODE_SIZE,
-          fill: EXPORT_COLORS.ink,
+          fill: C.ink,
           family: MONO_STACK,
           preserve: true,
         },
@@ -526,7 +588,7 @@ function flowCardSvg(card: FlowCardLayout, dimmed: boolean, current: boolean): s
       const u = underline as { from: number; length: number };
       const x1 = textX + monoWidth(u.from, CODE_SIZE);
       body.push(
-        `<line x1="${round(x1)}" y1="${round(top + CODE_BASELINE + 3)}" x2="${round(x1 + monoWidth(u.length, CODE_SIZE))}" y2="${round(top + CODE_BASELINE + 3)}" stroke="${EXPORT_COLORS.accentLine}" stroke-width="1" />`
+        `<line x1="${round(x1)}" y1="${round(top + CODE_BASELINE + 3)}" x2="${round(x1 + monoWidth(u.length, CODE_SIZE))}" y2="${round(top + CODE_BASELINE + 3)}" stroke="${C.accentLine}" stroke-width="1" />`
       );
     }
   });
@@ -539,13 +601,13 @@ function flowCardSvg(card: FlowCardLayout, dimmed: boolean, current: boolean): s
 function tokenSpan(text: string, token: Token, isRef: boolean): string {
   if (text === '') return '';
   const escaped = esc(text);
-  if (isRef) return `<tspan fill="${EXPORT_COLORS.accent}">${escaped}</tspan>`;
+  if (isRef) return `<tspan fill="${C.accent}">${escaped}</tspan>`;
   switch (token.cls) {
     case 'comment':
-      return `<tspan fill="${EXPORT_COLORS.codeComment}">${escaped}</tspan>`;
+      return `<tspan fill="${C.codeComment}">${escaped}</tspan>`;
     case 'string':
     case 'number':
-      return `<tspan fill="${EXPORT_COLORS.ink2}">${escaped}</tspan>`;
+      return `<tspan fill="${C.ink2}">${escaped}</tspan>`;
     case 'keyword':
       return `<tspan font-weight="500">${escaped}</tspan>`;
     default:
@@ -626,8 +688,8 @@ function flowCapSvg(cap: FlowEndCapLayout, dimmed: boolean): string {
   const { rows, height } = capRows(cap);
   const out: string[] = [
     rect(cap.x, cap.y, cap.width, Math.max(cap.height, height), {
-      fill: EXPORT_COLORS.paper,
-      stroke: EXPORT_COLORS.ruleSoft,
+      fill: C.paper,
+      stroke: C.ruleSoft,
       dash: '3 3',
     }),
   ];
@@ -640,10 +702,10 @@ function flowCapSvg(cap: FlowEndCapLayout, dimmed: boolean): string {
     const step = mono ? END_CAP_ROW : END_CAP_LINE;
     const fill =
       row.kind === 'form' || row.kind === 'lead'
-        ? EXPORT_COLORS.ink
+        ? C.ink
         : row.kind === 'soft'
-          ? EXPORT_COLORS.ink3
-          : EXPORT_COLORS.ink2;
+          ? C.ink3
+          : C.ink2;
     out.push(
       textEl(
         {
@@ -676,11 +738,11 @@ function flowLinkSvg(
       : `M${round(sx)},${round(sy)} C${round((sx + tx) / 2)},${round(sy)} ${round((sx + tx) / 2)},${round(ty)} ${round(tx)},${round(ty)}`;
 
   const out: string[] = [
-    `<path d="${path}" fill="none" stroke="${EXPORT_COLORS.ink3}" stroke-width="1"${link.dash ? ` stroke-dasharray="${link.dash}"` : ''} />`,
+    `<path d="${path}" fill="none" stroke="${C.ink3}" stroke-width="1"${link.dash ? ` stroke-dasharray="${link.dash}"` : ''} />`,
   ];
   if (!link.cap) {
     out.push(
-      `<polygon points="${round(tx - 10)},${round(ty - 4)} ${round(tx - 2)},${round(ty)} ${round(tx - 10)},${round(ty + 4)}" fill="${EXPORT_COLORS.ink3}" />`
+      `<polygon points="${round(tx - 10)},${round(ty - 4)} ${round(tx - 2)},${round(ty)} ${round(tx - 10)},${round(ty + 4)}" fill="${C.ink3}" />`
     );
   }
   const labelX = (sx + tx) / 2;
@@ -692,7 +754,7 @@ function flowLinkSvg(
           x: labelX,
           y: labelY - 8 - (link.labelLines.length - 1 - i) * 13,
           size: LINK_LABEL_SIZE,
-          fill: EXPORT_COLORS.ink3,
+          fill: C.ink3,
           family: MONO_STACK,
           anchor: 'middle',
         },
@@ -707,7 +769,7 @@ function flowLinkSvg(
           x: labelX,
           y: labelY + 17,
           size: LINK_LABEL_SIZE,
-          fill: EXPORT_COLORS.ink3,
+          fill: C.ink3,
           family: MONO_STACK,
           anchor: 'middle',
         },
@@ -720,6 +782,10 @@ function flowLinkSvg(
 
 /** The Flow strip as a standalone SVG. */
 export function flowSvg(layout: FlowLayout, options: FlowExportOptions = {}): string {
+  return withPalette(options.theme, () => drawFlowSvg(layout, options));
+}
+
+function drawFlowSvg(layout: FlowLayout, options: FlowExportOptions): string {
   const showAll = options.showAll ?? false;
   const active = options.activeFlowId ?? null;
   const onActive = (flows: string[]): boolean => active === null || flows.includes(active);
@@ -809,12 +875,12 @@ function mapNodeSvg(node: MapNodeLayout, selected: boolean, dimmed: boolean): st
   const strokeWidth = selected ? 2 : 1;
   const out: string[] = [
     rect(node.x, node.y, node.width, node.height, {
-      fill: selected ? EXPORT_COLORS.press : EXPORT_COLORS.paper,
+      fill: selected ? C.press : C.paper,
       stroke: dimmed
-        ? EXPORT_COLORS.ink4
+        ? C.ink4
         : module.test
-          ? EXPORT_COLORS.ink3
-          : EXPORT_COLORS.ink,
+          ? C.ink3
+          : C.ink,
       strokeWidth,
       dash: module.test ? '4 3' : undefined,
     }),
@@ -826,7 +892,7 @@ function mapNodeSvg(node: MapNodeLayout, selected: boolean, dimmed: boolean): st
         x: node.x + MODULE_PAD_X,
         y: node.y + 17,
         size: MODULE_NAME_SIZE,
-        fill: dimmed ? EXPORT_COLORS.ink4 : EXPORT_COLORS.ink,
+        fill: dimmed ? C.ink4 : C.ink,
         family: MONO_STACK,
         weight: 500,
       },
@@ -837,7 +903,7 @@ function mapNodeSvg(node: MapNodeLayout, selected: boolean, dimmed: boolean): st
         x: node.x + MODULE_PAD_X,
         y: node.y + 31.5,
         size: MODULE_META_SIZE,
-        fill: dimmed ? EXPORT_COLORS.ink4 : EXPORT_COLORS.ink3,
+        fill: dimmed ? C.ink4 : C.ink3,
       },
       // `node.island`, matching the canvas: an exported map that counts a
       // module the screen said nothing depends on is a different picture.
@@ -848,7 +914,7 @@ function mapNodeSvg(node: MapNodeLayout, selected: boolean, dimmed: boolean): st
   if (node.weight > 0) {
     out.push(
       rect(node.x, node.y + node.height - 4, node.width * node.weight, 4, {
-        fill: EXPORT_COLORS.ink,
+        fill: C.ink,
         fillOpacity: dimmed ? 0.1 : 0.3,
       })
     );
@@ -877,13 +943,17 @@ function mapEdgeSvg(
   const midY = (sy + ty) / 2;
   const path = `M${round(sx)},${round(sy)} C${round(sx)},${round(midY)} ${round(tx)},${round(midY)} ${round(tx)},${round(ty)}`;
   if (edge.back) {
-    return `<path d="${path}" fill="none" stroke="${EXPORT_COLORS.accent}" stroke-opacity="0.6" stroke-dasharray="4 3" stroke-width="${round(edge.width)}" />`;
+    return `<path d="${path}" fill="none" stroke="${C.accent}" stroke-opacity="0.6" stroke-dasharray="4 3" stroke-width="${round(edge.width)}" />`;
   }
-  return `<path d="${path}" fill="none" stroke="${EXPORT_COLORS.ink}" stroke-opacity="${hot ? 0.95 : 0.28}" stroke-width="${round(edge.width)}" />`;
+  return `<path d="${path}" fill="none" stroke="${C.ink}" stroke-opacity="${hot ? 0.95 : 0.28}" stroke-width="${round(edge.width)}" />`;
 }
 
 /** The Map as a standalone SVG. */
 export function mapSvg(layout: MapLayout, options: MapExportOptions = {}): string {
+  return withPalette(options.theme, () => drawMapSvg(layout, options));
+}
+
+function drawMapSvg(layout: MapLayout, options: MapExportOptions): string {
   const selected = options.selected ?? null;
   const nodes = new Map(layout.nodes.map((n) => [n.id, n]));
   const neighbours =
@@ -924,13 +994,13 @@ export function mapSvg(layout: MapLayout, options: MapExportOptions = {}): strin
   // canvas' back viewport portal puts them.
   for (const row of layout.layers) {
     body.push(
-      `<line x1="${round(ruleLeft)}" y1="${round(row.y)}" x2="${round(ruleRight)}" y2="${round(row.y)}" stroke="${EXPORT_COLORS.ruleFaint}" stroke-width="1" />`
+      `<line x1="${round(ruleLeft)}" y1="${round(row.y)}" x2="${round(ruleRight)}" y2="${round(row.y)}" stroke="${C.ruleFaint}" stroke-width="1" />`
     );
     if (row.label !== null) {
       const y = row.index === 0 ? row.y + 40 : row.y - 36;
       body.push(
         textEl(
-          { x: ruleLeft, y, size: LAYER_LABEL_SIZE, fill: EXPORT_COLORS.ink3 },
+          { x: ruleLeft, y, size: LAYER_LABEL_SIZE, fill: C.ink3 },
           esc(row.label)
         )
       );
