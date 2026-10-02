@@ -937,7 +937,12 @@ MyView` with a `build()` method, and a plain `class Model`. The golden must show
 - `MyView` as a `NodeKind::Struct` with its `build` method as a member (via the
   existing `extract_struct` path — no walker change);
 - `helper`/`driver` functions, the `Model` class, and the `../foo` import node;
-- the `driver` → `helper` `Calls` edge (plain `call_expression`).
+- the `driver` → `helper` `Calls` edge (plain `call_expression`);
+- the `MyView::build` → `helper` `Calls` edge from line 12. `tree-sitter-arkts`
+  0.3 parses the call inside the `@Component struct`'s `build()` method; 0.2 did
+  not, so this edge first appeared when #280 moved the grammar from 0.2 to 0.3
+  and the fixture was regenerated with the recipe below. Only `edges.json` and
+  `colby.db` changed.
 
 The ArkUI dynamic-dispatch / callback-synthesizer bridges are DEFERRED — the
 port has no callback synthesizer. So `ARKTS_SPEC` uses `call_types =

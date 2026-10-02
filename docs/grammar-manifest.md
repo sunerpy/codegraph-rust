@@ -26,7 +26,7 @@ grammar crates.
 | ------------------- | ------------------------ | ---------------------------------------------------------------------- |
 | `typescript`, `tsx` | `tree-sitter-typescript` | TypeScript and TSX entry points                                        |
 | `javascript`, `jsx` | `tree-sitter-javascript` | JS grammar includes JSX; separate specs preserve ID/extension behavior |
-| `arkts`             | `tree-sitter-arkts`      | `.ets`; ArkUI syntax                                                   |
+| `arkts`             | `tree-sitter-arkts`      | `.ets`; ArkUI syntax; calls in `struct` methods such as `build()`      |
 | `python`            | `tree-sitter-python`     | `.py`, `.pyw`                                                          |
 | `go`                | `tree-sitter-go`         | `.go`                                                                  |
 | `rust`              | `tree-sitter-rust`       | `.rs`                                                                  |

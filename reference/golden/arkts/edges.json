@@ -24,6 +24,18 @@
     "target": "function:190c728c90d859bafe85fc2d9d2aea72"
   },
   {
+    "col": 4,
+    "kind": "calls",
+    "line": 12,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:1ae7cb887c6ff76065390c4dd3100c38",
+    "target": "function:190c728c90d859bafe85fc2d9d2aea72"
+  },
+  {
     "col": null,
     "kind": "contains",
     "line": null,
