@@ -8,6 +8,7 @@ members = [
     "crates/codegraph-mcp",
     "crates/codegraph-daemon",
     "crates/codegraph-watch",
+    "crates/codegraph-ui",
     "crates/codegraph-cli",
     "crates/codegraph-bench",
 ]

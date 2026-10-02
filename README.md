@@ -291,6 +291,7 @@ make check
 - [`docs/architecture.md`](docs/architecture.md) — workspace and runtime design
 - [`docs/cli.md`](docs/cli.md) — complete command reference
 - [`docs/mcp.md`](docs/mcp.md) — MCP transports, tools, and clients
+- [`docs/ui.md`](docs/ui.md) — local browser viewer (preview, `CODEGRAPH_UI=1`)
 - [`docs/languages.md`](docs/languages.md) — language coverage and boundaries
 - [`docs/equivalence.md`](docs/equivalence.md) — deterministic golden contract
 - [`docs/upstream-sync/UPSTREAM.md`](docs/upstream-sync/UPSTREAM.md) — upstream ledger

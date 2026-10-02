@@ -20,6 +20,7 @@ graph TD
     mcp[codegraph-mcp]
     watch[codegraph-watch]
     daemon[codegraph-daemon]
+    ui[codegraph-ui]
     cli[codegraph-rs / codegraph binary]
     bench[codegraph-bench]
 
@@ -41,6 +42,13 @@ graph TD
     daemon --> core
     daemon --> mcp
     daemon --> watch
+    ui --> core
+    ui --> extract
+    ui --> store
+    ui --> resolve
+    ui --> graph
+    ui --> mcp
+    ui --> watch
     cli --> core
     cli --> extract
     cli --> store
@@ -49,22 +57,24 @@ graph TD
     cli --> mcp
     cli --> watch
     cli --> daemon
+    cli --> ui
     bench --> core
     bench --> extract
 ```
 
-| Crate               | Responsibility                                                      |
-| ------------------- | ------------------------------------------------------------------- |
-| `codegraph-core`    | shared types, node IDs, configuration, classification, logging      |
-| `codegraph-extract` | source discovery, language/custom extraction, unresolved references |
-| `codegraph-store`   | SQLite/FTS5 schema, migrations, persistence, queries, leases        |
-| `codegraph-resolve` | generic import/name matching and framework-aware resolution         |
-| `codegraph-graph`   | traversal, impact, query parsing, search ranking                    |
-| `codegraph-mcp`     | tool schemas/engine, rmcp stdio and streamable-HTTP transports      |
-| `codegraph-watch`   | incremental reconciliation and filesystem watcher                   |
-| `codegraph-daemon`  | detached shared process, IPC, and process registries                |
-| `codegraph-rs`      | clap CLI, agent installer, orchestration, shipped binary            |
-| `codegraph-bench`   | equivalence oracle and benchmark harness; not shipped               |
+| Crate               | Responsibility                                                        |
+| ------------------- | --------------------------------------------------------------------- |
+| `codegraph-core`    | shared types, node IDs, configuration, classification, logging        |
+| `codegraph-extract` | source discovery, language/custom extraction, unresolved references   |
+| `codegraph-store`   | SQLite/FTS5 schema, migrations, persistence, queries, leases          |
+| `codegraph-resolve` | generic import/name matching and framework-aware resolution           |
+| `codegraph-graph`   | traversal, impact, query parsing, search ranking                      |
+| `codegraph-mcp`     | tool schemas/engine, rmcp stdio and streamable-HTTP transports        |
+| `codegraph-watch`   | incremental reconciliation and filesystem watcher                     |
+| `codegraph-daemon`  | detached shared process, IPC, and process registries                  |
+| `codegraph-ui`      | browser viewer: loopback JSON API, live channel, embedded `ui/` build |
+| `codegraph-rs`      | clap CLI, agent installer, orchestration, shipped binary              |
+| `codegraph-bench`   | equivalence oracle and benchmark harness; not shipped                 |
 
 The dependency direction keeps extraction independent of persistence and keeps
 storage independent of query presentation. The CLI is the product assembly root.

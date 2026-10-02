@@ -416,15 +416,9 @@ export function createHttpAdapter(options: HttpAdapterOptions = {}): GraphAdapte
       return getJson<WireScreensPayload>('api/screens', signal);
     },
 
-    steps(request = {}, signal) {
-      const params = new URLSearchParams();
-      if (request.anchor) params.set('anchor', request.anchor);
-      else if (request.symbol) params.set('symbol', request.symbol);
-      if (request.depth) params.set('depth', String(request.depth));
-      if (request.limit) params.set('limit', String(request.limit));
-      if (request.through) params.set('through', '1');
-      return getJson<WireStepsPayload>(`api/steps${query(params)}`, signal);
-    },
+    // No `steps`: the codegraph-rs server does not build Steps yet (its effect
+    // and program builders are a later port), so the view says it cannot draw
+    // them instead of asking for an endpoint that is not there.
 
     entryPoints(request = {}, signal) {
       const params = new URLSearchParams();

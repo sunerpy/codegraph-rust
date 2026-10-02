@@ -14,7 +14,7 @@ use std::sync::mpsc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use codegraph_core::config::Config;
 use codegraph_core::deprioritize::DeprioritizeMatcher;
@@ -40,6 +40,7 @@ use time::format_description::well_known::Rfc3339;
 mod diagnostics;
 mod installer;
 mod structural_gate;
+mod viewer_gate;
 
 /// Test-only: the ONE process-wide environment lock for this binary.
 ///
@@ -170,7 +171,17 @@ fn main() {
 }
 
 fn cli_main() {
-    let cli = Cli::parse();
+    // The browser viewer is not part of a release yet: refuse `ui` / `web`
+    // (also as `help ui` or `ui --help`) before any startup work unless
+    // CODEGRAPH_UI=1 opts in.
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(command) = viewer_gate::requested_viewer_command(&raw_args)
+        && !viewer_gate::viewer_enabled()
+    {
+        eprintln!("{}", viewer_gate::refusal(command));
+        std::process::exit(1);
+    }
+    let cli = parse_cli();
     // Process bootstrap has no addressed project yet, so this config is
     // `APP_CONFIG`-or-defaults ONLY and may configure NOTHING but the logger
     // below. Every project operation (index, sync, watch, an MCP request) loads
@@ -214,6 +225,14 @@ fn cli_main() {
         }
         std::process::exit(1);
     }
+}
+
+/// `Cli::parse()`, with the viewer listed in `--help` only when it is enabled.
+fn parse_cli() -> Cli {
+    let enabled = viewer_gate::viewer_enabled();
+    let command = Cli::command().mut_subcommand("ui", |ui| ui.hide(!enabled));
+    let matches = command.get_matches();
+    Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit())
 }
 
 #[derive(Debug, Parser)]
@@ -578,6 +597,21 @@ enum Command {
         #[command(subcommand)]
         action: McpAction,
     },
+    /// Open the CodeGraph viewer in your browser — read your indexed project as a graph.
+    #[command(hide = true, visible_alias = "web", after_help = UI_AFTER_HELP)]
+    Ui {
+        /// The indexed project to read (default: the one you're standing in).
+        path: Option<PathBuf>,
+        /// Port to listen on (default: 4747, or the next free one).
+        #[arg(long, value_name = "NUMBER")]
+        port: Option<String>,
+        /// Print the URL instead of opening a browser.
+        #[arg(long = "no-open")]
+        no_open: bool,
+        /// Refuse every write — saved trails can be opened but not saved or deleted.
+        #[arg(long = "read-only")]
+        read_only: bool,
+    },
     /// Print the codegraph version.
     Version,
     /// Generate shell completion scripts (bash, zsh, fish, powershell, elvish).
@@ -926,6 +960,12 @@ fn run(cli: Cli) -> Result<()> {
         Command::Mcp { action } => match action {
             McpAction::List { json } => cmd_mcp_list(json),
         },
+        Command::Ui {
+            path,
+            port,
+            no_open,
+            read_only,
+        } => cmd_ui(path, port, no_open, read_only),
         Command::Version => {
             println!("codegraph {VERSION}");
             Ok(())
@@ -6806,6 +6846,141 @@ fn warn_ancestor_index_retarget(requested: &Path, resolved: &Path) {
         "         Run `codegraph init {}` first if you meant to give it its own index.",
         requested.display()
     );
+}
+
+const UI_AFTER_HELP: &str = "Examples:
+  $ codegraph ui                    Read the project you're standing in
+  $ codegraph ui ~/code/my-app      Read a specific indexed project
+  $ codegraph ui --port 8080        Use one specific port (fails if it's taken)
+  $ codegraph ui --no-open          Just print the URL (headless boxes, SSH)
+  $ codegraph web                   Same command under its alias
+
+Pick a symbol and you see who calls it on the left, its source in the middle,
+and what it calls on the right at the height of the line that calls it. Search
+with / (or Cmd-K), click a file path for the file's outline and its imports.
+
+Ask \"how does main reach open_store\" (or \"main -> open_store\") in the search
+box for the flow between two symbols: one card per hop, opened at the line that
+makes the next call, with dynamic-dispatch hops drawn dashed and named. The Map
+tab draws the whole project by module, with dependencies pointing down.
+
+Never opened this codebase before? The Entry points tab lists the routes with
+the symbols that serve them, the files that run something when they load, the
+tests, and what the most code depends on — and starts a flow from any of them.
+
+The page keeps up with the project while it is open: save a file and it says so
+within about half a second, and whatever is on screen re-reads the graph when
+something re-indexes it. It watches for that; it never polls.
+
+Save a walk you want to keep: name the trail and it is written under the index
+directory (.codegraph/ui/trails/, already gitignored) as plain JSON, listed on
+the empty screen, and reopened at the symbol you left. Hops are remembered by
+name rather than by position, so a saved trail survives re-indexing and says
+which hop moved when one does. Pass --read-only to refuse every write.
+
+The viewer listens on 127.0.0.1 only, so nothing on your network can reach it.
+It opens an index that already exists, never indexes, and never changes a line
+of your code — the one thing it writes is a trail you asked it to save.
+Requests from any other host are refused, and nothing is sent anywhere: no code,
+no paths, no analytics.
+
+Without --port it takes 4747, or the next free port if that one is busy.
+
+Set CODEGRAPH_BROWSER=<command> to choose which browser opens, or
+CODEGRAPH_BROWSER=none to never open one.";
+
+/// `codegraph ui [path]` (alias `web`): serve the embedded viewer over
+/// loopback and open it. Reads an index that already exists; never indexes.
+fn cmd_ui(
+    path: Option<PathBuf>,
+    port: Option<String>,
+    no_open: bool,
+    read_only: bool,
+) -> Result<()> {
+    // An explicit --port stays explicit: a scripted `--port 8080` that quietly
+    // lands on 8081 is worse than one that says the port is busy.
+    let requested_port = match port {
+        None => None,
+        Some(raw) => match raw.trim().parse::<u16>() {
+            Ok(port) => Some(port),
+            Err(_) => ui_refusal(format!(
+                "--port must be a whole number between 0 and 65535 (got \"{raw}\")."
+            )),
+        },
+    };
+    let start = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
+    let indexed = codegraph_ui::find_indexed_root(&start);
+    let project = indexed.clone().unwrap_or_else(|| start.clone());
+    // The same sensitive-directory refusal the MCP entry points use, before
+    // anything opens: `codegraph ui /etc` is turned away here.
+    if let Err(reason) = codegraph_ui::security::validate_project_path(&project) {
+        ui_refusal(reason);
+    }
+    if indexed.is_none() {
+        eprintln!("✗ No CodeGraph index found for {}", project.display());
+        eprintln!();
+        eprintln!("  The viewer reads an index that already exists — it never creates one.");
+        eprintln!("  To index this project:");
+        eprintln!();
+        eprintln!("    codegraph init");
+        eprintln!();
+        eprintln!("  Already indexed somewhere else? Point the viewer at it:");
+        eprintln!();
+        eprintln!("    codegraph ui /path/to/indexed/project");
+        eprintln!();
+        std::process::exit(1);
+    }
+    if !codegraph_ui::has_viewer() {
+        ui_refusal(
+            "The CodeGraph viewer assets are missing from this build.\n\
+             If you installed CodeGraph normally, reinstall it — the release binary embeds the viewer.\n\
+             If you are working from a source checkout, run: npm run build --prefix ui",
+        );
+    }
+    let options = codegraph_ui::UiOptions {
+        project_root: project.clone(),
+        port: requested_port,
+        read_only,
+    };
+    let served = codegraph_ui::serve_until_shutdown(options, |url| {
+        println!();
+        println!("CodeGraph viewer");
+        println!();
+        println!("  Reading  {}", project.display());
+        println!("  URL      {url}");
+        println!(
+            "  Access   this machine only — {}",
+            if read_only {
+                "read-only, nothing leaves your computer"
+            } else {
+                "nothing leaves your computer; saved trails are the only thing written"
+            }
+        );
+        println!();
+        let opened = !no_open && codegraph_ui::browser::open_browser(url);
+        println!(
+            "{}",
+            if opened {
+                "  Opening your browser... press Ctrl+C to stop."
+            } else {
+                "  Open that URL in a browser. Press Ctrl+C to stop."
+            }
+        );
+        println!();
+    });
+    // Both startup failures (no free port, a pinned port taken) carry their own
+    // remediation: print it plainly.
+    if let Err(err) = served {
+        ui_refusal(err);
+    }
+    Ok(())
+}
+
+/// A refusal the way upstream's `codegraph ui` prints one: a cross and the
+/// sentence — never a stack trace, never an `Error:` prefix.
+fn ui_refusal(message: impl std::fmt::Display) -> ! {
+    eprintln!("✗ {message}");
+    std::process::exit(1);
 }
 
 fn resolve_project_path_optional(start: &Path) -> PathBuf {

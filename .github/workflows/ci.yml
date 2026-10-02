@@ -229,6 +229,29 @@ jobs:
           cargo test -p codegraph-extract --locked --test scan_symlinks
           cargo test -p codegraph-watch --locked symlink
 
+  ui:
+    name: UI
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      # npm ci from the committed lockfile, svelte-check, the vitest suites, a
+      # production build, and a byte check that the embedded bundle under
+      # crates/codegraph-ui/viewer is exactly this build.
+      - name: Check, test and rebuild the viewer
+        run: make ui-check
+
   audit:
     name: Security Audit
     needs: workspace-version
@@ -306,7 +329,7 @@ jobs:
 
   ci-success:
     name: CI Success
-    needs: [workspace-version, linux, windows-clippy, windows-test, macos-watcher, audit]
+    needs: [workspace-version, linux, windows-clippy, windows-test, macos-watcher, ui, audit]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5

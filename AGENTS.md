@@ -71,18 +71,19 @@ or required by that guidance.
 The workspace members are declared in root `Cargo.toml`; that manifest is the
 authority when the list changes.
 
-| Crate                            | Owns                                                               |
-| -------------------------------- | ------------------------------------------------------------------ |
-| `codegraph-core`                 | shared types, config, IDs, file classification, logging            |
-| `codegraph-extract`              | language detection, tree-sitter/custom extraction, scan policy     |
-| `codegraph-store`                | SQLite schema/migrations, FTS5, persistence and queries            |
-| `codegraph-resolve`              | import/name resolution and framework resolvers                     |
-| `codegraph-graph`                | traversal, impact, search scoring and query parsing                |
-| `codegraph-mcp`                  | MCP schemas, rmcp transports, project resolution, tool rendering   |
-| `codegraph-watch`                | incremental synchronization and filesystem watching                |
-| `codegraph-daemon`               | shared process lifecycle, IPC, registries and detach behavior      |
-| `codegraph-cli` (`codegraph-rs`) | CLI, installer, orchestration and shipped binary                   |
-| `codegraph-bench`                | equivalence oracle and reproducible benchmark harness; not shipped |
+| Crate                            | Owns                                                                  |
+| -------------------------------- | --------------------------------------------------------------------- |
+| `codegraph-core`                 | shared types, config, IDs, file classification, logging               |
+| `codegraph-extract`              | language detection, tree-sitter/custom extraction, scan policy        |
+| `codegraph-store`                | SQLite schema/migrations, FTS5, persistence and queries               |
+| `codegraph-resolve`              | import/name resolution and framework resolvers                        |
+| `codegraph-graph`                | traversal, impact, search scoring and query parsing                   |
+| `codegraph-mcp`                  | MCP schemas, rmcp transports, project resolution, tool rendering      |
+| `codegraph-watch`                | incremental synchronization and filesystem watching                   |
+| `codegraph-daemon`               | shared process lifecycle, IPC, registries and detach behavior         |
+| `codegraph-ui`                   | browser viewer: loopback JSON API, live channel, embedded `ui/` build |
+| `codegraph-cli` (`codegraph-rs`) | CLI, installer, orchestration and shipped binary                      |
+| `codegraph-bench`                | equivalence oracle and reproducible benchmark harness; not shipped    |
 
 Keep dependency direction acyclic and lower layers independent of presentation.
 Extraction must not depend on store/graph. Query rendering must not leak into core
@@ -93,17 +94,18 @@ semantics. See [`docs/architecture.md`](docs/architecture.md) for the current gr
 Run the narrowest relevant tests while iterating, then the complete gate before
 handoff. Do not use a narrow test to claim a workspace-wide property.
 
-| Change                     | Minimum focused proof                                                  | Required documentation                                                       |
-| -------------------------- | ---------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| extraction/language rules  | extractor tests; affected golden corpus; incremental/full equivalence  | `languages.md`, `grammar-manifest.md`, and golden recipe when behavior moves |
-| resolution/framework rules | resolver unit/integration tests; ambiguity negatives; affected golden  | `equivalence.md` or framework reference when public behavior moves           |
-| schema/migrations/store    | schema parity; migration replay; state/lease tests; golden equivalence | `data-model.md`                                                              |
-| graph/search               | graph/query tests; deterministic ordering and limit cases              | CLI/MCP docs for public output changes                                       |
-| MCP/protocol               | engine tests; structural MCP goldens; rmcp stdio/HTTP/version tests    | `mcp.md`                                                                     |
-| CLI/installer              | command tests; installer round trips; script contract fixtures         | `cli.md`, README only for landing-page behavior                              |
-| daemon/watch/concurrency   | lifecycle, lock, recovery, watcher and platform-focused tests          | architecture/CLI/MCP lifecycle sections                                      |
-| release/install/checksum   | shell/PowerShell fixtures, asset-name checks, archive smoke            | README install section and release workflow contract                         |
-| docs/community files       | `python3 scripts/docs-check.py`; formatter; link/anchor checks         | update the canonical page, not a duplicate summary                           |
+| Change                         | Minimum focused proof                                                                                        | Required documentation                                                       |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------- |
+| extraction/language rules      | extractor tests; affected golden corpus; incremental/full equivalence                                        | `languages.md`, `grammar-manifest.md`, and golden recipe when behavior moves |
+| resolution/framework rules     | resolver unit/integration tests; ambiguity negatives; affected golden                                        | `equivalence.md` or framework reference when public behavior moves           |
+| schema/migrations/store        | schema parity; migration replay; state/lease tests; golden equivalence                                       | `data-model.md`                                                              |
+| graph/search                   | graph/query tests; deterministic ordering and limit cases                                                    | CLI/MCP docs for public output changes                                       |
+| MCP/protocol                   | engine tests; structural MCP goldens; rmcp stdio/HTTP/version tests                                          | `mcp.md`                                                                     |
+| CLI/installer                  | command tests; installer round trips; script contract fixtures                                               | `cli.md`, README only for landing-page behavior                              |
+| daemon/watch/concurrency       | lifecycle, lock, recovery, watcher and platform-focused tests                                                | architecture/CLI/MCP lifecycle sections                                      |
+| release/install/checksum       | shell/PowerShell fixtures, asset-name checks, archive smoke                                                  | README install section and release workflow contract                         |
+| viewer (`codegraph-ui`, `ui/`) | crate tests over indexed fixtures; `cli_ui`; `make ui-check` (rebuilds and byte-checks the committed bundle) | `ui.md`; `cli.md` for the command                                            |
+| docs/community files           | `python3 scripts/docs-check.py`; formatter; link/anchor checks                                               | update the canonical page, not a duplicate summary                           |
 
 If a change alters nodes, edges, reference resolution, file classification, or
 stored graph meaning, decide explicitly whether the extraction version must move.
@@ -136,7 +138,10 @@ The authoritative local/CI entry point is:
 make check
 ```
 
-`make ci` is a compatibility alias for the same complete gate. `make pre-ci` adds a package/unpack/execute smoke over the built release bytes.
+`make ci` is a compatibility alias for the same complete gate. `make pre-ci` adds the
+viewer frontend gate (`make ui-check`: `npm ci`, svelte-check, vitest, a production
+build, and a byte check of the committed bundle under `crates/codegraph-ui/viewer`)
+and a package/unpack/execute smoke over the built release bytes.
 It validates workspace-version consistency before any Cargo subprocess, required
 tool versions, Rust and repository-text formatting, workflow/shell linting,
 Clippy with warnings denied, locked tests, a locked release build, guardrails,

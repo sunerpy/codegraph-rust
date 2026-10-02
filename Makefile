@@ -15,7 +15,7 @@ OXFMT_ARGS := --no-error-on-unmatched-pattern --ignore-path .oxfmtignore .
 .PHONY: all build build-dev build-prod release release-target install uninstall \
         fmt fmt-rust fmt-oxfmt fmt-check fmt-rust-check fmt-oxfmt-check \
         tools-check workflow-lint docs-check workspace-version typecheck lint test guardrail script-tests archive-smoke \
-        check ci pre-ci hooks setup-hooks clean size-compare help \
+        check ci pre-ci ui ui-check hooks setup-hooks clean size-compare help \
         coverage coverage-html coverage-lcov coverage-open coverage-clean
 
 all: build
@@ -139,7 +139,23 @@ check:
 	@echo "All checks passed."
 
 ci: check
-pre-ci: check archive-smoke
+pre-ci: check ui-check archive-smoke
+
+# Rebuild the embedded viewer bundle (crates/codegraph-ui/viewer) from ui/.
+ui:
+	cd ui && npm ci && npm run build
+
+# The browser viewer's frontend (`ui/`, Node + npm): install from the lockfile,
+# type-check, test, rebuild, and require the committed bundle under
+# crates/codegraph-ui/viewer to be exactly that build. CI runs it as its own job.
+ui-check:
+	cd ui && npm ci && npm run check && npm test && npm run build
+	git diff --exit-code -- crates/codegraph-ui/viewer
+	@stale="$$(git status --porcelain --untracked-files=all -- crates/codegraph-ui/viewer)"; \
+		if [ -n "$$stale" ]; then \
+			echo "the committed viewer bundle is not this build; commit crates/codegraph-ui/viewer:"; \
+			echo "$$stale"; exit 1; \
+		fi
 
 archive-smoke:
 	bash scripts/smoke-release-archive.sh
@@ -189,7 +205,8 @@ help:
 	@printf '%s\n' \
 		'Targets:' \
 		'  check / ci           complete quality gate (ci is an alias)' \
-		'  pre-ci               complete gate plus local archive smoke' \
+		'  pre-ci               complete gate, viewer frontend, and local archive smoke' \
+		'  ui / ui-check        rebuild the viewer bundle / also check, test, and byte-check it' \
 		'  fmt / fmt-check       Rust plus repository text formatting' \
 		'  typecheck              locked cargo check for the workspace' \
 		'  lint / test / release locked Rust gates and shipped build' \

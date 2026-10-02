@@ -264,6 +264,7 @@ canonical agent 契约 [`AGENTS.md`](../../AGENTS.md)。
 - [`docs/architecture.md`](../architecture.md) — workspace 与运行时设计
 - [`docs/cli.md`](../cli.md) — 完整命令参考
 - [`docs/mcp.md`](../mcp.md) — MCP transport、工具与客户端
+- [`docs/ui.md`](../ui.md) — 本地浏览器查看器（预览，`CODEGRAPH_UI=1`）
 - [`docs/languages.md`](../languages.md) — 语言覆盖与边界
 - [`docs/equivalence.md`](../equivalence.md) — 确定性 golden 契约
 - [`docs/upstream-sync/UPSTREAM.md`](../upstream-sync/UPSTREAM.md) — 上游台账

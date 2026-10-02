@@ -10,6 +10,8 @@ volatile behavior elsewhere.
   daemon/watch lifecycle, configuration, and diagnostics
 - [MCP reference](mcp.md) — tool schemas, visible/known tools, project resolution,
   stdio and streamable HTTP, protocol behavior, and client configuration
+- [Browser viewer](ui.md) — the local read-only viewer (preview): usage, boundary,
+  live channel, API, and differences from upstream
 - [Supported languages](languages.md) — user-facing language coverage, extensions,
   extraction tiers, and static-analysis boundaries
 - [Godot static analysis](godot.md) — scenes, resources, scripts, autoloads,

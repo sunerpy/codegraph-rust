@@ -40,12 +40,15 @@
   resolution divergences that fix the findings the retroactive review had kept
   at upstream behavior, with extraction version 19. See the dated entries
   below, including the `v0.52.2` release record.
-- **Deferred UI family:** the browser viewer and the graph-semantic families
-  F1–F12 that shipped beside it in `v1.6.1` (framework navigation edges and
-  routers, the synthesis layer and its schema, cross-tier channels, server route
-  naming, the explore Flow, the React Native bridge) move to the next round by
-  owner decision on 2026-10-01. Rust UI code begins only after the owner selects
-  a Penpot design and a stable upstream baseline is re-audited.
+- **UI family, phase 1 (browser viewer):** started after the owner selected the
+  Penpot direction D design on 2026-10-02. The viewer — the `codegraph-ui`
+  server over upstream `v1.6.1`'s `ui/` frontend, behind `CODEGRAPH_UI=1` as
+  upstream gates it — is ported; see the 2026-10-02 viewer entry below. The
+  graph-semantic families F1–F12 that shipped beside it (framework navigation
+  edges and routers, the synthesis layer and its schema, cross-tier channels,
+  server route naming, the explore Flow, the React Native bridge) remain
+  deferred, scheduled as phases 2–4: F10/F11 first, then F1–F6 with Screens and
+  Steps, then F7–F9 and F12.
 
 The Rust product and upstream release versions are independent. This Current
 alignment block is the only place that states release parity; dated log entries
@@ -144,6 +147,52 @@ below remain immutable historical evidence.
 > that records colby parity — do not infer it from `Cargo.toml`.
 
 ## Sync log
+
+### 2026-10-02 — browser viewer PORTED: UI family phase 1 (`codegraph ui`, `CODEGRAPH_UI=1`)
+
+The viewer upstream ships in `v1.6.1` — `src/ui-server/**` (the loopback JSON
+API) and `ui/` (the Svelte 5 frontend) — is ported for the first time. Plan:
+`ui-viewer-phase1`, gate PASS in round 4.
+
+**Re-audit of the baseline (2026-10-02):** the latest stable upstream tag is
+still `v1.6.1` (`f4ddf508516332419ea3c95702810765936cf679`); upstream `main` is
+172 commits past it and unreleased, so the viewer is ported at `v1.6.1`. The
+families that feed it stay scheduled:
+
+| phase | families | what the viewer gains |
+| --- | --- | --- |
+| 2 | F10 explore Flow section, F11 branch guards | `when` conditions on Symbol and Flow links; explore leads with the same flow search |
+| 3 | F1 `navigates` edges and fan-out refs, F2–F6 routers (Expo, Next.js, React Router, TanStack, Vue/Nuxt) | the `/api/screens` walk past its early return, and `/api/steps` |
+| 4 | F7 synthesis layer, F8 cross-tier channels, F9 server route naming, F12 React Native bridge | synthesized dispatch hops, cross-tier steps |
+
+| upstream surface | Rust target | disposition |
+| --- | --- | --- |
+| `ui/` frontend (`v1.6.1:ui`, tree `7e3b440035f6745c546e5b10d92eba31144406c2`) | imported verbatim into `ui/` (MIT, `ui/LICENSE`), then one change: `createHttpAdapter` omits `steps` | PORT |
+| `src/ui-server/{index,security,static,assets,open-browser}.ts` | `crates/codegraph-ui` (`server`, `security`, `assets`, `browser`): loopback bind with port fallback, Host/Origin/method/write-marker checks, raw-path refusals, containment chokepoint, CSP, embedded bundle | PORT |
+| `src/ui-server/api/*` — stats, search, node (+ hierarchy), nodes, source (+ highlight), file, filecode, routes, entrypoints, map, deadcode, flow, trails (+ trail-store), events | `crates/codegraph-ui/src/api/*`, wire shapes, limits, error codes and refusals as upstream | PORT |
+| `src/graph/{dead-code,named-symbol-flow,symbol-lookup,type-hierarchy}.ts`, `continuationsFrom`, `src/extraction/syntax-tokens.ts` | `codegraph-graph::{dead_code, named_symbol_flow, symbol_lookup, hierarchy, flow_boundary}`, `codegraph-extract::syntax_tokens`; store SELECTs in `codegraph-store::viewer` | PORT |
+| `findDynamicBoundaries` / `shortlistBoundaryCandidates` | `codegraph-ui::api::boundary` over explore's own `codegraph_mcp::dynamic_boundaries` scanner | PORT |
+| the events source watcher's notify-only `syncFn` | `codegraph_watch::WatchOptions::observe_only`, additive | PORT |
+| `codegraph ui` / `web`, `viewer-gate.ts` | `codegraph-cli` `ui` command, gate before `Cli::parse()` | PORT |
+| `/api/screens` walk, `/api/steps`, `when` conditions | Screens answers upstream's own no-`navigates` early return; Steps is a JSON 404; conditions are absent — phases 2 and 3 (F1–F6, F11) | DEFER |
+| `countImplementers`, `buildTypeHierarchy`'s `overrides: false` | used only by `codegraph_explore` | N/A here |
+| `CODEGRAPH_VIEWER_PATH` | the bundle is embedded in the binary | N/A |
+
+KEEP-RUST, as this index holds the facts: an unresolved import is listed by the
+binding it names, not the module specifier; routes come from this port's
+resolvers (React, Vue, NestJS — not Express or Go); there are no synthesized
+dispatch edges, so no dashed `via …` flow hop and no Go implicit
+implementations in a hierarchy; the flow's directed walk sees every
+`(callee, kind)` pair `get_callees` reports rather than one row per neighbour.
+
+Tests port upstream's suites case by case: `crates/codegraph-ui/tests/*.rs`
+(`ui-server-api`, `ui-server`, routes, `ui-trails`, `ui-events-api`,
+`ui-map-api`, `ui-flow-api`, `ui-filecode-api`, the server half of
+`ui-entrypoints-api`, the engine halves of `type-hierarchy`, `dead-code` and
+`ui-highlight`), `crates/codegraph-cli/tests/cli_ui.rs` (`cli-ui-command` and the
+gate), and `ui/tests/` (the 17 frontend suites, the three mixed suites' model
+cases among them). Golden extraction output is unchanged: no extraction,
+resolution or schema change.
 
 ### 2026-10-02 — `v0.52.2` RELEASED: #295 shipped
 
