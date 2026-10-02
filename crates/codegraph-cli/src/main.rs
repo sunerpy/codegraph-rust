@@ -1418,6 +1418,32 @@ fn cmd_prompt_hook(path: Option<PathBuf>, query: Option<String>) -> Result<()> {
     Ok(())
 }
 
+/// `<current_root>/.gitignore` content: ignore everything in the index root.
+///
+/// A nested `.gitignore` scopes only to the directory it sits in, so this never
+/// touches the project's root `.gitignore` or its source tree.
+const INDEX_GITIGNORE_CONTENT: &str = "*\n";
+
+/// Idempotently write the index root's own `.gitignore`.
+///
+/// Convenience only. `git` never reads the index root as source, so a write
+/// failure (read-only filesystem, quota) must not undo an index that
+/// `index_project` already completed — it logs and returns instead of failing
+/// the command. An existing file is left byte-for-byte untouched.
+fn ensure_index_gitignore(paths: &codegraph_core::IndexPaths) {
+    let gitignore = paths.gitignore();
+    if gitignore.exists() {
+        return;
+    }
+    if let Err(error) = std::fs::write(&gitignore, INDEX_GITIGNORE_CONTENT) {
+        tracing::warn!(
+            path = %gitignore.display(),
+            %error,
+            "could not write the index root .gitignore; the index is unaffected"
+        );
+    }
+}
+
 fn cmd_init(
     path: Option<PathBuf>,
     target: &str,
@@ -1428,6 +1454,7 @@ fn cmd_init(
     if explicit_init_observes_readable_current(&project)? {
         println!("Already initialized in {}", project.display());
         println!("Use \"codegraph index\" to re-index or \"codegraph sync\" to update");
+        ensure_index_gitignore(&index_paths(&project)?);
         return installer::run_install_local_targets(project, target);
     }
     guard_indexable_root(&project)?;
@@ -1458,6 +1485,7 @@ fn cmd_init(
         );
     }
     print_index_result(&result);
+    ensure_index_gitignore(&index_paths(&project)?);
     installer::run_install_local_targets(project, target)
 }
 

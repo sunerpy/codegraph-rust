@@ -162,6 +162,50 @@ fn init_yes_is_behavior_neutral_and_non_interactive() {
 }
 
 #[test]
+fn init_writes_a_gitignore_inside_the_index_root() {
+    let fixture = Fixture::new("gitignore");
+
+    fixture.run_ok(&["init", "--yes"]);
+
+    let gitignore = fixture.project.join(".codegraph/.gitignore");
+    assert!(gitignore.is_file(), ".codegraph/.gitignore must be created");
+    assert_eq!(fs::read_to_string(&gitignore).unwrap(), "*\n");
+    // The project's own root .gitignore is never created or touched.
+    assert!(!fixture.project.join(".gitignore").exists());
+}
+
+#[test]
+fn init_backfills_the_gitignore_for_an_already_initialized_project() {
+    let fixture = Fixture::new("gitignore-backfill");
+
+    fixture.run_ok(&["init", "--yes"]);
+    fs::remove_file(fixture.project.join(".codegraph/.gitignore")).unwrap();
+    assert!(!fixture.project.join(".codegraph/.gitignore").exists());
+
+    let output = fixture.run_ok(&["init", "--yes"]);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Already initialized in"));
+    assert_eq!(
+        fs::read_to_string(fixture.project.join(".codegraph/.gitignore")).unwrap(),
+        "*\n"
+    );
+}
+
+#[test]
+fn init_never_overwrites_an_existing_index_gitignore() {
+    let fixture = Fixture::new("gitignore-idempotent");
+
+    fixture.run_ok(&["init", "--yes"]);
+    fs::write(fixture.project.join(".codegraph/.gitignore"), "*.db\n").unwrap();
+
+    fixture.run_ok(&["init", "--yes"]);
+
+    assert_eq!(
+        fs::read_to_string(fixture.project.join(".codegraph/.gitignore")).unwrap(),
+        "*.db\n"
+    );
+}
+
+#[test]
 fn install_init_keeps_the_init_unsafe_root_guard() {
     let fixture = Fixture::new("unsafe-home");
 

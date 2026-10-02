@@ -305,6 +305,8 @@ the same target values as `install` (csv ids such as `kiro,cursor`, plus `auto`,
 config and its `--path` are written under the project being initialized, even when
 the `[path]` argument differs from the current directory. It is idempotent.
 
+`init` also writes a `.gitignore` containing only `*` **inside the index root** (`<project>/.codegraph/.gitignore` by default, or the `CODEGRAPH_DIR` override). A nested `.gitignore` scopes only to the directory it sits in, so the project's own root `.gitignore` is never created or modified — the index is excluded from `git status` on its own. The write is idempotent: an existing file is left byte-for-byte untouched, and a failure (read-only filesystem, quota) logs a warning without failing the command, since the index itself is already complete.
+
 ```bash
 codegraph init                       # index only — no MCP config written (default none)
 codegraph init --yes                 # same init flow, explicit non-interactive entry point
