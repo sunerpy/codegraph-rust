@@ -481,7 +481,17 @@ fn matches_non_production_dir(lower_path: &str) -> bool {
     })
 }
 
+/// Whether a path looks like test or other non-production code (examples,
+/// samples, fixtures, benchmarks, demos) — upstream `isTestFile`, the wide
+/// reading ranking uses.
 pub fn is_test_file(file_path: &str) -> bool {
+    is_test_path(file_path) || matches_non_production_dir(&file_path.to_lowercase())
+}
+
+/// Whether a path names a TEST suite — upstream `isTestPath`, the narrow half of
+/// [`is_test_file`]: the file-name and directory conventions test suites use,
+/// and nothing else (an example or a fixture is not a test).
+pub fn is_test_path(file_path: &str) -> bool {
     let lower = file_path.to_lowercase();
     let file_name = basename(file_path);
     let lower_name = file_name.to_lowercase();
@@ -510,7 +520,7 @@ pub fn is_test_file(file_path: &str) -> bool {
         return true;
     }
 
-    matches_non_production_dir(&lower)
+    false
 }
 
 fn matches_separator_test(lower_name: &str) -> bool {
@@ -744,6 +754,27 @@ pub fn is_distinctive_identifier(token: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Upstream `__tests__/ui-entrypoints-api.test.ts` "keeps the suites and
+    /// drops the examples": the narrow predicate a "Tests" heading gathers by.
+    #[test]
+    fn keeps_the_suites_and_drops_the_examples() {
+        for suite in [
+            "foo_test.go",
+            "src/foo.test.ts",
+            "src/__tests__/foo.ts",
+            "test/foo.rb",
+            "src/FooTest.java",
+            "app/src/jvmTest/Bar.kt",
+        ] {
+            assert!(is_test_path(suite), "{suite}");
+            assert!(is_test_file(suite), "{suite}");
+        }
+        for other in ["examples/demo.ts", "benchmarks/run.ts", "fixtures/a.ts"] {
+            assert!(is_test_file(other), "{other}");
+            assert!(!is_test_path(other), "{other}");
+        }
+    }
 
     fn tokens(strs: &[&str]) -> HashSet<String> {
         strs.iter().map(|s| (*s).to_string()).collect()

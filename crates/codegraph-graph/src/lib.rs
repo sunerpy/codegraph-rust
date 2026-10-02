@@ -1,7 +1,13 @@
 //! codegraph-graph crate
 pub mod centrality;
+pub mod collation;
+pub mod dead_code;
 pub mod export;
+pub mod flow_boundary;
 pub mod graph;
+pub mod hierarchy;
+pub mod named_symbol_flow;
 pub mod query;
 pub mod segment_match;
 pub mod segments;
+pub mod symbol_lookup;

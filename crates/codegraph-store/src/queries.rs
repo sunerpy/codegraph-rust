@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::connection::Store;
 
-const SQLITE_PARAM_CHUNK_SIZE: usize = 500;
+pub(crate) const SQLITE_PARAM_CHUNK_SIZE: usize = 500;
 
 /// Env var name (#1231): set to `1` to opt out of bulk-index WAL-checkpoint
 /// deferral and keep SQLite's default `wal_autocheckpoint` interval.
@@ -1683,7 +1683,7 @@ where
     rows.collect()
 }
 
-fn row_to_node(row: &Row<'_>) -> rusqlite::Result<Node> {
+pub(crate) fn row_to_node(row: &Row<'_>) -> rusqlite::Result<Node> {
     Ok(Node {
         id: row.get("id")?,
         kind: parse_node_kind(row.get::<_, String>("kind")?)?,
@@ -1709,7 +1709,7 @@ fn row_to_node(row: &Row<'_>) -> rusqlite::Result<Node> {
     })
 }
 
-fn row_to_edge(row: &Row<'_>) -> rusqlite::Result<Edge> {
+pub(crate) fn row_to_edge(row: &Row<'_>) -> rusqlite::Result<Edge> {
     Ok(Edge {
         id: row.get("id")?,
         source: row.get("source")?,
@@ -1722,7 +1722,7 @@ fn row_to_edge(row: &Row<'_>) -> rusqlite::Result<Edge> {
     })
 }
 
-fn row_to_file(row: &Row<'_>) -> rusqlite::Result<FileRecord> {
+pub(crate) fn row_to_file(row: &Row<'_>) -> rusqlite::Result<FileRecord> {
     Ok(FileRecord {
         path: row.get("path")?,
         content_hash: row.get("content_hash")?,
@@ -1756,7 +1756,7 @@ fn millis_column(row: &Row<'_>, name: &str) -> rusqlite::Result<i64> {
     }
 }
 
-fn row_to_unresolved_ref(row: &Row<'_>) -> rusqlite::Result<UnresolvedRef> {
+pub(crate) fn row_to_unresolved_ref(row: &Row<'_>) -> rusqlite::Result<UnresolvedRef> {
     let raw_kind = row.get::<_, String>("reference_kind")?;
     let is_function_ref = raw_kind == "function_ref";
     let reference_kind = if is_function_ref {

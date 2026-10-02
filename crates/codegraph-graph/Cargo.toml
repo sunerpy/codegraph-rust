@@ -24,6 +24,7 @@ regex = "1.10"
 unicode-normalization = "0.1"
 
 [dev-dependencies]
+tempfile = "3"
 serde_json = { workspace = true }
 codegraph-extract = { path = "../codegraph-extract" }
 codegraph-resolve = { path = "../codegraph-resolve" }

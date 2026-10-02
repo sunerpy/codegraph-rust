@@ -926,6 +926,34 @@ impl WatchOptions {
         self
     }
 
+    /// A watcher that OBSERVES and never syncs.
+    ///
+    /// `on_paths` receives each settled batch of root-relative logical paths —
+    /// exactly the set a syncing watcher would hand its incremental sync — and
+    /// `on_scan` is called when the change cannot be described path by path (a
+    /// removed or renamed directory, a link topology or control-file change):
+    /// the case a syncing watcher escalates to a full sync. Both replace the
+    /// two sync closures and report an empty [`SyncOutcome`], so the default
+    /// closures, which open the index for writing, are never constructed.
+    /// Registration, scope, symlink mapping, debounce and the degrade latch are
+    /// the watcher's own. Used by the browser viewer's live channel.
+    #[must_use]
+    pub fn observe_only(
+        mut self,
+        on_paths: impl Fn(Vec<String>) + Send + Sync + 'static,
+        on_scan: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        self.sync_fn = Some(Arc::new(move |paths| {
+            on_paths(paths);
+            Ok(SyncOutcome::default())
+        }));
+        self.full_sync_fn = Some(Arc::new(move || {
+            on_scan();
+            Ok(SyncOutcome::default())
+        }));
+        self
+    }
+
     #[must_use]
     pub fn for_project(config: &Config, extensions: Arc<ExtensionOverrides>) -> Self {
         Self {
@@ -4056,6 +4084,120 @@ mod tests {
             seen,
             "an edit behind a followed link syncs its logical path"
         );
+    }
+
+    type Scans = Arc<AtomicUsize>;
+
+    /// A real watcher in observe-only mode: what it reports, and how often it
+    /// asked for a scan.
+    fn observing_watcher(root: &Path) -> (ProjectWatcher, Recorded, Scans) {
+        let seen: Recorded = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let scans = Arc::new(AtomicUsize::new(0));
+        let scan_counter = Arc::clone(&scans);
+        let watcher = ProjectWatcher::start(
+            root,
+            WatchOptions {
+                debounce: Duration::from_millis(50),
+                ..WatchOptions::default()
+            }
+            .observe_only(
+                move |paths| sink.lock().unwrap().push(paths),
+                move || {
+                    scan_counter.fetch_add(1, AtomicOrdering::SeqCst);
+                },
+            ),
+        )
+        .unwrap()
+        .unwrap();
+        // Native backends (FSEvents) need a moment before streams report.
+        std::thread::sleep(Duration::from_millis(300));
+        (watcher, seen, scans)
+    }
+
+    #[test]
+    fn observe_only_reports_an_edit_by_its_root_relative_path_and_writes_nothing() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-observe-edit");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/a.ts"), "export const a = 1;\n").unwrap();
+        // Every byte of the index namespace, so a write anywhere in it shows.
+        let snapshot = |root: &Path| -> Vec<(String, Vec<u8>)> {
+            let mut files: Vec<(String, Vec<u8>)> = fs::read_dir(root.join(".codegraph"))
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_file())
+                .map(|e| {
+                    (
+                        e.file_name().to_string_lossy().into_owned(),
+                        fs::read(e.path()).unwrap(),
+                    )
+                })
+                .collect();
+            files.sort();
+            files
+        };
+        let before = snapshot(dir.path());
+        let (watcher, seen, scans) = observing_watcher(dir.path());
+        fs::write(dir.path().join("src/a.ts"), "export const a = 2;\n").unwrap();
+        let reported = wait_until(|| saw_path(&seen, "src/a.ts"));
+        watcher.stop();
+        assert!(reported, "an edit is reported by its root-relative path");
+        assert_eq!(
+            scans.load(AtomicOrdering::SeqCst),
+            0,
+            "a file edit needs no scan"
+        );
+        // The default sync closures would have indexed the edit.
+        assert_eq!(
+            snapshot(dir.path()),
+            before,
+            "an observing watcher never writes the index"
+        );
+    }
+
+    #[test]
+    fn symlink_edit_is_observed_by_its_logical_path_without_a_sync() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-observe-link");
+        let outside = LinkTarget::new("observe");
+        fs::write(outside.0.join("x.ts"), "export const x = 1;\n").unwrap();
+        if !symlink_at(&outside.0, &dir.path().join("ext"), true) {
+            return;
+        }
+        let (watcher, seen, _) = observing_watcher(dir.path());
+        fs::write(outside.0.join("x.ts"), "export const x = 2;\n").unwrap();
+        let reported = wait_until(|| saw_path(&seen, "ext/x.ts"));
+        watcher.stop();
+        assert!(
+            reported,
+            "the logical path is reported, not the link target"
+        );
+    }
+
+    #[test]
+    fn observe_only_asks_for_a_scan_when_an_ancestor_directory_goes() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-observe-remove");
+        fs::create_dir_all(dir.path().join("pkg/inner")).unwrap();
+        fs::write(dir.path().join("pkg/inner/a.ts"), "export const a = 1;\n").unwrap();
+        let (watcher, _, scans) = observing_watcher(dir.path());
+        fs::remove_dir_all(dir.path().join("pkg")).unwrap();
+        let removed = wait_until(|| scans.load(AtomicOrdering::SeqCst) >= 1);
+        let before_rename = scans.load(AtomicOrdering::SeqCst);
+        fs::create_dir_all(dir.path().join("lib/deep")).unwrap();
+        fs::write(dir.path().join("lib/deep/b.ts"), "export const b = 1;\n").unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let settled = scans.load(AtomicOrdering::SeqCst);
+        fs::rename(dir.path().join("lib"), dir.path().join("lib2")).unwrap();
+        let renamed = wait_until(|| scans.load(AtomicOrdering::SeqCst) > settled);
+        watcher.stop();
+        assert!(
+            removed,
+            "removing an ancestor of watched files asks for a scan"
+        );
+        assert!(before_rename >= 1);
+        assert!(renamed, "renaming an ancestor directory asks for a scan");
     }
 
     #[test]
