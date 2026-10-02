@@ -4,7 +4,7 @@
    *
    * It renders whatever `palette.view` is: the entry points when the box is
    * empty, the ranked kind groups when it is not. The keyboard lives in
-   * `TopBar` (the keys are pressed in the input, not here) and arrives as the
+   * `SearchPalette` (the keys are pressed in the input, not here) and arrives as the
    * `selected` index; this component's only job beyond drawing is keeping that
    * row in view when the selection moves past the panel's edge.
    */
@@ -47,36 +47,73 @@
   {:else if palette.pending && view.items.length === 0}
     <p class="note">Searching…</p>
   {:else if view.empty}
-    <p class="note">{view.empty}</p>
+    <p class="note empty">{view.empty}</p>
   {/if}
+
+  <div class="keys" aria-hidden="true">
+    <span><span class="kbd">↑</span><span class="kbd">↓</span> move</span>
+    <span><span class="kbd">⏎</span> open</span>
+    <span><span class="kbd">esc</span> close</span>
+  </div>
 </div>
 
 <style>
+  /* §7 search palette: under the command input at its x and width, r 12,
+     `overlay` + `line-strong` + SH.pop; key hints along the bottom. */
   .panel {
     position: absolute;
     z-index: 40;
-    top: 32px;
+    top: 42px;
     right: 0;
     left: 0;
-    max-height: 420px;
+    display: flex;
+    max-height: min(480px, calc(100vh - 80px));
+    flex-direction: column;
+    gap: 2px;
     overflow: auto;
-    background: var(--paper);
-    border: 1px solid var(--ink);
+    padding: 8px;
+    border: 1px solid var(--line-strong);
+    border-radius: 12px;
+    background: var(--overlay);
+    box-shadow: var(--sh-pop);
   }
 
   .hint {
-    margin: 0;
+    margin: 0 0 4px;
     padding: 8px 10px;
-    border-bottom: 1px solid var(--rule-faint);
-    background: var(--paper-2);
-    color: var(--ink-2);
-    font-size: 12px;
+    border-radius: 8px;
+    background: var(--raised);
+    color: var(--fg-2);
+    font: var(--t-small);
   }
 
   .note {
     margin: 0;
-    padding: 8px 10px;
-    color: var(--ink-3);
-    font-size: 12px;
+    padding: 10px;
+    color: var(--fg-3);
+    font: var(--t-small);
+  }
+
+  .note.empty {
+    color: var(--fg-2);
+  }
+
+  .keys {
+    position: sticky;
+    bottom: -8px;
+    display: flex;
+    gap: 14px;
+    margin: 4px -8px -8px;
+    padding: 8px 12px;
+    border-top: 1px solid var(--line-faint);
+    background: var(--overlay);
+    color: var(--fg-3);
+    font: var(--t-caption);
+  }
+
+  .keys > span {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
   }
 </style>

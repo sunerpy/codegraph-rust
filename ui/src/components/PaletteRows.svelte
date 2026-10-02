@@ -101,39 +101,53 @@
     display: flex;
     align-items: baseline;
     gap: 8px;
-    padding: 6px 10px 4px;
-    border-bottom: 1px solid var(--rule-faint);
-    color: var(--ink-3);
-    font-size: 12px;
+    padding: 8px 8px 4px;
+    color: var(--fg-3);
+    font: var(--t-micro);
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
   }
 
   .head-note {
     overflow: hidden;
-    color: var(--ink-4);
-    font-size: 11.5px;
+    color: var(--fg-4);
+    font: var(--t-caption);
+    letter-spacing: 0;
     text-overflow: ellipsis;
+    text-transform: none;
     white-space: nowrap;
   }
 
+  /* §7: result rows 40 high, `card` + `line-faint`, r 8. */
   .row {
     display: grid;
     width: 100%;
-    align-items: baseline;
-    padding: 6px 10px;
-    border-bottom: 1px solid var(--rule-faint);
-    color: var(--ink);
+    min-height: 40px;
+    align-items: center;
+    margin: 0 0 4px;
+    padding: 0 10px;
+    border: 1px solid var(--line-faint);
+    border-radius: 8px;
+    background: var(--card);
+    color: var(--fg);
     gap: 10px;
-    grid-template-columns: 18px 1fr auto;
+    grid-template-columns: 20px minmax(0, 1fr) auto;
     text-align: left;
   }
 
-  .row:last-child {
-    border-bottom: 0;
+  .row:hover {
+    border-color: var(--line);
+    background: var(--raised);
   }
 
-  .row:hover,
   .row.sel {
-    background: var(--press);
+    border-color: var(--primary-line);
+    background: var(--primary-soft);
+    box-shadow: var(--glow-20);
+  }
+
+  .row.sel .nm {
+    color: var(--primary-ink);
   }
 
   .mid {
@@ -143,25 +157,22 @@
   }
 
   .nm {
-    font-family: var(--mono);
-    font-size: 12.5px;
+    font: var(--t-mono-500);
   }
 
   .nm.gen {
-    color: var(--ink-4);
+    color: var(--fg-4);
   }
 
   .sig {
-    margin-left: 6px;
-    color: var(--ink-3);
-    font-family: var(--mono);
-    font-size: 11.5px;
+    margin-left: 8px;
+    color: var(--fg-3);
+    font: var(--t-mono-sm);
   }
 
   .loc {
-    color: var(--ink-3);
-    font-family: var(--mono);
-    font-size: 11px;
+    color: var(--fg-3);
+    font: var(--t-mono-sm);
     white-space: nowrap;
   }
 </style>

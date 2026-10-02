@@ -1,18 +1,19 @@
 <!--
   "This file changed on disk after the last index sync."
 
-  One block, said the same way on every screen that can say it (design spec:
-  paper-2 fill, hairline rule, ⚠ in ink-3, 12.5px ink-2). Deliberately NOT
-  amber: amber is the untested badge's colour and nothing else's, and a warning
-  that borrows it makes two unrelated things look like the same kind of problem.
-  Deliberately not a modal either — the screen underneath is still mostly true,
-  and interrupting to say so would be the overclaim.
+  One block, said the same way on every screen that can say it. Direction D
+  (docs/design/viewer-d.md §3.3, §7) gives drift amber — conditional or stale —
+  as an `amber-soft` callout with a triangle-alert icon; upstream kept it grey
+  because its amber meant "untested" only (§12 records the change). Not a
+  modal: the screen underneath is still mostly true, and interrupting to say
+  so would be the overclaim.
 
   The caller supplies the tail of the sentence, because what follows the dash is
   the only part that differs: what this particular screen did about it.
 -->
 <script lang="ts">
   import type { Snippet } from 'svelte';
+  import Icon from './Icon.svelte';
 
   interface Props {
     /** Project-relative path, shown in mono. */
@@ -25,52 +26,44 @@
 </script>
 
 <div class="drift" role="status">
-  <span class="glyph" aria-hidden="true">⚠</span>
+  <span class="glyph"><Icon name="triangle-alert" /></span>
   <span class="body"><code>{file}</code> changed on disk after the last index sync — {@render children()}</span>
 </div>
 
 <style>
   .drift {
     display: grid;
-    grid-template-columns: 16px 1fr;
-    gap: 6px;
+    grid-template-columns: 16px minmax(0, 1fr);
+    gap: 10px;
     align-items: start;
-    padding: 8px 12px;
-    border: 1px solid var(--rule-soft);
-    background: var(--paper-2);
-    color: var(--ink-2);
-    font-size: 12.5px;
+    padding: 11px 14px;
+    border-radius: 10px;
+    background: var(--amber-soft);
+    color: var(--amber);
+    font: var(--t-small);
     line-height: 1.5;
   }
 
   .glyph {
-    color: var(--ink-3);
-    font-size: 12px;
-    line-height: 1.55;
+    display: inline-flex;
+    padding-top: 1px;
   }
 
   .body :global(code) {
-    font-family: var(--mono);
-    font-size: 12px;
-    color: var(--ink);
+    font: var(--t-mono-sm);
+    font-weight: 500;
   }
 
-  .body :global(button) {
-    background: none;
-    border: 0;
-    padding: 0;
-    color: var(--accent);
-    font: inherit;
-    cursor: pointer;
-    text-decoration: underline;
-    text-decoration-color: var(--accent-line);
-    text-underline-offset: 3px;
-  }
-
+  .body :global(button),
   .body :global(a) {
-    color: var(--accent);
+    padding: 0;
+    border: 0;
+    background: none;
+    color: inherit;
+    cursor: pointer;
+    font: inherit;
+    font-weight: 600;
     text-decoration: underline;
-    text-decoration-color: var(--accent-line);
     text-underline-offset: 3px;
   }
 </style>

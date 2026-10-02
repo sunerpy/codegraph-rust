@@ -1,6 +1,9 @@
 <script lang="ts">
   import { untrack } from 'svelte';
   import TopBar from './components/TopBar.svelte';
+  import NavRail from './components/NavRail.svelte';
+  import PhoneTabBar from './components/PhoneTabBar.svelte';
+  import MoreSheet from './components/MoreSheet.svelte';
   import TrailBar from './components/TrailBar.svelte';
   import HomeView from './views/HomeView.svelte';
   import SymbolView from './views/SymbolView.svelte';
@@ -30,6 +33,7 @@
   import { project } from './lib/project.svelte';
   import { live } from './lib/live.svelte';
   import { toast } from './lib/toast.svelte';
+  import { command } from './lib/command.svelte';
 
   // One `/api/stats` for the whole app: the top bar's counts and the Symbol
   // view's blast-radius denominator come out of the same payload.
@@ -66,6 +70,25 @@
   });
 
   let topbar: TopBar | null = $state(null);
+
+  // A view asked for the palette (the Start screen's Search button).
+  let seenSearchTick = command.searchTick;
+  $effect(() => {
+    const tick = command.searchTick;
+    untrack(() => {
+      if (tick === seenSearchTick) return;
+      seenSearchTick = tick;
+      topbar?.focusSearch();
+    });
+  });
+
+  /** The phone's More sheet — opened from the tab bar or the top bar. */
+  let moreOpen = $state(false);
+  // Moving on closes it: a destination in the sheet is a navigation.
+  $effect(() => {
+    void router.route;
+    untrack(() => (moreOpen = false));
+  });
 
   let route = $derived(router.route);
 
@@ -155,7 +178,8 @@
 
 <svelte:window {onkeydown} />
 
-<TopBar bind:this={topbar} project={project.name} stats={project.summary} showScreens={hasScreens} />
+<NavRail {hasScreens} />
+<TopBar bind:this={topbar} project={project.name} onmore={() => (moreOpen = true)} />
 <TrailBar />
 <main>
   {#if route.view === 'symbol' && route.id !== null}
@@ -189,6 +213,10 @@
     <HomeView project={project.name} />
   {/if}
 </main>
+<PhoneTabBar {hasScreens} {moreOpen} onmore={() => (moreOpen = !moreOpen)} />
+{#if moreOpen}
+  <MoreSheet {hasScreens} onclose={() => (moreOpen = false)} />
+{/if}
 <Toast />
 
 <style>
@@ -196,8 +224,18 @@
      Svelte's scoped styles cannot reach an element this component does not
      render. Only <main>, which it does render, is styled here. */
   main {
-    /* min-height:0 lets the row shrink so the view, not the page, scrolls. */
+    grid-area: main;
+    /* min-height:0 lets the row shrink so the view, not the page, scrolls.
+       The islands sit 8px from the ribbon (or the bar), the right edge and
+       the bottom (§2: x 72 … W−8, y 104 … H−8). */
     min-height: 0;
     overflow: hidden;
+    padding: var(--gap) var(--gap) var(--gap) var(--gap);
+  }
+
+  @media (max-width: 599px) {
+    main {
+      padding: var(--gap);
+    }
   }
 </style>

@@ -14,6 +14,7 @@
    * graph through the installed navigation driver — which is the right default
    * both for `codegraph ui` and for a host that installed one.
    */
+  import Icon from './Icon.svelte';
   import PalettePanel from './PalettePanel.svelte';
   import { palette } from '../lib/palette.svelte';
   import type { PaletteItem } from '../lib/search-model';
@@ -29,12 +30,15 @@
   }
 
   let {
-    placeholder = 'Search a symbol or file, or ask “how does execute reach getFile” — press / to focus',
+    placeholder = 'Search symbols and files — or ask “how does X reach Y”',
     label = 'Search symbols and files',
     onpick,
   }: Props = $props();
 
   let input: HTMLInputElement | null = $state(null);
+
+  /** The modifier the shortcut uses here: ⌘ on a Mac, Ctrl elsewhere. */
+  const MOD = /Mac|iPhone|iPad/.test(globalThis.navigator?.platform ?? '') ? '⌘' : 'Ctrl';
   let box: HTMLDivElement | null = $state(null);
 
   /** Focus and select the box — what `/` and Cmd-K reach. */
@@ -131,7 +135,8 @@
 
 <svelte:window {onpointerdown} />
 
-<div class="search" role="search" bind:this={box}>
+<div class="search" class:open={palette.open} role="search" bind:this={box}>
+  <span class="lead"><Icon name="search" /></span>
   <input
     bind:this={input}
     bind:value={palette.query}
@@ -149,34 +154,73 @@
     aria-autocomplete="list"
     aria-activedescendant={palette.open ? `palette-row-${palette.selected}` : undefined}
   />
+  <span class="keys" aria-hidden="true"><span class="kbd">{MOD}</span><span class="kbd">K</span></span>
   {#if palette.open}
     <PalettePanel onpick={pick} />
   {/if}
 </div>
 
 <style>
+  /* §7 command input: 36 high, r 10, `raised` + `line`; icon 16 at 12, the
+     text at 36, the ⌘ K caps 10 from the right edge. Focus is `primary-line`
+     with the 25 % glow. */
   .search {
     position: relative;
     width: 100%;
-    max-width: 720px;
+  }
+
+  .lead {
+    position: absolute;
+    top: 10px;
+    left: 12px;
+    display: inline-flex;
+    color: var(--fg-3);
+    pointer-events: none;
   }
 
   #q {
     width: 100%;
-    height: 30px;
-    padding: 0 10px;
-    border: 1px solid var(--rule-soft);
-    background: var(--paper-2);
-    color: var(--ink);
-    font: 13px var(--sans);
+    height: 36px;
+    padding: 0 64px 0 36px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--raised);
+    color: var(--fg);
+    font: var(--t-small);
+    transition:
+      border-color 120ms,
+      box-shadow 120ms;
+  }
+
+  #q:hover {
+    border-color: var(--line-strong);
   }
 
   #q:focus {
-    border-color: var(--ink);
+    border-color: var(--primary-line);
     outline: none;
+    box-shadow: var(--glow-25);
   }
 
   #q::placeholder {
-    color: var(--ink-3);
+    color: var(--fg-3);
+  }
+
+  /* The browser's own clear button would sit on the key caps. */
+  #q::-webkit-search-cancel-button {
+    display: none;
+  }
+
+  .keys {
+    position: absolute;
+    top: 9px;
+    right: 10px;
+    display: inline-flex;
+    gap: 4px;
+    pointer-events: none;
+  }
+
+  .search.open .keys {
+    display: none;
   }
 </style>

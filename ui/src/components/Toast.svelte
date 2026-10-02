@@ -15,19 +15,29 @@
 </div>
 
 <style>
+  /* `overlay` + `line-strong` + SH.pop, r 10 — a note, not a dialog. */
   .toast {
     position: fixed;
-    left: 50%;
     bottom: 22px;
-    transform: translateX(-50%);
-    background: var(--ink);
-    color: var(--paper);
-    padding: 8px 14px;
-    font-size: 12.5px;
-    line-height: 1.4;
+    left: 50%;
+    z-index: 80;
     max-width: 70ch;
-    z-index: 50;
+    padding: 9px 16px;
+    border: 1px solid var(--line-strong);
+    border-radius: 10px;
+    background: var(--overlay);
+    box-shadow: var(--sh-pop);
+    color: var(--fg);
+    font: var(--t-small-500);
+    line-height: 1.4;
+    transform: translateX(-50%);
     animation: rise 140ms ease-out;
+  }
+
+  @media (max-width: 599px) {
+    .toast {
+      bottom: 80px;
+    }
   }
 
   @keyframes rise {
