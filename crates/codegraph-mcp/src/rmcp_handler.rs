@@ -427,8 +427,10 @@ fn execute_owned(project_path: &Path, tool_name: &str, args: &Value) -> ToolResu
 impl ServerHandler for CodeGraphHandler {
     fn get_info(&self) -> ServerConfig {
         // capabilities = exactly {"tools":{}} (enable_tools, NO list_changed);
-        // protocolVersion falls back to V_2024_11_05 for unknown client versions;
-        // rmcp negotiates and echoes known versions verbatim.
+        // protocolVersion falls back to V_2024_11_05. rmcp echoes a known
+        // version that has an `initialize` handshake (2024-11-05 … 2025-11-25)
+        // verbatim; 2026-07-28 has none — it is served statelessly per request
+        // — so an `initialize` asking for it gets this fallback too.
         // serverInfo{name,version=crate}; instructions reused verbatim.
         InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
@@ -462,7 +464,7 @@ impl ServerHandler for CodeGraphHandler {
         }
 
         // `Peer::list_roots` is `#[deprecated]` (SEP-2577); it is still THE
-        // mechanism in rmcp 3.0.1 for a server to ask the client for its roots and
+        // mechanism in rmcp 3.5.0 for a server to ask the client for its roots and
         // still has no non-deprecated replacement, so the deprecation is allowed
         // at this one call site.
         #[allow(deprecated)]

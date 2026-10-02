@@ -253,10 +253,10 @@ fn http_initialize_negotiates_2024_11_05_and_no_roots() {
     });
 }
 
-/// Structural goldens cannot observe HTTP response headers, so this locks the
-/// 2026 stateless initialize path to the absence of `Mcp-Session-Id`.
+/// 2026-07-28 has no `initialize` handshake (rmcp 3.5), so an `initialize`
+/// asking for it falls back to 2024-11-05, still without `Mcp-Session-Id`.
 #[test]
-fn http_2026_initialize_has_no_session_id() {
+fn http_initialize_asking_2026_falls_back_without_a_session() {
     rt().block_on(async {
         let project = setup_mini_project();
         let (url, _addr, ct) = spawn_http_server(project.path().to_path_buf()).await;
@@ -276,15 +276,75 @@ fn http_2026_initialize_has_no_session_id() {
         assert_eq!(response.status(), 200, "initialize must return 200");
         assert!(
             response.headers().get("Mcp-Session-Id").is_none(),
-            "2026-07-28 HTTP must be stateless and omit Mcp-Session-Id: {:?}",
+            "initialize must not open a session: {:?}",
             response.headers()
         );
         let body: Value = response.json().await.expect("json body");
         assert_eq!(
             body["result"]["protocolVersion"],
-            json!("2026-07-28"),
-            "initialize must negotiate 2026-07-28: {body}"
+            json!("2024-11-05"),
+            "initialize asking for 2026-07-28 must fall back: {body}"
         );
+
+        ct.cancel();
+    });
+}
+
+/// Structural goldens observe neither HTTP response headers nor top-level
+/// `resultType`, so lock both for stateless 2026-07-28 requests: the protocol
+/// version and client capabilities ride in each request's `_meta`.
+#[test]
+fn http_2026_stateless_requests_carry_result_type_and_no_session() {
+    rt().block_on(async {
+        let project = setup_mini_project();
+        let (url, _addr, ct) = spawn_http_server(project.path().to_path_buf()).await;
+        let client = reqwest::Client::new();
+        let meta = json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {}
+        });
+        let list = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": { "_meta": meta }
+        });
+        let call = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "codegraph_search",
+                "arguments": { "query": "add" },
+                "_meta": meta
+            }
+        });
+        for (body, method, name) in [
+            (&list, "tools/list", None),
+            (&call, "tools/call", Some("codegraph_search")),
+        ] {
+            let response = post_json_with_mcp_headers(
+                &client,
+                &url,
+                body,
+                Some("2026-07-28"),
+                Some(method),
+                name,
+            )
+            .await;
+            assert_eq!(response.status(), 200, "{method} must succeed");
+            assert!(
+                response.headers().get("Mcp-Session-Id").is_none(),
+                "2026-07-28 HTTP must be stateless and omit Mcp-Session-Id: {:?}",
+                response.headers()
+            );
+            let reply: Value = response.json().await.expect("json body");
+            assert_eq!(
+                reply["result"]["resultType"],
+                json!("complete"),
+                "{method} at 2026-07-28 must carry resultType=complete: {reply}"
+            );
+        }
 
         ct.cancel();
     });

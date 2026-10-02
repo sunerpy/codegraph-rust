@@ -8,19 +8,28 @@ Protocol handshake: `initialize` returns `serverInfo.name: "codegraph"`.
 `CARGO_PKG_VERSION`), so it tracks releases automatically rather than being
 hardcoded.
 
-`protocolVersion` is negotiated, not fixed. The server (built on `rmcp` 3.0.1)
-echoes back whatever revision the client asks for, as long as it is one it knows:
-**2024-11-05**, **2025-03-26**, **2025-06-18**, **2025-11-25**, or
-**2026-07-28**. An unrecognized request falls back to `2024-11-05`. What the
-negotiated revision changes:
+`protocolVersion` is negotiated, not fixed. The server is built on `rmcp` 3.5.0.
 
-| client requests | negotiated | `resultType` in results | streamable-HTTP session          |
-| --------------- | ---------- | ----------------------- | -------------------------------- |
-| 2024-11-05      | 2024-11-05 | absent                  | no `Mcp-Session-Id` (our config) |
-| 2025-03-26      | 2025-03-26 | absent                  | no `Mcp-Session-Id` (our config) |
-| 2025-06-18      | 2025-06-18 | absent                  | no `Mcp-Session-Id` (our config) |
-| 2025-11-25      | 2025-11-25 | absent                  | no `Mcp-Session-Id` (our config) |
-| 2026-07-28      | 2026-07-28 | `"complete"`            | no `Mcp-Session-Id` (per spec)   |
+- **`initialize`.** It echoes back the revision the client asks for, as long as it
+  is one it knows that has an `initialize` handshake: **2024-11-05**,
+  **2025-03-26**, **2025-06-18** or **2025-11-25**.
+- **2026-07-28.** This revision has no `initialize`. A 2026-07-28 client sends
+  every request statelessly: the protocol version and client capabilities go in
+  the request's `_meta` (`io.modelcontextprotocol/protocolVersion`,
+  `io.modelcontextprotocol/clientCapabilities`), alongside the SEP-2243 headers.
+- **Fallback.** An `initialize` that asks for 2026-07-28 falls back to
+  `2024-11-05`, like any unrecognized request.
+
+What the revision changes:
+
+| client sends                   | served at  | `resultType` in results | streamable-HTTP session          |
+| ------------------------------ | ---------- | ----------------------- | -------------------------------- |
+| `initialize` for 2024-11-05    | 2024-11-05 | absent                  | no `Mcp-Session-Id` (our config) |
+| `initialize` for 2025-03-26    | 2025-03-26 | absent                  | no `Mcp-Session-Id` (our config) |
+| `initialize` for 2025-06-18    | 2025-06-18 | absent                  | no `Mcp-Session-Id` (our config) |
+| `initialize` for 2025-11-25    | 2025-11-25 | absent                  | no `Mcp-Session-Id` (our config) |
+| `initialize` for 2026-07-28    | 2024-11-05 | absent                  | no `Mcp-Session-Id` (our config) |
+| a stateless 2026-07-28 request | 2026-07-28 | `"complete"`            | no `Mcp-Session-Id` (per spec)   |
 
 Results carry the SEP-2322 discriminator `resultType: "complete"` only for a
 2026-07-28 peer; older peers get the key stripped, and per spec a missing

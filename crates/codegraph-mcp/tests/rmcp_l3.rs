@@ -108,15 +108,19 @@ fn negotiated_protocol_version_is_2024_11_05() {
     });
 }
 
+/// `initialize` echoes every known revision that has the handshake. 2026-07-28
+/// has none (rmcp 3.5: it is served statelessly per request, see
+/// `rmcp_http.rs`), so an `initialize` asking for it gets the 2024-11-05
+/// fallback.
 #[test]
-fn known_protocol_versions_are_echoed_by_handshake() {
+fn initialize_echoes_each_handshake_revision_and_falls_back_for_2026() {
     rt().block_on(async {
         for (requested, expected) in [
             (ProtocolVersion::V_2024_11_05, "2024-11-05"),
             (ProtocolVersion::V_2025_03_26, "2025-03-26"),
             (ProtocolVersion::V_2025_06_18, "2025-06-18"),
             (ProtocolVersion::V_2025_11_25, "2025-11-25"),
-            (ProtocolVersion::V_2026_07_28, "2026-07-28"),
+            (ProtocolVersion::V_2026_07_28, "2024-11-05"),
         ] {
             let project = setup_mini_project();
             let handler = CodeGraphHandler::new(Some(project.path().to_path_buf()));
@@ -136,16 +140,16 @@ fn known_protocol_versions_are_echoed_by_handshake() {
 }
 
 /// The structural goldens never compare top-level `resultType`, so explicitly
-/// lock its 2026 presence and its pre-2026 omission for both tool result shapes.
+/// lock its omission before 2026 for both tool result shapes. Its 2026
+/// presence needs stateless 2026-07-28 requests, which `rmcp_http.rs` sends.
 #[test]
-fn result_type_is_versioned_for_tools_list_and_call() {
+fn pre_2026_tool_results_omit_result_type() {
     rt().block_on(async {
         for (requested, expected) in [
             (ProtocolVersion::V_2024_11_05, None),
             (ProtocolVersion::V_2025_03_26, None),
             (ProtocolVersion::V_2025_06_18, None),
             (ProtocolVersion::V_2025_11_25, None),
-            (ProtocolVersion::V_2026_07_28, Some("complete")),
         ] {
             let project = setup_mini_project();
             let handler = CodeGraphHandler::new(Some(project.path().to_path_buf()));
