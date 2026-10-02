@@ -148,6 +148,21 @@ below remain immutable historical evidence.
 
 ## Sync log
 
+### 2026-10-03 — browser viewer RESTYLED: direction D, a local design layer
+
+The ported viewer's frontend now carries the design the owner selected
+([`../design/viewer-d.md`](../design/viewer-d.md), direction D) on top of the
+`v1.6.1` import: tokens, type, shell, view layouts, states, responsive layouts
+and a second, light token set (§3.6). This is codegraph-rs's own design, not an
+upstream change: the wire contract, the routes and the server are untouched, and
+the frontend's models keep upstream's behaviour — only the layout constants the
+components measure against moved, each pinned by name in the suites.
+
+A later sync of upstream `ui/` therefore re-applies this layer rather than
+taking upstream's paper/ink look. The visual differences from the boards, and
+from upstream where they matter, are listed in [`../ui.md`](../ui.md) under
+"Direction D as built".
+
 ### 2026-10-02 — browser viewer PORTED: UI family phase 1 (`codegraph ui`, `CODEGRAPH_UI=1`)
 
 The viewer upstream ships in `v1.6.1` — `src/ui-server/**` (the loopback JSON

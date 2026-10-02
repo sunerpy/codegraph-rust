@@ -6,8 +6,9 @@ outline and imports, the call path between two symbols, the repository as a map
 of modules, a type's hierarchy, the code nothing reaches, and the places to start
 reading an unfamiliar project. It is a Rust port of the upstream
 colbymchenry/codegraph `v1.6.1` viewer: the frontend is upstream's `ui/` (Svelte
-5 + Vite, MIT, see [`ui/LICENSE`](../ui/LICENSE)) and the JSON API behind it is
-the `codegraph-ui` crate.
+5 + Vite, MIT, see [`ui/LICENSE`](../ui/LICENSE)), restyled to the selected
+design ([`design/viewer-d.md`](design/viewer-d.md), direction D) with a dark and
+a light theme, and the JSON API behind it is the `codegraph-ui` crate.
 
 The viewer is a **preview**, gated exactly as upstream gates it: unless
 `CODEGRAPH_UI=1` is set, `ui`, its alias `web`, `help ui` and `ui --help` are
@@ -142,10 +143,66 @@ the Rust graph holds different facts, the viewer shows what this index holds:
 - The bundle is embedded in the binary, so upstream's `CODEGRAPH_VIEWER_PATH`
   has no counterpart.
 
+## Look and themes
+
+The viewer is drawn in direction D of [`design/viewer-d.md`](design/viewer-d.md):
+an icon nav rail on the left, a command bar with the `⌘K` / `Ctrl+K` search
+palette, the trail ribbon under it while a trail exists, and each view as
+rounded islands 8 px apart. Below 1024 px wide the rail narrows and the Symbol
+view's Called by rail becomes a drawer behind a header button; below 600 px a
+bottom tab bar (Start, Map, Symbol, Flow, More) replaces the rail, the Symbol
+view shows one pane at a time (Code, Called by, Calls), and tapping a call in
+the code opens a sheet with that line's calls.
+
+There are two themes with the same token names: **Nebula** (dark, §3.1 of the
+spec) and **Daylight** (light, §3.6). The viewer follows the operating system's
+`prefers-color-scheme` until the reader picks one: the theme control — System,
+Dark, Light — sits in the nav rail's foot on desktop and tablet and in the More
+sheet on the phone. The choice is stored in the browser's `localStorage` under
+`codegraph-ui.theme` and applied as `data-theme` on the page; System removes
+it. Copy image and Download SVG on the Flow and Map views paint the theme on
+screen. `ui/tests/theme-contrast.test.ts` reads both token sets out of
+`ui/src/lib/theme.css` and fails if any pair the spec declares falls below
+4.5:1.
+
+Interface text is set in Inter, code and names in JetBrains Mono, both bundled
+(OFL) so the viewer never fetches a font; ligatures are off, so `->` reads as
+written. The icons are Lucide (ISC) geometry, copied into
+`ui/src/lib/icons.ts` with its notice.
+
+### Direction D as built — 偏离（画板 vs 落地，供 owner 复核）
+
+| item                     | board                                          | landed                                                                                                                                                             |
+| ------------------------ | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| project switch           | name, chevron and a `main · <sha>` branch pill | the name alone: one project per viewer, and the API carries no git branch                                                                                          |
+| rail foot                | keyboard and settings                          | the theme switch above them; keyboard opens the shortcut sheet, settings a panel of what this viewer reads (port, read-only and watching are command-line choices) |
+| Saved trails destination | a trails screen                                | opens Entry points, which lists saved trails first                                                                                                                 |
+| Start, entry card        | "Entry functions" with Flow buttons            | "Where it starts" — routes when the project is routed, else the files that run something at their top level — opening the row; a flow starts from Entry points     |
+| Flow                     | 190 × 168 step cards and a step-detail panel   | upstream's cards opened at each call window, restyled; Every hop table below; its Runs when column reads "—" until conditions are ported                           |
+| Map toolbar              | zoom readout and an Include tests switch       | the zoom controls; Include tests lives in the inspector's View section; Open crate is Open first file                                                              |
+| Map key                  | the one-line legend                            | the same, opening to upstream's full key on request (upstream opened the full key by default)                                                                      |
+| File, This file          | edges in and out, prod and test files          | how many files depend on it and it on them, its symbols, its size — no edge totals in the payload                                                                  |
+| hierarchy                | a supertrait outside the index drawn at 50 %   | not drawn: the payload carries no outside-index supertypes                                                                                                         |
+| code lines               | a long line ends in `…`                        | a long line scrolls sideways, as upstream's did                                                                                                                    |
+| trail hops               | qualified names                                | the symbol's name, as upstream labels a hop                                                                                                                        |
+| SVG export               | — (upstream: always light)                     | the theme on screen                                                                                                                                                |
+| ligatures                | the boards show `->` as an arrow               | off (§13 left it open; source fidelity decides)                                                                                                                    |
+| tablet Symbol            | blast radius as two stat tiles under the code  | the four tiles stay at the foot of the Called by drawer                                                                                                            |
+
+Layout constants the components measure against moved with the design; the
+suites pin them by name: hierarchy rows 24 → 26 and indent 22 → 28; file
+outline rows at a 30 px pitch; map nodes 40 → 52 high, layers 74 → 44 and boxes
+34 → 28 apart; callee rows 34 → 44 high with a 52 px pitch. Character advances
+were re-measured in Chrome against the bundled fonts: the map label (12 px
+JetBrains Mono 500) 7.81 → 7.2, the map meta line (11 px Inter) 5.9 → 5.5, the
+flow link label (11 px mono) 6.65 → 6.6, the Screens pill (10.5 px mono) 6.3,
+unchanged.
+
 ## Developing the frontend
 
 The frontend lives in `ui/` with its own pinned dependencies and a committed
-`ui/package-lock.json`; `npm ci` is the only install path. `npm run build` writes
+`ui/package-lock.json`; `npm ci` is the only install path. `npm run build` (or
+`make ui`, which runs `npm ci` first) writes
 the production bundle into `crates/codegraph-ui/viewer/`, which the crate's
 `build.rs` embeds at compile time, so `cargo build` and `cargo install --git`
 never need Node. The bundle is committed, and `make ui-check` (the CI `UI` job)
