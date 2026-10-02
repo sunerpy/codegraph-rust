@@ -162,6 +162,71 @@ used to be raw hexes.
 - Component boundaries are below the 3:1 non-text ratio (`line` 1.28 on panel, input fill `raised` 1.14). An input
   is identified by its fill, icon and placeholder; focus adds `primary-line` + SH.glow 25 %.
 
+### 3.6 `D · Daylight` — the light theme (2026-10-02, no boards)
+
+The owner asked for a light version without boards, so this set is specified here and nowhere in Penpot. It
+has the same 39 token names and meanings as `D · Nebula`, and the 15 aliases of §3.2 map exactly as they do
+there. The accents were derived from their Nebula counterparts by darkening them in HLS until each held at
+least 4.5:1 on every light surface, and the whole set was checked by script. Ratios are WCAG 2.x against the
+six surfaces, floored to 2 decimals as in §3.1.
+
+| token | hex | bg | rail | panel | card | raised | overlay |
+|---|---|---|---|---|---|---|---|
+| `bg` | `#EBEEF4` | 1.00 | 1.05 | 1.16 | 1.09 | 1.02 | 1.16 |
+| `rail` | `#E4E8F0` | 1.05 | 1.00 | 1.22 | 1.15 | 1.08 | 1.22 |
+| `panel` | `#FFFFFF` | 1.16 | 1.22 | 1.00 | 1.06 | 1.13 | 1.00 |
+| `card` | `#F7F8FB` | 1.09 | 1.15 | 1.06 | 1.00 | 1.06 | 1.06 |
+| `raised` | `#EEF1F6` | 1.02 | 1.08 | 1.13 | 1.06 | 1.00 | 1.13 |
+| `overlay` | `#FFFFFF` | 1.16 | 1.22 | 1.00 | 1.06 | 1.13 | 1.00 |
+| `line` | `#D8DDE7` | 1.17 | 1.10 | 1.36 | 1.28 | 1.20 | 1.36 |
+| `line-strong` | `#BCC4D3` | 1.50 | 1.42 | 1.75 | 1.65 | 1.54 | 1.75 |
+| `line-faint` | `#E6E9F0` | 1.04 | 1.01 | 1.21 | 1.14 | 1.07 | 1.21 |
+| `fg` | `#1A2130` | 13.85 | 13.11 | 16.10 | 15.16 | 14.22 | 16.10 |
+| `fg-2` | `#434D62` | 7.29 | 6.90 | 8.47 | 7.98 | 7.48 | 8.47 |
+| `fg-3` | `#5F687C` | 4.80 | 4.55 | 5.58 | 5.26 | 4.93 | 5.58 |
+| `fg-4` | `#98A1B3` | 2.23 | 2.11 | 2.59 | 2.44 | 2.29 | 2.59 |
+| `primary` | `#4155EE` | 4.80 | 4.54 | 5.58 | 5.26 | 4.93 | 5.58 |
+| `primary-2` | `#7640ED` | 4.84 | 4.58 | 5.63 | 5.30 | 4.97 | 5.63 |
+| `primary-soft` | `#E9EDFF` | 1.00 | 1.05 | 1.16 | 1.09 | 1.02 | 1.16 |
+| `primary-line` | `#B9C3F6` | 1.48 | 1.40 | 1.72 | 1.62 | 1.52 | 1.72 |
+| `primary-ink` | `#3340AA` | 7.36 | 6.96 | 8.55 | 8.05 | 7.55 | 8.55 |
+| `primary-deep` | `#4C5FE8` | 4.39 | 4.16 | 5.11 | 4.81 | 4.51 | 5.11 |
+| `primary-2-deep` | `#7A4FE6` | 4.41 | 4.18 | 5.13 | 4.83 | 4.53 | 5.13 |
+| `on-primary` | `#FFFFFF` | — | — | — | — | — | — |
+| `cyan` | `#0B7280` | 4.84 | 4.58 | 5.62 | 5.29 | 4.96 | 5.62 |
+| `cyan-soft` | `#DCF2F5` | 1.00 | 1.05 | 1.16 | 1.09 | 1.02 | 1.16 |
+| `cyan-line` | `#8ACCD6` | 1.54 | 1.46 | 1.79 | 1.69 | 1.58 | 1.79 |
+| `green` | `#187648` | 4.85 | 4.59 | 5.63 | 5.31 | 4.98 | 5.63 |
+| `green-soft` | `#DDF3E7` | 1.00 | 1.05 | 1.16 | 1.09 | 1.02 | 1.16 |
+| `green-deep` | `#1F9A5E` | 3.09 | 2.92 | 3.59 | 3.38 | 3.17 | 3.59 |
+| `amber` | `#975A00` | 4.78 | 4.52 | 5.55 | 5.23 | 4.90 | 5.55 |
+| `amber-soft` | `#FBEED6` | 1.01 | 1.07 | 1.14 | 1.08 | 1.01 | 1.14 |
+| `red` | `#BF332B` | 4.85 | 4.59 | 5.63 | 5.31 | 4.98 | 5.63 |
+| `red-soft` | `#FBE4E2` | 1.04 | 1.01 | 1.21 | 1.14 | 1.07 | 1.21 |
+| `violet` | `#7747DF` | 4.81 | 4.55 | 5.59 | 5.27 | 4.94 | 5.59 |
+| `violet-soft` | `#EFE8FD` | 1.02 | 1.03 | 1.19 | 1.12 | 1.05 | 1.19 |
+| `syn-kw` | `#7444DA` | 5.04 | 4.77 | 5.86 | 5.52 | 5.17 | 5.86 |
+| `syn-str` | `#1B7943` | 4.67 | 4.42 | 5.43 | 5.11 | 4.80 | 5.43 |
+| `syn-num` | `#A15717` | 4.64 | 4.39 | 5.39 | 5.08 | 4.76 | 5.39 |
+| `syn-com` | `#626A7D` | 4.66 | 4.41 | 5.41 | 5.10 | 4.78 | 5.41 |
+| `syn-type` | `#0D7487` | 4.67 | 4.42 | 5.43 | 5.11 | 4.79 | 5.43 |
+| `syn-punct` | `#5F6A7E` | 4.69 | 4.44 | 5.45 | 5.13 | 4.81 | 5.45 |
+
+Worst pairs: the text ramp and the accents hold ≥ 4.52 on all six surfaces (`amber` on `rail`; `fg-4`
+excepted, decorative as in §3.5); the syntax colours ≥ 4.63 on `card`, `raised` and `primary-soft`, the only
+surfaces code sits on (`syn-num` on `primary-soft`); `on-primary` on the GRAD.button stops 5.11 / 5.13. Pill
+text on its own soft fill: primary-ink 7.34 · cyan 4.83 · green 4.84 · amber 4.84 · red 4.64 · violet 4.70.
+
+Effects (§4) in Daylight: SH.card `0 4 14 0 #101828 8 %`; SH.pop `0 12 32 0 #101828 16 %`; SH.glow(op)
+`0 0 14 0 primary @ 0.6 × op`; SH.glowCyan(op) and SH.glowGreen(op) `0 0 6 0` in their colour `@ 0.5 × op`. The
+gradients use the same stops by token name. Canvas: `card`, a dot grid `#D3D9E4` (pitch 20, radius 1.05) and
+the two ambient glows in `#C7D0FF` and `#E0D2FF` at the Nebula positions.
+
+Switching: the viewer follows `prefers-color-scheme` until the reader picks a theme. A three-state control —
+System, Dark, Light — stores the choice in `localStorage` under `codegraph-ui.theme` and applies it as
+`data-theme` on `<html>`; System removes the attribute. Desktop and tablet carry the control in the nav-rail
+foot, above Settings; the phone carries it in the More tab's sheet. This settles the light-variant item of §13.
+
 ## 4. Effects — tokens, never per-screen
 
 | Token | Value | Used by |
