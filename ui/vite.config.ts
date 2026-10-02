@@ -2,18 +2,14 @@ import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 
-// The viewer is emitted straight into the engine's `dist/` tree so it ships
-// with everything else: `build-bundle.sh` copies `dist` wholesale and
-// `pack-npm.sh` packs that bundle, so nothing extra has to be taught about it.
+// The viewer is emitted into the `codegraph-ui` crate, which embeds every file
+// under it into the binary at compile time (its build.rs). The output is
+// committed, so `cargo build` and `cargo install --git` never need Node; CI
+// rebuilds it and fails when the committed copy differs.
 //
-// NOT `dist/ui` — that name is already taken. `src/ui/` is the engine's
-// TERMINAL ui (shimmer progress + its worker) and tsc compiles it to
-// `dist/ui/`, so emitting here would both clobber it (emptyOutDir) and, worse,
-// leave the CLI serving compiled engine internals as static files.
-//
-// `fileURLToPath` (not a bare '../dist/viewer') keeps this a native path on
+// `fileURLToPath` (not a bare relative string) keeps this a native path on
 // Windows, where Rollup resolves outDir against the platform separator.
-const outDir = fileURLToPath(new URL('../dist/viewer', import.meta.url));
+const outDir = fileURLToPath(new URL('../crates/codegraph-ui/viewer', import.meta.url));
 
 export default defineConfig(({ command }) => {
   // `vite build` does NOT override an ambient NODE_ENV, and Svelte compiles in
@@ -29,8 +25,8 @@ export default defineConfig(({ command }) => {
     // survives being opened from the filesystem or mounted under a sub-path.
     base: './',
     build: {
-      // Scoped to dist/viewer — `emptyOutDir` must never be allowed to widen
-      // to dist/, which holds the compiled engine tsc wrote moments earlier.
+      // Scoped to the crate's viewer/ directory, which holds nothing but this
+      // build's output — `emptyOutDir` must never be allowed to widen past it.
       outDir,
       emptyOutDir: true,
       target: 'es2022',

@@ -14,6 +14,10 @@ release-please-config.json
 docs/upstream-sync/UPSTREAM.md
 docs/upstream-sync/V1_5_COMMIT_MANIFEST.md
 
+# The selected viewer design, transcribed from the Penpot boards: its tables
+# are numeric specs read against the board exports, so their layout is frozen.
+docs/design/viewer-d.md
+
 # Golden artifacts are byte-compared by the equivalence/golden oracle tests
 # (include_str! / fs::read). Reformatting them breaks the test suite.
 reference/
@@ -39,6 +43,13 @@ KNOWN_DIFFS.md
 
 # Rust sources are formatted by `cargo fmt`.
 *.rs
+
+# The browser viewer is vendored from upstream colbymchenry/codegraph (ui/,
+# MIT, see ui/LICENSE) and keeps upstream's formatting so it stays diffable
+# against the release it was imported from; svelte-check and the UI tests are
+# its gate. Its committed build output is generated, not authored.
+ui/
+crates/codegraph-ui/viewer/
 
 # Build artifacts / vendored deps.
 target/

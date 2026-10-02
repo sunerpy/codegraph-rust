@@ -34,3 +34,6 @@ target/llvm-cov/
 .aws/*.local
 .aws/*.rendered.local.json
 .aws/pipeline.rendered*
+
+# The browser viewer's npm install (ui/); its build output is committed under crates/codegraph-ui/viewer/.
+node_modules/
