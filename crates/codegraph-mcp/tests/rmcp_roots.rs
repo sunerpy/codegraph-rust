@@ -31,7 +31,7 @@ use rmcp::handler::client::ClientHandler;
 #[allow(deprecated)]
 // ListRootsResult/Root: SEP-2577 roots wire types (rmcp 2.1, no replacement).
 use rmcp::model::{
-    CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation, ListRootsResult,
+    CallToolRequestParams, ClientCapabilities, ClientConfig, Implementation, ListRootsResult,
     ProtocolVersion, Root,
 };
 use rmcp::service::{RequestContext, RoleClient};
@@ -62,13 +62,13 @@ struct RootsClient {
 }
 
 impl ClientHandler for RootsClient {
-    fn get_info(&self) -> ClientInfo {
+    fn get_info(&self) -> ClientConfig {
         // Declare the roots capability so the server's `should_request_roots`
         // gate fires (matches `default_is_adoptable` + client-declares-roots).
-        // `ClientInfo` is `#[non_exhaustive]`, so build via the constructor.
+        // `ClientConfig` is `#[non_exhaustive]`, so build via the constructor.
         #[allow(deprecated)]
         let capabilities = ClientCapabilities::builder().enable_roots().build();
-        ClientInfo::new(capabilities, Implementation::new("roots-test-client", "0"))
+        ClientConfig::new(capabilities, Implementation::new("roots-test-client", "0"))
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
     }
 

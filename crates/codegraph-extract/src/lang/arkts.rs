@@ -147,10 +147,10 @@ impl LanguageSpec for ArkTsSpec {
 
     fn get_visibility(&self, node: Node<'_>) -> Option<String> {
         for i in 0..node.child_count() {
-            let child = node.child(i as u32)?;
+            let child = node.child(i)?;
             if child.kind() == "accessibility_modifier" {
                 for j in 0..child.child_count() {
-                    let modifier = child.child(j as u32)?;
+                    let modifier = child.child(j)?;
                     match modifier.kind() {
                         "public" => return Some("public".to_string()),
                         "private" => return Some("private".to_string()),
@@ -201,10 +201,7 @@ impl LanguageSpec for ArkTsSpec {
 }
 
 fn has_direct_child_kind(node: Node<'_>, kind: &str) -> bool {
-    (0..node.child_count()).any(|i| {
-        node.child(i as u32)
-            .is_some_and(|child| child.kind() == kind)
-    })
+    (0..node.child_count()).any(|i| node.child(i).is_some_and(|child| child.kind() == kind))
 }
 
 #[cfg(test)]

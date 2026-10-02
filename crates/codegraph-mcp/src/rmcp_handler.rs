@@ -28,7 +28,7 @@ use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
     Implementation, InitializeResult, JsonObject, ListToolsResult, MetaObject,
-    PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
+    PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleServer};
 use serde_json::{Value, json};
@@ -425,7 +425,7 @@ fn execute_owned(project_path: &Path, tool_name: &str, args: &Value) -> ToolResu
 }
 
 impl ServerHandler for CodeGraphHandler {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         // capabilities = exactly {"tools":{}} (enable_tools, NO list_changed);
         // protocolVersion falls back to V_2024_11_05 for unknown client versions;
         // rmcp negotiates and echoes known versions verbatim.
@@ -1418,7 +1418,7 @@ mod handler_tests {
     async fn connect(
         handler: CodeGraphHandler,
     ) -> (
-        rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientInfo>,
+        rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientConfig>,
         tokio::task::JoinHandle<()>,
     ) {
         use rmcp::ServiceExt;
@@ -1428,7 +1428,7 @@ mod handler_tests {
                 let _ = running.waiting().await;
             }
         });
-        let client = rmcp::model::ClientInfo::default()
+        let client = rmcp::model::ClientConfig::default()
             .serve(client_io)
             .await
             .expect("rmcp client handshake");

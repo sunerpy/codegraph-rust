@@ -144,14 +144,12 @@ impl LanguageSpec for RustSpec {
 
     fn get_visibility(&self, node: Node<'_>) -> Option<String> {
         for i in 0..node.child_count() {
-            if let Some(child) = node.child(i as u32) {
+            if let Some(child) = node.child(i) {
                 if child.kind() == "visibility_modifier" {
                     return Some(
-                        if (0..child.child_count()).any(|idx| {
-                            child
-                                .child(idx as u32)
-                                .is_some_and(|inner| inner.kind() == "pub")
-                        }) {
+                        if (0..child.child_count())
+                            .any(|idx| child.child(idx).is_some_and(|inner| inner.kind() == "pub"))
+                        {
                             "public"
                         } else {
                             "private"
@@ -206,7 +204,7 @@ fn root_module(node: Node<'_>, source: &str) -> String {
 
 fn has_child_kind_recursive(node: Node<'_>, kind: &str) -> bool {
     (0..node.child_count()).any(|i| {
-        node.child(i as u32)
+        node.child(i)
             .is_some_and(|child| child.kind() == kind || has_child_kind_recursive(child, kind))
     })
 }

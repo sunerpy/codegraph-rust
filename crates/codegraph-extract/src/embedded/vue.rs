@@ -188,13 +188,13 @@ impl<'a> VueExtractor<'a> {
         let mut matches = cursor.matches(&query, tree.root_node(), block.content.as_bytes());
 
         while let Some(m) = matches.next() {
-            for capture in m.captures {
+            for capture in m.captures() {
                 let node = capture.node;
                 let capture_name = query.capture_names()[capture.index as usize];
 
                 if capture_name == "func" {
                     let name_node = m
-                        .captures
+                        .captures()
                         .iter()
                         .find(|c| query.capture_names()[c.index as usize] == "func.name")
                         .unwrap()
@@ -252,7 +252,7 @@ impl<'a> VueExtractor<'a> {
                     });
                 } else if capture_name == "import" {
                     let source_node = m
-                        .captures
+                        .captures()
                         .iter()
                         .find(|c| query.capture_names()[c.index as usize] == "import.source")
                         .unwrap()

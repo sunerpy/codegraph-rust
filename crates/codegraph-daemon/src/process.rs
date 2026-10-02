@@ -91,7 +91,7 @@ pub fn terminate_pid(pid: u32) -> bool {
     let Some(pid) = rustix::process::Pid::from_raw(raw) else {
         return false;
     };
-    rustix::process::kill_process(pid, rustix::process::Signal::Term).is_ok()
+    rustix::process::kill_process(pid, rustix::process::Signal::TERM).is_ok()
 }
 
 // Windows has no stable getppid; returning 0 makes the ppid-divergence branch
@@ -120,7 +120,7 @@ pub fn is_process_alive(pid: u32) -> bool {
     // proves it exists (treat as alive); any other error means it is gone.
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-        if handle == 0 {
+        if handle.is_null() {
             return GetLastError() == ERROR_ACCESS_DENIED;
         }
         let mut code: u32 = 0;
@@ -145,7 +145,7 @@ pub fn terminate_pid(pid: u32) -> bool {
     // Rust-side aliasing. A null handle means the open failed (nothing to kill).
     unsafe {
         let handle = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
-        if handle == 0 {
+        if handle.is_null() {
             return false;
         }
         let ok = TerminateProcess(handle, 1);

@@ -102,7 +102,7 @@ impl LanguageSpec for PascalSpec {
         while let Some(parent) = current {
             if parent.kind() == "declSection" {
                 for i in 0..parent.child_count() {
-                    if let Some(child) = parent.child(i as u32) {
+                    if let Some(child) = parent.child(i) {
                         match child.kind() {
                             "kPublic" | "kPublished" => return Some("public".to_string()),
                             "kPrivate" => return Some("private".to_string()),
@@ -118,7 +118,7 @@ impl LanguageSpec for PascalSpec {
     }
 
     fn is_static(&self, node: Node<'_>, _source: &str) -> bool {
-        (0..node.child_count()).any(|i| node.child(i as u32).is_some_and(|c| c.kind() == "kClass"))
+        (0..node.child_count()).any(|i| node.child(i).is_some_and(|c| c.kind() == "kClass"))
     }
 
     fn is_const(&self, node: Node<'_>) -> bool {

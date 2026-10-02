@@ -24,7 +24,7 @@ use parity::{TestProject, golden_client, setup_mini_project, workspace_root};
 async fn connect(
     handler: CodeGraphHandler,
 ) -> (
-    rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientInfo>,
+    rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientConfig>,
     tokio::task::JoinHandle<()>,
 ) {
     connect_with_protocol(handler, ProtocolVersion::V_2024_11_05).await
@@ -34,7 +34,7 @@ async fn connect_with_protocol(
     handler: CodeGraphHandler,
     protocol_version: ProtocolVersion,
 ) -> (
-    rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientInfo>,
+    rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientConfig>,
     tokio::task::JoinHandle<()>,
 ) {
     let (client_io, server_io) = tokio::io::duplex(1024 * 1024);

@@ -465,7 +465,7 @@ fn invalid_configured_root_rmcp_fails_closed_and_never_serves_trap_default_db() 
 fn rmcp_tool_call_search(project: &Path) -> Value {
     use rmcp::ServiceExt;
     use rmcp::model::{
-        CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation, ProtocolVersion,
+        CallToolRequestParams, ClientCapabilities, ClientConfig, Implementation, ProtocolVersion,
     };
 
     let project = project.to_path_buf();
@@ -482,7 +482,7 @@ fn rmcp_tool_call_search(project: &Path) -> Value {
                 let _ = running.waiting().await;
             }
         });
-        let client = ClientInfo::new(
+        let client = ClientConfig::new(
             ClientCapabilities::default(),
             Implementation::new("cfgroot", "0"),
         )

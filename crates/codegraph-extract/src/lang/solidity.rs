@@ -130,7 +130,7 @@ impl LanguageSpec for SoliditySpec {
                 // walk every child and return the first that matches, defaulting
                 // to `fallback` (upstream `fallbackReceiveName`).
                 for i in 0..node.child_count() {
-                    if let Some(child) = node.child(i as u32) {
+                    if let Some(child) = node.child(i) {
                         match child.kind() {
                             "fallback" => return Some("fallback".to_string()),
                             "receive" => return Some("receive".to_string()),

@@ -155,15 +155,13 @@ impl LanguageSpec for DartSpec {
         node.next_named_sibling()
             .filter(|next| next.kind() == "function_body")
             .is_some_and(|body| {
-                (0..body.child_count())
-                    .any(|i| body.child(i as u32).is_some_and(|c| c.kind() == "async"))
+                (0..body.child_count()).any(|i| body.child(i).is_some_and(|c| c.kind() == "async"))
             })
     }
 
     fn is_static(&self, node: Node<'_>, _source: &str) -> bool {
         node.kind() == "method_signature"
-            && (0..node.child_count())
-                .any(|i| node.child(i as u32).is_some_and(|c| c.kind() == "static"))
+            && (0..node.child_count()).any(|i| node.child(i).is_some_and(|c| c.kind() == "static"))
     }
 
     fn resolve_name(&self, node: Node<'_>, _source: &str) -> Option<String> {

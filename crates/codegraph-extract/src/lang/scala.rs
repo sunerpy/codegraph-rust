@@ -122,12 +122,12 @@ impl LanguageSpec for ScalaSpec {
             if matches!(child.kind(), "modifiers" | "access_modifier") {
                 let has_private = (0..child.child_count()).any(|idx| {
                     child
-                        .child(idx as u32)
+                        .child(idx)
                         .is_some_and(|inner| inner.kind() == "private")
                 });
                 let has_protected = (0..child.child_count()).any(|idx| {
                     child
-                        .child(idx as u32)
+                        .child(idx)
                         .is_some_and(|inner| inner.kind() == "protected")
                 });
                 if has_private {
@@ -146,7 +146,7 @@ impl LanguageSpec for ScalaSpec {
             child.kind() == "modifiers"
                 && (0..child.child_count()).any(|idx| {
                     child
-                        .child(idx as u32)
+                        .child(idx)
                         .is_some_and(|inner| inner.kind() == "static")
                 })
         })

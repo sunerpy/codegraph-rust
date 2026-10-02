@@ -22,8 +22,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use codegraph_mcp::rmcp_handler::CodeGraphHandler;
 use rmcp::ServiceExt;
 use rmcp::model::{
-    CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation, PaginatedRequestParams,
-    ProtocolVersion,
+    CallToolRequestParams, ClientCapabilities, ClientConfig, Implementation,
+    PaginatedRequestParams, ProtocolVersion,
 };
 use serde_json::{Value, json};
 
@@ -114,8 +114,8 @@ pub fn rewrite_project(project: &Path, request: &mut Value) {
 
 /// An rmcp client that requests protocolVersion 2024-11-05 (the golden's
 /// initialize request), so negotiation lands on 2024-11-05 for parity.
-pub fn golden_client() -> ClientInfo {
-    ClientInfo::new(
+pub fn golden_client() -> ClientConfig {
+    ClientConfig::new(
         ClientCapabilities::default(),
         Implementation::new("golden", "0"),
     )

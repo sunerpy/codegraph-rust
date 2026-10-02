@@ -124,7 +124,7 @@ impl LanguageSpec for ObjCSpec {
     }
 
     fn is_static(&self, node: Node<'_>, _source: &str) -> bool {
-        (0..node.child_count()).any(|i| node.child(i as u32).is_some_and(|c| c.kind() == "+"))
+        (0..node.child_count()).any(|i| node.child(i).is_some_and(|c| c.kind() == "+"))
     }
 
     fn extract_import(&self, node: Node<'_>, source: &str) -> Option<ImportInfo> {

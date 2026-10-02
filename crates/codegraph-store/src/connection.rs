@@ -1163,7 +1163,8 @@ fn configure_connection(conn: &Connection) -> rusqlite::Result<()> {
     conn.pragma_update(
         None,
         "journal_size_limit",
-        crate::queries::wal_valve_threshold_bytes(),
+        // In range by construction; rusqlite has no `ToSql` for `u64`.
+        i64::try_from(crate::queries::wal_valve_threshold_bytes()).unwrap_or(i64::MAX),
     )?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "cache_size", -64_000)?;
@@ -1195,7 +1196,8 @@ fn configure_connection_for_rebuild(
     configure(conn.pragma_update(
         None,
         "journal_size_limit",
-        crate::queries::wal_valve_threshold_bytes(),
+        // In range by construction; rusqlite has no `ToSql` for `u64`.
+        i64::try_from(crate::queries::wal_valve_threshold_bytes()).unwrap_or(i64::MAX),
     ))?;
     lease.validate_exclusive(paths)?;
     configure(conn.pragma_update(None, "synchronous", "NORMAL"))?;

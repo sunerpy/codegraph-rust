@@ -247,7 +247,7 @@ impl SessionRegistry {
                 // triggers). We only issue shutdown(SHUT_RDWR); no ownership is
                 // taken and the fd is not closed here.
                 let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-                let _ = rustix::net::shutdown(borrowed, rustix::net::Shutdown::ReadWrite);
+                let _ = rustix::net::shutdown(borrowed, rustix::net::Shutdown::Both);
             }
         }
         #[cfg(not(unix))]

@@ -180,7 +180,7 @@ impl LanguageSpec for SwiftSpec {
         // also matches `fileprivate`, so both keyword kinds map to private;
         // Swift defaults to internal.
         for idx in 0..node.child_count() {
-            let Some(child) = node.child(idx as u32) else {
+            let Some(child) = node.child(idx) else {
                 continue;
             };
             if child.kind() != "modifiers" {
@@ -203,7 +203,7 @@ impl LanguageSpec for SwiftSpec {
         // swift.ts:101-111 — modifiers containing `static` or `class`
         // (class methods are static-dispatch members).
         for idx in 0..node.child_count() {
-            let Some(child) = node.child(idx as u32) else {
+            let Some(child) = node.child(idx) else {
                 continue;
             };
             if child.kind() == "modifiers"
@@ -219,7 +219,7 @@ impl LanguageSpec for SwiftSpec {
         // swift.ts:112-120 — class_declaration covers classes, structs, enums;
         // split on the direct keyword child.
         for idx in 0..node.child_count() {
-            let Some(child) = node.child(idx as u32) else {
+            let Some(child) = node.child(idx) else {
                 continue;
             };
             if child.kind() == "struct" {
@@ -236,7 +236,7 @@ impl LanguageSpec for SwiftSpec {
         // swift.ts:121-129 — only `async` inside a modifiers child counts
         // (a bare `async` effect token between params and body does not).
         for idx in 0..node.child_count() {
-            let Some(child) = node.child(idx as u32) else {
+            let Some(child) = node.child(idx) else {
                 continue;
             };
             if child.kind() == "modifiers" && has_descendant_kind(child, "async") {
@@ -287,7 +287,7 @@ fn has_descendant_kind(node: Node<'_>, kind: &str) -> bool {
     }
     for idx in 0..node.child_count() {
         if node
-            .child(idx as u32)
+            .child(idx)
             .is_some_and(|child| has_descendant_kind(child, kind))
         {
             return true;

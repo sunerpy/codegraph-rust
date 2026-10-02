@@ -176,8 +176,5 @@ pub(crate) fn resolve_class_field_body<'tree>(
 }
 
 pub(crate) fn has_direct_child_kind(node: Node<'_>, kind: &str) -> bool {
-    (0..node.child_count()).any(|i| {
-        node.child(i as u32)
-            .is_some_and(|child| child.kind() == kind)
-    })
+    (0..node.child_count()).any(|i| node.child(i).is_some_and(|child| child.kind() == kind))
 }

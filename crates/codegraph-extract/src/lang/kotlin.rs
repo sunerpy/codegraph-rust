@@ -115,7 +115,7 @@ impl LanguageSpec for KotlinSpec {
         // 'enum' keyword under modifiers > class_modifier, so the modifiers
         // child is also scanned; the scan stops at the class body.
         for idx in 0..node.child_count() {
-            let Some(child) = node.child(idx as u32) else {
+            let Some(child) = node.child(idx) else {
                 continue;
             };
             match child.kind() {
@@ -137,7 +137,7 @@ impl LanguageSpec for KotlinSpec {
         // Upstream kotlin.ts:211-231: extension receiver is the user_type before '.'.
         let mut found_user_type = None;
         for idx in 0..node.child_count() {
-            let Some(child) = node.child(idx as u32) else {
+            let Some(child) = node.child(idx) else {
                 continue;
             };
             if child.kind() == "user_type" {
@@ -313,7 +313,7 @@ fn has_descendant_kind(node: Node<'_>, kind: &str) -> bool {
     }
     for idx in 0..node.child_count() {
         if node
-            .child(idx as u32)
+            .child(idx)
             .is_some_and(|child| has_descendant_kind(child, kind))
         {
             return true;
