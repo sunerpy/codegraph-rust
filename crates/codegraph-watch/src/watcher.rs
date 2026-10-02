@@ -9,7 +9,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use notify::event::{EventKind, RemoveKind};
+use notify::event::{AccessKind, AccessMode, EventKind, RemoveKind};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 use codegraph_core::IndexPaths;
@@ -1071,6 +1071,7 @@ impl ProjectWatcher {
             let callback_tx = tx.clone();
             let mut watcher =
                 notify::recommended_watcher(move |event: notify::Result<Event>| match event {
+                    Ok(event) if !changes_content(&event.kind) => {}
                     Ok(event) => {
                         let _ = callback_tx.send(LoopMessage::Event(WatchEventBatch::from_event(
                             &event.kind,
@@ -1368,6 +1369,18 @@ impl WatchEventBatch {
             _ => RemovalHint::None,
         };
         Self { paths, removal }
+    }
+}
+
+/// Whether an event can mean a file or directory changed. notify 8's inotify
+/// backend also reports every open (`IN_OPEN`) as an access event, which notify
+/// 6 never did. An open changes nothing, and the loop's own directory scans and
+/// the sync's own reads would feed it back as pending changes forever. Only a
+/// close after writing is an access worth a sync.
+fn changes_content(kind: &EventKind) -> bool {
+    match kind {
+        EventKind::Access(access) => *access == AccessKind::Close(AccessMode::Write),
+        _ => true,
     }
 }
 
@@ -1959,6 +1972,32 @@ fn epoch_millis() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_content_changes_reach_the_loop() {
+        use notify::event::{CreateKind, DataChange, ModifyKind};
+        // notify 8 reports every open; an open, a read or a read-only close
+        // changes nothing. A close after writing, and every other kind, can.
+        for (kind, expected) in [
+            (EventKind::Access(AccessKind::Open(AccessMode::Any)), false),
+            (EventKind::Access(AccessKind::Read), false),
+            (
+                EventKind::Access(AccessKind::Close(AccessMode::Read)),
+                false,
+            ),
+            (EventKind::Access(AccessKind::Any), false),
+            (
+                EventKind::Access(AccessKind::Close(AccessMode::Write)),
+                true,
+            ),
+            (EventKind::Create(CreateKind::Folder), true),
+            (EventKind::Modify(ModifyKind::Data(DataChange::Any)), true),
+            (EventKind::Remove(RemoveKind::Any), true),
+            (EventKind::Any, true),
+        ] {
+            assert_eq!(changes_content(&kind), expected, "{kind:?}");
+        }
+    }
     use std::fs;
     use std::sync::{Arc, Mutex};
 
