@@ -1,5 +1,13 @@
 # ui/ — the `codegraph ui` viewer, and `@colbymchenry/codegraph-ui`
 
+> **In codegraph-rs.** This tree was imported from upstream colbymchenry/codegraph
+> `v1.6.1` and is built here by `make ui` into `crates/codegraph-ui/viewer/`,
+> which the Rust binary embeds — see [`../docs/ui.md`](../docs/ui.md), the
+> canonical reference. Its look is direction D
+> ([`../docs/design/viewer-d.md`](../docs/design/viewer-d.md)) with a dark and a
+> light theme. The build, packaging and release passages below describe
+> upstream's npm monorepo, not this repository.
+
 One source tree, two builds.
 
 - **The app** — the browser reader for an indexed project: Svelte 5 + Vite,
@@ -16,8 +24,9 @@ each other in a review.
 An npm workspace of the engine, so `npm ci` at the repo root installs the
 toolchain for both.
 
-Design spec (every token, size and measurement):
-`../docs/design/codegraph-ui-design-spec.md`.
+Design spec (every token, size and measurement): upstream's
+`docs/design/codegraph-ui-design-spec.md`; in codegraph-rs,
+[`../docs/design/viewer-d.md`](../docs/design/viewer-d.md).
 
 ## Build
 
@@ -133,7 +142,7 @@ the screen is explained rather than silently missing.
    context, so one page reads one project. `<CodegraphUi>` installs them during
    initialisation, once — swapping projects means re-mounting the subtree
    (`{#key project}`), not swapping the prop.
-3. **Geometry is not themable.** 34px rail rows, the 300/320px rails, the 20px
+3. **Geometry is not themable.** 44px callee rows, the 288/320px rails, the 20px
    code line: the Symbol view measures these against each other to put a callee
    row beside the line that calls it. Colour and type are yours.
 
@@ -191,21 +200,22 @@ src/
   lib/export-image.ts     rasterising that SVG to PNG, clipboard and download
   lib/live.svelte.ts      /api/events: two counters every screen refreshes from
   lib/toast.svelte.ts     the one transient note ("Index updated · reloaded")
-  components/             TopBar, TrailBar, SavedTrails, KindGlyph, DriftBanner, Toast, ExportButtons, map/, flow/, symbol/, file/, entry/, screens/
+  components/             NavRail, TopBar (the command bar), TrailBar, PhoneTabBar, MoreSheet, SavedTrails, KindGlyph, Icon, DriftBanner, ErrorCard, Toast, ExportButtons, map/, flow/, symbol/, file/, entry/, screens/
   views/                  one component per route
 ```
 
-Fonts (Archivo Variable, IBM Plex Mono) are vendored through `@fontsource*` and
-emitted into `dist/viewer/assets`: a local reader must work offline and must not
-announce the project to a font CDN.
+Fonts (Inter and JetBrains Mono, both variable) are vendored through
+`@fontsource-variable` and emitted with the bundle's assets — never inlined, so
+the server's `font-src 'self'` policy holds: a local reader must work offline
+and must not announce the project to a font CDN.
 
 ## Export
 
 The Flow strip's header and the Map's side panel carry **Copy image** (a PNG on
 the clipboard) and **Download SVG** (a file for a README). Both render the
-**light** theme whatever the viewer is set to — an image is read on somebody
-else's screen — with 24px of paper around the drawing, a caption naming the path
-or the root, and a "CodeGraph" mark in the corner.
+theme on screen (light when the exporter is called without one), with 24px of
+paper around the drawing, a caption naming the path or the root, and a
+"CodeGraph" mark in the corner.
 
 `export-svg.ts` **serialises the layout object**; it does not scrape the DOM.
 `buildFlowLayout` and `buildMapLayout` already compute every rectangle, port and
@@ -217,7 +227,7 @@ will render in a README.
 
 Fonts travel as `font-family` stacks rather than embedded bytes. An SVG loaded
 as an image may not fetch a webfont, so a raster falls back to the platform's
-own monospace; every fallback in the stack advances at ~0.6em like IBM Plex
+own monospace; every fallback in the stack advances at ~0.6em like JetBrains
 Mono, so the code grid survives and only the letterforms change.
 
 ## Routes

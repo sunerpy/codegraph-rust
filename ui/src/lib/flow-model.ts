@@ -90,7 +90,10 @@ export const END_CAP_ROW = 18;
 export const END_CAP_GAP = 8;
 
 /**
- * Characters of 12px Archivo that fit across the cap's 216px of content.
+ * Characters of the cap's 12px text that fit across its 216px of content.
+ * Upstream sized it for Archivo; direction D sets the cap in Inter, measured in
+ * Chrome on 2026-10-03 at 5.81px a character on cap prose — about 37 to the
+ * line — so 32 stays on the pessimistic side the rule below asks for.
  *
  * The cap's height has to be known before it renders, for the same reason a
  * card's does — the layout packs columns with it. So the text is built here

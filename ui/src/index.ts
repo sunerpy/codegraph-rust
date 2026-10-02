@@ -30,8 +30,8 @@
  * 2. **The adapter is module-level, not context.** The pure model modules are
  *    plain TypeScript and cannot read a component's context, so one page reads
  *    one project. `<CodegraphUi>` installs it during initialisation.
- * 3. **Geometry is not themable.** 34px rail rows, 300/320px rails, the 20px
- *    code line: the Symbol view measures these against each other to put a
+ * 3. **Geometry is not themable.** 44px callee rows, the 288/320px rails, the
+ *    20px code line: the Symbol view measures these against each other to put a
  *    callee row beside the line that calls it. Colour and type are yours.
  */
 
