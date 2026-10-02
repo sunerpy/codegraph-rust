@@ -449,9 +449,40 @@ mod tests {
         assert!(resolve_project_file(dir.path(), "link/secret.txt").is_err());
     }
 
+    // POSIX only, as upstream gates it: on Windows `/` resolves to the root of
+    // the current drive and `/etc` to `<drive>:\etc`, neither of which is on the
+    // list. The Windows entries have their own test below.
+    #[cfg(not(windows))]
     #[test]
-    fn sensitive_roots_are_refused() {
-        assert!(validate_project_path(Path::new("/etc")).is_err());
-        assert!(validate_project_path(Path::new("/")).is_err());
+    fn blocks_posix_system_directories_exact_match() {
+        for root in ["/", "/etc"] {
+            let refusal = validate_project_path(Path::new(root)).unwrap_err();
+            assert!(
+                refusal.0.contains("sensitive system directory"),
+                "{root}: {}",
+                refusal.0
+            );
+        }
+    }
+
+    #[test]
+    fn allows_a_normal_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(validate_project_path(dir.path()).is_ok());
+    }
+
+    // The list stores the Windows entries lower case and the check compares the
+    // lower-cased path too, so any spelling is refused.
+    #[cfg(windows)]
+    #[test]
+    fn blocks_windows_system_directories_regardless_of_case() {
+        for root in ["C:\\Windows", "c:\\windows", "C:\\WINDOWS\\System32"] {
+            let refusal = validate_project_path(Path::new(root)).unwrap_err();
+            assert!(
+                refusal.0.contains("sensitive system directory"),
+                "{root}: {}",
+                refusal.0
+            );
+        }
     }
 }
