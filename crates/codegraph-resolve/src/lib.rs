@@ -31,6 +31,7 @@ mod object_literal;
 pub mod path_aliases;
 pub mod pathutil;
 pub mod resolver;
+mod rust_lexical;
 pub mod snapshot_context;
 pub mod source_facts;
 pub mod strip_comments;

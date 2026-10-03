@@ -701,6 +701,467 @@ fn is_bare_go_call(reference: &RefView, context: &dyn ResolutionContext) -> bool
     reference.language == Language::Go && is_receiver_less_call(reference, context)
 }
 
+/// How a Rust `calls` ref recorded under a bare name was written (KEEP-RUST,
+/// P15). The extractor keeps a receiver only for an identifier, `self`, one
+/// `self.<field>` hop and a `path::call()` receiver; any other receiver —
+/// `root().join(x)`, a deeper field chain, `vec![…]`, `?`, `.await`, indexing, a
+/// chain broken across lines — leaves the bare method name, with the ref's
+/// column at the start of the whole call expression. The source tells the two
+/// apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RustCallShape {
+    /// `join(x)`: neither receiver nor path, so a free function, never a method.
+    Bare,
+    /// `root().join(x)`: a method call whose receiver the extractor dropped.
+    Method,
+}
+
+/// How far past the ref's column a dropped receiver's `.name(` is looked for.
+const RUST_RECEIVER_WINDOW: usize = 4096;
+
+/// The shape of a Rust `calls` ref whose name has neither `.` nor `::`, read from
+/// its source: [`RustCallShape::Bare`] when the call expression starts with the
+/// name and a `(` or `::<` follows, [`RustCallShape::Method`] when it starts with
+/// something else and a `.name(` follows within [`RUST_RECEIVER_WINDOW`].
+/// `None` — no source, a column off its line, neither pattern — keeps every
+/// gate that reads the shape inert.
+pub(crate) fn rust_call_shape(
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<RustCallShape> {
+    let name = reference.reference_name.as_str();
+    if reference.language != Language::Rust
+        || reference.reference_kind != EdgeKind::Calls
+        || name.is_empty()
+        || name.contains('.')
+        || name.contains("::")
+    {
+        return None;
+    }
+    let facts = context.source_facts(&reference.file_path)?;
+    let start = rust_ref_offset(reference, &facts)?;
+    let rest = &facts.source()[start..];
+    if let Some(after) = rest.strip_prefix(name) {
+        if after.bytes().next().is_some_and(is_rust_ident_byte) {
+            return None;
+        }
+        let after = after.trim_start();
+        return (after.starts_with('(') || after.starts_with("::<")).then_some(RustCallShape::Bare);
+    }
+    let mut end = rest.len().min(RUST_RECEIVER_WINDOW);
+    while !rest.is_char_boundary(end) {
+        end -= 1;
+    }
+    rust_method_call_follows(&rest[..end], name).then_some(RustCallShape::Method)
+}
+
+/// The byte offset of `reference`'s column in its file, when the column lies on
+/// its line at a char boundary.
+fn rust_ref_offset(reference: &RefView, facts: &SourceFacts) -> Option<usize> {
+    let line_index = usize::try_from(reference.line).ok()?.checked_sub(1)?;
+    let line = facts.raw_line(line_index)?;
+    let column = usize::try_from(reference.column).ok()?;
+    if column > line.len() || !line.is_char_boundary(column) {
+        return None;
+    }
+    Some(facts.lines().raw_line_start(line_index)? + column)
+}
+
+fn is_rust_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte >= 0x80
+}
+
+/// Whether `text` holds a method call of `name`: one `.`, the whole word
+/// `name`, an optional `::<…>` turbofish, then `(`, with whitespace allowed
+/// between the parts.
+fn rust_method_call_follows(text: &str, name: &str) -> bool {
+    text.match_indices(name).any(|(at, _)| {
+        let bytes = text.as_bytes();
+        let end = at + name.len();
+        if bytes.get(end).is_some_and(|b| is_rust_ident_byte(*b)) {
+            return false;
+        }
+        let before = text[..at].trim_end();
+        if !before.ends_with('.') || before.ends_with("..") {
+            return false;
+        }
+        let mut after = text[end..].trim_start();
+        if let Some(generics) = after.strip_prefix("::<") {
+            let mut depth = 1usize;
+            let Some(close) = generics.bytes().position(|b| {
+                match b {
+                    b'<' => depth += 1,
+                    b'>' => depth -= 1,
+                    _ => {}
+                }
+                depth == 0
+            }) else {
+                return false;
+            };
+            after = generics[close + 1..].trim_start();
+        }
+        after.starts_with('(')
+    })
+}
+
+/// Method names a Rust call whose receiver the extractor dropped may not bind
+/// on the name alone (KEEP-RUST, P15 R3; the Rust analogue of upstream's
+/// `JS_BUILTIN_METHODS`, #1987). Every entry is a stable (Rust 1.98) method,
+/// callable with method syntax, of `Iterator` / `DoubleEndedIterator`,
+/// `Option`, `Result`, slices, `Vec`, `VecDeque`, `str`, `String`, `char` / `u8`
+/// ASCII, integers, `Duration` / `Instant`, the std maps and sets and `Entry`,
+/// `Path` / `PathBuf` / `OsStr` / `DirEntry` / `OpenOptions`, `Mutex` / `RwLock`
+/// / `OnceLock` / `Rc` / `Arc` / `Weak` / `RefCell` / `Cell` / atomics, the
+/// `io` / `fmt` I/O traits, `process::Command` / `Child`, `mpsc`, or the
+/// conversion and comparison traits — a curated subset, the ones commonly
+/// reached through call chains. A unique project method that shares one of
+/// these names is no evidence of the receiver's type: `root().join(name)` is
+/// `Path::join`. Sorted for binary search; changing it is a resolution change.
+const RUST_STD_METHODS: [&str; 307] = [
+    "abs",
+    "all",
+    "ancestors",
+    "and_then",
+    "any",
+    "append",
+    "arg",
+    "args",
+    "as_bytes",
+    "as_deref",
+    "as_deref_mut",
+    "as_micros",
+    "as_millis",
+    "as_mut",
+    "as_nanos",
+    "as_os_str",
+    "as_ref",
+    "as_secs",
+    "as_secs_f64",
+    "as_slice",
+    "as_str",
+    "back",
+    "binary_search",
+    "binary_search_by",
+    "binary_search_by_key",
+    "borrow",
+    "borrow_mut",
+    "by_ref",
+    "bytes",
+    "canonicalize",
+    "capacity",
+    "chain",
+    "char_indices",
+    "chars",
+    "checked_add",
+    "checked_sub",
+    "chunks",
+    "clamp",
+    "clear",
+    "clone",
+    "clone_from",
+    "cloned",
+    "cmp",
+    "collect",
+    "compare_exchange",
+    "components",
+    "concat",
+    "contains",
+    "contains_key",
+    "copied",
+    "count",
+    "current_dir",
+    "cycle",
+    "dedup",
+    "dedup_by_key",
+    "deref",
+    "deref_mut",
+    "difference",
+    "display",
+    "drain",
+    "duration_since",
+    "elapsed",
+    "ends_with",
+    "entry",
+    "enumerate",
+    "env",
+    "env_remove",
+    "eq",
+    "eq_ignore_ascii_case",
+    "err",
+    "exists",
+    "expect",
+    "expect_err",
+    "extend",
+    "extend_from_slice",
+    "extension",
+    "fetch_add",
+    "fetch_sub",
+    "file_name",
+    "file_stem",
+    "file_type",
+    "fill",
+    "filter",
+    "filter_map",
+    "find",
+    "find_map",
+    "first",
+    "flat_map",
+    "flatten",
+    "flush",
+    "fmt",
+    "fold",
+    "for_each",
+    "front",
+    "fuse",
+    "ge",
+    "get",
+    "get_mut",
+    "get_or_init",
+    "get_or_insert",
+    "get_or_insert_with",
+    "gt",
+    "hash",
+    "insert",
+    "insert_str",
+    "inspect",
+    "inspect_err",
+    "intersection",
+    "into",
+    "into_bytes",
+    "into_inner",
+    "into_iter",
+    "into_keys",
+    "into_os_string",
+    "into_string",
+    "into_values",
+    "is_absolute",
+    "is_alphabetic",
+    "is_alphanumeric",
+    "is_ascii",
+    "is_ascii_alphabetic",
+    "is_ascii_alphanumeric",
+    "is_ascii_digit",
+    "is_ascii_lowercase",
+    "is_ascii_punctuation",
+    "is_ascii_uppercase",
+    "is_ascii_whitespace",
+    "is_char_boundary",
+    "is_dir",
+    "is_empty",
+    "is_err",
+    "is_err_and",
+    "is_file",
+    "is_lowercase",
+    "is_none",
+    "is_none_or",
+    "is_ok",
+    "is_ok_and",
+    "is_relative",
+    "is_some",
+    "is_some_and",
+    "is_subset",
+    "is_symlink",
+    "is_uppercase",
+    "is_whitespace",
+    "iter",
+    "iter_mut",
+    "join",
+    "keys",
+    "kill",
+    "kind",
+    "last",
+    "le",
+    "len",
+    "lines",
+    "lock",
+    "lt",
+    "map",
+    "map_err",
+    "map_or",
+    "map_or_else",
+    "map_while",
+    "match_indices",
+    "matches",
+    "max",
+    "max_by",
+    "max_by_key",
+    "metadata",
+    "min",
+    "min_by",
+    "min_by_key",
+    "ne",
+    "next",
+    "nth",
+    "ok",
+    "ok_or",
+    "ok_or_else",
+    "open",
+    "or_default",
+    "or_else",
+    "or_insert",
+    "or_insert_with",
+    "output",
+    "parent",
+    "parse",
+    "partial_cmp",
+    "partition",
+    "path",
+    "peek",
+    "peekable",
+    "pop",
+    "pop_back",
+    "pop_front",
+    "position",
+    "pow",
+    "product",
+    "push",
+    "push_back",
+    "push_front",
+    "push_str",
+    "read",
+    "read_dir",
+    "read_exact",
+    "read_line",
+    "read_link",
+    "read_to_end",
+    "read_to_string",
+    "recv",
+    "reduce",
+    "remove",
+    "repeat",
+    "replace",
+    "replacen",
+    "reserve",
+    "resize",
+    "retain",
+    "rev",
+    "reverse",
+    "rfind",
+    "rposition",
+    "rsplit",
+    "rsplit_once",
+    "rsplitn",
+    "saturating_add",
+    "saturating_sub",
+    "scan",
+    "seek",
+    "send",
+    "set",
+    "set_extension",
+    "skip",
+    "skip_while",
+    "sort",
+    "sort_by",
+    "sort_by_key",
+    "sort_unstable",
+    "sort_unstable_by",
+    "sort_unstable_by_key",
+    "spawn",
+    "split",
+    "split_at",
+    "split_off",
+    "split_once",
+    "split_terminator",
+    "split_whitespace",
+    "splitn",
+    "starts_with",
+    "status",
+    "stderr",
+    "stdin",
+    "stdout",
+    "step_by",
+    "strip_prefix",
+    "strip_suffix",
+    "sum",
+    "swap",
+    "take",
+    "take_while",
+    "to_ascii_lowercase",
+    "to_ascii_uppercase",
+    "to_digit",
+    "to_lowercase",
+    "to_owned",
+    "to_path_buf",
+    "to_str",
+    "to_string",
+    "to_string_lossy",
+    "to_uppercase",
+    "to_vec",
+    "transpose",
+    "trim",
+    "trim_end",
+    "trim_end_matches",
+    "trim_matches",
+    "trim_start",
+    "trim_start_matches",
+    "truncate",
+    "try_borrow",
+    "try_borrow_mut",
+    "try_fold",
+    "try_for_each",
+    "try_into",
+    "try_lock",
+    "try_read",
+    "try_write",
+    "union",
+    "unwrap",
+    "unwrap_err",
+    "unwrap_or",
+    "unwrap_or_default",
+    "unwrap_or_else",
+    "unzip",
+    "upgrade",
+    "values",
+    "values_mut",
+    "wait",
+    "windows",
+    "with_extension",
+    "with_file_name",
+    "wrapping_add",
+    "wrapping_sub",
+    "write",
+    "write_all",
+    "write_fmt",
+    "write_str",
+    "xor",
+    "zip",
+];
+
+fn is_rust_std_method(name: &str) -> bool {
+    RUST_STD_METHODS.binary_search(&name).is_ok()
+}
+
+/// The prelude's enum variants. A bare one is `Option` / `Result`'s unless a
+/// `use` in scope imports a project variant of that name (KEEP-RUST, P15 R4).
+fn is_rust_prelude_variant(name: &str) -> bool {
+    matches!(name, "Ok" | "Err" | "Some" | "None")
+}
+
+/// Whether a `use` visible at `reference`'s call site names its name or is a
+/// glob. Unknown source counts as such a `use`, which keeps today's binding.
+fn rust_variant_import_in_scope(reference: &RefView, context: &dyn ResolutionContext) -> bool {
+    let Some(facts) = context.source_facts(&reference.file_path) else {
+        return true;
+    };
+    let Some(offset) = rust_ref_offset(reference, &facts) else {
+        return true;
+    };
+    facts.rust_use_in_scope(offset, &reference.reference_name)
+}
+
+/// A Rust method call whose receiver the extractor dropped (KEEP-RUST, P15):
+/// `root().join(x)`, or a chain broken across lines. The resolver sends it here
+/// ahead of import resolution, and nowhere else. It never binds through a
+/// `use`, takes no fuzzy guess, binds only a same-named method (R2), and never
+/// one that shares a std method's name (R3); [`match_by_exact_name`] applies
+/// both for this shape.
+pub fn match_rust_lost_receiver_call(
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<ResolvedRef> {
+    match_by_exact_name(reference, context)
+}
+
 /// Sticky binding patterns for one plain identifier
 /// (`localBindingPatterns`, upstream v1.6.1), anchored at the offset they are
 /// tried from. `\b`/`\w` are ASCII, as in upstream's JavaScript. The
@@ -939,6 +1400,15 @@ pub fn match_by_exact_name(
     {
         return Some(action);
     }
+    // KEEP-RUST (P15): a bare-named Rust call's shape, read from its source. A
+    // method call whose receiver the extractor dropped never binds a std
+    // method's name (R3).
+    let rust_shape = rust_call_shape(reference, context);
+    if rust_shape == Some(RustCallShape::Method) && is_rust_std_method(&reference.reference_name) {
+        return None;
+    }
+    let rust_bare = rust_shape == Some(RustCallShape::Bare);
+    let rust_method = rust_shape == Some(RustCallShape::Method);
     let same_name = context.get_nodes_by_name_shared(&reference.reference_name);
     // `NAME(...)` where NAME is a function-like macro somewhere in the project
     // is an expansion or a call to a same-named function — never the macro
@@ -966,8 +1436,20 @@ pub fn match_by_exact_name(
     let candidates: Vec<Arc<Node>> = reachable
         .iter()
         .filter(|n| node_is_eligible_target(reference.reference_kind, n))
-        // A receiver-less JS/TS or Go call cannot reach a method (#1714, #1857).
-        .filter(|n| !((bare_js || bare_go) && n.kind == NodeKind::Method))
+        // A receiver-less JS/TS, Go or Rust call cannot reach a method (#1714,
+        // #1857; P15 R1).
+        .filter(|n| !((bare_js || bare_go || rust_bare) && n.kind == NodeKind::Method))
+        // A Rust method call whose receiver was dropped reaches only a method:
+        // never a function, type, enum member or import (P15 R2).
+        .filter(|n| !rust_method || n.kind == NodeKind::Method)
+        // A bare `Ok` / `Err` / `Some` / `None` is the prelude's unless a `use`
+        // in its scope imports a project variant of that name (P15 R4).
+        .filter(|n| {
+            !(rust_bare
+                && n.kind == NodeKind::EnumMember
+                && is_rust_prelude_variant(&reference.reference_name)
+                && !rust_variant_import_in_scope(reference, context))
+        })
         // A name the file binds itself shadows every other file's symbol of
         // that name, so a bare call has no cross-file candidate.
         .filter(|n| {
@@ -3459,6 +3941,12 @@ fn find_best_match<'a, T: Borrow<Node>>(
 /// Fuzzy match — last resort with lower confidence (`matchFuzzy`,
 /// `name-matcher.ts:1060-1088`).
 pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Option<ResolvedRef> {
+    // A Rust method call whose receiver was dropped takes no fuzzy guess
+    // (KEEP-RUST, P15 R2); a bare Rust call still never reaches a method (R1).
+    let rust_shape = rust_call_shape(reference, context);
+    if rust_shape == Some(RustCallShape::Method) {
+        return None;
+    }
     let lower_name = reference.reference_name.to_lowercase();
     let candidates = context.get_nodes_by_lower_name_shared(&lower_name);
     if candidates.len() > ambiguous_name_ceiling() {
@@ -3503,7 +3991,8 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
                     context,
                 )));
     if bare_js_rejects
-        || (candidate.kind == NodeKind::Method && is_bare_go_call(reference, context))
+        || (candidate.kind == NodeKind::Method
+            && (is_bare_go_call(reference, context) || rust_shape == Some(RustCallShape::Bare)))
         // A builtin method call (`res.text()`) whose only same-named project
         // symbol is some function's closure must decline (#1708).
         || !is_lexically_reachable(candidate, reference, context)
@@ -10044,6 +10533,232 @@ mod tests {
             ),
             &ctx
         ));
+    }
+
+    // ====== KEEP-RUST P15 — Rust calls that lost their receiver ======
+
+    #[test]
+    fn rust_call_shape_reads_bare_and_dropped_receiver_calls() {
+        let source = "    join(x);\n    parse::<u8>(s);\n    root().join(x);\n    root()\n        .join(x);\n    joined(x);\n    root().joined(x);\n    0..len();\n    root().collect::<Vec<_>>(x);\n";
+        let ctx = Ctx::default().file("src/a.rs", source);
+        let shape = |name: &str, line: i64, column: i64| {
+            rust_call_shape(
+                &at_column(
+                    name,
+                    EdgeKind::Calls,
+                    "src/a.rs",
+                    Language::Rust,
+                    line,
+                    column,
+                ),
+                &ctx,
+            )
+        };
+        assert_eq!(shape("join", 1, 4), Some(RustCallShape::Bare));
+        assert_eq!(
+            shape("parse", 2, 4),
+            Some(RustCallShape::Bare),
+            "a turbofish still opens a bare call"
+        );
+        assert_eq!(
+            shape("join", 3, 4),
+            Some(RustCallShape::Method),
+            "root().join dropped its receiver"
+        );
+        assert_eq!(
+            shape("join", 4, 4),
+            Some(RustCallShape::Method),
+            "the `.join(` may sit on a later line"
+        );
+        assert_eq!(shape("join", 6, 4), None, "`joined(` is another name");
+        assert_eq!(shape("join", 7, 4), None, "`.joined(` is not `.join(`");
+        assert_eq!(
+            shape("len", 8, 7),
+            Some(RustCallShape::Bare),
+            "a range end is a bare call"
+        );
+        assert_eq!(
+            shape("collect", 9, 4),
+            Some(RustCallShape::Method),
+            "a turbofish after a dropped receiver"
+        );
+        assert_eq!(shape("join", 1, 400), None, "a column past the line end");
+        assert_eq!(shape("join", 99, 0), None, "a line past the file end");
+        // Only Rust `calls` refs whose name has no `.` / `::`, and only with source.
+        let unknown = |name: &str, kind: EdgeKind, path: &str, lang: Language| {
+            rust_call_shape(&at_column(name, kind, path, lang, 1, 4), &ctx)
+        };
+        assert_eq!(
+            unknown("join", EdgeKind::References, "src/a.rs", Language::Rust),
+            None
+        );
+        assert_eq!(
+            unknown("p.join", EdgeKind::Calls, "src/a.rs", Language::Rust),
+            None
+        );
+        assert_eq!(
+            unknown("a::join", EdgeKind::Calls, "src/a.rs", Language::Rust),
+            None
+        );
+        assert_eq!(
+            unknown("join", EdgeKind::Calls, "src/missing.rs", Language::Rust),
+            None
+        );
+        assert_eq!(
+            unknown("join", EdgeKind::Calls, "src/a.rs", Language::TypeScript),
+            None
+        );
+    }
+
+    #[test]
+    fn rust_receiver_gates_narrow_exact_name_candidates() {
+        let source = "fn f() {\n    root().join(x);\n    store().nodes_by_ids(x);\n    helper();\n    root().build();\n    Err(1);\n}\n";
+        let method = |name: &str, qualified: &str| {
+            mk(
+                &format!("method:{name}"),
+                NodeKind::Method,
+                name,
+                qualified,
+                "src/lib.rs",
+                Language::Rust,
+            )
+        };
+        let function = |name: &str| {
+            mk(
+                &format!("function:{name}"),
+                NodeKind::Function,
+                name,
+                name,
+                "src/util.rs",
+                Language::Rust,
+            )
+        };
+        let at = |name: &str, line: i64| {
+            at_column(name, EdgeKind::Calls, "src/a.rs", Language::Rust, line, 4)
+        };
+        let target = |reference: &RefView, ctx: &Ctx| {
+            match_by_exact_name(reference, ctx).map(|r| r.target_node_id)
+        };
+
+        // R3: a lone project method sharing a std method's name binds nothing.
+        let ctx = Ctx::default()
+            .file("src/a.rs", source)
+            .name("join", vec![method("join", "LineIndex::join")]);
+        assert_eq!(target(&at("join", 2), &ctx), None);
+        // R2: a project-specific name binds its lone method, never a free function.
+        let ctx = Ctx::default().file("src/a.rs", source).name(
+            "nodes_by_ids",
+            vec![method("nodes_by_ids", "Store::nodes_by_ids")],
+        );
+        assert_eq!(
+            target(&at("nodes_by_ids", 3), &ctx).as_deref(),
+            Some("method:nodes_by_ids")
+        );
+        let ctx = Ctx::default()
+            .file("src/a.rs", source)
+            .name("build", vec![function("build")]);
+        assert_eq!(target(&at("build", 5), &ctx), None);
+        // R1: a bare call binds the free fn, and never a method.
+        let ctx = Ctx::default().file("src/a.rs", source).name(
+            "helper",
+            vec![method("helper", "Store::helper"), function("helper")],
+        );
+        assert_eq!(
+            target(&at("helper", 4), &ctx).as_deref(),
+            Some("function:helper")
+        );
+        let ctx = Ctx::default()
+            .file("src/a.rs", source)
+            .name("helper", vec![method("helper", "Store::helper")]);
+        assert_eq!(target(&at("helper", 4), &ctx), None);
+        // R4: a bare `Err` is the prelude's unless a `use` in scope imports one.
+        let variant = mk(
+            "enum_member:Err",
+            NodeKind::EnumMember,
+            "Err",
+            "Outcome::Err",
+            "src/outcome.rs",
+            Language::Rust,
+        );
+        let ctx = Ctx::default()
+            .file("src/a.rs", source)
+            .name("Err", vec![variant.clone()]);
+        assert_eq!(target(&at("Err", 6), &ctx), None);
+        let imported = format!("use crate::outcome::Outcome::Err;\n{source}");
+        let ctx = Ctx::default()
+            .file("src/a.rs", &imported)
+            .name("Err", vec![variant]);
+        assert_eq!(
+            target(&at("Err", 7), &ctx).as_deref(),
+            Some("enum_member:Err")
+        );
+        // No source: the shape is unknown and today's binding stands.
+        let ctx = Ctx::default().name("join", vec![method("join", "LineIndex::join")]);
+        assert_eq!(target(&at("join", 2), &ctx).as_deref(), Some("method:join"));
+    }
+
+    #[test]
+    fn rust_receiver_gates_close_the_fuzzy_fallback() {
+        // Fuzzy matching is case-insensitive, so `Join` / `Helper` are its only
+        // candidates for `join` / `helper`; the shapes still gate them.
+        let source = "fn f() {\n    root().join(x);\n    helper(x);\n}\n";
+        let lone = |name: &str, kind: NodeKind| {
+            vec![mk(
+                &format!("{kind:?}:{name}"),
+                kind,
+                name,
+                name,
+                "src/x.rs",
+                Language::Rust,
+            )]
+        };
+        let fuzzy = |name: &str, line: i64, ctx: &Ctx| {
+            match_fuzzy(
+                &at_column(name, EdgeKind::Calls, "src/a.rs", Language::Rust, line, 4),
+                ctx,
+            )
+        };
+        let ctx = Ctx::default()
+            .file("src/a.rs", source)
+            .lower("join", lone("Join", NodeKind::Method));
+        assert!(
+            fuzzy("join", 2, &ctx).is_none(),
+            "a dropped receiver takes no fuzzy guess"
+        );
+        let ctx = Ctx::default()
+            .file("src/a.rs", source)
+            .lower("helper", lone("Helper", NodeKind::Method));
+        assert!(
+            fuzzy("helper", 3, &ctx).is_none(),
+            "a bare call never reaches a method"
+        );
+        let ctx = Ctx::default()
+            .file("src/a.rs", source)
+            .lower("helper", lone("Helper", NodeKind::Function));
+        assert!(
+            fuzzy("helper", 3, &ctx).is_some(),
+            "a bare call may still reach a function"
+        );
+    }
+
+    #[test]
+    fn rust_std_methods_are_sorted_and_unique() {
+        assert!(RUST_STD_METHODS.windows(2).all(|pair| pair[0] < pair[1]));
+        for name in [
+            "join",
+            "iter",
+            "as_str",
+            "is_empty",
+            "take",
+            "get_or_init",
+            "open",
+            "path",
+        ] {
+            assert!(is_rust_std_method(name), "{name}");
+        }
+        for name in ["nodes_by_ids", "current_db", "downgrade", "json"] {
+            assert!(!is_rust_std_method(name), "{name}");
+        }
     }
 
     #[test]

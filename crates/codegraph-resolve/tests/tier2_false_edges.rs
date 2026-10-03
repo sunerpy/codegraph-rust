@@ -544,3 +544,128 @@ fn same_name_recursion_self_edge_survives() {
         "and it must be the only calls edge: {described:?}"
     );
 }
+
+// ====== KEEP-RUST — Rust method calls that lost their receiver (P15) ======
+
+#[test]
+fn rust_dropped_receivers_are_extracted_as_bare_method_names() {
+    // Given `root().join(name)`, the same call broken across two lines, and
+    // `make_opt().take()`,
+    // When `chains.rs` is extracted,
+    // Then each call is a bare `join` / `take` ref: a receiver that is a plain
+    // call keeps no receiver text, which is the shape every case below rests on.
+    let root = fixture_root("rust_receiver");
+    let result = extract_file(&root, "src/chains.rs").expect("extract chains.rs");
+    let calls: Vec<(String, i64)> = result
+        .unresolved_references
+        .iter()
+        .filter(|r| r.reference_kind == EdgeKind::Calls)
+        .map(|r| (r.reference_name.clone(), r.line))
+        .collect();
+    for (name, line) in [("join", 5), ("join", 9), ("take", 14)] {
+        assert!(
+            calls.contains(&(name.to_string(), line)),
+            "expected a bare `{name}` call ref at line {line}: {calls:?}"
+        );
+    }
+}
+
+#[test]
+fn rust_method_call_with_a_dropped_receiver_binds_no_std_named_method() {
+    // Given method calls whose receiver the extractor dropped — `root().join`,
+    // the same chain broken across lines, `make_opt().take()` — beside the
+    // project's only `join` / `take` methods and an imported free fn `join`,
+    // When the pipeline resolves,
+    // Then none binds: a unique project method sharing a std method's name is
+    // no evidence of the receiver's type, and a method call never reaches a
+    // free function, through `use` or otherwise.
+    let g = resolve_fixture("rust_receiver");
+    for from in ["dropped_join", "broken_chain", "dropped_take"] {
+        let landed = calls_from(&g, from);
+        assert!(
+            !landed
+                .iter()
+                .any(|t| t.starts_with("join@") || t.starts_with("take@")),
+            "{from} must not bind a same-named project method or function: {landed:?}"
+        );
+    }
+}
+
+#[test]
+fn rust_receiver_gates_keep_validated_and_project_specific_calls() {
+    // Given `self.join(..)`, the path `LineIndex::join(..)` and
+    // `store().nodes_by_ids(..)`,
+    // When the pipeline resolves,
+    // Then each keeps its edge: validated receivers, paths and project-specific
+    // method names are outside the gates.
+    let g = resolve_fixture("rust_receiver");
+    assert_eq!(calls_from(&g, "joined"), vec!["join@src/lib.rs:L10"]);
+    assert!(
+        calls_from(&g, "explicit_path").contains(&"join@src/lib.rs:L10".to_string()),
+        "{:?}",
+        calls_from(&g, "explicit_path")
+    );
+    assert!(
+        calls_from(&g, "lookup").contains(&"nodes_by_ids@src/store.rs:L16".to_string()),
+        "{:?}",
+        calls_from(&g, "lookup")
+    );
+}
+
+#[test]
+fn rust_bare_call_never_binds_a_method() {
+    // Given a bare `helper()` beside a free fn `helper` and a nearer method
+    // `Store::helper`, a bare `join(..)` of the imported free fn beside the
+    // method `LineIndex::join`, and a bare `only_method()` whose only namesake
+    // is a method,
+    // When the pipeline resolves,
+    // Then `helper()` and `join(..)` bind their free fns and `only_method()`
+    // binds nothing: a Rust call with neither receiver nor path never reaches a
+    // method.
+    let g = resolve_fixture("rust_receiver");
+    assert_eq!(
+        calls_from(&g, "calls_helper"),
+        vec!["helper@src/store.rs:L3"]
+    );
+    assert_eq!(
+        calls_from(&g, "imported_free_fn"),
+        vec!["join@src/util.rs:L1"]
+    );
+    assert!(
+        calls_from(&g, "calls_only_method").is_empty(),
+        "{:?}",
+        calls_from(&g, "calls_only_method")
+    );
+}
+
+#[test]
+fn rust_bare_prelude_variant_binds_a_project_variant_only_with_a_use_in_scope() {
+    // Given bare `Err(..)` / `Ok(..)` calls beside a project `enum Outcome { Ok, Err }`,
+    // When the pipeline resolves,
+    // Then a call binds `Outcome::Err` only where a `use` naming it, or a glob,
+    // is in its own block and module: the top level, a child's `use super::*`,
+    // a braced use, a fn-local use. A parent's use does not reach a child
+    // module, a fn-local use does not reach a sibling fn, and a commented-out
+    // use is no use; those calls are the prelude's `Err`.
+    let g = resolve_fixture("rust_receiver");
+    let err = "Err@src/outcome.rs:L3".to_string();
+    for from in ["top_level_use", "child_glob", "braced_use", "fn_local_use"] {
+        assert!(
+            calls_from(&g, from).contains(&err),
+            "{from}: {:?}",
+            calls_from(&g, from)
+        );
+    }
+    assert!(
+        calls_from(&g, "braced_use").contains(&"Ok@src/outcome.rs:L2".to_string()),
+        "{:?}",
+        calls_from(&g, "braced_use")
+    );
+    for from in ["parent_use_does_not_leak", "sibling_fn", "commented_use"] {
+        assert!(
+            !calls_from(&g, from).iter().any(|t| t.starts_with("Err@")),
+            "{from}: {:?}",
+            calls_from(&g, from)
+        );
+    }
+}

@@ -135,6 +135,7 @@ pub struct SourceFacts {
     literal_binding_targets: Mutex<HashMap<(String, String), Option<String>>>,
     awaited_raw_names: OnceLock<HashSet<String>>,
     awaited_index: OnceLock<Arc<AwaitedIndex>>,
+    rust_use_scopes: OnceLock<crate::rust_lexical::RustUseScopes>,
 }
 
 impl SourceFacts {
@@ -157,12 +158,22 @@ impl SourceFacts {
             literal_binding_targets: Mutex::new(HashMap::new()),
             awaited_raw_names: OnceLock::new(),
             awaited_index: OnceLock::new(),
+            rust_use_scopes: OnceLock::new(),
         }
     }
 
     /// The raw source text.
     pub fn source(&self) -> &str {
         &self.source
+    }
+
+    /// Whether a Rust `use` item visible at byte `offset` names `name` or is a
+    /// glob (KEEP-RUST, P15 R4); see [`crate::rust_lexical::RustUseScopes`]. The
+    /// file's `use` items are scanned once, on first ask.
+    pub(crate) fn rust_use_in_scope(&self, offset: usize, name: &str) -> bool {
+        self.rust_use_scopes
+            .get_or_init(|| crate::rust_lexical::RustUseScopes::scan(&self.source))
+            .covers(offset, name)
     }
 
     /// Line index of the raw source.

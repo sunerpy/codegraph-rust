@@ -1822,6 +1822,24 @@ impl ReferenceResolver {
             return (candidates.into_iter().reduce(highest_confidence), None);
         }
 
+        // KEEP-RUST (P15): a Rust method call whose receiver the extractor
+        // dropped — `root().join(x)`, a chain broken across lines — is still a
+        // method call. It never resolves through a `use` binding or a fuzzy
+        // guess: it binds only a same-named method, and never one that shares a
+        // std method's name.
+        if crate::name_matcher::rust_call_shape(reference, context)
+            == Some(crate::name_matcher::RustCallShape::Method)
+        {
+            if let Some(result) = self.gate_language(
+                crate::name_matcher::match_rust_lost_receiver_call(reference, context),
+                reference,
+                context,
+            ) {
+                candidates.push(result);
+            }
+            return (candidates.into_iter().reduce(highest_confidence), None);
+        }
+
         // Strategy 2: import-based resolution (index.ts:704-708).
         if let Some(import_result) =
             self.gate_language(resolve_via_import(reference, context), reference, context)

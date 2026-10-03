@@ -49,6 +49,9 @@
   - #280's dependency updates, with extraction version 20.
 
   See the dated entries below, including the `v0.53.0` release record.
+- **On `main`, not yet released:** four KEEP-RUST resolution gates for Rust
+  method calls whose receiver the extractor dropped, with extraction version
+  21. See the 2026-10-03 "four KEEP-RUST gates" entry below.
 - **UI family, phase 1 (browser viewer):** started after the owner selected the
   Penpot direction D design on 2026-10-02. The viewer — the `codegraph-ui`
   server over upstream `v1.6.1`'s `ui/` frontend, behind `CODEGRAPH_UI=1` as
@@ -158,6 +161,58 @@ below remain immutable historical evidence.
 > that records colby parity — do not infer it from `Cargo.toml`.
 
 ## Sync log
+
+### 2026-10-03 — Rust method calls that lost their receiver: four KEEP-RUST gates
+
+On 2026-10-03 the owner asked for the cause of `join`, `iter` and `as_str`
+topping this repository's most-called lists to be fixed where it is
+statically decidable. The design passed the kirocodex plan gate in round 4
+(6 → 1 → 1 → 0).
+
+**Cause.** `extract_call` keeps a Rust receiver only in these cases:
+
+- an identifier;
+- `self`;
+- one `self.<field>` hop;
+- a `path::call()` receiver.
+
+Every other receiver leaves the bare method name: a plain call `root()`, a
+deeper field chain, `vec![…]`, `?`, `.await`, indexing, or a chain broken
+across lines. Upstream's `tree-sitter.ts` does the same. Resolution then treated
+`root().join(name)` as a bare call, and the project's only `join` method won at
+exact-match 0.9. That method is `LineIndex::join`, so 964 calls from 169 files
+landed on it.
+
+Upstream has no Rust counterpart to its JS/TS gates (#1987, #1714/#1857,
+#1683). These rules are stricter than upstream `v1.6.1` (`f4ddf50`):
+
+| rule | a Rust `calls` ref | binds |
+| --- | --- | --- |
+| R1 | with neither receiver nor path (`helper()`) | never a method |
+| R2 | whose receiver was dropped (`root().join(x)`) | only a method, never through `use`, never by a fuzzy guess |
+| R3 | whose receiver was dropped, named in `RUST_STD_METHODS` (307 std names) | nothing |
+| R4 | bare `Ok` / `Err` / `Some` / `None` | a project enum variant only when a `use` naming it, or a glob, is in its own block and module |
+
+**Shape.** It is read from the source. The ref's column is the call
+expression's start, so a bare call starts with its name. A dropped receiver
+starts with something else, and its `.name(` follows within 4 KiB. An unknown
+shape (no source, or a column off its line) keeps the old behaviour.
+
+**Measured** on an archive of `6cc9507`: old binary `0.53.0`, new binary this
+change, bundle excluded both times.
+
+- 3,284 edges removed, each attributed to one rule: R3 2,743, R1 296, R4 193,
+  R2 52.
+- A hand review of 20 removed edges per rule found every one false.
+- 48 edges added where a filtered candidate gave way to the right one. In 24 of
+  them a bare `node(…)` now reaches the free fn instead of a same-named method.
+  In 13, `.extract(…)` reaches `FrameworkResolver::extract` because R2 brought
+  the candidates under the ambiguity ceiling.
+- 451 Method-shaped edges with project-specific names survive. About a third
+  of a 20-edge sample are third-party crate methods (`is_match`, `body`) or a std
+  type outside the list (`SocketAddr::port`): the known limit of a std list.
+- No golden of any corpus moved, and `sync` after moving `LineIndex::join`
+  equals `index --force`.
 
 ### 2026-10-03 — `v0.53.0` RELEASED: the browser viewer and #303 shipped
 
