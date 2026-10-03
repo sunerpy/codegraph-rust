@@ -228,10 +228,10 @@ codegraph audit --orphans --exclude addons/ -p .   # recommended: denoise vendor
 ```
 
 `-p` selects the **project root**, not a result filter. To scope or denoise the
-report, use the CLI-layer prefix filters `--include <PREFIX>` / `--exclude
-<PREFIX>` (both repeatable, `/`-normalized). For a typical Godot project,
-`--exclude addons/` drops noise from vendored editor plugins; `--include
-<your-content-dir>/` narrows to your own resources.
+report, use the CLI-layer prefix filters `--include <PREFIX>` /
+`--exclude <PREFIX>` (both repeatable, `/`-normalized). For a typical Godot
+project, `--exclude addons/` drops noise from vendored editor plugins;
+`--include <your-content-dir>/` narrows to your own resources.
 
 Because `.tres`/`.tscn`/`project.godot` files have no tree-sitter grammar, they
 get no `file:` graph node and their `ExtResource(…)` references stay in the

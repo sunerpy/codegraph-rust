@@ -121,6 +121,7 @@ handoff. Do not use a narrow test to claim a workspace-wide property.
 | release/install/checksum       | shell/PowerShell fixtures, asset-name checks, archive smoke                                                  | README install section and release workflow contract                         |
 | viewer (`codegraph-ui`, `ui/`) | crate tests over indexed fixtures; `cli_ui`; `make ui-check` (rebuilds and byte-checks the committed bundle) | `ui.md`; `cli.md` for the command                                            |
 | docs/community files           | `python3 scripts/docs-check.py`; formatter; link/anchor checks                                               | update the canonical page, not a duplicate summary                           |
+| website pages (`docs/site/`)   | `docs-check.py`; formatter; firlab's sync + build + `check-dist.sh` (`docs-site.yml`)                        | `docs/site/README.md`; both languages; link canonical references, never copy |
 
 If a change alters nodes, edges, reference resolution, file classification, or
 stored graph meaning, decide explicitly whether the extraction version must move.

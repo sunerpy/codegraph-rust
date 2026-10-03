@@ -13,7 +13,8 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](../../LICENSE-MIT)
 
 [English](../../README.md) · [简体中文](README.zh-CN.md) ·
-[文档](../README.md) · [参与贡献](../../CONTRIBUTING.md)
+[网站](https://firlab.app/codegraph/) · [文档](../README.md) ·
+[参与贡献](../../CONTRIBUTING.md)
 
 </div>
 

@@ -4,6 +4,15 @@ The root [README](../README.md) is the landing page. This index points to the
 canonical technical references; update the owning page rather than duplicating
 volatile behavior elsewhere.
 
+## Website
+
+[firlab.app/codegraph](https://firlab.app/codegraph/) (English at
+[`/codegraph/en/`](https://firlab.app/codegraph/en/)) is the user guide, in Chinese
+and English, with screenshots of the browser viewer. Its pages live in
+[`site/`](site/README.md), next to the code they describe; that README explains how
+a change reaches the site, the writing rules and how the screenshots are taken. The
+site publishes the references below unchanged.
+
 ## Use CodeGraph
 
 - [CLI reference](cli.md) — command/path contracts, installation targets,

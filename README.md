@@ -13,7 +13,8 @@ native binary. No AI or vector runtime inside the indexer.
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE-MIT)
 
 [English](README.md) · [简体中文](docs/readme/README.zh-CN.md) ·
-[Documentation](docs/README.md) · [Contributing](CONTRIBUTING.md)
+[Website](https://firlab.app/codegraph/en/) · [Documentation](docs/README.md) ·
+[Contributing](CONTRIBUTING.md)
 
 </div>
 
