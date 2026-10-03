@@ -17,6 +17,13 @@ use codegraph_store::{
 const CHILD_ACTION: &str = "CODEGRAPH_INDEX_LEASE_CHILD_ACTION";
 const CHILD_MODE: &str = "CODEGRAPH_INDEX_LEASE_CHILD_MODE";
 const CHILD_PROJECT: &str = "CODEGRAPH_INDEX_LEASE_CHILD_PROJECT";
+/// Milliseconds the child may wait for the lock: CHILD_WAIT for a holder, the caller's bound for
+/// a probe, so a probe expected to acquire a free lock is not cut short by SHORT_DEADLINE.
+const CHILD_LOCK_WAIT_MS: &str = "CODEGRAPH_INDEX_LEASE_CHILD_LOCK_WAIT_MS";
+/// Test-only stand-in for a slow child: milliseconds the child sleeps after setting its
+/// deadline and before its first lock attempt, as a loaded Windows runner spends opening and
+/// validating the lock.
+const CHILD_PRE_ACQUIRE_DELAY_MS: &str = "CODEGRAPH_INDEX_LEASE_CHILD_PRE_ACQUIRE_DELAY_MS";
 const LOCK_BYTES: &[u8] = b"permanent-lock-sentinel\nnot-a-pid\n";
 const CHILD_WAIT: Duration = Duration::from_secs(5);
 const SHORT_DEADLINE: Duration = Duration::from_millis(80);
@@ -423,6 +430,23 @@ fn an_already_expired_deadline_is_nonmutating_even_when_the_lock_is_free() {
 }
 
 #[test]
+fn probes_acquire_a_free_lock_from_a_slow_child() {
+    // A probe expected to ACQUIRE must get the caller's bound for its own lock attempt. On a
+    // loaded Windows runner the child can take longer than SHORT_DEADLINE to reach its first
+    // attempt, and then reports TIMED_OUT for a lock nobody holds (Windows CI, 2026-10-03).
+    let project = TempProject::new("slow-probe");
+    let paths = project.paths();
+    stage_existing_lock(&paths, LOCK_BYTES);
+    for mode in ["shared", "exclusive"] {
+        assert_eq!(
+            run_probe_after(project.path(), mode, CHILD_WAIT, Duration::from_millis(300)),
+            "ACQUIRED",
+            "{mode} probe of a free lock"
+        );
+    }
+}
+
+#[test]
 fn a_clone_keeps_the_single_lock_alive_until_the_final_drop() {
     let project = TempProject::new("clone");
     let paths = project.paths();
@@ -474,10 +498,12 @@ fn lease_mode_parent_and_clone_drop_order_are_enforced() {
         "dropping a non-final shared clone must keep exclusives blocked"
     );
     drop(shared_clone_b);
+    // A probe expected to ACQUIRE gets CHILD_WAIT: SHORT_DEADLINE would also time the child's
+    // own open-and-validate work, which a loaded Windows runner can stretch past 80 ms.
     assert_eq!(
-        run_probe(shared_project.path(), "exclusive", SHORT_DEADLINE),
+        run_probe(shared_project.path(), "exclusive", CHILD_WAIT),
         "ACQUIRED",
-        "the final shared owner must release immediately"
+        "the final shared owner must release on drop"
     );
 
     let exclusive_project = TempProject::new("exclusive-parent-clones");
@@ -510,9 +536,9 @@ fn lease_mode_parent_and_clone_drop_order_are_enforced() {
     }
     drop(exclusive_clone_b);
     assert_eq!(
-        run_probe(exclusive_project.path(), "shared", SHORT_DEADLINE),
+        run_probe(exclusive_project.path(), "shared", CHILD_WAIT),
         "ACQUIRED",
-        "the final exclusive owner must release immediately"
+        "the final exclusive owner must release on drop"
     );
 
     // Build a real Current namespace exclusively through public production APIs,
@@ -564,9 +590,9 @@ fn lease_mode_parent_and_clone_drop_order_are_enforced() {
     }
 
     assert_eq!(
-        run_probe(store_project.path(), "exclusive", SHORT_DEADLINE),
+        run_probe(store_project.path(), "exclusive", CHILD_WAIT),
         "ACQUIRED",
-        "dropping the final Store owner must admit a fresh contender immediately"
+        "dropping the final Store owner must admit a fresh contender"
     );
 }
 
@@ -613,14 +639,25 @@ fn lease_child_process() {
     let mode = std::env::var(CHILD_MODE).expect("child mode env");
     let paths = IndexPaths::resolve(&project, None).expect("child resolve IndexPaths");
 
-    let acquire = || match mode.as_str() {
-        "shared" => {
-            IndexLease::acquire_shared_existing(&paths, deadline_after(SHORT_DEADLINE), || false)
+    let wait = std::env::var(CHILD_LOCK_WAIT_MS)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .expect("child lock wait env");
+    let delay = std::env::var(CHILD_PRE_ACQUIRE_DELAY_MS)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis);
+    let acquire = || {
+        let deadline = deadline_after(wait);
+        if let Some(delay) = delay {
+            std::thread::sleep(delay);
         }
-        "exclusive" => {
-            IndexLease::acquire_exclusive_existing(&paths, deadline_after(SHORT_DEADLINE), || false)
+        match mode.as_str() {
+            "shared" => IndexLease::acquire_shared_existing(&paths, deadline, || false),
+            "exclusive" => IndexLease::acquire_exclusive_existing(&paths, deadline, || false),
+            other => panic!("unknown child mode {other}"),
         }
-        other => panic!("unknown child mode {other}"),
     };
 
     match action.as_str() {
@@ -728,12 +765,27 @@ fn child_command(project: &Path, mode: &str, action: &str) -> Command {
         .arg("--nocapture")
         .env(CHILD_ACTION, action)
         .env(CHILD_MODE, mode)
-        .env(CHILD_PROJECT, project);
+        .env(CHILD_PROJECT, project)
+        .env(CHILD_LOCK_WAIT_MS, CHILD_WAIT.as_millis().to_string());
     command
 }
 
 fn run_probe(project: &Path, mode: &str, acquisition_bound: Duration) -> String {
+    run_probe_after(project, mode, acquisition_bound, Duration::ZERO)
+}
+
+fn run_probe_after(
+    project: &Path,
+    mode: &str,
+    acquisition_bound: Duration,
+    delay: Duration,
+) -> String {
     let mut child = child_command(project, mode, "probe")
+        .env(
+            CHILD_LOCK_WAIT_MS,
+            acquisition_bound.as_millis().to_string(),
+        )
+        .env(CHILD_PRE_ACQUIRE_DELAY_MS, delay.as_millis().to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -748,7 +800,8 @@ fn run_probe(project: &Path, mode: &str, acquisition_bound: Duration) -> String 
         output_tx.send(output).expect("send probe output");
     });
     let process_bound = acquisition_bound
-        .checked_add(CHILD_WAIT)
+        .checked_add(delay)
+        .and_then(|bound| bound.checked_add(CHILD_WAIT))
         .expect("probe process bound");
     let status = wait_bounded(&mut child, process_bound);
     assert!(status.success(), "probe child failed: {status}");

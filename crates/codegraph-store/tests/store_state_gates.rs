@@ -19,6 +19,13 @@ use serde_json::json;
 
 const CHILD_ACTION: &str = "CODEGRAPH_STORE_GATE_CHILD_ACTION";
 const CHILD_PROJECT: &str = "CODEGRAPH_STORE_GATE_CHILD_PROJECT";
+/// Milliseconds a probe child may wait for the lock: the caller's bound, so a probe expected to
+/// acquire a free lock is not cut short by SHORT_DEADLINE.
+const CHILD_LOCK_WAIT_MS: &str = "CODEGRAPH_STORE_GATE_CHILD_LOCK_WAIT_MS";
+/// Test-only stand-in for a slow child: milliseconds a probe sleeps after setting its deadline
+/// and before its first lock attempt, as a loaded Windows runner spends opening and validating
+/// the lock.
+const CHILD_PRE_ACQUIRE_DELAY_MS: &str = "CODEGRAPH_STORE_GATE_CHILD_PRE_ACQUIRE_DELAY_MS";
 const CHILD_WAIT: Duration = Duration::from_secs(5);
 const SHORT_DEADLINE: Duration = Duration::from_millis(80);
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
@@ -1580,6 +1587,19 @@ fn missing_state_with_non_utf8_database_sidecar_fails_closed() {
     }
 }
 
+#[test]
+fn exclusive_probe_acquires_a_free_lock_from_a_slow_child() {
+    // A probe expected to ACQUIRE must get the caller's bound for its own lock attempt. On a
+    // loaded Windows runner the child can take longer than SHORT_DEADLINE to reach its first
+    // attempt, and then reports TIMED_OUT for a lock nobody holds (Windows CI, 2026-10-03).
+    let project = TempProject::new("slow-probe");
+    stage_current(&project, Some(&CURRENT_EXTRACTION_VERSION.to_string()));
+    assert_eq!(
+        run_exclusive_probe_after(project.path(), CHILD_WAIT, Duration::from_millis(300)),
+        "ACQUIRED"
+    );
+}
+
 /// Child-process entry point used by deterministic lock contention tests.
 #[test]
 fn store_gate_child_process() {
@@ -1602,18 +1622,28 @@ fn store_gate_child_process() {
             println!("RELEASED");
             std::io::stdout().flush().expect("flush RELEASED");
         }
-        "probe-exclusive" => match IndexLease::acquire_exclusive_existing(
-            &paths,
-            deadline_after(SHORT_DEADLINE),
-            || false,
-        ) {
-            Ok(lease) => {
-                println!("ACQUIRED");
-                drop(lease);
+        "probe-exclusive" => {
+            let wait = std::env::var(CHILD_LOCK_WAIT_MS)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(Duration::from_millis)
+                .expect("probe lock wait env");
+            let deadline = deadline_after(wait);
+            if let Some(delay) = std::env::var(CHILD_PRE_ACQUIRE_DELAY_MS)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                std::thread::sleep(Duration::from_millis(delay));
             }
-            Err(codegraph_store::IndexLeaseError::TimedOut { .. }) => println!("TIMED_OUT"),
-            Err(error) => panic!("unexpected child probe error: {error}"),
-        },
+            match IndexLease::acquire_exclusive_existing(&paths, deadline, || false) {
+                Ok(lease) => {
+                    println!("ACQUIRED");
+                    drop(lease);
+                }
+                Err(codegraph_store::IndexLeaseError::TimedOut { .. }) => println!("TIMED_OUT"),
+                Err(error) => panic!("unexpected child probe error: {error}"),
+            }
+        }
         "write-current-wal-and-exit" => {
             let lease = IndexLease::acquire_exclusive_existing(&paths, deadline(), || false)
                 .expect("crash fixture acquires exclusive lease");
@@ -1721,8 +1751,16 @@ fn child_command(project: &Path, action: &str) -> Command {
     command
 }
 
-fn run_exclusive_probe(project: &Path, process_bound: Duration) -> String {
+/// Run a child that tries the exclusive lease for `lock_wait` and reports `ACQUIRED` or
+/// `TIMED_OUT`. Use SHORT_DEADLINE when the lock is expected to be held, CHILD_WAIT when free.
+fn run_exclusive_probe(project: &Path, lock_wait: Duration) -> String {
+    run_exclusive_probe_after(project, lock_wait, Duration::ZERO)
+}
+
+fn run_exclusive_probe_after(project: &Path, lock_wait: Duration, delay: Duration) -> String {
     let mut child = child_command(project, "probe-exclusive")
+        .env(CHILD_LOCK_WAIT_MS, lock_wait.as_millis().to_string())
+        .env(CHILD_PRE_ACQUIRE_DELAY_MS, delay.as_millis().to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -1738,8 +1776,9 @@ fn run_exclusive_probe(project: &Path, process_bound: Duration) -> String {
     });
     let status = wait_bounded(
         &mut child,
-        process_bound
-            .checked_add(CHILD_WAIT)
+        lock_wait
+            .checked_add(delay)
+            .and_then(|bound| bound.checked_add(CHILD_WAIT))
             .expect("probe process bound"),
     );
     assert!(status.success(), "probe child failed: {status}");
