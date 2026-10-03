@@ -40,10 +40,21 @@
   resolution divergences that fix the findings the retroactive review had kept
   at upstream behavior, with extraction version 19. See the dated entries
   below, including the `v0.52.2` release record.
+- **Shipped in codegraph-rs `v0.53.0`, 2026-10-03:**
+  - #298 and #300, the browser viewer (UI family phase 1) behind
+    `CODEGRAPH_UI=1`, drawn to direction D with a light theme;
+  - #303, which makes `sync` re-resolve every edge a same-named candidate's
+    arrival, departure or in-place change can move, so it equals
+    `index --force` again;
+  - #280's dependency updates, with extraction version 20.
+
+  See the dated entries below, including the `v0.53.0` release record.
 - **UI family, phase 1 (browser viewer):** started after the owner selected the
   Penpot direction D design on 2026-10-02. The viewer — the `codegraph-ui`
   server over upstream `v1.6.1`'s `ui/` frontend, behind `CODEGRAPH_UI=1` as
-  upstream gates it — is ported; see the 2026-10-02 viewer entry below. The
+  upstream gates it — is ported, restyled to direction D with a light theme,
+  and shipped in `v0.53.0`; see the 2026-10-02 and 2026-10-03 viewer entries
+  below. The
   graph-semantic families F1–F12 that shipped beside it (framework navigation
   edges and routers, the synthesis layer and its schema, cross-tier channels,
   server route naming, the explore Flow, the React Native bridge) remain
@@ -147,6 +158,43 @@ below remain immutable historical evidence.
 > that records colby parity — do not infer it from `Cargo.toml`.
 
 ## Sync log
+
+### 2026-10-03 — `v0.53.0` RELEASED: the browser viewer and #303 shipped
+
+Release-please PR [#299](https://github.com/sunerpy/codegraph-rust/pull/299)
+merged as `2ca1fabb32cece7af4e6d337b9bf6cc0ba946ab5` and cut tag `v0.53.0` at
+that exact commit, with the tree of its head `a9f3054`. That head brought `main`
+in through `gh pr update-branch`, so the release PR's CI tested the shipped
+tree. The implementation PRs merged from their reviewed heads with identical
+trees: #298 as `143752a`, #300 as `fee9ae7`, #303 as `a35e065`.
+
+Release workflow run
+[`37094204307`](https://github.com/sunerpy/codegraph-rust/actions/runs/37094204307)
+passed all twelve jobs on its first attempt, over main CI run
+[`37094204330`](https://github.com/sunerpy/codegraph-rust/actions/runs/37094204330).
+The release was published at 2026-10-03T03:56:56Z UTC. The official
+`codegraph-0.53.0-x86_64-unknown-linux-musl.tar.gz` digest is
+`b46c8d3cc37161a333daa53f4258727aae13de78fd37e315214451b5ac52d50f`.
+
+Black-box acceptance of the downloaded release, against the official
+`v0.52.2`:
+
+- `SHA256SUMS` and `gh attestation verify` passed for all six archives. The
+  binary reports `codegraph 0.53.0`, and its `.comment` section names rustc
+  1.98.0.
+- **Viewer gate:** without `CODEGRAPH_UI=1`, `codegraph ui` exits 1 with
+  upstream's "not in this release yet" refusal.
+- **Viewer:** with it, `ui --read-only --port 0` serves `/` under a CSP that
+  allows fonts from `'self'` only, `/api/stats` names the project, and
+  `/api/trails` answers `readOnly: true`. All 16 files of the bundle committed
+  at `v0.53.0` are served byte-for-byte, so the build accepted in #300 is the
+  one that shipped. Its CSS carries the Daylight tokens and its JS the
+  `codegraph-ui.theme` choice.
+- **#303:** a Rust project's `read` calls its own `ok` beside a JavaScript
+  `var ok`. Excluding the JavaScript file and syncing leaves `read → ok` at
+  confidence 0.4 under `v0.52.2`; `v0.53.0` gives 0.9, as `index --force` does.
+- **Upgrade:** an index written by `v0.52.2` (extraction 19) reads `outdated`
+  and becomes `current` after one `sync`.
 
 ### 2026-10-03 — `ui/README.md` rewritten for this repository
 
