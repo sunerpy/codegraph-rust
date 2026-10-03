@@ -7,9 +7,10 @@ Every number below was read back from the file through the plugin API on 2026-10
 all 15 boards and all 8 state fragments report 0 unmeasured text boxes and 0 fixed text boxes narrower
 than their text.
 
-**Status.** Design draft. The owner confirmed direction D on 2026-10-02 ("风格确认没有问题"). No UI code
-exists yet; when the viewer is built, the code follows these numbers (画板先改，代码随画板) and every conscious
-difference goes into a deviation log (`偏离（画板 vs 落地，供 owner 复核）`).
+**Status.** Built. The owner confirmed direction D on 2026-10-02 ("风格确认没有问题"), and the viewer follows
+these numbers since #300 (2026-10-03): the code follows the boards (画板先改，代码随画板), and every conscious
+difference is in the deviation log (`偏离（画板 vs 落地，供 owner 复核）`), [`../ui.md`](../ui.md) "Direction D as
+built".
 
 Coordinates are board-relative CSS px at 1×. PNGs in `png/` are 2×. A name in backticks is a library colour of
 the `D · Nebula` group (`fg-3`) or a typography of the `D · Type` group (`mono-500`).
@@ -453,7 +454,10 @@ Direction D was chosen by the owner as a deliberately more modern look; these ar
 
 - **Ligatures in code.** The boards show JetBrains Mono's contextual ligatures (`->` → `→`). Source fidelity
   argues for `font-variant-ligatures: none` in code, names and line refs; the owner decides.
-- **Light variant** of D, and whether `prefers-color-scheme` switches it.
+  Built with ligatures off everywhere, for that fidelity, and logged in the deviation table for the owner to
+  review ([`../ui.md`](../ui.md)).
+- **Light variant** of D, and whether `prefers-color-scheme` switches it. Settled by §3.6: Daylight, following
+  `prefers-color-scheme` until the reader picks System, Dark or Light.
 - **Breakpoints between 1440 and 768** (upstream's ≤ 1100 rail widths) are not drawn; nor are 1280 and 1920
   layouts.
 - **Motion.** None is drawn. If added: hover/focus transitions ≤ 150 ms, glow fades, all disabled under
