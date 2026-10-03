@@ -49,9 +49,10 @@
   - #280's dependency updates, with extraction version 20.
 
   See the dated entries below, including the `v0.53.0` release record.
-- **On `main`, not yet released:** four KEEP-RUST resolution gates for Rust
-  method calls whose receiver the extractor dropped, with extraction version
-  21. See the 2026-10-03 "four KEEP-RUST gates" entry below.
+- **Shipped in codegraph-rs `v0.53.1`, 2026-10-03:** #307, four KEEP-RUST
+  resolution gates for Rust method calls whose receiver the extractor dropped,
+  with extraction version 21. See the dated entries below, including the
+  `v0.53.1` release record.
 - **UI family, phase 1 (browser viewer):** started after the owner selected the
   Penpot direction D design on 2026-10-02. The viewer — the `codegraph-ui`
   server over upstream `v1.6.1`'s `ui/` frontend, behind `CODEGRAPH_UI=1` as
@@ -161,6 +162,39 @@ below remain immutable historical evidence.
 > that records colby parity — do not infer it from `Cargo.toml`.
 
 ## Sync log
+
+### 2026-10-03 — `v0.53.1` RELEASED: #307 shipped
+
+Release-please PR [#308](https://github.com/sunerpy/codegraph-rust/pull/308)
+merged as `4a6c21b1505af676248f731cf3738bdb0e700cc2` and cut tag `v0.53.1` at
+that exact commit, with the tree of its head `8c67fa4`. The bot's CI run was
+re-run by the owner. The implementation PR #307 merged as `f9f96c3`, with the
+tree of its reviewed head `ec1bf0f`; the kirocodex review passed in round 2
+(1 → 0).
+
+Release workflow run
+[`37104659922`](https://github.com/sunerpy/codegraph-rust/actions/runs/37104659922)
+passed all twelve jobs on its first attempt, over main CI run
+[`37104659935`](https://github.com/sunerpy/codegraph-rust/actions/runs/37104659935).
+The release was published at 2026-10-03T07:08:57Z UTC. The official
+`codegraph-0.53.1-x86_64-unknown-linux-musl.tar.gz` digest is
+`f18521f187234d398627cfa69c4d8750c45d7e9600ecc7fd44377cd8caaaeabc`.
+
+Black-box acceptance of the downloaded release, against the official
+`v0.53.0`:
+
+- `SHA256SUMS` and `gh attestation verify` passed for all six archives. The
+  binary reports `codegraph 0.53.1`, and its `.comment` section names rustc
+  1.98.0.
+- **R2/R3:** `root().join(name)` beside the project's only `join` method binds
+  `root` and `LineIndex::join` under `v0.53.0`, and only `root` now.
+- **R1:** a bare `helper()` whose only namesake is `Store::helper` binds that
+  method under `v0.53.0`, and nothing now.
+- **R4:** an import-free `Err(1)` beside `enum Outcome { Ok, Err }` binds
+  `Outcome::Err` under `v0.53.0` and nothing now. With
+  `use crate::outcome::Outcome::Err;` in scope, `Err(2)` binds it in both.
+- **Upgrade:** an index written by `v0.53.0` (extraction 20) reads `outdated`
+  and becomes `current` after one `sync`.
 
 ### 2026-10-03 — Rust method calls that lost their receiver: four KEEP-RUST gates
 
