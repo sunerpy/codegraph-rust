@@ -333,9 +333,43 @@ fn opener(dir: &TestDir) -> (PathBuf, PathBuf) {
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        wait_until_executable(&script);
+        // The warm-up run wrote an empty marker; the tests read only what `codegraph ui` writes.
+        let _ = std::fs::remove_file(&marker);
         script
     };
     (script, marker)
+}
+
+/// Run a just-written executable once, retrying while the kernel reports it busy.
+///
+/// Another thread of this test binary may fork while the script is still open for writing; the
+/// child holds the inherited descriptor until it execs, and running the script meanwhile fails with
+/// ETXTBSY, so `codegraph ui` could not start the stand-in browser. Once one run succeeds no writer
+/// is left.
+#[cfg(not(windows))]
+fn wait_until_executable(script: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match std::process::Command::new(script)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(mut child) => {
+                let _ = child.wait();
+                return;
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(error) => panic!("cannot run {}: {error}", script.display()),
+        }
+    }
 }
 
 fn wait_for_file(path: &Path, timeout: Duration) -> Option<String> {

@@ -615,6 +615,38 @@ fn symlinks_decline() {
     fs::remove_dir_all(&outside).ok();
 }
 
+/// Start a just-written executable once, retrying while the kernel reports it busy, then stop it.
+///
+/// Another thread of this test binary may fork while the file is still open for writing; the
+/// child holds the inherited descriptor until it execs, and running the file meanwhile fails with
+/// ETXTBSY. Here that failure looked like a declined git, so the test passed without the timeout
+/// ever running. Once one start succeeds no writer is left.
+#[cfg(unix)]
+fn wait_until_executable(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match std::process::Command::new(path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(mut child) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(error) => panic!("cannot run {}: {error}", path.display()),
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn a_hanging_git_declines_within_the_timeout() {
@@ -625,8 +657,10 @@ fn a_hanging_git_declines_within_the_timeout() {
         return;
     };
     let fake = repo.top.with_extension("fake-git");
-    fs::write(&fake, "#!/bin/sh\nsleep 30\n").unwrap();
+    // `exec`, so killing the stand-in kills the sleep too and leaves no orphan behind.
+    fs::write(&fake, "#!/bin/sh\nexec sleep 30\n").unwrap();
     fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    wait_until_executable(&fake);
     git_pending_hooks::set_git_program(Some(fake.clone()));
     git_pending_hooks::set_git_timeout(Some(Duration::from_millis(300)));
     let started = Instant::now();
@@ -634,6 +668,10 @@ fn a_hanging_git_declines_within_the_timeout() {
     git_pending_hooks::set_git_program(None);
     git_pending_hooks::set_git_timeout(None);
     assert_eq!(declined.1, PendingSource::FullInventory);
+    assert!(
+        started.elapsed() >= Duration::from_millis(300),
+        "the stand-in git ran until the timeout, rather than failing to start"
+    );
     assert!(
         started.elapsed() < Duration::from_secs(20),
         "the timeout bounds the wait"

@@ -755,7 +755,38 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        wait_until_executable(&script);
         script
+    }
+
+    /// Run a just-written executable once, retrying while the kernel reports it busy.
+    ///
+    /// Another thread of this test binary may fork while the script is still open for writing;
+    /// the child holds the inherited descriptor until it execs, and running the script meanwhile
+    /// fails with ETXTBSY, which `git` reports as a failed git (main's Coverage job on 81bd7c7).
+    /// Once one run succeeds no writer is left, so the test's own runs cannot hit it.
+    fn wait_until_executable(script: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match std::process::Command::new(script)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(mut child) => {
+                    let _ = child.wait();
+                    return;
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("cannot run {}: {error}", script.display()),
+            }
+        }
     }
 
     #[test]
