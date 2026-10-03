@@ -18,7 +18,7 @@ Site paths below are relative to `https://firlab.app/codegraph/`.
 | `guide/`, `reference/faq.md`, `privacy.md`, `developers.md` and the same paths under `en/`                                                                         | the user guide                                                                          |
 | `../cli.md`, `../mcp.md`, `../ui.md`, `../languages.md`, `../godot.md`, `../troubleshooting.md`                                                                    | `/en/reference/<name>`, as they are; `/reference/<name>` is a generated Chinese pointer |
 | `../architecture.md`, `../data-model.md`, `../equivalence.md`, `../grammar-manifest.md`, `../embedded-extraction.md`, `../benchmark.md`, `../benchmark-results.md` | `/en/dev/<name>`, with a generated Chinese pointer at `/dev/<name>`                     |
-| `public/`                                                                                                                                                          | the site root (`/codegraph-logo.svg`, `/screens/*.webp`)                                |
+| `public/`                                                                                                                                                          | the site root (`/codegraph-logo.svg`, `/screens/*.webp`, `/community/*`)                |
 | `tools/`, this file                                                                                                                                                | not published                                                                           |
 
 The canonical references stay English, as `docs/AGENTS.md` asks. The site publishes them unchanged and gives each a
@@ -85,6 +85,7 @@ Pages may use these components and no others; the sync rejects any other tag.
 | ----------------------------------------------------------------------------------- | --------------------------------------------------------- |
 | `<StatusTag status="available \| preview" />`                                       | release state, shown as text                              |
 | `<ScreenFigure src dark? width height alt caption? />`                              | a screenshot; `dark` is the same screen in the dark theme |
+| `<QrCode src alt caption? size? />`                                                 | a QR code on a white plate in both themes                 |
 | `<Badge>`                                                                           | VitePress's own badge                                     |
 | `HomeIndex`, `HomeSteps`, `SplitBlock`, `HomePlatforms`, `HomePrivacy`, `HomeScope` | the home pages only; they render the `home:` frontmatter  |
 
@@ -136,6 +137,9 @@ light and the dark theme, and waits until the view has finished loading. It stop
 - a symbol lookup that does not find exactly one match.
 
 `CODEGRAPH_SCREENS_COMMIT` changes the corpus commit and `CODEGRAPH_SCREENS_PORT` the port.
+
+`public/community/wechat-official-account.jpg` is the WeChat Official Account's QR code, the same image the pt-tools
+and Voltip sites show. The sync stops when a page names a `/screens/` or `/community/` file that does not exist.
 
 Look at every image before committing it. Capture again when the viewer's text or layout changes, and update the
 `width`/`height` in both home pages and in the `<ScreenFigure>` tags if the size changes.

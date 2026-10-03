@@ -277,7 +277,9 @@ The scripts check every archive against the release's `SHA256SUMS` before instal
 
 <HomeScope />
 
-## Feedback
+## Community and feedback
 
-Bug reports and feature requests go to [GitHub Issues](https://github.com/sunerpy/codegraph-rust/issues). CodeGraph is
-MIT-licensed.
+Bug reports and feature requests go to [GitHub Issues](https://github.com/sunerpy/codegraph-rust/issues). Scan the code
+with WeChat to follow the Official Account 六月水蓝. CodeGraph is MIT-licensed.
+
+<QrCode src="/community/wechat-official-account.jpg" alt="QR code of the WeChat Official Account 六月水蓝" caption="Official Account 六月水蓝" />

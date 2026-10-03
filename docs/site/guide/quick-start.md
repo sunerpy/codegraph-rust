@@ -189,12 +189,77 @@ Found 10 symbols across 4 files.
 
 ## 5. 跟踪调用和改动
 
-| 命令                                   | 列出                                                                                                        |
-| -------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `codegraph search applyDiscount -p .`  | 名称匹配的符号，最匹配的排在最前，附带位置和签名                                                            |
-| `codegraph callers applyDiscount -p .` | 调用或导入它的代码：这里是 `checkout` 和文件 `checkout.ts`                                                  |
-| `codegraph callees checkout -p .`      | 它调用的代码：`applyDiscount`、`subtotal`、`tax`，以及它用到的类型 `Cart`                                   |
-| `codegraph impact applyDiscount -p .`  | 改动它会影响的全部代码，沿调用方的调用方逐层展开，按文件分组：这里是 `checkout`、`checkout.ts` 和 `main.ts` |
+`search` 按名称查找符号，最匹配的排在最前。`callers` 和 `callees` 沿调用关系前进一步；`impact` 沿调用方的调用方逐层展开，列出改动会影响的全部代码，并按文件分组：
+
+::: code-group
+
+```text [search]
+$ codegraph search applyDiscount -p .
+
+Search Results for "applyDiscount":
+
+function    applyDiscount
+  src/pricing.ts:3
+  (amount: number, code?: string): number
+
+import      ./pricing
+  src/checkout.ts:2
+  import { applyDiscount, tax } from "./pricing";
+```
+
+```text [callers]
+$ codegraph callers applyDiscount -p .
+
+Callers of "applyDiscount" (2):
+
+applyDiscount (function) - src/pricing.ts:3
+
+function    checkout
+  src/checkout.ts:4
+
+file        checkout.ts [imports]
+  src/checkout.ts:1
+```
+
+```text [callees]
+$ codegraph callees checkout -p .
+
+Callees of "checkout" (4):
+
+checkout (function) - src/checkout.ts:4
+
+function    applyDiscount
+  src/pricing.ts:3
+
+method      subtotal
+  src/cart.ts:14
+
+function    tax
+  src/pricing.ts:8
+
+class       Cart [references]
+  src/cart.ts:7
+```
+
+```text [impact]
+$ codegraph impact applyDiscount -p .
+
+Impact of changing "applyDiscount" - 4 affected symbols:
+
+applyDiscount (function) - src/pricing.ts:3
+
+src/checkout.ts
+  function    checkout:4
+  file        checkout.ts:1
+
+src/main.ts
+  file        main.ts:1
+
+src/pricing.ts
+  function    applyDiscount:3
+```
+
+:::
 
 这些命令都支持 `--json`，供脚本使用。
 

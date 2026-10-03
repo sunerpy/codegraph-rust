@@ -170,11 +170,11 @@ def main() -> int:
 
     require_headings(
         "README.md",
-        ["Why CodeGraph", "Install", "Quickstart", "CLI", "MCP", "Agents and IDEs", "Performance", "Development", "License"],
+        ["Why CodeGraph", "Install", "Quickstart", "CLI", "MCP", "Agents and IDEs", "Browser viewer", "Performance", "Development", "Community", "License"],
     )
     require_headings(
         "docs/readme/README.zh-CN.md",
-        ["为什么选择 CodeGraph", "安装", "快速上手", "CLI", "MCP", "Agents 与 IDE", "性能", "开发", "许可证"],
+        ["为什么选择 CodeGraph", "安装", "快速上手", "CLI", "MCP", "Agents 与 IDE", "浏览器查看器", "性能", "开发", "交流与反馈", "许可证"],
     )
 
     english = read("README.md")

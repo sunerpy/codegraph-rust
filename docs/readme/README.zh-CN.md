@@ -14,7 +14,12 @@
 
 [English](../../README.md) · [简体中文](README.zh-CN.md) ·
 [网站](https://firlab.app/codegraph/) · [文档](../README.md) ·
-[参与贡献](../../CONTRIBUTING.md)
+[浏览器查看器](#浏览器查看器) · [交流与反馈](#交流与反馈) · [参与贡献](../../CONTRIBUTING.md)
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../site/public/screens/viewer-symbol-dark.webp" />
+  <img src="../site/public/screens/viewer-symbol-light.webp" width="880" alt="CodeGraph 浏览器查看器中的方法 IndexPaths::resolve：左侧是调用方，中间是标出每处调用的源码，右侧是它调用的函数。" />
+</picture>
 
 </div>
 
@@ -27,6 +32,8 @@ CodeGraph 把源码树转换成本地知识图谱：符号成为节点，调用�
   canonical 图谱输出。
 - **源码感知：** search、callers/callees、impact、文件源码和多文件探索共享同一索引。
 - **代理友好：** MCP 服务器暴露与 CLI 相同的图谱和逐字源码。
+- **可视化（预览）：** 本地浏览器查看器读取同一份索引：并排显示一个符号的调用方、
+  源码和被调用方，以及调用路径、架构图、类型层级和没有代码到达的符号。
 - **本地优先：** 索引位于项目内；共享 daemon 和 HTTP transport 都是本地进程。
 - **广泛语言覆盖：** grammar、嵌入式/模板文件以及 Godot、Tauri、JS 生态框架
   关系使用同一 schema。
@@ -225,6 +232,33 @@ codegraph skill update --dry-run --diff
 [`docs/mcp.md`](../mcp.md) 与
 [`editors/zed/README.md`](../../editors/zed/README.md)。
 
+## 浏览器查看器
+
+`codegraph ui` 在浏览器中以只读方式打开项目的索引。它目前是预览功能，未设置
+`CODEGRAPH_UI=1` 时会被拒绝：
+
+```bash
+CODEGRAPH_UI=1 codegraph ui              # 当前所在的已建立索引的项目
+CODEGRAPH_UI=1 codegraph ui --read-only  # 同时拒绝保存 Trail
+```
+
+它只监听 `127.0.0.1`，从不建立或修改索引，唯一写入的是你主动保存在
+`.codegraph/ui/trails/` 下的 Trail。它有深色和浅色两种主题，在你选择之前跟随系统设置。
+
+<table>
+  <tr>
+    <td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="../site/public/screens/viewer-flow-dark.webp" /><img src="../site/public/screens/viewer-flow-light.webp" alt="Flow 视图：从 cmd_explore 到 explore_file_header 的调用路径，每一跳附有发出调用的代码。" /></picture></td>
+    <td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="../site/public/screens/viewer-map-dark.webp" /><img src="../site/public/screens/viewer-map-light.webp" alt="Map 视图：本仓库的各个 crate 及其依赖关系，底层模块位于下方。" /></picture></td>
+  </tr>
+  <tr>
+    <td>Flow：从一个函数到另一个函数的调用路径</td>
+    <td>Map：模块及其依赖关系</td>
+  </tr>
+</table>
+
+网站上有每个视图的介绍：[浏览器查看器](https://firlab.app/codegraph/guide/viewer)。参考文档见
+[`docs/ui.md`](../ui.md)。
+
 ## 确定性与安全边界
 
 兼容性契约包括稳定 node ID、canonical golden artifact、SQLite schema parity、
@@ -263,6 +297,8 @@ canonical agent 契约 [`AGENTS.md`](../../AGENTS.md)。
 
 ## 文档
 
+- [firlab.app/codegraph](https://firlab.app/codegraph/) — 网站：指南、快速开始和查看器介绍
+  （[English](https://firlab.app/codegraph/en/)）
 - [`docs/README.md`](../README.md) — 文档地图
 - [`docs/architecture.md`](../architecture.md) — workspace 与运行时设计
 - [`docs/cli.md`](../cli.md) — 完整命令参考
@@ -272,6 +308,13 @@ canonical agent 契约 [`AGENTS.md`](../../AGENTS.md)。
 - [`docs/equivalence.md`](../equivalence.md) — 确定性 golden 契约
 - [`docs/upstream-sync/UPSTREAM.md`](../upstream-sync/UPSTREAM.md) — 上游台账
 - [`docs/troubleshooting.md`](../troubleshooting.md) — 诊断流程
+
+## 交流与反馈
+
+- 提问、问题报告和功能建议：[GitHub Issues](https://github.com/sunerpy/codegraph-rust/issues)。
+- 微信：公众号「六月水蓝」。
+
+<img src="../site/public/community/wechat-official-account.jpg" width="180" alt="微信公众号「六月水蓝」的二维码" />
 
 ## 许可证
 

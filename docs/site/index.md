@@ -270,6 +270,8 @@ cargo install --locked --git https://github.com/sunerpy/codegraph-rust codegraph
 
 <HomeScope />
 
-## 反馈
+## 交流与反馈
 
-问题报告和功能建议请提交到 [GitHub Issues](https://github.com/sunerpy/codegraph-rust/issues)。CodeGraph 以 MIT 许可发布。
+问题报告和功能建议请提交到 [GitHub Issues](https://github.com/sunerpy/codegraph-rust/issues)。使用微信扫码，可以关注公众号「六月水蓝」。CodeGraph 以 MIT 许可发布。
+
+<QrCode src="/community/wechat-official-account.jpg" alt="微信公众号「六月水蓝」的二维码" caption="公众号「六月水蓝」" />

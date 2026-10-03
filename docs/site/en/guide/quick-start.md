@@ -198,12 +198,78 @@ the command line's view of `codegraph_explore`, the tool coding agents call most
 
 ## 5. Follow calls and changes
 
-| Command                                | Lists                                                                                                                      |
-| -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `codegraph search applyDiscount -p .`  | the symbols whose name matches, best match first, with their location and signature                                        |
-| `codegraph callers applyDiscount -p .` | what calls or imports it: here `checkout` and the file `checkout.ts`                                                       |
-| `codegraph callees checkout -p .`      | what it calls: `applyDiscount`, `subtotal`, `tax`, and the `Cart` type it uses                                             |
-| `codegraph impact applyDiscount -p .`  | everything a change would reach, through callers of callers, grouped by file: here `checkout`, `checkout.ts` and `main.ts` |
+`search` finds symbols by name, best match first. `callers` and `callees` follow the calls one step, and `impact`
+follows callers of callers to everything a change would reach, grouped by file:
+
+::: code-group
+
+```text [search]
+$ codegraph search applyDiscount -p .
+
+Search Results for "applyDiscount":
+
+function    applyDiscount
+  src/pricing.ts:3
+  (amount: number, code?: string): number
+
+import      ./pricing
+  src/checkout.ts:2
+  import { applyDiscount, tax } from "./pricing";
+```
+
+```text [callers]
+$ codegraph callers applyDiscount -p .
+
+Callers of "applyDiscount" (2):
+
+applyDiscount (function) - src/pricing.ts:3
+
+function    checkout
+  src/checkout.ts:4
+
+file        checkout.ts [imports]
+  src/checkout.ts:1
+```
+
+```text [callees]
+$ codegraph callees checkout -p .
+
+Callees of "checkout" (4):
+
+checkout (function) - src/checkout.ts:4
+
+function    applyDiscount
+  src/pricing.ts:3
+
+method      subtotal
+  src/cart.ts:14
+
+function    tax
+  src/pricing.ts:8
+
+class       Cart [references]
+  src/cart.ts:7
+```
+
+```text [impact]
+$ codegraph impact applyDiscount -p .
+
+Impact of changing "applyDiscount" - 4 affected symbols:
+
+applyDiscount (function) - src/pricing.ts:3
+
+src/checkout.ts
+  function    checkout:4
+  file        checkout.ts:1
+
+src/main.ts
+  file        main.ts:1
+
+src/pricing.ts
+  function    applyDiscount:3
+```
+
+:::
 
 Each of them takes `--json` for scripts.
 

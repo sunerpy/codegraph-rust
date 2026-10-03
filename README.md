@@ -14,7 +14,12 @@ native binary. No AI or vector runtime inside the indexer.
 
 [English](README.md) · [简体中文](docs/readme/README.zh-CN.md) ·
 [Website](https://firlab.app/codegraph/en/) · [Documentation](docs/README.md) ·
-[Contributing](CONTRIBUTING.md)
+[Browser viewer](#browser-viewer) · [Community](#community) · [Contributing](CONTRIBUTING.md)
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/site/public/screens/viewer-symbol-dark.webp" />
+  <img src="docs/site/public/screens/viewer-symbol-light.webp" width="880" alt="The CodeGraph browser viewer showing the method IndexPaths::resolve: its callers on the left, its source with every call marked in the middle, and the functions it calls on the right." />
+</picture>
 
 </div>
 
@@ -31,6 +36,9 @@ LLM to rediscover structure through repeated text searches.
   exploration use one indexed representation.
 - **Agent-ready:** an MCP server exposes the same graph and verbatim source used by
   the CLI.
+- **Visual (preview):** a local browser viewer reads the same index: a symbol's
+  callers, source and callees side by side, call paths, an architecture map, type
+  hierarchies and the code nothing reaches.
 - **Local-first:** the index lives under the project; the shared daemon and HTTP
   transport are local processes.
 - **Broad language coverage:** grammar-backed languages, embedded/template files,
@@ -246,6 +254,35 @@ Full target and configuration matrices:
 [`docs/cli.md`](docs/cli.md), [`docs/mcp.md`](docs/mcp.md), and
 [`editors/zed/README.md`](editors/zed/README.md).
 
+## Browser viewer
+
+`codegraph ui` opens a local, read-only reader of the index in your browser. It is a
+preview, refused unless `CODEGRAPH_UI=1` is set:
+
+```bash
+CODEGRAPH_UI=1 codegraph ui              # the indexed project you are in
+CODEGRAPH_UI=1 codegraph ui --read-only  # also refuse saving trails
+```
+
+It binds `127.0.0.1` only, never builds or changes the index, and writes nothing but
+the trails you choose to save under `.codegraph/ui/trails/`. It has a dark and a light
+theme and follows the system's until you pick one.
+
+<table>
+  <tr>
+    <td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/site/public/screens/viewer-flow-dark.webp" /><img src="docs/site/public/screens/viewer-flow-light.webp" alt="The Flow view: the call path from cmd_explore to explore_file_header, each hop with the code that makes the call." /></picture></td>
+    <td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/site/public/screens/viewer-map-dark.webp" /><img src="docs/site/public/screens/viewer-map-light.webp" alt="The Map view: this repository's crates and the dependencies between them, foundations at the bottom." /></picture></td>
+  </tr>
+  <tr>
+    <td>Flow: the call path from one function to another</td>
+    <td>Map: modules and the dependencies between them</td>
+  </tr>
+</table>
+
+A tour of every view is on the website:
+[the browser viewer](https://firlab.app/codegraph/en/guide/viewer). The reference is
+[`docs/ui.md`](docs/ui.md).
+
 ## Determinism and safety
 
 The compatibility contract includes stable node IDs, canonical golden artifacts,
@@ -291,6 +328,8 @@ make check
 
 ## Documentation
 
+- [firlab.app/codegraph](https://firlab.app/codegraph/en/) — the website: guide, quick
+  start and a tour of the viewer ([简体中文](https://firlab.app/codegraph/))
 - [`docs/README.md`](docs/README.md) — documentation map
 - [`docs/architecture.md`](docs/architecture.md) — workspace and runtime design
 - [`docs/cli.md`](docs/cli.md) — complete command reference
@@ -300,6 +339,14 @@ make check
 - [`docs/equivalence.md`](docs/equivalence.md) — deterministic golden contract
 - [`docs/upstream-sync/UPSTREAM.md`](docs/upstream-sync/UPSTREAM.md) — upstream ledger
 - [`docs/troubleshooting.md`](docs/troubleshooting.md) — diagnostic workflow
+
+## Community
+
+- Questions, bug reports and feature requests:
+  [GitHub Issues](https://github.com/sunerpy/codegraph-rust/issues).
+- WeChat: the Official Account 六月水蓝.
+
+<img src="docs/site/public/community/wechat-official-account.jpg" width="180" alt="QR code of the WeChat Official Account 六月水蓝" />
 
 ## License
 
