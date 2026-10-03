@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.53.3](https://github.com/sunerpy/codegraph-rust/compare/v0.53.2...v0.53.3) (2026-10-03)
+
+
+### Bug Fixes
+
+* **cli:** pad the kind column in search, callers, callees and impact ([#314](https://github.com/sunerpy/codegraph-rust/issues/314)) ([72eefae](https://github.com/sunerpy/codegraph-rust/commit/72eefae04610a326e74f6a2119a30c1e26ad4704))
+
 ## [0.53.2](https://github.com/sunerpy/codegraph-rust/compare/v0.53.1...v0.53.2) (2026-10-03)
 
 
