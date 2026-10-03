@@ -208,6 +208,48 @@ fn callers_callees_text_output_render() {
 }
 
 #[test]
+fn text_rows_pad_the_kind_to_twelve_columns() {
+    // search, callers, callees and impact print `{kind:<12}{name}` like upstream's
+    // `kind.padEnd(12) + name`. Without padding the rows read `functionadd`.
+    let dir = TestDir::new("kind-column");
+    let project = indexed_project(&dir);
+    let p = project.to_str().unwrap();
+
+    let rows = |args: &[&str]| -> Vec<String> {
+        let run = run_in(dir.path(), args);
+        assert!(run.ok, "{args:?} must succeed: {}", run.stderr);
+        run.stdout.lines().map(str::to_string).collect()
+    };
+
+    let search = rows(&["search", "add", "-p", p]);
+    assert!(
+        search.iter().any(|line| line == "function    add"),
+        "search rows: {search:?}"
+    );
+    let callers = rows(&["callers", "add", "-p", p]);
+    assert!(
+        callers.iter().any(|line| line == "function    runDemo"),
+        "callers rows: {callers:?}"
+    );
+    let callees = rows(&["callees", "runDemo", "-p", p]);
+    assert!(
+        callees.iter().any(|line| line == "function    add"),
+        "callees rows: {callees:?}"
+    );
+    let impact = rows(&["impact", "add", "-p", p]);
+    for row in [
+        "  function    runDemo:3",
+        "  file        app.ts:1",
+        "  method      increment:8",
+    ] {
+        assert!(
+            impact.iter().any(|line| line == row),
+            "impact rows must include {row:?}: {impact:?}"
+        );
+    }
+}
+
+#[test]
 fn lookup_commands_refuse_fuzzy_only_symbol_matches() {
     let dir = TestDir::new("lookup-fuzzy-refusal");
     let project = indexed_project(&dir);

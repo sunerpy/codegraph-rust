@@ -8379,6 +8379,16 @@ mod formatter_and_env_tests {
     }
 
     #[test]
+    fn search_human_result_line_pads_the_kind_to_twelve_columns() {
+        // Upstream prints `kind.padEnd(12) + name`; the kind must not run into the name.
+        let sr = SearchResult {
+            node: query_test_node("myFunc"),
+            score: 1.0,
+        };
+        assert_eq!(format_search_result_line(&sr), "function    myFunc");
+    }
+
+    #[test]
     fn query_json_output_still_carries_raw_score() {
         // #1045: the percentage is dropped from the HUMAN output only. The
         // machine-readable --json output keeps the raw score for

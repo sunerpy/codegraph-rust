@@ -205,7 +205,8 @@ impl NodeKind {
 
 impl fmt::Display for NodeKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        // `pad`, not `write_str`: callers lay rows out with a width (`{:<12}`).
+        f.pad(self.as_str())
     }
 }
 
@@ -273,7 +274,8 @@ impl EdgeKind {
 
 impl fmt::Display for EdgeKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        // `pad`, not `write_str`: callers lay rows out with a width (`{:<12}`).
+        f.pad(self.as_str())
     }
 }
 
@@ -472,7 +474,8 @@ impl Language {
 
 impl fmt::Display for Language {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        // `pad`, not `write_str`: callers lay rows out with a width (`{:<12}`).
+        f.pad(self.as_str())
     }
 }
 
@@ -567,7 +570,8 @@ impl ReferenceSubkind {
 
 impl fmt::Display for ReferenceSubkind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        // `pad`, not `write_str`: callers lay rows out with a width (`{:<12}`).
+        f.pad(self.as_str())
     }
 }
 
@@ -661,6 +665,22 @@ mod tests {
         let round_tripped: Node = serde_json::from_value(value).expect("node deserializes");
 
         assert_eq!(round_tripped, node);
+    }
+
+    #[test]
+    fn display_honours_width_and_alignment() {
+        // The CLI lays rows out as `{:<12}{}` (upstream's `kind.padEnd(12)`); a Display that
+        // ignores the formatter's width prints `functionadd`.
+        assert_eq!(format!("{:<12}|", NodeKind::Function), "function    |");
+        assert_eq!(format!("{:>12}|", NodeKind::EnumMember), " enum_member|");
+        assert_eq!(format!("{:<8}|", EdgeKind::Calls), "calls   |");
+        assert_eq!(format!("{:^12}|", Language::TypeScript), " typescript |");
+        assert_eq!(
+            format!("{:<10}|", ReferenceSubkind::Autoload),
+            "autoload  |"
+        );
+        // A width narrower than the name never truncates it.
+        assert_eq!(format!("{:<3}", NodeKind::Function), "function");
     }
 
     #[test]
