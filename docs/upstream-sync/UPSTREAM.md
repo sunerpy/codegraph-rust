@@ -57,6 +57,11 @@
   global allocator of the static musl Linux builds. It is a release-build fix,
   not an upstream port, and changes no graph output. See the dated entries
   below, including the `v0.53.2` release record.
+- **Shipped in codegraph-rs `v0.53.3`, 2026-10-03:** #314. The kind column of
+  `search`, `callers`, `callees` and `impact` is padded the way upstream pads
+  it, and the store tests' lock probes use their caller's bound. It is a parity
+  fix, not an upstream port, and changes no graph or JSON output. See the dated
+  entries below, including the `v0.53.3` release record.
 - **UI family, phase 1 (browser viewer):** started after the owner selected the
   Penpot direction D design on 2026-10-02. The viewer — the `codegraph-ui`
   server over upstream `v1.6.1`'s `ui/` frontend, behind `CODEGRAPH_UI=1` as
@@ -166,6 +171,82 @@ below remain immutable historical evidence.
 > that records colby parity — do not infer it from `Cargo.toml`.
 
 ## Sync log
+
+### 2026-10-03 — `v0.53.3` RELEASED: #314 shipped
+
+Release-please PR [#315](https://github.com/sunerpy/codegraph-rust/pull/315)
+merged as `81bd7c711bb6fd680113f2a946e927d488c566d6`, and tag `v0.53.3` was cut
+at that exact commit.
+
+- The merge has the tree of the PR's head `b2f83bd`, `7e2db71…`.
+- The owner re-ran the bot's CI run and approved the PR as code owner.
+- The implementation PR #314 merged as `72eefae`, with the tree of its reviewed
+  head `603286d`. The kirocodex review passed in round 1, with no blocking
+  items.
+
+Release workflow run
+[`37143381806`](https://github.com/sunerpy/codegraph-rust/actions/runs/37143381806)
+passed all twelve jobs on its first attempt.
+
+- It ran over main CI run
+  [`37143381765`](https://github.com/sunerpy/codegraph-rust/actions/runs/37143381765),
+  whose required `CI Success` passed.
+- That run's informational Coverage job failed once, in
+  `git_pending::tests::a_system_attributes_file_is_a_conversion_risk`; see the
+  entry on stand-in executables below.
+- The release was published at 2026-10-03T18:25:40Z UTC.
+- The official `codegraph-0.53.3-x86_64-unknown-linux-musl.tar.gz` digest is
+  `769ca112ff554a82b9eabadabc11fa2f0322a40430e875244244a749e3330427`.
+
+Black-box acceptance of the downloaded release, against the official `v0.53.2`:
+
+- **Artifacts.** `SHA256SUMS` and `gh attestation verify` passed for all six
+  archives. The binary reports `codegraph 0.53.3`, and its `.comment` section
+  names rustc 1.98.0.
+- **The kind column.** On the mini fixture, `v0.53.2` prints `functionadd`;
+  `v0.53.3` prints the kind padded to twelve columns in all four commands,
+  for example `function    runDemo` from `callers`.
+- **JSON and graph.** The `--json` output of all four commands and
+  `codegraph export` are byte-identical to `v0.53.2`'s.
+- **Index.** An index built by `v0.53.2` reports `current` to `v0.53.3`; the
+  extraction version is unchanged.
+
+### 2026-10-03 — The kind column of the human output is padded
+
+Not an upstream port: a parity fix. Upstream's CLI prints
+`node.kind.padEnd(12)` before the name (`src/bin/codegraph.ts` at `v1.6.1`).
+The Rust rows use the same `{:<12}{}` layout, but `NodeKind`'s `Display` wrote
+its name with `write_str`, which ignores the formatter's width, so `search`,
+`callers`, `callees` and `impact` printed the kind and the name run together.
+
+#314 makes `NodeKind`, `EdgeKind`, `Language` and `ReferenceSubkind` format
+through `Formatter::pad`. Output written without a width is unchanged:
+`to_string()`, `--json` and the index.
+
+The same PR fixes the cross-process lock probes in the store tests. A probe
+always tried the lock with an 80 ms deadline, whatever bound its caller passed.
+The deadline was set before the child opened and validated the lock file, so on
+a slow Windows runner a probe of a free lock reported `TIMED_OUT`, as it did on
+main's CI at `c03fcbd`. Probes now take the caller's bound.
+
+### 2026-10-03 — Stand-in executables are run once before tests rely on them
+
+Not an upstream port. Three tests write a shell script and run it at once:
+git_pending's fake git, git_pending_fast_path's hanging git, and cli_ui's
+stand-in browser. When another thread of the same test binary forks while the
+script is still open for writing, the child keeps the inherited descriptor until
+it execs, and running the script meanwhile fails with `ETXTBSY`.
+
+- **The failure.** Main's Coverage job on `81bd7c7` failed this way: `git` read
+  the failed start as a failed git, and `conversion_risk` returned `None`.
+- **The reproduction.** On Linux, 8 threads forking `/bin/true` made 313 of
+  3,000 fresh scripts fail to start. Starting each script once, retrying while
+  the error is `ExecutableFileBusy`, left 0 failures in the 7,500 starts that
+  followed.
+- **The fix.** #317 (merged as `aef4efb`) adds that warm-up to the three
+  helpers. The hanging git now uses `exec sleep 30`, and its test checks that
+  the 300 ms timeout actually elapsed; before, a failed start could make the
+  test pass without the timeout ever running.
 
 ### 2026-10-03 — `v0.53.2` RELEASED: #310 shipped
 
