@@ -82,6 +82,9 @@ GitHub Releases publish these archive families:
 | Windows x86_64      | `x86_64-pc-windows-msvc`     | `.zip`    |
 | Windows ARM64       | `aarch64-pc-windows-msvc`    | `.zip`    |
 
+The Linux archives are static musl builds that allocate through mimalloc; the
+macOS and Windows archives use the platform allocator.
+
 Each release also includes `SHA256SUMS`. GitHub CLI users can additionally verify
 an archive's build provenance:
 

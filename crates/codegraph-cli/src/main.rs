@@ -42,6 +42,13 @@ mod installer;
 mod structural_gate;
 mod viewer_gate;
 
+/// musl's allocator serializes threads, so the static Linux release builds got
+/// slower as threads were added: a full index of this repository took over two
+/// minutes at 32 threads, against 51 s at one. Through mimalloc it takes 8 s.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Test-only: the ONE process-wide environment lock for this binary.
 ///
 /// `cargo test` runs every unit test of this binary on threads of a SINGLE

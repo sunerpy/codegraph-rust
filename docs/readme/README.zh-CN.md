@@ -76,6 +76,8 @@ GitHub Releases 发布以下归档系列：
 | Windows x86_64      | `x86_64-pc-windows-msvc`     | `.zip`    |
 | Windows ARM64       | `aarch64-pc-windows-msvc`    | `.zip`    |
 
+Linux 归档是静态链接的 musl 构建，内存分配走 mimalloc；macOS 与 Windows 归档使用系统分配器。
+
 每个 Release 还包含 `SHA256SUMS`。GitHub CLI 用户可进一步验证归档构建来源：
 
 ```bash

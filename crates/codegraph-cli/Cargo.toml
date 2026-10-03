@@ -44,6 +44,11 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 time = { workspace = true }
 
+# musl's allocator serializes threads; the static Linux release builds use
+# mimalloc instead. Other targets keep their system allocator.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { version = "0.1.52", default-features = false, features = ["v2"] }
+
 [dev-dependencies]
 rusqlite = { workspace = true }
 codegraph-bench = { path = "../codegraph-bench" }
