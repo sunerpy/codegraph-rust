@@ -19,6 +19,21 @@ CODEGRAPH_UI=1 codegraph ui --read-only    # 同时拒绝保存 Trail
 
 在任何页面按 `Ctrl+K`（macOS 上是 `⌘K`）都可以搜索符号或文件，也可以直接询问路径，例如 `how does checkout reach tax`。
 
+## Start（首页）
+
+<ScreenFigure src="/screens/viewer-home-light.webp" dark="/screens/viewer-home-dark.webp" width="1440" height="900" alt="本仓库在查看器中的首页：项目名称与索引状态、三个入口，以及索引构成、已保存的 Trail、被依赖最多的符号、代码从哪里开始运行、测试覆盖范围和按语言统计的文件。" />
+
+查看器打开时显示首页，内容全部来自已有的索引。项目名称和索引状态下方有三个入口：**Open the map**（打开结构图）、**Search**（搜索）和 **Read a flow**（阅读调用路径）。下方的卡片依次列出：
+
+- 图中包含的内容，按节点类型和边类型统计；
+- 你保存的 Trail；
+- 被最多代码依赖的生产代码符号；
+- 代码从哪里开始运行：在顶层执行代码的文件；索引中有路由时，列出路由；
+- 能到达最多其他文件的测试文件；
+- 按语言统计的已索引文件。
+
+点击任何名称都会打开对应的符号或文件；**All entry points**（全部入口）按文件分组列出所有入口。
+
 ## Symbol（符号）
 
 <ScreenFigure src="/screens/viewer-symbol-light.webp" dark="/screens/viewer-symbol-dark.webp" width="1440" height="900" alt="方法 IndexPaths::resolve 的 Symbol 视图：左侧是调用方，中间是标出每处调用的源码，右侧是它调用的函数。" />

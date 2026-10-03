@@ -25,6 +25,22 @@ It never builds or changes the index: index the project first with `codegraph in
 Press `Ctrl+K` (`⌘K` on macOS) anywhere to search for a symbol or a file, or to ask for a path such as
 `how does checkout reach tax`.
 
+## Start
+
+<ScreenFigure src="/screens/viewer-home-light.webp" dark="/screens/viewer-home-dark.webp" width="1440" height="900" alt="The viewer's start page for this repository: the project and its index state, three ways in, and cards for the index composition, saved trails, the most depended-on symbols, where the code starts, tests by reach and files by language." />
+
+The viewer opens on a start page built from what the index already holds. Under the project name and its index state
+are three ways in: **Open the map**, **Search** and **Read a flow**. The cards below show:
+
+- what the graph holds, by node and edge kind;
+- the trails you saved;
+- the production symbols the most code depends on;
+- where the code starts: the files that run something at their top level, or the routes when the index holds routes;
+- the test files that reach the most other files;
+- the indexed files by language.
+
+Every name opens its symbol or file, and **All entry points** lists every entry point, grouped by file.
+
 ## Symbol
 
 <ScreenFigure src="/screens/viewer-symbol-light.webp" dark="/screens/viewer-symbol-dark.webp" width="1440" height="900" alt="The Symbol view of the method IndexPaths::resolve: callers on the left, the source with each call marked in the middle, and the functions it calls on the right." />

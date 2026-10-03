@@ -2,8 +2,9 @@
 
 This page indexes a small project and asks it the questions CodeGraph is for, with the output you should see.
 
-You need CodeGraph installed ([Install](install.md)). Every command below takes the project with `-p`; run them in
-your own repository the same way.
+You need CodeGraph installed ([Install](install.md)). The commands below run in the project directory: `init` and
+`status` take the project as a positional `.`, and the queries take it with `-p .`. They work the same way in your own
+repository.
 
 ## A sample project
 

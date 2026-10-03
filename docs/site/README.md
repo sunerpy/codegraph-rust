@@ -122,7 +122,8 @@ CODEGRAPH_CHROME=/path/to/chrome docs/site/tools/capture-screens.sh target/relea
 
 `tools/capture-screens.sh` does four things:
 
-1. it extracts this repository at a fixed commit into a fresh `/tmp/codegraph-rust`, so no home path shows;
+1. it extracts this repository at a fixed commit into `codegraph-rust/` inside a new temporary directory, which it
+   removes, index included, when it exits;
 2. it writes the corpus's `.codegraph/config.toml`, which excludes the viewer bundle as `AGENTS.md` recommends;
 3. it indexes the corpus and serves it with `codegraph ui` on `127.0.0.1:4791`;
 4. it runs `tools/capture-screens.mjs`.
