@@ -6,7 +6,7 @@
   "placeholders": {
     "BINARY": "codegraph",
     "CRATE": "codegraph-rs",
-    "CURRENT_VERSION": "0.53.0",
+    "CURRENT_VERSION": "0.53.1",
     "DEFAULT_BRANCH": "main",
     "OWNER": "sunerpy",
     "PACKAGE_NAME": "codegraph-rs",

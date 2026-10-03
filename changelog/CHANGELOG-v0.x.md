@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.53.1](https://github.com/sunerpy/codegraph-rust/compare/v0.53.0...v0.53.1) (2026-10-03)
+
+
+### Bug Fixes
+
+* **resolve:** keep Rust method calls that lost their receiver off functions and std names ([#307](https://github.com/sunerpy/codegraph-rust/issues/307)) ([f9f96c3](https://github.com/sunerpy/codegraph-rust/commit/f9f96c33e1b4689a08bc4c0dce2a9ba755283341))
+
 ## [0.53.0](https://github.com/sunerpy/codegraph-rust/compare/v0.52.2...v0.53.0) (2026-10-03)
 
 
