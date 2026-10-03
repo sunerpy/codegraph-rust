@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.53.0](https://github.com/sunerpy/codegraph-rust/compare/v0.52.2...v0.53.0) (2026-10-03)
+
+
+### Features
+
+* **ui:** direction D design and a light theme ([#300](https://github.com/sunerpy/codegraph-rust/issues/300)) ([fee9ae7](https://github.com/sunerpy/codegraph-rust/commit/fee9ae78a78993dd677f0c0dfe643ca19e2e0aad))
+* **ui:** serve the upstream browser viewer ([#298](https://github.com/sunerpy/codegraph-rust/issues/298)) ([143752a](https://github.com/sunerpy/codegraph-rust/commit/143752aabea7b3a7e888efea6c61323dbec14101))
+
+
+### Bug Fixes
+
+* **sync:** re-resolve every edge a name's candidate change can move ([#303](https://github.com/sunerpy/codegraph-rust/issues/303)) ([a35e065](https://github.com/sunerpy/codegraph-rust/commit/a35e065e7ab984aa00ef9d4d46d6b5f2334599d7))
+
 ## [0.52.2](https://github.com/sunerpy/codegraph-rust/compare/v0.52.1...v0.52.2) (2026-10-01)
 
 
