@@ -1,90 +1,98 @@
-# ui/ — the `codegraph ui` viewer, and `@colbymchenry/codegraph-ui`
+# ui/ — the frontend of `codegraph ui`
 
-> **In codegraph-rs.** This tree was imported from upstream colbymchenry/codegraph
-> `v1.6.1` and is built here by `make ui` into `crates/codegraph-ui/viewer/`,
-> which the Rust binary embeds — see [`../docs/ui.md`](../docs/ui.md), the
-> canonical reference. Its look is direction D
-> ([`../docs/design/viewer-d.md`](../docs/design/viewer-d.md)) with a dark and a
-> light theme. The build, packaging and release passages below describe
-> upstream's npm monorepo, not this repository.
+The browser reader for an indexed project: Svelte 5 + Vite, built into
+`crates/codegraph-ui/viewer/`, embedded in the `codegraph` binary and served
+over loopback by `codegraph ui`. [`../docs/ui.md`](../docs/ui.md) is the
+reference for the command, its JSON API, its boundary and what it does
+differently from upstream; this file is about the frontend itself.
 
-One source tree, two builds.
+The tree was imported from upstream colbymchenry/codegraph `v1.6.1` (MIT, see
+[`LICENSE`](LICENSE)) and keeps upstream's formatting, so a later upstream sync
+can still diff it. Two things are local layers on top, and
+[`../docs/upstream-sync/UPSTREAM.md`](../docs/upstream-sync/UPSTREAM.md) records
+both for that sync to re-apply:
 
-- **The app** — the browser reader for an indexed project: Svelte 5 + Vite,
-  built as static files into `../dist/viewer` and served by the CLI over
-  loopback.
-- **The library** — the same components, packaged with `svelte-package` into
-  `dist/` as `@colbymchenry/codegraph-ui`, so a host (CodeGraph Pro) renders
-  the Symbol view, the Flow strip and the Map over its **own** graph reads.
+- the look: direction D
+  ([`../docs/design/viewer-d.md`](../docs/design/viewer-d.md)), with a dark and
+  a light theme;
+- this README.
 
-They are one tree on purpose. A forked component is a second answer to the same
-question about the same graph, and sooner or later the two get quoted against
-each other in a review.
-
-An npm workspace of the engine, so `npm ci` at the repo root installs the
-toolchain for both.
-
-Design spec (every token, size and measurement): upstream's
-`docs/design/codegraph-ui-design-spec.md`; in codegraph-rs,
-[`../docs/design/viewer-d.md`](../docs/design/viewer-d.md).
+Upstream also packages these components as `@colbymchenry/codegraph-ui` from
+`src/index.ts`. That entry is kept, but this repository builds only the app.
 
 ## Build
 
+The toolchain is pinned in `package.json` and `package-lock.json`, and `npm ci`
+is the only install path. From the repository root:
+
 ```bash
-npm run build          # from the repo root: tsc -> copy-assets -> this app
-npm run build:ui       # just the app, plus the dist assertion
-npm run build:lib      # the LIBRARY: svelte-package -> ui/dist, plus its checks
-npm run dev -w ui      # Vite dev server on 127.0.0.1:5174
-npm run check -w ui    # svelte-check
+make ui          # npm ci, then vite build into crates/codegraph-ui/viewer/
+make ui-check    # npm ci, svelte-check, vitest, a fresh build, and a byte check
 ```
 
-`build:lib` is deliberately not part of `npm run build`: the CLI does not need
-it, and a release that fails because a component library would not compile is a
-release that failed for the wrong reason.
+Inside `ui/`:
 
-`npm run build` emits **`dist/viewer/`** (`index.html` + hashed assets).
-`scripts/check-ui-build.mjs` then asserts the tree is complete, so a broken UI
-build fails the release instead of shipping a CLI that serves a 404. The same
-check runs again in `scripts/build-bundle.sh` (after the bundle stage copies
-`dist`) and in `scripts/pack-npm.sh` (after each archive is unpacked).
-
-### Why `dist/viewer` and not `dist/ui`
-
-`src/ui/` is the engine's **terminal** UI (shimmer progress and its worker) and
-tsc compiles it to `dist/ui/`. Pointing Vite there deletes those modules — the
-CLI then dies at startup with `Cannot find module '../ui/shimmer-progress'` —
-and would also leave the static server handing out compiled engine internals.
-`check-ui-build.mjs` re-asserts the compiled engine is intact after every UI
-build so that mistake cannot land twice.
-
-## `@colbymchenry/codegraph-ui`
-
-```svelte
-<script lang="ts">
-  import { CodegraphUi, SymbolView, FlowStrip, ArchitectureMap }
-    from '@colbymchenry/codegraph-ui';
-  import '@colbymchenry/codegraph-ui/theme.css';
-</script>
-
-<CodegraphUi adapter={myAdapter} nav={myNavigation}>
-  <SymbolView id={symbolId} line={null} />
-</CodegraphUi>
+```bash
+npm run check    # svelte-check
+npm test         # vitest: the suites in tests/
+npm run dev      # Vite on 127.0.0.1:5174, with no API behind it
 ```
 
-Exports: `SymbolView`, `FlowStrip`, `ArchitectureMap`, `FileView`,
-`FileSourceView`, `EntryPointsView`, `DeadCodeView`, `TypeHierarchy`, `TrailBar`,
-`SavedTrails`, `SearchPalette`, `PalettePanel`, `PaletteRows`, `DriftBanner`,
-`KindGlyph`, `ExportButtons`, `CodegraphUi` — plus every pure model function the screens are
-built from (`buildCalleeRail`, `buildFlowLayout`, `buildMapLayout`,
-`buildHierarchyModel`, `tokensByLine`, …) and the `Wire*` types an adapter
-answers in.
+The bundle is committed. The crate's `build.rs` embeds every file under
+`crates/codegraph-ui/viewer/`, so `cargo build` and `cargo install --git` never
+need Node. `make ui-check` is the CI `UI` job and part of `make pre-ci`. It
+fails when the committed bundle is not byte-for-byte a fresh build, so a change
+to `src/` lands together with the bundle `make ui` rebuilt from it.
 
-`TypeHierarchy` is the one screen that takes its data as a prop rather than
-asking the adapter: it is part of `SymbolView`'s payload (`/api/node`'s
-`hierarchy`), so a host that already holds a `WireSymbolPayload` can render the
-tree on its own without a second read.
+`npm run dev` serves the app on its own, so every `/api/…` request it makes
+fails. To work against a real index, add a `server.proxy` for `/api` to your
+local `vite.config.ts` that points at a running
+`CODEGRAPH_UI=1 codegraph ui --no-open --port <N>`. Or rebuild with `make ui`
+and run the binary.
 
-### The adapter is the only way data arrives
+## Layout
+
+```
+src/
+  main.ts                 fonts, the stored theme, mounts App into index.html's #app
+  index.ts                upstream's library entry; kept, not built here
+  app.css                 the shell grid and the primitives (islands, pills, buttons, …)
+  lib/theme.css           the design tokens: Daylight (light) and Nebula (dark)
+  lib/theme-choice.svelte.ts  System / Dark / Light, stored and applied as data-theme
+  lib/icons.ts            Lucide icon geometry (ISC), drawn as CSS masks by Icon
+  lib/adapter.ts          GraphAdapter, createHttpAdapter, the registry
+  lib/wire.ts             every Wire* payload shape — types only, no runtime
+  lib/api.ts              the screens' calls, one line each, over the adapter
+  lib/navigation.ts       href builders + navigate, behind a driver
+  lib/destinations.ts     what the nav rail, the phone tab bar and the More sheet offer
+  App.svelte              nav rail / command bar / trail ribbon / main, global keys
+  lib/router.svelte.ts    hash router: #/s/<id>, #/file/<path>, #/map, #/flow, #/entry, …
+  lib/trail.svelte.ts     the walked path; mirrored into the `t` query param
+  lib/trails.svelte.ts    saved trails: one shared fetch, and the two writes
+  lib/trails-model.ts     what a saved trail's row says, incl. its decay (pure)
+  lib/kinds.ts            kind glyph letters
+  lib/symbol-model.ts     the Symbol view's rails and callee rows (pure)
+  lib/map-model.ts        the Map's deterministic layered layout (pure)
+  lib/flow-model.ts       the Flow strip's card/link geometry + the end cap — a DAG (pure)
+  lib/filecode-model.ts   the whole-file view: fixed line height, arcs, paging (pure)
+  lib/hierarchy-model.ts  the type hierarchy's tree geometry (pure)
+  lib/entry-model.ts      the entry-points panel: rows, file groups, flow arming (pure)
+  lib/screens-model.ts    the Screens view: layering by distance from the entry, edge labels, pill lanes (pure)
+  lib/export-svg.ts       the Flow strip and the Map as a standalone SVG (pure)
+  lib/export-image.ts     rasterising that SVG to PNG, clipboard and download
+  lib/live.svelte.ts      /api/events: two counters every screen refreshes from
+  lib/toast.svelte.ts     the one transient note ("Index updated · reloaded")
+  components/             NavRail, TopBar (the command bar), TrailBar, PhoneTabBar, MoreSheet, ThemeSwitch, SearchPalette, SavedTrails, KindGlyph, Icon, DriftBanner, ErrorCard, Toast, ExportButtons, map/, flow/, symbol/, file/, entry/, screens/, steps/
+  views/                  one component per route
+tests/                    the vitest suites, one per model or behaviour
+```
+
+Fonts (Inter and JetBrains Mono, both variable) are vendored through
+`@fontsource-variable` and emitted with the bundle's assets — never inlined, so
+the server's `font-src 'self'` policy holds: a local reader must work offline
+and must not announce the project to a font CDN.
+
+## The adapter is the only way data arrives
 
 ```ts
 interface GraphAdapter {
@@ -97,46 +105,55 @@ interface GraphAdapter {
   fileCode(path, signal?): Promise<WireFileCodePayload>;
   flow(request, signal?): Promise<WireFlowPayload>;
   map(request?, signal?): Promise<WireMapPayload>;
+  screens(signal?): Promise<WireScreensPayload>;
   routes(request?, signal?): Promise<WireRoutes>;
   entryPoints(request?, signal?): Promise<WireEntryPoints>;
   deadCode(request?, signal?): Promise<WireDeadCode>;
   trails(signal?): Promise<WireTrails>;
 
-  // The only mutating pair, and the only optional methods besides `events`.
+  // Optional.
+  steps?(request, signal?): Promise<WireStepsPayload>;
   saveTrail?(request, signal?): Promise<WireTrails>;
   deleteTrail?(id, signal?): Promise<WireTrails>;
-  events?(handlers): () => void;   // optional: the live channel
+  events?(handlers): () => void;   // the live channel
 }
 ```
 
-The shapes are exactly what `src/ui-server/api/` serialises, and they live in
-`src/lib/wire.ts` — no imports, no runtime — so a host can depend on the
-vocabulary without depending on the viewer. The default implementation,
-`createHttpAdapter()`, is the loopback JSON API; a host that already holds the
-index implements the same thirteen required methods against its own reads and
-never makes an HTTP request. `scripts/check-ui-package.mjs` asserts that no module in the
-built package but `lib/adapter.js` touches the network, because a screen that
-reached past the adapter would be a screen that ignored the host.
+The shapes are what `crates/codegraph-ui/src/api/` serialises, upstream's wire
+format kept as it is, and they live in `src/lib/wire.ts`, which has no imports
+and no runtime. The app runs every screen on `createHttpAdapter()`, the loopback
+JSON API.
+
+`steps` is optional, and `createHttpAdapter()` leaves it out, because the Rust
+server does not build Steps yet. The Steps view therefore says it cannot draw
+steps.
 
 `events` is optional. Omit it and nothing connects and nothing polls; a host
 that learns about a sync some other way calls `live.signal('index')` instead,
 which is the same code path the stream uses.
 
 `saveTrail` / `deleteTrail` are optional for a different reason: they are the
-only methods in the interface that CHANGE anything, and a host must be able to
-render the reader without inheriting a write it never asked for. Omit them and
-`TrailBar` grows no Save button and `SavedTrails` says the host does not store
-them — the same thing it does when `trails()` answers `readOnly: true`, which is
-how a host that *can* store them declines a particular project. `trails()` itself
-is required: a host with nowhere to keep them answers an empty read-only list, so
-the screen is explained rather than silently missing.
+only methods in the interface that CHANGE anything, and a reader must be able to
+render without inheriting a write it never asked for. Omit them and `TrailBar`
+grows no Save button and `SavedTrails` says the host does not store them — the
+same thing it does when `trails()` answers `readOnly: true`, which is what
+`codegraph ui --read-only` does. `trails()` itself is required: a host with
+nowhere to keep them answers an empty read-only list, so the screen is
+explained rather than silently missing.
+
+`TypeHierarchy` is the one screen that takes its data as a prop rather than
+asking the adapter: it is part of `SymbolView`'s payload (`/api/node`'s
+`hierarchy`), so whoever already holds a `WireSymbolPayload` can render the tree
+without a second read.
 
 ### Three things that will bite
 
-1. **Import `theme.css` once.** Every component paints from the design tokens.
-   Override any variable on a narrower selector — including on a container,
-   since custom properties inherit; `<CodegraphUi theme="light">` uses exactly
-   that to put a light reader inside a dark application.
+1. **The tokens are the only colours.** Every component paints from
+   `lib/theme.css`. Daylight sits on the bare `:root`; Nebula sits under
+   `prefers-color-scheme: dark` and `[data-theme='dark']`. Both sets use the
+   same names, so a new colour is a token in both. `tests/theme-contrast.test.ts`
+   fails when a declared text/surface pair drops under 4.5:1, when the copies of
+   a set drift apart, or when the SVG export's palettes stop matching them.
 2. **The adapter and the navigation driver are module-level, not context.** The
    pure model modules are plain TypeScript and cannot read a component's
    context, so one page reads one project. `<CodegraphUi>` installs them during
@@ -144,7 +161,7 @@ the screen is explained rather than silently missing.
    (`{#key project}`), not swapping the prop.
 3. **Geometry is not themable.** 44px callee rows, the 288/320px rails, the 20px
    code line: the Symbol view measures these against each other to put a callee
-   row beside the line that calls it. Colour and type are yours.
+   row beside the line that calls it.
 
 ### Navigation
 
@@ -156,58 +173,8 @@ because middle-click, cmd-click and "copy link address" are how people read
 code.
 
 The app's half — parsing the hash, holding the live route — is
-`src/lib/router.svelte.ts`, which attaches `hashchange`/`popstate` listeners at
-module scope and is therefore **pruned out of the published package**. Nothing a
-host imports may drag a hash router into its application.
-
-### Versioning and publishing
-
-The package is versioned with the engine (`scripts/sync-ui-version.mjs` runs on
-every `build:lib`): `@colbymchenry/codegraph-ui@X.Y.Z` is the reader for
-`codegraph@X.Y.Z`, because the payload shapes are versioned with the binary that
-serves them.
-
-It is **prepared, not published.** `"private": true` in `package.json` is the
-guard — npm refuses to publish it — and `scripts/pack-npm.sh` only builds the
-tarball when `CODEGRAPH_PACK_UI=1`, into `release/npm-ui/` (never
-`release/npm/`, whose `codegraph-*` glob the release workflow publishes).
-Publishing is the maintainer's call and takes two deliberate edits.
-
-## Layout
-
-```
-src/
-  index.ts                the LIBRARY's entry — everything the package exports
-  main.ts                 fonts + tokens, mounts App into index.html's #app
-  app.css                 the app's reset, shell grid and primitives
-  lib/theme.css           the design tokens (light/dark) + the Svelte Flow map
-  lib/adapter.ts          GraphAdapter, createHttpAdapter, the registry
-  lib/wire.ts             every Wire* payload shape — types only, no runtime
-  lib/api.ts              the screens' calls, one line each, over the adapter
-  lib/navigation.ts       href builders + navigate, behind a driver
-  App.svelte              top bar / trail bar / main, global keys
-  lib/router.svelte.ts    hash router: #/s/<id>, #/file/<path>, #/map, #/flow, #/entry
-  lib/trail.svelte.ts     the walked path; mirrored into the `t` query param
-  lib/trails.svelte.ts    saved trails: one shared fetch, and the two writes
-  lib/trails-model.ts     what a saved trail's row says, incl. its decay (pure)
-  lib/kinds.ts            kind glyph letters
-  lib/map-model.ts        the Map's deterministic layered layout (pure)
-  lib/flow-model.ts       the Flow strip's card/link geometry + the end cap — a DAG (pure)
-  lib/filecode-model.ts   the whole-file view: fixed line height, arcs, paging (pure)
-  lib/entry-model.ts      the entry-points panel: rows, file groups, flow arming (pure)
-  lib/screens-model.ts    the Screens view: layering by distance from the entry, edge labels, pill lanes (pure)
-  lib/export-svg.ts       the Flow strip and the Map as a standalone SVG (pure)
-  lib/export-image.ts     rasterising that SVG to PNG, clipboard and download
-  lib/live.svelte.ts      /api/events: two counters every screen refreshes from
-  lib/toast.svelte.ts     the one transient note ("Index updated · reloaded")
-  components/             NavRail, TopBar (the command bar), TrailBar, PhoneTabBar, MoreSheet, SavedTrails, KindGlyph, Icon, DriftBanner, ErrorCard, Toast, ExportButtons, map/, flow/, symbol/, file/, entry/, screens/
-  views/                  one component per route
-```
-
-Fonts (Inter and JetBrains Mono, both variable) are vendored through
-`@fontsource-variable` and emitted with the bundle's assets — never inlined, so
-the server's `font-src 'self'` policy holds: a local reader must work offline
-and must not announce the project to a font CDN.
+`src/lib/router.svelte.ts`. It attaches `hashchange`/`popstate` listeners at
+module scope, which is why upstream keeps it out of the component library.
 
 ## Export
 
@@ -234,7 +201,7 @@ Mono, so the code grid survives and only the letterforms change.
 
 | hash | view |
 |---|---|
-| `#/` | nothing selected |
+| `#/` | Start: the project and what its index holds |
 | `#/s/<id>?hl=<line>&t=<trail>` | symbol view |
 | `#/file/<path>?hl=<line>` | file view — outline in source order |
 | `#/file/<path>?src=1` | file view — the whole file's source, with ports and call arcs |
@@ -243,7 +210,9 @@ Mono, so the code grid survives and only the letterforms change.
 | `#/flow?symbols=a,b,c` | flow strip — `codegraph_explore`'s own question |
 | `#/flow?t=<trail>` | flow strip — the trail you walked, read as a flow |
 | `#/entry` | entry points — routes, files that run something, tests, hubs |
+| `#/dead?exported=1` | dead code — `exported=1` widens it to exported symbols |
 | `#/screens` | screens — the app's screens and the transitions between them |
+| `#/steps?anchor=&symbol=&depth=&through=1&view=order` | steps — what happens from a screen or a symbol |
 
 ## Entry points
 
@@ -271,11 +240,14 @@ draws, the same identity the search palette rests its keyboard on.
 
 `#/screens` draws `/api/screens` — the app as its user meets it: one box per
 screen, an arrow for every way of getting from one to another, and on each
-arrow the condition under which it happens. The canvas is the Map's layout
-engine (`buildMapLayout`) driven by `screens-model.ts` with three options the
-Map never sets, because a screens graph differs from a module graph in one way
-that shapes the whole picture: it is full of cycles. Every screen returns to
-Home.
+arrow the condition under which it happens. This server answers upstream's "no
+screen navigation" result until the navigation resolvers are ported, so here
+the canvas is exercised by its suite rather than by an index.
+
+The canvas is the Map's layout engine (`buildMapLayout`) driven by
+`screens-model.ts` with three options the Map never sets, because a screens
+graph differs from a module graph in one way that shapes the whole picture: it
+is full of cycles. Every screen returns to Home.
 
 - **Layering is distance from the entry screen**, measured over every
   transition — not longest path over a two-cycle-broken set. Shared chrome (a
@@ -289,7 +261,7 @@ Home.
   so it is drawn around the boxes rather than through them; a transition
   between two screens on one row arches over the row, top to top. A hub widens
   so its ports are at least 12px apart (`portPitch`), and rows are 116px apart
-  instead of the Map's 74 (`layerGap`), because the edges here carry labels.
+  instead of the Map's 44 (`layerGap`), because the edges here carry labels.
 - **Lines fan out instead of stacking.** Drawn through one midpoint, every
   line between two rows crosses that height at its middle, and a line to a
   screen far to the side is nearly horizontal there — a hub's lines run stacked
@@ -323,7 +295,7 @@ Home.
 
 The geometry — ports, curves, pill lanes — is arithmetic in `screens-model.ts`
 and `map-model.ts`, tested without a browser in
-`__tests__/ui-screens-model.test.ts`.
+`tests/ui-screens-model.test.ts`.
 
 ## Where the graph stops
 
@@ -343,25 +315,26 @@ Two rules hold it together:
   same place ran out for the same reason, and two caps side by side would read
   as two different findings.
 
-The verdict itself is not computed here or in the server: it is
-`findDynamicBoundaries` in `src/graph/dynamic-boundary-report.ts`, the same
-detector `codegraph_explore` announces boundaries with.
+The verdict itself is not computed here. The server's `find_dynamic_boundaries`
+(`crates/codegraph-ui/src/api/boundary.rs`) runs `scan_dynamic_dispatch` from
+`codegraph_mcp::dynamic_boundaries`, the same detector `codegraph_explore`
+announces boundaries with.
 
 ## The type hierarchy
 
 A class, interface, struct, trait or enum carries a `hierarchy` on its
 `/api/node` payload: ancestors up, subtypes down, and the fan an interface call
 dispatches into. `buildHierarchyModel` turns it into a tree whose geometry is
-arithmetic — 24px rows, 22px of indent per descendant level, orthogonal 1px
-connectors computed from those two numbers. Nothing is measured; the same
-payload always draws the same picture.
+arithmetic — 26px rows (`HIER_ROW_H`), 28px of indent per descendant level
+(`HIER_INDENT`), connectors computed from those two numbers. Nothing is
+measured; the same payload always draws the same picture.
 
 The details worth knowing before changing it:
 
 - **`extends` is solid, `implements` dashed `4 3`, a synthesized edge dashed
-  `6 3`** with a `via <mechanism>` pill. In Go, `System` satisfies `Clock`
-  without either file naming the other and the edge exists only because the
-  resolver made it — the block says so rather than drawing it like a parse.
+  `6 3`** with a `via <mechanism>` pill. The Rust index synthesizes no
+  dynamic-dispatch edges, so this server never sends that last kind, and a Go
+  interface's implicit implementations are not part of its tree.
 - **Overrides on the members outline are a NAME match**, not an `overrides`
   edge (nothing in the engine emits one). They are matched against the nearest
   ancestor that declares the name and are blind to signatures, and the tooltip
@@ -370,10 +343,10 @@ The details worth knowing before changing it:
   reader looking at an interface gets every direct implementation before any
   subclass of one appears at all.
 
-The walk is not computed here or in the server: it is `buildTypeHierarchy` in
-`src/graph/type-hierarchy.ts`, whose `countImplementers` is also the number
-`codegraph_explore` prints when it announces an interface dispatch — so "N types
-implement X" is the same N wherever you read it.
+The walk is not computed here: it is `build_type_hierarchy` in
+`crates/codegraph-graph/src/hierarchy.rs`. Upstream's `countImplementers`, which
+upstream's `codegraph_explore` prints when it announces an interface dispatch,
+is not ported.
 
 ## Live updates
 
@@ -394,11 +367,11 @@ counter into a single call; the Map and the Flow strip instead read
 
 Reconnection is ours, not `EventSource`'s: each failure closes the stream and
 schedules ONE retry on a backoff that ends after eight attempts (~90 s), at
-which point the top bar says "Not live" and nothing more is requested until the
-tab is focused again. A `degraded` event — the server's watcher gave up — is
+which point the command bar says "Not live" and nothing more is requested until
+the tab is focused again. A `degraded` event — the server's watcher gave up — is
 shown the same way and never answered with a poll.
 
 Node ids and file paths are encoded per slash-separated segment, so
-`#/file/src/mcp/tools.ts` stays readable and still round-trips a segment
-containing a reserved character. Build hashes with `symbolHref()` /
+`#/file/crates/codegraph-ui/src/api/mod.rs` stays readable and still round-trips
+a segment containing a reserved character. Build hashes with `symbolHref()` /
 `fileHref()` / `mapHref()` / `flowHref()` rather than by hand.

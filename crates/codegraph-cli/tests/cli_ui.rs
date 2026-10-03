@@ -123,10 +123,7 @@ impl Viewer {
                         break;
                     }
                 }
-                Err(_) => {
-                    let _ = viewer.child.kill();
-                    panic!("codegraph ui never printed a URL:\n{}", viewer.output);
-                }
+                Err(_) => panic!("codegraph ui never printed a URL:\n{}", viewer.output),
             }
         }
         viewer
@@ -148,7 +145,16 @@ impl Viewer {
         true
     }
 
-    fn stop(mut self) {
+    fn stop(self) {
+        drop(self);
+    }
+}
+
+/// A failing assertion unwinds through here too. `Child` neither kills nor
+/// waits when dropped, so without this a test that fails while its server
+/// runs leaves that server running after the test binary exits.
+impl Drop for Viewer {
+    fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }

@@ -34,6 +34,21 @@ a second positional argument to a research command. If the index is unavailable,
 follow `status` recovery guidance; do not initialize or rebuild unless requested
 or required by that guidance.
 
+The committed viewer bundle in `crates/codegraph-ui/viewer/` is minified
+`make ui` output. Indexed, it adds about 3,300 symbols, nine in ten of them with
+one- or two-letter names, that crowd the most-depended-on and entry-point lists,
+and every name it shares with real code lowers that name's exact-match
+confidence. Keep it out of a local index with `.codegraph/config.toml`, which is
+local and never committed; `codegraph sync .` (or a running daemon) applies it:
+
+```toml
+[app]
+name = "codegraph-rust"
+
+[indexing]
+exclude = ["crates/codegraph-ui/viewer/"]
+```
+
 ## Hard invariants
 
 1. **Deterministic graph output.** Identical source and configuration must produce

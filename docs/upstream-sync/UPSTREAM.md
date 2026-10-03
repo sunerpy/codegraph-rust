@@ -148,6 +148,16 @@ below remain immutable historical evidence.
 
 ## Sync log
 
+### 2026-10-03 — `ui/README.md` rewritten for this repository
+
+The imported frontend README described upstream's npm monorepo: its build, the
+`@colbymchenry/codegraph-ui` package and its publishing, and engine files under
+`src/`. It now describes this repository: `make ui` and `make ui-check`, the
+committed bundle the crate embeds, the Rust files behind the server and the
+engine, and what the Rust server does not send yet. Its frontend-design sections
+are upstream's, with their paths, numbers and claims checked against this tree.
+A later sync of upstream `ui/` keeps this README rather than taking upstream's.
+
 ### 2026-10-03 — browser viewer RESTYLED: direction D, a local design layer
 
 The ported viewer's frontend now carries the design the owner selected
