@@ -53,6 +53,10 @@
   resolution gates for Rust method calls whose receiver the extractor dropped,
   with extraction version 21. See the dated entries below, including the
   `v0.53.1` release record.
+- **Shipped in codegraph-rs `v0.53.2`, 2026-10-03:** #310, mimalloc as the
+  global allocator of the static musl Linux builds. It is a release-build fix,
+  not an upstream port, and changes no graph output. See the dated entries
+  below, including the `v0.53.2` release record.
 - **UI family, phase 1 (browser viewer):** started after the owner selected the
   Penpot direction D design on 2026-10-02. The viewer — the `codegraph-ui`
   server over upstream `v1.6.1`'s `ui/` frontend, behind `CODEGRAPH_UI=1` as
@@ -162,6 +166,85 @@ below remain immutable historical evidence.
 > that records colby parity — do not infer it from `Cargo.toml`.
 
 ## Sync log
+
+### 2026-10-03 — `v0.53.2` RELEASED: #310 shipped
+
+Release-please PR [#311](https://github.com/sunerpy/codegraph-rust/pull/311)
+merged as `0b97144c3bc3c45b07aa07206dc73443030f4d36` and cut tag `v0.53.2` at
+that exact commit, with the tree of its head `f4e3103`. The bot's CI run was
+re-run by the owner. The implementation PR #310 merged as `a52a64c`, with the
+tree of its reviewed head `9bbf9be`; the kirocodex review passed in round 2
+(1 → 0).
+
+Release workflow run
+[`37118263946`](https://github.com/sunerpy/codegraph-rust/actions/runs/37118263946)
+passed all twelve jobs on its first attempt, over main CI run
+[`37118263952`](https://github.com/sunerpy/codegraph-rust/actions/runs/37118263952).
+Its two musl build jobs compiled mimalloc's C through zig. The release was
+published at 2026-10-03T11:14:07Z UTC. The
+official `codegraph-0.53.2-x86_64-unknown-linux-musl.tar.gz` digest is
+`b4d55e4c998568877c0afc1032e05304e16cc1b55dd5626665d2154ee414c6d4`.
+
+Black-box acceptance of the downloaded release, against the official
+`v0.53.1`:
+
+- `SHA256SUMS` and `gh attestation verify` passed for all six archives. The
+  binary reports `codegraph 0.53.2`, and its `.comment` section names rustc
+  1.98.0.
+- **Allocator:** both Linux binaries are statically linked and contain
+  mimalloc. The macOS and Windows binaries contain no `mimalloc` string.
+- **Speed:** on the archive of `d26df90`, three runs at 32 threads took
+  8.11–9.19 s against `v0.53.1`'s 110.1 s, 12.0–13.6× faster. Each was also
+  faster than the same binary's 13.25 s at 4 threads. All eight timed runs
+  exited 0 and produced the same graph.
+- **Graph output:** nodes, edges, unresolved references and file rows are
+  identical to `v0.53.1`'s.
+
+### 2026-10-03 — The musl release builds allocate through mimalloc
+
+Not an upstream port. The official Linux archives are static musl builds, and
+indexing with them got slower as threads were added. musl's allocator
+serializes threads, while extraction and resolution allocate in parallel
+through rayon. On the owner's go-ahead the same day, #310 makes mimalloc the
+global allocator on `target_env = "musl"` only:
+
+- the `mimalloc` crate 0.1.52 with feature `v2`, which bundles mimalloc 2.3.2
+  (MIT);
+- a target-gated dependency, so glibc, macOS and Windows builds keep their
+  system allocator and their dependency graph;
+- one `#[global_allocator]` static in the shipped binary, which is also the
+  daemon.
+
+**Why v2.** With its defaults, v3 peaked at 740–750 MB at 32 threads. The crate
+exposes no feature for the settings that lower it, and a shipped binary cannot
+rely on environment variables. v2 peaked at about 500 MB with no tuning.
+
+**Measurement.** The corpus is an archive of `d26df90` (689 files, viewer
+bundle excluded). The command is `codegraph init` with `RAYON_NUM_THREADS` set,
+on a 32-core Linux host, with the Release workflow's toolchain (zig 0.15.1,
+cargo-zigbuild 0.23.0, rustc 1.98.0). Each figure is wall time and peak RSS
+from `/usr/bin/time`. Each cell is one run, except #310 at 32 threads, which
+ran three times.
+Every timed run had to exit 0 and produce the same complete graph (141,628
+canonical rows, hashed after each run).
+
+| threads | `v0.53.1` (musl) | #310 (musl) | local glibc build |
+| --- | --- | --- | --- |
+| 32 | 122.2 s / 249 MB | 7.98–8.42 s / 497–506 MB | 5.20 s / 354 MB |
+| 4 | 68.1 s / 195 MB | 12.8 s / 252 MB | 12.1 s / 227 MB |
+| 1 | 50.6 s / 188 MB | 36.0 s / 218 MB | 38.3 s / 200 MB |
+
+Graph output is unchanged. Nodes, edges, unresolved references and file rows
+match `v0.53.1`'s over every non-timestamp column, so there is no
+extraction-version bump and no golden change. Both musl targets were built
+locally with that toolchain before merge; the `aarch64` binary was built but
+not run.
+
+**Review.** The plan passed the kirocodex plan gate in round 2 (1 → 0); round
+1 asked for the Chinese README mirror. The diff review passed in round 2
+(1 → 0). Round 1 found that the timing harness could report a failed run as a
+time. The numbers above come from the fixed harness, which was shown to stop on
+a failed run, a missing index, and a different graph.
 
 ### 2026-10-03 — `v0.53.1` RELEASED: #307 shipped
 
