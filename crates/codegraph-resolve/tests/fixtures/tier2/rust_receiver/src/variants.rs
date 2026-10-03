@@ -42,3 +42,12 @@ pub mod scoped {
         Err(7)
     }
 }
+
+pub mod aliased {
+    use crate::outcome::Outcome::Err as Failure;
+
+    pub fn alias_is_not_err() -> Result<u8, u8> {
+        let _ = Failure(0);
+        Err(8)
+    }
+}

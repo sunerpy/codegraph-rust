@@ -287,22 +287,7 @@ impl RustUseScopes {
                     let end = (i + 3..bytes.len())
                         .find(|&j| mask[j] && bytes[j] == b';')
                         .unwrap_or(bytes.len());
-                    let mut glob = false;
-                    let mut names = Vec::new();
-                    let mut j = i + 3;
-                    while j < end {
-                        if !mask[j] {
-                            j += 1;
-                        } else if bytes[j] == b'*' {
-                            glob = true;
-                            j += 1;
-                        } else if let Some((ident, after)) = read_ident(bytes, j) {
-                            names.push(ident.to_string());
-                            j = after;
-                        } else {
-                            j += 1;
-                        }
-                    }
+                    let (glob, names) = use_tree_names(bytes, &mask, i + 3, end);
                     found.push(ScannedUse {
                         block_open: stack.last().copied(),
                         module_open: stack
@@ -362,6 +347,71 @@ impl RustUseScopes {
                 && (item.glob || item.names.iter().any(|n| n == name))
         })
     }
+}
+
+/// The names a use tree in `bytes[start..end]` brings into scope, and whether it
+/// holds a glob. A leaf introduces its alias (`Err as Failure` → `Failure`, and
+/// `as _` → nothing), else its last path segment; a `self` leaf in a group
+/// introduces the segment before the group (`a::b::{self}` → `b`).
+fn use_tree_names(bytes: &[u8], mask: &[bool], start: usize, end: usize) -> (bool, Vec<String>) {
+    let mut glob = false;
+    let mut names = Vec::new();
+    // The last segment of the path before each open group, for `self` leaves.
+    let mut prefixes: Vec<Option<String>> = Vec::new();
+    let mut last: Option<String> = None;
+    let mut aliasing = false;
+    let mut j = start;
+    while j < end {
+        if !mask[j] || bytes[j].is_ascii_whitespace() {
+            j += 1;
+            continue;
+        }
+        match bytes[j] {
+            b'*' => {
+                glob = true;
+                last = None;
+                j += 1;
+            }
+            b'{' => {
+                prefixes.push(last.take());
+                j += 1;
+            }
+            b',' | b'}' => {
+                if let Some(name) = last.take() {
+                    names.push(name);
+                }
+                if bytes[j] == b'}' {
+                    prefixes.pop();
+                }
+                aliasing = false;
+                j += 1;
+            }
+            _ => {
+                let Some((ident, after)) = read_ident(bytes, j) else {
+                    j += 1;
+                    continue;
+                };
+                if ident == "as" {
+                    aliasing = true;
+                    last = None;
+                } else if aliasing {
+                    aliasing = false;
+                    if ident != "_" {
+                        names.push(ident.to_string());
+                    }
+                } else if ident == "self" {
+                    last = prefixes.last().cloned().flatten();
+                } else {
+                    last = Some(ident.to_string());
+                }
+                j = after;
+            }
+        }
+    }
+    if let Some(name) = last {
+        names.push(name);
+    }
+    (glob, names)
 }
 
 /// Whether the code byte at `i` starts the keyword `word`, on word boundaries.
@@ -449,6 +499,23 @@ mod tests {
             scopes.covers(at(src, "Some(7)"), "Some"),
             "a braced use tree, past a comment"
         );
+    }
+
+    #[test]
+    fn a_use_brings_in_its_leaves_or_their_aliases_only() {
+        let src = "use a::Outcome::Err as Failure;\n\
+                   use a::Outcome::{Ok as Fine, Some, None as _};\n\
+                   use a::b::{self, c::{d, self}};\n\
+                   use a::Outcome::Err as _;\n\
+                   fn f() { Err(1); Failure(2); Ok(3); Fine(4); Some(5); None; b; c; d }\n";
+        let scopes = RustUseScopes::scan(src);
+        let call = at(src, "Err(1)");
+        for introduced in ["Failure", "Fine", "Some", "b", "c", "d"] {
+            assert!(scopes.covers(call, introduced), "{introduced}");
+        }
+        for not_introduced in ["Err", "Ok", "None", "Outcome", "a", "_"] {
+            assert!(!scopes.covers(call, not_introduced), "{not_introduced}");
+        }
     }
 
     #[test]

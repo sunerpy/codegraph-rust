@@ -645,8 +645,9 @@ fn rust_bare_prelude_variant_binds_a_project_variant_only_with_a_use_in_scope() 
     // Then a call binds `Outcome::Err` only where a `use` naming it, or a glob,
     // is in its own block and module: the top level, a child's `use super::*`,
     // a braced use, a fn-local use. A parent's use does not reach a child
-    // module, a fn-local use does not reach a sibling fn, and a commented-out
-    // use is no use; those calls are the prelude's `Err`.
+    // module, a fn-local use does not reach a sibling fn, a commented-out use is
+    // no use, and `use …::Err as Failure` brings in `Failure`, not `Err`; those
+    // calls are the prelude's `Err`.
     let g = resolve_fixture("rust_receiver");
     let err = "Err@src/outcome.rs:L3".to_string();
     for from in ["top_level_use", "child_glob", "braced_use", "fn_local_use"] {
@@ -661,7 +662,12 @@ fn rust_bare_prelude_variant_binds_a_project_variant_only_with_a_use_in_scope() 
         "{:?}",
         calls_from(&g, "braced_use")
     );
-    for from in ["parent_use_does_not_leak", "sibling_fn", "commented_use"] {
+    for from in [
+        "parent_use_does_not_leak",
+        "sibling_fn",
+        "commented_use",
+        "alias_is_not_err",
+    ] {
         assert!(
             !calls_from(&g, from).iter().any(|t| t.starts_with("Err@")),
             "{from}: {:?}",
