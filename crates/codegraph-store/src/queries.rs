@@ -1614,6 +1614,32 @@ impl Store {
         &self,
         names: &[String],
     ) -> rusqlite::Result<Vec<FileReferenceSite>> {
+        self.reference_sites_to_named_targets(names, "!=")
+    }
+
+    /// Same-file counterpart of
+    /// [`Self::reference_sites_of_edges_to_named_targets`]: surviving
+    /// non-`contains` edges whose source and target share a file and whose
+    /// target name is selected. An exact-name resolution's confidence counts every
+    /// node of that name in the project, so a competitor arriving in or leaving
+    /// another file changes an edge inside a file nobody touched. Sync selects
+    /// only names whose candidates changed, not names whose nodes merely moved: a
+    /// candidate outside the referencing file is scored without its position, and
+    /// the same-file target outranks it either way.
+    pub fn reference_sites_of_same_file_edges_to_named_targets(
+        &self,
+        names: &[String],
+    ) -> rusqlite::Result<Vec<FileReferenceSite>> {
+        self.reference_sites_to_named_targets(names, "=")
+    }
+
+    /// The body of both named-target site queries; `file_relation` is the SQL
+    /// operator relating the edge's source and target files, `!=` or `=`.
+    fn reference_sites_to_named_targets(
+        &self,
+        names: &[String],
+        file_relation: &str,
+    ) -> rusqlite::Result<Vec<FileReferenceSite>> {
         if names.is_empty() {
             return Ok(Vec::new());
         }
@@ -1632,7 +1658,7 @@ impl Store {
                 JOIN nodes src ON src.id = e.source
                 WHERE tgt.name IN ({placeholders})
                   AND e.kind != 'contains'
-                  AND src.file_path != tgt.file_path
+                  AND src.file_path {file_relation} tgt.file_path
                 ORDER BY src.file_path, e.source, e.line, e.col"#
             );
             let params = chunk
@@ -3611,6 +3637,28 @@ mod tests {
             file_path: "fallback.rs".to_string(),
             site: None,
         }));
+        assert!(
+            named.iter().all(|entry| entry.file_path != "b.rs"),
+            "the cross-file query leaves same-file edges out"
+        );
+        let same_file = store
+            .reference_sites_of_same_file_edges_to_named_targets(&[
+                "callee".to_string(),
+                "sibling".to_string(),
+            ])
+            .unwrap();
+        assert_eq!(
+            same_file,
+            vec![FileReferenceSite {
+                file_path: "b.rs".to_string(),
+                site: Some(ReferenceSite {
+                    from_node_id: "function:self".to_string(),
+                    line: 10,
+                    col: 2,
+                }),
+            }],
+            "the same-file query returns exactly the edge whose source shares its target's file"
+        );
 
         let unresolved = |name: &str, line: i64| UnresolvedRef {
             id: None,

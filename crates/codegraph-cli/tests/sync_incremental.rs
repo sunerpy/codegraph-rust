@@ -256,6 +256,78 @@ fn sync_after_file_removal_equals_index_force() {
         .expect("sync after file removal must equal a full index --force from scratch");
 }
 
+/// A JavaScript `add` that competes, by name alone, with `src/math.ts`'s `add`.
+/// While both are indexed, `Counter.increment`'s same-file call to `add`
+/// resolves by exact name at a lower confidence than when `add` is unique, so
+/// the competitor arriving or leaving changes an edge inside an unchanged file.
+fn write_competing_add(project: &Path) {
+    fs::create_dir_all(project.join("web")).unwrap();
+    fs::write(
+        project.join("web/bundle.js"),
+        "function add(a, b) {\n  return a + b;\n}\n",
+    )
+    .unwrap();
+}
+
+#[test]
+fn sync_after_removing_a_same_named_competitor_equals_index_force() {
+    assert_sync_equals_index_force("remove-competitor", write_competing_add, |project| {
+        fs::remove_file(project.join("web/bundle.js")).unwrap();
+    });
+}
+
+#[test]
+fn sync_after_adding_a_same_named_competitor_equals_index_force() {
+    assert_sync_equals_index_force("add-competitor", |_| {}, write_competing_add);
+}
+
+#[test]
+fn sync_after_exporting_a_same_named_candidate_equals_index_force() {
+    // An `export` added on the same line keeps the node's id, yet it lets
+    // `src/f.ts`'s `foo` tie with `src/h.ts`'s for `main`'s bare call.
+    assert_sync_equals_index_force(
+        "export-candidate",
+        |project| {
+            fs::write(
+                project.join("src/h.ts"),
+                "export function foo(): number {\n  return 1;\n}\n",
+            )
+            .unwrap();
+            fs::write(
+                project.join("src/f.ts"),
+                "function foo(): number {\n  return 2;\n}\n",
+            )
+            .unwrap();
+            fs::write(
+                project.join("src/g.ts"),
+                "function main(): number {\n  return foo();\n}\n\nmain();\n",
+            )
+            .unwrap();
+        },
+        |project| {
+            fs::write(
+                project.join("src/f.ts"),
+                "export function foo(): number {\n  return 2;\n}\n",
+            )
+            .unwrap();
+        },
+    );
+}
+
+#[test]
+fn sync_after_excluding_a_same_named_competitor_equals_index_force() {
+    // `[indexing] exclude` takes the competitor out of scope while it stays on
+    // disk: the same removal as a delete, reached through the scan.
+    assert_sync_equals_index_force("exclude-competitor", write_competing_add, |project| {
+        fs::create_dir_all(project.join(".codegraph")).unwrap();
+        fs::write(
+            project.join(".codegraph/config.toml"),
+            "[app]\nname = \"mini\"\n\n[indexing]\nexclude = [\"web/\"]\n",
+        )
+        .unwrap();
+    });
+}
+
 fn prepend_game_flow_comment(project: &Path) {
     let path = project.join("game_flow.gd");
     let original = fs::read_to_string(&path).unwrap();

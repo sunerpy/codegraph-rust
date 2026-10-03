@@ -11,7 +11,7 @@ use codegraph_core::IndexPaths;
 use codegraph_core::config::Config;
 use codegraph_core::generated_header::detect_generated_file;
 use codegraph_core::node_id::hash_content;
-use codegraph_core::types::FileRecord;
+use codegraph_core::types::{FileRecord, Node};
 use codegraph_extract::{
     ExtensionOverrides, ExtractOptions, SourceText, detect_language_with,
     extract_file_with_options, is_source_file, read_source_file,
@@ -549,7 +549,7 @@ fn sync_paths_with_store(
     let mut dependent_sites = BTreeMap::new();
     let mut dependent_fallbacks = BTreeSet::new();
     let mut reindexed = HashSet::new();
-    let mut changed_names = HashSet::new();
+    let mut changed_names = ChangedNames::default();
 
     let paths = paths.into_iter().collect::<Vec<_>>();
     let total = paths.len();
@@ -597,8 +597,16 @@ fn sync_paths_with_store(
     }
 
     if changed {
-        let name_list: Vec<String> = changed_names.iter().cloned().collect();
+        let name_list: Vec<String> = changed_names.any.iter().cloned().collect();
         for affected in store.reference_sites_of_edges_to_named_targets(&name_list)? {
+            if !reindexed.contains(&affected.file_path) {
+                merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, affected);
+            }
+        }
+        let candidate_list: Vec<String> = changed_names.candidates.iter().cloned().collect();
+        for affected in
+            store.reference_sites_of_same_file_edges_to_named_targets(&candidate_list)?
+        {
             if !reindexed.contains(&affected.file_path) {
                 merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, affected);
             }
@@ -635,7 +643,7 @@ fn sync_paths_with_store(
             store,
             &scope_files,
             &scope_sites,
-            &changed_names,
+            &changed_names.any,
         )?;
         // Cross-file framework finalization on every sync (upstream index.ts:464).
         resolver.run_post_extract(store)?;
@@ -841,7 +849,7 @@ fn sync_one(
     outcome: &mut SyncOutcome,
     dependent_sites: &mut BTreeMap<String, BTreeSet<ReferenceSite>>,
     dependent_fallbacks: &mut BTreeSet<String>,
-    changed_names: &mut HashSet<String>,
+    changed_names: &mut ChangedNames,
     force_absent: bool,
 ) -> Result<bool> {
     let full = project_root.join(relative);
@@ -922,7 +930,7 @@ fn remove_tracked_file(
     outcome: &mut SyncOutcome,
     dependent_sites: &mut BTreeMap<String, BTreeSet<ReferenceSite>>,
     dependent_fallbacks: &mut BTreeSet<String>,
-    changed_names: &mut HashSet<String>,
+    changed_names: &mut ChangedNames,
 ) -> Result<bool> {
     let was_tracked = store.file_by_path(relative)?.is_some();
     if !was_tracked {
@@ -932,9 +940,7 @@ fn remove_tracked_file(
     for dependent in store.reference_sites_dependent_on_file(relative)? {
         merge_dependent_site(dependent_sites, dependent_fallbacks, dependent);
     }
-    for name in node_names_in_file(store, relative)? {
-        changed_names.insert(name);
-    }
+    changed_names.note_removed(node_names_in_file(store, relative)?);
     delete_unresolved_refs_by_file(store, relative)?;
     store.delete_file_record(relative)?;
     outcome.files_removed += 1;
@@ -947,7 +953,7 @@ fn reextract_into_store(
     store: &mut Store,
     relative: &str,
     scope: &ProjectScope,
-    changed_names: &mut HashSet<String>,
+    changed_names: &mut ChangedNames,
     (metadata, source, content_hash): (&fs::Metadata, &SourceText, String),
 ) -> Result<()> {
     let result = codegraph_extract::engine::extraction_of(relative, source, &scope.options, |_| {});
@@ -979,24 +985,26 @@ fn reextract_into_store(
     };
 
     // A name's resolution outcomes (confidence, chosen target) depend on the set
-    // of nodes carrying that name. Only names whose node identity in THIS file
-    // changed — a node id present before but not after, or vice versa — can alter
-    // any ref's resolution; a name whose `(id)` set is unchanged resolves exactly
-    // as before. Editing the tail of a file (no line shift for earlier symbols)
-    // therefore contributes no names, keeping the re-resolve scope minimal.
-    let old_nodes: HashSet<(String, String)> = store
-        .nodes_by_file_path(relative)?
-        .into_iter()
-        .map(|node| (node.id, node.name))
+    // of nodes carrying that name. A node id present before but not after, or
+    // vice versa, touches its name; so does a node that keeps its id but changes
+    // anything else resolution reads, such as an added `export`
+    // (`ChangedNames::note_candidates`). Editing the tail of a file (no line
+    // shift for earlier symbols) therefore contributes no names, keeping the
+    // re-resolve scope minimal.
+    let old_nodes = store.nodes_by_file_path(relative)?;
+    let old_ids: HashSet<(&str, &str)> = old_nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node.name.as_str()))
         .collect();
-    let new_nodes: HashSet<(String, String)> = result
+    let new_ids: HashSet<(&str, &str)> = result
         .nodes
         .iter()
-        .map(|node| (node.id.clone(), node.name.clone()))
+        .map(|node| (node.id.as_str(), node.name.as_str()))
         .collect();
-    for (_, name) in old_nodes.symmetric_difference(&new_nodes) {
-        changed_names.insert(name.clone());
+    for (_, name) in old_ids.symmetric_difference(&new_ids) {
+        changed_names.any.insert((*name).to_string());
     }
+    changed_names.note_candidates(&old_nodes, &result.nodes);
 
     delete_unresolved_refs_by_file(store, relative)?;
     store.delete_file_record(relative)?;
@@ -1005,6 +1013,75 @@ fn reextract_into_store(
     store.insert_unresolved_refs(&refs)?;
     store.upsert_file(&file)?;
     Ok(())
+}
+
+/// The names a sync's changed files touched, which the resolution of refs in
+/// the files it did not reindex depends on.
+#[derive(Debug, Default)]
+struct ChangedNames {
+    /// Every touched name: a node of it arrived, left, changed id (a move
+    /// included), or changed anything else resolution reads. Cross-file edges to
+    /// such a name are re-resolved, and so are the unresolved refs naming it.
+    any: HashSet<String>,
+    /// The touched names whose candidates changed as a ref outside their file
+    /// sees them: a node arrived, left, or changed anything but its position.
+    /// Only these can move an edge whose source and target share an unchanged
+    /// file, so only these re-resolve such edges; a line shift elsewhere does not.
+    candidates: HashSet<String>,
+}
+
+impl ChangedNames {
+    /// Every node of a file left the index: all its names are touched.
+    fn note_removed(&mut self, names: HashSet<String>) {
+        for name in names {
+            self.candidates.insert(name.clone());
+            self.any.insert(name);
+        }
+    }
+
+    /// Record each name whose nodes differ between `before` and `after` as a ref
+    /// outside the file sees them, comparing the two sides as multisets of
+    /// [`candidate_key`]s.
+    fn note_candidates(&mut self, before: &[Node], after: &[Node]) {
+        let mut keys: BTreeMap<&str, (Vec<String>, Vec<String>)> = BTreeMap::new();
+        for node in before {
+            keys.entry(&node.name)
+                .or_default()
+                .0
+                .push(candidate_key(node));
+        }
+        for node in after {
+            keys.entry(&node.name)
+                .or_default()
+                .1
+                .push(candidate_key(node));
+        }
+        for (name, (mut old, mut new)) in keys {
+            old.sort_unstable();
+            new.sort_unstable();
+            if old != new {
+                self.any.insert(name.to_string());
+                self.candidates.insert(name.to_string());
+            }
+        }
+    }
+}
+
+/// A node as a ref in ANOTHER file sees it during resolution: every field but
+/// its id, its position and its timestamp. Two nodes with equal keys are
+/// interchangeable candidates for such a ref wherever they sit in their own
+/// file, since name matching reads a candidate's line only when the candidate
+/// shares the ref's file. A node that cannot be serialized keys by its id, so a
+/// move still counts as a change.
+fn candidate_key(node: &Node) -> String {
+    let mut key = node.clone();
+    key.id.clear();
+    key.start_line = 0;
+    key.end_line = 0;
+    key.start_column = 0;
+    key.end_column = 0;
+    key.updated_at = 0;
+    serde_json::to_string(&key).unwrap_or_else(|_| format!("unserializable:{}", node.id))
 }
 
 fn node_names_in_file(store: &Store, relative: &str) -> Result<HashSet<String>> {
@@ -1606,6 +1683,68 @@ pub(crate) mod tests {
         assert!(
             names.contains("answer"),
             "stored node names should include the exported symbol, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn candidate_changes_ignore_a_move_and_catch_everything_else() {
+        use codegraph_core::types::{Language, NodeKind};
+
+        // Given: one `add` function, described by its id, line and export flag.
+        let node = |id: &str, line: i64, exported: bool| Node {
+            id: id.to_string(),
+            kind: NodeKind::Function,
+            name: "add".to_string(),
+            qualified_name: "add".to_string(),
+            file_path: "src/math.ts".to_string(),
+            language: Language::TypeScript,
+            start_line: line,
+            end_line: line + 2,
+            start_column: 0,
+            end_column: 1,
+            docstring: None,
+            signature: None,
+            visibility: None,
+            is_exported: exported,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+            decorators: Vec::new(),
+            type_parameters: Vec::new(),
+            return_type: None,
+            updated_at: line,
+        };
+        let changed = |before: &[Node], after: &[Node]| {
+            let mut names = ChangedNames::default();
+            names.note_candidates(before, after);
+            assert!(names.candidates.is_subset(&names.any));
+            names.candidates
+        };
+
+        // Then: a move (new id, lines and timestamp, nothing else) is no candidate change.
+        assert!(
+            changed(
+                &[node("function:a", 1, true)],
+                &[node("function:b", 9, true)]
+            )
+            .is_empty()
+        );
+        // And: an `export` added on the same line keeps the id and still counts.
+        assert!(
+            changed(
+                &[node("function:a", 1, false)],
+                &[node("function:a", 1, true)]
+            )
+            .contains("add")
+        );
+        // And: a node arriving counts, and so does one of two identical nodes leaving.
+        assert!(changed(&[], &[node("function:a", 1, true)]).contains("add"));
+        assert!(
+            changed(
+                &[node("function:a", 1, true), node("function:b", 9, true)],
+                &[node("function:a", 1, true)],
+            )
+            .contains("add")
         );
     }
 
