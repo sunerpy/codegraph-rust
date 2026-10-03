@@ -438,7 +438,7 @@ Direction D was chosen by the owner as a deliberately more modern look; these ar
 
 | Upstream rule | D |
 |---|---|
-| Paper/ink editorial, light and dark themes | dark only (`D · Nebula`); a light variant is an open question |
+| Paper/ink editorial, light and dark themes | the boards are dark (`D · Nebula`); the light set `D · Daylight` is specified in §3.6 without boards, and the viewer ships both |
 | Square corners everywhere, no shadows, no gradients | radius 8–18, shadow tokens SH.card / SH.pop, glow tokens, four gradient tokens (§4) |
 | One oxblood accent for focus, selection and edges; amber only for the untested badge; drift never amber | six accents with one meaning each (§3.3); amber marks drift, WHEN conditions, the unreached band and modules nothing depends on |
 | Near-monochrome syntax so edges are the only colour in code | coloured syntax (`syn-*`); call names `cyan` in capsules so calls still stand out |
@@ -448,7 +448,7 @@ Direction D was chosen by the owner as a deliberately more modern look; these ar
 | Focus ring `outline: 2px solid accent; offset 1px` | 2 px `primary` ring 4 px outside (3 px on buttons) + SH.glow 45 % |
 | Kind glyphs: 16 px hollow squares, ink letter | soft filled tiles coloured by kind (§7) |
 | Dimmed map nodes 0.1, edges 0.06 | 45 % nodes, 35 % edges on the Map; 55 % / 22–35 % on Screens, so the route labels stay readable |
-| Code font without ligatures | JetBrains Mono renders `->` as an arrow on the boards; open rule below |
+| Code font without ligatures | JetBrains Mono renders `->` as an arrow on the boards; the viewer turns ligatures off, as upstream does (§13) |
 
 ## 13. Not drawn / open rules
 
