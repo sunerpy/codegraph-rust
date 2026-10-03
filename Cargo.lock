@@ -438,7 +438,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-bench"
-version = "0.53.1"
+version = "0.53.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -453,7 +453,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-core"
-version = "0.53.1"
+version = "0.53.2"
 dependencies = [
  "anyhow",
  "globset",
@@ -470,7 +470,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-daemon"
-version = "0.53.1"
+version = "0.53.2"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -491,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-extract"
-version = "0.53.1"
+version = "0.53.2"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -540,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-graph"
-version = "0.53.1"
+version = "0.53.2"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -557,7 +557,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-mcp"
-version = "0.53.1"
+version = "0.53.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -581,7 +581,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-resolve"
-version = "0.53.1"
+version = "0.53.2"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -595,7 +595,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-rs"
-version = "0.53.1"
+version = "0.53.2"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -634,7 +634,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-store"
-version = "0.53.1"
+version = "0.53.2"
 dependencies = [
  "anyhow",
  "codegraph-core",
@@ -647,7 +647,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-ui"
-version = "0.53.1"
+version = "0.53.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -677,7 +677,7 @@ dependencies = [
 
 [[package]]
 name = "codegraph-watch"
-version = "0.53.1"
+version = "0.53.2"
 dependencies = [
  "anyhow",
  "codegraph-core",

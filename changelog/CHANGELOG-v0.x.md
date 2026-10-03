@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.53.2](https://github.com/sunerpy/codegraph-rust/compare/v0.53.1...v0.53.2) (2026-10-03)
+
+
+### Performance Improvements
+
+* **cli:** allocate through mimalloc in the musl release builds ([#310](https://github.com/sunerpy/codegraph-rust/issues/310)) ([a52a64c](https://github.com/sunerpy/codegraph-rust/commit/a52a64c6e1efdc34ccc997709ddb02616c69bcf8))
+
 ## [0.53.1](https://github.com/sunerpy/codegraph-rust/compare/v0.53.0...v0.53.1) (2026-10-03)
 
 
