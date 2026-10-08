@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.54.0](https://github.com/sunerpy/codegraph-rust/compare/v0.53.3...v0.54.0) (2026-10-08)
+
+
+### Features
+
+* **init:** write a self-scoped .gitignore inside the index root ([c9924e4](https://github.com/sunerpy/codegraph-rust/commit/c9924e4ce626f273601e0cbc4fd0aec624ba4bd7))
+
 ## [0.53.3](https://github.com/sunerpy/codegraph-rust/compare/v0.53.2...v0.53.3) (2026-10-03)
 
 
