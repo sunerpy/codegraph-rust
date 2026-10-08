@@ -40,6 +40,8 @@ sha1_smol = "1"
 rayon = "1.8"
 globset = "0.4"
 ignore = "0.4"
+cap-fs-ext = "=4.0.3"
+cap-std = "=4.0.3"
 
 # Logging (rust-base-convention)
 tracing = "0.1"

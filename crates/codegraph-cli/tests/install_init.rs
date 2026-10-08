@@ -39,7 +39,17 @@ impl Fixture {
     }
 
     fn command(&self, cwd: &std::path::Path, args: &[&str]) -> Output {
-        Command::new(bin())
+        self.command_with_env(cwd, args, &[])
+    }
+
+    fn command_with_env(
+        &self,
+        cwd: &std::path::Path,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> Output {
+        let mut command = Command::new(bin());
+        command
             .args(args)
             .current_dir(cwd)
             .env("HOME", &self.home)
@@ -48,9 +58,11 @@ impl Fixture {
             .env("HERMES_HOME", self.root.join("hermes"))
             .env_remove("CLAUDE_CONFIG_DIR")
             .env_remove("CODEX_HOME")
-            .env_remove("APPDATA")
-            .output()
-            .expect("run codegraph")
+            .env_remove("APPDATA");
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        command.output().expect("run codegraph")
     }
 
     fn run_ok(&self, args: &[&str]) -> Output {
@@ -76,6 +88,22 @@ fn now_nanos() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos()
+}
+
+fn symlink_file_for_test(target: &std::path::Path, link: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(target, link).is_ok()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (target, link);
+        false
+    }
 }
 
 #[test]
@@ -159,6 +187,168 @@ fn init_yes_is_behavior_neutral_and_non_interactive() {
 
     assert!(String::from_utf8_lossy(&output.stdout).contains("Initialized in"));
     assert!(fixture.project.join(".codegraph/codegraph.db").is_file());
+}
+
+#[test]
+fn init_writes_a_gitignore_only_inside_a_fresh_index_root() {
+    let fixture = Fixture::new("gitignore");
+
+    fixture.run_ok(&["init", "--yes"]);
+
+    let gitignore = fixture.project.join(".codegraph/.gitignore");
+    assert!(gitignore.is_file(), ".codegraph/.gitignore must be created");
+    assert_eq!(fs::read_to_string(&gitignore).unwrap(), "*\n");
+    // The project's own root .gitignore is never created or touched.
+    assert!(!fixture.project.join(".gitignore").exists());
+}
+
+#[test]
+fn a_fresh_index_root_stays_out_of_git_status() {
+    let fixture = Fixture::new("gitignore-status");
+    let git_init = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&fixture.project)
+        .output()
+        .expect("initialize test git repository");
+    assert!(git_init.status.success());
+
+    fixture.run_ok(&["init", "--yes"]);
+
+    let status = Command::new("git")
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .current_dir(&fixture.project)
+        .output()
+        .expect("read test git status");
+    assert!(status.status.success());
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        !status.lines().any(|line| line.contains(".codegraph")),
+        "the fresh index root must be hidden by its nested .gitignore: {status}"
+    );
+    assert!(
+        status.lines().any(|line| line == "?? main.rs"),
+        "the assertion must not hide unrelated project files: {status}"
+    );
+}
+
+#[test]
+fn init_writes_a_gitignore_inside_a_fresh_custom_index_root() {
+    let fixture = Fixture::new("gitignore-custom-fresh");
+
+    let output = fixture.command_with_env(
+        &fixture.project,
+        &["init", "--yes"],
+        &[("CODEGRAPH_DIR", "cache")],
+    );
+
+    assert!(
+        output.status.success(),
+        "custom-root init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.project.join("cache/.gitignore")).unwrap(),
+        "*\n"
+    );
+    assert!(!fixture.project.join(".codegraph").exists());
+}
+
+#[test]
+fn init_never_backfills_an_existing_index_root() {
+    let fixture = Fixture::new("gitignore-no-backfill");
+
+    fixture.run_ok(&["init", "--yes"]);
+    fs::remove_file(fixture.project.join(".codegraph/.gitignore")).unwrap();
+
+    let output = fixture.run_ok(&["init", "--yes"]);
+
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Already initialized in"));
+    assert!(
+        !fixture.project.join(".codegraph/.gitignore").exists(),
+        "an existing index root must never be backfilled"
+    );
+}
+
+#[test]
+fn init_never_hides_an_unrelated_file_in_an_existing_custom_root() {
+    let fixture = Fixture::new("gitignore-custom-existing");
+    let cache = fixture.project.join("cache");
+    fs::create_dir(&cache).unwrap();
+    fs::write(cache.join("user-note.txt"), "belongs to the user\n").unwrap();
+
+    let git_init = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&fixture.project)
+        .output()
+        .expect("initialize test git repository");
+    assert!(git_init.status.success());
+
+    let output = fixture.command_with_env(
+        &fixture.project,
+        &["init", "--yes"],
+        &[("CODEGRAPH_DIR", "cache")],
+    );
+    assert!(
+        output.status.success(),
+        "custom-root init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        !cache.join(".gitignore").exists(),
+        "an existing custom root must not receive a whole-directory ignore"
+    );
+    let status = Command::new("git")
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .current_dir(&fixture.project)
+        .output()
+        .expect("read test git status");
+    assert!(status.status.success());
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status.lines().any(|line| line == "?? cache/user-note.txt"),
+        "the unrelated file must stay visible in git status: {status}"
+    );
+}
+
+#[test]
+fn init_never_follows_a_dangling_index_gitignore_symlink() {
+    let fixture = Fixture::new("gitignore-dangling");
+    let index_root = fixture.project.join(".codegraph");
+    let external = fixture.root.join("outside-target");
+    fs::create_dir(&index_root).unwrap();
+    if !symlink_file_for_test(&external, &index_root.join(".gitignore")) {
+        return;
+    }
+
+    fixture.run_ok(&["init", "--yes"]);
+
+    assert!(
+        fs::symlink_metadata(index_root.join(".gitignore"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the dangling link must stay untouched"
+    );
+    assert!(
+        !external.exists(),
+        "init must never create a dangling link target outside the index root"
+    );
+}
+
+#[test]
+fn init_never_overwrites_an_existing_index_gitignore() {
+    let fixture = Fixture::new("gitignore-idempotent");
+
+    fixture.run_ok(&["init", "--yes"]);
+    fs::write(fixture.project.join(".codegraph/.gitignore"), "*.db\n").unwrap();
+
+    fixture.run_ok(&["init", "--yes"]);
+
+    assert_eq!(
+        fs::read_to_string(fixture.project.join(".codegraph/.gitignore")).unwrap(),
+        "*.db\n"
+    );
 }
 
 #[test]

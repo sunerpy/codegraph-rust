@@ -6,13 +6,13 @@
 //! calls in a bounded loop with a monotonic deadline and cancellation checks.
 
 use std::fs::{File, OpenOptions};
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "test-hooks")]
-use std::io::{Read, Write};
+use std::io::Read;
 
 use codegraph_core::IndexPaths;
 use thiserror::Error;
@@ -30,11 +30,14 @@ enum LeaseMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AcquireCheckpoint {
+    ProjectRootOpened,
     RootCreated,
     InitialMetadataValidated,
     HandleOpened,
     KernelLockAcquired,
     FinalPathCorroborated,
+    InitialGitignoreLeaseValidated,
+    InitialGitignoreRootOpened,
 }
 
 #[derive(Debug)]
@@ -253,7 +256,9 @@ impl IndexLease {
         mut cancelled: impl FnMut() -> bool,
         mut checkpoint: impl FnMut(AcquireCheckpoint),
     ) -> Result<Self, IndexLeaseError> {
-        let root = paths.current_root();
+        use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
+
+        let root_path = paths.current_root();
         let lock_path = paths.permanent_lock();
         if cancelled() {
             return Err(IndexLeaseError::Cancelled { path: lock_path });
@@ -261,50 +266,68 @@ impl IndexLease {
         if Instant::now() >= deadline {
             return Err(IndexLeaseError::TimedOut { path: lock_path });
         }
-        match std::fs::symlink_metadata(root) {
+        let project =
+            cap_std::fs::Dir::from_std_file(open_directory_no_follow(paths.project()).map_err(
+                |source| IndexLeaseError::CreateRoot {
+                    path: paths.project().to_path_buf(),
+                    source,
+                },
+            )?);
+        checkpoint(AcquireCheckpoint::ProjectRootOpened);
+        debug_assert_eq!(root_path.parent(), Some(paths.project()));
+        let root_name = root_path
+            .file_name()
+            .expect("IndexPaths current root always has a file name");
+        match project.symlink_metadata(root_name) {
             Ok(_) => {
                 return Err(IndexLeaseError::NamespaceAlreadyExists {
-                    path: root.to_path_buf(),
+                    path: root_path.to_path_buf(),
                 });
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(source) => {
                 return Err(IndexLeaseError::CreateRoot {
-                    path: root.to_path_buf(),
+                    path: root_path.to_path_buf(),
                     source,
                 });
             }
         }
-        let parent = root
-            .parent()
-            .expect("IndexPaths current root always has a parent");
-        std::fs::create_dir_all(parent).map_err(|source| IndexLeaseError::CreateRoot {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-        std::fs::create_dir(root).map_err(|source| {
+        project.create_dir(root_name).map_err(|source| {
             if source.kind() == io::ErrorKind::AlreadyExists {
                 IndexLeaseError::NamespaceAlreadyExists {
-                    path: root.to_path_buf(),
+                    path: root_path.to_path_buf(),
                 }
             } else {
                 IndexLeaseError::CreateRoot {
-                    path: root.to_path_buf(),
+                    path: root_path.to_path_buf(),
                     source,
                 }
             }
         })?;
+        let root =
+            project
+                .open_dir_nofollow(root_name)
+                .map_err(|source| IndexLeaseError::CreateRoot {
+                    path: root_path.to_path_buf(),
+                    source,
+                })?;
         checkpoint(AcquireCheckpoint::RootCreated);
-        let file = OpenOptions::new()
+        let lock_name = lock_path
+            .file_name()
+            .expect("IndexPaths permanent lock always has a file name");
+        let mut lock_options = cap_std::fs::OpenOptions::new();
+        lock_options
             .read(true)
             .write(true)
             .create_new(true)
-            .truncate(false)
-            .open(&lock_path)
+            .follow(FollowSymlinks::No);
+        let file = root
+            .open_with(lock_name, &lock_options)
+            .map(cap_std::fs::File::into_std)
             .map_err(|source| classify_create_error(&lock_path, source))?;
         let opened_identity = opened_identity(&file, &lock_path, None)?;
         checkpoint(AcquireCheckpoint::HandleOpened);
-        Self::acquire_file(
+        let lease = Self::acquire_file(
             file,
             PendingAcquisition {
                 lock_path,
@@ -314,8 +337,10 @@ impl IndexLease {
                 opened_identity,
             },
             cancelled,
-            checkpoint,
-        )
+            &mut checkpoint,
+        )?;
+        ensure_initial_gitignore(paths, &lease, &root, &mut checkpoint);
+        Ok(lease)
     }
 
     /// Whether this capability represents a shared reader lock.
@@ -555,6 +580,172 @@ fn lease_test_wait(marker: u8, selector_env: &str) {
         .read_exact(&mut release)
         .expect("receive lease test barrier release");
     assert_eq!(release, [b'R'], "invalid lease test barrier release byte");
+}
+
+const INITIAL_GITIGNORE_BYTES: &[u8] = b"*\n";
+
+/// Best-effort Git hygiene for a namespace this process just created. Existing
+/// roots never reach this function, so a custom/config-only root is never
+/// backfilled and unrelated files cannot become hidden retroactively.
+fn ensure_initial_gitignore(
+    paths: &IndexPaths,
+    lease: &IndexLease,
+    root: &cap_std::fs::Dir,
+    checkpoint: &mut impl FnMut(AcquireCheckpoint),
+) {
+    if let Err(error) = create_initial_gitignore(paths, lease, root, checkpoint) {
+        tracing::warn!(
+            path = %paths.gitignore().display(),
+            %error,
+            "could not create the new index root's .gitignore; the index is unaffected"
+        );
+    }
+}
+
+/// Create, never replace, the new root's nested ignore file. The root is opened
+/// without following aliases and every child operation is relative to that
+/// retained directory capability, so replacing the pathname cannot redirect a
+/// later create outside the namespace.
+fn create_initial_gitignore(
+    paths: &IndexPaths,
+    lease: &IndexLease,
+    root: &cap_std::fs::Dir,
+    checkpoint: &mut impl FnMut(AcquireCheckpoint),
+) -> io::Result<()> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+
+    lease
+        .validate_exclusive(paths)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    checkpoint(AcquireCheckpoint::InitialGitignoreLeaseValidated);
+    validate_initial_root(paths, lease, root)?;
+    checkpoint(AcquireCheckpoint::InitialGitignoreRootOpened);
+    let path = paths.gitignore();
+    let name = path
+        .file_name()
+        .expect("IndexPaths gitignore always has a file name");
+    match root.symlink_metadata(name) {
+        Ok(metadata) if cap_metadata_is_regular(&metadata) => return Ok(()),
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "refusing to replace a non-regular .gitignore entry",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        .follow(FollowSymlinks::No);
+    let mut file = match root.open_with(name, &options) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let metadata = root.symlink_metadata(name)?;
+            if cap_metadata_is_regular(&metadata) {
+                return Ok(());
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "refusing to follow or replace a raced .gitignore alias",
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    file.write_all(INITIAL_GITIGNORE_BYTES)?;
+    file.flush()?;
+    file.sync_all()
+}
+
+fn validate_initial_root(
+    paths: &IndexPaths,
+    lease: &IndexLease,
+    root: &cap_std::fs::Dir,
+) -> io::Result<()> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+
+    let lock_path = paths.permanent_lock();
+    let lock_name = lock_path
+        .file_name()
+        .expect("IndexPaths permanent lock always has a file name");
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let relative_lock = root.open_with(lock_name, &options)?.into_std();
+    if !is_regular(&relative_lock.metadata()?) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "opened index root does not contain a regular permanent lock",
+        ));
+    }
+    if identity_for_file(&relative_lock)? != identity_for_file(&lease.inner.file)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "opened index root does not contain the leased permanent lock",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_directory_no_follow(path: &Path) -> io::Result<File> {
+    use rustix::fs::{Mode, OFlags};
+
+    Ok(File::from(rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?))
+}
+
+#[cfg(windows)]
+fn open_directory_no_follow(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        // Omitting FILE_SHARE_DELETE pins the opened root while relative child
+        // operations use it, matching cap-std's Windows directory contract.
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() || is_alias(&metadata) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "index root is not a non-aliased directory",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_directory_no_follow(_path: &Path) -> io::Result<File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "safe directory-relative creation is unsupported on this platform",
+    ))
+}
+
+fn cap_metadata_is_regular(metadata: &cap_std::fs::Metadata) -> bool {
+    if !metadata.is_file() || metadata.is_symlink() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use cap_std::fs::MetadataExt as _;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+    }
+    #[cfg(not(windows))]
+    true
 }
 
 fn validated_path_metadata(lock_path: &Path) -> Result<std::fs::Metadata, IndexLeaseError> {
@@ -860,6 +1051,200 @@ mod tests {
             .try_lock()
             .expect("failed creation never locks the competing entry");
         competing_handle.unlock().expect("unlock competing entry");
+    }
+
+    #[test]
+    fn initial_lock_creation_never_follows_a_replaced_index_root() {
+        let project = TempProject::new("lock-parent-race");
+        let external = TempProject::new("lock-parent-external");
+        let paths = project.paths();
+        let displaced = project.0.join("displaced-lock-index-root");
+
+        let mut replaced = false;
+        let error = IndexLease::create_exclusive_with(
+            &paths,
+            deadline(),
+            || false,
+            |point| {
+                if point == AcquireCheckpoint::RootCreated && !replaced {
+                    std::fs::rename(paths.current_root(), &displaced)
+                        .expect("displace the opened root before lock creation");
+                    symlink(&external.0, paths.current_root())
+                        .expect("replace the root with an external alias");
+                    replaced = true;
+                }
+            },
+        )
+        .expect_err("the replacement path must never become lock authority");
+
+        assert!(matches!(
+            error,
+            IndexLeaseError::LockChangedDuringAcquisition { path }
+                if path == paths.permanent_lock()
+        ));
+        assert!(
+            !external.0.join("index.lock").exists(),
+            "initial lock creation must stay relative to the opened root"
+        );
+        assert!(
+            displaced.join("index.lock").is_file(),
+            "the no-longer-authoritative directory received the relative create"
+        );
+        assert!(
+            !external.0.join(".gitignore").exists(),
+            "failed lock corroboration must not reach Git hygiene"
+        );
+    }
+
+    #[test]
+    fn initial_namespace_creation_never_follows_a_replaced_project_root() {
+        let project = TempProject::new("project-parent-race");
+        let external = TempProject::new("project-parent-external");
+        let paths = project.paths();
+        let displaced = project.0.with_file_name(format!(
+            "codegraph-index-lease-displaced-project-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+
+        let mut replaced = false;
+        let error = IndexLease::create_exclusive_with(
+            &paths,
+            deadline(),
+            || false,
+            |point| {
+                if point == AcquireCheckpoint::ProjectRootOpened && !replaced {
+                    std::fs::rename(&project.0, &displaced)
+                        .expect("displace the opened project root");
+                    symlink(&external.0, &project.0)
+                        .expect("replace the project path with an external alias");
+                    replaced = true;
+                }
+            },
+        )
+        .expect_err("the replacement project path must never become lock authority");
+
+        assert!(matches!(
+            error,
+            IndexLeaseError::LockChangedDuringAcquisition { path }
+                if path == paths.permanent_lock()
+        ));
+        assert!(
+            !external.0.join(".codegraph").exists(),
+            "namespace creation must stay relative to the opened project"
+        );
+        assert!(
+            displaced.join(".codegraph/index.lock").is_file(),
+            "the relative create stays with the opened project capability"
+        );
+
+        std::fs::remove_file(&project.0).expect("remove replacement project alias");
+        std::fs::rename(&displaced, &project.0).expect("restore project for cleanup");
+    }
+
+    #[test]
+    fn initial_gitignore_never_follows_an_alias_raced_after_lock_validation() {
+        let project = TempProject::new("gitignore-alias-race");
+        let paths = project.paths();
+        let external = project.0.with_file_name(format!(
+            "codegraph-index-lease-external-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+
+        let mut installed = false;
+        let lease = IndexLease::create_exclusive_with(
+            &paths,
+            deadline(),
+            || false,
+            |point| {
+                if point == AcquireCheckpoint::FinalPathCorroborated && !installed {
+                    symlink(&external, paths.gitignore())
+                        .expect("install dangling gitignore after lock validation");
+                    installed = true;
+                }
+            },
+        )
+        .expect("the index lease remains valid when optional git hygiene is refused");
+
+        assert!(
+            std::fs::symlink_metadata(paths.gitignore())
+                .expect("raced alias remains")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            !external.exists(),
+            "the best-effort gitignore write must not follow the raced alias"
+        );
+        drop(lease);
+    }
+
+    #[test]
+    fn initial_gitignore_never_follows_a_replaced_index_root() {
+        let project = TempProject::new("gitignore-parent-race");
+        let external = TempProject::new("gitignore-parent-external");
+        let paths = project.paths();
+        let displaced = project.0.join("displaced-index-root");
+
+        let mut replaced = false;
+        let lease = IndexLease::create_exclusive_with(
+            &paths,
+            deadline(),
+            || false,
+            |point| {
+                if point == AcquireCheckpoint::InitialGitignoreLeaseValidated && !replaced {
+                    std::fs::rename(paths.current_root(), &displaced)
+                        .expect("displace the validated index root");
+                    symlink(&external.0, paths.current_root())
+                        .expect("replace the index root with an external alias");
+                    replaced = true;
+                }
+            },
+        )
+        .expect("optional Git hygiene must not invalidate the acquired lease");
+
+        assert!(
+            !external.0.join(".gitignore").exists(),
+            "a replaced index root must never redirect .gitignore creation outside the project"
+        );
+        drop(lease);
+    }
+
+    #[test]
+    fn initial_gitignore_uses_the_opened_root_after_its_path_is_replaced() {
+        let project = TempProject::new("gitignore-open-root-race");
+        let external = TempProject::new("gitignore-open-root-external");
+        let paths = project.paths();
+        let displaced = project.0.join("displaced-open-index-root");
+
+        let mut replaced = false;
+        let lease = IndexLease::create_exclusive_with(
+            &paths,
+            deadline(),
+            || false,
+            |point| {
+                if point == AcquireCheckpoint::InitialGitignoreRootOpened && !replaced {
+                    std::fs::rename(paths.current_root(), &displaced)
+                        .expect("displace the opened index root");
+                    symlink(&external.0, paths.current_root())
+                        .expect("replace the opened root path with an external alias");
+                    replaced = true;
+                }
+            },
+        )
+        .expect("directory-relative Git hygiene keeps the acquired lease valid");
+
+        assert!(
+            !external.0.join(".gitignore").exists(),
+            "relative creation must never follow the replacement path"
+        );
+        assert_eq!(
+            std::fs::read(displaced.join(".gitignore")).unwrap(),
+            INITIAL_GITIGNORE_BYTES,
+            "the create remains bound to the directory capability that was opened"
+        );
+        drop(lease);
     }
 
     #[test]

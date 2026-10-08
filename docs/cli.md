@@ -306,6 +306,8 @@ the same target values as `install` (csv ids such as `kiro,cursor`, plus `auto`,
 config and its `--path` are written under the project being initialized, even when
 the `[path]` argument differs from the current directory. It is idempotent.
 
+When CodeGraph creates a previously absent index root, it also creates a nested `.gitignore` containing only `*` (`<project>/.codegraph/.gitignore` by default, or under the `CODEGRAPH_DIR` override). The file is created relative to a no-follow directory capability, without following or replacing an existing entry, and only after the new root's exclusive lease is held. An index root that already existed is never backfilled or modified, so unrelated files in a pre-existing custom root do not become hidden. The project's own root `.gitignore` is never created or changed. Failure to create this convenience file logs a warning but does not abort indexing.
+
 ```bash
 codegraph init                       # index only — no MCP config written (default none)
 codegraph init --yes                 # same init flow, explicit non-interactive entry point

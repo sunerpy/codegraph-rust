@@ -94,8 +94,9 @@ Indexed 4 files
 ```
 
 `init` creates `.codegraph/` in the project and indexes every file it recognises. Files ignored by `.gitignore`, and
-dependency and build directories such as `node_modules` and `target`, are left out. Add `.codegraph/` to your
-`.gitignore`: it is a local cache, rebuilt from the source at any time.
+dependency and build directories such as `node_modules` and `target`, are left out. A newly created index directory
+contains its own `.gitignore`, so the local cache stays out of `git status`. CodeGraph does not add that file to an
+index directory that already existed; add the directory to the project's `.gitignore` yourself in that case.
 
 ## 2. Check it
 

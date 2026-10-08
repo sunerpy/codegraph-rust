@@ -198,6 +198,11 @@ impl IndexPaths {
         self.current_root.join("codegraph.db")
     }
 
+    /// `<current_root>/.gitignore`.
+    pub fn gitignore(&self) -> PathBuf {
+        self.current_root.join(".gitignore")
+    }
+
     /// `<current_root>/index.lock` — the permanent lock file (never truncated or
     /// deleted by normal operation).
     pub fn permanent_lock(&self) -> PathBuf {
@@ -656,6 +661,7 @@ mod tests {
 
         assert_eq!(paths.current_root(), root);
         assert_eq!(paths.current_db(), root.join("codegraph.db"));
+        assert_eq!(paths.gitignore(), root.join(".gitignore"));
         assert_eq!(paths.permanent_lock(), root.join("index.lock"));
         assert_eq!(
             paths.state_slots(),

@@ -10,8 +10,10 @@ that go online are the install scripts and `codegraph self-update`, which downlo
 
 ## Should I commit `.codegraph/`?
 
-No. It is a local cache that can be rebuilt from the source at any time, and its contents depend on the machine. Add
-`.codegraph/` to your `.gitignore`.
+No. It is a local cache that can be rebuilt from the source at any time, and its contents depend on the machine. A
+new index directory contains a nested `.gitignore`, so it stays out of `git status` without changing the project's
+root `.gitignore`. CodeGraph leaves an index directory that already existed untouched; add that directory to the
+project's `.gitignore` yourself if it is still visible.
 
 ## A call I can see in the code is missing. Why?
 

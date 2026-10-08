@@ -91,7 +91,7 @@ Indexed 4 files
 22 nodes, 39 edges in 94ms
 ```
 
-`init` 在项目中创建 `.codegraph/`，并索引它能识别的所有文件。`.gitignore` 忽略的文件，以及 `node_modules`、`target` 等依赖和构建目录，不会被索引。请把 `.codegraph/` 加入 `.gitignore`：它是本地缓存，随时可以从源码重建。
+`init` 在项目中创建 `.codegraph/`，并索引它能识别的所有文件。`.gitignore` 忽略的文件，以及 `node_modules`、`target` 等依赖和构建目录，不会被索引。新建的索引目录包含自己的 `.gitignore`，因此这个本地缓存不会出现在 `git status` 中。如果索引目录原本已经存在，CodeGraph 不会补写或修改该文件；此时请自行把索引目录加入项目的 `.gitignore`。
 
 ## 2. 检查索引
 
