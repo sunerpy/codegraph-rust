@@ -2,7 +2,7 @@
 
 This is the AS-BUILT storage contract owned by `codegraph-store`.
 
-- Current schema version: **8**
+- Current schema version: **9**
 - Base DDL: `crates/codegraph-store/src/schema.rs`
 - Ordered migrations: `crates/codegraph-store/src/migrations.rs`
 - Connection and lease policy: `crates/codegraph-store/src/connection.rs`
@@ -34,6 +34,7 @@ loudly if the table itself is absent.
 |       6 | `unresolved_refs.reference_subkind` for structural/framework evidence        |
 |       7 | Deduplicate edges and add their unique semantic identity index               |
 |       8 | `files.generated` plus the partial generated-file index                      |
+|       9 | `synthesis_inputs` plus the partial synthesized-edge site index              |
 
 Schema version and extraction version are independent. A DDL change needs a
 schema migration; a change in graph meaning may need an extraction-version move
@@ -84,6 +85,13 @@ documented compatibility ID are the exception, not a second general formula.
 | `line`, `col`      | INTEGER nullable                  | source location when known                     |
 | `provenance`       | TEXT nullable default NULL        | resolution/synthesis provenance                |
 
+A synthesized edge, one the resolver infers rather than reads from a call site
+(dynamic dispatch, callbacks, cross-tier channels), carries
+`provenance = 'heuristic'` and a `metadata` object with `synthesizedBy` (the pass
+that made it) and, when the wiring happens elsewhere, `registeredAt`
+(`path:line` of the registration). Consumers such as the type hierarchy and the
+named-symbol flow recognize synthesized edges by that provenance value.
+
 An edge's semantic identity is:
 
 ```text
@@ -122,6 +130,15 @@ path classification where required.
 | `file_path`                        | TEXT not null default `''`        | source file context (migration 2)             |
 | `language`                         | TEXT not null default `unknown`   | source language (migration 2)                 |
 | `reference_subkind`                | TEXT nullable                     | structural/framework label (migration 6)      |
+
+### `synthesis_inputs`
+
+| Column      | Type             | Contract                                                      |
+| ----------- | ---------------- | ------------------------------------------------------------- |
+| `file_path` | TEXT primary key | a file that fed a synthesis pass; cascades with `files(path)` |
+
+A sync reads it to tell whether a deleted or edited file changes synthesized
+edges, so it can recompute them without re-reading every file (migration 9).
 
 ### `project_metadata`
 
@@ -162,8 +179,10 @@ The base schema creates:
 
 - node indexes on kind, name, qualified name, file path, language,
   `(file_path, start_line)`, and `lower(name)`;
-- edge indexes on kind, `(source, kind)`, `(target, kind)`, provenance, and the
-  unique semantic identity tuple;
+- edge indexes on kind, `(source, kind)`, `(target, kind)`, provenance, the
+  unique semantic identity tuple, and the partial `idx_edges_synthesis_site`
+  over synthesized edges' `metadata.registeredAt` (only rows whose metadata
+  names `synthesizedBy`; `json_valid` guards keep malformed metadata out);
 - file indexes on language, modified time, and the partial `generated = 1` set;
 - unresolved-reference indexes on source node, name, file path, and
   `(from_node_id, reference_name)`.

@@ -1244,10 +1244,13 @@ codegraph sync /path/to/project          # ordinary changes or a supported upgra
 codegraph index --force /path/to/project # only when the CLI explicitly requires recovery
 ```
 
-Extraction versions 11 → 12 and 12 → 13 are supported `sync` upgrades: `status`
-reports the old index as outdated, and `sync` rebuilds it into the current
-namespace. Do not run `index --force` solely because the extraction version
-changed.
+An index built by an older extraction version is a supported `sync` upgrade:
+`status` reports it as outdated, and `sync` (or the catch-up a daemon or MCP
+session runs when it opens the project) rebuilds it from source into the current
+namespace, applying any pending schema migration on the way. The result equals a
+fresh `init`. Do not run `index --force` solely because the extraction version
+changed. An older binary refuses an index a newer extraction version wrote and
+leaves it untouched.
 
 If a supported grammar reports tree errors and extraction collapses to only the
 synthetic file node, `init`/`index`/`sync` still succeed but print and persist
