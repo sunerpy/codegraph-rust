@@ -276,6 +276,13 @@ before starting a large research session. If the watcher is expected, wait for
 its debounce and re-check status. If no watcher is running, use `codegraph sync`;
 do not default to a full `codegraph index` for ordinary source changes.
 
+A burst of many changes — a branch switch, a mass rename or move — or any sign
+that the operating system dropped file events makes the watcher re-scan the
+whole project on its own. Until that catch-up commits, responses can start with
+`⚠️ CodeGraph auto-sync is RECOVERING …`; read the files you rely on directly
+in the meantime. Large renames never need `codegraph index`: `codegraph sync`
+reconciles the whole project against the index.
+
 ---
 
 ## Fallback rules — when to use Read/grep instead

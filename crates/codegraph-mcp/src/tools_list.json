@@ -235,7 +235,7 @@
   },
   {
     "name": "codegraph_status",
-    "description": "Index health check (files / nodes / edges). Skip unless debugging.",
+    "description": "Index health check (files / nodes / edges), auto-sync state, and files changed since the last sync. Skip unless debugging or results look stale.",
     "inputSchema": {
       "type": "object",
       "properties": {

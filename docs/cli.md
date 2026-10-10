@@ -1122,6 +1122,22 @@ This keeps the total watch count well inside the OS inotify limit on large trees
 and makes daemon startup fast. A newly-created non-ignored directory is picked up
 automatically on its create event — no restart required.
 
+A settled burst normally syncs exactly the paths its events named. Three cases
+make it run one full project reconcile instead, the same pass `codegraph sync`
+runs:
+
+- the burst named more than 500 paths, as a branch switch or a mass rename does;
+- the backend said events may have been dropped: inotify's queue overflowed,
+  FSEvents asked for a rescan, or an event arrived without naming any path;
+- on Windows, whose backend can lose events without saying so, an idle watcher
+  compares the index with the disk every `CODEGRAPH_WATCH_SENTINEL_MS` (60 s by
+  default; `0` turns this off) and found changes no event reported. It also
+  registers its root watch again.
+
+In the last two cases the watcher reports RECOVERING, naming the cause, until
+that full reconcile commits; a reconcile that fails is retried like any other
+failed sync.
+
 Three project-control files are recognized before ordinary include/exclude
 filtering: the selected index root's `config.toml` and `codegraph.json`, plus the
 project-root `.gitignore`. Editing one reloads the effective Config, extension
@@ -1165,6 +1181,7 @@ Three escape hatches:
 | `CODEGRAPH_DAEMON_RETRY_MS`        | `5000`       | ≥0; `0` disables              | How long a cold-start stdio session waits before starting or re-attaching the shared daemon after its connection was lost; doubles after each miss. Empty, malformed, or negative values use the default                                                                                           |
 | `CODEGRAPH_DAEMON_RETRY_MAX_MS`    | `300000`     | ≥ `CODEGRAPH_DAEMON_RETRY_MS` | Cap for that doubling wait                                                                                                                                                                                                                                                                         |
 | `CODEGRAPH_WATCH_DEBOUNCE_MS`      | `2000`       | 100–60000                     | File-change debounce window before a re-index triggers                                                                                                                                                                                                                                             |
+| `CODEGRAPH_WATCH_SENTINEL_MS`      | `60000`      | 0 or 1000–3600000             | Windows only: how often an idle watcher checks the index for changes no event reported; `0` disables. Empty or malformed values use the default                                                                                                                                                    |
 | `CODEGRAPH_NO_WATCH`               | —            | —                             | Disable the live file watcher (equivalent to `serve --no-watch`)                                                                                                                                                                                                                                   |
 | `CODEGRAPH_FORCE_WATCH`            | —            | —                             | Override WSL2 `/mnt/` auto-disable; does not override `NO_WATCH`                                                                                                                                                                                                                                   |
 | `CODEGRAPH_NO_WAL_DEFER`           | —            | `1` enables opt-out           | Keep SQLite's default WAL autocheckpoint interval during bulk indexing                                                                                                                                                                                                                             |

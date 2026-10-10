@@ -4430,13 +4430,11 @@ fn with_health_banner(
         return result;
     }
     let banner = match health {
-        Some(codegraph_watch::WatchHealth::Recovering { .. }) => {
-            "⚠️ CodeGraph auto-sync is RECOVERING — another process held the index lock, so \
-             syncing paused; changes are still being collected, but the full index catch-up \
-             has not completed. Read files directly to confirm current content before relying \
-             on these results."
-                .to_string()
-        }
+        Some(codegraph_watch::WatchHealth::Recovering { reason }) => format!(
+            "⚠️ CodeGraph auto-sync is RECOVERING — a full index catch-up has not completed \
+             yet; changes are still being collected. Read files directly to confirm current \
+             content before relying on these results.\n  Reason: {reason}"
+        ),
         Some(codegraph_watch::WatchHealth::Disabled { reason }) => format!(
             "⚠️ CodeGraph auto-sync is DISABLED — live file watching stopped, so the index is \
              frozen and any file edited since then is stale here. Read files directly to confirm \

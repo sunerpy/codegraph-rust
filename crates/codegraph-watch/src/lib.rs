@@ -24,8 +24,8 @@ pub use sync::{
     sync_project_once_cancellable, sync_project_once_with_progress,
 };
 pub use watcher::{
-    LOCK_RECOVERY_INTERVAL, PendingFile, ProjectWatcher, WatchHealth, WatchOptions,
-    start_serve_watcher, watch_health, watch_options_for_project,
+    CODEGRAPH_WATCH_SENTINEL_MS, LOCK_RECOVERY_INTERVAL, PendingFile, ProjectWatcher, WatchHealth,
+    WatchOptions, start_serve_watcher, watch_health, watch_options_for_project,
 };
 #[cfg(feature = "test-hooks")]
 pub use watcher::{WatchHealthGuard, register_watch_health_for_tests};

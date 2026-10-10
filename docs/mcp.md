@@ -480,7 +480,9 @@ maintained once.
 The daemon runs a file watcher (`codegraph-watch`) that live-reindexes changed
 files. Events are debounced (default ~2 s; tunable via
 `CODEGRAPH_WATCH_DEBOUNCE_MS`) so a burst of saves triggers one incremental
-rebuild rather than many. The watcher is auto-disabled on WSL2 `/mnt/` drives
+rebuild rather than many. A burst of more than 500 paths, or any sign that the
+OS dropped events, runs one full project reconcile instead (see
+[`cli.md`](cli.md#live-file-watch)). The watcher is auto-disabled on WSL2 `/mnt/` drives
 where recursive watch is too slow; set `CODEGRAPH_FORCE_WATCH=1` to override.
 The selected index root's `config.toml` and `codegraph.json`, plus the project
 root `.gitignore`, are live control files: their events bypass ordinary
@@ -745,9 +747,13 @@ When the server runs the project's live watcher in-process, every answer also
 reports its health, since edits the index never heard about cannot reach the
 per-file banner above:
 
-- **RECOVERING** — another process held the index past the sync's contention
-  budget (a long foreground `index`). Watching continues and changes are still
-  collected; a full reconcile is retried every 30 s, and until one commits each
+- **RECOVERING** — a full reconcile is owed and has not committed yet, and the
+  banner names why. Either another process held the index past the sync's
+  contention budget (a long foreground `index`), in which case the reconcile is
+  retried every 30 s, or the watcher saw a sign that file events were lost (an
+  overflowed or dropped event stream, an event without a path, or, on Windows,
+  drift its sentinel found), in which case it runs right away. Watching
+  continues and changes are still collected; until the reconcile commits each
   response starts with `⚠️ CodeGraph auto-sync is RECOVERING …`.
 - **DISABLED** — watching stopped (watch resources exhausted, or syncs failing
   persistently). Responses start with `⚠️ CodeGraph auto-sync is DISABLED …` and

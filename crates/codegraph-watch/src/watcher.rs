@@ -29,6 +29,9 @@ type SyncFn = Arc<dyn Fn(Vec<String>) -> Result<SyncOutcome> + Send + Sync>;
 /// or cannot be expressed as a path list (see [`RemovalHint`]).
 type FullSyncFn = Arc<dyn Fn() -> Result<SyncOutcome> + Send + Sync>;
 type NoticeCallback = Arc<dyn Fn(String) + Send + Sync>;
+/// The drift sentinel's check: `Some(detail)` when the disk holds changes the
+/// index never recorded, `None` when it is current or cannot be read right now.
+type DriftCheckFn = Arc<dyn Fn() -> Result<Option<String>> + Send + Sync>;
 
 /// The OS watcher, shared between [`ProjectWatcher`] (which owns its lifetime)
 /// and the event-loop thread (which registers a watch when a brand-new
@@ -877,12 +880,57 @@ pub struct WatchOptions {
     /// How often a RECOVERING watcher retries its full reconcile. Defaults to
     /// [`LOCK_RECOVERY_INTERVAL`].
     pub lock_recovery_interval: Duration,
+    /// How often an idle watcher checks the index for changes its events never
+    /// reported (the drift sentinel). `None` turns it off. Defaults to
+    /// [`CODEGRAPH_WATCH_SENTINEL_MS`] on Windows, whose backend can lose events
+    /// without saying so, and `None` elsewhere.
+    pub drift_sentinel: Option<Duration>,
+    /// Override for the sentinel's check. Defaults to the delta `codegraph
+    /// status` reports; tests inject a script.
+    drift_check_fn: Option<DriftCheckFn>,
 }
 
 /// How often a watcher paused by lock contention retries its full reconcile,
 /// so a long-lived writer is not polled in a loop (upstream #1959's re-arm
 /// cooldown).
 pub const LOCK_RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Above this many pending paths a burst syncs the whole project instead of
+/// path by path (upstream #1397's `SCOPED_SYNC_MAX_PENDING`). A branch switch or
+/// mass rename is cheaper to diff once, and the full scan also repairs anything
+/// the burst's events failed to report.
+const SCOPED_SYNC_MAX_PENDING: usize = 500;
+
+/// Env var name: milliseconds between drift-sentinel checks of an idle watcher
+/// on Windows (default 60000); `0` turns the sentinel off. Other platforms run
+/// no sentinel, because their backends report lost events.
+pub const CODEGRAPH_WATCH_SENTINEL_MS: &str = "CODEGRAPH_WATCH_SENTINEL_MS";
+const DEFAULT_SENTINEL_MS: u64 = 60_000;
+const MIN_SENTINEL_MS: u64 = 1_000;
+const MAX_SENTINEL_MS: u64 = 3_600_000;
+
+/// How long one sentinel check waits for a shared index lease before skipping
+/// the round: a writer holding the index is already syncing it.
+const DRIFT_READ_BUDGET: Duration = Duration::from_millis(250);
+
+fn drift_sentinel_from_env() -> Option<Duration> {
+    if cfg!(windows) {
+        parse_sentinel_ms(std::env::var(CODEGRAPH_WATCH_SENTINEL_MS).ok().as_deref())
+    } else {
+        None
+    }
+}
+
+/// Unset, empty or malformed gives the default; `0` disables; anything else is
+/// clamped to [`MIN_SENTINEL_MS`, `MAX_SENTINEL_MS`].
+fn parse_sentinel_ms(raw: Option<&str>) -> Option<Duration> {
+    let millis = raw
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SENTINEL_MS);
+    (millis > 0).then(|| Duration::from_millis(millis.clamp(MIN_SENTINEL_MS, MAX_SENTINEL_MS)))
+}
 
 impl Default for WatchOptions {
     fn default() -> Self {
@@ -907,6 +955,8 @@ impl Default for WatchOptions {
             cancel: SyncCancellation::new(),
             lock_contention_budget: MAX_BACKOFF,
             lock_recovery_interval: LOCK_RECOVERY_INTERVAL,
+            drift_sentinel: drift_sentinel_from_env(),
+            drift_check_fn: None,
         }
     }
 }
@@ -951,6 +1001,8 @@ impl WatchOptions {
             on_scan();
             Ok(SyncOutcome::default())
         }));
+        // Index drift is the syncing watcher's to repair, not an observer's.
+        self.drift_sentinel = None;
         self
     }
 
@@ -1053,6 +1105,13 @@ impl ProjectWatcher {
             let cancel = cancel.clone();
             Arc::new(move || sync_project_once_cancellable(&project_root, &cancel))
         });
+        let drift_sentinel = options.drift_sentinel;
+        let drift_check_fn = options.drift_check_fn.clone().unwrap_or_else(|| {
+            let project_root = project_root.clone();
+            let index_paths = Arc::clone(&index_paths);
+            let cancel = cancel.clone();
+            Arc::new(move || index_drift(&project_root, &index_paths, &cancel))
+        });
         let (tx, rx) = mpsc::channel();
         let degraded = Arc::new(DegradedState::default());
         let health_key = project_root.clone();
@@ -1097,19 +1156,9 @@ impl ProjectWatcher {
             Arc::new(Mutex::new(None))
         } else {
             let callback_tx = tx.clone();
-            let mut watcher =
-                notify::recommended_watcher(move |event: notify::Result<Event>| match event {
-                    Ok(event) if !changes_content(&event.kind) => {}
-                    Ok(event) => {
-                        let _ = callback_tx.send(LoopMessage::Event(WatchEventBatch::from_event(
-                            &event.kind,
-                            event.paths,
-                        )));
-                    }
-                    Err(err) => {
-                        let _ = callback_tx.send(LoopMessage::WatchError(err));
-                    }
-                })?;
+            let mut watcher = notify::recommended_watcher(move |event: notify::Result<Event>| {
+                forward_notify(&callback_tx, event);
+            })?;
             // Windows ReadDirectoryChangesW and macOS FSEvents cover descendants
             // with one recursive root watch. Registering every directory separately
             // is both redundant and expensive on Windows (one 16 KiB buffer plus OS
@@ -1218,6 +1267,8 @@ impl ProjectWatcher {
                 supplemental_cap_warned,
                 lock_contention_budget,
                 lock_recovery_interval,
+                drift_sentinel,
+                drift_check_fn,
             });
             loop_finished.store(true, Ordering::SeqCst);
         });
@@ -1298,6 +1349,13 @@ impl ProjectWatcher {
         ])));
     }
 
+    /// Feed one notify callback result exactly as the OS watcher would, so a
+    /// test can produce the `Rescan` and path-less shapes no runner emits on
+    /// demand.
+    pub fn ingest_notify_event_for_tests(&self, event: notify::Result<Event>) {
+        forward_notify(&self.tx, event);
+    }
+
     /// Feed a REMOVED-DIRECTORY event, the notify `Remove(RemoveKind::Folder)`
     /// shape, without needing a real OS watcher.
     pub fn ingest_removed_dir_for_tests(&self, relative: impl Into<PathBuf>) {
@@ -1372,6 +1430,10 @@ enum LoopMessage {
 struct WatchEventBatch {
     paths: Vec<PathBuf>,
     removal: RemovalHint,
+    /// The backend may have dropped events: it flagged the event `Rescan`
+    /// (inotify queue overflow, an FSEvents drop) or reported a change without
+    /// naming any path. Only a full sync can find what was lost.
+    rescan: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1387,6 +1449,7 @@ impl WatchEventBatch {
         Self {
             paths,
             removal: RemovalHint::None,
+            rescan: false,
         }
     }
 
@@ -1396,7 +1459,34 @@ impl WatchEventBatch {
             EventKind::Remove(RemoveKind::Any) => RemovalHint::Ambiguous,
             _ => RemovalHint::None,
         };
-        Self { paths, removal }
+        Self {
+            paths,
+            removal,
+            rescan: false,
+        }
+    }
+
+    /// The batch for one notify event that [`changes_content`] let through.
+    fn from_notify(event: Event) -> Self {
+        let rescan = event.need_rescan() || event.paths.is_empty();
+        Self {
+            rescan,
+            ..Self::from_event(&event.kind, event.paths)
+        }
+    }
+}
+
+/// Hand one notify callback result to the event loop: content changes as a
+/// batch, errors as errors, and opens/reads not at all.
+fn forward_notify(tx: &Sender<LoopMessage>, event: notify::Result<Event>) {
+    match event {
+        Ok(event) if !changes_content(&event.kind) => {}
+        Ok(event) => {
+            let _ = tx.send(LoopMessage::Event(WatchEventBatch::from_notify(event)));
+        }
+        Err(err) => {
+            let _ = tx.send(LoopMessage::WatchError(err));
+        }
     }
 }
 
@@ -1454,6 +1544,8 @@ struct EventLoopCtx {
     supplemental_cap_warned: bool,
     lock_contention_budget: Duration,
     lock_recovery_interval: Duration,
+    drift_sentinel: Option<Duration>,
+    drift_check_fn: DriftCheckFn,
 }
 
 fn event_loop(ctx: EventLoopCtx) {
@@ -1476,6 +1568,8 @@ fn event_loop(ctx: EventLoopCtx) {
         mut supplemental_cap_warned,
         lock_contention_budget,
         lock_recovery_interval,
+        drift_sentinel,
+        drift_check_fn,
     } = ctx;
     let mut pending = BTreeMap::<String, PendingInfo>::new();
     let mut deadline = None::<Instant>;
@@ -1484,8 +1578,14 @@ fn event_loop(ctx: EventLoopCtx) {
     // per-path list (one full sync instead of N incremental ones) yet still
     // flushes exactly once, on the same debounce deadline.
     let mut full_sync_pending = false;
+    // When an idle watcher next asks the drift sentinel whether the disk holds
+    // changes its events never reported. Only consulted while nothing is
+    // pending; every sync pushes it a whole interval out.
+    let mut sentinel_due = drift_sentinel.map(|every| Instant::now() + every);
+    let mut drift_error_reported = false;
     loop {
-        let message = match deadline {
+        let wake = deadline.or(sentinel_due);
+        let message = match wake {
             Some(when) => match rx.recv_timeout(when.saturating_duration_since(Instant::now())) {
                 Ok(message) => Some(message),
                 Err(RecvTimeoutError::Timeout) => None,
@@ -1499,7 +1599,11 @@ fn event_loop(ctx: EventLoopCtx) {
 
         match message {
             Some(LoopMessage::Event(batch)) => {
-                let WatchEventBatch { paths, removal } = batch;
+                let WatchEventBatch {
+                    paths,
+                    removal,
+                    rescan,
+                } = batch;
                 let mut control_changes = ControlChanges::default();
                 let mut normalized = Vec::new();
                 // Set when this batch changes which links the index follows.
@@ -1685,6 +1789,18 @@ fn event_loop(ctx: EventLoopCtx) {
                     supplemental = next_supplemental;
                     full_sync_pending = true;
                 }
+                // The backend may have dropped events (upstream #2025's
+                // `filename == null`, an inotify overflow, an FSEvents drop):
+                // only a full scan finds what they would have reported.
+                if rescan && runtime_scope.enabled {
+                    full_sync_pending = true;
+                    begin_lost_event_recovery(
+                        &degraded,
+                        &mut deadline,
+                        runtime_scope.debounce,
+                        "the OS watcher reported dropped events or a change without a path",
+                    );
+                }
                 // While lock contention paused auto-sync, the recovery retry keeps
                 // its own cadence; a burst of edits must not poll the other writer.
                 if !pending.is_empty() && !degraded.is_recovering() {
@@ -1704,12 +1820,42 @@ fn event_loop(ctx: EventLoopCtx) {
             }
             #[cfg(test)]
             Some(LoopMessage::Flush(reply)) => {
-                if !pending.is_empty() {
+                if !pending.is_empty() || full_sync_pending {
                     deadline = Some(Instant::now());
                 }
                 let _ = reply.send(());
             }
             Some(LoopMessage::Stop) => break,
+            None if deadline.is_none() => {
+                // The drift sentinel's idle tick. A recovery already owes a full
+                // reconcile, and a disabled scope syncs nothing.
+                sentinel_due = drift_sentinel.map(|every| Instant::now() + every);
+                if degraded.is_recovering() || !runtime_scope.enabled {
+                    continue;
+                }
+                match drift_check_fn() {
+                    Ok(Some(detail)) => {
+                        // A backend that lost events may also have dropped its
+                        // watch without saying so (notify's Windows backend on an
+                        // unexpected error code): register the root again.
+                        rewatch_root(&watcher, &project_root, &on_sync_error);
+                        full_sync_pending = true;
+                        begin_lost_event_recovery(
+                            &degraded,
+                            &mut deadline,
+                            Duration::ZERO,
+                            &format!("the drift sentinel found {detail}"),
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        if !drift_error_reported && let Some(callback) = &on_sync_error {
+                            callback(format!("watch drift check failed: {err:#}"));
+                        }
+                        drift_error_reported = true;
+                    }
+                }
+            }
             None => {
                 // Taken for the attempt; a failed or paused sync puts it back.
                 let mut batch = Some(std::mem::take(&mut pending));
@@ -1718,7 +1864,11 @@ fn event_loop(ctx: EventLoopCtx) {
                     .map(|batch| batch.keys().cloned().collect::<Vec<_>>())
                     .unwrap_or_default();
                 deadline = None;
-                let full_sync = std::mem::take(&mut full_sync_pending);
+                sentinel_due = drift_sentinel.map(|every| Instant::now() + every);
+                // A burst past the ceiling is diffed whole: cheaper than path by
+                // path, and it also repairs whatever its events failed to report.
+                let full_sync =
+                    std::mem::take(&mut full_sync_pending) || paths.len() > SCOPED_SYNC_MAX_PENDING;
                 let attempt = if full_sync {
                     run_full_sync_with_backoff(&full_sync_fn, lock_contention_budget)
                 } else {
@@ -1795,6 +1945,77 @@ fn event_loop(ctx: EventLoopCtx) {
 fn with_trigger_paths(mut outcome: SyncOutcome, trigger_paths: Vec<String>) -> SyncOutcome {
     outcome.trigger_paths = trigger_paths;
     outcome
+}
+
+/// Events may have been lost: report RECOVERING, naming `cause`, until the full
+/// sync the caller owes commits, and schedule that sync `delay` from now. A
+/// recovery already under way (lock contention) owes the same full reconcile,
+/// so it keeps its own reason and retry cadence.
+fn begin_lost_event_recovery(
+    degraded: &DegradedState,
+    deadline: &mut Option<Instant>,
+    delay: Duration,
+    cause: &str,
+) {
+    if degraded.is_recovering() {
+        return;
+    }
+    degraded.mark_recovering(format!("events may have been lost: {cause}"));
+    *deadline = Some(Instant::now() + delay);
+}
+
+/// Register the recursive root watch again. Only single-root backends need it:
+/// notify's Windows backend can drop that watch on an unexpected error code
+/// without reporting anything, while per-directory backends report failures.
+fn rewatch_root(
+    watcher: &SharedWatcher,
+    project_root: &Path,
+    on_sync_error: &Option<NoticeCallback>,
+) {
+    if watch_registration(platform_watch_backend()) != WatchRegistration::SingleRootRecursive {
+        return;
+    }
+    let Ok(mut guard) = watcher.lock() else {
+        return;
+    };
+    let Some(watcher) = guard.as_mut() else {
+        return;
+    };
+    let _ = watcher.unwatch(project_root);
+    if let Err(err) = watcher.watch(project_root, RecursiveMode::Recursive)
+        && let Some(callback) = on_sync_error
+    {
+        callback(format!(
+            "re-watching {} after drift failed: {err}",
+            project_root.display()
+        ));
+    }
+}
+
+/// The drift sentinel's default check: the same delta `codegraph status`
+/// reports (git's fast path when it can vouch for the tree, the full inventory
+/// otherwise). A writer holding the index is already syncing it, and an index
+/// that is not current is the catch-up's to rebuild, so both skip the round.
+fn index_drift(
+    project_root: &Path,
+    index_paths: &IndexPaths,
+    cancel: &SyncCancellation,
+) -> Result<Option<String>> {
+    let deadline = Instant::now() + DRIFT_READ_BUDGET;
+    let Ok(store) =
+        codegraph_store::Store::open_for_read(index_paths, deadline, || cancel.is_cancelled())
+    else {
+        return Ok(None);
+    };
+    let pending = crate::sync::pending_project_changes(project_root, &store)?;
+    Ok((!pending.is_empty()).then(|| {
+        format!(
+            "{} added, {} modified and {} removed path(s) the watcher never reported",
+            pending.added.len(),
+            pending.modified.len(),
+            pending.removed.len()
+        )
+    }))
 }
 
 /// Apply the EMFILE/ENFILE → degrade-once, ENOSPC → warn classification to a
@@ -4326,6 +4547,294 @@ mod tests {
         assert!(
             scheduled,
             "a file link whose target became a directory now reaches a tree the scan follows"
+        );
+    }
+
+    // ---- lost events (upstream #1397, #2025; sunerpy/codegraph-rust#269) ----
+
+    /// What an injected watcher's syncs did: every incremental batch, and one
+    /// channel message per full sync.
+    struct SyncLog {
+        incremental: Recorded,
+        full: mpsc::Receiver<()>,
+    }
+
+    /// An inert watcher whose syncs only record what they were asked to do. The
+    /// full sync runs `full_sync` first, so a test can fail or hold it.
+    fn logging_watcher(
+        root: &Path,
+        options: WatchOptions,
+        full_sync: impl Fn() -> Result<()> + Send + Sync + 'static,
+    ) -> (ProjectWatcher, SyncLog) {
+        let incremental: Recorded = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&incremental);
+        let sync_fn: SyncFn = Arc::new(move |paths| {
+            sink.lock().unwrap().push(paths);
+            Ok(SyncOutcome::default())
+        });
+        let (full_tx, full) = mpsc::channel();
+        let full_sync_fn: FullSyncFn = Arc::new(move || {
+            full_sync()?;
+            let _ = full_tx.send(());
+            Ok(SyncOutcome::default())
+        });
+        let watcher = ProjectWatcher::start(
+            root,
+            WatchOptions {
+                inert_for_tests: true,
+                sync_fn: Some(sync_fn),
+                full_sync_fn: Some(full_sync_fn),
+                drift_sentinel: None,
+                ..options
+            },
+        )
+        .unwrap()
+        .unwrap();
+        (watcher, SyncLog { incremental, full })
+    }
+
+    fn quiet_options() -> WatchOptions {
+        WatchOptions {
+            debounce: Duration::from_secs(30),
+            ..WatchOptions::default()
+        }
+    }
+
+    #[test]
+    fn rescan_flag_forces_full_sync() {
+        use notify::event::{Flag, ModifyKind};
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-rescan-flag");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        let (watcher, log) = logging_watcher(dir.path(), quiet_options(), || Ok(()));
+
+        // inotify reports a queue overflow as a path-less `Other` event flagged
+        // Rescan; FSEvents flags a dropped stream the same way, with a path.
+        watcher
+            .ingest_notify_event_for_tests(Ok(Event::new(EventKind::Other).set_flag(Flag::Rescan)));
+        watcher.flush_for_tests();
+        log.full
+            .recv_timeout(Duration::from_secs(2))
+            .expect("an overflow schedules a full sync");
+        watcher.ingest_notify_event_for_tests(Ok(Event::new(EventKind::Modify(ModifyKind::Any))
+            .add_path(PathBuf::from("src/app.ts"))
+            .set_flag(Flag::Rescan)));
+        watcher.flush_for_tests();
+        log.full
+            .recv_timeout(Duration::from_secs(2))
+            .expect("a Rescan flag on a named path also schedules a full sync");
+        watcher.stop();
+
+        assert!(
+            log.incremental.lock().unwrap().is_empty(),
+            "a possible event loss never takes the path-scoped sync"
+        );
+    }
+
+    #[test]
+    fn empty_path_event_forces_full_sync() {
+        use notify::event::{CreateKind, ModifyKind};
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-empty-path");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        let (watcher, log) = logging_watcher(dir.path(), quiet_options(), || Ok(()));
+
+        // An open or a read names no change and still never reaches the loop.
+        watcher.ingest_notify_event_for_tests(Ok(Event::new(EventKind::Access(AccessKind::Open(
+            AccessMode::Any,
+        )))));
+        watcher.flush_for_tests();
+        assert!(log.full.try_recv().is_err(), "an open schedules nothing");
+
+        // A change the backend could not attribute to any path (libuv's
+        // `filename == null`) can only be found by a full scan.
+        for kind in [
+            EventKind::Modify(ModifyKind::Any),
+            EventKind::Create(CreateKind::Any),
+        ] {
+            watcher.ingest_notify_event_for_tests(Ok(Event::new(kind)));
+            watcher.flush_for_tests();
+            log.full
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap_or_else(|_| panic!("a path-less {kind:?} schedules a full sync"));
+        }
+        watcher.stop();
+        assert!(log.incremental.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn burst_over_500_paths_forces_full_sync() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-burst-ceiling");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        let (watcher, log) = logging_watcher(dir.path(), quiet_options(), || Ok(()));
+
+        // At the ceiling the burst is still synced path by path...
+        for n in 0..SCOPED_SYNC_MAX_PENDING {
+            watcher.ingest_event_for_tests(format!("src/f{n:04}.ts"));
+        }
+        watcher.flush_for_tests();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while log.incremental.lock().unwrap().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        {
+            let batches = log.incremental.lock().unwrap();
+            assert_eq!(batches.len(), 1, "one scoped sync at the ceiling");
+            assert_eq!(batches[0].len(), SCOPED_SYNC_MAX_PENDING);
+        }
+        assert!(log.full.try_recv().is_err());
+
+        // ...and one path more makes it one full sync instead.
+        for n in 0..=SCOPED_SYNC_MAX_PENDING {
+            watcher.ingest_event_for_tests(format!("src/g{n:04}.ts"));
+        }
+        watcher.flush_for_tests();
+        log.full
+            .recv_timeout(Duration::from_secs(2))
+            .expect("a burst past the ceiling schedules a full sync");
+        watcher.stop();
+        assert_eq!(
+            log.incremental.lock().unwrap().len(),
+            1,
+            "the burst past the ceiling never takes the path-scoped sync"
+        );
+    }
+
+    #[test]
+    fn lost_events_report_recovering_until_committed() {
+        use notify::event::Flag;
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-lost-recovering");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        // The first full sync fails; the retry is held until the test lets it
+        // commit, so the health in between is observable.
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempt_counter = Arc::clone(&attempts);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let (watcher, log) = logging_watcher(
+            dir.path(),
+            WatchOptions {
+                debounce: Duration::from_millis(20),
+                ..WatchOptions::default()
+            },
+            move || {
+                if attempt_counter.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                    anyhow::bail!("disk unavailable");
+                }
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .map_err(|_| anyhow::anyhow!("test never released the sync"))
+            },
+        );
+        assert_eq!(watcher.health(), WatchHealth::Healthy);
+
+        watcher
+            .ingest_notify_event_for_tests(Ok(Event::new(EventKind::Other).set_flag(Flag::Rescan)));
+        let recovering = wait_until(|| attempts.load(AtomicOrdering::SeqCst) >= 2);
+        assert!(recovering, "the failed full sync is retried");
+        match watcher.health() {
+            WatchHealth::Recovering { reason } => assert!(
+                reason.contains("events may have been lost"),
+                "the reason names the cause: {reason}"
+            ),
+            other => panic!("RECOVERING until a full sync commits, got {other:?}"),
+        }
+
+        release_tx.send(()).unwrap();
+        log.full
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the retried full sync commits");
+        let healthy = wait_until(|| watcher.health() == WatchHealth::Healthy);
+        watcher.stop();
+        assert!(healthy, "a committed full sync ends the recovery");
+    }
+
+    #[test]
+    fn sentinel_drift_triggers_full_sync() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-sentinel-drift");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        let checks = Arc::new(AtomicUsize::new(0));
+        let check_counter = Arc::clone(&checks);
+        let drift_check_fn: DriftCheckFn = Arc::new(move || {
+            // Only the second check finds drift: the first proves a clean check
+            // schedules nothing.
+            Ok((check_counter.fetch_add(1, AtomicOrdering::SeqCst) == 1)
+                .then(|| "1 added path the watcher never reported".to_string()))
+        });
+        let incremental: Recorded = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&incremental);
+        let (full_tx, full_rx) = mpsc::channel();
+        let full_checks = Arc::clone(&checks);
+        let watcher = ProjectWatcher::start(
+            dir.path(),
+            WatchOptions {
+                debounce: Duration::from_millis(20),
+                inert_for_tests: true,
+                sync_fn: Some(Arc::new(move |paths| {
+                    sink.lock().unwrap().push(paths);
+                    Ok(SyncOutcome::default())
+                })),
+                full_sync_fn: Some(Arc::new(move || {
+                    let _ = full_tx.send(full_checks.load(AtomicOrdering::SeqCst));
+                    Ok(SyncOutcome::default())
+                })),
+                drift_sentinel: Some(Duration::from_millis(30)),
+                drift_check_fn: Some(drift_check_fn),
+                ..WatchOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        let checks_before_sync = full_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("drift found by the sentinel schedules a full sync");
+        assert_eq!(
+            checks_before_sync, 2,
+            "the full sync follows the check that found drift, not the clean one"
+        );
+        let checked_again = wait_until(|| checks.load(AtomicOrdering::SeqCst) >= 4);
+        let healthy = watcher.health() == WatchHealth::Healthy;
+        watcher.stop();
+        assert!(checked_again, "the sentinel keeps checking while idle");
+        assert!(healthy, "the committed full sync ends the recovery");
+        assert!(full_rx.try_recv().is_err(), "clean checks schedule nothing");
+        assert!(incremental.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sentinel_interval_parses_its_env_value() {
+        assert_eq!(parse_sentinel_ms(None), Some(Duration::from_secs(60)));
+        assert_eq!(parse_sentinel_ms(Some("")), Some(Duration::from_secs(60)));
+        assert_eq!(
+            parse_sentinel_ms(Some("soon")),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(parse_sentinel_ms(Some("0")), None);
+        assert_eq!(parse_sentinel_ms(Some("5")), Some(Duration::from_secs(1)));
+        assert_eq!(
+            parse_sentinel_ms(Some("90000")),
+            Some(Duration::from_secs(90))
+        );
+        assert_eq!(
+            parse_sentinel_ms(Some("99999999")),
+            Some(Duration::from_secs(3_600))
+        );
+        assert_eq!(
+            WatchOptions::default().drift_sentinel.is_some(),
+            cfg!(windows),
+            "only Windows runs the sentinel by default"
+        );
+        assert_eq!(
+            WatchOptions::default()
+                .observe_only(|_| {}, || {})
+                .drift_sentinel,
+            None
         );
     }
 }
