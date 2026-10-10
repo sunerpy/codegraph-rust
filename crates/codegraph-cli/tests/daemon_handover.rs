@@ -406,6 +406,32 @@ fn an_older_release_daemon_that_does_not_drain_keeps_the_project() {
     session.close();
 }
 
+/// A session classified an older daemon, and a newer one took the project
+/// before the shutdown frame went out: the frame is sent only on a connection
+/// whose own hello names the classified peer, so the newer daemon never sees
+/// it.
+#[test]
+fn a_shutdown_bound_to_an_older_peer_never_drains_a_newer_daemon() {
+    let dir = TestDir::new("race");
+    let project = indexed_project(&dir);
+    let mut newer = StandInDaemon::start(&project, dir.path(), "999.0.0", false);
+    let paths = codegraph_core::IndexPaths::resolve(&project, None).unwrap();
+
+    let outcome =
+        codegraph_daemon::request_daemon_shutdown_of(&project, paths.project_identity(), |hello| {
+            hello["codegraph"] == "0.0.1"
+        });
+    assert!(
+        matches!(
+            outcome,
+            Ok(codegraph_daemon::ShutdownOutcome::Declined { pid, .. }) if pid == newer.pid()
+        ),
+        "{outcome:?}"
+    );
+    assert!(newer.running(), "the newer daemon never received the frame");
+    assert_eq!(writer_pid(&project), Some(newer.pid()));
+}
+
 /// The daemon a copied install starts exits once that copy is replaced: the
 /// copy is renamed away, the way updaters move a running executable aside, and
 /// a new file takes its path.

@@ -30,7 +30,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 pub use control::{
     CONTROL_PROTOCOL, ControlAck, ControlFrame, ShutdownOutcome, parse_control_frame,
-    request_daemon_shutdown,
+    request_daemon_shutdown, request_daemon_shutdown_of,
 };
 pub use install::{CODEGRAPH_DAEMON_INSTALL_CHECK_MS, InstallIdentity, install_check_interval};
 pub use lease_keeper::{

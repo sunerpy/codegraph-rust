@@ -1668,6 +1668,9 @@ fn drain_project_daemon(project: &Path, project_identity: &str) -> Result<(), St
         Ok(codegraph_daemon::ShutdownOutcome::Unresponsive { pid, detail }) => Err(format!(
             "daemon {pid} did not acknowledge the shutdown control frame ({detail})"
         )),
+        Ok(codegraph_daemon::ShutdownOutcome::Declined { pid, detail }) => Err(format!(
+            "daemon {pid} was not asked to shut down ({detail})"
+        )),
         Err(error) => Err(format!("could not reach this project's daemon: {error:#}")),
     }
 }
@@ -4201,7 +4204,17 @@ fn replace_older_daemon(project_root: &Path) -> DaemonReplacement {
             ));
         }
     };
-    match codegraph_daemon::request_daemon_shutdown(project_root, &identity) {
+    // The frame goes only to a daemon whose hello, on the shutdown connection
+    // itself, is the older release classified above: a daemon that took the
+    // project in between is never asked.
+    let classified = version.clone();
+    let is_classified = move |hello: &serde_json::Value| {
+        matches!(
+            codegraph_daemon::classify_daemon_hello(hello),
+            DaemonPeer::OlderRelease { version } if version == classified
+        )
+    };
+    match codegraph_daemon::request_daemon_shutdown_of(project_root, &identity, is_classified) {
         Ok(ShutdownOutcome::Drained { pid }) => {
             tracing::info!(
                 pid,
@@ -4213,6 +4226,9 @@ fn replace_older_daemon(project_root: &Path) -> DaemonReplacement {
         Ok(ShutdownOutcome::NoDaemon) => DaemonReplacement::Drained,
         Ok(ShutdownOutcome::Unresponsive { pid, detail }) => DaemonReplacement::Kept(format!(
             "the codegraph {version} daemon (pid {pid}) did not drain when asked ({detail})"
+        )),
+        Ok(ShutdownOutcome::Declined { pid, detail }) => DaemonReplacement::Kept(format!(
+            "the project's daemon (pid {pid}) is no longer the codegraph {version} one ({detail})"
         )),
         Err(error) => DaemonReplacement::Kept(format!(
             "the codegraph {version} daemon could not be asked to drain ({error:#})"
