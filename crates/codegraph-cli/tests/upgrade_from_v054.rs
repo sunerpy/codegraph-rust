@@ -101,8 +101,9 @@ fn assert_upgraded_like_a_fresh_init(project: &Path, label: &str) {
         ExtractionStatus::Current,
         "the upgraded namespace must be current"
     );
+    // `immutable=1` takes no lock and leaves no `-wal`/`-shm` beside the index.
     let conn = rusqlite::Connection::open_with_flags(
-        format!("file:{}?immutable=1", paths.current_db().display()),
+        format!("{}?immutable=1", sqlite_file_uri(&paths.current_db())),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )
     .expect("open upgraded database");
@@ -134,6 +135,25 @@ fn assert_upgraded_like_a_fresh_init(project: &Path, label: &str) {
     if let Err(report) = diff_canonical(&fresh, &upgraded, None) {
         panic!("the upgraded index differs from a fresh init:\n{report}");
     }
+}
+
+/// `path` as an absolute SQLite `file:` URI: a Windows verbatim prefix (`\\?\`)
+/// is dropped and every byte outside the unreserved set is percent-encoded.
+fn sqlite_file_uri(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    let text = text.strip_prefix("//?/").unwrap_or(&text);
+    let mut uri = String::from("file://");
+    if !text.starts_with('/') {
+        uri.push('/');
+    }
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || b"/-._~:".contains(&byte) {
+            uri.push(char::from(byte));
+        } else {
+            uri.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    uri
 }
 
 fn mini_fixture() -> PathBuf {
