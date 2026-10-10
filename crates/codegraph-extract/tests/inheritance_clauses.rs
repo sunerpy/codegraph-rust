@@ -134,3 +134,24 @@ fn php_extends_and_implements_are_supertypes() {
         ]
     );
 }
+
+/// G10 (upstream `1244c621`, #2397): a Go struct's embedded field and an
+/// interface's embedded interface are `extends` refs, named where they are
+/// written: `*Head` (the `*` is its own token), `sync.Mutex` by `Mutex`, and
+/// `Box[int]` by `Box`. A named field, a method, a type set (`~int |
+/// float64`) and a predeclared type are not embeddings.
+#[test]
+fn go_embedded_types_are_supertypes() {
+    let source = "package db\n\ntype DB struct {\n\t*Head\n\tQueryable\n\tsync.Mutex\n\tBox[int]\n\tname string\n\terror\n}\n\ntype IRouter interface {\n\tIRoutes\n\tio.Reader\n\tGroup(p string) *RouterGroup\n\t~int | float64\n}\n";
+    assert_eq!(
+        supertypes("db/db.go", source, Language::Go),
+        vec![
+            extends("DB", "Box"),
+            extends("DB", "Head"),
+            extends("DB", "Mutex"),
+            extends("DB", "Queryable"),
+            extends("IRouter", "IRoutes"),
+            extends("IRouter", "Reader"),
+        ]
+    );
+}

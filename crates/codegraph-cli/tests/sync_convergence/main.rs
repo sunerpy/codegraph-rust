@@ -631,6 +631,7 @@ matrix! {
     objc_change_a_superclass,
     python_change_a_base_class,
     php_change_a_parent_class,
+    go_change_an_embedded_struct,
     scala_change_a_parent_trait,
     solidity_change_a_base_contract,
     cfml_change_a_base_component,

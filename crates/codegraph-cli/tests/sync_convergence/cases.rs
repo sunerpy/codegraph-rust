@@ -917,6 +917,20 @@ pub fn php_change_a_parent_class() -> Case {
         .edge_after("class App::Square", "extends", "class App::Figure")
 }
 
+/// G10: a Go struct's embedded type is its supertype.
+pub fn go_change_an_embedded_struct() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Go])
+        .file("go.mod", "module example.com/db\n\ngo 1.22\n")
+        .file(
+            "parts.go",
+            "package db\n\ntype Head struct{}\n\ntype Tail struct{}\n",
+        )
+        .file("db.go", "package db\n\ntype DB struct {\n\t*Head\n}\n")
+        .write("db.go", "package db\n\ntype DB struct {\n\t*Tail\n}\n")
+        .edge_before("struct DB", "extends", "struct Head")
+        .edge_after("struct DB", "extends", "struct Tail")
+}
+
 pub fn scala_change_a_parent_trait() -> Case {
     Case::new(Change::EditHeritage, &[Language::Scala])
         .file(

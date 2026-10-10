@@ -4756,6 +4756,43 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             if child.kind() == "class_heritage" {
                 self.extract_inheritance(child, class_id);
             }
+            // G10 (upstream `1244c621`, #2397) — Go embedding: a struct's
+            // field without a name (`*Head`, `pkg.Base`, `Box[T]`) and an
+            // interface's lone named type are supertypes.
+            if self.spec.language() == Language::Go {
+                match child.kind() {
+                    "field_declaration_list" => self.extract_inheritance(child, class_id),
+                    "field_declaration" => {
+                        let named = child
+                            .named_children(&mut child.walk())
+                            .any(|c| c.kind() == "field_identifier");
+                        let embedded = (!named)
+                            .then(|| {
+                                go_embedded_type_name(child_by_field(child, "type"), self.source)
+                            })
+                            .flatten();
+                        if let Some(type_id) = embedded {
+                            let name = node_text(type_id, self.source);
+                            self.push_ref(class_id, &name, EdgeKind::Extends, type_id);
+                        }
+                    }
+                    "type_elem" => {
+                        let terms: Vec<_> = child
+                            .named_children(&mut child.walk())
+                            .filter(|c| c.kind() != "comment")
+                            .collect();
+                        let embedded = match terms.as_slice() {
+                            [term] => go_embedded_type_name(Some(*term), self.source),
+                            _ => None,
+                        };
+                        if let Some(type_id) = embedded {
+                            let name = node_text(type_id, self.source);
+                            self.push_ref(class_id, &name, EdgeKind::Extends, type_id);
+                        }
+                    }
+                    _ => {}
+                }
+            }
             // G7 — PHP `class S extends Base implements A, B` and
             // `interface I extends J, K`: every listed name, by its last `\`
             // segment (the name a class is stored under and a `use` brings
@@ -6170,6 +6207,55 @@ fn has_type_annotation_refs(language: Language) -> bool {
             | Language::Swift
             | Language::Dart
             | Language::Php
+    )
+}
+
+/// The name node of the type a Go embedding names (upstream
+/// `goEmbeddedTypeName`): `Base`, `pkg.Base` by `Base`, `Base[T]` by `Base`;
+/// a predeclared type is none.
+fn go_embedded_type_name<'tree>(
+    ty: Option<SyntaxNode<'tree>>,
+    source: &str,
+) -> Option<SyntaxNode<'tree>> {
+    let ty = ty?;
+    let ty = if ty.kind() == "generic_type" {
+        child_by_field(ty, "type")?
+    } else {
+        ty
+    };
+    if ty.kind() == "qualified_type" {
+        return child_by_field(ty, "name");
+    }
+    (ty.kind() == "type_identifier" && !is_go_predeclared_type(&node_text(ty, source)))
+        .then_some(ty)
+}
+
+/// Go's predeclared types (upstream `GO_PREDECLARED_TYPES`).
+fn is_go_predeclared_type(name: &str) -> bool {
+    matches!(
+        name,
+        "any"
+            | "bool"
+            | "byte"
+            | "comparable"
+            | "complex64"
+            | "complex128"
+            | "error"
+            | "float32"
+            | "float64"
+            | "int"
+            | "int8"
+            | "int16"
+            | "int32"
+            | "int64"
+            | "rune"
+            | "string"
+            | "uint"
+            | "uint8"
+            | "uint16"
+            | "uint32"
+            | "uint64"
+            | "uintptr"
     )
 }
 
@@ -9276,11 +9362,11 @@ public:
         );
     }
 
-    // NEGATIVE: a non-C++ language that has a `:`-bearing construct must be
-    // unaffected by the base_class_clause arm (Go struct embedding is NOT a
-    // base_class_clause and does not emit Extends via this path).
+    // Go struct embedding is no C++ base_class_clause, but it is a supertype
+    // (G10, upstream `1244c621`): the embedded `Base` is one `Extends` ref,
+    // emitted once, by the Go arm.
     #[test]
-    fn go_struct_unaffected_by_cpp_base_arm() {
+    fn go_struct_embedding_is_one_extends_ref() {
         let src = r#"
 package main
 type Base struct{}
@@ -9289,11 +9375,11 @@ type D struct {
 }
 "#;
         let (_, refs) = run("d.go", src, Language::Go);
-        // No C++ base_class_clause exists in Go; the arm must not fire.
-        assert!(
-            !has_ref(&refs, EdgeKind::Extends, "Base"),
-            "Go struct embedding must not go through the C++ base arm"
-        );
+        let extends = refs
+            .iter()
+            .filter(|r| r.reference_kind == EdgeKind::Extends && r.reference_name == "Base")
+            .count();
+        assert_eq!(extends, 1, "Go struct embedding is one Extends ref");
     }
 
     // The #1061 export-macro path and the general base arm must NOT double-emit:

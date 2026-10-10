@@ -12,6 +12,30 @@
     "target": "method:7c53230815733da97f5fffbad03321ed"
   },
   {
+    "col": 1,
+    "kind": "extends",
+    "line": 17,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "struct:606f2ccca37614d5812343568306d220",
+    "target": "struct:a10a7dcc11300874eeecc89c491e4c1d"
+  },
+  {
+    "col": 1,
+    "kind": "extends",
+    "line": 8,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "interface:8ce05b9afd075953348b7d6bf74a9556",
+    "target": "interface:ff5c816f7e8b8bcf3e978f4fa19dc63a"
+  },
+  {
     "col": 11,
     "kind": "calls",
     "line": 8,
