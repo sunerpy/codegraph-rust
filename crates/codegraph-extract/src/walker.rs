@@ -98,7 +98,8 @@ fn is_literal_receiver(node: SyntaxNode<'_>) -> bool {
 /// Call-node kinds whose `function` child names a member on a receiver — the
 /// `obj.method` family across the grammars (`member_expression` for TS/JS/ArkTS,
 /// `attribute` for Python, `field_expression` for Go/Rust/C/C++,
-/// `navigation_expression` for Swift/Kotlin, plus C++ `qualified_identifier`).
+/// `navigation_expression` for Swift/Kotlin, plus C++ `qualified_identifier`
+/// as a receiver, `ns::obj.m()`; a qualified C++ callee keeps its scope, G13).
 const MEMBER_SHAPED_CALLEE_KINDS: [&str; 6] = [
     "member_expression",
     "attribute",
@@ -3884,7 +3885,13 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             }
         });
         if let Some(func) = func {
-            if is_member_shaped_callee(func) {
+            // G13 — a C++ call keeps the scope it is written with: `ns::f()`
+            // calls `ns::f`, `Base::m()` calls `Base::m`, and `::f()`, from
+            // the global scope, `::f`. The qualified-name matcher binds it;
+            // template arguments are stripped below.
+            let cpp_scoped =
+                self.spec.language() == Language::Cpp && func.kind() == "qualified_identifier";
+            if is_member_shaped_callee(func) && !cpp_scoped {
                 if let Some(property) = member_name_of(func) {
                     let method_name = node_text(property, self.source);
                     let ts_js = is_ts_js_chain_language(self.spec.language());

@@ -341,6 +341,30 @@ pub fn swift_method_body_edit() -> Case {
         .edge_throughout("function tick", "instantiates", "class Counter")
 }
 
+/// G13: a C++ call keeps its scope, so `ns::compute()` and `alt::compute()`
+/// reach different functions of one name.
+pub fn cpp_qualified_call_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Cpp])
+        .file(
+            "src/compute.hpp",
+            "namespace ns {\nint compute();\n}\n\nnamespace alt {\nint compute();\n}\n",
+        )
+        .file(
+            "src/compute.cpp",
+            "#include \"compute.hpp\"\n\nnamespace ns {\nint compute() { return 1; }\n}\n\nnamespace alt {\nint compute() { return 2; }\n}\n",
+        )
+        .file(
+            "src/run.cpp",
+            "#include \"compute.hpp\"\n\nint run() {\n  return ns::compute();\n}\n",
+        )
+        .write(
+            "src/run.cpp",
+            "#include \"compute.hpp\"\n\nint run() {\n  return alt::compute();\n}\n",
+        )
+        .edge_before("function run", "calls", "function ns::compute")
+        .edge_after("function run", "calls", "function alt::compute")
+}
+
 pub fn vue_component_template_edit() -> Case {
     Case::new(Change::BodyEdit, &[Language::Vue])
         .file("package.json", "{\"name\":\"shop\",\"dependencies\":{\"vue\":\"3.4.0\"}}\n")

@@ -52,7 +52,7 @@
     "kind": "calls",
     "line": 10,
     "metadata": {
-      "confidence": 0.85,
+      "confidence": 0.95,
       "resolvedBy": "qualified-name"
     },
     "provenance": null,
@@ -352,8 +352,8 @@
     "kind": "calls",
     "line": 8,
     "metadata": {
-      "confidence": 0.9,
-      "resolvedBy": "exact-match"
+      "confidence": 0.95,
+      "resolvedBy": "qualified-name"
     },
     "provenance": null,
     "source": "function:8118a321a3f16f7898de2768139b459d",
