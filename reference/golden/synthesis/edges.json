@@ -24,6 +24,18 @@
     "target": "function:4dd6d60e8491a45d03b1aeacb013539a"
   },
   {
+    "col": 11,
+    "kind": "references",
+    "line": 27,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "function:31958cc8a7c1c6134f84b5da2195fa02",
+    "target": "interface:8ce05b9afd075953348b7d6bf74a9556"
+  },
+  {
     "col": 12,
     "kind": "references",
     "line": 10,

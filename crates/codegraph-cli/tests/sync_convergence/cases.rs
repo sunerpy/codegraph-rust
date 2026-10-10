@@ -122,6 +122,21 @@ pub fn go_composite_literal_of_an_added_struct() -> Case {
         .edge_after("function main", "instantiates", "struct Widget @widget.go")
 }
 
+/// G3: a Go parameter type is a reference to a struct that appears later.
+pub fn go_parameter_type_of_an_added_struct() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Go])
+        .file("go.mod", "module example.com/shop\n\ngo 1.22\n")
+        .file(
+            "main.go",
+            "package main\n\nfunc Ship(o Order) int {\n\treturn 1\n}\n",
+        )
+        .write(
+            "order.go",
+            "package main\n\ntype Order struct {\n\tID int\n}\n",
+        )
+        .edge_after("function Ship", "references", "struct Order @order.go")
+}
+
 /// Upstream #2392 notes that C includes already converge.
 pub fn c_include_of_an_added_header() -> Case {
     Case::new(Change::AddImportTarget, &[Language::C])

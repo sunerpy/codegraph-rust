@@ -4708,7 +4708,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     }
 
     fn extract_type_annotations(&mut self, node: SyntaxNode<'tree>, node_id: &str) {
-        if !matches!(self.spec.language(), Language::TypeScript | Language::Tsx) {
+        if !has_type_annotation_refs(self.spec.language()) {
             return;
         }
         if let Some(params) = child_by_field(node, self.spec.params_field()) {
@@ -5765,6 +5765,17 @@ fn property_or_field_signature(node: SyntaxNode<'_>, name: &str, source: &str) -
     type_node.map(|node| format!("{} {name}", node_text(node, source)))
 }
 
+/// Languages whose declarations' annotated types are `references` from them
+/// (upstream `TYPE_ANNOTATION_LANGUAGES`, G3).
+fn has_type_annotation_refs(language: Language) -> bool {
+    matches!(
+        language,
+        Language::TypeScript | Language::Tsx | Language::Rust | Language::Go
+    )
+}
+
+/// Built-in and primitive type names, which name no project symbol (upstream
+/// `BUILTIN_TYPE_NAMES`, one set for every language).
 fn is_builtin_type(name: &str) -> bool {
     matches!(
         name,
@@ -5780,6 +5791,47 @@ fn is_builtin_type(name: &str) -> bool {
             | "object"
             | "symbol"
             | "bigint"
+            // Rust
+            | "str"
+            | "bool"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "f32"
+            | "f64"
+            | "char"
+            // Java, C#
+            | "int"
+            | "long"
+            | "short"
+            | "byte"
+            | "float"
+            | "double"
+            // Go
+            | "int8"
+            | "int16"
+            | "int32"
+            | "int64"
+            | "uint8"
+            | "uint16"
+            | "uint32"
+            | "uint64"
+            | "float32"
+            | "float64"
+            | "complex64"
+            | "complex128"
+            | "rune"
+            | "error"
+            // Scala primitives and ubiquitous standard aliases
             | "Int"
             | "Long"
             | "Short"
