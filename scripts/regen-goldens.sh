@@ -141,17 +141,18 @@ write_corpus() {
 
 mini_transplant() {
     command -v sqlite3 >/dev/null 2>&1 || die "--mini-transplant needs the sqlite3 CLI"
-    local committed="$repo/reference/golden/mini/colby.db" fresh work
+    local committed="$repo/reference/golden/mini/colby.db" fresh work log
     [ -f "$committed" ] || die "missing $committed"
     new_scratch mini
     work="$scratch_dir"
     cp -a "$repo/crates/codegraph-bench/fixtures/mini/." "$work/"
+    new_scratch mini-init-log
+    log="$scratch_dir/init.log"
     if ! env -u CODEGRAPH_DIR CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
-        "$codegraph_bin" init "$work" >"$work.init.log" 2>&1; then
-        cat "$work.init.log" >&2
+        "$codegraph_bin" init "$work" >"$log" 2>&1; then
+        cat "$log" >&2
         die "codegraph init failed for mini"
     fi
-    scratch+=("$work.init.log")
     fresh="$work/.codegraph/codegraph.db"
     # Keep the fresh schema_versions rows: copying mini's would leave
     # MAX(version) behind the schema the fresh database already has.
