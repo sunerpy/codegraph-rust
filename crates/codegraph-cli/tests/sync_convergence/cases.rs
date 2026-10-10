@@ -902,14 +902,30 @@ pub fn typescript_config_toml_excludes_a_competitor() -> Case {
     .edge_throughout("function run", "calls", "function add @src/math.ts")
 }
 
-/// The root `.gitignore` is a watcher control file too.
+/// The root `.gitignore` is a watcher control file too. The hidden directory
+/// is one the default ignores keep (`vendor/` is never indexed at all), so the
+/// call moves from the competitor to the remaining definition.
 pub fn python_root_gitignore_hides_a_competitor() -> Case {
     Case::new(Change::ControlFile, &[Language::Python])
         .file("tools/alpha.py", "def helper():\n    return 1\n")
-        .file("vendor/beta.py", "def helper():\n    return 2\n")
+        .file("legacy/beta.py", "def helper():\n    return 2\n")
         .file("main.py", "def main():\n    return helper()\n")
-        .write(".gitignore", "vendor/\n")
-        .edge_throughout("function main", "calls", "function helper @tools/alpha.py")
+        .write(".gitignore", "legacy/\n")
+        .edge_before("function main", "calls", "function helper @legacy/beta.py")
+        .edge_after("function main", "calls", "function helper @tools/alpha.py")
+}
+
+/// The repository's `.git/info/exclude` is read with the root `.gitignore`
+/// (upstream #1728), so it is a control file as well.
+pub fn python_repository_exclude_hides_a_competitor() -> Case {
+    Case::new(Change::ControlFile, &[Language::Python])
+        .file("tools/alpha.py", "def helper():\n    return 1\n")
+        .file("legacy/beta.py", "def helper():\n    return 2\n")
+        .file("main.py", "def main():\n    return helper()\n")
+        .file(".git/info/exclude", "# git ls-files --exclude-standard\n")
+        .write(".git/info/exclude", "legacy/\n")
+        .edge_before("function main", "calls", "function helper @legacy/beta.py")
+        .edge_after("function main", "calls", "function helper @tools/alpha.py")
 }
 
 pub fn lua_extension_override_appears_in_codegraph_json() -> Case {

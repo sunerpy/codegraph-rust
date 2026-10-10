@@ -484,8 +484,8 @@ rebuild rather than many. A burst of more than 500 paths, or any sign that the
 OS dropped events, runs one full project reconcile instead (see
 [`cli.md`](cli.md#live-file-watch)). The watcher is auto-disabled on WSL2 `/mnt/` drives
 where recursive watch is too slow; set `CODEGRAPH_FORCE_WATCH=1` to override.
-The selected index root's `config.toml` and `codegraph.json`, plus the project
-root `.gitignore`, are live control files: their events bypass ordinary
+The selected index root's `config.toml` and `codegraph.json`, the project root
+`.gitignore`, and `.git/info/exclude` are live control files: their events bypass ordinary
 include/exclude filtering, reload the running scope, reconcile OS watch targets,
 and trigger one full scan that supersedes queued path deltas. Invalid TOML keeps
 the last valid scope and is reported; malformed JSON keeps the existing tolerant

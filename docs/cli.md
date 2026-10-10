@@ -71,8 +71,8 @@ by the same rules: what changed between the recorded commit and `HEAD`, plus wha
 inventory still answers whenever git might not see a change:
 
 - there is no record, the commit no longer exists, or the repository has no commit;
-- the scope changed: config, root `.gitignore`, extension overrides, index root,
-  or binary version;
+- the scope changed: config, root `.gitignore`, `.git/info/exclude`, extension
+  overrides, index root, or binary version;
 - the index was built through symlinks, or the repository has submodules;
 - an untracked nested repository or an `assume-unchanged` or `skip-worktree` entry
   is present;
@@ -1142,7 +1142,13 @@ A `build` directory that is a Java, Kotlin or Scala package under a source root
 output, so it stays indexed and watched. The root `.gitignore` prunes the index
 and the watcher alike, with git's own rules: a slash-less rule applies at any
 depth, a leading or inner `/` anchors it to the project root, `*` and `**` glob,
-and `!` re-includes a path unless a directory above it is ignored.
+and `!` re-includes a path unless a directory above it is ignored. The
+repository's own `.git/info/exclude` prunes them the same way. git ranks a
+`.gitignore` above it, so a `.gitignore` rule wins a conflict with an exclude
+rule. It is read only from a real `.git` directory at the project root, never
+through a link: a linked worktree or submodule, whose `.git` is a file naming a
+git directory elsewhere, and a project below its repository's root read no
+exclude file, and the user-wide `core.excludesFile` is never read.
 
 Indexing follows symlinked files and directories, including targets outside
 the project, and indexes their files under the link's own path. A directory is
@@ -1182,11 +1188,13 @@ In the last two cases the watcher reports RECOVERING, naming the cause, until
 that full reconcile commits; a reconcile that fails is retried like any other
 failed sync.
 
-Three project-control files are recognized before ordinary include/exclude
-filtering: the selected index root's `config.toml` and `codegraph.json`, plus the
-project-root `.gitignore`. Editing one reloads the effective Config, extension
-overrides, and watch policy, atomically replaces the live scope, reconciles
-per-directory OS watches, and schedules one full project reconcile. That full
+Four project-control files are recognized before ordinary include/exclude
+filtering: the selected index root's `config.toml` and `codegraph.json`, the
+project-root `.gitignore`, and `.git/info/exclude`. Editing one reloads the
+effective Config, extension overrides, and watch policy, atomically replaces the
+live scope, reconciles per-directory OS watches, and schedules one full project
+reconcile. Per-directory backends watch `.git/info` for its exclude file when
+that directory exists as the watcher starts. That full
 reconcile dominates queued path events, while every later incremental sync
 re-checks the current scope, so an old event cannot re-add a newly excluded
 file. Invalid TOML keeps the last valid runtime scope and reports the error;

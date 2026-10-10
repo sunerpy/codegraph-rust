@@ -522,6 +522,24 @@ fn an_unknown_stamp_or_a_new_scope_declines() {
     repo.assert_declines("the root .gitignore changed");
 }
 
+/// `.git/info/exclude` decides scan membership (upstream #1728) but hides
+/// nothing from `git status` that is already tracked, so a record made before
+/// an edit to it proves nothing afterwards.
+#[test]
+fn a_changed_repository_exclude_declines() {
+    let _hooks = hooks_guard();
+    let Some(repo) = indexed("exclude-scope") else {
+        return;
+    };
+    fs::write(
+        repo.top.join(".git/info/exclude"),
+        ".codegraph/\nsrc/b.ts\n",
+    )
+    .unwrap();
+    let pending = repo.assert_declines("the repository exclude file changed");
+    assert_eq!(pending.removed, paths(&["src/b.ts"]));
+}
+
 #[test]
 fn nested_repositories_submodules_and_hidden_changes_decline() {
     let _hooks = hooks_guard();

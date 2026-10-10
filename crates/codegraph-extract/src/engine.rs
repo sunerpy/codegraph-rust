@@ -898,13 +898,56 @@ pub fn size_skip_result(file_path: &str, size: u64, max: u64) -> ExtractionResul
     }
 }
 
-/// The project-root `.gitignore`, read with git's own rules through the
-/// `ignore` crate, as upstream reads it with the `ignore` package: a leading or
-/// inner `/` anchors a rule to the root, a slash-less rule applies at any
-/// depth, `*` and `**` glob, a trailing `/` matches directories only, and `!`
-/// re-includes. Shared with `codegraph-watch`, so the watcher's `.gitignore`
-/// verdict is the scan's by construction. An unreadable, non-UTF-8 or NUL-laden
-/// file is treated as absent and an unparseable line is skipped, never fatal.
+/// The repository's own exclude file, relative to the project root. git reads
+/// it beside every `.gitignore` for files nobody wants committed (upstream
+/// #1728).
+pub const REPOSITORY_EXCLUDE: &str = ".git/info/exclude";
+
+/// The largest exclude file read; a bigger one is treated as absent.
+const REPOSITORY_EXCLUDE_MAX_BYTES: u64 = 1024 * 1024;
+
+/// The directory holding [`REPOSITORY_EXCLUDE`], when both it and `.git` are
+/// real directories of the project root. A `.git` file (a linked worktree or a
+/// submodule) names a git directory outside the project, and a symlinked
+/// `.git` or `info` can lead there too, so none of them is followed.
+pub fn repository_exclude_dir(root: &Path) -> Option<PathBuf> {
+    let real_dir = |path: &Path| {
+        fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+    };
+    let git = root.join(".git");
+    let info = git.join("info");
+    (real_dir(&git) && real_dir(&info)).then_some(info)
+}
+
+/// The text of [`REPOSITORY_EXCLUDE`]: a regular file (not a link) in
+/// [`repository_exclude_dir`], read through the bounded source reader, so it
+/// is stat-ed before it is opened and a FIFO there is never opened. `None`
+/// when there is no such file, or it is unreadable, over the size limit or
+/// NUL-laden.
+pub fn read_repository_exclude(root: &Path) -> Option<String> {
+    let path = repository_exclude_dir(root)?.join("exclude");
+    if !fs::symlink_metadata(&path).ok()?.file_type().is_file() {
+        return None;
+    }
+    match read_source_file(&path, REPOSITORY_EXCLUDE, REPOSITORY_EXCLUDE_MAX_BYTES)
+        .ok()?
+        .1
+    {
+        SourceText::Text(text) if !text.contains('\0') => Some(text),
+        _ => None,
+    }
+}
+
+/// The project-root `.gitignore`, together with the repository's own
+/// [`REPOSITORY_EXCLUDE`], read with git's own rules through the `ignore`
+/// crate, as upstream reads them with the `ignore` package: a leading or inner
+/// `/` anchors a rule to the root, a slash-less rule applies at any depth, `*`
+/// and `**` glob, a trailing `/` matches directories only, and `!` re-includes.
+/// git ranks a `.gitignore` above the exclude file, so the exclude rules are
+/// read first and a `.gitignore` line wins a conflict with them. Shared with
+/// `codegraph-watch`, so the watcher's verdict is the scan's by construction.
+/// An unreadable, non-UTF-8 or NUL-laden `.gitignore` is treated as absent and
+/// an unparseable line is skipped, never fatal.
 #[derive(Debug, Clone, Default)]
 pub struct RootGitignore {
     matcher: Option<ignore::gitignore::Gitignore>,
@@ -912,17 +955,19 @@ pub struct RootGitignore {
 
 impl RootGitignore {
     pub fn load(root: &Path) -> Self {
-        let Ok(text) = fs::read_to_string(root.join(".gitignore")) else {
-            return Self::default();
-        };
-        if text.contains('\0') {
-            return Self::default();
-        }
+        let gitignore = fs::read_to_string(root.join(".gitignore"))
+            .ok()
+            .filter(|text| !text.contains('\0'));
         // Rooted at `.` so a root-relative candidate is never prefix-stripped.
         let mut builder = ignore::gitignore::GitignoreBuilder::new(".");
-        for line in text.lines() {
-            // An invalid glob drops only its own line; the rest still apply.
-            let _ = builder.add_line(None, line);
+        for text in [read_repository_exclude(root), gitignore]
+            .into_iter()
+            .flatten()
+        {
+            for line in text.lines() {
+                // An invalid glob drops only its own line; the rest still apply.
+                let _ = builder.add_line(None, line);
+            }
         }
         let matcher = builder.build().ok().filter(|matcher| !matcher.is_empty());
         Self { matcher }

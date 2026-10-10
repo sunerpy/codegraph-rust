@@ -91,6 +91,8 @@ impl RuntimeWatchScope {
 struct ControlChanges {
     config_toml: bool,
     codegraph_json: bool,
+    /// The root `.gitignore` or the repository's `.git/info/exclude`: the two
+    /// files [`RootGitignore`](codegraph_extract::RootGitignore) reads.
     root_gitignore: bool,
 }
 
@@ -105,6 +107,7 @@ struct ControlFiles {
     config_toml: String,
     codegraph_json: String,
     root_gitignore: String,
+    repository_exclude: &'static str,
 }
 
 impl ControlFiles {
@@ -113,6 +116,7 @@ impl ControlFiles {
             config_toml: relative_path(project_root, &paths.config_toml()),
             codegraph_json: relative_path(project_root, &paths.extension_config()),
             root_gitignore: ".gitignore".to_string(),
+            repository_exclude: codegraph_extract::engine::REPOSITORY_EXCLUDE,
         }
     }
 
@@ -123,7 +127,7 @@ impl ControlFiles {
         } else if relative == self.codegraph_json {
             changes.codegraph_json = true;
             true
-        } else if relative == self.root_gitignore {
+        } else if relative == self.root_gitignore || relative == self.repository_exclude {
             changes.root_gitignore = true;
             true
         } else {
@@ -1196,6 +1200,15 @@ impl ProjectWatcher {
                     index_paths.current_root().to_path_buf(),
                     RecursiveMode::NonRecursive,
                 ));
+            }
+            // `.git/` is never watched as source either, yet the repository's
+            // `.git/info/exclude` decides scan membership like the root
+            // `.gitignore` (upstream #1728), so its directory gets the same
+            // explicit control watch. A recursive root watch already reports it.
+            if watch_registration(backend) == WatchRegistration::PerDirNonRecursive
+                && let Some(info) = codegraph_extract::engine::repository_exclude_dir(&project_root)
+            {
+                targets.push((info, RecursiveMode::NonRecursive));
             }
             let mut watch_err: Option<notify::Error> = None;
             for (dir, mode) in &targets {
@@ -2730,6 +2743,59 @@ mod tests {
         let readmitted = outcome_rx
             .recv_timeout(FULL_SYNC_WAIT)
             .expect("gitignore-readmission full sync");
+        assert_eq!(readmitted.files_reindexed, 1);
+        assert!(
+            codegraph_store::Store::open(&paths.current_db())
+                .unwrap()
+                .file_by_path("generated/drop.ts")
+                .unwrap()
+                .is_some()
+        );
+        watcher.stop();
+    }
+
+    /// The repository's `.git/info/exclude` decides scan membership like the
+    /// root `.gitignore` (upstream #1728), so an edit to it reloads the scope
+    /// and reconciles, although the rest of `.git/` is always ignored.
+    #[test]
+    fn repository_exclude_reload_reconciles_and_readmits_sources() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-exclude-reload");
+        fs::create_dir_all(dir.path().join(".git/info")).unwrap();
+        fs::create_dir_all(dir.path().join("generated")).unwrap();
+        fs::write(
+            dir.path().join("generated/drop.ts"),
+            "export function drop() { return 1; }\n",
+        )
+        .unwrap();
+        let paths = IndexPaths::resolve(dir.path(), None).unwrap();
+        let initial = crate::sync::sync_project_once(dir.path()).unwrap();
+        assert_eq!(initial.files_reindexed, 1);
+        let (outcome_tx, outcome_rx) = mpsc::channel();
+        let mut options = live_project_options(dir.path());
+        options.debounce = Duration::from_secs(30);
+        options.inert_for_tests = true;
+        options.on_sync_complete = Some(Arc::new(move |outcome| {
+            outcome_tx.send(outcome).unwrap();
+        }));
+        let watcher = ProjectWatcher::start(dir.path(), options).unwrap().unwrap();
+
+        fs::write(dir.path().join(".git/info/exclude"), "generated/\n").unwrap();
+        watcher.ingest_event_for_tests(".git/info/exclude");
+        watcher.ingest_event_for_tests("generated/drop.ts");
+        watcher.flush_for_tests();
+        let removed = outcome_rx
+            .recv_timeout(FULL_SYNC_WAIT)
+            .expect("exclude-removal full sync");
+        assert_eq!(removed.files_removed, 1);
+        assert_eq!(removed.trigger_paths, vec![".git/info/exclude".to_string()]);
+
+        fs::write(dir.path().join(".git/info/exclude"), "").unwrap();
+        watcher.ingest_event_for_tests(".git/info/exclude");
+        watcher.flush_for_tests();
+        let readmitted = outcome_rx
+            .recv_timeout(FULL_SYNC_WAIT)
+            .expect("exclude-readmission full sync");
         assert_eq!(readmitted.files_reindexed, 1);
         assert!(
             codegraph_store::Store::open(&paths.current_db())

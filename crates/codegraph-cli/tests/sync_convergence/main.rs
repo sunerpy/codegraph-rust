@@ -56,8 +56,9 @@ pub enum Change {
     EditHeritage,
     /// A second declaration of an already-referenced name appears elsewhere.
     AddCompetitor,
-    /// A project control file changes: `package.json`, `tsconfig.json`, or the
-    /// index root's `codegraph.json`.
+    /// A project control file changes: `package.json`, `tsconfig.json`, the
+    /// root `.gitignore`, `.git/info/exclude`, or the index root's
+    /// `config.toml` or `codegraph.json`.
     ControlFile,
     /// A `.h` header changes from C to C++ content.
     HeaderFlip,
@@ -313,6 +314,9 @@ fn watcher_sync(project: &Indexed, changed: &[&str]) {
         paths.config_toml(),
         paths.extension_config(),
         paths.project().join(".gitignore"),
+        paths
+            .project()
+            .join(codegraph_extract::engine::REPOSITORY_EXCLUDE),
     ]
     .map(|path| relative_slash(paths.project(), &path));
     let outcome = if changed
@@ -570,6 +574,7 @@ matrix! {
     php_add_a_same_named_competitor,
     typescript_config_toml_excludes_a_competitor,
     python_root_gitignore_hides_a_competitor,
+    python_repository_exclude_hides_a_competitor,
     lua_extension_override_appears_in_codegraph_json,
     #[ignore = "unscheduled, found by W0-04: a tsconfig.json `paths` change does not re-resolve the unchanged importers"]
     typescript_tsconfig_paths_alias_appears,
