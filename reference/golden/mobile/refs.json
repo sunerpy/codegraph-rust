@@ -197,7 +197,7 @@
     "language": "objc",
     "line": 5,
     "reference_kind": "calls",
-    "reference_name": "[Greeter alloc]"
+    "reference_name": "Greeter.alloc().init"
   },
   {
     "candidates": null,
@@ -211,6 +211,16 @@
   },
   {
     "candidates": null,
+    "col": 24,
+    "file_path": "bridge/ios/Caller.m",
+    "from_node_id": "method:b9e09b3b72138d018e6e7c4f6f7a7b73",
+    "language": "objc",
+    "line": 5,
+    "reference_kind": "calls",
+    "reference_name": "Greeter.alloc"
+  },
+  {
+    "candidates": null,
     "col": 26,
     "file_path": "expo-modules/ios/HelloModule.swift",
     "from_node_id": "class:6f54d95ed9c790af0ac11c4f615b0b98",
@@ -218,6 +228,16 @@
     "line": 3,
     "reference_kind": "extends",
     "reference_name": "Module"
+  },
+  {
+    "candidates": null,
+    "col": 26,
+    "file_path": "rn/ios/CameraModule.m",
+    "from_node_id": "class:d1889da6439ee0a541b27a297ad399d2",
+    "language": "objc",
+    "line": 4,
+    "reference_kind": "extends",
+    "reference_name": "RCTEventEmitter"
   },
   {
     "candidates": null,
@@ -317,7 +337,7 @@
     "language": "objc",
     "line": 6,
     "reference_kind": "calls",
-    "reference_name": "greeter"
+    "reference_name": "greeter.greet:"
   },
   {
     "candidates": null,
@@ -398,6 +418,16 @@
     "line": 13,
     "reference_kind": "decorates",
     "reference_name": "ReactMethod"
+  },
+  {
+    "candidates": null,
+    "col": 43,
+    "file_path": "rn/ios/CameraModule.m",
+    "from_node_id": "class:d1889da6439ee0a541b27a297ad399d2",
+    "language": "objc",
+    "line": 4,
+    "reference_kind": "implements",
+    "reference_name": "RCTBridgeModule"
   },
   {
     "candidates": null,

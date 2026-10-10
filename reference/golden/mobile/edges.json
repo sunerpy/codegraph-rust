@@ -72,8 +72,8 @@
     "target": "method:07320ceff8c988f8c55108ce16e67e60"
   },
   {
-    "col": 24,
-    "kind": "instantiates",
+    "col": 25,
+    "kind": "references",
     "line": 5,
     "metadata": {
       "confidence": 0.5,

@@ -421,7 +421,9 @@ pub fn objc_implementation_body_edit() -> Case {
             "#import \"Greeter.h\"\n\n@implementation Greeter\n- (NSString *)greet:(NSString *)name {\n    return [name copy];\n}\n@end\n",
         )
         .edge_throughout("file:main.m", "imports", "file:Greeter.h")
-        .edge_throughout("function main", "instantiates", "class Greeter")
+        // `[[Greeter alloc] init]` is a message to the class: a reference to
+        // it (G5), as upstream records it.
+        .edge_throughout("function main", "references", "class Greeter")
 }
 
 pub fn gdscript_autoload_method_body_edit() -> Case {
@@ -814,6 +816,25 @@ pub fn csharp_base_list_gains_an_interface() -> Case {
         )
         .edge_throughout("class Shapes::Square", "extends", "class Shapes::Shape")
         .edge_after("class Shapes::Square", "implements", "interface Shapes::IDrawable")
+}
+
+/// G5: an Objective-C `@interface` names its superclass.
+pub fn objc_change_a_superclass() -> Case {
+    Case::new(Change::EditHeritage, &[Language::ObjC])
+        .file(
+            "Sources/Base.h",
+            "@interface Base\n- (void)ping;\n@end\n\n@interface Other\n- (void)ping;\n@end\n",
+        )
+        .file(
+            "Sources/Sub.m",
+            "#import \"Base.h\"\n\n@interface Sub : Base\n@end\n",
+        )
+        .write(
+            "Sources/Sub.m",
+            "#import \"Base.h\"\n\n@interface Sub : Other\n@end\n",
+        )
+        .edge_before("class Sub", "extends", "class Base")
+        .edge_after("class Sub", "extends", "class Other")
 }
 
 pub fn scala_change_a_parent_trait() -> Case {

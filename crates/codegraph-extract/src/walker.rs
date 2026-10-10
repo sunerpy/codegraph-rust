@@ -3842,6 +3842,10 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 }
             }
         }
+        if node.kind() == "message_expression" {
+            self.extract_objc_message(node, &caller_id);
+            return;
+        }
         if self.spec.language() == Language::Cpp {
             match crate::lang::recover_explicit_operator_call(node, self.source) {
                 Some(crate::lang::ExplicitOperatorCall::Callee(callee)) => {
@@ -4191,6 +4195,67 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             format!("{receiver_name}.{method_name}")
         };
         self.push_ref(caller_id, &callee, EdgeKind::Calls, node);
+    }
+
+    /// An Objective-C message send (upstream's `message_expression` arm): a
+    /// call named by its full selector, each keyword taking a `:` when the
+    /// message has arguments (`[c storeImage:k forKey:key]` is
+    /// `storeImage:forKey:`). A `self`/`super` receiver leaves the bare
+    /// selector; any other receiver is written before it (`cache.reset`), and
+    /// a class receiver is also a reference to the class. A unary message to a
+    /// class factory's result keeps the chain, `Factory.create().doIt`, so
+    /// resolution can read the factory's return type.
+    fn extract_objc_message(&mut self, node: SyntaxNode<'tree>, caller_id: &str) {
+        let Some(selector) = self.objc_selector(node) else {
+            return;
+        };
+        let receiver = child_by_field(node, "receiver");
+        let callee = match receiver {
+            Some(receiver) if receiver.kind() != "message_expression" => {
+                let receiver_name = node_text(receiver, self.source);
+                if receiver_name.is_empty() || matches!(receiver_name.as_str(), "self" | "super") {
+                    selector
+                } else {
+                    if is_objc_class_name(&receiver_name) {
+                        self.push_ref(caller_id, &receiver_name, EdgeKind::References, receiver);
+                    }
+                    format!("{receiver_name}.{selector}")
+                }
+            }
+            Some(receiver) if is_word(&selector) => {
+                let inner_receiver = child_by_field(receiver, "receiver");
+                let inner_name = inner_receiver.map(|r| node_text(r, self.source));
+                match (inner_receiver, inner_name, self.objc_selector(receiver)) {
+                    (Some(inner), Some(name), Some(inner_selector))
+                        if inner.kind() == "identifier"
+                            && name.starts_with(|c: char| c.is_ascii_uppercase()) =>
+                    {
+                        format!("{name}.{inner_selector}().{selector}")
+                    }
+                    _ => selector,
+                }
+            }
+            _ => selector,
+        };
+        self.push_ref(caller_id, &callee, EdgeKind::Calls, node);
+    }
+
+    /// The selector a message sends: its `method` keywords, each followed by
+    /// `:` when the message carries arguments.
+    fn objc_selector(&self, node: SyntaxNode<'tree>) -> Option<String> {
+        let keywords: Vec<String> = node
+            .children_by_field_name("method", &mut node.walk())
+            .map(|keyword| node_text(keyword, self.source))
+            .collect();
+        let first = keywords.first()?.clone();
+        let has_colon = node
+            .children(&mut node.walk())
+            .any(|child| child.kind() == ":");
+        Some(if has_colon {
+            keywords.iter().map(|k| format!("{k}:")).collect()
+        } else {
+            first
+        })
     }
 
     /// An object construction: its `instantiates` reference and, for a Java
@@ -4555,6 +4620,29 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     }
 
     fn extract_inheritance(&mut self, node: SyntaxNode<'tree>, class_id: &str) {
+        // G5 (upstream `61153f96`) — Objective-C `@interface Sub : Base <P, Q>`
+        // extends its superclass and implements each adopted protocol.
+        if node.kind() == "class_interface" && self.spec.language() == Language::ObjC {
+            if let Some(superclass) = child_by_field(node, "superclass") {
+                let name = node_text(superclass, self.source);
+                self.push_ref(class_id, &name, EdgeKind::Extends, superclass);
+            }
+            for arguments in node.named_children(&mut node.walk()) {
+                if arguments.kind() != "parameterized_arguments" {
+                    continue;
+                }
+                for type_name in arguments.named_children(&mut arguments.walk()) {
+                    let protocol = type_name
+                        .named_children(&mut type_name.walk())
+                        .find(|c| matches!(c.kind(), "type_identifier" | "identifier"));
+                    if let Some(protocol) = protocol {
+                        let name = node_text(protocol, self.source);
+                        self.push_ref(class_id, &name, EdgeKind::Implements, protocol);
+                    }
+                }
+            }
+            return;
+        }
         for child in node.named_children(&mut node.walk()) {
             if matches!(
                 child.kind(),
@@ -6047,6 +6135,18 @@ fn has_type_annotation_refs(language: Language) -> bool {
             | Language::Dart
             | Language::Php
     )
+}
+
+/// A capitalized Objective-C identifier names a class.
+fn is_objc_class_name(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_uppercase())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// A selector of one bare keyword (no `:`), the only kind a chain resolver
+/// reads.
+fn is_word(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// The PHP node kinds a type hint is written as (upstream `PHP_TYPE_NODES`).

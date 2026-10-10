@@ -75,3 +75,19 @@ fn csharp_base_lists_name_every_supertype() {
         ]
     );
 }
+
+/// G5 (upstream `61153f96`): `@interface Sub : Base <Doer, Saver>` extends
+/// its superclass and implements each protocol it adopts.
+#[test]
+fn objc_interfaces_name_their_superclass_and_protocols() {
+    let source =
+        "@interface Sub : Base <Doer, Saver>\n- (void)work;\n@end\n\n@interface Root\n@end\n";
+    assert_eq!(
+        supertypes("Sources/Sub.h", source, Language::ObjC),
+        vec![
+            extends("Sub", "Base"),
+            ("Sub".to_string(), EdgeKind::Implements, "Doer".to_string()),
+            ("Sub".to_string(), EdgeKind::Implements, "Saver".to_string()),
+        ]
+    );
+}

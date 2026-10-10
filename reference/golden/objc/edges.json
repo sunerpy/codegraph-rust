@@ -36,6 +36,54 @@
     "target": "import:1ce470e34d12b1d96f2893c77175d57f"
   },
   {
+    "col": 17,
+    "kind": "extends",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.4,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "class:8cede3a6d1ba882388e3e2a33c6444f3",
+    "target": "class:af64ae616fc3bb7b883e8a45029b29f8"
+  },
+  {
+    "col": 23,
+    "kind": "implements",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "class:8cede3a6d1ba882388e3e2a33c6444f3",
+    "target": "protocol:9120395f2fb9f2545511f7bb9556d8c6"
+  },
+  {
+    "col": 4,
+    "kind": "calls",
+    "line": 11,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:49ca705b64b6a4720b4f148fb99b72a9",
+    "target": "method:170d8afffc0f57cedd01f0804accb327"
+  },
+  {
+    "col": 4,
+    "kind": "calls",
+    "line": 12,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "method:49ca705b64b6a4720b4f148fb99b72a9",
+    "target": "method:170d8afffc0f57cedd01f0804accb327"
+  },
+  {
     "col": 4,
     "kind": "calls",
     "line": 14,
@@ -48,8 +96,8 @@
     "target": "function:472cf6a0fb6f2d37874ed780d46c849b"
   },
   {
-    "col": 4,
-    "kind": "instantiates",
+    "col": 5,
+    "kind": "references",
     "line": 13,
     "metadata": {
       "confidence": 0.4,
