@@ -223,8 +223,8 @@ The watcher maintains per-directory watches outside ignored trees, debounces
 bursts, reloads project control files, and reconciles additions, modifications,
 deletions, and scope changes through `codegraph-watch`. A burst past 500 paths,
 a backend's sign of dropped events, or (on Windows) drift found by an idle
-sentinel escalates to one full reconcile, and the lost-event cases report
-RECOVERING until it commits. Each mutation acquires the
+sentinel escalates to one full reconcile, reported as RECOVERING until it
+commits. Each mutation acquires the
 store's short-lived `index.lock` writer authority; readers use corroborated state
 and shared leases. A separate persistent `writer.pid` file carries an OS kernel
 exclusive lock for the lifetime of the ONE process allowed to run watcher/catch-up

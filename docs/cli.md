@@ -1184,9 +1184,8 @@ runs:
   default; `0` turns this off) and found changes no event reported. It also
   registers its root watch again.
 
-In the last two cases the watcher reports RECOVERING, naming the cause, until
-that full reconcile commits; a reconcile that fails is retried like any other
-failed sync.
+In each case the watcher reports RECOVERING, naming the cause, until that full
+reconcile commits; a reconcile that fails is retried like any other failed sync.
 
 Four project-control files are recognized before ordinary include/exclude
 filtering: the selected index root's `config.toml` and `codegraph.json`, the

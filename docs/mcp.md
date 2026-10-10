@@ -761,8 +761,9 @@ per-file banner above:
   banner names why. Either another process held the index past the sync's
   contention budget (a long foreground `index`), in which case the reconcile is
   retried every 30 s, or the watcher saw a sign that file events were lost (an
-  overflowed or dropped event stream, an event without a path, or, on Windows,
-  drift its sentinel found), in which case it runs right away. Watching
+  overflowed or dropped event stream, an event without a path, a burst of more
+  than 500 paths, or, on Windows, drift its sentinel found), in which case it
+  runs right away. Watching
   continues and changes are still collected; until the reconcile commits each
   response starts with `⚠️ CodeGraph auto-sync is RECOVERING …`.
 - **DISABLED** — watching stopped (watch resources exhausted, or syncs failing

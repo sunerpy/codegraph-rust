@@ -1879,9 +1879,17 @@ fn event_loop(ctx: EventLoopCtx) {
                 deadline = None;
                 sentinel_due = drift_sentinel.map(|every| Instant::now() + every);
                 // A burst past the ceiling is diffed whole: cheaper than path by
-                // path, and it also repairs whatever its events failed to report.
-                let full_sync =
-                    std::mem::take(&mut full_sync_pending) || paths.len() > SCOPED_SYNC_MAX_PENDING;
+                // path, and it also repairs whatever its events failed to report,
+                // so it reports RECOVERING like any other possible event loss
+                // until that full sync commits.
+                let burst = paths.len() > SCOPED_SYNC_MAX_PENDING;
+                if burst && !degraded.is_recovering() {
+                    degraded.mark_recovering(format!(
+                        "events may have been lost: {} paths changed at once",
+                        paths.len()
+                    ));
+                }
+                let full_sync = std::mem::take(&mut full_sync_pending) || burst;
                 let attempt = if full_sync {
                     run_full_sync_with_backoff(&full_sync_fn, lock_contention_budget)
                 } else {
@@ -4733,7 +4741,20 @@ mod tests {
         let _env = crate::test_env::env_guard();
         let dir = crate::sync::tests::TestDir::new("watch-burst-ceiling");
         fs::create_dir_all(dir.path().join("src")).unwrap();
-        let (watcher, log) = logging_watcher(dir.path(), quiet_options(), || Ok(()));
+        // The full sync is held until the test lets it commit, so the health
+        // while it runs is observable.
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let full_started = Arc::new(AtomicUsize::new(0));
+        let started = Arc::clone(&full_started);
+        let (watcher, log) = logging_watcher(dir.path(), quiet_options(), move || {
+            started.fetch_add(1, AtomicOrdering::SeqCst);
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|_| anyhow::anyhow!("test never released the sync"))
+        });
 
         // At the ceiling the burst is still synced path by path...
         for n in 0..SCOPED_SYNC_MAX_PENDING {
@@ -4751,15 +4772,33 @@ mod tests {
         }
         assert!(log.full.try_recv().is_err());
 
-        // ...and one path more makes it one full sync instead.
+        assert_eq!(watcher.health(), WatchHealth::Healthy);
+
+        // ...and one path more makes it one full sync instead, during which the
+        // watcher reports RECOVERING: such a burst may have lost events too.
         for n in 0..=SCOPED_SYNC_MAX_PENDING {
             watcher.ingest_event_for_tests(format!("src/g{n:04}.ts"));
         }
         watcher.flush_for_tests();
+        assert!(
+            wait_until(|| full_started.load(AtomicOrdering::SeqCst) == 1),
+            "a burst past the ceiling runs a full sync"
+        );
+        match watcher.health() {
+            WatchHealth::Recovering { reason } => assert!(
+                reason.contains("events may have been lost")
+                    && reason.contains(&format!("{} paths", SCOPED_SYNC_MAX_PENDING + 1)),
+                "the reason names the burst: {reason}"
+            ),
+            other => panic!("RECOVERING while the burst is reconciled, got {other:?}"),
+        }
+        release_tx.send(()).unwrap();
         log.full
             .recv_timeout(Duration::from_secs(2))
-            .expect("a burst past the ceiling schedules a full sync");
+            .expect("the full sync commits");
+        let healthy = wait_until(|| watcher.health() == WatchHealth::Healthy);
         watcher.stop();
+        assert!(healthy, "the committed full sync ends the recovery");
         assert_eq!(
             log.incremental.lock().unwrap().len(),
             1,
