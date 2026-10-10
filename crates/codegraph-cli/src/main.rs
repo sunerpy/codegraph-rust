@@ -2128,6 +2128,9 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
             .is_none_or(|v| v < codegraph_store::CURRENT_EXTRACTION_VERSION);
     let resolution_incomplete = store.is_resolution_incomplete()?;
     let pending = codegraph_watch::pending_project_changes(&project, &store)?;
+    // Files whose content is current but whose symbols are missing: the content
+    // hash behind "up to date" cannot see them (upstream #2336).
+    let health = FilesMissingSymbols::of(&store)?;
 
     if json_output {
         let mut index_obj = json!({
@@ -2135,6 +2138,8 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
             "builtWithExtractionVersion": built_with_extraction_version,
             "currentExtractionVersion": codegraph_store::CURRENT_EXTRACTION_VERSION,
             "reindexRecommended": reindex_recommended,
+            "filesNeedingReindex": health.needs_reindex.len(),
+            "filesWithParseErrors": health.parse_errors.len(),
         });
         // #1187: surface the interrupted-index state ONLY when the marker is set,
         // so a healthy index's status JSON is byte-identical to a pre-#1187 build.
@@ -2223,6 +2228,13 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
             }
         }
     }
+    let missing_symbols = health.warnings();
+    if !missing_symbols.is_empty() {
+        println!();
+        for line in &missing_symbols {
+            println!("⚠ {line}");
+        }
+    }
     if resolution_incomplete {
         println!(
             "\n⚠ Index is PARTIAL: a resolution pass was interrupted, so some call\n  edges are missing. Run `codegraph sync` to heal it.\n"
@@ -2232,10 +2244,85 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
             "\nIndex has {} pending source change(s). Run `codegraph sync`.\n",
             pending.total()
         );
-    } else {
+    } else if missing_symbols.is_empty() {
         println!("\nIndex is up to date\n");
+    } else {
+        println!();
     }
     Ok(())
+}
+
+/// Indexed files whose content is current but whose symbols are missing,
+/// grouped by what to do about them (upstream #2336). Paths are sorted.
+struct FilesMissingSymbols {
+    needs_reindex: Vec<String>,
+    parse_errors: Vec<String>,
+}
+
+impl FilesMissingSymbols {
+    fn of(store: &Store) -> Result<Self> {
+        let mut health = Self {
+            needs_reindex: Vec::new(),
+            parse_errors: Vec::new(),
+        };
+        for file in store.files_without_nodes_or_with_errors()? {
+            match codegraph_extract::engine::missing_symbols(&file) {
+                Some(codegraph_extract::engine::MissingSymbols::NeedsReindex) => {
+                    health.needs_reindex.push(file.path);
+                }
+                Some(codegraph_extract::engine::MissingSymbols::ParseError) => {
+                    health.parse_errors.push(file.path);
+                }
+                None => {}
+            }
+        }
+        Ok(health)
+    }
+
+    /// One line per non-empty group: what is wrong, what to do, and up to
+    /// three of the files. A hash-based `sync` does not revisit a row whose
+    /// content is current, so a wiped row needs `codegraph index`.
+    fn warnings(&self) -> Vec<String> {
+        let sample = |paths: &[String]| {
+            let mut text = paths.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+            if paths.len() > 3 {
+                text.push_str(&format!(
+                    " (+{} more)",
+                    format_number(paths.len() as i64 - 3)
+                ));
+            }
+            text
+        };
+        let mut lines = Vec::new();
+        let reindex = self.needs_reindex.len();
+        if reindex > 0 {
+            lines.push(format!(
+                "{} {} symbols — run `codegraph index` to rebuild {}: {}",
+                format_number(reindex as i64),
+                if reindex == 1 {
+                    "file is missing its"
+                } else {
+                    "files are missing their"
+                },
+                if reindex == 1 { "it" } else { "them" },
+                sample(&self.needs_reindex)
+            ));
+        }
+        let unparsed = self.parse_errors.len();
+        if unparsed > 0 {
+            lines.push(format!(
+                "{} {} missing: {} — `codegraph files --json` shows the errors",
+                format_number(unparsed as i64),
+                if unparsed == 1 {
+                    "file could not be parsed, so its symbols are"
+                } else {
+                    "files could not be parsed, so their symbols are"
+                },
+                sample(&self.parse_errors)
+            ));
+        }
+        lines
+    }
 }
 
 fn print_wal_status(wal_size: u64, db_size: u64) {
@@ -7370,6 +7457,9 @@ struct FileOutput<'a> {
     language: Language,
     node_count: i64,
     size: i64,
+    /// The errors extraction recorded for the file (upstream #2336); empty when
+    /// it parsed cleanly.
+    errors: &'a [String],
 }
 
 impl<'a> From<&'a FileRecord> for FileOutput<'a> {
@@ -7379,6 +7469,7 @@ impl<'a> From<&'a FileRecord> for FileOutput<'a> {
             language: file.language,
             node_count: file.node_count,
             size: file.size,
+            errors: &file.errors,
         }
     }
 }

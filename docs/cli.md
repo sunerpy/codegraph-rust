@@ -473,6 +473,10 @@ read `0` while the graph actually holds those nodes. `files` recomputes the
 displayed count from the `nodes` table for display only — it never rewrites the
 stored `files.node_count` column, so the golden output is unaffected.
 
+`files --json` lists each file's `path`, `language`, `nodeCount`, `size` and
+`errors`: the errors extraction recorded for it, such as a parse that produced no
+symbols or a file over `max_file_size` (an empty array when it parsed cleanly).
+
 ---
 
 ## `codegraph audit` — read-only Godot resource audit
@@ -944,6 +948,25 @@ Until the viewer leaves preview, `ui` and its alias `web` — also as `help ui` 
 `ui --help` — exit 1 unless `CODEGRAPH_UI=1` is set, and the command is hidden
 from `--help`. The boundary, the live channel, the API and the differences from
 upstream are documented in [the viewer reference](ui.md).
+
+## `codegraph status` — files missing their symbols
+
+A content-hash comparison calls a file up to date even when its stored row holds
+none of its symbols, so `status` also reads the stored rows (upstream #2336).
+`status --json` reports two counts under `index`:
+
+- `filesNeedingReindex`: files stored with no nodes and no recorded reason.
+  Every parse stores at least the file node, so such a row was wiped; a
+  hash-based `sync` does not revisit it, and `codegraph index` rebuilds it.
+- `filesWithParseErrors`: files whose recorded parse failure left them without
+  symbols. They stay that way until the file or the parser changes;
+  `codegraph files --json` shows the errors.
+
+A file over `max_file_size` and a file-level-only language (YAML, Twig,
+properties, Godot scenes, resources and project files) are empty on purpose and
+are counted in neither. Human output names up to three files of each group in a
+warning, and says the index is up to date only when both groups are empty and no
+change is pending.
 
 ## `codegraph status` — WAL diagnostics
 

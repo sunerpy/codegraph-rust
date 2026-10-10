@@ -893,9 +893,7 @@ pub fn size_skip_result(file_path: &str, size: u64, max: u64) -> ExtractionResul
         nodes: Vec::new(),
         edges: Vec::new(),
         unresolved_references: Vec::new(),
-        errors: vec![format!(
-            "File exceeds max size ({size} > {max}): {file_path}"
-        )],
+        errors: vec![format!("{SIZE_SKIP_PREFIX} ({size} > {max}): {file_path}")],
         duration_ms: 0,
     }
 }
@@ -1134,6 +1132,46 @@ fn is_extractable_source_path(relative: &str, overrides: &ExtensionOverrides) ->
             || is_file_level_only_language(language))
 }
 
+/// Why an indexed file whose content is current has none of the symbols it
+/// should have (upstream #2336). A content-hash comparison calls such a file
+/// up to date, so only its stored row can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingSymbols {
+    /// Stored with no nodes and no recorded reason; every parse stores at least
+    /// the file node, so the row was wiped and a rebuild restores it.
+    NeedsReindex,
+    /// A recorded parse failure left it without symbols; it stays this way
+    /// until the file or the parser changes.
+    ParseError,
+}
+
+/// Classify one stored file row; `None` when it has its symbols or is empty on
+/// purpose (a file over the size limit, a file-level-only language).
+#[must_use]
+pub fn missing_symbols(file: &codegraph_core::types::FileRecord) -> Option<MissingSymbols> {
+    let collapsed = file
+        .errors
+        .iter()
+        .any(|error| error.contains(PARSE_COLLAPSE_WARNING));
+    if file.node_count > 0 {
+        return collapsed.then_some(MissingSymbols::ParseError);
+    }
+    if is_file_level_only_language(file.language) {
+        return None;
+    }
+    if file.errors.is_empty() {
+        return Some(MissingSymbols::NeedsReindex);
+    }
+    let skipped_for_size = file
+        .errors
+        .iter()
+        .all(|error| error.starts_with(SIZE_SKIP_PREFIX));
+    (!skipped_for_size).then_some(MissingSymbols::ParseError)
+}
+
+/// The start of the error [`size_skip_result`] records.
+const SIZE_SKIP_PREFIX: &str = "File exceeds max size";
+
 fn is_file_level_only_language(language: Language) -> bool {
     matches!(
         language,
@@ -1156,6 +1194,46 @@ fn normalize_path(path: impl AsRef<Path>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn missing_symbols_classifies_stored_rows_like_upstream() {
+        use codegraph_core::types::FileRecord;
+        let row = |language: Language, node_count: i64, errors: &[&str]| FileRecord {
+            path: "src/a.ts".to_string(),
+            content_hash: String::new(),
+            language,
+            size: 1,
+            modified_at: 0,
+            indexed_at: 0,
+            node_count,
+            errors: errors.iter().map(|error| (*error).to_string()).collect(),
+            generated: false,
+        };
+        let collapsed = format!(
+            "src/a.ts: {PARSE_COLLAPSE_WARNING} - the file is indexed but contributes nothing to the graph"
+        );
+        assert_eq!(missing_symbols(&row(Language::TypeScript, 3, &[])), None);
+        assert_eq!(
+            missing_symbols(&row(Language::TypeScript, 1, &[&collapsed])),
+            Some(MissingSymbols::ParseError)
+        );
+        assert_eq!(
+            missing_symbols(&row(Language::TypeScript, 0, &[])),
+            Some(MissingSymbols::NeedsReindex)
+        );
+        assert_eq!(missing_symbols(&row(Language::Yaml, 0, &[])), None);
+        assert_eq!(missing_symbols(&row(Language::GodotScene, 0, &[])), None);
+        let oversized = size_skip_result("src/a.ts", 9, 4).errors;
+        let oversized = oversized.iter().map(String::as_str).collect::<Vec<_>>();
+        assert_eq!(
+            missing_symbols(&row(Language::TypeScript, 0, &oversized)),
+            None
+        );
+        assert_eq!(
+            missing_symbols(&row(Language::TypeScript, 0, &["could not read the file"])),
+            Some(MissingSymbols::ParseError)
+        );
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::SystemTime;
