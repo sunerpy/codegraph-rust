@@ -85,3 +85,25 @@ fn smoke_sync_rereads_the_graph_after_an_edit() {
     assert_unresolved!(project, "function main" => calls => "helper");
     assert_edge!(project, "file:lib.py" => contains => "function assist");
 }
+
+#[test]
+fn smoke_file_selector_matches_an_embedded_file_node() {
+    // The Liquid extractor keys its file node by a hash, not `file:{path}`;
+    // a `file:` selector still names it by path.
+    let project = Project::new()
+        .file(
+            "templates/product.liquid",
+            "<div class=\"product\">\n  {% render 'price' %}\n</div>\n",
+        )
+        .file(
+            "snippets/price.liquid",
+            "<span class=\"price\">{{ product.price }}</span>\n",
+        )
+        .index();
+
+    assert_edge!(
+        project,
+        "file:templates/product.liquid" => references => "file:snippets/price.liquid",
+        resolved_by = "file-path",
+    );
+}

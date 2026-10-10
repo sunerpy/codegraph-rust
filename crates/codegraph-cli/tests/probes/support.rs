@@ -490,7 +490,9 @@ impl Graph {
     /// `node` in selector notation.
     pub fn describe(&self, id: &str) -> String {
         match self.node(id) {
-            Some(node) if node.kind == NodeKind::File.as_str() => node.id.clone(),
+            Some(node) if node.kind == NodeKind::File.as_str() => {
+                format!("file:{}", node.file_path)
+            }
             Some(node) => format!(
                 "{} {} @{}:{}",
                 node.kind, node.qualified_name, node.file_path, node.start_line
@@ -703,11 +705,12 @@ struct Selector<'a> {
 impl<'a> Selector<'a> {
     #[track_caller]
     fn parse(text: &'a str) -> Self {
-        if text.starts_with("file:") {
+        if let Some(path) = text.strip_prefix("file:") {
+            assert!(!path.is_empty(), "malformed node selector `{text}`");
             return Self {
-                file_node: Some(text),
+                file_node: Some(path),
                 kind: None,
-                qualified_name: text,
+                qualified_name: path,
                 file: None,
                 line: None,
             };
@@ -747,8 +750,10 @@ impl<'a> Selector<'a> {
     }
 
     fn matches(&self, node: &NodeRow) -> bool {
-        if let Some(id) = self.file_node {
-            return node.id == id;
+        // By path, not by id: the embedded extractors (Liquid, MyBatis, …) key
+        // their file node by a hash rather than `file:{path}`.
+        if let Some(path) = self.file_node {
+            return node.kind == NodeKind::File.as_str() && node.file_path == path;
         }
         node.qualified_name == self.qualified_name
             && self.kind.is_none_or(|kind| node.kind == kind)
