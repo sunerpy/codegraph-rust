@@ -7,6 +7,7 @@
 
 pub mod control;
 pub mod http_registry;
+mod install;
 mod lease_keeper;
 mod lock;
 pub mod mcp_registry;
@@ -31,6 +32,7 @@ pub use control::{
     CONTROL_PROTOCOL, ControlAck, ControlFrame, ShutdownOutcome, parse_control_frame,
     request_daemon_shutdown,
 };
+pub use install::{CODEGRAPH_DAEMON_INSTALL_CHECK_MS, InstallIdentity, install_check_interval};
 pub use lease_keeper::{
     CODEGRAPH_DAEMON_RETRY_MAX_MS, CODEGRAPH_DAEMON_RETRY_MS, DaemonRetryPolicy,
     SessionLeaseKeeper, keep_session_attached,
@@ -49,7 +51,7 @@ pub use project_service::{
     ProjectDaemonLease, attach_project_daemon_passive, project_service_broker,
     retain_project_daemon, retain_project_daemon_passive,
 };
-pub use proxy::{ProxyOutcome, run_proxy, verify_daemon_hello};
+pub use proxy::{DaemonPeer, ProxyOutcome, classify_daemon_hello, run_proxy, verify_daemon_hello};
 pub use session::{SessionRegistry, read_daemon_hello, run_session_recv};
 pub use spawn::{
     CODEGRAPH_HTTP_DETACH_INTERNAL, CODEGRAPH_SKIP_STARTUP_CATCHUP, spawn_detached_daemon,
@@ -203,6 +205,14 @@ pub struct DaemonOptions {
     /// acknowledges success, so the caller fails closed. Defaults to
     /// [`DRAIN_TIMEOUT`].
     pub drain_budget: Duration,
+    /// The install this daemon runs, recorded at start. Once the file there is
+    /// replaced or removed (an upgrade), the daemon drains and exits so the next
+    /// session starts one from the current install (upstream #2346). Defaults
+    /// to the running executable; `None` disables the check.
+    pub install: Option<InstallIdentity>,
+    /// How often [`Self::install`] is checked. Defaults to
+    /// [`install_check_interval`]; `None` disables the check.
+    pub install_check: Option<Duration>,
 }
 
 impl Default for DaemonOptions {
@@ -214,6 +224,8 @@ impl Default for DaemonOptions {
             run_mcp: true,
             watch: true,
             drain_budget: DRAIN_TIMEOUT,
+            install: InstallIdentity::current(),
+            install_check: install_check_interval(),
         }
     }
 }
@@ -571,6 +583,7 @@ async fn run_accept_loop_async(
     let mut ticker = tokio::time::interval(Duration::from_millis(tick_ms));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_sweep = std::time::Instant::now();
+    let mut last_install_check = std::time::Instant::now();
 
     let stop_reason: Option<anyhow::Error> = loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -637,6 +650,21 @@ async fn run_accept_loop_async(
                 if last_sweep.elapsed().as_millis() >= client_sweep_ms {
                     sweep_dead_clients(&registry);
                     last_sweep = std::time::Instant::now();
+                }
+                // A daemon keeps running the code it started with. Once its
+                // install is replaced or removed it steps aside, so the next
+                // session starts a daemon from the current install (#2346).
+                if let (Some(install), Some(every)) = (&options.install, options.install_check)
+                    && last_install_check.elapsed() >= every
+                {
+                    last_install_check = std::time::Instant::now();
+                    if install.changed() {
+                        info!(
+                            install = %install.path().display(),
+                            "daemon exiting: its install was upgraded or removed"
+                        );
+                        break None;
+                    }
                 }
                 let idle_ms = registry.millis_since_active();
                 if idle_ms > max_idle_ms {

@@ -238,7 +238,11 @@ up, the session retains a passive lease on it, the same client connection an
 explicit `projectPath` service holds, so the daemon does not idle-exit while the
 session lives. If that lease stops being live (the daemon died, was replaced, or
 the index was re-created), the session starts or re-attaches a daemon with
-exponential backoff, and never creates an index that is gone. Explicit direct mode
+exponential backoff, and never creates an index that is gone. A session that
+meets a daemon of an older plain `X.Y.Z` release asks it to drain over the
+project-bound control channel and starts one from its own install; a daemon of
+any other version keeps the project. Each daemon also exits once its own
+executable is replaced or removed. Explicit direct mode
 (`CODEGRAPH_NO_DAEMON=1`) may own the writer instead; a second direct process fails
 fast rather than alternating sync mutations. An unindexed explicit path remains
 state-free: only `codegraph init` creates an index namespace.

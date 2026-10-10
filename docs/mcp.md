@@ -506,7 +506,10 @@ but starts no second watcher. It then retains a passive connection to the daemon
 it started, so the daemon keeps live sync running for as long as the session is
 open instead of idle-exiting under it; if that connection is lost, the session
 starts or re-attaches a daemon with backoff (`CODEGRAPH_DAEMON_RETRY_MS`, see
-[`cli.md`](cli.md#detached-daemon-lifecycle)). When `CODEGRAPH_NO_DAEMON=1` is used, the foreground
+[`cli.md`](cli.md#detached-daemon-lifecycle)). A daemon left running by an older
+release is drained and replaced by one from the session's own install; a newer or
+unresponsive one is left alone, and the session then serves reads without
+auto-sync and says so on stderr. When `CODEGRAPH_NO_DAEMON=1` is used, the foreground
 process owns this writer lock; a second direct server for the same project exits
 with actionable guidance. Read-only/no-default sessions take no writer lock.
 When the resolved root is exactly `$HOME` or the filesystem root (`/`), the

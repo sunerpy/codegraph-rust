@@ -18,6 +18,7 @@ use anyhow::Result;
 use codegraph_mcp::ProjectService as _;
 use tracing::{debug, info};
 
+use crate::install::InstallIdentity;
 use crate::project_service::{
     ProjectDaemonLease, attach_project_daemon_passive, retain_project_daemon_passive,
 };
@@ -121,6 +122,9 @@ pub struct SessionLeaseKeeper {
 pub fn keep_session_attached(project_root: PathBuf, no_watch: bool) -> SessionLeaseKeeper {
     let (stop, stopped) = mpsc::channel::<()>();
     let policy = DaemonRetryPolicy::from_env();
+    // The install this session runs. Once it is replaced or removed, the
+    // session runs replaced code and must not start daemons for the project.
+    let install = InstallIdentity::current();
     let spawned = std::thread::Builder::new()
         .name("codegraph-daemon-lease".to_string())
         .spawn(move || {
@@ -137,12 +141,27 @@ pub fn keep_session_attached(project_root: PathBuf, no_watch: bool) -> SessionLe
                 },
                 ProjectDaemonLease::is_live,
                 |delay| wait_unless_stopped(&stopped, delay),
+                || own_install_unchanged(install.as_ref()),
             );
         });
     if let Err(error) = spawned {
         debug!(%error, "could not start the daemon lease keeper; the session serves without one");
     }
     SessionLeaseKeeper { _stop: stop }
+}
+
+/// Whether this session may still start or re-attach daemons: false once its
+/// own install was upgraded or removed (upstream #2346), which it reports once.
+fn own_install_unchanged(install: Option<&InstallIdentity>) -> bool {
+    if install.is_some_and(InstallIdentity::changed) {
+        // stdout carries JSON-RPC only; MCP hosts log stderr.
+        eprintln!(
+            "[CodeGraph MCP] This session's CodeGraph install was upgraded or removed; it keeps \
+             serving reads, but restart the session to use the current install."
+        );
+        return false;
+    }
+    true
 }
 
 /// Wait `delay`; `false` once the keeper was dropped.
@@ -154,14 +173,16 @@ fn wait_unless_stopped(stopped: &mpsc::Receiver<()>, delay: Duration) -> bool {
 }
 
 /// The keeper loop, with every effect injected so the backoff is unit-testable:
-/// `attach` acquires a lease, `is_live` checks a held one, and `wait` sleeps for
-/// the given delay and returns `false` when the keeper should stop.
+/// `attach` acquires a lease, `is_live` checks a held one, `wait` sleeps for
+/// the given delay and returns `false` when the keeper should stop, and
+/// `may_retry` is asked before every retry.
 fn run_keeper<L>(
     policy: DaemonRetryPolicy,
     liveness_poll: Duration,
     mut attach: impl FnMut(Attach) -> Result<L>,
     is_live: impl Fn(&L) -> bool,
     mut wait: impl FnMut(Duration) -> bool,
+    mut may_retry: impl FnMut() -> bool,
 ) {
     let mut mode = Attach::JustSpawned;
     let mut delay = policy.base;
@@ -192,7 +213,7 @@ fn run_keeper<L>(
                 debug!(?mode, error = %format!("{error:#}"), "no shared daemon lease");
             }
         }
-        if !policy.retries() || !wait(delay) {
+        if !policy.retries() || !wait(delay) || !may_retry() {
             return;
         }
         delay = policy.next(delay);
@@ -222,6 +243,7 @@ mod tests {
         waits: RefCell<Vec<Duration>>,
         polls_left: Cell<u32>,
         max_waits: usize,
+        may_retry: Cell<bool>,
     }
 
     impl Script {
@@ -232,6 +254,7 @@ mod tests {
                 waits: RefCell::new(Vec::new()),
                 polls_left: Cell::new(0),
                 max_waits,
+                may_retry: Cell::new(true),
             }
         }
 
@@ -259,6 +282,7 @@ mod tests {
                     waits.push(delay);
                     waits.len() < self.max_waits
                 },
+                || self.may_retry.get(),
             );
         }
 
@@ -337,6 +361,16 @@ mod tests {
         script.run(DaemonRetryPolicy::from_millis(5_000, 300_000));
         assert_eq!(*script.modes.borrow(), [Attach::JustSpawned]);
         assert_eq!(*script.waits.borrow(), [POLL, POLL, POLL]);
+    }
+
+    #[test]
+    fn a_session_whose_install_changed_never_retries() {
+        // The first attach fails; the retry is refused, so no daemon is started.
+        let script = Script::new(vec![None, Some(9)], 10);
+        script.may_retry.set(false);
+        script.run(DaemonRetryPolicy::from_millis(5_000, 300_000));
+        assert_eq!(*script.modes.borrow(), [Attach::JustSpawned]);
+        assert_eq!(*script.waits.borrow(), [ms(5_000)]);
     }
 
     #[test]

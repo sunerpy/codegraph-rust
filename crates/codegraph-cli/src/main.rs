@@ -3919,8 +3919,24 @@ fn serve_spawn_or_proxy(
     match cold_start_action(daemon_already_running(project_root)) {
         ColdStartAction::ProxyToRunningDaemon => {
             tracing::debug!("serve_spawn_or_proxy: attaching to existing daemon (warm)");
-            if let Some(result) = proxy_to_running_daemon(project_root) {
-                return result;
+            match proxy_to_running_daemon(project_root) {
+                WarmAttach::Proxied(result) => return result,
+                WarmAttach::VersionMismatch => match replace_older_daemon(project_root) {
+                    DaemonReplacement::Drained => {
+                        return serve_after_replacement(
+                            project,
+                            project_root,
+                            no_watch,
+                            explicit_path,
+                        );
+                    }
+                    DaemonReplacement::Kept(reason) => {
+                        // stdout carries JSON-RPC only; MCP hosts log stderr, so a
+                        // session that quietly stopped syncing is visible there.
+                        eprintln!("[CodeGraph MCP] {READ_ONLY_SESSION_NOTICE}: {reason}.");
+                    }
+                },
+                WarmAttach::Unavailable => {}
             }
             // A failed transport attach does not grant a second watcher. Keep the
             // request path available as a read-only direct session while the live
@@ -3928,50 +3944,95 @@ fn serve_spawn_or_proxy(
             serve_direct_stdio(project, explicit_project_services(no_watch))
         }
         ColdStartAction::SpawnDaemonAndServeDirect => {
-            // Cold: kick off the shared daemon for FUTURE sessions, then serve
-            // this session direct immediately. The spawn is best-effort and
-            // idempotent — `start_or_attach` (via the daemon's pid lock) makes N
-            // concurrent cold sessions converge on at most one daemon, and a
-            // failed/lost race just means this session serves direct (which it
-            // does anyway). We deliberately do NOT poll or proxy here: that
-            // prelude is exactly what blew past opencode's handshake timeout.
-            if spawn_shared_daemon_best_effort(project_root, no_watch) {
-                // The detached daemon is the sole writer. This foreground process
-                // exists only to answer the first MCP handshake without waiting for
-                // socket readiness; starting another watcher/catch-up here recreated
-                // the exact dual-writer race #1740 guards against.
-                //
-                // The daemon is also what keeps this session's index live, and a
-                // daemon with no client idle-exits. Once its socket is up, the
-                // keeper retains a passive lease for the life of the session and,
-                // if that lease is lost, starts or re-attaches a daemon with
-                // backoff (upstream #2293). It runs on its own thread, so the
-                // handshake below still never waits on the daemon.
-                let _lease_keeper =
-                    codegraph_daemon::keep_session_attached(project_root.to_path_buf(), no_watch);
-                serve_direct_stdio(project, explicit_project_services(no_watch))
-            } else {
-                // If the child could not even be spawned, preserve the established
-                // in-process fallback. It takes writer.pid itself, so two fallback
-                // processes still cannot run competing watchers.
-                serve_direct(project, project_root, no_watch, explicit_path)
-            }
+            serve_cold_start(project, project_root, no_watch, explicit_path)
         }
     }
 }
 
-/// Attach to an ALREADY-running shared daemon via the real proxy. Returns
-/// `Some(Ok(()))` when the proxy bridged the session (caller must NOT also serve
-/// direct), or `None` when it could not attach (socket gone, version mismatch,
-/// or connect error) — the caller then falls back to direct serving. Unchanged
-/// proxy semantics: `run_proxy` answers `initialize`/`tools/list` locally and
+/// The stderr notice of a session that serves reads while another process owns
+/// the project's writer slot (upstream's `readOnlyFallback`).
+const READ_ONLY_SESSION_NOTICE: &str = "Serving reads in-process without auto-sync";
+
+/// Cold: kick off the shared daemon, then serve this session direct immediately.
+/// The spawn is best-effort and idempotent — `start_or_attach` (via the daemon's
+/// pid lock) makes N concurrent cold sessions converge on at most one daemon,
+/// and a failed/lost race just means this session serves direct (which it does
+/// anyway). We deliberately do NOT poll or proxy here: that prelude is exactly
+/// what blew past opencode's handshake timeout.
+fn serve_cold_start(
+    project: Option<PathBuf>,
+    project_root: &Path,
+    no_watch: bool,
+    explicit_path: bool,
+) -> Result<()> {
+    if spawn_shared_daemon_best_effort(project_root, no_watch) {
+        // The detached daemon is the sole writer. This foreground process exists
+        // only to answer the first MCP handshake without waiting for socket
+        // readiness; starting another watcher/catch-up here recreated the exact
+        // dual-writer race #1740 guards against.
+        //
+        // The daemon is also what keeps this session's index live, and a daemon
+        // with no client idle-exits. Once its socket is up, the keeper retains a
+        // passive lease for the life of the session and, if that lease is lost,
+        // starts or re-attaches a daemon with backoff (upstream #2293). It runs
+        // on its own thread, so the handshake below still never waits on the
+        // daemon.
+        let _lease_keeper =
+            codegraph_daemon::keep_session_attached(project_root.to_path_buf(), no_watch);
+        serve_direct_stdio(project, explicit_project_services(no_watch))
+    } else {
+        // If the child could not even be spawned, preserve the established
+        // in-process fallback. It takes writer.pid itself, so two fallback
+        // processes still cannot run competing watchers.
+        serve_direct(project, project_root, no_watch, explicit_path)
+    }
+}
+
+/// After an older install's daemon drained: start this install's daemon and
+/// proxy to it once its socket is up within the usual poll window; a slower
+/// start is served like a cold start, which attaches as soon as it can.
+fn serve_after_replacement(
+    project: Option<PathBuf>,
+    project_root: &Path,
+    no_watch: bool,
+    explicit_path: bool,
+) -> Result<()> {
+    if !spawn_shared_daemon_best_effort(project_root, no_watch) {
+        return serve_direct(project, project_root, no_watch, explicit_path);
+    }
+    poll_for_daemon_socket(project_root);
+    if let WarmAttach::Proxied(result) = proxy_to_running_daemon(project_root) {
+        return result;
+    }
+    let _lease_keeper =
+        codegraph_daemon::keep_session_attached(project_root.to_path_buf(), no_watch);
+    serve_direct_stdio(project, explicit_project_services(no_watch))
+}
+
+/// What attaching to a running daemon came to.
+enum WarmAttach {
+    /// The proxy bridged the session until one side closed.
+    Proxied(Result<()>),
+    /// The daemon is another build: its hello did not match this one.
+    VersionMismatch,
+    /// No usable socket, or the attach failed.
+    Unavailable,
+}
+
+/// Attach to an ALREADY-running shared daemon via the real proxy. On
+/// [`WarmAttach::Proxied`] the caller must NOT also serve direct; otherwise it
+/// may replace an older daemon or fall back to direct serving. Unchanged proxy
+/// semantics: `run_proxy` answers `initialize`/`tools/list` locally and
 /// forwards tool calls; its fd half-close / ppid-watchdog teardown is untouched.
-fn proxy_to_running_daemon(project_root: &Path) -> Option<Result<()>> {
-    let socket_path = codegraph_daemon::recorded_socket_path(project_root).ok()?;
+/// A mismatch is reported before `run_proxy` reads any client input.
+fn proxy_to_running_daemon(project_root: &Path) -> WarmAttach {
+    let Ok(socket_path) = codegraph_daemon::recorded_socket_path(project_root) else {
+        return WarmAttach::Unavailable;
+    };
     if !socket_path.exists() {
         tracing::debug!("proxy_to_running_daemon: daemon socket missing; falling back to direct");
         heal_stale_daemon_if_dead(project_root);
-        return None;
+        return WarmAttach::Unavailable;
     }
 
     let host_ppid = Some(codegraph_daemon::current_ppid());
@@ -3982,18 +4043,93 @@ fn proxy_to_running_daemon(project_root: &Path) -> Option<Result<()>> {
         BufReader::new(stdin.lock()),
         io::stdout(),
     ) {
-        Ok(codegraph_daemon::ProxyOutcome::Proxied) => Some(Ok(())),
+        Ok(codegraph_daemon::ProxyOutcome::Proxied) => WarmAttach::Proxied(Ok(())),
         Ok(codegraph_daemon::ProxyOutcome::VersionMismatch) => {
-            tracing::debug!(
-                "proxy_to_running_daemon: daemon version mismatch; falling back to direct"
-            );
-            None
+            tracing::debug!("proxy_to_running_daemon: daemon version mismatch");
+            WarmAttach::VersionMismatch
         }
         Err(err) => {
             tracing::debug!(error = %err, "proxy_to_running_daemon: proxy attach failed; falling back to direct");
             heal_stale_daemon_if_dead(project_root);
-            None
+            WarmAttach::Unavailable
         }
+    }
+}
+
+/// What a session did about a running daemon of another build.
+enum DaemonReplacement {
+    /// The daemon of an older release drained on request; the project's
+    /// rendezvous and writer slot are free for this install's daemon.
+    Drained,
+    /// The daemon keeps the project, for the reason given.
+    Kept(String),
+}
+
+/// Replace a running daemon only when it is an OLDER plain `X.Y.Z` release
+/// (upstream #2343): ask it to drain over its control channel, which is bound
+/// to this project's identity, so nothing is ever signalled by pid. A daemon of
+/// a newer release, a prerelease or an unknown version is never stopped, so two
+/// installs cannot take turns replacing each other's daemon, and one that does
+/// not acknowledge the drain keeps the project and its writer slot.
+fn replace_older_daemon(project_root: &Path) -> DaemonReplacement {
+    use codegraph_daemon::{DaemonPeer, ShutdownOutcome};
+
+    let hello = match codegraph_daemon::recorded_socket_path(project_root)
+        .and_then(|socket| codegraph_daemon::attach_to_daemon(&socket))
+    {
+        Ok(client) => client.hello,
+        Err(error) => {
+            return DaemonReplacement::Kept(format!(
+                "the project's daemon could not be reached ({error:#})"
+            ));
+        }
+    };
+    let version = match codegraph_daemon::classify_daemon_hello(&hello) {
+        DaemonPeer::OlderRelease { version } => version,
+        DaemonPeer::Same => {
+            return DaemonReplacement::Kept(
+                "the project's daemon is this build but did not accept the session".to_string(),
+            );
+        }
+        DaemonPeer::Foreign {
+            version: Some(version),
+        } => {
+            return DaemonReplacement::Kept(format!(
+                "the project's daemon runs codegraph {version}, which codegraph {VERSION} never \
+                 replaces"
+            ));
+        }
+        DaemonPeer::Foreign { version: None } => {
+            return DaemonReplacement::Kept(
+                "the project's daemon runs an unknown codegraph version, which is never replaced"
+                    .to_string(),
+            );
+        }
+    };
+    let identity = match index_paths(project_root) {
+        Ok(paths) => paths.project_identity().to_string(),
+        Err(error) => {
+            return DaemonReplacement::Kept(format!(
+                "the codegraph {version} daemon was left running: {error:#}"
+            ));
+        }
+    };
+    match codegraph_daemon::request_daemon_shutdown(project_root, &identity) {
+        Ok(ShutdownOutcome::Drained { pid }) => {
+            tracing::info!(
+                pid,
+                %version,
+                "replaced the daemon an older codegraph install left running"
+            );
+            DaemonReplacement::Drained
+        }
+        Ok(ShutdownOutcome::NoDaemon) => DaemonReplacement::Drained,
+        Ok(ShutdownOutcome::Unresponsive { pid, detail }) => DaemonReplacement::Kept(format!(
+            "the codegraph {version} daemon (pid {pid}) did not drain when asked ({detail})"
+        )),
+        Err(error) => DaemonReplacement::Kept(format!(
+            "the codegraph {version} daemon could not be asked to drain ({error:#})"
+        )),
     }
 }
 
