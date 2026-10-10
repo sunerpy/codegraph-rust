@@ -1007,10 +1007,13 @@ Before choosing Direct/daemon mode, `serve --mcp` resolves one default root:
    workspace manifest or `.git`;
 3. adopt the child only when exactly one indexed project is found.
 
-The downward scan is deterministic and bounded: depth 4, at most 64 candidates,
+The downward scan is deterministic and bounded: depth 4, at most 64 candidates
+and 10,000 directory entries (plus a 500 ms backstop for slow filesystems),
 sorted directory traversal, no descent below an indexed child, and no
 `node_modules`, VCS metadata, build output, vendor, virtualenv, cache, or temp
-directories. It never runs from `$HOME` or a filesystem root. An adopted child
+directories. It never runs from `$HOME` or a filesystem root. A scan that stops
+at its entry budget or backstop adopts nothing and says so, because it cannot
+know the child it found is the only one. An adopted child
 enters the ordinary daemon/watcher/catch-up path, so the daemon socket and watch
 scope are keyed to the child rather than the unindexed workspace container.
 

@@ -534,10 +534,16 @@ project folder as the working directory.
 For a normal unindexed workspace container, stdio startup has one additional
 safe path before entering no-default mode: if the launch directory has a
 workspace manifest or `.git`, CodeGraph scans downward to depth 4, inspects at
-most 64 indexed candidates, skips dot/heavy/build/vendor/venv/cache/temp
+most 64 indexed candidates and 10,000 directory entries in all (with a 500 ms
+backstop for slow filesystems), skips dot/heavy/build/vendor/venv/cache/temp
 directories, and stops below an indexed child. Exactly one candidate is adopted
 and gets the full daemon/watcher/catch-up lifecycle. Zero or multiple candidates
-are never guessed. This scan is forbidden at `$HOME` and filesystem roots.
+are never guessed, and a scan that stops at its entry budget or backstop adopts
+nothing, because it cannot know the candidate it found is the only one. This
+scan is forbidden at `$HOME` and filesystem roots. `serve --mcp` runs it once
+before it chooses direct or daemon mode, and the MCP server runs its own on the
+first `tools/list` or tool call rather than before answering `initialize`, so a
+large launch directory delays the handshake by at most the backstop.
 
 Multiple indexed children do not need duplicate MCP registrations. On the first
 tool call that supplies an explicit `projectPath`, CodeGraph starts or attaches
@@ -580,9 +586,10 @@ The stdio server resolves a default project from these sources:
    `.codegraph/` index root. A cwd at or inside an indexed project resolves it
    here, and `projectPath` is optional.
 3. **bounded workspace child scan** — if find-up yields nothing and the launch
-   directory contains `.git` or a workspace manifest, scan at most four levels
-   and 64 candidates. Exactly one indexed child is adopted; multiple candidates
-   are sorted and reported, never selected. HOME and filesystem roots are not
+   directory contains `.git` or a workspace manifest, scan at most four levels,
+   64 candidates and 10,000 entries. Exactly one indexed child of a complete
+   scan is adopted; multiple candidates are sorted and reported, never selected,
+   and a scan cut short adopts nothing. HOME and filesystem roots are not
    scanned.
 4. **MCP `initialize` handshake** — if startup resolution yields nothing, the server reads
    the `initialize` message sent by the client and adopts the workspace it

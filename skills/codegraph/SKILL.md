@@ -92,7 +92,7 @@ one usable index, normally created with `codegraph init`.
 
 A bare stdio launch first walks upward for an index. If that misses and the
 launch directory is a workspace root (manifest or `.git`), CodeGraph performs a
-bounded scan (depth 4, at most 64 candidates). It adopts exactly one indexed
+bounded scan (depth 4, at most 64 candidates and 10,000 entries). It adopts exactly one indexed
 child and starts that child's normal daemon/watcher/catch-up path. Zero or
 multiple children are never guessed: the tool response and stderr name the
 sorted candidates, and the caller must pass `projectPath` or restart with
