@@ -65,6 +65,7 @@ fn spawn_detached_daemon_inner(
     // Resolved once, fail-closed: the log target must be the project's own v2
     // rendezvous log, never a reconstructed path.
     let log_path = daemon_log_path(root)?;
+    // console-window-guard: `detach` starts it with no console (DETACHED_PROCESS).
     let mut command = Command::new(exe);
     command
         .arg("serve")
@@ -119,6 +120,7 @@ pub fn spawn_detached_http(
     project: Option<&Path>,
     log_file: &Path,
 ) -> Result<u32> {
+    // console-window-guard: `detach` starts it with no console (DETACHED_PROCESS).
     let mut command = Command::new(exe);
     command
         .arg("serve")

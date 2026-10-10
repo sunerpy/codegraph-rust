@@ -8,8 +8,8 @@ mod watcher;
 mod worktree;
 
 pub use git::{
-    DEFAULT_SYNC_HOOKS, GitHookName, GitHookResult, install_git_sync_hooks, is_git_repo,
-    is_sync_hook_installed, remove_git_sync_hooks,
+    DEFAULT_SYNC_HOOKS, GitHookName, GitHookResult, hide_console_window, install_git_sync_hooks,
+    is_git_repo, is_sync_hook_installed, remove_git_sync_hooks,
 };
 #[cfg(feature = "test-hooks")]
 pub use git_pending::test_hooks as git_pending_hooks;

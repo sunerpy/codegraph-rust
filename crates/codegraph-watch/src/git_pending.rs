@@ -111,12 +111,7 @@ fn git(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
+    crate::git::hide_console_window(&mut command);
     let mut child = command.spawn().ok()?;
     let stdout = child.stdout.take()?;
     let reader = std::thread::spawn(move || {
@@ -768,6 +763,7 @@ mod tests {
     fn wait_until_executable(script: &Path) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
+            // console-window-guard: test-only, runs a test's own stand-in script.
             match std::process::Command::new(script)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())

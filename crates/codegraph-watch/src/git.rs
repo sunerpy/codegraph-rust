@@ -46,14 +46,31 @@ pub(crate) const GIT_REPO_SELECTION_ENV: &[&str] = &[
 ];
 
 /// Build a `git` [`Command`] rooted at `dir` with the ambient repo-selection
-/// environment stripped, so discovery happens from `dir` alone.
+/// environment stripped, so discovery happens from `dir` alone, and no console
+/// window of its own on Windows.
 pub(crate) fn git_command(dir: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.current_dir(dir);
     for var in GIT_REPO_SELECTION_ENV {
         cmd.env_remove(var);
     }
+    hide_console_window(&mut cmd);
     cmd
+}
+
+/// Keep a child process from opening a console window of its own on Windows.
+/// The daemon runs detached, with no console, so every console program it
+/// starts (git above all) would get a new visible one that flashes once per
+/// call, on daemon start and on every auto-sync (upstream #2280). A no-op
+/// elsewhere.
+pub fn hide_console_window(command: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
 }
 
 pub fn install_git_sync_hooks(project_root: impl AsRef<Path>) -> Result<GitHookResult> {

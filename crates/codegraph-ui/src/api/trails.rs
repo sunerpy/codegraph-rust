@@ -815,6 +815,7 @@ fn git_user_name(project_root: &Path) -> Option<String> {
     for var in GIT_LOCATION_VARS {
         command.env_remove(var);
     }
+    codegraph_watch::hide_console_window(&mut command);
     let mut child = command.spawn().ok()?;
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
