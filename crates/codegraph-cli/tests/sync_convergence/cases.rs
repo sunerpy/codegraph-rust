@@ -341,6 +341,22 @@ pub fn swift_method_body_edit() -> Case {
         .edge_throughout("function tick", "instantiates", "class Counter")
 }
 
+/// #897: a Kotlin function's value reference follows the object constant it
+/// reads.
+pub fn kotlin_object_constant_reader_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Kotlin])
+        .file(
+            "src/Config.kt",
+            "object Config {\n    const val MAX_RETRIES = 3\n    const val MAX_WAIT = 30\n\n    fun limit(): Int = MAX_RETRIES\n}\n",
+        )
+        .write(
+            "src/Config.kt",
+            "object Config {\n    const val MAX_RETRIES = 3\n    const val MAX_WAIT = 30\n\n    fun limit(): Int = MAX_WAIT\n}\n",
+        )
+        .edge_before("method Config::limit", "references", "constant Config::MAX_RETRIES")
+        .edge_after("method Config::limit", "references", "constant Config::MAX_WAIT")
+}
+
 /// #897: a Ruby method's value reference follows the class constant it reads.
 pub fn ruby_class_constant_reader_body_edit() -> Case {
     Case::new(Change::BodyEdit, &[Language::Ruby])

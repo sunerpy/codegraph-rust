@@ -1338,6 +1338,15 @@
     "metadata": null,
     "provenance": null,
     "source": "file:vapor/Package.swift",
+    "target": "constant:9a81f1b949a20cd685a8aefa52236a66"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "file:vapor/Package.swift",
     "target": "import:f12e7545a4638c45f23b4a61175e8758"
   },
   {

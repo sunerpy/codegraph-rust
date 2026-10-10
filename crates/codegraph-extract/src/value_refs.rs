@@ -37,6 +37,11 @@ pub(crate) fn has_value_refs(language: Language) -> bool {
             | Language::Ruby
             | Language::C
             | Language::Pascal
+            | Language::Java
+            | Language::CSharp
+            | Language::Kotlin
+            | Language::Swift
+            | Language::Dart
     )
 }
 
@@ -183,6 +188,17 @@ impl<'tree> ValueRefs<'tree> {
                 }
                 // C `T X = …`: the file-scope value and a local that shadows it.
                 "init_declarator" => bump(crate::lang::c_declarator_identifier(Some(node))),
+                // Kotlin / Swift `val`/`let X = …`: an object's or a type's
+                // static value, and a local that shadows it.
+                "property_declaration" => bump(property_declarator_name(node)),
+                // Dart: a top-level or `static` constant, a field or `var`, and
+                // a local.
+                "static_final_declaration"
+                | "initialized_identifier"
+                | "initialized_variable_definition" => bump(
+                    node.named_children(&mut node.walk())
+                        .find(|child| child.kind() == "identifier"),
+                ),
                 // Scala `val X = …` / `var X = …`.
                 "val_definition" | "var_definition" => {
                     bump(child_by_field(node, "pattern").filter(|p| p.kind() == "identifier"));
@@ -213,6 +229,42 @@ impl<'tree> ValueRefs<'tree> {
             }
         }
     }
+}
+
+/// The name a Kotlin or Swift `property_declaration` binds: kotlin-ng's
+/// `variable_declaration` identifier, or the first `simple_identifier` of a
+/// Swift pattern.
+fn property_declarator_name(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
+    if let Some(declaration) = node
+        .named_children(&mut node.walk())
+        .find(|child| child.kind() == "variable_declaration")
+    {
+        return declaration
+            .named_children(&mut declaration.walk())
+            .find(|child| child.kind() == "identifier");
+    }
+    let pattern = child_by_field(node, "name").or_else(|| {
+        node.named_children(&mut node.walk())
+            .find(|child| matches!(child.kind(), "value_binding_pattern" | "pattern"))
+    })?;
+    first_simple_identifier(pattern)
+}
+
+/// The first `simple_identifier` at or below `node`, breadth first.
+fn first_simple_identifier(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
+    let mut queue = std::collections::VecDeque::from([node]);
+    let mut guard = 0;
+    while let Some(current) = queue.pop_front() {
+        guard += 1;
+        if guard > 40 {
+            break;
+        }
+        if current.kind() == "simple_identifier" {
+            return Some(current);
+        }
+        queue.extend(current.named_children(&mut current.walk()));
+    }
+    None
 }
 
 /// Three or more UTF-16 code units, one of them an ASCII uppercase letter or

@@ -100,8 +100,9 @@ file, class, module, struct or enum scope with a distinctive name (three or more
 characters, one of them an uppercase letter or `_`) is a target, and none whose
 name the file binds again in an inner scope. Generated files have none. The
 languages are TypeScript, JavaScript, TSX, ArkTS, Go, Python, PHP, Scala, Rust,
-Ruby, C and Pascal (whose targets are its `const`s only), and the scripts of
-Vue, Svelte and Astro components through the extractor they delegate to.
+Ruby, C, Pascal (whose targets are its `const`s only), Java, C#, Kotlin, Swift
+and Dart, and the scripts of Vue, Svelte and Astro components through the
+extractor they delegate to.
 
 An edge's semantic identity is:
 

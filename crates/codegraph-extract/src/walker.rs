@@ -612,10 +612,29 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 self.extract_swift_computed_property(node, computed);
                 skip_children = true;
             } else if let Some(owner_id) = self.node_stack.last().cloned() {
-                // tree-sitter.ts:453-487 — Swift stored properties inside a type
-                // are not their own nodes; their property-wrapper attributes and
-                // declared type attach to the enclosing type. Children stay
-                // visited so initializer calls are captured.
+                // #897 — a stored property inside a type is a node: a `static
+                // let`/`static var` a shared constant/variable, an instance one
+                // a field. Its property-wrapper attributes and declared type
+                // attach to the enclosing type (tree-sitter.ts:453-487), and
+                // children stay visited so initializer calls are captured.
+                if let Some((name, is_let)) = swift_stored_property(node, self.source) {
+                    let is_static = self.spec.is_static(node, self.source);
+                    let kind = match (is_static, is_let) {
+                        (true, true) => NodeKind::Constant,
+                        (true, false) => NodeKind::Variable,
+                        (false, _) => NodeKind::Field,
+                    };
+                    self.create_node(
+                        kind,
+                        &name,
+                        node,
+                        NodeExtra {
+                            visibility: self.spec.get_visibility(node),
+                            is_static,
+                            ..NodeExtra::default()
+                        },
+                    );
+                }
                 self.extract_decorators_for(node, &owner_id);
                 self.extract_variable_type_annotation(node, &owner_id);
             }
@@ -665,6 +684,8 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     fn visit_language_specific(&mut self, node: SyntaxNode<'tree>) -> bool {
         match self.spec.language() {
             Language::Scala => self.visit_scala_node(node),
+            Language::Kotlin => self.visit_kotlin_node(node),
+            Language::Dart => self.visit_dart_node(node),
             Language::Lua | Language::Luau => self.visit_lua_node(node),
             Language::ObjC => self.visit_objc_node(node),
             Language::Ruby => self.visit_ruby_node(node),
@@ -3174,6 +3195,10 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 self.extract_pascal_constant(node);
                 return;
             }
+            Language::Swift => {
+                self.extract_swift_global(node);
+                return;
+            }
             _ => {}
         }
         if !matches!(
@@ -3466,6 +3491,96 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 },
             );
         }
+    }
+
+    /// #897 — a Swift top-level stored property: `let` a constant, `var` a
+    /// variable. A computed one is none.
+    fn extract_swift_global(&mut self, node: SyntaxNode<'tree>) {
+        if node.kind() != "property_declaration" {
+            return;
+        }
+        let Some((name, is_let)) = swift_stored_property(node, self.source) else {
+            return;
+        };
+        let kind = if is_let {
+            NodeKind::Constant
+        } else {
+            NodeKind::Variable
+        };
+        self.create_node(
+            kind,
+            &name,
+            node,
+            NodeExtra {
+                docstring: self.docstring_for(node),
+                is_exported: self.spec.is_exported(node, self.source),
+                ..NodeExtra::default()
+            },
+        );
+    }
+
+    /// #897 — a Kotlin property is a node by where it is declared: at the top
+    /// level or in an `object` / companion object a shared value (`val` a
+    /// constant, `var` a variable), in a class a field. A local is none and
+    /// stays the default path's. The property's subtree is not walked, as
+    /// before.
+    fn visit_kotlin_node(&mut self, node: SyntaxNode<'tree>) -> bool {
+        if node.kind() != "property_declaration" {
+            return false;
+        }
+        let Some(name_node) = node
+            .named_children(&mut node.walk())
+            .find(|child| child.kind() == "variable_declaration")
+            .and_then(|declaration| {
+                declaration
+                    .named_children(&mut declaration.walk())
+                    .find(|child| child.kind() == "identifier")
+            })
+        else {
+            return false;
+        };
+        let Some(scope) = kotlin_property_scope(node) else {
+            return false;
+        };
+        let is_val = node
+            .children(&mut node.walk())
+            .any(|child| child.kind() == "val");
+        let kind = match (scope, is_val) {
+            (KotlinPropertyScope::Instance, _) => NodeKind::Field,
+            (KotlinPropertyScope::Shared, true) => NodeKind::Constant,
+            (KotlinPropertyScope::Shared, false) => NodeKind::Variable,
+        };
+        self.create_node(
+            kind,
+            &node_text(name_node, self.source),
+            node,
+            NodeExtra {
+                docstring: self.docstring_for(node),
+                visibility: self.spec.get_visibility(node),
+                ..NodeExtra::default()
+            },
+        );
+        true
+    }
+
+    /// #897 — a Dart `static_final_declaration` is exactly a top-level or class
+    /// `static` `const`/`final`, the shared constant; an instance field or a
+    /// local is another node kind. Its children stay visited, as before.
+    fn visit_dart_node(&mut self, node: SyntaxNode<'tree>) -> bool {
+        if node.kind() == "static_final_declaration"
+            && let Some(name_node) = child_by_field(node, "name")
+        {
+            self.create_node(
+                NodeKind::Constant,
+                &node_text(name_node, self.source),
+                node,
+                NodeExtra {
+                    signature: value_signature(child_by_field(node, "value"), self.source),
+                    ..NodeExtra::default()
+                },
+            );
+        }
+        false
     }
 
     /// A Pascal unit or class `const` (upstream `extractPascalConst`). A
@@ -3852,6 +3967,15 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             return;
         }
 
+        // #897 — a Java `static final` or C# `const` / `static readonly` field
+        // is a constant (OD-5: it was a field).
+        let kind = if matches!(self.spec.language(), Language::Java | Language::CSharp)
+            && self.spec.is_const(node)
+        {
+            NodeKind::Constant
+        } else {
+            NodeKind::Field
+        };
         for declarator in declarators {
             let Some(name_node) = child_by_field(declarator, "name").or_else(|| {
                 declarator
@@ -3863,7 +3987,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             let name = node_text(name_node, self.source);
             let signature = property_or_field_signature(node, &name, self.source);
             if let Some(field_node) = self.create_node(
-                NodeKind::Field,
+                kind,
                 &name,
                 declarator,
                 NodeExtra {
@@ -6565,6 +6689,60 @@ fn has_c_function_ancestor(node: SyntaxNode<'_>) -> bool {
         parent = current.parent();
     }
     false
+}
+
+/// A Swift stored property's name and whether it is a `let` (upstream
+/// `swiftPropertyInfo`); none for a computed property.
+fn swift_stored_property(node: SyntaxNode<'_>, source: &str) -> Option<(String, bool)> {
+    if node.named_children(&mut node.walk()).any(|child| {
+        matches!(
+            child.kind(),
+            "computed_property" | "protocol_property_requirements"
+        )
+    }) {
+        return None;
+    }
+    let pattern = child_by_field(node, "name").or_else(|| {
+        node.named_children(&mut node.walk())
+            .find(|child| matches!(child.kind(), "value_binding_pattern" | "pattern"))
+    })?;
+    let name = first_descendant_kind(pattern, "simple_identifier")
+        .or_else(|| (pattern.kind() == "simple_identifier").then_some(pattern))?;
+    let is_let = node
+        .named_children(&mut node.walk())
+        .find(|child| child.kind() == "value_binding_pattern")
+        .is_some_and(|binding| node_text(binding, source).trim_start().starts_with("let"));
+    Some((node_text(name, source), is_let))
+}
+
+#[derive(Clone, Copy)]
+enum KotlinPropertyScope {
+    Shared,
+    Instance,
+}
+
+/// Where a Kotlin property is declared (upstream `kotlinPropertyKind`): none
+/// for a local (a function, lambda, initializer block, control body or
+/// accessor), shared at the top level or in an `object` / companion object,
+/// instance in a class.
+fn kotlin_property_scope(node: SyntaxNode<'_>) -> Option<KotlinPropertyScope> {
+    let mut parent = node.parent();
+    while let Some(current) = parent {
+        match current.kind() {
+            "function_body"
+            | "function_declaration"
+            | "lambda_literal"
+            | "anonymous_initializer"
+            | "control_structure_body"
+            | "getter"
+            | "setter" => return None,
+            "companion_object" | "object_declaration" => return Some(KotlinPropertyScope::Shared),
+            "class_declaration" => return Some(KotlinPropertyScope::Instance),
+            _ => {}
+        }
+        parent = current.parent();
+    }
+    Some(KotlinPropertyScope::Shared)
 }
 
 /// Whether a Scala value is declared in a `class`, `trait`, `enum` or

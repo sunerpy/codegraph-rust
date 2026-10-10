@@ -99,6 +99,12 @@ impl LanguageSpec for CSharpSpec {
     fn is_static(&self, node: Node<'_>, _source: &str) -> bool {
         has_modifier(node, "static")
     }
+    /// A `const` or `static readonly` field is a constant (upstream #897); an
+    /// instance `readonly` or a plain `static` field stays a field.
+    fn is_const(&self, node: Node<'_>) -> bool {
+        has_modifier(node, "const")
+            || (has_modifier(node, "static") && has_modifier(node, "readonly"))
+    }
     fn is_async(&self, node: Node<'_>) -> bool {
         has_modifier(node, "async")
     }

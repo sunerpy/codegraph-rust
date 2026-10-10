@@ -114,6 +114,13 @@ impl LanguageSpec for JavaSpec {
         modifier_kinds(node).is_some_and(|kinds| kinds.iter().any(|kind| *kind == "static"))
     }
 
+    /// A `static final` field is a constant (upstream #897); an instance or
+    /// `final`-only field stays a field.
+    fn is_const(&self, node: Node<'_>) -> bool {
+        modifier_kinds(node)
+            .is_some_and(|kinds| kinds.contains(&"static") && kinds.contains(&"final"))
+    }
+
     fn extract_package(&self, node: Node<'_>, source: &str) -> Option<String> {
         node.named_children(&mut node.walk())
             .find(|child| matches!(child.kind(), "scoped_identifier" | "identifier"))

@@ -247,7 +247,7 @@
     "errors": null,
     "generated": 0,
     "language": "swift",
-    "node_count": 2,
+    "node_count": 3,
     "path": "vapor/Package.swift",
     "size": 320
   },

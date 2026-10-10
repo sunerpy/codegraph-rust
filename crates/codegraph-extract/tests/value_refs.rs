@@ -335,3 +335,174 @@ fn pascal_readers_of_unit_constants() {
     );
     assert!(readers("shadow.pas", shadow, Language::Pascal, "TIMEOUT").is_empty());
 }
+
+fn row(kind: &str, name: &str) -> (String, String) {
+    (kind.to_string(), name.to_string())
+}
+
+/// Java: a `static final` field is a constant (OD-5: it was a field); an
+/// instance `final` field is per-object state, a field and no target.
+#[test]
+fn java_readers_of_static_final_constants() {
+    let source = "class Limits {\n  public static final int MAX_ITEMS = 100;\n  static final String[] STATUS_NAMES = { \"ok\", \"fail\" };\n  final int instanceId = 1;\n  int capped(int n) { return n > MAX_ITEMS ? MAX_ITEMS : n; }\n  String label(int i) { return STATUS_NAMES[i]; }\n  int id() { return instanceId; }\n}";
+    assert_eq!(
+        values("Limits.java", source, Language::Java),
+        [
+            row("Constant", "Limits::MAX_ITEMS"),
+            row("Constant", "Limits::STATUS_NAMES"),
+            row("Field", "Limits::instanceId"),
+        ]
+    );
+    assert_eq!(
+        readers("Limits.java", source, Language::Java, "MAX_ITEMS"),
+        ["capped"]
+    );
+    assert_eq!(
+        readers("Limits.java", source, Language::Java, "STATUS_NAMES"),
+        ["label"]
+    );
+    assert!(readers("Limits.java", source, Language::Java, "instanceId").is_empty());
+}
+
+#[test]
+fn a_java_constant_shadowed_by_a_local_has_no_readers() {
+    let source = "class Shadow {\n  static final int TIMEOUT = 30;\n  int usesConst() { return TIMEOUT; }\n  int shadows() { int TIMEOUT = 5; return TIMEOUT; }\n}";
+    assert!(readers("Shadow.java", source, Language::Java, "TIMEOUT").is_empty());
+}
+
+/// C#: `const` and `static readonly` fields are constants; an instance
+/// `readonly` field stays a field.
+#[test]
+fn csharp_readers_of_const_and_static_readonly_fields() {
+    let source = "class Limits {\n  const int MAX_ITEMS = 100;\n  static readonly string[] STATUS_NAMES = { \"ok\", \"fail\" };\n  readonly int instanceId = 1;\n  int Capped(int n) { return n > MAX_ITEMS ? MAX_ITEMS : n; }\n  string Label(int i) { return STATUS_NAMES[i]; }\n  int Id() { return instanceId; }\n}";
+    assert_eq!(
+        values("Limits.cs", source, Language::CSharp),
+        [
+            row("Constant", "Limits::MAX_ITEMS"),
+            row("Constant", "Limits::STATUS_NAMES"),
+            row("Field", "Limits::instanceId"),
+        ]
+    );
+    assert_eq!(
+        readers("Limits.cs", source, Language::CSharp, "MAX_ITEMS"),
+        ["Capped"]
+    );
+    assert_eq!(
+        readers("Limits.cs", source, Language::CSharp, "STATUS_NAMES"),
+        ["Label"]
+    );
+    assert!(readers("Limits.cs", source, Language::CSharp, "instanceId").is_empty());
+}
+
+#[test]
+fn a_csharp_constant_shadowed_by_a_local_has_no_readers() {
+    let source = "class Shadow {\n  const int TIMEOUT = 30;\n  int UsesConst() { return TIMEOUT; }\n  int Shadows() { int TIMEOUT = 5; return TIMEOUT; }\n}";
+    assert!(readers("Shadow.cs", source, Language::CSharp, "TIMEOUT").is_empty());
+}
+
+/// Kotlin: a top-level property and an `object`'s or companion object's are
+/// shared (`val` a constant, `var` a variable); a class property is a field;
+/// a local is no node.
+#[test]
+fn kotlin_readers_of_top_level_object_and_companion_constants() {
+    let source = "const val TOP_LEVEL_MAX = 100\nobject Config {\n  const val TIMEOUT_MS = 30\n  val STATUS_NAMES = listOf(\"ok\", \"fail\")\n  fun capped(n: Int): Int = if (n > TIMEOUT_MS) TIMEOUT_MS else n\n  fun label(i: Int): String = STATUS_NAMES[i]\n}\nclass Widget {\n  companion object { const val MAX_RETRIES = 3 }\n  val instanceField = 1\n  fun retries(): Int = MAX_RETRIES\n  fun within(n: Int): Int = if (n < TOP_LEVEL_MAX) n else TOP_LEVEL_MAX\n}";
+    assert_eq!(
+        values("Demo.kt", source, Language::Kotlin),
+        [
+            row("Constant", "Config::STATUS_NAMES"),
+            row("Constant", "Config::TIMEOUT_MS"),
+            row("Constant", "TOP_LEVEL_MAX"),
+            row("Constant", "Widget::MAX_RETRIES"),
+            row("Field", "Widget::instanceField"),
+        ]
+    );
+    assert_eq!(
+        readers("Demo.kt", source, Language::Kotlin, "STATUS_NAMES"),
+        ["label"]
+    );
+    assert_eq!(
+        readers("Demo.kt", source, Language::Kotlin, "MAX_RETRIES"),
+        ["retries"]
+    );
+    assert_eq!(
+        readers("Demo.kt", source, Language::Kotlin, "TOP_LEVEL_MAX"),
+        ["within"]
+    );
+    assert!(readers("Demo.kt", source, Language::Kotlin, "instanceField").is_empty());
+}
+
+#[test]
+fn a_kotlin_constant_shadowed_by_a_local_has_no_readers() {
+    let source = "object Config {\n  const val TIMEOUT = 30\n  fun usesConst(): Int = TIMEOUT\n  fun shadows(): Int { val TIMEOUT = 5; return TIMEOUT }\n}";
+    assert!(readers("Shadow.kt", source, Language::Kotlin, "TIMEOUT").is_empty());
+}
+
+/// Swift: a top-level `let` and a type's `static let` are constants; an
+/// instance stored `let` is a field; a computed property is a property.
+#[test]
+fn swift_readers_of_top_level_and_static_constants() {
+    let source = "let topLevelMax = 100\nenum Constants {\n  static let TIMEOUT_MS = 30\n  static let STATUS_NAMES = [\"ok\", \"fail\"]\n}\nstruct Widget {\n  static let MAX_RETRIES = 3\n  let instanceField = 1\n  func retries() -> Int { return Widget.MAX_RETRIES }\n  func within(_ n: Int) -> Int { return n < topLevelMax ? n : topLevelMax }\n}\nfunc labels(_ i: Int) -> String { return Constants.STATUS_NAMES[i] }";
+    assert_eq!(
+        values("Demo.swift", source, Language::Swift),
+        [
+            row("Constant", "Constants::STATUS_NAMES"),
+            row("Constant", "Constants::TIMEOUT_MS"),
+            row("Constant", "Widget::MAX_RETRIES"),
+            row("Constant", "topLevelMax"),
+            row("Field", "Widget::instanceField"),
+        ]
+    );
+    assert_eq!(
+        readers("Demo.swift", source, Language::Swift, "STATUS_NAMES"),
+        ["labels"]
+    );
+    assert_eq!(
+        readers("Demo.swift", source, Language::Swift, "MAX_RETRIES"),
+        ["retries"]
+    );
+    assert_eq!(
+        readers("Demo.swift", source, Language::Swift, "topLevelMax"),
+        ["within"]
+    );
+    assert!(readers("Demo.swift", source, Language::Swift, "instanceField").is_empty());
+}
+
+#[test]
+fn a_swift_constant_shadowed_by_a_local_has_no_readers() {
+    let source = "enum Config {\n  static let TIMEOUT = 30\n  static func usesConst() -> Int { return TIMEOUT }\n  static func shadows() -> Int { let TIMEOUT = 5; return TIMEOUT }\n}";
+    assert!(readers("Shadow.swift", source, Language::Swift, "TIMEOUT").is_empty());
+}
+
+/// Dart: a top-level `const`/`final` and a class `static const`/`static
+/// final` (`static_final_declaration`) are constants; an instance field is
+/// none.
+#[test]
+fn dart_readers_of_top_level_and_static_constants() {
+    let source = "const TOP_LEVEL_MAX = 100;\nclass Config {\n  static const TIMEOUT_MS = 30;\n  static final STATUS_NAMES = [\"ok\", \"fail\"];\n  final int instanceField = 1;\n  int capped(int n) => n > TIMEOUT_MS ? TIMEOUT_MS : n;\n  String label(int i) { return STATUS_NAMES[i]; }\n  int withinLimit(int n) => n < TOP_LEVEL_MAX ? n : TOP_LEVEL_MAX;\n}";
+    assert_eq!(
+        values("demo.dart", source, Language::Dart),
+        [
+            row("Constant", "Config::STATUS_NAMES"),
+            row("Constant", "Config::TIMEOUT_MS"),
+            row("Constant", "TOP_LEVEL_MAX"),
+        ]
+    );
+    assert_eq!(
+        readers("demo.dart", source, Language::Dart, "TIMEOUT_MS"),
+        ["capped"]
+    );
+    assert_eq!(
+        readers("demo.dart", source, Language::Dart, "STATUS_NAMES"),
+        ["label"]
+    );
+    assert_eq!(
+        readers("demo.dart", source, Language::Dart, "TOP_LEVEL_MAX"),
+        ["withinLimit"]
+    );
+}
+
+#[test]
+fn a_dart_constant_shadowed_by_a_local_has_no_readers() {
+    let source = "const TIMEOUT = 30;\nclass C {\n  int usesConst() => TIMEOUT;\n  int shadows() { const TIMEOUT = 5; return TIMEOUT; }\n}";
+    assert!(readers("shadow.dart", source, Language::Dart, "TIMEOUT").is_empty());
+}
