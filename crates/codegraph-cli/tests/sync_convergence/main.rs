@@ -628,6 +628,7 @@ matrix! {
     csharp_base_list_gains_an_interface,
     objc_change_a_superclass,
     python_change_a_base_class,
+    php_change_a_parent_class,
     scala_change_a_parent_trait,
     solidity_change_a_base_contract,
     cfml_change_a_base_component,

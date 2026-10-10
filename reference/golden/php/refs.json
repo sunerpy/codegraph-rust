@@ -71,6 +71,16 @@
   },
   {
     "candidates": null,
+    "col": 29,
+    "file_path": "tests/ControllerTest.php",
+    "from_node_id": "class:82ee0565e7bb3f0efd92d1ef50aa4660",
+    "language": "php",
+    "line": 7,
+    "reference_kind": "extends",
+    "reference_name": "TestCase"
+  },
+  {
+    "candidates": null,
     "col": 31,
     "file_path": "tests/ControllerTest.php",
     "from_node_id": "method:eb71c0f01dd64f14e6a9c61109c8dd41",

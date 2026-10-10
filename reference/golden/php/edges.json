@@ -108,6 +108,42 @@
     "target": "method:e822dba813ffc7afcfa32af0dbe94cc3"
   },
   {
+    "col": 23,
+    "kind": "extends",
+    "line": 5,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "class:4a5a584db1e132f1566e3f2166285884",
+    "target": "class:158122603a9ae3fc9141a03774beaf92"
+  },
+  {
+    "col": 24,
+    "kind": "extends",
+    "line": 10,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "class:f5e89867f58614512b75125ac61ac081",
+    "target": "class:158122603a9ae3fc9141a03774beaf92"
+  },
+  {
+    "col": 25,
+    "kind": "extends",
+    "line": 16,
+    "metadata": {
+      "confidence": 0.4,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "class:b0cd3cd0e3a094fa1a18eac6baaa3aa6",
+    "target": "class:9abdb02b1af0e4409192055bfeb8d0af"
+  },
+  {
     "col": 32,
     "kind": "calls",
     "line": 19,
@@ -130,6 +166,18 @@
     "provenance": null,
     "source": "method:eb71c0f01dd64f14e6a9c61109c8dd41",
     "target": "method:d7e53b91aba4c60a50c0023d3ae0b6fa"
+  },
+  {
+    "col": 40,
+    "kind": "implements",
+    "line": 10,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "class:f5e89867f58614512b75125ac61ac081",
+    "target": "interface:449d0b11560cee5d7f36e7567a0c539a"
   },
   {
     "col": null,

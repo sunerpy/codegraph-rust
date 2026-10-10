@@ -107,3 +107,30 @@ fn python_class_bases_are_supertypes() {
         ]
     );
 }
+
+/// G7: a PHP class extends its `base_clause` parent and implements each
+/// interface of its `class_interface_clause`; an interface extends every
+/// parent it lists. A qualified name binds by its last segment, the name a
+/// class is stored under and a `use` import brings into scope.
+#[test]
+fn php_extends_and_implements_are_supertypes() {
+    let source = "<?php\nnamespace App;\nclass Store extends \\App\\Base implements Contracts\\Saver, Countable {}\ninterface Saver extends Thing, Other {}\n";
+    assert_eq!(
+        supertypes("src/Store.php", source, Language::Php),
+        vec![
+            extends("Saver", "Other"),
+            extends("Saver", "Thing"),
+            extends("Store", "Base"),
+            (
+                "Store".to_string(),
+                EdgeKind::Implements,
+                "Countable".to_string()
+            ),
+            (
+                "Store".to_string(),
+                EdgeKind::Implements,
+                "Saver".to_string()
+            ),
+        ]
+    );
+}

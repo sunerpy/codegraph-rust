@@ -856,6 +856,25 @@ pub fn python_change_a_base_class() -> Case {
         .edge_after("class Dog", "extends", "class Robot")
 }
 
+/// G7: a PHP class extends its `base_clause` parent.
+pub fn php_change_a_parent_class() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Php])
+        .file(
+            "src/Shapes.php",
+            "<?php\n\nnamespace App;\n\nclass Shape\n{\n}\n\nclass Figure\n{\n}\n",
+        )
+        .file(
+            "src/Square.php",
+            "<?php\n\nnamespace App;\n\nclass Square extends Shape\n{\n}\n",
+        )
+        .write(
+            "src/Square.php",
+            "<?php\n\nnamespace App;\n\nclass Square extends Figure\n{\n}\n",
+        )
+        .edge_before("class App::Square", "extends", "class App::Shape")
+        .edge_after("class App::Square", "extends", "class App::Figure")
+}
+
 pub fn scala_change_a_parent_trait() -> Case {
     Case::new(Change::EditHeritage, &[Language::Scala])
         .file(

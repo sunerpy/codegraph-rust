@@ -1052,6 +1052,16 @@
   {
     "candidates": null,
     "col": 29,
+    "file_path": "laravel/app/Http/Controllers/UserController.php",
+    "from_node_id": "class:4f18c6a55fbdb96432d525ab7e14c64e",
+    "language": "php",
+    "line": 5,
+    "reference_kind": "extends",
+    "reference_name": "Controller"
+  },
+  {
+    "candidates": null,
+    "col": 29,
     "file_path": "play/app/controllers/HomeController.scala",
     "from_node_id": "method:dffa1d90061d3bb5d52e05bf5da1951d",
     "language": "scala",
@@ -1088,6 +1098,16 @@
     "line": 1,
     "reference_kind": "imports",
     "reference_name": "FastAPI"
+  },
+  {
+    "candidates": null,
+    "col": 33,
+    "file_path": "drupal/modules/custom/greeting/src/Controller/GreetingController.php",
+    "from_node_id": "class:4427637d355b7933cc98e64c30388b30",
+    "language": "php",
+    "line": 7,
+    "reference_kind": "extends",
+    "reference_name": "ControllerBase"
   },
   {
     "candidates": null,

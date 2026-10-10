@@ -4756,6 +4756,30 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             if child.kind() == "class_heritage" {
                 self.extract_inheritance(child, class_id);
             }
+            // G7 — PHP `class S extends Base implements A, B` and
+            // `interface I extends J, K`: every listed name, by its last `\`
+            // segment (the name a class is stored under and a `use` brings
+            // into scope).
+            if self.spec.language() == Language::Php
+                && matches!(child.kind(), "base_clause" | "class_interface_clause")
+            {
+                let kind = if child.kind() == "base_clause" {
+                    EdgeKind::Extends
+                } else {
+                    EdgeKind::Implements
+                };
+                for parent in child.named_children(&mut child.walk()) {
+                    if !matches!(parent.kind(), "name" | "qualified_name") {
+                        continue;
+                    }
+                    let text = node_text(parent, self.source);
+                    let name = text.rsplit('\\').next().unwrap_or(&text).trim();
+                    if !name.is_empty() {
+                        let name = name.to_string();
+                        self.push_ref(class_id, &name, kind, parent);
+                    }
+                }
+            }
             // G6 (upstream v1.0.1) — Python `class Flask(Scaffold, mixins.Mixin)`:
             // each identifier or dotted base in the argument list is a
             // supertype; `metaclass=M` (a keyword argument) and `Generic[T]`
