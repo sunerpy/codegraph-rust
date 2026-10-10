@@ -410,6 +410,26 @@ fn valid_ident(text: &str) -> bool {
         && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
+/// The identifier a C declarator declares (upstream `cDeclaratorIdentifier`):
+/// through `init_declarator`, `pointer_declarator`, `array_declarator` and
+/// `parenthesized_declarator`, each by its `declarator` field. A
+/// `function_declarator` is a prototype or a function pointer, never a value.
+pub(crate) fn c_declarator_identifier(node: Option<Node<'_>>) -> Option<Node<'_>> {
+    let mut current = node;
+    for _ in 0..12 {
+        let node = current?;
+        match node.kind() {
+            "identifier" => return Some(node),
+            "init_declarator"
+            | "pointer_declarator"
+            | "array_declarator"
+            | "parenthesized_declarator" => current = child_by_field(node, "declarator"),
+            _ => return None,
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,24 +549,4 @@ mod tests {
         let names: Vec<&str> = attribute_like_defines(src).into_iter().collect();
         assert_eq!(names, ["EFIAPI", "SEC_ATTR"]);
     }
-}
-
-/// The identifier a C declarator declares (upstream `cDeclaratorIdentifier`):
-/// through `init_declarator`, `pointer_declarator`, `array_declarator` and
-/// `parenthesized_declarator`, each by its `declarator` field. A
-/// `function_declarator` is a prototype or a function pointer, never a value.
-pub(crate) fn c_declarator_identifier(node: Option<Node<'_>>) -> Option<Node<'_>> {
-    let mut current = node;
-    for _ in 0..12 {
-        let node = current?;
-        match node.kind() {
-            "identifier" => return Some(node),
-            "init_declarator"
-            | "pointer_declarator"
-            | "array_declarator"
-            | "parenthesized_declarator" => current = child_by_field(node, "declarator"),
-            _ => return None,
-        }
-    }
-    None
 }
