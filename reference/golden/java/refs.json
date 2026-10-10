@@ -2,12 +2,62 @@
   {
     "candidates": null,
     "col": 0,
+    "file_path": "src/main/java/app/shapes/Main.java",
+    "from_node_id": "namespace:d2b9cc03ff2a1861e03fdab9098fdcf9",
+    "language": "java",
+    "line": 3,
+    "reference_kind": "imports",
+    "reference_name": "java.util.ArrayList"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "src/main/java/app/shapes/Main.java",
+    "from_node_id": "namespace:d2b9cc03ff2a1861e03fdab9098fdcf9",
+    "language": "java",
+    "line": 4,
+    "reference_kind": "imports",
+    "reference_name": "java.util.List"
+  },
+  {
+    "candidates": null,
+    "col": 0,
     "file_path": "src/main/java/app/shapes/Square.java",
     "from_node_id": "namespace:81eb58e808c579f6c7e095f79a3ac1d6",
     "language": "java",
     "line": 3,
     "reference_kind": "imports",
     "reference_name": "app.util.MathUtil.square"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "src/test/java/app/MainTest.java",
+    "from_node_id": "namespace:0241892b231b76f262f1d6f12c9a13bc",
+    "language": "java",
+    "line": 3,
+    "reference_kind": "imports",
+    "reference_name": "org.mockito.Mockito.mock"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "src/test/java/app/MainTest.java",
+    "from_node_id": "namespace:0241892b231b76f262f1d6f12c9a13bc",
+    "language": "java",
+    "line": 4,
+    "reference_kind": "imports",
+    "reference_name": "org.mockito.Mockito.verify"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "src/test/java/app/MainTest.java",
+    "from_node_id": "namespace:0241892b231b76f262f1d6f12c9a13bc",
+    "language": "java",
+    "line": 7,
+    "reference_kind": "imports",
+    "reference_name": "java.lang.reflect.Method"
   },
   {
     "candidates": null,

@@ -4,54 +4,6 @@
     "kind": "imports",
     "line": 1,
     "metadata": {
-      "confidence": 0.9,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "file:bridge/ios/Greeter.swift",
-    "target": "import:efe9e6fec454d2f54f8b100813493eb7"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 1,
-    "metadata": {
-      "confidence": 0.9,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "file:expo-modules/ios/HelloModule.swift",
-    "target": "import:03babfdb2a0ee12320c8fca88877c447"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 1,
-    "metadata": {
-      "confidence": 0.9,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "file:expo-modules/src/index.ts",
-    "target": "import:3d0084b775fca6e0e2d625a6f1eccd38"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 1,
-    "metadata": {
-      "confidence": 0.9,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "file:rn/src/Camera.tsx",
-    "target": "import:e4645a89194010668d5d554eaa4e7738"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 1,
-    "metadata": {
       "confidence": 0.95,
       "resolvedBy": "qualified-name"
     },
@@ -94,66 +46,6 @@
     "provenance": null,
     "source": "file:rn/ios/CameraModule.m",
     "target": "import:94066fb7d31758f52a193ea4ed1f986b"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 3,
-    "metadata": {
-      "confidence": 0.9,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "namespace:2c5f68b89857398f3f9fd80747c4ce1d",
-    "target": "import:f232db7ec87b90eaee11fa1912e05397"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 3,
-    "metadata": {
-      "confidence": 0.9,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "namespace:6c3a9356c606e3f675e0dab3fba13d1d",
-    "target": "import:c546d0a6e22893f887a40b272aa118da"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 4,
-    "metadata": {
-      "confidence": 0.9,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "namespace:2c5f68b89857398f3f9fd80747c4ce1d",
-    "target": "import:7494987585c73cf84e3c60797211210b"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 4,
-    "metadata": {
-      "confidence": 0.9,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "namespace:6c3a9356c606e3f675e0dab3fba13d1d",
-    "target": "import:72beb7f14dbd062f17f88777ed81d1d1"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 5,
-    "metadata": {
-      "confidence": 0.9,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "namespace:6c3a9356c606e3f675e0dab3fba13d1d",
-    "target": "import:c8f432773ac3b288a83192da05ae73cb"
   },
   {
     "col": 13,

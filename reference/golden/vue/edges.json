@@ -1,17 +1,5 @@
 [
   {
-    "col": 0,
-    "kind": "imports",
-    "line": 1,
-    "metadata": {
-      "confidence": 0.9,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "file:src/composables/useCounter.ts",
-    "target": "import:ddcf75e7656d4346509f14857778a4f4"
-  },
-  {
     "col": 18,
     "kind": "references",
     "line": 8,

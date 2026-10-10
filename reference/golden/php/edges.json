@@ -9,31 +9,7 @@
     },
     "provenance": null,
     "source": "namespace:af2b1f4b9beef2072a30dae246e21427",
-    "target": "import:e8e1a49851f97a13773732cea1856ff0"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 5,
-    "metadata": {
-      "confidence": 0.9,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "namespace:ecdfc0eb0d3003d191ba5713cb2e8831",
-    "target": "import:479941da6788826457791fe291270812"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 6,
-    "metadata": {
-      "confidence": 0.9,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "namespace:af2b1f4b9beef2072a30dae246e21427",
-    "target": "import:23d9eb91ad20144b8c5d3388fc8bc382"
+    "target": "namespace:087cd3f8e35861feacdc40e7dc9d886f"
   },
   {
     "col": 15,

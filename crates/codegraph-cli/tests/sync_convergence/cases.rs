@@ -876,6 +876,30 @@ pub fn php_add_a_same_named_competitor() -> Case {
 
 // ----- a project control file changes --------------------------------------
 
+/// Upstream #965: an import statement is never a name-match candidate, so a
+/// PHP `use` binds the namespace it names, ahead of its own statement, and
+/// another file's identical `use` is no competitor either.
+pub fn php_use_of_a_namespace_gains_a_same_named_import_elsewhere() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Php])
+        .file(
+            "src/Field/Base.php",
+            "<?php\n\nnamespace App\\Field;\n\nclass Base\n{\n}\n",
+        )
+        .file(
+            "src/Controller.php",
+            "<?php\n\nnamespace App;\n\nuse App\\Field;\n\nclass Controller\n{\n}\n",
+        )
+        .write(
+            "src/Other.php",
+            "<?php\n\nnamespace App;\n\nuse App\\Field;\n\nclass Other\n{\n}\n",
+        )
+        .edge_throughout(
+            "namespace App @src/Controller.php",
+            "imports",
+            "namespace App\\Field @src/Field/Base.php",
+        )
+}
+
 /// The index root's `config.toml` is a watcher control file: the watcher
 /// reloads its scope and reconciles the whole project.
 pub fn typescript_config_toml_excludes_a_competitor() -> Case {

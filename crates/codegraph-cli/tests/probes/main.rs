@@ -107,3 +107,28 @@ fn smoke_file_selector_matches_an_embedded_file_node() {
         resolved_by = "file-path",
     );
 }
+
+/// Upstream #965 (`0a91d0f5`): an import statement is not a definition, so no
+/// reference binds another file's import node by name. App.vue's import of
+/// `vue` used to land on Widget.svelte's import of `vue`.
+#[test]
+fn pr0965_vue_import_never_binds_a_svelte_import_node() {
+    let project = Project::new()
+        .file(
+            "src/App.vue",
+            "<template>\n  <div>{{ count }}</div>\n</template>\n\n<script>\nimport { ref } from \"vue\";\n\nexport default {\n  setup() {\n    const count = ref(0);\n    return { count };\n  },\n};\n</script>\n",
+        )
+        .file(
+            "src/Widget.svelte",
+            "<script>\n  import { ref } from \"vue\";\n  let count = ref(0);\n</script>\n\n<p>{count}</p>\n",
+        )
+        .index();
+
+    assert_no_edge!(
+        project,
+        "component src/App.vue::App" => imports => "import vue @src/Widget.svelte"
+    );
+    assert_no_edge!(project, "component src/App.vue::App" => imports => "import vue");
+    // The package is not in the project, so the import stays unresolved.
+    assert_unresolved!(project, "component src/App.vue::App" => imports => "vue");
+}

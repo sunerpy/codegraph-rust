@@ -5,18 +5,6 @@
     "line": 1,
     "metadata": {
       "confidence": 0.9,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "file:pkg/service.py",
-    "target": "import:77de8c1e0efc6cfc112d20a7df6b5519"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 1,
-    "metadata": {
-      "confidence": 0.9,
       "resolvedBy": "import"
     },
     "provenance": null,
@@ -238,18 +226,6 @@
     "provenance": null,
     "source": "file:pkg/models/user.py",
     "target": "class:87c409b2abd116818b83ffeb16248828"
-  },
-  {
-    "col": 7,
-    "kind": "imports",
-    "line": 1,
-    "metadata": {
-      "confidence": 0.9,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "file:tests/conftest.py",
-    "target": "import:717376c5975a7ba05a7eef52516e31d2"
   },
   {
     "col": null,

@@ -4,18 +4,6 @@
     "kind": "imports",
     "line": 1,
     "metadata": {
-      "confidence": 0.9,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "file:alias_consumer.ts",
-    "target": "import:09ce996766fd26d9e6998db066851b9d"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 1,
-    "metadata": {
       "confidence": 0.95,
       "resolvedBy": "qualified-name"
     },

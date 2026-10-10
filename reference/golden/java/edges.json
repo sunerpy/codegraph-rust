@@ -2,54 +2,6 @@
   {
     "col": 0,
     "kind": "imports",
-    "line": 3,
-    "metadata": {
-      "confidence": 0.9,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "namespace:0241892b231b76f262f1d6f12c9a13bc",
-    "target": "import:5f89d0c4c4c8996fe486c4851e4d0fc8"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 3,
-    "metadata": {
-      "confidence": 0.9,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "namespace:d2b9cc03ff2a1861e03fdab9098fdcf9",
-    "target": "import:2b244b8fe1be9e8812a109e14e5ab457"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 4,
-    "metadata": {
-      "confidence": 0.9,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "namespace:0241892b231b76f262f1d6f12c9a13bc",
-    "target": "import:0330d1c5d8d1ef121cbc5c38ebd70859"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 4,
-    "metadata": {
-      "confidence": 0.9,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "namespace:d2b9cc03ff2a1861e03fdab9098fdcf9",
-    "target": "import:f294f4c864dc4a1188a97c9726415161"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
     "line": 6,
     "metadata": {
       "confidence": 0.95,
@@ -58,18 +10,6 @@
     "provenance": null,
     "source": "namespace:0241892b231b76f262f1d6f12c9a13bc",
     "target": "class:94e832e0c31a7087908a6e3a64f46c91"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 7,
-    "metadata": {
-      "confidence": 0.9,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "namespace:0241892b231b76f262f1d6f12c9a13bc",
-    "target": "import:bce3cc394ea048be4411a12a60fc4ac1"
   },
   {
     "col": 25,

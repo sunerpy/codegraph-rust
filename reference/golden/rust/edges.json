@@ -1,17 +1,5 @@
 [
   {
-    "col": 0,
-    "kind": "imports",
-    "line": 1,
-    "metadata": {
-      "confidence": 0.9,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "file:consumer.rs",
-    "target": "import:b45211470cf011dde09b7990d7e238e4"
-  },
-  {
     "col": 12,
     "kind": "calls",
     "line": 89,

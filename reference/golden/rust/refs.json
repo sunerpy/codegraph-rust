@@ -1,6 +1,16 @@
 [
   {
     "candidates": null,
+    "col": 0,
+    "file_path": "consumer.rs",
+    "from_node_id": "file:consumer.rs",
+    "language": "rust",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "crate"
+  },
+  {
+    "candidates": null,
     "col": 12,
     "file_path": "consumer.rs",
     "from_node_id": "file:consumer.rs",

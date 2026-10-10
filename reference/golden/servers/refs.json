@@ -2,6 +2,26 @@
   {
     "candidates": null,
     "col": 0,
+    "file_path": "actix/src/main.rs",
+    "from_node_id": "file:actix/src/main.rs",
+    "language": "rust",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "actix_web"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "aspnet/Controllers/UsersController.cs",
+    "from_node_id": "namespace:5621b770c48eb2fb78dfb3599ac32818",
+    "language": "csharp",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "Microsoft.AspNetCore.Mvc"
+  },
+  {
+    "candidates": null,
+    "col": 0,
     "file_path": "aspnet/Program.cs",
     "from_node_id": "file:aspnet/Program.cs",
     "language": "csharp",
@@ -28,6 +48,26 @@
     "line": 6,
     "reference_kind": "calls",
     "reference_name": "app.Run"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "axum/src/main.rs",
+    "from_node_id": "file:axum/src/main.rs",
+    "language": "rust",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "axum"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "drupal/modules/custom/greeting/src/Controller/GreetingController.php",
+    "from_node_id": "namespace:9cc6f3fa64a53fb24596b3a255875059",
+    "language": "php",
+    "line": 5,
+    "reference_kind": "imports",
+    "reference_name": "Drupal\\Core\\Controller\\ControllerBase"
   },
   {
     "candidates": null,
@@ -75,9 +115,29 @@
     "file_path": "fastapi/main.py",
     "from_node_id": "file:fastapi/main.py",
     "language": "python",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "fastapi"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "fastapi/main.py",
+    "from_node_id": "file:fastapi/main.py",
+    "language": "python",
     "line": 16,
     "reference_kind": "calls",
     "reference_name": "app.include_router"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "flask/app.py",
+    "from_node_id": "file:flask/app.py",
+    "language": "python",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "flask"
   },
   {
     "candidates": null,
@@ -95,9 +155,39 @@
     "file_path": "laravel/routes/api.php",
     "from_node_id": "file:laravel/routes/api.php",
     "language": "php",
+    "line": 3,
+    "reference_kind": "imports",
+    "reference_name": "Illuminate\\Support\\Facades\\Route"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "laravel/routes/api.php",
+    "from_node_id": "file:laravel/routes/api.php",
+    "language": "php",
     "line": 5,
     "reference_kind": "calls",
     "reference_name": "Route.get"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "laravel/routes/web.php",
+    "from_node_id": "file:laravel/routes/web.php",
+    "language": "php",
+    "line": 3,
+    "reference_kind": "imports",
+    "reference_name": "App\\Http\\Controllers\\UserController"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "laravel/routes/web.php",
+    "from_node_id": "file:laravel/routes/web.php",
+    "language": "php",
+    "line": 4,
+    "reference_kind": "imports",
+    "reference_name": "Illuminate\\Support\\Facades\\Route"
   },
   {
     "candidates": null,
@@ -142,12 +232,52 @@
   {
     "candidates": null,
     "col": 0,
+    "file_path": "nest/src/app.module.ts",
+    "from_node_id": "file:nest/src/app.module.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "@nestjs/common"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "nest/src/main.ts",
+    "from_node_id": "file:nest/src/main.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "@nestjs/core"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "nest/src/main.ts",
+    "from_node_id": "file:nest/src/main.ts",
+    "language": "typescript",
+    "line": 2,
+    "reference_kind": "imports",
+    "reference_name": "@nestjs/common"
+  },
+  {
+    "candidates": null,
+    "col": 0,
     "file_path": "nest/src/users/users.controller.ts",
     "from_node_id": "class:36b4b6e1e98c86a0b4c46c4efad52e9c",
     "language": "typescript",
     "line": 4,
     "reference_kind": "decorates",
     "reference_name": "Controller"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "nest/src/users/users.controller.ts",
+    "from_node_id": "file:nest/src/users/users.controller.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "@nestjs/common"
   },
   {
     "candidates": null,
@@ -162,12 +292,42 @@
   {
     "candidates": null,
     "col": 0,
+    "file_path": "nest/src/users/users.service.ts",
+    "from_node_id": "file:nest/src/users/users.service.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "@nestjs/common"
+  },
+  {
+    "candidates": null,
+    "col": 0,
     "file_path": "play/app/controllers/HomeController.scala",
     "from_node_id": "class:908c4169dedf1fe5157efb633b5125a9",
     "language": "scala",
     "line": 6,
     "reference_kind": "decorates",
     "reference_name": "Singleton"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "play/app/controllers/HomeController.scala",
+    "from_node_id": "file:play/app/controllers/HomeController.scala",
+    "language": "scala",
+    "line": 3,
+    "reference_kind": "imports",
+    "reference_name": "javax"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "play/app/controllers/HomeController.scala",
+    "from_node_id": "file:play/app/controllers/HomeController.scala",
+    "language": "scala",
+    "line": 4,
+    "reference_kind": "imports",
+    "reference_name": "play"
   },
   {
     "candidates": null,
@@ -222,12 +382,102 @@
   {
     "candidates": null,
     "col": 0,
+    "file_path": "spring/src/main/java/com/example/users/UserController.java",
+    "from_node_id": "namespace:89420a54d6cc3ed24b9523bf98d7ed5d",
+    "language": "java",
+    "line": 3,
+    "reference_kind": "imports",
+    "reference_name": "org.springframework.beans.factory.annotation.Autowired"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "spring/src/main/java/com/example/users/UserController.java",
+    "from_node_id": "namespace:89420a54d6cc3ed24b9523bf98d7ed5d",
+    "language": "java",
+    "line": 4,
+    "reference_kind": "imports",
+    "reference_name": "org.springframework.web.bind.annotation.GetMapping"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "spring/src/main/java/com/example/users/UserController.java",
+    "from_node_id": "namespace:89420a54d6cc3ed24b9523bf98d7ed5d",
+    "language": "java",
+    "line": 5,
+    "reference_kind": "imports",
+    "reference_name": "org.springframework.web.bind.annotation.PathVariable"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "spring/src/main/java/com/example/users/UserController.java",
+    "from_node_id": "namespace:89420a54d6cc3ed24b9523bf98d7ed5d",
+    "language": "java",
+    "line": 6,
+    "reference_kind": "imports",
+    "reference_name": "org.springframework.web.bind.annotation.RequestMapping"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "spring/src/main/java/com/example/users/UserController.java",
+    "from_node_id": "namespace:89420a54d6cc3ed24b9523bf98d7ed5d",
+    "language": "java",
+    "line": 7,
+    "reference_kind": "imports",
+    "reference_name": "org.springframework.web.bind.annotation.RestController"
+  },
+  {
+    "candidates": null,
+    "col": 0,
     "file_path": "spring/src/main/java/com/example/users/UserService.java",
     "from_node_id": "class:19fed4f1deb67fb9289f70ef980e2c67",
     "language": "java",
     "line": 5,
     "reference_kind": "decorates",
     "reference_name": "Service"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "spring/src/main/java/com/example/users/UserService.java",
+    "from_node_id": "namespace:02ebee76e8a3ddd520f7ada1f2a9b996",
+    "language": "java",
+    "line": 3,
+    "reference_kind": "imports",
+    "reference_name": "org.springframework.stereotype.Service"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "vapor/Package.swift",
+    "from_node_id": "file:vapor/Package.swift",
+    "language": "swift",
+    "line": 2,
+    "reference_kind": "imports",
+    "reference_name": "PackageDescription"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "vapor/Sources/App/Controllers/TodoController.swift",
+    "from_node_id": "file:vapor/Sources/App/Controllers/TodoController.swift",
+    "language": "swift",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "Vapor"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "vapor/Sources/App/routes.swift",
+    "from_node_id": "file:vapor/Sources/App/routes.swift",
+    "language": "swift",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "Vapor"
   },
   {
     "candidates": null,

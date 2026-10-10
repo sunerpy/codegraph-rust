@@ -572,6 +572,7 @@ matrix! {
     kotlin_add_a_same_named_competitor,
     ruby_add_a_same_named_competitor,
     php_add_a_same_named_competitor,
+    php_use_of_a_namespace_gains_a_same_named_import_elsewhere,
     typescript_config_toml_excludes_a_competitor,
     python_root_gitignore_hides_a_competitor,
     python_repository_exclude_hides_a_competitor,

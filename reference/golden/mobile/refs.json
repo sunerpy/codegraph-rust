@@ -11,6 +11,96 @@
   },
   {
     "candidates": null,
+    "col": 0,
+    "file_path": "bridge/ios/Greeter.swift",
+    "from_node_id": "file:bridge/ios/Greeter.swift",
+    "language": "swift",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "Foundation"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "expo-modules/android/src/main/java/expo/modules/hello/HelloModule.kt",
+    "from_node_id": "namespace:2c5f68b89857398f3f9fd80747c4ce1d",
+    "language": "kotlin",
+    "line": 3,
+    "reference_kind": "imports",
+    "reference_name": "expo.modules.kotlin.modules.Module"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "expo-modules/android/src/main/java/expo/modules/hello/HelloModule.kt",
+    "from_node_id": "namespace:2c5f68b89857398f3f9fd80747c4ce1d",
+    "language": "kotlin",
+    "line": 4,
+    "reference_kind": "imports",
+    "reference_name": "expo.modules.kotlin.modules.ModuleDefinition"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "expo-modules/ios/HelloModule.swift",
+    "from_node_id": "file:expo-modules/ios/HelloModule.swift",
+    "language": "swift",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "ExpoModulesCore"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "expo-modules/src/index.ts",
+    "from_node_id": "file:expo-modules/src/index.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "expo-modules-core"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "rn/android/app/src/main/java/com/example/CameraModule.java",
+    "from_node_id": "namespace:6c3a9356c606e3f675e0dab3fba13d1d",
+    "language": "java",
+    "line": 3,
+    "reference_kind": "imports",
+    "reference_name": "com.facebook.react.bridge.Promise"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "rn/android/app/src/main/java/com/example/CameraModule.java",
+    "from_node_id": "namespace:6c3a9356c606e3f675e0dab3fba13d1d",
+    "language": "java",
+    "line": 4,
+    "reference_kind": "imports",
+    "reference_name": "com.facebook.react.bridge.ReactContextBaseJavaModule"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "rn/android/app/src/main/java/com/example/CameraModule.java",
+    "from_node_id": "namespace:6c3a9356c606e3f675e0dab3fba13d1d",
+    "language": "java",
+    "line": 5,
+    "reference_kind": "imports",
+    "reference_name": "com.facebook.react.bridge.ReactMethod"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "rn/src/Camera.tsx",
+    "from_node_id": "file:rn/src/Camera.tsx",
+    "language": "tsx",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "react-native"
+  },
+  {
+    "candidates": null,
     "col": 11,
     "file_path": "flutter/lib/main.dart",
     "from_node_id": "method:06cc27db07d4944f8a4f2dccba77e661",

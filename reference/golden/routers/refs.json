@@ -1,6 +1,166 @@
 [
   {
     "candidates": null,
+    "col": 0,
+    "file_path": "apps/angular/src/app/app.routes.ts",
+    "from_node_id": "file:apps/angular/src/app/app.routes.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "@angular/router"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "apps/angular/src/app/home/home.component.ts",
+    "from_node_id": "file:apps/angular/src/app/home/home.component.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "@angular/core"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "apps/angular/src/app/home/home.component.ts",
+    "from_node_id": "file:apps/angular/src/app/home/home.component.ts",
+    "language": "typescript",
+    "line": 2,
+    "reference_kind": "imports",
+    "reference_name": "@angular/router"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "apps/expo/app/_layout.tsx",
+    "from_node_id": "file:apps/expo/app/_layout.tsx",
+    "language": "tsx",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "expo-router"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "apps/expo/app/index.tsx",
+    "from_node_id": "file:apps/expo/app/index.tsx",
+    "language": "tsx",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "expo-router"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "apps/expo/app/index.tsx",
+    "from_node_id": "file:apps/expo/app/index.tsx",
+    "language": "tsx",
+    "line": 2,
+    "reference_kind": "imports",
+    "reference_name": "react-native"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "apps/expo/app/settings.tsx",
+    "from_node_id": "file:apps/expo/app/settings.tsx",
+    "language": "tsx",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "react-native"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "apps/next/app/dashboard/page.tsx",
+    "from_node_id": "file:apps/next/app/dashboard/page.tsx",
+    "language": "tsx",
+    "line": 2,
+    "reference_kind": "imports",
+    "reference_name": "next/navigation"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "apps/next/app/page.tsx",
+    "from_node_id": "file:apps/next/app/page.tsx",
+    "language": "tsx",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "next/link"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "apps/react-router/src/main.tsx",
+    "from_node_id": "file:apps/react-router/src/main.tsx",
+    "language": "tsx",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "react-router-dom"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "apps/react-router/src/pages/Layout.tsx",
+    "from_node_id": "file:apps/react-router/src/pages/Layout.tsx",
+    "language": "tsx",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "react-router-dom"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "apps/sveltekit/src/routes/blog/[slug=slug]/+page.ts",
+    "from_node_id": "file:apps/sveltekit/src/routes/blog/[slug=slug]/+page.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "@sveltejs/kit"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "apps/tanstack/src/routes/index.tsx",
+    "from_node_id": "file:apps/tanstack/src/routes/index.tsx",
+    "language": "tsx",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "@tanstack/react-router"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "apps/tanstack/src/routes/posts.tsx",
+    "from_node_id": "file:apps/tanstack/src/routes/posts.tsx",
+    "language": "tsx",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "@tanstack/react-router"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "apps/vue/src/router/index.ts",
+    "from_node_id": "file:apps/vue/src/router/index.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "vue-router"
+  },
+  {
+    "candidates": null,
+    "col": 1,
+    "file_path": "apps/vue/src/views/Home.vue",
+    "from_node_id": "component:1a7b7031523fe7654fa37131da535be3",
+    "language": "vue",
+    "line": 3,
+    "reference_kind": "imports",
+    "reference_name": "vue-router"
+  },
+  {
+    "candidates": null,
     "col": 10,
     "file_path": "apps/expo/app/_layout.tsx",
     "from_node_id": "function:d16a883860241c55bdc8506906d752d9",

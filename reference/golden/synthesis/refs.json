@@ -2,12 +2,72 @@
   {
     "candidates": null,
     "col": 0,
+    "file_path": "dispatch/src/Events.java",
+    "from_node_id": "namespace:559ecd17038af11c9b6ef54ae38f2d50",
+    "language": "java",
+    "line": 3,
+    "reference_kind": "imports",
+    "reference_name": "org.springframework.context.ApplicationEventPublisher"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "dispatch/src/Events.java",
+    "from_node_id": "namespace:559ecd17038af11c9b6ef54ae38f2d50",
+    "language": "java",
+    "line": 4,
+    "reference_kind": "imports",
+    "reference_name": "org.springframework.context.event.EventListener"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "js/src/Counter.tsx",
+    "from_node_id": "file:js/src/Counter.tsx",
+    "language": "tsx",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "react"
+  },
+  {
+    "candidates": null,
+    "col": 0,
     "file_path": "js/src/events.js",
     "from_node_id": "file:js/src/events.js",
     "language": "javascript",
     "line": 9,
     "reference_kind": "calls",
     "reference_name": "bus.on"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "js/src/store.ts",
+    "from_node_id": "file:js/src/store.ts",
+    "language": "typescript",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "@reduxjs/toolkit"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "js/src/store.ts",
+    "from_node_id": "file:js/src/store.ts",
+    "language": "typescript",
+    "line": 2,
+    "reference_kind": "imports",
+    "reference_name": "pinia"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "python/tasks.py",
+    "from_node_id": "file:python/tasks.py",
+    "language": "python",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "celery"
   },
   {
     "candidates": null,

@@ -1,6 +1,36 @@
 [
   {
     "candidates": null,
+    "col": 0,
+    "file_path": "src/App/Store.cs",
+    "from_node_id": "namespace:8f15a54d8f657c2e21df81a2391cb68a",
+    "language": "csharp",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "System"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "src/App/Store.cs",
+    "from_node_id": "namespace:8f15a54d8f657c2e21df81a2391cb68a",
+    "language": "csharp",
+    "line": 2,
+    "reference_kind": "imports",
+    "reference_name": "System.IO"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "src/App/Store.cs",
+    "from_node_id": "namespace:8f15a54d8f657c2e21df81a2391cb68a",
+    "language": "csharp",
+    "line": 3,
+    "reference_kind": "imports",
+    "reference_name": "System.Math"
+  },
+  {
+    "candidates": null,
     "col": 12,
     "file_path": "src/App/Store.cs",
     "from_node_id": "method:fb6e3b0761da57101db4a4ffde0342a4",

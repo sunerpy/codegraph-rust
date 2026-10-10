@@ -2,42 +2,6 @@
   {
     "col": 0,
     "kind": "imports",
-    "line": 1,
-    "metadata": {
-      "confidence": 0.9,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "namespace:8f15a54d8f657c2e21df81a2391cb68a",
-    "target": "import:a61dcb9985112af14a86dd433e13e8aa"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 2,
-    "metadata": {
-      "confidence": 0.9,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "namespace:8f15a54d8f657c2e21df81a2391cb68a",
-    "target": "import:218d43326e4679c3443e1e03ae7f0b39"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 3,
-    "metadata": {
-      "confidence": 0.9,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "namespace:8f15a54d8f657c2e21df81a2391cb68a",
-    "target": "import:4d81e002609cb31fe68bf38f8347d842"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
     "line": 4,
     "metadata": {
       "confidence": 0.95,

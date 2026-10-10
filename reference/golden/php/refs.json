@@ -1,6 +1,26 @@
 [
   {
     "candidates": null,
+    "col": 0,
+    "file_path": "src/Controller.php",
+    "from_node_id": "namespace:af2b1f4b9beef2072a30dae246e21427",
+    "language": "php",
+    "line": 6,
+    "reference_kind": "imports",
+    "reference_name": "App\\Field\\FirstName"
+  },
+  {
+    "candidates": null,
+    "col": 0,
+    "file_path": "tests/ControllerTest.php",
+    "from_node_id": "namespace:ecdfc0eb0d3003d191ba5713cb2e8831",
+    "language": "php",
+    "line": 5,
+    "reference_kind": "imports",
+    "reference_name": "App\\Controller"
+  },
+  {
+    "candidates": null,
     "col": 11,
     "file_path": "src/Util/helpers.php",
     "from_node_id": "function:2c3e0ea1a203fedfce0fee1a81132f72",

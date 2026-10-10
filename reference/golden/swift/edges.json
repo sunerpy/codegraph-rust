@@ -1,29 +1,5 @@
 [
   {
-    "col": 0,
-    "kind": "imports",
-    "line": 1,
-    "metadata": {
-      "confidence": 0.7,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "file:Sources/App/Client.swift",
-    "target": "import:e7d6b1d33098a46a18b0556f4c17d6db"
-  },
-  {
-    "col": 0,
-    "kind": "imports",
-    "line": 1,
-    "metadata": {
-      "confidence": 0.7,
-      "resolvedBy": "exact-match"
-    },
-    "provenance": null,
-    "source": "file:Sources/App/Models.swift",
-    "target": "import:aacb44dc3c30d77f70a55d9f3e6270a6"
-  },
-  {
     "col": 15,
     "kind": "calls",
     "line": 12,
