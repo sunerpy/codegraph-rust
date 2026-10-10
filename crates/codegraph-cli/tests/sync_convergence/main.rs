@@ -604,6 +604,7 @@ matrix! {
     vue_component_template_edit,
     liquid_snippet_body_edit,
     luau_module_function_body_edit,
+    vue_script_function_body_edit,
     objc_implementation_body_edit,
     gdscript_autoload_method_body_edit,
     typescript_rename_an_imported_function,

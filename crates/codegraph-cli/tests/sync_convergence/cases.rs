@@ -402,6 +402,26 @@ pub fn luau_module_function_body_edit() -> Case {
         .edge_throughout("file:src/Shop.luau", "imports", "file:src/Inventory.luau")
 }
 
+/// G8: a Vue script's function bodies are extracted, so editing a call in one
+/// moves its edge.
+pub fn vue_script_function_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Vue, Language::TypeScript])
+        .file(
+            "src/actions.ts",
+            "export function run(): number {\n  return 1;\n}\n\nexport function stop(): number {\n  return 0;\n}\n",
+        )
+        .file(
+            "src/App.vue",
+            "<template>\n  <button @click=\"go\">go</button>\n</template>\n\n<script setup lang=\"ts\">\nimport { run, stop } from './actions';\n\nfunction go() {\n  return run();\n}\n</script>\n",
+        )
+        .write(
+            "src/App.vue",
+            "<template>\n  <button @click=\"go\">go</button>\n</template>\n\n<script setup lang=\"ts\">\nimport { run, stop } from './actions';\n\nfunction go() {\n  return stop();\n}\n</script>\n",
+        )
+        .edge_before("function go", "calls", "function run")
+        .edge_after("function go", "calls", "function stop")
+}
+
 pub fn objc_implementation_body_edit() -> Case {
     Case::new(Change::BodyEdit, &[Language::ObjC])
         .file(

@@ -121,7 +121,7 @@
     "errors": null,
     "generated": 0,
     "language": "vue",
-    "node_count": 1,
+    "node_count": 3,
     "path": "apps/nuxt/pages/users/[id].vue",
     "size": 126
   },
@@ -229,7 +229,7 @@
     "errors": null,
     "generated": 0,
     "language": "vue",
-    "node_count": 1,
+    "node_count": 2,
     "path": "apps/vue/src/views/Home.vue",
     "size": 140
   }

@@ -65,14 +65,14 @@ These languages wrap or embed code in another language (or use a custom extracto
 host file gets its own node; inner code is delegated to the appropriate Tier-1 grammar
 and merged back into the parent result.
 
-| Language      | Extensions                                       | Extraction                    | Notes                                                                                    |
-| ------------- | ------------------------------------------------ | ----------------------------- | ---------------------------------------------------------------------------------------- |
-| Vue           | `.vue`                                           | Embedded (delegates to TS/JS) | `<script>` and `<script setup>` blocks delegated; `lang="ts"` selects TypeScript grammar |
-| Svelte        | `.svelte`                                        | Embedded (delegates to TS/JS) | Script blocks extracted and delegated; component node created for the file               |
-| Astro         | `.astro`                                         | Embedded                      | Detected via embedded pre-pass only (not in the built-in extension map)                  |
-| Razor         | `.razor` `.cshtml`                               | Embedded (custom)             | Detected via embedded pre-pass only; C# snippets extracted from `.cshtml`/`.razor` files |
-| Liquid        | `.liquid`, `templates/*.json`, `sections/*.json` | Custom regex extractor        | Shopify template support; path-based `.json` detection for templates and sections        |
-| XML (MyBatis) | `.xml`                                           | Custom (MyBatis mapper)       | Extracts SQL-mapper nodes from MyBatis XML files; generic XML gets a file node only      |
+| Language      | Extensions                                       | Extraction                    | Notes                                                                                                                                                                                    |
+| ------------- | ------------------------------------------------ | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Vue           | `.vue`                                           | Embedded (delegates to TS/JS) | `<script>` and `<script setup>` blocks delegated; `lang="ts"` selects TypeScript grammar Each `<script>` block is extracted by the TypeScript or JavaScript extractor at its file lines. |
+| Svelte        | `.svelte`                                        | Embedded (delegates to TS/JS) | Script blocks extracted and delegated; component node created for the file                                                                                                               |
+| Astro         | `.astro`                                         | Embedded                      | Detected via embedded pre-pass only (not in the built-in extension map)                                                                                                                  |
+| Razor         | `.razor` `.cshtml`                               | Embedded (custom)             | Detected via embedded pre-pass only; C# snippets extracted from `.cshtml`/`.razor` files                                                                                                 |
+| Liquid        | `.liquid`, `templates/*.json`, `sections/*.json` | Custom regex extractor        | Shopify template support; path-based `.json` detection for templates and sections                                                                                                        |
+| XML (MyBatis) | `.xml`                                           | Custom (MyBatis mapper)       | Extracts SQL-mapper nodes from MyBatis XML files; generic XML gets a file node only                                                                                                      |
 
 ---
 

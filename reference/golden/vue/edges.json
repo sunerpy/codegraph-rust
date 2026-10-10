@@ -1,5 +1,17 @@
 [
   {
+    "col": 12,
+    "kind": "calls",
+    "line": 11,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "constant:3361d9de96f9b8296ef5f6715a372f3a",
+    "target": "function:4969a1ad19a6bf73e764e687c6323329"
+  },
+  {
     "col": 18,
     "kind": "references",
     "line": 8,
@@ -25,6 +37,27 @@
     "target": "component:f4f2c5bd83c7e2d2bd25b6aeca79a228"
   },
   {
+    "col": 9,
+    "kind": "calls",
+    "line": 16,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "function:9bdc9cd1f3fedac8bed880a1d4210b7a",
+    "target": "function:4969a1ad19a6bf73e764e687c6323329"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "component:bf4932bbbd9ae2d8b66cf6b90d96d83a",
+    "target": "constant:3361d9de96f9b8296ef5f6715a372f3a"
+  },
+  {
     "col": null,
     "kind": "contains",
     "line": null,
@@ -32,6 +65,42 @@
     "provenance": null,
     "source": "component:bf4932bbbd9ae2d8b66cf6b90d96d83a",
     "target": "function:9bdc9cd1f3fedac8bed880a1d4210b7a"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "component:bf4932bbbd9ae2d8b66cf6b90d96d83a",
+    "target": "import:11238120f7290722088b7100c5606d28"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "component:bf4932bbbd9ae2d8b66cf6b90d96d83a",
+    "target": "import:5c379979046e84279087fa18b4701e92"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "component:bf4932bbbd9ae2d8b66cf6b90d96d83a",
+    "target": "import:7e507bd267b19b4aa026b0befba077d6"
+  },
+  {
+    "col": null,
+    "kind": "contains",
+    "line": null,
+    "metadata": null,
+    "provenance": null,
+    "source": "component:f4f2c5bd83c7e2d2bd25b6aeca79a228",
+    "target": "import:53ac2b441303553cd61bae19cf2ca7f6"
   },
   {
     "col": null,

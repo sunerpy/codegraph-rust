@@ -4,7 +4,7 @@
     "errors": null,
     "generated": 0,
     "language": "vue",
-    "node_count": 2,
+    "node_count": 6,
     "path": "src/components/App.vue",
     "size": 396
   },
@@ -13,7 +13,7 @@
     "errors": null,
     "generated": 0,
     "language": "vue",
-    "node_count": 1,
+    "node_count": 2,
     "path": "src/components/Counter.vue",
     "size": 415
   },

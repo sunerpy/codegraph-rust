@@ -1,11 +1,11 @@
-use codegraph_core::node_id::{NodeIdAllocator, generate_node_id, utf16_column};
+use codegraph_core::node_id::generate_node_id;
 use codegraph_core::types::{
     Edge, EdgeKind, ExtractionResult, Language, Node, NodeKind, UnresolvedRef,
 };
 use regex::Regex;
 use std::path::Path;
-use streaming_iterator::StreamingIterator;
-use tree_sitter::{Parser, Query, QueryCursor};
+
+use crate::embedded::shared::{empty_result, merge_delegated_result};
 
 // Vue built-in components to skip
 fn is_vue_builtin(name: &str) -> bool {
@@ -51,8 +51,6 @@ pub struct VueExtractor<'a> {
     edges: Vec<Edge>,
     unresolved_references: Vec<UnresolvedRef>,
     errors: Vec<String>,
-    /// Same-line namesakes keep distinct ids across every script block (#1349).
-    node_ids: NodeIdAllocator,
 }
 
 impl<'a> VueExtractor<'a> {
@@ -64,7 +62,6 @@ impl<'a> VueExtractor<'a> {
             edges: Vec::new(),
             unresolved_references: Vec::new(),
             errors: Vec::new(),
-            node_ids: NodeIdAllocator::default(),
         }
     }
 
@@ -163,126 +160,31 @@ impl<'a> VueExtractor<'a> {
         blocks
     }
 
+    /// A script block is extracted by the TypeScript (or JavaScript)
+    /// extractor, as upstream's Vue extractor delegates it (G8), and its
+    /// result joins the component at the block's file lines.
     fn process_script_block(&mut self, block: &ScriptBlock, component_id: &str) {
-        let mut parser = Parser::new();
         let language = if block.is_typescript {
-            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
+            Language::TypeScript
         } else {
-            tree_sitter_javascript::LANGUAGE.into()
+            Language::JavaScript
         };
-        parser.set_language(&language).unwrap();
-
-        let tree = parser.parse(&block.content, None).unwrap();
-
-        // Simple query to find functions and imports for the prototype
-        let query_str = r#"
-            (function_declaration
-                name: (identifier) @func.name) @func
-            
-            (import_statement
-                source: (string) @import.source) @import
-        "#;
-
-        let query = Query::new(&language, query_str).unwrap();
-        let mut cursor = QueryCursor::new();
-        let mut matches = cursor.matches(&query, tree.root_node(), block.content.as_bytes());
-
-        while let Some(m) = matches.next() {
-            for capture in m.captures() {
-                let node = capture.node;
-                let capture_name = query.capture_names()[capture.index as usize];
-
-                if capture_name == "func" {
-                    let name_node = m
-                        .captures()
-                        .iter()
-                        .find(|c| query.capture_names()[c.index as usize] == "func.name")
-                        .unwrap()
-                        .node;
-                    let name = name_node
-                        .utf8_text(block.content.as_bytes())
-                        .unwrap()
-                        .to_string();
-
-                    let start_pos = node.start_position();
-                    let end_pos = node.end_position();
-
-                    let id = self.node_ids.generate(
-                        self.file_path,
-                        NodeKind::Function,
-                        &name,
-                        start_pos.row as u32 + 1,
-                        utf16_column(&block.content, node.start_byte()),
-                    );
-                    let qualified_name = format!("{}::{}", self.file_path, name);
-
-                    self.nodes.push(Node {
-                        id: id.clone(),
-                        kind: NodeKind::Function,
-                        name,
-                        qualified_name,
-                        file_path: self.file_path.to_string(),
-                        language: Language::Vue,
-                        start_line: start_pos.row as i64 + block.line_offset + 1, // 1-indexed
-                        end_line: end_pos.row as i64 + block.line_offset + 1,
-                        start_column: start_pos.column as i64 + 1,
-                        end_column: end_pos.column as i64 + 1,
-                        docstring: None,
-                        signature: None,
-                        visibility: None,
-                        is_exported: false,
-                        is_async: false,
-                        is_static: false,
-                        is_abstract: false,
-                        decorators: vec![],
-                        type_parameters: vec![],
-                        return_type: None,
-                        updated_at: 0,
-                    });
-
-                    self.edges.push(Edge {
-                        id: None,
-                        source: component_id.to_string(),
-                        target: id,
-                        kind: EdgeKind::Contains,
-                        metadata: None,
-                        line: None,
-                        col: None,
-                        provenance: None,
-                    });
-                } else if capture_name == "import" {
-                    let source_node = m
-                        .captures()
-                        .iter()
-                        .find(|c| query.capture_names()[c.index as usize] == "import.source")
-                        .unwrap()
-                        .node;
-                    let source_text = source_node
-                        .utf8_text(block.content.as_bytes())
-                        .unwrap()
-                        .to_string();
-                    let clean_source = source_text
-                        .trim_matches(|c| c == '"' || c == '\'')
-                        .to_string();
-
-                    let start_pos = node.start_position();
-
-                    self.unresolved_references.push(UnresolvedRef {
-                        id: None,
-                        from_node_id: component_id.to_string(),
-                        reference_name: clean_source,
-                        reference_kind: EdgeKind::Imports,
-                        line: start_pos.row as i64 + block.line_offset + 1,
-                        col: start_pos.column as i64 + 1,
-                        candidates: None,
-                        file_path: self.file_path.to_string(),
-                        language: Language::Vue,
-                        is_function_ref: false,
-                        reference_subkind: None,
-                    });
-                }
-            }
-        }
+        let delegated =
+            crate::engine::extract_source(self.file_path, &block.content, Some(language));
+        let mut merged = empty_result(0);
+        merge_delegated_result(
+            &mut merged,
+            delegated,
+            component_id,
+            self.file_path,
+            Language::Vue,
+            block.line_offset,
+        );
+        self.nodes.append(&mut merged.nodes);
+        self.edges.append(&mut merged.edges);
+        self.unresolved_references
+            .append(&mut merged.unresolved_references);
+        self.errors.append(&mut merged.errors);
     }
 
     fn extract_template_components(&mut self, component_id: &str) {

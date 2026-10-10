@@ -151,16 +151,6 @@
   },
   {
     "candidates": null,
-    "col": 1,
-    "file_path": "apps/vue/src/views/Home.vue",
-    "from_node_id": "component:1a7b7031523fe7654fa37131da535be3",
-    "language": "vue",
-    "line": 3,
-    "reference_kind": "imports",
-    "reference_name": "vue-router"
-  },
-  {
-    "candidates": null,
     "col": 10,
     "file_path": "apps/expo/app/_layout.tsx",
     "from_node_id": "function:d16a883860241c55bdc8506906d752d9",
@@ -238,6 +228,16 @@
     "line": 1,
     "reference_kind": "references",
     "reference_name": "RouterLink"
+  },
+  {
+    "candidates": null,
+    "col": 14,
+    "file_path": "apps/nuxt/pages/users/[id].vue",
+    "from_node_id": "constant:d7a8d34fa1fce6ecb20fd36b87bc7726",
+    "language": "vue",
+    "line": 3,
+    "reference_kind": "calls",
+    "reference_name": "useRoute"
   },
   {
     "candidates": null,
@@ -648,6 +648,16 @@
     "line": 2,
     "reference_kind": "imports",
     "reference_name": "useRouter"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "apps/nuxt/pages/index.vue",
+    "from_node_id": "function:13bf526514dd2ebd32bee115b7bd0144",
+    "language": "vue",
+    "line": 4,
+    "reference_kind": "calls",
+    "reference_name": "navigateTo"
   },
   {
     "candidates": null,
